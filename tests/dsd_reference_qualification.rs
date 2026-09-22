@@ -12,7 +12,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::{mpsc, Arc, Mutex};
@@ -719,6 +719,7 @@ fn assert_exact_w64_package_probe(
     let (expected_bits, encoding, expected_encoding) = match depth {
         "int16" => (16, W64SampleEncoding::SignedInteger, "Signed Integer PCM"),
         "int24" => (24, W64SampleEncoding::SignedInteger, "Signed Integer PCM"),
+        "int32" => (32, W64SampleEncoding::SignedInteger, "Signed Integer PCM"),
         "float32" => (32, W64SampleEncoding::FloatingPoint, "Floating Point PCM"),
         "float64" => (64, W64SampleEncoding::FloatingPoint, "Floating Point PCM"),
         _ => panic!("unknown depth {depth}"),
@@ -807,6 +808,7 @@ fn assert_exact_w64_package_probe(
     let expected_codec = match depth {
         "int16" => "pcm_s16le",
         "int24" => "pcm_s24le",
+        "int32" => "pcm_s32le",
         "float32" => "pcm_f32le",
         "float64" => "pcm_f64le",
         _ => unreachable!(),
@@ -1991,10 +1993,316 @@ fn write_dsf_reference_fixture_with_byte(
     Duration::from_secs_f64(sample_count as f64 / f64::from(sample_rate_hz))
 }
 
+fn write_dsf_sigma_delta_tone_fixture(
+    path: &Path,
+    channels: u16,
+    sample_rate_hz: u32,
+) -> Duration {
+    assert!(channels > 0);
+    let file = File::create(path).expect("create sigma-delta DSF qualification fixture");
+    let mut writer = sacd_rs::dsf_writer::DsfWriter::new(
+        file,
+        channels
+            .try_into()
+            .expect("sigma-delta DSF fixture channel count fits u8"),
+        sample_rate_hz,
+    )
+    .expect("create sigma-delta DSF qualification writer");
+
+    const BYTES_PER_CHANNEL: usize = 32_768;
+    const AMPLITUDE: f64 = 0.25;
+    let channel_count = usize::from(channels);
+    let mut phases = vec![0.0_f64; channel_count];
+    let mut errors = vec![0.0_f64; channel_count];
+    let phase_steps = (0..channel_count)
+        .map(|channel| {
+            let frequency_hz = 997.0 + 431.0 * channel as f64;
+            std::f64::consts::TAU * frequency_hz / f64::from(sample_rate_hz)
+        })
+        .collect::<Vec<_>>();
+    let mut payload = Vec::with_capacity(BYTES_PER_CHANNEL * channel_count);
+
+    // DsfWriter accepts SACD-style MSB-first bytes and reverses them for
+    // DSF storage. Pack the earliest modulator sample into bit 7 here.
+    for _ in 0..BYTES_PER_CHANNEL {
+        for channel in 0..channel_count {
+            let mut byte = 0_u8;
+            for bit in 0..8 {
+                let target = AMPLITUDE * phases[channel].sin();
+                errors[channel] += target;
+                let one = errors[channel] >= 0.0;
+                if one {
+                    errors[channel] -= 1.0;
+                    byte |= 1_u8 << (7 - bit);
+                } else {
+                    errors[channel] += 1.0;
+                }
+                phases[channel] += phase_steps[channel];
+                if phases[channel] >= std::f64::consts::TAU {
+                    phases[channel] -= std::f64::consts::TAU;
+                }
+            }
+            payload.push(byte);
+        }
+    }
+
+    writer
+        .write_interleaved(&payload)
+        .expect("write sigma-delta DSF qualification payload");
+    writer
+        .finish()
+        .expect("finish sigma-delta DSF qualification fixture");
+
+    let mut fixture = File::open(path).expect("reopen sigma-delta DSF qualification fixture");
+    let info = sacd_rs::dsd_file::inspect_dsf(&mut fixture)
+        .expect("inspect completed sigma-delta DSF qualification fixture");
+    assert_eq!(info.channel_count, channels);
+    assert_eq!(info.sample_rate, sample_rate_hz);
+    let sample_count = info
+        .sample_count_per_channel
+        .expect("sigma-delta DSF fixture declares per-channel sample count");
+    assert_eq!(sample_count, (BYTES_PER_CHANNEL * 8) as u64);
+    Duration::from_secs_f64(sample_count as f64 / f64::from(sample_rate_hz))
+}
+
 fn write_dsf_reference_fixture(path: &Path, channels: u16, sample_rate_hz: u32) -> Duration {
     // The commissioning 0x69 pattern reconstructs to exact PCM zero and is the
     // regression fixture for the certified leading-silence termination defect.
     write_dsf_reference_fixture_with_byte(path, channels, sample_rate_hz, 0x69)
+}
+
+
+#[derive(Debug)]
+struct HistoricalDcCertifiedProbe {
+    observation: tonepoet_pipeline::ReferenceCertifiedPeakObservation,
+    sample_min: f64,
+    sample_max: f64,
+    first_sample: f64,
+    last_sample: f64,
+    unique_sample_bit_patterns: usize,
+}
+
+fn historical_dc_certified_w64_probe(
+    path: &Path,
+    id: MeasurementId,
+    purpose: TruePeakPurpose,
+    subject: tonepoet_pipeline::ReferenceObservationSubject,
+) -> HistoricalDcCertifiedProbe {
+    let mut file = File::open(path)
+        .unwrap_or_else(|error| panic!("open historical DC probe carrier {}: {error}", path.display()));
+    let structure = inspect_exact_w64_pcm(
+        &mut file,
+        W64PcmFormatExpectation {
+            sample_rate_hz: 88_200,
+            channels: 2,
+            bits_per_sample: 64,
+            encoding: W64SampleEncoding::FloatingPoint,
+        },
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "historical DC probe exact Wave64 parser rejected {}: {error}",
+            path.display()
+        )
+    });
+    assert!(structure.sample_frames > 0, "historical DC probe carrier is empty");
+    let payload_len = usize::try_from(structure.declared_data_bytes)
+        .expect("historical DC probe Wave64 payload fits usize");
+    assert_eq!(
+        payload_len % 8,
+        0,
+        "historical DC probe Float64 payload is sample-aligned"
+    );
+    file.seek(SeekFrom::Start(structure.data_payload_offset()))
+        .expect("seek historical DC probe Wave64 payload");
+    let mut payload = vec![0_u8; payload_len];
+    file.read_exact(&mut payload)
+        .expect("read complete historical DC probe Wave64 payload");
+
+    // The pinned SoX-ng Wave64 Float64 payload is stored in signed-Q1.31
+    // numeric units: 2^31 represents full scale. Decode the exact power-of-two
+    // storage convention before feeding the certified meter, matching the
+    // production Reference reader.
+    const SOX_FLOAT64_W64_Q31_TO_FS: f64 = 1.0 / 2_147_483_648.0;
+    let samples = payload
+        .chunks_exact(8)
+        .map(|raw| {
+            f64::from_le_bytes(raw.try_into().expect("Float64 sample is eight bytes"))
+                * SOX_FLOAT64_W64_Q31_TO_FS
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        samples.len(),
+        usize::try_from(structure.sample_frames).expect("frame count fits usize") * 2,
+        "historical DC probe Wave64 sample extent"
+    );
+    assert!(
+        samples.iter().all(|sample| sample.is_finite()),
+        "historical DC probe carrier must contain finite Float64 samples"
+    );
+    let sample_min = samples.iter().copied().fold(f64::INFINITY, f64::min);
+    let sample_max = samples.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let first_sample = samples[0];
+    let last_sample = *samples.last().expect("historical DC probe carrier has samples");
+    let unique_sample_bit_patterns = samples
+        .iter()
+        .map(|sample| sample.to_bits())
+        .collect::<BTreeSet<_>>()
+        .len();
+
+    let peak_tier = tonepoet_true_peak::PeakTier::Standard;
+    let mut meter = tonepoet_true_peak::CertifiedPeakMeter::new(
+        88_200,
+        2,
+        tonepoet_true_peak::EdgePolicy::RepeatEndpoints,
+        peak_tier,
+    )
+    .expect("initialize historical DC certified meter");
+    meter
+        .push_interleaved(&samples)
+        .expect("scan historical DC Wave64 payload");
+    let certificate = meter
+        .finalize()
+        .expect("finalize historical DC certified meter");
+    assert_eq!(certificate.tier, peak_tier);
+    assert_eq!(certificate.reported_point_estimate.frames, structure.sample_frames);
+
+    let status = match certificate.status {
+        tonepoet_true_peak::SearchStatus::Complete => {
+            tonepoet_pipeline::ReferenceCertifiedSearchStatus::Complete
+        }
+        tonepoet_true_peak::SearchStatus::WorkLimited => {
+            tonepoet_pipeline::ReferenceCertifiedSearchStatus::WorkLimited
+        }
+        tonepoet_true_peak::SearchStatus::TimeLimited => {
+            panic!("historical DC probe returned retired time-limited authority")
+        }
+    };
+    let result = if certificate.finite_interval.is_silence() {
+        tonepoet_pipeline::ReferenceCertifiedPeakResult::VerifiedSilence
+    } else {
+        tonepoet_pipeline::ReferenceCertifiedPeakResult::Finite {
+            point_linear_bits: certificate.reported_point_estimate.overall.linear().to_bits(),
+            lower_linear_bits: certificate.finite_interval.lower_linear.to_bits(),
+            upper_linear_bits: certificate.finite_interval.upper_linear.to_bits(),
+            status,
+        }
+    };
+
+    let programme_sha256 = tonepoet_pipeline::Sha256Digest::of_bytes(&payload);
+    let mut evidence_hasher = Sha256::new();
+    evidence_hasher.update(b"tonepoet-reference-certified-peak-observation/v1\0");
+    evidence_hasher.update(programme_sha256.0);
+    evidence_hasher.update(88_200_u32.to_be_bytes());
+    evidence_hasher.update(2_u16.to_be_bytes());
+    evidence_hasher.update(structure.sample_frames.to_be_bytes());
+    evidence_hasher.update([match subject {
+        tonepoet_pipeline::ReferenceObservationSubject::ProtectedR64 => 0,
+        tonepoet_pipeline::ReferenceObservationSubject::TerminalQpcm => 1,
+    }]);
+    evidence_hasher.update([match purpose {
+        TruePeakPurpose::GainAuthority => 0,
+        TruePeakPurpose::PostFinalAcceptance => 1,
+    }]);
+    evidence_hasher.update([1]); // TruePeakScanTier::Standard
+    match result {
+        tonepoet_pipeline::ReferenceCertifiedPeakResult::VerifiedSilence => {
+            evidence_hasher.update([0]);
+        }
+        tonepoet_pipeline::ReferenceCertifiedPeakResult::Finite {
+            point_linear_bits,
+            lower_linear_bits,
+            upper_linear_bits,
+            status,
+        } => {
+            evidence_hasher.update([1]);
+            evidence_hasher.update(point_linear_bits.to_be_bytes());
+            evidence_hasher.update(lower_linear_bits.to_be_bytes());
+            evidence_hasher.update(upper_linear_bits.to_be_bytes());
+            evidence_hasher.update([match status {
+                tonepoet_pipeline::ReferenceCertifiedSearchStatus::Complete => 0,
+                tonepoet_pipeline::ReferenceCertifiedSearchStatus::WorkLimited => 1,
+            }]);
+        }
+    }
+    let certificate_sha256 =
+        tonepoet_pipeline::Sha256Digest(evidence_hasher.finalize().into());
+    let reader_authority = match subject {
+        tonepoet_pipeline::ReferenceObservationSubject::ProtectedR64 => {
+            tonepoet_pipeline::qualification_schema::REFERENCE_R64_READER_ID
+        }
+        tonepoet_pipeline::ReferenceObservationSubject::TerminalQpcm => {
+            tonepoet_pipeline::qualification_schema::REFERENCE_QPCM_READER_ID
+        }
+    };
+    let observation = tonepoet_pipeline::ReferenceCertifiedPeakObservation {
+        id,
+        scope: tonepoet_pipeline::MeasurementScope::Plan,
+        purpose,
+        subject,
+        observer_identity:
+            tonepoet_pipeline::qualification_schema::reference_certified_observer_id(
+                TruePeakScanTier::Standard,
+            )
+            .to_string(),
+        reconstruction:
+            tonepoet_pipeline::qualification_schema::REFERENCE_CERTIFIED_RECONSTRUCTION
+                .to_string(),
+        edge_policy: tonepoet_pipeline::qualification_schema::REFERENCE_CERTIFIED_EDGE_POLICY
+            .to_string(),
+        scan_tier:
+            tonepoet_pipeline::qualification_schema::reference_certified_scan_tier_name(
+                TruePeakScanTier::Standard,
+            )
+            .to_string(),
+        authority_endpoint:
+            tonepoet_pipeline::qualification_schema::REFERENCE_CERTIFIED_AUTHORITY_ENDPOINT
+                .to_string(),
+        reader_authority: reader_authority.to_string(),
+        sample_rate_hz: 88_200,
+        channels: 2,
+        sample_frames: structure.sample_frames,
+        programme_sha256,
+        complete_reader: true,
+        result,
+        certificate_sha256,
+    };
+    observation
+        .validate_active_contract()
+        .expect("historical DC probe observation matches the active contract");
+
+    HistoricalDcCertifiedProbe {
+        observation,
+        sample_min,
+        sample_max,
+        first_sample,
+        last_sample,
+        unique_sample_bit_patterns,
+    }
+}
+
+fn certified_probe_interval_json(
+    observation: &tonepoet_pipeline::ReferenceCertifiedPeakObservation,
+) -> Value {
+    match observation.result {
+        tonepoet_pipeline::ReferenceCertifiedPeakResult::VerifiedSilence => serde_json::json!({
+            "kind": "verified_silence",
+            "lower_linear": 0.0,
+            "upper_linear": 0.0,
+        }),
+        tonepoet_pipeline::ReferenceCertifiedPeakResult::Finite {
+            point_linear_bits,
+            lower_linear_bits,
+            upper_linear_bits,
+            status,
+        } => serde_json::json!({
+            "kind": "finite",
+            "point_linear": f64::from_bits(point_linear_bits),
+            "lower_linear": f64::from_bits(lower_linear_bits),
+            "upper_linear": f64::from_bits(upper_linear_bits),
+            "status": format!("{status:?}"),
+        }),
+    }
 }
 
 fn qualify_common_reference_candidate_execution() -> Value {
@@ -2019,6 +2327,8 @@ fn qualify_common_reference_candidate_execution() -> Value {
 
     let mut settings = PipelineSettings::default();
     settings.dsd = tonepoet_pipeline::DsdSettings::reference();
+    settings.dsd.from_dsd.gain =
+        reference_auto_gain(DbNano::DEFAULT_REFERENCE_TRUE_PEAK_TARGET);
     settings.target_format = AudioFormat::Wav;
     settings.target_sample_rate = RateTarget::PcmHz(88_200);
     settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Float64);
@@ -2093,10 +2403,10 @@ fn qualify_common_reference_candidate_execution() -> Value {
     }), "Reference Q01 defaults must use the Standard certified tier");
 
     // Run the same candidate closure over a deterministic non-silent DSD
-    // programme. 0x00 is a legal one-bit stream with strong DC content, so it
-    // cannot collapse into the exact-zero shortcut under the Reference
-    // reconstruction. This guards against a qualification that proves only
-    // the silence fast path.
+    // programme. The fixture is a first-order one-bit sigma-delta modulation
+    // of channel-distinct audio-band tones, so it exercises ordinary DSD
+    // reconstruction and automatic gain without the pathological full-scale
+    // DC represented by a byte stream of 0x00.
     let non_silent_root = root.join("non-silent");
     let non_silent_materialize_root = non_silent_root.join("materialized");
     let non_silent_work = non_silent_root.join("work");
@@ -2105,7 +2415,7 @@ fn qualify_common_reference_candidate_execution() -> Value {
     fs::create_dir_all(&non_silent_work).expect("create non-silent candidate work root");
     let non_silent_source = non_silent_root.join("source.dsf");
     let non_silent_duration =
-        write_dsf_reference_fixture_with_byte(&non_silent_source, 2, 2_822_400, 0x00);
+        write_dsf_sigma_delta_tone_fixture(&non_silent_source, 2, 2_822_400);
     let non_silent_materialized = qualify_reference_source_materialization(
         &source_kind,
         &non_silent_source,
@@ -2158,13 +2468,72 @@ fn qualify_common_reference_candidate_execution() -> Value {
             observation.result,
             tonepoet_pipeline::ReferenceCertifiedPeakResult::Finite { .. }
         )
-    }), "0x00 Q01 fixture must exercise the ordinary non-silent certified path");
+    }), "sigma-delta Q01 fixture must exercise the ordinary non-silent certified path");
     assert!(non_silent_candidate.measurements.values().all(|observation| {
         observation.scan_tier
             == tonepoet_pipeline::qualification_schema::reference_certified_scan_tier_name(
                 TruePeakScanTier::Standard,
             )
     }));
+
+    assert!(
+        matches!(
+            non_silent_candidate.plan.gain_policy,
+            ResolvedGainPolicy::TruePeakNormalize {
+                target_dbtp,
+                scope: TruePeakScope::Track,
+                scan: TruePeakScanTier::Standard,
+                bound_gain: None,
+                ..
+            } if target_dbtp == DbNano::DEFAULT_REFERENCE_TRUE_PEAK_TARGET
+        ),
+        "non-silent Q01 must exercise track-scoped Reference automatic gain"
+    );
+
+    let non_silent_pre = non_silent_candidate
+        .measurements
+        .values()
+        .find(|observation| {
+            observation.subject
+                == tonepoet_pipeline::ReferenceObservationSubject::ProtectedR64
+                && observation.purpose == TruePeakPurpose::GainAuthority
+        })
+        .expect("non-silent candidate records protected-R64 gain authority");
+    let non_silent_gain = tonepoet_pipeline::resolve_reference_certified_gain(
+        non_silent_pre,
+        non_silent_candidate.plan.gain_policy,
+        tonepoet_true_peak::HQ1024V1_RECONSTRUCTION_LINF_GAIN_UPPER,
+    )
+    .expect("non-silent candidate automatic gain resolves from certified authority");
+    assert!(
+        non_silent_gain.selected_gain > DbNano::ZERO,
+        "low-level sigma-delta programme must exercise a positive automatic gain"
+    );
+    let non_silent_terminal = non_silent_candidate
+        .commands
+        .iter()
+        .find(|record| {
+            record.description.as_deref()
+                == Some("Apply one qualified Reference terminal realization")
+        })
+        .expect("non-silent candidate records the qualified terminal command");
+    let expected_gain_arg = non_silent_gain.selected_gain.render(true);
+    assert_eq!(
+        non_silent_terminal
+            .sanitized_args
+            .iter()
+            .filter(|arg| arg.as_str() == "gain")
+            .count(),
+        1,
+        "qualified terminal must realize exactly one gain scalar"
+    );
+    assert!(
+        non_silent_terminal.sanitized_args.windows(2).any(|pair| {
+            pair[0].as_str() == "gain" && pair[1].as_str() == expected_gain_arg.as_str()
+        }),
+        "qualified terminal must realize the certified automatic gain"
+    );
+
     assert_eq!(
         non_silent_candidate.plan.qualification_candidate_manifest_digest,
         candidate.plan.qualification_candidate_manifest_digest,
@@ -2193,9 +2562,12 @@ fn qualify_common_reference_candidate_execution() -> Value {
         "delivered_path_created": false,
         "staged_artifact": candidate.staged_artifact_path.display().to_string(),
         "measurement_count": candidate.measurements.len(),
-        "programmes_exercised": ["exact_silence_0x69", "non_silent_0x00"],
+        "programmes_exercised": ["exact_silence_0x69", "sigma_delta_stereo_tones"],
         "silent_programme_verified_silence": true,
         "non_silent_programme_verified_finite": true,
+        "non_silent_automatic_gain_applied": true,
+        "non_silent_gain_policy": "true_peak_normalize_track_standard",
+        "non_silent_selected_gain_db": non_silent_gain.selected_gain.render(false),
         "non_silent_measurement_count": non_silent_candidate.measurements.len(),
         "common_runtime_closure_fingerprint_sha256": candidate.common_runtime_closure_fingerprint_sha256,
         "metadata_mutation_closure_fingerprint_sha256": candidate.metadata_mutation_closure_fingerprint_sha256,
@@ -2204,6 +2576,277 @@ fn qualify_common_reference_candidate_execution() -> Value {
         "materialization_identity_digest": materialized.materialization_identity_digest.to_hex(),
         "production_refusal": promotion_error,
     })
+}
+
+
+fn qualify_historical_dc_root_cause_probe() -> Value {
+    let sox = required_tool(SOX_ENV);
+    let ffmpeg = required_tool(FFMPEG_ENV);
+    let temp = TempDir::new().expect("historical DC root-cause probe tempdir");
+    let root = temp.path().join("historical-dc-root-cause");
+    let materialize_root = root.join("materialized");
+    let work = root.join("work");
+    fs::create_dir_all(&materialize_root).expect("create historical DC materialization root");
+    fs::create_dir_all(&work).expect("create historical DC work root");
+
+    let source = root.join("source.dsf");
+    let source_duration =
+        write_dsf_reference_fixture_with_byte(&source, 2, 2_822_400, 0x00);
+    let source_kind = DsdSourceKind::DsfUncompressed;
+    let materialized = qualify_reference_source_materialization(
+        &source_kind,
+        &source,
+        &materialize_root,
+    )
+    .expect("historical DC source materialization");
+
+    // Preserve the former Q01 request exactly: Reference defaults, singleton
+    // programme, Float64 W64 at 88.2 kHz. Do not replace the default Album
+    // selection here; the singleton resolver itself must prove Track scope.
+    let mut settings = PipelineSettings::default();
+    settings.dsd = tonepoet_pipeline::DsdSettings::reference();
+    settings.target_format = AudioFormat::Wav;
+    settings.target_sample_rate = RateTarget::PcmHz(88_200);
+    settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Float64);
+    let delivered = root.join("candidate-delivered.w64");
+    let request = PlanRequest {
+        input_path: materialized.materialized_path.clone(),
+        output_path: delivered.clone(),
+        source: SourceInfo {
+            format: AudioFormat::Dsf,
+            codec: AudioCodec::Dsd,
+            sample_rate_hz: Some(2_822_400),
+            bit_depth: None,
+            true_source_depth: None,
+            source_representation: SourceRepresentationKind::Dsd,
+            sample_kind: Some(SampleKind::Dsd),
+            channels: Some(2),
+            duration: Some(source_duration),
+            frame_extent: None,
+            dsd_source_kind: Some(source_kind),
+            audio_md5: None,
+        },
+        settings,
+        plan_scope: tonepoet_pipeline::PlanScope::track("phase5-historical-dc-root-cause"),
+        intermediate_dir: Some(work),
+        container_ffmpeg_flags: Vec::new(),
+        resolved_output_target: Some(ResolvedOutputTarget::WavW64),
+        reference_programme_scope: ReferenceProgrammeScope::Singleton,
+        planned_riff_non_audio_upper_bound_bytes: Some(0),
+    };
+    let planned = plan_conversion(&request).expect("historical DC request plans");
+    let summary = planned
+        .reference
+        .expect("historical DC request admits Reference delivery");
+    assert!(
+        matches!(
+            summary.gain_policy,
+            ResolvedGainPolicy::TruePeakNormalize {
+                target_dbtp,
+                scope: TruePeakScope::Track,
+                scan: TruePeakScanTier::Standard,
+                bound_gain: None,
+                ..
+            } if target_dbtp == DbNano::DEFAULT_REFERENCE_TRUE_PEAK_TARGET
+        ),
+        "former 0x00 Q01 request must resolve singleton Auto to Track / Standard / -1 dBTP"
+    );
+
+    let tool_paths = HashMap::from([
+        ("sox".to_string(), sox.clone()),
+        ("ffmpeg".to_string(), ffmpeg.clone()),
+    ]);
+    let runner = RealToolRunner::new(tool_paths.clone());
+    let cancel = CancellationToken::new();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("historical DC root-cause runtime");
+    let execution = runtime.block_on(qualify_reference_common_candidate_execution(
+        &request,
+        &root,
+        &runner,
+        &cancel,
+        &tool_paths,
+    ));
+
+    let (execution_outcome, execution_error, commands) = match execution {
+        Ok(candidate) => (
+            "accepted",
+            None,
+            candidate.commands,
+        ),
+        Err(error) => {
+            let message = error.to_string();
+            assert!(
+                message.contains("Reference post-terminal acceptance failed"),
+                "historical DC probe must reach post-terminal acceptance before failing; got: {message}"
+            );
+            ("post_terminal_rejected", Some(message), error.commands)
+        }
+    };
+    assert!(
+        !delivered.exists(),
+        "historical DC candidate probe must remain nonpublishing"
+    );
+    assert!(summary.r64_path.is_file(), "historical DC probe retained protected R64");
+    assert!(summary.qpcm_path.is_file(), "historical DC probe retained terminal QPCM");
+
+    // Re-read the retained files independently after the common executor has
+    // returned. This reconstructs the missing authority chain even on the
+    // post-acceptance error path, where the executor intentionally returns
+    // CommandRecords but not its measurement map.
+    let pre = historical_dc_certified_w64_probe(
+        &summary.r64_path,
+        MeasurementId(1),
+        TruePeakPurpose::GainAuthority,
+        tonepoet_pipeline::ReferenceObservationSubject::ProtectedR64,
+    );
+    let gain_authority = tonepoet_pipeline::resolve_reference_certified_gain(
+        &pre.observation,
+        summary.gain_policy,
+        tonepoet_true_peak::HQ1024V1_RECONSTRUCTION_LINF_GAIN_UPPER,
+    )
+    .expect("historical DC gain resolves from the independently reconstructed authority");
+
+    let terminal = commands
+        .iter()
+        .find(|record| {
+            record.description.as_deref()
+                == Some("Apply one qualified Reference terminal realization")
+        })
+        .expect("historical DC failure retains the terminal CommandRecord");
+    let terminal_gain_args = terminal
+        .sanitized_args
+        .windows(2)
+        .filter_map(|pair| (pair[0].as_str() == "gain").then_some(pair[1].as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        terminal_gain_args.len(),
+        1,
+        "historical DC terminal realizes exactly one gain scalar"
+    );
+    let emitted_gain = terminal_gain_args[0]
+        .parse::<DbNano>()
+        .expect("historical DC terminal gain argument parses as DbNano");
+    assert_eq!(
+        emitted_gain, gain_authority.selected_gain,
+        "historical DC terminal must emit the exact selected gain authority"
+    );
+
+    let post = historical_dc_certified_w64_probe(
+        &summary.qpcm_path,
+        MeasurementId(2),
+        TruePeakPurpose::PostFinalAcceptance,
+        tonepoet_pipeline::ReferenceObservationSubject::TerminalQpcm,
+    );
+    let post_acceptance = tonepoet_pipeline::validate_reference_post_terminal_certified_peak(
+        &post.observation,
+        summary.gain_policy,
+    );
+    assert_eq!(
+        execution_outcome == "accepted",
+        post_acceptance.is_ok(),
+        "historical DC executor result must agree with the independently reconstructed post-terminal certificate"
+    );
+
+    let selected_gain_db = gain_authority.selected_gain.0 as f64 / 1_000_000_000.0;
+    let selected_gain_linear = 10.0_f64.powf(selected_gain_db / 20.0);
+    let scalar_predicted_min = pre.sample_min * selected_gain_linear;
+    let scalar_predicted_max = pre.sample_max * selected_gain_linear;
+    let scalar_predicts_sample_rail =
+        scalar_predicted_min <= -1.0 || scalar_predicted_max >= 1.0;
+    let qpcm_reaches_sample_rail = post.sample_min <= -1.0 || post.sample_max >= 1.0;
+    let root_cause_class = if qpcm_reaches_sample_rail && scalar_predicts_sample_rail {
+        "selected_gain_drives_sample_domain_clipping"
+    } else if qpcm_reaches_sample_rail {
+        "terminal_runtime_output_not_explained_by_selected_scalar"
+    } else {
+        "historical_full_scale_rail_not_reproduced"
+    };
+
+    let report = serde_json::json!({
+        "schema": "tonepoet-reference-historical-dc-root-cause/v1",
+        "status": "captured",
+        "historical_fixture": "write_dsf_reference_fixture_with_byte(..., 0x00)",
+        "execution_outcome": execution_outcome,
+        "execution_error": execution_error,
+        "resolved_gain_policy": {
+            "mode": "true_peak_normalize",
+            "target_dbtp": DbNano::DEFAULT_REFERENCE_TRUE_PEAK_TARGET.render(false),
+            "scope": "track",
+            "scan": "standard",
+            "bound_gain": null,
+        },
+        "protected_r64": {
+            "interval": certified_probe_interval_json(&pre.observation),
+            "sample_min": pre.sample_min,
+            "sample_max": pre.sample_max,
+            "first_sample": pre.first_sample,
+            "last_sample": pre.last_sample,
+            "unique_sample_bit_patterns": pre.unique_sample_bit_patterns,
+            "sample_frames": pre.observation.sample_frames,
+            "programme_sha256": pre.observation.programme_sha256.to_hex(),
+            "certificate_sha256": pre.observation.certificate_sha256.to_hex(),
+        },
+        "gain_authority": {
+            "requested_gain_db": gain_authority.requested_gain.render(false),
+            "selected_gain_db": gain_authority.selected_gain.render(false),
+            "ceiling_dbtp": gain_authority.ceiling.render(false),
+            "terminal_sample_error_linear": f64::from_bits(gain_authority.terminal_sample_error_linear_bits),
+            "terminal_reconstructed_error_linear": f64::from_bits(gain_authority.terminal_reconstructed_error_linear_bits),
+            "maximum_linear_gain": gain_authority.maximum_linear_gain_bits.map(f64::from_bits),
+            "reduced_for_ceiling": gain_authority.reduced_for_ceiling,
+        },
+        "terminal": {
+            "emitted_gain_db": terminal_gain_args[0],
+            "sanitized_args": terminal.sanitized_args.clone(),
+            "exit": format!("{:?}", terminal.exit),
+        },
+        "scalar_model": {
+            "selected_gain_linear": selected_gain_linear,
+            "predicted_sample_min": scalar_predicted_min,
+            "predicted_sample_max": scalar_predicted_max,
+            "predicts_sample_rail": scalar_predicts_sample_rail,
+        },
+        "terminal_qpcm": {
+            "interval": certified_probe_interval_json(&post.observation),
+            "sample_min": post.sample_min,
+            "sample_max": post.sample_max,
+            "first_sample": post.first_sample,
+            "last_sample": post.last_sample,
+            "unique_sample_bit_patterns": post.unique_sample_bit_patterns,
+            "sample_frames": post.observation.sample_frames,
+            "programme_sha256": post.observation.programme_sha256.to_hex(),
+            "certificate_sha256": post.observation.certificate_sha256.to_hex(),
+            "post_terminal_acceptance": match post_acceptance {
+                Ok(()) => "accepted".to_string(),
+                Err(error) => format!("rejected: {error}"),
+            },
+        },
+        "root_cause_class": root_cause_class,
+        "qpcm_reaches_sample_rail": qpcm_reaches_sample_rail,
+        "terminal_gain_matches_selected_authority": true,
+    });
+    eprintln!(
+        "HISTORICAL_DC_ROOT_CAUSE_PROBE={} ",
+        serde_json::to_string_pretty(&report).expect("serialize historical DC root-cause report")
+    );
+    report
+}
+
+#[test]
+fn historical_dc_root_cause_probe_captures_authority_chain() {
+    if !selected() {
+        eprintln!(
+            "skipping historical DC root-cause probe; set {GATE}=1 to run the pinned real-tool reproduction"
+        );
+        return;
+    }
+
+    let report = qualify_historical_dc_root_cause_probe();
+    assert_eq!(report["status"], "captured");
+    assert_eq!(report["terminal_gain_matches_selected_authority"], true);
 }
 
 fn qualify_q02_common_closure_binding(common_candidate_execution: &Value) -> Value {
@@ -3070,6 +3713,14 @@ fn assert_production_plan_structure(
     }
 
     let mut settings = PipelineSettings::default();
+    // The package lowering reads the encoder level from settings; carry the
+    // level the planned cell recorded so the emitted argv is the cell's, not
+    // the default's.
+    match (summary.target, summary.package_compression_level) {
+        (ResolvedOutputTarget::FlacNative, Some(level)) => settings.flac.compression_level = level,
+        (ResolvedOutputTarget::WavPackNative, Some(level)) => settings.wavpack.mode = wavpack_mode(level),
+        _ => {}
+    }
     settings.target_format = match summary.target {
         ResolvedOutputTarget::FlacNative => AudioFormat::Flac,
         ResolvedOutputTarget::WavPackNative => AudioFormat::WavPack,
@@ -4398,7 +5049,8 @@ fn qualify_lossless_package_cells(
                         }
                         let dither_tail: &[&str] = match depth {
                             PcmBitDepth::Int24 => &["dither"],
-                            PcmBitDepth::Float32 | PcmBitDepth::Float64 => &[],
+                            // Int32 Reference terminals carry no dither (production rule).
+                            PcmBitDepth::Int32 | PcmBitDepth::Float32 | PcmBitDepth::Float64 => &[],
                             _ => unreachable!(),
                         };
                         if dither_tail.is_empty() {
@@ -4522,11 +5174,49 @@ fn qualify_lossless_package_cells(
                             assert_eq!(metadata_error.to_string(), rejection);
                             w64_metadata_entry_rejection_count += 1;
                         } else {
+                            // RF64's FFmpeg INFO carrier persists only TITLE, ARTIST, ALBUM,
+                            // GENRE, DATE, TRACKNUMBER (with TRACKTOTAL), COMMENT, and
+                            // COPYRIGHT; production refuses the rest fail-closed. Prove the
+                            // refusal on the full set, then mutate with the supported subset.
+                            let (cell_track_metadata, cell_album_metadata) =
+                                if target == ResolvedOutputTarget::WavRf64 {
+                                    let refusal = runtime
+                                        .block_on(qualify_production_metadata_mutation(
+                                            packaged,
+                                            &track_metadata,
+                                            &album_metadata,
+                                            &metadata_runner,
+                                            &CancellationToken::new(),
+                                        ))
+                                        .expect_err("RF64 must refuse metadata its carrier cannot preserve");
+                                    assert_eq!(
+                                        refusal.to_string(),
+                                        "RF64's current FFmpeg metadata carrier cannot preserve requested ALBUMARTIST metadata",
+                                    );
+                                    let mut track = track_metadata.clone();
+                                    track.album_artist = None::<String>.into();
+                                    track.composer = None::<String>.into();
+                                    track.performer = None::<String>.into();
+                                    track.arranger = None::<String>.into();
+                                    track.disc_number = None;
+                                    track.isrc = None;
+                                    track.publisher = None;
+                                    track.pre_emphasis = false;
+                                    track.extra.clear();
+                                    let mut album = album_metadata.clone();
+                                    album.album_artist = None::<String>.into();
+                                    album.total_discs = None;
+                                    album.disc_number = None;
+                                    album.extra.clear();
+                                    (track, album)
+                                } else {
+                                    (track_metadata.clone(), album_metadata.clone())
+                                };
                             let outcome = runtime
                                 .block_on(qualify_production_metadata_mutation(
                                     packaged,
-                                    &track_metadata,
-                                    &album_metadata,
+                                    &cell_track_metadata,
+                                    &cell_album_metadata,
                                     &metadata_runner,
                                     &CancellationToken::new(),
                                 ))
@@ -6112,6 +6802,7 @@ fn complete_p0_reference_qualification_report() {
     let decode_route_table = qualification_decode_route_table_evidence();
     let default_settings_live_smoke = qualify_default_settings_dsd64_dsf_to_flac();
     let common_candidate_execution = qualify_common_reference_candidate_execution();
+    let historical_dc_root_cause = qualify_historical_dc_root_cause_probe();
     let runtime_closure_fingerprint_sha256 = common_candidate_execution
         ["common_runtime_closure_fingerprint_sha256"]
         .as_str()
@@ -6227,6 +6918,7 @@ fn complete_p0_reference_qualification_report() {
     let real_tool_candidate_evidence = serde_json::json!({
         "status": "passed",
         "common_candidate_execution": common_candidate_execution,
+        "historical_dc_root_cause": historical_dc_root_cause,
         "default_general_processing_smoke": default_settings_live_smoke,
         "subprocess_environment_probe": environment_probe_results,
         "source_front_end": source_front_end_results,

@@ -31991,8 +31991,17 @@ pub(super) fn scan_reference_w64_certified_peak(
                 }
             }
             (tonepoet_pipeline::W64SampleEncoding::FloatingPoint, 64) => {
+                // Pinned SoX-ng Wave64 stores Float64 sample payloads in its
+                // signed-Q1.31 numeric scale: a stored value of 2^31 is full
+                // scale. Convert that exact power-of-two representation to
+                // the normalized full-scale domain consumed by the certified
+                // meter. Float32 Wave64 uses normalized storage and must not
+                // take this conversion.
+                const SOX_FLOAT64_W64_Q31_TO_FS: f64 = 1.0 / 2_147_483_648.0;
                 for raw in bytes[..count].chunks_exact(8) {
-                    samples.push(f64::from_le_bytes(raw.try_into().expect("8-byte Float64 sample")));
+                    let stored =
+                        f64::from_le_bytes(raw.try_into().expect("8-byte Float64 sample"));
+                    samples.push(stored * SOX_FLOAT64_W64_Q31_TO_FS);
                 }
             }
             _ => unreachable!("sample representation was admitted above"),
