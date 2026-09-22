@@ -1001,7 +1001,10 @@ pub const fn typed_b6_profile() -> ResolvedDsdProfile {
 pub enum ReferenceDither {
     /// No dither for floating point.
     None,
-    /// Plain SoX TPDF for Int24.
+    /// Plain triangular PDF dither for qualified integer terminals.
+    ///
+    /// Int24 is realized by SoX-ng. Int32 is realized by the commissioned
+    /// FFmpeg/libswresample double-to-S32 triangular terminal.
     Tpdf,
     /// SoX Shibata for Int16.
     Shibata,
@@ -1517,8 +1520,8 @@ pub fn reference_decode_authority(
         )));
     }
     let expected_dither = match contract.bit_depth {
-        PcmBitDepth::Int24 => ReferenceDither::Tpdf,
-        PcmBitDepth::Int32 | PcmBitDepth::Float32 | PcmBitDepth::Float64 => ReferenceDither::None,
+        PcmBitDepth::Int24 | PcmBitDepth::Int32 => ReferenceDither::Tpdf,
+        PcmBitDepth::Float32 | PcmBitDepth::Float64 => ReferenceDither::None,
         PcmBitDepth::Int8 | PcmBitDepth::Int16 => {
             return Err(ReferenceDecodeAuthorityError::new(format!(
                 "Reference v7 has no decoded-sample route for {:?}",
@@ -2478,9 +2481,9 @@ pub fn terminal_realization_bound(
         PcmBitDepth::Int24 => (2_199_023_255_552, -1_010_002_327, "int24-tpdf-2lsb"),
         PcmBitDepth::Float32 => (1_099_511_627_776, -1_010_001_164, "float32-2^-23"),
         PcmBitDepth::Int32 => (
-            2_147_483_648,
-            -1_010_000_003,
-            "int32-sox-s32-effects-half-lsb",
+            8_589_940_737,
+            -1_010_000_010,
+            "int32-ffmpeg-triangular-2lsb-plus-f64-scalar-2^-51",
         ),
         PcmBitDepth::Float64 => (
             2_147_487_744,
@@ -3299,6 +3302,14 @@ pub(crate) fn resolve_reference_static_admission(
         ));
     }
     let depth = resolve_reference_depth(request.settings.target_bit_depth)?;
+    if depth == PcmBitDepth::Int32
+        && !crate::semantic_plan::ffmpeg_int32_triangular_terminal_commissioned_for_current_arch()
+    {
+        return Err(invalid_reference(
+            "target_bit_depth",
+            ReferenceErrorCode::Toolchain,
+        ));
+    }
     if !target.is_p0_reference_lossless() {
         return Err(invalid_target_depth("resolved_output_target", target, depth));
     }
@@ -3344,8 +3355,8 @@ pub(crate) fn resolve_reference_static_admission(
                     ReferenceErrorCode::Int16TerminalUnqualified,
                 ));
             }
-            PcmBitDepth::Int24 => ReferenceDither::Tpdf,
-            PcmBitDepth::Int32 | PcmBitDepth::Float32 | PcmBitDepth::Float64 => ReferenceDither::None,
+            PcmBitDepth::Int24 | PcmBitDepth::Int32 => ReferenceDither::Tpdf,
+            PcmBitDepth::Float32 | PcmBitDepth::Float64 => ReferenceDither::None,
             PcmBitDepth::Int8 => {
                 return Err(invalid_terminal_depth("target_bit_depth", depth));
             }
@@ -3427,7 +3438,7 @@ pub(crate) fn plan_reference_dsd_with_common_hash(
         source_rate,
         channels,
         target,
-        depth: _,
+        depth,
         target_rate_hz,
         profile,
         front_end,
@@ -3517,6 +3528,9 @@ pub(crate) fn plan_reference_dsd_with_common_hash(
     });
     let scratch_paths = reference_scratch_paths(request)?;
     let mut cleanup_paths = vec![r64.clone(), qpcm.clone()];
+    if depth == PcmBitDepth::Int32 {
+        cleanup_paths.push(reference_int32_normalized_carrier_path(&qpcm));
+    }
     cleanup_paths.extend(scratch_paths.all().into_iter().map(Path::to_path_buf));
     if final_work != request.output_path {
         cleanup_paths.push(final_work.clone());
@@ -3632,8 +3646,156 @@ fn build_render_command(
     command
 }
 
+/// Int32 Reference terminal lowering. The SoX-ng reader removes the Wave64
+/// Q1.31 transport scale without applying gain or quantization. The production
+/// executor then applies `selected_gain` with the certified binary64 scalar
+/// pump and feeds the resulting true-scale f64le stream to the commissioned
+/// FFmpeg/libswresample Float64-to-S32 triangular terminal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReferenceInt32TpdfTerminalLowering {
+    /// Exact SoX-ng Wave64-to-true-scale-f64le normalization command.
+    pub normalize_carrier: PlannedCommand,
+    /// Commissioned FFmpeg triangular-dither terminal command.
+    pub terminal: PlannedCommand,
+    /// Planner-owned raw Float64 carrier consumed by the certified scalar pump.
+    pub normalized_carrier_path: PathBuf,
+    /// The one selected gain scalar applied by the certified scalar pump.
+    pub selected_gain: DbNano,
+    /// Exact final PCM contract bound to this lowering.
+    pub contract: FinalPcmContract,
+}
+
+/// Physical lowering selected for the one Reference terminal realization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReferenceTerminalLowering {
+    /// One SoX-ng terminal command for Int24/Float32/Float64.
+    Command(PlannedCommand),
+    /// SoX-ng true-scale bridge + in-process certified scalar + commissioned
+    /// FFmpeg triangular Int32 terminal.
+    Int32Tpdf(ReferenceInt32TpdfTerminalLowering),
+}
+
+fn reference_int32_normalized_carrier_path(output: &Path) -> PathBuf {
+    let mut path = output.as_os_str().to_os_string();
+    path.push(".reference-int32-carrier.f64le");
+    PathBuf::from(path)
+}
+
+fn lower_reference_int32_tpdf_terminal(
+    input: &Path,
+    output: &Path,
+    contract: FinalPcmContract,
+    selected_gain: DbNano,
+) -> Result<ReferenceInt32TpdfTerminalLowering> {
+    if contract.bit_depth != PcmBitDepth::Int32
+        || contract.sample_kind != SampleKind::SignedInteger
+        || contract.dither != ReferenceDither::Tpdf
+        || contract.sample_rate_hz == 0
+        || contract.channels == 0
+    {
+        return Err(PlanningError::invalid_settings(
+            "target_bit_depth",
+            "Reference Int32 TPDF terminal lowering requires a nonzero signed-Int32 TPDF contract",
+        ));
+    }
+    if !crate::semantic_plan::ffmpeg_int32_triangular_terminal_commissioned_for_current_arch() {
+        return Err(invalid_reference(
+            "target_bit_depth",
+            ReferenceErrorCode::Toolchain,
+        ));
+    }
+
+    let normalized_carrier_path = reference_int32_normalized_carrier_path(output);
+    let mut normalize_carrier = PlannedCommand::new(
+        ToolIdentifier::Sox,
+        vec![
+            "-S".to_string(),
+            "-D".to_string(),
+            input.display().to_string(),
+            "-t".to_string(),
+            "raw".to_string(),
+            "-e".to_string(),
+            "floating-point".to_string(),
+            "-b".to_string(),
+            "64".to_string(),
+            "-L".to_string(),
+            normalized_carrier_path.display().to_string(),
+        ],
+        InputSource::Path(input.to_path_buf()),
+        OutputSink::Path(normalized_carrier_path.clone()),
+        None,
+        "Normalize protected Reference Wave64 to true-scale Float64 carrier",
+    );
+    normalize_carrier.environment_policy = CommandEnvironmentPolicy::ClearAndSet;
+    normalize_carrier.environment = reference_command_environment();
+
+    let filter = format!(
+        "aresample=resampler=soxr:out_sample_rate={}:precision=33:cutoff=0.95:dither_method=triangular:out_sample_fmt=s32",
+        contract.sample_rate_hz,
+    );
+    let mut terminal = PlannedCommand::new(
+        ToolIdentifier::Ffmpeg,
+        vec![
+            "-y".to_string(),
+            "-hide_banner".to_string(),
+            "-nostdin".to_string(),
+            "-f".to_string(),
+            "f64le".to_string(),
+            "-ar".to_string(),
+            contract.sample_rate_hz.to_string(),
+            "-ac".to_string(),
+            contract.channels.to_string(),
+            "-i".to_string(),
+            normalized_carrier_path.display().to_string(),
+            "-map".to_string(),
+            "0:a:0".to_string(),
+            "-map_metadata".to_string(),
+            "-1".to_string(),
+            "-vn".to_string(),
+            "-af".to_string(),
+            filter,
+            "-c:a".to_string(),
+            "pcm_s32le".to_string(),
+            output.display().to_string(),
+        ],
+        InputSource::Path(normalized_carrier_path.clone()),
+        OutputSink::Path(output.to_path_buf()),
+        None,
+        format!(
+            "Apply certified Reference scalar {} then commissioned FFmpeg Int32 triangular terminal",
+            selected_gain.render(true),
+        ),
+    );
+    terminal.environment_policy = CommandEnvironmentPolicy::ClearAndSet;
+    terminal.environment = reference_command_environment();
+
+    Ok(ReferenceInt32TpdfTerminalLowering {
+        normalize_carrier,
+        terminal,
+        normalized_carrier_path,
+        selected_gain,
+        contract,
+    })
+}
+
 /// Lower the one admitted Reference terminal realization from protected R64
 /// to QPCM after the common gain decision has produced an exact scalar.
+pub fn lower_reference_terminal(
+    input: &Path,
+    output: &Path,
+    contract: FinalPcmContract,
+    selected_gain: DbNano,
+) -> Result<ReferenceTerminalLowering> {
+    if contract.bit_depth == PcmBitDepth::Int32 {
+        return lower_reference_int32_tpdf_terminal(input, output, contract, selected_gain)
+            .map(ReferenceTerminalLowering::Int32Tpdf);
+    }
+    lower_reference_terminal_command(input, output, contract, selected_gain)
+        .map(ReferenceTerminalLowering::Command)
+}
+
+/// Lower the admitted one-command SoX-ng Reference terminal. Int32 is excluded
+/// because its qualified TPDF realization uses the commissioned FFmpeg terminal.
 pub fn lower_reference_terminal_command(
     input: &Path,
     output: &Path,
@@ -3642,9 +3804,14 @@ pub fn lower_reference_terminal_command(
 ) -> Result<PlannedCommand> {
     let (encoding, bits) = match contract.bit_depth {
         PcmBitDepth::Int24 => ("signed-integer", "24"),
-        PcmBitDepth::Int32 => ("signed-integer", "32"),
         PcmBitDepth::Float32 => ("floating-point", "32"),
         PcmBitDepth::Float64 => ("floating-point", "64"),
+        PcmBitDepth::Int32 => {
+            return Err(PlanningError::invalid_settings(
+                "target_bit_depth",
+                "Reference Int32 is lowered by lower_reference_terminal through the commissioned FFmpeg TPDF terminal",
+            ));
+        }
         PcmBitDepth::Int16 => {
             return Err(invalid_reference(
                 "target_bit_depth",
@@ -4313,7 +4480,7 @@ mod tests {
             channels: 2,
             sample_kind: bit_depth.sample_kind(),
             bit_depth,
-            dither: if bit_depth == PcmBitDepth::Int24 {
+            dither: if matches!(bit_depth, PcmBitDepth::Int24 | PcmBitDepth::Int32) {
                 ReferenceDither::Tpdf
             } else {
                 ReferenceDither::None
@@ -6207,6 +6374,99 @@ mod tests {
     }
 
     #[test]
+    fn int32_reference_terminal_uses_true_scale_bridge_scalar_and_commissioned_ffmpeg_tpdf() {
+        let contract = decode_contract(PcmBitDepth::Int32);
+        let lowering = lower_reference_terminal(
+            Path::new("protected.w64"),
+            Path::new("terminal.w64"),
+            contract,
+            DbNano(1_250_000_000),
+        );
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            let ReferenceTerminalLowering::Int32Tpdf(lowering) = lowering
+                .expect("commissioned x86_64 Int32 terminal lowers")
+            else {
+                panic!("Int32 must use the dedicated TPDF lowering");
+            };
+            assert_eq!(lowering.selected_gain, DbNano(1_250_000_000));
+            assert_eq!(lowering.contract, contract);
+            assert_eq!(lowering.normalize_carrier.tool, ToolIdentifier::Sox);
+            assert_eq!(
+                lowering.normalize_carrier.args,
+                [
+                    "-S",
+                    "-D",
+                    "protected.w64",
+                    "-t",
+                    "raw",
+                    "-e",
+                    "floating-point",
+                    "-b",
+                    "64",
+                    "-L",
+                    "terminal.w64.reference-int32-carrier.f64le",
+                ]
+                .map(str::to_string),
+            );
+
+            assert_eq!(lowering.terminal.tool, ToolIdentifier::Ffmpeg);
+            assert_eq!(
+                lowering.terminal.args,
+                [
+                    "-y",
+                    "-hide_banner",
+                    "-nostdin",
+                    "-f",
+                    "f64le",
+                    "-ar",
+                    "88200",
+                    "-ac",
+                    "2",
+                    "-i",
+                    "terminal.w64.reference-int32-carrier.f64le",
+                    "-map",
+                    "0:a:0",
+                    "-map_metadata",
+                    "-1",
+                    "-vn",
+                    "-af",
+                    "aresample=resampler=soxr:out_sample_rate=88200:precision=33:cutoff=0.95:dither_method=triangular:out_sample_fmt=s32",
+                    "-c:a",
+                    "pcm_s32le",
+                    "terminal.w64",
+                ]
+                .map(str::to_string),
+            );
+
+            let request = reference_request(
+                DsdRate::Dsd64,
+                88_200,
+                ResolvedOutputTarget::WavW64,
+                PcmBitDepth::Int32,
+                DsdReconstructionSelection::Reference,
+            );
+            let plan = plan_reference_dsd(&request).expect("commissioned Int32 plan");
+            let summary = plan.reference.as_ref().expect("Reference summary");
+            assert!(plan
+                .cleanup_paths()
+                .contains(&reference_int32_normalized_carrier_path(&summary.qpcm_path)));
+
+            assert!(lower_reference_terminal_command(
+                Path::new("protected.w64"),
+                Path::new("terminal.w64"),
+                contract,
+                DbNano::ZERO,
+            )
+            .is_err());
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
+        assert!(lowering.is_err(), "uncommissioned architectures fail closed");
+    }
+
+    #[test]
     fn terminal_bound_identity_is_rate_specific_and_numerically_conservative() {
         let low = terminal_realization_bound(44_100, PcmBitDepth::Int24);
         let high = terminal_realization_bound(768_000, PcmBitDepth::Int24);
@@ -6220,11 +6480,12 @@ mod tests {
     }
 
     #[test]
-    fn v9_inherits_corrected_float64_effects_bound_and_preserves_other_terminal_bounds() {
+    fn v17_preserves_existing_bounds_and_adds_qualified_int32_tpdf_bound() {
         assert_eq!(DbNano::POST_FINAL_ACCEPTANCE_RESERVE, DbNano(10_000_000));
         let cases = [
             (PcmBitDepth::Int24, 2_199_023_255_552_u64, -1_010_002_327_i64),
             (PcmBitDepth::Float32, 1_099_511_627_776_u64, -1_010_001_164_i64),
+            (PcmBitDepth::Int32, 8_589_940_737_u64, -1_010_000_010_i64),
             (PcmBitDepth::Float64, 2_147_487_744_u64, -1_010_000_003_i64),
         ];
         for (depth, expected_q63, expected_safe) in cases {

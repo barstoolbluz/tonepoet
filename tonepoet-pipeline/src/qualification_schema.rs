@@ -511,7 +511,7 @@ pub const REFERENCE_METADATA_MUTATION_ID: &str = "tonepoet:reference_metadata_mu
 /// Post-mutation decoded-sample identity authority.
 pub const REFERENCE_POST_METADATA_IDENTITY_ID: &str = "tonepoet:reference_post_metadata_sample_identity/v16";
 /// Reference terminal-realization authority using the common linear error calculus.
-pub const REFERENCE_TERMINAL_ID: &str = "tonepoet:reference_terminal_realization/hq1024_linear_error/v1";
+pub const REFERENCE_TERMINAL_ID: &str = "tonepoet:reference_terminal_realization/hq1024_linear_error/v2";
 /// Candidate declaration: concrete numerical source digest is supplied by the build closure.
 pub const REFERENCE_NUMERICAL_SOURCE_BINDING: &str =
     "build-bound:TONEPOET_TRUE_PEAK_SOURCE_SHA256/v1";
@@ -623,11 +623,14 @@ impl ReferenceCommonPrimitiveClosureV1 {
             reader_decode_implementation: format!(
                 "{REFERENCE_R64_READER_ID}+{REFERENCE_QPCM_READER_ID}"
             ),
-            tool_identity_version_closure:
-                "sox-ng-14.8.0.1+ffmpeg-qualified-v16+phase4-native-metadata".to_string(),
+            tool_identity_version_closure: format!(
+                "sox-ng-14.8.0.1+{}+phase4-native-metadata",
+                crate::FFMPEG_INT32_TRIANGULAR_TERMINAL_AUTHORITY_ID,
+            ),
             reconstruction_profile: "sealed-reference-profile-matrix-v16".to_string(),
             terminal_implementation: REFERENCE_TERMINAL_ID.to_string(),
-            dither_quantization_policy: "sealed-reference-terminal-depth-policy-v16".to_string(),
+            dither_quantization_policy:
+                "sealed-reference-terminal-depth-policy-v17-int32-ffmpeg-triangular-tpdf".to_string(),
             metadata_writer_route: REFERENCE_METADATA_MUTATION_ID.to_string(),
             post_mutation_checks: REFERENCE_POST_METADATA_IDENTITY_ID.to_string(),
             simd_implementation: REFERENCE_SIMD_BINDING.to_string(),

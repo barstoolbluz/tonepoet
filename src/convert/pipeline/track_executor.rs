@@ -2359,6 +2359,7 @@ pub(crate) async fn execute_planned_track_conversion_with_scalar_pump(
                         summary,
                         &plan_request,
                         Some(&track.source_ref),
+                        reference_toolchain.as_ref(),
                         runner,
                         cancel,
                         tool_paths,
@@ -2827,9 +2828,11 @@ struct EmbeddedQualifiedSox {
 #[serde(deny_unknown_fields)]
 struct EmbeddedQualifiedFfmpeg {
     major_version: u32,
+    version: String,
     package_attribute: String,
     nixpkgs_revision: String,
     nixpkgs_nar_hash: String,
+    int32_triangular_terminal_authority: String,
     required_probe_markers: Vec<String>,
 }
 
@@ -3084,6 +3087,7 @@ struct EmbeddedTerminalBounds {
     post_final_acceptance_reserve_basis: String,
     int16_shibata: EmbeddedTerminalBound,
     int24_tpdf: EmbeddedTerminalBound,
+    int32_tpdf: EmbeddedTerminalBound,
     float32: EmbeddedTerminalBound,
     float64: EmbeddedTerminalBound,
 }
@@ -5860,6 +5864,11 @@ fn validate_embedded_reference_policy_tables(
             &manifest.terminal_bounds.int24_tpdf,
         ),
         (
+            "int32_tpdf",
+            PcmBitDepth::Int32,
+            &manifest.terminal_bounds.int32_tpdf,
+        ),
+        (
             "float32",
             PcmBitDepth::Float32,
             &manifest.terminal_bounds.float32,
@@ -5897,9 +5906,10 @@ fn validate_embedded_reference_policy_tables(
         let expected_realization = match depth {
             PcmBitDepth::Int16 => "int16-shibata-unqualified-no-conservative-bound",
             PcmBitDepth::Int24 => "int24-tpdf-2lsb",
+            PcmBitDepth::Int32 => "int32-ffmpeg-triangular-2lsb-plus-f64-scalar-2^-51",
             PcmBitDepth::Float32 => "float32-2^-23",
             PcmBitDepth::Float64 => "float64-sox-s32-effects-half-lsb-plus-f64-2^-51",
-            PcmBitDepth::Int8 | PcmBitDepth::Int32 => {
+            PcmBitDepth::Int8 => {
                 return Err(reference_toolchain_error(
                     "compiled terminal-bound table contains an unsupported depth",
                 ));
@@ -6737,9 +6747,12 @@ async fn attest_reference_toolchain(
 
     let (locked_nixpkgs_revision, locked_nixpkgs_nar_hash) = embedded_flake_lock_input("nixpkgs")?;
     if manifest.ffmpeg.major_version != 7
+        || manifest.ffmpeg.version != "7.1.3"
         || manifest.ffmpeg.package_attribute != "ffmpeg_7-full"
         || manifest.ffmpeg.nixpkgs_revision != locked_nixpkgs_revision
         || manifest.ffmpeg.nixpkgs_nar_hash != locked_nixpkgs_nar_hash
+        || manifest.ffmpeg.int32_triangular_terminal_authority
+            != tonepoet_pipeline::FFMPEG_INT32_TRIANGULAR_TERMINAL_AUTHORITY_ID
     {
         return Err(reference_toolchain_error(
             "the embedded FFmpeg package lock does not match the immutable policy",
@@ -6818,7 +6831,7 @@ async fn attest_reference_toolchain(
     .await?;
     let ffmpeg = attest_external_reference_tool(
         ToolBinary::Ffmpeg,
-        "",
+        &manifest.ffmpeg.version,
         Some(manifest.ffmpeg.major_version),
         &manifest.ffmpeg.required_probe_markers,
         runner,
@@ -8315,10 +8328,150 @@ fn reference_cancelled_error() -> TrackExecutionError {
     TrackExecutionError::new(ConvertError::Realize("cancelled".to_string()), Vec::new())
 }
 
+async fn execute_reference_terminal_lowering(
+    lowering: &tonepoet_pipeline::ReferenceTerminalLowering,
+    sample_frames: u64,
+    reference_toolchain: Option<&ReferenceToolchainEvidence>,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_paths: &HashMap<String, PathBuf>,
+    tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
+    progress: &mut OperationProgressTracker<'_>,
+    start_fraction: f32,
+    end_fraction: f32,
+    track_label: String,
+) -> Result<Vec<CommandRecord>, TrackExecutionError> {
+    match lowering {
+        tonepoet_pipeline::ReferenceTerminalLowering::Command(command) => {
+            execute_commands(
+                std::slice::from_ref(command),
+                None,
+                runner,
+                cancel,
+                tool_paths,
+                tool_concurrency_limits,
+                progress,
+                start_fraction,
+                end_fraction,
+                track_label,
+            )
+            .await
+        }
+        tonepoet_pipeline::ReferenceTerminalLowering::Int32Tpdf(int32) => {
+            let midpoint = start_fraction + (end_fraction - start_fraction) * 0.35;
+            let mut records = execute_commands(
+                std::slice::from_ref(&int32.normalize_carrier),
+                None,
+                runner,
+                cancel,
+                tool_paths,
+                tool_concurrency_limits.clone(),
+                progress,
+                start_fraction,
+                midpoint,
+                track_label.clone(),
+            )
+            .await?;
+
+            let frame_bytes = u64::from(int32.contract.channels)
+                .checked_mul(std::mem::size_of::<f64>() as u64)
+                .ok_or_else(|| {
+                    TrackExecutionError::new(
+                        ConvertError::Backend(
+                            "Reference Int32 scalar-pump frame size overflowed".to_string(),
+                        ),
+                        records.clone(),
+                    )
+                })?;
+            let expected_bytes = sample_frames.checked_mul(frame_bytes).ok_or_else(|| {
+                TrackExecutionError::new(
+                    ConvertError::Backend(
+                        "Reference Int32 scalar-pump extent overflowed".to_string(),
+                    ),
+                    records.clone(),
+                )
+            })?;
+            let actual_bytes = fs::metadata(&int32.normalized_carrier_path)
+                .map_err(|error| {
+                    TrackExecutionError::new(
+                        ConvertError::Backend(format!(
+                            "Reference Int32 true-scale carrier metadata failed: {error}"
+                        )),
+                        records.clone(),
+                    )
+                })?
+                .len();
+            if expected_bytes == 0 || actual_bytes != expected_bytes {
+                return Err(TrackExecutionError::new(
+                    ConvertError::Backend(format!(
+                        "Reference Int32 true-scale carrier extent mismatch: expected {expected_bytes} bytes, found {actual_bytes}"
+                    )),
+                    records,
+                ));
+            }
+            let expected_sha256 = stable_file_sha256(&int32.normalized_carrier_path).map_err(|error| {
+                TrackExecutionError::new(
+                    ConvertError::Backend(format!(
+                        "Reference Int32 true-scale carrier hash failed: {error}"
+                    )),
+                    records.clone(),
+                )
+            })?;
+            let pump = RetainedPcmScalarPump {
+                input_path: int32.normalized_carrier_path.clone(),
+                sample_rate_hz: int32.contract.sample_rate_hz,
+                channels: int32.contract.channels,
+                gain_db: int32.selected_gain,
+                expected_bytes,
+                expected_sha256,
+            };
+            let toolchain = reference_toolchain.ok_or_else(|| {
+                TrackExecutionError::new(
+                    ConvertError::Backend(
+                        "Reference Int32 TPDF terminal requires an attested FFmpeg toolchain"
+                            .to_string(),
+                    ),
+                    records.clone(),
+                )
+            })?;
+            let bound_terminal = QualifiedTerminalExecutableBinding {
+                command_index: 0,
+                executable: BoundToolExecutable {
+                    canonical_path: toolchain.ffmpeg.canonical_path.clone(),
+                    executable_sha256: toolchain.ffmpeg.executable_sha256,
+                },
+            };
+            let mut terminal_records = execute_commands_with_scalar_pump(
+                std::slice::from_ref(&int32.terminal),
+                pump,
+                Some(&bound_terminal),
+                runner,
+                cancel,
+                tool_paths,
+                tool_concurrency_limits,
+                progress,
+                midpoint,
+                end_fraction,
+                track_label,
+            )
+            .await
+            .map_err(|mut error| {
+                let mut all = records.clone();
+                all.append(&mut error.commands);
+                error.commands = all;
+                error
+            })?;
+            records.append(&mut terminal_records);
+            Ok(records)
+        }
+    }
+}
+
 async fn execute_reference_common_plan(
     summary: &DsdReferencePlanSummary,
     plan_request: &PlanRequest,
     source_ref: Option<&TrackSourceRef>,
+    reference_toolchain: Option<&ReferenceToolchainEvidence>,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     tool_paths: &HashMap<String, PathBuf>,
@@ -8575,7 +8728,10 @@ async fn execute_reference_common_plan(
     })?;
 
     // 5. One terminal gain/dither/format realization into authoritative QPCM.
-    let terminal = tonepoet_pipeline::lower_reference_terminal_command(
+    // Int32 uses the commissioned FFmpeg triangular terminal on a true-scale
+    // Float64 carrier; the one gain scalar is applied by the same certified
+    // in-process binary64 pump used by the retained FFmpeg terminal authority.
+    let terminal = tonepoet_pipeline::lower_reference_terminal(
         &summary.r64_path,
         &summary.qpcm_path,
         summary.final_pcm,
@@ -8588,9 +8744,10 @@ async fn execute_reference_common_plan(
         )
     })?;
     let (w4s, w4e) = window(4, total_steps);
-    let mut terminal_records = execute_commands(
-        std::slice::from_ref(&terminal),
-        None,
+    let mut terminal_records = execute_reference_terminal_lowering(
+        &terminal,
+        r64_structure.sample_frames,
+        reference_toolchain,
         runner,
         cancel,
         tool_paths,
@@ -8600,7 +8757,13 @@ async fn execute_reference_common_plan(
         w4e,
         track_label.clone(),
     )
-    .await?;
+    .await
+    .map_err(|mut error| {
+        let mut all = records.clone();
+        all.append(&mut error.commands);
+        error.commands = all;
+        error
+    })?;
     records.append(&mut terminal_records);
 
     // 6. QPCM structure/extent + independent decode/hash authority.
@@ -8952,6 +9115,7 @@ pub async fn qualify_reference_common_candidate_execution(
         &summary,
         plan_request,
         None,
+        Some(&toolchain),
         runner,
         cancel,
         tool_paths,

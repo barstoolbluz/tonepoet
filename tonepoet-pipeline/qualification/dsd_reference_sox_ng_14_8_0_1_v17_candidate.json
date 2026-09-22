@@ -18,7 +18,9 @@
     "required_probe_markers": [
       "loudnorm",
       "print_format"
-    ]
+    ],
+    "version": "7.1.3",
+    "int32_triangular_terminal_authority": "ffmpeg_7-full-n7.1.3+nixpkgs-dd9b079222d43e1943b6ebd802f04fd959dc8e61/libswresample-dbl-triangular-s32/v1"
   },
   "in_process": {
     "sacd_rs_build_identity": "sacd-rs-0.1.0-src-sha256:494a98a23e8cf9db1e77416107cffcfa0819b7d1e769fd23a472052f6da018d8",
@@ -330,6 +332,11 @@
       "max_added_peak_fs_q63_ceil": 2199023255552,
       "safe_pre_terminal_ceiling_dbtp": "-1.010002327"
     },
+    "int32_tpdf": {
+      "realization": "int32-ffmpeg-triangular-2lsb-plus-f64-scalar-2^-51",
+      "max_added_peak_fs_q63_ceil": 8589940737,
+      "safe_pre_terminal_ceiling_dbtp": "-1.010000010"
+    },
     "float32": {
       "realization": "float32-2^-23",
       "max_added_peak_fs_q63_ceil": 1099511627776,
@@ -343,8 +350,8 @@
     "post_final_acceptance_reserve_db": "0.010000000",
     "post_final_acceptance_reserve_basis": "one_analyzer_reporting_quantum"
   },
-  "qualification_basis": "Policy v17 preserves the complete v16 policy contract and advances only the immutable SoX-ng source lock to the Wave64-finalization-corrected revision. Promotion requires the complete pinned real-tool release gate under the new source identity.",
-  "runtime_activation": "Fail closed unless the embedded v17 candidate is promoted by a passed release certification that binds the exact candidate bytes and the complete W64 integrity evidence under the v17 source lock.",
+  "qualification_basis": "Policy v17 preserves the v16 contract except for two append-only corrections: the immutable SoX-ng Wave64-finalization source lock and Reference Int32 terminal realization, which now uses the commissioned FFmpeg 7.1.3/libswresample Float64-to-S32 triangular-dither authority on a true-scale carrier after one certified binary64 scalar gain.",
+  "runtime_activation": "Fail closed unless the embedded v17 candidate is promoted by a passed release certification that binds the exact candidate bytes, the commissioned FFmpeg Int32 triangular terminal authority, and the complete W64/common-model qualification evidence under the v17 source lock.",
   "cell_contract": {
     "schema": "tonepoet-dsd-reference-qualified-cells/v3",
     "source_kinds": [
@@ -1138,7 +1145,7 @@
   "qualification_report": {
     "schema": "tonepoet-dsd-reference-policy-qualification-report/v1",
     "path": "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v17_report.md",
-    "sha256": "6e16eccb9e76a153dae951b8c83160cee49f23e2e30d49be63f68952745cca94",
+    "sha256": "4e112f847906fb3ce7ad0f1455637299404511ac8e6c1af6a46f82e543392333",
     "guidance_sha256": "a5a5556c70b93c56d216c0d142ab5213920fa9f696caa48ea4110f382bf2e36f",
     "decimation_report_sha256": "af6e6880003f2b3673d804b992a093700cd8141465ee0277f8689d48209055c7",
     "commission_sha256": "87612a3b1d46aa6e7c4dd34bc9d5f9a45d539aa892ec7b454b52c6d9926288f7",

@@ -1,22 +1,43 @@
-# DSD Reference policy v17 qualification report
+# DSD Reference policy v17 qualification-basis report
 
-Policy v17 is the append-only source-lock successor to v16. It preserves the v16 DSP, analyzer, terminal, packaging, metadata, capacity, and exact Wave64 structural-integrity contracts without editing any v16 evidence bytes.
+Policy v17 remains an unpromoted qualification candidate. This source-controlled report records the policy delta and the evidence that the real-tool gate must produce; it is not execution evidence and does not promote the candidate.
 
-## Source-lock correction
+## Append-only corrections from v16
 
-- Bind SoX-ng 14.8.0.1 to revision `9ed22fb3d813d6c02f67c254e57d162cee014a30` and NAR `sha256-WxMirop+SH3RzUM57QBDjetp9Q4qhFjzcfo2OJHStcs=`.
-- Preserve the v16 manifest, candidate, certification skeleton, report, checker, and v8 terminal source proof byte-for-byte as historical evidence.
-- Bind the Phase-5 common candidate to the active `sox_ng_14_8_0_1_v17` policy identity while retaining its explicit v16 inherited-evidence digest.
-- Re-run the complete real-tool gate before production promotion; a source-lock update is not accepted from static source inspection alone.
+- Bind SoX-ng 14.8.0.1 to revision `9ed22fb3d813d6c02f67c254e57d162cee014a30` and NAR `sha256-WxMirop+SH3RzUM57QBDjetp9Q4qhFjzcfo2OJHStcs=`. Historical v16 artifacts remain byte-for-byte frozen.
+- Keep Int24 on the existing SoX-ng TPDF terminal.
+- Correct Reference Int32 from undithered SoX-ng signed-32 output to the already commissioned FFmpeg 7.1.3/libswresample Float64-to-S32 plain-triangular terminal, authority `ffmpeg_7-full-n7.1.3+nixpkgs-dd9b079222d43e1943b6ebd802f04fd959dc8e61/libswresample-dbl-triangular-s32/v1`.
+- Normalize protected Float64 Wave64 to headerless true-scale `f64le` with the qualified SoX-ng Float64-W64 reader route before gain. The one selected gain is then applied by the certified in-process binary64 scalar pump; FFmpeg receives the gained Float64 stream and owns the one Int32 TPDF+dither/quantization effect.
 
-## Source audit
+## Int32 physical error authority
 
-The v17 source-lock proof is `tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v17_source_lock_proof.md` (`sha256:4746ec2e7764d15e31d14b95ea39e8c7c45698b45b8e83129df77bfea28217ac`). Exact-content comparison found the terminal-arithmetic authorities `src/sox_ng.h` and `src/gain.c` byte-for-byte identical between the v16 and v17 pins. The new revision changes output-finalization behavior, including the sparse-file length accounting used by the Wave64 repair, so the Wave64 and full qualification gates remain mandatory.
+The commissioned FFmpeg terminal proof bounds the combined triangular-dither plus S32 conversion effect by
+
+```text
+E_ffmpeg = next_up(2^-31 + 2^-52 + 2^-31)
+         = 9.313227966600836e-10 FS
+         = 2.0000004768371586 S32 LSB
+Q1.63 ceiling = 8,589,936,641
+```
+
+Reference gain is a distinct physical operation before FFmpeg. The certified binary64 scalar multiplication contributes at most `2^-51` FS. Policy v17 therefore charges both once:
+
+```text
+E_reference_int32 = next_up(E_ffmpeg + 2^-51)
+Q1.63 ceiling     = 8,589,940,737
+safe preterminal = -1.010000010 dBTP
+```
+
+The safe ceiling uses the existing `-1.000000000 dBTP` public ceiling and one `0.010000000 dB` post-final analyzer-reporting reserve. This is a deterministic worst-case authority, not an observed maximum.
+
+The FFmpeg proof and commissioning record is `tonepoet-pipeline/qualification/ffmpeg_int32_triangular_terminal_bound_2026-09-14.md`. The SoX-ng source-lock proof is `tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v17_source_lock_proof.md` (`sha256:4746ec2e7764d15e31d14b95ea39e8c7c45698b45b8e83129df77bfea28217ac`).
 
 ## Qualification contract
 
-The gate remains the v16-established complete qualification surface: workspace tests, formatting, lint, pinned-tool attestation, live smoke, throughput/deadline qualification, complete Reference qualification, the 60-cell exact-Wave64 matrix, and Phase-5 common-model release certification. The existing exact parser must continue to reject malformed Wave64 and accept only files whose declared root/data extents, chunk traversal, alignment, PCM format, and frame count match their physical contents and upstream authority.
+`complete_p0_reference_qualification_report` must execute the shared production lowerer/executor, the full lossless package matrix, the 80-cell exact-Wave64 characterization, complete-reader checks, GAIN08/GAIN09, workspace regression, timeout/cancellation/resource checks, and paired performance/resource characterization. Int32 matrix cells must prove that the command transcript uses the exact FFmpeg triangular authority, that no SoX `dither` effect owns Int32, that the carrier bridge is true-scale `f64le`, and that measured terminal realization error remains below the v17 deterministic bound.
+
+The generated common-model report, certification, and evidence JSON are the release evidence. They are written only by the gated qualification path; they are not hand-authored by this policy derivation.
 
 ## Status
 
-`not_run`. Production remains fail-closed until the operator runs the gated qualification in the exact declared closure and installs the completed report/certification output.
+`not_run`. Production remains fail-closed until the operator executes the exact pinned gate and installs a matching passed report/certification/evidence set.

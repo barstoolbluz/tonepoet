@@ -22792,6 +22792,10 @@ fn dither_log_line(
             return "requested (TPDF, Reference policy) — not applied (executed command did not emit the policy dither stage)"
                 .to_string();
         }
+        if source_has_int32_target(source, settings) {
+            return "yes (TPDF, commissioned FFmpeg/libswresample Int32 triangular terminal, Reference policy)"
+                .to_string();
+        }
         return "yes (TPDF, sox_ng, Reference policy)".to_string();
     }
     if applies {
@@ -59779,6 +59783,70 @@ mod conversion_log_tests {
             "{log}"
         );
         assert!(!log.contains("2822.4kHz FLAC"), "{log}");
+    }
+
+    #[test]
+    fn reference_int32_conversion_log_names_commissioned_ffmpeg_triangular_terminal() {
+        let mut source = log_test_source();
+        source.kind = SourceKind::SacdIso;
+        source.tracks[0].sample_rate = Some(DsdRate::Dsd64.hz());
+        source.tracks[0].bit_depth = None;
+        source.tracks[0].source_audio.bit_depth = None;
+        source.tracks[0].source_audio.coding = Some(SourceAudioCoding::Dsd);
+        source.tracks[0].source_ref = TrackSourceRef::SacdTrack {
+            iso: PathBuf::from("/music/source.iso"),
+            track_index: 0,
+            area: SacdArea::Stereo,
+        };
+
+        let mut req = log_test_request();
+        req.settings.target_format = PlannerAudioFormat::Wav;
+        req.settings.target_sample_rate = RateTarget::Source;
+        req.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int32);
+        req.settings.dsd = tonepoet_pipeline::DsdSettings::reference();
+
+        let mut record = ok_record();
+        record.verified_output_bit_depth = Some(PcmBitDepth::Int32);
+        record.commands = vec![
+            command_record_for(ToolBinary::Sox),
+            command_record_for(ToolBinary::Ffmpeg),
+        ];
+        record.commands[0].description =
+            Some("Normalize protected Reference Wave64 to true-scale Float64 carrier".to_string());
+        record.commands[0].sanitized_args = vec![
+            "-t".to_string(),
+            "raw".to_string(),
+            "-e".to_string(),
+            "floating-point".to_string(),
+            "-b".to_string(),
+            "64".to_string(),
+            "-L".to_string(),
+        ];
+        record.commands[1].description =
+            Some("Commissioned Reference FFmpeg Int32 triangular terminal".to_string());
+        record.commands[1].sanitized_args = vec![
+            "-af".to_string(),
+            "aresample=resampler=soxr:out_sample_rate=88200:precision=33:cutoff=0.95:dither_method=triangular:out_sample_fmt=s32".to_string(),
+            "-c:a".to_string(),
+            "pcm_s32le".to_string(),
+        ];
+
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![record],
+            stages: stage_records(),
+        };
+        let log = build_conversion_log(
+            &outcome,
+            &source,
+            &req,
+            &log_test_artifacts(),
+            None,
+        );
+
+        assert!(log.contains(
+            "Dither: yes (TPDF, commissioned FFmpeg/libswresample Int32 triangular terminal, Reference policy)"
+        ), "{log}");
+        assert!(!log.contains("Dither: yes (TPDF, sox_ng, Reference policy)"), "{log}");
     }
 
     #[test]

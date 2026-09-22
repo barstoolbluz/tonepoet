@@ -1179,8 +1179,8 @@ fn assert_qualification_decode_route_table() -> Value {
     };
     let int32 = FinalPcmContract {
         bit_depth: PcmBitDepth::Int32,
-        // Int32 Reference terminals carry no dither (production rule).
-        dither: ReferenceDither::None,
+        // Int32 Reference terminals use the commissioned FFmpeg triangular TPDF terminal.
+        dither: ReferenceDither::Tpdf,
         ..int24
     };
     let float32 = FinalPcmContract {
@@ -4805,8 +4805,84 @@ fn qualify_analyzer_carrier_contract() -> Value {
 #[derive(Debug)]
 struct PlannedChainResult {
     terminal_args: Vec<String>,
+    terminal_normalize_args: Option<Vec<String>>,
+    terminal_gain_linear: f64,
     package_producer_args: Option<Vec<String>>,
     package_args: Option<Vec<String>>,
+}
+
+fn apply_qualification_scalar_to_f64le_in_place(path: &Path, gain_db: DbNano) {
+    let gain = tonepoet_pipeline::conservative_linear_gain_lower(gain_db)
+        .expect("qualified Reference scalar resolves");
+    let mut bytes = fs::read(path)
+        .unwrap_or_else(|error| panic!("cannot read qualification f64le carrier {}: {error}", path.display()));
+    assert_eq!(
+        bytes.len() % std::mem::size_of::<f64>(),
+        0,
+        "qualification f64le carrier is truncated: {}",
+        path.display(),
+    );
+    for raw in bytes.chunks_exact_mut(std::mem::size_of::<f64>()) {
+        let sample = f64::from_le_bytes(raw.try_into().expect("f64 sample width"));
+        assert!(sample.is_finite(), "qualification scalar input must be finite");
+        let scaled = sample * gain;
+        assert!(scaled.is_finite(), "qualification scalar output must be finite");
+        raw.copy_from_slice(&scaled.to_le_bytes());
+    }
+    let mut staged = path.as_os_str().to_os_string();
+    staged.push(".scaled.tmp");
+    let staged = PathBuf::from(staged);
+    fs::write(&staged, &bytes).unwrap_or_else(|error| {
+        panic!("cannot stage qualification f64le carrier {}: {error}", staged.display())
+    });
+    fs::rename(&staged, path).unwrap_or_else(|error| {
+        panic!(
+            "cannot replace qualification f64le carrier {} from {}: {error}",
+            path.display(),
+            staged.display(),
+        )
+    });
+}
+
+struct TerminalQualificationResult {
+    terminal_args: Vec<String>,
+    normalize_args: Option<Vec<String>>,
+    gain_linear: f64,
+}
+
+fn run_reference_terminal_qualification(
+    lowering: &tonepoet_pipeline::ReferenceTerminalLowering,
+    sox: &Path,
+    ffmpeg: &Path,
+) -> TerminalQualificationResult {
+    match lowering {
+        tonepoet_pipeline::ReferenceTerminalLowering::Command(command) => {
+            run_planned_command(command, sox, ffmpeg);
+            let gain_db = gain_arg(&command.args)
+                .expect("one-command Reference terminal has one gain")
+                .parse::<f64>()
+                .expect("Reference gain token parses as f64");
+            TerminalQualificationResult {
+                terminal_args: command.args.clone(),
+                normalize_args: None,
+                gain_linear: 10_f64.powf(gain_db / 20.0),
+            }
+        }
+        tonepoet_pipeline::ReferenceTerminalLowering::Int32Tpdf(int32) => {
+            run_planned_command(&int32.normalize_carrier, sox, ffmpeg);
+            apply_qualification_scalar_to_f64le_in_place(
+                &int32.normalized_carrier_path,
+                int32.selected_gain,
+            );
+            run_planned_command(&int32.terminal, sox, ffmpeg);
+            TerminalQualificationResult {
+                terminal_args: int32.terminal.args.clone(),
+                normalize_args: Some(int32.normalize_carrier.args.clone()),
+                gain_linear: tonepoet_pipeline::conservative_linear_gain_lower(int32.selected_gain)
+                    .expect("qualified Reference scalar resolves"),
+            }
+        }
+    }
 }
 
 fn decode_f64le_samples(output: &Output, route: ReferenceDecodeMechanism) -> Vec<f64> {
@@ -4903,13 +4979,8 @@ fn assert_terminal_realization_bound(
     sox: &Path,
     ffmpeg: &Path,
     summary: &tonepoet_pipeline::DsdReferencePlanSummary,
-    terminal_args: &[String],
+    gain: f64,
 ) -> f64 {
-    let gain_db = gain_arg(terminal_args)
-        .expect("Reference terminal command has one gain")
-        .parse::<f64>()
-        .expect("Reference gain token parses as f64");
-    let gain = 10_f64.powf(gain_db / 20.0);
     let input_carrier = summary
         .decoded_carrier(ReferenceDecodedCarrierSelector::ReconstructionR64)
         .expect("qualified R64 carrier binding");
@@ -5256,14 +5327,15 @@ fn qualify_lossless_package_cells(
                             ResolvedGainPolicy::TruePeakNormalize { bound_gain: None, .. } => DbNano::ZERO,
                             ResolvedGainPolicy::Off { .. } => DbNano::ZERO,
                         };
-                        let terminal = tonepoet_pipeline::lower_reference_terminal_command(
+                        let terminal = tonepoet_pipeline::lower_reference_terminal(
                             &summary.r64_path,
                             &summary.qpcm_path,
                             summary.final_pcm,
                             selected_gain,
                         )
                         .expect("common terminal lowering");
-                        run_planned_command(&terminal, &sox, &ffmpeg);
+                        let terminal_run =
+                            run_reference_terminal_qualification(&terminal, &sox, &ffmpeg);
                         let mut package_producer_args = None;
                         let mut package_args = None;
                         if let Some(lowering) = tonepoet_pipeline::lower_reference_package(
@@ -5287,7 +5359,9 @@ fn qualify_lossless_package_cells(
                             }
                         }
                         let chain = PlannedChainResult {
-                            terminal_args: terminal.args.clone(),
+                            terminal_args: terminal_run.terminal_args,
+                            terminal_normalize_args: terminal_run.normalize_args,
+                            terminal_gain_linear: terminal_run.gain_linear,
                             package_producer_args,
                             package_args,
                         };
@@ -5311,7 +5385,7 @@ fn qualify_lossless_package_cells(
                                 &sox,
                                 &ffmpeg,
                                 summary,
-                                &chain.terminal_args,
+                                chain.terminal_gain_linear,
                             );
                             assert!(observed.is_finite());
                             terminal_observed_max_error_by_depth
@@ -5399,24 +5473,51 @@ fn qualify_lossless_package_cells(
                             );
                             package_identity_comparison_count += 1;
                         }
-                        let dither_tail: &[&str] = match depth {
-                            PcmBitDepth::Int24 => &["dither"],
-                            // Int32 Reference terminals carry no dither (production rule).
-                            PcmBitDepth::Int32 | PcmBitDepth::Float32 | PcmBitDepth::Float64 => &[],
+                        match depth {
+                            PcmBitDepth::Int24 => {
+                                assert!(chain.terminal_normalize_args.is_none());
+                                assert!(chain.terminal_args.iter().any(|arg| arg == "dither"));
+                                assert_eq!(
+                                    chain.terminal_args.iter().filter(|arg| arg.as_str() == "gain").count(),
+                                    1,
+                                );
+                            }
+                            PcmBitDepth::Int32 => {
+                                let normalize = chain
+                                    .terminal_normalize_args
+                                    .as_ref()
+                                    .expect("Int32 qualification has a true-scale bridge");
+                                assert!(normalize.windows(2).any(|pair| pair[0] == "-t" && pair[1] == "raw"));
+                                assert!(normalize.windows(2).any(|pair| pair[0] == "-b" && pair[1] == "64"));
+                                assert!(normalize.iter().any(|arg| arg == "-L"));
+                                assert!(!normalize.iter().any(|arg| arg == "gain" || arg == "dither"));
+                                assert_eq!(
+                                    chain.terminal_args.iter().filter(|arg| arg.as_str() == "gain").count(),
+                                    0,
+                                );
+                                let filter = chain
+                                    .terminal_args
+                                    .windows(2)
+                                    .find(|pair| pair[0] == "-af")
+                                    .map(|pair| pair[1].as_str())
+                                    .expect("Int32 terminal has one aresample filter");
+                                assert!(filter.contains("dither_method=triangular"));
+                                assert!(filter.contains("out_sample_fmt=s32"));
+                                assert!(chain.terminal_args.windows(2).any(|pair| {
+                                    pair[0] == "-c:a" && pair[1] == "pcm_s32le"
+                                }));
+                                assert!(!chain.terminal_args.iter().any(|arg| arg == "volume"));
+                            }
+                            PcmBitDepth::Float32 | PcmBitDepth::Float64 => {
+                                assert!(chain.terminal_normalize_args.is_none());
+                                assert!(!chain.terminal_args.iter().any(|arg| arg == "dither"));
+                                assert_eq!(
+                                    chain.terminal_args.iter().filter(|arg| arg.as_str() == "gain").count(),
+                                    1,
+                                );
+                            }
                             _ => unreachable!(),
-                        };
-                        if dither_tail.is_empty() {
-                            assert!(!chain.terminal_args.iter().any(|arg| arg == "dither"));
-                        } else {
-                            assert!(chain
-                                .terminal_args
-                                .windows(dither_tail.len())
-                                .any(|window| window.iter().map(String::as_str).eq(dither_tail.iter().copied())));
                         }
-                        assert_eq!(
-                            chain.terminal_args.iter().filter(|arg| arg.as_str() == "gain").count(),
-                            1
-                        );
                         if target == ResolvedOutputTarget::WavW64 {
                             assert!(chain.package_producer_args.is_none());
                             assert!(chain.package_args.is_none());
@@ -5747,6 +5848,16 @@ fn qualify_lossless_package_cells(
             "measured_route_case_counts": route_counts,
             "measured_hash_encoding_case_counts": encoding_counts,
             "measured_terminal_realization_route_case_counts": terminal_route_counts,
+            "reference_int32_terminal": {
+                "authority": tonepoet_pipeline::FFMPEG_INT32_TRIANGULAR_TERMINAL_AUTHORITY_ID,
+                "ffmpeg_version": "7.1.3",
+                "carrier_bridge": "sox-ng-wave64-q1.31-to-true-scale-f64le",
+                "gain_realization": "certified-in-process-binary64-scalar",
+                "dither": "triangular-tpdf",
+                "sample_format": "s32",
+                "max_added_peak_fs_q63_ceil": 8_589_940_737_u64,
+                "safe_pre_terminal_ceiling_dbtp": "-1.010000010",
+            },
             "package_identity_comparison_count": package_identity_comparison_count,
             "w64_direct_delivery_exact_validation_count": w64_direct_delivery_exact_validation_count,
             "w64_same_path_hash_counted_as_independent_packaging": false,
