@@ -388,35 +388,127 @@ pub fn analyze_file(
 
     let sample_limit = max_samples.unwrap_or(u64::MAX);
     let mut total_decoded: u64 = 0;
+    // The legacy wrapper exception is intentionally whole-file only. A seeked
+    // or bounded analysis does not establish that the decoder reached the
+    // STREAMINFO terminal extent and therefore retains ordinary error handling.
+    let wrapped_flac = crate::flac_envelope::WrappedFlacDecodeGuard::for_path(
+        path,
+        start_sample.is_none() && max_samples.is_none(),
+    )
+    .map_err(|error| format!("inspect FLAC wrapper: {error}"))?;
+    let mut accepted_wrapped_eof = false;
+    let mut reached_sample_limit = false;
 
-    'decode: for (stream, packet) in ictx.packets() {
-        if stream.index() != stream_idx {
+    'decode: loop {
+        let mut packet = ffmpeg::Packet::empty();
+        match packet.read(&mut ictx) {
+            Ok(()) => {}
+            Err(ffmpeg::Error::Eof) => break,
+            Err(error) if wrapped_flac.accepts_post_extent_error(total_decoded) => {
+                accepted_wrapped_eof = true;
+                log::debug!(
+                    "accepted legacy ID3-wrapped FLAC demux EOF after declared extent: path={}, frames={}, error={error}",
+                    path.display(),
+                    total_decoded,
+                );
+                break;
+            }
+            Err(error) => return Err(format!("demux failed: {error}")),
+        }
+        if packet.stream() != stream_idx {
             continue;
         }
-        decoder
-            .send_packet(&packet)
-            .map_err(|e| format!("send_packet: {}", e))?;
+        if let Err(error) = decoder.send_packet(&packet) {
+            if wrapped_flac.accepts_post_extent_error(total_decoded) {
+                accepted_wrapped_eof = true;
+                log::debug!(
+                    "accepted legacy ID3-wrapped FLAC packet EOF after declared extent: path={}, frames={}, error={error}",
+                    path.display(),
+                    total_decoded,
+                );
+                break;
+            }
+            return Err(format!("send_packet: {error}"));
+        }
 
-        while decoder.receive_frame(&mut decoded).is_ok() {
-            process_frame!();
-            total_decoded += decoded.samples() as u64;
-            if total_decoded >= sample_limit {
-                break 'decode;
+        loop {
+            match decoder.receive_frame(&mut decoded) {
+                Ok(()) => {
+                    let frame_samples = decoded.samples() as u64;
+                    let next_decoded = wrapped_flac
+                        .checked_advance(total_decoded, frame_samples)
+                        .map_err(|error| error.to_string())?;
+                    process_frame!();
+                    total_decoded = next_decoded;
+                    if total_decoded >= sample_limit {
+                        reached_sample_limit = true;
+                        break 'decode;
+                    }
+                }
+                Err(ffmpeg::Error::Eof) => break,
+                Err(ffmpeg::Error::Other { errno })
+                    if errno == ffmpeg::util::error::EAGAIN => break,
+                Err(error) if wrapped_flac.accepts_post_extent_error(total_decoded) => {
+                    accepted_wrapped_eof = true;
+                    log::debug!(
+                        "accepted legacy ID3-wrapped FLAC decoder EOF after declared extent: path={}, frames={}, error={error}",
+                        path.display(),
+                        total_decoded,
+                    );
+                    break 'decode;
+                }
+                Err(error) => return Err(format!("audio decoder failed: {error}")),
             }
         }
     }
 
     // Flush decoder — process remaining buffered frames.
-    if total_decoded < sample_limit {
-        decoder.send_eof().map_err(|e| format!("send_eof: {}", e))?;
-        while decoder.receive_frame(&mut decoded).is_ok() {
-            process_frame!();
-            total_decoded += decoded.samples() as u64;
-            if total_decoded >= sample_limit {
-                break;
+    if !reached_sample_limit && !accepted_wrapped_eof {
+        if let Err(error) = decoder.send_eof() {
+            if wrapped_flac.accepts_post_extent_error(total_decoded) {
+                accepted_wrapped_eof = true;
+                log::debug!(
+                    "accepted legacy ID3-wrapped FLAC flush EOF after declared extent: path={}, frames={}, error={error}",
+                    path.display(),
+                    total_decoded,
+                );
+            } else {
+                return Err(format!("send_eof: {error}"));
             }
         }
     }
+    if !reached_sample_limit && !accepted_wrapped_eof {
+        loop {
+            match decoder.receive_frame(&mut decoded) {
+                Ok(()) => {
+                    let frame_samples = decoded.samples() as u64;
+                    let next_decoded = wrapped_flac
+                        .checked_advance(total_decoded, frame_samples)
+                        .map_err(|error| error.to_string())?;
+                    process_frame!();
+                    total_decoded = next_decoded;
+                }
+                Err(ffmpeg::Error::Eof) => break,
+                Err(ffmpeg::Error::Other { errno })
+                    if errno == ffmpeg::util::error::EAGAIN => {
+                        return Err("decoder flush ended without clean EOF".to_string())
+                    }
+                Err(error) if wrapped_flac.accepts_post_extent_error(total_decoded) => {
+                    log::debug!(
+                        "accepted legacy ID3-wrapped FLAC decoder EOF after declared extent: path={}, frames={}, error={error}",
+                        path.display(),
+                        total_decoded,
+                    );
+                    break;
+                }
+                Err(error) => return Err(format!("audio decoder failed: {error}")),
+            }
+        }
+    }
+
+    wrapped_flac
+        .validate_complete(total_decoded)
+        .map_err(|error| error.to_string())?;
 
     // Flush last partial block (reference: dr_rms divides by actual count).
     if block_sample_count > 0 {
@@ -715,6 +807,34 @@ pub fn dr_label(dr: i32) -> &'static str {
 #[cfg(test)]
 mod loudness_status_tests {
     use super::*;
+
+    #[test]
+    fn analyze_accepts_id3_wrapped_flac_fixture() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/regression/id3_wrapped_flac/id3v2_id3v1_48000.flac");
+        let result = analyze_file(&path, None, None)
+            .expect(":analyze must accept the verified ID3v2 + FLAC + ID3v1 envelope");
+        assert_eq!(result.sample_rate, 48_000);
+        assert_eq!(result.channels, 2);
+        assert!((result.duration_secs - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn analyze_accepts_id3v1_trailer_only_stream_copy() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/regression/id3_wrapped_flac/id3v2_id3v1_48000.flac");
+        let bytes = std::fs::read(&source).expect("read wrapped FLAC fixture");
+        assert!(bytes.starts_with(b"ID3"));
+        let temp = tempfile::tempdir().expect("temp dir");
+        let staged = temp.path().join("stream-copy.flac");
+        std::fs::write(&staged, &bytes[10..]).expect("write trailer-only staged FLAC");
+
+        let result = analyze_file(&staged, None, None)
+            .expect(":analyze must accept a verified trailer-only native FLAC stream copy");
+        assert_eq!(result.sample_rate, 48_000);
+        assert_eq!(result.channels, 2);
+        assert!((result.duration_secs - 1.0).abs() < 0.01);
+    }
 
     #[test]
     fn native_unavailability_maps_without_collapsing_reasons() {

@@ -24,7 +24,7 @@ use tonepoet_pipeline::{
     AacProfile, AacSettings, AudioFormat, BitDepthTarget, DbNano, DitherType,
     DsdFilterPreset, DsdGeneralExportLevel, DsdGeneralReconstruction, DsdLowpassMethod,
     DsdNoiseShaper, DsdReconstructionSelection, DsdReferencePolicyVersion, DsdSettings,
-    DsdSourceGainMode, DsdSourcePathway, GainCompensation, MetadataSettings, ModulatorOrder,
+    DsdSourcePathway, GainCompensation, MetadataSettings, ModulatorOrder,
     Mp3Mode, Mp3Settings, NyquistTransition, OpusContentType, OpusSettings, PcmBitDepth,
     PipelineSettings, PreferredTool, RateTarget, ReplayGainMode, ReplayGainSettings,
     ResampleQuality, SampleGainPolicy, SoxResamplerSettings, SoxSincPhase,
@@ -135,14 +135,16 @@ fn rich_common_settings() -> PipelineSettings {
     settings.dsd.pcm_to_dsd.sinc.allow_aliasing = true;
     settings.dsd.pcm_to_dsd.gain_compensation = GainCompensation::Decibels(1.5);
 
-    // While General is selected, qualified-Reference controls are dormant but
+    // While Custom is selected, qualified-Reference controls are dormant but
     // still raw settings identity. Use them to prove the strict single schema
     // propagates every stored field without making them execution claims.
     settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V15;
     settings.dsd.from_dsd.profile = DsdReconstructionSelection::Wideband;
-    settings.dsd.from_dsd.gain_mode = DsdSourceGainMode::Fixed;
-    settings.dsd.from_dsd.fixed_gain_db = Some(db("-3.250000000"));
-    settings.dsd.from_dsd.normalize_peak_target_dbfs = db("-1.000000000");
+    settings.dsd.from_dsd.gain = SampleGainPolicy::TruePeakNormalize {
+        target_dbtp: db("-1.250000000"),
+        scope: TruePeakScope::Album,
+        scan: TruePeakScanTier::Standard,
+    };
 
     settings.dsd.general_from_dsd.reconstruction = DsdGeneralReconstruction::ReferenceProtected;
     settings.dsd.general_from_dsd.lowpass = DsdLowpassMethod::Sinc;
@@ -194,6 +196,12 @@ fn custom_fixed_sentinel() -> PipelineSettings {
     settings.dsd.set_gain_policy(SampleGainPolicy::FixedGain {
         gain_db: db("1.250000000"),
     });
+    // This setting is dormant while Custom is selected, but remains part of
+    // raw settings identity. Exercise the non-default mode/gain slot without
+    // inventing a second Reference-only gain schema.
+    settings.dsd.from_dsd.gain = SampleGainPolicy::FixedGain {
+        gain_db: db("1.750000000"),
+    };
     settings.pcm_true_peak.policy = SampleGainPolicy::FixedGain {
         gain_db: db("2.250000000"),
     };
@@ -205,13 +213,17 @@ fn custom_fixed_sentinel() -> PipelineSettings {
 fn reference_sentinel() -> PipelineSettings {
     let mut settings = rich_common_settings();
     settings.dsd.from_dsd.pathway = DsdSourcePathway::Reference;
-    settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V16;
+    settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V17;
     settings.dsd.from_dsd.profile = DsdReconstructionSelection::Wideband;
-    settings.dsd.from_dsd.gain_mode = DsdSourceGainMode::Fixed;
-    settings.dsd.from_dsd.fixed_gain_db = Some(db("-3.250000000"));
-    // Explicit Reference delivery is mutually exclusive with the General DSD
-    // sample-domain gain policy. The General sentinels above cover those fields.
+    settings.dsd.from_dsd.gain = SampleGainPolicy::TruePeakNormalize {
+        target_dbtp: db("-1.250000000"),
+        scope: TruePeakScope::Track,
+        scan: TruePeakScanTier::Reference,
+    };
+    // Explicit Reference delivery is mutually exclusive with the Custom DSD
+    // sample-domain gain policy. The Custom sentinels above cover those fields.
     settings.dsd.set_gain_policy(SampleGainPolicy::Off);
+    settings.dsd.clear_runtime_album_gain();
     settings.validate().expect("valid Reference-pathway sentinel");
     settings
 }
@@ -264,7 +276,7 @@ fn canonical_field_value(settings: &PipelineSettings, path: &str) -> serde_json:
                 serde_json::Value::Null
             }
         }
-        "dsd.general_from_dsd.runtime_album_gain_db" => serde_json::to_value(
+        "dsd.runtime_album_gain_db" => serde_json::to_value(
             settings.dsd.runtime_album_gain_db(),
         )
         .expect("serialize DSD runtime gain"),
@@ -305,6 +317,7 @@ fn canonical_fingerprint_inventory_has_no_duplicates_or_retired_gain_paths() {
         "dsd.dsd_to_pcm_gain_mode",
         "dsd.dsd_to_pcm_auto_gain_margin_db",
         "dsd.dsd_to_pcm_gain_db",
+        "dsd.from_dsd.automatic_gain_scope",
         "pcm_true_peak.enabled",
         "pcm_true_peak.allow_boost",
     ] {
@@ -413,7 +426,7 @@ fn general_dsd_policy_carries_reconstruction_export_scope_and_tier_independently
 #[test]
 fn strict_dsd_settings_have_one_representation_for_general_and_reference_intent() {
     let general = DsdSettings::default();
-    assert_eq!(general.from_dsd.pathway, DsdSourcePathway::General);
+    assert_eq!(general.from_dsd.pathway, DsdSourcePathway::Custom);
     assert_eq!(general.gain_policy(), SampleGainPolicy::Off);
 
     let reference = DsdSettings::reference();

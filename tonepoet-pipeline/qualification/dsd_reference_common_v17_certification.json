@@ -1,13 +1,74 @@
 {
-  "schema_version": 17,
+  "candidate_manifest_sha256": "0ed1460cbb6388a0c999ed623bee4c3d42c146c80e639a6814c41cf19e337b71",
   "execution_model": "tonepoet-reference-common-model/v1",
-  "status": "not_run",
-  "outcome": "not_run",
-  "candidate_manifest_sha256": "",
-  "qualification_report_sha256": "",
-  "runtime_closure_fingerprint_sha256": "",
-  "metadata_mutation_closure_fingerprint_sha256": null,
-  "positive_case_count": 0,
-  "expected_negative_case_count": 0,
-  "gates": []
+  "expected_negative_case_count": 44,
+  "gates": [
+    {
+      "evidence_sha256": "5217a3420c48124e608aa8ad98c188a54620d95064e4c0d3b90924f537156676",
+      "gate": "Q01",
+      "status": "passed"
+    },
+    {
+      "evidence_sha256": "c4a228abea614fa940e938f0cde6236ad49509f0c35c2456ce110ad3172a5230",
+      "gate": "Q02",
+      "status": "passed"
+    },
+    {
+      "evidence_sha256": "fcab2888a76cb34c5b359c9bb9fcb9902faba8de868c9c4ee3c49865c359a1f3",
+      "gate": "GAIN08",
+      "status": "passed"
+    },
+    {
+      "evidence_sha256": "657fd008b6f9d20d25931b93857b8295d6481d09bbb48758d890ad865f2ab6e8",
+      "gate": "GAIN09",
+      "status": "passed"
+    },
+    {
+      "evidence_sha256": "b55174f560b0575b27e417a65ae048a6dc78c99b2ffefc8a0fa6c89cd44d317e",
+      "gate": "wave64_integrity_80_cell",
+      "status": "passed"
+    },
+    {
+      "evidence_sha256": "c547fbead7751707b64bbf7c05bf8c08d1786e1307cb775c6961bc66425637fc",
+      "gate": "complete_reader",
+      "status": "passed"
+    },
+    {
+      "evidence_sha256": "bfb4132a296450a3bc3c8f65c573311b1df97c83ad59614a03719eb05fa87922",
+      "gate": "package_identity",
+      "status": "passed"
+    },
+    {
+      "evidence_sha256": "6444131f343df2dec3d1df7c1b6cea7276077e497e19304a1a85056790753b61",
+      "gate": "post_metadata_identity",
+      "status": "passed"
+    },
+    {
+      "evidence_sha256": "7540e57d567b5bc153604f9767ecb1fcd90e49da54ee8beb26415dade496bbed",
+      "gate": "timeout_cancellation_resource",
+      "status": "passed"
+    },
+    {
+      "evidence_sha256": "5a4f34159d45e912d8544407825e9ae6c8a36eee897f71d6ce94b5c350bc5305",
+      "gate": "ordinary_workspace_regression",
+      "status": "passed"
+    },
+    {
+      "evidence_sha256": "d1bcc13c5aaa1925de81b57447b2afae0287f7c8b1aa3fdefee25659512c2674",
+      "gate": "real_tool_candidate_qualification",
+      "status": "passed"
+    },
+    {
+      "evidence_sha256": "436f1116dbe13b839b9cd3af5af51ac9903071be7bd4da4a3eb4874ec78c5989",
+      "gate": "paired_performance_resource",
+      "status": "passed"
+    }
+  ],
+  "metadata_mutation_closure_fingerprint_sha256": "a84b61dfe3c2c5574e27944f37fa694bd4c52d5f6762b9087b3f2c6801aa3664",
+  "outcome": "qualified",
+  "positive_case_count": 946,
+  "qualification_report_sha256": "dd503c2c6b7c50ad5852431d4baec22954ae8af1cd681365d2e101dde1782841",
+  "runtime_closure_fingerprint_sha256": "e9a191edcdcf44c04a6c37882902f7d1f2ec4377c5296c7fbb6cfb79e04c46d0",
+  "schema_version": 17,
+  "status": "passed"
 }

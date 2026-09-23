@@ -82,7 +82,9 @@ The crate root re-exports the public items from these modules.
 - `DsdGeneralExportLevel`: `Native`, `NominalCompensated`, `ProtectedR64`, `NativeWithOffset { offset_db }`
 - `DsdToPcmSincSettings`: directional general DSD-to-PCM sinc parameters
 - `PcmToDsdSettings`: `noise_shaper`, `modulator_order`, `trellis`, `filter`, `sinc`, `gain_compensation`
-- `DsdSourceSettings`: qualified Reference-delivery controls: `pathway`, `reference_policy`, `profile`, `gain_mode`, `fixed_gain_db`, `normalize_peak_target_dbfs`
+- `DsdSourceSettings`: qualified Reference-delivery controls: `pathway`, `reference_policy`, `profile`, `gain`
+  - Reference reuses `SampleGainPolicy` and admits only `Off` or `TruePeakNormalize`. Normalization uses a signed true-peak target from -12.0 through 0.0 dBTP (default -1.0), `Album` or `Track` scope (default `Album`), and the same `Reference` / `Standard` / `Fast` certified scan tiers exposed by Custom (default `Standard`). Album scope resolves to Track when the submitted programme is not an independent album.
+  - Methods: `reference_auto_gain_default`, `reference_true_peak_target_dbtp`, `reference_certified_scan_tier`, `resolved_reference_gain_scope`, `reference_auto_gain_selected`
 - `PcmTruePeakGainSettings`: `policy` plus runtime-only album gain authority
   - Methods: `is_true_peak`, `is_active`, `album_true_peak_gain_selected`, `target_dbtp`, `scope`, `scan_tier`, `fixed_gain_db`, policy/scope/tier setters, effective target and runtime album binding/clearing accessors
 - `TrellisSettings`: `lookahead`, `nodes`, `latency`

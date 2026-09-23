@@ -832,7 +832,8 @@ impl ConversionManager {
             .pipeline_settings
             .as_ref()
             .map(|settings| {
-                settings.dsd.album_true_peak_gain_selected()
+                (batch.len() > 1 && settings.dsd.reference_auto_album_gain_possible())
+                    || settings.dsd.album_true_peak_gain_selected()
                     || (settings.pcm_true_peak.is_true_peak()
                         && settings.pcm_true_peak.scope()
                             == Some(tonepoet_pipeline::TruePeakScope::Album))
@@ -4971,6 +4972,45 @@ mod per_track_epoch_tests {
             &source_artifacts,
             &options,
             |_| panic!("album-scope detection failure must abort before item configuration"),
+        );
+
+        assert_eq!(transaction.outcome.enqueued, 0);
+        assert!(transaction.outcome.errors > 0);
+        assert!(
+            transaction
+                .outcome
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("album-scoped true-peak gain requires every item")
+        );
+        assert!(transaction.admitted_item_ids.is_empty());
+        assert!(transaction.artifacts_remaining_caller_owned.contains(&artifact));
+        let queue = manager.queue.try_read().expect("queue read lock");
+        assert!(queue.all_items().is_empty());
+    }
+
+    #[test]
+    fn reference_auto_album_scope_rejects_partial_batch_before_queue_mutation() {
+        let manager = ConversionManager::new(ConversionConfig::default());
+        let (artifact_dir, artifact) =
+            synthetic_artifact_for("reference-auto-album", "reference-auto-album");
+        let unsupported = artifact_dir.join("unsupported.not-audio");
+        fs::write(&unsupported, b"not an admitted conversion source")
+            .expect("write unsupported batch member");
+        let source_artifacts = [artifact.clone()].into_iter().collect::<HashSet<_>>();
+
+        let mut options = ConversionOptions::default();
+        let mut settings = tonepoet_pipeline::PipelineSettings::default();
+        settings.dsd = tonepoet_pipeline::DsdSettings::reference();
+        options.pipeline_settings = Some(settings);
+
+        let transaction = manager.commit_batch_with_cue_artifacts(
+            &[artifact.clone(), unsupported],
+            &HashSet::new(),
+            &source_artifacts,
+            &options,
+            |_| panic!("Reference album-scope detection failure must abort before item configuration"),
         );
 
         assert_eq!(transaction.outcome.enqueued, 0);

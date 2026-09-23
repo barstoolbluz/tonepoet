@@ -14,6 +14,14 @@ fn db(value: &str) -> DbNano {
 fn reference_constructor_selects_reference_without_schema_origin_state() {
     let settings = DsdSettings::reference();
     assert_eq!(settings.from_dsd.pathway, DsdSourcePathway::Reference);
+    assert_eq!(
+        settings.from_dsd.gain,
+        SampleGainPolicy::TruePeakNormalize {
+            target_dbtp: db("-1.000000000"),
+            scope: TruePeakScope::Album,
+            scan: TruePeakScanTier::Standard,
+        }
+    );
     assert_eq!(settings.gain_policy(), SampleGainPolicy::Off);
 }
 
@@ -56,4 +64,11 @@ fn strict_dsd_wire_has_directional_objects_and_no_origin_or_version_selector() {
     for retired in ["origin", "schema_origin", "settings_version", "legacy"] {
         assert!(!object.contains_key(retired), "retired selector {retired} leaked into wire");
     }
+    let from_dsd = object["from_dsd"]
+        .as_object()
+        .expect("from_dsd settings object");
+    assert!(
+        !from_dsd.contains_key("automatic_gain_scope"),
+        "retired Reference scope selector leaked into wire",
+    );
 }

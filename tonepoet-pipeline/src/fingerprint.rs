@@ -114,7 +114,8 @@ pub const SETTINGS_FINGERPRINT_FIELD_PATHS: &[&str] = &[
     "dsd.pcm_to_dsd.sinc.kaiser_beta", "dsd.pcm_to_dsd.sinc.linear_phase",
     "dsd.pcm_to_dsd.sinc.allow_aliasing", "dsd.pcm_to_dsd.gain_compensation",
     "dsd.from_dsd.pathway", "dsd.from_dsd.reference_policy", "dsd.from_dsd.profile",
-    "dsd.from_dsd.gain_mode", "dsd.from_dsd.fixed_gain_db", "dsd.from_dsd.normalize_peak_target_dbfs",
+    "dsd.from_dsd.gain.mode", "dsd.from_dsd.gain.target_dbtp", "dsd.from_dsd.gain.scope",
+    "dsd.from_dsd.gain.scan", "dsd.from_dsd.gain.gain_db",
     "dsd.general_from_dsd.reconstruction", "dsd.general_from_dsd.lowpass",
     "dsd.general_from_dsd.sinc.taps", "dsd.general_from_dsd.sinc.passband_hz",
     "dsd.general_from_dsd.sinc.transition_hz", "dsd.general_from_dsd.sinc.kaiser_beta",
@@ -122,7 +123,7 @@ pub const SETTINGS_FINGERPRINT_FIELD_PATHS: &[&str] = &[
     "dsd.general_from_dsd.export_level", "dsd.general_from_dsd.export_offset_db",
     "dsd.general_from_dsd.gain.mode", "dsd.general_from_dsd.gain.target_dbtp",
     "dsd.general_from_dsd.gain.scope", "dsd.general_from_dsd.gain.scan",
-    "dsd.general_from_dsd.gain.gain_db", "dsd.general_from_dsd.runtime_album_gain_db",
+    "dsd.general_from_dsd.gain.gain_db", "dsd.runtime_album_gain_db",
     "pcm_true_peak.policy.mode", "pcm_true_peak.policy.target_dbtp", "pcm_true_peak.policy.scope",
     "pcm_true_peak.policy.scan", "pcm_true_peak.policy.gain_db", "pcm_true_peak.runtime_album_gain_db",
     "metadata.transfer_tags", "metadata.preserve_artwork", "metadata.store_source_audio_md5",
@@ -135,11 +136,15 @@ pub const SETTINGS_FINGERPRINT_FIELD_COUNT: usize = SETTINGS_FINGERPRINT_FIELD_P
 
 /// DSD album-scoped fields that must participate in output identity.
 pub const DSD_ALBUM_GAIN_FINGERPRINT_FIELD_PATHS: &[&str] = &[
+    "dsd.from_dsd.gain.mode",
+    "dsd.from_dsd.gain.target_dbtp",
+    "dsd.from_dsd.gain.scope",
+    "dsd.from_dsd.gain.scan",
     "dsd.general_from_dsd.gain.mode",
     "dsd.general_from_dsd.gain.target_dbtp",
     "dsd.general_from_dsd.gain.scope",
     "dsd.general_from_dsd.gain.scan",
-    "dsd.general_from_dsd.runtime_album_gain_db",
+    "dsd.runtime_album_gain_db",
 ];
 
 /// PCM gain fields that must participate in output identity.
@@ -161,7 +166,8 @@ pub const SETTINGS_SNAPSHOT_V2_DSD_FIELD_PATHS: &[&str] = &[
     "dsd.pcm_to_dsd.sinc.kaiser_beta", "dsd.pcm_to_dsd.sinc.linear_phase",
     "dsd.pcm_to_dsd.sinc.allow_aliasing", "dsd.pcm_to_dsd.gain_compensation",
     "dsd.from_dsd.pathway", "dsd.from_dsd.reference_policy", "dsd.from_dsd.profile",
-    "dsd.from_dsd.gain_mode", "dsd.from_dsd.fixed_gain_db", "dsd.from_dsd.normalize_peak_target_dbfs",
+    "dsd.from_dsd.gain.mode", "dsd.from_dsd.gain.target_dbtp", "dsd.from_dsd.gain.scope",
+    "dsd.from_dsd.gain.scan", "dsd.from_dsd.gain.gain_db",
     "dsd.general_from_dsd.reconstruction", "dsd.general_from_dsd.lowpass",
     "dsd.general_from_dsd.sinc.taps", "dsd.general_from_dsd.sinc.passband_hz",
     "dsd.general_from_dsd.sinc.transition_hz", "dsd.general_from_dsd.sinc.kaiser_beta",
@@ -169,7 +175,7 @@ pub const SETTINGS_SNAPSHOT_V2_DSD_FIELD_PATHS: &[&str] = &[
     "dsd.general_from_dsd.export_level", "dsd.general_from_dsd.export_offset_db",
     "dsd.general_from_dsd.gain.mode", "dsd.general_from_dsd.gain.target_dbtp",
     "dsd.general_from_dsd.gain.scope", "dsd.general_from_dsd.gain.scan",
-    "dsd.general_from_dsd.gain.gain_db", "dsd.general_from_dsd.runtime_album_gain_db",
+    "dsd.general_from_dsd.gain.gain_db", "dsd.runtime_album_gain_db",
 ];
 
 /// Number of strict directional DSD fields in the settings snapshot.
@@ -2553,30 +2559,25 @@ fn canonical_source_kind(source: &DsdSourceKind) -> String {
 
 fn canonical_gain_policy(policy: crate::ResolvedGainPolicy) -> String {
     match policy {
-        crate::ResolvedGainPolicy::ReferenceCompensated { requested_gain, ceiling, terminal_bound } => format!(
-            "reference:{}:{}:{}:{}",
-            requested_gain.render(false),
+        crate::ResolvedGainPolicy::TruePeakNormalize {
+            target_dbtp,
+            scope,
+            scan,
+            bound_gain,
+            terminal_bound,
+        } => format!(
+            "auto:{}:{scope:?}:{scan:?}:{}:{}:{}",
+            target_dbtp.render(false),
+            option_db_nano(bound_gain),
+            terminal_bound.max_added_peak_fs_q63_ceil,
+            terminal_bound.derivation_digest.to_hex(),
+        ),
+        crate::ResolvedGainPolicy::Off { ceiling, terminal_bound } => format!(
+            "off:{}:{}:{}",
             ceiling.render(false),
             terminal_bound.max_added_peak_fs_q63_ceil,
             terminal_bound.derivation_digest.to_hex(),
         ),
-        crate::ResolvedGainPolicy::NativeLevelExact { gain, ceiling, terminal_bound } => format!(
-            "native:{}:{}:{}:{}",
-            gain.render(false),
-            ceiling.render(false),
-            terminal_bound.max_added_peak_fs_q63_ceil,
-            terminal_bound.derivation_digest.to_hex(),
-        ),
-        crate::ResolvedGainPolicy::FixedExact { gain, ceiling, terminal_bound } => format!(
-            "fixed:{}:{}:{}:{}",
-            gain.render(false),
-            ceiling.render(false),
-            terminal_bound.max_added_peak_fs_q63_ceil,
-            terminal_bound.derivation_digest.to_hex(),
-        ),
-        crate::ResolvedGainPolicy::NormalizePeak { target_dbfs } => {
-            format!("normalize:{}", target_dbfs.render(false))
-        }
     }
 }
 
@@ -2699,7 +2700,7 @@ fn push_dsd(writer: &mut FingerprintWriter, settings: &DsdSettings) {
 
     let from = settings.from_dsd;
     writer.field_static("dsd.from_dsd.pathway", match from.pathway {
-        crate::DsdSourcePathway::General => "general",
+        crate::DsdSourcePathway::Custom => "custom",
         crate::DsdSourcePathway::Reference => "reference",
         crate::DsdSourcePathway::Manual => "manual",
     });
@@ -2708,17 +2709,7 @@ fn push_dsd(writer: &mut FingerprintWriter, settings: &DsdSettings) {
         crate::DsdReconstructionSelection::Reference => "reference",
         crate::DsdReconstructionSelection::Wideband => "wideband",
     });
-    writer.field_static("dsd.from_dsd.gain_mode", match from.gain_mode {
-        crate::DsdSourceGainMode::Reference => "reference",
-        crate::DsdSourceGainMode::NativeLevel => "native_level",
-        crate::DsdSourceGainMode::Fixed => "fixed",
-        crate::DsdSourceGainMode::NormalizePeak => "sample_peak_normalize",
-    });
-    writer.field_string("dsd.from_dsd.fixed_gain_db", option_db_nano(from.fixed_gain_db));
-    writer.field_string(
-        "dsd.from_dsd.normalize_peak_target_dbfs",
-        from.normalize_peak_target_dbfs.render(false),
-    );
+    push_sample_gain_policy(writer, "dsd.from_dsd.gain", from.gain);
 
     let general = settings.general_from_dsd;
     writer.field_static("dsd.general_from_dsd.reconstruction", match general.reconstruction {
@@ -2747,7 +2738,7 @@ fn push_dsd(writer: &mut FingerprintWriter, settings: &DsdSettings) {
     }
     push_sample_gain_policy(writer, "dsd.general_from_dsd.gain", general.gain);
     writer.field_string(
-        "dsd.general_from_dsd.runtime_album_gain_db",
+        "dsd.runtime_album_gain_db",
         option_db_nano(settings.runtime_album_gain_db()),
     );
 }

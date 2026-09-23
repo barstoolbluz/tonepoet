@@ -77,7 +77,8 @@ use super::track_executor::{
     finalize_cue_stream_direct_track_plan, prepare_cue_stream_direct_track_plan,
     retained_pcm_scalar_stream_plan_admitted,
     run_segmented_tool_pipeline_with_concurrency, SegmentedPipelineExecutionError,
-    preflight_reference_rerun_authority, reference_bound_metadata_executable,
+    preflight_reference_rerun_authority, materialize_reference_source_for_album_gain,
+    reference_bound_metadata_executable,
     reference_metadata_toolchains_match, run_bound_tool_command_with_concurrency,
     run_tool_command_with_concurrency,
     verify_reference_metadata_toolchain_before_mutation, verify_reference_output_after_metadata,
@@ -1189,6 +1190,36 @@ async fn realize_track_with_tool_limits_and_stats(
                 dsd_dst_stats: dsd_dst_stats_from_file(path, Some(file_len(path).unwrap_or(0)), None),
                 scalar_pump: None,
             })
+        }
+        TrackSourceRef::DsdReferenceAutoGainCarrier {
+            path,
+            sample_rate_hz,
+            channels,
+            gain_db,
+            ..
+        } => {
+            if !path.exists() || !path.is_file() {
+                return Err(ConvertError::TrackValidation(format!(
+                    "retained Reference album carrier is missing or not a regular file: {}",
+                    path.display(),
+                )));
+            }
+            if *sample_rate_hz == 0 || *channels == 0 {
+                return Err(ConvertError::TrackValidation(
+                    "retained Reference album carrier has invalid geometry".to_string(),
+                ));
+            }
+            if gain_db.is_none() {
+                return Err(ConvertError::TrackValidation(
+                    "retained Reference album carrier reached execution before the submitted-batch scalar was bound"
+                        .to_string(),
+                ));
+            }
+            // The carrier is already the exact protected-R64 waveform observed
+            // by the certified scanner. Reference terminal execution owns the
+            // one gain realization; the common realizer must not scale or
+            // decode/re-encode this retained authority.
+            Ok(RealizedTrackInfo::without_stats(path.clone()))
         }
         TrackSourceRef::DsdTruePeakCarrier {
             path,
@@ -13586,6 +13617,110 @@ FILE "01 - Wanna Be Startin' Somethin'.dts" WAVE
     }
 
     #[tokio::test]
+    async fn id3_wrapped_flac_full_pipeline_replaygain_rescan_succeeds() {
+        let strict = cue_matrix_strict_mode();
+        let case = matrix_cases()
+            .into_iter()
+            .find(|case| case.format == tonepoet_pipeline::AudioFormat::Flac)
+            .expect("FLAC matrix case");
+        let unavailable = case_unavailability_reasons(&case);
+        if !unavailable.is_empty() {
+            let message = format!(
+                "ID3-wrapped FLAC ReplayGain integration requires {}",
+                unavailable.join(", ")
+            );
+            if strict {
+                panic!("{message}; strict tool mode forbids skipping this invariant");
+            }
+            eprintln!("skipping {message}");
+            return;
+        }
+
+        let source_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/regression/id3_wrapped_flac/id3v2_id3v1_48000.flac");
+        assert!(source_path.is_file(), "missing ID3-wrapped FLAC regression fixture");
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let case_root = temp.path().join("id3-wrapped-flac-replaygain-rescan");
+        std::fs::create_dir_all(case_root.join("out")).expect("output root");
+        std::fs::create_dir_all(case_root.join("logs")).expect("log root");
+
+        let mut req = request_for_case(&case_root, &source_path, &case);
+        req.job_id = "id3-wrapped-flac-replaygain-rescan".to_string();
+        req.item_id = req.job_id.clone();
+        // Publish into a per-album subdirectory of the pre-created output root,
+        // as the sibling real-output tests do; the root itself already exists.
+        req.naming.per_album_subdir = true;
+        req.settings.metadata.preserve_artwork = false;
+        req.stages.replaygain = StageRequirement::Enabled;
+        req.settings.replay_gain.mode = Some(tonepoet_pipeline::ReplayGainMode::Track);
+        req.settings.replay_gain.existing_tags =
+            tonepoet_pipeline::ReplayGainExistingTagPolicy::Rescan;
+
+        let runner = RealToolRunner::new(HashMap::new());
+        let reporter = crate::convert::pipeline::reporter::RecordingReporter::new();
+        let cancel = CancellationToken::new();
+        let report = run_pipeline_item(req, &runner, &reporter, &cancel).await;
+
+        assert!(
+            matches!(&report.outcome, AlbumOutcome::Complete { .. }),
+            "ID3-wrapped FLAC ReplayGain pipeline should complete: {:?}",
+            &report.outcome,
+        );
+        let replaygain_outcome = match &report.outcome {
+            AlbumOutcome::Complete { stages, .. }
+            | AlbumOutcome::Partial { stages, .. }
+            | AlbumOutcome::Blocked { stages, .. } => stages
+                .iter()
+                .find(|record| record.stage == PipelineStage::ReplayGain)
+                .map(|record| &record.outcome),
+        };
+        assert!(
+            matches!(replaygain_outcome, Some(StageOutcome::Ok)),
+            "ReplayGain stage should succeed for ID3-wrapped FLAC; got {replaygain_outcome:?}",
+        );
+
+        let published = report.published.as_ref().expect("published album");
+        let output_path = published
+            .entries
+            .iter()
+            .find(|entry| matches!(&entry.role, PublishRole::Audio))
+            .map(|entry| entry.final_path.clone())
+            .expect("published FLAC audio");
+        assert!(output_path.is_file(), "published audio artifact must exist");
+
+        let published_bytes = std::fs::read(&output_path).expect("read published FLAC");
+        assert_eq!(
+            published_bytes.get(..4),
+            Some(&b"fLaC"[..]),
+            "published FLAC must not retain the source ID3v2 prefix"
+        );
+        assert!(
+            published_bytes.len() < 128
+                || published_bytes[published_bytes.len() - 128..]
+                    .get(..3)
+                    != Some(&b"TAG"[..]),
+            "published FLAC must not retain the source ID3v1 trailer"
+        );
+        let published_guard =
+            crate::flac_envelope::WrappedFlacDecodeGuard::for_path(&output_path, true)
+                .expect("inspect published FLAC");
+        assert_eq!(
+            published_guard.declared_sample_frames(),
+            None,
+            "published FLAC must no longer need legacy decoder tolerance"
+        );
+
+        let tags = format_tag_map(&ffprobe_json(&output_path));
+        for key in ["REPLAYGAIN_TRACK_GAIN", "REPLAYGAIN_TRACK_PEAK"] {
+            assert!(
+                tags.get(key).is_some_and(|value| !value.trim().is_empty()),
+                "ReplayGain-enabled conversion should write {key}; tags were {tags:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn headerless_untaggable_sidecar_cue_keeps_album_empty_through_real_flac_output() {
         let strict = cue_matrix_strict_mode();
         let case = matrix_cases()
@@ -22657,6 +22792,10 @@ fn dither_log_line(
             return "requested (TPDF, Reference policy) — not applied (executed command did not emit the policy dither stage)"
                 .to_string();
         }
+        if source_has_int32_target(source, settings) {
+            return "yes (TPDF, commissioned FFmpeg/libswresample Int32 triangular terminal, Reference policy)"
+                .to_string();
+        }
         return "yes (TPDF, sox_ng, Reference policy)".to_string();
     }
     if applies {
@@ -22917,23 +23056,42 @@ fn append_dsd_settings(
             push_kv_line(
                 log,
                 "DSD gain mode",
-                match reference.gain_mode {
-                    tonepoet_pipeline::DsdSourceGainMode::Reference => "reference compensated",
-                    tonepoet_pipeline::DsdSourceGainMode::NativeLevel => "native level exact",
-                    tonepoet_pipeline::DsdSourceGainMode::Fixed => "reference fixed",
-                    tonepoet_pipeline::DsdSourceGainMode::NormalizePeak => "sample-peak normalize",
+                match reference.gain {
+                    tonepoet_pipeline::SampleGainPolicy::TruePeakNormalize { .. } => {
+                        "certified true-peak normalize"
+                    }
+                    tonepoet_pipeline::SampleGainPolicy::Off => "off",
+                    tonepoet_pipeline::SampleGainPolicy::TruePeakGuard { .. } => {
+                        "invalid true-peak guard"
+                    }
+                    tonepoet_pipeline::SampleGainPolicy::FixedGain { .. } => "invalid fixed gain",
                 },
             );
-            if reference.gain_mode == tonepoet_pipeline::DsdSourceGainMode::Fixed {
-                if let Some(gain) = reference.fixed_gain_db {
-                    push_kv_line(log, "DSD fixed gain", format!("{} dB", gain));
-                }
-            }
-            if reference.gain_mode == tonepoet_pipeline::DsdSourceGainMode::NormalizePeak {
+            if reference.reference_auto_gain_selected() {
                 push_kv_line(
                     log,
-                    "DSD sample-peak normalize target",
-                    format!("{} dBFS", reference.normalize_peak_target_dbfs),
+                    "DSD Reference true-peak target",
+                    format!(
+                        "{} dBTP",
+                        reference
+                            .reference_true_peak_target_dbtp()
+                            .unwrap_or(tonepoet_pipeline::DbNano::DEFAULT_REFERENCE_TRUE_PEAK_TARGET)
+                    ),
+                );
+                push_kv_line(
+                    log,
+                    "DSD Reference gain scope",
+                    match reference.gain.scope().unwrap_or(tonepoet_pipeline::TruePeakScope::Track) {
+                        tonepoet_pipeline::TruePeakScope::Track => "track",
+                        tonepoet_pipeline::TruePeakScope::Album => "album",
+                    },
+                );
+                push_kv_line(
+                    log,
+                    "DSD Reference scan tier",
+                    tonepoet_pipeline::qualification_schema::reference_certified_scan_tier_name(
+                        reference.reference_certified_scan_tier(),
+                    ),
                 );
             }
             push_kv_line(
@@ -22942,7 +23100,7 @@ fn append_dsd_settings(
                 reference.reference_policy.key(),
             );
         } else {
-            push_kv_line(log, "DSD path", "general");
+            push_kv_line(log, "DSD path", "custom");
             push_kv_line(
                 log,
                 "DSD reconstruction",
@@ -23475,6 +23633,28 @@ fn conversion_summary(
             }
         }
     }
+    if let TrackSourceRef::DsdReferenceAutoGainCarrier { target_dbtp, .. } = &track.source_ref {
+        if let Some(gain_db) = req.settings.dsd.runtime_album_gain_db() {
+            let scope = match (
+                req.settings.dsd.runtime_album_track_count(),
+                req.settings.dsd.runtime_album_loudest_peak_dbfs(),
+            ) {
+                (Some(track_count), Some(loudest)) => format!(
+                    "{track_count} measured DSD track(s), loudest true peak {} dBTP",
+                    loudest.render(false),
+                ),
+                (Some(track_count), None) => {
+                    format!("{track_count} verified-silent DSD track(s)")
+                }
+                _ => "submitted DSD batch".to_string(),
+            };
+            transforms.push(format!(
+                "submitted-batch DSD Reference album gain {} dB ({scope}; target {} dBTP)",
+                gain_db.render(true),
+                target_dbtp.render(false),
+            ));
+        }
+    }
     if let Some(gain_db) = req.settings.pcm_true_peak.fixed_gain_db() {
         transforms.push(format!(
             "user-supplied PCM fixed gain {} dB (unclamped; may clip)",
@@ -24005,7 +24185,11 @@ fn source_track_dsd_rate(track: &PreparedTrack) -> Option<DsdRate> {
 fn prepared_track_uses_dsd_source(track: &PreparedTrack) -> bool {
     matches!(track.source_audio.coding, Some(SourceAudioCoding::Dsd))
         || source_track_dsd_rate(track).is_some()
-        || matches!(&track.source_ref, TrackSourceRef::DsdTruePeakCarrier { .. })
+        || matches!(
+            &track.source_ref,
+            TrackSourceRef::DsdTruePeakCarrier { .. }
+                | TrackSourceRef::DsdReferenceAutoGainCarrier { .. }
+        )
 }
 
 fn source_audio_description(track: &PreparedTrack) -> String {
@@ -24089,6 +24273,7 @@ fn source_ref_extension(source_ref: &TrackSourceRef) -> Option<String> {
     let path = match source_ref {
         TrackSourceRef::StagedFile(path) => path,
         TrackSourceRef::DsdTruePeakCarrier { source_path, .. }
+        | TrackSourceRef::DsdReferenceAutoGainCarrier { source_path, .. }
         | TrackSourceRef::PcmTruePeakCarrier { source_path, .. }
         | TrackSourceRef::RegisteredEffectCarrier { source_path, .. } => source_path,
         TrackSourceRef::CueStreamSegment { source_image, .. }
@@ -24963,6 +25148,17 @@ fn track_source_ref_label(source_ref: &TrackSourceRef) -> String {
             ..
         } => format!(
             "album-gain raw Float64 carrier {} ({sample_rate_hz} Hz, {channels}ch; DSD authority {})",
+            path_log_value(path),
+            path_log_value(source_path),
+        ),
+        TrackSourceRef::DsdReferenceAutoGainCarrier {
+            path,
+            source_path,
+            sample_rate_hz,
+            channels,
+            ..
+        } => format!(
+            "Reference auto-gain raw Float64 carrier {} ({sample_rate_hz} Hz, {channels}ch; DSD authority {})",
             path_log_value(path),
             path_log_value(source_path),
         ),
@@ -27072,6 +27268,7 @@ fn publish_album_output_bound(
                         &temp_dir,
                         plan,
                         manifest,
+                        manifest_album_dir,
                         &incremental_marker_path,
                         fragment_batch_identity.as_ref(),
                         &mut published_entries,
@@ -27269,6 +27466,7 @@ fn publish_incremental_album_output(
     temp_dir: &Path,
     plan: &PublishPlan,
     manifest: Option<&super::manifest::ConversionManifest>,
+    manifest_album_dir: Option<&Path>,
     marker_path: &Path,
     fragment_batch_identity: Option<&ConversionLogBatchIdentity>,
     published_entries: &mut Vec<PublishedEntry>,
@@ -27449,6 +27647,7 @@ fn publish_incremental_album_output(
     let native_manifest_path = match write_native_incremental_manifest_transactionally(
         plan,
         manifest,
+        manifest_album_dir,
         &mut rollback,
     ) {
         Ok(path) => path,
@@ -27513,7 +27712,7 @@ fn publish_incremental_album_output(
 
     match native_manifest_path {
         Some(path) => Ok(Some(path)),
-        None => write_incremental_manifest(plan, manifest),
+        None => write_incremental_manifest(plan, manifest, manifest_album_dir),
     }
 }
 
@@ -28010,6 +28209,7 @@ fn should_fallback_to_remove_then_rename_for_replace(err: &io::Error, dst: &Path
 fn write_native_incremental_manifest_transactionally(
     plan: &PublishPlan,
     manifest: Option<&super::manifest::ConversionManifest>,
+    manifest_album_dir: Option<&Path>,
     rollback: &mut IncrementalPublishRollback,
 ) -> Result<Option<PathBuf>, PublishError> {
     let Some(manifest) = manifest else {
@@ -28024,7 +28224,10 @@ fn write_native_incremental_manifest_transactionally(
 
     let final_manifest_path = super::manifest::manifest_path(&plan.album_dir);
     rollback.snapshot_destination(&final_manifest_path)?;
-    super::manifest::write_manifest_for_publish(&plan.album_dir, &plan.album_dir, manifest)
+    // A bound (descriptor-route) plan carries the album as `/proc/self/fd/N/...`;
+    // the manifest records the logical album directory, so validate against that.
+    let validation_album_dir = manifest_album_dir.unwrap_or(plan.album_dir.as_path());
+    super::manifest::write_manifest_for_publish(&plan.album_dir, validation_album_dir, manifest)
         .map_err(|err| PublishError::Manifest(err.to_string()))?;
     Ok(Some(final_manifest_path))
 }
@@ -28032,11 +28235,13 @@ fn write_native_incremental_manifest_transactionally(
 fn write_incremental_manifest(
     plan: &PublishPlan,
     manifest: Option<&super::manifest::ConversionManifest>,
+    manifest_album_dir: Option<&Path>,
 ) -> Result<Option<PathBuf>, PublishError> {
     let Some(manifest) = manifest else {
         return Ok(None);
     };
-    match super::manifest::write_manifest_for_publish(&plan.album_dir, &plan.album_dir, manifest) {
+    let validation_album_dir = manifest_album_dir.unwrap_or(plan.album_dir.as_path());
+    match super::manifest::write_manifest_for_publish(&plan.album_dir, validation_album_dir, manifest) {
         Ok(_written_manifest_path) => Ok(Some(super::manifest::manifest_path(&plan.album_dir))),
         Err(err) if matches!(
             &manifest.route_identity,
@@ -29584,6 +29789,7 @@ fn track_source_identity_path(track: &PreparedTrack) -> &Path {
     match &track.source_ref {
         TrackSourceRef::StagedFile(path) => path.as_path(),
         TrackSourceRef::DsdTruePeakCarrier { source_path, .. }
+        | TrackSourceRef::DsdReferenceAutoGainCarrier { source_path, .. }
         | TrackSourceRef::PcmTruePeakCarrier { source_path, .. }
         | TrackSourceRef::RegisteredEffectCarrier { source_path, .. } => source_path.as_path(),
         TrackSourceRef::CueStreamSegment { source_image, .. }
@@ -29595,6 +29801,113 @@ fn track_source_identity_path(track: &PreparedTrack) -> &Path {
         TrackSourceRef::DvdVideoTrack { source, .. } => source.as_path(),
         TrackSourceRef::BluRayTrack { source, .. } => source.as_path(),
     }
+}
+
+fn normalize_legacy_wrapped_flac_artifact_before_publish(
+    source_path: &Path,
+    staged_path: &Path,
+) -> io::Result<()> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    let Some(retained) =
+        crate::flac_envelope::wrapped_flac_normalization_range(source_path, staged_path)?
+    else {
+        return Ok(());
+    };
+    let retained_len = retained.end.checked_sub(retained.start).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "legacy FLAC normalization range is inverted for {}",
+                staged_path.display()
+            ),
+        )
+    })?;
+    if retained_len == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "legacy FLAC normalization would produce an empty output: {}",
+                staged_path.display()
+            ),
+        ));
+    }
+
+    let temp = metadata_rewrite_temp_path(staged_path)?;
+    let write_result = (|| -> io::Result<()> {
+        let mut input = fs::File::open(staged_path)?;
+        input.seek(SeekFrom::Start(retained.start))?;
+        let mut bounded = input.take(retained_len);
+        let mut output = fs::File::create(temp.path())?;
+        let copied = io::copy(&mut bounded, &mut output)?;
+        if copied != retained_len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "legacy FLAC normalization copied {copied} of {retained_len} bytes from {}",
+                    staged_path.display()
+                ),
+            ));
+        }
+        output.sync_all()?;
+
+        if crate::flac_envelope::wrapped_flac_normalization_range(source_path, temp.path())?
+            .is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "legacy FLAC normalization left an ID3 envelope on {}",
+                    staged_path.display()
+                ),
+            ));
+        }
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        temp.cleanup_best_effort();
+        return Err(error);
+    }
+
+    replace_rewritten_metadata_file(staged_path, temp)?;
+    Ok(())
+}
+
+fn normalize_legacy_wrapped_flac_outputs_before_publish(
+    artifact_set: &ArtifactSet,
+    source: &PreparedSource,
+    req: &PipelineRequest,
+) -> io::Result<()> {
+    if req.settings.target_format != PlannerAudioFormat::Flac {
+        return Ok(());
+    }
+    let AudioArtifacts::Tracks(tracks) = &artifact_set.audio else {
+        // Merged outputs are newly authored carriers rather than byte-preserved
+        // single-file conversions, so source-envelope provenance does not apply.
+        return Ok(());
+    };
+
+    let source_by_id: BTreeMap<TrackId, &PreparedTrack> = source
+        .tracks
+        .iter()
+        .map(|track| (track.id.clone(), track))
+        .collect();
+    for artifact in tracks {
+        let prepared = source_by_id.get(&artifact.track_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "published track {:?} has no corresponding prepared source track",
+                    artifact.track_id
+                ),
+            )
+        })?;
+        normalize_legacy_wrapped_flac_artifact_before_publish(
+            track_source_identity_path(prepared),
+            &artifact.staged_path,
+        )?;
+    }
+    Ok(())
 }
 
 
@@ -29644,6 +29957,7 @@ pub struct ScheduledAlbum {
     pub plan: AlbumPlan,
     pub stages: Vec<StageRecord>,
     pub(crate) source_replaygain: Option<crate::convert::replaygain::ReplayGainSourceScan>,
+    pub(crate) reference_auto_gain_measurements: Vec<ReferenceAutoGainPreparedMeasurement>,
     pub(crate) dsd_true_peak_measurements: Vec<CertifiedTruePeakPreparedMeasurement>,
     pub(crate) pcm_true_peak_measurements: Vec<CertifiedTruePeakPreparedMeasurement>,
     dsd_true_peak_timings: BTreeMap<TrackId, DsdAlbumGainTiming>,
@@ -29704,6 +30018,9 @@ fn bound_certified_true_peak_carrier(source_ref: &TrackSourceRef) -> bool {
     matches!(
         source_ref,
         TrackSourceRef::DsdTruePeakCarrier {
+            gain_db: Some(_),
+            ..
+        } | TrackSourceRef::DsdReferenceAutoGainCarrier {
             gain_db: Some(_),
             ..
         } | TrackSourceRef::PcmTruePeakCarrier {
@@ -29771,6 +30088,7 @@ impl CertifiedTruePeakScratchRetrySeed {
 
         if album.req.settings.dsd.runtime_album_gain_db().is_some()
             && !album.req.settings.dsd.album_true_peak_gain_selected()
+            && !album.req.settings.dsd.reference_auto_album_gain_possible()
         {
             return Err(
                 "runtime DSD album gain reached scratch retry outside album-scoped true-peak gain mode"
@@ -29832,7 +30150,46 @@ fn validate_retained_certified_true_peak_carriers_for_disk_retry(
 ) -> Result<usize, String> {
     let mut carriers = 0usize;
     for track in &source.tracks {
-        let (path, channels, gain_db) = match &track.source_ref {
+        match &track.source_ref {
+            TrackSourceRef::DsdReferenceAutoGainCarrier {
+                path,
+                gain_db,
+                carrier_sha256,
+                ..
+            } => {
+                if gain_db.is_none() {
+                    return Err(format!(
+                        "retained Reference carrier reached retry before its common scalar was bound: {}",
+                        path.display(),
+                    ));
+                }
+                if !path.starts_with(scratch_staging_root) {
+                    return Err(format!(
+                        "retained Reference carrier escaped its scratch staging root: {}",
+                        path.display(),
+                    ));
+                }
+                let metadata = fs::metadata(path).map_err(|error| {
+                    format!(
+                        "could not stat retained Reference carrier for disk retry {}: {error}",
+                        path.display(),
+                    )
+                })?;
+                if !metadata.is_file() || metadata.len() == 0 {
+                    return Err(format!(
+                        "retained Reference carrier for disk retry is missing, non-regular, or empty: {}",
+                        path.display(),
+                    ));
+                }
+                let actual_digest = sha256_file(path)?;
+                if actual_digest != *carrier_sha256 {
+                    return Err(format!(
+                        "retained Reference carrier changed after certified observation; refusing stale retry binding: {}",
+                        path.display(),
+                    ));
+                }
+                carriers = carriers.saturating_add(1);
+            }
             TrackSourceRef::DsdTruePeakCarrier {
                 path,
                 channels,
@@ -29844,55 +30201,56 @@ fn validate_retained_certified_true_peak_carriers_for_disk_retry(
                 channels,
                 gain_db,
                 ..
-            } => (path, *channels, *gain_db),
-            _ => continue,
-        };
-        if gain_db.is_none() {
-            return Err(format!(
-                "retained certified carrier reached retry before its scalar was bound: {}",
-                path.display(),
-            ));
-        }
-        if !path.starts_with(scratch_staging_root) {
-            return Err(format!(
-                "retained certified carrier escaped its scratch staging root: {}",
-                path.display(),
-            ));
-        }
-        let metadata = fs::metadata(path).map_err(|error| {
-            format!(
-                "could not stat retained certified carrier for disk retry {}: {error}",
-                path.display(),
-            )
-        })?;
-        let frame_bytes = u64::from(channels)
-            .checked_mul(std::mem::size_of::<f64>() as u64)
-            .ok_or_else(|| "retained certified carrier frame size overflowed".to_string())?;
-        if !metadata.is_file()
-            || metadata.len() == 0
-            || frame_bytes == 0
-            || metadata.len() % frame_bytes != 0
-        {
-            return Err(format!(
-                "retained certified carrier for disk retry is missing, non-regular, empty, or frame-misaligned: {}",
-                path.display(),
-            ));
-        }
+            } => {
+                if gain_db.is_none() {
+                    return Err(format!(
+                        "retained certified carrier reached retry before its scalar was bound: {}",
+                        path.display(),
+                    ));
+                }
+                if !path.starts_with(scratch_staging_root) {
+                    return Err(format!(
+                        "retained certified carrier escaped its scratch staging root: {}",
+                        path.display(),
+                    ));
+                }
+                let metadata = fs::metadata(path).map_err(|error| {
+                    format!(
+                        "could not stat retained certified carrier for disk retry {}: {error}",
+                        path.display(),
+                    )
+                })?;
+                let frame_bytes = u64::from(*channels)
+                    .checked_mul(std::mem::size_of::<f64>() as u64)
+                    .ok_or_else(|| "retained certified carrier frame size overflowed".to_string())?;
+                if !metadata.is_file()
+                    || metadata.len() == 0
+                    || frame_bytes == 0
+                    || metadata.len() % frame_bytes != 0
+                {
+                    return Err(format!(
+                        "retained certified carrier for disk retry is missing, non-regular, empty, or frame-misaligned: {}",
+                        path.display(),
+                    ));
+                }
 
-        // PERF03: path identity alone is insufficient.  The digest was bound by
-        // the same traversal that completed the certified observation, encoded
-        // into the private carrier name, and is recomputed only on this
-        // exceptional retry path.  Any mutation at the same path invalidates
-        // the measurement/scalar binding before terminal work starts.
-        let expected_digest = certified_carrier_digest_from_path(path)?;
-        let actual_digest = sha256_file(path)?;
-        if actual_digest != expected_digest {
-            return Err(format!(
-                "retained certified carrier changed after measurement; refusing stale retry binding: {}",
-                path.display(),
-            ));
+                // PERF03: path identity alone is insufficient.  The digest was bound by
+                // the same traversal that completed the certified observation, encoded
+                // into the private carrier name, and is recomputed only on this
+                // exceptional retry path.  Any mutation at the same path invalidates
+                // the measurement/scalar binding before terminal work starts.
+                let expected_digest = certified_carrier_digest_from_path(path)?;
+                let actual_digest = sha256_file(path)?;
+                if actual_digest != expected_digest {
+                    return Err(format!(
+                        "retained certified carrier changed after measurement; refusing stale retry binding: {}",
+                        path.display(),
+                    ));
+                }
+                carriers = carriers.saturating_add(1);
+            }
+            _ => {}
         }
-        carriers = carriers.saturating_add(1);
     }
     if carriers == 0 {
         return Err("certified true-peak disk retry had no retained measured carrier to reuse".to_string());
@@ -29969,6 +30327,7 @@ async fn retry_resolved_certified_true_peak_once_on_disk(
         plan: seed.plan,
         stages: seed.stages,
         source_replaygain: seed.source_replaygain,
+        reference_auto_gain_measurements: Vec::new(),
         dsd_true_peak_measurements: seed.dsd_true_peak_measurements,
         pcm_true_peak_measurements: seed.pcm_true_peak_measurements,
         dsd_true_peak_timings: seed.dsd_true_peak_timings,
@@ -30044,6 +30403,7 @@ pub(crate) fn scheduled_album_for_test(
         plan,
         stages,
         source_replaygain: None,
+        reference_auto_gain_measurements: Vec::new(),
         dsd_true_peak_measurements: Vec::new(),
         pcm_true_peak_measurements: Vec::new(),
         dsd_true_peak_timings: BTreeMap::new(),
@@ -30064,7 +30424,9 @@ pub(crate) async fn resolve_dsd_album_gain_post_barrier_rerun(
     album: ScheduledAlbum,
     reporter: &dyn PipelineReporter,
 ) -> ScheduledMaterialization {
-    let post_barrier_gain_is_bound = album.req.settings.dsd.album_true_peak_gain_selected()
+    let post_barrier_gain_is_bound = (album.req.settings.dsd.reference_auto_album_gain_possible()
+        && album.req.settings.dsd.runtime_album_gain_db().is_some())
+        || album.req.settings.dsd.album_true_peak_gain_selected()
         || (album.req.settings.pcm_true_peak.album_true_peak_gain_selected()
             && album.req.settings.pcm_true_peak.runtime_album_gain_db().is_some());
     if album.req.publish.overwrite != OverwritePolicy::SkipIfManifestMatch
@@ -31583,10 +31945,10 @@ where
 
 
 /// Full-input certified Reference observation over one independently validated
-/// Wave64 sample payload. Unlike the general-DSD Reference scan-tier adapter,
-/// this qualified-delivery reader never applies the constant-prefix shortcut:
-/// every declared terminal/programme sample is decoded and pushed to the
-/// certified HQ1024V1 meter.
+/// Wave64 sample payload. The reader never omits a constant prefix: every declared
+/// terminal/programme sample is decoded and pushed to the certified HQ1024V1 meter.
+/// The meter may internally prove exact-zero reconstruction support without further
+/// refinement, but that proof does not weaken this complete-reader contract.
 pub(super) fn scan_reference_w64_certified_peak(
     carrier: &Path,
     structure: tonepoet_pipeline::W64ExactStructure,
@@ -31594,6 +31956,7 @@ pub(super) fn scan_reference_w64_certified_peak(
     id: tonepoet_pipeline::MeasurementId,
     purpose: tonepoet_pipeline::TruePeakPurpose,
     subject: tonepoet_pipeline::ReferenceObservationSubject,
+    scan_mode: tonepoet_pipeline::TruePeakScanTier,
     cancel: &CancellationToken,
 ) -> Result<tonepoet_pipeline::ReferenceCertifiedPeakObservation, String> {
     use std::io::{Read, Seek, SeekFrom};
@@ -31607,6 +31970,7 @@ pub(super) fn scan_reference_w64_certified_peak(
     }
     let bytes_per_sample = match (expected.encoding, expected.bits_per_sample) {
         (tonepoet_pipeline::W64SampleEncoding::SignedInteger, 24) => 3_usize,
+        (tonepoet_pipeline::W64SampleEncoding::SignedInteger, 32) => 4_usize,
         (tonepoet_pipeline::W64SampleEncoding::FloatingPoint, 32) => 4_usize,
         (tonepoet_pipeline::W64SampleEncoding::FloatingPoint, 64) => 8_usize,
         _ => {
@@ -31653,11 +32017,12 @@ pub(super) fn scan_reference_w64_certified_peak(
     file.seek(SeekFrom::Start(structure.data_payload_offset()))
         .map_err(|error| format!("could not seek Reference certified Wave64 payload: {error}"))?;
 
+    let peak_tier = dsd_true_peak_tier(scan_mode);
     let mut meter = tonepoet_true_peak::CertifiedPeakMeter::new(
         expected.sample_rate_hz,
         usize::from(expected.channels),
         tonepoet_true_peak::EdgePolicy::RepeatEndpoints,
-        tonepoet_true_peak::PeakTier::Reference,
+        peak_tier,
     )
     .map_err(|error| format!("could not initialize Reference certified peak meter: {error}"))?;
 
@@ -31693,14 +32058,29 @@ pub(super) fn scan_reference_w64_certified_peak(
                     samples.push(f64::from(signed) / 8_388_608.0);
                 }
             }
+            (tonepoet_pipeline::W64SampleEncoding::SignedInteger, 32) => {
+                for raw in bytes[..count].chunks_exact(4) {
+                    let signed = i32::from_le_bytes(raw.try_into().expect("4-byte Int32 sample"));
+                    samples.push(f64::from(signed) / 2_147_483_648.0);
+                }
+            }
             (tonepoet_pipeline::W64SampleEncoding::FloatingPoint, 32) => {
                 for raw in bytes[..count].chunks_exact(4) {
                     samples.push(f64::from(f32::from_le_bytes(raw.try_into().expect("4-byte Float32 sample"))));
                 }
             }
             (tonepoet_pipeline::W64SampleEncoding::FloatingPoint, 64) => {
+                // Pinned SoX-ng Wave64 stores Float64 sample payloads in its
+                // signed-Q1.31 numeric scale: a stored value of 2^31 is full
+                // scale. Convert that exact power-of-two representation to
+                // the normalized full-scale domain consumed by the certified
+                // meter. Float32 Wave64 uses normalized storage and must not
+                // take this conversion.
+                const SOX_FLOAT64_W64_Q31_TO_FS: f64 = 1.0 / 2_147_483_648.0;
                 for raw in bytes[..count].chunks_exact(8) {
-                    samples.push(f64::from_le_bytes(raw.try_into().expect("8-byte Float64 sample")));
+                    let stored =
+                        f64::from_le_bytes(raw.try_into().expect("8-byte Float64 sample"));
+                    samples.push(stored * SOX_FLOAT64_W64_Q31_TO_FS);
                 }
             }
             _ => unreachable!("sample representation was admitted above"),
@@ -31736,7 +32116,7 @@ pub(super) fn scan_reference_w64_certified_peak(
         .finalize()
         .map_err(|error| format!("could not finalize Reference certified peak observation: {error}"))?;
     if certificate.reconstruction != tonepoet_true_peak::CertifiedReconstruction::Hq1024V1
-        || certificate.tier != tonepoet_true_peak::PeakTier::Reference
+        || certificate.tier != peak_tier
         || certificate.reported_point_estimate.frames != structure.sample_frames
     {
         return Err("Reference certified peak meter returned the wrong reconstruction/tier/extent".to_string());
@@ -31791,6 +32171,11 @@ pub(super) fn scan_reference_w64_certified_peak(
         tonepoet_pipeline::TruePeakPurpose::GainAuthority => 0,
         tonepoet_pipeline::TruePeakPurpose::PostFinalAcceptance => 1,
     }]);
+    evidence_hasher.update([match scan_mode {
+        tonepoet_pipeline::TruePeakScanTier::Reference => 0,
+        tonepoet_pipeline::TruePeakScanTier::Standard => 1,
+        tonepoet_pipeline::TruePeakScanTier::Fast => 2,
+    }]);
     match result {
         tonepoet_pipeline::ReferenceCertifiedPeakResult::VerifiedSilence => {
             evidence_hasher.update([0]);
@@ -31825,10 +32210,10 @@ pub(super) fn scan_reference_w64_certified_peak(
         scope: tonepoet_pipeline::MeasurementScope::Plan,
         purpose,
         subject,
-        observer_identity: tonepoet_pipeline::qualification_schema::REFERENCE_CERTIFIED_OBSERVER_ID.to_string(),
+        observer_identity: tonepoet_pipeline::qualification_schema::reference_certified_observer_id(scan_mode).to_string(),
         reconstruction: tonepoet_pipeline::qualification_schema::REFERENCE_CERTIFIED_RECONSTRUCTION.to_string(),
         edge_policy: tonepoet_pipeline::qualification_schema::REFERENCE_CERTIFIED_EDGE_POLICY.to_string(),
-        scan_tier: tonepoet_pipeline::qualification_schema::REFERENCE_CERTIFIED_SCAN_TIER.to_string(),
+        scan_tier: tonepoet_pipeline::qualification_schema::reference_certified_scan_tier_name(scan_mode).to_string(),
         authority_endpoint: tonepoet_pipeline::qualification_schema::REFERENCE_CERTIFIED_AUTHORITY_ENDPOINT.to_string(),
         reader_authority: reader_authority.to_string(),
         sample_rate_hz: expected.sample_rate_hz,
@@ -36725,6 +37110,486 @@ fn scale_certified_true_peak_f64le(
     result
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ReferenceAutoGainPreparedMeasurement {
+    pub track_id: TrackId,
+    pub measurement: tonepoet_pipeline::AlbumPeakMeasurement,
+    pub terminal_bound: tonepoet_pipeline::AlbumTerminalBound,
+    pub target_dbtp: tonepoet_pipeline::DbNano,
+}
+
+#[derive(Default)]
+struct PreparedReferenceAutoGainCarriers {
+    measurements: Vec<ReferenceAutoGainPreparedMeasurement>,
+}
+
+struct PreparedReferenceAutoGainCarrier {
+    source_ref: TrackSourceRef,
+    measurement: ReferenceAutoGainPreparedMeasurement,
+}
+
+fn cleanup_reference_album_prepass_scratch(
+    scratch: &tonepoet_pipeline::ReferenceScratchPaths,
+    work_dir: &Path,
+) {
+    for path in scratch.all() {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => log::warn!(
+                "could not remove Reference album-prepass scratch {}: {error}",
+                path.display(),
+            ),
+        }
+    }
+    match fs::remove_dir_all(work_dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => log::warn!(
+            "could not remove Reference album-prepass work directory {}: {error}",
+            work_dir.display(),
+        ),
+    }
+}
+
+async fn prepare_reference_auto_gain_carrier_for_track(
+    req: &PipelineRequest,
+    track: PreparedTrack,
+    planned_output: &Path,
+    staging: &StagingDir,
+    carrier_dir: &Path,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
+) -> Result<PreparedReferenceAutoGainCarrier, String> {
+    if cancel.is_cancelled() {
+        return Err("Reference album auto-gain preparation cancelled".to_string());
+    }
+
+    let original_source_path = track_source_identity_path(&track).to_path_buf();
+    let realized = realize_track_with_tool_limits_and_stats(
+        &track.source_ref,
+        Some(&track),
+        req,
+        staging,
+        runner,
+        cancel,
+        tool_concurrency_limits.clone(),
+        false,
+        None,
+    )
+    .await
+    .map_err(|error| {
+        format!(
+            "could not realize Reference album participant {}: {error}",
+            track.id.source_ordinal,
+        )
+    })?;
+    let source = source_info_for_true_peak_realized_track(
+        &track,
+        &realized.path,
+        runner,
+        cancel,
+        tool_concurrency_limits.as_ref(),
+    )
+    .await
+    .map_err(|error| {
+        format!(
+            "could not resolve Reference source facts for track {}: {error}",
+            track.id.source_ordinal,
+        )
+    })?;
+    if !source.is_dsd() {
+        return Err(format!(
+            "Reference album participant {} is no longer an authoritative DSD source",
+            track.id.source_ordinal,
+        ));
+    }
+    let source_rate_hz = source.sample_rate_hz.filter(|rate| *rate > 0).ok_or_else(|| {
+        format!(
+            "Reference album participant {} has no authoritative DSD sample rate",
+            track.id.source_ordinal,
+        )
+    })?;
+    let channels = source.channels.filter(|channels| *channels > 0).ok_or_else(|| {
+        format!(
+            "Reference album participant {} has no authoritative channel count",
+            track.id.source_ordinal,
+        )
+    })?;
+
+    let track_stem = pcm_true_peak_track_stem(&track.id);
+    let plan_work_dir = carrier_dir.join(format!("plan-{track_stem}"));
+    fs::create_dir_all(&plan_work_dir).map_err(|error| {
+        format!(
+            "could not create Reference album-prepass work directory {}: {error}",
+            plan_work_dir.display(),
+        )
+    })?;
+    let plan_request = plan_request_for_track_with_resolved_source(
+        req,
+        &track,
+        &realized.path,
+        planned_output,
+        plan_work_dir.clone(),
+        source.clone(),
+    )
+    .map_err(|error| {
+        format!(
+            "could not bind Reference album participant {} to the typed plan: {error}",
+            track.id.source_ordinal,
+        )
+    })?;
+    let plan = tonepoet_pipeline::plan_conversion(&plan_request).map_err(|error| {
+        format!(
+            "could not plan Reference album participant {}: {error}",
+            track.id.source_ordinal,
+        )
+    })?;
+    let summary = plan.reference.as_ref().ok_or_else(|| {
+        format!(
+            "Reference album participant {} lost qualified Reference authority",
+            track.id.source_ordinal,
+        )
+    })?;
+    let target_dbtp = match summary.gain_policy {
+        tonepoet_pipeline::ResolvedGainPolicy::TruePeakNormalize {
+            target_dbtp,
+            scope: tonepoet_pipeline::TruePeakScope::Album,
+            bound_gain: None,
+            ..
+        } => target_dbtp,
+        tonepoet_pipeline::ResolvedGainPolicy::TruePeakNormalize {
+            scope: tonepoet_pipeline::TruePeakScope::Album,
+            bound_gain: Some(_),
+            ..
+        } => {
+            return Err(format!(
+                "Reference album participant {} reached the prepass with a stale runtime scalar",
+                track.id.source_ordinal,
+            ));
+        }
+        other => {
+            return Err(format!(
+                "Reference album participant {} resolved unexpected prepass gain policy {other:?}",
+                track.id.source_ordinal,
+            ));
+        }
+    };
+    let source_kind = plan_request
+        .source
+        .dsd_source_kind
+        .clone()
+        .ok_or_else(|| {
+            format!(
+                "Reference album participant {} has no admitted DSD source identity",
+                track.id.source_ordinal,
+            )
+        })?;
+    if matches!(
+        source_kind,
+        tonepoet_pipeline::DsdSourceKind::SacdTrack { .. }
+            | tonepoet_pipeline::DsdSourceKind::UnknownDsdContainer
+    ) {
+        return Err(format!(
+            "Reference album participant {} uses an unqualified source front-end",
+            track.id.source_ordinal,
+        ));
+    }
+
+    let scratch = tonepoet_pipeline::reference_scratch_paths(&plan_request)
+        .map_err(|error| error.to_string())?;
+    let materialization = materialize_reference_source_for_album_gain(
+        &plan_request,
+        &track,
+        &realized.path,
+        &scratch,
+        cancel,
+    )
+    .await
+    .map_err(|error| {
+        format!(
+            "could not materialize Reference album participant {}: {}",
+            track.id.source_ordinal, error.error,
+        )
+    })?;
+
+    let carrier_hash = stable_path_hash(&original_source_path);
+    let carrier_path = carrier_dir.join(format!(
+        "track-{track_stem}-{carrier_hash}.reference-protected.w64"
+    ));
+    let _ = fs::remove_file(&carrier_path);
+    let render = tonepoet_pipeline::build_reference_protected_reconstruction_command(
+        &materialization.path,
+        &carrier_path,
+        summary.final_pcm.sample_rate_hz,
+        summary.profile,
+        source.duration,
+    );
+    let render_result = run_dsd_true_peak_planned_command(
+        &render,
+        runner,
+        cancel,
+        tool_concurrency_limits.as_ref(),
+    )
+    .await;
+    if let Err(error) = render_result {
+        let _ = fs::remove_file(&carrier_path);
+        cleanup_reference_album_prepass_scratch(&scratch, &plan_work_dir);
+        return Err(format!(
+            "Reference album participant {} could not realize protected R64: {error}",
+            track.id.source_ordinal,
+        ));
+    }
+
+    let structure = (|| -> Result<tonepoet_pipeline::W64ExactStructure, String> {
+        let mut file = fs::File::open(&carrier_path).map_err(|error| {
+            format!(
+                "could not open retained Reference album carrier {}: {error}",
+                carrier_path.display(),
+            )
+        })?;
+        tonepoet_pipeline::inspect_exact_w64_pcm(
+            &mut file,
+            tonepoet_pipeline::W64PcmFormatExpectation {
+                sample_rate_hz: summary.final_pcm.sample_rate_hz,
+                channels: summary.final_pcm.channels,
+                bits_per_sample: 64,
+                encoding: tonepoet_pipeline::W64SampleEncoding::FloatingPoint,
+            },
+        )
+        .map_err(|error| format!("retained Reference protected R64 failed exact validation: {error}"))
+    })();
+    let structure = match structure {
+        Ok(structure) if structure.sample_frames > 0 => structure,
+        Ok(_) => {
+            let _ = fs::remove_file(&carrier_path);
+            cleanup_reference_album_prepass_scratch(&scratch, &plan_work_dir);
+            return Err(format!(
+                "Reference album participant {} produced an empty protected R64",
+                track.id.source_ordinal,
+            ));
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&carrier_path);
+            cleanup_reference_album_prepass_scratch(&scratch, &plan_work_dir);
+            return Err(error);
+        }
+    };
+
+    let scan_path = carrier_path.clone();
+    let scan_cancel = cancel.clone();
+    let expectation = tonepoet_pipeline::W64PcmExpectation {
+        sample_rate_hz: summary.final_pcm.sample_rate_hz,
+        channels: summary.final_pcm.channels,
+        bits_per_sample: 64,
+        sample_frames: structure.sample_frames,
+        encoding: tonepoet_pipeline::W64SampleEncoding::FloatingPoint,
+    };
+    let scan_tier = summary.certified_scan_tier();
+    let observation = tokio::task::spawn_blocking(move || {
+        scan_reference_w64_certified_peak(
+            &scan_path,
+            structure,
+            expectation,
+            tonepoet_pipeline::MeasurementId(1),
+            tonepoet_pipeline::TruePeakPurpose::GainAuthority,
+            tonepoet_pipeline::ReferenceObservationSubject::ProtectedR64,
+            scan_tier,
+            &scan_cancel,
+        )
+    })
+    .await
+    .map_err(|error| format!("Reference album certified scan task failed: {error}"))?
+    .map_err(|error| {
+        format!(
+            "Reference album participant {} certified scan failed: {error}",
+            track.id.source_ordinal,
+        )
+    })?;
+    let carrier_sha256 = sha256_file(&carrier_path).map_err(|error| {
+        format!(
+            "Reference album participant {} carrier integrity hash failed: {error}",
+            track.id.source_ordinal,
+        )
+    })?;
+    let (measurement, terminal_bound) = tonepoet_pipeline::reference_album_gain_constraint(
+        &observation,
+        summary.gain_policy,
+        tonepoet_true_peak::HQ1024V1_RECONSTRUCTION_LINF_GAIN_UPPER,
+    )
+    .map_err(|error| {
+        format!(
+            "Reference album participant {} could not derive its terminal-safe constraint: {error}",
+            track.id.source_ordinal,
+        )
+    })?;
+
+    cleanup_reference_album_prepass_scratch(&scratch, &plan_work_dir);
+    let track_id = track.id.clone();
+    Ok(PreparedReferenceAutoGainCarrier {
+        source_ref: TrackSourceRef::DsdReferenceAutoGainCarrier {
+            path: carrier_path,
+            source_path: original_source_path,
+            source_sample_rate_hz: source_rate_hz,
+            sample_rate_hz: summary.final_pcm.sample_rate_hz,
+            channels,
+            duration: source.duration,
+            source_kind,
+            gain_db: None,
+            target_dbtp,
+            unbound_semantic_plan_hash: summary.semantic_plan_hash_v1,
+            source_content_sha256: materialization.source_content_sha256,
+            canonical_materialization_sha256: materialization.canonical_materialization_sha256,
+            carrier_sha256,
+            observation,
+        },
+        measurement: ReferenceAutoGainPreparedMeasurement {
+            track_id,
+            measurement,
+            terminal_bound,
+            target_dbtp,
+        },
+    })
+}
+
+async fn prepare_reference_auto_gain_carriers(
+    req: &PipelineRequest,
+    prepared: &mut PreparedSource,
+    album_plan: &AlbumPlan,
+    staging: &StagingDir,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
+) -> Result<PreparedReferenceAutoGainCarriers, String> {
+    let album_members = req
+        .album_batch
+        .as_ref()
+        .map(|batch| batch.expected_track_count)
+        .unwrap_or(1);
+    if !req.settings.dsd.reference_delivery_selected()
+        || !req.settings.dsd.from_dsd.reference_auto_gain_selected()
+        || !req.settings.dsd.reference_auto_album_gain_possible()
+        || album_members <= 1
+    {
+        return Ok(PreparedReferenceAutoGainCarriers::default());
+    }
+
+    let selected = album_plan
+        .entries
+        .iter()
+        .map(|entry| entry.track_id.clone())
+        .collect::<BTreeSet<_>>();
+    let carrier_dir = staging.root.join("reference-auto-gain");
+    fs::create_dir_all(&carrier_dir).map_err(|error| {
+        format!("could not create Reference auto-gain staging: {error}")
+    })?;
+    let jobs = prepared
+        .tracks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, track)| {
+            if !selected.contains(&track.id) || !prepared_track_uses_dsd_source(track) {
+                return None;
+            }
+            let planned_output = album_plan
+                .entries
+                .iter()
+                .find(|entry| entry.track_id == track.id)?
+                .final_path
+                .clone();
+            Some((index, track.clone(), planned_output))
+        })
+        .collect::<Vec<_>>();
+    if jobs.is_empty() {
+        return Ok(PreparedReferenceAutoGainCarriers::default());
+    }
+
+    let analysis_cancel = cancel.child_token();
+    type ReferenceAutoGainFuture<'a> = std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = (usize, Result<PreparedReferenceAutoGainCarrier, String>),
+                > + Send
+                + 'a,
+        >,
+    >;
+    let mut pending: Vec<Option<ReferenceAutoGainFuture<'_>>> = jobs
+        .into_iter()
+        .map(|(index, track, planned_output)| {
+            let task_cancel = analysis_cancel.clone();
+            let task_limits = tool_concurrency_limits.clone();
+            let task_carrier_dir = carrier_dir.as_path();
+            Some(Box::pin(async move {
+                let result = prepare_reference_auto_gain_carrier_for_track(
+                    req,
+                    track,
+                    &planned_output,
+                    staging,
+                    task_carrier_dir,
+                    runner,
+                    &task_cancel,
+                    task_limits,
+                )
+                .await;
+                (index, result)
+            }) as ReferenceAutoGainFuture<'_>)
+        })
+        .collect();
+    let mut remaining = pending.len();
+    let mut carriers = std::iter::repeat_with(|| None)
+        .take(prepared.tracks.len())
+        .collect::<Vec<Option<PreparedReferenceAutoGainCarrier>>>();
+    let mut first_error = None;
+    while remaining > 0 {
+        let (track_index, result) = std::future::poll_fn(|cx| {
+            for slot in &mut pending {
+                let ready = slot.as_mut().and_then(|future| {
+                    match std::future::Future::poll(future.as_mut(), cx) {
+                        std::task::Poll::Ready(output) => Some(output),
+                        std::task::Poll::Pending => None,
+                    }
+                });
+                if let Some(output) = ready {
+                    *slot = None;
+                    return std::task::Poll::Ready(output);
+                }
+            }
+            std::task::Poll::Pending
+        })
+        .await;
+        remaining -= 1;
+        match result {
+            Ok(carrier) if first_error.is_none() => carriers[track_index] = Some(carrier),
+            Ok(_) => {}
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                    analysis_cancel.cancel();
+                }
+            }
+        }
+    }
+    if let Some(error) = first_error {
+        for carrier in carriers.into_iter().flatten() {
+            if let TrackSourceRef::DsdReferenceAutoGainCarrier { path, .. } = carrier.source_ref {
+                let _ = fs::remove_file(path);
+            }
+        }
+        return Err(error);
+    }
+
+    let mut measurements = Vec::new();
+    for (track_index, carrier) in carriers.into_iter().enumerate() {
+        let Some(carrier) = carrier else {
+            continue;
+        };
+        prepared.tracks[track_index].source_ref = carrier.source_ref;
+        measurements.push(carrier.measurement);
+    }
+    Ok(PreparedReferenceAutoGainCarriers { measurements })
+}
+
 struct PreparedDsdTruePeakCarrier {
     source_ref: TrackSourceRef,
     measurement: CertifiedTruePeakPreparedMeasurement,
@@ -38766,7 +39631,13 @@ async fn prepare_pipeline_item_for_scheduler_scoped_inner(
     // ordinary per-item rerun gate skip one participant before the aggregate is
     // bound; doing so could silently reuse an output normalized against a
     // different submitted set.
-    let submitted_album_gain_selected = req.settings.dsd.album_true_peak_gain_selected()
+    let reference_auto_album_selected = req.settings.dsd.reference_auto_album_gain_possible()
+        && req
+            .album_batch
+            .as_ref()
+            .is_some_and(|batch| batch.expected_track_count > 1);
+    let submitted_album_gain_selected = reference_auto_album_selected
+        || req.settings.dsd.album_true_peak_gain_selected()
         || req.settings.pcm_true_peak.album_true_peak_gain_selected();
     if !submitted_album_gain_selected {
         if let super::rerun::RerunDecision::Skip {
@@ -38840,6 +39711,58 @@ async fn prepare_pipeline_item_for_scheduler_scoped_inner(
         }
         pre_actions_completed_before_album_gain_rerun = true;
     }
+
+    let prepared_reference_auto_gain_carriers = match prepare_reference_auto_gain_carriers(
+        &req,
+        &mut prepared,
+        &album_plan,
+        &staging,
+        runner,
+        cancel,
+        tool_concurrency_limits.clone(),
+    )
+    .await
+    {
+        Ok(carriers) => carriers,
+        Err(error) => {
+            let record = stage_record(
+                PipelineStage::Convert,
+                StageOutcome::Failed(format!(
+                    "submitted-batch Reference auto-gain analysis failed: {error}"
+                )),
+            );
+            emit_stage_finished(reporter, &item_id, record.clone()).await;
+            stages.push(record);
+            let failed = failed_track_records(&prepared, &error);
+            let outcome = AlbumOutcome::Blocked {
+                successful: Vec::new(),
+                failed,
+                stages,
+                reason: BlockReason::RequiredStageFailure(PipelineStage::Convert),
+            };
+            let published = publish_terminal_conversion_log_fragment_if_needed(
+                &req,
+                Some(&prepared),
+                None,
+                &outcome,
+                staging,
+                Some(runner),
+            );
+            return ScheduledMaterialization::Finished(
+                finalize_report(
+                    &req,
+                    reporter,
+                    Some(prepared),
+                    Some(album_plan),
+                    None,
+                    published,
+                    outcome,
+                )
+                .await,
+            );
+        }
+    };
+    let reference_auto_gain_measurements = prepared_reference_auto_gain_carriers.measurements;
 
     let prepared_album_gain_carriers = match prepare_dsd_true_peak_carriers(
         &req,
@@ -38956,6 +39879,7 @@ async fn prepare_pipeline_item_for_scheduler_scoped_inner(
         plan: album_plan,
         stages,
         source_replaygain: None,
+        reference_auto_gain_measurements,
         dsd_true_peak_measurements,
         pcm_true_peak_measurements,
         dsd_true_peak_timings,
@@ -41709,6 +42633,38 @@ pub(crate) async fn finish_pipeline_album_for_scheduler_with_tool_limits_and_ret
             ))
             .await;
         }
+        if let Err(err) = normalize_legacy_wrapped_flac_outputs_before_publish(
+            artifact_set,
+            &source_value,
+            &req,
+        ) {
+            let record = stage_record(
+                PipelineStage::Publish,
+                StageOutcome::Failed(format!(
+                    "failed to normalize legacy ID3-wrapped FLAC output: {err}"
+                )),
+            );
+            emit_stage_finished(reporter, &item_id, record.clone()).await;
+            current_outcome =
+                push_stage_and_reaggregate(current_outcome, record, req.failure_policy);
+            current_outcome = AlbumOutcome::Blocked {
+                successful: successful_tracks_from(&current_outcome),
+                failed: failed_tracks_from(&current_outcome),
+                stages: stages_from(&current_outcome),
+                reason: BlockReason::PublishFailed,
+            };
+            return_before_failure_publication_if_retryable_scratch!(current_outcome.clone());
+            return Box::pin(finalize_report(
+                &req,
+                reporter,
+                source,
+                plan,
+                artifacts,
+                published,
+                current_outcome,
+            ))
+            .await;
+        }
     }
 
     // Native Reference publication always carries manifest-v2 authority.
@@ -42853,6 +43809,35 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_once(
             return_before_failure_publication_if_retryable_scratch!(current_outcome.clone());
             return finalize_report(
                 &req, reporter, source, plan, artifacts, published, current_outcome,
+            )
+            .await;
+        }
+        if let Err(err) =
+            normalize_legacy_wrapped_flac_outputs_before_publish(artifact_set, source_ref, &req)
+        {
+            let record = stage_record(
+                PipelineStage::Publish,
+                StageOutcome::Failed(format!(
+                    "failed to normalize legacy ID3-wrapped FLAC output: {err}"
+                )),
+            );
+            emit_stage_finished(reporter, &item_id, record.clone()).await;
+            stages.push(record);
+            current_outcome = AlbumOutcome::Blocked {
+                successful: successful_tracks_from(&current_outcome),
+                failed: failed_tracks_from(&current_outcome),
+                stages,
+                reason: BlockReason::PublishFailed,
+            };
+            return_before_failure_publication_if_retryable_scratch!(current_outcome.clone());
+            return finalize_report(
+                &req,
+                reporter,
+                source,
+                plan,
+                artifacts,
+                published,
+                current_outcome,
             )
             .await;
         }
@@ -45127,6 +46112,7 @@ fn companion_track_source_path_and_role(
     match source_ref {
         TrackSourceRef::StagedFile(path) => Some((path.as_path(), CompanionSourceRefRole::File)),
         TrackSourceRef::DsdTruePeakCarrier { source_path, .. }
+        | TrackSourceRef::DsdReferenceAutoGainCarrier { source_path, .. }
         | TrackSourceRef::PcmTruePeakCarrier { source_path, .. }
         | TrackSourceRef::RegisteredEffectCarrier { source_path, .. } => {
             Some((source_path.as_path(), CompanionSourceRefRole::File))
@@ -52805,6 +53791,7 @@ fn track_specific_template_source_file_path(source_ref: &TrackSourceRef) -> Opti
     match source_ref {
         TrackSourceRef::StagedFile(path) => Some(path.as_path()),
         TrackSourceRef::DsdTruePeakCarrier { .. }
+        | TrackSourceRef::DsdReferenceAutoGainCarrier { .. }
         | TrackSourceRef::PcmTruePeakCarrier { .. }
         | TrackSourceRef::RegisteredEffectCarrier { .. }
         | TrackSourceRef::CueStreamSegment { .. }
@@ -52822,6 +53809,7 @@ fn template_source_file_path(source_ref: &TrackSourceRef) -> Option<&Path> {
     match source_ref {
         TrackSourceRef::StagedFile(path) => Some(path.as_path()),
         TrackSourceRef::DsdTruePeakCarrier { source_path, .. }
+        | TrackSourceRef::DsdReferenceAutoGainCarrier { source_path, .. }
         | TrackSourceRef::PcmTruePeakCarrier { source_path, .. }
         | TrackSourceRef::RegisteredEffectCarrier { source_path, .. } => Some(source_path.as_path()),
         TrackSourceRef::CueStreamSegment { source_image, .. }
@@ -56523,6 +57511,7 @@ fn build_manifest_for_album(
                     .map(|t| match &t.source_ref {
                         TrackSourceRef::StagedFile(p) => p.clone(),
                         TrackSourceRef::DsdTruePeakCarrier { source_path, .. }
+                        | TrackSourceRef::DsdReferenceAutoGainCarrier { source_path, .. }
                         | TrackSourceRef::PcmTruePeakCarrier { source_path, .. }
                         | TrackSourceRef::RegisteredEffectCarrier { source_path, .. } => {
                             source_path.clone()
@@ -58471,7 +59460,7 @@ mod conversion_log_tests {
             tonepoet_pipeline::SampleGainPolicy::dsd_guard_default(),
         );
         let guard_log = build_conversion_log(&outcome, &dsd_source, &dsd_req, &artifacts, None);
-        assert!(guard_log.contains("DSD path: general"));
+        assert!(guard_log.contains("DSD path: custom"));
         assert!(guard_log.contains("DSD gain mode: true-peak guard"));
         assert!(guard_log.contains("DSD true-peak target: -0.100000000 dBTP"));
         assert!(guard_log.contains("DSD true-peak scope: track"));
@@ -58869,6 +59858,70 @@ mod conversion_log_tests {
             "{log}"
         );
         assert!(!log.contains("2822.4kHz FLAC"), "{log}");
+    }
+
+    #[test]
+    fn reference_int32_conversion_log_names_commissioned_ffmpeg_triangular_terminal() {
+        let mut source = log_test_source();
+        source.kind = SourceKind::SacdIso;
+        source.tracks[0].sample_rate = Some(DsdRate::Dsd64.hz());
+        source.tracks[0].bit_depth = None;
+        source.tracks[0].source_audio.bit_depth = None;
+        source.tracks[0].source_audio.coding = Some(SourceAudioCoding::Dsd);
+        source.tracks[0].source_ref = TrackSourceRef::SacdTrack {
+            iso: PathBuf::from("/music/source.iso"),
+            track_index: 0,
+            area: SacdArea::Stereo,
+        };
+
+        let mut req = log_test_request();
+        req.settings.target_format = PlannerAudioFormat::Wav;
+        req.settings.target_sample_rate = RateTarget::Source;
+        req.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int32);
+        req.settings.dsd = tonepoet_pipeline::DsdSettings::reference();
+
+        let mut record = ok_record();
+        record.verified_output_bit_depth = Some(PcmBitDepth::Int32);
+        record.commands = vec![
+            command_record_for(ToolBinary::Sox),
+            command_record_for(ToolBinary::Ffmpeg),
+        ];
+        record.commands[0].description =
+            Some("Normalize protected Reference Wave64 to true-scale Float64 carrier".to_string());
+        record.commands[0].sanitized_args = vec![
+            "-t".to_string(),
+            "raw".to_string(),
+            "-e".to_string(),
+            "floating-point".to_string(),
+            "-b".to_string(),
+            "64".to_string(),
+            "-L".to_string(),
+        ];
+        record.commands[1].description =
+            Some("Commissioned Reference FFmpeg Int32 triangular terminal".to_string());
+        record.commands[1].sanitized_args = vec![
+            "-af".to_string(),
+            "aresample=resampler=soxr:out_sample_rate=88200:precision=33:cutoff=0.95:dither_method=triangular:out_sample_fmt=s32".to_string(),
+            "-c:a".to_string(),
+            "pcm_s32le".to_string(),
+        ];
+
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![record],
+            stages: stage_records(),
+        };
+        let log = build_conversion_log(
+            &outcome,
+            &source,
+            &req,
+            &log_test_artifacts(),
+            None,
+        );
+
+        assert!(log.contains(
+            "Dither: yes (TPDF, commissioned FFmpeg/libswresample Int32 triangular terminal, Reference policy)"
+        ), "{log}");
+        assert!(!log.contains("Dither: yes (TPDF, sox_ng, Reference policy)"), "{log}");
     }
 
     #[test]
@@ -63716,6 +64769,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                 plan,
                 stages: Vec::new(),
                 source_replaygain: None,
+                reference_auto_gain_measurements: Vec::new(),
                 dsd_true_peak_measurements: Vec::new(),
                 pcm_true_peak_measurements: Vec::new(),
                 dsd_true_peak_timings: BTreeMap::new(),

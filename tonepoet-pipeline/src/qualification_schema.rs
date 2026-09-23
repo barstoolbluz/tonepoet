@@ -448,14 +448,52 @@ pub const REFERENCE_ACCEPTED_PHASE4_SHA256: &str = "2f34c5e74af049f132b9bfd0eb27
 pub const REFERENCE_DESIGN_HANDOFF_SHA256: &str = "cfda6bd32495e21124f73198a4d52a8ff304adb28cd16b16d3c389e6b567bbd5";
 /// Digest of the inherited v16 evidence retained as historical context.
 pub const REFERENCE_INHERITED_V16_EVIDENCE_SHA256: &str = "cbea231eb727598ac547dc7346c5ab9a0f6182aeaacdc3e205ec916517ae2b53";
-/// Certified in-process peak-observer identity used by Reference gain and acceptance.
-pub const REFERENCE_CERTIFIED_OBSERVER_ID: &str = "tonepoet-true-peak:fast066v2_reference/certified_peak_meter/v1";
+/// Default certified in-process peak-observer identity used by Reference gain and acceptance.
+pub const REFERENCE_CERTIFIED_OBSERVER_ID: &str = "tonepoet-true-peak:fast066v2_standard/certified_peak_meter/v1";
 /// Named certified finite reconstruction target.
 pub const REFERENCE_CERTIFIED_RECONSTRUCTION: &str = "hq1024_v1";
 /// Certified finite-target endpoint policy.
 pub const REFERENCE_CERTIFIED_EDGE_POLICY: &str = "repeat_endpoints";
-/// Search tier admitted for qualified Reference observation.
-pub const REFERENCE_CERTIFIED_SCAN_TIER: &str = "reference";
+/// Default search tier for qualified Reference observation.
+pub const REFERENCE_CERTIFIED_SCAN_TIER: &str = "standard";
+
+/// Stable certified observer identity for one selected Reference scan tier.
+#[must_use]
+pub const fn reference_certified_observer_id(scan: crate::TruePeakScanTier) -> &'static str {
+    match scan {
+        crate::TruePeakScanTier::Reference => {
+            "tonepoet-true-peak:fast066v2_reference/certified_peak_meter/v1"
+        }
+        crate::TruePeakScanTier::Standard => {
+            "tonepoet-true-peak:fast066v2_standard/certified_peak_meter/v1"
+        }
+        crate::TruePeakScanTier::Fast => {
+            "tonepoet-true-peak:fast066v2_fast/certified_peak_meter/v1"
+        }
+    }
+}
+
+/// Stable evidence token for one selected Reference scan tier.
+#[must_use]
+pub const fn reference_certified_scan_tier_name(scan: crate::TruePeakScanTier) -> &'static str {
+    match scan {
+        crate::TruePeakScanTier::Reference => "reference",
+        crate::TruePeakScanTier::Standard => "standard",
+        crate::TruePeakScanTier::Fast => "fast",
+    }
+}
+
+/// Parse an admitted Reference scan-tier evidence token.
+#[must_use]
+pub fn reference_certified_scan_tier(value: &str) -> Option<crate::TruePeakScanTier> {
+    match value {
+        "reference" => Some(crate::TruePeakScanTier::Reference),
+        "standard" => Some(crate::TruePeakScanTier::Standard),
+        "fast" => Some(crate::TruePeakScanTier::Fast),
+        _ => None,
+    }
+}
+
 /// Certificate component that has ceiling authority.
 pub const REFERENCE_CERTIFIED_AUTHORITY_ENDPOINT: &str = "finite_interval_upper";
 /// Stable common typed planner identity.
@@ -473,7 +511,7 @@ pub const REFERENCE_METADATA_MUTATION_ID: &str = "tonepoet:reference_metadata_mu
 /// Post-mutation decoded-sample identity authority.
 pub const REFERENCE_POST_METADATA_IDENTITY_ID: &str = "tonepoet:reference_post_metadata_sample_identity/v16";
 /// Reference terminal-realization authority using the common linear error calculus.
-pub const REFERENCE_TERMINAL_ID: &str = "tonepoet:reference_terminal_realization/hq1024_linear_error/v1";
+pub const REFERENCE_TERMINAL_ID: &str = "tonepoet:reference_terminal_realization/hq1024_linear_error/v2";
 /// Candidate declaration: concrete numerical source digest is supplied by the build closure.
 pub const REFERENCE_NUMERICAL_SOURCE_BINDING: &str =
     "build-bound:TONEPOET_TRUE_PEAK_SOURCE_SHA256/v1";
@@ -575,7 +613,7 @@ impl ReferenceCommonPrimitiveClosureV1 {
     #[must_use]
     pub fn current_declaration() -> Self {
         Self {
-            policy_identity: "sox_ng_14_8_0_1_v16+common-v17-candidate".to_string(),
+            policy_identity: "sox_ng_14_8_0_1_v17+common-v17-candidate".to_string(),
             semantic_plan_identity: REFERENCE_COMMON_PLANNER_ID.to_string(),
             numerical_implementation: REFERENCE_NUMERICAL_SOURCE_BINDING.to_string(),
             common_implementation_source: REFERENCE_COMMON_SOURCE_BINDING.to_string(),
@@ -585,11 +623,14 @@ impl ReferenceCommonPrimitiveClosureV1 {
             reader_decode_implementation: format!(
                 "{REFERENCE_R64_READER_ID}+{REFERENCE_QPCM_READER_ID}"
             ),
-            tool_identity_version_closure:
-                "sox-ng-14.8.0.1+ffmpeg-qualified-v16+phase4-native-metadata".to_string(),
+            tool_identity_version_closure: format!(
+                "sox-ng-14.8.0.1+{}+phase4-native-metadata",
+                crate::FFMPEG_INT32_TRIANGULAR_TERMINAL_AUTHORITY_ID,
+            ),
             reconstruction_profile: "sealed-reference-profile-matrix-v16".to_string(),
             terminal_implementation: REFERENCE_TERMINAL_ID.to_string(),
-            dither_quantization_policy: "sealed-reference-terminal-depth-policy-v16".to_string(),
+            dither_quantization_policy:
+                "sealed-reference-terminal-depth-policy-v17-int32-ffmpeg-triangular-tpdf".to_string(),
             metadata_writer_route: REFERENCE_METADATA_MUTATION_ID.to_string(),
             post_mutation_checks: REFERENCE_POST_METADATA_IDENTITY_ID.to_string(),
             simd_implementation: REFERENCE_SIMD_BINDING.to_string(),
@@ -725,7 +766,7 @@ pub const REFERENCE_REQUIRED_RELEASE_GATES: [&str; 12] = [
     "Q02",
     "GAIN08",
     "GAIN09",
-    "wave64_integrity_60_cell",
+    "wave64_integrity_80_cell",
     "complete_reader",
     "package_identity",
     "post_metadata_identity",
@@ -874,6 +915,27 @@ impl ReferenceReleaseCertificationV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reference_observer_identity_round_trips_every_admitted_scan_tier() {
+        assert_eq!(
+            reference_certified_observer_id(crate::TruePeakScanTier::Standard),
+            REFERENCE_CERTIFIED_OBSERVER_ID,
+        );
+        assert_eq!(
+            reference_certified_scan_tier_name(crate::TruePeakScanTier::Standard),
+            REFERENCE_CERTIFIED_SCAN_TIER,
+        );
+        for scan in [
+            crate::TruePeakScanTier::Reference,
+            crate::TruePeakScanTier::Standard,
+            crate::TruePeakScanTier::Fast,
+        ] {
+            let name = reference_certified_scan_tier_name(scan);
+            assert_eq!(reference_certified_scan_tier(name), Some(scan));
+            assert!(reference_certified_observer_id(scan).contains(name));
+        }
+    }
 
     fn synthetic_canonical_evidence() -> ReferenceStreamedWavCapacityEvidenceV2 {
         let accepted_payload =

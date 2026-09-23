@@ -164,6 +164,16 @@ fn validate_certified_carrier_album_gain_authority(
                 == Some(tonepoet_pipeline::TruePeakScope::Album),
             "DSD",
         ),
+        TrackSourceRef::DsdReferenceAutoGainCarrier { gain_db, .. } => (
+            request.settings.dsd.runtime_album_gain_db(),
+            *gain_db,
+            request.settings.dsd.reference_delivery_selected()
+                && request.settings.dsd.from_dsd.reference_auto_gain_selected()
+                && request.settings.dsd.from_dsd.resolved_reference_gain_scope(
+                    &reference_programme_scope(request, track),
+                ) == Some(tonepoet_pipeline::TruePeakScope::Album),
+            "Reference DSD",
+        ),
         TrackSourceRef::PcmTruePeakCarrier { gain_db, .. } => (
             request.settings.pcm_true_peak.runtime_album_gain_db(),
             *gain_db,
@@ -464,10 +474,15 @@ fn plan_request_for_track_impl(
                 }
             }
         }
-    } else if settings.dsd.runtime_album_gain_db().is_some() {
+    } else if settings.dsd.runtime_album_gain_db().is_some()
+        && !matches!(&track.source_ref, TrackSourceRef::DsdReferenceAutoGainCarrier { .. })
+    {
         // The submitted-batch authority applies only to DSD tracks that were
         // measured into explicit album-gain carriers. A mixed DSD/non-DSD
         // source must never apply that gain to its ordinary PCM members.
+        // A retained Reference album carrier is exactly such a measured DSD
+        // track: its common scalar stays on the DSD policy surface so the
+        // Reference planner binds it.
         settings.dsd.set_runtime_album_gain_db(None);
     }
     if !matches!(
@@ -750,6 +765,9 @@ fn reference_source_kind(
     track: &PreparedTrack,
     realized_input: &Path,
 ) -> Result<DsdSourceKind, ConvertError> {
+    if let TrackSourceRef::DsdReferenceAutoGainCarrier { source_kind, .. } = &track.source_ref {
+        return Ok(source_kind.clone());
+    }
     if matches!(&track.source_ref, TrackSourceRef::SacdTrack { .. }) {
         // SACD Reference cells are unavailable in P0. Do not read the ISO TOC
         // while constructing a plan merely to reject the cell afterward. When
@@ -2335,6 +2353,39 @@ pub fn source_info_for_realized_track(
     track: &PreparedTrack,
     realized_input: &Path,
 ) -> Result<SourceInfo, ConvertError> {
+    if let TrackSourceRef::DsdReferenceAutoGainCarrier {
+        source_sample_rate_hz,
+        channels,
+        duration,
+        source_kind,
+        ..
+    } = &track.source_ref
+    {
+        let format = match source_kind {
+            DsdSourceKind::DsfUncompressed => PlannerFormat::Dsf,
+            DsdSourceKind::DsdiffUncompressed | DsdSourceKind::DsdiffDst => PlannerFormat::Dff,
+            DsdSourceKind::SacdTrack { .. } | DsdSourceKind::UnknownDsdContainer => {
+                return Err(ConvertError::Backend(
+                    "retained Reference album carrier has an unqualified source kind".to_string(),
+                ));
+            }
+        };
+        return Ok(SourceInfo {
+            dsd_source_kind: Some(source_kind.clone()),
+            format,
+            codec: PlannerCodec::Dsd,
+            sample_rate_hz: Some(*source_sample_rate_hz),
+            bit_depth: None,
+            true_source_depth: None,
+            source_representation: SourceRepresentationKind::Dsd,
+            sample_kind: Some(SampleKind::Dsd),
+            channels: Some(*channels),
+            duration: *duration,
+            frame_extent: None,
+            audio_md5: None,
+        });
+    }
+
     if let TrackSourceRef::DsdTruePeakCarrier {
         sample_rate_hz,
         channels,

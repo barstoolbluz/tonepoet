@@ -33,7 +33,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] } # evidence JSON is read back and compared as parsed f64
 toml = "0.8"
 toml_edit = "0.22"
 chrono = { version = "0.4", features = ["serde"] }

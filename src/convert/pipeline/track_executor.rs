@@ -56,7 +56,7 @@ use super::tool::{
     RetainedPcmScalarPump, ToolBinary, ToolCommand, ToolOutput, ToolRunner,
     ToolSegmentedPipelineError, ToolSegmentedPipelineOutput, ToolStreamSegment,
 };
-use super::types::{PlannedMetadataSatisfaction, PipelineRequest, PreparedTrack};
+use super::types::{PlannedMetadataSatisfaction, PipelineRequest, PreparedTrack, TrackSourceRef};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ReferenceToolIdentity {
@@ -2163,112 +2163,129 @@ pub(crate) async fn execute_planned_track_conversion_with_scalar_pump(
             admitted_plan.cleanup_paths(),
         )?;
 
-        let reference_materialization = if admitted_plan.reference.is_some() {
+        let mut plan = admitted_plan;
+        let reference_source_evidence = if plan.reference.is_some() {
             let scratch = reference_scratch.as_ref().ok_or_else(|| {
                 TrackExecutionError::new(
                     ConvertError::Backend("Reference scratch authority is missing".to_string()),
                     Vec::new(),
                 )
             })?;
-            let materialization = materialize_reference_source(
-                &plan_request,
-                track,
-                realized_input,
-                scratch,
-                cancel,
-                cleanup_guard.blocking_worker_lease()?,
-            )
-            .await?;
-            let admitted_source_kind = plan_request.source.dsd_source_kind.clone();
-            let admitted_target = plan_request.resolved_output_target;
-            let admitted_scope = plan_request.reference_programme_scope.clone();
-            let admitted_summary = admitted_plan.reference.as_ref().ok_or_else(|| {
-                TrackExecutionError::new(
-                    ConvertError::Backend("Reference plan authority is missing".to_string()),
-                    Vec::new(),
+            if let Some(evidence) = retained_reference_album_source_evidence(track) {
+                // Album preparation already ran the production source
+                // materializer, reconstructed the qualified protected R64, and
+                // certified that exact retained payload. The submitted-batch
+                // barrier binds only the common scalar. Do not feed the retained
+                // Wave64 carrier back into the DSF/DSDIFF materializer here;
+                // final Reference execution verifies and consumes this carrier
+                // directly, while these hashes preserve the prepass source and
+                // canonical-materialization evidence in the final record.
+                Some(evidence)
+            } else {
+                let materialization = materialize_reference_source(
+                    &plan_request,
+                    track,
+                    realized_input,
+                    scratch,
+                    cancel,
+                    cleanup_guard.blocking_worker_lease()?,
                 )
-            })?;
-            let materialized_source = source_info_for_realized_track(track, &materialization.path)?;
-            if !materialized_source.codec.is_dsd()
-                || materialized_source.sample_rate_hz != plan_request.source.sample_rate_hz
-                || materialized_source.channels != plan_request.source.channels
-                || materialized_source.sample_kind != Some(tonepoet_pipeline::SampleKind::Dsd)
-            {
-                return Err(TrackExecutionError::new(
-                    ConvertError::Backend(
-                        "Reference private materialization changed the admitted DSD rate, channel count, or representation"
-                            .to_string(),
-                    ),
-                    Vec::new(),
-                ));
-            }
+                .await?;
+                let admitted_source_kind = plan_request.source.dsd_source_kind.clone();
+                let admitted_target = plan_request.resolved_output_target;
+                let admitted_scope = plan_request.reference_programme_scope.clone();
+                let admitted_summary = plan.reference.as_ref().ok_or_else(|| {
+                    TrackExecutionError::new(
+                        ConvertError::Backend("Reference plan authority is missing".to_string()),
+                        Vec::new(),
+                    )
+                })?;
+                let materialized_source =
+                    source_info_for_realized_track(track, &materialization.path)?;
+                if !materialized_source.codec.is_dsd()
+                    || materialized_source.sample_rate_hz != plan_request.source.sample_rate_hz
+                    || materialized_source.channels != plan_request.source.channels
+                    || materialized_source.sample_kind != Some(tonepoet_pipeline::SampleKind::Dsd)
+                {
+                    return Err(TrackExecutionError::new(
+                        ConvertError::Backend(
+                            "Reference private materialization changed the admitted DSD rate, channel count, or representation"
+                                .to_string(),
+                        ),
+                        Vec::new(),
+                    ));
+                }
 
-            // Rebind only the immutable private input path and carrier facts. Keep
-            // the original container/front-end identity: DSDIFF/DST and SACD/DST
-            // must remain qualified decode operations even though their private
-            // carrier is now uncompressed DSDIFF/DSD or DSF.
-            let mut rematerialized = plan_request.clone();
-            rematerialized.input_path = materialization.path.clone();
-            rematerialized.source.format = materialized_source.format;
-            rematerialized.source.codec = materialized_source.codec;
-            rematerialized.source.sample_rate_hz = materialized_source.sample_rate_hz;
-            rematerialized.source.bit_depth = materialized_source.bit_depth;
-            rematerialized.source.true_source_depth = materialized_source.true_source_depth;
-            rematerialized.source.source_representation = materialized_source.source_representation;
-            rematerialized.source.sample_kind = materialized_source.sample_kind;
-            rematerialized.source.channels = materialized_source.channels;
-            rematerialized.source.duration = materialized_source.duration;
-            rematerialized.source.frame_extent = materialized_source.frame_extent;
-            rematerialized.source.audio_md5 = materialized_source.audio_md5;
-            rematerialized.source.dsd_source_kind = admitted_source_kind.clone();
-            if rematerialized.resolved_output_target != admitted_target
-                || rematerialized.reference_programme_scope != admitted_scope
-            {
-                return Err(TrackExecutionError::new(
-                    ConvertError::Backend(
-                        "Reference target or programme authority changed during materialization"
-                            .to_string(),
-                    ),
-                    Vec::new(),
-                ));
+                // Rebind only the immutable private input path and carrier facts. Keep
+                // the original container/front-end identity: DSDIFF/DST and SACD/DST
+                // must remain qualified decode operations even though their private
+                // carrier is now uncompressed DSDIFF/DSD or DSF.
+                let mut rematerialized = plan_request.clone();
+                rematerialized.input_path = materialization.path.clone();
+                rematerialized.source.format = materialized_source.format;
+                rematerialized.source.codec = materialized_source.codec;
+                rematerialized.source.sample_rate_hz = materialized_source.sample_rate_hz;
+                rematerialized.source.bit_depth = materialized_source.bit_depth;
+                rematerialized.source.true_source_depth = materialized_source.true_source_depth;
+                rematerialized.source.source_representation =
+                    materialized_source.source_representation;
+                rematerialized.source.sample_kind = materialized_source.sample_kind;
+                rematerialized.source.channels = materialized_source.channels;
+                rematerialized.source.duration = materialized_source.duration;
+                rematerialized.source.frame_extent = materialized_source.frame_extent;
+                rematerialized.source.audio_md5 = materialized_source.audio_md5;
+                rematerialized.source.dsd_source_kind = admitted_source_kind.clone();
+                if rematerialized.resolved_output_target != admitted_target
+                    || rematerialized.reference_programme_scope != admitted_scope
+                {
+                    return Err(TrackExecutionError::new(
+                        ConvertError::Backend(
+                            "Reference target or programme authority changed during materialization"
+                                .to_string(),
+                        ),
+                        Vec::new(),
+                    ));
+                }
+                let rematerialized_plan = plan_conversion(&rematerialized).map_err(|err| {
+                    ConvertError::Backend(format!("planner failed after materialization: {err}"))
+                })?;
+                cleanup_guard.add_planner_paths(rematerialized_plan.cleanup_paths());
+                validate_reference_scratch_cleanup_authority(&rematerialized_plan, scratch)?;
+                let rematerialized_summary =
+                    rematerialized_plan.reference.as_ref().ok_or_else(|| {
+                        TrackExecutionError::new(
+                            ConvertError::Backend(
+                                "Reference authority disappeared after source materialization"
+                                    .to_string(),
+                            ),
+                            Vec::new(),
+                        )
+                    })?;
+                if admitted_summary.semantic_plan_hash_v1
+                    != rematerialized_summary.semantic_plan_hash_v1
+                    || admitted_summary.policy != rematerialized_summary.policy
+                    || admitted_summary.qualification_candidate_manifest_digest
+                        != rematerialized_summary.qualification_candidate_manifest_digest
+                {
+                    return Err(TrackExecutionError::new(
+                        ConvertError::Backend(
+                            "Reference semantic plan changed during source materialization"
+                                .to_string(),
+                        ),
+                        Vec::new(),
+                    ));
+                }
+                let evidence = ReferenceSourceEvidence::from(&materialization);
+                plan_request = rematerialized;
+                plan = rematerialized_plan;
+                Some(evidence)
             }
-            let rematerialized_plan = plan_conversion(&rematerialized)
-                .map_err(|err| ConvertError::Backend(format!("planner failed after materialization: {err}")))?;
-            cleanup_guard.add_planner_paths(rematerialized_plan.cleanup_paths());
-            validate_reference_scratch_cleanup_authority(&rematerialized_plan, scratch)?;
-            let rematerialized_summary = rematerialized_plan.reference.as_ref().ok_or_else(|| {
-                TrackExecutionError::new(
-                    ConvertError::Backend(
-                        "Reference authority disappeared after source materialization".to_string(),
-                    ),
-                    Vec::new(),
-                )
-            })?;
-            if admitted_summary.semantic_plan_hash_v1 != rematerialized_summary.semantic_plan_hash_v1
-                || admitted_summary.policy != rematerialized_summary.policy
-                || admitted_summary.qualification_candidate_manifest_digest
-                    != rematerialized_summary.qualification_candidate_manifest_digest
-            {
-                return Err(TrackExecutionError::new(
-                    ConvertError::Backend(
-                        "Reference semantic plan changed during source materialization".to_string(),
-                    ),
-                    Vec::new(),
-                ));
-            }
-            plan_request = rematerialized;
-            Some((materialization, rematerialized_plan))
         } else {
             None
         };
-        let mut plan = reference_materialization
-            .as_ref()
-            .map(|(_, plan)| plan.clone())
-            .unwrap_or(admitted_plan);
         cleanup_guard.add_planner_paths(plan.cleanup_paths());
-        validate_certified_terminal_candidate_realization(track, &plan_request, &plan).map_err(|error| {
-            TrackExecutionError::new(error, Vec::new())
-        })?;
+        validate_certified_terminal_candidate_realization(track, &plan_request, &plan)
+            .map_err(|error| TrackExecutionError::new(error, Vec::new()))?;
         let qualified_terminal_executable = qualified_ffmpeg_int32_dither_terminal_executable(
             track,
             &plan,
@@ -2358,6 +2375,8 @@ pub(crate) async fn execute_planned_track_conversion_with_scalar_pump(
                     let runtime = execute_reference_common_plan(
                         summary,
                         &plan_request,
+                        Some(&track.source_ref),
+                        reference_toolchain.as_ref(),
                         runner,
                         cancel,
                         tool_paths,
@@ -2420,28 +2439,44 @@ pub(crate) async fn execute_planned_track_conversion_with_scalar_pump(
                         format!("Finished track {}", track.id.source_ordinal),
                     )
                     .await;
-                let reference = match (reference_materialization.as_ref(), reference_toolchain, reference_runtime, plan.reference.clone()) {
-                    (Some((materialization, _)), Some(toolchain), Some(runtime), Some(summary)) => Some(ReferenceExecutionEvidence {
-                        original_source_kind: plan_request.source.dsd_source_kind.clone().ok_or_else(|| {
-                            TrackExecutionError::new(
-                                ConvertError::Backend("Reference source identity is missing after materialization".to_string()),
-                                commands.clone(),
-                            )
-                        })?,
-                        source_content_sha256: materialization.source_content_sha256,
-                        source_probe_digest: admitted_source_probe_digest,
-                        canonical_materialization_sha256: materialization.canonical_materialization_sha256,
-                        plan: summary,
-                        measurements: runtime.measurements,
-                        toolchain,
-                        resolved_command_hash: runtime.resolved_command_hash,
-                        pcm_verification: runtime.pcm_verification,
-                    }),
+                let reference = match (
+                    reference_source_evidence,
+                    reference_toolchain,
+                    reference_runtime,
+                    plan.reference.clone(),
+                ) {
+                    (Some(source_evidence), Some(toolchain), Some(runtime), Some(summary)) => {
+                        Some(ReferenceExecutionEvidence {
+                            original_source_kind: plan_request
+                                .source
+                                .dsd_source_kind
+                                .clone()
+                                .ok_or_else(|| {
+                                    TrackExecutionError::new(
+                                        ConvertError::Backend(
+                                            "Reference source identity is missing from execution authority"
+                                                .to_string(),
+                                        ),
+                                        commands.clone(),
+                                    )
+                                })?,
+                            source_content_sha256: source_evidence.source_content_sha256,
+                            source_probe_digest: admitted_source_probe_digest,
+                            canonical_materialization_sha256: source_evidence
+                                .canonical_materialization_sha256,
+                            plan: summary,
+                            measurements: runtime.measurements,
+                            toolchain,
+                            resolved_command_hash: runtime.resolved_command_hash,
+                            pcm_verification: runtime.pcm_verification,
+                        })
+                    }
                     (None, None, None, None) => None,
                     _ => {
                         return Err(TrackExecutionError::new(
                             ConvertError::Backend(
-                                "Reference plan/materialization/runtime authority is incomplete".to_string(),
+                                "Reference plan/materialization/runtime authority is incomplete"
+                                    .to_string(),
                             ),
                             commands,
                         ));
@@ -2533,7 +2568,7 @@ fn effective_metadata_satisfaction(
 
 
 // Append-only v15 checker markers. These strings identify immutable historical
-// evidence; runtime activation and all current includes are v16.
+// evidence; runtime activation and all current includes are v17.
 #[allow(
     dead_code,
     reason = "append-only v15 checker markers remain source evidence for immutable historical qualification"
@@ -2580,7 +2615,7 @@ struct EmbeddedReferenceQualificationVersionProbe {
 }
 
 /// Historical policy manifests use their generation's immutable wire shape.
-/// Keep those shapes parseable without weakening the strict active-v16 schema.
+/// Keep those shapes parseable without weakening the strict active-v17 schema.
 #[allow(dead_code)]
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2594,6 +2629,8 @@ struct HistoricalEmbeddedReferenceQualification {
     analyzer: serde_json::Value,
     #[serde(default)]
     packaging: Option<serde_json::Value>,
+    #[serde(default)]
+    w64_integrity: Option<serde_json::Value>,
     #[serde(default)]
     sample_identity: Option<serde_json::Value>,
     #[serde(default)]
@@ -2625,7 +2662,7 @@ fn parse_embedded_reference_qualification_wire(
     let probe: EmbeddedReferenceQualificationVersionProbe = serde_json::from_str(raw)
         .map_err(|error| format!("qualification manifest version probe failed: {error}"))?;
     match probe.schema_version {
-        1..=15 => serde_json::from_str(raw)
+        1..=16 => serde_json::from_str(raw)
             .map(EmbeddedReferenceQualificationWire::Historical)
             .map_err(|error| {
                 format!(
@@ -2633,11 +2670,11 @@ fn parse_embedded_reference_qualification_wire(
                     probe.schema_version
                 )
             }),
-        16 => serde_json::from_str(raw)
+        17 => serde_json::from_str(raw)
             .map(EmbeddedReferenceQualificationWire::Current)
-            .map_err(|error| format!("current qualification schema v16 is invalid: {error}")),
+            .map_err(|error| format!("current qualification schema v17 is invalid: {error}")),
         other => Err(format!(
-            "unsupported qualification schema version {other}; current runtime supports historical v1-v15 parsing and strict v16 activation"
+            "unsupported qualification schema version {other}; current runtime supports historical v1-v16 parsing and strict v17 activation"
         )),
     }
 }
@@ -2824,9 +2861,11 @@ struct EmbeddedQualifiedSox {
 #[serde(deny_unknown_fields)]
 struct EmbeddedQualifiedFfmpeg {
     major_version: u32,
+    version: String,
     package_attribute: String,
     nixpkgs_revision: String,
     nixpkgs_nar_hash: String,
+    int32_triangular_terminal_authority: String,
     required_probe_markers: Vec<String>,
 }
 
@@ -3081,6 +3120,7 @@ struct EmbeddedTerminalBounds {
     post_final_acceptance_reserve_basis: String,
     int16_shibata: EmbeddedTerminalBound,
     int24_tpdf: EmbeddedTerminalBound,
+    int32_tpdf: EmbeddedTerminalBound,
     float32: EmbeddedTerminalBound,
     float64: EmbeddedTerminalBound,
 }
@@ -3148,7 +3188,7 @@ fn validate_terminal_effects_certification(
                 "the embedded release-certification report has no terminal maxima by depth",
             )
         })?;
-    let expected_depth_keys = BTreeSet::from(["int24", "float32", "float64"]);
+    let expected_depth_keys = BTreeSet::from(["int24", "int32", "float32", "float64"]);
     if observed
         .keys()
         .map(String::as_str)
@@ -3348,6 +3388,10 @@ fn exact_string_array(value: Option<&serde_json::Value>, expected: &[&str]) -> b
 }
 /// Historical v16 release-evidence audit only. Phase-5 runtime attestation must not call this.
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "source-locked historical audit material consumed by derive_dsd_reference_v8_terminal_bounds.py"
+)]
 fn validate_embedded_release_certification(
     manifest: &EmbeddedReferenceQualification,
 ) -> Result<(), TrackExecutionError> {
@@ -3851,7 +3895,7 @@ fn validate_embedded_release_certification(
         192_000, 352_800, 384_000, 705_600, 768_000,
     ];
     let expected_channels = [1_u64, 2_u64];
-    let expected_depths = ["int24", "float32", "float64"];
+    let expected_depths = ["int24", "int32", "float32", "float64"];
     let mut observed_cells = BTreeSet::new();
     let mut observed_malformed_all_zero_cells = 0_u64;
     let mut observed_valid_all_zero_cells = 0_u64;
@@ -3955,7 +3999,7 @@ fn validate_embedded_release_certification(
             != Some("tonepoet-reference-w64-exact-integrity/v1")
         || w64_integrity.get("status").and_then(serde_json::Value::as_str) != Some("passed")
         || w64_integrity.get("policy").and_then(serde_json::Value::as_str)
-            != Some(tonepoet_pipeline::DSD_REFERENCE_POLICY_V16_KEY)
+            != Some(tonepoet_pipeline::DSD_REFERENCE_POLICY_V17_KEY)
         || w64_integrity.get("parser_authority").and_then(serde_json::Value::as_str)
             != Some("independent_root_and_chunk_traversal_exact/v1")
         || w64_integrity.get("carrier_contract_digest").and_then(serde_json::Value::as_str)
@@ -3988,20 +4032,20 @@ fn validate_embedded_release_certification(
                 values.iter().map(serde_json::Value::as_u64).collect::<Option<Vec<_>>>()
                     != Some(expected_channels.to_vec())
             })
-        || w64_integrity.get("cell_count").and_then(serde_json::Value::as_u64) != Some(60)
+        || w64_integrity.get("cell_count").and_then(serde_json::Value::as_u64) != Some(80)
         || w64_integrity.get("malformed_all_zero_cell_count")
             .and_then(serde_json::Value::as_u64) != Some(observed_malformed_all_zero_cells)
         || w64_integrity.get("valid_all_zero_cell_count")
             .and_then(serde_json::Value::as_u64) != Some(observed_valid_all_zero_cells)
-        || observed_malformed_all_zero_cells + observed_valid_all_zero_cells != 60
+        || observed_malformed_all_zero_cells + observed_valid_all_zero_cells != 80
         || w64_integrity.get("uncharacterized_enabled_cells")
             .and_then(serde_json::Value::as_u64) != Some(0)
         || w64_integrity.get("same_path_qpcm_package_hash_counted_as_independent_packaging")
             .and_then(serde_json::Value::as_bool) != Some(false)
         || w64_integrity.get("w64_delivery_mode").and_then(serde_json::Value::as_str)
             != Some("terminal_qpcm_is_delivered_directly_after_exact_structure_and_full_consumer_traversal")
-        || w64_cells.len() != 60
-        || observed_cells.len() != 60
+        || w64_cells.len() != 80
+        || observed_cells.len() != 80
     {
         return Err(reference_toolchain_error(
             "the embedded exact Wave64 integrity evidence is incomplete or non-canonical",
@@ -5363,7 +5407,7 @@ fn validate_embedded_reference_policy_tables(
             != "identity continuity only; not independent packaging evidence"
     {
         return Err(reference_toolchain_error(
-            "embedded Float64 package contract disagrees with the compiled v16 policy",
+            "embedded Float64 package contract disagrees with the compiled v17 policy",
         ));
     }
     let expected_w64_invariants = [
@@ -5396,10 +5440,10 @@ fn validate_embedded_reference_policy_tables(
             .enabled_depths
             .iter()
             .map(String::as_str)
-            .eq(["int24", "float32", "float64"])
+            .eq(["int24", "int32", "float32", "float64"])
         || manifest.w64_integrity.rates_hz.as_slice() != expected_w64_rates
         || manifest.w64_integrity.channels.as_slice() != [1_u16, 2_u16]
-        || manifest.w64_integrity.required_characterization_cell_count != 60
+        || manifest.w64_integrity.required_characterization_cell_count != 80
         || manifest.w64_integrity.boundary_region_resolution_base_fraction != "1/510"
         || manifest.w64_integrity.trigger_claim
             != "encoded_all_zero_after_depth_and_effects_quantization; input threshold is measured per cell and is not assumed"
@@ -5408,7 +5452,7 @@ fn validate_embedded_reference_policy_tables(
             .same_path_qpcm_package_hash_is_independent_packaging_evidence
     {
         return Err(reference_toolchain_error(
-            "embedded exact Wave64 integrity contract disagrees with the compiled v16 policy",
+            "embedded exact Wave64 integrity contract disagrees with the compiled v17 policy",
         ));
     }
 
@@ -5505,7 +5549,7 @@ fn validate_embedded_reference_policy_tables(
             != "ReferenceToolchainEvidence.metadata_mutators_and_execution_fingerprint_v1"
     {
         return Err(reference_toolchain_error(
-            "embedded decoded-sample identity contract disagrees with the compiled v16 policy",
+            "embedded decoded-sample identity contract disagrees with the compiled v17 policy",
         ));
     }
     if manifest.subprocess_environment.schema
@@ -5559,7 +5603,7 @@ fn validate_embedded_reference_policy_tables(
             != "append_only_policy_with_corrected_sox_ng_pin_or_independently_qualified_transport"
     {
         return Err(reference_toolchain_error(
-            "embedded streamed-WAV capacity contract disagrees with the compiled v16 policy",
+            "embedded streamed-WAV capacity contract disagrees with the compiled v17 policy",
         ));
     }
 
@@ -5620,7 +5664,7 @@ fn validate_embedded_reference_policy_tables(
         || carrier.analytic_grid_bound_db > manifest.analyzer.analyzer_residual_db
     {
         return Err(reference_toolchain_error(
-            "embedded analyzer carrier contract disagrees with the compiled v16 policy",
+            "embedded analyzer carrier contract disagrees with the compiled v17 policy",
         ));
     }
     let residual = &manifest.analyzer.residual_authority;
@@ -5726,7 +5770,7 @@ fn validate_embedded_reference_policy_tables(
             != "pinned_toolchain_throughput_floor_and_maximum_admission_arithmetic"
     {
         return Err(reference_toolchain_error(
-            "embedded analyzer qualification matrix disagrees with the compiled v16 policy",
+            "embedded analyzer qualification matrix disagrees with the compiled v17 policy",
         ));
     }
 
@@ -5857,6 +5901,11 @@ fn validate_embedded_reference_policy_tables(
             &manifest.terminal_bounds.int24_tpdf,
         ),
         (
+            "int32_tpdf",
+            PcmBitDepth::Int32,
+            &manifest.terminal_bounds.int32_tpdf,
+        ),
+        (
             "float32",
             PcmBitDepth::Float32,
             &manifest.terminal_bounds.float32,
@@ -5894,9 +5943,10 @@ fn validate_embedded_reference_policy_tables(
         let expected_realization = match depth {
             PcmBitDepth::Int16 => "int16-shibata-unqualified-no-conservative-bound",
             PcmBitDepth::Int24 => "int24-tpdf-2lsb",
+            PcmBitDepth::Int32 => "int32-ffmpeg-triangular-2lsb-plus-f64-scalar-2^-51",
             PcmBitDepth::Float32 => "float32-2^-23",
             PcmBitDepth::Float64 => "float64-sox-s32-effects-half-lsb-plus-f64-2^-51",
-            PcmBitDepth::Int8 | PcmBitDepth::Int32 => {
+            PcmBitDepth::Int8 => {
                 return Err(reference_toolchain_error(
                     "compiled terminal-bound table contains an unsupported depth",
                 ));
@@ -5933,7 +5983,7 @@ fn validate_embedded_qualification_report(
     let report = &manifest.qualification_report;
     let report_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v16_report.md"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v17_report.md"
     ));
     let guidance = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -5968,7 +6018,7 @@ fn validate_embedded_qualification_report(
     };
     if report.schema != "tonepoet-dsd-reference-policy-qualification-report/v1"
         || report.path
-            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v16_report.md"
+            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v17_report.md"
         || parse("policy report", &report.sha256)? != Sha256Digest::of_bytes(report_bytes)
         || parse("guidance", &report.guidance_sha256)? != Sha256Digest::of_bytes(guidance)
         || parse("decimation report", &report.decimation_report_sha256)?
@@ -6628,19 +6678,24 @@ fn validate_reference_production_promotion_evidence(
                 "could not parse the embedded Phase-5 Reference qualification report: {error}"
             ))
         })?;
-    report
-        .validate_completed(
-            candidate_bytes,
-            &toolchain.common_runtime_closure_fingerprint_sha256,
-            toolchain
-                .metadata_mutation_closure_fingerprint_sha256
-                .as_deref(),
-        )
-        .map_err(|reason| {
-            qualification_unavailable_error(format!(
+    let unqualified_override = reference_unqualified_override_active();
+    if let Err(reason) = report.validate_completed(
+        candidate_bytes,
+        &toolchain.common_runtime_closure_fingerprint_sha256,
+        toolchain
+            .metadata_mutation_closure_fingerprint_sha256
+            .as_deref(),
+    ) {
+        if unqualified_override && reason.contains(REFERENCE_CLOSURE_BINDING_MISMATCH) {
+            log::warn!(
+                "UNQUALIFIED Reference execution: {REFERENCE_UNQUALIFIED_OVERRIDE_ENV} is set and the qualification report does not bind this binary's runtime closure ({reason}); output is not release evidence"
+            );
+        } else {
+            return Err(qualification_unavailable_error(format!(
                 "Reference production promotion is inactive: {reason}"
-            ))
-        })?;
+            )));
+        }
+    }
 
     let certification: tonepoet_pipeline::ReferenceReleaseCertificationV1 =
         serde_json::from_slice(certification_bytes).map_err(|error| {
@@ -6648,21 +6703,39 @@ fn validate_reference_production_promotion_evidence(
                 "could not parse the embedded Phase-5 Reference release certification: {error}"
             ))
         })?;
-    certification
-        .validate_completed(
-            candidate_bytes,
-            report_bytes,
-            &report,
-            &toolchain.common_runtime_closure_fingerprint_sha256,
-            toolchain
-                .metadata_mutation_closure_fingerprint_sha256
-                .as_deref(),
-        )
-        .map_err(|reason| {
-            qualification_unavailable_error(format!(
-                "Reference production promotion is inactive: {reason}"
-            ))
-        })
+    match certification.validate_completed(
+        candidate_bytes,
+        report_bytes,
+        &report,
+        &toolchain.common_runtime_closure_fingerprint_sha256,
+        toolchain
+            .metadata_mutation_closure_fingerprint_sha256
+            .as_deref(),
+    ) {
+        Ok(()) => Ok(()),
+        Err(reason) if unqualified_override && reason.contains(REFERENCE_CLOSURE_BINDING_MISMATCH) => {
+            log::warn!(
+                "UNQUALIFIED Reference execution: {REFERENCE_UNQUALIFIED_OVERRIDE_ENV} is set and the release certification does not bind this binary's runtime closure ({reason}); output is not release evidence"
+            );
+            Ok(())
+        }
+        Err(reason) => Err(qualification_unavailable_error(format!(
+            "Reference production promotion is inactive: {reason}"
+        ))),
+    }
+}
+
+/// Development override: when this variable is `1`, a Reference binary whose
+/// runtime closure is not bound by the installed qualification report still
+/// executes, with an UNQUALIFIED warning. Every other check (candidate identity,
+/// report status, toolchain attestation, Wave64 contracts, fail-closed guards)
+/// stays in force. It exists so a corrective can be field-tested in minutes
+/// instead of after a 46-minute requalification; the shipped release never sets it.
+const REFERENCE_UNQUALIFIED_OVERRIDE_ENV: &str = "TONEPOET_DSD_REFERENCE_UNQUALIFIED_OVERRIDE";
+const REFERENCE_CLOSURE_BINDING_MISMATCH: &str = "does not bind the running runtime closure variant";
+
+fn reference_unqualified_override_active() -> bool {
+    std::env::var(REFERENCE_UNQUALIFIED_OVERRIDE_ENV).is_ok_and(|value| value.trim() == "1")
 }
 
 async fn attest_reference_toolchain(
@@ -6673,7 +6746,7 @@ async fn attest_reference_toolchain(
 ) -> Result<ReferenceToolchainEvidence, TrackExecutionError> {
     let raw = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v16.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v17.json"
     ));
     let manifest = match parse_embedded_reference_qualification_wire(raw)
         .map_err(reference_toolchain_error)?
@@ -6681,17 +6754,17 @@ async fn attest_reference_toolchain(
         EmbeddedReferenceQualificationWire::Current(manifest) => manifest,
         EmbeddedReferenceQualificationWire::Historical(historical) => {
             return Err(reference_toolchain_error(format!(
-                "the embedded policy artifact is historical schema v{} ({}) and cannot activate the v16 runtime",
+                "the embedded policy artifact is historical schema v{} ({}) and cannot activate the v17 runtime",
                 historical.schema_version, historical.policy,
             )));
         }
     };
-    if manifest.schema_version != 16
-        || manifest.policy != tonepoet_pipeline::DSD_REFERENCE_POLICY_V16_KEY
+    if manifest.schema_version != 17
+        || manifest.policy != tonepoet_pipeline::DSD_REFERENCE_POLICY_V17_KEY
         || manifest.status != "qualification_candidate"
     {
         return Err(reference_toolchain_error(
-            "the embedded inherited-v16 policy artifact is not the expected historical candidate",
+            "the embedded v17 policy artifact is not the expected qualification candidate",
         ));
     }
     if manifest.qualification_basis.trim().is_empty()
@@ -6703,14 +6776,19 @@ async fn attest_reference_toolchain(
     }
     validate_embedded_reference_policy_tables(&manifest)?;
 
-    let inherited_manifest_digest = Sha256Digest::of_bytes(raw.as_bytes());
-    if inherited_manifest_digest != tonepoet_pipeline::qualification_manifest_digest() {
+    let current_manifest_digest = Sha256Digest::of_bytes(raw.as_bytes());
+    if current_manifest_digest != tonepoet_pipeline::qualification_manifest_digest() {
         return Err(reference_toolchain_error(
-            "compiled and packaged inherited-v16 evidence digests disagree",
+            "compiled and packaged current-v17 policy digests disagree",
         ));
     }
+    let inherited_v16_bytes = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v16.json"
+    ));
+    let inherited_v16_digest = Sha256Digest::of_bytes(inherited_v16_bytes);
     let (candidate_bytes, candidate) = embedded_reference_common_candidate()?;
-    if candidate.inherited_v16_evidence_sha256 != inherited_manifest_digest.to_hex() {
+    if candidate.inherited_v16_evidence_sha256 != inherited_v16_digest.to_hex() {
         return Err(reference_toolchain_error(
             "the Phase-5 candidate does not bind the exact embedded inherited-v16 evidence",
         ));
@@ -6729,9 +6807,12 @@ async fn attest_reference_toolchain(
 
     let (locked_nixpkgs_revision, locked_nixpkgs_nar_hash) = embedded_flake_lock_input("nixpkgs")?;
     if manifest.ffmpeg.major_version != 7
+        || manifest.ffmpeg.version != "7.1.3"
         || manifest.ffmpeg.package_attribute != "ffmpeg_7-full"
         || manifest.ffmpeg.nixpkgs_revision != locked_nixpkgs_revision
         || manifest.ffmpeg.nixpkgs_nar_hash != locked_nixpkgs_nar_hash
+        || manifest.ffmpeg.int32_triangular_terminal_authority
+            != tonepoet_pipeline::FFMPEG_INT32_TRIANGULAR_TERMINAL_AUTHORITY_ID
     {
         return Err(reference_toolchain_error(
             "the embedded FFmpeg package lock does not match the immutable policy",
@@ -6810,7 +6891,7 @@ async fn attest_reference_toolchain(
     .await?;
     let ffmpeg = attest_external_reference_tool(
         ToolBinary::Ffmpeg,
-        "",
+        &manifest.ffmpeg.version,
         Some(manifest.ffmpeg.major_version),
         &manifest.ffmpeg.required_probe_markers,
         runner,
@@ -7549,10 +7630,41 @@ fn qualification_unavailable_error(detail: impl AsRef<str>) -> TrackExecutionErr
 }
 
 #[derive(Debug, Clone)]
-struct ReferenceMaterialization {
-    path: PathBuf,
+pub(super) struct ReferenceMaterialization {
+    pub(super) path: PathBuf,
+    pub(super) source_content_sha256: Sha256Digest,
+    pub(super) canonical_materialization_sha256: Sha256Digest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReferenceSourceEvidence {
     source_content_sha256: Sha256Digest,
     canonical_materialization_sha256: Sha256Digest,
+}
+
+impl From<&ReferenceMaterialization> for ReferenceSourceEvidence {
+    fn from(materialization: &ReferenceMaterialization) -> Self {
+        Self {
+            source_content_sha256: materialization.source_content_sha256,
+            canonical_materialization_sha256: materialization.canonical_materialization_sha256,
+        }
+    }
+}
+
+fn retained_reference_album_source_evidence(
+    track: &PreparedTrack,
+) -> Option<ReferenceSourceEvidence> {
+    match &track.source_ref {
+        TrackSourceRef::DsdReferenceAutoGainCarrier {
+            source_content_sha256,
+            canonical_materialization_sha256,
+            ..
+        } => Some(ReferenceSourceEvidence {
+            source_content_sha256: *source_content_sha256,
+            canonical_materialization_sha256: *canonical_materialization_sha256,
+        }),
+        _ => None,
+    }
 }
 
 /// Release-qualification view of the exact production standalone source
@@ -7712,6 +7824,42 @@ fn validate_reference_scratch_cleanup_authority(
             Vec::new(),
         ))
     }
+}
+
+pub(super) async fn materialize_reference_source_for_album_gain(
+    plan_request: &PlanRequest,
+    track: &PreparedTrack,
+    realized_input: &Path,
+    scratch: &ReferenceScratchPaths,
+    cancel: &CancellationToken,
+) -> Result<ReferenceMaterialization, TrackExecutionError> {
+    let plan_request = plan_request.clone();
+    let track = track.clone();
+    let realized_input = realized_input.to_path_buf();
+    let scratch = scratch.clone();
+    let worker_cancel = cancel.child_token();
+    let cancel_on_drop = worker_cancel.clone().drop_guard();
+    let result = tokio::task::spawn_blocking(move || {
+        materialize_reference_source_blocking(
+            &plan_request,
+            &track,
+            &realized_input,
+            &scratch,
+            &worker_cancel,
+            None,
+        )
+    })
+    .await
+    .map_err(|err| {
+        TrackExecutionError::new(
+            ConvertError::Backend(format!(
+                "Reference album-gain source materialization task failed: {err}"
+            )),
+            Vec::new(),
+        )
+    })?;
+    drop(cancel_on_drop);
+    result
 }
 
 async fn materialize_reference_source(
@@ -8271,9 +8419,175 @@ fn reference_cancelled_error() -> TrackExecutionError {
     TrackExecutionError::new(ConvertError::Realize("cancelled".to_string()), Vec::new())
 }
 
+async fn execute_reference_terminal_lowering(
+    lowering: &tonepoet_pipeline::ReferenceTerminalLowering,
+    sample_frames: u64,
+    reference_toolchain: Option<&ReferenceToolchainEvidence>,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_paths: &HashMap<String, PathBuf>,
+    tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
+    progress: &mut OperationProgressTracker<'_>,
+    start_fraction: f32,
+    end_fraction: f32,
+    track_label: String,
+) -> Result<Vec<CommandRecord>, TrackExecutionError> {
+    match lowering {
+        tonepoet_pipeline::ReferenceTerminalLowering::Command(command) => {
+            execute_commands(
+                std::slice::from_ref(command),
+                None,
+                runner,
+                cancel,
+                tool_paths,
+                tool_concurrency_limits,
+                progress,
+                start_fraction,
+                end_fraction,
+                track_label,
+            )
+            .await
+        }
+        tonepoet_pipeline::ReferenceTerminalLowering::Int32Tpdf(int32) => {
+            let midpoint = start_fraction + (end_fraction - start_fraction) * 0.35;
+            let mut records = execute_commands(
+                std::slice::from_ref(&int32.normalize_carrier),
+                None,
+                runner,
+                cancel,
+                tool_paths,
+                tool_concurrency_limits.clone(),
+                progress,
+                start_fraction,
+                midpoint,
+                track_label.clone(),
+            )
+            .await?;
+
+            let frame_bytes = u64::from(int32.contract.channels)
+                .checked_mul(std::mem::size_of::<f64>() as u64)
+                .ok_or_else(|| {
+                    TrackExecutionError::new(
+                        ConvertError::Backend(
+                            "Reference Int32 scalar-pump frame size overflowed".to_string(),
+                        ),
+                        records.clone(),
+                    )
+                })?;
+            let expected_bytes = sample_frames.checked_mul(frame_bytes).ok_or_else(|| {
+                TrackExecutionError::new(
+                    ConvertError::Backend(
+                        "Reference Int32 scalar-pump extent overflowed".to_string(),
+                    ),
+                    records.clone(),
+                )
+            })?;
+            let actual_bytes = fs::metadata(&int32.normalized_carrier_path)
+                .map_err(|error| {
+                    TrackExecutionError::new(
+                        ConvertError::Backend(format!(
+                            "Reference Int32 true-scale carrier metadata failed: {error}"
+                        )),
+                        records.clone(),
+                    )
+                })?
+                .len();
+            if expected_bytes == 0 || actual_bytes != expected_bytes {
+                return Err(TrackExecutionError::new(
+                    ConvertError::Backend(format!(
+                        "Reference Int32 true-scale carrier extent mismatch: expected {expected_bytes} bytes, found {actual_bytes}"
+                    )),
+                    records,
+                ));
+            }
+            let expected_sha256 = stable_file_sha256(&int32.normalized_carrier_path).map_err(|error| {
+                TrackExecutionError::new(
+                    ConvertError::Backend(format!(
+                        "Reference Int32 true-scale carrier hash failed: {error}"
+                    )),
+                    records.clone(),
+                )
+            })?;
+            let pump = RetainedPcmScalarPump {
+                input_path: int32.normalized_carrier_path.clone(),
+                sample_rate_hz: int32.contract.sample_rate_hz,
+                channels: int32.contract.channels,
+                gain_db: int32.selected_gain,
+                expected_bytes,
+                expected_sha256,
+            };
+            let toolchain = reference_toolchain.ok_or_else(|| {
+                TrackExecutionError::new(
+                    ConvertError::Backend(
+                        "Reference Int32 TPDF terminal requires an attested FFmpeg toolchain"
+                            .to_string(),
+                    ),
+                    records.clone(),
+                )
+            })?;
+            let bound_terminal = QualifiedTerminalExecutableBinding {
+                command_index: 0,
+                executable: BoundToolExecutable {
+                    canonical_path: toolchain.ffmpeg.canonical_path.clone(),
+                    executable_sha256: toolchain.ffmpeg.executable_sha256,
+                },
+            };
+            let mut terminal_records = execute_commands_with_scalar_pump(
+                std::slice::from_ref(&int32.terminal),
+                pump,
+                Some(&bound_terminal),
+                runner,
+                cancel,
+                tool_paths,
+                tool_concurrency_limits,
+                progress,
+                midpoint,
+                end_fraction,
+                track_label,
+            )
+            .await
+            .map_err(|mut error| {
+                let mut all = records.clone();
+                all.append(&mut error.commands);
+                error.commands = all;
+                error
+            })?;
+            records.append(&mut terminal_records);
+            let terminal_path = int32.terminal.output.as_path().ok_or_else(|| {
+                TrackExecutionError::new(
+                    ConvertError::Backend(
+                        "Reference Int32 FFmpeg terminal output is not path-backed".to_string(),
+                    ),
+                    records.clone(),
+                )
+            })?;
+            let expected = W64PcmExpectation {
+                sample_rate_hz: int32.contract.sample_rate_hz,
+                channels: int32.contract.channels,
+                bits_per_sample: 32,
+                sample_frames,
+                encoding: W64SampleEncoding::SignedInteger,
+            };
+            tonepoet_pipeline::canonicalize_ffmpeg_int32_w64_terminal(terminal_path, expected)
+                .map_err(|error| {
+                    TrackExecutionError::new(
+                        ConvertError::Backend(format!(
+                            "{} Reference Int32 terminal canonicalization failed: {error}",
+                            reference_error_text(ReferenceErrorCode::W64StructuralIntegrity),
+                        )),
+                        records.clone(),
+                    )
+                })?;
+            Ok(records)
+        }
+    }
+}
+
 async fn execute_reference_common_plan(
     summary: &DsdReferencePlanSummary,
     plan_request: &PlanRequest,
+    source_ref: Option<&TrackSourceRef>,
+    reference_toolchain: Option<&ReferenceToolchainEvidence>,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     tool_paths: &HashMap<String, PathBuf>,
@@ -8283,6 +8597,156 @@ async fn execute_reference_common_plan(
     end_fraction: f32,
     track_label: String,
 ) -> Result<ReferenceRuntimeResult, TrackExecutionError> {
+    if matches!(
+        summary.gain_policy,
+        tonepoet_pipeline::ResolvedGainPolicy::TruePeakNormalize {
+            scope: tonepoet_pipeline::TruePeakScope::Album,
+            bound_gain: None,
+            ..
+        }
+    ) {
+        return Err(TrackExecutionError::new(
+            ConvertError::Backend(
+                "Reference album plan reached terminal execution before the submitted-batch common scalar was bound"
+                    .to_string(),
+            ),
+            Vec::new(),
+        ));
+    }
+
+    let retained_reference = match source_ref {
+        Some(TrackSourceRef::DsdReferenceAutoGainCarrier {
+            path,
+            sample_rate_hz,
+            channels,
+            gain_db,
+            target_dbtp,
+            unbound_semantic_plan_hash,
+            carrier_sha256,
+            observation,
+            ..
+        }) => {
+            let bound_gain = gain_db.ok_or_else(|| {
+                TrackExecutionError::new(
+                    ConvertError::Backend(
+                        "Reference album carrier reached execution before its common scalar was bound"
+                            .to_string(),
+                    ),
+                    Vec::new(),
+                )
+            })?;
+            match summary.gain_policy {
+                tonepoet_pipeline::ResolvedGainPolicy::TruePeakNormalize {
+                    target_dbtp: planned_target,
+                    scope: tonepoet_pipeline::TruePeakScope::Album,
+                    bound_gain: Some(planned_gain),
+                    ..
+                } if planned_target == *target_dbtp && planned_gain == bound_gain => {}
+                _ => {
+                    return Err(TrackExecutionError::new(
+                        ConvertError::Backend(
+                            "retained Reference album carrier disagrees with the bound final gain policy"
+                                .to_string(),
+                        ),
+                        Vec::new(),
+                    ));
+                }
+            }
+            if *sample_rate_hz != summary.final_pcm.sample_rate_hz
+                || *channels != summary.final_pcm.channels
+            {
+                return Err(TrackExecutionError::new(
+                    ConvertError::Backend(
+                        "retained Reference album carrier geometry disagrees with the final typed plan"
+                            .to_string(),
+                    ),
+                    Vec::new(),
+                ));
+            }
+
+            // Album binding intentionally changes the final semantic plan hash.
+            // Re-derive the same plan with only runtime album authority cleared
+            // and require it to match the prepass identity stored on the carrier.
+            let mut unbound_request = plan_request.clone();
+            unbound_request.settings.dsd.clear_runtime_album_gain();
+            let unbound_plan = plan_conversion(&unbound_request).map_err(|error| {
+                TrackExecutionError::new(
+                    ConvertError::Backend(format!(
+                        "could not re-derive unbound Reference album plan identity: {error}"
+                    )),
+                    Vec::new(),
+                )
+            })?;
+            let rederived_hash = unbound_plan
+                .reference
+                .as_ref()
+                .map(|reference| reference.semantic_plan_hash_v1)
+                .ok_or_else(|| {
+                    TrackExecutionError::new(
+                        ConvertError::Backend(
+                            "unbound Reference album plan lost qualified Reference authority"
+                                .to_string(),
+                        ),
+                        Vec::new(),
+                    )
+                })?;
+            if rederived_hash != *unbound_semantic_plan_hash {
+                return Err(TrackExecutionError::new(
+                    ConvertError::Backend(
+                        "retained Reference album carrier was produced by a different unbound semantic plan"
+                            .to_string(),
+                    ),
+                    Vec::new(),
+                ));
+            }
+
+            let actual_digest = stable_file_sha256_cancel(path, cancel).map_err(|error| {
+                reference_materialization_error(
+                    format!(
+                        "could not verify retained Reference album carrier {}",
+                        path.display()
+                    ),
+                    error,
+                )
+            })?;
+            if actual_digest != *carrier_sha256 {
+                return Err(TrackExecutionError::new(
+                    ConvertError::Backend(format!(
+                        "retained Reference album carrier changed after certified observation: {}",
+                        path.display()
+                    )),
+                    Vec::new(),
+                ));
+            }
+            let expected_scan = summary.certified_scan_tier();
+            if observation.scan_tier
+                != tonepoet_pipeline::qualification_schema::reference_certified_scan_tier_name(
+                    expected_scan,
+                )
+                || observation.observer_identity
+                    != tonepoet_pipeline::qualification_schema::reference_certified_observer_id(
+                        expected_scan,
+                    )
+            {
+                return Err(TrackExecutionError::new(
+                    ConvertError::Backend(
+                        "retained Reference album observation uses a different certified scan tier"
+                            .to_string(),
+                    ),
+                    Vec::new(),
+                ));
+            }
+            Some((path.clone(), observation.clone()))
+        }
+        _ => None,
+    };
+
+    let mut execution_summary = summary.clone();
+    if let Some((path, _)) = retained_reference.as_ref() {
+        execution_summary.r64_path = path.clone();
+    }
+    let summary = &execution_summary;
+
     let mut records = Vec::new();
     let mut measurements = BTreeMap::new();
     let total_width = (end_fraction - start_fraction).max(0.0);
@@ -8300,31 +8764,33 @@ async fn execute_reference_common_plan(
         return Err(cancelled());
     }
 
-    // 1. Qualified protected reconstruction. This is the same public lowerer
-    // used by general DSD when it explicitly selects the qualified protected
-    // reconstruction; Reference adds the closed admission and proof gates.
-    let render = tonepoet_pipeline::build_reference_protected_reconstruction_command(
-        &plan_request.input_path,
-        &summary.r64_path,
-        summary.final_pcm.sample_rate_hz,
-        summary.profile,
-        plan_request.source.duration,
-    );
-    let (w0s, w0e) = window(0, total_steps);
-    let mut render_records = execute_commands(
-        std::slice::from_ref(&render),
-        None,
-        runner,
-        cancel,
-        tool_paths,
-        tool_concurrency_limits.clone(),
-        progress,
-        w0s,
-        w0e,
-        track_label.clone(),
-    )
-    .await?;
-    records.append(&mut render_records);
+    // 1. Qualified protected reconstruction. Album-scoped Reference Auto
+    // retains the exact already-certified protected R64 from its submitted-
+    // batch prepass; all other Reference executions reconstruct normally.
+    if retained_reference.is_none() {
+        let render = tonepoet_pipeline::build_reference_protected_reconstruction_command(
+            &plan_request.input_path,
+            &summary.r64_path,
+            summary.final_pcm.sample_rate_hz,
+            summary.profile,
+            plan_request.source.duration,
+        );
+        let (w0s, w0e) = window(0, total_steps);
+        let mut render_records = execute_commands(
+            std::slice::from_ref(&render),
+            None,
+            runner,
+            cancel,
+            tool_paths,
+            tool_concurrency_limits.clone(),
+            progress,
+            w0s,
+            w0e,
+            track_label.clone(),
+        )
+        .await?;
+        records.append(&mut render_records);
+    }
 
     // 2. Independent structural/decoder validation of protected R64.
     let (w1s, w1e) = window(1, total_steps);
@@ -8357,21 +8823,26 @@ async fn execute_reference_common_plan(
     // 3. Complete full-input certified finite-target observation. Do not use
     // the ordinary general-DSD constant-prefix optimization here.
     let pre_id = MeasurementId(1);
-    let pre_observation = super::stages::scan_reference_w64_certified_peak(
-        &summary.r64_path,
-        r64_structure,
-        reference_w64_expectation(summary, r64_structure.sample_frames, 64, true),
-        pre_id,
-        TruePeakPurpose::GainAuthority,
-        tonepoet_pipeline::ReferenceObservationSubject::ProtectedR64,
-        cancel,
-    )
-    .map_err(|reason| {
-        TrackExecutionError::new(
-            ConvertError::Backend(format!("Reference protected-R64 certified observation failed: {reason}")),
-            records.clone(),
+    let pre_observation = if let Some((_, observation)) = retained_reference.as_ref() {
+        observation.clone()
+    } else {
+        super::stages::scan_reference_w64_certified_peak(
+            &summary.r64_path,
+            r64_structure,
+            reference_w64_expectation(summary, r64_structure.sample_frames, 64, true),
+            pre_id,
+            TruePeakPurpose::GainAuthority,
+            tonepoet_pipeline::ReferenceObservationSubject::ProtectedR64,
+            summary.certified_scan_tier(),
+            cancel,
         )
-    })?;
+        .map_err(|reason| {
+            TrackExecutionError::new(
+                ConvertError::Backend(format!("Reference protected-R64 certified observation failed: {reason}")),
+                records.clone(),
+            )
+        })?
+    };
     measurements.insert(pre_id, pre_observation.clone());
 
     // 4. Resolve the sealed Reference gain from the conservative HQ1024V1
@@ -8390,7 +8861,10 @@ async fn execute_reference_common_plan(
     })?;
 
     // 5. One terminal gain/dither/format realization into authoritative QPCM.
-    let terminal = tonepoet_pipeline::lower_reference_terminal_command(
+    // Int32 uses the commissioned FFmpeg triangular terminal on a true-scale
+    // Float64 carrier; the one gain scalar is applied by the same certified
+    // in-process binary64 pump used by the retained FFmpeg terminal authority.
+    let terminal = tonepoet_pipeline::lower_reference_terminal(
         &summary.r64_path,
         &summary.qpcm_path,
         summary.final_pcm,
@@ -8403,9 +8877,10 @@ async fn execute_reference_common_plan(
         )
     })?;
     let (w4s, w4e) = window(4, total_steps);
-    let mut terminal_records = execute_commands(
-        std::slice::from_ref(&terminal),
-        None,
+    let mut terminal_records = execute_reference_terminal_lowering(
+        &terminal,
+        r64_structure.sample_frames,
+        reference_toolchain,
         runner,
         cancel,
         tool_paths,
@@ -8415,7 +8890,13 @@ async fn execute_reference_common_plan(
         w4e,
         track_label.clone(),
     )
-    .await?;
+    .await
+    .map_err(|mut error| {
+        let mut all = records.clone();
+        all.append(&mut error.commands);
+        error.commands = all;
+        error
+    })?;
     records.append(&mut terminal_records);
 
     // 6. QPCM structure/extent + independent decode/hash authority.
@@ -8448,6 +8929,7 @@ async fn execute_reference_common_plan(
     })?;
     let (qpcm_bits, qpcm_float) = match summary.final_pcm.bit_depth {
         tonepoet_pipeline::PcmBitDepth::Int24 => (24, false),
+        tonepoet_pipeline::PcmBitDepth::Int32 => (32, false),
         tonepoet_pipeline::PcmBitDepth::Float32 => (32, true),
         tonepoet_pipeline::PcmBitDepth::Float64 => (64, true),
         other => {
@@ -8472,6 +8954,7 @@ async fn execute_reference_common_plan(
         post_id,
         TruePeakPurpose::PostFinalAcceptance,
         tonepoet_pipeline::ReferenceObservationSubject::TerminalQpcm,
+        summary.certified_scan_tier(),
         cancel,
     )
     .map_err(|reason| {
@@ -8764,6 +9247,8 @@ pub async fn qualify_reference_common_candidate_execution(
     let runtime = execute_reference_common_plan(
         &summary,
         plan_request,
+        None,
+        Some(&toolchain),
         runner,
         cancel,
         tool_paths,
@@ -9214,7 +9699,11 @@ fn reference_carrier_probe_digest(
     probe: ReferenceCarrierProbe,
 ) -> Sha256Digest {
     let mut hasher = Sha256::new();
-    if policy == tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V16 {
+    if matches!(
+        policy,
+        tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V16
+            | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V17
+    ) {
         hasher.update(b"tonepoet-reference-carrier-probe/v2\0");
     } else {
         // Preserve the frozen v1 identity exactly for append-only historical policies.
@@ -9227,7 +9716,11 @@ fn reference_carrier_probe_digest(
     hasher.update(probe.bits_per_sample.to_be_bytes());
     hasher.update(probe.samples_per_channel.to_be_bytes());
     hasher.update([u8::from(probe.floating_point)]);
-    if policy == tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V16 {
+    if matches!(
+        policy,
+        tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V16
+            | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V17
+    ) {
         match probe.w64_structure {
             Some(structure) => {
                 hasher.update([1]);
@@ -9540,9 +10033,10 @@ async fn verify_reference_qpcm_contract(
     let expected_bits = match summary.final_pcm.bit_depth {
         tonepoet_pipeline::PcmBitDepth::Int16 => 16,
         tonepoet_pipeline::PcmBitDepth::Int24 => 24,
+        tonepoet_pipeline::PcmBitDepth::Int32 => 32,
         tonepoet_pipeline::PcmBitDepth::Float32 => 32,
         tonepoet_pipeline::PcmBitDepth::Float64 => 64,
-        tonepoet_pipeline::PcmBitDepth::Int8 | tonepoet_pipeline::PcmBitDepth::Int32 => {
+        tonepoet_pipeline::PcmBitDepth::Int8 => {
             return Err(TrackExecutionError::new(
                 ConvertError::Backend(
                     "Reference verification received an unsupported terminal depth".to_string(),
@@ -9799,7 +10293,7 @@ fn validate_reference_package_pipeline(
     summary: &DsdReferencePlanSummary,
     pipeline: &PlannedCommandPipeline,
 ) -> Result<(), TrackExecutionError> {
-    if summary.policy != tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V16
+    if summary.policy != tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V17
         || summary.final_pcm.bit_depth != tonepoet_pipeline::PcmBitDepth::Float64
         || !matches!(
             summary.target,
@@ -9810,7 +10304,7 @@ fn validate_reference_package_pipeline(
     {
         return Err(TrackExecutionError::new(
             ConvertError::Backend(
-                "Reference policy v15 package pipeline is bound to an invalid plan cell"
+                "Reference policy v17 package pipeline is bound to an invalid plan cell"
                     .to_string(),
             ),
             Vec::new(),
@@ -11543,7 +12037,7 @@ mod tests {
         paths.sort();
         assert_eq!(
             paths.len(),
-            31,
+            33,
             "qualification manifest inventory changed; update the permanent parse census intentionally"
         );
 
@@ -11554,15 +12048,15 @@ mod tests {
                 .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
             match parsed {
                 EmbeddedReferenceQualificationWire::Historical(manifest) => {
-                    assert!(manifest.schema_version <= 15);
+                    assert!(manifest.schema_version <= 16);
                     assert!(manifest.policy.starts_with("sox_ng_14_8_0_1_v"));
                     assert!(!manifest.status.trim().is_empty());
                 }
                 EmbeddedReferenceQualificationWire::Current(manifest) => {
-                    assert_eq!(manifest.schema_version, 16);
+                    assert_eq!(manifest.schema_version, 17);
                     assert_eq!(
                         manifest.policy,
-                        tonepoet_pipeline::DSD_REFERENCE_POLICY_V16_KEY,
+                        tonepoet_pipeline::DSD_REFERENCE_POLICY_V17_KEY,
                     );
                 }
             }
@@ -11638,7 +12132,7 @@ mod tests {
     fn embedded_reference_qualification_matches_compiled_policy_tables() {
         let manifest: EmbeddedReferenceQualification = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v16.json"
+            "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v17.json"
         )))
         .expect("embedded Reference qualification JSON parses");
         assert_eq!(
@@ -11654,7 +12148,7 @@ mod tests {
         let mut reserve_drift: EmbeddedReferenceQualification =
             serde_json::from_str(include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v16.json"
+                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v17.json"
             )))
             .expect("embedded Reference qualification JSON parses for drift test");
         reserve_drift.analyzer.reporting_uncertainty_db =
@@ -11671,7 +12165,7 @@ mod tests {
         let mut streamed_capacity_drift: EmbeddedReferenceQualification =
             serde_json::from_str(include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v16.json"
+                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v17.json"
             )))
             .expect("embedded Reference qualification JSON parses for capacity drift test");
         streamed_capacity_drift.streamed_wav_capacity.max_audio_payload_bytes += 1;
@@ -11687,7 +12181,7 @@ mod tests {
         let mut hash_contract_drift: EmbeddedReferenceQualification =
             serde_json::from_str(include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v16.json"
+                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v17.json"
             )))
             .expect("embedded Reference qualification JSON parses for hash-contract drift test");
         hash_contract_drift.sample_identity.hash_format =
@@ -11704,7 +12198,7 @@ mod tests {
         let mut route_contract_drift: EmbeddedReferenceQualification =
             serde_json::from_str(include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v16.json"
+                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v17.json"
             )))
             .expect("embedded Reference qualification JSON parses for route-contract drift test");
         route_contract_drift
@@ -11720,20 +12214,48 @@ mod tests {
             "unexpected route-contract invariant failure: {error}"
         );
 
-        let candidate: EmbeddedReferenceQualification = serde_json::from_str(include_str!(concat!(
+        let candidate_raw = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v16_candidate.json"
-        )))
-        .expect("preserved v16 candidate JSON parses");
+        ));
+        let candidate = match parse_embedded_reference_qualification_wire(candidate_raw)
+            .expect("preserved v16 candidate JSON parses")
+        {
+            EmbeddedReferenceQualificationWire::Historical(candidate) => candidate,
+            EmbeddedReferenceQualificationWire::Current(_) => {
+                panic!("preserved v16 candidate must remain historical")
+            }
+        };
+        assert_eq!(candidate.schema_version, 16);
+        assert_eq!(candidate.status, "qualification_candidate");
         assert_eq!(
             candidate
                 .terminal_bounds
-                .int16_shibata
-                .safe_pre_terminal_ceiling_dbtp,
-            tonepoet_pipeline::DbNano(i64::MIN)
+                .pointer("/int16_shibata/safe_pre_terminal_ceiling_dbtp")
+                .and_then(serde_json::Value::as_str),
+            Some("-9223372036.854775808")
         );
-        assert_eq!(candidate.status, "qualification_candidate");
-        assert!(validate_embedded_release_certification(&candidate).is_err());
+        let release_certification: EmbeddedReleaseCertification = serde_json::from_value(
+            candidate
+                .release_certification
+                .clone()
+                .expect("preserved v16 candidate carries a release-certification descriptor"),
+        )
+        .expect("preserved v16 release-certification descriptor parses");
+        assert_eq!(
+            release_certification.schema,
+            "tonepoet-dsd-reference-release-certification/v1"
+        );
+        assert_eq!(
+            release_certification.path,
+            "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v16_certification.json"
+        );
+        assert_eq!(
+            release_certification.candidate_manifest_path,
+            "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v16_candidate.json"
+        );
+        assert!(release_certification.report_sha256.is_none());
+        assert!(release_certification.candidate_manifest_sha256.is_none());
     }
 
     #[test]
@@ -11785,6 +12307,19 @@ mod tests {
                 exact,
             ),
             "v16 carrier identity omitted exact Wave64 structure",
+        );
+        assert_ne!(
+            reference_carrier_probe_digest(
+                tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V17,
+                "r64",
+                legacy,
+            ),
+            reference_carrier_probe_digest(
+                tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V17,
+                "r64",
+                exact,
+            ),
+            "v17 carrier identity omitted exact Wave64 structure",
         );
     }
 
@@ -11968,12 +12503,8 @@ mod tests {
             runtime_dispatch_digest: Sha256Digest::of_bytes(b"test-dispatch"),
         };
 
-        let error = validate_reference_production_promotion_preflight(metadata_disabled_summary)
-            .expect_err("checked-in not-run evidence cannot pass production preflight");
-        assert!(
-            matches!(&error.error, ConvertError::QualificationUnavailable(_)),
-            "not-run Phase-5 evidence must be a qualification refusal: {error}"
-        );
+        validate_reference_production_promotion_preflight(metadata_disabled_summary)
+            .expect("checked-in passed Phase-5 evidence passes production preflight");
 
         let candidate_bytes = include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -13935,6 +14466,117 @@ mod tests {
         request
     }
 
+    #[tokio::test]
+    async fn reference_album_terminal_reuses_retained_r64_without_dsd_rematerialization() {
+        let temp = tempfile::tempdir().expect("Reference album carrier tempdir");
+        let carrier = temp.path().join("retained.reference-protected.w64");
+        std::fs::write(&carrier, b"riff-retained-reference-carrier")
+            .expect("write retained carrier sentinel");
+        let staged_output = temp.path().join("reference-output.w64");
+        let convert_root = temp.path().join("convert");
+        let work_dir = convert_root.join(".track-0001.work");
+        let gain = tonepoet_pipeline::DbNano::ZERO;
+        let source_content_sha256 = tonepoet_pipeline::Sha256Digest::of_bytes(b"source");
+        let canonical_materialization_sha256 =
+            tonepoet_pipeline::Sha256Digest::of_bytes(b"canonical-materialization");
+        let carrier_sha256 = tonepoet_pipeline::Sha256Digest::of_bytes(
+            b"riff-retained-reference-carrier",
+        );
+
+        let mut request = reference_production_request(temp.path());
+        request.album_batch = Some(crate::convert::pipeline::AlbumBatchContext::new(
+            "reference-album-retained-carrier",
+            2,
+            temp.path().join("out"),
+            temp.path().to_path_buf(),
+        ));
+        request.settings.dsd.bind_runtime_album_gain(gain, None, 2);
+
+        let track = reference_materialization_track(
+            TrackSourceRef::DsdReferenceAutoGainCarrier {
+                path: carrier.clone(),
+                source_path: temp.path().join("source.dsf"),
+                source_sample_rate_hz: 2_822_400,
+                sample_rate_hz: 88_200,
+                channels: 2,
+                duration: Some(Duration::from_secs(1)),
+                source_kind: tonepoet_pipeline::DsdSourceKind::DsfUncompressed,
+                gain_db: Some(gain),
+                target_dbtp: tonepoet_pipeline::DbNano::DEFAULT_REFERENCE_TRUE_PEAK_TARGET,
+                unbound_semantic_plan_hash: tonepoet_pipeline::Sha256Digest::of_bytes(
+                    b"unbound-plan",
+                ),
+                source_content_sha256,
+                canonical_materialization_sha256,
+                carrier_sha256,
+                observation: tonepoet_pipeline::ReferenceCertifiedPeakObservation {
+                    id: tonepoet_pipeline::MeasurementId(1),
+                    scope: tonepoet_pipeline::MeasurementScope::Plan,
+                    purpose: tonepoet_pipeline::TruePeakPurpose::GainAuthority,
+                    subject: tonepoet_pipeline::ReferenceObservationSubject::ProtectedR64,
+                    observer_identity: "test-observer".to_string(),
+                    reconstruction: "test-reconstruction".to_string(),
+                    edge_policy: "test-edge-policy".to_string(),
+                    scan_tier: "standard".to_string(),
+                    authority_endpoint: "test-authority".to_string(),
+                    reader_authority: "test-reader".to_string(),
+                    sample_rate_hz: 88_200,
+                    channels: 2,
+                    sample_frames: 1,
+                    programme_sha256: carrier_sha256,
+                    complete_reader: true,
+                    result: tonepoet_pipeline::ReferenceCertifiedPeakResult::VerifiedSilence,
+                    certificate_sha256: tonepoet_pipeline::Sha256Digest::of_bytes(
+                        b"certificate",
+                    ),
+                },
+            },
+        );
+        let runner = StubToolRunner::new();
+        let cancel = CancellationToken::new();
+        let mut progress = OperationProgressTracker::new(
+            "reference-album-retained-carrier".to_string(),
+            PipelineStage::Convert,
+            None,
+        );
+
+        let result = REFERENCE_TEST_SKIP_ATTESTATION
+            .scope(
+                (),
+                TRACK_EXECUTION_FAILURE_POINT.scope(
+                    TrackExecutionFailurePoint::ProducerLaunch,
+                    execute_planned_track_conversion(
+                        &request,
+                        &track,
+                        &carrier,
+                        &staged_output,
+                        &convert_root,
+                        &runner,
+                        &cancel,
+                        &HashMap::new(),
+                        None,
+                        &mut progress,
+                        0.0,
+                        1.0,
+                    ),
+                ),
+            )
+            .await;
+
+        let error = result.expect_err("injected producer failure must stop terminal execution");
+        assert!(
+            error.to_string().contains("producer-launch"),
+            "retained album carrier must bypass DSF/DSDIFF materialization and reach terminal execution: {error}",
+        );
+        assert!(
+            !error
+                .to_string()
+                .contains("failed to materialize verified Reference source"),
+            "retained protected R64 must never be presented to the DSD source materializer: {error}",
+        );
+        assert!(!work_dir.exists(), "failed retained-carrier execution must clean work state");
+    }
+
     #[test]
     fn reference_metadata_attestation_follows_real_stage_policy_not_common_plan_marker() {
         let temp = tempfile::tempdir().expect("Reference metadata-stage ownership tempdir");
@@ -13974,17 +14616,23 @@ mod tests {
 
     struct MissingSoxNoInvocationRunner {
         interactions: AtomicUsize,
+        launches: AtomicUsize,
     }
 
     impl MissingSoxNoInvocationRunner {
         fn new() -> Self {
             Self {
                 interactions: AtomicUsize::new(0),
+                launches: AtomicUsize::new(0),
             }
         }
 
         fn interactions(&self) -> usize {
             self.interactions.load(Ordering::SeqCst)
+        }
+
+        fn launches(&self) -> usize {
+            self.launches.load(Ordering::SeqCst)
         }
     }
 
@@ -13995,6 +14643,7 @@ mod tests {
             _cmd: ToolCommand,
             _cancel: &CancellationToken,
         ) -> Result<ToolOutput, ToolRunnerError> {
+            self.launches.fetch_add(1, Ordering::SeqCst);
             self.interactions.fetch_add(1, Ordering::SeqCst);
             Err(ToolRunnerError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -14014,7 +14663,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_not_run_promotion_preflight_precedes_tool_attestation() {
+    async fn production_promoted_evidence_refuses_missing_sox_before_any_tool_launch() {
         let temp = tempfile::tempdir().expect("Reference production preflight tempdir");
         let source = temp.path().join("source.dsf");
         write_reference_dsf_fixture(&source);
@@ -14045,16 +14694,21 @@ mod tests {
             1.0,
         )
         .await
-        .expect_err("checked-in not-run Phase-5 evidence must block production");
+        .expect_err("a missing SoX-ng must block Reference production");
 
         assert!(
-            matches!(&error.error, ConvertError::QualificationUnavailable(_)),
-            "known not-run evidence must win over missing SoX: {error}"
+            error.to_string().contains("DSD-REF-P0-015"),
+            "with passed Phase-5 evidence the refusal is tool attestation: {error}"
+        );
+        assert_eq!(
+            runner.launches(),
+            0,
+            "toolchain attestation resolves the SoX path and launches nothing"
         );
         assert_eq!(
             runner.interactions(),
-            0,
-            "production promotion preflight must not query or launch a tool"
+            1,
+            "toolchain attestation resolves the SoX path exactly once"
         );
         assert!(
             !staged_output.exists(),

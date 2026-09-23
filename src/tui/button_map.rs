@@ -58,12 +58,14 @@ pub enum TuiButton {
     ConversionPresetPill(usize),
     DsdPathPill(usize),
     DsdProfilePill(usize),
+    DsdCustomReconstructionPill(usize),
+    DsdCustomLowpassPill(usize),
+    DsdCustomExportLevelPill(usize),
     DsdGainPill(usize),
     DsdTruePeakScopePill(usize),
     DsdTruePeakScanPill(usize),
     DsdGainDbField,
     DsdTruePeakTargetField,
-    DsdSamplePeakTargetField,
     MergePill(usize),
     ForceEncodePill(usize),
     DiscSubfoldersPill(usize),
@@ -605,12 +607,14 @@ impl TuiButton {
             | Self::ConversionPresetPill(_)
             | Self::DsdPathPill(_)
             | Self::DsdProfilePill(_)
+            | Self::DsdCustomReconstructionPill(_)
+            | Self::DsdCustomLowpassPill(_)
+            | Self::DsdCustomExportLevelPill(_)
             | Self::DsdGainPill(_)
             | Self::DsdTruePeakScopePill(_)
             | Self::DsdTruePeakScanPill(_)
             | Self::DsdGainDbField
             | Self::DsdTruePeakTargetField
-            | Self::DsdSamplePeakTargetField
             | Self::MergePill(_)
             | Self::ForceEncodePill(_)
             | Self::DiscSubfoldersPill(_)

@@ -159,13 +159,21 @@ pub enum CertifiedReconstruction {
 /// [`PeakTier::Fast`] without an explicit migration decision.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum PeakTier {
-    /// Exhaustive Reference9 search of HQ1024V1.
+    /// Exhaustive Reference9 search of HQ1024V1. Interval objective: 0.0000001
+    /// dB. Measured 2026-09-21 commissioning cost: about 4.26 seconds of wall
+    /// time per programme minute (release, 88.2 kHz stereo, -0.9 dBFS sine).
     Reference,
-    /// Deterministic bounded-work Fast90 search of HQ1024V1.
+    /// Deterministic bounded-work Fast90 search of HQ1024V1. Interval
+    /// objective: 0.0001 dB. Measured 2026-09-21 commissioning cost: about
+    /// 3.30 seconds of wall time per programme minute (release, 88.2 kHz
+    /// stereo, -0.9 dBFS sine).
     #[default]
     Standard,
-    /// Deterministic certified Fast066 search of HQ1024V1, with a release
-    /// commissioning target of 0.66 seconds of wall time per programme minute.
+    /// Deterministic certified Fast066 search of HQ1024V1. Its interval width
+    /// is content-dependent. The 2026-09-21 pre-correction silence measurement
+    /// was 9.6 seconds for 0.09 seconds of programme (6,400 seconds/programme
+    /// minute); release commissioning requires at most 0.66 seconds/programme
+    /// minute after the exact-zero correction.
     Fast,
 }
 

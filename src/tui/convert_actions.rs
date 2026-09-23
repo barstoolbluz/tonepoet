@@ -418,7 +418,10 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
         dsd.from_dsd.pathway = *format.dsd_pathway.selected_value();
         dsd.from_dsd.profile = *format.dsd_profile.selected_value();
         match dsd.from_dsd.pathway {
-            tonepoet_pipeline::DsdSourcePathway::General => {
+            tonepoet_pipeline::DsdSourcePathway::Custom => {
+                dsd.general_from_dsd.reconstruction = *format.dsd_custom_reconstruction.selected_value();
+                dsd.general_from_dsd.lowpass = *format.dsd_custom_lowpass.selected_value();
+                dsd.general_from_dsd.export_level = *format.dsd_custom_export_level.selected_value();
                 dsd.general_from_dsd.gain = match *format.dsd_gain_mode.selected_value() {
                     DsdGainMode::Off => tonepoet_pipeline::SampleGainPolicy::Off,
                     DsdGainMode::TruePeakGuard => tonepoet_pipeline::SampleGainPolicy::TruePeakGuard {
@@ -434,39 +437,28 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
                     DsdGainMode::FixedGain => tonepoet_pipeline::SampleGainPolicy::FixedGain {
                         gain_db: format.dsd_gain_db,
                     },
-                    DsdGainMode::Reference
-                    | DsdGainMode::NativeLevel
-                    | DsdGainMode::ReferenceFixed
-                    | DsdGainMode::SamplePeakNormalize => {
-                        return Err("Reference-only DSD gain policy selected for the general DSD pathway".to_string());
+                    DsdGainMode::ReferenceAuto => {
+                        return Err("Reference automatic gain selected for the Custom DSD pathway".to_string());
                     }
                 };
             }
             tonepoet_pipeline::DsdSourcePathway::Reference => {
                 dsd.general_from_dsd.gain = tonepoet_pipeline::SampleGainPolicy::Off;
                 match *format.dsd_gain_mode.selected_value() {
-                    DsdGainMode::Reference => {
-                        dsd.from_dsd.gain_mode = tonepoet_pipeline::DsdSourceGainMode::Reference;
-                        dsd.from_dsd.fixed_gain_db = None;
+                    DsdGainMode::ReferenceAuto => {
+                        dsd.from_dsd.gain = tonepoet_pipeline::SampleGainPolicy::TruePeakNormalize {
+                            target_dbtp: format.dsd_true_peak_target_dbtp,
+                            scope: *format.dsd_true_peak_scope.selected_value(),
+                            scan: *format.dsd_true_peak_scan_mode.selected_value(),
+                        };
                     }
-                    DsdGainMode::NativeLevel => {
-                        dsd.from_dsd.gain_mode = tonepoet_pipeline::DsdSourceGainMode::NativeLevel;
-                        dsd.from_dsd.fixed_gain_db = None;
+                    DsdGainMode::Off => {
+                        dsd.from_dsd.gain = tonepoet_pipeline::SampleGainPolicy::Off;
                     }
-                    DsdGainMode::ReferenceFixed => {
-                        dsd.from_dsd.gain_mode = tonepoet_pipeline::DsdSourceGainMode::Fixed;
-                        dsd.from_dsd.fixed_gain_db = Some(format.dsd_gain_db);
-                    }
-                    DsdGainMode::SamplePeakNormalize => {
-                        dsd.from_dsd.gain_mode = tonepoet_pipeline::DsdSourceGainMode::NormalizePeak;
-                        dsd.from_dsd.fixed_gain_db = None;
-                        dsd.from_dsd.normalize_peak_target_dbfs = format.dsd_sample_peak_target_dbfs;
-                    }
-                    DsdGainMode::Off
-                    | DsdGainMode::TruePeakGuard
+                    DsdGainMode::TruePeakGuard
                     | DsdGainMode::TruePeakNormalize
                     | DsdGainMode::FixedGain => {
-                        return Err("ordinary DSD gain policy selected for the qualified Reference pathway".to_string());
+                        return Err("Custom DSD gain policy selected for the qualified Reference pathway".to_string());
                     }
                 }
             }

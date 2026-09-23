@@ -724,13 +724,20 @@ pub enum TruePeakScope {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum TruePeakScanTier {
-    /// Tightest certified interval tier.
+    /// Tightest certified interval tier. Objective: 0.0000001 dB. Measured
+    /// 2026-09-21 commissioning cost: about 4.26 seconds of wall time per
+    /// programme minute (release, 88.2 kHz stereo, -0.9 dBFS sine).
     #[cfg_attr(feature = "serde", serde(rename = "fast066v2_reference"))]
     Reference,
-    /// Ordinary certified interval tier.
+    /// Ordinary certified interval tier. Objective: 0.0001 dB. Measured
+    /// 2026-09-21 commissioning cost: about 3.30 seconds of wall time per
+    /// programme minute (release, 88.2 kHz stereo, -0.9 dBFS sine).
     #[cfg_attr(feature = "serde", serde(rename = "fast066v2_standard"))]
     Standard,
-    /// Fastest certified tier; interval width is content-dependent.
+    /// Fastest certified tier; interval width is content-dependent. The 2026-09-21
+    /// pre-correction silence measurement was 9.6 seconds for 0.09 seconds of
+    /// programme (6,400 seconds/programme minute); release commissioning requires
+    /// at most 0.66 seconds/programme minute after the exact-zero correction.
     #[default]
     #[cfg_attr(feature = "serde", serde(rename = "fast066v2_fast"))]
     Fast,

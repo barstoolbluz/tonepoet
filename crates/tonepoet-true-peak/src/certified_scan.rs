@@ -968,6 +968,77 @@ impl RawBuffer {
         self.values[frame * self.channels + channel]
     }
 
+    /// True only when every sample in the complete requested raw support is
+    /// IEEE-754 positive or negative zero. This is intentionally bit based: a
+    /// subnormal source must never be collapsed into the zero fast path by a
+    /// host running with DAZ/FTZ enabled.
+    fn range_is_exact_zero(&self, start: i128, end_inclusive: i128) -> bool {
+        debug_assert!(self.contains(start, end_inclusive));
+        let buffer_start = self.start_index.expect("raw buffer is non-empty");
+        let first_frame = self.head_frames
+            + usize::try_from(start - buffer_start).expect("bounded raw zero-range start");
+        let frames = usize::try_from(end_inclusive - start + 1)
+            .expect("bounded raw zero-range length");
+        let first_sample = first_frame * self.channels;
+        let last_sample = first_sample + frames * self.channels;
+        self.values[first_sample..last_sample]
+            .iter()
+            .all(|sample| magnitude_bits(*sample) == 0)
+    }
+
+    /// True only when one channel is bitwise constant across the complete raw
+    /// support. Positive and negative zero are treated as the same exact value;
+    /// every other binary64 value, including subnormals, must match bit for bit.
+    ///
+    /// Reference uses exact-flat proofs to collapse translation-equivalent
+    /// work. Keep the classification integer-only so DAZ/FTZ cannot turn a
+    /// nonzero constant into a false zero/flat witness.
+    fn samples_are_exact_constant_equivalent(left: f64, right: f64) -> bool {
+        if magnitude_bits(left) == 0 {
+            magnitude_bits(right) == 0
+        } else {
+            left.to_bits() == right.to_bits()
+        }
+    }
+
+    fn channel_is_exact_constant(
+        &self,
+        start: i128,
+        end_inclusive: i128,
+        channel: usize,
+    ) -> bool {
+        debug_assert!(self.contains(start, end_inclusive));
+        debug_assert!(channel < self.channels);
+        let first = self.sample(start, channel);
+        (start + 1..=end_inclusive).all(|index| {
+            Self::samples_are_exact_constant_equivalent(first, self.sample(index, channel))
+        })
+    }
+
+    /// Return the raw sample indices whose value differs from the immediately
+    /// preceding sample under the same exact-flat equivalence used above.
+    /// The caller can use these monotone boundaries to classify many sliding
+    /// support windows in linear time instead of rescanning each window.
+    fn channel_change_positions(
+        &self,
+        start: i128,
+        end_inclusive: i128,
+        channel: usize,
+    ) -> Vec<i128> {
+        debug_assert!(self.contains(start, end_inclusive));
+        debug_assert!(channel < self.channels);
+        let mut changes = Vec::new();
+        let mut previous = self.sample(start, channel);
+        for index in start + 1..=end_inclusive {
+            let sample = self.sample(index, channel);
+            if !Self::samples_are_exact_constant_equivalent(previous, sample) {
+                changes.push(index);
+            }
+            previous = sample;
+        }
+        changes
+    }
+
     fn discard_before(&mut self, keep_index: i128) {
         let Some(start) = self.start_index else {
             return;
@@ -1886,7 +1957,7 @@ impl CertifiedScanner {
             && self.processing_elapsed_nanos() >= self.fast_allowed_processing_nanos()
     }
 
-    fn fast_tile_raw_support(&self, coarse_start: i128, coarse_end: i128) -> (i128, i128) {
+    fn tile_raw_support(&self, coarse_start: i128, coarse_end: i128) -> (i128, i128) {
         debug_assert!(coarse_end > coarse_start);
         let tail = self.spec.tail();
         let required_coarse_start = coarse_start + i128::from(tail.offset_min);
@@ -1909,7 +1980,7 @@ impl CertifiedScanner {
     ) {
         debug_assert_eq!(self.policy, SearchPolicy::RetiredClockFast1s);
         debug_assert!(channel < self.channels);
-        let (raw_start, raw_end) = self.fast_tile_raw_support(coarse_start, coarse_end);
+        let (raw_start, raw_end) = self.tile_raw_support(coarse_start, coarse_end);
         debug_assert!(self.raw.contains(raw_start, raw_end));
 
         let mut raw_peak = 0.0_f64;
@@ -2451,6 +2522,7 @@ impl CertifiedScanner {
         channel: usize,
         coarse_start: i128,
         coarse_end: i128,
+        resolved_flat_cells: &[bool],
     ) -> BinaryHeap<CandidateNode> {
         let tail = self.spec.tail();
         let coarse_support_start = coarse_start + i128::from(tail.offset_min);
@@ -2464,12 +2536,20 @@ impl CertifiedScanner {
         let mut heap = BinaryHeap::new();
         let search_lower = self.overall_lower_peak;
         let interval_count = usize::try_from(coarse_end - coarse_start).expect("bounded tile cells");
+        debug_assert_eq!(resolved_flat_cells.len(), interval_count);
 
         let mut root_offset = 0usize;
         while root_offset < interval_count {
             let root_len = ROOT_GROUP_CELLS.min(interval_count - root_offset);
             let root_start = coarse_start + root_offset as i128;
             let root_end = root_start + root_len as i128;
+            if resolved_flat_cells[root_offset..root_offset + root_len]
+                .iter()
+                .all(|flat| *flat)
+            {
+                root_offset += root_len;
+                continue;
+            }
             let root_upper = self.coarse_group_upper(&summary, root_start, root_end);
             self.diagnostics.authoritative_coarse_groups =
                 self.diagnostics.authoritative_coarse_groups.saturating_add(1);
@@ -2489,6 +2569,14 @@ impl CertifiedScanner {
                 let child_len = CHILD_GROUP_CELLS.min(root_len - child_offset);
                 let child_start = root_start + child_offset as i128;
                 let child_end = child_start + child_len as i128;
+                let child_mask_start = root_offset + child_offset;
+                if resolved_flat_cells[child_mask_start..child_mask_start + child_len]
+                    .iter()
+                    .all(|flat| *flat)
+                {
+                    child_offset += child_len;
+                    continue;
+                }
                 let child_upper = self.coarse_group_upper(&summary, child_start, child_end);
                 self.diagnostics.authoritative_coarse_groups =
                     self.diagnostics.authoritative_coarse_groups.saturating_add(1);
@@ -2506,6 +2594,9 @@ impl CertifiedScanner {
 
                 let mut cells = Vec::with_capacity(child_len);
                 for local in 0..child_len {
+                    if resolved_flat_cells[root_offset + child_offset + local] {
+                        continue;
+                    }
                     let cell = child_start + local as i128;
                     let (endpoint_upper, d2_upper, magnitude_upper) =
                         summary.root_components(tail, cell, cell + 1);
@@ -3265,6 +3356,167 @@ impl CertifiedScanner {
         }
     }
 
+    /// Resolve one contiguous Reference cell span whose complete reconstruction
+    /// support is one exact raw constant without expanding translation-equivalent
+    /// candidate trees.
+    ///
+    /// The certified reconstruction is linear and shift invariant. The first
+    /// qualified stage is 2x, so a constant raw input can still yield two
+    /// distinct coarse parities if the binary64 half-delay DC sum is not
+    /// exactly unity. Compute those two coarse authorities once, settle both
+    /// endpoint parities, then enumerate one representative target cell of each
+    /// parity present in the span over every non-identity tail phase. This is
+    /// algebraically the same direct authority as
+    /// `accurate_target_evaluation`, including propagated binary64 and
+    /// composition-error bounds, but its work is bounded by the reconstruction
+    /// phase count rather than the length of the flat run.
+    fn resolve_reference_constant_span(
+        &mut self,
+        coarse_start: i128,
+        coarse_end: i128,
+        channel: usize,
+    ) {
+        debug_assert_eq!(self.policy, SearchPolicy::Reference9);
+        debug_assert!(coarse_end > coarse_start);
+        debug_assert!(channel < self.channels);
+        let first = self.accurate_direct_coarse(coarse_start, channel);
+        let second = self.accurate_direct_coarse(coarse_start + 1, channel);
+        let coarse_by_parity = if coarse_start.rem_euclid(2) == 0 {
+            [first, second]
+        } else {
+            [second, first]
+        };
+        let tail = self.spec.tail();
+        let representatives = if coarse_start + 1 < coarse_end { 2 } else { 1 };
+        let mut coarse = Vec::with_capacity(tail.offset_count);
+
+        // Every searched cell owns its left endpoint and the final cell also
+        // owns the right endpoint. Even a one-cell span therefore needs both
+        // coarse parities in its settled upper authority.
+        for evaluation in coarse_by_parity {
+            self.observe_evaluation_base(channel, evaluation);
+            self.settled_evaluated_upper_channel_peaks[channel] = self
+                .settled_evaluated_upper_channel_peaks[channel]
+                .max(evaluation.upper());
+        }
+
+        for cell_offset in 0..representatives {
+            let cell = coarse_start + cell_offset;
+            for phase in 1..tail.factor {
+                coarse.clear();
+                let mut propagated = 0.0_f64;
+                let mut local_magnitude = 0.0_f64;
+                for offset in tail.offset_min..=tail.offset_max {
+                    let coefficient = tail.coefficient(phase, offset);
+                    if coefficient == 0.0 {
+                        continue;
+                    }
+                    let parity = (cell + i128::from(offset)).rem_euclid(2) as usize;
+                    let coarse_evaluation = coarse_by_parity[parity];
+                    propagated = upper_add(
+                        propagated,
+                        upper_mul(coefficient.abs(), coarse_evaluation.error),
+                    );
+                    local_magnitude = local_magnitude.max(coarse_evaluation.upper());
+                    coarse.push((coefficient, coarse_evaluation.value));
+                }
+                let dot = accurate_dot(coarse.iter().copied());
+                let model = upper_mul(
+                    tail.composition_error_per_coarse_peak_upper,
+                    local_magnitude,
+                );
+                let evaluation = Evaluation {
+                    value: dot.value,
+                    error: upper_add(upper_add(dot.error, propagated), model),
+                };
+
+                self.observe_evaluation_base(channel, evaluation);
+                self.settled_evaluated_upper_channel_peaks[channel] = self
+                    .settled_evaluated_upper_channel_peaks[channel]
+                    .max(evaluation.upper());
+                self.diagnostics.phase_evaluations = self
+                    .diagnostics
+                    .phase_evaluations
+                    .saturating_add(1);
+            }
+        }
+    }
+
+    /// Classify Reference target cells whose complete reconstruction support
+    /// lies inside one exact raw plateau. The raw change list is built once per
+    /// non-constant channel/tile, and the cell windows advance monotonically,
+    /// so long flat runs are detected in O(raw support + cell count) time.
+    fn reference_flat_cell_mask(
+        &self,
+        coarse_start: i128,
+        coarse_end: i128,
+        channel: usize,
+    ) -> Vec<bool> {
+        debug_assert_eq!(self.policy, SearchPolicy::Reference9);
+        debug_assert!(coarse_end > coarse_start);
+        debug_assert!(channel < self.channels);
+        let interval_count =
+            usize::try_from(coarse_end - coarse_start).expect("bounded Reference tile cells");
+        let (raw_start, raw_end) = self.tile_raw_support(coarse_start, coarse_end);
+        let changes = self
+            .raw
+            .channel_change_positions(raw_start, raw_end, channel);
+        if changes.is_empty() {
+            return vec![true; interval_count];
+        }
+
+        let tail = self.spec.tail();
+        let mut next_change = 0usize;
+        let mut flat = Vec::with_capacity(interval_count);
+        for local in 0..interval_count {
+            let cell = coarse_start + local as i128;
+            let required_coarse_start = cell + i128::from(tail.offset_min);
+            let required_coarse_end = cell + i128::from(tail.offset_max);
+            let (cell_raw_start, cell_raw_end) = self
+                .spec
+                .raw_support_for_coarse_range(required_coarse_start, required_coarse_end);
+            while next_change < changes.len() && changes[next_change] <= cell_raw_start {
+                next_change += 1;
+            }
+            flat.push(
+                next_change == changes.len() || changes[next_change] > cell_raw_end,
+            );
+        }
+        flat
+    }
+
+    fn resolve_reference_flat_runs(
+        &mut self,
+        coarse_start: i128,
+        flat_cells: &[bool],
+        channel: usize,
+    ) {
+        let mut local = 0usize;
+        while local < flat_cells.len() {
+            if !flat_cells[local] {
+                local += 1;
+                continue;
+            }
+            let run_start = local;
+            while local < flat_cells.len() && flat_cells[local] {
+                local += 1;
+            }
+            let run_coarse_start = coarse_start + run_start as i128;
+            let run_coarse_end = coarse_start + local as i128;
+            let tail = self.spec.tail();
+            let (run_raw_start, run_raw_end) = self.spec.raw_support_for_coarse_range(
+                run_coarse_start + i128::from(tail.offset_min),
+                run_coarse_end - 1 + i128::from(tail.offset_max),
+            );
+            debug_assert!(
+                self.raw
+                    .channel_is_exact_constant(run_raw_start, run_raw_end, channel),
+                "adjacent flat target-cell supports must share one raw constant",
+            );
+            self.resolve_reference_constant_span(run_coarse_start, run_coarse_end, channel);
+        }
+    }
+
     fn process_tile(
         &mut self,
         _start_frame: i128,
@@ -3274,16 +3526,9 @@ impl CertifiedScanner {
     ) {
         debug_assert!(coarse_end >= coarse_start);
         self.diagnostics.tiles_processed = self.diagnostics.tiles_processed.saturating_add(1);
-        let tail = self.spec.tail();
-        let cache_start = coarse_start + i128::from(tail.offset_min);
-        let cache_end = if coarse_end == coarse_start {
-            coarse_start
-        } else {
-            coarse_end - 1 + i128::from(tail.offset_max)
-        };
-        self.strict_cache.reset(cache_start, cache_end);
 
         if coarse_end == coarse_start {
+            self.strict_cache.reset(coarse_start, coarse_start);
             for channel in 0..self.channels {
                 let evaluation = self.strict_coarse_evaluation(coarse_start, channel);
                 self.observe_target_evaluation(
@@ -3298,6 +3543,25 @@ impl CertifiedScanner {
             self.settle_tile_frontiers();
             return;
         }
+
+        // A finite linear reconstruction of an all-zero support is exactly
+        // zero at every target knot. Prove that property over the *complete*
+        // raw support before constructing numerical envelopes or candidate
+        // trees. Besides being exact, this prevents zero-valued roundoff
+        // envelopes from keeping every Reference9 node artificially live.
+        // Signed zero is admitted; every nonzero bit pattern, including a
+        // subnormal under DAZ/FTZ, takes the ordinary certified path.
+        let (raw_start, raw_end) = self.tile_raw_support(coarse_start, coarse_end);
+        debug_assert!(self.raw.contains(raw_start, raw_end));
+        if self.raw.range_is_exact_zero(raw_start, raw_end) {
+            self.settle_tile_frontiers();
+            return;
+        }
+
+        let tail = self.spec.tail();
+        let cache_start = coarse_start + i128::from(tail.offset_min);
+        let cache_end = coarse_end - 1 + i128::from(tail.offset_max);
+        self.strict_cache.reset(cache_start, cache_end);
 
         // Fast may reach its cumulative allowance while the prefix is being
         // produced. Do not spend additional time constructing a selective
@@ -3351,7 +3615,19 @@ impl CertifiedScanner {
         for channel in 0..self.channels {
             let candidates = match self.policy {
                 SearchPolicy::Reference9 => {
-                    self.generate_channel_candidates(channel, coarse_start, coarse_end)
+                    if self.raw.channel_is_exact_constant(raw_start, raw_end, channel) {
+                        self.resolve_reference_constant_span(coarse_start, coarse_end, channel);
+                        continue;
+                    }
+                    let flat_cells =
+                        self.reference_flat_cell_mask(coarse_start, coarse_end, channel);
+                    self.resolve_reference_flat_runs(coarse_start, &flat_cells, channel);
+                    self.generate_channel_candidates(
+                        channel,
+                        coarse_start,
+                        coarse_end,
+                        &flat_cells,
+                    )
                 }
                 SearchPolicy::Fast90 | SearchPolicy::RetiredClockFast1s => {
                     self.generate_fast90_channel_candidates(
@@ -3860,6 +4136,19 @@ mod tests {
     }
 
     #[test]
+    fn raw_zero_range_is_bit_exact_and_never_absorbs_subnormals() {
+        let mut raw = RawBuffer::new(1, 4);
+        raw.push(-1, &[0.0]);
+        raw.push(0, &[-0.0]);
+        raw.push(1, &[0.0]);
+        assert!(raw.range_is_exact_zero(-1, 1));
+        assert!(raw.channel_is_exact_constant(-1, 1, 0));
+        raw.push(2, &[f64::from_bits(1)]);
+        assert!(!raw.range_is_exact_zero(-1, 2));
+        assert!(!raw.channel_is_exact_constant(-1, 2, 0));
+    }
+
+    #[test]
     fn frozen_geometry_and_curvature_metadata_match_the_design() {
         let legacy = legacy_tail_metadata();
         let hq = hq_tail_metadata();
@@ -3897,6 +4186,130 @@ mod tests {
             meter.push_interleaved(chunk).unwrap();
         }
         meter.finalize().unwrap()
+    }
+
+    #[test]
+    fn reference_exact_zero_programme_finishes_without_candidate_refinement() {
+        let frames = 1_024;
+        let mut interleaved = Vec::with_capacity(frames * 2);
+        for frame in 0..frames {
+            let zero = if frame % 2 == 0 { 0.0 } else { -0.0 };
+            interleaved.extend_from_slice(&[zero, -zero]);
+        }
+        let certificate = scan_with_chunks(
+            ReconstructionId::Hq1024V1,
+            SearchPolicy::Reference9,
+            &interleaved,
+            2,
+            EdgePolicy::RepeatEndpoints,
+            137,
+        );
+        assert_eq!(certificate.status, SearchStatus::Complete);
+        assert!(certificate.finite_interval.is_silence());
+        assert_eq!(certificate.diagnostics.candidate_cells, 0);
+        assert_eq!(certificate.diagnostics.phase_evaluations, 0);
+        assert_eq!(certificate.diagnostics.direct_rescore_evaluations, 0);
+    }
+
+    #[test]
+    fn reference_flat_cell_mask_keeps_step_boundaries_on_the_ordinary_path() {
+        let spec = ReconstructionSpec::for_id(ReconstructionId::Hq1024V1);
+        let mut scanner = CertifiedScanner::new(spec, SearchPolicy::Reference9, 1);
+        let coarse_start = 0_i128;
+        // The tile must be long enough that each plateau exceeds one cell's
+        // complete raw reconstruction support (about first_taps plus the tail
+        // span); 512 coarse cells leave plateaus shorter than that and no cell
+        // can be flat.
+        let coarse_end = 8_192_i128;
+        let (raw_start, raw_end) = scanner.tile_raw_support(coarse_start, coarse_end);
+        let transition = raw_start + (raw_end - raw_start) / 2;
+        for index in raw_start..=raw_end {
+            let sample = if index < transition { -0.5 } else { -0.25 };
+            scanner.raw.push(index, &[sample]);
+        }
+
+        let flat = scanner.reference_flat_cell_mask(coarse_start, coarse_end, 0);
+        assert_eq!(flat.len(), usize::try_from(coarse_end - coarse_start).unwrap());
+        assert!(flat.iter().any(|value| *value));
+        assert!(flat.iter().any(|value| !*value));
+
+        let tail = spec.tail();
+        for (local, is_flat) in flat.into_iter().enumerate() {
+            let cell = coarse_start + local as i128;
+            let (cell_raw_start, cell_raw_end) = spec.raw_support_for_coarse_range(
+                cell + i128::from(tail.offset_min),
+                cell + i128::from(tail.offset_max),
+            );
+            assert_eq!(
+                is_flat,
+                scanner
+                    .raw
+                    .channel_is_exact_constant(cell_raw_start, cell_raw_end, 0),
+            );
+        }
+    }
+
+    #[test]
+    fn reference_long_constant_carrier_uses_bounded_flat_authority() {
+        let frames = TILE_INPUT_FRAMES as usize * 2 + 257;
+        let samples = vec![-0.5_f64; frames];
+        let certificate = scan_with_chunks(
+            ReconstructionId::Hq1024V1,
+            SearchPolicy::Reference9,
+            &samples,
+            1,
+            EdgePolicy::RepeatEndpoints,
+            173,
+        );
+
+        assert_eq!(certificate.status, SearchStatus::Complete);
+        assert!(certificate.finite_interval.lower_linear > 0.0);
+        assert!(certificate.finite_interval.upper_linear.is_finite());
+        assert!(
+            certificate.finite_interval.upper_linear >= certificate.finite_interval.lower_linear
+        );
+        assert!(certificate.diagnostics.tiles_processed >= 3);
+        assert_eq!(certificate.diagnostics.candidate_cells, 0);
+        assert_eq!(certificate.diagnostics.groups_expanded, 0);
+        assert_eq!(certificate.diagnostics.refined_cells, 0);
+        assert_eq!(certificate.diagnostics.direct_rescore_evaluations, 0);
+
+        let phase_bound = certificate
+            .diagnostics
+            .tiles_processed
+            .saturating_mul(2)
+            .saturating_mul((HQ1024_TAIL_FACTOR - 1) as u64);
+        assert!(
+            certificate.diagnostics.phase_evaluations <= phase_bound,
+            "flat authority must be bounded by two coarse parities per tile",
+        );
+    }
+
+    #[test]
+    fn reference_leading_silence_then_signal_terminates_with_finite_authority() {
+        const SILENT_FRAMES: usize = 8_192;
+        const SIGNAL_FRAMES: usize = 1_024;
+        let mut interleaved = vec![0.0_f64; SILENT_FRAMES * 2];
+        interleaved.reserve(SIGNAL_FRAMES * 2);
+        for frame in 0..SIGNAL_FRAMES {
+            let phase = std::f64::consts::TAU * frame as f64 / 97.0;
+            let sample = 0.25 * phase.sin();
+            interleaved.extend_from_slice(&[sample, -sample]);
+        }
+
+        let certificate = scan_with_chunks(
+            ReconstructionId::Hq1024V1,
+            SearchPolicy::Reference9,
+            &interleaved,
+            2,
+            EdgePolicy::RepeatEndpoints,
+            173,
+        );
+
+        assert_eq!(certificate.status, SearchStatus::Complete);
+        assert!(!certificate.finite_interval.is_silence());
+        assert!(certificate.finite_interval.upper_linear > 0.0);
+        assert!(certificate.diagnostics.tiles_processed >= 3);
     }
 
     fn scan_with_chunk_pattern(
@@ -4876,6 +5289,9 @@ mod tests {
                 assert_eq!(whole, thirty_seven, "{reconstruction:?} {edge:?}: whole vs 37-frame");
                 assert_eq!(whole, irregular, "{reconstruction:?} {edge:?}: whole vs irregular");
                 assert_eq!(whole.status, SearchStatus::Complete);
+                let exact = exhaustive_peak(reconstruction, &samples, 1, edge);
+                assert!(whole.finite_interval.lower_linear <= exact);
+                assert!(whole.finite_interval.upper_linear >= exact);
             }
         }
     }
@@ -5170,7 +5586,7 @@ mod tests {
         );
         let coarse_start = 512_i128;
         let coarse_end = 640_i128;
-        let (raw_start, raw_end) = scanner.fast_tile_raw_support(coarse_start, coarse_end);
+        let (raw_start, raw_end) = scanner.tile_raw_support(coarse_start, coarse_end);
         for input_index in raw_start..=raw_end {
             scanner.raw.push(input_index, &[0.9, 0.2]);
         }

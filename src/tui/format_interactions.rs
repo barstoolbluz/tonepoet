@@ -117,6 +117,24 @@ pub fn handle_format_button(
             source_bits,
             source_rate,
         ),
+        TuiButton::DsdCustomReconstructionPill(index) => format.select_row_index(
+            FormatField::DsdCustomReconstruction,
+            index,
+            source_bits,
+            source_rate,
+        ),
+        TuiButton::DsdCustomLowpassPill(index) => format.select_row_index(
+            FormatField::DsdCustomLowpass,
+            index,
+            source_bits,
+            source_rate,
+        ),
+        TuiButton::DsdCustomExportLevelPill(index) => format.select_row_index(
+            FormatField::DsdCustomExportLevel,
+            index,
+            source_bits,
+            source_rate,
+        ),
         TuiButton::DsdGainPill(index) => format.select_row_index(
             FormatField::DsdGain,
             index,
@@ -143,12 +161,6 @@ pub fn handle_format_button(
         ),
         TuiButton::DsdTruePeakTargetField => format.select_row_index(
             FormatField::DsdTruePeakTarget,
-            0,
-            source_bits,
-            source_rate,
-        ),
-        TuiButton::DsdSamplePeakTargetField => format.select_row_index(
-            FormatField::DsdSamplePeakTarget,
             0,
             source_bits,
             source_rate,
