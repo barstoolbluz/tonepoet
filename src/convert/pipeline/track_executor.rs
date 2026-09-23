@@ -8510,6 +8510,23 @@ async fn execute_reference_common_plan(
     end_fraction: f32,
     track_label: String,
 ) -> Result<ReferenceRuntimeResult, TrackExecutionError> {
+    if matches!(
+        summary.gain_policy,
+        tonepoet_pipeline::ResolvedGainPolicy::TruePeakNormalize {
+            scope: tonepoet_pipeline::TruePeakScope::Album,
+            bound_gain: None,
+            ..
+        }
+    ) {
+        return Err(TrackExecutionError::new(
+            ConvertError::Backend(
+                "Reference album plan reached terminal execution before the submitted-batch common scalar was bound"
+                    .to_string(),
+            ),
+            Vec::new(),
+        ));
+    }
+
     let retained_reference = match source_ref {
         Some(TrackSourceRef::DsdReferenceAutoGainCarrier {
             path,

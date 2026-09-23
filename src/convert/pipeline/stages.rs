@@ -23633,6 +23633,28 @@ fn conversion_summary(
             }
         }
     }
+    if let TrackSourceRef::DsdReferenceAutoGainCarrier { target_dbtp, .. } = &track.source_ref {
+        if let Some(gain_db) = req.settings.dsd.runtime_album_gain_db() {
+            let scope = match (
+                req.settings.dsd.runtime_album_track_count(),
+                req.settings.dsd.runtime_album_loudest_peak_dbfs(),
+            ) {
+                (Some(track_count), Some(loudest)) => format!(
+                    "{track_count} measured DSD track(s), loudest true peak {} dBTP",
+                    loudest.render(false),
+                ),
+                (Some(track_count), None) => {
+                    format!("{track_count} verified-silent DSD track(s)")
+                }
+                _ => "submitted DSD batch".to_string(),
+            };
+            transforms.push(format!(
+                "submitted-batch DSD Reference album gain {} dB ({scope}; target {} dBTP)",
+                gain_db.render(true),
+                target_dbtp.render(false),
+            ));
+        }
+    }
     if let Some(gain_db) = req.settings.pcm_true_peak.fixed_gain_db() {
         transforms.push(format!(
             "user-supplied PCM fixed gain {} dB (unclamped; may clip)",
@@ -29989,6 +30011,9 @@ fn bound_certified_true_peak_carrier(source_ref: &TrackSourceRef) -> bool {
         TrackSourceRef::DsdTruePeakCarrier {
             gain_db: Some(_),
             ..
+        } | TrackSourceRef::DsdReferenceAutoGainCarrier {
+            gain_db: Some(_),
+            ..
         } | TrackSourceRef::PcmTruePeakCarrier {
             gain_db: Some(_),
             ..
@@ -30054,6 +30079,7 @@ impl CertifiedTruePeakScratchRetrySeed {
 
         if album.req.settings.dsd.runtime_album_gain_db().is_some()
             && !album.req.settings.dsd.album_true_peak_gain_selected()
+            && !album.req.settings.dsd.reference_auto_album_gain_possible()
         {
             return Err(
                 "runtime DSD album gain reached scratch retry outside album-scoped true-peak gain mode"
@@ -30115,7 +30141,46 @@ fn validate_retained_certified_true_peak_carriers_for_disk_retry(
 ) -> Result<usize, String> {
     let mut carriers = 0usize;
     for track in &source.tracks {
-        let (path, channels, gain_db) = match &track.source_ref {
+        match &track.source_ref {
+            TrackSourceRef::DsdReferenceAutoGainCarrier {
+                path,
+                gain_db,
+                carrier_sha256,
+                ..
+            } => {
+                if gain_db.is_none() {
+                    return Err(format!(
+                        "retained Reference carrier reached retry before its common scalar was bound: {}",
+                        path.display(),
+                    ));
+                }
+                if !path.starts_with(scratch_staging_root) {
+                    return Err(format!(
+                        "retained Reference carrier escaped its scratch staging root: {}",
+                        path.display(),
+                    ));
+                }
+                let metadata = fs::metadata(path).map_err(|error| {
+                    format!(
+                        "could not stat retained Reference carrier for disk retry {}: {error}",
+                        path.display(),
+                    )
+                })?;
+                if !metadata.is_file() || metadata.len() == 0 {
+                    return Err(format!(
+                        "retained Reference carrier for disk retry is missing, non-regular, or empty: {}",
+                        path.display(),
+                    ));
+                }
+                let actual_digest = sha256_file(path)?;
+                if actual_digest != *carrier_sha256 {
+                    return Err(format!(
+                        "retained Reference carrier changed after certified observation; refusing stale retry binding: {}",
+                        path.display(),
+                    ));
+                }
+                carriers = carriers.saturating_add(1);
+            }
             TrackSourceRef::DsdTruePeakCarrier {
                 path,
                 channels,
@@ -30127,55 +30192,56 @@ fn validate_retained_certified_true_peak_carriers_for_disk_retry(
                 channels,
                 gain_db,
                 ..
-            } => (path, *channels, *gain_db),
-            _ => continue,
-        };
-        if gain_db.is_none() {
-            return Err(format!(
-                "retained certified carrier reached retry before its scalar was bound: {}",
-                path.display(),
-            ));
-        }
-        if !path.starts_with(scratch_staging_root) {
-            return Err(format!(
-                "retained certified carrier escaped its scratch staging root: {}",
-                path.display(),
-            ));
-        }
-        let metadata = fs::metadata(path).map_err(|error| {
-            format!(
-                "could not stat retained certified carrier for disk retry {}: {error}",
-                path.display(),
-            )
-        })?;
-        let frame_bytes = u64::from(channels)
-            .checked_mul(std::mem::size_of::<f64>() as u64)
-            .ok_or_else(|| "retained certified carrier frame size overflowed".to_string())?;
-        if !metadata.is_file()
-            || metadata.len() == 0
-            || frame_bytes == 0
-            || metadata.len() % frame_bytes != 0
-        {
-            return Err(format!(
-                "retained certified carrier for disk retry is missing, non-regular, empty, or frame-misaligned: {}",
-                path.display(),
-            ));
-        }
+            } => {
+                if gain_db.is_none() {
+                    return Err(format!(
+                        "retained certified carrier reached retry before its scalar was bound: {}",
+                        path.display(),
+                    ));
+                }
+                if !path.starts_with(scratch_staging_root) {
+                    return Err(format!(
+                        "retained certified carrier escaped its scratch staging root: {}",
+                        path.display(),
+                    ));
+                }
+                let metadata = fs::metadata(path).map_err(|error| {
+                    format!(
+                        "could not stat retained certified carrier for disk retry {}: {error}",
+                        path.display(),
+                    )
+                })?;
+                let frame_bytes = u64::from(*channels)
+                    .checked_mul(std::mem::size_of::<f64>() as u64)
+                    .ok_or_else(|| "retained certified carrier frame size overflowed".to_string())?;
+                if !metadata.is_file()
+                    || metadata.len() == 0
+                    || frame_bytes == 0
+                    || metadata.len() % frame_bytes != 0
+                {
+                    return Err(format!(
+                        "retained certified carrier for disk retry is missing, non-regular, empty, or frame-misaligned: {}",
+                        path.display(),
+                    ));
+                }
 
-        // PERF03: path identity alone is insufficient.  The digest was bound by
-        // the same traversal that completed the certified observation, encoded
-        // into the private carrier name, and is recomputed only on this
-        // exceptional retry path.  Any mutation at the same path invalidates
-        // the measurement/scalar binding before terminal work starts.
-        let expected_digest = certified_carrier_digest_from_path(path)?;
-        let actual_digest = sha256_file(path)?;
-        if actual_digest != expected_digest {
-            return Err(format!(
-                "retained certified carrier changed after measurement; refusing stale retry binding: {}",
-                path.display(),
-            ));
+                // PERF03: path identity alone is insufficient.  The digest was bound by
+                // the same traversal that completed the certified observation, encoded
+                // into the private carrier name, and is recomputed only on this
+                // exceptional retry path.  Any mutation at the same path invalidates
+                // the measurement/scalar binding before terminal work starts.
+                let expected_digest = certified_carrier_digest_from_path(path)?;
+                let actual_digest = sha256_file(path)?;
+                if actual_digest != expected_digest {
+                    return Err(format!(
+                        "retained certified carrier changed after measurement; refusing stale retry binding: {}",
+                        path.display(),
+                    ));
+                }
+                carriers = carriers.saturating_add(1);
+            }
+            _ => {}
         }
-        carriers = carriers.saturating_add(1);
     }
     if carriers == 0 {
         return Err("certified true-peak disk retry had no retained measured carrier to reuse".to_string());
