@@ -2691,3 +2691,39 @@ the in-app form of the scanner-and-repair backlog item from 2026-07-27; a librar
 sweep can come later on top of it.
 
 Not part of the 2026-09-20 DSD and ID3 brief; scheduled after it.
+
+## 39. A GIF cover picture makes every FLAC track of an album fail to convert
+
+Found 2026-09-23 on a per-track FLAC album (Billboard Top Hits 1988, ten tracks, 44.1/16)
+whose embedded front cover is a 304x300 GIF. All ten tracks fail, in every session; the
+other nineteen albums in the same set, with JPEG covers, convert.
+
+### Mechanism
+
+The metadata-and-artwork stage runs FFmpeg with the source's picture stream mapped and
+copied into the FLAC output. FFmpeg's FLAC muxer writes only JPEG and PNG attached
+pictures and refuses before writing the header:
+
+```
+[flac] GIF image support is not implemented.
+Could not write header (incorrect codec parameters ?): Not yet implemented in FFmpeg
+```
+
+Reproduced standalone: `ffmpeg -i in.flac -map 0 -c copy out.flac` fails on such a file;
+`-map 0:a` succeeds. The stage's error text is FFmpeg's entire banner and metadata dump
+followed by that one line, and the TUI shows only "Convert: one or more tracks failed",
+so the cause is invisible from inside tonepoet.
+
+### Required
+
+An album whose cover art is GIF, BMP, or any picture codec the output container's muxer
+does not accept converts with its cover preserved: the picture is carried in a form the
+target accepts, and the conversion log says what was done to it. The track does not fail
+because of its picture. When a track does fail, the queue entry and the history show the
+failure's own sentence, not only "one or more tracks failed" (the same disclosure gap is
+outcome 6 of the 2026-09-23 SACD brief).
+
+### Workaround
+
+Copy the album, replace the picture in the copy with a PNG via `metaflac
+--remove --block-type=PICTURE` and `--import-picture-from`, convert the copy.
