@@ -27268,6 +27268,7 @@ fn publish_album_output_bound(
                         &temp_dir,
                         plan,
                         manifest,
+                        manifest_album_dir,
                         &incremental_marker_path,
                         fragment_batch_identity.as_ref(),
                         &mut published_entries,
@@ -27465,6 +27466,7 @@ fn publish_incremental_album_output(
     temp_dir: &Path,
     plan: &PublishPlan,
     manifest: Option<&super::manifest::ConversionManifest>,
+    manifest_album_dir: Option<&Path>,
     marker_path: &Path,
     fragment_batch_identity: Option<&ConversionLogBatchIdentity>,
     published_entries: &mut Vec<PublishedEntry>,
@@ -27645,6 +27647,7 @@ fn publish_incremental_album_output(
     let native_manifest_path = match write_native_incremental_manifest_transactionally(
         plan,
         manifest,
+        manifest_album_dir,
         &mut rollback,
     ) {
         Ok(path) => path,
@@ -27709,7 +27712,7 @@ fn publish_incremental_album_output(
 
     match native_manifest_path {
         Some(path) => Ok(Some(path)),
-        None => write_incremental_manifest(plan, manifest),
+        None => write_incremental_manifest(plan, manifest, manifest_album_dir),
     }
 }
 
@@ -28206,6 +28209,7 @@ fn should_fallback_to_remove_then_rename_for_replace(err: &io::Error, dst: &Path
 fn write_native_incremental_manifest_transactionally(
     plan: &PublishPlan,
     manifest: Option<&super::manifest::ConversionManifest>,
+    manifest_album_dir: Option<&Path>,
     rollback: &mut IncrementalPublishRollback,
 ) -> Result<Option<PathBuf>, PublishError> {
     let Some(manifest) = manifest else {
@@ -28220,7 +28224,10 @@ fn write_native_incremental_manifest_transactionally(
 
     let final_manifest_path = super::manifest::manifest_path(&plan.album_dir);
     rollback.snapshot_destination(&final_manifest_path)?;
-    super::manifest::write_manifest_for_publish(&plan.album_dir, &plan.album_dir, manifest)
+    // A bound (descriptor-route) plan carries the album as `/proc/self/fd/N/...`;
+    // the manifest records the logical album directory, so validate against that.
+    let validation_album_dir = manifest_album_dir.unwrap_or(plan.album_dir.as_path());
+    super::manifest::write_manifest_for_publish(&plan.album_dir, validation_album_dir, manifest)
         .map_err(|err| PublishError::Manifest(err.to_string()))?;
     Ok(Some(final_manifest_path))
 }
@@ -28228,11 +28235,13 @@ fn write_native_incremental_manifest_transactionally(
 fn write_incremental_manifest(
     plan: &PublishPlan,
     manifest: Option<&super::manifest::ConversionManifest>,
+    manifest_album_dir: Option<&Path>,
 ) -> Result<Option<PathBuf>, PublishError> {
     let Some(manifest) = manifest else {
         return Ok(None);
     };
-    match super::manifest::write_manifest_for_publish(&plan.album_dir, &plan.album_dir, manifest) {
+    let validation_album_dir = manifest_album_dir.unwrap_or(plan.album_dir.as_path());
+    match super::manifest::write_manifest_for_publish(&plan.album_dir, validation_album_dir, manifest) {
         Ok(_written_manifest_path) => Ok(Some(super::manifest::manifest_path(&plan.album_dir))),
         Err(err) if matches!(
             &manifest.route_identity,

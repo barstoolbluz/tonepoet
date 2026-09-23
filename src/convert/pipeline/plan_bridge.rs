@@ -474,10 +474,15 @@ fn plan_request_for_track_impl(
                 }
             }
         }
-    } else if settings.dsd.runtime_album_gain_db().is_some() {
+    } else if settings.dsd.runtime_album_gain_db().is_some()
+        && !matches!(&track.source_ref, TrackSourceRef::DsdReferenceAutoGainCarrier { .. })
+    {
         // The submitted-batch authority applies only to DSD tracks that were
         // measured into explicit album-gain carriers. A mixed DSD/non-DSD
         // source must never apply that gain to its ordinary PCM members.
+        // A retained Reference album carrier is exactly such a measured DSD
+        // track: its common scalar stays on the DSD policy surface so the
+        // Reference planner binds it.
         settings.dsd.set_runtime_album_gain_db(None);
     }
     if !matches!(

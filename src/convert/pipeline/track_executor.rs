@@ -6678,19 +6678,24 @@ fn validate_reference_production_promotion_evidence(
                 "could not parse the embedded Phase-5 Reference qualification report: {error}"
             ))
         })?;
-    report
-        .validate_completed(
-            candidate_bytes,
-            &toolchain.common_runtime_closure_fingerprint_sha256,
-            toolchain
-                .metadata_mutation_closure_fingerprint_sha256
-                .as_deref(),
-        )
-        .map_err(|reason| {
-            qualification_unavailable_error(format!(
+    let unqualified_override = reference_unqualified_override_active();
+    if let Err(reason) = report.validate_completed(
+        candidate_bytes,
+        &toolchain.common_runtime_closure_fingerprint_sha256,
+        toolchain
+            .metadata_mutation_closure_fingerprint_sha256
+            .as_deref(),
+    ) {
+        if unqualified_override && reason.contains(REFERENCE_CLOSURE_BINDING_MISMATCH) {
+            log::warn!(
+                "UNQUALIFIED Reference execution: {REFERENCE_UNQUALIFIED_OVERRIDE_ENV} is set and the qualification report does not bind this binary's runtime closure ({reason}); output is not release evidence"
+            );
+        } else {
+            return Err(qualification_unavailable_error(format!(
                 "Reference production promotion is inactive: {reason}"
-            ))
-        })?;
+            )));
+        }
+    }
 
     let certification: tonepoet_pipeline::ReferenceReleaseCertificationV1 =
         serde_json::from_slice(certification_bytes).map_err(|error| {
@@ -6698,21 +6703,39 @@ fn validate_reference_production_promotion_evidence(
                 "could not parse the embedded Phase-5 Reference release certification: {error}"
             ))
         })?;
-    certification
-        .validate_completed(
-            candidate_bytes,
-            report_bytes,
-            &report,
-            &toolchain.common_runtime_closure_fingerprint_sha256,
-            toolchain
-                .metadata_mutation_closure_fingerprint_sha256
-                .as_deref(),
-        )
-        .map_err(|reason| {
-            qualification_unavailable_error(format!(
-                "Reference production promotion is inactive: {reason}"
-            ))
-        })
+    match certification.validate_completed(
+        candidate_bytes,
+        report_bytes,
+        &report,
+        &toolchain.common_runtime_closure_fingerprint_sha256,
+        toolchain
+            .metadata_mutation_closure_fingerprint_sha256
+            .as_deref(),
+    ) {
+        Ok(()) => Ok(()),
+        Err(reason) if unqualified_override && reason.contains(REFERENCE_CLOSURE_BINDING_MISMATCH) => {
+            log::warn!(
+                "UNQUALIFIED Reference execution: {REFERENCE_UNQUALIFIED_OVERRIDE_ENV} is set and the release certification does not bind this binary's runtime closure ({reason}); output is not release evidence"
+            );
+            Ok(())
+        }
+        Err(reason) => Err(qualification_unavailable_error(format!(
+            "Reference production promotion is inactive: {reason}"
+        ))),
+    }
+}
+
+/// Development override: when this variable is `1`, a Reference binary whose
+/// runtime closure is not bound by the installed qualification report still
+/// executes, with an UNQUALIFIED warning. Every other check (candidate identity,
+/// report status, toolchain attestation, Wave64 contracts, fail-closed guards)
+/// stays in force. It exists so a corrective can be field-tested in minutes
+/// instead of after a 46-minute requalification; the shipped release never sets it.
+const REFERENCE_UNQUALIFIED_OVERRIDE_ENV: &str = "TONEPOET_DSD_REFERENCE_UNQUALIFIED_OVERRIDE";
+const REFERENCE_CLOSURE_BINDING_MISMATCH: &str = "does not bind the running runtime closure variant";
+
+fn reference_unqualified_override_active() -> bool {
+    std::env::var(REFERENCE_UNQUALIFIED_OVERRIDE_ENV).is_ok_and(|value| value.trim() == "1")
 }
 
 async fn attest_reference_toolchain(
