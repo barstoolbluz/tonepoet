@@ -12399,12 +12399,8 @@ mod tests {
             runtime_dispatch_digest: Sha256Digest::of_bytes(b"test-dispatch"),
         };
 
-        let error = validate_reference_production_promotion_preflight(metadata_disabled_summary)
-            .expect_err("checked-in not-run evidence cannot pass production preflight");
-        assert!(
-            matches!(&error.error, ConvertError::QualificationUnavailable(_)),
-            "not-run Phase-5 evidence must be a qualification refusal: {error}"
-        );
+        validate_reference_production_promotion_preflight(metadata_disabled_summary)
+            .expect("checked-in passed Phase-5 evidence passes production preflight");
 
         let candidate_bytes = include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -14405,17 +14401,23 @@ mod tests {
 
     struct MissingSoxNoInvocationRunner {
         interactions: AtomicUsize,
+        launches: AtomicUsize,
     }
 
     impl MissingSoxNoInvocationRunner {
         fn new() -> Self {
             Self {
                 interactions: AtomicUsize::new(0),
+                launches: AtomicUsize::new(0),
             }
         }
 
         fn interactions(&self) -> usize {
             self.interactions.load(Ordering::SeqCst)
+        }
+
+        fn launches(&self) -> usize {
+            self.launches.load(Ordering::SeqCst)
         }
     }
 
@@ -14426,6 +14428,7 @@ mod tests {
             _cmd: ToolCommand,
             _cancel: &CancellationToken,
         ) -> Result<ToolOutput, ToolRunnerError> {
+            self.launches.fetch_add(1, Ordering::SeqCst);
             self.interactions.fetch_add(1, Ordering::SeqCst);
             Err(ToolRunnerError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -14445,7 +14448,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_not_run_promotion_preflight_precedes_tool_attestation() {
+    async fn production_promoted_evidence_refuses_missing_sox_before_any_tool_launch() {
         let temp = tempfile::tempdir().expect("Reference production preflight tempdir");
         let source = temp.path().join("source.dsf");
         write_reference_dsf_fixture(&source);
@@ -14476,16 +14479,21 @@ mod tests {
             1.0,
         )
         .await
-        .expect_err("checked-in not-run Phase-5 evidence must block production");
+        .expect_err("a missing SoX-ng must block Reference production");
 
         assert!(
-            matches!(&error.error, ConvertError::QualificationUnavailable(_)),
-            "known not-run evidence must win over missing SoX: {error}"
+            error.to_string().contains("DSD-REF-P0-015"),
+            "with passed Phase-5 evidence the refusal is tool attestation: {error}"
+        );
+        assert_eq!(
+            runner.launches(),
+            0,
+            "toolchain attestation resolves the SoX path and launches nothing"
         );
         assert_eq!(
             runner.interactions(),
-            0,
-            "production promotion preflight must not query or launch a tool"
+            1,
+            "toolchain attestation resolves the SoX path exactly once"
         );
         assert!(
             !staged_output.exists(),

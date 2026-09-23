@@ -1,11 +1,72 @@
 {
-  "schema_version": 17,
+  "candidate_manifest_sha256": "0ed1460cbb6388a0c999ed623bee4c3d42c146c80e639a6814c41cf19e337b71",
   "execution_model": "tonepoet-reference-common-model/v1",
-  "status": "not_run",
-  "candidate_manifest_sha256": "",
-  "runtime_closure_fingerprint_sha256": "",
-  "metadata_mutation_closure_fingerprint_sha256": null,
-  "positive_case_count": 0,
-  "expected_negative_case_count": 0,
-  "gates": []
+  "expected_negative_case_count": 44,
+  "gates": [
+    {
+      "evidence_sha256": "544aafa20c17873b5596ae65cf5ff74c66494d70f293549ea15d732e85c5f07b",
+      "gate": "Q01",
+      "status": "passed"
+    },
+    {
+      "evidence_sha256": "e8c919df12d99e6ef0f7cb96cd96f806bfe98670b9d106c9c5f3dd1308c30b5e",
+      "gate": "Q02",
+      "status": "passed"
+    },
+    {
+      "evidence_sha256": "da8032643afc44c6fd7c9fd2f886863b1195de260e0e0f74571ada1c783c8de2",
+      "gate": "GAIN08",
+      "status": "passed"
+    },
+    {
+      "evidence_sha256": "6ac4a79d7bdb2ef54526c5fda165963bad9bd853fc27fc10e215e0e1e14224fe",
+      "gate": "GAIN09",
+      "status": "passed"
+    },
+    {
+      "evidence_sha256": "b55174f560b0575b27e417a65ae048a6dc78c99b2ffefc8a0fa6c89cd44d317e",
+      "gate": "wave64_integrity_80_cell",
+      "status": "passed"
+    },
+    {
+      "evidence_sha256": "c547fbead7751707b64bbf7c05bf8c08d1786e1307cb775c6961bc66425637fc",
+      "gate": "complete_reader",
+      "status": "passed"
+    },
+    {
+      "evidence_sha256": "f7c7c4efc3e4a51cd2b03810a66febb027bd020ce9bb4ef10baa459035cf113c",
+      "gate": "package_identity",
+      "status": "passed"
+    },
+    {
+      "evidence_sha256": "6444131f343df2dec3d1df7c1b6cea7276077e497e19304a1a85056790753b61",
+      "gate": "post_metadata_identity",
+      "status": "passed"
+    },
+    {
+      "evidence_sha256": "8085f9d0ffbb935ed0d1fe7b94c42a088fd1ae9b929cdb030235d213eb39c771",
+      "gate": "timeout_cancellation_resource",
+      "status": "passed"
+    },
+    {
+      "evidence_sha256": "4601f01bff78543fd183efbedea6cd00665de9b74d4b60317e24090362b76df6",
+      "gate": "ordinary_workspace_regression",
+      "status": "passed"
+    },
+    {
+      "evidence_sha256": "9dafff01b021db33bf90f954a7af0cba189d44b8f583768be40825a54f6e4939",
+      "gate": "real_tool_candidate_qualification",
+      "status": "passed"
+    },
+    {
+      "evidence_sha256": "e5b62814b3369c713dfe6e2205da0c27947e51354b07eadb12e1ade5a2ae394d",
+      "gate": "paired_performance_resource",
+      "status": "passed"
+    }
+  ],
+  "metadata_mutation_closure_fingerprint_sha256": "c5158b9d72e680814eb08f7db96f33577a9a55be66ac33d7fe22f98946ba9f23",
+  "positive_case_count": 946,
+  "runtime_closure_fingerprint_sha256": "da20f9621ce131262ec2cfa7ee0a6be7c2777e837a2cd1d9224532b283ec0eb3",
+  "schema_version": 17,
+  "status": "passed"
 }
