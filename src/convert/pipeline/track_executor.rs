@@ -2163,112 +2163,129 @@ pub(crate) async fn execute_planned_track_conversion_with_scalar_pump(
             admitted_plan.cleanup_paths(),
         )?;
 
-        let reference_materialization = if admitted_plan.reference.is_some() {
+        let mut plan = admitted_plan;
+        let reference_source_evidence = if plan.reference.is_some() {
             let scratch = reference_scratch.as_ref().ok_or_else(|| {
                 TrackExecutionError::new(
                     ConvertError::Backend("Reference scratch authority is missing".to_string()),
                     Vec::new(),
                 )
             })?;
-            let materialization = materialize_reference_source(
-                &plan_request,
-                track,
-                realized_input,
-                scratch,
-                cancel,
-                cleanup_guard.blocking_worker_lease()?,
-            )
-            .await?;
-            let admitted_source_kind = plan_request.source.dsd_source_kind.clone();
-            let admitted_target = plan_request.resolved_output_target;
-            let admitted_scope = plan_request.reference_programme_scope.clone();
-            let admitted_summary = admitted_plan.reference.as_ref().ok_or_else(|| {
-                TrackExecutionError::new(
-                    ConvertError::Backend("Reference plan authority is missing".to_string()),
-                    Vec::new(),
+            if let Some(evidence) = retained_reference_album_source_evidence(track) {
+                // Album preparation already ran the production source
+                // materializer, reconstructed the qualified protected R64, and
+                // certified that exact retained payload. The submitted-batch
+                // barrier binds only the common scalar. Do not feed the retained
+                // Wave64 carrier back into the DSF/DSDIFF materializer here;
+                // final Reference execution verifies and consumes this carrier
+                // directly, while these hashes preserve the prepass source and
+                // canonical-materialization evidence in the final record.
+                Some(evidence)
+            } else {
+                let materialization = materialize_reference_source(
+                    &plan_request,
+                    track,
+                    realized_input,
+                    scratch,
+                    cancel,
+                    cleanup_guard.blocking_worker_lease()?,
                 )
-            })?;
-            let materialized_source = source_info_for_realized_track(track, &materialization.path)?;
-            if !materialized_source.codec.is_dsd()
-                || materialized_source.sample_rate_hz != plan_request.source.sample_rate_hz
-                || materialized_source.channels != plan_request.source.channels
-                || materialized_source.sample_kind != Some(tonepoet_pipeline::SampleKind::Dsd)
-            {
-                return Err(TrackExecutionError::new(
-                    ConvertError::Backend(
-                        "Reference private materialization changed the admitted DSD rate, channel count, or representation"
-                            .to_string(),
-                    ),
-                    Vec::new(),
-                ));
-            }
+                .await?;
+                let admitted_source_kind = plan_request.source.dsd_source_kind.clone();
+                let admitted_target = plan_request.resolved_output_target;
+                let admitted_scope = plan_request.reference_programme_scope.clone();
+                let admitted_summary = plan.reference.as_ref().ok_or_else(|| {
+                    TrackExecutionError::new(
+                        ConvertError::Backend("Reference plan authority is missing".to_string()),
+                        Vec::new(),
+                    )
+                })?;
+                let materialized_source =
+                    source_info_for_realized_track(track, &materialization.path)?;
+                if !materialized_source.codec.is_dsd()
+                    || materialized_source.sample_rate_hz != plan_request.source.sample_rate_hz
+                    || materialized_source.channels != plan_request.source.channels
+                    || materialized_source.sample_kind != Some(tonepoet_pipeline::SampleKind::Dsd)
+                {
+                    return Err(TrackExecutionError::new(
+                        ConvertError::Backend(
+                            "Reference private materialization changed the admitted DSD rate, channel count, or representation"
+                                .to_string(),
+                        ),
+                        Vec::new(),
+                    ));
+                }
 
-            // Rebind only the immutable private input path and carrier facts. Keep
-            // the original container/front-end identity: DSDIFF/DST and SACD/DST
-            // must remain qualified decode operations even though their private
-            // carrier is now uncompressed DSDIFF/DSD or DSF.
-            let mut rematerialized = plan_request.clone();
-            rematerialized.input_path = materialization.path.clone();
-            rematerialized.source.format = materialized_source.format;
-            rematerialized.source.codec = materialized_source.codec;
-            rematerialized.source.sample_rate_hz = materialized_source.sample_rate_hz;
-            rematerialized.source.bit_depth = materialized_source.bit_depth;
-            rematerialized.source.true_source_depth = materialized_source.true_source_depth;
-            rematerialized.source.source_representation = materialized_source.source_representation;
-            rematerialized.source.sample_kind = materialized_source.sample_kind;
-            rematerialized.source.channels = materialized_source.channels;
-            rematerialized.source.duration = materialized_source.duration;
-            rematerialized.source.frame_extent = materialized_source.frame_extent;
-            rematerialized.source.audio_md5 = materialized_source.audio_md5;
-            rematerialized.source.dsd_source_kind = admitted_source_kind.clone();
-            if rematerialized.resolved_output_target != admitted_target
-                || rematerialized.reference_programme_scope != admitted_scope
-            {
-                return Err(TrackExecutionError::new(
-                    ConvertError::Backend(
-                        "Reference target or programme authority changed during materialization"
-                            .to_string(),
-                    ),
-                    Vec::new(),
-                ));
+                // Rebind only the immutable private input path and carrier facts. Keep
+                // the original container/front-end identity: DSDIFF/DST and SACD/DST
+                // must remain qualified decode operations even though their private
+                // carrier is now uncompressed DSDIFF/DSD or DSF.
+                let mut rematerialized = plan_request.clone();
+                rematerialized.input_path = materialization.path.clone();
+                rematerialized.source.format = materialized_source.format;
+                rematerialized.source.codec = materialized_source.codec;
+                rematerialized.source.sample_rate_hz = materialized_source.sample_rate_hz;
+                rematerialized.source.bit_depth = materialized_source.bit_depth;
+                rematerialized.source.true_source_depth = materialized_source.true_source_depth;
+                rematerialized.source.source_representation =
+                    materialized_source.source_representation;
+                rematerialized.source.sample_kind = materialized_source.sample_kind;
+                rematerialized.source.channels = materialized_source.channels;
+                rematerialized.source.duration = materialized_source.duration;
+                rematerialized.source.frame_extent = materialized_source.frame_extent;
+                rematerialized.source.audio_md5 = materialized_source.audio_md5;
+                rematerialized.source.dsd_source_kind = admitted_source_kind.clone();
+                if rematerialized.resolved_output_target != admitted_target
+                    || rematerialized.reference_programme_scope != admitted_scope
+                {
+                    return Err(TrackExecutionError::new(
+                        ConvertError::Backend(
+                            "Reference target or programme authority changed during materialization"
+                                .to_string(),
+                        ),
+                        Vec::new(),
+                    ));
+                }
+                let rematerialized_plan = plan_conversion(&rematerialized).map_err(|err| {
+                    ConvertError::Backend(format!("planner failed after materialization: {err}"))
+                })?;
+                cleanup_guard.add_planner_paths(rematerialized_plan.cleanup_paths());
+                validate_reference_scratch_cleanup_authority(&rematerialized_plan, scratch)?;
+                let rematerialized_summary =
+                    rematerialized_plan.reference.as_ref().ok_or_else(|| {
+                        TrackExecutionError::new(
+                            ConvertError::Backend(
+                                "Reference authority disappeared after source materialization"
+                                    .to_string(),
+                            ),
+                            Vec::new(),
+                        )
+                    })?;
+                if admitted_summary.semantic_plan_hash_v1
+                    != rematerialized_summary.semantic_plan_hash_v1
+                    || admitted_summary.policy != rematerialized_summary.policy
+                    || admitted_summary.qualification_candidate_manifest_digest
+                        != rematerialized_summary.qualification_candidate_manifest_digest
+                {
+                    return Err(TrackExecutionError::new(
+                        ConvertError::Backend(
+                            "Reference semantic plan changed during source materialization"
+                                .to_string(),
+                        ),
+                        Vec::new(),
+                    ));
+                }
+                let evidence = ReferenceSourceEvidence::from(&materialization);
+                plan_request = rematerialized;
+                plan = rematerialized_plan;
+                Some(evidence)
             }
-            let rematerialized_plan = plan_conversion(&rematerialized)
-                .map_err(|err| ConvertError::Backend(format!("planner failed after materialization: {err}")))?;
-            cleanup_guard.add_planner_paths(rematerialized_plan.cleanup_paths());
-            validate_reference_scratch_cleanup_authority(&rematerialized_plan, scratch)?;
-            let rematerialized_summary = rematerialized_plan.reference.as_ref().ok_or_else(|| {
-                TrackExecutionError::new(
-                    ConvertError::Backend(
-                        "Reference authority disappeared after source materialization".to_string(),
-                    ),
-                    Vec::new(),
-                )
-            })?;
-            if admitted_summary.semantic_plan_hash_v1 != rematerialized_summary.semantic_plan_hash_v1
-                || admitted_summary.policy != rematerialized_summary.policy
-                || admitted_summary.qualification_candidate_manifest_digest
-                    != rematerialized_summary.qualification_candidate_manifest_digest
-            {
-                return Err(TrackExecutionError::new(
-                    ConvertError::Backend(
-                        "Reference semantic plan changed during source materialization".to_string(),
-                    ),
-                    Vec::new(),
-                ));
-            }
-            plan_request = rematerialized;
-            Some((materialization, rematerialized_plan))
         } else {
             None
         };
-        let mut plan = reference_materialization
-            .as_ref()
-            .map(|(_, plan)| plan.clone())
-            .unwrap_or(admitted_plan);
         cleanup_guard.add_planner_paths(plan.cleanup_paths());
-        validate_certified_terminal_candidate_realization(track, &plan_request, &plan).map_err(|error| {
-            TrackExecutionError::new(error, Vec::new())
-        })?;
+        validate_certified_terminal_candidate_realization(track, &plan_request, &plan)
+            .map_err(|error| TrackExecutionError::new(error, Vec::new()))?;
         let qualified_terminal_executable = qualified_ffmpeg_int32_dither_terminal_executable(
             track,
             &plan,
@@ -2422,28 +2439,44 @@ pub(crate) async fn execute_planned_track_conversion_with_scalar_pump(
                         format!("Finished track {}", track.id.source_ordinal),
                     )
                     .await;
-                let reference = match (reference_materialization.as_ref(), reference_toolchain, reference_runtime, plan.reference.clone()) {
-                    (Some((materialization, _)), Some(toolchain), Some(runtime), Some(summary)) => Some(ReferenceExecutionEvidence {
-                        original_source_kind: plan_request.source.dsd_source_kind.clone().ok_or_else(|| {
-                            TrackExecutionError::new(
-                                ConvertError::Backend("Reference source identity is missing after materialization".to_string()),
-                                commands.clone(),
-                            )
-                        })?,
-                        source_content_sha256: materialization.source_content_sha256,
-                        source_probe_digest: admitted_source_probe_digest,
-                        canonical_materialization_sha256: materialization.canonical_materialization_sha256,
-                        plan: summary,
-                        measurements: runtime.measurements,
-                        toolchain,
-                        resolved_command_hash: runtime.resolved_command_hash,
-                        pcm_verification: runtime.pcm_verification,
-                    }),
+                let reference = match (
+                    reference_source_evidence,
+                    reference_toolchain,
+                    reference_runtime,
+                    plan.reference.clone(),
+                ) {
+                    (Some(source_evidence), Some(toolchain), Some(runtime), Some(summary)) => {
+                        Some(ReferenceExecutionEvidence {
+                            original_source_kind: plan_request
+                                .source
+                                .dsd_source_kind
+                                .clone()
+                                .ok_or_else(|| {
+                                    TrackExecutionError::new(
+                                        ConvertError::Backend(
+                                            "Reference source identity is missing from execution authority"
+                                                .to_string(),
+                                        ),
+                                        commands.clone(),
+                                    )
+                                })?,
+                            source_content_sha256: source_evidence.source_content_sha256,
+                            source_probe_digest: admitted_source_probe_digest,
+                            canonical_materialization_sha256: source_evidence
+                                .canonical_materialization_sha256,
+                            plan: summary,
+                            measurements: runtime.measurements,
+                            toolchain,
+                            resolved_command_hash: runtime.resolved_command_hash,
+                            pcm_verification: runtime.pcm_verification,
+                        })
+                    }
                     (None, None, None, None) => None,
                     _ => {
                         return Err(TrackExecutionError::new(
                             ConvertError::Backend(
-                                "Reference plan/materialization/runtime authority is incomplete".to_string(),
+                                "Reference plan/materialization/runtime authority is incomplete"
+                                    .to_string(),
                             ),
                             commands,
                         ));
@@ -7578,6 +7611,37 @@ pub(super) struct ReferenceMaterialization {
     pub(super) path: PathBuf,
     pub(super) source_content_sha256: Sha256Digest,
     pub(super) canonical_materialization_sha256: Sha256Digest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReferenceSourceEvidence {
+    source_content_sha256: Sha256Digest,
+    canonical_materialization_sha256: Sha256Digest,
+}
+
+impl From<&ReferenceMaterialization> for ReferenceSourceEvidence {
+    fn from(materialization: &ReferenceMaterialization) -> Self {
+        Self {
+            source_content_sha256: materialization.source_content_sha256,
+            canonical_materialization_sha256: materialization.canonical_materialization_sha256,
+        }
+    }
+}
+
+fn retained_reference_album_source_evidence(
+    track: &PreparedTrack,
+) -> Option<ReferenceSourceEvidence> {
+    match &track.source_ref {
+        TrackSourceRef::DsdReferenceAutoGainCarrier {
+            source_content_sha256,
+            canonical_materialization_sha256,
+            ..
+        } => Some(ReferenceSourceEvidence {
+            source_content_sha256: *source_content_sha256,
+            canonical_materialization_sha256: *canonical_materialization_sha256,
+        }),
+        _ => None,
+    }
 }
 
 /// Release-qualification view of the exact production standalone source
@@ -14377,6 +14441,117 @@ mod tests {
         request.container_extension = Some("w64".to_string());
         request.container_ffmpeg_flags.clear();
         request
+    }
+
+    #[tokio::test]
+    async fn reference_album_terminal_reuses_retained_r64_without_dsd_rematerialization() {
+        let temp = tempfile::tempdir().expect("Reference album carrier tempdir");
+        let carrier = temp.path().join("retained.reference-protected.w64");
+        std::fs::write(&carrier, b"riff-retained-reference-carrier")
+            .expect("write retained carrier sentinel");
+        let staged_output = temp.path().join("reference-output.w64");
+        let convert_root = temp.path().join("convert");
+        let work_dir = convert_root.join(".track-0001.work");
+        let gain = tonepoet_pipeline::DbNano::ZERO;
+        let source_content_sha256 = tonepoet_pipeline::Sha256Digest::of_bytes(b"source");
+        let canonical_materialization_sha256 =
+            tonepoet_pipeline::Sha256Digest::of_bytes(b"canonical-materialization");
+        let carrier_sha256 = tonepoet_pipeline::Sha256Digest::of_bytes(
+            b"riff-retained-reference-carrier",
+        );
+
+        let mut request = reference_production_request(temp.path());
+        request.album_batch = Some(crate::convert::pipeline::AlbumBatchContext::new(
+            "reference-album-retained-carrier",
+            2,
+            temp.path().join("out"),
+            temp.path().to_path_buf(),
+        ));
+        request.settings.dsd.bind_runtime_album_gain(gain, None, 2);
+
+        let track = reference_materialization_track(
+            TrackSourceRef::DsdReferenceAutoGainCarrier {
+                path: carrier.clone(),
+                source_path: temp.path().join("source.dsf"),
+                source_sample_rate_hz: 2_822_400,
+                sample_rate_hz: 88_200,
+                channels: 2,
+                duration: Some(Duration::from_secs(1)),
+                source_kind: tonepoet_pipeline::DsdSourceKind::DsfUncompressed,
+                gain_db: Some(gain),
+                target_dbtp: tonepoet_pipeline::DbNano::DEFAULT_REFERENCE_TRUE_PEAK_TARGET,
+                unbound_semantic_plan_hash: tonepoet_pipeline::Sha256Digest::of_bytes(
+                    b"unbound-plan",
+                ),
+                source_content_sha256,
+                canonical_materialization_sha256,
+                carrier_sha256,
+                observation: tonepoet_pipeline::ReferenceCertifiedPeakObservation {
+                    id: tonepoet_pipeline::MeasurementId(1),
+                    scope: tonepoet_pipeline::MeasurementScope::Plan,
+                    purpose: tonepoet_pipeline::TruePeakPurpose::GainAuthority,
+                    subject: tonepoet_pipeline::ReferenceObservationSubject::ProtectedR64,
+                    observer_identity: "test-observer".to_string(),
+                    reconstruction: "test-reconstruction".to_string(),
+                    edge_policy: "test-edge-policy".to_string(),
+                    scan_tier: "standard".to_string(),
+                    authority_endpoint: "test-authority".to_string(),
+                    reader_authority: "test-reader".to_string(),
+                    sample_rate_hz: 88_200,
+                    channels: 2,
+                    sample_frames: 1,
+                    programme_sha256: carrier_sha256,
+                    complete_reader: true,
+                    result: tonepoet_pipeline::ReferenceCertifiedPeakResult::VerifiedSilence,
+                    certificate_sha256: tonepoet_pipeline::Sha256Digest::of_bytes(
+                        b"certificate",
+                    ),
+                },
+            },
+        );
+        let runner = StubToolRunner::new();
+        let cancel = CancellationToken::new();
+        let mut progress = OperationProgressTracker::new(
+            "reference-album-retained-carrier".to_string(),
+            PipelineStage::Convert,
+            None,
+        );
+
+        let result = REFERENCE_TEST_SKIP_ATTESTATION
+            .scope(
+                (),
+                TRACK_EXECUTION_FAILURE_POINT.scope(
+                    TrackExecutionFailurePoint::ProducerLaunch,
+                    execute_planned_track_conversion(
+                        &request,
+                        &track,
+                        &carrier,
+                        &staged_output,
+                        &convert_root,
+                        &runner,
+                        &cancel,
+                        &HashMap::new(),
+                        None,
+                        &mut progress,
+                        0.0,
+                        1.0,
+                    ),
+                ),
+            )
+            .await;
+
+        let error = result.expect_err("injected producer failure must stop terminal execution");
+        assert!(
+            error.to_string().contains("producer-launch"),
+            "retained album carrier must bypass DSF/DSDIFF materialization and reach terminal execution: {error}",
+        );
+        assert!(
+            !error
+                .to_string()
+                .contains("failed to materialize verified Reference source"),
+            "retained protected R64 must never be presented to the DSD source materializer: {error}",
+        );
+        assert!(!work_dir.exists(), "failed retained-carrier execution must clean work state");
     }
 
     #[test]
