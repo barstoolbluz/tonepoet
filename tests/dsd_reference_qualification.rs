@@ -606,6 +606,34 @@ fn first_nonempty_line(text: &str) -> &str {
         .unwrap_or_default()
 }
 
+/// Canonical unpromoted v17 report, as checked in before the qualification was installed.
+const NOT_RUN_REPORT_STUB: &str = r#"{
+  "schema_version": 17,
+  "execution_model": "tonepoet-reference-common-model/v1",
+  "status": "not_run",
+  "candidate_manifest_sha256": "",
+  "runtime_closure_fingerprint_sha256": "",
+  "metadata_mutation_closure_fingerprint_sha256": null,
+  "positive_case_count": 0,
+  "expected_negative_case_count": 0,
+  "gates": []
+}"#;
+
+/// Canonical unpromoted v17 certification, as checked in before the qualification was installed.
+const NOT_RUN_CERTIFICATION_STUB: &str = r#"{
+  "schema_version": 17,
+  "execution_model": "tonepoet-reference-common-model/v1",
+  "status": "not_run",
+  "outcome": "not_run",
+  "candidate_manifest_sha256": "",
+  "qualification_report_sha256": "",
+  "runtime_closure_fingerprint_sha256": "",
+  "metadata_mutation_closure_fingerprint_sha256": null,
+  "positive_case_count": 0,
+  "expected_negative_case_count": 0,
+  "gates": []
+}"#;
+
 #[test]
 fn qualified_environment_probe_child() {
     println!(
@@ -3283,12 +3311,12 @@ fn qualify_q02_common_closure_binding(common_candidate_execution: &Value) -> Val
         "Q02 certification must reject a runtime closure mismatch",
     );
 
-    let checked_in_report_bytes = include_bytes!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_common_v17_report.json"
-    ));
+    // The checked-in v17 report and certification are execution evidence once the
+    // qualification has been installed, so the status-only promotion probes start
+    // from the canonical unpromoted `not_run` stubs with empty gate evidence.
+    let checked_in_report_bytes: &[u8] = NOT_RUN_REPORT_STUB.as_bytes();
     let mut status_only_report: tonepoet_pipeline::ReferenceQualificationReportV1 =
-        serde_json::from_slice(checked_in_report_bytes).expect("checked-in v17 report parses");
+        serde_json::from_slice(checked_in_report_bytes).expect("not-run v17 report stub parses");
     status_only_report.status = "passed".to_string();
     status_only_report.candidate_manifest_sha256 = candidate_digest.clone();
     status_only_report.runtime_closure_fingerprint_sha256 = runtime_fingerprint.to_string();
@@ -3305,13 +3333,10 @@ fn qualify_q02_common_closure_binding(common_candidate_execution: &Value) -> Val
         "changing only report status/binding strings must not promote empty evidence",
     );
 
-    let checked_in_certification_bytes = include_bytes!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_common_v17_certification.json"
-    ));
+    let checked_in_certification_bytes: &[u8] = NOT_RUN_CERTIFICATION_STUB.as_bytes();
     let mut status_only_certification: tonepoet_pipeline::ReferenceReleaseCertificationV1 =
         serde_json::from_slice(checked_in_certification_bytes)
-            .expect("checked-in v17 certification parses");
+            .expect("not-run v17 certification stub parses");
     status_only_certification.status = "passed".to_string();
     status_only_certification.outcome = "qualified".to_string();
     status_only_certification.candidate_manifest_sha256 = candidate_digest;
