@@ -3355,6 +3355,10 @@ fn exact_string_array(value: Option<&serde_json::Value>, expected: &[&str]) -> b
 }
 /// Historical v16 release-evidence audit only. Phase-5 runtime attestation must not call this.
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "source-locked historical audit material consumed by derive_dsd_reference_v8_terminal_bounds.py"
+)]
 fn validate_embedded_release_certification(
     manifest: &EmbeddedReferenceQualification,
 ) -> Result<(), TrackExecutionError> {
@@ -8462,6 +8466,31 @@ async fn execute_reference_terminal_lowering(
                 error
             })?;
             records.append(&mut terminal_records);
+            let terminal_path = int32.terminal.output.as_path().ok_or_else(|| {
+                TrackExecutionError::new(
+                    ConvertError::Backend(
+                        "Reference Int32 FFmpeg terminal output is not path-backed".to_string(),
+                    ),
+                    records.clone(),
+                )
+            })?;
+            let expected = W64PcmExpectation {
+                sample_rate_hz: int32.contract.sample_rate_hz,
+                channels: int32.contract.channels,
+                bits_per_sample: 32,
+                sample_frames,
+                encoding: W64SampleEncoding::SignedInteger,
+            };
+            tonepoet_pipeline::canonicalize_ffmpeg_int32_w64_terminal(terminal_path, expected)
+                .map_err(|error| {
+                    TrackExecutionError::new(
+                        ConvertError::Backend(format!(
+                            "{} Reference Int32 terminal canonicalization failed: {error}",
+                            reference_error_text(ReferenceErrorCode::W64StructuralIntegrity),
+                        )),
+                        records.clone(),
+                    )
+                })?;
             Ok(records)
         }
     }
@@ -12081,20 +12110,48 @@ mod tests {
             "unexpected route-contract invariant failure: {error}"
         );
 
-        let candidate: EmbeddedReferenceQualification = serde_json::from_str(include_str!(concat!(
+        let candidate_raw = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v16_candidate.json"
-        )))
-        .expect("preserved v16 candidate JSON parses");
+        ));
+        let candidate = match parse_embedded_reference_qualification_wire(candidate_raw)
+            .expect("preserved v16 candidate JSON parses")
+        {
+            EmbeddedReferenceQualificationWire::Historical(candidate) => candidate,
+            EmbeddedReferenceQualificationWire::Current(_) => {
+                panic!("preserved v16 candidate must remain historical")
+            }
+        };
+        assert_eq!(candidate.schema_version, 16);
+        assert_eq!(candidate.status, "qualification_candidate");
         assert_eq!(
             candidate
                 .terminal_bounds
-                .int16_shibata
-                .safe_pre_terminal_ceiling_dbtp,
-            tonepoet_pipeline::DbNano(i64::MIN)
+                .pointer("/int16_shibata/safe_pre_terminal_ceiling_dbtp")
+                .and_then(serde_json::Value::as_str),
+            Some("-9223372036.854775808")
         );
-        assert_eq!(candidate.status, "qualification_candidate");
-        assert!(validate_embedded_release_certification(&candidate).is_err());
+        let release_certification: EmbeddedReleaseCertification = serde_json::from_value(
+            candidate
+                .release_certification
+                .clone()
+                .expect("preserved v16 candidate carries a release-certification descriptor"),
+        )
+        .expect("preserved v16 release-certification descriptor parses");
+        assert_eq!(
+            release_certification.schema,
+            "tonepoet-dsd-reference-release-certification/v1"
+        );
+        assert_eq!(
+            release_certification.path,
+            "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v16_certification.json"
+        );
+        assert_eq!(
+            release_certification.candidate_manifest_path,
+            "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v16_candidate.json"
+        );
+        assert!(release_certification.report_sha256.is_none());
+        assert!(release_certification.candidate_manifest_sha256.is_none());
     }
 
     #[test]

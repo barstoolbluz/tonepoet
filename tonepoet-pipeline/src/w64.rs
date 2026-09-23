@@ -612,6 +612,103 @@ pub fn validate_exact_w64_pcm<R: Read + Seek>(
     validate_exact_w64_pcm_inner(reader, expected.into(), Some(expected.sample_frames))
 }
 
+/// Canonicalize the one qualified FFmpeg Wave64 Int32 terminal defect in place.
+///
+/// FFmpeg 7.1.3 can include final 8-byte chunk-alignment zeros in the Wave64
+/// `data` chunk's declared payload size. For the admitted mono Int32 case, the
+/// four zero pad bytes become one apparent PCM frame. Stereo Int32 payloads are
+/// already 8-byte aligned and pass exact validation unchanged.
+///
+/// This repair is deliberately narrow: it accepts an already-exact carrier, or
+/// removes exactly the required trailing zero alignment bytes from an otherwise
+/// valid signed-Int32 Wave64 carrier, rewrites only the root/data extents, and
+/// revalidates the complete exact Wave64 contract. Every other deviation fails.
+pub fn canonicalize_ffmpeg_int32_w64_terminal(
+    path: &std::path::Path,
+    expected: W64PcmExpectation,
+) -> Result<W64ExactStructure, W64ValidationError> {
+    use std::fs::OpenOptions;
+
+    if expected.encoding != W64SampleEncoding::SignedInteger || expected.bits_per_sample != 32 {
+        return Err(W64ValidationError::invalid(
+            "FFmpeg Wave64 terminal canonicalization requires signed Int32 PCM",
+        ));
+    }
+
+    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+    let exact_error = match validate_exact_w64_pcm(&mut file, expected) {
+        Ok(structure) => return Ok(structure),
+        Err(error) => error,
+    };
+
+    let structure = inspect_exact_w64_pcm(&mut file, expected.into()).map_err(|error| {
+        W64ValidationError::invalid(format!(
+            "Wave64 does not match the qualified FFmpeg final-padding defect: exact validation failed with {exact_error}; structural inspection failed with {error}"
+        ))
+    })?;
+    let block_align = u64::from(expected.channels)
+        .checked_mul(4)
+        .ok_or_else(|| W64ValidationError::invalid("expected Int32 block alignment overflow"))?;
+    let expected_data_bytes = expected
+        .sample_frames
+        .checked_mul(block_align)
+        .ok_or_else(|| W64ValidationError::invalid("expected Int32 data extent overflow"))?;
+    let alignment_padding_bytes = (8 - (expected_data_bytes % 8)) % 8;
+    if alignment_padding_bytes == 0 {
+        return Err(W64ValidationError::invalid(format!(
+            "exact Wave64 validation failed but the expected Int32 payload requires no final alignment padding: {exact_error}"
+        )));
+    }
+    let padded_data_bytes = expected_data_bytes
+        .checked_add(alignment_padding_bytes)
+        .ok_or_else(|| W64ValidationError::invalid("padded Int32 data extent overflow"))?;
+    if structure.declared_data_bytes != padded_data_bytes {
+        return Err(W64ValidationError::invalid(format!(
+            "data chunk declares {} payload bytes; the qualified FFmpeg padding defect would declare {padded_data_bytes} for an exact {expected_data_bytes}-byte payload",
+            structure.declared_data_bytes,
+        )));
+    }
+    let declared_data_end = structure
+        .data_payload_offset()
+        .checked_add(structure.declared_data_bytes)
+        .ok_or_else(|| W64ValidationError::invalid("declared data extent overflow"))?;
+    if declared_data_end != structure.physical_file_bytes {
+        return Err(W64ValidationError::invalid(
+            "qualified FFmpeg padding repair requires the data chunk to be final",
+        ));
+    }
+
+    let padding_offset = structure
+        .data_payload_offset()
+        .checked_add(expected_data_bytes)
+        .ok_or_else(|| W64ValidationError::invalid("terminal padding offset overflow"))?;
+    let padding_len = usize::try_from(alignment_padding_bytes)
+        .map_err(|_| W64ValidationError::invalid("terminal padding is not addressable"))?;
+    let mut padding = [0_u8; 7];
+    read_exact_at(&mut file, padding_offset, &mut padding[..padding_len])?;
+    if padding[..padding_len].iter().any(|byte| *byte != 0) {
+        return Err(W64ValidationError::invalid(
+            "qualified FFmpeg terminal padding contains non-zero audio bytes",
+        ));
+    }
+
+    let exact_data_chunk_bytes = CHUNK_HEADER_BYTES
+        .checked_add(expected_data_bytes)
+        .ok_or_else(|| W64ValidationError::invalid("exact data chunk extent overflow"))?;
+    let exact_file_bytes = structure
+        .physical_file_bytes
+        .checked_sub(alignment_padding_bytes)
+        .ok_or_else(|| W64ValidationError::invalid("exact Wave64 file extent underflow"))?;
+    file.seek(SeekFrom::Start(structure.data_chunk_offset + 16))?;
+    file.write_all(&exact_data_chunk_bytes.to_le_bytes())?;
+    file.seek(SeekFrom::Start(16))?;
+    file.write_all(&exact_file_bytes.to_le_bytes())?;
+    file.set_len(exact_file_bytes)?;
+    file.flush()?;
+    file.seek(SeekFrom::Start(0))?;
+    validate_exact_w64_pcm(&mut file, expected)
+}
+
 /// Validate an exact PCM Wave64 carrier and copy only its declared audio payload.
 ///
 /// This is the production payload bridge used by the protected SSRC path and by
@@ -639,6 +736,9 @@ pub fn copy_exact_w64_pcm_payload<R: Read + Seek, W: Write>(
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 
     fn push_chunk(file: &mut Vec<u8>, guid: [u8; 16], payload: &[u8], pad: bool) {
         file.extend_from_slice(&guid);
@@ -694,6 +794,118 @@ mod tests {
         let file_len = file.len() as u64;
         file[16..24].copy_from_slice(&file_len.to_le_bytes());
         file
+    }
+
+    fn ffmpeg_padded_int32_fixture(expectation: W64PcmExpectation) -> Vec<u8> {
+        assert_eq!(expectation.encoding, W64SampleEncoding::SignedInteger);
+        assert_eq!(expectation.bits_per_sample, 32);
+        let mut file = fixture(expectation, false);
+        let data_chunk_offset = file
+            .windows(W64_DATA_GUID.len())
+            .position(|window| window == W64_DATA_GUID)
+            .expect("test fixture has data chunk");
+        let payload_offset = data_chunk_offset + CHUNK_HEADER_BYTES as usize;
+        let payload_bytes = usize::try_from(
+            expectation.sample_frames * u64::from(expectation.channels) * 4,
+        )
+        .expect("test payload fits usize");
+        for (index, byte) in file[payload_offset..payload_offset + payload_bytes]
+            .iter_mut()
+            .enumerate()
+        {
+            *byte = (index as u8).wrapping_mul(17).wrapping_add(3);
+        }
+        let padding_bytes = (8 - (payload_bytes as u64 % 8)) % 8;
+        assert!(padding_bytes > 0, "test fixture must require Wave64 padding");
+        file.extend(std::iter::repeat(0_u8).take(padding_bytes as usize));
+        let declared_chunk_bytes = CHUNK_HEADER_BYTES + payload_bytes as u64 + padding_bytes;
+        file[data_chunk_offset + 16..data_chunk_offset + 24]
+            .copy_from_slice(&declared_chunk_bytes.to_le_bytes());
+        let file_len = file.len() as u64;
+        file[16..24].copy_from_slice(&file_len.to_le_bytes());
+        file
+    }
+
+    fn temp_w64_path(label: &str) -> std::path::PathBuf {
+        let sequence = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "tonepoet-w64-{label}-{}-{sequence}.w64",
+            std::process::id(),
+        ))
+    }
+
+    #[test]
+    fn canonicalizes_ffmpeg_int32_mono_final_padding_and_is_idempotent() {
+        let expected = W64PcmExpectation {
+            sample_rate_hz: 44_100,
+            channels: 1,
+            bits_per_sample: 32,
+            sample_frames: 3,
+            encoding: W64SampleEncoding::SignedInteger,
+        };
+        let defective = ffmpeg_padded_int32_fixture(expected);
+        let data_chunk_offset = defective
+            .windows(W64_DATA_GUID.len())
+            .position(|window| window == W64_DATA_GUID)
+            .unwrap();
+        let payload_offset = data_chunk_offset + CHUNK_HEADER_BYTES as usize;
+        let expected_payload = defective[payload_offset..payload_offset + 12].to_vec();
+        let path = temp_w64_path("ffmpeg-int32-mono");
+        std::fs::write(&path, &defective).unwrap();
+
+        let repaired = canonicalize_ffmpeg_int32_w64_terminal(&path, expected).unwrap();
+        assert_eq!(repaired.sample_frames, expected.sample_frames);
+        assert_eq!(repaired.declared_data_bytes, 12);
+        assert_eq!(repaired.physical_file_bytes, defective.len() as u64 - 4);
+        let exact_bytes = std::fs::read(&path).unwrap();
+        assert_eq!(
+            &exact_bytes[payload_offset..payload_offset + 12],
+            expected_payload.as_slice()
+        );
+
+        let second = canonicalize_ffmpeg_int32_w64_terminal(&path, expected).unwrap();
+        assert_eq!(second, repaired);
+        assert_eq!(std::fs::read(&path).unwrap(), exact_bytes);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_nonzero_ffmpeg_int32_terminal_padding_without_mutation() {
+        let expected = W64PcmExpectation {
+            sample_rate_hz: 88_200,
+            channels: 1,
+            bits_per_sample: 32,
+            sample_frames: 5,
+            encoding: W64SampleEncoding::SignedInteger,
+        };
+        let mut defective = ffmpeg_padded_int32_fixture(expected);
+        *defective.last_mut().unwrap() = 1;
+        let path = temp_w64_path("ffmpeg-int32-nonzero-padding");
+        std::fs::write(&path, &defective).unwrap();
+
+        let error = canonicalize_ffmpeg_int32_w64_terminal(&path, expected).unwrap_err();
+        assert!(error.to_string().contains("non-zero audio bytes"));
+        assert_eq!(std::fs::read(&path).unwrap(), defective);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn leaves_aligned_stereo_int32_terminal_unchanged() {
+        let expected = W64PcmExpectation {
+            sample_rate_hz: 176_400,
+            channels: 2,
+            bits_per_sample: 32,
+            sample_frames: 3,
+            encoding: W64SampleEncoding::SignedInteger,
+        };
+        let exact = fixture(expected, false);
+        let path = temp_w64_path("ffmpeg-int32-stereo");
+        std::fs::write(&path, &exact).unwrap();
+
+        let structure = canonicalize_ffmpeg_int32_w64_terminal(&path, expected).unwrap();
+        assert_eq!(structure.sample_frames, expected.sample_frames);
+        assert_eq!(std::fs::read(&path).unwrap(), exact);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

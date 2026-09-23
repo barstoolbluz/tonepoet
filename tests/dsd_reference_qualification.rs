@@ -4870,11 +4870,39 @@ fn run_reference_terminal_qualification(
         }
         tonepoet_pipeline::ReferenceTerminalLowering::Int32Tpdf(int32) => {
             run_planned_command(&int32.normalize_carrier, sox, ffmpeg);
+            let frame_bytes = u64::from(int32.contract.channels) * 8;
+            let normalized_bytes = fs::metadata(&int32.normalized_carrier_path)
+                .expect("qualified Int32 normalized carrier metadata")
+                .len();
+            assert!(frame_bytes > 0);
+            assert_eq!(
+                normalized_bytes % frame_bytes,
+                0,
+                "qualified Int32 normalized carrier must contain whole f64le frames"
+            );
+            let sample_frames = normalized_bytes / frame_bytes;
+            assert!(sample_frames > 0, "qualified Int32 normalized carrier is empty");
             apply_qualification_scalar_to_f64le_in_place(
                 &int32.normalized_carrier_path,
                 int32.selected_gain,
             );
             run_planned_command(&int32.terminal, sox, ffmpeg);
+            let terminal_path = int32
+                .terminal
+                .output
+                .as_path()
+                .expect("qualified Int32 terminal output is path-backed");
+            tonepoet_pipeline::canonicalize_ffmpeg_int32_w64_terminal(
+                terminal_path,
+                tonepoet_pipeline::W64PcmExpectation {
+                    sample_rate_hz: int32.contract.sample_rate_hz,
+                    channels: int32.contract.channels,
+                    bits_per_sample: 32,
+                    sample_frames,
+                    encoding: tonepoet_pipeline::W64SampleEncoding::SignedInteger,
+                },
+            )
+            .expect("qualified Int32 FFmpeg Wave64 terminal canonicalizes exactly");
             TerminalQualificationResult {
                 terminal_args: int32.terminal.args.clone(),
                 normalize_args: Some(int32.normalize_carrier.args.clone()),
