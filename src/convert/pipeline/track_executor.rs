@@ -9021,6 +9021,7 @@ async fn execute_reference_common_plan(
         )
     })?;
     let (qpcm_bits, qpcm_float) = match summary.final_pcm.bit_depth {
+        tonepoet_pipeline::PcmBitDepth::Int16 => (16, false),
         tonepoet_pipeline::PcmBitDepth::Int24 => (24, false),
         tonepoet_pipeline::PcmBitDepth::Int32 => (32, false),
         tonepoet_pipeline::PcmBitDepth::Float32 => (32, true),

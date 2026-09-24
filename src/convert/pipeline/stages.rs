@@ -32047,6 +32047,7 @@ pub(super) fn scan_reference_w64_certified_peak(
         return Err("Reference certified Wave64 reader received inconsistent programme geometry".to_string());
     }
     let bytes_per_sample = match (expected.encoding, expected.bits_per_sample) {
+        (tonepoet_pipeline::W64SampleEncoding::SignedInteger, 16) => 2_usize,
         (tonepoet_pipeline::W64SampleEncoding::SignedInteger, 24) => 3_usize,
         (tonepoet_pipeline::W64SampleEncoding::SignedInteger, 32) => 4_usize,
         (tonepoet_pipeline::W64SampleEncoding::FloatingPoint, 32) => 4_usize,
@@ -32125,6 +32126,12 @@ pub(super) fn scan_reference_w64_certified_peak(
         programme_hasher.update(&bytes[..count]);
         samples.clear();
         match (expected.encoding, expected.bits_per_sample) {
+            (tonepoet_pipeline::W64SampleEncoding::SignedInteger, 16) => {
+                for raw in bytes[..count].chunks_exact(2) {
+                    let signed = i16::from_le_bytes([raw[0], raw[1]]);
+                    samples.push(f64::from(signed) / 32_768.0);
+                }
+            }
             (tonepoet_pipeline::W64SampleEncoding::SignedInteger, 24) => {
                 for raw in bytes[..count].chunks_exact(3) {
                     let packed = i32::from(raw[0]) | (i32::from(raw[1]) << 8) | (i32::from(raw[2]) << 16);
