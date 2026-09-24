@@ -2488,6 +2488,8 @@ fn preset_to_options(preset: &tonepoet_wizard::ConversionPreset) -> ConversionOp
         replaygain_mode,
         merge_to_single: preset.merge_to_single.unwrap_or(false),
         reencode_flac: preset.reencode_flac.unwrap_or(false),
+        target_sample_rate: preset.sample_rate,
+        target_bit_depth: preset.bit_depth,
         ..ConversionOptions::default()
     }
 }
