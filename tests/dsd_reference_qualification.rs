@@ -5969,6 +5969,9 @@ fn qualify_lossless_package_cells(
             }
         }
     }
+    // Under TONEPOET_QUAL_ONLY_CELL the matrix is one cell; the full-matrix
+    // counts below only hold for the complete run.
+    if std::env::var_os("TONEPOET_QUAL_ONLY_CELL").is_none() {
     assert_eq!(case_count, 3_540);
     assert_eq!(terminal_bound_cells.len(), 300);
     assert_eq!(package_identity_comparison_count, 3_240);
@@ -6024,11 +6027,14 @@ fn qualify_lossless_package_cells(
             ("qpcm:int32_le".to_string(), 1_020),
         ])
     );
+    }
 
+    if std::env::var_os("TONEPOET_QUAL_ONLY_CELL").is_none() {
     assert_eq!(
         terminal_observed_max_error_by_depth.keys().cloned().collect::<Vec<_>>(),
         vec!["float32".to_string(), "float64".to_string(), "int16".to_string(), "int24".to_string(), "int32".to_string()]
     );
+    }
 
     PackageQualificationEvidence {
         case_count,
@@ -7095,7 +7101,7 @@ fn reference_sacd_packet_info(frame_start: bool, payload_len: usize) -> [u8; 2] 
     ]
 }
 
-fn reference_sacd_dsd_sectors(frame: &[u8]) -> Vec<Vec<u8>> {
+fn reference_sacd_dsd_sectors(frame: &[u8], frame_number: u8) -> Vec<Vec<u8>> {
     const SECTOR_SIZE: usize = 2048;
     const FIRST_PAYLOAD: usize = 2000;
     let mut sectors = Vec::new();
@@ -7103,7 +7109,9 @@ fn reference_sacd_dsd_sectors(frame: &[u8]) -> Vec<Vec<u8>> {
     let mut first = vec![0_u8; SECTOR_SIZE];
     first[0] = (1 << 2) | (1 << 5);
     first[1..3].copy_from_slice(&reference_sacd_packet_info(true, first_len));
-    first[3..6].copy_from_slice(&[0, 0, 0]);
+    // Frame info: timecode minutes, seconds, frames. The extractor keeps only
+    // sectors whose timecode falls inside the track's TOC window.
+    first[3..6].copy_from_slice(&[0, 0, frame_number]);
     first[6..6 + first_len].copy_from_slice(&frame[..first_len]);
     sectors.push(first);
 
@@ -7120,7 +7128,7 @@ fn reference_sacd_dsd_sectors(frame: &[u8]) -> Vec<Vec<u8>> {
     sectors
 }
 
-fn reference_sacd_dst_sectors(payload: &[u8], channels: u16) -> Vec<Vec<u8>> {
+fn reference_sacd_dst_sectors(payload: &[u8], channels: u16, frame_number: u8) -> Vec<Vec<u8>> {
     const SECTOR_SIZE: usize = 2048;
     const FIRST_PAYLOAD: usize = 2041;
     const CONTINUATION_PAYLOAD: usize = 2045;
@@ -7139,7 +7147,7 @@ fn reference_sacd_dst_sectors(payload: &[u8], channels: u16) -> Vec<Vec<u8>> {
     let mut first = vec![0_u8; SECTOR_SIZE];
     first[0] = 1 | (1 << 2) | (1 << 5);
     first[1..3].copy_from_slice(&reference_sacd_packet_info(true, first_len));
-    first[3..7].copy_from_slice(&[0, 0, 0, ((sector_count & 0x1f) << 2) | channel_bits]);
+    first[3..7].copy_from_slice(&[0, 0, frame_number, ((sector_count & 0x1f) << 2) | channel_bits]);
     first[7..7 + first_len].copy_from_slice(&payload[..first_len]);
     let mut sectors = vec![first];
 
@@ -7192,7 +7200,7 @@ fn write_reference_sacd_source_front_end_fixture(
         _ => panic!("SACD source-front-end fixture only defines stereo, five-, and six-channel oracles"),
     };
     let sectors = match frame_encoding {
-        tonepoet_pipeline::SacdFrameEncoding::Dsd => reference_sacd_dsd_sectors(&expected_dsd),
+        tonepoet_pipeline::SacdFrameEncoding::Dsd => reference_sacd_dsd_sectors(&expected_dsd, 0),
         tonepoet_pipeline::SacdFrameEncoding::Dst => {
             let encoded = match channels {
                 2 => DST_STEREO.to_vec(),
@@ -7205,7 +7213,7 @@ fn write_reference_sacd_source_front_end_fixture(
                 6 => DST_SIX_CHANNEL.to_vec(),
                 _ => unreachable!(),
             };
-            reference_sacd_dst_sectors(&encoded, channels)
+            reference_sacd_dst_sectors(&encoded, channels, 0)
         }
     };
     let track_sector_count = u32::try_from(sectors.len()).expect("synthetic SACD track fits u32");
@@ -7318,18 +7326,22 @@ fn write_reference_sacd_multi_track_front_end_fixture(
     let expected_tracks = vec![first, second];
     let encoded_tracks = expected_tracks
         .iter()
-        .map(|expected| match frame_encoding {
-            tonepoet_pipeline::SacdFrameEncoding::Dsd => {
-                reference_sacd_dsd_sectors(expected)
-            }
-            tonepoet_pipeline::SacdFrameEncoding::Dst => {
-                let encoded = sacd_rs::dst::encode_uncompressed_frame_interleaved_with_rate(
-                    expected,
-                    u8::try_from(channels).expect("SACD fixture channel count fits u8"),
-                    sacd_rs::dst::DstRate::Dsd64,
-                )
-                .expect("encode multi-track standards-literal DST fixture");
-                reference_sacd_dst_sectors(&encoded, channels)
+        .enumerate()
+        .map(|(track_index, expected)| {
+            let frame_number = u8::try_from(track_index).expect("fixture track index fits u8");
+            match frame_encoding {
+                tonepoet_pipeline::SacdFrameEncoding::Dsd => {
+                    reference_sacd_dsd_sectors(expected, frame_number)
+                }
+                tonepoet_pipeline::SacdFrameEncoding::Dst => {
+                    let encoded = sacd_rs::dst::encode_uncompressed_frame_interleaved_with_rate(
+                        expected,
+                        u8::try_from(channels).expect("SACD fixture channel count fits u8"),
+                        sacd_rs::dst::DstRate::Dsd64,
+                    )
+                    .expect("encode multi-track standards-literal DST fixture");
+                    reference_sacd_dst_sectors(&encoded, channels, frame_number)
+                }
             }
         })
         .collect::<Vec<_>>();
