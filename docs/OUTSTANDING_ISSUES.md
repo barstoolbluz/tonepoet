@@ -2792,3 +2792,56 @@ The qualification's positive cells run through the same code path a queued Refer
 conversion runs through, so a cell that passes qualification is a conversion that works.
 The 3,540 serial cells take 3 h 15 min today; the parallel-harness brief of 2026-09-24
 covers the wall time.
+
+## 43. Browse context menu "Convert -> <preset>" applies a preset before the source is installed, so every DSD field is dropped
+
+Found 2026-09-24 converting the stereo area of a Dark Side of the Moon SACD ISO with the
+preset `SACD-to-PCM Reference` (`dsd_path = "reference"`, 176.4 kHz, 32-bit,
+`dither = "tpdf"`, `resampler = "soxr"`). From the Browse context menu the conversion
+fails at planning:
+
+```
+Convert: backend encode failed: planner failed: invalid settings for terminal_realization:
+lowered FFmpeg terminal disagrees with selected dither Tpdf: expected exactly one
+dither_method=triangular, observed 0 dither_method option(s)
+```
+
+The same preset loaded from the Convert screen's preset overlay, with the same source
+already staged, converts correctly on the Reference path.
+
+### Mechanism
+
+Both routes call the same applier, `TuiPreset::apply_to_pills` (`src/tui/presets.rs`).
+That applier guards every DSD field, including `dsd_path`, behind
+`FormatState::dsd_to_pcm_gain_available()`, which reads `source_is_dsd` from the pane
+state, and when the guard is false it skips the whole block without recording a refusal.
+
+The context-menu route, `finish_browse_queue_review_after_expansion`
+(`src/tui/command.rs`), calls `load_queue_preset_into_pills` before
+`install_browse_convert_source_paths`. At that moment the pane still describes the
+previous source, or none, so `source_is_dsd` is false: format, rate, depth, dither and
+resampler apply, `dsd_path = "reference"` and the gain fields are silently dropped, and
+the report still counts as complete. The SACD is then installed, the DSD pane appears with
+its default pathway, and the request goes down the Custom path with soxr, TPDF and Int32.
+
+The overlay route runs with the source already installed, so the guard is true and the
+Reference pathway is selected.
+
+### Second layer
+
+The planner refusal is the Custom path's own: an FFmpeg direct terminal at Int32 with
+TPDF selected is lowered without a `dither_method`, and the terminal validator in
+`tonepoet-pipeline/src/plan.rs` refuses the disagreement. Fail-closed is correct there,
+but the Format pane let that combination be submitted.
+
+### Required
+
+A preset chosen from the context menu produces exactly the conversion the same preset
+produces when loaded on the Convert screen. Preset fields are interpreted against the
+source they will convert, never against the previous one. A preset field that cannot be
+applied is reported as refused, never skipped. The Format pane does not submit a Custom
+Int32 FFmpeg terminal with a dither the planner will refuse.
+
+### Workaround
+
+Open the source with Convert -> Custom, then load the preset from the overlay.
