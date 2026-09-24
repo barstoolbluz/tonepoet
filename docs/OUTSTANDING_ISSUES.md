@@ -2727,3 +2727,68 @@ outcome 6 of the 2026-09-23 SACD brief).
 
 Copy the album, replace the picture in the copy with a PNG via `metaflac
 --remove --block-type=PICTURE` and `--import-picture-from`, convert the copy.
+
+## 40. The CLI cannot read any preset the TUI writes, and has no sample-rate flag
+
+Found 2026-09-24 while trying to run a 176.4 kHz / 32-bit Reference conversion from the
+command line. Every preset in `~/.config/tonepoet/presets/` written by the TUI fails
+under `tonepoet convert --preset <name>`:
+
+```
+Error: Failed to load preset 'dsd128-to-pcm-flac': TOML parse error at line 5, column 13
+  |
+5 | bit_depth = "32"
+```
+
+### Mechanism
+
+Two preset schemas coexist. The TUI writes `src/tui/presets.rs::TuiPreset` (version 4:
+`format`, `sample_rate`, `bit_depth` as a string such as `"32"` or `"32f"`, `dither`,
+`replaygain`, `resampler`, `dsd_path`, `dsd_gain`, and so on). The CLI's `--preset` loads
+the legacy wizard schema, `crates/tonepoet-wizard/src/presets.rs::ConversionPreset`
+(`selected_format` as the enum variant name `Flac`, `bit_depth` as an integer), through
+`PresetManager::load_preset` at `src/main.rs:1511`. Nothing writes the legacy schema any
+more, so the CLI flag only ever loads a hand-written file. Until be7f220 the mapping in
+`preset_to_options` also dropped `sample_rate` and `bit_depth`, so even a hand-written
+preset converted at the default rate and depth. The CLI has `--bit-depth` but no
+sample-rate flag at all, so the TUI is the only way to choose an output rate.
+
+### Required
+
+`tonepoet convert --preset <name>` loads the presets the TUI writes, and the same preset
+produces the same conversion on both surfaces. The CLI can request an output sample rate
+directly. There is one preset schema; the wizard one goes.
+
+## 41. Third-party multichannel FLACs with frames over about 200 KiB decode to nothing through FFmpeg
+
+Found 2026-09-23 during the v18 Reference qualification (P0 multichannel cells). FFmpeg's
+FLAC decoder silently returns no frames for a stream whose frames exceed roughly 200 KiB
+(191 KiB decoded, 240 KiB did not); no error is raised, the output is simply empty. The
+Reference encoder now sizes its own frames below that
+(`tonepoet-pipeline/src/dsd_reference.rs::reference_flac_block_size`, block size chosen so
+block x channels x bytes stays at or under 128 KiB), so tonepoet's outputs are safe. A
+FLAC written elsewhere with large frames (6 ch, 32-bit, block size 8192 or more) still hits
+it on every FFmpeg-decoded route: probing, custom conversion, ReplayGain, analyze.
+
+### Required
+
+A source FLAC that FFmpeg cannot decode is detected before conversion and reported as
+such, or decoded by another route (the `flac` reference decoder handles these files).
+Silent empty output never reaches the publish stage.
+
+## 42. The Reference qualification harness does not exercise the production executor
+
+Found 2026-09-24. The v18 qualification passed every Int16 cell while production Int16
+Reference conversion was still broken: the executor's QPCM depth table
+(`src/convert/pipeline/track_executor.rs::execute_reference_common_plan`) had no Int16 arm
+and the certified Wave64 peak reader (`stages.rs::scan_reference_w64_certified_peak`) could
+not read 16-bit samples. Both were found by a field run, not by the 3,540-cell matrix,
+because the harness (`tests/dsd_reference_qualification.rs::planned_reference_cell`) drives
+the pipeline crate's plan and tools directly rather than the production track executor.
+
+### Required
+
+The qualification's positive cells run through the same code path a queued Reference
+conversion runs through, so a cell that passes qualification is a conversion that works.
+The 3,540 serial cells take 3 h 15 min today; the parallel-harness brief of 2026-09-24
+covers the wall time.
