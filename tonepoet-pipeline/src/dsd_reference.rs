@@ -5142,6 +5142,10 @@ mod tests {
         settings.target_sample_rate = RateTarget::PcmHz(target_rate_hz);
         settings.target_bit_depth = BitDepthTarget::Pcm(depth);
         settings.dsd.from_dsd.profile = profile;
+        // The canonical Reference WavPack target carries no hybrid or
+        // correction-file flags; the settings default enables the latter.
+        settings.wavpack.hybrid = false;
+        settings.wavpack.correction_file = false;
         PlanRequest {
             input_path: PathBuf::from("admitted.dff"),
             output_path: PathBuf::from(format!("output.{extension}")),
@@ -5600,7 +5604,7 @@ mod tests {
                 PcmBitDepth::Int16,
                 DsdReconstructionSelection::Reference,
             );
-            assert!(plan_reference_dsd(&request).is_ok(), "Int16 refused for {target:?}");
+            plan_reference_dsd(&request).unwrap_or_else(|error| panic!("Int16 refused for {target:?}: {error}"));
         }
         let bound = terminal_realization_bound(88_200, PcmBitDepth::Int16);
         assert_eq!(bound.max_added_peak_fs_q63_ceil, 562_949_953_421_312);

@@ -4550,7 +4550,6 @@ mod tests {
 
         let expected_nanos = expected_duration_frames
             .checked_mul(1_000_000_000)
-            .and_then(|value| value.checked_add(74))
             .map(|value| value / 75)
             .expect("fixture duration conversion");
         assert_eq!(

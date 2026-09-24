@@ -3337,6 +3337,12 @@ fn plan_typed_with_effects_and_policy(
         let qpcm = SignalId(next_signal);
         next_signal += 1;
         let (precision, processing_domain, value_domain, storage_contract) = match admission.depth {
+            PcmBitDepth::Int16 => (
+                StoragePrecision::Pcm(PcmBitDepth::Int16),
+                ProcessingDomain::PcmInteger(PcmBitDepth::Int16),
+                ValueDomain::IntegerLattice(PcmBitDepth::Int16),
+                "wave64-pcm-s16le",
+            ),
             PcmBitDepth::Int24 => (
                 StoragePrecision::Pcm(PcmBitDepth::Int24),
                 ProcessingDomain::PcmInteger(PcmBitDepth::Int24),

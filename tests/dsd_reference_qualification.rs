@@ -7055,7 +7055,8 @@ fn write_predictive_dst_source_front_end_fixture(
     };
 
     let file = File::create(path).expect("create predictive DSDIFF/DST qualification fixture");
-    let mut writer = sacd_rs::dff_dst_writer::DffDstWriter::new(file, channels, 2_822_400)
+    let channel_count = u8::try_from(channels).expect("SACD fixture channel count fits u8");
+    let mut writer = sacd_rs::dff_dst_writer::DffDstWriter::new(file, channel_count, 2_822_400)
         .expect("create predictive DSDIFF/DST qualification writer");
     writer
         .write_encoded_frame(encoded, expected)
@@ -7307,7 +7308,7 @@ fn write_reference_sacd_multi_track_front_end_fixture(
             tonepoet_pipeline::SacdFrameEncoding::Dst => {
                 let encoded = sacd_rs::dst::encode_uncompressed_frame_interleaved_with_rate(
                     expected,
-                    usize::from(channels),
+                    u8::try_from(channels).expect("SACD fixture channel count fits u8"),
                     sacd_rs::dst::DstRate::Dsd64,
                 )
                 .expect("encode multi-track standards-literal DST fixture");
