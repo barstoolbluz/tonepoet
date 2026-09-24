@@ -3985,6 +3985,19 @@ fn build_float64_wav_package_pipeline(
     })
 }
 
+/// FLAC block size for a Reference package: the largest power of two from 1024
+/// to 32768 whose worst-case raw frame (block × channels × bytes per sample) fits
+/// in 128 KiB, so the pinned FFmpeg decoder can always read the frames back.
+fn reference_flac_block_size(contract: FinalPcmContract) -> u32 {
+    let bytes_per_sample = u64::from(contract.bit_depth.bits().div_ceil(8));
+    let raw_budget = 128_u64 * 1024;
+    let mut block = 32_768_u64;
+    while block > 1_024 && block * u64::from(contract.channels) * bytes_per_sample > raw_budget {
+        block /= 2;
+    }
+    u32::try_from(block).expect("block size fits u32")
+}
+
 fn build_package_command(
     input: &Path,
     output: &Path,
@@ -4021,6 +4034,17 @@ fn build_package_command(
         "-sn".to_string(),
         "-dn".to_string(),
     ];
+    if target == ResolvedOutputTarget::AlacM4a && contract.channels == 3 {
+        // FFmpeg guesses three channels as 2.1 and the ALAC encoder rematrixes
+        // that to 3.0, changing the samples. Pin the input layout to 3.0 so the
+        // encoder carries the three channels as they are.
+        let input_flag = args
+            .iter()
+            .position(|arg| arg == "-i")
+            .expect("package command names its input");
+        args.insert(input_flag, "3.0".to_string());
+        args.insert(input_flag, "-channel_layout".to_string());
+    }
     match target {
         ResolvedOutputTarget::WavRiff => args.extend([
             "-c:a".to_string(),
@@ -4046,6 +4070,15 @@ fn build_package_command(
             args.extend([
                 "-compression_level".to_string(),
                 settings.flac.compression_level.to_string(),
+                // FFmpeg's FLAC decoder, the qualified identity oracle, silently
+                // returns no frames once a frame exceeds roughly 200 KiB
+                // (measured on the pinned 7.1.3: 191 KiB decodes, 240 KiB does
+                // not). Its encoder picks a 32768-sample block at high rates,
+                // which with incompressible material at three or more channels
+                // makes frames of 240 to 580 KiB. Cap the block so a worst-case
+                // frame stays within 128 KiB of raw samples.
+                "-frame_size".to_string(),
+                reference_flac_block_size(contract).to_string(),
             ]);
         }
         ResolvedOutputTarget::AiffNative => {
@@ -4087,6 +4120,12 @@ fn build_package_command(
             ]);
         }
         ResolvedOutputTarget::AlacM4a => args.extend([
+            // FFmpeg guesses a three-channel stream as 2.1, which the ALAC
+            // encoder does not accept, and then negotiates silently down to
+            // stereo. An explicit output channel count makes it use the default
+            // N-channel layout (3.0, 4.0, 5.0, 5.1), all of which ALAC carries.
+            "-ac".to_string(),
+            contract.channels.to_string(),
             "-c:a".to_string(),
             "alac".to_string(),
             "-f".to_string(),

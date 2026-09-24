@@ -5477,10 +5477,19 @@ fn qualify_lossless_package_cells(
                 for (target, levels) in targets {
                     for level in levels {
                         let suffix = level.map_or_else(|| "default".to_string(), |v| v.to_string());
-                        let case_root = temp.path().join(format!(
+                        let cell_label = format!(
                             "{sample_rate_hz}-{channels}ch-{depth_key}-{}-{suffix}",
                             target_key(target)
-                        ));
+                        );
+                        // Operator facility: restrict the package matrix to one cell
+                        // (`TONEPOET_QUAL_ONLY_CELL=<rate>-<ch>ch-<depth>-<target>-<level>`)
+                        // to reproduce a failing cell in seconds instead of hours.
+                        if let Ok(only) = std::env::var("TONEPOET_QUAL_ONLY_CELL") {
+                            if cell_label != only {
+                                continue;
+                            }
+                        }
+                        let case_root = temp.path().join(cell_label);
                         fs::create_dir_all(&case_root).expect("create package case root");
                         let source = case_root.join("source-placeholder.dsf");
                         let plan = planned_reference_cell(
@@ -5647,6 +5656,14 @@ fn qualify_lossless_package_cells(
                         } else {
                             let packaged_hash =
                                 decoded_sample_hash(&packaged_carrier, &sox, &ffmpeg);
+                            if packaged_hash != qpcm_hash {
+                                // Keep the artifacts of a failing cell for inspection.
+                                let keep = std::path::PathBuf::from("/tmp/nix-shell.chi9EA/qual-failcell");
+                                let _ = fs::create_dir_all(&keep);
+                                let _ = fs::copy(packaged_carrier.path(), keep.join("packaged.bin"));
+                                let _ = fs::copy(qpcm_carrier.path(), keep.join("qpcm.w64"));
+                                eprintln!("kept failing cell artifacts in {}", keep.display());
+                            }
                             assert_eq!(
                                 packaged_hash,
                                 qpcm_hash,

@@ -305,6 +305,7 @@ fn validate_exact_w64_pcm_inner<R: Read + Seek>(
     reader: &mut R,
     expected: W64PcmFormatExpectation,
     expected_sample_frames: Option<u64>,
+    allow_final_alignment_padding: bool,
 ) -> Result<W64ExactStructure, W64ValidationError> {
     if expected.sample_rate_hz == 0 {
         return Err(W64ValidationError::invalid("expected sample rate must be non-zero"));
@@ -541,7 +542,11 @@ fn validate_exact_w64_pcm_inner<R: Read + Seek>(
             )));
         }
     }
-    if declared_data_bytes % u64::from(format.block_align) != 0 {
+    let block_remainder = declared_data_bytes % u64::from(format.block_align);
+    // The qualified FFmpeg Wave64 defect pads the final data chunk to 8-byte
+    // alignment and declares the pad as payload; a caller repairing that defect
+    // inspects with the pad tolerated (it is shorter than one alignment unit).
+    if block_remainder != 0 && !(allow_final_alignment_padding && block_remainder < 8) {
         return Err(W64ValidationError::invalid(format!(
             "data payload {declared_data_bytes} is not divisible by block alignment {}",
             format.block_align
@@ -600,7 +605,17 @@ pub fn inspect_exact_w64_pcm<R: Read + Seek>(
     reader: &mut R,
     expected: W64PcmFormatExpectation,
 ) -> Result<W64ExactStructure, W64ValidationError> {
-    validate_exact_w64_pcm_inner(reader, expected, None)
+    validate_exact_w64_pcm_inner(reader, expected, None, false)
+}
+
+/// Inspect a Wave64 carrier whose final data chunk may carry the qualified
+/// FFmpeg alignment pad (fewer than 8 bytes declared as payload). Only the
+/// FFmpeg Int32 terminal canonicalizer uses this; every other reader stays exact.
+fn inspect_w64_pcm_tolerating_final_alignment_padding<R: Read + Seek>(
+    reader: &mut R,
+    expected: W64PcmFormatExpectation,
+) -> Result<W64ExactStructure, W64ValidationError> {
+    validate_exact_w64_pcm_inner(reader, expected, None, true)
 }
 
 /// Validate an exact PCM Wave64 carrier against an externally supplied exact
@@ -609,7 +624,7 @@ pub fn validate_exact_w64_pcm<R: Read + Seek>(
     reader: &mut R,
     expected: W64PcmExpectation,
 ) -> Result<W64ExactStructure, W64ValidationError> {
-    validate_exact_w64_pcm_inner(reader, expected.into(), Some(expected.sample_frames))
+    validate_exact_w64_pcm_inner(reader, expected.into(), Some(expected.sample_frames), false)
 }
 
 /// Canonicalize the one qualified FFmpeg Wave64 Int32 terminal defect in place.
@@ -641,7 +656,8 @@ pub fn canonicalize_ffmpeg_int32_w64_terminal(
         Err(error) => error,
     };
 
-    let structure = inspect_exact_w64_pcm(&mut file, expected.into()).map_err(|error| {
+    let structure = inspect_w64_pcm_tolerating_final_alignment_padding(&mut file, expected.into())
+        .map_err(|error| {
         W64ValidationError::invalid(format!(
             "Wave64 does not match the qualified FFmpeg final-padding defect: exact validation failed with {exact_error}; structural inspection failed with {error}"
         ))
