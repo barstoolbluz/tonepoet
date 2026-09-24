@@ -87,9 +87,14 @@ pub fn build_conversion_manifest(
             "manifest cannot mix legacy and native Reference track authority".to_string(),
         ));
     }
-    if input.tracks.len() != 1 || input.tracks[0].track_identity.is_merged_output() {
+    if input.tracks.is_empty()
+        || input
+            .tracks
+            .iter()
+            .any(|track| track.track_identity.is_merged_output())
+    {
         return Err(ManifestError::InvalidAuthority(
-            "P0 Reference manifests require exactly one singleton track".to_string(),
+            "Reference manifests carry one or more singleton tracks and no merged output".to_string(),
         ));
     }
 
@@ -111,7 +116,7 @@ fn build_legacy_manifest(input: ManifestBuildInput) -> Result<ConversionManifest
 }
 
 fn build_reference_manifest(
-    mut input: ManifestBuildInput,
+    input: ManifestBuildInput,
 ) -> Result<ConversionManifest, ManifestError> {
     if !input.registered_effects.is_empty() {
         return Err(ManifestError::InvalidAuthority(
@@ -119,31 +124,53 @@ fn build_reference_manifest(
                 .to_string(),
         ));
     }
-    let track = input.tracks.pop().ok_or_else(|| {
+    // Every track of the manifest (one file, or one contained album such as an
+    // SACD area) executed under one Reference route: same policy, target and
+    // qualified candidate. The route identity is derived once and each track's
+    // evidence must agree with it.
+    let mut route_identity = None;
+    for track in &input.tracks {
+        let evidence = track.reference_evidence.as_ref().ok_or_else(|| {
+            ManifestError::InvalidAuthority(
+                "Reference manifest has no execution evidence".to_string(),
+            )
+        })?;
+        if evidence.plan.policy != input.settings.dsd.from_dsd.reference_policy {
+            return Err(ManifestError::InvalidAuthority(
+                "executed Reference policy does not match persisted settings".to_string(),
+            ));
+        }
+        let identity = ManifestRouteIdentityV2::DsdReferenceV2 {
+            settings_snapshot_fingerprint_v2: settings_snapshot_fingerprint_v2(&input.settings),
+            resolved_output_target: evidence.plan.target,
+            policy: evidence.plan.policy,
+            qualification_candidate_manifest_digest: evidence
+                .plan
+                .qualification_candidate_manifest_digest,
+        };
+        match &route_identity {
+            None => route_identity = Some(identity),
+            Some(existing) if *existing == identity => {}
+            Some(_) => {
+                return Err(ManifestError::InvalidAuthority(
+                    "Reference manifest tracks executed under different Reference routes"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    let route_identity = route_identity.ok_or_else(|| {
         ManifestError::InvalidAuthority("Reference manifest has no track".to_string())
     })?;
-    let evidence = track.reference_evidence.as_ref().ok_or_else(|| {
-        ManifestError::InvalidAuthority("Reference manifest has no execution evidence".to_string())
-    })?;
-
-    if evidence.plan.policy != input.settings.dsd.from_dsd.reference_policy {
-        return Err(ManifestError::InvalidAuthority(
-            "executed Reference policy does not match persisted settings".to_string(),
-        ));
+    let mut manifest_tracks = Vec::with_capacity(input.tracks.len());
+    for track in input.tracks {
+        manifest_tracks.push(build_reference_manifest_track(track)?);
     }
-
-    let route_identity = ManifestRouteIdentityV2::DsdReferenceV2 {
-        settings_snapshot_fingerprint_v2: settings_snapshot_fingerprint_v2(&input.settings),
-        resolved_output_target: evidence.plan.target,
-        policy: evidence.plan.policy,
-        qualification_candidate_manifest_digest: evidence.plan.qualification_candidate_manifest_digest,
-    };
-    let manifest_track = build_reference_manifest_track(track)?;
     ConversionManifest::new_reference(
         input.album_dir,
         input.settings,
         route_identity,
-        vec![manifest_track],
+        manifest_tracks,
     )
 }
 
@@ -232,6 +259,7 @@ fn build_reference_manifest_track(
                 | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V15
                 | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V16
                 | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V17
+                | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V18
         ) {
             reference_executed_evidence_digest_v3(&evidence)?
         } else {
@@ -277,6 +305,7 @@ fn validate_reference_packaged_sample_identity_mode(
         policy,
         tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V16
             | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V17
+            | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V18
     ) {
         return Ok(());
     }
@@ -460,6 +489,7 @@ mod manifest_merge_gap_tests {
         for policy in [
             DsdReferencePolicyVersion::SoxNg14801V16,
             DsdReferencePolicyVersion::SoxNg14801V17,
+            DsdReferencePolicyVersion::SoxNg14801V18,
         ] {
             assert!(validate_reference_packaged_sample_identity_mode(
                 policy,

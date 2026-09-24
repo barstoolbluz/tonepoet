@@ -2546,11 +2546,12 @@ fn canonical_source_kind(source: &DsdSourceKind) -> String {
         DsdSourceKind::DsdiffUncompressed => "dsdiff_uncompressed".to_string(),
         DsdSourceKind::DsdiffDst => "dsdiff_dst".to_string(),
         DsdSourceKind::SacdTrack { frame_format, selection } => format!(
-            "sacd:{frame_format:?}:{:?}:{}:{}:{}:{}",
+            "sacd:{frame_format:?}:{:?}:{}:{}:{}:{}:{}",
             selection.area,
             selection.track_index_zero_based,
             selection.start_frame,
             selection.frame_count,
+            selection.channels,
             selection.toc_digest.to_hex(),
         ),
         DsdSourceKind::UnknownDsdContainer => "unknown_dsd_container".to_string(),

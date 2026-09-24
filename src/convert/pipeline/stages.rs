@@ -4183,7 +4183,7 @@ async fn convert_tracks_with_reporter_with_tool_paths(
     let record = convert_stage_record_for_tracks(
         &records,
         if failed && req.failure_policy == FailurePolicy::FailAlbumOnAnyTrackFailure {
-            StageOutcome::Failed("one or more tracks failed".to_string())
+            StageOutcome::Failed(convert_stage_failure_message(&records))
         } else {
             StageOutcome::Ok
         },
@@ -4195,6 +4195,84 @@ async fn convert_tracks_with_reporter_with_tool_paths(
             sidecars: Vec::new(),
         },
         record,
+    }
+}
+
+fn convert_stage_failure_message(records: &[TrackRecord]) -> String {
+    let mut reasons = records.iter().filter_map(|record| match &record.outcome {
+        TrackOutcome::Err(reason) | TrackOutcome::Blocked(reason) if !reason.trim().is_empty() => {
+            Some(reason.as_str())
+        }
+        TrackOutcome::Ok | TrackOutcome::Err(_) | TrackOutcome::Blocked(_) => None,
+    });
+    let Some(first) = reasons.next() else {
+        return "one or more tracks failed".to_string();
+    };
+    let additional = reasons.count();
+    if additional == 0 {
+        first.to_string()
+    } else {
+        format!(
+            "{first} (+{additional} additional track failure{})",
+            if additional == 1 { "" } else { "s" }
+        )
+    }
+}
+
+#[cfg(test)]
+mod convert_stage_failure_message_tests {
+    use super::*;
+
+    fn record(source_ordinal: u32, outcome: TrackOutcome) -> TrackRecord {
+        TrackRecord {
+            track_id: TrackId {
+                source_ordinal,
+                disc_number: Some(1),
+                track_number: source_ordinal,
+            },
+            outcome,
+            source_ref: TrackSourceRef::StagedFile(PathBuf::from(format!(
+                "/stage/{source_ordinal:02}.dsf"
+            ))),
+            realized_input: None,
+            output_file: None,
+            commands: Vec::new(),
+            bytes_in: None,
+            bytes_out: None,
+            duration: None,
+            verified_output_bit_depth: None,
+            dsd_dst_stats: None,
+        }
+    }
+
+    #[test]
+    fn preserves_single_track_failure_text_verbatim() {
+        let reason = "DSD-REF-P0-023: SACD source front-end qualification failed";
+        let records = vec![record(1, TrackOutcome::Err(reason.to_string()))];
+        assert_eq!(convert_stage_failure_message(&records), reason);
+    }
+
+    #[test]
+    fn preserves_first_actionable_failure_and_counts_the_rest() {
+        let records = vec![
+            record(1, TrackOutcome::Ok),
+            record(2, TrackOutcome::Err("first failure".to_string())),
+            record(3, TrackOutcome::Blocked("second failure".to_string())),
+            record(4, TrackOutcome::Err("third failure".to_string())),
+        ];
+        assert_eq!(
+            convert_stage_failure_message(&records),
+            "first failure (+2 additional track failures)"
+        );
+    }
+
+    #[test]
+    fn falls_back_only_when_failed_records_have_no_reason() {
+        let records = vec![record(1, TrackOutcome::Err("   ".to_string()))];
+        assert_eq!(
+            convert_stage_failure_message(&records),
+            "one or more tracks failed"
+        );
     }
 }
 
@@ -31969,6 +32047,7 @@ pub(super) fn scan_reference_w64_certified_peak(
         return Err("Reference certified Wave64 reader received inconsistent programme geometry".to_string());
     }
     let bytes_per_sample = match (expected.encoding, expected.bits_per_sample) {
+        (tonepoet_pipeline::W64SampleEncoding::SignedInteger, 16) => 2_usize,
         (tonepoet_pipeline::W64SampleEncoding::SignedInteger, 24) => 3_usize,
         (tonepoet_pipeline::W64SampleEncoding::SignedInteger, 32) => 4_usize,
         (tonepoet_pipeline::W64SampleEncoding::FloatingPoint, 32) => 4_usize,
@@ -32047,6 +32126,12 @@ pub(super) fn scan_reference_w64_certified_peak(
         programme_hasher.update(&bytes[..count]);
         samples.clear();
         match (expected.encoding, expected.bits_per_sample) {
+            (tonepoet_pipeline::W64SampleEncoding::SignedInteger, 16) => {
+                for raw in bytes[..count].chunks_exact(2) {
+                    let signed = i16::from_le_bytes([raw[0], raw[1]]);
+                    samples.push(f64::from(signed) / 32_768.0);
+                }
+            }
             (tonepoet_pipeline::W64SampleEncoding::SignedInteger, 24) => {
                 for raw in bytes[..count].chunks_exact(3) {
                     let packed = i32::from(raw[0]) | (i32::from(raw[1]) << 8) | (i32::from(raw[2]) << 16);
@@ -32708,6 +32793,197 @@ mod album_true_peak_carrier_tests {
                 stderr_tail: String::new(),
                 elapsed: Duration::ZERO,
             },
+        }
+    }
+
+    #[test]
+    fn contained_sacd_reference_album_members_follow_the_planned_subset() {
+        let root = PathBuf::from("/tmp/contained-sacd-reference-test");
+        let iso = root.join("album.iso");
+        let tracks = (0_u32..4)
+            .map(|track_index| PreparedTrack {
+                id: TrackId {
+                    source_ordinal: track_index + 1,
+                    disc_number: None,
+                    track_number: track_index + 1,
+                },
+                source_ref: TrackSourceRef::SacdTrack {
+                    iso: iso.clone(),
+                    track_index,
+                    area: SacdArea::Stereo,
+                },
+                metadata: TrackMetadata {
+                    track_number: Some(track_index + 1),
+                    ..TrackMetadata::default()
+                },
+                expected_samples: None,
+                sample_rate: Some(crate::tui::sacd::SACD_SAMPLE_RATE_HZ),
+                source_audio: SourceAudioDescriptor::from_scalar(
+                    Some(crate::tui::sacd::SACD_SAMPLE_RATE_HZ),
+                    None,
+                    Some(SourceAudioCoding::Dsd),
+                ),
+                bit_depth: None,
+                warnings: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let prepared = PreparedSource {
+            container: iso,
+            kind: SourceKind::SacdIso,
+            tracks: tracks.clone(),
+            album_metadata: AlbumMetadata {
+                total_tracks: 4,
+                ..AlbumMetadata::default()
+            },
+            provenance: ExtractionProvenance {
+                source_kind: SourceKind::SacdIso,
+                source_sha256: None,
+                tool_versions: BTreeMap::new(),
+                extracted_at: chrono::Utc::now(),
+            },
+        };
+        let two_track_subset = AlbumPlan {
+            album_dir: root.join("out"),
+            album_dirs: Vec::new(),
+            entries: vec![
+                PlannedTrackOutput {
+                    track_id: tracks[1].id.clone(),
+                    final_path: root.join("out/02.flac"),
+                },
+                PlannedTrackOutput {
+                    track_id: tracks[3].id.clone(),
+                    final_path: root.join("out/04.flac"),
+                },
+            ],
+        };
+        assert_eq!(
+            contained_sacd_reference_album_member_count(&prepared, &two_track_subset),
+            2,
+            "contained album membership must be the selected subset, not total TOC tracks",
+        );
+
+        let singleton = AlbumPlan {
+            album_dir: root.join("out-single"),
+            album_dirs: Vec::new(),
+            entries: vec![PlannedTrackOutput {
+                track_id: tracks[1].id.clone(),
+                final_path: root.join("out-single/02.flac"),
+            }],
+        };
+        assert_eq!(
+            contained_sacd_reference_album_member_count(&prepared, &singleton),
+            1,
+            "one selected SACD track must not open the contained-album gain barrier",
+        );
+    }
+
+    fn contained_reference_test_carrier(
+        seed: u32,
+        measurement: tonepoet_pipeline::AlbumPeakMeasurement,
+        target_dbtp: tonepoet_pipeline::DbNano,
+    ) -> PreparedReferenceAutoGainCarrier {
+        let digest = tonepoet_pipeline::Sha256Digest::of_bytes(
+            format!("contained-sacd-{seed}").as_bytes(),
+        );
+        PreparedReferenceAutoGainCarrier {
+            source_ref: TrackSourceRef::DsdReferenceAutoGainCarrier {
+                path: PathBuf::from(format!("/tmp/contained-sacd-{seed}.w64")),
+                source_path: PathBuf::from("/tmp/contained-sacd.iso"),
+                source_sample_rate_hz: crate::tui::sacd::SACD_SAMPLE_RATE_HZ,
+                sample_rate_hz: 176_400,
+                channels: 2,
+                duration: Some(Duration::from_secs(1)),
+                source_kind: tonepoet_pipeline::DsdSourceKind::SacdTrack {
+                    frame_format: tonepoet_pipeline::SacdFrameEncoding::Dsd,
+                    selection: tonepoet_pipeline::SacdTrackSelection {
+                        area: tonepoet_pipeline::SacdAreaKind::Stereo,
+                        track_index_zero_based: seed - 1,
+                        start_frame: 650 + u64::from(seed - 1) * 8,
+                        frame_count: 8,
+                        channels: 2,
+                        toc_digest: digest,
+                    },
+                },
+                gain_db: None,
+                target_dbtp,
+                unbound_semantic_plan_hash: digest,
+                source_content_sha256: digest,
+                canonical_materialization_sha256: digest,
+                carrier_sha256: digest,
+                observation: tonepoet_pipeline::ReferenceCertifiedPeakObservation {
+                    id: tonepoet_pipeline::MeasurementId(seed),
+                    scope: tonepoet_pipeline::MeasurementScope::Plan,
+                    purpose: tonepoet_pipeline::TruePeakPurpose::GainAuthority,
+                    subject: tonepoet_pipeline::ReferenceObservationSubject::ProtectedR64,
+                    observer_identity: "test-observer".to_string(),
+                    reconstruction: "test-reconstruction".to_string(),
+                    edge_policy: "test-edge-policy".to_string(),
+                    scan_tier: "standard".to_string(),
+                    authority_endpoint: "test-authority".to_string(),
+                    reader_authority: "test-reader".to_string(),
+                    sample_rate_hz: 176_400,
+                    channels: 2,
+                    sample_frames: 1,
+                    programme_sha256: digest,
+                    complete_reader: true,
+                    result: tonepoet_pipeline::ReferenceCertifiedPeakResult::VerifiedSilence,
+                    certificate_sha256: digest,
+                },
+            },
+            measurement: ReferenceAutoGainPreparedMeasurement {
+                track_id: TrackId {
+                    source_ordinal: seed,
+                    disc_number: None,
+                    track_number: seed,
+                },
+                measurement,
+                terminal_bound: zero_terminal(),
+                target_dbtp,
+            },
+        }
+    }
+
+    #[test]
+    fn contained_sacd_reference_album_binds_one_loudest_constrained_scalar_to_every_carrier() {
+        let target = tonepoet_pipeline::DbNano::DEFAULT_REFERENCE_TRUE_PEAK_TARGET;
+        let quieter = tonepoet_pipeline::AlbumPeakMeasurement::Finite {
+            point_db: "-6.020599913".parse().unwrap(),
+            signal_upper_linear: 0.5,
+        };
+        let louder = tonepoet_pipeline::AlbumPeakMeasurement::Finite {
+            point_db: "-0.915149811".parse().unwrap(),
+            signal_upper_linear: 0.9,
+        };
+        let mut carriers = vec![
+            Some(contained_reference_test_carrier(1, quieter, target)),
+            Some(contained_reference_test_carrier(2, louder, target)),
+        ];
+        let mut req = super::pipeline_test_helpers::log_test_request();
+        req.settings.dsd = tonepoet_pipeline::DsdSettings::reference();
+
+        let authority = bind_contained_sacd_reference_album_gain(&mut req, &mut carriers, 2)
+            .expect("contained SACD album gain resolves");
+        let louder_only = tonepoet_pipeline::resolve_album_gain_constraints(
+            target,
+            &[(louder, zero_terminal())],
+        )
+        .expect("louder participant gain resolves");
+        assert_eq!(
+            authority.gain_db, louder_only.gain_db,
+            "the louder selected SACD participant must constrain the common scalar",
+        );
+        assert_eq!(authority.track_count, 2);
+        assert_eq!(req.settings.dsd.runtime_album_gain_db(), Some(authority.gain_db));
+        for carrier in carriers.iter().flatten() {
+            let TrackSourceRef::DsdReferenceAutoGainCarrier { gain_db, .. } = &carrier.source_ref
+            else {
+                panic!("test carrier lost Reference retained-carrier identity");
+            };
+            assert_eq!(
+                *gain_db,
+                Some(authority.gain_db),
+                "every contained SACD participant must retain the identical album scalar",
+            );
         }
     }
 
@@ -37205,19 +37481,6 @@ async fn prepare_reference_auto_gain_carrier_for_track(
             track.id.source_ordinal,
         ));
     }
-    let source_rate_hz = source.sample_rate_hz.filter(|rate| *rate > 0).ok_or_else(|| {
-        format!(
-            "Reference album participant {} has no authoritative DSD sample rate",
-            track.id.source_ordinal,
-        )
-    })?;
-    let channels = source.channels.filter(|channels| *channels > 0).ok_or_else(|| {
-        format!(
-            "Reference album participant {} has no authoritative channel count",
-            track.id.source_ordinal,
-        )
-    })?;
-
     let track_stem = pcm_true_peak_track_stem(&track.id);
     let plan_work_dir = carrier_dir.join(format!("plan-{track_stem}"));
     fs::create_dir_all(&plan_work_dir).map_err(|error| {
@@ -37240,6 +37503,32 @@ async fn prepare_reference_auto_gain_carrier_for_track(
             track.id.source_ordinal,
         )
     })?;
+    let reference_duration = plan_request.source.duration;
+    // The typed admission step is the authority for SACD geometry. In
+    // particular, a pre-TOC multichannel probe uses six channels only as a
+    // fallback; the SACD TOC may authoritatively report five. Retain the
+    // post-admission rate/channel facts so the protected carrier cannot drift
+    // from the plan it was measured under.
+    let source_rate_hz = plan_request
+        .source
+        .sample_rate_hz
+        .filter(|rate| *rate > 0)
+        .ok_or_else(|| {
+            format!(
+                "Reference album participant {} has no authoritative DSD sample rate",
+                track.id.source_ordinal,
+            )
+        })?;
+    let channels = plan_request
+        .source
+        .channels
+        .filter(|channels| *channels > 0)
+        .ok_or_else(|| {
+            format!(
+                "Reference album participant {} has no authoritative channel count",
+                track.id.source_ordinal,
+            )
+        })?;
     let plan = tonepoet_pipeline::plan_conversion(&plan_request).map_err(|error| {
         format!(
             "could not plan Reference album participant {}: {error}",
@@ -37288,11 +37577,10 @@ async fn prepare_reference_auto_gain_carrier_for_track(
         })?;
     if matches!(
         source_kind,
-        tonepoet_pipeline::DsdSourceKind::SacdTrack { .. }
-            | tonepoet_pipeline::DsdSourceKind::UnknownDsdContainer
+        tonepoet_pipeline::DsdSourceKind::UnknownDsdContainer
     ) {
         return Err(format!(
-            "Reference album participant {} uses an unqualified source front-end",
+            "Reference album participant {} uses an unknown DSD source front-end",
             track.id.source_ordinal,
         ));
     }
@@ -37324,7 +37612,7 @@ async fn prepare_reference_auto_gain_carrier_for_track(
         &carrier_path,
         summary.final_pcm.sample_rate_hz,
         summary.profile,
-        source.duration,
+        reference_duration,
     );
     let render_result = run_dsd_true_peak_planned_command(
         &render,
@@ -37434,7 +37722,7 @@ async fn prepare_reference_auto_gain_carrier_for_track(
             source_sample_rate_hz: source_rate_hz,
             sample_rate_hz: summary.final_pcm.sample_rate_hz,
             channels,
-            duration: source.duration,
+            duration: reference_duration,
             source_kind,
             gain_db: None,
             target_dbtp,
@@ -37453,8 +37741,79 @@ async fn prepare_reference_auto_gain_carrier_for_track(
     })
 }
 
+fn contained_sacd_reference_album_member_count(
+    prepared: &PreparedSource,
+    album_plan: &AlbumPlan,
+) -> usize {
+    if prepared.kind != SourceKind::SacdIso {
+        return 0;
+    }
+    let selected = album_plan
+        .entries
+        .iter()
+        .map(|entry| entry.track_id.clone())
+        .collect::<BTreeSet<_>>();
+    prepared
+        .tracks
+        .iter()
+        .filter(|track| {
+            selected.contains(&track.id)
+                && matches!(&track.source_ref, TrackSourceRef::SacdTrack { .. })
+        })
+        .count()
+}
+
+fn bind_contained_sacd_reference_album_gain(
+    req: &mut PipelineRequest,
+    carriers: &mut [Option<PreparedReferenceAutoGainCarrier>],
+    expected_members: usize,
+) -> Result<tonepoet_pipeline::AlbumGainAuthority, String> {
+    let mut target = None;
+    let mut participants = Vec::new();
+    for carrier in carriers.iter().flatten() {
+        if target.is_some_and(|value| value != carrier.measurement.target_dbtp) {
+            return Err(
+                "contained SACD Reference participants have different true-peak targets"
+                    .to_string(),
+            );
+        }
+        target.get_or_insert(carrier.measurement.target_dbtp);
+        participants.push((
+            carrier.measurement.measurement,
+            carrier.measurement.terminal_bound,
+        ));
+    }
+    if participants.len() != expected_members {
+        return Err(format!(
+            "contained SACD Reference album measured {} participant(s) for {} selected track(s)",
+            participants.len(), expected_members,
+        ));
+    }
+    let target = target.ok_or_else(|| {
+        "contained SACD Reference album has no certified gain participants".to_string()
+    })?;
+    let authority = tonepoet_pipeline::resolve_album_gain_constraints(target, &participants)
+        .map_err(|error| format!("contained SACD Reference auto gain failed: {error}"))?;
+    req.settings.dsd.bind_runtime_album_gain(
+        authority.gain_db,
+        authority.loudest_peak_dbfs,
+        authority.track_count,
+    );
+    for carrier in carriers.iter_mut().flatten() {
+        let TrackSourceRef::DsdReferenceAutoGainCarrier { gain_db, .. } = &mut carrier.source_ref
+        else {
+            return Err(
+                "contained SACD Reference gain resolution lost a retained protected-R64 carrier"
+                    .to_string(),
+            );
+        };
+        *gain_db = Some(authority.gain_db);
+    }
+    Ok(authority)
+}
+
 async fn prepare_reference_auto_gain_carriers(
-    req: &PipelineRequest,
+    req: &mut PipelineRequest,
     prepared: &mut PreparedSource,
     album_plan: &AlbumPlan,
     staging: &StagingDir,
@@ -37462,15 +37821,17 @@ async fn prepare_reference_auto_gain_carriers(
     cancel: &CancellationToken,
     tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
 ) -> Result<PreparedReferenceAutoGainCarriers, String> {
-    let album_members = req
+    let submitted_album_members = req
         .album_batch
         .as_ref()
         .map(|batch| batch.expected_track_count)
         .unwrap_or(1);
+    let contained_sacd_members = contained_sacd_reference_album_member_count(prepared, album_plan);
+    let contained_sacd_album = submitted_album_members <= 1 && contained_sacd_members > 1;
     if !req.settings.dsd.reference_delivery_selected()
         || !req.settings.dsd.from_dsd.reference_auto_gain_selected()
         || !req.settings.dsd.reference_auto_album_gain_possible()
-        || album_members <= 1
+        || (submitted_album_members <= 1 && !contained_sacd_album)
     {
         return Ok(PreparedReferenceAutoGainCarriers::default());
     }
@@ -37505,6 +37866,10 @@ async fn prepare_reference_auto_gain_carriers(
         return Ok(PreparedReferenceAutoGainCarriers::default());
     }
 
+    // The participant scans only need a read-only request snapshot. Keep the
+    // mutable request authority outside the concurrent futures so the contained
+    // album scalar can be bound exactly once after every observation completes.
+    let analysis_req = req.clone();
     let analysis_cancel = cancel.child_token();
     type ReferenceAutoGainFuture<'a> = std::pin::Pin<
         Box<
@@ -37520,9 +37885,10 @@ async fn prepare_reference_auto_gain_carriers(
             let task_cancel = analysis_cancel.clone();
             let task_limits = tool_concurrency_limits.clone();
             let task_carrier_dir = carrier_dir.as_path();
+            let task_req = &analysis_req;
             Some(Box::pin(async move {
                 let result = prepare_reference_auto_gain_carrier_for_track(
-                    req,
+                    task_req,
                     track,
                     &planned_output,
                     staging,
@@ -37580,12 +37946,33 @@ async fn prepare_reference_auto_gain_carriers(
     }
 
     let mut measurements = Vec::new();
+    if contained_sacd_album {
+        let authority = bind_contained_sacd_reference_album_gain(
+            req,
+            &mut carriers,
+            contained_sacd_members,
+        )?;
+        let loudest = authority
+            .loudest_peak_dbfs
+            .map(|value| value.render(false))
+            .unwrap_or_else(|| "-inf (verified silence)".to_string());
+        log::info!(
+            "DSD Reference contained SACD album gain: tracks={}, loudest point={} dBTP, target={} dBTP, fixed gain={} dB",
+            authority.track_count,
+            loudest,
+            authority.target_dbfs.render(false),
+            authority.gain_db.render(false),
+        );
+    }
+
     for (track_index, carrier) in carriers.into_iter().enumerate() {
         let Some(carrier) = carrier else {
             continue;
         };
         prepared.tracks[track_index].source_ref = carrier.source_ref;
-        measurements.push(carrier.measurement);
+        if !contained_sacd_album {
+            measurements.push(carrier.measurement);
+        }
     }
     Ok(PreparedReferenceAutoGainCarriers { measurements })
 }
@@ -39632,10 +40019,11 @@ async fn prepare_pipeline_item_for_scheduler_scoped_inner(
     // bound; doing so could silently reuse an output normalized against a
     // different submitted set.
     let reference_auto_album_selected = req.settings.dsd.reference_auto_album_gain_possible()
-        && req
+        && (req
             .album_batch
             .as_ref()
-            .is_some_and(|batch| batch.expected_track_count > 1);
+            .is_some_and(|batch| batch.expected_track_count > 1)
+            || contained_sacd_reference_album_member_count(&prepared, &album_plan) > 1);
     let submitted_album_gain_selected = reference_auto_album_selected
         || req.settings.dsd.album_true_peak_gain_selected()
         || req.settings.pcm_true_peak.album_true_peak_gain_selected();
@@ -39713,7 +40101,7 @@ async fn prepare_pipeline_item_for_scheduler_scoped_inner(
     }
 
     let prepared_reference_auto_gain_carriers = match prepare_reference_auto_gain_carriers(
-        &req,
+        &mut req,
         &mut prepared,
         &album_plan,
         &staging,
@@ -39728,7 +40116,7 @@ async fn prepare_pipeline_item_for_scheduler_scoped_inner(
             let record = stage_record(
                 PipelineStage::Convert,
                 StageOutcome::Failed(format!(
-                    "submitted-batch Reference auto-gain analysis failed: {error}"
+                    "Reference album auto-gain analysis failed: {error}"
                 )),
             );
             emit_stage_finished(reporter, &item_id, record.clone()).await;
@@ -42087,7 +42475,7 @@ fn convert_result_from_scheduled_outputs(
     let record = convert_stage_record_for_tracks(
         &records,
         if failed && req.failure_policy == FailurePolicy::FailAlbumOnAnyTrackFailure {
-            StageOutcome::Failed("one or more tracks failed".to_string())
+            StageOutcome::Failed(convert_stage_failure_message(&records))
         } else {
             StageOutcome::Ok
         },
@@ -56596,11 +56984,11 @@ fn scratch_retry_original_error_from_outcome(outcome: &AlbumOutcome) -> String {
 
     match outcome {
         AlbumOutcome::Complete { stages, .. } => stage_error(stages),
-        // Prefer the failing track's own error over the generic stage summary.
-        // A stage record for a failed convert reads "one or more tracks failed",
-        // which hides the actionable cause (for example ENOSPC) that the track
-        // record carries. This matches `scratch_track_retry_original_error`,
-        // which reads the track outputs directly.
+        // Prefer the failing track's own error over the stage summary. Older
+        // reports used a generic convert-stage failure, and track records remain
+        // the strongest authority for scratch-scoped retry classification. This
+        // matches `scratch_track_retry_original_error`, which reads track outputs
+        // directly.
         AlbumOutcome::Partial { failed, stages, .. }
         | AlbumOutcome::Blocked { failed, stages, .. } => {
             track_error(failed).or_else(|| stage_error(stages))
@@ -58946,6 +59334,21 @@ mod conversion_log_tests {
         assert!(log.contains("Target format: FLAC"));
         assert!(log.contains("Result: Complete"));
         assert!(log.contains("Log generated by tonepoet"));
+    }
+
+    #[test]
+    fn convert_stage_failure_message_preserves_actionable_track_error() {
+        let exact = "DSD-REF-P0-023: production SACD extraction failed";
+        let mut first = failed_record();
+        first.outcome = TrackOutcome::Err(exact.to_string());
+        assert_eq!(convert_stage_failure_message(&[first.clone()]), exact);
+
+        let mut second = ok_record();
+        second.outcome = TrackOutcome::Blocked("secondary failure".to_string());
+        assert_eq!(
+            convert_stage_failure_message(&[first, second]),
+            format!("{exact} (+1 additional track failure)")
+        );
     }
 
     #[test]

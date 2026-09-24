@@ -24,7 +24,7 @@ use super::types::{
     AlbumMetadata, MetadataValueList, PlannedMetadataSatisfaction, PipelineRequest, PreparedSource,
     PreparedTrack, CueSegmentCarrier, RegisteredEffectCarrierRepresentation,
     SelectedPhysicalCandidateBinding, SourceAudioCoding, SourceKind, StageRequirement,
-    TrackMetadata, TrackSourceRef, CUE_ARTWORK_PATH_EXTRA_KEY, FALLBACK_RECOVERED_METADATA_EXTRA_KEY,
+    TrackMetadata, TrackSelection, TrackSourceRef, CUE_ARTWORK_PATH_EXTRA_KEY, FALLBACK_RECOVERED_METADATA_EXTRA_KEY,
 };
 
 fn planned_riff_non_audio_upper_bound(
@@ -155,6 +155,7 @@ pub(crate) fn certified_terminal_candidate_binding(
 fn validate_certified_carrier_album_gain_authority(
     request: &PipelineRequest,
     track: &PreparedTrack,
+    reference_programme_scope: &ReferenceProgrammeScope,
 ) -> Result<(), ConvertError> {
     let (runtime_gain, carrier_gain, album_scope, domain) = match &track.source_ref {
         TrackSourceRef::DsdTruePeakCarrier { gain_db, .. } => (
@@ -169,9 +170,12 @@ fn validate_certified_carrier_album_gain_authority(
             *gain_db,
             request.settings.dsd.reference_delivery_selected()
                 && request.settings.dsd.from_dsd.reference_auto_gain_selected()
-                && request.settings.dsd.from_dsd.resolved_reference_gain_scope(
-                    &reference_programme_scope(request, track),
-                ) == Some(tonepoet_pipeline::TruePeakScope::Album),
+                && request
+                    .settings
+                    .dsd
+                    .from_dsd
+                    .resolved_reference_gain_scope(reference_programme_scope)
+                    == Some(tonepoet_pipeline::TruePeakScope::Album),
             "Reference DSD",
         ),
         TrackSourceRef::PcmTruePeakCarrier { gain_db, .. } => (
@@ -259,15 +263,88 @@ fn plan_request_for_track_impl(
     intermediate_dir: PathBuf,
     source_override: Option<SourceInfo>,
 ) -> Result<PlanRequest, ConvertError> {
-    validate_certified_carrier_album_gain_authority(request, track)?;
     let mut source = match source_override {
         Some(source) => source,
         None => source_info_for_realized_track(track, realized_input)?,
     };
     let selects_reference = selects_reference_dsd_to_pcm(&request.settings, source.is_dsd());
+    let mut sacd_admission = None;
     if selects_reference {
-        source.dsd_source_kind = Some(reference_source_kind(track, realized_input)?);
+        let source_kind = match &track.source_ref {
+            TrackSourceRef::SacdTrack {
+                iso,
+                track_index,
+                area,
+            } => {
+                let facts = reference_sacd_admission_facts(
+                    iso,
+                    *track_index,
+                    *area,
+                    &request.source.track_selection,
+                )?;
+                // Deferred SACD extraction deliberately leaves no DSF to probe at
+                // this point. Bind every pre-extraction source fact from the same
+                // authoritative TOC parse: rate, exact channel count, duration,
+                // source identity, and contained-programme membership.
+                let source_kind = facts.source_kind.clone();
+                if let DsdSourceKind::SacdTrack { selection, .. } = &source_kind {
+                    source.sample_rate_hz = Some(crate::tui::sacd::SACD_SAMPLE_RATE_HZ);
+                    source.channels = Some(selection.channels);
+                    // The TOC duration is the authoritative pre-extraction fact.
+                    // Once the private DSF/DSDIFF exists, preserve its probed
+                    // duration so post-materialization replanning uses the actual
+                    // canonical carrier metadata rather than a TOC estimate.
+                    source.duration.get_or_insert(facts.duration);
+                }
+                sacd_admission = Some(facts);
+                source_kind
+            }
+            TrackSourceRef::DsdReferenceAutoGainCarrier {
+                source_path,
+                source_kind,
+                ..
+            } => {
+                // Independent submitted albums already carry their programme
+                // scope in AlbumBatchContext. Contained SACD albums do not, so
+                // only they need a cheap TOC re-parse here to recover the exact
+                // selected-member set for terminal replanning.
+                let independent_album = request
+                    .album_batch
+                    .as_ref()
+                    .is_some_and(|batch| batch.expected_track_count > 1);
+                if !independent_album {
+                    if let DsdSourceKind::SacdTrack { selection, .. } = source_kind {
+                        let area = match selection.area {
+                            SacdAreaKind::Stereo => super::types::SacdArea::Stereo,
+                            SacdAreaKind::Multichannel => super::types::SacdArea::MultiChannel,
+                        };
+                        let facts = reference_sacd_admission_facts(
+                            source_path,
+                            selection.track_index_zero_based,
+                            area,
+                            &request.source.track_selection,
+                        )?;
+                        if &facts.source_kind != source_kind {
+                            return Err(ConvertError::Backend(
+                                "Reference SACD TOC selection changed after album prepass".to_string(),
+                            ));
+                        }
+                        sacd_admission = Some(facts);
+                    }
+                }
+                source_kind.clone()
+            }
+            _ => reference_source_kind(track, realized_input)?,
+        };
+        source.dsd_source_kind = Some(source_kind);
     }
+    let reference_programme_scope =
+        reference_programme_scope(request, track, sacd_admission.as_ref());
+    validate_certified_carrier_album_gain_authority(
+        request,
+        track,
+        &reference_programme_scope,
+    )?;
     source
         .validate()
         .map_err(|err| ConvertError::Backend(format!("invalid source facts for planner: {err}")))?;
@@ -552,9 +629,17 @@ fn plan_request_for_track_impl(
     // and source-audio MD5 storage from the materialized DSD carrier must be
     // disabled here, and those original SACD policies are treated as unsupported
     // rather than satisfied in metadata_obligations_for_request().
+    // A retained Reference album carrier produced from an SACD track carries the
+    // same disposition: the executor re-derives the carrier's unbound plan from
+    // it and must reach the identity the prepass hashed from the SACD track.
     if matches!(
         &track.source_ref,
-        TrackSourceRef::SacdTrack { .. } | TrackSourceRef::DvdVideoTrack { .. }
+        TrackSourceRef::SacdTrack { .. }
+            | TrackSourceRef::DvdVideoTrack { .. }
+            | TrackSourceRef::DsdReferenceAutoGainCarrier {
+                source_kind: DsdSourceKind::SacdTrack { .. },
+                ..
+            }
     ) {
         disable_planner_source_tag_transfer(&mut settings);
         disable_planner_artwork_transfer(&mut settings);
@@ -640,8 +725,6 @@ fn plan_request_for_track_impl(
             return Err(ConvertError::Backend(reason.to_string()));
         }
     }
-    let reference_programme_scope = reference_programme_scope(request, track);
-
     let planned_riff_non_audio_upper_bound_bytes = planned_riff_non_audio_upper_bound(
         request,
         track,
@@ -725,6 +808,7 @@ fn main_format_from_planner(format: &PlannerFormat) -> Option<crate::convert::Au
 fn reference_programme_scope(
     request: &PipelineRequest,
     track: &PreparedTrack,
+    sacd_admission: Option<&ReferenceSacdAdmissionFacts>,
 ) -> ReferenceProgrammeScope {
     if request.merge
         || matches!(
@@ -758,6 +842,14 @@ fn reference_programme_scope(
             }
         }
     }
+    if let Some(sacd_admission) = sacd_admission {
+        if sacd_admission.selected_members.get() > 1 {
+            return ReferenceProgrammeScope::ContainedAlbum {
+                expected_members: sacd_admission.selected_members,
+                programme_digest: sacd_admission.programme_digest,
+            };
+        }
+    }
     ReferenceProgrammeScope::Singleton
 }
 
@@ -768,18 +860,13 @@ fn reference_source_kind(
     if let TrackSourceRef::DsdReferenceAutoGainCarrier { source_kind, .. } = &track.source_ref {
         return Ok(source_kind.clone());
     }
-    if matches!(&track.source_ref, TrackSourceRef::SacdTrack { .. }) {
-        // SACD Reference cells are unavailable in P0. Do not read the ISO TOC
-        // while constructing a plan merely to reject the cell afterward. When
-        // SACD Reference is eventually qualified, TOC selection and its
-        // double-SHA mutation checks belong to executor preflight, where the
-        // source identity is already admitted and revalidated.
-        return Err(ConvertError::Backend(
-            tonepoet_pipeline::reference_error_text(
-                tonepoet_pipeline::ReferenceErrorCode::SacdFrontEndIntegrationUnqualified,
-            )
-            .to_string(),
-        ));
+    if let TrackSourceRef::SacdTrack {
+        iso,
+        track_index,
+        area,
+    } = &track.source_ref
+    {
+        return reference_sacd_source_kind(iso, *track_index, *area);
     }
     let metadata = dsd_source_metadata_from_path(realized_input)?.ok_or_else(|| {
         ConvertError::Backend(format!(
@@ -794,11 +881,88 @@ fn reference_source_kind(
     })
 }
 
-pub(super) fn reference_sacd_source_kind(
+#[derive(Debug, Clone)]
+struct ReferenceSacdAdmissionFacts {
+    source_kind: DsdSourceKind,
+    duration: Duration,
+    selected_members: std::num::NonZeroUsize,
+    programme_digest: Sha256Digest,
+}
+
+fn sacd_track_selection_indices(
+    track_count: usize,
+    selection: &TrackSelection,
+) -> Result<Vec<u32>, ConvertError> {
+    let max_ordinal = u32::try_from(track_count).map_err(|_| {
+        ConvertError::Backend("SACD track count exceeds planner selection range".to_string())
+    })?;
+    let selected = match selection {
+        TrackSelection::All => (1..=max_ordinal).collect::<Vec<_>>(),
+        TrackSelection::Range { start, end } => {
+            if *start == 0 || *end == 0 || start > end {
+                return Err(ConvertError::Backend(format!(
+                    "invalid SACD track range {start}-{end} during Reference admission"
+                )));
+            }
+            if *start > max_ordinal {
+                return Err(ConvertError::Backend(format!(
+                    "SACD track range start {start} exceeds track count {max_ordinal} during Reference admission"
+                )));
+            }
+            (*start..=(*end).min(max_ordinal)).collect::<Vec<_>>()
+        }
+        TrackSelection::Set(indices) => {
+            if indices.is_empty() {
+                return Err(ConvertError::Backend(
+                    "empty SACD track set during Reference admission".to_string(),
+                ));
+            }
+            for &index in indices {
+                if index == 0 || index > max_ordinal {
+                    return Err(ConvertError::Backend(format!(
+                        "SACD track {index} outside valid range 1-{max_ordinal} during Reference admission"
+                    )));
+                }
+            }
+            indices.iter().copied().collect::<Vec<_>>()
+        }
+    };
+    if selected.is_empty() {
+        return Err(ConvertError::Backend(
+            "SACD Reference admission selected no tracks".to_string(),
+        ));
+    }
+    Ok(selected)
+}
+
+fn sacd_duration_from_play_time(
+    play_time: crate::tui::sacd::PlayTime,
+) -> Result<Duration, ConvertError> {
+    let frames = u64::from(play_time.as_frame_count());
+    if frames == 0 {
+        return Err(ConvertError::Backend(
+            "selected SACD track has zero authoritative duration".to_string(),
+        ));
+    }
+    // SACD timing is exact on a 75 Hz clock. `Duration` stores integer
+    // nanoseconds, so 1/75 s is not nanosecond-exact. Truncate, as the probe of
+    // the extracted DSF does: the deferred admission plan and the post-extraction
+    // replan hash the same duration, and the executor requires the two semantic
+    // plan hashes to agree. Rounding up here put the two one nanosecond apart
+    // and refused every SACD track.
+    let nanoseconds = frames
+        .checked_mul(1_000_000_000)
+        .map(|value| value / u64::from(crate::tui::sacd::SACD_FRAME_RATE))
+        .ok_or_else(|| ConvertError::Backend("SACD duration conversion overflowed".to_string()))?;
+    Ok(Duration::from_nanos(nanoseconds))
+}
+
+fn reference_sacd_admission_facts(
     iso: &Path,
     track_index: u32,
     area: super::types::SacdArea,
-) -> Result<DsdSourceKind, ConvertError> {
+    track_selection: &TrackSelection,
+) -> Result<ReferenceSacdAdmissionFacts, ConvertError> {
     use crate::tui::sacd::parse_sacd_iso;
     let metadata = parse_sacd_iso(iso)
         .map_err(|err| ConvertError::Backend(format!("failed to read SACD TOC for Reference: {err}")))?;
@@ -849,17 +1013,54 @@ pub(super) fn reference_sacd_source_kind(
     let digest = hasher.finalize();
     let mut toc_digest = [0_u8; 32];
     toc_digest.copy_from_slice(&digest);
+    let toc_digest = Sha256Digest(toc_digest);
 
-    Ok(DsdSourceKind::SacdTrack {
-        frame_format,
-        selection: SacdTrackSelection {
-            area: area_kind,
-            track_index_zero_based: track_index,
-            start_frame: u64::from(entry.start_lsn),
-            frame_count: u64::from(entry.length_lsn),
-            toc_digest: Sha256Digest(toc_digest),
+    let selected_ordinals = sacd_track_selection_indices(area_info.tracks.len(), track_selection)?;
+    let current_ordinal = track_index.checked_add(1).ok_or_else(|| {
+        ConvertError::Backend("SACD track ordinal overflowed during Reference admission".to_string())
+    })?;
+    if !selected_ordinals.contains(&current_ordinal) {
+        return Err(ConvertError::Backend(format!(
+            "SACD track {current_ordinal} is outside the request's selected track set during Reference admission"
+        )));
+    }
+    let selected_members = std::num::NonZeroUsize::new(selected_ordinals.len()).ok_or_else(|| {
+        ConvertError::Backend("SACD Reference admission selected no tracks".to_string())
+    })?;
+    let mut programme_hasher = Sha256::new();
+    programme_hasher.update(b"tonepoet-reference-contained-sacd-album/v1\0");
+    programme_hasher.update(toc_digest.0);
+    programme_hasher.update((selected_ordinals.len() as u64).to_be_bytes());
+    for ordinal in &selected_ordinals {
+        programme_hasher.update(ordinal.to_be_bytes());
+    }
+    let programme_digest = Sha256Digest(programme_hasher.finalize().into());
+
+    Ok(ReferenceSacdAdmissionFacts {
+        source_kind: DsdSourceKind::SacdTrack {
+            frame_format,
+            selection: SacdTrackSelection {
+                area: area_kind,
+                track_index_zero_based: track_index,
+                start_frame: u64::from(entry.start_lsn),
+                frame_count: u64::from(entry.length_lsn),
+                channels: u16::from(area_info.header.channel_count),
+                toc_digest,
+            },
         },
+        duration: sacd_duration_from_play_time(entry.duration)?,
+        selected_members,
+        programme_digest,
     })
+}
+
+pub(super) fn reference_sacd_source_kind(
+    iso: &Path,
+    track_index: u32,
+    area: super::types::SacdArea,
+) -> Result<DsdSourceKind, ConvertError> {
+    reference_sacd_admission_facts(iso, track_index, area, &TrackSelection::All)
+        .map(|facts| facts.source_kind)
 }
 
 /// Disable planner-owned source tag transfer through one named policy gate.
@@ -2364,9 +2565,10 @@ pub fn source_info_for_realized_track(
         let format = match source_kind {
             DsdSourceKind::DsfUncompressed => PlannerFormat::Dsf,
             DsdSourceKind::DsdiffUncompressed | DsdSourceKind::DsdiffDst => PlannerFormat::Dff,
-            DsdSourceKind::SacdTrack { .. } | DsdSourceKind::UnknownDsdContainer => {
+            DsdSourceKind::SacdTrack { .. } => PlannerFormat::Dsf,
+            DsdSourceKind::UnknownDsdContainer => {
                 return Err(ConvertError::Backend(
-                    "retained Reference album carrier has an unqualified source kind".to_string(),
+                    "retained Reference album carrier has an unknown source kind".to_string(),
                 ));
             }
         };
@@ -2552,8 +2754,9 @@ pub fn source_info_for_realized_track(
         .or_else(|| match &track.source_ref {
             TrackSourceRef::CueStreamSegment { channels, .. } => Some(*channels),
             TrackSourceRef::SacdTrack { area: super::types::SacdArea::Stereo, .. } => Some(2),
-            // Multichannel Reference is rejected by policy; a non-stereo value
-            // keeps preflight and execution on the same deterministic error cell.
+            // This is only a pre-TOC fallback for ordinary source probing.
+            // Reference admission immediately replaces it with the exact channel
+            // count from the selected SACD area before source validation.
             TrackSourceRef::SacdTrack { area: super::types::SacdArea::MultiChannel, .. } => Some(6),
             _ => None,
         });
@@ -2784,7 +2987,7 @@ fn flac_streaminfo_audio_md5(path: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::{Path, PathBuf};
 
     use tempfile::TempDir;
@@ -2909,6 +3112,130 @@ mod tests {
             planner_format_from_path(Path::new("track.aac")),
             Some(PlannerFormat::Aac)
         );
+    }
+
+    fn write_reference_sacd_admission_fixture(
+        path: &Path,
+        area: SacdArea,
+        frame_encoding: tonepoet_pipeline::SacdFrameEncoding,
+        channels: u16,
+        durations: &[(u8, u8, u8)],
+    ) {
+        use std::io::{Seek, SeekFrom, Write};
+
+        const SECTOR_SIZE: u64 = 2048;
+        const AREA_LSN: u32 = 540;
+        const AUDIO_LSN: u32 = 650;
+        assert!(!durations.is_empty());
+        assert!(durations.len() <= u8::MAX as usize);
+
+        let file = std::fs::File::create(path).expect("create SACD admission fixture");
+        file.set_len(800 * SECTOR_SIZE)
+            .expect("size SACD admission fixture");
+        drop(file);
+        let mut file = std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open SACD admission fixture");
+
+        let mut master = vec![0_u8; 0xa8];
+        master[0..8].copy_from_slice(b"SACDMTOC");
+        master[0x08] = 1;
+        master[0x09] = 20;
+        master[0x10..0x12].copy_from_slice(&1_u16.to_be_bytes());
+        master[0x12..0x14].copy_from_slice(&1_u16.to_be_bytes());
+        match area {
+            SacdArea::Stereo => {
+                master[0x40..0x44].copy_from_slice(&AREA_LSN.to_be_bytes());
+                master[0x54..0x56].copy_from_slice(&3_u16.to_be_bytes());
+            }
+            SacdArea::MultiChannel => {
+                master[0x48..0x4c].copy_from_slice(&AREA_LSN.to_be_bytes());
+                master[0x56..0x58].copy_from_slice(&3_u16.to_be_bytes());
+            }
+        }
+        file.seek(SeekFrom::Start(510 * SECTOR_SIZE)).unwrap();
+        file.write_all(&master).unwrap();
+
+        let track_count = u8::try_from(durations.len()).expect("track count fits u8");
+        let mut area_toc = vec![0_u8; SECTOR_SIZE as usize];
+        area_toc[0..8].copy_from_slice(match area {
+            SacdArea::Stereo => b"TWOCHTOC",
+            SacdArea::MultiChannel => b"MULCHTOC",
+        });
+        area_toc[0x08] = 1;
+        area_toc[0x09] = 20;
+        area_toc[0x0a..0x0c].copy_from_slice(&3_u16.to_be_bytes());
+        area_toc[0x10..0x14].copy_from_slice(&64_000_u32.to_be_bytes());
+        area_toc[0x14] = 0x04;
+        area_toc[0x15] = match frame_encoding {
+            tonepoet_pipeline::SacdFrameEncoding::Dsd => 2,
+            tonepoet_pipeline::SacdFrameEncoding::Dst => 0,
+        };
+        area_toc[0x20] = u8::try_from(channels).expect("channel count fits u8");
+        area_toc[0x21] = if channels > 2 { 5 << 3 } else { 0 };
+        area_toc[0x22] = u8::try_from(channels).expect("channel count fits u8");
+        area_toc[0x45] = track_count;
+        area_toc[0x48..0x4c].copy_from_slice(&AUDIO_LSN.to_be_bytes());
+        area_toc[0x4c..0x50].copy_from_slice(
+            &(AUDIO_LSN + u32::from(track_count) * 8).to_be_bytes(),
+        );
+        file.seek(SeekFrom::Start(u64::from(AREA_LSN) * SECTOR_SIZE))
+            .unwrap();
+        file.write_all(&area_toc).unwrap();
+
+        let mut trl1 = vec![0_u8; SECTOR_SIZE as usize];
+        trl1[0..8].copy_from_slice(b"SACDTRL1");
+        let length_base = 8 + 255 * 4;
+        for index in 0..durations.len() {
+            let start_lsn = AUDIO_LSN + u32::try_from(index).unwrap() * 8;
+            trl1[8 + index * 4..12 + index * 4]
+                .copy_from_slice(&start_lsn.to_be_bytes());
+            trl1[length_base + index * 4..length_base + 4 + index * 4]
+                .copy_from_slice(&8_u32.to_be_bytes());
+        }
+        file.seek(SeekFrom::Start(u64::from(AREA_LSN + 1) * SECTOR_SIZE))
+            .unwrap();
+        file.write_all(&trl1).unwrap();
+
+        let mut trl2 = vec![0_u8; SECTOR_SIZE as usize];
+        trl2[0..8].copy_from_slice(b"SACDTRL2");
+        let duration_base = 8 + 255 * 4;
+        let mut elapsed_frames = 0_u32;
+        for (index, &(minutes, seconds, frames)) in durations.iter().enumerate() {
+            let start_minutes = elapsed_frames / (60 * crate::tui::sacd::SACD_FRAME_RATE);
+            let start_remainder = elapsed_frames % (60 * crate::tui::sacd::SACD_FRAME_RATE);
+            let start_seconds = start_remainder / crate::tui::sacd::SACD_FRAME_RATE;
+            let start_frames = start_remainder % crate::tui::sacd::SACD_FRAME_RATE;
+            let start = 8 + index * 4;
+            trl2[start] = u8::try_from(start_minutes).expect("fixture minutes fit u8");
+            trl2[start + 1] = u8::try_from(start_seconds).expect("fixture seconds fit u8");
+            trl2[start + 2] = u8::try_from(start_frames).expect("fixture frames fit u8");
+            let duration = duration_base + index * 4;
+            trl2[duration] = minutes;
+            trl2[duration + 1] = seconds;
+            trl2[duration + 2] = frames;
+            elapsed_frames += u32::from(minutes) * 60 * crate::tui::sacd::SACD_FRAME_RATE
+                + u32::from(seconds) * crate::tui::sacd::SACD_FRAME_RATE
+                + u32::from(frames);
+        }
+        file.seek(SeekFrom::Start(u64::from(AREA_LSN + 2) * SECTOR_SIZE))
+            .unwrap();
+        file.write_all(&trl2).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    fn reference_sacd_request(root: &Path, selection: TrackSelection) -> PipelineRequest {
+        let mut req = request(root);
+        req.source.track_selection = selection;
+        req.settings.dsd = tonepoet_pipeline::DsdSettings::reference();
+        req.settings.target_format = PlannerFormat::Flac;
+        req.settings.target_sample_rate = tonepoet_pipeline::RateTarget::PcmHz(176_400);
+        req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(
+            tonepoet_pipeline::PcmBitDepth::Int24,
+        );
+        req.stages.metadata = StageRequirement::Disabled;
+        req
     }
 
     fn track(source_ref: TrackSourceRef) -> PreparedTrack {
@@ -4153,7 +4480,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_native_sacd_rejects_without_plan_time_iso_io() {
+    fn reference_sacd_admission_requires_the_authoritative_iso_toc() {
         let temp = TempDir::new().expect("temp dir");
         let input = temp.path().join("realized.dsf");
         write_minimal_dsf(&input);
@@ -4178,13 +4505,130 @@ mod tests {
             &output,
             temp.path().join("work"),
         )
-        .expect_err("P0 native SACD must fail closed");
+        .expect_err("Reference SACD admission must fail closed without its ISO");
         let message = error.to_string();
-        assert!(message.contains("DSD-REF-P0-023"), "{message}");
-        assert!(
-            !message.contains("failed to read SACD TOC")
-                && !message.contains("No such file or directory"),
-            "native SACD rejection must not perform plan-time ISO I/O: {message}"
+        assert!(message.contains("failed to read SACD TOC for Reference"), "{message}");
+    }
+
+    fn assert_deferred_reference_sacd_plan(
+        area: SacdArea,
+        frame_encoding: tonepoet_pipeline::SacdFrameEncoding,
+        channels: u16,
+        track_index: u32,
+        selection: TrackSelection,
+        expected_members: usize,
+        expected_duration_frames: u64,
+    ) {
+        let temp = TempDir::new().expect("temp dir");
+        let iso = temp.path().join("album.iso");
+        write_reference_sacd_admission_fixture(
+            &iso,
+            area,
+            frame_encoding,
+            channels,
+            &[(0, 1, 1), (0, 2, 7), (0, 3, 11), (0, 4, 13)],
+        );
+        let req = reference_sacd_request(temp.path(), selection);
+        let track = track(TrackSourceRef::SacdTrack {
+            iso,
+            track_index,
+            area,
+        });
+        let placeholder = temp
+            .path()
+            .join("staging/reference-deferred-sacd/never-materialized.dsf");
+        assert!(!placeholder.exists());
+
+        let planned = plan_request_for_track(
+            &req,
+            &track,
+            &placeholder,
+            &temp.path().join("out.flac"),
+            temp.path().join("work"),
+        )
+        .expect("deferred SACD must reach typed Reference planning before extraction");
+
+        let expected_nanos = expected_duration_frames
+            .checked_mul(1_000_000_000)
+            .map(|value| value / 75)
+            .expect("fixture duration conversion");
+        assert_eq!(
+            planned.source.duration,
+            Some(std::time::Duration::from_nanos(expected_nanos)),
+            "SACD TOC duration must be bound before deferred extraction",
+        );
+        assert_eq!(planned.source.sample_rate_hz, Some(crate::tui::sacd::SACD_SAMPLE_RATE_HZ));
+        assert_eq!(planned.source.channels, Some(channels));
+        if expected_members > 1 {
+            assert!(matches!(
+                &planned.reference_programme_scope,
+                tonepoet_pipeline::ReferenceProgrammeScope::ContainedAlbum {
+                    expected_members: members,
+                    ..
+                } if members.get() == expected_members
+            ));
+        } else {
+            assert_eq!(
+                planned.reference_programme_scope,
+                tonepoet_pipeline::ReferenceProgrammeScope::Singleton,
+            );
+        }
+
+        let conversion = tonepoet_pipeline::plan_conversion(&planned)
+            .expect("initial Reference plan must be Ready before SACD extraction");
+        let reference = conversion.reference.expect("Reference plan summary");
+        assert!(matches!(
+            reference.gain_policy,
+            tonepoet_pipeline::ResolvedGainPolicy::TruePeakNormalize {
+                scope: tonepoet_pipeline::TruePeakScope::Album,
+                bound_gain: None,
+                ..
+            }
+        ) == (expected_members > 1));
+        assert!(!placeholder.exists(), "planning must not materialize the SACD source");
+    }
+
+    #[test]
+    fn reference_sacd_deferred_admission_binds_toc_duration_for_dsd_stereo_album() {
+        assert_deferred_reference_sacd_plan(
+            SacdArea::Stereo,
+            tonepoet_pipeline::SacdFrameEncoding::Dsd,
+            2,
+            1,
+            TrackSelection::Range { start: 1, end: 2 },
+            2,
+            2 * 75 + 7,
+        );
+    }
+
+    #[test]
+    fn reference_sacd_deferred_admission_binds_toc_duration_for_dst_multichannel_subset() {
+        let selected = [2_u32, 4_u32].into_iter().collect::<BTreeSet<_>>();
+        // Five channels deliberately differs from the legacy six-channel
+        // pre-TOC fallback and proves the typed admission uses exact TOC
+        // geometry before Reference planning.
+        assert_deferred_reference_sacd_plan(
+            SacdArea::MultiChannel,
+            tonepoet_pipeline::SacdFrameEncoding::Dst,
+            5,
+            3,
+            TrackSelection::Set(selected),
+            2,
+            4 * 75 + 13,
+        );
+    }
+
+    #[test]
+    fn reference_sacd_single_selected_track_remains_track_scope() {
+        let selected = [2_u32].into_iter().collect::<BTreeSet<_>>();
+        assert_deferred_reference_sacd_plan(
+            SacdArea::Stereo,
+            tonepoet_pipeline::SacdFrameEncoding::Dsd,
+            2,
+            1,
+            TrackSelection::Set(selected),
+            1,
+            2 * 75 + 7,
         );
     }
 

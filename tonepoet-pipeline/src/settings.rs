@@ -503,7 +503,7 @@ fn validate_dsd_settings(settings: &DsdSettings) -> Result<()> {
                     "Custom DSD sample-domain gain is incompatible with explicit Reference delivery",
                 ));
             }
-            if settings.from_dsd.reference_policy != DsdReferencePolicyVersion::SoxNg14801V17 {
+            if settings.from_dsd.reference_policy != DsdReferencePolicyVersion::SoxNg14801V18 {
                 return Err(PlanningError::invalid_settings(
                     "dsd.from_dsd.reference_policy",
                     reference_error_text(ReferenceErrorCode::Toolchain),
@@ -1248,9 +1248,9 @@ impl DsdSettings {
         matches!(self.from_dsd.pathway, DsdSourcePathway::Reference)
     }
 
-    /// True when a submitted independent album may bind the Reference Auto scalar.
+    /// True when an aggregate Reference programme may bind one Auto scalar.
     /// Programme shape remains the planner's authority; this settings-only predicate
-    /// exists solely to validate runtime-only barrier state.
+    /// exists solely to validate runtime-only album-gain state.
     #[must_use]
     pub const fn reference_auto_album_gain_possible(&self) -> bool {
         matches!(self.from_dsd.pathway, DsdSourcePathway::Reference)
@@ -1319,7 +1319,7 @@ impl DsdSettings {
         }
     }
 
-    /// Bind the complete runtime authority derived from one submitted batch.
+    /// Bind the complete runtime authority derived from one aggregate programme.
     pub fn bind_runtime_album_gain(
         &mut self,
         gain: DbNano,

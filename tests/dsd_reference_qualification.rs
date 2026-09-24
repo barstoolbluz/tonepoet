@@ -27,13 +27,14 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use tonepoet::convert::pipeline::{
-    plan_request_for_track, qualify_production_metadata_mutation,
+    plan_request_for_track, qualify_production_metadata_mutation, realize_track,
     qualify_reference_common_candidate_execution,
-    qualify_reference_production_promotion_gate,
+    qualify_reference_production_promotion_gate, qualify_reference_sacd_source_materialization,
     qualify_reference_source_materialization, ActionPipeline, AlbumMetadata, BoundToolExecutable,
     CueSidecarPolicy, DvdaDownmixPolicy, DvdaGroupSelection, EnvVar, FailurePolicy, LogPolicy,
     NamingCollisionPolicy, NamingPolicy, OverwritePolicy, PipelineRequest, PreparedTrack,
     PublishPolicy, RealToolRunner, SacdArea, SecretString, SourceAudioCoding, SourceAudioDescriptor,
+    StagingDir, StubToolRunner,
     SourceOptions, StagePolicy, StageRequirement, ToolBinary, ToolCommand, ToolRunner,
     ToolRunnerError, TrackId, TrackMetadata, TrackSelection, TrackSourceRef,
 };
@@ -61,7 +62,7 @@ use tonepoet_pipeline::{
 
 
 // Frozen v15 checker compatibility marker retained for inherited audit evidence;
-// the active common-model release report is schema v17.
+// the active common-model release report is schema v18.
 // append-only v15 checker source marker: "schema_version": 15
 // append-only v15 checker source marker: "silent_float64_w64_open_defect"
 #[allow(dead_code, reason = "append-only Reference qualification probe retained for historical evidence reproduction and targeted re-qualification")]
@@ -606,9 +607,9 @@ fn first_nonempty_line(text: &str) -> &str {
         .unwrap_or_default()
 }
 
-/// Canonical unpromoted v17 report, as checked in before the qualification was installed.
+/// Canonical unpromoted v18 report, as checked in before the qualification was installed.
 const NOT_RUN_REPORT_STUB: &str = r#"{
-  "schema_version": 17,
+  "schema_version": 18,
   "execution_model": "tonepoet-reference-common-model/v1",
   "status": "not_run",
   "candidate_manifest_sha256": "",
@@ -619,9 +620,9 @@ const NOT_RUN_REPORT_STUB: &str = r#"{
   "gates": []
 }"#;
 
-/// Canonical unpromoted v17 certification, as checked in before the qualification was installed.
+/// Canonical unpromoted v18 certification, as checked in before the qualification was installed.
 const NOT_RUN_CERTIFICATION_STUB: &str = r#"{
-  "schema_version": 17,
+  "schema_version": 18,
   "execution_model": "tonepoet-reference-common-model/v1",
   "status": "not_run",
   "outcome": "not_run",
@@ -1205,6 +1206,10 @@ fn assert_qualification_decode_route_table() -> Value {
         bit_depth: PcmBitDepth::Int24,
         dither: ReferenceDither::Tpdf,
     };
+    let int16 = FinalPcmContract {
+        bit_depth: PcmBitDepth::Int16,
+        ..int24
+    };
     let int32 = FinalPcmContract {
         bit_depth: PcmBitDepth::Int32,
         // Int32 Reference terminals use the commissioned FFmpeg triangular TPDF terminal.
@@ -1224,6 +1229,10 @@ fn assert_qualification_decode_route_table() -> Value {
         ..int24
     };
 
+    assert_eq!(
+        qpcm_decode_authority(int16).mechanism(),
+        ReferenceDecodeMechanism::DirectFfmpeg
+    );
     assert_eq!(
         qpcm_decode_authority(int24).mechanism(),
         ReferenceDecodeMechanism::DirectFfmpeg
@@ -1257,6 +1266,10 @@ fn assert_qualification_decode_route_table() -> Value {
         ReferenceDecodeMechanism::DirectFfmpeg
     );
     assert_eq!(
+        qpcm_decode_authority(int16).hash_encoding(),
+        ReferenceSampleHashEncoding::SignedInt16Le
+    );
+    assert_eq!(
         qpcm_decode_authority(int24).hash_encoding(),
         ReferenceSampleHashEncoding::SignedInt24Le
     );
@@ -1284,16 +1297,21 @@ fn assert_qualification_decode_route_table() -> Value {
         ReferenceDecodeRoleClass::PostMetadataW64,
         ReferenceDecodeRoleClass::PostMetadataNonW64,
     ] {
-        assert!(
-            REFERENCE_DECODE_ROUTE_RULES.iter().any(|rule| {
-                rule.role_class() == role
-                    && rule.bit_depth() == PcmBitDepth::Int32
-                    && rule.mechanism() == ReferenceDecodeMechanism::DirectFfmpeg
-                    && rule.hash_encoding() == ReferenceSampleHashEncoding::SignedInt32Le
-            }),
-            "current Reference decode table must carry the Int32 direct-FFmpeg route for {}",
-            role.key(),
-        );
+        for (depth, encoding) in [
+            (PcmBitDepth::Int16, ReferenceSampleHashEncoding::SignedInt16Le),
+            (PcmBitDepth::Int32, ReferenceSampleHashEncoding::SignedInt32Le),
+        ] {
+            assert!(
+                REFERENCE_DECODE_ROUTE_RULES.iter().any(|rule| {
+                    rule.role_class() == role
+                        && rule.bit_depth() == depth
+                        && rule.mechanism() == ReferenceDecodeMechanism::DirectFfmpeg
+                        && rule.hash_encoding() == encoding
+                }),
+                "current Reference decode table must carry the {depth:?} direct-FFmpeg route for {}",
+                role.key(),
+            );
+        }
     }
 
     let mut rejected_roles = Vec::new();
@@ -1740,6 +1758,7 @@ fn encode_w64_characterization_fixture(
     raw_file.sync_all().expect("sync W64 characterization source");
     drop(raw_file);
     let (encoding, bits) = match depth {
+        "int16" => ("signed-integer", "16"),
         "int24" => ("signed-integer", "24"),
         "int32" => ("signed-integer", "32"),
         "float32" => ("floating-point", "32"),
@@ -1871,6 +1890,7 @@ fn exact_w64_characterization_result(
     sample_frames: u64,
 ) -> Result<tonepoet_pipeline::W64ExactStructure, String> {
     let (bits_per_sample, encoding) = match depth {
+        "int16" => (16, W64SampleEncoding::SignedInteger),
         "int24" => (24, W64SampleEncoding::SignedInteger),
         "int32" => (32, W64SampleEncoding::SignedInteger),
         "float32" => (32, W64SampleEncoding::FloatingPoint),
@@ -1900,8 +1920,8 @@ fn qualify_w64_exact_integrity_contract() -> Value {
         44_100_u32, 48_000, 88_200, 96_000, 176_400,
         192_000, 352_800, 384_000, 705_600, 768_000,
     ];
-    let depths = ["int24", "int32", "float32", "float64"];
-    let channels_set = [1_u16, 2_u16];
+    let depths = ["int16", "int24", "int32", "float32", "float64"];
+    let channels_set = [1_u16, 2_u16, 3_u16, 4_u16, 5_u16, 6_u16];
     let exponents = (-96_i32..=-1_i32).collect::<Vec<_>>();
     let mut rows = Vec::new();
     let mut malformed_all_zero_cells = 0_u64;
@@ -2130,10 +2150,54 @@ fn qualify_w64_exact_integrity_contract() -> Value {
     }
 
     assert_eq!(rows.len(), rates.len() * channels_set.len() * depths.len());
+
+    // P0-025 was a RIFF32 transport limit, not a DSP limit. Prove the v18
+    // replacement at the actual carrier boundary with a sparse Wave64 whose
+    // declared PCM payload is larger than 4 GiB. The exact W64 parser seeks
+    // over the sparse extent, so this does not turn the qualification gate into
+    // a multi-gigabyte write/read benchmark; every ordinary W64 cell above
+    // still receives an independent FFmpeg full traversal.
+    require_sparse_file_support(temp.path());
+    let long_root = temp.path().join("long-programme-capacity");
+    fs::create_dir_all(&long_root).expect("create long-programme capacity root");
+    let long_seed = encode_w64_characterization_fixture(
+        &sox,
+        &long_root,
+        "seed",
+        176_400,
+        1,
+        "float64",
+        &[0.25_f64, -0.25_f64],
+    );
+    let long_payload_bytes = (1_u64 << 32) + 8;
+    let long_w64 = long_root.join("over-4gib-payload.w64");
+    let long_sample_frames =
+        create_sparse_w64_capacity_fixture(&long_seed, &long_w64, long_payload_bytes);
+    let long_structure = exact_w64_characterization_result(
+        &long_w64,
+        176_400,
+        1,
+        "float64",
+        long_sample_frames,
+    )
+    .expect("sparse >4 GiB Wave64 fixture must satisfy exact structure authority");
+    assert_eq!(long_structure.sample_frames, long_sample_frames);
+    assert!(long_payload_bytes > u64::from(u32::MAX));
+
+    let long_source = long_root.join("source.dsf");
+    write_dsf_reference_fixture_with_byte(&long_source, 1, 2_822_400, 0x69);
+    let long_plan = v18_long_programme_plan_result(
+        &long_root,
+        &long_source,
+        long_sample_frames,
+    )
+    .expect("v18 Reference planning must not retain the retired RIFF32 capacity refusal");
+    assert!(long_plan.reference.is_some());
+
     serde_json::json!({
         "schema": "tonepoet-reference-w64-exact-integrity/v1",
         "status": "passed",
-        "policy": tonepoet_pipeline::DSD_REFERENCE_POLICY_V17_KEY,
+        "policy": tonepoet_pipeline::DSD_REFERENCE_POLICY_V18_KEY,
         "parser_authority": "independent_root_and_chunk_traversal_exact/v1",
         "carrier_contract_digest": "tonepoet-reference-carrier-probe/v2",
         "declared_riff_extent_equals_physical_extent": true,
@@ -2153,6 +2217,19 @@ fn qualify_w64_exact_integrity_contract() -> Value {
         "uncharacterized_enabled_cells": 0,
         "same_path_qpcm_package_hash_counted_as_independent_packaging": false,
         "w64_delivery_mode": "terminal_qpcm_is_delivered_directly_after_exact_structure_and_full_consumer_traversal",
+        "long_programme_capacity": {
+            "status": "passed",
+            "carrier": "wave64",
+            "sample_rate_hz": 176_400,
+            "channels": 1,
+            "depth": "float64",
+            "logical_pcm_payload_bytes": long_payload_bytes,
+            "sample_frames": long_sample_frames,
+            "exceeds_u32_payload_bytes": true,
+            "exact_structure": "passed",
+            "v18_planner_admission": "passed",
+            "full_decode_disposition": "not_repeated_for_sparse_capacity_probe; independent_ffmpeg_full_traversal_is_required_for_all_300_ordinary_characterization_cells"
+        },
         "cells": rows,
     })
 }
@@ -3209,7 +3286,7 @@ fn historical_dc_root_cause_probe_confirms_current_path_avoids_former_rail() {
 fn qualify_q02_common_closure_binding(common_candidate_execution: &Value) -> Value {
     let candidate_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_common_v17_candidate.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_common_v18_candidate.json"
     ));
     let runtime_fingerprint = common_candidate_execution
         ["common_runtime_closure_fingerprint_sha256"]
@@ -3311,12 +3388,12 @@ fn qualify_q02_common_closure_binding(common_candidate_execution: &Value) -> Val
         "Q02 certification must reject a runtime closure mismatch",
     );
 
-    // The checked-in v17 report and certification are execution evidence once the
+    // The checked-in v18 report and certification are execution evidence once the
     // qualification has been installed, so the status-only promotion probes start
     // from the canonical unpromoted `not_run` stubs with empty gate evidence.
     let checked_in_report_bytes: &[u8] = NOT_RUN_REPORT_STUB.as_bytes();
     let mut status_only_report: tonepoet_pipeline::ReferenceQualificationReportV1 =
-        serde_json::from_slice(checked_in_report_bytes).expect("not-run v17 report stub parses");
+        serde_json::from_slice(checked_in_report_bytes).expect("not-run v18 report stub parses");
     status_only_report.status = "passed".to_string();
     status_only_report.candidate_manifest_sha256 = candidate_digest.clone();
     status_only_report.runtime_closure_fingerprint_sha256 = runtime_fingerprint.to_string();
@@ -3336,7 +3413,7 @@ fn qualify_q02_common_closure_binding(common_candidate_execution: &Value) -> Val
     let checked_in_certification_bytes: &[u8] = NOT_RUN_CERTIFICATION_STUB.as_bytes();
     let mut status_only_certification: tonepoet_pipeline::ReferenceReleaseCertificationV1 =
         serde_json::from_slice(checked_in_certification_bytes)
-            .expect("not-run v17 certification stub parses");
+            .expect("not-run v18 certification stub parses");
     status_only_certification.status = "passed".to_string();
     status_only_certification.outcome = "qualified".to_string();
     status_only_certification.candidate_manifest_sha256 = candidate_digest;
@@ -4161,7 +4238,7 @@ fn planned_reference_source_cell(
     settings.target_format = target_format(target);
     settings.target_sample_rate = RateTarget::PcmHz(target_rate_hz);
     settings.target_bit_depth = BitDepthTarget::Pcm(depth);
-    settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V17;
+    settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V18;
     settings.dsd.from_dsd.profile = profile;
     settings.dsd.from_dsd.gain = gain;
     settings.wavpack.hybrid = false;
@@ -4661,6 +4738,55 @@ fn capacity_boundary_plan_result(
         planned_riff_non_audio_upper_bound_bytes: Some(0),
     };
     fs::create_dir_all(root.join("capacity-work")).expect("create capacity planner work directory");
+    plan_reference_dsd(&request)
+}
+
+
+fn v18_long_programme_plan_result(
+    root: &Path,
+    input: &Path,
+    sample_frames: u64,
+) -> tonepoet_pipeline::Result<ConversionPlan> {
+    const SAMPLE_RATE_HZ: u32 = 176_400;
+    let mut settings = PipelineSettings::default();
+    settings.dsd = tonepoet_pipeline::DsdSettings::reference();
+    settings.target_format = target_format(ResolvedOutputTarget::WavW64);
+    settings.target_sample_rate = RateTarget::PcmHz(SAMPLE_RATE_HZ);
+    settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Float64);
+    settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V18;
+    settings.dsd.from_dsd.profile = DsdReconstructionSelection::Reference;
+    settings.dsd.from_dsd.gain =
+        reference_auto_gain(DbNano::DEFAULT_REFERENCE_TRUE_PEAK_TARGET);
+    let request = PlanRequest {
+        input_path: input.to_path_buf(),
+        output_path: root.join("long-programme.w64"),
+        source: SourceInfo {
+            format: AudioFormat::Dsf,
+            codec: AudioCodec::Dsd,
+            sample_rate_hz: Some(2_822_400),
+            bit_depth: None,
+            true_source_depth: None,
+            source_representation: SourceRepresentationKind::Dsd,
+            sample_kind: Some(SampleKind::Dsd),
+            channels: Some(1),
+            duration: Some(duration_for_guarded_output_frames(
+                sample_frames,
+                SAMPLE_RATE_HZ,
+            )),
+            frame_extent: None,
+            dsd_source_kind: Some(DsdSourceKind::DsfUncompressed),
+            audio_md5: None,
+        },
+        settings,
+        plan_scope: tonepoet_pipeline::PlanScope::track("long-programme-capacity"),
+        intermediate_dir: Some(root.join("long-programme-work")),
+        container_ffmpeg_flags: Vec::new(),
+        resolved_output_target: Some(ResolvedOutputTarget::WavW64),
+        reference_programme_scope: ReferenceProgrammeScope::Singleton,
+        planned_riff_non_audio_upper_bound_bytes: Some(0),
+    };
+    fs::create_dir_all(root.join("long-programme-work"))
+        .expect("create v18 long-programme planner work directory");
     plan_reference_dsd(&request)
 }
 
@@ -5263,10 +5389,12 @@ fn qualify_lossless_package_cells(
         .expect("production metadata qualification runtime");
     let metadata_runner = production_metadata_runner(&ffmpeg, &metaflac, &wvtag, &atomic_parsley);
     let (track_metadata, album_metadata) = qualification_metadata();
-    let planner_mono_source = temp.path().join("planner-mono.dsf");
-    let planner_stereo_source = temp.path().join("planner-stereo.dsf");
-    let _ = write_dsf_reference_fixture(&planner_mono_source, 1, 2_822_400);
-    let _ = write_dsf_reference_fixture(&planner_stereo_source, 2, 2_822_400);
+    let mut planner_sources = BTreeMap::new();
+    for channels in 1_u16..=6 {
+        let source = temp.path().join(format!("planner-{channels}ch.dsf"));
+        let _ = write_dsf_reference_fixture(&source, channels, 2_822_400);
+        planner_sources.insert(channels, source);
+    }
 
     let mut case_count = 0_usize;
     let mut terminal_bound_cells = BTreeSet::new();
@@ -5297,6 +5425,7 @@ fn qualify_lossless_package_cells(
         705_600, 768_000,
     ];
     let depths = [
+        (PcmBitDepth::Int16, "int16"),
         (PcmBitDepth::Int24, "int24"),
         (PcmBitDepth::Int32, "int32"),
         (PcmBitDepth::Float32, "float32"),
@@ -5304,7 +5433,7 @@ fn qualify_lossless_package_cells(
     ];
 
     for sample_rate_hz in rates {
-        for channels in [1_u16, 2_u16] {
+        for channels in 1_u16..=6 {
             for (depth, depth_key) in depths {
                 let targets: Vec<(ResolvedOutputTarget, Vec<Option<u8>>)> =
                     if matches!(depth, PcmBitDepth::Float32 | PcmBitDepth::Float64) {
@@ -5348,10 +5477,19 @@ fn qualify_lossless_package_cells(
                 for (target, levels) in targets {
                     for level in levels {
                         let suffix = level.map_or_else(|| "default".to_string(), |v| v.to_string());
-                        let case_root = temp.path().join(format!(
+                        let cell_label = format!(
                             "{sample_rate_hz}-{channels}ch-{depth_key}-{}-{suffix}",
                             target_key(target)
-                        ));
+                        );
+                        // Operator facility: restrict the package matrix to one cell
+                        // (`TONEPOET_QUAL_ONLY_CELL=<rate>-<ch>ch-<depth>-<target>-<level>`)
+                        // to reproduce a failing cell in seconds instead of hours.
+                        if let Ok(only) = std::env::var("TONEPOET_QUAL_ONLY_CELL") {
+                            if cell_label != only {
+                                continue;
+                            }
+                        }
+                        let case_root = temp.path().join(cell_label);
                         fs::create_dir_all(&case_root).expect("create package case root");
                         let source = case_root.join("source-placeholder.dsf");
                         let plan = planned_reference_cell(
@@ -5518,6 +5656,14 @@ fn qualify_lossless_package_cells(
                         } else {
                             let packaged_hash =
                                 decoded_sample_hash(&packaged_carrier, &sox, &ffmpeg);
+                            if packaged_hash != qpcm_hash {
+                                // Keep the artifacts of a failing cell for inspection.
+                                let keep = std::path::PathBuf::from("/tmp/nix-shell.chi9EA/qual-failcell");
+                                let _ = fs::create_dir_all(&keep);
+                                let _ = fs::copy(packaged_carrier.path(), keep.join("packaged.bin"));
+                                let _ = fs::copy(qpcm_carrier.path(), keep.join("qpcm.w64"));
+                                eprintln!("kept failing cell artifacts in {}", keep.display());
+                            }
                             assert_eq!(
                                 packaged_hash,
                                 qpcm_hash,
@@ -5527,7 +5673,7 @@ fn qualify_lossless_package_cells(
                             package_identity_comparison_count += 1;
                         }
                         match depth {
-                            PcmBitDepth::Int24 => {
+                            PcmBitDepth::Int16 | PcmBitDepth::Int24 => {
                                 assert!(chain.terminal_normalize_args.is_none());
                                 assert!(chain.terminal_args.iter().any(|arg| arg == "dither"));
                                 assert_eq!(
@@ -5642,11 +5788,9 @@ fn qualify_lossless_package_cells(
                                 Some(rejection),
                             );
 
-                            let planner_source = if channels == 1 {
-                                &planner_mono_source
-                            } else {
-                                &planner_stereo_source
-                            };
+                            let planner_source = planner_sources
+                                .get(&channels)
+                                .expect("planner fixture exists for every qualified channel count");
                             let planner_output = case_root.join("planner-rejected.w64");
                             let planner_work = case_root.join("planner-rejected-work");
                             let planner_request =
@@ -5825,63 +5969,72 @@ fn qualify_lossless_package_cells(
             }
         }
     }
-    assert_eq!(case_count, 820);
-    assert_eq!(terminal_bound_cells.len(), 80);
-    assert_eq!(package_identity_comparison_count, 740);
-    assert_eq!(w64_direct_delivery_exact_validation_count, 80);
-    assert_eq!(post_metadata_identity_comparison_count, 740);
-    assert_eq!(w64_planner_entry_rejection_count, 80);
-    assert_eq!(w64_metadata_entry_rejection_count, 80);
+    // Under TONEPOET_QUAL_ONLY_CELL the matrix is one cell; the full-matrix
+    // counts below only hold for the complete run.
+    if std::env::var_os("TONEPOET_QUAL_ONLY_CELL").is_none() {
+    assert_eq!(case_count, 3_540);
+    assert_eq!(terminal_bound_cells.len(), 300);
+    assert_eq!(package_identity_comparison_count, 3_240);
+    assert_eq!(w64_direct_delivery_exact_validation_count, 300);
+    assert_eq!(post_metadata_identity_comparison_count, 3_240);
+    assert_eq!(w64_planner_entry_rejection_count, 300);
+    assert_eq!(w64_metadata_entry_rejection_count, 300);
     assert_eq!(
         production_primary_mutator_case_counts,
         BTreeMap::from([
-            ("ffmpeg".to_string(), 220),
-            ("metaflac".to_string(), 360),
-            ("wvtag".to_string(), 160),
+            ("ffmpeg".to_string(), 900),
+            ("metaflac".to_string(), 1_620),
+            ("wvtag".to_string(), 720),
         ])
     );
-    assert_eq!(production_m4a_freeform_case_count, 20);
-    assert_eq!(independent_float64_riff_rf64_case_count, 40);
+    assert_eq!(production_m4a_freeform_case_count, 120);
+    assert_eq!(independent_float64_riff_rf64_case_count, 120);
     assert_eq!(
         terminal_route_counts,
         BTreeMap::from([
-            ("qpcm:ffmpeg_direct".to_string(), 60),
-            ("qpcm:sox_f64le_raw_stream".to_string(), 20),
-            ("r64:sox_f64le_raw_stream".to_string(), 80),
+            ("qpcm:ffmpeg_direct".to_string(), 240),
+            ("qpcm:sox_f64le_raw_stream".to_string(), 60),
+            ("r64:sox_f64le_raw_stream".to_string(), 300),
         ])
     );
     assert_eq!(
         route_counts,
         BTreeMap::from([
-            ("packaged:ffmpeg_direct".to_string(), 800),
-            ("packaged:sox_f64le_raw_stream".to_string(), 20),
-            ("post_metadata:ffmpeg_direct".to_string(), 740),
-            ("qpcm:ffmpeg_direct".to_string(), 760),
-            ("qpcm:sox_f64le_raw_stream".to_string(), 60),
+            ("packaged:ffmpeg_direct".to_string(), 3_480),
+            ("packaged:sox_f64le_raw_stream".to_string(), 60),
+            ("post_metadata:ffmpeg_direct".to_string(), 3_240),
+            ("qpcm:ffmpeg_direct".to_string(), 3_360),
+            ("qpcm:sox_f64le_raw_stream".to_string(), 180),
         ])
     );
     assert_eq!(
         encoding_counts,
         BTreeMap::from([
-            ("packaged:float32_le".to_string(), 60),
-            ("packaged:float64_le".to_string(), 60),
-            ("packaged:int24_le".to_string(), 360),
-            ("packaged:int32_le".to_string(), 340),
-            ("post_metadata:float32_le".to_string(), 40),
-            ("post_metadata:float64_le".to_string(), 40),
-            ("post_metadata:int24_le".to_string(), 340),
-            ("post_metadata:int32_le".to_string(), 320),
-            ("qpcm:float32_le".to_string(), 60),
-            ("qpcm:float64_le".to_string(), 60),
-            ("qpcm:int24_le".to_string(), 360),
-            ("qpcm:int32_le".to_string(), 340),
+            ("packaged:float32_le".to_string(), 180),
+            ("packaged:int16_le".to_string(), 1_080),
+            ("packaged:float64_le".to_string(), 180),
+            ("packaged:int24_le".to_string(), 1_080),
+            ("packaged:int32_le".to_string(), 1_020),
+            ("post_metadata:float32_le".to_string(), 120),
+            ("post_metadata:float64_le".to_string(), 120),
+            ("post_metadata:int16_le".to_string(), 1_020),
+            ("post_metadata:int24_le".to_string(), 1_020),
+            ("post_metadata:int32_le".to_string(), 960),
+            ("qpcm:float32_le".to_string(), 180),
+            ("qpcm:float64_le".to_string(), 180),
+            ("qpcm:int16_le".to_string(), 1_080),
+            ("qpcm:int24_le".to_string(), 1_080),
+            ("qpcm:int32_le".to_string(), 1_020),
         ])
     );
+    }
 
+    if std::env::var_os("TONEPOET_QUAL_ONLY_CELL").is_none() {
     assert_eq!(
         terminal_observed_max_error_by_depth.keys().cloned().collect::<Vec<_>>(),
-        vec!["float32".to_string(), "float64".to_string(), "int24".to_string(), "int32".to_string()]
+        vec!["float32".to_string(), "float64".to_string(), "int16".to_string(), "int24".to_string(), "int32".to_string()]
     );
+    }
 
     PackageQualificationEvidence {
         case_count,
@@ -5893,6 +6046,7 @@ fn qualify_lossless_package_cells(
             "route_authority": "typed_plan_carrier_path_role_target_depth_v2",
             "hash_format": REFERENCE_SAMPLE_HASH_FORMAT,
             "hash_codecs": {
+                "int16": ReferenceSampleHashEncoding::SignedInt16Le.ffmpeg_codec(),
                 "int24": ReferenceSampleHashEncoding::SignedInt24Le.ffmpeg_codec(),
                 "int32": ReferenceSampleHashEncoding::SignedInt32Le.ffmpeg_codec(),
                 "float32": ReferenceSampleHashEncoding::Float32Le.ffmpeg_codec(),
@@ -6510,27 +6664,27 @@ fn qualify_dst_oracle_fixture_authority() -> DstQualificationCounts {
         reference_programme_scope: ReferenceProgrammeScope::Singleton,
         planned_riff_non_audio_upper_bound_bytes: None,
     };
-    let error = plan_reference_dsd(&request).expect_err("six-channel Reference must reject");
-    assert_eq!(
-        error.to_string(),
-        format!(
-            "invalid settings for source.channels: {}",
-            tonepoet_pipeline::reference_error_text(ReferenceErrorCode::UnsupportedChannels)
-        )
-    );
+    plan_reference_dsd(&request)
+        .expect("predictive compressed DSD64 six-channel has commissioned oracle authority");
+
+    let mut mono_dsd64 = request.clone();
+    mono_dsd64.source.channels = Some(1);
+    plan_reference_dsd(&mono_dsd64)
+        .expect("DSD64 mono DST is admitted by the v18 channel-generic decoder contract");
 
     for (source_rate_hz, channels) in [
-        (2_822_400_u32, 1_u16),
         (5_644_800_u32, 1_u16),
         (5_644_800_u32, 2_u16),
+        (5_644_800_u32, 6_u16),
         (11_289_600_u32, 1_u16),
         (11_289_600_u32, 2_u16),
+        (11_289_600_u32, 6_u16),
     ] {
         let mut unsupported_request = request.clone();
         unsupported_request.source.channels = Some(channels);
         unsupported_request.source.sample_rate_hz = Some(source_rate_hz);
         let error = plan_reference_dsd(&unsupported_request)
-            .expect_err("predictive compressed DST outside DSD64 stereo must reject before decode");
+            .expect_err("predictive compressed DST above DSD64 must remain fail-closed");
         assert_eq!(
             error.to_string(),
             format!(
@@ -6542,11 +6696,10 @@ fn qualify_dst_oracle_fixture_authority() -> DstQualificationCounts {
         );
     }
 
-    let mut supported_request = request;
-    supported_request.source.channels = Some(2);
-    supported_request.source.sample_rate_hz = Some(2_822_400);
-    plan_reference_dsd(&supported_request)
-        .expect("predictive compressed DSD64 stereo has independent-oracle authority");
+    let mut stereo_dsd64 = request;
+    stereo_dsd64.source.channels = Some(2);
+    plan_reference_dsd(&stereo_dsd64)
+        .expect("predictive compressed DSD64 stereo remains admitted");
 
     let counts = DstQualificationCounts {
         total: CASES.len(),
@@ -6817,14 +6970,9 @@ fn qualify_source_front_end_planner_render(
         case_root,
         input,
         source_rate_hz,
-        // Policy v17 admits 88.2 kHz only from DSD64; DSD128 and DSD256 must
-        // target 176.4 kHz or higher (DSD-REF-P0-006). Keep each cell inside
-        // the admitted profile table.
-        match source_rate_hz {
-            2_822_400 => 88_200,
-            5_644_800 => 176_400,
-            _ => 352_800,
-        },
+        // Exercise the lowest newly admitted target where possible so source
+        // integration also traverses the target-limited B4T profile.
+        88_200,
         channels,
         source_format,
         source_kind.clone(),
@@ -6843,6 +6991,20 @@ fn qualify_source_front_end_planner_render(
         (
             DsdSourceKind::DsdiffDst,
             tonepoet_pipeline::DsdInputFrontEnd::DsdiffDst { .. },
+        ) => {}
+        (
+            DsdSourceKind::SacdTrack {
+                frame_format: tonepoet_pipeline::SacdFrameEncoding::Dsd,
+                ..
+            },
+            tonepoet_pipeline::DsdInputFrontEnd::SacdDsd { .. },
+        ) => {}
+        (
+            DsdSourceKind::SacdTrack {
+                frame_format: tonepoet_pipeline::SacdFrameEncoding::Dst,
+                ..
+            },
+            tonepoet_pipeline::DsdInputFrontEnd::SacdDst { .. },
         ) => {}
         (source_kind, front_end) => panic!(
             "Reference source-front-end plan mismatch: source={source_kind:?} front_end={front_end:?}"
@@ -6889,26 +7051,631 @@ fn qualify_source_front_end_planner_render(
     render_args_sha256
 }
 
-fn write_predictive_dst_source_front_end_fixture(path: &Path) -> &'static [u8] {
-    const ENCODED: &[u8] = include_bytes!(concat!(
+fn write_predictive_dst_source_front_end_fixture(
+    path: &Path,
+    channels: u16,
+) -> &'static [u8] {
+    const ENCODED_STEREO: &[u8] = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/crates/sacd-rs/src/dst/fixtures/frame_001.dst.bin"
     ));
-    const EXPECTED_DSD: &[u8] = include_bytes!(concat!(
+    const EXPECTED_STEREO: &[u8] = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/crates/sacd-rs/src/dst/fixtures/frame_001.dsd.bin"
     ));
+    const ENCODED_SIX_CHANNEL: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/crates/sacd-rs/src/dst/fixtures/frame_001_6ch.dst.bin"
+    ));
+    const EXPECTED_SIX_CHANNEL: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/crates/sacd-rs/src/dst/fixtures/frame_001_6ch.dsd.bin"
+    ));
+    let (encoded, expected) = match channels {
+        2 => (ENCODED_STEREO, EXPECTED_STEREO),
+        6 => (ENCODED_SIX_CHANNEL, EXPECTED_SIX_CHANNEL),
+        _ => panic!("predictive source-front-end fixture only defines 2ch and 6ch oracles"),
+    };
 
     let file = File::create(path).expect("create predictive DSDIFF/DST qualification fixture");
-    let mut writer = sacd_rs::dff_dst_writer::DffDstWriter::new(file, 2, 2_822_400)
+    let channel_count = u8::try_from(channels).expect("SACD fixture channel count fits u8");
+    let mut writer = sacd_rs::dff_dst_writer::DffDstWriter::new(file, channel_count, 2_822_400)
         .expect("create predictive DSDIFF/DST qualification writer");
     writer
-        .write_encoded_frame(ENCODED, EXPECTED_DSD)
+        .write_encoded_frame(encoded, expected)
         .expect("write pinned predictive DST frame with DSTC");
     writer
         .finish()
         .expect("finish predictive DSDIFF/DST qualification fixture");
-    EXPECTED_DSD
+    expected
+}
+
+fn reference_sacd_packet_info(frame_start: bool, payload_len: usize) -> [u8; 2] {
+    assert!(payload_len <= 0x07ff);
+    let len = payload_len as u16;
+    [
+        ((frame_start as u8) << 7)
+            | ((sacd_rs::frame::DATA_TYPE_AUDIO & 0x07) << 3)
+            | (((len >> 8) as u8) & 0x07),
+        (len & 0xff) as u8,
+    ]
+}
+
+fn reference_sacd_dsd_sectors(frame: &[u8], frame_number: u8) -> Vec<Vec<u8>> {
+    const SECTOR_SIZE: usize = 2048;
+    const FIRST_PAYLOAD: usize = 2000;
+    let mut sectors = Vec::new();
+    let first_len = frame.len().min(FIRST_PAYLOAD);
+    let mut first = vec![0_u8; SECTOR_SIZE];
+    first[0] = (1 << 2) | (1 << 5);
+    first[1..3].copy_from_slice(&reference_sacd_packet_info(true, first_len));
+    // Frame info: timecode minutes, seconds, frames. The extractor keeps only
+    // sectors whose timecode falls inside the track's TOC window.
+    first[3..6].copy_from_slice(&[0, 0, frame_number]);
+    first[6..6 + first_len].copy_from_slice(&frame[..first_len]);
+    sectors.push(first);
+
+    let mut offset = first_len;
+    while offset < frame.len() {
+        let len = (frame.len() - offset).min(FIRST_PAYLOAD);
+        let mut sector = vec![0_u8; SECTOR_SIZE];
+        sector[0] = 1 << 5;
+        sector[1..3].copy_from_slice(&reference_sacd_packet_info(false, len));
+        sector[3..3 + len].copy_from_slice(&frame[offset..offset + len]);
+        sectors.push(sector);
+        offset += len;
+    }
+    sectors
+}
+
+fn reference_sacd_dst_sectors(payload: &[u8], channels: u16, frame_number: u8) -> Vec<Vec<u8>> {
+    const SECTOR_SIZE: usize = 2048;
+    const FIRST_PAYLOAD: usize = 2041;
+    const CONTINUATION_PAYLOAD: usize = 2045;
+    let first_len = payload.len().min(FIRST_PAYLOAD);
+    let remaining = payload.len().saturating_sub(first_len);
+    let continuation_count = remaining.div_ceil(CONTINUATION_PAYLOAD);
+    let sector_count = u8::try_from(1 + continuation_count)
+        .expect("synthetic SACD DST frame sector count fits u8");
+    let channel_bits = match channels {
+        6 => 0b0000_0010,
+        5 => 0b0000_0001,
+        2 => 0,
+        _ => panic!("SACD qualification DST fixture requires 2, 5, or 6 channels"),
+    };
+
+    let mut first = vec![0_u8; SECTOR_SIZE];
+    first[0] = 1 | (1 << 2) | (1 << 5);
+    first[1..3].copy_from_slice(&reference_sacd_packet_info(true, first_len));
+    first[3..7].copy_from_slice(&[0, 0, frame_number, ((sector_count & 0x1f) << 2) | channel_bits]);
+    first[7..7 + first_len].copy_from_slice(&payload[..first_len]);
+    let mut sectors = vec![first];
+
+    let mut offset = first_len;
+    while offset < payload.len() {
+        let len = (payload.len() - offset).min(CONTINUATION_PAYLOAD);
+        let mut sector = vec![0_u8; SECTOR_SIZE];
+        sector[0] = 1 | (1 << 5);
+        sector[1..3].copy_from_slice(&reference_sacd_packet_info(false, len));
+        sector[3..3 + len].copy_from_slice(&payload[offset..offset + len]);
+        sectors.push(sector);
+        offset += len;
+    }
+    sectors
+}
+
+fn write_reference_sacd_source_front_end_fixture(
+    path: &Path,
+    area: SacdArea,
+    frame_encoding: tonepoet_pipeline::SacdFrameEncoding,
+    channels: u16,
+) -> Vec<u8> {
+    const SECTOR_SIZE: u64 = 2048;
+    const AREA_LSN: u32 = 540;
+    const AUDIO_LSN: u32 = 650;
+    const DSD_STEREO: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/crates/sacd-rs/src/dst/fixtures/frame_001.dsd.bin"
+    ));
+    const DSD_SIX_CHANNEL: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/crates/sacd-rs/src/dst/fixtures/frame_001_6ch.dsd.bin"
+    ));
+    const DST_STEREO: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/crates/sacd-rs/src/dst/fixtures/frame_001.dst.bin"
+    ));
+    const DST_SIX_CHANNEL: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/crates/sacd-rs/src/dst/fixtures/frame_001_6ch.dst.bin"
+    ));
+
+    let expected_dsd = match channels {
+        2 => DSD_STEREO.to_vec(),
+        5 => DSD_SIX_CHANNEL
+            .chunks_exact(6)
+            .flat_map(|cluster| cluster[..5].iter().copied())
+            .collect::<Vec<_>>(),
+        6 => DSD_SIX_CHANNEL.to_vec(),
+        _ => panic!("SACD source-front-end fixture only defines stereo, five-, and six-channel oracles"),
+    };
+    let sectors = match frame_encoding {
+        tonepoet_pipeline::SacdFrameEncoding::Dsd => reference_sacd_dsd_sectors(&expected_dsd, 0),
+        tonepoet_pipeline::SacdFrameEncoding::Dst => {
+            let encoded = match channels {
+                2 => DST_STEREO.to_vec(),
+                5 => sacd_rs::dst::encode_uncompressed_frame_interleaved_with_rate(
+                    &expected_dsd,
+                    5,
+                    sacd_rs::dst::DstRate::Dsd64,
+                )
+                .expect("encode five-channel standards-literal DST fixture"),
+                6 => DST_SIX_CHANNEL.to_vec(),
+                _ => unreachable!(),
+            };
+            reference_sacd_dst_sectors(&encoded, channels, 0)
+        }
+    };
+    let track_sector_count = u32::try_from(sectors.len()).expect("synthetic SACD track fits u32");
+
+    let file = File::create(path).expect("create SACD source-front-end fixture");
+    file.set_len(700 * SECTOR_SIZE)
+        .expect("size SACD source-front-end fixture");
+    drop(file);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("reopen SACD source-front-end fixture");
+
+    let mut master = vec![0_u8; 0xa8];
+    master[0..8].copy_from_slice(b"SACDMTOC");
+    master[0x08] = 1;
+    master[0x09] = 20;
+    master[0x10..0x12].copy_from_slice(&1_u16.to_be_bytes());
+    master[0x12..0x14].copy_from_slice(&1_u16.to_be_bytes());
+    match area {
+        SacdArea::Stereo => {
+            master[0x40..0x44].copy_from_slice(&AREA_LSN.to_be_bytes());
+            master[0x54..0x56].copy_from_slice(&3_u16.to_be_bytes());
+        }
+        SacdArea::MultiChannel => {
+            master[0x48..0x4c].copy_from_slice(&AREA_LSN.to_be_bytes());
+            master[0x56..0x58].copy_from_slice(&3_u16.to_be_bytes());
+        }
+    }
+    file.seek(SeekFrom::Start(510 * SECTOR_SIZE)).unwrap();
+    file.write_all(&master).unwrap();
+
+    let mut area_toc = vec![0_u8; SECTOR_SIZE as usize];
+    area_toc[0..8].copy_from_slice(match area {
+        SacdArea::Stereo => b"TWOCHTOC",
+        SacdArea::MultiChannel => b"MULCHTOC",
+    });
+    area_toc[0x08] = 1;
+    area_toc[0x09] = 20;
+    area_toc[0x0a..0x0c].copy_from_slice(&3_u16.to_be_bytes());
+    area_toc[0x10..0x14].copy_from_slice(&64_000_u32.to_be_bytes());
+    area_toc[0x14] = 0x04;
+    area_toc[0x15] = match frame_encoding {
+        tonepoet_pipeline::SacdFrameEncoding::Dsd => 2,
+        tonepoet_pipeline::SacdFrameEncoding::Dst => 0,
+    };
+    area_toc[0x20] = u8::try_from(channels).expect("SACD channel count fits u8");
+    area_toc[0x21] = if channels > 2 { 5 << 3 } else { 0 };
+    area_toc[0x22] = u8::try_from(channels).expect("SACD channel count fits u8");
+    area_toc[0x42] = 1; // one 1/75-second DSD frame
+    area_toc[0x45] = 1;
+    area_toc[0x48..0x4c].copy_from_slice(&AUDIO_LSN.to_be_bytes());
+    area_toc[0x4c..0x50]
+        .copy_from_slice(&(AUDIO_LSN + track_sector_count).to_be_bytes());
+    file.seek(SeekFrom::Start(u64::from(AREA_LSN) * SECTOR_SIZE)).unwrap();
+    file.write_all(&area_toc).unwrap();
+
+    let mut trl1 = vec![0_u8; SECTOR_SIZE as usize];
+    trl1[0..8].copy_from_slice(b"SACDTRL1");
+    trl1[8..12].copy_from_slice(&AUDIO_LSN.to_be_bytes());
+    let length_offset = 8 + 255 * 4;
+    trl1[length_offset..length_offset + 4]
+        .copy_from_slice(&track_sector_count.to_be_bytes());
+    file.seek(SeekFrom::Start(u64::from(AREA_LSN + 1) * SECTOR_SIZE)).unwrap();
+    file.write_all(&trl1).unwrap();
+
+    let mut trl2 = vec![0_u8; SECTOR_SIZE as usize];
+    trl2[0..8].copy_from_slice(b"SACDTRL2");
+    let duration_offset = 8 + 255 * 4;
+    trl2[duration_offset + 2] = 1;
+    file.seek(SeekFrom::Start(u64::from(AREA_LSN + 2) * SECTOR_SIZE)).unwrap();
+    file.write_all(&trl2).unwrap();
+
+    for (index, sector) in sectors.iter().enumerate() {
+        let lsn = u64::from(AUDIO_LSN) + u64::try_from(index).expect("sector index fits u64");
+        file.seek(SeekFrom::Start(lsn * SECTOR_SIZE)).unwrap();
+        file.write_all(sector).unwrap();
+    }
+    file.sync_all().expect("sync SACD source-front-end fixture");
+    expected_dsd
+}
+
+fn write_reference_sacd_multi_track_front_end_fixture(
+    path: &Path,
+    area: SacdArea,
+    frame_encoding: tonepoet_pipeline::SacdFrameEncoding,
+    channels: u16,
+) -> Vec<Vec<u8>> {
+    const SECTOR_SIZE: u64 = 2048;
+    const AREA_LSN: u32 = 540;
+    const AUDIO_LSN: u32 = 650;
+    const DSD_STEREO: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/crates/sacd-rs/src/dst/fixtures/frame_001.dsd.bin"
+    ));
+    const DSD_SIX_CHANNEL: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/crates/sacd-rs/src/dst/fixtures/frame_001_6ch.dsd.bin"
+    ));
+
+    let first = match channels {
+        2 => DSD_STEREO.to_vec(),
+        6 => DSD_SIX_CHANNEL.to_vec(),
+        _ => panic!("multi-track SACD regression fixture supports stereo or six-channel"),
+    };
+    let mut second = first.clone();
+    for byte in &mut second {
+        *byte ^= 0x55;
+    }
+    let expected_tracks = vec![first, second];
+    let encoded_tracks = expected_tracks
+        .iter()
+        .enumerate()
+        .map(|(track_index, expected)| {
+            let frame_number = u8::try_from(track_index).expect("fixture track index fits u8");
+            match frame_encoding {
+                tonepoet_pipeline::SacdFrameEncoding::Dsd => {
+                    reference_sacd_dsd_sectors(expected, frame_number)
+                }
+                tonepoet_pipeline::SacdFrameEncoding::Dst => {
+                    let encoded = sacd_rs::dst::encode_uncompressed_frame_interleaved_with_rate(
+                        expected,
+                        u8::try_from(channels).expect("SACD fixture channel count fits u8"),
+                        sacd_rs::dst::DstRate::Dsd64,
+                    )
+                    .expect("encode multi-track standards-literal DST fixture");
+                    reference_sacd_dst_sectors(&encoded, channels, frame_number)
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+    let lengths = encoded_tracks
+        .iter()
+        .map(|sectors| u32::try_from(sectors.len()).expect("SACD track sector count fits u32"))
+        .collect::<Vec<_>>();
+    let second_lsn = AUDIO_LSN + lengths[0];
+    let end_lsn = second_lsn + lengths[1];
+
+    let file = File::create(path).expect("create multi-track SACD fixture");
+    file.set_len(800 * SECTOR_SIZE)
+        .expect("size multi-track SACD fixture");
+    drop(file);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("reopen multi-track SACD fixture");
+
+    let mut master = vec![0_u8; 0xa8];
+    master[0..8].copy_from_slice(b"SACDMTOC");
+    master[0x08] = 1;
+    master[0x09] = 20;
+    master[0x10..0x12].copy_from_slice(&1_u16.to_be_bytes());
+    master[0x12..0x14].copy_from_slice(&1_u16.to_be_bytes());
+    match area {
+        SacdArea::Stereo => {
+            master[0x40..0x44].copy_from_slice(&AREA_LSN.to_be_bytes());
+            master[0x54..0x56].copy_from_slice(&3_u16.to_be_bytes());
+        }
+        SacdArea::MultiChannel => {
+            master[0x48..0x4c].copy_from_slice(&AREA_LSN.to_be_bytes());
+            master[0x56..0x58].copy_from_slice(&3_u16.to_be_bytes());
+        }
+    }
+    file.seek(SeekFrom::Start(510 * SECTOR_SIZE)).unwrap();
+    file.write_all(&master).unwrap();
+
+    let mut area_toc = vec![0_u8; SECTOR_SIZE as usize];
+    area_toc[0..8].copy_from_slice(match area {
+        SacdArea::Stereo => b"TWOCHTOC",
+        SacdArea::MultiChannel => b"MULCHTOC",
+    });
+    area_toc[0x08] = 1;
+    area_toc[0x09] = 20;
+    area_toc[0x0a..0x0c].copy_from_slice(&3_u16.to_be_bytes());
+    area_toc[0x10..0x14].copy_from_slice(&64_000_u32.to_be_bytes());
+    area_toc[0x14] = 0x04;
+    area_toc[0x15] = match frame_encoding {
+        tonepoet_pipeline::SacdFrameEncoding::Dsd => 2,
+        tonepoet_pipeline::SacdFrameEncoding::Dst => 0,
+    };
+    area_toc[0x20] = u8::try_from(channels).expect("channel count fits u8");
+    area_toc[0x21] = if channels > 2 { 5 << 3 } else { 0 };
+    area_toc[0x22] = u8::try_from(channels).expect("channel count fits u8");
+    area_toc[0x42] = 2; // two 1/75-second tracks
+    area_toc[0x45] = 2;
+    area_toc[0x48..0x4c].copy_from_slice(&AUDIO_LSN.to_be_bytes());
+    area_toc[0x4c..0x50].copy_from_slice(&end_lsn.to_be_bytes());
+    file.seek(SeekFrom::Start(u64::from(AREA_LSN) * SECTOR_SIZE)).unwrap();
+    file.write_all(&area_toc).unwrap();
+
+    let mut trl1 = vec![0_u8; SECTOR_SIZE as usize];
+    trl1[0..8].copy_from_slice(b"SACDTRL1");
+    trl1[8..12].copy_from_slice(&AUDIO_LSN.to_be_bytes());
+    trl1[12..16].copy_from_slice(&second_lsn.to_be_bytes());
+    let length_base = 8 + 255 * 4;
+    trl1[length_base..length_base + 4].copy_from_slice(&lengths[0].to_be_bytes());
+    trl1[length_base + 4..length_base + 8].copy_from_slice(&lengths[1].to_be_bytes());
+    file.seek(SeekFrom::Start(u64::from(AREA_LSN + 1) * SECTOR_SIZE)).unwrap();
+    file.write_all(&trl1).unwrap();
+
+    let mut trl2 = vec![0_u8; SECTOR_SIZE as usize];
+    trl2[0..8].copy_from_slice(b"SACDTRL2");
+    trl2[8 + 2] = 0;
+    trl2[12 + 2] = 1;
+    let duration_base = 8 + 255 * 4;
+    trl2[duration_base + 2] = 1;
+    trl2[duration_base + 4 + 2] = 1;
+    file.seek(SeekFrom::Start(u64::from(AREA_LSN + 2) * SECTOR_SIZE)).unwrap();
+    file.write_all(&trl2).unwrap();
+
+    for (track_index, sectors) in encoded_tracks.iter().enumerate() {
+        let base = if track_index == 0 { AUDIO_LSN } else { second_lsn };
+        for (sector_index, sector) in sectors.iter().enumerate() {
+            let lsn = u64::from(base) + u64::try_from(sector_index).expect("sector index fits u64");
+            file.seek(SeekFrom::Start(lsn * SECTOR_SIZE)).unwrap();
+            file.write_all(sector).unwrap();
+        }
+    }
+    file.sync_all().expect("sync multi-track SACD fixture");
+    expected_tracks
+}
+
+fn qualify_production_shaped_sacd_contained_album_case(
+    sox: &Path,
+    ffmpeg: &Path,
+    root: &Path,
+    key: &str,
+    area: SacdArea,
+    frame_encoding: tonepoet_pipeline::SacdFrameEncoding,
+    channels: u16,
+) -> Value {
+    let case_root = root.join(format!("sacd-contained-album-{key}"));
+    fs::create_dir_all(&case_root).expect("create contained SACD qualification directory");
+    let iso = case_root.join("source.iso");
+    let expected_tracks = write_reference_sacd_multi_track_front_end_fixture(
+        &iso,
+        area,
+        frame_encoding,
+        channels,
+    );
+
+    let mut request = w64_planner_request(&case_root, 176_400, PcmBitDepth::Int24);
+    request.job_id = format!("sacd-contained-{key}");
+    request.item_id = request.job_id.clone();
+    request.container = iso.clone();
+    request.source.sacd_area = Some(area);
+    request.source.track_selection = TrackSelection::All;
+    request.settings.target_format = AudioFormat::Flac;
+    request.container_extension = None;
+    request.stages.metadata = StageRequirement::Disabled;
+
+    let staging_root = case_root.join("staging");
+    fs::create_dir_all(&staging_root).expect("create contained SACD staging");
+    let staging = StagingDir::new(staging_root.clone(), request.job_id.clone());
+    let runner = StubToolRunner::new();
+    let cancel = CancellationToken::new();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build contained SACD qualification runtime");
+
+    let mut track_evidence = Vec::new();
+    for track_index in 0_u32..2 {
+        let track = PreparedTrack {
+            id: TrackId {
+                source_ordinal: track_index + 1,
+                disc_number: None,
+                track_number: track_index + 1,
+            },
+            source_ref: TrackSourceRef::SacdTrack {
+                iso: iso.clone(),
+                track_index,
+                area,
+            },
+            metadata: TrackMetadata {
+                track_number: Some(track_index + 1),
+                ..TrackMetadata::default()
+            },
+            expected_samples: None,
+            sample_rate: Some(2_822_400),
+            source_audio: SourceAudioDescriptor::from_scalar(
+                Some(2_822_400),
+                None,
+                Some(SourceAudioCoding::Dsd),
+            ),
+            bit_depth: None,
+            warnings: Vec::new(),
+        };
+
+        let deferred = runtime
+            .block_on(realize_track(
+                &track.source_ref,
+                &request,
+                &staging,
+                &runner,
+                &cancel,
+                None,
+            ))
+            .expect("Reference SACD realization must defer extraction");
+        assert!(!deferred.exists(), "deferred Reference carrier must not exist before attestation");
+        assert!(deferred.starts_with(staging_root.join("reference-deferred-sacd")));
+
+        let initial_request = plan_request_for_track(
+            &request,
+            &track,
+            &deferred,
+            &case_root.join(format!("initial-{track_index}.flac")),
+            case_root.join(format!("initial-work-{track_index}")),
+        )
+        .expect("TOC-authoritative deferred SACD plan request");
+        assert_eq!(
+            initial_request.source.duration,
+            Some(Duration::from_nanos(13_333_333)),
+            "1/75-second SACD duration must conservatively round upward",
+        );
+        assert!(matches!(
+            &initial_request.reference_programme_scope,
+            ReferenceProgrammeScope::ContainedAlbum { expected_members, .. }
+                if expected_members.get() == 2
+        ));
+        let initial_plan = plan_conversion(&initial_request)
+            .expect("deferred SACD must reach a Ready Reference plan before extraction");
+        assert!(matches!(
+            initial_plan.reference.as_ref().expect("Reference plan").gain_policy,
+            ResolvedGainPolicy::TruePeakNormalize {
+                scope: TruePeakScope::Album,
+                bound_gain: None,
+                ..
+            }
+        ));
+        assert!(!deferred.exists(), "initial planning must not extract the SACD source");
+
+        let materialize_root = case_root.join(format!("materialized-{track_index}"));
+        fs::create_dir_all(&materialize_root).expect("create contained SACD materialization root");
+        let (source_kind, materialized) = qualify_reference_sacd_source_materialization(
+            &iso,
+            track_index,
+            area,
+            &materialize_root,
+        )
+        .expect("production SACD materialization after deferred admission");
+        let decoded = collect_decoded_dsd(&materialized.materialized_path);
+        assert_eq!(decoded.as_slice(), expected_tracks[track_index as usize].as_slice());
+
+        let replanned_request = plan_request_for_track(
+            &request,
+            &track,
+            &materialized.materialized_path,
+            &case_root.join(format!("replanned-{track_index}.flac")),
+            case_root.join(format!("replanned-work-{track_index}")),
+        )
+        .expect("materialized SACD must re-enter Reference planning");
+        let replanned = plan_conversion(&replanned_request)
+            .expect("materialized SACD Reference replan must remain Ready");
+        assert!(matches!(
+            replanned.reference.as_ref().expect("Reference replan").gain_policy,
+            ResolvedGainPolicy::TruePeakNormalize {
+                scope: TruePeakScope::Album,
+                bound_gain: None,
+                ..
+            }
+        ));
+        let render_args_sha256 = qualify_source_front_end_planner_render(
+            sox,
+            ffmpeg,
+            &case_root.join(format!("render-{track_index}")),
+            &materialized.materialized_path,
+            2_822_400,
+            channels,
+            AudioFormat::Dsf,
+            source_kind,
+        );
+        track_evidence.push(serde_json::json!({
+            "track_index_zero_based": track_index,
+            "toc_duration_ns": 13_333_333_u64,
+            "deferred_placeholder_absent": true,
+            "initial_plan_ready": true,
+            "contained_album_members": 2,
+            "materialized_sha256": materialized.canonical_materialization_sha256.to_hex(),
+            "replan_ready": true,
+            "render_args_sha256": render_args_sha256,
+        }));
+    }
+
+    serde_json::json!({
+        "status": "passed",
+        "area": match area { SacdArea::Stereo => "stereo", SacdArea::MultiChannel => "multichannel" },
+        "frame_encoding": match frame_encoding { tonepoet_pipeline::SacdFrameEncoding::Dsd => "dsd", tonepoet_pipeline::SacdFrameEncoding::Dst => "dst" },
+        "channels": channels,
+        "selected_members": 2,
+        "programme_scope": "contained_album",
+        "gain_scope": "album_unbound_before_prepass",
+        "tracks": track_evidence,
+    })
+}
+
+fn qualify_sacd_source_front_end_case(
+    sox: &Path,
+    ffmpeg: &Path,
+    root: &Path,
+    key: &str,
+    area: SacdArea,
+    frame_encoding: tonepoet_pipeline::SacdFrameEncoding,
+    channels: u16,
+) -> Value {
+    let case_root = root.join(format!("sacd-{key}"));
+    let materialize_root = case_root.join("materialized");
+    fs::create_dir_all(&materialize_root).expect("create SACD source-front-end case directory");
+    let iso = case_root.join("source.iso");
+    let expected_dsd = write_reference_sacd_source_front_end_fixture(
+        &iso,
+        area,
+        frame_encoding,
+        channels,
+    );
+    let iso_sha256 = sha256_hex(&fs::read(&iso).expect("read SACD qualification ISO"));
+    let (source_kind, materialized) = qualify_reference_sacd_source_materialization(
+        &iso,
+        0,
+        area,
+        &materialize_root,
+    )
+    .expect("production SACD Reference materialization");
+    assert_eq!(materialized.source_content_sha256.to_hex(), iso_sha256);
+    let decoded_materialized = collect_decoded_dsd(&materialized.materialized_path);
+    assert_eq!(decoded_materialized.as_slice(), expected_dsd.as_slice());
+    match &source_kind {
+        DsdSourceKind::SacdTrack {
+            frame_format,
+            selection,
+        } => {
+            assert_eq!(*frame_format, frame_encoding);
+            assert_eq!(selection.channels, channels);
+            assert_eq!(selection.track_index_zero_based, 0);
+        }
+        other => panic!("SACD qualification returned non-SACD source kind: {other:?}"),
+    }
+    let render_args_sha256 = qualify_source_front_end_planner_render(
+        sox,
+        ffmpeg,
+        &case_root,
+        &materialized.materialized_path,
+        2_822_400,
+        channels,
+        AudioFormat::Dsf,
+        source_kind.clone(),
+    );
+    serde_json::json!({
+        "status": "passed",
+        "area": match area { SacdArea::Stereo => "stereo", SacdArea::MultiChannel => "multichannel" },
+        "frame_encoding": match frame_encoding { tonepoet_pipeline::SacdFrameEncoding::Dsd => "dsd", tonepoet_pipeline::SacdFrameEncoding::Dst => "dst" },
+        "channels": channels,
+        "source_iso_sha256": iso_sha256,
+        "canonical_materialized_sha256": materialized.canonical_materialization_sha256.to_hex(),
+        "oracle_dsd_sha256": sha256_hex(&expected_dsd),
+        "materialization_identity_digest": materialized.materialization_identity_digest.to_hex(),
+        "production_iso_content_hash_bound": true,
+        "production_toc_selection_revalidated_before_extraction": true,
+        "canonical_dsf_readback": "passed",
+        "planner_render": "passed",
+        "render_args_sha256": render_args_sha256,
+    })
 }
 
 fn qualify_production_source_front_end_integration() -> Value {
@@ -6933,7 +7700,7 @@ fn qualify_production_source_front_end_integration() -> Value {
         ),
     ] {
         for source_rate_hz in [2_822_400_u32, 5_644_800, 11_289_600] {
-            for channels in [1_u16, 2] {
+            for channels in 1_u16..=6 {
                 let case_root = root.join(format!(
                     "native-{source_kind_key}-{source_rate_hz}-{channels}ch"
                 ));
@@ -6997,14 +7764,14 @@ fn qualify_production_source_front_end_integration() -> Value {
             }
         }
     }
-    assert_eq!(native_cases.len(), 12);
+    assert_eq!(native_cases.len(), 36);
 
     let dst_root = root.join("dsdiff-dst-dsd64-stereo");
     let dst_materialize_root = dst_root.join("materialized");
     fs::create_dir_all(&dst_materialize_root)
         .expect("create DSDIFF/DST source-front-end case directory");
     let dst_source = dst_root.join("source.dff");
-    let expected_dsd = write_predictive_dst_source_front_end_fixture(&dst_source);
+    let expected_dsd = write_predictive_dst_source_front_end_fixture(&dst_source, 2);
 
     let mut dst_source_file = File::open(&dst_source).expect("open DSDIFF/DST source fixture");
     let dst_source_info = sacd_rs::dsd_file::inspect_dsd_container(&mut dst_source_file)
@@ -7099,6 +7866,46 @@ fn qualify_production_source_front_end_integration() -> Value {
         dst_kind,
     );
 
+    let dst_six_root = root.join("dsdiff-dst-dsd64-six-channel");
+    let dst_six_materialize_root = dst_six_root.join("materialized");
+    fs::create_dir_all(&dst_six_materialize_root)
+        .expect("create six-channel DSDIFF/DST source-front-end case directory");
+    let dst_six_source = dst_six_root.join("source.dff");
+    let dst_six_expected = write_predictive_dst_source_front_end_fixture(&dst_six_source, 6);
+    let dst_six_sha256 = sha256_hex(
+        &fs::read(&dst_six_source).expect("read six-channel predictive DSDIFF/DST source fixture"),
+    );
+    let dst_six_kind = DsdSourceKind::DsdiffDst;
+    let dst_six_materialized = qualify_reference_source_materialization(
+        &dst_six_kind,
+        &dst_six_source,
+        &dst_six_materialize_root,
+    )
+    .expect("production six-channel DSDIFF/DST source materialization");
+    let mut dst_six_canonical = File::open(&dst_six_materialized.materialized_path)
+        .expect("open six-channel canonical DSDIFF/DSD materialization");
+    let dst_six_info = sacd_rs::dsd_file::inspect_dsd_container(&mut dst_six_canonical)
+        .expect("inspect six-channel canonical DSDIFF/DSD materialization");
+    assert_eq!(dst_six_info.compression, sacd_rs::dsd_file::DsdCompression::Dsd);
+    assert_eq!(dst_six_info.sample_rate, 2_822_400);
+    assert_eq!(dst_six_info.channel_count, 6);
+    let dst_six_decoded = collect_decoded_dsd(&dst_six_materialized.materialized_path);
+    assert_eq!(
+        dst_six_decoded.as_slice(),
+        dst_six_expected,
+        "six-channel DSDIFF/DST canonical materialization must match the commissioned oracle",
+    );
+    let dst_six_render_args_sha256 = qualify_source_front_end_planner_render(
+        &sox,
+        &ffmpeg,
+        &dst_six_root,
+        &dst_six_materialized.materialized_path,
+        2_822_400,
+        6,
+        AudioFormat::Dff,
+        dst_six_kind,
+    );
+
     serde_json::json!({
         "schema": "tonepoet-reference-production-source-front-end-integration/v1",
         "status": "passed",
@@ -7119,8 +7926,53 @@ fn qualify_production_source_front_end_integration() -> Value {
             "materialization_identity_digest": baseline_identity.to_hex(),
             "materialization_identity_tamper_rejected": true,
         },
-        "sacd_dsd": "unavailable:DSD-REF-P0-023",
-        "sacd_dst": "unavailable:DSD-REF-P0-023",
+        "dsdiff_dst_six_channel": {
+            "source_rate_hz": 2_822_400,
+            "channels": 6,
+            "source_sha256": dst_six_sha256,
+            "canonical_materialized_sha256": dst_six_materialized.canonical_materialization_sha256.to_hex(),
+            "oracle_dsd_sha256": sha256_hex(dst_six_expected),
+            "cmpr_classification": "passed",
+            "dstc_verification": "passed",
+            "canonical_dff_readback": "passed",
+            "planner_render": "passed",
+            "render_args_sha256": dst_six_render_args_sha256,
+            "materialization_identity_digest": dst_six_materialized.materialization_identity_digest.to_hex(),
+        },
+        "sacd": {
+            "stereo_dsd": qualify_sacd_source_front_end_case(
+                &sox, &ffmpeg, root, "stereo-dsd", SacdArea::Stereo,
+                tonepoet_pipeline::SacdFrameEncoding::Dsd, 2,
+            ),
+            "stereo_dst": qualify_sacd_source_front_end_case(
+                &sox, &ffmpeg, root, "stereo-dst", SacdArea::Stereo,
+                tonepoet_pipeline::SacdFrameEncoding::Dst, 2,
+            ),
+            "multichannel_five_dsd": qualify_sacd_source_front_end_case(
+                &sox, &ffmpeg, root, "multichannel-five-dsd", SacdArea::MultiChannel,
+                tonepoet_pipeline::SacdFrameEncoding::Dsd, 5,
+            ),
+            "multichannel_five_dst": qualify_sacd_source_front_end_case(
+                &sox, &ffmpeg, root, "multichannel-five-dst", SacdArea::MultiChannel,
+                tonepoet_pipeline::SacdFrameEncoding::Dst, 5,
+            ),
+            "multichannel_six_dsd": qualify_sacd_source_front_end_case(
+                &sox, &ffmpeg, root, "multichannel-six-dsd", SacdArea::MultiChannel,
+                tonepoet_pipeline::SacdFrameEncoding::Dsd, 6,
+            ),
+            "multichannel_six_dst": qualify_sacd_source_front_end_case(
+                &sox, &ffmpeg, root, "multichannel-six-dst", SacdArea::MultiChannel,
+                tonepoet_pipeline::SacdFrameEncoding::Dst, 6,
+            ),
+            "production_shaped_contained_album_stereo_dsd": qualify_production_shaped_sacd_contained_album_case(
+                &sox, &ffmpeg, root, "stereo-dsd", SacdArea::Stereo,
+                tonepoet_pipeline::SacdFrameEncoding::Dsd, 2,
+            ),
+            "production_shaped_contained_album_multichannel_dst": qualify_production_shaped_sacd_contained_album_case(
+                &sox, &ffmpeg, root, "multichannel-dst", SacdArea::MultiChannel,
+                tonepoet_pipeline::SacdFrameEncoding::Dst, 6,
+            ),
+        },
     })
 }
 
@@ -7186,22 +8038,22 @@ fn qualify_pinned_reference_toolchain_and_profile_responses() -> Value {
 
     let qualification: Value = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v17.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v18.json"
     )))
     .expect("qualification JSON parses");
     let manifest_bytes = &include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v17.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v18.json"
     ))[..];
     let candidate_bytes = &include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v17_candidate.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v18_candidate.json"
     ))[..];
     match qualification["status"].as_str() {
         Some("qualification_candidate") => {
             assert_eq!(
                 manifest_bytes, candidate_bytes,
-                "the unpromoted v17 manifest must equal its preserved candidate snapshot"
+                "the unpromoted v18 manifest must equal its preserved candidate snapshot"
             );
             assert!(qualification["release_certification"]["report_sha256"].is_null());
             assert!(
@@ -7216,7 +8068,7 @@ fn qualify_pinned_reference_toolchain_and_profile_responses() -> Value {
                 .expect("promoted policy binds candidate manifest digest");
             assert_eq!(candidate_digest, sha256_hex(candidate_bytes));
         }
-        other => panic!("unexpected v17 policy status: {other:?}"),
+        other => panic!("unexpected v18 policy status: {other:?}"),
     }
     assert_eq!(qualification["sox_ng"]["revision"], "9ed22fb3d813d6c02f67c254e57d162cee014a30");
     assert_eq!(
@@ -7312,6 +8164,10 @@ fn qualify_pinned_reference_toolchain_and_profile_responses() -> Value {
     let mut explicit_profile_results = Vec::new();
     for (name, source_rate, target_rate, passband, transition, center, stopband) in [
         ("b3", 2_822_400, 88_200, 25_000, 10_000, 30_000, 35_000),
+        ("b4t_882_dsd128", 5_644_800, 88_200, 30_000, 14_000, 37_000, 44_000),
+        ("b4t_882_dsd256", 11_289_600, 88_200, 30_000, 14_000, 37_000, 44_000),
+        ("b4t_960_dsd128", 5_644_800, 96_000, 30_000, 18_000, 39_000, 48_000),
+        ("b4t_960_dsd256", 11_289_600, 96_000, 30_000, 18_000, 39_000, 48_000),
         ("b4", 5_644_800, 176_400, 30_000, 15_000, 37_500, 45_000),
         ("b4w", 5_644_800, 176_400, 35_000, 15_000, 42_500, 50_000),
         ("b5", 11_289_600, 176_400, 48_000, 22_000, 59_000, 70_000),
@@ -7643,7 +8499,7 @@ fn release_gate_evidence_output_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("target/dsd_reference_common_v17_release_gates")
+                .join("target/dsd_reference_common_v18_release_gates")
         })
 }
 
@@ -8192,13 +9048,13 @@ fn complete_p0_reference_qualification_report() {
 
     let candidate_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_common_v17_candidate.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_common_v18_candidate.json"
     ));
     let candidate: tonepoet_pipeline::ReferenceCommonQualificationV1 =
-        serde_json::from_slice(candidate_bytes).expect("v17 candidate manifest parses");
+        serde_json::from_slice(candidate_bytes).expect("v18 candidate manifest parses");
     candidate
         .validate_candidate_manifest()
-        .expect("v17 candidate manifest matches compiled Phase-5 contract");
+        .expect("v18 candidate manifest matches compiled qualification contract");
     let candidate_manifest_sha256 = sha256_hex(candidate_bytes);
 
     let forbidden_route_regression = assert_qualification_decode_route_table();
@@ -8238,16 +9094,22 @@ fn complete_p0_reference_qualification_report() {
     let source_front_end_results = qualify_production_source_front_end_integration();
     let profile_results = qualify_pinned_reference_toolchain_and_profile_responses();
 
+    let active_policy_bytes = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v18.json"
+    ));
+    let active_policy: Value =
+        serde_json::from_slice(active_policy_bytes).expect("active v18 policy evidence parses");
     let inherited_v16_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v16.json"
     ));
     let inherited_v16: Value =
         serde_json::from_slice(inherited_v16_bytes).expect("inherited v16 evidence parses");
-    let profile_cells = inherited_v16["cell_contract"]["profile_cells"]
+    let profile_cells = active_policy["cell_contract"]["profile_cells"]
         .as_array()
         .expect("profile cell table is an array");
-    let target_depth_cells = inherited_v16["cell_contract"]["target_depth_cells"]
+    let target_depth_cells = active_policy["cell_contract"]["target_depth_cells"]
         .as_array()
         .expect("target/depth cell table is an array");
     let supported_profile_cells = profile_cells
@@ -8382,7 +9244,7 @@ fn complete_p0_reference_qualification_report() {
         release_gate_result("Q02", &q02),
         release_gate_result("GAIN08", &gain08),
         release_gate_result("GAIN09", &gain09),
-        release_gate_result("wave64_integrity_80_cell", &w64_exact_integrity),
+        release_gate_result("wave64_integrity_300_cell", &w64_exact_integrity),
         release_gate_result("complete_reader", &complete_reader_evidence),
         release_gate_result("package_identity", &package_identity_evidence),
         release_gate_result("post_metadata_identity", &post_metadata_identity_evidence),
@@ -8409,8 +9271,8 @@ fn complete_p0_reference_qualification_report() {
         .expect("W64 qualification records expected malformed cells");
     assert_eq!(
         w64_exact_integrity["cell_count"].as_u64(),
-        Some(80),
-        "Phase-5 retains the complete 80-cell Wave64 characterization",
+        Some(300),
+        "v18 qualifies the complete 300-cell Wave64 characterization",
     );
     let positive_case_count = 1_u64
         + u64::try_from(package_case_count).expect("package case count fits u64")
@@ -8440,10 +9302,10 @@ fn complete_p0_reference_qualification_report() {
             &runtime_closure_fingerprint_sha256,
             Some(&metadata_mutation_closure_fingerprint_sha256),
         )
-        .expect("completed v17 report validates against both qualified closure variants");
+        .expect("completed v18 report validates against both qualified closure variants");
 
     let evidence_bundle = serde_json::json!({
-        "schema": "tonepoet-reference-common-v17-evidence/v1",
+        "schema": "tonepoet-reference-common-v18-evidence/v1",
         "status": "passed",
         "candidate_manifest_sha256": candidate_manifest_sha256,
         "runtime_closure_fingerprint_sha256": runtime_closure_fingerprint_sha256,
@@ -8454,7 +9316,7 @@ fn complete_p0_reference_qualification_report() {
             "Q02": q02,
             "GAIN08": gain08,
             "GAIN09": gain09,
-            "wave64_integrity_80_cell": w64_exact_integrity,
+            "wave64_integrity_300_cell": w64_exact_integrity,
             "complete_reader": complete_reader_evidence,
             "package_identity": package_identity_evidence,
             "post_metadata_identity": post_metadata_identity_evidence,
@@ -8484,7 +9346,7 @@ fn complete_p0_reference_qualification_report() {
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("target/dsd_reference_common_v17_evidence.json")
+                .join("target/dsd_reference_common_v18_evidence.json")
         });
     write_report_atomically(&evidence_path, &evidence_bundle);
 
@@ -8492,11 +9354,11 @@ fn complete_p0_reference_qualification_report() {
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("target/dsd_reference_common_v17_report.json")
+                .join("target/dsd_reference_common_v18_report.json")
         });
-    let report_value = serde_json::to_value(&report).expect("serialize v17 report value");
+    let report_value = serde_json::to_value(&report).expect("serialize v18 report value");
     write_report_atomically(&report_path, &report_value);
-    let report_bytes = fs::read(&report_path).expect("read exact installed v17 report bytes");
+    let report_bytes = fs::read(&report_path).expect("read exact installed v18 report bytes");
 
     let certification = tonepoet_pipeline::ReferenceReleaseCertificationV1 {
         schema_version: tonepoet_pipeline::REFERENCE_COMMON_QUALIFICATION_SCHEMA_VERSION,
@@ -8522,15 +9384,15 @@ fn complete_p0_reference_qualification_report() {
                 .metadata_mutation_closure_fingerprint_sha256
                 .as_deref(),
         )
-        .expect("v17 certification is derived from the exact matching completed report");
+        .expect("v18 certification is derived from the exact matching completed report");
     let certification_path = std::env::var_os("TONEPOET_DSD_REFERENCE_CERTIFICATION_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("target/dsd_reference_common_v17_certification.json")
+                .join("target/dsd_reference_common_v18_certification.json")
         });
     let certification_value =
-        serde_json::to_value(&certification).expect("serialize v17 certification value");
+        serde_json::to_value(&certification).expect("serialize v18 certification value");
     write_report_atomically(&certification_path, &certification_value);
 
     eprintln!(

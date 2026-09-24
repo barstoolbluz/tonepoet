@@ -428,18 +428,18 @@ impl ReferenceStreamedWavCapacityEvidenceV3 {
 
 
 /// Active common-model Reference qualification schema.
-pub const REFERENCE_COMMON_QUALIFICATION_SCHEMA_VERSION: u32 = 17;
+pub const REFERENCE_COMMON_QUALIFICATION_SCHEMA_VERSION: u32 = 18;
 /// Source-controlled unpromoted common-model candidate manifest.
 pub const REFERENCE_COMMON_CANDIDATE_MANIFEST_PATH: &str =
-    "qualification/dsd_reference_common_v17_candidate.json";
+    "qualification/dsd_reference_common_v18_candidate.json";
 /// Source-controlled qualification report. The checked-in report remains `not_run`
 /// until the exact candidate closure completes every release gate.
 pub const REFERENCE_COMMON_QUALIFICATION_REPORT_PATH: &str =
-    "qualification/dsd_reference_common_v17_report.json";
+    "qualification/dsd_reference_common_v18_report.json";
 /// Source-controlled release certification. The checked-in certification remains
 /// `not_run` until it is generated from the matching completed report.
 pub const REFERENCE_COMMON_RELEASE_CERTIFICATION_PATH: &str =
-    "qualification/dsd_reference_common_v17_certification.json";
+    "qualification/dsd_reference_common_v18_certification.json";
 /// Stable identity of the consolidated Reference execution model.
 pub const REFERENCE_COMMON_EXECUTION_MODEL: &str = "tonepoet-reference-common-model/v1";
 /// Exact accepted Phase-4 predecessor archive digest.
@@ -511,7 +511,7 @@ pub const REFERENCE_METADATA_MUTATION_ID: &str = "tonepoet:reference_metadata_mu
 /// Post-mutation decoded-sample identity authority.
 pub const REFERENCE_POST_METADATA_IDENTITY_ID: &str = "tonepoet:reference_post_metadata_sample_identity/v16";
 /// Reference terminal-realization authority using the common linear error calculus.
-pub const REFERENCE_TERMINAL_ID: &str = "tonepoet:reference_terminal_realization/hq1024_linear_error/v2";
+pub const REFERENCE_TERMINAL_ID: &str = "tonepoet:reference_terminal_realization/hq1024_linear_error/v3";
 /// Candidate declaration: concrete numerical source digest is supplied by the build closure.
 pub const REFERENCE_NUMERICAL_SOURCE_BINDING: &str =
     "build-bound:TONEPOET_TRUE_PEAK_SOURCE_SHA256/v1";
@@ -613,7 +613,7 @@ impl ReferenceCommonPrimitiveClosureV1 {
     #[must_use]
     pub fn current_declaration() -> Self {
         Self {
-            policy_identity: "sox_ng_14_8_0_1_v17+common-v17-candidate".to_string(),
+            policy_identity: "sox_ng_14_8_0_1_v18+common-v18-candidate".to_string(),
             semantic_plan_identity: REFERENCE_COMMON_PLANNER_ID.to_string(),
             numerical_implementation: REFERENCE_NUMERICAL_SOURCE_BINDING.to_string(),
             common_implementation_source: REFERENCE_COMMON_SOURCE_BINDING.to_string(),
@@ -627,10 +627,10 @@ impl ReferenceCommonPrimitiveClosureV1 {
                 "sox-ng-14.8.0.1+{}+phase4-native-metadata",
                 crate::FFMPEG_INT32_TRIANGULAR_TERMINAL_AUTHORITY_ID,
             ),
-            reconstruction_profile: "sealed-reference-profile-matrix-v16".to_string(),
+            reconstruction_profile: "sealed-reference-profile-matrix-v18-sacd-multichannel-target-limited".to_string(),
             terminal_implementation: REFERENCE_TERMINAL_ID.to_string(),
             dither_quantization_policy:
-                "sealed-reference-terminal-depth-policy-v17-int32-ffmpeg-triangular-tpdf".to_string(),
+                "sealed-reference-terminal-depth-policy-v18-int16-sox-tpdf-int32-ffmpeg-triangular-tpdf".to_string(),
             metadata_writer_route: REFERENCE_METADATA_MUTATION_ID.to_string(),
             post_mutation_checks: REFERENCE_POST_METADATA_IDENTITY_ID.to_string(),
             simd_implementation: REFERENCE_SIMD_BINDING.to_string(),
@@ -766,7 +766,7 @@ pub const REFERENCE_REQUIRED_RELEASE_GATES: [&str; 12] = [
     "Q02",
     "GAIN08",
     "GAIN09",
-    "wave64_integrity_80_cell",
+    "wave64_integrity_300_cell",
     "complete_reader",
     "package_identity",
     "post_metadata_identity",
