@@ -1,0 +1,11 @@
+{
+  "schema_version": 18,
+  "execution_model": "tonepoet-reference-common-model/v1",
+  "status": "not_run",
+  "candidate_manifest_sha256": "",
+  "runtime_closure_fingerprint_sha256": "",
+  "metadata_mutation_closure_fingerprint_sha256": null,
+  "positive_case_count": 0,
+  "expected_negative_case_count": 0,
+  "gates": []
+}

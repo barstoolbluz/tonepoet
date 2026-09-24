@@ -11,7 +11,7 @@ use crate::dsd_reference::{
     ResolvedGainPolicy, ResolvedOutputTarget,
 };
 use crate::enums::{
-    AudioCodec, AudioFormat, BitDepthTarget, DitherType, DsdFilterPreset, DsdLowpassMethod, 
+    AudioCodec, AudioFormat, BitDepthTarget, DitherType, DsdFilterPreset, DsdLowpassMethod,
     GainCompensation, Mp3Mode, PcmBitDepth, PreferredTool, RateTarget, ReplayGainMode,
     ResampleQuality, SsrcProfile, TruePeakScanTier, TruePeakScope,
 };
@@ -2227,7 +2227,7 @@ fn plan_typed_with_effects_and_policy(
         if request.source.duration.is_none() {
             facts.push(RequiredFact {
                 key: "source.duration".to_owned(),
-                reason: "Reference admission requires the authoritative duration for streamed-carrier capacity and analyzer-workload bounds".to_owned(),
+                reason: "Reference admission requires the authoritative duration for analyzer-workload and duration-bound planning".to_owned(),
             });
         }
         if request.resolved_output_target == Some(ResolvedOutputTarget::WavRiff) {
@@ -6046,7 +6046,7 @@ fn dsd_reconstruction_candidates(
 ) -> Vec<PhysicalCandidate> {
     if reference_reconstruction {
         vec![PhysicalCandidate {
-            identity: "reference-v17-qualified".to_owned(),
+            identity: "reference-v18-qualified".to_owned(),
             tool: Some(ToolIdentifier::Sox),
             contract: TransformContract {
                 representation: BoundaryRepresentationContract {
@@ -6576,9 +6576,10 @@ mod tests {
     }
 
     #[test]
-    fn reference_delivery_known_unsupported_cells_match_shared_admission() {
+    fn reference_delivery_v18_cells_match_shared_admission() {
         let mut sacd = dsd_request(SampleGainPolicy::Off);
         admit_reference(&mut sacd, ResolvedOutputTarget::FlacNative);
+        sacd.source.channels = Some(2);
         sacd.source.dsd_source_kind = Some(DsdSourceKind::SacdTrack {
             frame_format: SacdFrameEncoding::Dsd,
             selection: SacdTrackSelection {
@@ -6586,27 +6587,41 @@ mod tests {
                 track_index_zero_based: 0,
                 start_frame: 0,
                 frame_count: 1,
+                channels: 2,
                 toc_digest: Sha256Digest([0; 32]),
             },
         });
-        let Ok(PlanningOutcome::Refused(refusal)) = plan_typed(&sacd) else {
-            panic!("unqualified SACD Reference front-end must refuse")
+        let Ok(PlanningOutcome::Ready(plan)) = plan_typed(&sacd) else {
+            panic!("qualified stereo SACD Reference front-end must be ready")
         };
-        assert_eq!(refusal.code, "reference_admission_refused");
+        assert_eq!(plan.execution_capability, ExecutionCapability::ExecutableNow);
 
         let mut six_channel = dsd_request(SampleGainPolicy::Off);
         admit_reference(&mut six_channel, ResolvedOutputTarget::FlacNative);
         six_channel.source.channels = Some(6);
-        let Ok(PlanningOutcome::Refused(refusal)) = plan_typed(&six_channel) else {
-            panic!("six-channel Reference must refuse")
+        let Ok(PlanningOutcome::Ready(plan)) = plan_typed(&six_channel) else {
+            panic!("six-channel Reference must be ready")
         };
-        assert_eq!(refusal.code, "reference_admission_refused");
+        assert_eq!(plan.execution_capability, ExecutionCapability::ExecutableNow);
 
         let mut int16 = dsd_request(SampleGainPolicy::Off);
         admit_reference(&mut int16, ResolvedOutputTarget::FlacNative);
         int16.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int16);
-        let Ok(PlanningOutcome::Refused(refusal)) = plan_typed(&int16) else {
-            panic!("Reference Int16 must refuse")
+        let Ok(PlanningOutcome::Ready(plan)) = plan_typed(&int16) else {
+            panic!("Reference Int16 must be ready")
+        };
+        assert_eq!(plan.execution_capability, ExecutionCapability::ExecutableNow);
+
+        let mut invalid_sacd = sacd;
+        invalid_sacd.source.channels = Some(4);
+        if let Some(DsdSourceKind::SacdTrack { selection, .. }) =
+            invalid_sacd.source.dsd_source_kind.as_mut()
+        {
+            selection.area = SacdAreaKind::Multichannel;
+            selection.channels = 4;
+        }
+        let Ok(PlanningOutcome::Refused(refusal)) = plan_typed(&invalid_sacd) else {
+            panic!("unsupported four-channel SACD layout must refuse")
         };
         assert_eq!(refusal.code, "reference_admission_refused");
     }

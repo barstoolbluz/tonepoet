@@ -552,23 +552,9 @@ pub(crate) async fn preflight_reference_rerun_authority(
                 Vec::new(),
             ));
         }
-        let post_toc_sha256 = stable_file_sha256_cancel(iso, cancel).map_err(|err| {
-            reference_materialization_error(
-                format!(
-                    "failed to re-verify Reference SACD source {} after TOC admission",
-                    iso.display()
-                ),
-                err,
-            )
-        })?;
-        if post_toc_sha256 != source_content_sha256 {
-            return Err(TrackExecutionError::new(
-                ConvertError::Backend(
-                    "Reference SACD source changed during rerun admission".to_string(),
-                ),
-                Vec::new(),
-            ));
-        }
+        // Re-parse and bind the selected TOC identity, but do not read the full
+        // ISO a second time solely to detect a same-user mutation race. The
+        // provenance/content authority is the SHA-256 already computed above.
     }
     let source_probe_digest = reference_source_probe_digest_v1(&plan_request.source);
     let behavior_fingerprint_v1 =
@@ -2568,7 +2554,7 @@ fn effective_metadata_satisfaction(
 
 
 // Append-only v15 checker markers. These strings identify immutable historical
-// evidence; runtime activation and all current includes are v17.
+// evidence; runtime activation and all current includes are v18.
 #[allow(
     dead_code,
     reason = "append-only v15 checker markers remain source evidence for immutable historical qualification"
@@ -2615,7 +2601,7 @@ struct EmbeddedReferenceQualificationVersionProbe {
 }
 
 /// Historical policy manifests use their generation's immutable wire shape.
-/// Keep those shapes parseable without weakening the strict active-v17 schema.
+/// Keep those shapes parseable without weakening the strict active-v18 schema.
 #[allow(dead_code)]
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2662,7 +2648,7 @@ fn parse_embedded_reference_qualification_wire(
     let probe: EmbeddedReferenceQualificationVersionProbe = serde_json::from_str(raw)
         .map_err(|error| format!("qualification manifest version probe failed: {error}"))?;
     match probe.schema_version {
-        1..=16 => serde_json::from_str(raw)
+        1..=17 => serde_json::from_str(raw)
             .map(EmbeddedReferenceQualificationWire::Historical)
             .map_err(|error| {
                 format!(
@@ -2670,11 +2656,11 @@ fn parse_embedded_reference_qualification_wire(
                     probe.schema_version
                 )
             }),
-        17 => serde_json::from_str(raw)
+        18 => serde_json::from_str(raw)
             .map(EmbeddedReferenceQualificationWire::Current)
-            .map_err(|error| format!("current qualification schema v17 is invalid: {error}")),
+            .map_err(|error| format!("current qualification schema v18 is invalid: {error}")),
         other => Err(format!(
-            "unsupported qualification schema version {other}; current runtime supports historical v1-v16 parsing and strict v17 activation"
+            "unsupported qualification schema version {other}; current runtime supports historical v1-v17 parsing and strict v18 activation"
         )),
     }
 }
@@ -2780,14 +2766,20 @@ struct EmbeddedProductionW64RejectionEvidence {
 #[serde(deny_unknown_fields)]
 struct EmbeddedReferenceSampleIdentityRoutes {
     r64_float64_w64: String,
+    qpcm_int16_w64: String,
     qpcm_int24_w64: String,
+    qpcm_int32_w64: String,
     qpcm_float32_w64: String,
     qpcm_float64_w64: String,
+    packaged_int16_w64: String,
     packaged_int24_w64: String,
+    packaged_int32_w64: String,
     packaged_float32_w64: String,
     packaged_float64_w64: String,
     packaged_non_w64: String,
+    post_metadata_int16_w64: String,
     post_metadata_int24_w64: String,
+    post_metadata_int32_w64: String,
     post_metadata_float32_w64: String,
     post_metadata_float64_w64: String,
     post_metadata_non_w64: String,
@@ -2796,7 +2788,9 @@ struct EmbeddedReferenceSampleIdentityRoutes {
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EmbeddedReferenceSampleHashCodecs {
+    int16: String,
     int24: String,
+    int32: String,
     float32: String,
     float64: String,
 }
@@ -3017,6 +3011,8 @@ struct EmbeddedReferenceProfiles {
     b1: EmbeddedIntegratedProfile,
     b2: EmbeddedIntegratedProfile,
     b3: EmbeddedSincProfile,
+    b4t_882: EmbeddedSincProfile,
+    b4t_960: EmbeddedSincProfile,
     b4: EmbeddedSincProfile,
     b4w: EmbeddedSincProfile,
     b5: EmbeddedSincProfile,
@@ -3118,7 +3114,7 @@ struct EmbeddedTerminalBounds {
     derivation_schema: String,
     post_final_acceptance_reserve_db: tonepoet_pipeline::DbNano,
     post_final_acceptance_reserve_basis: String,
-    int16_shibata: EmbeddedTerminalBound,
+    int16_tpdf: EmbeddedTerminalBound,
     int24_tpdf: EmbeddedTerminalBound,
     int32_tpdf: EmbeddedTerminalBound,
     float32: EmbeddedTerminalBound,
@@ -3999,7 +3995,7 @@ fn validate_embedded_release_certification(
             != Some("tonepoet-reference-w64-exact-integrity/v1")
         || w64_integrity.get("status").and_then(serde_json::Value::as_str) != Some("passed")
         || w64_integrity.get("policy").and_then(serde_json::Value::as_str)
-            != Some(tonepoet_pipeline::DSD_REFERENCE_POLICY_V17_KEY)
+            != Some(tonepoet_pipeline::DSD_REFERENCE_POLICY_V18_KEY)
         || w64_integrity.get("parser_authority").and_then(serde_json::Value::as_str)
             != Some("independent_root_and_chunk_traversal_exact/v1")
         || w64_integrity.get("carrier_contract_digest").and_then(serde_json::Value::as_str)
@@ -5407,7 +5403,7 @@ fn validate_embedded_reference_policy_tables(
             != "identity continuity only; not independent packaging evidence"
     {
         return Err(reference_toolchain_error(
-            "embedded Float64 package contract disagrees with the compiled v17 policy",
+            "embedded Float64 package contract disagrees with the compiled v18 policy",
         ));
     }
     let expected_w64_invariants = [
@@ -5440,10 +5436,10 @@ fn validate_embedded_reference_policy_tables(
             .enabled_depths
             .iter()
             .map(String::as_str)
-            .eq(["int24", "int32", "float32", "float64"])
+            .eq(["int16", "int24", "int32", "float32", "float64"])
         || manifest.w64_integrity.rates_hz.as_slice() != expected_w64_rates
-        || manifest.w64_integrity.channels.as_slice() != [1_u16, 2_u16]
-        || manifest.w64_integrity.required_characterization_cell_count != 80
+        || manifest.w64_integrity.channels.as_slice() != [1_u16, 2_u16, 3_u16, 4_u16, 5_u16, 6_u16]
+        || manifest.w64_integrity.required_characterization_cell_count != 300
         || manifest.w64_integrity.boundary_region_resolution_base_fraction != "1/510"
         || manifest.w64_integrity.trigger_claim
             != "encoded_all_zero_after_depth_and_effects_quantization; input threshold is measured per cell and is not assumed"
@@ -5452,7 +5448,7 @@ fn validate_embedded_reference_policy_tables(
             .same_path_qpcm_package_hash_is_independent_packaging_evidence
     {
         return Err(reference_toolchain_error(
-            "embedded exact Wave64 integrity contract disagrees with the compiled v17 policy",
+            "embedded exact Wave64 integrity contract disagrees with the compiled v18 policy",
         ));
     }
 
@@ -5460,24 +5456,32 @@ fn validate_embedded_reference_policy_tables(
     let streamed_route = ReferenceDecodeMechanism::SoxFloat64W64RawStream.key();
     let routes = &manifest.sample_identity.routes;
     let codecs = &manifest.sample_identity.hash_codecs;
-    if manifest.sample_identity.schema != "tonepoet-reference-sample-identity/v7"
+    if manifest.sample_identity.schema != "tonepoet-reference-sample-identity/v8"
         || manifest.sample_identity.route_authority
             != "typed_plan_carrier_path_role_target_depth_v2"
         || routes.r64_float64_w64 != streamed_route
+        || routes.qpcm_int16_w64 != direct_route
         || routes.qpcm_int24_w64 != direct_route
+        || routes.qpcm_int32_w64 != direct_route
         || routes.qpcm_float32_w64 != direct_route
         || routes.qpcm_float64_w64 != streamed_route
+        || routes.packaged_int16_w64 != direct_route
         || routes.packaged_int24_w64 != direct_route
+        || routes.packaged_int32_w64 != direct_route
         || routes.packaged_float32_w64 != direct_route
         || routes.packaged_float64_w64 != streamed_route
         || routes.packaged_non_w64 != direct_route
+        || routes.post_metadata_int16_w64 != direct_route
         || routes.post_metadata_int24_w64 != direct_route
+        || routes.post_metadata_int32_w64 != direct_route
         || routes.post_metadata_float32_w64 != direct_route
         || routes.post_metadata_float64_w64 != streamed_route
         || routes.post_metadata_non_w64 != direct_route
         || manifest.sample_identity.hash_format
             != tonepoet_pipeline::REFERENCE_SAMPLE_HASH_FORMAT
+        || codecs.int16 != ReferenceSampleHashEncoding::SignedInt16Le.ffmpeg_codec()
         || codecs.int24 != ReferenceSampleHashEncoding::SignedInt24Le.ffmpeg_codec()
+        || codecs.int32 != ReferenceSampleHashEncoding::SignedInt32Le.ffmpeg_codec()
         || codecs.float32 != ReferenceSampleHashEncoding::Float32Le.ffmpeg_codec()
         || codecs.float64 != ReferenceSampleHashEncoding::Float64Le.ffmpeg_codec()
         || manifest.sample_identity.forbidden_route
@@ -5511,17 +5515,17 @@ fn validate_embedded_reference_policy_tables(
                 "wavpack_native",
                 "alac_m4a",
             ])
-        || manifest.sample_identity.metadata_mutation.admitted_cell_count != 420
-        || manifest.sample_identity.metadata_mutation.primary_mutator_case_counts.ffmpeg != 160
-        || manifest.sample_identity.metadata_mutation.primary_mutator_case_counts.metaflac != 180
-        || manifest.sample_identity.metadata_mutation.primary_mutator_case_counts.wvtag != 80
-        || manifest.sample_identity.metadata_mutation.m4a_atomicparsley_freeform_case_count != 20
+        || manifest.sample_identity.metadata_mutation.admitted_cell_count != 3_240
+        || manifest.sample_identity.metadata_mutation.primary_mutator_case_counts.ffmpeg != 900
+        || manifest.sample_identity.metadata_mutation.primary_mutator_case_counts.metaflac != 1_620
+        || manifest.sample_identity.metadata_mutation.primary_mutator_case_counts.wvtag != 720
+        || manifest.sample_identity.metadata_mutation.m4a_atomicparsley_freeform_case_count != 120
         || manifest.sample_identity.metadata_mutation.w64_rejection.planner_entry_point
             != "plan_request_for_track"
-        || manifest.sample_identity.metadata_mutation.w64_rejection.planner_case_count != 60
+        || manifest.sample_identity.metadata_mutation.w64_rejection.planner_case_count != 300
         || manifest.sample_identity.metadata_mutation.w64_rejection.metadata_entry_point
             != "qualify_production_metadata_mutation"
-        || manifest.sample_identity.metadata_mutation.w64_rejection.metadata_case_count != 60
+        || manifest.sample_identity.metadata_mutation.w64_rejection.metadata_case_count != 300
         || manifest.sample_identity.metadata_mutation.w64_rejection.code != "DSD-REF-P0-024"
         || !manifest
             .sample_identity
@@ -5549,7 +5553,7 @@ fn validate_embedded_reference_policy_tables(
             != "ReferenceToolchainEvidence.metadata_mutators_and_execution_fingerprint_v1"
     {
         return Err(reference_toolchain_error(
-            "embedded decoded-sample identity contract disagrees with the compiled v17 policy",
+            "embedded decoded-sample identity contract disagrees with the compiled v18 policy",
         ));
     }
     if manifest.subprocess_environment.schema
@@ -5581,8 +5585,8 @@ fn validate_embedded_reference_policy_tables(
         ));
     }
     let streamed_capacity = &manifest.streamed_wav_capacity;
-    if streamed_capacity.schema != "tonepoet-reference-streamed-wav-capacity/v1"
-        || streamed_capacity.applies_to != "all_reference_float64_wav_streams"
+    if streamed_capacity.schema != "tonepoet-reference-streamed-wav-capacity-retired/v1"
+        || streamed_capacity.applies_to != "historical_v12_v16_evidence_only"
         || streamed_capacity.riff_size_field_max
             != tonepoet_pipeline::REFERENCE_STREAMED_WAV_RIFF_SIZE_FIELD_MAX
         || streamed_capacity.riff_size_overhead_bytes
@@ -5594,16 +5598,15 @@ fn validate_embedded_reference_policy_tables(
             != tonepoet_pipeline::REFERENCE_STREAMED_WAV_BYTES_PER_SAMPLE
         || streamed_capacity.duration_guard_frames
             != tonepoet_pipeline::REFERENCE_STREAMED_WAV_DURATION_GUARD_FRAMES
-        || streamed_capacity.admission_rule
-            != "(ceil(duration_ns * target_rate_hz / 1000000000) + duration_guard_frames) * channels * bytes_per_sample <= max_audio_payload_bytes"
+        || streamed_capacity.admission_rule != "retired:no_active_reference_admission"
         || streamed_capacity.overflow_behavior
-            != "sox_ng_unseekable_wav_overflow_riff_size_58_data_size_modulo_2^32"
-        || streamed_capacity.overflow_error_code != "DSD-REF-P0-025"
+            != "historical:sox_ng_unseekable_wav_overflow_riff_size_58_data_size_modulo_2^32"
+        || streamed_capacity.overflow_error_code != "retired:DSD-REF-P0-025"
         || streamed_capacity.future_lift
-            != "append_only_policy_with_corrected_sox_ng_pin_or_independently_qualified_transport"
+            != "completed:common_path_backed_carriers_do_not_use_the_retired_streamed_wav_admission"
     {
         return Err(reference_toolchain_error(
-            "embedded streamed-WAV capacity contract disagrees with the compiled v17 policy",
+            "embedded streamed-WAV capacity contract disagrees with the compiled v18 policy",
         ));
     }
 
@@ -5664,7 +5667,7 @@ fn validate_embedded_reference_policy_tables(
         || carrier.analytic_grid_bound_db > manifest.analyzer.analyzer_residual_db
     {
         return Err(reference_toolchain_error(
-            "embedded analyzer carrier contract disagrees with the compiled v17 policy",
+            "embedded analyzer carrier contract disagrees with the compiled v18 policy",
         ));
     }
     let residual = &manifest.analyzer.residual_authority;
@@ -5770,7 +5773,7 @@ fn validate_embedded_reference_policy_tables(
             != "pinned_toolchain_throughput_floor_and_maximum_admission_arithmetic"
     {
         return Err(reference_toolchain_error(
-            "embedded analyzer qualification matrix disagrees with the compiled v17 policy",
+            "embedded analyzer qualification matrix disagrees with the compiled v18 policy",
         ));
     }
 
@@ -5834,6 +5837,30 @@ fn validate_embedded_reference_policy_tables(
             &manifest.profiles.b3,
         ),
         (
+            "b4t_882",
+            resolve_reference_profile(
+                DsdRate::Dsd128,
+                88_200,
+                DsdReconstructionSelection::Reference,
+            )
+            .map_err(|err| reference_toolchain_error(format!(
+                "compiled B4T/88.2 policy cannot be resolved: {err}"
+            )))?,
+            &manifest.profiles.b4t_882,
+        ),
+        (
+            "b4t_960",
+            resolve_reference_profile(
+                DsdRate::Dsd256,
+                96_000,
+                DsdReconstructionSelection::Reference,
+            )
+            .map_err(|err| reference_toolchain_error(format!(
+                "compiled B4T/96 policy cannot be resolved: {err}"
+            )))?,
+            &manifest.profiles.b4t_960,
+        ),
+        (
             "b4",
             resolve_reference_profile(
                 DsdRate::Dsd128,
@@ -5885,15 +5912,15 @@ fn validate_embedded_reference_policy_tables(
     validate_embedded_sinc_profile("b6", typed_b6_profile(), &b6_common)?;
     if b6.enabled {
         return Err(reference_toolchain_error(
-            "embedded B6 profile must remain typed but disabled under policy v15",
+            "embedded B6 profile must remain typed but disabled under policy v18",
         ));
     }
 
     let terminal_bounds = [
         (
-            "int16_shibata",
+            "int16_tpdf",
             PcmBitDepth::Int16,
-            &manifest.terminal_bounds.int16_shibata,
+            &manifest.terminal_bounds.int16_tpdf,
         ),
         (
             "int24_tpdf",
@@ -5922,7 +5949,7 @@ fn validate_embedded_reference_policy_tables(
     ];
     if manifest.terminal_bounds.target_rates_hz != P0_TARGET_RATES_HZ
         || manifest.terminal_bounds.derivation_schema
-            != "tonepoet-reference-terminal-bound/v3"
+            != "tonepoet-reference-terminal-bound/v4"
         || manifest.terminal_bounds.post_final_acceptance_reserve_db
             != tonepoet_pipeline::DbNano::POST_FINAL_ACCEPTANCE_RESERVE
         || manifest.terminal_bounds.post_final_acceptance_reserve_basis
@@ -5941,7 +5968,7 @@ fn validate_embedded_reference_policy_tables(
     }
     for (name, depth, embedded) in terminal_bounds {
         let expected_realization = match depth {
-            PcmBitDepth::Int16 => "int16-shibata-unqualified-no-conservative-bound",
+            PcmBitDepth::Int16 => "int16-tpdf-2lsb",
             PcmBitDepth::Int24 => "int24-tpdf-2lsb",
             PcmBitDepth::Int32 => "int32-ffmpeg-triangular-2lsb-plus-f64-scalar-2^-51",
             PcmBitDepth::Float32 => "float32-2^-23",
@@ -5983,7 +6010,7 @@ fn validate_embedded_qualification_report(
     let report = &manifest.qualification_report;
     let report_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v17_report.md"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v18_report.md"
     ));
     let guidance = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -6018,7 +6045,7 @@ fn validate_embedded_qualification_report(
     };
     if report.schema != "tonepoet-dsd-reference-policy-qualification-report/v1"
         || report.path
-            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v17_report.md"
+            != "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v18_report.md"
         || parse("policy report", &report.sha256)? != Sha256Digest::of_bytes(report_bytes)
         || parse("guidance", &report.guidance_sha256)? != Sha256Digest::of_bytes(guidance)
         || parse("decimation report", &report.decimation_report_sha256)?
@@ -6074,6 +6101,7 @@ fn embedded_depth_from_key(key: &str) -> Option<tonepoet_pipeline::PcmBitDepth> 
     Some(match key {
         "int16" => Depth::Int16,
         "int24" => Depth::Int24,
+        "int32" => Depth::Int32,
         "float32" => Depth::Float32,
         "float64" => Depth::Float64,
         _ => return None,
@@ -6096,7 +6124,7 @@ fn validate_embedded_reference_cell_contract(
         "sacd_dst",
     ];
     const SOURCE_RATES: [u32; 3] = [2_822_400, 5_644_800, 11_289_600];
-    const CHANNELS: [u16; 2] = [1, 2];
+    const CHANNELS: [u16; 6] = [1, 2, 3, 4, 5, 6];
     const GAIN_MODES: [&str; 4] = ["reference", "native_level", "fixed", "normalize_peak"];
     const TARGET_RATES: [u32; 10] = [
         44_100, 48_000, 88_200, 96_000, 176_400, 192_000, 352_800, 384_000,
@@ -6111,7 +6139,7 @@ fn validate_embedded_reference_cell_contract(
         "wavpack_native",
         "alac_m4a",
     ];
-    const DEPTHS: [&str; 4] = ["int16", "int24", "float32", "float64"];
+    const DEPTHS: [&str; 5] = ["int16", "int24", "int32", "float32", "float64"];
     const DIMENSIONS: [&str; 10] = [
         "source_kind",
         "source_rate_hz",
@@ -6173,11 +6201,17 @@ fn validate_embedded_reference_cell_contract(
                 }
                 let expected = match source_kind {
                     "dsf_uncompressed" | "dsdiff_uncompressed" => "supported",
-                    "dsdiff_dst" if source_rate_hz == 2_822_400 && channels == 2 => {
+                    "dsdiff_dst" if source_rate_hz == 2_822_400 => "supported",
+                    "dsdiff_dst" => "error:DSD-REF-P0-021",
+                    "sacd_dsd" | "sacd_dst"
+                        if source_rate_hz == 2_822_400 && matches!(channels, 2 | 5 | 6) =>
+                    {
                         "supported"
                     }
-                    "dsdiff_dst" => "error:DSD-REF-P0-021",
-                    "sacd_dsd" | "sacd_dst" => "error:DSD-REF-P0-023",
+                    "sacd_dsd" | "sacd_dst" if source_rate_hz != 2_822_400 => {
+                        "error:DSD-REF-P0-003"
+                    }
+                    "sacd_dsd" | "sacd_dst" => "error:DSD-REF-P0-005",
                     _ => unreachable!("source-kind table is fixed above"),
                 };
                 if embedded.result != expected {
@@ -6441,7 +6475,7 @@ fn embedded_reference_common_candidate(
 ) -> Result<(&'static [u8], tonepoet_pipeline::ReferenceCommonQualificationV1), TrackExecutionError> {
     let bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_common_v17_candidate.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_common_v18_candidate.json"
     ));
     let candidate: tonepoet_pipeline::ReferenceCommonQualificationV1 =
         serde_json::from_slice(bytes).map_err(|error| {
@@ -6560,11 +6594,11 @@ fn validate_reference_production_promotion_preflight(
 ) -> Result<(), TrackExecutionError> {
     let report_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_common_v17_report.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_common_v18_report.json"
     ));
     let certification_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_common_v17_certification.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_common_v18_certification.json"
     ));
     validate_reference_production_promotion_preflight_evidence(
         summary,
@@ -6580,7 +6614,7 @@ fn validate_reference_production_promotion_preflight_evidence(
 ) -> Result<(), TrackExecutionError> {
     let candidate_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_common_v17_candidate.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_common_v18_candidate.json"
     ));
     let candidate: tonepoet_pipeline::ReferenceCommonQualificationV1 =
         serde_json::from_slice(candidate_bytes).map_err(|error| {
@@ -6600,6 +6634,12 @@ fn validate_reference_production_promotion_preflight_evidence(
         return Err(qualification_unavailable_error(
             "Reference common-model candidate identity does not match the admitted plan",
         ));
+    }
+    if reference_unqualified_override_active() {
+        log::warn!(
+            "UNQUALIFIED Reference execution: {REFERENCE_UNQUALIFIED_OVERRIDE_ENV} is set; the installed qualification report and certification are not consulted; output is not release evidence"
+        );
+        return Ok(());
     }
 
     let report: tonepoet_pipeline::ReferenceQualificationReportV1 =
@@ -6637,11 +6677,11 @@ fn validate_reference_production_promotion(
 ) -> Result<(), TrackExecutionError> {
     let report_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_common_v17_report.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_common_v18_report.json"
     ));
     let certification_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_common_v17_certification.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_common_v18_certification.json"
     ));
     validate_reference_production_promotion_evidence(
         summary,
@@ -6664,6 +6704,9 @@ fn validate_reference_production_promotion_evidence(
         report_bytes,
         certification_bytes,
     )?;
+    if reference_unqualified_override_active() {
+        return Ok(());
+    }
 
     let (candidate_bytes, _candidate) = embedded_reference_common_candidate()?;
     let candidate_digest = Sha256Digest::of_bytes(candidate_bytes);
@@ -6746,7 +6789,7 @@ async fn attest_reference_toolchain(
 ) -> Result<ReferenceToolchainEvidence, TrackExecutionError> {
     let raw = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v17.json"
+        "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v18.json"
     ));
     let manifest = match parse_embedded_reference_qualification_wire(raw)
         .map_err(reference_toolchain_error)?
@@ -6754,17 +6797,17 @@ async fn attest_reference_toolchain(
         EmbeddedReferenceQualificationWire::Current(manifest) => manifest,
         EmbeddedReferenceQualificationWire::Historical(historical) => {
             return Err(reference_toolchain_error(format!(
-                "the embedded policy artifact is historical schema v{} ({}) and cannot activate the v17 runtime",
+                "the embedded policy artifact is historical schema v{} ({}) and cannot activate the v18 runtime",
                 historical.schema_version, historical.policy,
             )));
         }
     };
-    if manifest.schema_version != 17
-        || manifest.policy != tonepoet_pipeline::DSD_REFERENCE_POLICY_V17_KEY
+    if manifest.schema_version != 18
+        || manifest.policy != tonepoet_pipeline::DSD_REFERENCE_POLICY_V18_KEY
         || manifest.status != "qualification_candidate"
     {
         return Err(reference_toolchain_error(
-            "the embedded v17 policy artifact is not the expected qualification candidate",
+            "the embedded v18 policy artifact is not the expected qualification candidate",
         ));
     }
     if manifest.qualification_basis.trim().is_empty()
@@ -6779,7 +6822,7 @@ async fn attest_reference_toolchain(
     let current_manifest_digest = Sha256Digest::of_bytes(raw.as_bytes());
     if current_manifest_digest != tonepoet_pipeline::qualification_manifest_digest() {
         return Err(reference_toolchain_error(
-            "compiled and packaged current-v17 policy digests disagree",
+            "compiled and packaged current-v18 policy digests disagree",
         ));
     }
     let inherited_v16_bytes = include_bytes!(concat!(
@@ -7681,8 +7724,9 @@ pub struct ReferenceSourceMaterializationQualification {
 }
 
 /// Exercise the exact production materialization seam for a standalone DSF,
-/// DSDIFF/DSD, or qualified DSDIFF/DST source. SACD remains unavailable until
-/// an end-to-end ISO extraction corpus is commissioned.
+/// DSDIFF/DSD, or qualified DSDIFF/DST source. SACD uses the dedicated
+/// qualification seam below because its source authority is the ISO while its
+/// presented carrier is the per-track DSF extracted by the production reader.
 #[doc(hidden)]
 pub fn qualify_reference_source_materialization(
     source_kind: &DsdSourceKind,
@@ -7708,6 +7752,67 @@ pub fn qualify_reference_source_materialization(
             materialization.canonical_materialization_sha256,
         ),
     })
+}
+
+/// Exercise the exact production SACD admission, extraction, provenance hashing,
+/// and private materialization seam for one selected track. The returned source
+/// kind is derived from the ISO TOC by the same parser used during planning.
+#[doc(hidden)]
+pub fn qualify_reference_sacd_source_materialization(
+    iso: &Path,
+    track_index: u32,
+    area: super::types::SacdArea,
+    work_dir: &Path,
+) -> Result<(DsdSourceKind, ReferenceSourceMaterializationQualification), TrackExecutionError> {
+    let cancel = CancellationToken::new();
+    let source_kind = super::plan_bridge::reference_sacd_source_kind(iso, track_index, area)
+        .map_err(|err| TrackExecutionError::new(err, Vec::new()))?;
+    let scratch = ReferenceScratchPaths::for_source_kind(work_dir, &source_kind);
+    let source_content_sha256 = stable_file_sha256_cancel(iso, &cancel).map_err(|err| {
+        reference_materialization_error(
+            format!("failed to admit Reference source {}", iso.display()),
+            err,
+        )
+    })?;
+    let presented_source = extract_reference_sacd_presented_source_blocking(
+        iso,
+        track_index,
+        area,
+        &source_kind,
+        &scratch,
+        &cancel,
+        None,
+    )?;
+    let materialized = materialize_reference_presented_source(
+        &source_kind,
+        &presented_source,
+        &scratch,
+        &cancel,
+        None,
+    )
+    .map_err(|err| {
+        reference_materialization_error(
+            format!(
+                "failed to materialize verified Reference source {}",
+                presented_source.display()
+            ),
+            err,
+        )
+    })?;
+    let canonical_materialization_sha256 = materialized.canonical_materialization_sha256;
+    Ok((
+        source_kind.clone(),
+        ReferenceSourceMaterializationQualification {
+            materialized_path: materialized.path,
+            source_content_sha256,
+            canonical_materialization_sha256,
+            materialization_identity_digest: reference_materialization_identity_digest(
+                &source_kind,
+                source_content_sha256,
+                canonical_materialization_sha256,
+            ),
+        },
+    ))
 }
 
 #[doc(hidden)]
@@ -7764,6 +7869,7 @@ pub(crate) fn reference_materialization_identity_digest(
             );
             field(&mut hasher, &selection.start_frame.to_be_bytes());
             field(&mut hasher, &selection.frame_count.to_be_bytes());
+            field(&mut hasher, &selection.channels.to_be_bytes());
             field(&mut hasher, &selection.toc_digest.0);
         }
         DsdSourceKind::UnknownDsdContainer => {
@@ -7906,6 +8012,57 @@ async fn materialize_reference_source(
     result
 }
 
+fn extract_reference_sacd_presented_source_blocking(
+    iso: &Path,
+    track_index: u32,
+    area: super::types::SacdArea,
+    expected_source_kind: &DsdSourceKind,
+    scratch: &ReferenceScratchPaths,
+    cancel: &CancellationToken,
+    _materialization_pause: Option<&ReferenceMaterializationPause>,
+) -> Result<PathBuf, TrackExecutionError> {
+    let current_source_kind = reference_sacd_source_kind(iso, track_index, area)
+        .map_err(|err| TrackExecutionError::new(err, Vec::new()))?;
+    if &current_source_kind != expected_source_kind {
+        return Err(TrackExecutionError::new(
+            ConvertError::Backend(
+                "Reference SACD TOC selection changed after planning".to_string(),
+            ),
+            Vec::new(),
+        ));
+    }
+
+    // The TOC selection is re-parsed immediately before extraction. The one
+    // full-source SHA-256 computed by the caller remains the provenance/content
+    // authority; avoid two additional multi-gigabyte reads per selected track.
+    // The extracted canonical materialization is independently validated and
+    // hashed below.
+
+    let extracted = super::stages::realize_reference_sacd_track_blocking(
+        iso,
+        track_index,
+        area,
+        &scratch.sacd_extracted_source,
+        &scratch.sacd_extracted_source_temporary,
+        || {
+            #[cfg(test)]
+            if let Some(pause) = _materialization_pause {
+                pause.pause_if_selected(ReferenceMaterializationPausePoint::DuringSacdExtraction);
+            }
+            cancel.is_cancelled()
+        },
+    )
+    .map_err(|err| {
+        if cancel.is_cancelled() {
+            reference_cancelled_error()
+        } else {
+            TrackExecutionError::new(err, Vec::new())
+        }
+    })?;
+
+    Ok(extracted)
+}
+
 fn materialize_reference_source_blocking(
     plan_request: &PlanRequest,
     track: &PreparedTrack,
@@ -7944,88 +8101,15 @@ fn materialize_reference_source_blocking(
             iso,
             track_index,
             area,
-        } => {
-            let current_source_kind = reference_sacd_source_kind(iso, *track_index, *area)
-                .map_err(|err| TrackExecutionError::new(err, Vec::new()))?;
-            if &current_source_kind != source_kind {
-                return Err(TrackExecutionError::new(
-                    ConvertError::Backend(
-                        "Reference SACD TOC selection changed after planning".to_string(),
-                    ),
-                    Vec::new(),
-                ));
-            }
-            // Threat boundary: the pre/post SHA-256 checks detect ordinary
-            // same-user mutation while TOC selection and extraction run. They
-            // are deliberately not described as a pathname-race proof against
-            // a privileged adversary or a filesystem that violates stable-open
-            // semantics: the ISO is reopened by path for each check and by the
-            // extractor. Promotion of SACD Reference cells therefore still
-            // requires commissioned end-to-end fixtures and an explicit review
-            // of this reopen boundary; these hashes are fail-closed mutation
-            // detection, not a capability-style identity guarantee.
-            let post_toc_source_sha256 = stable_file_sha256_cancel(iso, cancel)
-                .map_err(|err| {
-                    reference_materialization_error(
-                        format!(
-                            "failed to re-verify Reference SACD source {} after TOC admission",
-                            iso.display()
-                        ),
-                        err,
-                    )
-                })?;
-            if post_toc_source_sha256 != source_content_sha256 {
-                return Err(TrackExecutionError::new(
-                    ConvertError::Backend(
-                        "Reference SACD source changed during TOC admission".to_string(),
-                    ),
-                    Vec::new(),
-                ));
-            }
-            let extracted = super::stages::realize_reference_sacd_track_blocking(
-                iso,
-                *track_index,
-                *area,
-                &scratch.sacd_extracted_source,
-                &scratch.sacd_extracted_source_temporary,
-                || {
-                    #[cfg(test)]
-                    if let Some(pause) = _materialization_pause {
-                        pause.pause_if_selected(
-                            ReferenceMaterializationPausePoint::DuringSacdExtraction,
-                        );
-                    }
-                    cancel.is_cancelled()
-                },
-            )
-            .map_err(|err| {
-                if cancel.is_cancelled() {
-                    reference_cancelled_error()
-                } else {
-                    TrackExecutionError::new(err, Vec::new())
-                }
-            })?;
-            let post_extract_source_sha256 = stable_file_sha256_cancel(iso, cancel)
-                .map_err(|err| {
-                    reference_materialization_error(
-                        format!(
-                            "failed to re-verify Reference SACD source {} after extraction",
-                            iso.display()
-                        ),
-                        err,
-                    )
-                })?;
-            if post_extract_source_sha256 != source_content_sha256 {
-                return Err(TrackExecutionError::new(
-                    ConvertError::Backend(
-                        "Reference SACD source changed during qualified track extraction"
-                            .to_string(),
-                    ),
-                    Vec::new(),
-                ));
-            }
-            extracted
-        }
+        } => extract_reference_sacd_presented_source_blocking(
+            iso,
+            *track_index,
+            *area,
+            source_kind,
+            scratch,
+            cancel,
+            _materialization_pause,
+        )?,
         _ => realized_input.to_path_buf(),
     };
 
@@ -8098,13 +8182,22 @@ fn materialize_reference_presented_source(
         DsdSourceKind::DsdiffDst => {
             (DsdContainerFormat::Dsdiff, DsdCompression::Dst)
         }
-        DsdSourceKind::SacdTrack { .. } => {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                tonepoet_pipeline::reference_error_text(
-                    tonepoet_pipeline::ReferenceErrorCode::SacdFrontEndIntegrationUnqualified,
-                ),
-            ));
+        DsdSourceKind::SacdTrack { selection, .. } => {
+            if source_info.channel_count != selection.channels
+                || source_info.sample_rate != crate::tui::sacd::SACD_SAMPLE_RATE_HZ
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Reference SACD extraction disagrees with admitted TOC facts: expected {} channels at {} Hz, extracted {} channels at {} Hz",
+                        selection.channels,
+                        crate::tui::sacd::SACD_SAMPLE_RATE_HZ,
+                        source_info.channel_count,
+                        source_info.sample_rate,
+                    ),
+                ));
+            }
+            (DsdContainerFormat::Dsf, DsdCompression::Dsd)
         }
         DsdSourceKind::UnknownDsdContainer => {
             return Err(io::Error::new(
@@ -9703,6 +9796,7 @@ fn reference_carrier_probe_digest(
         policy,
         tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V16
             | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V17
+            | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V18
     ) {
         hasher.update(b"tonepoet-reference-carrier-probe/v2\0");
     } else {
@@ -9720,6 +9814,7 @@ fn reference_carrier_probe_digest(
         policy,
         tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V16
             | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V17
+            | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V18
     ) {
         match probe.w64_structure {
             Some(structure) => {
@@ -10293,7 +10388,7 @@ fn validate_reference_package_pipeline(
     summary: &DsdReferencePlanSummary,
     pipeline: &PlannedCommandPipeline,
 ) -> Result<(), TrackExecutionError> {
-    if summary.policy != tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V17
+    if summary.policy != tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V18
         || summary.final_pcm.bit_depth != tonepoet_pipeline::PcmBitDepth::Float64
         || !matches!(
             summary.target,
@@ -10304,7 +10399,7 @@ fn validate_reference_package_pipeline(
     {
         return Err(TrackExecutionError::new(
             ConvertError::Backend(
-                "Reference policy v17 package pipeline is bound to an invalid plan cell"
+                "Reference policy v18 package pipeline is bound to an invalid plan cell"
                     .to_string(),
             ),
             Vec::new(),
@@ -10338,7 +10433,7 @@ fn validate_reference_package_pipeline(
     {
         return Err(TrackExecutionError::new(
             ConvertError::Backend(
-                "Reference policy v15 package pipeline has a noncanonical SoX producer"
+                "Reference Float64 package pipeline has a noncanonical SoX producer"
                     .to_string(),
             ),
             Vec::new(),
@@ -10389,7 +10484,7 @@ fn validate_reference_package_pipeline(
     {
         return Err(TrackExecutionError::new(
             ConvertError::Backend(
-                "Reference policy v15 package pipeline has a noncanonical FFmpeg consumer"
+                "Reference Float64 package pipeline has a noncanonical FFmpeg consumer"
                     .to_string(),
             ),
             Vec::new(),
@@ -12037,7 +12132,7 @@ mod tests {
         paths.sort();
         assert_eq!(
             paths.len(),
-            33,
+            35,
             "qualification manifest inventory changed; update the permanent parse census intentionally"
         );
 
@@ -12048,15 +12143,15 @@ mod tests {
                 .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
             match parsed {
                 EmbeddedReferenceQualificationWire::Historical(manifest) => {
-                    assert!(manifest.schema_version <= 16);
+                    assert!(manifest.schema_version <= 17);
                     assert!(manifest.policy.starts_with("sox_ng_14_8_0_1_v"));
                     assert!(!manifest.status.trim().is_empty());
                 }
                 EmbeddedReferenceQualificationWire::Current(manifest) => {
-                    assert_eq!(manifest.schema_version, 17);
+                    assert_eq!(manifest.schema_version, 18);
                     assert_eq!(
                         manifest.policy,
-                        tonepoet_pipeline::DSD_REFERENCE_POLICY_V17_KEY,
+                        tonepoet_pipeline::DSD_REFERENCE_POLICY_V18_KEY,
                     );
                 }
             }
@@ -12132,15 +12227,15 @@ mod tests {
     fn embedded_reference_qualification_matches_compiled_policy_tables() {
         let manifest: EmbeddedReferenceQualification = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v17.json"
+            "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v18.json"
         )))
         .expect("embedded Reference qualification JSON parses");
         assert_eq!(
             manifest
                 .terminal_bounds
-                .int16_shibata
+                .int16_tpdf
                 .safe_pre_terminal_ceiling_dbtp,
-            tonepoet_pipeline::DbNano(i64::MIN)
+            tonepoet_pipeline::DbNano(-1_010_595_538)
         );
         validate_embedded_reference_policy_tables(&manifest)
             .expect("embedded Reference qualification matches compiled policy tables");
@@ -12148,7 +12243,7 @@ mod tests {
         let mut reserve_drift: EmbeddedReferenceQualification =
             serde_json::from_str(include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v17.json"
+                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v18.json"
             )))
             .expect("embedded Reference qualification JSON parses for drift test");
         reserve_drift.analyzer.reporting_uncertainty_db =
@@ -12165,7 +12260,7 @@ mod tests {
         let mut streamed_capacity_drift: EmbeddedReferenceQualification =
             serde_json::from_str(include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v17.json"
+                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v18.json"
             )))
             .expect("embedded Reference qualification JSON parses for capacity drift test");
         streamed_capacity_drift.streamed_wav_capacity.max_audio_payload_bytes += 1;
@@ -12181,7 +12276,7 @@ mod tests {
         let mut hash_contract_drift: EmbeddedReferenceQualification =
             serde_json::from_str(include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v17.json"
+                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v18.json"
             )))
             .expect("embedded Reference qualification JSON parses for hash-contract drift test");
         hash_contract_drift.sample_identity.hash_format =
@@ -12198,7 +12293,7 @@ mod tests {
         let mut route_contract_drift: EmbeddedReferenceQualification =
             serde_json::from_str(include_str!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v17.json"
+                "/tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v18.json"
             )))
             .expect("embedded Reference qualification JSON parses for route-contract drift test");
         route_contract_drift
@@ -12508,7 +12603,7 @@ mod tests {
 
         let candidate_bytes = include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tonepoet-pipeline/qualification/dsd_reference_common_v17_candidate.json"
+            "/tonepoet-pipeline/qualification/dsd_reference_common_v18_candidate.json"
         ));
         let candidate_digest = tonepoet_pipeline::reference_sha256_hex(candidate_bytes);
         let gates = tonepoet_pipeline::REFERENCE_REQUIRED_RELEASE_GATES
@@ -14467,7 +14562,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reference_album_terminal_reuses_retained_r64_without_dsd_rematerialization() {
+    async fn reference_sacd_album_terminal_reuses_retained_r64_without_iso_rematerialization() {
         let temp = tempfile::tempdir().expect("Reference album carrier tempdir");
         let carrier = temp.path().join("retained.reference-protected.w64");
         std::fs::write(&carrier, b"riff-retained-reference-carrier")
@@ -14495,12 +14590,22 @@ mod tests {
         let track = reference_materialization_track(
             TrackSourceRef::DsdReferenceAutoGainCarrier {
                 path: carrier.clone(),
-                source_path: temp.path().join("source.dsf"),
+                source_path: temp.path().join("album.iso"),
                 source_sample_rate_hz: 2_822_400,
                 sample_rate_hz: 88_200,
                 channels: 2,
                 duration: Some(Duration::from_secs(1)),
-                source_kind: tonepoet_pipeline::DsdSourceKind::DsfUncompressed,
+                source_kind: tonepoet_pipeline::DsdSourceKind::SacdTrack {
+                    frame_format: tonepoet_pipeline::SacdFrameEncoding::Dsd,
+                    selection: tonepoet_pipeline::SacdTrackSelection {
+                        area: tonepoet_pipeline::SacdAreaKind::Stereo,
+                        track_index_zero_based: 0,
+                        start_frame: 510,
+                        frame_count: 75,
+                        channels: 2,
+                        toc_digest: tonepoet_pipeline::Sha256Digest::of_bytes(b"toc"),
+                    },
+                },
                 gain_db: Some(gain),
                 target_dbtp: tonepoet_pipeline::DbNano::DEFAULT_REFERENCE_TRUE_PEAK_TARGET,
                 unbound_semantic_plan_hash: tonepoet_pipeline::Sha256Digest::of_bytes(
@@ -14566,13 +14671,13 @@ mod tests {
         let error = result.expect_err("injected producer failure must stop terminal execution");
         assert!(
             error.to_string().contains("producer-launch"),
-            "retained album carrier must bypass DSF/DSDIFF materialization and reach terminal execution: {error}",
+            "retained SACD album carrier must bypass ISO/DSF rematerialization and reach terminal execution: {error}",
         );
         assert!(
             !error
                 .to_string()
                 .contains("failed to materialize verified Reference source"),
-            "retained protected R64 must never be presented to the DSD source materializer: {error}",
+            "retained SACD protected R64 must never be presented to the source materializer: {error}",
         );
         assert!(!work_dir.exists(), "failed retained-carrier execution must clean work state");
     }

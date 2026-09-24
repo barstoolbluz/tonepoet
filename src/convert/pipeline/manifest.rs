@@ -637,9 +637,9 @@ fn validate_manifest_authority(manifest: &ConversionManifest) -> Result<(), Mani
             policy,
             qualification_candidate_manifest_digest,
         } => {
-            if manifest.total_tracks != 1 {
+            if manifest.total_tracks == 0 {
                 return Err(ManifestError::InvalidAuthority(
-                    "P0 Reference manifest must contain exactly one track".to_string(),
+                    "Reference manifest must contain at least one track".to_string(),
                 ));
             }
             if *route_settings_snapshot != settings_snapshot_fingerprint_v2(&manifest.settings) {
@@ -718,6 +718,7 @@ fn validate_manifest_authority(manifest: &ConversionManifest) -> Result<(), Mani
                                 | DsdReferencePolicyVersion::SoxNg14801V15
                                 | DsdReferencePolicyVersion::SoxNg14801V16
                                 | DsdReferencePolicyVersion::SoxNg14801V17
+                                | DsdReferencePolicyVersion::SoxNg14801V18
                         ) || *executed_evidence_digest_v2 != Sha256Digest([0; 32]))
                         && (!matches!(
                             policy,
@@ -732,6 +733,7 @@ fn validate_manifest_authority(manifest: &ConversionManifest) -> Result<(), Mani
                                 | DsdReferencePolicyVersion::SoxNg14801V15
                                 | DsdReferencePolicyVersion::SoxNg14801V16
                                 | DsdReferencePolicyVersion::SoxNg14801V17
+                                | DsdReferencePolicyVersion::SoxNg14801V18
                         )
                             || *executed_evidence_digest_v3 != Sha256Digest([0; 32])) => {}
                     ManifestTrackExecutionIdentityV2::NativeDsdV2 { .. } => {
@@ -753,6 +755,7 @@ fn validate_manifest_authority(manifest: &ConversionManifest) -> Result<(), Mani
                                     | DsdReferencePolicyVersion::SoxNg14801V15
                                     | DsdReferencePolicyVersion::SoxNg14801V16
                                     | DsdReferencePolicyVersion::SoxNg14801V17
+                                | DsdReferencePolicyVersion::SoxNg14801V18
                             ) {
                                 if matches!(
                                     policy,
@@ -767,6 +770,7 @@ fn validate_manifest_authority(manifest: &ConversionManifest) -> Result<(), Mani
                                         | DsdReferencePolicyVersion::SoxNg14801V15
                                         | DsdReferencePolicyVersion::SoxNg14801V16
                                         | DsdReferencePolicyVersion::SoxNg14801V17
+                                        | DsdReferencePolicyVersion::SoxNg14801V18
                                 ) {
                                     "Reference v7+ track is missing v1, v2, or v3 executed verification authority"
                                 } else {
@@ -787,7 +791,10 @@ fn validate_manifest_authority(manifest: &ConversionManifest) -> Result<(), Mani
                 if let Some(DsdSourceKind::SacdTrack { selection, .. }) =
                     track.original_dsd_source_kind.as_ref()
                 {
-                    if selection.frame_count == 0 || selection.toc_digest == Sha256Digest([0; 32]) {
+                    if selection.frame_count == 0
+                        || selection.channels == 0
+                        || selection.toc_digest == Sha256Digest([0; 32])
+                    {
                         return Err(ManifestError::InvalidAuthority(
                             "SACD Reference identity has an incomplete track selection".to_string(),
                         ));
@@ -1306,6 +1313,7 @@ mod manifest_merge_gap_tests {
             (DsdReferencePolicyVersion::SoxNg14801V15, "v15"),
             (DsdReferencePolicyVersion::SoxNg14801V16, "v16"),
             (DsdReferencePolicyVersion::SoxNg14801V17, "v17"),
+            (DsdReferencePolicyVersion::SoxNg14801V18, "v18"),
         ] {
             let error = reference_manifest_with_evidence(policy, v1, v2, zero)
                 .unwrap_err();
