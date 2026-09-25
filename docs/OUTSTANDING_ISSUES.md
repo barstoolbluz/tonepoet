@@ -2924,3 +2924,37 @@ None confirmed. The operator restarted the TUI with no conversion running, which
 only place the pass runs; the user reports the item was not re-enqueued and does not
 appear in the Queue screen as Interrupted or retryable. The reservation on the folder
 is therefore still in place after a restart, and the pass's outcome remains invisible.
+
+## 45. A version bump invalidates the installed Reference qualification, and the TUI hides the reason
+
+Found 2026-09-25 immediately after the 0.5.3 bump. Every Reference conversion failed:
+
+```
+Convert: backend encode failed: DSD-REF-P0-015: The installed Reference toolchain does
+not match policy sox_ng_14_8_0_1_v18 or failed its behavior probes. Activate/install the
+qualified toolchain; tonepoet will not substitute another decoder, ...
+```
+
+The same conversion from the CLI states the real reason: "qualification unavailable:
+Reference production promotion is inactive: Reference qualification report does not bind
+the running runtime closure variant".
+
+### Mechanism
+
+`build.rs` hashes `Cargo.toml` and `Cargo.lock` into `TONEPOET_REFERENCE_COMMON_SOURCE_SHA256`,
+which `reference_common_runtime_closure_fingerprint` folds into the runtime closure. Changing
+the package version line therefore changes the closure, the embedded v18 report no longer
+binds it, and `validate_reference_production_promotion_evidence` fails closed. Repair is a
+full requalification (53 minutes at v0.5.3) and a reinstall of the three evidence files.
+
+`Cargo.lock` belongs in the lock: a dependency change can change Reference behaviour. The
+package version string cannot. The TUI's queue and failure text collapse the refusal into
+the generic P0-015 toolchain message, so the operator restarted the nix shell looking for a
+toolchain fault that did not exist.
+
+### Required
+
+A change that cannot affect Reference behaviour, the package version line first among
+them, does not invalidate the installed qualification. The TUI shows the same specific
+refusal reason the CLI prints, including that the installed report does not bind the
+running build, and says that requalification is the remedy.
