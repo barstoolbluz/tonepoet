@@ -2,8 +2,9 @@
 //!
 //! External work always executes behind a tonepoet-controlled containment process.
 //! Queue conversions reuse one long-lived supervisor per active item and fork
-//! command-specific containment workers beneath it; non-queue callers may use a
-//! fresh dedicated helper. Keeping containment out of the TUI/worker process avoids
+//! command-specific containment workers beneath it. Non-queue callers without
+//! lifetime leases reuse a process-local supervisor; leased calls use a dedicated
+//! helper. Keeping containment out of the TUI/worker process avoids
 //! changing process-global subreaper state there and gives timeout/cancellation
 //! ownership to a process which has no unrelated children.
 //!
@@ -21,7 +22,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::{CString, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
@@ -50,7 +51,6 @@ const ITEM_REQUEST_LEASE: u8 = b'L';
 const ITEM_REQUEST_SHUTDOWN: u8 = b'S';
 const ITEM_REQUEST_ACK: u8 = b'A';
 const ITEM_MAX_FDS: usize = 8;
-const INTERNAL_LAUNCHER_SUBCOMMAND: &str = "__action-script-launcher";
 const MAX_LAUNCH_SPEC_BYTES: usize = 1024 * 1024;
 const LAUNCHER_READY: u8 = b'R';
 const EVENT_ACK: u8 = b'A';
@@ -757,22 +757,19 @@ where
     };
     drop(control_parent);
 
-    let drain_deadline = Instant::now() + TAIL_DRAIN_GRACE;
-    while Instant::now() < drain_deadline {
-        let events = event_reader.read_available(&mut event_parent)?;
-        if events.is_empty() {
-            thread::sleep(Duration::from_millis(5));
-            continue;
+    // Lifecycle emission is synchronous: the helper cannot finish `run_helper`
+    // and publish its result until every emitted event has been acknowledged or
+    // the channel has disconnected. A final nonblocking read is therefore enough
+    // to consume any bytes already queued; a fixed post-command sleep only adds
+    // latency and does not protect an in-flight event.
+    for event in event_reader.read_available(&mut event_parent)? {
+        if event.schema_version() != LIFECYCLE_EVENT_SCHEMA {
+            return Err(ScriptSupervisorError::Protocol(
+                "script supervisor emitted an unsupported lifecycle event".to_string(),
+            ));
         }
-        for event in events {
-            if event.schema_version() != LIFECYCLE_EVENT_SCHEMA {
-                return Err(ScriptSupervisorError::Protocol(
-                    "script supervisor emitted an unsupported lifecycle event".to_string(),
-                ));
-            }
-            on_event(&event)?;
-            let _ = event_parent.write_all(&[EVENT_ACK]);
-        }
+        on_event(&event)?;
+        let _ = event_parent.write_all(&[EVENT_ACK]);
     }
 
     // Do not let an unobservable platform escape keep inherited output pipes
@@ -922,6 +919,16 @@ impl ItemExecutionSupervisorClient {
         read_item_ack(&mut request)
     }
 
+    fn is_running(&self) -> Result<bool, ScriptSupervisorError> {
+        let mut child = self.child.lock().map_err(|_| {
+            ScriptSupervisorError::Internal("item supervisor child lock poisoned".to_string())
+        })?;
+        let Some(child) = child.as_mut() else {
+            return Ok(false);
+        };
+        Ok(child.try_wait()?.is_none())
+    }
+
     pub fn shutdown(&self) -> Result<(), ScriptSupervisorError> {
         {
             let mut request = self
@@ -946,6 +953,32 @@ impl ItemExecutionSupervisorClient {
         }
         Ok(())
     }
+}
+
+/// Shared process-local supervisor for ordinary tool calls that do not carry
+/// durable execution/path/staging lifetime descriptors. It provides the same
+/// per-command containment backend as an item supervisor, but its lifetime is
+/// intentionally the Tonepoet process: keeping one small fork server alive
+/// amortises helper startup without extending any external ownership lease.
+pub(crate) fn shared_unleased_execution_supervisor(
+) -> Result<ItemExecutionSupervisorClient, ScriptSupervisorError> {
+    static SHARED: OnceLock<Mutex<Option<ItemExecutionSupervisorClient>>> = OnceLock::new();
+    let slot = SHARED.get_or_init(|| Mutex::new(None));
+    let mut guard = slot.lock().map_err(|_| {
+        ScriptSupervisorError::Internal("shared execution supervisor lock poisoned".to_string())
+    })?;
+    if let Some(supervisor) = guard.as_ref() {
+        if supervisor.is_running()? {
+            return Ok(supervisor.clone());
+        }
+    }
+    // A helper that exited between commands is safe to replace. We deliberately
+    // do not retry a submitted command: the caller must observe that failure so
+    // commands with external side effects can never run twice.
+    guard.take();
+    let supervisor = ItemExecutionSupervisorClient::start(&[])?;
+    *guard = Some(supervisor.clone());
+    Ok(supervisor)
 }
 
 fn read_item_ack(stream: &mut UnixStream) -> Result<(), ScriptSupervisorError> {
@@ -1357,20 +1390,17 @@ where
     }
     drop(control_parent);
 
-    let drain_deadline = Instant::now() + TAIL_DRAIN_GRACE;
-    while Instant::now() < drain_deadline {
-        let events = event_reader.read_available(&mut event_parent)?;
-        if events.is_empty() {
-            thread::sleep(Duration::from_millis(5));
-            continue;
+    // As in the dedicated-helper path, result publication is ordered after
+    // synchronous lifecycle acknowledgement. Consume only events already queued;
+    // do not tax every fast external command with an unconditional grace sleep.
+    for event in event_reader.read_available(&mut event_parent)? {
+        if event.schema_version() != LIFECYCLE_EVENT_SCHEMA {
+            return Err(ScriptSupervisorError::Protocol(
+                "item supervisor emitted an unsupported lifecycle event".to_string(),
+            ));
         }
-        for event in events {
-            if event.schema_version() != LIFECYCLE_EVENT_SCHEMA {
-                return Err(ScriptSupervisorError::Protocol("item supervisor emitted an unsupported lifecycle event".to_string()));
-            }
-            on_event(&event)?;
-            let _ = event_parent.write_all(&[EVENT_ACK]);
-        }
+        on_event(&event)?;
+        let _ = event_parent.write_all(&[EVENT_ACK]);
     }
 
     output_stop.store(true, Ordering::Release);
@@ -1810,9 +1840,10 @@ fn bind_post_album_environment_to_retained_cwd(
     Ok(())
 }
 
-/// Entry point used only by the hidden launcher subcommand.  The invocation is
-/// received from the already-armed supervisor over an inherited private socket;
-/// no pathname is reopened and no shell is involved.
+/// Exec-gate implementation used by the forked launcher and the hidden
+/// launcher entry point. The invocation is received from the already-armed
+/// supervisor over an inherited private socket; no pathname is reopened and no
+/// shell is involved.
 pub fn run_internal_launcher(
     launch_fd: RawFd,
     cgroup_fd: Option<RawFd>,
@@ -1839,7 +1870,7 @@ pub fn run_internal_launcher(
         ));
     }
 
-    // SAFETY: this hidden subcommand is the sole owner of the inherited launch
+    // SAFETY: this launcher process is the sole owner of the inherited launch
     // descriptor and a duplicate of the retained reviewed-script descriptor.
     // The script descriptor deliberately remains open across fexecve so a
     // shebang interpreter can consume it without reopening the pathname.
@@ -2638,42 +2669,116 @@ fn validate_descriptor(
     }
 }
 
+#[derive(Debug)]
+struct LauncherChild {
+    pid: libc::pid_t,
+    raw_wait_status: Option<i32>,
+}
+
+impl LauncherChild {
+    fn id(&self) -> u32 {
+        u32::try_from(self.pid).expect("fork returned a positive launcher pid")
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        if let Some(raw) = self.raw_wait_status {
+            return Ok(Some(ExitStatus::from_raw(raw)));
+        }
+        loop {
+            let mut raw = 0_i32;
+            let waited = unsafe { libc::waitpid(self.pid, &mut raw, libc::WNOHANG) };
+            if waited == 0 {
+                return Ok(None);
+            }
+            if waited == self.pid {
+                self.raw_wait_status = Some(raw);
+                return Ok(Some(ExitStatus::from_raw(raw)));
+            }
+            if waited < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "waitpid returned an unexpected launcher pid",
+            ));
+        }
+    }
+
+    fn wait(&mut self) -> io::Result<ExitStatus> {
+        if let Some(raw) = self.raw_wait_status {
+            return Ok(ExitStatus::from_raw(raw));
+        }
+        loop {
+            let mut raw = 0_i32;
+            let waited = unsafe { libc::waitpid(self.pid, &mut raw, 0) };
+            if waited == self.pid {
+                self.raw_wait_status = Some(raw);
+                return Ok(ExitStatus::from_raw(raw));
+            }
+            if waited < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "waitpid returned an unexpected launcher pid",
+            ));
+        }
+    }
+
+    fn kill(&mut self) -> io::Result<()> {
+        if self.raw_wait_status.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "launcher process has already exited",
+            ));
+        }
+        let result = unsafe { libc::kill(self.pid, libc::SIGKILL) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+}
+
 fn spawn_launcher(
     cgroup_fd: Option<RawFd>,
     script_fd: RawFd,
     extra: impl Fn() -> io::Result<()> + Send + Sync + 'static,
-) -> Result<(Child, UnixStream), ScriptSupervisorError> {
+) -> Result<(LauncherChild, UnixStream), ScriptSupervisorError> {
     let (release, launch_child) = UnixStream::pair()?;
-    let launch_fd = launch_child.as_raw_fd();
-    let current_executable = crate::reexec::current_executable_for_reexec().map_err(|error| {
-        ScriptSupervisorError::Internal(format!(
-            "cannot locate the current executable for the script launcher: {error}"
-        ))
-    })?;
-    let mut command = Command::new(current_executable);
-    command
-        .arg(INTERNAL_LAUNCHER_SUBCOMMAND)
-        .arg("--launch-fd")
-        .arg(launch_fd.to_string())
-        .arg("--script-fd")
-        .arg(script_fd.to_string());
-    if let Some(fd) = cgroup_fd {
-        command.arg("--cgroup-fd").arg(fd.to_string());
+    // Every caller runs inside the dedicated single-threaded containment
+    // helper (or a single-threaded backend worker forked by the persistent
+    // execution supervisor). Forking the tiny exec gate here avoids re-execing
+    // the full Tonepoet binary for every external command while preserving the
+    // same pre-release cgroup/session/process-group setup and retained-FD exec.
+    // Unrelated inherited supervisor descriptors stay CLOEXEC, so the final
+    // external exec sees the same descriptor boundary as the former re-exec gate.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(io::Error::last_os_error().into());
     }
-    command
-        .env_clear()
-        // The parent supervisor has already installed the invocation's exact
-        // stdin policy: ordinary commands receive /dev/null, while pipeline
-        // consumers receive their retained pipe endpoint. Inherit that
-        // sanitized descriptor instead of unconditionally replacing it with
-        // /dev/null at the containment boundary.
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    unsafe {
-        command.pre_exec(move || {
-            extra()?;
-            if libc::getpgrp() != libc::getpid() && libc::setpgid(0, 0) != 0 {
+    if pid == 0 {
+        // The fork child must not retain the supervisor side of the private
+        // release socket. Use `_exit` on every failure path so inherited Rust
+        // owners from the parent are never destructed a second time.
+        unsafe {
+            libc::close(release.as_raw_fd());
+        }
+        std::mem::forget(release);
+        let launch_fd = launch_child.into_raw_fd();
+        let setup = extra().and_then(|_| {
+            if unsafe { libc::getpgrp() } != unsafe { libc::getpid() }
+                && unsafe { libc::setpgid(0, 0) } != 0
+            {
                 return Err(io::Error::last_os_error());
             }
             clear_close_on_exec(launch_fd)?;
@@ -2683,10 +2788,19 @@ fn spawn_launcher(
             }
             Ok(())
         });
+        if setup.is_ok() {
+            let _ = run_internal_launcher(launch_fd, cgroup_fd, script_fd);
+        }
+        unsafe { libc::_exit(70) };
     }
-    let child = command.spawn()?;
     drop(launch_child);
-    Ok((child, release))
+    Ok((
+        LauncherChild {
+            pid,
+            raw_wait_status: None,
+        },
+        release,
+    ))
 }
 
 fn wait_launcher_ready(channel: &mut UnixStream) -> Result<(), ScriptSupervisorError> {
@@ -2731,7 +2845,7 @@ fn signal_process_group(pid: u32, signal: i32) {
     }
 }
 
-fn emergency_kill_child_group(child: &mut Child) -> Vec<String> {
+fn emergency_kill_child_group(child: &mut LauncherChild) -> Vec<String> {
     let mut errors = Vec::new();
     signal_process_group(child.id(), libc::SIGKILL);
     if let Err(error) = child.kill() {
@@ -3050,7 +3164,7 @@ mod linux {
 
     fn observe_leader_exit(
         event_fd: RawFd,
-        child: &mut Child,
+        child: &mut LauncherChild,
         raw_wait_status: &mut Option<i32>,
     ) -> Result<(), ScriptSupervisorError> {
         if raw_wait_status.is_none() {
@@ -3364,7 +3478,7 @@ mod linux {
 
     fn complete_leader_wait(
         event_fd: RawFd,
-        child: &mut Child,
+        child: &mut LauncherChild,
         raw_wait_status: Option<i32>,
     ) -> Result<i32, ScriptSupervisorError> {
         if let Some(raw) = raw_wait_status {
@@ -3387,7 +3501,7 @@ mod linux {
         leaf: &CgroupLeaf,
         root_pgid: i32,
         supervisor_pid: i32,
-        child: &mut Child,
+        child: &mut LauncherChild,
         tracked: &mut BTreeSet<ProcessIdentity>,
         raw_wait_status: &mut Option<i32>,
     ) -> Result<TerminationSummary, ScriptSupervisorError> {
@@ -3676,7 +3790,7 @@ mod linux {
         reason: TerminationReason,
         root_pgid: i32,
         supervisor_pid: i32,
-        child: &mut Child,
+        child: &mut LauncherChild,
         tracked: &mut BTreeSet<ProcessIdentity>,
         raw_wait_status: &mut Option<i32>,
     ) -> Result<TerminationSummary, ScriptSupervisorError> {
@@ -3951,7 +4065,7 @@ mod linux {
     /// exit code the protocol must record durably.
     fn reap_waitable_children_recording_leader(
         event_fd: RawFd,
-        child: &Child,
+        child: &LauncherChild,
         raw_wait_status: &mut Option<i32>,
     ) {
         let leader = child.id() as i32;
@@ -4382,7 +4496,7 @@ mod macos {
 
     fn observe_leader_exit(
         event_fd: RawFd,
-        child: &mut Child,
+        child: &mut LauncherChild,
         raw_wait_status: &mut Option<i32>,
     ) -> Result<(), ScriptSupervisorError> {
         if raw_wait_status.is_none() {
@@ -4403,7 +4517,7 @@ mod macos {
 
     fn complete_leader_wait(
         event_fd: RawFd,
-        child: &mut Child,
+        child: &mut LauncherChild,
         raw_wait_status: Option<i32>,
     ) -> Result<i32, ScriptSupervisorError> {
         if let Some(raw) = raw_wait_status {
@@ -4914,7 +5028,7 @@ mod macos {
         reason: TerminationReason,
         kqueue: RawFd,
         root_pgid: i32,
-        child: &mut Child,
+        child: &mut LauncherChild,
         tracked: &mut BTreeSet<ProcessIdentity>,
         raw_wait_status: &mut Option<i32>,
     ) -> Result<TerminationSummary, ScriptSupervisorError> {

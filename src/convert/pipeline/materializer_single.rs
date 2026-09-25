@@ -4,6 +4,8 @@
 //! executor, metadata, ReplayGain, publish, and logging stages then handle it.
 
 use std::collections::{BTreeMap, HashMap};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -52,6 +54,7 @@ impl super::stages::Materializer for SingleFileMaterializer {
         }
 
         let mut probe = probe_audio_file(&req.container, runner, cancel).await?;
+        validate_ffmpeg_flac_source(&req.container, runner, cancel).await?;
         if probe.coding == SourceAudioCoding::Dsd {
             // ffprobe reports DSF/DFF byte rates and block-padded durations;
             // the container header carries the EXACT bit rate and per-channel
@@ -533,6 +536,189 @@ pub(crate) fn single_file_filename_track_number(
         .max(1)
 }
 
+const FFMPEG_FLAC_RISKY_DECODED_FRAME_BYTES: u64 = 200 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FlacStreamInfo {
+    max_block_size: u16,
+    channels: u8,
+    bits_per_sample: u8,
+    total_samples: u64,
+}
+
+fn flac_stream_info(path: &Path) -> Result<Option<FlacStreamInfo>, MaterializeError> {
+    let mut file = File::open(path).map_err(|error| {
+        MaterializeError::Extraction(format!(
+            "cannot inspect FLAC STREAMINFO in {}: {error}",
+            path.display(),
+        ))
+    })?;
+    let mut prefix = [0_u8; 10];
+    let read = file.read(&mut prefix).map_err(|error| {
+        MaterializeError::Extraction(format!(
+            "cannot inspect FLAC header in {}: {error}",
+            path.display(),
+        ))
+    })?;
+    if read < 4 {
+        return Ok(None);
+    }
+
+    let mut flac_offset = 0_u64;
+    if read == 10 && &prefix[..3] == b"ID3" {
+        let size = prefix[6..10].iter().try_fold(0_u64, |acc, byte| {
+            (*byte < 0x80).then_some((acc << 7) | u64::from(*byte))
+        });
+        let Some(size) = size else {
+            return Ok(None);
+        };
+        flac_offset = 10 + size;
+        if prefix[5] & 0x10 != 0 {
+            flac_offset = flac_offset.saturating_add(10);
+        }
+    }
+
+    file.seek(SeekFrom::Start(flac_offset)).map_err(|error| {
+        MaterializeError::Extraction(format!(
+            "cannot seek FLAC header in {}: {error}",
+            path.display(),
+        ))
+    })?;
+    let mut magic = [0_u8; 4];
+    if file.read_exact(&mut magic).is_err() || &magic != b"fLaC" {
+        return Ok(None);
+    }
+    let mut block_header = [0_u8; 4];
+    if file.read_exact(&mut block_header).is_err() || block_header[0] & 0x7f != 0 {
+        return Ok(None);
+    }
+    let block_len = (u32::from(block_header[1]) << 16)
+        | (u32::from(block_header[2]) << 8)
+        | u32::from(block_header[3]);
+    if block_len < 34 {
+        return Ok(None);
+    }
+    let mut streaminfo = [0_u8; 34];
+    file.read_exact(&mut streaminfo).map_err(|error| {
+        MaterializeError::Extraction(format!(
+            "cannot read FLAC STREAMINFO in {}: {error}",
+            path.display(),
+        ))
+    })?;
+
+    let max_block_size = u16::from_be_bytes([streaminfo[2], streaminfo[3]]);
+    let packed = u64::from_be_bytes([
+        streaminfo[10], streaminfo[11], streaminfo[12], streaminfo[13],
+        streaminfo[14], streaminfo[15], streaminfo[16], streaminfo[17],
+    ]);
+    let channels = (((packed >> 41) & 0x7) as u8) + 1;
+    let bits_per_sample = (((packed >> 36) & 0x1f) as u8) + 1;
+    let total_samples = packed & ((1_u64 << 36) - 1);
+    Ok(Some(FlacStreamInfo {
+        max_block_size,
+        channels,
+        bits_per_sample,
+        total_samples,
+    }))
+}
+
+fn flac_requires_full_ffmpeg_decode(info: FlacStreamInfo) -> bool {
+    let decoded_bytes_per_sample = if info.bits_per_sample <= 16 { 2_u64 } else { 4_u64 };
+    u64::from(info.max_block_size)
+        .saturating_mul(u64::from(info.channels))
+        .saturating_mul(decoded_bytes_per_sample)
+        > FFMPEG_FLAC_RISKY_DECODED_FRAME_BYTES
+}
+
+fn final_ashowinfo_sample_extent(stderr: &str) -> Option<u64> {
+    stderr.lines().rev().find_map(|line| {
+        if !line.contains("ashowinfo") || !line.contains("nb_samples:") {
+            return None;
+        }
+        let mut pts = None;
+        let mut samples = None;
+        for token in line.split_whitespace() {
+            if let Some(value) = token.strip_prefix("pts:") {
+                pts = value.parse::<u64>().ok();
+            } else if let Some(value) = token.strip_prefix("nb_samples:") {
+                samples = value.parse::<u64>().ok();
+            }
+        }
+        pts.zip(samples).and_then(|(pts, samples)| pts.checked_add(samples))
+    })
+}
+
+/// Fail closed on the FFmpeg FLAC decoder defect reproduced by the Reference
+/// qualification suite: sufficiently large decoded FLAC frames can yield no
+/// audio while FFmpeg still exits zero.  Low-risk FLACs do not pay for a
+/// redundant traversal.  For risky STREAMINFO geometry, however, FFmpeg must
+/// decode the complete stream and the final decoded sample extent must match
+/// STREAMINFO before the source is admitted to conversion.
+pub(crate) async fn validate_ffmpeg_flac_source(
+    path: &Path,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+) -> Result<(), MaterializeError> {
+    let Some(info) = flac_stream_info(path)? else {
+        return Ok(());
+    };
+    let full_decode = flac_requires_full_ffmpeg_decode(info);
+    let mut args = vec![
+        "-hide_banner".into(),
+        "-nostdin".into(),
+        "-v".into(),
+        "info".into(),
+        "-i".into(),
+        path.to_string_lossy().into_owned(),
+        "-map".into(),
+        "0:a:0".into(),
+        "-af".into(),
+        "asetpts=N/SR/TB,ashowinfo".into(),
+    ];
+    if !full_decode {
+        // A single decoded frame cheaply proves that FFmpeg can produce audio
+        // for ordinary FLAC geometry.  The known large-frame decoder defect
+        // needs a complete traversal because it can fail only after admission.
+        args.extend(["-frames:a".into(), "1".into()]);
+    }
+    args.extend(["-f".into(), "null".into(), "-".into()]);
+
+    let cmd = ToolCommand {
+        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
+        binary: ToolBinary::Ffmpeg,
+        args,
+        secret_args: vec![],
+        cwd: None,
+        env: vec![],
+        timeout: Duration::from_secs(6 * 60 * 60),
+    };
+    let output = match runner.run(cmd, cancel).await {
+        Ok(output) => output,
+        Err(ToolRunnerError::Cancelled { .. }) => return Err(MaterializeError::Cancelled),
+        Err(error) => {
+            return Err(MaterializeError::Extraction(format!(
+                "FFmpeg cannot decode source FLAC {}: {error}",
+                path.display(),
+            )))
+        }
+    };
+    let decoded_samples = final_ashowinfo_sample_extent(&output.stderr_tail).unwrap_or(0);
+    if decoded_samples == 0 {
+        return Err(MaterializeError::Extraction(format!(
+            "FFmpeg reported success but decoded zero samples from source FLAC {}; refusing silent output",
+            path.display(),
+        )));
+    }
+    if full_decode && info.total_samples != 0 && decoded_samples != info.total_samples {
+        return Err(MaterializeError::Extraction(format!(
+            "FFmpeg decoded only {decoded_samples} of {} STREAMINFO samples from source FLAC {}; refusing truncated output",
+            info.total_samples,
+            path.display(),
+        )));
+    }
+    Ok(())
+}
+
 struct ProbeResult {
     sample_rate: u32,
     expected_samples: Option<u64>,
@@ -984,6 +1170,64 @@ mod tests {
 
     fn list_values(values: &MetadataValueList) -> Vec<&str> {
         values.values().iter().map(String::as_str).collect()
+    }
+
+    fn write_test_flac_streaminfo(
+        path: &Path,
+        max_block_size: u16,
+        channels: u8,
+        bits_per_sample: u8,
+        total_samples: u64,
+    ) {
+        assert!((1..=8).contains(&channels));
+        assert!((1..=32).contains(&bits_per_sample));
+        assert!(total_samples < (1_u64 << 36));
+        let mut streaminfo = [0_u8; 34];
+        streaminfo[..2].copy_from_slice(&16_u16.to_be_bytes());
+        streaminfo[2..4].copy_from_slice(&max_block_size.to_be_bytes());
+        let packed = (96_000_u64 << 44)
+            | (u64::from(channels - 1) << 41)
+            | (u64::from(bits_per_sample - 1) << 36)
+            | total_samples;
+        streaminfo[10..18].copy_from_slice(&packed.to_be_bytes());
+        let mut bytes = Vec::with_capacity(42);
+        bytes.extend_from_slice(b"fLaC");
+        bytes.extend_from_slice(&[0x80, 0x00, 0x00, 34]);
+        bytes.extend_from_slice(&streaminfo);
+        std::fs::write(path, bytes).expect("write synthetic FLAC STREAMINFO");
+    }
+
+    #[test]
+    fn flac_streaminfo_parser_recovers_decoder_risk_geometry() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("risk.flac");
+        write_test_flac_streaminfo(&path, 16_384, 6, 32, 123_456);
+        let info = flac_stream_info(&path)
+            .expect("STREAMINFO parse")
+            .expect("FLAC STREAMINFO");
+        assert_eq!(
+            info,
+            FlacStreamInfo {
+                max_block_size: 16_384,
+                channels: 6,
+                bits_per_sample: 32,
+                total_samples: 123_456,
+            }
+        );
+        assert!(flac_requires_full_ffmpeg_decode(info));
+        assert!(!flac_requires_full_ffmpeg_decode(FlacStreamInfo {
+            max_block_size: 8_192,
+            ..info
+        }));
+    }
+
+    #[test]
+    fn ashowinfo_extent_uses_last_decoded_frame() {
+        let stderr = "[Parsed_ashowinfo_0] n:0 pts:0 pts_time:0 nb_samples:8192\n\
+[Parsed_ashowinfo_0] n:1 pts:8192 pts_time:0.08 nb_samples:8192\n\
+[Parsed_ashowinfo_0] n:2 pts:16384 pts_time:0.17 nb_samples:4096\n";
+        assert_eq!(final_ashowinfo_sample_extent(stderr), Some(20_480));
+        assert_eq!(final_ashowinfo_sample_extent("no decoded audio"), None);
     }
 
     #[test]

@@ -1024,107 +1024,72 @@ impl TuiPreset {
         report
     }
 
-    /// Import from a legacy wizard ConversionPreset
-    pub fn from_legacy(preset: &tonepoet_wizard::ConversionPreset) -> Self {
-        use tonepoet_wizard::AudioFormat as WF;
-
-        let format = match preset.selected_format {
-            WF::Flac => "flac",
-            WF::Wav => "wav",
-            WF::Aiff => "aiff",
-            WF::WavPack => "wavpack",
-            WF::Mp3 => "mp3",
-            WF::Aac => "aac",
-            WF::Opus => "opus",
-        };
-
-        let bit_depth = match preset.bit_depth {
-            Some(16) => "16",
-            Some(24) => "24",
-            Some(32) => "32",
-            Some(320) => "32f",
-            _ => "24", // default
-        };
-
-        let dither = preset
-            .dither_type
-            .as_ref()
-            .map(|dt| {
-                use tonepoet_wizard::DitherType as WD;
-                match dt {
-                    WD::None => "none",
-                    WD::Tpdf => "tpdf",
-                    WD::Shibata | WD::LowShibata | WD::HighShibata => "shaped",
-                    WD::Gesemann => "shaped",
-                    WD::SlopedTpdf => "tpdf",
-                }
-            })
-            .unwrap_or("tpdf");
-
-        let replaygain = preset
-            .replaygain_mode
-            .as_ref()
-            .map(|rg| {
-                use tonepoet_wizard::ReplayGainMode as WR;
-                match rg {
-                    WR::Track => "track",
-                    WR::Album => "album",
-                    WR::Both => "both",
-                    WR::Off => "off",
-                }
-            })
-            .unwrap_or("off");
-
-        let merge = if preset.merge_to_single == Some(true) {
-            "single-image"
-        } else {
-            "multi-file"
-        };
-
-        Self {
-            name: preset.name.clone(),
-            description: preset.description.clone(),
-            version: 2,
-            format: format.to_string(),
-            sample_rate: preset.sample_rate.unwrap_or(44100),
-            bit_depth: bit_depth.to_string(),
-            dither: dither.to_string(),
-            replaygain: replaygain.to_string(),
-            resampler: default_resampler(),
-            noise_shaper: Some("clans".to_string()),
-            modulator_order: Some(8),
-            dsd_filter_preset: Some("auto".to_string()),
-            output_target: None,
-            dsd_path: None,
-            dsd_reconstruction: None,
-            dsd_lowpass: None,
-            dsd_profile: None,
-            dsd_export_level: None,
-            dsd_true_peak_scope: None,
-            dsd_true_peak_scan: None,
-            dsd_gain: None,
-            dsd_gain_db: None,
-            dsd_true_peak_target_dbtp: None,
-            // The legacy wizard preset carries no PCM true-peak state, exactly
-            // as it carries none of the DSD gain state above.
-            pcm_gain: None,
-            pcm_fixed_gain_db: None,
-            pcm_true_peak_target_dbtp: None,
-            pcm_true_peak_scope: None,
-            pcm_true_peak_scan: None,
-            album_artist_for_conversion: None,
-            dest_path: None,
-            folder_template: "%ARTIST%/%ALBUM% (%YEAR%)".to_string(),
-            filename_template: "%TRACKNN% - %TITLE%.%EXT%".to_string(),
-            merge: merge.to_string(),
-            companion_extensions: default_companion_extensions(),
-            companion_folders: String::new(),
-            companion_exclude_files: String::new(),
-            force_encode: false,
-            disc_subfolders: false,
-            write_log: false,
-            actions: crate::convert::pipeline::ActionPipeline::default(),
+    /// Project this on-disk TUI preset into the same `ConversionOptions`
+    /// carrier used by the live TUI.
+    ///
+    /// A CLI preset is loaded before its inputs are probed, while the TUI
+    /// normally applies a preset after source identity is known.  Preserve
+    /// both source-relative policy branches here: ordinary PCM true-peak
+    /// policy comes from a PCM-source projection and DSD-to-PCM policy comes
+    /// from a DSD-source projection.  The production planner then selects the
+    /// relevant branch from the actual admitted source instead of whichever
+    /// source class happened to be assumed while loading the preset.
+    pub fn to_conversion_options(
+        &self,
+        config: &crate::config::TonepoetConfig,
+    ) -> Result<crate::convert::ConversionOptions, String> {
+        fn project(
+            preset: &TuiPreset,
+            config: &crate::config::TonepoetConfig,
+            source_is_dsd: bool,
+        ) -> Result<(
+            crate::convert::ConversionOptions,
+            OutputOptionsState,
+            MetadataState,
+        ), String> {
+            let mut format = FormatState::new();
+            format.set_source_is_dsd(source_is_dsd);
+            let mut output = OutputOptionsState::new();
+            let mut metadata = MetadataState::default();
+            let report = preset.apply_to_pills(&mut format, &mut output, &mut metadata);
+            if !report.is_complete() {
+                return Err(format!(
+                    "preset '{}' cannot be applied{}",
+                    preset.name,
+                    report.status_suffix(),
+                ));
+            }
+            let mut options = super::convert_actions::try_pills_to_options(
+                &format,
+                &output,
+                config,
+            )?;
+            output.apply_companion_copying_to_conversion_options(&mut options);
+            options.album_artist_override = metadata
+                .album_artist_for_conversion
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            Ok((options, output, metadata))
         }
+
+        let (mut options, _, _) = project(self, config, false)?;
+        let (dsd_options, _, _) = project(self, config, true)?;
+        match (
+            options.pipeline_settings.as_mut(),
+            dsd_options.pipeline_settings.as_ref(),
+        ) {
+            (Some(settings), Some(dsd_settings)) => {
+                // Keep PCM-source policy from the first projection, but retain
+                // the dormant DSD-source policy that is visible only after a
+                // DSD source has been probed in the TUI.
+                settings.dsd.from_dsd = dsd_settings.dsd.from_dsd.clone();
+                settings.dsd.general_from_dsd = dsd_settings.dsd.general_from_dsd.clone();
+            }
+            _ => return Err(format!("preset '{}' did not produce pipeline settings", self.name)),
+        }
+        Ok(options)
     }
 }
 
@@ -1292,13 +1257,10 @@ pub fn load_preset_from_path(path: &Path) -> Result<TuiPreset, String> {
         return Ok(preset);
     }
 
-    // Versionless files are the only inputs eligible for the legacy wizard wire.
-    let mut preset = TuiPreset::from_legacy(
-        &toml::from_str::<tonepoet_wizard::ConversionPreset>(&contents)
-            .map_err(|error| format!("Invalid versionless legacy preset '{}': {error}", path.display()))?,
-    );
-    preset.name = display_name.to_string();
-    Ok(preset)
+    Err(format!(
+        "Preset '{}' has no TUI preset version; versionless wizard presets are not supported",
+        path.display(),
+    ))
 }
 
 /// Save a preset to disk in the configured presets directory.

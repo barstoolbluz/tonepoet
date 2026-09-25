@@ -20,4 +20,4 @@ pub use types::{
 pub use theme::WizardTheme;
 pub use ui::{draw_wizard, draw_wizard_with_theme, ButtonId, MouseAreas};
 
-pub use presets::{ConversionPreset, PresetManager};
+pub use presets::{PresetManager, TuiPresetProjection};

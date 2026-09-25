@@ -97,6 +97,10 @@ enum Commands {
         #[arg(short, long)]
         format: Option<String>,
 
+        /// Target output sample rate in Hz, or `source` to preserve the source rate.
+        #[arg(long = "sample-rate", value_name = "HZ|source", value_parser = parse_cli_sample_rate)]
+        sample_rate: Option<u32>,
+
         /// Target PCM bit depth (16, 24, 32, 32f, 64f, or source). With no
         /// flag, DSD/lossy sources use the target format's documented default.
         #[arg(long = "bit-depth", value_name = "16|24|32|32f|64f|source", value_parser = parse_cli_bit_depth)]
@@ -603,6 +607,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         Commands::Convert {
             paths,
             format,
+            sample_rate,
             bit_depth,
             output,
             workers,
@@ -642,6 +647,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             run_convert(
                 paths,
                 format,
+                sample_rate,
                 bit_depth,
                 output,
                 workers,
@@ -883,6 +889,20 @@ fn parse_format(s: &str) -> anyhow::Result<AudioFormat> {
     }
 }
 
+fn parse_cli_sample_rate(value: &str) -> Result<u32, String> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("source") {
+        return Ok(0);
+    }
+    let parsed = value
+        .parse::<u32>()
+        .map_err(|_| format!("invalid sample rate '{value}'; expected a positive Hz value or source"))?;
+    if parsed == 0 {
+        return Err("sample rate must be positive or 'source'".to_string());
+    }
+    Ok(parsed)
+}
+
 fn parse_cli_bit_depth(value: &str) -> Result<u32, String> {
     match value.trim().to_ascii_lowercase().as_str() {
         "source" => Ok(0),
@@ -937,6 +957,19 @@ mod startup_config_tests {
         assert!(!reset);
         assert!(!path);
         assert!(retire_secret_journal);
+    }
+}
+
+#[cfg(test)]
+mod sample_rate_cli_tests {
+    use super::parse_cli_sample_rate;
+
+    #[test]
+    fn accepts_hz_and_source_sample_rate_values() {
+        assert_eq!(parse_cli_sample_rate("176400"), Ok(176_400));
+        assert_eq!(parse_cli_sample_rate("source"), Ok(0));
+        assert!(parse_cli_sample_rate("0").is_err());
+        assert!(parse_cli_sample_rate("96k").is_err());
     }
 }
 
@@ -1462,10 +1495,61 @@ mod dsd_reference_cli_settings_tests {
 }
 
 
+fn pipeline_audio_format_for_cli(format: AudioFormat) -> tonepoet_pipeline::AudioFormat {
+    use tonepoet_pipeline::AudioFormat as PipelineFormat;
+    match format {
+        AudioFormat::Flac => PipelineFormat::Flac,
+        AudioFormat::Wav => PipelineFormat::Wav,
+        AudioFormat::Aiff => PipelineFormat::Aiff,
+        AudioFormat::WavPack => PipelineFormat::WavPack,
+        AudioFormat::Mp3 => PipelineFormat::Mp3,
+        AudioFormat::Aac => PipelineFormat::Aac,
+        AudioFormat::Opus => PipelineFormat::Opus,
+        AudioFormat::Alac => PipelineFormat::Alac,
+        AudioFormat::Dsf => PipelineFormat::Dsf,
+        AudioFormat::Dff => PipelineFormat::Dff,
+        AudioFormat::Dts => PipelineFormat::Dts,
+        AudioFormat::Ac3 => PipelineFormat::Ac3,
+        AudioFormat::Lpcm => PipelineFormat::Wav,
+        AudioFormat::Ape | AudioFormat::Musepack | AudioFormat::Shorten | AudioFormat::Ogg | AudioFormat::Tta => PipelineFormat::Flac,
+    }
+}
+
+fn cli_rate_target_for_cli(
+    output_format: AudioFormat,
+    rate: u32,
+) -> anyhow::Result<tonepoet_pipeline::RateTarget> {
+    use tonepoet_pipeline::{DsdRate, RateTarget};
+    if rate == 0 {
+        return Ok(RateTarget::Source);
+    }
+    if matches!(output_format, AudioFormat::Dsf | AudioFormat::Dff) {
+        return DsdRate::from_hz(rate)
+            .map(RateTarget::Dsd)
+            .ok_or_else(|| anyhow::anyhow!("{rate} Hz is not a supported DSD output rate"));
+    }
+    Ok(RateTarget::PcmHz(rate))
+}
+
+fn cli_bit_depth_target(depth: u32) -> anyhow::Result<tonepoet_pipeline::BitDepthTarget> {
+    use tonepoet_pipeline::{BitDepthTarget, PcmBitDepth};
+    let depth = match depth {
+        0 => return Ok(BitDepthTarget::Source),
+        16 => PcmBitDepth::Int16,
+        24 => PcmBitDepth::Int24,
+        32 => PcmBitDepth::Int32,
+        320 => PcmBitDepth::Float32,
+        640 => PcmBitDepth::Float64,
+        other => return Err(anyhow::anyhow!("unsupported CLI bit depth {other}")),
+    };
+    Ok(BitDepthTarget::Pcm(depth))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_convert(
     paths: Vec<PathBuf>,
     format: Option<String>,
+    sample_rate: Option<u32>,
     bit_depth: Option<u32>,
     output: Option<PathBuf>,
     workers: Option<usize>,
@@ -1503,17 +1587,21 @@ async fn run_convert(
     dvda_downmix: Option<DvdaDownmixPolicy>,
     config: &TonepoetConfig,
 ) -> anyhow::Result<()> {
-    // Load preset if specified
+    // CLI and TUI deliberately share one on-disk preset schema and one
+    // projection into ConversionOptions.  The projection preserves dormant
+    // PCM-source and DSD-source policy until the real source is admitted.
     let preset_options: Option<ConversionOptions> = if let Some(preset_name) = &preset {
-        let preset_mgr = tonepoet_wizard::PresetManager::new()
-            .map_err(|e| anyhow::anyhow!("Failed to initialize preset manager: {}", e))?;
-        let preset = preset_mgr
-            .load_preset(preset_name)
+        let preset = tonepoet::tui::presets::load_preset(preset_name)
             .map_err(|e| anyhow::anyhow!("Failed to load preset '{}': {}", preset_name, e))?;
-        Some(preset_to_options(&preset))
+        Some(
+            preset
+                .to_conversion_options(config)
+                .map_err(|e| anyhow::anyhow!("Failed to apply preset '{}': {}", preset_name, e))?,
+        )
     } else {
         None
     };
+    let preset_loaded = preset_options.is_some();
 
     // Determine output format
     let output_format = if let Some(fmt_str) = &format {
@@ -1531,19 +1619,34 @@ async fn run_convert(
         ..ConversionOptions::default()
     });
 
-    // Apply CLI overrides
-    options.output_format = output_format;
+    // Apply CLI overrides.  An explicit format selects that codec's default
+    // container; do not retain a container override from a preset for a
+    // different format.
+    if format.is_some() {
+        options.output_format = output_format;
+        options.quality = output_format.default_quality();
+        options.container_extension = None;
+        options.container_ffmpeg_flags.clear();
+    } else {
+        options.output_format = output_format;
+    }
+    if let Some(rate) = sample_rate {
+        options.target_sample_rate = (rate != 0).then_some(rate);
+    }
     if let Some(depth) = bit_depth {
-        options.target_bit_depth = Some(depth);
+        options.target_bit_depth = (depth != 0).then_some(depth);
     }
     if let Some(dir) = &output {
         options.output_dir = Some(dir.clone());
-    } else if let Some(ref dir) = config.conversion.default_destination {
-        options.output_dir = Some(dir.clone());
+    } else if options.output_dir.is_none() {
+        if let Some(ref dir) = config.conversion.default_destination {
+            options.output_dir = Some(dir.clone());
+        }
     }
-    // The config's default action pipeline applies when nothing more
-    // specific set one (same rule the TUI uses for its Output Options seed).
-    if options.actions.is_empty() {
+    // Seed an ordinary CLI request from the configured action pipeline. A
+    // loaded TUI preset is authoritative even when it deliberately stores an
+    // empty action pipeline, matching preset application on the TUI surface.
+    if !preset_loaded && options.actions.is_empty() {
         options.actions = config.conversion.actions.clone();
     }
 
@@ -1564,7 +1667,7 @@ async fn run_convert(
             tonepoet::convert::simple_wizard::ReplayGainMode::Both => tonepoet_pipeline::ReplayGainMode::Both,
         });
         settings.replay_gain.existing_tags = existing_tags;
-    } else if config.conversion.calculate_replaygain {
+    } else if !preset_loaded && config.conversion.calculate_replaygain {
         options.calculate_replaygain = true;
         if options.replaygain_mode.is_none() {
             options.replaygain_mode = Some(tonepoet::convert::simple_wizard::ReplayGainMode::Album);
@@ -1616,11 +1719,15 @@ async fn run_convert(
             _ => Backend::FFmpeg,
         });
     }
-    options.append_lineage_to_comment =
-        append_lineage || config.conversion.append_lineage_to_comment;
-    options.write_log_file = write_log || config.conversion.write_log_file;
-    options.create_disc_subfolders = disc_subfolders;
-    options.generate_cue_files = generate_cue || config.conversion.generate_cue_files;
+    options.append_lineage_to_comment = options.append_lineage_to_comment
+        || append_lineage
+        || config.conversion.append_lineage_to_comment;
+    options.write_log_file = options.write_log_file
+        || write_log
+        || (!preset_loaded && config.conversion.write_log_file);
+    options.create_disc_subfolders = options.create_disc_subfolders || disc_subfolders;
+    options.generate_cue_files =
+        options.generate_cue_files || generate_cue || config.conversion.generate_cue_files;
     if let Some(template) = &naming {
         options.naming_template = Some(template.clone());
     }
@@ -1628,12 +1735,49 @@ async fn run_convert(
         options.folder_template = Some(template.clone());
     }
 
-    // Materialize the CLI's complete planner settings through the checked
-    // compatibility bridge. This is where `--bit-depth source` remains Source,
-    // while malformed numeric requests are rejected rather than substituted.
-    let mut cli_pipeline_settings =
+    // Preserve the exact settings carried by a TUI preset.  The legacy bridge
+    // is only a fallback for an ordinary CLI request; rebuilding an existing
+    // preset here would discard source-relative gain and resampler policy.
+    let mut cli_pipeline_settings = if let Some(settings) = options.pipeline_settings.clone() {
+        settings
+    } else {
         tonepoet::convert::pipeline::pipeline_settings_from_legacy_options(&options)
-            .map_err(|error| anyhow::anyhow!("invalid conversion settings: {error}"))?;
+            .map_err(|error| anyhow::anyhow!("invalid conversion settings: {error}"))?
+    };
+    if format.is_some() {
+        cli_pipeline_settings.target_format = pipeline_audio_format_for_cli(output_format);
+    }
+    if let Some(rate) = sample_rate {
+        cli_pipeline_settings.target_sample_rate = cli_rate_target_for_cli(output_format, rate)?;
+    }
+    if let Some(depth) = bit_depth {
+        cli_pipeline_settings.target_bit_depth = cli_bit_depth_target(depth)?;
+    }
+    if reencode_flac {
+        cli_pipeline_settings.force_encode = true;
+    }
+    if let Some(level) = compression_level {
+        if output_format == AudioFormat::Flac {
+            cli_pipeline_settings.flac.compression_level = level;
+        }
+    }
+    if let Some(br) = bitrate {
+        match output_format {
+            AudioFormat::Mp3 => {
+                cli_pipeline_settings.mp3.mode = tonepoet_pipeline::Mp3Mode::Cbr;
+                cli_pipeline_settings.mp3.bitrate_kbps = br;
+            }
+            AudioFormat::Aac => {
+                cli_pipeline_settings.aac.profile = tonepoet_pipeline::AacProfile::LcAac;
+                cli_pipeline_settings.aac.bitrate_kbps = br;
+            }
+            AudioFormat::Opus => {
+                cli_pipeline_settings.opus.bitrate_kbps = br;
+                cli_pipeline_settings.opus.complexity = 10;
+            }
+            _ => {}
+        }
+    }
     apply_cli_dsd_reference_settings(
         &mut cli_pipeline_settings,
         output_format,
@@ -2329,7 +2473,10 @@ fn build_pipeline_request_template(
         CueSidecarPolicy::PreferSidecar
     };
 
-    let output_root = output.clone().unwrap_or_else(|| PathBuf::from("."));
+    let output_root = output
+        .clone()
+        .or_else(|| options.output_dir.clone())
+        .unwrap_or_else(|| PathBuf::from("."));
 
     let parsed_rg = replaygain
         .as_deref()
@@ -2341,7 +2488,7 @@ fn build_pipeline_request_template(
 
     let mut request = PipelineRequest {
         registered_effects: Vec::new(),
-        actions: tonepoet::convert::pipeline::ActionPipeline::default(),
+        actions: options.actions.clone(),
         worker_count: None,
         scratch_staging: None,
         job_id: String::new(),     // filled per-item
@@ -2376,11 +2523,15 @@ fn build_pipeline_request_template(
             tonepoet::convert::pipeline::pipeline_settings_from_legacy_options(options)
                 .expect("CLI template tests supply valid legacy conversion options")
         }),
-        merge,
+        merge: merge || options.merge_to_single,
         output_root: output_root.clone(),
         naming: NamingPolicy {
-            template: naming.unwrap_or("%NN% - %TITLE%").to_string(),
-            folder_template: folder_naming.map(str::to_string),
+            template: naming
+                .map(str::to_string)
+                .unwrap_or_else(|| options.effective_naming_template("%NN% - %TITLE%")),
+            folder_template: folder_naming
+                .map(str::to_string)
+                .or_else(|| options.folder_template.clone()),
             per_album_subdir: true,
             collision_policy: NamingCollisionPolicy::Fail,
             windows_portable,
@@ -2423,8 +2574,8 @@ fn build_pipeline_request_template(
         } else {
             FailurePolicy::FailAlbumOnAnyTrackFailure
         },
-        container_extension: None,
-        container_ffmpeg_flags: Vec::new(),
+        container_extension: options.container_extension.clone(),
+        container_ffmpeg_flags: options.container_ffmpeg_flags.clone(),
         album_batch: None,
         album_batch_track: None,
         companion: tonepoet::convert::pipeline::CompanionCopyPolicy {
@@ -2448,50 +2599,6 @@ fn build_pipeline_request_template(
         request.settings.replay_gain.existing_tags = existing_tags;
     }
     Some(request)
-}
-
-/// Convert a wizard ConversionPreset to ConversionOptions
-fn preset_to_options(preset: &tonepoet_wizard::ConversionPreset) -> ConversionOptions {
-    use tonepoet_wizard::AudioFormat as WizFormat;
-
-    let format = match preset.selected_format {
-        WizFormat::Flac => AudioFormat::Flac,
-        WizFormat::Wav => AudioFormat::Wav,
-        WizFormat::Aiff => AudioFormat::Aiff,
-        WizFormat::Mp3 => AudioFormat::Mp3,
-        WizFormat::Aac => AudioFormat::Aac,
-        WizFormat::Opus => AudioFormat::Opus,
-        WizFormat::WavPack => AudioFormat::WavPack,
-    };
-
-    let quality = format.default_quality();
-
-    let replaygain_mode = preset.replaygain_mode.as_ref().map(|mode| {
-        use tonepoet::convert::simple_wizard::ReplayGainMode;
-        use tonepoet_wizard::ReplayGainMode as WizRG;
-        match mode {
-            WizRG::Track => ReplayGainMode::Track,
-            WizRG::Album => ReplayGainMode::Album,
-            WizRG::Both => ReplayGainMode::Both,
-            WizRG::Off => return ReplayGainMode::Album, // shouldn't reach here
-        }
-    });
-
-    ConversionOptions {
-        output_format: format,
-        quality,
-        calculate_replaygain: preset
-            .replaygain_mode
-            .as_ref()
-            .map(|m| !matches!(m, tonepoet_wizard::ReplayGainMode::Off))
-            .unwrap_or(false),
-        replaygain_mode,
-        merge_to_single: preset.merge_to_single.unwrap_or(false),
-        reencode_flac: preset.reencode_flac.unwrap_or(false),
-        target_sample_rate: preset.sample_rate,
-        target_bit_depth: preset.bit_depth,
-        ..ConversionOptions::default()
-    }
 }
 
 async fn run_wizard(_config: &TonepoetConfig) -> anyhow::Result<()> {

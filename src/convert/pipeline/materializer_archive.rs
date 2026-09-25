@@ -4799,6 +4799,7 @@ async fn probe_audio_file(
         Err(ToolRunnerError::Cancelled { .. }) => return Err(MaterializeError::Cancelled),
         Err(e) => return Err(e.into()),
     };
+    super::materializer_single::validate_ffmpeg_flac_source(path, runner, cancel).await?;
 
     parse_ffprobe_json(&output.stdout_tail)
 }
