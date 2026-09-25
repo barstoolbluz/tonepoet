@@ -18,9 +18,11 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::{mpsc, Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use fs2::FileExt;
+use rayon::prelude::*;
 use sacd_rs::dsd_file::DsdFrameReader;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -4047,6 +4049,9 @@ fn plan_request_settings_for_summary(
 ) -> PipelineSettings {
     let mut settings = PipelineSettings::default();
     settings.dsd = tonepoet_pipeline::DsdSettings::reference();
+    settings.dsd.from_dsd.reference_policy = DsdReferencePolicyVersion::SoxNg14801V18;
+    settings.dsd.from_dsd.profile = DsdReconstructionSelection::Reference;
+    settings.dsd.from_dsd.gain = reference_auto_gain(DbNano::DEFAULT_REFERENCE_TRUE_PEAK_TARGET);
     settings.target_format = target_format(summary.target);
     settings.target_sample_rate = RateTarget::PcmHz(summary.final_pcm.sample_rate_hz);
     settings.target_bit_depth = BitDepthTarget::Pcm(summary.final_pcm.bit_depth);
@@ -5373,29 +5378,109 @@ fn record_decode_authority(
         .or_default() += 1;
 }
 
-fn qualify_lossless_package_cells(
-    forbidden_route_regression: Value,
-) -> PackageQualificationEvidence {
-    let sox = required_tool(SOX_ENV);
-    let ffmpeg = required_tool(FFMPEG_ENV);
-    let metaflac = required_tool(METAFLAC_ENV);
-    let wvtag = required_tool(WVTAG_ENV);
-    let atomic_parsley = required_tool(ATOMIC_PARSLEY_ENV);
-    let ffprobe = required_sibling_tool(&ffmpeg, "ffprobe");
-    let temp = TempDir::new().expect("package qualification tempdir");
+
+#[derive(Default)]
+struct PackageRateEvidence {
+    case_count: usize,
+    terminal_bound_case_count: usize,
+    terminal_observed_max_error_by_depth: BTreeMap<String, f64>,
+    route_counts: BTreeMap<String, usize>,
+    encoding_counts: BTreeMap<String, usize>,
+    terminal_route_counts: BTreeMap<String, usize>,
+    production_primary_mutator_case_counts: BTreeMap<String, usize>,
+    production_m4a_freeform_case_count: usize,
+    independent_float64_riff_rf64_case_count: usize,
+    package_identity_comparison_count: usize,
+    w64_direct_delivery_exact_validation_count: usize,
+    post_metadata_identity_comparison_count: usize,
+    w64_planner_entry_rejection_count: usize,
+    w64_metadata_entry_rejection_count: usize,
+}
+
+fn add_case_counts(target: &mut BTreeMap<String, usize>, source: BTreeMap<String, usize>) {
+    for (key, value) in source {
+        *target.entry(key).or_default() += value;
+    }
+}
+
+fn merge_maxima(target: &mut BTreeMap<String, f64>, source: BTreeMap<String, f64>) {
+    for (key, value) in source {
+        target
+            .entry(key)
+            .and_modify(|current| *current = current.max(value))
+            .or_insert(value);
+    }
+}
+
+fn panic_payload_text(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_string()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+fn copy_qualification_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            copy_qualification_tree(&source_path, &destination_path)?;
+        } else if file_type.is_file() {
+            fs::copy(&source_path, &destination_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn preserve_failed_qualification_cell(case_root: &Path, cell_label: &str) -> PathBuf {
+    let base = std::env::var_os("TONEPOET_QUAL_FAIL_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("tonepoet-qual-failcell"));
+    let destination = base.join(cell_label);
+    if destination.exists() {
+        let _ = fs::remove_dir_all(&destination);
+    }
+    if let Err(error) = copy_qualification_tree(case_root, &destination) {
+        eprintln!(
+            "could not preserve failing qualification cell {} at {}: {error}",
+            case_root.display(),
+            destination.display(),
+        );
+    }
+    destination
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qualify_lossless_package_rate(
+    sample_rate_hz: u32,
+    temp_root: &Path,
+    sox: &Path,
+    ffmpeg: &Path,
+    metaflac: &Path,
+    wvtag: &Path,
+    atomic_parsley: &Path,
+    ffprobe: &Path,
+    planner_sources: &BTreeMap<u16, PathBuf>,
+    track_metadata: &TrackMetadata,
+    album_metadata: &AlbumMetadata,
+    cancelled: &AtomicBool,
+) -> PackageRateEvidence {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .expect("production metadata qualification runtime");
-    let metadata_runner = production_metadata_runner(&ffmpeg, &metaflac, &wvtag, &atomic_parsley);
-    let (track_metadata, album_metadata) = qualification_metadata();
-    let mut planner_sources = BTreeMap::new();
-    for channels in 1_u16..=6 {
-        let source = temp.path().join(format!("planner-{channels}ch.dsf"));
-        let _ = write_dsf_reference_fixture(&source, channels, 2_822_400);
-        planner_sources.insert(channels, source);
-    }
-
+        .expect("per-rate package qualification runtime");
+    let metadata_runner = production_metadata_runner(ffmpeg, metaflac, wvtag, atomic_parsley);
+    let candidate_tool_paths = HashMap::from([
+        ("sox".to_string(), sox.to_path_buf()),
+        ("ffmpeg".to_string(), ffmpeg.to_path_buf()),
+    ]);
+    let candidate_runner = RealToolRunner::new(candidate_tool_paths.clone());
     let mut case_count = 0_usize;
     let mut terminal_bound_cells = BTreeSet::new();
     let mut route_counts = BTreeMap::<String, usize>::new();
@@ -5410,20 +5495,6 @@ fn qualify_lossless_package_cells(
     let mut post_metadata_identity_comparison_count = 0_usize;
     let mut w64_planner_entry_rejection_count = 0_usize;
     let mut w64_metadata_entry_rejection_count = 0_usize;
-    let alignment_probes = qualify_alignment_metadata_mutation_probes(
-        &sox,
-        &ffmpeg,
-        temp.path(),
-        &runtime,
-        &metadata_runner,
-        &track_metadata,
-        &album_metadata,
-    );
-
-    let rates = [
-        44_100_u32, 48_000, 88_200, 96_000, 176_400, 192_000, 352_800, 384_000,
-        705_600, 768_000,
-    ];
     let depths = [
         (PcmBitDepth::Int16, "int16"),
         (PcmBitDepth::Int24, "int24"),
@@ -5432,8 +5503,7 @@ fn qualify_lossless_package_cells(
         (PcmBitDepth::Float64, "float64"),
     ];
 
-    for sample_rate_hz in rates {
-        for channels in 1_u16..=6 {
+        'channels: for channels in 1_u16..=6 {
             for (depth, depth_key) in depths {
                 let targets: Vec<(ResolvedOutputTarget, Vec<Option<u8>>)> =
                     if matches!(depth, PcmBitDepth::Float32 | PcmBitDepth::Float64) {
@@ -5489,9 +5559,16 @@ fn qualify_lossless_package_cells(
                                 continue;
                             }
                         }
-                        let case_root = temp.path().join(cell_label);
+                        if cancelled.load(Ordering::Acquire) {
+                            break 'channels;
+                        }
+                        let case_root = temp_root.join(&cell_label);
                         fs::create_dir_all(&case_root).expect("create package case root");
-                        let source = case_root.join("source-placeholder.dsf");
+                        let cell_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let source = planner_sources
+                            .get(&channels)
+                            .expect("planner fixture exists for every qualified channel count")
+                            .clone();
                         let plan = planned_reference_cell(
                             &case_root,
                             &source,
@@ -5505,14 +5582,80 @@ fn qualify_lossless_package_cells(
                             level,
                         );
                         let summary = plan.reference.as_ref().expect("Reference summary");
-                        synth_r64_fixture(
-                            &sox,
-                            &summary.r64_path,
-                            sample_rate_hz,
-                            channels,
-                            "0.025",
-                            false,
-                        );
+
+                        // A positive package cell is first executed by the exact
+                        // common production Reference executor.  The historical
+                        // independent terminal/package checks below remain as
+                        // evidence oracles, but they no longer stand in for the
+                        // conversion path being qualified.
+                        let candidate_request = PlanRequest {
+                            input_path: source.clone(),
+                            output_path: summary.delivered_path.clone(),
+                            source: SourceInfo {
+                                format: AudioFormat::Dsf,
+                                codec: AudioCodec::Dsd,
+                                sample_rate_hz: Some(2_822_400),
+                                bit_depth: None,
+                                true_source_depth: None,
+                                source_representation: SourceRepresentationKind::Dsd,
+                                sample_kind: Some(SampleKind::Dsd),
+                                channels: Some(channels),
+                                duration: Some(std::time::Duration::from_secs_f64(
+                                    (32_768_f64 * 8.0) / 2_822_400.0,
+                                )),
+                                frame_extent: None,
+                                dsd_source_kind: Some(DsdSourceKind::DsfUncompressed),
+                                audio_md5: None,
+                            },
+                            settings: plan_request_settings_for_summary(summary, level),
+                            plan_scope: tonepoet_pipeline::PlanScope::track(format!(
+                                "qualification-{cell_label}"
+                            )),
+                            intermediate_dir: Some(case_root.join("work")),
+                            container_ffmpeg_flags: Vec::new(),
+                            resolved_output_target: Some(target),
+                            reference_programme_scope: ReferenceProgrammeScope::Singleton,
+                            planned_riff_non_audio_upper_bound_bytes: Some(0),
+                        };
+                        let candidate = runtime
+                            .block_on(qualify_reference_common_candidate_execution(
+                                &candidate_request,
+                                &case_root,
+                                &candidate_runner,
+                                &CancellationToken::new(),
+                                &candidate_tool_paths,
+                            ))
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "production Reference executor failed for {cell_label}: {error}"
+                                )
+                            });
+                        assert_eq!(candidate.plan.target, summary.target);
+                        assert_eq!(candidate.plan.final_pcm, summary.final_pcm);
+                        assert_eq!(candidate.plan.r64_path, summary.r64_path);
+                        assert_eq!(candidate.plan.qpcm_path, summary.qpcm_path);
+                        assert_eq!(candidate.plan.packaged_path, summary.packaged_path);
+                        assert!(candidate.staged_artifact_path.is_file());
+
+                        // The independent package oracle below intentionally
+                        // re-executes terminal/package lowering from the R64
+                        // produced by the production executor. Remove only its
+                        // downstream artifacts so pre-existing files cannot
+                        // affect overwrite semantics.
+                        let candidate_downstream = BTreeSet::from([
+                            summary.qpcm_path.clone(),
+                            summary.packaged_path.clone(),
+                        ]);
+                        for path in candidate_downstream {
+                            if path.exists() {
+                                fs::remove_file(&path).unwrap_or_else(|error| {
+                                    panic!(
+                                        "cannot reset candidate artifact {} before independent oracle: {error}",
+                                        path.display(),
+                                    )
+                                });
+                            }
+                        }
                         let selected_gain = match summary.gain_policy {
                             ResolvedGainPolicy::TruePeakNormalize { bound_gain: Some(gain), .. } => gain,
                             ResolvedGainPolicy::TruePeakNormalize { bound_gain: None, .. } => DbNano::ZERO,
@@ -5656,14 +5799,6 @@ fn qualify_lossless_package_cells(
                         } else {
                             let packaged_hash =
                                 decoded_sample_hash(&packaged_carrier, &sox, &ffmpeg);
-                            if packaged_hash != qpcm_hash {
-                                // Keep the artifacts of a failing cell for inspection.
-                                let keep = std::path::PathBuf::from("/tmp/nix-shell.chi9EA/qual-failcell");
-                                let _ = fs::create_dir_all(&keep);
-                                let _ = fs::copy(packaged_carrier.path(), keep.join("packaged.bin"));
-                                let _ = fs::copy(qpcm_carrier.path(), keep.join("qpcm.w64"));
-                                eprintln!("kept failing cell artifacts in {}", keep.display());
-                            }
                             assert_eq!(
                                 packaged_hash,
                                 qpcm_hash,
@@ -5963,17 +6098,167 @@ fn qualify_lossless_package_cells(
                                 });
                             }
                         }
-                        case_count += 1;
+                        }));
+                        match cell_result {
+                            Ok(()) => case_count += 1,
+                            Err(payload) => {
+                                cancelled.store(true, Ordering::Release);
+                                let kept = preserve_failed_qualification_cell(&case_root, &cell_label);
+                                panic!(
+                                    "qualification cell {cell_label} failed: {}; artifacts kept at {}",
+                                    panic_payload_text(payload.as_ref()),
+                                    kept.display(),
+                                );
+                            }
+                        }
                     }
                 }
             }
         }
+
+    PackageRateEvidence {
+        case_count,
+        terminal_bound_case_count: terminal_bound_cells.len(),
+        terminal_observed_max_error_by_depth,
+        route_counts,
+        encoding_counts,
+        terminal_route_counts,
+        production_primary_mutator_case_counts,
+        production_m4a_freeform_case_count,
+        independent_float64_riff_rf64_case_count,
+        package_identity_comparison_count,
+        w64_direct_delivery_exact_validation_count,
+        post_metadata_identity_comparison_count,
+        w64_planner_entry_rejection_count,
+        w64_metadata_entry_rejection_count,
     }
-    // Under TONEPOET_QUAL_ONLY_CELL the matrix is one cell; the full-matrix
-    // counts below only hold for the complete run.
+}
+
+fn qualify_lossless_package_cells(
+    forbidden_route_regression: Value,
+) -> PackageQualificationEvidence {
+    let sox = required_tool(SOX_ENV);
+    let ffmpeg = required_tool(FFMPEG_ENV);
+    let metaflac = required_tool(METAFLAC_ENV);
+    let wvtag = required_tool(WVTAG_ENV);
+    let atomic_parsley = required_tool(ATOMIC_PARSLEY_ENV);
+    let ffprobe = required_sibling_tool(&ffmpeg, "ffprobe");
+    let temp = TempDir::new().expect("package qualification tempdir");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("production metadata qualification runtime");
+    let metadata_runner = production_metadata_runner(&ffmpeg, &metaflac, &wvtag, &atomic_parsley);
+    let (track_metadata, album_metadata) = qualification_metadata();
+    let mut planner_sources = BTreeMap::new();
+    for channels in 1_u16..=6 {
+        let source = temp.path().join(format!("planner-{channels}ch.dsf"));
+        let _ = write_dsf_reference_fixture(&source, channels, 2_822_400);
+        planner_sources.insert(channels, source);
+    }
+
+    let mut case_count = 0_usize;
+    let mut route_counts = BTreeMap::<String, usize>::new();
+    let mut encoding_counts = BTreeMap::<String, usize>::new();
+    let mut terminal_route_counts = BTreeMap::<String, usize>::new();
+    let mut terminal_observed_max_error_by_depth = BTreeMap::<String, f64>::new();
+    let mut production_primary_mutator_case_counts = BTreeMap::<String, usize>::new();
+    let mut production_m4a_freeform_case_count = 0_usize;
+    let mut independent_float64_riff_rf64_case_count = 0_usize;
+    let mut package_identity_comparison_count = 0_usize;
+    let mut w64_direct_delivery_exact_validation_count = 0_usize;
+    let mut post_metadata_identity_comparison_count = 0_usize;
+    let mut w64_planner_entry_rejection_count = 0_usize;
+    let mut w64_metadata_entry_rejection_count = 0_usize;
+    let alignment_probes = qualify_alignment_metadata_mutation_probes(
+        &sox,
+        &ffmpeg,
+        temp.path(),
+        &runtime,
+        &metadata_runner,
+        &track_metadata,
+        &album_metadata,
+    );
+
+    let rates = [
+        44_100_u32, 48_000, 88_200, 96_000, 176_400, 192_000, 352_800, 384_000,
+        705_600, 768_000,
+    ];
+    let cancelled = AtomicBool::new(false);
+    let requested_jobs = std::env::var("TONEPOET_QUAL_JOBS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0);
+    let jobs = requested_jobs
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|value| value.get()).unwrap_or(1))
+        .min(rates.len())
+        .max(1);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(jobs)
+        .thread_name(|index| format!("tonepoet-reference-qual-{index}"))
+        .build()
+        .expect("build package qualification thread pool");
+    let rate_evidence = pool.install(|| {
+        rates
+            .par_iter()
+            .map(|sample_rate_hz| {
+                qualify_lossless_package_rate(
+                    *sample_rate_hz,
+                    temp.path(),
+                    &sox,
+                    &ffmpeg,
+                    &metaflac,
+                    &wvtag,
+                    &atomic_parsley,
+                    &ffprobe,
+                    &planner_sources,
+                    &track_metadata,
+                    &album_metadata,
+                    &cancelled,
+                )
+            })
+            .collect::<Vec<_>>()
+    });
+
+    let mut terminal_bound_case_count = 0_usize;
+    for evidence in rate_evidence {
+        case_count += evidence.case_count;
+        terminal_bound_case_count += evidence.terminal_bound_case_count;
+        merge_maxima(
+            &mut terminal_observed_max_error_by_depth,
+            evidence.terminal_observed_max_error_by_depth,
+        );
+        add_case_counts(&mut route_counts, evidence.route_counts);
+        add_case_counts(&mut encoding_counts, evidence.encoding_counts);
+        add_case_counts(&mut terminal_route_counts, evidence.terminal_route_counts);
+        add_case_counts(
+            &mut production_primary_mutator_case_counts,
+            evidence.production_primary_mutator_case_counts,
+        );
+        production_m4a_freeform_case_count += evidence.production_m4a_freeform_case_count;
+        independent_float64_riff_rf64_case_count += evidence.independent_float64_riff_rf64_case_count;
+        package_identity_comparison_count += evidence.package_identity_comparison_count;
+        w64_direct_delivery_exact_validation_count += evidence.w64_direct_delivery_exact_validation_count;
+        post_metadata_identity_comparison_count += evidence.post_metadata_identity_comparison_count;
+        w64_planner_entry_rejection_count += evidence.w64_planner_entry_rejection_count;
+        w64_metadata_entry_rejection_count += evidence.w64_metadata_entry_rejection_count;
+    }
+
+    // Under TONEPOET_QUAL_ONLY_CELL the matrix is exactly one cell; reject a
+    // misspelled/nonexistent selector instead of reporting a false-positive run.
+    if let Some(only) = std::env::var_os("TONEPOET_QUAL_ONLY_CELL") {
+        assert_eq!(
+            case_count,
+            1,
+            "TONEPOET_QUAL_ONLY_CELL={} matched {case_count} package cells",
+            only.to_string_lossy(),
+        );
+    }
+
+    // Full-matrix counts remain the authoritative qualification contract.
     if std::env::var_os("TONEPOET_QUAL_ONLY_CELL").is_none() {
     assert_eq!(case_count, 3_540);
-    assert_eq!(terminal_bound_cells.len(), 300);
+    assert_eq!(terminal_bound_case_count, 300);
     assert_eq!(package_identity_comparison_count, 3_240);
     assert_eq!(w64_direct_delivery_exact_validation_count, 300);
     assert_eq!(post_metadata_identity_comparison_count, 3_240);
@@ -6038,7 +6323,7 @@ fn qualify_lossless_package_cells(
 
     PackageQualificationEvidence {
         case_count,
-        terminal_bound_case_count: terminal_bound_cells.len(),
+        terminal_bound_case_count,
         terminal_observed_max_error_by_depth,
         sample_identity_oracle: serde_json::json!({
             "schema": "tonepoet-reference-sample-identity-oracle/v4",

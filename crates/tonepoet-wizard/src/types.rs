@@ -684,7 +684,7 @@ impl SimpleWizard {
         }
     }
 
-    pub fn load_preset(&mut self, preset: &crate::presets::ConversionPreset) {
+    pub fn load_preset(&mut self, preset: &crate::presets::TuiPresetProjection) {
         // Load core wizard state
         self.selected_format = Some(preset.selected_format);
         self.selected_quality = preset.selected_quality.clone();
