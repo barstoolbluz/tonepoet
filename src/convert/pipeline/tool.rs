@@ -1558,7 +1558,8 @@ impl RealToolRunner {
         {
             use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
             use crate::convert::script_supervisor::{
-                run_supervised, run_supervised_via_item_supervisor, ContainmentPreference,
+                run_supervised, run_supervised_via_item_supervisor,
+                shared_unleased_execution_supervisor, ContainmentPreference,
                 RuntimeDirectoryIdentity, ScriptLifecycleEvent, SupervisedCommand,
             };
 
@@ -1633,6 +1634,31 @@ impl RealToolRunner {
                     None => None,
                 }
             };
+            let retained_lifetime_files = if item_supervisor.is_some() {
+                Vec::new()
+            } else {
+                crate::concurrency::current_supervision_lifetime_files().map_err(|error| {
+                    ToolRunnerError::Io(std::io::Error::new(std::io::ErrorKind::Other, error))
+                })?
+            };
+            // Ordinary direct runners carry no durable ownership descriptors.
+            // Route those calls through one process-local fork server so the
+            // trusted supervisor is amortised across commands. Commands with
+            // lifetime descriptors keep the dedicated helper path: retaining
+            // such descriptors in a process-global supervisor would extend
+            // their authority beyond the command that owns them.
+            let supervisor_for_run = if let Some(supervisor) = item_supervisor.clone() {
+                Some(supervisor)
+            } else if retained_lifetime_files.is_empty() {
+                Some(shared_unleased_execution_supervisor().map_err(|error| {
+                    ToolRunnerError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("start shared execution supervisor: {error}"),
+                    ))
+                })?)
+            } else {
+                None
+            };
             let invocation = SupervisedCommand {
                 token: token.clone(),
                 runtime_directory: runtime_directory.clone(),
@@ -1648,15 +1674,10 @@ impl RealToolRunner {
                 runtime_identity,
                 containment_preference: ContainmentPreference::Auto,
                 helper_executable: None,
-                // A queue execution's lifetime descriptors live in its one
-                // persistent item supervisor. Fresh per-command helpers are
-                // used only for non-queue callers that have no item authority.
-                retained_lifetime_files: if item_supervisor.is_some() {
-                    Vec::new()
-                } else {
-                    crate::concurrency::current_supervision_lifetime_files()
-                        .map_err(|error| ToolRunnerError::Io(std::io::Error::new(std::io::ErrorKind::Other, error)))?
-                },
+                // Queue descriptors live in the queue's item supervisor;
+                // non-queue descriptors remain command-scoped and therefore
+                // force the dedicated helper path above.
+                retained_lifetime_files,
                 stdin_file,
                 stdout_file,
                 stderr_file,
@@ -1665,7 +1686,6 @@ impl RealToolRunner {
             let containment_token = invocation.token.clone();
             let containment_runtime = invocation.runtime_directory.clone();
             let event_item = execution_item.clone();
-            let supervisor_for_run = item_supervisor.clone();
             let outcome = tokio::task::spawn_blocking(move || {
                 let mut lifecycle = |event: &ScriptLifecycleEvent| {
                     if let Some(item_id) = event_item.as_deref() {

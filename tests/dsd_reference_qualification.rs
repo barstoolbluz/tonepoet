@@ -5411,8 +5411,11 @@ fn preserve_failed_qualification_cell(case_root: &Path, cell_label: &str) -> Pat
 }
 
 #[allow(clippy::too_many_arguments)]
-fn qualify_lossless_package_rate(
+fn qualify_lossless_package_group(
     sample_rate_hz: u32,
+    channels: u16,
+    depth: PcmBitDepth,
+    depth_key: &'static str,
     temp_root: &Path,
     sox: &Path,
     ffmpeg: &Path,
@@ -5428,7 +5431,7 @@ fn qualify_lossless_package_rate(
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .expect("per-rate package qualification runtime");
+        .expect("package qualification worker runtime");
     let metadata_runner = production_metadata_runner(ffmpeg, metaflac, wvtag, atomic_parsley);
     let candidate_tool_paths = HashMap::from([
         ("sox".to_string(), sox.to_path_buf()),
@@ -5449,15 +5452,11 @@ fn qualify_lossless_package_rate(
     let mut post_metadata_identity_comparison_count = 0_usize;
     let mut w64_planner_entry_rejection_count = 0_usize;
     let mut w64_metadata_entry_rejection_count = 0_usize;
-    let depths = [
-        (PcmBitDepth::Int16, "int16"),
-        (PcmBitDepth::Int24, "int24"),
-        (PcmBitDepth::Int32, "int32"),
-        (PcmBitDepth::Float32, "float32"),
-        (PcmBitDepth::Float64, "float64"),
-    ];
+    // One Rayon work item owns one rate × channel × depth group. Keep the
+    // established cell body and evidence accounting unchanged below.
+    let depths = [(depth, depth_key)];
 
-        'channels: for channels in 1_u16..=6 {
+        'channels: for channels in [channels] {
             for (depth, depth_key) in depths {
                 let targets: Vec<(ResolvedOutputTarget, Vec<Option<u8>>)> =
                     if matches!(depth, PcmBitDepth::Float32 | PcmBitDepth::Float64) {
@@ -6163,6 +6162,22 @@ fn qualify_lossless_package_cells(
         44_100_u32, 48_000, 88_200, 96_000, 176_400, 192_000, 352_800, 384_000,
         705_600, 768_000,
     ];
+    // Use enough independent work units to fill all available cores and to
+    // prevent the two slowest sample rates from becoming a long serial tail.
+    let mut work_items = Vec::with_capacity(rates.len() * 6 * 5);
+    for sample_rate_hz in rates {
+        for channels in 1_u16..=6 {
+            for (depth, depth_key) in [
+                (PcmBitDepth::Int16, "int16"),
+                (PcmBitDepth::Int24, "int24"),
+                (PcmBitDepth::Int32, "int32"),
+                (PcmBitDepth::Float32, "float32"),
+                (PcmBitDepth::Float64, "float64"),
+            ] {
+                work_items.push((sample_rate_hz, channels, depth, depth_key));
+            }
+        }
+    }
     let cancelled = AtomicBool::new(false);
     let requested_jobs = std::env::var("TONEPOET_QUAL_JOBS")
         .ok()
@@ -6170,19 +6185,22 @@ fn qualify_lossless_package_cells(
         .filter(|value| *value > 0);
     let jobs = requested_jobs
         .unwrap_or_else(|| std::thread::available_parallelism().map(|value| value.get()).unwrap_or(1))
-        .min(rates.len())
+        .min(work_items.len())
         .max(1);
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(jobs)
         .thread_name(|index| format!("tonepoet-reference-qual-{index}"))
         .build()
         .expect("build package qualification thread pool");
-    let rate_evidence = pool.install(|| {
-        rates
+    let group_evidence = pool.install(|| {
+        work_items
             .par_iter()
-            .map(|sample_rate_hz| {
-                qualify_lossless_package_rate(
+            .map(|(sample_rate_hz, channels, depth, depth_key)| {
+                qualify_lossless_package_group(
                     *sample_rate_hz,
+                    *channels,
+                    *depth,
+                    *depth_key,
                     temp.path(),
                     &sox,
                     &ffmpeg,
@@ -6200,7 +6218,7 @@ fn qualify_lossless_package_cells(
     });
 
     let mut terminal_bound_case_count = 0_usize;
-    for evidence in rate_evidence {
+    for evidence in group_evidence {
         case_count += evidence.case_count;
         terminal_bound_case_count += evidence.terminal_bound_case_count;
         merge_maxima(
