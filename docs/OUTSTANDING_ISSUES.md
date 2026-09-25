@@ -2655,6 +2655,13 @@ in #35a exists to catch; deliver that test with the fix.
 
 ## 37. Every external tool call costs 0.7 to 1.2 s of launch overhead
 
+**Status 2026-09-25:** partly resolved on main @ 780d4f4 (v0.5.3). The containment helper forks a
+small exec gate instead of re-execing the binary, unleased direct calls share one supervisor, and the
+100 ms post-command sleep is gone. Stage A rerun: opustags 759 to 163 ms, AtomicParsley 775 to 188 ms,
+metaflac 723 to 128 ms, ffprobe 955 to 386 ms (direct 284 ms). Fixed cost is now about 100 to 180 ms
+per call; the tens-of-milliseconds target and the Metadata-stage parity are still open. The user
+accepts the improvement for now (2026-09-25).
+
 Found by the same profile. Run directly on the same files, metaflac, opustags, and AtomicParsley
 take 5 to 7 ms and ffprobe 284 ms; under tonepoet they take 723 ms to 1.2 s (medians over 30 to 60
 runs). tonepoet's own process start is 318 ms. Every tool run goes through the script-supervisor
@@ -2730,6 +2737,10 @@ Copy the album, replace the picture in the copy with a PNG via `metaflac
 
 ## 40. The CLI cannot read any preset the TUI writes, and has no sample-rate flag
 
+**Status 2026-09-25:** resolved on main @ 780d4f4 (v0.5.3). One preset schema (the TUI's); the wizard
+schema is gone; `tonepoet convert --preset` loads TUI presets and `--sample-rate` exists. Field-verified
+with `SACD-to-PCM Reference` on a DSF and an SACD track at 176.4 kHz / 32-bit.
+
 Found 2026-09-24 while trying to run a 176.4 kHz / 32-bit Reference conversion from the
 command line. Every preset in `~/.config/tonepoet/presets/` written by the TUI fails
 under `tonepoet convert --preset <name>`:
@@ -2761,6 +2772,10 @@ directly. There is one preset schema; the wizard one goes.
 
 ## 41. Third-party multichannel FLACs with frames over about 200 KiB decode to nothing through FFmpeg
 
+**Status 2026-09-25:** resolved on main @ 780d4f4 (v0.5.3) by the detection branch of the requirement:
+single-file, archive and CUE materializers run an FFmpeg admission probe and refuse a FLAC that
+decodes to zero samples ("refusing silent output"). No alternative decode route was added.
+
 Found 2026-09-23 during the v18 Reference qualification (P0 multichannel cells). FFmpeg's
 FLAC decoder silently returns no frames for a stream whose frames exceed roughly 200 KiB
 (191 KiB decoded, 240 KiB did not); no error is raised, the output is simply empty. The
@@ -2777,6 +2792,9 @@ such, or decoded by another route (the `flac` reference decoder handles these fi
 Silent empty output never reaches the publish stage.
 
 ## 42. The Reference qualification harness does not exercise the production executor
+
+**Status 2026-09-25:** resolved on main @ 780d4f4 (v0.5.3). Every positive package cell runs through
+`execute_reference_common_plan`; the 3,540-cell run passes in 53 minutes on 16 cores.
 
 Found 2026-09-24. The v18 qualification passed every Int16 cell while production Int16
 Reference conversion was still broken: the executor's QPCM depth table
