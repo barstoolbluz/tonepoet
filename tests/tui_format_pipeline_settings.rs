@@ -101,6 +101,16 @@ fn auto_dither_selects_defaults_and_preserves_manual_choice() {
     state.select_bit_depth(BitDepthChoice::Int32, Some(24));
     assert_eq!(*state.dither.selected_value(), DitherType::None);
 
+    // Int32 admits only the dithers the planner can realize (none, and TPDF
+    // where the FFmpeg triangular terminal is commissioned). A manual shaped
+    // choice made there is clamped away rather than submitted to a refusal.
+    state.dither.select_value(&DitherType::Gesemann);
+    state.mark_dither_overridden();
+    state.apply_format_constraints();
+    assert_eq!(*state.dither.selected_value(), DitherType::None);
+
+    // A manual choice made at a depth that admits it survives later depth changes.
+    state.select_bit_depth(BitDepthChoice::Int24, Some(32));
     state.dither.select_value(&DitherType::Gesemann);
     state.mark_dither_overridden();
     state.select_bit_depth(BitDepthChoice::Int16, Some(24));
