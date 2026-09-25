@@ -4008,6 +4008,10 @@ fn plan_request_settings_for_summary(
     settings.target_format = target_format(summary.target);
     settings.target_sample_rate = RateTarget::PcmHz(summary.final_pcm.sample_rate_hz);
     settings.target_bit_depth = BitDepthTarget::Pcm(summary.final_pcm.bit_depth);
+    // The Reference WavPack target admits neither hybrid mode nor a correction
+    // file; both production surfaces clear them when Reference is selected.
+    settings.wavpack.hybrid = false;
+    settings.wavpack.correction_file = false;
     match summary.target {
         ResolvedOutputTarget::FlacNative => {
             if let Some(level) = compression_level {
