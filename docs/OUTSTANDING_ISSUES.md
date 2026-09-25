@@ -2845,3 +2845,63 @@ Int32 FFmpeg terminal with a dither the planner will refuse.
 ### Workaround
 
 Open the source with Convert -> Custom, then load the preset from the overlay.
+
+## 44. A session closed mid-conversion leaves its output folder reserved forever; the next session's recovery pass silently gives up
+
+Found 2026-09-25. A TUI converting an SACD ISO was closed with Ctrl+Q at 20 percent. A new
+TUI started five minutes later. Every later attempt to convert the same album, from any
+source, to the same destination folder fails at PlanOutputs:
+
+```
+output concurrency admission failed: filesystem mutation conflicts with recovery
+reservation: '/home/daedalus/temp/Genesis - The Lamb Lies Down on Broadway (1974) [FLAC]
+{Atlantic 75 SACD}' overlaps '/home/daedalus/temp/Genesis - The Lamb Lies Down on
+Broadway (1974) [FLAC] {Atlantic 75 SACD}'
+```
+
+Deleting the staging directory from Browse fails the same way. The status line says
+"blocked by an unresolved copy or move; review recovery details", but the recovery window
+lists file transfers only, and the Queue screen shows no Interrupted item for the album:
+the queue row is still `Processing` at 20 percent under the dead session's scope.
+
+### Mechanism
+
+The dead session (pid 949672) left four descriptors under
+`~/.config/tonepoet/concurrency-v1`: its queue scope, the queue execution, an
+execution-staging claim on `.tonepoet-staging/job-…`, and an execution claim on the album
+folder (mode write, scope subtree). Their families reserve after owner death, so
+`classify_availability` reports RecoveryReserved and `acquire_grouped_internal` refuses
+any overlapping mutation with the message above. That refusal is correct while the item is
+unrecovered.
+
+Recovery of dead scopes happens in one place, `Database::recover_dead_queue_scopes`
+(`src/db.rs`), called from `load_queue_items`, which runs only from
+`AppState::new_with_open_database` at TUI start. The loop over other scopes contains
+
+```rust
+Err(error) if error.contains("live-owned") => return Ok(()),
+```
+
+so the first scope whose descriptor lock is still held aborts the whole pass, silently,
+for every remaining scope. When the new TUI started, the dead session's supervisor
+process tree (execution-item supervisor, leader pid 1061844) was still winding down
+holding inherited descriptor fds, so the pass returned early. Nothing re-runs it: the
+log has no line from the pass, and 202 queue-scope descriptors and 227 scope rows have
+accumulated. A second execution (an m4b conversion under pid 2116017) is stranded the
+same way.
+
+### Required
+
+An execution whose owner died is recovered whenever a session observes it, not only at
+one startup: the pass retries, or runs again on queue load, and a scope it cannot recover
+yet is skipped with a logged reason rather than ending the pass for every other scope.
+The recovered item appears as Interrupted with Retry in the Queue screen and its claims
+are released when it is retried or removed. When admission is refused by a recovery
+reservation the refusal names the interrupted item and where to act on it, instead of
+pointing at the file-transfer recovery window.
+
+### Workaround
+
+With no conversion running, quit the current TUI and start it again; the pass runs at
+startup, finds the descriptors unlocked, marks the item Interrupted, and releases the
+folder.
