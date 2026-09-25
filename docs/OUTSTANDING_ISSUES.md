@@ -2902,6 +2902,7 @@ pointing at the file-transfer recovery window.
 
 ### Workaround
 
-With no conversion running, quit the current TUI and start it again; the pass runs at
-startup, finds the descriptors unlocked, marks the item Interrupted, and releases the
-folder.
+None confirmed. The operator restarted the TUI with no conversion running, which is the
+only place the pass runs; the user reports the item was not re-enqueued and does not
+appear in the Queue screen as Interrupted or retryable. The reservation on the folder
+is therefore still in place after a restart, and the pass's outcome remains invisible.
