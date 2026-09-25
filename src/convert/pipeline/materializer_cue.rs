@@ -4790,7 +4790,19 @@ mod materializer_cue_tests {
             _cancel: &CancellationToken,
         ) -> Result<ToolOutput, ToolRunnerError> {
             let is_ffmpeg = matches!(&cmd.binary, ToolBinary::Ffmpeg);
-            let stdout_tail = if is_ffmpeg {
+            // The single-file FLAC admission guard decodes through ffmpeg with
+            // `ashowinfo` to a null muxer; answer it like a decodable source
+            // instead of treating `-` as a segment destination.
+            let is_flac_admission_probe =
+                is_ffmpeg && cmd.args.iter().any(|arg| arg.contains("ashowinfo"));
+            let stderr_tail = if is_flac_admission_probe {
+                "[Parsed_ashowinfo_1 @ 0x0] n:0 pts:0 pts_time:0 fmt:s16 channels:1 rate:44100 nb_samples:4608\n".to_string()
+            } else {
+                String::new()
+            };
+            let stdout_tail = if is_flac_admission_probe {
+                String::new()
+            } else if is_ffmpeg {
                 let destination = cmd.args.last().expect("ffmpeg command has destination");
                 self.ffmpeg_destinations
                     .lock()
@@ -4828,7 +4840,7 @@ mod materializer_cue_tests {
             Ok(ToolOutput {
                 exit: crate::convert::pipeline::tool::ProcessExit::Code(0),
                 stdout_tail,
-                stderr_tail: String::new(),
+                stderr_tail,
                 elapsed: Duration::from_millis(10),
                 command: crate::convert::pipeline::tool::CommandRecord {
                     environment_policy: cmd.environment_policy,
