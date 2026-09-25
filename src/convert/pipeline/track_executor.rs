@@ -6734,9 +6734,7 @@ fn validate_reference_production_promotion_evidence(
                 "UNQUALIFIED Reference execution: {REFERENCE_UNQUALIFIED_OVERRIDE_ENV} is set and the qualification report does not bind this binary's runtime closure ({reason}); output is not release evidence"
             );
         } else {
-            return Err(qualification_unavailable_error(format!(
-                "Reference production promotion is inactive: {reason}"
-            )));
+            return Err(reference_production_promotion_refusal(reason));
         }
     }
 
@@ -6762,9 +6760,7 @@ fn validate_reference_production_promotion_evidence(
             );
             Ok(())
         }
-        Err(reason) => Err(qualification_unavailable_error(format!(
-            "Reference production promotion is inactive: {reason}"
-        ))),
+        Err(reason) => Err(reference_production_promotion_refusal(reason)),
     }
 }
 
@@ -6776,6 +6772,18 @@ fn validate_reference_production_promotion_evidence(
 /// instead of after a 46-minute requalification; the shipped release never sets it.
 const REFERENCE_UNQUALIFIED_OVERRIDE_ENV: &str = "TONEPOET_DSD_REFERENCE_UNQUALIFIED_OVERRIDE";
 const REFERENCE_CLOSURE_BINDING_MISMATCH: &str = "does not bind the running runtime closure variant";
+
+fn reference_production_promotion_refusal(reason: impl AsRef<str>) -> TrackExecutionError {
+    let reason = reason.as_ref();
+    let detail = if reason.contains(REFERENCE_CLOSURE_BINDING_MISMATCH) {
+        format!(
+            "Reference production promotion is inactive: {reason}. The installed Reference qualification does not bind this running build; requalify and reinstall the Reference qualification report and release certification for this build"
+        )
+    } else {
+        format!("Reference production promotion is inactive: {reason}")
+    };
+    qualification_unavailable_error(detail)
+}
 
 fn reference_unqualified_override_active() -> bool {
     std::env::var(REFERENCE_UNQUALIFIED_OVERRIDE_ENV).is_ok_and(|value| value.trim() == "1")
@@ -12715,6 +12723,16 @@ mod tests {
             &mismatch.error,
             ConvertError::QualificationUnavailable(_)
         ));
+        let refusal = mismatch.to_string();
+        assert!(
+            refusal.contains(REFERENCE_CLOSURE_BINDING_MISMATCH),
+            "closure mismatch reason should remain visible: {refusal}"
+        );
+        assert!(
+            refusal.contains("installed Reference qualification does not bind this running build")
+                && refusal.contains("requalify and reinstall"),
+            "closure mismatch should name the operator remedy: {refusal}"
+        );
     }
 
     fn env_value<'a>(cmd: &'a ToolCommand, key: &str) -> Option<&'a str> {

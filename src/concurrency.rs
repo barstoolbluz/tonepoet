@@ -1769,9 +1769,19 @@ impl MutationClaimGuard {
                     ClaimAvailability::RecoveryReserved => "recovery reservation",
                     ClaimAvailability::ReclaimableEphemeral => unreachable!(),
                 };
+                let queue_execution = match &existing_family {
+                    LeaseFamily::QueueExecution { execution_id }
+                    | LeaseFamily::ExecutionClaim { execution_id }
+                    | LeaseFamily::ExecutionStaging { execution_id } => {
+                        format!("; queue execution {execution_id}")
+                    }
+                    LeaseFamily::JournalOperation { .. }
+                    | LeaseFamily::QueueScope { .. }
+                    | LeaseFamily::EphemeralMutation { .. } => String::new(),
+                };
                 return Err(format!(
-                    "filesystem mutation conflicts with {owner}: '{}' overlaps '{}'",
-                    requested.identity.original.display(), existing.identity.original.display()
+                    "filesystem mutation conflicts with {owner}: '{}' overlaps '{}'{}",
+                    requested.identity.original.display(), existing.identity.original.display(), queue_execution
                 ));
             }
         }

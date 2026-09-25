@@ -643,6 +643,63 @@ pub fn observable_tonepoet_peer_processes() -> Vec<String> {
 }
 
 impl Database {
+    fn retire_queue_execution_lifecycle(execution_id: &str, descriptor_path: &Path) {
+        let Ok(execution_uuid) = uuid::Uuid::parse_str(execution_id) else {
+            log::warn!("could not parse queue execution id while retiring recovery reservations: {execution_id}");
+            return;
+        };
+        let family = crate::concurrency::LeaseFamily::QueueExecution {
+            execution_id: execution_uuid,
+        };
+        if let Err(error) = crate::concurrency::retire_descriptor_after_lifecycle_release(
+            descriptor_path,
+            &family,
+        ) {
+            log::warn!(
+                "queue execution {execution_id} descriptor retirement was incomplete: {error}"
+            );
+        }
+        for namespace in [
+            crate::concurrency::LeaseFamily::ExecutionClaim {
+                execution_id: uuid::Uuid::nil(),
+            },
+            crate::concurrency::LeaseFamily::ExecutionStaging {
+                execution_id: uuid::Uuid::nil(),
+            },
+        ] {
+            match crate::concurrency::lifecycle_descriptor_hints(&namespace) {
+                Ok(hints) => {
+                    for (id, path) in hints
+                        .into_iter()
+                        .filter(|(id, _)| *id == execution_uuid)
+                    {
+                        let family = match namespace {
+                            crate::concurrency::LeaseFamily::ExecutionClaim { .. } => {
+                                crate::concurrency::LeaseFamily::ExecutionClaim { execution_id: id }
+                            }
+                            _ => crate::concurrency::LeaseFamily::ExecutionStaging {
+                                execution_id: id,
+                            },
+                        };
+                        if let Err(error) =
+                            crate::concurrency::retire_descriptor_after_lifecycle_release(
+                                &path, &family,
+                            )
+                        {
+                            log::warn!(
+                                "queue execution {execution_id} child recovery reservation {} could not be retired: {error}",
+                                path.display()
+                            );
+                        }
+                    }
+                }
+                Err(error) => log::warn!(
+                    "queue execution {execution_id} child recovery reservation scan failed closed: {error}"
+                ),
+            }
+        }
+    }
+
     /// Open (or create) the production database, run migrations, and enable the
     /// same durability/performance pragmas used by ordinary application starts.
     pub fn open() -> Result<Self, String> {
@@ -3405,7 +3462,34 @@ impl Database {
         })
     }
 
-    fn recover_dead_queue_scopes(&self, current_scope: uuid::Uuid) -> Result<(), String> {
+    pub(crate) fn queue_item_for_execution(
+        &self,
+        execution_id: uuid::Uuid,
+    ) -> Result<Option<crate::convert::ConversionItem>, String> {
+        let item_json = self
+            .conn
+            .query_row(
+                "SELECT q.item_json
+                 FROM conversion_queue_executions e
+                 JOIN conversion_queue_v24 q ON q.id=e.item_id
+                 WHERE e.execution_id=?1",
+                [execution_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("queue recovery item lookup: {error}"))?;
+        item_json
+            .map(|json| {
+                serde_json::from_str(&json)
+                    .map_err(|error| format!("queue recovery item decode: {error}"))
+            })
+            .transpose()
+    }
+
+    fn recover_dead_queue_scopes(
+        &self,
+        current_scope: uuid::Uuid,
+    ) -> Result<Vec<crate::convert::ConversionItem>, String> {
         fn prior_boot(origin_json: &str) -> bool {
             let Ok(origin) = serde_json::from_str::<crate::concurrency::OwnerProcessIdentity>(origin_json) else {
                 return false;
@@ -3435,9 +3519,10 @@ impl Database {
         drop(stmt);
 
         // Acquire every currently recoverable dead-scope authority in the same
-        // deterministic order used for merge.  If a peer wins one of these
-        // races, abandon this pass entirely rather than recovering a later
-        // scope first and making ordering scheduler-dependent.
+        // deterministic order used for merge. A scope that becomes live-owned
+        // between the availability probe and lease acquisition is simply not
+        // recoverable in this pass; it must not suppress recovery of unrelated
+        // later scopes.
         let mut scopes = Vec::<DeadQueueScopeRecovery>::new();
         for (scope_text, descriptor_text, origin_identity, scope_order) in scope_rows {
             let Ok(scope_id) = uuid::Uuid::parse_str(&scope_text) else {
@@ -3450,7 +3535,12 @@ impl Database {
 
             let recovery_lease = if descriptor_path.exists() {
                 match crate::concurrency::descriptor_availability(&descriptor_path) {
-                    Ok((_family, crate::concurrency::ClaimAvailability::Live)) => continue,
+                    Ok((_family, crate::concurrency::ClaimAvailability::Live)) => {
+                        log::info!(
+                            "queue scope {scope_text} is still live-owned during recovery; skipping it for this pass"
+                        );
+                        continue;
+                    }
                     Ok((_family, crate::concurrency::ClaimAvailability::RecoveryReserved)) => {}
                     Ok((_family, crate::concurrency::ClaimAvailability::ReclaimableEphemeral)) => {
                         log::error!("durable queue scope classified ephemeral; leaving it untouched: {scope_text}");
@@ -3463,7 +3553,12 @@ impl Database {
                 }
                 match crate::concurrency::PersistentLease::acquire_existing_recovery(&descriptor_path, &family) {
                     Ok(lease) => lease,
-                    Err(error) if error.contains("live-owned") => return Ok(()),
+                    Err(error) if error.contains("live-owned") => {
+                        log::info!(
+                            "queue scope {scope_text} became live-owned during recovery; skipping it for this pass: {error}"
+                        );
+                        continue;
+                    }
                     Err(error) => {
                         log::warn!("queue scope {scope_text} recovery lease acquisition failed closed: {error}");
                         continue;
@@ -3482,12 +3577,20 @@ impl Database {
                     }
                     Err(error) if error.contains("lifecycle already has a descriptor") => {
                         let Some(existing) = crate::concurrency::find_family_descriptor(&family)? else {
-                            return Ok(());
+                            log::warn!(
+                                "queue scope {scope_text} descriptor appeared during reconstruction but could not be located; skipping it for this pass"
+                            );
+                            continue;
                         };
                         descriptor_path = existing;
                         match crate::concurrency::PersistentLease::acquire_existing_recovery(&descriptor_path, &family) {
                             Ok(lease) => lease,
-                            Err(_) => return Ok(()),
+                            Err(error) => {
+                                log::info!(
+                                    "queue scope {scope_text} reconstruction raced another owner; skipping it for this pass: {error}"
+                                );
+                                continue;
+                            }
                         }
                     }
                     Err(error) => {
@@ -3526,7 +3629,7 @@ impl Database {
         }
 
         if scopes.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         scopes.sort_by(|left, right| {
             (left.scope_order, left.scope_id).cmp(&(right.scope_order, right.scope_id))
@@ -3670,7 +3773,7 @@ impl Database {
 
         let current_origin = serde_json::to_string(&crate::concurrency::OwnerProcessIdentity::current())
             .map_err(|e| format!("serialize recovery origin identity: {e}"))?;
-        let (emptied_scopes, transitioned_executions) = run_queue_immediate_transaction(
+        let (emptied_scopes, transitioned_executions, adopted_items) = run_queue_immediate_transaction(
             &self.conn,
             "queue dead-scope recovery",
             |tx| {
@@ -3723,6 +3826,7 @@ impl Database {
 
                 let mut emptied_scopes = std::collections::HashSet::<uuid::Uuid>::new();
                 let mut transitioned_executions = std::collections::HashSet::<String>::new();
+                let mut adopted_items = Vec::<crate::convert::ConversionItem>::new();
                 for scope in &scopes {
                     for row in &scope.rows {
                         let item = match serde_json::from_str::<crate::convert::ConversionItem>(&row.item_json) {
@@ -3748,7 +3852,7 @@ impl Database {
                                 })?;
                             tx.execute(
                                 "UPDATE conversion_queue_v24
-                                 SET owner_scope=?1, position=?2, item_json=?3, execution_id=NULL
+                                 SET owner_scope=?1, position=?2, item_json=?3
                                  WHERE id=?4 AND owner_scope=?5",
                                 params![current_scope.to_string(), append_position, interrupted_json, row.id, scope.scope_text],
                             )
@@ -3759,18 +3863,52 @@ impl Database {
                                 )
                             })?;
                             tx.execute(
-                                "DELETE FROM conversion_queue_executions WHERE execution_id=?1",
-                                [execution_id],
+                                "UPDATE conversion_queue_executions
+                                 SET owner_scope=?1, state='interrupted', updated_unix_ms=?2
+                                 WHERE execution_id=?3 AND item_id=?4",
+                                params![
+                                    current_scope.to_string(),
+                                    chrono::Utc::now().timestamp_millis(),
+                                    execution_id,
+                                    row.id,
+                                ],
                             )
                             .map_err(|e| {
                                 QueueTransactionError::sqlite(
-                                    "retire recovered execution row",
+                                    "retain recovered interrupted execution reservation",
                                     e,
                                 )
                             })?;
                             transitioned_executions.insert(execution_id.clone());
+                            adopted_items.push(interrupted);
                             append_position += 1;
                         } else {
+                            if let Some(execution_id) = row.execution_id.as_ref() {
+                                let Some(execution) = executions.get(execution_id) else {
+                                    continue;
+                                };
+                                if !execution.recoverable {
+                                    continue;
+                                }
+                                tx.execute(
+                                    "UPDATE conversion_queue_executions
+                                     SET owner_scope=?1, state='interrupted', updated_unix_ms=?2
+                                     WHERE execution_id=?3 AND item_id=?4",
+                                    params![
+                                        current_scope.to_string(),
+                                        chrono::Utc::now().timestamp_millis(),
+                                        execution_id,
+                                        row.id,
+                                    ],
+                                )
+                                .map_err(|e| {
+                                    QueueTransactionError::sqlite(
+                                        "adopt interrupted queue execution reservation",
+                                        e,
+                                    )
+                                })?;
+                                transitioned_executions.insert(execution_id.clone());
+                            }
                             tx.execute(
                                 "UPDATE conversion_queue_v24 SET owner_scope=?1, position=?2
                                  WHERE id=?3 AND owner_scope=?4",
@@ -3779,6 +3917,7 @@ impl Database {
                             .map_err(|e| {
                                 QueueTransactionError::sqlite("adopt dead queue row", e)
                             })?;
+                            adopted_items.push(item);
                             append_position += 1;
                         }
                     }
@@ -3806,39 +3945,22 @@ impl Database {
                     }
                 }
 
-                Ok((emptied_scopes, transitioned_executions))
+                Ok((emptied_scopes, transitioned_executions, adopted_items))
             },
         )?;
 
         // The DB transition is now authoritative. Release our recovery OFDs,
-        // then lifecycle-retire descriptors on fresh OFDs in registry order.
+        // but keep execution/path descriptors as unlocked RecoveryReserved
+        // authority while the adopted row is Interrupted. Retry/removal is the
+        // explicit lifecycle boundary that retires those reservations.
         for (execution_id, execution) in executions {
             let DeadExecutionRecovery {
-                descriptor_path,
                 recovery_lease,
                 cleanup_requests,
                 ..
             } = execution;
             drop(recovery_lease);
             if transitioned_executions.contains(&execution_id) {
-                if let Ok(execution_uuid) = uuid::Uuid::parse_str(&execution_id) {
-                    let family = crate::concurrency::LeaseFamily::QueueExecution { execution_id: execution_uuid };
-                    let _ = crate::concurrency::retire_descriptor_after_lifecycle_release(&descriptor_path, &family);
-                    for namespace in [
-                        crate::concurrency::LeaseFamily::ExecutionClaim { execution_id: uuid::Uuid::nil() },
-                        crate::concurrency::LeaseFamily::ExecutionStaging { execution_id: uuid::Uuid::nil() },
-                    ] {
-                        if let Ok(hints) = crate::concurrency::lifecycle_descriptor_hints(&namespace) {
-                            for (id, path) in hints.into_iter().filter(|(id, _)| *id == execution_uuid) {
-                                let family = match namespace {
-                                    crate::concurrency::LeaseFamily::ExecutionClaim { .. } => crate::concurrency::LeaseFamily::ExecutionClaim { execution_id: id },
-                                    _ => crate::concurrency::LeaseFamily::ExecutionStaging { execution_id: id },
-                                };
-                                let _ = crate::concurrency::retire_descriptor_after_lifecycle_release(&path, &family);
-                            }
-                        }
-                    }
-                }
                 for request in cleanup_requests {
                     let _ = crate::convert::script_supervisor::cleanup_supervised(&request);
                     let _ = std::fs::remove_dir_all(&request.runtime_directory);
@@ -3858,7 +3980,23 @@ impl Database {
                 let _ = crate::concurrency::retire_descriptor_after_lifecycle_release(&descriptor_path, &family);
             }
         }
-        Ok(())
+        Ok(adopted_items)
+    }
+
+    /// Re-run dead-scope recovery for a live session and return only rows that
+    /// this pass newly adopted. The caller can merge these by stable queue ID
+    /// without reloading or replacing its in-memory queue state.
+    pub(crate) fn recover_dead_queue_items(
+        &self,
+    ) -> Result<Vec<crate::convert::ConversionItem>, String> {
+        if !self.has_queue_items()? {
+            if let Err(error) = self.cleanup_dead_empty_queue_scopes() {
+                log::warn!("periodic empty queue-scope cleanup failed closed: {error}");
+            }
+            return Ok(Vec::new());
+        }
+        let scope_id = self.ensure_queue_scope()?.scope_id;
+        self.recover_dead_queue_scopes(scope_id)
     }
 
     /// Incrementally reconcile SQLite with the current durable queue intent.
@@ -4003,11 +4141,23 @@ impl Database {
                             item.id, owner
                         )));
                     }
-                    let desired_execution = execution_for_item
+                    let mut desired_execution = execution_for_item
                         .get(&item.id)
                         .map(|(id, _)| id.clone());
                     match existing.remove(&item.id) {
                         Some((old_json, old_position, old_execution)) => {
+                            // A recovered Interrupted row deliberately retains
+                            // its prior QueueExecution/ExecutionClaim/
+                            // ExecutionStaging reservations. Merely persisting
+                            // the UI queue must not release them. Changing the
+                            // item to Queued (Retry) or removing it makes
+                            // desired_execution None and retires the lifecycle
+                            // after this transaction commits.
+                            if desired_execution.is_none()
+                                && matches!(item.status, crate::convert::ConversionStatus::Interrupted)
+                            {
+                                desired_execution = old_execution.clone();
+                            }
                             let old_reference = Self::persisted_queue_reference(&old_json);
                             if old_reference.as_deref() != item.archive_password_ref.as_deref() {
                                 if let Some(reference) = old_reference {
@@ -4146,13 +4296,34 @@ impl Database {
                     crate::concurrency::LeaseFamily::QueueExecution { execution_id: id } if id.to_string() == execution_id => Some(item_id.clone()),
                     _ => None,
                 });
-                if let Some(item_key) = item_key {
+                let had_runtime_execution = if let Some(item_key) = item_key {
                     crate::concurrency::unregister_runtime_execution(&item_key);
                     leases.remove(&item_key);
-                }
+                    true
+                } else {
+                    false
+                };
                 if let Ok(id) = uuid::Uuid::parse_str(&execution_id) {
-                    let family = crate::concurrency::LeaseFamily::QueueExecution { execution_id: id };
-                    let _ = crate::concurrency::retire_descriptor_after_lifecycle_release(Path::new(&descriptor_path), &family);
+                    if had_runtime_execution {
+                        // The live runtime authority owns supplemental claim/staging
+                        // leases and retires them during unregister. Preserve the
+                        // existing fast path for ordinary terminal executions.
+                        let family = crate::concurrency::LeaseFamily::QueueExecution {
+                            execution_id: id,
+                        };
+                        let _ = crate::concurrency::retire_descriptor_after_lifecycle_release(
+                            Path::new(&descriptor_path),
+                            &family,
+                        );
+                    } else {
+                        // Recovered Interrupted rows deliberately have no live
+                        // runtime authority. Retry/Remove must retire the orphaned
+                        // execution claim/staging descriptors as one lifecycle.
+                        Self::retire_queue_execution_lifecycle(
+                            &execution_id,
+                            Path::new(&descriptor_path),
+                        );
+                    }
                 }
             }
         }
@@ -4301,7 +4472,7 @@ impl Database {
             return Ok(QueueLoadOutcome { items: Vec::new(), degradation: None });
         }
         let scope_id = self.ensure_queue_scope()?.scope_id;
-        self.recover_dead_queue_scopes(scope_id)?;
+        let _ = self.recover_dead_queue_scopes(scope_id)?;
         let mut stmt = self.conn.prepare(
             "SELECT id, item_json FROM conversion_queue_v24 WHERE owner_scope=?1 ORDER BY position ASC, id ASC"
         ).map_err(|e| format!("queue load prepare: {e}"))?;
@@ -7069,6 +7240,306 @@ mod tests {
         ).is_err(), "old-name INSERT must fail after activation");
         assert!(conn.execute("DELETE FROM conversion_queue WHERE id='legacy-a'", []).is_err(),
             "old-name DELETE must fail after activation");
+    }
+
+    #[test]
+    fn dead_scope_recovery_skips_live_owned_race_instead_of_ending_the_pass() {
+        let source = include_str!("db.rs");
+        let start = source
+            .find("fn recover_dead_queue_scopes(")
+            .expect("dead-scope recovery helper exists");
+        let tail = &source[start..];
+        let end = tail
+            .find("\n    pub(crate) fn recover_dead_queue_items(")
+            .expect("dead-scope recovery helper has a bounded end");
+        let body = &tail[..end];
+
+        let initially_live = body
+            .find("Ok((_family, crate::concurrency::ClaimAvailability::Live)) => {")
+            .expect("recovery handles scopes observed live-owned before acquisition");
+        let arm = &body[initially_live..];
+        let arm_end = arm
+            .find("Ok((_family, crate::concurrency::ClaimAvailability::RecoveryReserved))")
+            .expect("initial live-owned arm has a bounded end");
+        let arm = &arm[..arm_end];
+        assert!(
+            arm.contains("log::info!"),
+            "an initially live-owned scope must log why it is skipped for this recovery pass"
+        );
+        assert!(
+            arm.contains("continue;"),
+            "an initially live-owned scope must be skipped so later dead scopes are still recovered"
+        );
+        assert!(
+            !arm.contains("return Ok"),
+            "an initially live-owned scope must never terminate the full recovery pass"
+        );
+
+        let live_owned_race = body
+            .find("Err(error) if error.contains(\"live-owned\")")
+            .expect("recovery handles live-owned acquisition races");
+        let arm = &body[live_owned_race..];
+        let arm_end = arm.find("Err(error) =>").unwrap_or(arm.len());
+        let arm = &arm[..arm_end];
+        assert!(
+            arm.contains("log::info!"),
+            "a live-owned acquisition race must log why it is skipped for this recovery pass"
+        );
+        assert!(
+            arm.contains("continue;"),
+            "one temporarily live-owned scope must be skipped so later dead scopes are still recovered"
+        );
+        assert!(
+            !arm.contains("return Ok"),
+            "a live-owned acquisition race must never terminate the full recovery pass"
+        );
+    }
+
+    #[test]
+    fn recovered_interrupted_rows_hold_reservations_until_retry_or_removal() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().expect("recovered reservation tempdir");
+        let db_path = temp.path().join("tonepoet.db");
+        let db = Database::open_path(&db_path).expect("open recovered reservation database");
+        let keeper = queue_item(
+            "current-scope-keeper",
+            "/music/current-scope-keeper.flac",
+            crate::convert::ConversionStatus::Paused,
+        );
+        db.sync_queue(&[&keeper]).expect("publish current queue scope");
+        let current_scope = db.ensure_queue_scope().expect("current queue scope").scope_id;
+
+        let dead_scope_id = uuid::Uuid::new_v4();
+        let dead_scope_lease = crate::concurrency::PersistentLease::create(
+            crate::concurrency::LeaseFamily::QueueScope {
+                scope_id: dead_scope_id,
+            },
+            &[],
+        )
+        .expect("create dead queue scope descriptor");
+        let dead_scope_descriptor = dead_scope_lease.descriptor_path().to_path_buf();
+        let origin_identity = serde_json::to_string(
+            &crate::concurrency::OwnerProcessIdentity::current(),
+        )
+        .expect("serialize dead scope origin identity");
+        let now = chrono::Utc::now().timestamp_millis();
+        db.conn
+            .execute(
+                "INSERT INTO conversion_queue_scopes(scope_uuid,descriptor_path,origin_identity,created_unix_ms) VALUES(?1,?2,?3,?4)",
+                params![
+                    dead_scope_id.to_string(),
+                    dead_scope_descriptor.to_string_lossy(),
+                    &origin_identity,
+                    now,
+                ],
+            )
+            .expect("insert dead queue scope row");
+
+        struct RecoveredReservationFixture {
+            item: crate::convert::ConversionItem,
+            execution_id: uuid::Uuid,
+            queue_descriptor: PathBuf,
+            claim_descriptor: PathBuf,
+            staging_descriptor: PathBuf,
+        }
+
+        let mut fixtures = Vec::new();
+        for (position, id) in ["retry-recovered", "remove-recovered"].into_iter().enumerate() {
+            let execution_id = uuid::Uuid::new_v4();
+            let queue_lease = crate::concurrency::PersistentLease::create(
+                crate::concurrency::LeaseFamily::QueueExecution { execution_id },
+                &[],
+            )
+            .expect("create dead queue execution descriptor");
+
+            let output_root = temp.path().join(format!("{id}-output"));
+            std::fs::create_dir_all(&output_root).expect("create recovered output root");
+            let output_claim = crate::concurrency::PathClaim::resolve(
+                &output_root,
+                crate::concurrency::ClaimMode::Write,
+                crate::concurrency::ClaimScope::Subtree,
+            )
+            .expect("resolve recovered output claim");
+            let claim_lease = crate::concurrency::PersistentLease::create(
+                crate::concurrency::LeaseFamily::ExecutionClaim { execution_id },
+                std::slice::from_ref(&output_claim),
+            )
+            .expect("create dead execution claim descriptor");
+
+            let staging_root = temp.path().join(format!("{id}-staging"));
+            std::fs::create_dir_all(&staging_root).expect("create recovered staging root");
+            let staging_claim = crate::concurrency::PathClaim::resolve(
+                &staging_root,
+                crate::concurrency::ClaimMode::Write,
+                crate::concurrency::ClaimScope::Subtree,
+            )
+            .expect("resolve recovered staging claim");
+            let staging_lease = crate::concurrency::PersistentLease::create(
+                crate::concurrency::LeaseFamily::ExecutionStaging { execution_id },
+                std::slice::from_ref(&staging_claim),
+            )
+            .expect("create dead execution staging descriptor");
+
+            let item = queue_item(
+                id,
+                &format!("/music/{id}.flac"),
+                crate::convert::ConversionStatus::Processing {
+                    progress: 20.0,
+                    message: Some("Converting".to_string()),
+                    file_progress: None,
+                    phase: Some(crate::convert::ConversionPhase::Converting),
+                    phase_progress: Some(0.2),
+                },
+            );
+            let item_json = serde_json::to_string(&item).expect("serialize dead Processing item");
+            db.conn
+                .execute(
+                    "INSERT INTO conversion_queue_v24(owner_scope,id,item_json,position,execution_id) VALUES(?1,?2,?3,?4,?5)",
+                    params![
+                        dead_scope_id.to_string(),
+                        item.id,
+                        item_json,
+                        position as i64,
+                        execution_id.to_string(),
+                    ],
+                )
+                .expect("insert dead Processing row");
+            db.conn
+                .execute(
+                    "INSERT INTO conversion_queue_executions(execution_id,owner_scope,item_id,descriptor_path,origin_identity,state,external_released,created_unix_ms,updated_unix_ms) VALUES(?1,?2,?3,?4,?5,'processing',0,?6,?6)",
+                    params![
+                        execution_id.to_string(),
+                        dead_scope_id.to_string(),
+                        item.id,
+                        queue_lease.descriptor_path().to_string_lossy(),
+                        &origin_identity,
+                        now,
+                    ],
+                )
+                .expect("insert dead queue execution row");
+
+            fixtures.push(RecoveredReservationFixture {
+                item,
+                execution_id,
+                queue_descriptor: queue_lease.descriptor_path().to_path_buf(),
+                claim_descriptor: claim_lease.descriptor_path().to_path_buf(),
+                staging_descriptor: staging_lease.descriptor_path().to_path_buf(),
+            });
+            drop(staging_lease);
+            drop(claim_lease);
+            drop(queue_lease);
+        }
+        drop(dead_scope_lease);
+
+        let mut recovered = db
+            .recover_dead_queue_items()
+            .expect("recover dead Processing rows");
+        recovered.sort_by(|left, right| left.id.cmp(&right.id));
+        assert_eq!(recovered.len(), 2);
+        assert!(recovered.iter().all(|item| {
+            matches!(item.status, crate::convert::ConversionStatus::Interrupted)
+        }));
+        assert!(
+            !dead_scope_descriptor.exists(),
+            "fully adopted dead scope must retire after recovery commit"
+        );
+
+        for fixture in &fixtures {
+            let (owner_scope, state, row_execution): (String, String, Option<String>) = db
+                .conn
+                .query_row(
+                    "SELECT e.owner_scope,e.state,q.execution_id FROM conversion_queue_executions e JOIN conversion_queue_v24 q ON q.id=e.item_id WHERE e.execution_id=?1",
+                    [fixture.execution_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("read recovered execution authority");
+            assert_eq!(owner_scope, current_scope.to_string());
+            assert_eq!(state, "interrupted");
+            let expected_execution = fixture.execution_id.to_string();
+            assert_eq!(row_execution.as_deref(), Some(expected_execution.as_str()));
+            for descriptor in [
+                &fixture.queue_descriptor,
+                &fixture.claim_descriptor,
+                &fixture.staging_descriptor,
+            ] {
+                assert!(
+                    matches!(
+                        crate::concurrency::descriptor_availability(descriptor),
+                        Ok((_, crate::concurrency::ClaimAvailability::RecoveryReserved))
+                    ),
+                    "recovered Interrupted item must keep reservation {}",
+                    descriptor.display()
+                );
+            }
+        }
+
+        let retry = recovered
+            .iter()
+            .find(|item| item.id == "retry-recovered")
+            .expect("retry fixture recovered")
+            .clone();
+        let remove = recovered
+            .iter()
+            .find(|item| item.id == "remove-recovered")
+            .expect("remove fixture recovered")
+            .clone();
+        db.sync_queue(&[&keeper, &retry, &remove])
+            .expect("persist Interrupted recovery rows without releasing reservations");
+        for fixture in &fixtures {
+            assert!(fixture.queue_descriptor.exists());
+            assert!(fixture.claim_descriptor.exists());
+            assert!(fixture.staging_descriptor.exists());
+        }
+
+        let mut retry_queued = retry;
+        retry_queued.status = crate::convert::ConversionStatus::Queued;
+        db.sync_queue(&[&keeper, &retry_queued])
+            .expect("retry one recovered row and remove the other");
+
+        for fixture in &fixtures {
+            assert!(
+                !fixture.queue_descriptor.exists(),
+                "Retry/Remove must retire QueueExecution reservation for {}",
+                fixture.item.id
+            );
+            assert!(
+                !fixture.claim_descriptor.exists(),
+                "Retry/Remove must retire ExecutionClaim reservation for {}",
+                fixture.item.id
+            );
+            assert!(
+                !fixture.staging_descriptor.exists(),
+                "Retry/Remove must retire ExecutionStaging reservation for {}",
+                fixture.item.id
+            );
+            let execution_rows: i64 = db
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM conversion_queue_executions WHERE execution_id=?1",
+                    [fixture.execution_id.to_string()],
+                    |row| row.get(0),
+                )
+                .expect("count retired execution rows");
+            assert_eq!(execution_rows, 0);
+        }
+        let retry_execution: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT execution_id FROM conversion_queue_v24 WHERE id=?1",
+                [&retry_queued.id],
+                |row| row.get(0),
+            )
+            .expect("read retried queue row");
+        assert!(retry_execution.is_none());
+        let removed_rows: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM conversion_queue_v24 WHERE id=?1",
+                [&remove.id],
+                |row| row.get(0),
+            )
+            .expect("count removed queue row");
+        assert_eq!(removed_rows, 0);
     }
 
     #[test]

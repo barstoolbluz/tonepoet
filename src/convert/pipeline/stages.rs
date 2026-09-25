@@ -14151,7 +14151,7 @@ fn all_artifacts_have_complete_replaygain(
     Ok(true)
 }
 
-fn replaygain_member_id(track_id: &TrackId) -> String {
+pub(crate) fn replaygain_member_id(track_id: &TrackId) -> String {
     format!(
         "source:{}:disc:{}:track:{}",
         track_id.source_ordinal,
@@ -30035,6 +30035,10 @@ pub struct ScheduledAlbum {
     pub plan: AlbumPlan,
     pub stages: Vec<StageRecord>,
     pub(crate) source_replaygain: Option<crate::convert::replaygain::ReplayGainSourceScan>,
+    /// Dispatcher-coordinated post-encode ReplayGain observation for one
+    /// independent-file member of an Album/Both batch. `Err` is a fail-closed
+    /// barrier result: this item must not synthesize album gain from itself.
+    pub(crate) batch_replaygain: Option<Result<crate::convert::replaygain::ReplayGainSourceScan, String>>,
     pub(crate) reference_auto_gain_measurements: Vec<ReferenceAutoGainPreparedMeasurement>,
     pub(crate) dsd_true_peak_measurements: Vec<CertifiedTruePeakPreparedMeasurement>,
     pub(crate) pcm_true_peak_measurements: Vec<CertifiedTruePeakPreparedMeasurement>,
@@ -30081,6 +30085,7 @@ struct CertifiedTruePeakScratchRetrySeed {
     plan: AlbumPlan,
     stages: Vec<StageRecord>,
     source_replaygain: Option<crate::convert::replaygain::ReplayGainSourceScan>,
+    batch_replaygain: Option<Result<crate::convert::replaygain::ReplayGainSourceScan, String>>,
     dsd_true_peak_measurements: Vec<CertifiedTruePeakPreparedMeasurement>,
     pcm_true_peak_measurements: Vec<CertifiedTruePeakPreparedMeasurement>,
     dsd_true_peak_timings: BTreeMap<TrackId, DsdAlbumGainTiming>,
@@ -30208,6 +30213,7 @@ impl CertifiedTruePeakScratchRetrySeed {
             plan: album.plan.clone(),
             stages: album.stages.clone(),
             source_replaygain: album.source_replaygain.clone(),
+            batch_replaygain: album.batch_replaygain.clone(),
             dsd_true_peak_measurements: album.dsd_true_peak_measurements.clone(),
             pcm_true_peak_measurements: album.pcm_true_peak_measurements.clone(),
             dsd_true_peak_timings: album.dsd_true_peak_timings.clone(),
@@ -30405,6 +30411,7 @@ async fn retry_resolved_certified_true_peak_once_on_disk(
         plan: seed.plan,
         stages: seed.stages,
         source_replaygain: seed.source_replaygain,
+        batch_replaygain: seed.batch_replaygain,
         reference_auto_gain_measurements: Vec::new(),
         dsd_true_peak_measurements: seed.dsd_true_peak_measurements,
         pcm_true_peak_measurements: seed.pcm_true_peak_measurements,
@@ -30481,6 +30488,7 @@ pub(crate) fn scheduled_album_for_test(
         plan,
         stages,
         source_replaygain: None,
+        batch_replaygain: None,
         reference_auto_gain_measurements: Vec::new(),
         dsd_true_peak_measurements: Vec::new(),
         pcm_true_peak_measurements: Vec::new(),
@@ -40267,6 +40275,7 @@ async fn prepare_pipeline_item_for_scheduler_scoped_inner(
         plan: album_plan,
         stages,
         source_replaygain: None,
+        batch_replaygain: None,
         reference_auto_gain_measurements,
         dsd_true_peak_measurements,
         pcm_true_peak_measurements,
@@ -42558,6 +42567,7 @@ pub(crate) async fn finish_pipeline_album_for_scheduler_with_tool_limits_and_ret
     let run_timing = album.run_timing.clone();
     let action_output = album.action_output;
     let source_replaygain = album.source_replaygain;
+    let batch_replaygain = album.batch_replaygain;
     let dsd_true_peak_timings = album.dsd_true_peak_timings;
     let album_gain_scope_disclosure = album.album_gain_scope_disclosure;
     let req = album.req;
@@ -42797,6 +42807,40 @@ pub(crate) async fn finish_pipeline_album_for_scheduler_with_tool_limits_and_ret
 
     if req.stages.replaygain == StageRequirement::Enabled {
         emit_stage_started(reporter, &item_id, PipelineStage::ReplayGain).await;
+        let batch_scan_record = batch_replaygain.as_ref().map(|scan| match scan {
+            Ok(scan) => {
+                let artifacts = artifacts.as_ref().expect("artifacts present");
+                let paths = artifact_audio_paths(artifacts)
+                    .into_iter()
+                    .map(Path::to_path_buf)
+                    .collect::<Vec<_>>();
+                let member_ids = artifact_replaygain_member_ids(artifacts);
+                crate::convert::replaygain::apply_source_scan(
+                    &paths,
+                    &member_ids,
+                    req.settings
+                        .replay_gain
+                        .mode
+                        .unwrap_or(tonepoet_pipeline::ReplayGainMode::Both),
+                    req.settings.replay_gain.prevent_clipping,
+                    scan,
+                )
+                .map_err(ReplayGainError::Io)
+                .map(|report| StageRecord {
+                    stage: PipelineStage::ReplayGain,
+                    outcome: if report.has_unavailable_requested_gain() {
+                        StageOutcome::OkWithDetail(report.status_summary())
+                    } else {
+                        StageOutcome::Ok
+                    },
+                    dsd_dst_stats: None,
+                })
+            }
+            Err(error) => Err(ReplayGainError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                error.clone(),
+            ))),
+        });
         let source_scan_record = source_replaygain.as_ref().and_then(|scan| {
             apply_cue_source_replaygain_if_eligible(
                 artifacts.as_ref().expect("artifacts present"),
@@ -42805,11 +42849,11 @@ pub(crate) async fn finish_pipeline_album_for_scheduler_with_tool_limits_and_ret
                 scan,
             )
         });
-        let replaygain_result = match source_scan_record {
+        let replaygain_result = match batch_scan_record.or(source_scan_record) {
             Some(Ok(record)) => Ok(record),
             // Observation recovery is completed before this point. Once a
-            // retained source-pass result is selected, failure to apply its
-            // required metadata state is publication-blocking; do not hide a
+            // retained scan is selected, failure to apply its required
+            // metadata state is publication-blocking; do not hide a
             // writer/identity failure behind an unrelated final-output rescan.
             Some(Err(error)) => Err(error),
             None => Box::pin(apply_replaygain_with_source_and_tool_limits(
@@ -52196,15 +52240,25 @@ pub fn map_album_outcome(
             failed: failed.len() as u32,
             log_path: log_path.unwrap_or_default(),
         },
-        AlbumOutcome::Blocked { reason, stages, .. } => {
+        AlbumOutcome::Blocked {
+            reason,
+            failed,
+            stages,
+            ..
+        } => {
             let stage_error = stages.iter().rev().find_map(|r| match &r.outcome {
                 StageOutcome::Failed(err) => Some(format!("{:?}: {}", r.stage, err)),
                 _ => None,
             });
-            let error = match stage_error {
-                Some(detail) => detail,
-                None => format!("album blocked: {:?}", reason),
-            };
+            let track_error = (!failed.is_empty()).then(|| convert_stage_failure_message(failed));
+            // A failed track carries the executor's actionable sentence (for
+            // example an FFmpeg muxer refusal or a Reference qualification
+            // mismatch). Prefer it to the stage-level summary so Queue and
+            // History do not collapse the real cause into a generic stage
+            // label. Stage-only failures still retain their diagnostic.
+            let error = track_error
+                .or(stage_error)
+                .unwrap_or_else(|| format!("album blocked: {:?}", reason));
             ConversionStatus::Failed { error, log_path }
         }
     }
@@ -65172,6 +65226,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                 plan,
                 stages: Vec::new(),
                 source_replaygain: None,
+                batch_replaygain: None,
                 reference_auto_gain_measurements: Vec::new(),
                 dsd_true_peak_measurements: Vec::new(),
                 pcm_true_peak_measurements: Vec::new(),

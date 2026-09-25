@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event};
 use ratatui::{backend::CrosstermBackend, Terminal};
@@ -23,6 +23,32 @@ use super::text_input::TextInputState;
 /// deferred work continues promptly without making one render absorb an
 /// unbounded reducer batch.
 const MAX_ASYNC_MESSAGES_PER_FRAME: usize = 32;
+const DEAD_QUEUE_RECOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
+fn merge_recovered_queue_items(
+    app: &mut AppState,
+    pending: &mut VecDeque<crate::convert::ConversionItem>,
+) -> usize {
+    if pending.is_empty() {
+        return 0;
+    }
+    let Ok(mut queue) = app.manager.queue.try_write() else {
+        return 0;
+    };
+    let mut known_ids = queue
+        .all_items()
+        .into_iter()
+        .map(|item| item.id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let mut added = 0usize;
+    while let Some(item) = pending.pop_front() {
+        if known_ids.insert(item.id.clone()) {
+            queue.add_item_direct(item);
+            added = added.saturating_add(1);
+        }
+    }
+    added
+}
 
 /// Recover database-owned full-file rollback transactions before scanning the
 /// browse directory for standalone FLAC/DSF sidecars. A byte-identical legacy
@@ -66,6 +92,8 @@ pub async fn run_app(
         app.set_status(message);
     }
     let mut deferred_browse_visible_messages: VecDeque<AppMessage> = VecDeque::new();
+    let mut pending_recovered_queue_items = VecDeque::new();
+    let mut last_dead_queue_recovery_attempt = Instant::now();
 
     loop {
         // Check whether terminal input is already queued before firing any
@@ -73,6 +101,30 @@ pub async fn run_app(
         // an event waiting while the old debounce expires, causing periodic
         // folder classification/probe/stat work in the middle of scrolling.
         let input_waiting_at_frame_start = event::poll(Duration::from_millis(0))?;
+
+        // Queue-scope recovery is not a startup-only event. A dead session's
+        // supervisor tree can still be winding down when this process starts,
+        // making its durable scope temporarily live-owned. Re-observe at a
+        // low cadence once input is idle; each pass remains fail-closed for
+        // live owners and returns only rows newly adopted by this session.
+        if !input_waiting_at_frame_start
+            && last_dead_queue_recovery_attempt.elapsed() >= DEAD_QUEUE_RECOVERY_RETRY_INTERVAL
+        {
+            last_dead_queue_recovery_attempt = Instant::now();
+            match app.db.recover_dead_queue_items() {
+                Ok(items) => pending_recovered_queue_items.extend(items),
+                Err(error) => log::warn!("live queue recovery observation failed closed: {error}"),
+            }
+        }
+        let recovered_count =
+            merge_recovered_queue_items(app, &mut pending_recovered_queue_items);
+        if recovered_count > 0 {
+            app.save_queue();
+            app.set_status(format!(
+                "Recovered {recovered_count} queue item{} from an ended session; interrupted conversions are available in Queue for Retry or removal",
+                if recovered_count == 1 { "" } else { "s" },
+            ));
+        }
 
         // 1. Refresh items from the manager. Startup journal recoveries and
         // any queue left waiting behind a transient modal claim the serial
@@ -2648,6 +2700,7 @@ fn publish_probe_status_with_sentinel_clamp(
 
 fn handle_convert_source_probe_result(
     app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
     generation: u64,
     path: std::path::PathBuf,
     source_mode: super::app::SourceMode,
@@ -2733,6 +2786,15 @@ fn handle_convert_source_probe_result(
             .refresh_source_constraints_preserving_format_selection();
     }
 
+
+    if super::command::complete_pending_browse_convert_preset_after_probe(
+        app,
+        tx,
+        generation,
+        &path,
+    ) {
+        return;
+    }
 
     let status = if let Some(notice) = probe_notice {
         format!("Probe warning: {notice}")
@@ -7339,7 +7401,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             source_mode,
             baseline,
         } => {
-            handle_convert_source_probe_result(app, generation, path, source_mode, baseline);
+            handle_convert_source_probe_result(app, tx, generation, path, source_mode, baseline);
         }
         AppMessage::ArchivePreviewProgress {
             generation,
@@ -14249,7 +14311,8 @@ mod sentinel_clamp_status_tests {
             metadata: crate::tui::probe::SourceMetadata::default(),
             probe_notice: Some("tolerant metadata read".to_string()),
         };
-        handle_convert_source_probe_result(&mut app, generation, path, realized, baseline);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        handle_convert_source_probe_result(&mut app, &tx, generation, path, realized, baseline);
 
         // The clamp itself is correct (rate=source is invalid for a DSD
         // target with a KNOWN PCM source) — the pin is that it is REPORTED.
