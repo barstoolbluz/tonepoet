@@ -62,7 +62,6 @@ use tonepoet_pipeline::{
     REFERENCE_DECODE_ROUTE_RULES, REFERENCE_SAMPLE_HASH_FORMAT,
 };
 
-
 // Frozen v15 checker compatibility marker retained for inherited audit evidence;
 // the active common-model release report is schema v18.
 // append-only v15 checker source marker: "schema_version": 15
@@ -1589,72 +1588,6 @@ fn sox_streamed_float64_w64_sample_hash(
         })
 }
 
-fn synth_r64_fixture(
-    sox: &Path,
-    output: &Path,
-    sample_rate_hz: u32,
-    channels: u16,
-    amplitude: &str,
-    silence: bool,
-) {
-    synth_r64_fixture_duration(
-        sox,
-        output,
-        sample_rate_hz,
-        channels,
-        amplitude,
-        silence,
-        "0.05",
-    );
-}
-
-fn synth_r64_fixture_duration(
-    sox: &Path,
-    output: &Path,
-    sample_rate_hz: u32,
-    channels: u16,
-    amplitude: &str,
-    silence: bool,
-    duration_seconds: &str,
-) {
-    let mut args = vec![
-        "-S".to_string(),
-        "-D".to_string(),
-        // Input-format options precede the null input; placed after it they
-        // describe the output and sox_ng synthesizes at its 48 kHz default and
-        // resamples.
-        "-r".to_string(),
-        sample_rate_hz.to_string(),
-        "-c".to_string(),
-        channels.to_string(),
-        "-n".to_string(),
-        "-t".to_string(),
-        "w64".to_string(),
-        "-e".to_string(),
-        "floating-point".to_string(),
-        "-b".to_string(),
-        "64".to_string(),
-        output.display().to_string(),
-    ];
-    if silence {
-        args.extend([
-            "trim".to_string(),
-            "0".to_string(),
-            duration_seconds.to_string(),
-        ]);
-    } else {
-        args.extend([
-            "synth".to_string(),
-            duration_seconds.to_string(),
-            "sine".to_string(),
-            "997".to_string(),
-            "vol".to_string(),
-            amplitude.to_string(),
-        ]);
-    }
-    run(sox, &args);
-}
-
 #[allow(dead_code, reason = "append-only Reference qualification probe retained for historical evidence reproduction and targeted re-qualification")]
 fn probe_direct_ffmpeg_f64_w64(ffmpeg: &Path, input: &Path) -> Output {
     let args = vec![
@@ -1737,7 +1670,6 @@ fn exact_float64_w64_header(observation: W64HeaderObservation) -> bool {
                 .checked_add(24)
                 .expect("W64 data-chunk size arithmetic does not overflow")
 }
-
 
 fn encode_w64_characterization_fixture(
     sox: &Path,
@@ -2345,7 +2277,6 @@ fn write_dsf_reference_fixture(path: &Path, channels: u16, sample_rate_hz: u32) 
     write_dsf_reference_fixture_with_byte(path, channels, sample_rate_hz, 0x69)
 }
 
-
 #[derive(Debug)]
 struct HistoricalDcCertifiedProbe {
     observation: tonepoet_pipeline::ReferenceCertifiedPeakObservation,
@@ -2908,14 +2839,37 @@ fn qualify_common_reference_candidate_execution() -> Value {
         "silent and non-silent Q01 runs must execute the same runtime closure",
     );
 
-    let promotion_error = qualify_reference_production_promotion_gate(&candidate)
-        .expect_err("candidate/not-run evidence must remain blocked in production");
-    assert!(
-        promotion_error.contains("promotion is inactive")
-            || promotion_error.contains("not_run")
-            || promotion_error.contains("not completed"),
-        "unexpected Q01 production refusal: {promotion_error}"
-    );
+    let promotion_error = match qualify_reference_production_promotion_gate(&candidate) {
+        Err(promotion_error) => {
+            assert!(
+                promotion_error.contains("promotion is inactive")
+                    || promotion_error.contains("not_run")
+                    || promotion_error.contains("not completed"),
+                "unexpected Q01 production refusal: {promotion_error}"
+            );
+            promotion_error
+        }
+        Ok(()) => {
+            // Requalifying an already-installed tree: the gate may accept only
+            // because a passed embedded report binds this exact runtime closure.
+            let installed = installed_reference_reports_binding_closure(
+                &candidate.common_runtime_closure_fingerprint_sha256,
+            );
+            assert!(
+                !installed.is_empty(),
+                "production promotion accepted a Q01 candidate whose runtime closure {} is bound by no installed passed report",
+                candidate.common_runtime_closure_fingerprint_sha256,
+            );
+            format!(
+                "accepted: runtime closure already bound by installed passed report(s) {}",
+                installed
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+    };
 
     serde_json::json!({
         "status": "passed",
@@ -2995,7 +2949,6 @@ fn qualify_common_reference_candidate_execution() -> Value {
         "production_refusal": promotion_error,
     })
 }
-
 
 fn qualify_historical_dc_root_cause_probe() -> Value {
     let sox = required_tool(SOX_ENV);
@@ -4746,7 +4699,6 @@ fn capacity_boundary_plan_result(
     plan_reference_dsd(&request)
 }
 
-
 fn v18_long_programme_plan_result(
     root: &Path,
     input: &Path,
@@ -5209,7 +5161,6 @@ fn known_defective_w64_metadata_remux_args(input: &Path, output: &Path) -> Vec<S
     ]
 }
 
-
 fn deterministic_int24_mono_bytes(sample_count: usize) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(sample_count * 3);
     for index in 0..sample_count {
@@ -5377,7 +5328,6 @@ fn record_decode_authority(
         .entry(format!("{phase}:{}", authority.hash_encoding().key()))
         .or_default() += 1;
 }
-
 
 #[derive(Default)]
 struct PackageRateEvidence {
@@ -6132,6 +6082,31 @@ fn qualify_lossless_package_rate(
         w64_planner_entry_rejection_count,
         w64_metadata_entry_rejection_count,
     }
+}
+
+/// Installed Reference qualification reports (status passed) whose runtime
+/// closure fingerprint equals `fingerprint`.
+fn installed_reference_reports_binding_closure(fingerprint: &str) -> Vec<PathBuf> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tonepoet-pipeline/qualification");
+    let mut found = Vec::new();
+    for entry in fs::read_dir(&dir).expect("read installed qualification dir").flatten() {
+        let path = entry.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !(name.starts_with("dsd_reference_common_v") && name.ends_with("_report.json")) {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else { continue };
+        let Ok(report) = serde_json::from_str::<Value>(&text) else { continue };
+        let passed = report.get("status").and_then(Value::as_str) == Some("passed");
+        let bound = report
+            .get("runtime_closure_fingerprint_sha256")
+            .and_then(Value::as_str)
+            == Some(fingerprint);
+        if passed && bound {
+            found.push(path);
+        }
+    }
+    found
 }
 
 fn qualify_lossless_package_cells(
