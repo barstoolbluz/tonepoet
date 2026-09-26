@@ -2650,6 +2650,12 @@ malformed-present-peer phase on `sole_structural_multifile_sidecar_survives_conf
 
 ## 36. Album ReplayGain on per-track albums reduces to track gain
 
+**Status 2026-09-26:** resolved on main @ 6d11d35 (v0.5.3). Independent-file Album/Both members
+leave the direct single-file executor and rendezvous at a post-encode barrier; one native
+measurement over the cohort; each member gets the shared album values plus its own track values.
+Field: ten-track album, one album gain (-7.88 dB, equal to loudgain's album value), ten track gains.
+The #35a regression runs green in the gate.
+
 Found by the Stage A profile, 2026-09-19 (`docs/STAGE_A_PROFILE_2026-09-19.md`). Converting a
 folder of ten FLAC tracks with `--replaygain album` produced ten different
 `REPLAYGAIN_ALBUM_GAIN` values, each equal to that track's `REPLAYGAIN_TRACK_GAIN`. The observer
@@ -2718,6 +2724,11 @@ sweep can come later on top of it.
 Not part of the 2026-09-20 DSD and ID3 brief; scheduled after it.
 
 ## 39. A GIF cover picture makes every FLAC track of an album fail to convert
+
+**Status 2026-09-26:** resolved on main @ 6d11d35 (v0.5.3). Artwork is transcoded to PNG with the
+attached-picture disposition on the FFmpeg encode and metadata-transfer paths; a failed track's own
+sentence reaches the queue entry. Field: the Billboard 1988 album converts 10 of 10 with its cover.
+The conversion log does not yet mention the artwork normalisation.
 
 Found 2026-09-23 on a per-track FLAC album (Billboard Top Hits 1988, ten tracks, 44.1/16)
 whose embedded front cover is a 304x300 GIF. All ten tracks fail, in every session; the
@@ -2831,6 +2842,11 @@ covers the wall time.
 
 ## 43. Browse context menu "Convert -> <preset>" applies a preset before the source is installed, so every DSD field is dropped
 
+**Status 2026-09-26:** fixed on main @ 6d11d35 (v0.5.3), regressions green; live TUI check on the
+Dark Side ISO still owed by the user. The preset is deferred until the source probe resolves;
+inapplicable DSD fields are refused, not skipped; saved PCM presets carry no DSD fields; Int32
+dither is limited to what the planner admits.
+
 Found 2026-09-24 converting the stereo area of a Dark Side of the Moon SACD ISO with the
 preset `SACD-to-PCM Reference` (`dsd_path = "reference"`, 176.4 kHz, 32-bit,
 `dither = "tpdf"`, `resampler = "soxr"`). From the Browse context menu the conversion
@@ -2883,6 +2899,11 @@ Int32 FFmpeg terminal with a dither the planner will refuse.
 Open the source with Convert -> Custom, then load the preset from the overlay.
 
 ## 44. A session closed mid-conversion leaves its output folder reserved forever; the next session's recovery pass silently gives up
+
+**Status 2026-09-26:** fixed on main @ 6d11d35 (v0.5.3), regressions green; live check (the stranded
+Genesis reservation recovering when the TUI is next opened) still owed by the user. Live-owned scopes
+are logged and skipped instead of ending the pass; the TUI re-observes every five seconds; adopted
+rows appear as Interrupted; claims stay reserved until Retry or Remove; the refusal names the item.
 
 Found 2026-09-25. A TUI converting an SACD ISO was closed with Ctrl+Q at 20 percent. A new
 TUI started five minutes later. Every later attempt to convert the same album, from any
@@ -2944,6 +2965,12 @@ appear in the Queue screen as Interrupted or retryable. The reservation on the f
 is therefore still in place after a restart, and the pass's outcome remains invisible.
 
 ## 45. A version bump invalidates the installed Reference qualification, and the TUI hides the reason
+
+**Status 2026-09-26:** resolved on main @ 6d11d35 (v0.5.3). The root package version value in
+`Cargo.toml` and `Cargo.lock` is canonicalised before hashing (`reference_source_lock.rs`); a test
+recomputes the closure with only the version changed and shows it equal; `Cargo.lock` stays bound.
+The TUI refusal states that the installed report does not bind the running build and that
+requalification is the remedy.
 
 Found 2026-09-25 immediately after the 0.5.3 bump. Every Reference conversion failed:
 
