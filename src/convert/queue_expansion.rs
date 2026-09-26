@@ -1846,7 +1846,7 @@ fn read_embedded_cuesheet_text_for_queue(path: &Path) -> Result<Option<String>, 
 
     let tagged = match lofty::read_from_path(path) {
         Ok(tagged) => tagged,
-        Err(error) if crate::metadata_persistence::native_ape_error_is_eligible(&error) => {
+        Err(error) if crate::metadata_persistence::native_ape_fallback_is_eligible(path, &error) => {
             let outcome = match crate::metadata_persistence::read_native_ape_fallback(path) {
                 Ok(outcome) => outcome,
                 Err(native_error) => {

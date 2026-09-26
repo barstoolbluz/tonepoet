@@ -457,6 +457,8 @@ fn apply_realized_wav_carrier_facts(
         .and_then(|len_in_pts| expected_samples_from_pts_len(len_in_pts, carrier.sample_rate));
     track.source_audio = SourceAudioDescriptor {
         coding: track.source_audio.coding.or(Some(SourceAudioCoding::DvdaUnknown)),
+        codec_name: track.source_audio.codec_name.clone(),
+        format_name: track.source_audio.format_name.clone(),
         channel_groups: vec![ChannelGroupDescriptor {
             group_nr: 1,
             channels: Some(carrier.channels),
@@ -3227,6 +3229,8 @@ fn source_audio_descriptor_for_facts(audio_facts: AudioFacts<'_>) -> SourceAudio
     if let Some(probed) = audio_facts.stream_probe {
         return SourceAudioDescriptor {
             coding: Some(SourceAudioCoding::DvdaUnknown),
+            codec_name: None,
+            format_name: None,
             channel_groups: stream_probe_channel_group_descriptors(probed),
             primary_sample_rate: Some(probed.sample_rate),
             bit_depth: probed.bit_depth.map(u32::from),
@@ -3240,6 +3244,8 @@ fn source_audio_descriptor_for_facts(audio_facts: AudioFacts<'_>) -> SourceAudio
 
     SourceAudioDescriptor {
         coding: Some(SourceAudioCoding::DvdaUnknown),
+        codec_name: None,
+        format_name: None,
         channel_groups,
         primary_sample_rate: audio_facts.sample_rate,
         bit_depth: audio_facts.bit_depth.map(u32::from),

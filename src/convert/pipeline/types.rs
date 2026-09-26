@@ -2072,6 +2072,16 @@ pub const CUE_ARTWORK_MIME_EXTRA_KEY: &str = "tonepoet_cue_artwork_mime";
 pub const CUE_ARTWORK_SOURCE_EXTRA_KEY: &str = "tonepoet_cue_artwork_source";
 pub const CUE_ARTWORK_UNSUPPORTED_EXTRA_KEY: &str = "tonepoet_cue_artwork_unsupported";
 
+/// Generic staged-source artwork handoff used when a source reader recovers
+/// artwork that the ordinary encoder/tag reader cannot safely consume. The
+/// post-encode metadata stage owns these keys; they are never emitted as tags.
+pub const STAGED_SOURCE_ARTWORK_PATH_EXTRA_KEY: &str =
+    "tonepoet_staged_source_artwork_path";
+pub const STAGED_SOURCE_ARTWORK_MIME_EXTRA_KEY: &str =
+    "tonepoet_staged_source_artwork_mime";
+pub const STAGED_SOURCE_ARTWORK_SOURCE_EXTRA_KEY: &str =
+    "tonepoet_staged_source_artwork_source";
+
 /// Reserved AlbumMetadata.extra marker proving that a SingleFile source was
 /// expanded from embedded container chapters. This is pipeline provenance,
 /// never user metadata, and lets pre-publish structural finalization distinguish
@@ -2414,6 +2424,19 @@ pub struct ChannelGroupDescriptor {
 pub struct SourceAudioDescriptor {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coding: Option<SourceAudioCoding>,
+    /// Decoder-reported codec identity for a directly probed source carrier.
+    ///
+    /// This is intentionally independent of `coding`: APE, TTA, Shorten, and
+    /// FLAC all decode to PCM, but only FLAC may satisfy a FLAC stream-copy
+    /// request. Keeping the codec spelling prevents planner identity from
+    /// being reconstructed from a filename extension.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codec_name: Option<String>,
+    /// Demuxer/container identity reported by ffprobe for the same carrier.
+    /// The raw comma-separated spelling is retained because it is a source
+    /// fact and can distinguish a misnamed carrier from its extension.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format_name: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub channel_groups: Vec<ChannelGroupDescriptor>,
     #[serde(
@@ -2433,6 +2456,8 @@ impl Default for SourceAudioDescriptor {
     fn default() -> Self {
         Self {
             coding: None,
+            codec_name: None,
+            format_name: None,
             channel_groups: Vec::new(),
             primary_sample_rate: None,
             bit_depth: None,
@@ -2449,10 +2474,162 @@ impl SourceAudioDescriptor {
     ) -> Self {
         Self {
             coding,
+            codec_name: None,
+            format_name: None,
             channel_groups: Vec::new(),
             primary_sample_rate: sample_rate.filter(|hz| *hz != 0),
             bit_depth,
         }
+    }
+
+    /// Attach the exact decoder/demuxer identities used to classify a source.
+    /// Empty probe fields remain absent rather than becoming authoritative
+    /// empty strings.
+    #[must_use]
+    pub fn with_probe_identity(
+        mut self,
+        codec_name: Option<&str>,
+        format_name: Option<&str>,
+    ) -> Self {
+        self.codec_name = codec_name
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        self.format_name = format_name
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        self
+    }
+}
+
+fn probe_format_has(format_name: Option<&str>, expected: &[&str]) -> bool {
+    let Some(format_name) = format_name else {
+        return false;
+    };
+    format_name
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .any(|value| expected.iter().any(|candidate| value.eq_ignore_ascii_case(candidate)))
+}
+
+fn source_extension_matches_probe(
+    extension: &str,
+    codec_name: &str,
+    format_name: Option<&str>,
+) -> Option<bool> {
+    let extension = extension.trim_start_matches('.').to_ascii_lowercase();
+    let codec = codec_name.trim().to_ascii_lowercase();
+    let format = |expected: &[&str]| probe_format_has(format_name, expected);
+    let has_format_fact = format_name
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    let codec_and_format = |codec_matches: bool, expected: &[&str]| {
+        codec_matches && (!has_format_fact || format(expected))
+    };
+
+    let matches = match extension.as_str() {
+        // For formats that name both a codec and a concrete carrier, a codec
+        // match alone is not enough. FLAC-in-Ogg, for example, is not a native
+        // FLAC file and must not be reported as matching a `.flac` extension.
+        "flac" => codec_and_format(codec == "flac", &["flac"]),
+        "ape" => codec_and_format(codec == "ape", &["ape"]),
+        "wv" => codec_and_format(codec == "wavpack", &["wv", "wavpack"]),
+        "mp3" => codec_and_format(matches!(codec.as_str(), "mp3" | "mp3float"), &["mp3"]),
+        "wav" | "wave" => format(&["wav"]),
+        "aif" | "aiff" | "aifc" => format(&["aiff"]),
+        "m4a" | "m4b" | "mp4" => format(&["mov", "mp4", "m4a", "3gp", "3g2", "mj2"]),
+        "aac" => codec_and_format(codec == "aac", &["aac"]),
+        "alac" => codec_and_format(codec == "alac", &["mov", "mp4", "m4a", "3gp", "3g2", "mj2"]),
+        "ogg" | "oga" => format(&["ogg"]),
+        "opus" => codec_and_format(codec == "opus", &["ogg"]),
+        "dsf" => codec_and_format(codec.starts_with("dsd"), &["dsf"]),
+        "dff" => codec_and_format(codec.starts_with("dsd") || codec == "dst", &["dff", "iff"]),
+        "dts" => codec_and_format(matches!(codec.as_str(), "dts" | "dca"), &["dts"]),
+        "ac3" => codec_and_format(codec == "ac3", &["ac3"]),
+        "mpc" | "mpp" | "mp+" => codec_and_format(
+            matches!(codec.as_str(), "mpc7" | "mpc8"),
+            &["mpc", "mpc7", "mpc8"],
+        ),
+        "shn" => codec_and_format(codec == "shorten", &["shn", "shorten"]),
+        "tta" => codec_and_format(codec == "tta", &["tta"]),
+        _ => return None,
+    };
+    Some(matches)
+}
+
+/// Describe a confident filename/content identity disagreement using both the
+/// user-visible extension and the decoder-reported codec. Unknown extensions
+/// remain silent rather than manufacturing a mismatch from incomplete facts.
+#[must_use]
+pub fn source_identity_mismatch_warning(
+    path: &std::path::Path,
+    codec_name: Option<&str>,
+    format_name: Option<&str>,
+) -> Option<String> {
+    let extension = path.extension()?.to_str()?.trim();
+    let codec_name = codec_name.map(str::trim).filter(|value| !value.is_empty())?;
+    if source_extension_matches_probe(extension, codec_name, format_name)? {
+        return None;
+    }
+
+    let mut warning = format!(
+        "Source identity mismatch: filename extension '.{}' disagrees with decoded codec '{}'",
+        extension, codec_name
+    );
+    if let Some(format_name) = format_name.map(str::trim).filter(|value| !value.is_empty()) {
+        warning.push_str(&format!(" (decoder format '{}')", format_name));
+    }
+    Some(warning)
+}
+
+
+#[cfg(test)]
+mod source_identity_tests {
+    use super::source_identity_mismatch_warning;
+    use std::path::Path;
+
+    #[test]
+    fn misnamed_decode_only_source_reports_extension_and_decoder_facts() {
+        let warning = source_identity_mismatch_warning(
+            Path::new("08 - Track 08.flac"),
+            Some("ape"),
+            Some("ape"),
+        )
+        .expect("misnamed APE must be disclosed");
+        assert!(warning.contains("'.flac'"));
+        assert!(warning.contains("'ape'"));
+        assert!(warning.contains("decoder format 'ape'"));
+    }
+
+    #[test]
+    fn matching_and_unknown_extensions_do_not_invent_mismatches() {
+        assert!(source_identity_mismatch_warning(
+            Path::new("track.ape"),
+            Some("ape"),
+            Some("ape"),
+        )
+        .is_none());
+        assert!(source_identity_mismatch_warning(
+            Path::new("track.bin"),
+            Some("ape"),
+            Some("ape"),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn matching_codec_in_different_container_is_still_a_mismatch() {
+        let warning = source_identity_mismatch_warning(
+            Path::new("wrapped.flac"),
+            Some("flac"),
+            Some("ogg"),
+        )
+        .expect("container disagreement must remain visible");
+        assert!(warning.contains("'.flac'"));
+        assert!(warning.contains("decoded codec 'flac'"));
+        assert!(warning.contains("decoder format 'ogg'"));
     }
 }
 

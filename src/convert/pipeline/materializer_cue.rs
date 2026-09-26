@@ -517,6 +517,7 @@ impl Materializer for CueImageMaterializer {
         let mut decode_paths = HashMap::new();
         let mut image_metadata = HashMap::new();
         let mut image_artwork = HashMap::new();
+        let mut image_identity_warnings = HashMap::new();
         for image_path in &unique_images {
             if cancel.is_cancelled() {
                 return Err(MaterializeError::Cancelled);
@@ -530,6 +531,16 @@ impl Materializer for CueImageMaterializer {
                     cancel,
                 )
                 .await?;
+            let identity_warning = if used_wvunpack_fallback {
+                None
+            } else {
+                source_identity_mismatch_warning(
+                    image_path,
+                    probe.codec_name.as_deref(),
+                    probe.format_name.as_deref(),
+                )
+            };
+            image_identity_warnings.insert(image_key.clone(), identity_warning);
             probes.insert(image_key.clone(), probe);
             decode_paths.insert(image_key.clone(), decode_path);
             image_metadata.insert(image_key.clone(), read_image_album_metadata(image_path));
@@ -691,7 +702,12 @@ impl Materializer for CueImageMaterializer {
                     probe.bit_depth,
                     Some(probe.coding),
                 ),
-                warnings: Vec::new(),
+                warnings: image_identity_warnings
+                    .get(&image_key)
+                    .cloned()
+                    .flatten()
+                    .into_iter()
+                    .collect(),
             });
         }
 
@@ -1337,7 +1353,7 @@ fn read_embedded_cuesheet(path: &Path) -> Result<Option<String>, MaterializeErro
 
     let tagged = match lofty::read_from_path(path) {
         Ok(tagged) => tagged,
-        Err(error) if crate::metadata_persistence::native_ape_error_is_eligible(&error) => {
+        Err(error) if crate::metadata_persistence::native_ape_fallback_is_eligible(path, &error) => {
             let outcome = match crate::metadata_persistence::read_native_ape_fallback(path) {
                 Ok(outcome) => outcome,
                 Err(native_error) => {

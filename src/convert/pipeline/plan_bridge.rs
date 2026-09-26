@@ -25,6 +25,7 @@ use super::types::{
     PreparedTrack, CueSegmentCarrier, RegisteredEffectCarrierRepresentation,
     SelectedPhysicalCandidateBinding, SourceAudioCoding, SourceKind, StageRequirement,
     TrackMetadata, TrackSelection, TrackSourceRef, CUE_ARTWORK_PATH_EXTRA_KEY, FALLBACK_RECOVERED_METADATA_EXTRA_KEY,
+    STAGED_SOURCE_ARTWORK_PATH_EXTRA_KEY,
 };
 
 fn planned_riff_non_audio_upper_bound(
@@ -2263,6 +2264,12 @@ pub fn source_supports_source_artwork_preservation(
     req: &PipelineRequest,
     source: &PreparedSource,
 ) -> bool {
+    if source_has_staged_artwork(source) {
+        return req
+            .settings
+            .target_format
+            .supports_cue_post_encode_artwork_embedding();
+    }
     match source.kind {
         SourceKind::CueImage => cue_source_has_extracted_artwork(source)
             && req
@@ -2272,6 +2279,14 @@ pub fn source_supports_source_artwork_preservation(
         SourceKind::SacdIso | SourceKind::DvdVideo => false,
         _ => req.settings.target_format.supports_planner_embedded_artwork_transfer(),
     }
+}
+
+fn source_has_staged_artwork(source: &PreparedSource) -> bool {
+    source
+        .album_metadata
+        .extra
+        .get(STAGED_SOURCE_ARTWORK_PATH_EXTRA_KEY)
+        .is_some_and(|value| !value.trim().is_empty())
 }
 
 fn cue_source_has_extracted_artwork(source: &PreparedSource) -> bool {
@@ -2695,25 +2710,42 @@ pub fn source_info_for_realized_track(
         });
     }
 
-    let format = planner_format_from_path(realized_input).unwrap_or_else(|| match &track.source_ref {
-        TrackSourceRef::SacdTrack { .. } => PlannerFormat::Dsf,
-        TrackSourceRef::DvdVideoTrack { .. } => PlannerFormat::Wav,
-        _ => PlannerFormat::Flac,
-    });
-    let codec = match &track.source_ref {
-        TrackSourceRef::CueStreamSegment {
-            carrier: CueSegmentCarrier::PcmF32LeWav | CueSegmentCarrier::PcmF64LeWav,
-            ..
+    // A directly probed source carrier is identified by what the decoder
+    // actually opened, not by its filename. This is both a correctness and a
+    // safety boundary: decode-only codecs such as APE/TTA/Shorten must never
+    // become stream-copy eligible merely because their path has (or falls back
+    // to) a target-looking extension. Realized derivative carriers keep their
+    // own physical identity instead of inheriting the original source probe.
+    let probed_identity = match &track.source_ref {
+        TrackSourceRef::StagedFile(path) if path == realized_input => {
+            planner_identity_from_probe(&track.source_audio)
         }
-        | TrackSourceRef::CueSegmentCarrier {
-            carrier: CueSegmentCarrier::PcmF32LeWav | CueSegmentCarrier::PcmF64LeWav,
-            ..
-        }
-        | TrackSourceRef::EmbeddedChapterCarrier {
-            carrier: CueSegmentCarrier::PcmF32LeWav | CueSegmentCarrier::PcmF64LeWav,
-            ..
-        } => PlannerCodec::PcmFloat,
-        _ => codec_for_format(&format),
+        _ => None,
+    };
+    let (format, codec) = if let Some(identity) = probed_identity {
+        identity
+    } else {
+        let format = planner_format_from_path(realized_input).unwrap_or_else(|| match &track.source_ref {
+            TrackSourceRef::SacdTrack { .. } => PlannerFormat::Dsf,
+            TrackSourceRef::DvdVideoTrack { .. } => PlannerFormat::Wav,
+            _ => PlannerFormat::Flac,
+        });
+        let codec = match &track.source_ref {
+            TrackSourceRef::CueStreamSegment {
+                carrier: CueSegmentCarrier::PcmF32LeWav | CueSegmentCarrier::PcmF64LeWav,
+                ..
+            }
+            | TrackSourceRef::CueSegmentCarrier {
+                carrier: CueSegmentCarrier::PcmF32LeWav | CueSegmentCarrier::PcmF64LeWav,
+                ..
+            }
+            | TrackSourceRef::EmbeddedChapterCarrier {
+                carrier: CueSegmentCarrier::PcmF32LeWav | CueSegmentCarrier::PcmF64LeWav,
+                ..
+            } => PlannerCodec::PcmFloat,
+            _ => codec_for_format(&format),
+        };
+        (format, codec)
     };
     // For SACD-realized tracks, DSD container inspection may fail on test
     // placeholders or when the file was already validated by the extraction
@@ -2800,6 +2832,151 @@ fn planner_source_representation(track: &PreparedTrack) -> SourceRepresentationK
     }
 }
 
+fn probe_format_has(format_name: Option<&str>, expected: &[&str]) -> bool {
+    let Some(format_name) = format_name else {
+        return false;
+    };
+    format_name
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .any(|value| expected.iter().any(|candidate| value.eq_ignore_ascii_case(candidate)))
+}
+
+fn planner_custom_source_format(
+    extension: impl Into<String>,
+    display_name: impl Into<String>,
+) -> PlannerFormat {
+    PlannerFormat::Custom {
+        extension: extension.into(),
+        display_name: display_name.into(),
+    }
+}
+
+/// Translate decoder facts into the planner's built-in vocabulary without
+/// inventing identity from the path. Unknown and decode-only codecs deliberately
+/// become `Custom`; that makes content equality unprovable and therefore
+/// excludes passthrough/stream-copy while the ordinary FFmpeg lowerer can still
+/// decode the carrier by probing its bytes.
+fn planner_identity_from_probe(
+    source_audio: &super::types::SourceAudioDescriptor,
+) -> Option<(PlannerFormat, PlannerCodec)> {
+    let codec_name = source_audio.codec_name.as_deref()?.trim();
+    if codec_name.is_empty() {
+        return None;
+    }
+    let codec = codec_name.to_ascii_lowercase();
+    let format_name = source_audio.format_name.as_deref();
+    let custom_format = || {
+        let extension = format_name
+            .and_then(|name| name.split(',').next())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(codec_name);
+        planner_custom_source_format(extension, format_name.unwrap_or(codec_name))
+    };
+
+    // Built-in format identity is admitted only when both the decoded codec and
+    // the decoder-reported carrier agree. A codec match alone cannot prove
+    // byte-for-byte passthrough: FLAC-in-Ogg is FLAC audio, but it is not a
+    // native FLAC carrier. Unknown/mismatched carriers stay `Custom` while the
+    // codec remains available for source representation and lowering.
+    let identity = match codec.as_str() {
+        "flac" if probe_format_has(format_name, &["flac"]) => {
+            (PlannerFormat::Flac, PlannerCodec::Flac)
+        }
+        "flac" => (custom_format(), PlannerCodec::Flac),
+        "wavpack" if probe_format_has(format_name, &["wv", "wavpack"]) => {
+            (PlannerFormat::WavPack, PlannerCodec::WavPack)
+        }
+        "wavpack" => (custom_format(), PlannerCodec::WavPack),
+        "mp3" | "mp3float" if probe_format_has(format_name, &["mp3"]) => {
+            (PlannerFormat::Mp3, PlannerCodec::Mp3)
+        }
+        "mp3" | "mp3float" => (custom_format(), PlannerCodec::Mp3),
+        "aac"
+            if probe_format_has(
+                format_name,
+                &["mov", "mp4", "m4a", "3gp", "3g2", "mj2"],
+            ) =>
+        {
+            (PlannerFormat::Aac, PlannerCodec::Aac)
+        }
+        "aac" => (custom_format(), PlannerCodec::Aac),
+        "opus" if probe_format_has(format_name, &["ogg"]) => {
+            (PlannerFormat::Opus, PlannerCodec::Opus)
+        }
+        "opus" => (custom_format(), PlannerCodec::Opus),
+        "alac"
+            if probe_format_has(
+                format_name,
+                &["mov", "mp4", "m4a", "3gp", "3g2", "mj2"],
+            ) =>
+        {
+            (PlannerFormat::Alac, PlannerCodec::Alac)
+        }
+        "alac" => (custom_format(), PlannerCodec::Alac),
+        "dts" | "dca" if probe_format_has(format_name, &["dts"]) => (
+            PlannerFormat::Dts,
+            PlannerCodec::Custom("DTS".to_string()),
+        ),
+        "dts" | "dca" => (custom_format(), PlannerCodec::Custom("DTS".to_string())),
+        "ac3" if probe_format_has(format_name, &["ac3"]) => (
+            PlannerFormat::Ac3,
+            PlannerCodec::Custom("AC3".to_string()),
+        ),
+        "ac3" => (custom_format(), PlannerCodec::Custom("AC3".to_string())),
+        value if value.starts_with("dsd") || value == "dst" => {
+            let format = if probe_format_has(format_name, &["dff", "iff"]) {
+                PlannerFormat::Dff
+            } else if probe_format_has(format_name, &["dsf"]) {
+                PlannerFormat::Dsf
+            } else {
+                custom_format()
+            };
+            (format, PlannerCodec::Dsd)
+        }
+        value if value.starts_with("pcm_") => {
+            let format = if probe_format_has(format_name, &["wav"]) {
+                PlannerFormat::Wav
+            } else if probe_format_has(format_name, &["aiff"]) {
+                PlannerFormat::Aiff
+            } else {
+                custom_format()
+            };
+            let codec = if value.starts_with("pcm_f") {
+                PlannerCodec::PcmFloat
+            } else if value.starts_with("pcm_u") {
+                PlannerCodec::PcmUnsigned
+            } else {
+                PlannerCodec::PcmSigned
+            };
+            (format, codec)
+        }
+        // These codecs are accepted only as source inputs. Keep their exact
+        // decoder identity instead of pretending they are the requested target.
+        "ape" | "tta" | "shorten" | "mpc7" | "mpc8" | "vorbis" => {
+            let extension = match codec.as_str() {
+                "ape" => "ape",
+                "tta" => "tta",
+                "shorten" => "shn",
+                "mpc7" | "mpc8" => "mpc",
+                "vorbis" => "ogg",
+                _ => unreachable!(),
+            };
+            (
+                planner_custom_source_format(extension, codec_name),
+                PlannerCodec::Custom(codec_name.to_string()),
+            )
+        }
+        _ => (
+            custom_format(),
+            PlannerCodec::Custom(codec_name.to_string()),
+        ),
+    };
+    Some(identity)
+}
+
 pub fn planner_format_from_main(format: crate::convert::AudioFormat) -> PlannerFormat {
     match format {
         crate::convert::AudioFormat::Flac => PlannerFormat::Flac,
@@ -2814,13 +2991,14 @@ pub fn planner_format_from_main(format: crate::convert::AudioFormat) -> PlannerF
         crate::convert::AudioFormat::Dff => PlannerFormat::Dff,
         crate::convert::AudioFormat::Dts => PlannerFormat::Dts,
         crate::convert::AudioFormat::Ac3 => PlannerFormat::Ac3,
-        // Decode-only source formats are never output targets; default to FLAC
-        // like the pre-existing Ape arm.
-        crate::convert::AudioFormat::Ape
-        | crate::convert::AudioFormat::Musepack
-        | crate::convert::AudioFormat::Shorten
-        | crate::convert::AudioFormat::Ogg
-        | crate::convert::AudioFormat::Tta => PlannerFormat::Flac,
+        // Decode-only formats are input identities, never aliases for FLAC.
+        // Keeping them custom prevents equality with any built-in output even
+        // on paths that do not yet carry decoder probe facts.
+        crate::convert::AudioFormat::Ape => planner_custom_source_format("ape", "APE"),
+        crate::convert::AudioFormat::Musepack => planner_custom_source_format("mpc", "Musepack"),
+        crate::convert::AudioFormat::Shorten => planner_custom_source_format("shn", "Shorten"),
+        crate::convert::AudioFormat::Ogg => planner_custom_source_format("ogg", "Ogg/Vorbis"),
+        crate::convert::AudioFormat::Tta => planner_custom_source_format("tta", "TTA"),
         crate::convert::AudioFormat::Lpcm => PlannerFormat::Wav, // LPCM maps to WAV container
     }
 }
@@ -2838,6 +3016,11 @@ pub fn planner_format_from_path(path: &Path) -> Option<PlannerFormat> {
         "alac" => Some(PlannerFormat::Alac),
         "dsf" => Some(PlannerFormat::Dsf),
         "dff" => Some(PlannerFormat::Dff),
+        "ape" => Some(planner_custom_source_format("ape", "APE")),
+        "mpc" | "mpp" | "mp+" => Some(planner_custom_source_format("mpc", "Musepack")),
+        "shn" => Some(planner_custom_source_format("shn", "Shorten")),
+        "ogg" | "oga" => Some(planner_custom_source_format("ogg", "Ogg/Vorbis")),
+        "tta" => Some(planner_custom_source_format("tta", "TTA")),
         _ => None,
     }
 }
@@ -2992,8 +3175,8 @@ mod tests {
 
     use tempfile::TempDir;
     use tonepoet_pipeline::{
-        AudioFormat as PlannerFormat, EffectInstanceId, EffectIntent, EffectPlacement,
-        PcmBitDepth, PipelineSettings, PlanAction, PlanOperation, PlanRequest, PreferredTool,
+        AudioCodec as PlannerCodec, AudioFormat as PlannerFormat, EffectInstanceId, EffectIntent,
+        EffectPlacement, PcmBitDepth, PipelineSettings, PlanAction, PlanOperation, PlanRequest, PreferredTool,
         RegisteredUnaryEffect, TopologyPlan,
     };
 
@@ -3004,7 +3187,8 @@ mod tests {
         resolve_wavpack_hybrid_source_working_depth, SourceAudioCoding,
         flac_streaminfo_audio_md5, metadata_obligations_for_request,
         orchestrator_metadata_stage_required, plan_request_for_track,
-        planner_format_from_path, planner_metadata_obligations_for_track,
+        planner_format_from_main, planner_format_from_path, planner_identity_from_probe,
+        planner_metadata_obligations_for_track,
         source_audio_md5_policy_downgrade_message,
         source_info_for_realized_track, source_needs_authoritative_metadata,
         source_supports_source_tag_transfer, DsdPlannerSourceKind,
@@ -3092,6 +3276,49 @@ mod tests {
             batch_resolved_identity: None,
             metadata_overrides: Default::default(),
         }
+    }
+
+    #[test]
+    fn decode_only_sources_never_alias_flac_identity() {
+        let descriptor = SourceAudioDescriptor::from_scalar(
+            Some(96_000),
+            Some(24),
+            Some(SourceAudioCoding::Pcm),
+        )
+        .with_probe_identity(Some("ape"), Some("ape"));
+        let (format, codec) = planner_identity_from_probe(&descriptor)
+            .expect("decoder identity should be authoritative");
+        assert!(matches!(format, PlannerFormat::Custom { .. }));
+        assert_eq!(codec, PlannerCodec::Custom("ape".to_string()));
+        assert!(matches!(
+            planner_format_from_main(crate::convert::AudioFormat::Ape),
+            PlannerFormat::Custom { .. }
+        ));
+        assert!(matches!(
+            planner_format_from_path(Path::new("track.ape")),
+            Some(PlannerFormat::Custom { .. })
+        ));
+    }
+
+    #[test]
+    fn probed_codec_wins_even_when_filename_claims_flac() {
+        let descriptor = SourceAudioDescriptor::default()
+            .with_probe_identity(Some("ape"), Some("ape"));
+        let (format, codec) = planner_identity_from_probe(&descriptor)
+            .expect("decoder identity should be available");
+        assert!(matches!(&format, PlannerFormat::Custom { .. }));
+        assert_ne!(format, planner_format_from_path(Path::new("misnamed.flac")).unwrap());
+        assert_eq!(codec, PlannerCodec::Custom("ape".to_string()));
+    }
+
+    #[test]
+    fn probed_container_must_agree_before_builtin_passthrough_identity() {
+        let descriptor = SourceAudioDescriptor::default()
+            .with_probe_identity(Some("flac"), Some("ogg"));
+        let (format, codec) = planner_identity_from_probe(&descriptor)
+            .expect("decoder identity should be available");
+        assert!(matches!(format, PlannerFormat::Custom { .. }));
+        assert_eq!(codec, PlannerCodec::Flac);
     }
 
     #[test]
