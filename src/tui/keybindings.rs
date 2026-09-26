@@ -10765,6 +10765,28 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                         completion: None,
                     };
                 }
+                KeyCode::Char('r') => {
+                    if app.analysis_wrapper_repair_pending {
+                        app.set_status("FLAC wrapper repair is already running");
+                        return;
+                    }
+                    let targets =
+                        super::analyze::flac_wrapper_repair_targets(&app.analysis_results);
+                    if targets.is_empty() {
+                        app.set_status("Analyze: no wrapped FLACs to repair");
+                        return;
+                    }
+                    app.analysis_wrapper_repair_pending = true;
+                    start_tag_maintenance(
+                        app,
+                        None,
+                        targets,
+                        false,
+                        super::probe::TagMaintenanceKind::RepairFlacWrappers,
+                        tui_file_picker::VerificationMode::Standard,
+                        tx,
+                    );
+                }
                 KeyCode::Up => {
                     scroll = scroll.saturating_sub(1);
                     app.active_overlay = ActiveOverlay::Analysis { scroll };
@@ -45718,16 +45740,25 @@ fn handle_generic_overlay_mouse_in_area(
                     .min(area.1 as usize - 2) as u16;
                 let x = (area.0.saturating_sub(w)) / 2;
                 let y = (area.1.saturating_sub(h)) / 2;
-                (
-                    Rect::new(x, y, w, h),
-                    vec![
-                        (":analyze!", ":analyze!"),
-                        (":write-dr", ":write-dr"),
-                        (":write-rg-track", ":write-rg-track"),
-                        (":write-rg-album", ":write-rg-album"),
-                        ("Esc close", "esc"),
-                    ],
-                )
+                let mut hints = vec![(":analyze!", ":analyze!")];
+                if app
+                    .analysis_results
+                    .iter()
+                    .any(|result| result.flac_wrappers.is_some_and(|wrappers| wrappers.any()))
+                {
+                    if app.analysis_wrapper_repair_pending {
+                        hints.push(("Repairing", ""));
+                    } else {
+                        hints.push(("r Repair", "r"));
+                    }
+                }
+                hints.extend([
+                    (":write-dr", ":write-dr"),
+                    (":write-rg-track", ":write-rg-track"),
+                    (":write-rg-album", ":write-rg-album"),
+                    ("Esc close", "esc"),
+                ]);
+                (Rect::new(x, y, w, h), hints)
             }
             ActiveOverlay::BulkRename(ref state) => {
                 let w = ((area.0 as usize) * 85 / 100)
@@ -47050,7 +47081,11 @@ pub(super) fn tag_maintenance_status_line(
         .iter()
         .map(|result| result.durability_warnings.len())
         .sum::<usize>();
-    let mut parts = if kind == super::probe::TagMaintenanceKind::Repair
+    let mut parts = if matches!(
+        kind,
+        super::probe::TagMaintenanceKind::Repair
+            | super::probe::TagMaintenanceKind::RepairFlacWrappers
+    )
         && changed == 0
         && failed == 0
         && cancelled == 0

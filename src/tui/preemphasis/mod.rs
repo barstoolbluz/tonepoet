@@ -123,6 +123,21 @@ pub fn detect_preemphasis_metadata_catalog(path: PathBuf) -> PreemphasisResult {
     result_from_advisory(path, advisory.as_ref())
 }
 
+/// Detect pre-emphasis for one row of a single-image CUE. CUE evidence is
+/// supplied from that parsed TRACK block so a FLAGS PRE on one track cannot
+/// contaminate every row backed by the shared FILE. File tags and catalog
+/// evidence remain source-scoped and are still merged normally.
+pub(crate) fn detect_preemphasis_metadata_catalog_for_cue_track(
+    path: PathBuf,
+    cue_track_has_pre: bool,
+) -> PreemphasisResult {
+    let advisory = detect_preemphasis_advisory_for_cue_track(&path, cue_track_has_pre);
+    if advisory.is_some() && source_is_known_non_red_book(&path) {
+        return empty_result(path, PreemphasisConfidence::NotDetected, String::new());
+    }
+    result_from_advisory(path, advisory.as_ref())
+}
+
 /// Detect only the metadata/catalog evidence. This function deliberately does
 /// not probe source format facts, making it suitable for metadata-read workers;
 /// callers must apply `preemphasis_advisory_for_source` once `SourceInfo` is
@@ -154,6 +169,41 @@ pub fn detect_preemphasis_advisory(path: &std::path::Path) -> Option<Preemphasis
             source: catalog_match.source,
             source_row: catalog_match.source_row,
             source_catalog_cell: catalog_match.source_catalog_cell,
+        }),
+        detail: catalog_match.detail,
+    })
+}
+
+fn detect_preemphasis_advisory_for_cue_track(
+    path: &std::path::Path,
+    cue_track_has_pre: bool,
+) -> Option<PreemphasisAdvisory> {
+    if metadata::check_pre_flag_tag_evidence(path).is_some() {
+        return Some(PreemphasisAdvisory {
+            evidence: PreemphasisAdvisoryEvidence::ExplicitTag,
+            confidence: PreemphasisConfidence::Detected,
+            catalog: None,
+            detail: "PRE tag".to_string(),
+        });
+    }
+    if cue_track_has_pre {
+        return Some(PreemphasisAdvisory {
+            evidence: PreemphasisAdvisoryEvidence::CueFlag,
+            confidence: PreemphasisConfidence::Detected,
+            catalog: None,
+            detail: "CUE FLAGS PRE".to_string(),
+        });
+    }
+    let catalog_match = catalog::check_catalog_evidence(path)?;
+    Some(PreemphasisAdvisory {
+        evidence: PreemphasisAdvisoryEvidence::Catalog,
+        confidence: catalog_match.confidence,
+        catalog: Some(CatalogAdvisory {
+            catalog_number: catalog_match.catalog_number.clone(),
+            quality: catalog_match.quality,
+            source: catalog_match.source,
+            source_row: catalog_match.source_row,
+            source_catalog_cell: catalog_match.source_catalog_cell.clone(),
         }),
         detail: catalog_match.detail,
     })
@@ -556,6 +606,56 @@ async fn run_spectral_scorer(path: &PathBuf) -> Result<PreemphasisResult, String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_red_book_wav(path: &std::path::Path) {
+        use std::io::Write;
+
+        let sample_rate = 44_100u32;
+        let samples = vec![0i16; sample_rate as usize * 2];
+        let data_len = (samples.len() * 2) as u32;
+        let mut file = std::fs::File::create(path).expect("create wav");
+        file.write_all(b"RIFF").expect("riff");
+        file.write_all(&(36u32 + data_len).to_le_bytes())
+            .expect("riff size");
+        file.write_all(b"WAVEfmt ").expect("wave fmt");
+        file.write_all(&16u32.to_le_bytes()).expect("fmt size");
+        file.write_all(&1u16.to_le_bytes()).expect("pcm");
+        file.write_all(&1u16.to_le_bytes()).expect("channels");
+        file.write_all(&sample_rate.to_le_bytes()).expect("rate");
+        file.write_all(&(sample_rate * 2).to_le_bytes())
+            .expect("byte rate");
+        file.write_all(&2u16.to_le_bytes()).expect("align");
+        file.write_all(&16u16.to_le_bytes()).expect("bits");
+        file.write_all(b"data").expect("data");
+        file.write_all(&data_len.to_le_bytes()).expect("data size");
+        for sample in samples {
+            file.write_all(&sample.to_le_bytes()).expect("sample");
+        }
+    }
+
+    #[test]
+    fn single_image_cue_preemphasis_is_track_scoped() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let audio = temp.path().join("album.wav");
+        write_red_book_wav(&audio);
+        std::fs::write(
+            temp.path().join("album.cue"),
+            concat!(
+                "FILE \"album.wav\" WAVE\n",
+                "  TRACK 01 AUDIO\n",
+                "    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n",
+                "    FLAGS PRE\n",
+                "    INDEX 01 00:01:00\n",
+            ),
+        )
+        .expect("cue");
+
+        let track1 = detect_preemphasis_metadata_catalog_for_cue_track(audio.clone(), false);
+        let track2 = detect_preemphasis_metadata_catalog_for_cue_track(audio, true);
+        assert_eq!(track1.confidence, PreemphasisConfidence::NotDetected);
+        assert_eq!(track2.confidence, PreemphasisConfidence::Detected);
+    }
 
     fn spectral_positive_result(path: PathBuf) -> PreemphasisResult {
         PreemphasisResult {

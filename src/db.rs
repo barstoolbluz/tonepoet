@@ -2856,7 +2856,7 @@ impl Database {
 
     /// Bump this when the analysis algorithm changes to invalidate
     /// cached results computed by an older version.
-    const ANALYSIS_ALGO_VERSION: i32 = 26;
+    const ANALYSIS_ALGO_VERSION: i32 = 27;
 
     /// Look up cached analysis. Returns None if not cached, stale,
     /// or computed by an older algorithm version.
@@ -2866,7 +2866,14 @@ impl Database {
         mtime: i64,
         size: u64,
     ) -> Option<crate::tui::analyze::AnalysisResult> {
-        self.conn
+        // Wrapper state is intentionally not cached: it is cheap head/tail I/O
+        // and must reflect an in-place repair immediately even when the audio
+        // analysis row is still otherwise valid.
+        let flac_wrappers = crate::flac_envelope::inspect_legacy_flac_wrappers(
+            std::path::Path::new(file_path),
+        )
+        .ok()?;
+        let mut result = self.conn
             .query_row(
                 "SELECT dr_value, peak_db, rms_db, clipping_count, dc_bias,
                     actual_bit_depth, declared_bit_depth, sample_rate, channels,
@@ -2890,7 +2897,12 @@ impl Database {
                     };
                     let hdcd_int: Option<i32> = row.get(15)?;
                     Ok(crate::tui::analyze::AnalysisResult {
+                        source_path: std::path::PathBuf::from(file_path),
                         path: std::path::PathBuf::from(file_path),
+                        flac_wrappers,
+                        flac_wrapper_repair_path: flac_wrappers
+                            .filter(|wrappers| wrappers.any())
+                            .map(|_| std::path::PathBuf::from(file_path)),
                         dr_value: row.get(0)?,
                         peak_db: row.get(1)?,
                         rms_db: row.get(2)?,
@@ -2912,7 +2924,23 @@ impl Database {
                     })
                 },
             )
-            .ok()
+            .ok()?;
+
+        // Metadata/CUE/catalog pre-emphasis evidence is cheap and can change
+        // independently of the audio file identity (most notably a sidecar
+        // CUE edit). Keep cached PCM/loudness/HDCD facts, but refresh this
+        // source-scoped evidence on every cache hit just like wrapper state.
+        let preemphasis = crate::tui::preemphasis::detect_preemphasis_metadata_catalog(
+            std::path::PathBuf::from(file_path),
+        );
+        result.preemphasis = Some(preemphasis.confidence);
+        result.preemphasis_detail = if preemphasis.detail.is_empty() {
+            None
+        } else {
+            Some(preemphasis.detail)
+        };
+
+        Some(result)
     }
 
     /// Look up only the HDCD / Phase-2-safe pre-emphasis facts from the
@@ -10144,6 +10172,101 @@ mod tests {
         assert_eq!(
             changed_identity.preemphasis,
             Some(PreemphasisConfidence::NotDetected),
+        );
+    }
+
+    #[test]
+    fn cached_analysis_rebuilds_wrapped_flac_repair_provenance_from_physical_path() {
+        let db = Database::open_memory().expect("database");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/regression/id3_wrapped_flac/id3v2_id3v1_48000.flac");
+        let path = temp.path().join("album.flac");
+        std::fs::copy(&source, &path).expect("copy wrapped FLAC fixture");
+        let size = std::fs::metadata(&path).expect("stat wrapped fixture").len();
+        let file_path = path.to_string_lossy().into_owned();
+
+        let mut analyzed = crate::tui::analyze::analyze_file(&path, None, None)
+            .expect("analyze wrapped fixture");
+        analyzed.loudness_status = crate::tui::analyze::LoudnessAnalysisStatus::Available;
+        db.store_analysis(&file_path, 1000, size, &analyzed)
+            .expect("store analysis cache row");
+
+        let cached = db
+            .get_cached_analysis(&file_path, 1000, size)
+            .expect("load cached wrapped FLAC analysis");
+        assert!(cached.flac_wrappers.is_some_and(|wrappers| wrappers.any()));
+        assert_eq!(
+            cached.flac_wrapper_repair_path.as_deref(),
+            Some(path.as_path()),
+            "fresh wrapper inspection must restore physical repair provenance",
+        );
+        assert_eq!(cached.source_path, path);
+    }
+
+    #[test]
+    fn cached_analysis_refreshes_sidecar_preemphasis_without_redecoding_audio() {
+        use std::io::Write;
+
+        let db = Database::open_memory().expect("database");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("album.wav");
+        let sample_rate = 44_100u32;
+        let sample_count = sample_rate as usize;
+        let data_len = (sample_count * 2) as u32;
+        let mut file = std::fs::File::create(&path).expect("create wav");
+        file.write_all(b"RIFF").unwrap();
+        file.write_all(&(36u32 + data_len).to_le_bytes()).unwrap();
+        file.write_all(b"WAVEfmt ").unwrap();
+        file.write_all(&16u32.to_le_bytes()).unwrap();
+        file.write_all(&1u16.to_le_bytes()).unwrap();
+        file.write_all(&1u16.to_le_bytes()).unwrap();
+        file.write_all(&sample_rate.to_le_bytes()).unwrap();
+        file.write_all(&(sample_rate * 2).to_le_bytes()).unwrap();
+        file.write_all(&2u16.to_le_bytes()).unwrap();
+        file.write_all(&16u16.to_le_bytes()).unwrap();
+        file.write_all(b"data").unwrap();
+        file.write_all(&data_len.to_le_bytes()).unwrap();
+        for _ in 0..sample_count {
+            file.write_all(&1_000i16.to_le_bytes()).unwrap();
+        }
+        drop(file);
+
+        let size = std::fs::metadata(&path).expect("stat wav").len();
+        let file_path = path.to_string_lossy().into_owned();
+        let mut analyzed = crate::tui::analyze::analyze_file(&path, None, None)
+            .expect("analyze wav");
+        analyzed.loudness_status = crate::tui::analyze::LoudnessAnalysisStatus::Available;
+        analyzed.preemphasis = Some(crate::tui::preemphasis::PreemphasisConfidence::NotDetected);
+        db.store_analysis(&file_path, 1000, size, &analyzed)
+            .expect("store analysis");
+
+        let before = db
+            .get_cached_analysis(&file_path, 1000, size)
+            .expect("cache hit before cue edit");
+        assert_eq!(
+            before.preemphasis,
+            Some(crate::tui::preemphasis::PreemphasisConfidence::NotDetected)
+        );
+
+        std::fs::write(
+            temp.path().join("album.cue"),
+            concat!(
+                "FILE \"album.wav\" WAVE\n",
+                "  TRACK 01 AUDIO\n",
+                "    FLAGS PRE\n",
+                "    INDEX 01 00:00:00\n",
+            ),
+        )
+        .expect("write cue");
+
+        let after = db
+            .get_cached_analysis(&file_path, 1000, size)
+            .expect("same audio cache hit after cue edit");
+        assert_eq!(
+            after.preemphasis,
+            Some(crate::tui::preemphasis::PreemphasisConfidence::Detected),
+            "sidecar-only PRE changes must refresh without invalidating PCM analysis",
         );
     }
 

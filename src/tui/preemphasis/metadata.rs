@@ -201,7 +201,7 @@ fn check_cue_file_for_audio_preemphasis(cue_path: &Path, audio_path: &Path) -> b
 }
 
 /// Return true only for real CUE FLAGS lines that include PRE as a flag token.
-fn cue_line_has_pre_flag(line: &str) -> bool {
+pub(crate) fn cue_line_has_pre_flag(line: &str) -> bool {
     let line = line.trim();
 
     if line.is_empty() {
