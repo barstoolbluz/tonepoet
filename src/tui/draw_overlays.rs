@@ -644,7 +644,13 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState, theme: super::theme::Them
             super::conversion_actions_ui::draw_actions_run(f, state, theme);
         }
         ActiveOverlay::Analysis { scroll } => {
-            draw_analysis(f, &app.analysis_results, scroll, theme);
+            draw_analysis(
+                f,
+                &app.analysis_results,
+                scroll,
+                app.analysis_wrapper_repair_pending,
+                theme,
+            );
         }
         ActiveOverlay::Help { screen, scroll } => {
             super::help::draw_help(f, screen, scroll, theme);
@@ -4260,7 +4266,13 @@ fn draw_bulk_rename(
 }
 
 /// Draw the analysis results overlay.
-fn draw_analysis(f: &mut Frame, results: &[super::analyze::AnalysisResult], scroll: usize, theme: super::theme::Theme) {
+fn draw_analysis(
+    f: &mut Frame,
+    results: &[super::analyze::AnalysisResult],
+    scroll: usize,
+    wrapper_repair_pending: bool,
+    theme: super::theme::Theme,
+) {
     use super::analyze::dr_label;
 
     let area = f.size();
@@ -4297,11 +4309,7 @@ fn draw_analysis(f: &mut Frame, results: &[super::analyze::AnalysisResult], scro
         if i > 0 {
             lines.push(Line::from(""));
         }
-        let name = r
-            .path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| r.path.display().to_string());
+        let name = super::analyze::display_name(r);
         lines.push(Line::from(Span::styled(
             format!("  {}", name),
             Style::default()
@@ -4316,7 +4324,7 @@ fn draw_analysis(f: &mut Frame, results: &[super::analyze::AnalysisResult], scro
             _ => theme.cyan,
         };
 
-        let entries: Vec<(&str, String, Color)> = vec![
+        let mut entries: Vec<(&str, String, Color)> = vec![
             (
                 "Dynamic Range",
                 format!("DR{} ({})", r.dr_value, dr_label(r.dr_value)),
@@ -4360,19 +4368,10 @@ fn draw_analysis(f: &mut Frame, results: &[super::analyze::AnalysisResult], scro
             ),
             (
                 "Bit Depth",
-                format!(
-                    "{}-bit{}",
-                    r.actual_bit_depth,
-                    r.declared_bit_depth
-                        .map(|d| if d != r.actual_bit_depth {
-                            format!(" ({} declared)", d)
-                        } else {
-                            String::new()
-                        })
-                        .unwrap_or_default()
-                ),
+                super::analyze::bit_depth_display(r),
                 if r.declared_bit_depth
-                    .map(|d| d != r.actual_bit_depth)
+                    .zip(super::analyze::known_bit_depth(r))
+                    .map(|(declared, actual)| declared != actual)
                     .unwrap_or(false)
                 {
                     theme.amber
@@ -4381,6 +4380,16 @@ fn draw_analysis(f: &mut Frame, results: &[super::analyze::AnalysisResult], scro
                 },
             ),
         ];
+
+        if let Some(wrappers) = r.flac_wrappers.filter(|wrappers| wrappers.any()) {
+            let value = match (wrappers.id3v2_prefix, wrappers.id3v1_trailer) {
+                (true, true) => "ID3v2 prefix + ID3v1 trailer",
+                (true, false) => "ID3v2 prefix",
+                (false, true) => "ID3v1 trailer",
+                (false, false) => unreachable!("filtered above"),
+            };
+            entries.push(("FLAC Wrapper", value.to_string(), theme.amber));
+        }
 
         // LUFS + true peak (if available).
         let mut extra: Vec<(&str, String, Color)> = Vec::new();
@@ -4480,8 +4489,27 @@ fn draw_analysis(f: &mut Frame, results: &[super::analyze::AnalysisResult], scro
     f.render_widget(Paragraph::new(visible_lines), chunks[0]);
 
     // Footer pills.
-    let footer = Line::from(vec![
-        footer_pill(":analyze!", theme.amber, theme),
+    let mut footer_parts = vec![footer_pill(":analyze!", theme.amber, theme)];
+    if results
+        .iter()
+        .any(|result| result.flac_wrappers.is_some_and(|wrappers| wrappers.any()))
+    {
+        footer_parts.push(pill_gap());
+        footer_parts.push(footer_pill(
+            if wrapper_repair_pending {
+                "Repairing"
+            } else {
+                "r Repair"
+            },
+            if wrapper_repair_pending {
+                theme.text_muted
+            } else {
+                theme.amber
+            },
+            theme,
+        ));
+    }
+    footer_parts.extend([
         pill_gap(),
         footer_pill(":write-dr", theme.blue, theme),
         pill_gap(),
@@ -4491,6 +4519,7 @@ fn draw_analysis(f: &mut Frame, results: &[super::analyze::AnalysisResult], scro
         pill_gap(),
         footer_pill("Esc close", theme.purple, theme),
     ]);
+    let footer = Line::from(footer_parts);
     f.render_widget(
         Paragraph::new(footer).alignment(Alignment::Center),
         chunks[1],

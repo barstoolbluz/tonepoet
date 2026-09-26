@@ -6667,6 +6667,98 @@ mod bookmark_detail_retry_regression_tests {
     }
 }
 
+fn analysis_batch_completion_status(
+    results: &[crate::tui::analyze::AnalysisResult],
+    failures: &[String],
+) -> String {
+    if failures.is_empty() {
+        return results
+            .last()
+            .map(|last| {
+                let name = super::analyze::display_name(last);
+                format!(
+                    "Analyzed: {} - DR{} ({})",
+                    name,
+                    last.dr_value,
+                    super::analyze::dr_label(last.dr_value),
+                )
+            })
+            .unwrap_or_else(|| "Analysis completed without usable results".to_string());
+    }
+
+    let mut reasons = failures.to_vec();
+    reasons.sort();
+    reasons.dedup();
+    let shown = reasons.iter().take(3).cloned().collect::<Vec<_>>();
+    let more = reasons.len().saturating_sub(shown.len());
+    let mut detail = shown.join("; ");
+    if more > 0 {
+        detail.push_str(&format!("; +{} more", more));
+    }
+    format!(
+        "Analysis complete: {} succeeded, {} failed: {}",
+        results.len(),
+        failures.len(),
+        detail,
+    )
+}
+
+#[cfg(test)]
+mod analysis_batch_status_tests {
+    use super::*;
+
+    fn result(path: &str) -> crate::tui::analyze::AnalysisResult {
+        crate::tui::analyze::AnalysisResult {
+            source_path: std::path::PathBuf::from(path),
+            path: std::path::PathBuf::from(path),
+            flac_wrappers: None,
+            flac_wrapper_repair_path: None,
+            dr_value: 10,
+            peak_db: -1.0,
+            rms_db: -12.0,
+            clipping_count: 0,
+            dc_bias: 0.0,
+            actual_bit_depth: 16,
+            declared_bit_depth: Some(16),
+            sample_rate: 44_100,
+            channels: 2,
+            duration_secs: 1.0,
+            lufs: None,
+            true_peak_dbtp: None,
+            loudness_status: crate::tui::analyze::LoudnessAnalysisStatus::NotScanned,
+            preemphasis: None,
+            preemphasis_corr: None,
+            preemphasis_detail: None,
+            hdcd_detected: None,
+            hdcd_detail: None,
+        }
+    }
+
+    fn status_for_order(sequence: &[Result<crate::tui::analyze::AnalysisResult, String>]) -> String {
+        let mut results = Vec::new();
+        let mut failures = Vec::new();
+        for item in sequence {
+            match item {
+                Ok(result) => results.push(result.clone()),
+                Err(error) => failures.push(error.clone()),
+            }
+        }
+        analysis_batch_completion_status(&results, &failures)
+    }
+
+    #[test]
+    fn analysis_failure_disclosure_is_completion_order_independent() {
+        let ok = result("/music/good.flac");
+        let err_then_ok = vec![Err("bad.flac: decode failed".to_string()), Ok(ok.clone())];
+        let ok_then_err = vec![Ok(ok), Err("bad.flac: decode failed".to_string())];
+        let first = status_for_order(&err_then_ok);
+        let second = status_for_order(&ok_then_err);
+        assert_eq!(first, second);
+        assert!(first.contains("1 succeeded, 1 failed"));
+        assert!(first.contains("bad.flac: decode failed"));
+    }
+}
+
 pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMessage>) {
     match msg {
         AppMessage::HostClipboardReadComplete {
@@ -7872,36 +7964,41 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             match result {
                 Ok(result) => {
                     // Persist to SQLite analysis cache for cross-session reuse.
-                    if let Ok(meta) = std::fs::metadata(&result.path) {
-                        let mtime = meta
-                            .modified()
-                            .map(crate::db::systemtime_to_unix)
-                            .unwrap_or(0);
-                        if let Err(e) = app.db.store_analysis(
-                            &result.path.display().to_string(),
-                            mtime,
-                            meta.len(),
-                            &result,
-                        ) {
-                            log::error!("analysis cache store failed: {}", e);
+                    // Synthetic single-image CUE rows intentionally do not
+                    // share the carrier's cache key: each row has different
+                    // PCM metrics even though `source_path` is the same file.
+                    if result.path == result.source_path {
+                        if let Ok(meta) = std::fs::metadata(&result.source_path) {
+                            let mtime = meta
+                                .modified()
+                                .map(crate::db::systemtime_to_unix)
+                                .unwrap_or(0);
+                            if let Err(e) = app.db.store_analysis(
+                                &result.source_path.display().to_string(),
+                                mtime,
+                                meta.len(),
+                                &result,
+                            ) {
+                                log::error!("analysis cache store failed: {}", e);
+                            }
                         }
                     }
 
                     // Refresh only the probe row whose launch-independent file
                     // identity still matches the completed path.
-                    if result.hdcd_detected == Some(true) {
-                        if let Ok(meta) = std::fs::metadata(&result.path) {
+                    if result.path == result.source_path && result.hdcd_detected == Some(true) {
+                        if let Ok(meta) = std::fs::metadata(&result.source_path) {
                             let identity =
                                 crate::tui::browse::ProbeCacheIdentity::from_metadata(&meta);
                             app.browse.update_valid_probe_for_identity(
-                                &result.path,
+                                &result.source_path,
                                 identity,
                                 |cached| {
                                     cached.metadata.hdcd_detail = result.hdcd_detail.clone();
                                 },
                             );
                         } else {
-                            app.browse.remove_probe_cache_entry(&result.path);
+                            app.browse.remove_probe_cache_entry(&result.source_path);
                         }
                     }
 
@@ -7925,41 +8022,12 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
 
                     app.analysis_results.push(*result);
                     if finished {
-                        let mut result_paths: Vec<std::path::PathBuf> = app
-                            .analysis_results
-                            .iter()
-                            .map(|result| result.path.clone())
-                            .collect();
-                        crate::tui::probe::sort_paths_by_track(&mut result_paths);
-                        app.analysis_results.sort_by(|a, b| {
-                            let ai = result_paths
-                                .iter()
-                                .position(|path| *path == a.path)
-                                .unwrap_or(usize::MAX);
-                            let bi = result_paths
-                                .iter()
-                                .position(|path| *path == b.path)
-                                .unwrap_or(usize::MAX);
-                            ai.cmp(&bi)
-                        });
+                        super::analyze::sort_results_for_display(&mut app.analysis_results);
 
-                        let status = app
-                            .analysis_results
-                            .last()
-                            .map(|last| {
-                                let name = last
-                                    .path
-                                    .file_name()
-                                    .map(|name| name.to_string_lossy().to_string())
-                                    .unwrap_or_default();
-                                format!(
-                                    "Analyzed: {} — DR{} ({})",
-                                    name,
-                                    last.dr_value,
-                                    super::analyze::dr_label(last.dr_value),
-                                )
-                            })
-                            .unwrap_or_else(|| "Analysis completed without usable results".to_string());
+                        let status = analysis_batch_completion_status(
+                            &app.analysis_results,
+                            &app.analysis_failures,
+                        );
                         let may_publish =
                             completion_operation_has_overlay_authority(app, kind, operation_id);
                         retire_completion_operation(app, kind, operation_id);
@@ -7977,7 +8045,16 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                     }
                 }
                 Err(error) => {
-                    let status = format!("Analysis failed: {}", error);
+                    app.analysis_failures.push(error.clone());
+                    let status = if finished {
+                        super::analyze::sort_results_for_display(&mut app.analysis_results);
+                        analysis_batch_completion_status(
+                            &app.analysis_results,
+                            &app.analysis_failures,
+                        )
+                    } else {
+                        format!("Analysis failed: {}", error)
+                    };
                     if finished {
                         let may_publish = !app.analysis_results.is_empty()
                             && completion_operation_has_overlay_authority(
@@ -9489,6 +9566,20 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             refreshed_entries,
         } => {
             let mut refresh_failed = false;
+            if kind == super::probe::TagMaintenanceKind::RepairFlacWrappers {
+                app.analysis_wrapper_repair_pending = false;
+                for analysis in &mut app.analysis_results {
+                    let repair_path = analysis.flac_wrapper_repair_path.clone();
+                    if let Err(error) = super::analyze::refresh_flac_wrapper_state(analysis) {
+                        refresh_failed = true;
+                        let path = repair_path.as_deref().unwrap_or(&analysis.path);
+                        log::warn!(
+                            "failed to refresh FLAC wrapper state for '{}': {error}",
+                            path.display()
+                        );
+                    }
+                }
+            }
             let changed_paths = result
                 .as_ref()
                 .map(|results| {

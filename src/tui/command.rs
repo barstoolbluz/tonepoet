@@ -5530,6 +5530,7 @@ Host clipboard failures are reported instead of silently claiming that an intern
                         let can_seek = super::cue_parser::can_ffmpeg_read(&info.audio_path);
                         app.set_status(format!("Analyzing {} tracks (single image)...", n,));
                         app.analysis_results.clear();
+                        app.analysis_failures.clear();
                         app.analysis_pending = n;
 
                         // Build display names from CUE metadata.
@@ -5556,6 +5557,14 @@ Host clipboard failures are reported instead of silently claiming that an intern
                                 let audio_path = info.audio_path.clone();
                                 let display_path = display_paths[i].clone();
                                 let original_path = info.audio_path.clone();
+                                let cue_track_has_pre = info.sheet.tracks[i]
+                                    .directives
+                                    .iter()
+                                    .any(|directive| {
+                                        super::preemphasis::metadata::cue_line_has_pre_flag(
+                                            directive,
+                                        )
+                                    });
                                 let tx = tx.clone();
                                 tokio::spawn(async move {
                                     let pcm_path = audio_path.clone();
@@ -5581,9 +5590,10 @@ Host clipboard failures are reported instead of silently claiming that an intern
                                     let final_result = match pcm_result {
                                         Ok(Ok(mut result)) => {
                                             result.path = display_path;
+                                            result.source_path = original_path.clone();
 
-                                            let pe_result = super::preemphasis::detect_preemphasis_metadata_catalog(
-                                                original_path.clone(),
+                                            let pe_result = super::preemphasis::detect_preemphasis_metadata_catalog_for_cue_track(
+                                                original_path.clone(), cue_track_has_pre,
                                             );
                                             result.preemphasis = Some(pe_result.confidence);
                                             result.preemphasis_detail = if pe_result.detail.is_empty() {
@@ -5592,10 +5602,7 @@ Host clipboard failures are reported instead of silently claiming that an intern
                                                 Some(pe_result.detail)
                                             };
 
-                                            if result.declared_bit_depth == Some(16)
-                                                || (result.declared_bit_depth.is_none()
-                                                    && result.actual_bit_depth <= 16)
-                                            {
+                                            if super::analyze::hdcd_eligible(&result) {
                                                 if let Some(hdcd) = hdcd_result {
                                                     result.hdcd_detected = Some(hdcd.detected);
                                                     if hdcd.detected {
@@ -5667,6 +5674,14 @@ Host clipboard failures are reported instead of silently claiming that an intern
                                 for (i, temp_path) in track_paths.into_iter().enumerate() {
                                     let display_path = display_paths[i].clone();
                                     let original_path = info.audio_path.clone();
+                                    let cue_track_has_pre = info.sheet.tracks[i]
+                                        .directives
+                                        .iter()
+                                        .any(|directive| {
+                                            super::preemphasis::metadata::cue_line_has_pre_flag(
+                                                directive,
+                                            )
+                                        });
                                     let tx = tx.clone();
                                     tokio::spawn(async move {
                                         let pcm_path = temp_path.clone();
@@ -5682,6 +5697,7 @@ Host clipboard failures are reported instead of silently claiming that an intern
                                         let final_result = match pcm_result {
                                             Ok(Ok(mut result)) => {
                                                 result.path = display_path;
+                                                result.source_path = original_path.clone();
                                                 match lufs_result {
                                                     Ok(scan) => {
                                                         result.lufs = scan.integrated_lufs;
@@ -5696,8 +5712,8 @@ Host clipboard failures are reported instead of silently claiming that an intern
                                                             super::analyze::LoudnessAnalysisStatus::Failed(error);
                                                     }
                                                 }
-                                                let pe_result = super::preemphasis::detect_preemphasis_metadata_catalog(
-                                                    original_path.clone(),
+                                                let pe_result = super::preemphasis::detect_preemphasis_metadata_catalog_for_cue_track(
+                                                    original_path.clone(), cue_track_has_pre,
                                                 );
                                                 result.preemphasis = Some(pe_result.confidence);
                                                 result.preemphasis_detail = if pe_result.detail.is_empty() {
@@ -5705,10 +5721,7 @@ Host clipboard failures are reported instead of silently claiming that an intern
                                                 } else {
                                                     Some(pe_result.detail)
                                                 };
-                                                if result.declared_bit_depth == Some(16)
-                                                    || (result.declared_bit_depth.is_none()
-                                                        && result.actual_bit_depth <= 16)
-                                                {
+                                                if super::analyze::hdcd_eligible(&result) {
                                                     if let Some(hdcd) = hdcd_result {
                                                         result.hdcd_detected = Some(hdcd.detected);
                                                         if hdcd.detected {
@@ -5750,6 +5763,7 @@ Host clipboard failures are reported instead of silently claiming that an intern
                     }
                 };
                 app.analysis_results.clear();
+                app.analysis_failures.clear();
 
                 // Check DB cache for each path; only spawn analysis for misses.
                 // :analyze! skips the cache entirely.
@@ -5881,10 +5895,7 @@ Host clipboard failures are reported instead of silently claiming that an intern
                                     };
 
                                     // HDCD detection (only meaningful for 16-bit sources).
-                                    if result.declared_bit_depth == Some(16)
-                                        || (result.declared_bit_depth.is_none()
-                                            && result.actual_bit_depth <= 16)
-                                    {
+                                    if super::analyze::hdcd_eligible(&result) {
                                         if let Some(hdcd) = hdcd_result {
                                             result.hdcd_detected = Some(hdcd.detected);
                                             if hdcd.detected {
@@ -7489,6 +7500,12 @@ Host clipboard failures are reported instead of silently claiming that an intern
             }
         }
         Command::WriteRgTrack | Command::WriteRgAlbum => {
+            if super::analyze::has_synthetic_source_rows(&app.analysis_results) {
+                app.set_status(
+                    "ReplayGain write is unavailable for single-image CUE analysis rows; the shared carrier cannot represent per-track ReplayGain tags",
+                );
+                return;
+            }
             let album = matches!(cmd, Command::WriteRgAlbum);
             let prevent_clipping = match super::convert_actions::format_state_to_pipeline_settings(
                 &app.convert.format,
@@ -7504,7 +7521,7 @@ Host clipboard failures are reported instead of silently claiming that an intern
             let paths: Vec<std::path::PathBuf> = app
                 .analysis_results
                 .iter()
-                .map(|r| r.path.clone())
+                .map(|r| r.source_path.clone())
                 .collect();
             if paths.is_empty() {
                 app.set_status("No analysis results — run :analyze first");
@@ -7553,8 +7570,10 @@ Host clipboard failures are reported instead of silently claiming that an intern
                 });
                 // Invalidate probe cache for the written files.
                 for r in &app.analysis_results {
-                    app.browse.remove_probe_cache_entry(&r.path);
-                    let _ = app.db.invalidate_probe(&r.path.display().to_string());
+                    app.browse.remove_probe_cache_entry(&r.source_path);
+                    let _ = app
+                        .db
+                        .invalidate_probe(&r.source_path.display().to_string());
                 }
             }
         }

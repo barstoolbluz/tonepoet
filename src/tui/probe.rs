@@ -1337,6 +1337,20 @@ mod flac_metadata_writer {
         pub durability_warnings: Vec<String>,
     }
 
+    #[derive(Debug, Clone)]
+    pub(super) enum FlacWrapperRepairOutcome {
+        NotModified,
+        CommittedAndVerified {
+            report: FlacWriteReport,
+            removed: crate::flac_envelope::LegacyFlacWrappers,
+        },
+        CommittedButVerificationFailed {
+            report: FlacWriteReport,
+            removed: crate::flac_envelope::LegacyFlacWrappers,
+            reason: String,
+        },
+    }
+
     impl FlacWriteReport {
         fn clean() -> Self {
             Self { durability_warnings: Vec::new() }
@@ -1597,23 +1611,59 @@ mod flac_metadata_writer {
         path: &Path,
         cancel: Option<&super::MetadataWriteCancelFlag>,
     ) -> Result<Option<FlacWriteReport>, String> {
-        if !is_probably_flac(path) {
-            return Ok(None);
+        match rewrite_legacy_flac_wrappers(path, cancel, false)? {
+            FlacWrapperRepairOutcome::NotModified => Ok(None),
+            FlacWrapperRepairOutcome::CommittedAndVerified { report, .. } => Ok(Some(report)),
+            FlacWrapperRepairOutcome::CommittedButVerificationFailed { reason, .. } => Err(reason),
         }
-        reject_symlink_native_write(path, "tag repair")?;
-        let mut write_claim = acquire_common_write_claim(path, "tag repair")?;
+    }
+
+    pub(super) fn repair_legacy_flac_wrappers(
+        path: &Path,
+        cancel: Option<&super::MetadataWriteCancelFlag>,
+    ) -> Result<FlacWrapperRepairOutcome, String> {
+        rewrite_legacy_flac_wrappers(path, cancel, true)
+    }
+
+    fn rewrite_legacy_flac_wrappers(
+        path: &Path,
+        cancel: Option<&super::MetadataWriteCancelFlag>,
+        strip_id3v1_trailer: bool,
+    ) -> Result<FlacWrapperRepairOutcome, String> {
+        if !is_probably_flac(path) {
+            return Ok(FlacWrapperRepairOutcome::NotModified);
+        }
+        reject_symlink_native_write(path, "FLAC wrapper repair")?;
+        let mut write_claim = acquire_common_write_claim(path, "FLAC wrapper repair")?;
         recover_metadata_journal(path)?;
-        recover_artwork_rollback_journal_before_native_write(path, "tag repair")?;
-        reject_hardlinked_native_write(path, "tag repair")?;
-        let metadata = read_flac_metadata(path)?;
-        if metadata.stream_offset == 0 {
+        recover_artwork_rollback_journal_before_native_write(path, "FLAC wrapper repair")?;
+        reject_hardlinked_native_write(path, "FLAC wrapper repair")?;
+        let Some(wrappers) = crate::flac_envelope::inspect_legacy_flac_wrappers(path)? else {
+            return Err(format!(
+                "refusing FLAC wrapper repair for '{}': the source is no longer a native FLAC stream",
+                path.display()
+            ));
+        };
+        let wrappers_to_remove = crate::flac_envelope::LegacyFlacWrappers {
+            id3v2_prefix: wrappers.id3v2_prefix,
+            id3v1_trailer: strip_id3v1_trailer && wrappers.id3v1_trailer,
+        };
+        if !wrappers_to_remove.any() {
             let mut report = FlacWriteReport::clean();
             if let Some(warning) = write_claim.release_with_warning(
-                "FLAC common write lock removal after no-op tag repair",
+                "FLAC common write lock removal after no-op wrapper repair",
             ) {
                 report.durability_warnings.push(warning);
             }
-            return Ok(None);
+            return Ok(FlacWrapperRepairOutcome::NotModified);
+        }
+
+        let metadata = read_flac_metadata(path)?;
+        if wrappers.id3v2_prefix != (metadata.stream_offset != 0) {
+            return Err(format!(
+                "refusing FLAC wrapper repair for '{}': wrapper shape changed while preparing the rewrite",
+                path.display()
+            ));
         }
 
         let commit = stream_rewrite_with_prefix_policy(
@@ -1623,24 +1673,59 @@ mod flac_metadata_writer {
             &metadata.blocks,
             cancel,
             false,
+            wrappers_to_remove.id3v1_trailer,
         )?;
-        let verified = read_flac_metadata(path)?;
-        if verified.stream_offset != 0 {
-            return Err(format!(
-                "FLAC tag repair committed for '{}', but the legacy ID3v2 prefix is still present",
-                path.display()
-            ));
-        }
         let mut report = FlacWriteReport::clean();
         if let Some(warning) = commit.durability_warning {
             report.durability_warnings.push(warning);
         }
+
+        let verification = (|| -> Result<(), String> {
+            let Some(after_wrappers) = crate::flac_envelope::inspect_legacy_flac_wrappers(path)? else {
+                return Err(format!(
+                    "FLAC wrapper repair committed for '{}', but the replacement is no longer recognized as native FLAC",
+                    path.display()
+                ));
+            };
+            if wrappers_to_remove.id3v2_prefix && after_wrappers.id3v2_prefix {
+                return Err(format!(
+                    "FLAC wrapper repair committed for '{}', but the legacy ID3v2 prefix is still present",
+                    path.display()
+                ));
+            }
+            if wrappers_to_remove.id3v1_trailer && after_wrappers.id3v1_trailer {
+                return Err(format!(
+                    "FLAC wrapper repair committed for '{}', but the legacy ID3v1 trailer is still present",
+                    path.display()
+                ));
+            }
+            let verified = read_flac_metadata(path)?;
+            if verified.raw_metadata_region != metadata.raw_metadata_region {
+                return Err(format!(
+                    "FLAC wrapper repair committed for '{}', but native FLAC metadata changed unexpectedly",
+                    path.display()
+                ));
+            }
+            Ok(())
+        })();
+
         if let Some(warning) = write_claim.release_with_warning(
-            "FLAC common write lock removal after tag repair",
+            "FLAC common write lock removal after wrapper repair",
         ) {
             report.durability_warnings.push(warning);
         }
-        Ok(Some(report))
+
+        match verification {
+            Ok(()) => Ok(FlacWrapperRepairOutcome::CommittedAndVerified {
+                report,
+                removed: wrappers_to_remove,
+            }),
+            Err(reason) => Ok(FlacWrapperRepairOutcome::CommittedButVerificationFailed {
+                report,
+                removed: wrappers_to_remove,
+                reason,
+            }),
+        }
     }
 
     pub(super) fn clear_all_tags(
@@ -1684,6 +1769,7 @@ mod flac_metadata_writer {
             metadata.audio_start,
             &replacement,
             cancel,
+            false,
             false,
         )?;
         let verified = read_flac_metadata(path)?;
@@ -2699,6 +2785,7 @@ mod flac_metadata_writer {
             blocks,
             cancel,
             true,
+            false,
         )
     }
 
@@ -2709,6 +2796,7 @@ mod flac_metadata_writer {
         blocks: &[FlacBlock],
         cancel: Option<&super::MetadataWriteCancelFlag>,
         preserve_prefix: bool,
+        strip_id3v1_trailer: bool,
     ) -> Result<StreamRewriteCommit, String> {
         super::check_metadata_write_cancel(cancel, "before starting FLAC overflow rewrite")?;
         reject_symlink_overflow_rewrite(path)?;
@@ -2723,6 +2811,30 @@ mod flac_metadata_writer {
         reject_hardlinked_overflow_rewrite(path, &source_metadata)?;
         let source_identity = SourceFileIdentity::capture(path, &source_metadata)?;
         let preservation = OriginalFileMetadata::capture(path, &source_metadata)?;
+        let source_end = if strip_id3v1_trailer {
+            let trailer_start = source_metadata.len().checked_sub(128).ok_or_else(|| {
+                format!(
+                    "refusing FLAC wrapper repair for '{}': the ID3v1 trailer disappeared before rewrite",
+                    path.display()
+                )
+            })?;
+            input
+                .seek(SeekFrom::Start(trailer_start))
+                .map_err(|err| format!("seek FLAC ID3v1 trailer '{}': {err}", path.display()))?;
+            let mut signature = [0_u8; 3];
+            input
+                .read_exact(&mut signature)
+                .map_err(|err| format!("read FLAC ID3v1 trailer '{}': {err}", path.display()))?;
+            if &signature != b"TAG" {
+                return Err(format!(
+                    "refusing FLAC wrapper repair for '{}': the ID3v1 trailer changed before rewrite",
+                    path.display()
+                ));
+            }
+            trailer_start
+        } else {
+            source_metadata.len()
+        };
         if stream_offset > crate::metadata_persistence::MAX_ID3V2_FLAC_PREFIX_LEN {
             return Err(format!(
                 "invalid FLAC rewrite offset for '{}': stream offset {} exceeds maximum {}",
@@ -2734,12 +2846,13 @@ mod flac_metadata_writer {
         let metadata_start = stream_offset
             .checked_add(4)
             .ok_or_else(|| format!("FLAC stream offset overflows for '{}'", path.display()))?;
-        if old_audio_start < metadata_start || old_audio_start > source_metadata.len() {
+        if old_audio_start < metadata_start || old_audio_start > source_end {
             return Err(format!(
-                "invalid FLAC rewrite offsets for '{}': stream at {}, audio at {}, file length {}",
+                "invalid FLAC rewrite offsets for '{}': stream at {}, audio at {}, copy end {}, file length {}",
                 path.display(),
                 stream_offset,
                 old_audio_start,
+                source_end,
                 source_metadata.len(),
             ));
         }
@@ -2771,7 +2884,13 @@ mod flac_metadata_writer {
         input
             .seek(SeekFrom::Start(old_audio_start))
             .map_err(|err| format!("seek FLAC audio '{}': {err}", path.display()))?;
-        copy_stream_bounded(path, &mut input, &mut output, cancel)
+        copy_stream_bounded(
+            path,
+            &mut input,
+            &mut output,
+            source_end - old_audio_start,
+            cancel,
+        )
             .map_err(|err| format!("stream FLAC audio rewrite '{}': {err}", path.display()))?;
         output
             .flush()
@@ -3451,12 +3570,13 @@ mod flac_metadata_writer {
         target_path: &Path,
         input: &mut std::fs::File,
         output: &mut std::fs::File,
+        mut remaining: u64,
         cancel: Option<&super::MetadataWriteCancelFlag>,
     ) -> std::io::Result<u64> {
         let _ = &target_path;
         let mut buf = vec![0u8; STREAM_COPY_BUF];
         let mut copied = 0u64;
-        loop {
+        while remaining > 0 {
             if let Some(cancel) = cancel {
                 if cancel.is_cancelled() {
                     cancel.record_observation();
@@ -3466,15 +3586,23 @@ mod flac_metadata_writer {
                     ));
                 }
             }
-            let n = input.read(&mut buf)?;
+            let chunk_len = remaining.min(buf.len() as u64) as usize;
+            let n = input.read(&mut buf[..chunk_len])?;
             if n == 0 {
-                return Ok(copied);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "source ended after {copied} bytes with {remaining} bytes still required"
+                    ),
+                ));
             }
             output.write_all(&buf[..n])?;
             copied += n as u64;
+            remaining -= n as u64;
             #[cfg(test)]
             run_test_stream_copy_chunk_hook(target_path, copied);
         }
+        Ok(copied)
     }
 
     pub(super) fn acquire_native_write_claim(path: &Path, operation: &str) -> Result<FlacWriteClaim, String> {
@@ -11687,6 +11815,7 @@ pub(crate) fn write_tag_value_lists_for_transfer_at_verification(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TagMaintenanceKind {
     Repair,
+    RepairFlacWrappers,
     RemoveAll,
 }
 
@@ -11694,6 +11823,7 @@ impl TagMaintenanceKind {
     pub fn label(self) -> &'static str {
         match self {
             Self::Repair => "Repair tags",
+            Self::RepairFlacWrappers => "Repair FLAC wrappers",
             Self::RemoveAll => "Remove all tags",
         }
     }
@@ -11701,6 +11831,7 @@ impl TagMaintenanceKind {
     pub fn progress_verb(self) -> &'static str {
         match self {
             Self::Repair => "Repairing",
+            Self::RepairFlacWrappers => "Repairing FLAC wrapper in",
             Self::RemoveAll => "Removing tags from",
         }
     }
@@ -11843,7 +11974,7 @@ fn repair_tags_atomic(
         }
     }
 
-    if let Err(error) = check_metadata_write_cancel(cancel, "before checking FLAC tag prefix") {
+    if let Err(error) = check_metadata_write_cancel(cancel, "before checking FLAC wrappers") {
         result.cancelled = true;
         return result.fail(error);
     }
@@ -11858,6 +11989,60 @@ fn repair_tags_atomic(
                 .extend(report.durability_warnings);
         }
         Ok(None) => {}
+        Err(error) => return result.fail(error),
+    }
+    result
+}
+
+fn legacy_flac_wrapper_repair_description(
+    wrappers: crate::flac_envelope::LegacyFlacWrappers,
+) -> String {
+    match (wrappers.id3v2_prefix, wrappers.id3v1_trailer) {
+        (true, true) => "removed legacy ID3v2 prefix and ID3v1 trailer from FLAC".to_string(),
+        (true, false) => "removed legacy ID3v2 prefix from FLAC".to_string(),
+        (false, true) => "removed legacy ID3v1 trailer from FLAC".to_string(),
+        (false, false) => "FLAC had no legacy wrappers".to_string(),
+    }
+}
+
+fn repair_flac_wrappers_atomic(
+    path: &std::path::Path,
+    cancel: Option<&MetadataWriteCancelFlag>,
+) -> TagMaintenanceFileResult {
+    let mut result = TagMaintenanceFileResult::new(path);
+    if let Err(error) = check_metadata_write_cancel(cancel, "before repairing FLAC wrappers") {
+        result.cancelled = true;
+        return result.fail(error);
+    }
+
+    match flac_metadata_writer::repair_legacy_flac_wrappers(path, cancel) {
+        Ok(flac_metadata_writer::FlacWrapperRepairOutcome::NotModified) => {}
+        Ok(flac_metadata_writer::FlacWrapperRepairOutcome::CommittedAndVerified {
+            report,
+            removed,
+        }) => {
+            result.changed = true;
+            result
+                .changes
+                .push(legacy_flac_wrapper_repair_description(removed));
+            result
+                .durability_warnings
+                .extend(report.durability_warnings);
+        }
+        Ok(flac_metadata_writer::FlacWrapperRepairOutcome::CommittedButVerificationFailed {
+            report,
+            removed,
+            reason,
+        }) => {
+            result.changed = true;
+            result
+                .changes
+                .push(legacy_flac_wrapper_repair_description(removed));
+            result
+                .durability_warnings
+                .extend(report.durability_warnings);
+            return result.fail(reason);
+        }
         Err(error) => return result.fail(error),
     }
     result
@@ -12060,6 +12245,7 @@ pub fn run_tag_maintenance(
 ) -> TagMaintenanceFileResult {
     match kind {
         TagMaintenanceKind::Repair => repair_tags_atomic(path, verification, cancel),
+        TagMaintenanceKind::RepairFlacWrappers => repair_flac_wrappers_atomic(path, cancel),
         TagMaintenanceKind::RemoveAll => remove_all_tags_atomic(path, verification, cancel),
     }
 }
@@ -26464,6 +26650,172 @@ mod tests {
             .expect("audio start after repair");
         let bytes = std::fs::read(&path).expect("read repaired FLAC");
         assert_eq!(&bytes[audio_start as usize..], audio.as_slice());
+    }
+
+    #[test]
+    fn analysis_wrapper_repair_preserves_exact_native_flac_stream_and_is_idempotent() {
+        let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-analysis-wrapper-repair",
+        );
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/regression/id3_wrapped_flac/id3v2_id3v1_48000.flac");
+        let path = temp.path().join("wrapped.flac");
+        std::fs::copy(&source, &path).expect("copy wrapped fixture");
+
+        let before = std::fs::read(&path).expect("read wrapped fixture");
+        let stream_offset = crate::metadata_persistence::flac_stream_offset(&path)
+            .expect("inspect FLAC stream")
+            .expect("wrapped fixture must be FLAC") as usize;
+        assert!(stream_offset > 0);
+        assert!(before.len() >= stream_offset + 128);
+        assert_eq!(&before[before.len() - 128..before.len() - 125], b"TAG");
+        let expected_native_stream = before[stream_offset..before.len() - 128].to_vec();
+        let before_blocks = flac_metadata_writer::test_block_payloads(&path)
+            .expect("read wrapped FLAC metadata blocks");
+        assert!(before_blocks.iter().any(|(kind, _)| *kind == 0)); // STREAMINFO
+        assert!(before_blocks.iter().any(|(kind, _)| *kind == 4)); // VORBIS_COMMENT
+        assert!(before_blocks.iter().any(|(kind, _)| *kind == 1)); // PADDING
+
+        let result = run_tag_maintenance(
+            &path,
+            TagMaintenanceKind::RepairFlacWrappers,
+            tui_file_picker::VerificationMode::Standard,
+            None,
+        );
+        assert!(result.changed);
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert_eq!(
+            crate::flac_envelope::inspect_legacy_flac_wrappers(&path).unwrap(),
+            Some(crate::flac_envelope::LegacyFlacWrappers::default())
+        );
+
+        let after = std::fs::read(&path).expect("read repaired FLAC");
+        assert_eq!(after, expected_native_stream);
+        assert!(after.starts_with(b"fLaC"));
+        assert_eq!(
+            flac_metadata_writer::test_block_payloads(&path)
+                .expect("read repaired FLAC metadata blocks"),
+            before_blocks
+        );
+
+        let second = run_tag_maintenance(
+            &path,
+            TagMaintenanceKind::RepairFlacWrappers,
+            tui_file_picker::VerificationMode::Standard,
+            None,
+        );
+        assert!(!second.changed);
+        assert!(second.error.is_none(), "{:?}", second.error);
+        assert_eq!(std::fs::read(&path).unwrap(), after);
+    }
+
+    #[test]
+    fn single_image_cue_analysis_repairs_shared_physical_flac_carrier_once() {
+        if !command_available("ffprobe") {
+            eprintln!("skipping single-image CUE wrapper regression: ffprobe unavailable");
+            return;
+        }
+
+        let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-analysis-wrapper-cue-provenance",
+        );
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/regression/id3_wrapped_flac/id3v2_id3v1_48000.flac");
+        let album_path = temp.path().join("album.flac");
+        std::fs::copy(&source, &album_path).expect("copy wrapped single-image fixture");
+        std::fs::write(
+            temp.path().join("album.cue"),
+            concat!(
+                "FILE \"album.flac\" WAVE\n",
+                "  TRACK 01 AUDIO\n",
+                "    TITLE \"Track One\"\n",
+                "    INDEX 01 00:00:00\n",
+                "  TRACK 02 AUDIO\n",
+                "    TITLE \"Track Two\"\n",
+                "    INDEX 01 00:00:37\n",
+            ),
+        )
+        .expect("write single-image CUE");
+
+        let info = crate::tui::cue_parser::detect_single_image(temp.path())
+            .expect("valid two-track single-image CUE");
+        assert_eq!(info.audio_path, album_path);
+        assert_eq!(info.track_boundaries.len(), 2);
+        assert!(
+            crate::tui::cue_parser::can_ffmpeg_read(&info.audio_path),
+            "wrapped FLAC fixture must take the seek-based single-image Analyze path",
+        );
+
+        let mut results = Vec::new();
+        for (index, &(start, count)) in info.track_boundaries.iter().enumerate() {
+            let mut result = crate::tui::analyze::analyze_file(
+                &info.audio_path,
+                Some(start),
+                Some(count),
+            )
+            .expect("seek-based CUE track analysis");
+            let display_path = info.audio_path.parent().unwrap().join(format!(
+                "{:02} - {}.flac",
+                info.sheet.tracks[index].number,
+                info.sheet.tracks[index]
+                    .title
+                    .as_deref()
+                    .unwrap_or("Track"),
+            ));
+            result.path = display_path.clone();
+
+            assert_eq!(result.path, display_path);
+            assert_eq!(result.source_path, album_path);
+            assert!(!result.path.exists(), "synthetic CUE display path must not be required");
+            assert_eq!(
+                result.flac_wrapper_repair_path.as_deref(),
+                Some(album_path.as_path()),
+                "repair provenance must remain the physical single-image carrier",
+            );
+            assert!(
+                result.flac_wrappers.is_some_and(|wrappers| wrappers.any()),
+                "each seeked row must report the carrier wrapper finding",
+            );
+            results.push(result);
+        }
+
+        let targets = crate::tui::analyze::flac_wrapper_repair_targets(&results);
+        assert_eq!(targets, vec![album_path.clone()]);
+
+        let repair = run_tag_maintenance(
+            &targets[0],
+            TagMaintenanceKind::RepairFlacWrappers,
+            tui_file_picker::VerificationMode::Standard,
+            None,
+        );
+        assert!(repair.changed);
+        assert!(repair.error.is_none(), "{:?}", repair.error);
+
+        let repaired = std::fs::read(&album_path).expect("read repaired single image");
+        assert!(repaired.starts_with(b"fLaC"));
+        assert!(
+            repaired.len() < 128 || &repaired[repaired.len() - 128..repaired.len() - 125] != b"TAG",
+            "ID3v1 trailer must be removed",
+        );
+
+        for result in &mut results {
+            crate::tui::analyze::refresh_flac_wrapper_state(result)
+                .expect("refresh wrapper state from physical carrier");
+            assert_eq!(
+                result.flac_wrappers,
+                Some(crate::flac_envelope::LegacyFlacWrappers::default()),
+            );
+            assert!(result.flac_wrapper_repair_path.is_none());
+            assert!(!result.path.exists(), "repair must not create synthetic CUE track files");
+        }
+        assert!(
+            !results
+                .iter()
+                .any(|result| result.flac_wrappers.is_some_and(|wrappers| wrappers.any())),
+            "all CUE rows must refresh clean so the Repair pill disappears",
+        );
     }
 
     #[test]

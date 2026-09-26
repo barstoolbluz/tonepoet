@@ -13997,6 +13997,13 @@ pub struct AppState {
     /// Number of analysis tasks currently in flight. While > 0, the
     /// status bar shows a persistent "Analyzing..." message.
     pub analysis_pending: usize,
+    /// Failures from the current Analysis batch. Cleared at dispatch and kept
+    /// until the batch completes so final disclosure cannot depend on which
+    /// task happened to finish last.
+    pub analysis_failures: Vec<String>,
+    /// Prevent duplicate in-place wrapper-repair jobs from the analysis view.
+    /// Cleared when the maintenance completion ledger returns.
+    pub analysis_wrapper_repair_pending: bool,
     /// Temp directory for single-image analysis segment extraction.
     /// Cleaned up when `analysis_pending` reaches 0.
     pub analysis_temp_dir: Option<PathBuf>,
@@ -15369,6 +15376,8 @@ impl AppState {
             hover_target: None,
             analysis_results: Vec::new(),
             analysis_pending: 0,
+            analysis_failures: Vec::new(),
+            analysis_wrapper_repair_pending: false,
             analysis_temp_dir: None,
             verify_results: Vec::new(),
             preemph_results: Vec::new(),
@@ -16270,7 +16279,7 @@ impl AppState {
     pub fn clear_expired_status(&mut self) {
         if self.analysis_pending > 0 {
             let pending = self.analysis_pending;
-            let done = self.analysis_results.len();
+            let done = self.analysis_results.len() + self.analysis_failures.len();
             self.status_message = Some((
                 format!("Analyzing... ({}/{})", done, done + pending),
                 std::time::Instant::now(),

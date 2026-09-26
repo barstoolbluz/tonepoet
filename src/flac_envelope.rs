@@ -38,6 +38,66 @@ struct FlacEnvelopeLayout {
     has_id3v1_trailer: bool,
 }
 
+/// Legacy non-FLAC wrappers found around an otherwise native FLAC stream.
+///
+/// `None` from [`inspect_legacy_flac_wrappers`] means the path is not a
+/// structurally recognized native FLAC stream. `Some(default())` means it is a
+/// native FLAC with no legacy wrappers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct LegacyFlacWrappers {
+    pub(crate) id3v2_prefix: bool,
+    pub(crate) id3v1_trailer: bool,
+}
+
+impl LegacyFlacWrappers {
+    #[must_use]
+    pub(crate) const fn any(self) -> bool {
+        self.id3v2_prefix || self.id3v1_trailer
+    }
+}
+
+/// Inspect the current on-disk wrapper shape using the same bounded ID3v2
+/// parser that owns native FLAC metadata routing. This deliberately performs
+/// only O(1) head/tail I/O; callers can refresh it after a repair without
+/// re-decoding audio.
+pub(crate) fn inspect_legacy_flac_wrappers(
+    path: &Path,
+) -> Result<Option<LegacyFlacWrappers>, String> {
+    if crate::metadata_persistence::metadata_persistence_route_for_path(path)
+        != crate::metadata_persistence::MetadataPersistenceRoute::NativeFlacVorbis
+    {
+        return Ok(None);
+    }
+
+    let mut file = File::open(path)
+        .map_err(|error| format!("open FLAC wrapper target '{}': {error}", path.display()))?;
+    let file_len = file
+        .metadata()
+        .map_err(|error| format!("stat FLAC wrapper target '{}': {error}", path.display()))?
+        .len();
+    let Some(flac_offset) = crate::metadata_persistence::detect_flac_stream_offset(&mut file)
+        .map_err(|error| format!("inspect FLAC wrapper target '{}': {error}", path.display()))?
+    else {
+        return Ok(None);
+    };
+
+    let id3v1_trailer = if file_len >= ID3V1_LEN {
+        file.seek(SeekFrom::Start(file_len - ID3V1_LEN))
+            .map_err(|error| format!("seek FLAC wrapper trailer '{}': {error}", path.display()))?;
+        let mut signature = [0_u8; 3];
+        file.read_exact(&mut signature)
+            .map_err(|error| format!("read FLAC wrapper trailer '{}': {error}", path.display()))?;
+        &signature == b"TAG"
+    } else {
+        false
+    };
+
+    Ok(Some(LegacyFlacWrappers {
+        id3v2_prefix: flac_offset != 0,
+        id3v1_trailer,
+    }))
+}
+
 /// Shared decode guard for a native FLAC stream whose trailing ID3v1 bytes may
 /// make FFmpeg report a post-audio decoder error.
 ///
@@ -367,6 +427,67 @@ mod tests {
         id3v1[..3].copy_from_slice(b"TAG");
         bytes.extend_from_slice(&id3v1);
         bytes
+    }
+
+    #[test]
+    fn wrapper_inspection_distinguishes_all_native_flac_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let wrapped = wrapped_fixture(48_000);
+        let prefix_len = ID3V2_HEADER_LEN as usize;
+        let trailer_start = wrapped.len() - ID3V1_LEN as usize;
+
+        let cases = [
+            (
+                "both.flac",
+                wrapped.clone(),
+                LegacyFlacWrappers {
+                    id3v2_prefix: true,
+                    id3v1_trailer: true,
+                },
+            ),
+            (
+                "prefix.flac",
+                wrapped[..trailer_start].to_vec(),
+                LegacyFlacWrappers {
+                    id3v2_prefix: true,
+                    id3v1_trailer: false,
+                },
+            ),
+            (
+                "trailer.flac",
+                wrapped[prefix_len..].to_vec(),
+                LegacyFlacWrappers {
+                    id3v2_prefix: false,
+                    id3v1_trailer: true,
+                },
+            ),
+            (
+                "clean.flac",
+                wrapped[prefix_len..trailer_start].to_vec(),
+                LegacyFlacWrappers::default(),
+            ),
+        ];
+
+        for (name, bytes, expected) in cases {
+            let path = dir.path().join(name);
+            File::create(&path).unwrap().write_all(&bytes).unwrap();
+            assert_eq!(
+                inspect_legacy_flac_wrappers(&path).unwrap(),
+                Some(expected),
+                "wrong wrapper classification for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn wrapper_inspection_ignores_non_flac_id3_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tagged.mp3");
+        File::create(&path)
+            .unwrap()
+            .write_all(b"ID3\x04\x00\x00\x00\x00\x00\x00not-a-flac")
+            .unwrap();
+        assert_eq!(inspect_legacy_flac_wrappers(&path).unwrap(), None);
     }
 
     #[test]

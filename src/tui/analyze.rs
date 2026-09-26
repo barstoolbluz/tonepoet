@@ -64,7 +64,18 @@ pub enum LoudnessAnalysisStatus {
 /// Results of a single-file audio analysis.
 #[derive(Debug, Clone)]
 pub struct AnalysisResult {
+    /// Physical source file that produced this analysis row. For ordinary
+    /// files this is identical to `path`; single-image CUE rows keep the
+    /// carrier here while `path` is replaced with a synthetic display name.
+    pub source_path: PathBuf,
     pub path: PathBuf,
+    /// Legacy ID3 wrappers surrounding a native FLAC stream. `None` means the
+    /// source is not routed as native FLAC; `Some(default())` is a clean FLAC.
+    pub(crate) flac_wrappers: Option<crate::flac_envelope::LegacyFlacWrappers>,
+    /// Physical native-FLAC carrier to repair when `flac_wrappers` reports a
+    /// legacy wrapper. This remains the source path even when `path` is later
+    /// replaced with a synthetic CUE-track display name.
+    pub(crate) flac_wrapper_repair_path: Option<PathBuf>,
     /// TT Dynamic Range value (integer, 1-20+). Higher = more dynamic.
     pub dr_value: i32,
     /// Sample peak in dBFS.
@@ -217,37 +228,39 @@ pub fn analyze_file(
     let mut decoded = ffmpeg::util::frame::Audio::empty();
 
     macro_rules! process_frame {
-        () => {
-            let n = decoded.samples();
+        ($frame_offset:expr, $frame_count:expr) => {
+            let frame_offset: usize = $frame_offset;
+            let n: usize = $frame_count;
+            let frame_total = decoded.samples();
             if n == 0 {
-                continue;
+                return Err("internal analysis error: empty selected frame".to_string());
             }
 
             // ── Extract per-channel samples + accumulate global stats ──
             for ch in 0..channels as usize {
                 match sample_fmt {
                     Sample::I16(SampleType::Planar) => {
-                        let plane = decoded.plane::<i16>(ch);
+                        let plane = &decoded.plane::<i16>(ch)[frame_offset..frame_offset + n];
                         let floats: Vec<f64> = plane.iter().map(|&s| s as f64 / 32768.0).collect();
                         let i32s: Vec<i32> = plane.iter().map(|&s| (s as i32) << 16).collect();
                         accumulate_global!(floats, Some(&i32s));
                         ch_floats[ch] = floats;
                     }
                     Sample::I32(SampleType::Planar) => {
-                        let plane = decoded.plane::<i32>(ch);
+                        let plane = &decoded.plane::<i32>(ch)[frame_offset..frame_offset + n];
                         let floats: Vec<f64> =
                             plane.iter().map(|&s| s as f64 / 2147483648.0).collect();
                         accumulate_global!(floats, Some(plane));
                         ch_floats[ch] = floats;
                     }
                     Sample::F32(SampleType::Planar) => {
-                        let plane = decoded.plane::<f32>(ch);
+                        let plane = &decoded.plane::<f32>(ch)[frame_offset..frame_offset + n];
                         let floats: Vec<f64> = plane.iter().map(|&s| s as f64).collect();
                         accumulate_global!(floats, None::<&[i32]>);
                         ch_floats[ch] = floats;
                     }
                     Sample::F64(SampleType::Planar) => {
-                        let plane = decoded.plane::<f64>(ch);
+                        let plane = &decoded.plane::<f64>(ch)[frame_offset..frame_offset + n];
                         let floats: Vec<f64> = plane.to_vec();
                         accumulate_global!(floats, None::<&[i32]>);
                         ch_floats[ch] = floats;
@@ -260,19 +273,21 @@ pub fn analyze_file(
                         let full: &[i16] = unsafe {
                             std::slice::from_raw_parts(
                                 raw.as_ptr() as *const i16,
-                                n * channels as usize,
+                                frame_total * channels as usize,
                             )
                         };
                         let floats: Vec<f64> = full
                             .iter()
-                            .skip(ch)
+                            .skip(frame_offset * channels as usize + ch)
                             .step_by(channels as usize)
+                            .take(n)
                             .map(|&s| s as f64 / 32768.0)
                             .collect();
                         let i32s: Vec<i32> = full
                             .iter()
-                            .skip(ch)
+                            .skip(frame_offset * channels as usize + ch)
                             .step_by(channels as usize)
+                            .take(n)
                             .map(|&s| (s as i32) << 16)
                             .collect();
                         accumulate_global!(floats, Some(&i32s));
@@ -283,19 +298,21 @@ pub fn analyze_file(
                         let full: &[i32] = unsafe {
                             std::slice::from_raw_parts(
                                 raw.as_ptr() as *const i32,
-                                n * channels as usize,
+                                frame_total * channels as usize,
                             )
                         };
                         let floats: Vec<f64> = full
                             .iter()
-                            .skip(ch)
+                            .skip(frame_offset * channels as usize + ch)
                             .step_by(channels as usize)
+                            .take(n)
                             .map(|&s| s as f64 / 2147483648.0)
                             .collect();
                         let i32_ch: Vec<i32> = full
                             .iter()
-                            .skip(ch)
+                            .skip(frame_offset * channels as usize + ch)
                             .step_by(channels as usize)
+                            .take(n)
                             .copied()
                             .collect();
                         accumulate_global!(floats, Some(&i32_ch));
@@ -306,13 +323,14 @@ pub fn analyze_file(
                         let full: &[f32] = unsafe {
                             std::slice::from_raw_parts(
                                 raw.as_ptr() as *const f32,
-                                n * channels as usize,
+                                frame_total * channels as usize,
                             )
                         };
                         let floats: Vec<f64> = full
                             .iter()
-                            .skip(ch)
+                            .skip(frame_offset * channels as usize + ch)
                             .step_by(channels as usize)
+                            .take(n)
                             .map(|&s| s as f64)
                             .collect();
                         accumulate_global!(floats, None::<&[i32]>);
@@ -323,13 +341,14 @@ pub fn analyze_file(
                         let full: &[f64] = unsafe {
                             std::slice::from_raw_parts(
                                 raw.as_ptr() as *const f64,
-                                n * channels as usize,
+                                frame_total * channels as usize,
                             )
                         };
                         let floats: Vec<f64> = full
                             .iter()
-                            .skip(ch)
+                            .skip(frame_offset * channels as usize + ch)
                             .step_by(channels as usize)
+                            .take(n)
                             .copied()
                             .collect();
                         accumulate_global!(floats, None::<&[i32]>);
@@ -376,18 +395,27 @@ pub fn analyze_file(
         };
     }
 
-    // Seek to start position if specified.
+    // Seek to start position if specified. `Input::seek` uses FFmpeg's base
+    // timebase when no stream index is supplied, not the audio stream's
+    // sample/timebase units.
     if let Some(start) = start_sample {
-        // For most lossless formats, time_base = 1/sample_rate,
-        // so the timestamp in time_base units IS the sample number.
-        let ts = start as i64;
+        use ffmpeg::{rescale, Rescale};
+        let ts = (start as i64).rescale((1, sample_rate as i32), rescale::TIME_BASE);
         // Seek to the nearest keyframe at or before the target.
         ictx.seek(ts, ..ts)
             .map_err(|e| format!("seek failed: {}", e))?;
     }
 
     let sample_limit = max_samples.unwrap_or(u64::MAX);
+    let requested_start = start_sample.unwrap_or(0);
+    let requested_end = max_samples.and_then(|count| requested_start.checked_add(count));
     let mut total_decoded: u64 = 0;
+    let mut selected_samples: u64 = 0;
+    // Whole-file decoding can safely fall back to a zero-based cursor if a
+    // decoder omits timestamps. A seeked analysis cannot: the first decoded
+    // frame may begin before the requested point, so exact CUE boundaries
+    // require its best-effort timestamp.
+    let mut decoded_cursor = if start_sample.is_none() { Some(0u64) } else { None };
     // The legacy wrapper exception is intentionally whole-file only. A seeked
     // or bounded analysis does not establish that the decoder reached the
     // STREAMINFO terminal extent and therefore retains ordinary error handling.
@@ -398,6 +426,51 @@ pub fn analyze_file(
     .map_err(|error| format!("inspect FLAC wrapper: {error}"))?;
     let mut accepted_wrapped_eof = false;
     let mut reached_sample_limit = false;
+
+    macro_rules! process_decoded_frame {
+        () => {{
+            use ffmpeg::Rescale;
+
+            let frame_samples = decoded.samples() as u64;
+            let next_decoded = wrapped_flac
+                .checked_advance(total_decoded, frame_samples)
+                .map_err(|error| error.to_string())?;
+
+            let frame_start = if let Some(timestamp) = decoded.timestamp() {
+                let sample = timestamp.rescale(time_base, (1, sample_rate as i32));
+                if sample < 0 { 0 } else { sample as u64 }
+            } else if let Some(cursor) = decoded_cursor {
+                cursor
+            } else {
+                return Err(
+                    "seeked analysis frame has no timestamp; exact sample boundary unavailable"
+                        .to_string(),
+                );
+            };
+            let frame_end = frame_start.saturating_add(frame_samples);
+            decoded_cursor = Some(frame_end);
+            total_decoded = next_decoded;
+
+            if frame_end <= requested_start {
+                false
+            } else if requested_end.is_some_and(|end| frame_start >= end) {
+                true
+            } else {
+                let selected_start = requested_start.max(frame_start);
+                let selected_end = requested_end
+                    .map(|end| end.min(frame_end))
+                    .unwrap_or(frame_end);
+                if selected_end > selected_start {
+                    let frame_offset = (selected_start - frame_start) as usize;
+                    let frame_count = (selected_end - selected_start) as usize;
+                    process_frame!(frame_offset, frame_count);
+                    selected_samples = selected_samples.saturating_add(frame_count as u64);
+                }
+                selected_samples >= sample_limit
+                    || requested_end.is_some_and(|end| frame_end >= end)
+            }
+        }};
+    }
 
     'decode: loop {
         let mut packet = ffmpeg::Packet::empty();
@@ -434,13 +507,7 @@ pub fn analyze_file(
         loop {
             match decoder.receive_frame(&mut decoded) {
                 Ok(()) => {
-                    let frame_samples = decoded.samples() as u64;
-                    let next_decoded = wrapped_flac
-                        .checked_advance(total_decoded, frame_samples)
-                        .map_err(|error| error.to_string())?;
-                    process_frame!();
-                    total_decoded = next_decoded;
-                    if total_decoded >= sample_limit {
+                    if process_decoded_frame!() {
                         reached_sample_limit = true;
                         break 'decode;
                     }
@@ -481,12 +548,9 @@ pub fn analyze_file(
         loop {
             match decoder.receive_frame(&mut decoded) {
                 Ok(()) => {
-                    let frame_samples = decoded.samples() as u64;
-                    let next_decoded = wrapped_flac
-                        .checked_advance(total_decoded, frame_samples)
-                        .map_err(|error| error.to_string())?;
-                    process_frame!();
-                    total_decoded = next_decoded;
+                    if process_decoded_frame!() {
+                        break;
+                    }
                 }
                 Err(ffmpeg::Error::Eof) => break,
                 Err(ffmpeg::Error::Other { errno })
@@ -554,8 +618,16 @@ pub fn analyze_file(
 
     let dr_value = compute_dr(&dr_block_rms, &dr_block_peak, channels as usize);
 
+    let flac_wrappers = crate::flac_envelope::inspect_legacy_flac_wrappers(path)?;
+    let flac_wrapper_repair_path = flac_wrappers
+        .filter(|wrappers| wrappers.any())
+        .map(|_| path.to_path_buf());
+
     Ok(AnalysisResult {
+        source_path: path.to_path_buf(),
         path: path.to_path_buf(),
+        flac_wrappers,
+        flac_wrapper_repair_path,
         dr_value,
         peak_db,
         rms_db,
@@ -687,6 +759,60 @@ pub struct HdcdResult {
     pub detail: String,
 }
 
+pub(crate) fn known_bit_depth(result: &AnalysisResult) -> Option<u32> {
+    known_bit_depth_values(result.actual_bit_depth, result.declared_bit_depth)
+}
+
+fn known_bit_depth_values(actual_bit_depth: u32, declared_bit_depth: Option<u32>) -> Option<u32> {
+    if actual_bit_depth > 0 {
+        Some(actual_bit_depth)
+    } else {
+        declared_bit_depth.filter(|depth| *depth > 0)
+    }
+}
+
+pub(crate) fn bit_depth_display(result: &AnalysisResult) -> String {
+    bit_depth_display_values(result.actual_bit_depth, result.declared_bit_depth)
+}
+
+fn bit_depth_display_values(actual_bit_depth: u32, declared_bit_depth: Option<u32>) -> String {
+    let Some(depth) = known_bit_depth_values(actual_bit_depth, declared_bit_depth) else {
+        return "unknown / not applicable".to_string();
+    };
+    match declared_bit_depth {
+        Some(declared) if declared != depth => format!("{depth}-bit ({declared} declared)"),
+        _ => format!("{depth}-bit"),
+    }
+}
+
+pub(crate) fn hdcd_eligible(result: &AnalysisResult) -> bool {
+    hdcd_eligible_depth(result.declared_bit_depth, result.actual_bit_depth)
+}
+
+fn hdcd_eligible_depth(declared_bit_depth: Option<u32>, actual_bit_depth: u32) -> bool {
+    declared_bit_depth == Some(16)
+        || (declared_bit_depth.is_none() && actual_bit_depth > 0 && actual_bit_depth <= 16)
+}
+
+fn hdcd_ffmpeg_args(seek_secs: Option<f64>, duration_secs: Option<f64>) -> Vec<String> {
+    let mut args = vec![
+        "-hide_banner".to_string(),
+        "-nostats".to_string(),
+        "-y".to_string(),
+        "-v".to_string(),
+        "info".to_string(),
+    ];
+    if let Some(ss) = seek_secs {
+        args.push("-ss".to_string());
+        args.push(format!("{ss:.6}"));
+    }
+    if let Some(duration) = duration_secs {
+        args.push("-t".to_string());
+        args.push(format!("{duration:.6}"));
+    }
+    args
+}
+
 /// Detect HDCD encoding by running ffmpeg's af_hdcd filter and parsing
 /// the info-level stderr output.
 ///
@@ -700,11 +826,7 @@ pub async fn detect_hdcd(
     use tokio::process::Command;
 
     let mut cmd = Command::new("ffmpeg");
-    cmd.args(["-hide_banner", "-nostats", "-y", "-v", "info"]);
-    if let Some(ss) = seek_secs {
-        cmd.args(["-ss", &format!("{:.6}", ss)]);
-    }
-    cmd.args(["-t", &format!("{:.6}", duration_secs.unwrap_or(1.0))]);
+    cmd.args(hdcd_ffmpeg_args(seek_secs, duration_secs));
     cmd.arg("-i").arg(path);
     cmd.args(["-af", "hdcd", "-f", "s24le", "/dev/null"]);
     cmd.stdout(std::process::Stdio::null());
@@ -793,6 +915,85 @@ fn parse_hdcd_output(stderr: &str) -> Option<HdcdResult> {
     })
 }
 
+/// Collect the distinct physical carriers represented by wrapped Analyze rows.
+/// Single-image CUE tracks intentionally share one carrier even though each row
+/// has its own synthetic display path.
+pub(crate) fn flac_wrapper_repair_targets(results: &[AnalysisResult]) -> Vec<PathBuf> {
+    let mut seen = std::collections::HashSet::new();
+    results
+        .iter()
+        .filter(|result| {
+            result
+                .flac_wrappers
+                .is_some_and(|wrappers| wrappers.any())
+        })
+        .filter_map(|result| result.flac_wrapper_repair_path.as_ref())
+        .filter(|path| seen.insert((*path).clone()))
+        .cloned()
+        .collect()
+}
+
+pub(crate) fn has_synthetic_source_rows(results: &[AnalysisResult]) -> bool {
+    results.iter().any(|result| result.path != result.source_path)
+}
+
+pub(crate) fn display_name(result: &AnalysisResult) -> String {
+    if result.path != result.source_path {
+        if let Some(parent) = result.source_path.parent() {
+            if let Ok(relative) = result.path.strip_prefix(parent) {
+                return relative.to_string_lossy().to_string();
+            }
+        }
+    }
+    result
+        .path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| result.path.display().to_string())
+}
+
+/// Order Analysis rows without ever handing synthetic CUE display paths to
+/// filesystem-aware sort helpers. Ordinary rows retain the existing tag-aware
+/// physical-file ordering; a single-image CUE batch is ordered by its generated
+/// display label, whose leading two-digit track number preserves CUE order.
+pub(crate) fn sort_results_for_display(results: &mut Vec<AnalysisResult>) {
+    if has_synthetic_source_rows(results) {
+        results.sort_by_cached_key(|result| display_name(result).to_ascii_lowercase());
+        return;
+    }
+
+    let mut paths = results
+        .iter()
+        .map(|result| result.source_path.clone())
+        .collect::<Vec<_>>();
+    super::probe::sort_paths_by_track(&mut paths);
+    results.sort_by(|a, b| {
+        let ai = paths
+            .iter()
+            .position(|path| *path == a.source_path)
+            .unwrap_or(usize::MAX);
+        let bi = paths
+            .iter()
+            .position(|path| *path == b.source_path)
+            .unwrap_or(usize::MAX);
+        ai.cmp(&bi)
+    });
+}
+
+/// Refresh wrapper state after an Analyze repair without losing the physical
+/// carrier provenance carried separately from the row's display path.
+pub(crate) fn refresh_flac_wrapper_state(result: &mut AnalysisResult) -> Result<(), String> {
+    let Some(repair_path) = result.flac_wrapper_repair_path.clone() else {
+        return Ok(());
+    };
+    let wrappers = crate::flac_envelope::inspect_legacy_flac_wrappers(&repair_path)?;
+    result.flac_wrappers = wrappers;
+    result.flac_wrapper_repair_path = wrappers
+        .filter(|wrappers| wrappers.any())
+        .map(|_| repair_path);
+    Ok(())
+}
+
 /// DR value quality label.
 pub fn dr_label(dr: i32) -> &'static str {
     match dr {
@@ -808,6 +1009,209 @@ pub fn dr_label(dr: i32) -> &'static str {
 mod loudness_status_tests {
     use super::*;
 
+    fn write_pcm16_mono_wav(path: &Path, sample_rate: u32, samples: &[i16]) {
+        use std::io::Write;
+
+        let data_len = (samples.len() * std::mem::size_of::<i16>()) as u32;
+        let mut file = std::fs::File::create(path).expect("create wav");
+        file.write_all(b"RIFF").expect("riff");
+        file.write_all(&(36u32 + data_len).to_le_bytes())
+            .expect("riff size");
+        file.write_all(b"WAVEfmt ").expect("wave fmt");
+        file.write_all(&16u32.to_le_bytes()).expect("fmt size");
+        file.write_all(&1u16.to_le_bytes()).expect("pcm format");
+        file.write_all(&1u16.to_le_bytes()).expect("channels");
+        file.write_all(&sample_rate.to_le_bytes()).expect("sample rate");
+        file.write_all(&(sample_rate * 2).to_le_bytes())
+            .expect("byte rate");
+        file.write_all(&2u16.to_le_bytes()).expect("block align");
+        file.write_all(&16u16.to_le_bytes()).expect("bits");
+        file.write_all(b"data").expect("data");
+        file.write_all(&data_len.to_le_bytes()).expect("data size");
+        for sample in samples {
+            file.write_all(&sample.to_le_bytes()).expect("sample");
+        }
+    }
+
+    #[test]
+    fn seeked_analysis_matches_exact_isolated_region() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sample_rate = 44_100u32;
+        let region_samples = sample_rate as usize * 2;
+        let mut album = vec![1_000i16; region_samples];
+        album.extend(std::iter::repeat(-12_000i16).take(region_samples));
+        let isolated = vec![-12_000i16; region_samples];
+        let album_path = temp.path().join("album.wav");
+        let isolated_path = temp.path().join("track2.wav");
+        write_pcm16_mono_wav(&album_path, sample_rate, &album);
+        write_pcm16_mono_wav(&isolated_path, sample_rate, &isolated);
+
+        let seeked = analyze_file(
+            &album_path,
+            Some(region_samples as u64),
+            Some(region_samples as u64),
+        )
+        .expect("seeked track analysis");
+        let direct = analyze_file(&isolated_path, None, None).expect("isolated track analysis");
+
+        assert_eq!(seeked.dr_value, direct.dr_value);
+        assert!((seeked.peak_db - direct.peak_db).abs() < 1e-9);
+        assert!((seeked.rms_db - direct.rms_db).abs() < 1e-9);
+        assert!((seeked.dc_bias - direct.dc_bias).abs() < 1e-12);
+        assert_eq!(seeked.clipping_count, direct.clipping_count);
+        assert_eq!(seeked.actual_bit_depth, direct.actual_bit_depth);
+        assert!((seeked.duration_secs - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn whole_file_hdcd_args_do_not_impose_one_second_limit() {
+        let whole = hdcd_ffmpeg_args(None, None);
+        assert!(!whole.iter().any(|arg| arg == "-t"));
+
+        let segment = hdcd_ffmpeg_args(Some(180.0), Some(42.5));
+        assert!(segment
+            .windows(2)
+            .any(|pair| pair[0] == "-ss" && pair[1] == "180.000000"));
+        assert!(segment
+            .windows(2)
+            .any(|pair| pair[0] == "-t" && pair[1] == "42.500000"));
+    }
+
+    fn write_late_hdcd_packet_wav(path: &Path) {
+        use std::io::Write;
+
+        const SAMPLE_RATE: u32 = 44_100;
+        const CHANNELS: u16 = 2;
+        const SECONDS: usize = 2;
+        const PREFIX_WINDOW: u32 = 0x7de0_a5d0;
+        const CONTROL_BYTE: u8 = 0x53;
+
+        // FFmpeg's HDCD scanner starts with a 32-sample read-ahead, then
+        // advances over digital silence in 31-sample windows. Choose the first
+        // such boundary at or after 1.5 seconds so a one-second scan cannot
+        // see the packet. PREFIX_WINDOW maps to the Format A sync word
+        // 0x7e0fa005; CONTROL_BYTE maps to a valid peak-extend control.
+        let threshold = (SAMPLE_RATE as usize * 3) / 2;
+        let silent_windows = (threshold.saturating_sub(32) + 30) / 31;
+        let packet_start = 32 + 31 * silent_windows;
+
+        let mut packet_bits = Vec::with_capacity(39);
+        for bit in (0..31).rev() {
+            packet_bits.push(((PREFIX_WINDOW >> bit) & 1) as i16);
+        }
+        for bit in (0..8).rev() {
+            packet_bits.push(((CONTROL_BYTE >> bit) & 1) as i16);
+        }
+
+        let frame_count = SAMPLE_RATE as usize * SECONDS;
+        let data_len = frame_count * CHANNELS as usize * std::mem::size_of::<i16>();
+        let mut file = std::fs::File::create(path).expect("create synthetic HDCD wav");
+        file.write_all(b"RIFF").expect("riff");
+        file.write_all(&(36u32 + data_len as u32).to_le_bytes())
+            .expect("riff size");
+        file.write_all(b"WAVEfmt ").expect("wave fmt");
+        file.write_all(&16u32.to_le_bytes()).expect("fmt size");
+        file.write_all(&1u16.to_le_bytes()).expect("pcm format");
+        file.write_all(&CHANNELS.to_le_bytes()).expect("channels");
+        file.write_all(&SAMPLE_RATE.to_le_bytes())
+            .expect("sample rate");
+        file.write_all(&(SAMPLE_RATE * CHANNELS as u32 * 2).to_le_bytes())
+            .expect("byte rate");
+        file.write_all(&(CHANNELS * 2).to_le_bytes())
+            .expect("block align");
+        file.write_all(&16u16.to_le_bytes()).expect("bits");
+        file.write_all(b"data").expect("data");
+        file.write_all(&(data_len as u32).to_le_bytes())
+            .expect("data size");
+
+        for frame in 0..frame_count {
+            let bit = if (packet_start..packet_start + packet_bits.len()).contains(&frame) {
+                packet_bits[frame - packet_start]
+            } else {
+                0
+            };
+            let sample = 1_000i16 + bit;
+            file.write_all(&sample.to_le_bytes()).expect("left sample");
+            file.write_all(&sample.to_le_bytes()).expect("right sample");
+        }
+    }
+
+    #[tokio::test]
+    async fn whole_file_hdcd_scan_detects_code_after_first_second() {
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("late-hdcd.wav");
+        write_late_hdcd_packet_wav(&path);
+
+        let first_second = detect_hdcd(&path, None, Some(1.0))
+            .await
+            .expect("bounded HDCD scan");
+        assert!(!first_second.detected);
+
+        let whole = detect_hdcd(&path, None, None)
+            .await
+            .expect("whole-file HDCD scan");
+        assert!(whole.detected);
+        assert!(whole.peak_extend);
+        assert!(whole.total_packets > 0);
+    }
+
+    #[test]
+    fn unknown_bit_depth_is_not_renderable_or_hdcd_eligible() {
+        assert_eq!(known_bit_depth_values(0, None), None);
+        assert_eq!(
+            bit_depth_display_values(0, None),
+            "unknown / not applicable"
+        );
+        assert!(!hdcd_eligible_depth(None, 0));
+        assert!(hdcd_eligible_depth(None, 16));
+        assert!(hdcd_eligible_depth(Some(16), 0));
+        assert!(!hdcd_eligible_depth(Some(24), 16));
+    }
+
+    #[test]
+    fn synthetic_analysis_rows_are_detected_for_mutation_refusal() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("album.wav");
+        let silence = vec![0i16; 44_100];
+        write_pcm16_mono_wav(&source, 44_100, &silence);
+        let direct = analyze_file(&source, None, None).expect("direct analysis");
+        assert!(!has_synthetic_source_rows(std::slice::from_ref(&direct)));
+
+        let mut cue_row = direct;
+        cue_row.path = temp.path().join("01 - Track One.flac");
+        assert!(has_synthetic_source_rows(std::slice::from_ref(&cue_row)));
+        assert_eq!(cue_row.source_path, source);
+    }
+
+    #[test]
+    fn synthetic_cue_sort_uses_display_identity_without_filesystem_path_semantics() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("album.wav");
+        let silence = vec![0i16; 44_100];
+        write_pcm16_mono_wav(&source, 44_100, &silence);
+        let base = analyze_file(&source, None, None).expect("direct analysis");
+
+        let mut track_two = base.clone();
+        track_two.path = temp.path().join("02 - AC/DC.flac");
+        let mut track_one = base;
+        track_one.path = temp.path().join("01 - First.flac");
+        let mut rows = vec![track_two, track_one];
+
+        sort_results_for_display(&mut rows);
+
+        assert_eq!(display_name(&rows[0]), "01 - First.flac");
+        assert_eq!(display_name(&rows[1]), "02 - AC/DC.flac");
+        assert!(!temp.path().join("02 - AC").exists());
+    }
+
     #[test]
     fn analyze_accepts_id3_wrapped_flac_fixture() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -817,6 +1221,14 @@ mod loudness_status_tests {
         assert_eq!(result.sample_rate, 48_000);
         assert_eq!(result.channels, 2);
         assert!((result.duration_secs - 1.0).abs() < 0.01);
+        assert_eq!(
+            result.flac_wrappers,
+            Some(crate::flac_envelope::LegacyFlacWrappers {
+                id3v2_prefix: true,
+                id3v1_trailer: true,
+            })
+        );
+        assert_eq!(result.flac_wrapper_repair_path.as_deref(), Some(path.as_path()));
     }
 
     #[test]
@@ -834,6 +1246,13 @@ mod loudness_status_tests {
         assert_eq!(result.sample_rate, 48_000);
         assert_eq!(result.channels, 2);
         assert!((result.duration_secs - 1.0).abs() < 0.01);
+        assert_eq!(
+            result.flac_wrappers,
+            Some(crate::flac_envelope::LegacyFlacWrappers {
+                id3v2_prefix: false,
+                id3v1_trailer: true,
+            })
+        );
     }
 
     #[test]
