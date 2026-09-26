@@ -1104,11 +1104,22 @@ impl TuiPreset {
             let mut output = OutputOptionsState::new();
             let mut metadata = MetadataState::default();
             let report = preset.apply_to_pills(&mut format, &mut output, &mut metadata);
-            if !report.is_complete() {
+            // Each projection interprets the preset against one source class.
+            // Fields that belong to the other class are dormant here by
+            // construction, so their refusals are expected and are decided by
+            // the other projection; every other refusal is a real failure.
+            let dormant_prefix = if source_is_dsd { "pcm_" } else { "dsd_" };
+            let refused = report
+                .refused_fields
+                .iter()
+                .filter(|field| !field.starts_with(dormant_prefix))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !refused.is_empty() {
                 return Err(format!(
-                    "preset '{}' cannot be applied{}",
+                    "preset '{}' cannot be applied; refused fields: {}",
                     preset.name,
-                    report.status_suffix(),
+                    refused.join(", "),
                 ));
             }
             let mut options = super::convert_actions::try_pills_to_options(
@@ -2108,6 +2119,37 @@ merge = "multi-file"
         assert_eq!(first.refused_fields, vec!["output_target".to_string()]);
         assert_eq!(*first_format.format.selected_value(), AudioFormat::Dsf);
         assert_eq!(*second_format.format.selected_value(), AudioFormat::Dsf);
+    }
+
+    #[test]
+    fn cli_projection_accepts_presets_that_carry_dsd_fields() {
+        let config = crate::config::TonepoetConfig::default();
+        let format = FormatState::new();
+        let output = OutputOptionsState::new();
+        let metadata = MetadataState::default();
+        let mut preset = TuiPreset::from_pill_state("sacd-reference", &format, &output, &metadata);
+        preset.format = "flac".to_string();
+        preset.sample_rate = 176_400;
+        preset.bit_depth = "32".to_string();
+        preset.dither = "tpdf".to_string();
+        preset.dsd_path = Some("reference".to_string());
+        preset.dsd_profile = Some("reference".to_string());
+        preset.dsd_gain = Some("auto".to_string());
+        preset.dsd_true_peak_target_dbtp = Some("-0.100000000".to_string());
+        preset.dsd_true_peak_scope = Some("album".to_string());
+        preset.dsd_true_peak_scan = Some("fast066v2_standard".to_string());
+
+        let options = preset
+            .to_conversion_options(&config)
+            .expect("a preset with dormant DSD fields loads from the CLI");
+        let settings = options
+            .pipeline_settings
+            .expect("projection yields pipeline settings");
+        assert_eq!(
+            settings.dsd.from_dsd.pathway,
+            tonepoet_pipeline::DsdSourcePathway::Reference,
+            "the DSD projection's Reference pathway must survive into the merged settings"
+        );
     }
 
     #[test]
