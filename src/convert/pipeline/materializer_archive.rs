@@ -5894,6 +5894,8 @@ mod tests {
                 Some(24),
                 Some(SourceAudioCoding::Pcm),
             )
+            // The simulated ffprobe reports a codec but no format entry.
+            .with_probe_identity(Some("flac"), None)
         );
         let TrackSourceRef::StagedFile(path) = &track.source_ref else {
             panic!("archive materializer must stage extracted files");
@@ -5949,6 +5951,7 @@ mod tests {
                 Some(16),
                 Some(SourceAudioCoding::Pcm),
             )
+            .with_probe_identity(Some("pcm_s16le"), Some("wav"))
         );
         assert_eq!(track.expected_samples, Some(2_205));
         let TrackSourceRef::StagedFile(path) = &track.source_ref else {

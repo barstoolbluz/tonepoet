@@ -23319,7 +23319,16 @@ mod tests {
         );
         let read = read_all_tags_merged_with_metadata(std::slice::from_ref(&path))
             .expect("read renamed WavPack bytes through Lofty content detection");
-        assert!(read.metadata_errors[0].is_none());
+        // The bytes are WavPack under a Musepack name: the read succeeds, and
+        // the editor discloses the extension/content disagreement as a
+        // recoverable warning naming both facts.
+        let identity = read.metadata_errors[0]
+            .as_ref()
+            .expect("renamed carrier must be disclosed");
+        assert_eq!(identity.kind, MetadataReadIssueKind::RecoverableTagWarning);
+        assert!(identity.reason.contains("Source identity mismatch"), "{}", identity.reason);
+        assert!(identity.reason.contains("'.mpc'"), "{}", identity.reason);
+        assert!(identity.reason.to_ascii_lowercase().contains("wavpack"), "{}", identity.reason);
         assert!(read.entries.iter().any(|entry| {
             entry.display_key.eq_ignore_ascii_case("CUESHEET")
                 && entry.per_file_values.first().map(crate::tui::probe::MetadataFieldValues::as_str) == Some(cue)
