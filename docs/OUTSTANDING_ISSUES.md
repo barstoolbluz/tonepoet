@@ -2407,6 +2407,16 @@ identical in effect on the workflow.
 
 ## 33. APE source "converted" to FLAC produced byte-identical Monkey's Audio carrying a `.flac` extension; embedded cover art destroyed; malformed-APEv2 sources unreadable by the editor
 
+**Status 2026-09-26:** resolved on main @ 7083144 (v0.5.3). Planner source identity comes from the
+probe's decoder codec and demuxer names; decode-only formats (APE, Musepack, Shorten, OGG, TTA)
+become a custom planner identity that can never satisfy passthrough or stream copy; a filename
+whose extension disagrees with its content is disclosed with both facts on conversion and in the
+editor; conversion and editor share one bounded APEv2 reader that repairs the recorded descriptor
+defects and recovers a cover mislabelled as text only when the payload is a recognised image.
+Field on the album above: eight real FLACs, bit-exact audio, one album folder, filenames from
+`Title`, the 47,931-byte JPEG on every track, encode commands in the log. Defects A, B and D
+verified fixed in the field; C (the editor) covered by regression, live TUI check owed by the user.
+
 **Replicated 2026-09-26** on branch `apply/five-field-defects-2026-09-25` @ 852332c (v0.5.3, the
 redesigned pipeline), same source album, `tonepoet convert <dir> --format flac`. Eight of eight
 "succeeded" in 15 s; every output begins with `MAC `, ffprobe says `ape`, 96 kHz / 24-bit; no
