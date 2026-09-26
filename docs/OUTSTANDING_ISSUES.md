@@ -16,7 +16,7 @@ schema, the five field defects, decode-only passthrough):
 - #34 resolved since e2afa8e; #35a delivered with #36, #35b delivered with #34; #35c open.
 - #18 changed shape (incumbent now wins; the second conversion fails at Publish instead).
 - Open and unchanged: #2-#8, #10-#13, #15-#17, #19-#26, #29-#32.
-- Filed after the sweep: #46 (CLI preset regression), #47, #48, #49. #38 resolved 2026-09-26.
+- Filed after the sweep: #46 (CLI preset regression, resolved same day), #47, #48, #49. #38 resolved 2026-09-26.
 
 
 **Status sweep 2026-08-25:** every entry was re-verified against `main @ ec362ee` by reading the code
@@ -3065,6 +3065,11 @@ refusal reason the CLI prints, including that the installed report does not bind
 running build, and says that requalification is the remedy.
 
 ## 46. Regression (v0.5.3 @ 6d11d35): a TUI preset that carries DSD fields cannot be loaded from the CLI at all
+
+**Status 2026-09-26:** resolved on main (merge of fix/46-cli-preset-dsd-fields @ d662e81). Each CLI
+projection now treats the other source class's fields as dormant and fails only on its own
+refusals. Field: the SACD preset converts a DSF on the Reference path (176.4/32, -0.1 dBTP) and a
+FLAC with its PCM policy; gate 7095/0/16.
 
 Found 2026-09-26. `tonepoet convert <file> --preset "SACD-to-PCM Reference"` fails before
 queueing, for a DSF source as much as for a FLAC source:
