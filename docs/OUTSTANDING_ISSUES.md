@@ -15,7 +15,8 @@ schema, the five field defects, decode-only passthrough):
 - Partly resolved: #37 (tool launch 0.7-1.2 s down to 0.1-0.18 s; tens-of-ms target open).
 - #34 resolved since e2afa8e; #35a delivered with #36, #35b delivered with #34; #35c open.
 - #18 changed shape (incumbent now wins; the second conversion fails at Publish instead).
-- Open and unchanged: #2-#8, #10-#13, #15-#17, #19-#26, #29-#32, #38.
+- Open and unchanged: #2-#8, #10-#13, #15-#17, #19-#26, #29-#32.
+- Filed after the sweep: #46 (CLI preset regression), #47, #48, #49. #38 resolved 2026-09-26.
 
 
 **Status sweep 2026-08-25:** every entry was re-verified against `main @ ec362ee` by reading the code
@@ -2755,7 +2756,14 @@ shows the Metadata stage on Opus and AAC within a few percent of the tag writers
 
 ## 38. Analyze detects ID3-wrapped FLACs and offers to repair them
 
-**Status:** open, not started; scheduled after #34, whose decode tolerance it builds on.
+**Status 2026-09-26:** resolved on main @ c2c8502 (v0.5.3). `:analyze` shows a "FLAC Wrapper" row
+for an ID3v2 prefix, an ID3v1 trailer, or both; `r Repair` appears only for wrapped results and
+rewrites through the overflow rewrite's in-place safety path, copying exactly the inner stream
+(byte-exact regression on the fixture, idempotent; single-image CUE albums repair their one
+carrier). The same delivery fixed seven Analysis defects from the model's own audit (exact CUE
+sample windows, per-track CUE PRE, physical source identity for ReplayGain writes and DR
+reports, whole-file HDCD scan, deterministic batch failure disclosure, unknown bit depth, cache-hit
+PRE refresh); analysis cache version 26 → 27. Live check on the Asia album owed by the user.
 
 Follows #34. Once the native decoder tolerates an ID3v2 prefix and an ID3v1 trailer, the
 wrappers are still a defect in the file: other tools trip on them, and every later native
