@@ -2889,6 +2889,29 @@ fn requires_measure_then_gain_materialization(request: &PipelineRequest) -> bool
                 .is_some_and(|batch| batch.expected_track_count > 1))
 }
 
+fn requests_dispatcher_album_replaygain(request: &PipelineRequest) -> bool {
+    request.album_batch.is_some()
+        && request.stages.replaygain == crate::convert::pipeline::StageRequirement::Enabled
+        && matches!(
+            request
+                .settings
+                .replay_gain
+                .mode
+                .unwrap_or(tonepoet_pipeline::ReplayGainMode::Both),
+            tonepoet_pipeline::ReplayGainMode::Album | tonepoet_pipeline::ReplayGainMode::Both
+        )
+}
+
+fn requires_dispatcher_album_replaygain_barrier(request: &PipelineRequest) -> bool {
+    // Album/Both ReplayGain needs encoded independent siblings to rendezvous
+    // at the scheduler barrier. A singleton needs no cross-item reduction.
+    requests_dispatcher_album_replaygain(request)
+        && request
+            .album_batch
+            .as_ref()
+            .is_some_and(|batch| batch.expected_track_count > 1)
+}
+
 #[derive(Default)]
 struct DsdAlbumGainQueuePreflight {
     item_to_submission: BTreeMap<String, String>,
@@ -3021,19 +3044,9 @@ fn preflight_replaygain_album_batches(items: &[ConversionItem]) -> ReplayGainBat
             .iter()
             .copied()
             .filter(|item| {
-                item.pipeline_request.as_ref().is_some_and(|request| {
-                    request.stages.replaygain
-                        == crate::convert::pipeline::StageRequirement::Enabled
-                        && matches!(
-                            request
-                                .settings
-                                .replay_gain
-                                .mode
-                                .unwrap_or(tonepoet_pipeline::ReplayGainMode::Both),
-                            tonepoet_pipeline::ReplayGainMode::Album
-                                | tonepoet_pipeline::ReplayGainMode::Both
-                        )
-                })
+                item.pipeline_request
+                    .as_ref()
+                    .is_some_and(requests_dispatcher_album_replaygain)
             })
             .collect::<Vec<_>>();
         if album_replaygain_members.is_empty() {
@@ -5030,6 +5043,7 @@ fn build_initial_work(
 
     if matches!(source_kind, Some(SourceKind::SingleFile))
         && !requires_measure_then_gain_materialization(&request)
+        && !requires_dispatcher_album_replaygain_barrier(&request)
         && request.registered_effects.is_empty()
         && !has_embedded_chapters
     {
@@ -7865,6 +7879,7 @@ fi
         use lofty::file::TaggedFileExt;
         use lofty::tag::ItemKey;
 
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("queued ReplayGain tempdir");
         let album_root = temp.path().join("Artist").join("Album");
         std::fs::create_dir_all(&album_root).expect("album source directory");
@@ -7880,7 +7895,7 @@ fi
             request.job_id = format!("job-{id}");
             request.container = input;
             request.output_root = temp.path().join("out");
-            request.naming.per_album_subdir = false;
+            request.naming.per_album_subdir = true;
             request.log.write_json_log = false;
             request.log.write_conversion_log = false;
             request.settings.target_format = tonepoet_pipeline::AudioFormat::Wav;
@@ -7888,7 +7903,7 @@ fi
             request.settings.force_encode = true;
             request.settings.metadata.transfer_tags = false;
             request.settings.metadata.preserve_artwork = false;
-            request.settings.replay_gain.mode = Some(tonepoet_pipeline::ReplayGainMode::Both);
+            request.settings.replay_gain.mode = Some(tonepoet_pipeline::ReplayGainMode::Album);
             request.stages.replaygain = StageRequirement::Enabled;
 
             let mut item = conversion_item_with_pipeline_request(id, request);
@@ -7905,15 +7920,40 @@ fi
             scratch_directory: None,
             scratch_memory_limit_percent: 0,
         });
+        let registered_execution_items = Arc::new(Mutex::new(Vec::<String>::new()));
+        let registered_execution_items_for_hook = Arc::clone(&registered_execution_items);
+        processor.set_execution_acquisition_hook(move |item_id| {
+            let execution_id = uuid::Uuid::new_v4();
+            let queue_lease = Arc::new(crate::concurrency::PersistentLease::create(
+                crate::concurrency::LeaseFamily::QueueExecution { execution_id },
+                &[],
+            )?);
+            crate::concurrency::register_runtime_execution(
+                item_id,
+                execution_id,
+                queue_lease,
+                None,
+            )?;
+            registered_execution_items_for_hook
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(item_id.to_string());
+            Ok(())
+        });
         let mut queue = ConversionQueue::new();
         for item in items {
             queue.items_mut().push_back(item);
         }
 
-        processor
-            .process_queue(&mut queue)
-            .await
-            .expect("two-track queued album ReplayGain conversion");
+        let process_result = processor.process_queue(&mut queue).await;
+        let registered_execution_items = registered_execution_items
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        for item_id in registered_execution_items {
+            crate::concurrency::unregister_runtime_execution(&item_id);
+        }
+        process_result.expect("two-track queued album ReplayGain conversion");
         assert_eq!(queue.failed_items(), 0);
 
         let mut outputs = files_with_extension(&temp.path().join("out"), "wav");
@@ -11577,6 +11617,76 @@ FILE "disc2.flac" WAVE
         assert_eq!(work.kind, WorkKind::SingleFile);
         assert_eq!(work.job_id, "prepared-job-01");
         assert_eq!(job_to_item.get("prepared-job-01").map(String::as_str), Some("item-01"));
+        assert!(terminal.is_empty());
+    }
+
+    #[test]
+    fn album_replaygain_batch_routes_single_files_through_scheduler_barrier_path() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_root = temp.path().join("Artist").join("Album");
+        std::fs::create_dir_all(&album_root).expect("album dir");
+        let track_01 = album_root.join("01 - First.flac");
+        let track_02 = album_root.join("02 - Second.flac");
+        std::fs::write(&track_01, b"not real audio; dispatch test only").expect("track 1 file");
+        std::fs::write(&track_02, b"not real audio; dispatch test only").expect("track 2 file");
+
+        let mut req_01 = processor_dispatch_request_for_path(
+            temp.path(),
+            "item-01",
+            "album-rg-job-01",
+            track_01,
+        );
+        let mut req_02 = processor_dispatch_request_for_path(
+            temp.path(),
+            "item-02",
+            "album-rg-job-02",
+            track_02,
+        );
+        for request in [&mut req_01, &mut req_02] {
+            request.stages.replaygain = StageRequirement::Enabled;
+            request.settings.replay_gain.mode = Some(tonepoet_pipeline::ReplayGainMode::Album);
+        }
+        let mut items = vec![
+            conversion_item_with_pipeline_request("item-01", req_01),
+            conversion_item_with_pipeline_request("item-02", req_02),
+        ];
+        prepare_album_batches_for_queued_independent_single_file_jobs(&mut items);
+
+        let first_request = items[0]
+            .pipeline_request
+            .as_ref()
+            .expect("prepared album ReplayGain request");
+        assert!(requires_dispatcher_album_replaygain_barrier(first_request));
+
+        let pool = SharedWorkerPool::<QueueWorkOutput>::new_with_limits(
+            Some(1),
+            CancellationToken::new(),
+            PoolLimits::default(),
+        );
+        let mut terminal = BTreeMap::new();
+        let mut job_to_item = BTreeMap::new();
+        let tool_paths = HashMap::new();
+        let (progress_tx, _progress_rx) = broadcast::channel(4);
+        let work = build_initial_work(
+            items[0].clone(),
+            &pool,
+            &mut terminal,
+            &mut job_to_item,
+            &tool_paths,
+            Arc::new(Mutex::new(HashMap::new())),
+            &progress_tx,
+            None,
+            2,
+            Arc::new(ToolConcurrencyLimits::new(1, 1, 1, 1)),
+            None,
+        )
+        .expect("album ReplayGain single-file item produces scheduler work");
+
+        assert_eq!(
+            work.kind,
+            WorkKind::MaterializeItem,
+            "dispatcher-split Album/Both ReplayGain members must bypass the direct single-file executor so they can reach the shared post-encode barrier"
+        );
         assert!(terminal.is_empty());
     }
 
