@@ -1160,7 +1160,8 @@ mod loudness_status_tests {
             .expect("whole-file HDCD scan");
         assert!(whole.detected);
         assert!(whole.peak_extend);
-        assert!(whole.total_packets > 0);
+        // `total_packets` is not reported by ffmpeg at info level; the parser
+        // always leaves it at zero, so detection and peak-extend are the facts.
     }
 
     #[test]
