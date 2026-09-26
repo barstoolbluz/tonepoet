@@ -2407,6 +2407,24 @@ identical in effect on the workflow.
 
 ## 33. APE source "converted" to FLAC produced byte-identical Monkey's Audio carrying a `.flac` extension; embedded cover art destroyed; malformed-APEv2 sources unreadable by the editor
 
+**Replicated 2026-09-26** on branch `apply/five-field-defects-2026-09-25` @ 852332c (v0.5.3, the
+redesigned pipeline), same source album, `tonepoet convert <dir> --format flac`. Eight of eight
+"succeeded" in 15 s; every output begins with `MAC `, ffprobe says `ape`, 96 kHz / 24-bit; no
+output carries a PICTURE block. Conversion logs now exist and say "Conversion: 24-bit/96kHz
+source -> 24-bit/96kHz FLAC", "Force encode: No", "Commands: none recorded", "Metadata:
+Skipped (already satisfied by the output planner)".
+
+**Mechanism of Defect A, established.** `planner_format_from_path` (`src/convert/pipeline/plan_bridge.rs`)
+has no `ape` arm, so the plan bridge falls back to `PlannerFormat::Flac` and `codec_for_format`
+then yields `PlannerCodec::Flac`. `planner_format_from_main` maps the decode-only formats (APE,
+Musepack, Shorten, OGG, TTA) to FLAC the same way, by design comment. The planner therefore
+sees source FLAC/FLAC, target FLAC, same rate and depth, no force encode, and `is_passthrough`
+(`tonepoet-pipeline/src/plan.rs`) selects a stream copy. The pipeline crate has no APE format or
+codec at all. This is not APE-specific: every decode-only source format converted to FLAC without
+`--force-encode` is published unencoded under a `.flac` name. Defect D also still reproduces
+(`08 - Track 08.flac`, each track in its own folder named after the file stem). Defects B and C
+not re-examined this pass.
+
 **Status:** open, filed 2026-09-14 from a field report. Not reproduced under test. **Deliberately
 deferred**: replicate this *after* the planner/pipeline redesign lands and is integrated, then hand
 the replication to the model. Filing now so the artifacts and measurements are not lost.
