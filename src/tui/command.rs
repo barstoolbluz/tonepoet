@@ -1580,11 +1580,11 @@ pub(crate) fn handle_browse_convert_expansion_complete(
                 app,
                 tx,
                 preset,
+                post_load,
                 expansion.queue,
                 expansion.expanded_folder_count,
                 true,
             ) {
-                apply_browse_convert_post_load_action(app, tx, post_load);
                 if let Some(warning) = first_warning.as_deref() {
                     append_current_status_note_if_missing(app, warning);
                 }
@@ -9265,6 +9265,7 @@ fn finish_browse_queue_review_after_expansion(
     app: &mut AppState,
     tx: &mpsc::Sender<AppMessage>,
     preset: Option<String>,
+    post_load: BrowseConvertPostLoad,
     queue: QueueExpansionResult,
     expanded_folder_count: usize,
     queue_paths_prepared_off_reducer: bool,
@@ -9307,23 +9308,15 @@ fn finish_browse_queue_review_after_expansion(
             crate::convert::queue_expansion::path_list_contains_queue_identity(&paths, path)
         });
     }
+    let preset_failure_expansion_warning = expansion_errors.first().cloned();
+    app.pending_browse_convert_preset_continuation = None;
 
     // Queue review settings are part of the same user-visible operation as
     // source installation. Preserve them until the source transition reports
     // success so archive preflight failure cannot retarget the prior source.
     let settings_before = QueueReviewSettingsSnapshot::capture(app);
 
-    if let Some(name) = &preset {
-        if let Err(msg) = load_queue_preset_into_pills(app, name) {
-            if let Some(err) = expansion_errors.first() {
-                log::warn!("queue expansion warning dropped by preset failure: {}", err);
-            }
-            crate::convert::queue_expansion::cleanup_synthetic_cue_artifacts(&synthetic_cue_artifacts);
-            settings_before.restore(app);
-            app.set_status(msg);
-            return false;
-        }
-    } else {
+    if preset.is_none() {
         app.convert.format = super::app::FormatState::new();
         // Reset to configured defaults, not to an empty state: AppState
         // construction seeds dest_path from config, and the post-load Commit
@@ -9354,7 +9347,77 @@ fn finish_browse_queue_review_after_expansion(
         return false;
     }
 
-    app.current_screen == AppScreen::Convert && !app.convert.source.mode.is_empty()
+    // Presets are source-relative policy. Install the source first, then wait
+    // for the matching probe when source facts are still unresolved. This is
+    // essential for generic ISO/SACD sources: the path alone cannot establish
+    // DSD availability, so applying now would interpret the preset against the
+    // previous/placeholder source and either drop or refuse valid DSD fields.
+    if let Some(name) = preset {
+        if app.convert.source.mode.probe_in_progress() {
+            let Some(path) = app.convert.source.mode.current_path().cloned() else {
+                app.set_status("preset application refused: probed source has no current path");
+                return false;
+            };
+            app.pending_browse_convert_preset_continuation = Some(
+                super::app::PendingBrowseConvertPresetContinuation {
+                    generation: app.probe_generation,
+                    path,
+                    preset: name,
+                    post_load,
+                },
+            );
+            return true;
+        }
+        if let Err(msg) = load_queue_preset_into_pills(app, &name) {
+            if let Some(err) = preset_failure_expansion_warning.as_deref() {
+                log::warn!("queue expansion warning accompanied preset refusal: {}", err);
+            }
+            app.set_status(msg);
+            return false;
+        }
+    }
+
+    let ready = app.current_screen == AppScreen::Convert && !app.convert.source.mode.is_empty();
+    if ready {
+        apply_browse_convert_post_load_action(app, tx, post_load);
+    }
+    ready
+}
+
+pub(crate) fn complete_pending_browse_convert_preset_after_probe(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    generation: u64,
+    path: &std::path::Path,
+) -> bool {
+    let matches = app
+        .pending_browse_convert_preset_continuation
+        .as_ref()
+        .is_some_and(|pending| {
+            pending.generation == generation && pending.path.as_path() == path
+        });
+    if !matches {
+        return false;
+    }
+
+    let pending = app
+        .pending_browse_convert_preset_continuation
+        .take()
+        .expect("matching deferred preset continuation must exist");
+    match load_queue_preset_into_pills(app, &pending.preset) {
+        Ok(report) => {
+            app.set_status(format!(
+                "preset loaded: {}{}",
+                pending.preset,
+                report.status_suffix()
+            ));
+            apply_browse_convert_post_load_action(app, tx, pending.post_load);
+        }
+        Err(message) => {
+            app.set_status(message);
+        }
+    }
+    true
 }
 
 fn apply_browse_convert_post_load_action(
@@ -9645,16 +9708,15 @@ fn execute_queue_with_post_load(
                 return;
             }
 
-            if finish_browse_queue_review_after_expansion(
+            let _ = finish_browse_queue_review_after_expansion(
                 app,
                 tx,
                 preset,
+                post_load,
                 selection,
                 0,
                 true,
-            ) {
-                apply_browse_convert_post_load_action(app, tx, post_load);
-            }
+            );
             prefix_current_status_with_stale_selection_notice(app, dropped_stale_count);
         }
         AppScreen::Library => {
@@ -19438,6 +19500,36 @@ mod execute_queue_state_consistency_tests {
     use crate::tui::browse::BrowseEntry;
     use tokio::sync::mpsc;
 
+    #[test]
+    fn browse_context_preset_is_applied_after_the_conversion_source_is_installed() {
+        let source = include_str!("command.rs");
+        let start = source
+            .find("fn finish_browse_queue_review_after_expansion(")
+            .expect("queue review helper should exist");
+        let end = source[start..]
+            .find("\nfn apply_browse_convert_post_load_action(")
+            .map(|offset| start + offset)
+            .expect("queue review helper should have a bounded end");
+        let body = &source[start..end];
+
+        let install = body
+            .find("let installed = install_browse_convert_source_paths(")
+            .expect("Browse queue review must install the selected source");
+        let preset = body
+            .find("if let Some(name) = preset {")
+            .expect("Browse queue review must apply an optional preset");
+        let apply = body[preset..]
+            .find("load_queue_preset_into_pills(app, &name)")
+            .map(|offset| preset + offset)
+            .expect("Browse queue review must apply the preset to the installed source");
+
+        assert!(install < preset && preset < apply);
+        assert!(
+            !body[..install].contains("load_queue_preset_into_pills(app, &name)"),
+            "a context-menu preset must never be interpreted against the previous source",
+        );
+    }
+
 
     #[test]
     fn failed_archive_review_restores_existing_source_settings_and_preset_identity() {
@@ -19484,6 +19576,7 @@ mod execute_queue_state_consistency_tests {
             &mut app,
             &tx,
             None,
+            BrowseConvertPostLoad::ReviewOnly,
             QueueExpansionResult {
                 paths: vec![archive],
                 ..QueueExpansionResult::default()
@@ -20157,9 +20250,6 @@ mod execute_queue_state_consistency_tests {
     #[test]
     fn async_convert_review_completion_preserves_post_load_commit_continuation() {
         let source = include_str!("command.rs");
-        let target_start = source
-            .find("ConvertReview {\n        preset: Option<String>,\n        post_load: BrowseConvertPostLoad,")
-            .expect("ConvertReview target should carry post-load continuation");
         let handler_start = source
             .find("pub(crate) fn handle_browse_convert_expansion_complete(")
             .expect("expansion completion handler should exist");
@@ -20171,12 +20261,22 @@ mod execute_queue_state_consistency_tests {
         let finish_call = handler_body
             .find("finish_browse_queue_review_after_expansion(")
             .expect("fresh ConvertReview completions should publish via queue review helper");
-        let continuation = handler_body
-            .find("apply_browse_convert_post_load_action(app, tx, post_load)")
-            .expect("fresh ConvertReview completions should resume post-load commit/start");
+        let post_load_arg = handler_body[finish_call..]
+            .find("post_load,")
+            .expect("post-load continuation must travel with queue review publication");
 
-        assert!(target_start < handler_start);
-        assert!(finish_call < continuation);
+        let continuation_start = source
+            .find("pub(crate) fn complete_pending_browse_convert_preset_after_probe(")
+            .expect("deferred preset continuation helper should exist");
+        let continuation_end = source[continuation_start..]
+            .find("\nfn apply_browse_convert_post_load_action(")
+            .map(|offset| continuation_start + offset)
+            .expect("deferred continuation helper should have a bounded end");
+        let continuation_body = &source[continuation_start..continuation_end];
+        assert!(continuation_body.contains(
+            "apply_browse_convert_post_load_action(app, tx, pending.post_load)"
+        ));
+        assert!(post_load_arg > 0);
     }
 
     #[test]

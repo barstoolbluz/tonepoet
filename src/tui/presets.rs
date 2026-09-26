@@ -383,6 +383,7 @@ impl TuiPreset {
         output_opts: &OutputOptionsState,
         metadata: &MetadataState,
     ) -> Self {
+        let dsd_source_fields_available = format.dsd_to_pcm_gain_available();
         Self {
             name: name.to_string(),
             description: None,
@@ -405,34 +406,42 @@ impl TuiPreset {
                 .selected_value()
                 .resolved_output_target(format.selected_container())
                 .map(|target| target.key().to_string()),
-            dsd_path: match *format.dsd_pathway.selected_value() {
-                tonepoet_pipeline::DsdSourcePathway::Custom => Some("custom".to_string()),
-                tonepoet_pipeline::DsdSourcePathway::Reference => Some("reference".to_string()),
-                tonepoet_pipeline::DsdSourcePathway::Manual => None,
-            },
-            dsd_reconstruction: (*format.dsd_pathway.selected_value()
-                == tonepoet_pipeline::DsdSourcePathway::Custom)
+            dsd_path: dsd_source_fields_available
+                .then(|| match *format.dsd_pathway.selected_value() {
+                    tonepoet_pipeline::DsdSourcePathway::Custom => Some("custom".to_string()),
+                    tonepoet_pipeline::DsdSourcePathway::Reference => Some("reference".to_string()),
+                    tonepoet_pipeline::DsdSourcePathway::Manual => None,
+                })
+                .flatten(),
+            dsd_reconstruction: (dsd_source_fields_available
+                && *format.dsd_pathway.selected_value()
+                    == tonepoet_pipeline::DsdSourcePathway::Custom)
                 .then(|| match *format.dsd_custom_reconstruction.selected_value() {
                     tonepoet_pipeline::DsdGeneralReconstruction::General => "native".to_string(),
                     tonepoet_pipeline::DsdGeneralReconstruction::ReferenceProtected => "reference".to_string(),
                 }),
-            dsd_lowpass: (*format.dsd_pathway.selected_value()
-                == tonepoet_pipeline::DsdSourcePathway::Custom)
+            dsd_lowpass: (dsd_source_fields_available
+                && *format.dsd_pathway.selected_value()
+                    == tonepoet_pipeline::DsdSourcePathway::Custom)
                 .then(|| match *format.dsd_custom_lowpass.selected_value() {
                     tonepoet_pipeline::enums::DsdLowpassMethod::Auto => "auto".to_string(),
                     tonepoet_pipeline::enums::DsdLowpassMethod::SoxUltra => "sox-ultra".to_string(),
                     tonepoet_pipeline::enums::DsdLowpassMethod::Sinc => "sinc".to_string(),
                 }),
-            dsd_profile: ((*format.dsd_pathway.selected_value() == tonepoet_pipeline::DsdSourcePathway::Reference)
-                || (*format.dsd_pathway.selected_value() == tonepoet_pipeline::DsdSourcePathway::Custom
-                    && *format.dsd_custom_reconstruction.selected_value()
-                        == tonepoet_pipeline::DsdGeneralReconstruction::ReferenceProtected))
+            dsd_profile: (dsd_source_fields_available
+                && ((*format.dsd_pathway.selected_value()
+                    == tonepoet_pipeline::DsdSourcePathway::Reference)
+                    || (*format.dsd_pathway.selected_value()
+                        == tonepoet_pipeline::DsdSourcePathway::Custom
+                        && *format.dsd_custom_reconstruction.selected_value()
+                            == tonepoet_pipeline::DsdGeneralReconstruction::ReferenceProtected)))
                 .then(|| match *format.dsd_profile.selected_value() {
                     tonepoet_pipeline::DsdReconstructionSelection::Reference => "reference".to_string(),
                     tonepoet_pipeline::DsdReconstructionSelection::Wideband => "wideband".to_string(),
                 }),
-            dsd_export_level: (*format.dsd_pathway.selected_value()
-                == tonepoet_pipeline::DsdSourcePathway::Custom
+            dsd_export_level: (dsd_source_fields_available
+                && *format.dsd_pathway.selected_value()
+                    == tonepoet_pipeline::DsdSourcePathway::Custom
                 && *format.dsd_custom_reconstruction.selected_value()
                     == tonepoet_pipeline::DsdGeneralReconstruction::ReferenceProtected)
                 .then(|| match *format.dsd_custom_export_level.selected_value() {
@@ -441,19 +450,23 @@ impl TuiPreset {
                     tonepoet_pipeline::DsdGeneralExportLevel::ProtectedR64 => "protected".to_string(),
                     tonepoet_pipeline::DsdGeneralExportLevel::NativeWithOffset { .. } => "native".to_string(),
                 }),
-            dsd_gain: Some(format.dsd_gain_mode.selected_value().preset_key().to_string()),
-            dsd_gain_db: matches!(
-                *format.dsd_gain_mode.selected_value(),
-                DsdGainMode::FixedGain
-            )
-            .then(|| format.dsd_gain_db.render(false)),
-            dsd_true_peak_target_dbtp: (matches!(
+            dsd_gain: dsd_source_fields_available
+                .then(|| format.dsd_gain_mode.selected_value().preset_key().to_string()),
+            dsd_gain_db: (dsd_source_fields_available
+                && matches!(
+                    *format.dsd_gain_mode.selected_value(),
+                    DsdGainMode::FixedGain
+                ))
+                .then(|| format.dsd_gain_db.render(false)),
+            dsd_true_peak_target_dbtp: (dsd_source_fields_available
+                && matches!(
                     (*format.dsd_pathway.selected_value(), *format.dsd_gain_mode.selected_value()),
                     (tonepoet_pipeline::DsdSourcePathway::Custom, DsdGainMode::TruePeakGuard | DsdGainMode::TruePeakNormalize)
                         | (tonepoet_pipeline::DsdSourcePathway::Reference, DsdGainMode::ReferenceAuto)
                 ))
                 .then(|| format.dsd_true_peak_target_dbtp.render(false)),
-            dsd_true_peak_scope: (matches!(
+            dsd_true_peak_scope: (dsd_source_fields_available
+                && matches!(
                     (*format.dsd_pathway.selected_value(), *format.dsd_gain_mode.selected_value()),
                     (tonepoet_pipeline::DsdSourcePathway::Custom, DsdGainMode::TruePeakGuard | DsdGainMode::TruePeakNormalize)
                         | (tonepoet_pipeline::DsdSourcePathway::Reference, DsdGainMode::ReferenceAuto)
@@ -462,7 +475,8 @@ impl TuiPreset {
                     tonepoet_pipeline::TruePeakScope::Track => "track",
                     tonepoet_pipeline::TruePeakScope::Album => "album",
                 }.to_string()),
-            dsd_true_peak_scan: (matches!(
+            dsd_true_peak_scan: (dsd_source_fields_available
+                && matches!(
                     (*format.dsd_pathway.selected_value(), *format.dsd_gain_mode.selected_value()),
                     (tonepoet_pipeline::DsdSourcePathway::Custom, DsdGainMode::TruePeakGuard | DsdGainMode::TruePeakNormalize)
                         | (tonepoet_pipeline::DsdSourcePathway::Reference, DsdGainMode::ReferenceAuto)
@@ -565,8 +579,29 @@ impl TuiPreset {
 
             // DSD-source fields are meaningful only for an actual DSD-to-PCM
             // conversion. The strict v5 schema stores one explicit mode and
-            // never interprets retired auto/normalize/manual tokens.
-            if format_state.dsd_to_pcm_gain_available() {
+            // never interprets retired auto/normalize/manual tokens. A field
+            // present in the preset is never silently ignored: if the resolved
+            // source/path/mode makes it inapplicable, record a refusal so the
+            // caller can fail the preset application atomically.
+            let dsd_fields_present = [
+                ("dsd_path", self.dsd_path.is_some()),
+                ("dsd_reconstruction", self.dsd_reconstruction.is_some()),
+                ("dsd_lowpass", self.dsd_lowpass.is_some()),
+                ("dsd_profile", self.dsd_profile.is_some()),
+                ("dsd_export_level", self.dsd_export_level.is_some()),
+                ("dsd_gain", self.dsd_gain.is_some()),
+                ("dsd_gain_db", self.dsd_gain_db.is_some()),
+                ("dsd_true_peak_target_dbtp", self.dsd_true_peak_target_dbtp.is_some()),
+                ("dsd_true_peak_scope", self.dsd_true_peak_scope.is_some()),
+                ("dsd_true_peak_scan", self.dsd_true_peak_scan.is_some()),
+            ];
+            if !format_state.dsd_to_pcm_gain_available() {
+                for (field, present) in dsd_fields_present {
+                    if present {
+                        report.record(field, false);
+                    }
+                }
+            } else {
                 let gain_fields_present = self.dsd_gain.is_some()
                     || self.dsd_gain_db.is_some()
                     || self.dsd_true_peak_target_dbtp.is_some()
@@ -598,65 +633,75 @@ impl TuiPreset {
                     }
                 }
 
-                if *format_state.dsd_pathway.selected_value()
-                    == tonepoet_pipeline::DsdSourcePathway::Custom
-                {
-                    if let Some(raw) = self.dsd_reconstruction.as_deref() {
-                        let value = match raw {
-                            "native" => Some(tonepoet_pipeline::DsdGeneralReconstruction::General),
-                            "reference" => Some(tonepoet_pipeline::DsdGeneralReconstruction::ReferenceProtected),
-                            _ => None,
-                        };
-                        report.record(
-                            "dsd_reconstruction",
-                            value.is_some_and(|value| format_state.dsd_custom_reconstruction.select_value(&value)),
-                        );
+                let custom_path = *format_state.dsd_pathway.selected_value()
+                    == tonepoet_pipeline::DsdSourcePathway::Custom;
+                if let Some(raw) = self.dsd_reconstruction.as_deref() {
+                    let value = match raw {
+                        "native" => Some(tonepoet_pipeline::DsdGeneralReconstruction::General),
+                        "reference" => Some(tonepoet_pipeline::DsdGeneralReconstruction::ReferenceProtected),
+                        _ => None,
+                    };
+                    report.record(
+                        "dsd_reconstruction",
+                        custom_path
+                            && value.is_some_and(|value| {
+                                format_state.dsd_custom_reconstruction.select_value(&value)
+                            }),
+                    );
+                    if custom_path {
                         format_state.apply_format_constraints();
                     }
-                    if let Some(raw) = self.dsd_lowpass.as_deref() {
-                        let value = match raw {
-                            "auto" => Some(tonepoet_pipeline::enums::DsdLowpassMethod::Auto),
-                            "sox-ultra" => Some(tonepoet_pipeline::enums::DsdLowpassMethod::SoxUltra),
-                            "sinc" => Some(tonepoet_pipeline::enums::DsdLowpassMethod::Sinc),
-                            _ => None,
-                        };
-                        report.record(
-                            "dsd_lowpass",
-                            value.is_some_and(|value| format_state.dsd_custom_lowpass.select_value(&value)),
-                        );
-                    }
-                    if let Some(raw) = self.dsd_export_level.as_deref() {
-                        let value = match raw {
-                            "native" => Some(tonepoet_pipeline::DsdGeneralExportLevel::Native),
-                            "compensated" => Some(tonepoet_pipeline::DsdGeneralExportLevel::NominalCompensated),
-                            "protected" => Some(tonepoet_pipeline::DsdGeneralExportLevel::ProtectedR64),
-                            _ => None,
-                        };
-                        report.record(
-                            "dsd_export_level",
-                            value.is_some_and(|value| format_state.dsd_custom_export_level.select_value(&value)),
-                        );
-                    }
+                }
+                if let Some(raw) = self.dsd_lowpass.as_deref() {
+                    let value = match raw {
+                        "auto" => Some(tonepoet_pipeline::enums::DsdLowpassMethod::Auto),
+                        "sox-ultra" => Some(tonepoet_pipeline::enums::DsdLowpassMethod::SoxUltra),
+                        "sinc" => Some(tonepoet_pipeline::enums::DsdLowpassMethod::Sinc),
+                        _ => None,
+                    };
+                    report.record(
+                        "dsd_lowpass",
+                        custom_path
+                            && value.is_some_and(|value| {
+                                format_state.dsd_custom_lowpass.select_value(&value)
+                            }),
+                    );
+                }
+                if let Some(raw) = self.dsd_export_level.as_deref() {
+                    let value = match raw {
+                        "native" => Some(tonepoet_pipeline::DsdGeneralExportLevel::Native),
+                        "compensated" => Some(tonepoet_pipeline::DsdGeneralExportLevel::NominalCompensated),
+                        "protected" => Some(tonepoet_pipeline::DsdGeneralExportLevel::ProtectedR64),
+                        _ => None,
+                    };
+                    report.record(
+                        "dsd_export_level",
+                        custom_path
+                            && value.is_some_and(|value| {
+                                format_state.dsd_custom_export_level.select_value(&value)
+                            }),
+                    );
                 }
 
-                if *format_state.dsd_pathway.selected_value()
+                let profile_available = *format_state.dsd_pathway.selected_value()
                     == tonepoet_pipeline::DsdSourcePathway::Reference
                     || (*format_state.dsd_pathway.selected_value()
                         == tonepoet_pipeline::DsdSourcePathway::Custom
                         && *format_state.dsd_custom_reconstruction.selected_value()
-                            == tonepoet_pipeline::DsdGeneralReconstruction::ReferenceProtected)
-                {
-                    if let Some(raw_profile) = self.dsd_profile.as_deref() {
-                        let profile = match raw_profile {
-                            "reference" => Some(tonepoet_pipeline::DsdReconstructionSelection::Reference),
-                            "wideband" => Some(tonepoet_pipeline::DsdReconstructionSelection::Wideband),
-                            _ => None,
-                        };
-                        report.record(
-                            "dsd_profile",
-                            profile.is_some_and(|value| format_state.dsd_profile.select_value(&value)),
-                        );
-                    }
+                            == tonepoet_pipeline::DsdGeneralReconstruction::ReferenceProtected);
+                if let Some(raw_profile) = self.dsd_profile.as_deref() {
+                    let profile = match raw_profile {
+                        "reference" => Some(tonepoet_pipeline::DsdReconstructionSelection::Reference),
+                        "wideband" => Some(tonepoet_pipeline::DsdReconstructionSelection::Wideband),
+                        _ => None,
+                    };
+                    report.record(
+                        "dsd_profile",
+                        profile_available
+                            && profile.is_some_and(|value| {
+                                format_state.dsd_profile.select_value(&value)
+                            }),
+                    );
                 }
 
                 if let Some(raw_gain) = self.dsd_gain.as_deref() {
@@ -674,21 +719,24 @@ impl TuiPreset {
                     );
                 }
 
-                if let Some(raw) = self.dsd_gain_db.as_deref().filter(|_| {
-                        *format_state.dsd_pathway.selected_value()
-                    == tonepoet_pipeline::DsdSourcePathway::Custom
-                    && *format_state.dsd_gain_mode.selected_value() == DsdGainMode::FixedGain
-                    }) {
-                    match raw.parse::<tonepoet_pipeline::DbNano>() {
-                        Ok(value)
-                            if (tonepoet_pipeline::DbNano::MIN_FIXED_GAIN
-                                ..=tonepoet_pipeline::DbNano::MAX_FIXED_GAIN)
-                                .contains(&value) =>
-                        {
-                            format_state.dsd_gain_db = value;
-                            report.record("dsd_gain_db", true);
+                if let Some(raw) = self.dsd_gain_db.as_deref() {
+                    let fixed_gain_available = *format_state.dsd_pathway.selected_value()
+                        == tonepoet_pipeline::DsdSourcePathway::Custom
+                        && *format_state.dsd_gain_mode.selected_value() == DsdGainMode::FixedGain;
+                    if fixed_gain_available {
+                        match raw.parse::<tonepoet_pipeline::DbNano>() {
+                            Ok(value)
+                                if (tonepoet_pipeline::DbNano::MIN_FIXED_GAIN
+                                    ..=tonepoet_pipeline::DbNano::MAX_FIXED_GAIN)
+                                    .contains(&value) =>
+                            {
+                                format_state.dsd_gain_db = value;
+                                report.record("dsd_gain_db", true);
+                            }
+                            _ => report.record("dsd_gain_db", false),
                         }
-                        _ => report.record("dsd_gain_db", false),
+                    } else {
+                        report.record("dsd_gain_db", false);
                     }
                 }
                 let certified_true_peak_selected = matches!(
@@ -696,24 +744,24 @@ impl TuiPreset {
                     (tonepoet_pipeline::DsdSourcePathway::Custom, DsdGainMode::TruePeakGuard | DsdGainMode::TruePeakNormalize)
                         | (tonepoet_pipeline::DsdSourcePathway::Reference, DsdGainMode::ReferenceAuto)
                 );
-                if let Some(raw) = self.dsd_true_peak_target_dbtp.as_deref().filter(|_| {
-                        certified_true_peak_selected
-                    }) {
-                    match raw.parse::<tonepoet_pipeline::DbNano>() {
-                        Ok(value)
-                            if (tonepoet_pipeline::DbNano::MIN_NORMALIZE_TARGET
-                                ..=tonepoet_pipeline::DbNano::MAX_NORMALIZE_TARGET)
-                                .contains(&value) =>
-                        {
-                            format_state.dsd_true_peak_target_dbtp = value;
-                            report.record("dsd_true_peak_target_dbtp", true);
+                if let Some(raw) = self.dsd_true_peak_target_dbtp.as_deref() {
+                    if certified_true_peak_selected {
+                        match raw.parse::<tonepoet_pipeline::DbNano>() {
+                            Ok(value)
+                                if (tonepoet_pipeline::DbNano::MIN_NORMALIZE_TARGET
+                                    ..=tonepoet_pipeline::DbNano::MAX_NORMALIZE_TARGET)
+                                    .contains(&value) =>
+                            {
+                                format_state.dsd_true_peak_target_dbtp = value;
+                                report.record("dsd_true_peak_target_dbtp", true);
+                            }
+                            _ => report.record("dsd_true_peak_target_dbtp", false),
                         }
-                        _ => report.record("dsd_true_peak_target_dbtp", false),
+                    } else {
+                        report.record("dsd_true_peak_target_dbtp", false);
                     }
                 }
-                if let Some(raw_scope) = self.dsd_true_peak_scope.as_deref().filter(|_| {
-                        certified_true_peak_selected
-                    }) {
+                if let Some(raw_scope) = self.dsd_true_peak_scope.as_deref() {
                     let scope = match raw_scope {
                         "track" => Some(tonepoet_pipeline::TruePeakScope::Track),
                         "album" => Some(tonepoet_pipeline::TruePeakScope::Album),
@@ -721,12 +769,13 @@ impl TuiPreset {
                     };
                     report.record(
                         "dsd_true_peak_scope",
-                        scope.is_some_and(|value| format_state.dsd_true_peak_scope.select_value(&value)),
+                        certified_true_peak_selected
+                            && scope.is_some_and(|value| {
+                                format_state.dsd_true_peak_scope.select_value(&value)
+                            }),
                     );
                 }
-                if let Some(raw_scan) = self.dsd_true_peak_scan.as_deref().filter(|_| {
-                        certified_true_peak_selected
-                    }) {
+                if let Some(raw_scan) = self.dsd_true_peak_scan.as_deref() {
                     let scan = match raw_scan {
                         "fast066v2_reference" => Some(tonepoet_pipeline::TruePeakScanTier::Reference),
                         "fast066v2_standard" => Some(tonepoet_pipeline::TruePeakScanTier::Standard),
@@ -735,7 +784,10 @@ impl TuiPreset {
                     };
                     report.record(
                         "dsd_true_peak_scan",
-                        scan.is_some_and(|value| format_state.dsd_true_peak_scan_mode.select_value(&value)),
+                        certified_true_peak_selected
+                            && scan.is_some_and(|value| {
+                                format_state.dsd_true_peak_scan_mode.select_value(&value)
+                            }),
                     );
                 }
             }
@@ -2056,6 +2108,53 @@ merge = "multi-file"
         assert_eq!(first.refused_fields, vec!["output_target".to_string()]);
         assert_eq!(*first_format.format.selected_value(), AudioFormat::Dsf);
         assert_eq!(*second_format.format.selected_value(), AudioFormat::Dsf);
+    }
+
+    #[test]
+    fn saved_pcm_preset_omits_dsd_source_only_fields() {
+        let format = FormatState::new();
+        let output = OutputOptionsState::new();
+        let metadata = MetadataState::default();
+        let preset = TuiPreset::from_pill_state("pcm", &format, &output, &metadata);
+
+        assert!(preset.dsd_path.is_none());
+        assert!(preset.dsd_reconstruction.is_none());
+        assert!(preset.dsd_lowpass.is_none());
+        assert!(preset.dsd_profile.is_none());
+        assert!(preset.dsd_export_level.is_none());
+        assert!(preset.dsd_gain.is_none());
+        assert!(preset.dsd_gain_db.is_none());
+        assert!(preset.dsd_true_peak_target_dbtp.is_none());
+        assert!(preset.dsd_true_peak_scope.is_none());
+        assert!(preset.dsd_true_peak_scan.is_none());
+    }
+
+    #[test]
+    fn inapplicable_dsd_source_fields_are_refused_instead_of_skipped() {
+        let format = FormatState::new();
+        let output = OutputOptionsState::new();
+        let metadata = MetadataState::default();
+        let mut preset = TuiPreset::from_pill_state("invalid-dsd-context", &format, &output, &metadata);
+        preset.dsd_path = Some("reference".to_string());
+        preset.dsd_gain = Some("auto".to_string());
+        preset.dsd_true_peak_scope = Some("album".to_string());
+
+        let mut restored_format = FormatState::new();
+        let mut restored_output = OutputOptionsState::new();
+        let mut restored_metadata = MetadataState::default();
+        let report = preset.apply_to_pills(
+            &mut restored_format,
+            &mut restored_output,
+            &mut restored_metadata,
+        );
+
+        assert!(!report.is_complete());
+        assert!(report.refused_fields.iter().any(|field| field == "dsd_path"));
+        assert!(report.refused_fields.iter().any(|field| field == "dsd_gain"));
+        assert!(report
+            .refused_fields
+            .iter()
+            .any(|field| field == "dsd_true_peak_scope"));
     }
 
     #[test]

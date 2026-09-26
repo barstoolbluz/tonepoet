@@ -207,10 +207,43 @@ impl ReplayGainManifestBinding {
 /// serialized. The scalar album result is valid only for this exact manifest.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ReplayGainSourceScan {
+    /// Members whose per-track observations are carried by this value and may
+    /// be written by `apply_source_scan`.
     pub manifest: ReplayGainManifestBinding,
+    /// Full cohort that contributed to `album`. For ordinary/CUE scans this is
+    /// identical to `manifest`; an independent-file album batch may retain one
+    /// member's track observation while binding the shared album reduction to
+    /// the complete dispatcher-authored cohort.
+    pub album_manifest: ReplayGainManifestBinding,
     pub demand: MetricDemand,
     pub tracks: Vec<NativeObservationSummary>,
     pub album: Option<AlbumLoudnessSummary>,
+}
+
+impl ReplayGainSourceScan {
+    pub(crate) fn slice_for_members(&self, member_ids: &[String]) -> io::Result<Self> {
+        let manifest = ReplayGainManifestBinding::new(member_ids.to_vec())?;
+        let mut tracks = Vec::with_capacity(member_ids.len());
+        for member_id in member_ids {
+            let Some(track) = self
+                .tracks
+                .iter()
+                .find(|track| track.subject.participant == *member_id)
+            else {
+                return Err(invalid(format!(
+                    "ReplayGain batch scan has no observation for manifest member {member_id:?}"
+                )));
+            };
+            tracks.push(track.clone());
+        }
+        Ok(Self {
+            manifest,
+            album_manifest: self.album_manifest.clone(),
+            demand: self.demand,
+            tracks,
+            album: self.album.clone(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -551,6 +584,7 @@ pub(crate) fn measure_paths(
         None => None,
     };
     Ok(ReplayGainSourceScan {
+        album_manifest: manifest.clone(),
         manifest,
         demand,
         tracks: summaries,
@@ -1266,6 +1300,7 @@ pub(crate) fn reduce_cue_observations(
         .map(|builder| builder.finalize().map_err(|error| invalid(format!("CUE album finalization failed: {error}"))))
         .transpose()?;
     Ok(ReplayGainSourceScan {
+        album_manifest: manifest.clone(),
         manifest,
         demand,
         tracks: summaries,
@@ -1296,15 +1331,25 @@ pub(crate) fn apply_source_scan(
     for track in &scan.tracks {
         validate_retained_summary(track, scan.demand)?;
     }
+    if !scan
+        .manifest
+        .ordered_members
+        .iter()
+        .all(|member| scan.album_manifest.ordered_members.contains(member))
+    {
+        return Err(invalid(
+            "retained ReplayGain member manifest is not a subset of its album cohort",
+        ));
+    }
     if let Some(album) = scan.album.as_ref() {
         if album.profile != PRODUCTION_PROFILE
             || !album.metric_coverage.satisfies(scan.demand.native())
-            || album.track_count != scan.tracks.len()
+            || album.track_count != scan.album_manifest.ordered_members.len()
             || !album.reporting_peak_linear.is_finite()
             || album.reporting_peak_linear < 0.0
         {
             return Err(invalid(
-                "retained ReplayGain album envelope does not match the current native manifest/coverage",
+                "retained ReplayGain album envelope does not match the bound album cohort/coverage",
             ));
         }
     } else if matches!(

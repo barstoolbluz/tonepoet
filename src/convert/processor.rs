@@ -2327,6 +2327,33 @@ impl PendingDsdAlbumGainSubmission {
     }
 }
 
+type ReplayGainBatchReadyMember = (ScheduledAlbum, Vec<ScheduledTrackOutput>);
+
+struct PendingReplayGainAlbumBatch {
+    expected_items: usize,
+    completed_item_ids: BTreeSet<String>,
+    ready_members: BTreeMap<String, ReplayGainBatchReadyMember>,
+    failure: Option<String>,
+}
+
+impl PendingReplayGainAlbumBatch {
+    fn new(expected_items: usize) -> Self {
+        Self {
+            expected_items,
+            completed_item_ids: BTreeSet::new(),
+            ready_members: BTreeMap::new(),
+            failure: None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ReplayGainBatchPreflight {
+    item_to_batch: BTreeMap<String, String>,
+    expected_by_batch: BTreeMap<String, usize>,
+    failures: BTreeMap<String, String>,
+}
+
 enum QueueWorkOutput {
     Materialized {
         item_id: String,
@@ -2348,6 +2375,10 @@ enum QueueWorkOutput {
         job_id: String,
         outputs: Vec<ScheduledTrackOutput>,
         source_replaygain: Option<crate::convert::replaygain::ReplayGainSourceScan>,
+    },
+    ReplayGainBatchMeasured {
+        batch_id: String,
+        members: Vec<ReplayGainBatchReadyMember>,
     },
     PostProcessed {
         item_id: String,
@@ -2379,6 +2410,7 @@ struct SubmissionPump {
     album_gain_rerun: VecDeque<ScheduledAlbum>,
     album_fanout: VecDeque<String>,
     realized_encodes: VecDeque<(String, ScheduledRealizedTrack, CancellationToken)>,
+    replaygain_batch_measurement: VecDeque<(String, Vec<ReplayGainBatchReadyMember>)>,
     album_postprocess: VecDeque<(ScheduledAlbum, Vec<ScheduledTrackOutput>)>,
     #[cfg(test)]
     synthetic_fanout: VecDeque<SyntheticFanout>,
@@ -2400,6 +2432,7 @@ impl SubmissionPump {
             album_gain_rerun: VecDeque::new(),
             album_fanout: VecDeque::new(),
             realized_encodes: VecDeque::new(),
+            replaygain_batch_measurement: VecDeque::new(),
             album_postprocess: VecDeque::new(),
             #[cfg(test)]
             synthetic_fanout: VecDeque::new(),
@@ -2423,6 +2456,14 @@ impl SubmissionPump {
         job_cancel: CancellationToken,
     ) {
         self.realized_encodes.push_back((job_id, realized, job_cancel));
+    }
+
+    fn enqueue_replaygain_batch_measurement(
+        &mut self,
+        batch_id: String,
+        members: Vec<ReplayGainBatchReadyMember>,
+    ) {
+        self.replaygain_batch_measurement.push_back((batch_id, members));
     }
 
     fn enqueue_album_postprocess(
@@ -2564,6 +2605,14 @@ impl SubmissionPump {
         loop {
             if let Some(deferred) = self.deferred_unit.take() {
                 if !self.try_submit_unit(pool, deferred.unit, deferred.counted) {
+                    return;
+                }
+                continue;
+            }
+
+            if let Some((batch_id, members)) = self.replaygain_batch_measurement.pop_front() {
+                let unit = build_replaygain_batch_measurement_work(batch_id, members);
+                if !self.try_submit_unit(pool, unit, true) {
                     return;
                 }
                 continue;
@@ -2746,6 +2795,7 @@ impl SubmissionPump {
             .saturating_add(usize::from(self.deferred_unit.is_some()))
             .saturating_add(self.album_gain_rerun.len())
             .saturating_add(self.realized_encodes.len())
+            .saturating_add(self.replaygain_batch_measurement.len())
             .saturating_add(self.album_postprocess.len())
             .saturating_add(self.pending_album_source_units(pending_albums))
             .saturating_add(self.synthetic_fanout_backlog_depth())
@@ -2837,6 +2887,29 @@ fn requires_measure_then_gain_materialization(request: &PipelineRequest) -> bool
                 .album_batch
                 .as_ref()
                 .is_some_and(|batch| batch.expected_track_count > 1))
+}
+
+fn requests_dispatcher_album_replaygain(request: &PipelineRequest) -> bool {
+    request.album_batch.is_some()
+        && request.stages.replaygain == crate::convert::pipeline::StageRequirement::Enabled
+        && matches!(
+            request
+                .settings
+                .replay_gain
+                .mode
+                .unwrap_or(tonepoet_pipeline::ReplayGainMode::Both),
+            tonepoet_pipeline::ReplayGainMode::Album | tonepoet_pipeline::ReplayGainMode::Both
+        )
+}
+
+fn requires_dispatcher_album_replaygain_barrier(request: &PipelineRequest) -> bool {
+    // Album/Both ReplayGain needs encoded independent siblings to rendezvous
+    // at the scheduler barrier. A singleton needs no cross-item reduction.
+    requests_dispatcher_album_replaygain(request)
+        && request
+            .album_batch
+            .as_ref()
+            .is_some_and(|batch| batch.expected_track_count > 1)
 }
 
 #[derive(Default)]
@@ -2947,6 +3020,224 @@ fn preflight_dsd_album_gain_submissions(items: &[ConversionItem]) -> DsdAlbumGai
     }
 
     result
+}
+
+fn preflight_replaygain_album_batches(items: &[ConversionItem]) -> ReplayGainBatchPreflight {
+    let mut result = ReplayGainBatchPreflight::default();
+    let mut groups: BTreeMap<String, Vec<&ConversionItem>> = BTreeMap::new();
+
+    for item in items {
+        let Some(request) = item.pipeline_request.as_ref() else {
+            continue;
+        };
+        let Some(batch) = request.album_batch.as_ref() else {
+            continue;
+        };
+        groups
+            .entry(batch.conversion_log_batch_id.clone())
+            .or_default()
+            .push(item);
+    }
+
+    for (batch_id, members) in groups {
+        let album_replaygain_members = members
+            .iter()
+            .copied()
+            .filter(|item| {
+                item.pipeline_request
+                    .as_ref()
+                    .is_some_and(requests_dispatcher_album_replaygain)
+            })
+            .collect::<Vec<_>>();
+        if album_replaygain_members.is_empty() {
+            continue;
+        }
+
+        // Multi-track single-item sources already enter one album postprocess
+        // gate and therefore already reduce correctly. This barrier is only
+        // for dispatcher-split albums where one queue item represents one file.
+        let all_independent_single_files = members.iter().all(|item| {
+            item.pipeline_request
+                .as_ref()
+                .and_then(|request| detect_source_kind(request).ok())
+                == Some(SourceKind::SingleFile)
+        });
+        if !all_independent_single_files {
+            continue;
+        }
+
+        let failure = if album_replaygain_members.len() != members.len() {
+            Some(
+                "album ReplayGain batch has mixed ReplayGain policies; every independent member must participate in one album reduction"
+                    .to_string(),
+            )
+        } else {
+            let first_request = members[0]
+                .pipeline_request
+                .as_ref()
+                .expect("album-batch members retain prepared requests");
+            let expected = first_request
+                .album_batch
+                .as_ref()
+                .expect("grouped item retains album batch")
+                .expected_track_count;
+            let inconsistent_contract = members.iter().any(|item| {
+                let request = item
+                    .pipeline_request
+                    .as_ref()
+                    .expect("album-batch members retain prepared requests");
+                request
+                    .album_batch
+                    .as_ref()
+                    .is_none_or(|batch| {
+                        batch.expected_track_count != expected
+                            || batch.conversion_log_batch_id != batch_id
+                    })
+                    || request.album_batch_track.is_none()
+            });
+            if inconsistent_contract {
+                Some(
+                    "album ReplayGain batch has inconsistent dispatcher membership/order context"
+                        .to_string(),
+                )
+            } else if expected != members.len() {
+                Some(format!(
+                    "album ReplayGain requires the complete independent-file batch: {} queued member(s) are present but the dispatcher expects {}",
+                    members.len(), expected,
+                ))
+            } else {
+                None
+            }
+        };
+
+        if let Some(reason) = failure {
+            for item in album_replaygain_members {
+                result.failures.insert(item.id.clone(), reason.clone());
+            }
+            continue;
+        }
+
+        result.expected_by_batch.insert(batch_id.clone(), members.len());
+        for item in members {
+            result
+                .item_to_batch
+                .insert(item.id.clone(), batch_id.clone());
+        }
+    }
+
+    result
+}
+
+fn account_terminal_replaygain_batch_participants(
+    terminal: &BTreeMap<String, ConversionStatus>,
+    item_to_batch: &BTreeMap<String, String>,
+    pending: &mut BTreeMap<String, PendingReplayGainAlbumBatch>,
+) -> BTreeSet<String> {
+    let mut completed = BTreeSet::new();
+    for (item_id, status) in terminal {
+        let Some(batch_id) = item_to_batch.get(item_id) else {
+            continue;
+        };
+        let Some(state) = pending.get_mut(batch_id) else {
+            continue;
+        };
+        if state.completed_item_ids.insert(item_id.clone()) {
+            state.failure.get_or_insert_with(|| {
+                format!(
+                    "album ReplayGain participant {item_id} ended before the complete batch reached the post-encode reduction barrier: {status:?}"
+                )
+            });
+        }
+        if state.completed_item_ids.len() >= state.expected_items {
+            completed.insert(batch_id.clone());
+        }
+    }
+    completed
+}
+
+fn release_completed_replaygain_batch(
+    batch_id: &str,
+    pending: &mut BTreeMap<String, PendingReplayGainAlbumBatch>,
+    submissions: &mut SubmissionPump,
+    pool: &SharedWorkerPool<QueueWorkOutput>,
+) {
+    let Some(mut state) = pending.remove(batch_id) else {
+        return;
+    };
+    if state.completed_item_ids.len() < state.expected_items {
+        pending.insert(batch_id.to_string(), state);
+        return;
+    }
+
+    let mut members = state.ready_members.into_values().collect::<Vec<_>>();
+    members.sort_by_key(|(album, _)| {
+        album
+            .req
+            .album_batch_track
+            .as_ref()
+            .map(|track| track.source_ordinal)
+            .unwrap_or(u32::MAX)
+    });
+
+    if members.len() == state.expected_items && state.failure.is_none() {
+        pool.metrics().record_jobs_queued(1);
+        submissions.enqueue_replaygain_batch_measurement(batch_id.to_string(), members);
+        return;
+    }
+
+    let reason = state.failure.take().unwrap_or_else(|| {
+        format!(
+            "album ReplayGain batch reached the reduction barrier with {} ready member(s), expected {}",
+            members.len(), state.expected_items,
+        )
+    });
+    for (mut album, outputs) in members {
+        album.batch_replaygain = Some(Err(reason.clone()));
+        pool.metrics().record_jobs_queued(1);
+        submissions.enqueue_album_postprocess(album, outputs);
+    }
+}
+
+fn enqueue_album_postprocess_with_replaygain_barrier(
+    album: ScheduledAlbum,
+    outputs: Vec<ScheduledTrackOutput>,
+    item_to_batch: &BTreeMap<String, String>,
+    pending: &mut BTreeMap<String, PendingReplayGainAlbumBatch>,
+    submissions: &mut SubmissionPump,
+    pool: &SharedWorkerPool<QueueWorkOutput>,
+) {
+    let item_id = album.item_id.clone();
+    let Some(batch_id) = item_to_batch.get(&item_id) else {
+        pool.metrics().record_jobs_queued(1);
+        submissions.enqueue_album_postprocess(album, outputs);
+        return;
+    };
+    let Some(state) = pending.get_mut(batch_id) else {
+        // Preflight-created barrier state disappearing is an internal
+        // coordination failure. Fail closed rather than reverting to the
+        // one-item album reduction that caused #36.
+        let mut album = album;
+        album.batch_replaygain = Some(Err(format!(
+            "album ReplayGain barrier state for batch {batch_id} disappeared before post-processing"
+        )));
+        pool.metrics().record_jobs_queued(1);
+        submissions.enqueue_album_postprocess(album, outputs);
+        return;
+    };
+
+    if !state.completed_item_ids.insert(item_id.clone()) {
+        let mut album = album;
+        album.batch_replaygain = Some(Err(format!(
+            "album ReplayGain participant {item_id} reached the batch barrier more than once"
+        )));
+        pool.metrics().record_jobs_queued(1);
+        submissions.enqueue_album_postprocess(album, outputs);
+        return;
+    }
+    state.ready_members.insert(item_id, (album, outputs));
+    if state.completed_item_ids.len() >= state.expected_items {
+        release_completed_replaygain_batch(batch_id, pending, submissions, pool);
+    }
 }
 
 fn release_scheduled_album(
@@ -4225,9 +4516,11 @@ async fn run_queue_with_shared_orchestrator(
     );
     let total_items = queued_items.len();
     let album_gain_preflight = preflight_dsd_album_gain_submissions(&queued_items);
+    let replaygain_preflight = preflight_replaygain_album_batches(&queued_items);
     let invalid_item_ids = album_gain_preflight
         .failures
         .keys()
+        .chain(replaygain_preflight.failures.keys())
         .cloned()
         .collect::<BTreeSet<_>>();
     let queued_items = queued_items
@@ -4246,6 +4539,7 @@ async fn run_queue_with_shared_orchestrator(
     let mut terminal: BTreeMap<String, ConversionStatus> = album_gain_preflight
         .failures
         .iter()
+        .chain(replaygain_preflight.failures.iter())
         .map(|(item_id, error)| {
             (
                 item_id.clone(),
@@ -4273,6 +4567,14 @@ async fn run_queue_with_shared_orchestrator(
                 submission_id,
                 PendingDsdAlbumGainSubmission::new(expected, ordered_item_ids),
             )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let replaygain_batch_by_item = replaygain_preflight.item_to_batch;
+    let mut pending_replaygain_batches = replaygain_preflight
+        .expected_by_batch
+        .into_iter()
+        .map(|(batch_id, expected)| {
+            (batch_id, PendingReplayGainAlbumBatch::new(expected))
         })
         .collect::<BTreeMap<_, _>>();
     let mut job_to_item: BTreeMap<String, String> = BTreeMap::new();
@@ -4324,6 +4626,19 @@ async fn run_queue_with_shared_orchestrator(
                     &cancel,
                 );
             }
+        }
+        let completed_replaygain_batches = account_terminal_replaygain_batch_participants(
+            &terminal,
+            &replaygain_batch_by_item,
+            &mut pending_replaygain_batches,
+        );
+        for batch_id in completed_replaygain_batches {
+            release_completed_replaygain_batch(
+                &batch_id,
+                &mut pending_replaygain_batches,
+                &mut submissions,
+                &pool,
+            );
         }
         submissions.record_backlog(pool.metrics(), &pending_albums);
         if terminal.len() >= total_items {
@@ -4518,8 +4833,14 @@ async fn run_queue_with_shared_orchestrator(
                         }
 
                         if let Some((album, outputs)) = submit_postprocess {
-                            pool.metrics().record_jobs_queued(1);
-                            submissions.enqueue_album_postprocess(album, outputs);
+                            enqueue_album_postprocess_with_replaygain_barrier(
+                                album,
+                                outputs,
+                                &replaygain_batch_by_item,
+                                &mut pending_replaygain_batches,
+                                &mut submissions,
+                                &pool,
+                            );
                             submissions.record_backlog(pool.metrics(), &pending_albums);
                         }
                     }
@@ -4558,10 +4879,27 @@ async fn run_queue_with_shared_orchestrator(
                             }
                         }
                         if let Some((album, outputs)) = submit_postprocess {
-                            pool.metrics().record_jobs_queued(1);
-                            submissions.enqueue_album_postprocess(album, outputs);
+                            enqueue_album_postprocess_with_replaygain_barrier(
+                                album,
+                                outputs,
+                                &replaygain_batch_by_item,
+                                &mut pending_replaygain_batches,
+                                &mut submissions,
+                                &pool,
+                            );
                             submissions.record_backlog(pool.metrics(), &pending_albums);
                         }
+                    }
+                    Ok(QueueWorkOutput::ReplayGainBatchMeasured { batch_id, members }) => {
+                        log::debug!(
+                            "album ReplayGain batch {batch_id} measured; releasing {} member(s) to post-processing",
+                            members.len()
+                        );
+                        for (album, outputs) in members {
+                            pool.metrics().record_jobs_queued(1);
+                            submissions.enqueue_album_postprocess(album, outputs);
+                        }
+                        submissions.record_backlog(pool.metrics(), &pending_albums);
                     }
                     Ok(QueueWorkOutput::PostProcessed { item_id, status }) => {
                         if terminal.insert(item_id, status.clone()).is_none() {
@@ -4705,6 +5043,7 @@ fn build_initial_work(
 
     if matches!(source_kind, Some(SourceKind::SingleFile))
         && !requires_measure_then_gain_materialization(&request)
+        && !requires_dispatcher_album_replaygain_barrier(&request)
         && request.registered_effects.is_empty()
         && !has_embedded_chapters
     {
@@ -5229,6 +5568,111 @@ fn build_realized_encode_work(
                 }
             };
             Ok(QueueWorkOutput::Encoded { job_id, output })
+        }),
+    }
+}
+
+fn build_replaygain_batch_measurement_work(
+    batch_id: String,
+    mut members: Vec<ReplayGainBatchReadyMember>,
+) -> WorkUnit<QueueWorkOutput> {
+    members.sort_by_key(|(album, _)| {
+        album
+            .req
+            .album_batch_track
+            .as_ref()
+            .map(|track| track.source_ordinal)
+            .unwrap_or(u32::MAX)
+    });
+    let job_id = format!("replaygain-batch:{batch_id}");
+    let unit_id = format!("replaygain-batch-measure:{batch_id}");
+    WorkUnit {
+        job_id,
+        unit_id,
+        kind: WorkKind::PipelineItem,
+        task: boxed_work(move |_worker_cancel| async move {
+            let mut paths = Vec::with_capacity(members.len());
+            let mut member_ids = Vec::with_capacity(members.len());
+            let mut preflight_error = None;
+
+            for (album, outputs) in &members {
+                if outputs.len() != 1 {
+                    preflight_error = Some(format!(
+                        "album ReplayGain batch member {} produced {} scheduled outputs; independent-file batching requires exactly one",
+                        album.item_id,
+                        outputs.len(),
+                    ));
+                    break;
+                }
+                let output = &outputs[0];
+                if !output.ok {
+                    preflight_error = Some(format!(
+                        "album ReplayGain batch member {} failed conversion before album reduction",
+                        album.item_id,
+                    ));
+                    break;
+                }
+                let Some(artifact) = output.artifact.as_ref() else {
+                    preflight_error = Some(format!(
+                        "album ReplayGain batch member {} has no encoded artifact at the reduction barrier",
+                        album.item_id,
+                    ));
+                    break;
+                };
+                paths.push(artifact.staged_path.clone());
+                member_ids.push(crate::convert::pipeline::stages::replaygain_member_id(
+                    &artifact.track_id,
+                ));
+            }
+
+            let scan = if let Some(error) = preflight_error {
+                Err(error)
+            } else {
+                let paths_for_scan = paths.clone();
+                let member_ids_for_scan = member_ids.clone();
+                match tokio::task::spawn_blocking(move || {
+                    crate::convert::replaygain::measure_paths(
+                        &paths_for_scan,
+                        &member_ids_for_scan,
+                        tonepoet_pipeline::ReplayGainMode::Both,
+                        crate::convert::replaygain::MetricDemand::IntegratedOnly,
+                    )
+                    .map_err(|error| error.to_string())
+                })
+                .await
+                {
+                    Ok(scan) => scan,
+                    Err(error) => Err(format!(
+                        "album ReplayGain measurement worker failed: {error}"
+                    )),
+                }
+            };
+
+            match scan {
+                Ok(scan) => {
+                    for ((album, outputs), member_id) in
+                        members.iter_mut().zip(member_ids.iter())
+                    {
+                        match scan.slice_for_members(std::slice::from_ref(member_id)) {
+                            Ok(slice) => album.batch_replaygain = Some(Ok(slice)),
+                            Err(error) => {
+                                album.batch_replaygain = Some(Err(format!(
+                                    "album ReplayGain batch result could not be bound to {}: {error}",
+                                    album.item_id,
+                                )));
+                            }
+                        }
+                        debug_assert_eq!(outputs.len(), 1);
+                    }
+                }
+                Err(error) => {
+                    for (album, _) in &mut members {
+                        album.batch_replaygain = Some(Err(error.clone()));
+                    }
+                }
+            }
+
+            Ok(QueueWorkOutput::ReplayGainBatchMeasured { batch_id, members })
         }),
     }
 }
@@ -7263,6 +7707,57 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn write_processor_test_tone_wav(path: &std::path::Path, frames: u32, amplitude: i16) {
+        let channels = 2_u16;
+        let sample_rate = 44_100_u32;
+        let bits_per_sample = 16_u16;
+        let block_align = channels * (bits_per_sample / 8);
+        let byte_rate = sample_rate * u32::from(block_align);
+        let data_len = frames * u32::from(block_align);
+        let mut bytes = Vec::with_capacity(44 + data_len as usize);
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36_u32 + data_len).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&channels.to_le_bytes());
+        bytes.extend_from_slice(&sample_rate.to_le_bytes());
+        bytes.extend_from_slice(&byte_rate.to_le_bytes());
+        bytes.extend_from_slice(&block_align.to_le_bytes());
+        bytes.extend_from_slice(&bits_per_sample.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_len.to_le_bytes());
+        for frame in 0..frames {
+            let sample = if (frame / 64) % 2 == 0 { amplitude } else { -amplitude };
+            for _ in 0..channels {
+                bytes.extend_from_slice(&sample.to_le_bytes());
+            }
+        }
+        std::fs::write(path, bytes).expect("write processor tone WAV fixture");
+    }
+
+    #[cfg(unix)]
+    fn files_with_extension(root: &std::path::Path, extension: &str) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return found;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                found.extend(files_with_extension(&path, extension));
+            } else if path
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case(extension))
+            {
+                found.push(path);
+            }
+        }
+        found
+    }
+
+    #[cfg(unix)]
     fn find_file_named(root: &std::path::Path, name: &str) -> Option<PathBuf> {
         let entries = std::fs::read_dir(root).ok()?;
         for entry in entries.flatten() {
@@ -7376,6 +7871,135 @@ fi
             ]),
             log_path,
         )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn queued_independent_album_replaygain_reduces_across_all_members() {
+        use lofty::file::TaggedFileExt;
+        use lofty::tag::ItemKey;
+
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().expect("queued ReplayGain tempdir");
+        let album_root = temp.path().join("Artist").join("Album");
+        std::fs::create_dir_all(&album_root).expect("album source directory");
+        let loud = album_root.join("01 - Loud.wav");
+        let quiet = album_root.join("02 - Quiet.wav");
+        write_processor_test_tone_wav(&loud, 88_200, 12_000);
+        write_processor_test_tone_wav(&quiet, 88_200, 3_000);
+
+        let mut items = Vec::new();
+        for (id, input) in [("rg-loud", loud), ("rg-quiet", quiet)] {
+            let mut request = pipeline_request_for_processor_limit_test(temp.path());
+            request.item_id = id.to_string();
+            request.job_id = format!("job-{id}");
+            request.container = input;
+            request.output_root = temp.path().join("out");
+            request.naming.per_album_subdir = true;
+            request.log.write_json_log = false;
+            request.log.write_conversion_log = false;
+            request.settings.target_format = tonepoet_pipeline::AudioFormat::Wav;
+            request.settings.preferred_tool = tonepoet_pipeline::PreferredTool::Ffmpeg;
+            request.settings.force_encode = true;
+            request.settings.metadata.transfer_tags = false;
+            request.settings.metadata.preserve_artwork = false;
+            request.settings.replay_gain.mode = Some(tonepoet_pipeline::ReplayGainMode::Album);
+            request.stages.replaygain = StageRequirement::Enabled;
+
+            let mut item = conversion_item_with_pipeline_request(id, request);
+            item.output_format = crate::convert::formats::AudioFormat::Wav;
+            item.status = ConversionStatus::Queued;
+            items.push(item);
+        }
+
+        let (tool_paths, _tool_log) = synthetic_processor_fake_tools(temp.path());
+        let mut processor = ConversionProcessor::new(ProcessorConfig {
+            worker_count: 2,
+            tool_paths,
+            default_destination_directory: None,
+            scratch_directory: None,
+            scratch_memory_limit_percent: 0,
+        });
+        let registered_execution_items = Arc::new(Mutex::new(Vec::<String>::new()));
+        let registered_execution_items_for_hook = Arc::clone(&registered_execution_items);
+        processor.set_execution_acquisition_hook(move |item_id| {
+            let execution_id = uuid::Uuid::new_v4();
+            let queue_lease = Arc::new(crate::concurrency::PersistentLease::create(
+                crate::concurrency::LeaseFamily::QueueExecution { execution_id },
+                &[],
+            )?);
+            crate::concurrency::register_runtime_execution(
+                item_id,
+                execution_id,
+                queue_lease,
+                None,
+            )?;
+            registered_execution_items_for_hook
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(item_id.to_string());
+            Ok(())
+        });
+        let mut queue = ConversionQueue::new();
+        for item in items {
+            queue.items_mut().push_back(item);
+        }
+
+        let process_result = processor.process_queue(&mut queue).await;
+        let registered_execution_items = registered_execution_items
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        for item_id in registered_execution_items {
+            crate::concurrency::unregister_runtime_execution(&item_id);
+        }
+        process_result.expect("two-track queued album ReplayGain conversion");
+        assert_eq!(queue.failed_items(), 0);
+
+        let mut outputs = files_with_extension(&temp.path().join("out"), "wav");
+        outputs.sort();
+        assert_eq!(
+            outputs.len(),
+            2,
+            "one shared album batch must publish exactly its two WAV members: {outputs:?}"
+        );
+
+        let read_values = |path: &std::path::Path| {
+            let tagged = lofty::read_from_path(path).expect("read queued ReplayGain output tags");
+            let find = |key: ItemKey| {
+                tagged
+                    .tags()
+                    .iter()
+                    .find_map(|tag| tag.get_string(&key))
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| panic!("missing {key:?} on {}", path.display()))
+            };
+            (
+                find(ItemKey::ReplayGainTrackGain),
+                find(ItemKey::ReplayGainTrackPeak),
+                find(ItemKey::ReplayGainAlbumGain),
+                find(ItemKey::ReplayGainAlbumPeak),
+            )
+        };
+        let loud_tags = read_values(&outputs[0]);
+        let quiet_tags = read_values(&outputs[1]);
+
+        assert_ne!(
+            loud_tags.0, quiet_tags.0,
+            "different-amplitude tracks must retain independent track gains"
+        );
+        assert_ne!(
+            loud_tags.1, quiet_tags.1,
+            "different-amplitude tracks must retain independent track peaks"
+        );
+        assert_eq!(
+            loud_tags.2, quiet_tags.2,
+            "every member of one queued album must receive the same album gain"
+        );
+        assert_eq!(
+            loud_tags.3, quiet_tags.3,
+            "every member of one queued album must receive the same album peak"
+        );
     }
 
     #[cfg(unix)]
@@ -10993,6 +11617,76 @@ FILE "disc2.flac" WAVE
         assert_eq!(work.kind, WorkKind::SingleFile);
         assert_eq!(work.job_id, "prepared-job-01");
         assert_eq!(job_to_item.get("prepared-job-01").map(String::as_str), Some("item-01"));
+        assert!(terminal.is_empty());
+    }
+
+    #[test]
+    fn album_replaygain_batch_routes_single_files_through_scheduler_barrier_path() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_root = temp.path().join("Artist").join("Album");
+        std::fs::create_dir_all(&album_root).expect("album dir");
+        let track_01 = album_root.join("01 - First.flac");
+        let track_02 = album_root.join("02 - Second.flac");
+        std::fs::write(&track_01, b"not real audio; dispatch test only").expect("track 1 file");
+        std::fs::write(&track_02, b"not real audio; dispatch test only").expect("track 2 file");
+
+        let mut req_01 = processor_dispatch_request_for_path(
+            temp.path(),
+            "item-01",
+            "album-rg-job-01",
+            track_01,
+        );
+        let mut req_02 = processor_dispatch_request_for_path(
+            temp.path(),
+            "item-02",
+            "album-rg-job-02",
+            track_02,
+        );
+        for request in [&mut req_01, &mut req_02] {
+            request.stages.replaygain = StageRequirement::Enabled;
+            request.settings.replay_gain.mode = Some(tonepoet_pipeline::ReplayGainMode::Album);
+        }
+        let mut items = vec![
+            conversion_item_with_pipeline_request("item-01", req_01),
+            conversion_item_with_pipeline_request("item-02", req_02),
+        ];
+        prepare_album_batches_for_queued_independent_single_file_jobs(&mut items);
+
+        let first_request = items[0]
+            .pipeline_request
+            .as_ref()
+            .expect("prepared album ReplayGain request");
+        assert!(requires_dispatcher_album_replaygain_barrier(first_request));
+
+        let pool = SharedWorkerPool::<QueueWorkOutput>::new_with_limits(
+            Some(1),
+            CancellationToken::new(),
+            PoolLimits::default(),
+        );
+        let mut terminal = BTreeMap::new();
+        let mut job_to_item = BTreeMap::new();
+        let tool_paths = HashMap::new();
+        let (progress_tx, _progress_rx) = broadcast::channel(4);
+        let work = build_initial_work(
+            items[0].clone(),
+            &pool,
+            &mut terminal,
+            &mut job_to_item,
+            &tool_paths,
+            Arc::new(Mutex::new(HashMap::new())),
+            &progress_tx,
+            None,
+            2,
+            Arc::new(ToolConcurrencyLimits::new(1, 1, 1, 1)),
+            None,
+        )
+        .expect("album ReplayGain single-file item produces scheduler work");
+
+        assert_eq!(
+            work.kind,
+            WorkKind::MaterializeItem,
+            "dispatcher-split Album/Both ReplayGain members must bypass the direct single-file executor so they can reach the shared post-encode barrier"
+        );
         assert!(terminal.is_empty());
     }
 

@@ -996,7 +996,12 @@ fn build_ffmpeg_encode_pcm(
         step.input.clone(),
         step.output.clone(),
         context.request.source.duration,
-        step.description.clone(),
+        ffmpeg_description_with_artwork_normalization(
+            step.description.clone(),
+            context.request.settings.metadata.preserve_artwork
+                && format_supports_artwork(target_format),
+            target_format,
+        ),
     )
     .with_metadata_effect(ffmpeg_encode_metadata_effect(context, step, target_format)))
 }
@@ -1138,7 +1143,12 @@ fn build_ffmpeg_encode_lossy(
         step.input.clone(),
         step.output.clone(),
         context.request.source.duration,
-        step.description.clone(),
+        ffmpeg_description_with_artwork_normalization(
+            step.description.clone(),
+            context.request.settings.metadata.preserve_artwork
+                && format_supports_artwork(target_format),
+            target_format,
+        ),
     )
     .with_metadata_effect(ffmpeg_encode_metadata_effect(context, step, target_format)))
 }
@@ -1324,6 +1334,11 @@ pub fn build_ffmpeg_source_metadata_transfer_command(
         &container_extension.trim_start_matches('.').to_ascii_lowercase(),
         target_format,
     )?;
+    let description = ffmpeg_description_with_artwork_normalization(
+        description.into(),
+        preserve_artwork,
+        target_format,
+    );
 
     let mut args = vec![
         "-y".into(),
@@ -1351,7 +1366,9 @@ pub fn build_ffmpeg_source_metadata_transfer_command(
         args.push("-map".into());
         args.push("1:v?".into());
         args.push("-c:v".into());
-        args.push("copy".into());
+        args.push("png".into());
+        args.push("-disposition:v".into());
+        args.push("attached_pic".into());
     } else {
         args.push("-vn".into());
     }
@@ -1748,6 +1765,20 @@ fn add_ffmpeg_container_format_args(args: &mut Vec<String>, target_format: &Audi
     }
 }
 
+fn ffmpeg_description_with_artwork_normalization(
+    description: String,
+    normalize_artwork: bool,
+    target_format: &AudioFormat,
+) -> String {
+    if normalize_artwork {
+        format!(
+            "{description}; normalize embedded artwork to PNG for {target_format} container compatibility"
+        )
+    } else {
+        description
+    }
+}
+
 fn add_ffmpeg_metadata_args(
     context: &PlanContext<'_>,
     args: &mut Vec<String>,
@@ -1765,7 +1796,9 @@ fn add_ffmpeg_metadata_args(
         args.push("-map".into());
         args.push("0:v?".into());
         args.push("-c:v".into());
-        args.push("copy".into());
+        args.push("png".into());
+        args.push("-disposition:v".into());
+        args.push("attached_pic".into());
     } else {
         args.push("-vn".into());
     }
@@ -4373,6 +4406,17 @@ mod tests {
                 ..MetadataPlanEffect::none()
             }
         );
+        assert!(command.args.windows(2).any(|window| {
+            window[0] == "-c:v" && window[1] == "png"
+        }));
+        assert!(command.args.windows(2).any(|window| {
+            window[0] == "-disposition:v" && window[1] == "attached_pic"
+        }));
+        assert!(
+            command.description.contains("normalize embedded artwork to PNG"),
+            "metadata rewrite log description must disclose artwork normalization: {}",
+            command.description,
+        );
     }
 
     #[test]
@@ -4467,6 +4511,13 @@ mod tests {
             MetadataDisposition::WritesRequestedPolicy,
             "an FFmpeg encode can make a later MetadataTransfer redundant only when it reads the original request input"
         );
+        assert!(command.args.windows(2).any(|window| {
+            window[0] == "-c:v" && window[1] == "png"
+        }));
+        assert!(command.args.windows(2).any(|window| {
+            window[0] == "-disposition:v" && window[1] == "attached_pic"
+        }));
+        assert!(command.description.contains("normalize embedded artwork to PNG"));
     }
 
     #[test]
@@ -4532,6 +4583,13 @@ mod tests {
             MetadataDisposition::DoesNotWrite,
             "preserving metadata from an intermediate input must not prune an explicit original-source MetadataTransfer step"
         );
+        assert!(command.args.windows(2).any(|window| {
+            window[0] == "-c:v" && window[1] == "png"
+        }));
+        assert!(command.args.windows(2).any(|window| {
+            window[0] == "-disposition:v" && window[1] == "attached_pic"
+        }));
+        assert!(command.description.contains("normalize embedded artwork to PNG"));
     }
 
     #[test]

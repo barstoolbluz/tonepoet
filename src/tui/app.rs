@@ -2190,6 +2190,14 @@ impl fmt::Debug for PendingBrowseConvertExpansion {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingBrowseConvertPresetContinuation {
+    pub generation: u64,
+    pub path: PathBuf,
+    pub preset: String,
+    pub post_load: crate::tui::command::BrowseConvertPostLoad,
+}
+
 impl PendingBrowseConvertExpansion {
     pub fn matches(
         &self,
@@ -3526,6 +3534,53 @@ mod clamp_pill_tests {
 
         assert!(!format.dither_overridden);
         assert_eq!(*format.dither.selected_value(), DitherType::None);
+    }
+
+    #[test]
+    fn int32_dither_options_match_the_planners_commissioned_terminal() {
+        use super::{BitDepthChoice, DitherType};
+
+        let mut format = FormatState::new();
+        format.bit_depth.select_value(&BitDepthChoice::Int32);
+        format.apply_format_constraints();
+
+        let enabled = |dither| {
+            format
+                .dither
+                .options
+                .iter()
+                .find(|option| option.value == dither)
+                .map(|option| option.enabled)
+                .expect("dither option")
+        };
+        assert!(enabled(DitherType::None));
+        assert_eq!(
+            enabled(DitherType::TPDF),
+            tonepoet_pipeline::ffmpeg_int32_triangular_terminal_commissioned_for_current_arch(),
+        );
+        for dither in [
+            DitherType::Shibata,
+            DitherType::LowShibata,
+            DitherType::HighShibata,
+            DitherType::Gesemann,
+            DitherType::Lipshitz,
+        ] {
+            assert!(!enabled(dither), "{dither:?} has no qualified Int32 terminal");
+        }
+    }
+
+    #[test]
+    fn unqualified_int32_dither_selection_is_clamped_before_submission() {
+        use super::{BitDepthChoice, DitherType};
+
+        let mut format = FormatState::new();
+        format.bit_depth.select_value(&BitDepthChoice::Int32);
+        format.dither.select_value(&DitherType::Shibata);
+        format.dither_overridden = true;
+        format.apply_format_constraints();
+
+        assert_eq!(*format.dither.selected_value(), DitherType::None);
+        assert!(!format.dither_overridden);
     }
 
     #[test]
@@ -6039,6 +6094,27 @@ impl FormatState {
                         opt.enabled = false;
                     }
                 }
+            }
+        }
+
+        // Int32 dither has a deliberately narrow physical authority. Ordinary
+        // SoX/SSRC Int32 dither is not behavior-qualified, and the only
+        // FFmpeg terminal admitted by the planner is plain triangular (TPDF)
+        // on an architecture whose exact closure has been commissioned. Keep
+        // the interactive surface inside that same admissible set rather than
+        // allowing a selection that can only fail at planning time. Reference
+        // owns its terminal dither separately and its generic dither row is
+        // already disabled above.
+        if !reference_selected && *self.bit_depth.selected_value() == BitDepthChoice::Int32 {
+            self.dither.set_all_enabled(false);
+            self.dither.set_enabled(&DitherType::None, true);
+            self.dither.set_enabled(
+                &DitherType::TPDF,
+                tonepoet_pipeline::ffmpeg_int32_triangular_terminal_commissioned_for_current_arch(),
+            );
+            if !self.dither.options[self.dither.selected].enabled {
+                self.dither.select_value(&DitherType::None);
+                self.dither_overridden = false;
             }
         }
 
@@ -13953,6 +14029,10 @@ pub struct AppState {
     /// New source/queue requests cancel and replace this handle; completion
     /// reducers accept only the matching generation and request snapshot.
     pub pending_browse_convert_expansion: Option<PendingBrowseConvertExpansion>,
+    /// Context-menu preset application deferred until the async source probe
+    /// resolves the source-relative DSD/PCM constraints. Generation and path
+    /// bind the continuation to the exact source transition that created it.
+    pub pending_browse_convert_preset_continuation: Option<PendingBrowseConvertPresetContinuation>,
     /// Session-persistent advanced CUE choices keyed by folder. Normal quiet
     /// auto-selection remains the default for folders with no override.
     pub cue_selection_overrides: crate::convert::queue_expansion::QueueCueSelectionOverrides,
@@ -15183,6 +15263,7 @@ impl AppState {
             probe_generation: 0,
             tui_tx: None,
             pending_browse_convert_expansion: None,
+            pending_browse_convert_preset_continuation: None,
             cue_selection_overrides: crate::convert::queue_expansion::QueueCueSelectionOverrides::new(),
             browse_cue_inspection_generation: 0,
             preset: PresetState::default(),
@@ -16106,6 +16187,55 @@ impl AppState {
     pub fn set_status(&mut self, msg: impl Into<String>) {
         let msg = msg.into();
         if msg.contains("filesystem mutation conflicts with recovery reservation") {
+            if let Some(execution_id) = msg
+                .split_once("; queue execution ")
+                .and_then(|(_, suffix)| suffix.split_whitespace().next())
+                .and_then(|value| uuid::Uuid::parse_str(value).ok())
+            {
+                match self.db.queue_item_for_execution(execution_id) {
+                    Ok(Some(item)) => {
+                        let source = item
+                            .input_path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| item.input_path.display().to_string());
+                        let text = if matches!(item.status, crate::convert::ConversionStatus::Interrupted) {
+                            format!(
+                                "Output is reserved by interrupted conversion '{}' (queue item {}); open Queue and choose Retry or remove the item to release the reservation",
+                                source, item.id,
+                            )
+                        } else {
+                            format!(
+                                "Output is reserved by conversion '{}' (queue item {}) while its ended execution is being recovered; open Queue, then Retry or remove it after it becomes Interrupted",
+                                source, item.id,
+                            )
+                        };
+                        self.status_message = Some((text, std::time::Instant::now()));
+                        return;
+                    }
+                    Ok(None) => {
+                        self.status_message = Some((
+                            format!(
+                                "Output is reserved by queue execution {execution_id} while recovery is incomplete; open Queue and retry after the interrupted item appears"
+                            ),
+                            std::time::Instant::now(),
+                        ));
+                        return;
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "could not resolve queue execution {execution_id} for recovery-conflict status: {error}"
+                        );
+                        self.status_message = Some((
+                            format!(
+                                "Output is reserved by queue execution {execution_id} while recovery is incomplete; open Queue and retry after the interrupted item appears"
+                            ),
+                            std::time::Instant::now(),
+                        ));
+                        return;
+                    }
+                }
+            }
             let _ = crate::tui::recovery_ui::intercept_recovery_conflict_status(self, &msg);
             self.status_message = Some((
                 "That file change is blocked by an unresolved copy or move; review recovery details before changing the overlapping path".to_string(),

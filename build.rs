@@ -1,20 +1,16 @@
 mod build_native_mlp_decoder;
+mod reference_source_lock;
 
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 fn hash_source_files(paths: &[&str]) -> String {
-    let mut hasher = Sha256::new();
-    for path in paths {
-        let bytes = std::fs::read(path)
-            .unwrap_or_else(|error| panic!("could not read Reference closure source {path}: {error}"));
-        hasher.update((path.len() as u64).to_be_bytes());
-        hasher.update(path.as_bytes());
-        hasher.update((bytes.len() as u64).to_be_bytes());
-        hasher.update(bytes);
+    reference_source_lock::hash_reference_source_files_with_reader(paths, |path| {
+        let bytes = std::fs::read(path)?;
         println!("cargo:rerun-if-changed={path}");
-    }
-    format!("{:x}", hasher.finalize())
+        Ok(bytes)
+    })
+    .unwrap_or_else(|error| panic!("could not hash Reference closure sources: {error}"))
 }
 
 fn collect_tree_files(root: &str) -> Vec<PathBuf> {
@@ -103,28 +99,8 @@ fn main() {
     // the shipping Reference path. Keep this set intentionally narrow: it is
     // the common planner/executor/readers/package/metadata/check ownership
     // surface, not an unrelated whole-workspace cache key.
-    let reference_common_source_sha256 = hash_source_files(&[
-        "Cargo.toml",
-        "Cargo.lock",
-        "build.rs",
-        "tonepoet-pipeline/Cargo.toml",
-        "tonepoet-pipeline/src/semantic_plan.rs",
-        "tonepoet-pipeline/src/dsd_reference.rs",
-        "tonepoet-pipeline/src/dsd_album_gain.rs",
-        "tonepoet-pipeline/src/plan.rs",
-        "tonepoet-pipeline/src/settings.rs",
-        "tonepoet-pipeline/src/enums.rs",
-        "tonepoet-pipeline/src/source.rs",
-        "tonepoet-pipeline/src/tools.rs",
-        "tonepoet-pipeline/src/fingerprint.rs",
-        "tonepoet-pipeline/src/qualification_schema.rs",
-        "tonepoet-pipeline/src/w64.rs",
-        "src/convert/pipeline/plan_bridge.rs",
-        "src/convert/pipeline/track_executor.rs",
-        "src/convert/pipeline/stages.rs",
-        "src/convert/pipeline/manifest_builder.rs",
-        "src/convert/replaygain.rs",
-    ]);
+    let reference_common_source_sha256 =
+        hash_source_files(reference_source_lock::REFERENCE_COMMON_SOURCE_PATHS);
     println!(
         "cargo:rustc-env=TONEPOET_REFERENCE_COMMON_SOURCE_SHA256={reference_common_source_sha256}"
     );
