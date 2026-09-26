@@ -3104,3 +3104,65 @@ carried into the per-track command list.
 The conversion log lists every external command that produced a track, in order,
 including the true-peak preparation stage's resampler and carrier steps, with the same
 timing and exit fields as the encode commands.
+
+## 48. SSRC's dither and noise shaping are not commissioned inside the certified true-peak chain
+
+Filed 2026-09-26 from the Journey Greatest Hits conversion (176.4 kHz / 32-bit FLAC to
+88.2 kHz / 24-bit FLAC, SSRC selected, PCM true-peak gain on). The user's requirement,
+stated before this filing and restated now: when SSRC is the selected resampler, SSRC does
+the resampling and the dither and noise shaping of the output, whether or not the certified
+true-peak gain stage is in play.
+
+### What happens today
+
+On the direct route (no true-peak stage) SSRC resamples and dithers; its dither ids are
+mapped per target rate in `tonepoet-pipeline/src/mapping.rs` (`ssrc_dither_selection_for_rate`).
+With PCM or DSD true-peak gain on, the chain is measure-then-gain: SSRC is commissioned only
+as a Binary64-preserving resampler (`tonepoet-pipeline/src/ssrc_binary64.rs`, 42 rate pairs)
+producing a Float64 carrier; the terminal quantization is the commissioned SoX quantizer with
+TPDF dither (or the FFmpeg Int32 triangular terminal). The selected dither is overridden and
+the log says "Dither: yes (TPDF via SoX)". SSRC's noise shaping is unreachable on any
+conversion that uses true-peak gain.
+
+### Required
+
+With SSRC selected, the certified chain's terminal is SSRC: resample, gain, dither and noise
+shaping performed by SSRC, with the same certified terminal error bounds the SoX and FFmpeg
+terminals carry, so the hard-ceiling guarantee holds unchanged. The user's dither selection
+is honoured on this route, the log names the tool that dithered and the shaping used, and
+the qualification evidence for the new terminal is execution evidence from this machine.
+
+## 49. The conversion log buries the essential facts under useless ones
+
+Filed 2026-09-26 from the same Journey conversion log: 292 lines for 16 tracks, longest
+line 702 characters, 48 lines that are nothing but staging paths. Issue #47 records the
+specific omission (the preparation stage's commands, so the SSRC step is invisible); this
+issue is the log as a whole.
+
+### What the log spends its lines on
+
+- Three path-only lines per track (`Source ref`, `Realized input`, `Output file`), each a
+  200-plus character `.tonepoet-staging/job-<uuid>-<uuid>/...` path that no longer exists
+  when the log is read.
+- The per-track measured true peak, the target, and the gain applied do exist, but only
+  inside the `Source ref` line, after the staging path, as `point -4.147972000; gain
+  -0.000003809`. Nothing labels them.
+- A `Timing scope:` paragraph of boilerplate at the end of every log.
+- Settings restated per track in prose ("Conversion: 32-bit/176.4kHz FLAC → 24-bit/88.2kHz
+  FLAC (SSRC resampling, TPDF dither)") that names the wrong tool for the dither's route
+  and omits the resampler command entirely.
+
+### What it does not say
+
+Per track: which tools ran, in order, with what they did (resample, measure, gain,
+quantize, dither, encode); the measured true peak and the gain actually applied, as
+labelled fields; whether the gain stage changed the audio at all; the ReplayGain values
+written. Per album: the album gain and peak and which tracks set them.
+
+### Required
+
+A conversion log a person reads to learn what happened. Every step that touched the audio
+appears once, in order, with its tool, its purpose, and its numbers; the measured peaks,
+targets, gains and ReplayGain values are labelled fields; staging paths, internal
+identifiers, and boilerplate are absent or confined to a trailing diagnostic section. The
+user is the reader; a log the user calls a trainwreck is failing its only job.
