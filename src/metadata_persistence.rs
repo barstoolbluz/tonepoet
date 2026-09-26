@@ -11,6 +11,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use lofty::file::TaggedFileExt;
+use lofty::picture::PictureType;
 use lofty::tag::{ItemKey, TagType};
 
 const FLAC_MAGIC: &[u8; 4] = b"fLaC";
@@ -195,7 +196,10 @@ pub(crate) const APE_SIGNATURE: &[u8; 8] = b"APETAGEX";
 pub(crate) const APE_DESCRIPTOR_LEN: usize = 32;
 pub(crate) const APE_VERSION_2: u32 = 2_000;
 pub(crate) const APE_FLAG_HEADER_PRESENT: u32 = 1 << 31;
+pub(crate) const APE_FLAG_FOOTER_PRESENT: u32 = 1 << 30;
 pub(crate) const APE_FLAG_IS_HEADER: u32 = 1 << 29;
+const APE_DESCRIPTOR_DEFINED_FLAG_MASK: u32 =
+    APE_FLAG_HEADER_PRESENT | APE_FLAG_FOOTER_PRESENT | APE_FLAG_IS_HEADER;
 pub(crate) const APE_ITEM_READ_ONLY: u32 = 1;
 pub(crate) const APE_ITEM_TYPE_MASK: u32 = 0b110;
 pub(crate) const APE_ITEM_TYPE_TEXT: u32 = 0;
@@ -230,6 +234,10 @@ pub(crate) struct NativeApeTag {
     pub(crate) footer_end: u64,
     pub(crate) had_header: bool,
     pub(crate) items: Vec<NativeApeItem>,
+    /// Non-fatal descriptor defects repaired by the bounded native reader.
+    /// Item bounds/counts still have to validate exactly before these repairs
+    /// are admitted.
+    pub(crate) repair_warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -245,27 +253,41 @@ pub(crate) struct NeutralApeRow {
 pub(crate) struct NeutralApeWarning {
     pub(crate) path: std::path::PathBuf,
     pub(crate) escaped_keys: Vec<String>,
+    pub(crate) repairs: Vec<String>,
 }
 
 impl NeutralApeWarning {
     pub(crate) fn message(&self) -> String {
-        format!(
-            "{} invalid APE key{} skipped in '{}': {}",
-            self.escaped_keys.len(),
-            if self.escaped_keys.len() == 1 { "" } else { "s" },
-            self.path.display(),
-            self.escaped_keys
-                .iter()
-                .map(|key| format!("'{key}'"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
+        let mut messages = Vec::new();
+        if !self.escaped_keys.is_empty() {
+            messages.push(format!(
+                "{} invalid APE key{} skipped in '{}': {}",
+                self.escaped_keys.len(),
+                if self.escaped_keys.len() == 1 { "" } else { "s" },
+                self.path.display(),
+                self.escaped_keys
+                    .iter()
+                    .map(|key| format!("'{key}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        messages.extend(self.repairs.iter().cloned());
+        messages.join("; ")
     }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct NeutralApeArtwork {
+    pub(crate) picture_type: PictureType,
+    pub(crate) mime_type: String,
+    pub(crate) data: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct NeutralApeReadOutcome {
     pub(crate) rows: Vec<NeutralApeRow>,
+    pub(crate) artwork: Vec<NeutralApeArtwork>,
     pub(crate) warning: Option<NeutralApeWarning>,
 }
 
@@ -299,6 +321,26 @@ pub(crate) fn native_ape_error_is_eligible(err: &lofty::error::LoftyError) -> bo
                 Some(lofty::file::FileType::Ape | lofty::file::FileType::Mpc)
             )
     )
+}
+
+
+fn carrier_has_monkeys_audio_magic(path: &Path) -> bool {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut magic = [0_u8; 4];
+    file.read_exact(&mut magic).is_ok() && &magic == b"MAC "
+}
+
+/// Admit the shared bounded APEv2 fallback when Lofty identified the carrier
+/// as APE/Musepack, or when the carrier itself proves Monkey's Audio despite a
+/// misleading filename extension. The latter case is important for diagnosing
+/// and repairing legacy outputs that were accidentally published as `.flac`.
+pub(crate) fn native_ape_fallback_is_eligible(
+    path: &Path,
+    err: &lofty::error::LoftyError,
+) -> bool {
+    native_ape_error_is_eligible(err) || carrier_has_monkeys_audio_magic(path)
 }
 
 pub(crate) fn ape_key_is_valid(key: &[u8]) -> bool {
@@ -382,6 +424,26 @@ pub(crate) fn read_native_ape_tag(path: &Path) -> Result<Option<NativeApeTag>, S
     let tag_size = u64::from(u32_le_at(&footer, 12)?);
     let item_count = u32_le_at(&footer, 16)?;
     let footer_flags = u32_le_at(&footer, 20)?;
+    let mut repair_warnings = Vec::new();
+    let reserved_flag_bits = footer_flags & !APE_DESCRIPTOR_DEFINED_FLAG_MASK;
+    if reserved_flag_bits != 0 {
+        repair_warnings.push(format!(
+            "APEv2 footer in '{}' sets reserved flag bits 0x{reserved_flag_bits:08x}; accepted because the bounded item table is structurally exact",
+            path.display()
+        ));
+    }
+    if footer_flags & APE_FLAG_IS_HEADER != 0 {
+        repair_warnings.push(format!(
+            "APEv2 footer in '{}' is incorrectly marked as a header; treated as a footer",
+            path.display()
+        ));
+    }
+    if footer[24..32].iter().any(|byte| *byte != 0) {
+        repair_warnings.push(format!(
+            "APEv2 footer in '{}' has non-zero reserved bytes; accepted because the bounded item table is structurally exact",
+            path.display()
+        ));
+    }
     if tag_size < APE_DESCRIPTOR_LEN as u64
         || tag_size > MAX_NATIVE_APE_TAG_BYTES
         || tag_size > footer_end
@@ -400,31 +462,41 @@ pub(crate) fn read_native_ape_tag(path: &Path) -> Result<Option<NativeApeTag>, S
 
     let items_start = footer_end - tag_size;
     let items_len = tag_size - APE_DESCRIPTOR_LEN as u64;
-    let had_header = footer_flags & APE_FLAG_HEADER_PRESENT != 0;
-    let replace_start = if had_header {
-        if items_start < APE_DESCRIPTOR_LEN as u64 {
-            return Err(format!("APEv2 header underflows file start in '{}'", path.display()));
-        }
+    let header_claimed = footer_flags & APE_FLAG_HEADER_PRESENT != 0;
+    let (had_header, replace_start) = if header_claimed && items_start >= APE_DESCRIPTOR_LEN as u64 {
         let header_start = items_start - APE_DESCRIPTOR_LEN as u64;
         file.seek(SeekFrom::Start(header_start))
             .map_err(|error| format!("seek APEv2 header in '{}': {error}", path.display()))?;
         let mut header = [0u8; APE_DESCRIPTOR_LEN];
         file.read_exact(&mut header)
             .map_err(|error| format!("read APEv2 header in '{}': {error}", path.display()))?;
-        if &header[..8] != APE_SIGNATURE
-            || u32_le_at(&header, 8)? != version
-            || u32_le_at(&header, 12)? != tag_size as u32
-            || u32_le_at(&header, 16)? != item_count
-            || u32_le_at(&header, 20)? & APE_FLAG_IS_HEADER == 0
-        {
-            return Err(format!(
-                "APEv2 footer claims a header but the matching header is absent or inconsistent in '{}'",
+        if &header[..8] == APE_SIGNATURE {
+            if u32_le_at(&header, 8)? != version
+                || u32_le_at(&header, 12)? != tag_size as u32
+                || u32_le_at(&header, 16)? != item_count
+                || u32_le_at(&header, 20)? & APE_FLAG_IS_HEADER == 0
+            {
+                return Err(format!(
+                    "APEv2 footer claims a header but the adjacent APE descriptor is inconsistent in '{}'",
+                    path.display()
+                ));
+            }
+            (true, header_start)
+        } else {
+            repair_warnings.push(format!(
+                "APEv2 footer in '{}' claims a header that is absent; ignored the malformed header-present flag",
                 path.display()
             ));
+            (false, items_start)
         }
-        header_start
+    } else if header_claimed {
+        repair_warnings.push(format!(
+            "APEv2 footer in '{}' claims a header before file start; ignored the malformed header-present flag",
+            path.display()
+        ));
+        (false, items_start)
     } else {
-        items_start
+        (false, items_start)
     };
 
     let items_len_usize = usize::try_from(items_len)
@@ -502,6 +574,7 @@ pub(crate) fn read_native_ape_tag(path: &Path) -> Result<Option<NativeApeTag>, S
         footer_end,
         had_header,
         items,
+        repair_warnings,
     }))
 }
 
@@ -611,26 +684,102 @@ pub(crate) fn native_ape_numbering_rows(
     Some(rows)
 }
 
-pub(crate) fn native_ape_rows(
-    tag: &NativeApeTag,
-    path: &Path,
-) -> Result<Vec<NeutralApeRow>, String> {
+fn native_ape_cover_picture_type(raw_key: &str) -> Option<PictureType> {
+    match raw_key.trim().to_ascii_lowercase().as_str() {
+        "cover art (front)" => Some(PictureType::CoverFront),
+        "cover art (back)" => Some(PictureType::CoverBack),
+        _ => None,
+    }
+}
+
+fn recognized_image_mime(data: &[u8]) -> Option<&'static str> {
+    if data.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if data.starts_with(b"BM") {
+        Some("image/bmp")
+    } else if data.len() >= 12 && data.starts_with(b"RIFF") && &data[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+fn ape_cover_image_payload(value: &[u8]) -> Option<(&'static str, &[u8])> {
+    if let Some(mime) = recognized_image_mime(value) {
+        return Some((mime, value));
+    }
+    // APEv2 cover-art values conventionally begin with a filename followed by
+    // NUL and image bytes. Keep the filename probe deliberately small so a
+    // corrupt binary blob cannot trigger an unbounded delimiter scan.
+    let nul = value.iter().take(256).position(|byte| *byte == 0)?;
+    let filename = std::str::from_utf8(&value[..nul]).ok()?;
+    if filename.chars().any(char::is_control) {
+        return None;
+    }
+    let image = value.get(nul + 1..)?;
+    recognized_image_mime(image).map(|mime| (mime, image))
+}
+
+#[derive(Debug)]
+struct NeutralApeProjection {
+    rows: Vec<NeutralApeRow>,
+    artwork: Vec<NeutralApeArtwork>,
+    repairs: Vec<String>,
+}
+
+fn project_native_ape_tag(tag: &NativeApeTag, path: &Path) -> Result<NeutralApeProjection, String> {
     let mut rows = Vec::new();
+    let mut artwork = Vec::new();
+    let mut repairs = Vec::new();
     for item in tag.items.iter().filter(|item| item.key.is_some()) {
         let raw_key = item.key.as_deref().expect("filtered valid APE key");
+        let cover_type = native_ape_cover_picture_type(raw_key);
         match item.item_type() {
             APE_ITEM_TYPE_TEXT | APE_ITEM_TYPE_LOCATOR => {
-                let value = std::str::from_utf8(&item.value).map_err(|_| {
-                    format!(
-                        "APEv2 item '{}' has invalid UTF-8 text in '{}'",
-                        raw_key,
-                        path.display()
-                    )
-                })?;
+                let value = match std::str::from_utf8(&item.value) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        let Some(picture_type) = cover_type else {
+                            return Err(format!(
+                                "APEv2 item '{}' has invalid UTF-8 text in '{}'",
+                                raw_key,
+                                path.display()
+                            ));
+                        };
+                        let Some((mime_type, image)) = ape_cover_image_payload(&item.value) else {
+                            return Err(format!(
+                                "APEv2 cover item '{}' has invalid UTF-8 and no recognized image payload in '{}'",
+                                raw_key,
+                                path.display()
+                            ));
+                        };
+                        artwork.push(NeutralApeArtwork {
+                            picture_type,
+                            mime_type: mime_type.to_string(),
+                            data: image.to_vec(),
+                        });
+                        let canonical_key = native_ape_canonical_key(raw_key);
+                        rows.push(NeutralApeRow {
+                            raw_key: raw_key.to_string(),
+                            item_key: item_key_for_neutral_ape_row(&canonical_key),
+                            canonical_key,
+                            value: format!("<binary, {} bytes>", image.len()),
+                            is_binary: true,
+                        });
+                        repairs.push(format!(
+                            "APEv2 item '{}' in '{}' is declared as text but contains a recognized {} image; recovered it as binary artwork",
+                            raw_key,
+                            path.display(),
+                            mime_type
+                        ));
+                        continue;
+                    }
+                };
 
-                // Numbering fields are physically scalar and may encode a
-                // number/total pair with '/'. Do not reinterpret a NUL-valued
-                // item as numbering; preserve its physical values instead.
                 if !value.contains('\0') {
                     if let Some(numbering_rows) = native_ape_numbering_rows(raw_key, value) {
                         rows.extend(numbering_rows.into_iter().map(
@@ -648,10 +797,6 @@ pub(crate) fn native_ape_rows(
 
                 let canonical_key = native_ape_canonical_key(raw_key);
                 let item_key = item_key_for_neutral_ape_row(&canonical_key);
-                // APEv2 represents multiple text values as NUL-separated
-                // strings inside one item. Emit one neutral row per physical
-                // value so the editor merge layer can preserve order and
-                // multiplicity without a join/split round-trip.
                 for value in value.split('\0') {
                     rows.push(NeutralApeRow {
                         raw_key: raw_key.to_string(),
@@ -663,6 +808,15 @@ pub(crate) fn native_ape_rows(
                 }
             }
             APE_ITEM_TYPE_BINARY => {
+                if let Some(picture_type) = cover_type {
+                    if let Some((mime_type, image)) = ape_cover_image_payload(&item.value) {
+                        artwork.push(NeutralApeArtwork {
+                            picture_type,
+                            mime_type: mime_type.to_string(),
+                            data: image.to_vec(),
+                        });
+                    }
+                }
                 let canonical_key = native_ape_canonical_key(raw_key);
                 rows.push(NeutralApeRow {
                     raw_key: raw_key.to_string(),
@@ -681,7 +835,14 @@ pub(crate) fn native_ape_rows(
             }
         }
     }
-    Ok(rows)
+    Ok(NeutralApeProjection { rows, artwork, repairs })
+}
+
+pub(crate) fn native_ape_rows(
+    tag: &NativeApeTag,
+    path: &Path,
+) -> Result<Vec<NeutralApeRow>, String> {
+    Ok(project_native_ape_tag(tag, path)?.rows)
 }
 
 pub(crate) fn read_native_ape_fallback(path: &Path) -> Result<NeutralApeReadOutcome, String> {
@@ -691,18 +852,25 @@ pub(crate) fn read_native_ape_fallback(path: &Path) -> Result<NeutralApeReadOutc
             path.display()
         )
     })?;
-    let rows = native_ape_rows(&tag, path)?;
+    let projection = project_native_ape_tag(&tag, path)?;
     let escaped_keys = tag
         .items
         .iter()
         .filter(|item| item.key.is_none())
         .map(|item| display_escaped_ape_key(&item.key_bytes))
         .collect::<Vec<_>>();
-    let warning = (!escaped_keys.is_empty()).then(|| NeutralApeWarning {
+    let mut repairs = tag.repair_warnings.clone();
+    repairs.extend(projection.repairs);
+    let warning = (!escaped_keys.is_empty() || !repairs.is_empty()).then(|| NeutralApeWarning {
         path: path.to_path_buf(),
         escaped_keys,
+        repairs,
     });
-    Ok(NeutralApeReadOutcome { rows, warning })
+    Ok(NeutralApeReadOutcome {
+        rows: projection.rows,
+        artwork: projection.artwork,
+        warning,
+    })
 }
 
 pub(crate) fn invalid_native_ape_keys(path: &Path) -> Result<Vec<String>, String> {
@@ -1520,6 +1688,92 @@ mod tests {
         assert_eq!(native_ape_item_capacity(100_000_000, 90), 10);
         assert_eq!(native_ape_item_capacity(3, 90), 3);
         assert_eq!(native_ape_item_capacity(u32::MAX, 8), 0);
+    }
+
+
+    fn ape_item(key: &str, flags: u32, value: &[u8]) -> Vec<u8> {
+        let mut item = Vec::new();
+        item.extend_from_slice(&(u32::try_from(value.len()).expect("fixture value length")).to_le_bytes());
+        item.extend_from_slice(&flags.to_le_bytes());
+        item.extend_from_slice(key.as_bytes());
+        item.push(0);
+        item.extend_from_slice(value);
+        item
+    }
+
+    fn write_ape_fixture(
+        path: &Path,
+        items: &[Vec<u8>],
+        footer_flags: u32,
+        reserved: [u8; 8],
+    ) {
+        let mut bytes = vec![0_u8; 64];
+        bytes[..4].copy_from_slice(b"MAC ");
+        let items_len = items.iter().map(Vec::len).sum::<usize>();
+        for item in items {
+            bytes.extend_from_slice(item);
+        }
+        let tag_size = u32::try_from(items_len + APE_DESCRIPTOR_LEN).expect("fixture tag size");
+        let item_count = u32::try_from(items.len()).expect("fixture item count");
+        bytes.extend_from_slice(APE_SIGNATURE);
+        bytes.extend_from_slice(&APE_VERSION_2.to_le_bytes());
+        bytes.extend_from_slice(&tag_size.to_le_bytes());
+        bytes.extend_from_slice(&item_count.to_le_bytes());
+        bytes.extend_from_slice(&footer_flags.to_le_bytes());
+        bytes.extend_from_slice(&reserved);
+        std::fs::write(path, bytes).expect("write APE fixture");
+    }
+
+    #[test]
+    fn native_ape_fallback_repairs_field_sample_shape_and_recovers_cover() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("sample.flac");
+        let mut cover = b"cover.jpg\0".to_vec();
+        cover.extend_from_slice(&[0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0xff, 0xd9]);
+        let items = vec![
+            ape_item("Title", APE_ITEM_TYPE_TEXT, b"Aisle Of Plenty"),
+            ape_item("Album", APE_ITEM_TYPE_TEXT, b"Selling England by the Pound"),
+            ape_item("Track", APE_ITEM_TYPE_TEXT, b"B4"),
+            // The field sample advertises this image as UTF-8 text even though
+            // its payload is the conventional filename-NUL-JPEG binary form.
+            ape_item("Cover Art (front)", APE_ITEM_TYPE_TEXT, &cover),
+        ];
+        write_ape_fixture(&path, &items, 0xaa99_dbad, [0x00, 0x4c, 0xe6, 0x0b, 0, 0, 0, 0]);
+        assert!(carrier_has_monkeys_audio_magic(&path));
+
+        let outcome = read_native_ape_fallback(&path).expect("bounded repair should succeed");
+        assert!(outcome.rows.iter().any(|row| {
+            row.canonical_key == "TITLE" && row.value == "Aisle Of Plenty" && !row.is_binary
+        }));
+        assert!(outcome.rows.iter().any(|row| {
+            row.canonical_key == "ALBUM" && row.value == "Selling England by the Pound"
+        }));
+        assert!(outcome.rows.iter().any(|row| {
+            row.canonical_key == "TRACKNUMBER" && row.value == "B4"
+        }), "lexical source numbering must remain visible even when it is not numeric");
+        assert_eq!(outcome.artwork.len(), 1);
+        assert_eq!(outcome.artwork[0].picture_type, PictureType::CoverFront);
+        assert_eq!(outcome.artwork[0].mime_type, "image/jpeg");
+        assert_eq!(outcome.artwork[0].data.as_slice(), &cover[b"cover.jpg\0".len()..]);
+
+        let warning = outcome.warning.expect("repairs must be disclosed").message();
+        assert!(warning.contains("reserved flag bits"));
+        assert!(warning.contains("non-zero reserved bytes"));
+        assert!(warning.contains("claims a header that is absent"));
+        assert!(warning.contains("declared as text"));
+        assert!(warning.contains("image/jpeg"));
+    }
+
+    #[test]
+    fn native_ape_fallback_does_not_generalize_invalid_utf8_repair() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("bad.ape");
+        let items = vec![ape_item("Comment", APE_ITEM_TYPE_TEXT, &[0xff, 0xfe])];
+        write_ape_fixture(&path, &items, APE_FLAG_FOOTER_PRESENT, [0; 8]);
+
+        let error = read_native_ape_fallback(&path).expect_err("arbitrary invalid text must fail");
+        assert!(error.contains("invalid UTF-8 text"));
+        assert!(error.contains("Comment"));
     }
 
     #[test]

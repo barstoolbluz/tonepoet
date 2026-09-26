@@ -4,12 +4,14 @@
 //! executor, metadata, ReplayGain, publish, and logging stages then handle it.
 
 use std::collections::{BTreeMap, HashMap};
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use super::errors::{MaterializeError, ToolRunnerError};
@@ -30,6 +32,131 @@ fn normalize_single_file_embedded_chapters(
             path.display()
         ))
     })
+}
+
+#[derive(Debug)]
+struct StagedRecoveredArtwork {
+    path: PathBuf,
+    mime_type: String,
+}
+
+static RECOVERED_ARTWORK_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn recovered_artwork_extension(mime_type: &str) -> &'static str {
+    match mime_type {
+        "image/jpeg" => "jpg",
+        "image/png" => "png",
+        "image/gif" => "gif",
+        "image/bmp" => "bmp",
+        "image/webp" => "webp",
+        _ => "img",
+    }
+}
+
+fn stage_recovered_ape_artwork(
+    source: &Path,
+    staging: &StagingDir,
+) -> Result<Option<StagedRecoveredArtwork>, MaterializeError> {
+    let outcome = crate::metadata_persistence::read_native_ape_fallback(source)
+        .map_err(MaterializeError::Parse)?;
+    let Some(artwork) = outcome
+        .artwork
+        .iter()
+        .find(|artwork| artwork.picture_type == lofty::picture::PictureType::CoverFront)
+        .or_else(|| outcome.artwork.first())
+    else {
+        return Ok(None);
+    };
+
+    let digest = Sha256::digest(&artwork.data);
+    let digest_hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let directory = staging.root.join("source-artwork");
+    fs::create_dir_all(&directory).map_err(MaterializeError::Io)?;
+    let destination = directory.join(format!(
+        "{digest_hex}.{}",
+        recovered_artwork_extension(&artwork.mime_type)
+    ));
+
+    if destination.exists() {
+        let existing = fs::read(&destination).map_err(MaterializeError::Io)?;
+        if existing.as_slice() != artwork.data.as_slice() {
+            return Err(MaterializeError::Parse(format!(
+                "content-addressed recovered artwork path collision at {}",
+                destination.display()
+            )));
+        }
+        return Ok(Some(StagedRecoveredArtwork {
+            path: destination,
+            mime_type: artwork.mime_type.clone(),
+        }));
+    }
+
+    let (temporary, mut file) = loop {
+        let sequence = RECOVERED_ARTWORK_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temporary = directory.join(format!(
+            ".{digest_hex}.{}.{}.tmp",
+            std::process::id(),
+            sequence
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => break (temporary, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(MaterializeError::Io(error)),
+        }
+    };
+    if let Err(error) = file.write_all(&artwork.data).and_then(|_| file.sync_all()) {
+        let _ = fs::remove_file(&temporary);
+        return Err(MaterializeError::Io(error));
+    }
+    drop(file);
+    match fs::rename(&temporary, &destination) {
+        Ok(()) => {}
+        Err(error) if destination.exists() => {
+            let _ = fs::remove_file(&temporary);
+            let existing = fs::read(&destination).map_err(MaterializeError::Io)?;
+            if existing.as_slice() != artwork.data.as_slice() {
+                return Err(MaterializeError::Parse(format!(
+                    "concurrent recovered artwork write disagreed at {}: {error}",
+                    destination.display()
+                )));
+            }
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            return Err(MaterializeError::Io(error));
+        }
+    }
+
+    Ok(Some(StagedRecoveredArtwork {
+        path: destination,
+        mime_type: artwork.mime_type.clone(),
+    }))
+}
+
+fn attach_staged_recovered_artwork(
+    album: &mut AlbumMetadata,
+    source: &Path,
+    staged: StagedRecoveredArtwork,
+) {
+    album.extra.insert(
+        STAGED_SOURCE_ARTWORK_PATH_EXTRA_KEY.to_string(),
+        staged.path.display().to_string(),
+    );
+    album.extra.insert(
+        STAGED_SOURCE_ARTWORK_MIME_EXTRA_KEY.to_string(),
+        staged.mime_type,
+    );
+    album.extra.insert(
+        STAGED_SOURCE_ARTWORK_SOURCE_EXTRA_KEY.to_string(),
+        source.display().to_string(),
+    );
 }
 
 #[async_trait]
@@ -170,6 +297,13 @@ impl super::stages::Materializer for SingleFileMaterializer {
                 req.album_batch_track.as_ref(),
             ));
         }
+        if let Some(warning) = source_identity_mismatch_warning(
+            &req.container,
+            probe.codec_name.as_deref(),
+            probe.format_name.as_deref(),
+        ) {
+            metadata_warnings.push(warning);
+        }
         report_metadata_warnings(
             reporter,
             &req.item_id,
@@ -279,6 +413,15 @@ impl super::stages::Materializer for SingleFileMaterializer {
                 // a sidecar metadata total must not collapse it back to one.
                 album_metadata.total_tracks = embedded_chapters.len() as u32;
             }
+            if metadata_recovered_by_fallback && req.settings.metadata.preserve_artwork {
+                if let Some(artwork) = stage_recovered_ape_artwork(&req.container, staging)? {
+                    attach_staged_recovered_artwork(
+                        &mut album_metadata,
+                        &req.container,
+                        artwork,
+                    );
+                }
+            }
             return Ok(PreparedSource {
                 container: req.container.clone(),
                 kind: SourceKind::SingleFile,
@@ -312,7 +455,8 @@ impl super::stages::Materializer for SingleFileMaterializer {
                 Some(probe.sample_rate),
                 probe.bit_depth,
                 Some(probe.coding),
-            ),
+            )
+            .with_probe_identity(probe.codec_name.as_deref(), probe.format_name.as_deref()),
             warnings: metadata_warnings,
         };
 
@@ -322,6 +466,15 @@ impl super::stages::Materializer for SingleFileMaterializer {
         });
         if let Some(cue_album_metadata) = cue_album_metadata {
             merge_sidecar_cue_album_metadata(&mut album_metadata, cue_album_metadata);
+        }
+        if metadata_recovered_by_fallback && req.settings.metadata.preserve_artwork {
+            if let Some(artwork) = stage_recovered_ape_artwork(&req.container, staging)? {
+                attach_staged_recovered_artwork(
+                    &mut album_metadata,
+                    &req.container,
+                    artwork,
+                );
+            }
         }
         Ok(PreparedSource {
             container: req.container.clone(),
@@ -724,6 +877,8 @@ struct ProbeResult {
     expected_samples: Option<u64>,
     bit_depth: Option<u32>,
     coding: SourceAudioCoding,
+    codec_name: Option<String>,
+    format_name: Option<String>,
 }
 
 async fn probe_audio_file(
@@ -742,7 +897,7 @@ async fn probe_audio_file(
             "-show_entries".into(),
             "stream=sample_rate,duration,bits_per_raw_sample,bits_per_sample,sample_fmt,codec_name".into(),
             "-show_entries".into(),
-            "format=duration".into(),
+            "format=format_name,duration".into(),
             "-of".into(),
             "json".into(),
             path.to_string_lossy().into_owned(),
@@ -798,12 +953,21 @@ fn parse_ffprobe_json(json: &str) -> Result<ProbeResult, MaterializeError> {
         });
     let codec_name = value
         .pointer("/streams/0/codec_name")
-        .and_then(|value| value.as_str());
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let format_name = value
+        .pointer("/format/format_name")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     let sample_fmt = value
         .pointer("/streams/0/sample_fmt")
         .and_then(|value| value.as_str());
     let (coding, bit_depth) =
-        classify_source_audio_probe(codec_name, sample_fmt, integer_bit_depth);
+        classify_source_audio_probe(codec_name.as_deref(), sample_fmt, integer_bit_depth);
     let (sample_rate, expected_samples) =
         crate::convert::pipeline::normalize_dsd_probe_rate(coding, sample_rate, expected_samples);
 
@@ -812,6 +976,8 @@ fn parse_ffprobe_json(json: &str) -> Result<ProbeResult, MaterializeError> {
         expected_samples,
         bit_depth,
         coding,
+        codec_name,
+        format_name,
     })
 }
 
@@ -874,7 +1040,7 @@ pub(crate) fn individual_file_metadata_source_is_viable(path: &Path) -> bool {
 
     match lofty::read_from_path(path) {
         Ok(_) => true,
-        Err(error) if crate::metadata_persistence::native_ape_error_is_eligible(&error) => true,
+        Err(error) if crate::metadata_persistence::native_ape_fallback_is_eligible(path, &error) => true,
         Err(error) => !crate::metadata_persistence::lofty_error_is_unsupported_metadata_format(&error),
     }
 }
@@ -922,7 +1088,7 @@ pub(crate) fn read_track_metadata_with_warnings_and_viability(
             Ok((metadata, warnings, false, true))
         }
         Err(lofty_error)
-            if crate::metadata_persistence::native_ape_error_is_eligible(&lofty_error) =>
+            if crate::metadata_persistence::native_ape_fallback_is_eligible(path, &lofty_error) =>
         {
             match crate::metadata_persistence::read_native_ape_fallback(path) {
                 Ok(outcome) => {

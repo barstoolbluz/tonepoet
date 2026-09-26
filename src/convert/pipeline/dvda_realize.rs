@@ -5795,6 +5795,8 @@ mod tests {
     fn prepared_source_audio_expectation_sums_channel_groups() {
         let source_audio = SourceAudioDescriptor {
             coding: Some(SourceAudioCoding::DvdaUnknown),
+            codec_name: None,
+            format_name: None,
             primary_sample_rate: Some(192_000),
             bit_depth: Some(24),
             channel_groups: vec![

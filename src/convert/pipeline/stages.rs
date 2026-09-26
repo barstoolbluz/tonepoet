@@ -5345,7 +5345,19 @@ struct CueArtworkSidecar {
 }
 
 fn cue_artwork_sidecar_from_album_metadata(album: &AlbumMetadata) -> Option<CueArtworkSidecar> {
-    let path = album.extra.get(CUE_ARTWORK_PATH_EXTRA_KEY)?.trim();
+    let (path_key, mime_key) = if album
+        .extra
+        .get(STAGED_SOURCE_ARTWORK_PATH_EXTRA_KEY)
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        (
+            STAGED_SOURCE_ARTWORK_PATH_EXTRA_KEY,
+            STAGED_SOURCE_ARTWORK_MIME_EXTRA_KEY,
+        )
+    } else {
+        (CUE_ARTWORK_PATH_EXTRA_KEY, CUE_ARTWORK_MIME_EXTRA_KEY)
+    };
+    let path = album.extra.get(path_key)?.trim();
     if path.is_empty() {
         return None;
     }
@@ -5353,7 +5365,7 @@ fn cue_artwork_sidecar_from_album_metadata(album: &AlbumMetadata) -> Option<CueA
         path: PathBuf::from(path),
         mime_type: album
             .extra
-            .get(CUE_ARTWORK_MIME_EXTRA_KEY)
+            .get(mime_key)
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty()),
     })
@@ -5927,6 +5939,9 @@ fn is_internal_metadata_extra_key(key: &str) -> bool {
         || key == CUE_ARTWORK_MIME_EXTRA_KEY
         || key == CUE_ARTWORK_SOURCE_EXTRA_KEY
         || key == CUE_ARTWORK_UNSUPPORTED_EXTRA_KEY
+        || key == STAGED_SOURCE_ARTWORK_PATH_EXTRA_KEY
+        || key == STAGED_SOURCE_ARTWORK_MIME_EXTRA_KEY
+        || key == STAGED_SOURCE_ARTWORK_SOURCE_EXTRA_KEY
         || key == EMBEDDED_CHAPTER_STRUCTURE_EXTRA_KEY
         || key.starts_with(CUE_USER_METADATA_EXTRA_PREFIX)
         || key.starts_with(SOURCE_TEXT_TAG_EXTRA_PREFIX)

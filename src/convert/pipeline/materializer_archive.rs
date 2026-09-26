@@ -364,7 +364,14 @@ impl super::stages::Materializer for ArchiveMaterializer {
                 continue;
             }
 
-            let (mut metadata, metadata_warnings) = read_track_metadata_with_warnings(path)?;
+            let (mut metadata, mut metadata_warnings) = read_track_metadata_with_warnings(path)?;
+            if let Some(warning) = source_identity_mismatch_warning(
+                path,
+                probe.codec_name.as_deref(),
+                probe.format_name.as_deref(),
+            ) {
+                metadata_warnings.push(warning);
+            }
             super::materializer_single::report_metadata_warnings(
                 reporter,
                 &req.item_id,
@@ -393,7 +400,8 @@ impl super::stages::Materializer for ArchiveMaterializer {
                     Some(probe.sample_rate),
                     probe.bit_depth,
                     probe.coding,
-                ),
+                )
+                .with_probe_identity(probe.codec_name.as_deref(), probe.format_name.as_deref()),
                 bit_depth: probe.bit_depth,
                 warnings: metadata_warnings,
             });
@@ -4764,6 +4772,8 @@ pub(crate) struct ProbeResult {
     pub expected_samples: Option<u64>,
     pub bit_depth: Option<u32>,
     pub coding: Option<SourceAudioCoding>,
+    pub codec_name: Option<String>,
+    pub format_name: Option<String>,
 }
 
 /// Probe a single audio file via ffprobe through `ToolRunner`.
@@ -4783,7 +4793,7 @@ async fn probe_audio_file(
             "-show_entries".into(),
             "stream=codec_name,sample_fmt,sample_rate,duration,bits_per_raw_sample,bits_per_sample".into(),
             "-show_entries".into(),
-            "format=duration".into(),
+            "format=format_name,duration".into(),
             "-of".into(),
             "json".into(),
             path.display().to_string(),
@@ -4846,12 +4856,21 @@ fn parse_ffprobe_json(json_str: &str) -> Result<ProbeResult, MaterializeError> {
         });
     let codec_name = val
         .pointer("/streams/0/codec_name")
-        .and_then(|value| value.as_str());
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let format_name = val
+        .pointer("/format/format_name")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     let sample_fmt = val
         .pointer("/streams/0/sample_fmt")
         .and_then(|value| value.as_str());
     let (coding, bit_depth) =
-        classify_source_audio_probe(codec_name, sample_fmt, integer_bit_depth);
+        classify_source_audio_probe(codec_name.as_deref(), sample_fmt, integer_bit_depth);
     let (sample_rate, expected_samples) =
         crate::convert::pipeline::normalize_dsd_probe_rate(coding, sample_rate, expected_samples);
 
@@ -4860,6 +4879,8 @@ fn parse_ffprobe_json(json_str: &str) -> Result<ProbeResult, MaterializeError> {
         expected_samples,
         bit_depth,
         coding: Some(coding),
+        codec_name,
+        format_name,
     })
 }
 
@@ -5873,6 +5894,8 @@ mod tests {
                 Some(24),
                 Some(SourceAudioCoding::Pcm),
             )
+            // The simulated ffprobe reports a codec but no format entry.
+            .with_probe_identity(Some("flac"), None)
         );
         let TrackSourceRef::StagedFile(path) = &track.source_ref else {
             panic!("archive materializer must stage extracted files");
@@ -5928,6 +5951,7 @@ mod tests {
                 Some(16),
                 Some(SourceAudioCoding::Pcm),
             )
+            .with_probe_identity(Some("pcm_s16le"), Some("wav"))
         );
         assert_eq!(track.expected_samples, Some(2_205));
         let TrackSourceRef::StagedFile(path) = &track.source_ref else {

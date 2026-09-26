@@ -924,7 +924,7 @@ pub fn read_metadata(path: &Path) -> Result<SourceMetadata, String> {
 
     match lofty::read_from_path(path) {
         Ok(tagged_file) => Ok(source_metadata_from_tags(path, tagged_file.tags(), true)),
-        Err(error) if native_ape_error_is_eligible(&error) => {
+        Err(error) if native_ape_fallback_is_eligible(path, &error) => {
             let outcome = read_native_ape_fallback(path).map_err(|native_error| {
                 format!(
                     "Failed to read tags from '{}': {error}; native APEv2 fallback also refused: {native_error}",
@@ -952,21 +952,43 @@ pub fn read_embedded_picture_bytes(
     path: &Path,
     picture_type: lofty::picture::PictureType,
 ) -> Result<Vec<u8>, String> {
-
     use lofty::file::TaggedFileExt;
 
     recover_metadata_before_read(path)?;
 
-    let tagged_file = lofty::read_from_path(path)
-        .map_err(|e| format!("Failed to read artwork from '{}': {}", path.display(), e))?;
-
-    for tag in tagged_file.tags() {
-        if let Some(picture) = tag
-            .pictures()
-            .iter()
-            .find(|picture| picture.pic_type() == picture_type)
-        {
-            return Ok(picture.data().to_vec());
+    match lofty::read_from_path(path) {
+        Ok(tagged_file) => {
+            for tag in tagged_file.tags() {
+                if let Some(picture) = tag
+                    .pictures()
+                    .iter()
+                    .find(|picture| picture.pic_type() == picture_type)
+                {
+                    return Ok(picture.data().to_vec());
+                }
+            }
+        }
+        Err(error) if native_ape_fallback_is_eligible(path, &error) => {
+            let outcome = read_neutral_native_ape_fallback(path).map_err(|native_error| {
+                format!(
+                    "Failed to read artwork from '{}': {error}; native APEv2 fallback also refused: {native_error}",
+                    path.display()
+                )
+            })?;
+            if let Some(artwork) = outcome
+                .artwork
+                .into_iter()
+                .find(|artwork| artwork.picture_type == picture_type)
+            {
+                return Ok(artwork.data);
+            }
+        }
+        Err(error) => {
+            return Err(format!(
+                "Failed to read artwork from '{}': {}",
+                path.display(),
+                error
+            ));
         }
     }
 
@@ -8626,7 +8648,7 @@ fn source_metadata_from_tags(
 }
 
 use crate::metadata_persistence::{
-    ape_key_is_valid, native_ape_canonical_key, native_ape_error_is_eligible,
+    ape_key_is_valid, native_ape_canonical_key, native_ape_fallback_is_eligible,
     native_ape_rows, optional_id3v1_start,
     read_native_ape_fallback as read_neutral_native_ape_fallback, read_native_ape_tag,
     NativeApeTag, APE_DESCRIPTOR_LEN, APE_FLAG_HEADER_PRESENT, APE_FLAG_IS_HEADER,
@@ -8730,7 +8752,34 @@ fn read_native_ape_fallback(path: &std::path::Path) -> Result<NativeApeReadOutco
         kind: MetadataReadIssueKind::RecoverableTagWarning,
         reason: warning.message(),
     });
-    let metadata = source_metadata_from_canonical_fields(path, &fields);
+    let mut metadata = source_metadata_from_canonical_fields(path, &fields);
+    metadata.artwork = outcome
+        .artwork
+        .into_iter()
+        .map(|artwork| {
+            let dimensions = if artwork.mime_type == "image/png" {
+                parse_png_dimensions(&artwork.data)
+            } else if artwork.mime_type == "image/jpeg" {
+                parse_jpeg_dimensions(&artwork.data)
+            } else {
+                None
+            };
+            ArtworkInfo {
+                picture_type: artwork.picture_type,
+                mime_type: artwork.mime_type,
+                data_size: artwork.data.len(),
+                width: dimensions.and_then(|value| value.0),
+                height: dimensions.and_then(|value| value.1),
+            }
+        })
+        .collect();
+    metadata.artwork.sort_by(|left, right| {
+        left.picture_type
+            .as_u8()
+            .cmp(&right.picture_type.as_u8())
+            .then_with(|| left.mime_type.cmp(&right.mime_type))
+            .then_with(|| left.data_size.cmp(&right.data_size))
+    });
     Ok(NativeApeReadOutcome {
         fields,
         metadata,
@@ -9206,10 +9255,61 @@ fn overlay_mp4_native_multivalue_editor_fields(
     }
 }
 
+fn editor_source_identity_issue(path: &std::path::Path) -> Option<MetadataReadIssue> {
+    let source = match probe_audio(path) {
+        Ok(source) => source,
+        Err(error) => {
+            log::debug!(
+                "metadata editor source-identity probe failed for '{}': {}",
+                path.display(),
+                error
+            );
+            return None;
+        }
+    };
+    crate::convert::pipeline::source_identity_mismatch_warning(
+        path,
+        Some(&source.codec),
+        Some(&source.format_name),
+    )
+    .map(|reason| MetadataReadIssue {
+        kind: MetadataReadIssueKind::RecoverableTagWarning,
+        reason,
+    })
+}
+
+fn merge_metadata_read_issues(
+    first: Option<MetadataReadIssue>,
+    second: Option<MetadataReadIssue>,
+) -> Option<MetadataReadIssue> {
+    match (first, second) {
+        (None, None) => None,
+        (Some(issue), None) | (None, Some(issue)) => Some(issue),
+        (Some(first), Some(second)) => Some(MetadataReadIssue {
+            kind: MetadataReadIssueKind::RecoverableTagWarning,
+            reason: format!("{}; {}", first.reason, second.reason),
+        }),
+    }
+}
+
+fn augment_metadata_read_error(
+    mut error: MetadataReadIssue,
+    identity_issue: Option<MetadataReadIssue>,
+) -> MetadataReadIssue {
+    if let Some(identity_issue) = identity_issue {
+        error.reason = format!("{}; {}", identity_issue.reason, error.reason);
+    }
+    error
+}
+
 fn read_editor_metadata_file(
     path: &std::path::Path,
 ) -> Result<(Vec<CanonicalEditorTagField>, SourceMetadata, Option<MetadataReadIssue>), MetadataReadIssue> {
     use lofty::file::TaggedFileExt;
+
+    // Probe once at the editor I/O boundary so a misleading filename is
+    // disclosed even when the tag reader itself refuses the file.
+    let identity_issue = editor_source_identity_issue(path);
 
     match lofty::read_from_path(path) {
         Ok(tagged) => {
@@ -9217,26 +9317,39 @@ fn read_editor_metadata_file(
             let mut fields = editor_fields_from_tagged_file(path, &tagged);
             if tagged.tag(lofty::tag::TagType::Mp4Ilst).is_some() {
                 let state = read_mp4_native_multivalue_state(path).map_err(|reason| {
-                    MetadataReadIssue {
-                        kind: MetadataReadIssueKind::TagRead,
-                        reason,
-                    }
+                    augment_metadata_read_error(
+                        MetadataReadIssue {
+                            kind: MetadataReadIssueKind::TagRead,
+                            reason,
+                        },
+                        identity_issue.clone(),
+                    )
                 })?;
                 overlay_mp4_native_multivalue_editor_fields(&mut fields, &state);
             }
-            Ok((fields, metadata, None))
+            Ok((fields, metadata, identity_issue))
         }
-        Err(err) if native_ape_error_is_eligible(&err) => match read_native_ape_fallback(path) {
-            Ok(outcome) => Ok((outcome.fields, outcome.metadata, outcome.warning)),
-            Err(native_error) => Err(MetadataReadIssue {
-                kind: MetadataReadIssueKind::TagRead,
-                reason: format!(
-                    "failed to read '{}': {err}; native APEv2 fallback also refused: {native_error}",
-                    path.display()
-                ),
-            }),
+        Err(err) if native_ape_fallback_is_eligible(path, &err) => match read_native_ape_fallback(path) {
+            Ok(outcome) => Ok((
+                outcome.fields,
+                outcome.metadata,
+                merge_metadata_read_issues(outcome.warning, identity_issue),
+            )),
+            Err(native_error) => {
+                let issue = MetadataReadIssue {
+                    kind: MetadataReadIssueKind::TagRead,
+                    reason: format!(
+                        "failed to read '{}': {err}; native APEv2 fallback also refused: {native_error}",
+                        path.display()
+                    ),
+                };
+                Err(augment_metadata_read_error(issue, identity_issue))
+            }
         },
-        Err(err) => Err(MetadataReadIssue::from_lofty_read_error(path, err)),
+        Err(err) => Err(augment_metadata_read_error(
+            MetadataReadIssue::from_lofty_read_error(path, err),
+            identity_issue,
+        )),
     }
 }
 
@@ -13574,7 +13687,7 @@ pub fn remove_invalid_ape_items_atomic(
 fn wavpack_requires_native_ape_writer(path: &std::path::Path) -> Result<bool, String> {
     match lofty::read_from_path(path) {
         Ok(_) => Ok(false),
-        Err(error) if native_ape_error_is_eligible(&error) => Ok(true),
+        Err(error) if native_ape_fallback_is_eligible(path, &error) => Ok(true),
         Err(error) => Err(format!(
             "failed to read healthy-writer eligibility for '{}': {error}",
             path.display()
@@ -23206,7 +23319,16 @@ mod tests {
         );
         let read = read_all_tags_merged_with_metadata(std::slice::from_ref(&path))
             .expect("read renamed WavPack bytes through Lofty content detection");
-        assert!(read.metadata_errors[0].is_none());
+        // The bytes are WavPack under a Musepack name: the read succeeds, and
+        // the editor discloses the extension/content disagreement as a
+        // recoverable warning naming both facts.
+        let identity = read.metadata_errors[0]
+            .as_ref()
+            .expect("renamed carrier must be disclosed");
+        assert_eq!(identity.kind, MetadataReadIssueKind::RecoverableTagWarning);
+        assert!(identity.reason.contains("Source identity mismatch"), "{}", identity.reason);
+        assert!(identity.reason.contains("'.mpc'"), "{}", identity.reason);
+        assert!(identity.reason.to_ascii_lowercase().contains("wavpack"), "{}", identity.reason);
         assert!(read.entries.iter().any(|entry| {
             entry.display_key.eq_ignore_ascii_case("CUESHEET")
                 && entry.per_file_values.first().map(crate::tui::probe::MetadataFieldValues::as_str) == Some(cue)
