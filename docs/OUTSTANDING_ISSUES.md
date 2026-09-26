@@ -3055,3 +3055,52 @@ A change that cannot affect Reference behaviour, the package version line first 
 them, does not invalidate the installed qualification. The TUI shows the same specific
 refusal reason the CLI prints, including that the installed report does not bind the
 running build, and says that requalification is the remedy.
+
+## 46. Regression (v0.5.3 @ 6d11d35): a TUI preset that carries DSD fields cannot be loaded from the CLI at all
+
+Found 2026-09-26. `tonepoet convert <file> --preset "SACD-to-PCM Reference"` fails before
+queueing, for a DSF source as much as for a FLAC source:
+
+```
+Error: Failed to apply preset 'SACD-to-PCM Reference': preset 'SACD-to-PCM Reference'
+cannot be applied; refused fields: dsd_path, dsd_profile, dsd_gain,
+dsd_true_peak_target_dbtp, dsd_true_peak_scope, dsd_true_peak_scan
+```
+
+The same preset on the same DSF converted from the CLI on 2026-09-25, before the
+five-defects merge.
+
+### Mechanism
+
+`TuiPreset::to_conversion_options` (`src/tui/presets.rs`, from #40) projects the preset
+twice, once as a PCM source and once as a DSD source, and fails if either report is
+incomplete. The #43 fix made `apply_to_pills` record every inapplicable DSD field as a
+refusal instead of skipping it. The PCM projection therefore always refuses a preset's
+DSD fields, and the CLI rejects every preset that has any. The TUI is unaffected because
+it applies a preset once, against the installed source.
+
+### Required
+
+A TUI preset loads from the CLI regardless of which source class its dormant fields are
+for; the fields are interpreted against the source that is converted. `--preset
+"SACD-to-PCM Reference"` on a DSF converts on the Reference path again, and on a FLAC it
+converts with the preset's PCM settings.
+
+## 47. The conversion log does not record the commands of the true-peak preparation stage, so an SSRC resample is invisible
+
+Found 2026-09-26 on a 176.4 kHz / 32-bit FLAC album converted to 88.2 kHz / 24-bit with
+SSRC selected and PCM true-peak gain on. The log's settings say "Resampling: yes (SSRC
+profile=ultra ...)", but each track's "Commands:" lists one sox invocation only, reading a
+raw Float64 carrier at 88.2 kHz and writing the 24-bit FLAC with `dither`. Nothing in the
+log shows how the carrier reached 88.2 kHz, so the log reads as if SoX did the work.
+
+Reproduced with the pipeline observer: SSRC ran once per track
+(`realize_protected_ssrc_true_peak_carrier`, `src/convert/pipeline/stages.rs`), sox twice
+(carrier ingress and the final quantization). The preparation stage's commands are not
+carried into the per-track command list.
+
+### Required
+
+The conversion log lists every external command that produced a track, in order,
+including the true-peak preparation stage's resampler and carrier steps, with the same
+timing and exit fields as the encode commands.
