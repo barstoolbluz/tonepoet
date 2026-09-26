@@ -13,9 +13,9 @@ schema, the five field defects, decode-only passthrough):
   e665357, none written in any 2026-09-26 field run); #28 earlier.
 - Fixed with regressions green, live TUI check still owed by the user: #43, #44.
 - Partly resolved: #37 (tool launch 0.7-1.2 s down to 0.1-0.18 s; tens-of-ms target open).
-- #35a delivered with #36 (a real queued ReplayGain conversion in the gate); #35b and #35c open.
+- #34 resolved since e2afa8e; #35a delivered with #36, #35b delivered with #34; #35c open.
 - #18 changed shape (incumbent now wins; the second conversion fails at Publish instead).
-- Open and unchanged: #2-#8, #10-#13, #15-#17, #19-#26, #29-#32, #34, #38.
+- Open and unchanged: #2-#8, #10-#13, #15-#17, #19-#26, #29-#32, #38.
 
 
 **Status sweep 2026-08-25:** every entry was re-verified against `main @ ec362ee` by reading the code
@@ -2590,6 +2590,12 @@ image, never an output target), which is correct and not in question here.
 
 ## 34. `:analyze` Loudness fails with "audio decoder failed: Invalid data found when processing input" on ID3-prefixed FLACs with an ID3v1 trailer
 
+**Status 2026-09-26:** resolved, and had been since e2afa8e (2026-09-20) without this entry being
+updated. The native decode wrapper accepts the post-extent error of an ID3-wrapped FLAC once the
+declared sample count has been decoded (`accepts_post_extent_error`, `src/convert/replaygain.rs`).
+Verified today: a ReplayGain-enabled conversion of an Audio Fidelity Asia track succeeds and
+writes the gain. `:analyze` measures through the same `measure_paths`; its live check is owed.
+
 **Status:** open, filed 2026-09-17 from a field report. Diagnosed to the decode wrapper, not the
 loudness crate.
 
@@ -2630,8 +2636,10 @@ conversion, so conversions of these files with ReplayGain enabled are expected t
 **Status 2026-09-26:** 35a delivered with #36 on main @ 6d11d35:
 `queued_independent_album_replaygain_reduces_across_all_members` runs a two-track album
 through `process_queue` with registered runtime executions and asserts the published tags
-(WAV, Album mode; the subprocess-writer and Track-mode variants are not covered). 35b and 35c
-remain open; 35b is to be delivered with #34.
+(WAV, Album mode; the subprocess-writer and Track-mode variants are not covered). 35c remains
+open. 35b is delivered: `fixtures/regression/id3_wrapped_flac/id3v2_id3v1_48000.flac` with
+`id3_wrapped_flac_observes_declared_extent_and_succeeds` and the trailer-only sibling in
+`src/convert/replaygain.rs`.
 
 **Status:** open, filed 2026-09-19. Not "nice to have": each item is a test whose absence let a
 user-visible failure ship past a green gate this month.
