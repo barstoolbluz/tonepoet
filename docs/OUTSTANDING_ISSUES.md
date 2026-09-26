@@ -1,8 +1,22 @@
 # Outstanding Issues
 
-Running list of diagnosed-but-unfixed issues. Newest at the top. Each entry records the
-symptom, the root cause (with code anchors), and the intended fix direction — enough to
-hand to a reasoning-model brief without re-diagnosing.
+Running list of diagnosed-but-unfixed issues. Entries are numbered in filing order and
+appended at the bottom, so the newest is last. Each entry records the symptom, the root
+cause (with code anchors), and the intended fix direction — enough to hand to a
+reasoning-model brief without re-diagnosing. A dated **Status** line inside an entry is
+authoritative over its original body.
+
+**Status sweep 2026-09-26** against `main @ 7083144` (v0.5.3), after the 2026-09-20 to
+2026-09-26 arcs (Reference DSD auto gain, SACD front end, parallel qualification, one preset
+schema, the five field defects, decode-only passthrough):
+- Resolved, field-verified: #33, #36, #39, #40, #41, #42, #45; #27 (manifest default-off since
+  e665357, none written in any 2026-09-26 field run); #28 earlier.
+- Fixed with regressions green, live TUI check still owed by the user: #43, #44.
+- Partly resolved: #37 (tool launch 0.7-1.2 s down to 0.1-0.18 s; tens-of-ms target open).
+- #35a delivered with #36 (a real queued ReplayGain conversion in the gate); #35b and #35c open.
+- #18 changed shape (incumbent now wins; the second conversion fails at Publish instead).
+- Open and unchanged: #2-#8, #10-#13, #15-#17, #19-#26, #29-#32, #34, #38.
+
 
 **Status sweep 2026-08-25:** every entry was re-verified against `main @ ec362ee` by reading the code
 path (not by grepping for absence — that method produced a false "open" on #7). Each issue carries a
@@ -1359,6 +1373,13 @@ count entirely. That devalues the mechanism for the cases where it is right.
 
 ## 18. Two concurrent conversions into one album directory refuse each other — including the one that started first
 
+**Status 2026-09-26:** changed shape on main @ 7083144. Re-run of the reproduction (two CLI
+conversions of different tracks of one album, same `--output`, 2 s apart): the first now
+succeeds and publishes; the second fails at Publish with "destination already exists:
+<album dir>" rather than at admission. Observation (b), the incumbent being refused, is gone.
+Observation (a), track-disjoint work into one album folder being refused, remains, now as a
+publish-time collision on the album directory.
+
 **Status:** open, **reproduced deterministically from the CLI**. 2026-08-31.
 
 ### Reproduction
@@ -2027,6 +2048,11 @@ Mechanism and scope are the implementer's call. Described in full as section B o
 
 ## 27. The conversion manifest is written to the output root, not the album folder, and serves nobody
 
+**Status 2026-09-26:** resolved. `PublishPolicy::write_manifest` defaults to false and every
+production request builder sets it false (commit e665357, "manifest default-off"); no
+`.tonepoet-manifest.json` appeared in any 2026-09-26 field output root. The `rerun` reader still
+exists but has nothing to read.
+
 **Status:** open. Established 2026-09-01, confirmed by the user against real DSD conversions.
 
 Tonepoet writes a hidden `.tonepoet-manifest.json` recording how a conversion was performed.
@@ -2601,6 +2627,12 @@ conversion, so conversions of these files with ReplayGain enabled are expected t
 
 ## 35. Missing test coverage: two field failures the gate could not see
 
+**Status 2026-09-26:** 35a delivered with #36 on main @ 6d11d35:
+`queued_independent_album_replaygain_reduces_across_all_members` runs a two-track album
+through `process_queue` with registered runtime executions and asserts the published tags
+(WAV, Album mode; the subprocess-writer and Track-mode variants are not covered). 35b and 35c
+remain open; 35b is to be delivered with #34.
+
 **Status:** open, filed 2026-09-19. Not "nice to have": each item is a test whose absence let a
 user-visible failure ship past a green gate this month.
 
@@ -2714,6 +2746,8 @@ milliseconds, with the containment guarantees unchanged. The Stage A profile re-
 shows the Metadata stage on Opus and AAC within a few percent of the tag writers' direct time.
 
 ## 38. Analyze detects ID3-wrapped FLACs and offers to repair them
+
+**Status:** open, not started; scheduled after #34, whose decode tolerance it builds on.
 
 Follows #34. Once the native decoder tolerates an ID3v2 prefix and an ID3v1 trailer, the
 wrappers are still a defect in the file: other tools trip on them, and every later native
