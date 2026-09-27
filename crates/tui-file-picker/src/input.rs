@@ -86,10 +86,65 @@ impl FilePickerState {
     }
 
     /// Insert text returned by the embedding application's asynchronous host
-    /// clipboard reader. Picker name/path editors are single-line, so this uses
-    /// the same first-line rule as bracketed terminal paste.
+    /// clipboard reader. Navigation-surface paste requests consume the same
+    /// snapshot as filesystem path input; picker name/path editors remain
+    /// single-line and use the same first-line rule as bracketed terminal paste.
     pub fn paste_host_clipboard_text(&mut self, text: &str) -> bool {
+        if let Some(target) = self.host_clipboard_filesystem_paste_target.take() {
+            if !self.file_operation_policy().allow_paste {
+                self.set_error(crate::state::FilePickerError::OperationDisabled("paste"));
+                return false;
+            }
+            let retained_matches = self
+                .clipboard
+                .as_ref()
+                .is_some_and(|clipboard| clipboard.matches_host_text(text));
+            let clipboard = match crate::filesystem_clipboard::filesystem_clipboard_from_host_text(
+                text,
+                self.clipboard.as_ref(),
+            ) {
+                Ok(clipboard) => clipboard,
+                Err(reason) => {
+                    self.set_error(crate::state::FilePickerError::ClipboardTextInvalid(reason));
+                    return false;
+                }
+            };
+            if !retained_matches {
+                self.clipboard = Some(clipboard.clone());
+                self.paste_retry_plan = None;
+            }
+            return match self.try_paste_clipboard_to(&target) {
+                Ok(()) => true,
+                Err(error) => {
+                    self.set_error(error);
+                    false
+                }
+            };
+        }
         self.handle_terminal_paste(text)
+    }
+
+    /// Apply a terminal-provided bracketed paste to picker navigation as a
+    /// filesystem paste. Unlike Ctrl+V/Ctrl+P, the host payload is already in
+    /// hand, so no asynchronous clipboard read is requested.
+    pub fn paste_filesystem_host_clipboard_text(&mut self, text: &str) -> bool {
+        self.host_clipboard_filesystem_paste_target = Some(self.filesystem_paste_target());
+        self.paste_host_clipboard_text(text)
+    }
+
+    fn request_host_filesystem_paste(&mut self, target: PathBuf) {
+        self.host_clipboard_filesystem_paste_target = Some(target);
+        self.host_clipboard_paste_requested = true;
+    }
+
+    fn request_host_text_paste(&mut self) {
+        // A newer text-paste request supersedes any filesystem destination
+        // frozen for an older asynchronous clipboard read. The embedding app
+        // already rejects the older read by generation; clearing this target
+        // also prevents the newer text payload from being misrouted as a file
+        // operation when it is delivered to the picker.
+        self.host_clipboard_filesystem_paste_target = None;
+        self.host_clipboard_paste_requested = true;
     }
 
     fn host_clipboard_paste_is_available(&self) -> bool {
@@ -192,7 +247,7 @@ impl FilePickerState {
             _ => false,
         };
         if host_text_paste_chord && self.host_clipboard_paste_is_available() {
-            self.host_clipboard_paste_requested = true;
+            self.request_host_text_paste();
             return FilePickerAction::None;
         }
         self.last_click = None;
@@ -753,8 +808,18 @@ impl FilePickerState {
                 self.cut_current();
                 FilePickerAction::None
             }
-            KeyCode::Char('v' | 'p') if key.modifiers == KeyModifiers::CONTROL => {
-                self.paste_clipboard();
+            KeyCode::Char(c)
+                if (c.eq_ignore_ascii_case(&'v')
+                    && (key.modifiers == KeyModifiers::CONTROL
+                        || key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)))
+                    || (c.eq_ignore_ascii_case(&'p')
+                        && key.modifiers == KeyModifiers::CONTROL) =>
+            {
+                if !self.file_operation_policy().allow_paste {
+                    self.set_error(FilePickerError::OperationDisabled("paste"));
+                    return FilePickerAction::None;
+                }
+                self.request_host_filesystem_paste(self.filesystem_paste_target());
                 FilePickerAction::None
             }
             KeyCode::Char(c)
@@ -923,8 +988,19 @@ impl FilePickerState {
             KeyCode::Char('x') if key.modifiers == KeyModifiers::CONTROL => {
                 self.apply_menu_action_if_enabled(FilePickerMenuAction::Cut)
             }
-            KeyCode::Char('v' | 'p') if key.modifiers == KeyModifiers::CONTROL => {
-                self.apply_menu_action_if_enabled(FilePickerMenuAction::Paste)
+            KeyCode::Char(c)
+                if (c.eq_ignore_ascii_case(&'v')
+                    && (key.modifiers == KeyModifiers::CONTROL
+                        || key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)))
+                    || (c.eq_ignore_ascii_case(&'p')
+                        && key.modifiers == KeyModifiers::CONTROL) =>
+            {
+                if self.file_operation_policy().allow_paste {
+                    self.request_host_filesystem_paste(self.filesystem_paste_target());
+                } else {
+                    self.set_error(FilePickerError::OperationDisabled("paste"));
+                }
+                FilePickerAction::None
             }
             KeyCode::Delete => self.apply_menu_action_if_enabled(FilePickerMenuAction::Delete),
             KeyCode::Char(c)
@@ -1651,9 +1727,7 @@ impl FilePickerState {
                 } else {
                     self.current_dir.clone()
                 };
-                if let Err(error) = self.try_paste_clipboard_to(&target) {
-                    self.set_error(error);
-                }
+                self.request_host_filesystem_paste(target);
                 self.close_menu();
                 FilePickerAction::None
             }
@@ -1736,7 +1810,7 @@ impl FilePickerState {
             }
             FilePickerMenuAction::TextPaste => {
                 if self.context_text_input_mut().is_some() {
-                    self.host_clipboard_paste_requested = true;
+                    self.request_host_text_paste();
                 }
                 self.close_menu();
                 FilePickerAction::None
@@ -2432,6 +2506,8 @@ mod tests {
         assert!(picker.paste_host_clipboard_text("/tmp/music\nignored"));
         assert_eq!(picker.address_input.text, "/tmp/music");
 
+        // A navigation surface also requests the authoritative host clipboard,
+        // but as a filesystem paste with a frozen destination, never as text.
         picker.cancel_address_edit();
         picker.focus = FilePickerFocus::Files;
         assert_eq!(
@@ -2441,7 +2517,35 @@ mod tests {
             )),
             FilePickerAction::None
         );
-        assert!(!picker.take_host_clipboard_paste_request());
+        assert!(picker.take_host_clipboard_paste_request());
+        assert_eq!(
+            picker.host_clipboard_filesystem_paste_target.as_deref(),
+            Some(temp.path()),
+        );
+    }
+
+    #[test]
+    fn newer_text_paste_request_clears_older_filesystem_paste_destination() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let frozen_destination = temp.path().join("destination");
+        fs::create_dir(&frozen_destination).expect("destination");
+        let mut picker = FilePickerState::new(FilePickerConfig {
+            start_dir: temp.path().to_path_buf(),
+            ..FilePickerConfig::default()
+        });
+
+        picker.request_host_filesystem_paste(frozen_destination);
+        assert!(picker.host_clipboard_filesystem_paste_target.is_some());
+
+        picker.begin_address_edit();
+        assert_eq!(
+            picker.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)),
+            FilePickerAction::None,
+        );
+        assert!(picker.host_clipboard_filesystem_paste_target.is_none());
+        assert!(picker.take_host_clipboard_paste_request());
+        assert!(picker.paste_host_clipboard_text("replacement"));
+        assert_eq!(picker.address_input.text, "replacement");
     }
 
     #[test]
@@ -2471,6 +2575,8 @@ mod tests {
             picker.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)),
             FilePickerAction::None,
         );
+        assert!(picker.take_host_clipboard_paste_request());
+        assert!(picker.paste_host_clipboard_text(&source.display().to_string()));
         assert!(picker.paste_task.is_some());
     }
 
@@ -2554,22 +2660,32 @@ mod tests {
     }
 
     #[test]
-    fn tree_ctrl_p_and_ctrl_v_paste_into_the_selected_tree_directory() {
-        for code in ['p', 'v'] {
+    fn tree_paste_chords_use_host_clipboard_and_selected_tree_directory() {
+        for (code, modifiers, label) in [
+            ('p', KeyModifiers::CONTROL, "Ctrl+P"),
+            ('v', KeyModifiers::CONTROL, "Ctrl+V"),
+            (
+                'v',
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                "Ctrl+Shift+V",
+            ),
+        ] {
             let (_temp, mut picker, source, current_dir, tree_target) =
                 picker_with_tree_clipboard();
 
             assert_eq!(
-                picker.handle_key(KeyEvent::new(KeyCode::Char(code), KeyModifiers::CONTROL)),
+                picker.handle_key(KeyEvent::new(KeyCode::Char(code), modifiers)),
                 FilePickerAction::None,
             );
+            assert!(picker.take_host_clipboard_paste_request());
+            assert!(picker.paste_host_clipboard_text(&source.display().to_string()));
 
             let expected = tree_target.join(source.file_name().expect("source name"));
             wait_for_path(&expected);
-            assert!(expected.exists(), "Ctrl+{code} must target the selected tree row");
+            assert!(expected.exists(), "{label} must target the selected tree row");
             assert!(
                 !current_dir.join(source.file_name().expect("source name")).exists(),
-                "Ctrl+{code} must not fall back to current_dir while Tree owns focus"
+                "{label} must not fall back to current_dir while Tree owns focus"
             );
         }
     }
@@ -2601,7 +2717,7 @@ mod tests {
     }
 
     #[test]
-    fn tree_paste_reports_empty_and_disabled_policy_without_changing_target() {
+    fn tree_paste_requests_host_clipboard_and_disabled_policy_still_blocks() {
         let temp = tempfile::tempdir().expect("tempdir");
         let current_dir = temp.path().join("current");
         let tree_target = temp.path().join("tree-target");
@@ -2614,7 +2730,8 @@ mod tests {
         select_tree_path(&mut picker, &tree_target);
 
         picker.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
-        assert!(matches!(picker.last_error(), Some(FilePickerError::ClipboardEmpty)));
+        assert!(picker.take_host_clipboard_paste_request());
+        assert!(picker.last_error().is_none());
         assert_eq!(picker.filesystem_paste_target(), tree_target);
 
         let source = temp.path().join("source.flac");
@@ -2986,7 +3103,7 @@ mod tests {
     }
 
     #[test]
-    fn disabled_paste_menu_does_not_call_paste() {
+    fn paste_menu_requests_authoritative_host_clipboard_even_without_retained_transaction() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut picker = FilePickerState::new(FilePickerConfig {
             start_dir: temp.path().to_path_buf(),
@@ -3000,7 +3117,8 @@ mod tests {
             .position(|(label, _)| *label == "Paste")
             .expect("toolbar menu exposes Paste");
         let _ = picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(matches!(picker.last_error(), Some(FilePickerError::ClipboardEmpty)));
+        assert!(picker.take_host_clipboard_paste_request());
+        assert!(picker.last_error().is_none());
     }
 
 

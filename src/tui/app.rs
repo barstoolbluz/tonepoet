@@ -13524,8 +13524,9 @@ pub enum ConfirmAction {
         scope: TagTransferScope,
         edit_count: usize,
     },
-    /// Apply a frozen terminal-clipboard snapshot to the selected metadata
-    /// row after the user confirms positional/multi-field overwrite semantics.
+    /// Apply a frozen terminal-clipboard snapshot after confirmation. The
+    /// field index may be the add-row sentinel for a rowless structured field
+    /// set; row-specific payloads still require an existing metadata row.
     MetadataRowsClipboardPaste {
         session_id: u64,
         field_index: usize,

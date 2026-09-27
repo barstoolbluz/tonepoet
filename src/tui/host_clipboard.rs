@@ -7,6 +7,8 @@
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
+#[cfg(target_os = "linux")]
+use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -24,11 +26,16 @@ const CLIPBOARD_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const CLIPBOARD_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const CLIPBOARD_WRITE_DRAIN_TIMEOUT: Duration = Duration::from_secs(8);
 const CLIPBOARD_HISTORY_LIMIT: usize = 32;
+#[cfg(target_os = "linux")]
+const LINUX_ANCESTOR_SCAN_LIMIT: usize = 64;
+#[cfg(target_os = "linux")]
+const LINUX_PROC_ENV_MAX_BYTES: usize = 256 * 1024;
 
 #[derive(Default)]
 struct HostClipboardWriteState {
     pending: Option<String>,
     worker_running: bool,
+    last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,25 +63,52 @@ struct ClipboardAttempt {
     outcome: Result<String, String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct ClipboardEnvironment {
     wayland_display: Option<OsString>,
     display: Option<OsString>,
+    xdg_runtime_dir: Option<OsString>,
+    xauthority: Option<OsString>,
     tmux: Option<OsString>,
     sty: Option<OsString>,
     term: Option<OsString>,
     path: Option<OsString>,
+    wayland_display_source: Option<String>,
+    display_source: Option<String>,
+    remote_session: bool,
 }
 
 impl ClipboardEnvironment {
     fn detect() -> Self {
-        Self {
-            wayland_display: std::env::var_os("WAYLAND_DISPLAY"),
-            display: std::env::var_os("DISPLAY"),
-            tmux: std::env::var_os("TMUX"),
-            sty: std::env::var_os("STY"),
-            term: std::env::var_os("TERM"),
-            path: std::env::var_os("PATH"),
+        let wayland_display = nonempty_env_var("WAYLAND_DISPLAY");
+        let display = nonempty_env_var("DISPLAY");
+        let env = Self {
+            wayland_display_source: wayland_display
+                .as_ref()
+                .map(|_| "process environment".to_string()),
+            display_source: display
+                .as_ref()
+                .map(|_| "process environment".to_string()),
+            wayland_display,
+            display,
+            xdg_runtime_dir: nonempty_env_var("XDG_RUNTIME_DIR"),
+            xauthority: nonempty_env_var("XAUTHORITY"),
+            tmux: nonempty_env_var("TMUX"),
+            sty: nonempty_env_var("STY"),
+            term: nonempty_env_var("TERM"),
+            path: nonempty_env_var("PATH"),
+            remote_session: nonempty_env_var("SSH_CONNECTION").is_some()
+                || nonempty_env_var("SSH_TTY").is_some(),
+        };
+        #[cfg(target_os = "linux")]
+        {
+            let mut env = env;
+            recover_linux_graphical_environment(&mut env);
+            env
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            env
         }
     }
 
@@ -93,6 +127,208 @@ impl ClipboardEnvironment {
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "<unset>".to_string())
     }
+
+    fn display_value_with_source(value: &Option<OsString>, source: &Option<String>) -> String {
+        let value = Self::display_value(value);
+        match source {
+            Some(source) if value != "<unset>" => format!("{value} ({source})"),
+            _ => value,
+        }
+    }
+}
+
+fn nonempty_env_var(name: &str) -> Option<OsString> {
+    std::env::var_os(name).filter(|value| !value.is_empty())
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Default)]
+struct LinuxAncestorEnvironment {
+    wayland_display: Option<OsString>,
+    display: Option<OsString>,
+    xdg_runtime_dir: Option<OsString>,
+    xauthority: Option<OsString>,
+    remote_session: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn recover_linux_graphical_environment(env: &mut ClipboardEnvironment) {
+    if env.display.is_some()
+        || (env.wayland_display.is_some() && env.xdg_runtime_dir.is_some())
+    {
+        return;
+    }
+
+    let Some((mut pid, current_euid)) = linux_process_parent_and_euid(std::process::id()) else {
+        infer_wayland_display_from_runtime(env);
+        return;
+    };
+
+    for _ in 0..LINUX_ANCESTOR_SCAN_LIMIT {
+        if pid <= 1 {
+            break;
+        }
+        let Some((parent_pid, ancestor_euid)) = linux_process_parent_and_euid(pid) else {
+            break;
+        };
+        if ancestor_euid == current_euid {
+            if let Some(ancestor) = read_linux_ancestor_environment(pid) {
+                merge_linux_ancestor_environment(env, pid, &ancestor);
+            }
+        }
+        if parent_pid == 0 || parent_pid == pid {
+            break;
+        }
+        pid = parent_pid;
+    }
+
+    infer_wayland_display_from_runtime(env);
+}
+
+#[cfg(target_os = "linux")]
+fn infer_wayland_display_from_runtime(env: &mut ClipboardEnvironment) {
+    if env.wayland_display.is_some() || env.remote_session {
+        return;
+    }
+    let Some(runtime_dir) = env.xdg_runtime_dir.as_deref() else {
+        return;
+    };
+    let Some(display) = discover_unique_wayland_socket(Path::new(runtime_dir)) else {
+        return;
+    };
+    env.wayland_display = Some(display.clone());
+    env.wayland_display_source = Some(format!(
+        "unique socket {}",
+        Path::new(runtime_dir).join(Path::new(&display)).display()
+    ));
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_parent_and_euid(pid: u32) -> Option<(u32, u32)> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let mut parent_pid = None;
+    let mut effective_uid = None;
+    for line in status.lines() {
+        if let Some(value) = line.strip_prefix("PPid:") {
+            parent_pid = value.trim().parse::<u32>().ok();
+        } else if let Some(value) = line.strip_prefix("Uid:") {
+            effective_uid = value
+                .split_whitespace()
+                .nth(1)
+                .and_then(|value| value.parse::<u32>().ok());
+        }
+        if parent_pid.is_some() && effective_uid.is_some() {
+            break;
+        }
+    }
+    Some((parent_pid?, effective_uid?))
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_ancestor_environment(pid: u32) -> Option<LinuxAncestorEnvironment> {
+    let file = File::open(format!("/proc/{pid}/environ")).ok()?;
+    let mut bytes = Vec::new();
+    file.take((LINUX_PROC_ENV_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > LINUX_PROC_ENV_MAX_BYTES {
+        return None;
+    }
+    Some(parse_linux_ancestor_environment(&bytes))
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_ancestor_environment(bytes: &[u8]) -> LinuxAncestorEnvironment {
+    use std::os::unix::ffi::OsStringExt;
+
+    let mut result = LinuxAncestorEnvironment::default();
+    for entry in bytes.split(|byte| *byte == 0).filter(|entry| !entry.is_empty()) {
+        let Some(separator) = entry.iter().position(|byte| *byte == b'=') else {
+            continue;
+        };
+        let key = &entry[..separator];
+        let value = &entry[separator + 1..];
+        if value.is_empty() {
+            continue;
+        }
+        let value = || OsString::from_vec(value.to_vec());
+        if key == b"WAYLAND_DISPLAY" {
+            result.wayland_display = Some(value());
+        } else if key == b"DISPLAY" {
+            result.display = Some(value());
+        } else if key == b"XDG_RUNTIME_DIR" {
+            result.xdg_runtime_dir = Some(value());
+        } else if key == b"XAUTHORITY" {
+            result.xauthority = Some(value());
+        } else if key == b"SSH_CONNECTION" || key == b"SSH_TTY" {
+            result.remote_session = true;
+        }
+    }
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn merge_linux_ancestor_environment(
+    env: &mut ClipboardEnvironment,
+    pid: u32,
+    ancestor: &LinuxAncestorEnvironment,
+) {
+    env.remote_session |= ancestor.remote_session;
+
+    if env.wayland_display.is_none() {
+        if let Some(display) = ancestor.wayland_display.as_ref() {
+            env.wayland_display = Some(display.clone());
+            env.wayland_display_source = Some(format!("same-UID ancestor pid {pid}"));
+            if ancestor.xdg_runtime_dir.is_some() {
+                env.xdg_runtime_dir = ancestor.xdg_runtime_dir.clone();
+            }
+        }
+    } else if env.xdg_runtime_dir.is_none()
+        && ancestor.wayland_display.as_ref() == env.wayland_display.as_ref()
+    {
+        env.xdg_runtime_dir = ancestor.xdg_runtime_dir.clone();
+    }
+
+    if env.display.is_none() {
+        if let Some(display) = ancestor.display.as_ref() {
+            env.display = Some(display.clone());
+            env.display_source = Some(format!("same-UID ancestor pid {pid}"));
+            if ancestor.xauthority.is_some() {
+                env.xauthority = ancestor.xauthority.clone();
+            }
+        }
+    } else if env.xauthority.is_none() && ancestor.display.as_ref() == env.display.as_ref() {
+        env.xauthority = ancestor.xauthority.clone();
+    }
+
+    if env.xdg_runtime_dir.is_none() {
+        env.xdg_runtime_dir = ancestor.xdg_runtime_dir.clone();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn discover_unique_wayland_socket(runtime_dir: &Path) -> Option<OsString> {
+    use std::os::unix::fs::FileTypeExt;
+
+    let mut candidate = None;
+    for entry in std::fs::read_dir(runtime_dir).ok()?.flatten() {
+        let name = entry.file_name();
+        let name_text = name.to_string_lossy();
+        if !name_text.starts_with("wayland-") || name_text.ends_with(".lock") {
+            continue;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_socket() {
+            continue;
+        }
+        if candidate.is_some() {
+            return None;
+        }
+        candidate = Some(name);
+    }
+    candidate
 }
 
 #[derive(Debug, Clone)]
@@ -110,8 +346,19 @@ struct HostWriteOutcome {
 
 trait ClipboardBackend {
     fn command_exists(&self, program: &str, env: &ClipboardEnvironment) -> bool;
-    fn write_command(&self, program: &str, args: &[&str], payload: &[u8]) -> Result<(), String>;
-    fn read_command(&self, program: &str, args: &[&str]) -> Result<String, String>;
+    fn write_command(
+        &self,
+        program: &str,
+        args: &[&str],
+        payload: &[u8],
+        env: &ClipboardEnvironment,
+    ) -> Result<(), String>;
+    fn read_command(
+        &self,
+        program: &str,
+        args: &[&str],
+        env: &ClipboardEnvironment,
+    ) -> Result<String, String>;
     fn write_osc52(&self, text: &str, env: &ClipboardEnvironment) -> Result<(), String>;
 }
 
@@ -122,12 +369,23 @@ impl ClipboardBackend for RealClipboardBackend {
         program_exists_in_path(program, env.path.as_deref())
     }
 
-    fn write_command(&self, program: &str, args: &[&str], payload: &[u8]) -> Result<(), String> {
-        run_clipboard_write(program, args, payload)
+    fn write_command(
+        &self,
+        program: &str,
+        args: &[&str],
+        payload: &[u8],
+        env: &ClipboardEnvironment,
+    ) -> Result<(), String> {
+        run_clipboard_write(program, args, payload, env)
     }
 
-    fn read_command(&self, program: &str, args: &[&str]) -> Result<String, String> {
-        run_clipboard_read(program, args)
+    fn read_command(
+        &self,
+        program: &str,
+        args: &[&str],
+        env: &ClipboardEnvironment,
+    ) -> Result<String, String> {
+        run_clipboard_read(program, args, env)
     }
 
     fn write_osc52(&self, text: &str, env: &ClipboardEnvironment) -> Result<(), String> {
@@ -245,6 +503,7 @@ pub(crate) fn publish_system_clipboard(text: &str) {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.pending = Some(text.to_string());
+        state.last_error = None;
         if state.worker_running {
             false
         } else {
@@ -264,6 +523,7 @@ pub(crate) fn publish_system_clipboard(text: &str) {
             state.worker_running = false;
             state.pending = None;
             let detail = format!("could not start host clipboard worker: {error}");
+            state.last_error = Some(detail.clone());
             record_attempt(ClipboardOperation::Write, "worker", Err(detail.clone()));
             send_status(format!(
                 "Host clipboard write failed: {detail}"
@@ -309,11 +569,19 @@ fn host_clipboard_write_worker_with<B, E, S>(
         let env = detect_environment();
         match write_host_clipboard_with(backend, &env, &next, ClipboardOperation::Write) {
             Ok(outcome) => {
+                state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .last_error = None;
                 if let Some(warning) = outcome.warning {
                     report_status(format!("Host clipboard write warning: {warning}"));
                 }
             }
             Err(error) => {
+                state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .last_error = Some(error.clone());
                 log::debug!("host clipboard write unavailable: {error}");
                 report_status(format!(
                     "Host clipboard write failed: {error}; run :clipboard"
@@ -328,11 +596,14 @@ fn host_clipboard_write_worker_with<B, E, S>(
 /// Paste can race the asynchronous writer and read the host's previous value.
 /// A bounded failure is safer than silently pasting stale external contents if
 /// a host helper wedges despite its own command deadline.
-fn wait_for_prior_host_clipboard_writes() -> Result<(), String> {
+fn wait_for_host_clipboard_write_state(
+    state: &Mutex<HostClipboardWriteState>,
+    timeout: Duration,
+) -> Result<(), String> {
     let started = Instant::now();
     loop {
         let drained = {
-            let state = write_state()
+            let state = state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             !state.worker_running && state.pending.is_none()
@@ -340,7 +611,7 @@ fn wait_for_prior_host_clipboard_writes() -> Result<(), String> {
         if drained {
             return Ok(());
         }
-        if started.elapsed() >= CLIPBOARD_WRITE_DRAIN_TIMEOUT {
+        if started.elapsed() >= timeout {
             return Err(
                 "timed out waiting for a prior Tonepoet host-clipboard write to finish"
                     .to_string(),
@@ -350,12 +621,78 @@ fn wait_for_prior_host_clipboard_writes() -> Result<(), String> {
     }
 }
 
+fn wait_for_host_clipboard_write_completion(
+    state: &Mutex<HostClipboardWriteState>,
+    timeout: Duration,
+) -> Result<(), String> {
+    wait_for_host_clipboard_write_state(state, timeout)?;
+    let mut state = state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match state.last_error.take() {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// Wait for queued Tonepoet host-clipboard publications to finish. Structured
+/// metadata copy uses this as a publication barrier before returning control
+/// to the terminal, which closes the app-controlled part of the immediate
+/// Copy -> bracketed-paste race without retaining clipboard text in-process.
+pub(crate) fn wait_for_host_clipboard_publication() -> Result<(), String> {
+    wait_for_host_clipboard_write_completion(write_state(), CLIPBOARD_WRITE_DRAIN_TIMEOUT)
+}
+
+fn wait_for_prior_host_clipboard_writes() -> Result<(), String> {
+    wait_for_host_clipboard_publication()
+}
+
 /// Launch a bounded host clipboard read. The generation and semantic target
 /// prevent a late completion from mutating a different editor.
 pub(crate) fn request_host_clipboard_paste(
     tx: mpsc::Sender<AppMessage>,
     generation: u64,
     target: HostClipboardPasteTarget,
+) {
+    request_host_clipboard_paste_inner(tx, generation, target, None);
+}
+
+/// Reconcile a terminal-generated bracketed paste with the host clipboard.
+///
+/// The terminal payload is only a one-shot transport fallback. It is captured
+/// by this read operation and discarded with the worker; it is never retained
+/// as an in-process clipboard authority. When a native host read is available,
+/// that newer snapshot wins after all queued Tonepoet writes have drained.
+pub(crate) fn request_host_clipboard_paste_with_fallback(
+    tx: mpsc::Sender<AppMessage>,
+    generation: u64,
+    target: HostClipboardPasteTarget,
+    terminal_fallback: String,
+) {
+    request_host_clipboard_paste_inner(
+        tx,
+        generation,
+        target,
+        Some(terminal_fallback),
+    );
+}
+
+fn resolve_host_clipboard_read(
+    result: Result<String, String>,
+    terminal_fallback: Option<String>,
+) -> Result<String, String> {
+    match (result, terminal_fallback) {
+        (Ok(text), _) => Ok(text),
+        (Err(_), Some(text)) => Ok(text),
+        (Err(error), None) => Err(error),
+    }
+}
+
+fn request_host_clipboard_paste_inner(
+    tx: mpsc::Sender<AppMessage>,
+    generation: u64,
+    target: HostClipboardPasteTarget,
+    terminal_fallback: Option<String>,
 ) {
     let fallback_tx = tx.clone();
     let fallback_target = target.clone();
@@ -365,7 +702,10 @@ pub(crate) fn request_host_clipboard_paste(
             let result = wait_for_prior_host_clipboard_writes().and_then(|()| {
                 let env = ClipboardEnvironment::detect();
                 let backend = RealClipboardBackend;
-                read_host_clipboard_with(&backend, &env, ClipboardOperation::Read)
+                resolve_host_clipboard_read(
+                    read_host_clipboard_with(&backend, &env, ClipboardOperation::Read),
+                    terminal_fallback,
+                )
             });
             let _ = tx.blocking_send(AppMessage::HostClipboardReadComplete {
                 generation,
@@ -498,9 +838,15 @@ fn clipboard_diagnostic_report(backend: &impl ClipboardBackend) -> String {
         .cloned()
         .collect::<Vec<_>>();
     let mut report = format!(
-        "Environment\n  WAYLAND_DISPLAY={}\n  DISPLAY={}\n  TMUX={}\n  STY={}\n  TERM={}\n\nDetected transports\n  write: {}{}\n  read: {}\n\nLive self-test\n  {}\n\nRecent attempts",
-        ClipboardEnvironment::display_value(&env.wayland_display),
-        ClipboardEnvironment::display_value(&env.display),
+        "Environment\n  WAYLAND_DISPLAY={}\n  DISPLAY={}\n  XDG_RUNTIME_DIR={}\n  XAUTHORITY={}\n  remote-session={}\n  TMUX={}\n  STY={}\n  TERM={}\n\nDetected transports\n  write: {}{}\n  read: {}\n\nLive self-test\n  {}\n\nRecent attempts",
+        ClipboardEnvironment::display_value_with_source(
+            &env.wayland_display,
+            &env.wayland_display_source,
+        ),
+        ClipboardEnvironment::display_value_with_source(&env.display, &env.display_source),
+        ClipboardEnvironment::display_value(&env.xdg_runtime_dir),
+        ClipboardEnvironment::display_value(&env.xauthority),
+        if env.remote_session { "yes" } else { "no" },
         ClipboardEnvironment::display_value(&env.tmux),
         ClipboardEnvironment::display_value(&env.sty),
         ClipboardEnvironment::display_value(&env.term),
@@ -546,7 +892,7 @@ fn write_host_clipboard_with(
     let mut errors = Vec::new();
     if text.len() <= NATIVE_CLIPBOARD_MAX_BYTES {
         for candidate in native_write_candidates(backend, env) {
-            match backend.write_command(candidate.program, &candidate.args, text.as_bytes()) {
+            match backend.write_command(candidate.program, &candidate.args, text.as_bytes(), env) {
                 Ok(()) => {
                     record_attempt(
                         operation,
@@ -623,7 +969,7 @@ fn read_host_clipboard_with(
 
     let mut errors = Vec::new();
     for candidate in candidates {
-        match backend.read_command(candidate.program, &candidate.args) {
+        match backend.read_command(candidate.program, &candidate.args, env) {
             Ok(text) => {
                 record_attempt(
                     operation,
@@ -715,7 +1061,7 @@ fn actionable_write_error(env: &ClipboardEnvironment, errors: &[String]) -> Stri
     let mut reason = if cfg!(target_os = "macos") {
         "no usable pbcopy transport".to_string()
     } else if env.wayland_display.is_none() && env.display.is_none() {
-        "no WAYLAND_DISPLAY or DISPLAY; native clipboard helpers were not eligible".to_string()
+        "no readable Wayland/X11 display could be resolved from the process or same-UID session ancestry; native clipboard helpers were not eligible".to_string()
     } else {
         "no usable wl-copy/xclip/xsel transport".to_string()
     };
@@ -736,7 +1082,13 @@ fn actionable_read_error(env: &ClipboardEnvironment, errors: &[String]) -> Strin
     let mut reason = if cfg!(target_os = "macos") {
         "host clipboard read requires a usable pbpaste transport".to_string()
     } else if env.wayland_display.is_none() && env.display.is_none() {
-        "host clipboard read requires WAYLAND_DISPLAY or DISPLAY".to_string()
+        if env.remote_session {
+            "host clipboard read could not resolve a readable Wayland/X11 display from this remote session lineage; write-only OSC 52 cannot service Ctrl+V/Ctrl+P"
+                .to_string()
+        } else {
+            "host clipboard read could not resolve a readable Wayland/X11 display from the process or same-UID session ancestry"
+                .to_string()
+        }
     } else {
         "install wl-clipboard, xclip, or xsel, or fix the detected helper".to_string()
     };
@@ -771,18 +1123,26 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
-fn run_clipboard_write(program: &str, args: &[&str], payload: &[u8]) -> Result<(), String> {
+fn run_clipboard_write(
+    program: &str,
+    args: &[&str],
+    payload: &[u8],
+    env: &ClipboardEnvironment,
+) -> Result<(), String> {
     // Clipboard writers such as xclip may fork a long-lived selection owner.
     // Piping stderr and waiting for EOF would then wait on every descendant
     // that inherited the descriptor, defeating the command timeout and
     // stranding the coalescing worker. Native write failures remain actionable
     // through the helper name and exit status; foreground reads still retain
     // bounded stdout/stderr capture below.
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    apply_clipboard_command_environment(&mut command, env);
+    let mut child = command
         .spawn()
         .map_err(|error| error.to_string())?;
 
@@ -806,12 +1166,19 @@ fn run_clipboard_write(program: &str, args: &[&str], payload: &[u8]) -> Result<(
     }
 }
 
-fn run_clipboard_read(program: &str, args: &[&str]) -> Result<String, String> {
-    let mut child = Command::new(program)
+fn run_clipboard_read(
+    program: &str,
+    args: &[&str],
+    env: &ClipboardEnvironment,
+) -> Result<String, String> {
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    apply_clipboard_command_environment(&mut command, env);
+    let mut child = command
         .spawn()
         .map_err(|error| error.to_string())?;
 
@@ -855,6 +1222,21 @@ fn run_clipboard_read(program: &str, args: &[&str]) -> Result<String, String> {
         ));
     }
     String::from_utf8(bytes).map_err(|_| "clipboard text is not valid UTF-8".to_string())
+}
+
+fn apply_clipboard_command_environment(command: &mut Command, env: &ClipboardEnvironment) {
+    if let Some(value) = env.wayland_display.as_ref() {
+        command.env("WAYLAND_DISPLAY", value);
+    }
+    if let Some(value) = env.display.as_ref() {
+        command.env("DISPLAY", value);
+    }
+    if let Some(value) = env.xdg_runtime_dir.as_ref() {
+        command.env("XDG_RUNTIME_DIR", value);
+    }
+    if let Some(value) = env.xauthority.as_ref() {
+        command.env("XAUTHORITY", value);
+    }
 }
 
 fn read_bounded_stderr(stderr: impl Read) -> Result<String, String> {
@@ -985,6 +1367,7 @@ mod tests {
             program: &str,
             _args: &[&str],
             _payload: &[u8],
+            _env: &ClipboardEnvironment,
         ) -> Result<(), String> {
             self.writes
                 .lock()
@@ -996,7 +1379,12 @@ mod tests {
                 .unwrap_or(Ok(()))
         }
 
-        fn read_command(&self, program: &str, _args: &[&str]) -> Result<String, String> {
+        fn read_command(
+            &self,
+            program: &str,
+            _args: &[&str],
+            _env: &ClipboardEnvironment,
+        ) -> Result<String, String> {
             self.read_results
                 .get(program)
                 .cloned()
@@ -1010,24 +1398,198 @@ mod tests {
 
     fn x11_env() -> ClipboardEnvironment {
         ClipboardEnvironment {
-            wayland_display: None,
             display: Some(OsString::from(":0")),
-            tmux: None,
-            sty: None,
             term: Some(OsString::from("xterm-256color")),
-            path: None,
+            display_source: Some("test fixture".to_string()),
+            ..ClipboardEnvironment::default()
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_ancestor_environment_parser_extracts_clipboard_context() {
+        let parsed = parse_linux_ancestor_environment(
+            b"PATH=/bin\0WAYLAND_DISPLAY=wayland-7\0XDG_RUNTIME_DIR=/run/user/1000\0DISPLAY=:3\0XAUTHORITY=/run/user/1000/xauth\0SSH_CONNECTION=client server\0",
+        );
+        assert_eq!(
+            parsed.wayland_display.as_deref(),
+            Some(std::ffi::OsStr::new("wayland-7"))
+        );
+        assert_eq!(
+            parsed.xdg_runtime_dir.as_deref(),
+            Some(std::ffi::OsStr::new("/run/user/1000"))
+        );
+        assert_eq!(
+            parsed.display.as_deref(),
+            Some(std::ffi::OsStr::new(":3"))
+        );
+        assert_eq!(
+            parsed.xauthority.as_deref(),
+            Some(std::ffi::OsStr::new("/run/user/1000/xauth"))
+        );
+        assert!(parsed.remote_session);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nearest_same_uid_ancestor_fills_missing_display_context_without_overriding_inherited_values() {
+        let mut env = ClipboardEnvironment {
+            display: Some(OsString::from(":42")),
+            display_source: Some("process environment".to_string()),
+            xdg_runtime_dir: Some(OsString::from("/run/user/1000/sandbox")),
+            ..ClipboardEnvironment::default()
+        };
+        let nearest = LinuxAncestorEnvironment {
+            wayland_display: Some(OsString::from("wayland-2")),
+            display: Some(OsString::from(":7")),
+            xdg_runtime_dir: Some(OsString::from("/run/user/1000")),
+            xauthority: Some(OsString::from("/tmp/nearest-xauth")),
+            remote_session: false,
+        };
+        merge_linux_ancestor_environment(&mut env, 4242, &nearest);
+
+        assert_eq!(env.display.as_deref(), Some(std::ffi::OsStr::new(":42")));
+        assert_eq!(
+            env.display_source.as_deref(),
+            Some("process environment")
+        );
+        assert_eq!(
+            env.wayland_display.as_deref(),
+            Some(std::ffi::OsStr::new("wayland-2"))
+        );
+        assert_eq!(
+            env.wayland_display_source.as_deref(),
+            Some("same-UID ancestor pid 4242")
+        );
+        assert_eq!(
+            env.xdg_runtime_dir.as_deref(),
+            Some(std::ffi::OsStr::new("/run/user/1000"))
+        );
+        assert!(env.xauthority.is_none());
+
+        let farther = LinuxAncestorEnvironment {
+            wayland_display: Some(OsString::from("wayland-9")),
+            display: Some(OsString::from(":9")),
+            xdg_runtime_dir: Some(OsString::from("/run/user/1000/farther")),
+            xauthority: Some(OsString::from("/tmp/farther-xauth")),
+            remote_session: false,
+        };
+        merge_linux_ancestor_environment(&mut env, 3131, &farther);
+        assert_eq!(
+            env.wayland_display.as_deref(),
+            Some(std::ffi::OsStr::new("wayland-2"))
+        );
+        assert_eq!(env.display.as_deref(), Some(std::ffi::OsStr::new(":42")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recovered_x11_display_makes_native_clipboard_read_eligible() {
+        let mut env = ClipboardEnvironment {
+            xauthority: Some(OsString::from("/tmp/stale-xauth")),
+            ..ClipboardEnvironment::default()
+        };
+        let ancestor = LinuxAncestorEnvironment {
+            display: Some(OsString::from(":7")),
+            xauthority: Some(OsString::from("/tmp/tonepoet-xauth")),
+            ..LinuxAncestorEnvironment::default()
+        };
+        merge_linux_ancestor_environment(&mut env, 4242, &ancestor);
+
+        let mut backend = FakeBackend::default();
+        backend.programs.insert("xclip".to_string());
+        backend
+            .read_results
+            .insert("xclip".to_string(), Ok("Duke".to_string()));
+        let value = read_host_clipboard_with(
+            &backend,
+            &env,
+            ClipboardOperation::Diagnostic,
+        )
+        .expect("ancestor-recovered DISPLAY should admit xclip");
+        assert_eq!(value, "Duke");
+        assert_eq!(
+            env.xauthority.as_deref(),
+            Some(std::ffi::OsStr::new("/tmp/tonepoet-xauth"))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unique_wayland_runtime_socket_is_inferred_only_for_local_sessions() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let socket_path = temp.path().join("wayland-5");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket_path)
+            .expect("wayland fixture socket");
+        std::fs::write(temp.path().join("wayland-5.lock"), b"fixture")
+            .expect("lock fixture");
+
+        let mut local = ClipboardEnvironment {
+            xdg_runtime_dir: Some(temp.path().as_os_str().to_os_string()),
+            ..ClipboardEnvironment::default()
+        };
+        infer_wayland_display_from_runtime(&mut local);
+        assert_eq!(
+            local.wayland_display.as_deref(),
+            Some(std::ffi::OsStr::new("wayland-5"))
+        );
+
+        let mut remote = ClipboardEnvironment {
+            xdg_runtime_dir: Some(temp.path().as_os_str().to_os_string()),
+            remote_session: true,
+            ..ClipboardEnvironment::default()
+        };
+        infer_wayland_display_from_runtime(&mut remote);
+        assert!(remote.wayland_display.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn multiple_wayland_runtime_sockets_are_not_guessed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _first = std::os::unix::net::UnixListener::bind(temp.path().join("wayland-0"))
+            .expect("first wayland fixture socket");
+        let _second = std::os::unix::net::UnixListener::bind(temp.path().join("wayland-1"))
+            .expect("second wayland fixture socket");
+
+        let mut env = ClipboardEnvironment {
+            xdg_runtime_dir: Some(temp.path().as_os_str().to_os_string()),
+            ..ClipboardEnvironment::default()
+        };
+        infer_wayland_display_from_runtime(&mut env);
+        assert!(env.wayland_display.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_clipboard_helper_receives_resolved_display_environment() {
+        let env = ClipboardEnvironment {
+            wayland_display: Some(OsString::from("wayland-4")),
+            display: Some(OsString::from(":8")),
+            xdg_runtime_dir: Some(OsString::from("/run/user/1000")),
+            xauthority: Some(OsString::from("/tmp/tonepoet-xauth")),
+            ..ClipboardEnvironment::default()
+        };
+        let value = run_clipboard_read(
+            "sh",
+            &[
+                "-c",
+                "printf '%s|%s|%s|%s' \"$WAYLAND_DISPLAY\" \"$DISPLAY\" \"$XDG_RUNTIME_DIR\" \"$XAUTHORITY\"",
+            ],
+            &env,
+        )
+        .expect("shell fixture should inherit resolved display context");
+        assert_eq!(
+            value,
+            "wayland-4|:8|/run/user/1000|/tmp/tonepoet-xauth"
+        );
     }
 
     #[cfg(target_os = "macos")]
     fn macos_env() -> ClipboardEnvironment {
         ClipboardEnvironment {
-            wayland_display: None,
-            display: None,
-            tmux: None,
-            sty: None,
             term: Some(OsString::from("xterm-256color")),
-            path: None,
+            ..ClipboardEnvironment::default()
         }
     }
 
@@ -1049,6 +1611,7 @@ mod tests {
             program: &str,
             _args: &[&str],
             payload: &[u8],
+            env: &ClipboardEnvironment,
         ) -> Result<(), String> {
             assert_eq!(program, "xclip");
             if self
@@ -1073,10 +1636,15 @@ mod tests {
                 "tonepoet-clipboard-test",
                 log_path.as_ref(),
             ];
-            run_clipboard_write("sh", &args, payload)
+            run_clipboard_write("sh", &args, payload, env)
         }
 
-        fn read_command(&self, _program: &str, _args: &[&str]) -> Result<String, String> {
+        fn read_command(
+            &self,
+            _program: &str,
+            _args: &[&str],
+            _env: &ClipboardEnvironment,
+        ) -> Result<String, String> {
             Err("unused".to_string())
         }
 
@@ -1093,13 +1661,93 @@ mod tests {
     #[test]
     fn native_write_does_not_wait_for_a_descendant_that_inherits_stderr() {
         let started = Instant::now();
-        run_clipboard_write("sh", &["-c", "cat >/dev/null; sleep 5 &"], b"Duke")
-            .expect("immediate clipboard owner parent exits successfully");
+        run_clipboard_write(
+            "sh",
+            &["-c", "cat >/dev/null; sleep 5 &"],
+            b"Duke",
+            &x11_env(),
+        )
+        .expect("immediate clipboard owner parent exits successfully");
         assert!(
             started.elapsed() < CLIPBOARD_COMMAND_TIMEOUT,
             "native write waited for a background descendant instead of the immediate child: {:?}",
             started.elapsed(),
         );
+    }
+
+    #[test]
+    fn metadata_copy_publication_barrier_waits_for_queued_write_before_returning() {
+        let state = std::sync::Arc::new(Mutex::new(HostClipboardWriteState {
+            pending: Some("structured metadata envelope".to_string()),
+            worker_running: true,
+            last_error: None,
+        }));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_state = std::sync::Arc::clone(&state);
+        let worker = std::thread::spawn(move || {
+            ready_tx.send(()).expect("signal waiter");
+            release_rx.recv().expect("release publication");
+            let mut state = worker_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.pending = None;
+            state.worker_running = false;
+        });
+        ready_rx.recv().expect("publication worker ready");
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            release_tx.send(()).expect("release publication worker");
+        });
+
+        let started = Instant::now();
+        wait_for_host_clipboard_write_completion(state.as_ref(), Duration::from_secs(1))
+            .expect("publication barrier drains");
+        assert!(
+            started.elapsed() >= Duration::from_millis(30),
+            "metadata copy returned before its queued host publication drained",
+        );
+        releaser.join().expect("publication releaser");
+        worker.join().expect("publication worker");
+    }
+
+    #[test]
+    fn metadata_copy_publication_barrier_surfaces_and_consumes_write_failure() {
+        let state = Mutex::new(HostClipboardWriteState {
+            pending: None,
+            worker_running: false,
+            last_error: Some("xclip exited with status 1".to_string()),
+        });
+
+        let error = wait_for_host_clipboard_write_completion(&state, Duration::from_millis(1))
+            .expect_err("failed publication must not be reported as a successful copy");
+        assert_eq!(error, "xclip exited with status 1");
+        wait_for_host_clipboard_write_completion(&state, Duration::from_millis(1))
+            .expect("the reported failure must not poison unrelated later clipboard reads");
+    }
+
+    #[test]
+    fn bracketed_metadata_reconciliation_prefers_the_fresh_host_read() {
+        let resolved = resolve_host_clipboard_read(
+            Ok("structured field-set envelope".to_string()),
+            Some("stale\nraw\nlines".to_string()),
+        )
+        .expect("fresh host read should win");
+        assert_eq!(resolved, "structured field-set envelope");
+    }
+
+    #[test]
+    fn bracketed_metadata_reconciliation_falls_back_only_when_host_read_is_unavailable() {
+        let resolved = resolve_host_clipboard_read(
+            Err("native host clipboard read unavailable".to_string()),
+            Some("terminal bracketed payload".to_string()),
+        )
+        .expect("terminal payload remains usable when native reads are unavailable");
+        assert_eq!(resolved, "terminal bracketed payload");
+
+        let error = resolve_host_clipboard_read(Err("read failed".to_string()), None)
+            .expect_err("ordinary host reads must still surface failures");
+        assert_eq!(error, "read failed");
     }
 
     #[cfg(unix)]
@@ -1116,6 +1764,7 @@ mod tests {
         let state = std::sync::Arc::new(Mutex::new(HostClipboardWriteState {
             pending: Some("first".to_string()),
             worker_running: true,
+            last_error: None,
         }));
 
         let worker_backend = std::sync::Arc::clone(&backend);

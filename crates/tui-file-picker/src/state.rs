@@ -510,6 +510,7 @@ pub enum FilePickerError {
     OperationDisabled(&'static str),
     WrongSelectionMode(&'static str),
     ClipboardEmpty,
+    ClipboardTextInvalid(String),
     ClipboardPathHasNoFileName(PathBuf),
     ClipboardSourceMissing(PathBuf),
     CrossDeviceMoveRejected { source: PathBuf, destination: PathBuf },
@@ -549,6 +550,7 @@ impl FilePickerError {
             Self::OperationDisabled(operation) => format!("Operation disabled by file picker policy: {operation}"),
             Self::WrongSelectionMode(message) => (*message).to_string(),
             Self::ClipboardEmpty => "Nothing to paste".to_string(),
+            Self::ClipboardTextInvalid(message) => format!("Clipboard is not pasteable: {message}"),
             Self::ClipboardPathHasNoFileName(path) => format!("Clipboard path has no file name: {}", path.display()),
             Self::ClipboardSourceMissing(path) => format!("Clipboard source no longer exists: {}", path.display()),
             Self::CrossDeviceMoveRejected { source, destination } => format!(
@@ -1206,10 +1208,14 @@ pub struct FilePickerState {
     /// One-shot request raised by a paste chord in a focused text editor.
     /// The embedding application owns the asynchronous host clipboard read.
     pub(crate) host_clipboard_paste_requested: bool,
+    /// Filesystem destination frozen when a navigation-surface Paste requests
+    /// an authoritative host-clipboard snapshot. `None` means the pending
+    /// host read belongs to a text editor instead.
+    pub(crate) host_clipboard_filesystem_paste_target: Option<PathBuf>,
     pub(crate) paste_task: Option<PickerPasteTask>,
     /// Exact source-to-destination mappings retained after an incomplete cut.
     /// This prevents retries from allocating a suffixed duplicate path.
-    paste_retry_plan: Option<PasteRetryPlan>,
+    pub(crate) paste_retry_plan: Option<PasteRetryPlan>,
     pub(crate) pending_delete: Vec<PathBuf>,
     pub(crate) delete_confirm_button: DeleteConfirmButton,
     pub(crate) properties_open: bool,
@@ -1322,6 +1328,7 @@ impl FilePickerState {
             sort_changed: false,
             clipboard: None,
             host_clipboard_paste_requested: false,
+            host_clipboard_filesystem_paste_target: None,
             paste_task: None,
             paste_retry_plan: None,
             pending_delete: Vec::new(),
@@ -1404,6 +1411,10 @@ impl FilePickerState {
         std::mem::swap(
             &mut self.host_clipboard_paste_requested,
             &mut other.host_clipboard_paste_requested,
+        );
+        std::mem::swap(
+            &mut self.host_clipboard_filesystem_paste_target,
+            &mut other.host_clipboard_filesystem_paste_target,
         );
         std::mem::swap(&mut self.paste_task, &mut other.paste_task);
         std::mem::swap(&mut self.paste_retry_plan, &mut other.paste_retry_plan);
@@ -5002,14 +5013,11 @@ impl FilePickerState {
                 && action_paths.iter().all(|path| path.is_file()),
             FilePickerMenuAction::Delete => self.operation_policy.allow_delete && !action_paths.is_empty(),
             FilePickerMenuAction::Paste => {
+                // The host clipboard is authoritative and cannot be inspected
+                // synchronously while constructing the menu. Keep Paste
+                // available whenever policy allows it; activation performs the
+                // bounded host read and validates the returned path payload.
                 self.operation_policy.allow_paste
-                    && self
-                        .clipboard
-                        .as_ref()
-                        .is_some_and(|clipboard| {
-                            !clipboard.is_empty()
-                                && clipboard.paths().iter().all(|path| path.exists())
-                        })
             }
             FilePickerMenuAction::SelectAll => !self.entries.is_empty(),
             FilePickerMenuAction::InvertSelection => !self.entries.is_empty(),

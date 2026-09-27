@@ -5215,7 +5215,7 @@ pub fn execute_command(app: &mut AppState, cmd: Command, tx: &mpsc::Sender<AppMe
 
 Tonepoet has one text clipboard: the terminal/host clipboard. Text and metadata copy/cut publish there directly, preferring wl-copy on Wayland and xclip/xsel on X11. When no native helper is available, writes fall back to OSC 52 through /dev/tty. Structured metadata is encoded as a versioned text envelope so multi-value and positional fields survive the host clipboard round trip without a second in-process authority.
 
-Ctrl+V, Ctrl+P, and Ctrl+Shift+V all paste from that same host clipboard. When a terminal supplies a bracketed-paste payload Tonepoet consumes that payload directly; otherwise the key chord triggers an asynchronous host-clipboard read. Filesystem Cut/Copy/Paste keeps its separate operation transaction state; that is not a text clipboard.
+Ctrl+V, Ctrl+P, and Ctrl+Shift+V all paste from that same host clipboard. When a terminal supplies a bracketed-paste payload Tonepoet consumes that payload directly; otherwise the key chord triggers an asynchronous host-clipboard read. Filesystem Cut/Copy/Paste may retain operation and retry metadata, but each new paste first consults the host clipboard and reuses that metadata only when the host path projection still matches exactly.
 
 Run :clipboard to inspect the detected display/multiplexer environment, helper discovery, a reversible live write/read check when restoration is safe, and recent transport outcomes.
 

@@ -6821,6 +6821,38 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                     }
                 }
             }
+            super::message::HostClipboardPasteTarget::BrowseFilesystem {
+                target_dir,
+                interaction_generation,
+            } => {
+                if generation != app.host_clipboard_paste_generation {
+                    return;
+                }
+                if interaction_generation != app.host_clipboard_interaction_generation {
+                    app.set_status(
+                        "Terminal clipboard result ignored because focus changed while it was being read",
+                    );
+                    return;
+                }
+                match result {
+                    Ok(text) if !text.is_empty() => {
+                        super::keybindings::start_filesystem_clipboard_paste_from_host_text(
+                            app,
+                            &text,
+                            target_dir,
+                            tx,
+                        );
+                        let queued_jobs = app.file_transfers.queued_summaries();
+                        if let ActiveOverlay::FileTaskProgress(session) = &mut app.active_overlay {
+                            session.progress.set_queued_jobs(queued_jobs);
+                        }
+                    }
+                    Ok(_) => app.set_status("Terminal clipboard is empty"),
+                    Err(error) => {
+                        app.set_status(format!("Terminal clipboard unavailable: {error}"));
+                    }
+                }
+            }
             target => {
                 super::keybindings::handle_host_clipboard_read_complete(
                     app,
@@ -7905,15 +7937,52 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 }
             }
         }
-        AppMessage::FolderClassifyComplete { path, identity, classification } => {
-            let was_pending = app.browse.complete_folder_classification(&path);
+        AppMessage::FolderClassifyComplete {
+            request_id,
+            scan_generation,
+            probe_cue_availability,
+            cue_fingerprint,
+            path,
+            identity,
+            mut classification,
+        } => {
+            let was_pending = app.browse.complete_folder_classification(
+                &path,
+                request_id,
+                scan_generation,
+                probe_cue_availability,
+            );
             if !was_pending {
                 return;
             }
             match app.browse.classify_filesystem_async_completion(&path, identity) {
                 crate::tui::browse::FilesystemAsyncCompletion::Accept => {
+                    let cue_fingerprint = if probe_cue_availability {
+                        match cue_fingerprint.filter(|fingerprint| fingerprint.is_current()) {
+                            Some(fingerprint) => Some(fingerprint),
+                            None => {
+                                // One of the concrete CUE/audio members changed
+                                // while the exact worker was running. Preserve
+                                // the useful folder classification, but never
+                                // publish the now-unverifiable CUE facts.
+                                classification.embedded_cue_availability =
+                                    crate::tui::probe::EmbeddedCueAvailability::Unknown;
+                                classification.cue_import_availability =
+                                    crate::tui::probe::CueImportAvailability::Unknown;
+                                classification.cue_repair_availability =
+                                    crate::tui::browse::CueRepairAvailability::Unknown;
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     let is_current = app.browse.is_current_entry_path(&path);
                     app.browse.insert_folder_classification_for_identity(path.clone(), identity, classification);
+                    if let Some(fingerprint) = cue_fingerprint {
+                        app.browse
+                            .retain_folder_cue_probe_fingerprint(path.clone(), fingerprint);
+                    }
                     app.browse.store_directory_summary_for_identity_best_effort(&path, identity, &app.db);
                     app.browse
                         .continue_requested_folder_cue_availability_probe(&path, tx);
@@ -10634,6 +10703,17 @@ fn replay_single_line_terminal_text_at_current_focus(
 /// Handle a bracketed paste event. When the BulkRename overlay is active,
 /// multi-line paste replaces the template-derived targets line-by-line.
 /// In text input overlays, the pasted text is inserted at the cursor.
+fn metadata_terminal_paste_needs_host_reconciliation(
+    target: &super::message::HostClipboardPasteTarget,
+) -> bool {
+    matches!(
+        target,
+        super::message::HostClipboardPasteTarget::MetadataRows { .. }
+            | super::message::HostClipboardPasteTarget::MetadataTags { .. }
+            | super::message::HostClipboardPasteTarget::MetadataDetailWholeField { .. }
+    )
+}
+
 fn handle_paste(app: &mut AppState, text: &str, tx: &mpsc::Sender<AppMessage>) {
     // A terminal-provided paste is itself a newer user interaction. This also
     // invalidates a raw Ctrl+Shift+V host-read request if the terminal emits a
@@ -10655,21 +10735,11 @@ fn handle_paste(app: &mut AppState, text: &str, tx: &mpsc::Sender<AppMessage>) {
     // The dedicated picker owns its focused text fields. When navigation owns
     // focus, an intercepted Ctrl+V arrives as Event::Paste and is promoted to
     // the same filesystem-paste command as Ctrl+V/Ctrl+P.
-    let mut picker_empty_clipboard = false;
     if let ActiveOverlay::FilePicker(session) = &mut app.active_overlay {
         if session.picker.handle_terminal_paste(text) {
             return;
         }
-        if session.picker.has_filesystem_clipboard() {
-            let _ = session.picker.paste_clipboard();
-            return;
-        }
-        picker_empty_clipboard = true;
-    }
-    if picker_empty_clipboard {
-        app.set_status(
-            "terminal paste found no focused text editor and the filesystem clipboard is empty; use Ctrl+C/Ctrl+X first, or focus a text field",
-        );
+        let _ = session.picker.paste_filesystem_host_clipboard_text(text);
         return;
     }
 
@@ -10758,32 +10828,23 @@ fn handle_paste(app: &mut AppState, text: &str, tx: &mpsc::Sender<AppMessage>) {
             }
         }
         ActiveOverlay::MetadataEditor(_) => {
-            // A bracketed-paste event already carries the terminal clipboard
-            // payload. Route it through the same target-specific semantics as
-            // an asynchronous host read so Ctrl+V/Ctrl+P/Ctrl+Shift+V cannot
-            // diverge on confirmations, structured fields, or TrackScalar lists.
-            let mut picker_handled = false;
-            let mut picker_empty_clipboard = false;
+            // A terminal can snapshot Ctrl+Shift+V while a preceding metadata
+            // copy is still publishing, then deliver that stale bracketed text
+            // after the write completes. Reconcile metadata paste against a
+            // fresh host read after prior Tonepoet writes drain. The terminal
+            // payload remains a one-shot fallback for transports such as OSC 52
+            // where host reads are unavailable; it is not retained as a private
+            // clipboard.
             if let ActiveOverlay::MetadataEditor(state) = &mut app.active_overlay {
                 if let Some(file_picker) = state.file_picker.as_mut() {
                     if file_picker.picker.handle_terminal_paste(text) {
                         return;
                     }
-                    if file_picker.picker.has_filesystem_clipboard() {
-                        let _ = file_picker.picker.paste_clipboard();
-                    } else {
-                        picker_empty_clipboard = true;
-                    }
-                    picker_handled = true;
+                    let _ = file_picker
+                        .picker
+                        .paste_filesystem_host_clipboard_text(text);
+                    return;
                 }
-            }
-            if picker_handled {
-                if picker_empty_clipboard {
-                    app.set_status(
-                        "terminal paste found no focused picker text editor and the filesystem clipboard is empty; use Ctrl+C/Ctrl+X first, or focus a text field",
-                    );
-                }
-                return;
             }
 
             let target = match &app.active_overlay {
@@ -10838,11 +10899,20 @@ fn handle_paste(app: &mut AppState, text: &str, tx: &mpsc::Sender<AppMessage>) {
                 _ => None,
             };
             if let Some(target) = target {
-                super::keybindings::handle_terminal_clipboard_text(
-                    app,
-                    target,
-                    text.to_string(),
-                );
+                if metadata_terminal_paste_needs_host_reconciliation(&target) {
+                    super::keybindings::begin_host_clipboard_paste_with_terminal_fallback(
+                        app,
+                        tx,
+                        target,
+                        text.to_string(),
+                    );
+                } else {
+                    super::keybindings::handle_terminal_clipboard_text(
+                        app,
+                        target,
+                        text.to_string(),
+                    );
+                }
             } else {
                 app.set_status(
                     "terminal paste is unavailable on this metadata-editor tab",
@@ -10850,9 +10920,17 @@ fn handle_paste(app: &mut AppState, text: &str, tx: &mpsc::Sender<AppMessage>) {
             }
         }
         ActiveOverlay::FileTaskProgress(_) => {
-            app.set_status(
-                "terminal paste is unavailable while file-task progress is open; close it before editing text",
+            let target_dir = app.browse.current_dir.clone();
+            super::keybindings::start_filesystem_clipboard_paste_from_host_text(
+                app,
+                text,
+                target_dir,
+                tx,
             );
+            let queued_jobs = app.file_transfers.queued_summaries();
+            if let ActiveOverlay::FileTaskProgress(session) = &mut app.active_overlay {
+                session.progress.set_queued_jobs(queued_jobs);
+            }
         }
         ActiveOverlay::None => {
             if app.current_screen != super::app::AppScreen::Browse {
@@ -10885,17 +10963,22 @@ fn handle_paste(app: &mut AppState, text: &str, tx: &mpsc::Sender<AppMessage>) {
                 app.browse.update_filter_from_input();
                 return;
             }
-            if app.browse.filesystem_clipboard.is_some() {
-                let paste_key = crossterm::event::KeyEvent::new(
-                    crossterm::event::KeyCode::Char('p'),
-                    crossterm::event::KeyModifiers::CONTROL,
-                );
-                super::keybindings::handle_browse_filesystem_clipboard_key(app, paste_key, tx);
+            let target_dir = if app.browse.tree_navigation_active() {
+                app.browse
+                    .selected_tree_path()
+                    .unwrap_or_else(|| app.browse.current_dir.clone())
             } else {
-                app.set_status(
-                    "terminal paste found no focused text editor and the filesystem clipboard is empty; use Ctrl+C/Ctrl+X first, or focus a text field; Ctrl+P is the alternate paste chord",
-                );
-            }
+                app.browse.current_dir.clone()
+            };
+            // Bracketed paste already carries the terminal emulator's current
+            // clipboard payload. Never replace it with retained in-process
+            // Cut/Copy state; resolve this exact snapshot instead.
+            super::keybindings::start_filesystem_clipboard_paste_from_host_text(
+                app,
+                text,
+                target_dir,
+                tx,
+            );
         }
         _ => {
             app.set_status(
@@ -11024,10 +11107,10 @@ mod browse_bracketed_paste_tests {
         app.browse.current_dir = destination_dir;
         app.browse.filesystem_clipboard = tui_file_picker::FilesystemClipboard::new(
             tui_file_picker::FilePickerClipboardMode::Copy,
-            vec![source],
+            vec![source.clone()],
         );
 
-        handle_paste(&mut app, "terminal clipboard payload is intentionally ignored", &test_tx());
+        handle_paste(&mut app, &source.display().to_string(), &test_tx());
 
         assert!(
             !app.file_transfers.pending_by_session.is_empty(),
@@ -11052,10 +11135,10 @@ mod browse_bracketed_paste_tests {
         app.browse.search.focus = super::super::browse::SearchFocus::Results;
         app.browse.filesystem_clipboard = tui_file_picker::FilesystemClipboard::new(
             tui_file_picker::FilePickerClipboardMode::Copy,
-            vec![source],
+            vec![source.clone()],
         );
 
-        handle_paste(&mut app, "ignored terminal payload", &test_tx());
+        handle_paste(&mut app, &source.display().to_string(), &test_tx());
 
         assert!(!app.file_transfers.pending_by_session.is_empty());
     }
@@ -11098,7 +11181,7 @@ mod browse_bracketed_paste_tests {
 
         handle_paste(
             &mut app,
-            "terminal clipboard payload is intentionally ignored",
+            &source.display().to_string(),
             &test_tx(),
         );
 
@@ -11155,7 +11238,7 @@ mod browse_bracketed_paste_tests {
 
         handle_paste(
             &mut app,
-            "terminal clipboard payload is intentionally ignored",
+            &source.display().to_string(),
             &test_tx(),
         );
 
@@ -11174,7 +11257,7 @@ mod browse_bracketed_paste_tests {
     }
 
     #[test]
-    fn picker_tree_bracketed_paste_with_empty_clipboard_reports_guidance() {
+    fn picker_tree_bracketed_paste_uses_terminal_payload_without_retained_clipboard() {
         let temp = tempfile::tempdir().expect("tempdir");
         let tree_target = temp.path().join("tree-target");
         std::fs::create_dir(&tree_target).expect("tree target");
@@ -11192,12 +11275,18 @@ mod browse_bracketed_paste_tests {
             picker,
         ));
 
-        handle_paste(&mut app, "ignored terminal payload", &test_tx());
+        let source = temp.path().join("external.flac");
+        std::fs::write(&source, b"audio").expect("source");
+        handle_paste(&mut app, &source.display().to_string(), &test_tx());
 
-        assert!(app.status_message.as_ref().is_some_and(|(message, _)| {
-            message.contains("filesystem clipboard is empty")
-                && message.contains("Ctrl+C/Ctrl+X")
-        }));
+        let expected = tree_target.join("external.flac");
+        for _ in 0..200 {
+            if expected.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(expected.exists(), "bracketed paste must use the terminal payload even with no retained transaction");
     }
 
     #[test]
@@ -11250,6 +11339,77 @@ mod browse_bracketed_paste_tests {
     }
 
     #[test]
+    fn bracketed_filesystem_paste_replaces_stale_retained_transaction_with_host_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let stale = temp.path().join("stale.flac");
+        let current = temp.path().join("current.flac");
+        let destination = temp.path().join("destination");
+        std::fs::write(&stale, b"stale").expect("stale source");
+        std::fs::write(&current, b"current").expect("current source");
+        std::fs::create_dir(&destination).expect("destination");
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = super::super::app::AppScreen::Browse;
+        app.browse.current_dir = destination.clone();
+        app.browse.filesystem_clipboard = tui_file_picker::FilesystemClipboard::new(
+            tui_file_picker::FilePickerClipboardMode::Cut,
+            vec![stale],
+        );
+        app.file_transfers.blocked_for_attention = true;
+
+        handle_paste(&mut app, &current.display().to_string(), &test_tx());
+
+        let queued = app.file_transfers.queued.front().expect("queued paste");
+        assert_eq!(queued.destination_dir, destination);
+        assert_eq!(queued.clipboard.paths(), std::slice::from_ref(&current));
+        assert_eq!(queued.clipboard.mode(), tui_file_picker::FilePickerClipboardMode::Copy);
+        assert_eq!(
+            app.browse
+                .filesystem_clipboard
+                .as_ref()
+                .expect("retained host transaction")
+                .paths(),
+            std::slice::from_ref(&current),
+        );
+    }
+
+    #[test]
+    fn host_filesystem_read_completion_uses_captured_destination_not_current_browse_dir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("track.flac");
+        let captured_destination = temp.path().join("captured");
+        let later_destination = temp.path().join("later");
+        std::fs::write(&source, b"audio").expect("source");
+        std::fs::create_dir(&captured_destination).expect("captured destination");
+        std::fs::create_dir(&later_destination).expect("later destination");
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = super::super::app::AppScreen::Browse;
+        app.browse.current_dir = later_destination;
+        app.file_transfers.blocked_for_attention = true;
+        app.host_clipboard_paste_generation = 9;
+        let interaction_generation = app.host_clipboard_interaction_generation;
+        let (tx, _rx) = mpsc::channel(4);
+
+        handle_message(
+            &mut app,
+            AppMessage::HostClipboardReadComplete {
+                generation: 9,
+                target: super::super::message::HostClipboardPasteTarget::BrowseFilesystem {
+                    target_dir: captured_destination.clone(),
+                    interaction_generation,
+                },
+                result: Ok(source.display().to_string()),
+            },
+            &tx,
+        );
+
+        let queued = app.file_transfers.queued.front().expect("queued paste");
+        assert_eq!(queued.destination_dir, captured_destination);
+        assert_eq!(queued.clipboard.paths(), std::slice::from_ref(&source));
+    }
+
+    #[test]
     fn bracketed_paste_outside_browse_never_starts_a_stale_filesystem_paste() {
         let temp = tempfile::tempdir().expect("tempdir");
         let source = temp.path().join("track.flac");
@@ -11271,14 +11431,14 @@ mod browse_bracketed_paste_tests {
     }
 
     #[test]
-    fn bracketed_paste_without_text_focus_explains_ctrl_v_file_paste_split() {
+    fn bracketed_paste_without_text_focus_rejects_non_path_terminal_text() {
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = super::super::app::AppScreen::Browse;
 
         handle_paste(&mut app, "text", &test_tx());
 
         assert!(app.status_message.as_ref().is_some_and(|(message, _)| {
-            message.contains("filesystem clipboard is empty") && message.contains("Ctrl+P")
+            message.contains("Paste failed") && message.contains("does not exist")
         }));
     }
 }
@@ -11389,7 +11549,170 @@ mod metadata_detail_paste_tests {
     }
 
     #[test]
-    fn editing_phase_bracketed_track_scalar_paste_confirms_and_drops_extra_lines() {
+    fn structured_metadata_bracketed_paste_reconciles_with_the_host_before_application() {
+        let session_id = 7;
+        for target in [
+            super::super::message::HostClipboardPasteTarget::MetadataRows {
+                session_id,
+                field_index: 0,
+            },
+            super::super::message::HostClipboardPasteTarget::MetadataTags {
+                session_id,
+                view: crate::tui::app::MetadataEditorView::Canonical,
+            },
+            super::super::message::HostClipboardPasteTarget::MetadataDetailWholeField {
+                session_id,
+                field_index: 0,
+            },
+        ] {
+            assert!(metadata_terminal_paste_needs_host_reconciliation(&target));
+        }
+
+        assert!(!metadata_terminal_paste_needs_host_reconciliation(
+            &super::super::message::HostClipboardPasteTarget::MetadataInline {
+                session_id,
+                field_index: 0,
+            },
+        ));
+    }
+
+    #[test]
+    fn editing_phase_reconciled_field_set_paste_works_from_add_row_sentinel() {
+        let source = vec![
+            editing_entry("TITLE", ItemKey::TrackTitle, &["One", "Two"]),
+            editing_entry("ARTIST", ItemKey::TrackArtist, &["Artist One", "Artist Two"]),
+        ];
+        let clipboard = crate::tui::tag_interchange::serialize_clipboard_tag_entries(
+            source.iter(),
+            crate::tui::tag_interchange::ClipboardTagPayloadKind::FieldSet,
+        )
+        .text;
+        let mut state = MetadataEditorState::for_files(
+            vec!["/tmp/a.flac".into(), "/tmp/b.flac".into()],
+            vec![editing_entry("ALBUM", ItemKey::AlbumTitle, &["Album", "Album"])],
+            vec!["a".to_string(), "b".to_string()],
+            MetadataTechnicalDetails::default(),
+        );
+        state.phase = MetadataEditorPhase::Editing;
+        state.cursor = state.active_surface().entries.len();
+        let session_id = state.active_surface().technical_details.session_id;
+        let sentinel = state.cursor;
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.host_clipboard_paste_generation = 1;
+        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
+
+        super::super::keybindings::handle_host_clipboard_read_complete(
+            &mut app,
+            1,
+            super::super::message::HostClipboardPasteTarget::MetadataRows {
+                session_id,
+                field_index: sentinel,
+            },
+            Ok(clipboard),
+        );
+
+        let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
+            panic!("reconciled field-set paste from + Add field must stay in the editor");
+        };
+        for key in ["TITLE", "ARTIST"] {
+            assert!(state
+                .active_surface()
+                .entries
+                .iter()
+                .any(|entry| entry.display_key == key));
+        }
+    }
+
+    #[test]
+    fn metadata_ctrl_v_ctrl_p_and_bracketed_ctrl_shift_v_share_field_set_semantics() {
+        let source = vec![editing_entry(
+            "GENRE",
+            ItemKey::Genre,
+            &["Progressive Rock", "Progressive Rock"],
+        )];
+        let clipboard = crate::tui::tag_interchange::serialize_clipboard_tag_entries(
+            source.iter(),
+            crate::tui::tag_interchange::ClipboardTagPayloadKind::FieldSet,
+        )
+        .text;
+
+        let make_app = || {
+            let mut state = MetadataEditorState::for_files(
+                vec!["/tmp/a.flac".into(), "/tmp/b.flac".into()],
+                vec![editing_entry(
+                    "ALBUM",
+                    ItemKey::AlbumTitle,
+                    &["Duke", "Duke"],
+                )],
+                vec!["a".to_string(), "b".to_string()],
+                MetadataTechnicalDetails::default(),
+            );
+            state.phase = MetadataEditorPhase::Editing;
+            state.cursor = state.active_surface().entries.len();
+            let mut app = AppState::new_for_test(TonepoetConfig::default());
+            app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
+            app
+        };
+
+        let metadata_values = |app: &AppState, key: &str| -> Vec<String> {
+            let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
+                panic!("metadata paste route must leave the editor open");
+            };
+            state
+                .active_surface()
+                .entries
+                .iter()
+                .find(|entry| entry.display_key == key)
+                .unwrap_or_else(|| panic!("missing {key} after metadata paste"))
+                .per_file_values
+                .iter()
+                .map(|value| value.as_str().to_string())
+                .collect()
+        };
+
+        let mut snapshots = Vec::new();
+        // Ctrl+V, Ctrl+P, and metadata bracketed Ctrl+Shift+V all terminate in
+        // HostClipboardReadComplete after the latter reconciles its terminal
+        // snapshot against the host. The keybinding regression separately
+        // proves that the raw key chords request this same MetadataRows target.
+        for generation in [41_u64, 42_u64, 43_u64] {
+            let mut app = make_app();
+            let (session_id, sentinel) = match &app.active_overlay {
+                ActiveOverlay::MetadataEditor(state) => (
+                    state.active_surface().technical_details.session_id,
+                    state.cursor,
+                ),
+                _ => unreachable!(),
+            };
+            app.host_clipboard_paste_generation = generation;
+            super::super::keybindings::handle_host_clipboard_read_complete(
+                &mut app,
+                generation,
+                super::super::message::HostClipboardPasteTarget::MetadataRows {
+                    session_id,
+                    field_index: sentinel,
+                },
+                Ok(clipboard.clone()),
+            );
+            snapshots.push((
+                metadata_values(&app, "ALBUM"),
+                metadata_values(&app, "GENRE"),
+            ));
+        }
+
+        assert!(snapshots.windows(2).all(|pair| pair[0] == pair[1]));
+        assert_eq!(
+            snapshots[0],
+            (
+                vec!["Duke".to_string(), "Duke".to_string()],
+                vec!["Progressive Rock".to_string(), "Progressive Rock".to_string()],
+            ),
+            "all paste routes must parse and apply the same field-set envelope",
+        );
+    }
+
+    #[test]
+    fn editing_phase_reconciled_track_scalar_paste_confirms_and_drops_extra_lines() {
         let mut state = MetadataEditorState::for_files(
             vec!["/tmp/a.flac".into(), "/tmp/b.flac".into()],
             vec![editing_entry("TITLE", ItemKey::TrackTitle, &["Old A", "Old B"])],
@@ -11399,10 +11722,19 @@ mod metadata_detail_paste_tests {
         state.phase = MetadataEditorPhase::Editing;
         let session_id = state.active_surface().technical_details.session_id;
         let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.host_clipboard_paste_generation = 1;
         app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
         let (tx, _rx) = mpsc::channel(8);
 
-        handle_paste(&mut app, "One\nTwo\n", &tx);
+        super::super::keybindings::handle_host_clipboard_read_complete(
+            &mut app,
+            1,
+            super::super::message::HostClipboardPasteTarget::MetadataRows {
+                session_id,
+                field_index: 0,
+            },
+            Ok("One\nTwo\n".to_string()),
+        );
         let ActiveOverlay::Confirmation { action, .. } = &app.active_overlay else {
             panic!("un-descended TrackScalar paste must ask for confirmation");
         };
@@ -11429,7 +11761,16 @@ mod metadata_detail_paste_tests {
         };
         assert_eq!(state.active_surface().entries[0].per_file_values, ["One", "Two"]);
 
-        handle_paste(&mut app, "Three\nFour\nIgnored", &tx);
+        app.host_clipboard_paste_generation = 2;
+        super::super::keybindings::handle_host_clipboard_read_complete(
+            &mut app,
+            2,
+            super::super::message::HostClipboardPasteTarget::MetadataRows {
+                session_id,
+                field_index: 0,
+            },
+            Ok("Three\nFour\nIgnored".to_string()),
+        );
         let ActiveOverlay::Confirmation { message, action } = &app.active_overlay else {
             panic!("overflow TrackScalar paste must still ask for confirmation");
         };
@@ -11543,7 +11884,7 @@ mod metadata_detail_paste_tests {
     }
 
     #[test]
-    fn detail_bracketed_paste_without_row_editor_uses_list_aware_whole_field_path() {
+    fn detail_reconciled_paste_without_row_editor_uses_list_aware_whole_field_path() {
         let entry = set_valued_entry(
             "PERFORMER",
             ItemKey::Performer,
@@ -11558,10 +11899,19 @@ mod metadata_detail_paste_tests {
         state.phase = MetadataEditorPhase::DetailEdit;
         state.detail_field_idx = 0;
 
+        let session_id = state.active_surface().technical_details.session_id;
         let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.host_clipboard_paste_generation = 1;
         app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
-        let (tx, _rx) = mpsc::channel(8);
-        handle_paste(&mut app, "A; B\nC; D", &tx);
+        super::super::keybindings::handle_host_clipboard_read_complete(
+            &mut app,
+            1,
+            super::super::message::HostClipboardPasteTarget::MetadataDetailWholeField {
+                session_id,
+                field_index: 0,
+            },
+            Ok("A; B\nC; D".to_string()),
+        );
 
         let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
             panic!("metadata editor should remain open");
@@ -20799,12 +21149,19 @@ mod async_message_drain_tests {
             identity.modified,
         )];
         app.browse.selected_index = 0;
-        app.browse.mark_folder_classification_pending_for_test(path.clone());
+        let request_id = app
+            .browse
+            .mark_folder_classification_pending_for_test(path.clone());
+        let scan_generation = app.browse.scan_generation;
 
         let (tx, _rx) = mpsc::channel(4);
         handle_message(
             &mut app,
             AppMessage::FolderClassifyComplete {
+                request_id,
+                scan_generation,
+                probe_cue_availability: false,
+                cue_fingerprint: None,
                 path: path.clone(),
                 identity,
                 classification: folder_classification(
@@ -20838,10 +21195,15 @@ mod async_message_drain_tests {
         );
 
         let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let scan_generation = app.browse.scan_generation;
         let (tx, _rx) = mpsc::channel(4);
         handle_message(
             &mut app,
             AppMessage::FolderClassifyComplete {
+                request_id: 1,
+                scan_generation,
+                probe_cue_availability: false,
+                cue_fingerprint: None,
                 path: path.clone(),
                 identity,
                 classification: folder_classification(
@@ -20863,12 +21225,19 @@ mod async_message_drain_tests {
         let stale_identity = crate::tui::browse::ProbeCacheIdentity { modified: None, size: 0 };
 
         let mut app = AppState::new_for_test(TonepoetConfig::default());
-        app.browse.mark_folder_classification_pending_for_test(path.clone());
+        let request_id = app
+            .browse
+            .mark_folder_classification_pending_for_test(path.clone());
+        let scan_generation = app.browse.scan_generation;
 
         let (tx, _rx) = mpsc::channel(4);
         handle_message(
             &mut app,
             AppMessage::FolderClassifyComplete {
+                request_id,
+                scan_generation,
+                probe_cue_availability: false,
+                cue_fingerprint: None,
                 path: path.clone(),
                 identity: stale_identity,
                 classification: folder_classification(
@@ -20881,6 +21250,86 @@ mod async_message_drain_tests {
 
         assert!(!app.browse.folder_classification_pending_for(&path));
         assert!(!app.browse.has_valid_folder_classification_for_identity(&path, stale_identity));
+    }
+
+    #[test]
+    fn stale_folder_classify_owner_cannot_consume_newer_pending_request() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("album");
+        std::fs::create_dir(&path).expect("mkdir");
+        let identity = crate::tui::browse::ProbeCacheIdentity::from_metadata(
+            &std::fs::metadata(&path).expect("metadata"),
+        );
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
+            path.clone(),
+            "album".to_string(),
+            EntryKind::Directory,
+            identity.size,
+            identity.modified,
+        )];
+        app.browse.selected_index = 0;
+
+        let stale_request = app
+            .browse
+            .mark_folder_classification_pending_for_test(path.clone());
+        app.browse.clear_folder_classification_work_queue();
+        let current_request = app
+            .browse
+            .mark_folder_classification_pending_for_test(path.clone());
+        let scan_generation = app.browse.scan_generation;
+        assert_ne!(stale_request, current_request);
+
+        let (tx, _rx) = mpsc::channel(4);
+        handle_message(
+            &mut app,
+            AppMessage::FolderClassifyComplete {
+                request_id: stale_request,
+                scan_generation,
+                probe_cue_availability: false,
+                cue_fingerprint: None,
+                path: path.clone(),
+                identity,
+                classification: folder_classification(
+                    identity,
+                    crate::tui::browse::FolderClassificationKind::Unknown,
+                ),
+            },
+            &tx,
+        );
+
+        assert!(
+            app.browse.folder_classification_pending_for(&path),
+            "an old worker must not consume the pending marker owned by its replacement",
+        );
+        assert!(!app.browse.has_valid_folder_classification_for_identity(&path, identity));
+
+        handle_message(
+            &mut app,
+            AppMessage::FolderClassifyComplete {
+                request_id: current_request,
+                scan_generation,
+                probe_cue_availability: false,
+                cue_fingerprint: None,
+                path: path.clone(),
+                identity,
+                classification: folder_classification(
+                    identity,
+                    crate::tui::browse::FolderClassificationKind::Album,
+                ),
+            },
+            &tx,
+        );
+
+        assert!(!app.browse.folder_classification_pending_for(&path));
+        assert_eq!(
+            app.browse
+                .current_folder_classification()
+                .map(|classification| classification.kind),
+            Some(crate::tui::browse::FolderClassificationKind::Album),
+        );
     }
     #[test]
     fn completion_reducer_trusts_worker_report_without_probing_missing_paths() {

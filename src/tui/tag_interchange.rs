@@ -1323,6 +1323,48 @@ mod tests {
         )
     }
 
+    fn unified_cue_editor_with_tracks(
+        track_count: usize,
+        entries: Vec<TagEntry>,
+    ) -> super::super::app::MetadataEditorState {
+        let mut state = editor_with_files(1, entries);
+        let cue_path = std::path::PathBuf::from("/tmp/album.cue");
+        let audio_path = std::path::PathBuf::from("/tmp/album.flac");
+        let track_sources = (0..track_count)
+            .map(|index| super::super::app::CueAlbumTrackSource {
+                cue_path: cue_path.clone(),
+                audio_path: audio_path.clone(),
+                local_track_index: index,
+                original_track_number: (index + 1) as u32,
+                file_ref: "album.flac".to_string(),
+                index00_frames: None,
+                index01_frames: Some((index as u32).saturating_mul(75)),
+                index00_sample: None,
+                index01_sample: None,
+                isrc: None,
+                album_user_metadata: Default::default(),
+                user_metadata: Default::default(),
+                tonepoet_metadata_present: false,
+                directives: Vec::new(),
+            })
+            .collect();
+        state.active_surface_mut().cue_album_synthetic_sheet =
+            Some(super::super::app::CueAlbumSyntheticSheet {
+                cue_paths: vec![cue_path],
+                audio_paths: vec![audio_path],
+                track_sources,
+                album_title: None,
+                album_performer: None,
+                album_date: None,
+                album_genre: None,
+                album_catalog: None,
+                user_metadata: Default::default(),
+                program_sample_rate: None,
+                program_total_samples: None,
+            });
+        state
+    }
+
     #[test]
     fn transfer_created_custom_field_is_session_visible_but_existing_custom_field_stays_hidden() {
         let source = vec![entry("CUSTOM_LABEL", &["replacement"])];
@@ -1418,6 +1460,79 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["New One", "New Two"],
         );
+    }
+
+    #[test]
+    fn clipboard_field_set_uses_semantic_dimensions_on_single_image_unified_cue() {
+        let mut title = entry("TITLE", &["Old"]);
+        title.row_scope = RowScope::Track;
+        title.per_file_values = crate::tui::probe::metadata_field_values_from_scalars(
+            (1..=10).map(|index| format!("Old {index}")).collect(),
+        );
+        title.per_file_originals = title.per_file_values.clone();
+        title.per_file_stored_value_counts = vec![1; 10];
+        title.value = "<multiple values>".to_string();
+        title.original = title.value.clone();
+        title.is_mixed = true;
+
+        let album = entry("ALBUM", &["Old Album"]);
+        let mut state = unified_cue_editor_with_tracks(10, vec![title, album]);
+        let blocks = vec![
+            FieldBlock {
+                key: "TITLE".to_string(),
+                values: crate::tui::probe::metadata_field_values_from_scalars(
+                    (1..=10).map(|index| format!("New {index}")).collect(),
+                ),
+            },
+            FieldBlock {
+                key: "ALBUM".to_string(),
+                values: crate::tui::probe::metadata_field_values_from_scalars(vec![
+                    "New Album".to_string(),
+                ]),
+            },
+        ];
+
+        let report = apply_clipboard_field_blocks_to_editor(&mut state, &blocks)
+            .expect("mixed track/file field set must use each field's semantic axis");
+        assert_eq!(report.applied.len(), 2);
+        assert_eq!(state.active_surface().entries[0].row_scope, RowScope::Track);
+        assert_eq!(state.active_surface().entries[1].row_scope, RowScope::File);
+        assert_eq!(
+            state.active_surface().entries[0]
+                .per_file_values
+                .iter()
+                .map(|value| value.as_str())
+                .collect::<Vec<_>>(),
+            (1..=10)
+                .map(|index| format!("New {index}"))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(state.active_surface().entries[1].per_file_values.len(), 1);
+        assert_eq!(state.active_surface().entries[1].per_file_values[0], "New Album");
+    }
+
+    #[test]
+    fn clipboard_field_set_creates_missing_unified_cue_track_row_on_track_axis() {
+        let mut state = unified_cue_editor_with_tracks(10, vec![entry("ALBUM", &["Album"])]);
+        let blocks = vec![FieldBlock {
+            key: "TITLE".to_string(),
+            values: crate::tui::probe::metadata_field_values_from_scalars(
+                (1..=10).map(|index| format!("Track {index}")).collect(),
+            ),
+        }];
+
+        apply_clipboard_field_blocks_to_editor(&mut state, &blocks)
+            .expect("missing TITLE must be created on the logical-track axis");
+        let title = state
+            .active_surface()
+            .entries
+            .iter()
+            .find(|entry| entry.display_key == "TITLE")
+            .expect("TITLE row created");
+        assert_eq!(title.row_scope, RowScope::Track);
+        assert_eq!(title.per_file_values.len(), 10);
+        assert_eq!(title.per_file_stored_value_counts, vec![0; 10]);
+        assert_eq!(title.per_file_originals.len(), 10);
     }
 
     #[test]
@@ -6285,15 +6400,89 @@ pub(crate) fn apply_clipboard_field_blocks_to_editor(
     )
 }
 
+#[derive(Debug, Clone, Copy)]
+struct FieldBlockApplyTarget {
+    target_count: usize,
+    row_scope: super::probe::RowScope,
+    existing_track_scoped: bool,
+}
+
+fn field_block_apply_target(
+    state: &super::app::MetadataEditorState,
+    canonical_key: &str,
+    existing_row: Option<usize>,
+) -> Result<FieldBlockApplyTarget, String> {
+    let surface = state.active_surface();
+    let presentation_count = surface.paths.len();
+
+    if let Some(sheet) = surface.cue_album_synthetic_sheet.as_ref() {
+        let dimensions = super::probe::UnifiedCueDimensions {
+            files: sheet.audio_paths.len(),
+            tracks: sheet.track_sources.len(),
+            presentation: presentation_count,
+        };
+        let existing_scope = existing_row
+            .and_then(|index| surface.entries.get(index))
+            .map(|entry| entry.effective_row_scope(dimensions.files));
+        let declared_scope = existing_scope.unwrap_or_else(|| {
+            if canonical_key == "ARTIST" {
+                super::probe::RowScope::Track
+            } else {
+                super::probe::RowScope::File
+            }
+        });
+        let (row_scope, target_count, dimension_name) =
+            if let Some(shape) = super::probe::unified_cue_row_shape(canonical_key, declared_scope)
+            {
+                (
+                    shape.scope,
+                    shape.dimension(dimensions),
+                    shape.dimension_name,
+                )
+            } else {
+                let target_count = match declared_scope {
+                    super::probe::RowScope::File => dimensions.files,
+                    super::probe::RowScope::Track => dimensions.tracks,
+                };
+                let dimension_name = match declared_scope {
+                    super::probe::RowScope::File => "album/file",
+                    super::probe::RowScope::Track => "logical-track",
+                };
+                (declared_scope, target_count, dimension_name)
+            };
+        if target_count == 0 {
+            return Err(format!(
+                "{canonical_key} has no {dimension_name} targets in this unified CUE presentation"
+            ));
+        }
+        return Ok(FieldBlockApplyTarget {
+            target_count,
+            row_scope,
+            existing_track_scoped: existing_row.is_some()
+                && row_scope == super::probe::RowScope::Track,
+        });
+    }
+
+    if presentation_count == 0 {
+        return Err("metadata editor has no file targets".to_string());
+    }
+    let row_scope = existing_row
+        .and_then(|index| surface.entries.get(index))
+        .map(|entry| entry.effective_row_scope(presentation_count))
+        .unwrap_or(super::probe::RowScope::File);
+    Ok(FieldBlockApplyTarget {
+        target_count: presentation_count,
+        row_scope,
+        existing_track_scoped: existing_row.is_some()
+            && row_scope == super::probe::RowScope::Track,
+    })
+}
+
 fn apply_field_blocks_to_editor_with_policy(
     state: &mut super::app::MetadataEditorState,
     blocks: &[FieldBlock],
     track_scoped_policy: ExistingTrackScopedApplyPolicy,
 ) -> Result<FieldBlockApplyReport, String> {
-    let file_count = state.active_surface().paths.len();
-    if file_count == 0 {
-        return Err("metadata editor has no file targets".to_string());
-    }
     let mut target_rows = std::collections::HashMap::new();
     for (index, entry) in state.active_surface().entries.iter().enumerate() {
         let key = super::probe::canonical_metadata_display_key(&entry.display_key);
@@ -6310,24 +6499,28 @@ fn apply_field_blocks_to_editor_with_policy(
         if !is_field_block_key(&block.key) {
             return Err(format!("{} is not a valid tag-block key", block.key));
         }
-        if !seen.insert(block.key.clone()) {
-            return Err(format!("{} appears more than once in the tag blocks", block.key));
+        let canonical_key = super::probe::canonical_metadata_display_key(&block.key);
+        if !seen.insert(canonical_key.clone()) {
+            return Err(format!(
+                "{canonical_key} appears more than once in the tag blocks"
+            ));
         }
-        let mode = validate_block_count(block, file_count).map_err(|error| error.to_string())?;
-        let row = target_rows.get(&block.key).copied();
-        let track_scoped = row
-            .and_then(|index| state.active_surface().entries.get(index))
-            .is_some_and(|entry| entry.is_track_scoped(file_count));
-        plans.push((block, mode, row, track_scoped));
+        let row = target_rows.get(&canonical_key).copied();
+        let target = field_block_apply_target(state, &canonical_key, row)?;
+        let mode = validate_block_count(block, target.target_count)
+            .map_err(|error| error.to_string())?;
+        plans.push((block, mode, row, target));
     }
 
     let mut report = FieldBlockApplyReport::default();
-    for (block, mode, existing_row, track_scoped) in plans {
-        if track_scoped && track_scoped_policy == ExistingTrackScopedApplyPolicy::Skip {
+    for (block, mode, existing_row, target) in plans {
+        if target.existing_track_scoped
+            && track_scoped_policy == ExistingTrackScopedApplyPolicy::Skip
+        {
             report.skipped_track_scoped.push(block.key.clone());
             continue;
         }
-        let values = (0..file_count)
+        let values = (0..target.target_count)
             .map(|index| {
                 let value = value_for_target(block, mode, index)
                     .cloned()
@@ -6364,6 +6557,7 @@ fn apply_field_blocks_to_editor_with_policy(
             let entry = &mut surface.entries[row];
             entry.value = display;
             entry.is_mixed = !all_same;
+            entry.row_scope = target.row_scope;
             entry.per_file_values = values;
             entry.mb_proposed_value = None;
             entry.mb_proposed_per_file = None;
@@ -6377,10 +6571,12 @@ fn apply_field_blocks_to_editor_with_policy(
                 is_binary: false,
                 is_mixed: !all_same,
                 has_multiple_stored_values: false,
-                row_scope: super::probe::RowScope::File,
-                per_file_stored_value_counts: vec![0; file_count],
+                row_scope: target.row_scope,
+                per_file_stored_value_counts: vec![0; target.target_count],
                 per_file_values: values,
-                per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(vec![String::new(); file_count]),
+                per_file_originals: crate::tui::probe::metadata_field_values_from_scalars(
+                    vec![String::new(); target.target_count],
+                ),
                 mb_proposed_value: None,
                 mb_proposed_per_file: None,
             });
