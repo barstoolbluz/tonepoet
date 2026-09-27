@@ -3182,6 +3182,8 @@ user is the reader; a log the user calls a trainwreck is failing its only job.
 
 ## 50. A minimal DST silence frame fails the whole Reference album
 
+**Status 2026-09-27: resolved on main @ e4cd2f8 (v0.5.3).** Decoder zero-extends only in the arithmetic phase; both field frames are fixtures; Reference requalified for the new sacd-rs identity; Bach Vol. 1 converts 22/22 on the Reference preset (with a short folder template, see #51).
+
 Filed 2026-09-27. Bach, Cantatas for the Complete Liturgical Year Vol. 1 (Accent, DSD64,
 DST-coded), stereo area, track 1, on the Reference path:
 
