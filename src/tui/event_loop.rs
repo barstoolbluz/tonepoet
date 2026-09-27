@@ -2308,6 +2308,7 @@ fn reduce_file_task_complete(
                 pending.clipboard.mode(),
                 retry_sources.clone(),
             )
+            .map(|clipboard| clipboard.inherit_logical_identity(&pending.clipboard))
         };
         app.browse.filesystem_clipboard_retry_plan = if !all_completed {
             // Whichever plan is retained, the user-facing retry token must exclude
@@ -6775,21 +6776,25 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 }
                 if interaction_generation != app.host_clipboard_interaction_generation {
                     app.set_status(
-                        "Terminal clipboard result ignored because focus changed while it was being read",
+                        "Clipboard result ignored because focus changed while it was being read",
                     );
                     return;
                 }
                 if super::keybindings::editor_text_input(app, target).is_none() {
-                    app.set_status("Terminal clipboard result ignored because the editor changed");
+                    app.set_status("Clipboard result ignored because the editor changed");
                     return;
                 }
                 match result {
-                    Ok(text) if !text.is_empty() => {
-                        replay_single_line_terminal_text_at_current_focus(app, &text, tx);
+                    Ok(text) => {
+                        let _ = tui_file_picker::observe_host_clipboard_text(text.clone());
+                        if text.is_empty() {
+                            app.set_status("Clipboard is empty");
+                        } else {
+                            replay_single_line_terminal_text_at_current_focus(app, &text, tx);
+                        }
                     }
-                    Ok(_) => app.set_status("Terminal clipboard is empty"),
                     Err(error) => {
-                        app.set_status(format!("Terminal clipboard unavailable: {error}"));
+                        app.set_status(format!("Clipboard unavailable: {error}"));
                     }
                 }
             }
@@ -6801,25 +6806,77 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 }
                 if interaction_generation != app.host_clipboard_interaction_generation {
                     app.set_status(
-                        "Terminal clipboard result ignored because focus changed while it was being read",
+                        "Clipboard result ignored because focus changed while it was being read",
                     );
                     return;
                 }
                 match result {
-                    Ok(text) if !text.is_empty() => {
+                    Ok(text) => {
                         if !super::keybindings::current_focus_needs_generic_host_clipboard(app) {
                             app.set_status(
-                                "Terminal clipboard result ignored because the editor changed",
+                                "Clipboard result ignored because the editor changed",
                             );
                             return;
                         }
-                        replay_single_line_terminal_text_at_current_focus(app, &text, tx);
+                        let _ = tui_file_picker::observe_host_clipboard_text(text.clone());
+                        if text.is_empty() {
+                            app.set_status("Clipboard is empty");
+                        } else {
+                            replay_single_line_terminal_text_at_current_focus(app, &text, tx);
+                        }
                     }
-                    Ok(_) => app.set_status("Terminal clipboard is empty"),
                     Err(error) => {
-                        app.set_status(format!("Terminal clipboard unavailable: {error}"));
+                        app.set_status(format!("Clipboard unavailable: {error}"));
                     }
                 }
+            }
+            super::message::HostClipboardPasteTarget::FilePickerOverlay {
+                session_id,
+                interaction_generation,
+            } => {
+                if generation != app.host_clipboard_paste_generation {
+                    return;
+                }
+                if interaction_generation != app.host_clipboard_interaction_generation {
+                    app.set_status(
+                        "Clipboard result ignored because focus changed while it was being read",
+                    );
+                    return;
+                }
+                super::keybindings::handle_host_clipboard_read_complete(
+                    app,
+                    generation,
+                    super::message::HostClipboardPasteTarget::FilePickerOverlay {
+                        session_id,
+                        interaction_generation,
+                    },
+                    result,
+                );
+            }
+            super::message::HostClipboardPasteTarget::MetadataFilePicker {
+                editor_session_id,
+                picker_session_id,
+                interaction_generation,
+            } => {
+                if generation != app.host_clipboard_paste_generation {
+                    return;
+                }
+                if interaction_generation != app.host_clipboard_interaction_generation {
+                    app.set_status(
+                        "Clipboard result ignored because focus changed while it was being read",
+                    );
+                    return;
+                }
+                super::keybindings::handle_host_clipboard_read_complete(
+                    app,
+                    generation,
+                    super::message::HostClipboardPasteTarget::MetadataFilePicker {
+                        editor_session_id,
+                        picker_session_id,
+                        interaction_generation,
+                    },
+                    result,
+                );
             }
             super::message::HostClipboardPasteTarget::BrowseFilesystem {
                 target_dir,
@@ -6830,26 +6887,34 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 }
                 if interaction_generation != app.host_clipboard_interaction_generation {
                     app.set_status(
-                        "Terminal clipboard result ignored because focus changed while it was being read",
+                        "Clipboard result ignored because focus changed while it was being read",
                     );
                     return;
                 }
                 match result {
-                    Ok(text) if !text.is_empty() => {
-                        super::keybindings::start_filesystem_clipboard_paste_from_host_text(
-                            app,
-                            &text,
-                            target_dir,
-                            tx,
-                        );
-                        let queued_jobs = app.file_transfers.queued_summaries();
-                        if let ActiveOverlay::FileTaskProgress(session) = &mut app.active_overlay {
-                            session.progress.set_queued_jobs(queued_jobs);
+                    Ok(text) => {
+                        if text.is_empty() {
+                            // Empty host content is still authoritative. The
+                            // filesystem resolver owns observation so it can
+                            // preserve a bound Cut transaction across harmless
+                            // transport newline framing for non-empty values.
+                            let _ = tui_file_picker::observe_host_clipboard_text(text);
+                            app.set_status("Clipboard is empty");
+                        } else {
+                            super::keybindings::start_filesystem_clipboard_paste_from_host_text(
+                                app,
+                                &text,
+                                target_dir,
+                                tx,
+                            );
+                            let queued_jobs = app.file_transfers.queued_summaries();
+                            if let ActiveOverlay::FileTaskProgress(session) = &mut app.active_overlay {
+                                session.progress.set_queued_jobs(queued_jobs);
+                            }
                         }
                     }
-                    Ok(_) => app.set_status("Terminal clipboard is empty"),
                     Err(error) => {
-                        app.set_status(format!("Terminal clipboard unavailable: {error}"));
+                        app.set_status(format!("Clipboard unavailable: {error}"));
                     }
                 }
             }
@@ -10703,21 +10768,15 @@ fn replay_single_line_terminal_text_at_current_focus(
 /// Handle a bracketed paste event. When the BulkRename overlay is active,
 /// multi-line paste replaces the template-derived targets line-by-line.
 /// In text input overlays, the pasted text is inserted at the cursor.
-fn metadata_terminal_paste_needs_host_reconciliation(
-    target: &super::message::HostClipboardPasteTarget,
-) -> bool {
-    matches!(
-        target,
-        super::message::HostClipboardPasteTarget::MetadataRows { .. }
-            | super::message::HostClipboardPasteTarget::MetadataTags { .. }
-            | super::message::HostClipboardPasteTarget::MetadataDetailWholeField { .. }
-    )
-}
-
 fn handle_paste(app: &mut AppState, text: &str, tx: &mpsc::Sender<AppMessage>) {
-    // A terminal-provided paste is itself a newer user interaction. This also
-    // invalidates a raw Ctrl+Shift+V host-read request if the terminal emits a
-    // bracketed-paste event for the same physical gesture.
+    // A terminal-supplied bracketed paste is authoritative. Advance both the
+    // logical clipboard and the command-read generation before applying it so
+    // an older in-flight Ctrl+V/Ctrl+P host read cannot overwrite this value.
+    let terminal_snapshot = tui_file_picker::observe_terminal_clipboard_text(text.to_string());
+    app.host_clipboard_paste_generation = app
+        .host_clipboard_paste_generation
+        .checked_add(1)
+        .unwrap_or(1);
     app.host_clipboard_interaction_generation = app
         .host_clipboard_interaction_generation
         .checked_add(1)
@@ -10739,7 +10798,9 @@ fn handle_paste(app: &mut AppState, text: &str, tx: &mpsc::Sender<AppMessage>) {
         if session.picker.handle_terminal_paste(text) {
             return;
         }
-        let _ = session.picker.paste_filesystem_host_clipboard_text(text);
+        let _ = session
+            .picker
+            .paste_filesystem_logical_clipboard_text(text, &terminal_snapshot);
         return;
     }
 
@@ -10828,13 +10889,9 @@ fn handle_paste(app: &mut AppState, text: &str, tx: &mpsc::Sender<AppMessage>) {
             }
         }
         ActiveOverlay::MetadataEditor(_) => {
-            // A terminal can snapshot Ctrl+Shift+V while a preceding metadata
-            // copy is still publishing, then deliver that stale bracketed text
-            // after the write completes. Reconcile metadata paste against a
-            // fresh host read after prior Tonepoet writes drain. The terminal
-            // payload remains a one-shot fallback for transports such as OSC 52
-            // where host reads are unavailable; it is not retained as a private
-            // clipboard.
+            // The terminal supplied this payload explicitly; apply it directly
+            // through the same metadata parser/application path as command paste.
+            // Do not reread the host clipboard or substitute retained state.
             if let ActiveOverlay::MetadataEditor(state) = &mut app.active_overlay {
                 if let Some(file_picker) = state.file_picker.as_mut() {
                     if file_picker.picker.handle_terminal_paste(text) {
@@ -10842,7 +10899,7 @@ fn handle_paste(app: &mut AppState, text: &str, tx: &mpsc::Sender<AppMessage>) {
                     }
                     let _ = file_picker
                         .picker
-                        .paste_filesystem_host_clipboard_text(text);
+                        .paste_filesystem_logical_clipboard_text(text, &terminal_snapshot);
                     return;
                 }
             }
@@ -10899,20 +10956,11 @@ fn handle_paste(app: &mut AppState, text: &str, tx: &mpsc::Sender<AppMessage>) {
                 _ => None,
             };
             if let Some(target) = target {
-                if metadata_terminal_paste_needs_host_reconciliation(&target) {
-                    super::keybindings::begin_host_clipboard_paste_with_terminal_fallback(
-                        app,
-                        tx,
-                        target,
-                        text.to_string(),
-                    );
-                } else {
-                    super::keybindings::handle_terminal_clipboard_text(
-                        app,
-                        target,
-                        text.to_string(),
-                    );
-                }
+                super::keybindings::handle_terminal_clipboard_text(
+                    app,
+                    target,
+                    text.to_string(),
+                );
             } else {
                 app.set_status(
                     "terminal paste is unavailable on this metadata-editor tab",
@@ -11549,31 +11597,23 @@ mod metadata_detail_paste_tests {
     }
 
     #[test]
-    fn structured_metadata_bracketed_paste_reconciles_with_the_host_before_application() {
-        let session_id = 7;
-        for target in [
-            super::super::message::HostClipboardPasteTarget::MetadataRows {
-                session_id,
-                field_index: 0,
-            },
-            super::super::message::HostClipboardPasteTarget::MetadataTags {
-                session_id,
-                view: crate::tui::app::MetadataEditorView::Canonical,
-            },
-            super::super::message::HostClipboardPasteTarget::MetadataDetailWholeField {
-                session_id,
-                field_index: 0,
-            },
-        ] {
-            assert!(metadata_terminal_paste_needs_host_reconciliation(&target));
-        }
+    fn terminal_paste_becomes_authoritative_and_invalidates_older_command_reads() {
+        tui_file_picker::with_scoped_shared_text_clipboard("older", || {
+            let mut app = AppState::new_for_test(TonepoetConfig::default());
+            app.host_clipboard_paste_generation = 7;
+            app.active_overlay = ActiveOverlay::FileInput {
+                input: crate::tui::text_input::TextInputState::new(String::new()),
+            };
+            let (tx, _rx) = mpsc::channel(4);
 
-        assert!(!metadata_terminal_paste_needs_host_reconciliation(
-            &super::super::message::HostClipboardPasteTarget::MetadataInline {
-                session_id,
-                field_index: 0,
-            },
-        ));
+            handle_paste(&mut app, "terminal-authoritative", &tx);
+
+            assert_eq!(app.host_clipboard_paste_generation, 8);
+            let snapshot = tui_file_picker::logical_clipboard_snapshot()
+                .expect("terminal paste must be retained logically");
+            assert_eq!(snapshot.text, "terminal-authoritative");
+            assert_eq!(snapshot.origin, tui_file_picker::LogicalClipboardOrigin::TerminalPaste);
+        });
     }
 
     #[test]
@@ -11671,11 +11711,10 @@ mod metadata_detail_paste_tests {
         };
 
         let mut snapshots = Vec::new();
-        // Ctrl+V, Ctrl+P, and metadata bracketed Ctrl+Shift+V all terminate in
-        // HostClipboardReadComplete after the latter reconciles its terminal
-        // snapshot against the host. The keybinding regression separately
-        // proves that the raw key chords request this same MetadataRows target.
-        for generation in [41_u64, 42_u64, 43_u64] {
+        // Ctrl+V and Ctrl+P resolve through HostClipboardReadComplete. The
+        // bracketed Ctrl+Shift+V case must apply the terminal payload directly
+        // but converge on the same structured metadata parser/application path.
+        for generation in [41_u64, 42_u64] {
             let mut app = make_app();
             let (session_id, sentinel) = match &app.active_overlay {
                 ActiveOverlay::MetadataEditor(state) => (
@@ -11699,6 +11738,14 @@ mod metadata_detail_paste_tests {
                 metadata_values(&app, "GENRE"),
             ));
         }
+
+        let mut bracketed = make_app();
+        let (tx, _rx) = mpsc::channel(8);
+        handle_paste(&mut bracketed, &clipboard, &tx);
+        snapshots.push((
+            metadata_values(&bracketed, "ALBUM"),
+            metadata_values(&bracketed, "GENRE"),
+        ));
 
         assert!(snapshots.windows(2).all(|pair| pair[0] == pair[1]));
         assert_eq!(
@@ -19516,7 +19563,7 @@ mod tag_clipboard_completion_tests {
         assert_eq!(clipboard.entries[0].per_file_stored_value_counts, vec![2, 1]);
         assert_eq!(
             app.status_message.as_ref().map(|(message, _)| message.as_str()),
-            Some("Copied 1 field from 2 files to terminal clipboard"),
+            Some("Copied 1 field from 2 files"),
         );
         assert_eq!(app.browse.tag_clipboard_copy_active_generation, None);
         assert!(app.browse.tag_clipboard_copy_cancel.is_none());
@@ -22808,5 +22855,185 @@ mod browse_tab_async_routing_tests {
             app.archive_passwords.get(&archive).map(String::as_str),
             Some("good")
         );
+    }
+}
+
+#[cfg(test)]
+mod host_clipboard_picker_ownership_tests {
+    use super::*;
+    use crate::config::TonepoetConfig;
+    use crate::tui::app::{
+        FilePickerPurpose, MetadataEditorState, MetadataFilePickerState, MetadataTechnicalDetails,
+    };
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn channel() -> mpsc::Sender<AppMessage> {
+        let (tx, _rx) = mpsc::channel(8);
+        tx
+    }
+
+    fn picker_for(dir: &std::path::Path) -> tui_file_picker::FilePickerState {
+        let mut picker = tui_file_picker::FilePickerState::new(
+            tui_file_picker::FilePickerConfig {
+                start_dir: dir.to_path_buf(),
+                ..tui_file_picker::FilePickerConfig::default()
+            },
+        );
+        assert_eq!(
+            picker.handle_key(KeyEvent::new(
+                KeyCode::Char('l'),
+                KeyModifiers::CONTROL,
+            )),
+            tui_file_picker::FilePickerAction::None,
+        );
+        assert_eq!(picker.focus(), tui_file_picker::FilePickerFocus::Address);
+        picker
+    }
+
+    fn picker_debug(app: &AppState) -> String {
+        match &app.active_overlay {
+            ActiveOverlay::FilePicker(session) => format!("{:?}", session.picker),
+            ActiveOverlay::MetadataEditor(state) => format!(
+                "{:?}",
+                state.file_picker.as_ref().expect("metadata picker").picker
+            ),
+            other => panic!("expected picker owner, got {other:?}"),
+        }
+    }
+
+    fn status_text(app: &AppState) -> Option<&str> {
+        app.status_message.as_ref().map(|(message, _)| message.as_str())
+    }
+
+    #[test]
+    fn stale_global_picker_host_read_is_ignored_after_address_focus_moves_to_search() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let picker = picker_for(temp.path());
+        let session = MetadataFilePickerState::new(FilePickerPurpose::SelectFile, picker);
+        let session_id = session.session_id;
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::FilePicker(session);
+        app.host_clipboard_paste_generation = 9;
+        app.host_clipboard_interaction_generation = 41;
+        let request_interaction_generation = app.host_clipboard_interaction_generation;
+
+        let ActiveOverlay::FilePicker(session) = &mut app.active_overlay else {
+            unreachable!();
+        };
+        session.picker.set_focus(tui_file_picker::FilePickerFocus::Search);
+        app.host_clipboard_interaction_generation += 1;
+        let before = picker_debug(&app);
+
+        handle_message(
+            &mut app,
+            AppMessage::HostClipboardReadComplete {
+                generation: 9,
+                target: super::super::message::HostClipboardPasteTarget::FilePickerOverlay {
+                    session_id,
+                    interaction_generation: request_interaction_generation,
+                },
+                result: Ok("must-not-land".to_string()),
+            },
+            &channel(),
+        );
+
+        assert_eq!(
+            status_text(&app),
+            Some("Clipboard result ignored because focus changed while it was being read")
+        );
+        assert_eq!(picker_debug(&app), before, "stale completion must not mutate Address or Search");
+    }
+
+    #[test]
+    fn stale_metadata_picker_host_read_is_ignored_after_address_focus_moves_to_search() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let audio = temp.path().join("track.flac");
+        std::fs::write(&audio, b"audio").expect("audio fixture");
+        let mut state = Box::new(MetadataEditorState::for_files(
+            vec![audio],
+            Vec::new(),
+            vec!["track.flac".to_string()],
+            MetadataTechnicalDetails::default(),
+        ));
+        let editor_session_id = state.active_surface().technical_details.session_id;
+        let picker = picker_for(temp.path());
+        let picker_state = MetadataFilePickerState::new(FilePickerPurpose::SelectFile, picker);
+        let picker_session_id = picker_state.session_id;
+        state.file_picker = Some(picker_state);
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::MetadataEditor(state);
+        app.host_clipboard_paste_generation = 12;
+        app.host_clipboard_interaction_generation = 77;
+        let request_interaction_generation = app.host_clipboard_interaction_generation;
+
+        let ActiveOverlay::MetadataEditor(state) = &mut app.active_overlay else {
+            unreachable!();
+        };
+        state
+            .file_picker
+            .as_mut()
+            .expect("metadata picker")
+            .picker
+            .set_focus(tui_file_picker::FilePickerFocus::Search);
+        app.host_clipboard_interaction_generation += 1;
+        let before = picker_debug(&app);
+
+        handle_message(
+            &mut app,
+            AppMessage::HostClipboardReadComplete {
+                generation: 12,
+                target: super::super::message::HostClipboardPasteTarget::MetadataFilePicker {
+                    editor_session_id,
+                    picker_session_id,
+                    interaction_generation: request_interaction_generation,
+                },
+                result: Ok("must-not-land".to_string()),
+            },
+            &channel(),
+        );
+
+        assert_eq!(
+            status_text(&app),
+            Some("Clipboard result ignored because focus changed while it was being read")
+        );
+        assert_eq!(picker_debug(&app), before, "stale completion must not mutate Address or Search");
+    }
+
+    #[test]
+    fn global_picker_host_read_still_pastes_when_interaction_generation_is_unchanged() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let destination = temp.path().join("destination");
+        std::fs::create_dir(&destination).expect("destination");
+        let picker = picker_for(temp.path());
+        let session = MetadataFilePickerState::new(FilePickerPurpose::SelectFile, picker);
+        let session_id = session.session_id;
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::FilePicker(session);
+        app.host_clipboard_paste_generation = 15;
+        app.host_clipboard_interaction_generation = 101;
+
+        handle_message(
+            &mut app,
+            AppMessage::HostClipboardReadComplete {
+                generation: 15,
+                target: super::super::message::HostClipboardPasteTarget::FilePickerOverlay {
+                    session_id,
+                    interaction_generation: 101,
+                },
+                result: Ok(destination.display().to_string()),
+            },
+            &channel(),
+        );
+
+        let ActiveOverlay::FilePicker(session) = &mut app.active_overlay else {
+            panic!("expected global picker");
+        };
+        assert_eq!(session.picker.focus(), tui_file_picker::FilePickerFocus::Address);
+        assert_eq!(
+            session.picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            tui_file_picker::FilePickerAction::None,
+        );
+        assert_eq!(session.picker.current_dir(), destination.as_path());
     }
 }

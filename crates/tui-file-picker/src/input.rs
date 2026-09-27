@@ -85,29 +85,35 @@ impl FilePickerState {
         true
     }
 
-    /// Insert text returned by the embedding application's asynchronous host
-    /// clipboard reader. Navigation-surface paste requests consume the same
-    /// snapshot as filesystem path input; picker name/path editors remain
-    /// single-line and use the same first-line rule as bracketed terminal paste.
-    pub fn paste_host_clipboard_text(&mut self, text: &str) -> bool {
+    fn paste_resolved_clipboard_text(
+        &mut self,
+        text: &str,
+        snapshot: &crate::LogicalClipboardSnapshot,
+    ) -> bool {
         if let Some(target) = self.host_clipboard_filesystem_paste_target.take() {
             if !self.file_operation_policy().allow_paste {
                 self.set_error(crate::state::FilePickerError::OperationDisabled("paste"));
                 return false;
             }
-            let retained_matches = self
+            let retained = self
                 .clipboard
                 .as_ref()
-                .is_some_and(|clipboard| clipboard.matches_host_text(text));
+                .filter(|clipboard| clipboard.matches_logical_snapshot(snapshot));
             let clipboard = match crate::filesystem_clipboard::filesystem_clipboard_from_host_text(
                 text,
-                self.clipboard.as_ref(),
+                retained,
             ) {
                 Ok(clipboard) => clipboard,
                 Err(reason) => {
                     self.set_error(crate::state::FilePickerError::ClipboardTextInvalid(reason));
                     return false;
                 }
+            };
+            let retained_matches = retained.is_some();
+            let clipboard = if retained_matches {
+                clipboard
+            } else {
+                clipboard.bind_logical_snapshot(snapshot)
             };
             if !retained_matches {
                 self.clipboard = Some(clipboard.clone());
@@ -124,12 +130,46 @@ impl FilePickerState {
         self.handle_terminal_paste(text)
     }
 
-    /// Apply a terminal-provided bracketed paste to picker navigation as a
-    /// filesystem paste. Unlike Ctrl+V/Ctrl+P, the host payload is already in
-    /// hand, so no asynchronous clipboard read is requested.
-    pub fn paste_filesystem_host_clipboard_text(&mut self, text: &str) -> bool {
+    /// Insert text returned by the embedding application's asynchronous host
+    /// clipboard reader. A successful host read becomes the current logical
+    /// clipboard before application; identical text preserves generation so a
+    /// Tonepoet-originated Cut transaction can safely retain its semantics.
+    pub fn paste_host_clipboard_text(&mut self, text: &str) -> bool {
+        // Native clipboard helpers may append one transport newline to the
+        // filesystem projection. Preserve a Tonepoet Cut/Copy generation when
+        // the currently bound transaction proves this host text is the same
+        // canonical path list; otherwise the successful host read is a new
+        // authoritative logical value.
+        if let Some(snapshot) = crate::logical_clipboard_snapshot() {
+            if self.clipboard.as_ref().is_some_and(|clipboard| {
+                clipboard.matches_logical_snapshot(&snapshot)
+                    && clipboard.matches_host_text(text)
+            }) {
+                return self.paste_resolved_clipboard_text(text, &snapshot);
+            }
+        }
+        let snapshot = crate::observe_host_clipboard_text(text.to_string());
+        self.paste_resolved_clipboard_text(text, &snapshot)
+    }
+
+    /// Apply a terminal-provided bracketed paste to picker navigation after
+    /// the embedding application has already accepted it as the current logical
+    /// clipboard generation.
+    pub fn paste_filesystem_logical_clipboard_text(
+        &mut self,
+        text: &str,
+        snapshot: &crate::LogicalClipboardSnapshot,
+    ) -> bool {
         self.host_clipboard_filesystem_paste_target = Some(self.filesystem_paste_target());
-        self.paste_host_clipboard_text(text)
+        self.paste_resolved_clipboard_text(text, snapshot)
+    }
+
+    /// Apply a terminal-provided bracketed paste to picker navigation as a
+    /// filesystem paste. The terminal payload itself is authoritative and
+    /// always creates a new logical generation, invalidating stale Cut state.
+    pub fn paste_filesystem_host_clipboard_text(&mut self, text: &str) -> bool {
+        let snapshot = crate::observe_terminal_clipboard_text(text.to_string());
+        self.paste_filesystem_logical_clipboard_text(text, &snapshot)
     }
 
     fn request_host_filesystem_paste(&mut self, target: PathBuf) {
@@ -2578,6 +2618,77 @@ mod tests {
         assert!(picker.take_host_clipboard_paste_request());
         assert!(picker.paste_host_clipboard_text(&source.display().to_string()));
         assert!(picker.paste_task.is_some());
+    }
+
+    #[test]
+    fn retained_logical_clipboard_preserves_copy_and_cut_without_host_read_transport() {
+        crate::with_scoped_shared_text_clipboard("seed", || {
+            for (key, expected_mode) in [
+                ('c', crate::FilePickerClipboardMode::Copy),
+                ('x', crate::FilePickerClipboardMode::Cut),
+            ] {
+                let temp = tempfile::tempdir().expect("tempdir");
+                let source_dir = temp.path().join("source");
+                let destination_dir = temp.path().join("destination");
+                fs::create_dir(&source_dir).expect("source dir");
+                fs::create_dir(&destination_dir).expect("destination dir");
+                let source = source_dir.join("track.flac");
+                fs::write(&source, b"audio").expect("source");
+
+                let mut picker = FilePickerState::new_host_managed(FilePickerConfig {
+                    start_dir: source_dir,
+                    ..FilePickerConfig::default()
+                });
+                let source_index = picker
+                    .entries()
+                    .iter()
+                    .position(|entry| entry.path == source)
+                    .expect("source visible");
+                picker.set_file_cursor(source_index, 4);
+
+                assert_eq!(
+                    picker.handle_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::CONTROL)),
+                    FilePickerAction::None,
+                );
+                let snapshot = crate::logical_clipboard_snapshot().expect("retained clipboard");
+                assert_eq!(snapshot.text, source.to_string_lossy().to_string());
+                let transaction = picker.clipboard.as_ref().expect("structured transaction");
+                assert_eq!(transaction.mode(), expected_mode);
+                assert!(transaction.matches_logical_snapshot(&snapshot));
+
+                assert!(picker.navigate_to_dir(destination_dir.clone()));
+                picker.focus = FilePickerFocus::Files;
+                assert_eq!(
+                    picker.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)),
+                    FilePickerAction::None,
+                );
+                assert!(picker.take_host_clipboard_paste_request());
+
+                // This is the value the embedding broker resolves when native
+                // host discovery reports NoReadableTransport. No desktop
+                // clipboard is consulted; the retained logical generation is
+                // still authoritative.
+                assert!(picker.paste_filesystem_logical_clipboard_text(
+                    &snapshot.text,
+                    &snapshot,
+                ));
+                match picker
+                    .take_host_mutation_request()
+                    .expect("host-managed paste request")
+                {
+                    crate::FilePickerHostMutationRequest::Paste {
+                        clipboard,
+                        target_dir,
+                    } => {
+                        assert_eq!(clipboard.mode(), expected_mode);
+                        assert_eq!(clipboard.paths(), &[source.clone()]);
+                        assert!(clipboard.matches_logical_snapshot(&snapshot));
+                        assert_eq!(target_dir, destination_dir);
+                    }
+                    other => panic!("unexpected host mutation request: {other:?}"),
+                }
+            }
+        });
     }
 
     fn select_tree_path(picker: &mut FilePickerState, target: &std::path::Path) {

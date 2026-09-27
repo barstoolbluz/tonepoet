@@ -184,10 +184,12 @@ pub enum HostClipboardPasteTarget {
     },
     FilePickerOverlay {
         session_id: u64,
+        interaction_generation: u64,
     },
     MetadataFilePicker {
         editor_session_id: u64,
         picker_session_id: u64,
+        interaction_generation: u64,
     },
     /// Filesystem paste requested from Browse navigation. The destination is
     /// frozen at key/context-menu dispatch; the interaction generation rejects
