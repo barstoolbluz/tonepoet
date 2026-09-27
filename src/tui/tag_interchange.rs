@@ -438,6 +438,9 @@ pub enum ClipboardTagPayload {
     FieldSet(Vec<FieldBlock>),
 }
 
+const CLIPBOARD_NAMESPACE_PREFIX: &str = "@tonepoet-clipboard-";
+const CLIPBOARD_SINGLE_FIELD_HEADER: &str = "@tonepoet-clipboard-v1:single-field";
+const CLIPBOARD_FIELD_SET_HEADER: &str = "@tonepoet-clipboard-v1:field-set";
 const CLIPBOARD_SINGLE_FIELD_PREFIX: &str = "@tonepoet-clipboard-v1:single-field\n";
 const CLIPBOARD_FIELD_SET_PREFIX: &str = "@tonepoet-clipboard-v1:field-set\n";
 
@@ -686,13 +689,44 @@ pub fn serialize_clipboard_tag_entries<'a>(
 /// clipboard contains ordinary text (which may still be interpreted by an
 /// explicit tag-import command).
 pub fn parse_clipboard_tag_payload(input: &str) -> Result<Option<ClipboardTagPayload>, String> {
-    let (kind, body) = if let Some(body) = input.strip_prefix(CLIPBOARD_SINGLE_FIELD_PREFIX) {
-        (ClipboardTagPayloadKind::SingleField, body)
-    } else if let Some(body) = input.strip_prefix(CLIPBOARD_FIELD_SET_PREFIX) {
-        (ClipboardTagPayloadKind::FieldSet, body)
-    } else {
+    if !input.starts_with(CLIPBOARD_NAMESPACE_PREFIX) {
         return Ok(None);
+    }
+
+    // Normalize only the envelope's transport framing. Clipboard serialization
+    // JSON-escapes any CR/LF that belongs to a metadata value, so literal CR or
+    // CRLF bytes here are line delimiters rather than value content. This makes
+    // LF, CRLF, and legacy bare-CR terminal transports semantically identical
+    // without trimming keys, values, or structured JSON payloads.
+    let normalized = input.replace("\r\n", "\n").replace('\r', "\n");
+    let Some((header, body)) = normalized.split_once('\n') else {
+        return Err("clipboard metadata: malformed Tonepoet clipboard envelope framing".to_string());
     };
+    let kind = match header {
+        CLIPBOARD_SINGLE_FIELD_HEADER => ClipboardTagPayloadKind::SingleField,
+        CLIPBOARD_FIELD_SET_HEADER => ClipboardTagPayloadKind::FieldSet,
+        header if header.starts_with("@tonepoet-clipboard-v1:") => {
+            return Err(format!(
+                "clipboard metadata: unsupported Tonepoet clipboard envelope kind {:?}",
+                header.trim_start_matches("@tonepoet-clipboard-v1:")
+            ));
+        }
+        header => {
+            return Err(format!(
+                "clipboard metadata: unsupported Tonepoet clipboard envelope {:?}",
+                header
+            ));
+        }
+    };
+    for line in body.split('\n') {
+        if let Some(encoded) = line.strip_prefix(MULTI_VALUE_LINE_PREFIX) {
+            serde_json::from_str::<Vec<String>>(encoded).map_err(|error| {
+                format!(
+                    "clipboard metadata: malformed structured multi-value payload: {error}"
+                )
+            })?;
+        }
+    }
     let blocks = parse_field_blocks(body).map_err(|error| format!("clipboard metadata: {error}"))?;
     match kind {
         ClipboardTagPayloadKind::SingleField => {
@@ -1030,6 +1064,54 @@ mod tests {
                 .expect("ordinary text is not an envelope"),
             None,
             "ordinary line-oriented clipboard text must never be guessed to be structured metadata",
+        );
+    }
+
+    #[test]
+    fn structured_clipboard_envelope_accepts_lf_crlf_and_bare_cr_framing() {
+        let lf = concat!(
+            "@tonepoet-clipboard-v1:field-set\n",
+            "GENRE\n",
+            "@tonepoet-mv1:[\"Prog-Rock\",\"Prog\",\"Progressive Rock\",\"Art Rock\",\"AOR\"]",
+        );
+        for framed in [
+            lf.to_string(),
+            lf.replace('\n', "\r\n"),
+            lf.replace('\n', "\r"),
+        ] {
+            let parsed = parse_clipboard_tag_payload(&framed)
+                .expect("structured clipboard framing parses")
+                .expect("structured clipboard payload");
+            let ClipboardTagPayload::FieldSet(blocks) = parsed else {
+                panic!("expected field-set payload");
+            };
+            assert_eq!(blocks.len(), 1);
+            assert_eq!(blocks[0].key, "GENRE");
+            assert_eq!(blocks[0].values.len(), 1, "one metadata position is broadcast");
+            assert_eq!(
+                blocks[0].values[0].to_texts(),
+                ["Prog-Rock", "Prog", "Progressive Rock", "Art Rock", "AOR"],
+            );
+        }
+    }
+
+    #[test]
+    fn recognizable_malformed_structured_clipboard_never_falls_back_to_raw_text() {
+        for malformed in [
+            "@tonepoet-clipboard-v1:unknown\nGENRE\nRock",
+            "@tonepoet-clipboard-v2:field-set\nGENRE\nRock",
+            "@tonepoet-clipboard-v1:field-set",
+            "@tonepoet-clipboard-v1:field-set\nGENRE",
+            "@tonepoet-clipboard-v1:field-set\nGENRE\n@tonepoet-mv1:not-json",
+        ] {
+            assert!(
+                parse_clipboard_tag_payload(malformed).is_err(),
+                "recognizable Tonepoet envelope must fail closed: {malformed:?}",
+            );
+        }
+        assert_eq!(
+            parse_clipboard_tag_payload("GENRE\nRock").expect("plain text classification"),
+            None,
         );
     }
 

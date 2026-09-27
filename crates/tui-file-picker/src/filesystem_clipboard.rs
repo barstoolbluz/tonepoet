@@ -7,6 +7,12 @@ use std::path::{Path, PathBuf};
 pub struct FilesystemClipboard {
     mode: FilePickerClipboardMode,
     paths: Vec<PathBuf>,
+    // Logical clipboard identity is process-lifetime authority only. Do not
+    // persist it in file-task/recovery serialization.
+    #[serde(skip)]
+    logical_generation: Option<u64>,
+    #[serde(skip)]
+    logical_text: Option<String>,
 }
 
 impl FilesystemClipboard {
@@ -25,7 +31,12 @@ impl FilesystemClipboard {
             normalized.retain(|existing| !existing.starts_with(&path));
             normalized.push(path);
         }
-        (!normalized.is_empty()).then_some(Self { mode, paths: normalized })
+        (!normalized.is_empty()).then_some(Self {
+            mode,
+            paths: normalized,
+            logical_generation: None,
+            logical_text: None,
+        })
     }
 
     pub fn mode(&self) -> FilePickerClipboardMode {
@@ -44,12 +55,42 @@ impl FilesystemClipboard {
         self.paths.is_empty()
     }
 
+    /// Bind this structured transaction to the exact logical clipboard value
+    /// created by the Tonepoet Cut/Copy operation. The binding survives retry
+    /// subsets so destructive Cut semantics are never inferred from text alone.
+    pub fn bind_logical_snapshot(
+        mut self,
+        snapshot: &crate::LogicalClipboardSnapshot,
+    ) -> Self {
+        self.logical_generation = Some(snapshot.generation);
+        self.logical_text = Some(snapshot.text.clone());
+        self
+    }
+
+    /// Preserve logical clipboard ownership while deriving a residual retry
+    /// transaction from an existing Cut/Copy operation.
+    pub fn inherit_logical_identity(mut self, source: &Self) -> Self {
+        self.logical_generation = source.logical_generation;
+        self.logical_text = source.logical_text.clone();
+        self
+    }
+
+    pub fn logical_generation(&self) -> Option<u64> {
+        self.logical_generation
+    }
+
+    pub fn matches_logical_snapshot(&self, snapshot: &crate::LogicalClipboardSnapshot) -> bool {
+        self.logical_generation == Some(snapshot.generation)
+            && self.logical_text.as_deref() == Some(snapshot.text.as_str())
+    }
+
     /// Plain-text projection mirrored to the host clipboard.
     ///
-    /// The host clipboard is authoritative for each user-initiated paste. This
-    /// projection lets a retained transaction recover Cut/Copy semantics only
-    /// while the host text still matches it exactly, and is also portable for
-    /// pasting the selected paths into a shell, editor, or file manager.
+    /// A readable host clipboard is authoritative for command paste; when no
+    /// readable host transport exists, the retained logical snapshot supplies
+    /// this same projection. A structured transaction may recover Cut/Copy
+    /// semantics only while its exact logical generation remains current. The
+    /// text is also portable to a shell, editor, or file manager.
     pub fn text_projection(&self) -> String {
         self.paths
             .iter()
@@ -63,7 +104,12 @@ impl FilesystemClipboard {
     /// newline, so accept that transport-level difference without weakening
     /// path or ordering equality.
     pub fn matches_host_text(&self, text: &str) -> bool {
-        normalize_host_clipboard_text(text) == self.text_projection()
+        let expected = self
+            .logical_text
+            .as_deref()
+            .map(normalize_host_clipboard_text)
+            .unwrap_or_else(|| self.text_projection());
+        normalize_host_clipboard_text(text) == expected
     }
 }
 
@@ -90,19 +136,19 @@ pub fn filesystem_clipboard_from_host_text(
 
     let normalized = normalize_host_clipboard_text(text);
     if normalized.is_empty() {
-        return Err("terminal clipboard is empty".to_string());
+        return Err("clipboard is empty".to_string());
     }
 
     let mut paths = Vec::new();
     for line in normalized.split('\n') {
         let line = line.trim_end_matches('\r');
         if line.is_empty() {
-            return Err("terminal clipboard contains an empty path line".to_string());
+            return Err("clipboard contains an empty path line".to_string());
         }
         let path = PathBuf::from(line);
         if !path.exists() {
             return Err(format!(
-                "terminal clipboard path does not exist: {}",
+                "clipboard path does not exist: {}",
                 path.display()
             ));
         }
@@ -110,7 +156,7 @@ pub fn filesystem_clipboard_from_host_text(
     }
 
     FilesystemClipboard::new(FilePickerClipboardMode::Copy, paths)
-        .ok_or_else(|| "terminal clipboard contains no pasteable filesystem paths".to_string())
+        .ok_or_else(|| "clipboard contains no pasteable filesystem paths".to_string())
 }
 
 /// Remap a currently viewed path after a successful cut/paste operation.
@@ -244,6 +290,31 @@ mod tests {
         .expect("external host clipboard");
         assert_eq!(replaced.mode(), FilePickerClipboardMode::Copy);
         assert_eq!(replaced.paths(), &[other]);
+    }
+
+    #[test]
+    fn cut_semantics_require_the_exact_logical_generation_even_for_identical_text() {
+        crate::with_scoped_shared_text_clipboard("seed", || {
+            let source = PathBuf::from("/music/album");
+            let text = source.to_string_lossy().to_string();
+            let copy_snapshot = crate::retain_logical_clipboard_text(text.clone());
+            let retained = FilesystemClipboard::new(
+                FilePickerClipboardMode::Cut,
+                vec![source],
+            )
+            .expect("clipboard")
+            .bind_logical_snapshot(&copy_snapshot);
+            assert!(retained.matches_logical_snapshot(&copy_snapshot));
+
+            let same_host = crate::observe_host_clipboard_text(text.clone());
+            assert!(retained.matches_logical_snapshot(&same_host));
+
+            let explicit_terminal = crate::observe_terminal_clipboard_text(text);
+            assert!(
+                !retained.matches_logical_snapshot(&explicit_terminal),
+                "an explicit terminal paste must supersede stale destructive Cut provenance even when text is identical",
+            );
+        });
     }
 
     #[test]

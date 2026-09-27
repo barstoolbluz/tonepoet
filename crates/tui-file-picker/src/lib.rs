@@ -30,11 +30,13 @@ pub use filesystem_clipboard::{
 };
 pub use text_input::{
     apply_path_completion, apply_tab_completion, apply_template_variable_completion,
-    handle_text_input_key, handle_text_input_key_with_boundaries, mirror_host_clipboard_text,
-    read_shared_text_clipboard,
+    handle_text_input_key, handle_text_input_key_with_boundaries, logical_clipboard_snapshot,
+    mirror_host_clipboard_text, observe_host_clipboard_text, observe_terminal_clipboard_text,
+    read_shared_text_clipboard, retain_logical_clipboard_text,
     set_shared_clipboard_publish_hook, with_scoped_shared_text_clipboard,
     with_scoped_shared_text_clipboard_publish_hook, write_shared_text_clipboard,
-    CompletionMode, TextBoundaryMode, TextInputState,
+    write_shared_text_clipboard_with_snapshot, CompletionMode, LogicalClipboardOrigin,
+    LogicalClipboardSnapshot, TextBoundaryMode, TextInputState,
 };
 pub use type_ahead::{
     first_type_ahead_match, TypeAheadCandidate, TypeAheadState, TYPE_AHEAD_TIMEOUT,

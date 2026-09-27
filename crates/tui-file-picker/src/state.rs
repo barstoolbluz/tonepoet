@@ -3084,6 +3084,7 @@ impl FilePickerState {
                 clipboard.mode(),
                 remaining.iter().map(|mapping| mapping.source.clone()),
             )
+            .map(|residual| residual.inherit_logical_identity(&clipboard))
         };
 
         let mut refresh_parents = HashSet::new();
@@ -4233,8 +4234,9 @@ impl FilePickerState {
         let clipboard =
             FilesystemClipboard::new(FilePickerClipboardMode::Cut, paths)
                 .ok_or(FilePickerError::NoSelection)?;
-        crate::text_input::mirror_host_clipboard_text(&clipboard.text_projection());
-        self.clipboard = Some(clipboard);
+        let canonical_text = clipboard.text_projection();
+        let snapshot = crate::text_input::write_shared_text_clipboard_with_snapshot(canonical_text);
+        self.clipboard = Some(clipboard.bind_logical_snapshot(&snapshot));
         self.paste_retry_plan = None;
         self.clear_error();
         Ok(())
@@ -4258,8 +4260,9 @@ impl FilePickerState {
         let clipboard =
             FilesystemClipboard::new(FilePickerClipboardMode::Copy, paths)
                 .ok_or(FilePickerError::NoSelection)?;
-        crate::text_input::mirror_host_clipboard_text(&clipboard.text_projection());
-        self.clipboard = Some(clipboard);
+        let canonical_text = clipboard.text_projection();
+        let snapshot = crate::text_input::write_shared_text_clipboard_with_snapshot(canonical_text);
+        self.clipboard = Some(clipboard.bind_logical_snapshot(&snapshot));
         self.paste_retry_plan = None;
         self.clear_error();
         Ok(())
@@ -4551,6 +4554,7 @@ impl FilePickerState {
             }
         } else {
             FilesystemClipboard::new(clipboard.mode(), remaining_sources.clone())
+                .map(|residual| residual.inherit_logical_identity(&clipboard))
         };
 
         let mut refresh_parents = HashSet::new();
@@ -5013,10 +5017,10 @@ impl FilePickerState {
                 && action_paths.iter().all(|path| path.is_file()),
             FilePickerMenuAction::Delete => self.operation_policy.allow_delete && !action_paths.is_empty(),
             FilePickerMenuAction::Paste => {
-                // The host clipboard is authoritative and cannot be inspected
-                // synchronously while constructing the menu. Keep Paste
-                // available whenever policy allows it; activation performs the
-                // bounded host read and validates the returned path payload.
+                // Clipboard source resolution is asynchronous and cannot be
+                // completed while constructing the menu. Keep Paste available
+                // whenever policy allows it; activation resolves readable host
+                // authority or the retained fallback, then validates paths.
                 self.operation_policy.allow_paste
             }
             FilePickerMenuAction::SelectAll => !self.entries.is_empty(),
@@ -8761,9 +8765,11 @@ mod tests {
                 },
             );
 
-            assert_eq!(crate::text_input::read_shared_text_clipboard(), "prior text");
+            assert_eq!(crate::text_input::read_shared_text_clipboard(), expected);
             let clipboard = picker.clipboard.as_ref().expect("structured clipboard");
             assert_eq!(clipboard.paths(), &[file.clone()]);
+            let snapshot = crate::logical_clipboard_snapshot().expect("logical clipboard");
+            assert!(clipboard.matches_logical_snapshot(&snapshot));
         });
         assert_eq!(published.borrow().as_slice(), &[expected.clone(), expected]);
     }

@@ -2413,7 +2413,7 @@ fn handle_tag_clipboard_copy_complete_with_publisher<F>(
                     });
                 }
                 let mut status = format!(
-                    "Copied {} field{} from {} file{} to terminal clipboard",
+                    "Copied {} field{} from {} file{}",
                     field_count,
                     if field_count == 1 { "" } else { "s" },
                     file_count,
@@ -3178,7 +3178,9 @@ pub fn execute_context_action(
                 tui_file_picker::FilePickerClipboardMode::Cut,
                 vec![path],
             ) {
-                mirror_host_clipboard_text(&clipboard.text_projection());
+                let canonical_text = clipboard.text_projection();
+                let snapshot = tui_file_picker::write_shared_text_clipboard_with_snapshot(canonical_text);
+                let clipboard = clipboard.bind_logical_snapshot(&snapshot);
                 app.browse.replace_filesystem_clipboard_from_user(clipboard);
                 app.set_status("Cut tree folder");
             }
@@ -3188,7 +3190,9 @@ pub fn execute_context_action(
                 tui_file_picker::FilePickerClipboardMode::Copy,
                 vec![path],
             ) {
-                mirror_host_clipboard_text(&clipboard.text_projection());
+                let canonical_text = clipboard.text_projection();
+                let snapshot = tui_file_picker::write_shared_text_clipboard_with_snapshot(canonical_text);
+                let clipboard = clipboard.bind_logical_snapshot(&snapshot);
                 app.browse.replace_filesystem_clipboard_from_user(clipboard);
                 app.set_status("Copied tree folder");
             }
@@ -3333,7 +3337,9 @@ pub fn execute_context_action(
             match tui_file_picker::FilesystemClipboard::new(mode, selection.paths) {
                 Some(clipboard) => {
                     let count = clipboard.paths().len();
-                    mirror_host_clipboard_text(&clipboard.text_projection());
+                    let canonical_text = clipboard.text_projection();
+                    let snapshot = tui_file_picker::write_shared_text_clipboard_with_snapshot(canonical_text);
+                    let clipboard = clipboard.bind_logical_snapshot(&snapshot);
                     app.browse.replace_filesystem_clipboard_from_user(clipboard);
                     app.set_status(format!(
                         "{} {count} item{}",
@@ -3566,7 +3572,7 @@ pub fn execute_context_action(
             } else {
                 match publish_metadata_clipboard(&serialized.text) {
                     Ok(()) => app.set_status(format!(
-                        "metadata editor: copied {} {}-view tag field{} to terminal clipboard",
+                        "metadata editor: copied {} {}-view tag field{}",
                         serialized.keys.len(),
                         state.metadata_view.label(),
                         if serialized.keys.len() == 1 { "" } else { "s" }
@@ -4328,23 +4334,22 @@ pub fn execute_context_action(
     }
 }
 
-/// Publish through Tonepoet's single user-visible clipboard authority: the
-/// terminal/host clipboard. No in-process paste carrier is updated here.
+/// Commit Tonepoet's canonical clipboard text synchronously, then publish that
+/// same representation to the best available host/terminal transport.
 pub(crate) fn publish_text_clipboard(text: &str) {
-    tui_file_picker::mirror_host_clipboard_text(text);
+    let _ = tui_file_picker::write_shared_text_clipboard_with_snapshot(text.to_string());
 }
 
-/// Publish structured metadata to the host clipboard and do not report the
-/// copy as complete until Tonepoet's queued host write has drained. This is a
-/// publication barrier, not a second clipboard: no text is retained here.
+/// Structured metadata copy uses the same retained logical clipboard and waits
+/// for Tonepoet-controlled publication work to drain before reporting success.
+/// A publication timeout is diagnostic only: the retained copy is already
+/// valid and must remain usable in SSH/headless sessions.
 pub(crate) fn publish_metadata_clipboard(text: &str) -> Result<(), String> {
     publish_text_clipboard(text);
-    super::host_clipboard::wait_for_host_clipboard_publication()
-}
-
-/// Publish structured clipboard content through the same host authority.
-pub(crate) fn mirror_host_clipboard_text(text: &str) {
-    tui_file_picker::mirror_host_clipboard_text(text);
+    if let Err(error) = super::host_clipboard::wait_for_host_clipboard_publication() {
+        log::warn!("clipboard retained; external publication did not drain cleanly: {error}");
+    }
+    Ok(())
 }
 
 /// Host hook installed into `tui-file-picker`. Text-input copies call this
@@ -6093,7 +6098,7 @@ mod tests {
         assert_eq!(blocks[0].values, vec!["Behind the Lines", "Duchess"]);
         assert_eq!(
             app.status_message.as_ref().map(|(message, _)| message.as_str()),
-            Some("Copied 1 field from 2 files to terminal clipboard")
+            Some("Copied 1 field from 2 files")
         );
     }
 
@@ -6431,7 +6436,7 @@ mod tests {
             assert!(clipboard
                 .status_message
                 .as_ref()
-                .is_some_and(|(message, _)| message.contains("Reading host clipboard")));
+                .is_some_and(|(message, _)| message.contains("Reading clipboard")));
 
             let mut file = AppState::new_for_test(TonepoetConfig::default());
             file.pending_metadata_editor = Some(parked_test_editor(vec![
@@ -7997,7 +8002,7 @@ mod tests {
     }
 
     #[test]
-    fn browse_filesystem_copy_and_cut_preserve_internal_text_clipboard() {
+    fn browse_filesystem_copy_and_cut_update_one_logical_clipboard() {
         let temp = tempfile::tempdir().expect("tempdir");
         let file = temp.path().join("track.flac");
         std::fs::write(&file, b"audio").expect("fixture");
@@ -8034,10 +8039,16 @@ mod tests {
                     );
                 },
             );
-            assert_eq!(
-                tui_file_picker::read_shared_text_clipboard(),
-                "prior metadata text",
-            );
+            let expected = file.to_string_lossy().to_string();
+            assert_eq!(tui_file_picker::read_shared_text_clipboard(), expected);
+            let snapshot = tui_file_picker::logical_clipboard_snapshot()
+                .expect("filesystem copy must retain one logical clipboard value");
+            let clipboard = app
+                .browse
+                .filesystem_clipboard
+                .as_ref()
+                .expect("structured filesystem clipboard");
+            assert!(clipboard.matches_logical_snapshot(&snapshot));
         });
 
         let clipboard = app
@@ -8052,7 +8063,7 @@ mod tests {
     }
 
     #[test]
-    fn browse_tab_paste_requests_host_clipboard_instead_of_using_retained_transaction() {
+    fn browse_tab_paste_resolves_logical_clipboard_before_using_retained_transaction() {
         let temp = tempfile::tempdir().expect("tempdir");
         let tab_a = temp.path().join("tab-a");
         let tab_b = temp.path().join("tab-b");
@@ -8086,11 +8097,11 @@ mod tests {
         assert_eq!(
             app.host_clipboard_paste_generation,
             generation_before.wrapping_add(1),
-            "Paste must request a fresh host-clipboard snapshot",
+            "Paste must request fresh logical-clipboard source resolution",
         );
         assert!(
             app.file_transfers.queued.is_empty(),
-            "retained filesystem transaction metadata must not be pasted before the host read completes",
+            "retained filesystem transaction metadata must not bypass logical source resolution",
         );
     }
 

@@ -495,7 +495,7 @@ fn record_attempt(
 
 /// Publication hook installed into `tui-file-picker`.
 ///
-/// Queue one authoritative host-clipboard publication without blocking the reducer.
+/// Queue one host/terminal clipboard publication without blocking the reducer.
 /// Rapid host writes are coalesced using last-value-wins semantics.
 pub(crate) fn publish_system_clipboard(text: &str) {
     let should_start = {
@@ -526,7 +526,7 @@ pub(crate) fn publish_system_clipboard(text: &str) {
             state.last_error = Some(detail.clone());
             record_attempt(ClipboardOperation::Write, "worker", Err(detail.clone()));
             send_status(format!(
-                "Host clipboard write failed: {detail}"
+                "Tonepoet clipboard retained; external publication unavailable: {detail}"
             ));
         }
     }
@@ -574,7 +574,7 @@ fn host_clipboard_write_worker_with<B, E, S>(
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .last_error = None;
                 if let Some(warning) = outcome.warning {
-                    report_status(format!("Host clipboard write warning: {warning}"));
+                    report_status(format!("External clipboard publication note: {warning}"));
                 }
             }
             Err(error) => {
@@ -584,7 +584,7 @@ fn host_clipboard_write_worker_with<B, E, S>(
                     .last_error = Some(error.clone());
                 log::debug!("host clipboard write unavailable: {error}");
                 report_status(format!(
-                    "Host clipboard write failed: {error}; run :clipboard"
+                    "Tonepoet clipboard retained; external publication unavailable: {error}; run :clipboard"
                 ));
             }
         }
@@ -621,6 +621,7 @@ fn wait_for_host_clipboard_write_state(
     }
 }
 
+#[cfg(test)]
 fn wait_for_host_clipboard_write_completion(
     state: &Mutex<HostClipboardWriteState>,
     timeout: Duration,
@@ -636,15 +637,15 @@ fn wait_for_host_clipboard_write_completion(
 }
 
 /// Wait for queued Tonepoet host-clipboard publications to finish. Structured
-/// metadata copy uses this as a publication barrier before returning control
-/// to the terminal, which closes the app-controlled part of the immediate
-/// Copy -> bracketed-paste race without retaining clipboard text in-process.
+/// metadata copy uses this as an ordering barrier before returning control to
+/// the terminal. The logical clipboard was retained synchronously before the
+/// publication was queued; OSC 52 completion cannot imply terminal acceptance.
 pub(crate) fn wait_for_host_clipboard_publication() -> Result<(), String> {
-    wait_for_host_clipboard_write_completion(write_state(), CLIPBOARD_WRITE_DRAIN_TIMEOUT)
+    wait_for_host_clipboard_write_state(write_state(), CLIPBOARD_WRITE_DRAIN_TIMEOUT)
 }
 
 fn wait_for_prior_host_clipboard_writes() -> Result<(), String> {
-    wait_for_host_clipboard_publication()
+    wait_for_host_clipboard_write_state(write_state(), CLIPBOARD_WRITE_DRAIN_TIMEOUT)
 }
 
 /// Launch a bounded host clipboard read. The generation and semantic target
@@ -654,46 +655,19 @@ pub(crate) fn request_host_clipboard_paste(
     generation: u64,
     target: HostClipboardPasteTarget,
 ) {
-    request_host_clipboard_paste_inner(tx, generation, target, None);
-}
-
-/// Reconcile a terminal-generated bracketed paste with the host clipboard.
-///
-/// The terminal payload is only a one-shot transport fallback. It is captured
-/// by this read operation and discarded with the worker; it is never retained
-/// as an in-process clipboard authority. When a native host read is available,
-/// that newer snapshot wins after all queued Tonepoet writes have drained.
-pub(crate) fn request_host_clipboard_paste_with_fallback(
-    tx: mpsc::Sender<AppMessage>,
-    generation: u64,
-    target: HostClipboardPasteTarget,
-    terminal_fallback: String,
-) {
-    request_host_clipboard_paste_inner(
-        tx,
-        generation,
-        target,
-        Some(terminal_fallback),
-    );
-}
-
-fn resolve_host_clipboard_read(
-    result: Result<String, String>,
-    terminal_fallback: Option<String>,
-) -> Result<String, String> {
-    match (result, terminal_fallback) {
-        (Ok(text), _) => Ok(text),
-        (Err(_), Some(text)) => Ok(text),
-        (Err(error), None) => Err(error),
-    }
+    request_host_clipboard_paste_inner(tx, generation, target);
 }
 
 fn request_host_clipboard_paste_inner(
     tx: mpsc::Sender<AppMessage>,
     generation: u64,
     target: HostClipboardPasteTarget,
-    terminal_fallback: Option<String>,
 ) {
+    // Clipboard acquisition is asynchronous. Capture the logical generation
+    // before spawning so a newer Tonepoet copy or terminal paste can supersede
+    // this request even when the editor/focus identity itself has not changed.
+    let logical_generation_at_request = tui_file_picker::logical_clipboard_snapshot()
+        .map(|snapshot| snapshot.generation);
     let fallback_tx = tx.clone();
     let fallback_target = target.clone();
     let spawn_result = std::thread::Builder::new()
@@ -702,11 +676,25 @@ fn request_host_clipboard_paste_inner(
             let result = wait_for_prior_host_clipboard_writes().and_then(|()| {
                 let env = ClipboardEnvironment::detect();
                 let backend = RealClipboardBackend;
-                resolve_host_clipboard_read(
-                    read_host_clipboard_with(&backend, &env, ClipboardOperation::Read),
-                    terminal_fallback,
+                let retained = tui_file_picker::logical_clipboard_snapshot();
+                resolve_command_clipboard_read(
+                    &backend,
+                    &env,
+                    retained.as_ref().map(|snapshot| snapshot.text.as_str()),
+                    ClipboardOperation::Read,
                 )
             });
+            let logical_generation_now = tui_file_picker::logical_clipboard_snapshot()
+                .map(|snapshot| snapshot.generation);
+            if logical_generation_now != logical_generation_at_request {
+                record_attempt(
+                    ClipboardOperation::Read,
+                    "stale-logical-generation",
+                    Ok("discarded because a newer logical clipboard value superseded the request"
+                        .to_string()),
+                );
+                return;
+            }
             let _ = tx.blocking_send(AppMessage::HostClipboardReadComplete {
                 generation,
                 target,
@@ -953,6 +941,29 @@ fn write_host_clipboard_with(
             Err(actionable_write_error(env, &errors))
         }
     }
+}
+
+
+fn resolve_command_clipboard_read(
+    backend: &impl ClipboardBackend,
+    env: &ClipboardEnvironment,
+    retained: Option<&str>,
+    operation: ClipboardOperation,
+) -> Result<String, String> {
+    if native_read_candidates(backend, env).is_empty() {
+        if let Some(text) = retained {
+            record_attempt(
+                operation,
+                "retained-logical",
+                Ok(format!("{} bytes; no readable host transport", text.len())),
+            );
+            return Ok(text.to_string());
+        }
+    }
+
+    // If a readable native backend exists, it is authoritative. An unexpected
+    // failure must surface rather than silently substituting retained data.
+    read_host_clipboard_with(backend, env, operation)
 }
 
 fn read_host_clipboard_with(
@@ -1712,7 +1723,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_copy_publication_barrier_surfaces_and_consumes_write_failure() {
+    fn write_completion_diagnostic_surfaces_and_consumes_write_failure() {
         let state = Mutex::new(HostClipboardWriteState {
             pending: None,
             worker_running: false,
@@ -1727,27 +1738,60 @@ mod tests {
     }
 
     #[test]
-    fn bracketed_metadata_reconciliation_prefers_the_fresh_host_read() {
-        let resolved = resolve_host_clipboard_read(
-            Ok("structured field-set envelope".to_string()),
-            Some("stale\nraw\nlines".to_string()),
-        )
-        .expect("fresh host read should win");
-        assert_eq!(resolved, "structured field-set envelope");
+    fn logical_generation_change_marks_an_in_flight_read_stale() {
+        tui_file_picker::with_scoped_shared_text_clipboard("A", || {
+            let request_generation = tui_file_picker::logical_clipboard_snapshot()
+                .map(|snapshot| snapshot.generation);
+            let _ = tui_file_picker::retain_logical_clipboard_text("B");
+            let current_generation = tui_file_picker::logical_clipboard_snapshot()
+                .map(|snapshot| snapshot.generation);
+            assert_ne!(current_generation, request_generation);
+        });
     }
 
     #[test]
-    fn bracketed_metadata_reconciliation_falls_back_only_when_host_read_is_unavailable() {
-        let resolved = resolve_host_clipboard_read(
-            Err("native host clipboard read unavailable".to_string()),
-            Some("terminal bracketed payload".to_string()),
+    fn command_paste_uses_retained_value_only_when_no_readable_transport_exists() {
+        let backend = FakeBackend::default();
+        let env = ClipboardEnvironment::default();
+        let resolved = resolve_command_clipboard_read(
+            &backend,
+            &env,
+            Some("retained Tonepoet value"),
+            ClipboardOperation::Diagnostic,
         )
-        .expect("terminal payload remains usable when native reads are unavailable");
-        assert_eq!(resolved, "terminal bracketed payload");
+        .expect("retained fallback should satisfy a headless paste");
+        assert_eq!(resolved, "retained Tonepoet value");
+    }
 
-        let error = resolve_host_clipboard_read(Err("read failed".to_string()), None)
-            .expect_err("ordinary host reads must still surface failures");
-        assert_eq!(error, "read failed");
+    #[test]
+    fn command_paste_without_transport_or_retained_value_is_unavailable() {
+        let backend = FakeBackend::default();
+        let env = ClipboardEnvironment::default();
+        let error = resolve_command_clipboard_read(
+            &backend,
+            &env,
+            None,
+            ClipboardOperation::Diagnostic,
+        )
+        .expect_err("no readable backend and no retained value must fail");
+        assert!(error.contains("host clipboard read"));
+    }
+
+    #[test]
+    fn command_paste_does_not_hide_failure_of_an_existing_authoritative_backend() {
+        let mut backend = FakeBackend::default();
+        backend.programs.insert("xclip".to_string());
+        backend
+            .read_results
+            .insert("xclip".to_string(), Err("backend failed".to_string()));
+        let error = resolve_command_clipboard_read(
+            &backend,
+            &x11_env(),
+            Some("stale retained value"),
+            ClipboardOperation::Diagnostic,
+        )
+        .expect_err("a present but failing host backend must remain authoritative");
+        assert!(error.contains("backend failed"));
     }
 
     #[cfg(unix)]

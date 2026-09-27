@@ -3,32 +3,182 @@
 use crossterm::event::{KeyCode, KeyEvent};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 static TEXT_INPUT_CLIPBOARD_PUBLISH_HOOK: OnceLock<fn(&str)> = OnceLock::new();
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogicalClipboardOrigin {
+    TonepoetCopy,
+    HostRead,
+    TerminalPaste,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogicalClipboardSnapshot {
+    pub text: String,
+    pub generation: u64,
+    pub origin: LogicalClipboardOrigin,
+}
+
+#[derive(Debug, Default)]
+struct LogicalClipboardState {
+    generation: u64,
+    snapshot: Option<LogicalClipboardSnapshot>,
+}
+
+static LOGICAL_CLIPBOARD: OnceLock<Mutex<LogicalClipboardState>> = OnceLock::new();
+static LOGICAL_CLIPBOARD_COPY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn logical_clipboard_state() -> &'static Mutex<LogicalClipboardState> {
+    LOGICAL_CLIPBOARD.get_or_init(|| Mutex::new(LogicalClipboardState::default()))
+}
+
+fn logical_clipboard_copy_lock() -> &'static Mutex<()> {
+    LOGICAL_CLIPBOARD_COPY_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn next_generation(current: u64) -> u64 {
+    let next = current.wrapping_add(1);
+    if next == 0 {
+        1
+    } else {
+        next
+    }
+}
+
 thread_local! {
-    /// Optional thread-scoped clipboard used by tests that need an atomic
-    /// setup/dispatch/assertion sequence and by the embedding TUI while it
-    /// replays one already-read host snapshot. Production does not retain the
-    /// value outside that scoped dispatch.
-    static SCOPED_TEXT_INPUT_CLIPBOARD: RefCell<Option<String>> = RefCell::new(None);
+    /// Optional thread-scoped clipboard used by deterministic tests and while
+    /// the embedding TUI replays one already-resolved logical clipboard value
+    /// through an ordinary text-input reducer. Production uses the process-
+    /// lifetime broker below.
+    static SCOPED_TEXT_INPUT_CLIPBOARD: RefCell<Option<LogicalClipboardSnapshot>> = RefCell::new(None);
     static SCOPED_TEXT_INPUT_CLIPBOARD_PUBLISH_HOOK: RefCell<Option<Box<dyn Fn(&str)>>> = RefCell::new(None);
 }
 
-/// Publish text to the terminal/host clipboard. The only in-process value is
-/// the thread-scoped seam used by deterministic tests and by the embedding TUI
-/// to replay one already-read host snapshot through the ordinary text-input
-/// reducer. Production calls do not retain a second clipboard value.
-pub fn write_shared_text_clipboard(text: impl Into<String>) {
-    let text = text.into();
+fn update_scoped_logical_clipboard(
+    text: String,
+    origin: LogicalClipboardOrigin,
+    preserve_generation_if_equal: bool,
+) -> Option<LogicalClipboardSnapshot> {
     SCOPED_TEXT_INPUT_CLIPBOARD.with(|scoped| {
         let mut scoped = scoped.borrow_mut();
-        if scoped.is_some() {
-            *scoped = Some(text.clone());
+        let current = scoped.as_ref()?;
+        if preserve_generation_if_equal && current.text == text {
+            return Some(current.clone());
         }
-    });
+        let snapshot = LogicalClipboardSnapshot {
+            text,
+            generation: next_generation(current.generation),
+            origin,
+        };
+        *scoped = Some(snapshot.clone());
+        Some(snapshot)
+    })
+}
+
+fn replace_process_logical_clipboard(
+    text: String,
+    origin: LogicalClipboardOrigin,
+    preserve_generation_if_equal: bool,
+) -> LogicalClipboardSnapshot {
+    let mut state = logical_clipboard_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if preserve_generation_if_equal {
+        if let Some(current) = state.snapshot.as_ref() {
+            if current.text == text {
+                return current.clone();
+            }
+        }
+    }
+    state.generation = next_generation(state.generation);
+    let snapshot = LogicalClipboardSnapshot {
+        text,
+        generation: state.generation,
+        origin,
+    };
+    state.snapshot = Some(snapshot.clone());
+    snapshot
+}
+
+/// Retain a successful Tonepoet-originated copy before any best-effort host
+/// publication. This is the process-lifetime fallback behind the single
+/// logical clipboard; it is not a second user-visible clipboard.
+pub fn retain_logical_clipboard_text(text: impl Into<String>) -> LogicalClipboardSnapshot {
+    let text = text.into();
+    if let Some(snapshot) = update_scoped_logical_clipboard(
+        text.clone(),
+        LogicalClipboardOrigin::TonepoetCopy,
+        false,
+    ) {
+        return snapshot;
+    }
+    replace_process_logical_clipboard(text, LogicalClipboardOrigin::TonepoetCopy, false)
+}
+
+/// Accept a successfully read host clipboard value as authoritative. If it is
+/// byte-for-byte identical to the current logical value, preserve generation
+/// identity because no newer external state is observable.
+pub fn observe_host_clipboard_text(text: impl Into<String>) -> LogicalClipboardSnapshot {
+    let text = text.into();
+    if let Some(snapshot) = update_scoped_logical_clipboard(
+        text.clone(),
+        LogicalClipboardOrigin::HostRead,
+        true,
+    ) {
+        return snapshot;
+    }
+    replace_process_logical_clipboard(text, LogicalClipboardOrigin::HostRead, true)
+}
+
+/// Accept a terminal-supplied bracketed paste as a new authoritative logical
+/// clipboard generation. Even identical text advances generation so stale
+/// structured Cut metadata cannot survive an explicit terminal paste.
+pub fn observe_terminal_clipboard_text(text: impl Into<String>) -> LogicalClipboardSnapshot {
+    let text = text.into();
+    if let Some(snapshot) = update_scoped_logical_clipboard(
+        text.clone(),
+        LogicalClipboardOrigin::TerminalPaste,
+        false,
+    ) {
+        return snapshot;
+    }
+    replace_process_logical_clipboard(text, LogicalClipboardOrigin::TerminalPaste, false)
+}
+
+pub fn logical_clipboard_snapshot() -> Option<LogicalClipboardSnapshot> {
+    if let Some(snapshot) = SCOPED_TEXT_INPUT_CLIPBOARD.with(|scoped| scoped.borrow().clone()) {
+        return Some(snapshot);
+    }
+    logical_clipboard_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .snapshot
+        .clone()
+}
+
+/// Retain text synchronously, then publish the same canonical representation
+/// to the terminal/host transport.
+pub fn write_shared_text_clipboard_with_snapshot(
+    text: impl Into<String>,
+) -> LogicalClipboardSnapshot {
+    let text = text.into();
+    // Serialize the retained-generation commit and host-queue handoff. The host
+    // worker is already FIFO/last-value-wins, but without this small critical
+    // section two concurrent copy producers could retain A then B while queueing
+    // B then A. Holding the lock only across the nonblocking publish hook keeps
+    // the broker race-resistant without putting clipboard I/O under the mutex.
+    let _copy_guard = logical_clipboard_copy_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let snapshot = retain_logical_clipboard_text(text.clone());
     mirror_host_clipboard_text(&text);
+    snapshot
+}
+
+pub fn write_shared_text_clipboard(text: impl Into<String>) {
+    let _ = write_shared_text_clipboard_with_snapshot(text);
 }
 
 /// Publish a best-effort host clipboard projection. Structured filesystem
@@ -60,13 +210,13 @@ pub fn set_shared_clipboard_publish_hook(hook: fn(&str)) -> bool {
     TEXT_INPUT_CLIPBOARD_PUBLISH_HOOK.set(hook).is_ok()
 }
 
-/// Read the currently scoped host snapshot, if one is being replayed. There is
-/// deliberately no process-wide production fallback: an unscoped read is empty
-/// so callers cannot accidentally paste stale in-memory data instead of asking
-/// the host clipboard.
+/// Read the currently resolved logical clipboard value. Command-driven paste
+/// should still ask the embedding host broker first; this direct read is the
+/// retained fallback used when no readable host transport exists and by the
+/// shared text-input reducer during replay.
 pub fn read_shared_text_clipboard() -> String {
-    SCOPED_TEXT_INPUT_CLIPBOARD
-        .with(|scoped| scoped.borrow().clone())
+    logical_clipboard_snapshot()
+        .map(|snapshot| snapshot.text)
         .unwrap_or_default()
 }
 
@@ -78,7 +228,7 @@ pub fn with_scoped_shared_text_clipboard<R>(
     initial: impl Into<String>,
     f: impl FnOnce() -> R,
 ) -> R {
-    struct Restore(Option<String>);
+    struct Restore(Option<LogicalClipboardSnapshot>);
 
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -88,8 +238,18 @@ pub fn with_scoped_shared_text_clipboard<R>(
         }
     }
 
+    let initial = initial.into();
     let previous = SCOPED_TEXT_INPUT_CLIPBOARD.with(|scoped| {
-        scoped.replace(Some(initial.into()))
+        let generation = scoped
+            .borrow()
+            .as_ref()
+            .map(|snapshot| next_generation(snapshot.generation))
+            .unwrap_or(1);
+        scoped.replace(Some(LogicalClipboardSnapshot {
+            text: initial,
+            generation,
+            origin: LogicalClipboardOrigin::HostRead,
+        }))
     });
     let _restore = Restore(previous);
     f()
@@ -401,9 +561,9 @@ impl TextInputState {
         self.record_edit(before)
     }
 
-    /// Paste only an explicitly scoped host snapshot. The embedding TUI owns
-    /// asynchronous host reads and scopes their completion around this reducer;
-    /// calling this directly in production cannot resurrect stale copied text.
+    /// Paste the currently resolved logical clipboard value. The embedding TUI
+    /// still resolves command paste against a readable host clipboard first;
+    /// this reducer also supports the retained fallback when no host read exists.
     pub fn paste_clipboard(&mut self) -> bool {
         let clipboard = read_shared_text_clipboard();
         if clipboard.is_empty() {
@@ -2729,6 +2889,35 @@ mod tests {
             published.borrow().as_slice(),
             &["/music/album/track.flac".to_string()],
         );
+    }
+
+    #[test]
+    fn logical_clipboard_generation_tracks_copy_host_and_terminal_authority() {
+        with_scoped_shared_text_clipboard("seed", || {
+            let first = retain_logical_clipboard_text("A");
+            let second = retain_logical_clipboard_text("B");
+            assert!(second.generation > first.generation);
+            assert_eq!(read_shared_text_clipboard(), "B");
+
+            let same_host = observe_host_clipboard_text("B");
+            assert_eq!(same_host.generation, second.generation);
+            assert_eq!(same_host.origin, second.origin);
+
+            let explicit_terminal = observe_terminal_clipboard_text("B");
+            assert!(explicit_terminal.generation > same_host.generation);
+            assert_eq!(explicit_terminal.origin, LogicalClipboardOrigin::TerminalPaste);
+            assert_eq!(read_shared_text_clipboard(), "B");
+
+            let external = observe_host_clipboard_text("C");
+            assert!(external.generation > explicit_terminal.generation);
+            assert_eq!(external.origin, LogicalClipboardOrigin::HostRead);
+            assert_eq!(read_shared_text_clipboard(), "C");
+
+            let empty_external = observe_host_clipboard_text("");
+            assert!(empty_external.generation > external.generation);
+            assert_eq!(empty_external.origin, LogicalClipboardOrigin::HostRead);
+            assert_eq!(read_shared_text_clipboard(), "");
+        });
     }
 
     #[test]
