@@ -4,22 +4,22 @@
   "expected_negative_case_count": 34,
   "gates": [
     {
-      "evidence_sha256": "8577e64fa8ef79972e322cdb11655cbe91a365129907d362bf082f4a1fa106f1",
+      "evidence_sha256": "6491d55ccc66bcd67d7fda8fac751ea1043c2be8874387e0851f23a7e7afbea1",
       "gate": "Q01",
       "status": "passed"
     },
     {
-      "evidence_sha256": "2823830bc11a37bcfe63675aba71a038661c13d45a4a353b0216c97876711d74",
+      "evidence_sha256": "219f963b8735b1e1528f6a2e5b0fde485d4fd1ba8a3fe1c34da43261a092e02c",
       "gate": "Q02",
       "status": "passed"
     },
     {
-      "evidence_sha256": "65000ac88d147270e7d1b8c02cb3839371e627b86372388daea3f8bb51e19b5a",
+      "evidence_sha256": "4f9dff9e168ef62c840eb1b0bd999bcb569ae27c623ecc074d95f909049a0886",
       "gate": "GAIN08",
       "status": "passed"
     },
     {
-      "evidence_sha256": "10510cfa605a961ec1c869a37fdeb4f14ba060b2e96ec1a3d1fd2fe2ecb7e871",
+      "evidence_sha256": "e120eb5265d344636f2345fea9788e8b6562e202eda1e27593d7d9e7bbf8f5e0",
       "gate": "GAIN09",
       "status": "passed"
     },
@@ -34,7 +34,7 @@
       "status": "passed"
     },
     {
-      "evidence_sha256": "0a1c54360d3452fdb5cb0732800c2ecd3e8cb8832dfb8156921e745648a84c94",
+      "evidence_sha256": "c4ef64d648cdc3d6459958d8b1b53ef4b264e34f0aa83e98cbb3be7ef20ce9d3",
       "gate": "package_identity",
       "status": "passed"
     },
@@ -44,29 +44,29 @@
       "status": "passed"
     },
     {
-      "evidence_sha256": "160150323dad7c1c48b8caa499de4be277af98e00492e0cc4c3a4a2a591831c0",
+      "evidence_sha256": "574a2d1098c0643dbe2ccefc27bc543b2d2bd4e10b202abb3f18cc9745ee2a8f",
       "gate": "timeout_cancellation_resource",
       "status": "passed"
     },
     {
-      "evidence_sha256": "f84a892c083b9d15db6047f4d3785c000c98fba6b25f76799459b625e61782b6",
+      "evidence_sha256": "16b4b49872a5ee5bc0bf91c4abaa68484ff8ebac0851042237e7f385379021f8",
       "gate": "ordinary_workspace_regression",
       "status": "passed"
     },
     {
-      "evidence_sha256": "23d3061bd29b2813c586947519fc86527d88f34b14e677fab83109f9c9ce27d6",
+      "evidence_sha256": "0826c83251423e211c7ff5c05d09c2da6c7a39230d606154942e5ff714fbff82",
       "gate": "real_tool_candidate_qualification",
       "status": "passed"
     },
     {
-      "evidence_sha256": "d129dc38c661beaccaf4e91395b78b2e4fde23226c582c82caa43d4cd92dd74d",
+      "evidence_sha256": "e9c97914b1a7d51be928d081ab4b99516a80517e89771f5dd5b095e24effede7",
       "gate": "paired_performance_resource",
       "status": "passed"
     }
   ],
-  "metadata_mutation_closure_fingerprint_sha256": "0731d88c2d06e2c34b3ed493f192315196800968070aedfce09db63aa4256e92",
+  "metadata_mutation_closure_fingerprint_sha256": "d206d3d6291f7007475c9bad9e65deb8182e7e2dbd71257548ec713672c82f2f",
   "positive_case_count": 3903,
-  "runtime_closure_fingerprint_sha256": "b112ac37e56ad6acf2bbb9b50e885855242d3e4de563d53ca050bff7a9bec4ae",
+  "runtime_closure_fingerprint_sha256": "f3358960848db8ddeecac16c6022967215714d7dfb78ed8fca5efa03013d6e6a",
   "schema_version": 18,
   "status": "passed"
 }

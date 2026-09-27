@@ -2393,6 +2393,51 @@ mod tests {
     }
 
     #[test]
+    fn strict_extract_accepts_issue50_minimal_dst_silence_without_integrity_loss() {
+        const CASES: [(&[u8], u8); 2] = [
+            (include_bytes!("dst/issue50_fixtures/issue50_minimal_stereo.dst.bin"), 2),
+            (include_bytes!("dst/issue50_fixtures/issue50_minimal_5ch.dst.bin"), 5),
+        ];
+
+        for (payload, channel_count) in CASES {
+            let sectors = vec![synth_dst_sector(
+                payload,
+                channel_count,
+                1,
+                Timecode {
+                    minutes: 0,
+                    seconds: 0,
+                    frames: 1,
+                },
+            )];
+            let td = write_iso(&sectors);
+            let mut iso = IsoReader::open(&td.path().join("test.iso")).unwrap();
+            let mut output = std::io::Cursor::new(Vec::<u8>::new());
+            let opts = ExtractOptions::new(0, 1, channel_count, OutputFormat::Dff);
+            let report = extract_track_with_integrity_options(
+                &mut iso,
+                &mut output,
+                opts,
+                ExtractIntegrityOptions::strict().with_frame_format(FrameFormat::Dst),
+            )
+            .expect("minimal DST silence frame must pass strict extraction");
+
+            let expected_audio_bytes = 4704usize * usize::from(channel_count);
+            assert!(!report.integrity_loss_detected());
+            assert_eq!(report.stats.frames_read, 1);
+            assert_eq!(report.stats.audio_bytes, expected_audio_bytes as u64);
+            assert_eq!(report.integrity.parser_frames_emitted, 1);
+            assert_eq!(report.integrity.parser_bytes_emitted, payload.len() as u64);
+
+            let out = output.into_inner();
+            let audio_offset = crate::dff_writer::header_size(channel_count) as usize;
+            assert!(out[audio_offset..audio_offset + expected_audio_bytes]
+                .iter()
+                .all(|&byte| byte == 0x99));
+        }
+    }
+
+    #[test]
     fn extract_bad_dst_frame_returns_decode_error() {
         let payload = vec![0xDEu8; 100];
         let sectors = vec![synth_dst_sector(
