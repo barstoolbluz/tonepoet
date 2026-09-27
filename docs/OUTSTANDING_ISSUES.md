@@ -3179,3 +3179,39 @@ appears once, in order, with its tool, its purpose, and its numbers; the measure
 targets, gains and ReplayGain values are labelled fields; staging paths, internal
 identifiers, and boilerplate are absent or confined to a trailing diagnostic section. The
 user is the reader; a log the user calls a trainwreck is failing its only job.
+
+## 50. A minimal DST silence frame fails the whole Reference album
+
+Filed 2026-09-27. Bach, Cantatas for the Complete Liturgical Year Vol. 1 (Accent, DSD64,
+DST-coded), stereo area, track 1, on the Reference path:
+
+```
+Reference album auto-gain analysis failed: could not materialize Reference album
+participant 1: track realization failed: SACD extraction failed for .../sacd_bach_vol_1.iso
+track 1: DST decode error: unexpected EOF in DST stream after 8 bytes
+```
+
+### What is on the disc
+
+Stereo track 1 carries a run of 35 identical 8-byte DST frames (`ff 02 00 c0 41 80 05 6e`)
+at timecodes 115-149, about half a second of digital silence 1.5 s into the track; every
+other frame is 2-4 KB. The multichannel area carries the same run as 21-byte frames and
+extracts without complaint. Zero-padding the 8-byte frame and decoding it yields a full
+9408-byte frame of constant 0x99, the DSD idle pattern. The frame is valid encoder output
+for silence, not damage.
+
+### Why sacd-rs rejects it
+
+`BitReader` refuses reads past the end of the frame until `ArithmeticCoder::new` enables
+zero-padding. This frame's header syntax consumes all 64 bits before that point, so the
+next read is a hard EOF. The reference decoder reads zeros past the end. Because
+extraction runs with strict integrity, the error is fatal for the track, and the Reference
+album stage needs every track, so the whole album fails. Reproduces in one second:
+`tonepoet convert <iso> --track 1 --area stereo --format flac --output <tmp>`.
+
+### Required
+
+Minimal DST frames decode as the silence they encode, on every channel count, under the
+strict integrity mode the Reference path uses. Genuine truncation of a frame that needed
+more bits is still reported as an error, not silently zero-filled. This disc converts on
+the Reference path.
