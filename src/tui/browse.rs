@@ -381,11 +381,54 @@ pub struct DiscProbeActiveJob {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FolderClassifyRequest {
+    request_id: u64,
     path: PathBuf,
     identity: ProbeCacheIdentity,
     scan_generation: u64,
     cursor_focused: bool,
     probe_cue_availability: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FolderClassifyPending {
+    request_id: u64,
+    scan_generation: u64,
+    probe_cue_availability: bool,
+}
+
+/// Identity of the concrete files consulted by an exact CUE availability
+/// probe. Directory identity catches child add/remove/rename operations, while
+/// these member identities catch in-place edits that leave the containing
+/// directory's mtime unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderCueProbeFingerprint {
+    members: Vec<(PathBuf, ProbeCacheIdentity)>,
+}
+
+impl FolderCueProbeFingerprint {
+    fn capture<I>(paths: I) -> Option<Self>
+    where
+        I: IntoIterator<Item = PathBuf>,
+    {
+        let mut paths = paths.into_iter().collect::<Vec<_>>();
+        paths.sort();
+        paths.dedup();
+        let mut members = Vec::with_capacity(paths.len());
+        for path in paths {
+            let metadata = std::fs::metadata(&path).ok()?;
+            members.push((path, ProbeCacheIdentity::from_metadata(&metadata)));
+        }
+        Some(Self { members })
+    }
+
+    pub fn is_current(&self) -> bool {
+        self.members.iter().all(|(path, expected)| {
+            std::fs::metadata(path)
+                .ok()
+                .map(|metadata| ProbeCacheIdentity::from_metadata(&metadata) == *expected)
+                .unwrap_or(false)
+        })
+    }
 }
 
 /// Coalesced Browse reducer work. Async completions set these flags while the
@@ -2570,7 +2613,9 @@ pub struct BrowseState {
     /// Multi-selected file paths
     pub multi_selected: Vec<PathBuf>,
 
-    /// Shared in-memory filesystem clipboard used by Cut/Copy/Paste.
+    /// Retained filesystem transaction metadata for Cut/Copy/retry semantics.
+    /// Every new user paste is sourced from the host clipboard; this state is
+    /// reused only while its text projection still matches that host snapshot.
     pub filesystem_clipboard: Option<tui_file_picker::FilesystemClipboard>,
 
     /// Monotonic ownership revision for explicit user Copy/Cut actions. A
@@ -2778,7 +2823,13 @@ pub struct BrowseState {
 
     /// Folder classifications currently queued or running. Used to debounce
     /// cursor focus and avoid duplicate bounded walks for the same path.
-    folder_classification_pending: std::collections::HashSet<PathBuf>,
+    folder_classification_pending: HashMap<PathBuf, FolderClassifyPending>,
+    folder_classification_next_request_id: u64,
+
+    /// Exact CUE-probe member identity for cached CUE facts. This is separate
+    /// from the directory identity because in-place edits to a child CUE/audio
+    /// file do not ordinarily change the directory mtime.
+    folder_cue_probe_fingerprint: HashMap<PathBuf, FolderCueProbeFingerprint>,
 
     /// Explicit menu requests that need an embedded-only authority result.
     /// This survives an already-running ordinary folder classification; its
@@ -3793,7 +3844,9 @@ impl BrowseState {
             directory_summary_cold_work_policy: BrowseDirectorySummaryColdWorkPolicy::default(),
             directory_stats_cold_work_policy: BrowseDirectoryStatsColdWorkPolicy::default(),
             folder_classification_cache: HashMap::new(),
-            folder_classification_pending: std::collections::HashSet::new(),
+            folder_classification_pending: HashMap::new(),
+            folder_classification_next_request_id: 0,
+            folder_cue_probe_fingerprint: HashMap::new(),
             folder_cue_availability_probe_requested: std::collections::HashSet::new(),
             folder_classification_queue: VecDeque::new(),
             sacd_classify_cache: HashMap::new(),
@@ -3902,6 +3955,8 @@ impl BrowseState {
         std::mem::swap(&mut self.directory_stats_cold_work_policy, &mut other.directory_stats_cold_work_policy);
         std::mem::swap(&mut self.folder_classification_cache, &mut other.folder_classification_cache);
         std::mem::swap(&mut self.folder_classification_pending, &mut other.folder_classification_pending);
+        std::mem::swap(&mut self.folder_classification_next_request_id, &mut other.folder_classification_next_request_id);
+        std::mem::swap(&mut self.folder_cue_probe_fingerprint, &mut other.folder_cue_probe_fingerprint);
         std::mem::swap(&mut self.folder_cue_availability_probe_requested, &mut other.folder_cue_availability_probe_requested);
         std::mem::swap(&mut self.folder_classification_queue, &mut other.folder_classification_queue);
         std::mem::swap(&mut self.sacd_classify_cache, &mut other.sacd_classify_cache);
@@ -9357,7 +9412,7 @@ impl BrowseState {
             let cold_directory_work_allowed = self.uncached_directory_summary_work_allowed_for_focus();
             let classification_needed = cold_directory_work_allowed
                 && !classification_valid
-                && !self.folder_classification_pending.contains(&path);
+                && !self.folder_classification_pending.contains_key(&path);
             let stats_needed = self.recursive_dir_stats_allowed_for_focus()
                 && classification
                     .as_deref()
@@ -9927,15 +9982,24 @@ impl BrowseState {
     ) {
         self.discard_stale_queued_folder_classifications();
         if self.has_valid_folder_classification_for_identity(&path, identity)
-            || self.folder_classification_pending.contains(&path)
+            || self.folder_classification_pending.contains_key(&path)
         {
             return;
         }
 
-        self.folder_classification_pending.insert(path.clone());
+        let request_id = self.next_folder_classification_request_id();
+        self.folder_classification_pending.insert(
+            path.clone(),
+            FolderClassifyPending {
+                request_id,
+                scan_generation: self.scan_generation,
+                probe_cue_availability: false,
+            },
+        );
         self.folder_classification_queue
             .retain(|request| !same_scanned_path(&request.path, &path));
         self.folder_classification_queue.push_front(FolderClassifyRequest {
+            request_id,
             path,
             identity,
             scan_generation: self.scan_generation,
@@ -9961,31 +10025,60 @@ impl BrowseState {
             return;
         }
         let identity = ProbeCacheIdentity::from_entry(&entry);
-        if self
-            .valid_folder_classification_for_entry(&entry)
-            .is_some_and(|classification| {
-                classification.embedded_cue_availability
+        let cached_cue_is_resolved_and_fresh = self
+            .folder_classification_cache
+            .get(&entry.path)
+            .filter(|cached| cached.is_valid_for(identity))
+            .is_some_and(|cached| {
+                cached.classification.embedded_cue_availability
                     != EmbeddedCueAvailability::Unknown
-                    && classification.cue_import_availability
+                    && cached.classification.cue_import_availability
                         != CueImportAvailability::Unknown
-                    && classification.cue_repair_availability
+                    && cached.classification.cue_repair_availability
                         != CueRepairAvailability::Unknown
-            })
-        {
-            self.folder_cue_availability_probe_requested.remove(&entry.path);
+                    && self
+                        .folder_cue_probe_fingerprint
+                        .get(&entry.path)
+                        .is_some_and(FolderCueProbeFingerprint::is_current)
+            });
+        if cached_cue_is_resolved_and_fresh {
             return;
         }
 
+        // Directory `(mtime, size)` does not change when an existing sidecar
+        // CUE or embedded-CUE carrier is edited in place. Remove stale CUE
+        // authority before menu construction so a stale positive can never be
+        // rendered while its exact replacement is being computed.
+        if let Some(cached) = self
+            .folder_classification_cache
+            .get_mut(&entry.path)
+            .filter(|cached| cached.is_valid_for(identity))
+        {
+            let classification = Arc::make_mut(&mut cached.classification);
+            classification.embedded_cue_availability = EmbeddedCueAvailability::Unknown;
+            classification.cue_import_availability = CueImportAvailability::Unknown;
+            classification.cue_repair_availability = CueRepairAvailability::Unknown;
+        }
+        self.folder_cue_probe_fingerprint.remove(&entry.path);
         self.folder_cue_availability_probe_requested
             .insert(entry.path.clone());
-        if self.folder_classification_pending.contains(&entry.path) {
+        if self.folder_classification_pending.contains_key(&entry.path) {
             return;
         }
 
-        self.folder_classification_pending.insert(entry.path.clone());
+        let request_id = self.next_folder_classification_request_id();
+        self.folder_classification_pending.insert(
+            entry.path.clone(),
+            FolderClassifyPending {
+                request_id,
+                scan_generation: self.scan_generation,
+                probe_cue_availability: true,
+            },
+        );
         self.folder_classification_queue
             .retain(|request| !same_scanned_path(&request.path, &entry.path));
         self.folder_classification_queue.push_front(FolderClassifyRequest {
+            request_id,
             path: entry.path,
             identity,
             scan_generation: self.scan_generation,
@@ -10024,7 +10117,10 @@ impl BrowseState {
             if generation_current && cursor_still_focused {
                 kept.push_back(request);
             } else {
-                self.folder_classification_pending.remove(&request.path);
+                self.remove_folder_classification_pending_if_owned(
+                    &request.path,
+                    request.request_id,
+                );
             }
         }
         self.folder_classification_queue = kept;
@@ -10037,57 +10133,56 @@ impl BrowseState {
         self.discard_stale_queued_folder_classifications();
         while let Some(request) = self.folder_classification_queue.pop_front() {
             if request.scan_generation != self.scan_generation {
-                self.folder_classification_pending.remove(&request.path);
+                self.remove_folder_classification_pending_if_owned(
+                    &request.path,
+                    request.request_id,
+                );
                 continue;
             }
             if request.cursor_focused && !self.is_current_entry_path(&request.path) {
-                self.folder_classification_pending.remove(&request.path);
+                self.remove_folder_classification_pending_if_owned(
+                    &request.path,
+                    request.request_id,
+                );
                 continue;
             }
             let cached_satisfies_request = self
                 .folder_classification_cache
                 .get(&request.path)
                 .filter(|cached| cached.is_valid_for(request.identity))
-                .is_some_and(|cached| {
-                    !request.probe_cue_availability
-                        || (cached.classification.embedded_cue_availability
-                            != EmbeddedCueAvailability::Unknown
-                            && cached.classification.cue_import_availability
-                                != CueImportAvailability::Unknown
-                            && cached.classification.cue_repair_availability
-                                != CueRepairAvailability::Unknown)
-                });
+                .is_some_and(|_| !request.probe_cue_availability);
             if cached_satisfies_request {
-                self.folder_classification_pending.remove(&request.path);
-                if request.probe_cue_availability {
-                    self.folder_cue_availability_probe_requested.remove(&request.path);
-                }
+                self.remove_folder_classification_pending_if_owned(
+                    &request.path,
+                    request.request_id,
+                );
                 continue;
             }
             let Some(current_identity) = std::fs::metadata(&request.path)
                 .ok()
                 .map(|metadata| ProbeCacheIdentity::from_metadata(&metadata))
             else {
-                self.folder_classification_pending.remove(&request.path);
+                self.remove_folder_classification_pending_if_owned(
+                    &request.path,
+                    request.request_id,
+                );
                 self.remove_folder_classification_cache_entry(&request.path);
                 continue;
             };
             if current_identity != request.identity {
-                self.folder_classification_pending.remove(&request.path);
+                self.remove_folder_classification_pending_if_owned(
+                    &request.path,
+                    request.request_id,
+                );
                 self.remove_folder_classification_cache_entry(&request.path);
                 if request.cursor_focused && self.is_current_entry_path(&request.path) {
                     self.schedule_cursor_focused_folder_classification(request.path, current_identity, tx);
                 }
                 continue;
             }
-            if request.probe_cue_availability {
-                // The explicit request has now been consumed. Leaving the
-                // marker armed would reschedule forever when a bounded scan
-                // legitimately returns `Unknown` (for example, budget
-                // exhaustion on an unusually large directory).
-                self.folder_cue_availability_probe_requested.remove(&request.path);
-            }
             spawn_folder_classification(
+                request.request_id,
+                request.scan_generation,
                 request.path,
                 request.identity,
                 request.probe_cue_availability,
@@ -10096,8 +10191,59 @@ impl BrowseState {
         }
     }
 
-    pub fn complete_folder_classification(&mut self, path: &Path) -> bool {
-        self.folder_classification_pending.remove(path)
+    fn next_folder_classification_request_id(&mut self) -> u64 {
+        let next = self.folder_classification_next_request_id.wrapping_add(1);
+        self.folder_classification_next_request_id = if next == 0 { 1 } else { next };
+        self.folder_classification_next_request_id
+    }
+
+    fn remove_folder_classification_pending_if_owned(
+        &mut self,
+        path: &Path,
+        request_id: u64,
+    ) -> bool {
+        let owned = self
+            .folder_classification_pending
+            .get(path)
+            .copied()
+            .filter(|pending| pending.request_id == request_id);
+        if let Some(pending) = owned {
+            self.folder_classification_pending.remove(path);
+            if pending.probe_cue_availability {
+                self.folder_cue_availability_probe_requested.remove(path);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn complete_folder_classification(
+        &mut self,
+        path: &Path,
+        request_id: u64,
+        scan_generation: u64,
+        probe_cue_availability: bool,
+    ) -> bool {
+        if scan_generation != self.scan_generation {
+            return false;
+        }
+        let accepted = self
+            .folder_classification_pending
+            .get(path)
+            .is_some_and(|pending| {
+                pending.request_id == request_id
+                    && pending.scan_generation == scan_generation
+                    && pending.probe_cue_availability == probe_cue_availability
+            });
+        if !accepted {
+            return false;
+        }
+        self.folder_classification_pending.remove(path);
+        if probe_cue_availability {
+            self.folder_cue_availability_probe_requested.remove(path);
+        }
+        true
     }
 
     pub fn clear_folder_classification_work_queue(&mut self) {
@@ -10173,7 +10319,13 @@ impl BrowseState {
             self.remove_folder_classification_cache_entry(&pending.path);
             self.clear_browse_cold_probe_tracking_for(&pending.path);
             self.dir_stats_pending.remove(&pending.path);
-            self.folder_classification_pending.remove(&pending.path);
+            if self
+                .folder_classification_pending
+                .remove(&pending.path)
+                .is_some_and(|classification| classification.probe_cue_availability)
+            {
+                self.folder_cue_availability_probe_requested.remove(&pending.path);
+            }
             return;
         };
 
@@ -10208,7 +10360,7 @@ impl BrowseState {
                     );
                 }
             } else if self.uncached_directory_summary_work_allowed_for_focus()
-                && !self.folder_classification_pending.contains(&pending.path)
+                && !self.folder_classification_pending.contains_key(&pending.path)
             {
                 self.schedule_cursor_focused_folder_classification(pending.path.clone(), identity, tx);
             }
@@ -10813,6 +10965,7 @@ impl BrowseState {
         identity: ProbeCacheIdentity,
         classification: FolderContentClassification,
     ) {
+        self.folder_cue_probe_fingerprint.remove(&path);
         let entry = FolderClassificationCacheEntry::new(identity, classification);
         let classification = entry.classification.clone();
         self.folder_classification_cache.insert(path.clone(), entry);
@@ -10823,9 +10976,18 @@ impl BrowseState {
 
     pub fn remove_folder_classification_cache_entry(&mut self, path: &Path) {
         self.folder_classification_cache.remove(path);
+        self.folder_cue_probe_fingerprint.remove(path);
         self.directory_summary_cache.remove(path);
         self.directory_summary_db_miss_cache.remove(path);
         self.persist_directory_summary_cache_best_effort();
+    }
+
+    pub fn retain_folder_cue_probe_fingerprint(
+        &mut self,
+        path: PathBuf,
+        fingerprint: FolderCueProbeFingerprint,
+    ) {
+        self.folder_cue_probe_fingerprint.insert(path, fingerprint);
     }
 
     pub fn valid_directory_summary_for_entry(
@@ -10868,15 +11030,24 @@ impl BrowseState {
     }
 
     pub fn folder_classification_pending_for(&self, path: &Path) -> bool {
-        self.folder_classification_pending.contains(path)
+        self.folder_classification_pending.contains_key(path)
     }
 
     /// Test helper for exercising async reducers without reaching into private
     /// debounce internals. Production code must still mark pending work only
     /// through the focused classification scheduler.
     #[cfg(test)]
-    pub fn mark_folder_classification_pending_for_test(&mut self, path: PathBuf) {
-        self.folder_classification_pending.insert(path);
+    pub fn mark_folder_classification_pending_for_test(&mut self, path: PathBuf) -> u64 {
+        let request_id = self.next_folder_classification_request_id();
+        self.folder_classification_pending.insert(
+            path,
+            FolderClassifyPending {
+                request_id,
+                scan_generation: self.scan_generation,
+                probe_cue_availability: false,
+            },
+        );
+        request_id
     }
 
     pub fn folder_audio_summary_probe_work_in_flight(&self, audio: &FolderAudioSummary) -> bool {
@@ -12213,6 +12384,8 @@ fn folder_probe_profile_label(info: &SourceInfo) -> String {
 }
 
 pub fn spawn_folder_classification(
+    request_id: u64,
+    scan_generation: u64,
     path: PathBuf,
     identity: ProbeCacheIdentity,
     probe_cue_availability: bool,
@@ -12220,8 +12393,9 @@ pub fn spawn_folder_classification(
 ) {
     tokio::spawn(async move {
         let classify_path = path.clone();
-        let classification = tokio::task::spawn_blocking(move || {
+        let (classification, cue_fingerprint) = tokio::task::spawn_blocking(move || {
             let mut classification = classify_folder_content_blocking(&classify_path, identity);
+            let mut cue_fingerprint = None;
             if probe_cue_availability {
                 let incomplete_member_set = classification.io_budget_exhausted
                     || (classification.audio.file_paths.is_empty()
@@ -12268,17 +12442,25 @@ pub fn spawn_folder_classification(
                         .map(|rejection| CueRepairAvailability::Repairable(rejection.cue_path))
                         .unwrap_or(CueRepairAvailability::Absent);
                 }
+
+                let mut fingerprint_paths = classification.audio.file_paths.clone();
+                fingerprint_paths.extend(candidates);
+                cue_fingerprint = FolderCueProbeFingerprint::capture(fingerprint_paths);
             }
-            classification
+            (classification, cue_fingerprint)
         })
         .await
         .unwrap_or_else(|err| {
             log::warn!("folder classification task failed for {}: {err}", path.display());
-            FolderContentClassification::unknown(identity, true)
+            (FolderContentClassification::unknown(identity, true), None)
         });
 
         let _ = tx
             .send(crate::tui::message::AppMessage::FolderClassifyComplete {
+                request_id,
+                scan_generation,
+                probe_cue_availability,
+                cue_fingerprint,
                 path,
                 identity,
                 classification,
@@ -20706,6 +20888,107 @@ mod disc_directory_navigation_tests {
         assert!(
             !state.dir_stats_pending.contains(&album),
             "recursive stats policy should suppress the stats walk independently"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolved_cue_cache_does_not_suppress_exact_revalidation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("Cached CUE Album");
+        std::fs::create_dir_all(&album).expect("album fixture");
+        std::fs::write(album.join("01.flac"), b"not real audio").expect("track fixture");
+        let identity = std::fs::metadata(&album)
+            .ok()
+            .map(|metadata| ProbeCacheIdentity::from_metadata(&metadata))
+            .expect("album identity");
+        let mut classification = classify_folder_content_blocking(&album, identity);
+        classification.embedded_cue_availability = EmbeddedCueAvailability::Absent;
+        classification.cue_import_availability = CueImportAvailability::Absent;
+        classification.cue_repair_availability = CueRepairAvailability::Absent;
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let mut state = focused_state_for_existing_entry(
+            album.clone(),
+            "Cached CUE Album",
+            EntryKind::Directory,
+        );
+        state.insert_folder_classification_for_identity(album.clone(), identity, classification);
+        assert!(!state.folder_classification_pending_for(&album));
+
+        state.request_current_folder_cue_availability(&tx);
+
+        assert!(
+            state.folder_classification_pending_for(&album),
+            "directory identity alone cannot prove exact CUE freshness; a resolved cache must still revalidate",
+        );
+        assert!(
+            state.folder_cue_availability_probe_requested.contains(&album),
+            "the explicit CUE request must remain owned until its exact worker completes",
+        );
+    }
+
+    #[tokio::test]
+    async fn in_place_cue_edit_invalidates_exact_cue_authority_before_menu_build() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("Fingerprint Album");
+        std::fs::create_dir_all(&album).expect("album fixture");
+        let audio = album.join("01.flac");
+        let cue = album.join("album.cue");
+        std::fs::write(&audio, b"not real audio").expect("track fixture");
+        std::fs::write(&cue, b"FILE \"01.flac\" WAVE\n").expect("cue fixture");
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let mut state = focused_state_for_existing_entry(
+            album.clone(),
+            "Fingerprint Album",
+            EntryKind::Directory,
+        );
+        let identity = ProbeCacheIdentity::from_entry(&state.entries[0]);
+        let mut classification = classify_folder_content_blocking(&album, identity);
+        classification.embedded_cue_availability = EmbeddedCueAvailability::Absent;
+        classification.cue_import_availability = CueImportAvailability::Present;
+        classification.cue_repair_availability = CueRepairAvailability::Absent;
+        state.insert_folder_classification_for_identity(album.clone(), identity, classification);
+        state.retain_folder_cue_probe_fingerprint(
+            album.clone(),
+            FolderCueProbeFingerprint::capture(vec![audio, cue.clone()])
+                .expect("cue fingerprint"),
+        );
+
+        state.request_current_folder_cue_availability(&tx);
+        assert!(
+            !state.folder_classification_pending_for(&album),
+            "unchanged member identities may reuse an exact CUE result",
+        );
+        assert_eq!(
+            state
+                .current_folder_classification()
+                .map(|classification| classification.cue_import_availability),
+            Some(CueImportAvailability::Present),
+        );
+
+        // Editing the CUE in place changes the child file identity without
+        // requiring the containing directory's identity to change.
+        std::fs::write(&cue, b"FILE \"01.flac\" WAVE\nREM changed in place\n")
+            .expect("rewrite cue in place");
+        state.request_current_folder_cue_availability(&tx);
+
+        assert!(state.folder_classification_pending_for(&album));
+        let classification = state
+            .current_folder_classification()
+            .expect("folder classification remains cached");
+        assert_eq!(
+            classification.cue_import_availability,
+            CueImportAvailability::Unknown,
+            "stale positive CUE authority must be hidden before the menu is built",
+        );
+        assert_eq!(
+            classification.cue_repair_availability,
+            CueRepairAvailability::Unknown,
+        );
+        assert_eq!(
+            classification.embedded_cue_availability,
+            EmbeddedCueAvailability::Unknown,
         );
     }
 

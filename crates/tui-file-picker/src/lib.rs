@@ -25,7 +25,9 @@ mod tree;
 
 pub use click_timing::{classify_click, ClickDisposition, ClickTracker, DOUBLE_CLICK_WINDOW};
 pub use filter::FilePickerFilter;
-pub use filesystem_clipboard::{remap_path_after_cut, FilesystemClipboard};
+pub use filesystem_clipboard::{
+    filesystem_clipboard_from_host_text, remap_path_after_cut, FilesystemClipboard,
+};
 pub use text_input::{
     apply_path_completion, apply_tab_completion, apply_template_variable_completion,
     handle_text_input_key, handle_text_input_key_with_boundaries, mirror_host_clipboard_text,

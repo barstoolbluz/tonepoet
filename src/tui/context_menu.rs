@@ -974,7 +974,7 @@ fn build_utilities_submenu(
         let advanced_cue_available = advanced_folder.is_some();
         if cue_import_available
             || advanced_cue_available
-            || embedded_cue_availability != super::probe::EmbeddedCueAvailability::Absent
+            || embedded_cue_availability == super::probe::EmbeddedCueAvailability::Present
         {
             children.push(ContextMenuEntry::Item(ContextMenuItem {
                 label: "View embedded CUE sheet".to_string(),
@@ -1345,25 +1345,13 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
                     ));
                 }
                 super::browse::CueRepairAvailability::Unknown
-                    if cue_import_availability != super::probe::CueImportAvailability::Absent =>
-                {
-                    items.push(item_enabled(
-                        "Repair malformed CUE (create copy)",
-                        ContextAction::RepairCue {
-                            folder: entry.path.clone(),
-                            cue_path: None,
-                        },
-                        false,
-                    ));
-                }
-                super::browse::CueRepairAvailability::Unknown
                 | super::browse::CueRepairAvailability::Absent => {}
             }
             // Directory menu construction must not synchronously scan or parse
             // CUE files. Sidecar import, repairability, Advanced-CUE, and
             // embedded-only availability consume the background classification
-            // cache; unresolved actions stay disabled until the cache resolves,
-            // while known-absent actions are omitted.
+            // cache; unresolved and known-absent actions are omitted rather
+            // than creating provisional rows that later change menu geometry.
             items.push(build_tagging_submenu(
                 false,
                 super::probe::EmbeddedCueAvailability::Absent,
@@ -1507,10 +1495,31 @@ fn select_menu_label(level: &mut MenuLevel, label: &str) -> Option<usize> {
     positions.get(selected).copied()
 }
 
-/// Rebuild an already-open Browse entry menu after a background probe changes
-/// embedded-CUE availability. Preserve the open submenu breadcrumb and focused
-/// label where they still exist so a late probe does not throw the user back to
-/// the root merely to enable or disable four items.
+fn same_menu_geometry(left: &[ContextMenuEntry], right: &[ContextMenuEntry]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter().zip(right).all(|(left, right)| match (left, right) {
+        (ContextMenuEntry::Separator, ContextMenuEntry::Separator) => true,
+        (ContextMenuEntry::Item(left), ContextMenuEntry::Item(right)) => left.label == right.label,
+        (
+            ContextMenuEntry::Submenu {
+                label: left_label,
+                children: left_children,
+            },
+            ContextMenuEntry::Submenu {
+                label: right_label,
+                children: right_children,
+            },
+        ) => left_label == right_label && same_menu_geometry(left_children, right_children),
+        _ => false,
+    })
+}
+
+/// Rebuild an already-open Browse entry menu after background classification
+/// changes CUE availability. Preserve physical menu geometry for the lifetime
+/// of the open menu; when only enabled state changes, also preserve the open
+/// submenu breadcrumb and focused label where they still exist.
 pub(super) fn refresh_open_browse_entry_menu(app: &mut AppState) {
     if app.current_screen != AppScreen::Browse || app.browse_context_action_paths.is_none() {
         return;
@@ -1525,6 +1534,30 @@ pub(super) fn refresh_open_browse_entry_menu(app: &mut AppState) {
         app.active_overlay = overlay;
         return;
     };
+
+    let rebuilt_root = build_browse_entry_menu(app);
+    let Some(old_root) = old_levels.first() else {
+        app.active_overlay = ActiveOverlay::ContextMenu {
+            levels: old_levels,
+            origin,
+            anchor_bottom,
+        };
+        return;
+    };
+
+    // Async classification may resolve an Unknown CUE state to Present or
+    // Absent while the menu is open. Never add or remove physical rows under
+    // the pointer: retain the current geometry and publish the new shape on the
+    // next menu open. Same-shape refreshes are still useful for enabling an
+    // already visible action after a background probe completes.
+    if !same_menu_geometry(&old_root.entries, &rebuilt_root) {
+        app.active_overlay = ActiveOverlay::ContextMenu {
+            levels: old_levels,
+            origin,
+            anchor_bottom,
+        };
+        return;
+    }
 
     let submenu_path = old_levels
         .iter()
@@ -1541,7 +1574,7 @@ pub(super) fn refresh_open_browse_entry_menu(app: &mut AppState) {
         .and_then(menu_entry_label)
         .map(ToOwned::to_owned);
 
-    let mut levels = vec![MenuLevel::new(build_browse_entry_menu(app))];
+    let mut levels = vec![MenuLevel::new(rebuilt_root)];
     for label in submenu_path {
         let Some(current) = levels.last_mut() else {
             break;
@@ -1574,13 +1607,10 @@ pub fn build_browse_tree_menu(app: &AppState, index: usize) -> Vec<ContextMenuEn
     };
     let path = node.path.clone();
     let mutable = path.parent().is_some();
-    let paste_enabled = app
-        .browse
-        .filesystem_clipboard
-        .as_ref()
-        .is_some_and(|clipboard| {
-            !clipboard.is_empty() && clipboard.paths().iter().all(|source| source.exists())
-        });
+    // Host clipboard contents are authoritative and read asynchronously only
+    // after activation, so menu construction cannot truthfully disable Paste
+    // based on Tonepoet's retained transaction metadata.
+    let paste_enabled = true;
     vec![
         item("Open in New Tab", ContextAction::OpenEntryInNewTab(path.clone())),
         separator(),
@@ -1657,7 +1687,7 @@ pub fn build_editor_context_menu(app: &AppState) -> Vec<ContextMenuEntry> {
 }
 
 /// Build the context menu for a right-click on empty space in the browse list.
-pub fn build_browse_empty_menu(app: &AppState) -> Vec<ContextMenuEntry> {
+pub fn build_browse_empty_menu(_app: &AppState) -> Vec<ContextMenuEntry> {
     vec![
         ContextMenuEntry::Submenu {
             label: "New".to_string(),
@@ -1670,12 +1700,7 @@ pub fn build_browse_empty_menu(app: &AppState) -> Vec<ContextMenuEntry> {
         item_enabled(
             "Paste",
             ContextAction::PasteSelection,
-            app.browse
-                .filesystem_clipboard
-                .as_ref()
-                .is_some_and(|clipboard| {
-                    !clipboard.is_empty() && clipboard.paths().iter().all(|path| path.exists())
-                }),
+            true,
         ),
         separator(),
         item("Refresh", ContextAction::Refresh),
@@ -3169,15 +3194,14 @@ pub fn execute_context_action(
             }
         }
         ContextAction::TreePaste(target_dir) => {
-            let Some(clipboard) = app.browse.filesystem_clipboard.clone() else {
-                app.set_status("Nothing to paste");
-                return;
-            };
-            super::keybindings::start_filesystem_clipboard_paste(
+            let interaction_generation = app.host_clipboard_interaction_generation;
+            super::keybindings::begin_host_clipboard_paste(
                 app,
-                clipboard,
-                target_dir,
                 tx,
+                super::message::HostClipboardPasteTarget::BrowseFilesystem {
+                    target_dir,
+                    interaction_generation,
+                },
             );
         }
         ContextAction::TreeDelete(path) => {
@@ -3330,15 +3354,15 @@ pub fn execute_context_action(
                 archive_synthetic_file_op_status(app, "paste");
                 return;
             }
-            let Some(clipboard) = app.browse.filesystem_clipboard.clone() else {
-                app.set_status("Nothing to paste");
-                return;
-            };
-            super::keybindings::start_filesystem_clipboard_paste(
+            let target_dir = app.browse.current_dir.clone();
+            let interaction_generation = app.host_clipboard_interaction_generation;
+            super::keybindings::begin_host_clipboard_paste(
                 app,
-                clipboard,
-                app.browse.current_dir.clone(),
                 tx,
+                super::message::HostClipboardPasteTarget::BrowseFilesystem {
+                    target_dir,
+                    interaction_generation,
+                },
             );
         }
         ContextAction::DuplicateSelection => {
@@ -3540,13 +3564,17 @@ pub fn execute_context_action(
                     state.metadata_view.label()
                 ));
             } else {
-                publish_text_clipboard(&serialized.text);
-                app.set_status(format!(
-                    "metadata editor: copied {} {}-view tag field{} to terminal clipboard",
-                    serialized.keys.len(),
-                    state.metadata_view.label(),
-                    if serialized.keys.len() == 1 { "" } else { "s" }
-                ));
+                match publish_metadata_clipboard(&serialized.text) {
+                    Ok(()) => app.set_status(format!(
+                        "metadata editor: copied {} {}-view tag field{} to terminal clipboard",
+                        serialized.keys.len(),
+                        state.metadata_view.label(),
+                        if serialized.keys.len() == 1 { "" } else { "s" }
+                    )),
+                    Err(error) => app.set_status(format!(
+                        "metadata editor: terminal clipboard write failed: {error}"
+                    )),
+                }
             }
             app.active_overlay = ActiveOverlay::MetadataEditor(state);
         }
@@ -4304,6 +4332,14 @@ pub fn execute_context_action(
 /// terminal/host clipboard. No in-process paste carrier is updated here.
 pub(crate) fn publish_text_clipboard(text: &str) {
     tui_file_picker::mirror_host_clipboard_text(text);
+}
+
+/// Publish structured metadata to the host clipboard and do not report the
+/// copy as complete until Tonepoet's queued host write has drained. This is a
+/// publication barrier, not a second clipboard: no text is retained here.
+pub(crate) fn publish_metadata_clipboard(text: &str) -> Result<(), String> {
+    publish_text_clipboard(text);
+    super::host_clipboard::wait_for_host_clipboard_publication()
 }
 
 /// Publish structured clipboard content through the same host authority.
@@ -6846,6 +6882,29 @@ mod tests {
         app
     }
 
+    fn synthetic_cue_menu_classification(
+        cue_import_availability: crate::tui::probe::CueImportAvailability,
+        cue_repair_availability: crate::tui::browse::CueRepairAvailability,
+        embedded_cue_availability: crate::tui::probe::EmbeddedCueAvailability,
+    ) -> super::super::browse::FolderContentClassification {
+        super::super::browse::FolderContentClassification {
+            kind: super::super::browse::FolderClassificationKind::Album,
+            identity: super::super::browse::ProbeCacheIdentity {
+                modified: None,
+                size: 0,
+            },
+            audio: super::super::browse::FolderAudioSummary::default(),
+            units: Vec::new(),
+            unit_count: 1,
+            collection_many: false,
+            io_budget_exhausted: false,
+            disc_marker: None,
+            embedded_cue_availability,
+            cue_import_availability,
+            cue_repair_availability,
+        }
+    }
+
     fn assert_pending_editor_uses_embedded_cue(app: &AppState, expected_carrier: &Path) {
         let state = app
             .pending_metadata_editor
@@ -6963,6 +7022,119 @@ mod tests {
         assert!(menu_labels_recursive(&menu)
             .iter()
             .any(|label| label == "Repair malformed CUE (create copy)"));
+    }
+
+    #[test]
+    fn open_menu_keeps_positive_cue_geometry_when_exact_revalidation_turns_absent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("album");
+        std::fs::create_dir(&album).expect("album dir");
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![BrowseEntry::new(
+            album.clone(),
+            "album".to_string(),
+            EntryKind::Directory,
+            0,
+            None,
+        )];
+        app.browse.selected_index = 0;
+        app.browse.insert_folder_classification_for_test(
+            album.clone(),
+            synthetic_cue_menu_classification(
+                crate::tui::probe::CueImportAvailability::Present,
+                crate::tui::browse::CueRepairAvailability::Absent,
+                crate::tui::probe::EmbeddedCueAvailability::Absent,
+            ),
+        );
+        app.browse_context_action_paths = Some(vec![album.clone()]);
+
+        let initial = build_browse_entry_menu(&app);
+        let initial_labels = menu_labels_recursive(&initial);
+        assert!(initial_labels.iter().any(|label| label == "Advanced CUE Options"));
+        app.active_overlay = ActiveOverlay::ContextMenu {
+            levels: vec![MenuLevel::new(initial)],
+            origin: (3, 4),
+            anchor_bottom: false,
+        };
+
+        app.browse.insert_folder_classification_for_test(
+            album,
+            synthetic_cue_menu_classification(
+                crate::tui::probe::CueImportAvailability::Absent,
+                crate::tui::browse::CueRepairAvailability::Absent,
+                crate::tui::probe::EmbeddedCueAvailability::Absent,
+            ),
+        );
+        refresh_open_browse_entry_menu(&mut app);
+
+        let ActiveOverlay::ContextMenu { levels, .. } = &app.active_overlay else {
+            panic!("context menu must remain open");
+        };
+        assert_eq!(menu_labels_recursive(&levels[0].entries), initial_labels);
+        assert!(
+            !menu_labels_recursive(&build_browse_entry_menu(&app))
+                .iter()
+                .any(|label| label == "Advanced CUE Options"),
+            "the corrected classification must become visible on the next menu open",
+        );
+    }
+
+    #[test]
+    fn open_menu_keeps_unknown_geometry_when_cue_revalidation_turns_absent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("album");
+        std::fs::create_dir(&album).expect("album dir");
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![BrowseEntry::new(
+            album.clone(),
+            "album".to_string(),
+            EntryKind::Directory,
+            0,
+            None,
+        )];
+        app.browse.selected_index = 0;
+        app.browse_context_action_paths = Some(vec![album.clone()]);
+
+        let initial = build_browse_entry_menu(&app);
+        let initial_labels = menu_labels_recursive(&initial);
+        assert!(
+            !initial_labels.iter().any(|label| label == "Repair malformed CUE (create copy)"),
+            "unresolved repairability must not create a provisional menu row",
+        );
+        assert!(
+            !initial_labels.iter().any(|label| label == "View embedded CUE sheet"),
+            "unresolved embedded-CUE availability must not create provisional menu rows",
+        );
+        app.active_overlay = ActiveOverlay::ContextMenu {
+            levels: vec![MenuLevel::new(initial)],
+            origin: (3, 4),
+            anchor_bottom: false,
+        };
+
+        app.browse.insert_folder_classification_for_test(
+            album,
+            synthetic_cue_menu_classification(
+                crate::tui::probe::CueImportAvailability::Absent,
+                crate::tui::browse::CueRepairAvailability::Absent,
+                crate::tui::probe::EmbeddedCueAvailability::Absent,
+            ),
+        );
+        refresh_open_browse_entry_menu(&mut app);
+
+        let ActiveOverlay::ContextMenu { levels, .. } = &app.active_overlay else {
+            panic!("context menu must remain open");
+        };
+        assert_eq!(
+            menu_labels_recursive(&levels[0].entries),
+            initial_labels,
+            "Unknown -> Absent must not remove rows from an already-open menu",
+        );
     }
 
     #[test]
@@ -7880,7 +8052,7 @@ mod tests {
     }
 
     #[test]
-    fn browse_tab_paste_snapshots_the_focused_destination_and_survives_later_switches() {
+    fn browse_tab_paste_requests_host_clipboard_instead_of_using_retained_transaction() {
         let temp = tempfile::tempdir().expect("tempdir");
         let tab_a = temp.path().join("tab-a");
         let tab_b = temp.path().join("tab-b");
@@ -7893,7 +8065,7 @@ mod tests {
         app.current_screen = AppScreen::Browse;
         app.browse.current_dir = tab_a.clone();
         app.browse.entries = vec![BrowseEntry::new(
-            source.clone(),
+            source,
             "track.flac".to_string(),
             EntryKind::AudioFile(crate::convert::formats::AudioFormat::Flac),
             5,
@@ -7905,22 +8077,20 @@ mod tests {
         execute_context_action(&mut app, ContextAction::CopySelection, &tx, false);
         assert!(app.browse.open_dir_in_new_tab(tab_b.clone(), true));
         assert_eq!(app.browse.current_dir, tab_b);
-        assert!(app.browse.filesystem_clipboard.is_some(), "clipboard must cross tabs");
+        assert!(app.browse.filesystem_clipboard.is_some(), "transaction metadata must cross tabs");
 
-        // Keep the transfer queued so the enqueue-time destination snapshot is
-        // directly inspectable without starting a filesystem worker.
         app.file_transfers.blocked_for_attention = true;
+        let generation_before = app.host_clipboard_paste_generation;
         execute_context_action(&mut app, ContextAction::PasteSelection, &tx, false);
-        let queued = app.file_transfers.queued.front().expect("queued transfer");
-        assert_eq!(queued.destination_dir, tab_b);
-        assert_eq!(queued.clipboard.paths(), &[source]);
 
-        assert!(app.browse.switch_to_tab(0));
-        assert_eq!(app.browse.current_dir, tab_a);
         assert_eq!(
-            app.file_transfers.queued.front().expect("queued transfer").destination_dir,
-            tab_b,
-            "later tab switches must not retarget an in-flight/queued transfer",
+            app.host_clipboard_paste_generation,
+            generation_before.wrapping_add(1),
+            "Paste must request a fresh host-clipboard snapshot",
+        );
+        assert!(
+            app.file_transfers.queued.is_empty(),
+            "retained filesystem transaction metadata must not be pasted before the host read completes",
         );
     }
 

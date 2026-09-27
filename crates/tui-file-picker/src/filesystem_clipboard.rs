@@ -1,4 +1,4 @@
-//! Shared in-memory filesystem clipboard model.
+//! Retained filesystem clipboard transaction metadata.
 
 use crate::FilePickerClipboardMode;
 use std::path::{Path, PathBuf};
@@ -46,9 +46,10 @@ impl FilesystemClipboard {
 
     /// Plain-text projection mirrored to the host clipboard.
     ///
-    /// The in-process clipboard remains authoritative for copy/move semantics;
-    /// this projection is intentionally portable and lossless enough for users
-    /// to paste the selected paths into a shell, editor, or file manager.
+    /// The host clipboard is authoritative for each user-initiated paste. This
+    /// projection lets a retained transaction recover Cut/Copy semantics only
+    /// while the host text still matches it exactly, and is also portable for
+    /// pasting the selected paths into a shell, editor, or file manager.
     pub fn text_projection(&self) -> String {
         self.paths
             .iter()
@@ -56,6 +57,60 @@ impl FilesystemClipboard {
             .collect::<Vec<_>>()
             .join("\n")
     }
+
+    /// Whether host clipboard text still names this exact transaction.
+    /// Native clipboard readers differ on whether they retain one trailing
+    /// newline, so accept that transport-level difference without weakening
+    /// path or ordering equality.
+    pub fn matches_host_text(&self, text: &str) -> bool {
+        normalize_host_clipboard_text(text) == self.text_projection()
+    }
+}
+
+fn normalize_host_clipboard_text(text: &str) -> String {
+    text.replace("\r\n", "\n")
+        .trim_end_matches(|ch| matches!(ch, '\r' | '\n'))
+        .to_string()
+}
+
+/// Resolve one host-clipboard snapshot into a filesystem operation.
+///
+/// If the text still matches Tonepoet's retained transaction exactly, retain
+/// its Cut/Copy mode and retry identity. Otherwise the host clipboard is the
+/// authority and any valid path list becomes a fresh Copy transaction.
+pub fn filesystem_clipboard_from_host_text(
+    text: &str,
+    retained: Option<&FilesystemClipboard>,
+) -> Result<FilesystemClipboard, String> {
+    if let Some(retained) = retained {
+        if retained.matches_host_text(text) {
+            return Ok(retained.clone());
+        }
+    }
+
+    let normalized = normalize_host_clipboard_text(text);
+    if normalized.is_empty() {
+        return Err("terminal clipboard is empty".to_string());
+    }
+
+    let mut paths = Vec::new();
+    for line in normalized.split('\n') {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            return Err("terminal clipboard contains an empty path line".to_string());
+        }
+        let path = PathBuf::from(line);
+        if !path.exists() {
+            return Err(format!(
+                "terminal clipboard path does not exist: {}",
+                path.display()
+            ));
+        }
+        paths.push(path);
+    }
+
+    FilesystemClipboard::new(FilePickerClipboardMode::Copy, paths)
+        .ok_or_else(|| "terminal clipboard contains no pasteable filesystem paths".to_string())
 }
 
 /// Remap a currently viewed path after a successful cut/paste operation.
@@ -160,5 +215,53 @@ mod tests {
             clipboard.text_projection(),
             "/music/disc 1/01.flac\n/music/disc 2/02.flac"
         );
+    }
+
+    #[test]
+    fn host_text_preserves_cut_only_while_projection_still_matches() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("album");
+        std::fs::create_dir(&source).expect("source");
+        let retained = FilesystemClipboard::new(
+            FilePickerClipboardMode::Cut,
+            vec![source.clone()],
+        )
+        .expect("clipboard");
+
+        let matched = filesystem_clipboard_from_host_text(
+            &format!("{}\n", source.display()),
+            Some(&retained),
+        )
+        .expect("matching host clipboard");
+        assert_eq!(matched.mode(), FilePickerClipboardMode::Cut);
+
+        let other = temp.path().join("other");
+        std::fs::create_dir(&other).expect("other");
+        let replaced = filesystem_clipboard_from_host_text(
+            &other.display().to_string(),
+            Some(&retained),
+        )
+        .expect("external host clipboard");
+        assert_eq!(replaced.mode(), FilePickerClipboardMode::Copy);
+        assert_eq!(replaced.paths(), &[other]);
+    }
+
+    #[test]
+    fn host_text_rejects_nonexistent_external_paths_instead_of_using_stale_transaction() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("album");
+        std::fs::create_dir(&source).expect("source");
+        let retained = FilesystemClipboard::new(
+            FilePickerClipboardMode::Cut,
+            vec![source],
+        )
+        .expect("clipboard");
+
+        let error = filesystem_clipboard_from_host_text(
+            "/definitely/not/a/tonepoet/path",
+            Some(&retained),
+        )
+        .expect_err("stale transaction must not win");
+        assert!(error.contains("does not exist"));
     }
 }

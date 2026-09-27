@@ -3969,6 +3969,26 @@ pub(super) fn begin_host_clipboard_paste(
     app.set_status("Reading host clipboard...");
 }
 
+pub(super) fn begin_host_clipboard_paste_with_terminal_fallback(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    target: super::message::HostClipboardPasteTarget,
+    terminal_fallback: String,
+) {
+    app.host_clipboard_paste_generation = app
+        .host_clipboard_paste_generation
+        .checked_add(1)
+        .unwrap_or(1);
+    let generation = app.host_clipboard_paste_generation;
+    super::host_clipboard::request_host_clipboard_paste_with_fallback(
+        tx.clone(),
+        generation,
+        target,
+        terminal_fallback,
+    );
+    app.set_status("Reading host clipboard...");
+}
+
 fn single_line_clipboard_text(text: &str) -> &str {
     text.split(|ch| matches!(ch, '\r' | '\n')).next().unwrap_or("")
 }
@@ -4394,7 +4414,19 @@ pub(crate) fn handle_terminal_clipboard_text(
         }
         super::message::HostClipboardPasteTarget::FilePickerOverlay { session_id } => {
             match &mut app.active_overlay {
-                ActiveOverlay::FilePicker(session) if session.session_id == session_id => session.picker.paste_host_clipboard_text(&text),
+                ActiveOverlay::FilePicker(session) if session.session_id == session_id => {
+                    let applied = session.picker.paste_host_clipboard_text(&text);
+                    if !applied {
+                        if let Some(error) = session.picker.error_message() {
+                            success_status = Some(error);
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        true
+                    }
+                }
                 _ => false,
             }
         }
@@ -4402,13 +4434,26 @@ pub(crate) fn handle_terminal_clipboard_text(
             match &mut app.active_overlay {
                 ActiveOverlay::MetadataEditor(state) if state.active_surface().technical_details.session_id == editor_session_id => {
                     state.file_picker.as_mut().filter(|session| session.session_id == picker_session_id)
-                        .map(|session| session.picker.paste_host_clipboard_text(&text)).unwrap_or(false)
+                        .map(|session| {
+                            let applied = session.picker.paste_host_clipboard_text(&text);
+                            if !applied {
+                                if let Some(error) = session.picker.error_message() {
+                                    success_status = Some(error);
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                true
+                            }
+                        }).unwrap_or(false)
                 }
                 _ => false,
             }
         }
         super::message::HostClipboardPasteTarget::CurrentTerminalFocus { .. }
         | super::message::HostClipboardPasteTarget::EditorText { .. }
+        | super::message::HostClipboardPasteTarget::BrowseFilesystem { .. }
         | super::message::HostClipboardPasteTarget::MetadataRows { .. }
         | super::message::HostClipboardPasteTarget::MetadataTags { .. }
         | super::message::HostClipboardPasteTarget::MetadataChapterTitles { .. } => unreachable!("handled above"),
@@ -7794,9 +7839,10 @@ pub(crate) fn handle_browse_filesystem_clipboard_key(
     key: KeyEvent,
     tx: &mpsc::Sender<AppMessage>,
 ) -> bool {
-    if key.modifiers != KeyModifiers::CONTROL
-        || !matches!(key.code, KeyCode::Char('c' | 'x' | 'v' | 'p'))
-    {
+    let copy_or_cut = key.modifiers == KeyModifiers::CONTROL
+        && matches!(key.code, KeyCode::Char('c' | 'x'));
+    let paste = is_host_clipboard_paste_chord(&key);
+    if !copy_or_cut && !paste {
         return false;
     }
     if app.browse.is_in_archive() {
@@ -7811,14 +7857,22 @@ pub(crate) fn handle_browse_filesystem_clipboard_key(
         match key.code {
             KeyCode::Char('c') => super::context_menu::ContextAction::TreeCopy(path),
             KeyCode::Char('x') => super::context_menu::ContextAction::TreeCut(path),
-            KeyCode::Char('v' | 'p') => super::context_menu::ContextAction::TreePaste(path),
+            KeyCode::Char(c)
+                if c.eq_ignore_ascii_case(&'v') || c.eq_ignore_ascii_case(&'p') =>
+            {
+                super::context_menu::ContextAction::TreePaste(path)
+            }
             _ => unreachable!(),
         }
     } else {
         match key.code {
             KeyCode::Char('c') => super::context_menu::ContextAction::CopySelection,
             KeyCode::Char('x') => super::context_menu::ContextAction::CutSelection,
-            KeyCode::Char('v' | 'p') => super::context_menu::ContextAction::PasteSelection,
+            KeyCode::Char(c)
+                if c.eq_ignore_ascii_case(&'v') || c.eq_ignore_ascii_case(&'p') =>
+            {
+                super::context_menu::ContextAction::PasteSelection
+            }
             _ => unreachable!(),
         }
     };
@@ -8171,7 +8225,12 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
             }
             return;
         }
-        (KeyCode::Char('c' | 'x' | 'v' | 'p'), KeyModifiers::CONTROL) => {
+        _ if is_host_clipboard_paste_chord(&key) => {
+            let handled = handle_browse_filesystem_clipboard_key(app, key, tx);
+            debug_assert!(handled, "matched paste key must be handled");
+            return;
+        }
+        (KeyCode::Char('c' | 'x'), KeyModifiers::CONTROL) => {
             let handled = handle_browse_filesystem_clipboard_key(app, key, tx);
             debug_assert!(handled, "matched clipboard key must be handled");
             return;
@@ -8649,8 +8708,7 @@ fn handle_browse_search_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender
     // control focuses must delegate both paste chords to the file
     // clipboard arm. Only the input focus owns in-app text paste; every other
     // search focus delegates Ctrl+V/Ctrl+P to filesystem paste.
-    if matches!(key.code, KeyCode::Char('v' | 'p'))
-        && key.modifiers == KeyModifiers::CONTROL
+    if is_host_clipboard_paste_chord(&key)
         && app.browse.search.focus != SearchFocus::Input
     {
         app.browse
@@ -10284,20 +10342,19 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             super::recovery_ui::handle_key(app, key, tx);
         }
         ActiveOverlay::FileTaskProgress(mut session) => {
-            if matches!(key.code, KeyCode::Char('v' | 'p'))
-                && key.modifiers == KeyModifiers::CONTROL
+            if is_host_clipboard_paste_chord(&key)
                 && !session.progress.is_terminal()
             {
-                let clipboard = app.browse.filesystem_clipboard.clone();
-                let destination = app.browse.current_dir.clone();
-                if let Some(clipboard) = clipboard {
-                    start_filesystem_clipboard_paste(app, clipboard, destination, tx);
-                    session
-                        .progress
-                        .set_queued_jobs(app.file_transfers.queued_summaries());
-                } else {
-                    app.set_status("Filesystem clipboard is empty");
-                }
+                let target_dir = app.browse.current_dir.clone();
+                let interaction_generation = app.host_clipboard_interaction_generation;
+                begin_host_clipboard_paste(
+                    app,
+                    tx,
+                    super::message::HostClipboardPasteTarget::BrowseFilesystem {
+                        target_dir,
+                        interaction_generation,
+                    },
+                );
                 app.active_overlay = ActiveOverlay::FileTaskProgress(session);
                 return;
             }
@@ -21216,7 +21273,8 @@ pub(crate) fn metadata_editor_copy_detail_field(
     if serialized.text.is_empty() {
         return Err("metadata editor: selected field is not representable on the clipboard".to_string());
     }
-    super::context_menu::publish_text_clipboard(&serialized.text);
+    super::context_menu::publish_metadata_clipboard(&serialized.text)
+        .map_err(|error| format!("metadata editor: terminal clipboard write failed: {error}"))?;
     Ok(entry.per_file_values.len())
 }
 
@@ -22084,14 +22142,31 @@ pub(super) fn metadata_editor_deselect_all_rows(
 fn metadata_editor_selected_rows_serialization(
     state: &super::app::MetadataEditorState,
 ) -> Result<super::tag_interchange::FieldBlockSerialization, String> {
-    let rows = metadata_editor_effective_selected_rows(state);
-    if rows.is_empty() {
-        return Err("metadata editor: no tag row selected".to_string());
-    }
-    let kind = if rows.len() == 1 {
-        super::tag_interchange::ClipboardTagPayloadKind::SingleField
+    let len = state.active_surface().entries.len();
+    let has_explicit_selection = !state.active_surface().selected_rows.is_empty();
+    let explicit_rows = state
+        .active_surface()
+        .selected_rows
+        .iter()
+        .copied()
+        .filter(|index| *index < len && state.metadata_entry_is_visible(*index))
+        .collect::<Vec<_>>();
+    let (rows, kind) = if has_explicit_selection {
+        if explicit_rows.is_empty() {
+            return Err("metadata editor: selected tag rows are no longer available".to_string());
+        }
+        (
+            explicit_rows,
+            super::tag_interchange::ClipboardTagPayloadKind::FieldSet,
+        )
     } else {
-        super::tag_interchange::ClipboardTagPayloadKind::FieldSet
+        if state.cursor >= len {
+            return Err("metadata editor: no tag row selected".to_string());
+        }
+        (
+            vec![state.cursor],
+            super::tag_interchange::ClipboardTagPayloadKind::SingleField,
+        )
     };
     let serialized = super::tag_interchange::serialize_clipboard_tag_entries(
         rows.iter()
@@ -22109,7 +22184,8 @@ pub(super) fn metadata_editor_copy_selected_rows(
     state: &super::app::MetadataEditorState,
 ) -> Result<usize, String> {
     let serialized = metadata_editor_selected_rows_serialization(state)?;
-    super::context_menu::publish_text_clipboard(&serialized.text);
+    super::context_menu::publish_metadata_clipboard(&serialized.text)
+        .map_err(|error| format!("metadata editor: terminal clipboard write failed: {error}"))?;
     let mut status = format!(
         "Copied {} field{} to terminal clipboard",
         serialized.keys.len(),
@@ -22376,7 +22452,6 @@ fn handle_metadata_editor_key(
         MetadataEditorPhase::Editing => {
             if is_host_clipboard_paste_chord(&key)
                 && state.content_tab == crate::tui::app::ContentTab::Metadata
-                && state.cursor < state.active_surface().entries.len()
             {
                 begin_host_clipboard_paste(
                     app,
@@ -50155,11 +50230,17 @@ fn handle_metadata_editor_mouse_in_area(
                         }
                     }
                     MetadataEditorPhase::Editing
-                        if in_content && state.content_tab == crate::tui::app::ContentTab::Metadata =>
+                        if in_popup && state.content_tab == crate::tui::app::ContentTab::Metadata =>
                     {
-                        // Map the visible row back to the complete embedded-tag model.
-                        let visible_row = (my - content_y) as usize + state.scroll;
-                        let row = state.visible_metadata_rows().get(visible_row).copied();
+                        // Right-click anywhere inside the metadata overlay can
+                        // initiate a rowless structured field-set paste. Only
+                        // content-row clicks acquire a concrete row destination.
+                        let row = if in_content {
+                            let visible_row = (my - content_y) as usize + state.scroll;
+                            state.visible_metadata_rows().get(visible_row).copied()
+                        } else {
+                            None
+                        };
                         if let Some(row) = row.filter(|row| *row < state.active_surface().entries.len()) {
                             state.cursor = row;
                             let column = metadata_editor_row_column_for_x(inner_x, mx);
@@ -50175,13 +50256,47 @@ fn handle_metadata_editor_mouse_in_area(
                                 anchor_bottom: false,
                             };
                         } else if row == Some(state.active_surface().entries.len()) {
-                            // Only the rendered "+ Add field..." row is
-                            // actionable. Empty content below it is a no-op.
+                            // The add-field row is also a rowless field-set paste
+                            // destination. Keep the cursor on the sentinel row so
+                            // single-field/plain-text payloads cannot accidentally
+                            // overwrite the previously selected metadata row.
+                            state.cursor = state.active_surface().entries.len();
+                            let entries = vec![
+                                crate::tui::context_menu::ContextMenuEntry::Item(
+                                    super::context_menu::ContextMenuItem {
+                                        label: "Add new field".to_string(),
+                                        action: super::context_menu::ContextAction::MetadataAddField,
+                                        shortcut: None,
+                                        enabled: !state.read_only,
+                                    },
+                                ),
+                                crate::tui::context_menu::ContextMenuEntry::Separator,
+                                crate::tui::context_menu::ContextMenuEntry::Item(
+                                    super::context_menu::ContextMenuItem {
+                                        label: "Paste".to_string(),
+                                        action: super::context_menu::ContextAction::MetadataRowsPaste,
+                                        shortcut: Some("Ctrl+V".to_string()),
+                                        enabled: !state.read_only,
+                                    },
+                                ),
+                            ];
+                            app.pending_metadata_editor = Some(state);
+                            app.active_overlay = ActiveOverlay::ContextMenu {
+                                levels: vec![super::context_menu::MenuLevel::new(entries)],
+                                origin: (mx, my),
+                                anchor_bottom: false,
+                            };
+                        } else {
+                            // Non-row metadata-overlay space has no row destination.
+                            // Route Paste through the add-row sentinel so structured
+                            // field sets remain valid while row-specific payloads are
+                            // rejected rather than applied to a stale cursor.
+                            state.cursor = state.active_surface().entries.len();
                             let entries = vec![crate::tui::context_menu::ContextMenuEntry::Item(
                                 super::context_menu::ContextMenuItem {
-                                    label: "Add new field".to_string(),
-                                    action: super::context_menu::ContextAction::MetadataAddField,
-                                    shortcut: None,
+                                    label: "Paste".to_string(),
+                                    action: super::context_menu::ContextAction::MetadataRowsPaste,
+                                    shortcut: Some("Ctrl+V".to_string()),
                                     enabled: !state.read_only,
                                 },
                             )];
@@ -50191,8 +50306,6 @@ fn handle_metadata_editor_mouse_in_area(
                                 origin: (mx, my),
                                 anchor_bottom: false,
                             };
-                        } else {
-                            app.active_overlay = ActiveOverlay::MetadataEditor(state);
                         }
                     }
                     _ => {
@@ -53786,6 +53899,39 @@ fn recovery_journal_is_already_claimed(
 /// cancellable file-task worker. Destinations are preplanned and retained so
 /// the event loop can reconcile partial copy/move jobs and construct a
 /// retryable residual clipboard from the structured completion report.
+pub(super) fn start_filesystem_clipboard_paste_from_host_text(
+    app: &mut AppState,
+    text: &str,
+    destination_dir: std::path::PathBuf,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    let retained_matches = app
+        .browse
+        .filesystem_clipboard
+        .as_ref()
+        .is_some_and(|clipboard| clipboard.matches_host_text(text));
+    let clipboard = match tui_file_picker::filesystem_clipboard_from_host_text(
+        text,
+        app.browse.filesystem_clipboard.as_ref(),
+    ) {
+        Ok(clipboard) => clipboard,
+        Err(reason) => {
+            app.set_status(format!("Paste failed: {reason}"));
+            return;
+        }
+    };
+
+    if !retained_matches {
+        // The host clipboard changed after Tonepoet's last Cut/Copy. Promote
+        // the host snapshot to a fresh Copy transaction so retries retain
+        // exact paths without turning the old in-process clipboard back into
+        // a second user-visible authority.
+        app.browse
+            .replace_filesystem_clipboard_from_user(clipboard.clone());
+    }
+    start_filesystem_clipboard_paste(app, clipboard, destination_dir, tx);
+}
+
 pub(super) fn start_filesystem_clipboard_paste(
     app: &mut AppState,
     clipboard: tui_file_picker::FilesystemClipboard,
@@ -69147,7 +69293,7 @@ fn execute_confirm_action(
                 return;
             };
             if state.active_surface().technical_details.session_id != *session_id
-                || *field_index >= state.active_surface().entries.len()
+                || *field_index > state.active_surface().entries.len()
             {
                 app.active_overlay = ActiveOverlay::MetadataEditor(state);
                 app.set_status("metadata editor: clipboard paste cancelled because the editor changed");
@@ -75457,12 +75603,13 @@ mod phase4_tests {
         .expect("valid clipboard envelope")
         .expect("structured clipboard payload");
         match payload {
-            crate::tui::tag_interchange::ClipboardTagPayload::SingleField(block) => {
-                assert_eq!(block.key, "ARTIST");
-                assert_eq!(block.values.len(), 1);
-                assert_eq!(block.values[0].to_texts(), ["Genesis"]);
+            crate::tui::tag_interchange::ClipboardTagPayload::FieldSet(blocks) => {
+                assert_eq!(blocks.len(), 1);
+                assert_eq!(blocks[0].key, "ARTIST");
+                assert_eq!(blocks[0].values.len(), 1);
+                assert_eq!(blocks[0].values[0].to_texts(), ["Genesis"]);
             }
-            other => panic!("expected single-field payload, got {other:?}"),
+            other => panic!("expected one-field set payload, got {other:?}"),
         }
     }
 
@@ -75812,7 +75959,79 @@ ignored".to_string()),
     }
 
     #[test]
-    fn metadata_ctrl_c_serializes_one_selected_row_as_single_field_envelope() {
+    fn metadata_ctrl_click_one_field_then_ctrl_c_publishes_a_field_set_envelope() {
+        let state = two_file_editor(vec![
+            entry(
+                "TITLE",
+                ItemKey::TrackTitle,
+                &["Behind the Lines", "Duchess"],
+                &["Behind the Lines", "Duchess"],
+            ),
+            entry(
+                "ARTIST",
+                ItemKey::TrackArtist,
+                &["Genesis", "Genesis"],
+                &["Genesis", "Genesis"],
+            ),
+        ]);
+        let area = ratatui::layout::Rect::new(0, 0, 100, 40);
+        let layout = crate::tui::draw_overlays::metadata_editor_layout_for_area(area);
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+
+        handle_metadata_editor_mouse_in_area(
+            &mut app,
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(
+                    crossterm::event::MouseButton::Left,
+                ),
+                column: layout.inner.x.saturating_add(1),
+                row: layout.content_area.y,
+                modifiers: KeyModifiers::CONTROL,
+            },
+            &tx,
+            area,
+        );
+        let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
+            panic!("metadata editor must remain open after Ctrl+click");
+        };
+        assert_eq!(state.active_surface().selected_rows, [0].into_iter().collect());
+
+        let published = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let sink = std::rc::Rc::clone(&published);
+        tui_file_picker::with_scoped_shared_text_clipboard_publish_hook(
+            move |text| sink.borrow_mut().push(text.to_string()),
+            || {
+                handle_key(
+                    &mut app,
+                    KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                    &tx,
+                );
+            },
+        );
+
+        let published = published.borrow();
+        assert_eq!(published.len(), 1);
+        let payload = crate::tui::tag_interchange::parse_clipboard_tag_payload(&published[0])
+            .expect("clipboard envelope parses")
+            .expect("clipboard envelope is recognized");
+        let crate::tui::tag_interchange::ClipboardTagPayload::FieldSet(blocks) = payload else {
+            panic!("one Ctrl+clicked row must preserve field identity as a field set");
+        };
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].key, "TITLE");
+        assert_eq!(
+            blocks[0].values,
+            vec![
+                crate::tui::probe::MetadataFieldValues::from_scalar("Behind the Lines"),
+                crate::tui::probe::MetadataFieldValues::from_scalar("Duchess"),
+            ],
+        );
+    }
+
+    #[test]
+    fn metadata_implicit_current_row_ctrl_c_publishes_a_single_field_envelope() {
         let mut state = two_file_editor(vec![
             entry(
                 "TITLE",
@@ -75827,19 +76046,78 @@ ignored".to_string()),
                 &["Genesis", "Genesis"],
             ),
         ]);
-        state.active_surface_mut().selected_rows.insert(1);
-        let serialized = metadata_editor_selected_rows_serialization(&state)
-            .expect("selection serializes");
-        assert_eq!(serialized.keys, vec!["ARTIST"]);
-        let payload = crate::tui::tag_interchange::parse_clipboard_tag_payload(&serialized.text)
+        state.cursor = 1;
+        assert!(state.active_surface().selected_rows.is_empty());
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let published = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let sink = std::rc::Rc::clone(&published);
+        tui_file_picker::with_scoped_shared_text_clipboard_publish_hook(
+            move |text| sink.borrow_mut().push(text.to_string()),
+            || {
+                handle_key(
+                    &mut app,
+                    KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                    &tx,
+                );
+            },
+        );
+
+        let published = published.borrow();
+        assert_eq!(published.len(), 1);
+        let payload = crate::tui::tag_interchange::parse_clipboard_tag_payload(&published[0])
             .expect("clipboard envelope parses")
             .expect("clipboard envelope is recognized");
-        let crate::tui::tag_interchange::ClipboardTagPayload::SingleField(block) = payload
-        else {
-            panic!("one selected row must use the single-field clipboard envelope");
+        let crate::tui::tag_interchange::ClipboardTagPayload::SingleField(block) = payload else {
+            panic!("implicit current-row Ctrl+C must remain a single-field payload");
         };
         assert_eq!(block.key, "ARTIST");
-        assert_eq!(block.values, vec!["Genesis"]);
+        assert_eq!(block.values.len(), 1);
+        assert_eq!(block.values[0].to_texts(), ["Genesis"]);
+    }
+
+    #[test]
+    fn metadata_select_all_chords_preserve_field_set_intent_even_for_one_field() {
+        for (code, modifiers, label) in [
+            (KeyCode::Char('a'), KeyModifiers::CONTROL, "Ctrl+A"),
+            (KeyCode::Char('l'), KeyModifiers::ALT, "Alt+L"),
+        ] {
+            let state = two_file_editor(vec![entry(
+                "GENRE",
+                ItemKey::Genre,
+                &["Rock", "Rock"],
+                &["Rock", "Rock"],
+            )]);
+            let mut app = AppState::new_for_test(TonepoetConfig::default());
+            app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
+            let (tx, _rx) = tokio::sync::mpsc::channel(8);
+            handle_key(&mut app, KeyEvent::new(code, modifiers), &tx);
+
+            let published = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+            let sink = std::rc::Rc::clone(&published);
+            tui_file_picker::with_scoped_shared_text_clipboard_publish_hook(
+                move |text| sink.borrow_mut().push(text.to_string()),
+                || {
+                    handle_key(
+                        &mut app,
+                        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                        &tx,
+                    );
+                },
+            );
+
+            let published = published.borrow();
+            let payload = crate::tui::tag_interchange::parse_clipboard_tag_payload(
+                published.first().unwrap_or_else(|| panic!("{label} copy was not published")),
+            )
+            .expect("clipboard envelope parses")
+            .expect("clipboard envelope is recognized");
+            assert!(
+                matches!(payload, crate::tui::tag_interchange::ClipboardTagPayload::FieldSet(ref blocks) if blocks.len() == 1 && blocks[0].key == "GENRE"),
+                "{label} must preserve explicit field-set identity before Ctrl+C",
+            );
+        }
     }
 
     #[test]
@@ -75864,19 +76142,35 @@ ignored".to_string()),
                 ],
             ),
         ]);
-        state.active_surface_mut().selected_rows.insert(1);
+        state.cursor = 1;
         let single = metadata_editor_selected_rows_serialization(&state)
-            .expect("multiline single-row selection serializes");
+            .expect("implicit multiline current-row copy serializes");
         assert_eq!(single.keys, vec!["COMMENT"]);
         let payload = crate::tui::tag_interchange::parse_clipboard_tag_payload(&single.text)
             .expect("single-field clipboard envelope parses")
             .expect("single-field clipboard envelope is recognized");
         let crate::tui::tag_interchange::ClipboardTagPayload::SingleField(comment) = payload
         else {
-            panic!("one selected multiline row must remain a single-field payload");
+            panic!("implicit multiline current-row copy must remain a single-field payload");
         };
         assert_eq!(
             comment.values[0].to_texts(),
+            ["recorded live\nremastered 2024"],
+        );
+
+        state.active_surface_mut().selected_rows.insert(1);
+        let one_field_set = metadata_editor_selected_rows_serialization(&state)
+            .expect("explicit one-row multiline selection serializes");
+        let payload = crate::tui::tag_interchange::parse_clipboard_tag_payload(&one_field_set.text)
+            .expect("one-field set clipboard envelope parses")
+            .expect("one-field set clipboard envelope is recognized");
+        let crate::tui::tag_interchange::ClipboardTagPayload::FieldSet(blocks) = payload else {
+            panic!("explicit one-row multiline selection must remain a field set");
+        };
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].key, "COMMENT");
+        assert_eq!(
+            blocks[0].values[0].to_texts(),
             ["recorded live\nremastered 2024"],
         );
 
@@ -76126,6 +76420,331 @@ ignored".to_string()),
             }
             assert!(labels.contains(&METADATA_EDIT_PER_TRACK_LABEL));
         }
+    }
+
+    #[tokio::test]
+    async fn metadata_add_row_all_paste_chords_request_the_host_clipboard() {
+        for (code, modifiers, label) in [
+            (KeyCode::Char('v'), KeyModifiers::CONTROL, "Ctrl+V"),
+            (KeyCode::Char('p'), KeyModifiers::CONTROL, "Ctrl+P"),
+            (
+                KeyCode::Char('v'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                "Ctrl+Shift+V",
+            ),
+        ] {
+            let mut state = two_file_editor(vec![entry(
+                "ALBUM",
+                ItemKey::AlbumTitle,
+                &["Album", "Album"],
+                &["Album", "Album"],
+            )]);
+            state.cursor = state.active_surface().entries.len();
+            let sentinel = state.cursor;
+            let mut app = AppState::new_for_test(TonepoetConfig::default());
+            app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
+            let (tx, _rx) = tokio::sync::mpsc::channel(4);
+            let generation_before = app.host_clipboard_paste_generation;
+
+            handle_key(&mut app, KeyEvent::new(code, modifiers), &tx);
+
+            assert_eq!(
+                app.host_clipboard_paste_generation,
+                generation_before.wrapping_add(1),
+                "{label} from + Add field must request the current host clipboard",
+            );
+            let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
+                panic!("{label} must keep the metadata editor open while the host read is pending");
+            };
+            assert_eq!(
+                state.cursor, sentinel,
+                "{label} must retain the rowless paste sentinel",
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_one_field_set_paste_creates_missing_key_without_a_selected_row() {
+        let source = vec![entry(
+            "GENRE",
+            ItemKey::Genre,
+            &["Progressive Rock", "Progressive Rock"],
+            &["Progressive Rock", "Progressive Rock"],
+        )];
+        let clipboard = super::super::tag_interchange::serialize_clipboard_tag_entries(
+            source.iter(),
+            super::super::tag_interchange::ClipboardTagPayloadKind::FieldSet,
+        )
+        .text;
+        let mut state = two_file_editor(vec![entry(
+            "ALBUM",
+            ItemKey::AlbumTitle,
+            &["Duke", "Duke"],
+            &["Duke", "Duke"],
+        )]);
+        state.cursor = state.active_surface().entries.len();
+        let session_id = state.active_surface().technical_details.session_id;
+        let sentinel = state.cursor;
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
+
+        handle_terminal_clipboard_text(
+            &mut app,
+            super::super::message::HostClipboardPasteTarget::MetadataRows {
+                session_id,
+                field_index: sentinel,
+            },
+            clipboard,
+        );
+
+        let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
+            panic!("one-field field-set paste should stay in the metadata editor");
+        };
+        let genre = state
+            .active_surface()
+            .entries
+            .iter()
+            .find(|entry| entry.display_key == "GENRE")
+            .expect("missing GENRE key must be created");
+        assert_eq!(genre.per_file_values, ["Progressive Rock", "Progressive Rock"]);
+        assert_eq!(
+            state
+                .active_surface()
+                .entries
+                .iter()
+                .find(|entry| entry.display_key == "ALBUM")
+                .expect("existing ALBUM row retained")
+                .per_file_values,
+            ["Duke", "Duke"],
+            "field-set identity must not redirect GENRE values into the cursor's ALBUM row",
+        );
+    }
+
+    #[test]
+    fn metadata_field_set_paste_is_valid_on_the_add_field_row() {
+        let source = vec![
+            entry(
+                "TITLE",
+                ItemKey::TrackTitle,
+                &["One", "Two"],
+                &["One", "Two"],
+            ),
+            entry(
+                "ARTIST",
+                ItemKey::TrackArtist,
+                &["Artist One", "Artist Two"],
+                &["Artist One", "Artist Two"],
+            ),
+        ];
+        let clipboard = super::super::tag_interchange::serialize_clipboard_tag_entries(
+            source.iter(),
+            super::super::tag_interchange::ClipboardTagPayloadKind::FieldSet,
+        )
+        .text;
+        let mut state = two_file_editor(vec![entry(
+            "ALBUM",
+            ItemKey::AlbumTitle,
+            &["Album", "Album"],
+            &["Album", "Album"],
+        )]);
+        state.cursor = state.active_surface().entries.len();
+        let session_id = state.active_surface().technical_details.session_id;
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
+        handle_terminal_clipboard_text(
+            &mut app,
+            super::super::message::HostClipboardPasteTarget::MetadataRows {
+                session_id,
+                field_index: 1,
+            },
+            clipboard,
+        );
+
+        let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
+            panic!("rowless field-set paste should return directly to the metadata editor");
+        };
+        for key in ["TITLE", "ARTIST"] {
+            assert!(
+                state
+                    .active_surface()
+                    .entries
+                    .iter()
+                    .any(|entry| entry.display_key == key),
+                "field-set paste from the add row must create {key}",
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_field_set_overwrite_confirmation_accepts_the_add_row_sentinel() {
+        let source = vec![
+            entry(
+                "TITLE",
+                ItemKey::TrackTitle,
+                &["New One", "New Two"],
+                &["New One", "New Two"],
+            ),
+            entry(
+                "ARTIST",
+                ItemKey::TrackArtist,
+                &["Artist One", "Artist Two"],
+                &["Artist One", "Artist Two"],
+            ),
+        ];
+        let clipboard = super::super::tag_interchange::serialize_clipboard_tag_entries(
+            source.iter(),
+            super::super::tag_interchange::ClipboardTagPayloadKind::FieldSet,
+        )
+        .text;
+        let mut state = two_file_editor(vec![entry(
+            "TITLE",
+            ItemKey::TrackTitle,
+            &["Old One", "Old Two"],
+            &["Old One", "Old Two"],
+        )]);
+        state.cursor = state.active_surface().entries.len();
+        let session_id = state.active_surface().technical_details.session_id;
+        let sentinel = state.cursor;
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+
+        handle_terminal_clipboard_text(
+            &mut app,
+            super::super::message::HostClipboardPasteTarget::MetadataRows {
+                session_id,
+                field_index: sentinel,
+            },
+            clipboard,
+        );
+        let ActiveOverlay::Confirmation { action, .. } = &app.active_overlay else {
+            panic!("overwriting a field set from the add row must still confirm");
+        };
+        assert!(matches!(
+            action,
+            ConfirmAction::MetadataRowsClipboardPaste {
+                session_id: actual_session,
+                field_index,
+                ..
+            } if *actual_session == session_id && *field_index == sentinel
+        ));
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            &tx,
+        );
+        let ActiveOverlay::MetadataEditor(state) = &app.active_overlay else {
+            panic!("accepting rowless field-set overwrite must restore the editor");
+        };
+        let title = state
+            .active_surface()
+            .entries
+            .iter()
+            .find(|entry| entry.display_key == "TITLE")
+            .expect("TITLE retained");
+        assert_eq!(title.per_file_values, ["New One", "New Two"]);
+        assert!(state
+            .active_surface()
+            .entries
+            .iter()
+            .any(|entry| entry.display_key == "ARTIST"));
+    }
+
+    #[test]
+    fn metadata_right_click_any_non_row_overlay_space_offers_rowless_paste() {
+        let area = ratatui::layout::Rect::new(0, 0, 100, 40);
+        let layout = crate::tui::draw_overlays::metadata_editor_layout_for_area(area);
+        assert!(layout.content_area.height >= 4, "fixture needs blank metadata space");
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+
+        let run = |column: u16, row: u16| {
+            let state = two_file_editor(vec![entry(
+                "ALBUM",
+                ItemKey::AlbumTitle,
+                &["Album", "Album"],
+                &["Album", "Album"],
+            )]);
+            let mut app = AppState::new_for_test(TonepoetConfig::default());
+            app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(state));
+            handle_metadata_editor_mouse_in_area(
+                &mut app,
+                crossterm::event::MouseEvent {
+                    kind: crossterm::event::MouseEventKind::Down(
+                        crossterm::event::MouseButton::Right,
+                    ),
+                    column,
+                    row,
+                    modifiers: crossterm::event::KeyModifiers::NONE,
+                },
+                &tx,
+                area,
+            );
+            app
+        };
+
+        let content_x = layout.content_area.x.saturating_add(2);
+        let add_row_y = layout.content_area.y.saturating_add(1);
+        let add_app = run(content_x, add_row_y);
+        let ActiveOverlay::ContextMenu { levels, .. } = &add_app.active_overlay else {
+            panic!("right-clicking + Add field must open a context menu");
+        };
+        let add_labels = levels[0]
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                super::super::context_menu::ContextMenuEntry::Item(item) => {
+                    Some(item.label.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(add_labels.contains(&"Add new field"));
+        assert!(add_labels.contains(&"Paste"));
+        assert_eq!(
+            add_app.pending_metadata_editor.as_ref().unwrap().cursor,
+            1,
+            "rowless context must use the add-row sentinel rather than a stale field cursor",
+        );
+
+        let blank_y = layout.content_area.y.saturating_add(3);
+        let blank_app = run(content_x, blank_y);
+        let ActiveOverlay::ContextMenu { levels, .. } = &blank_app.active_overlay else {
+            panic!("right-clicking blank metadata space must open a context menu");
+        };
+        let blank_labels = levels[0]
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                super::super::context_menu::ContextMenuEntry::Item(item) => {
+                    Some(item.label.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(blank_labels, vec!["Paste"]);
+        assert_eq!(blank_app.pending_metadata_editor.as_ref().unwrap().cursor, 1);
+
+        let header_app = run(
+            layout.popup.x.saturating_add(2),
+            layout.popup.y.saturating_add(1),
+        );
+        let ActiveOverlay::ContextMenu { levels, .. } = &header_app.active_overlay else {
+            panic!("right-clicking non-row metadata-overlay chrome must open a context menu");
+        };
+        let header_labels = levels[0]
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                super::super::context_menu::ContextMenuEntry::Item(item) => {
+                    Some(item.label.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(header_labels, vec!["Paste"]);
+        assert_eq!(header_app.pending_metadata_editor.as_ref().unwrap().cursor, 1);
     }
 
     #[test]
@@ -79615,7 +80234,7 @@ ignored".to_string()),
     }
 
     #[test]
-    fn metadata_editor_right_click_outside_content_is_inert_even_when_dirty() {
+    fn metadata_editor_right_click_outside_content_offers_rowless_paste_and_keeps_dirty_state() {
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.active_overlay = ActiveOverlay::MetadataEditor(Box::new(single_image_state(vec![
             entry("TITLE", ItemKey::TrackTitle, &["New"], &["Old"]),
@@ -79629,14 +80248,28 @@ ignored".to_string()),
             Rect::new(0, 0, 100, 40),
         );
 
-        match &app.active_overlay {
-            ActiveOverlay::MetadataEditor(state) => {
-                assert!(state.active_surface().dirty);
-                assert_eq!(state.active_surface().entries[0].value, "New");
-            }
-            other => panic!("expected metadata editor to remain open, got {other:?}"),
-        }
-        assert!(app.pending_metadata_editor.is_none());
+        // Non-row overlay space opens the rowless Paste menu; the editor is
+        // parked unchanged (dirty edits intact) behind it and the cursor sits
+        // on the add-row sentinel so no row can be overwritten by mistake.
+        let ActiveOverlay::ContextMenu { levels, .. } = &app.active_overlay else {
+            panic!("expected rowless paste context menu, got {:?}", app.active_overlay);
+        };
+        let labels = levels[0]
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                crate::tui::context_menu::ContextMenuEntry::Item(item) => Some(item.label.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(labels, vec!["Paste"]);
+        let state = app
+            .pending_metadata_editor
+            .as_ref()
+            .expect("dirty editor must be parked behind the context menu");
+        assert!(state.active_surface().dirty);
+        assert_eq!(state.active_surface().entries[0].value, "New");
+        assert_eq!(state.cursor, state.active_surface().entries.len());
     }
 
     fn parked_metadata_context_menu() -> AppState {
@@ -108037,8 +108670,16 @@ mod file_picker_browse_parity_regression_tests {
     }
 
     #[tokio::test]
-    async fn files_ctrl_x_then_ctrl_v_or_ctrl_p_starts_paste_task() {
-        for paste_chord in ['v', 'p'] {
+    async fn files_ctrl_x_then_all_paste_chords_request_fresh_host_clipboard() {
+        for (paste_chord, modifiers, label) in [
+            ('v', KeyModifiers::CONTROL, "Ctrl+V"),
+            ('p', KeyModifiers::CONTROL, "Ctrl+P"),
+            (
+                'v',
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                "Ctrl+Shift+V",
+            ),
+        ] {
             let temp = tempfile::tempdir().expect("tempdir");
             let src_dir = temp.path().join("src");
             let dst_dir = temp.path().join("dst");
@@ -108049,7 +108690,7 @@ mod file_picker_browse_parity_regression_tests {
             let mut app = AppState::new_for_test(TonepoetConfig::default());
             app.current_screen = AppScreen::Browse;
             app.browse.current_dir = src_dir.clone();
-            app.browse.entries = vec![browse_file_entry(file.clone())];
+            app.browse.entries = vec![browse_file_entry(file)];
             app.browse
                 .set_navigation_pane(crate::tui::browse::BrowseNavigationPane::Files);
             let (tx, _rx) = mpsc::channel(16);
@@ -108059,26 +108700,31 @@ mod file_picker_browse_parity_regression_tests {
                 KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
                 &tx,
             );
-            assert!(app.browse.filesystem_clipboard.is_some(), "cut must stage clipboard");
+            assert!(app.browse.filesystem_clipboard.is_some(), "cut must retain transaction metadata");
 
             app.browse.current_dir = dst_dir;
             app.browse.entries.clear();
+            let generation_before = app.host_clipboard_paste_generation;
             handle_key(
                 &mut app,
-                KeyEvent::new(KeyCode::Char(paste_chord), KeyModifiers::CONTROL),
+                KeyEvent::new(KeyCode::Char(paste_chord), modifiers),
                 &tx,
             );
 
+            assert_eq!(
+                app.host_clipboard_paste_generation,
+                generation_before.wrapping_add(1),
+                "{label} must request the current host clipboard",
+            );
             assert!(
-                !app.file_transfers.pending_by_session.is_empty(),
-                "Ctrl+{paste_chord} must start a paste task; status={:?}",
-                app.status_message
+                app.file_transfers.pending_by_session.is_empty() && app.file_transfers.queued.is_empty(),
+                "retained transaction metadata must not start a paste before the host read completes",
             );
         }
     }
 
     #[tokio::test]
-    async fn every_non_input_search_focus_delegates_file_ctrl_v() {
+    async fn every_non_input_search_focus_delegates_file_ctrl_v_to_host_read() {
         use crate::tui::browse::SearchFocus;
 
         let focuses = [
@@ -108115,6 +108761,7 @@ mod file_picker_browse_parity_regression_tests {
             app.browse.entries.clear();
             app.browse.search.active = true;
             app.browse.search.focus = focus;
+            let generation_before = app.host_clipboard_paste_generation;
 
             handle_key(
                 &mut app,
@@ -108122,11 +108769,13 @@ mod file_picker_browse_parity_regression_tests {
                 &tx,
             );
 
-            assert!(
-                !app.file_transfers.pending_by_session.is_empty(),
-                "search focus {focus:?} must delegate the paste chord to file paste; status={:?}",
-                app.status_message
+            assert_eq!(
+                app.host_clipboard_paste_generation,
+                generation_before.wrapping_add(1),
+                "search focus {focus:?} must delegate Ctrl+V to the host clipboard",
             );
+            assert!(app.file_transfers.pending_by_session.is_empty());
+            assert!(app.file_transfers.queued.is_empty());
         }
     }
 
@@ -108691,11 +109340,11 @@ mod file_picker_browse_parity_regression_tests {
         assert!(matches!(app.active_overlay, ActiveOverlay::ContextMenu { .. }));
     }
 
-    /// Contract change (queue round): Ctrl+V with the live progress overlay
-    /// open no longer refuses with "file task is active" — it ENQUEUES the
-    /// paste (or honestly reports an empty clipboard).
+    /// A live transfer overlay is still Browse navigation for clipboard
+    /// purposes. Ctrl+V/P must request the host clipboard rather than treating
+    /// retained Cut/Copy transaction metadata as a second clipboard.
     #[test]
-    fn file_task_overlay_ctrl_v_enqueues_instead_of_refusing() {
+    fn file_task_overlay_ctrl_v_requests_host_clipboard_without_using_retained_transaction() {
         let temp = tempfile::tempdir().expect("tempdir");
         let source = temp.path().join("track.flac");
         std::fs::write(&source, b"audio").expect("source");
@@ -108703,7 +109352,7 @@ mod file_picker_browse_parity_regression_tests {
         std::fs::create_dir(&destination).expect("dest");
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
-        app.browse.current_dir = destination.clone();
+        app.browse.current_dir = destination;
         let (controls, _rx) = std::sync::mpsc::channel();
         let progress = tui_file_picker::FileTaskProgressState::new(
             tui_file_picker::FileTaskKind::Move,
@@ -108713,24 +109362,7 @@ mod file_picker_browse_parity_regression_tests {
         app.active_overlay = ActiveOverlay::FileTaskProgress(
             super::super::app::FileTaskProgressSession::new(progress, controls),
         );
-        // Simulate a live running job owning the scheduler slot so the new
-        // paste must queue rather than start.
         app.file_transfers.active_session_id = Some(4242);
-        let (tx, _rx) = mpsc::channel(4);
-
-        // Empty clipboard: honest message, nothing queued.
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
-            &tx,
-        );
-        assert!(app
-            .status_message
-            .as_ref()
-            .is_some_and(|(message, _)| message.contains("clipboard is empty")));
-        assert!(app.file_transfers.queued.is_empty());
-
-        // With a clipboard: the paste is enqueued and the overlay survives.
         app.browse.filesystem_clipboard = Some(
             tui_file_picker::FilesystemClipboard::new(
                 tui_file_picker::FilePickerClipboardMode::Copy,
@@ -108738,12 +109370,20 @@ mod file_picker_browse_parity_regression_tests {
             )
             .expect("clipboard"),
         );
+        let (tx, _rx) = mpsc::channel(4);
+        let generation_before = app.host_clipboard_paste_generation;
+
         handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
             &tx,
         );
-        assert_eq!(app.file_transfers.queued.len(), 1);
+
+        assert_eq!(
+            app.host_clipboard_paste_generation,
+            generation_before.wrapping_add(1),
+        );
+        assert!(app.file_transfers.queued.is_empty());
         assert!(matches!(
             app.active_overlay,
             ActiveOverlay::FileTaskProgress(_)

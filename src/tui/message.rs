@@ -165,9 +165,10 @@ pub enum HostClipboardPasteTarget {
         session_id: u64,
         field_index: usize,
     },
-    /// Paste onto the selected metadata key row. Structured single-field
-    /// payloads are free-form; field sets and track-scalar line lists retain
-    /// the frozen row/session for confirmation.
+    /// Paste into metadata Editing mode. `field_index == entries.len()` is
+    /// the rowless add-field/blank-space sentinel: structured field sets may
+    /// apply there, while single-field and plain-text payloads still require
+    /// an existing row. The frozen cursor/session rejects late host reads.
     MetadataRows {
         session_id: u64,
         field_index: usize,
@@ -187,6 +188,13 @@ pub enum HostClipboardPasteTarget {
     MetadataFilePicker {
         editor_session_id: u64,
         picker_session_id: u64,
+    },
+    /// Filesystem paste requested from Browse navigation. The destination is
+    /// frozen at key/context-menu dispatch; the interaction generation rejects
+    /// a late clipboard read after subsequent user input changes intent.
+    BrowseFilesystem {
+        target_dir: std::path::PathBuf,
+        interaction_generation: u64,
     },
 }
 
@@ -562,9 +570,14 @@ pub enum AppMessage {
     /// Browse cursor debounce. Ordinary classification performs only bounded
     /// directory/extension work; an explicit context-menu enrichment may also
     /// inspect CUE availability and repairability on that worker. Reducers still
-    /// validate the captured directory identity and current selection before
-    /// publishing the cached classification.
+    /// validate request ownership, scan generation, the captured directory
+    /// identity, current selection, and (for exact CUE work) the concrete
+    /// member-file fingerprint before publishing cached CUE authority.
     FolderClassifyComplete {
+        request_id: u64,
+        scan_generation: u64,
+        probe_cue_availability: bool,
+        cue_fingerprint: Option<crate::tui::browse::FolderCueProbeFingerprint>,
         path: std::path::PathBuf,
         identity: crate::tui::browse::ProbeCacheIdentity,
         classification: crate::tui::browse::FolderContentClassification,
