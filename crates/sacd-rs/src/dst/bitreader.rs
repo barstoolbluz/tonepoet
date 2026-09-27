@@ -20,8 +20,15 @@ impl<'a> BitReader<'a> {
         }
     }
 
-    pub(crate) fn set_zero_pad_after_eof(&mut self, yes: bool) {
-        self.zero_pad_after_eof = yes;
+    pub(crate) fn has_physical_bits_remaining(&self) -> Result<bool, DstError> {
+        let total_bits = self.input.len().checked_mul(8).ok_or(
+            DstError::InternalDecodeError("bit reader input length overflow"),
+        )?;
+        Ok(self.bit_pos < total_bits)
+    }
+
+    pub(crate) fn enable_zero_padding_after_eof(&mut self) {
+        self.zero_pad_after_eof = true;
     }
 
     pub(crate) fn read_bit(&mut self) -> Result<u8, DstError> {

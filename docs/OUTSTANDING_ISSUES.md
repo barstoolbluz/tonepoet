@@ -3215,3 +3215,35 @@ Minimal DST frames decode as the silence they encode, on every channel count, un
 strict integrity mode the Reference path uses. Genuine truncation of a frame that needed
 more bits is still reported as an error, not silently zero-filled. This disc converts on
 the Reference path.
+
+## 51. Publish fails with "File name too long" on album names near the 255-byte limit
+
+Filed 2026-09-27 while field-testing #50. Bach, Cantatas Vol. 1 on the "SACD-to-PCM
+Reference" preset, whose folder template is `%ARTIST% - %ALBUM% (%YEAR%) [%FORMAT%]
+{%TITLE_EXTRA%}`. The album directory name it produces is 244 bytes:
+
+```
+Johann Sebastian Bach; La Petite Bande; Sigiswald Kuijken; Gerlinde Sämann; Petra Noskaiová;
+Christoph Genz; Jan Van der Crabben - Cantatas The Complete Liturgical Year in 64 Cantatas,
+Vol. 1 (2017) [FLAC] {NL Accent ACC 25319 SACD  32-176.4}
+```
+
+Extraction, decimation, gain and quantization all succeed; the track fails at Publish with
+`io error: File name too long (os error 36)`, and the user sees nothing but that line.
+
+### Why
+
+The 244-byte name itself fits ext4's 255-byte limit. Publish derives hidden sibling names from
+it, `.<name>.tmp-…`, `.<name>.backup-…`, `.<name>.lock` (`stages.rs`, `backup_dir_prefix`,
+`cleanup_orphan_publish_temps`, `album_lock_path`), and those overflow. Nothing clamps or
+checks component length anywhere in naming or publish, so a template that expands past 255
+bytes fails the same way, later and less clearly. Multi-artist classical metadata makes
+`%ARTIST%` alone exceed 100 bytes routinely.
+
+### Required
+
+An album directory or file name that the filesystem cannot hold is detected before any work
+is done and shortened deterministically, with the shortening disclosed in the status line and
+the conversion log. Publish's derived sibling names never push a legal album name over the
+limit. The same conversion with `--folder-naming "%ALBUM%"` converts today; with the preset's
+template it must convert too.

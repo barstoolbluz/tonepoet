@@ -227,7 +227,11 @@ impl DstDecoder {
     ) -> Result<(), DstError> {
         let syntax = CompressedSyntax::read(reader, self.channel_count, self.frame_bytes_per_channel)?;
 
-        if reader.read_bit()? != 0 {
+        // The reference decoder parses all compressed syntax strictly, then
+        // treats only the arithmetic-code tail as zero-extended. Its leading
+        // zero marker is validated when physically present; an empty tail is
+        // legal and initializes the arithmetic decoder entirely from zeros.
+        if reader.has_physical_bits_remaining()? && reader.read_bit()? != 0 {
             return Err(DstError::InvalidArithmeticCode);
         }
 
@@ -1029,8 +1033,8 @@ struct ArithmeticCoder {
 
 impl ArithmeticCoder {
     fn new(reader: &mut BitReader<'_>) -> Result<Self, DstError> {
+        reader.enable_zero_padding_after_eof();
         let c = reader.read_bits(12)?;
-        reader.set_zero_pad_after_eof(true);
         Ok(Self { a: ARITHMETIC_ONE - 1, c })
     }
 
@@ -1108,6 +1112,49 @@ mod tests {
         let mut frame = Vec::with_capacity(bytes + 1);
         frame.push(0); // DSTCoded=0, dummy=0, six zero stuffing bits.
         frame.extend(std::iter::repeat(fill).take(bytes));
+        frame
+    }
+
+    fn push_test_bits(bits: &mut Vec<u8>, value: u32, width: usize) {
+        for shift in (0..width).rev() {
+            bits.push(((value >> shift) & 1) as u8);
+        }
+    }
+
+    fn minimal_zero_tailed_compressed_frame(channel_count: u8) -> Vec<u8> {
+        assert!((1..=6).contains(&channel_count));
+
+        let mut bits = vec![
+            1, // DSTCoded.
+            1, // Probability segmentation same as filter segmentation.
+            1, // Filter segmentation same for all channels.
+            1, // Single filter segment reaches the end of each channel.
+            1, // Probability mapping same as filter mapping.
+            1, // Filter mapping same for all channels.
+        ];
+        bits.extend(std::iter::repeat(1u8).take(usize::from(channel_count))); // Half probability.
+
+        // One two-tap filter: [1, -255], stored literally.
+        push_test_bits(&mut bits, 1, 7);
+        bits.push(0);
+        push_test_bits(&mut bits, 1, 9);
+        push_test_bits(&mut bits, 257, 9); // -255 in 9-bit two's complement.
+
+        // One two-entry probability table: [1, 1], compact-coded with Rice m=0.
+        push_test_bits(&mut bits, 1, 6);
+        bits.push(1);
+        push_test_bits(&mut bits, 0, 2);
+        push_test_bits(&mut bits, 0, 7);
+        push_test_bits(&mut bits, 0, 3);
+        bits.push(1); // Rice-coded delta 0.
+
+        // Deliberately append no arithmetic payload. Any bits needed to finish
+        // the final byte are physical zeros; for four channels even those are
+        // absent because the syntax ends exactly on a byte boundary.
+        let mut frame = vec![0u8; (bits.len() + 7) / 8];
+        for (index, bit) in bits.into_iter().enumerate() {
+            frame[index / 8] |= bit << (7 - (index % 8));
+        }
         frame
     }
 
@@ -1244,6 +1291,69 @@ mod tests {
             assert_eq!(rate.frame_bytes_per_channel().unwrap(), bytes_per_channel);
             assert_eq!(rate.frame_bits_per_channel().unwrap(), bytes_per_channel * 8);
         }
+    }
+
+    #[test]
+    fn minimal_zero_tailed_compressed_frames_decode_all_legal_channel_counts() {
+        for channel_count in 1..=6u8 {
+            let encoded = minimal_zero_tailed_compressed_frame(channel_count);
+            let decoded = decode_frame(&encoded, channel_count)
+                .expect("complete DST syntax with a short arithmetic tail must decode");
+            assert_eq!(decoded.len(), 4704 * usize::from(channel_count));
+            assert!(
+                decoded.iter().all(|&byte| byte == 0x66),
+                "unexpected decoded payload for {channel_count} channels"
+            );
+        }
+    }
+
+    #[test]
+    fn issue50_minimal_silence_fixtures_decode_byte_exact() {
+        use sha2::{Digest as _, Sha256};
+
+        const CASES: [(&[u8], &[u8], u8, &str, &str); 2] = [
+            (
+                include_bytes!("issue50_fixtures/issue50_minimal_stereo.dst.bin"),
+                include_bytes!("issue50_fixtures/issue50_minimal_stereo.dsd.bin"),
+                2,
+                "ffe702794e29482dcd1037a96341c2fe4fc593f856142065af269fec0c2480f9",
+                "4faaab209cd51206464485ef0d28513db6ad0494897a8cee6a4b27eac0ce8e58",
+            ),
+            (
+                include_bytes!("issue50_fixtures/issue50_minimal_5ch.dst.bin"),
+                include_bytes!("issue50_fixtures/issue50_minimal_5ch.dsd.bin"),
+                5,
+                "c7fedcb5a51dd6eb39c323d9324e3956138a71f3911df65a62e5b470ffe51424",
+                "6fb556828667ebb8641c460c270e16dbeae01ee864959710cc2c4f35c0c8473c",
+            ),
+        ];
+
+        for (encoded, expected, channel_count, encoded_sha256, decoded_sha256) in CASES {
+            assert_eq!(format!("{:x}", Sha256::digest(encoded)), encoded_sha256);
+            assert_eq!(format!("{:x}", Sha256::digest(expected)), decoded_sha256);
+            assert!(expected.iter().all(|&byte| byte == 0x99));
+            let actual = decode_frame(encoded, channel_count)
+                .expect("minimal silence DST fixture must decode");
+            assert_eq!(actual.as_slice(), expected);
+        }
+    }
+
+    #[test]
+    fn truncated_compressed_syntax_remains_an_error() {
+        let encoded = include_bytes!("issue50_fixtures/issue50_minimal_stereo.dst.bin");
+        let err = decode_frame(&encoded[..6], 2).unwrap_err();
+        assert!(matches!(err, DstError::UnexpectedEof { consumed: 6 }));
+    }
+
+    #[test]
+    fn present_nonzero_arithmetic_marker_is_rejected() {
+        let mut encoded = include_bytes!("issue50_fixtures/issue50_minimal_stereo.dst.bin").to_vec();
+        // This fixture's compressed syntax ends after bit 53, so bit 54 is the
+        // first physically present arithmetic-code bit. It must remain zero.
+        encoded[6] |= 0x02;
+
+        let err = decode_frame(&encoded, 2).unwrap_err();
+        assert!(matches!(err, DstError::InvalidArithmeticCode));
     }
 
     #[test]

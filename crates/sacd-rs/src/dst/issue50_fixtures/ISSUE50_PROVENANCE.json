@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "issue": 50,
+  "date": "2026-09-27",
+  "scope": "Minimal DSD64 DST silence frames observed on Bach, Cantatas Vol. 1 (Accent)",
+  "expected_output_authority": "The issue report established that zero-extending the short stereo arithmetic tail decodes to constant 0x99 DSD idle bytes. The expected files are literal 0x99 byte sequences of one decoded DSD64 frame, not output captured from the production decoder.",
+  "reference_decoder_check": "Sound-Linux-More/sacd-extract parses compressed syntax from physical frame bits, records only the physical arithmetic-code tail, and zero-extends reads inside arithmetic initialization/decoding. It validates the leading arithmetic bit only when that physical tail is non-empty.",
+  "cases": [
+    {
+      "case_id": "issue50_minimal_stereo",
+      "channels": 2,
+      "source_hex": "ff0200c04180056e",
+      "source_sha256": "ffe702794e29482dcd1037a96341c2fe4fc593f856142065af269fec0c2480f9",
+      "source_bytes": 8,
+      "expected_dsd": "issue50_minimal_stereo.dsd.bin",
+      "expected_sha256": "4faaab209cd51206464485ef0d28513db6ad0494897a8cee6a4b27eac0ce8e58",
+      "expected_bytes": 9408,
+      "expected_byte_value": "0x99"
+    },
+    {
+      "case_id": "issue50_minimal_5ch",
+      "channels": 5,
+      "source_hex": "f9af810060204008081002020c0020c0020c002c2d",
+      "source_sha256": "c7fedcb5a51dd6eb39c323d9324e3956138a71f3911df65a62e5b470ffe51424",
+      "source_bytes": 21,
+      "expected_dsd": "issue50_minimal_5ch.dsd.bin",
+      "expected_sha256": "6fb556828667ebb8641c460c270e16dbeae01ee864959710cc2c4f35c0c8473c",
+      "expected_bytes": 23520,
+      "expected_byte_value": "0x99",
+      "channel_count_note": "The frame parses under the DST syntax as five-channel; it does not parse as 1, 2, 3, 4, or 6-channel data."
+    }
+  ]
+}
