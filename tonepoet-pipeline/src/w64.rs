@@ -26,7 +26,7 @@ const CHUNK_HEADER_BYTES: u64 = 24;
 /// PCM representation expected in an exact Wave64 carrier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum W64SampleEncoding {
-    /// Signed linear PCM.
+    /// Integer PCM (8-bit unsigned-biased, 16/24/32-bit signed).
     SignedInteger,
     /// IEEE floating-point PCM.
     FloatingPoint,
@@ -306,6 +306,7 @@ fn validate_exact_w64_pcm_inner<R: Read + Seek>(
     expected: W64PcmFormatExpectation,
     expected_sample_frames: Option<u64>,
     allow_final_alignment_padding: bool,
+    allow_ssrc_final_two_byte_padding: bool,
 ) -> Result<W64ExactStructure, W64ValidationError> {
     if expected.sample_rate_hz == 0 {
         return Err(W64ValidationError::invalid("expected sample rate must be non-zero"));
@@ -315,7 +316,7 @@ fn validate_exact_w64_pcm_inner<R: Read + Seek>(
     }
     match expected.encoding {
         W64SampleEncoding::SignedInteger
-            if !matches!(expected.bits_per_sample, 16 | 24 | 32) =>
+            if !matches!(expected.bits_per_sample, 8 | 16 | 24 | 32) =>
         {
             return Err(W64ValidationError::invalid(format!(
                 "unsupported signed-integer PCM width {}",
@@ -443,6 +444,28 @@ fn validate_exact_w64_pcm_inner<R: Read + Seek>(
 
         if chunk_end == declared_file_bytes {
             offset = chunk_end;
+            break;
+        }
+        // SSRC 2.4.2 can append exactly two zero bytes after its final `data`
+        // chunk without including them in the chunk size. This is not Wave64's
+        // 8-byte alignment rule, so only the dedicated SSRC validator admits it.
+        if allow_ssrc_final_two_byte_padding
+            && guid == W64_DATA_GUID
+            && declared_file_bytes - chunk_end == 2
+        {
+            let mut padding = [0_u8; 2];
+            read_exact_at(reader, chunk_end, &mut padding)?;
+            if padding.iter().any(|byte| *byte != 0) {
+                return Err(W64ValidationError::invalid(
+                    "non-zero SSRC two-byte trailing Wave64 padding",
+                ));
+            }
+            alignment_padding_bytes = checked_add(
+                alignment_padding_bytes,
+                2,
+                "alignment padding total",
+            )?;
+            offset = declared_file_bytes;
             break;
         }
         let next_offset = align_up_8(chunk_end)?;
@@ -605,7 +628,7 @@ pub fn inspect_exact_w64_pcm<R: Read + Seek>(
     reader: &mut R,
     expected: W64PcmFormatExpectation,
 ) -> Result<W64ExactStructure, W64ValidationError> {
-    validate_exact_w64_pcm_inner(reader, expected, None, false)
+    validate_exact_w64_pcm_inner(reader, expected, None, false, false)
 }
 
 /// Inspect a Wave64 carrier whose final data chunk may carry the qualified
@@ -615,7 +638,7 @@ fn inspect_w64_pcm_tolerating_final_alignment_padding<R: Read + Seek>(
     reader: &mut R,
     expected: W64PcmFormatExpectation,
 ) -> Result<W64ExactStructure, W64ValidationError> {
-    validate_exact_w64_pcm_inner(reader, expected, None, true)
+    validate_exact_w64_pcm_inner(reader, expected, None, true, false)
 }
 
 /// Validate an exact PCM Wave64 carrier against an externally supplied exact
@@ -624,7 +647,48 @@ pub fn validate_exact_w64_pcm<R: Read + Seek>(
     reader: &mut R,
     expected: W64PcmExpectation,
 ) -> Result<W64ExactStructure, W64ValidationError> {
-    validate_exact_w64_pcm_inner(reader, expected.into(), Some(expected.sample_frames), false)
+    validate_exact_w64_pcm_inner(
+        reader,
+        expected.into(),
+        Some(expected.sample_frames),
+        false,
+        false,
+    )
+}
+
+/// Validate the exact PCM geometry emitted by the certified SSRC terminal.
+///
+/// Spec-compliant Wave64 is always accepted first. SSRC 2.4.2 additionally has
+/// one observed container quirk: it can append exactly two zero bytes after the
+/// final data chunk while leaving the data chunk's declared payload exact. The
+/// fallback admits only that byte pattern; exact payload length, frame count,
+/// PCM format, root extent, and every other structural invariant remain intact.
+pub fn validate_ssrc_w64_pcm<R: Read + Seek>(
+    reader: &mut R,
+    expected: W64PcmExpectation,
+) -> Result<W64ExactStructure, W64ValidationError> {
+    let exact_error = match validate_exact_w64_pcm_inner(
+        reader,
+        expected.into(),
+        Some(expected.sample_frames),
+        false,
+        false,
+    ) {
+        Ok(structure) => return Ok(structure),
+        Err(error) => error,
+    };
+    match validate_exact_w64_pcm_inner(
+        reader,
+        expected.into(),
+        Some(expected.sample_frames),
+        false,
+        true,
+    ) {
+        Ok(structure) => Ok(structure),
+        Err(ssrc_error) => Err(W64ValidationError::invalid(format!(
+            "exact validation failed ({exact_error}); SSRC two-byte-pad validation failed ({ssrc_error})"
+        ))),
+    }
 }
 
 /// Canonicalize the one qualified FFmpeg Wave64 Int32 terminal defect in place.
@@ -924,6 +988,14 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    fn ssrc_two_byte_padded_fixture(expected: W64PcmExpectation) -> Vec<u8> {
+        let mut bytes = fixture(expected, expected.encoding == W64SampleEncoding::FloatingPoint);
+        bytes.extend_from_slice(&[0, 0]);
+        let file_len = bytes.len() as u64;
+        bytes[16..24].copy_from_slice(&file_len.to_le_bytes());
+        bytes
+    }
+
     #[test]
     fn accepts_exact_integer_with_unaligned_final_data() {
         let expected = W64PcmExpectation {
@@ -953,6 +1025,64 @@ mod tests {
             .unwrap();
         assert_eq!(parsed.sample_frames, 4);
         assert!(parsed.fact_chunk_offset.is_some());
+    }
+
+    #[test]
+    fn ssrc_validator_preserves_spec_exact_wave64_behavior() {
+        let expected = W64PcmExpectation {
+            sample_rate_hz: 96_000,
+            channels: 2,
+            bits_per_sample: 32,
+            sample_frames: 4,
+            encoding: W64SampleEncoding::FloatingPoint,
+        };
+        let bytes = fixture(expected, true);
+        let exact = validate_exact_w64_pcm(&mut Cursor::new(bytes.clone()), expected).unwrap();
+        let ssrc = validate_ssrc_w64_pcm(&mut Cursor::new(bytes), expected).unwrap();
+        assert_eq!(ssrc, exact);
+    }
+
+    #[test]
+    fn ssrc_validator_accepts_only_its_exact_two_zero_byte_trailing_pad() {
+        let expected = W64PcmExpectation {
+            sample_rate_hz: 192_000,
+            channels: 1,
+            bits_per_sample: 16,
+            sample_frames: 17_833,
+            encoding: W64SampleEncoding::SignedInteger,
+        };
+        let bytes = ssrc_two_byte_padded_fixture(expected);
+        assert!(validate_exact_w64_pcm(&mut Cursor::new(bytes.clone()), expected).is_err());
+        let parsed = validate_ssrc_w64_pcm(&mut Cursor::new(bytes.clone()), expected).unwrap();
+        assert_eq!(parsed.sample_frames, expected.sample_frames);
+        assert_eq!(parsed.declared_data_bytes, expected.sample_frames * 2);
+        assert_eq!(parsed.alignment_padding_bytes, 2);
+
+        let mut nonzero = bytes;
+        let last = nonzero.len() - 1;
+        nonzero[last] = 1;
+        let error = validate_ssrc_w64_pcm(&mut Cursor::new(nonzero), expected).unwrap_err();
+        assert!(
+            error.to_string().contains("two-byte") || error.to_string().contains("non-zero")
+        );
+    }
+
+    #[test]
+    fn ssrc_two_byte_pad_does_not_weaken_exact_frame_extent() {
+        let actual = W64PcmExpectation {
+            sample_rate_hz: 192_000,
+            channels: 1,
+            bits_per_sample: 24,
+            sample_frames: 11,
+            encoding: W64SampleEncoding::SignedInteger,
+        };
+        let bytes = ssrc_two_byte_padded_fixture(actual);
+        let expected = W64PcmExpectation {
+            sample_frames: 12,
+            ..actual
+        };
+        let error = validate_ssrc_w64_pcm(&mut Cursor::new(bytes), expected).unwrap_err();
+        assert!(error.to_string().contains("expected 36"));
     }
 
     #[test]

@@ -109,7 +109,11 @@ pub fn delete_stale_publish_temp_dirs(album_dir: &Path) -> io::Result<Vec<PathBu
         .and_then(|s| s.to_str())
         .map(sanitize_component)
         .unwrap_or_else(|| "album".to_string());
-    let prefix = format!(".{album_name}.tmp");
+    let legacy_prefix = format!(".{album_name}.tmp");
+    let compact_prefix = format!(
+        ".tonepoet-tmp-{}-",
+        super::coordination_name::album_coordination_token(album_dir),
+    );
 
     let mut deleted = Vec::new();
     if !final_parent.exists() {
@@ -126,7 +130,7 @@ pub fn delete_stale_publish_temp_dirs(album_dir: &Path) -> io::Result<Vec<PathBu
         let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
             continue;
         };
-        if name.starts_with(&prefix) {
+        if name.starts_with(&compact_prefix) || name.starts_with(&legacy_prefix) {
             fs::remove_dir_all(&path)?;
             deleted.push(path);
         }

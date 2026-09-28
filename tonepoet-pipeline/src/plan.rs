@@ -1007,24 +1007,21 @@ pub fn plan_conversion_with_registry(
             let context = request.context();
             let (steps, finalization) =
                 prune_redundant_metadata_steps(&context, registry, &steps, finalization)?;
-            let selected_direct_pcm_terminal = typed
+            let selected_pcm_terminal = typed
                 .as_ref()
                 .map(selected_terminal_realization)
                 .transpose()?
                 .flatten()
                 .and_then(|realization| match realization {
-                    crate::semantic_plan::SelectedTerminalRealization::Pcm(realization)
-                        if matches!(
-                            realization.kind,
-                            crate::semantic_plan::PcmTerminalRealizationKind::SoxDirect
-                                | crate::semantic_plan::PcmTerminalRealizationKind::FfmpegDirect
-                        ) => Some(realization),
+                    crate::semantic_plan::SelectedTerminalRealization::Pcm(realization) => {
+                        Some(realization)
+                    }
                     _ => None,
                 });
             let mut commands = Vec::with_capacity(steps.len());
             for step in &steps {
-                let frozen_tool = selected_direct_pcm_terminal.and_then(|realization| {
-                    matches!(
+                let frozen_tool = selected_pcm_terminal.and_then(|realization| {
+                    let matching_encode = matches!(
                         &step.operation,
                         PlanOperation::EncodePcm {
                             target_format,
@@ -1034,10 +1031,25 @@ pub fn plan_conversion_with_registry(
                         } if target_format == &realization.target_format
                             && target_rate_hz == &realization.target_rate_hz
                             && target_bit_depth == &realization.target_bit_depth
-                    )
-                    .then_some(&realization.selected_tool)
+                    );
+                    if !matching_encode {
+                        return None;
+                    }
+                    match realization.kind {
+                        crate::semantic_plan::PcmTerminalRealizationKind::SoxDirect
+                        | crate::semantic_plan::PcmTerminalRealizationKind::FfmpegDirect => {
+                            Some(realization.selected_tool.clone())
+                        }
+                        crate::semantic_plan::PcmTerminalRealizationKind::SsrcPreterminalFfmpegPackage => {
+                            Some(ToolIdentifier::Ffmpeg)
+                        }
+                        crate::semantic_plan::PcmTerminalRealizationKind::SsrcPreterminalSoxPackage => {
+                            Some(ToolIdentifier::Sox)
+                        }
+                        _ => None,
+                    }
                 });
-                commands.push(match frozen_tool {
+                commands.push(match frozen_tool.as_ref() {
                     Some(tool) => registry.build_command_for_tool(&context, step, tool)?,
                     None => registry.build_command(&context, step)?,
                 });
@@ -1718,6 +1730,7 @@ fn validate_direct_terminal_dither(
             }
         }
         PcmTerminalRealizationKind::SsrcPreterminalFfmpegPackage
+        | PcmTerminalRealizationKind::SsrcPreterminalSoxPackage
         | PcmTerminalRealizationKind::SoxPreterminalFfmpegPackage
         | PcmTerminalRealizationKind::SoxPreterminalWavPackHybrid
         | PcmTerminalRealizationKind::FfmpegPreterminalWavPackHybrid
@@ -1879,11 +1892,141 @@ fn validate_selected_terminal_lowering(
             }
             validate_direct_terminal_dither(&commands[direct_indices[0]], realization)?;
         }
-        PcmTerminalRealizationKind::SsrcPreterminalFfmpegPackage => {
-            return Err(PlanningError::invalid_settings(
-                "terminal_realization",
-                "SSRC preterminal package-only cells are not admitted in this build",
-            ));
+        PcmTerminalRealizationKind::SsrcPreterminalFfmpegPackage
+        | PcmTerminalRealizationKind::SsrcPreterminalSoxPackage => {
+            let expected_package_tool = match realization.kind {
+                PcmTerminalRealizationKind::SsrcPreterminalFfmpegPackage => ToolIdentifier::Ffmpeg,
+                PcmTerminalRealizationKind::SsrcPreterminalSoxPackage => ToolIdentifier::Sox,
+                _ => unreachable!("matched SSRC preterminal package realization"),
+            };
+            let sox_wavpack_int24 = matches!(
+                realization.kind,
+                PcmTerminalRealizationKind::SsrcPreterminalSoxPackage
+            ) && realization.target_format == AudioFormat::WavPack
+                && realization.target_bit_depth == PcmBitDepth::Int24;
+            if realization.target_format == AudioFormat::Wav
+                || !realization.target_format.is_pcm_lossless()
+                || realization.wavpack_hybrid
+                || realization.selected_tool != ToolIdentifier::Ssrc
+                || ssrc_indices.len() != 1
+                || direct_indices.len() != 1
+                || (expected_package_tool == ToolIdentifier::Sox && !sox_wavpack_int24)
+            {
+                return Err(PlanningError::invalid_settings(
+                    "terminal_realization",
+                    format!(
+                        "selected SSRC preterminal package cell has invalid binding: format={}, depth={:?}, hybrid={}, package_tool={}, ssrc_steps={}, package_steps={}",
+                        realization.target_format,
+                        realization.target_bit_depth,
+                        realization.wavpack_hybrid,
+                        expected_package_tool,
+                        ssrc_indices.len(),
+                        direct_indices.len(),
+                    ),
+                ));
+            }
+            let ssrc_index = ssrc_indices[0];
+            let package_index = direct_indices[0];
+            if ssrc_index >= package_index {
+                return Err(PlanningError::invalid_settings(
+                    "terminal_realization",
+                    "SSRC final-sample preterminal must precede the lossless package-only operation",
+                ));
+            }
+            validate_ssrc_terminal_command(&commands[ssrc_index], realization)?;
+
+            let package = &commands[package_index];
+            if package.tool != expected_package_tool {
+                return Err(PlanningError::invalid_settings(
+                    "terminal_realization",
+                    format!(
+                        "selected SSRC preterminal package lowered with {} instead of {}",
+                        package.tool, expected_package_tool,
+                    ),
+                ));
+            }
+            if !matches!(
+                &steps[package_index].operation,
+                PlanOperation::EncodePcm {
+                    target_format,
+                    target_rate_hz,
+                    target_bit_depth,
+                    apply_processing: false,
+                } if target_format == &realization.target_format
+                    && target_rate_hz == &realization.target_rate_hz
+                    && target_bit_depth == &realization.target_bit_depth
+            ) {
+                return Err(PlanningError::invalid_settings(
+                    "terminal_realization",
+                    "SSRC preterminal package must lower as an exact-depth/rate EncodePcm operation with apply_processing=false",
+                ));
+            }
+            if commands[ssrc_index].output.as_path() != package.input.as_path() {
+                return Err(PlanningError::invalid_settings(
+                    "terminal_realization",
+                    "lossless package-only operation is not consuming the SSRC-realized sample artifact",
+                ));
+            }
+            match expected_package_tool {
+                ToolIdentifier::Ffmpeg => {
+                    if package.args.iter().any(|arg| {
+                        arg == "-af"
+                            || arg == "-ar"
+                            || arg.contains("dither_method=")
+                            || arg == "--dither"
+                            || arg == "dither"
+                    }) {
+                        return Err(PlanningError::invalid_settings(
+                            "terminal_realization",
+                            "lossless SSRC FFmpeg package-only command contains sample-rate, filter, requantization/dither processing",
+                        ));
+                    }
+                }
+                ToolIdentifier::Sox => {
+                    let output = package.output.as_path().ok_or_else(|| {
+                        PlanningError::invalid_settings(
+                            "terminal_realization",
+                            "SSRC SoX package-only command has no path output",
+                        )
+                    })?;
+                    let output = output.to_string_lossy();
+                    if package.args.last().map(String::as_str) != Some(output.as_ref())
+                        || package.args.iter().any(|arg| arg == "-r")
+                    {
+                        return Err(PlanningError::invalid_settings(
+                            "terminal_realization",
+                            "lossless SSRC SoX package-only command contains a sample-rate override or an effect after the output path",
+                        ));
+                    }
+                }
+                _ => unreachable!("SSRC package-only realization permits only FFmpeg or SoX"),
+            }
+            if steps.iter().enumerate().skip(ssrc_index + 1).any(|(index, step)| {
+                index != package_index
+                    && matches!(
+                        step.operation,
+                        PlanOperation::ResamplePcm { .. }
+                            | PlanOperation::EncodePcm { .. }
+                            | PlanOperation::EncodeLossy { .. }
+                            | PlanOperation::PcmToDsd { .. }
+                            | PlanOperation::DsdRateChange { .. }
+                    )
+            }) {
+                return Err(PlanningError::invalid_settings(
+                    "terminal_realization",
+                    "SSRC preterminal package route contains a second sample-changing operation after SSRC",
+                ));
+            }
+            if commands.iter().enumerate().any(|(index, command)| {
+                index != ssrc_index
+                    && (command_ffmpeg_dither_method_count(command) != 0
+                        || command.args.iter().any(|arg| arg == "--dither" || arg == "dither"))
+            }) {
+                return Err(PlanningError::invalid_settings(
+                    "terminal_realization",
+                    "SSRC preterminal package route contains downstream or duplicate dither ownership",
+                ));
+            }
         }
         PcmTerminalRealizationKind::SoxPreterminalFfmpegPackage
         | PcmTerminalRealizationKind::SoxPreterminalWavPackHybrid => {
@@ -2849,8 +2992,9 @@ fn plan_from_pcm(
         let profile =
             mapping::ssrc_profile(request.settings.ssrc, request.settings.resample_quality);
         // Resolve the same immediate representation the typed semantic planner
-        // uses. A direct-WAV terminal lets SSRC own the final integer/float
-        // write; any later sample work or split-only cell keeps SSRC Float64.
+        // uses. SSRC may own the final sample realization either directly in
+        // WAV or in an integer WAV preterminal that a lossless FFmpeg package
+        // step consumes without any sample-changing processing.
         let immediate = crate::semantic_plan::resolve_ssrc_immediate_output(
             request,
             ssrc_target_rate_hz,
@@ -2864,7 +3008,9 @@ fn plan_from_pcm(
                 format!("{}: {}", refusal.code, refusal.reason),
             )
         })?;
-        let ssrc_path = if immediate.role == crate::semantic_plan::SsrcOutputRole::Terminal {
+        let direct_wav_terminal = immediate.role == crate::semantic_plan::SsrcOutputRole::Terminal
+            && request.settings.target_format == AudioFormat::Wav;
+        let ssrc_path = if direct_wav_terminal {
             final_work.clone()
         } else {
             context.intermediate_path(steps.len(), "wav")
@@ -2883,6 +3029,18 @@ fn plan_from_pcm(
         );
         *current_input = InputSource::Path(ssrc_path);
         if immediate.role == crate::semantic_plan::SsrcOutputRole::Terminal {
+            if direct_wav_terminal {
+                return Ok(());
+            }
+            push_encode_final(
+                request,
+                steps,
+                current_input,
+                final_work,
+                Some(ssrc_target_rate_hz),
+                target_depth,
+                false,
+            )?;
             return Ok(());
         }
         push_encode_final(
@@ -4328,8 +4486,8 @@ mod phase2_retained_gain_carrier_planning_tests {
 mod stage_a_lowering_selection_diagnostics {
     use super::*;
     use crate::enums::{
-        AudioCodec, AudioFormat, BitDepthTarget, PcmBitDepth, PreferredTool, RateTarget,
-        SampleKind,
+        AudioCodec, AudioFormat, BitDepthTarget, DitherType, PcmBitDepth, PreferredTool,
+        RateTarget, SampleKind,
     };
     use crate::semantic_plan::{plan_typed, PlanningOutcome, TypedPlanNode};
     use crate::settings::PipelineSettings;
@@ -4547,6 +4705,97 @@ mod stage_a_lowering_selection_diagnostics {
                 assert!(matches!(&resample.emitted_operation, PlanOperation::ResamplePcm { .. }));
             }
         }
+    }
+
+    #[test]
+    fn wavpack_int24_ssrc_terminal_packages_with_sox_without_processing() {
+        let mut request = pcm_request(
+            "pcm-wavpack-int24-resample-ssrc",
+            96_000,
+            AudioFormat::WavPack,
+            44_100,
+            PreferredTool::Ssrc,
+        );
+        request.settings.ssrc.force = true;
+        request.settings.wavpack.hybrid = false;
+        request.settings.dither_type = DitherType::Tpdf;
+        request.settings.dither_explicit = true;
+        request.settings.metadata.transfer_tags = false;
+        request.settings.metadata.preserve_artwork = false;
+
+        let plan = plan_conversion(&request).expect("WavPack Int24 SSRC package-only route must plan");
+        let PlanAction::Execute { commands, .. } = plan.action else {
+            panic!("WavPack Int24 SSRC route must execute")
+        };
+        let ssrc = commands
+            .iter()
+            .find(|command| command.tool == ToolIdentifier::Ssrc)
+            .expect("SSRC terminal command");
+        assert!(
+            ssrc.args.windows(2).any(|pair| pair[0] == "--bits" && pair[1] == "24"),
+            "{:?}",
+            ssrc.args,
+        );
+        assert!(
+            ssrc.args.windows(2).any(|pair| pair[0] == "--dither" && pair[1] == "99"),
+            "{:?}",
+            ssrc.args,
+        );
+        assert!(
+            ssrc.args.windows(2).any(|pair| pair[0] == "--pdf" && pair[1] == "1"),
+            "{:?}",
+            ssrc.args,
+        );
+
+        let package = commands.last().expect("WavPack package command");
+        assert_eq!(package.tool, ToolIdentifier::Sox);
+        assert!(!package.args.iter().any(|arg| arg == "dither"));
+        assert!(!package.args.iter().any(|arg| arg == "rate" || arg == "-r"));
+        assert_eq!(
+            package.args.last().map(String::as_str),
+            package.output.as_path().map(|path| path.to_string_lossy()).as_deref(),
+            "SoX package-only command must end at the output path with no effects appended",
+        );
+    }
+
+    #[test]
+    fn wavpack_int24_ssrc_unavailable_dither_refuses_but_none_stays_switchless() {
+        let mut request = pcm_request(
+            "pcm-wavpack-int24-resample-ssrc-1764",
+            96_000,
+            AudioFormat::WavPack,
+            176_400,
+            PreferredTool::Ssrc,
+        );
+        request.settings.ssrc.force = true;
+        request.settings.wavpack.hybrid = false;
+        request.settings.dither_type = DitherType::Tpdf;
+        request.settings.dither_explicit = true;
+        request.settings.metadata.transfer_tags = false;
+        request.settings.metadata.preserve_artwork = false;
+
+        let error = plan_conversion(&request)
+            .expect_err("176.4 kHz WavPack Int24 TPDF must fail before SSRC command construction");
+        assert!(
+            error.to_string().contains("ssrc_terminal_dither_unavailable"),
+            "{error}",
+        );
+
+        request.settings.dither_type = DitherType::None;
+        let plan = plan_conversion(&request)
+            .expect("176.4 kHz WavPack Int24 with no dither must retain SSRC ownership");
+        let PlanAction::Execute { commands, .. } = plan.action else {
+            panic!("WavPack Int24 no-dither route must execute")
+        };
+        let ssrc = commands
+            .iter()
+            .find(|command| command.tool == ToolIdentifier::Ssrc)
+            .expect("SSRC terminal command");
+        assert!(ssrc.args.windows(2).any(|pair| pair[0] == "--bits" && pair[1] == "24"));
+        assert!(!ssrc.args.iter().any(|arg| arg == "--dither" || arg == "--pdf"));
+        let package = commands.last().expect("WavPack package command");
+        assert_eq!(package.tool, ToolIdentifier::Sox);
+        assert!(!package.args.iter().any(|arg| arg == "dither" || arg == "rate" || arg == "-r"));
     }
 
     #[test]

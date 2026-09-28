@@ -12910,6 +12910,7 @@ mod tests {
                 terminal_realization: Some(terminal_realization),
                 strong_ssrc_resampler: None,
             }),
+            ssrc_true_peak_replay: None,
         });
         track.sample_rate = Some(48_000);
         track.bit_depth = Some(640);

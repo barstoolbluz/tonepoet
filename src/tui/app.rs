@@ -3537,7 +3537,7 @@ mod clamp_pill_tests {
     }
 
     #[test]
-    fn int32_dither_options_match_the_planners_commissioned_terminal() {
+    fn non_ssrc_int32_dither_options_match_the_planners_commissioned_terminal() {
         use super::{BitDepthChoice, DitherType};
 
         let mut format = FormatState::new();
@@ -3567,6 +3567,33 @@ mod clamp_pill_tests {
         ] {
             assert!(!enabled(dither), "{dither:?} has no qualified Int32 terminal");
         }
+    }
+
+    #[test]
+    fn ssrc_int32_dither_preserves_selection_and_uses_rate_aware_refusal() {
+        use super::{BitDepthChoice, DitherType, ResamplerChoice};
+
+        let mut format = FormatState::new();
+        format.resampler.select_value(&ResamplerChoice::Ssrc);
+        format.sample_rate.select_value(&44_100);
+        format.bit_depth.select_value(&BitDepthChoice::Int32);
+        format.dither.select_value(&DitherType::Shibata);
+        format.dither_overridden = true;
+        format.apply_format_constraints();
+
+        assert_eq!(*format.dither.selected_value(), DitherType::Shibata);
+        assert!(format.dither_overridden);
+        assert!(!format.ssrc_dither_invalid_for_selected_rate());
+
+        format.sample_rate.select_value(&176_400);
+        format.dither.select_value(&DitherType::TPDF);
+        format.dither_overridden = true;
+        format.apply_format_constraints();
+
+        assert_eq!(*format.dither.selected_value(), DitherType::TPDF);
+        assert!(format.dither_overridden);
+        assert!(format.ssrc_dither_invalid_for_selected_rate());
+        assert_eq!(format.ssrc_dither_status_label(), Some("ssrc unavailable"));
     }
 
     #[test]
@@ -4927,7 +4954,7 @@ impl FormatState {
         if self.ssrc_dither_override_active() {
             Some("ssrc override")
         } else if self.ssrc_dither_invalid_for_selected_rate() {
-            Some("ssrc split")
+            Some("ssrc unavailable")
         } else if self.ssrc_dither_approximation_active() {
             Some("ssrc approx")
         } else {
@@ -6097,15 +6124,18 @@ impl FormatState {
             }
         }
 
-        // Int32 dither has a deliberately narrow physical authority. Ordinary
-        // SoX/SSRC Int32 dither is not behavior-qualified, and the only
-        // FFmpeg terminal admitted by the planner is plain triangular (TPDF)
-        // on an architecture whose exact closure has been commissioned. Keep
-        // the interactive surface inside that same admissible set rather than
-        // allowing a selection that can only fail at planning time. Reference
+        // Int32 dither authority is backend-specific. Ordinary SoX Int32
+        // dither remains unqualified and FFmpeg admits only its commissioned
+        // triangular cell. SSRC is different: supported destination rates own
+        // their native Int32 dither/PDF stage directly, while unsupported rates
+        // remain selected so the planner can refuse them explicitly instead of
+        // silently transferring ownership or clamping user intent. Reference
         // owns its terminal dither separately and its generic dither row is
         // already disabled above.
-        if !reference_selected && *self.bit_depth.selected_value() == BitDepthChoice::Int32 {
+        if !reference_selected
+            && *self.bit_depth.selected_value() == BitDepthChoice::Int32
+            && !matches!(*self.resampler.selected_value(), ResamplerChoice::Ssrc)
+        {
             self.dither.set_all_enabled(false);
             self.dither.set_enabled(&DitherType::None, true);
             self.dither.set_enabled(
@@ -6386,24 +6416,27 @@ fn selected_global_dither_needs_ssrc_approximation(dither: DitherType) -> bool {
 }
 
 fn selected_global_ssrc_dither_valid_for_rate(dither: DitherType, target_rate_hz: u32) -> bool {
-    match dither {
-        // These map to sample-rate-independent SSRC IDs 98/99.
-        DitherType::None | DitherType::TPDF | DitherType::SloppedTPDF => true,
-        // These map to SSRC ATH Curve A intensities. SSRC only publishes ATH A
-        // tables for the rates below, and the pipeline clamps requested
-        // intensity to the strongest ATH A ID available at that rate.
-        DitherType::LowShibata
-        | DitherType::Shibata
-        | DitherType::HighShibata
-        | DitherType::Lipshitz
-        | DitherType::FWeighted
-        | DitherType::ModifiedEWeighted
-        | DitherType::ImprovedEWeighted
-        | DitherType::Gesemann => matches!(
-            target_rate_hz,
-            44_100 | 48_000 | 88_200 | 96_000 | 192_000 | 8_000 | 11_025 | 22_050
-        ),
+    if dither == DitherType::None {
+        return true;
     }
+    let pipeline_dither = match dither {
+        DitherType::None => unreachable!("no-dither handled above"),
+        DitherType::TPDF => tonepoet_pipeline::DitherType::Tpdf,
+        DitherType::SloppedTPDF => tonepoet_pipeline::DitherType::SlopedTpdf,
+        DitherType::Shibata => tonepoet_pipeline::DitherType::Shibata,
+        DitherType::LowShibata => tonepoet_pipeline::DitherType::LowShibata,
+        DitherType::HighShibata => tonepoet_pipeline::DitherType::HighShibata,
+        DitherType::Lipshitz => tonepoet_pipeline::DitherType::Lipshitz,
+        DitherType::FWeighted => tonepoet_pipeline::DitherType::FWeighted,
+        DitherType::ModifiedEWeighted => tonepoet_pipeline::DitherType::ModifiedEWeighted,
+        DitherType::ImprovedEWeighted => tonepoet_pipeline::DitherType::ImprovedEWeighted,
+        DitherType::Gesemann => tonepoet_pipeline::DitherType::Gesemann,
+    };
+    tonepoet_pipeline::mapping::ssrc_dither_selection_for_rate(
+        pipeline_dither,
+        target_rate_hz,
+    )
+    .is_ok()
 }
 
 /// Enum to allow generic prev/next on whichever pill is focused
@@ -17882,33 +17915,17 @@ fn validate_ssrc_dither_id_for_target_rate(dither_id: u8, target_rate_hz: u32) -
     if target_rate_hz == SOURCE_SAMPLE_RATE_SENTINEL {
         // The concrete rate is unavailable at the TUI boundary. The pipeline
         // performs the same validation after resolving RateTarget::Source, so
-        // rejecting here would make every shaped ID unusable in a source-coupled
-        // preset without adding safety.
+        // rejecting here would make a source-coupled preset unusable without
+        // adding any safety.
         return Ok(());
     }
 
-    // Mirror SSRC's rate-dependent dither menu. IDs 98 and 99 are treated as
-    // sample-rate-independent simple/no-shaper choices; shaped ATH and legacy
-    // IDs must be available for the selected destination rate.
-    let valid = if matches!(dither_id, 98 | 99) {
-        true
-    } else {
-        match target_rate_hz {
-            44_100 => matches!(dither_id, 0..=6 | 10..=16 | 90..=92),
-            48_000 => matches!(dither_id, 0..=6 | 10..=16 | 90 | 91),
-            88_200 | 96_000 | 192_000 => matches!(dither_id, 0..=2),
-            8_000 | 11_025 | 22_050 => matches!(dither_id, 0 | 1 | 9),
-            _ => false,
-        }
-    };
-
-    if valid {
-        Ok(())
-    } else {
-        Err(format!(
-            "SSRC dither id {dither_id} is not available for target sample rate {target_rate_hz} Hz"
-        ))
-    }
+    tonepoet_pipeline::mapping::validate_ssrc_dither_id_for_rate(dither_id, target_rate_hz)
+        .map_err(|_| {
+            format!(
+                "SSRC dither id {dither_id} is not available for target sample rate {target_rate_hz} Hz"
+            )
+        })
 }
 
 fn parse_optional_ssrc_pdf(
@@ -18442,6 +18459,15 @@ mod ssrc_format_settings_handler_tests {
     }
 
     #[test]
+    fn concrete_rate_rejects_unshaped_ssrc_dither_when_target_has_no_table() {
+        assert_eq!(
+            validate_ssrc_dither_id_for_target_rate(99, 176_400)
+                .expect_err("176.4 kHz must reject SSRC dither id 99"),
+            "SSRC dither id 99 is not available for target sample rate 176400 Hz"
+        );
+    }
+
+    #[test]
     fn ssrc_overlay_creation_seeds_empty_override_fields_as_empty_text() {
         let mut format = FormatState::new();
         format.resampler.select_value(&ResamplerChoice::Ssrc);
@@ -18648,9 +18674,13 @@ mod ssrc_format_settings_handler_tests {
         format.dither.select_value(&DitherType::HighShibata);
 
         assert!(format.ssrc_dither_invalid_for_selected_rate());
-        assert_eq!(format.ssrc_dither_status_label(), Some("ssrc split"));
+        assert_eq!(format.ssrc_dither_status_label(), Some("ssrc unavailable"));
 
         format.dither.select_value(&DitherType::TPDF);
+        assert!(format.ssrc_dither_invalid_for_selected_rate());
+        assert_eq!(format.ssrc_dither_status_label(), Some("ssrc unavailable"));
+
+        format.dither.select_value(&DitherType::None);
         assert!(!format.ssrc_dither_invalid_for_selected_rate());
         assert_eq!(format.ssrc_dither_status_label(), None);
     }

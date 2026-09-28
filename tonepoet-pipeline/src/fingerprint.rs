@@ -1056,6 +1056,9 @@ fn push_terminal_realization(
                     PcmTerminalRealizationKind::SsrcPreterminalFfmpegPackage => {
                         "ssrc_preterminal_ffmpeg_package"
                     }
+                    PcmTerminalRealizationKind::SsrcPreterminalSoxPackage => {
+                        "ssrc_preterminal_sox_package"
+                    }
                     PcmTerminalRealizationKind::SoxDirect => "sox_direct",
                     PcmTerminalRealizationKind::FfmpegDirect => "ffmpeg_direct",
                     PcmTerminalRealizationKind::SoxPreterminalFfmpegPackage => {

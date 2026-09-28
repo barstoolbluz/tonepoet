@@ -3636,6 +3636,30 @@ fn resolve_pcm_true_peak_submission_albums(
         capped_count,
     );
 
+    // Validate every SSRC-owned terminal binding before mutating any album.
+    // Qualification gain points characterize a cell's error bound; their
+    // extrema are not a normalization policy cap. This barrier rejects only a
+    // gain that the exact SSRC matrix itself cannot represent.
+    for album in albums.iter() {
+        for track in &album.source.tracks {
+            if let TrackSourceRef::PcmTruePeakCarrier {
+                ssrc_true_peak_replay: Some(replay),
+                ..
+            } = &track.source_ref
+            {
+                replay
+                    .binding
+                    .validate_gain_db_nano(authority.gain_db.0)
+                    .map_err(|error| {
+                        format!(
+                            "submitted-batch PCM true-peak gain is not executable by the commissioned SSRC terminal for item {} track {:?}: {error}",
+                            album.item_id, track.id,
+                        )
+                    })?;
+            }
+        }
+    }
+
     for album in albums.iter_mut() {
         if album.pcm_true_peak_measurements.is_empty() {
             continue;
@@ -3960,6 +3984,29 @@ fn resolve_shared_pcm_dsd_true_peak_submission_albums(
         authority.gain_db.render(false),
         capped_count,
     );
+
+    // As above, prove the common scalar is executable by every SSRC terminal
+    // participant before binding either the PCM or DSD half of the batch. The
+    // representative qualification gain corpus is evidence, not a runtime cap.
+    for album in albums.iter() {
+        for track in &album.source.tracks {
+            if let TrackSourceRef::PcmTruePeakCarrier {
+                ssrc_true_peak_replay: Some(replay),
+                ..
+            } = &track.source_ref
+            {
+                replay
+                    .binding
+                    .validate_gain_db_nano(authority.gain_db.0)
+                    .map_err(|error| {
+                        format!(
+                            "submitted-batch shared true-peak gain is not executable by the commissioned SSRC terminal for item {} track {:?}: {error}",
+                            album.item_id, track.id,
+                        )
+                    })?;
+            }
+        }
+    }
 
     for album in albums.iter_mut() {
         if !album.pcm_true_peak_measurements.is_empty() {
@@ -6834,6 +6881,7 @@ mod tests {
                 lossy_target_capped: false,
                 strong_ssrc_resampler: None,
                 terminal_candidate,
+                ssrc_true_peak_replay: None,
             }
         };
         let mut track = album_gain_scope_test_track(track_id.clone(), source_ref);
@@ -7413,6 +7461,111 @@ mod tests {
             Some(expected.gain_db),
             "one-track Album must be numerically identical to the same paired Track solve",
         );
+    }
+
+    #[test]
+    fn pcm_album_gain_allows_normalize_gain_above_qualification_corpus() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let target: tonepoet_pipeline::DbNano = "-0.100000000".parse().expect("target");
+        let measurement = tonepoet_pipeline::AlbumPeakMeasurement::Finite {
+            point_db: "-30.000000000".parse().expect("point"),
+            signal_upper_linear: 0.031_622_776_601_683_79,
+        };
+        let bound = shared_album_test_bound(0.0);
+        let expected = tonepoet_pipeline::resolve_true_peak_gain_constraints(
+            target,
+            &[(measurement, bound)],
+            true,
+        )
+        .expect("quiet material must resolve a finite normalize boost");
+        assert!(
+            expected.gain_db.0 > 24_000_000_000,
+            "fixture must exercise the former +24 dB admission cap: {} dB",
+            expected.gain_db.render(false),
+        );
+
+        let mut album = shared_album_test_scheduled(
+            temp.path(),
+            "pcm-ssrc-wide-gain",
+            false,
+            true,
+            target,
+            measurement,
+            bound,
+        );
+        album.req.submission_size = Some(1);
+        album
+            .req
+            .settings
+            .dsd
+            .set_gain_policy(tonepoet_pipeline::SampleGainPolicy::Off);
+        let tonepoet_pipeline::GainDecisionBinding::SubmittedBatch {
+            expected_participants,
+            ..
+        } = &mut album.pcm_true_peak_measurements[0].execution.binding
+        else {
+            panic!("Album fixture must carry a submitted-batch decision binding");
+        };
+        *expected_participants = Some(1);
+
+        let TrackSourceRef::PcmTruePeakCarrier {
+            ssrc_true_peak_replay,
+            ..
+        } = &mut album.source.tracks[0].source_ref
+        else {
+            panic!("PCM fixture must retain a PCM true-peak carrier");
+        };
+        *ssrc_true_peak_replay = Some(Box::new(
+            crate::convert::pipeline::SsrcTruePeakReplayTerminal {
+                ingress_path: temp.path().join("protected-ingress.wav"),
+                ingress_sha256: tonepoet_pipeline::Sha256Digest::of_bytes(b"protected-ingress"),
+                source_rate_hz: 48_000,
+                target_rate_hz: 48_000,
+                channels: 2,
+                binding: tonepoet_pipeline::SelectedSsrcTruePeakTerminalBinding {
+                    contract_id: tonepoet_pipeline::SSRC_TRUE_PEAK_REPLAY_TERMINAL_V1.to_string(),
+                    gain_model_id: tonepoet_pipeline::SSRC_MIXCHANNELS_GAIN_V1.to_string(),
+                    evidence_id: format!("sha256:{}", "11".repeat(32)),
+                    qualification_report_sha256: "11".repeat(32),
+                    expected_executable_sha256: "22".repeat(32),
+                    source_revision: tonepoet_pipeline::ssrc_binary64::PINNED_SSRC_SOURCE_REV
+                        .to_string(),
+                    build_identity: "test-build".to_string(),
+                    scope: tonepoet_pipeline::SsrcTruePeakTerminalScope {
+                        profile: tonepoet_pipeline::SsrcProfile::High,
+                        source_rate_hz: 48_000,
+                        target_rate_hz: 48_000,
+                        channels: 2,
+                        target_bit_depth: tonepoet_pipeline::PcmBitDepth::Int24,
+                        dither_id: Some(2),
+                        pdf_type: Some(tonepoet_pipeline::SsrcPdfType::Triangular),
+                        base_attenuation_db: None,
+                        min_phase: false,
+                        architecture: std::env::consts::ARCH.to_string(),
+                    },
+                    minimum_gain_db_nano: -24_000_000_000,
+                    maximum_gain_db_nano: 24_000_000_000,
+                    stored_sample_error_bound:
+                        tonepoet_pipeline::SsrcTruePeakStoredSampleErrorBound::TargetLsbNano(
+                            8_000_000_000,
+                        ),
+                },
+            },
+        ));
+
+        let mut albums = vec![album];
+        resolve_pcm_true_peak_submission_albums(&mut albums)
+            .expect("qualification corpus extrema must not cap TruePeakNormalize");
+        assert_eq!(
+            albums[0].req.settings.pcm_true_peak.runtime_album_gain_db(),
+            Some(expected.gain_db),
+        );
+        let TrackSourceRef::PcmTruePeakCarrier { gain_db, .. } =
+            &albums[0].source.tracks[0].source_ref
+        else {
+            panic!("PCM fixture must remain a PCM true-peak carrier");
+        };
+        assert_eq!(*gain_db, Some(expected.gain_db));
     }
 
     #[test]

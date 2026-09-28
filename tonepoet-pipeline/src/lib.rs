@@ -15,6 +15,7 @@ pub mod plugins;
 pub mod qualification_schema;
 pub mod semantic_plan;
 pub mod ssrc_binary64;
+pub mod ssrc_true_peak_terminal;
 pub mod settings;
 pub mod source;
 pub mod tools;
@@ -39,6 +40,7 @@ pub use plan::{
 pub use qualification_schema::*;
 pub use semantic_plan::*;
 pub use ssrc_binary64::*;
+pub use ssrc_true_peak_terminal::*;
 pub use plugins::{
     FfmpegPlugin, FlacPlugin, MetaflacPlugin, SoxPlugin, SsrcPlugin,
 };

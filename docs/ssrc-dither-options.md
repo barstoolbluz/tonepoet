@@ -44,23 +44,24 @@ Documented approximations:
 - `HighShibata`: ATH Curve A intensity 6 with triangular PDF, clamped to the strongest Curve A intensity available at the destination rate.
 - `Lipshitz`, `FWeighted`, `ModifiedEWeighted`, `ImprovedEWeighted`, and `Gesemann`: ATH Curve A intensity 0 with triangular PDF.
 
-For ATH Curve A mappings, the maximum admitted intensity is 6 at 44.1/48 kHz, 2 at 88.2/96/192 kHz, and 1 at 8/11.025/22.05 kHz. IDs 98 and 99 are accepted independently of those ATH tables. Other explicit native IDs are validated against the destination rate and fail closed when unavailable.
+For ATH Curve A mappings, the maximum admitted intensity is 6 at 44.1/48 kHz, 2 at 88.2/96/192 kHz, and 1 at 8/11.025/22.05 kHz. The pinned SSRC 2.4.2 build has no dither table at 176.4, 352.8, or 384 kHz; this includes IDs 98 and 99. Any active dither selection is therefore refused before command construction at those rates. Global `None` remains valid because Tonepoet emits no `--dither`/`--pdf` switches. Other explicit native IDs are likewise validated against the destination rate and fail closed when unavailable.
 
 Native `dither_id` and/or `pdf_type` settings override the derived global pair. The resolved plan records the native pair and its origin instead of pretending a native override is the original global family.
 
-## Int32 gate
+## Int32 ownership
 
-SSRC native Int32 dither ownership is not commissioned for the retained pinned cell.
+Ordinary Int32 is resolved through the same destination-rate-valid native SSRC dither/PDF mapping as Int16 and Int24.
 
-- An explicit global Int32 dither request may use the admitted Float64 split-terminal route and perform the qualified later terminal quantization.
-- An explicit SSRC-native Int32 dither/PDF override is refused because it cannot be reassigned to another terminal.
-- A directly selected SSRC Int32 terminal never emits uncommissioned native dither.
+- At supported destination rates, an explicit global Int32 dither request remains on SSRC. TPDF at 44.1 kHz, for example, lowers as `--bits 32 --dither 99 --pdf 1`.
+- A supported explicit native `dither_id`/`pdf_type` override likewise remains owned by SSRC.
+- At destination rates with no SSRC dither table, any active Int32 dither request fails before command construction. `None` remains valid and emits no dither switches.
+- Int32 ownership is not silently transferred to FFmpeg merely because the destination container is lossless and non-WAV.
 
 ## Terminal fusion versus Float64 split
 
-When SSRC can own the final integer terminal, the planner may fuse resampling, integer quantization, and the resolved SSRC dither/PDF pair into that operation.
+When SSRC can own the final integer sample realization, the planner fuses resampling, integer quantization, and the resolved SSRC dither/PDF pair into that operation. Direct WAV output consumes the samples directly. An admitted non-WAV lossless target may follow with sample-preserving package-only encoding; FFmpeg owns the ordinary admitted cells, while non-hybrid WavPack Int24 uses SoX because FFmpeg cannot faithfully store that depth. The package step must consume the SSRC artifact at the same rate/depth and may not resample, filter, requantize, or dither.
 
-When later gain/effects or another admitted terminal must follow the resampler, SSRC instead emits a nonterminal Float64 carrier. Ordinary Float64 SSRC output is `PcmFloating`; Float64 storage width or double-computation profiles do not by themselves establish `Binary64` preservation authority.
+When later sample-changing gain/effects or an unadmitted terminal must follow the resampler, SSRC instead emits a nonterminal Float64 carrier. An active SSRC-native dither/PDF override cannot be reassigned across that split. Ordinary Float64 SSRC output is `PcmFloating`; Float64 storage width or double-computation profiles do not by themselves establish `Binary64` preservation authority.
 
 ## Binary64 preservation authority
 

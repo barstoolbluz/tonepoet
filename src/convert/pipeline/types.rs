@@ -1135,6 +1135,32 @@ pub enum RegisteredEffectCarrierRepresentation {
         bit_depth: PcmBitDepth,
         terminal_candidate: SelectedPhysicalCandidateBinding,
     },
+    /// Integer PCM WAV whose sample realization was completed by the
+    /// separately commissioned SSRC true-peak terminal replay. Downstream
+    /// work may only package/encode these exact samples; it must not apply
+    /// another gain, resample, dither, or quantizer.
+    CertifiedSsrcTruePeakTerminalW64 {
+        bit_depth: PcmBitDepth,
+    },
+}
+
+/// Exact protected source-rate Float64 ingress retained for one certified
+/// SSRC true-peak terminal replay. The content digest prevents the terminal
+/// stage from silently replaying different bytes than the observation pass.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SsrcTruePeakReplayTerminal {
+    /// Exact source-rate Float64 WAV replayed by the terminal SSRC invocation.
+    pub ingress_path: PathBuf,
+    /// Digest binding the replay to the bytes used by protected observation.
+    pub ingress_sha256: tonepoet_pipeline::Sha256Digest,
+    /// Protected replay input rate.
+    pub source_rate_hz: u32,
+    /// Final SSRC terminal rate.
+    pub target_rate_hz: u32,
+    /// Interleaved channel count bound by qualification.
+    pub channels: u16,
+    /// Exact commissioned terminal cell and error authority.
+    pub binding: tonepoet_pipeline::SelectedSsrcTruePeakTerminalBinding,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1249,10 +1275,20 @@ pub enum TrackSourceRef {
         /// track and future on the pipeline path; an inline value overflowed the
         /// default test-thread stack in `depth_format_matrix`.
         strong_ssrc_resampler: Option<Box<tonepoet_pipeline::SelectedStrongSsrcResamplerBinding>>,
-        /// Typed physical terminal candidate whose proof was charged by the gain decision.
-        /// Old transient serialized state may omit it, but certified execution then fails closed.
+        /// Typed terminal identity retained by the certified gain decision. On the
+        /// established non-SSRC route this is also the charged final sample
+        /// terminal. When `ssrc_true_peak_replay` is present, the separately
+        /// commissioned replay binding owns the final stored-sample error bound;
+        /// this value remains decision/provenance identity only. Old transient
+        /// serialized state may omit it, but certified execution then fails closed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         terminal_candidate: Option<SelectedPhysicalCandidateBinding>,
+        /// Present only when the selected protected SSRC resampler also owns
+        /// final true-peak gain/dither/quantization. Historical transient state
+        /// omits this and therefore retains the established non-SSRC terminal
+        /// behavior rather than acquiring new authority.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ssrc_true_peak_replay: Option<Box<SsrcTruePeakReplayTerminal>>,
     },
     /// Audio-only carrier produced by the Phase-3 common realizer after the
     /// exact registered-effect/resampler chain. Historical serialized state
