@@ -3699,11 +3699,15 @@ mod tests {
             assert_arg(&ssrc.args, "--dither", "99");
             assert_arg(&ssrc.args, "--pdf", "1");
 
+            // The package-only step consumes the SSRC artifact directly. Its
+            // own output is a staged `.output.tonepoet-final.flac` name, not
+            // the caller's `output.flac`, so bind it by that consumption edge
+            // rather than by the final path.
             let package = commands
                 .iter()
                 .find(|command| {
                     command.tool == ToolIdentifier::Ffmpeg
-                        && command.output.as_path().is_some_and(|path| path.ends_with("output.flac"))
+                        && command.input.as_path() == ssrc.output.as_path()
                 })
                 .expect("FFmpeg FLAC package command");
             assert_no_arg(&package.args, "-af");

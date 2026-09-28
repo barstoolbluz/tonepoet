@@ -4690,10 +4690,29 @@ mod stage_a_lowering_selection_diagnostics {
                     records.iter().any(|record| matches!(&record.operation, PlanOperation::ResamplePcm { .. })),
                     "{route}: resampling route did not account for typed ResamplePcm"
                 );
-                assert!(
-                    records.iter().any(|record| matches!(&record.operation, PlanOperation::EncodePcm { .. } | PlanOperation::EncodeLossy { .. })),
-                    "{route}: resampling route did not separately account for terminal encoding"
-                );
+                // R6: when SSRC owns the final integer samples for an
+                // admitted lossless package-only cell, the package step is
+                // sample-preserving and is deliberately NOT a second semantic
+                // PCM terminal — see
+                // `lossless_wavpack_int24_package_uses_ssrc_preterminal_and_sox_packages_only`.
+                // Such routes account for terminal encoding through the
+                // selected terminal realization contract instead of a typed
+                // EncodePcm node.
+                let ssrc_owns_terminal = records.iter().any(|record| {
+                    matches!(
+                        &record.resolved_parameters,
+                        crate::semantic_plan::ResolvedOperationParameters::ResampleSsrc {
+                            output_role: crate::semantic_plan::SsrcOutputRole::Terminal,
+                            ..
+                        }
+                    )
+                });
+                if !ssrc_owns_terminal {
+                    assert!(
+                        records.iter().any(|record| matches!(&record.operation, PlanOperation::EncodePcm { .. } | PlanOperation::EncodeLossy { .. })),
+                        "{route}: resampling route did not separately account for terminal encoding"
+                    );
+                }
             }
             if route == "pcm-flac-resample-ssrc" {
                 let resample = records
