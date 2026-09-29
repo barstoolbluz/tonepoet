@@ -23,7 +23,7 @@ cargo test --workspace --no-fail-fast --exclude tonepoet-true-peak   # THE GATE
                              # without --no-fail-fast, --workspace stops at the
                              # first failing binary; tonepoet-true-peak costs
                              # ~41 min and is gated separately. See ## Testing —
-                             # a clean gate is 6858/4, NOT zero failures.
+                             # a clean gate is 7192/2, NOT zero failures.
 cargo test -p tonepoet-backend   # Backend tests only
 cargo test -p tonepoet-features  # Features tests only
 cargo test -p tonepoet-true-peak # True-peak + loudness core (~41 min)
@@ -139,8 +139,9 @@ tonepoet (main binary + lib)
 
 ## The true-peak crate (`crates/tonepoet-true-peak`)
 
-Separately gated, ~41 min, **136 passed / 0 failed**. Excluded from the routine workspace
-gate; run it explicitly whenever the crate itself changes.
+Separately gated, ~41 min, **160 passed / 0 failed** (was 136 before the portable-Reference
+dispatch-tier work added 24). Excluded from the routine workspace gate; run it explicitly
+whenever the crate itself changes.
 
 - **Its public API is frozen.** Additions are allowed, removals and signature changes are
   not.
@@ -257,16 +258,30 @@ cargo test -p tonepoet-features    # log writer, CUE generator
 cargo test -p tonepoet-true-peak   # BS.1770 true-peak + loudness core (~41 min)
 ```
 
-Tests are in `crates/*/tests/` directories, `src/` (inline `#[cfg(test)]` modules), and `tests/` (integration/contract/sentinel tests). The workspace suite is ~6,860 tests across 57 targets, plus 136 in `tonepoet-true-peak`.
+Tests are in `crates/*/tests/` directories, `src/` (inline `#[cfg(test)]` modules), and `tests/` (integration/contract/sentinel tests). The workspace suite is ~7,190 tests across 57 targets, plus 160 in `tonepoet-true-peak`.
 NEVER truncate failure output.
 
-**A clean gate on `main` is 6858 passed / 4 FAILED, not zero failures.** Three are the
-deferred hard-ceiling tests awaiting a decision on which quantity governs the output
-ceiling; the fourth is a recurrent contention flake
-(`cue_matrix_validates_real_outputs_when_external_tools_are_available`, "persistent lease
-descriptor exceeds 1048576 bytes") that passes in isolation. The correct check is that the
-failure set equals exactly those four — a fifth failure, or a different one, is real.
-`cargo test -p tonepoet-true-peak` is separate and IS at 136/0.
+**A clean gate on `main` is 7192 passed / 2 FAILED, not zero failures.** Both failures are
+the Reference qualification refusing stale promoted evidence:
+
+- `convert::pipeline::track_executor::tests::phase5_promotion_binds_core_and_optional_metadata_closure_variants`
+- `convert::pipeline::track_executor::tests::production_promoted_evidence_refuses_missing_sox_before_any_tool_launch`
+
+Both say "Reference qualification report is incomplete or does not bind the exact
+candidate/required closure variants". The portable-Reference work changed the active v18
+policy while the checked-in promoted artifacts deliberately stayed on the previous closure,
+so these clear only when Reference is requalified on the build host. **Never hand-edit
+promoted evidence to silence them** — they are the requalification debt made visible.
+
+The correct check is that the failure set equals exactly those two. A third failure, or a
+different one, is real. The gate is now deterministic: repeated runs on an unloaded host
+give the identical result, so a varying failure set is itself a defect.
+
+`cargo test -p tonepoet-true-peak` is separate and IS at 160/0.
+
+Superseded 2026-09-29: the three deferred hard-ceiling failures now pass, and the recurrent
+"persistent lease descriptor exceeds 1048576 bytes" contention flake was fixed by the
+schema-3 descriptor encoding.
 
 ## External Tool Dependencies
 
