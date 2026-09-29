@@ -78,6 +78,7 @@ const FFMPEG_ENV: &str = "TONEPOET_REFERENCE_FFMPEG_PATH";
 const METAFLAC_ENV: &str = "TONEPOET_REFERENCE_METAFLAC_PATH";
 const WVTAG_ENV: &str = "TONEPOET_REFERENCE_WVTAG_PATH";
 const ATOMIC_PARSLEY_ENV: &str = "TONEPOET_REFERENCE_ATOMIC_PARSLEY_PATH";
+const RUNTIME_CLOSURE_ROOT_ENV: &str = "TONEPOET_REFERENCE_RUNTIME_CLOSURE_ROOT";
 const METAFLAC_STORE_ENV: &str = "TONEPOET_REFERENCE_METAFLAC_STORE_PATH";
 const WVTAG_STORE_ENV: &str = "TONEPOET_REFERENCE_WVTAG_STORE_PATH";
 const ATOMIC_PARSLEY_STORE_ENV: &str = "TONEPOET_REFERENCE_ATOMIC_PARSLEY_STORE_PATH";
@@ -353,7 +354,34 @@ fn required_sibling_tool(tool: &Path, executable: &str) -> PathBuf {
     })
 }
 
+fn qualified_runtime_closure_path(root: &Path, executable: &Path, label: &str) -> String {
+    let relative = executable.strip_prefix(root).unwrap_or_else(|_| {
+        panic!(
+            "qualified {label} executable {} is outside staged Reference runtime closure {}",
+            executable.display(),
+            root.display(),
+        )
+    });
+    assert!(
+        !relative.as_os_str().is_empty(),
+        "qualified {label} executable resolves to the runtime-closure root itself",
+    );
+    relative
+        .to_str()
+        .unwrap_or_else(|| panic!("qualified {label} runtime-closure path is not UTF-8"))
+        .to_string()
+}
+
 fn apply_qualified_environment(command: &mut Command) {
+    command.env_clear();
+    command.env("LC_ALL", "C");
+    command.env(
+        tonepoet_pipeline::REFERENCE_SOXR_USE_SIMD_ENV,
+        tonepoet_pipeline::REFERENCE_SOXR_USE_SIMD,
+    );
+}
+
+fn apply_locale_only_environment(command: &mut Command) {
     command.env_clear();
     command.env("LC_ALL", "C");
 }
@@ -589,6 +617,10 @@ fn run(path: &Path, args: &[String]) -> Output {
     run_with_pre_clear_environment(path, args, &[])
 }
 
+fn run_locale_only(path: &Path, args: &[String]) -> Output {
+    run_configured_command(path, args, apply_locale_only_environment)
+}
+
 fn run_unchecked(path: &Path, args: &[String]) -> Output {
     run_configured_command_unchecked(path, args, apply_qualified_environment)
 }
@@ -639,10 +671,12 @@ const NOT_RUN_CERTIFICATION_STUB: &str = r#"{
 #[test]
 fn qualified_environment_probe_child() {
     println!(
-        "ambient={} lc_all={}",
+        "ambient={} lc_all={} soxr_use_simd={}",
         std::env::var("TONEPOET_QUALIFICATION_AMBIENT_POISON")
             .unwrap_or_else(|_| "unset".to_string()),
         std::env::var("LC_ALL").unwrap_or_else(|_| "unset".to_string()),
+        std::env::var(tonepoet_pipeline::REFERENCE_SOXR_USE_SIMD_ENV)
+            .unwrap_or_else(|_| "unset".to_string()),
     );
 }
 
@@ -659,14 +693,17 @@ fn qualify_subprocess_environment_isolation() -> Value {
     );
     let text = combined(&output);
     assert!(
-        text.contains("ambient=unset lc_all=C"),
+        text.contains("ambient=unset lc_all=C soxr_use_simd=0"),
         "clear-and-set environment probe observed unexpected child environment: {text}"
     );
     serde_json::json!({
         "status": "passed",
         "schema": "tonepoet-reference-subprocess-environment-probe/v1",
         "policy": "clear_and_set",
-        "qualified_environment": {"LC_ALL": "C"},
+        "qualified_environment": {
+            "LC_ALL": "C",
+            "SOXR_USE_SIMD": tonepoet_pipeline::REFERENCE_SOXR_USE_SIMD,
+        },
         "ambient_poison_key": "TONEPOET_QUALIFICATION_AMBIENT_POISON",
         "ambient_poison_observed": false,
     })
@@ -871,7 +908,7 @@ fn inspect_w64_header(input: &Path) -> W64HeaderObservation {
 }
 
 fn sox_info_value(sox: &Path, input: &Path, flag: &str) -> String {
-    let output = run(
+    let output = run_locale_only(
         sox,
         &[
             "--i".to_string(),
@@ -975,9 +1012,10 @@ fn assert_exact_w64_package_probe(
         input.display(),
     );
 
-    // A second implementation must parse the exact container. This is not a
-    // metadata-only probe: ffprobe must accept the declared extents and stream.
-    let output = run(
+    // A second implementation must parse the exact container. FFprobe is a
+    // control/authority probe and cannot invoke libsoxr, so its environment is
+    // locale-only rather than the Reference audio-subprocess environment.
+    let output = run_locale_only(
         ffprobe,
         &[
             "-v".to_string(),
@@ -1051,7 +1089,7 @@ fn assert_exact_package_probe(
         return;
     }
 
-    let output = run(
+    let output = run_locale_only(
         ffprobe,
         &[
             "-v".to_string(),
@@ -1422,6 +1460,8 @@ fn ffmpeg_sample_hash(ffmpeg: &Path, input: &Path, pcm_codec: &str) -> String {
     let output = run(
         ffmpeg,
         &[
+            "-cpuflags".to_string(),
+            tonepoet_pipeline::REFERENCE_FFMPEG_CPUFLAGS.to_string(),
             "-nostdin".to_string(),
             "-hide_banner".to_string(),
             "-loglevel".to_string(),
@@ -1502,6 +1542,8 @@ fn sox_streamed_float64_w64_sample_hash(
         "-".to_string(),
     ];
     let consumer_args = vec![
+        "-cpuflags".to_string(),
+        tonepoet_pipeline::REFERENCE_FFMPEG_CPUFLAGS.to_string(),
         "-hide_banner".to_string(),
         "-nostdin".to_string(),
         "-loglevel".to_string(),
@@ -1742,6 +1784,8 @@ fn probe_ffmpeg_w64_full_traversal(ffmpeg: &Path, input: &Path) -> Output {
     run_unchecked(
         ffmpeg,
         &[
+            "-cpuflags".to_string(),
+            tonepoet_pipeline::REFERENCE_FFMPEG_CPUFLAGS.to_string(),
             "-hide_banner".to_string(),
             "-nostdin".to_string(),
             "-loglevel".to_string(),
@@ -1765,6 +1809,8 @@ fn decode_w64_to_f64(ffmpeg: &Path, input: &Path, expected_values: usize) -> Vec
     let output = run(
         ffmpeg,
         &[
+            "-cpuflags".to_string(),
+            tonepoet_pipeline::REFERENCE_FFMPEG_CPUFLAGS.to_string(),
             "-hide_banner".to_string(),
             "-nostdin".to_string(),
             "-loglevel".to_string(),
@@ -2893,6 +2939,7 @@ fn qualify_common_reference_candidate_execution() -> Value {
         "metadata_mutation_closure_fingerprint_sha256": candidate.metadata_mutation_closure_fingerprint_sha256,
         "candidate_manifest_sha256": candidate.plan.qualification_candidate_manifest_digest.to_hex(),
         "runtime_dispatch_digest": candidate.toolchain.runtime_dispatch_digest.to_hex(),
+        "portable_runtime_closure_digest": candidate.toolchain.portable_runtime_closure_digest.map(|digest| digest.to_hex()),
         "ffmpeg_canonical_path": candidate.toolchain.ffmpeg.canonical_path.display().to_string(),
         "ffmpeg_executable_sha256": candidate.toolchain.ffmpeg.executable_sha256.to_hex(),
         "sox_ng_canonical_path": candidate.toolchain.sox_ng.canonical_path.display().to_string(),
@@ -4482,7 +4529,13 @@ fn run_planned_command_pipeline(
     );
     assert_eq!(
         pipeline.producer.environment,
-        BTreeMap::from([("LC_ALL".to_string(), "C".to_string())])
+        BTreeMap::from([
+            ("LC_ALL".to_string(), "C".to_string()),
+            (
+                tonepoet_pipeline::REFERENCE_SOXR_USE_SIMD_ENV.to_string(),
+                tonepoet_pipeline::REFERENCE_SOXR_USE_SIMD.to_string(),
+            ),
+        ])
     );
     assert_eq!(pipeline.consumer.tool, ToolIdentifier::Ffmpeg);
     assert_eq!(pipeline.consumer.input, tonepoet_pipeline::InputSource::Stdin);
@@ -4492,7 +4545,13 @@ fn run_planned_command_pipeline(
     );
     assert_eq!(
         pipeline.consumer.environment,
-        BTreeMap::from([("LC_ALL".to_string(), "C".to_string())])
+        BTreeMap::from([
+            ("LC_ALL".to_string(), "C".to_string()),
+            (
+                tonepoet_pipeline::REFERENCE_SOXR_USE_SIMD_ENV.to_string(),
+                tonepoet_pipeline::REFERENCE_SOXR_USE_SIMD.to_string(),
+            ),
+        ])
     );
 
     let mut producer_command = Command::new(sox);
@@ -4759,7 +4818,13 @@ fn inspect_streaming_wav_header(producer: &PlannedCommand, sox: &Path) -> (u32, 
         producer.environment_policy,
         tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet
     );
-    assert_eq!(producer.environment, BTreeMap::from([("LC_ALL".to_string(), "C".to_string())]));
+    assert_eq!(producer.environment, BTreeMap::from([
+            ("LC_ALL".to_string(), "C".to_string()),
+            (
+                tonepoet_pipeline::REFERENCE_SOXR_USE_SIMD_ENV.to_string(),
+                tonepoet_pipeline::REFERENCE_SOXR_USE_SIMD.to_string(),
+            ),
+        ]));
     let mut command = Command::new(sox);
     command
         .args(&producer.args)
@@ -5047,6 +5112,8 @@ fn direct_ffmpeg_f64_samples(ffmpeg: &Path, input: &Path) -> Vec<f64> {
     let output = run(
         ffmpeg,
         &[
+            "-cpuflags".to_string(),
+            tonepoet_pipeline::REFERENCE_FFMPEG_CPUFLAGS.to_string(),
             "-nostdin".to_string(),
             "-hide_banner".to_string(),
             "-loglevel".to_string(),
@@ -5214,6 +5281,8 @@ fn ffmpeg_decode_int24_bytes(ffmpeg: &Path, input: &Path) -> Vec<u8> {
     run(
         ffmpeg,
         &[
+            "-cpuflags".to_string(),
+            tonepoet_pipeline::REFERENCE_FFMPEG_CPUFLAGS.to_string(),
             "-hide_banner".to_string(),
             "-nostdin".to_string(),
             "-i".to_string(),
@@ -5250,7 +5319,7 @@ fn qualify_alignment_metadata_mutation_probes(
     assert_ne!(w64_expected.len() % 8, 0);
     fs::write(&w64_raw, &w64_expected).expect("write W64 alignment probe raw PCM");
     sox_raw_int24_mono_container(sox, &w64_raw, &w64_original, "w64");
-    run(
+    run_locale_only(
         ffmpeg,
         &known_defective_w64_metadata_remux_args(&w64_original, &w64_rewrite),
     );
@@ -8266,26 +8335,26 @@ fn qualify_pinned_reference_toolchain_and_profile_responses() -> Value {
     let atomic_parsley = required_tool(ATOMIC_PARSLEY_ENV);
     let ffprobe = required_sibling_tool(&ffmpeg, "ffprobe");
 
-    let sox_version = combined(&run(&sox, &["--version".to_string()]));
+    let sox_version = combined(&run_locale_only(&sox, &["--version".to_string()]));
     assert!(
         sox_version.contains("14.8.0.1"),
         "unexpected SoX-ng version: {sox_version}"
     );
-    let sox_sinc = combined(&run(
+    let sox_sinc = combined(&run_locale_only(
         &sox,
         &["--help-effect".to_string(), "sinc".to_string()],
     ));
     assert!(sox_sinc.to_ascii_lowercase().contains("sinc"));
 
-    let ffmpeg_version = combined(&run(&ffmpeg, &["-version".to_string()]));
+    let ffmpeg_version = combined(&run_locale_only(&ffmpeg, &["-version".to_string()]));
     let first = ffmpeg_version.lines().next().unwrap_or_default();
-    let ffprobe_version = combined(&run(&ffprobe, &["-version".to_string()]));
+    let ffprobe_version = combined(&run_locale_only(&ffprobe, &["-version".to_string()]));
     let ffprobe_first = ffprobe_version.lines().next().unwrap_or_default();
     assert!(
         first.split_whitespace().any(|token| token.starts_with("7.")),
         "qualified FFmpeg must report major version 7: {first}"
     );
-    let loudnorm = combined(&run(
+    let loudnorm = combined(&run_locale_only(
         &ffmpeg,
         &[
             "-hide_banner".to_string(),
@@ -8295,18 +8364,18 @@ fn qualify_pinned_reference_toolchain_and_profile_responses() -> Value {
     ));
     assert!(loudnorm.contains("print_format"));
 
-    let metaflac_version = combined(&run(&metaflac, &["--version".to_string()]));
+    let metaflac_version = combined(&run_locale_only(&metaflac, &["--version".to_string()]));
     assert!(
         metaflac_version.to_ascii_lowercase().contains("metaflac"),
         "unexpected metaflac version response: {metaflac_version}"
     );
-    let wvtag_version = combined(&run(&wvtag, &["--version".to_string()]));
+    let wvtag_version = combined(&run_locale_only(&wvtag, &["--version".to_string()]));
     assert!(
         wvtag_version.to_ascii_lowercase().contains("wvtag"),
         "unexpected wvtag version response: {wvtag_version}"
     );
     // AtomicParsley reports its version banner when invoked without arguments.
-    let atomic_parsley_version = combined(&run(&atomic_parsley, &[]));
+    let atomic_parsley_version = combined(&run_locale_only(&atomic_parsley, &[]));
     let atomic_parsley_reported_version = atomic_parsley_version
         .lines()
         .map(str::trim)
@@ -8523,68 +8592,63 @@ fn qualify_pinned_reference_toolchain_and_profile_responses() -> Value {
             "stopband_db": stopband_db,
         }));
     }
+    // The Nix store paths remain build provenance, but they are deliberately not
+    // execution-path authority in portable/package qualification. The exact
+    // staged bytes being qualified must instead live inside the attested,
+    // relocatable Reference runtime closure.
     let sox_store = std::env::var("TONEPOET_REFERENCE_SOX_STORE_PATH")
-        .expect("qualified package must expose the exact SoX-ng store path");
+        .expect("qualification build must expose SoX-ng build-provenance store path");
     let ffmpeg_store = std::env::var("TONEPOET_REFERENCE_FFMPEG_STORE_PATH")
-        .expect("qualified package must expose the exact FFmpeg store path");
+        .expect("qualification build must expose FFmpeg build-provenance store path");
     let metaflac_store = std::env::var(METAFLAC_STORE_ENV)
-        .expect("qualified package must expose the exact metaflac store path");
+        .expect("qualification build must expose metaflac build-provenance store path");
     let wvtag_store = std::env::var(WVTAG_STORE_ENV)
-        .expect("qualified package must expose the exact wvtag store path");
+        .expect("qualification build must expose wvtag build-provenance store path");
     let atomic_parsley_store = std::env::var(ATOMIC_PARSLEY_STORE_ENV)
-        .expect("qualified package must expose the exact AtomicParsley store path");
-    assert_eq!(
-        fs::canonicalize(Path::new(&sox_store).join("bin/sox"))
-            .expect("qualified SoX-ng store must contain bin/sox"),
-        sox,
-        "SoX-ng activation path does not belong to the compiled qualification store"
-    );
-    assert_eq!(
-        fs::canonicalize(Path::new(&ffmpeg_store).join("bin/ffmpeg"))
-            .expect("qualified FFmpeg store must contain bin/ffmpeg"),
-        ffmpeg,
-        "FFmpeg activation path does not belong to the compiled qualification store"
-    );
-    assert_eq!(
-        fs::canonicalize(Path::new(&ffmpeg_store).join("bin/ffprobe"))
-            .expect("qualified FFmpeg store must contain bin/ffprobe"),
-        ffprobe,
-        "FFprobe does not belong to the qualified FFmpeg store"
-    );
-    assert_eq!(
-        fs::canonicalize(Path::new(&metaflac_store).join("bin/metaflac"))
-            .expect("qualified metaflac store must contain bin/metaflac"),
-        metaflac,
-        "metaflac activation path does not belong to the compiled qualification store"
-    );
-    assert_eq!(
-        fs::canonicalize(Path::new(&wvtag_store).join("bin/wvtag"))
-            .expect("qualified wvtag store must contain bin/wvtag"),
-        wvtag,
-        "wvtag activation path does not belong to the compiled qualification store"
-    );
-    assert_eq!(
-        fs::canonicalize(Path::new(&atomic_parsley_store).join("bin/AtomicParsley"))
-            .expect("qualified AtomicParsley store must contain bin/AtomicParsley"),
-        atomic_parsley,
-        "AtomicParsley activation path does not belong to the compiled qualification store"
+        .expect("qualification build must expose AtomicParsley build-provenance store path");
+    let runtime_closure_root_raw = std::env::var_os(RUNTIME_CLOSURE_ROOT_ENV).unwrap_or_else(|| {
+        panic!("{RUNTIME_CLOSURE_ROOT_ENV} must name the staged Reference runtime closure")
+    });
+    let runtime_closure_root = fs::canonicalize(&runtime_closure_root_raw).unwrap_or_else(|error| {
+        panic!(
+            "cannot canonicalize {RUNTIME_CLOSURE_ROOT_ENV}={}: {error}",
+            Path::new(&runtime_closure_root_raw).display(),
+        )
+    });
+    let sox_runtime_closure_path =
+        qualified_runtime_closure_path(&runtime_closure_root, &sox, "SoX-ng");
+    let ffmpeg_runtime_closure_path =
+        qualified_runtime_closure_path(&runtime_closure_root, &ffmpeg, "FFmpeg");
+    let ffprobe_runtime_closure_path =
+        qualified_runtime_closure_path(&runtime_closure_root, &ffprobe, "FFprobe");
+    let metaflac_runtime_closure_path =
+        qualified_runtime_closure_path(&runtime_closure_root, &metaflac, "metaflac");
+    let wvtag_runtime_closure_path =
+        qualified_runtime_closure_path(&runtime_closure_root, &wvtag, "wvtag");
+    let atomic_parsley_runtime_closure_path = qualified_runtime_closure_path(
+        &runtime_closure_root,
+        &atomic_parsley,
+        "AtomicParsley",
     );
     serde_json::json!({
         "sox_ng": {
             "canonical_path": sox.display().to_string(),
-            "store_path": sox_store,
+            "runtime_closure_path": sox_runtime_closure_path,
+            "build_provenance_store_path": sox_store,
             "executable_sha256": sha256_hex(&fs::read(&sox).expect("read qualified SoX-ng executable")),
             "reported_version": sox_version.lines().next().unwrap_or_default(),
             "required_probe": "sinc",
         },
         "ffmpeg": {
             "canonical_path": ffmpeg.display().to_string(),
-            "store_path": ffmpeg_store,
+            "runtime_closure_path": ffmpeg_runtime_closure_path,
+            "build_provenance_store_path": ffmpeg_store,
             "executable_sha256": sha256_hex(&fs::read(&ffmpeg).expect("read qualified FFmpeg executable")),
             "reported_version": first,
             "required_probes": ["loudnorm", "print_format"],
             "ffprobe": {
                 "canonical_path": ffprobe.display().to_string(),
+                "runtime_closure_path": ffprobe_runtime_closure_path,
                 "executable_sha256": sha256_hex(&fs::read(&ffprobe).expect("read qualified FFprobe executable")),
                 "reported_version": ffprobe_first,
             },
@@ -8592,19 +8656,22 @@ fn qualify_pinned_reference_toolchain_and_profile_responses() -> Value {
         "production_metadata_mutators": {
             "metaflac": {
                 "canonical_path": metaflac.display().to_string(),
-                "store_path": metaflac_store,
+                "runtime_closure_path": metaflac_runtime_closure_path,
+                "build_provenance_store_path": metaflac_store,
                 "executable_sha256": sha256_hex(&fs::read(&metaflac).expect("read qualified metaflac executable")),
                 "reported_version": first_nonempty_line(&metaflac_version),
             },
             "wvtag": {
                 "canonical_path": wvtag.display().to_string(),
-                "store_path": wvtag_store,
+                "runtime_closure_path": wvtag_runtime_closure_path,
+                "build_provenance_store_path": wvtag_store,
                 "executable_sha256": sha256_hex(&fs::read(&wvtag).expect("read qualified wvtag executable")),
                 "reported_version": first_nonempty_line(&wvtag_version),
             },
             "AtomicParsley": {
                 "canonical_path": atomic_parsley.display().to_string(),
-                "store_path": atomic_parsley_store,
+                "runtime_closure_path": atomic_parsley_runtime_closure_path,
+                "build_provenance_store_path": atomic_parsley_store,
                 "executable_sha256": sha256_hex(&fs::read(&atomic_parsley).expect("read qualified AtomicParsley executable")),
                 "reported_version": atomic_parsley_reported_version,
             },
@@ -9313,6 +9380,176 @@ fn qualify_paired_performance_resource_release_gate(
     )
 }
 
+
+fn qualify_internal_reference_dispatch_tiers() -> Value {
+    assert_eq!(
+        std::env::consts::ARCH,
+        "x86_64",
+        "portable Reference qualification is x86_64-only",
+    );
+
+    let sample_rate = 48_000_u32;
+    let loudness_cases = [
+        (
+            "scalar",
+            1_usize,
+            tonepoet_true_peak::loudness::LoudnessSimdBackend::Scalar,
+        ),
+        (
+            "sse2",
+            2_usize,
+            tonepoet_true_peak::loudness::LoudnessSimdBackend::Sse2,
+        ),
+        (
+            "avx",
+            4_usize,
+            tonepoet_true_peak::loudness::LoudnessSimdBackend::Avx,
+        ),
+    ];
+    let mut loudness = serde_json::Map::new();
+    for (name, channels, backend) in loudness_cases {
+        let production =
+            tonepoet_true_peak::loudness::production_loudness_simd_backend_for_qualification(
+                channels,
+            );
+        assert_eq!(
+            production, backend,
+            "qualification host does not select the admitted {name} loudness tier at its production channel geometry",
+        );
+
+        let mut samples = Vec::with_capacity(sample_rate as usize * channels);
+        for frame in 0..sample_rate as usize {
+            let t = frame as f64 / f64::from(sample_rate);
+            for channel in 0..channels {
+                let amplitude = 0.20 - 0.015 * channel as f64;
+                let frequency_hz = 997.0 + 379.0 * channel as f64;
+                samples.push(
+                    amplitude * (std::f64::consts::TAU * frequency_hz * t).sin(),
+                );
+            }
+        }
+
+        let mut meter = tonepoet_true_peak::loudness::LoudnessMeter::new(sample_rate, channels)
+            .expect("construct Reference loudness qualification meter");
+        meter
+            .force_simd_backend_for_qualification(backend)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "qualified loudness tier {} unavailable: {error}",
+                    backend.qualification_name()
+                )
+            });
+        meter
+            .push_interleaved(&samples)
+            .expect("exercise qualified loudness production kernel");
+        let measurement = meter
+            .finalize()
+            .expect("finalize qualified loudness production kernel");
+        let lufs = measurement
+            .summary
+            .integrated
+            .finite_lufs()
+            .expect("qualification programme produces finite integrated loudness");
+        loudness.insert(
+            name.to_string(),
+            serde_json::json!({
+                "backend": backend.qualification_name(),
+                "production_channels": channels,
+                "integrated_lufs_bits": format!("{:016x}", lufs.to_bits()),
+                "range_lu_bits": measurement.summary.range.finite_lu().map(|value| format!("{:016x}", value.to_bits())),
+                "real_frames": measurement.summary.real_frames,
+            }),
+        );
+    }
+
+    let peak_channels = 2_usize;
+    let peak_frames = 8_192_usize;
+    let mut peak_samples = Vec::with_capacity(peak_frames * peak_channels);
+    for frame in 0..peak_frames {
+        let t = frame as f64 / f64::from(sample_rate);
+        let impulse = if frame == 17 || frame == peak_frames - 29 {
+            0.73
+        } else {
+            0.0
+        };
+        peak_samples.push(impulse + 0.21 * (std::f64::consts::TAU * 17_321.0 * t).sin());
+        peak_samples.push(
+            -0.5 * impulse + 0.18 * (std::f64::consts::TAU * 19_117.0 * t).sin(),
+        );
+    }
+    let cases = [
+        (
+            "reference_scalar",
+            tonepoet_true_peak::PeakTier::Reference,
+            tonepoet_true_peak::CertifiedPeakSimdBackend::Scalar,
+        ),
+        (
+            "standard_scalar",
+            tonepoet_true_peak::PeakTier::Standard,
+            tonepoet_true_peak::CertifiedPeakSimdBackend::Scalar,
+        ),
+        (
+            "standard_avx",
+            tonepoet_true_peak::PeakTier::Standard,
+            tonepoet_true_peak::CertifiedPeakSimdBackend::Avx,
+        ),
+        (
+            "fast_scalar",
+            tonepoet_true_peak::PeakTier::Fast,
+            tonepoet_true_peak::CertifiedPeakSimdBackend::Scalar,
+        ),
+        (
+            "fast_avx",
+            tonepoet_true_peak::PeakTier::Fast,
+            tonepoet_true_peak::CertifiedPeakSimdBackend::Avx,
+        ),
+    ];
+    let mut peak = serde_json::Map::new();
+    for (name, tier, backend) in cases {
+        let mut meter = tonepoet_true_peak::CertifiedPeakMeter::new(
+            sample_rate,
+            peak_channels,
+            tonepoet_true_peak::EdgePolicy::ZeroExtend,
+            tier,
+        )
+        .expect("construct certified-peak qualification meter");
+        meter
+            .force_simd_backend_for_qualification(backend)
+            .unwrap_or_else(|error| {
+                panic!("qualified certified-peak case {name} unavailable: {error}")
+            });
+        meter
+            .push_interleaved(&peak_samples)
+            .expect("exercise certified-peak production kernel");
+        let certificate = meter
+            .finalize()
+            .expect("finalize certified-peak production kernel");
+        peak.insert(
+            name.to_string(),
+            serde_json::json!({
+                "backend": backend.qualification_name(),
+                "lower_linear_bits": format!("{:016x}", certificate.finite_interval.lower_linear.to_bits()),
+                "upper_linear_bits": format!("{:016x}", certificate.finite_interval.upper_linear.to_bits()),
+                "status": format!("{:?}", certificate.status),
+            }),
+        );
+    }
+
+    serde_json::json!({
+        "status": "passed",
+        "schema": "tonepoet-reference-internal-dispatch-qualification/v1",
+        "loudness": loudness,
+        "certified_peak": peak,
+        "production_selector_certified_peak": {
+            "reference": tonepoet_true_peak::production_certified_peak_simd_backend_for_qualification(tonepoet_true_peak::PeakTier::Reference).qualification_name(),
+            "standard": tonepoet_true_peak::production_certified_peak_simd_backend_for_qualification(tonepoet_true_peak::PeakTier::Standard).qualification_name(),
+            "fast": tonepoet_true_peak::production_certified_peak_simd_backend_for_qualification(tonepoet_true_peak::PeakTier::Fast).qualification_name(),
+        },
+        "admitted_loudness_tiers": tonepoet_pipeline::qualification_schema::REFERENCE_QUALIFIED_X86_64_LOUDNESS_DISPATCH_TIERS,
+        "admitted_certified_peak_tiers": tonepoet_pipeline::qualification_schema::REFERENCE_QUALIFIED_X86_64_CERTIFIED_PEAK_DISPATCH_TIERS,
+    })
+}
+
 fn release_gate_result(gate: &str, evidence: &Value) -> tonepoet_pipeline::ReferenceReleaseGateResultV1 {
     tonepoet_pipeline::ReferenceReleaseGateResultV1 {
         gate: gate.to_string(),
@@ -9327,6 +9564,12 @@ fn complete_p0_reference_qualification_report() {
         eprintln!("skipping; set {GATE}=1 to run the mandatory real-tool Reference qualification");
         return;
     }
+
+    let (portable_runtime_closure_sha256, portable_runtime_closure_entry_count) =
+        tonepoet::convert::pipeline::qualify_reference_portable_runtime_closure_identity()
+            .expect("portable Reference runtime closure attests")
+            .expect("final portable Reference qualification requires the staged runtime-closure manifest");
+    let internal_dispatch_tiers = qualify_internal_reference_dispatch_tiers();
 
     let candidate_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -9502,6 +9745,12 @@ fn complete_p0_reference_qualification_report() {
     let real_tool_candidate_evidence = serde_json::json!({
         "status": "passed",
         "common_candidate_execution": common_candidate_execution,
+        "portable_runtime_closure": {
+            "schema": "tonepoet-reference-runtime-closure/v1",
+            "digest": portable_runtime_closure_sha256,
+            "entry_count": portable_runtime_closure_entry_count,
+        },
+        "internal_dispatch_tiers": internal_dispatch_tiers,
         "historical_dc_root_cause": historical_dc_root_cause,
         "default_general_processing_smoke": default_settings_live_smoke,
         "subprocess_environment_probe": environment_probe_results,

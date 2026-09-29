@@ -2298,10 +2298,6 @@ pub fn execution_fingerprint_v1(
             ("atomic_parsley", &mutators.atomic_parsley),
         ] {
             writer.field_string(
-                &format!("metadata_mutator.{name}.canonical_path"),
-                mutator.canonical_path.clone(),
-            );
-            writer.field_string(
                 &format!("metadata_mutator.{name}.sha256"),
                 mutator.executable_sha256.to_hex(),
             );
@@ -3224,7 +3220,22 @@ mod tests {
     }
 
     #[test]
-    fn execution_fingerprint_binds_every_metadata_mutator_identity_component() {
+    fn execution_fingerprint_is_invariant_to_metadata_mutator_install_location() {
+        let behavior = BehaviorFingerprintV1(Sha256Digest::of_bytes(b"behavior"));
+        let semantic = SemanticPlanHashV1(Sha256Digest::of_bytes(b"semantic"));
+        let qualification = Sha256Digest::of_bytes(b"qualification");
+        let base = test_reference_execution_identity();
+        let mut relocated = base.clone();
+        relocated.metadata_mutators.as_mut().unwrap().metaflac.canonical_path =
+            "/opt/tonepoet/libexec/metaflac".to_string();
+        assert_eq!(
+            execution_fingerprint_v1(behavior, semantic, qualification, &base),
+            execution_fingerprint_v1(behavior, semantic, qualification, &relocated),
+        );
+    }
+
+    #[test]
+    fn execution_fingerprint_binds_every_metadata_mutator_content_identity_component() {
         let behavior = BehaviorFingerprintV1(Sha256Digest::of_bytes(b"behavior"));
         let semantic = SemanticPlanHashV1(Sha256Digest::of_bytes(b"semantic"));
         let qualification = Sha256Digest::of_bytes(b"qualification");

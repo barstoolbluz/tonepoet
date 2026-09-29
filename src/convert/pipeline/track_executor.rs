@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -119,6 +119,325 @@ pub struct ReferenceToolchainEvidence {
     pub dst_fixture_digest: Sha256Digest,
     pub platform_abi_digest: Sha256Digest,
     pub runtime_dispatch_digest: Sha256Digest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub portable_runtime_closure_digest: Option<Sha256Digest>,
+}
+
+
+const REFERENCE_RUNTIME_CLOSURE_ROOT_ENV: &str = "TONEPOET_REFERENCE_RUNTIME_CLOSURE_ROOT";
+const REFERENCE_RUNTIME_CLOSURE_MANIFEST_ENV: &str =
+    "TONEPOET_REFERENCE_RUNTIME_CLOSURE_MANIFEST_PATH";
+const REFERENCE_RUNTIME_CLOSURE_SCHEMA: &str = "tonepoet-reference-runtime-closure/v1";
+const REFERENCE_RUNTIME_CLOSURE_MANIFEST_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const REFERENCE_RUNTIME_CLOSURE_MAX_ENTRIES: usize = 100_000;
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReferenceRuntimeClosureManifest {
+    schema: String,
+    entries: Vec<ReferenceRuntimeClosureManifestEntry>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReferenceRuntimeClosureManifestEntry {
+    path: String,
+    kind: String,
+    #[serde(default)]
+    sha256: Option<String>,
+    #[serde(default)]
+    target: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReferenceRuntimeClosureEntryIdentity {
+    Directory,
+    File(Sha256Digest),
+    Symlink(String),
+}
+
+#[derive(Debug, Clone)]
+struct ReferencePortableRuntimeClosure {
+    root: PathBuf,
+    digest: Sha256Digest,
+    entries: BTreeMap<String, ReferenceRuntimeClosureEntryIdentity>,
+}
+
+fn reference_runtime_closure_relative_path(path: &Path) -> io::Result<String> {
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Reference runtime-closure path must be non-empty and relative",
+        ));
+    }
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => parts.push(part.to_str().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Reference runtime-closure paths must be UTF-8",
+                )
+            })?),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Reference runtime-closure paths may not contain '.', '..', roots, or prefixes",
+                ));
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Reference runtime-closure path may not name the closure root",
+        ));
+    }
+    Ok(parts.join("/"))
+}
+
+fn reference_runtime_closure_digest(
+    entries: &BTreeMap<String, ReferenceRuntimeClosureEntryIdentity>,
+) -> Sha256Digest {
+    fn field(hasher: &mut Sha256, bytes: &[u8]) {
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+    let mut hasher = Sha256::new();
+    field(&mut hasher, REFERENCE_RUNTIME_CLOSURE_SCHEMA.as_bytes());
+    for (path, identity) in entries {
+        field(&mut hasher, path.as_bytes());
+        match identity {
+            ReferenceRuntimeClosureEntryIdentity::Directory => {
+                field(&mut hasher, b"directory");
+            }
+            ReferenceRuntimeClosureEntryIdentity::File(digest) => {
+                field(&mut hasher, b"file");
+                field(&mut hasher, &digest.0);
+            }
+            ReferenceRuntimeClosureEntryIdentity::Symlink(target) => {
+                field(&mut hasher, b"symlink");
+                field(&mut hasher, target.as_bytes());
+            }
+        }
+    }
+    Sha256Digest(hasher.finalize().into())
+}
+
+fn scan_reference_runtime_closure(
+    root: &Path,
+) -> io::Result<BTreeMap<String, ReferenceRuntimeClosureEntryIdentity>> {
+    let root = fs::canonicalize(root)?;
+    if !root.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Reference runtime-closure root is not a directory",
+        ));
+    }
+    let mut entries = BTreeMap::new();
+    for item in walkdir::WalkDir::new(&root)
+        .follow_links(false)
+        .min_depth(1)
+        .sort_by_file_name()
+    {
+        let item = item.map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+        if entries.len() >= REFERENCE_RUNTIME_CLOSURE_MAX_ENTRIES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Reference runtime closure exceeds the entry limit",
+            ));
+        }
+        let relative = item.path().strip_prefix(&root).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "runtime-closure entry escaped its root")
+        })?;
+        let key = reference_runtime_closure_relative_path(relative)?;
+        let file_type = item.file_type();
+        let identity = if file_type.is_dir() {
+            ReferenceRuntimeClosureEntryIdentity::Directory
+        } else if file_type.is_file() {
+            ReferenceRuntimeClosureEntryIdentity::File(stable_file_sha256(item.path())?)
+        } else if file_type.is_symlink() {
+            let target = fs::read_link(item.path())?;
+            if target.is_absolute() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Reference runtime-closure symlink {key} has an absolute target"),
+                ));
+            }
+            let target_text = target.to_str().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Reference runtime-closure symlink {key} target is not UTF-8"),
+                )
+            })?;
+            let resolved_target = fs::canonicalize(item.path())?;
+            if !resolved_target.starts_with(&root) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Reference runtime-closure symlink {key} escapes the closure root"),
+                ));
+            }
+            ReferenceRuntimeClosureEntryIdentity::Symlink(target_text.to_string())
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Reference runtime-closure entry {key} is not a file, directory, or symlink"),
+            ));
+        };
+        if entries.insert(key.clone(), identity).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("duplicate Reference runtime-closure path {key}"),
+            ));
+        }
+    }
+    Ok(entries)
+}
+
+fn attest_reference_portable_runtime_closure(
+) -> Result<Option<ReferencePortableRuntimeClosure>, TrackExecutionError> {
+    let root = std::env::var_os(REFERENCE_RUNTIME_CLOSURE_ROOT_ENV);
+    let manifest = std::env::var_os(REFERENCE_RUNTIME_CLOSURE_MANIFEST_ENV);
+    let (root, manifest) = match (root, manifest) {
+        (None, None) => return Ok(None),
+        (Some(root), Some(manifest)) => (PathBuf::from(root), PathBuf::from(manifest)),
+        _ => {
+            return Err(reference_toolchain_error(format!(
+                "{REFERENCE_RUNTIME_CLOSURE_ROOT_ENV} and {REFERENCE_RUNTIME_CLOSURE_MANIFEST_ENV} must be set together"
+            )));
+        }
+    };
+    let root = fs::canonicalize(&root).map_err(|error| {
+        reference_toolchain_error(format!("could not resolve portable Reference runtime-closure root: {error}"))
+    })?;
+    let manifest_metadata = fs::symlink_metadata(&manifest).map_err(|error| {
+        reference_toolchain_error(format!("could not inspect portable Reference runtime-closure manifest: {error}"))
+    })?;
+    if !manifest_metadata.file_type().is_file() || manifest_metadata.file_type().is_symlink() {
+        return Err(reference_toolchain_error(
+            "portable Reference runtime-closure manifest must be a regular non-symlink file",
+        ));
+    }
+    if manifest_metadata.len() > REFERENCE_RUNTIME_CLOSURE_MANIFEST_MAX_BYTES {
+        return Err(reference_toolchain_error(
+            "portable Reference runtime-closure manifest exceeds the size limit",
+        ));
+    }
+    let manifest = fs::canonicalize(&manifest).map_err(|error| {
+        reference_toolchain_error(format!("could not resolve portable Reference runtime-closure manifest: {error}"))
+    })?;
+    if manifest.starts_with(&root) {
+        return Err(reference_toolchain_error(
+            "portable Reference runtime-closure manifest must live outside the closure tree",
+        ));
+    }
+    let bytes = fs::read(&manifest).map_err(|error| {
+        reference_toolchain_error(format!("could not read portable Reference runtime-closure manifest: {error}"))
+    })?;
+    let wire: ReferenceRuntimeClosureManifest = serde_json::from_slice(&bytes).map_err(|error| {
+        reference_toolchain_error(format!("invalid portable Reference runtime-closure manifest: {error}"))
+    })?;
+    if wire.schema != REFERENCE_RUNTIME_CLOSURE_SCHEMA {
+        return Err(reference_toolchain_error(format!(
+            "unsupported portable Reference runtime-closure schema {}",
+            wire.schema
+        )));
+    }
+    if wire.entries.len() > REFERENCE_RUNTIME_CLOSURE_MAX_ENTRIES {
+        return Err(reference_toolchain_error(
+            "portable Reference runtime-closure manifest exceeds the entry limit",
+        ));
+    }
+    let mut expected = BTreeMap::new();
+    let mut prior_path: Option<&str> = None;
+    for entry in &wire.entries {
+        let normalized = reference_runtime_closure_relative_path(Path::new(&entry.path)).map_err(|error| {
+            reference_toolchain_error(format!("invalid runtime-closure manifest path {:?}: {error}", entry.path))
+        })?;
+        if normalized != entry.path {
+            return Err(reference_toolchain_error(format!(
+                "runtime-closure manifest path {:?} is not canonical",
+                entry.path
+            )));
+        }
+        if prior_path.is_some_and(|prior| prior >= entry.path.as_str()) {
+            return Err(reference_toolchain_error(
+                "runtime-closure manifest entries must be unique and strictly sorted by path",
+            ));
+        }
+        prior_path = Some(&entry.path);
+        let identity = match entry.kind.as_str() {
+            "directory" => {
+                if entry.sha256.is_some() || entry.target.is_some() {
+                    return Err(reference_toolchain_error(format!(
+                        "runtime-closure directory {} unexpectedly carries file or symlink identity",
+                        entry.path
+                    )));
+                }
+                ReferenceRuntimeClosureEntryIdentity::Directory
+            }
+            "file" => {
+                if entry.target.is_some() {
+                    return Err(reference_toolchain_error(format!(
+                        "runtime-closure file {} unexpectedly carries a symlink target",
+                        entry.path
+                    )));
+                }
+                let sha = entry.sha256.as_deref().ok_or_else(|| {
+                    reference_toolchain_error(format!("runtime-closure file {} lacks sha256", entry.path))
+                })?;
+                ReferenceRuntimeClosureEntryIdentity::File(Sha256Digest::from_hex(sha).map_err(|error| {
+                    reference_toolchain_error(format!("runtime-closure file {} has invalid sha256: {error}", entry.path))
+                })?)
+            }
+            "symlink" => {
+                if entry.sha256.is_some() {
+                    return Err(reference_toolchain_error(format!(
+                        "runtime-closure symlink {} unexpectedly carries sha256",
+                        entry.path
+                    )));
+                }
+                let target = entry.target.clone().ok_or_else(|| {
+                    reference_toolchain_error(format!("runtime-closure symlink {} lacks target", entry.path))
+                })?;
+                if Path::new(&target).is_absolute() {
+                    return Err(reference_toolchain_error(format!(
+                        "runtime-closure symlink {} has an absolute target",
+                        entry.path
+                    )));
+                }
+                ReferenceRuntimeClosureEntryIdentity::Symlink(target)
+            }
+            other => {
+                return Err(reference_toolchain_error(format!(
+                    "runtime-closure entry {} has unsupported kind {other:?}", entry.path
+                )));
+            }
+        };
+        expected.insert(entry.path.clone(), identity);
+    }
+    let actual = scan_reference_runtime_closure(&root).map_err(|error| {
+        reference_toolchain_error(format!("portable Reference runtime-closure scan failed: {error}"))
+    })?;
+    if actual != expected {
+        let missing = expected.keys().find(|path| !actual.contains_key(*path));
+        let extra = actual.keys().find(|path| !expected.contains_key(*path));
+        let changed = expected.iter().find(|(path, identity)| actual.get(*path) != Some(*identity));
+        return Err(reference_toolchain_error(format!(
+            "portable Reference runtime closure does not match its manifest (missing={missing:?}, extra={extra:?}, changed={:?})",
+            changed.map(|(path, _)| path)
+        )));
+    }
+    let digest = reference_runtime_closure_digest(&actual);
+    Ok(Some(ReferencePortableRuntimeClosure { root, digest, entries: actual }))
+}
+
+#[doc(hidden)]
+pub fn qualify_reference_portable_runtime_closure_identity(
+) -> Result<Option<(String, usize)>, String> {
+    attest_reference_portable_runtime_closure()
+        .map(|closure| closure.map(|closure| (closure.digest.to_hex(), closure.entries.len())))
+        .map_err(|error| error.to_string())
 }
 
 pub(crate) fn reference_execution_identity_input(
@@ -513,6 +832,8 @@ pub(crate) async fn preflight_reference_rerun_authority(
         cancel,
         summary.front_end,
         metadata_enabled,
+        usize::from(summary.final_pcm.channels),
+        summary.certified_scan_tier(),
     )
     .await?;
     let original_authority = match &track.source_ref {
@@ -2035,7 +2356,6 @@ async fn qualified_ffmpeg_int32_dither_terminal_executable(
             QUALIFIED_FFMPEG_INT32_DITHER_VERSION, reported_version,
         )));
     }
-
     Ok(Some(QualifiedTerminalExecutableBinding {
         command_index,
         executable,
@@ -2133,6 +2453,8 @@ pub(crate) async fn execute_planned_track_conversion_with_scalar_pump(
                     cancel,
                     summary.front_end,
                     metadata_enabled,
+                    usize::from(summary.final_pcm.channels),
+                    summary.certified_scan_tier(),
                 )
                 .await?;
                 validate_reference_production_promotion(summary, &toolchain)?;
@@ -5281,7 +5603,9 @@ fn validate_embedded_reference_policy_tables(
         "0.445312500",
     ];
     const ANALYZER_MULTITONE_OFFSETS: [&str; 2] = ["0.250000000", "0.750000000"];
-    const ANALYZER_FLOAT32_PRODUCER_ARGS: [&str; 17] = [
+    const ANALYZER_FLOAT32_PRODUCER_ARGS: [&str; 19] = [
+        "-cpuflags",
+        tonepoet_pipeline::REFERENCE_FFMPEG_CPUFLAGS,
         "-nostdin",
         "-hide_banner",
         "-nostats",
@@ -5349,15 +5673,22 @@ fn validate_embedded_reference_policy_tables(
         "{sample_rate_hz_x16}",
         "stats",
     ];
-    let expected_environment = std::collections::BTreeMap::from([(
+    let expected_environment = std::collections::BTreeMap::from([
+        ("LC_ALL".to_string(), "C".to_string()),
+        (
+            tonepoet_pipeline::REFERENCE_SOXR_USE_SIMD_ENV.to_string(),
+            tonepoet_pipeline::REFERENCE_SOXR_USE_SIMD.to_string(),
+        ),
+    ]);
+    let expected_metadata_environment = std::collections::BTreeMap::from([(
         "LC_ALL".to_string(),
         "C".to_string(),
     )]);
     const PACKAGE_PRODUCER_ARGS: [&str; 11] = [
         "-S", "-D", "{qpcm_w64}", "-t", "raw", "-e", "floating-point", "-b", "64", "-L", "-",
     ];
-    const PACKAGE_CONSUMER_ARGS: [&str; 24] = [
-        "-y", "-hide_banner", "-nostdin", "-f", "f64le", "-ar", "{sample_rate_hz}",
+    const PACKAGE_CONSUMER_ARGS: [&str; 26] = [
+        "-cpuflags", tonepoet_pipeline::REFERENCE_FFMPEG_CPUFLAGS, "-y", "-hide_banner", "-nostdin", "-f", "f64le", "-ar", "{sample_rate_hz}",
         "-ac", "{channels}", "-i", "pipe:0", "-map", "0:a:0", "-map_metadata", "-1",
         "-vn", "-sn", "-dn", "-c:a", "pcm_f64le", "-f", "wav", "{rf64_args}", "{output}",
     ];
@@ -5500,7 +5831,7 @@ fn validate_embedded_reference_policy_tables(
         || manifest.sample_identity.metadata_mutation.qualification_scope
             != "authoritative_tag_mutation_without_artwork_or_replaygain"
         || manifest.sample_identity.metadata_mutation.environment_policy != "clear_and_set"
-        || manifest.sample_identity.metadata_mutation.environment != expected_environment
+        || manifest.sample_identity.metadata_mutation.environment != expected_metadata_environment
         || !manifest
             .sample_identity
             .metadata_mutation
@@ -5544,11 +5875,11 @@ fn validate_embedded_reference_policy_tables(
             .riff_odd_byte_int24_mono_probe
             != "qualified_via_exact_production_ffmpeg_route"
         || manifest.sample_identity.metadata_mutation.runtime_identity_binding
-            != "certified_report_to_compiled_store_to_runner_resolution"
+            != "attested_release_identity_to_package_activation_to_runner_resolution"
         || manifest.sample_identity.metadata_mutation.execution_authority
-            != "exact_canonical_path_plus_executable_sha256"
+            != "package_activation_path_plus_executable_sha256_plus_runtime_closure_manifest"
         || manifest.sample_identity.metadata_mutation.pre_mutation_reverification
-            != "path_sha256_version_closure"
+            != "portable_runtime_closure_plus_activation_path_sha256_version_release_identity"
         || manifest.sample_identity.metadata_mutation.per_output_authority
             != "ReferenceToolchainEvidence.metadata_mutators_and_execution_fingerprint_v1"
     {
@@ -5560,7 +5891,7 @@ fn validate_embedded_reference_policy_tables(
         != "tonepoet-reference-subprocess-environment/v1"
         || manifest.subprocess_environment.policy != "clear_and_set"
         || manifest.subprocess_environment.variables != expected_environment
-        || manifest.subprocess_environment.scope != "all_reference_external_commands"
+        || manifest.subprocess_environment.scope != "reference_audio_external_commands"
     {
         return Err(reference_toolchain_error(
             "embedded Reference subprocess environment policy is not canonical",
@@ -6497,7 +6828,7 @@ fn reference_common_runtime_closure_fingerprint(
     sacd_rs_build_identity: &str,
     dst_fixture_digest: Sha256Digest,
     platform_abi_digest: Sha256Digest,
-    runtime_dispatch_digest: Sha256Digest,
+    _runtime_dispatch_digest: Sha256Digest,
 ) -> Result<String, TrackExecutionError> {
     fn field(hasher: &mut Sha256, value: &[u8]) {
         hasher.update((value.len() as u64).to_be_bytes());
@@ -6543,7 +6874,6 @@ fn reference_common_runtime_closure_fingerprint(
             .to_be_bytes(),
     );
     for identity in [sox_ng, ffmpeg] {
-        field(&mut hasher, identity.canonical_path.to_string_lossy().as_bytes());
         field(&mut hasher, &identity.executable_sha256.0);
         field(&mut hasher, identity.reported_version.as_bytes());
         field(&mut hasher, &identity.closure_digest.0);
@@ -6552,7 +6882,13 @@ fn reference_common_runtime_closure_fingerprint(
     field(&mut hasher, sacd_rs_build_identity.as_bytes());
     field(&mut hasher, &dst_fixture_digest.0);
     field(&mut hasher, &platform_abi_digest.0);
-    field(&mut hasher, &runtime_dispatch_digest.0);
+    // The promoted closure admits the qualified dispatch SET.  Per-run execution
+    // identity separately records the concrete selected tier.  Binding the host's
+    // selected tier here would make a portable qualification machine-specific.
+    field(
+        &mut hasher,
+        tonepoet_pipeline::qualification_schema::REFERENCE_SIMD_BINDING.as_bytes(),
+    );
     Ok(format!("{:x}", hasher.finalize()))
 }
 
@@ -6578,10 +6914,6 @@ fn reference_metadata_mutation_closure_fingerprint(
         &metadata_mutators.wvtag,
         &metadata_mutators.atomic_parsley,
     ] {
-        field(
-            &mut hasher,
-            identity.canonical_path.to_string_lossy().as_bytes(),
-        );
         field(&mut hasher, &identity.executable_sha256.0);
         field(&mut hasher, identity.reported_version.as_bytes());
         field(&mut hasher, &identity.closure_digest.0);
@@ -6794,6 +7126,8 @@ async fn attest_reference_toolchain(
     cancel: &CancellationToken,
     front_end: tonepoet_pipeline::DsdInputFrontEnd,
     metadata_enabled: bool,
+    channels: usize,
+    scan_tier: tonepoet_pipeline::TruePeakScanTier,
 ) -> Result<ReferenceToolchainEvidence, TrackExecutionError> {
     let raw = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -6826,6 +7160,7 @@ async fn attest_reference_toolchain(
         ));
     }
     validate_embedded_reference_policy_tables(&manifest)?;
+    let portable_runtime_closure = attest_reference_portable_runtime_closure()?;
 
     let current_manifest_digest = Sha256Digest::of_bytes(raw.as_bytes());
     if current_manifest_digest != tonepoet_pipeline::qualification_manifest_digest() {
@@ -6936,6 +7271,7 @@ async fn attest_reference_toolchain(
         &manifest.sox_ng.version,
         None,
         &manifest.sox_ng.required_probe_markers,
+        portable_runtime_closure.as_ref(),
         runner,
         cancel,
     )
@@ -6945,6 +7281,7 @@ async fn attest_reference_toolchain(
         &manifest.ffmpeg.version,
         Some(manifest.ffmpeg.major_version),
         &manifest.ffmpeg.required_probe_markers,
+        portable_runtime_closure.as_ref(),
         runner,
         cancel,
     )
@@ -6953,18 +7290,21 @@ async fn attest_reference_toolchain(
         Some(ReferenceMetadataMutatorToolchain {
             metaflac: attest_reference_metadata_mutator(
                 ToolBinary::Metaflac,
+                portable_runtime_closure.as_ref(),
                 runner,
                 cancel,
             )
             .await?,
             wvtag: attest_reference_metadata_mutator(
                 ToolBinary::Wvtag,
+                portable_runtime_closure.as_ref(),
                 runner,
                 cancel,
             )
             .await?,
             atomic_parsley: attest_reference_metadata_mutator(
                 ToolBinary::AtomicParsley,
+                portable_runtime_closure.as_ref(),
                 runner,
                 cancel,
             )
@@ -6975,7 +7315,7 @@ async fn attest_reference_toolchain(
     };
 
     let platform_abi_digest = reference_platform_abi_digest();
-    let runtime_dispatch_digest = reference_runtime_dispatch_digest();
+    let runtime_dispatch_digest = qualified_reference_runtime_dispatch(channels, scan_tier)?;
     let actual_fixture_digest = sacd_rs::DST_REFERENCE_FIXTURE_CORPUS_ID
         .strip_prefix("sha256:")
         .ok_or_else(|| reference_toolchain_error(
@@ -7022,6 +7362,7 @@ async fn attest_reference_toolchain(
         dst_fixture_digest,
         platform_abi_digest,
         runtime_dispatch_digest,
+        portable_runtime_closure_digest: portable_runtime_closure.as_ref().map(|closure| closure.digest),
     })
 }
 
@@ -7080,6 +7421,13 @@ pub(crate) async fn verify_reference_metadata_toolchain_before_mutation(
             "Reference metadata mutation has no attested metadata-mutator toolchain",
         )
     })?;
+    let portable_runtime_closure = attest_reference_portable_runtime_closure()?;
+    let current_portable_digest = portable_runtime_closure.as_ref().map(|closure| closure.digest);
+    if current_portable_digest != toolchain.portable_runtime_closure_digest {
+        return Err(reference_toolchain_error(
+            "portable Reference runtime-closure identity drift before metadata mutation",
+        ));
+    }
     for binary in [
         ToolBinary::Ffmpeg,
         ToolBinary::Metaflac,
@@ -7115,23 +7463,15 @@ pub(crate) async fn verify_reference_metadata_toolchain_before_mutation(
                 binary.canonical_name()
             ))
         })?;
-        let compiled_path = compiled_reference_executable_path(binary).map_err(|error| {
-            reference_toolchain_error(format!(
-                "could not resolve compiled {} before metadata mutation: {error}",
-                binary.canonical_name()
-            ))
-        })?;
         if resolved_path.as_path() != canonical_path.as_path()
             || activation_path.as_path() != canonical_path.as_path()
-            || compiled_path.as_path() != canonical_path.as_path()
         {
             return Err(reference_toolchain_error(format!(
-                "{} metadata path drift: attested {}, runtime {}, activation {}, compiled {}",
+                "{} metadata path drift: attested {}, runtime {}, activation {}",
                 binary.canonical_name(),
                 canonical_path.display(),
                 resolved_path.display(),
                 activation_path.display(),
-                compiled_path.display(),
             )));
         }
         let actual_sha256 = stable_file_sha256(canonical_path).map_err(|error| {
@@ -7152,6 +7492,7 @@ pub(crate) async fn verify_reference_metadata_toolchain_before_mutation(
             canonical_path,
             executable_sha256,
             reported_version,
+            portable_runtime_closure.as_ref(),
         )?;
         if actual_closure != closure_digest {
             return Err(reference_toolchain_error(format!(
@@ -7226,6 +7567,7 @@ async fn attest_external_reference_tool(
     exact_version: &str,
     required_major_version: Option<u32>,
     required_probe_markers: &[String],
+    portable_runtime_closure: Option<&ReferencePortableRuntimeClosure>,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
 ) -> Result<ReferenceToolIdentity, TrackExecutionError> {
@@ -7247,19 +7589,12 @@ async fn attest_external_reference_tool(
             binary.canonical_name()
         ))
     })?;
-    let compiled_path = compiled_reference_executable_path(binary).map_err(|err| {
-        reference_toolchain_error(format!(
-            "could not resolve the compiled {} closure: {err}",
-            binary.canonical_name()
-        ))
-    })?;
-    if path != policy_path || path != compiled_path {
+    if path != policy_path {
         return Err(reference_toolchain_error(format!(
-            "{} runner path {}, activation path {}, and compiled closure path {} do not match",
+            "{} runner path {} does not match package activation path {}",
             binary.canonical_name(),
             path.display(),
-            policy_path.display(),
-            compiled_path.display()
+            policy_path.display()
         )));
     }
     let executable_sha256 = stable_file_sha256(&path).map_err(|err| {
@@ -7355,8 +7690,13 @@ async fn attest_external_reference_tool(
         )
         .as_bytes(),
     );
-    let closure_digest =
-        reference_installation_identity(binary, &path, executable_sha256, &reported_version)?;
+    let closure_digest = reference_installation_identity(
+        binary,
+        &path,
+        executable_sha256,
+        &reported_version,
+        portable_runtime_closure,
+    )?;
 
     Ok(ReferenceToolIdentity {
         canonical_path: path,
@@ -7371,6 +7711,7 @@ async fn attest_external_reference_tool(
 
 async fn attest_reference_metadata_mutator(
     binary: ToolBinary,
+    portable_runtime_closure: Option<&ReferencePortableRuntimeClosure>,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
 ) -> Result<ReferenceMetadataMutatorIdentity, TrackExecutionError> {
@@ -7392,19 +7733,12 @@ async fn attest_reference_metadata_mutator(
             binary.canonical_name()
         ))
     })?;
-    let compiled_path = compiled_reference_executable_path(binary).map_err(|error| {
-        reference_toolchain_error(format!(
-            "could not resolve the compiled {} closure: {error}",
-            binary.canonical_name()
-        ))
-    })?;
-    if resolved_path != activation_path || resolved_path != compiled_path {
+    if resolved_path != activation_path {
         return Err(reference_toolchain_error(format!(
-            "{} runtime path {}, activation path {}, and compiled closure path {} do not match",
+            "{} runtime path {} does not match package activation path {}",
             binary.canonical_name(),
             resolved_path.display(),
             activation_path.display(),
-            compiled_path.display(),
         )));
     }
     let executable_sha256 = stable_file_sha256(&resolved_path).map_err(|error| {
@@ -7443,6 +7777,7 @@ async fn attest_reference_metadata_mutator(
         &resolved_path,
         executable_sha256,
         &reported_version,
+        portable_runtime_closure,
     )?;
     Ok(ReferenceMetadataMutatorIdentity {
         canonical_path: resolved_path,
@@ -7557,13 +7892,73 @@ fn reference_installation_identity(
     path: &Path,
     executable_sha256: Sha256Digest,
     reported_version: &str,
+    portable_runtime_closure: Option<&ReferencePortableRuntimeClosure>,
 ) -> Result<Sha256Digest, TrackExecutionError> {
     let store = compiled_reference_store_path(binary).ok_or_else(|| {
         reference_toolchain_error(format!(
-            "the binary lacks an immutable {} Reference store binding",
+            "the binary lacks an immutable {} Reference build-provenance binding",
             binary.canonical_name()
         ))
     })?;
+    if let Some(closure) = portable_runtime_closure {
+        let relative = path.strip_prefix(&closure.root).map_err(|_| {
+            reference_toolchain_error(format!(
+                "{} executable {} is outside the attested portable runtime closure {}",
+                binary.canonical_name(),
+                path.display(),
+                closure.root.display()
+            ))
+        })?;
+        let relative = reference_runtime_closure_relative_path(relative).map_err(|error| {
+            reference_toolchain_error(format!(
+                "{} executable has an invalid runtime-closure path: {error}",
+                binary.canonical_name()
+            ))
+        })?;
+        match closure.entries.get(&relative) {
+            Some(ReferenceRuntimeClosureEntryIdentity::File(digest))
+                if *digest == executable_sha256 => {}
+            Some(_) => {
+                return Err(reference_toolchain_error(format!(
+                    "{} executable does not match its attested runtime-closure entry {relative}",
+                    binary.canonical_name()
+                )));
+            }
+            None => {
+                return Err(reference_toolchain_error(format!(
+                    "{} executable is not present in the attested runtime-closure manifest",
+                    binary.canonical_name()
+                )));
+            }
+        }
+        let identity = format!(
+            "portable-runtime-closure/v1\0{}\0{}\0{}\0{}\0{}",
+            binary.canonical_name(),
+            store,
+            closure.digest.to_hex(),
+            executable_sha256.to_hex(),
+            reported_version
+        );
+        return Ok(Sha256Digest::of_bytes(identity.as_bytes()));
+    }
+
+    // Legacy Nix development/qualification mode remains fail-closed and path-bound.
+    // Portable release qualification must set the closure-manifest environment and
+    // therefore takes the branch above.
+    let compiled_path = compiled_reference_executable_path(binary).map_err(|error| {
+        reference_toolchain_error(format!(
+            "could not resolve the compiled {} closure: {error}",
+            binary.canonical_name()
+        ))
+    })?;
+    if path != compiled_path {
+        return Err(reference_toolchain_error(format!(
+            "{} runtime path {} does not match compiled closure path {} without a portable runtime-closure manifest",
+            binary.canonical_name(),
+            path.display(),
+            compiled_path.display()
+        )));
+    }
     let installation = format!(
         "nix-store-closure/v2\0{}\0{}\0{}\0{}",
         store,
@@ -7609,41 +8004,45 @@ fn reference_platform_abi_digest() -> Sha256Digest {
     Sha256Digest::of_bytes(identity.as_bytes())
 }
 
-fn reference_runtime_dispatch_digest() -> Sha256Digest {
-    let mut features = Vec::new();
-    #[cfg(target_arch = "x86_64")]
-    {
-        for (name, enabled) in [
-            ("sse2", std::is_x86_feature_detected!("sse2")),
-            ("sse3", std::is_x86_feature_detected!("sse3")),
-            ("ssse3", std::is_x86_feature_detected!("ssse3")),
-            ("sse4.1", std::is_x86_feature_detected!("sse4.1")),
-            ("sse4.2", std::is_x86_feature_detected!("sse4.2")),
-            ("avx", std::is_x86_feature_detected!("avx")),
-            ("avx2", std::is_x86_feature_detected!("avx2")),
-            ("fma", std::is_x86_feature_detected!("fma")),
-        ] {
-            if enabled {
-                features.push(name);
-            }
-        }
+fn qualified_reference_runtime_dispatch(
+    channels: usize,
+    scan_tier: tonepoet_pipeline::TruePeakScanTier,
+) -> Result<Sha256Digest, TrackExecutionError> {
+    if std::env::consts::ARCH != "x86_64" {
+        return Err(reference_toolchain_error(format!(
+            "Reference portable dispatch qualification currently supports x86_64, not {}",
+            std::env::consts::ARCH
+        )));
     }
-    #[cfg(target_arch = "aarch64")]
+    let loudness = tonepoet_true_peak::loudness::production_loudness_simd_backend_for_qualification(channels)
+        .qualification_name();
+    if !tonepoet_pipeline::qualification_schema::REFERENCE_QUALIFIED_X86_64_LOUDNESS_DISPATCH_TIERS
+        .contains(&loudness)
     {
-        for (name, enabled) in [
-            ("neon", std::arch::is_aarch64_feature_detected!("neon")),
-        ] {
-            if enabled {
-                features.push(name);
-            }
-        }
+        return Err(reference_toolchain_error(format!(
+            "runtime loudness dispatch tier {loudness} was not qualified"
+        )));
+    }
+    let peak_tier = match scan_tier {
+        tonepoet_pipeline::TruePeakScanTier::Reference => tonepoet_true_peak::PeakTier::Reference,
+        tonepoet_pipeline::TruePeakScanTier::Standard => tonepoet_true_peak::PeakTier::Standard,
+        tonepoet_pipeline::TruePeakScanTier::Fast => tonepoet_true_peak::PeakTier::Fast,
+    };
+    let certified_peak = tonepoet_true_peak::production_certified_peak_simd_backend_for_qualification(peak_tier)
+        .qualification_name();
+    if !tonepoet_pipeline::qualification_schema::REFERENCE_QUALIFIED_X86_64_CERTIFIED_PEAK_DISPATCH_TIERS
+        .contains(&certified_peak)
+    {
+        return Err(reference_toolchain_error(format!(
+            "runtime certified-peak dispatch tier {certified_peak} was not qualified"
+        )));
     }
     let identity = format!(
-        "tonepoet-reference-runtime-dispatch/v1\0{}\0{}",
-        std::env::consts::ARCH,
-        features.join(",")
+        "tonepoet-reference-runtime-dispatch/v3\0x86_64\0loudness={loudness}\0certified_peak={certified_peak}\0ffmpeg={}\0libsoxr={}=0",
+        tonepoet_pipeline::REFERENCE_FFMPEG_CPUFLAGS,
+        tonepoet_pipeline::REFERENCE_SOXR_USE_SIMD_ENV,
     );
-    Sha256Digest::of_bytes(identity.as_bytes())
+    Ok(Sha256Digest::of_bytes(identity.as_bytes()))
 }
 
 
@@ -9337,6 +9736,8 @@ pub async fn qualify_reference_common_candidate_execution(
         cancel,
         summary.front_end,
         metadata_enabled,
+        usize::from(summary.final_pcm.channels),
+        summary.certified_scan_tier(),
     )
     .await?;
     // Deliberately no production-promotion validation here. Candidate execution
@@ -9414,7 +9815,13 @@ struct ReferenceCarrierProbe {
 }
 
 fn canonical_reference_environment() -> BTreeMap<String, String> {
-    BTreeMap::from([("LC_ALL".to_string(), "C".to_string())])
+    BTreeMap::from([
+        ("LC_ALL".to_string(), "C".to_string()),
+        (
+            tonepoet_pipeline::REFERENCE_SOXR_USE_SIMD_ENV.to_string(),
+            tonepoet_pipeline::REFERENCE_SOXR_USE_SIMD.to_string(),
+        ),
+    ])
 }
 
 fn build_reference_carrier_probe_command(
@@ -9524,7 +9931,10 @@ fn build_reference_float64_w64_hash_pipeline(
 
     let mut consumer = PlannedCommand::new(
         ToolIdentifier::Ffmpeg,
-        vec![
+        tonepoet_pipeline::REFERENCE_FFMPEG_CPUFLAGS_ARGS
+            .into_iter()
+            .map(str::to_string)
+            .chain([
             "-hide_banner".to_string(),
             "-nostdin".to_string(),
             "-loglevel".to_string(),
@@ -9551,7 +9961,8 @@ fn build_reference_float64_w64_hash_pipeline(
             "-hash".to_string(),
             "sha256".to_string(),
             "-".to_string(),
-        ],
+            ])
+            .collect(),
         tonepoet_pipeline::InputSource::Stdin,
         tonepoet_pipeline::OutputSink::Stdout,
         None,
@@ -9853,7 +10264,10 @@ fn reference_carrier_probe_digest(
 fn reference_hash_args(carrier: &ReferenceDecodedCarrier) -> Vec<String> {
     let path = carrier.path();
     let authority = carrier.authority();
-    vec![
+    tonepoet_pipeline::REFERENCE_FFMPEG_CPUFLAGS_ARGS
+        .into_iter()
+        .map(str::to_string)
+        .chain([
         "-hide_banner".to_string(),
         "-nostdin".to_string(),
         "-loglevel".to_string(),
@@ -9874,7 +10288,8 @@ fn reference_hash_args(carrier: &ReferenceDecodedCarrier) -> Vec<String> {
         "-hash".to_string(),
         "sha256".to_string(),
         "-".to_string(),
-    ]
+        ])
+        .collect()
 }
 
 fn parse_reference_hash_output(text: &str) -> Result<Sha256Digest, String> {
@@ -10043,7 +10458,10 @@ fn build_reference_ffmpeg_full_traversal_command(
 ) -> PlannedCommand {
     let mut command = PlannedCommand::new(
         ToolIdentifier::Ffmpeg,
-        vec![
+        tonepoet_pipeline::REFERENCE_FFMPEG_CPUFLAGS_ARGS
+            .into_iter()
+            .map(str::to_string)
+            .chain([
             "-hide_banner".to_string(),
             "-nostdin".to_string(),
             "-loglevel".to_string(),
@@ -10061,7 +10479,8 @@ fn build_reference_ffmpeg_full_traversal_command(
             "-f".to_string(),
             "null".to_string(),
             "-".to_string(),
-        ],
+            ])
+            .collect(),
         tonepoet_pipeline::InputSource::Path(path.to_path_buf()),
         tonepoet_pipeline::OutputSink::Stdout,
         None,
@@ -10386,11 +10805,10 @@ pub(crate) async fn verify_reference_output_after_metadata(
     Ok(())
 }
 
-fn reference_command_environment_is_canonical(command: &PlannedCommand) -> bool {
+fn reference_audio_environment_is_canonical(command: &PlannedCommand) -> bool {
     command.environment_policy
         == tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet
-        && command.environment.len() == 1
-        && command.environment.get("LC_ALL").map(String::as_str) == Some("C")
+        && command.environment == canonical_reference_environment()
 }
 
 fn validate_reference_package_pipeline(
@@ -10438,7 +10856,7 @@ fn validate_reference_package_pipeline(
             .iter()
             .map(String::as_str)
             .eq(expected_producer)
-        || !reference_command_environment_is_canonical(&pipeline.producer)
+        || !reference_audio_environment_is_canonical(&pipeline.producer)
     {
         return Err(TrackExecutionError::new(
             ConvertError::Backend(
@@ -10453,6 +10871,8 @@ fn validate_reference_package_pipeline(
     let sample_rate = summary.final_pcm.sample_rate_hz.to_string();
     let channels = summary.final_pcm.channels.to_string();
     let mut expected_consumer = vec![
+        "-cpuflags",
+        tonepoet_pipeline::REFERENCE_FFMPEG_CPUFLAGS,
         "-y",
         "-hide_banner",
         "-nostdin",
@@ -10489,7 +10909,7 @@ fn validate_reference_package_pipeline(
             .iter()
             .map(String::as_str)
             .eq(expected_consumer)
-        || !reference_command_environment_is_canonical(&pipeline.consumer)
+        || !reference_audio_environment_is_canonical(&pipeline.consumer)
     {
         return Err(TrackExecutionError::new(
             ConvertError::Backend(
@@ -11672,7 +12092,7 @@ fn track_label(track: &PreparedTrack) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap};
-    use std::path::{Path, PathBuf};
+    use std::path::{Component, Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -12063,7 +12483,7 @@ mod tests {
 
     #[test]
     fn reference_evidence_subprocesses_clear_and_set_exact_environment() {
-        let expected = BTreeMap::from([("LC_ALL".to_string(), "C".to_string())]);
+        let expected = canonical_reference_environment();
         let path = PathBuf::from("carrier.w64");
         let probe = build_reference_carrier_probe_command(&path, "carrier", "-r", "sample rate");
         assert_eq!(
@@ -12520,6 +12940,24 @@ mod tests {
             core, unchanged_core,
             "optional metadata identity must not split the core runtime closure"
         );
+
+        let mut relocated_sox = sox.clone();
+        relocated_sox.canonical_path = PathBuf::from("/opt/tonepoet/libexec/sox");
+        let relocated_core = reference_common_runtime_closure_fingerprint(
+            candidate_bytes,
+            &candidate,
+            &relocated_sox,
+            &ffmpeg,
+            "test-sacd-rs",
+            fixture,
+            platform,
+            Sha256Digest::of_bytes(b"different-admitted-runtime-tier"),
+        )
+        .expect("relocated qualified closure hashes");
+        assert_eq!(
+            core, relocated_core,
+            "portable closure identity must not bind install prefix or the host-selected admitted tier"
+        );
     }
 
     #[test]
@@ -12605,6 +13043,7 @@ mod tests {
             dst_fixture_digest: Sha256Digest::of_bytes(b"test-fixture"),
             platform_abi_digest: Sha256Digest::of_bytes(b"test-platform"),
             runtime_dispatch_digest: Sha256Digest::of_bytes(b"test-dispatch"),
+            portable_runtime_closure_digest: None,
         };
 
         validate_reference_production_promotion_preflight(metadata_disabled_summary)
