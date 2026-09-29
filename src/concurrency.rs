@@ -4893,9 +4893,9 @@ mod tests {
     fn oversized_schema_two_descriptor_fails_before_any_lease_is_published() {
         let scope = scoped_test_coordination_root();
         let family = LeaseFamily::EphemeralMutation { claim_id: Uuid::new_v4() };
-        let error = PersistentLease::acquire(
+        let error = PersistentLease::create(
             family.clone(),
-            synthetic_descriptor_claims(4_000, 320),
+            &synthetic_descriptor_claims(4_000, 320),
         )
         .expect_err("genuinely oversized schema-2 descriptor must fail closed");
         assert!(
