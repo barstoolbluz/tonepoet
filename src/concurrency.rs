@@ -17,7 +17,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-const DESCRIPTOR_SCHEMA: u32 = 1;
+const DESCRIPTOR_SCHEMA_LEGACY: u32 = 1;
+const DESCRIPTOR_SCHEMA: u32 = 2;
 const DESCRIPTOR_MAX_BYTES: u64 = 1024 * 1024;
 const EXECUTION_STAGING_RETIRE_CONTENTION_BUDGET: Duration = Duration::from_millis(250);
 const EXECUTION_STAGING_RETIRE_CONTENTION_SLEEP: Duration = Duration::from_millis(2);
@@ -779,6 +780,184 @@ struct LeaseDescriptor {
     coordination_group: Option<String>,
 }
 
+
+/// Compact schema-2 wire identity. Path spellings are interned into the
+/// descriptor-level table, so the same lossless pathname is never repeated in
+/// every identity field of every claim. The in-memory `LeaseDescriptor` remains
+/// unchanged; this is only the durable representation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CompactResolvedPathIdentity {
+    original: u32,
+    namespace_path: u32,
+    #[serde(default)]
+    namespace_dependencies: Vec<u32>,
+    resolved_io_path: u32,
+    canonical_existing_ancestor: u32,
+    suffix: u32,
+    #[serde(default)]
+    dev: Option<u64>,
+    #[serde(default)]
+    ino: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CompactPathClaim {
+    identity: CompactResolvedPathIdentity,
+    mode: ClaimMode,
+    scope: ClaimScope,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LeaseDescriptorWireV2 {
+    schema: u32,
+    descriptor_id: Uuid,
+    family: LeaseFamily,
+    owner: OwnerProcessIdentity,
+    created_unix_ms: u64,
+    #[serde(
+        serialize_with = "lossless_path_serde::serialize_vec",
+        deserialize_with = "lossless_path_serde::deserialize_vec"
+    )]
+    paths: Vec<PathBuf>,
+    #[serde(default)]
+    claims: Vec<CompactPathClaim>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    coordination_group: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+struct LeaseDescriptorSchemaProbe {
+    schema: u32,
+}
+
+#[derive(Default)]
+struct DescriptorPathInterner {
+    paths: Vec<PathBuf>,
+    indexes: HashMap<PathBuf, u32>,
+}
+
+impl DescriptorPathInterner {
+    fn intern(&mut self, path: &Path) -> Result<u32, String> {
+        if let Some(index) = self.indexes.get(path) {
+            return Ok(*index);
+        }
+        let index = u32::try_from(self.paths.len())
+            .map_err(|_| "persistent lease descriptor contains too many distinct paths".to_string())?;
+        let owned = path.to_path_buf();
+        self.paths.push(owned.clone());
+        self.indexes.insert(owned, index);
+        Ok(index)
+    }
+}
+
+fn compact_claim(
+    paths: &mut DescriptorPathInterner,
+    claim: &PathClaim,
+) -> Result<CompactPathClaim, String> {
+    let identity = &claim.identity;
+    Ok(CompactPathClaim {
+        identity: CompactResolvedPathIdentity {
+            original: paths.intern(&identity.original)?,
+            namespace_path: paths.intern(&identity.namespace_path)?,
+            namespace_dependencies: identity
+                .namespace_dependencies
+                .iter()
+                .map(|path| paths.intern(path))
+                .collect::<Result<Vec<_>, _>>()?,
+            resolved_io_path: paths.intern(&identity.resolved_io_path)?,
+            canonical_existing_ancestor: paths.intern(&identity.canonical_existing_ancestor)?,
+            suffix: paths.intern(&identity.suffix)?,
+            dev: identity.dev,
+            ino: identity.ino,
+        },
+        mode: claim.mode,
+        scope: claim.scope,
+    })
+}
+
+fn compact_path<'a>(paths: &'a [PathBuf], index: u32) -> Result<&'a PathBuf, String> {
+    paths.get(index as usize).ok_or_else(|| {
+        format!("persistent lease schema-2 path index {index} is outside the path table")
+    })
+}
+
+fn expand_claim(paths: &[PathBuf], claim: CompactPathClaim) -> Result<PathClaim, String> {
+    let identity = claim.identity;
+    Ok(PathClaim {
+        identity: ResolvedPathIdentity {
+            original: compact_path(paths, identity.original)?.clone(),
+            namespace_path: compact_path(paths, identity.namespace_path)?.clone(),
+            namespace_dependencies: identity
+                .namespace_dependencies
+                .into_iter()
+                .map(|index| compact_path(paths, index).cloned())
+                .collect::<Result<Vec<_>, _>>()?,
+            resolved_io_path: compact_path(paths, identity.resolved_io_path)?.clone(),
+            canonical_existing_ancestor: compact_path(paths, identity.canonical_existing_ancestor)?.clone(),
+            suffix: compact_path(paths, identity.suffix)?.clone(),
+            dev: identity.dev,
+            ino: identity.ino,
+        },
+        mode: claim.mode,
+        scope: claim.scope,
+    })
+}
+
+fn encode_descriptor_for_storage(descriptor: &LeaseDescriptor) -> Result<Vec<u8>, String> {
+    if descriptor.schema != DESCRIPTOR_SCHEMA {
+        return Err(format!(
+            "cannot encode persistent lease schema {} with schema-2 encoder",
+            descriptor.schema
+        ));
+    }
+    let mut paths = DescriptorPathInterner::default();
+    let claims = descriptor
+        .claims
+        .iter()
+        .map(|claim| compact_claim(&mut paths, claim))
+        .collect::<Result<Vec<_>, _>>()?;
+    let wire = LeaseDescriptorWireV2 {
+        schema: DESCRIPTOR_SCHEMA,
+        descriptor_id: descriptor.descriptor_id,
+        family: descriptor.family.clone(),
+        owner: descriptor.owner,
+        created_unix_ms: descriptor.created_unix_ms,
+        paths: paths.paths,
+        claims,
+        coordination_group: descriptor.coordination_group.clone(),
+    };
+    serde_json::to_vec(&wire)
+        .map_err(|error| format!("serialize persistent lease schema 2: {error}"))
+}
+
+fn decode_descriptor_from_storage(bytes: &[u8]) -> Result<LeaseDescriptor, String> {
+    let probe: LeaseDescriptorSchemaProbe = serde_json::from_slice(bytes)
+        .map_err(|error| format!("decode persistent lease schema: {error}"))?;
+    match probe.schema {
+        DESCRIPTOR_SCHEMA_LEGACY => serde_json::from_slice(bytes)
+            .map_err(|error| format!("decode persistent lease schema 1: {error}")),
+        DESCRIPTOR_SCHEMA => {
+            let wire: LeaseDescriptorWireV2 = serde_json::from_slice(bytes)
+                .map_err(|error| format!("decode persistent lease schema 2: {error}"))?;
+            let claims = wire
+                .claims
+                .into_iter()
+                .map(|claim| expand_claim(&wire.paths, claim))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(LeaseDescriptor {
+                schema: DESCRIPTOR_SCHEMA,
+                descriptor_id: wire.descriptor_id,
+                family: wire.family,
+                owner: wire.owner,
+                created_unix_ms: wire.created_unix_ms,
+                claims,
+                coordination_group: wire.coordination_group,
+            })
+        }
+        schema => Err(format!("unsupported persistent lease schema {schema}")),
+    }
+}
+
 pub struct PersistentLease {
     file: Arc<File>,
     descriptor_path: PathBuf,
@@ -1296,8 +1475,15 @@ impl PersistentLease {
             claims: descriptor_claims,
             coordination_group,
         };
-        let encoded = serde_json::to_vec(&body)
+        let encoded = encode_descriptor_for_storage(&body)
             .map_err(|e| format!("serialize persistent lease {}: {e}", path.display()))?;
+        if encoded.len() as u64 > DESCRIPTOR_MAX_BYTES {
+            return Err(format!(
+                "persistent lease descriptor exceeds {} bytes before publication: {}",
+                DESCRIPTOR_MAX_BYTES,
+                path.display()
+            ));
+        }
         // EphemeralMutation has no post-crash recovery authority: after a
         // machine loss every holder is dead and its unlocked descriptor is
         // reclaimable. Durable lifecycle families, by contrast, must preserve
@@ -2149,11 +2335,8 @@ fn read_descriptor_from(file: &mut File, path: &Path) -> Result<LeaseDescriptor,
     file.seek(SeekFrom::Start(0)).map_err(|e| format!("seek persistent lease {}: {e}", path.display()))?;
     let mut bytes = Vec::with_capacity(descriptor_metadata.len() as usize);
     file.read_to_end(&mut bytes).map_err(|e| format!("read persistent lease {}: {e}", path.display()))?;
-    let descriptor: LeaseDescriptor = serde_json::from_slice(&bytes)
+    let descriptor = decode_descriptor_from_storage(&bytes)
         .map_err(|e| format!("decode persistent lease {}: {e}", path.display()))?;
-    if descriptor.schema != DESCRIPTOR_SCHEMA {
-        return Err(format!("unsupported persistent lease schema {} in {}", descriptor.schema, path.display()));
-    }
     if !path_matches_family(path, &descriptor.family, descriptor.descriptor_id) {
         return Err(format!("persistent lease pathname/body identity mismatch: {}", path.display()));
     }
@@ -4624,6 +4807,111 @@ mod tests {
                 "dropping the last local holder must prune the weak co-hold index"
             );
         });
+    }
+
+
+    fn synthetic_descriptor_claims(count: usize, tail_len: usize) -> Vec<PathClaim> {
+        let common_ancestor = PathBuf::from("/tmp");
+        let common_suffix = PathBuf::from("leaf");
+        (0..count)
+            .map(|index| {
+                let path = PathBuf::from(format!(
+                    "/tmp/tonepoet-lease-{index:05}-{}",
+                    "x".repeat(tail_len)
+                ));
+                PathClaim {
+                    identity: ResolvedPathIdentity {
+                        original: path.clone(),
+                        namespace_path: path.clone(),
+                        namespace_dependencies: Vec::new(),
+                        resolved_io_path: path,
+                        canonical_existing_ancestor: common_ancestor.clone(),
+                        suffix: common_suffix.clone(),
+                        dev: None,
+                        ino: None,
+                    },
+                    mode: ClaimMode::Write,
+                    scope: ClaimScope::Exact,
+                }
+            })
+            .collect()
+    }
+
+    fn synthetic_lease_descriptor(schema: u32, claims: Vec<PathClaim>) -> LeaseDescriptor {
+        LeaseDescriptor {
+            schema,
+            descriptor_id: Uuid::new_v4(),
+            family: LeaseFamily::JournalOperation { job_id: Uuid::new_v4() },
+            owner: OwnerProcessIdentity::current(),
+            created_unix_ms: unix_ms(),
+            claims,
+            coordination_group: None,
+        }
+    }
+
+    #[test]
+    fn schema_two_compacts_large_legitimate_claim_sets_below_reader_bound() {
+        let descriptor = synthetic_lease_descriptor(
+            DESCRIPTOR_SCHEMA,
+            synthetic_descriptor_claims(2_500, 96),
+        );
+        let mut legacy = descriptor.clone();
+        legacy.schema = DESCRIPTOR_SCHEMA_LEGACY;
+        let legacy_bytes = serde_json::to_vec(&legacy).expect("serialize legacy descriptor");
+        assert!(
+            legacy_bytes.len() as u64 > DESCRIPTOR_MAX_BYTES,
+            "fixture must reproduce the schema-1 descriptor inflation"
+        );
+
+        let compact = encode_descriptor_for_storage(&descriptor).expect("encode schema-2 descriptor");
+        assert!(
+            compact.len() as u64 <= DESCRIPTOR_MAX_BYTES,
+            "schema-2 descriptor must stay within the unchanged reader safety bound: {} bytes",
+            compact.len()
+        );
+        let decoded = decode_descriptor_from_storage(&compact).expect("decode schema-2 descriptor");
+        assert_eq!(decoded.claims, descriptor.claims);
+        assert_eq!(decoded.family, descriptor.family);
+        assert_eq!(decoded.descriptor_id, descriptor.descriptor_id);
+    }
+
+    #[test]
+    fn reader_accepts_legacy_schema_one_descriptors() {
+        let legacy = synthetic_lease_descriptor(
+            DESCRIPTOR_SCHEMA_LEGACY,
+            synthetic_descriptor_claims(3, 8),
+        );
+        let bytes = serde_json::to_vec(&legacy).expect("serialize schema-1 descriptor");
+        let decoded = decode_descriptor_from_storage(&bytes).expect("decode legacy descriptor");
+        assert_eq!(decoded.schema, DESCRIPTOR_SCHEMA_LEGACY);
+        assert_eq!(decoded.descriptor_id, legacy.descriptor_id);
+        assert_eq!(decoded.family, legacy.family);
+        assert_eq!(decoded.claims, legacy.claims);
+    }
+
+    #[test]
+    fn oversized_schema_two_descriptor_fails_before_any_lease_is_published() {
+        let scope = scoped_test_coordination_root();
+        let family = LeaseFamily::EphemeralMutation { claim_id: Uuid::new_v4() };
+        let error = PersistentLease::acquire(
+            family.clone(),
+            synthetic_descriptor_claims(4_000, 320),
+        )
+        .expect_err("genuinely oversized schema-2 descriptor must fail closed");
+        assert!(
+            error.contains("exceeds 1048576 bytes before publication"),
+            "unexpected oversized-descriptor error: {error}"
+        );
+        let family_dir = scope.path().join(family.namespace());
+        let published = std::fs::read_dir(&family_dir)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry.path().extension().and_then(|v| v.to_str()) == Some("lease"))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        assert!(published.is_empty(), "oversized descriptor published a lease pathname");
     }
 
     #[cfg(unix)]
