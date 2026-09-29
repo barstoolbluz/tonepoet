@@ -824,6 +824,14 @@ impl CertifiedTwoXEngine {
     fn fast90_same_graph_avx_active(&self) -> bool {
         self.inner.fast90_same_graph_avx_active()
     }
+
+    fn force_fast90_same_graph_avx_for_qualification(
+        &mut self,
+        enabled: bool,
+    ) -> Result<(), &'static str> {
+        self.inner
+            .force_fast90_same_graph_avx_for_qualification(enabled)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3851,6 +3859,31 @@ impl CertifiedPeakMeterImpl {
             frames: 0,
             input_channel_peaks: vec![0.0; channels],
         })
+    }
+
+    pub(super) fn force_simd_backend_for_qualification(
+        &mut self,
+        use_avx: bool,
+    ) -> Result<(), &'static str> {
+        if self.started || self.frames != 0 {
+            return Err("cannot change certified-peak dispatch after input");
+        }
+        match self.scanner.policy {
+            SearchPolicy::Reference9 if use_avx => {
+                return Err("Reference9 has no admitted AVX prefix executor");
+            }
+            SearchPolicy::Reference9 => {
+                self.engine
+                    .force_fast90_same_graph_avx_for_qualification(false)?;
+            }
+            SearchPolicy::Fast90 | SearchPolicy::RetiredClockFast1s => {
+                self.engine
+                    .force_fast90_same_graph_avx_for_qualification(use_avx)?;
+            }
+        }
+        self.scanner.diagnostics.accelerated_same_graph_avx_prefix_active =
+            self.engine.fast90_same_graph_avx_active();
+        Ok(())
     }
 
     pub(super) fn push_interleaved(&mut self, samples: &[f64]) -> Result<(), TruePeakError> {

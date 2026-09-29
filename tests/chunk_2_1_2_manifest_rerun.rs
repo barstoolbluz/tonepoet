@@ -185,14 +185,27 @@ fn changed_source_forces_redo() {
 fn stale_publish_temp_cleanup_matches_real_tmp_prefix() {
     let temp = tempfile::tempdir().unwrap();
     let album_dir = temp.path().join("Album");
-    let real_publish_tmp = temp.path().join(".Album.tmp-123");
+    let legacy_publish_tmp = temp.path().join(".Album.tmp-123");
+    let compact_token = {
+        use sha2::{Digest, Sha256};
+        let digest = hex::encode(Sha256::digest(b"Album"));
+        digest[..24].to_owned()
+    };
+    let compact_publish_tmp = temp
+        .path()
+        .join(format!(".tonepoet-tmp-{compact_token}-123"));
     let unrelated_partial = temp.path().join(".Album.partial-123");
-    fs::create_dir_all(&real_publish_tmp).unwrap();
+    fs::create_dir_all(&legacy_publish_tmp).unwrap();
+    fs::create_dir_all(&compact_publish_tmp).unwrap();
     fs::create_dir_all(&unrelated_partial).unwrap();
 
-    let deleted = delete_stale_publish_temp_dirs(&album_dir).unwrap();
-    assert_eq!(deleted, vec![real_publish_tmp.clone()]);
-    assert!(!real_publish_tmp.exists());
+    let mut deleted = delete_stale_publish_temp_dirs(&album_dir).unwrap();
+    deleted.sort();
+    let mut expected = vec![legacy_publish_tmp.clone(), compact_publish_tmp.clone()];
+    expected.sort();
+    assert_eq!(deleted, expected);
+    assert!(!legacy_publish_tmp.exists());
+    assert!(!compact_publish_tmp.exists());
     assert!(unrelated_partial.exists());
 }
 

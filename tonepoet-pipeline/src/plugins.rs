@@ -25,8 +25,7 @@ pub enum SsrcDitherAvailability {
     /// SSRC owns the resolved native dither/PDF pair.
     Active,
     /// A derived global family has no native SSRC mapping for this terminal cell.
-    /// The semantic planner may split to a later terminal when no explicit native
-    /// override requires SSRC ownership.
+    /// Callers must not construct an SSRC terminal command from this result.
     UnavailableForSsrcTerminal {
         /// Explanation of why the requested terminal cell has no native mapping.
         reason: String,
@@ -80,9 +79,43 @@ impl ResolvedSsrcDither {
 /// Dither belongs to the final integer write, not to a comparison between the
 /// source and destination nominal widths. Float/nonterminal SSRC output never
 /// emits dither. A derived global family that is unavailable at the selected
-/// rate is returned as a split-capable terminal miss; an active explicit native
-/// override remains fail-closed.
+/// rate is returned as an unavailable terminal result so planning can fail
+/// before command construction; an active explicit native override remains
+/// fail-closed as well.
 pub(crate) fn resolve_ssrc_dither_for_rate(
+    settings: &crate::settings::PipelineSettings,
+    source_depth: Option<PcmBitDepth>,
+    effective_target_depth: Option<PcmBitDepth>,
+    target_rate_hz: u32,
+) -> Result<ResolvedSsrcDither> {
+    resolve_ssrc_dither_for_rate_common(
+        settings,
+        source_depth,
+        effective_target_depth,
+        target_rate_hz,
+    )
+}
+
+/// Resolve SSRC dither for the separately execution-qualified true-peak terminal.
+///
+/// Ordinary and certified terminals share the exact native SSRC dither/PDF
+/// parameter mapping. Certification adds execution evidence and an error bound;
+/// it does not change which integer widths the pinned SSRC executable can dither.
+pub fn resolve_certified_ssrc_terminal_dither_for_rate(
+    settings: &crate::settings::PipelineSettings,
+    source_depth: Option<PcmBitDepth>,
+    effective_target_depth: Option<PcmBitDepth>,
+    target_rate_hz: u32,
+) -> Result<ResolvedSsrcDither> {
+    resolve_ssrc_dither_for_rate_common(
+        settings,
+        source_depth,
+        effective_target_depth,
+        target_rate_hz,
+    )
+}
+
+fn resolve_ssrc_dither_for_rate_common(
     settings: &crate::settings::PipelineSettings,
     _source_depth: Option<PcmBitDepth>,
     effective_target_depth: Option<PcmBitDepth>,
@@ -99,31 +132,6 @@ pub(crate) fn resolve_ssrc_dither_for_rate(
     let explicit_id = settings.ssrc.dither_id;
     let explicit_pdf = settings.ssrc.pdf_type;
     let native_override_active = explicit_id.is_some() || explicit_pdf.is_some();
-
-    // Int32 native dither ownership remains behind the retained exact-cell
-    // characterization gate. The semantic planner splits an explicit global
-    // Int32 request to Float64 + the admitted later terminal; an explicit
-    // SSRC-native override is refused before lowering because it cannot be
-    // reassigned. A directly constructed Int32 SSRC step therefore never
-    // emits uncommissioned native dither.
-    if target_depth == PcmBitDepth::Int32 {
-        if native_override_active || (settings.dither_explicit && requested_global != DitherType::None) {
-            return Ok(ResolvedSsrcDither {
-                requested_global,
-                dither_id: None,
-                pdf_type: None,
-                origin: if native_override_active {
-                    SsrcDitherOrigin::NativeOverride
-                } else {
-                    SsrcDitherOrigin::GlobalExact
-                },
-                availability: SsrcDitherAvailability::UnavailableForSsrcTerminal {
-                    reason: "SSRC Int32 dither ownership is not commissioned for the retained pinned cell".to_owned(),
-                },
-            });
-        }
-        return Ok(ResolvedSsrcDither::inactive(requested_global));
-    }
 
     if !native_override_active && requested_global == DitherType::None {
         return Ok(ResolvedSsrcDither::inactive(requested_global));
@@ -746,10 +754,7 @@ impl ToolPlugin for SsrcPlugin {
             }
             if let Some(pdf) = resolved_dither.pdf_type {
                 args.push("--pdf".into());
-                args.push(match pdf {
-                    SsrcPdfType::Rectangular => "0".into(),
-                    SsrcPdfType::Triangular => "1".into(),
-                });
+                args.push(mapping::ssrc_pdf_cli_value(pdf).into());
             }
             args.push(input);
             args.push(output);
@@ -2357,7 +2362,7 @@ pub(crate) fn source_depth_policy_tpdf_requested(
 /// This intentionally admits only authoritative Float32/Float64 PCM with a
 /// `Source` depth request resolved to Int32, and only plain TPDF selected either
 /// by the automatic Source-depth rule or explicitly by the user. It does not
-/// commission arbitrary explicit Int32 dither, SoX/SSRC Int32 dither, or any
+/// commission arbitrary explicit Int32 dither, ordinary SoX Int32 dither, or any
 /// other WavPack-hybrid dither mode.
 pub(crate) fn wavpack_hybrid_float_source_int32_tpdf_requested(
     request: &PlanRequest,
@@ -3573,7 +3578,25 @@ mod tests {
     }
 
     #[test]
-    fn explicit_int32_dither_direct_ssrc_terminal_remains_uncommissioned() {
+    fn ordinary_ssrc_int32_dither_is_owned_by_ssrc_at_supported_rate() {
+        let mut settings = PipelineSettings::default();
+        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int32);
+        settings.dither_type = DitherType::Tpdf;
+        settings.dither_explicit = true;
+
+        let command = ssrc_resample_command_with(
+            settings,
+            44_100,
+            Some(PcmBitDepth::Int32),
+        )
+        .expect("ordinary direct SSRC Int32 dither must be executable at 44.1 kHz");
+        assert_arg(&command.args, "--bits", "32");
+        assert_arg(&command.args, "--dither", "99");
+        assert_arg(&command.args, "--pdf", "1");
+    }
+
+    #[test]
+    fn ordinary_ssrc_int32_dither_remains_rate_aware() {
         let mut settings = PipelineSettings::default();
         settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int32);
         settings.dither_type = DitherType::Tpdf;
@@ -3581,116 +3604,173 @@ mod tests {
 
         let error = ssrc_resample_command_with(
             settings.clone(),
-            44_100,
+            176_400,
             Some(PcmBitDepth::Int32),
         )
-        .expect_err("direct SSRC Int32 dither ownership is not commissioned");
+        .expect_err("176.4 kHz has no SSRC dither table");
         assert!(format!("{error:?}").contains("dither mapping is unavailable"));
 
-        let error = ssrc_resample_command_with(settings, 44_100, None)
-            .expect_err("settings-carried Int32 dither must remain uncommissioned");
-        assert!(format!("{error:?}").contains("dither mapping is unavailable"));
+        settings.dither_type = DitherType::None;
+        settings.dither_explicit = true;
+        let command = ssrc_resample_command_with(
+            settings,
+            176_400,
+            Some(PcmBitDepth::Int32),
+        )
+        .expect("Int32 with no dither remains valid at 176.4 kHz");
+        assert_arg(&command.args, "--bits", "32");
+        assert_no_arg(&command.args, "--dither");
+        assert_no_arg(&command.args, "--pdf");
     }
 
     #[test]
-    fn ssrc_rate_change_keeps_explicit_int32_dither_on_final_ffmpeg_terminal() {
+    fn ordinary_and_certified_ssrc_int32_dither_use_the_same_native_mapping() {
+        let mut settings = PipelineSettings::default();
+        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int32);
+        settings.dither_type = DitherType::Tpdf;
+        settings.dither_explicit = true;
+
+        let ordinary = resolve_ssrc_dither_for_rate(
+            &settings,
+            Some(PcmBitDepth::Float64),
+            Some(PcmBitDepth::Int32),
+            44_100,
+        )
+        .expect("ordinary SSRC dither resolution");
+        let qualified = resolve_certified_ssrc_terminal_dither_for_rate(
+            &settings,
+            Some(PcmBitDepth::Float64),
+            Some(PcmBitDepth::Int32),
+            44_100,
+        )
+        .expect("certified terminal dither resolution");
+        assert_eq!(ordinary, qualified);
+        assert_eq!(ordinary.dither_id, Some(99));
+        assert_eq!(ordinary.pdf_type, Some(SsrcPdfType::Triangular));
+        assert_eq!(ordinary.origin, SsrcDitherOrigin::GlobalExact);
+        assert_eq!(ordinary.availability, SsrcDitherAvailability::Active);
+    }
+
+    #[test]
+    fn ordinary_ssrc_int32_native_override_remains_owned_by_ssrc() {
+        let mut settings = PipelineSettings::default();
+        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int32);
+        settings.dither_type = DitherType::Tpdf;
+        settings.dither_explicit = true;
+        settings.ssrc.dither_id = Some(98);
+        settings.ssrc.pdf_type = Some(SsrcPdfType::Triangular);
+
+        let command = ssrc_resample_command_with(
+            settings,
+            44_100,
+            Some(PcmBitDepth::Int32),
+        )
+        .expect("supported native Int32 dither override must remain on SSRC");
+        assert_arg(&command.args, "--bits", "32");
+        assert_arg(&command.args, "--dither", "98");
+        assert_arg(&command.args, "--pdf", "1");
+    }
+
+    #[test]
+    fn ssrc_lossless_non_wav_package_keeps_terminal_dither_on_ssrc() {
+        for depth in [PcmBitDepth::Int16, PcmBitDepth::Int24] {
+            let mut settings = PipelineSettings::default();
+            settings.target_format = AudioFormat::Flac;
+            settings.target_sample_rate = crate::enums::RateTarget::PcmHz(44_100);
+            settings.target_bit_depth = BitDepthTarget::Pcm(depth);
+            settings.nyquist_transition = crate::enums::NyquistTransition::BrickWall;
+            settings.dither_type = DitherType::Tpdf;
+            settings.dither_explicit = true;
+            settings.ssrc.force = true;
+            let mut request = pcm_request_with(settings, PcmBitDepth::Int24);
+            request.output_path = PathBuf::from("output.flac");
+
+            let lowered = crate::plan_conversion(&request)
+                .expect("SSRC must own final samples before lossless FLAC packaging");
+            let PlanAction::Execute { commands, .. } = lowered.action else {
+                panic!("rate-changing SSRC FLAC route must execute")
+            };
+
+            let ssrc = commands
+                .iter()
+                .find(|command| command.tool == ToolIdentifier::Ssrc)
+                .expect("SSRC resample command");
+            assert_arg(&ssrc.args, "--bits", &ssrc_bits_arg(depth));
+            assert_arg(&ssrc.args, "--dither", "99");
+            assert_arg(&ssrc.args, "--pdf", "1");
+
+            // The package-only step consumes the SSRC artifact directly. Its
+            // own output is a staged `.output.tonepoet-final.flac` name, not
+            // the caller's `output.flac`, so bind it by that consumption edge
+            // rather than by the final path.
+            let package = commands
+                .iter()
+                .find(|command| {
+                    command.tool == ToolIdentifier::Ffmpeg
+                        && command.input.as_path() == ssrc.output.as_path()
+                })
+                .expect("FFmpeg FLAC package command");
+            assert_no_arg(&package.args, "-af");
+            assert_no_arg(&package.args, "-ar");
+            assert!(
+                !package.args.iter().any(|arg| arg.contains("dither_method=")),
+                "package-only FFmpeg command must not dither: {package:#?}",
+            );
+            assert_eq!(ssrc.output.as_path(), package.input.as_path());
+        }
+    }
+
+    #[test]
+    fn ssrc_lossless_non_wav_package_refuses_unavailable_dither_before_lowering() {
         let mut settings = PipelineSettings::default();
         settings.target_format = AudioFormat::Flac;
-        settings.target_sample_rate = crate::enums::RateTarget::PcmHz(44_100);
-        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int32);
+        settings.target_sample_rate = crate::enums::RateTarget::PcmHz(176_400);
+        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int16);
         settings.nyquist_transition = crate::enums::NyquistTransition::BrickWall;
         settings.dither_type = DitherType::Tpdf;
         settings.dither_explicit = true;
-        let mut request = pcm_request_with(settings, PcmBitDepth::Int32);
+        settings.ssrc.force = true;
+        let mut request = pcm_request_with(settings, PcmBitDepth::Int24);
         request.output_path = PathBuf::from("output.flac");
 
-        let typed = match crate::semantic_plan::plan_typed(&request)
-            .expect("typed SSRC explicit Int32 plan")
-        {
-            crate::semantic_plan::PlanningOutcome::Ready(plan) => plan,
-            other => panic!("ordinary SSRC explicit Int32 route should be Ready: {other:?}"),
-        };
-        let realization = typed
-            .nodes
-            .iter()
-            .find_map(|node| match node {
-                crate::semantic_plan::TypedPlanNode::Operation {
-                    operation: PlanOperation::EncodePcm { .. },
-                    candidates,
-                    selected_candidate,
-                    ..
-                } => candidates
-                    .get(*selected_candidate)
-                    .and_then(|candidate| candidate.contract.terminal_realization.as_ref()),
-                _ => None,
-            })
-            .expect("selected terminal realization");
-        let crate::semantic_plan::SelectedTerminalRealization::Pcm(realization) = realization else {
-            panic!("expected PCM terminal realization")
-        };
-        assert_eq!(realization.selected_tool, ToolIdentifier::Ffmpeg);
-        assert_eq!(
-            realization.input_precision,
-            crate::semantic_plan::StoragePrecision::Pcm(PcmBitDepth::Float64)
-        );
-        assert_eq!(
-            realization.input_value_domain,
-            crate::semantic_plan::ValueDomain::FiniteFloating
-        );
-        assert_eq!(realization.effective_dither, Some(DitherType::Tpdf));
+        let error = crate::plan_conversion(&request)
+            .expect_err("unsupported SSRC dither must refuse instead of moving to FFmpeg");
+        let rendered = format!("{error:?}");
+        assert!(rendered.contains("ssrc_terminal_dither_unavailable"), "{rendered}");
+        assert!(rendered.contains("176400"), "{rendered}");
+    }
+
+    #[test]
+    fn ssrc_lossless_non_wav_package_keeps_none_switchless() {
+        let mut settings = PipelineSettings::default();
+        settings.target_format = AudioFormat::Flac;
+        settings.target_sample_rate = crate::enums::RateTarget::PcmHz(176_400);
+        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int16);
+        settings.nyquist_transition = crate::enums::NyquistTransition::BrickWall;
+        settings.dither_type = DitherType::None;
+        settings.dither_explicit = true;
+        settings.ssrc.force = true;
+        let mut request = pcm_request_with(settings, PcmBitDepth::Int24);
+        request.output_path = PathBuf::from("output.flac");
 
         let lowered = crate::plan_conversion(&request)
-            .expect("SSRC route must preserve the selected final FFmpeg Int32 dither");
+            .expect("SSRC None route must remain valid at 176.4 kHz");
         let PlanAction::Execute { commands, .. } = lowered.action else {
-            panic!("rate-changing SSRC route must execute")
-        };
-
-        let ssrc = commands
-            .iter()
-            .find(|command| command.tool == ToolIdentifier::Ssrc)
-            .expect("SSRC resample command");
-        assert_arg(&ssrc.args, "--bits", "-64");
-        assert_no_arg(&ssrc.args, "--dither");
-        assert_no_arg(&ssrc.args, "--pdf");
-
-        let dither_commands = commands
-            .iter()
-            .filter(|command| {
-                command
-                    .args
-                    .iter()
-                    .any(|arg| arg.contains("dither_method=triangular"))
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(dither_commands.len(), 1, "{commands:#?}");
-        assert_eq!(dither_commands[0].tool, ToolIdentifier::Ffmpeg);
-        let dither_method_count = commands
-            .iter()
-            .flat_map(|command| command.args.iter())
-            .map(|arg| arg.matches("dither_method=").count())
-            .sum::<usize>();
-        assert_eq!(dither_method_count, 1, "{commands:#?}");
-
-        let mut control = request.clone();
-        control.settings.dither_explicit = false;
-        let lowered = crate::plan_conversion(&control)
-            .expect("SSRC non-explicit Int32 control must lower");
-        let PlanAction::Execute { commands, .. } = lowered.action else {
-            panic!("rate-changing SSRC control must execute")
+            panic!("rate-changing SSRC FLAC route must execute")
         };
         let ssrc = commands
             .iter()
             .find(|command| command.tool == ToolIdentifier::Ssrc)
             .expect("SSRC resample command");
-        assert_arg(&ssrc.args, "--bits", "-64");
+        assert_arg(&ssrc.args, "--bits", "16");
         assert_no_arg(&ssrc.args, "--dither");
         assert_no_arg(&ssrc.args, "--pdf");
         assert!(
-            !commands
+            commands
                 .iter()
-                .flat_map(|command| command.args.iter())
-                .any(|arg| arg.contains("dither_method=")),
-            "non-explicit Int32 control must leave final FFmpeg packaging undithered: {commands:#?}",
+                .filter(|command| command.tool == ToolIdentifier::Ffmpeg)
+                .all(|command| !command.args.iter().any(|arg| arg.contains("dither_method="))),
+            "downstream packaging must remain undithered: {commands:#?}",
         );
     }
 
@@ -3872,6 +3952,30 @@ mod tests {
     }
 
     #[test]
+    fn ssrc_command_keeps_global_none_valid_at_rate_without_dither_table() {
+        let mut settings = PipelineSettings::default();
+        settings.dither_type = DitherType::None;
+
+        let command = ssrc_resample_command_with(settings, 176_400, Some(PcmBitDepth::Int16))
+            .expect("no-dither SSRC terminal must not depend on a destination dither table");
+        assert_no_arg(&command.args, "--dither");
+        assert_no_arg(&command.args, "--pdf");
+        assert_arg(&command.args, "--bits", "16");
+    }
+
+    #[test]
+    fn ssrc_command_rejects_tpdf_at_rate_without_ssrc_dither_table() {
+        let mut settings = PipelineSettings::default();
+        settings.dither_type = DitherType::Tpdf;
+
+        let err = ssrc_resample_command_with(settings, 176_400, Some(PcmBitDepth::Int16))
+            .expect_err("SSRC 2.4.2 exposes no dither table at 176.4 kHz");
+        let message = format!("{err:?}");
+        assert!(message.contains("dither mapping is unavailable"));
+        assert!(message.contains("176400") || message.contains("176_400"));
+    }
+
+    #[test]
     fn planner_format_metadata_capabilities_are_centralized_on_audio_format() {
         assert!(AudioFormat::Flac.supports_planner_source_tag_transfer());
         assert!(AudioFormat::Wav.supports_planner_source_tag_transfer());
@@ -3989,6 +4093,23 @@ mod tests {
                 "sox must remain available for WavPack Int24 (apply_processing={apply_processing})"
             );
         }
+
+        let package_step = step(false);
+        let package = SoxPlugin
+            .build_command(&request.context(), &package_step)
+            .expect("SoX must build the WavPack Int24 package-only command");
+        assert_eq!(package.tool, ToolIdentifier::Sox);
+        assert!(
+            package.args.windows(2).any(|pair| pair[0] == "-b" && pair[1] == "24"),
+            "{:?}",
+            package.args,
+        );
+        assert!(!package.args.iter().any(|arg| arg == "dither" || arg == "rate" || arg == "-r"));
+        assert_eq!(
+            package.args.last().map(String::as_str),
+            package.output.as_path().map(|path| path.to_string_lossy()).as_deref(),
+            "package-only SoX command must append no effects after the output path",
+        );
 
         // Faithful FFmpeg cells stay eligible. Float32 is the native
         // floating-point WavPack representation; Float64 is rejected earlier.

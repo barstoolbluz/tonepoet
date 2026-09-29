@@ -24,9 +24,11 @@ pub const REFERENCE_COMMON_SOURCE_PATHS: &[&str] = &[
     "tonepoet-pipeline/src/plugins.rs",
     "tonepoet-pipeline/src/w64.rs",
     "src/convert/pipeline/plan_bridge.rs",
+    "src/convert/pipeline/coordination_name.rs",
     "src/convert/pipeline/track_executor.rs",
     "src/convert/pipeline/stages.rs",
     "src/convert/pipeline/manifest_builder.rs",
+    "src/fs_limits.rs",
     "src/convert/replaygain.rs",
 ];
 

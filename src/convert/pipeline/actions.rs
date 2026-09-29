@@ -4828,17 +4828,17 @@ fn explicit_preview_temporary_path(context: &ActionContext) -> PathBuf {
 }
 
 fn shared_album_publication_lock_name(album_component: &OsStr) -> OsString {
-    let mut name = OsString::from(".");
-    name.push(album_component);
-    name.push(".lock");
-    name
+    OsString::from(format!(
+        ".tonepoet-publish-{}.lock",
+        super::coordination_name::component_coordination_token(album_component)
+    ))
 }
 
 fn shared_action_execution_lock_name(album_component: &OsStr) -> OsString {
-    let mut name = OsString::from(".");
-    name.push(album_component);
-    name.push(".actions.lock");
-    name
+    OsString::from(format!(
+        ".tonepoet-actions-{}.lock",
+        super::coordination_name::component_coordination_token(album_component)
+    ))
 }
 
 #[cfg(test)]

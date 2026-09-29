@@ -434,6 +434,43 @@ pub(crate) struct InternalPeakCertificate {
     pub diagnostics: SearchDiagnostics,
 }
 
+/// Qualification-visible identity of the production certified-peak executor.
+/// This is intentionally not a user-selectable runtime setting.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CertifiedPeakSimdBackend {
+    Scalar,
+    Avx,
+}
+
+impl CertifiedPeakSimdBackend {
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn qualification_name(self) -> &'static str {
+        match self {
+            Self::Scalar => "scalar",
+            Self::Avx => "avx",
+        }
+    }
+}
+
+#[doc(hidden)]
+#[must_use]
+pub fn production_certified_peak_simd_backend_for_qualification(
+    tier: PeakTier,
+) -> CertifiedPeakSimdBackend {
+    let avx = match tier {
+        PeakTier::Reference => false,
+        PeakTier::Standard => qualified_half_delay_fft::fast90_avx_available(),
+        PeakTier::Fast => fast_scan::production_avx_available(),
+    };
+    if avx {
+        CertifiedPeakSimdBackend::Avx
+    } else {
+        CertifiedPeakSimdBackend::Scalar
+    }
+}
+
 /// Streaming certified HQ1024V1 meter.
 ///
 /// Caller chunk sizes do not define FFT blocks or search tiles. All three tiers
@@ -511,6 +548,25 @@ impl CertifiedPeakMeter {
                 execution_mode,
             )?),
         })
+    }
+
+    /// Qualification-only selector for the production certified-peak executor.
+    /// The selected path is the same production kernel; this API is append-only
+    /// and hidden so ordinary callers cannot override production dispatch.
+    #[doc(hidden)]
+    pub fn force_simd_backend_for_qualification(
+        &mut self,
+        backend: CertifiedPeakSimdBackend,
+    ) -> Result<(), &'static str> {
+        let use_avx = matches!(backend, CertifiedPeakSimdBackend::Avx);
+        match &mut self.inner {
+            CertifiedPeakBackend::Certified(inner) => {
+                inner.force_simd_backend_for_qualification(use_avx)
+            }
+            CertifiedPeakBackend::Fast(inner) => {
+                inner.force_simd_backend_for_qualification(use_avx)
+            }
+        }
     }
 
     pub fn push_interleaved(&mut self, samples: &[f64]) -> Result<(), TruePeakError> {
@@ -1240,6 +1296,35 @@ mod public_surface_tests {
         ));
         meter.push_interleaved(&[0.25, -0.5]).unwrap();
         assert_eq!(meter.finalize().unwrap().frames, 1);
+    }
+
+    #[test]
+    fn certified_peak_qualification_dispatch_override_respects_tier_contract() {
+        let mut reference =
+            CertifiedPeakMeter::new(48_000, 2, EdgePolicy::RepeatEndpoints, PeakTier::Reference)
+                .unwrap();
+        reference
+            .force_simd_backend_for_qualification(CertifiedPeakSimdBackend::Scalar)
+            .unwrap();
+        assert!(reference
+            .force_simd_backend_for_qualification(CertifiedPeakSimdBackend::Avx)
+            .is_err());
+
+        for tier in [PeakTier::Standard, PeakTier::Fast] {
+            let mut scalar =
+                CertifiedPeakMeter::new(48_000, 2, EdgePolicy::RepeatEndpoints, tier).unwrap();
+            scalar
+                .force_simd_backend_for_qualification(CertifiedPeakSimdBackend::Scalar)
+                .unwrap();
+            if production_certified_peak_simd_backend_for_qualification(tier)
+                == CertifiedPeakSimdBackend::Avx
+            {
+                let mut avx =
+                    CertifiedPeakMeter::new(48_000, 2, EdgePolicy::RepeatEndpoints, tier).unwrap();
+                avx.force_simd_backend_for_qualification(CertifiedPeakSimdBackend::Avx)
+                    .unwrap();
+            }
+        }
     }
 
     #[test]

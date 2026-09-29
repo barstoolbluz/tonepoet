@@ -163,6 +163,19 @@ pub struct SsrcDitherSelection {
     pub pdf_type: Option<SsrcPdfType>,
 }
 
+/// Render SSRC's documented CLI value for a resolved dither PDF.
+///
+/// This is the same mapping the built-in SSRC plugin has always emitted; the
+/// helper exists so certified execution can validate and reproduce it without
+/// duplicating string literals.
+#[must_use]
+pub const fn ssrc_pdf_cli_value(pdf: SsrcPdfType) -> &'static str {
+    match pdf {
+        SsrcPdfType::Rectangular => "0",
+        SsrcPdfType::Triangular => "1",
+    }
+}
+
 impl SsrcDitherSelection {
     /// Create a new SSRC dither selection with the given dither ID and optional PDF type.
     #[must_use]
@@ -248,21 +261,18 @@ pub const fn ssrc_dither_id(dither: DitherType) -> u8 {
 /// Return true when an SSRC `--dither` ID is available for the destination
 /// sample rate.
 ///
-/// The shaped ATH and legacy IDs are rate-specific. IDs `98` (Simple
-/// triangular) and `99` (No shaper) are treated as sample-rate independent
-/// because they do not depend on an ATH coefficient table. For unlisted rates,
-/// fail closed by accepting only those two sample-rate-independent choices.
+/// SSRC's dither table is destination-rate specific, including the nominal
+/// simple/no-shaper IDs 98/99. The pinned SSRC 2.4.2 executable exposes no
+/// dither table at unlisted rates (notably 176.4/352.8/384 kHz), so every
+/// active `--dither` selection fails closed there. A user-facing `None` request
+/// remains valid because command lowering emits no `--dither` switch at all.
 #[must_use]
 pub const fn ssrc_dither_id_available_for_rate(dither_id: u8, target_rate_hz: u32) -> bool {
-    if matches!(dither_id, 98 | 99) {
-        return true;
-    }
-
     match target_rate_hz {
-        44_100 => matches!(dither_id, 0..=6 | 10..=16 | 90..=92),
-        48_000 => matches!(dither_id, 0..=6 | 10..=16 | 90 | 91),
-        88_200 | 96_000 | 192_000 => matches!(dither_id, 0..=2),
-        8_000 | 11_025 | 22_050 => matches!(dither_id, 0 | 1 | 9),
+        44_100 => matches!(dither_id, 0..=6 | 10..=16 | 90..=92 | 98 | 99),
+        48_000 => matches!(dither_id, 0..=6 | 10..=16 | 90 | 91 | 98 | 99),
+        88_200 | 96_000 | 192_000 => matches!(dither_id, 0..=2 | 98 | 99),
+        8_000 | 11_025 | 22_050 => matches!(dither_id, 0 | 1 | 9 | 98 | 99),
         _ => false,
     }
 }
@@ -405,8 +415,9 @@ mod tests {
         assert!(!ssrc_dither_id_available_for_rate(6, 22_050));
         assert!(ssrc_dither_id_available_for_rate(9, 22_050));
         assert!(!ssrc_dither_id_available_for_rate(9, 44_100));
-        assert!(ssrc_dither_id_available_for_rate(98, 176_400));
-        assert!(ssrc_dither_id_available_for_rate(99, 176_400));
+        assert!(!ssrc_dither_id_available_for_rate(98, 176_400));
+        assert!(!ssrc_dither_id_available_for_rate(99, 176_400));
+        assert!(ssrc_dither_id_available_for_rate(99, 192_000));
     }
 
     #[test]
@@ -428,7 +439,7 @@ mod tests {
     #[test]
     fn rate_aware_ssrc_shaped_mapping_rejects_unlisted_rates() {
         assert!(ssrc_dither_selection_for_rate(DitherType::Shibata, 176_400).is_err());
-        assert!(ssrc_dither_selection_for_rate(DitherType::Tpdf, 176_400).is_ok());
+        assert!(ssrc_dither_selection_for_rate(DitherType::Tpdf, 176_400).is_err());
     }
 
     #[test]

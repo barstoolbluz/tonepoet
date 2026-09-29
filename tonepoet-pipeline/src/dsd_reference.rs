@@ -71,6 +71,27 @@ pub const DSD_REFERENCE_SOX_NG_VERSION: &str = "14.8.0.1";
 pub const DSD_REFERENCE_QUALIFICATION_MANIFEST_PATH: &str =
     "qualification/dsd_reference_sox_ng_14_8_0_1_v18.json";
 
+/// CPU ceiling for every FFmpeg invocation that participates in qualified
+/// Reference audio or decoded-sample identity. x86-64 guarantees SSE/SSE2; the
+/// ceiling therefore preserves the baseline vector path while excluding
+/// host-specific AVX/FMA dispatch.
+pub const REFERENCE_FFMPEG_CPUFLAGS: &str = "sse+sse2";
+/// Canonical argv pair for the Reference FFmpeg CPU ceiling.
+pub const REFERENCE_FFMPEG_CPUFLAGS_ARGS: [&str; 2] =
+    ["-cpuflags", REFERENCE_FFMPEG_CPUFLAGS];
+/// libsoxr dispatches independently of FFmpeg's `-cpuflags` mask.
+pub const REFERENCE_SOXR_USE_SIMD_ENV: &str = "SOXR_USE_SIMD";
+/// Canonical libsoxr dispatch pin for Reference execution.
+pub const REFERENCE_SOXR_USE_SIMD: &str = "0";
+
+fn reference_ffmpeg_args(args: Vec<String>) -> Vec<String> {
+    REFERENCE_FFMPEG_CPUFLAGS_ARGS
+        .into_iter()
+        .map(str::to_string)
+        .chain(args)
+        .collect()
+}
+
 /// Signed nanodecibels used for policy arithmetic and canonical serialization.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DbNano(pub i64);
@@ -3684,7 +3705,7 @@ fn build_render_command(
         "Render qualified Reference DSD reconstruction",
     );
     command.environment_policy = CommandEnvironmentPolicy::ClearAndSet;
-    command.environment.insert("LC_ALL".to_string(), "C".to_string());
+    command.environment = reference_command_environment();
     command
 }
 
@@ -3777,7 +3798,7 @@ fn lower_reference_int32_tpdf_terminal(
     );
     let mut terminal = PlannedCommand::new(
         ToolIdentifier::Ffmpeg,
-        vec![
+        reference_ffmpeg_args(vec![
             "-y".to_string(),
             "-hide_banner".to_string(),
             "-nostdin".to_string(),
@@ -3799,7 +3820,7 @@ fn lower_reference_int32_tpdf_terminal(
             "-c:a".to_string(),
             "pcm_s32le".to_string(),
             output.display().to_string(),
-        ],
+        ]),
         InputSource::Path(normalized_carrier_path.clone()),
         OutputSink::Path(output.to_path_buf()),
         None,
@@ -3897,7 +3918,13 @@ pub fn lower_reference_terminal_command(
 }
 
 fn reference_command_environment() -> BTreeMap<String, String> {
-    BTreeMap::from([("LC_ALL".to_string(), "C".to_string())])
+    BTreeMap::from([
+        ("LC_ALL".to_string(), "C".to_string()),
+        (
+            REFERENCE_SOXR_USE_SIMD_ENV.to_string(),
+            REFERENCE_SOXR_USE_SIMD.to_string(),
+        ),
+    ])
 }
 
 fn build_float64_wav_package_pipeline(
@@ -3937,7 +3964,7 @@ fn build_float64_wav_package_pipeline(
     producer.environment_policy = CommandEnvironmentPolicy::ClearAndSet;
     producer.environment = reference_command_environment();
 
-    let mut args = vec![
+    let mut args = reference_ffmpeg_args(vec![
         "-y".to_string(),
         "-hide_banner".to_string(),
         "-nostdin".to_string(),
@@ -3960,7 +3987,7 @@ fn build_float64_wav_package_pipeline(
         "pcm_f64le".to_string(),
         "-f".to_string(),
         "wav".to_string(),
-    ];
+    ]);
     if target == ResolvedOutputTarget::WavRf64 {
         args.extend(["-rf64".to_string(), "always".to_string()]);
     }
@@ -4020,7 +4047,7 @@ fn build_package_command(
             return Err(invalid_terminal_depth("target_bit_depth", contract.bit_depth));
         }
     };
-    let mut args = vec![
+    let mut args = reference_ffmpeg_args(vec![
         "-y".to_string(),
         "-hide_banner".to_string(),
         "-nostdin".to_string(),
@@ -4033,7 +4060,7 @@ fn build_package_command(
         "-vn".to_string(),
         "-sn".to_string(),
         "-dn".to_string(),
-    ];
+    ]);
     if target == ResolvedOutputTarget::AlacM4a && contract.channels == 3 {
         // FFmpeg guesses three channels as 2.1 and the ALAC encoder rematrixes
         // that to 3.0, changing the samples. Pin the input layout to 3.0 so the
@@ -5965,7 +5992,7 @@ mod tests {
                 assert_eq!(command.environment_policy, CommandEnvironmentPolicy::ClearAndSet);
                 assert_eq!(
                     command.environment,
-                    BTreeMap::from([("LC_ALL".to_string(), "C".to_string())])
+                    reference_command_environment()
                 );
             }
             assert_eq!(
@@ -6438,6 +6465,8 @@ mod tests {
                 assert_eq!(
                     package.args,
                     vec![
+                        "-cpuflags".to_string(),
+                        REFERENCE_FFMPEG_CPUFLAGS.to_string(),
                         "-y".to_string(),
                         "-hide_banner".to_string(),
                         "-nostdin".to_string(),
@@ -6584,6 +6613,8 @@ mod tests {
             assert_eq!(
                 lowering.terminal.args,
                 [
+                    "-cpuflags",
+                    REFERENCE_FFMPEG_CPUFLAGS,
                     "-y",
                     "-hide_banner",
                     "-nostdin",

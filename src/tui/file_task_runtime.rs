@@ -3146,6 +3146,18 @@ mod tests {
             serde_json::json!({"large": "plan"}),
         )
         .expect("create journal");
+        let record = handle.load().expect("load large-plan journal");
+        let descriptor = record
+            .lease_descriptor
+            .as_ref()
+            .expect("large file operation must publish its ownership descriptor");
+        let descriptor_len = std::fs::metadata(descriptor)
+            .expect("large-plan lease descriptor metadata")
+            .len();
+        assert!(
+            descriptor_len <= 1024 * 1024,
+            "an ordinary 2,000-mapping copy must fit the unchanged 1 MiB lease-reader envelope: {descriptor_len} bytes"
+        );
         let initial_len = std::fs::metadata(handle.path()).expect("initial metadata").len();
         for index in 0..100 {
             handle

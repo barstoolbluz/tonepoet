@@ -24,6 +24,7 @@ pub(crate) mod bluray_ts_demux;
 pub(crate) mod bluray_lpcm;
 pub(crate) mod bluray_wav_validate;
 pub(crate) mod bluray_realize;
+pub(crate) mod coordination_name;
 pub mod actions;
 pub(crate) mod baseline;
 pub(crate) mod chapter_write;

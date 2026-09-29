@@ -6,6 +6,7 @@
 //! (each falling back to the narrower ISA when unavailable).
 
 use super::k_weighting::{FilterState, KWeightingCoefficients};
+use super::LoudnessSimdBackend;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Backend(BackendKind);
@@ -51,6 +52,16 @@ impl Backend {
 
     pub(super) const fn is_scalar(self) -> bool {
         matches!(self.0, BackendKind::Scalar)
+    }
+
+    pub(super) const fn qualification_backend(self) -> LoudnessSimdBackend {
+        match self.0 {
+            BackendKind::Scalar => LoudnessSimdBackend::Scalar,
+            #[cfg(target_arch = "x86_64")]
+            BackendKind::Sse2 => LoudnessSimdBackend::Sse2,
+            #[cfg(target_arch = "x86_64")]
+            BackendKind::Avx => LoudnessSimdBackend::Avx,
+        }
     }
 
     #[cfg(target_arch = "x86_64")]

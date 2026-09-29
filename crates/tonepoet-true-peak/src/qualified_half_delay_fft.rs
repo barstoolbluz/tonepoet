@@ -423,7 +423,7 @@ fn pointwise_multiply_fast90(values: &mut [Complex64], filter: &[Complex64]) {
 }
 
 #[inline]
-fn fast90_avx_available() -> bool {
+pub(crate) fn fast90_avx_available() -> bool {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         std::arch::is_x86_feature_detected!("avx")
@@ -696,6 +696,22 @@ impl QualifiedHalfDelayFft {
 
     pub(crate) const fn fast90_same_graph_avx_active(&self) -> bool {
         self.fast90_same_graph_avx
+    }
+
+    /// Qualification-only dispatch override. The same production graph is
+    /// retained; only its scalar/AVX executor is selected explicitly.
+    pub(crate) fn force_fast90_same_graph_avx_for_qualification(
+        &mut self,
+        enabled: bool,
+    ) -> Result<(), &'static str> {
+        if self.has_pending() {
+            return Err("cannot change certified prefix dispatch after input");
+        }
+        if enabled && !fast90_avx_available() {
+            return Err("AVX is not available on this qualification host");
+        }
+        self.fast90_same_graph_avx = enabled;
+        Ok(())
     }
 
     pub(crate) fn has_pending(&self) -> bool {

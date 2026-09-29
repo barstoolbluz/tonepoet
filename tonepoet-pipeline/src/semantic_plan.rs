@@ -868,6 +868,8 @@ pub enum PcmTerminalRealizationKind {
     SsrcDirectWav,
     /// SSRC owns the final samples and FFmpeg performs a proved package-only wrap.
     SsrcPreterminalFfmpegPackage,
+    /// SSRC owns final WavPack Int24 samples and SoX performs a proved package-only wrap.
+    SsrcPreterminalSoxPackage,
     /// The selected SoX command owns the final PCM realization.
     SoxDirect,
     /// The selected FFmpeg command owns the final PCM realization.
@@ -1080,6 +1082,9 @@ pub fn terminal_proof_authority(
                 PcmTerminalRealizationKind::SsrcDirectWav => "ssrc-direct-wav",
                 PcmTerminalRealizationKind::SsrcPreterminalFfmpegPackage => {
                     "ssrc-preterminal+ffmpeg"
+                }
+                PcmTerminalRealizationKind::SsrcPreterminalSoxPackage => {
+                    "ssrc-preterminal+sox"
                 }
                 PcmTerminalRealizationKind::SoxDirect => "sox-direct",
                 PcmTerminalRealizationKind::FfmpegDirect => "ffmpeg-direct",
@@ -1994,6 +1999,37 @@ fn ssrc_native_dither_override_active(request: &PlanRequest) -> bool {
     request.settings.ssrc.dither_id.is_some() || request.settings.ssrc.pdf_type.is_some()
 }
 
+fn ssrc_preterminal_ffmpeg_package_admitted(
+    request: &PlanRequest,
+    depth: PcmBitDepth,
+) -> bool {
+    if depth.is_float() {
+        return false;
+    }
+    match request.settings.target_format {
+        AudioFormat::Flac | AudioFormat::Aiff => true,
+        AudioFormat::WavPack => {
+            !request.settings.wavpack.hybrid && depth != PcmBitDepth::Int24
+        }
+        AudioFormat::Alac => matches!(depth, PcmBitDepth::Int16 | PcmBitDepth::Int24),
+        _ => false,
+    }
+}
+
+fn ssrc_preterminal_sox_package_admitted(
+    request: &PlanRequest,
+    depth: PcmBitDepth,
+) -> bool {
+    request.settings.target_format == AudioFormat::WavPack
+        && !request.settings.wavpack.hybrid
+        && depth == PcmBitDepth::Int24
+}
+
+fn ssrc_preterminal_package_admitted(request: &PlanRequest, depth: PcmBitDepth) -> bool {
+    ssrc_preterminal_ffmpeg_package_admitted(request, depth)
+        || ssrc_preterminal_sox_package_admitted(request, depth)
+}
+
 /// Resolve the immediate SSRC output depth and terminal role for this request.
 pub(crate) fn resolve_ssrc_immediate_output(
     request: &PlanRequest,
@@ -2011,40 +2047,20 @@ pub(crate) fn resolve_ssrc_immediate_output(
     let later_sample_processing = has_post_resample_effects
         || !matches!(gain_policy, SampleGainPolicy::Off)
         || request.settings.target_format.is_lossy();
-    let package_requires_split = request.settings.target_format.is_pcm_lossless()
-        && request.settings.target_format != AudioFormat::Wav;
+    let terminal_container_admitted = request.settings.target_format == AudioFormat::Wav
+        || final_depth.is_some_and(|depth| ssrc_preterminal_package_admitted(request, depth));
 
-    if native_terminal_request && (later_sample_processing || package_requires_split) {
+    if native_terminal_request && (later_sample_processing || !terminal_container_admitted) {
         return Err(PlanRefusal {
             code: "ssrc_native_terminal_override_cannot_split".to_owned(),
-            reason: "an active SSRC-native dither/PDF override requires SSRC to own the final integer terminal, but later processing or an unadmitted package-only cell requires a Float64 split".to_owned(),
+            reason: "an active SSRC-native dither/PDF override requires SSRC to own the final integer sample realization, but later sample processing or an unavailable package-only cell requires a Float64 split".to_owned(),
         });
     }
 
-    if let Some(PcmBitDepth::Int32) = final_depth {
-        let int32_dither = crate::plugins::int32_dither_requested(
-            request,
-            Some(PcmBitDepth::Int32),
-        );
-        if native_override {
-            return Err(PlanRefusal {
-                code: "ssrc_int32_dither_unqualified".to_owned(),
-                reason: "SSRC Int32 dither/noise-shaping ownership is not commissioned; the explicit native override cannot be silently reassigned to the retained FFmpeg terminal".to_owned(),
-            });
-        }
-        if int32_dither {
-            return Ok(SsrcImmediateOutput {
-                depth: PcmBitDepth::Float64,
-                role: SsrcOutputRole::Nonterminal,
-            });
-        }
-    }
-
-    let can_direct_terminal = !later_sample_processing
-        && !package_requires_split
-        && request.settings.target_format == AudioFormat::Wav
+    let can_ssrc_terminal = !later_sample_processing
+        && terminal_container_admitted
         && final_depth.is_some();
-    if can_direct_terminal {
+    if can_ssrc_terminal {
         let depth = final_depth.expect("terminal predicate requires a resolved depth");
         let dither = crate::plugins::resolve_ssrc_dither_for_rate(
             &request.settings,
@@ -2056,15 +2072,14 @@ pub(crate) fn resolve_ssrc_immediate_output(
             code: "ssrc_parameter_resolution".to_owned(),
             reason: error.to_string(),
         })?;
-        if matches!(
-            dither.availability,
-            crate::plugins::SsrcDitherAvailability::UnavailableForSsrcTerminal { .. }
-        ) {
-            // This is a derived global-family fusion miss, not a whole-request
-            // settings error. A later admitted terminal may own the dither.
-            return Ok(SsrcImmediateOutput {
-                depth: PcmBitDepth::Float64,
-                role: SsrcOutputRole::Nonterminal,
+        if let crate::plugins::SsrcDitherAvailability::UnavailableForSsrcTerminal { reason } =
+            &dither.availability
+        {
+            return Err(PlanRefusal {
+                code: "ssrc_terminal_dither_unavailable".to_owned(),
+                reason: format!(
+                    "SSRC cannot honor the selected dither at destination rate {target_rate_hz} Hz: {reason}"
+                ),
             });
         }
         return Ok(SsrcImmediateOutput {
@@ -2085,12 +2100,18 @@ fn resolve_ssrc_terminal_realization(
     target_rate_hz: u32,
     target_bit_depth: PcmBitDepth,
 ) -> Result<SelectedTerminalRealization, PlanRefusal> {
-    if request.settings.target_format != AudioFormat::Wav {
+    let kind = if request.settings.target_format == AudioFormat::Wav {
+        PcmTerminalRealizationKind::SsrcDirectWav
+    } else if ssrc_preterminal_ffmpeg_package_admitted(request, target_bit_depth) {
+        PcmTerminalRealizationKind::SsrcPreterminalFfmpegPackage
+    } else if ssrc_preterminal_sox_package_admitted(request, target_bit_depth) {
+        PcmTerminalRealizationKind::SsrcPreterminalSoxPackage
+    } else {
         return Err(PlanRefusal {
             code: "ssrc_package_cell_unavailable".to_owned(),
-            reason: "SSRC terminal fusion is currently admitted only for direct WAV output; non-WAV lossless delivery must use the Float64 split terminal unless a package-only cell is separately qualified".to_owned(),
+            reason: "SSRC final-sample ownership requires either direct WAV output or an admitted lossless package-only cell".to_owned(),
         });
-    }
+    };
     let dither = crate::plugins::resolve_ssrc_dither_for_rate(
         &request.settings,
         request.source.authoritative_pcm_depth(),
@@ -2107,7 +2128,7 @@ fn resolve_ssrc_terminal_realization(
     ) {
         return Err(PlanRefusal {
             code: "ssrc_terminal_dither_unavailable".to_owned(),
-            reason: "SSRC terminal fusion was selected although its resolved dither family is unavailable at the target rate".to_owned(),
+            reason: "SSRC terminal ownership was selected although its resolved dither family is unavailable at the target rate".to_owned(),
         });
     }
     let dither_active = matches!(
@@ -2118,11 +2139,11 @@ fn resolve_ssrc_terminal_realization(
         .then_some(dither.requested_global);
     Ok(SelectedTerminalRealization::Pcm(
         SelectedPcmTerminalRealization {
-            kind: PcmTerminalRealizationKind::SsrcDirectWav,
+            kind,
             selected_tool: ToolIdentifier::Ssrc,
             input_precision: input_state.precision.clone(),
             input_value_domain: input_state.value_domain.clone(),
-            target_format: AudioFormat::Wav,
+            target_format: request.settings.target_format.clone(),
             target_rate_hz: Some(target_rate_hz),
             target_bit_depth,
             wavpack_hybrid: false,
@@ -5491,7 +5512,8 @@ fn terminal_contract_for_candidate(
                 is_qualified_ffmpeg_int32_triangular_wavpack_hybrid_preterminal(realization)
             }
             PcmTerminalRealizationKind::SsrcDirectWav
-            | PcmTerminalRealizationKind::SsrcPreterminalFfmpegPackage => false,
+            | PcmTerminalRealizationKind::SsrcPreterminalFfmpegPackage
+            | PcmTerminalRealizationKind::SsrcPreterminalSoxPackage => false,
             PcmTerminalRealizationKind::NativeWavPackHybridPackage => false,
         },
         SelectedTerminalRealization::LossyFfmpegEncoderInput { .. } => true,
@@ -8670,6 +8692,24 @@ mod tests {
     }
 
     #[test]
+    fn non_wav_float_target_keeps_the_existing_float64_split() {
+        let mut request = forced_ssrc_wav_request(PcmBitDepth::Float32, DitherType::None);
+        request.settings.target_format = AudioFormat::Aiff;
+        request.output_path = PathBuf::from("out.aiff");
+
+        let immediate = resolve_ssrc_immediate_output(
+            &request,
+            44_100,
+            Some(PcmBitDepth::Float32),
+            false,
+            SampleGainPolicy::Off,
+        )
+        .expect("R5 integer package admission must not broaden ordinary float packaging");
+        assert_eq!(immediate.depth, PcmBitDepth::Float64);
+        assert_eq!(immediate.role, SsrcOutputRole::Nonterminal);
+    }
+
+    #[test]
     fn ordinary_ssrc_float64_profiles_remain_pcm_floating() {
         for (profile, expected_precision) in [
             (SsrcProfile::Standard, SsrcComputationPrecision::Single),
@@ -8844,6 +8884,59 @@ mod tests {
     }
 
     #[test]
+    fn forced_ssrc_direct_terminal_refuses_unavailable_destination_rate_dither() {
+        let mut request = forced_ssrc_wav_request(PcmBitDepth::Int16, DitherType::Tpdf);
+        request.settings.target_sample_rate = RateTarget::PcmHz(176_400);
+
+        let Ok(PlanningOutcome::Refused(refusal)) = plan_typed(&request) else {
+            panic!("forced SSRC must refuse a dither selection the destination rate cannot execute")
+        };
+        assert_eq!(refusal.code, "ssrc_terminal_dither_unavailable");
+        assert!(refusal.reason.contains("176400"), "{}", refusal.reason);
+        assert!(refusal.reason.contains("dither"), "{}", refusal.reason);
+    }
+
+    #[test]
+    fn forced_ssrc_direct_terminal_keeps_none_valid_without_destination_dither_table() {
+        let mut request = forced_ssrc_wav_request(PcmBitDepth::Int16, DitherType::None);
+        request.settings.target_sample_rate = RateTarget::PcmHz(176_400);
+
+        let Ok(PlanningOutcome::Ready(plan)) = plan_typed(&request) else {
+            panic!("undithered SSRC terminal must remain valid without a destination dither table")
+        };
+        let resolved = plan
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                TypedPlanNode::Operation {
+                    operation: PlanOperation::ResamplePcm { .. },
+                    resolved_parameters,
+                    ..
+                } => Some(resolved_parameters),
+                _ => None,
+            })
+            .expect("SSRC resampler parameters");
+        match resolved {
+            ResolvedOperationParameters::ResampleSsrc {
+                effective_output_depth,
+                output_role,
+                effective_dither,
+                ..
+            } => {
+                assert_eq!(*effective_output_depth, PcmBitDepth::Int16);
+                assert_eq!(*output_role, SsrcOutputRole::Terminal);
+                assert_eq!(
+                    effective_dither.availability,
+                    crate::plugins::SsrcDitherAvailability::Inactive
+                );
+                assert!(effective_dither.dither_id.is_none());
+                assert!(effective_dither.pdf_type.is_none());
+            }
+            other => panic!("unexpected SSRC resolved parameters: {other:?}"),
+        }
+    }
+
+    #[test]
     fn forced_ssrc_int16_terminal_records_integer_domain_and_native_tpdf() {
         let request = forced_ssrc_wav_request(PcmBitDepth::Int16, DitherType::Tpdf);
         let Ok(PlanningOutcome::Ready(plan)) = plan_typed(&request) else {
@@ -8900,11 +8993,70 @@ mod tests {
     }
 
     #[test]
-    fn explicit_int32_dither_splits_ssrc_to_float64_before_later_terminal() {
+    fn explicit_int32_dither_remains_on_direct_ssrc_terminal() {
         let mut request = forced_ssrc_wav_request(PcmBitDepth::Int32, DitherType::Tpdf);
         request.settings.dither_explicit = true;
         let Ok(PlanningOutcome::Ready(plan)) = plan_typed(&request) else {
-            panic!("explicit Int32 dither should use the retained split terminal")
+            panic!("explicit Int32 dither should remain on the ordinary SSRC terminal")
+        };
+        let (resolved, selected) = plan
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                TypedPlanNode::Operation {
+                    operation: PlanOperation::ResamplePcm { .. },
+                    candidates,
+                    selected_candidate,
+                    resolved_parameters,
+                    ..
+                } => Some((resolved_parameters, &candidates[*selected_candidate])),
+                _ => None,
+            })
+            .expect("SSRC resampler parameters");
+        match resolved {
+            ResolvedOperationParameters::ResampleSsrc {
+                effective_output_depth,
+                output_role,
+                effective_dither,
+                ..
+            } => {
+                assert_eq!(*effective_output_depth, PcmBitDepth::Int32);
+                assert_eq!(*output_role, SsrcOutputRole::Terminal);
+                assert_eq!(effective_dither.dither_id, Some(99));
+                assert_eq!(effective_dither.pdf_type, Some(SsrcPdfType::Triangular));
+                assert_eq!(
+                    effective_dither.availability,
+                    crate::plugins::SsrcDitherAvailability::Active
+                );
+            }
+            other => panic!("unexpected SSRC resolved parameters: {other:?}"),
+        }
+        let Some(SelectedTerminalRealization::Pcm(realization)) =
+            selected.contract.terminal_realization.as_ref()
+        else {
+            panic!("SSRC terminal realization must be attached to the resampler")
+        };
+        assert_eq!(realization.kind, PcmTerminalRealizationKind::SsrcDirectWav);
+        assert_eq!(realization.dither_owner, PcmTerminalDitherOwner::SsrcResampler);
+        assert!(!plan.nodes.iter().any(|node| matches!(
+            node,
+            TypedPlanNode::Operation { operation: PlanOperation::EncodePcm { .. }, .. }
+        )));
+    }
+
+    #[test]
+    fn explicit_int32_dither_refuses_unavailable_ssrc_rate_but_none_remains_valid() {
+        let mut request = forced_ssrc_wav_request(PcmBitDepth::Int32, DitherType::Tpdf);
+        request.settings.dither_explicit = true;
+        request.settings.target_sample_rate = RateTarget::PcmHz(176_400);
+        let Ok(PlanningOutcome::Refused(refusal)) = plan_typed(&request) else {
+            panic!("176.4 kHz Int32 TPDF must fail before command construction")
+        };
+        assert_eq!(refusal.code, "ssrc_terminal_dither_unavailable");
+
+        request.settings.dither_type = DitherType::None;
+        let Ok(PlanningOutcome::Ready(plan)) = plan_typed(&request) else {
+            panic!("176.4 kHz Int32 with no dither must remain a direct SSRC terminal")
         };
         let resolved = plan
             .nodes
@@ -8925,18 +9077,190 @@ mod tests {
                 effective_dither,
                 ..
             } => {
-                assert_eq!(*effective_output_depth, PcmBitDepth::Float64);
-                assert_eq!(*output_role, SsrcOutputRole::Nonterminal);
-                assert_eq!(effective_dither.availability, crate::plugins::SsrcDitherAvailability::Inactive);
-                assert!(effective_dither.dither_id.is_none());
-                assert!(effective_dither.pdf_type.is_none());
+                assert_eq!(*effective_output_depth, PcmBitDepth::Int32);
+                assert_eq!(*output_role, SsrcOutputRole::Terminal);
+                assert_eq!(
+                    effective_dither.availability,
+                    crate::plugins::SsrcDitherAvailability::Inactive
+                );
             }
             other => panic!("unexpected SSRC resolved parameters: {other:?}"),
         }
-        assert!(plan.nodes.iter().any(|node| matches!(
-            node,
-            TypedPlanNode::Operation { operation: PlanOperation::EncodePcm { target_bit_depth: PcmBitDepth::Int32, .. }, .. }
-        )));
+    }
+
+    #[test]
+    fn lossless_flac_package_uses_ssrc_preterminal_and_keeps_dither_on_ssrc() {
+        let mut request = forced_ssrc_wav_request(PcmBitDepth::Int24, DitherType::Tpdf);
+        request.settings.target_format = AudioFormat::Flac;
+        request.output_path = PathBuf::from("out.flac");
+        request.settings.dither_explicit = true;
+
+        let Ok(PlanningOutcome::Ready(plan)) = plan_typed(&request) else {
+            panic!("lossless FLAC packaging should preserve an SSRC-owned integer terminal")
+        };
+        let (resolved, selected) = plan
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                TypedPlanNode::Operation {
+                    operation: PlanOperation::ResamplePcm { .. },
+                    candidates,
+                    selected_candidate,
+                    resolved_parameters,
+                    ..
+                } => Some((resolved_parameters, &candidates[*selected_candidate])),
+                _ => None,
+            })
+            .expect("selected SSRC resampler");
+        match resolved {
+            ResolvedOperationParameters::ResampleSsrc {
+                effective_output_depth,
+                output_role,
+                effective_dither,
+                ..
+            } => {
+                assert_eq!(*effective_output_depth, PcmBitDepth::Int24);
+                assert_eq!(*output_role, SsrcOutputRole::Terminal);
+                assert_eq!(effective_dither.dither_id, Some(99));
+                assert_eq!(effective_dither.pdf_type, Some(SsrcPdfType::Triangular));
+            }
+            other => panic!("unexpected SSRC resolved parameters: {other:?}"),
+        }
+        let Some(SelectedTerminalRealization::Pcm(realization)) =
+            selected.contract.terminal_realization.as_ref()
+        else {
+            panic!("SSRC package realization must be attached to the resampler")
+        };
+        assert_eq!(
+            realization.kind,
+            PcmTerminalRealizationKind::SsrcPreterminalFfmpegPackage
+        );
+        assert_eq!(realization.target_format, AudioFormat::Flac);
+        assert_eq!(realization.dither_owner, PcmTerminalDitherOwner::SsrcResampler);
+        assert!(
+            !plan.nodes.iter().any(|node| matches!(
+                node,
+                TypedPlanNode::Operation { operation: PlanOperation::EncodePcm { .. }, .. }
+            )),
+            "sample-preserving packaging must not become a second semantic PCM terminal",
+        );
+    }
+
+    #[test]
+    fn lossless_wavpack_int24_package_uses_ssrc_preterminal_and_sox_packages_only() {
+        let mut request = forced_ssrc_wav_request(PcmBitDepth::Int24, DitherType::Tpdf);
+        request.settings.target_format = AudioFormat::WavPack;
+        request.settings.wavpack.hybrid = false;
+        request.output_path = PathBuf::from("out.wv");
+        request.settings.dither_explicit = true;
+
+        let Ok(PlanningOutcome::Ready(plan)) = plan_typed(&request) else {
+            panic!("lossless WavPack Int24 packaging should preserve an SSRC-owned integer terminal")
+        };
+        let (resolved, selected) = plan
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                TypedPlanNode::Operation {
+                    operation: PlanOperation::ResamplePcm { .. },
+                    candidates,
+                    selected_candidate,
+                    resolved_parameters,
+                    ..
+                } => Some((resolved_parameters, &candidates[*selected_candidate])),
+                _ => None,
+            })
+            .expect("selected SSRC resampler");
+        match resolved {
+            ResolvedOperationParameters::ResampleSsrc {
+                effective_output_depth,
+                output_role,
+                effective_dither,
+                ..
+            } => {
+                assert_eq!(*effective_output_depth, PcmBitDepth::Int24);
+                assert_eq!(*output_role, SsrcOutputRole::Terminal);
+                assert_eq!(effective_dither.dither_id, Some(99));
+                assert_eq!(effective_dither.pdf_type, Some(SsrcPdfType::Triangular));
+            }
+            other => panic!("unexpected SSRC resolved parameters: {other:?}"),
+        }
+        let Some(SelectedTerminalRealization::Pcm(realization)) =
+            selected.contract.terminal_realization.as_ref()
+        else {
+            panic!("SSRC WavPack package realization must be attached to the resampler")
+        };
+        assert_eq!(
+            realization.kind,
+            PcmTerminalRealizationKind::SsrcPreterminalSoxPackage
+        );
+        assert_eq!(realization.target_format, AudioFormat::WavPack);
+        assert_eq!(realization.target_bit_depth, PcmBitDepth::Int24);
+        assert!(!realization.wavpack_hybrid);
+        assert_eq!(realization.dither_owner, PcmTerminalDitherOwner::SsrcResampler);
+        assert!(
+            !plan.nodes.iter().any(|node| matches!(
+                node,
+                TypedPlanNode::Operation { operation: PlanOperation::EncodePcm { .. }, .. }
+            )),
+            "sample-preserving SoX packaging must not become a second semantic PCM terminal",
+        );
+    }
+
+    #[test]
+    fn lossless_wavpack_int24_package_refuses_unavailable_ssrc_dither_before_split() {
+        let mut request = forced_ssrc_wav_request(PcmBitDepth::Int24, DitherType::Tpdf);
+        request.settings.target_format = AudioFormat::WavPack;
+        request.settings.wavpack.hybrid = false;
+        request.output_path = PathBuf::from("out.wv");
+        request.settings.target_sample_rate = RateTarget::PcmHz(176_400);
+        request.settings.dither_explicit = true;
+
+        let Ok(PlanningOutcome::Refused(refusal)) = plan_typed(&request) else {
+            panic!("WavPack Int24 packaging must not evade unavailable SSRC dither via Float64 split")
+        };
+        assert_eq!(refusal.code, "ssrc_terminal_dither_unavailable");
+
+        request.settings.dither_type = DitherType::None;
+        let Ok(PlanningOutcome::Ready(plan)) = plan_typed(&request) else {
+            panic!("WavPack Int24 with no dither must retain SSRC terminal ownership")
+        };
+        let realization = plan
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                TypedPlanNode::Operation {
+                    operation: PlanOperation::ResamplePcm { .. },
+                    candidates,
+                    selected_candidate,
+                    ..
+                } => candidates[*selected_candidate].contract.terminal_realization.as_ref(),
+                _ => None,
+            })
+            .expect("SSRC WavPack Int24 terminal realization");
+        let SelectedTerminalRealization::Pcm(realization) = realization else {
+            panic!("expected PCM terminal realization")
+        };
+        assert_eq!(
+            realization.kind,
+            PcmTerminalRealizationKind::SsrcPreterminalSoxPackage
+        );
+        assert_eq!(realization.effective_dither, None);
+        assert_eq!(realization.dither_owner, PcmTerminalDitherOwner::None);
+    }
+
+    #[test]
+    fn lossless_flac_package_refuses_unavailable_ssrc_dither_before_split() {
+        let mut request = forced_ssrc_wav_request(PcmBitDepth::Int16, DitherType::Tpdf);
+        request.settings.target_format = AudioFormat::Flac;
+        request.output_path = PathBuf::from("out.flac");
+        request.settings.target_sample_rate = RateTarget::PcmHz(176_400);
+        request.settings.dither_explicit = true;
+
+        let Ok(PlanningOutcome::Refused(refusal)) = plan_typed(&request) else {
+            panic!("non-WAV packaging must not evade unavailable SSRC dither via Float64 split")
+        };
+        assert_eq!(refusal.code, "ssrc_terminal_dither_unavailable");
     }
 
     #[test]

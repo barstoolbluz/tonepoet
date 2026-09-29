@@ -518,9 +518,16 @@ pub const REFERENCE_NUMERICAL_SOURCE_BINDING: &str =
 /// Candidate declaration: concrete common Reference source digest is supplied by the build closure.
 pub const REFERENCE_COMMON_SOURCE_BINDING: &str =
     "build-bound:TONEPOET_REFERENCE_COMMON_SOURCE_SHA256/v1";
-/// Candidate declaration: the concrete target dispatch is measured at runtime.
+/// Portable x86_64 Reference admits every qualified in-process dispatch tier
+/// while external-tool dispatch is constrained to the named deterministic set.
 pub const REFERENCE_SIMD_BINDING: &str =
-    "runtime-bound:reference_runtime_dispatch_digest/same-graph-avx-qualified/v1";
+    "qualified-set:tonepoet-true-peak/reference-dispatch/loudness[scalar,sse2,avx]+certified-peak[scalar,avx]+ffmpeg[sse+sse2]+libsoxr[SOXR_USE_SIMD=0]/v4";
+/// In-process loudness SIMD tiers admitted by the x86_64 qualification.
+pub const REFERENCE_QUALIFIED_X86_64_LOUDNESS_DISPATCH_TIERS: [&str; 3] =
+    ["scalar", "sse2", "avx"];
+/// In-process certified-peak SIMD tiers admitted by the x86_64 qualification.
+pub const REFERENCE_QUALIFIED_X86_64_CERTIFIED_PEAK_DISPATCH_TIERS: [&str; 2] =
+    ["scalar", "avx"];
 /// Candidate declaration: the exact compiler/build identity is supplied by the root build script.
 pub const REFERENCE_COMPILER_BUILD_BINDING: &str =
     "build-bound:TONEPOET_COMPILER_BUILD_CLOSURE/v1";
@@ -624,7 +631,7 @@ impl ReferenceCommonPrimitiveClosureV1 {
                 "{REFERENCE_R64_READER_ID}+{REFERENCE_QPCM_READER_ID}"
             ),
             tool_identity_version_closure: format!(
-                "sox-ng-14.8.0.1+{}+phase4-native-metadata",
+                "sox-ng-14.8.0.1+{}+portable-runtime-closure-manifest/v1+phase4-native-metadata",
                 crate::FFMPEG_INT32_TRIANGULAR_TERMINAL_AUTHORITY_ID,
             ),
             reconstruction_profile: "sealed-reference-profile-matrix-v18-sacd-multichannel-target-limited".to_string(),

@@ -2049,7 +2049,9 @@ Mechanism and scope are the implementer's call. Described in full as section B o
 
 ## 27. The conversion manifest is written to the output root, not the album folder, and serves nobody
 
-**Status 2026-09-26:** resolved. `PublishPolicy::write_manifest` defaults to false and every
+**Status 2026-09-28:** NOT resolved; reopened as #53. The 2026-09-26 note below was wrong: it quoted the very line `req.publish.write_manifest || reference_manifest_required` and still missed that the Reference route writes the manifest unconditionally. Every Reference album publish since July writes `.tonepoet-manifest.json` into the album folder.
+
+**Status 2026-09-26 (superseded):** resolved. `PublishPolicy::write_manifest` defaults to false and every
 production request builder sets it false (commit e665357, "manifest default-off"); no
 `.tonepoet-manifest.json` appeared in any 2026-09-26 field output root. The `rerun` reader still
 exists but has nothing to read.
@@ -3249,3 +3251,257 @@ is done and shortened deterministically, with the shortening disclosed in the st
 the conversion log. Publish's derived sibling names never push a legal album name over the
 limit. The same conversion with `--folder-naming "%ALBUM%"` converts today; with the preset's
 template it must convert too.
+
+## 52. Saving the SACD editor refuses a sidecar authored by foobar2000 for a two-area disc
+
+Filed 2026-09-27. Bach, Die Kunst der Fuge (Channel Classics CCS SA 38316), SACD ISO with
+18 stereo and 18 multichannel tracks. The folder carries a foobar2000 SACD metabase XML from
+2022 with 18 `<track>` elements, ids 1-18, TOTALTRACKS 18, full TITLE/ARTIST/COMPOSER/
+PERFORMER tags and ReplayGain. Saving from the editor with both presentation tabs open fails:
+
+```
+SACD sidecar save failed: sidecar area 2 has 0 track(s) but presentation 'Multichannel'
+has 18; refusing to map
+```
+
+### Why
+
+tonepoet's sidecar convention (`src/tui/sacd_sidecar.rs`, `tracks_for_area`) is continuous
+ids: 1..N1 for the stereo area, N1+1..N1+N2 for the multichannel area. The foobar2000 plugin
+exposes one area at a time and its metabase never carries a second block, so its XML covers
+one area only. The save path (`src/tui/keybindings.rs`, the `sidecar area {} has {} track(s)`
+refusal) has a mint branch for a missing XML, seeding both areas from the ISO, and an update
+branch that requires the XML to cover every presentation. There is no path for an XML that
+covers fewer areas than the disc. Nothing is lost; the save is refused with the mismatch named.
+
+This shape is common: any SACD folder with a foobar-authored XML and a multichannel layer.
+The user's requirement is backward compatibility with these files: tonepoet must read, keep,
+and extend them rather than demand its own two-area layout.
+
+### Required
+
+- The editor saves over a sidecar that covers fewer areas than the disc. The missing area is
+  seeded from the ISO's table of contents on the continuous id scheme, the existing area's
+  entries and ReplayGain are carried through untouched, and the status line discloses that the
+  sidecar was extended.
+- A sidecar whose track count matches neither area, or whose ids fit neither area, is still
+  refused with the mismatch named.
+- The extended file is still readable by tonepoet and does not disturb the foobar2000 entries
+  it started from. Whether foobar2000 itself reads the extended file is to be established, not
+  assumed.
+
+
+## 53. tonepoet writes hidden files into the user's output folders. This must never happen.
+
+Filed 2026-09-28, the third time the same pattern has been discovered in the field. #27 was
+declared resolved on 2026-09-26 by defaulting `PublishPolicy::write_manifest` to false; the
+Reference route ignores that default (`stages.rs`: "Native Reference publication always
+carries manifest-v2 authority", `reference_manifest_required`) and has written a 20-55 KB
+`.tonepoet-manifest.json` into every Reference album folder since the P0 implementation
+landed (385a914, 2026-07-19). The user found it in a library folder on 2026-09-27.
+
+### The user's requirement, verbatim in substance
+
+No human user, hobbyist or prosumer, wants a hidden file created by a tool they may not even
+remember, travelling with their music. It is clutter and wasted space. It is unacceptable in
+any form, on any route, under any option, and it must not recur.
+
+### Required
+
+- A conversion writes into the destination exactly the artifacts the user asked for: the
+  audio files, and when enabled the conversion log, CUE sheet, and companion artwork. Nothing
+  else. No hidden files, no dotfiles, no manifests, no markers, no locks left behind, on any
+  route including Reference.
+- Whatever the Reference route needs for incremental publish, rerun detection, or the
+  P0-020 authority check lives outside the destination, for example in tonepoet's database,
+  keyed by content hashes, or is dropped. The route's guarantees hold unchanged.
+- If the route needs a working file for this, it is fine to create one, in tonepoet's own
+  temp or scratch space, never in the destination, and tonepoet cleans it up: on close of the
+  conversion, or, if that is missed, periodically as garbage collection. (User's decision,
+  2026-09-28.)
+
+### Addendum 2026-09-28: the staging directory is the same problem, at 31 GB
+
+`<output root>/.tonepoet-staging/` is where every job stages its converted tracks and
+Reference auto-gain carriers before Publish. It lives in the user's output root, not in
+tonepoet's temp space. On 2026-09-28 the user's output root `~/temp` held four leftover
+`job-<uuid>-<uuid>` directories totalling 31 GB, from conversions on 2026-09-27 16:47, 20:09,
+21:56 and 2026-09-28 00:15 that failed at Publish (#51) or were interrupted. Nothing removes
+them: there is no cleanup on failure and no garbage collection. A successful publish removes
+its own job directory but leaves `.tonepoet-staging` itself behind.
+
+Required, in addition to the above: staging lives in tonepoet's temp space, or, if same-
+filesystem atomic publish demands a sibling of the destination, it is removed with the job on
+every exit path, success, failure, cancel and crash, and a periodic sweep removes anything
+orphaned. The output root ends a conversion with no `.tonepoet-*` entry in it.
+- A test asserts the destination's file set after a Reference album publish, and after every
+  other route, equals the user-visible artifacts and nothing else, so this cannot come back
+  silently.
+- `docs/` and briefs carry this as a standing rule for every future delivery.
+
+## 54. `manage_tmux_clipboard` silently no-ops under byobu whenever `$BYOBU_CONFIG_DIR` is not `~/.byobu`
+
+Filed 2026-09-28 while restoring OSC 52 copy/cut from the metadata-editing overlay on a
+fresh host: SSH → byobu (tmux 3.5a backend), no `DISPLAY`/`WAYLAND_DISPLAY`
+(`XDG_SESSION_TYPE=tty`), so OSC 52 through `/dev/tty` is the only write transport
+available.
+
+The user cannot copy or cut from the TUI. `set-clipboard` is at tmux's default
+`external`, which emits OSC 52 when tmux itself copies but refuses to forward it from
+applications running inside tmux. The documented remedy — `[ui] manage_tmux_clipboard =
+true`, per `:help clipboard` — reports success and changes nothing.
+
+### Why
+
+`target_config_path_from()` (`src/tui/tmux_clipboard.rs:54`) hardcodes the byobu target:
+
+```rust
+Some("tmux") => Some(home.join(".byobu").join(".tmux.conf")),
+```
+
+with the comment "Byobu's tmux profile sources ~/.byobu/.tmux.conf and ignores
+~/.tmux.conf entirely." The second half is right; the first is only true when
+`$BYOBU_CONFIG_DIR` happens to be `~/.byobu`. Byobu's profile actually sources
+`$BYOBU_CONFIG_DIR/.tmux.conf` (`/usr/share/byobu/profiles/tmuxrc:30`), and on Debian and
+Ubuntu that variable is `~/.config/byobu` — the XDG layout, which is byobu's default on
+those distributions. On this host both files exist and are empty; tonepoet writes the one
+byobu never reads.
+
+The failure is silent in both directions: the write succeeds, the marker block lands, the
+managed-block round trip in `ensure_clipboard_block` is satisfied, and nothing ever checks
+that the chosen path is on byobu's source list. The user is left believing OSC 52
+passthrough is configured.
+
+Not byobu-specific in principle — the plain-tmux branch assumes `~/.tmux.conf` and would
+miss `$XDG_CONFIG_HOME/tmux/tmux.conf`, which tmux 3.1+ reads — but byobu is where a
+default distro install breaks it.
+
+### Workaround in use
+
+The block was written by hand to `~/.config/byobu/.tmux.conf` using tonepoet's own markers
+(so a fixed `manage_tmux_clipboard` will adopt rather than duplicate it) and applied live
+with `tmux set-option -g`. Copy from the overlay then works, subject to the outer terminal
+permitting OSC 52 writes.
+
+### Required
+
+`target_config_path_from()` honors `$BYOBU_CONFIG_DIR` when the backend is tmux, falling
+back to `~/.byobu` only when the variable is unset, and takes `$XDG_CONFIG_HOME` into
+account on the plain-tmux branch. The function is already pure over its environment and
+its tests cover the branches by construction (`tmux_clipboard.rs:254-268`), so the
+parameter list grows by one and the existing cases stay meaningful. Failing that, the
+feature must verify the file it wrote is one the running multiplexer loads and report
+plainly when it is not, rather than claiming a success the user cannot observe.
+
+## 55. Int32 + TPDF + album true-peak fails whenever the target rate differs from the source
+
+Filed 2026-09-28. Boston, *Boston* (Japan Epic 25AP 296), one 2.1 GB WavPack image —
+float32, 192 kHz, stereo — with a sidecar CUE, 8 tracks. Settings: FLAC, Int32, TPDF
+dither, ReplayGain/true-peak in album scope with a 0.1 dB margin.
+
+Targeting 176.4 kHz fails every track with:
+
+```
+backend encode failed: qualified FFmpeg Int32 triangular-dither terminal is
+unavailable (qualified FFmpeg terminal is missing its resolved out_sample_rate)
+```
+
+Targeting 192 kHz succeeds on all 8 tracks and produces correct s32/192 kHz FLAC with
+ReplayGain tags. The only difference is whether the target rate equals the source rate.
+
+### What is established
+
+The refusal is `track_executor.rs:1674`. When the selected terminal realization carries a
+resolved target rate, the emitted `aresample` filter must contain `out_sample_rate` equal
+to both the input rate and the target rate; when the realization carries no rate, the
+filter must not contain the key at all. Both modes are deliberate.
+
+The album true-peak flow stages each track to a Float64 carrier before the terminal,
+which is what makes this the *qualified* Int32 triangular terminal —
+`matches_ffmpeg_int32_triangular_terminal_model` (`semantic_plan.rs:981`) requires
+`input_precision == Pcm(Float64)`. Commissioning for x86_64 is `true` (`:967`).
+
+From the succeeding 192 kHz run's conversion log, the terminal is:
+
+```
+ffmpeg ... -f f64le -ar 192000 -ac 2 -i pipe:0 ...
+  -af aresample=resampler=soxr:precision=33:cutoff=0.950:dither_method=triangular:out_sample_fmt=s32
+```
+
+No `out_sample_rate`, and it passes, because at same rate the realization reports `None`.
+
+Planning alone is self-consistent in both directions. Asking the planner directly for
+WavPack-f32-192k to FLAC-Int32 under album true-peak yields, for a 176.4 kHz target,
+`target_rate_hz=Some(176400)` with a filter that *does* carry `out_sample_rate=176400`;
+for a 192 kHz target, `target_rate_hz=None` with a filter that omits it. Neither trips
+the check.
+
+The filter builder omits the key whenever no rate change is requested of that step
+(`tonepoet-pipeline/src/plugins.rs:1832`). That is not an R6 regression — pre-bundle
+`main` @ `70e5e4f` emits a byte-identical filter.
+
+### Hypothesis — unverified, may be wrong
+
+Something in the album carrier flow, which planning-only inspection does not exercise,
+produces a terminal whose realization reports a resolved rate while its filter reports
+none. A carrier already resampled to the target rate before the terminal step would have
+that shape. The real 176.4 kHz command was never captured, so this is a lead rather than
+a finding.
+
+Which side is wrong is also unsettled: the terminal may need to pin its rate explicitly
+even when same-rate, or the realization may need to report no rate once the carrier is
+already at rate.
+
+### Required
+
+That conversion succeeds. More generally, Int32 with TPDF and album true-peak produces
+correct output at any supported target rate whether or not it differs from the source
+rate, and the qualified terminal's self-consistency check either passes or refuses for a
+true reason. A regression covers the rate-change case specifically; that is the case with
+no coverage today.
+
+## 56. MusicBrainz tagging refuses a single-image APE + sidecar CUE album because the editor opened one row instead of fourteen
+
+Filed 2026-09-29. `~/torrents/Pret-A-Porter_OST` — *Prêt-à-Porter* soundtrack, one
+455 MB Monkey's Audio image (`Various - Pret-А-Porter.ape`) with a sidecar
+`Various - Pret-А-Porter.cue` carrying 14 `TRACK ... AUDIO` entries. The CUE is
+ISO-8859 with CRLF terminators and its `FILE` line names the `.ape`. The folder
+also holds a `.log` and several cover images.
+
+The MusicBrainz lookup succeeds and the release picker works. On choosing a
+release, populating the metadata-editing overlay fails in the status bar with:
+
+```
+:tags-mb: refusing incomplete release data: MusicBrainz track projection parsed
+14 tracks but the editor expects 1
+```
+
+MusicBrainz parsed the release correctly — 14 tracks, matching the CUE. The
+refusal is the dimensional-agreement guard at `src/tui/musicbrainz.rs:1187`
+(and the equivalent at `:1195`), which requires the projected track count to
+equal the editor's row count before any mutation is allowed. The guard is doing
+what it says; the disagreement is upstream of it.
+
+The user reports MusicBrainz tagging has worked on other albums up to this one.
+
+### Hypothesis — unverified
+
+`n_tracks` is 1, which is what the editor would report if it opened on the APE
+image as a single whole-file row rather than on the 14 CUE-derived track rows.
+APE is decode-only and not tag-writable (`AudioFormat::input_decodable` vs
+`output_encodable`, `formats.rs:133`), so an untaggable single-image album may
+not be getting the sidecar-CUE album surface that an equivalent FLAC image
+receives. Whether the APE-ness is the discriminator, or something else about
+this folder is, was not established — the editor's row construction for this
+album was never inspected. Treat as a lead.
+
+### Required
+
+A single-image album whose sidecar CUE defines N tracks presents N editable
+track rows in the metadata editor, and a MusicBrainz release with N tracks
+applies to it, whether or not the image format is tag-writable. Where the
+carrier genuinely cannot hold the result, the refusal names that — not a track
+count the user has no way to act on.
+
+The count-agreement guard itself stays. It caught a real inconsistency; it
+should not be relaxed to let a 14-vs-1 mismatch through.

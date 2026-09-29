@@ -189,7 +189,12 @@ fn ssrc_active_attenuation_min_phase_and_dither_are_bound_end_to_end() {
     assert_active_change(&base, &dither, |parameters| {
         matches!(parameters, ResolvedOperationParameters::ResampleSsrc { .. })
     });
-    assert!(command_has_fragment(&dither, "dither_method=triangular"));
+    // R6: SSRC owns the terminal integer samples for admitted lossless
+    // package-only cells, so TPDF binds as SSRC's own `--dither 99 --pdf 1`
+    // rather than as an FFmpeg `dither_method=triangular` on a later terminal.
+    assert!(command_has_sequence(&dither, &["--dither", "99"]));
+    assert!(command_has_sequence(&dither, &["--pdf", "1"]));
+    assert!(!command_has_fragment(&dither, "dither_method="));
 }
 
 #[test]

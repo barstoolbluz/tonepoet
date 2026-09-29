@@ -1221,6 +1221,45 @@ async fn realize_track_with_tool_limits_and_stats(
             // decode/re-encode this retained authority.
             Ok(RealizedTrackInfo::without_stats(path.clone()))
         }
+        TrackSourceRef::PcmTruePeakCarrier {
+            path,
+            sample_rate_hz,
+            channels,
+            gain_db,
+            ssrc_true_peak_replay: Some(replay),
+            ..
+        } => {
+            if !path.exists() || !path.is_file() {
+                return Err(ConvertError::TrackValidation(format!(
+                    "certified SSRC true-peak observation carrier is missing or not a regular file: {}",
+                    path.display(),
+                )));
+            }
+            let gain_db = gain_db.ok_or_else(|| {
+                ConvertError::TrackValidation(
+                    "certified SSRC true-peak carrier reached realization before its gain authority was bound"
+                        .to_string(),
+                )
+            })?;
+            replay
+                .binding
+                .validate_gain_db_nano(gain_db.0)
+                .map_err(ConvertError::TrackValidation)?;
+            if *sample_rate_hz == 0
+                || *channels == 0
+                || replay.target_rate_hz != *sample_rate_hz
+                || replay.channels != *channels
+            {
+                return Err(ConvertError::TrackValidation(
+                    "certified SSRC true-peak replay geometry disagrees with the measured carrier"
+                        .to_string(),
+                ));
+            }
+            // The observation carrier is retained only as measurement
+            // authority. The final scalar belongs to the certified SSRC
+            // replay itself, so the common realizer must not apply it here.
+            Ok(RealizedTrackInfo::without_stats(path.clone()))
+        }
         TrackSourceRef::DsdTruePeakCarrier {
             path,
             sample_rate_hz,
@@ -1358,6 +1397,29 @@ async fn realize_track_with_tool_limits_and_stats(
                             path.display(),
                         )));
                     }
+                }
+                RegisteredEffectCarrierRepresentation::CertifiedSsrcTruePeakTerminalW64 { bit_depth } => {
+                    let mut file = fs::File::open(path).map_err(ConvertError::Io)?;
+                    let encoding = if bit_depth.is_float() {
+                        tonepoet_pipeline::W64SampleEncoding::FloatingPoint
+                    } else {
+                        tonepoet_pipeline::W64SampleEncoding::SignedInteger
+                    };
+                    tonepoet_pipeline::inspect_exact_w64_pcm(
+                        &mut file,
+                        tonepoet_pipeline::W64PcmFormatExpectation {
+                            sample_rate_hz: *sample_rate_hz,
+                            channels: *channels,
+                            bits_per_sample: bit_depth.bits() as u16,
+                            encoding,
+                        },
+                    )
+                    .map_err(|error| {
+                        ConvertError::TrackValidation(format!(
+                            "registered-effect certified SSRC Wave64 carrier {} is invalid: {error}",
+                            path.display(),
+                        ))
+                    })?;
                 }
             }
             Ok(RealizedTrackInfo::without_stats(path.clone()))
@@ -3442,6 +3504,13 @@ pub fn plan_outputs(
     source: &PreparedSource,
     req: &PipelineRequest,
 ) -> Result<AlbumPlan, PlanError> {
+    plan_outputs_with_name_shortening_notices(source, req).map(|(plan, _)| plan)
+}
+
+fn plan_outputs_with_name_shortening_notices(
+    source: &PreparedSource,
+    req: &PipelineRequest,
+) -> Result<(AlbumPlan, Vec<OutputNameShorteningNotice>), PlanError> {
     if source.tracks.is_empty() {
         return Err(PlanError::EmptyManifest);
     }
@@ -3453,6 +3522,8 @@ pub fn plan_outputs(
         .map_err(PlanError::InvalidTemplate)?;
 
     let output_root = normalize_path(&req.output_root);
+    let component_limit = crate::fs_limits::name_max_bytes_for(&output_root);
+    let mut shortening_notices = BTreeSet::new();
     let folder_template_uses_disc_tokens = req
         .naming
         .folder_template
@@ -3462,10 +3533,16 @@ pub fn plan_outputs(
         match &req.naming.folder_template {
             Some(tmpl) => {
                 let rendered = render_folder_template(tmpl, source, &req.settings);
-                output_root.join(apply_windows_portable_path(
+                let rendered = apply_windows_portable_path(
                     rendered,
                     req.naming.windows_portable,
                     "Album",
+                );
+                output_root.join(shorten_relative_path_components(
+                    rendered,
+                    component_limit,
+                    true,
+                    &mut shortening_notices,
                 ))
             }
             None => {
@@ -3477,11 +3554,17 @@ pub fn plan_outputs(
                         .or_else(|| source.container.file_stem().and_then(|s| s.to_str()))
                         .unwrap_or("Album"),
                 );
-                output_root.join(if req.naming.windows_portable {
+                let album_component = if req.naming.windows_portable {
                     windows_portable_component(&album_component, "Album")
                 } else {
                     album_component
-                })
+                };
+                output_root.join(shorten_component_for_filesystem(
+                    &album_component,
+                    component_limit,
+                    false,
+                    &mut shortening_notices,
+                ))
             }
         }
     } else if req.naming.per_album_subdir && req.naming.folder_template.is_none() {
@@ -3493,11 +3576,17 @@ pub fn plan_outputs(
                 .or_else(|| source.container.file_stem().and_then(|s| s.to_str()))
                 .unwrap_or("Album"),
         );
-        output_root.join(if req.naming.windows_portable {
+        let album_component = if req.naming.windows_portable {
             windows_portable_component(&album_component, "Album")
         } else {
             album_component
-        })
+        };
+        output_root.join(shorten_component_for_filesystem(
+            &album_component,
+            component_limit,
+            false,
+            &mut shortening_notices,
+        ))
     } else {
         output_root.clone()
     };
@@ -3520,6 +3609,15 @@ pub fn plan_outputs(
             req.naming.windows_portable,
             "untitled",
         );
+        // The leaf receives its target extension below and is shortened only
+        // after that extension is known. Intermediate template components can
+        // be clamped immediately.
+        let rel = shorten_relative_path_components(
+            rel,
+            component_limit,
+            false,
+            &mut shortening_notices,
+        );
         reject_escaping_path(&rel).map_err(PlanError::InvalidTemplate)?;
 
         let album_dir_for_track = if req.naming.per_album_subdir && folder_template_uses_disc_tokens {
@@ -3529,10 +3627,16 @@ pub fn plan_outputs(
                 .as_deref()
                 .expect("folder_template_uses_disc_tokens requires a folder template");
             let rendered = render_folder_template_for_track(tmpl, source, track, &req.settings);
-            output_root.join(apply_windows_portable_path(
+            let rendered = apply_windows_portable_path(
                 rendered,
                 req.naming.windows_portable,
                 "Album",
+            );
+            output_root.join(shorten_relative_path_components(
+                rendered,
+                component_limit,
+                true,
+                &mut shortening_notices,
             ))
         } else {
             static_album_dir.clone()
@@ -3544,6 +3648,11 @@ pub fn plan_outputs(
 
         let mut final_path = normalize_path(&album_dir_for_track.join(rel));
         append_default_extension(&mut final_path, &req.settings.target_format, req.container_extension.as_deref());
+        final_path = shorten_final_path_component(
+            final_path,
+            component_limit,
+            &mut shortening_notices,
+        );
         if !path_is_under_root(&final_path, &output_root) {
             return Err(PlanError::PathOutsideOutputRoot(
                 final_path.display().to_string(),
@@ -3569,6 +3678,11 @@ pub fn plan_outputs(
                         final_path = append_collision_suffix(
                             &original,
                             &format!("{:03}-{attempt}", track.id.source_ordinal),
+                        );
+                        final_path = shorten_final_path_component(
+                            final_path,
+                            component_limit,
+                            &mut shortening_notices,
                         );
                         collision_key = normalized_collision_key(&final_path);
                         if !seen.contains(&collision_key) {
@@ -3597,11 +3711,14 @@ pub fn plan_outputs(
         .cloned()
         .unwrap_or(static_album_dir);
 
-    Ok(AlbumPlan {
-        album_dir,
-        album_dirs,
-        entries,
-    })
+    Ok((
+        AlbumPlan {
+            album_dir,
+            album_dirs,
+            entries,
+        },
+        shortening_notices.into_iter().collect(),
+    ))
 }
 
 /// Resolve the album directory at the queue-dispatch boundary from the same
@@ -3833,6 +3950,116 @@ async fn select_scalar_transport_or_materialized_baseline(
     realized.path = output;
     realized.scalar_pump = None;
     Ok(realized)
+}
+
+#[derive(Debug)]
+struct FinalExecutionInput {
+    planner_track: PreparedTrack,
+    realized_input: PathBuf,
+    scalar_pump: Option<RetainedPcmScalarPump>,
+    prefix_commands: Vec<CommandRecord>,
+    prefix_elapsed: Duration,
+}
+
+async fn prepare_final_execution_input(
+    track: &PreparedTrack,
+    realized: RealizedTrackInfo,
+    convert_root: &Path,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_paths: &HashMap<String, PathBuf>,
+    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
+) -> Result<FinalExecutionInput, (String, Vec<CommandRecord>)> {
+    let TrackSourceRef::PcmTruePeakCarrier {
+        path: measured_carrier_path,
+        source_path,
+        sample_rate_hz,
+        channels,
+        duration,
+        gain_db,
+        strong_ssrc_resampler,
+        ssrc_true_peak_replay: Some(replay),
+        ..
+    } = &track.source_ref
+    else {
+        return Ok(FinalExecutionInput {
+            planner_track: track.clone(),
+            realized_input: realized.path,
+            scalar_pump: realized.scalar_pump,
+            prefix_commands: Vec::new(),
+            prefix_elapsed: Duration::ZERO,
+        });
+    };
+
+    if realized.scalar_pump.is_some() {
+        return Err((
+            "certified SSRC true-peak terminal reached final execution with an external scalar pump"
+                .to_string(),
+            Vec::new(),
+        ));
+    }
+    let gain_db = gain_db.ok_or_else(|| {
+        (
+            "certified SSRC true-peak terminal reached final execution before its gain was bound"
+                .to_string(),
+            Vec::new(),
+        )
+    })?;
+    let strong = strong_ssrc_resampler.as_deref().ok_or_else(|| {
+        (
+            "certified SSRC true-peak terminal lost the protected observation resampler binding"
+                .to_string(),
+            Vec::new(),
+        )
+    })?;
+    if replay.target_rate_hz != *sample_rate_hz || replay.channels != *channels {
+        return Err((
+            "certified SSRC true-peak replay disagrees with retained carrier geometry".to_string(),
+            Vec::new(),
+        ));
+    }
+
+    let track_stem = pcm_true_peak_track_stem(&track.id);
+    let terminal_path = convert_root.join(format!(
+        ".tonepoet-ssrc-terminal-{track_stem}-{}.w64",
+        &replay.ingress_sha256.to_hex()[..16],
+    ));
+    let (terminal_command, terminal_elapsed) = realize_bound_ssrc_true_peak_terminal(
+        replay,
+        strong,
+        gain_db,
+        measured_carrier_path,
+        &terminal_path,
+        runner,
+        cancel,
+        tool_paths,
+        tool_concurrency_limits,
+    )
+    .await?;
+
+    let mut planner_track = track.clone();
+    planner_track.source_ref = TrackSourceRef::RegisteredEffectCarrier {
+        path: terminal_path.clone(),
+        source_path: source_path.clone(),
+        sample_rate_hz: replay.target_rate_hz,
+        channels: replay.channels,
+        duration: *duration,
+        source_was_dsd: false,
+        resampler_consumed: true,
+        representation:
+            RegisteredEffectCarrierRepresentation::CertifiedSsrcTruePeakTerminalW64 {
+                bit_depth: replay.binding.scope.target_bit_depth,
+            },
+    };
+    planner_track.sample_rate = Some(replay.target_rate_hz);
+
+    Ok(FinalExecutionInput {
+        planner_track,
+        realized_input: terminal_path,
+        scalar_pump: None,
+        prefix_commands: vec![terminal_command],
+        prefix_elapsed: terminal_elapsed,
+    })
 }
 
 /// Build a deterministic failed track output for scheduler boundary failures.
@@ -4387,11 +4614,43 @@ async fn convert_one_track_work(
             });
         }
     };
-    let RealizedTrackInfo {
-        path: realized_input,
-        dsd_dst_stats: realized_dsd_dst_stats,
+    let realized_dsd_dst_stats = realized.dsd_dst_stats.clone();
+    let final_input = match prepare_final_execution_input(
+        &track,
+        realized,
+        &convert_root,
+        runner,
+        &cancel,
+        &tool_paths,
+        tool_concurrency_limits.as_ref(),
+    )
+    .await
+    {
+        Ok(input) => input,
+        Err((error, commands)) => {
+            let record = failed_track_record(
+                &track,
+                None,
+                Some(staged_path),
+                commands,
+                error,
+            );
+            return Ok(ScheduledTrackOutput {
+                index: track_index,
+                record,
+                artifact: None,
+                ok: false,
+                metadata_satisfaction: PlannedMetadataSatisfaction::none(),
+            });
+        }
+    };
+    let FinalExecutionInput {
+        planner_track,
+        realized_input,
         scalar_pump,
-    } = realized;
+        prefix_commands,
+        prefix_elapsed,
+    } = final_input;
 
     if let Some(parent) = staged_path.parent() {
         if let Err(err) = fs::create_dir_all(parent) {
@@ -4409,7 +4668,7 @@ async fn convert_one_track_work(
     let bytes_in = file_len(&realized_input);
     let executed = Box::pin(execute_planned_track_conversion_with_scalar_pump(
         &req,
-        &track,
+        &planner_track,
         &realized_input,
         scalar_pump,
         &staged_path,
@@ -4433,13 +4692,17 @@ async fn convert_one_track_work(
                     &track,
                     Some(realized_input),
                     Some(staged_path),
-                    executed.commands,
+                    {
+                        let mut commands = prefix_commands.clone();
+                        commands.extend(executed.commands.clone());
+                        commands
+                    },
                     error,
                 );
                 Ok(ScheduledTrackOutput { index: track_index, record, artifact: None, ok: false, metadata_satisfaction: PlannedMetadataSatisfaction::none() })
             } else {
                 let post_encode_expected_samples = match post_encode_expected_samples_for_track(
-                    &track,
+                    &planner_track,
                     &realized_input,
                     &req.settings,
                     runner,
@@ -4450,7 +4713,8 @@ async fn convert_one_track_work(
                 {
                     Ok(samples) => samples,
                     Err(err) => {
-                        let commands = command_from_convert_error(&err);
+                        let mut commands = prefix_commands.clone();
+                        commands.extend(command_from_convert_error(&err));
                         let record = failed_track_record(
                             &track,
                             Some(realized_input),
@@ -4465,7 +4729,7 @@ async fn convert_one_track_work(
                 let post_encode_validation = match validate_encoded_output_with_tool_limits(
                     &staged_path,
                     post_encode_expected_samples,
-                    expected_post_encode_depth_for_track(&track, &req.settings),
+                    expected_post_encode_depth_for_track(&planner_track, &req.settings),
                     &req.settings.target_format,
                     runner,
                     &cancel,
@@ -4475,7 +4739,8 @@ async fn convert_one_track_work(
                 {
                     Ok(validation) => validation,
                     Err(err) => {
-                        let commands = command_from_convert_error(&err);
+                        let mut commands = prefix_commands.clone();
+                        commands.extend(command_from_convert_error(&err));
                         let record = failed_track_record(
                             &track,
                             Some(realized_input),
@@ -4493,7 +4758,8 @@ async fn convert_one_track_work(
                     dsd_dst_stats_from_file(&staged_path, None, bytes_out),
                 );
                 apply_byte_totals_to_stats(&mut dsd_dst_stats, bytes_in, bytes_out);
-                let mut commands = executed.commands;
+                let mut commands = prefix_commands.clone();
+                commands.extend(executed.commands);
                 append_dsd_dst_stats_to_command_descriptions(&mut commands, dsd_dst_stats.as_ref());
                 let record = TrackRecord {
                     track_id: track.id.clone(),
@@ -4504,7 +4770,7 @@ async fn convert_one_track_work(
                     commands,
                     bytes_in,
                     bytes_out,
-                    duration: Some(executed.elapsed),
+                    duration: Some(prefix_elapsed.saturating_add(executed.elapsed)),
                     verified_output_bit_depth: post_encode_validation.measured_depth,
                     dsd_dst_stats,
                 };
@@ -4525,7 +4791,8 @@ async fn convert_one_track_work(
         }
         Err(err) => {
             let error = err.to_string();
-            let commands = err.commands;
+            let mut commands = prefix_commands;
+            commands.extend(err.commands);
             let record = failed_track_record(
                 &track,
                 Some(realized_input),
@@ -22334,6 +22601,11 @@ fn append_conversion_settings_section(
         None => push_kv_line(log, "Folder template", "album-name fallback"),
     }
     push_kv_line(log, "Filename template", &req.naming.template);
+    if let Ok((_, notices)) = plan_outputs_with_name_shortening_notices(source, req) {
+        for notice in notices {
+            push_kv_line(log, "Output name shortened", notice.log_value());
+        }
+    }
 }
 
 fn sample_rate_transition_log_label(
@@ -22924,7 +23196,7 @@ fn dither_log_line(
         let tool = processing_tool_label(tracks, settings);
         if tool == "SSRC" {
             return format!(
-                "requested ({requested}) — not applied (SSRC has no 32-bit dither stage)"
+                "requested ({requested}) — not applied (executed SSRC command did not emit the resolved dither stage)"
             );
         }
         if tool == "SoX" {
@@ -23585,7 +23857,7 @@ fn per_track_dither_disclosure(
         Some(tonepoet_pipeline::PcmBitDepth::Int32)
             if command_records_use_tool(&[record], ToolBinary::Ssrc) =>
         {
-            "SSRC has no 32-bit dither stage"
+            "executed SSRC command did not emit the resolved dither stage"
         }
         Some(tonepoet_pipeline::PcmBitDepth::Int32)
             if command_records_use_tool(&[record], ToolBinary::Sox) =>
@@ -23952,9 +24224,10 @@ fn dither_applies(
         Some(tonepoet_pipeline::PcmBitDepth::Int32) => {
             // Ordinary SoX Int32 dither is not behavior-qualified: supported
             // installations may accept the effect while producing unchanged
-            // samples. Only the mapped ffmpeg/soxr path may claim application
-            // without executed command records. Reference DSD is handled by
-            // its separate qualified-policy branch above.
+            // samples. FFmpeg may claim its commissioned mapped cell without
+            // command records; SSRC Int32 ownership is destination-rate-specific,
+            // so actual SSRC command records remain the authority for logging.
+            // Reference DSD is handled by its separate qualified-policy branch above.
             dither_explicit
                 && matches!(resampler, ResamplerFamily::Soxr | ResamplerFamily::Auto)
                 && tonepoet_pipeline::mapping::soxr_dither_method(dither).is_some()
@@ -24101,6 +24374,9 @@ fn preconversion_disclosure_messages(
 ) -> Vec<String> {
     let settings = &req.settings;
     let mut messages = BTreeSet::new();
+    if let Ok((_, notices)) = plan_outputs_with_name_shortening_notices(source, req) {
+        messages.extend(notices.into_iter().map(|notice| notice.status_message()));
+    }
     for track in &source.tracks {
         if let Some((requested_hz, effective_hz)) = ordinary_lossy_rate_divergence(track, settings) {
             messages.insert(format!(
@@ -26441,7 +26717,10 @@ impl MultiRootPublishTransaction {
                 | OverwritePolicy::VerifyIfManifestMatch => {
                     let backup = unique_path(
                         &self.output_root,
-                        &format!(".{}.multi-root-backup", album_dir_marker_name(root)?),
+                        &format!(
+                            ".tonepoet-multi-root-backup-{}",
+                            super::coordination_name::album_coordination_token(root),
+                        ),
                     );
                     self.record_restore(root, &backup)?;
                     fs::rename(root, &backup).map_err(|err| {
@@ -27242,13 +27521,7 @@ fn publish_album_output_bound(
     let final_parent = parent_dir_or_current(&plan.album_dir);
     fs::create_dir_all(final_parent).map_err(PublishError::io_at("creating publish parent dir", final_parent))?;
 
-    let album_name = plan
-        .album_dir
-        .file_name()
-        .and_then(|s| s.to_str())
-        .map(sanitize_component)
-        .unwrap_or_else(|| "album".to_string());
-    cleanup_stale_publish_lock_artifacts(final_parent, &album_name);
+    cleanup_stale_publish_lock_artifacts(final_parent, &plan.album_dir);
     // The wrapper always supplies a descriptor-bound authority.  Keeping a
     // second pathname lock here would reintroduce an independent lock domain.
     debug_assert!(authority.is_some());
@@ -27262,16 +27535,25 @@ fn publish_album_output_bound(
             "action identity/manual authority appeared while actionless publication was waiting for the album lock; retry publication under identity authority",
         )));
     }
-    let marker_path = final_parent.join(format!(".{album_name}.publish-in-progress"));
+    let coordination_token = super::coordination_name::album_coordination_token(&plan.album_dir);
+    let marker_path = final_parent.join(format!(
+        ".tonepoet-publish-{coordination_token}.json"
+    ));
     let incremental_marker_path = final_parent.join(format!(
-        ".{album_name}.incremental-publish-in-progress"
+        ".tonepoet-incremental-{coordination_token}.json"
     ));
     repair_interrupted_publish(&plan.album_dir, &marker_path)?;
     repair_interrupted_incremental_publish(&plan.album_dir, &incremental_marker_path)?;
-    cleanup_orphan_publish_temps(final_parent, &album_name)?;
+    cleanup_orphan_publish_temps(final_parent, &plan.album_dir)?;
 
-    let temp_dir = unique_path(final_parent, &format!(".{album_name}.tmp"));
-    let backup_dir = unique_path(final_parent, &format!(".{album_name}.backup"));
+    let temp_dir = unique_path(
+        final_parent,
+        &format!(".tonepoet-tmp-{coordination_token}"),
+    );
+    let backup_dir = unique_path(
+        final_parent,
+        &format!(".tonepoet-backup-{coordination_token}"),
+    );
 
     if let Err(err) = fs::create_dir_all(&temp_dir) {
         let _ = fs::remove_dir_all(&temp_dir);
@@ -27384,7 +27666,7 @@ fn publish_album_output_bound(
                 ));
             }
             OverwritePolicy::ReplaceWithBackup | OverwritePolicy::AlwaysRedo => {
-                if let Err(err) = write_publish_marker(&marker_path, &backup_dir) {
+                if let Err(err) = write_publish_marker(&plan.album_dir, &marker_path, &backup_dir) {
                     let _ = fs::remove_dir_all(&temp_dir);
                     return Err(err);
                 }
@@ -27405,7 +27687,7 @@ fn publish_album_output_bound(
             | OverwritePolicy::VerifyIfManifestMatch => {
                 // The rerun gate already decided to proceed (not skip).
                 // Treat as replace-with-backup for the publish step.
-                if let Err(err) = write_publish_marker(&marker_path, &backup_dir) {
+                if let Err(err) = write_publish_marker(&plan.album_dir, &marker_path, &backup_dir) {
                     let _ = fs::remove_dir_all(&temp_dir);
                     return Err(err);
                 }
@@ -27500,7 +27782,7 @@ fn publish_album_output_bound(
         guard.disarm_failure_mark();
     }
     cleanup_successful_staging(staging);
-    cleanup_stale_publish_lock_artifacts(final_parent, &album_name);
+    cleanup_stale_publish_lock_artifacts(final_parent, &plan.album_dir);
 
     Ok(PublishedAlbum {
         album_dir: plan.album_dir.clone(),
@@ -32593,7 +32875,8 @@ fn album_gain_terminal_bound_with_effective_dither(
                 | PcmTerminalRealizationKind::SoxPreterminalFfmpegPackage
                 | PcmTerminalRealizationKind::SoxPreterminalWavPackHybrid => sox_output_error,
                 PcmTerminalRealizationKind::SsrcDirectWav
-                | PcmTerminalRealizationKind::SsrcPreterminalFfmpegPackage => {
+                | PcmTerminalRealizationKind::SsrcPreterminalFfmpegPackage
+                | PcmTerminalRealizationKind::SsrcPreterminalSoxPackage => {
                     return Err(
                         "SSRC terminal realization has no retained certified hard-ceiling terminal-error authority"
                             .to_owned(),
@@ -34067,6 +34350,11 @@ mod album_true_peak_carrier_tests {
             tonepoet_pipeline::PcmTerminalRealizationKind::SoxDirect => {
                 tonepoet_pipeline::ToolIdentifier::Sox
             }
+            tonepoet_pipeline::PcmTerminalRealizationKind::SsrcDirectWav
+            | tonepoet_pipeline::PcmTerminalRealizationKind::SsrcPreterminalFfmpegPackage
+            | tonepoet_pipeline::PcmTerminalRealizationKind::SsrcPreterminalSoxPackage => {
+                tonepoet_pipeline::ToolIdentifier::Ssrc
+            }
             _ => tonepoet_pipeline::ToolIdentifier::Ffmpeg,
         };
         let dither_owner = match (kind, effective_dither) {
@@ -34077,6 +34365,11 @@ mod album_true_peak_carrier_tests {
             }
             (tonepoet_pipeline::PcmTerminalRealizationKind::FfmpegPreterminalWavPackHybrid, Some(_)) => {
                 tonepoet_pipeline::PcmTerminalDitherOwner::FfmpegPreterminal
+            }
+            (tonepoet_pipeline::PcmTerminalRealizationKind::SsrcDirectWav, Some(_))
+            | (tonepoet_pipeline::PcmTerminalRealizationKind::SsrcPreterminalFfmpegPackage, Some(_))
+            | (tonepoet_pipeline::PcmTerminalRealizationKind::SsrcPreterminalSoxPackage, Some(_)) => {
+                tonepoet_pipeline::PcmTerminalDitherOwner::SsrcResampler
             }
             (_, Some(_)) => tonepoet_pipeline::PcmTerminalDitherOwner::SelectedTerminal,
         };
@@ -35552,7 +35845,8 @@ fn validate_terminal_bound_realization_settings(
             }
             match (realization.kind.clone(), realization.effective_dither, realization.dither_owner) {
                 (PcmTerminalRealizationKind::SsrcDirectWav, _, _)
-                | (PcmTerminalRealizationKind::SsrcPreterminalFfmpegPackage, _, _) => {
+                | (PcmTerminalRealizationKind::SsrcPreterminalFfmpegPackage, _, _)
+                | (PcmTerminalRealizationKind::SsrcPreterminalSoxPackage, _, _) => {
                     return Err(
                         "SSRC terminal realization reached the retained certified hard-ceiling terminal-bound validator"
                             .to_owned(),
@@ -35592,6 +35886,7 @@ fn validate_terminal_bound_realization_settings(
                 PcmTerminalRealizationKind::SoxDirect
                     | PcmTerminalRealizationKind::SsrcDirectWav
                     | PcmTerminalRealizationKind::SsrcPreterminalFfmpegPackage
+                    | PcmTerminalRealizationKind::SsrcPreterminalSoxPackage
             )
                 && realization.selected_tool != ToolIdentifier::Ffmpeg
             {
@@ -36129,6 +36424,631 @@ async fn execute_bound_protected_ssrc_once(
 }
 
 
+fn ssrc_true_peak_terminal_bits_arg(depth: PcmBitDepth) -> Result<String, String> {
+    match depth {
+        PcmBitDepth::Int8 | PcmBitDepth::Int16 | PcmBitDepth::Int24 | PcmBitDepth::Int32 => {
+            Ok(depth.bits().to_string())
+        }
+        PcmBitDepth::Float32 => Ok("-32".to_string()),
+        PcmBitDepth::Float64 => Ok("-64".to_string()),
+    }
+}
+
+fn validate_ssrc_true_peak_replay_binding(
+    replay: &SsrcTruePeakReplayTerminal,
+    strong: &tonepoet_pipeline::SelectedStrongSsrcResamplerBinding,
+    gain_db: tonepoet_pipeline::DbNano,
+) -> Result<(), String> {
+    let binding = &replay.binding;
+    tonepoet_pipeline::validate_selected_binding(binding, &binding.scope)?;
+    binding.validate_gain_db_nano(gain_db.0)?;
+    if replay.source_rate_hz == 0
+        || replay.target_rate_hz == 0
+        || replay.channels == 0
+        || replay.source_rate_hz != binding.scope.source_rate_hz
+        || replay.target_rate_hz != binding.scope.target_rate_hz
+        || replay.channels != binding.scope.channels
+    {
+        return Err(
+            "certified SSRC true-peak replay geometry disagrees with its commissioned scope"
+                .to_string(),
+        );
+    }
+    if binding.scope.profile != strong.resolved_resampler.profile
+        || binding.scope.source_rate_hz != strong.resolved_resampler.source_rate_hz
+        || binding.scope.target_rate_hz != strong.resolved_resampler.target_rate_hz
+        || binding.scope.base_attenuation_db != strong.resolved_resampler.attenuation_db
+        || binding.scope.min_phase != strong.resolved_resampler.min_phase
+    {
+        return Err(
+            "certified SSRC true-peak terminal scope no longer matches the protected observation resampler"
+                .to_string(),
+        );
+    }
+    if binding.expected_executable_sha256
+        != strong.binary64_preservation.expected_executable_sha256
+        || binding.source_revision != strong.binary64_preservation.source_revision
+        || binding.build_identity != strong.binary64_preservation.build_identity
+    {
+        return Err(
+            "certified SSRC true-peak terminal no longer binds the protected observation executable/source/build identity"
+                .to_string(),
+        );
+    }
+    if binding.scope.pdf_type.is_some() && binding.scope.dither_id.is_none() {
+        return Err(
+            "certified SSRC true-peak terminal has a PDF selection without a dither selection"
+                .to_string(),
+        );
+    }
+    let _ = ssrc_true_peak_terminal_bits_arg(binding.scope.target_bit_depth)?;
+    Ok(())
+}
+
+fn ssrc_true_peak_terminal_command(
+    replay: &SsrcTruePeakReplayTerminal,
+    gain_db: tonepoet_pipeline::DbNano,
+    input: &Path,
+    output: &Path,
+) -> Result<ToolCommand, String> {
+    let scope = &replay.binding.scope;
+    let gain_matrix = tonepoet_pipeline::ssrc_true_peak_gain_matrix(gain_db, replay.channels)?;
+    let mut args = vec![
+        "--rate".to_owned(),
+        replay.target_rate_hz.to_string(),
+        "--profile".to_owned(),
+        scope.profile.as_arg().to_owned(),
+        "--bits".to_owned(),
+        ssrc_true_peak_terminal_bits_arg(scope.target_bit_depth)?,
+        "--mixChannels".to_owned(),
+        gain_matrix,
+    ];
+    if let Some(base_attenuation_db) = scope.base_attenuation_db.as_ref() {
+        args.push("--att".to_owned());
+        args.push(base_attenuation_db.clone());
+    }
+    if let Some(dither_id) = scope.dither_id {
+        args.push("--dither".to_owned());
+        args.push(dither_id.to_string());
+        // The seed is part of the versioned certified-terminal contract.
+        // Fixed seeding makes operator qualification and production replay
+        // exactly reproducible without changing the requested dither/shaper.
+        args.push("--seed".to_owned());
+        args.push(tonepoet_pipeline::SSRC_TRUE_PEAK_DITHER_SEED_V1.to_string());
+    }
+    if scope.min_phase {
+        args.push("--minPhase".to_owned());
+    }
+    if let Some(pdf) = scope.pdf_type {
+        args.push("--pdf".to_owned());
+        args.push(tonepoet_pipeline::mapping::ssrc_pdf_cli_value(pdf).to_owned());
+    }
+    args.extend([
+        "--dstContainer".to_owned(),
+        "w64".to_owned(),
+        input.to_string_lossy().into_owned(),
+        output.to_string_lossy().into_owned(),
+    ]);
+    Ok(ToolCommand {
+        environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet,
+        binary: ToolBinary::Ssrc,
+        args,
+        secret_args: Vec::new(),
+        cwd: None,
+        env: Vec::new(),
+        timeout: DEFAULT_CONVERT_TIMEOUT,
+    })
+}
+
+fn validate_ssrc_true_peak_terminal_probe(
+    probe: &RealizedProbe,
+    replay: &SsrcTruePeakReplayTerminal,
+) -> Result<(), String> {
+    let expected_depth = replay.binding.scope.target_bit_depth;
+    let observed_depth = measured_pcm_depth(probe);
+    if probe.sample_rate != replay.target_rate_hz
+        || probe.channels != Some(u32::from(replay.channels))
+        || observed_depth != Some(expected_depth)
+        || !probe
+            .codec_name
+            .as_deref()
+            .is_some_and(|codec| codec.starts_with("pcm_"))
+    {
+        return Err(format!(
+            "certified SSRC terminal output geometry is not exact {} Hz / {} ch / {:?} PCM: rate={} channels={:?} codec={:?} sample_fmt={:?} bits={:?} resolved_depth={:?}",
+            replay.target_rate_hz,
+            replay.channels,
+            expected_depth,
+            probe.sample_rate,
+            probe.channels,
+            probe.codec_name,
+            probe.sample_fmt,
+            probe.bits_per_raw_sample.or(probe.bits_per_sample),
+            observed_depth,
+        ));
+    }
+    Ok(())
+}
+
+
+#[derive(Debug, Clone, Copy)]
+struct SsrcTerminalConformance {
+    sample_values: u64,
+    max_error_linear: f64,
+}
+
+fn normalized_ssrc_terminal_sample(bytes: &[u8], depth: PcmBitDepth) -> Result<f64, String> {
+    let value = match depth {
+        // Linear PCM stores 8-bit samples with an unsigned 128 bias.
+        PcmBitDepth::Int8 => f64::from(i16::from(bytes[0]) - 128) / 128.0,
+        PcmBitDepth::Int16 => {
+            let raw = i16::from_le_bytes([bytes[0], bytes[1]]);
+            f64::from(raw) / 32768.0
+        }
+        PcmBitDepth::Int24 => {
+            let raw = i32::from(bytes[0])
+                | (i32::from(bytes[1]) << 8)
+                | (i32::from(bytes[2]) << 16);
+            let signed = if raw & 0x0080_0000 != 0 {
+                raw | !0x00ff_ffff
+            } else {
+                raw
+            };
+            f64::from(signed) / 8_388_608.0
+        }
+        PcmBitDepth::Int32 => {
+            let raw = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            f64::from(raw) / 2_147_483_648.0
+        }
+        PcmBitDepth::Float32 => {
+            f64::from(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+        }
+        PcmBitDepth::Float64 => f64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]),
+    };
+    Ok(value)
+}
+
+/// Verify the actual terminal realization against the exact measured carrier.
+///
+/// Qualification establishes a conservative per-cell stored-sample error bound.
+/// Production then enforces that bound for every sample of every conversion,
+/// so the hard-ceiling proof does not rely on qualification vectors alone.
+fn verify_ssrc_true_peak_terminal_conformance(
+    measured_carrier: &Path,
+    terminal_w64: &Path,
+    target_rate_hz: u32,
+    channels: u16,
+    depth: PcmBitDepth,
+    gain_db: tonepoet_pipeline::DbNano,
+    stored_sample_error_linear: f64,
+    cancel: &CancellationToken,
+) -> Result<SsrcTerminalConformance, String> {
+    use std::io::{BufReader, Read as _, Seek as _, SeekFrom};
+
+    if target_rate_hz == 0 || channels == 0 {
+        return Err("SSRC terminal conformance received invalid carrier geometry".to_string());
+    }
+    if !stored_sample_error_linear.is_finite() || stored_sample_error_linear <= 0.0 {
+        return Err("SSRC terminal conformance received an invalid commissioned error bound".to_string());
+    }
+    let bytes_per_terminal_sample = match depth {
+        PcmBitDepth::Int8 => 1_usize,
+        PcmBitDepth::Int16 => 2,
+        PcmBitDepth::Int24 => 3,
+        PcmBitDepth::Int32 | PcmBitDepth::Float32 => 4,
+        PcmBitDepth::Float64 => 8,
+    };
+    let measured_frame_bytes = usize::from(channels)
+        .checked_mul(std::mem::size_of::<f64>())
+        .ok_or_else(|| "SSRC measured-carrier frame size overflowed".to_string())?;
+    let measured_bytes = fs::metadata(measured_carrier)
+        .map_err(|error| format!("could not stat measured SSRC carrier {}: {error}", measured_carrier.display()))?
+        .len();
+    let measured_frame_bytes_u64 = u64::try_from(measured_frame_bytes)
+        .map_err(|_| "SSRC measured-carrier frame size is not addressable".to_string())?;
+    if measured_bytes == 0 || measured_bytes % measured_frame_bytes_u64 != 0 {
+        return Err(format!(
+            "measured SSRC carrier {} has {} bytes, not exact {}-channel Float64 frames",
+            measured_carrier.display(), measured_bytes, channels,
+        ));
+    }
+    let sample_frames = measured_bytes / measured_frame_bytes_u64;
+    let sample_values = sample_frames
+        .checked_mul(u64::from(channels))
+        .ok_or_else(|| "SSRC terminal conformance sample count overflowed".to_string())?;
+
+    let mut terminal = BufReader::new(
+        fs::File::open(terminal_w64)
+            .map_err(|error| format!("could not open SSRC terminal {}: {error}", terminal_w64.display()))?,
+    );
+    let encoding = if depth.is_float() {
+        tonepoet_pipeline::W64SampleEncoding::FloatingPoint
+    } else {
+        tonepoet_pipeline::W64SampleEncoding::SignedInteger
+    };
+    let structure = tonepoet_pipeline::validate_ssrc_w64_pcm(
+        &mut terminal,
+        tonepoet_pipeline::W64PcmExpectation {
+            sample_rate_hz: target_rate_hz,
+            channels,
+            bits_per_sample: depth.bits() as u16,
+            sample_frames,
+            encoding,
+        },
+    )
+    .map_err(|error| format!("SSRC terminal Wave64 is not exact: {error}"))?;
+    terminal
+        .seek(SeekFrom::Start(structure.data_payload_offset()))
+        .map_err(|error| format!("could not seek SSRC terminal payload: {error}"))?;
+
+    let gain = tonepoet_pipeline::conservative_linear_gain_lower(gain_db)
+        .map_err(|error| format!("could not reconstruct certified SSRC gain scalar: {error}"))?;
+    if !gain.is_finite() || gain < 0.0 {
+        return Err("SSRC terminal conformance derived non-finite proof constants".to_string());
+    }
+
+    let mut measured = BufReader::new(
+        fs::File::open(measured_carrier)
+            .map_err(|error| format!("could not open measured SSRC carrier {}: {error}", measured_carrier.display()))?,
+    );
+    const VALUES_PER_CHUNK: usize = 16 * 1024;
+    let mut measured_buf = vec![0_u8; VALUES_PER_CHUNK * std::mem::size_of::<f64>()];
+    let mut terminal_buf = vec![0_u8; VALUES_PER_CHUNK * bytes_per_terminal_sample];
+    let mut remaining = sample_values;
+    let mut sample_index = 0_u64;
+    let mut max_error_linear = 0.0_f64;
+
+    while remaining > 0 {
+        if cancel.is_cancelled() {
+            return Err("certified SSRC terminal conformance verification cancelled".to_string());
+        }
+        let count = usize::try_from(remaining.min(VALUES_PER_CHUNK as u64))
+            .map_err(|_| "SSRC terminal conformance chunk is not addressable".to_string())?;
+        let measured_len = count * std::mem::size_of::<f64>();
+        let terminal_len = count * bytes_per_terminal_sample;
+        measured
+            .read_exact(&mut measured_buf[..measured_len])
+            .map_err(|error| format!("measured SSRC carrier ended early: {error}"))?;
+        terminal
+            .read_exact(&mut terminal_buf[..terminal_len])
+            .map_err(|error| format!("SSRC terminal payload ended early: {error}"))?;
+
+        for local in 0..count {
+            let m = local * 8;
+            let reference = f64::from_le_bytes(
+                measured_buf[m..m + 8]
+                    .try_into()
+                    .expect("fixed Float64 sample width"),
+            );
+            if !reference.is_finite() {
+                return Err(format!(
+                    "measured SSRC carrier contains non-finite sample at interleaved index {}",
+                    sample_index + local as u64,
+                ));
+            }
+            let t = local * bytes_per_terminal_sample;
+            let actual = normalized_ssrc_terminal_sample(
+                &terminal_buf[t..t + bytes_per_terminal_sample],
+                depth,
+            )?;
+            let expected = reference * gain;
+            let error = (actual - expected).abs();
+            if error > max_error_linear {
+                max_error_linear = error;
+            }
+            if !actual.is_finite()
+                || !expected.is_finite()
+                || !error.is_finite()
+                || error > stored_sample_error_linear
+            {
+                return Err(format!(
+                    "certified SSRC terminal exceeded its commissioned stored-sample bound at interleaved sample {}: actual={actual:.17e} expected={expected:.17e} error={error:.17e} linear-FS bound={stored_sample_error_linear:.17e} linear-FS",
+                    sample_index + local as u64,
+                ));
+            }
+        }
+        sample_index += count as u64;
+        remaining -= count as u64;
+    }
+
+    Ok(SsrcTerminalConformance {
+        sample_values,
+        max_error_linear,
+    })
+}
+
+async fn realize_bound_ssrc_true_peak_terminal(
+    replay: &SsrcTruePeakReplayTerminal,
+    strong: &tonepoet_pipeline::SelectedStrongSsrcResamplerBinding,
+    gain_db: tonepoet_pipeline::DbNano,
+    measured_carrier: &Path,
+    output: &Path,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_paths: &HashMap<String, PathBuf>,
+    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
+) -> Result<(CommandRecord, Duration), (String, Vec<CommandRecord>)> {
+    let fail = |message: String| (message, Vec::new());
+    validate_ssrc_true_peak_replay_binding(replay, strong, gain_db).map_err(fail)?;
+    if !replay.ingress_path.is_file() {
+        return Err(fail(format!(
+            "certified SSRC replay ingress is missing: {}",
+            replay.ingress_path.display(),
+        )));
+    }
+    validate_protected_ssrc_riff_ingress(&replay.ingress_path).map_err(fail)?;
+    let actual_ingress_sha = sha256_file(&replay.ingress_path).map_err(fail)?;
+    if actual_ingress_sha != replay.ingress_sha256 {
+        return Err(fail(format!(
+            "certified SSRC replay ingress content changed: expected {}, got {}",
+            replay.ingress_sha256, actual_ingress_sha,
+        )));
+    }
+    let ingress_probe = probe_realized_segment_with_tool_limits(
+        &replay.ingress_path,
+        runner,
+        cancel,
+        tool_concurrency_limits,
+    )
+    .await
+    .map_err(|error| (error.to_string(), command_from_convert_error(&error)))?;
+    validate_protected_ssrc_ingress_probe(
+        &ingress_probe,
+        replay.source_rate_hz,
+        replay.channels,
+    )
+    .map_err(fail)?;
+
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            fail(format!(
+                "could not create certified SSRC terminal directory {}: {error}",
+                parent.display(),
+            ))
+        })?;
+    }
+    let mut temp_os = output.as_os_str().to_os_string();
+    temp_os.push(".part");
+    let temp = PathBuf::from(temp_os);
+    let _ = fs::remove_file(&temp);
+    let _ = fs::remove_file(output);
+
+    let executable = protected_ssrc_bound_executable(strong, tool_paths).map_err(fail)?;
+    let command = ssrc_true_peak_terminal_command(replay, gain_db, &replay.ingress_path, &temp)
+        .map_err(fail)?;
+    let mut tool_output = match run_bound_tool_command_with_concurrency(
+        command,
+        &executable,
+        runner,
+        cancel,
+        tool_concurrency_limits,
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(error) => {
+            let _ = fs::remove_file(&temp);
+            let commands = command_from_tool_error(&error).into_iter().collect();
+            return Err((
+                format!("certified SSRC true-peak terminal execution failed: {error}"),
+                commands,
+            ));
+        }
+    };
+    tool_output.command.description = Some(
+        "SSRC certified true-peak terminal: resample + bound gain + final PCM realization"
+            .to_string(),
+    );
+    let command_record = tool_output.command.clone();
+    let commands = || vec![command_record.clone()];
+    if !temp.is_file() || file_len(&temp).unwrap_or(0) == 0 {
+        let _ = fs::remove_file(&temp);
+        return Err((
+            format!(
+                "certified SSRC true-peak terminal produced no output at {}",
+                temp.display(),
+            ),
+            commands(),
+        ));
+    }
+    let probe = probe_realized_segment_with_tool_limits(
+        &temp,
+        runner,
+        cancel,
+        tool_concurrency_limits,
+    )
+    .await
+    .map_err(|error| {
+        let mut transcript = commands();
+        transcript.extend(command_from_convert_error(&error));
+        (error.to_string(), transcript)
+    })?;
+    validate_ssrc_true_peak_terminal_probe(&probe, replay).map_err(|error| (error, commands()))?;
+
+    let conformance_measured = measured_carrier.to_path_buf();
+    let conformance_terminal = temp.clone();
+    let conformance_cancel = cancel.clone();
+    let conformance_depth = replay.binding.scope.target_bit_depth;
+    let conformance_bound_linear = replay
+        .binding
+        .stored_sample_error_linear_upper()
+        .map_err(|error| (error, commands()))?;
+    let conformance_rate = replay.target_rate_hz;
+    let conformance_channels = replay.channels;
+    let conformance = tokio::task::spawn_blocking(move || {
+        verify_ssrc_true_peak_terminal_conformance(
+            &conformance_measured,
+            &conformance_terminal,
+            conformance_rate,
+            conformance_channels,
+            conformance_depth,
+            gain_db,
+            conformance_bound_linear,
+            &conformance_cancel,
+        )
+    })
+    .await
+    .map_err(|error| {
+        let _ = fs::remove_file(&temp);
+        (
+            format!("certified SSRC terminal conformance worker failed: {error}"),
+            commands(),
+        )
+    })?
+    .map_err(|error| {
+        let _ = fs::remove_file(&temp);
+        (error, commands())
+    })?;
+    log::info!(
+        "SSRC certified terminal conformance verified samples={} max_error_linear={:.17e} commissioned_bound_linear={:.17e}",
+        conformance.sample_values,
+        conformance.max_error_linear,
+        conformance_bound_linear,
+    );
+
+    fs::File::open(&temp)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| {
+            (
+                format!("could not sync certified SSRC terminal output {}: {error}", temp.display()),
+                commands(),
+            )
+        })?;
+    fs::rename(&temp, output).map_err(|error| {
+        let _ = fs::remove_file(&temp);
+        (
+            format!(
+                "could not commit certified SSRC terminal output {} -> {}: {error}",
+                temp.display(),
+                output.display(),
+            ),
+            commands(),
+        )
+    })?;
+    if let Some(parent) = output.parent() {
+        sync_parent_dir(output).map_err(|error| {
+            (
+                format!(
+                    "could not sync certified SSRC terminal directory {}: {error}",
+                    parent.display(),
+                ),
+                commands(),
+            )
+        })?;
+    }
+    Ok((command_record, tool_output.elapsed))
+}
+
+
+#[derive(Debug, Clone)]
+struct RetainedSsrcTruePeakIngress {
+    path: PathBuf,
+    sha256: tonepoet_pipeline::Sha256Digest,
+}
+
+fn selected_ssrc_true_peak_terminal_binding(
+    req: &PipelineRequest,
+    track: &PreparedTrack,
+    source_rate_hz: u32,
+    target_rate_hz: u32,
+    channels: u16,
+    strong: &tonepoet_pipeline::SelectedStrongSsrcResamplerBinding,
+) -> Result<tonepoet_pipeline::SelectedSsrcTruePeakTerminalBinding, String> {
+    let terminal_settings = pcm_true_peak_terminal_settings(req, track);
+    let target_bit_depth = match terminal_settings.target_bit_depth {
+        BitDepthTarget::Pcm(depth) => depth,
+        BitDepthTarget::Source => {
+            return Err("SSRC true-peak terminal preflight did not resolve target bit depth".to_string())
+        }
+    };
+    let resolved_dither =
+        tonepoet_pipeline::plugins::resolve_certified_ssrc_terminal_dither_for_rate(
+        &terminal_settings,
+        super::plan_bridge::resolve_source_pcm_depth(track),
+        Some(target_bit_depth),
+        target_rate_hz,
+    )
+    .map_err(|error| format!("could not resolve SSRC terminal dither: {error}"))?;
+    if let tonepoet_pipeline::plugins::SsrcDitherAvailability::UnavailableForSsrcTerminal { reason } =
+        &resolved_dither.availability
+    {
+        return Err(format!(
+            "SSRC true-peak terminal cannot honor the selected dither at {target_rate_hz} Hz: {reason}",
+        ));
+    }
+    let scope = tonepoet_pipeline::SsrcTruePeakTerminalScope {
+        profile: strong.resolved_resampler.profile,
+        source_rate_hz,
+        target_rate_hz,
+        channels,
+        target_bit_depth,
+        dither_id: resolved_dither.dither_id,
+        pdf_type: resolved_dither.pdf_type,
+        base_attenuation_db: strong.resolved_resampler.attenuation_db.clone(),
+        min_phase: strong.resolved_resampler.min_phase,
+        architecture: std::env::consts::ARCH.to_owned(),
+    };
+    let selected = tonepoet_pipeline::production_binding_for_scope(&scope).ok_or_else(|| {
+        format!(
+            "SSRC true-peak terminal cell is not commissioned for profile {:?}, {} -> {} Hz, {} ch, {:?}, dither {:?}/{:?}; run qualification/ssrc_true_peak_terminal/qualify_ssrc_true_peak_terminal.py on this machine and promote its generated registry",
+            scope.profile,
+            scope.source_rate_hz,
+            scope.target_rate_hz,
+            scope.channels,
+            scope.target_bit_depth,
+            scope.dither_id,
+            scope.pdf_type,
+        )
+    })?;
+    tonepoet_pipeline::validate_selected_binding(&selected, &scope)?;
+    if selected.expected_executable_sha256
+        != strong.binary64_preservation.expected_executable_sha256
+        || selected.source_revision != strong.binary64_preservation.source_revision
+        || selected.build_identity != strong.binary64_preservation.build_identity
+    {
+        return Err(
+            "SSRC true-peak terminal evidence does not bind the same executable/source/build identity as the protected observation resampler"
+                .to_string(),
+        );
+    }
+    Ok(selected)
+}
+
+fn ssrc_true_peak_terminal_bound(
+    settings: &tonepoet_pipeline::PipelineSettings,
+    binding: &tonepoet_pipeline::SelectedSsrcTruePeakTerminalBinding,
+) -> Result<tonepoet_pipeline::AlbumTerminalBound, String> {
+    use tonepoet_pipeline::{AlbumCeilingDomain, AlbumTerminalBound};
+
+    let stored_error = next_up_nonnegative(binding.stored_sample_error_linear_upper()?);
+    if !stored_error.is_finite() || stored_error <= 0.0 {
+        return Err("SSRC true-peak terminal evidence produced an invalid stored-sample error bound".to_string());
+    }
+    let reconstructed = next_up_nonnegative(
+        stored_error * tonepoet_true_peak::HQ1024V1_RECONSTRUCTION_LINF_GAIN_UPPER,
+    );
+    // Keep the domain decision identical to the established PCM terminal
+    // authority. In particular, WavPack hybrid is governed at encoder-input
+    // PCM even though `AudioFormat::WavPack` is not globally classified as a
+    // lossy format.
+    let lossy_policy = tonepoet_pipeline::pcm_true_peak_lossy_floor_applies(
+        &settings.target_format,
+        settings.wavpack.hybrid,
+    );
+    Ok(AlbumTerminalBound {
+        pre_gain_reconstructed_error_linear: 0.0,
+        stored_sample_error_linear: (!lossy_policy).then_some(stored_error),
+        post_gain_reconstructed_error_linear: reconstructed,
+        domain: if lossy_policy {
+            AlbumCeilingDomain::LossyEncoderInputPcm
+        } else {
+            AlbumCeilingDomain::LosslessStoredPcm
+        },
+    })
+}
+
 async fn realize_protected_ssrc_true_peak_carrier(
     req: &PipelineRequest,
     track: &PreparedTrack,
@@ -36144,7 +37064,7 @@ async fn realize_protected_ssrc_true_peak_carrier(
     cancel: &CancellationToken,
     tool_paths: &HashMap<String, PathBuf>,
     tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
-) -> Result<(), String> {
+) -> Result<RetainedSsrcTruePeakIngress, String> {
     let strong = selected.strong_ssrc_resampler.as_ref().ok_or_else(|| {
         format!(
             "selected SSRC resampler {} lacks its commissioned protected execution binding",
@@ -36217,9 +37137,12 @@ async fn realize_protected_ssrc_true_peak_carrier(
     .await?;
 
     bridge_validated_ssrc_w64_payload(&w64_path, carrier_path, target_rate_hz, channels)?;
-    let _ = fs::remove_file(&ingress_path);
+    let ingress_sha256 = sha256_file(&ingress_path)?;
     let _ = fs::remove_file(&w64_path);
-    Ok(())
+    Ok(RetainedSsrcTruePeakIngress {
+        path: ingress_path,
+        sha256: ingress_sha256,
+    })
 }
 
 
@@ -36313,6 +37236,132 @@ mod protected_ssrc_runtime_tests {
         }
     }
 
+    fn synthetic_ssrc_terminal_binding(
+        depth: PcmBitDepth,
+    ) -> tonepoet_pipeline::SelectedSsrcTruePeakTerminalBinding {
+        let (dither_id, pdf_type, stored_sample_error_bound) = if depth.is_float() {
+            (
+                None,
+                None,
+                tonepoet_pipeline::SsrcTruePeakStoredSampleErrorBound::AbsoluteLinearFsBits(
+                    1.0e-6_f64.to_bits(),
+                ),
+            )
+        } else {
+            (
+                Some(2),
+                Some(SsrcPdfType::Triangular),
+                tonepoet_pipeline::SsrcTruePeakStoredSampleErrorBound::TargetLsbNano(
+                    8_000_000_000,
+                ),
+            )
+        };
+        tonepoet_pipeline::SelectedSsrcTruePeakTerminalBinding {
+            contract_id: tonepoet_pipeline::SSRC_TRUE_PEAK_REPLAY_TERMINAL_V1.to_owned(),
+            gain_model_id: tonepoet_pipeline::SSRC_MIXCHANNELS_GAIN_V1.to_owned(),
+            evidence_id: format!("sha256:{}", "11".repeat(32)),
+            qualification_report_sha256: "11".repeat(32),
+            expected_executable_sha256: "22".repeat(32),
+            source_revision: tonepoet_pipeline::PINNED_SSRC_SOURCE_REV.to_owned(),
+            build_identity: "test-build".to_owned(),
+            scope: tonepoet_pipeline::SsrcTruePeakTerminalScope {
+                profile: SsrcProfile::High,
+                source_rate_hz: 96_000,
+                target_rate_hz: 44_100,
+                channels: 2,
+                target_bit_depth: depth,
+                dither_id,
+                pdf_type,
+                base_attenuation_db: Some("0.0".to_owned()),
+                min_phase: false,
+                architecture: std::env::consts::ARCH.to_owned(),
+            },
+            minimum_gain_db_nano: -24_000_000_000,
+            maximum_gain_db_nano: 24_000_000_000,
+            stored_sample_error_bound,
+        }
+    }
+
+    fn synthetic_ssrc_replay(depth: PcmBitDepth) -> SsrcTruePeakReplayTerminal {
+        SsrcTruePeakReplayTerminal {
+            ingress_path: PathBuf::from("protected-ingress.wav"),
+            ingress_sha256: tonepoet_pipeline::Sha256Digest::of_bytes(b"protected-ingress"),
+            source_rate_hz: 96_000,
+            target_rate_hz: 44_100,
+            channels: 2,
+            binding: synthetic_ssrc_terminal_binding(depth),
+        }
+    }
+
+    #[test]
+    fn float_ssrc_terminal_command_uses_native_bits_without_dither_switches() {
+        for (depth, bits) in [
+            (PcmBitDepth::Float32, "-32"),
+            (PcmBitDepth::Float64, "-64"),
+        ] {
+            let replay = synthetic_ssrc_replay(depth);
+            let command = ssrc_true_peak_terminal_command(
+                &replay,
+                tonepoet_pipeline::DbNano::ZERO,
+                Path::new("in.wav"),
+                Path::new("out.w64"),
+            )
+            .expect("floating-point certified terminal command");
+            let bits_index = command
+                .args
+                .iter()
+                .position(|arg| arg == "--bits")
+                .expect("--bits");
+            assert_eq!(command.args[bits_index + 1], bits);
+            assert!(!command.args.iter().any(|arg| {
+                matches!(arg.as_str(), "--dither" | "--seed" | "--pdf")
+            }));
+            assert!(command.args.iter().any(|arg| arg == "--mixChannels"));
+        }
+    }
+
+    #[test]
+    fn float_ssrc_terminal_bound_lifts_absolute_error_like_integer_cells() {
+        let binding = synthetic_ssrc_terminal_binding(PcmBitDepth::Float32);
+        let mut settings = tonepoet_pipeline::PipelineSettings::default();
+        settings.target_format = tonepoet_pipeline::AudioFormat::Wav;
+        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Float32);
+        let bound = ssrc_true_peak_terminal_bound(&settings, &binding)
+            .expect("floating-point SSRC terminal bound");
+        assert_eq!(bound.domain, tonepoet_pipeline::AlbumCeilingDomain::LosslessStoredPcm);
+        assert!(bound.stored_sample_error_linear.unwrap() >= 1.0e-6);
+        assert!(
+            bound.post_gain_reconstructed_error_linear
+                >= 1.0e-6 * tonepoet_true_peak::HQ1024V1_RECONSTRUCTION_LINF_GAIN_UPPER
+        );
+    }
+
+    #[test]
+    fn ssrc_terminal_bound_uses_existing_wavpack_hybrid_encoder_input_domain() {
+        let binding = synthetic_ssrc_terminal_binding(PcmBitDepth::Int24);
+        let mut settings = tonepoet_pipeline::PipelineSettings::default();
+        settings.target_format = tonepoet_pipeline::AudioFormat::WavPack;
+        settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
+        settings.wavpack.hybrid = true;
+
+        let hybrid = ssrc_true_peak_terminal_bound(&settings, &binding)
+            .expect("qualified SSRC hybrid bound");
+        assert_eq!(
+            hybrid.domain,
+            tonepoet_pipeline::AlbumCeilingDomain::LossyEncoderInputPcm
+        );
+        assert_eq!(hybrid.stored_sample_error_linear, None);
+
+        settings.wavpack.hybrid = false;
+        let lossless = ssrc_true_peak_terminal_bound(&settings, &binding)
+            .expect("qualified SSRC lossless WavPack bound");
+        assert_eq!(
+            lossless.domain,
+            tonepoet_pipeline::AlbumCeilingDomain::LosslessStoredPcm
+        );
+        assert!(lossless.stored_sample_error_linear.is_some());
+    }
+
     #[test]
     fn pcm_true_peak_track_record_serializes_executed_strong_ssrc_provenance() {
         const EXECUTABLE_SHA256: &str =
@@ -36338,6 +37387,7 @@ mod protected_ssrc_runtime_tests {
                 lossy_target_capped: false,
                 strong_ssrc_resampler: Some(Box::new(strong_binding(EXECUTABLE_SHA256.to_owned()))),
                 terminal_candidate: None,
+                ssrc_true_peak_replay: None,
             },
             realized_input: None,
             output_file: None,
@@ -36394,6 +37444,104 @@ mod protected_ssrc_runtime_tests {
         let file_len = file.len() as u64;
         file[16..24].copy_from_slice(&file_len.to_le_bytes());
         (file, payload)
+    }
+
+    fn float_terminal_w64_fixture(
+        rate: u32,
+        channels: u16,
+        depth: PcmBitDepth,
+        samples: &[f64],
+    ) -> Vec<u8> {
+        const RIFF: [u8; 16] = *b"riff.\x91\xcf\x11\xa5\xd6\x28\xdb\x04\xc1\0\0";
+        const WAVE: [u8; 16] = *b"wave\xf3\xac\xd3\x11\x8c\xd1\0\xc0O\x8e\xdb\x8a";
+        const FMT: [u8; 16] = *b"fmt \xf3\xac\xd3\x11\x8c\xd1\0\xc0O\x8e\xdb\x8a";
+        const FACT: [u8; 16] = *b"fact\xf3\xac\xd3\x11\x8c\xd1\0\xc0O\x8e\xdb\x8a";
+        const DATA: [u8; 16] = *b"data\xf3\xac\xd3\x11\x8c\xd1\0\xc0O\x8e\xdb\x8a";
+
+        assert!(depth.is_float());
+        assert_eq!(samples.len() % usize::from(channels), 0);
+        let bytes_per_sample = (depth.bits() / 8) as u16;
+        let block_align = channels * bytes_per_sample;
+        let byte_rate = rate * u32::from(block_align);
+        let mut fmt = Vec::new();
+        fmt.extend_from_slice(&3_u16.to_le_bytes());
+        fmt.extend_from_slice(&channels.to_le_bytes());
+        fmt.extend_from_slice(&rate.to_le_bytes());
+        fmt.extend_from_slice(&byte_rate.to_le_bytes());
+        fmt.extend_from_slice(&block_align.to_le_bytes());
+        fmt.extend_from_slice(&(depth.bits() as u16).to_le_bytes());
+
+        let mut payload = Vec::new();
+        for sample in samples {
+            match depth {
+                PcmBitDepth::Float32 => payload.extend_from_slice(&(*sample as f32).to_le_bytes()),
+                PcmBitDepth::Float64 => payload.extend_from_slice(&sample.to_le_bytes()),
+                _ => unreachable!(),
+            }
+        }
+        let frames = (samples.len() / usize::from(channels)) as u64;
+        let mut file = Vec::from(RIFF);
+        file.extend_from_slice(&0_u64.to_le_bytes());
+        file.extend_from_slice(&WAVE);
+        push_w64_chunk(&mut file, FMT, &fmt);
+        push_w64_chunk(&mut file, FACT, &frames.to_le_bytes());
+        push_w64_chunk(&mut file, DATA, &payload);
+        let file_len = file.len() as u64;
+        file[16..24].copy_from_slice(&file_len.to_le_bytes());
+        file
+    }
+
+    #[test]
+    fn float_ssrc_terminal_conformance_accepts_bound_and_rejects_mutation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let measured = temp.path().join("measured.f64le");
+        let samples = [0.25_f64, -0.5, 0.125, -0.25];
+        let mut measured_bytes = Vec::new();
+        for sample in samples {
+            measured_bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        fs::write(&measured, measured_bytes).expect("measured carrier");
+        let cancel = CancellationToken::new();
+
+        for depth in [PcmBitDepth::Float32, PcmBitDepth::Float64] {
+            let terminal = temp.path().join(format!("terminal-{depth:?}.w64"));
+            fs::write(
+                &terminal,
+                float_terminal_w64_fixture(44_100, 2, depth, &samples),
+            )
+            .expect("terminal fixture");
+            verify_ssrc_true_peak_terminal_conformance(
+                &measured,
+                &terminal,
+                44_100,
+                2,
+                depth,
+                tonepoet_pipeline::DbNano::ZERO,
+                1.0e-6,
+                &cancel,
+            )
+            .expect("exact floating terminal must conform");
+
+            let mut mutated = samples;
+            mutated[2] += 1.0e-3;
+            fs::write(
+                &terminal,
+                float_terminal_w64_fixture(44_100, 2, depth, &mutated),
+            )
+            .expect("mutated terminal fixture");
+            let error = verify_ssrc_true_peak_terminal_conformance(
+                &measured,
+                &terminal,
+                44_100,
+                2,
+                depth,
+                tonepoet_pipeline::DbNano::ZERO,
+                1.0e-6,
+                &cancel,
+            )
+            .expect_err("out-of-bound floating terminal sample must fail closed");
+            assert!(error.contains("exceeded its commissioned stored-sample bound"), "{error}");
+        }
     }
 
     #[tokio::test]
@@ -36677,10 +37825,9 @@ fn validate_selected_registered_resampler_command(
     if exact_flag_value(&planned.args, "--dither")? != expected_dither.as_deref() {
         return Err("selected SSRC command dither id disagrees with the frozen typed contract".to_string());
     }
-    let expected_pdf = effective_dither.pdf_type.map(|value| match value {
-        SsrcPdfType::Rectangular => "0",
-        SsrcPdfType::Triangular => "1",
-    });
+    let expected_pdf = effective_dither
+        .pdf_type
+        .map(tonepoet_pipeline::mapping::ssrc_pdf_cli_value);
     if exact_flag_value(&planned.args, "--pdf")? != expected_pdf {
         return Err("selected SSRC command dither PDF disagrees with the frozen typed contract".to_string());
     }
@@ -36908,10 +38055,32 @@ async fn prepare_pcm_true_peak_carrier_for_track(
         target_rate_hz,
         execution.pre_observation_resampler.as_ref(),
     )?;
+    // Qualification is checked before materializing the protected ingress or
+    // running SSRC. A missing terminal cell must therefore fail closed before
+    // the expensive true-peak carrier work starts.
+    let ssrc_terminal_binding = execution
+        .pre_observation_resampler
+        .as_ref()
+        .filter(|resampler| resampler.selected.tool == tonepoet_pipeline::ToolIdentifier::Ssrc)
+        .map(|resampler| {
+            let strong = resampler.selected.strong_ssrc_resampler.as_ref().ok_or_else(|| {
+                "selected SSRC true-peak resampler lost its strong preservation binding".to_string()
+            })?;
+            selected_ssrc_true_peak_terminal_binding(
+                req,
+                &track,
+                source_rate_hz,
+                target_rate_hz,
+                channels,
+                strong,
+            )
+        })
+        .transpose()?;
     let carrier_hash = stable_path_hash(&original_source_path);
     let raw_carrier_path = carrier_dir.join(format!("track-{track_stem}-{carrier_hash}.f64le"));
     let mut carrier_path = raw_carrier_path.clone();
     let _ = fs::remove_file(&raw_carrier_path);
+    let mut retained_ssrc_ingress: Option<RetainedSsrcTruePeakIngress> = None;
     if let Some(resampler) = execution
         .pre_observation_resampler
         .as_ref()
@@ -36925,30 +38094,32 @@ async fn prepare_pcm_true_peak_carrier_for_track(
                 track.id.source_ordinal,
             ));
         }
-        realize_protected_ssrc_true_peak_carrier(
-            req,
-            &track,
-            &realized.path,
-            &carrier_path,
-            carrier_dir,
-            &track_stem,
-            source_rate_hz,
-            target_rate_hz,
-            channels,
-            &resampler.selected,
-            runner,
-            cancel,
-            tool_paths,
-            tool_concurrency_limits.clone(),
-        )
-        .await
-        .map_err(|error| {
-            let _ = fs::remove_file(&carrier_path);
-            format!(
-                "PCM track {} could not realize its commissioned protected SSRC carrier: {error}",
-                track.id.source_ordinal,
+        retained_ssrc_ingress = Some(
+            realize_protected_ssrc_true_peak_carrier(
+                req,
+                &track,
+                &realized.path,
+                &carrier_path,
+                carrier_dir,
+                &track_stem,
+                source_rate_hz,
+                target_rate_hz,
+                channels,
+                &resampler.selected,
+                runner,
+                cancel,
+                tool_paths,
+                tool_concurrency_limits.clone(),
             )
-        })?;
+            .await
+            .map_err(|error| {
+                let _ = fs::remove_file(&carrier_path);
+                format!(
+                    "PCM track {} could not realize its commissioned protected SSRC carrier: {error}",
+                    track.id.source_ordinal,
+                )
+            })?,
+        );
     } else {
         let carrier_req = pcm_true_peak_carrier_request(req, target_rate_hz);
         let convert_root = carrier_dir.join(format!("work-{track_stem}"));
@@ -37050,11 +38221,15 @@ async fn prepare_pcm_true_peak_carrier_for_track(
     carrier_path = bound_path;
 
     let terminal_settings = pcm_true_peak_terminal_settings(req, &track);
-    let terminal_bound = pcm_true_peak_terminal_bound(
-        &terminal_settings,
-        target_rate_hz,
-        &terminal_realization,
-    )?;
+    let terminal_bound = if let Some(binding) = ssrc_terminal_binding.as_ref() {
+        ssrc_true_peak_terminal_bound(&terminal_settings, binding)?
+    } else {
+        pcm_true_peak_terminal_bound(
+            &terminal_settings,
+            target_rate_hz,
+            &terminal_realization,
+        )?
+    };
     let execution_policy = if execution.allow_boost {
         SampleGainPolicy::TruePeakNormalize {
             target_dbtp: execution.requested_target_dbtp,
@@ -37090,6 +38265,9 @@ async fn prepare_pcm_true_peak_carrier_for_track(
     } else {
         None
     };
+    if let (Some(binding), Some(gain_db)) = (ssrc_terminal_binding.as_ref(), gain_db) {
+        binding.validate_gain_db_nano(gain_db.0)?;
+    }
     let point_dbtp = match measurement {
         tonepoet_pipeline::AlbumPeakMeasurement::Finite { point_db, .. } => Some(point_db),
         tonepoet_pipeline::AlbumPeakMeasurement::Silence => None,
@@ -37131,6 +38309,23 @@ async fn prepare_pcm_true_peak_carrier_for_track(
                 .and_then(|resampler| resampler.selected.strong_ssrc_resampler.clone())
                 .map(Box::new),
             terminal_candidate: Some(execution.charged_terminal.clone()),
+            ssrc_true_peak_replay: match (retained_ssrc_ingress, ssrc_terminal_binding) {
+                (Some(ingress), Some(binding)) => Some(Box::new(SsrcTruePeakReplayTerminal {
+                    ingress_path: ingress.path,
+                    ingress_sha256: ingress.sha256,
+                    source_rate_hz,
+                    target_rate_hz,
+                    channels,
+                    binding,
+                })),
+                (None, None) => None,
+                _ => {
+                    return Err(
+                        "SSRC true-peak terminal replay state became internally inconsistent"
+                            .to_string(),
+                    )
+                }
+            },
         },
         measurement: CertifiedTruePeakPreparedMeasurement {
             track_id: track.id,
@@ -42324,12 +43519,52 @@ pub async fn encode_realized_track_for_scheduler_with_tool_limits_and_version_ca
         }
     }
 
-    let bytes_in = file_len(&realized.realized_path);
+    let final_input = match prepare_final_execution_input(
+        &realized.track,
+        RealizedTrackInfo {
+            path: realized.realized_path.clone(),
+            dsd_dst_stats: realized.realized_dsd_dst_stats.clone(),
+            scalar_pump: realized.scalar_pump.clone(),
+        },
+        &realized.convert_root,
+        &runner,
+        &realized.cancel,
+        &tool_paths,
+        tool_concurrency_limits.as_ref(),
+    )
+    .await
+    {
+        Ok(input) => input,
+        Err((error, commands)) => {
+            let record = failed_track_record(
+                &realized.track,
+                Some(realized.realized_path.clone()),
+                Some(staged_path),
+                commands,
+                error,
+            );
+            return Ok(ScheduledTrackOutput {
+                index: realized.index,
+                record,
+                artifact: None,
+                ok: false,
+                metadata_satisfaction: PlannedMetadataSatisfaction::none(),
+            });
+        }
+    };
+    let FinalExecutionInput {
+        planner_track,
+        realized_input,
+        scalar_pump,
+        prefix_commands,
+        prefix_elapsed,
+    } = final_input;
+    let bytes_in = file_len(&realized_input);
     let executed = execute_planned_track_conversion_with_scalar_pump(
         &realized.req,
-        &realized.track,
-        &realized.realized_path,
-        realized.scalar_pump.clone(),
+        &planner_track,
+        &realized_input,
+        scalar_pump,
         &staged_path,
         &realized.convert_root,
         &runner,
@@ -42349,16 +43584,20 @@ pub async fn encode_realized_track_for_scheduler_with_tool_limits_and_version_ca
                 let error = format!("planner did not produce output: {}", staged_path.display());
                 let record = failed_track_record(
                     &realized.track,
-                    Some(realized.realized_path),
+                    Some(realized_input.clone()),
                     Some(staged_path),
-                    executed.commands,
+                    {
+                        let mut commands = prefix_commands.clone();
+                        commands.extend(executed.commands.clone());
+                        commands
+                    },
                     error,
                 );
                 Ok(ScheduledTrackOutput { index: realized.index, record, artifact: None, ok: false, metadata_satisfaction: PlannedMetadataSatisfaction::none() })
             } else {
                 let post_encode_expected_samples = match post_encode_expected_samples_for_track(
-                    &realized.track,
-                    &realized.realized_path,
+                    &planner_track,
+                    &realized_input,
                     &realized.req.settings,
                     &runner,
                     &realized.cancel,
@@ -42368,10 +43607,11 @@ pub async fn encode_realized_track_for_scheduler_with_tool_limits_and_version_ca
                 {
                     Ok(samples) => samples,
                     Err(err) => {
-                        let commands = command_from_convert_error(&err);
+                        let mut commands = prefix_commands.clone();
+                        commands.extend(command_from_convert_error(&err));
                         let record = failed_track_record(
                             &realized.track,
-                            Some(realized.realized_path),
+                            Some(realized_input.clone()),
                             Some(staged_path),
                             commands,
                             err.to_string(),
@@ -42383,7 +43623,7 @@ pub async fn encode_realized_track_for_scheduler_with_tool_limits_and_version_ca
                 let post_encode_validation = match validate_encoded_output_with_tool_limits(
                     &staged_path,
                     post_encode_expected_samples,
-                    expected_post_encode_depth_for_track(&realized.track, &realized.req.settings),
+                    expected_post_encode_depth_for_track(&planner_track, &realized.req.settings),
                     &realized.req.settings.target_format,
                     &runner,
                     &realized.cancel,
@@ -42393,10 +43633,11 @@ pub async fn encode_realized_track_for_scheduler_with_tool_limits_and_version_ca
                 {
                     Ok(validation) => validation,
                     Err(err) => {
-                        let commands = command_from_convert_error(&err);
+                        let mut commands = prefix_commands.clone();
+                        commands.extend(command_from_convert_error(&err));
                         let record = failed_track_record(
                             &realized.track,
-                            Some(realized.realized_path),
+                            Some(realized_input.clone()),
                             Some(staged_path),
                             commands,
                             err.to_string(),
@@ -42411,18 +43652,19 @@ pub async fn encode_realized_track_for_scheduler_with_tool_limits_and_version_ca
                     dsd_dst_stats_from_file(&staged_path, None, bytes_out),
                 );
                 apply_byte_totals_to_stats(&mut dsd_dst_stats, bytes_in, bytes_out);
-                let mut commands = executed.commands;
+                let mut commands = prefix_commands.clone();
+                commands.extend(executed.commands);
                 append_dsd_dst_stats_to_command_descriptions(&mut commands, dsd_dst_stats.as_ref());
                 let record = TrackRecord {
                     track_id: realized.track.id.clone(),
                     outcome: TrackOutcome::Ok,
                     source_ref: realized.track.source_ref.clone(),
-                    realized_input: Some(realized.realized_path.clone()),
+                    realized_input: Some(realized_input.clone()),
                     output_file: Some(staged_path.clone()),
                     commands,
                     bytes_in,
                     bytes_out,
-                    duration: Some(executed.elapsed),
+                    duration: Some(prefix_elapsed.saturating_add(executed.elapsed)),
                     verified_output_bit_depth: post_encode_validation.measured_depth,
                     dsd_dst_stats,
                 };
@@ -42443,10 +43685,11 @@ pub async fn encode_realized_track_for_scheduler_with_tool_limits_and_version_ca
         }
         Err(err) => {
             let error = err.to_string();
-            let commands = err.commands;
+            let mut commands = prefix_commands;
+            commands.extend(err.commands);
             let record = failed_track_record(
                 &realized.track,
-                Some(realized.realized_path),
+                Some(realized_input),
                 Some(staged_path),
                 commands,
                 error,
@@ -48643,7 +49886,7 @@ mod companion_copy_hardening_tests {
         let mut request = test_request(temp.path(), source_path.clone());
         let album = request.output_root.join("Album");
         std::fs::create_dir_all(&album).expect("album");
-        let publication_lock = request.output_root.join(".Album.lock");
+        let publication_lock = album_lock_path(&album);
         let script_marker = temp.path().join("script-observed-unlocked-publication.marker");
         let environment_marker = temp.path().join("script-album-environment.txt");
         let script = temp.path().join("probe-publication-lock.sh");
@@ -48716,8 +49959,12 @@ mod companion_copy_hardening_tests {
             album.to_string_lossy().to_string(),
             "script environment must preserve the stable published album path while execution uses the retained descriptor-backed working directory"
         );
+        let action_lock = request.output_root.join(format!(
+            ".tonepoet-actions-{}.lock",
+            crate::convert::pipeline::coordination_name::album_coordination_token(&album),
+        ));
         assert!(
-            !request.output_root.join(".Album.actions.lock").exists(),
+            !action_lock.exists(),
             "action-execution authority must be retired after terminal completion"
         );
     }
@@ -54813,6 +56060,153 @@ fn sanitize_component(value: &str) -> String {
     }
 }
 
+const OUTPUT_NAME_HASH_HEX_LEN: usize = 24;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct OutputNameShorteningNotice {
+    original: String,
+    shortened: String,
+    original_bytes: usize,
+    limit_bytes: usize,
+}
+
+impl OutputNameShorteningNotice {
+    fn status_message(&self) -> String {
+        format!(
+            "Output name shortened before conversion: {}-byte component {:?} -> {:?} (filesystem limit {} bytes).",
+            self.original_bytes, self.original, self.shortened, self.limit_bytes
+        )
+    }
+
+    fn log_value(&self) -> String {
+        format!(
+            "{} bytes -> {} bytes (limit {}): {:?} -> {:?}",
+            self.original_bytes,
+            self.shortened.len(),
+            self.limit_bytes,
+            self.original,
+            self.shortened
+        )
+    }
+}
+
+fn utf8_prefix_with_max_bytes(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = 0_usize;
+    for (index, ch) in value.char_indices() {
+        let next = index + ch.len_utf8();
+        if next > max_bytes {
+            break;
+        }
+        end = next;
+    }
+    &value[..end]
+}
+
+fn shortened_component_value(value: &str, max_bytes: usize, preserve_extension: bool) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+
+    let digest = hex::encode(Sha256::digest(value.as_bytes()));
+    let hash_len = OUTPUT_NAME_HASH_HEX_LEN.min(max_bytes.saturating_sub(1));
+    let hash = &digest[..hash_len];
+    let suffix = format!("~{hash}");
+
+    let extension = preserve_extension
+        .then(|| value.rsplit_once('.'))
+        .flatten()
+        .filter(|(stem, ext)| !stem.is_empty() && !ext.is_empty())
+        .map(|(_, ext)| format!(".{ext}"))
+        .filter(|ext| suffix.len().saturating_add(ext.len()) < max_bytes);
+    let extension = extension.as_deref().unwrap_or("");
+    let reserved = suffix.len().saturating_add(extension.len());
+    if reserved >= max_bytes {
+        // This is reachable only on an implausibly tiny NAME_MAX. Retain as
+        // much deterministic digest as the filesystem can hold rather than
+        // creating an over-limit name or splitting UTF-8.
+        return digest[..digest.len().min(max_bytes)].to_owned();
+    }
+
+    let prefix_budget = max_bytes - reserved;
+    let prefix_source = if extension.is_empty() {
+        value
+    } else {
+        &value[..value.len() - extension.len()]
+    };
+    let prefix = utf8_prefix_with_max_bytes(prefix_source, prefix_budget);
+    format!("{prefix}{suffix}{extension}")
+}
+
+fn shorten_component_for_filesystem(
+    value: &str,
+    max_bytes: usize,
+    preserve_extension: bool,
+    notices: &mut BTreeSet<OutputNameShorteningNotice>,
+) -> String {
+    let shortened = shortened_component_value(value, max_bytes, preserve_extension);
+    if shortened != value {
+        notices.insert(OutputNameShorteningNotice {
+            original: value.to_owned(),
+            shortened: shortened.clone(),
+            original_bytes: value.len(),
+            limit_bytes: max_bytes,
+        });
+    }
+    shortened
+}
+
+fn shorten_relative_path_components(
+    path: PathBuf,
+    max_bytes: usize,
+    shorten_leaf: bool,
+    notices: &mut BTreeSet<OutputNameShorteningNotice>,
+) -> PathBuf {
+    let components = path.components().collect::<Vec<_>>();
+    let last_normal = components
+        .iter()
+        .rposition(|component| matches!(component, Component::Normal(_)));
+    let mut shortened = PathBuf::new();
+    for (index, component) in components.into_iter().enumerate() {
+        match component {
+            Component::Normal(value) if shorten_leaf || Some(index) != last_normal => {
+                let value = value.to_string_lossy();
+                shortened.push(shorten_component_for_filesystem(
+                    &value,
+                    max_bytes,
+                    false,
+                    notices,
+                ));
+            }
+            _ => shortened.push(component.as_os_str()),
+        }
+    }
+    shortened
+}
+
+fn shorten_final_path_component(
+    path: PathBuf,
+    max_bytes: usize,
+    notices: &mut BTreeSet<OutputNameShorteningNotice>,
+) -> PathBuf {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return path;
+    };
+    let shortened = shorten_component_for_filesystem(
+        file_name,
+        max_bytes,
+        true,
+        notices,
+    );
+    if shortened == file_name {
+        path
+    } else {
+        path.with_file_name(shortened)
+    }
+}
+
 /// Like `sanitize_component`, but renders a forward slash as a two-space gap
 /// between the surrounding tokens (house style for the `%TITLE_EXTRA%`
 /// pressing/edition designator, e.g. `LP / 24-192` -> `LP  24-192`, so a reader
@@ -55597,18 +56991,11 @@ struct PublishRecoveryMarker {
     backup_dir_name: String,
 }
 
-fn write_publish_marker(marker_path: &Path, backup_dir: &Path) -> Result<(), PublishError> {
-    let album_dir = marker_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .and_then(|name| name.strip_prefix('.'))
-        .and_then(|name| name.strip_suffix(".publish-in-progress"))
-        .ok_or_else(|| {
-            PublishError::BackupFailed(format!(
-                "could not derive album name from publish marker {}",
-                marker_path.display()
-            ))
-        })?;
+fn write_publish_marker(
+    album_dir: &Path,
+    marker_path: &Path,
+    backup_dir: &Path,
+) -> Result<(), PublishError> {
     let backup_dir_name = backup_dir
         .file_name()
         .and_then(|name| name.to_str())
@@ -55621,7 +57008,7 @@ fn write_publish_marker(marker_path: &Path, backup_dir: &Path) -> Result<(), Pub
         .to_string();
     let marker = PublishRecoveryMarker {
         version: 1,
-        album_dir_name: album_dir.to_string(),
+        album_dir_name: album_dir_marker_name(album_dir)?,
         backup_dir_name,
     };
     let bytes = serde_json::to_vec_pretty(&marker).map_err(|err| {
@@ -55784,7 +57171,10 @@ fn validate_incremental_marker(
         )));
     }
 
-    let expected_prefix = format!(".{expected_album}.tmp-");
+    let expected_prefix = format!(
+        ".tonepoet-tmp-{}-",
+        super::coordination_name::album_coordination_token(album_dir)
+    );
     if !marker.temp_dir_name.starts_with(&expected_prefix) {
         return Err(PublishError::RollbackFailed(format!(
             "incremental publish recovery marker {} points at non-matching temp directory {}",
@@ -55899,11 +57289,17 @@ fn album_dir_marker_name(album_dir: &Path) -> Result<String, PublishError> {
 }
 
 fn backup_dir_prefix(album_dir: &Path) -> Result<String, PublishError> {
-    Ok(format!(".{}.backup-", album_dir_marker_name(album_dir)?))
+    Ok(format!(
+        ".tonepoet-backup-{}-",
+        super::coordination_name::album_coordination_token(album_dir)
+    ))
 }
 
-fn cleanup_orphan_publish_temps(parent: &Path, album_name: &str) -> Result<(), PublishError> {
-    let prefix = format!(".{album_name}.tmp-");
+fn cleanup_orphan_publish_temps(parent: &Path, album_dir: &Path) -> Result<(), PublishError> {
+    let prefix = format!(
+        ".tonepoet-tmp-{}-",
+        super::coordination_name::album_coordination_token(album_dir)
+    );
     let entries = match fs::read_dir(parent) {
         Ok(entries) => entries,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -56056,11 +57452,16 @@ fn cleanup_unheld_staging_parent_locks(parent: &Path) {
     }
 }
 
-fn cleanup_stale_publish_lock_artifacts(parent: &Path, album_name: &str) {
+fn cleanup_stale_publish_lock_artifacts(parent: &Path, album_dir: &Path) {
     let Ok(entries) = fs::read_dir(parent) else {
         return;
     };
-    let hidden_current = format!(".{album_name}.lock");
+    let album_name = album_dir_marker_name(album_dir).unwrap_or_else(|_| "album".to_owned());
+    let compact_current = format!(
+        ".tonepoet-publish-{}.lock",
+        super::coordination_name::album_coordination_token(album_dir)
+    );
+    let hidden_legacy = format!(".{album_name}.lock");
     let legacy_current = format!("{album_name}.lock");
 
     for entry in entries.flatten() {
@@ -56068,14 +57469,24 @@ fn cleanup_stale_publish_lock_artifacts(parent: &Path, album_name: &str) {
         let Some(name) = name.to_str() else {
             continue;
         };
-        if is_stale_publish_lock_candidate(name, &hidden_current, &legacy_current) {
+        if is_stale_publish_lock_candidate(
+            name,
+            &compact_current,
+            &hidden_legacy,
+            &legacy_current,
+        ) {
             remove_unheld_lock_file_best_effort(&entry.path());
         }
     }
 }
 
-fn is_stale_publish_lock_candidate(name: &str, hidden_current: &str, legacy_current: &str) -> bool {
-    if name == hidden_current || name == legacy_current {
+fn is_stale_publish_lock_candidate(
+    name: &str,
+    compact_current: &str,
+    hidden_legacy: &str,
+    legacy_current: &str,
+) -> bool {
+    if name == compact_current || name == hidden_legacy || name == legacy_current {
         return true;
     }
 
@@ -56272,10 +57683,10 @@ fn acquire_blocking_file_lock(lock_path: &Path, remove_on_drop: bool) -> io::Res
 
 #[allow(dead_code)] // bundle-provided API surface, not yet wired to a caller
 fn album_lock_path(album_dir: &Path) -> PathBuf {
-    match album_dir.file_name().and_then(|name| name.to_str()) {
-        Some(name) => album_dir.with_file_name(format!(".{name}.lock")),
-        None => PathBuf::from(format!(".{}.lock", album_dir.display())),
-    }
+    album_dir.with_file_name(format!(
+        ".tonepoet-publish-{}.lock",
+        super::coordination_name::album_coordination_token(album_dir)
+    ))
 }
 
 fn legacy_album_lock_path(album_dir: &Path) -> PathBuf {
@@ -60144,6 +61555,77 @@ mod conversion_log_tests {
     }
 
     #[test]
+    fn certified_ssrc_true_peak_terminal_log_names_ssrc_as_dither_owner() {
+        let mut source = log_test_source();
+        source.tracks.truncate(1);
+        source.tracks[0].sample_rate = Some(176_400);
+        source.tracks[0].bit_depth = Some(32);
+        source.tracks[0].source_audio = SourceAudioDescriptor::from_scalar(
+            Some(176_400),
+            Some(32),
+            Some(SourceAudioCoding::Pcm),
+        );
+
+        let mut req = log_test_request();
+        req.settings.target_format = PlannerAudioFormat::Flac;
+        req.settings.target_sample_rate = RateTarget::PcmHz(88_200);
+        req.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
+        req.settings.preferred_tool = PreferredTool::Ssrc;
+        req.settings.dither_type = DitherType::Tpdf;
+        req.settings.dither_explicit = true;
+        req.settings.pcm_true_peak.set_policy(tonepoet_pipeline::SampleGainPolicy::TruePeakGuard {
+            target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            scope: tonepoet_pipeline::TruePeakScope::Track,
+            scan: tonepoet_pipeline::TruePeakScanTier::Standard,
+        });
+
+        let artifacts = log_test_artifacts();
+        let mut terminal = command_record_for(ToolBinary::Ssrc);
+        terminal.description = Some(
+            "SSRC certified true-peak terminal: resample + bound gain + dither/noise shaping + quantization"
+                .to_string(),
+        );
+        terminal.sanitized_args = vec![
+            "--rate".to_string(),
+            "88200".to_string(),
+            "--bits".to_string(),
+            "24".to_string(),
+            "--mixChannels".to_string(),
+            "0.9,0;0,0.9".to_string(),
+            "--dither".to_string(),
+            "99".to_string(),
+            "--seed".to_string(),
+            "1".to_string(),
+            "--pdf".to_string(),
+            "1".to_string(),
+            "--dstContainer".to_string(),
+            "w64".to_string(),
+        ];
+        let mut package = command_record_for(ToolBinary::Ffmpeg);
+        package.description = Some("Encode FLAC from certified integer PCM".to_string());
+        package.sanitized_args = vec![
+            "-i".to_string(),
+            "/stage/terminal.w64".to_string(),
+            "-c:a".to_string(),
+            "flac".to_string(),
+            "/stage/out.flac".to_string(),
+        ];
+        let mut record = ok_record();
+        record.verified_output_bit_depth = Some(PcmBitDepth::Int24);
+        record.commands = vec![terminal, package];
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![record],
+            stages: stage_records(),
+        };
+        let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
+
+        assert!(log.contains("Dither: yes (TPDF via SSRC"), "{log}");
+        assert!(log.contains("dither_id=99, pdf=1"), "{log}");
+        assert!(!log.contains("Dither: yes (TPDF via SoX)"), "{log}");
+        assert!(log.contains("SSRC certified true-peak terminal"), "{log}");
+    }
+
+    #[test]
     fn requested_but_unapplied_dither_is_disclosed_by_settings_and_track_lines() {
         fn render(
             source: &PreparedSource,
@@ -60185,13 +61667,30 @@ mod conversion_log_tests {
         ssrc_int32.settings.preferred_tool = PreferredTool::Ssrc;
         let mut ssrc_record = ok_record();
         ssrc_record.verified_output_bit_depth = Some(PcmBitDepth::Int32);
-        ssrc_record.commands = vec![command_record_for(ToolBinary::Ssrc)];
+        let mut ssrc_command = command_record_for(ToolBinary::Ssrc);
+        ssrc_command.sanitized_args = vec![
+            "--bits".to_string(),
+            "32".to_string(),
+            "--dither".to_string(),
+            "99".to_string(),
+            "--pdf".to_string(),
+            "1".to_string(),
+        ];
+        ssrc_record.commands = vec![ssrc_command];
         let ssrc_log = render(&source, &ssrc_int32, ssrc_record);
-        assert!(ssrc_log.contains(
-            "Dither: requested (TPDF) — not applied (SSRC has no 32-bit dither stage)"
+        assert!(ssrc_log.contains("Dither: yes (TPDF via SSRC"));
+        assert!(ssrc_log.contains("dither_id=99, pdf=1"));
+        assert!(!ssrc_log.contains("via FFmpeg"));
+
+        let mut missing_ssrc_stage = ok_record();
+        missing_ssrc_stage.verified_output_bit_depth = Some(PcmBitDepth::Int32);
+        missing_ssrc_stage.commands = vec![command_record_for(ToolBinary::Ssrc)];
+        let missing_ssrc_log = render(&source, &ssrc_int32, missing_ssrc_stage);
+        assert!(missing_ssrc_log.contains(
+            "Dither: requested (TPDF) — not applied (executed SSRC command did not emit the resolved dither stage)"
         ));
-        assert!(ssrc_log.contains(
-            "Warning: Dither requested (TPDF) — not applied (SSRC has no 32-bit dither stage)"
+        assert!(missing_ssrc_log.contains(
+            "Warning: Dither requested (TPDF) — not applied (executed SSRC command did not emit the resolved dither stage)"
         ));
 
         let mut sox_int32 = automatic_int32.clone();
@@ -61098,6 +62597,95 @@ mod naming_template_tests {
             plan.entries[0].final_path,
             PathBuf::from("/out/Miles Davis/A Tribute to Jack Johnson (1971)/01 - Right Off.flac")
         );
+    }
+
+    #[test]
+    fn overlong_output_components_are_shortened_deterministically_on_utf8_boundaries() {
+        let original = format!("{}-tail", "é".repeat(180));
+        assert!(original.len() > 255);
+
+        let shortened = shortened_component_value(&original, 255, false);
+        let repeated = shortened_component_value(&original, 255, false);
+        let different = shortened_component_value(
+            &format!("{}-different-tail", "é".repeat(180)),
+            255,
+            false,
+        );
+
+        assert_eq!(shortened, repeated, "shortening must be stable");
+        assert!(shortened.len() <= 255, "shortened component exceeds NAME_MAX");
+        assert!(shortened.is_char_boundary(shortened.len()));
+        assert_ne!(shortened, different, "hash suffix must discriminate long names");
+        assert!(shortened.contains('~'), "shortened name carries a visible hash delimiter");
+    }
+
+    #[test]
+    fn overlong_track_leaf_preserves_target_extension_and_is_disclosed() {
+        let mut source = template_source();
+        source.tracks[0].metadata.title = Some("é".repeat(180));
+        let mut req = template_request(None);
+        req.naming.template = "%TITLE%".to_string();
+
+        let (plan, notices) = plan_outputs_with_name_shortening_notices(&source, &req)
+            .expect("overlong output leaf plans");
+        let leaf = plan.entries[0]
+            .final_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("UTF-8 planned leaf");
+
+        assert!(leaf.len() <= crate::fs_limits::CONSERVATIVE_NAME_MAX_BYTES);
+        assert!(leaf.ends_with(".flac"), "target extension must survive shortening: {leaf}");
+        assert_eq!(notices.len(), 1, "exactly the overlong leaf should be disclosed");
+        assert!(notices[0].status_message().contains("Output name shortened before conversion"));
+
+        let messages = preconversion_disclosure_messages(&source, &req);
+        assert!(messages.iter().any(|message| message.contains("Output name shortened before conversion")));
+    }
+
+    #[test]
+    fn legal_near_limit_album_name_publishes_without_overlong_internal_siblings() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_name = "A".repeat(244);
+        let mut source = template_source();
+        source.album_metadata.album = Some(album_name.clone());
+        let mut req = template_request(Some("%ALBUM%".to_string()));
+        req.output_root = temp.path().join("out");
+
+        let (plan, notices) = plan_outputs_with_name_shortening_notices(&source, &req)
+            .expect("244-byte album component is legal on a 255-byte filesystem");
+        assert_eq!(
+            plan.album_dir.file_name().and_then(|name| name.to_str()),
+            Some(album_name.as_str()),
+            "a legal user-visible component must not be shortened merely to make internal siblings fit",
+        );
+        assert!(notices.is_empty(), "legal user-visible album name should not be rewritten");
+
+        let token = crate::convert::pipeline::coordination_name::album_coordination_token(&plan.album_dir);
+        for internal in [
+            format!(".tonepoet-publish-{token}.lock"),
+            format!(".tonepoet-publish-{token}.json"),
+            format!(".tonepoet-incremental-{token}.json"),
+            format!(".tonepoet-tmp-{token}-123456"),
+            format!(".tonepoet-backup-{token}-123456"),
+        ] {
+            assert!(internal.len() < 96, "coordination name unexpectedly large: {internal}");
+            assert!(internal.len() <= crate::fs_limits::CONSERVATIVE_NAME_MAX_BYTES);
+        }
+
+        let staging = StagingDir::new(
+            temp.path().join("staging-near-limit-album"),
+            "near-limit-album".to_string(),
+        );
+        std::fs::create_dir_all(&staging.root).expect("staging root");
+        let artifacts = staged_artifacts_for_plan(&staging, &plan);
+        let publish_plan = build_publish_plan(&artifacts, &req, &plan.album_dir)
+            .expect("near-limit album builds publish plan");
+        let published = publish_album_output(staging, &publish_plan, req.publish.clone(), None)
+            .expect("near-limit album publishes with compact internal siblings");
+
+        assert_eq!(published.album_dir, plan.album_dir);
+        assert!(plan.entries[0].final_path.exists());
     }
 
     fn staged_artifacts_for_plan(staging: &StagingDir, plan: &AlbumPlan) -> ArtifactSet {
@@ -68390,18 +69978,22 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
 
         let final_parent = parent_dir_or_current(&plan.album_dir);
         let _publish_lock = acquire_publish_lock(&plan.album_dir)?;
-        let album_name = plan
-            .album_dir
-            .file_name()
-            .and_then(|s| s.to_str())
-            .map(sanitize_component)
-            .unwrap_or_else(|| "album".to_string());
-        let marker_path = final_parent.join(format!(".{album_name}.publish-in-progress"));
+        let coordination_token =
+            crate::convert::pipeline::coordination_name::album_coordination_token(&plan.album_dir);
+        let marker_path = final_parent.join(format!(
+            ".tonepoet-publish-{coordination_token}.json"
+        ));
         repair_interrupted_publish(&plan.album_dir, &marker_path)?;
-        cleanup_orphan_publish_temps(final_parent, &album_name)?;
+        cleanup_orphan_publish_temps(final_parent, &plan.album_dir)?;
 
-        let temp_dir = unique_path(final_parent, &format!(".{album_name}.tmp"));
-        let backup_dir = unique_path(final_parent, &format!(".{album_name}.backup"));
+        let temp_dir = unique_path(
+            final_parent,
+            &format!(".tonepoet-tmp-{coordination_token}"),
+        );
+        let backup_dir = unique_path(
+            final_parent,
+            &format!(".tonepoet-backup-{coordination_token}"),
+        );
         if let Err(err) = std::fs::create_dir_all(&temp_dir) {
             let _ = std::fs::remove_dir_all(&temp_dir);
             return Err(PublishError::Io(err));
@@ -68461,7 +70053,9 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                 | OverwritePolicy::AlwaysRedo
                 | OverwritePolicy::SkipIfManifestMatch
                 | OverwritePolicy::VerifyIfManifestMatch => {
-                    if let Err(err) = write_publish_marker(&marker_path, &backup_dir) {
+                    if let Err(err) =
+                        write_publish_marker(&plan.album_dir, &marker_path, &backup_dir)
+                    {
                         let _ = std::fs::remove_dir_all(&temp_dir);
                         return Err(err);
                     }
@@ -68520,7 +70114,11 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         std::fs::create_dir_all(&fixture.album_dir).expect("existing album dir");
         std::fs::write(fixture.album_dir.join("old.flac"), b"old output").expect("old output");
 
-        let marker_path = parent.join(".Gate Test.publish-in-progress");
+        let coordination_token =
+            crate::convert::pipeline::coordination_name::album_coordination_token(&fixture.album_dir);
+        let marker_path = parent.join(format!(
+            ".tonepoet-publish-{coordination_token}.json"
+        ));
         let plan = PublishPlan {
             album_dir: fixture.album_dir.clone(),
             entries: vec![PublishEntry {
@@ -68580,7 +70178,10 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         assert!(std::fs::read_dir(&parent)
             .expect("parent entries")
             .filter_map(|entry| entry.ok())
-            .all(|entry| !entry.file_name().to_string_lossy().starts_with(".Gate Test.tmp-")));
+            .all(|entry| !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(&format!(".tonepoet-tmp-{coordination_token}-"))));
     }
 
     #[test]
@@ -68593,14 +70194,19 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         );
         let parent = fixture.album_dir.parent().unwrap().to_path_buf();
         std::fs::create_dir_all(&parent).expect("album parent");
-        let backup_dir = parent.join(".Gate Test.backup-test");
+        let coordination_token =
+            crate::convert::pipeline::coordination_name::album_coordination_token(&fixture.album_dir);
+        let backup_name = format!(".tonepoet-backup-{coordination_token}-test");
+        let backup_dir = parent.join(&backup_name);
         std::fs::create_dir_all(&backup_dir).expect("backup dir");
         std::fs::write(backup_dir.join("restored.flac"), b"restored").expect("backup file");
-        let marker_path = parent.join(".Gate Test.publish-in-progress");
+        let marker_path = parent.join(format!(
+            ".tonepoet-publish-{coordination_token}.json"
+        ));
         let marker = serde_json::json!({
             "version": 1,
             "album_dir_name": "Gate Test",
-            "backup_dir_name": ".Gate Test.backup-test"
+            "backup_dir_name": backup_name
         });
         std::fs::write(&marker_path, serde_json::to_vec_pretty(&marker).unwrap()).expect("marker");
 
@@ -73381,15 +74987,19 @@ Source-aware setting: yes
         std::fs::write(album_dir.join("conversion.log"), b"original log\ncrash log\n")
             .expect("half-appended log");
 
-        let temp_dir = out.join(".Album.tmp-crash");
+        let coordination_token = crate::convert::pipeline::coordination_name::album_coordination_token(&album_dir);
+        let temp_name = format!(".tonepoet-tmp-{coordination_token}-crash");
+        let temp_dir = out.join(&temp_name);
         std::fs::create_dir_all(&temp_dir).expect("incremental recovery temp");
         std::fs::write(temp_dir.join(".incremental-rollback-log"), b"original log\n")
             .expect("log backup");
-        let marker_path = out.join(".Album.incremental-publish-in-progress");
+        let marker_path = out.join(format!(
+            ".tonepoet-incremental-{coordination_token}.json"
+        ));
         let marker = serde_json::json!({
             "version": 1,
             "album_dir_name": "Album",
-            "temp_dir_name": ".Album.tmp-crash",
+            "temp_dir_name": temp_name,
             "actions": [
                 {
                     "action": "restore_original_file",
@@ -73510,16 +75120,20 @@ Source-aware setting: yes
         )
         .expect("prepared replacement temp");
 
-        let temp_dir = out.join(".Album.tmp-cue-crash");
+        let coordination_token = crate::convert::pipeline::coordination_name::album_coordination_token(&album_dir);
+        let temp_name = format!(".tonepoet-tmp-{coordination_token}-cue-crash");
+        let temp_dir = out.join(&temp_name);
         std::fs::create_dir_all(&temp_dir).expect("incremental recovery temp");
         std::fs::write(temp_dir.join(".incremental-rollback-cue"), b"original cue
 ")
             .expect("cue backup");
-        let marker_path = out.join(".Album.incremental-publish-in-progress");
+        let marker_path = out.join(format!(
+            ".tonepoet-incremental-{coordination_token}.json"
+        ));
         let marker = serde_json::json!({
             "version": 1,
             "album_dir_name": "Album",
-            "temp_dir_name": ".Album.tmp-cue-crash",
+            "temp_dir_name": temp_name,
             "actions": [
                 {
                     "action": "remove_created_file",

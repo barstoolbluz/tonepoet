@@ -100,6 +100,29 @@ pub enum LoudnessSimdBackend {
     Avx,
 }
 
+impl LoudnessSimdBackend {
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn qualification_name(self) -> &'static str {
+        match self {
+            Self::Scalar => "scalar",
+            Self::Sse2 => "sse2",
+            Self::Avx => "avx",
+        }
+    }
+}
+
+/// Report the backend production dispatch would select for this channel count.
+/// Qualification uses this to bind the actual runtime choice without exposing
+/// a user-selectable production override.
+#[doc(hidden)]
+#[must_use]
+pub fn production_loudness_simd_backend_for_qualification(
+    channels: usize,
+) -> LoudnessSimdBackend {
+    simd::Backend::production(channels).qualification_backend()
+}
+
 /// Loudness role of one decoded channel, in decoded channel order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ChannelRole {

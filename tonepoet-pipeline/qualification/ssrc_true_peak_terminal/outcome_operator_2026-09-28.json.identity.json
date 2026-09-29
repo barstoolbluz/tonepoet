@@ -1,0 +1,6 @@
+{
+  "evidence_id": "sha256:352bb5dc6fc657c5d13bcfc9bacf295c8e97cf96a5897860e5f29ec77dc0f1b3",
+  "outcome": "not_qualified",
+  "qualification_report": "tonepoet-pipeline/qualification/ssrc_true_peak_terminal/outcome_operator_2026-09-28.json",
+  "qualification_report_sha256": "352bb5dc6fc657c5d13bcfc9bacf295c8e97cf96a5897860e5f29ec77dc0f1b3"
+}

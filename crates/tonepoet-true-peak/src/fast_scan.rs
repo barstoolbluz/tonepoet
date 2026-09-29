@@ -1026,12 +1026,20 @@ struct FastState {
     dense_prefix: Option<QualifiedHalfDelayFft>,
 }
 
+pub(crate) fn production_avx_available() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::is_x86_feature_detected!("avx")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
 impl FastState {
     fn new(channels: usize, execution_mode: FastExecutionMode) -> Self {
-        #[cfg(target_arch = "x86_64")]
-        let use_avx = std::is_x86_feature_detected!("avx");
-        #[cfg(not(target_arch = "x86_64"))]
-        let use_avx = false;
+        let use_avx = production_avx_available();
         let mut diagnostics = SearchDiagnostics::default();
         diagnostics.accelerated_same_graph_avx_prefix_active = use_avx;
         Self {
@@ -1211,8 +1219,13 @@ impl FastState {
         let mut second = vec![None; len];
         let wanted_first = first_cache.wanted.clone();
         let wanted_second = second_cache.map(|cache| cache.wanted.clone()).unwrap_or_else(|| vec![false; len]);
+        let use_avx = self.use_avx;
         let prefix = self.dense_prefix.get_or_insert_with(|| {
-            QualifiedHalfDelayFft::new_fast90(ReconstructionId::Hq1024V1, 2)
+            let mut prefix = QualifiedHalfDelayFft::new_fast90(ReconstructionId::Hq1024V1, 2);
+            prefix
+                .force_fast90_same_graph_avx_for_qualification(use_avx)
+                .expect("Fast dispatch was validated before lazy prefix construction");
+            prefix
         });
         self.diagnostics.accelerated_same_graph_avx_prefix_active = prefix.fast90_same_graph_avx_active();
         let mut emitted_frames = 0usize;
@@ -1830,6 +1843,24 @@ impl FastPeakMeterImpl {
                 destination.copy_from_slice(frame);
             }
         }
+    }
+
+    pub(super) fn force_simd_backend_for_qualification(
+        &mut self,
+        use_avx: bool,
+    ) -> Result<(), &'static str> {
+        if self.started || self.state.nominal_frames_seen != 0 {
+            return Err("cannot change Fast certified-peak dispatch after input");
+        }
+        if use_avx && !production_avx_available() {
+            return Err("AVX is not available on this qualification host");
+        }
+        self.state.use_avx = use_avx;
+        self.state.diagnostics.accelerated_same_graph_avx_prefix_active = use_avx;
+        if let Some(prefix) = &mut self.state.dense_prefix {
+            prefix.force_fast90_same_graph_avx_for_qualification(use_avx)?;
+        }
+        Ok(())
     }
 
     pub(super) fn push_interleaved(&mut self, samples: &[f64]) -> Result<(), TruePeakError> {

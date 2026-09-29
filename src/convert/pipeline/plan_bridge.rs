@@ -368,6 +368,16 @@ fn plan_request_for_track_impl(
         } => Some((*bit_depth, terminal_candidate)),
         _ => None,
     };
+    let certified_ssrc_true_peak_terminal_depth = match &track.source_ref {
+        TrackSourceRef::RegisteredEffectCarrier {
+            representation:
+                RegisteredEffectCarrierRepresentation::CertifiedSsrcTruePeakTerminalW64 {
+                    bit_depth,
+                },
+            ..
+        } => Some(*bit_depth),
+        _ => None,
+    };
     let pcm_true_peak_carrier = matches!(
         &track.source_ref,
         TrackSourceRef::PcmTruePeakCarrier { .. }
@@ -418,7 +428,8 @@ fn plan_request_for_track_impl(
                 request.settings.target_format
             );
         }
-        settings.force_encode = registered_effect_terminal.is_none();
+        settings.force_encode = registered_effect_terminal.is_none()
+            && certified_ssrc_true_peak_terminal_depth.is_none();
         disable_planner_source_tag_transfer(&mut settings);
         disable_planner_artwork_transfer(&mut settings);
         disable_planner_source_audio_md5(&mut settings);
@@ -493,6 +504,39 @@ fn plan_request_for_track_impl(
                 settings.dsd.set_gain_policy(tonepoet_pipeline::SampleGainPolicy::Off);
                 settings.pcm_true_peak.set_policy(tonepoet_pipeline::SampleGainPolicy::Off);
                 settings.force_encode = false;
+            }
+            if let Some(bit_depth) = certified_ssrc_true_peak_terminal_depth {
+                // SSRC has already performed the certified resample, bound
+                // gain, and final PCM sample realization. Integer cells also
+                // own their dither/noise shaping; floating-point cells have it
+                // inactive. The remaining plan is package-only for WAV or
+                // sample-preserving codec encoding for other PCM targets.
+                settings.target_bit_depth = BitDepthTarget::Pcm(bit_depth);
+                settings.dither_type = tonepoet_pipeline::DitherType::None;
+                settings.dither_explicit = false;
+                settings.ssrc.force = false;
+                settings.ssrc.dither_id = None;
+                settings.ssrc.pdf_type = None;
+                settings.dsd.set_gain_policy(tonepoet_pipeline::SampleGainPolicy::Off);
+                settings.pcm_true_peak.set_policy(tonepoet_pipeline::SampleGainPolicy::Off);
+                // The terminal carrier is physically Wave64. It may pass through
+                // only when the requested container is Wave64 too. A default WAV,
+                // RF64-in-WAV, Matroska, or other WAV-codec container still needs
+                // a package/encode step; otherwise the planner would copy Wave64
+                // bytes verbatim under the requested container spelling. Dither,
+                // gain, and resampling remain disabled above, so this downstream
+                // step can only preserve/encode the already-realized PCM samples.
+                let requested_container = request
+                    .container_extension
+                    .as_deref()
+                    .unwrap_or_else(|| request.settings.target_format.extension())
+                    .trim_start_matches('.')
+                    .to_ascii_lowercase();
+                let wave64_passthrough = request.settings.target_format
+                    == tonepoet_pipeline::AudioFormat::Wav
+                    && requested_container == "w64"
+                    && request.container_ffmpeg_flags.is_empty();
+                settings.force_encode = !wave64_passthrough;
             }
             let dsd_derived = matches!(
                 &track.source_ref,
@@ -2685,7 +2729,10 @@ pub fn source_info_for_realized_track(
                 PcmBitDepth::Float64,
                 SampleKind::Float,
             ),
-            RegisteredEffectCarrierRepresentation::TerminalPcmWav { bit_depth, .. } => {
+            RegisteredEffectCarrierRepresentation::TerminalPcmWav { bit_depth, .. }
+            | RegisteredEffectCarrierRepresentation::CertifiedSsrcTruePeakTerminalW64 {
+                bit_depth,
+            } => {
                 let (codec, sample_kind) = if bit_depth.is_float() {
                     (PlannerCodec::PcmFloat, SampleKind::Float)
                 } else {
@@ -3200,7 +3247,8 @@ mod tests {
         ExtractionProvenance, FailurePolicy, LogPolicy, CueSegmentCarrier,
         PlannedMetadataSatisfaction, NamingCollisionPolicy, NamingPolicy, OverwritePolicy,
         PipelineRequest, PreparedSource, PreparedTrack, PublishPolicy, SacdArea,
-        SelectedPhysicalCandidateBinding, SourceAudioDescriptor, SourceKind, SourceOptions,
+        RegisteredEffectCarrierRepresentation, SelectedPhysicalCandidateBinding,
+        SourceAudioDescriptor, SourceKind, SourceOptions,
         StagePolicy, StageRequirement, TrackId,
         TrackMetadata, TrackSelection, TrackSourceRef, CUE_ARTWORK_PATH_EXTRA_KEY,
         FALLBACK_RECOVERED_METADATA_EXTRA_KEY,
@@ -5040,6 +5088,7 @@ mod tests {
             lossy_target_capped: false,
             strong_ssrc_resampler: None,
             terminal_candidate: Some(selected_terminal.clone()),
+            ssrc_true_peak_replay: None,
         });
         prepared_track.sample_rate = Some(96_000);
         prepared_track.bit_depth = Some(320);
@@ -5153,6 +5202,7 @@ mod tests {
             lossy_target_capped: false,
             strong_ssrc_resampler: None,
             terminal_candidate: Some(selected_terminal(tonepoet_pipeline::ToolIdentifier::Ffmpeg)),
+            ssrc_true_peak_replay: None,
         });
 
         let planned = plan_request_for_track(
@@ -5246,6 +5296,7 @@ mod tests {
             lossy_target_capped: false,
             strong_ssrc_resampler: None,
             terminal_candidate: Some(selected_terminal(tonepoet_pipeline::ToolIdentifier::Ffmpeg)),
+            ssrc_true_peak_replay: None,
         });
         prepared.bit_depth = Some(320);
         prepared.source_audio.bit_depth = Some(320);
@@ -5308,6 +5359,7 @@ mod tests {
                 lossy_target_capped: false,
                 strong_ssrc_resampler: None,
                 terminal_candidate: Some(selected_terminal(tonepoet_pipeline::ToolIdentifier::Ffmpeg)),
+                ssrc_true_peak_replay: None,
             });
             prepared.bit_depth = Some(source_bits);
             prepared.source_audio.bit_depth = Some(source_bits);
@@ -5567,6 +5619,7 @@ mod tests {
             lossy_target_capped: false,
             strong_ssrc_resampler: None,
             terminal_candidate: Some(execution.charged_terminal.clone()),
+            ssrc_true_peak_replay: None,
         });
         prepared.sample_rate = Some(48_000);
         prepared.source_audio = SourceAudioDescriptor::from_scalar(
@@ -5658,6 +5711,7 @@ mod tests {
                 lossy_target_capped: true,
                 strong_ssrc_resampler: None,
                 terminal_candidate: Some(execution.charged_terminal.clone()),
+                ssrc_true_peak_replay: None,
             });
             prepared.sample_rate = Some(48_000);
             prepared.source_audio = SourceAudioDescriptor::from_scalar(
@@ -5683,6 +5737,176 @@ mod tests {
             );
             assert!(!tools.iter().any(|tool| *tool == tonepoet_pipeline::ToolIdentifier::Sox));
         }
+    }
+
+    #[test]
+    fn certified_ssrc_terminal_repackages_default_wav_but_wave64_can_passthrough() {
+        let temp = TempDir::new().expect("temp dir");
+        let carrier = temp.path().join("terminal.w64");
+        std::fs::write(&carrier, b"placeholder").expect("carrier placeholder");
+        let source = temp.path().join("source.flac");
+        std::fs::write(&source, b"source").expect("source placeholder");
+        let prepared = track(TrackSourceRef::RegisteredEffectCarrier {
+            path: carrier.clone(),
+            source_path: source,
+            sample_rate_hz: 88_200,
+            channels: 2,
+            duration: None,
+            source_was_dsd: false,
+            resampler_consumed: true,
+            representation: RegisteredEffectCarrierRepresentation::CertifiedSsrcTruePeakTerminalW64 {
+                bit_depth: PcmBitDepth::Int24,
+            },
+        });
+
+        let mut wav_req = request(temp.path());
+        wav_req.settings.target_format = PlannerFormat::Wav;
+        wav_req.settings.target_sample_rate = tonepoet_pipeline::RateTarget::PcmHz(88_200);
+        wav_req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(PcmBitDepth::Int24);
+        wav_req.container_extension = None;
+        let wav_output = temp.path().join("out.wav");
+        let wav_plan = plan_request_for_track(
+            &wav_req,
+            &prepared,
+            &carrier,
+            &wav_output,
+            temp.path().join("work-wav"),
+        )
+        .expect("certified SSRC terminal default WAV plan builds");
+        assert!(wav_plan.settings.force_encode, "Wave64 bytes must not passthrough under .wav");
+        assert!(matches!(
+            tonepoet_pipeline::plan_topology(&wav_plan).expect("WAV topology"),
+            TopologyPlan::Execute { .. }
+        ));
+        assert_eq!(wav_plan.settings.dither_type, tonepoet_pipeline::DitherType::None);
+        assert_eq!(wav_plan.settings.pcm_true_peak.policy, tonepoet_pipeline::SampleGainPolicy::Off);
+
+        let mut w64_req = wav_req.clone();
+        w64_req.container_extension = Some("w64".to_string());
+        let w64_output = temp.path().join("out.w64");
+        let w64_plan = plan_request_for_track(
+            &w64_req,
+            &prepared,
+            &carrier,
+            &w64_output,
+            temp.path().join("work-w64"),
+        )
+        .expect("certified SSRC terminal Wave64 plan builds");
+        assert!(!w64_plan.settings.force_encode, "native Wave64 may preserve the carrier byte-for-byte");
+        // Carrier tracks disable source tag transfer, so the planner takes the
+        // stream-copy topology rather than pure passthrough. Either way no step
+        // may touch samples: only metadata transfer is admissible.
+        match tonepoet_pipeline::plan_topology(&w64_plan).expect("Wave64 topology") {
+            TopologyPlan::Passthrough { .. } => {}
+            TopologyPlan::Execute { steps, .. } => {
+                for step in &steps {
+                    assert!(
+                        matches!(step.operation, tonepoet_pipeline::PlanOperation::MetadataTransfer { .. }),
+                        "native Wave64 target must not re-realize samples: {:?}",
+                        step.operation
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn certified_ssrc_float_terminal_packages_supported_pcm_targets_without_sample_changes() {
+        let temp = TempDir::new().expect("temp dir");
+        let cases = [
+            (PlannerFormat::Wav, PcmBitDepth::Float32, "wav-f32", "wav"),
+            (PlannerFormat::Wav, PcmBitDepth::Float64, "wav-f64", "wav"),
+            (PlannerFormat::Aiff, PcmBitDepth::Float32, "aiff-f32", "aiff"),
+            (PlannerFormat::Aiff, PcmBitDepth::Float64, "aiff-f64", "aiff"),
+            (PlannerFormat::WavPack, PcmBitDepth::Float32, "wv-f32", "wv"),
+        ];
+        for (format, depth, label, extension) in cases {
+            let carrier = temp.path().join(format!("terminal-{label}.w64"));
+            std::fs::write(&carrier, b"placeholder").expect("carrier placeholder");
+            let source = temp.path().join(format!("source-{label}.flac"));
+            std::fs::write(&source, b"source").expect("source placeholder");
+            let prepared = track(TrackSourceRef::RegisteredEffectCarrier {
+                path: carrier.clone(),
+                source_path: source,
+                sample_rate_hz: 88_200,
+                channels: 2,
+                duration: None,
+                source_was_dsd: false,
+                resampler_consumed: true,
+                representation:
+                    RegisteredEffectCarrierRepresentation::CertifiedSsrcTruePeakTerminalW64 {
+                        bit_depth: depth,
+                    },
+            });
+            let mut req = request(temp.path());
+            req.settings.target_format = format;
+            req.settings.target_sample_rate = tonepoet_pipeline::RateTarget::PcmHz(88_200);
+            req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(depth);
+            req.container_extension = None;
+            let output = temp.path().join(format!("out-{label}.{extension}"));
+            let planned = plan_request_for_track(
+                &req,
+                &prepared,
+                &carrier,
+                &output,
+                temp.path().join(format!("work-{label}")),
+            )
+            .unwrap_or_else(|error| panic!("{label} certified SSRC float terminal plan: {error}"));
+            assert_eq!(
+                planned.settings.target_bit_depth,
+                tonepoet_pipeline::BitDepthTarget::Pcm(depth),
+            );
+            assert_eq!(planned.settings.dither_type, tonepoet_pipeline::DitherType::None);
+            assert!(!planned.settings.ssrc.force);
+            assert_eq!(planned.settings.ssrc.dither_id, None);
+            assert_eq!(planned.settings.ssrc.pdf_type, None);
+            assert_eq!(
+                planned.settings.pcm_true_peak.policy,
+                tonepoet_pipeline::SampleGainPolicy::Off,
+            );
+            assert!(planned.settings.force_encode, "{label} must package the Wave64 carrier");
+        }
+    }
+
+    #[test]
+    fn certified_ssrc_terminal_rf64_selection_never_passthrough_copies_wave64() {
+        let temp = TempDir::new().expect("temp dir");
+        let carrier = temp.path().join("terminal.w64");
+        std::fs::write(&carrier, b"placeholder").expect("carrier placeholder");
+        let source = temp.path().join("source.flac");
+        std::fs::write(&source, b"source").expect("source placeholder");
+        let prepared = track(TrackSourceRef::RegisteredEffectCarrier {
+            path: carrier.clone(),
+            source_path: source,
+            sample_rate_hz: 88_200,
+            channels: 2,
+            duration: None,
+            source_was_dsd: false,
+            resampler_consumed: true,
+            representation: RegisteredEffectCarrierRepresentation::CertifiedSsrcTruePeakTerminalW64 {
+                bit_depth: PcmBitDepth::Int24,
+            },
+        });
+        let mut req = request(temp.path());
+        req.settings.target_format = PlannerFormat::Wav;
+        req.settings.target_sample_rate = tonepoet_pipeline::RateTarget::PcmHz(88_200);
+        req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(PcmBitDepth::Int24);
+        req.container_extension = Some("wav".to_string());
+        req.container_ffmpeg_flags = vec!["-rf64".to_string(), "auto".to_string()];
+        let output = temp.path().join("out.wav");
+        let planned = plan_request_for_track(
+            &req,
+            &prepared,
+            &carrier,
+            &output,
+            temp.path().join("work-rf64"),
+        )
+        .expect("certified SSRC terminal RF64 plan builds");
+        assert!(planned.settings.force_encode);
+        assert!(matches!(
+            tonepoet_pipeline::plan_topology(&planned).expect("RF64 topology"),
+            TopologyPlan::Execute { .. }
+        ));
     }
 
     #[test]
@@ -5803,6 +6027,7 @@ mod tests {
             lossy_target_capped: true,
             strong_ssrc_resampler: None,
             terminal_candidate: Some(selected_terminal(tonepoet_pipeline::ToolIdentifier::Ffmpeg)),
+            ssrc_true_peak_replay: None,
         });
         prepared_track.bit_depth = Some(640);
         prepared_track.source_audio.bit_depth = Some(640);

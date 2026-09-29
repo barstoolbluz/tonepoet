@@ -1995,7 +1995,7 @@ mod ssrc_rate_dependent_dither_validation_tests {
     }
 
     #[test]
-    fn explicit_sample_rate_independent_ssrc_dither_id_can_override_invalid_global_mapping() {
+    fn explicit_native_ssrc_dither_id_availability_is_deferred_to_active_terminal() {
         let mut settings = PipelineSettings::default();
         settings.preferred_tool = PreferredTool::Ssrc;
         settings.target_sample_rate = RateTarget::PcmHz(176_400);

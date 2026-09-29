@@ -101,6 +101,8 @@
       "source_container": "carrier_sensitive_w64",
       "producer_tool": "ffmpeg",
       "producer_args_template": [
+        "-cpuflags",
+        "sse+sse2",
         "-nostdin",
         "-hide_banner",
         "-nostats",
@@ -121,7 +123,8 @@
       ],
       "environment_policy": "clear_and_set",
       "environment": {
-        "LC_ALL": "C"
+        "LC_ALL": "C",
+        "SOXR_USE_SIMD": "0"
       },
       "transport": "direct_stdout_to_stdin_no_shell",
       "consumer_tool": "sox_ng",
@@ -250,9 +253,10 @@
     "schema": "tonepoet-reference-subprocess-environment/v1",
     "policy": "clear_and_set",
     "variables": {
-      "LC_ALL": "C"
+      "LC_ALL": "C",
+      "SOXR_USE_SIMD": "0"
     },
-    "scope": "all_reference_external_commands"
+    "scope": "reference_audio_external_commands"
   },
   "qualification_supervision": {
     "schema": "tonepoet-reference-qualification-supervision/v1",
@@ -364,8 +368,8 @@
       "safe_pre_terminal_ceiling_dbtp": "-1.010595538"
     }
   },
-  "qualification_basis": "Policy v18 extends the v17 deterministic Reference contract with qualified SACD DSD/DST extraction, one-through-six-channel execution, target-limited DSD128/DSD256 to 88.2/96 kHz profiles, a bounded Int16 SoX-ng TPDF terminal, and retirement of the obsolete streamed-WAV RIFF32 length admission. Historical analyzer/evidence authorities remain immutable.",
-  "runtime_activation": "Fail closed unless the embedded v18 candidate is promoted by a passed release certification that binds the exact candidate bytes and the complete v18 common-model qualification evidence, including SACD/multichannel source-front-end, Int16 terminal, B4T response, and 300-cell Wave64 gates.",
+  "qualification_basis": "Policy v18 extends the v17 deterministic Reference contract with qualified SACD DSD/DST extraction, one-through-six-channel execution, target-limited DSD128/DSD256 to 88.2/96 kHz profiles, a bounded Int16 SoX-ng TPDF terminal, portable content-addressed attestation of the complete package-private external runtime closure, and qualification of every admitted x86_64 internal dispatch tier. Historical analyzer/evidence authorities remain immutable.",
+  "runtime_activation": "Fail closed unless the embedded v18 candidate is promoted by a passed release certification that binds the exact candidate bytes, the final staged portable runtime-closure manifest, every admitted Reference dispatch tier, and the complete v18 common-model qualification evidence. Package installation location is not identity; the staged runtime-closure bytes and manifest must be the bytes installed and executed.",
   "cell_contract": {
     "schema": "tonepoet-dsd-reference-qualified-cells/v3",
     "source_kinds": [
@@ -1604,6 +1608,8 @@
     ],
     "consumer_tool": "ffmpeg",
     "consumer_args_template": [
+      "-cpuflags",
+      "sse+sse2",
       "-y",
       "-hide_banner",
       "-nostdin",
@@ -1638,7 +1644,8 @@
     "disk_intermediate": false,
     "environment_policy": "clear_and_set",
     "environment": {
-      "LC_ALL": "C"
+      "LC_ALL": "C",
+      "SOXR_USE_SIMD": "0"
     },
     "forbidden_route": "ffmpeg_direct_decode_of_float64_qpcm_w64",
     "stream_framing": "headerless_raw_pcm",
@@ -1681,7 +1688,8 @@
     "oracle_independence": "float64_w64_source_sox_decode_vs_riff_rf64_output_ffmpeg_decode",
     "environment_policy": "clear_and_set",
     "environment": {
-      "LC_ALL": "C"
+      "LC_ALL": "C",
+      "SOXR_USE_SIMD": "0"
     },
     "metadata_mutation": {
       "w64": "error:DSD-REF-P0-024",
@@ -1719,9 +1727,9 @@
       "rf64_preservation": "source_magic_RF64_requires_ffmpeg_-rf64_always",
       "w64_non_8_aligned_int24_mono_probe": "known_muxer_defect_phantom_sample",
       "riff_odd_byte_int24_mono_probe": "qualified_via_exact_production_ffmpeg_route",
-      "runtime_identity_binding": "certified_report_to_compiled_store_to_runner_resolution",
-      "execution_authority": "exact_canonical_path_plus_executable_sha256",
-      "pre_mutation_reverification": "path_sha256_version_closure",
+      "runtime_identity_binding": "attested_release_identity_to_package_activation_to_runner_resolution",
+      "execution_authority": "package_activation_path_plus_executable_sha256_plus_runtime_closure_manifest",
+      "pre_mutation_reverification": "portable_runtime_closure_plus_activation_path_sha256_version_release_identity",
       "per_output_authority": "ReferenceToolchainEvidence.metadata_mutators_and_execution_fingerprint_v1"
     }
   },

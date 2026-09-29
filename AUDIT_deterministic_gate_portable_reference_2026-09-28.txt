@@ -1,0 +1,99 @@
+PASS 01 lease reader safety bound remains exactly 1 MiB
+PASS 02 current persistent lease schema is 2
+PASS 03 schema 1 legacy reader remains admitted
+PASS 04 writer uses compact schema-2 encoder
+PASS 05 writer validates encoded size before staging file construction
+PASS 06 oversize error is explicitly pre-publication
+PASS 07 path interning is present
+PASS 08 large compact-descriptor regression is present
+PASS 09 legacy schema regression is present
+PASS 10 genuine oversize pre-publication regression is present
+PASS 11 portable root and manifest env are paired
+PASS 12 manifest has bounded read size
+PASS 13 manifest must be regular non-symlink
+PASS 14 manifest must live outside closure root
+PASS 15 closure paths must be relative and canonical
+PASS 16 closure manifest must be strictly sorted/unique
+PASS 17 directories are attested members
+PASS 18 files bind exact SHA-256
+PASS 19 symlink target text is part of identity
+PASS 20 absolute symlink targets fail
+PASS 21 escaping symlinks fail
+PASS 22 missing/extra/changed closure members fail
+PASS 23 runtime closure digest binds schema and entries
+PASS 24 portable tool executable must be inside closure
+PASS 25 portable tool executable must match manifested file hash
+PASS 26 legacy no-manifest mode remains exact compiled-path bound
+PASS 27 package activation path is compared to runner path
+PASS 28 metadata mutation re-attests closure before mutation
+PASS 29 builder manifests real directories including empty ones
+PASS 30 builder rejects manifest inside closure
+PASS 31 builder scans twice before publication
+PASS 32 builder re-scans after atomic publication
+PASS 33 builder rejects escaping symlinks
+PASS 34 promoted SIMD binding is a qualified set
+PASS 35 qualified loudness set is scalar/sse2/avx
+PASS 36 qualified peak set is scalar/avx
+PASS 37 runtime loudness selector uses production selector
+PASS 38 runtime peak selector uses production selector
+PASS 39 common closure hashes qualified dispatch set
+PASS 40 common closure does not hash host runtime dispatch digest
+PASS 41 per-run execution fingerprint hashes actual runtime dispatch
+PASS 42 metadata mutator install path removed from execution identity
+PASS 43 relocation-invariance fingerprint regression exists
+PASS 44 common-closure relocation/runtime-tier invariance regression exists
+PASS 45 qualification exercises scalar loudness production geometry
+PASS 46 qualification exercises SSE2 loudness production geometry
+PASS 47 qualification exercises AVX loudness production geometry
+PASS 48 qualification forces actual loudness production kernel
+PASS 49 qualification forces actual certified-peak production kernel
+PASS 50 Reference9 AVX is explicitly refused
+PASS 51 canonical FFmpeg ceiling is SSE+SSE2
+PASS 52 canonical libsoxr pin is SOXR_USE_SIMD=0
+PASS 53 Reference FFmpeg lowering wrapper prepends CPU flags
+PASS 54 Reference audio environment contains locale and libsoxr pin
+PASS 55 runtime canonical Reference audio env contains libsoxr pin
+PASS 56 Float64 package validator requires FFmpeg CPU ceiling
+PASS 57 direct sample hash runtime path carries CPU ceiling
+PASS 58 full traversal runtime path carries CPU ceiling
+PASS 59 active qualification helper ffmpeg_sample_hash carries CPU ceiling
+PASS 60 active qualification helper probe_ffmpeg_w64_full_traversal carries CPU ceiling
+PASS 61 active qualification helper decode_w64_to_f64 carries CPU ceiling
+PASS 62 active qualification helper direct_ffmpeg_f64_samples carries CPU ceiling
+PASS 63 active qualification helper ffmpeg_decode_int24_bytes carries CPU ceiling
+PASS 64 historical direct FFmpeg F64 probe remains explicitly append-only/dead
+PASS 65 qualification audio runner applies libsoxr pin
+PASS 66 qualification has separate locale-only runner
+PASS 67 metadata W64 remux uses locale-only runner
+PASS 68 version/control probes use locale-only runner
+PASS 69 active v18 policy audio env is LC_ALL+C and SOXR pin
+PASS 70 active v18 policy env scope is Reference audio only
+PASS 71 active v18 policy metadata env is locale-only
+PASS 72 active v18 policy analyzer FFmpeg producer carries CPU ceiling
+PASS 73 active v18 policy package FFmpeg consumer carries CPU ceiling
+PASS 74 active v18 policy runtime activation names final staged closure
+PASS 75 v18 candidate policy audio env is LC_ALL+C and SOXR pin
+PASS 76 v18 candidate policy env scope is Reference audio only
+PASS 77 v18 candidate policy metadata env is locale-only
+PASS 78 v18 candidate policy analyzer FFmpeg producer carries CPU ceiling
+PASS 79 v18 candidate policy package FFmpeg consumer carries CPU ceiling
+PASS 80 v18 candidate policy runtime activation names final staged closure
+PASS 81 common candidate binds portable closure manifest identity
+PASS 82 common candidate binds qualified dispatch set not host tier
+PASS 83 final qualification requires portable runtime closure env
+PASS 84 final qualification emits portable closure digest
+PASS 85 final qualification emits internal dispatch tier evidence
+PASS 86 historical v16 qualification artifacts are untouched
+PASS 87 promoted v18 evidence/report/certification remain untouched
+PASS 88 SoX information/control probes use the locale-only environment
+PASS 89 FFprobe package authority probes use the locale-only environment
+PASS 90 no FFprobe authority probe uses the audio/libsoxr environment
+PASS 91 portable final qualification no longer equates staged executables to Nix store paths
+PASS 92 portable final qualification requires each active tool inside staged runtime closure
+PASS 93 Nix store paths are retained only as named build provenance in active evidence
+PASS 94 qualification environment isolation proves SOXR_USE_SIMD=0
+PASS 95 ordinary qualified FFmpeg Int32 terminal retains exact compiled-path binding
+PASS 96 ordinary qualified FFmpeg Int32 terminal was not given Reference CPU-ceiling argv
+
+RESULT 96/96 PASS
+NOTE cargo/rustc/nix are unavailable in this environment; this is a target-free source/policy audit, not Rust execution evidence.
