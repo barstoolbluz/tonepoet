@@ -18,7 +18,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 const DESCRIPTOR_SCHEMA_LEGACY: u32 = 1;
-const DESCRIPTOR_SCHEMA: u32 = 2;
+const DESCRIPTOR_SCHEMA_INTERNED_OBJECTS: u32 = 2;
+const DESCRIPTOR_SCHEMA: u32 = 3;
 const DESCRIPTOR_MAX_BYTES: u64 = 1024 * 1024;
 const EXECUTION_STAGING_RETIRE_CONTENTION_BUDGET: Duration = Duration::from_millis(250);
 const EXECUTION_STAGING_RETIRE_CONTENTION_SLEEP: Duration = Duration::from_millis(2);
@@ -781,12 +782,12 @@ struct LeaseDescriptor {
 }
 
 
-/// Compact schema-2 wire identity. Path spellings are interned into the
-/// descriptor-level table, so the same lossless pathname is never repeated in
-/// every identity field of every claim. The in-memory `LeaseDescriptor` remains
-/// unchanged; this is only the durable representation.
+/// Schema-2 wire identity. Path spellings are interned into the descriptor-level
+/// table, so the same lossless pathname is never repeated in every identity
+/// field of every claim. Schema 2 still wrote each claim as a verbose JSON
+/// object; it remains here for backward-compatible reads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct CompactResolvedPathIdentity {
+struct CompactResolvedPathIdentityV2 {
     original: u32,
     namespace_path: u32,
     #[serde(default)]
@@ -801,8 +802,8 @@ struct CompactResolvedPathIdentity {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct CompactPathClaim {
-    identity: CompactResolvedPathIdentity,
+struct CompactPathClaimV2 {
+    identity: CompactResolvedPathIdentityV2,
     mode: ClaimMode,
     scope: ClaimScope,
 }
@@ -820,7 +821,56 @@ struct LeaseDescriptorWireV2 {
     )]
     paths: Vec<PathBuf>,
     #[serde(default)]
-    claims: Vec<CompactPathClaim>,
+    claims: Vec<CompactPathClaimV2>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    coordination_group: Option<String>,
+}
+
+/// Schema 3 keeps schema 2's lossless descriptor-level path interning but
+/// removes the remaining O(claims) JSON field-name overhead. The tuple layout
+/// is fixed by the schema version, in this order:
+///
+/// 0 original path index
+/// 1 namespace path index
+/// 2 namespace-dependency path indexes
+/// 3 resolved-I/O path index
+/// 4 canonical-existing-ancestor path index
+/// 5 suffix path index
+/// 6 device id
+/// 7 inode
+/// 8 claim mode
+/// 9 claim scope
+///
+/// This is intentionally a durable wire-only representation. The in-memory
+/// `PathClaim` stays named and self-describing, while a large ordinary file
+/// operation no longer spends more bytes on repeated JSON keys than on paths.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CompactPathClaimV3(
+    u32,
+    u32,
+    Vec<u32>,
+    u32,
+    u32,
+    u32,
+    Option<u64>,
+    Option<u64>,
+    ClaimMode,
+    ClaimScope,
+);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LeaseDescriptorWireV3 {
+    schema: u32,
+    descriptor_id: Uuid,
+    family: LeaseFamily,
+    owner: OwnerProcessIdentity,
+    created_unix_ms: u64,
+    #[serde(
+        serialize_with = "lossless_path_serde::serialize_vec",
+        deserialize_with = "lossless_path_serde::deserialize_vec"
+    )]
+    paths: Vec<PathBuf>,
+    claims: Vec<CompactPathClaimV3>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     coordination_group: Option<String>,
 }
@@ -850,13 +900,14 @@ impl DescriptorPathInterner {
     }
 }
 
-fn compact_claim(
+#[cfg(test)]
+fn compact_claim_v2(
     paths: &mut DescriptorPathInterner,
     claim: &PathClaim,
-) -> Result<CompactPathClaim, String> {
+) -> Result<CompactPathClaimV2, String> {
     let identity = &claim.identity;
-    Ok(CompactPathClaim {
-        identity: CompactResolvedPathIdentity {
+    Ok(CompactPathClaimV2 {
+        identity: CompactResolvedPathIdentityV2 {
             original: paths.intern(&identity.original)?,
             namespace_path: paths.intern(&identity.namespace_path)?,
             namespace_dependencies: identity
@@ -875,13 +926,36 @@ fn compact_claim(
     })
 }
 
+fn compact_claim_v3(
+    paths: &mut DescriptorPathInterner,
+    claim: &PathClaim,
+) -> Result<CompactPathClaimV3, String> {
+    let identity = &claim.identity;
+    Ok(CompactPathClaimV3(
+        paths.intern(&identity.original)?,
+        paths.intern(&identity.namespace_path)?,
+        identity
+            .namespace_dependencies
+            .iter()
+            .map(|path| paths.intern(path))
+            .collect::<Result<Vec<_>, _>>()?,
+        paths.intern(&identity.resolved_io_path)?,
+        paths.intern(&identity.canonical_existing_ancestor)?,
+        paths.intern(&identity.suffix)?,
+        identity.dev,
+        identity.ino,
+        claim.mode,
+        claim.scope,
+    ))
+}
+
 fn compact_path<'a>(paths: &'a [PathBuf], index: u32) -> Result<&'a PathBuf, String> {
     paths.get(index as usize).ok_or_else(|| {
-        format!("persistent lease schema-2 path index {index} is outside the path table")
+        format!("persistent lease compact path index {index} is outside the path table")
     })
 }
 
-fn expand_claim(paths: &[PathBuf], claim: CompactPathClaim) -> Result<PathClaim, String> {
+fn expand_claim_v2(paths: &[PathBuf], claim: CompactPathClaimV2) -> Result<PathClaim, String> {
     let identity = claim.identity;
     Ok(PathClaim {
         identity: ResolvedPathIdentity {
@@ -903,10 +977,42 @@ fn expand_claim(paths: &[PathBuf], claim: CompactPathClaim) -> Result<PathClaim,
     })
 }
 
+fn expand_claim_v3(paths: &[PathBuf], claim: CompactPathClaimV3) -> Result<PathClaim, String> {
+    let CompactPathClaimV3(
+        original,
+        namespace_path,
+        namespace_dependencies,
+        resolved_io_path,
+        canonical_existing_ancestor,
+        suffix,
+        dev,
+        ino,
+        mode,
+        scope,
+    ) = claim;
+    Ok(PathClaim {
+        identity: ResolvedPathIdentity {
+            original: compact_path(paths, original)?.clone(),
+            namespace_path: compact_path(paths, namespace_path)?.clone(),
+            namespace_dependencies: namespace_dependencies
+                .into_iter()
+                .map(|index| compact_path(paths, index).cloned())
+                .collect::<Result<Vec<_>, _>>()?,
+            resolved_io_path: compact_path(paths, resolved_io_path)?.clone(),
+            canonical_existing_ancestor: compact_path(paths, canonical_existing_ancestor)?.clone(),
+            suffix: compact_path(paths, suffix)?.clone(),
+            dev,
+            ino,
+        },
+        mode,
+        scope,
+    })
+}
+
 fn encode_descriptor_for_storage(descriptor: &LeaseDescriptor) -> Result<Vec<u8>, String> {
     if descriptor.schema != DESCRIPTOR_SCHEMA {
         return Err(format!(
-            "cannot encode persistent lease schema {} with schema-2 encoder",
+            "cannot encode persistent lease schema {} with schema-3 encoder",
             descriptor.schema
         ));
     }
@@ -914,10 +1020,34 @@ fn encode_descriptor_for_storage(descriptor: &LeaseDescriptor) -> Result<Vec<u8>
     let claims = descriptor
         .claims
         .iter()
-        .map(|claim| compact_claim(&mut paths, claim))
+        .map(|claim| compact_claim_v3(&mut paths, claim))
+        .collect::<Result<Vec<_>, _>>()?;
+    let wire = LeaseDescriptorWireV3 {
+        schema: DESCRIPTOR_SCHEMA,
+        descriptor_id: descriptor.descriptor_id,
+        family: descriptor.family.clone(),
+        owner: descriptor.owner,
+        created_unix_ms: descriptor.created_unix_ms,
+        paths: paths.paths,
+        claims,
+        coordination_group: descriptor.coordination_group.clone(),
+    };
+    serde_json::to_vec(&wire)
+        .map_err(|error| format!("serialize persistent lease schema 3: {error}"))
+}
+
+#[cfg(test)]
+fn encode_descriptor_schema_two_for_test(
+    descriptor: &LeaseDescriptor,
+) -> Result<Vec<u8>, String> {
+    let mut paths = DescriptorPathInterner::default();
+    let claims = descriptor
+        .claims
+        .iter()
+        .map(|claim| compact_claim_v2(&mut paths, claim))
         .collect::<Result<Vec<_>, _>>()?;
     let wire = LeaseDescriptorWireV2 {
-        schema: DESCRIPTOR_SCHEMA,
+        schema: DESCRIPTOR_SCHEMA_INTERNED_OBJECTS,
         descriptor_id: descriptor.descriptor_id,
         family: descriptor.family.clone(),
         owner: descriptor.owner,
@@ -936,13 +1066,31 @@ fn decode_descriptor_from_storage(bytes: &[u8]) -> Result<LeaseDescriptor, Strin
     match probe.schema {
         DESCRIPTOR_SCHEMA_LEGACY => serde_json::from_slice(bytes)
             .map_err(|error| format!("decode persistent lease schema 1: {error}")),
-        DESCRIPTOR_SCHEMA => {
+        DESCRIPTOR_SCHEMA_INTERNED_OBJECTS => {
             let wire: LeaseDescriptorWireV2 = serde_json::from_slice(bytes)
                 .map_err(|error| format!("decode persistent lease schema 2: {error}"))?;
             let claims = wire
                 .claims
                 .into_iter()
-                .map(|claim| expand_claim(&wire.paths, claim))
+                .map(|claim| expand_claim_v2(&wire.paths, claim))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(LeaseDescriptor {
+                schema: DESCRIPTOR_SCHEMA_INTERNED_OBJECTS,
+                descriptor_id: wire.descriptor_id,
+                family: wire.family,
+                owner: wire.owner,
+                created_unix_ms: wire.created_unix_ms,
+                claims,
+                coordination_group: wire.coordination_group,
+            })
+        }
+        DESCRIPTOR_SCHEMA => {
+            let wire: LeaseDescriptorWireV3 = serde_json::from_slice(bytes)
+                .map_err(|error| format!("decode persistent lease schema 3: {error}"))?;
+            let claims = wire
+                .claims
+                .into_iter()
+                .map(|claim| expand_claim_v3(&wire.paths, claim))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(LeaseDescriptor {
                 schema: DESCRIPTOR_SCHEMA,
@@ -1477,6 +1625,11 @@ impl PersistentLease {
         };
         let encoded = encode_descriptor_for_storage(&body)
             .map_err(|e| format!("serialize persistent lease {}: {e}", path.display()))?;
+        // Claim count is not the safety boundary. Schema 3 keeps ordinary
+        // high-cardinality jobs compact by removing repeated claim field names,
+        // while unusually large unique path material still grows the encoded
+        // descriptor past this exact reader envelope and fails before any
+        // staging or published pathname exists.
         if encoded.len() as u64 > DESCRIPTOR_MAX_BYTES {
             return Err(format!(
                 "persistent lease descriptor exceeds {} bytes before publication: {}",
@@ -4850,7 +5003,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_two_compacts_large_legitimate_claim_sets_below_reader_bound() {
+    fn schema_three_compacts_large_claim_sets_below_reader_bound() {
         let descriptor = synthetic_lease_descriptor(
             DESCRIPTOR_SCHEMA,
             synthetic_descriptor_claims(2_500, 96),
@@ -4863,13 +5016,13 @@ mod tests {
             "fixture must reproduce the schema-1 descriptor inflation"
         );
 
-        let compact = encode_descriptor_for_storage(&descriptor).expect("encode schema-2 descriptor");
+        let compact = encode_descriptor_for_storage(&descriptor).expect("encode schema-3 descriptor");
         assert!(
             compact.len() as u64 <= DESCRIPTOR_MAX_BYTES,
-            "schema-2 descriptor must stay within the unchanged reader safety bound: {} bytes",
+            "schema-3 descriptor must stay within the unchanged reader safety bound: {} bytes",
             compact.len()
         );
-        let decoded = decode_descriptor_from_storage(&compact).expect("decode schema-2 descriptor");
+        let decoded = decode_descriptor_from_storage(&compact).expect("decode schema-3 descriptor");
         assert_eq!(decoded.claims, descriptor.claims);
         assert_eq!(decoded.family, descriptor.family);
         assert_eq!(decoded.descriptor_id, descriptor.descriptor_id);
@@ -4890,14 +5043,29 @@ mod tests {
     }
 
     #[test]
-    fn oversized_schema_two_descriptor_fails_before_any_lease_is_published() {
+    fn reader_accepts_schema_two_interned_object_descriptors() {
+        let descriptor = synthetic_lease_descriptor(
+            DESCRIPTOR_SCHEMA_INTERNED_OBJECTS,
+            synthetic_descriptor_claims(3, 8),
+        );
+        let bytes = encode_descriptor_schema_two_for_test(&descriptor)
+            .expect("serialize schema-2 descriptor");
+        let decoded = decode_descriptor_from_storage(&bytes).expect("decode schema-2 descriptor");
+        assert_eq!(decoded.schema, DESCRIPTOR_SCHEMA_INTERNED_OBJECTS);
+        assert_eq!(decoded.descriptor_id, descriptor.descriptor_id);
+        assert_eq!(decoded.family, descriptor.family);
+        assert_eq!(decoded.claims, descriptor.claims);
+    }
+
+    #[test]
+    fn oversized_schema_three_descriptor_fails_before_any_lease_is_published() {
         let scope = scoped_test_coordination_root();
         let family = LeaseFamily::EphemeralMutation { claim_id: Uuid::new_v4() };
         let error = PersistentLease::create(
             family.clone(),
             &synthetic_descriptor_claims(4_000, 320),
         )
-        .expect_err("genuinely oversized schema-2 descriptor must fail closed");
+        .expect_err("genuinely oversized schema-3 descriptor must fail closed");
         assert!(
             error.contains("exceeds 1048576 bytes before publication"),
             "unexpected oversized-descriptor error: {error}"

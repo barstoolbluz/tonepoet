@@ -29506,6 +29506,11 @@ mod tests {
 
     #[test]
     fn common_write_lock_parent_sync_failure_is_reported_after_committed_tag_write() {
+        // This path acquires the process-wide persistent mutation claim. Keep
+        // it inside the reviewed coordination-test fixture protocol so a
+        // parallel test cannot lend it a temporary coordination root that is
+        // retired while this writer is between directory creation and staging.
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("common-cleanup-warning.flac");
         let _ = write_synthetic_flac(&path, &[("TITLE", "Original")], 4096, 64 * 1024);
