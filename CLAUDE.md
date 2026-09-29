@@ -23,7 +23,8 @@ cargo test --workspace --no-fail-fast --exclude tonepoet-true-peak   # THE GATE
                              # without --no-fail-fast, --workspace stops at the
                              # first failing binary; tonepoet-true-peak costs
                              # ~41 min and is gated separately. See ## Testing —
-                             # a clean gate is 7192/2, NOT zero failures.
+                             # a clean gate is 7194/0; see ## Testing for the
+                             # rare coordination-contention flake.
 cargo test -p tonepoet-backend   # Backend tests only
 cargo test -p tonepoet-features  # Features tests only
 cargo test -p tonepoet-true-peak # True-peak + loudness core (~41 min)
@@ -261,27 +262,34 @@ cargo test -p tonepoet-true-peak   # BS.1770 true-peak + loudness core (~41 min)
 Tests are in `crates/*/tests/` directories, `src/` (inline `#[cfg(test)]` modules), and `tests/` (integration/contract/sentinel tests). The workspace suite is ~7,190 tests across 57 targets, plus 160 in `tonepoet-true-peak`.
 NEVER truncate failure output.
 
-**A clean gate on `main` is 7192 passed / 2 FAILED, not zero failures.** Both failures are
-the Reference qualification refusing stale promoted evidence:
+**A clean gate on `main` is 7194 passed / 0 FAILED.** Reference was requalified on
+2026-09-29 against the Nix rooting, so the two stale-evidence qualification refusals that
+previously failed are gone.
 
-- `convert::pipeline::track_executor::tests::phase5_promotion_binds_core_and_optional_metadata_closure_variants`
-- `convert::pipeline::track_executor::tests::production_promoted_evidence_refuses_missing_sox_before_any_tool_launch`
+A rare coordination-contention flake remains. It appeared once in four consecutive runs
+on a 32-thread host, on two tests that both pass in isolation:
 
-Both say "Reference qualification report is incomplete or does not bind the exact
-candidate/required closure variants". The portable-Reference work changed the active v18
-policy while the checked-in promoted artifacts deliberately stayed on the previous closure,
-so these clear only when Reference is requalified on the build host. **Never hand-edit
-promoted evidence to silence them** — they are the requalification debt made visible.
+```
+scanner probe must acquire the now-ownerless durable descriptor inode:
+  Os { code: 11, kind: WouldBlock }
+retire test recovery reservation: "persistent lease is live-owned: .../…lease"
+```
 
-The correct check is that the failure set equals exactly those two. A third failure, or a
-different one, is real. The gate is now deterministic: repeated runs on an unloaded host
-give the identical result, so a varying failure set is itself a defect.
+This is lock/ownership contention, a different family from the descriptor-size flake
+("exceeds 1048576 bytes") that the schema-3 encoding fixed. It hit `concurrency` and
+`tui::keybindings::permanent_delete_tests` in the one observed occurrence — different
+subsystems, so it may wander rather than being specific to those two.
+
+A failure that survives running the test alone is real. A failure that disappears in
+isolation, with one of the messages above, is this known flake — rerun, and do not
+"fix" it by serializing the suite or relaxing a lock.
 
 `cargo test -p tonepoet-true-peak` is separate and IS at 160/0.
 
-Superseded 2026-09-29: the three deferred hard-ceiling failures now pass, and the recurrent
-"persistent lease descriptor exceeds 1048576 bytes" contention flake was fixed by the
-schema-3 descriptor encoding.
+Superseded 2026-09-29: the three deferred hard-ceiling failures now pass; the
+"persistent lease descriptor exceeds 1048576 bytes" flake was fixed by the schema-3
+descriptor encoding; and the two stale-evidence qualification refusals were cleared by
+requalification.
 
 ## External Tool Dependencies
 
