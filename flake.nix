@@ -111,6 +111,52 @@
           fuseiso
         ]);
 
+        # Linux package releases cannot execute copied Nix ELFs directly:
+        # their PT_INTERP paths name /nix/store. Build a tiny static launcher
+        # whose own startup has no host dynamic-loader dependency.
+        referenceRuntimeLauncher = if pkgs.stdenv.isLinux then
+          pkgs.pkgsStatic.stdenv.mkDerivation {
+            pname = "tonepoet-reference-runtime-launcher";
+            version = "1";
+            dontUnpack = true;
+            buildPhase = ''
+              $CC -std=c11 -Os -Wall -Wextra -Werror -static \
+                -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
+                -Wl,--build-id=sha1 \
+                ${./tools/reference_runtime_launcher.c} \
+                -o tonepoet-reference-runtime-launcher
+            '';
+            installPhase = ''
+              install -Dm755 tonepoet-reference-runtime-launcher \
+                $out/bin/tonepoet-reference-runtime-launcher
+            '';
+          }
+        else null;
+
+        referenceRuntimeStager = if pkgs.stdenv.isLinux then
+          pkgs.writeShellApplication {
+            name = "stage-tonepoet-reference-runtime";
+            runtimeInputs = with pkgs; [
+              python3
+              nix
+              patchelf
+              binutils
+              coreutils
+            ];
+            text = ''
+              exec ${pkgs.python3}/bin/python3 \
+                ${./tools/stage_reference_runtime_closure.py} \
+                --launcher ${referenceRuntimeLauncher}/bin/tonepoet-reference-runtime-launcher \
+                --manifest-builder ${./tools/build_reference_runtime_closure_manifest.py} \
+                --nix-store ${pkgs.nix}/bin/nix-store \
+                --patchelf ${pkgs.patchelf}/bin/patchelf \
+                --readelf ${pkgs.binutils}/bin/readelf \
+                --cp ${pkgs.coreutils}/bin/cp \
+                "$@"
+            '';
+          }
+        else null;
+
       in
       {
         packages.default = pkgs.rustPlatform.buildRustPackage {
@@ -192,9 +238,16 @@
           '';
         };
 
-        apps.default = {
-          type = "app";
-          program = "${self.packages.${system}.default}/bin/tonepoet";
+        apps = {
+          default = {
+            type = "app";
+            program = "${self.packages.${system}.default}/bin/tonepoet";
+          };
+        } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          stage-reference-runtime = {
+            type = "app";
+            program = "${referenceRuntimeStager}/bin/stage-tonepoet-reference-runtime";
+          };
         };
       }
     );
