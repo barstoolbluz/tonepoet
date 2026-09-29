@@ -8606,9 +8606,19 @@ fn qualify_pinned_reference_toolchain_and_profile_responses() -> Value {
         .expect("qualification build must expose wvtag build-provenance store path");
     let atomic_parsley_store = std::env::var(ATOMIC_PARSLEY_STORE_ENV)
         .expect("qualification build must expose AtomicParsley build-provenance store path");
-    let runtime_closure_root_raw = std::env::var_os(RUNTIME_CLOSURE_ROOT_ENV).unwrap_or_else(|| {
-        panic!("{RUNTIME_CLOSURE_ROOT_ENV} must name the staged Reference runtime closure")
-    });
+    // Two legitimate deployment rootings. A package stages a private,
+    // relocatable runtime tree and names it via RUNTIME_CLOSURE_ROOT_ENV. A Nix
+    // deployment needs no staging at all: a binary cache reproduces the exact
+    // same absolute store paths on every machine, so the store itself is the
+    // runtime closure and the bound executables already live inside it. Default
+    // to that rooting rather than refusing to qualify a Nix build.
+    let runtime_closure_rooting = if std::env::var_os(RUNTIME_CLOSURE_ROOT_ENV).is_some() {
+        "staged-package"
+    } else {
+        "nix-store"
+    };
+    let runtime_closure_root_raw = std::env::var_os(RUNTIME_CLOSURE_ROOT_ENV)
+        .unwrap_or_else(|| std::ffi::OsString::from("/nix/store"));
     let runtime_closure_root = fs::canonicalize(&runtime_closure_root_raw).unwrap_or_else(|error| {
         panic!(
             "cannot canonicalize {RUNTIME_CLOSURE_ROOT_ENV}={}: {error}",
@@ -8680,6 +8690,10 @@ fn qualify_pinned_reference_toolchain_and_profile_responses() -> Value {
             "os": std::env::consts::OS,
             "arch": std::env::consts::ARCH,
             "family": std::env::consts::FAMILY,
+        },
+        "runtime_closure": {
+            "rooting": runtime_closure_rooting,
+            "root": runtime_closure_root.display().to_string(),
         },
         "integrated_rate_profiles": integrated_rate_results,
         "explicit_composite_profiles": explicit_profile_results,
