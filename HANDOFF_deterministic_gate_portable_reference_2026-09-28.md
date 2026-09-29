@@ -1,10 +1,10 @@
-# TonePoet deterministic gate + portable Reference — source candidate complete
+# TonePoet deterministic gate + portable Reference + album rate-edge corrective — source candidate complete
 
 Date: 2026-09-28 EDT / 2026-09-29 UTC
 Base supplied by brief: `apply/ssrc-wavpack-int24-r6 @ 3a8cb1a`
 Problem 1 commit: `54f9e289f6fa0a51e8a0f60479baa03878435a75` (`bound persistent lease encoding deterministically`)
 
-This file is the authoritative handoff for the source candidate in this bundle. The source work for the governing brief is complete. Release promotion is intentionally **not** complete because the final build-host qualification has not been run and must not be fabricated.
+This file is the authoritative handoff for the corrected source candidate in this bundle. Problems 1 and 2 remain as previously implemented; the follow-up Problem 3 album true-peak rate-edge defect is corrected locally in the executor. Release promotion is intentionally **not** complete because Rust execution and the final build-host qualification have not been run here and must not be fabricated.
 
 ## Problem 1 — deterministic coordination descriptor
 
@@ -94,6 +94,22 @@ The release qualification environment-isolation probe explicitly verifies both `
 
 Historical v16 qualification/evidence remains untouched.
 
+## Problem 3 — album true-peak carrier consumes the pre-observation rate edge
+
+The retained physical terminal candidate is still the proof authority selected before the album true-peak carrier is materialized. For a rate-changing PCM album flow that candidate can correctly retain `target_rate_hz=Some(rate)` because the charged physical route included the pre-observation rate change. The final carrier, however, is already the measured final-rate Float64 waveform, and the final FFmpeg Int32/TPDF terminal is deliberately same-rate and therefore emits no `out_sample_rate`.
+
+The executor now derives a private command-shape realization only for `PcmTruePeakCarrier`:
+
+- the retained candidate and its identity are never mutated;
+- final FFmpeg raw input `-ar` must equal the carrier rate;
+- if the retained realization carries `Some(rate)`, that rate must also equal the carrier rate or execution fails closed;
+- only after both checks does the private execution realization consume that already-completed rate edge by setting `target_rate_hz=None`;
+- the existing command-shape validator is unchanged: `Some(rate)` still requires explicit matching `out_sample_rate`, while `None` still forbids it.
+
+Focused regressions cover the reported 192 kHz Float32 WavPack -> 176.4 kHz Float64 album carrier -> FLAC Int32 + explicit TPDF case, prove there is no post-observation `ResamplePcm` and no FFmpeg `out_sample_rate`, reproduce the old stale-realization refusal, and prove the normalized physical realization is accepted. Additional regressions cover an already-`None` 192 kHz same-rate realization, retained-rate/carrier disagreement, and final raw-input/carrier disagreement.
+
+The correction is confined to `src/convert/pipeline/track_executor.rs`; `plan_bridge.rs`, `tonepoet-pipeline`, Problems 1/2 implementation bytes, and the existing validator invariant are not redesigned or weakened.
+
 ## Qualification evidence state — intentionally unpromoted
 
 The source candidate and active v18 policy changed. The checked-in promoted v18 evidence/report/certification remain on the previous closure on purpose. Do **not** hand-edit their hashes or copy candidate values into promoted evidence.
@@ -121,9 +137,12 @@ export TONEPOET_REFERENCE_WVTAG_PATH="$TONEPOET_REFERENCE_RUNTIME_CLOSURE_ROOT/b
 export TONEPOET_REFERENCE_ATOMIC_PARSLEY_PATH="$TONEPOET_REFERENCE_RUNTIME_CLOSURE_ROOT/bin/AtomicParsley"
 export PATH="$TONEPOET_REFERENCE_RUNTIME_CLOSURE_ROOT/bin:$PATH"
 
-# 3. First run the small source gates requested by the brief.
+# 3. Run the small source gates requested by the brief plus the focused root regression.
 cargo test -p tonepoet-true-peak
 cargo test -p tonepoet-pipeline
+cargo test -p tonepoet --lib \
+  convert::pipeline::track_executor::tests::album_pcm_true_peak_rate_change_consumes_charged_rate_before_final_terminal_shape_check \
+  -- --nocapture
 
 # 4. Run the mandatory real-tool qualification and write fresh promoted artifacts.
 export TONEPOET_REQUIRE_TOOLS=1
@@ -151,7 +170,8 @@ Performed against the final source candidate:
 - manifest relocation test with files, real/empty directories, and a relative symlink: byte-identical manifest/digest across two prefixes, PASS.
 - escaping-symlink manifest build: rejected, PASS.
 - host FFmpeg 7.1.5 smoke accepted `-cpuflags sse+sse2` under `LC_ALL=C SOXR_USE_SIMD=0`: PASS. This is only a control-mechanism smoke test, not qualification evidence for the pinned build.
-- focused target-free corrective source/policy audit: `96/96 PASS`; see `AUDIT_deterministic_gate_portable_reference_2026-09-28.txt`.
+- the prior Problems 1/2 `96/96 PASS` audit is retained as historical evidence in `AUDIT_deterministic_gate_portable_reference_2026-09-28.txt`; this corrective does not rewrite the portable-closure/policy implementation, and its relocation/mutation/escaping-symlink smoke was replayed successfully.
+- focused Problem 3 corrective target-free audit: `29/29 PASS`; see `AUDIT_problem3_album_true_peak_rate_edge_corrective_R1_2026-09-28.txt`.
 - direct target-free Problem-1 descriptor assertions (1 MiB bound, schema 2, schema-1 compatibility, pre-publication size check, and all three regressions): PASS.
 - existing current-tree coordination verifier `tools/verify_concurrency_corrective_round6_r1.py`: PASS (broader coordination authority/admission coverage; it is not the descriptor-specific proof).
 

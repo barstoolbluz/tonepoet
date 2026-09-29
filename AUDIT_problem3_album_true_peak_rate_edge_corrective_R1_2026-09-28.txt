@@ -1,0 +1,32 @@
+PASS 01 normalization is scoped to PCM true-peak carriers
+PASS 02 retained charged realization is cloned rather than mutated
+PASS 03 final FFmpeg raw input rate must equal carrier rate
+PASS 04 charged pre-observation target rate must equal carrier rate
+PASS 05 only the private execution realization consumes the completed rate edge
+PASS 06 qualified terminal prelaunch path derives the physical execution realization
+PASS 07 existing command-shape validator remains authoritative after normalization
+PASS 08 validator target-rate branch remains intact
+PASS 09 unconsumed Some(rate) still requires out_sample_rate
+PASS 10 None still forbids out_sample_rate
+PASS 11 regression models WavPack source provenance
+PASS 12 carrier fixture preserves original 192 kHz source authority
+PASS 13 carrier fixture preserves original Float32 source authority
+PASS 14 regression models 176.4 kHz realized carrier/target
+PASS 15 regression exercises album true-peak authority
+PASS 16 regression targets FLAC
+PASS 17 regression targets Int32
+PASS 18 regression requests explicit TPDF
+PASS 19 regression proves no post-observation typed resampler
+PASS 20 regression proves final FFmpeg aresample omits out_sample_rate
+PASS 21 regression reproduces the old stale-realization refusal
+PASS 22 regression exercises executor normalization on the actual lowered terminal
+PASS 23 regression verifies only execution realization becomes source-rate
+PASS 24 retained proof candidate keeps its charged rate identity
+PASS 25 retained terminal remains FFmpeg
+PASS 26 retained terminal remains TPDF-qualified
+PASS 27 same-rate already-None regression exists
+PASS 28 charged-rate/carrier mismatch regression exists
+PASS 29 raw-input/carrier mismatch regression exists
+
+RESULT 29/29 PASS
+NOTE Rust/Cargo/Nix are unavailable in this environment; these are target-free source invariants, not Rust execution evidence.
