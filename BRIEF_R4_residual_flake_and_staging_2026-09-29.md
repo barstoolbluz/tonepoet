@@ -1,7 +1,7 @@
 # Brief R4 — the album rate-change terminal still fails, plus three open items
 
 Date: 2026-09-29
-Base: `main` @ `7fdf717`
+Base: `main` @ `191fc8b`
 
 The Nix path is done: Reference is requalified, the qualification admits the
 scalar/sse2/avx dispatch set from one host, and a clean gate is 7194 / 0.
@@ -41,21 +41,26 @@ with an unnormalized rate.
 
 Track 3 is the longest track on the album by a wide margin:
 
-| track | duration | approx. f64 carrier |
+| track | duration | f64 carrier |
 |---|---|---|
-| 1 | 286 s | 0.88 GB |
-| 2 | 302 s | 0.93 GB |
-| **3** | **469 s** | **1.44 GB** |
-| 4 | 180 s | 0.55 GB |
-| 5-8 | 228-261 s | 0.70-0.80 GB |
+| 1 | 286.00 s | 0.88 GB |
+| 2 | 302.00 s | 0.93 GB |
+| **3** | **469.00 s** | **1.44 GB** |
+| 4 | 180.00 s | 0.55 GB |
+| 5 | 261.00 s | 0.80 GB |
+| 6 | 251.67 s | 0.77 GB |
+| 7 | 227.47 s | 0.70 GB |
+| 8 | 285.37 s | 0.88 GB |
+
+Durations are from the CUE index points, with track 8 derived from the image
+duration of 2262.5 s. Carrier sizes are 192 kHz x 2 channels x 8 bytes.
 
 Scratch admission for the job logged `estimated_bytes=1.0 GB`. Scratch is
 `/dev/shm/tonepoet` with `scratch_memory_limit_percent = 50` on a 125 GiB host;
 the admission log showed 60.6 GB of budget remaining, so this is not budget
 exhaustion.
 
-In the earlier successful 192 kHz run of the same album, track 3 was also the
-slowest track to encode. It is the largest single unit of work either way.
+It is by a clear margin the largest single unit of work in the album.
 
 R1's regression for this defect passes. Its normalization applies only to a
 `PcmTruePeakCarrier` source.
