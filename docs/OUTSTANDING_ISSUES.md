@@ -3392,3 +3392,70 @@ its tests cover the branches by construction (`tmux_clipboard.rs:254-268`), so t
 parameter list grows by one and the existing cases stay meaningful. Failing that, the
 feature must verify the file it wrote is one the running multiplexer loads and report
 plainly when it is not, rather than claiming a success the user cannot observe.
+
+## 55. Int32 + TPDF + album true-peak fails whenever the target rate differs from the source
+
+Filed 2026-09-28. Boston, *Boston* (Japan Epic 25AP 296), one 2.1 GB WavPack image —
+float32, 192 kHz, stereo — with a sidecar CUE, 8 tracks. Settings: FLAC, Int32, TPDF
+dither, ReplayGain/true-peak in album scope with a 0.1 dB margin.
+
+Targeting 176.4 kHz fails every track with:
+
+```
+backend encode failed: qualified FFmpeg Int32 triangular-dither terminal is
+unavailable (qualified FFmpeg terminal is missing its resolved out_sample_rate)
+```
+
+Targeting 192 kHz succeeds on all 8 tracks and produces correct s32/192 kHz FLAC with
+ReplayGain tags. The only difference is whether the target rate equals the source rate.
+
+### What is established
+
+The refusal is `track_executor.rs:1674`. When the selected terminal realization carries a
+resolved target rate, the emitted `aresample` filter must contain `out_sample_rate` equal
+to both the input rate and the target rate; when the realization carries no rate, the
+filter must not contain the key at all. Both modes are deliberate.
+
+The album true-peak flow stages each track to a Float64 carrier before the terminal,
+which is what makes this the *qualified* Int32 triangular terminal —
+`matches_ffmpeg_int32_triangular_terminal_model` (`semantic_plan.rs:981`) requires
+`input_precision == Pcm(Float64)`. Commissioning for x86_64 is `true` (`:967`).
+
+From the succeeding 192 kHz run's conversion log, the terminal is:
+
+```
+ffmpeg ... -f f64le -ar 192000 -ac 2 -i pipe:0 ...
+  -af aresample=resampler=soxr:precision=33:cutoff=0.950:dither_method=triangular:out_sample_fmt=s32
+```
+
+No `out_sample_rate`, and it passes, because at same rate the realization reports `None`.
+
+Planning alone is self-consistent in both directions. Asking the planner directly for
+WavPack-f32-192k to FLAC-Int32 under album true-peak yields, for a 176.4 kHz target,
+`target_rate_hz=Some(176400)` with a filter that *does* carry `out_sample_rate=176400`;
+for a 192 kHz target, `target_rate_hz=None` with a filter that omits it. Neither trips
+the check.
+
+The filter builder omits the key whenever no rate change is requested of that step
+(`tonepoet-pipeline/src/plugins.rs:1832`). That is not an R6 regression — pre-bundle
+`main` @ `70e5e4f` emits a byte-identical filter.
+
+### Hypothesis — unverified, may be wrong
+
+Something in the album carrier flow, which planning-only inspection does not exercise,
+produces a terminal whose realization reports a resolved rate while its filter reports
+none. A carrier already resampled to the target rate before the terminal step would have
+that shape. The real 176.4 kHz command was never captured, so this is a lead rather than
+a finding.
+
+Which side is wrong is also unsettled: the terminal may need to pin its rate explicitly
+even when same-rate, or the realization may need to report no rate once the carrier is
+already at rate.
+
+### Required
+
+That conversion succeeds. More generally, Int32 with TPDF and album true-peak produces
+correct output at any supported target rate whether or not it differs from the source
+rate, and the qualified terminal's self-consistency check either passes or refuses for a
+true reason. A regression covers the rate-change case specifically; that is the case with
+no coverage today.
