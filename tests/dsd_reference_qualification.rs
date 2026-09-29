@@ -713,6 +713,112 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+fn qualification_runtime_rooting_attestation(
+    portable_runtime_closure: Option<(String, usize)>,
+    common_candidate_execution: &Value,
+    profile_results: &Value,
+) -> Value {
+    let rooting = profile_results["runtime_closure"]["rooting"]
+        .as_str()
+        .expect("pinned toolchain evidence records its runtime rooting");
+    match portable_runtime_closure {
+        Some((digest, entry_count)) => {
+            assert_eq!(
+                rooting, "staged-package",
+                "a runtime-closure manifest may qualify only the staged-package rooting",
+            );
+            assert_eq!(
+                common_candidate_execution["portable_runtime_closure_digest"].as_str(),
+                Some(digest.as_str()),
+                "candidate execution and the qualification preflight must attest the same staged runtime closure",
+            );
+            serde_json::json!({
+                "schema": "tonepoet-reference-runtime-closure/v1",
+                "rooting": "staged-package",
+                "digest": digest,
+                "entry_count": entry_count,
+            })
+        }
+        None => {
+            assert_eq!(
+                rooting, "nix-store",
+                "manifest-free qualification is valid only for the immutable Nix-store rooting",
+            );
+            assert_eq!(
+                profile_results["runtime_closure"]["root"].as_str(),
+                Some("/nix/store"),
+                "Nix qualification must be rooted at the canonical store",
+            );
+            assert!(
+                common_candidate_execution["portable_runtime_closure_digest"].is_null(),
+                "Nix qualification must not silently reuse staged-package manifest identity",
+            );
+
+            // A package manifest binds every staged member byte because arbitrary
+            // package prefixes have no stronger content-addressed authority. Nix
+            // already gives us that authority: immutable store paths name the
+            // exact build outputs, while the existing common/metadata closure
+            // fingerprints bind the executable hashes, versions, behavior probes,
+            // and per-tool installation identities used by Reference. Include the
+            // six actually executed binaries as an independent cross-check, and
+            // domain-separate this identity so Nix evidence can never satisfy a
+            // staged-package qualification (or vice versa).
+            let authority = serde_json::json!({
+                "schema": "tonepoet-reference-nix-runtime-attestation/v1",
+                "root": "/nix/store",
+                "common_runtime_closure_fingerprint_sha256": common_candidate_execution["common_runtime_closure_fingerprint_sha256"].clone(),
+                "metadata_mutation_closure_fingerprint_sha256": common_candidate_execution["metadata_mutation_closure_fingerprint_sha256"].clone(),
+                "executables": {
+                    "sox_ng": {
+                        "runtime_closure_path": profile_results["sox_ng"]["runtime_closure_path"].clone(),
+                        "build_provenance_store_path": profile_results["sox_ng"]["build_provenance_store_path"].clone(),
+                        "executable_sha256": profile_results["sox_ng"]["executable_sha256"].clone(),
+                        "reported_version": profile_results["sox_ng"]["reported_version"].clone(),
+                    },
+                    "ffmpeg": {
+                        "runtime_closure_path": profile_results["ffmpeg"]["runtime_closure_path"].clone(),
+                        "build_provenance_store_path": profile_results["ffmpeg"]["build_provenance_store_path"].clone(),
+                        "executable_sha256": profile_results["ffmpeg"]["executable_sha256"].clone(),
+                        "reported_version": profile_results["ffmpeg"]["reported_version"].clone(),
+                    },
+                    "ffprobe": {
+                        "runtime_closure_path": profile_results["ffmpeg"]["ffprobe"]["runtime_closure_path"].clone(),
+                        "build_provenance_store_path": profile_results["ffmpeg"]["build_provenance_store_path"].clone(),
+                        "executable_sha256": profile_results["ffmpeg"]["ffprobe"]["executable_sha256"].clone(),
+                        "reported_version": profile_results["ffmpeg"]["ffprobe"]["reported_version"].clone(),
+                    },
+                    "metaflac": {
+                        "runtime_closure_path": profile_results["production_metadata_mutators"]["metaflac"]["runtime_closure_path"].clone(),
+                        "build_provenance_store_path": profile_results["production_metadata_mutators"]["metaflac"]["build_provenance_store_path"].clone(),
+                        "executable_sha256": profile_results["production_metadata_mutators"]["metaflac"]["executable_sha256"].clone(),
+                        "reported_version": profile_results["production_metadata_mutators"]["metaflac"]["reported_version"].clone(),
+                    },
+                    "wvtag": {
+                        "runtime_closure_path": profile_results["production_metadata_mutators"]["wvtag"]["runtime_closure_path"].clone(),
+                        "build_provenance_store_path": profile_results["production_metadata_mutators"]["wvtag"]["build_provenance_store_path"].clone(),
+                        "executable_sha256": profile_results["production_metadata_mutators"]["wvtag"]["executable_sha256"].clone(),
+                        "reported_version": profile_results["production_metadata_mutators"]["wvtag"]["reported_version"].clone(),
+                    },
+                    "AtomicParsley": {
+                        "runtime_closure_path": profile_results["production_metadata_mutators"]["AtomicParsley"]["runtime_closure_path"].clone(),
+                        "build_provenance_store_path": profile_results["production_metadata_mutators"]["AtomicParsley"]["build_provenance_store_path"].clone(),
+                        "executable_sha256": profile_results["production_metadata_mutators"]["AtomicParsley"]["executable_sha256"].clone(),
+                        "reported_version": profile_results["production_metadata_mutators"]["AtomicParsley"]["reported_version"].clone(),
+                    },
+                },
+            });
+            let encoded = serde_json::to_vec(&authority)
+                .expect("Nix runtime attestation evidence is serializable");
+            serde_json::json!({
+                "schema": "tonepoet-reference-nix-runtime-attestation/v1",
+                "rooting": "nix-store",
+                "digest": sha256_hex(&encoded),
+                "authority": authority,
+            })
+        }
+    }
+}
+
 fn sha256_file_digest(path: &Path) -> Sha256Digest {
     let mut file = File::open(path)
         .unwrap_or_else(|error| panic!("cannot open {} for SHA-256: {error}", path.display()));
@@ -4334,8 +4440,17 @@ fn run_planned_command(
         command.environment_policy,
         tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet
     );
-    assert_eq!(command.environment.len(), 1);
+    // R1 bound libsoxr's dispatch alongside the locale, so a Reference audio
+    // command now carries exactly these two and nothing else.
+    assert_eq!(command.environment.len(), 2);
     assert_eq!(command.environment.get("LC_ALL").map(String::as_str), Some("C"));
+    assert_eq!(
+        command
+            .environment
+            .get(tonepoet_pipeline::REFERENCE_SOXR_USE_SIMD_ENV)
+            .map(String::as_str),
+        Some(tonepoet_pipeline::REFERENCE_SOXR_USE_SIMD),
+    );
     let tool = match &command.tool {
         ToolIdentifier::Sox => sox,
         ToolIdentifier::Ffmpeg => ffmpeg,
@@ -9443,8 +9558,31 @@ fn qualify_internal_reference_dispatch_tiers() -> Value {
             }
         }
 
-        let mut meter = tonepoet_true_peak::loudness::LoudnessMeter::new(sample_rate, channels)
-            .expect("construct Reference loudness qualification meter");
+        // `LoudnessMeter::new` only resolves unambiguous mono/stereo layouts.
+        // The AVX tier is deliberately qualified on 4 channels, so name the
+        // roles explicitly. Every role carries a non-zero BS.1770 weight, so
+        // all four lanes do real arithmetic; an Lfe/Unused channel would be
+        // weighted 0.0 and would not exercise the kernel.
+        let roles: Vec<tonepoet_true_peak::loudness::ChannelRole> = match channels {
+            1 => vec![tonepoet_true_peak::loudness::ChannelRole::Mono],
+            2 => vec![
+                tonepoet_true_peak::loudness::ChannelRole::Left,
+                tonepoet_true_peak::loudness::ChannelRole::Right,
+            ],
+            4 => vec![
+                tonepoet_true_peak::loudness::ChannelRole::Left,
+                tonepoet_true_peak::loudness::ChannelRole::Right,
+                tonepoet_true_peak::loudness::ChannelRole::LeftSurround,
+                tonepoet_true_peak::loudness::ChannelRole::RightSurround,
+            ],
+            other => panic!("no qualified loudness channel layout for {other} channels"),
+        };
+        let mut meter = tonepoet_true_peak::loudness::LoudnessMeter::with_roles(
+            sample_rate,
+            &roles,
+            tonepoet_true_peak::loudness::LoudnessProfile::NativeEbu2023,
+        )
+        .expect("construct Reference loudness qualification meter");
         meter
             .force_simd_backend_for_qualification(backend)
             .unwrap_or_else(|error| {
@@ -9579,10 +9717,13 @@ fn complete_p0_reference_qualification_report() {
         return;
     }
 
-    let (portable_runtime_closure_sha256, portable_runtime_closure_entry_count) =
+    // Staged packages must still present the paired, fully attested closure
+    // manifest. `None` is intentionally reserved for the immutable Nix-store
+    // rooting, whose exact execution bytes are bound after the real tool probes
+    // below. A half-configured package environment still fails here.
+    let portable_runtime_closure =
         tonepoet::convert::pipeline::qualify_reference_portable_runtime_closure_identity()
-            .expect("portable Reference runtime closure attests")
-            .expect("final portable Reference qualification requires the staged runtime-closure manifest");
+            .expect("Reference runtime closure rooting attests");
     let internal_dispatch_tiers = qualify_internal_reference_dispatch_tiers();
 
     let candidate_bytes = include_bytes!(concat!(
@@ -9632,6 +9773,11 @@ fn complete_p0_reference_qualification_report() {
     let dst_counts = qualify_dst_oracle_fixture_authority();
     let source_front_end_results = qualify_production_source_front_end_integration();
     let profile_results = qualify_pinned_reference_toolchain_and_profile_responses();
+    let runtime_rooting_attestation = qualification_runtime_rooting_attestation(
+        portable_runtime_closure,
+        &common_candidate_execution,
+        &profile_results,
+    );
 
     let active_policy_bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -9759,11 +9905,7 @@ fn complete_p0_reference_qualification_report() {
     let real_tool_candidate_evidence = serde_json::json!({
         "status": "passed",
         "common_candidate_execution": common_candidate_execution,
-        "portable_runtime_closure": {
-            "schema": "tonepoet-reference-runtime-closure/v1",
-            "digest": portable_runtime_closure_sha256,
-            "entry_count": portable_runtime_closure_entry_count,
-        },
+        "runtime_rooting_attestation": runtime_rooting_attestation,
         "internal_dispatch_tiers": internal_dispatch_tiers,
         "historical_dc_root_cause": historical_dc_root_cause,
         "default_general_processing_smoke": default_settings_live_smoke,
