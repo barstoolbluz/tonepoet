@@ -4440,8 +4440,17 @@ fn run_planned_command(
         command.environment_policy,
         tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet
     );
-    assert_eq!(command.environment.len(), 1);
+    // R1 bound libsoxr's dispatch alongside the locale, so a Reference audio
+    // command now carries exactly these two and nothing else.
+    assert_eq!(command.environment.len(), 2);
     assert_eq!(command.environment.get("LC_ALL").map(String::as_str), Some("C"));
+    assert_eq!(
+        command
+            .environment
+            .get(tonepoet_pipeline::REFERENCE_SOXR_USE_SIMD_ENV)
+            .map(String::as_str),
+        Some(tonepoet_pipeline::REFERENCE_SOXR_USE_SIMD),
+    );
     let tool = match &command.tool {
         ToolIdentifier::Sox => sox,
         ToolIdentifier::Ffmpeg => ffmpeg,
@@ -9549,8 +9558,31 @@ fn qualify_internal_reference_dispatch_tiers() -> Value {
             }
         }
 
-        let mut meter = tonepoet_true_peak::loudness::LoudnessMeter::new(sample_rate, channels)
-            .expect("construct Reference loudness qualification meter");
+        // `LoudnessMeter::new` only resolves unambiguous mono/stereo layouts.
+        // The AVX tier is deliberately qualified on 4 channels, so name the
+        // roles explicitly. Every role carries a non-zero BS.1770 weight, so
+        // all four lanes do real arithmetic; an Lfe/Unused channel would be
+        // weighted 0.0 and would not exercise the kernel.
+        let roles: Vec<tonepoet_true_peak::loudness::ChannelRole> = match channels {
+            1 => vec![tonepoet_true_peak::loudness::ChannelRole::Mono],
+            2 => vec![
+                tonepoet_true_peak::loudness::ChannelRole::Left,
+                tonepoet_true_peak::loudness::ChannelRole::Right,
+            ],
+            4 => vec![
+                tonepoet_true_peak::loudness::ChannelRole::Left,
+                tonepoet_true_peak::loudness::ChannelRole::Right,
+                tonepoet_true_peak::loudness::ChannelRole::LeftSurround,
+                tonepoet_true_peak::loudness::ChannelRole::RightSurround,
+            ],
+            other => panic!("no qualified loudness channel layout for {other} channels"),
+        };
+        let mut meter = tonepoet_true_peak::loudness::LoudnessMeter::with_roles(
+            sample_rate,
+            &roles,
+            tonepoet_true_peak::loudness::LoudnessProfile::NativeEbu2023,
+        )
+        .expect("construct Reference loudness qualification meter");
         meter
             .force_simd_backend_for_qualification(backend)
             .unwrap_or_else(|error| {
