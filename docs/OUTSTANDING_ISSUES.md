@@ -3459,3 +3459,49 @@ correct output at any supported target rate whether or not it differs from the s
 rate, and the qualified terminal's self-consistency check either passes or refuses for a
 true reason. A regression covers the rate-change case specifically; that is the case with
 no coverage today.
+
+## 56. MusicBrainz tagging refuses a single-image APE + sidecar CUE album because the editor opened one row instead of fourteen
+
+Filed 2026-09-29. `~/torrents/Pret-A-Porter_OST` — *Prêt-à-Porter* soundtrack, one
+455 MB Monkey's Audio image (`Various - Pret-А-Porter.ape`) with a sidecar
+`Various - Pret-А-Porter.cue` carrying 14 `TRACK ... AUDIO` entries. The CUE is
+ISO-8859 with CRLF terminators and its `FILE` line names the `.ape`. The folder
+also holds a `.log` and several cover images.
+
+The MusicBrainz lookup succeeds and the release picker works. On choosing a
+release, populating the metadata-editing overlay fails in the status bar with:
+
+```
+:tags-mb: refusing incomplete release data: MusicBrainz track projection parsed
+14 tracks but the editor expects 1
+```
+
+MusicBrainz parsed the release correctly — 14 tracks, matching the CUE. The
+refusal is the dimensional-agreement guard at `src/tui/musicbrainz.rs:1187`
+(and the equivalent at `:1195`), which requires the projected track count to
+equal the editor's row count before any mutation is allowed. The guard is doing
+what it says; the disagreement is upstream of it.
+
+The user reports MusicBrainz tagging has worked on other albums up to this one.
+
+### Hypothesis — unverified
+
+`n_tracks` is 1, which is what the editor would report if it opened on the APE
+image as a single whole-file row rather than on the 14 CUE-derived track rows.
+APE is decode-only and not tag-writable (`AudioFormat::input_decodable` vs
+`output_encodable`, `formats.rs:133`), so an untaggable single-image album may
+not be getting the sidecar-CUE album surface that an equivalent FLAC image
+receives. Whether the APE-ness is the discriminator, or something else about
+this folder is, was not established — the editor's row construction for this
+album was never inspected. Treat as a lead.
+
+### Required
+
+A single-image album whose sidecar CUE defines N tracks presents N editable
+track rows in the metadata editor, and a MusicBrainz release with N tracks
+applies to it, whether or not the image format is tag-writable. Where the
+carrier genuinely cannot hold the result, the refusal names that — not a track
+count the user has no way to act on.
+
+The count-agreement guard itself stays. It caught a real inconsistency; it
+should not be relaxed to let a 14-vs-1 mismatch through.
