@@ -3395,6 +3395,50 @@ plainly when it is not, rather than claiming a success the user cannot observe.
 
 ## 55. Int32 + TPDF + album true-peak fails whenever the target rate differs from the source
 
+**Status 2026-09-29:** still open. The R1 corrective's Problem 3 work addressed this
+defect and its regression passes, but the correction is incomplete — the original failure
+reproduces on `main` @ `7fdf717` with every corrective applied.
+
+Re-running the same conversion, exactly one track now fails:
+
+```
+track 3: backend encode failed: qualified FFmpeg Int32 triangular-dither terminal is
+unavailable (qualified FFmpeg terminal is missing its resolved out_sample_rate)
+```
+
+The other seven report `PCM true-peak scan cancelled`. That is collateral: track 3's
+failure cancelled the album while their scans were in flight, and track 4 had measured
+successfully one second earlier. The real error appears only in
+`~/.cache/tonepoet/tonepoet.log`; from the TUI the run looks like a true-peak scanning
+problem, which it is not. That masking is worth fixing on its own.
+
+What the re-run established. The album has no shared decoded intermediate: each track is
+cut straight out of the WavPack image by its own ffmpeg `atrim` invocation into its own
+segment WAV, then into its own Float64 carrier. Eight structurally identical pipelines
+differing only in segment boundaries, and exactly one reaches the terminal with an
+unnormalized rate.
+
+Track 3 is the longest track by a wide margin — 469 s against 180-302 s for the rest,
+giving a ~1.44 GB Float64 carrier versus ~0.93 GB for track 2. It was also the slowest
+track to encode in the earlier successful 192 kHz run. Scratch admission logged
+`estimated_bytes=1.0 GB` with 60.6 GB of budget remaining, so this is not budget
+exhaustion.
+
+**Hypothesis, unverified:** something duration- or size-dependent puts the longest track
+on a path where R1's normalization — which applies only to a `PcmTruePeakCarrier` source
+— does not take effect. Nothing was instrumented to confirm it, no other per-track
+difference has been ruled out, and the tracks run concurrently so ordering effects are
+not excluded.
+
+Also established: this configuration cannot be produced from the CLI. No command-line
+flag sets the PCM true-peak policy and no preset covers it, so only the TUI reaches it.
+That is why it was field-reported rather than caught by a test, and it is why the
+regression that does exist did not protect against this.
+
+Carried to the R4 brief.
+
+---
+
 Filed 2026-09-28. Boston, *Boston* (Japan Epic 25AP 296), one 2.1 GB WavPack image —
 float32, 192 kHz, stereo — with a sidecar CUE, 8 tracks. Settings: FLAC, Int32, TPDF
 dither, ReplayGain/true-peak in album scope with a 0.1 dB margin.
