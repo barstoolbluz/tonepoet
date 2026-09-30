@@ -3395,8 +3395,17 @@ plainly when it is not, rather than claiming a success the user cannot observe.
 
 ## 55. Int32 + TPDF + album true-peak fails whenever the target rate differs from the source
 
-**Status 2026-09-29:** still open. The R1 corrective's Problem 3 work addressed this
-defect and its regression passes, but the correction is incomplete — the original failure
+> **RESOLVED 2026-09-30.** Field-verified: the Boston album converts at 176.4 kHz from the
+> 192 kHz Float32 WavPack image. The R1 correction consumed the realized carrier rate edge
+> but left the consistency check behind the consumed-edge flag, so a charged rate that
+> disagreed with the certified carrier was accepted rather than refused. The R5 corrective
+> moved that check ahead of the flag: validation is unconditional once both a charged rate
+> and a certified carrier exist, while consumption stays conditional. A static invariant now
+> asserts the ordering. The collateral-cancellation masking described below was corrected in
+> the same chain — one track's failure no longer reports as eight. Gate 7204/0.
+
+**Status 2026-09-29 (superseded):** still open. The R1 corrective's Problem 3 work addressed
+this defect and its regression passes, but the correction is incomplete — the original failure
 reproduces on `main` @ `7fdf717` with every corrective applied.
 
 Re-running the same conversion, exactly one track now fails:

@@ -1648,6 +1648,7 @@ pub async fn execute_planned_track_conversion(
         track,
         realized_input,
         None,
+        None,
         staged_output,
         convert_root,
         runner,
@@ -2185,27 +2186,102 @@ fn qualified_ffmpeg_int32_dither_error(detail: impl AsRef<str>) -> TrackExecutio
     )
 }
 
-/// Derive the physical realization seen by the final qualified FFmpeg terminal.
+/// Runtime-only proof carried from certified observation preparation through
+/// final terminal binding.  This is deliberately not serialized: it records a
+/// fact about this execution, not a new planner or manifest identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CertifiedTruePeakTerminalExecutionState {
+    /// Rate of the exact certified carrier lineage measured before the one
+    /// bound gain step.
+    pub measured_carrier_rate_hz: u32,
+    /// True only when the certified pre-observation path already executed the
+    /// source->target PCM rate edge charged by the retained terminal candidate.
+    pub pre_observation_rate_edge_consumed: bool,
+}
+
+/// Derive the private physical realization seen by the final qualified FFmpeg
+/// terminal without mutating the retained charged proof identity.
 ///
-/// A PCM true-peak carrier is already the final-rate waveform: any rate edge
-/// recorded on the retained pre-observation terminal candidate was consumed
-/// before the carrier was measured. Keep that charged candidate unchanged for
-/// proof identity, but validate that the carrier and final raw FFmpeg ingress
-/// agree with the charged rate before removing only that consumed rate edge
-/// from the private command-shape realization.
+/// A charged target-rate edge may be removed from this private execution view
+/// only when the upstream execution state explicitly says the certified
+/// pre-observation path consumed it.  The final typed plan and raw FFmpeg
+/// ingress must independently agree with that measured rate.  This keeps the
+/// decision semantic even if a later execution step changes the concrete
+/// `TrackSourceRef` representation.
 fn qualified_ffmpeg_int32_execution_realization(
-    track: &PreparedTrack,
+    execution_state: Option<&CertifiedTruePeakTerminalExecutionState>,
+    plan_request: &PlanRequest,
     terminal: &PlannedCommand,
     charged_realization: &tonepoet_pipeline::SelectedPcmTerminalRealization,
 ) -> Result<tonepoet_pipeline::SelectedPcmTerminalRealization, String> {
     let mut execution_realization = charged_realization.clone();
-    let TrackSourceRef::PcmTruePeakCarrier {
-        sample_rate_hz: carrier_rate_hz,
-        ..
-    } = &track.source_ref
-    else {
+    let Some(charged_rate_hz) = charged_realization.target_rate_hz else {
         return Ok(execution_realization);
     };
+    let Some(execution_state) = execution_state else {
+        return Ok(execution_realization);
+    };
+    let carrier_rate_hz = execution_state.measured_carrier_rate_hz;
+    if carrier_rate_hz == 0 {
+        return Err("qualified FFmpeg terminal certified carrier rate is zero".to_string());
+    }
+    // A certified carrier and a charged target describe the same physical rate
+    // edge whether or not that edge is eligible to be consumed here.  Refuse
+    // disagreement first; the consumed flag authorizes only the private
+    // removal of an edge that is already known to agree with the carrier.
+    if charged_rate_hz != carrier_rate_hz {
+        return Err(format!(
+            "charged FFmpeg terminal target rate {charged_rate_hz} does not match realized true-peak carrier rate {carrier_rate_hz}"
+        ));
+    }
+    if !execution_state.pre_observation_rate_edge_consumed {
+        return Ok(execution_realization);
+    }
+    if plan_request.source.sample_rate_hz != Some(carrier_rate_hz) {
+        return Err(format!(
+            "qualified FFmpeg terminal final planner source rate does not match the measured carrier rate {carrier_rate_hz} Hz"
+        ));
+    }
+    if plan_request.settings.target_sample_rate
+        != tonepoet_pipeline::RateTarget::PcmHz(carrier_rate_hz)
+    {
+        return Err(format!(
+            "qualified FFmpeg terminal final planner target does not preserve the measured carrier rate {carrier_rate_hz} Hz"
+        ));
+    }
+
+    let typed = match tonepoet_pipeline::plan_typed(plan_request).map_err(|error| {
+        format!(
+            "qualified FFmpeg terminal could not rebuild the final typed carrier plan: {error}"
+        )
+    })? {
+        tonepoet_pipeline::PlanningOutcome::Ready(plan) => plan,
+        tonepoet_pipeline::PlanningOutcome::Refused(refusal) => {
+            return Err(format!(
+                "qualified FFmpeg terminal final typed carrier plan was refused ({}): {}",
+                refusal.code, refusal.reason,
+            ));
+        }
+        tonepoet_pipeline::PlanningOutcome::NeedFacts(needs) => {
+            return Err(format!(
+                "qualified FFmpeg terminal final typed carrier plan still needs facts: {needs:?}"
+            ));
+        }
+    };
+    if typed.nodes.iter().any(|node| {
+        matches!(
+            node,
+            tonepoet_pipeline::TypedPlanNode::Operation {
+                operation: tonepoet_pipeline::PlanOperation::ResamplePcm { .. },
+                ..
+            }
+        )
+    }) {
+        return Err(
+            "qualified FFmpeg terminal final typed carrier plan still contains a PCM rate edge after certified true-peak observation"
+                .to_string(),
+        );
+    }
 
     let final_input_rate_hz = unique_planned_arg_value(&terminal.args, "-ar")?
         .parse::<u32>()
@@ -2215,30 +2291,25 @@ fn qualified_ffmpeg_int32_execution_realization(
     if final_input_rate_hz == 0 {
         return Err("qualified FFmpeg terminal input rate is zero".to_string());
     }
-    if final_input_rate_hz != *carrier_rate_hz {
+    if final_input_rate_hz != carrier_rate_hz {
         return Err(format!(
             "qualified FFmpeg terminal raw input rate {final_input_rate_hz} does not match realized true-peak carrier rate {carrier_rate_hz}"
         ));
     }
 
-    if let Some(charged_rate_hz) = charged_realization.target_rate_hz {
-        if charged_rate_hz != *carrier_rate_hz {
-            return Err(format!(
-                "charged FFmpeg terminal target rate {charged_rate_hz} does not match realized true-peak carrier rate {carrier_rate_hz}"
-            ));
-        }
-        execution_realization.target_rate_hz = None;
-    }
-
+    // The charged candidate remains immutable for qualification/proof identity.
+    // Only this private execution realization acknowledges that the certified
+    // pre-observation path already consumed the rate edge.
+    execution_realization.target_rate_hz = None;
     Ok(execution_realization)
 }
 
-async fn qualified_ffmpeg_int32_dither_terminal_executable(
+fn qualified_ffmpeg_int32_dither_terminal_binding(
     track: &PreparedTrack,
+    execution_state: Option<&CertifiedTruePeakTerminalExecutionState>,
+    plan_request: &PlanRequest,
     plan: &ConversionPlan,
-    runner: &dyn ToolRunner,
-    cancel: &CancellationToken,
-) -> Result<Option<QualifiedTerminalExecutableBinding>, TrackExecutionError> {
+) -> Result<Option<(usize, tonepoet_pipeline::SelectedPcmTerminalRealization)>, TrackExecutionError> {
     let Some(selected) = certified_terminal_candidate_binding(track)
         .map_err(|error| TrackExecutionError::new(error, Vec::new()))?
     else {
@@ -2331,11 +2402,37 @@ async fn qualified_ffmpeg_int32_dither_terminal_executable(
         }
         (final_artifact_index, final_artifact_command)
     };
-    let execution_realization =
-        qualified_ffmpeg_int32_execution_realization(track, terminal, realization)
-            .map_err(qualified_ffmpeg_int32_dither_error)?;
+    let execution_realization = qualified_ffmpeg_int32_execution_realization(
+        execution_state,
+        plan_request,
+        terminal,
+        realization,
+    )
+    .map_err(qualified_ffmpeg_int32_dither_error)?;
     validate_qualified_ffmpeg_int32_terminal_command_shape(terminal, &execution_realization)
         .map_err(qualified_ffmpeg_int32_dither_error)?;
+
+    Ok(Some((command_index, execution_realization)))
+}
+
+async fn qualified_ffmpeg_int32_dither_terminal_executable(
+    track: &PreparedTrack,
+    execution_state: Option<&CertifiedTruePeakTerminalExecutionState>,
+    plan_request: &PlanRequest,
+    plan: &ConversionPlan,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+) -> Result<Option<QualifiedTerminalExecutableBinding>, TrackExecutionError> {
+    let Some((command_index, _execution_realization)) =
+        qualified_ffmpeg_int32_dither_terminal_binding(
+            track,
+            execution_state,
+            plan_request,
+            plan,
+        )?
+    else {
+        return Ok(None);
+    };
 
     let (locked_revision, locked_nar_hash) = embedded_flake_lock_input("nixpkgs")
         .map_err(|error| qualified_ffmpeg_int32_dither_error(error.to_string()))?;
@@ -2418,6 +2515,7 @@ pub(crate) async fn execute_planned_track_conversion_with_scalar_pump(
     track: &PreparedTrack,
     realized_input: &Path,
     scalar_pump: Option<RetainedPcmScalarPump>,
+    certified_true_peak_execution: Option<CertifiedTruePeakTerminalExecutionState>,
     staged_output: &Path,
     convert_root: &Path,
     runner: &dyn ToolRunner,
@@ -2647,6 +2745,8 @@ pub(crate) async fn execute_planned_track_conversion_with_scalar_pump(
             .map_err(|error| TrackExecutionError::new(error, Vec::new()))?;
         let qualified_terminal_executable = qualified_ffmpeg_int32_dither_terminal_executable(
             track,
+            certified_true_peak_execution.as_ref(),
+            &plan_request,
             &plan,
             runner,
             cancel,
@@ -12309,6 +12409,48 @@ mod tests {
         track
     }
 
+    fn pcm_true_peak_terminal_plan_request(
+        root: &Path,
+        track: &PreparedTrack,
+        carrier_rate_hz: u32,
+        target_format: AudioFormat,
+    ) -> PlanRequest {
+        let carrier = match &track.source_ref {
+            TrackSourceRef::PcmTruePeakCarrier { path, .. } => path.clone(),
+            other => panic!("expected PCM true-peak carrier, got {other:?}"),
+        };
+        let mut request = metadata_test_request(root);
+        request.container = root.join("source.wv");
+        request.settings.target_format = target_format.clone();
+        request.settings.target_sample_rate = tonepoet_pipeline::RateTarget::PcmHz(carrier_rate_hz);
+        request.settings.target_bit_depth =
+            tonepoet_pipeline::BitDepthTarget::Pcm(tonepoet_pipeline::PcmBitDepth::Int32);
+        request.settings.dither_type = tonepoet_pipeline::DitherType::Tpdf;
+        request.settings.dither_explicit = true;
+        request.settings.preferred_tool = tonepoet_pipeline::PreferredTool::Ffmpeg;
+        request.settings.metadata.transfer_tags = false;
+        request.settings.metadata.preserve_artwork = false;
+        request.settings.metadata.store_source_audio_md5 = false;
+        request.settings.pcm_true_peak.policy =
+            tonepoet_pipeline::SampleGainPolicy::TruePeakNormalize {
+                target_dbtp: "-1.000000000".parse().expect("target"),
+                scope: tonepoet_pipeline::TruePeakScope::Track,
+                scan: tonepoet_pipeline::TruePeakScanTier::Standard,
+            };
+        let output = root.join(match target_format {
+            AudioFormat::Flac => "out.flac",
+            _ => "out.wav",
+        });
+        plan_request_for_track(
+            &request,
+            track,
+            &carrier,
+            &output,
+            root.join("plan-work"),
+        )
+        .expect("true-peak terminal plan request")
+    }
+
     #[test]
     fn qualified_ffmpeg_int32_scalar_pump_rewrite_changes_only_input_transport() {
         let command = qualified_ffmpeg_int32_command(
@@ -12347,6 +12489,311 @@ mod tests {
         );
         validate_qualified_ffmpeg_int32_terminal_command_shape(&command, &realization)
             .expect("canonical same-rate raw-f64le terminal must be covered");
+    }
+
+    struct AlbumTruePeakCarrierWritingRunner {
+        inner: StubToolRunner,
+    }
+
+    impl AlbumTruePeakCarrierWritingRunner {
+        fn new() -> Self {
+            Self {
+                inner: StubToolRunner::new(),
+            }
+        }
+
+        fn push_probe(&self) {
+            self.inner.push_output(ToolOutput {
+                exit: ProcessExit::Code(0),
+                stdout_tail: r#"{
+  "streams": [{
+    "codec_name": "wavpack",
+    "sample_fmt": "flt",
+    "sample_rate": "192000",
+    "channels": 2,
+    "duration_ts": 192000,
+    "time_base": "1/192000",
+    "bits_per_raw_sample": "32"
+  }],
+  "format": {}
+}"#
+                .to_string(),
+                stderr_tail: String::new(),
+                elapsed: Duration::ZERO,
+                command: CommandRecord {
+                    environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
+                    environment: BTreeMap::new(),
+                    description: None,
+                    binary: ToolBinary::Ffprobe,
+                    sanitized_args: Vec::new(),
+                    cwd: None,
+                    env_keys: Vec::new(),
+                    exit: Some(ProcessExit::Code(0)),
+                    stdout_tail: String::new(),
+                    stderr_tail: String::new(),
+                    elapsed: Duration::ZERO,
+                },
+            });
+        }
+
+        fn materialize_carrier(cmd: &ToolCommand) {
+            if cmd.binary != ToolBinary::Ffmpeg {
+                return;
+            }
+            let Some(output) = cmd.args.last() else {
+                return;
+            };
+            let output = Path::new(output);
+            if output.extension().and_then(|value| value.to_str()) != Some("f64le") {
+                return;
+            }
+            if let Some(parent) = output.parent() {
+                std::fs::create_dir_all(parent).expect("create carrier output parent");
+            }
+            // A small, whole-frame silence carrier is sufficient: the regression
+            // exercises preparation/binding/execution semantics, not scanner
+            // throughput. The field-reported 1.44 GB carrier remains a build-host
+            // acceptance replay rather than a unit-test fixture.
+            std::fs::write(output, vec![0_u8; 16 * 4096])
+                .expect("materialize deterministic Float64 stereo carrier");
+        }
+    }
+
+    #[async_trait]
+    impl ToolRunner for AlbumTruePeakCarrierWritingRunner {
+        async fn run(
+            &self,
+            cmd: ToolCommand,
+            cancel: &CancellationToken,
+        ) -> Result<ToolOutput, ToolRunnerError> {
+            let result = self.inner.run(cmd.clone(), cancel).await;
+            if result.is_ok() {
+                Self::materialize_carrier(&cmd);
+            }
+            result
+        }
+
+        async fn run_bound(
+            &self,
+            cmd: ToolCommand,
+            _executable: &BoundToolExecutable,
+            cancel: &CancellationToken,
+        ) -> Result<ToolOutput, ToolRunnerError> {
+            self.run(cmd, cancel).await
+        }
+    }
+
+    #[tokio::test]
+    async fn album_pcm_true_peak_rate_change_real_preparation_gain_and_terminal_path() {
+        let temp = TempDir::new().expect("temp dir");
+        let source = temp.path().join("boston-image.wv");
+        std::fs::write(&source, b"probe/convert are supplied by the test runner")
+            .expect("source fixture");
+        let final_output = temp.path().join("out/03.flac");
+        let mut original_track = metadata_test_track(TrackSourceRef::StagedFile(source.clone()));
+        original_track.id = TrackId {
+            source_ordinal: 3,
+            disc_number: Some(1),
+            track_number: 3,
+        };
+        original_track.expected_samples = Some(192_000);
+        original_track.sample_rate = Some(192_000);
+        original_track.bit_depth = Some(320);
+        original_track.source_audio = SourceAudioDescriptor::from_scalar(
+            Some(192_000),
+            Some(320),
+            Some(SourceAudioCoding::Pcm),
+        );
+
+        let mut request = metadata_test_request(temp.path());
+        request.job_id = "r4-boston-rate-change".to_string();
+        request.item_id = "r4-boston-rate-change".to_string();
+        request.container = source.clone();
+        request.submission_id = Some("r4-boston-album".to_string());
+        request.submission_size = Some(1);
+        request.settings.target_format = AudioFormat::Flac;
+        request.settings.target_sample_rate = tonepoet_pipeline::RateTarget::PcmHz(176_400);
+        request.settings.target_bit_depth =
+            tonepoet_pipeline::BitDepthTarget::Pcm(tonepoet_pipeline::PcmBitDepth::Int32);
+        request.settings.dither_type = tonepoet_pipeline::DitherType::Tpdf;
+        request.settings.dither_explicit = true;
+        request.settings.preferred_tool = tonepoet_pipeline::PreferredTool::Ffmpeg;
+        request.settings.metadata.transfer_tags = false;
+        request.settings.metadata.preserve_artwork = false;
+        request.settings.metadata.store_source_audio_md5 = false;
+        request.settings.pcm_true_peak.policy =
+            tonepoet_pipeline::SampleGainPolicy::TruePeakNormalize {
+                target_dbtp: "-0.100000000".parse().expect("target"),
+                scope: tonepoet_pipeline::TruePeakScope::Album,
+                scan: tonepoet_pipeline::TruePeakScanTier::Standard,
+            };
+
+        let staging = crate::convert::pipeline::StagingDir::new(
+            temp.path().join("staging"),
+            request.job_id.clone(),
+        );
+        let carrier_dir = temp.path().join("pcm-true-peak");
+        std::fs::create_dir_all(&carrier_dir).expect("carrier directory");
+        let runner = AlbumTruePeakCarrierWritingRunner::new();
+        runner.push_probe();
+        let cancel = CancellationToken::new();
+        let tool_paths = HashMap::new();
+        let preparation = crate::convert::pipeline::stages::prepare_pcm_true_peak_carrier_for_regression(
+            &request,
+            original_track.clone(),
+            &final_output,
+            &staging,
+            &carrier_dir,
+            &runner,
+            &cancel,
+            &tool_paths,
+        );
+        let (carrier_source_ref, prepared_measurement) =
+            with_injected_track_execution_runner_for_test(preparation)
+                .await
+                .expect("real PCM true-peak preparation path reaches a measured carrier");
+
+        let mut prepared_track = original_track;
+        prepared_track.source_ref = carrier_source_ref;
+        let TrackSourceRef::PcmTruePeakCarrier {
+            path: measured_carrier,
+            sample_rate_hz,
+            gain_db,
+            terminal_candidate: Some(charged_candidate),
+            ..
+        } = &prepared_track.source_ref
+        else {
+            panic!("real preparation must publish a PCM true-peak carrier");
+        };
+        assert_eq!(*sample_rate_hz, 176_400);
+        assert_eq!(*gain_db, None, "Album scope binds gain only at the barrier");
+        assert_eq!(charged_candidate.tool, ToolIdentifier::Ffmpeg);
+        let Some(tonepoet_pipeline::SelectedTerminalRealization::Pcm(charged_realization)) =
+            charged_candidate.terminal_realization.as_ref()
+        else {
+            panic!("real preparation must retain the charged PCM terminal realization");
+        };
+        assert_eq!(charged_realization.target_rate_hz, Some(176_400));
+        assert_eq!(charged_realization.target_bit_depth, tonepoet_pipeline::PcmBitDepth::Int32);
+        assert_eq!(charged_realization.effective_dither, Some(tonepoet_pipeline::DitherType::Tpdf));
+        // Own the measured path across the move into PreparedSource. This keeps
+        // the regression honest without retaining a reference into the moved
+        // pre-barrier track value.
+        let measured_carrier = measured_carrier.clone();
+
+        let source_value = crate::convert::pipeline::PreparedSource {
+            container: source.clone(),
+            kind: crate::convert::pipeline::SourceKind::SingleFile,
+            tracks: vec![prepared_track],
+            album_metadata: crate::convert::pipeline::AlbumMetadata::default(),
+            provenance: crate::convert::pipeline::ExtractionProvenance {
+                source_kind: crate::convert::pipeline::SourceKind::SingleFile,
+                source_sha256: None,
+                tool_versions: BTreeMap::new(),
+                extracted_at: chrono::Utc::now(),
+            },
+        };
+        let album_plan = crate::convert::pipeline::AlbumPlan {
+            album_dir: temp.path().join("out"),
+            album_dirs: Vec::new(),
+            entries: vec![crate::convert::pipeline::PlannedTrackOutput {
+                track_id: source_value.tracks[0].id.clone(),
+                final_path: final_output.clone(),
+            }],
+        };
+        let mut album = crate::convert::pipeline::stages::scheduled_album_for_test(
+            request,
+            "r4-boston-rate-change".to_string(),
+            staging,
+            source_value,
+            album_plan,
+            Vec::new(),
+            temp.path(),
+        );
+        album.pcm_true_peak_measurements.push(prepared_measurement);
+        crate::convert::processor::resolve_pcm_true_peak_submission_albums(
+            std::slice::from_mut(&mut album),
+        )
+        .expect("real Album barrier binds one common true-peak gain");
+
+        let bound_track = &album.source.tracks[0];
+        let execution_state = crate::convert::pipeline::stages::certified_true_peak_terminal_execution_state(bound_track)
+            .expect("bound measured carrier publishes runtime terminal state");
+        assert!(execution_state.pre_observation_rate_edge_consumed);
+        assert_eq!(execution_state.measured_carrier_rate_hz, 176_400);
+        let TrackSourceRef::PcmTruePeakCarrier {
+            path: bound_carrier,
+            gain_db: Some(_),
+            terminal_candidate: Some(bound_candidate),
+            ..
+        } = &bound_track.source_ref
+        else {
+            panic!("Album barrier must preserve and bind the measured carrier");
+        };
+        assert_eq!(bound_carrier, &measured_carrier);
+
+        let plan_request = plan_request_for_track(
+            &album.req,
+            bound_track,
+            bound_carrier,
+            &final_output,
+            temp.path().join("final-work"),
+        )
+        .expect("final per-track execution request builds from the bound Album carrier");
+        let typed = match tonepoet_pipeline::plan_typed(&plan_request)
+            .expect("final typed plan builds")
+        {
+            tonepoet_pipeline::PlanningOutcome::Ready(plan) => plan,
+            other => panic!("final Album carrier plan must be ready: {other:?}"),
+        };
+        assert!(typed.nodes.iter().all(|node| !matches!(
+            node,
+            tonepoet_pipeline::TypedPlanNode::Operation {
+                operation: tonepoet_pipeline::PlanOperation::ResamplePcm { .. },
+                ..
+            }
+        )));
+        let plan = plan_conversion(&plan_request).expect("final physical plan builds");
+        let PlanAction::Execute {
+            commands,
+            finalization,
+            ..
+        } = &plan.action
+        else {
+            panic!("final Album carrier must encode");
+        };
+        let terminal = finalized_artifact_producing_command(commands, finalization.as_ref())
+            .expect("final artifact terminal");
+        assert_eq!(terminal.tool, ToolIdentifier::Ffmpeg);
+        assert_eq!(unique_planned_arg_value(&terminal.args, "-ar").unwrap(), "176400");
+        let filter = unique_planned_arg_value(&terminal.args, "-af").expect("terminal filter");
+        assert!(filter.contains("dither_method=triangular"), "{filter}");
+        assert!(filter.contains("out_sample_fmt=s32"), "{filter}");
+        assert!(!filter.contains("out_sample_rate="), "{filter}");
+
+        let Some(tonepoet_pipeline::SelectedTerminalRealization::Pcm(charged)) =
+            bound_candidate.terminal_realization.as_ref()
+        else {
+            panic!("bound carrier must retain its charged PCM terminal realization");
+        };
+        let (qualified_command_index, private_execution) =
+            qualified_ffmpeg_int32_dither_terminal_binding(
+                bound_track,
+                Some(&execution_state),
+                &plan_request,
+                &plan,
+            )
+            .expect("real Album carrier reaches the qualified Int32/TPDF terminal binding")
+            .expect("real Album carrier retains its qualified FFmpeg terminal candidate");
+        assert_eq!(
+            commands.get(qualified_command_index).map(|command| &command.tool),
+            Some(&ToolIdentifier::Ffmpeg),
+            "the production binding must select the actual FFmpeg artifact terminal",
+        );
+        assert_eq!(private_execution.target_rate_hz, None);
+        assert_eq!(charged.target_rate_hz, Some(176_400), "proof identity remains charged");
+        validate_qualified_ffmpeg_int32_terminal_command_shape(terminal, &private_execution)
+            .expect("real preparation -> Album gain -> final FFmpeg Int32/TPDF terminal is accepted");
     }
 
     #[test]
@@ -12458,8 +12905,19 @@ mod tests {
                 .contains("missing its resolved out_sample_rate"),
         );
 
-        let execution = qualified_ffmpeg_int32_execution_realization(&track, terminal, &charged)
-            .expect("the already-consumed pre-observation rate edge is recognized");
+        let execution_state = crate::convert::pipeline::stages::certified_true_peak_terminal_execution_state(&track)
+            .expect("bound measured carrier must publish terminal execution state");
+        assert!(
+            execution_state.pre_observation_rate_edge_consumed,
+            "the production carrier boundary must record the 192 kHz -> 176.4 kHz edge as already consumed",
+        );
+        let execution = qualified_ffmpeg_int32_execution_realization(
+            Some(&execution_state),
+            &plan_request,
+            terminal,
+            &charged,
+        )
+        .expect("the already-consumed pre-observation rate edge is recognized");
         assert_eq!(charged.target_rate_hz, Some(176_400));
         assert_eq!(
             execution.target_rate_hz, None,
@@ -12501,8 +12959,22 @@ mod tests {
             "aresample=resampler=soxr:precision=33:cutoff=0.95:dither_method=triangular:out_sample_fmt=s32",
         );
 
-        let execution = qualified_ffmpeg_int32_execution_realization(&track, &command, &charged)
-            .expect("same-rate carrier realization remains valid");
+        let plan_request = pcm_true_peak_terminal_plan_request(
+            temp.path(),
+            &track,
+            192_000,
+            AudioFormat::Wav,
+        );
+        let execution_state = crate::convert::pipeline::stages::certified_true_peak_terminal_execution_state(&track)
+            .expect("bound measured carrier must publish terminal execution state");
+        assert!(!execution_state.pre_observation_rate_edge_consumed);
+        let execution = qualified_ffmpeg_int32_execution_realization(
+            Some(&execution_state),
+            &plan_request,
+            &command,
+            &charged,
+        )
+        .expect("same-rate carrier realization remains valid");
         assert_eq!(charged.target_rate_hz, None);
         assert_eq!(execution.target_rate_hz, None);
         validate_qualified_ffmpeg_int32_terminal_command_shape(&command, &execution)
@@ -12524,8 +12996,25 @@ mod tests {
             "aresample=resampler=soxr:precision=33:cutoff=0.95:dither_method=triangular:out_sample_fmt=s32",
         );
 
-        let error = qualified_ffmpeg_int32_execution_realization(&track, &command, &charged)
-            .expect_err("a charged rate that disagrees with the realized carrier must refuse");
+        let plan_request = pcm_true_peak_terminal_plan_request(
+            temp.path(),
+            &track,
+            176_400,
+            AudioFormat::Wav,
+        );
+        let execution_state = crate::convert::pipeline::stages::certified_true_peak_terminal_execution_state(&track)
+            .expect("bound measured carrier must publish terminal execution state");
+        assert!(
+            !execution_state.pre_observation_rate_edge_consumed,
+            "a contradictory charged rate must not be mistaken for an already-consumed edge",
+        );
+        let error = qualified_ffmpeg_int32_execution_realization(
+            Some(&execution_state),
+            &plan_request,
+            &command,
+            &charged,
+        )
+        .expect_err("a charged rate that disagrees with the realized carrier must refuse");
         assert!(
             error.contains("target rate 192000") && error.contains("carrier rate 176400"),
             "unexpected refusal: {error}",
@@ -12547,8 +13036,21 @@ mod tests {
             "aresample=resampler=soxr:precision=33:cutoff=0.95:dither_method=triangular:out_sample_fmt=s32",
         );
 
-        let error = qualified_ffmpeg_int32_execution_realization(&track, &command, &charged)
-            .expect_err("the final raw FFmpeg ingress must be the measured carrier rate");
+        let plan_request = pcm_true_peak_terminal_plan_request(
+            temp.path(),
+            &track,
+            176_400,
+            AudioFormat::Wav,
+        );
+        let execution_state = crate::convert::pipeline::stages::certified_true_peak_terminal_execution_state(&track)
+            .expect("bound measured carrier must publish terminal execution state");
+        let error = qualified_ffmpeg_int32_execution_realization(
+            Some(&execution_state),
+            &plan_request,
+            &command,
+            &charged,
+        )
+        .expect_err("the final raw FFmpeg ingress must be the measured carrier rate");
         assert!(
             error.contains("raw input rate 192000") && error.contains("carrier rate 176400"),
             "unexpected refusal: {error}",

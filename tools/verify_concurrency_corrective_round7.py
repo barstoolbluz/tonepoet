@@ -49,14 +49,14 @@ def main() -> int:
     concurrency = read("src/concurrency.rs")
     gate = read("scripts/validate_concurrency_round7.sh")
 
-    persistent = concurrency[
-        concurrency.index("pub struct PersistentLease {") : concurrency.index(
-            "/// Process-local view of descriptor handles", concurrency.index("pub struct PersistentLease {")
-        )
-    ]
+    persistent_begin = concurrency.index("struct PersistentLeaseSharedState {")
+    persistent_end = concurrency.index(
+        "/// Process-local view of descriptor handles", persistent_begin
+    )
+    persistent = concurrency[persistent_begin:persistent_end]
     require(
         "lifetime_file_exported: std::sync::atomic::AtomicBool" in persistent,
-        "persistent lease records whether close-only authority was exported",
+        "persistent lease shared state records whether close-only authority was exported",
     )
 
     duplicate = function(concurrency, "duplicate_lifetime_file")
@@ -122,8 +122,9 @@ def main() -> int:
     persistent_drop = concurrency[persistent_drop_begin:persistent_drop_end]
     require(
         "remove_file" not in persistent_drop
-        and "unregister_local_persistent_lease" in persistent_drop,
-        "raw/detached PersistentLease keeps the existing close-only Drop contract",
+        and "LeaseFamily::JournalOperation" in persistent_drop
+        and "FileExt::unlock" in persistent_drop,
+        "PersistentLease Drop still never unlinks authority and explicit unlock is JournalOperation-only",
     )
 
     admission = function(concurrency, "acquire_grouped_internal")
