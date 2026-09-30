@@ -1189,6 +1189,10 @@ fn local_persistent_lease_registration(
     registration
 }
 
+/// Test-only view of the weak co-hold index. Production code reads the
+/// registration directly; this exists so a regression can assert that dropping
+/// the last local holder prunes the entry.
+#[cfg(test)]
 fn local_persistent_lease_file(path: &Path) -> Option<Arc<File>> {
     local_persistent_lease_registration(path).map(|(file, _)| file)
 }
