@@ -6,8 +6,8 @@ Base: the supplied `tonepoet-src.tar.gz` is authoritative. It is our local
 
 R10 works. SSRC no longer becomes unavailable when it cannot own the selected
 dither, the explicit-native-override refusal still holds, and `DitherType::None`
-stays SSRC-owned. Twelve of thirteen valid cells plan and lower correctly. One
-does not.
+stays SSRC-owned. Eleven of the twelve valid cells plan and lower correctly.
+One does not.
 
 ---
 
@@ -38,8 +38,9 @@ explicit TPDF, metadata transfer off:
 | WavPack | ffmpeg→ssrc→ffmpeg | **common_realizer** | ffmpeg→ssrc→ffmpeg | ffmpeg→ssrc→ffmpeg | format-rejected |
 | WAV | ffmpeg→ssrc→ffmpeg | ffmpeg→ssrc→ffmpeg | ffmpeg→ssrc→ffmpeg | ffmpeg→ssrc | ffmpeg→ssrc |
 
-The format-rejected cells are pre-existing rules — FLAC/ALAC refuse float
-depths, WavPack refuses Float64 — not consequences of this work. The two WAV
+Fifteen cells, three format-rejected by pre-existing rules — FLAC/ALAC refuse
+float depths, WavPack refuses Float64 — leaving twelve valid, of which eleven
+realize. The two WAV
 float cells correctly plan no terminal, because there is nothing to quantize.
 
 Every cell whose terminal is FFmpeg realizes. The single failing cell is the
