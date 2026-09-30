@@ -3740,3 +3740,63 @@ stays at zero for a genuine lossless mismatch; this is about comparing comparabl
 quantities, not about loosening the check. Where an expectation carries a sample count, it
 carries the rate that count is expressed in, so a future domain mismatch fails loudly
 rather than silently comparing across rates.
+
+## 59. A second TUI instance blocks metadata saves on albums it never opened
+
+Filed 2026-09-30. Two TUI instances were running. Saving metadata on
+`~/torrents/Chaka Khan  Freddie Hubbard  Joe Henderson  Chick Corea  Stanley Clarke  Lenny White - 1982 - (Japan),DSF,(tracks),(ART-9+KIV+Tangens)`
+— nine DSF tracks — failed in the second instance:
+
+```
+Metadata: 0 saved, 9 failed, unsaved changes remain — metadata-editor save busy:
+filesystem mutation conflicts with live owner: '/home/daedalus/torrents/Chaka Khan  …
+```
+
+Closing the other instance and retrying saved successfully. **That instance did not
+have this album, or this folder, open.** An unrelated second instance should not
+make an album unwritable.
+
+### What the conflict guard does
+
+`src/concurrency.rs` refuses when a requested claim overlaps a claim held by a live
+owner in a different execution lifecycle and coordination group. The refusal names
+the owner class and the overlapping pair.
+
+### What could not be established
+
+By the time the system was inspected the other instance had exited and its
+queue-scope lease was gone. The surviving lease held `"paths":[]` and `"claims":[]`,
+so nothing on disk explained the refusal; the conflicting claim existed only while
+the save was attempted.
+
+Whether the other instance held a claim on an ancestor directory that overlaps every
+album beneath it, held stale claims from a completed operation, or something else,
+is unknown.
+
+### A diagnosability gap that caused this
+
+Nothing logs claim registration or conflict. The application log contains 5,824 lines
+mentioning the other instance's scope, every one the same five-second recovery poll
+(`queue scope <id> is still live-owned during recovery; skipping it for this pass`),
+and not one recording what that scope claimed. The status-bar message is also
+truncated before the overlapping path and owning execution, which is the only place
+the information appears at all.
+
+A transient conflict is therefore unreconstructable after the fact, which is why this
+issue cannot say what actually conflicted.
+
+### Also observed in the same session
+
+A `__execution-item-supervisor` child had been alive 97 minutes with no children, no
+CPU and only a socket descriptor, parented to an idle TUI with no conversion running.
+Whether a stranded supervisor keeps an execution identity live, and whether that
+relates to this refusal, was not determined.
+
+### Required
+
+A second instance that has not opened an album does not prevent saving it, and
+whatever scope the guard uses is no broader than the work actually in flight.
+
+When a claim conflict does occur, the reason names the overlapping path and the
+owning execution somewhere durable, so the conflict can be diagnosed after it clears
+rather than only while it is happening.
