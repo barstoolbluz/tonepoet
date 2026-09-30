@@ -1149,7 +1149,21 @@ mod tests {
             sample_frames: 11,
             encoding: W64SampleEncoding::SignedInteger,
         };
-        let bytes = ssrc_trailing_zero_padded_fixture(actual, 6);
+        // This fixture ends seven bytes short of the data chunk's ordinary
+        // eight-byte alignment boundary. Eight trailing zeros therefore make
+        // the SSRC-only rule load-bearing: seven satisfy normal alignment and
+        // the eighth is an otherwise undeclared tail byte.
+        let bytes = ssrc_trailing_zero_padded_fixture(actual, 8);
+        assert!(inspect_exact_w64_pcm(
+            &mut Cursor::new(bytes.clone()),
+            W64PcmFormatExpectation::from(actual),
+        )
+        .is_err());
+        inspect_ssrc_w64_pcm(
+            &mut Cursor::new(bytes.clone()),
+            W64PcmFormatExpectation::from(actual),
+        )
+        .unwrap();
         let expected = W64PcmExpectation {
             sample_frames: 12,
             ..actual
