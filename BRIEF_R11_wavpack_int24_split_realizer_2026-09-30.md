@@ -30,7 +30,8 @@ realize it.
 ## The boundary, measured
 
 Planning across formats and depths, all 96 kHz to 176.4 kHz, forced SSRC,
-explicit TPDF, metadata transfer off:
+explicit TPDF, metadata transfer off. 352.8 kHz, the other rate the original
+report named, was not measured:
 
 | target | Int16 | Int24 | Int32 | Float32 | Float64 |
 |---|---|---|---|---|---|
