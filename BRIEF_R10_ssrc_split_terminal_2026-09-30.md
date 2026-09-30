@@ -13,8 +13,19 @@ choose a dither type. The conversion refuses:
 ssrc_terminal_dither_unavailable
 ```
 
-SSRC has no dither or noise-shaping table at those destination rates. That is
-true. It does not follow that SSRC is unavailable.
+SSRC has no dither table at those destination rates. We confirmed that
+directly against the pinned build — dither id 99, 16-bit, profile high:
+
+| destination | result |
+|---|---|
+| 44.1 kHz | accepted |
+| 96 kHz | accepted |
+| 176.4 kHz | refused, exit 255 |
+| 192 kHz | accepted |
+| 352.8 kHz | refused, exit 255 |
+
+So the gap is specific: the 44.1-family multiples above 96 kHz, not high rates
+in general. That is true of SSRC and does not follow that SSRC is unavailable.
 
 ## The outcome we want
 
@@ -49,7 +60,9 @@ case, with the comment:
 > This is a derived global-family fusion miss, not a whole-request settings
 > error. A later admitted terminal may own the dither.
 
-Commit `142192e` replaced that `Ok` with the present `Err`. R6's goal —
+Commit `142192e` replaced that `Ok` with the present `Err`. Note that
+`ssrc_terminal_dither_unavailable` is now raised from two places, in
+`resolve_ssrc_immediate_output` and in `resolve_ssrc_terminal_realization`. R6's goal —
 keeping ordinary SSRC dither ownership on SSRC — was sound; the refusal
 appears to have been applied more broadly than that goal required. The code
 already separates an explicit SSRC-native override from an ordinary dither
