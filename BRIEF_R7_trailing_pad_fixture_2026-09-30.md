@@ -1,7 +1,11 @@
 # Brief R7 — one fixture in your corrective never reaches its assertion
 
 Date: 2026-09-30
-Base: `main` @ `03a62eb` with the R6 corrective applied
+Base: the supplied `tonepoet-src.tar.gz` is authoritative. It is our local
+`main` @ `03a62eb` with your R6 corrective applied. That commit is local to our
+build host and not yet pushed, so — as your source-identity note last round
+correctly observed — it cannot be resolved from the archive. Treat the tarball
+bytes as the base, not the hash.
 
 The corrective works. The production validator now accepts the exact 228-byte
 repro it previously rejected, the qualification harness gets past dither
