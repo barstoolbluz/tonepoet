@@ -83,8 +83,9 @@ loudly instead of silently comparing across rates.
 
 ## State
 
-Gate 7206-7208 passed, 0 failed plus up to two contention flakes that pass in
-isolation. `tonepoet-true-peak` 160/0. Reference requalified on the Nix
+Gate: 7,208 tests. The last two runs were 7207/1 and 7206/2, every failure a
+contention flake that passes in isolation. `tonepoet-true-peak` 160/0, last
+measured before this chain and unchanged since. Reference requalified on the Nix
 rooting. SSRC true-peak registry commissioned with 4,368 records bound to
 report SHA-256 `b5ab9698`. Issues #55 and #57 closed; this is filed as #58.
 
