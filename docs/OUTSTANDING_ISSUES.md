@@ -3638,3 +3638,58 @@ evidence.
 
 Do not hand-author registry records, and do not promote a report containing non-passing
 cells.
+
+## 58. Post-encode sample drift compares a source-rate expectation against a target-rate output
+
+Filed 2026-09-30. AC/DC, *Back in Black* (Japan Atlantic P-10906A), one WavPack image with
+a sidecar CUE, 10 tracks, 192 kHz source. FLAC, Int16, TPDF, album true-peak, target
+44.1 kHz — the conversion that motivated commissioning the SSRC true-peak registry, run
+immediately after that registry was promoted.
+
+Track 7 fails validation:
+
+```
+track validation failed: post-encode sample drift for lossless output
+  .../007-07 - You Shook Me All Night Long.flac: expected 40140800, got 9219840, allowed 0
+```
+
+### Why
+
+40140800 / 9219840 = 4.35374149659864, which is exactly 192000/44100. Both counts describe
+the same 209.067 seconds of audio: the expectation is in source-rate samples, the actual is
+in target-rate samples, and the check compares them directly with a tolerance of zero.
+
+The rate guard immediately above the drift comparison, which rejects a mismatch between
+`expected.sample_rate` and the probed rate, did not fire. So the expectation carries a
+source-domain sample count without a sample rate that would have exposed the
+inconsistency.
+
+This is the same family as issue #55 — rate-change accounting where one side of a
+comparison was never converted into the other's domain — but at a different site:
+post-encode lossless validation in `stages.rs` rather than the terminal realization.
+
+### Scope not established
+
+Only track 7 reached validation. The other nine report `certified SSRC true-peak terminal
+execution failed: tool cancelled`, which is collateral from track 7's failure cancelling
+the album while their work was in flight. Whether the drift affects every track or only
+some was not determined.
+
+### A second, smaller defect
+
+That collateral wording is a cancellation variant the scheduler's classifier does not
+recognise. The R4 corrective taught it to classify `PCM true-peak measurement failed for
+track <N>: PCM true-peak scan cancelled` as collateral; this path produces `certified SSRC
+true-peak terminal execution failed: tool cancelled` instead, so nine cancellations are
+again counted as peer failures and the originating cause is not the headline. The
+classifier should recognise this variant too, on the same exact-match basis rather than by
+generic substring.
+
+### Required
+
+A lossless conversion whose target rate differs from its source rate validates against an
+expectation in the output's own domain, and the AC/DC album converts. The drift tolerance
+stays at zero for a genuine lossless mismatch; this is about comparing comparable
+quantities, not about loosening the check. Where an expectation carries a sample count, it
+carries the rate that count is expressed in, so a future domain mismatch fails loudly
+rather than silently comparing across rates.
