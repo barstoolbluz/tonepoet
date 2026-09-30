@@ -3561,6 +3561,23 @@ should not be relaxed to let a 14-vs-1 mismatch through.
 
 ## 57. SSRC emits a four-byte Wave64 trailing pad; tonepoet and its qualification harness accept only two
 
+> **RESOLVED 2026-09-30.** There were two Wave64 defects, not one. The R6 corrective made
+> the SSRC tail policy single-owned in `w64.rs`, with the qualification harness reaching it
+> through the compiled helper rather than reimplementing it, and admitted the four-byte
+> over-alignment tail this issue describes. The R8 corrective then admitted the
+> short-of-alignment case — the `w64_alignment_padding` class, 447 cells in the superseded
+> run — while keeping truncation refusable. R7 fixed a test fixture that never reached its
+> own assertion.
+>
+> The full production grid then qualified on this host: **4,368 cells, 4,368 passed, 0
+> failed**, in 32.4 minutes at `--jobs 16`. That is the corrected grid size the R6 handoff
+> named; the superseded run's 4,536 was the uncorrected grid. Promotion ran through
+> `promote_ssrc_true_peak_terminal.py`, the only supported path, writing 4,368 registry
+> records bound to report SHA-256 `b5ab9698`. No record was hand-authored.
+>
+> The conversion that motivated this now gets past commissioning and fails later, at
+> post-encode validation — filed separately as #58.
+
 Filed 2026-09-30. Found while trying to commission the SSRC true-peak terminal after a
 field failure: AC/DC, *Back in Black* (Japan Atlantic P-10906A), 192 kHz to 44.1 kHz,
 FLAC Int16, TPDF, album true-peak. The conversion refused with
