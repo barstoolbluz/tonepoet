@@ -41,10 +41,12 @@ Tonepoet's production validator checks `declared_file_bytes - chunk_end == 2` in
 `ssrc_validator_accepts_only_its_exact_two_zero_byte_trailing_pad`. The harness
 mirrors production; neither is the more permissive of the two.
 
-It is frame-count dependent. A one-second fixture at every probe rate crossed
-with all 22 admitted dither IDs — 132 combinations — parses without a single
-failure. The harness's 64-frame probe does not. That is why this was never seen
-in ordinary conversion.
+It is frame-count dependent. Sweeping a one-second fixture across six
+destination rates crossed with all 22 admitted dither IDs produced no parse
+failure and no unexpected `ssrc` exit; the only non-zero exits were legitimate
+rate-unavailable diagnostics the harness already tolerates. The harness's
+64-frame probe fails on the first rate it tries. That is why this never showed
+up in ordinary conversion, where buffers are far larger.
 
 ## The shipped evidence cannot be promoted instead
 
@@ -56,9 +58,16 @@ non-passing cell.
 
 Its failure classes are dominated by this same defect — `w64_alignment_padding`
 447 and `w64_truncated_chunk_header` 345, together 792 cells or 17% of the grid,
-failing on Wave64 parsing rather than on anything numerical. The R6 handoff also
-specifies a corrected grid of 4,368 cells against that run's 4,536, so it is
-superseded on its own terms.
+failing on Wave64 parsing rather than on anything numerical. The remaining
+classes are `saturation_premise` 1194 and `other` 168.
+
+That run derives from `ssrc_binary64/outcome_grid42_2026-09-20.json`: 3 profiles
+x 42 rate pairs x 2 channel counts x 18 cells = 4,536, matching its cell count
+exactly. That file is already the script default, so `--production-grid` covers
+the 192000 -> 44100 pair this album needs without an extra flag. Note also that
+4,536 minus the 168 `other` cells is 4,368, the corrected grid size the R6
+handoff names — an arithmetic observation, not a verified account of what the
+correction removed.
 
 ## Required
 
