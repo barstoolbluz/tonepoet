@@ -3570,7 +3570,7 @@ mod clamp_pill_tests {
     }
 
     #[test]
-    fn ssrc_int32_dither_preserves_selection_and_uses_rate_aware_refusal() {
+    fn ssrc_int32_dither_preserves_selection_and_marks_split_requirement() {
         use super::{BitDepthChoice, DitherType, ResamplerChoice};
 
         let mut format = FormatState::new();
@@ -3583,7 +3583,7 @@ mod clamp_pill_tests {
 
         assert_eq!(*format.dither.selected_value(), DitherType::Shibata);
         assert!(format.dither_overridden);
-        assert!(!format.ssrc_dither_invalid_for_selected_rate());
+        assert!(!format.ssrc_dither_split_required_for_selected_rate());
 
         format.sample_rate.select_value(&176_400);
         format.dither.select_value(&DitherType::TPDF);
@@ -3592,8 +3592,8 @@ mod clamp_pill_tests {
 
         assert_eq!(*format.dither.selected_value(), DitherType::TPDF);
         assert!(format.dither_overridden);
-        assert!(format.ssrc_dither_invalid_for_selected_rate());
-        assert_eq!(format.ssrc_dither_status_label(), Some("ssrc unavailable"));
+        assert!(format.ssrc_dither_split_required_for_selected_rate());
+        assert_eq!(format.ssrc_dither_status_label(), Some("split dither"));
     }
 
     #[test]
@@ -4932,12 +4932,13 @@ impl FormatState {
             && selected_global_dither_needs_ssrc_approximation(*self.dither.selected_value())
     }
 
-    /// True when SSRC is selected and the global dither pill would derive an
-    /// SSRC shaper ID that is unavailable for the selected destination rate.
+    /// True when SSRC is selected and the ordinary global dither pill cannot be
+    /// realized by SSRC at the selected destination rate, so the planner must
+    /// keep SSRC on a Float64 carrier and assign dither to a qualified terminal.
     ///
-    /// Explicit SSRC overlay overrides take precedence, and float output skips
-    /// dither/noise-shaping emission entirely.
-    pub fn ssrc_dither_invalid_for_selected_rate(&self) -> bool {
+    /// This is not a whole-request refusal. Explicit SSRC overlay overrides
+    /// remain SSRC-owned and fail closed; float output skips dither entirely.
+    pub fn ssrc_dither_split_required_for_selected_rate(&self) -> bool {
         matches!(*self.resampler.selected_value(), ResamplerChoice::Ssrc)
             && !self.ssrc_dither_override_active()
             && *self.sample_rate.selected_value() != SOURCE_SAMPLE_RATE_SENTINEL
@@ -4953,8 +4954,8 @@ impl FormatState {
     pub fn ssrc_dither_status_label(&self) -> Option<&'static str> {
         if self.ssrc_dither_override_active() {
             Some("ssrc override")
-        } else if self.ssrc_dither_invalid_for_selected_rate() {
-            Some("ssrc unavailable")
+        } else if self.ssrc_dither_split_required_for_selected_rate() {
+            Some("split dither")
         } else if self.ssrc_dither_approximation_active() {
             Some("ssrc approx")
         } else {
@@ -18666,27 +18667,27 @@ mod ssrc_format_settings_handler_tests {
     }
 
     #[test]
-    fn ssrc_dither_status_labels_invalid_global_mapping_for_selected_rate() {
+    fn ssrc_dither_status_labels_split_global_mapping_for_selected_rate() {
         let mut format = FormatState::new();
         format.resampler.select_value(&ResamplerChoice::Ssrc);
         format.sample_rate.select_value(&176_400);
         format.bit_depth.select_value(&BitDepthChoice::Int16);
         format.dither.select_value(&DitherType::HighShibata);
 
-        assert!(format.ssrc_dither_invalid_for_selected_rate());
-        assert_eq!(format.ssrc_dither_status_label(), Some("ssrc unavailable"));
+        assert!(format.ssrc_dither_split_required_for_selected_rate());
+        assert_eq!(format.ssrc_dither_status_label(), Some("split dither"));
 
         format.dither.select_value(&DitherType::TPDF);
-        assert!(format.ssrc_dither_invalid_for_selected_rate());
-        assert_eq!(format.ssrc_dither_status_label(), Some("ssrc unavailable"));
+        assert!(format.ssrc_dither_split_required_for_selected_rate());
+        assert_eq!(format.ssrc_dither_status_label(), Some("split dither"));
 
         format.dither.select_value(&DitherType::None);
-        assert!(!format.ssrc_dither_invalid_for_selected_rate());
+        assert!(!format.ssrc_dither_split_required_for_selected_rate());
         assert_eq!(format.ssrc_dither_status_label(), None);
     }
 
     #[test]
-    fn ssrc_dither_invalid_status_is_suppressed_for_float_output_and_explicit_overrides() {
+    fn ssrc_dither_split_status_is_suppressed_for_float_output_and_explicit_overrides() {
         let mut format = FormatState::new();
         format.format.select_value(&AudioFormat::Wav); // WAV supports float bit depths
         format.apply_format_constraints(); // Enable Float32/Float64 for WAV
@@ -18695,13 +18696,13 @@ mod ssrc_format_settings_handler_tests {
         format.bit_depth.select_value(&BitDepthChoice::Float32);
         format.dither.select_value(&DitherType::HighShibata);
 
-        assert!(!format.ssrc_dither_invalid_for_selected_rate());
+        assert!(!format.ssrc_dither_split_required_for_selected_rate());
         assert_eq!(format.ssrc_dither_status_label(), Some("ssrc approx"));
 
         format.bit_depth.select_value(&BitDepthChoice::Int16);
         format.ssrc_dither_id = Some(99);
         format.ssrc_pdf_type = Some(SsrcPdfType::Triangular);
-        assert!(!format.ssrc_dither_invalid_for_selected_rate());
+        assert!(!format.ssrc_dither_split_required_for_selected_rate());
         assert_eq!(format.ssrc_dither_status_label(), Some("ssrc override"));
     }
 }

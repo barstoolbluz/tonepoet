@@ -79,9 +79,10 @@ impl ResolvedSsrcDither {
 /// Dither belongs to the final integer write, not to a comparison between the
 /// source and destination nominal widths. Float/nonterminal SSRC output never
 /// emits dither. A derived global family that is unavailable at the selected
-/// rate is returned as an unavailable terminal result so planning can fail
-/// before command construction; an active explicit native override remains
-/// fail-closed as well.
+/// rate is returned as an unavailable SSRC-terminal result so ordinary
+/// planning can retain SSRC for Float64 rate conversion and assign the global
+/// dither to a qualified later terminal. An active explicit native override
+/// remains fail-closed and cannot migrate to another tool.
 pub(crate) fn resolve_ssrc_dither_for_rate(
     settings: &crate::settings::PipelineSettings,
     source_depth: Option<PcmBitDepth>,
@@ -1874,10 +1875,15 @@ fn ffmpeg_audio_filter(
         filters.push(format!("volume={}dB:precision=double", gain.render(false)));
     }
 
+    let effective_depth = effective_target_depth(context, target_depth);
     let processing_produces_fractional_pcm = target_rate_hz.is_some()
         || settings.dsd.runtime_album_gain_db().is_some()
-        || settings.pcm_true_peak.fixed_gain_db().is_some();
-    let effective_depth = effective_target_depth(context, target_depth);
+        || settings.pcm_true_peak.fixed_gain_db().is_some()
+        || terminal_consumes_ssrc_float64_continuation(
+            context,
+            target_rate_hz,
+            effective_depth,
+        );
     let dither = effective_pcm_dither(context.request, effective_depth);
     let ffmpeg_needs_dither = match effective_depth {
         Some(PcmBitDepth::Int32) => int32_dither_requested(context.request, effective_depth),
@@ -2142,7 +2148,12 @@ fn add_sox_pcm_effects(
     // boundary checks this command against that resolved fact.
     let processing_produces_fractional_pcm = target_rate_hz.is_some()
         || context.request.settings.dsd.runtime_album_gain_db().is_some()
-        || context.request.settings.pcm_true_peak.fixed_gain_db().is_some();
+        || context.request.settings.pcm_true_peak.fixed_gain_db().is_some()
+        || terminal_consumes_ssrc_float64_continuation(
+            context,
+            target_rate_hz,
+            effective_depth,
+        );
     let depth_allows_dither = match effective_depth {
         Some(depth) => {
             target_depth_needs_dither(depth)
@@ -2159,6 +2170,57 @@ fn add_sox_pcm_effects(
     if should_dither {
         args.extend(mapping::sox_dither_args(dither));
     }
+}
+
+/// Recover the one carrier fact that the legacy `EncodePcm` bridge does not
+/// encode explicitly: an SSRC split has already performed the requested rate
+/// conversion and handed this terminal a Float64 continuation.
+///
+/// The terminal's `target_rate_hz` deliberately remains `None` so the encoder
+/// cannot perform a second rate conversion.  The typed planner therefore owns
+/// the authoritative split decision; lowering only replays that decision far
+/// enough to decide whether an integer landing reduces precision and needs the
+/// already-selected dither.
+fn terminal_consumes_ssrc_float64_continuation(
+    context: &PlanContext<'_>,
+    terminal_target_rate_hz: Option<u32>,
+    terminal_target_depth: Option<PcmBitDepth>,
+) -> bool {
+    if terminal_target_rate_hz.is_some()
+        || !context.request.settings.target_format.is_pcm_lossless()
+        || !matches!(
+            terminal_target_depth,
+            Some(depth) if !depth.is_float()
+        )
+    {
+        return false;
+    }
+
+    let request = context.request;
+    let crate::enums::RateTarget::PcmHz(target_rate_hz) = request.settings.target_sample_rate
+    else {
+        return false;
+    };
+    if request.source.sample_rate_hz == Some(target_rate_hz)
+        || !(request.settings.ssrc.force
+            || request.settings.nyquist_transition == crate::enums::NyquistTransition::BrickWall)
+    {
+        return false;
+    }
+
+    matches!(
+        crate::semantic_plan::resolve_ssrc_immediate_output(
+            request,
+            target_rate_hz,
+            terminal_target_depth,
+            false,
+            request.settings.pcm_true_peak.policy,
+        ),
+        Ok(crate::semantic_plan::SsrcImmediateOutput {
+            depth: PcmBitDepth::Float64,
+            role: crate::semantic_plan::SsrcOutputRole::Nonterminal,
+        })
+    )
 }
 
 fn add_sox_pcm_to_dsd_effects(
@@ -3721,7 +3783,7 @@ mod tests {
     }
 
     #[test]
-    fn ssrc_lossless_non_wav_package_refuses_unavailable_dither_before_lowering() {
+    fn ssrc_same_depth_flac_split_lands_float64_with_ffmpeg_dither_and_no_second_rate() {
         let mut settings = PipelineSettings::default();
         settings.target_format = AudioFormat::Flac;
         settings.target_sample_rate = crate::enums::RateTarget::PcmHz(176_400);
@@ -3730,14 +3792,39 @@ mod tests {
         settings.dither_type = DitherType::Tpdf;
         settings.dither_explicit = true;
         settings.ssrc.force = true;
-        let mut request = pcm_request_with(settings, PcmBitDepth::Int24);
+        let mut request = pcm_request_with(settings, PcmBitDepth::Int16);
         request.output_path = PathBuf::from("output.flac");
 
-        let error = crate::plan_conversion(&request)
-            .expect_err("unsupported SSRC dither must refuse instead of moving to FFmpeg");
-        let rendered = format!("{error:?}");
-        assert!(rendered.contains("ssrc_terminal_dither_unavailable"), "{rendered}");
-        assert!(rendered.contains("176400"), "{rendered}");
+        let lowered = crate::plan_conversion(&request)
+            .expect("ordinary TPDF must split when SSRC has no destination-rate dither table");
+        let PlanAction::Execute { commands, .. } = lowered.action else {
+            panic!("rate-changing SSRC FLAC route must execute")
+        };
+        let ssrc = commands
+            .iter()
+            .find(|command| command.tool == ToolIdentifier::Ssrc)
+            .expect("SSRC Float64 resample command");
+        assert_arg(&ssrc.args, "--bits", "-64");
+        assert_no_arg(&ssrc.args, "--dither");
+        assert_no_arg(&ssrc.args, "--pdf");
+
+        let terminal = commands
+            .iter()
+            .find(|command| {
+                command.tool == ToolIdentifier::Ffmpeg
+                    && command.input.as_path() == ssrc.output.as_path()
+                    && command.args.iter().any(|arg| arg.contains("dither_method=triangular"))
+            })
+            .expect("FFmpeg must own terminal TPDF after the SSRC Float64 split");
+        assert_eq!(ssrc.output.as_path(), terminal.input.as_path());
+        assert_no_arg(&terminal.args, "-ar");
+        assert!(
+            !terminal
+                .args
+                .iter()
+                .any(|arg| arg.contains("out_sample_rate=")),
+            "FFmpeg terminal may quantize/dither through aresample but must not repeat SSRC's rate conversion: {terminal:#?}",
+        );
     }
 
     #[test]
