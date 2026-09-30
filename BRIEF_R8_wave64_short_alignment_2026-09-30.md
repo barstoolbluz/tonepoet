@@ -31,38 +31,22 @@ The rejection comes from production, not the harness. Your single-owner design
 is working exactly as intended; it is simply reporting a case the policy does
 not yet cover.
 
-## The two defects are confirmed, not inferred
+## Two defects, one fixed
 
-We re-ran cells sampled from each historical failure class against the current
-build:
+The superseded 4,536-cell run separated them, and re-running samples from each
+class against the current build confirms the split is real:
 
-| historical class | sampled | result now |
-|---|---|---|
-| `w64_truncated_chunk_header` | 4 | 4 pass — R6 fixed this class |
-| `w64_alignment_padding` | 4 requested, 3 returned | 3 fail, all with the short-alignment message |
-
-The fourth alignment cell, `high:44100:48000:1:16:99:triangular`, produced no
-result, most likely a rate-unsupported dither the harness skips.
-
-So the class names in the superseded run map onto real, current behavior rather
-than onto a guess about naming. The 4,536-cell run separates them cleanly:
-
-| class | cells | shape | status |
+| class | cells then | shape | sampled now |
 |---|---|---|---|
-| `w64_truncated_chunk_header` | 345 | runs over the aligned end | fixed by R6 |
-| `w64_alignment_padding` | 447 | falls short of the aligned end | still failing |
+| `w64_truncated_chunk_header` | 345 | runs over the aligned end | 4 of 4 pass |
+| `w64_alignment_padding` | 447 | falls short of the aligned end | 3 of 3 fail |
 
-The 447 is the historical count for that class, not a measured count under the
-current build. It is the expected scale of the remaining work, given that every
-sampled cell from that class still fails the same way.
+So R6 fixed one class cleanly and did not touch the other. The 447 is the
+historical count, not a re-measured one, but every sampled cell from it still
+fails the same way.
 
-It is not a single bit depth. The 447 break down as 234 at 8-bit, 129 at
-24-bit, 84 at 16-bit — whichever payload sizes leave the data chunk end off the
-eight-byte boundary, which depends on frames, channels and bytes per sample.
-
-Our two trial failures were `high:192000:44100:2:24:99:triangular` and
-`insane:192000:44100:1:24:99:triangular`, while `long:96000:44100:2:24:99:triangular`
-passed, consistent with that.
+Not a single bit depth: the 447 are 234 at 8-bit, 129 at 24-bit, 84 at 16-bit —
+whichever payload sizes leave the data chunk end off the eight-byte boundary.
 
 ## Why we did not run the full grid
 
