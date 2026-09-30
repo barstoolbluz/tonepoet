@@ -34,6 +34,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -202,6 +203,7 @@ def _unsupported_dither_for_rate(stderr: str, dither_id: int, target_rate_hz: in
 
 def discover_ssrc_dither_capabilities(
     exe: Path,
+    helper: Path,
     target_rates_hz: Iterable[int],
     root: Path,
 ) -> dict[int, tuple[int, ...]]:
@@ -241,7 +243,7 @@ def discover_ssrc_dither_capabilities(
                         f"SSRC dither capability probe succeeded without output for "
                         f"{target_rate_hz} Hz / ID {dither_id}"
                     )
-                parse_w64(out, target_rate_hz, 1)
+                parse_w64(out, target_rate_hz, 1, helper)
                 supported.append(dither_id)
                 continue
             if _unsupported_dither_for_rate(proc.stderr, dither_id, target_rate_hz):
@@ -367,7 +369,7 @@ def _parse_w64_bytes(
     data: bytes,
     expected_rate: int,
     expected_channels: int,
-    allow_ssrc_final_two_byte_padding: bool,
+    allow_final_data_tail_candidate: bool,
 ) -> dict[str, Any]:
     if len(data) < 40 or data[:16] != W64_RIFF_GUID or data[24:40] != W64_WAVE_GUID:
         raise ValueError("not an exact Wave64 RIFF/WAVE root")
@@ -413,14 +415,11 @@ def _parse_w64_bytes(
                 raise ValueError("duplicate Wave64 data chunk")
             payload = body
         end = offset + size
-        if (
-            allow_ssrc_final_two_byte_padding
-            and guid == W64_DATA_GUID
-            and len(data) - end == 2
-        ):
-            if any(data[end:]):
-                raise ValueError("non-zero SSRC Wave64 trailing padding")
-            ssrc_trailing_padding_bytes = 2
+        # Candidate extraction deliberately does not decide whether a final
+        # SSRC tail is admissible. Any residual bytes after `data` are exposed
+        # to the production Rust helper, which owns the zero-only policy.
+        if allow_final_data_tail_candidate and guid == W64_DATA_GUID and end < len(data):
+            ssrc_trailing_padding_bytes = len(data) - end
             offset = len(data)
             break
         aligned = (end + 7) & ~7
@@ -443,18 +442,68 @@ def _parse_w64_bytes(
     }
 
 
-def parse_w64(path: Path, expected_rate: int, expected_channels: int) -> dict[str, Any]:
+def _admit_ssrc_w64_with_production_helper(
+    helper: Path,
+    path: Path,
+    expected_rate: int,
+    expected_channels: int,
+    candidate: dict[str, Any],
+) -> None:
+    fmt = candidate["format"]
+    encoding = fmt["encoding"]
+    if encoding not in {"pcm_integer", "pcm_float"}:
+        raise ValueError(f"cannot delegate unknown Wave64 encoding to production: {encoding}")
+    helper_encoding = "signed_integer" if encoding == "pcm_integer" else "floating_point"
+    proc = invoke([
+        str(helper), "--inspect-ssrc-w64", str(path), str(expected_rate),
+        str(expected_channels), str(fmt["bits"]), helper_encoding,
+    ])
+    if proc.returncode != 0:
+        raise ValueError(f"production SSRC Wave64 validator rejected carrier: {proc.stderr[-2048:]}")
+    try:
+        admitted = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise ValueError("production SSRC Wave64 validator returned invalid JSON") from exc
+    expected = {
+        "sample_frames": candidate["frames"],
+        "declared_data_bytes": len(candidate["payload"]),
+        "physical_file_bytes": path.stat().st_size,
+        "trailing_bytes_after_data": candidate["ssrc_trailing_padding_bytes"],
+    }
+    for key, value in expected.items():
+        if admitted.get(key) != value:
+            raise ValueError(
+                f"production SSRC Wave64 validator disagrees on {key}: "
+                f"reported {admitted.get(key)!r}, Python extraction found {value!r}"
+            )
+
+
+def parse_w64(
+    path: Path,
+    expected_rate: int,
+    expected_channels: int,
+    helper: Path | None = None,
+) -> dict[str, Any]:
     data = path.read_bytes()
     try:
         return _parse_w64_bytes(data, expected_rate, expected_channels, False)
     except ValueError as exact_error:
         try:
-            return _parse_w64_bytes(data, expected_rate, expected_channels, True)
+            candidate = _parse_w64_bytes(data, expected_rate, expected_channels, True)
         except ValueError as ssrc_error:
             raise ValueError(
-                f"Wave64 failed exact parsing ({exact_error}) and narrow SSRC two-byte "
-                f"trailing-pad parsing ({ssrc_error})"
+                f"Wave64 failed exact parsing ({exact_error}) and SSRC trailing-zero "
+                f"candidate parsing ({ssrc_error})"
             ) from ssrc_error
+        if helper is None:
+            raise ValueError(
+                "Wave64 requires the SSRC compatibility path, but no production "
+                "qualification helper was supplied"
+            ) from exact_error
+        _admit_ssrc_w64_with_production_helper(
+            helper, path, expected_rate, expected_channels, candidate
+        )
+        return candidate
 
 
 def decode_float_pcm(w64: dict[str, Any], expected_bits: int) -> list[float]:
@@ -602,9 +651,9 @@ def run_gain_point(exe: Path, helper: Path, cell: Cell, gain: str, root: Path) -
         }
 
     try:
-        observed_w64 = parse_w64(observation, cell.target_rate_hz, cell.channels)
-        terminal_w64_a = parse_w64(terminal_a, cell.target_rate_hz, cell.channels)
-        terminal_w64_b = parse_w64(terminal_b, cell.target_rate_hz, cell.channels)
+        observed_w64 = parse_w64(observation, cell.target_rate_hz, cell.channels, helper)
+        terminal_w64_a = parse_w64(terminal_a, cell.target_rate_hz, cell.channels, helper)
+        terminal_w64_b = parse_w64(terminal_b, cell.target_rate_hz, cell.channels, helper)
         observed = decode_float64(observed_w64)
         if cell.is_float():
             realized = decode_float_pcm(terminal_w64_a, cell.float_bits())
@@ -782,7 +831,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ssrc", type=Path, required=True, help="exact commissioned SSRC executable")
     parser.add_argument("--gain-helper", type=Path, required=True,
-                        help="compiled tonepoet-pipeline ssrc_true_peak_gain_qualification binary")
+                        help=("compiled tonepoet-pipeline ssrc_true_peak_gain_qualification "
+                              "binary (gain authority plus SSRC Wave64 admission)"))
     parser.add_argument("--binary64-outcome", type=Path,
                         default=here.parent / "ssrc_binary64" / "outcome_grid42_2026-09-20.json")
     parser.add_argument("--tonepoet-root", type=Path, required=True,
@@ -800,6 +850,7 @@ def main() -> int:
     parser.add_argument("--jobs", type=int, default=1,
                         help="parallel physical cells; each SSRC process may itself be multithreaded")
     args = parser.parse_args()
+    qualification_started = time.monotonic()
 
     exe = args.ssrc.resolve()
     helper = args.gain_helper.resolve()
@@ -847,14 +898,22 @@ def main() -> int:
         for error in explicit_cell_errors:
             print(error, file=sys.stderr)
         return 2
-    target_rates = {
-        int(pair[1])
-        for pair in binary64.get("ssrc_scope", {}).get("rate_scope", ())
-        if len(pair) == 2
-    }
+    if args.production_grid:
+        target_rates = {
+            int(pair[1])
+            for pair in binary64.get("ssrc_scope", {}).get("rate_scope", ())
+            if len(pair) == 2
+        }
+    else:
+        # A single explicit cell is also the preflight cost probe. Do not pay
+        # for the whole production grid's 22-ID capability sweep merely to time
+        # one cell; probe only destination rates whose explicit cell uses dither.
+        target_rates = {
+            cell.target_rate_hz for cell in cells if cell.dither_id is not None
+        }
     with tempfile.TemporaryDirectory(prefix="tonepoet-ssrc-dither-probe-") as probe_td:
         dither_capabilities = discover_ssrc_dither_capabilities(
-            exe, target_rates, Path(probe_td)
+            exe, helper, target_rates, Path(probe_td)
         )
     for cell in cells:
         if (
@@ -878,6 +937,7 @@ def main() -> int:
         return 2
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    execution_started = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="tonepoet-ssrc-terminal-qualification-") as td:
         root = Path(td)
         if args.jobs == 1:
@@ -886,6 +946,7 @@ def main() -> int:
             with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
                 futures = [pool.submit(run_cell, exe, helper, cell, gains, root, arch) for cell in cells]
                 results = [future.result() for future in futures]
+    execution_wall_seconds = time.monotonic() - execution_started
     results.sort(key=lambda item: item["cell_key"])
 
     all_passed = all(result.get("passed") for result in results)
@@ -945,12 +1006,17 @@ def main() -> int:
         "qualification_report_sha256": report_sha,
         "outcome": "candidate_for_review" if all_passed else "not_qualified",
     }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    total_wall_seconds = time.monotonic() - qualification_started
     print(json.dumps({
         "output": str(args.output),
         "identity": str(identity_path),
         "sha256": report_sha,
         "cells": len(results),
         "passed": all_passed,
+        "total_wall_seconds": round(total_wall_seconds, 6),
+        "execution_wall_seconds": round(execution_wall_seconds, 6),
+        "fixed_overhead_wall_seconds": round(total_wall_seconds - execution_wall_seconds, 6),
+        "wall_seconds_per_cell": round(execution_wall_seconds / len(results), 6),
     }, sort_keys=True))
     return 0 if all_passed else 1
 
