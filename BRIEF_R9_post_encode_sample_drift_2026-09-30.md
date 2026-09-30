@@ -31,8 +31,10 @@ The machinery to handle this exists and was not used.
 `resampled_sample_count` when source and target rates differ, sets the target
 rate, marks the expectation resampled, and attaches an SSRC filter-tail
 allowance. Two signals say that branch was skipped and the `same_rate`
-fallback taken instead: the tolerance is 0, where the resampled branch would
-carry a non-zero SSRC FIR-tail allowance; and the rate guard above the drift
+fallback taken instead: the tolerance is 0, and `encoded_output_sample_tolerance`
+returns at least 1 for any resampled expectation — the SSRC FIR tail when a
+filter length is known, otherwise 1 for endpoint rounding — so 0 can only come
+from a non-resampled expectation; and the rate guard above the drift
 comparison passed, which the fallback permits because it still records the
 target rate while leaving the count unscaled.
 
@@ -86,9 +88,9 @@ isolation. `tonepoet-true-peak` 160/0. Reference requalified on the Nix
 rooting. SSRC true-peak registry commissioned with 4,368 records bound to
 report SHA-256 `b5ab9698`. Issues #55 and #57 closed; this is filed as #58.
 
-The contention flake has now appeared on five different tests across runs, all
-in the coordination-lease area, which supports the wandering hypothesis from
-the R4 brief rather than any test-specific cause.
+The contention flake has now appeared on seven different tests across runs,
+all in the coordination-lease area, which supports the wandering hypothesis
+from the R4 brief rather than any test-specific cause.
 
 ## Build capability
 
