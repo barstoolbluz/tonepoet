@@ -1,0 +1,6 @@
+{
+  "evidence_id": "sha256:b5ab9698fc461bf4dad7660a6b123d46ebd5db914beb5b495609f3eb82f22b8f",
+  "outcome": "candidate_for_review",
+  "qualification_report": "/tmp/grid_full.json",
+  "qualification_report_sha256": "b5ab9698fc461bf4dad7660a6b123d46ebd5db914beb5b495609f3eb82f22b8f"
+}
