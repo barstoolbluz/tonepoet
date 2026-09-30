@@ -23,7 +23,7 @@ cargo test --workspace --no-fail-fast --exclude tonepoet-true-peak   # THE GATE
                              # without --no-fail-fast, --workspace stops at the
                              # first failing binary; tonepoet-true-peak costs
                              # ~41 min and is gated separately. See ## Testing —
-                             # a clean gate is 7194/0; see ## Testing for the
+                             # a clean gate is 7204/0; see ## Testing for the
                              # rare coordination-contention flake.
 cargo test -p tonepoet-backend   # Backend tests only
 cargo test -p tonepoet-features  # Features tests only
@@ -259,15 +259,15 @@ cargo test -p tonepoet-features    # log writer, CUE generator
 cargo test -p tonepoet-true-peak   # BS.1770 true-peak + loudness core (~41 min)
 ```
 
-Tests are in `crates/*/tests/` directories, `src/` (inline `#[cfg(test)]` modules), and `tests/` (integration/contract/sentinel tests). The workspace suite is ~7,190 tests across 57 targets, plus 160 in `tonepoet-true-peak`.
+Tests are in `crates/*/tests/` directories, `src/` (inline `#[cfg(test)]` modules), and `tests/` (integration/contract/sentinel tests). The workspace suite is ~7,200 tests across 57 targets, plus 160 in `tonepoet-true-peak`.
 NEVER truncate failure output.
 
-**A clean gate on `main` is 7194 passed / 0 FAILED.** Reference was requalified on
+**A clean gate on `main` is 7204 passed / 0 FAILED.** Reference was requalified on
 2026-09-29 against the Nix rooting, so the two stale-evidence qualification refusals that
 previously failed are gone.
 
-A rare coordination-contention flake remains. It appeared once in four consecutive runs
-on a 32-thread host, on two tests that both pass in isolation:
+A rare coordination-contention flake remains. It appeared once in six gate runs on a
+32-thread host, on two tests that both pass in isolation:
 
 ```
 scanner probe must acquire the now-ownerless durable descriptor inode:
