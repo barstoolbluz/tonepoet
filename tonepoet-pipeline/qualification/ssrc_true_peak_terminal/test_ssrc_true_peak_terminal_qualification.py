@@ -187,7 +187,7 @@ class QualificationUnitTests(unittest.TestCase):
             with mock.patch.object(q, "invoke", side_effect=fake_invoke), mock.patch.object(
                 q, "parse_w64", return_value={"frames": 1}
             ):
-                found = q.discover_ssrc_dither_capabilities(Path("/ssrc"), [176_400], root)
+                found = q.discover_ssrc_dither_capabilities(Path("/ssrc"), Path("/helper"), [176_400], root)
             self.assertEqual(found, {176_400: (0,)})
 
             def bad_invoke(argv):
@@ -195,33 +195,86 @@ class QualificationUnitTests(unittest.TestCase):
 
             with mock.patch.object(q, "invoke", side_effect=bad_invoke):
                 with self.assertRaises(RuntimeError):
-                    q.discover_ssrc_dither_capabilities(Path("/ssrc"), [176_400], root / "bad")
+                    q.discover_ssrc_dither_capabilities(Path("/ssrc"), Path("/helper"), [176_400], root / "bad")
 
-    def test_wave64_accepts_only_ssrc_final_two_zero_byte_pad(self):
+    def test_wave64_ssrc_zero_tail_is_admitted_only_by_production_helper(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             rate = 192_000
             channels = 1
             bits = 16
-            payload = struct.pack("<hhhhh", 1, -2, 3, -4, 5)
+            # Data ends at offset 110: two zeros reach the 8-byte boundary and
+            # four more reproduce the R6 field probe's post-alignment tail.
+            payload = struct.pack("<hhh", 1, -2, 3)
             align = channels * (bits // 8)
             fmt = struct.pack("<HHIIHH", 1, channels, rate, rate * align, align, bits)
             fmt_chunk = w64_chunk(q.W64_FMT_GUID, fmt)
             data_chunk = q.W64_DATA_GUID + struct.pack("<Q", 24 + len(payload)) + payload
-            body = q.W64_WAVE_GUID + fmt_chunk + data_chunk + b"\0\0"
+            body = q.W64_WAVE_GUID + fmt_chunk + data_chunk + b"\0" * 6
             bytes_ = q.W64_RIFF_GUID + struct.pack("<Q", 24 + len(body)) + body
             path = root / "ssrc-pad.w64"
             path.write_bytes(bytes_)
-            parsed = q.parse_w64(path, rate, channels)
+
+            candidate = q._parse_w64_bytes(bytes_, rate, channels, True)
+            self.assertEqual(candidate["payload"], payload)
+            self.assertEqual(candidate["frames"], 3)
+            self.assertEqual(candidate["ssrc_trailing_padding_bytes"], 6)
+
+            with self.assertRaisesRegex(ValueError, "no production qualification helper"):
+                q.parse_w64(path, rate, channels)
+
+            def helper_invoke(argv):
+                self.assertEqual(argv[1], "--inspect-ssrc-w64")
+                self.assertEqual(argv[-2:], ["16", "signed_integer"])
+                admitted = {
+                    "sample_frames": 3,
+                    "declared_data_bytes": len(payload),
+                    "physical_file_bytes": len(bytes_),
+                    "trailing_bytes_after_data": 6,
+                }
+                return q.subprocess.CompletedProcess(argv, 0, json.dumps(admitted), "")
+
+            with mock.patch.object(q, "invoke", side_effect=helper_invoke):
+                parsed = q.parse_w64(path, rate, channels, Path("/helper"))
             self.assertEqual(parsed["payload"], payload)
-            self.assertEqual(parsed["frames"], 5)
-            self.assertEqual(parsed["ssrc_trailing_padding_bytes"], 2)
+            self.assertEqual(parsed["ssrc_trailing_padding_bytes"], 6)
 
             mutated = bytearray(bytes_)
             mutated[-1] = 1
             path.write_bytes(mutated)
-            with self.assertRaises(ValueError):
-                q.parse_w64(path, rate, channels)
+            rejected = q.subprocess.CompletedProcess(
+                [], 2, "", "Tonepoet SSRC Wave64 validation failed: non-zero trailing bytes"
+            )
+            with mock.patch.object(q, "invoke", return_value=rejected):
+                with self.assertRaisesRegex(ValueError, "production SSRC Wave64 validator rejected"):
+                    q.parse_w64(path, rate, channels, Path("/helper"))
+
+    def test_wave64_ssrc_helper_disagreement_is_fatal(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "ssrc-pad.w64"
+            rate = 48_000
+            payload = struct.pack("<hhh", 1, 2, 3)
+            fmt = struct.pack("<HHIIHH", 1, 1, rate, rate * 2, 2, 16)
+            body = (
+                q.W64_WAVE_GUID
+                + w64_chunk(q.W64_FMT_GUID, fmt)
+                + q.W64_DATA_GUID
+                + struct.pack("<Q", 24 + len(payload))
+                + payload
+                + b"\0" * 6
+            )
+            bytes_ = q.W64_RIFF_GUID + struct.pack("<Q", 24 + len(body)) + body
+            path.write_bytes(bytes_)
+            admitted = {
+                "sample_frames": 999,
+                "declared_data_bytes": len(payload),
+                "physical_file_bytes": len(bytes_),
+                "trailing_bytes_after_data": 6,
+            }
+            proc = q.subprocess.CompletedProcess([], 0, json.dumps(admitted), "")
+            with mock.patch.object(q, "invoke", return_value=proc):
+                with self.assertRaisesRegex(ValueError, "disagrees on sample_frames"):
+                    q.parse_w64(path, rate, 1, Path("/helper"))
 
 
 

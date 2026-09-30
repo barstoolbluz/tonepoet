@@ -101,7 +101,8 @@ pub struct W64ExactStructure {
     pub declared_data_bytes: u64,
     /// Exact sample frames derived from the data extent and block alignment.
     pub sample_frames: u64,
-    /// Total validated zero alignment padding bytes.
+    /// Total validated zero structural padding bytes. For the dedicated SSRC
+    /// path this includes the admitted final zero-only run after `data`.
     pub alignment_padding_bytes: u64,
 }
 
@@ -172,6 +173,27 @@ fn read_exact_at<R: Read + Seek>(
     reader.seek(SeekFrom::Start(offset))?;
     reader.read_exact(buffer)?;
     Ok(())
+}
+
+fn range_is_all_zero<R: Read + Seek>(
+    reader: &mut R,
+    offset: u64,
+    length: u64,
+) -> Result<bool, W64ValidationError> {
+    const BUFFER_BYTES: usize = 8192;
+    reader.seek(SeekFrom::Start(offset))?;
+    let mut remaining = length;
+    let mut buffer = [0_u8; BUFFER_BYTES];
+    while remaining > 0 {
+        let take = usize::try_from(remaining.min(BUFFER_BYTES as u64))
+            .map_err(|_| W64ValidationError::invalid("zero-padding extent is not addressable"))?;
+        reader.read_exact(&mut buffer[..take])?;
+        if buffer[..take].iter().any(|byte| *byte != 0) {
+            return Ok(false);
+        }
+        remaining -= take as u64;
+    }
+    Ok(true)
 }
 
 fn le_u16(bytes: &[u8]) -> u16 {
@@ -306,7 +328,7 @@ fn validate_exact_w64_pcm_inner<R: Read + Seek>(
     expected: W64PcmFormatExpectation,
     expected_sample_frames: Option<u64>,
     allow_final_alignment_padding: bool,
-    allow_ssrc_final_two_byte_padding: bool,
+    allow_ssrc_final_trailing_zero_padding: bool,
 ) -> Result<W64ExactStructure, W64ValidationError> {
     if expected.sample_rate_hz == 0 {
         return Err(W64ValidationError::invalid("expected sample rate must be non-zero"));
@@ -446,27 +468,30 @@ fn validate_exact_w64_pcm_inner<R: Read + Seek>(
             offset = chunk_end;
             break;
         }
-        // SSRC 2.4.2 can append exactly two zero bytes after its final `data`
-        // chunk without including them in the chunk size. This is not Wave64's
-        // 8-byte alignment rule, so only the dedicated SSRC validator admits it.
-        if allow_ssrc_final_two_byte_padding
-            && guid == W64_DATA_GUID
-            && declared_file_bytes - chunk_end == 2
-        {
-            let mut padding = [0_u8; 2];
-            read_exact_at(reader, chunk_end, &mut padding)?;
-            if padding.iter().any(|byte| *byte != 0) {
-                return Err(W64ValidationError::invalid(
-                    "non-zero SSRC two-byte trailing Wave64 padding",
-                ));
+        // The pinned SSRC 2.4.2 build can append a zero-only run after its
+        // final `data` chunk without including those bytes in the chunk size.
+        // The run is not Wave64 chunk payload and is not required to match the
+        // ordinary 8-byte alignment width. Only the dedicated SSRC validator
+        // admits it, and only when every remaining byte to the exact root/EOF
+        // extent is zero. Payload length, frame count, and format remain exact.
+        if allow_ssrc_final_trailing_zero_padding && guid == W64_DATA_GUID {
+            let aligned_chunk_end = align_up_8(chunk_end)?;
+            let trailing_bytes = declared_file_bytes - chunk_end;
+            // Never let the compatibility path weaken Wave64's ordinary
+            // chunk-alignment minimum. It may admit SSRC's extra zero tail,
+            // but it may not turn a truncated alignment pad into valid input.
+            if trailing_bytes > 0
+                && declared_file_bytes >= aligned_chunk_end
+                && range_is_all_zero(reader, chunk_end, trailing_bytes)?
+            {
+                alignment_padding_bytes = checked_add(
+                    alignment_padding_bytes,
+                    trailing_bytes,
+                    "alignment padding total",
+                )?;
+                offset = declared_file_bytes;
+                break;
             }
-            alignment_padding_bytes = checked_add(
-                alignment_padding_bytes,
-                2,
-                "alignment padding total",
-            )?;
-            offset = declared_file_bytes;
-            break;
         }
         let next_offset = align_up_8(chunk_end)?;
         if next_offset > declared_file_bytes {
@@ -656,13 +681,33 @@ pub fn validate_exact_w64_pcm<R: Read + Seek>(
     )
 }
 
+/// Inspect the PCM geometry emitted by the certified SSRC terminal.
+///
+/// Spec-compliant Wave64 is accepted unchanged. The pinned SSRC 2.4.2 build may
+/// also leave a zero-only run after its final data chunk. The dedicated SSRC
+/// path admits that run only through the exact root/physical extent; the data
+/// payload, PCM format, and all other structural invariants remain exact.
+pub fn inspect_ssrc_w64_pcm<R: Read + Seek>(
+    reader: &mut R,
+    expected: W64PcmFormatExpectation,
+) -> Result<W64ExactStructure, W64ValidationError> {
+    let exact_error = match validate_exact_w64_pcm_inner(reader, expected, None, false, false) {
+        Ok(structure) => return Ok(structure),
+        Err(error) => error,
+    };
+    match validate_exact_w64_pcm_inner(reader, expected, None, false, true) {
+        Ok(structure) => Ok(structure),
+        Err(ssrc_error) => Err(W64ValidationError::invalid(format!(
+            "exact validation failed ({exact_error}); SSRC trailing-zero validation failed ({ssrc_error})"
+        ))),
+    }
+}
+
 /// Validate the exact PCM geometry emitted by the certified SSRC terminal.
 ///
-/// Spec-compliant Wave64 is always accepted first. SSRC 2.4.2 additionally has
-/// one observed container quirk: it can append exactly two zero bytes after the
-/// final data chunk while leaving the data chunk's declared payload exact. The
-/// fallback admits only that byte pattern; exact payload length, frame count,
-/// PCM format, root extent, and every other structural invariant remain intact.
+/// This is the frame-authoritative production form of [`inspect_ssrc_w64_pcm`].
+/// It preserves the same SSRC-only trailing-zero policy while requiring the
+/// caller's exact frame count as well.
 pub fn validate_ssrc_w64_pcm<R: Read + Seek>(
     reader: &mut R,
     expected: W64PcmExpectation,
@@ -686,7 +731,7 @@ pub fn validate_ssrc_w64_pcm<R: Read + Seek>(
     ) {
         Ok(structure) => Ok(structure),
         Err(ssrc_error) => Err(W64ValidationError::invalid(format!(
-            "exact validation failed ({exact_error}); SSRC two-byte-pad validation failed ({ssrc_error})"
+            "exact validation failed ({exact_error}); SSRC trailing-zero validation failed ({ssrc_error})"
         ))),
     }
 }
@@ -988,9 +1033,12 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    fn ssrc_two_byte_padded_fixture(expected: W64PcmExpectation) -> Vec<u8> {
+    fn ssrc_trailing_zero_padded_fixture(
+        expected: W64PcmExpectation,
+        trailing_bytes: usize,
+    ) -> Vec<u8> {
         let mut bytes = fixture(expected, expected.encoding == W64SampleEncoding::FloatingPoint);
-        bytes.extend_from_slice(&[0, 0]);
+        bytes.extend(std::iter::repeat(0_u8).take(trailing_bytes));
         let file_len = bytes.len() as u64;
         bytes[16..24].copy_from_slice(&file_len.to_le_bytes());
         bytes
@@ -1043,32 +1091,57 @@ mod tests {
     }
 
     #[test]
-    fn ssrc_validator_accepts_only_its_exact_two_zero_byte_trailing_pad() {
+    fn ssrc_validator_accepts_zero_only_tail_to_root_extent() {
         let expected = W64PcmExpectation {
             sample_rate_hz: 192_000,
             channels: 1,
             bits_per_sample: 16,
-            sample_frames: 17_833,
+            sample_frames: 3,
             encoding: W64SampleEncoding::SignedInteger,
         };
-        let bytes = ssrc_two_byte_padded_fixture(expected);
+        // Six bytes follow the data chunk: two reach the ordinary 8-byte
+        // boundary and four more reproduce the R6 field probe defect.
+        let bytes = ssrc_trailing_zero_padded_fixture(expected, 6);
         assert!(validate_exact_w64_pcm(&mut Cursor::new(bytes.clone()), expected).is_err());
         let parsed = validate_ssrc_w64_pcm(&mut Cursor::new(bytes.clone()), expected).unwrap();
         assert_eq!(parsed.sample_frames, expected.sample_frames);
         assert_eq!(parsed.declared_data_bytes, expected.sample_frames * 2);
-        assert_eq!(parsed.alignment_padding_bytes, 2);
+        assert_eq!(parsed.alignment_padding_bytes, 6);
+
+        let inspected = inspect_ssrc_w64_pcm(
+            &mut Cursor::new(bytes.clone()),
+            W64PcmFormatExpectation::from(expected),
+        )
+        .unwrap();
+        assert_eq!(inspected.sample_frames, expected.sample_frames);
+
+        // Preserve the previously commissioned two-byte SSRC quirk as a
+        // strict subset of the generalized zero-tail rule.
+        let prior = W64PcmExpectation {
+            // Four mono Int16 frames end the data chunk on an 8-byte boundary,
+            // so the following two zeros are wholly SSRC trailing pad.
+            sample_frames: 4,
+            ..expected
+        };
+        let two_byte = ssrc_trailing_zero_padded_fixture(prior, 2);
+        assert!(validate_exact_w64_pcm(&mut Cursor::new(two_byte.clone()), prior).is_err());
+        let prior_parsed = validate_ssrc_w64_pcm(&mut Cursor::new(two_byte), prior).unwrap();
+        assert_eq!(prior_parsed.alignment_padding_bytes, 2);
+
+        // The compatibility path cannot excuse a truncated ordinary alignment
+        // pad: this 3-frame payload needs two bytes to reach an 8-byte boundary.
+        let underaligned = ssrc_trailing_zero_padded_fixture(expected, 1);
+        assert!(validate_ssrc_w64_pcm(&mut Cursor::new(underaligned), expected).is_err());
 
         let mut nonzero = bytes;
         let last = nonzero.len() - 1;
         nonzero[last] = 1;
         let error = validate_ssrc_w64_pcm(&mut Cursor::new(nonzero), expected).unwrap_err();
-        assert!(
-            error.to_string().contains("two-byte") || error.to_string().contains("non-zero")
-        );
+        assert!(error.to_string().contains("SSRC trailing-zero validation failed"));
     }
 
     #[test]
-    fn ssrc_two_byte_pad_does_not_weaken_exact_frame_extent() {
+    fn ssrc_trailing_zero_pad_does_not_weaken_exact_frame_extent() {
         let actual = W64PcmExpectation {
             sample_rate_hz: 192_000,
             channels: 1,
@@ -1076,7 +1149,7 @@ mod tests {
             sample_frames: 11,
             encoding: W64SampleEncoding::SignedInteger,
         };
-        let bytes = ssrc_two_byte_padded_fixture(actual);
+        let bytes = ssrc_trailing_zero_padded_fixture(actual, 6);
         let expected = W64PcmExpectation {
             sample_frames: 12,
             ..actual
