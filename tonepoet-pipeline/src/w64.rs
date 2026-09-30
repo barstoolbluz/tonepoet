@@ -468,22 +468,18 @@ fn validate_exact_w64_pcm_inner<R: Read + Seek>(
             offset = chunk_end;
             break;
         }
-        // The pinned SSRC 2.4.2 build can append a zero-only run after its
+        // The pinned SSRC 2.4.2 build can leave a zero-only run after its
         // final `data` chunk without including those bytes in the chunk size.
-        // The run is not Wave64 chunk payload and is not required to match the
-        // ordinary 8-byte alignment width. Only the dedicated SSRC validator
-        // admits it, and only when every remaining byte to the exact root/EOF
-        // extent is zero. Payload length, frame count, and format remain exact.
+        // Observed carriers may stop short of, land on, or run beyond the
+        // ordinary 8-byte alignment boundary. The run is not audio payload.
+        // Only the dedicated SSRC validator admits it, and only when every
+        // remaining byte to the exact root/EOF extent is zero. A genuinely
+        // truncated declared chunk was already rejected above by `chunk_end >
+        // declared_file_bytes`; payload length, frame count, and format remain
+        // exact below.
         if allow_ssrc_final_trailing_zero_padding && guid == W64_DATA_GUID {
-            let aligned_chunk_end = align_up_8(chunk_end)?;
             let trailing_bytes = declared_file_bytes - chunk_end;
-            // Never let the compatibility path weaken Wave64's ordinary
-            // chunk-alignment minimum. It may admit SSRC's extra zero tail,
-            // but it may not turn a truncated alignment pad into valid input.
-            if trailing_bytes > 0
-                && declared_file_bytes >= aligned_chunk_end
-                && range_is_all_zero(reader, chunk_end, trailing_bytes)?
-            {
+            if trailing_bytes > 0 && range_is_all_zero(reader, chunk_end, trailing_bytes)? {
                 alignment_padding_bytes = checked_add(
                     alignment_padding_bytes,
                     trailing_bytes,
@@ -1128,16 +1124,88 @@ mod tests {
         let prior_parsed = validate_ssrc_w64_pcm(&mut Cursor::new(two_byte), prior).unwrap();
         assert_eq!(prior_parsed.alignment_padding_bytes, 2);
 
-        // The compatibility path cannot excuse a truncated ordinary alignment
-        // pad: this 3-frame payload needs two bytes to reach an 8-byte boundary.
-        let underaligned = ssrc_trailing_zero_padded_fixture(expected, 1);
-        assert!(validate_ssrc_w64_pcm(&mut Cursor::new(underaligned), expected).is_err());
-
         let mut nonzero = bytes;
         let last = nonzero.len() - 1;
         nonzero[last] = 1;
         let error = validate_ssrc_w64_pcm(&mut Cursor::new(nonzero), expected).unwrap_err();
         assert!(error.to_string().contains("SSRC trailing-zero validation failed"));
+    }
+
+    #[test]
+    fn ssrc_validator_accepts_short_zero_alignment_tail() {
+        let expected = W64PcmExpectation {
+            sample_rate_hz: 192_000,
+            channels: 1,
+            bits_per_sample: 8,
+            sample_frames: 1,
+            encoding: W64SampleEncoding::SignedInteger,
+        };
+
+        // The complete one-byte payload ends one byte past an 8-byte boundary
+        // and ordinarily needs seven zero bytes before another chunk. SSRC can
+        // end the root/physical extent inside that alignment interval. Exercise
+        // every genuinely short zero-tail width; the generic exact validator
+        // remains strict while the dedicated SSRC path admits the carrier.
+        for trailing_bytes in 1..7 {
+            let bytes = ssrc_trailing_zero_padded_fixture(expected, trailing_bytes);
+            assert!(validate_exact_w64_pcm(&mut Cursor::new(bytes.clone()), expected).is_err());
+            let parsed = validate_ssrc_w64_pcm(&mut Cursor::new(bytes), expected).unwrap();
+            assert_eq!(parsed.sample_frames, expected.sample_frames);
+            assert_eq!(parsed.declared_data_bytes, 1);
+            assert_eq!(parsed.alignment_padding_bytes, trailing_bytes as u64);
+        }
+    }
+
+    #[test]
+    fn ssrc_short_alignment_tail_covers_affected_integer_widths() {
+        for bits_per_sample in [8_u16, 16, 24] {
+            let expected = W64PcmExpectation {
+                sample_rate_hz: 192_000,
+                channels: 1,
+                bits_per_sample,
+                sample_frames: 1,
+                encoding: W64SampleEncoding::SignedInteger,
+            };
+            let bytes = ssrc_trailing_zero_padded_fixture(expected, 1);
+            assert!(validate_exact_w64_pcm(&mut Cursor::new(bytes.clone()), expected).is_err());
+            let parsed = validate_ssrc_w64_pcm(&mut Cursor::new(bytes), expected).unwrap();
+            assert_eq!(parsed.sample_frames, 1);
+            assert_eq!(parsed.declared_data_bytes, u64::from(bits_per_sample / 8));
+            assert_eq!(parsed.alignment_padding_bytes, 1);
+        }
+    }
+
+    #[test]
+    fn ssrc_short_alignment_tail_must_be_zero() {
+        let expected = W64PcmExpectation {
+            sample_rate_hz: 192_000,
+            channels: 1,
+            bits_per_sample: 8,
+            sample_frames: 1,
+            encoding: W64SampleEncoding::SignedInteger,
+        };
+        let mut bytes = ssrc_trailing_zero_padded_fixture(expected, 3);
+        *bytes.last_mut().unwrap() = 1;
+        let error = validate_ssrc_w64_pcm(&mut Cursor::new(bytes), expected).unwrap_err();
+        assert!(error.to_string().contains("SSRC trailing-zero validation failed"));
+    }
+
+    #[test]
+    fn ssrc_short_alignment_policy_does_not_admit_truncated_data_chunk() {
+        let expected = W64PcmExpectation {
+            sample_rate_hz: 192_000,
+            channels: 1,
+            bits_per_sample: 16,
+            sample_frames: 3,
+            encoding: W64SampleEncoding::SignedInteger,
+        };
+        let mut bytes = fixture(expected, false);
+        bytes.pop();
+        let physical_len = bytes.len() as u64;
+        bytes[16..24].copy_from_slice(&physical_len.to_le_bytes());
+
+        let error = validate_ssrc_w64_pcm(&mut Cursor::new(bytes), expected).unwrap_err();
+        assert!(error.to_string().contains("beyond declared/physical extent"));
     }
 
     #[test]
