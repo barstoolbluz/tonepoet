@@ -26,10 +26,21 @@ the same 209.067 seconds of audio. The expectation is in source-rate samples,
 the actual is in target-rate samples, and they are compared directly with a
 tolerance of zero.
 
-The rate guard immediately above the drift comparison — which rejects a
-mismatch between the expectation's sample rate and the probed rate — did not
-fire. The expectation therefore carries a sample count with no rate attached
-to expose the inconsistency.
+The machinery to handle this exists and was not used.
+`post_encode_sample_expectation_from_source` rescales via
+`resampled_sample_count` when source and target rates differ, sets the target
+rate, marks the expectation resampled, and attaches an SSRC filter-tail
+allowance. Two signals say that branch was skipped and the `same_rate`
+fallback taken instead: the tolerance is 0, where the resampled branch would
+carry a non-zero SSRC FIR-tail allowance; and the rate guard above the drift
+comparison passed, which the fallback permits because it still records the
+target rate while leaving the count unscaled.
+
+Why the rescaling branch was skipped is not established. One candidate is
+`source_sample_rate` arriving as `None`, which selects the fallback. There is
+a recovery path that re-probes the realized input when the source rate is
+missing, and it logs when it runs; it did not log during this conversion.
+That is a lead, not a finding.
 
 This is the same family as issue #55: rate-change accounting where one side of
 a comparison was never brought into the other's domain. Different site —

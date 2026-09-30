@@ -3659,10 +3659,19 @@ track validation failed: post-encode sample drift for lossless output
 the same 209.067 seconds of audio: the expectation is in source-rate samples, the actual is
 in target-rate samples, and the check compares them directly with a tolerance of zero.
 
-The rate guard immediately above the drift comparison, which rejects a mismatch between
-`expected.sample_rate` and the probed rate, did not fire. So the expectation carries a
-source-domain sample count without a sample rate that would have exposed the
-inconsistency.
+The machinery to handle this exists and was not used.
+`post_encode_sample_expectation_from_source` rescales through `resampled_sample_count`
+when source and target rates differ, records the target rate, marks the expectation
+resampled and attaches an SSRC filter-tail allowance. Two signals say the `same_rate`
+fallback was taken instead: the reported tolerance is 0, where the resampled branch would
+carry a non-zero SSRC FIR-tail allowance; and the rate guard above the drift comparison
+passed, which the fallback permits because it still records the target rate while leaving
+the count unscaled.
+
+Why the rescaling branch was skipped is unresolved. `source_sample_rate` arriving as
+`None` would select the fallback; a recovery path re-probes the realized input in that
+case and logs when it does, and it did not log during this conversion. Lead, not
+finding.
 
 This is the same family as issue #55 — rate-change accounting where one side of a
 comparison was never converted into the other's domain — but at a different site:
