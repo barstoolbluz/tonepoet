@@ -3658,6 +3658,27 @@ cells.
 
 ## 58. Post-encode sample drift compares a source-rate expectation against a target-rate output
 
+> **RESOLVED 2026-09-30.** Field-verified: AC/DC *Back in Black* converts from the 192 kHz
+> WavPack image to ten FLAC tracks at s16/44.1 kHz.
+>
+> The cause was not the `source_sample_rate=None` lead recorded below.
+> `prepare_final_execution_input()` rewrote `planner_track.sample_rate` to the replay
+> target rate after the certified SSRC terminal had consumed the rate edge, but left
+> `expected_samples` in the source domain. The post-encode helper then correctly saw
+> rate == target and built a strict same-rate expectation around a mislabelled count.
+>
+> The fix binds count and rate together at that same point:
+> `verify_ssrc_true_peak_terminal_conformance()` already establishes the exact
+> target-domain frame extent, so `SsrcTerminalConformance` now carries it and the replay
+> boundary binds `expected_samples` to it. No rescaling at the final check and no
+> tolerance change — the lossless drift check stays at `allowed 0`.
+>
+> The scheduler's cancellation classifier also gained the exact
+> `certified SSRC true-peak terminal execution failed: tool cancelled` wrapper.
+> A third wrapper, `certified SSRC terminal conformance verification cancelled`, was
+> observed once on a stale binary and has not been seen since; if collateral masking
+> recurs, that is the next one to add.
+
 Filed 2026-09-30. AC/DC, *Back in Black* (Japan Atlantic P-10906A), one WavPack image with
 a sidecar CUE, 10 tracks, 192 kHz source. FLAC, Int16, TPDF, album true-peak, target
 44.1 kHz — the conversion that motivated commissioning the SSRC true-peak registry, run
