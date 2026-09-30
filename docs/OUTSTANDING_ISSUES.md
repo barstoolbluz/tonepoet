@@ -3558,3 +3558,83 @@ count the user has no way to act on.
 
 The count-agreement guard itself stays. It caught a real inconsistency; it
 should not be relaxed to let a 14-vs-1 mismatch through.
+
+## 57. SSRC emits a four-byte Wave64 trailing pad; tonepoet and its qualification harness accept only two
+
+Filed 2026-09-30. Found while trying to commission the SSRC true-peak terminal after a
+field failure: AC/DC, *Back in Black* (Japan Atlantic P-10906A), 192 kHz to 44.1 kHz,
+FLAC Int16, TPDF, album true-peak. The conversion refused with
+
+```
+PCM true-peak analysis failed: SSRC true-peak terminal cell is not commissioned for
+profile High, 192000 -> 44100 Hz, 2 ch, Int16, dither Some(99)/Some(Triangular);
+run qualification/ssrc_true_peak_terminal/qualify_ssrc_true_peak_terminal.py on this
+machine and promote its generated registry
+```
+
+That refusal is correct — `COMMISSIONED_SSRC_TRUE_PEAK_TERMINALS` ships empty by design.
+The defect is that the commissioning run cannot be performed.
+
+### What happens
+
+`qualify_ssrc_true_peak_terminal.py` dies during `discover_ssrc_dither_capabilities`,
+before any cell is characterized:
+
+```
+ValueError: Wave64 failed exact parsing (truncated Wave64 chunk header) and narrow
+SSRC two-byte trailing-pad parsing (truncated Wave64 chunk header)
+```
+
+44.1 kHz sorts first among the probe rates, so the harness fails immediately.
+
+### Minimal reproduction
+
+48000 -> 44100 Hz, 64 frames, mono, 16-bit, `--dither 99 --pdf 1 --dstContainer w64`,
+against the pinned `ssrc-2.4.2` build. The 228-byte output:
+
+```
+root size field: 228            (agrees with the physical file length)
+  fmt  chunk @40  size 40  -> end 80,  aligned 80
+  data chunk @80  size 142 -> end 222, aligned 224
+stopped at 224; 4 bytes remain: 00000000
+```
+
+SSRC writes four zero bytes past the eight-aligned end of its final chunk. Both
+validators admit exactly two: the harness checks `len(data) - end == 2`, and tonepoet's
+production validator checks `declared_file_bytes - chunk_end == 2` in
+`tonepoet-pipeline/src/w64.rs`, pinned by a test named
+`ssrc_validator_accepts_only_its_exact_two_zero_byte_trailing_pad`. The harness mirrors
+production exactly; neither is more permissive than the other.
+
+It is frame-count dependent. A one-second fixture at every probe rate crossed with all
+22 admitted dither IDs — 132 combinations — parses without a single failure. The
+harness's 64-frame probe does not.
+
+### Why the shipped evidence cannot be promoted instead
+
+`outcome_operator_2026-09-28` characterizes 4,536 cells and includes the exact cell this
+album needs, `high:192000:44100:2:16:99:triangular`, as `passed`. It cannot be promoted:
+its own identity file records `"outcome": "not_qualified"`, only 2,382 of 4,536 cells
+passed, and `promote_ssrc_true_peak_terminal.py` refuses any report containing a
+non-passing cell. Its failure classes are dominated by this same defect —
+`w64_alignment_padding` 447 and `w64_truncated_chunk_header` 345, together 792 cells or
+17% of the grid, failing on Wave64 parsing rather than on anything numerical. The R6
+handoff also specifies a corrected grid of 4,368 cells, so that run is superseded on its
+own terms.
+
+### Required
+
+The SSRC true-peak terminal grid can be qualified on the build host, and the AC/DC
+conversion succeeds once its cell is commissioned. Wave64 written by the pinned SSRC
+build and Wave64 accepted by tonepoet agree, with the rule stated once and enforced
+identically in the production validator and the qualification harness.
+
+Three candidate owners, unresolved here: `ssrc` emits two bytes or none; both validators
+accept any run of trailing zeros up to the declared root size; or the writer includes the
+pad in the data chunk's declared size. `ssrc` is our own fork so any of the three is
+reachable, but the exactly-two rule is deliberate in production code with a test pinning
+it, and relaxing it is a decision about what Wave64 tonepoet will accept as certified
+evidence.
+
+Do not hand-author registry records, and do not promote a report containing non-passing
+cells.
