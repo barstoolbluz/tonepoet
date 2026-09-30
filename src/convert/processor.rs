@@ -2332,6 +2332,7 @@ fn scheduler_cancellation_failure(output: &ScheduledTrackOutput) -> bool {
         reason,
         "cancelled"
             | "tool cancelled"
+            | "certified SSRC true-peak terminal execution failed: tool cancelled"
             | "PCM true-peak scan cancelled"
             | "PCM true-peak analysis cancelled"
             | "PCM true-peak gain cancelled"
@@ -6579,6 +6580,27 @@ mod tests {
             ),
         );
         assert!(!scheduler_cancellation_failure(&merely_mentions_cancellation));
+
+        let ssrc_terminal_cancelled = scheduler_failure_test_output(
+            0,
+            1,
+            TrackOutcome::Err(
+                "certified SSRC true-peak terminal execution failed: tool cancelled".to_string(),
+            ),
+        );
+        assert!(scheduler_cancellation_failure(&ssrc_terminal_cancelled));
+
+        let ssrc_terminal_independent_failure = scheduler_failure_test_output(
+            0,
+            1,
+            TrackOutcome::Err(
+                "certified SSRC true-peak terminal execution failed: backend rejected input"
+                    .to_string(),
+            ),
+        );
+        assert!(!scheduler_cancellation_failure(
+            &ssrc_terminal_independent_failure
+        ));
     }
 
     #[test]
@@ -6609,6 +6631,59 @@ mod tests {
         assert!(
             !collateral.contains(&independent.record.track_id),
             "a genuine backend failure after fail-fast starts is still a real peer failure",
+        );
+    }
+
+    #[test]
+    fn scheduler_failure_provenance_classifies_certified_ssrc_terminal_cancel_as_collateral() {
+        let primary = scheduler_failure_test_output(
+            6,
+            7,
+            TrackOutcome::Err("post-encode sample validation failed".to_string()),
+        );
+        let mut cause = None;
+        let mut collateral = BTreeSet::new();
+        assert!(record_scheduler_failure_provenance(
+            false,
+            &AlbumReadiness::Failed {
+                finished: 1,
+                expected: 10,
+                failed: 1,
+            },
+            &primary,
+            &mut cause,
+            &mut collateral,
+        ));
+
+        let cancelled = scheduler_failure_test_output(
+            4,
+            5,
+            TrackOutcome::Err(
+                "certified SSRC true-peak terminal execution failed: tool cancelled".to_string(),
+            ),
+        );
+        assert!(!record_scheduler_failure_provenance(
+            true,
+            &AlbumReadiness::Failed {
+                finished: 2,
+                expected: 10,
+                failed: 2,
+            },
+            &cancelled,
+            &mut cause,
+            &mut collateral,
+        ));
+
+        assert_eq!(
+            cause.as_ref().map(|cause| cause.track_id.source_ordinal),
+            Some(7),
+        );
+        assert_eq!(
+            collateral
+                .iter()
+                .map(|track_id| track_id.source_ordinal)
+                .collect::<Vec<_>>(),
+            vec![5],
         );
     }
 

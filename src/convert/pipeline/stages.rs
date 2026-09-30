@@ -3962,6 +3962,15 @@ struct FinalExecutionInput {
     prefix_elapsed: Duration,
 }
 
+fn bind_certified_ssrc_terminal_sample_domain(
+    track: &mut PreparedTrack,
+    sample_rate_hz: u32,
+    sample_frames: u64,
+) {
+    track.expected_samples = Some(sample_frames);
+    track.sample_rate = Some(sample_rate_hz);
+}
+
 /// Preserve the certified pre-observation rate realization as runtime execution
 /// state before later carrier handling can change the concrete source-ref
 /// representation.  Unknown source rate stays fail-closed: it never authorizes
@@ -4069,18 +4078,19 @@ async fn prepare_final_execution_input(
         ".tonepoet-ssrc-terminal-{track_stem}-{}.w64",
         &replay.ingress_sha256.to_hex()[..16],
     ));
-    let (terminal_command, terminal_elapsed) = realize_bound_ssrc_true_peak_terminal(
-        replay,
-        strong,
-        gain_db,
-        measured_carrier_path,
-        &terminal_path,
-        runner,
-        cancel,
-        tool_paths,
-        tool_concurrency_limits,
-    )
-    .await?;
+    let (terminal_command, terminal_elapsed, terminal_sample_frames) =
+        realize_bound_ssrc_true_peak_terminal(
+            replay,
+            strong,
+            gain_db,
+            measured_carrier_path,
+            &terminal_path,
+            runner,
+            cancel,
+            tool_paths,
+            tool_concurrency_limits,
+        )
+        .await?;
 
     let mut planner_track = track.clone();
     planner_track.source_ref = TrackSourceRef::RegisteredEffectCarrier {
@@ -4096,7 +4106,17 @@ async fn prepare_final_execution_input(
                 bit_depth: replay.binding.scope.target_bit_depth,
             },
     };
-    planner_track.sample_rate = Some(replay.target_rate_hz);
+    // The replay terminal is already in the final sample-rate domain, and its
+    // conformance check has just verified this exact frame extent against the
+    // measured carrier. Keep the planner track's count and rate in that same
+    // domain so the subsequent lossless encode remains an exact (zero-tolerance)
+    // sample-count check rather than comparing source-rate frames to target-rate
+    // frames or re-applying resampler tolerance after the rate edge was consumed.
+    bind_certified_ssrc_terminal_sample_domain(
+        &mut planner_track,
+        replay.target_rate_hz,
+        terminal_sample_frames,
+    );
 
     Ok(FinalExecutionInput {
         planner_track,
@@ -36853,6 +36873,7 @@ fn validate_ssrc_true_peak_terminal_probe(
 
 #[derive(Debug, Clone, Copy)]
 struct SsrcTerminalConformance {
+    sample_frames: u64,
     sample_values: u64,
     max_error_linear: f64,
 }
@@ -37034,6 +37055,7 @@ fn verify_ssrc_true_peak_terminal_conformance(
     }
 
     Ok(SsrcTerminalConformance {
+        sample_frames,
         sample_values,
         max_error_linear,
     })
@@ -37049,7 +37071,7 @@ async fn realize_bound_ssrc_true_peak_terminal(
     cancel: &CancellationToken,
     tool_paths: &HashMap<String, PathBuf>,
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
-) -> Result<(CommandRecord, Duration), (String, Vec<CommandRecord>)> {
+) -> Result<(CommandRecord, Duration, u64), (String, Vec<CommandRecord>)> {
     let fail = |message: String| (message, Vec::new());
     validate_ssrc_true_peak_replay_binding(replay, strong, gain_db).map_err(fail)?;
     if !replay.ingress_path.is_file() {
@@ -37218,7 +37240,7 @@ async fn realize_bound_ssrc_true_peak_terminal(
             )
         })?;
     }
-    Ok((command_record, tool_output.elapsed))
+    Ok((command_record, tool_output.elapsed, conformance.sample_frames))
 }
 
 
@@ -37790,7 +37812,7 @@ mod protected_ssrc_runtime_tests {
                 float_terminal_w64_fixture(44_100, 2, depth, &samples),
             )
             .expect("terminal fixture");
-            verify_ssrc_true_peak_terminal_conformance(
+            let conformance = verify_ssrc_true_peak_terminal_conformance(
                 &measured,
                 &terminal,
                 44_100,
@@ -37801,6 +37823,8 @@ mod protected_ssrc_runtime_tests {
                 &cancel,
             )
             .expect("exact floating terminal must conform");
+            assert_eq!(conformance.sample_frames, 2);
+            assert_eq!(conformance.sample_values, 4);
 
             let mut mutated = samples;
             mutated[2] += 1.0e-3;
@@ -75993,6 +76017,48 @@ mod validate_encoded_output_tests {
                 ssrc_fft_length: None,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn certified_ssrc_terminal_post_encode_expectation_is_exact_in_output_domain() {
+        let mut planner_track =
+            non_dvda_validation_test_track(Some(40_140_800), Some(192_000));
+        bind_certified_ssrc_terminal_sample_domain(&mut planner_track, 44_100, 9_219_840);
+        let settings = flac_settings_with_rate(RateTarget::PcmHz(44_100));
+
+        let expectation = post_encode_sample_expectation_from_source(
+            &planner_track,
+            planner_track.expected_samples,
+            planner_track.scalar_sample_rate(),
+            &settings,
+        )
+        .expect("terminal-domain expectation");
+        assert_eq!(
+            expectation,
+            PostEncodeSampleExpectation::same_rate(9_219_840, Some(44_100)),
+        );
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let out = temp.path().join("track.flac");
+        std::fs::write(&out, b"fake-flac").expect("write");
+        let runner = stub_with_probe(&ffprobe_exact_json(44_100, 9_219_841));
+        let cancel = CancellationToken::new();
+        let result = validate_encoded_output_with_tool_limits(
+            &out,
+            Some(expectation),
+            None,
+            &tonepoet_pipeline::AudioFormat::Flac,
+            &runner,
+            &cancel,
+            None,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(ConvertError::TrackValidation(message))
+                if message.contains("post-encode sample drift") && message.contains("allowed 0")
+        ));
     }
 
     #[test]
