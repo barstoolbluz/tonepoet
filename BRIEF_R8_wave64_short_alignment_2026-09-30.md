@@ -31,14 +31,30 @@ The rejection comes from production, not the harness. Your single-owner design
 is working exactly as intended; it is simply reporting a case the policy does
 not yet cover.
 
-## The two defects are visible in the existing evidence
+## The two defects are confirmed, not inferred
 
-The superseded 4,536-cell operator run separates them cleanly:
+We re-ran cells sampled from each historical failure class against the current
+build:
+
+| historical class | sampled | result now |
+|---|---|---|
+| `w64_truncated_chunk_header` | 4 | 4 pass — R6 fixed this class |
+| `w64_alignment_padding` | 4 requested, 3 returned | 3 fail, all with the short-alignment message |
+
+The fourth alignment cell, `high:44100:48000:1:16:99:triangular`, produced no
+result, most likely a rate-unsupported dither the harness skips.
+
+So the class names in the superseded run map onto real, current behavior rather
+than onto a guess about naming. The 4,536-cell run separates them cleanly:
 
 | class | cells | shape | status |
 |---|---|---|---|
 | `w64_truncated_chunk_header` | 345 | runs over the aligned end | fixed by R6 |
 | `w64_alignment_padding` | 447 | falls short of the aligned end | still failing |
+
+The 447 is the historical count for that class, not a measured count under the
+current build. It is the expected scale of the remaining work, given that every
+sampled cell from that class still fails the same way.
 
 It is not a single bit depth. The 447 break down as 234 at 8-bit, 129 at
 24-bit, 84 at 16-bit — whichever payload sizes leave the data chunk end off the
