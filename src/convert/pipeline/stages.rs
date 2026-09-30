@@ -82,7 +82,7 @@ use super::track_executor::{
     reference_metadata_toolchains_match, run_bound_tool_command_with_concurrency,
     run_tool_command_with_concurrency,
     verify_reference_metadata_toolchain_before_mutation, verify_reference_output_after_metadata,
-    CueStreamDirectTrackPlan, ReferenceToolchainEvidence,
+    CertifiedTruePeakTerminalExecutionState, CueStreamDirectTrackPlan, ReferenceToolchainEvidence,
 };
 pub use super::track_executor::ToolConcurrencyLimits;
 use super::plan_bridge::{
@@ -3957,8 +3957,51 @@ struct FinalExecutionInput {
     planner_track: PreparedTrack,
     realized_input: PathBuf,
     scalar_pump: Option<RetainedPcmScalarPump>,
+    certified_true_peak_execution: Option<CertifiedTruePeakTerminalExecutionState>,
     prefix_commands: Vec<CommandRecord>,
     prefix_elapsed: Duration,
+}
+
+/// Preserve the certified pre-observation rate realization as runtime execution
+/// state before later carrier handling can change the concrete source-ref
+/// representation.  Unknown source rate stays fail-closed: it never authorizes
+/// removal of a charged rate edge.
+pub(crate) fn certified_true_peak_terminal_execution_state(
+    track: &PreparedTrack,
+) -> Option<CertifiedTruePeakTerminalExecutionState> {
+    let TrackSourceRef::PcmTruePeakCarrier {
+        sample_rate_hz: measured_carrier_rate_hz,
+        gain_db: Some(_),
+        terminal_candidate: Some(terminal_candidate),
+        ..
+    } = &track.source_ref
+    else {
+        return None;
+    };
+
+    // The concrete carrier variant establishes that this is the waveform that
+    // certified true-peak preparation measured.  Whether the pre-observation
+    // *rate edge* was consumed is a separate execution fact: the retained
+    // charged candidate must name this carrier rate and the original source
+    // authority must name a different rate.  Capturing that fact here lets it
+    // survive later representation changes without teaching the final terminal
+    // about PcmTruePeakCarrier.
+    let charged_target_rate_hz = match terminal_candidate.terminal_realization.as_ref() {
+        Some(tonepoet_pipeline::SelectedTerminalRealization::Pcm(realization)) => {
+            realization.target_rate_hz
+        }
+        _ => None,
+    };
+    let pre_observation_rate_edge_consumed = charged_target_rate_hz
+        .is_some_and(|charged_rate_hz| charged_rate_hz == *measured_carrier_rate_hz)
+        && track
+            .scalar_sample_rate()
+            .is_some_and(|source_rate_hz| source_rate_hz != *measured_carrier_rate_hz);
+
+    Some(CertifiedTruePeakTerminalExecutionState {
+        measured_carrier_rate_hz: *measured_carrier_rate_hz,
+        pre_observation_rate_edge_consumed,
+    })
 }
 
 async fn prepare_final_execution_input(
@@ -3970,6 +4013,7 @@ async fn prepare_final_execution_input(
     tool_paths: &HashMap<String, PathBuf>,
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
 ) -> Result<FinalExecutionInput, (String, Vec<CommandRecord>)> {
+    let certified_true_peak_execution = certified_true_peak_terminal_execution_state(track);
     let TrackSourceRef::PcmTruePeakCarrier {
         path: measured_carrier_path,
         source_path,
@@ -3986,6 +4030,7 @@ async fn prepare_final_execution_input(
             planner_track: track.clone(),
             realized_input: realized.path,
             scalar_pump: realized.scalar_pump,
+            certified_true_peak_execution,
             prefix_commands: Vec::new(),
             prefix_elapsed: Duration::ZERO,
         });
@@ -4057,6 +4102,7 @@ async fn prepare_final_execution_input(
         planner_track,
         realized_input: terminal_path,
         scalar_pump: None,
+        certified_true_peak_execution,
         prefix_commands: vec![terminal_command],
         prefix_elapsed: terminal_elapsed,
     })
@@ -4410,7 +4456,12 @@ async fn convert_tracks_with_reporter_with_tool_paths(
     let record = convert_stage_record_for_tracks(
         &records,
         if failed && req.failure_policy == FailurePolicy::FailAlbumOnAnyTrackFailure {
-            StageOutcome::Failed(convert_stage_failure_message(&records))
+            StageOutcome::Failed(convert_stage_failure_message_with_context(
+                &records,
+                // Sequential conversion has no scheduler album-failure context;
+                // the helper falls back to the plain multi-failure message.
+                None,
+            ))
         } else {
             StageOutcome::Ok
         },
@@ -4422,6 +4473,37 @@ async fn convert_tracks_with_reporter_with_tool_paths(
             sidecars: Vec::new(),
         },
         record,
+    }
+}
+
+fn convert_stage_failure_message_with_context(
+    records: &[TrackRecord],
+    failure_context: Option<&ScheduledAlbumFailureContext>,
+) -> String {
+    let Some(context) = failure_context else {
+        return convert_stage_failure_message(records);
+    };
+    let additional = records
+        .iter()
+        .filter(|record| record.track_id != context.cause.track_id)
+        .filter(|record| !context.collateral_cancellations.contains(&record.track_id))
+        .filter(|record| {
+            matches!(
+                &record.outcome,
+                TrackOutcome::Err(reason) | TrackOutcome::Blocked(reason)
+                    if !reason.trim().is_empty()
+            )
+        })
+        .count();
+    if additional == 0 {
+        context.cause.error.clone()
+    } else {
+        format!(
+            "{} (+{} additional track failure{})",
+            context.cause.error,
+            additional,
+            if additional == 1 { "" } else { "s" },
+        )
     }
 }
 
@@ -4500,6 +4582,183 @@ mod convert_stage_failure_message_tests {
             convert_stage_failure_message(&records),
             "one or more tracks failed"
         );
+    }
+
+    #[test]
+    fn causal_album_failure_outranks_lower_index_collateral_cancellation() {
+        let cause_track = record(3, TrackOutcome::Err(
+            "backend encode failed: distinctive qualified terminal error".to_string(),
+        ));
+        let context = ScheduledAlbumFailureContext {
+            cause: ScheduledAlbumFailureCause {
+                track_index: 2,
+                track_id: cause_track.track_id.clone(),
+                error: "backend encode failed: distinctive qualified terminal error".to_string(),
+            },
+            collateral_cancellations: [1_u32, 2, 4, 5, 6, 7, 8]
+                .into_iter()
+                .map(|source_ordinal| TrackId {
+                    source_ordinal,
+                    disc_number: Some(1),
+                    track_number: source_ordinal,
+                })
+                .collect(),
+        };
+        let records = vec![
+            record(
+                1,
+                TrackOutcome::Err(
+                    "PCM true-peak measurement failed for track 1: PCM true-peak scan cancelled"
+                        .to_string(),
+                ),
+            ),
+            record(
+                2,
+                TrackOutcome::Err(
+                    "PCM true-peak measurement failed for track 2: PCM true-peak scan cancelled"
+                        .to_string(),
+                ),
+            ),
+            cause_track,
+            record(
+                4,
+                TrackOutcome::Err(
+                    "PCM true-peak measurement failed for track 4: PCM true-peak scan cancelled"
+                        .to_string(),
+                ),
+            ),
+            record(
+                5,
+                TrackOutcome::Err(
+                    "PCM true-peak measurement failed for track 5: PCM true-peak scan cancelled"
+                        .to_string(),
+                ),
+            ),
+            record(
+                6,
+                TrackOutcome::Err(
+                    "PCM true-peak measurement failed for track 6: PCM true-peak scan cancelled"
+                        .to_string(),
+                ),
+            ),
+            record(
+                7,
+                TrackOutcome::Err(
+                    "PCM true-peak measurement failed for track 7: PCM true-peak scan cancelled"
+                        .to_string(),
+                ),
+            ),
+            record(
+                8,
+                TrackOutcome::Err(
+                    "PCM true-peak measurement failed for track 8: PCM true-peak scan cancelled"
+                        .to_string(),
+                ),
+            ),
+        ];
+
+        assert_eq!(
+            convert_stage_failure_message_with_context(&records, Some(&context)),
+            "backend encode failed: distinctive qualified terminal error"
+        );
+    }
+
+    #[test]
+    fn causal_album_failure_keeps_independent_second_failure_but_not_cancellations() {
+        let cause_track = record(3, TrackOutcome::Err("primary backend error".to_string()));
+        let independent = record(6, TrackOutcome::Err("independent backend error".to_string()));
+        let context = ScheduledAlbumFailureContext {
+            cause: ScheduledAlbumFailureCause {
+                track_index: 2,
+                track_id: cause_track.track_id.clone(),
+                error: "primary backend error".to_string(),
+            },
+            collateral_cancellations: [1_u32, 2, 4, 5, 7, 8]
+                .into_iter()
+                .map(|source_ordinal| TrackId {
+                    source_ordinal,
+                    disc_number: Some(1),
+                    track_number: source_ordinal,
+                })
+                .collect(),
+        };
+        let records = vec![
+            record(
+                1,
+                TrackOutcome::Err(
+                    "PCM true-peak measurement failed for track 1: PCM true-peak scan cancelled"
+                        .to_string(),
+                ),
+            ),
+            record(
+                2,
+                TrackOutcome::Err(
+                    "PCM true-peak measurement failed for track 2: PCM true-peak scan cancelled"
+                        .to_string(),
+                ),
+            ),
+            cause_track,
+            record(
+                4,
+                TrackOutcome::Err(
+                    "PCM true-peak measurement failed for track 4: PCM true-peak scan cancelled"
+                        .to_string(),
+                ),
+            ),
+            record(
+                5,
+                TrackOutcome::Err(
+                    "PCM true-peak measurement failed for track 5: PCM true-peak scan cancelled"
+                        .to_string(),
+                ),
+            ),
+            independent,
+            record(
+                7,
+                TrackOutcome::Err(
+                    "PCM true-peak measurement failed for track 7: PCM true-peak scan cancelled"
+                        .to_string(),
+                ),
+            ),
+            record(
+                8,
+                TrackOutcome::Err(
+                    "PCM true-peak measurement failed for track 8: PCM true-peak scan cancelled"
+                        .to_string(),
+                ),
+            ),
+        ];
+
+        assert_eq!(
+            convert_stage_failure_message_with_context(&records, Some(&context)),
+            "primary backend error (+1 additional track failure)"
+        );
+    }
+
+    #[test]
+    fn terminal_status_prefers_causal_convert_stage_error_over_sorted_cancellations() {
+        let backend = "backend encode failed: qualified terminal lost resolved out_sample_rate";
+        let failed = vec![
+            record(1, TrackOutcome::Err("PCM true-peak scan cancelled".to_string())),
+            record(2, TrackOutcome::Err("PCM true-peak scan cancelled".to_string())),
+            record(3, TrackOutcome::Err(backend.to_string())),
+        ];
+        let stages = vec![convert_stage_record_for_tracks(
+            &failed,
+            StageOutcome::Failed(backend.to_string()),
+        )];
+        let outcome = AlbumOutcome::Blocked {
+            successful: Vec::new(),
+            failed,
+            stages,
+            reason: BlockReason::TrackFailures,
+        };
+
+        let status = map_album_outcome(&outcome, None, None, 0);
+        match status {
+            ConversionStatus::Failed { error, .. } => assert_eq!(error, backend),
+            other => panic!("expected failed conversion status, got {other:?}"),
+        }
     }
 }
 
@@ -4648,6 +4907,7 @@ async fn convert_one_track_work(
         planner_track,
         realized_input,
         scalar_pump,
+        certified_true_peak_execution,
         prefix_commands,
         prefix_elapsed,
     } = final_input;
@@ -4671,6 +4931,7 @@ async fn convert_one_track_work(
         &planner_track,
         &realized_input,
         scalar_pump,
+        certified_true_peak_execution,
         &staged_path,
         &convert_root,
         runner,
@@ -30321,6 +30582,19 @@ pub(crate) struct DsdAlbumGainScopeDisclosure {
     pub excluded_non_dsd_item_count: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScheduledAlbumFailureCause {
+    pub track_index: usize,
+    pub track_id: TrackId,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScheduledAlbumFailureContext {
+    pub cause: ScheduledAlbumFailureCause,
+    pub collateral_cancellations: BTreeSet<TrackId>,
+}
+
 /// Album state held by the global scheduler between materialization, track
 /// encoding, and album-level post-processing. The run lock stays alive for the
 /// whole album so two workers cannot mutate the same staging root.
@@ -30336,6 +30610,10 @@ pub struct ScheduledAlbum {
     /// independent-file member of an Album/Both batch. `Err` is a fail-closed
     /// barrier result: this item must not synthesize album gain from itself.
     pub(crate) batch_replaygain: Option<Result<crate::convert::replaygain::ReplayGainSourceScan, String>>,
+    /// Scheduler-only failure provenance.  Track outputs remain complete and
+    /// deterministically ordered; this context prevents cancellation fallout
+    /// from replacing the failure that actually triggered album fail-fast.
+    pub(crate) scheduler_failure_context: Option<ScheduledAlbumFailureContext>,
     pub(crate) reference_auto_gain_measurements: Vec<ReferenceAutoGainPreparedMeasurement>,
     pub(crate) dsd_true_peak_measurements: Vec<CertifiedTruePeakPreparedMeasurement>,
     pub(crate) pcm_true_peak_measurements: Vec<CertifiedTruePeakPreparedMeasurement>,
@@ -30709,6 +30987,7 @@ async fn retry_resolved_certified_true_peak_once_on_disk(
         stages: seed.stages,
         source_replaygain: seed.source_replaygain,
         batch_replaygain: seed.batch_replaygain,
+        scheduler_failure_context: None,
         reference_auto_gain_measurements: Vec::new(),
         dsd_true_peak_measurements: seed.dsd_true_peak_measurements,
         pcm_true_peak_measurements: seed.pcm_true_peak_measurements,
@@ -30786,6 +31065,7 @@ pub(crate) fn scheduled_album_for_test(
         stages,
         source_replaygain: None,
         batch_replaygain: None,
+        scheduler_failure_context: None,
         reference_auto_gain_measurements: Vec::new(),
         dsd_true_peak_measurements: Vec::new(),
         pcm_true_peak_measurements: Vec::new(),
@@ -38336,6 +38616,32 @@ async fn prepare_pcm_true_peak_carrier_for_track(
     })
 }
 
+#[cfg(test)]
+pub(crate) async fn prepare_pcm_true_peak_carrier_for_regression(
+    req: &PipelineRequest,
+    track: PreparedTrack,
+    planned_output: &Path,
+    staging: &StagingDir,
+    carrier_dir: &Path,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_paths: &HashMap<String, PathBuf>,
+) -> Result<(TrackSourceRef, CertifiedTruePeakPreparedMeasurement), String> {
+    let prepared = prepare_pcm_true_peak_carrier_for_track(
+        req,
+        track,
+        planned_output,
+        staging,
+        carrier_dir,
+        runner,
+        cancel,
+        tool_paths,
+        None,
+    )
+    .await?;
+    Ok((prepared.source_ref, prepared.measurement))
+}
+
 async fn prepare_pcm_true_peak_carriers(
     req: &PipelineRequest,
     prepared: &mut PreparedSource,
@@ -41486,6 +41792,7 @@ async fn prepare_pipeline_item_for_scheduler_scoped_inner(
         stages,
         source_replaygain: None,
         batch_replaygain: None,
+        scheduler_failure_context: None,
         reference_auto_gain_measurements,
         dsd_true_peak_measurements,
         pcm_true_peak_measurements,
@@ -43556,6 +43863,7 @@ pub async fn encode_realized_track_for_scheduler_with_tool_limits_and_version_ca
         planner_track,
         realized_input,
         scalar_pump,
+        certified_true_peak_execution,
         prefix_commands,
         prefix_elapsed,
     } = final_input;
@@ -43565,6 +43873,7 @@ pub async fn encode_realized_track_for_scheduler_with_tool_limits_and_version_ca
         &planner_track,
         &realized_input,
         scalar_pump,
+        certified_true_peak_execution,
         &staged_path,
         &realized.convert_root,
         &runner,
@@ -43709,6 +44018,7 @@ fn convert_result_from_scheduled_outputs(
     source: &PreparedSource,
     outputs: Vec<ScheduledTrackOutput>,
     req: &PipelineRequest,
+    failure_context: Option<&ScheduledAlbumFailureContext>,
 ) -> ConvertStageResult {
     let mut records_by_index: Vec<Option<TrackRecord>> = vec![None; source.tracks.len()];
     let mut artifacts_by_index: Vec<Option<TrackArtifact>> = vec![None; source.tracks.len()];
@@ -43742,7 +44052,10 @@ fn convert_result_from_scheduled_outputs(
     let record = convert_stage_record_for_tracks(
         &records,
         if failed && req.failure_policy == FailurePolicy::FailAlbumOnAnyTrackFailure {
-            StageOutcome::Failed(convert_stage_failure_message(&records))
+            StageOutcome::Failed(convert_stage_failure_message_with_context(
+                &records,
+                failure_context,
+            ))
         } else {
             StageOutcome::Ok
         },
@@ -43823,6 +44136,7 @@ pub(crate) async fn finish_pipeline_album_for_scheduler_with_tool_limits_and_ret
     let certified_true_peak_scratch_authority = certified_true_peak_retry_seed.is_some()
         || resolved_album_gain_scratch_authority;
     let run_timing = album.run_timing.clone();
+    let scheduler_failure_context = album.scheduler_failure_context.clone();
     let action_output = album.action_output;
     let source_replaygain = album.source_replaygain;
     let batch_replaygain = album.batch_replaygain;
@@ -43842,7 +44156,12 @@ pub(crate) async fn finish_pipeline_album_for_scheduler_with_tool_limits_and_ret
     let publication_binding;
 
     emit_stage_started(reporter, &item_id, PipelineStage::Convert).await;
-    let converted = convert_result_from_scheduled_outputs(&source_value, track_outputs, &req);
+    let converted = convert_result_from_scheduled_outputs(
+        &source_value,
+        track_outputs,
+        &req,
+        scheduler_failure_context.as_ref(),
+    );
     emit_stage_finished(reporter, &item_id, converted.record.clone()).await;
     stages.push(converted.record.clone());
     let tracks = converted.tracks.clone();
@@ -53508,17 +53827,23 @@ pub fn map_album_outcome(
             stages,
             ..
         } => {
+            let convert_error = (!failed.is_empty()).then(|| {
+                stages.iter().rev().find_map(|r| match (&r.stage, &r.outcome) {
+                    (PipelineStage::Convert, StageOutcome::Failed(err)) => Some(err.clone()),
+                    _ => None,
+                })
+            }).flatten();
             let stage_error = stages.iter().rev().find_map(|r| match &r.outcome {
                 StageOutcome::Failed(err) => Some(format!("{:?}: {}", r.stage, err)),
                 _ => None,
             });
             let track_error = (!failed.is_empty()).then(|| convert_stage_failure_message(failed));
-            // A failed track carries the executor's actionable sentence (for
-            // example an FFmpeg muxer refusal or a Reference qualification
-            // mismatch). Prefer it to the stage-level summary so Queue and
-            // History do not collapse the real cause into a generic stage
-            // label. Stage-only failures still retain their diagnostic.
-            let error = track_error
+            // The scheduler's Convert-stage diagnostic may carry causal failure
+            // provenance that cannot be reconstructed from index-sorted track
+            // records after fail-fast cancellation. Prefer that exact sentence;
+            // non-scheduler paths produce the same ordinary track summary.
+            let error = convert_error
+                .or(track_error)
                 .or(stage_error)
                 .unwrap_or_else(|| format!("album blocked: {:?}", reason));
             ConversionStatus::Failed { error, log_path }
@@ -66830,6 +67155,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                 stages: Vec::new(),
                 source_replaygain: None,
                 batch_replaygain: None,
+                scheduler_failure_context: None,
                 reference_auto_gain_measurements: Vec::new(),
                 dsd_true_peak_measurements: Vec::new(),
                 pcm_true_peak_measurements: Vec::new(),

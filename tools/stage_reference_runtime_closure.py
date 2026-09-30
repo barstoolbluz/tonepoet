@@ -231,16 +231,76 @@ def patch_dynamic_elf(path: Path, *, stage_root: Path, store_root: Path, patchel
     }
 
 
-def rewrite_absolute_symlinks(stage_root: Path, store_root: Path) -> int:
+REFERENCE_IRRELEVANT_EXTERNAL_SYMLINK_POLICY = "bluez-host-config/v1"
+BLUEZ_HOST_CONFIG_LINKS = frozenset({"input.conf", "main.conf", "network.conf"})
+
+
+def reference_irrelevant_external_symlink(
+    link: Path, *, stage_root: Path, target_text: str
+) -> bool:
+    """Return true only for BlueZ daemon host-config indirections.
+
+    The ffmpeg-full closure can pull BlueZ into the Nix requisites even though
+    Reference does not run bluetoothd or consume its daemon configuration.
+    Nix's BlueZ output deliberately exposes /etc/bluetooth/*.conf as absolute
+    host-configuration symlinks. Preserving those links would make the package
+    host-dependent; copying host /etc bytes would be worse. Omit exactly the
+    three known daemon-config links so an accidental read fails deterministically
+    with ENOENT, and keep every other external absolute symlink fail-closed.
+    """
+    try:
+        relative = link.relative_to(stage_root / Path(PRIVATE_STORE))
+    except ValueError:
+        return False
+    if len(relative.parts) != 4:
+        return False
+    store_object, etc_dir, bluetooth_dir, name = relative.parts
+    if not store_object.endswith("-bluez-5.84"):
+        return False
+    if (etc_dir, bluetooth_dir) != ("etc", "bluetooth"):
+        return False
+    if name not in BLUEZ_HOST_CONFIG_LINKS:
+        return False
+    return target_text == f"/etc/bluetooth/{name}"
+
+
+def rewrite_absolute_symlinks(
+    stage_root: Path,
+    store_root: Path,
+    *,
+    omitted_external: list[dict[str, str]] | None = None,
+) -> int:
     count = 0
-    # Snapshot the paths first because each rewrite replaces the directory entry.
-    links = [p for p in stage_root.rglob("*") if p.is_symlink()]
+    # Snapshot and sort first because each rewrite/omission replaces a directory
+    # entry and the recorded omission list is part of deterministic staging metadata.
+    links = sorted(
+        (p for p in stage_root.rglob("*") if p.is_symlink()),
+        key=lambda p: p.as_posix(),
+    )
     for link in links:
         target_text = os.readlink(link)
         if not os.path.isabs(target_text):
             continue
         source_target = Path(target_text)
         if not within(source_target, store_root):
+            if reference_irrelevant_external_symlink(
+                link, stage_root=stage_root, target_text=target_text
+            ):
+                parent_mode = stat.S_IMODE(link.parent.stat().st_mode)
+                try:
+                    link.parent.chmod(parent_mode | stat.S_IWUSR | stat.S_IXUSR)
+                    link.unlink()
+                finally:
+                    link.parent.chmod(parent_mode)
+                if omitted_external is not None:
+                    omitted_external.append(
+                        {
+                            "path": link.relative_to(stage_root).as_posix(),
+                            "target": target_text,
+                            "policy": REFERENCE_IRRELEVANT_EXTERNAL_SYMLINK_POLICY,
+                        }
+                    )
+                continue
             raise StageError(f"absolute symlink points outside Nix store: {link} -> {target_text}")
         staged_target = staged_store_path(stage_root, store_root, source_target)
         if not staged_target.exists() and not staged_target.is_symlink():
@@ -552,7 +612,12 @@ def main() -> int:
     temp_manifest.unlink(missing_ok=True)
     try:
         copy_requisites(requisites, stage_root=temp_root, store_root=store_root, cp=args.cp)
-        absolute_symlinks_rewritten = rewrite_absolute_symlinks(temp_root, store_root)
+        omitted_external_symlinks: list[dict[str, str]] = []
+        absolute_symlinks_rewritten = rewrite_absolute_symlinks(
+            temp_root,
+            store_root,
+            omitted_external=omitted_external_symlinks,
+        )
 
         patch_counts = {"dynamic_elf": 0, "rpath_entries_rewritten": 0, "needed_entries_rewritten": 0}
         for path in sorted((p for p in temp_root.rglob("*") if p.is_file() and not p.is_symlink()), key=lambda p: p.as_posix()):
@@ -584,6 +649,7 @@ def main() -> int:
             "requisite_store_path_count": len(requisites),
             "requisite_store_paths": [str(path) for path in requisites],
             "absolute_symlinks_rewritten": absolute_symlinks_rewritten,
+            "external_absolute_symlinks_omitted": omitted_external_symlinks,
             "elf_patch_counts": patch_counts,
             "entrypoints": entrypoints,
             "private_dependency_resolution": private_resolution,
@@ -617,6 +683,7 @@ def main() -> int:
         print(f"requisite_store_paths={len(requisites)}")
         print(f"dynamic_elf={patch_counts['dynamic_elf']}")
         print(f"absolute_symlinks_rewritten={absolute_symlinks_rewritten}")
+        print(f"external_absolute_symlinks_omitted={len(omitted_external_symlinks)}")
         return 0
     finally:
         if temp_root.exists():

@@ -49,7 +49,7 @@ use crate::convert::pipeline::{
     RealToolRunner, ScheduledAlbum, ScheduledMaterialization,
     ScheduledCueStreamTrack, ScheduledRealizedTrack, ScheduledTrackOutput, SchedulerMetrics, SchedulerMetricsSnapshot,
     ScratchStagingConfig, SharedWorkerPool, SourceAudioCoding, SourceKind, StageOutcome, ToolBinary,
-    ToolConcurrencyLimits, TrackMetadata, TrackOutcome, TrackSourceRef, TrySubmitError, WorkKind,
+    ToolConcurrencyLimits, TrackId, TrackMetadata, TrackOutcome, TrackSourceRef, TrySubmitError, WorkKind,
     WorkUnit,
     source_text_tag_key_from_extra,
 };
@@ -61,7 +61,7 @@ use crate::convert::pipeline::stages::{
     prepare_verified_single_file_album_batch_completion_order_fallback,
     resolve_dsd_album_gain_post_barrier_rerun,
     finish_pipeline_album_for_scheduler_with_tool_limits_and_retry_paths,
-    CertifiedTruePeakPreparedMeasurement,
+    CertifiedTruePeakPreparedMeasurement, ScheduledAlbumFailureCause, ScheduledAlbumFailureContext,
 };
 use crate::convert::pipeline::materializer_single::read_track_metadata_with_warnings;
 #[cfg(test)]
@@ -76,7 +76,7 @@ use crate::convert::pipeline::{
     PipelineStage, PlannedMetadataSatisfaction, PlannedTrackOutput, PreparedTrack, PublishedAlbum,
     PublishPolicy, RedactedPipelineRequest, scheduled_album_for_test,
     SourceAudioDescriptor, SourceOptions, StagePolicy, StageRequirement, StagingDir,
-    TrackArtifact, TrackId, TrackRecord, TrackSelection,
+    TrackArtifact, TrackRecord, TrackSelection,
 };
 
 /// Scratch-staging policy for direct single-item API calls.
@@ -2305,6 +2305,85 @@ struct PendingAlbum {
     next_source_track: usize,
     job_cancel: CancellationToken,
     cancel_requested: bool,
+    causal_failure: Option<ScheduledAlbumFailureCause>,
+    collateral_cancellations: BTreeSet<TrackId>,
+}
+
+fn scheduled_track_failure_cause(output: &ScheduledTrackOutput) -> Option<ScheduledAlbumFailureCause> {
+    let error = match &output.record.outcome {
+        TrackOutcome::Err(error) | TrackOutcome::Blocked(error) if !error.trim().is_empty() => {
+            error.clone()
+        }
+        TrackOutcome::Ok | TrackOutcome::Err(_) | TrackOutcome::Blocked(_) => return None,
+    };
+    Some(ScheduledAlbumFailureCause {
+        track_index: output.index,
+        track_id: output.record.track_id.clone(),
+        error,
+    })
+}
+
+fn scheduler_cancellation_failure(output: &ScheduledTrackOutput) -> bool {
+    let reason = match &output.record.outcome {
+        TrackOutcome::Err(reason) | TrackOutcome::Blocked(reason) => reason.trim(),
+        TrackOutcome::Ok => return false,
+    };
+    matches!(
+        reason,
+        "cancelled"
+            | "tool cancelled"
+            | "PCM true-peak scan cancelled"
+            | "PCM true-peak analysis cancelled"
+            | "PCM true-peak gain cancelled"
+            | "album DSD true-peak scan cancelled"
+            | "DSD certified true-peak analysis cancelled"
+            | "Reference certified peak observation cancelled"
+            | "Reference album auto-gain preparation cancelled"
+            | "registered-effect carrier preparation cancelled"
+            | "registered effect chain cancelled"
+            | "certified SSRC terminal conformance verification cancelled"
+            | "album cancelled before track realization"
+            | "album cancelled before realized encode"
+            | "album cancelled before staged encode"
+            | "album cancelled before grouped CUE fallback realization"
+            | "album cancelled before CUE fallback conversion"
+    ) || pcm_true_peak_measurement_cancellation(
+        reason,
+        output.record.track_id.source_ordinal,
+    )
+}
+
+fn pcm_true_peak_measurement_cancellation(reason: &str, source_ordinal: u32) -> bool {
+    const PREFIX: &str = "PCM true-peak measurement failed for track ";
+    const LEAF: &str = "PCM true-peak scan cancelled";
+
+    let Some(rest) = reason.strip_prefix(PREFIX) else {
+        return false;
+    };
+    let Some((ordinal, leaf)) = rest.split_once(": ") else {
+        return false;
+    };
+    leaf == LEAF && ordinal.parse::<u32>() == Ok(source_ordinal)
+}
+
+/// Update scheduler-only failure provenance before the output is moved into the
+/// deterministic track record stream. Returns true exactly for the first
+/// failing output that transitions the album into fail-fast cancellation.
+fn record_scheduler_failure_provenance(
+    cancel_requested: bool,
+    readiness: &AlbumReadiness,
+    output: &ScheduledTrackOutput,
+    causal_failure: &mut Option<ScheduledAlbumFailureCause>,
+    collateral_cancellations: &mut BTreeSet<TrackId>,
+) -> bool {
+    if cancel_requested && scheduler_cancellation_failure(output) {
+        collateral_cancellations.insert(output.record.track_id.clone());
+    }
+    if !cancel_requested && matches!(readiness, AlbumReadiness::Failed { .. }) {
+        *causal_failure = scheduled_track_failure_cause(output);
+        return true;
+    }
+    false
 }
 
 struct PendingDsdAlbumGainSubmission {
@@ -3290,6 +3369,8 @@ fn release_scheduled_album(
                 next_source_track: 0,
                 job_cancel,
                 cancel_requested: false,
+                causal_failure: None,
+                collateral_cancellations: BTreeSet::new(),
             },
         );
         submissions.enqueue_album_fanout(job_id);
@@ -3515,7 +3596,7 @@ fn validate_album_true_peak_execution_identity(
     Ok((effective_target, execution.allow_boost))
 }
 
-fn resolve_pcm_true_peak_submission_albums(
+pub(crate) fn resolve_pcm_true_peak_submission_albums(
     albums: &mut [ScheduledAlbum],
 ) -> Result<(), String> {
     let mut requested_target = None;
@@ -4845,28 +4926,39 @@ async fn run_queue_with_shared_orchestrator(
                         let mut submit_postprocess: Option<(ScheduledAlbum, Vec<ScheduledTrackOutput>)> = None;
 
                         if let Some(pending) = pending_albums.get_mut(&job_id) {
+                            let trigger_fail_fast = record_scheduler_failure_provenance(
+                                pending.cancel_requested,
+                                &readiness,
+                                &output,
+                                &mut pending.causal_failure,
+                                &mut pending.collateral_cancellations,
+                            );
                             pending.finished += 1;
                             pending.outputs.push(output);
 
-                            match readiness {
-                                AlbumReadiness::Waiting { .. } | AlbumReadiness::ReadyForPostProcess => {}
-                                AlbumReadiness::Failed { .. } => {
-                                    // Do not remove the pending album on the first failure.
-                                    // Fail-fast policy cancels not-yet-started and in-flight units,
-                                    // but each expected track must still report a deterministic
-                                    // terminal ScheduledTrackOutput before album post-processing,
-                                    // durable logging, and queue accounting run.
-                                    if !pending.cancel_requested {
-                                        pending.job_cancel.cancel();
-                                        pending.cancel_requested = true;
-                                    }
-                                }
+                            if trigger_fail_fast {
+                                // The causal record above is captured before cancellation can
+                                // manufacture lower-index peer failures. Keep waiting for every
+                                // deterministic terminal output, but only this transition owns
+                                // the album cancellation token.
+                                pending.job_cancel.cancel();
+                                pending.cancel_requested = true;
                             }
 
                             if pending.finished >= pending.expected {
                                 if let Some(mut pending) = pending_albums.remove(&job_id) {
                                     pending.outputs.sort_by_key(|output| output.index);
-                                    if let Some(album) = pending.album.take() {
+                                    if let Some(mut album) = pending.album.take() {
+                                        if let Some(cause) = pending.causal_failure.take() {
+                                            album.scheduler_failure_context = Some(
+                                                ScheduledAlbumFailureContext {
+                                                    cause,
+                                                    collateral_cancellations: std::mem::take(
+                                                        &mut pending.collateral_cancellations,
+                                                    ),
+                                                },
+                                            );
+                                        }
                                         submit_postprocess = Some((album, pending.outputs));
                                     }
                                 }
@@ -4900,11 +4992,16 @@ async fn run_queue_with_shared_orchestrator(
                             pool.metrics().record_track_encode_output(output.ok);
                             let readiness = tracker.mark_track_finished(&job_id, output.ok);
                             if let Some(pending) = pending_albums.get_mut(&job_id) {
+                                let trigger_fail_fast = record_scheduler_failure_provenance(
+                                    pending.cancel_requested,
+                                    &readiness,
+                                    &output,
+                                    &mut pending.causal_failure,
+                                    &mut pending.collateral_cancellations,
+                                );
                                 pending.finished += 1;
                                 pending.outputs.push(output);
-                                if matches!(readiness, AlbumReadiness::Failed { .. })
-                                    && !pending.cancel_requested
-                                {
+                                if trigger_fail_fast {
                                     pending.job_cancel.cancel();
                                     pending.cancel_requested = true;
                                 }
@@ -4913,6 +5010,16 @@ async fn run_queue_with_shared_orchestrator(
                                         pending.outputs.sort_by_key(|output| output.index);
                                         if let Some(mut album) = pending.album.take() {
                                             album.source_replaygain = source_replaygain.clone();
+                                            if let Some(cause) = pending.causal_failure.take() {
+                                                album.scheduler_failure_context = Some(
+                                                    ScheduledAlbumFailureContext {
+                                                        cause,
+                                                        collateral_cancellations: std::mem::take(
+                                                            &mut pending.collateral_cancellations,
+                                                        ),
+                                                    },
+                                                );
+                                            }
                                             submit_postprocess = Some((album, pending.outputs));
                                         }
                                     }
@@ -6360,6 +6467,150 @@ mod tests {
 
     use super::*;
     use crate::convert::pipeline::DvdaDownmixPolicy;
+
+    fn scheduler_failure_test_output(
+        index: usize,
+        source_ordinal: u32,
+        outcome: TrackOutcome,
+    ) -> ScheduledTrackOutput {
+        let track_id = TrackId {
+            source_ordinal,
+            disc_number: Some(1),
+            track_number: source_ordinal,
+        };
+        ScheduledTrackOutput {
+            index,
+            record: TrackRecord {
+                track_id,
+                outcome,
+                source_ref: TrackSourceRef::StagedFile(PathBuf::from(format!(
+                    "track-{source_ordinal}.wav"
+                ))),
+                realized_input: None,
+                output_file: None,
+                commands: Vec::new(),
+                bytes_in: None,
+                bytes_out: None,
+                duration: None,
+                verified_output_bit_depth: None,
+                dsd_dst_stats: None,
+            },
+            artifact: None,
+            ok: false,
+            metadata_satisfaction: PlannedMetadataSatisfaction::none(),
+        }
+    }
+
+    #[test]
+    fn scheduler_failure_provenance_keeps_track_three_as_cause_after_lower_index_cancellation() {
+        let primary = scheduler_failure_test_output(2, 3, TrackOutcome::Err(
+            "backend encode failed: distinctive terminal error".to_string(),
+        ));
+        let mut cause = None;
+        let mut collateral = BTreeSet::new();
+        assert!(record_scheduler_failure_provenance(
+            false,
+            &AlbumReadiness::Failed { finished: 1, expected: 8, failed: 1 },
+            &primary,
+            &mut cause,
+            &mut collateral,
+        ));
+        let cause = cause.expect("first failed output becomes causal provenance");
+        assert_eq!(cause.track_index, 2);
+        assert_eq!(cause.track_id.source_ordinal, 3);
+        assert_eq!(
+            cause.error,
+            "backend encode failed: distinctive terminal error"
+        );
+
+        let mut retained_cause = Some(cause);
+        for ordinal in [1_u32, 2, 4, 5, 6, 7, 8] {
+            let cancelled = scheduler_failure_test_output(
+                ordinal.saturating_sub(1) as usize,
+                ordinal,
+                TrackOutcome::Err(format!(
+                    "PCM true-peak measurement failed for track {ordinal}: PCM true-peak scan cancelled"
+                )),
+            );
+            assert!(!record_scheduler_failure_provenance(
+                true,
+                &AlbumReadiness::Failed {
+                    finished: ordinal as usize,
+                    expected: 8,
+                    failed: ordinal as usize,
+                },
+                &cancelled,
+                &mut retained_cause,
+                &mut collateral,
+            ));
+        }
+        assert_eq!(retained_cause.as_ref().unwrap().track_id.source_ordinal, 3);
+        assert_eq!(collateral.len(), 7);
+        assert!(collateral.iter().all(|id| id.source_ordinal != 3));
+    }
+
+    #[test]
+    fn scheduler_cancellation_classifier_requires_exact_true_peak_wrapper_and_track() {
+        let wrapped = scheduler_failure_test_output(
+            0,
+            1,
+            TrackOutcome::Err(
+                "PCM true-peak measurement failed for track 1: PCM true-peak scan cancelled"
+                    .to_string(),
+            ),
+        );
+        assert!(scheduler_cancellation_failure(&wrapped));
+
+        let wrong_track = scheduler_failure_test_output(
+            0,
+            1,
+            TrackOutcome::Err(
+                "PCM true-peak measurement failed for track 2: PCM true-peak scan cancelled"
+                    .to_string(),
+            ),
+        );
+        assert!(!scheduler_cancellation_failure(&wrong_track));
+
+        let merely_mentions_cancellation = scheduler_failure_test_output(
+            0,
+            1,
+            TrackOutcome::Err(
+                "backend failed after another operation was cancelled".to_string(),
+            ),
+        );
+        assert!(!scheduler_cancellation_failure(&merely_mentions_cancellation));
+    }
+
+    #[test]
+    fn scheduler_failure_provenance_does_not_hide_independent_second_failure() {
+        let primary = scheduler_failure_test_output(2, 3, TrackOutcome::Err(
+            "primary backend error".to_string(),
+        ));
+        let mut cause = None;
+        let mut collateral = BTreeSet::new();
+        assert!(record_scheduler_failure_provenance(
+            false,
+            &AlbumReadiness::Failed { finished: 1, expected: 8, failed: 1 },
+            &primary,
+            &mut cause,
+            &mut collateral,
+        ));
+
+        let independent = scheduler_failure_test_output(5, 6, TrackOutcome::Err(
+            "independent backend error".to_string(),
+        ));
+        assert!(!record_scheduler_failure_provenance(
+            true,
+            &AlbumReadiness::Failed { finished: 2, expected: 8, failed: 2 },
+            &independent,
+            &mut cause,
+            &mut collateral,
+        ));
+        assert!(
+            !collateral.contains(&independent.record.track_id),
+            "a genuine backend failure after fail-fast starts is still a real peer failure",
+        );
+    }
 
     fn run_on_conversion_worker_stack<F, Fut>(test: F)
     where

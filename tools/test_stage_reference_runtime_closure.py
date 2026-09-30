@@ -78,6 +78,51 @@ class StagingPureTests(unittest.TestCase):
         with self.assertRaises(stage.StageError):
             stage.rewrite_absolute_symlinks(self.stage, self.store)
 
+    def test_bluez_host_config_symlinks_are_omitted_and_recorded(self) -> None:
+        bluez = self.stage / "nix" / "store" / ("b" * 32 + "-bluez-5.84") / "etc" / "bluetooth"
+        bluez.mkdir(parents=True)
+        for name in sorted(stage.BLUEZ_HOST_CONFIG_LINKS):
+            (bluez / name).symlink_to(f"/etc/bluetooth/{name}")
+        omitted: list[dict[str, str]] = []
+        rewritten = stage.rewrite_absolute_symlinks(
+            self.stage, self.store, omitted_external=omitted
+        )
+        self.assertEqual(rewritten, 0)
+        self.assertEqual(len(omitted), 3)
+        expected = [
+            {
+                "path": (
+                    Path("nix")
+                    / "store"
+                    / ("b" * 32 + "-bluez-5.84")
+                    / "etc"
+                    / "bluetooth"
+                    / name
+                ).as_posix(),
+                "target": f"/etc/bluetooth/{name}",
+                "policy": "bluez-host-config/v1",
+            }
+            for name in sorted(stage.BLUEZ_HOST_CONFIG_LINKS)
+        ]
+        self.assertEqual(omitted, expected, "staging evidence must record exact deterministic omissions")
+        self.assertTrue(all(not (bluez / name).exists() for name in stage.BLUEZ_HOST_CONFIG_LINKS))
+
+    def test_bluez_policy_is_pinned_to_the_observed_5_84_output(self) -> None:
+        bluez = self.stage / "nix" / "store" / ("b" * 32 + "-bluez-5.85") / "etc" / "bluetooth"
+        bluez.mkdir(parents=True)
+        link = bluez / "network.conf"
+        link.symlink_to("/etc/bluetooth/network.conf")
+        with self.assertRaises(stage.StageError):
+            stage.rewrite_absolute_symlinks(self.stage, self.store, omitted_external=[])
+
+    def test_bluez_policy_does_not_admit_unknown_external_config(self) -> None:
+        bluez = self.stage / "nix" / "store" / ("b" * 32 + "-bluez-5.84") / "etc" / "bluetooth"
+        bluez.mkdir(parents=True)
+        link = bluez / "future.conf"
+        link.symlink_to("/etc/bluetooth/future.conf")
+        with self.assertRaises(stage.StageError):
+            stage.rewrite_absolute_symlinks(self.stage, self.store, omitted_external=[])
+
     def test_copy_requisites_breaks_source_hardlinks_before_path_dependent_patching(self) -> None:
         source_object = self.store / "bbbb-hardlinks"
         (source_object / "lib" / "nested").mkdir(parents=True)

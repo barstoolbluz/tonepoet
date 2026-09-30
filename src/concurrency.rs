@@ -1,11 +1,13 @@
 //! Cross-process concurrency primitives for independent tonepoet sessions.
 //!
 //! Persistent leases deliberately differ from the repository's short-lived
-//! local file locks: `PersistentLease::drop` is close-only, never explicitly
-//! unlocks a possibly-shared open-file description, and never unlinks its
-//! descriptor. Ordinary `MutationClaimGuard` teardown may retire an unexported
-//! ephemeral descriptor immediately before that close; detached/exported
-//! authority keeps the persistent close-only/lazy-retirement contract.
+//! local file locks. Durable descriptors normally remain published after their
+//! logical owner ends so recovery authority survives, while unexported
+//! `JournalOperation` leases explicitly release their shared `flock` at the
+//! final in-process logical-owner boundary. That makes accidental fork-before-
+//! exec fd copies harmless without weakening deliberate exported authority.
+//! Ordinary `MutationClaimGuard` teardown may additionally retire an unexported
+//! ephemeral descriptor before close.
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -1106,20 +1108,40 @@ fn decode_descriptor_from_storage(bytes: &[u8]) -> Result<LeaseDescriptor, Strin
     }
 }
 
+struct PersistentLeaseSharedState {
+    /// Logical Rust owners of one shared open-file description. This count is
+    /// independent of kernel fd duplicates: accidental fork copies do not gain
+    /// logical ownership, while explicit same-process recovery co-holders do.
+    logical_owners: std::sync::atomic::AtomicUsize,
+    /// A deliberate fd export is transferable authority and may outlive every
+    /// Rust owner in this process. Once exported, final-owner Drop must remain
+    /// close-only and let the last exported fd release the kernel lock.
+    lifetime_file_exported: std::sync::atomic::AtomicBool,
+}
+
+impl PersistentLeaseSharedState {
+    fn new(lifetime_file_exported: bool) -> Self {
+        Self {
+            logical_owners: std::sync::atomic::AtomicUsize::new(1),
+            lifetime_file_exported: std::sync::atomic::AtomicBool::new(
+                lifetime_file_exported,
+            ),
+        }
+    }
+}
+
 pub struct PersistentLease {
     file: Arc<File>,
     descriptor_path: PathBuf,
     descriptor_id: Uuid,
     family: LeaseFamily,
     claims: Arc<[PathClaim]>,
-    // A fork may transiently duplicate any CLOEXEC fd until the child reaches
-    // exec; that accidental co-holder is not transferable mutation authority.
-    // An explicit lifetime-file export is different: it may intentionally
-    // outlive this Rust lease and is part of the cross-process authority
-    // protocol. Once one has ever been handed out, guard teardown must leave
-    // descriptor retirement to the ordinary lock-aware scanner rather than
-    // hiding a still-live exported OFD.
-    lifetime_file_exported: std::sync::atomic::AtomicBool,
+    shared: Arc<PersistentLeaseSharedState>,
+}
+
+struct LocalPersistentLeaseRegistration {
+    file: std::sync::Weak<File>,
+    shared: std::sync::Weak<PersistentLeaseSharedState>,
 }
 
 /// Process-local view of descriptor handles created by this process. Weak
@@ -1128,49 +1150,53 @@ pub struct PersistentLease {
 /// the durable lifecycle itself has explicitly become recoverable before the
 /// creating handle is dropped (notably deterministic in-process recovery
 /// tests and same-process handoff). Foreign owners can never enter this path.
-fn local_persistent_lease_files() -> &'static Mutex<HashMap<PathBuf, std::sync::Weak<File>>> {
-    static FILES: OnceLock<Mutex<HashMap<PathBuf, std::sync::Weak<File>>>> = OnceLock::new();
+fn local_persistent_lease_files(
+) -> &'static Mutex<HashMap<PathBuf, LocalPersistentLeaseRegistration>> {
+    static FILES: OnceLock<Mutex<HashMap<PathBuf, LocalPersistentLeaseRegistration>>> =
+        OnceLock::new();
     FILES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn register_local_persistent_lease(path: &Path, file: &Arc<File>) {
+fn register_local_persistent_lease(
+    path: &Path,
+    file: &Arc<File>,
+    shared: &Arc<PersistentLeaseSharedState>,
+) {
     local_persistent_lease_files()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(path.to_path_buf(), Arc::downgrade(file));
+        .insert(
+            path.to_path_buf(),
+            LocalPersistentLeaseRegistration {
+                file: Arc::downgrade(file),
+                shared: Arc::downgrade(shared),
+            },
+        );
 }
 
-fn unregister_local_persistent_lease(path: &Path, file: &Arc<File>) {
+fn local_persistent_lease_registration(
+    path: &Path,
+) -> Option<(Arc<File>, Arc<PersistentLeaseSharedState>)> {
     let mut files = local_persistent_lease_files()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let remove = match files.get(path).and_then(std::sync::Weak::upgrade) {
-        // `registered` is one temporary strong reference and `file` is this
-        // lease's reference. A count of two therefore means this is the last
-        // process-local co-holder of the registered open-file description.
-        Some(registered) => Arc::ptr_eq(&registered, file) && Arc::strong_count(&registered) == 2,
-        None => true,
-    };
-    if remove {
+    let registration = files.get(path).and_then(|registration| {
+        Some((registration.file.upgrade()?, registration.shared.upgrade()?))
+    });
+    if registration.is_none() {
         files.remove(path);
     }
+    registration
 }
 
 fn local_persistent_lease_file(path: &Path) -> Option<Arc<File>> {
-    let mut files = local_persistent_lease_files()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let file = files.get(path).and_then(std::sync::Weak::upgrade);
-    if file.is_none() {
-        files.remove(path);
-    }
-    file
+    local_persistent_lease_registration(path).map(|(file, _)| file)
 }
 
 fn current_process_coheld_descriptor(
     path: &Path,
     descriptor: &LeaseDescriptor,
-) -> Result<Option<Arc<File>>, String> {
+) -> Result<Option<(Arc<File>, Arc<PersistentLeaseSharedState>)>, String> {
     // Same-process co-holding exists solely for durable file-task journal
     // recovery. Keep every other lease family on the ordinary exclusive-lock
     // path so this narrow handoff cannot grow into a generic local bypass.
@@ -1179,11 +1205,78 @@ fn current_process_coheld_descriptor(
     {
         return Ok(None);
     }
-    let Some(file) = local_persistent_lease_file(path) else {
+    let Some((file, shared)) = local_persistent_lease_registration(path) else {
         return Ok(None);
     };
     verify_coordination_path_binding(&file, path, "process-local persistent lease")?;
-    Ok(Some(file))
+    Ok(Some((file, shared)))
+}
+
+fn acquire_current_process_coheld_descriptor(
+    path: &Path,
+    descriptor: &LeaseDescriptor,
+) -> Result<Option<(Arc<File>, Arc<PersistentLeaseSharedState>)>, String> {
+    if !matches!(&descriptor.family, LeaseFamily::JournalOperation { .. })
+        || descriptor.owner != OwnerProcessIdentity::current()
+    {
+        return Ok(None);
+    }
+
+    // Increment logical ownership while holding the registration mutex. Final
+    // owner Drop uses the same mutex before decrementing, so a recovery handoff
+    // can never race a 1->0 transition and inherit an explicitly unlocked OFD.
+    let mut files = local_persistent_lease_files()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(registration) = files.get(path) else {
+        return Ok(None);
+    };
+    let Some(file) = registration.file.upgrade() else {
+        files.remove(path);
+        return Ok(None);
+    };
+    let Some(shared) = registration.shared.upgrade() else {
+        files.remove(path);
+        return Ok(None);
+    };
+    verify_coordination_path_binding(&file, path, "process-local persistent lease")?;
+    shared
+        .logical_owners
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    Ok(Some((file, shared)))
+}
+
+fn release_local_persistent_lease_owner(
+    path: &Path,
+    file: &Arc<File>,
+    shared: &Arc<PersistentLeaseSharedState>,
+) -> bool {
+    let mut files = local_persistent_lease_files()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let previous = shared
+        .logical_owners
+        .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    debug_assert!(previous > 0, "persistent lease logical-owner count underflow");
+    let final_owner = previous == 1;
+    if final_owner {
+        let remove = files.get(path).is_some_and(|registration| {
+            registration
+                .file
+                .upgrade()
+                .is_some_and(|registered| Arc::ptr_eq(&registered, file))
+                && registration
+                    .shared
+                    .upgrade()
+                    .is_some_and(|registered| Arc::ptr_eq(&registered, shared))
+        });
+        if remove || files.get(path).is_some_and(|registration| {
+            registration.file.upgrade().is_none() || registration.shared.upgrade().is_none()
+        }) {
+            files.remove(path);
+        }
+    }
+    final_owner
 }
 
 /// Removes a coordination pathname owned by this creation attempt on ordinary
@@ -1739,8 +1832,9 @@ impl PersistentLease {
         verify_coordination_path_binding(&file, &path, "published persistent lease")?;
         final_cleanup.disarm();
         let file = Arc::new(file);
+        let shared = Arc::new(PersistentLeaseSharedState::new(false));
         if matches!(&family, LeaseFamily::JournalOperation { .. }) {
-            register_local_persistent_lease(&path, &file);
+            register_local_persistent_lease(&path, &file, &shared);
         }
         Ok(Self {
             file,
@@ -1748,7 +1842,7 @@ impl PersistentLease {
             descriptor_id,
             family,
             claims: retained_claims,
-            lifetime_file_exported: std::sync::atomic::AtomicBool::new(false),
+            shared,
         })
     }
 
@@ -1793,10 +1887,11 @@ impl PersistentLease {
                     ));
                 }
                 let file = Arc::new(opened);
+                let shared = Arc::new(PersistentLeaseSharedState::new(false));
                 if matches!(&descriptor.family, LeaseFamily::JournalOperation { .. })
                     && descriptor.owner == OwnerProcessIdentity::current()
                 {
-                    register_local_persistent_lease(path, &file);
+                    register_local_persistent_lease(path, &file, &shared);
                 }
                 return Ok(Self {
                     file,
@@ -1804,7 +1899,7 @@ impl PersistentLease {
                     descriptor_id: descriptor.descriptor_id,
                     family: descriptor.family,
                     claims: descriptor.claims.into(),
-                    lifetime_file_exported: std::sync::atomic::AtomicBool::new(false),
+                    shared,
                 });
             }
             Err(error) if is_lock_contended(&error) => {}
@@ -1827,7 +1922,7 @@ impl PersistentLease {
         // The caller has already proven a durable same-process handoff state.
         // Co-hold only the exact locally-created locked OFD; never unlock,
         // duplicate by pathname, or bypass a foreign owner's descriptor.
-        let Some(file) = current_process_coheld_descriptor(path, &descriptor)? else {
+        let Some((file, shared)) = acquire_current_process_coheld_descriptor(path, &descriptor)? else {
             return Err(format!("persistent lease is live-owned: {}", path.display()));
         };
         Ok(Self {
@@ -1836,7 +1931,7 @@ impl PersistentLease {
             descriptor_id: descriptor.descriptor_id,
             family: descriptor.family,
             claims: descriptor.claims.into(),
-            lifetime_file_exported: std::sync::atomic::AtomicBool::new(false),
+            shared,
         })
     }
 
@@ -1905,7 +2000,7 @@ impl PersistentLease {
             descriptor_id: descriptor.descriptor_id,
             family: descriptor.family,
             claims: descriptor.claims.into(),
-            lifetime_file_exported: std::sync::atomic::AtomicBool::new(false),
+            shared: Arc::new(PersistentLeaseSharedState::new(false)),
         })
     }
 
@@ -1928,7 +2023,8 @@ impl PersistentLease {
                 self.descriptor_path.display()
             )
         })?;
-        self.lifetime_file_exported
+        self.shared
+            .lifetime_file_exported
             .store(true, std::sync::atomic::Ordering::Release);
         Ok(Arc::new(duplicate))
     }
@@ -1947,6 +2043,7 @@ impl PersistentLease {
     fn retire_ephemeral_descriptor_on_guard_drop(&self) {
         if !matches!(&self.family, LeaseFamily::EphemeralMutation { .. })
             || self
+                .shared
                 .lifetime_file_exported
                 .load(std::sync::atomic::Ordering::Acquire)
         {
@@ -1998,7 +2095,8 @@ impl PersistentLease {
         // lexical ownership. Treat it exactly like duplicate_lifetime_file so
         // guard Drop can never hide a descriptor a caller may deliberately
         // arrange to survive in another process.
-        self.lifetime_file_exported
+        self.shared
+            .lifetime_file_exported
             .store(true, std::sync::atomic::Ordering::Release);
         self.file.as_raw_fd()
     }
@@ -2021,19 +2119,46 @@ impl PersistentLease {
             descriptor_id: descriptor.descriptor_id,
             family: descriptor.family,
             claims: descriptor.claims.into(),
-            lifetime_file_exported: std::sync::atomic::AtomicBool::new(true),
+            shared: Arc::new(PersistentLeaseSharedState::new(true)),
         })
     }
 }
 
 impl Drop for PersistentLease {
     fn drop(&mut self) {
-        // This is bookkeeping only: pruning the weak process-local co-hold
-        // index neither unlocks nor unlinks authority. Only JournalOperation
-        // descriptors participate, so ordinary ephemeral/queue leases pay no
-        // recovery-index synchronization cost on drop.
-        if matches!(&self.family, LeaseFamily::JournalOperation { .. }) {
-            unregister_local_persistent_lease(&self.descriptor_path, &self.file);
+        if !matches!(&self.family, LeaseFamily::JournalOperation { .. }) {
+            return;
+        }
+
+        // A JournalOperation pathname is durable recovery authority, but its
+        // kernel lock represents *live* execution authority. Release that lock
+        // at the final in-process logical-owner boundary instead of waiting for
+        // every accidental fork-time duplicate of this OFD to close. Deliberate
+        // lifetime exports are different: they are real authority and keep the
+        // historical close-only behavior until the exported fd itself closes.
+        let final_owner = release_local_persistent_lease_owner(
+            &self.descriptor_path,
+            &self.file,
+            &self.shared,
+        );
+        if !final_owner
+            || self
+                .shared
+                .lifetime_file_exported
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+
+        #[cfg(unix)]
+        if let Err(error) = FileExt::unlock(self.file.as_ref()) {
+            // Drop cannot report an error. Keep the descriptor published and
+            // fail closed; ordinary close still releases the lock when no fd
+            // copy remains, and recovery scanners will classify it correctly.
+            log::error!(
+                "release final unexported JournalOperation lock {}: {error}",
+                self.descriptor_path.display(),
+            );
         }
     }
 }
@@ -4096,6 +4221,161 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn journal_operation_final_logical_owner_unlocks_accidental_fork_copy_immediately() {
+        use std::os::fd::AsRawFd;
+
+        with_root(|_| {
+            let family = LeaseFamily::JournalOperation {
+                job_id: Uuid::new_v4(),
+            };
+            let lease = PersistentLease::create(family.clone(), &[])
+                .expect("create durable journal operation lease");
+            let path = lease.descriptor_path().to_path_buf();
+            let fd_flags = unsafe { libc::fcntl(lease.file.as_raw_fd(), libc::F_GETFD) };
+            assert!(fd_flags >= 0, "inspect journal lease fd flags");
+            assert_ne!(
+                fd_flags & libc::FD_CLOEXEC,
+                0,
+                "regression requires the production CLOEXEC journal lease fd",
+            );
+
+            let mut ready = [0; 2];
+            let mut release = [0; 2];
+            assert_eq!(unsafe { libc::pipe(ready.as_mut_ptr()) }, 0, "create ready pipe");
+            assert_eq!(
+                unsafe { libc::pipe(release.as_mut_ptr()) },
+                0,
+                "create release pipe",
+            );
+            let child = unsafe { libc::fork() };
+            if child == 0 {
+                unsafe {
+                    libc::close(ready[0]);
+                    libc::close(release[1]);
+                    let marker = [b'R'];
+                    if libc::write(ready[1], marker.as_ptr().cast(), 1) != 1 {
+                        libc::_exit(2);
+                    }
+                    libc::close(ready[1]);
+                    let mut release_marker = [0u8; 1];
+                    if libc::read(release[0], release_marker.as_mut_ptr().cast(), 1) != 1 {
+                        libc::_exit(3);
+                    }
+                    libc::close(release[0]);
+                    libc::_exit(0);
+                }
+            }
+            if child < 0 {
+                unsafe {
+                    libc::close(ready[0]);
+                    libc::close(ready[1]);
+                    libc::close(release[0]);
+                    libc::close(release[1]);
+                }
+                panic!("fork journal test child: {}", std::io::Error::last_os_error());
+            }
+            unsafe {
+                libc::close(ready[1]);
+                libc::close(release[0]);
+            }
+            let mut ready_marker = [0u8; 1];
+            let ready_result = unsafe {
+                libc::read(ready[0], ready_marker.as_mut_ptr().cast(), 1)
+            };
+            unsafe { libc::close(ready[0]) };
+
+            let mut availability = None;
+            let mut retired = None;
+            if ready_result == 1 {
+                drop(lease);
+                availability = Some(descriptor_availability(&path));
+                retired = Some(retire_descriptor_after_lifecycle_release(&path, &family));
+            } else {
+                drop(lease);
+            }
+
+            // Always release/reap the pre-exec child before assertions so a
+            // failed synchronization cannot strand a process in the test run.
+            let release_marker = [b'X'];
+            let signalled = unsafe {
+                libc::write(release[1], release_marker.as_ptr().cast(), 1) == 1
+            };
+            unsafe { libc::close(release[1]) };
+            let mut status = 0;
+            let waited = loop {
+                let result = unsafe { libc::waitpid(child, &mut status, 0) };
+                if result >= 0
+                    || std::io::Error::last_os_error().kind()
+                        != std::io::ErrorKind::Interrupted
+                {
+                    break result;
+                }
+            };
+
+            assert_eq!(ready_result, 1, "fork child must confirm inherited-fd hold");
+            assert!(signalled, "release journal fork child");
+            assert_eq!(waited, child, "reap journal fork child");
+            assert!(libc::WIFEXITED(status), "journal fork child must exit normally");
+            assert_eq!(libc::WEXITSTATUS(status), 0, "journal fork child exit status");
+            assert_eq!(
+                availability
+                    .expect("fork synchronization must produce availability")
+                    .expect("probe now-ownerless durable descriptor")
+                    .1,
+                ClaimAvailability::RecoveryReserved,
+                "accidental fork copy must not retain live JournalOperation authority",
+            );
+            retired
+                .expect("fork synchronization must attempt lifecycle retirement")
+                .expect("lifecycle retirement must lock immediately without retry");
+            assert!(
+                !path.exists(),
+                "retirement must remove the durable descriptor while the accidental fork copy is still open",
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_operation_deliberate_lifetime_export_remains_live_until_export_closes() {
+        with_root(|_| {
+            let family = LeaseFamily::JournalOperation {
+                job_id: Uuid::new_v4(),
+            };
+            let lease = PersistentLease::create(family.clone(), &[])
+                .expect("create durable journal operation lease");
+            let path = lease.descriptor_path().to_path_buf();
+            let exported = lease
+                .duplicate_lifetime_file()
+                .expect("export deliberate journal lifetime authority");
+            drop(lease);
+
+            assert_eq!(
+                descriptor_availability(&path)
+                    .expect("probe deliberately exported journal descriptor")
+                    .1,
+                ClaimAvailability::Live,
+                "explicitly exported authority must remain live after the Rust owner ends",
+            );
+            let error = retire_descriptor_after_lifecycle_release(&path, &family)
+                .expect_err("lifecycle retirement must not bypass deliberate exported authority");
+            assert!(error.contains("live-owned"), "unexpected retirement error: {error}");
+
+            drop(exported);
+            assert_eq!(
+                descriptor_availability(&path)
+                    .expect("probe journal descriptor after deliberate export closes")
+                    .1,
+                ClaimAvailability::RecoveryReserved,
+            );
+            retire_descriptor_after_lifecycle_release(&path, &family)
+                .expect("journal descriptor retires immediately after deliberate export closes");
+            assert!(!path.exists());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn lifecycle_retirement_waits_out_accidental_cloexec_coholder_but_not_live_authority() {
         use std::os::fd::AsRawFd;
 
@@ -4949,8 +5229,22 @@ mod tests {
                 .expect_err("strict lifecycle acquisition must still reject a live holder");
             assert!(strict_error.contains("live-owned"), "unexpected error: {strict_error}");
 
-            drop(recovery);
             drop(lease);
+            assert_eq!(
+                descriptor_availability(&path)
+                    .expect("remaining same-OFD logical co-holder stays live")
+                    .1,
+                ClaimAvailability::Live,
+                "dropping one same-process logical owner must not unlock the shared OFD",
+            );
+            drop(recovery);
+            assert_eq!(
+                descriptor_availability(&path)
+                    .expect("final same-OFD logical owner ended")
+                    .1,
+                ClaimAvailability::RecoveryReserved,
+                "only the final unexported logical owner releases JournalOperation live authority",
+            );
             let reclaimed = PersistentLease::acquire_existing_recovery(&path, &family)
                 .expect("dead local owner should be acquired normally");
             assert_eq!(reclaimed.descriptor_id(), descriptor_id);
@@ -4959,6 +5253,48 @@ mod tests {
                 local_persistent_lease_file(&path).is_none(),
                 "dropping the last local holder must prune the weak co-hold index"
             );
+        });
+    }
+
+
+    #[test]
+    fn same_process_journal_coholder_shares_deliberate_export_authority() {
+        with_root(|_| {
+            let family = LeaseFamily::JournalOperation {
+                job_id: Uuid::new_v4(),
+            };
+            let lease = PersistentLease::create(family.clone(), &[])
+                .expect("create durable journal operation lease");
+            let path = lease.descriptor_path().to_path_buf();
+            let coholder = PersistentLease::acquire_existing_recovery_with_local_handoff(
+                &path,
+                &family,
+            )
+            .expect("same-process recovery coholder");
+            let exported = coholder
+                .duplicate_lifetime_file()
+                .expect("export deliberate authority from one same-OFD coholder");
+
+            drop(lease);
+            drop(coholder);
+            assert_eq!(
+                descriptor_availability(&path)
+                    .expect("probe shared exported journal authority")
+                    .1,
+                ClaimAvailability::Live,
+                "an export by either same-OFD coholder must suppress final-owner logical unlock",
+            );
+
+            drop(exported);
+            assert_eq!(
+                descriptor_availability(&path)
+                    .expect("probe journal authority after shared export closes")
+                    .1,
+                ClaimAvailability::RecoveryReserved,
+            );
+            retire_descriptor_after_lifecycle_release(&path, &family)
+                .expect("shared exported journal descriptor retires after the export closes");
+            assert!(!path.exists());
         });
     }
 
