@@ -65,6 +65,12 @@ def main() -> int:
     ):
         require(token in realization, f"R4-1 {label}")
 
+    require(
+        realization.index("charged_rate_hz != carrier_rate_hz")
+        < realization.index("if !execution_state.pre_observation_rate_edge_consumed"),
+        "R4-1 charged/carrier disagreement is refused before consumed-edge authorization",
+    )
+
     real_flow = section(
         executor,
         "async fn album_pcm_true_peak_rate_change_real_preparation_gain_and_terminal_path()",

@@ -2221,17 +2221,21 @@ fn qualified_ffmpeg_int32_execution_realization(
     let Some(execution_state) = execution_state else {
         return Ok(execution_realization);
     };
-    if !execution_state.pre_observation_rate_edge_consumed {
-        return Ok(execution_realization);
-    }
     let carrier_rate_hz = execution_state.measured_carrier_rate_hz;
     if carrier_rate_hz == 0 {
         return Err("qualified FFmpeg terminal certified carrier rate is zero".to_string());
     }
+    // A certified carrier and a charged target describe the same physical rate
+    // edge whether or not that edge is eligible to be consumed here.  Refuse
+    // disagreement first; the consumed flag authorizes only the private
+    // removal of an edge that is already known to agree with the carrier.
     if charged_rate_hz != carrier_rate_hz {
         return Err(format!(
             "charged FFmpeg terminal target rate {charged_rate_hz} does not match realized true-peak carrier rate {carrier_rate_hz}"
         ));
+    }
+    if !execution_state.pre_observation_rate_edge_consumed {
+        return Ok(execution_realization);
     }
     if plan_request.source.sample_rate_hz != Some(carrier_rate_hz) {
         return Err(format!(
@@ -13000,6 +13004,10 @@ mod tests {
         );
         let execution_state = crate::convert::pipeline::stages::certified_true_peak_terminal_execution_state(&track)
             .expect("bound measured carrier must publish terminal execution state");
+        assert!(
+            !execution_state.pre_observation_rate_edge_consumed,
+            "a contradictory charged rate must not be mistaken for an already-consumed edge",
+        );
         let error = qualified_ffmpeg_int32_execution_realization(
             Some(&execution_state),
             &plan_request,
