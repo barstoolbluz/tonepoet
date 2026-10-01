@@ -7584,6 +7584,24 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 result,
             );
         }
+        AppMessage::BrowseCueFileReferenceRepairComplete {
+            generation,
+            browse_scan_generation,
+            tab_id,
+            origin_dir,
+            cue_path,
+            result,
+        } => {
+            super::keybindings::handle_browse_cue_file_reference_repair_complete(
+                app,
+                generation,
+                browse_scan_generation,
+                tab_id,
+                origin_dir,
+                cue_path,
+                result,
+            );
+        }
         AppMessage::ProbeResult {
             generation,
             path,
@@ -8036,6 +8054,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                                     crate::tui::probe::CueImportAvailability::Unknown;
                                 classification.cue_repair_availability =
                                     crate::tui::browse::CueRepairAvailability::Unknown;
+                                classification.cue_file_reference_repairs.clear();
                                 None
                             }
                         }
@@ -8052,6 +8071,39 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                     app.browse
                         .continue_requested_folder_cue_availability_probe(&path, tx);
                     super::context_menu::refresh_open_browse_entry_menu(app);
+                    let direct_cue_malformed_warning = if probe_cue_availability
+                        && app.browse.current_dir == path
+                        && matches!(
+                            &app.active_overlay,
+                            crate::tui::app::ActiveOverlay::ContextMenu { .. }
+                        )
+                    {
+                        app.browse.selected_entry().and_then(|entry| {
+                            if !crate::convert::classify::is_cue_sheet_path(&entry.path) {
+                                return None;
+                            }
+                            if !app.browse_context_action_paths.as_ref().is_some_and(|paths| {
+                                paths.len() == 1 && paths[0] == entry.path
+                            }) {
+                                return None;
+                            }
+                            super::context_menu::direct_cue_file_reference_probe_if_authoritative(
+                                app,
+                                &entry.path,
+                            )
+                            .and_then(|probe| match &probe.assessment {
+                                crate::convert::cue_parser::CueFileReferenceRepairAssessment::Malformed {
+                                    warning,
+                                } => Some(warning.clone()),
+                                _ => None,
+                            })
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(warning) = direct_cue_malformed_warning {
+                        app.set_status(warning);
+                    }
                     if is_current {
                         // Re-enter the cheap current-entry policy path after
                         // caching the classification. This lets cached summary
@@ -20403,6 +20455,251 @@ mod async_message_drain_tests {
         app.status_message.as_ref().map(|(message, _)| message.as_str())
     }
 
+    fn direct_cue_utilities(
+        entries: &[crate::tui::context_menu::ContextMenuEntry],
+    ) -> Option<&[crate::tui::context_menu::ContextMenuEntry]> {
+        entries.iter().find_map(|entry| match entry {
+            crate::tui::context_menu::ContextMenuEntry::Submenu { label, children }
+                if label == "Utilities" => Some(children.as_slice()),
+            _ => None,
+        })
+    }
+
+    fn direct_cue_repair_label(
+        entries: &[crate::tui::context_menu::ContextMenuEntry],
+    ) -> Option<&str> {
+        direct_cue_utilities(entries)?.iter().find_map(|entry| match entry {
+            crate::tui::context_menu::ContextMenuEntry::Item(item)
+                if matches!(
+                    &item.action,
+                    crate::tui::context_menu::ContextAction::RepairCueFileReference { .. }
+                ) && item.enabled =>
+            {
+                Some(item.label.as_str())
+            }
+            _ => None,
+        })
+    }
+
+    fn open_direct_cue_utilities_panel(app: &mut AppState) {
+        let crate::tui::app::ActiveOverlay::ContextMenu { levels, .. } = &mut app.active_overlay
+        else {
+            panic!("context menu must be open");
+        };
+        let root = levels.first_mut().expect("root menu level");
+        let utilities_index = root
+            .entries
+            .iter()
+            .position(|entry| matches!(
+                entry,
+                crate::tui::context_menu::ContextMenuEntry::Submenu { label, .. }
+                    if label == "Utilities"
+            ))
+            .expect("direct-CUE Utilities submenu");
+        let selectable = root
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| match entry {
+                crate::tui::context_menu::ContextMenuEntry::Item(item) if item.enabled => {
+                    Some(index)
+                }
+                crate::tui::context_menu::ContextMenuEntry::Submenu { children, .. }
+                    if !children.is_empty() => Some(index),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        root.selected = selectable
+            .iter()
+            .position(|index| *index == utilities_index)
+            .expect("Utilities must be selectable");
+        let children = match &root.entries[utilities_index] {
+            crate::tui::context_menu::ContextMenuEntry::Submenu { children, .. } => {
+                children.clone()
+            }
+            _ => unreachable!(),
+        };
+        levels.push(crate::tui::context_menu::MenuLevel::new(children));
+    }
+
+    async fn drive_to_exact_cue_classification(
+        app: &mut AppState,
+        rx: &mut mpsc::Receiver<AppMessage>,
+        tx: &mpsc::Sender<AppMessage>,
+    ) {
+        for _ in 0..16 {
+            let message = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+                .await
+                .expect("folder-classification completion timed out")
+                .expect("folder-classification channel closed");
+            let exact = matches!(
+                &message,
+                AppMessage::FolderClassifyComplete {
+                    probe_cue_availability: true,
+                    ..
+                }
+            );
+            handle_message(app, message, tx);
+            if exact {
+                return;
+            }
+        }
+        panic!("exact CUE classification did not complete");
+    }
+
+    fn write_minimal_wav(path: &std::path::Path) {
+        // Canonical one-sample PCM WAVE. The R13 repair assessor needs only the
+        // filename, but a real container keeps metadata/embedded-CUE probes
+        // from turning a menu test into an invalid-file special case.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&38u32.to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&44_100u32.to_le_bytes());
+        bytes.extend_from_slice(&88_200u32.to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&0i16.to_le_bytes());
+        std::fs::write(path, bytes).expect("write WAV fixture");
+    }
+
+    #[tokio::test]
+    async fn direct_cue_first_context_menu_resolves_reserved_repair_slot_in_place() {
+        use crate::config::AggregateMetadataTarget::{EmbeddedCue, IndividualFiles, SidecarCue};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cue = temp.path().join("album.cue");
+        let audio = temp.path().join("actual.wav");
+        write_minimal_wav(&audio);
+        std::fs::write(
+            &cue,
+            b"FILE \"missing.wav\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+        )
+        .expect("write CUE fixture");
+
+        let metadata = std::fs::metadata(&cue).expect("CUE metadata");
+        let mut config = TonepoetConfig::default();
+        config.conversion.aggregate_metadata_target_priority =
+            vec![SidecarCue, IndividualFiles, EmbeddedCue];
+        let mut app = AppState::new_for_test(config);
+        app.current_screen = crate::tui::app::AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
+            cue.clone(),
+            "album.cue".to_string(),
+            EntryKind::OtherFile,
+            metadata.len(),
+            metadata.modified().ok(),
+        )];
+        app.browse.selected_index = 0;
+
+        let (tx, mut rx) = mpsc::channel(32);
+        crate::tui::keybindings::open_context_menu_with_tx(&mut app, 0, 0, Some(&tx));
+
+        let initial_root_len = match &app.active_overlay {
+            crate::tui::app::ActiveOverlay::ContextMenu { levels, .. } => {
+                let root = &levels[0].entries;
+                let utilities = direct_cue_utilities(root).expect("reserved Utilities submenu");
+                assert_eq!(utilities.len(), 1, "repair slot must reserve exactly one row");
+                assert!(matches!(
+                    &utilities[0],
+                    crate::tui::context_menu::ContextMenuEntry::Item(item)
+                        if !item.enabled && item.label == "Checking CUE repair..."
+                ));
+                assert!(direct_cue_repair_label(root).is_none());
+                root.len()
+            }
+            other => panic!("expected one open context menu, got {other:?}"),
+        };
+
+        // The user may already have entered Utilities while the exact probe is
+        // pending. Keep that same panel open and let its reserved row resolve.
+        open_direct_cue_utilities_panel(&mut app);
+
+        drive_to_exact_cue_classification(&mut app, &mut rx, &tx).await;
+
+        match &app.active_overlay {
+            crate::tui::app::ActiveOverlay::ContextMenu { levels, .. } => {
+                assert_eq!(levels.len(), 2, "the open Utilities panel must be preserved");
+                let root = &levels[0].entries;
+                assert_eq!(
+                    root.len(),
+                    initial_root_len,
+                    "async repairability must not move root menu rows"
+                );
+                let label = direct_cue_repair_label(root)
+                    .expect("first context-menu interaction must expose repair after exact probe");
+                assert!(label.contains("album.repaired.cue"), "unexpected label: {label}");
+                assert!(label.contains("missing.wav"), "unexpected label: {label}");
+                assert!(label.contains("actual.wav"), "unexpected label: {label}");
+                assert!(matches!(
+                    &levels[1].entries[0],
+                    crate::tui::context_menu::ContextMenuEntry::Item(item)
+                        if item.enabled
+                            && matches!(
+                                &item.action,
+                                crate::tui::context_menu::ContextAction::RepairCueFileReference { .. }
+                            )
+                ));
+            }
+            other => panic!("context menu closed or changed overlay: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_cue_first_context_menu_keeps_malformed_case_non_actionable_and_warns() {
+        use crate::config::AggregateMetadataTarget::{EmbeddedCue, IndividualFiles, SidecarCue};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cue = temp.path().join("album.cue");
+        write_minimal_wav(&temp.path().join("candidate-a.wav"));
+        write_minimal_wav(&temp.path().join("candidate-b.wav"));
+        std::fs::write(
+            &cue,
+            b"FILE \"missing.wav\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+        )
+        .expect("write CUE fixture");
+
+        let metadata = std::fs::metadata(&cue).expect("CUE metadata");
+        let mut config = TonepoetConfig::default();
+        config.conversion.aggregate_metadata_target_priority =
+            vec![SidecarCue, IndividualFiles, EmbeddedCue];
+        let mut app = AppState::new_for_test(config);
+        app.current_screen = crate::tui::app::AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
+            cue,
+            "album.cue".to_string(),
+            EntryKind::OtherFile,
+            metadata.len(),
+            metadata.modified().ok(),
+        )];
+        app.browse.selected_index = 0;
+
+        let (tx, mut rx) = mpsc::channel(32);
+        crate::tui::keybindings::open_context_menu_with_tx(&mut app, 0, 0, Some(&tx));
+        drive_to_exact_cue_classification(&mut app, &mut rx, &tx).await;
+
+        let root = match &app.active_overlay {
+            crate::tui::app::ActiveOverlay::ContextMenu { levels, .. } => &levels[0].entries,
+            other => panic!("context menu closed or changed overlay: {other:?}"),
+        };
+        assert!(direct_cue_repair_label(root).is_none());
+        let utilities = direct_cue_utilities(root).expect("reserved Utilities submenu");
+        assert!(matches!(
+            &utilities[0],
+            crate::tui::context_menu::ContextMenuEntry::Item(item)
+                if !item.enabled && item.label.contains("automatic repair unavailable")
+        ));
+        let warning = status(&app).unwrap_or_default();
+        assert!(warning.contains("malformed"), "unexpected warning: {warning}");
+    }
+
     fn completion_report(message: &str) -> tui_file_picker::FileTaskCompletionReport {
         tui_file_picker::FileTaskCompletionReport {
             is_move: false,
@@ -21174,6 +21471,7 @@ mod async_message_drain_tests {
                 crate::tui::probe::EmbeddedCueAvailability::Unknown,
             cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
             cue_repair_availability: crate::tui::browse::CueRepairAvailability::Unknown,
+            cue_file_reference_repairs: std::collections::BTreeMap::new(),
         }
     }
 

@@ -987,6 +987,7 @@ impl DirectorySummaryCacheEntry {
                 embedded_cue_availability: EmbeddedCueAvailability::Unknown,
                 cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
                 cue_repair_availability: CueRepairAvailability::Unknown,
+                cue_file_reference_repairs: std::collections::BTreeMap::new(),
             };
             entry.facts.classification_scope = Some(classification_scope);
             entry.facts.classification = Some(Arc::new(classification));
@@ -1099,6 +1100,21 @@ pub enum CueRepairAvailability {
     Repairable(PathBuf),
 }
 
+/// Exact, explicit-context-menu probe result for one direct-child sidecar CUE
+/// whose FILE reference may be malformed. The repair assessment itself comes
+/// from the conversion-domain parser; these two optional facts are the only
+/// additional inputs needed to apply configured aggregate-metadata authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CueFileReferenceRepairProbe {
+    pub assessment: crate::convert::cue_parser::CueFileReferenceRepairAssessment,
+    /// `Some(true)` when at least one user-visible tag row exists on the unique
+    /// replacement carrier, `Some(false)` when tags were read successfully and
+    /// absent, and `None` when absence could not be proven.
+    pub individual_tags_present: Option<bool>,
+    /// Same tri-state contract for a usable embedded CUESHEET.
+    pub embedded_cue_present: Option<bool>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FolderContentClassification {
     pub kind: FolderClassificationKind,
@@ -1122,6 +1138,11 @@ pub struct FolderContentClassification {
     /// this is resolved only by an explicit context-menu enrichment request so
     /// normal Browse movement never parses CUE sheets on the reducer thread.
     pub cue_repair_availability: CueRepairAvailability,
+    /// Per-sidecar R13 FILE-reference repair facts. Populated only by the
+    /// explicit CUE-availability worker; ordinary cursor classification keeps
+    /// this empty so moving around Browse never reads CUE/tag payloads.
+    pub cue_file_reference_repairs:
+        std::collections::BTreeMap<PathBuf, CueFileReferenceRepairProbe>,
 }
 
 fn classification_summary_scope(classification: &FolderContentClassification) -> DirectorySummaryScope {
@@ -1159,6 +1180,7 @@ impl FolderContentClassification {
             embedded_cue_availability: EmbeddedCueAvailability::Unknown,
             cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
             cue_repair_availability: CueRepairAvailability::Unknown,
+            cue_file_reference_repairs: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1175,6 +1197,7 @@ impl FolderContentClassification {
             embedded_cue_availability: EmbeddedCueAvailability::Unknown,
             cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
             cue_repair_availability: CueRepairAvailability::Unknown,
+            cue_file_reference_repairs: std::collections::BTreeMap::new(),
         }
     }
 
@@ -10009,7 +10032,8 @@ impl BrowseState {
         self.launch_ready_folder_classifications(tx);
     }
 
-    /// Request exact CUE availability for the currently selected folder.
+    /// Request exact CUE availability for the currently selected folder, or
+    /// for the displayed parent when the selected entry is an explicit CUE.
     /// The ordinary folder classifier remains extension-only and fast; this
     /// explicit request enriches its cached result on the same bounded worker
     /// only when the context menu needs sidecar-import, repairability, or
@@ -10021,13 +10045,48 @@ impl BrowseState {
         let Some(entry) = self.entries.get(self.selected_index).cloned() else {
             return;
         };
-        if !entry.is_child_dir() {
+        if self.archive.is_some() {
             return;
         }
-        let identity = ProbeCacheIdentity::from_entry(&entry);
+        let (target_path, identity, cursor_focused, direct_cue_path) = if entry.is_child_dir() {
+            (
+                entry.path.clone(),
+                ProbeCacheIdentity::from_entry(&entry),
+                true,
+                None,
+            )
+        } else if crate::convert::classify::is_cue_sheet_path(&entry.path) {
+            let target_path = self.current_dir.clone();
+            let Some(identity) = std::fs::metadata(&target_path)
+                .ok()
+                .map(|metadata| ProbeCacheIdentity::from_metadata(&metadata))
+            else {
+                return;
+            };
+            // The selected CUE remains the focus owner; the classification
+            // target is its parent directory, so the generic cursor-path
+            // equality guard must not discard this explicit request.
+            (target_path, identity, false, Some(entry.path.clone()))
+        } else {
+            return;
+        };
+        if direct_cue_path.is_some()
+            && self
+                .folder_classification_cache
+                .get(&target_path)
+                .is_some_and(|cached| !cached.is_valid_for(identity))
+        {
+            // Direct-CUE menu construction reads the displayed directory's
+            // cache rather than a child-entry cache. Drop a parent snapshot
+            // whose own identity changed before building the menu; otherwise
+            // a stale repair action could survive one frame while the exact
+            // replacement worker is being launched.
+            self.folder_classification_cache.remove(&target_path);
+            self.folder_cue_probe_fingerprint.remove(&target_path);
+        }
         let cached_cue_is_resolved_and_fresh = self
             .folder_classification_cache
-            .get(&entry.path)
+            .get(&target_path)
             .filter(|cached| cached.is_valid_for(identity))
             .is_some_and(|cached| {
                 cached.classification.embedded_cue_availability
@@ -10036,9 +10095,15 @@ impl BrowseState {
                         != CueImportAvailability::Unknown
                     && cached.classification.cue_repair_availability
                         != CueRepairAvailability::Unknown
+                    && direct_cue_path.as_ref().is_none_or(|cue_path| {
+                        cached
+                            .classification
+                            .cue_file_reference_repairs
+                            .contains_key(cue_path)
+                    })
                     && self
                         .folder_cue_probe_fingerprint
-                        .get(&entry.path)
+                        .get(&target_path)
                         .is_some_and(FolderCueProbeFingerprint::is_current)
             });
         if cached_cue_is_resolved_and_fresh {
@@ -10051,24 +10116,25 @@ impl BrowseState {
         // rendered while its exact replacement is being computed.
         if let Some(cached) = self
             .folder_classification_cache
-            .get_mut(&entry.path)
+            .get_mut(&target_path)
             .filter(|cached| cached.is_valid_for(identity))
         {
             let classification = Arc::make_mut(&mut cached.classification);
             classification.embedded_cue_availability = EmbeddedCueAvailability::Unknown;
             classification.cue_import_availability = CueImportAvailability::Unknown;
             classification.cue_repair_availability = CueRepairAvailability::Unknown;
+            classification.cue_file_reference_repairs.clear();
         }
-        self.folder_cue_probe_fingerprint.remove(&entry.path);
+        self.folder_cue_probe_fingerprint.remove(&target_path);
         self.folder_cue_availability_probe_requested
-            .insert(entry.path.clone());
-        if self.folder_classification_pending.contains_key(&entry.path) {
+            .insert(target_path.clone());
+        if self.folder_classification_pending.contains_key(&target_path) {
             return;
         }
 
         let request_id = self.next_folder_classification_request_id();
         self.folder_classification_pending.insert(
-            entry.path.clone(),
+            target_path.clone(),
             FolderClassifyPending {
                 request_id,
                 scan_generation: self.scan_generation,
@@ -10076,13 +10142,13 @@ impl BrowseState {
             },
         );
         self.folder_classification_queue
-            .retain(|request| !same_scanned_path(&request.path, &entry.path));
+            .retain(|request| !same_scanned_path(&request.path, &target_path));
         self.folder_classification_queue.push_front(FolderClassifyRequest {
             request_id,
-            path: entry.path,
+            path: target_path,
             identity,
             scan_generation: self.scan_generation,
-            cursor_focused: true,
+            cursor_focused,
             probe_cue_availability: true,
         });
         self.launch_ready_folder_classifications(tx);
@@ -10095,8 +10161,15 @@ impl BrowseState {
         path: &Path,
         tx: &tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
     ) {
+        let selected_cue_uses_parent = self
+            .entries
+            .get(self.selected_index)
+            .is_some_and(|entry| {
+                crate::convert::classify::is_cue_sheet_path(&entry.path)
+                    && same_scanned_path(path, &self.current_dir)
+            });
         if !self.folder_cue_availability_probe_requested.contains(path)
-            || !self.is_current_entry_path(path)
+            || (!self.is_current_entry_path(path) && !selected_cue_uses_parent)
         {
             return;
         }
@@ -10765,6 +10838,17 @@ impl BrowseState {
     pub fn current_folder_classification(&self) -> Option<&Arc<FolderContentClassification>> {
         let entry = self.entries.get(self.selected_index)?;
         self.valid_folder_classification_for_entry(entry)
+    }
+
+    /// Return the cached classification for the displayed directory itself.
+    ///
+    /// Direct-child CUE context menus explicitly refresh this parent cache
+    /// before construction, so this lookup deliberately performs no filesystem
+    /// I/O on the reducer thread.
+    pub fn current_directory_classification(&self) -> Option<&Arc<FolderContentClassification>> {
+        self.folder_classification_cache
+            .get(&self.current_dir)
+            .map(|cached| &cached.classification)
     }
 
     pub fn has_valid_folder_classification_for_identity(
@@ -12443,8 +12527,87 @@ pub fn spawn_folder_classification(
                         .unwrap_or(CueRepairAvailability::Absent);
                 }
 
+                classification.cue_file_reference_repairs.clear();
+                for cue_path in &candidates {
+                    let assessment =
+                        match crate::convert::cue_parser::assess_cue_file_reference_repair(
+                            cue_path,
+                        ) {
+                        Ok(assessment) => assessment,
+                        Err(error) => {
+                            log::warn!(
+                                "failed to assess direct CUE FILE reference for {}: {error}",
+                                cue_path.display()
+                            );
+                            continue;
+                        }
+                    };
+
+                    let (individual_tags_present, embedded_cue_present) = match &assessment {
+                        crate::convert::cue_parser::CueFileReferenceRepairAssessment::Repairable(
+                            plan,
+                        ) => {
+                            let audio_paths = vec![plan.replacement_audio_path.clone()];
+                            let individual_tags =
+                                cue_repair_individual_tags_present(&audio_paths, true);
+                            let embedded =
+                                match super::keybindings::embedded_cuesheet_availability_for_paths(
+                                    &audio_paths,
+                                ) {
+                                EmbeddedCueAvailability::Present => Some(true),
+                                EmbeddedCueAvailability::Absent => Some(false),
+                                EmbeddedCueAvailability::Unknown => None,
+                            };
+                            (individual_tags, embedded)
+                        }
+                        crate::convert::cue_parser::CueFileReferenceRepairAssessment::Malformed {
+                            ..
+                        } => {
+                            // A malformed FILE reference may have no unique
+                            // replacement carrier, but authority still has to
+                            // be resolved before surfacing its warning. Use the
+                            // classifier's concrete member set, and only prove
+                            // absence when that set is complete.
+                            let individual_tags = cue_repair_individual_tags_present(
+                                &classification.audio.file_paths,
+                                !incomplete_member_set,
+                            );
+                            let embedded = match classification.embedded_cue_availability {
+                                EmbeddedCueAvailability::Present => Some(true),
+                                EmbeddedCueAvailability::Absent => Some(false),
+                                EmbeddedCueAvailability::Unknown => None,
+                            };
+                            (individual_tags, embedded)
+                        }
+                        crate::convert::cue_parser::CueFileReferenceRepairAssessment::NotNeeded => {
+                            (None, None)
+                        }
+                    };
+                    classification.cue_file_reference_repairs.insert(
+                        cue_path.clone(),
+                        CueFileReferenceRepairProbe {
+                            assessment,
+                            individual_tags_present,
+                            embedded_cue_present,
+                        },
+                    );
+                }
+
                 let mut fingerprint_paths = classification.audio.file_paths.clone();
                 fingerprint_paths.extend(candidates);
+                fingerprint_paths.extend(
+                    classification
+                        .cue_file_reference_repairs
+                        .values()
+                        .filter_map(|probe| match &probe.assessment {
+                            crate::convert::cue_parser::CueFileReferenceRepairAssessment::Repairable(
+                                plan,
+                            ) => {
+                                Some(plan.replacement_audio_path.clone())
+                            }
+                            _ => None,
+                        }),
+                );
                 cue_fingerprint = FolderCueProbeFingerprint::capture(fingerprint_paths);
             }
             (classification, cue_fingerprint)
@@ -12467,6 +12630,35 @@ pub fn spawn_folder_classification(
             })
             .await;
     });
+}
+
+pub(super) fn cue_repair_individual_tags_present(
+    paths: &[PathBuf],
+    member_set_complete: bool,
+) -> Option<bool> {
+    if paths.is_empty() {
+        return member_set_complete.then_some(false);
+    }
+    let merged = super::probe::read_all_tags_merged_with_metadata(paths).ok()?;
+    if merged
+        .metadata_errors
+        .iter()
+        .flatten()
+        .any(super::probe::MetadataReadIssue::blocks_metadata_use)
+    {
+        return None;
+    }
+    let present = merged.entries.iter().any(|entry| {
+        !entry.display_key.eq_ignore_ascii_case("CUESHEET")
+            && entry.per_file_originals.iter().any(|values| {
+                values.texts().any(|value| !value.trim().is_empty())
+            })
+    });
+    if present {
+        Some(true)
+    } else {
+        member_set_complete.then_some(false)
+    }
 }
 
 #[derive(Debug)]
@@ -12564,6 +12756,7 @@ fn classify_folder_content_blocking(
             embedded_cue_availability: EmbeddedCueAvailability::Unknown,
             cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
             cue_repair_availability: CueRepairAvailability::Unknown,
+            cue_file_reference_repairs: std::collections::BTreeMap::new(),
         };
     }
 
@@ -12580,6 +12773,7 @@ fn classify_folder_content_blocking(
             embedded_cue_availability: EmbeddedCueAvailability::Unknown,
             cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
             cue_repair_availability: CueRepairAvailability::Unknown,
+            cue_file_reference_repairs: std::collections::BTreeMap::new(),
         };
     }
 
@@ -12766,6 +12960,7 @@ fn classify_units_if_decided(
                 embedded_cue_availability: EmbeddedCueAvailability::Unknown,
                 cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
                 cue_repair_availability: CueRepairAvailability::Unknown,
+                cue_file_reference_repairs: std::collections::BTreeMap::new(),
             })
         }
         MultiDiscDecision::Collection => Some(FolderContentClassification::collection(
@@ -12807,6 +13002,7 @@ fn finalize_folder_units(
                 embedded_cue_availability: EmbeddedCueAvailability::Unknown,
                 cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
                 cue_repair_availability: CueRepairAvailability::Unknown,
+                cue_file_reference_repairs: std::collections::BTreeMap::new(),
             }
         }
         _ => classify_units_if_decided(
@@ -19678,6 +19874,7 @@ mod browse_perf_followup_v10_tests {
             embedded_cue_availability: EmbeddedCueAvailability::Unknown,
             cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
             cue_repair_availability: CueRepairAvailability::Unknown,
+            cue_file_reference_repairs: std::collections::BTreeMap::new(),
         }));
         entry.facts.stats_scope = Some(DirectorySummaryScope::RecursiveBestEffort);
         entry.facts.stats = Some(Arc::new(DirStats {
@@ -20925,6 +21122,93 @@ mod disc_directory_navigation_tests {
             state.folder_cue_availability_probe_requested.contains(&album),
             "the explicit CUE request must remain owned until its exact worker completes",
         );
+    }
+
+    #[tokio::test]
+    async fn direct_cue_exact_probe_targets_displayed_parent_without_cursor_path_aliasing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cue = temp.path().join("album.cue");
+        std::fs::write(
+            &cue,
+            b"FILE \"missing.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+        )
+        .expect("cue fixture");
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let mut state = focused_state_for_existing_entry(
+            cue,
+            "album.cue",
+            EntryKind::OtherFile,
+        );
+        state.current_dir = temp.path().to_path_buf();
+
+        state.request_current_folder_cue_availability(&tx);
+
+        assert!(
+            state.folder_classification_pending_for(temp.path()),
+            "a direct CUE request must classify its displayed parent, not the text file as a folder",
+        );
+        assert!(
+            state
+                .folder_cue_availability_probe_requested
+                .contains(temp.path()),
+            "the direct CUE request must retain ownership under the displayed parent path",
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_cue_request_hides_stale_parent_repair_facts_before_menu_build() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cue = temp.path().join("album.cue");
+        std::fs::write(
+            &cue,
+            b"FILE \"missing.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+        )
+        .expect("cue fixture");
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let mut state = focused_state_for_existing_entry(
+            cue.clone(),
+            "album.cue",
+            EntryKind::OtherFile,
+        );
+        state.current_dir = temp.path().to_path_buf();
+
+        let stale_identity = ProbeCacheIdentity {
+            modified: None,
+            size: u64::MAX,
+        };
+        let mut stale = FolderContentClassification::unknown(stale_identity, false);
+        stale.cue_file_reference_repairs.insert(
+            cue.clone(),
+            CueFileReferenceRepairProbe {
+                assessment: crate::convert::cue_parser::CueFileReferenceRepairAssessment::Repairable(
+                    crate::convert::cue_parser::CueFileReferenceRepairPlan {
+                        cue_path: cue.clone(),
+                        destination_path: temp.path().join("album.repaired.cue"),
+                        original_reference: "missing.flac".to_string(),
+                        replacement_reference: "old.flac".to_string(),
+                        replacement_audio_path: temp.path().join("old.flac"),
+                    },
+                ),
+                individual_tags_present: Some(false),
+                embedded_cue_present: Some(false),
+            },
+        );
+        state.insert_folder_classification_for_identity(
+            temp.path().to_path_buf(),
+            stale_identity,
+            stale,
+        );
+        assert!(state.current_directory_classification().is_some());
+
+        state.request_current_folder_cue_availability(&tx);
+
+        assert!(
+            state.current_directory_classification().is_none(),
+            "invalid parent identity must hide stale direct-CUE repair facts before the async replacement arrives",
+        );
+        assert!(state.folder_classification_pending_for(temp.path()));
     }
 
     #[tokio::test]

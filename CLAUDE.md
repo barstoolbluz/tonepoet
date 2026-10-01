@@ -23,7 +23,7 @@ cargo test --workspace --no-fail-fast --exclude tonepoet-true-peak   # THE GATE
                              # without --no-fail-fast, --workspace stops at the
                              # first failing binary; tonepoet-true-peak costs
                              # ~41 min and is gated separately. See ## Testing —
-                             # a clean gate is 7212/0; see ## Testing for the
+                             # a clean gate is 7228/0; see ## Testing for the
                              # rare coordination-contention flake.
 cargo test -p tonepoet-backend   # Backend tests only
 cargo test -p tonepoet-features  # Features tests only
@@ -262,14 +262,17 @@ cargo test -p tonepoet-true-peak   # BS.1770 true-peak + loudness core (~41 min)
 Tests are in `crates/*/tests/` directories, `src/` (inline `#[cfg(test)]` modules), and `tests/` (integration/contract/sentinel tests). The workspace suite is ~7,210 tests across 57 targets, plus 160 in `tonepoet-true-peak`.
 NEVER truncate failure output.
 
-**A clean gate on `main` is 7212 passed / 0 FAILED.** Reference was requalified on
-2026-09-29 against the Nix rooting, and the SSRC true-peak terminal registry was
-commissioned on 2026-09-30, so the stale-evidence and uncommissioned refusals that
-previously failed are gone.
+**A clean gate on `main` is 7228 passed / 0 FAILED across 62 targets** (was 7212;
+R13 and R14 added 16 CUE-decoder and FILE-reference-repair tests on 2026-10-01).
+Reference was requalified on 2026-09-29 against the Nix rooting, and the SSRC
+true-peak terminal registry was commissioned on 2026-09-30, so the stale-evidence
+and uncommissioned refusals that previously failed are gone.
 
-A coordination-contention flake remains, and it wanders. Across roughly twenty gate runs it has
-hit ten different tests, usually none or one or two per run and once four, every one
-passing in isolation.
+A coordination-contention flake remains, and it wanders. Across roughly twenty-five gate
+runs it has hit twelve different tests, usually none or one or two per run and once four,
+every one passing in isolation. It can move between two runs of the same tree: on
+2026-10-01 the lib-only run hit one `concurrency` test and the full gate hit a different
+one, and a third run of the same commit was clean.
 Observed messages:
 
 ```
@@ -277,6 +280,7 @@ scanner probe must acquire the now-ownerless durable descriptor inode:
   Os { code: 11, kind: WouldBlock }
 retire test recovery reservation: "persistent lease is live-owned: .../…lease"
 assertion `left == right` failed   left: Live   right: RecoveryReserved
+lazy reclamation must remove the retired exported descriptor
 ```
 
 All are lock/ownership contention in the coordination-lease area, a different family from
