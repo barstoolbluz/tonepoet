@@ -23,7 +23,7 @@ cargo test --workspace --no-fail-fast --exclude tonepoet-true-peak   # THE GATE
                              # without --no-fail-fast, --workspace stops at the
                              # first failing binary; tonepoet-true-peak costs
                              # ~41 min and is gated separately. See ## Testing —
-                             # a clean gate is 7210/0; see ## Testing for the
+                             # a clean gate is 7212/0; see ## Testing for the
                              # rare coordination-contention flake.
 cargo test -p tonepoet-backend   # Backend tests only
 cargo test -p tonepoet-features  # Features tests only
@@ -262,13 +262,14 @@ cargo test -p tonepoet-true-peak   # BS.1770 true-peak + loudness core (~41 min)
 Tests are in `crates/*/tests/` directories, `src/` (inline `#[cfg(test)]` modules), and `tests/` (integration/contract/sentinel tests). The workspace suite is ~7,210 tests across 57 targets, plus 160 in `tonepoet-true-peak`.
 NEVER truncate failure output.
 
-**A clean gate on `main` is 7210 passed / 0 FAILED.** Reference was requalified on
+**A clean gate on `main` is 7212 passed / 0 FAILED.** Reference was requalified on
 2026-09-29 against the Nix rooting, and the SSRC true-peak terminal registry was
 commissioned on 2026-09-30, so the stale-evidence and uncommissioned refusals that
 previously failed are gone.
 
-A coordination-contention flake remains, and it wanders. Across a dozen gate runs it has
-hit seven different tests, never more than two in a run, every one passing in isolation.
+A coordination-contention flake remains, and it wanders. Across roughly twenty gate runs it has
+hit ten different tests, usually none or one or two per run and once four, every one
+passing in isolation.
 Observed messages:
 
 ```
@@ -281,7 +282,7 @@ assertion `left == right` failed   left: Live   right: RecoveryReserved
 All are lock/ownership contention in the coordination-lease area, a different family from
 the descriptor-size flake ("exceeds 1048576 bytes") that the schema-3 encoding fixed. Do
 not expect it on a specific test; expect it somewhere in `concurrency`,
-`tui::keybindings` or `tui::probe`.
+`tui::keybindings`, `tui::probe` or `tui::rename_plan`.
 
 A failure that survives running the test alone is real. A failure that disappears in
 isolation, with one of the messages above, is this known flake — rerun, and do not
