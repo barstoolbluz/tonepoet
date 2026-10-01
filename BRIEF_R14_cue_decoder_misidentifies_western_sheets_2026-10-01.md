@@ -49,13 +49,17 @@ that is supposed to keep Windows-1252 the Western default. When no `FILE`
 resolves there is no `+5,000` path signal to drown it out, so `+10` decides the
 encoding of the whole sheet.
 
-Windows-1251 is not involved: it earns no CJK bonus and sits at priority 5, so
-it never wins these cases. This is pre-existing behavior that R13's new tests
-are the first to exercise, because "no FILE resolves" is exactly the repair
-domain R13 introduced.
+Windows-1251 is not involved. Removing that candidate from the table entirely
+and re-running leaves both tests failing identically, with the same GBK
+message — so this is pre-existing behavior that R13's new tests are the first
+to exercise, because "no FILE resolves" is exactly the repair domain R13
+introduced. The other six `cue_file_reference_repair_*` tests pass either way.
 
-Verified independently of our code: `b"B\xF6rk"` decodes under GBK to `鰎`,
-`Аудио.flac` is GBK-encodable, `Börk.flac` is not.
+Supporting detail, verified independently of our code: `b"B\xF6rk"` decodes
+under GBK to `鰎`, which falls inside `is_cjk_or_kana`; `Аудио.flac` is
+GBK-encodable and `Börk.flac` is not; and candidates are sorted by score
+descending and only then by priority ascending, so a `+10` difference settles
+the choice before the tiebreak is consulted.
 
 ## Required
 
@@ -90,7 +94,7 @@ Gate: 5,822 passed / 3 failed in `-p tonepoet --lib`; every other target green.
 Two of the three are the failures above; the third is the flake.
 
 `cargo fmt --all -- --check` is not a usable gate here and was not run as one:
-it reports diffs in roughly 260 files including `build.rs` and all of
+it reports diffs in 285 files including `build.rs` and all of
 `tui-file-picker`, which R13 never touched. The tree has never been
 rustfmt-clean.
 
