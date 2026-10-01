@@ -599,6 +599,7 @@ struct DecodedCueCandidate {
 fn cue_decode_score(text: &str, cue_parent: Option<&Path>) -> i64 {
     let sheet = parse_cue(text);
     let mut score = 0i64;
+    let mut has_resolved_path_evidence = false;
 
     score += (sheet.tracks.len() as i64) * 1_000;
     score += sheet
@@ -623,9 +624,18 @@ fn cue_decode_score(text: &str, cue_parent: Option<&Path>) -> i64 {
             // losing only because its decoded path needs the same fallback the
             // materializer will later use.
             score += match cue_decode_path_resolution(parent, file) {
-                CueDecodePathResolution::Exact => 5_000,
-                CueDecodePathResolution::UniqueNameFallback => 4_500,
-                CueDecodePathResolution::UniqueStemFallback => 4_000,
+                CueDecodePathResolution::Exact => {
+                    has_resolved_path_evidence = true;
+                    5_000
+                }
+                CueDecodePathResolution::UniqueNameFallback => {
+                    has_resolved_path_evidence = true;
+                    4_500
+                }
+                CueDecodePathResolution::UniqueStemFallback => {
+                    has_resolved_path_evidence = true;
+                    4_000
+                }
                 CueDecodePathResolution::Ambiguous => -2_500,
                 CueDecodePathResolution::SearchDirectoryExists => 50,
                 CueDecodePathResolution::Missing => 0,
@@ -649,11 +659,13 @@ fn cue_decode_score(text: &str, cue_parent: Option<&Path>) -> i64 {
             score -= 100_000;
         } else if ch.is_control() && !matches!(ch, '\n' | '\r' | '\t') {
             score -= 500;
-        } else if cue_parent.is_some() && is_cjk_or_kana(ch) {
+        } else if has_resolved_path_evidence && is_cjk_or_kana(ch) {
             // CJK/kana is a weak signal by itself because some unrelated byte
-            // sequences are valid in multiple East Asian encodings. Use it only
-            // when path context exists; actual FILE resolution above remains
-            // the strong signal.
+            // sequences are valid in multiple East Asian encodings. Only use it
+            // after the same decoded candidate has produced corroborating FILE
+            // resolution; merely knowing the CUE's parent directory is not
+            // evidence that an East Asian decode is correct. Actual FILE
+            // resolution above remains the strong signal.
             score += 10;
         }
     }
@@ -6448,6 +6460,27 @@ FILE "album.wav" WAVE
             sheet.tracks[0].file.as_deref(),
             Some("Various - Pret-А-Porter.ape")
         );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cue_byte_decoder_keeps_western_fallback_when_east_asian_text_has_no_path_evidence() {
+        let dir = unique_cue_parser_test_dir("western_fallback_without_path_evidence");
+        let cue_path = dir.join("album.cue");
+
+        // 0xF6 0x72 is valid GBK and decodes to a CJK character, but the FILE
+        // reference is missing under every candidate. A coincidental CJK decode
+        // must not outrank the established Windows-1252 fallback in that case.
+        let raw = b"TITLE \"B\xF6rk\"\nFILE \"missing.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n";
+        let decoded = decode_cue_bytes_for_path(raw, &cue_path)
+            .expect("Windows-1252 remains the fallback without path evidence");
+        assert!(decoded.contains("TITLE \"Börk\""));
+        assert!(!decoded.contains('鰎'));
+
+        let decoded_for_write = decode_cue_bytes_with_context_for_write(raw, cue_path.parent())
+            .expect("identify write encoding");
+        assert_eq!(decoded_for_write.encoding.name(), "Windows-1252");
 
         let _ = std::fs::remove_dir_all(dir);
     }
