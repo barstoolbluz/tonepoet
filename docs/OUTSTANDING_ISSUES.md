@@ -3539,8 +3539,9 @@ The user reports MusicBrainz tagging has worked on other albums up to this one.
 
 ### Cause — established 2026-10-01
 
-Not APE. The sidecar CUE is **Windows-1251**, and the CUE text decoder has no
-Cyrillic candidate. Running the production decoder against the real file:
+Not APE. The sidecar CUE's only non-ASCII bytes require **Windows-1251**, and
+the CUE text decoder has no Cyrillic candidate. Running the production decoder
+against the real file:
 
 ```
 decoded FILE line: FILE "Various - Pret-À-Porter.ape" WAVE
@@ -3550,11 +3551,15 @@ actual filename  : "Various - Pret-А-Porter.ape"
 names equal      : false
 ```
 
-The byte is `0xC0`. Windows-1252 decodes it `À`; the filename on disk holds
-Cyrillic `А` (U+0410, `\xd0\x90` in UTF-8), which is what `0xC0` means in
-Windows-1251. The decoder's legacy candidates are CP932/Shift-JIS, EUC-JP, GBK,
-Big5 and Windows-1252 (`src/convert/cue_parser.rs`), so Windows-1252 wins by
-default and yields a filename that does not exist.
+The whole CUE holds exactly two non-ASCII bytes, both `0xC0` — one in the album
+`TITLE`, one in `FILE`. Windows-1252 decodes `0xC0` as `À`; the filename on disk
+holds Cyrillic `А` (U+0410, `\xd0\x90` in UTF-8). Among Cyrillic codepages only
+Windows-1251 maps `0xC0` to that character (KOI8-R `ю`, ISO-8859-5 `р`, CP866
+`└`). It is a homoglyph, not Russian text: Cyrillic `А` typed as a stand-in for
+the `à` of *Prêt-à-Porter*. The decoder's legacy candidates are CP932/Shift-JIS,
+EUC-JP, GBK, Big5 and Windows-1252 (`src/convert/cue_parser.rs:526`), so
+Windows-1252 wins on the priority tiebreak and yields a filename that does not
+exist.
 
 From there: the `FILE` reference does not resolve, `single_image_info_for_cue`
 returns `None`, no CUE album surface is built, the MusicBrainz flow is handed
@@ -3565,9 +3570,11 @@ Both CUE-aware path builders (`paths_for_cue_metadata_surfaces`,
 `paths_for_single_image_cue_infos` in `src/tui/command.rs`) already emit one
 path per CUE track, so nothing downstream needs changing.
 
-Repairable: the decoder's candidate scoring is already path-aware — it prefers
-a candidate whose decoded `FILE` reference actually exists — so a Cyrillic
-candidate resolves this album with no user interaction.
+Repairable: `cue_decode_score` awards `Exact` resolution +5,000 against
+`Missing` 0, so a Windows-1251 candidate would win decisively, not narrowly. The
+existing name/stem fallbacks cannot rescue it — they compare with
+`eq_ignore_ascii_case` and so cannot bridge a non-ASCII difference. One decoder
+to fix: `decode_cue_bytes_for_path` is the only variant production uses.
 
 ### Required
 
