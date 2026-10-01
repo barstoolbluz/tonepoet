@@ -29,9 +29,10 @@ realize it.
 
 ## The boundary, measured
 
-Planning across formats and depths, all 96 kHz to 176.4 kHz, forced SSRC,
-explicit TPDF, metadata transfer off. 352.8 kHz, the other rate the original
-report named, was not measured:
+Planning across formats and depths, forced SSRC, explicit TPDF, metadata
+transfer off, at both affected destination rates — 96 kHz to 176.4 kHz and
+176.4 kHz to 352.8 kHz. **The two rates give identical results**, so one table
+serves for both:
 
 | target | Int16 | Int24 | Int32 | Float32 | Float64 |
 |---|---|---|---|---|---|
@@ -45,7 +46,8 @@ realize. The two WAV
 float cells correctly plan no terminal, because there is nothing to quantize.
 
 Every cell whose terminal is FFmpeg realizes. The single failing cell is the
-one whose terminal is SoX.
+one whose terminal is SoX, and it fails the same way at both rates — so the
+gap is specific to the format and depth, not to the destination rate.
 
 ## What that suggests, unverified
 
