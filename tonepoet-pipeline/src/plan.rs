@@ -4778,7 +4778,7 @@ mod stage_a_lowering_selection_diagnostics {
     }
 
     #[test]
-    fn wavpack_int24_ssrc_unavailable_dither_refuses_but_none_stays_switchless() {
+    fn wavpack_int24_ssrc_unavailable_dither_splits_to_sox_but_none_stays_ssrc_owned() {
         let mut request = pcm_request(
             "pcm-wavpack-int24-resample-ssrc-1764",
             96_000,
@@ -4793,11 +4793,30 @@ mod stage_a_lowering_selection_diagnostics {
         request.settings.metadata.transfer_tags = false;
         request.settings.metadata.preserve_artwork = false;
 
-        let error = plan_conversion(&request)
-            .expect_err("176.4 kHz WavPack Int24 TPDF must fail before SSRC command construction");
+        let plan = plan_conversion(&request)
+            .expect("176.4 kHz WavPack Int24 TPDF must split after SSRC instead of refusing");
+        let PlanAction::Execute { commands, .. } = plan.action else {
+            panic!("WavPack Int24 split route must execute")
+        };
+        let ssrc = commands
+            .iter()
+            .find(|command| command.tool == ToolIdentifier::Ssrc)
+            .expect("SSRC Float64 command");
+        assert!(ssrc.args.windows(2).any(|pair| pair[0] == "--bits" && pair[1] == "-64"));
+        assert!(!ssrc.args.iter().any(|arg| arg == "--dither" || arg == "--pdf"));
+        let terminal = commands
+            .iter()
+            .find(|command| {
+                command.tool == ToolIdentifier::Sox
+                    && command.input.as_path() == ssrc.output.as_path()
+                    && command.args.iter().any(|arg| arg == "dither")
+            })
+            .expect("SoX must own WavPack Int24 terminal TPDF");
+        assert_eq!(ssrc.output.as_path(), terminal.input.as_path());
         assert!(
-            error.to_string().contains("ssrc_terminal_dither_unavailable"),
-            "{error}",
+            !terminal.args.iter().any(|arg| arg == "rate" || arg == "-r"),
+            "SoX terminal must not repeat SSRC's rate conversion: {:?}",
+            terminal.args,
         );
 
         request.settings.dither_type = DitherType::None;

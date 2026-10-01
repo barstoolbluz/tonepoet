@@ -263,9 +263,11 @@ pub const fn ssrc_dither_id(dither: DitherType) -> u8 {
 ///
 /// SSRC's dither table is destination-rate specific, including the nominal
 /// simple/no-shaper IDs 98/99. The pinned SSRC 2.4.2 executable exposes no
-/// dither table at unlisted rates (notably 176.4/352.8/384 kHz), so every
-/// active `--dither` selection fails closed there. A user-facing `None` request
-/// remains valid because command lowering emits no `--dither` switch at all.
+/// dither table at unlisted rates (notably 176.4/352.8/384 kHz), so an SSRC
+/// terminal cannot emit any active `--dither` selection there. Ordinary global
+/// dither policy may still be realized by a qualified terminal after an SSRC
+/// Float64 split. A user-facing `None` request remains valid because command
+/// lowering emits no `--dither` switch at all.
 #[must_use]
 pub const fn ssrc_dither_id_available_for_rate(dither_id: u8, target_rate_hz: u32) -> bool {
     match target_rate_hz {
