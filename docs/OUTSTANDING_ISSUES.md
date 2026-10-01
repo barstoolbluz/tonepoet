@@ -3853,3 +3853,59 @@ whatever scope the guard uses is no broader than the work actually in flight.
 When a claim conflict does occur, the reason names the overlapping path and the
 owning execution somewhere durable, so the conflict can be diagnosed after it clears
 rather than only while it is happening.
+
+## 60. An East Asian CUE whose audio file is missing can decode as Windows-1252 mojibake
+
+Filed 2026-10-01. Introduced deliberately by R14 as the cost of fixing the
+inverse defect; narrow, but a real regression inside its band.
+
+R14 made the `+10` CJK/kana bonus in `cue_decode_score` conditional on the same
+candidate having actually resolved a `FILE` reference. That stops a Western
+sheet whose bytes happen to form valid GBK from being read as East Asian. It
+also means a genuinely East Asian sheet loses the bonus when its audio file is
+missing or renamed, at which point it ties with Windows-1252 on the remaining
+score and loses the priority tiebreak.
+
+Measured against the production decoder, both sheets Shift-JIS with an
+unresolvable `FILE`:
+
+```
+TITLE 日本語    (93 FA 96 7B 8C EA)        -> TITLE "“ú–{Œê"    mojibake
+TITLE 日　本語  (93 FA 81 40 96 7B 8C EA)  -> TITLE "日　本語"    correct
+```
+
+The difference is byte `0x81`. WHATWG Windows-1252 maps `0x81`, `0x8D`, `0x8F`,
+`0x90` and `0x9D` to C1 control characters, and the scorer docks `-500` per
+control character — far more than the `+10` that was lost, so Shift-JIS still
+wins. A sheet whose high bytes all avoid that set has nothing penalizing
+Windows-1252 and loses.
+
+The full-width space `81 40` is pervasive in real Japanese text, so many sheets
+are incidentally protected. Short or Latin-punctuated titles are not.
+
+Scope is limited to sheets whose `FILE` does not resolve. When it resolves,
+`Exact` is worth `+5,000` and the East Asian candidate wins outright, so a
+complete, correct folder is unaffected.
+
+### Not a reason to revert R14
+
+The inverse defect R14 fixed hits Western sheets, a much larger population, and
+it mis-identified the encoding used to *write back* a repaired CUE. Keeping
+path resolution decisive is the right default.
+
+### Required
+
+An East Asian CUE whose audio file is absent still presents its own text
+correctly, without weakening the rule that path resolution decides when path
+evidence exists.
+
+Where the encoding genuinely cannot be settled, the user is told the sheet's
+encoding is uncertain rather than shown confident mojibake — and no automatic
+repair writes bytes back in a guessed codepage.
+
+### Not determined
+
+Whether an encoding-confidence signal belongs in the decoder or in the surface
+that displays the result; whether the C1-penalty interaction described above is
+dependable enough to lean on deliberately; and whether a repair surface, as
+filed for #56, is the right home for this.
