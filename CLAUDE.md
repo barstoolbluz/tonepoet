@@ -334,7 +334,7 @@ Compile-time embedded reference data lives under `assets/` (`include_str!`/`incl
 
 ## Important Notes
 
-- **The giant files** (measured 2026-09-14; they grow steadily, so re-measure rather than trusting these): `src/tui/keybindings.rs` ~108K lines, `src/convert/pipeline/stages.rs` ~72K lines / 2.8 MB, `src/tui/app.rs` ~22K lines, `src/convert/processor.rs` ~9.7K lines. stages.rs holds the pipeline stage functions, publish logic, template rendering, and conversion log assembly. **Search these; never read one whole.**
+- **The giant files** (measured 2026-10-01; they grow steadily, so re-measure rather than trusting these): `src/tui/keybindings.rs` 113K lines / 4.5 MB, `tonepoet-pipeline/src/ssrc_true_peak_terminal_commissioned.rs` 87K / 4.4 MB, `src/convert/pipeline/stages.rs` 80K / 3.1 MB, `src/tui/probe.rs` 32K / 1.3 MB, `src/tui/command.rs` 24K / 960K, `src/tui/app.rs` 23K / 908K, `src/convert/processor.rs` 13K / 500K. stages.rs holds the pipeline stage functions, publish logic, template rendering, and conversion log assembly. **Search these; never read one whole.** The commissioned registry is `@generated` by `promote_ssrc_true_peak_terminal.py` — never hand-edit it; re-run qualification and promotion instead. For scale, the tracked Rust tree is ~944K lines across 382 files, of which that one generated file is ~9%.
 - The wizard crate has its own `main.rs` for standalone use but tonepoet's `main.rs` embeds the wizard directly
 - The new TUI (`src/tui/`) is the primary interface; the wizard crate is kept as-is for legacy/preset access
 - Archive passwords are configurable via `--archive-password` flag or `config.toml` — no hardcoded defaults
