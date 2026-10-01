@@ -3515,8 +3515,12 @@ no coverage today.
 
 ## 56. A sidecar CUE in an encoding we carry no candidate for resolves to a filename that does not exist, so the album never becomes a CUE album
 
-> **RESOLVED 2026-10-01 by R13** (field-verified: the real album parses 14
-> tracks, its FILE resolves, and repair assessment is `NotNeeded`)**.** The path-aware decoder now carries a
+> **RESOLVED 2026-10-01 by R13 + R14** (field-verified: the real album parses 14
+> tracks, its FILE resolves, and repair assessment is `NotNeeded`)**.** R14
+> follows up: the `+10` CJK/kana bonus in `cue_decode_score` now requires that
+> the same candidate actually resolved a FILE reference, so a Western sheet whose
+> bytes happen to be valid GBK is no longer decoded as East Asian when nothing
+> resolves. The path-aware decoder now carries a
 > Windows-1251 candidate while preserving Windows-1252 as the syntax-only legacy
 > tie-break, so the measured Prêt-à-Porter sidecar resolves its Cyrillic-`А` image
 > exactly and reaches the normal 14-track CUE surface. For genuinely unresolved
