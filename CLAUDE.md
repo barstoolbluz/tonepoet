@@ -254,6 +254,9 @@ cargo test --workspace --no-fail-fast --exclude tonepoet-true-peak
 # --exclude tonepoet-true-peak: that crate costs ~41 min on its own. Gate it separately
 #   at crate-delivery time:  cargo test -p tonepoet-true-peak --no-fail-fast
 
+cargo test -p tonepoet --lib       # root-crate unit tests only (~5,826; ~31s after build)
+                                   #   the usual home of a real failure; the gate's
+                                   #   biggest target by far
 cargo test -p tonepoet-backend     # ffmpeg builders, integration, channels
 cargo test -p tonepoet-features    # log writer, CUE generator
 cargo test -p tonepoet-true-peak   # BS.1770 true-peak + loudness core (~41 min)
@@ -338,7 +341,8 @@ Compile-time embedded reference data lives under `assets/` (`include_str!`/`incl
 
 ## Important Notes
 
-- **The giant files** (measured 2026-10-01; they grow steadily, so re-measure rather than trusting these): `src/tui/keybindings.rs` 113K lines / 4.5 MB, `tonepoet-pipeline/src/ssrc_true_peak_terminal_commissioned.rs` 87K / 4.4 MB, `src/convert/pipeline/stages.rs` 80K / 3.1 MB, `src/tui/probe.rs` 32K / 1.3 MB, `src/tui/command.rs` 24K / 960K, `src/tui/app.rs` 23K / 908K, `src/convert/processor.rs` 13K / 500K. stages.rs holds the pipeline stage functions, publish logic, template rendering, and conversion log assembly. **Search these; never read one whole.** The commissioned registry is `@generated` by `promote_ssrc_true_peak_terminal.py` — never hand-edit it; re-run qualification and promotion instead. For scale, the tracked Rust tree is ~944K lines across 382 files, of which that one generated file is ~9%.
+- **The giant files** (re-measured 2026-10-01 after R13/R14; they grow steadily, so re-measure rather than trusting these): `src/tui/keybindings.rs` 113K lines / 4.5 MB, `tonepoet-pipeline/src/ssrc_true_peak_terminal_commissioned.rs` 87K / 4.4 MB, `src/convert/pipeline/stages.rs` 80K / 3.1 MB, `src/tui/probe.rs` 32K / 1.3 MB, `src/tui/command.rs` 24K / 960K, `src/tui/app.rs` 23K / 908K, `src/tui/event_loop.rs` 23K / 936K, `src/tui/browse.rs` 22K / 836K, `src/convert/processor.rs` 13K / 500K, `src/tui/context_menu.rs` 8.5K / 340K, `src/convert/cue_parser.rs` 7.2K / 272K. stages.rs holds the pipeline stage functions, publish logic, template rendering, and conversion log assembly. **Search these; never read one whole.** The commissioned registry is `@generated` by `promote_ssrc_true_peak_terminal.py` — never hand-edit it; re-run qualification and promotion instead. For scale, the tracked Rust tree is ~946K lines across 393 files, of which that one generated file is ~9%.
+- **CUE text encoding is guessed, and path resolution is the deciding signal.** `decode_cue_bytes_for_path` (`src/convert/cue_parser.rs`) is the only decoder production uses; the path-blind `decode_cue_bytes` is test-only. It tries UTF-8/BOM first, then scores legacy candidates — CP932/Shift-JIS, EUC-JP, GBK, Big5, Windows-1251, Windows-1252 — and sorts by score descending, then by priority ascending (Windows-1252 is priority 0, the Western default on a pure tie). Resolving a decoded `FILE` reference is worth up to +5,000 and dominates everything else; the +10 CJK/kana bonus applies *only* when that same candidate actually resolved a file (R14). Consequence worth knowing before touching the scorer: when no candidate resolves, the decision comes down to the tiebreak and the -500-per-control-character penalty — see issue #60.
 - The wizard crate has its own `main.rs` for standalone use but tonepoet's `main.rs` embeds the wizard directly
 - The new TUI (`src/tui/`) is the primary interface; the wizard crate is kept as-is for legacy/preset access
 - Archive passwords are configurable via `--archive-password` flag or `config.toml` — no hardcoded defaults
