@@ -3538,10 +3538,17 @@ fn plan_typed_with_effects_and_policy(
                 ))
                 && terminal_dither != DitherType::None
                 && !mapping::requires_sox_dither(terminal_dither)
-                && mapping::soxr_dither_method(terminal_dither).is_some();
+                && mapping::soxr_dither_method(terminal_dither).is_some()
+                && candidates.iter().any(|candidate| {
+                    candidate.tool.as_ref() == Some(&ToolIdentifier::Ffmpeg)
+                        && candidate_contract_mismatch(candidate, &requirements).is_none()
+                });
             // Preserve the retained SSRC split cell: after a Float64 SSRC
             // output, FFmpeg owns terminal dither families that it can realize
-            // exactly. The command lowerer binds this already-selected tool
+            // exactly, but only where FFmpeg is actually an admitted terminal
+            // candidate. WavPack Int24 deliberately excludes FFmpeg because its
+            // encoder silently substitutes 32-bit storage; that split remains
+            // SoX-owned. The command lowerer binds this already-selected tool
             // rather than re-ranking the terminal step a second time.
             let current_route = if ssrc_split_ffmpeg_terminal {
                 Some(ToolIdentifier::Ffmpeg)
@@ -9359,6 +9366,7 @@ mod tests {
         let Ok(PlanningOutcome::Ready(plan)) = plan_typed(&request) else {
             panic!("WavPack Int24 must keep SSRC for rate conversion and move TPDF to SoX")
         };
+        assert_eq!(plan.execution_capability, ExecutionCapability::ExecutableNow);
         let (resample_parameters, resample_candidate) = plan
             .nodes
             .iter()
@@ -9446,6 +9454,7 @@ mod tests {
         let Ok(PlanningOutcome::Ready(plan)) = plan_typed(&request) else {
             panic!("FLAC must keep SSRC for rate conversion and move TPDF to FFmpeg")
         };
+        assert_eq!(plan.execution_capability, ExecutionCapability::ExecutableNow);
         let terminal = plan
             .nodes
             .iter()
