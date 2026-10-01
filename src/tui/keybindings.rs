@@ -12178,6 +12178,153 @@ pub(super) fn handle_browse_cue_repair_complete(
     }
 }
 
+const BROWSE_CUE_FILE_REFERENCE_REPAIR_STATUS: &str = "Repairing CUE FILE reference...";
+
+pub(super) fn start_browse_cue_file_reference_repair(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    expected_plan: crate::convert::cue_parser::CueFileReferenceRepairPlan,
+) {
+    // Reuse the explicit CUE operation generation: a later inspection/repair
+    // supersedes this one, and stale completions cannot steal status ownership.
+    app.browse_cue_inspection_generation = app.browse_cue_inspection_generation.wrapping_add(1);
+    let generation = app.browse_cue_inspection_generation;
+    let browse_scan_generation = app.browse.scan_generation;
+    let tab_id = app.browse.active_tab_id();
+    let origin_dir = app.browse.current_dir.clone();
+    let metadata_target_priority = app.config.conversion.aggregate_metadata_target_priority.clone();
+    app.active_overlay = ActiveOverlay::None;
+    app.set_status(BROWSE_CUE_FILE_REFERENCE_REPAIR_STATUS);
+
+    let tx = tx.clone();
+    let cue_path = expected_plan.cue_path.clone();
+    tokio::spawn(async move {
+        let worker_path = expected_plan.cue_path.clone();
+        let result = match tokio::task::spawn_blocking(move || {
+            let assessment = crate::convert::cue_parser::assess_cue_file_reference_repair(
+                &worker_path,
+            )?;
+            let current_plan = match assessment {
+                crate::convert::cue_parser::CueFileReferenceRepairAssessment::Repairable(plan) => {
+                    plan
+                }
+                crate::convert::cue_parser::CueFileReferenceRepairAssessment::NotNeeded => {
+                    return Err(format!(
+                        "CUE '{}' no longer needs FILE-reference repair",
+                        worker_path.display()
+                    ));
+                }
+                crate::convert::cue_parser::CueFileReferenceRepairAssessment::Malformed {
+                    warning,
+                } => return Err(warning),
+            };
+            if current_plan != expected_plan {
+                return Err(format!(
+                    "CUE '{}' repair inputs changed after the menu was built; reopen Utilities to review the new repair before running it",
+                    worker_path.display()
+                ));
+            }
+            let audio_paths = vec![current_plan.replacement_audio_path.clone()];
+            let individual_tags_present =
+                super::browse::cue_repair_individual_tags_present(&audio_paths, true);
+            let embedded_cue_present =
+                match embedded_cuesheet_availability_for_paths(&audio_paths) {
+                    super::probe::EmbeddedCueAvailability::Present => Some(true),
+                    super::probe::EmbeddedCueAvailability::Absent => Some(false),
+                    super::probe::EmbeddedCueAvailability::Unknown => None,
+                };
+            if !super::context_menu::direct_cue_sidecar_authority_is_proven(
+                &metadata_target_priority,
+                individual_tags_present,
+                embedded_cue_present,
+            ) {
+                return Err(format!(
+                    "CUE '{}' is no longer the proven authoritative metadata source; repair was not run",
+                    worker_path.display()
+                ));
+            }
+            crate::convert::cue_parser::repair_cue_file_reference_with_plan(&current_plan)
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => Err(format!(
+                "CUE FILE-reference repair worker did not complete: {error}"
+            )),
+        };
+        let _ = tx
+            .send(AppMessage::BrowseCueFileReferenceRepairComplete {
+                generation,
+                browse_scan_generation,
+                tab_id,
+                origin_dir,
+                cue_path,
+                result,
+            })
+            .await;
+    });
+}
+
+pub(super) fn handle_browse_cue_file_reference_repair_complete(
+    app: &mut AppState,
+    generation: u64,
+    browse_scan_generation: u64,
+    tab_id: super::browse::BrowseTabId,
+    origin_dir: std::path::PathBuf,
+    cue_path: std::path::PathBuf,
+    result: Result<crate::convert::cue_parser::CueFileReferenceRepairOutcome, String>,
+) {
+    if app.browse_cue_inspection_generation != generation {
+        log::debug!(
+            "discarded superseded CUE FILE-reference repair for {}",
+            cue_path.display()
+        );
+        return;
+    }
+    if app.current_screen != AppScreen::Browse
+        || app.browse.scan_generation != browse_scan_generation
+        || app.browse.active_tab_id() != tab_id
+        || app.browse.current_dir != origin_dir
+    {
+        if app
+            .status_message
+            .as_ref()
+            .is_some_and(|(message, _)| message == BROWSE_CUE_FILE_REFERENCE_REPAIR_STATUS)
+        {
+            app.status_message = None;
+        }
+        log::debug!(
+            "discarded stale CUE FILE-reference repair completion for {}",
+            cue_path.display()
+        );
+        return;
+    }
+
+    match result {
+        Ok(crate::convert::cue_parser::CueFileReferenceRepairOutcome::Created { path }) => {
+            app.set_status(format!(
+                "Created repaired CUE {}; original {} was not changed",
+                path.display(),
+                cue_path.display()
+            ));
+        }
+        Ok(
+            crate::convert::cue_parser::CueFileReferenceRepairOutcome::ExistingIdentical { path },
+        ) => {
+            app.set_status(format!(
+                "Validated existing repaired CUE {}; original {} was not changed",
+                path.display(),
+                cue_path.display()
+            ));
+        }
+        Err(error) => {
+            app.set_status(format!(
+                "CUE FILE-reference repair failed; original left unchanged: {error}"
+            ));
+        }
+    }
+}
+
 fn accept_cue_selection(
     app: &mut AppState,
     tx: &mpsc::Sender<AppMessage>,
@@ -13144,6 +13291,21 @@ pub(super) fn open_context_menu_with_tx(
             match hit {
                 Some(TuiButton::BrowseEntry(_)) | Some(TuiButton::BrowseEntryGutter(_)) => {
                     app.browse_context_action_paths = browse_context_paths_for_current_entry(app);
+                    let malformed_cue_warning = app.browse.selected_entry().and_then(|entry| {
+                        if !crate::convert::classify::is_cue_sheet_path(&entry.path) {
+                            return None;
+                        }
+                        direct_cue_file_reference_probe_if_authoritative(app, &entry.path)
+                            .and_then(|probe| match &probe.assessment {
+                                crate::convert::cue_parser::CueFileReferenceRepairAssessment::Malformed {
+                                    warning,
+                                } => Some(warning.clone()),
+                                _ => None,
+                            })
+                    });
+                    if let Some(warning) = malformed_cue_warning {
+                        app.set_status(warning);
+                    }
                     build_browse_entry_menu(app)
                 }
                 Some(TuiButton::BrowseTreeNode(index))

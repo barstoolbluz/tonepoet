@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use encoding_rs::{BIG5, EUC_JP, GBK, SHIFT_JIS, WINDOWS_1252};
+use encoding_rs::{BIG5, EUC_JP, GBK, SHIFT_JIS, WINDOWS_1251, WINDOWS_1252};
 
 /// Open-ended metadata carried inside a CUE using Tonepoet-owned inert REM
 /// records. Values are ordered because several editor fields are ordered
@@ -427,7 +427,7 @@ pub fn parse_cue_file(path: &Path) -> Result<CueSheet, String> {
 /// CUE files from older ripping tools are often not UTF-8. We first accept
 /// UTF-8 and Unicode files that declare a BOM. Legacy CUEs are decoded by
 /// trying common, non-lossy encodings used by real-world rips: CP932/Shift-JIS,
-/// EUC-JP, GBK, Big5, and Windows-1252. Candidates are scored by CUE parse
+/// EUC-JP, GBK, Big5, Windows-1251, and Windows-1252. Candidates are scored by CUE parse
 /// quality and, when a CUE path is available, by whether decoded FILE references
 /// resolve on disk using the same separator-normalization and extension-fallback
 /// semantics used by the materializer. Unlike `String::from_utf8_lossy`, this never substitutes
@@ -527,6 +527,11 @@ fn decode_cue_bytes_with_context_for_write(
         LegacyCueEncoding { name: "EUC-JP", encoding: EUC_JP, priority: 2 },
         LegacyCueEncoding { name: "GBK", encoding: GBK, priority: 3 },
         LegacyCueEncoding { name: "Big5", encoding: BIG5, priority: 4 },
+        // Keep Windows-1252 as the Western fallback on syntax-only ties. A
+        // path-resolving Windows-1251 decode still wins by thousands of points,
+        // which fixes Cyrillic/homoglyph filenames without changing pathless
+        // legacy-decoder behavior for bytes that are valid in both codepages.
+        LegacyCueEncoding { name: "Windows-1251", encoding: WINDOWS_1251, priority: 5 },
         // Prefer Windows-1252 on pure syntax ties. Path-aware scoring below
         // still lets CP932/Shift-JIS, EUC-JP, GBK, or Big5 win when their
         // decoded FILE references actually exist.
@@ -570,7 +575,7 @@ fn decode_cue_bytes_with_context_for_write(
             },
         })
         .ok_or_else(|| {
-            "CUE is not valid UTF-8, UTF-16, CP932/Shift-JIS, EUC-JP, GBK, Big5, or Windows-1252"
+            "CUE is not valid UTF-8, UTF-16, CP932/Shift-JIS, EUC-JP, GBK, Big5, Windows-1251, or Windows-1252"
                 .to_string()
         })
 }
@@ -769,6 +774,511 @@ fn is_cjk_or_kana(ch: char) -> bool {
             | 0x4E00..=0x9FFF  // CJK Unified Ideographs
             | 0xAC00..=0xD7AF  // Hangul syllables
     )
+}
+
+/// A narrowly-scoped repair Tonepoet can prove before offering it to a user.
+///
+/// R13 deliberately limits automatic FILE-reference repair to a single-image
+/// sidecar: every AUDIO track must share one relative FILE reference, that
+/// reference must fail the normal resolver, and its search directory must
+/// contain exactly one audio file. Anything broader would require guessing
+/// among filenames or changing multi-file geometry, neither of which is a safe
+/// automatic repair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CueFileReferenceRepairPlan {
+    pub cue_path: PathBuf,
+    pub destination_path: PathBuf,
+    pub original_reference: String,
+    pub replacement_reference: String,
+    pub replacement_audio_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CueFileReferenceRepairAssessment {
+    /// The CUE's FILE reference already resolves under normal materializer
+    /// semantics, so changing it would be gratuitous.
+    NotNeeded,
+    /// The defect has one deterministic repair.
+    Repairable(CueFileReferenceRepairPlan),
+    /// The CUE is malformed, but Tonepoet cannot repair it without guessing.
+    Malformed { warning: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CueFileReferenceRepairOutcome {
+    Created { path: PathBuf },
+    ExistingIdentical { path: PathBuf },
+}
+
+/// Return the sibling path used by the explicit R13 repair surface.
+///
+/// The original is intentionally never mutated: this makes recovery trivial
+/// and mirrors the established cumulative-CUE repair-copy convention.
+pub fn cue_file_reference_repair_copy_path(cue_path: &Path) -> Option<PathBuf> {
+    let parent = cue_path.parent()?;
+    let stem = cue_path.file_stem()?;
+    if stem
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        .ends_with(".repaired")
+    {
+        return None;
+    }
+    let mut repaired_name = stem.to_os_string();
+    repaired_name.push(".repaired.cue");
+    Some(parent.join(repaired_name))
+}
+
+/// Inspect one sidecar CUE and determine whether its unresolved FILE reference
+/// has a single safe repair. This function performs no writes.
+pub fn assess_cue_file_reference_repair(
+    cue_path: &Path,
+) -> Result<CueFileReferenceRepairAssessment, String> {
+    let raw = std::fs::read(cue_path).map_err(|error| {
+        format!(
+            "failed to read CUE '{}' for FILE-reference repair: {error}",
+            cue_path.display()
+        )
+    })?;
+    assess_cue_file_reference_repair_bytes(cue_path, &raw)
+}
+
+fn assess_cue_file_reference_repair_bytes(
+    cue_path: &Path,
+    raw: &[u8],
+) -> Result<CueFileReferenceRepairAssessment, String> {
+    let parent = cue_path.parent().ok_or_else(|| {
+        format!(
+            "CUE '{}' has no parent directory; FILE-reference repair is unavailable",
+            cue_path.display()
+        )
+    })?;
+    let decoded = match decode_cue_bytes_for_path(raw, cue_path) {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            return Ok(CueFileReferenceRepairAssessment::Malformed {
+                warning: format!("CUE '{}' is malformed: {error}", cue_path.display()),
+            });
+        }
+    };
+    let sheet = parse_cue(&decoded);
+    if sheet.tracks.is_empty() {
+        return Ok(CueFileReferenceRepairAssessment::Malformed {
+            warning: format!(
+                "CUE '{}' is malformed: it has no AUDIO tracks",
+                cue_path.display()
+            ),
+        });
+    }
+
+    let mut file_references = std::collections::BTreeSet::<String>::new();
+    for track in &sheet.tracks {
+        let Some(reference) = track.file.as_deref().filter(|value| !value.trim().is_empty()) else {
+            return Ok(CueFileReferenceRepairAssessment::Malformed {
+                warning: format!(
+                    "CUE '{}' is malformed: AUDIO track {} has no FILE reference",
+                    cue_path.display(),
+                    track.number
+                ),
+            });
+        };
+        file_references.insert(reference.to_string());
+    }
+
+    if file_references.len() != 1 {
+        let unresolved = file_references.iter().any(|reference| {
+            !matches!(
+                cue_decode_path_resolution(parent, reference),
+                CueDecodePathResolution::Exact
+                    | CueDecodePathResolution::UniqueNameFallback
+                    | CueDecodePathResolution::UniqueStemFallback
+            )
+        });
+        return Ok(if unresolved {
+            CueFileReferenceRepairAssessment::Malformed {
+                warning: format!(
+                    "CUE '{}' is malformed: automatic FILE-reference repair is limited to a single shared image reference; this sheet contains {} distinct AUDIO FILE references",
+                    cue_path.display(),
+                    file_references.len()
+                ),
+            }
+        } else {
+            CueFileReferenceRepairAssessment::NotNeeded
+        });
+    }
+
+    let original_reference = file_references.into_iter().next().expect("one reference");
+    match cue_decode_path_resolution(parent, &original_reference) {
+        CueDecodePathResolution::Exact
+        | CueDecodePathResolution::UniqueNameFallback
+        | CueDecodePathResolution::UniqueStemFallback => {
+            return Ok(CueFileReferenceRepairAssessment::NotNeeded);
+        }
+        CueDecodePathResolution::Ambiguous => {
+            return Ok(CueFileReferenceRepairAssessment::Malformed {
+                warning: format!(
+                    "CUE '{}' is malformed: FILE reference {:?} is ambiguous; no automatic repair is safe",
+                    cue_path.display(),
+                    original_reference
+                ),
+            });
+        }
+        CueDecodePathResolution::SearchDirectoryExists | CueDecodePathResolution::Missing => {}
+    }
+
+    let normalized_reference =
+        original_reference.replace('\\', &std::path::MAIN_SEPARATOR.to_string());
+    let raw_path = PathBuf::from(&normalized_reference);
+    if raw_path.is_absolute()
+        || raw_path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Ok(CueFileReferenceRepairAssessment::Malformed {
+            warning: format!(
+                "CUE '{}' is malformed: FILE reference {:?} escapes the sidecar directory; Tonepoet will not guess a replacement",
+                cue_path.display(),
+                original_reference
+            ),
+        });
+    }
+
+    let search_dir = cue_decode_fallback_search_dir(parent, &raw_path);
+    let candidates = match cue_repair_audio_candidates(&search_dir) {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            return Ok(CueFileReferenceRepairAssessment::Malformed {
+                warning: format!(
+                    "CUE '{}' is malformed: FILE reference {:?} does not resolve and its candidate directory cannot be inspected completely: {error}; no automatic repair is safe",
+                    cue_path.display(),
+                    original_reference
+                ),
+            });
+        }
+    };
+    if candidates.len() != 1 {
+        let detail = match candidates.len() {
+            0 => "no audio files are available in the referenced directory".to_string(),
+            count => format!("{count} audio files are plausible replacements"),
+        };
+        return Ok(CueFileReferenceRepairAssessment::Malformed {
+            warning: format!(
+                "CUE '{}' is malformed: FILE reference {:?} does not resolve and {detail}; no automatic repair is safe",
+                cue_path.display(),
+                original_reference
+            ),
+        });
+    }
+
+    let replacement_audio_path = candidates.into_iter().next().expect("one candidate");
+    let replacement_name = match replacement_audio_path
+        .file_name()
+        .and_then(|value| value.to_str())
+    {
+        Some(name) => name,
+        None => {
+            return Ok(CueFileReferenceRepairAssessment::Malformed {
+                warning: format!(
+                    "CUE '{}' is malformed: the unique replacement audio filename is not valid Unicode; automatic repair is unavailable",
+                    cue_path.display()
+                ),
+            });
+        }
+    };
+    let replacement_reference =
+        cue_repair_reference_with_original_directory(&original_reference, replacement_name);
+    if replacement_reference.chars().any(|ch| matches!(ch, '\r' | '\n' | '"')) {
+        return Ok(CueFileReferenceRepairAssessment::Malformed {
+            warning: format!(
+                "CUE '{}' is malformed: the only replacement filename cannot be represented safely in a CUE FILE directive",
+                cue_path.display()
+            ),
+        });
+    }
+
+    let destination_path = match cue_file_reference_repair_copy_path(cue_path) {
+        Some(path) => path,
+        None => {
+            return Ok(CueFileReferenceRepairAssessment::Malformed {
+                warning: format!(
+                    "CUE '{}' is already a repair copy and is still malformed; Tonepoet will not create a second-generation repair",
+                    cue_path.display()
+                ),
+            });
+        }
+    };
+
+    let plan = CueFileReferenceRepairPlan {
+        cue_path: cue_path.to_path_buf(),
+        destination_path,
+        original_reference,
+        replacement_reference,
+        replacement_audio_path,
+    };
+    let repaired_bytes = match validated_cue_file_reference_repair_bytes(raw, cue_path, &plan) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return Ok(CueFileReferenceRepairAssessment::Malformed {
+                warning: format!(
+                    "CUE '{}' is malformed and Tonepoet cannot produce a validated automatic repair: {error}",
+                    cue_path.display()
+                ),
+            });
+        }
+    };
+    match std::fs::read(&plan.destination_path) {
+        Ok(existing) if existing != repaired_bytes => {
+            return Ok(CueFileReferenceRepairAssessment::Malformed {
+                warning: format!(
+                    "CUE '{}' is malformed, but repair target '{}' already exists with different contents; Tonepoet will not overwrite it",
+                    cue_path.display(),
+                    plan.destination_path.display()
+                ),
+            });
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Ok(CueFileReferenceRepairAssessment::Malformed {
+                warning: format!(
+                    "CUE '{}' is malformed, but repair target '{}' cannot be inspected safely: {error}",
+                    cue_path.display(),
+                    plan.destination_path.display()
+                ),
+            });
+        }
+    }
+
+    Ok(CueFileReferenceRepairAssessment::Repairable(plan))
+}
+
+fn cue_repair_audio_candidates(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(format!(
+                "failed to read '{}': {error}",
+                dir.display()
+            ));
+        }
+    };
+
+    let mut candidates = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "failed while enumerating '{}': {error}",
+                dir.display()
+            )
+        })?;
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+            format!(
+                "failed to inspect candidate '{}': {error}",
+                path.display()
+            )
+        })?;
+        if metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && cue_decode_has_audio_extension(&path)
+        {
+            candidates.push(path);
+        }
+    }
+    candidates.sort();
+    Ok(candidates)
+}
+
+fn cue_repair_reference_with_original_directory(
+    original_reference: &str,
+    replacement_name: &str,
+) -> String {
+    // Preserve the sidecar's original slash convention and directory token
+    // byte-for-byte. Only the basename is the repair target.
+    match original_reference.rfind(|ch| ch == '/' || ch == '\\') {
+        Some(index) => format!("{}{replacement_name}", &original_reference[..=index]),
+        None => replacement_name.to_string(),
+    }
+}
+
+/// Create a validated sibling repair copy from one exact source snapshot.
+/// The source sidecar is never modified or renamed.
+pub fn repair_cue_file_reference(
+    cue_path: &Path,
+) -> Result<CueFileReferenceRepairOutcome, String> {
+    let raw = std::fs::read(cue_path).map_err(|error| {
+        format!(
+            "failed to read CUE '{}' for FILE-reference repair: {error}",
+            cue_path.display()
+        )
+    })?;
+    let plan = match assess_cue_file_reference_repair_bytes(cue_path, &raw)? {
+        CueFileReferenceRepairAssessment::Repairable(plan) => plan,
+        CueFileReferenceRepairAssessment::NotNeeded => {
+            return Err(format!(
+                "CUE '{}' does not need FILE-reference repair",
+                cue_path.display()
+            ));
+        }
+        CueFileReferenceRepairAssessment::Malformed { warning } => return Err(warning),
+    };
+    commit_cue_file_reference_repair(&raw, &plan)
+}
+
+/// Execute the exact repair plan previously shown to the user. If filesystem
+/// changes would alter any visible repair input, refuse and require the menu to
+/// be rebuilt rather than silently applying a different edit.
+pub fn repair_cue_file_reference_with_plan(
+    expected_plan: &CueFileReferenceRepairPlan,
+) -> Result<CueFileReferenceRepairOutcome, String> {
+    let cue_path = &expected_plan.cue_path;
+    let raw = std::fs::read(cue_path).map_err(|error| {
+        format!(
+            "failed to read CUE '{}' for FILE-reference repair: {error}",
+            cue_path.display()
+        )
+    })?;
+    let current_plan = match assess_cue_file_reference_repair_bytes(cue_path, &raw)? {
+        CueFileReferenceRepairAssessment::Repairable(plan) => plan,
+        CueFileReferenceRepairAssessment::NotNeeded => {
+            return Err(format!(
+                "CUE '{}' no longer needs FILE-reference repair",
+                cue_path.display()
+            ));
+        }
+        CueFileReferenceRepairAssessment::Malformed { warning } => return Err(warning),
+    };
+    if current_plan != *expected_plan {
+        return Err(format!(
+            "CUE '{}' repair inputs changed after the action was offered; reopen Utilities to review the new repair",
+            cue_path.display()
+        ));
+    }
+    commit_cue_file_reference_repair(&raw, &current_plan)
+}
+
+fn commit_cue_file_reference_repair(
+    raw: &[u8],
+    plan: &CueFileReferenceRepairPlan,
+) -> Result<CueFileReferenceRepairOutcome, String> {
+    let cue_path = &plan.cue_path;
+    let repaired_bytes = validated_cue_file_reference_repair_bytes(raw, cue_path, plan)?;
+
+    // Match the established cumulative-CUE repair publication discipline:
+    // reject a stale source snapshot, claim the destination namespace object,
+    // then publish without overwrite. The original is never write-claimed or
+    // mutated.
+    ensure_sidecar_snapshot_unchanged(cue_path, raw)?;
+    let (_mutation_claim, admitted_destination) =
+        acquire_cue_sidecar_write_claim(&plan.destination_path)?;
+
+    // The repair copy is useful only while its replacement still resolves to
+    // the exact filename shown to the user. Re-check immediately before
+    // publication; external filesystem changes after this point are outside
+    // Tonepoet's mutation authority, but no stale plan is knowingly committed.
+    if cue_decode_path_resolution(
+        plan.destination_path
+            .parent()
+            .ok_or_else(|| "repair destination has no parent directory".to_string())?,
+        &plan.replacement_reference,
+    ) != CueDecodePathResolution::Exact
+    {
+        return Err(format!(
+            "replacement audio '{}' changed or disappeared before commit; no repair copy was written",
+            plan.replacement_audio_path.display()
+        ));
+    }
+
+    // Validate the source again after acquiring the destination claim so even
+    // an idempotent ExistingIdentical result is tied to the current source.
+    ensure_sidecar_snapshot_unchanged(cue_path, raw)?;
+    match std::fs::read(&admitted_destination) {
+        Ok(existing) if existing == repaired_bytes => {
+            return Ok(CueFileReferenceRepairOutcome::ExistingIdentical {
+                path: plan.destination_path.clone(),
+            });
+        }
+        Ok(_) => {
+            return Err(format!(
+                "repaired CUE destination '{}' already exists with different contents; left it unchanged",
+                plan.destination_path.display()
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect repaired CUE destination '{}': {error}",
+                plan.destination_path.display()
+            ));
+        }
+    }
+
+    // Re-read the source immediately before publication as well. The first
+    // check rejects work prepared from an already-stale snapshot; this second
+    // check closes the local window spent acquiring/validating the destination.
+    ensure_sidecar_snapshot_unchanged(cue_path, raw)?;
+    atomic_create_new_no_replace(&admitted_destination, &repaired_bytes)?;
+    Ok(CueFileReferenceRepairOutcome::Created {
+        path: plan.destination_path.clone(),
+    })
+}
+
+fn validated_cue_file_reference_repair_bytes(
+    raw: &[u8],
+    cue_path: &Path,
+    plan: &CueFileReferenceRepairPlan,
+) -> Result<Vec<u8>, String> {
+    let replacements = BTreeMap::from([(
+        plan.original_reference.clone(),
+        plan.replacement_reference.clone(),
+    )]);
+    let (encoding_outcome, repaired_bytes) =
+        rewrite_cue_file_reference_bytes(raw, cue_path, &replacements)?;
+    if let CueSidecarWritebackOutcome::RewrittenUtf8Fallback { source_encoding } =
+        encoding_outcome
+    {
+        return Err(format!(
+            "replacement FILE reference is not representable in the source {source_encoding} encoding; automatic repair will not normalize the whole CUE to UTF-8"
+        ));
+    }
+    if repaired_bytes.as_slice() == raw {
+        return Err(format!(
+            "CUE '{}' repair produced no byte change; original left unchanged",
+            cue_path.display()
+        ));
+    }
+
+    let decoded_repaired = decode_cue_bytes_for_path(&repaired_bytes, &plan.destination_path)
+        .map_err(|error| format!("failed to validate repaired CUE encoding: {error}"))?;
+    let repaired_sheet = parse_cue(&decoded_repaired);
+    if repaired_sheet.tracks.is_empty()
+        || repaired_sheet.tracks.iter().any(|track| {
+            track.file.as_deref() != Some(plan.replacement_reference.as_str())
+                || track.index01_frames.is_none()
+        })
+    {
+        return Err(
+            "repaired CUE failed FILE/track/index validation; no copy was written".to_string(),
+        );
+    }
+    if cue_decode_path_resolution(
+        plan.destination_path
+            .parent()
+            .ok_or_else(|| "repair destination has no parent directory".to_string())?,
+        &plan.replacement_reference,
+    ) != CueDecodePathResolution::Exact
+    {
+        return Err(
+            "repaired CUE FILE reference did not resolve exactly; no copy was written".to_string(),
+        );
+    }
+    Ok(repaired_bytes)
 }
 
 
@@ -5910,6 +6420,251 @@ FILE "album.wav" WAVE
 
         let sheet = parse_cue(&decoded);
         assert_eq!(sheet.tracks[0].file.as_deref(), Some("日本.flac"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cue_byte_decoder_uses_path_context_for_windows_1251_homoglyph_filename() {
+        let dir = unique_cue_parser_test_dir("windows_1251_homoglyph");
+        let audio_path = dir.join("Various - Pret-А-Porter.ape");
+        std::fs::write(&audio_path, b"").expect("create referenced audio");
+        let cue_path = dir.join("album.cue");
+
+        // 0xC0 is À in Windows-1252 but Cyrillic А (U+0410) in Windows-1251.
+        // With no path context the established Windows-1252 tie-break remains
+        // stable; with the real sidecar path, the exact FILE hit must dominate.
+        let raw = b"TITLE \"Pret-\xC0-Porter\"\nFILE \"Various - Pret-\xC0-Porter.ape\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n";
+        let pathless = decode_cue_bytes(raw).expect("pathless legacy decode");
+        assert!(pathless.contains("Pret-À-Porter"));
+
+        let decoded = decode_cue_bytes_for_path(raw, &cue_path)
+            .expect("Windows-1251 fallback decodes with path context");
+        assert!(decoded.contains("Pret-А-Porter"));
+        assert!(!decoded.contains("Pret-À-Porter"));
+
+        let sheet = parse_cue(&decoded);
+        assert_eq!(
+            sheet.tracks[0].file.as_deref(),
+            Some("Various - Pret-А-Porter.ape")
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cue_file_reference_repair_is_single_candidate_copy_only_and_idempotent() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let dir = unique_cue_parser_test_dir("file_reference_repair_unique");
+        let cue_path = dir.join("album.cue");
+        let audio_path = dir.join("actual.flac");
+        std::fs::write(&audio_path, b"").expect("create only audio candidate");
+        let original = concat!(
+            "TITLE \"Album\"\r\n",
+            "FILE \"renamed-away.flac\" WAVE\r\n",
+            "  TRACK 01 AUDIO\r\n",
+            "    TITLE \"One\"\r\n",
+            "    INDEX 01 00:00:00\r\n",
+            "  TRACK 02 AUDIO\r\n",
+            "    TITLE \"Two\"\r\n",
+            "    INDEX 01 03:00:00\r\n",
+        );
+        std::fs::write(&cue_path, original).expect("write malformed cue");
+
+        let assessment = assess_cue_file_reference_repair(&cue_path).expect("assess repair");
+        let plan = match assessment {
+            CueFileReferenceRepairAssessment::Repairable(plan) => plan,
+            other => panic!("expected repairable CUE, got {other:?}"),
+        };
+        assert_eq!(plan.original_reference, "renamed-away.flac");
+        assert_eq!(plan.replacement_reference, "actual.flac");
+        assert_eq!(plan.replacement_audio_path, audio_path);
+        assert_eq!(plan.destination_path, dir.join("album.repaired.cue"));
+
+        let first = repair_cue_file_reference_with_plan(&plan)
+            .expect("create repair copy from the exact assessed plan");
+        assert_eq!(
+            first,
+            CueFileReferenceRepairOutcome::Created {
+                path: dir.join("album.repaired.cue")
+            }
+        );
+        assert_eq!(
+            std::fs::read(&cue_path).expect("read original"),
+            original.as_bytes(),
+            "repair must never mutate the source CUE"
+        );
+        let repaired = std::fs::read_to_string(dir.join("album.repaired.cue"))
+            .expect("read repair copy");
+        assert_eq!(
+            repaired,
+            original.replace("renamed-away.flac", "actual.flac"),
+            "only FILE filename tokens should change"
+        );
+
+        let second = repair_cue_file_reference(&cue_path).expect("reuse identical repair copy");
+        assert_eq!(
+            second,
+            CueFileReferenceRepairOutcome::ExistingIdentical {
+                path: dir.join("album.repaired.cue")
+            }
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cue_file_reference_repair_refuses_when_the_offered_plan_changes_before_execution() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let dir = unique_cue_parser_test_dir("file_reference_repair_stale_plan");
+        let cue_path = dir.join("album.cue");
+        let first_audio = dir.join("first.flac");
+        std::fs::write(&first_audio, b"").expect("first audio candidate");
+        std::fs::write(
+            &cue_path,
+            "FILE \"missing.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+        )
+        .expect("write malformed cue");
+
+        let expected_plan = match assess_cue_file_reference_repair(&cue_path)
+            .expect("assess initial repair")
+        {
+            CueFileReferenceRepairAssessment::Repairable(plan) => plan,
+            other => panic!("expected initial repair plan, got {other:?}"),
+        };
+        std::fs::remove_file(&first_audio).expect("remove first candidate");
+        std::fs::write(dir.join("second.flac"), b"").expect("replacement candidate changed");
+
+        let error = repair_cue_file_reference_with_plan(&expected_plan)
+            .expect_err("stale displayed plan must be refused");
+        assert!(error.contains("repair inputs changed"));
+        assert!(!dir.join("album.repaired.cue").exists());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cue_file_reference_repair_refuses_to_guess_between_multiple_audio_files() {
+        let dir = unique_cue_parser_test_dir("file_reference_repair_ambiguous");
+        let cue_path = dir.join("album.cue");
+        std::fs::write(dir.join("one.flac"), b"").expect("audio one");
+        std::fs::write(dir.join("two.ape"), b"").expect("audio two");
+        std::fs::write(
+            &cue_path,
+            "FILE \"missing.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+        )
+        .expect("write malformed cue");
+
+        let assessment = assess_cue_file_reference_repair(&cue_path).expect("assess malformed cue");
+        let warning = match assessment {
+            CueFileReferenceRepairAssessment::Malformed { warning } => warning,
+            other => panic!("expected nonrepairable malformed CUE, got {other:?}"),
+        };
+        assert!(warning.contains("2 audio files are plausible replacements"));
+        assert!(warning.contains("no automatic repair is safe"));
+        assert!(!dir.join("album.repaired.cue").exists());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cue_file_reference_repair_is_not_offered_over_a_conflicting_repair_copy() {
+        let dir = unique_cue_parser_test_dir("file_reference_repair_conflict");
+        let cue_path = dir.join("album.cue");
+        let repaired_path = dir.join("album.repaired.cue");
+        std::fs::write(dir.join("actual.flac"), b"").expect("audio candidate");
+        std::fs::write(
+            &cue_path,
+            "FILE \"missing.flac\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n",
+        )
+        .expect("write malformed cue");
+        std::fs::write(&repaired_path, b"pre-existing unrelated data")
+            .expect("write conflicting repair target");
+
+        let assessment = assess_cue_file_reference_repair(&cue_path).expect("assess conflict");
+        let warning = match assessment {
+            CueFileReferenceRepairAssessment::Malformed { warning } => warning,
+            other => panic!("expected nonrepairable conflict, got {other:?}"),
+        };
+        assert!(warning.contains("already exists with different contents"));
+        assert_eq!(
+            std::fs::read(&repaired_path).expect("read conflicting target"),
+            b"pre-existing unrelated data"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cue_file_reference_repair_preserves_identified_legacy_encoding_when_representable() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let dir = unique_cue_parser_test_dir("file_reference_repair_legacy_encoding");
+        let cue_path = dir.join("album.cue");
+        std::fs::write(dir.join("Börk.flac"), b"").expect("create audio candidate");
+        let source_text = concat!(
+            "TITLE \"Börk\"\r\n",
+            "FILE \"missing.flac\" WAVE\r\n",
+            "  TRACK 01 AUDIO\r\n",
+            "    INDEX 01 00:00:00\r\n",
+        );
+        let (encoded, _encoding, had_errors) = WINDOWS_1252.encode(source_text);
+        assert!(!had_errors);
+        std::fs::write(&cue_path, encoded.as_ref()).expect("write Windows-1252 cue");
+
+        repair_cue_file_reference(&cue_path).expect("repair legacy cue");
+        let repaired = std::fs::read(dir.join("album.repaired.cue")).expect("repair bytes");
+        assert!(repaired.windows(4).any(|window| window == b"B\xF6rk"));
+        assert!(
+            !repaired.windows(5).any(|window| window == b"B\xC3\xB6rk"),
+            "representable repair should not normalize the source to UTF-8"
+        );
+        let decoded = decode_cue_bytes_for_path(&repaired, &dir.join("album.repaired.cue"))
+            .expect("decode repaired legacy cue");
+        assert!(decoded.contains("FILE \"Börk.flac\" WAVE"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cue_file_reference_repair_refuses_implicit_whole_sheet_encoding_normalization() {
+        let dir = unique_cue_parser_test_dir("file_reference_repair_no_encoding_normalization");
+        let cue_path = dir.join("album.cue");
+        std::fs::write(dir.join("Аудио.flac"), b"").expect("create Unicode audio candidate");
+        let source_text = concat!(
+            "TITLE \"Börk\"\r\n",
+            "FILE \"missing.flac\" WAVE\r\n",
+            "  TRACK 01 AUDIO\r\n",
+            "    INDEX 01 00:00:00\r\n",
+        );
+        let (encoded, _encoding, had_errors) = WINDOWS_1252.encode(source_text);
+        assert!(!had_errors);
+        std::fs::write(&cue_path, encoded.as_ref()).expect("write Windows-1252 cue");
+
+        let assessment = assess_cue_file_reference_repair(&cue_path).expect("assess repair");
+        let warning = match assessment {
+            CueFileReferenceRepairAssessment::Malformed { warning } => warning,
+            other => panic!("expected normalization refusal, got {other:?}"),
+        };
+        assert!(warning.contains("will not normalize the whole CUE to UTF-8"));
+        assert!(!dir.join("album.repaired.cue").exists());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn windows_1251_path_recovery_removes_the_r13_album_from_repair_set() {
+        let dir = unique_cue_parser_test_dir("r13_cp1251_not_repair");
+        let cue_path = dir.join("Pret-A-Porter.cue");
+        std::fs::write(dir.join("Various - Pret-А-Porter.ape"), b"")
+            .expect("create real image name");
+        let raw = b"TITLE \"Pret-\xC0-Porter\"\nFILE \"Various - Pret-\xC0-Porter.ape\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n";
+        std::fs::write(&cue_path, raw).expect("write Windows-1251 sidecar");
+
+        assert_eq!(
+            assess_cue_file_reference_repair(&cue_path).expect("assess recovered cue"),
+            CueFileReferenceRepairAssessment::NotNeeded,
+            "candidate expansion should solve the real encoding defect before repair is considered"
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }

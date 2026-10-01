@@ -778,6 +778,7 @@ mod tests {
             embedded_cue_availability: crate::tui::probe::EmbeddedCueAvailability::Unknown,
             cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
             cue_repair_availability: crate::tui::browse::CueRepairAvailability::Unknown,
+            cue_file_reference_repairs: std::collections::BTreeMap::new(),
         };
 
         let mut app = AppState::new_for_test(TonepoetConfig::default());

@@ -178,6 +178,15 @@ pub enum ContextAction {
         folder: PathBuf,
         cue_path: Option<PathBuf>,
     },
+    /// Create/reuse a validated sibling copy whose one unresolved single-image
+    /// FILE reference is replaced with the unique audio file Tonepoet can
+    /// prove. The source CUE is never modified.
+    RepairCueFileReference {
+        plan: crate::convert::cue_parser::CueFileReferenceRepairPlan,
+    },
+    /// Non-actionable row occupying the stable direct-CUE repair slot while
+    /// exact repairability/authority is pending or unavailable.
+    CueFileReferenceRepairInfo,
     /// Tree-pane operations carry their target explicitly so a later cursor
     /// change cannot redirect the operation.
     TreeNewFile(PathBuf),
@@ -1179,6 +1188,138 @@ fn directory_cue_repair_availability(
         .unwrap_or(super::browse::CueRepairAvailability::Unknown)
 }
 
+pub(super) fn direct_cue_sidecar_authority_is_proven(
+    priority: &[crate::config::AggregateMetadataTarget],
+    individual_tags_present: Option<bool>,
+    embedded_cue_present: Option<bool>,
+) -> bool {
+    use crate::config::AggregateMetadataTarget::{EmbeddedCue, IndividualFiles, SidecarCue};
+
+    // Reuse the same normalized aggregate-authority resolver as the rest of
+    // Tonepoet. Unknown higher-priority alternatives remain viable here: only
+    // a proven absence is strong enough to let the sidecar win by fallback.
+    crate::metadata_authority::resolve_aggregate_metadata_target_by(priority, |target| {
+        match target {
+            IndividualFiles => individual_tags_present != Some(false),
+            SidecarCue => true,
+            EmbeddedCue => embedded_cue_present != Some(false),
+        }
+    }) == Some(SidecarCue)
+}
+
+pub(super) fn direct_cue_file_reference_probe_if_authoritative<'a>(
+    app: &'a AppState,
+    cue_path: &Path,
+) -> Option<&'a super::browse::CueFileReferenceRepairProbe> {
+    let probe = app
+        .browse
+        .current_directory_classification()?
+        .cue_file_reference_repairs
+        .get(cue_path)?;
+    direct_cue_sidecar_authority_is_proven(
+        &app.config.conversion.aggregate_metadata_target_priority,
+        probe.individual_tags_present,
+        probe.embedded_cue_present,
+    )
+    .then_some(probe)
+}
+
+fn direct_cue_repair_slot_item(
+    label: impl Into<String>,
+    action: ContextAction,
+    enabled: bool,
+) -> ContextMenuEntry {
+    ContextMenuEntry::Item(ContextMenuItem {
+        label: label.into(),
+        action,
+        shortcut: None,
+        enabled,
+    })
+}
+
+fn direct_cue_repair_utilities_submenu(app: &AppState, cue_path: &Path) -> ContextMenuEntry {
+    let probe = app
+        .browse
+        .current_directory_classification()
+        .and_then(|classification| classification.cue_file_reference_repairs.get(cue_path));
+
+    let child = match probe {
+        Some(probe)
+            if direct_cue_sidecar_authority_is_proven(
+                &app.config.conversion.aggregate_metadata_target_priority,
+                probe.individual_tags_present,
+                probe.embedded_cue_present,
+            ) => {
+            match &probe.assessment {
+                crate::convert::cue_parser::CueFileReferenceRepairAssessment::Repairable(plan) => {
+                    let destination = plan
+                        .destination_path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| plan.destination_path.display().to_string());
+                    direct_cue_repair_slot_item(
+                        format!(
+                            "Create repaired copy {:?}: FILE {:?} -> {:?}",
+                            destination, plan.original_reference, plan.replacement_reference
+                        ),
+                        ContextAction::RepairCueFileReference { plan: plan.clone() },
+                        true,
+                    )
+                }
+                crate::convert::cue_parser::CueFileReferenceRepairAssessment::Malformed { .. } => {
+                    direct_cue_repair_slot_item(
+                        "Malformed CUE — automatic repair unavailable",
+                        ContextAction::CueFileReferenceRepairInfo,
+                        false,
+                    )
+                }
+                crate::convert::cue_parser::CueFileReferenceRepairAssessment::NotNeeded => {
+                    direct_cue_repair_slot_item(
+                        "No FILE-reference repair needed",
+                        ContextAction::CueFileReferenceRepairInfo,
+                        false,
+                    )
+                }
+            }
+        }
+        Some(probe)
+            if matches!(
+                &probe.assessment,
+                crate::convert::cue_parser::CueFileReferenceRepairAssessment::NotNeeded
+            ) => {
+            direct_cue_repair_slot_item(
+                "No FILE-reference repair needed",
+                ContextAction::CueFileReferenceRepairInfo,
+                false,
+            )
+        }
+        Some(_) => direct_cue_repair_slot_item(
+            "CUE repair unavailable for this metadata source",
+            ContextAction::CueFileReferenceRepairInfo,
+            false,
+        ),
+        None if app
+            .browse
+            .folder_classification_pending_for(&app.browse.current_dir) => {
+            direct_cue_repair_slot_item(
+                "Checking CUE repair...",
+                ContextAction::CueFileReferenceRepairInfo,
+                false,
+            )
+        }
+        None => direct_cue_repair_slot_item(
+            "CUE repair status unavailable",
+            ContextAction::CueFileReferenceRepairInfo,
+            false,
+        ),
+    };
+
+    ContextMenuEntry::Submenu {
+        label: "Utilities".to_string(),
+        children: vec![child],
+    }
+}
+
 /// Build the context menu for a right-click on a browse entry.
 pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
     let entry = match app.browse.selected_entry() {
@@ -1404,6 +1545,7 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
                         super::probe::EmbeddedCueAvailability::Absent,
                         true,
                     ));
+                    items.push(direct_cue_repair_utilities_submenu(app, &entry.path));
                 }
                 items.push(separator());
             }
@@ -1495,13 +1637,24 @@ fn select_menu_label(level: &mut MenuLevel, label: &str) -> Option<usize> {
     positions.get(selected).copied()
 }
 
+fn is_direct_cue_repair_slot_item(item: &ContextMenuItem) -> bool {
+    matches!(
+        &item.action,
+        ContextAction::RepairCueFileReference { .. } | ContextAction::CueFileReferenceRepairInfo
+    )
+}
+
 fn same_menu_geometry(left: &[ContextMenuEntry], right: &[ContextMenuEntry]) -> bool {
     if left.len() != right.len() {
         return false;
     }
     left.iter().zip(right).all(|(left, right)| match (left, right) {
         (ContextMenuEntry::Separator, ContextMenuEntry::Separator) => true,
-        (ContextMenuEntry::Item(left), ContextMenuEntry::Item(right)) => left.label == right.label,
+        (ContextMenuEntry::Item(left), ContextMenuEntry::Item(right)) => {
+            left.label == right.label
+                || (is_direct_cue_repair_slot_item(left)
+                    && is_direct_cue_repair_slot_item(right))
+        }
         (
             ContextMenuEntry::Submenu {
                 label: left_label,
@@ -1548,8 +1701,10 @@ pub(super) fn refresh_open_browse_entry_menu(app: &mut AppState) {
     // Async classification may resolve an Unknown CUE state to Present or
     // Absent while the menu is open. Never add or remove physical rows under
     // the pointer: retain the current geometry and publish the new shape on the
-    // next menu open. Same-shape refreshes are still useful for enabling an
-    // already visible action after a background probe completes.
+    // next menu open. The one exception is the fixed direct-CUE Utilities
+    // repair slot: it reserves one row up front, so its pending/informational
+    // contents may resolve in place without moving any row. Same-shape
+    // refreshes are also useful for enabling already visible actions.
     if !same_menu_geometry(&old_root.entries, &rebuilt_root) {
         app.active_overlay = ActiveOverlay::ContextMenu {
             levels: old_levels,
@@ -1845,7 +2000,9 @@ fn archive_context_action_requires_real_paths(action: &ContextAction) -> Option<
         | ContextAction::PasteSelection
         | ContextAction::DuplicateSelection => Some("filesystem clipboard operation"),
         ContextAction::OpenSystemDefault(_) => Some("system-default editing"),
-        ContextAction::InspectCueChoices(_) | ContextAction::RepairCue { .. } => {
+        ContextAction::InspectCueChoices(_)
+        | ContextAction::RepairCue { .. }
+        | ContextAction::RepairCueFileReference { .. } => {
             Some("CUE folder inspection")
         }
         ContextAction::BulkRename
@@ -3129,6 +3286,15 @@ pub fn execute_context_action(
                     );
                 }
             }
+        }
+        ContextAction::RepairCueFileReference { plan } => {
+            if app.current_screen == AppScreen::Browse {
+                super::keybindings::start_browse_cue_file_reference_repair(app, tx, plan);
+            }
+        }
+        ContextAction::CueFileReferenceRepairInfo => {
+            // This variant is used only by a disabled, geometry-reserving row.
+            // Keep dispatch inert even if a future caller invokes it directly.
         }
         ContextAction::BrowseTabNew => {
             if app.current_screen == AppScreen::Browse {
@@ -6882,6 +7048,7 @@ mod tests {
                 embedded_cue_availability: availability,
                 cue_import_availability,
                 cue_repair_availability,
+                cue_file_reference_repairs: std::collections::BTreeMap::new(),
             },
         );
         app
@@ -6907,7 +7074,139 @@ mod tests {
             embedded_cue_availability,
             cue_import_availability,
             cue_repair_availability,
+            cue_file_reference_repairs: std::collections::BTreeMap::new(),
         }
+    }
+
+    fn app_with_direct_cue_file_reference_repair_probe(
+        priority: Vec<crate::config::AggregateMetadataTarget>,
+        individual_tags_present: Option<bool>,
+        embedded_cue_present: Option<bool>,
+    ) -> AppState {
+        let mut config = TonepoetConfig::default();
+        config.conversion.aggregate_metadata_target_priority = priority;
+        let mut app = AppState::new_for_test(config);
+        app.current_screen = AppScreen::Browse;
+        let parent = PathBuf::from("/music/r13");
+        let cue_path = parent.join("album.cue");
+        app.browse.current_dir = parent.clone();
+        app.browse.entries = vec![BrowseEntry::new(
+            cue_path.clone(),
+            "album.cue".to_string(),
+            EntryKind::OtherFile,
+            0,
+            None,
+        )];
+        app.browse.selected_index = 0;
+
+        let mut classification = synthetic_cue_menu_classification(
+            crate::tui::probe::CueImportAvailability::Absent,
+            crate::tui::browse::CueRepairAvailability::Absent,
+            crate::tui::probe::EmbeddedCueAvailability::Absent,
+        );
+        classification.cue_file_reference_repairs.insert(
+            cue_path.clone(),
+            crate::tui::browse::CueFileReferenceRepairProbe {
+                assessment: crate::convert::cue_parser::CueFileReferenceRepairAssessment::Repairable(
+                    crate::convert::cue_parser::CueFileReferenceRepairPlan {
+                        cue_path: cue_path.clone(),
+                        destination_path: parent.join("album.repaired.cue"),
+                        original_reference: "missing.flac".to_string(),
+                        replacement_reference: "actual.flac".to_string(),
+                        replacement_audio_path: parent.join("actual.flac"),
+                    },
+                ),
+                individual_tags_present,
+                embedded_cue_present,
+            },
+        );
+        app.browse
+            .insert_folder_classification_for_test(parent, classification);
+        app
+    }
+
+    #[test]
+    fn direct_cue_file_reference_repair_is_offered_under_utilities_when_sidecar_is_configured_first() {
+        use crate::config::AggregateMetadataTarget::{EmbeddedCue, IndividualFiles, SidecarCue};
+        let app = app_with_direct_cue_file_reference_repair_probe(
+            vec![SidecarCue, IndividualFiles, EmbeddedCue],
+            Some(true),
+            Some(true),
+        );
+        let menu = build_browse_entry_menu(&app);
+        assert!(menu_contains_action(&menu, |action| matches!(
+            action,
+            ContextAction::RepairCueFileReference { .. }
+        )));
+        let labels = menu_labels_recursive(&menu);
+        assert!(labels
+            .iter()
+            .any(|label| label == "Create repaired copy \"album.repaired.cue\": FILE \"missing.flac\" -> \"actual.flac\""));
+    }
+
+    #[test]
+    fn direct_cue_file_reference_repair_requires_higher_priority_alternatives_to_be_proven_absent() {
+        use crate::config::AggregateMetadataTarget::{EmbeddedCue, IndividualFiles, SidecarCue};
+        for (individual, embedded, expected) in [
+            (Some(false), Some(false), true),
+            (Some(true), Some(false), false),
+            (Some(false), Some(true), false),
+            (None, Some(false), false),
+            (Some(false), None, false),
+        ] {
+            let app = app_with_direct_cue_file_reference_repair_probe(
+                vec![IndividualFiles, EmbeddedCue, SidecarCue],
+                individual,
+                embedded,
+            );
+            let menu = build_browse_entry_menu(&app);
+            assert_eq!(
+                menu_contains_action(&menu, |action| matches!(
+                    action,
+                    ContextAction::RepairCueFileReference { .. }
+                )),
+                expected,
+                "individual={individual:?} embedded={embedded:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn direct_cue_authority_probe_does_not_treat_unknown_or_present_alternatives_as_absent() {
+        use crate::config::AggregateMetadataTarget::{EmbeddedCue, IndividualFiles, SidecarCue};
+        for (individual, embedded, expected_authoritative) in [
+            (Some(false), Some(false), true),
+            (Some(true), Some(false), false),
+            (Some(false), Some(true), false),
+            (None, Some(false), false),
+            (Some(false), None, false),
+        ] {
+            let app = app_with_direct_cue_file_reference_repair_probe(
+                vec![IndividualFiles, EmbeddedCue, SidecarCue],
+                individual,
+                embedded,
+            );
+            assert_eq!(
+                direct_cue_file_reference_probe_if_authoritative(
+                    &app,
+                    Path::new("/music/r13/album.cue"),
+                )
+                .is_some(),
+                expected_authoritative,
+                "individual={individual:?} embedded={embedded:?}",
+            );
+        }
+
+        let app = app_with_direct_cue_file_reference_repair_probe(
+            vec![SidecarCue, IndividualFiles, EmbeddedCue],
+            Some(true),
+            Some(true),
+        );
+        assert!(direct_cue_file_reference_probe_if_authoritative(
+            &app,
+            Path::new("/music/r13/album.cue"),
+        )
+        .is_some());
     }
 
     fn assert_pending_editor_uses_embedded_cue(app: &AppState, expected_carrier: &Path) {

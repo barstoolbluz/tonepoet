@@ -399,6 +399,17 @@ pub enum AppMessage {
         cue_path: std::path::PathBuf,
         result: Result<crate::convert::split_cue_album::SplitCueRepairOutcome, String>,
     },
+    /// Completion of the explicit direct-CUE FILE-reference repair. This is a
+    /// separate repair domain from cumulative-index repair: it only creates or
+    /// reuses a validated sibling `.repaired.cue` and never mutates the source.
+    BrowseCueFileReferenceRepairComplete {
+        generation: u64,
+        browse_scan_generation: u64,
+        tab_id: crate::tui::browse::BrowseTabId,
+        origin_dir: std::path::PathBuf,
+        cue_path: std::path::PathBuf,
+        result: Result<crate::convert::cue_parser::CueFileReferenceRepairOutcome, String>,
+    },
     /// Result of an asynchronous Convert-source probe launched from command
     /// handlers or picker returns. `generation` is captured at dispatch time;
     /// the event-loop reducer drops stale completions when the source has

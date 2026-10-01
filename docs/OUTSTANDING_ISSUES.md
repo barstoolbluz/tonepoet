@@ -3515,6 +3515,16 @@ no coverage today.
 
 ## 56. A sidecar CUE in an encoding we carry no candidate for resolves to a filename that does not exist, so the album never becomes a CUE album
 
+> **RESOLVED 2026-10-01 by R13** (field-verified: the real album parses 14
+> tracks, its FILE resolves, and repair assessment is `NotNeeded`)**.** The path-aware decoder now carries a
+> Windows-1251 candidate while preserving Windows-1252 as the syntax-only legacy
+> tie-break, so the measured Prêt-à-Porter sidecar resolves its Cyrillic-`А` image
+> exactly and reaches the normal 14-track CUE surface. For genuinely unresolved
+> single-image `FILE` references, an explicit authoritative-sidecar Utilities
+> action can create an idempotent validated `.repaired.cue` copy only when exactly
+> one safe replacement exists; ambiguous/unrepresentable repairs are refused with
+> a malformed-CUE warning and the source is never modified.
+
 Filed 2026-09-29. `~/torrents/Pret-A-Porter_OST` — *Prêt-à-Porter* soundtrack, one
 455 MB Monkey's Audio image (`Various - Pret-А-Porter.ape`) with a sidecar
 `Various - Pret-А-Porter.cue` carrying 14 `TRACK ... AUDIO` entries, CRLF
