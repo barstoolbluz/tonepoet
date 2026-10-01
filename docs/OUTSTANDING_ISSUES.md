@@ -3513,13 +3513,13 @@ rate, and the qualified terminal's self-consistency check either passes or refus
 true reason. A regression covers the rate-change case specifically; that is the case with
 no coverage today.
 
-## 56. MusicBrainz tagging refuses a single-image APE + sidecar CUE album because the editor opened one row instead of fourteen
+## 56. A sidecar CUE in an encoding we carry no candidate for resolves to a filename that does not exist, so the album never becomes a CUE album
 
 Filed 2026-09-29. `~/torrents/Pret-A-Porter_OST` — *Prêt-à-Porter* soundtrack, one
 455 MB Monkey's Audio image (`Various - Pret-А-Porter.ape`) with a sidecar
-`Various - Pret-А-Porter.cue` carrying 14 `TRACK ... AUDIO` entries. The CUE is
-ISO-8859 with CRLF terminators and its `FILE` line names the `.ape`. The folder
-also holds a `.log` and several cover images.
+`Various - Pret-А-Porter.cue` carrying 14 `TRACK ... AUDIO` entries, CRLF
+terminated, its `FILE` line naming the `.ape`. The folder also holds a `.log`
+and several cover images.
 
 The MusicBrainz lookup succeeds and the release picker works. On choosing a
 release, populating the metadata-editing overlay fails in the status bar with:
@@ -3537,16 +3537,37 @@ what it says; the disagreement is upstream of it.
 
 The user reports MusicBrainz tagging has worked on other albums up to this one.
 
-### Hypothesis — unverified
+### Cause — established 2026-10-01
 
-`n_tracks` is 1, which is what the editor would report if it opened on the APE
-image as a single whole-file row rather than on the 14 CUE-derived track rows.
-APE is decode-only and not tag-writable (`AudioFormat::input_decodable` vs
-`output_encodable`, `formats.rs:133`), so an untaggable single-image album may
-not be getting the sidecar-CUE album surface that an equivalent FLAC image
-receives. Whether the APE-ness is the discriminator, or something else about
-this folder is, was not established — the editor's row construction for this
-album was never inspected. Treat as a lead.
+Not APE. The sidecar CUE is **Windows-1251**, and the CUE text decoder has no
+Cyrillic candidate. Running the production decoder against the real file:
+
+```
+decoded FILE line: FILE "Various - Pret-À-Porter.ape" WAVE
+decoded name     : "Various - Pret-À-Porter.ape"
+exists on disk   : false
+actual filename  : "Various - Pret-А-Porter.ape"
+names equal      : false
+```
+
+The byte is `0xC0`. Windows-1252 decodes it `À`; the filename on disk holds
+Cyrillic `А` (U+0410, `\xd0\x90` in UTF-8), which is what `0xC0` means in
+Windows-1251. The decoder's legacy candidates are CP932/Shift-JIS, EUC-JP, GBK,
+Big5 and Windows-1252 (`src/convert/cue_parser.rs`), so Windows-1252 wins by
+default and yields a filename that does not exist.
+
+From there: the `FILE` reference does not resolve, `single_image_info_for_cue`
+returns `None`, no CUE album surface is built, the MusicBrainz flow is handed
+the one `.ape` file, and `n_tracks` is 1 against MusicBrainz's 14. A FLAC image
+with the same filename would fail identically.
+
+Both CUE-aware path builders (`paths_for_cue_metadata_surfaces`,
+`paths_for_single_image_cue_infos` in `src/tui/command.rs`) already emit one
+path per CUE track, so nothing downstream needs changing.
+
+Repairable: the decoder's candidate scoring is already path-aware — it prefers
+a candidate whose decoded `FILE` reference actually exists — so a Cyrillic
+candidate resolves this album with no user interaction.
 
 ### Required
 
@@ -3558,6 +3579,17 @@ count the user has no way to act on.
 
 The count-agreement guard itself stays. It caught a real inconsistency; it
 should not be relaxed to let a 14-vs-1 mismatch through.
+
+Beyond this album: where no candidate encoding can resolve the `FILE`
+reference, the CUE is genuinely malformed. The user wants an automated CUE
+repair surfaced in the metadata-editing overlay or dynamically in the context
+menu under "Utilities", offered only when the sidecar CUE is authoritative
+(configured, or by absence of tagged files and an embedded CUE) **and** the
+user explicitly acts on it **and** it actually needs repair **and** the defect
+is repairable. Where it is not repairable, offer nothing and warn plainly that
+the CUE is malformed.
+
+Written up as `BRIEF_R13_cue_encoding_and_repair_2026-10-01.md`.
 
 ## 57. SSRC emits a four-byte Wave64 trailing pad; tonepoet and its qualification harness accept only two
 
