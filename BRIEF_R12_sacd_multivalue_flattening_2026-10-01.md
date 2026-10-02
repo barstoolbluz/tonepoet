@@ -5,18 +5,16 @@ Base: the supplied `tonepoet-src.tar.gz` is our `main` at gate 7237/0.
 
 ## What the user sees
 
-Converting an SACD ISO that has an XML sidecar produces FLAC files whose
-metadata editor shows backslashes in multi-value fields:
+Reported: converting an SACD ISO that has an XML sidecar produces FLAC files
+whose metadata editor shows backslashes in multi-value fields —
 
 ```
 La Petite Bande, Dir. Sigiswald Kuijken\; Sophie Karthäuser - Soprano\;
 Petra Noskaiová - Alto\; Christoph Genz - Tenor\; Dominik Wörner - Baryton
 ```
 
-Conversions from DSF, PCM and CUE sources do not show them. Only SACD.
-
-The converted file holds one value containing semicolons. A DSF-sourced
-conversion of a comparable album holds several distinct values.
+— in `PERFORMER`, `ARTIST` and `GENRE`, and that conversions from DSF, PCM and
+CUE sources do not show them. Only SACD.
 
 ## What the sidecars contain
 
@@ -55,6 +53,25 @@ and every `; ` instance above comes from that series. The two others — a
 Steely Dan and an Analogue Productions reissue — use no `; ` anywhere. Four
 sidecars are included in this bundle under `sidecars/`, covering both cases.
 
+## What a conversion produces
+
+Converting track 1 of Bach Vol. 12 (sidecar included in this bundle) and
+reading the result with `metaflac`:
+
+| field | sidecar, track 1 | converted FLAC |
+|---|---|---|
+| `ARTIST` | `Johann Sebastian Bach; La Petite Bande; …` (7 names) | same, one value |
+| `ALBUMARTIST` | `Johann Sebastian Bach` | the 7-name `ARTIST` string |
+| `COMPOSER` | `Johann Sebastian Bach` | absent |
+| `PERFORMER` | absent | the 7-name `ARTIST` string |
+| `GENRE` | `Classical` | `Classical` |
+
+The sidecar's own `ALBUMARTIST` and `COMPOSER` values survive only under
+`TONEPOET_TRACK_*` and `TONEPOET_ALBUM_*` keys.
+
+`PERFORMER` is one of the fields the escaping was reported in, and it does not
+appear anywhere in the sidecar corpus.
+
 ## The outcome we want
 
 Multi-value metadata from an SACD sidecar reaches the converted files as
@@ -70,8 +87,9 @@ than inventing a new one.
 
 ## State
 
-Gate 7237 passed / 0 failed across 63 targets, zero warnings.
-`tonepoet-true-peak` 160/0. Reference qualification current as of 2026-10-02;
+Gate 7237 passed / 0 failed across 63 targets, zero warnings (run today).
+`tonepoet-true-peak` is gated separately and was not run today; CLAUDE.md
+records it at 160/0. Reference qualification current as of 2026-10-02;
 `tests/reference_qualification_freshness.rs` fails the gate if a locked source
 drifts from it.
 
