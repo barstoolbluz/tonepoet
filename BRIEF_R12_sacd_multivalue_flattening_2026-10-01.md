@@ -20,12 +20,21 @@ conversion of a comparable album holds several distinct values.
 
 ## What the sidecars contain
 
-Measured across the 22 SACD metabase sidecars on this machine, 961 tracks:
+Measured across the SACD metabase sidecars on this machine — 13 distinct files,
+539 tracks (22 files were found; 9 are byte-identical copies present in both
+`~/livetorrents` and `~/torrents`):
 
-- No `<track>` ever repeats a `<meta name=…>`.
-- `ARTIST` contains `; ` in 948 of 961 tracks.
-- `COMPOSER` in 8 of 952. `ALBUMARTIST` in some.
-- `TITLE`, `ALBUM`, `DATE`, `ISRC`, `CATALOGNUMBER`, `TRACKNUMBER`: never.
+| field | tracks | with `; ` |
+|---|---|---|
+| ARTIST | 539 | 526 |
+| ALBUMARTIST | 491 | 49 |
+| COMPOSER | 530 | 4 |
+| TITLE | 539 | 0 |
+| ALBUM | 539 | 0 |
+| GENRE | 178 | 0 |
+
+No `<track>` in the corpus repeats a `<meta name=…>`. `PERFORMER` does not
+appear at all.
 
 A representative value:
 
@@ -40,6 +49,11 @@ and one that is less tidy:
 <meta name="ALBUMARTIST" value="La Petite Band, Sigiswald Kuijken; Sämann,
 Noskaiova, Genz, Van der Crabben"/>
 ```
+
+Caveat on the corpus: 11 of the 13 are one Bach cantata series from one label,
+and every `; ` instance above comes from that series. The two others — a
+Steely Dan and an Analogue Productions reissue — use no `; ` anywhere. Four
+sidecars are included in this bundle under `sidecars/`, covering both cases.
 
 ## The outcome we want
 
