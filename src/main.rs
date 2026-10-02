@@ -2059,14 +2059,23 @@ async fn run_convert(
     // by an unrelated active execution.
     let queue_db = tonepoet::db::Database::open()
         .map_err(|error| anyhow::anyhow!("could not open durable conversion queue: {error}"))?;
+    let recovered_durable_items = queue_db
+        .recover_dead_queue_items()
+        .map_err(|error| anyhow::anyhow!("could not recover interrupted conversions: {error}"))?;
+    if !recovered_durable_items.is_empty() {
+        log::info!(
+            "CLI recovered {} durable queue item(s) from dead conversion sessions",
+            recovered_durable_items.len()
+        );
+    }
     {
         let q = queue.read().await;
-        let mut durable_items = q
+        let mut current_durable_items = q
             .all_items()
             .into_iter()
             .map(|item| item.clone())
             .collect::<Vec<_>>();
-        for item in &mut durable_items {
+        for item in &mut current_durable_items {
             if matches!(item.status, ConversionStatus::Queued) {
                 item.status = ConversionStatus::Interrupted;
                 item.started_at = None;
@@ -2075,6 +2084,10 @@ async fn run_convert(
                 item.closed_track_epochs.clear();
             }
         }
+        let durable_items = merge_recovered_cli_queue_items(
+            &recovered_durable_items,
+            current_durable_items,
+        );
         let refs = durable_items.iter().collect::<Vec<_>>();
         let report = queue_db
             .sync_queue(&refs)
@@ -2162,7 +2175,16 @@ async fn run_convert(
     // recovery rather than being guessed safe here.
     let terminal_sync = {
         let q = queue.read().await;
-        let refs = q.all_items();
+        let current_durable_items = q
+            .all_items()
+            .into_iter()
+            .map(|item| item.clone())
+            .collect::<Vec<_>>();
+        let durable_items = merge_recovered_cli_queue_items(
+            &recovered_durable_items,
+            current_durable_items,
+        );
+        let refs = durable_items.iter().collect::<Vec<_>>();
         queue_db
             .sync_queue(&refs)
             .map(|report| {
@@ -2211,6 +2233,25 @@ async fn run_convert(
             sync_error
         )),
     }
+}
+
+fn merge_recovered_cli_queue_items(
+    recovered: &[tonepoet::convert::ConversionItem],
+    current: Vec<tonepoet::convert::ConversionItem>,
+) -> Vec<tonepoet::convert::ConversionItem> {
+    let current_ids = current
+        .iter()
+        .map(|item| item.id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let mut merged = Vec::with_capacity(recovered.len().saturating_add(current.len()));
+    merged.extend(
+        recovered
+            .iter()
+            .filter(|item| !current_ids.contains(item.id.as_str()))
+            .cloned(),
+    );
+    merged.extend(current);
+    merged
 }
 
 /// Everything the CLI convert scan decided to queue, plus user-facing
@@ -3786,6 +3827,37 @@ mod pipeline_cli_tests {
             quality: AudioFormat::Flac.default_quality(),
             ..ConversionOptions::default()
         }
+    }
+
+    fn cli_queue_item(id: &str) -> ConversionItem {
+        let mut item = ConversionItem::new(
+            PathBuf::from(format!("/{id}.flac")),
+            FileFormat::Audio(AudioFormat::Flac),
+            default_options(),
+        );
+        item.id = id.to_string();
+        item
+    }
+
+    #[test]
+    fn recovered_cli_rows_are_preserved_without_overriding_current_items() {
+        let recovered_only = cli_queue_item("recovered-only");
+        let recovered_duplicate = cli_queue_item("same-id");
+        let current = cli_queue_item("same-id");
+
+        let merged = merge_recovered_cli_queue_items(
+            &[recovered_only.clone(), recovered_duplicate],
+            vec![current.clone()],
+        );
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].id, recovered_only.id);
+        assert_eq!(merged[1].id, current.id);
+        assert_eq!(
+            merged.iter().filter(|item| item.id == "same-id").count(),
+            1,
+            "the current CLI submission must remain authoritative for a duplicate stable id"
+        );
     }
 
     #[test]

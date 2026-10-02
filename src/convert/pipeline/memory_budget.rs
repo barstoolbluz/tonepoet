@@ -25,6 +25,7 @@ const SCRATCH_PROBE_FILE: &str = ".tonepoet-scratch-write-test";
 const SCRATCH_CLEANUP_LOCK_FILE: &str = ".tonepoet-staging.cleanup.lock";
 const RUN_LOCK_SUFFIX: &str = ".run.lock";
 const STAGING_OWNER_MARKER: &str = ".tonepoet-staging-owner";
+const LEGACY_COMPANION_SNAPSHOT_PREFIX: &str = ".tonepoet-companion-snapshot-";
 
 #[derive(Debug, Clone)]
 pub struct ScratchStagingConfig {
@@ -844,8 +845,24 @@ fn unique_nanos() -> u128 {
         .unwrap_or_default()
 }
 
-fn cleanup_stale_staging_trees(staging_parent: &Path) -> io::Result<()> {
-    fs::create_dir_all(staging_parent)?;
+pub(crate) fn cleanup_stale_staging_trees(staging_parent: &Path) -> io::Result<()> {
+    // Cleanup is maintenance, not creation.  In particular, callers probing a
+    // legacy output-local staging path must not recreate `.tonepoet-staging`
+    // merely to discover that there is nothing to sweep.
+    match fs::symlink_metadata(staging_parent) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "staging parent is not a directory: {}",
+                    staging_parent.display()
+                ),
+            ));
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    }
     let Some(_cleanup_lock) = try_acquire_cleanup_lock(staging_parent)? else {
         return Ok(());
     };
@@ -859,7 +876,7 @@ fn cleanup_stale_staging_trees(staging_parent: &Path) -> io::Result<()> {
         let file_type = match entry.file_type() {
             Ok(file_type) => file_type,
             Err(err) => {
-                log::warn!("could not inspect scratch staging entry {}: {err}", entry.path().display());
+                log::warn!("could not inspect staging entry {}: {err}", entry.path().display());
                 continue;
             }
         };
@@ -882,12 +899,131 @@ fn cleanup_stale_staging_trees(staging_parent: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Remove only the hidden companion-snapshot layout emitted by pre-R15 builds.
+///
+/// Those snapshots predate per-tree ownership markers, so there is no reliable
+/// way to associate one snapshot with one legacy run lock. Fail closed while
+/// *any* old run lock in this staging parent is held; once no live legacy
+/// conversion can own the parent, shared mutation admission is the authority
+/// that permits removing each known TonePoet snapshot directory.
+pub(crate) fn cleanup_legacy_companion_snapshots(staging_parent: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(staging_parent) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "staging parent is not a directory: {}",
+                    staging_parent.display()
+                ),
+            ));
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    }
+    let Some(_cleanup_lock) = try_acquire_cleanup_lock(staging_parent)? else {
+        return Ok(());
+    };
+
+    let mut snapshots = Vec::new();
+    let mut run_locks = Vec::new();
+    for entry in fs::read_dir(staging_parent)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(err) => {
+                log::warn!(
+                    "could not inspect legacy staging entry {}: {err}",
+                    entry.path().display()
+                );
+                continue;
+            }
+        };
+
+        if file_type.is_file() && is_run_lock_file_name(&name) {
+            run_locks.push(entry.path());
+        } else if file_type.is_dir() && is_legacy_companion_snapshot_name(&name) {
+            snapshots.push(entry.path());
+        }
+    }
+
+    for lock_path in &run_locks {
+        match probe_existing_run_lock(lock_path) {
+            Ok(RunLockProbe::Held) => {
+                log::debug!(
+                    "legacy companion snapshot cleanup: held run lock keeps hidden snapshots intact: {}",
+                    lock_path.display()
+                );
+                return Ok(());
+            }
+            Ok(RunLockProbe::Missing) => {}
+            Ok(RunLockProbe::Unlocked(file)) => {
+                let _ = file.unlock();
+            }
+            Err(err) => {
+                log::warn!(
+                    "could not inspect legacy staging run lock {}; leaving hidden companion snapshots intact: {err}",
+                    lock_path.display()
+                );
+                return Ok(());
+            }
+        }
+    }
+
+    for snapshot in snapshots {
+        let claim = match PathClaim::resolve_with_semantics(
+            &snapshot,
+            ClaimMode::Write,
+            ClaimScope::Subtree,
+            PathResolutionSemantics::NamespaceObject,
+        ) {
+            Ok(claim) => claim,
+            Err(error) => {
+                log::warn!(
+                    "legacy companion snapshot cleanup: could not resolve shared claim for {}; leaving snapshot intact: {error}",
+                    snapshot.display(),
+                );
+                continue;
+            }
+        };
+        let admitted_path = claim.identity.resolved_io_path.clone();
+        let _guard = match MutationClaimGuard::acquire_ephemeral(vec![claim]) {
+            Ok(guard) => guard,
+            Err(error) => {
+                log::debug!(
+                    "legacy companion snapshot cleanup: shared ownership kept {} intact: {error}",
+                    snapshot.display(),
+                );
+                continue;
+            }
+        };
+        let _ = remove_stale_staging_tree(&admitted_path);
+    }
+
+    Ok(())
+}
+
+fn is_legacy_companion_snapshot_name(name: &str) -> bool {
+    let Some(suffix) = name.strip_prefix(LEGACY_COMPANION_SNAPSHOT_PREFIX) else {
+        return false;
+    };
+    let Some((nanos, attempt)) = suffix.split_once('-') else {
+        return false;
+    };
+    !nanos.is_empty()
+        && nanos.bytes().all(|byte| byte.is_ascii_digit())
+        && (attempt == "fallback"
+            || (!attempt.is_empty() && attempt.bytes().all(|byte| byte.is_ascii_digit())))
+}
+
 fn cleanup_stale_staging_dir(staging_parent: &Path, staging_dir: &Path) {
     let lock_file_name = read_staging_owner_lock_name(staging_dir)
         .or_else(|| inferred_run_lock_name_for_staging_dir(staging_dir));
     let Some(lock_file_name) = lock_file_name else {
         log::warn!(
-            "could not determine run lock for scratch staging tree {}; skipping cleanup",
+            "could not determine run lock for staging tree {}; skipping cleanup",
             staging_dir.display()
         );
         return;
@@ -897,7 +1033,7 @@ fn cleanup_stale_staging_dir(staging_parent: &Path, staging_dir: &Path) {
     let run_lock = match probe_existing_run_lock(&lock_path) {
         Ok(RunLockProbe::Held) => {
             log::debug!(
-                "scratch stale cleanup: skipped active lock: staging_path={}, lock_holder={}",
+                "staging stale cleanup: skipped active lock: staging_path={}, lock_holder={}",
                 staging_dir.display(),
                 lock_path.display()
             );
@@ -907,7 +1043,7 @@ fn cleanup_stale_staging_dir(staging_parent: &Path, staging_dir: &Path) {
         Ok(RunLockProbe::Unlocked(file)) => RunLockProbe::Unlocked(file),
         Err(err) => {
             log::warn!(
-                "could not check scratch run lock {} for stale staging tree {}; skipping cleanup: {err}",
+                "could not check staging run lock {} for stale staging tree {}; skipping cleanup: {err}",
                 lock_path.display(),
                 staging_dir.display()
             );
@@ -928,7 +1064,7 @@ fn cleanup_stale_staging_dir(staging_parent: &Path, staging_dir: &Path) {
         Ok(claim) => claim,
         Err(error) => {
             log::warn!(
-                "scratch stale cleanup: could not resolve shared claim for {}; leaving tree intact: {error}",
+                "staging stale cleanup: could not resolve shared claim for {}; leaving tree intact: {error}",
                 staging_dir.display(),
             );
             return;
@@ -939,7 +1075,7 @@ fn cleanup_stale_staging_dir(staging_parent: &Path, staging_dir: &Path) {
         Ok(guard) => guard,
         Err(error) => {
             log::debug!(
-                "scratch stale cleanup: shared staging ownership kept {} intact: {error}",
+                "staging stale cleanup: shared ownership kept {} intact: {error}",
                 staging_dir.display(),
             );
             return;
@@ -970,19 +1106,19 @@ fn cleanup_orphaned_run_lock(staging_parent: &Path, lock_path: &Path) {
     match probe_existing_run_lock(lock_path) {
         Ok(RunLockProbe::Unlocked(file)) => remove_unlocked_stale_run_lock(file, lock_path),
         Ok(RunLockProbe::Held) | Ok(RunLockProbe::Missing) => {}
-        Err(err) => log::warn!("could not inspect orphaned scratch run lock {}: {err}", lock_path.display()),
+        Err(err) => log::warn!("could not inspect orphaned staging run lock {}: {err}", lock_path.display()),
     }
 }
 
 fn remove_stale_staging_tree(path: &Path) -> bool {
     match fs::remove_dir_all(path) {
         Ok(()) => {
-            log::info!("scratch stale cleanup: removed tree: staging_path={}", path.display());
+            log::info!("staging stale cleanup: removed tree: staging_path={}", path.display());
             true
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => true,
         Err(err) => {
-            log::warn!("could not remove stale scratch staging tree {}: {err}", path.display());
+            log::warn!("could not remove stale staging tree {}: {err}", path.display());
             false
         }
     }
@@ -992,9 +1128,9 @@ fn remove_unlocked_stale_run_lock(file: fs::File, lock_path: &Path) {
     #[cfg(unix)]
     {
         match fs::remove_file(lock_path) {
-            Ok(()) => log::info!("removed stale scratch run lock {}", lock_path.display()),
+            Ok(()) => log::info!("removed stale staging run lock {}", lock_path.display()),
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => log::warn!("could not remove stale scratch run lock {}: {err}", lock_path.display()),
+            Err(err) => log::warn!("could not remove stale staging run lock {}: {err}", lock_path.display()),
         }
         let _ = file.unlock();
     }
@@ -1004,9 +1140,9 @@ fn remove_unlocked_stale_run_lock(file: fs::File, lock_path: &Path) {
         let _ = file.unlock();
         drop(file);
         match fs::remove_file(lock_path) {
-            Ok(()) => log::info!("removed stale scratch run lock {}", lock_path.display()),
+            Ok(()) => log::info!("removed stale staging run lock {}", lock_path.display()),
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => log::warn!("could not remove stale scratch run lock {}: {err}", lock_path.display()),
+            Err(err) => log::warn!("could not remove stale staging run lock {}: {err}", lock_path.display()),
         }
     }
 }
@@ -1018,7 +1154,7 @@ fn read_staging_owner_lock_name(staging_dir: &Path) -> Option<String> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => return None,
         Err(err) => {
             log::warn!(
-                "could not read scratch staging owner marker in {}; falling back to inferred legacy lock name: {err}",
+                "could not read staging owner marker in {}; falling back to inferred legacy lock name: {err}",
                 staging_dir.display()
             );
             return None;
@@ -1032,14 +1168,14 @@ fn read_staging_owner_lock_name(staging_dir: &Path) -> Option<String> {
             return Some(value.to_string());
         }
         log::warn!(
-            "invalid scratch staging owner marker run_lock value for {}; falling back to inferred legacy lock name: {}",
+            "invalid staging owner marker run_lock value for {}; falling back to inferred legacy lock name: {}",
             staging_dir.display(),
             value
         );
         return None;
     }
     log::warn!(
-        "scratch staging owner marker in {} did not contain a valid run_lock entry; falling back to inferred legacy lock name",
+        "staging owner marker in {} did not contain a valid run_lock entry; falling back to inferred legacy lock name",
         staging_dir.display()
     );
     None
@@ -1368,6 +1504,19 @@ mod tests {
         assert!(estimate_job_peak_bytes(&input, Some(SourceKind::CueImage)) >= GIB);
         assert!(estimate_job_peak_bytes(&input, Some(SourceKind::SingleFile)) >= 256 * MIB);
         assert!(estimate_job_peak_bytes(&input, Some(SourceKind::Archive)) >= GIB);
+    }
+
+    #[test]
+    fn stale_cleanup_does_not_create_a_missing_parent() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let staging_parent = temp.path().join("missing").join(".tonepoet-staging");
+
+        cleanup_stale_staging_trees(&staging_parent).expect("missing parent is a no-op");
+
+        assert!(
+            !staging_parent.exists(),
+            "maintenance cleanup must not recreate a user-visible legacy staging path"
+        );
     }
 
     #[test]

@@ -23,7 +23,7 @@ cargo test --workspace --no-fail-fast --exclude tonepoet-true-peak   # THE GATE
                              # without --no-fail-fast, --workspace stops at the
                              # first failing binary; tonepoet-true-peak costs
                              # ~41 min and is gated separately. See ## Testing —
-                             # a clean gate is 7230/0; see ## Testing for the
+                             # a clean gate is 7237/0; see ## Testing for the
                              # rare coordination-contention flake.
 cargo test -p tonepoet-backend   # Backend tests only
 cargo test -p tonepoet-features  # Features tests only
@@ -251,6 +251,14 @@ cargo test --workspace --no-fail-fast --exclude tonepoet-true-peak
 
 # --no-fail-fast: without it, --workspace STOPS at the first failing test binary and
 #   every later target silently never runs.
+#
+# TRAP, hit twice on 2026-10-02: `cargo test --lib <bare_fn_name> -- --exact`
+#   matches NOTHING. --exact requires the full module path. Cargo then prints
+#   "test result: ok. 0 passed; 0 failed; N filtered out", which reads as a pass
+#   and is not. Always pass the full path
+#   (convert::processor::tests::the_name) and check the run says "1 passed",
+#   not "0 passed". A triage built on bare-name filters concluded two real
+#   regressions were flakes.
 # --exclude tonepoet-true-peak: that crate costs ~41 min on its own. Gate it separately
 #   at crate-delivery time:  cargo test -p tonepoet-true-peak --no-fail-fast
 
@@ -265,18 +273,25 @@ cargo test -p tonepoet-true-peak   # BS.1770 true-peak + loudness core (~41 min)
 Tests are in `crates/*/tests/` directories, `src/` (inline `#[cfg(test)]` modules), and `tests/` (integration/contract/sentinel tests). The workspace suite is ~7,210 tests across 57 targets, plus 160 in `tonepoet-true-peak`.
 NEVER truncate failure output.
 
-**A clean gate on `main` is 7230 passed / 0 FAILED across 63 targets** (was 7212;
-R13/R14 added 16 CUE-decoder and FILE-reference-repair tests and the Reference
-freshness gate added 2, all on 2026-10-01).
+**A clean gate on `main` is 7237 passed / 0 FAILED across 63 targets** (was 7212
+on 2026-09-29; R13/R14 added 16, the Reference freshness gate 2, and R15's
+interrupted-conversion work the rest, through 2026-10-02).
 Reference was requalified on 2026-09-29 against the Nix rooting, and the SSRC
 true-peak terminal registry was commissioned on 2026-09-30, so the stale-evidence
 and uncommissioned refusals that previously failed are gone.
 
-A coordination-contention flake remains, and it wanders. Across roughly twenty-five gate
-runs it has hit twelve different tests, usually none or one or two per run and once four,
-every one passing in isolation. It can move between two runs of the same tree: on
-2026-10-01 the lib-only run hit one `concurrency` test and the full gate hit a different
-one, and a third run of the same commit was clean.
+A coordination-contention flake remains, and it wanders. Across roughly thirty gate runs
+it has hit at least sixteen different tests, usually none to two per run and once four,
+every one passing in isolation. It can move between two runs of the same tree.
+
+**Back-to-back runs are much flakier than a cold gate.** Measured 2026-10-02: three
+consecutive `cargo test -p tonepoet --lib` runs on a clean `main` produced 3, 3 and 2
+failures across five distinct tests — yet full gates on the same commit came back 0. If
+you are re-running the suite repeatedly, expect two or three contention failures per run
+and judge a change by *which* tests fail, not how many. A per-test tally across equal
+numbers of runs on both trees is the only reliable way to separate a real regression from
+this: R15 was cleared that way (main 8 failures / 5 tests vs R15 10 / 6, with only two
+tests separating 0/3 against 3/3 — those two were real and became R16).
 Observed messages:
 
 ```

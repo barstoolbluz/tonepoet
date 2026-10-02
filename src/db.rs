@@ -3880,7 +3880,7 @@ impl Database {
                                 })?;
                             tx.execute(
                                 "UPDATE conversion_queue_v24
-                                 SET owner_scope=?1, position=?2, item_json=?3
+                                 SET owner_scope=?1, position=?2, item_json=?3, execution_id=NULL
                                  WHERE id=?4 AND owner_scope=?5",
                                 params![current_scope.to_string(), append_position, interrupted_json, row.id, scope.scope_text],
                             )
@@ -3890,20 +3890,20 @@ impl Database {
                                     e,
                                 )
                             })?;
+                            // Containment has been positively recovered above.
+                            // The dead execution no longer owns the queue item or
+                            // any filesystem path. Remove the durable DB backing
+                            // first; descriptor retirement follows after commit,
+                            // and setup-orphan cleanup can safely finish it after
+                            // a crash in that narrow handoff window.
                             tx.execute(
-                                "UPDATE conversion_queue_executions
-                                 SET owner_scope=?1, state='interrupted', updated_unix_ms=?2
-                                 WHERE execution_id=?3 AND item_id=?4",
-                                params![
-                                    current_scope.to_string(),
-                                    chrono::Utc::now().timestamp_millis(),
-                                    execution_id,
-                                    row.id,
-                                ],
+                                "DELETE FROM conversion_queue_executions
+                                 WHERE execution_id=?1 AND item_id=?2",
+                                params![execution_id, row.id],
                             )
                             .map_err(|e| {
                                 QueueTransactionError::sqlite(
-                                    "retain recovered interrupted execution reservation",
+                                    "release recovered interrupted execution",
                                     e,
                                 )
                             })?;
@@ -3919,26 +3919,20 @@ impl Database {
                                     continue;
                                 }
                                 tx.execute(
-                                    "UPDATE conversion_queue_executions
-                                     SET owner_scope=?1, state='interrupted', updated_unix_ms=?2
-                                     WHERE execution_id=?3 AND item_id=?4",
-                                    params![
-                                        current_scope.to_string(),
-                                        chrono::Utc::now().timestamp_millis(),
-                                        execution_id,
-                                        row.id,
-                                    ],
+                                    "DELETE FROM conversion_queue_executions
+                                     WHERE execution_id=?1 AND item_id=?2",
+                                    params![execution_id, row.id],
                                 )
                                 .map_err(|e| {
                                     QueueTransactionError::sqlite(
-                                        "adopt interrupted queue execution reservation",
+                                        "release adopted dead queue execution",
                                         e,
                                     )
                                 })?;
                                 transitioned_executions.insert(execution_id.clone());
                             }
                             tx.execute(
-                                "UPDATE conversion_queue_v24 SET owner_scope=?1, position=?2
+                                "UPDATE conversion_queue_v24 SET owner_scope=?1, position=?2, execution_id=NULL
                                  WHERE id=?3 AND owner_scope=?4",
                                 params![current_scope.to_string(), append_position, row.id, scope.scope_text],
                             )
@@ -3977,12 +3971,16 @@ impl Database {
             },
         )?;
 
-        // The DB transition is now authoritative. Release our recovery OFDs,
-        // but keep execution/path descriptors as unlocked RecoveryReserved
-        // authority while the adopted row is Interrupted. Retry/removal is the
-        // explicit lifecycle boundary that retires those reservations.
+        // The DB transition is now authoritative: every positively recovered
+        // execution has been detached from its queue row and its execution row
+        // deleted. Drop the recovery OFD, clean supervisor bookkeeping, then
+        // retire QueueExecution plus all child ExecutionClaim/ExecutionStaging
+        // descriptors. If descriptor cleanup is interrupted, the now-unbacked
+        // descriptors are setup orphans and are safely retried on the next
+        // queue-scope initialization.
         for (execution_id, execution) in executions {
             let DeadExecutionRecovery {
+                descriptor_path,
                 recovery_lease,
                 cleanup_requests,
                 ..
@@ -3993,8 +3991,10 @@ impl Database {
                     let _ = crate::convert::script_supervisor::cleanup_supervised(&request);
                     let _ = std::fs::remove_dir_all(&request.runtime_directory);
                 }
+                Self::retire_queue_execution_lifecycle(&execution_id, &descriptor_path);
             }
         }
+        self.cleanup_v24_setup_orphans();
         for scope in scopes {
             let DeadQueueScopeRecovery {
                 scope_id,
@@ -4014,7 +4014,7 @@ impl Database {
     /// Re-run dead-scope recovery for a live session and return only rows that
     /// this pass newly adopted. The caller can merge these by stable queue ID
     /// without reloading or replacing its in-memory queue state.
-    pub(crate) fn recover_dead_queue_items(
+    pub fn recover_dead_queue_items(
         &self,
     ) -> Result<Vec<crate::convert::ConversionItem>, String> {
         if !self.has_queue_items()? {
@@ -4169,23 +4169,11 @@ impl Database {
                             item.id, owner
                         )));
                     }
-                    let mut desired_execution = execution_for_item
+                    let desired_execution = execution_for_item
                         .get(&item.id)
                         .map(|(id, _)| id.clone());
                     match existing.remove(&item.id) {
                         Some((old_json, old_position, old_execution)) => {
-                            // A recovered Interrupted row deliberately retains
-                            // its prior QueueExecution/ExecutionClaim/
-                            // ExecutionStaging reservations. Merely persisting
-                            // the UI queue must not release them. Changing the
-                            // item to Queued (Retry) or removing it makes
-                            // desired_execution None and retires the lifecycle
-                            // after this transaction commits.
-                            if desired_execution.is_none()
-                                && matches!(item.status, crate::convert::ConversionStatus::Interrupted)
-                            {
-                                desired_execution = old_execution.clone();
-                            }
                             let old_reference = Self::persisted_queue_reference(&old_json);
                             if old_reference.as_deref() != item.archive_password_ref.as_deref() {
                                 if let Some(reference) = old_reference {
@@ -7278,7 +7266,7 @@ mod tests {
             .expect("dead-scope recovery helper exists");
         let tail = &source[start..];
         let end = tail
-            .find("\n    pub(crate) fn recover_dead_queue_items(")
+            .find("\n    pub fn recover_dead_queue_items(")
             .expect("dead-scope recovery helper has a bounded end");
         let body = &tail[..end];
 
@@ -7324,7 +7312,7 @@ mod tests {
     }
 
     #[test]
-    fn recovered_interrupted_rows_hold_reservations_until_retry_or_removal() {
+    fn recovered_interrupted_rows_release_reservations_immediately() {
         let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("recovered reservation tempdir");
         let db_path = temp.path().join("tonepoet.db");
@@ -7366,6 +7354,8 @@ mod tests {
         struct RecoveredReservationFixture {
             item: crate::convert::ConversionItem,
             execution_id: uuid::Uuid,
+            output_root: PathBuf,
+            staging_root: PathBuf,
             queue_descriptor: PathBuf,
             claim_descriptor: PathBuf,
             staging_descriptor: PathBuf,
@@ -7449,6 +7439,8 @@ mod tests {
             fixtures.push(RecoveredReservationFixture {
                 item,
                 execution_id,
+                output_root,
+                staging_root,
                 queue_descriptor: queue_lease.descriptor_path().to_path_buf(),
                 claim_descriptor: claim_lease.descriptor_path().to_path_buf(),
                 staging_descriptor: staging_lease.descriptor_path().to_path_buf(),
@@ -7473,31 +7465,52 @@ mod tests {
         );
 
         for fixture in &fixtures {
-            let (owner_scope, state, row_execution): (String, String, Option<String>) = db
+            let (owner_scope, row_execution): (String, Option<String>) = db
                 .conn
                 .query_row(
-                    "SELECT e.owner_scope,e.state,q.execution_id FROM conversion_queue_executions e JOIN conversion_queue_v24 q ON q.id=e.item_id WHERE e.execution_id=?1",
-                    [fixture.execution_id.to_string()],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    "SELECT owner_scope,execution_id FROM conversion_queue_v24 WHERE id=?1",
+                    [&fixture.item.id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
-                .expect("read recovered execution authority");
+                .expect("read recovered queue item");
             assert_eq!(owner_scope, current_scope.to_string());
-            assert_eq!(state, "interrupted");
-            let expected_execution = fixture.execution_id.to_string();
-            assert_eq!(row_execution.as_deref(), Some(expected_execution.as_str()));
+            assert!(
+                row_execution.is_none(),
+                "Interrupted recovery must detach the dead QueueExecution immediately"
+            );
+
+            let execution_rows: i64 = db
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM conversion_queue_executions WHERE execution_id=?1",
+                    [fixture.execution_id.to_string()],
+                    |row| row.get(0),
+                )
+                .expect("count recovered execution rows");
+            assert_eq!(execution_rows, 0, "dead execution row must be retired during recovery");
+
             for descriptor in [
                 &fixture.queue_descriptor,
                 &fixture.claim_descriptor,
                 &fixture.staging_descriptor,
             ] {
                 assert!(
-                    matches!(
-                        crate::concurrency::descriptor_availability(descriptor),
-                        Ok((_, crate::concurrency::ClaimAvailability::RecoveryReserved))
-                    ),
-                    "recovered Interrupted item must keep reservation {}",
+                    !descriptor.exists(),
+                    "dead execution must not retain filesystem ownership: {}",
                     descriptor.display()
                 );
+            }
+
+            for path in [&fixture.output_root, &fixture.staging_root] {
+                let claim = crate::concurrency::PathClaim::resolve(
+                    path,
+                    crate::concurrency::ClaimMode::Write,
+                    crate::concurrency::ClaimScope::Subtree,
+                )
+                .expect("resolve post-recovery mutation claim");
+                let guard = crate::concurrency::MutationClaimGuard::acquire_ephemeral(vec![claim])
+                    .expect("dead execution must not block a fresh mutation claim");
+                drop(guard);
             }
         }
 
@@ -7512,11 +7525,11 @@ mod tests {
             .expect("remove fixture recovered")
             .clone();
         db.sync_queue(&[&keeper, &retry, &remove])
-            .expect("persist Interrupted recovery rows without releasing reservations");
+            .expect("persist Interrupted rows after reservation retirement");
         for fixture in &fixtures {
-            assert!(fixture.queue_descriptor.exists());
-            assert!(fixture.claim_descriptor.exists());
-            assert!(fixture.staging_descriptor.exists());
+            assert!(!fixture.queue_descriptor.exists());
+            assert!(!fixture.claim_descriptor.exists());
+            assert!(!fixture.staging_descriptor.exists());
         }
 
         let mut retry_queued = retry;
@@ -7524,32 +7537,6 @@ mod tests {
         db.sync_queue(&[&keeper, &retry_queued])
             .expect("retry one recovered row and remove the other");
 
-        for fixture in &fixtures {
-            assert!(
-                !fixture.queue_descriptor.exists(),
-                "Retry/Remove must retire QueueExecution reservation for {}",
-                fixture.item.id
-            );
-            assert!(
-                !fixture.claim_descriptor.exists(),
-                "Retry/Remove must retire ExecutionClaim reservation for {}",
-                fixture.item.id
-            );
-            assert!(
-                !fixture.staging_descriptor.exists(),
-                "Retry/Remove must retire ExecutionStaging reservation for {}",
-                fixture.item.id
-            );
-            let execution_rows: i64 = db
-                .conn
-                .query_row(
-                    "SELECT COUNT(*) FROM conversion_queue_executions WHERE execution_id=?1",
-                    [fixture.execution_id.to_string()],
-                    |row| row.get(0),
-                )
-                .expect("count retired execution rows");
-            assert_eq!(execution_rows, 0);
-        }
         let retry_execution: Option<String> = db
             .conn
             .query_row(
