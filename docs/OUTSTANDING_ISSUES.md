@@ -3367,16 +3367,19 @@ orphaned. The output root ends a conversion with no `.tonepoet-*` entry in it.
 
 ### Reproduced 2026-10-02 on a default configuration
 
-A 22-track DSD64 SACD ISO, `SIGKILL`ed two minutes in, no `scratch_directory`
-configured, left **658 MB** in the output root:
+A 22-track DSD64 SACD ISO, `SIGKILL`ed about fifteen seconds in, no
+`scratch_directory` configured, left this in the output root:
 
 ```
-.tonepoet-staging/.job-87876a7a-….run.lock
-.tonepoet-staging/job-87876a7a-…-87876a7a-…/converted/
-.tonepoet-staging/job-87876a7a-…-87876a7a-…/realized-sacd-tracks/*.tmp   (17 files)
+.tonepoet-staging/.job-<uuid>.run.lock
+.tonepoet-staging/job-<uuid>-<uuid>/converted/
+.tonepoet-staging/job-<uuid>-<uuid>/realized-sacd-tracks/*.tmp
 ```
 
-A later successful conversion into the same root does not remove it.
+Size depends on how far it got: two runs left 658 MB and 1.8 GB (the latter
+11 `.tmp` files, 44 entries, 1 lock). Converting a *different* album into the
+same root afterwards succeeds and leaves the orphan untouched — still 1.8 GB,
+same job directory.
 
 Two qualifications on the original filing:
 

@@ -14,22 +14,27 @@ Both were reproduced on a default configuration today, deterministically.
 
 ## What was measured
 
-A 22-track DSD64 SACD ISO converting to FLAC, `SIGKILL`ed about two minutes in,
-with no `scratch_directory` configured — the default any user has.
+A 22-track DSD64 SACD ISO converting to FLAC, `SIGKILL`ed about fifteen seconds
+in, with no `scratch_directory` configured — the default any user has.
 
-**Left in the output root, 658 MB:**
+**Left in the output root:**
 
 ```
 .tonepoet-staging/
-.tonepoet-staging/.job-87876a7a-….run.lock
-.tonepoet-staging/job-87876a7a-…-87876a7a-…/converted/
-.tonepoet-staging/job-87876a7a-…-87876a7a-…/realized-sacd-tracks/
-    .sacd_bach_vol_1_…_track_001_….dsf.1185854.1790907091152209047.tmp
-    … 16 more
+.tonepoet-staging/.job-<uuid>.run.lock
+.tonepoet-staging/job-<uuid>-<uuid>/converted/
+.tonepoet-staging/job-<uuid>-<uuid>/realized-sacd-tracks/
+    .sacd_bach_vol_1_…_track_001_….dsf.<pid>.<nanos>.tmp
+    … one per track realized so far
 ```
 
-A later successful conversion into the same root does not remove it. It is
-still 658 MB afterwards.
+How much depends on how far it got: two runs killed at different moments left
+658 MB and 1.8 GB (11 `.tmp` files, 44 entries, 1 lock).
+
+Nothing removes it afterwards. Converting a *different* album into the same
+output root succeeds — `1/1 succeeded` — and the orphan is untouched: still
+1.8 GB, still 11 `.tmp` files, same `job-<uuid>-<uuid>` directory. The root now
+holds the new album beside a staging tree from a process that died.
 
 **And the album is now permanently unconvertible:**
 
