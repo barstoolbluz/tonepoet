@@ -43,13 +43,10 @@ block. The template above is the one the user's TUI is configured with.
 
 - The message says "output concurrency admission failed". Nothing concurrent is
   involved in the reproduction.
-- The label and pressing detail in the second path — `We Release Jazz`,
-  `WRJ010LTD`, `24-96kHz` — are all present in the source folder name,
-  `Hiroshi Suzuki - Cat (1975, 2021, WRJ) [LP 24-96]`.
-- The message text occurs once in the tree, in `admit_planned_output_claim`
-  (`src/convert/pipeline/stages.rs`).
 - Nothing is written to the output root: no album directory, no partial
   output, no staging.
+- The field occurrence left a terminal failed status persisted in the queue, so
+  re-running produced the same five failures and no new log output.
 
 ## The outcome we want
 
@@ -61,9 +58,6 @@ Where a conversion genuinely cannot proceed, the user is told what is wrong
 with their album in terms they can act on, once — not an internal message about
 namespace redirection repeated per track.
 
-A conversion that has never run should not be able to inherit a terminal
-failed state that survives re-running it.
-
 ## State
 
 Gate 7244 passed / 0 failed across 63 targets, zero warnings.
@@ -72,8 +66,9 @@ records it at 160/0. Reference qualification current as of 2026-10-02.
 
 ## Build capability
 
-`cargo test -p tonepoet-pipeline` builds in seconds. `stages.rs` is in the root
-`tonepoet` crate, which peaks at 6.24 GB in one `rustc` and will OOM under a
-4 GB ceiling; write those changes uncompiled and say so. `stages.rs` is also
-Reference-source-locked, so a change there requires requalification on our
-build host — say so in the delivery notes and we will run it.
+`cargo test -p tonepoet-pipeline` builds in seconds. The root `tonepoet` crate
+peaks at 6.24 GB in one `rustc` and will OOM under a 4 GB ceiling; write those
+changes uncompiled and say so. Some files are Reference-source-locked
+(`reference_source_lock.rs` lists them) and changing one requires
+requalification on our build host — if your change touches any, say so in the
+delivery notes and we will run it.
