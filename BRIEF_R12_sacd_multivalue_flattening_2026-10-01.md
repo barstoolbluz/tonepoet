@@ -1,8 +1,7 @@
-# Brief R12 — SACD conversions flatten multi-value metadata
+# Brief R12 — SACD sidecar multi-value metadata arrives as one delimited string
 
-Date: 2026-10-01
-Base: the supplied `tonepoet-src.tar.gz` is authoritative. It is our local
-`main` at gate 7212/0.
+Date: 2026-10-02 (supersedes the 2026-10-01 draft)
+Base: the supplied `tonepoet-src.tar.gz` is our `main` at gate 7237/0.
 
 ## What the user sees
 
@@ -14,61 +13,56 @@ La Petite Bande, Dir. Sigiswald Kuijken\; Sophie Karthäuser - Soprano\;
 Petra Noskaiová - Alto\; Christoph Genz - Tenor\; Dominik Wörner - Baryton
 ```
 
-The same album's editor, opened on the SACD ISO itself, shows no backslashes.
-Conversions from DSF, PCM and CUE sources do not show them either. Only SACD.
+Conversions from DSF, PCM and CUE sources do not show them. Only SACD.
 
-## What is actually different
+The converted file holds one value containing semicolons. A DSF-sourced
+conversion of a comparable album holds several distinct values.
 
-The backslashes are not the defect. They are a faithful rendering of what the
-converted file contains.
+## What the sidecars contain
 
-Two conversions, same editor, read with `metaflac`:
+Measured across the 22 SACD metabase sidecars on this machine, 961 tracks:
 
-| source | ARTIST in the FLAC |
-|---|---|
-| DSF — *Echoes of an Era* | six repeated `ARTIST=` keys, no semicolons |
-| SACD — *Bachkantaten* | one `ARTIST=` key whose value contains semicolons |
+- No `<track>` ever repeats a `<meta name=…>`.
+- `ARTIST` contains `; ` in 948 of 961 tracks.
+- `COMPOSER` in 8 of 952. `ALBUMARTIST` in some.
+- `TITLE`, `ALBUM`, `DATE`, `ISRC`, `CATALOGNUMBER`, `TRACKNUMBER`: never.
 
-Given six distinct values the editor joins them for display and has nothing to
-escape. Given one value with literal semicolons inside, it escapes them,
-because an unescaped `;` would be indistinguishable from the separator it uses
-between values. That escaping round-trips correctly and nothing is corrupted
-on save.
+A representative value:
 
-So the difference is in the files, not the editor. The SACD path produced a
-single delimited string where the DSF path produced distinct values.
+```xml
+<meta name="ARTIST" value="Johann Sebastian Bach; La Petite Bande; Sigiswald
+Kuijken; Gerlinde Sämann; Petra Noskaiová; Christoph Genz; Jan Van der Crabben"/>
+```
+
+and one that is less tidy:
+
+```xml
+<meta name="ALBUMARTIST" value="La Petite Band, Sigiswald Kuijken; Sämann,
+Noskaiova, Genz, Van der Crabben"/>
+```
 
 ## The outcome we want
 
-Multi-value metadata from an SACD sidecar survives conversion as multiple
-values, the way it does from every other source. A listener's tagger, a
-library scanner and tonepoet's own editor should all see the same structure
-for the same album regardless of which source it came from.
+Multi-value metadata from an SACD sidecar reaches the converted files as
+multiple values, the way it does from every other source. A listener's tagger,
+a library scanner and tonepoet's own editor should see the same structure for
+the same album regardless of which source it came from.
 
 Where a field genuinely holds one value that happens to contain a semicolon,
-it stays one value and the editor is free to escape it. The point is that the
-structure of the metadata should reflect the structure of the source, not an
-artifact of how it travelled.
+it stays one value.
 
-## Where we stopped
-
-We did not determine where the flattening happens — whether the sidecar is
-parsed into one value, whether multiple values are joined somewhere in the
-SACD path, or whether the writer collapses them. The album is at
-`~/temp/La Petite Bande, Dir. Sigiswald Kuijken; …  - Bachkantaten (BWV 55, 56, 98, 180) (2005) [FLAC]`
-and its source ISO has an XML sidecar.
-
-Worth knowing: the editor opened on the ISO shows these values unescaped,
-which suggests the pre-conversion representation may differ from the
-post-conversion one. We did not confirm that.
+Writing a sidecar back should reproduce the source's own convention rather
+than inventing a new one.
 
 ## State
 
-Gate 7212 passed / 0 failed, zero warnings. `tonepoet-true-peak` 160/0.
-Reference requalified; SSRC true-peak registry commissioned.
+Gate 7237 passed / 0 failed across 63 targets, zero warnings.
+`tonepoet-true-peak` 160/0. Reference qualification current as of 2026-10-02;
+`tests/reference_qualification_freshness.rs` fails the gate if a locked source
+drifts from it.
 
 ## Build capability
 
-`cargo test -p tonepoet-pipeline` builds in seconds. The root `tonepoet` crate
-peaks at 6.24 GB in one `rustc` and will OOM under a 4 GB ceiling; the SACD
-and metadata paths live there, so write those uncompiled and say so.
+`cargo test -p tonepoet-pipeline` builds in seconds. The SACD and metadata
+paths live in the root `tonepoet` crate, which peaks at 6.24 GB in one `rustc`
+and will OOM under a 4 GB ceiling; write those changes uncompiled and say so.
