@@ -39,7 +39,10 @@ pub struct SidecarTrack {
     /// Spec-encoded id (1..N1 stereo, (N1+1)..(N1+N2) MCH).
     pub id: u32,
     /// `<meta name="K" value="V"/>` entries, deduplicated by key
-    /// (later occurrences overwrite earlier ones).
+    /// (later occurrences overwrite earlier ones). Values stay in the
+    /// metabase's raw scalar representation so writeback can preserve the
+    /// source convention. Call [`SidecarTrack::meta_values`] when projecting
+    /// an established ordered-list field into pipeline/editor metadata.
     pub meta: BTreeMap<String, String>,
     /// `<replaygain name="K" value="V"/>` entries — kept separate
     /// because the sidecar nests them under their own element rather
@@ -47,6 +50,66 @@ pub struct SidecarTrack {
     /// replaygain_track_peak, replaygain_album_gain,
     /// replaygain_album_peak.
     pub replaygain: BTreeMap<String, String>,
+}
+
+const METABASE_ORDERED_VALUE_SEPARATOR: &str = "; ";
+
+fn canonical_metabase_list_key(key: &str) -> String {
+    let uppercase = key.trim().to_ascii_uppercase();
+    if uppercase == "ALBUM ARTIST" {
+        "ALBUMARTIST".to_string()
+    } else {
+        uppercase
+    }
+}
+
+fn metabase_field_is_ordered_list(key: &str) -> bool {
+    let canonical = canonical_metabase_list_key(key);
+    crate::metadata_persistence::field_is_in_contract(
+        &canonical,
+        crate::metadata_persistence::PIPELINE_ORDERED_LIST_FIELDS,
+    )
+}
+
+fn decode_metabase_meta_values(key: &str, raw: &str) -> Vec<String> {
+    if !metabase_field_is_ordered_list(key) || !raw.contains(METABASE_ORDERED_VALUE_SEPARATOR) {
+        return crate::metadata_persistence::normalize_ordered_metadata_member(raw)
+            .into_iter()
+            .collect();
+    }
+
+    crate::metadata_persistence::normalize_ordered_metadata_values(
+        raw.split(METABASE_ORDERED_VALUE_SEPARATOR),
+    )
+}
+
+impl SidecarTrack {
+    /// Return the raw scalar metabase value for `key`. `ALBUMARTIST` also
+    /// accepts the legacy/spaced `ALBUM ARTIST` spelling already supported by
+    /// the SACD editor.
+    pub(crate) fn meta_value(&self, key: &str) -> Option<&str> {
+        let canonical = key.trim().to_ascii_uppercase();
+        if let Some(value) = self.meta.get(&canonical) {
+            return Some(value.as_str());
+        }
+        if canonical == "ALBUMARTIST" {
+            return self.meta.get("ALBUM ARTIST").map(String::as_str);
+        }
+        None
+    }
+
+    /// Project one metabase `<meta>` scalar into its logical ordered values.
+    ///
+    /// foo_input_sacd-compatible metabases serialize ordered-list fields as one
+    /// attribute joined by `"; "`. Split only TonePoet's established pipeline
+    /// list fields; scalar fields such as TITLE and ALBUM retain semicolons
+    /// verbatim. The raw `meta` map is never rewritten here, so parsing does not
+    /// silently change sidecar writeback representation.
+    pub(crate) fn meta_values(&self, key: &str) -> Option<Vec<String>> {
+        let raw = self.meta_value(key)?;
+        let values = decode_metabase_meta_values(key, raw);
+        (!values.is_empty()).then_some(values)
+    }
 }
 
 /// Top-level parsed sidecar. `store_id` and `version` come from the
@@ -856,6 +919,64 @@ mod tests {
         // canonical form).
         assert!(!t.meta.contains_key("album"));
         assert!(!t.meta.contains_key("title"));
+    }
+
+    #[test]
+    fn metabase_ordered_values_split_only_list_fields_and_preserve_raw_storage() {
+        let xml = r#"<root><store id="A" type="SACD" version="1.1">
+<track id="1"><meta name="ARTIST" value="Johann Sebastian Bach; La Petite Bande; Johann Sebastian Bach"/><meta name="ALBUM ARTIST" value="La Petite Bande, Sigiswald Kuijken; Sämann, Noskaiova"/><meta name="COMPOSER" value="Composer A; Composer B"/><meta name="TITLE" value="Act I; Scene 2"/><meta name="TRACKNUMBER" value="1"/><meta name="TOTALTRACKS" value="1"/></track>
+</store></root>"#;
+        let m = parse_sidecar_str(xml).expect("parse");
+        let t = &m.tracks[0];
+
+        assert_eq!(
+            t.meta_values("ARTIST").expect("artist values"),
+            vec![
+                "Johann Sebastian Bach".to_string(),
+                "La Petite Bande".to_string(),
+                "Johann Sebastian Bach".to_string(),
+            ]
+        );
+        assert_eq!(
+            t.meta_values("ALBUMARTIST").expect("album artist values"),
+            vec![
+                "La Petite Bande, Sigiswald Kuijken".to_string(),
+                "Sämann, Noskaiova".to_string(),
+            ]
+        );
+        assert_eq!(
+            t.meta_values("COMPOSER").expect("composer values"),
+            vec!["Composer A".to_string(), "Composer B".to_string()]
+        );
+        assert_eq!(
+            t.meta_values("TITLE").expect("title value"),
+            vec!["Act I; Scene 2".to_string()]
+        );
+
+        // Projection must not mutate the raw metabase representation: save
+        // should continue to write one attribute using the source convention.
+        assert_eq!(
+            t.meta.get("ARTIST").map(String::as_str),
+            Some("Johann Sebastian Bach; La Petite Bande; Johann Sebastian Bach")
+        );
+        let serialized = serialize_sidecar(&m);
+        assert!(serialized.contains(
+            r#"name="ARTIST" value="Johann Sebastian Bach; La Petite Bande; Johann Sebastian Bach""#
+        ));
+        assert_eq!(serialized.matches(r#"name="ARTIST""#).count(), 1);
+    }
+
+    #[test]
+    fn metabase_list_projection_requires_the_exact_source_separator() {
+        let mut track = SidecarTrack::default();
+        track
+            .meta
+            .insert("ARTIST".to_string(), "Artist A;Artist B".to_string());
+
+        assert_eq!(
+            track.meta_values("ARTIST").expect("artist value"),
+            vec!["Artist A;Artist B".to_string()]
+        );
     }
 
     #[test]

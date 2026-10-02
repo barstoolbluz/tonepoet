@@ -258,7 +258,8 @@ fn album_metadata(
         insert_nonempty(&mut extra, "sacd_area_copyright", copyright.clone());
     }
 
-    let sc = |key: &str| sidecar_first_track.and_then(|t| t.meta.get(key)).cloned();
+    let sc = |key: &str| sidecar_meta_value(sidecar_first_track, key);
+    let sc_values = |key: &str| sidecar_nonempty_meta_values(sidecar_first_track, key);
 
     // Promote sidecar-only fields to album-level extra so folder templates
     // can resolve %CATALOGNUMBER%, %RELEASECOUNTRY%, MusicBrainz IDs, etc.
@@ -274,10 +275,13 @@ fn album_metadata(
         album: sc("ALBUM")
             .or_else(|| metadata.album_title().map(str::to_string))
             .or_else(|| area.header.description.clone()),
-        album_artist: sc("ARTIST")
-            .or_else(|| metadata.album_artist().map(str::to_string))
-            .into(),
-        genre: sc("GENRE").or_else(|| first_genre(metadata)).into(),
+        album_artist: sc_values("ALBUMARTIST")
+            .or_else(|| sc_values("ARTIST"))
+            .unwrap_or_else(|| {
+                MetadataValueList::from_optional(metadata.album_artist().map(str::to_string))
+            }),
+        genre: sc_values("GENRE")
+            .unwrap_or_else(|| MetadataValueList::from_optional(first_genre(metadata))),
         date: sc("DATE").or_else(|| format_disc_date(metadata.master_toc.disc_date)),
         total_tracks,
         total_discs: if metadata.master_toc.album_set_size > 1 {
@@ -351,25 +355,41 @@ fn track_metadata(
         insert_nonempty(&mut extra, "sacd_composer_phonetic", value.clone());
     }
 
-    // Sidecar is primary source for text metadata; TOC is fallback.
-    let sc = |key: &str| sidecar.and_then(|t| t.meta.get(key)).cloned();
+    // Sidecar is primary source for text metadata; TOC is fallback. Ordered
+    // fields use the metabase's logical list projection while scalar fields keep
+    // their original scalar semantics.
+    let sc = |key: &str| sidecar_meta_value(sidecar, key);
+    let sc_values = |key: &str| sidecar_nonempty_meta_values(sidecar, key);
 
     TrackMetadata {
         title: sc("TITLE").or_else(|| entry.text.title.clone()),
-        artist: sc("ARTIST")
-            .or_else(|| entry.text.performer.clone())
-            .or_else(|| metadata.album_artist().map(str::to_string))
-            .into(),
-        album_artist: sc("ARTIST")
-            .or_else(|| metadata.album_artist().map(str::to_string))
-            .into(),
-        composer: entry.text.composer.clone().into(),
-        performer: track_performer_from_sidecar_or_toc(sidecar, entry.text.performer.clone()).into(),
-        arranger: sc("ARRANGER").or_else(|| entry.text.arranger.clone()).into(),
-        genre: sc("GENRE")
-            .or_else(|| entry.genre.map(genre_to_string))
-            .or_else(|| first_genre(metadata))
-            .into(),
+        artist: sc_values("ARTIST").unwrap_or_else(|| {
+            MetadataValueList::from_optional(
+                entry
+                    .text
+                    .performer
+                    .clone()
+                    .or_else(|| metadata.album_artist().map(str::to_string)),
+            )
+        }),
+        album_artist: sc_values("ALBUMARTIST")
+            .or_else(|| sc_values("ARTIST"))
+            .unwrap_or_else(|| {
+                MetadataValueList::from_optional(metadata.album_artist().map(str::to_string))
+            }),
+        composer: sc_values("COMPOSER")
+            .unwrap_or_else(|| MetadataValueList::from_optional(entry.text.composer.clone())),
+        performer: track_performer_from_sidecar_or_toc(sidecar, entry.text.performer.clone()),
+        arranger: sc_values("ARRANGER")
+            .unwrap_or_else(|| MetadataValueList::from_optional(entry.text.arranger.clone())),
+        genre: sc_values("GENRE").unwrap_or_else(|| {
+            MetadataValueList::from_optional(
+                entry
+                    .genre
+                    .map(genre_to_string)
+                    .or_else(|| first_genre(metadata)),
+            )
+        }),
         date: sc("DATE").or_else(|| format_disc_date(metadata.master_toc.disc_date)),
         track_number: Some(track_number),
         disc_number: disc_number(metadata),
@@ -399,20 +419,28 @@ fn track_metadata(
     }
 }
 
-fn sidecar_nonempty_meta_value(sidecar: Option<&SidecarTrack>, key: &str) -> Option<String> {
+fn sidecar_meta_value(sidecar: Option<&SidecarTrack>, key: &str) -> Option<String> {
     sidecar
-        .and_then(|track| track.meta.get(key))
-        .filter(|value| !value.trim().is_empty())
-        .cloned()
+        .and_then(|track| track.meta_value(key))
+        .map(str::to_string)
+}
+
+fn sidecar_nonempty_meta_values(
+    sidecar: Option<&SidecarTrack>,
+    key: &str,
+) -> Option<MetadataValueList> {
+    sidecar
+        .and_then(|track| track.meta_values(key))
+        .map(MetadataValueList::from_values)
 }
 
 fn track_performer_from_sidecar_or_toc(
     sidecar: Option<&SidecarTrack>,
     toc_performer: Option<String>,
-) -> Option<String> {
-    sidecar_nonempty_meta_value(sidecar, "PERFORMER")
-        .or_else(|| sidecar_nonempty_meta_value(sidecar, "ARTIST"))
-        .or(toc_performer)
+) -> MetadataValueList {
+    sidecar_nonempty_meta_values(sidecar, "PERFORMER")
+        .or_else(|| sidecar_nonempty_meta_values(sidecar, "ARTIST"))
+        .unwrap_or_else(|| MetadataValueList::from_optional(toc_performer))
 }
 
 fn is_standard_sidecar_album_key(key: &str) -> bool {
@@ -420,7 +448,10 @@ fn is_standard_sidecar_album_key(key: &str) -> bool {
         key,
         "TITLE"
             | "ALBUM"
+            | "ALBUMARTIST"
+            | "ALBUM ARTIST"
             | "ARTIST"
+            | "COMPOSER"
             | "PERFORMER"
             | "ARRANGER"
             | "GENRE"
@@ -434,7 +465,18 @@ fn is_standard_sidecar_album_key(key: &str) -> bool {
 fn is_standard_sidecar_track_key(key: &str) -> bool {
     matches!(
         key,
-        "TITLE" | "ARTIST" | "PERFORMER" | "ARRANGER" | "GENRE" | "DATE" | "ISRC" | "TRACKNUMBER" | "TOTALTRACKS"
+        "TITLE"
+            | "ARTIST"
+            | "ALBUMARTIST"
+            | "ALBUM ARTIST"
+            | "COMPOSER"
+            | "PERFORMER"
+            | "ARRANGER"
+            | "GENRE"
+            | "DATE"
+            | "ISRC"
+            | "TRACKNUMBER"
+            | "TOTALTRACKS"
     )
 }
 
@@ -617,6 +659,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::convert::pipeline::stages::authoritative_metadata_tags;
 
     fn sidecar_track(entries: &[(&str, &str)]) -> SidecarTrack {
         let mut track = SidecarTrack::default();
@@ -674,6 +717,220 @@ mod tests {
     fn performer_is_standard_sidecar_metadata_not_tonepoet_extra() {
         assert!(is_standard_sidecar_track_key("PERFORMER"));
         assert!(is_standard_sidecar_album_key("PERFORMER"));
+    }
+
+    #[test]
+    fn sidecar_ordered_values_become_pipeline_lists_in_order_without_deduplication() {
+        let sidecar = sidecar_track(&[
+            ("ARTIST", "Artist A; Artist B; Artist A"),
+            ("ALBUMARTIST", "Ensemble A; Ensemble B"),
+            ("COMPOSER", "Composer A; Composer B"),
+        ]);
+
+        assert_eq!(
+            sidecar_nonempty_meta_values(Some(&sidecar), "ARTIST")
+                .expect("artist values")
+                .values(),
+            &[
+                "Artist A".to_string(),
+                "Artist B".to_string(),
+                "Artist A".to_string(),
+            ]
+        );
+        assert_eq!(
+            sidecar_nonempty_meta_values(Some(&sidecar), "ALBUMARTIST")
+                .expect("album artist values")
+                .values(),
+            &["Ensemble A".to_string(), "Ensemble B".to_string()]
+        );
+        assert_eq!(
+            sidecar_nonempty_meta_values(Some(&sidecar), "COMPOSER")
+                .expect("composer values")
+                .values(),
+            &["Composer A".to_string(), "Composer B".to_string()]
+        );
+    }
+
+    #[test]
+    fn sidecar_performer_projection_preserves_multiple_values() {
+        let sidecar = sidecar_track(&[("PERFORMER", "Performer A; Performer B")]);
+
+        assert_eq!(
+            track_performer_from_sidecar_or_toc(Some(&sidecar), Some("TOC Performer".to_string()))
+                .values(),
+            &["Performer A".to_string(), "Performer B".to_string()]
+        );
+    }
+
+    #[test]
+    fn newly_typed_sidecar_fields_do_not_fall_through_to_track_extra() {
+        assert!(is_standard_sidecar_track_key("COMPOSER"));
+        assert!(is_standard_sidecar_track_key("ALBUMARTIST"));
+        assert!(is_standard_sidecar_track_key("ALBUM ARTIST"));
+        assert!(is_standard_sidecar_album_key("COMPOSER"));
+        assert!(is_standard_sidecar_album_key("ALBUMARTIST"));
+        assert!(is_standard_sidecar_album_key("ALBUM ARTIST"));
+    }
+
+    fn composer_test_context(track_count: usize) -> (SacdMetadata, AreaInfo) {
+        use crate::tui::sacd::{AreaPointer, AreaTocHeader, FrameFormat, MasterToc};
+
+        let tracks = (0..track_count).map(|_| TrackEntry::default()).collect();
+        let area = AreaInfo {
+            header: AreaTocHeader {
+                kind: AreaKind::Stereo,
+                spec_version: (1, 20),
+                size_sectors: 0,
+                max_byte_rate: 0,
+                sample_frequency: 4,
+                frame_format: FrameFormat::Dsd3In14,
+                channel_count: 2,
+                loudspeaker_config: 0,
+                extra_settings: 0,
+                max_available_channels: 2,
+                area_mute_flags: 0,
+                total_playtime: PlayTime::default(),
+                track_offset: 0,
+                track_count: track_count as u8,
+                track_start_lsn: 0,
+                track_end_lsn: 0,
+                text_area_count: 0,
+                locales: Vec::new(),
+                description: None,
+                description_phonetic: None,
+                copyright: None,
+                copyright_phonetic: None,
+            },
+            tracks,
+            consistency: Default::default(),
+        };
+        let metadata = SacdMetadata {
+            master_toc: MasterToc {
+                spec_version: (1, 20),
+                album_set_size: 1,
+                album_sequence_number: 1,
+                album_catalog_number: String::new(),
+                album_genres: Vec::new(),
+                two_channel: AreaPointer {
+                    toc_1_start: 0,
+                    toc_2_start: 0,
+                    toc_size_sectors: 0,
+                },
+                multi_channel: AreaPointer {
+                    toc_1_start: 0,
+                    toc_2_start: 0,
+                    toc_size_sectors: 0,
+                },
+                disc_type_hybrid: false,
+                disc_catalog_number: String::new(),
+                disc_genres: Vec::new(),
+                disc_date: None,
+                text_area_count: 0,
+                locales: Vec::new(),
+            },
+            master_text: None,
+            stereo: Some(area.clone()),
+            multi_channel: None,
+            consistency: Default::default(),
+        };
+        (metadata, area)
+    }
+
+    #[test]
+    fn sidecar_composer_stays_track_scoped_and_never_becomes_album_extra() {
+        let sidecars = [
+            sidecar_track(&[("COMPOSER", "Bronisław Kaper")]),
+            sidecar_track(&[("COMPOSER", "Miles Davis")]),
+            sidecar_track(&[("COMPOSER", "Victor Young")]),
+            sidecar_track(&[("COMPOSER", "Cole Porter")]),
+        ];
+        let expected = ["Bronisław Kaper", "Miles Davis", "Victor Young", "Cole Porter"];
+        let (metadata, area) = composer_test_context(sidecars.len());
+
+        let album = album_metadata(
+            &metadata,
+            &area,
+            SacdArea::Stereo,
+            sidecars.len() as u32,
+            sidecars.first(),
+        );
+        assert!(
+            !album.extra.contains_key("composer"),
+            "track 1 COMPOSER must not become shared album extra metadata"
+        );
+
+        for (index, ((entry, sidecar), expected_composer)) in area
+            .tracks
+            .iter()
+            .zip(sidecars.iter())
+            .zip(expected.iter())
+            .enumerate()
+        {
+            let track = track_metadata(
+                entry,
+                &metadata,
+                &area,
+                SacdArea::Stereo,
+                index as u32 + 1,
+                Some(sidecar),
+            );
+            assert_eq!(track.composer.values(), &[(*expected_composer).to_string()]);
+            assert!(
+                !track.extra.contains_key("composer"),
+                "canonical per-track COMPOSER must not also fall through to track extra"
+            );
+            let tags = authoritative_metadata_tags(&track, &album);
+            let composer_values = tags
+                .iter()
+                .filter(|(key, _)| key == "COMPOSER")
+                .map(|(_, value)| value.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(composer_values, vec![*expected_composer]);
+            assert!(
+                !tags
+                    .iter()
+                    .any(|(key, _)| key == "TONEPOET_ALBUM_COMPOSER"),
+                "track {} must not receive a composer copied from track 1: {tags:?}",
+                index + 1
+            );
+        }
+    }
+
+    #[test]
+    fn multivalue_sidecar_composer_is_ordered_and_not_album_extra() {
+        let sidecar = sidecar_track(&[("COMPOSER", "Composer A; Composer B")]);
+        let (metadata, area) = composer_test_context(1);
+        let album = album_metadata(&metadata, &area, SacdArea::Stereo, 1, Some(&sidecar));
+        let track = track_metadata(
+            &area.tracks[0],
+            &metadata,
+            &area,
+            SacdArea::Stereo,
+            1,
+            Some(&sidecar),
+        );
+
+        assert_eq!(
+            track.composer.values(),
+            &["Composer A".to_string(), "Composer B".to_string()]
+        );
+        assert!(
+            !album.extra.contains_key("composer"),
+            "multi-value COMPOSER must not become TONEPOET_ALBUM_COMPOSER input"
+        );
+        let tags = authoritative_metadata_tags(&track, &album);
+        let composer_values = tags
+            .iter()
+            .filter(|(key, _)| key == "COMPOSER")
+            .map(|(_, value)| value.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(composer_values, vec!["Composer A", "Composer B"]);
+        assert!(
+            !tags
+                .iter()
+                .any(|(key, _)| key == "TONEPOET_ALBUM_COMPOSER"),
+            "multi-value COMPOSER must not also emit an album-extra composer tag: {tags:?}"
+        );
     }
 }
 
