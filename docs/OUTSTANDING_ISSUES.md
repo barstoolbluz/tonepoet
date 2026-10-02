@@ -3040,8 +3040,9 @@ with recovery reservation: '…/Bachkantaten (BWV 55, 56, 98, 180)' overlaps
 The path overlaps itself, and the named queue execution is provably the dead
 process: `conversion_queue_executions` row `fe1f6d05-…` carries the running
 job's `item_id` and `origin_identity {"pid":1185854,…}`, the killed pid. The
-row stays at `state = 'interrupted'`, `external_released = 0`, and nothing
-reaps it. Isolation:
+row stays at `state = 'interrupted'`, `external_released = 0`, and no CLI run
+we tried released it (the TUI restart pass was not exercised here; the field
+report above says the reservation survived one). Isolation:
 
 - deleting `.tonepoet-staging` does **not** release it — the reservation
   outlives the directory, so it is durable state elsewhere;

@@ -6,7 +6,7 @@ Base: the supplied `tonepoet-src.tar.gz` is our `main` at gate 7230/0.
 Issues #53 and #44 are the same event seen from two sides. Killing a
 conversion mid-flight leaves two things behind: hundreds of megabytes of
 staging in the user's output folder, and a durable reservation that makes that
-album permanently unconvertible. Neither is cleaned up by anything.
+album unconvertible. Nothing we exercised cleans up either.
 
 Both were reproduced on a default configuration today, deterministically.
 
@@ -14,8 +14,9 @@ Both were reproduced on a default configuration today, deterministically.
 
 ## What was measured
 
-A 22-track DSD64 SACD ISO converting to FLAC, `SIGKILL`ed about fifteen seconds
-in, with no `scratch_directory` configured — the default any user has.
+A DSD64 SACD ISO — 22 tracks in the stereo area — converting to FLAC,
+`SIGKILL`ed about fifteen seconds in, with no `scratch_directory` configured,
+which is the default any user has.
 
 **Left in the output root:**
 
@@ -36,7 +37,7 @@ output root succeeds — `1/1 succeeded` — and the orphan is untouched: still
 1.8 GB, still 11 `.tmp` files, same `job-<uuid>-<uuid>` directory. The root now
 holds the new album beside a staging tree from a process that died.
 
-**And the album is now permanently unconvertible:**
+**And the album is now unconvertible:**
 
 ```
 PlanOutputs: output concurrency admission failed: filesystem mutation conflicts
@@ -58,7 +59,16 @@ Three further measurements narrow it:
   reservation is scoped to that album path, not global.
 - The row persists with `state = 'interrupted'` and `external_released = 0`,
   across process exits and later successful conversions. Two such rows are
-  present after two killed runs. Nothing reaps them.
+  present after two killed runs.
+
+### What we did not exercise
+
+Everything above was run from the CLI. We did not exercise the TUI's
+restart-time recovery pass, which #44 records as the only place it runs; the
+report there is that after such a restart the item was not re-enqueued and the
+reservation was still in place. We also did not wait to see whether any delayed
+sweep exists. So "nothing cleans this up" is what we observed across repeated
+CLI runs, plus that field report — not an exhaustive search for a reaper.
 
 ## What is already fine
 
