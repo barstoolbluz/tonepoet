@@ -3026,6 +3026,31 @@ only place the pass runs; the user reports the item was not re-enqueued and does
 appear in the Queue screen as Interrupted or retryable. The reservation on the folder
 is therefore still in place after a restart, and the pass's outcome remains invisible.
 
+
+### Reproduced 2026-10-02, deterministically
+
+`SIGKILL` a conversion, then convert the same album again:
+
+```
+PlanOutputs: output concurrency admission failed: filesystem mutation conflicts
+with recovery reservation: '…/Bachkantaten (BWV 55, 56, 98, 180)' overlaps
+'…/Bachkantaten (BWV 55, 56, 98, 180)'; queue execution fe1f6d05-…
+```
+
+The path overlaps itself and the named queue execution is the dead process.
+Isolation:
+
+- deleting `.tonepoet-staging` does **not** release it — the reservation
+  outlives the directory, so it is durable state elsewhere;
+- a brand-new output root with the same album name converts fine — the
+  reservation is scoped to the album path, not global.
+
+Possibly the same root as #59 and #18 (same machinery, same "filesystem
+mutation conflicts with …" wording); unverified. #59 has been hard to pursue
+because its evidence vanished, and this is a reliable way in.
+
+Written up with #53 as `BRIEF_R15_interrupted_conversions_leave_junk_2026-10-02.md`.
+
 ## 45. A version bump invalidates the installed Reference qualification, and the TUI hides the reason
 
 **Status 2026-09-26:** resolved on main @ 6d11d35 (v0.5.3). The root package version value in
@@ -3338,6 +3363,36 @@ orphaned. The output root ends a conversion with no `.tonepoet-*` entry in it.
   other route, equals the user-visible artifacts and nothing else, so this cannot come back
   silently.
 - `docs/` and briefs carry this as a standing rule for every future delivery.
+
+
+### Reproduced 2026-10-02 on a default configuration
+
+A 22-track DSD64 SACD ISO, `SIGKILL`ed two minutes in, no `scratch_directory`
+configured, left **658 MB** in the output root:
+
+```
+.tonepoet-staging/.job-87876a7a-….run.lock
+.tonepoet-staging/job-87876a7a-…-87876a7a-…/converted/
+.tonepoet-staging/job-87876a7a-…-87876a7a-…/realized-sacd-tracks/*.tmp   (17 files)
+```
+
+A later successful conversion into the same root does not remove it.
+
+Two qualifications on the original filing:
+
+- **`scratch_directory` masks it.** With it set, staging goes to tmpfs and the
+  output root stays clean (`/dev/shm/tonepoet` is 0 bytes after success). The
+  user set that on 2026-10-01, after the 31 GB incident, so their own installs
+  are now protected; a default install is not.
+- **The manifest half did not reproduce.** No `.tonepoet-manifest.json` appeared
+  on any 2026-10-02 run — default flags, Reference SACD route, neither output
+  root nor album folder. The forcing code is still present and unchanged
+  (`stages.rs`, `reference_manifest_required`). Not established whether that
+  site is unreachable on this route or the condition no longer fires; **not**
+  claimed fixed.
+
+Written up with #44 as `BRIEF_R15_interrupted_conversions_leave_junk_2026-10-02.md` —
+the same kill leaves both the bytes and a reservation that bricks the album.
 
 ## 54. `manage_tmux_clipboard` silently no-ops under byobu whenever `$BYOBU_CONFIG_DIR` is not `~/.byobu`
 
