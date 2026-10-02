@@ -1,8 +1,10 @@
 # Brief R16 — R15 is correct; two older tests still assert what it removed
 
 Date: 2026-10-02
-Base: the supplied `tonepoet-src.tar.gz` is our `main` with R15 corrective R2
-applied and Reference requalified.
+Base: the supplied `tonepoet-src.tar.gz` is the unmerged branch
+`apply/r15-interrupted-conversions-2026-10-02` — our `main` plus R15 corrective
+R2 and the Reference requalification it forced. It is not merged, because the
+gate is not green.
 
 R15 is accepted in substance and field-verified. Two tests fail, and neither
 is a defect in R15: both are pre-existing tests that pin the behavior R15 was
@@ -18,10 +20,12 @@ configured:
 | | before R15 | with R15 |
 |---|---|---|
 | output root after the kill | 658 MB – 1.8 GB orphaned | **0 bytes** |
-| converting that album again | refused, forever | **1/1 succeeded** |
+| converting that album again | refused on every later attempt | **1/1 succeeded** |
 | final folder | staging tree beside the audio | audio + companions only |
 
-Both #53 and #44 are resolved end to end.
+#44 and the staging half of #53 are resolved end to end. #53's manifest half
+is untouched here: `.tonepoet-manifest.json` never reproduced on any route we
+tried, before or after R15, so there is nothing to confirm. It stays open.
 
 ## The two failures
 
