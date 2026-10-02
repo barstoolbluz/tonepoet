@@ -25,8 +25,10 @@ Both #53 and #44 are resolved end to end.
 
 ## The two failures
 
-Both fail 3/3 in isolation and 3/3 in the full suite, and neither ever failed
-on `main` across three runs. They are deterministic, not the known flake.
+Both fail 3/3 in isolation, in both full-gate runs, and in all three loaded
+lib runs. Neither appeared in any failure list across four pre-R15 gate runs
+or three loaded lib runs on `main`. They are deterministic, not the known
+flake.
 
 ### 1. A test still requires staging in the user's output root
 
@@ -81,7 +83,7 @@ the two tests above separate cleanly, 0/3 against 3/3.
 
 Reference requalified after R15 changed the locked `stages.rs`: 3903 positive /
 34 negative, passed; runtime closure fingerprint `89252720…`. The freshness
-gate added this morning caught that drift on its own, before anything merged.
+gate added on 2026-10-01 caught that drift on its own, before anything merged.
 
 ## Build capability
 
