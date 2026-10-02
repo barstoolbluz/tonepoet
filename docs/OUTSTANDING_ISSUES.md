@@ -3985,3 +3985,56 @@ Whether an encoding-confidence signal belongs in the decoder or in the surface
 that displays the result; whether the C1-penalty interaction described above is
 dependable enough to lean on deliberately; and whether a repair surface, as
 filed for #56, is the right home for this.
+
+## 61. Every track fails: "output planning redirected planner-authoritative album namespace"
+
+Filed 2026-10-02. `~/temp/Hiroshi Suzuki - Cat (1975) [FLAC]`, five tracks, all
+failing at `PlanOutputs` with one message, truncated in the TUI. Full text from
+`~/.cache/tonepoet/tonepoet.log`:
+
+```
+output concurrency admission failed: output planning redirected
+planner-authoritative album namespace from
+'/home/daedalus/temp/Hiroshi Suzuki - Cat (1975) [FLAC]' to
+'/home/daedalus/temp/Hiroshi Suzuki - Cat (1975) [FLAC] {We Release Jazz
+WRJ010LTD Reissue LP  24-96kHz}'
+```
+
+The two paths differ only by the trailing label/pressing braces.
+
+### Evidence, captured live and unclassified
+
+Taken 2026-10-02 17:16 EDT with the session still open, three minutes after
+the failures, read-only. Bundled with
+`BRIEF_R17_album_namespace_redirect_2026-10-02.md`.
+
+- All five failures share one timestamp, `21:14:09Z`.
+- Nothing exists under `~/temp` for the album — no output, no staging.
+- One process running: pid 2932280, `tonepoet tui`, the session that ran it.
+- `conversion_queue_scopes`: one row, scope `59d0205e…`, pid 2932280, created
+  13:36:18. One matching lease file, same mtime. A prior scope (`09cb2fc0…`,
+  pid 800268) was present at 13:35 and is gone.
+- `conversion_queue_executions`: 0 rows. The five album rows have
+  `execution_id = NULL`.
+- `execution-claim/`, `execution-staging/` and `queue-execution/` all carry
+  mtime `17:14:09.2248087420` — the failure instant — and are empty.
+- The message occurs once in the tree, `stages.rs`,
+  `admit_planned_output_claim`.
+
+Not established: whether a second session existed at 17:14 (none left a trace
+in the scope table or the lease directory, which is not proof of absence);
+whether the album directory name is expected to change after admission;
+whether those three directories were written and cleaned, or never written.
+
+The user's recollection places this with the concurrent-session lease family,
+#15 / #18 / #59. Unconfirmed — recorded as a lead, not a classification.
+
+### Required
+
+An album whose directory name is fully determined before work begins converts
+successfully. Where the name legitimately changes while planning, the
+conversion follows it rather than failing.
+
+Where a conversion genuinely cannot proceed, every track does not fail with an
+internal message about namespace redirection. The user is told what is wrong
+with their album and what to do about it.
