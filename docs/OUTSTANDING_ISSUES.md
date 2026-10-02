@@ -4036,6 +4036,14 @@ The user's placement of this with the concurrent-session family (#15, #18, #59)
 does not hold for this issue. Those have different messages and remain open on
 their own terms.
 
+### Also reported
+
+In the TUI the five tracks stay `Failed` across repeated attempts within one
+session; closing the application and starting it again (after a recompile in
+this instance) and the conversion works. A fresh CLI process using the same
+folder template fails every time, on a binary built after the most recent code
+change.
+
 ### Required
 
 An album whose folder template contains a conditional block converts
