@@ -1,14 +1,11 @@
-# Brief R17 — a conversion fails because its album directory name changes mid-plan
+# Brief R17 — a conditional block in the folder template fails every track
 
 Date: 2026-10-02
 Base: the supplied `tonepoet-src.tar.gz` is our `main` at gate 7244/0.
 
-Every track of an album failed in the TUI. The evidence below was captured
-while the session was still open, and is offered **unclassified** — we have not
-determined which observations are causes, symptoms, or unrelated. The raw
-captures are in `evidence/`.
-
 ## What the user sees
+
+Five tracks, all failing instantly:
 
 ```
 01 - Shrimp Dance.flac                                              FLAC Failed
@@ -19,66 +16,53 @@ captures are in `evidence/`.
   WRJ010LTD Reissue LP  24-96kHz}'
 ```
 
-All five tracks fail with the same message. The TUI truncates it; the full text
-above is from `~/.cache/tonepoet/tonepoet.log`.
+The failed status persists in the queue, so re-running the conversion shows the
+same five failures and writes nothing new to the log.
 
-## Observations, unclassified
+## Reproduction
 
-Captured 2026-10-02 17:16 EDT, three minutes after the failures.
+Deterministic, in one process, with a private config, data dir, cache and
+output root. No TUI. Nothing else running.
 
-- The two paths in the message differ only by a trailing
-  `{We Release Jazz WRJ010LTD Reissue LP  24-96kHz}`.
-- All five failures carry one timestamp: `2026-10-02T21:14:09Z` (17:14:09 EDT).
-- Nothing exists under `~/temp` for this album. No partial output, no staging.
-- One `tonepoet` process is running: pid 2932280, `tonepoet tui`. It is the
-  session that ran this conversion and it is still open.
-- `conversion_queue_scopes` holds exactly one row: scope `59d0205e…`,
-  `origin_identity` pid 2932280, created 2026-10-02 13:36:18 EDT.
-- `~/.config/tonepoet/concurrency-v1/queue-scope/` holds exactly one lease
-  file, mtime 13:36:18, matching that row.
-- A different scope (`09cb2fc0…`, pid 800268, created 2026-10-01 21:11) was
-  present in that table at 13:35 today and is no longer there.
-- `conversion_queue_executions` is empty — 0 rows.
-- 29 queue rows exist, all owned by scope `59d0205e…`. Five mention this album;
-  all five have `execution_id = NULL`.
-- Directory mtimes under the coordination root:
+```bash
+export XDG_CONFIG_HOME=/tmp/iso/cfg XDG_DATA_HOME=/tmp/iso/data XDG_CACHE_HOME=/tmp/iso/cache
+tonepoet convert '~/torrents/Hiroshi Suzuki - Cat (1975, 2021, WRJ) [LP 24-96]'/*.flac \
+  --format flac --output /tmp/iso/out \
+  --folder-naming '%ALBUM_ARTIST% - %ALBUM% (%YEAR%) [%FORMAT%] {%TITLE_EXTRA%  %BITDEPTH%-%SAMPLERATE%}'
+```
 
-  ```
-  13:36:18  queue-scope/<the one lease file>
-  17:05:01  concurrency-v1/
-  17:06:22  queue-scope/
-  17:08:27  journal-operation/
-  17:11:43  ephemeral-mutation/
-  17:14:09  execution-claim/
-  17:14:09  execution-staging/
-  17:14:09  queue-execution/
-  ```
+Every track fails with the message above.
 
-  The last three carry the failure timestamp to the fraction
-  (`17:14:09.2248087420`) and are empty now.
-- The message text occurs once in the tree, at `src/convert/pipeline/stages.rs`
-  in `admit_planned_output_claim`.
-- The user's recollection is that this belongs to a family of failures
-  involving concurrent sessions invalidating leases, related to issues #15,
-  #18 and #59. We did not establish whether it does.
+The same command with a `--folder-naming` that has no `{...}` block converts
+5 of 5 and writes `Cat (We Release Jazz WRJ010LTD Reissue LP 24-96)`.
 
-## What we did not determine
+The two paths in the message differ by exactly the contents of the conditional
+block. The template above is the one the user's TUI is configured with.
 
-Whether a second session existed at 17:14:09; we found no trace of one in the
-two places we looked, which is not the same as proving absence. Whether the
-album directory name is expected to change after a claim is admitted. Whether
-the empty `execution-claim`, `execution-staging` and `queue-execution`
-directories were written and cleaned at the failure, or never written.
+## Observations
+
+- The message says "output concurrency admission failed". Nothing concurrent is
+  involved in the reproduction.
+- The label and pressing detail in the second path — `We Release Jazz`,
+  `WRJ010LTD`, `24-96kHz` — are all present in the source folder name,
+  `Hiroshi Suzuki - Cat (1975, 2021, WRJ) [LP 24-96]`.
+- The message text occurs once in the tree, in `admit_planned_output_claim`
+  (`src/convert/pipeline/stages.rs`).
+- Nothing is written to the output root: no album directory, no partial
+  output, no staging.
 
 ## The outcome we want
 
-An album whose directory name is fully determined before work begins converts
-successfully. Where the name legitimately changes while planning, the
-conversion follows it rather than failing.
+An album whose folder template contains a conditional block converts
+successfully, and lands in the folder the template describes once all of its
+variables are known.
 
-Where a conversion genuinely cannot proceed, every track does not fail with
-one internal message about namespace redirection. The user is told what is
-wrong with their album and what to do about it.
+Where a conversion genuinely cannot proceed, the user is told what is wrong
+with their album in terms they can act on, once — not an internal message about
+namespace redirection repeated per track.
+
+A conversion that has never run should not be able to inherit a terminal
+failed state that survives re-running it.
 
 ## State
 

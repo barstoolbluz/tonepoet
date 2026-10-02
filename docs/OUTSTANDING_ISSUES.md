@@ -3986,55 +3986,63 @@ that displays the result; whether the C1-penalty interaction described above is
 dependable enough to lean on deliberately; and whether a repair surface, as
 filed for #56, is the right home for this.
 
-## 61. Every track fails: "output planning redirected planner-authoritative album namespace"
+## 61. A conditional `{...}` block in the folder template fails every track of the album
 
-Filed 2026-10-02. `~/temp/Hiroshi Suzuki - Cat (1975) [FLAC]`, five tracks, all
-failing at `PlanOutputs` with one message, truncated in the TUI. Full text from
-`~/.cache/tonepoet/tonepoet.log`:
+Filed 2026-10-02. **Reproduced deterministically in a single isolated process.**
+Originally filed as a concurrency bug on the strength of its message text; it is
+not one.
+
+### Reproduction
+
+```bash
+export XDG_CONFIG_HOME=/tmp/iso/cfg XDG_DATA_HOME=/tmp/iso/data XDG_CACHE_HOME=/tmp/iso/cache
+tonepoet convert '~/torrents/Hiroshi Suzuki - Cat (1975, 2021, WRJ) [LP 24-96]'/*.flac \
+  --format flac --output /tmp/iso/out \
+  --folder-naming '%ALBUM_ARTIST% - %ALBUM% (%YEAR%) [%FORMAT%] {%TITLE_EXTRA%  %BITDEPTH%-%SAMPLERATE%}'
+```
+
+Every track fails:
 
 ```
-output concurrency admission failed: output planning redirected
+PlanOutputs: output concurrency admission failed: output planning redirected
 planner-authoritative album namespace from
-'/home/daedalus/temp/Hiroshi Suzuki - Cat (1975) [FLAC]' to
-'/home/daedalus/temp/Hiroshi Suzuki - Cat (1975) [FLAC] {We Release Jazz
-WRJ010LTD Reissue LP  24-96kHz}'
+'…/Hiroshi Suzuki - Cat (1975) [FLAC]' to
+'…/Hiroshi Suzuki - Cat (1975) [FLAC] {We Release Jazz WRJ010LTD Reissue LP  24-96kHz}'
 ```
 
-The two paths differ only by the trailing label/pressing braces.
+The same command with a `--folder-naming` carrying no `{...}` block converts
+5/5 and produces `Cat (We Release Jazz WRJ010LTD Reissue LP 24-96)`. The two
+paths in the message differ by exactly the contents of the conditional block.
 
-### Evidence, captured live and unclassified
+No TUI, no second session, private config/data/cache/output. The message says
+"concurrency admission" but nothing concurrent is involved.
 
-Taken 2026-10-02 17:16 EDT with the session still open, three minutes after
-the failures, read-only. Bundled with
-`BRIEF_R17_album_namespace_redirect_2026-10-02.md`.
+### Field occurrence
 
-- All five failures share one timestamp, `21:14:09Z`.
-- Nothing exists under `~/temp` for the album — no output, no staging.
-- One process running: pid 2932280, `tonepoet tui`, the session that ran it.
-- `conversion_queue_scopes`: one row, scope `59d0205e…`, pid 2932280, created
-  13:36:18. One matching lease file, same mtime. A prior scope (`09cb2fc0…`,
-  pid 800268) was present at 13:35 and is gone.
-- `conversion_queue_executions`: 0 rows. The five album rows have
-  `execution_id = NULL`.
-- `execution-claim/`, `execution-staging/` and `queue-execution/` all carry
-  mtime `17:14:09.2248087420` — the failure instant — and are empty.
-- The message occurs once in the tree, `stages.rs`,
-  `admit_planned_output_claim`.
+Hit in the TUI on `~/temp/Hiroshi Suzuki - Cat (1975) [FLAC]`, five tracks, all
+failing instantly at `PlanOutputs`. The failed status persists in
+`conversion_queue_v24`, so re-running shows the same five failures without
+producing new log lines. The TUI's `folder_template` is the one above.
 
-Not established: whether a second session existed at 17:14 (none left a trace
-in the scope table or the lease directory, which is not proof of absence);
-whether the album directory name is expected to change after admission;
-whether those three directories were written and cleaned, or never written.
+### Retracted
 
-The user's recollection places this with the concurrent-session lease family,
-#15 / #18 / #59. Unconfirmed — recorded as a lead, not a classification.
+An earlier revision of this entry said no second session existed at the time of
+the field failure. That was wrong: CLI conversions run during debugging at
+17:04:38 and 17:06:17 used the real config and database without an
+`XDG_CONFIG_HOME` override. It is moot — the isolated reproduction shows no
+second session is needed — but the claim should not stand.
+
+The user's placement of this with the concurrent-session family (#15, #18, #59)
+does not hold for this issue. Those have different messages and remain open on
+their own terms.
 
 ### Required
 
-An album whose directory name is fully determined before work begins converts
-successfully. Where the name legitimately changes while planning, the
-conversion follows it rather than failing.
+An album whose folder template contains a conditional block converts
+successfully, and lands in the folder the template describes once all its
+variables are known.
 
-Where a conversion genuinely cannot proceed, every track does not fail with an
-internal message about namespace redirection. The user is told what is wrong
-with their album and what to do about it.
+Where a conversion genuinely cannot proceed, the user is told what is wrong
+with their album in terms they can act on — not an internal message about
+namespace redirection, repeated once per track.
+
