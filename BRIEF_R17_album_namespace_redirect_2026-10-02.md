@@ -33,7 +33,7 @@ tonepoet convert '~/torrents/Hiroshi Suzuki - Cat (1975, 2021, WRJ) [LP 24-96]'/
 
 Every track fails. That template is the one the user's TUI is configured with.
 
-Other observed runs of the same source and binary:
+The same source and binary, same isolated setup, varying only `--folder-naming`:
 
 | `--folder-naming` | result |
 |---|---|
