@@ -45,15 +45,20 @@ with recovery reservation: '…/Bachkantaten (BWV 55, 56, 98, 180)' overlaps
 fe1f6d05-e666-466b-8005-6ab8017106f1
 ```
 
-The path is reported as overlapping itself, and the named queue execution
-belongs to the process that was killed.
+The path is reported as overlapping itself. The named queue execution is the
+killed process: row `fe1f6d05-…` in `conversion_queue_executions` carries
+`item_id 87876a7a-…`, the job that was running, and
+`origin_identity {"pid":1185854,…}`, the pid that was killed.
 
-Two further measurements narrow it:
+Three further measurements narrow it:
 
 - Deleting `.tonepoet-staging` entirely does **not** release the reservation.
-  It survives the directory, so it is durable state elsewhere.
+  It survives the directory.
 - A brand-new output root with the same album name converts fine. The
   reservation is scoped to that album path, not global.
+- The row persists with `state = 'interrupted'` and `external_released = 0`,
+  across process exits and later successful conversions. Two such rows are
+  present after two killed runs. Nothing reaps them.
 
 ## What is already fine
 
