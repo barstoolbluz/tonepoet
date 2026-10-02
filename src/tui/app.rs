@@ -16245,12 +16245,12 @@ impl AppState {
                             .unwrap_or_else(|| item.input_path.display().to_string());
                         let text = if matches!(item.status, crate::convert::ConversionStatus::Interrupted) {
                             format!(
-                                "Output is reserved by interrupted conversion '{}' (queue item {}); open Queue and choose Retry or remove the item to release the reservation",
+                                "Output is temporarily reserved while TonePoet safely recovers interrupted conversion '{}' (queue item {}); recovery is retried automatically, so retry this action after it completes",
                                 source, item.id,
                             )
                         } else {
                             format!(
-                                "Output is reserved by conversion '{}' (queue item {}) while its ended execution is being recovered; open Queue, then Retry or remove it after it becomes Interrupted",
+                                "Output is temporarily reserved by ended conversion '{}' (queue item {}) while TonePoet verifies recovery safety; recovery is retried automatically, so retry this action after the item becomes Interrupted",
                                 source, item.id,
                             )
                         };
@@ -16260,7 +16260,7 @@ impl AppState {
                     Ok(None) => {
                         self.status_message = Some((
                             format!(
-                                "Output is reserved by queue execution {execution_id} while recovery is incomplete; open Queue and retry after the interrupted item appears"
+                                "Output is temporarily reserved by interrupted execution {execution_id} while TonePoet finishes safe recovery; recovery is retried automatically, so retry this action after it completes"
                             ),
                             std::time::Instant::now(),
                         ));
@@ -16272,7 +16272,7 @@ impl AppState {
                         );
                         self.status_message = Some((
                             format!(
-                                "Output is reserved by queue execution {execution_id} while recovery is incomplete; open Queue and retry after the interrupted item appears"
+                                "Output is temporarily reserved by queue execution {execution_id} while safe recovery is incomplete; recovery is retried automatically, so retry this action after recovery completes"
                             ),
                             std::time::Instant::now(),
                         ));

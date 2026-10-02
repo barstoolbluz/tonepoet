@@ -67,8 +67,9 @@ use super::dvdv_realize::realize_dvdv_track;
 use super::bluray_realize::realize_bluray_track;
 use super::materializer_single::SingleFileMaterializer;
 use super::memory_budget::{
-    estimate_job_peak_bytes, estimate_streaming_cue_scratch_peak_bytes,
-    write_staging_owner_marker, ScratchAdmissionFailureKind, ScratchReservation,
+    cleanup_legacy_companion_snapshots, cleanup_stale_staging_trees, estimate_job_peak_bytes,
+    estimate_streaming_cue_scratch_peak_bytes, write_staging_owner_marker,
+    ScratchAdmissionFailureKind, ScratchReservation,
 };
 use super::dvda_realize::{realize_dvda_track, DvdaRealizationAudioPolicy, DvdaSourceAudioExpectation};
 use super::track_executor::{
@@ -15720,6 +15721,7 @@ fn publish_pre_materialization_conversion_log_fragment_with_selection(
             context: "staging parent creation",
         };
     }
+    sweep_stale_staging_for_request(req, &staging_parent);
 
     let _run_lock = match acquire_run_lock(&staging_parent, &req.job_id, &req.item_id) {
         Ok(lock) => lock,
@@ -15741,7 +15743,6 @@ fn publish_pre_materialization_conversion_log_fragment_with_selection(
         sanitize_component(&req.item_id)
     ));
     let _ = delete_stale_staging_dir(&staging_root);
-    let using_scratch_staging = staging_allocation.is_scratch();
     if let Err(err) = fs::create_dir_all(&staging_root) {
         log::warn!(
             "pre-materialization conversion log fragment staging directory creation skipped for {}: {err}",
@@ -15752,9 +15753,7 @@ fn publish_pre_materialization_conversion_log_fragment_with_selection(
             context: "staging directory creation",
         };
     }
-    if using_scratch_staging {
-        mark_staging_root_best_effort(&staging_root, req);
-    }
+    mark_staging_root_best_effort(&staging_root, req);
     let staging = staging_allocation.into_staging_dir(staging_root, req.job_id.clone());
 
     let staged_artifacts = match stage_pre_materialization_conversion_log_fragment(outcome, req, &staging) {
@@ -32093,6 +32092,12 @@ fn admit_initial_conversion_claims(req: &mut PipelineRequest) -> Result<(), Stri
     )?;
     req.container = admitted_source;
     req.output_root = admitted_output_root;
+    // Recovery happens before scheduling, so stale work from a dead execution
+    // no longer owns either namespace. Sweep both the managed work area and
+    // the pre-R15 output-local location before planning can fail for an
+    // unrelated reason and leave old user-visible junk behind.
+    let managed_staging = disk_staging_parent_for(req);
+    sweep_stale_staging_for_request(req, &managed_staging);
     Ok(())
 }
 
@@ -46136,10 +46141,67 @@ fn container_companion_snapshot_before_publish_best_effort(
         );
         return None;
     }
-    let snapshot_root = unique_path(&snapshot_parent, ".tonepoet-companion-snapshot");
+    let snapshot_prefix = format!(
+        "companion-snapshot-{}-{}",
+        sanitize_component(&req.job_id),
+        sanitize_component(&req.item_id),
+    );
+    let snapshot_root = unique_path(&snapshot_parent, &snapshot_prefix);
+    // A scratch-backed materialization holds its compatibility run lock under
+    // scratch, while the companion snapshot intentionally lives in managed
+    // disk staging so it can outlive publish. The owner marker therefore cannot
+    // be the authoritative liveness signal for this cross-parent case. Admit
+    // the snapshot as another ExecutionStaging subtree before it becomes
+    // visible; the shared claim prevents a concurrent sweeper from deleting
+    // live companion data and is retired with the execution lifecycle.
+    if let Some(execution_id) = crate::concurrency::runtime_execution_id(&req.item_id) {
+        let claim = match crate::concurrency::PathClaim::resolve(
+            &snapshot_root,
+            crate::concurrency::ClaimMode::Write,
+            crate::concurrency::ClaimScope::Subtree,
+        ) {
+            Ok(claim) => claim,
+            Err(err) => {
+                log::warn!(
+                    "container companion snapshot skipped for {}: cannot resolve staging ownership for {}: {err}",
+                    req.item_id,
+                    snapshot_root.display()
+                );
+                return None;
+            }
+        };
+        if let Err(err) = register_execution_claims(
+            req,
+            crate::concurrency::LeaseFamily::ExecutionStaging { execution_id },
+            vec![claim],
+            None,
+        ) {
+            log::warn!(
+                "container companion snapshot skipped for {}: cannot register staging ownership for {}: {err}",
+                req.item_id,
+                snapshot_root.display()
+            );
+            return None;
+        }
+    }
     if let Err(err) = fs::create_dir_all(&snapshot_root) {
         log::warn!(
             "container companion snapshot skipped for {}: cannot create {}: {err}",
+            req.item_id,
+            snapshot_root.display()
+        );
+        return None;
+    }
+    // Companion snapshots are siblings of the main job staging tree so publish
+    // cannot consume them before the post-publish copy. They therefore need
+    // their own stale-cleanup identity. Reuse the still-held item run lock, and
+    // fail closed if its durable marker cannot be written: an unowned snapshot
+    // would be impossible to distinguish from live work after SIGKILL.
+    let run_lock_name = run_lock_file_name(&req.job_id, &req.item_id);
+    if let Err(err) = write_staging_owner_marker(&snapshot_root, &run_lock_name) {
+        let _ = fs::remove_dir_all(&snapshot_root);
+        log::warn!(
+            "container companion snapshot skipped for {}: cannot record staging ownership at {}: {err}",
             req.item_id,
             snapshot_root.display()
         );
@@ -51354,6 +51416,19 @@ mod companion_copy_hardening_tests {
 
         let snapshot = container_companion_snapshot_before_publish_best_effort(&req, &source)
             .expect("eligible internals produce a snapshot");
+        assert!(
+            !snapshot
+                .root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .starts_with('.'),
+            "snapshot directories must be visible to the stale-staging sweeper"
+        );
+        assert!(
+            snapshot.root.join(".tonepoet-staging-owner").is_file(),
+            "snapshot must identify the live item run lock for crash cleanup"
+        );
         assert!(snapshot.root.join("lineage.txt").is_file());
         assert!(!snapshot.root.join("skipme.ini").exists(), "include list respected");
         assert!(!snapshot.root.join("01 - Track.flac").exists(), "source audio skipped");
@@ -51379,6 +51454,120 @@ mod companion_copy_hardening_tests {
             std::fs::read(album_dir.join("lineage.txt")).expect("lineage copied"),
             b"ripped from UK first press"
         );
+    }
+
+    #[test]
+    fn scratch_backed_live_companion_snapshot_is_protected_then_reaped_after_execution_release() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().expect("temp dir");
+        let container = temp.path().join("downloads").join("album.7z");
+        std::fs::create_dir_all(container.parent().expect("container parent"))
+            .expect("container parent");
+        std::fs::write(&container, b"archive").expect("container");
+
+        let mut req = test_request(temp.path(), container.clone());
+        req.job_id = format!("scratch-companion-job-{}", uuid::Uuid::new_v4());
+        req.item_id = format!("scratch-companion-item-{}", uuid::Uuid::new_v4());
+        req.companion.extensions = vec!["txt".to_string()];
+        req.scratch_staging = Some(
+            super::super::memory_budget::ScratchStagingConfig::with_fixed_memory_and_filesystem_for_test(
+                temp.path().join("scratch"),
+                90,
+                20 * 1024 * 1024 * 1024,
+                20 * 1024 * 1024 * 1024,
+                20 * 1024 * 1024 * 1024,
+                20 * 1024 * 1024 * 1024,
+            ),
+        );
+
+        let execution_id = uuid::Uuid::new_v4();
+        let queue_family = crate::concurrency::LeaseFamily::QueueExecution { execution_id };
+        let queue_lease = Arc::new(
+            crate::concurrency::PersistentLease::create(queue_family.clone(), &[])
+                .expect("queue execution lease"),
+        );
+        let queue_descriptor = queue_lease.descriptor_path().to_path_buf();
+        crate::concurrency::register_runtime_execution(
+            &req.item_id,
+            execution_id,
+            Arc::clone(&queue_lease),
+            None,
+        )
+        .expect("runtime execution");
+
+        let selection = select_staging_parent_for(&req);
+        assert!(selection.is_scratch(), "fixture must use configured scratch staging");
+        let scratch_parent = selection.parent.clone();
+        let attempt = prepare_materialization_attempt(&req, selection)
+            .expect("scratch materialization attempt");
+        assert!(attempt.staging.root.starts_with(&scratch_parent));
+        let scratch_lock = scratch_parent.join(run_lock_file_name(&req.job_id, &req.item_id));
+        assert!(scratch_lock.is_file(), "main live run lock must be under scratch");
+
+        let extraction = attempt.staging.root.join("extracted").join("Album");
+        std::fs::create_dir_all(&extraction).expect("extraction root");
+        let staged_audio = extraction.join("01 - Track.flac");
+        std::fs::write(&staged_audio, b"audio").expect("staged audio");
+        std::fs::write(extraction.join("lineage.txt"), b"keep me while live")
+            .expect("lineage");
+        let source = test_prepared_source(
+            SourceKind::Archive,
+            container,
+            vec![test_prepared_track(TrackSourceRef::StagedFile(staged_audio))],
+        );
+
+        let snapshot = container_companion_snapshot_before_publish_best_effort(&req, &source)
+            .expect("eligible internal companion snapshot");
+        let snapshot_root = snapshot.root.clone();
+        let managed_parent = disk_staging_parent_for(&req);
+        assert_eq!(snapshot_root.parent(), Some(managed_parent.as_path()));
+        assert!(
+            !managed_parent.join(run_lock_file_name(&req.job_id, &req.item_id)).exists(),
+            "scratch-backed run lock must not be synthesized beside the managed snapshot"
+        );
+        assert_eq!(
+            std::fs::read(snapshot_root.join("lineage.txt")).expect("live snapshot lineage"),
+            b"keep me while live"
+        );
+        let held = crate::concurrency::runtime_execution_claims(&req.item_id)
+            .expect("runtime claims");
+        let snapshot_claim = crate::concurrency::PathClaim::resolve(
+            &snapshot_root,
+            crate::concurrency::ClaimMode::Write,
+            crate::concurrency::ClaimScope::Subtree,
+        )
+        .expect("snapshot claim");
+        assert!(
+            held.iter().any(|claim| claim.covers(&snapshot_claim)),
+            "live runtime execution must durably own the managed companion snapshot"
+        );
+
+        sweep_stale_staging_parent_best_effort(&managed_parent);
+        assert!(
+            snapshot_root.is_dir(),
+            "live ExecutionStaging must defeat stale cleanup"
+        );
+        assert_eq!(
+            std::fs::read(snapshot_root.join("lineage.txt")).expect("lineage after live sweep"),
+            b"keep me while live"
+        );
+
+        crate::concurrency::unregister_runtime_execution(&req.item_id);
+        drop(queue_lease);
+        crate::concurrency::retire_descriptor_after_lifecycle_release(
+            &queue_descriptor,
+            &queue_family,
+        )
+        .expect("retire queue execution descriptor");
+
+        sweep_stale_staging_parent_best_effort(&managed_parent);
+        assert!(
+            !snapshot_root.exists(),
+            "after execution lifecycle retirement the orphaned managed snapshot must be reaped"
+        );
+
+        drop(snapshot);
+        drop(attempt);
     }
 
     #[test]
@@ -57929,7 +58118,7 @@ fn mark_staging_root_best_effort(staging_root: &Path, req: &PipelineRequest) {
     let lock_file_name = run_lock_file_name(&req.job_id, &req.item_id);
     if let Err(err) = write_staging_owner_marker(staging_root, &lock_file_name) {
         log::warn!(
-            "could not write scratch staging owner marker for {} at {}: {err}",
+            "could not write staging owner marker for {} at {}: {err}",
             req.item_id,
             staging_root.display()
         );
@@ -58482,14 +58671,13 @@ fn prepare_materialization_attempt(
         ).map_err(MaterializeError::Parse)?;
     }
     fs::create_dir_all(&staging_parent).map_err(MaterializeError::Io)?;
+    sweep_stale_staging_for_request(req, &staging_parent);
     let run_lock = acquire_run_lock(&staging_parent, &req.job_id, &req.item_id)?;
     let _ = delete_stale_staging_dir(&staging_root);
     let used_scratch = selection.is_scratch();
     let staging = selection.into_staging_dir(staging_root, req.job_id.clone());
     fs::create_dir_all(&staging.root).map_err(MaterializeError::Io)?;
-    if used_scratch {
-        mark_staging_root_best_effort(&staging.root, req);
-    }
+    mark_staging_root_best_effort(&staging.root, req);
 
     Ok(MaterializationAttempt {
         staging,
@@ -59190,7 +59378,35 @@ fn staging_parent_for(req: &PipelineRequest) -> PathBuf {
     disk_staging_parent_for(req)
 }
 
+fn managed_disk_staging_root() -> PathBuf {
+    #[cfg(test)]
+    {
+        return std::env::temp_dir()
+            .join(format!("tonepoet-test-conversion-work-{}", std::process::id()));
+    }
+
+    #[cfg(not(test))]
+    {
+        dirs::cache_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("tonepoet")
+            .join("conversion-work")
+    }
+}
+
+fn managed_output_staging_token(req: &PipelineRequest) -> String {
+    let output_identity = req.output_root.to_string_lossy();
+    let digest = hex::encode(Sha256::digest(output_identity.as_bytes()));
+    digest[..24].to_string()
+}
+
 pub(crate) fn disk_staging_parent_for(req: &PipelineRequest) -> PathBuf {
+    managed_disk_staging_root()
+        .join(managed_output_staging_token(req))
+        .join(STAGING_PARENT_NAME)
+}
+
+fn legacy_output_staging_parent_for(req: &PipelineRequest) -> PathBuf {
     if req.naming.per_album_subdir {
         return req.output_root.join(STAGING_PARENT_NAME);
     }
@@ -59203,10 +59419,278 @@ pub(crate) fn disk_staging_parent_for(req: &PipelineRequest) -> PathBuf {
     parent.join(STAGING_PARENT_NAME)
 }
 
+fn sweep_stale_staging_parent_best_effort(parent: &Path) {
+    if let Err(err) = cleanup_stale_staging_trees(parent) {
+        log::warn!(
+            "could not sweep stale staging parent {}: {err}",
+            parent.display()
+        );
+        return;
+    }
+    cleanup_empty_staging_parent_best_effort(parent);
+}
+
+fn sweep_legacy_output_staging_parent_best_effort(parent: &Path) {
+    // First handle ordinary pre-R15 item stagings and run locks. Hidden
+    // companion snapshots need a separate compatibility pass because old
+    // builds gave them neither an owner marker nor a name visible to the
+    // generic sweeper. Keep that authority intentionally narrow.
+    sweep_stale_staging_parent_best_effort(parent);
+    if let Err(err) = cleanup_legacy_companion_snapshots(parent) {
+        log::warn!(
+            "could not sweep legacy companion snapshots under {}: {err}",
+            parent.display()
+        );
+        return;
+    }
+    cleanup_empty_staging_parent_best_effort(parent);
+}
+
+fn is_managed_output_staging_token(name: &str) -> bool {
+    name.len() == 24 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn sweep_managed_disk_staging_root_best_effort(root: &Path) {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return,
+        Err(err) => {
+            log::warn!("could not inspect managed conversion-work root {}: {err}", root.display());
+            return;
+        }
+    };
+
+    for entry in entries.flatten() {
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) => {
+                log::warn!(
+                    "could not inspect managed conversion-work entry {}: {error}",
+                    entry.path().display()
+                );
+                continue;
+            }
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !is_managed_output_staging_token(name) {
+            continue;
+        }
+
+        let shard = entry.path();
+        sweep_stale_staging_parent_best_effort(&shard.join(STAGING_PARENT_NAME));
+        match fs::remove_dir(&shard) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                // A live/stale staging parent or any future app-owned metadata
+                // keeps the shard non-empty. That is expected and not noisy.
+                if !shard.join(STAGING_PARENT_NAME).exists() {
+                    log::debug!(
+                        "managed conversion-work shard {} remains non-empty after staging cleanup: {err}",
+                        shard.display()
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn sweep_all_managed_disk_staging_best_effort() {
+    let root = managed_disk_staging_root();
+    sweep_managed_disk_staging_root_best_effort(&root);
+}
+
+fn sweep_managed_disk_staging_once_best_effort() {
+    static SWEEP_ONCE: OnceLock<()> = OnceLock::new();
+    SWEEP_ONCE.get_or_init(sweep_all_managed_disk_staging_best_effort);
+}
+
+fn sweep_stale_staging_for_request(req: &PipelineRequest, active_parent: &Path) {
+    // One bounded process-start sweep prevents app-cache orphans from becoming
+    // permanent merely because the user never targets the same output root
+    // again. Live run locks and shared ExecutionStaging claims make this safe
+    // against concurrent conversions in this or another process.
+    sweep_managed_disk_staging_once_best_effort();
+    sweep_stale_staging_parent_best_effort(active_parent);
+
+    let disk_parent = disk_staging_parent_for(req);
+    if disk_parent != active_parent {
+        sweep_stale_staging_parent_best_effort(&disk_parent);
+    }
+
+    // R15 moves ordinary work out of the user's output root. Sweep the old
+    // location as well so upgrading TonePoet repairs jobs killed by previous
+    // builds without requiring the user to discover or delete hidden staging.
+    let legacy_parent = legacy_output_staging_parent_for(req);
+    if legacy_parent != active_parent && legacy_parent != disk_parent {
+        sweep_legacy_output_staging_parent_best_effort(&legacy_parent);
+    }
+}
+
 #[cfg(test)]
 mod scratch_staging_parent_tests {
     use super::*;
     use super::super::memory_budget::ScratchStagingConfig;
+
+    #[test]
+    fn default_disk_staging_lives_outside_the_user_output_root() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut req = pipeline_test_helpers::log_test_request();
+        req.output_root = temp.path().join("requested-output");
+
+        let managed = disk_staging_parent_for(&req);
+        let legacy = legacy_output_staging_parent_for(&req);
+
+        assert_ne!(managed, legacy);
+        assert!(
+            !managed.starts_with(&req.output_root),
+            "default working storage must not live in the user-selected output root: {}",
+            managed.display()
+        );
+        assert_eq!(managed.file_name().and_then(|name| name.to_str()), Some(STAGING_PARENT_NAME));
+        assert!(
+            managed.starts_with(managed_disk_staging_root()),
+            "default disk staging must live in TonePoet-owned conversion work storage"
+        );
+
+        let mut other = req.clone();
+        other.output_root = temp.path().join("other-output");
+        assert_ne!(
+            disk_staging_parent_for(&req),
+            disk_staging_parent_for(&other),
+            "independent output roots should not share item/run-lock namespaces"
+        );
+    }
+
+    #[test]
+    fn managed_staging_startup_sweep_reaps_orphans_from_other_output_shards() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().expect("managed sweep tempdir");
+        let root = temp.path().join("conversion-work");
+        let shard = root.join("aaaaaaaaaaaaaaaaaaaaaaaa");
+        let staging_parent = shard.join(STAGING_PARENT_NAME);
+        let stale_root = staging_parent.join("dead-job-dead-item");
+        let stale_lock_name = ".dead-job-dead-item.run.lock";
+        std::fs::create_dir_all(&stale_root).expect("managed stale staging root");
+        std::fs::write(stale_root.join("partial.tmp"), b"orphaned bytes")
+            .expect("managed stale bytes");
+        std::fs::write(staging_parent.join(stale_lock_name), b"")
+            .expect("managed stale run lock");
+        write_staging_owner_marker(&stale_root, stale_lock_name)
+            .expect("managed stale owner marker");
+
+        sweep_managed_disk_staging_root_best_effort(&root);
+
+        assert!(
+            !stale_root.exists(),
+            "a later process sweep must remove managed work even for an unrelated output root"
+        );
+        assert!(
+            !shard.exists(),
+            "empty managed output shards should be retired after stale work is removed"
+        );
+    }
+
+    #[test]
+    fn materialization_sweeps_legacy_output_local_orphan_without_user_cleanup() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().expect("temp dir");
+        let input = temp.path().join("input.flac");
+        std::fs::write(&input, b"fake flac").expect("input");
+
+        let mut req = pipeline_test_helpers::log_test_request();
+        req.container = input;
+        req.output_root = temp.path().join("requested-output");
+        std::fs::create_dir_all(&req.output_root).expect("output root");
+        req.job_id = "current-job".to_string();
+        req.item_id = "current-item".to_string();
+
+        let legacy_parent = legacy_output_staging_parent_for(&req);
+        let stale_root = legacy_parent.join("dead-job-dead-item");
+        let stale_lock_name = ".dead-job-dead-item.run.lock";
+        std::fs::create_dir_all(&stale_root).expect("legacy staging root");
+        std::fs::write(stale_root.join("partial.tmp"), b"orphaned bytes")
+            .expect("legacy staged bytes");
+        std::fs::write(legacy_parent.join(stale_lock_name), b"")
+            .expect("legacy run lock");
+        write_staging_owner_marker(&stale_root, stale_lock_name)
+            .expect("legacy staging owner marker");
+
+        let selection = StagingParentSelection::disk(disk_staging_parent_for(&req));
+        let attempt = prepare_materialization_attempt(&req, selection)
+            .expect("managed materialization attempt");
+
+        assert!(
+            !legacy_parent.exists(),
+            "a later conversion must sweep an unlocked output-local staging orphan"
+        );
+        assert!(attempt.staging.root.exists());
+        assert!(
+            attempt.staging.root.join(".tonepoet-staging-owner").exists(),
+            "disk-backed staging needs the same precise stale-owner marker as configured scratch"
+        );
+        drop(attempt);
+    }
+
+    #[test]
+    fn legacy_hidden_companion_snapshots_wait_for_old_run_locks_then_cleanup_narrowly() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut req = pipeline_test_helpers::log_test_request();
+        req.output_root = temp.path().join("requested-output");
+        std::fs::create_dir_all(&req.output_root).expect("output root");
+
+        let legacy_parent = legacy_output_staging_parent_for(&req);
+
+        let first_snapshot = legacy_parent.join(".tonepoet-companion-snapshot-1000000000-0");
+        std::fs::create_dir_all(&first_snapshot).expect("first legacy snapshot");
+        std::fs::write(first_snapshot.join("lineage.txt"), b"old orphan")
+            .expect("first legacy companion");
+
+        sweep_legacy_output_staging_parent_best_effort(&legacy_parent);
+        assert!(
+            !first_snapshot.exists(),
+            "an ownerless pre-R15 companion snapshot must be removed when no old run lock is held"
+        );
+
+        let second_snapshot = legacy_parent.join(".tonepoet-companion-snapshot-2000000000-1");
+        let unrelated_hidden = legacy_parent.join(".user-hidden-directory");
+        std::fs::create_dir_all(&second_snapshot).expect("second legacy snapshot");
+        std::fs::write(second_snapshot.join("lineage.txt"), b"live legacy companion")
+            .expect("second legacy companion");
+        std::fs::create_dir_all(&unrelated_hidden).expect("unrelated hidden directory");
+        std::fs::write(unrelated_hidden.join("keep.txt"), b"not tonepoet staging")
+            .expect("unrelated hidden payload");
+
+        let live_lock = acquire_run_lock(&legacy_parent, "old-live-job", "old-live-item")
+            .expect("hold old run lock");
+        sweep_legacy_output_staging_parent_best_effort(&legacy_parent);
+        assert!(
+            second_snapshot.is_dir(),
+            "any held legacy run lock must conservatively keep ownerless legacy snapshots intact"
+        );
+        assert!(
+            unrelated_hidden.is_dir(),
+            "unrelated hidden directories are never cleanup targets"
+        );
+
+        drop(live_lock);
+        sweep_legacy_output_staging_parent_best_effort(&legacy_parent);
+        assert!(
+            !second_snapshot.exists(),
+            "legacy snapshot becomes removable after the last old run lock is released"
+        );
+        assert!(
+            unrelated_hidden.is_dir(),
+            "legacy compatibility cleanup must not broaden authority to arbitrary dot-directories"
+        );
+    }
 
     #[test]
     fn album_gain_scratch_bypasses_unbounded_multitrack_container() {
@@ -59370,7 +59854,7 @@ mod scratch_staging_parent_tests {
     }
 
     #[test]
-    fn zero_percent_disk_fallback_materialization_creates_output_relative_staging() {
+    fn zero_percent_disk_fallback_materialization_creates_managed_staging() {
         let temp = tempfile::tempdir().expect("temp dir");
         let input = temp.path().join("input.flac");
         std::fs::write(&input, b"fake flac").expect("input");
@@ -59389,6 +59873,14 @@ mod scratch_staging_parent_tests {
         let staging_root = attempt.staging.root.clone();
         assert!(staging_root.starts_with(&disk_parent));
         assert!(staging_root.exists());
+        assert!(
+            !staging_root.starts_with(&req.output_root),
+            "disk fallback working storage must stay out of the user-selected output root"
+        );
+        assert!(
+            staging_root.join(".tonepoet-staging-owner").exists(),
+            "disk-backed staging needs an ownership marker for post-crash cleanup"
+        );
         assert!(
             !staging_root.starts_with(temp.path().join("scratch")),
             "0% scratch budget must not create a scratch-backed materialization attempt"

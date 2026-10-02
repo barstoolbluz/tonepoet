@@ -2247,9 +2247,22 @@ impl MutationClaimGuard {
                     | LeaseFamily::QueueScope { .. }
                     | LeaseFamily::EphemeralMutation { .. } => String::new(),
                 };
+                let requested_path = requested.identity.original.display().to_string();
+                let existing_path = existing.identity.original.display().to_string();
+                let conflict = if requested_path == existing_path {
+                    format!("path '{existing_path}' is already reserved")
+                } else {
+                    format!("requested '{requested_path}' overlaps reserved '{existing_path}'")
+                };
+                let advice = match availability {
+                    ClaimAvailability::Live => "; retry after the owning operation finishes",
+                    ClaimAvailability::RecoveryReserved => {
+                        "; retry after TonePoet finishes interrupted-operation recovery"
+                    }
+                    ClaimAvailability::ReclaimableEphemeral => unreachable!(),
+                };
                 return Err(format!(
-                    "filesystem mutation conflicts with {owner}: '{}' overlaps '{}'{}",
-                    requested.identity.original.display(), existing.identity.original.display(), queue_execution
+                    "filesystem mutation conflicts with {owner}: {conflict}{advice}{queue_execution}"
                 ));
             }
         }
@@ -4604,6 +4617,15 @@ mod tests {
             drop(lease);
             let error = MutationClaimGuard::acquire_ephemeral(vec![claim]).unwrap_err();
             assert!(error.contains("recovery reservation"));
+            assert!(error.contains("is already reserved"));
+            assert!(
+                error.contains("retry after TonePoet finishes interrupted-operation recovery"),
+                "recovery conflicts should tell the user what to do next: {error}"
+            );
+            assert!(
+                !error.contains("overlaps"),
+                "same-path conflicts must not describe a path as overlapping itself: {error}"
+            );
             assert!(descriptor.exists());
         });
     }
