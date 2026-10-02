@@ -1,11 +1,11 @@
-# Brief R17 — a conditional block in the folder template fails every track
+# Brief R17 — an album fails every track with an album-namespace redirect
 
 Date: 2026-10-02
-Base: the supplied `tonepoet-src.tar.gz` is our `main` at gate 7244/0.
+Base: the supplied `tonepoet-src.tar.gz`.
 
 ## What the user sees
 
-Five tracks, all failing instantly:
+Five tracks, all failing instantly, in the TUI:
 
 ```
 01 - Shrimp Dance.flac                                              FLAC Failed
@@ -16,13 +16,13 @@ Five tracks, all failing instantly:
   WRJ010LTD Reissue LP  24-96kHz}'
 ```
 
-The failed status persists in the queue, so re-running the conversion shows the
+The failed status persists in the queue. Re-running the conversion shows the
 same five failures and writes nothing new to the log.
 
 ## Reproduction
 
-Deterministic, in one process, with a private config, data dir, cache and
-output root. No TUI. Nothing else running.
+One process, empty config directory, private data dir, cache and output root,
+no second tonepoet participating:
 
 ```bash
 export XDG_CONFIG_HOME=/tmp/iso/cfg XDG_DATA_HOME=/tmp/iso/data XDG_CACHE_HOME=/tmp/iso/cache
@@ -31,32 +31,34 @@ tonepoet convert '~/torrents/Hiroshi Suzuki - Cat (1975, 2021, WRJ) [LP 24-96]'/
   --folder-naming '%ALBUM_ARTIST% - %ALBUM% (%YEAR%) [%FORMAT%] {%TITLE_EXTRA%  %BITDEPTH%-%SAMPLERATE%}'
 ```
 
-Every track fails with the message above.
+Every track fails. That template is the one the user's TUI is configured with.
 
-The same command with a `--folder-naming` that has no `{...}` block converts
-5 of 5 and writes `Cat (We Release Jazz WRJ010LTD Reissue LP 24-96)`.
+Other observed runs of the same source and binary:
 
-The two paths in the message differ by exactly the contents of the conditional
-block. The template above is the one the user's TUI is configured with.
+| `--folder-naming` | result |
+|---|---|
+| `…[%FORMAT%] {%TITLE_EXTRA%  %BITDEPTH%-%SAMPLERATE%}` | fails, redirect as above |
+| `…[%FORMAT%] %TITLE_EXTRA%  %BITDEPTH%-%SAMPLERATE%` | fails, `…Reissue LP  -` → `…Reissue LP  24-96kHz` |
+| flag omitted entirely | 5/5 succeeded, wrote `Cat (We Release Jazz WRJ010LTD Reissue LP 24-96)` |
+
+In each failure the two paths in the message differ only in the rendering of
+the template's trailing portion.
 
 ## Observations
 
-- The message says "output concurrency admission failed". Nothing concurrent is
-  involved in the reproduction.
+- The message says "output concurrency admission failed". Nothing concurrent
+  is involved in the reproduction.
 - Nothing is written to the output root: no album directory, no partial
   output, no staging.
-- The field occurrence left a terminal failed status persisted in the queue, so
-  re-running produced the same five failures and no new log output.
 
 ## The outcome we want
 
-An album whose folder template contains a conditional block converts
-successfully, and lands in the folder the template describes once all of its
-variables are known.
+An album converts successfully, and lands in the folder its template
+describes.
 
 Where a conversion genuinely cannot proceed, the user is told what is wrong
-with their album in terms they can act on, once — not an internal message about
-namespace redirection repeated per track.
+with their album in terms they can act on, once — not an internal message
+about namespace redirection repeated per track.
 
 ## State
 
