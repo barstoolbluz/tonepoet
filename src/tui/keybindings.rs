@@ -87165,8 +87165,11 @@ mod artwork_file_picker_handoff_tests {
             tui_file_picker::VerificationMode::Standard,
         )
         .expect_err("conflicting Tonepoet write must reject picker rename");
-        assert!(error.message().to_ascii_lowercase().contains("busy")
-            || error.message().to_ascii_lowercase().contains("overlap"));
+        let conflict_message = error.message().to_ascii_lowercase();
+        assert!(
+            conflict_message.contains("live owner") && conflict_message.contains("retry after"),
+            "live conflict refusal should identify the owner and tell the user when to retry: {conflict_message}"
+        );
         assert_eq!(fs::read(&source).expect("source retained"), b"cover");
         assert!(!destination.exists(), "destination must not appear before admission");
 

@@ -10142,7 +10142,12 @@ FILE "track.flac" WAVE
                 1,
                 "{retry_stage:?} ENOSPC should trigger exactly one disk retry"
             );
-            let expected_disk_staging_path = output_root.join(".tonepoet-staging");
+            let expected_disk_staging_path = disk_staging_parent_for(&req);
+            assert!(
+                !expected_disk_staging_path.starts_with(&output_root),
+                "disk retry staging must remain outside the user's output root; got {}",
+                expected_disk_staging_path.display()
+            );
             let retry_logs = captured_test_logs_since_for_item(log_cursor, &item_id);
             assert!(
                 retry_logs.iter().any(|line| {
