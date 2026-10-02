@@ -23,7 +23,7 @@ cargo test --workspace --no-fail-fast --exclude tonepoet-true-peak   # THE GATE
                              # without --no-fail-fast, --workspace stops at the
                              # first failing binary; tonepoet-true-peak costs
                              # ~41 min and is gated separately. See ## Testing —
-                             # a clean gate is 7237/0; see ## Testing for the
+                             # a clean gate is 7244/0; see ## Testing for the
                              # rare coordination-contention flake.
 cargo test -p tonepoet-backend   # Backend tests only
 cargo test -p tonepoet-features  # Features tests only
@@ -273,9 +273,9 @@ cargo test -p tonepoet-true-peak   # BS.1770 true-peak + loudness core (~41 min)
 Tests are in `crates/*/tests/` directories, `src/` (inline `#[cfg(test)]` modules), and `tests/` (integration/contract/sentinel tests). The workspace suite is ~7,210 tests across 57 targets, plus 160 in `tonepoet-true-peak`.
 NEVER truncate failure output.
 
-**A clean gate on `main` is 7237 passed / 0 FAILED across 63 targets** (was 7212
-on 2026-09-29; R13/R14 added 16, the Reference freshness gate 2, and R15's
-interrupted-conversion work the rest, through 2026-10-02).
+**A clean gate on `main` is 7244 passed / 0 FAILED across 63 targets** (was 7212
+on 2026-09-29; R13/R14 added 16, the Reference freshness gate 2, and R15/R16 and
+R12's SACD multi-value work the rest, through 2026-10-02).
 Reference was requalified on 2026-09-29 against the Nix rooting, and the SSRC
 true-peak terminal registry was commissioned on 2026-09-30, so the stale-evidence
 and uncommissioned refusals that previously failed are gone.
