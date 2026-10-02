@@ -10,6 +10,10 @@
 // raise the macro recursion limit for this test crate to expand it.
 #![recursion_limit = "512"]
 
+#[path = "../reference_source_lock.rs"]
+#[allow(dead_code)]
+mod reference_source_lock;
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -10082,6 +10086,33 @@ fn complete_p0_reference_qualification_report() {
         serde_json::to_value(&certification).expect("serialize v18 certification value");
     write_report_atomically(&certification_path, &certification_value);
 
+    // Record which locked Reference sources this qualification was produced
+    // from. `tests/reference_qualification_freshness.rs` compares the working
+    // tree against this, so drift is caught by the ordinary gate instead of by
+    // a user's DSD conversion failing with "promotion is inactive".
+    let source_lock_path = std::env::var_os("TONEPOET_DSD_REFERENCE_SOURCE_LOCK_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("target/dsd_reference_common_v18_source_lock.json")
+        });
+    let mut locked_source_sha256 = serde_json::Map::new();
+    for path in reference_source_lock::REFERENCE_COMMON_SOURCE_PATHS {
+        let raw = fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(path))
+            .unwrap_or_else(|error| panic!("read locked Reference source {path}: {error}"));
+        let bytes = reference_source_lock::reference_source_bytes_for_hash(path, &raw)
+            .unwrap_or_else(|error| panic!("canonicalize locked Reference source {path}: {error}"));
+        locked_source_sha256.insert(path.to_string(), serde_json::json!(sha256_hex(&bytes)));
+    }
+    write_report_atomically(
+        &source_lock_path,
+        &serde_json::json!({
+            "schema_version": 1,
+            "runtime_closure_fingerprint_sha256": report.runtime_closure_fingerprint_sha256,
+            "locked_source_sha256": locked_source_sha256,
+        }),
+    );
+
     eprintln!(
         "Reference generated release-gate evidence: {}",
         generated_release_gate_evidence_dir.display()
@@ -10089,4 +10120,5 @@ fn complete_p0_reference_qualification_report() {
     eprintln!("Reference common-model evidence: {}", evidence_path.display());
     eprintln!("Reference common-model qualification report: {}", report_path.display());
     eprintln!("Reference common-model release certification: {}", certification_path.display());
+    eprintln!("Reference locked-source record: {}", source_lock_path.display());
 }

@@ -23,7 +23,7 @@ cargo test --workspace --no-fail-fast --exclude tonepoet-true-peak   # THE GATE
                              # without --no-fail-fast, --workspace stops at the
                              # first failing binary; tonepoet-true-peak costs
                              # ~41 min and is gated separately. See ## Testing —
-                             # a clean gate is 7228/0; see ## Testing for the
+                             # a clean gate is 7230/0; see ## Testing for the
                              # rare coordination-contention flake.
 cargo test -p tonepoet-backend   # Backend tests only
 cargo test -p tonepoet-features  # Features tests only
@@ -265,8 +265,9 @@ cargo test -p tonepoet-true-peak   # BS.1770 true-peak + loudness core (~41 min)
 Tests are in `crates/*/tests/` directories, `src/` (inline `#[cfg(test)]` modules), and `tests/` (integration/contract/sentinel tests). The workspace suite is ~7,210 tests across 57 targets, plus 160 in `tonepoet-true-peak`.
 NEVER truncate failure output.
 
-**A clean gate on `main` is 7228 passed / 0 FAILED across 62 targets** (was 7212;
-R13 and R14 added 16 CUE-decoder and FILE-reference-repair tests on 2026-10-01).
+**A clean gate on `main` is 7230 passed / 0 FAILED across 63 targets** (was 7212;
+R13/R14 added 16 CUE-decoder and FILE-reference-repair tests and the Reference
+freshness gate added 2, all on 2026-10-01).
 Reference was requalified on 2026-09-29 against the Nix rooting, and the SSRC
 true-peak terminal registry was commissioned on 2026-09-30, so the stale-evidence
 and uncommissioned refusals that previously failed are gone.
@@ -301,6 +302,33 @@ Superseded 2026-09-29: the three deferred hard-ceiling failures now pass; the
 "persistent lease descriptor exceeds 1048576 bytes" flake was fixed by the schema-3
 descriptor encoding; and the two stale-evidence qualification refusals were cleared by
 requalification.
+
+
+### Reference qualification goes stale when locked sources change
+
+The Reference runtime closure fingerprint binds the exact bytes of the 24 files in
+`REFERENCE_COMMON_SOURCE_PATHS` (`reference_source_lock.rs`). Touch one — `w64.rs`,
+`track_executor.rs`, `stages.rs`, `semantic_plan.rs`, `Cargo.lock`, … — and the installed
+qualification stops binding the running build, so **every DSD source fails at runtime**
+with "Reference production promotion is inactive". That is the certification machinery
+working, not a bug.
+
+`tests/reference_qualification_freshness.rs` catches this in the ordinary gate and names
+the drifted files. It needs no audio tools and runs in milliseconds. If it fails,
+requalify — do not edit the sidecar by hand:
+
+```bash
+unset TONEPOET_REFERENCE_RUNTIME_CLOSURE_ROOT TONEPOET_REFERENCE_RUNTIME_CLOSURE_MANIFEST_PATH
+export TONEPOET_REQUIRE_TOOLS=1
+cargo test --release --test dsd_reference_qualification \
+  complete_p0_reference_qualification_report -- --nocapture   # ~13 min
+cp target/dsd_reference_common_v18_{report,certification,evidence,source_lock}.json \
+   tonepoet-pipeline/qualification/
+```
+
+The qualification run writes the sidecar itself, so requalify-then-copy keeps it correct.
+This was added after R4–R11 silently invalidated the 2026-09-29 qualification and the
+breakage surfaced only when a field SACD conversion failed eight commits later.
 
 ## External Tool Dependencies
 
