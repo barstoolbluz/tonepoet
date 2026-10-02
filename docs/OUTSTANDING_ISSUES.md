@@ -3027,6 +3027,12 @@ appear in the Queue screen as Interrupted or retryable. The reservation on the f
 is therefore still in place after a restart, and the pass's outcome remains invisible.
 
 
+> **RESOLVED 2026-10-02 by R15.** Field-verified: killing a 22-track SACD
+> conversion and converting the same album again now succeeds (`1/1`), where
+> every attempt was previously refused. Dead executions release their
+> ownership after positive containment recovery; live conflicts still fail
+> closed.
+
 ### Reproduced 2026-10-02, deterministically
 
 `SIGKILL` a conversion, then convert the same album again:
@@ -3368,6 +3374,14 @@ orphaned. The output root ends a conversion with no `.tonepoet-*` entry in it.
   silently.
 - `docs/` and briefs carry this as a standing rule for every future delivery.
 
+
+> **Staging half RESOLVED 2026-10-02 by R15** (field-verified: the output root
+> is 0 bytes after a hard kill, where it previously held 658 MB - 1.8 GB).
+> Default disk staging now lives in TonePoet-owned cache storage, with a
+> process-start sweep and an upgrade-cleanup pass for pre-R15 leftovers.
+> **The manifest half stays open**: `.tonepoet-manifest.json` never reproduced
+> on any route tried, before or after R15, and R15 did not touch it. The
+> forcing code in `stages.rs` (`reference_manifest_required`) is unchanged.
 
 ### Reproduced 2026-10-02 on a default configuration
 
