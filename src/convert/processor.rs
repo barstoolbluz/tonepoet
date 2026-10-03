@@ -959,6 +959,43 @@ pub(crate) fn dispatch_track_metadata_for_authority_matrix_test(
     dispatch_track_metadata_for_output_planning(req, source_kind)
 }
 
+/// Whether queue-time output planning is still missing an audio fact that can
+/// change the rendered album folder after source materialization.
+///
+/// The dispatch-time synthetic `PreparedSource` deliberately carries metadata
+/// but no probed sample rate or source PCM depth. A folder template that asks
+/// to preserve either source property therefore cannot be promoted to
+/// planner-authoritative output identity yet: rendering the missing token as
+/// empty would turn a later, legitimate materialized render into an apparent
+/// namespace redirect.
+///
+/// Explicit rate/depth targets remain dispatch-stable and keep the existing
+/// fast path. The one rate exception is a lossy DSD hard-ceiling route, where
+/// the effective encoder rate depends on whether the materialized source is a
+/// DSD participant.
+fn folder_template_needs_materialized_audio_for_dispatch(req: &PipelineRequest) -> bool {
+    if !req.naming.per_album_subdir {
+        return false;
+    }
+    let Some(template) = req.naming.folder_template.as_deref() else {
+        return false;
+    };
+
+    let sample_rate_needs_source = matches!(
+        req.settings.target_sample_rate,
+        tonepoet_pipeline::RateTarget::Source
+    ) || (req.settings.target_format.is_lossy()
+        && (req.settings.dsd.gain_policy().is_true_peak()
+            || req.settings.dsd.runtime_album_gain_db().is_some()));
+    let bit_depth_needs_source = matches!(
+        req.settings.target_bit_depth,
+        tonepoet_pipeline::BitDepthTarget::Source
+    );
+
+    (template.contains("%SAMPLERATE%") && sample_rate_needs_source)
+        || (template.contains("%BITDEPTH%") && bit_depth_needs_source)
+}
+
 /// Return an authoritative batch album directory only when every request can
 /// be planned from queue-time metadata through the canonical output planner
 /// and every result agrees. Any uncertainty deliberately leaves the batch
@@ -969,6 +1006,9 @@ fn planner_resolved_album_output_dir_for_dispatch(
 ) -> Option<PathBuf> {
     let mut resolved: Option<PathBuf> = None;
     for req in requests {
+        if folder_template_needs_materialized_audio_for_dispatch(req) {
+            return None;
+        }
         let source_kind = detect_source_kind(req).ok()?;
         let metadata = dispatch_track_metadata_for_output_planning(req, source_kind)?;
         let album_dir = plan_album_dir_from_dispatch_metadata(req, source_kind, metadata).ok()?;
@@ -8815,6 +8855,89 @@ fi
         );
     }
 
+    fn source_resolution_dispatch_requests(
+        temp: &tempfile::TempDir,
+    ) -> Vec<PipelineRequest> {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("silence.flac");
+        let first = temp.path().join("01 - First.flac");
+        let second = temp.path().join("02 - Second.flac");
+        std::fs::copy(&fixture, &first).expect("first FLAC fixture copy");
+        std::fs::copy(&fixture, &second).expect("second FLAC fixture copy");
+
+        [
+            ("resolution-first", "resolution-first-job", first),
+            ("resolution-second", "resolution-second-job", second),
+        ]
+        .into_iter()
+        .map(|(item_id, job_id, container)| {
+            let mut request =
+                processor_dispatch_request_for_path(temp.path(), item_id, job_id, container);
+            request.naming.folder_template =
+                Some("%FORMAT% {%BITDEPTH%-%SAMPLERATE%}".to_string());
+            request
+        })
+        .collect()
+    }
+
+    #[test]
+    fn dispatch_album_authority_guard_tracks_source_resolution_tokens_independently() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut request = pipeline_request_for_processor_limit_test(temp.path());
+
+        request.naming.folder_template = Some("%SAMPLERATE%".to_string());
+        assert!(folder_template_needs_materialized_audio_for_dispatch(&request));
+        request.settings.target_sample_rate = tonepoet_pipeline::RateTarget::PcmHz(96_000);
+        assert!(!folder_template_needs_materialized_audio_for_dispatch(&request));
+
+        request.naming.folder_template = Some("%BITDEPTH%".to_string());
+        assert!(folder_template_needs_materialized_audio_for_dispatch(&request));
+        request.settings.target_bit_depth =
+            tonepoet_pipeline::BitDepthTarget::Pcm(tonepoet_pipeline::PcmBitDepth::Int24);
+        assert!(!folder_template_needs_materialized_audio_for_dispatch(&request));
+    }
+
+    #[test]
+    fn planner_resolved_album_output_dir_waits_for_source_resolution_tokens() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let requests = source_resolution_dispatch_requests(&temp);
+
+        let source_kind = detect_source_kind(&requests[0]).expect("source kind");
+        assert_eq!(source_kind, SourceKind::SingleFile);
+        let metadata = dispatch_track_metadata_for_output_planning(&requests[0], source_kind)
+            .expect("valid FLAC fixture supplies dispatch metadata");
+        assert_eq!(
+            plan_album_dir_from_dispatch_metadata(&requests[0], source_kind, metadata)
+                .expect("queue-time plan"),
+            temp.path().join("out").join("FLAC"),
+            "the synthetic queue-time source has no source rate/depth, so the conditional resolution block is incomplete before materialization"
+        );
+        assert_eq!(
+            planner_resolved_album_output_dir_for_dispatch(&requests),
+            None,
+            "an incomplete source-derived resolution render must stay provisional instead of becoming a false planner-authoritative namespace"
+        );
+    }
+
+    #[test]
+    fn planner_resolved_album_output_dir_keeps_explicit_resolution_fast_path() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut requests = source_resolution_dispatch_requests(&temp);
+        for request in &mut requests {
+            request.settings.target_sample_rate = tonepoet_pipeline::RateTarget::PcmHz(96_000);
+            request.settings.target_bit_depth =
+                tonepoet_pipeline::BitDepthTarget::Pcm(tonepoet_pipeline::PcmBitDepth::Int24);
+        }
+
+        assert_eq!(
+            planner_resolved_album_output_dir_for_dispatch(&requests),
+            Some(temp.path().join("out").join("FLAC {24-96kHz}")),
+            "explicit output resolution is fully knowable at dispatch and must retain planner authority"
+        );
+    }
+
     #[test]
     fn planner_resolved_album_output_dir_rejects_case_variant_prospective_directories() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -10456,6 +10579,51 @@ FILE "track.flac" WAVE
         req.suppress_incremental_conversion_log_append = false;
         req.expected_album_track_count = None;
         req
+    }
+
+    #[test]
+    fn queued_folder_dispatch_keeps_source_resolution_template_provisional() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let album_root = temp.path().join("album");
+        std::fs::create_dir_all(&album_root).expect("album root");
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("silence.flac");
+        let first = album_root.join("01 - First.flac");
+        let second = album_root.join("02 - Second.flac");
+        std::fs::copy(&fixture, &first).expect("first FLAC fixture copy");
+        std::fs::copy(&fixture, &second).expect("second FLAC fixture copy");
+
+        let make_item = |item_id: &str, job_id: &str, container: PathBuf| {
+            let mut request =
+                processor_dispatch_request_for_path(temp.path(), item_id, job_id, container);
+            request.naming.folder_template = Some(
+                "%ALBUM_ARTIST% - %ALBUM% (%YEAR%) [%FORMAT%] {%TITLE_EXTRA%  %BITDEPTH%-%SAMPLERATE%}"
+                    .to_string(),
+            );
+            conversion_item_with_pipeline_request(item_id, request)
+        };
+        let mut items = vec![
+            make_item("resolution-01", "job-resolution-01", first),
+            make_item("resolution-02", "job-resolution-02", second),
+        ];
+
+        prepare_album_batches_for_queued_independent_single_file_jobs(&mut items);
+
+        for item in &items {
+            let batch = item
+                .pipeline_request
+                .as_ref()
+                .expect("prepared request")
+                .album_batch
+                .as_ref()
+                .expect("two-track folder receives album batch");
+            assert!(
+                !batch.album_output_dir_is_planner_resolved(),
+                "source-derived resolution naming must remain provisional until materialization"
+            );
+        }
     }
 
     #[test]
