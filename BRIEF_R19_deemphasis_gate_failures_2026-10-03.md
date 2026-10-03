@@ -19,8 +19,7 @@ siblings. Nothing else was touched.
 
 `installed_reference_qualification_binds_the_current_locked_sources` fails
 because R18 changes four Reference-locked files: `plan_bridge.rs`, `stages.rs`,
-`fingerprint.rs`, `semantic_plan.rs`. Requalification is ours to run on this
-host once the implementation settles. Do not treat it as something to fix.
+`fingerprint.rs`, `semantic_plan.rs`. Requalification runs on this host.
 
 ## Not R18
 
@@ -65,8 +64,6 @@ cue_real_output_matrix_tests::single_file_custom_tags_survive_real_writer_matrix
   both: cue_to_opus first metadata pass missing metadata key PRE_EMPHASIS
 ```
 
-These two run real external encoders.
-
 ### One in `src/tui/context_menu.rs`
 
 ```
@@ -86,7 +83,6 @@ records it at 160/0.
 
 ## Build capability
 
-`cargo test -p tonepoet-pipeline` builds in seconds, and three of the nine
-failures are in that crate. The root `tonepoet` crate peaks at 6.24 GB in one
-`rustc` and will OOM under a 4 GB ceiling; write those changes uncompiled and
-say so.
+`cargo test -p tonepoet-pipeline` builds in seconds. The root `tonepoet` crate
+peaks at 6.24 GB in one `rustc` and will OOM under a 4 GB ceiling; write those
+changes uncompiled and say so.
