@@ -3986,7 +3986,19 @@ that displays the result; whether the C1-penalty interaction described above is
 dependable enough to lean on deliberately; and whether a repair surface, as
 filed for #56, is the right home for this.
 
-## 61. A conditional `{...}` block in the folder template fails every track of the album
+## 61. An album fails every track with an album-namespace redirect
+
+> **RESOLVED 2026-10-02 by R17.** Field-verified on the reported album: both
+> folder templates that previously failed every track now convert 5/5 and
+> publish under the fully rendered folder. Dispatch no longer promotes an
+> album path to planner-authoritative while the template still depends on a
+> fact that only materialization supplies; the admission guard itself is
+> unchanged. No Reference-locked source changed.
+>
+> Note: the published year moved 1975 → 1976, which is the real `DATE` tag.
+> The 1975 came from dispatch-time metadata.
+
+
 
 Filed 2026-10-02. **Reproduced deterministically in a single isolated process.**
 Originally filed as a concurrency bug on the strength of its message text; it is
