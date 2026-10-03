@@ -9925,6 +9925,47 @@ pub fn apply_convert_source_disc_selection_to_pipeline_request(
     apply_convert_source_disc_selection_to_source_options(mode, &mut request.source);
 }
 
+/// Install or remove the request-local semantic CD de-emphasis effect. The TUI
+/// never chooses a physical backend; Phase 2 selects a qualified candidate.
+fn set_request_cd_deemphasis(
+    request: &mut crate::convert::pipeline::PipelineRequest,
+    enabled: bool,
+) {
+    request.registered_effects.retain(|effect| {
+        !matches!(
+            effect.effect,
+            tonepoet_pipeline::RegisteredUnaryEffect::CdDeemphasis
+        )
+    });
+    if !enabled {
+        return;
+    }
+
+    let id = tonepoet_pipeline::EffectInstanceId(
+        request
+            .registered_effects
+            .iter()
+            .map(|effect| effect.id.0)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1),
+    );
+    let after = request
+        .registered_effects
+        .iter()
+        .filter(|effect| {
+            effect.placement != tonepoet_pipeline::EffectPlacement::AfterPcmResample
+        })
+        .map(|effect| effect.id)
+        .collect();
+    request.registered_effects.push(tonepoet_pipeline::EffectIntent {
+        id,
+        effect: tonepoet_pipeline::RegisteredUnaryEffect::CdDeemphasis,
+        after,
+        placement: tonepoet_pipeline::EffectPlacement::SourceRate,
+    });
+}
+
 /// Return `request` after applying the Convert-screen selected presentation to
 /// `request.source`.
 #[must_use]
@@ -10005,6 +10046,41 @@ fn execute_commit_with_source_options_transform(
         app.set_status("nothing to commit — no source file loaded");
         return;
     }
+
+    // Batch de-emphasis is intentionally per-item. Do not admit work before
+    // the bounded eligibility-first preflight has accounted for every member;
+    // otherwise a fast commit could miss PRE_EMPHASIS on a later eligible
+    // track or apply a manual override to an unresolved member.
+    if matches!(&app.convert.source.mode, SourceMode::Batch { .. })
+        && (app.convert.source.deemphasis_batch_preflight_pending
+            || batch.iter().any(|path| {
+                !app.convert
+                    .source
+                    .deemphasis_batch_preflight
+                    .contains_key(path)
+            }))
+    {
+        app.set_status("pre-emphasis source scan is still completing — commit again when it finishes");
+        return;
+    }
+
+    let mut deemphasis_path_states = app.convert.source.deemphasis_batch_preflight.clone();
+    if !matches!(&app.convert.source.mode, SourceMode::Batch { .. }) {
+        if let (Some(path), Some(info)) = (
+            app.convert.source.mode.current_path().cloned(),
+            app.convert.source.mode.current_info(),
+        ) {
+            deemphasis_path_states.insert(
+                path,
+                super::app::ConvertDeemphasisPathState {
+                    eligible: crate::tui::probe::convert_cd_deemphasis_eligible(info),
+                    evidence: app.convert.source.mode.current_metadata().convert_preemphasis,
+                },
+            );
+        }
+    }
+    let deemphasis_enabled = app.convert.format.deemphasis_enabled;
+    let deemphasis_overridden = app.convert.format.deemphasis_overridden;
 
     // Block commit when no destination path is set.
     if app.convert.output_options.dest_path.is_none() {
@@ -10187,6 +10263,14 @@ fn execute_commit_with_source_options_transform(
             }
             apply_queue_item_cue_sidecar_override_to_source_options(item, &mut item_source);
 
+            let apply_cd_deemphasis = deemphasis_enabled
+                && deemphasis_path_states
+                    .get(&item.input_path)
+                    .is_some_and(|state| {
+                        state.eligible
+                            && (deemphasis_overridden || state.evidence.explicit_affirmative)
+                    });
+
             if let Some(existing_req) = item.pipeline_request.as_mut() {
                 // `commit_batch_with_cue_metadata_artifacts()` may already have attached
                 // a full PipelineRequest from an earlier admission path. Replace
@@ -10207,6 +10291,7 @@ fn execute_commit_with_source_options_transform(
                 existing_req.merge = options.merge_to_single;
                 existing_req.companion = companion_policy.clone();
                 existing_req.actions = options.actions.clone();
+                set_request_cd_deemphasis(existing_req, apply_cd_deemphasis);
             } else {
                 let output_root = options.output_dir.clone()
                     .map(|p| crate::convert::pipeline::unified_request::expand_tilde(&p))
@@ -10275,6 +10360,9 @@ fn execute_commit_with_source_options_transform(
                     suppress_incremental_conversion_log_append: false,
                     companion: companion_policy.clone(),
                 });
+                if let Some(request) = item.pipeline_request.as_mut() {
+                    set_request_cd_deemphasis(request, apply_cd_deemphasis);
+                }
             }
         },
     );

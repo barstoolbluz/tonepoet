@@ -47,6 +47,8 @@ pub enum TuiButton {
     DepthPill(usize),
     ResamplerPill(usize),
     DitherPill(usize),
+    DeemphasisPill(usize),
+    DeemphasisInfo,
     ReplayGainPill(usize),
     PcmTruePeakPill(usize),
     TruePeakScopePill(usize),
@@ -596,6 +598,8 @@ impl TuiButton {
             | Self::DepthPill(_)
             | Self::ResamplerPill(_)
             | Self::DitherPill(_)
+            | Self::DeemphasisPill(_)
+            | Self::DeemphasisInfo
             | Self::ReplayGainPill(_)
             | Self::PcmTruePeakPill(_)
             | Self::TruePeakScopePill(_)

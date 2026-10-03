@@ -135,6 +135,7 @@ pub async fn run_app(
         app.clear_expired_status();
         check_pending_browse_rename(app);
         check_batch_probe_debounce(app, &tx);
+        check_deemphasis_batch_preflight(app, &tx);
         if !input_waiting_at_frame_start {
             check_browse_probe_debounce(app, &tx);
         }
@@ -851,6 +852,34 @@ fn check_batch_probe_debounce(app: &mut AppState, tx: &mpsc::Sender<AppMessage>)
             );
         }
     }
+}
+
+fn check_deemphasis_batch_preflight(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
+    if app.convert.source.deemphasis_batch_preflight_pending {
+        return;
+    }
+    let (paths, known_info) = match &app.convert.source.mode {
+        super::app::SourceMode::Batch { paths, cursor, cursor_info, .. } if !paths.is_empty() => {
+            if app.convert.source.deemphasis_batch_preflight.len() == paths.len()
+                && paths.iter().all(|path| app.convert.source.deemphasis_batch_preflight.contains_key(path))
+            {
+                return;
+            }
+            let mut known = std::collections::BTreeMap::new();
+            if let (Some(path), Some(info)) = (paths.get(*cursor), cursor_info.as_ref()) {
+                known.insert(path.clone(), info.clone());
+            }
+            (paths.clone(), known)
+        }
+        _ => return,
+    };
+    app.convert.source.deemphasis_batch_preflight_pending = true;
+    super::app::spawn_convert_deemphasis_batch_preflight(
+        app.probe_generation,
+        paths,
+        known_info,
+        tx.clone(),
+    );
 }
 
 fn check_browse_probe_debounce(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
@@ -2771,6 +2800,14 @@ fn handle_convert_source_probe_result(
 
     if metadata_unchanged {
         super::app::apply_source_metadata_to_convert(&mut app.convert, &detected_metadata);
+    } else {
+        // Convert de-emphasis evidence is source fact, not editable metadata. A
+        // concurrent metadata edit must not suppress or delay this narrow
+        // probe result; only the ordinary editable field projection is
+        // baseline-protected above.
+        app.convert
+            .format
+            .set_convert_deemphasis_evidence(&detected_metadata.convert_preemphasis);
     }
 
     if format_unchanged {
@@ -2899,6 +2936,10 @@ fn handle_archive_preview_result(
 
             if metadata_unchanged {
                 super::app::apply_source_metadata_to_convert(&mut app.convert, &detected_metadata);
+            } else {
+                app.convert
+                    .format
+                    .set_convert_deemphasis_evidence(&detected_metadata.convert_preemphasis);
             }
 
             if format_unchanged {
@@ -6513,6 +6554,63 @@ fn handle_convert_audio_probe_complete(
     publish_probe_status_with_sentinel_clamp(app, status, was_sentinel_selected);
 }
 
+fn handle_convert_deemphasis_batch_preflight_complete(
+    app: &mut AppState,
+    generation: u64,
+    paths: Vec<std::path::PathBuf>,
+    results: Vec<(std::path::PathBuf, super::app::ConvertDeemphasisPathState)>,
+) {
+    if generation != app.probe_generation {
+        // A same-path generation refresh can obsolete an in-flight inventory.
+        // Clear only that matching pending marker so the next event-loop tick
+        // can restart under the current generation; different-source installs
+        // already reset batch de-emphasis state in set_source_mode().
+        if matches!(
+            &app.convert.source.mode,
+            super::app::SourceMode::Batch { paths: current, .. } if *current == paths
+        ) {
+            app.convert.source.deemphasis_batch_preflight_pending = false;
+        }
+        return;
+    }
+    let current_paths = match &app.convert.source.mode {
+        super::app::SourceMode::Batch { paths, .. } => paths,
+        _ => return,
+    };
+    if *current_paths != paths {
+        return;
+    }
+    app.convert.source.deemphasis_batch_preflight_pending = false;
+    app.convert.source.deemphasis_batch_preflight = results.into_iter().collect();
+    let eligible_count = app
+        .convert
+        .source
+        .deemphasis_batch_preflight
+        .values()
+        .filter(|state| state.eligible)
+        .count();
+    let explicit_count = app
+        .convert
+        .source
+        .deemphasis_batch_preflight
+        .values()
+        .filter(|state| state.eligible && state.evidence.explicit_affirmative)
+        .count();
+    let catalog_count = app
+        .convert
+        .source
+        .deemphasis_batch_preflight
+        .values()
+        .filter(|state| state.eligible && !state.evidence.explicit_affirmative && state.evidence.catalog_exact)
+        .count();
+    app.convert.format.set_batch_convert_deemphasis_summary(
+        eligible_count,
+        explicit_count,
+        catalog_count,
+        paths.len(),
+    );
+}
+
 fn handle_bookmark_detail_loaded_with_retry<F>(
     app: &mut AppState,
     tx: &mpsc::Sender<AppMessage>,
@@ -7757,6 +7855,9 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 probe_notice,
                 baseline,
             );
+        }
+        AppMessage::ConvertDeemphasisBatchPreflightComplete { generation, paths, results } => {
+            handle_convert_deemphasis_batch_preflight_complete(app, generation, paths, results);
         }
         AppMessage::ProbeCacheWarmComplete { tab_id, generation, path, rows } => {
             // Do not merge here. Queue rows on the owning tab and let the

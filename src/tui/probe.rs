@@ -72,6 +72,18 @@ impl Default for ArtworkInfo {
     }
 }
 
+/// Narrow Convert-only evidence extracted from tags already opened by Lofty.
+/// This is intentionally stricter than the generic pre-emphasis detector.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConvertPreemphasisTagEvidence {
+    /// Exact `PRE_EMPHASIS` field with trimmed value `1` or case-insensitive `YES`.
+    pub explicit_affirmative: bool,
+    /// Actual source CATALOGNUMBER value, if present.
+    pub catalog_number: Option<String>,
+    /// Whether that actual tag value is an exact authoritative catalog hit.
+    pub catalog_exact: bool,
+}
+
 /// Metadata tags from the source file
 #[derive(Debug, Clone, Default)]
 pub struct SourceMetadata {
@@ -94,6 +106,9 @@ pub struct SourceMetadata {
     /// CATALOGNUMBER tag (Vorbis comment) or similar format-specific
     /// field. Used by the bulk rename wizard for `%CATALOG%`.
     pub catalog_number: Option<String>,
+
+    /// Convert-only narrow pre-emphasis evidence from this same tag pass.
+    pub convert_preemphasis: ConvertPreemphasisTagEvidence,
 
     /// Gain/peak values from REPLAYGAIN_* tags. Raw strings as stored in the
     /// file (e.g. `"-6.57 dB"` for gain, `"0.988281"` for peak).
@@ -8646,6 +8661,131 @@ fn source_metadata_tool_from_tag(tag: &lofty::tag::Tag) -> Option<String> {
     None
 }
 
+/// Extract only the evidence authorized for Convert CD de-emphasis.
+///
+/// No CUE, folder, COMMENT, spectral, artwork, or generic advisory work occurs
+/// here. The exact-key/value rule is deliberately narrower than the historical
+/// detector used by Details and other callers.
+pub(crate) fn convert_preemphasis_evidence_from_tags(
+    tags: &[lofty::tag::Tag],
+) -> ConvertPreemphasisTagEvidence {
+    use lofty::tag::ItemKey;
+
+    let pre_key = ItemKey::Unknown("PRE_EMPHASIS".to_string());
+    let catalog_key = ItemKey::Unknown("CATALOGNUMBER".to_string());
+    let mut evidence = ConvertPreemphasisTagEvidence::default();
+
+    for tag in tags {
+        if !evidence.explicit_affirmative {
+            if let Some(value) = tag.get_string(&pre_key) {
+                let value = value.trim();
+                evidence.explicit_affirmative = value == "1" || value.eq_ignore_ascii_case("YES");
+            }
+        }
+        if evidence.catalog_number.is_none() {
+            evidence.catalog_number = tag
+                .get_string(&ItemKey::CatalogNumber)
+                .or_else(|| tag.get_string(&catalog_key))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+        }
+    }
+
+    evidence.catalog_exact = evidence
+        .catalog_number
+        .as_deref()
+        .and_then(super::preemphasis::catalog::match_catalog_tag_value)
+        .is_some();
+    evidence
+}
+
+/// Read only the tags needed by Convert's batch pre-emphasis inventory.
+/// Technical eligibility must be established by the caller before invoking it.
+pub(crate) fn read_convert_preemphasis_tag_evidence(
+    path: &Path,
+) -> Result<ConvertPreemphasisTagEvidence, String> {
+    use lofty::file::TaggedFileExt;
+    let tagged = lofty::read_from_path(path)
+        .map_err(|error| format!("failed to read Convert pre-emphasis tags: {error}"))?;
+    Ok(convert_preemphasis_evidence_from_tags(tagged.tags()))
+}
+
+/// Positive technical gate for the destructive Convert de-emphasis feature.
+pub(crate) fn convert_cd_deemphasis_eligible(info: &SourceInfo) -> bool {
+    info.compression_is_lossless == Some(true)
+        && info.sample_format_is_float == Some(false)
+        && info.bit_depth == Some(16)
+        && info.sample_rate == 44_100
+}
+
+#[cfg(test)]
+mod convert_deemphasis_evidence_tests {
+    use super::*;
+    use lofty::tag::{ItemKey, ItemValue, Tag, TagItem, TagType};
+
+    fn tag_with(key: ItemKey, value: &str) -> Tag {
+        let mut tag = Tag::new(TagType::VorbisComments);
+        tag.push(TagItem::new(key, ItemValue::Text(value.to_owned())));
+        tag
+    }
+
+    #[test]
+    fn convert_authority_accepts_only_exact_key_one_or_yes() {
+        for value in ["1", "YES", "yes", " Yes "] {
+            let tag = tag_with(ItemKey::Unknown("PRE_EMPHASIS".to_owned()), value);
+            assert!(convert_preemphasis_evidence_from_tags(&[tag]).explicit_affirmative, "{value}");
+        }
+        for value in ["0", "NO", "", "TRUE", "ON", "Y"] {
+            let tag = tag_with(ItemKey::Unknown("PRE_EMPHASIS".to_owned()), value);
+            assert!(!convert_preemphasis_evidence_from_tags(&[tag]).explicit_affirmative, "{value}");
+        }
+        for key in ["PRE-EMPHASIS", "PRE EMPHASIS", "PREEMPHASIS"] {
+            let tag = tag_with(ItemKey::Unknown(key.to_owned()), "YES");
+            assert!(!convert_preemphasis_evidence_from_tags(&[tag]).explicit_affirmative, "{key}");
+        }
+    }
+
+    #[test]
+    fn convert_catalog_advisory_requires_actual_exact_catalog_tag() {
+        let exact = tag_with(ItemKey::Unknown("CATALOGNUMBER".to_owned()), "35DP 150");
+        let evidence = convert_preemphasis_evidence_from_tags(&[exact]);
+        assert_eq!(evidence.catalog_number.as_deref(), Some("35DP 150"));
+        assert!(evidence.catalog_exact);
+
+        let unknown = tag_with(ItemKey::Unknown("CATALOGNUMBER".to_owned()), "35DP 151");
+        assert!(!convert_preemphasis_evidence_from_tags(&[unknown]).catalog_exact);
+    }
+
+    #[test]
+    fn convert_deemphasis_eligibility_requires_all_positive_cd_pcm_facts() {
+        let eligible = SourceInfo {
+            format_name: "flac".to_owned(),
+            codec: "flac".to_owned(),
+            bit_depth: Some(16),
+            sample_format_is_float: Some(false),
+            compression_is_lossless: Some(true),
+            sample_rate: 44_100,
+            channels: 2,
+            channel_layout: "stereo".to_owned(),
+            duration_secs: 1.0,
+            file_size: 1,
+        };
+        assert!(convert_cd_deemphasis_eligible(&eligible));
+        for ineligible in [
+            SourceInfo { bit_depth: Some(24), ..eligible.clone() },
+            SourceInfo { sample_rate: 48_000, ..eligible.clone() },
+            SourceInfo { sample_format_is_float: Some(true), ..eligible.clone() },
+            SourceInfo { compression_is_lossless: Some(false), ..eligible.clone() },
+            SourceInfo { bit_depth: None, ..eligible.clone() },
+            SourceInfo { sample_format_is_float: None, ..eligible.clone() },
+            SourceInfo { compression_is_lossless: None, ..eligible.clone() },
+        ] {
+            assert!(!convert_cd_deemphasis_eligible(&ineligible));
+        }
+    }
+}
+
 fn source_metadata_from_tags(
     path: &Path,
     tags: &[lofty::tag::Tag],
@@ -8659,6 +8799,7 @@ fn source_metadata_from_tags(
     let cuesheet_key = ItemKey::Unknown("CUESHEET".to_string());
 
     let mut meta = SourceMetadata::default();
+    meta.convert_preemphasis = convert_preemphasis_evidence_from_tags(tags);
     for tag in tags {
         if meta.title.is_none() {
             meta.title = tag.title().map(|s| s.to_string());

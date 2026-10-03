@@ -25,6 +25,7 @@ use super::types::{
     PreparedTrack, CueSegmentCarrier, RegisteredEffectCarrierRepresentation,
     SelectedPhysicalCandidateBinding, SourceAudioCoding, SourceKind, StageRequirement,
     TrackMetadata, TrackSelection, TrackSourceRef, CUE_ARTWORK_PATH_EXTRA_KEY, FALLBACK_RECOVERED_METADATA_EXTRA_KEY,
+    source_text_tag_key_from_extra, source_text_tags_indicate_pre_emphasis,
     STAGED_SOURCE_ARTWORK_PATH_EXTRA_KEY,
 };
 
@@ -476,34 +477,77 @@ fn plan_request_for_track_impl(
                 settings.ssrc.pdf_type = None;
             }
             if let Some((bit_depth, terminal_candidate)) = registered_effect_terminal {
-                if request.settings.target_format != tonepoet_pipeline::AudioFormat::Wav {
-                    return Err(ConvertError::Backend(format!(
-                        "registered-effect terminal carrier {} is a direct SSRC WAV realization but requested target is {:?}",
-                        terminal_candidate.identity, request.settings.target_format,
-                    )));
-                }
-                match terminal_candidate.terminal_realization.as_ref() {
+                let realization = match terminal_candidate.terminal_realization.as_ref() {
                     Some(tonepoet_pipeline::SelectedTerminalRealization::Pcm(realization))
-                        if realization.kind
-                            == tonepoet_pipeline::PcmTerminalRealizationKind::SsrcDirectWav
-                            && realization.target_bit_depth == bit_depth => {}
+                        if realization.selected_tool == tonepoet_pipeline::ToolIdentifier::Ssrc
+                            && realization.target_bit_depth == bit_depth
+                            && realization.target_format == request.settings.target_format
+                            && realization
+                                .target_rate_hz
+                                .map_or(true, |rate| rate == sample_rate_hz)
+                            && realization.wavpack_hybrid
+                                == (request.settings.target_format
+                                    == tonepoet_pipeline::AudioFormat::WavPack
+                                    && request.settings.wavpack.hybrid) => realization,
                     other => {
                         return Err(ConvertError::Backend(format!(
-                            "registered-effect terminal carrier {} lost its direct SSRC terminal binding: {:?}",
+                            "registered-effect terminal carrier {} lost its frozen SSRC terminal binding or target agreement: {:?}",
                             terminal_candidate.identity, other,
                         )))
                     }
-                }
-                // Sample realization is complete. Downstream work is a WAV
-                // payload-preserving copy plus orchestrator-owned metadata;
-                // none of the original sample-changing terminal settings may
-                // run again.
+                };
+
+                // SSRC has already realized the final sample values. The
+                // retained realization determines whether the downstream leg
+                // is a direct WAV delivery or one of the already-qualified
+                // lossless package-only continuations. Bind the legacy
+                // lowerer to that frozen package owner instead of consulting
+                // the user's mutable backend preference or running a new
+                // candidate search.
+                settings.preferred_tool = match realization.kind {
+                    tonepoet_pipeline::PcmTerminalRealizationKind::SsrcDirectWav => {
+                        if request.settings.target_format != tonepoet_pipeline::AudioFormat::Wav {
+                            return Err(ConvertError::Backend(format!(
+                                "registered-effect terminal carrier {} retained direct SSRC WAV ownership for non-WAV target {:?}",
+                                terminal_candidate.identity, request.settings.target_format,
+                            )));
+                        }
+                        // Preserve the historical direct-carrier behavior:
+                        // Phase 3 may copy the already-final WAV payload rather
+                        // than asking the planner to select SSRC again when no
+                        // resample remains to perform.
+                        PreferredTool::Auto
+                    }
+                    tonepoet_pipeline::PcmTerminalRealizationKind::SsrcPreterminalFfmpegPackage => {
+                        PreferredTool::Ffmpeg
+                    }
+                    tonepoet_pipeline::PcmTerminalRealizationKind::SsrcPreterminalSoxPackage => {
+                        PreferredTool::Sox
+                    }
+                    other => {
+                        return Err(ConvertError::Backend(format!(
+                            "registered-effect terminal carrier {} retained unsupported SSRC terminal realization {:?}",
+                            terminal_candidate.identity, other,
+                        )))
+                    }
+                };
+
+                // Sample realization is complete. Downstream work is either a
+                // payload-preserving direct WAV delivery or a package-only
+                // lossless encode. None of the original sample-changing
+                // terminal settings may run again.
                 settings.target_bit_depth = BitDepthTarget::Pcm(bit_depth);
                 settings.dither_type = tonepoet_pipeline::DitherType::None;
                 settings.dither_explicit = false;
+                settings.ssrc.force = false;
+                settings.ssrc.dither_id = None;
+                settings.ssrc.pdf_type = None;
                 settings.dsd.set_gain_policy(tonepoet_pipeline::SampleGainPolicy::Off);
                 settings.pcm_true_peak.set_policy(tonepoet_pipeline::SampleGainPolicy::Off);
-                settings.force_encode = false;
+                settings.force_encode = !matches!(
+                    realization.kind,
+                    tonepoet_pipeline::PcmTerminalRealizationKind::SsrcDirectWav
+                );
             }
             if let Some(bit_depth) = certified_ssrc_true_peak_terminal_depth {
                 // SSRC has already performed the certified resample, bound
@@ -741,6 +785,18 @@ fn plan_request_for_track_impl(
             }
         }
     }
+    // CD pre-emphasis playback signaling is meaningful only for the narrow
+    // lossless integer 16-bit/44.1-kHz preservation domain when correction was
+    // not applied. The post-encode metadata stage performs authoritative
+    // key/token filtering, but planner-owned source-tag passthrough must not
+    // bypass that policy (including requests whose metadata stage is disabled).
+    // Artwork remains independently eligible for planner transfer.
+    if settings.metadata.transfer_tags
+        && request_suppresses_cd_preemphasis_signaling(request, track, &source, &settings)
+    {
+        disable_planner_source_tag_transfer(&mut settings);
+    }
+
     if !selects_reference {
         settings
             .validate()
@@ -3123,6 +3179,77 @@ pub(super) fn resolve_source_pcm_depth(track: &PreparedTrack) -> Option<PcmBitDe
         })
 }
 
+
+fn request_applies_cd_deemphasis(request: &PipelineRequest) -> bool {
+    request.registered_effects.iter().any(|intent| {
+        matches!(
+            intent.effect,
+            tonepoet_pipeline::RegisteredUnaryEffect::CdDeemphasis
+        )
+    })
+}
+
+fn planner_output_preserves_cd_preemphasis_signaling_domain(
+    track: &PreparedTrack,
+    source: &SourceInfo,
+    settings: &PipelineSettings,
+) -> bool {
+    if !settings.target_format.is_pcm_lossless()
+        || (settings.target_format == PlannerFormat::WavPack && settings.wavpack.hybrid)
+    {
+        return false;
+    }
+
+    let target_rate_hz = match settings.target_sample_rate {
+        RateTarget::Source => source.sample_rate_hz.or_else(|| track.scalar_sample_rate()),
+        RateTarget::PcmHz(hz) => Some(hz),
+        RateTarget::Dsd(_) => None,
+    };
+    let target_depth = match settings.target_bit_depth {
+        BitDepthTarget::Source => resolve_source_pcm_depth(track).map(|source_depth| {
+            tonepoet_pipeline::source_pcm_depth_for_target(
+                &settings.target_format,
+                settings.wavpack.hybrid,
+                source_depth,
+            )
+        }),
+        BitDepthTarget::Pcm(depth) => Some(depth),
+    };
+
+    target_rate_hz == Some(44_100) && target_depth == Some(PcmBitDepth::Int16)
+}
+
+fn track_has_source_preemphasis_signaling(track: &PreparedTrack) -> bool {
+    track.metadata.pre_emphasis
+        || source_text_tags_indicate_pre_emphasis(&track.metadata.extra)
+        || track.metadata.extra.iter().any(|(key, value)| {
+            source_text_tag_key_from_extra(&track.metadata.extra, key, value).is_some_and(
+                |source_key| {
+                    let normalized = source_key
+                        .chars()
+                        .filter(|character| character.is_ascii_alphanumeric())
+                        .map(|character| character.to_ascii_lowercase())
+                        .collect::<String>();
+                    normalized == "cueflags"
+                        && value
+                            .split_ascii_whitespace()
+                            .any(|flag| flag.eq_ignore_ascii_case("PRE"))
+                },
+            )
+        })
+}
+
+fn request_suppresses_cd_preemphasis_signaling(
+    request: &PipelineRequest,
+    track: &PreparedTrack,
+    source: &SourceInfo,
+    settings: &PipelineSettings,
+) -> bool {
+    track_has_source_preemphasis_signaling(track)
+        && (request_applies_cd_deemphasis(request)
+            || !planner_output_preserves_cd_preemphasis_signaling_domain(track, source, settings))
+}
+
 /// Resolve the integer PCM working depth used when WavPack hybrid consumes a
 /// `BitDepthTarget::Source` request, including retained true-peak/fixed-gain
 /// carriers.
@@ -3542,6 +3669,121 @@ mod tests {
             strong_ssrc_resampler: None,
         }
     }
+
+    fn pcm_source_info(
+        format: PlannerFormat,
+        codec: tonepoet_pipeline::AudioCodec,
+        sample_rate_hz: u32,
+        bit_depth: tonepoet_pipeline::PcmBitDepth,
+    ) -> tonepoet_pipeline::SourceInfo {
+        tonepoet_pipeline::SourceInfo {
+            format,
+            codec,
+            sample_rate_hz: Some(sample_rate_hz),
+            bit_depth: Some(bit_depth),
+            true_source_depth: Some(bit_depth),
+            source_representation: tonepoet_pipeline::SourceRepresentationKind::Pcm,
+            sample_kind: Some(if bit_depth.is_float() {
+                tonepoet_pipeline::SampleKind::Float
+            } else {
+                tonepoet_pipeline::SampleKind::SignedInteger
+            }),
+            channels: Some(2),
+            duration: None,
+            frame_extent: None,
+            dsd_source_kind: None,
+            audio_md5: None,
+        }
+    }
+
+    fn cd_deemphasis_effect() -> EffectIntent {
+        EffectIntent {
+            id: EffectInstanceId(9001),
+            effect: RegisteredUnaryEffect::CdDeemphasis,
+            after: Vec::new(),
+            placement: EffectPlacement::SourceRate,
+        }
+    }
+
+    fn forced_ssrc_terminal_fixture(
+        root: &Path,
+        target_format: PlannerFormat,
+        output_name: &str,
+    ) -> (
+        PipelineRequest,
+        PathBuf,
+        PathBuf,
+        SelectedPhysicalCandidateBinding,
+    ) {
+        let source_path = root.join("source.flac");
+        let output = root.join(output_name);
+        let mut req = request(root);
+        req.settings.target_format = target_format;
+        req.settings.wavpack.hybrid = false;
+        req.settings.target_sample_rate = tonepoet_pipeline::RateTarget::PcmHz(88_200);
+        req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(
+            tonepoet_pipeline::PcmBitDepth::Int24,
+        );
+        req.settings.preferred_tool = PreferredTool::Ssrc;
+        req.settings.ssrc.force = true;
+        req.settings.dither_type = tonepoet_pipeline::DitherType::None;
+        req.settings.metadata.transfer_tags = false;
+        req.settings.metadata.preserve_artwork = false;
+        req.registered_effects = vec![cd_deemphasis_effect()];
+
+        let mut source_track = track(TrackSourceRef::StagedFile(source_path.clone()));
+        source_track.sample_rate = Some(44_100);
+        source_track.bit_depth = Some(16);
+        source_track.source_audio = SourceAudioDescriptor::from_scalar(
+            Some(44_100),
+            Some(16),
+            Some(SourceAudioCoding::Pcm),
+        );
+        let initial = super::plan_request_for_track_with_resolved_source(
+            &req,
+            &source_track,
+            &source_path,
+            &output,
+            root.join("initial-plan"),
+            pcm_source_info(
+                PlannerFormat::Flac,
+                tonepoet_pipeline::AudioCodec::Flac,
+                44_100,
+                tonepoet_pipeline::PcmBitDepth::Int16,
+            ),
+        )
+        .expect("initial registered-effect request");
+        let selected = super::registered_effect_execution_contract(
+            &initial,
+            &req.registered_effects,
+        )
+        .expect("registered-effect execution contract")
+        .resampler
+        .expect("forced SSRC rate change must retain selected resampler")
+        .selected;
+        (req, source_path, output, selected)
+    }
+
+    fn registered_terminal_carrier_ref(
+        carrier: PathBuf,
+        source_path: PathBuf,
+        terminal_candidate: SelectedPhysicalCandidateBinding,
+    ) -> TrackSourceRef {
+        TrackSourceRef::RegisteredEffectCarrier {
+            path: carrier,
+            source_path,
+            sample_rate_hz: 88_200,
+            channels: 2,
+            duration: None,
+            source_was_dsd: false,
+            resampler_consumed: true,
+            representation: RegisteredEffectCarrierRepresentation::TerminalPcmWav {
+                bit_depth: tonepoet_pipeline::PcmBitDepth::Int24,
+                terminal_candidate,
+            },
+        }
+    }
+
 
     fn cue_carrier(path: PathBuf, source_image: PathBuf, start_sample: u64, samples: u64) -> TrackSourceRef {
         TrackSourceRef::CueSegmentCarrier {
@@ -4100,6 +4342,310 @@ mod tests {
             planned.settings.target_bit_depth,
             tonepoet_pipeline::BitDepthTarget::Pcm(tonepoet_pipeline::PcmBitDepth::Int24)
         );
+    }
+
+    #[test]
+    fn r18_preemphasis_policy_blocks_raw_source_tag_passthrough_outside_preservation_domain() {
+        let temp = TempDir::new().expect("temp dir");
+        let input = temp.path().join("source.flac");
+        let output = temp.path().join("out.flac");
+        let mut req = request(temp.path());
+        req.settings.target_format = PlannerFormat::Flac;
+        req.settings.target_sample_rate = tonepoet_pipeline::RateTarget::PcmHz(44_100);
+        req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(
+            tonepoet_pipeline::PcmBitDepth::Int16,
+        );
+        req.settings.metadata.transfer_tags = true;
+        let mut prepared = track(TrackSourceRef::StagedFile(input.clone()));
+        prepared.sample_rate = Some(44_100);
+        prepared.bit_depth = Some(16);
+        prepared.source_audio = SourceAudioDescriptor::from_scalar(
+            Some(44_100),
+            Some(16),
+            Some(SourceAudioCoding::Pcm),
+        );
+        let source = tonepoet_pipeline::SourceInfo {
+            format: PlannerFormat::Flac,
+            codec: tonepoet_pipeline::AudioCodec::Flac,
+            sample_rate_hz: Some(44_100),
+            bit_depth: Some(tonepoet_pipeline::PcmBitDepth::Int16),
+            true_source_depth: Some(tonepoet_pipeline::PcmBitDepth::Int16),
+            source_representation: tonepoet_pipeline::SourceRepresentationKind::Pcm,
+            sample_kind: Some(tonepoet_pipeline::SampleKind::SignedInteger),
+            channels: Some(2),
+            duration: None,
+            frame_extent: None,
+            dsd_source_kind: None,
+            audio_md5: None,
+        };
+
+        let preservation = super::plan_request_for_track_with_resolved_source(
+            &req,
+            &prepared,
+            &input,
+            &output,
+            temp.path().join("work-preserve"),
+            source.clone(),
+        )
+        .expect("16/44.1 preservation plan request");
+        assert!(
+            preservation.settings.metadata.transfer_tags,
+            "uncorrected lossless integer 16/44.1 may preserve source playback signaling"
+        );
+
+        req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(
+            tonepoet_pipeline::PcmBitDepth::Int24,
+        );
+        let unrelated = super::plan_request_for_track_with_resolved_source(
+            &req,
+            &prepared,
+            &input,
+            &output,
+            temp.path().join("work-unrelated"),
+            source.clone(),
+        )
+        .expect("24/44.1 request without pre-emphasis signaling");
+        assert!(
+            unrelated.settings.metadata.transfer_tags,
+            "non-preservation alone must not suppress unrelated source-tag passthrough"
+        );
+
+        crate::convert::pipeline::types::insert_source_text_tag(
+            &mut prepared.metadata.extra,
+            "CUE_FLAGS",
+            "DCP PRE",
+        );
+        let raw_cue_flags = super::plan_request_for_track_with_resolved_source(
+            &req,
+            &prepared,
+            &input,
+            &output,
+            temp.path().join("work-raw-cue-flags"),
+            source.clone(),
+        )
+        .expect("24/44.1 request with raw CUE_FLAGS PRE signaling");
+        assert!(
+            !raw_cue_flags.settings.metadata.transfer_tags,
+            "raw CUE_FLAGS=PRE source provenance must not bypass target-aware playback-signaling suppression"
+        );
+        prepared.metadata.extra.clear();
+
+        prepared.metadata.pre_emphasis = true;
+        let rendered = super::plan_request_for_track_with_resolved_source(
+            &req,
+            &prepared,
+            &input,
+            &output,
+            temp.path().join("work-render"),
+            source.clone(),
+        )
+        .expect("24/44.1 non-preservation plan request with pre-emphasis signaling");
+        assert!(
+            !rendered.settings.metadata.transfer_tags,
+            "non-preservation output must not bypass target-aware pre-emphasis filtering with raw tag passthrough"
+        );
+
+        req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(
+            tonepoet_pipeline::PcmBitDepth::Int16,
+        );
+        req.registered_effects.push(EffectIntent {
+            id: EffectInstanceId(44),
+            effect: RegisteredUnaryEffect::CdDeemphasis,
+            after: Vec::new(),
+            placement: EffectPlacement::SourceRate,
+        });
+        let corrected = super::plan_request_for_track_with_resolved_source(
+            &req,
+            &prepared,
+            &input,
+            &output,
+            temp.path().join("work-corrected"),
+            source,
+        )
+        .expect("corrected 16/44.1 plan request");
+        assert!(
+            !corrected.settings.metadata.transfer_tags,
+            "successfully corrected output must not carry raw source pre-emphasis signaling through the encoder"
+        );
+    }
+
+    #[test]
+    fn r18_registered_effect_ssrc_flac_package_only_survives_phase3_bridge() {
+        let temp = TempDir::new().expect("temp dir");
+        let terminal_carrier = temp.path().join("registered-after-ssrc.wav");
+        let (req, source_path, output, selected) =
+            forced_ssrc_terminal_fixture(temp.path(), PlannerFormat::Flac, "out.flac");
+        let Some(tonepoet_pipeline::SelectedTerminalRealization::Pcm(realization)) =
+            selected.terminal_realization.as_ref()
+        else {
+            panic!("forced SSRC FLAC route must retain terminal realization")
+        };
+        assert_eq!(
+            realization.kind,
+            tonepoet_pipeline::PcmTerminalRealizationKind::SsrcPreterminalFfmpegPackage,
+        );
+
+        let mut terminal_track = track(registered_terminal_carrier_ref(
+            terminal_carrier.clone(),
+            source_path,
+            selected,
+        ));
+        terminal_track.sample_rate = Some(88_200);
+        terminal_track.bit_depth = Some(24);
+        terminal_track.source_audio = SourceAudioDescriptor::from_scalar(
+            Some(88_200),
+            Some(24),
+            Some(SourceAudioCoding::Pcm),
+        );
+        let downstream = super::plan_request_for_track_with_resolved_source(
+            &req,
+            &terminal_track,
+            &terminal_carrier,
+            &output,
+            temp.path().join("downstream-plan"),
+            pcm_source_info(
+                PlannerFormat::Wav,
+                tonepoet_pipeline::AudioCodec::PcmSigned,
+                88_200,
+                tonepoet_pipeline::PcmBitDepth::Int24,
+            ),
+        )
+        .expect("SSRC FLAC package-only carrier must cross Phase-3 bridge");
+
+        assert_eq!(downstream.settings.preferred_tool, PreferredTool::Ffmpeg);
+        assert!(!downstream.settings.ssrc.force);
+        assert_eq!(
+            downstream.settings.dither_type,
+            tonepoet_pipeline::DitherType::None,
+        );
+        assert!(downstream.settings.force_encode);
+
+        let plan = tonepoet_pipeline::plan_conversion(&downstream)
+            .expect("downstream FFmpeg package-only plan");
+        let PlanAction::Execute { commands, .. } = plan.action else {
+            panic!("FLAC package-only continuation must execute")
+        };
+        assert_eq!(commands.len(), 1, "downstream must contain only the package step");
+        let package = &commands[0];
+        assert_eq!(package.tool, tonepoet_pipeline::ToolIdentifier::Ffmpeg);
+        assert!(!package.args.iter().any(|arg| arg == "-af" || arg == "-ar"));
+        assert!(!package.args.iter().any(|arg| arg.contains("dither_method=")));
+        assert!(!package.args.iter().any(|arg| arg == "--dither" || arg == "dither"));
+    }
+
+    #[test]
+    fn r18_registered_effect_ssrc_wavpack_package_only_survives_phase3_bridge() {
+        let temp = TempDir::new().expect("temp dir");
+        let terminal_carrier = temp.path().join("registered-after-ssrc.wav");
+        let (req, source_path, output, selected) =
+            forced_ssrc_terminal_fixture(temp.path(), PlannerFormat::WavPack, "out.wv");
+        let Some(tonepoet_pipeline::SelectedTerminalRealization::Pcm(realization)) =
+            selected.terminal_realization.as_ref()
+        else {
+            panic!("forced SSRC WavPack route must retain terminal realization")
+        };
+        assert_eq!(
+            realization.kind,
+            tonepoet_pipeline::PcmTerminalRealizationKind::SsrcPreterminalSoxPackage,
+        );
+
+        let mut terminal_track = track(registered_terminal_carrier_ref(
+            terminal_carrier.clone(),
+            source_path,
+            selected,
+        ));
+        terminal_track.sample_rate = Some(88_200);
+        terminal_track.bit_depth = Some(24);
+        terminal_track.source_audio = SourceAudioDescriptor::from_scalar(
+            Some(88_200),
+            Some(24),
+            Some(SourceAudioCoding::Pcm),
+        );
+        let downstream = super::plan_request_for_track_with_resolved_source(
+            &req,
+            &terminal_track,
+            &terminal_carrier,
+            &output,
+            temp.path().join("downstream-plan"),
+            pcm_source_info(
+                PlannerFormat::Wav,
+                tonepoet_pipeline::AudioCodec::PcmSigned,
+                88_200,
+                tonepoet_pipeline::PcmBitDepth::Int24,
+            ),
+        )
+        .expect("SSRC WavPack package-only carrier must cross Phase-3 bridge");
+
+        assert_eq!(downstream.settings.preferred_tool, PreferredTool::Sox);
+        assert!(!downstream.settings.ssrc.force);
+        assert_eq!(
+            downstream.settings.dither_type,
+            tonepoet_pipeline::DitherType::None,
+        );
+        assert!(downstream.settings.force_encode);
+
+        let plan = tonepoet_pipeline::plan_conversion(&downstream)
+            .expect("downstream SoX package-only plan");
+        let PlanAction::Execute { commands, .. } = plan.action else {
+            panic!("WavPack package-only continuation must execute")
+        };
+        assert_eq!(commands.len(), 1, "downstream must contain only the package step");
+        let package = &commands[0];
+        assert_eq!(package.tool, tonepoet_pipeline::ToolIdentifier::Sox);
+        assert!(!package.args.iter().any(|arg| arg == "-r" || arg == "rate"));
+        assert!(!package.args.iter().any(|arg| arg == "dither"));
+        assert_eq!(
+            package.args.last().map(String::as_str),
+            package.output.as_path().map(|path| path.to_string_lossy()).as_deref(),
+            "SoX package-only command must end at the output path with no effects appended",
+        );
+    }
+
+    #[test]
+    fn r18_registered_effect_ssrc_direct_wav_bridge_behavior_is_unchanged() {
+        let temp = TempDir::new().expect("temp dir");
+        let terminal_carrier = temp.path().join("registered-after-ssrc.wav");
+        let (req, source_path, output, selected) =
+            forced_ssrc_terminal_fixture(temp.path(), PlannerFormat::Wav, "out.wav");
+        let Some(tonepoet_pipeline::SelectedTerminalRealization::Pcm(realization)) =
+            selected.terminal_realization.as_ref()
+        else {
+            panic!("forced SSRC WAV route must retain terminal realization")
+        };
+        assert_eq!(
+            realization.kind,
+            tonepoet_pipeline::PcmTerminalRealizationKind::SsrcDirectWav,
+        );
+
+        let mut terminal_track = track(registered_terminal_carrier_ref(
+            terminal_carrier.clone(),
+            source_path,
+            selected,
+        ));
+        terminal_track.sample_rate = Some(88_200);
+        terminal_track.bit_depth = Some(24);
+        terminal_track.source_audio = SourceAudioDescriptor::from_scalar(
+            Some(88_200),
+            Some(24),
+            Some(SourceAudioCoding::Pcm),
+        );
+        let downstream = super::plan_request_for_track_with_resolved_source(
+            &req,
+            &terminal_track,
+            &terminal_carrier,
+            &output,
+            temp.path().join("downstream-plan"),
+            pcm_source_info(
+                PlannerFormat::Wav,
+                tonepoet_pipeline::AudioCodec::PcmSigned,
+                88_200,
+                tonepoet_pipeline::PcmBitDepth::Int24,
+            ),
+        )
+        .expect("direct SSRC WAV carrier must retain historical bridge behavior");
+        assert_eq!(downstream.settings.preferred_tool, PreferredTool::Auto);
+        assert!(!downstream.settings.force_encode);
+        assert!(!downstream.settings.ssrc.force);
     }
 
     #[test]

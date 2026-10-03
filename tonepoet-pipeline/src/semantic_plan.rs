@@ -639,6 +639,9 @@ pub enum RegisteredUnaryEffect {
         /// Low-pass cutoff frequency in hertz.
         frequency_hz: u32,
     },
+    /// Backend-neutral Red Book CD de-emphasis intent. Physical planning may
+    /// realize this with a qualified SoX-ng or FFmpeg candidate.
+    CdDeemphasis,
 }
 
 /// Placement of a registered effect relative to the one semantic PCM resampler.
@@ -648,8 +651,13 @@ pub enum EffectPlacement {
     /// Run after the PCM resampler. This is the historical/default behavior.
     #[default]
     AfterPcmResample,
-    /// Run before the PCM resampler.
+    /// Run before the PCM resampler. This remains strict: a request using
+    /// this historical placement is invalid when no semantic PCM resampler is
+    /// present.
     BeforePcmResample,
+    /// Run at the source rate before the one PCM resampler when present, or
+    /// before terminal encoding when no rate conversion is required.
+    SourceRate,
 }
 
 /// One effect instance plus explicit predecessor constraints.
@@ -1310,7 +1318,12 @@ pub enum TypedPlanNode {
         output: SignalId,
         /// Effect instance realized by this node.
         instance: EffectIntent,
-        /// Physical lowering selected for this effect.
+        /// Qualified physical candidates in deterministic order. Historical
+        /// tool-specific effects carry exactly one candidate.
+        candidates: Vec<EffectLowering>,
+        /// Selected candidate index within `candidates`.
+        selected_candidate: usize,
+        /// Exact selected lowering retained for the existing Phase-3 bridge.
         lowering: EffectLowering,
     },
     /// Explicit DSD reconstruction export-level boundary.
@@ -1679,6 +1692,10 @@ struct CandidateSearchPolicy {
     strip_terminal_proof_for_tool: Option<ToolIdentifier>,
     #[cfg(test)]
     ssrc_binary64_evidence_override: Option<TestBinary64SsrcEvidenceOverride>,
+    #[cfg(test)]
+    unavailable_effect_tool: Option<ToolIdentifier>,
+    #[cfg(test)]
+    forced_effect_tool: Option<ToolIdentifier>,
 }
 
 #[cfg(test)]
@@ -1697,6 +1714,10 @@ impl Default for CandidateSearchPolicy {
             strip_terminal_proof_for_tool: None,
             #[cfg(test)]
             ssrc_binary64_evidence_override: None,
+            #[cfg(test)]
+            unavailable_effect_tool: None,
+            #[cfg(test)]
+            forced_effect_tool: None,
         }
     }
 }
@@ -1913,15 +1934,22 @@ fn resolved_runtime_album_gain(request: &PlanRequest) -> Result<Option<DbNano>, 
     }
 }
 
-fn append_registered_effect_segment(
+#[derive(Debug, Clone)]
+struct PreparedRegisteredEffectNode {
+    input: SignalId,
+    output: SignalId,
+    instance: EffectIntent,
+    candidates: Vec<EffectLowering>,
+}
+
+fn prepare_registered_effect_segment(
     states: &mut Vec<AudioState>,
-    nodes: &mut Vec<TypedPlanNode>,
     next_signal: &mut u32,
     working_signal: &mut SignalId,
     effects: &[EffectIntent],
-) -> Result<(), PlanRefusal> {
+) -> Result<Vec<PreparedRegisteredEffectNode>, PlanRefusal> {
     if effects.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     if !matches!(
         states
@@ -1937,8 +1965,9 @@ fn append_registered_effect_segment(
         });
     }
 
+    let mut prepared = Vec::with_capacity(effects.len());
     for instance in effects {
-        let lowering = lower_registered_effect(&instance.effect)?;
+        let candidates = registered_effect_candidates(&instance.effect)?;
         let input_state = states
             .iter()
             .find(|state| state.id == *working_signal)
@@ -1957,8 +1986,7 @@ fn append_registered_effect_segment(
                 instance.id.0
             )),
             programme: input_state.programme,
-            // The registered effect realizer writes a Float64 carrier. Do not
-            // inherit an integer source width or a source storage contract.
+            // The common registered-effect realizer writes a Float64 carrier.
             precision: StoragePrecision::Pcm(PcmBitDepth::Float64),
             storage_contract: Fact::Pending(format!(
                 "effect.{}.float64_carrier",
@@ -1975,15 +2003,169 @@ fn append_registered_effect_segment(
             claims: BTreeSet::new(),
             obligations: input_state.obligations,
         });
-        nodes.push(TypedPlanNode::ApplyEffect {
+        prepared.push(PreparedRegisteredEffectNode {
             input: *working_signal,
             output: effected,
             instance: instance.clone(),
-            lowering,
+            candidates,
         });
         *working_signal = effected;
     }
+    Ok(prepared)
+}
+
+fn selected_registered_effect_candidate(
+    request: &PlanRequest,
+    effect: &RegisteredUnaryEffect,
+    candidates: &[EffectLowering],
+    adjacent_tool: Option<&ToolIdentifier>,
+    search_policy: &CandidateSearchPolicy,
+    require_protected_true_peak: bool,
+) -> Result<usize, PlanRefusal> {
+    if candidates.is_empty() {
+        return Err(PlanRefusal {
+            code: "effect_candidate_unavailable".to_owned(),
+            reason: "registered effect has no qualified physical candidate".to_owned(),
+        });
+    }
+
+    // R18 requires candidate-level qualification for the backend-neutral CD
+    // de-emphasis effect. Preserve the historical protected-route admission
+    // behavior for older tool-specific effects so existing true-peak refusal
+    // codes and SSRC proof flow remain stable.
+    #[cfg(not(test))]
+    let _ = search_policy;
+
+    let require_candidate_protection = require_protected_true_peak
+        && matches!(effect, RegisteredUnaryEffect::CdDeemphasis);
+    let contract_qualified = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| {
+            !require_candidate_protection
+                || effect_contract_preserves_protected_true_peak_input(&candidate.contract)
+        })
+        .collect::<Vec<_>>();
+    if contract_qualified.is_empty() {
+        return Err(PlanRefusal {
+            code: "protected_pre_resample_effect_unqualified".to_owned(),
+            reason: format!(
+                "registered effect {effect:?} has no physical candidate with the protected Binary64 overload-preservation contract required before certified true-peak observation"
+            ),
+        });
+    }
+
+    #[cfg(test)]
+    let usable = contract_qualified
+        .into_iter()
+        .filter(|(_, candidate)| {
+            search_policy
+                .unavailable_effect_tool
+                .as_ref()
+                .is_none_or(|tool| &candidate.tool != tool)
+        })
+        .collect::<Vec<_>>();
+    #[cfg(not(test))]
+    let usable = contract_qualified;
+
+    if usable.is_empty() {
+        return Err(PlanRefusal {
+            code: "effect_candidate_unavailable".to_owned(),
+            reason: "all registered physical candidates for the effect are unavailable or unqualified"
+                .to_owned(),
+        });
+    }
+
+    // A planner test may force one backend to exercise candidate fallback. The
+    // production policy has no user-facing de-emphasis-backend selector.
+    #[cfg(test)]
+    if let Some(forced) = search_policy.forced_effect_tool.as_ref() {
+        return usable
+            .iter()
+            .find(|(_, candidate)| &candidate.tool == forced)
+            .map(|(index, _)| *index)
+            .ok_or_else(|| PlanRefusal {
+                code: "forced_effect_candidate_unavailable".to_owned(),
+                reason: format!("forced registered-effect backend {forced} is unavailable"),
+            });
+    }
+
+    // Preserve the existing explicit backend preference when it names a
+    // qualified effect backend. This outranks process-count affinity.
+    if !matches!(request.settings.preferred_tool, PreferredTool::Auto) {
+        if let Some((index, _)) = usable.iter().find(|(_, candidate)| {
+            candidate.tool.matches_preference(&request.settings.preferred_tool)
+        }) {
+            return Ok(*index);
+        }
+    }
+
+    // Otherwise prefer the already-frozen adjacent physical owner as a
+    // handoff-minimizing tie-breaker. Correctness/qualification is encoded by
+    // the candidate set itself; affinity never changes the semantic route.
+    if let Some(adjacent_tool) = adjacent_tool {
+        if let Some((index, _)) = usable
+            .iter()
+            .find(|(_, candidate)| &candidate.tool == adjacent_tool)
+        {
+            return Ok(*index);
+        }
+    }
+
+    // Candidate enumeration is stable; use its first qualified member.
+    Ok(usable[0].0)
+}
+
+fn commit_registered_effect_segment(
+    nodes: &mut Vec<TypedPlanNode>,
+    prepared: Vec<PreparedRegisteredEffectNode>,
+    request: &PlanRequest,
+    search_policy: &CandidateSearchPolicy,
+    adjacent_tool: Option<&ToolIdentifier>,
+    require_protected_true_peak: bool,
+) -> Result<(), PlanRefusal> {
+    for prepared in prepared {
+        let selected_candidate = selected_registered_effect_candidate(
+            request,
+            &prepared.instance.effect,
+            &prepared.candidates,
+            adjacent_tool,
+            search_policy,
+            require_protected_true_peak,
+        )?;
+        let lowering = prepared.candidates[selected_candidate].clone();
+        nodes.push(TypedPlanNode::ApplyEffect {
+            input: prepared.input,
+            output: prepared.output,
+            instance: prepared.instance,
+            candidates: prepared.candidates,
+            selected_candidate,
+            lowering,
+        });
+    }
     Ok(())
+}
+
+fn append_registered_effect_segment(
+    states: &mut Vec<AudioState>,
+    nodes: &mut Vec<TypedPlanNode>,
+    next_signal: &mut u32,
+    working_signal: &mut SignalId,
+    effects: &[EffectIntent],
+    request: &PlanRequest,
+    search_policy: &CandidateSearchPolicy,
+    adjacent_tool: Option<&ToolIdentifier>,
+    require_protected_true_peak: bool,
+) -> Result<(), PlanRefusal> {
+    let prepared = prepare_registered_effect_segment(states, next_signal, working_signal, effects)?;
+    commit_registered_effect_segment(
+        nodes,
+        prepared,
+        request,
+        search_policy,
+        adjacent_tool,
+        require_protected_true_peak,
+    )
 }
 
 /// Immediate SSRC output contract resolved before terminal/package lowering.
@@ -2580,15 +2762,21 @@ fn plan_typed_with_effects_and_policy(
         let target_rate = target_pcm_rate_fact(request);
         match (current_rate, target_rate) {
             (Fact::Known(current), Fact::Known(target)) if current != target => {
-                if let Err(refusal) = append_registered_effect_segment(
-                    &mut states,
-                    &mut nodes,
-                    &mut next_signal,
-                    &mut working_signal,
-                    &pre_resample_effects,
-                ) {
-                    return Ok(PlanningOutcome::Refused(refusal));
-                }
+                // Source-rate effects alter the typed input state before the
+                // semantic resampler, but physical effect selection is deferred
+                // until that resampler's candidate has been frozen. This lets a
+                // backend-neutral effect use adjacent-tool affinity without
+                // changing the requested resampler.
+                let prepared_pre_resample_effects =
+                    match prepare_registered_effect_segment(
+                        &mut states,
+                        &mut next_signal,
+                        &mut working_signal,
+                        &pre_resample_effects,
+                    ) {
+                        Ok(prepared) => prepared,
+                        Err(refusal) => return Ok(PlanningOutcome::Refused(refusal)),
+                    };
                 if !pre_resample_effects.is_empty() {
                     capability = ExecutionCapability::ExecutableByPhase3CommonRealizer;
                 }
@@ -2866,26 +3054,46 @@ fn plan_typed_with_effects_and_policy(
                     }
                     Err(CandidateSelectionError::Resource(limit)) => return Err(limit),
                 };
+                let selected_resampler_tool = candidates[selected_candidate].tool.clone();
+
+                // Retain the pre-R18 protected-route rule for historical
+                // tool-specific pre-resample effects. CD de-emphasis is
+                // additionally checked candidate-by-candidate in
+                // `selected_registered_effect_candidate`, including SSRC
+                // routes, because neither current lowering owns the required
+                // protected Binary64/overload-preservation proof.
                 if pcm_hard_ceiling_resampler
                     && !pre_resample_effects.is_empty()
-                    && candidates[selected_candidate].tool.as_ref() != Some(&ToolIdentifier::Ssrc)
+                    && selected_resampler_tool.as_ref() != Some(&ToolIdentifier::Ssrc)
                 {
-                    for effect in &pre_resample_effects {
-                        let lowering = match lower_registered_effect(&effect.effect) {
-                            Ok(lowering) => lowering,
-                            Err(refusal) => return Ok(PlanningOutcome::Refused(refusal)),
-                        };
+                    for prepared in &prepared_pre_resample_effects {
+                        if matches!(prepared.instance.effect, RegisteredUnaryEffect::CdDeemphasis) {
+                            continue;
+                        }
+                        let lowering = &prepared.candidates[0];
                         if !effect_contract_preserves_protected_true_peak_input(&lowering.contract) {
                             return Ok(PlanningOutcome::Refused(PlanRefusal {
                                 code: "protected_pre_resample_effect_unqualified".to_owned(),
                                 reason: format!(
                                     "registered effect {:?} does not carry its own protected Binary64 overload-preservation contract before the certified hard-ceiling resampler",
-                                    effect.effect
+                                    prepared.instance.effect
                                 ),
                             }));
                         }
                     }
                 }
+
+                if let Err(refusal) = commit_registered_effect_segment(
+                    &mut nodes,
+                    prepared_pre_resample_effects,
+                    request,
+                    search_policy,
+                    selected_resampler_tool.as_ref(),
+                    true_peak_policy(intent.gain_policy).is_some(),
+                ) {
+                    return Ok(PlanningOutcome::Refused(refusal));
+                }
+
                 if current_route.is_some()
                     && candidates[selected_candidate].tool.as_ref() != current_route.as_ref()
                     && capability == ExecutionCapability::ExecutableNow
@@ -2960,12 +3168,31 @@ fn plan_typed_with_effects_and_policy(
                 working_signal = resampled;
             }
             (Fact::Known(current), Fact::Known(target)) if current == target => {
-                if !pre_resample_effects.is_empty() {
+                let has_strict_before_effect = pre_resample_effects
+                    .iter()
+                    .any(|effect| effect.placement == EffectPlacement::BeforePcmResample);
+                if has_strict_before_effect {
                     return Ok(PlanningOutcome::Refused(PlanRefusal {
                         code: "effect_before_resample_without_resample".to_owned(),
                         reason: "BeforePcmResample effect placement requires an actual PCM sample-rate conversion"
                             .to_owned(),
                     }));
+                }
+                if let Err(refusal) = append_registered_effect_segment(
+                    &mut states,
+                    &mut nodes,
+                    &mut next_signal,
+                    &mut working_signal,
+                    &pre_resample_effects,
+                    request,
+                    search_policy,
+                    None,
+                    true_peak_policy(intent.gain_policy).is_some(),
+                ) {
+                    return Ok(PlanningOutcome::Refused(refusal));
+                }
+                if !pre_resample_effects.is_empty() {
+                    capability = ExecutionCapability::ExecutableByPhase3CommonRealizer;
                 }
             }
             (Fact::Pending(key), Fact::Known(_)) => {
@@ -2990,7 +3217,10 @@ fn plan_typed_with_effects_and_policy(
         }
     }
 
-    if !pre_resample_effects.is_empty() && !pcm_resample_inserted {
+    let has_strict_before_effect = pre_resample_effects
+        .iter()
+        .any(|effect| effect.placement == EffectPlacement::BeforePcmResample);
+    if has_strict_before_effect && !pcm_resample_inserted {
         return Ok(PlanningOutcome::Refused(PlanRefusal {
             code: "effect_before_resample_without_resample".to_owned(),
             reason: "BeforePcmResample effect placement requires an actual PCM sample-rate conversion"
@@ -3031,6 +3261,10 @@ fn plan_typed_with_effects_and_policy(
         &mut next_signal,
         &mut working_signal,
         &post_resample_effects,
+        request,
+        search_policy,
+        None,
+        false,
     ) {
         return Ok(PlanningOutcome::Refused(refusal));
     }
@@ -5086,13 +5320,13 @@ fn validate_effect_dependencies(
                     ),
                 });
             };
-            if effect.placement == EffectPlacement::BeforePcmResample
+            if effect.placement != EffectPlacement::AfterPcmResample
                 && predecessor.placement == EffectPlacement::AfterPcmResample
             {
                 return Err(PlanRefusal {
                     code: "effect_dependency_crosses_resampler_backwards".to_owned(),
                     reason: format!(
-                        "pre-resample effect instance {} cannot depend on post-resample instance {}",
+                        "source/pre-resample effect instance {} cannot depend on post-resample instance {}",
                         effect.id.0, dependency.0,
                     ),
                 });
@@ -5102,74 +5336,62 @@ fn validate_effect_dependencies(
     Ok(by_id)
 }
 
-fn strict_order_effect_partition(
-    effects: &[EffectIntent],
-    placement: EffectPlacement,
-    by_id: &BTreeMap<EffectInstanceId, &EffectIntent>,
-) -> Result<Vec<EffectIntent>, PlanRefusal> {
-    let members = effects
-        .iter()
-        .filter(|effect| effect.placement == placement)
-        .map(|effect| effect.id)
-        .collect::<BTreeSet<_>>();
-    let mut emitted = BTreeSet::new();
-    let mut ordered = Vec::with_capacity(members.len());
-    while ordered.len() < members.len() {
-        let ready = members
-            .iter()
-            .filter(|id| !emitted.contains(*id))
-            .filter(|id| {
-                let effect = by_id.get(id).expect("partition effect must exist");
-                effect.after.iter().all(|dependency| {
-                    // A post-resample dependency on a pre-resample effect is
-                    // satisfied by crossing the resampler barrier. Dependencies
-                    // inside this partition still participate in strict order.
-                    !members.contains(dependency) || emitted.contains(dependency)
-                })
-            })
-            .copied()
-            .collect::<Vec<_>>();
-        match ready.as_slice() {
-            [] => {
-                return Err(PlanRefusal {
-                    code: "effect_order_cycle".to_owned(),
-                    reason: "registered effect ordering constraints contain a cycle".to_owned(),
-                });
-            }
-            [id] => {
-                emitted.insert(*id);
-                ordered.push((**by_id.get(id).expect("ready effect must exist")).clone());
-            }
-            _ => {
-                return Err(PlanRefusal {
-                    code: "ambiguous_effect_order".to_owned(),
-                    reason: format!(
-                        "effect instances {:?} are simultaneously unordered within {:?}; declare their relative order explicitly",
-                        ready.iter().map(|id| id.0).collect::<Vec<_>>(),
-                        placement,
-                    ),
-                });
-            }
-        }
-    }
-    Ok(ordered)
-}
-
 fn order_registered_effect_partitions(
     effects: &[EffectIntent],
 ) -> Result<(Vec<EffectIntent>, Vec<EffectIntent>), PlanRefusal> {
     let by_id = validate_effect_dependencies(effects)?;
-    let before = strict_order_effect_partition(
-        effects,
-        EffectPlacement::BeforePcmResample,
-        &by_id,
-    )?;
-    let after = strict_order_effect_partition(
-        effects,
-        EffectPlacement::AfterPcmResample,
-        &by_id,
-    )?;
-    Ok((before, after))
+    let pre_members = effects
+        .iter()
+        .filter(|effect| effect.placement != EffectPlacement::AfterPcmResample)
+        .map(|effect| effect.id)
+        .collect::<BTreeSet<_>>();
+    let post_members = effects
+        .iter()
+        .filter(|effect| effect.placement == EffectPlacement::AfterPcmResample)
+        .map(|effect| effect.id)
+        .collect::<BTreeSet<_>>();
+
+    let strict_order = |members: &BTreeSet<EffectInstanceId>| -> Result<Vec<EffectIntent>, PlanRefusal> {
+        let mut emitted = BTreeSet::new();
+        let mut ordered = Vec::with_capacity(members.len());
+        while ordered.len() < members.len() {
+            let ready = members
+                .iter()
+                .filter(|id| !emitted.contains(*id))
+                .filter(|id| {
+                    let effect = by_id.get(id).expect("partition effect must exist");
+                    effect.after.iter().all(|dependency| {
+                        !members.contains(dependency) || emitted.contains(dependency)
+                    })
+                })
+                .copied()
+                .collect::<Vec<_>>();
+            match ready.as_slice() {
+                [] => {
+                    return Err(PlanRefusal {
+                        code: "effect_order_cycle".to_owned(),
+                        reason: "registered effect ordering constraints contain a cycle".to_owned(),
+                    });
+                }
+                [id] => {
+                    emitted.insert(*id);
+                    ordered.push((**by_id.get(id).expect("ready effect must exist")).clone());
+                }
+                _ => {
+                    return Err(PlanRefusal {
+                        code: "ambiguous_effect_order".to_owned(),
+                        reason: format!(
+                            "effect instances {:?} are simultaneously unordered within one resampler-barrier partition; declare their relative order explicitly",
+                            ready.iter().map(|id| id.0).collect::<Vec<_>>(),
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(ordered)
+    };
+
+    Ok((strict_order(&pre_members)?, strict_order(&post_members)?))
 }
 
 /// Resolve effect constraints to one deterministic semantic order.
@@ -5199,31 +5421,53 @@ fn effect_contract_preserves_protected_true_peak_input(contract: &TransformContr
         && contract.representation.emitted_value_domain == Some(ValueDomain::FiniteFloating)
 }
 
-/// Validate and lower one registered effect to its actual tool argument surface.
-pub fn lower_registered_effect(effect: &RegisteredUnaryEffect) -> Result<EffectLowering, PlanRefusal> {
+/// Enumerate qualified physical lowerings for one registered effect.
+///
+/// Historical tool-specific effects intentionally retain a singleton candidate
+/// set. `CdDeemphasis` is backend-neutral and exposes both built-in physical
+/// realizations; planner selection occurs only after adjacent route context is
+/// available.
+pub fn registered_effect_candidates(
+    effect: &RegisteredUnaryEffect,
+) -> Result<Vec<EffectLowering>, PlanRefusal> {
     let plain = TransformContract::plain_transform();
-    match effect {
+    let deemphasis_contract = || TransformContract {
+        representation: BoundaryRepresentationContract {
+            accepted_processing_domains: all_pcm_processing_domains(),
+            accepted_value_domains: all_pcm_value_domains(),
+            emitted_processing_domain: Some(ProcessingDomain::PcmFloating),
+            emitted_precision: Some(StoragePrecision::Pcm(PcmBitDepth::Float64)),
+            emitted_value_domain: Some(ValueDomain::FiniteFloating),
+        },
+        terminal_realization: None,
+        terminal_proof: None,
+        carries_claims: BTreeSet::new(),
+        produces_claims: BTreeSet::new(),
+        signal_equivalent_for: BTreeSet::new(),
+        runtime_obligations: BTreeSet::new(),
+    };
+    let candidates = match effect {
         RegisteredUnaryEffect::SoxHighPass { frequency_hz } => {
             validate_effect_frequency(*frequency_hz)?;
-            Ok(EffectLowering {
+            vec![EffectLowering {
                 tool: ToolIdentifier::Sox,
                 arguments: EffectArgumentMapping::SoxEffect(vec![
                     "highpass".to_owned(),
                     frequency_hz.to_string(),
                 ]),
                 contract: plain,
-            })
+            }]
         }
         RegisteredUnaryEffect::SoxLowPass { frequency_hz } => {
             validate_effect_frequency(*frequency_hz)?;
-            Ok(EffectLowering {
+            vec![EffectLowering {
                 tool: ToolIdentifier::Sox,
                 arguments: EffectArgumentMapping::SoxEffect(vec![
                     "lowpass".to_owned(),
                     frequency_hz.to_string(),
                 ]),
                 contract: plain,
-            })
+            }]
         }
         RegisteredUnaryEffect::SoxSamplePeakNormalize { target_dbfs } => {
             if !(DbNano::MIN_NORMALIZE_TARGET..=DbNano::MAX_NORMALIZE_TARGET).contains(target_dbfs) {
@@ -5232,32 +5476,59 @@ pub fn lower_registered_effect(effect: &RegisteredUnaryEffect) -> Result<EffectL
                     reason: "sample-peak normalize target must be between -12.0 and 0.0 dBFS".to_owned(),
                 });
             }
-            Ok(EffectLowering {
+            vec![EffectLowering {
                 tool: ToolIdentifier::Sox,
                 arguments: EffectArgumentMapping::SoxEffect(vec![
                     "norm".to_owned(),
                     target_dbfs.render(false),
                 ]),
                 contract: plain,
-            })
+            }]
         }
         RegisteredUnaryEffect::FfmpegHighPass { frequency_hz } => {
             validate_effect_frequency(*frequency_hz)?;
-            Ok(EffectLowering {
+            vec![EffectLowering {
                 tool: ToolIdentifier::Ffmpeg,
                 arguments: EffectArgumentMapping::FfmpegAudioFilter(format!("highpass=f={frequency_hz}")),
                 contract: plain,
-            })
+            }]
         }
         RegisteredUnaryEffect::FfmpegLowPass { frequency_hz } => {
             validate_effect_frequency(*frequency_hz)?;
-            Ok(EffectLowering {
+            vec![EffectLowering {
                 tool: ToolIdentifier::Ffmpeg,
                 arguments: EffectArgumentMapping::FfmpegAudioFilter(format!("lowpass=f={frequency_hz}")),
                 contract: plain,
-            })
+            }]
         }
-    }
+        RegisteredUnaryEffect::CdDeemphasis => vec![
+            EffectLowering {
+                tool: ToolIdentifier::Sox,
+                arguments: EffectArgumentMapping::SoxEffect(vec!["deemph".to_owned()]),
+                contract: deemphasis_contract(),
+            },
+            EffectLowering {
+                tool: ToolIdentifier::Ffmpeg,
+                arguments: EffectArgumentMapping::FfmpegAudioFilter(
+                    "aemphasis=mode=reproduction:type=cd".to_owned(),
+                ),
+                contract: deemphasis_contract(),
+            },
+        ],
+    };
+    Ok(candidates)
+}
+
+/// Compatibility helper returning the deterministic first registered lowering.
+/// New planner code should retain the candidate set and select explicitly.
+pub fn lower_registered_effect(effect: &RegisteredUnaryEffect) -> Result<EffectLowering, PlanRefusal> {
+    registered_effect_candidates(effect)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| PlanRefusal {
+            code: "effect_candidate_unavailable".to_owned(),
+            reason: "registered effect has no physical lowering".to_owned(),
+        })
 }
 
 fn validate_effect_frequency(frequency_hz: u32) -> Result<(), PlanRefusal> {
@@ -7052,6 +7323,8 @@ mod tests {
             forced_tool: Some(ToolIdentifier::Ffmpeg),
             strip_terminal_proof_for_tool: None,
             ssrc_binary64_evidence_override: None,
+            unavailable_effect_tool: None,
+            forced_effect_tool: None,
         };
         match plan_typed_with_effects_and_policy(&request, &[], &forced) {
             Ok(PlanningOutcome::Ready(_)) if ffmpeg_int32_triangular_terminal_commissioned_for_current_arch() => {}
@@ -7144,6 +7417,8 @@ mod tests {
                 forced_tool: Some(ToolIdentifier::Ffmpeg),
                 strip_terminal_proof_for_tool: None,
                 ssrc_binary64_evidence_override: None,
+                unavailable_effect_tool: None,
+                forced_effect_tool: None,
             };
             let Ok(PlanningOutcome::Refused(refusal)) =
                 plan_typed_with_effects_and_policy(&request, &[], &forced)
@@ -7168,6 +7443,8 @@ mod tests {
             forced_tool: None,
             strip_terminal_proof_for_tool: Some(ToolIdentifier::Sox),
             ssrc_binary64_evidence_override: None,
+            unavailable_effect_tool: None,
+            forced_effect_tool: None,
         };
         let Ok(PlanningOutcome::Ready(plan)) =
             plan_typed_with_effects_and_policy(&request, &[], &search)
@@ -7191,6 +7468,8 @@ mod tests {
             forced_tool: Some(ToolIdentifier::Sox),
             strip_terminal_proof_for_tool: Some(ToolIdentifier::Sox),
             ssrc_binary64_evidence_override: None,
+            unavailable_effect_tool: None,
+            forced_effect_tool: None,
         };
         let Ok(PlanningOutcome::Refused(refusal)) =
             plan_typed_with_effects_and_policy(&request, &[], &forced)
@@ -7301,6 +7580,8 @@ mod tests {
                     scope: scope.clone(),
                     evidence: established(scope),
                 }),
+                unavailable_effect_tool: None,
+                forced_effect_tool: None,
             }
         }
 
@@ -7506,6 +7787,8 @@ mod tests {
                 scope: scope.clone(),
                 evidence,
             }),
+            unavailable_effect_tool: None,
+            forced_effect_tool: None,
         };
         let strong_request = |
             frame_extent: Option<crate::source::SourceFrameExtent>,
@@ -7684,6 +7967,8 @@ mod tests {
             forced_tool: None,
             strip_terminal_proof_for_tool: Some(ToolIdentifier::Sox),
             ssrc_binary64_evidence_override: None,
+            unavailable_effect_tool: None,
+            forced_effect_tool: None,
         };
         let error = plan_typed_with_effects_and_policy(&request, &[], &search)
             .expect_err("bounded alternative search must return PlanningResourceLimit");
@@ -8819,6 +9104,8 @@ mod tests {
                     scope: scope.clone(),
                 },
             }),
+            unavailable_effect_tool: None,
+            forced_effect_tool: None,
         };
         let Ok(PlanningOutcome::Ready(first)) =
             plan_typed_with_effects_and_policy(&request, &[], &policy("first"))
@@ -9694,6 +9981,332 @@ mod tests {
             .position(|node| matches!(node, TypedPlanNode::ApplyEffect { instance, .. } if instance.placement == EffectPlacement::AfterPcmResample))
             .expect("post-resample effect");
         assert!(pre_index < resampler_index && resampler_index < post_index);
+    }
+
+
+    fn cd_deemphasis_source_rate_effect() -> EffectIntent {
+        EffectIntent {
+            id: EffectInstanceId(900),
+            effect: RegisteredUnaryEffect::CdDeemphasis,
+            after: Vec::new(),
+            placement: EffectPlacement::SourceRate,
+        }
+    }
+
+    #[test]
+    fn cd_deemphasis_registers_both_physical_candidates() {
+        let candidates = registered_effect_candidates(&RegisteredUnaryEffect::CdDeemphasis)
+            .expect("CD de-emphasis candidates");
+        assert_eq!(candidates.len(), 2);
+        assert!(matches!(
+            (&candidates[0].tool, &candidates[0].arguments),
+            (ToolIdentifier::Sox, EffectArgumentMapping::SoxEffect(args))
+                if args == &vec!["deemph".to_owned()]
+        ));
+        assert!(matches!(
+            (&candidates[1].tool, &candidates[1].arguments),
+            (ToolIdentifier::Ffmpeg, EffectArgumentMapping::FfmpegAudioFilter(filter))
+                if filter == "aemphasis=mode=reproduction:type=cd"
+        ));
+    }
+
+    #[test]
+    fn cd_deemphasis_candidate_fallback_is_planner_owned() {
+        let request = pcm_request(SampleGainPolicy::Off);
+        let effect = cd_deemphasis_source_rate_effect();
+        for (unavailable, expected) in [
+            (ToolIdentifier::Sox, ToolIdentifier::Ffmpeg),
+            (ToolIdentifier::Ffmpeg, ToolIdentifier::Sox),
+        ] {
+            let search = CandidateSearchPolicy {
+                unavailable_effect_tool: Some(unavailable),
+                ..CandidateSearchPolicy::default()
+            };
+            let Ok(PlanningOutcome::Ready(plan)) =
+                plan_typed_with_effects_and_policy(&request, std::slice::from_ref(&effect), &search)
+            else {
+                panic!("one qualified CD de-emphasis backend must remain selectable")
+            };
+            let (candidates, selected_candidate, lowering) = plan
+                .nodes
+                .iter()
+                .find_map(|node| match node {
+                    TypedPlanNode::ApplyEffect {
+                        candidates,
+                        selected_candidate,
+                        lowering,
+                        ..
+                    } => Some((candidates, *selected_candidate, lowering)),
+                    _ => None,
+                })
+                .expect("CD de-emphasis node");
+            assert_eq!(candidates.len(), 2, "typed plan retains the candidate set");
+            assert_eq!(candidates[selected_candidate].tool, expected);
+            assert_eq!(lowering.tool, expected, "execution lowering is the selected candidate");
+        }
+    }
+
+    #[test]
+    fn cd_deemphasis_source_rate_executes_without_manufacturing_resampler() {
+        let request = pcm_request(SampleGainPolicy::Off);
+        let Ok(PlanningOutcome::Ready(plan)) =
+            plan_typed_with_effects(&request, &[cd_deemphasis_source_rate_effect()])
+        else {
+            panic!("same-rate source-rate de-emphasis must be admitted")
+        };
+        assert!(plan.nodes.iter().any(|node| matches!(
+            node,
+            TypedPlanNode::ApplyEffect { instance, .. }
+                if instance.effect == RegisteredUnaryEffect::CdDeemphasis
+                    && instance.placement == EffectPlacement::SourceRate
+        )));
+        assert!(!plan.nodes.iter().any(|node| matches!(
+            node,
+            TypedPlanNode::Operation { operation: PlanOperation::ResamplePcm { .. }, .. }
+        )), "same-rate de-emphasis must not manufacture a no-op resampler");
+    }
+
+    #[test]
+    fn cd_deemphasis_forced_ssrc_flac_24_882_preserves_one_resampler_and_package_owner() {
+        let mut request = forced_ssrc_wav_request(PcmBitDepth::Int24, DitherType::None);
+        request.source.sample_rate_hz = Some(44_100);
+        request.source.bit_depth = Some(PcmBitDepth::Int16);
+        request.source.true_source_depth = Some(PcmBitDepth::Int16);
+        request.settings.target_format = AudioFormat::Flac;
+        request.output_path = PathBuf::from("out.flac");
+        request.settings.target_sample_rate = RateTarget::PcmHz(88_200);
+        request.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
+
+        let Ok(PlanningOutcome::Ready(plan)) =
+            plan_typed_with_effects(&request, &[cd_deemphasis_source_rate_effect()])
+        else {
+            panic!("CD de-emphasis -> SSRC -> FLAC package route must be admitted")
+        };
+
+        let effect_index = plan.nodes.iter().position(|node| matches!(
+            node,
+            TypedPlanNode::ApplyEffect { instance, .. }
+                if instance.effect == RegisteredUnaryEffect::CdDeemphasis
+        )).expect("de-emphasis node");
+        let resamplers = plan.nodes.iter().enumerate().filter_map(|(index, node)| match node {
+            TypedPlanNode::Operation {
+                operation: PlanOperation::ResamplePcm { target_rate_hz, .. },
+                candidates,
+                selected_candidate,
+                ..
+            } => Some((index, *target_rate_hz, &candidates[*selected_candidate])),
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(resamplers.len(), 1, "exactly one semantic PCM rate conversion");
+        let (resample_index, target_rate, selected) = resamplers[0];
+        assert!(effect_index < resample_index, "de-emphasis must precede SSRC");
+        assert_eq!(target_rate, 88_200);
+        assert_eq!(selected.tool, Some(ToolIdentifier::Ssrc));
+        let Some(SelectedTerminalRealization::Pcm(realization)) =
+            selected.contract.terminal_realization.as_ref()
+        else {
+            panic!("SSRC FLAC route must retain terminal/package realization")
+        };
+        assert_eq!(
+            realization.kind,
+            PcmTerminalRealizationKind::SsrcPreterminalFfmpegPackage
+        );
+        assert_eq!(realization.target_rate_hz, None, "package-only continuation must not resample");
+        assert_eq!(realization.effective_dither, None);
+    }
+
+    #[test]
+    fn cd_deemphasis_ssrc_wavpack_int24_preserves_sox_package_only_owner() {
+        let mut request = forced_ssrc_wav_request(PcmBitDepth::Int24, DitherType::None);
+        request.source.sample_rate_hz = Some(44_100);
+        request.source.bit_depth = Some(PcmBitDepth::Int16);
+        request.source.true_source_depth = Some(PcmBitDepth::Int16);
+        request.settings.target_format = AudioFormat::WavPack;
+        request.settings.wavpack.hybrid = false;
+        request.output_path = PathBuf::from("out.wv");
+        request.settings.target_sample_rate = RateTarget::PcmHz(88_200);
+
+        let Ok(PlanningOutcome::Ready(plan)) =
+            plan_typed_with_effects(&request, &[cd_deemphasis_source_rate_effect()])
+        else {
+            panic!("CD de-emphasis -> SSRC -> SoX package-only WavPack route must be admitted")
+        };
+        let selected = plan
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                TypedPlanNode::Operation {
+                    operation: PlanOperation::ResamplePcm { .. },
+                    candidates,
+                    selected_candidate,
+                    ..
+                } => Some(&candidates[*selected_candidate]),
+                _ => None,
+            })
+            .expect("selected SSRC resampler");
+        assert_eq!(selected.tool, Some(ToolIdentifier::Ssrc));
+        let Some(SelectedTerminalRealization::Pcm(realization)) =
+            selected.contract.terminal_realization.as_ref()
+        else {
+            panic!("SSRC WavPack route must retain package-only terminal realization")
+        };
+        assert_eq!(
+            realization.kind,
+            PcmTerminalRealizationKind::SsrcPreterminalSoxPackage
+        );
+        assert_eq!(realization.target_rate_hz, None);
+        assert_eq!(realization.effective_dither, None);
+        assert_eq!(realization.dither_owner, PcmTerminalDitherOwner::None);
+    }
+
+    #[test]
+    fn cd_deemphasis_ssrc_float64_split_terminal_keeps_one_rate_change() {
+        let mut request = forced_ssrc_wav_request(PcmBitDepth::Int24, DitherType::Tpdf);
+        request.source.sample_rate_hz = Some(44_100);
+        request.source.bit_depth = Some(PcmBitDepth::Int16);
+        request.source.true_source_depth = Some(PcmBitDepth::Int16);
+        request.settings.target_format = AudioFormat::WavPack;
+        request.settings.wavpack.hybrid = false;
+        request.output_path = PathBuf::from("out.wv");
+        request.settings.target_sample_rate = RateTarget::PcmHz(176_400);
+        request.settings.dither_explicit = true;
+
+        let Ok(PlanningOutcome::Ready(plan)) =
+            plan_typed_with_effects(&request, &[cd_deemphasis_source_rate_effect()])
+        else {
+            panic!("CD de-emphasis -> SSRC Float64 -> downstream WavPack terminal must be admitted")
+        };
+        let resamplers = plan
+            .nodes
+            .iter()
+            .filter_map(|node| match node {
+                TypedPlanNode::Operation {
+                    operation: PlanOperation::ResamplePcm { target_rate_hz, .. },
+                    candidates,
+                    selected_candidate,
+                    resolved_parameters,
+                    ..
+                } => Some((*target_rate_hz, &candidates[*selected_candidate], resolved_parameters)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(resamplers.len(), 1, "split terminal must retain one semantic rate change");
+        let (target_rate_hz, resampler, resolved) = resamplers[0];
+        assert_eq!(target_rate_hz, 176_400);
+        assert_eq!(resampler.tool, Some(ToolIdentifier::Ssrc));
+        assert!(matches!(
+            resolved,
+            ResolvedOperationParameters::ResampleSsrc {
+                effective_output_depth: PcmBitDepth::Float64,
+                output_role: SsrcOutputRole::Nonterminal,
+                ..
+            }
+        ));
+        let terminal = plan
+            .nodes
+            .iter()
+            .find_map(|node| match node {
+                TypedPlanNode::Operation {
+                    operation: PlanOperation::EncodePcm { .. },
+                    candidates,
+                    selected_candidate,
+                    ..
+                } => Some(&candidates[*selected_candidate]),
+                _ => None,
+            })
+            .expect("downstream WavPack terminal");
+        let Some(SelectedTerminalRealization::Pcm(realization)) =
+            terminal.contract.terminal_realization.as_ref()
+        else {
+            panic!("split terminal must retain a PCM realization")
+        };
+        assert_eq!(realization.target_rate_hz, None, "downstream terminal must not resample");
+        assert_eq!(realization.input_precision, StoragePrecision::Pcm(PcmBitDepth::Float64));
+    }
+
+    #[test]
+    fn cd_deemphasis_same_rate_lossy_route_executes_without_resampler() {
+        let mut request = pcm_request(SampleGainPolicy::Off);
+        request.source.sample_rate_hz = Some(44_100);
+        request.source.bit_depth = Some(PcmBitDepth::Int16);
+        request.source.true_source_depth = Some(PcmBitDepth::Int16);
+        request.settings.target_format = AudioFormat::Mp3;
+        request.output_path = PathBuf::from("out.mp3");
+        request.settings.target_sample_rate = RateTarget::PcmHz(44_100);
+
+        let Ok(PlanningOutcome::Ready(plan)) =
+            plan_typed_with_effects(&request, &[cd_deemphasis_source_rate_effect()])
+        else {
+            panic!("same-rate lossy CD de-emphasis route must be admitted")
+        };
+        assert!(plan.nodes.iter().any(|node| matches!(
+            node,
+            TypedPlanNode::ApplyEffect { instance, .. }
+                if instance.effect == RegisteredUnaryEffect::CdDeemphasis
+        )));
+        assert!(!plan.nodes.iter().any(|node| matches!(
+            node,
+            TypedPlanNode::Operation { operation: PlanOperation::ResamplePcm { .. }, .. }
+        )));
+    }
+
+    #[test]
+    fn cd_deemphasis_backend_does_not_replace_sox_or_ffmpeg_resampler() {
+        for (preferred_resampler, forced_effect) in [
+            (PreferredTool::Sox, ToolIdentifier::Ffmpeg),
+            (PreferredTool::Ffmpeg, ToolIdentifier::Sox),
+        ] {
+            let mut request = pcm_request(SampleGainPolicy::Off);
+            request.source.sample_rate_hz = Some(44_100);
+            request.settings.target_sample_rate = RateTarget::PcmHz(88_200);
+            let expected = match &preferred_resampler {
+                PreferredTool::Sox => ToolIdentifier::Sox,
+                PreferredTool::Ffmpeg => ToolIdentifier::Ffmpeg,
+                _ => unreachable!(),
+            };
+            request.settings.preferred_tool = preferred_resampler;
+            let search = CandidateSearchPolicy {
+                forced_effect_tool: Some(forced_effect.clone()),
+                ..CandidateSearchPolicy::default()
+            };
+            let Ok(PlanningOutcome::Ready(plan)) = plan_typed_with_effects_and_policy(
+                &request,
+                &[cd_deemphasis_source_rate_effect()],
+                &search,
+            ) else {
+                panic!("cross-tool source effect/resampler route must be admitted")
+            };
+            let effect_tool = plan.nodes.iter().find_map(|node| match node {
+                TypedPlanNode::ApplyEffect { lowering, .. } => Some(lowering.tool.clone()),
+                _ => None,
+            }).expect("effect tool");
+            assert_eq!(effect_tool, forced_effect);
+            let resampler_tool = plan.nodes.iter().find_map(|node| match node {
+                TypedPlanNode::Operation {
+                    operation: PlanOperation::ResamplePcm { .. },
+                    candidates,
+                    selected_candidate,
+                    ..
+                } => candidates[*selected_candidate].tool.clone(),
+                _ => None,
+            }).expect("resampler tool");
+            assert_eq!(resampler_tool, expected, "effect choice must not replace frozen resampler");
+        }
+    }
+
+    #[test]
+    fn cd_deemphasis_true_peak_fails_closed_when_no_candidate_has_protected_contract() {
+        let request = pcm_request(SampleGainPolicy::TruePeakGuard {
+            target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            scope: TruePeakScope::Track,
+            scan: TruePeakScanTier::Standard,
+        });
+        let Ok(PlanningOutcome::Refused(refusal)) =
+            plan_typed_with_effects(&request, &[cd_deemphasis_source_rate_effect()])
+        else {
+            panic!("unqualified source-rate de-emphasis must not precede certified true-peak observation")
+        };
+        assert_eq!(refusal.code, "protected_pre_resample_effect_unqualified");
     }
 
     #[test]

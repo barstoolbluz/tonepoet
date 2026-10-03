@@ -44,6 +44,9 @@ pub struct TuiPreset {
     pub replaygain: String, // "album", "track", "both", optional "-if-missing", or "off"
     #[serde(default = "default_resampler")]
     pub resampler: String, // "sox", "ssrc", "soxr"
+    /// Explicit user de-emphasis override. None means follow source/target automatic policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deemphasis: Option<bool>,
     #[serde(default)]
     pub noise_shaper: Option<String>, // "clans", "sdm", "crfb"
     #[serde(default)]
@@ -207,6 +210,7 @@ impl PresetWireLegacy {
             dither: self.dither,
             replaygain: self.replaygain,
             resampler: self.resampler,
+            deemphasis: None,
             noise_shaper: self.noise_shaper,
             modulator_order: self.modulator_order,
             dsd_filter_preset: self.dsd_filter_preset,
@@ -398,6 +402,7 @@ impl TuiPreset {
             dither: format.dither.selected_label().to_lowercase(),
             replaygain: format.replaygain.selected_label().to_lowercase(),
             resampler: format.resampler.selected_label().to_lowercase(),
+            deemphasis: format.deemphasis_overridden.then_some(format.deemphasis_enabled),
             noise_shaper: Some(format.noise_shaper.selected_label().to_lowercase()),
             modulator_order: Some(format.modulator_order.selected_value().value()),
             dsd_filter_preset: Some(format.conversion_preset.selected_label().to_lowercase()),
@@ -842,6 +847,20 @@ impl TuiPreset {
         }
 
         if !is_dsd {
+            match self.deemphasis {
+                Some(value) => {
+                    format_state.deemphasis_enabled = value;
+                    format_state.deemphasis_overridden = true;
+                    report.record("deemphasis", true);
+                }
+                None => {
+                    // Absence is meaningful: return this source-sensitive
+                    // control to automatic policy rather than retaining a
+                    // stale explicit override from the current session.
+                    format_state.deemphasis_overridden = false;
+                    format_state.recompute_auto_deemphasis();
+                }
+            }
             match parse_replaygain(&self.replaygain) {
                 Some(value) => report.record(
                     "replaygain",

@@ -3643,6 +3643,7 @@ fn convert_format_field_value(app: &AppState, field: FormatField) -> String {
         FormatField::BitDepth => format.bit_depth.selected_label().to_string(),
         FormatField::Resampler => format.resampler.selected_label().to_string(),
         FormatField::Dither => format.dither.selected_label().to_string(),
+        FormatField::Deemphasis => if format.deemphasis_enabled { "on" } else { "off" }.to_string(),
         FormatField::ReplayGain => format.replaygain.selected_label().to_string(),
         FormatField::PcmTruePeak => format.pcm_gain_mode.selected_label().to_string(),
         FormatField::PcmGainDb => format!("{} dB", format.pcm_fixed_gain_db.render(true)),
@@ -48631,6 +48632,10 @@ fn commit_format_settings(app: &mut AppState, kind: &FormatSettingsKind) {
         }
     }
     app.convert.format.apply_auto_gain_defaults();
+    // WavPack hybrid status changes the R18 preservation domain even when
+    // codec/rate/depth pills themselves do not move. Keep the automatic
+    // De-emphasis default synchronized until the user explicitly overrides it.
+    app.convert.format.recompute_auto_deemphasis();
     app.preset.mark_modified();
 }
 
@@ -71894,6 +71899,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::DepthPill(_)
             | TuiButton::ResamplerPill(_)
             | TuiButton::DitherPill(_)
+            | TuiButton::DeemphasisPill(_)
             | TuiButton::ReplayGainPill(_)
             | TuiButton::PcmTruePeakPill(_)
             | TuiButton::TruePeakScopePill(_)
@@ -71919,6 +71925,19 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 if super::format_interactions::handle_convert_format_button(&mut app.convert, button) {
                     app.preset.mark_modified();
                 }
+            }
+            TuiButton::DeemphasisInfo => {
+                app.convert.focus = ConvertFocus::Format;
+                let message = if app.convert.format.deemphasis_override_warning_active() {
+                    "De-emphasis is Off for a non-preservation target. The output waveform will remain pre-emphasized, but TonePoet will suppress pre-emphasis playback signaling for this target.".to_string()
+                } else {
+                    "This catalog number matches a release known to use CD pre-emphasis. TonePoet did not find an affirmative PRE_EMPHASIS tag, so de-emphasis has not been enabled automatically.".to_string()
+                };
+                app.active_overlay = ActiveOverlay::Notice {
+                    title: "CD pre-emphasis".to_string(),
+                    message,
+                    scroll: 0,
+                };
             }
             TuiButton::FormatSettingsButton => {
                 app.convert.focus = ConvertFocus::Format;
