@@ -1538,6 +1538,43 @@ fn selected_terminal_realization(
     Ok(realization)
 }
 
+fn selected_pcm_terminal_input_rate_hz(
+    typed: &crate::semantic_plan::TypedConversionPlan,
+    realization: &crate::semantic_plan::SelectedPcmTerminalRealization,
+) -> Option<u32> {
+    typed.nodes.iter().find_map(|node| {
+        let crate::semantic_plan::TypedPlanNode::Operation {
+            operation: PlanOperation::EncodePcm { .. },
+            input_signal: Some(input_signal),
+            candidates,
+            selected_candidate,
+            ..
+        } = node
+        else {
+            return None;
+        };
+        let candidate = candidates.get(*selected_candidate)?;
+        let Some(crate::semantic_plan::SelectedTerminalRealization::Pcm(
+            candidate_realization,
+        )) = candidate.contract.terminal_realization.as_ref()
+        else {
+            return None;
+        };
+        if candidate_realization != realization {
+            return None;
+        }
+        let input_state = typed
+            .audio_states
+            .iter()
+            .find(|state| state.id == *input_signal)?;
+        match &input_state.sample_rate_hz {
+            crate::semantic_plan::Fact::Known(rate_hz) => Some(*rate_hz),
+            crate::semantic_plan::Fact::Pending(_)
+            | crate::semantic_plan::Fact::Unavailable(_) => None,
+        }
+    })
+}
+
 fn command_args_contain_sequence(args: &[String], sequence: &[String]) -> bool {
     !sequence.is_empty()
         && args
@@ -1781,6 +1818,14 @@ fn validate_selected_terminal_lowering(
             _ => None,
         })
         .collect::<Vec<_>>();
+    // A fused retained DsdToPcm command physically owns both reconstruction and
+    // final PCM packaging. The semantic terminal intentionally carries no rate
+    // change when reconstruction has already established the requested rate, so
+    // bind that physical rate to the terminal's typed input state rather than
+    // requiring a duplicate target-rate claim on the synthetic EncodePcm node.
+    let fused_terminal_rate_hz = realization
+        .target_rate_hz
+        .or_else(|| selected_pcm_terminal_input_rate_hz(typed, realization));
     let fused_dsd_indices = steps
         .iter()
         .enumerate()
@@ -1791,7 +1836,7 @@ fn validate_selected_terminal_lowering(
                 target_bit_depth,
                 ..
             } if target_format == &realization.target_format
-                && Some(*target_rate_hz) == realization.target_rate_hz
+                && Some(*target_rate_hz) == fused_terminal_rate_hz
                 && target_bit_depth == &realization.target_bit_depth => Some(index),
             _ => None,
         })
