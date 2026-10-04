@@ -69,6 +69,12 @@ pub fn handle_format_button(
             source_bits,
             source_rate,
         ),
+        TuiButton::DeemphasisPill(index) => format.select_row_index(
+            FormatField::Deemphasis,
+            index,
+            source_bits,
+            source_rate,
+        ),
         TuiButton::ReplayGainPill(index) => format.select_row_index(
             FormatField::ReplayGain, index, source_bits, source_rate,
         ),

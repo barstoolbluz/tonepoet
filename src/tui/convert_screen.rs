@@ -302,6 +302,19 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
             FormatField::BitDepth => register_pill_row(buttons, &state.bit_depth, y, label_col, TuiButton::DepthPill),
             FormatField::Resampler => register_pill_row(buttons, &state.resampler, y, label_col, TuiButton::ResamplerPill),
             FormatField::Dither => register_pill_row(buttons, &state.dither, y, label_col, TuiButton::DitherPill),
+            FormatField::Deemphasis => {
+                buttons.record_button(TuiButton::DeemphasisPill(0), Rect::new(label_col, y, 5, 1));
+                buttons.record_button(TuiButton::DeemphasisPill(1), Rect::new(label_col + 7, y, 4, 1));
+                if matches!(
+                    state.deemphasis_evidence,
+                    super::app::ConvertDeemphasisEvidence::CatalogExact
+                        | super::app::ConvertDeemphasisEvidence::CueFlag
+                )
+                    || state.deemphasis_override_warning_active()
+                {
+                    buttons.record_button(TuiButton::DeemphasisInfo, Rect::new(label_col + 13, y, 2, 1));
+                }
+            }
             FormatField::ReplayGain => register_pill_row(buttons, &state.replaygain, y, label_col, TuiButton::ReplayGainPill),
             FormatField::PcmTruePeak => register_pill_row(
                 buttons,
@@ -791,7 +804,11 @@ mod format_render_registration_tests {
     use super::*;
     use crate::config::TonepoetConfig;
     use crate::convert::formats::AudioFormat;
-    use crate::tui::app::{AppScreen, DsdGainMode, FormatField, ResamplerChoice};
+    use crate::tui::app::{
+        ActiveOverlay, AppScreen, BitDepthChoice, ConvertDeemphasisEvidence, DsdGainMode,
+        FormatField, ResamplerChoice,
+    };
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use tonepoet_pipeline::enums::ResampleQuality;
@@ -806,6 +823,159 @@ mod format_render_registration_tests {
         (0..height)
             .find(|&y| row_text(terminal, y, width).contains(needle))
             .unwrap_or_else(|| panic!("rendered row containing {needle:?} not found"))
+    }
+
+    fn rendered_symbol_x(
+        terminal: &Terminal<TestBackend>,
+        width: u16,
+        y: u16,
+        symbol: &str,
+    ) -> u16 {
+        (0..width)
+            .find(|&x| terminal.backend().buffer().get(x, y).symbol() == symbol)
+            .unwrap_or_else(|| panic!("rendered symbol {symbol:?} not found on row {y}"))
+    }
+
+    fn render_deemphasis_info_case(
+        app: &mut AppState,
+        width: u16,
+        height: u16,
+    ) -> Terminal<TestBackend> {
+        let theme = crate::tui::theme::theme_by_slug(crate::tui::theme::default_theme_slug())
+            .expect("default theme");
+        app.current_screen = AppScreen::Convert;
+        app.convert.focus = ConvertFocus::Format;
+        app.convert.layout = ConvertLayout::Maximized(ConvertFocus::Format);
+        app.button_map.clear();
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| draw_convert_screen(frame, frame.size(), app, theme))
+            .expect("draw de-emphasis info case");
+        terminal
+    }
+
+    #[test]
+    fn catalog_deemphasis_info_hitbox_tracks_rendered_icon_and_opens_notice() {
+        const WIDTH: u16 = 120;
+        const HEIGHT: u16 = 48;
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.convert.format.deemphasis_eligible = true;
+        app.convert.format.deemphasis_evidence = ConvertDeemphasisEvidence::CatalogExact;
+        app.convert.format.deemphasis_enabled = false;
+        app.convert.format.deemphasis_overridden = false;
+
+        let terminal = render_deemphasis_info_case(&mut app, WIDTH, HEIGHT);
+        let row = rendered_row(&terminal, WIDTH, HEIGHT, "Possible pre-emphasis");
+        let icon_x = rendered_symbol_x(&terminal, WIDTH, row, "ⓘ");
+        assert_eq!(
+            app.button_map.find_button_at(icon_x, row),
+            Some(TuiButton::DeemphasisInfo),
+            "the visible catalog advisory icon must own its screen cell",
+        );
+        assert!(app
+            .button_map
+            .find_button_rect(&TuiButton::DeemphasisPill(0))
+            .is_some());
+        assert!(app
+            .button_map
+            .find_button_rect(&TuiButton::DeemphasisPill(1))
+            .is_some());
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        crate::tui::keybindings::handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: icon_x,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+            &tx,
+        );
+        assert!(matches!(
+            app.active_overlay,
+            ActiveOverlay::Notice { ref title, .. } if title == "CD pre-emphasis"
+        ));
+    }
+
+    #[test]
+    fn cue_flag_deemphasis_info_hitbox_tracks_rendered_icon_and_opens_notice() {
+        const WIDTH: u16 = 120;
+        const HEIGHT: u16 = 48;
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.convert.format.deemphasis_eligible = true;
+        app.convert.format.deemphasis_evidence = ConvertDeemphasisEvidence::CueFlag;
+        app.convert.format.deemphasis_enabled = false;
+        app.convert.format.deemphasis_overridden = false;
+
+        let terminal = render_deemphasis_info_case(&mut app, WIDTH, HEIGHT);
+        let row = rendered_row(&terminal, WIDTH, HEIGHT, "CUE flags pre-emphasis");
+        let icon_x = rendered_symbol_x(&terminal, WIDTH, row, "ⓘ");
+        assert_eq!(
+            app.button_map.find_button_at(icon_x, row),
+            Some(TuiButton::DeemphasisInfo),
+            "the visible CUE advisory icon must own its screen cell",
+        );
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        crate::tui::keybindings::handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: icon_x,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+            &tx,
+        );
+        assert!(matches!(
+            app.active_overlay,
+            ActiveOverlay::Notice { ref title, ref message, .. }
+                if title == "CD pre-emphasis" && message.contains("FLAGS PRE")
+        ));
+    }
+
+    #[test]
+    fn manual_off_warning_info_hitbox_tracks_rendered_icon_and_opens_notice() {
+        const WIDTH: u16 = 140;
+        const HEIGHT: u16 = 48;
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.convert.format.deemphasis_eligible = true;
+        app.convert.format.deemphasis_evidence = ConvertDeemphasisEvidence::ExplicitTag;
+        app.convert.format.deemphasis_enabled = false;
+        app.convert.format.deemphasis_overridden = true;
+        assert!(app.convert.format.format.select_value(&AudioFormat::Flac));
+        assert!(app.convert.format.sample_rate.select_value(&44_100));
+        assert!(app.convert.format.bit_depth.select_value(&BitDepthChoice::Int24));
+        app.convert.format.apply_format_constraints();
+        assert!(app.convert.format.deemphasis_override_warning_active());
+
+        let terminal = render_deemphasis_info_case(&mut app, WIDTH, HEIGHT);
+        let row = rendered_row(&terminal, WIDTH, HEIGHT, "pre-emphasis retained");
+        let icon_x = rendered_symbol_x(&terminal, WIDTH, row, "ⓘ");
+        assert_eq!(
+            app.button_map.find_button_at(icon_x, row),
+            Some(TuiButton::DeemphasisInfo),
+            "the visible manual-Off warning icon must own its screen cell",
+        );
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        crate::tui::keybindings::handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: icon_x,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+            &tx,
+        );
+        assert!(matches!(
+            app.active_overlay,
+            ActiveOverlay::Notice { ref title, ref message, .. }
+                if title == "CD pre-emphasis" && message.contains("playback signaling")
+        ));
     }
 
     #[test]

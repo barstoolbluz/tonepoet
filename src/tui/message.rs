@@ -559,6 +559,12 @@ pub enum AppMessage {
         probe_notice: Option<String>,
         baseline: crate::tui::app::ConvertProbeBaseline,
     },
+    /// Bounded whole-batch technical/evidence inventory for Convert CD de-emphasis.
+    ConvertDeemphasisBatchPreflightComplete {
+        generation: u64,
+        paths: Vec<std::path::PathBuf>,
+        results: Vec<(std::path::PathBuf, crate::tui::app::ConvertDeemphasisPathState)>,
+    },
     /// Result of an asynchronous optical-disc probe launched by the Browse
     /// info pane or the Audio Streams action. The payload uses the unified
     /// DiscContents model shared by DVD-Audio and SACD, plus an optional

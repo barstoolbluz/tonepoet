@@ -221,8 +221,14 @@ pub fn settings_and_effects_fingerprint(
             );
         }
         push_registered_effect(&mut writer, &prefix, &effect.effect);
-        if effect.placement == EffectPlacement::BeforePcmResample {
-            writer.field_static(&format!("{prefix}.placement"), "before_pcm_resample");
+        match effect.placement {
+            EffectPlacement::AfterPcmResample => {}
+            EffectPlacement::BeforePcmResample => {
+                writer.field_static(&format!("{prefix}.placement"), "before_pcm_resample");
+            }
+            EffectPlacement::SourceRate => {
+                writer.field_static(&format!("{prefix}.placement"), "source_rate");
+            }
         }
     }
     SettingsFingerprint(writer.finish())
@@ -817,12 +823,16 @@ fn push_semantic_node(writer: &mut FingerprintWriter, index: usize, node: &Typed
             output,
             instance,
             lowering,
+            ..
         } => {
             writer.field_static(&format!("{prefix}.kind"), "apply_effect");
             writer.field_string(&format!("{prefix}.input"), input.0.to_string());
             writer.field_string(&format!("{prefix}.output"), output.0.to_string());
             writer.field_string(&format!("{prefix}.instance"), instance.id.0.to_string());
             push_registered_effect(writer, &format!("{prefix}.effect"), &instance.effect);
+            if instance.placement == EffectPlacement::SourceRate {
+                writer.field_static(&format!("{prefix}.placement"), "source_rate");
+            }
             writer.field_static(&format!("{prefix}.tool"), lowering.tool.program());
             match &lowering.arguments {
                 EffectArgumentMapping::SoxEffect(args) => {
@@ -2030,6 +2040,9 @@ fn push_registered_effect(
             writer.field_static(&format!("{prefix}.kind"), "ffmpeg_lowpass");
             writer.field_string(&format!("{prefix}.frequency_hz"), frequency_hz.to_string());
         }
+        RegisteredUnaryEffect::CdDeemphasis => {
+            writer.field_static(&format!("{prefix}.kind"), "cd_deemphasis");
+        }
     }
 }
 
@@ -3199,6 +3212,27 @@ mod tests {
         assert_ne!(
             settings_and_effects_fingerprint(&settings, &[first]),
             settings_and_effects_fingerprint(&settings, &[changed]),
+        );
+    }
+
+    #[test]
+    fn cd_deemphasis_and_source_rate_placement_are_execution_significant() {
+        let settings = PipelineSettings::default();
+        let source_rate = EffectIntent {
+            id: crate::semantic_plan::EffectInstanceId(18),
+            effect: RegisteredUnaryEffect::CdDeemphasis,
+            after: Vec::new(),
+            placement: EffectPlacement::SourceRate,
+        };
+        let mut after = source_rate.clone();
+        after.placement = EffectPlacement::AfterPcmResample;
+        assert_ne!(
+            settings_and_effects_fingerprint(&settings, &[]),
+            settings_and_effects_fingerprint(&settings, std::slice::from_ref(&source_rate)),
+        );
+        assert_ne!(
+            settings_and_effects_fingerprint(&settings, &[source_rate]),
+            settings_and_effects_fingerprint(&settings, &[after]),
         );
     }
 

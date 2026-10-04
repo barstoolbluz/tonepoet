@@ -8,7 +8,7 @@ use ratatui::{
     Frame,
 };
 
-use super::app::{FormatField, FormatState, ResamplerChoice};
+use super::app::{ConvertDeemphasisEvidence, FormatField, FormatState, ResamplerChoice};
 use super::pill::render_pill_spans;
 
 /// Draw the format pane with green border.
@@ -131,6 +131,27 @@ pub fn draw_format_pane(
                             format_state.ssrc_dither_status_label().unwrap_or(""),
                             &spans,
                             row_focused && !ssrc_override,
+                            theme,
+                        ));
+                    }
+                    FormatField::Deemphasis => {
+                        let suffix = if format_state.deemphasis_override_warning_active() {
+                            "ⓘ ⚠ pre-emphasis retained; playback signaling suppressed"
+                        } else {
+                            match format_state.deemphasis_evidence {
+                                ConvertDeemphasisEvidence::ExplicitTag => "Pre-emphasis detected",
+                                ConvertDeemphasisEvidence::CueFlag => "ⓘ CUE flags pre-emphasis",
+                                ConvertDeemphasisEvidence::CatalogExact => "ⓘ Possible pre-emphasis",
+                                ConvertDeemphasisEvidence::None => "",
+                            }
+                        };
+                        lines.push(pill_row(
+                            border_color,
+                            w,
+                            "de-emphasis",
+                            suffix,
+                            &deemphasis_pill_spans(format_state.deemphasis_enabled, row_focused, theme),
+                            row_focused,
                             theme,
                         ));
                     }
@@ -424,6 +445,36 @@ pub fn draw_format_pane(
     }
     lines.push(bot_line);
     f.render_widget(Paragraph::new(lines), area);
+}
+
+fn deemphasis_pill_spans(
+    enabled: bool,
+    row_focused: bool,
+    theme: super::theme::Theme,
+) -> Vec<Span<'static>> {
+    [false, true]
+        .into_iter()
+        .enumerate()
+        .flat_map(|(index, value)| {
+            let selected = value == enabled;
+            let style = if selected {
+                Style::default()
+                    .fg(theme.pill_active_fg)
+                    .bg(theme.pill_active_bg)
+                    .add_modifier(Modifier::BOLD)
+            } else if row_focused {
+                Style::default().fg(theme.text_muted)
+            } else {
+                Style::default().fg(theme.text_dim)
+            };
+            let mut spans = Vec::new();
+            if index > 0 {
+                spans.push(Span::raw("  "));
+            }
+            spans.push(Span::styled(if value { " on " } else { " off " }, style));
+            spans
+        })
+        .collect()
 }
 
 fn render_enabled_pill_spans<T: Clone>(

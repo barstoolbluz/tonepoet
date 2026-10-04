@@ -20,7 +20,7 @@ use tonepoet_pipeline::{
 use crate::convert::{ConversionConfig, ConversionItem, ConversionManager};
 use crate::tui::button_map::{ButtonRenderMap, DoubleClickState};
 use crate::tui::pill::PillState;
-use crate::tui::probe::{SourceInfo, SourceMetadata};
+use crate::tui::probe::{ConvertPreemphasisEvidence, SourceInfo, SourceMetadata};
 
 /// Upper bound for retained Browse archive listings. Listing large archives can
 /// allocate substantial path metadata, so the cache is deliberately small and
@@ -772,6 +772,12 @@ pub(crate) fn probe_cue_proxy_source(
         first_info.file_size = probed.iter().map(|(_, info)| info.file_size).sum();
     }
 
+    if crate::tui::probe::convert_cd_deemphasis_eligible(&first_info)
+        && crate::tui::preemphasis::metadata::cue_sheet_has_pre_flag(&sheet)
+    {
+        metadata.convert_preemphasis.cue_flag = true;
+    }
+
     Ok(CueProxyProbeResult {
         info: Some(first_info),
         metadata,
@@ -883,6 +889,24 @@ pub enum SourceRateIdentity {
     Lost,
 }
 
+/// Convert-specific source evidence for CD de-emphasis, from weakest advisory
+/// tier through strongest automatic authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConvertDeemphasisEvidence {
+    #[default]
+    None,
+    CatalogExact,
+    CueFlag,
+    ExplicitTag,
+}
+
+/// Per-path result retained by the bounded batch preflight.
+#[derive(Debug, Clone, Default)]
+pub struct ConvertDeemphasisPathState {
+    pub eligible: bool,
+    pub evidence: ConvertPreemphasisEvidence,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConvertProbeFormatSnapshot {
     pub format: AudioFormat,
@@ -898,6 +922,8 @@ pub struct ConvertProbeFormatSnapshot {
     pub bit_depth_overridden: bool,
     pub dither_overridden: bool,
     pub resampler_overridden: bool,
+    pub deemphasis_enabled: bool,
+    pub deemphasis_overridden: bool,
 }
 
 impl ConvertProbeFormatSnapshot {
@@ -916,6 +942,8 @@ impl ConvertProbeFormatSnapshot {
             bit_depth_overridden: format.bit_depth_overridden,
             dither_overridden: format.dither_overridden,
             resampler_overridden: format.resampler_overridden,
+            deemphasis_enabled: format.deemphasis_enabled,
+            deemphasis_overridden: format.deemphasis_overridden,
         }
     }
 }
@@ -945,6 +973,9 @@ pub(crate) fn apply_source_metadata_to_convert(
     convert.metadata.album = metadata.album.clone();
     convert.metadata.genre = metadata.genre.clone();
     convert.metadata.year = metadata.year.clone();
+    convert
+        .format
+        .set_convert_deemphasis_evidence(&metadata.convert_preemphasis);
 }
 
 pub(crate) fn clear_source_metadata_in_convert(convert: &mut ConvertState) {
@@ -1080,7 +1111,14 @@ pub(crate) fn probe_convert_source_for_message(
             let carrier_metadata = crate::tui::probe::read_metadata(path).unwrap_or_default();
             if let Some(source) = sidecar_cue_track_metadata {
                 return match transferred_sidecar_metadata_for_preview(source, carrier_metadata) {
-                    Ok(metadata) => (Some(info), metadata, None),
+                    Ok(mut metadata) => {
+                        if crate::tui::probe::convert_cd_deemphasis_eligible(&info)
+                            && crate::tui::preemphasis::metadata::convert_cue_flag_evidence_for_path(path)
+                        {
+                            metadata.convert_preemphasis.cue_flag = true;
+                        }
+                        (Some(info), metadata, None)
+                    }
                     Err(error) => (
                         Some(info),
                         SourceMetadata::default(),
@@ -1091,7 +1129,7 @@ pub(crate) fn probe_convert_source_for_message(
                     ),
                 };
             }
-            let metadata = match cue_policy {
+            let mut metadata = match cue_policy {
                 crate::convert::pipeline::CueSidecarPolicy::IgnoreCue => carrier_metadata,
                 crate::convert::pipeline::CueSidecarPolicy::SidecarOnly
                 | crate::convert::pipeline::CueSidecarPolicy::EmbeddedOnly => {
@@ -1123,6 +1161,11 @@ pub(crate) fn probe_convert_source_for_message(
                     );
                 }
             };
+            if crate::tui::probe::convert_cd_deemphasis_eligible(&info)
+                && crate::tui::preemphasis::metadata::convert_cue_flag_evidence_for_path(path)
+            {
+                metadata.convert_preemphasis.cue_flag = true;
+            }
             (Some(info), metadata, None)
         }
         Err(err) => (
@@ -2009,6 +2052,110 @@ pub(crate) fn spawn_convert_batch_cursor_probe(
     });
 }
 
+/// Spawn the Convert-only batch de-emphasis preflight off the event thread.
+/// The worker proves technical eligibility first and opens tags only for paths
+/// that satisfy the strict lossless/integer/16-bit/44.1-kHz gate. Sequential
+/// execution is intentionally a bounded-concurrency implementation (bound=1);
+/// the feature is uncommon and this avoids an album-sized process/I/O burst.
+pub(crate) fn spawn_convert_deemphasis_batch_preflight(
+    generation: u64,
+    paths: Vec<PathBuf>,
+    known_info: BTreeMap<PathBuf, SourceInfo>,
+    tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
+) {
+    tokio::spawn(async move {
+        let result_paths = paths.clone();
+        let results = tokio::task::spawn_blocking(move || {
+            // Preserve the eligibility-first invariant: do all technical
+            // probes before opening tags or sidecars for de-emphasis evidence.
+            let mut eligibility = Vec::with_capacity(paths.len());
+            let mut eligible_paths = Vec::new();
+            for path in paths {
+                let info = known_info
+                    .get(&path)
+                    .cloned()
+                    .or_else(|| crate::tui::probe::probe_audio(&path).ok());
+                let eligible = info
+                    .as_ref()
+                    .is_some_and(crate::tui::probe::convert_cd_deemphasis_eligible);
+                if eligible {
+                    eligible_paths.push(path.clone());
+                }
+                eligibility.push((path, eligible));
+            }
+
+            // Parse each shallow candidate CUE/log once for the whole batch.
+            let cue_evidence =
+                crate::tui::preemphasis::metadata::convert_cue_flag_evidence_for_paths(
+                    &eligible_paths,
+                );
+
+            let mut results = Vec::with_capacity(eligibility.len());
+            for (path, eligible) in eligibility {
+                let mut evidence = if eligible {
+                    crate::tui::probe::read_convert_preemphasis_tag_evidence(&path)
+                        .unwrap_or_default()
+                } else {
+                    ConvertPreemphasisEvidence::default()
+                };
+                evidence.cue_flag = eligible && cue_evidence.contains(&path);
+                results.push((
+                    path,
+                    ConvertDeemphasisPathState { eligible, evidence },
+                ));
+            }
+            results
+        })
+        .await
+        .unwrap_or_default();
+        let _ = tx
+            .send(crate::tui::message::AppMessage::ConvertDeemphasisBatchPreflightComplete {
+                generation,
+                paths: result_paths,
+                results,
+            })
+            .await;
+    });
+}
+
+/// Ensure the current Convert batch has one bounded de-emphasis preflight in
+/// flight, or report that its exact path set is already complete. The helper
+/// is shared by the event-loop maintenance tick and Browse post-load commit
+/// continuations so an auto-commit never depends on a later timer tick to
+/// start the safety gate.
+pub(crate) fn ensure_convert_deemphasis_batch_preflight(
+    app: &mut AppState,
+    tx: &tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
+) -> bool {
+    if app.convert.source.deemphasis_batch_preflight_pending {
+        return false;
+    }
+    let (paths, known_info) = match &app.convert.source.mode {
+        SourceMode::Batch { paths, cursor, cursor_info, .. } if !paths.is_empty() => {
+            if app.convert.source.deemphasis_batch_preflight.len() == paths.len()
+                && paths.iter().all(|path| {
+                    app.convert
+                        .source
+                        .deemphasis_batch_preflight
+                        .contains_key(path)
+                })
+            {
+                return true;
+            }
+            let mut known = BTreeMap::new();
+            if let (Some(path), Some(info)) = (paths.get(*cursor), cursor_info.as_ref()) {
+                known.insert(path.clone(), info.clone());
+            }
+            (paths.clone(), known)
+        }
+        _ => return true,
+    };
+
+    app.convert.source.deemphasis_batch_preflight_pending = true;
+    spawn_convert_deemphasis_batch_preflight(app.probe_generation, paths, known_info, tx.clone());
+    false
+}
+
 fn cue_sheet_metadata(
     sheet: &crate::tui::cue_parser::CueSheet,
     mut metadata: SourceMetadata,
@@ -2195,6 +2342,16 @@ pub struct PendingBrowseConvertPresetContinuation {
     pub generation: u64,
     pub path: PathBuf,
     pub preset: String,
+    pub post_load: crate::tui::command::BrowseConvertPostLoad,
+}
+
+/// Deferred Browse post-load action waiting for the exact batch de-emphasis
+/// preflight that guards Convert commit. Generation plus the complete path
+/// vector prevents stale background work from committing a replacement source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingBrowseConvertPostLoadContinuation {
+    pub generation: u64,
+    pub paths: Vec<PathBuf>,
     pub post_load: crate::tui::command::BrowseConvertPostLoad,
 }
 
@@ -3928,6 +4085,130 @@ mod clamp_pill_tests {
         opus.apply_format_constraints();
         assert_eq!(*opus.sample_rate.selected_value(), 48_000);
     }
+
+    fn eligible_deemphasis_state() -> FormatState {
+        let mut format = FormatState::new();
+        format.source_is_dsd = false;
+        format.source_is_lossless = Some(true);
+        format.source_pcm_rate_hz = Some(44_100);
+        format.source_pcm_bit_depth = Some(16);
+        format.source_pcm_float_bits = None;
+        format.deemphasis_eligible = true;
+        format.format.select_value(&AudioFormat::Flac);
+        format.sample_rate.select_value(&44_100);
+        format.bit_depth.select_value(&super::BitDepthChoice::Int16);
+        format
+    }
+
+    #[test]
+    fn deemphasis_auto_default_tracks_preservation_domain_until_overridden() {
+        let mut format = eligible_deemphasis_state();
+        format.set_convert_deemphasis_evidence(&super::ConvertPreemphasisEvidence {
+            explicit_affirmative: true,
+            cue_flag: false,
+            catalog_number: None,
+            catalog_exact: false,
+        });
+        assert!(!format.deemphasis_enabled, "lossless integer 16/44.1 preserves emphasized source");
+
+        format.bit_depth.select_value(&super::BitDepthChoice::Int24);
+        format.apply_format_constraints();
+        assert!(format.deemphasis_enabled, "24/44.1 leaves the preservation domain");
+
+        format.deemphasis_enabled = false;
+        format.deemphasis_overridden = true;
+        format.sample_rate.select_value(&88_200);
+        format.apply_format_constraints();
+        assert!(!format.deemphasis_enabled, "explicit user override must survive target changes");
+    }
+
+    #[test]
+    fn catalog_only_advisory_never_auto_enables_deemphasis() {
+        let mut format = eligible_deemphasis_state();
+        format.bit_depth.select_value(&super::BitDepthChoice::Int24);
+        format.set_convert_deemphasis_evidence(&super::ConvertPreemphasisEvidence {
+            explicit_affirmative: false,
+            cue_flag: false,
+            catalog_number: Some("35DP 150".to_owned()),
+            catalog_exact: true,
+        });
+        assert_eq!(format.deemphasis_evidence, super::ConvertDeemphasisEvidence::CatalogExact);
+        assert!(!format.deemphasis_enabled);
+    }
+
+    #[test]
+    fn cue_flag_advisory_outranks_catalog_but_never_auto_enables_deemphasis() {
+        let mut format = eligible_deemphasis_state();
+        format.bit_depth.select_value(&super::BitDepthChoice::Int24);
+        format.set_convert_deemphasis_evidence(&super::ConvertPreemphasisEvidence {
+            explicit_affirmative: false,
+            cue_flag: true,
+            catalog_number: Some("35DP 150".to_owned()),
+            catalog_exact: true,
+        });
+        assert_eq!(format.deemphasis_evidence, super::ConvertDeemphasisEvidence::CueFlag);
+        assert!(!format.deemphasis_enabled);
+        assert!(format
+            .pane_rows(false)
+            .contains(&super::FormatPaneRow::Field(super::FormatField::Deemphasis)));
+
+        format.deemphasis_enabled = true;
+        format.deemphasis_overridden = true;
+        format.sample_rate.select_value(&88_200);
+        format.apply_format_constraints();
+        assert!(format.deemphasis_enabled, "manual On must remain authoritative");
+    }
+
+    #[test]
+    fn explicit_tag_outranks_cue_flag_and_catalog() {
+        let mut format = eligible_deemphasis_state();
+        format.bit_depth.select_value(&super::BitDepthChoice::Int24);
+        format.set_convert_deemphasis_evidence(&super::ConvertPreemphasisEvidence {
+            explicit_affirmative: true,
+            cue_flag: true,
+            catalog_number: Some("35DP 150".to_owned()),
+            catalog_exact: true,
+        });
+        assert_eq!(format.deemphasis_evidence, super::ConvertDeemphasisEvidence::ExplicitTag);
+        assert!(format.deemphasis_enabled);
+    }
+
+    #[test]
+    fn deemphasis_row_promotion_uses_single_pane_row_authority() {
+        let mut format = eligible_deemphasis_state();
+        assert!(!format.pane_rows(false).contains(&super::FormatPaneRow::Field(super::FormatField::Deemphasis)));
+        assert!(format.pane_rows(true).contains(&super::FormatPaneRow::Field(super::FormatField::Deemphasis)));
+
+        format.set_convert_deemphasis_evidence(&super::ConvertPreemphasisEvidence {
+            explicit_affirmative: true,
+            cue_flag: false,
+            catalog_number: None,
+            catalog_exact: false,
+        });
+        assert!(format.pane_rows(false).contains(&super::FormatPaneRow::Field(super::FormatField::Deemphasis)));
+    }
+
+    #[test]
+    fn mixed_batch_source_policy_uses_eligible_member_cd_facts_not_representative() {
+        use super::SOURCE_SAMPLE_RATE_SENTINEL;
+        let mut format = FormatState::new();
+        // Simulate an ineligible representative track while the bounded batch
+        // inventory has proved that another member is eligible and explicitly
+        // tagged. The De-emphasis policy applies only to those eligible members.
+        format.source_pcm_rate_hz = Some(96_000);
+        format.source_pcm_bit_depth = Some(24);
+        format.source_pcm_float_bits = None;
+        format.format.select_value(&AudioFormat::Flac);
+        format.sample_rate.select_value(&SOURCE_SAMPLE_RATE_SENTINEL);
+        format.bit_depth.select_value(&super::BitDepthChoice::Source);
+        format.set_batch_convert_deemphasis_summary(1, 1, 0, 0, 2);
+
+        assert!(format.deemphasis_target_is_preservation_domain());
+        assert!(
+            !format.deemphasis_enabled,
+            "Source resolves through each eligible 16/44.1 member, not the representative"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3989,6 +4270,10 @@ pub struct SourceState {
     /// Prevents N probes during rapid navigation — only fires once
     /// the cursor has been still for 150ms.
     pub batch_probe_debounce: Option<(PathBuf, std::time::Instant)>,
+    /// Per-item technical eligibility and narrow Convert evidence for CD de-emphasis.
+    pub deemphasis_batch_preflight: BTreeMap<PathBuf, ConvertDeemphasisPathState>,
+    /// True while the current source generation has a bounded batch preflight in flight.
+    pub deemphasis_batch_preflight_pending: bool,
     /// Audio paths whose sibling sidecar CUE was already evaluated by browse
     /// queue expansion and classified as a metadata artifact. This metadata is
     /// part of the Convert source payload, not process-global state: the user
@@ -4061,6 +4346,8 @@ impl Clone for SourceState {
             advanced_open: self.advanced_open,
             batch_probe_pending: self.batch_probe_pending.clone(),
             batch_probe_debounce: self.batch_probe_debounce.clone(),
+            deemphasis_batch_preflight: self.deemphasis_batch_preflight.clone(),
+            deemphasis_batch_preflight_pending: self.deemphasis_batch_preflight_pending,
             cue_artifact_audio: self.cue_artifact_audio.clone(),
             cue_artifact_metadata: self.cue_artifact_metadata.clone(),
             explicit_cue_source_policy: self.explicit_cue_source_policy,
@@ -4082,6 +4369,8 @@ impl Default for SourceState {
             advanced_open: false,
             batch_probe_pending: None,
             batch_probe_debounce: None,
+            deemphasis_batch_preflight: BTreeMap::new(),
+            deemphasis_batch_preflight_pending: false,
             cue_artifact_audio: std::collections::HashSet::new(),
             cue_artifact_metadata: std::collections::BTreeMap::new(),
             explicit_cue_source_policy: None,
@@ -4128,6 +4417,8 @@ pub enum FormatField {
     BitDepth,
     Resampler,
     Dither,
+    /// CD source-rate de-emphasis correction.
+    Deemphasis,
     ReplayGain,
     /// Enable the ordinary-PCM true-peak measure/gain step.
     PcmTruePeak,
@@ -4404,6 +4695,19 @@ pub struct FormatState {
     /// Probe-established lossless PCM/source class used only for the
     /// lossless->lossy automatic safety default. `None` means unknown.
     pub source_is_lossless: Option<bool>,
+    /// Probe-established PCM rate/depth retained independently of output policy.
+    pub source_pcm_rate_hz: Option<u32>,
+    pub source_pcm_bit_depth: Option<u32>,
+    /// Strict destructive-feature eligibility and source evidence.
+    pub deemphasis_eligible: bool,
+    pub deemphasis_evidence: ConvertDeemphasisEvidence,
+    pub deemphasis_enabled: bool,
+    pub deemphasis_overridden: bool,
+    /// Aggregate batch counts for promoted warning text.
+    pub deemphasis_explicit_count: usize,
+    pub deemphasis_cue_count: usize,
+    pub deemphasis_catalog_count: usize,
+    pub deemphasis_total_count: usize,
     /// Probe-established DSD source sample rate used to disable impossible
     /// profile choices without replacing planner-grade validation.
     pub source_dsd_rate_hz: Option<u32>,
@@ -4738,6 +5042,16 @@ impl FormatState {
             source_is_dsd: false,
             source_pcm_float_bits: None,
             source_is_lossless: None,
+            source_pcm_rate_hz: None,
+            source_pcm_bit_depth: None,
+            deemphasis_eligible: false,
+            deemphasis_evidence: ConvertDeemphasisEvidence::None,
+            deemphasis_enabled: false,
+            deemphasis_overridden: false,
+            deemphasis_explicit_count: 0,
+            deemphasis_cue_count: 0,
+            deemphasis_catalog_count: 0,
+            deemphasis_total_count: 0,
             source_dsd_rate_hz: None,
             source_rate_identity: SourceRateIdentity::Unstaged,
             field_focus: FormatField::Format,
@@ -5019,6 +5333,9 @@ impl FormatState {
                     FormatPaneRow::Field(FormatField::Dither),
                 ]);
             }
+            if self.deemphasis_eligible && self.deemphasis_evidence != ConvertDeemphasisEvidence::None {
+                rows.push(FormatPaneRow::Field(FormatField::Deemphasis));
+            }
             if !self.source_is_dsd {
                 rows.push(FormatPaneRow::Field(FormatField::PcmTruePeak));
                 match *self.pcm_gain_mode.selected_value() {
@@ -5070,6 +5387,14 @@ impl FormatState {
                     DsdGainMode::Off => {}
                 }
             }
+        }
+
+        if maximized
+            && self.deemphasis_eligible
+            && self.deemphasis_evidence == ConvertDeemphasisEvidence::None
+        {
+            rows.push(FormatPaneRow::Spacer);
+            rows.push(FormatPaneRow::Field(FormatField::Deemphasis));
         }
 
         if maximized && self.format.selected_value().available_containers().len() > 1 {
@@ -5381,6 +5706,11 @@ impl FormatState {
     /// Select the next enabled pill in the focused row and run row-specific side effects.
     /// Key and mouse handlers should use this instead of calling `focused_pill_mut()` directly.
     pub fn select_focused_next(&mut self, source_bits: Option<u32>, source_rate: Option<u32>) {
+        if self.field_focus == FormatField::Deemphasis {
+            self.deemphasis_enabled = !self.deemphasis_enabled;
+            self.deemphasis_overridden = true;
+            return;
+        }
         if self.field_focus == FormatField::Container {
             self.select_container_next();
             return;
@@ -5407,6 +5737,11 @@ impl FormatState {
 
     /// Select the previous enabled pill in the focused row and run row-specific side effects.
     pub fn select_focused_prev(&mut self, source_bits: Option<u32>, source_rate: Option<u32>) {
+        if self.field_focus == FormatField::Deemphasis {
+            self.deemphasis_enabled = !self.deemphasis_enabled;
+            self.deemphasis_overridden = true;
+            return;
+        }
         if self.field_focus == FormatField::Container {
             self.select_container_prev();
             return;
@@ -5460,6 +5795,17 @@ impl FormatState {
             FormatField::BitDepth => select_enabled_index(&mut self.bit_depth, index),
             FormatField::Resampler => select_enabled_index(&mut self.resampler, index),
             FormatField::Dither => select_enabled_index(&mut self.dither, index),
+            FormatField::Deemphasis => {
+                if !self.deemphasis_eligible {
+                    false
+                } else if index < 2 {
+                    self.deemphasis_enabled = index == 1;
+                    self.deemphasis_overridden = true;
+                    true
+                } else {
+                    false
+                }
+            }
             FormatField::ReplayGain => select_enabled_index(&mut self.replaygain, index),
             FormatField::PcmTruePeak => select_enabled_index(&mut self.pcm_gain_mode, index),
             FormatField::PcmGainDb => {
@@ -5751,6 +6097,136 @@ impl FormatState {
         }
     }
 
+    /// Install narrow source evidence without broadening the generic detector.
+    pub fn set_convert_deemphasis_evidence(&mut self, evidence: &ConvertPreemphasisEvidence) {
+        self.deemphasis_evidence = if evidence.explicit_affirmative {
+            ConvertDeemphasisEvidence::ExplicitTag
+        } else if evidence.cue_flag {
+            ConvertDeemphasisEvidence::CueFlag
+        } else if evidence.catalog_exact {
+            ConvertDeemphasisEvidence::CatalogExact
+        } else {
+            ConvertDeemphasisEvidence::None
+        };
+        self.deemphasis_explicit_count = if evidence.explicit_affirmative { 1 } else { 0 };
+        self.deemphasis_cue_count = if !evidence.explicit_affirmative && evidence.cue_flag {
+            1
+        } else {
+            0
+        };
+        self.deemphasis_catalog_count = if !evidence.explicit_affirmative
+            && !evidence.cue_flag
+            && evidence.catalog_exact
+        {
+            1
+        } else {
+            0
+        };
+        self.deemphasis_total_count = 1;
+        self.recompute_auto_deemphasis();
+    }
+
+    /// Install an aggregate batch inventory while preserving per-path execution
+    /// authority in SourceState.
+    pub fn set_batch_convert_deemphasis_summary(
+        &mut self,
+        eligible_count: usize,
+        explicit_count: usize,
+        cue_count: usize,
+        catalog_count: usize,
+        total_count: usize,
+    ) {
+        self.deemphasis_eligible = eligible_count > 0;
+        self.deemphasis_evidence = if explicit_count > 0 {
+            ConvertDeemphasisEvidence::ExplicitTag
+        } else if cue_count > 0 {
+            ConvertDeemphasisEvidence::CueFlag
+        } else if catalog_count > 0 {
+            ConvertDeemphasisEvidence::CatalogExact
+        } else {
+            ConvertDeemphasisEvidence::None
+        };
+        self.deemphasis_explicit_count = explicit_count;
+        self.deemphasis_cue_count = cue_count;
+        self.deemphasis_catalog_count = catalog_count;
+        self.deemphasis_total_count = total_count;
+        self.recompute_auto_deemphasis();
+    }
+
+    /// True only for the one output domain that may retain a pre-emphasized
+    /// waveform and CD playback signaling.
+    pub fn deemphasis_target_is_preservation_domain(&self) -> bool {
+        let format = *self.format.selected_value();
+        let lossless_pcm = matches!(
+            format,
+            AudioFormat::Flac
+                | AudioFormat::Wav
+                | AudioFormat::Aiff
+                | AudioFormat::WavPack
+                | AudioFormat::Alac
+                | AudioFormat::Lpcm
+        ) && !(format == AudioFormat::WavPack && self.wavpack_hybrid);
+        if !lossless_pcm {
+            return false;
+        }
+        // Destructure the control so the repository-wide PreparedTrack
+        // migration audit does not mistake this FormatState field for audio data.
+        let Self { sample_rate, .. } = self;
+        // The control is scoped to members already proven eligible. For that
+        // domain, a Source rate/depth selector resolves to integer 16/44.1 even
+        // when a mixed batch's representative path itself is ineligible. Do not
+        // let representative-track facts contaminate the per-item automatic
+        // preservation policy.
+        let rate = match *sample_rate.selected_value() {
+            SOURCE_SAMPLE_RATE_SENTINEL if self.deemphasis_eligible => Some(44_100),
+            SOURCE_SAMPLE_RATE_SENTINEL => self.source_pcm_rate_hz,
+            rate => Some(rate),
+        };
+        let integer_16 = match *self.bit_depth.selected_value() {
+            BitDepthChoice::Source if self.deemphasis_eligible => true,
+            BitDepthChoice::Source => self.source_pcm_bit_depth == Some(16)
+                && self.source_pcm_float_bits.is_none(),
+            BitDepthChoice::Int16 => true,
+            BitDepthChoice::Int24
+            | BitDepthChoice::Int32
+            | BitDepthChoice::Float32
+            | BitDepthChoice::Float64 => false,
+        };
+        rate == Some(44_100) && integer_16
+    }
+
+    pub fn recompute_auto_deemphasis(&mut self) {
+        if self.deemphasis_overridden {
+            return;
+        }
+        self.deemphasis_enabled = self.deemphasis_eligible
+            && self.deemphasis_evidence == ConvertDeemphasisEvidence::ExplicitTag
+            && !self.deemphasis_target_is_preservation_domain();
+    }
+
+    pub fn deemphasis_override_warning_active(&self) -> bool {
+        self.deemphasis_eligible
+            && self.deemphasis_evidence == ConvertDeemphasisEvidence::ExplicitTag
+            && self.deemphasis_overridden
+            && !self.deemphasis_enabled
+            && !self.deemphasis_target_is_preservation_domain()
+    }
+
+    /// Reset only the user-policy provenance when a genuinely different source
+    /// is installed. Probe enrichment for the same source must not call this.
+    pub fn reset_deemphasis_for_source_replacement(&mut self) {
+        self.deemphasis_eligible = false;
+        self.deemphasis_evidence = ConvertDeemphasisEvidence::None;
+        self.deemphasis_enabled = false;
+        self.deemphasis_overridden = false;
+        self.deemphasis_explicit_count = 0;
+        self.deemphasis_cue_count = 0;
+        self.deemphasis_catalog_count = 0;
+        self.deemphasis_total_count = 0;
+        self.source_pcm_rate_hz = None;
+        self.source_pcm_bit_depth = None;
+    }
+
     /// Clear only decisions that were derived from source facts when the newly
     /// installed source has no reliable probe information.
     ///
@@ -5769,6 +6245,17 @@ impl FormatState {
         self.source_is_dsd = false;
         self.source_pcm_float_bits = None;
         self.source_is_lossless = None;
+        self.source_pcm_rate_hz = None;
+        self.source_pcm_bit_depth = None;
+        self.deemphasis_eligible = false;
+        self.deemphasis_evidence = ConvertDeemphasisEvidence::None;
+        self.deemphasis_explicit_count = 0;
+        self.deemphasis_cue_count = 0;
+        self.deemphasis_catalog_count = 0;
+        self.deemphasis_total_count = 0;
+        if !self.deemphasis_overridden {
+            self.deemphasis_enabled = false;
+        }
         self.source_dsd_rate_hz = None;
         self.source_rate_identity = SourceRateIdentity::Lost;
 
@@ -6219,6 +6706,7 @@ impl FormatState {
                 self.source_derived_bit_depth = Some(selected);
             }
         }
+        self.recompute_auto_deemphasis();
         if !self.visible_fields(true).contains(&self.field_focus) {
             self.field_focus = FormatField::Format;
         }
@@ -6264,6 +6752,7 @@ impl FormatState {
             FormatField::BitDepth => FocusedPill::BitDepth(&mut self.bit_depth),
             FormatField::Resampler => FocusedPill::Resampler(&mut self.resampler),
             FormatField::Dither => FocusedPill::Dither(&mut self.dither),
+            FormatField::Deemphasis => unreachable!("de-emphasis uses its dedicated boolean selector"),
             FormatField::ReplayGain => FocusedPill::ReplayGain(&mut self.replaygain),
             FormatField::PcmTruePeak => FocusedPill::PcmTruePeak(&mut self.pcm_gain_mode),
             FormatField::PcmGainDb => FocusedPill::PcmGainDb {
@@ -6984,6 +7473,10 @@ impl ConvertState {
                     None
                 };
                 self.format.source_is_lossless = source_info_is_lossless(info);
+                let SourceInfo { sample_rate: source_rate, .. } = info;
+                self.format.source_pcm_rate_hz = (!source_is_dsd).then_some(*source_rate);
+                self.format.source_pcm_bit_depth = (!source_is_dsd).then_some(info.bit_depth).flatten();
+                self.format.deemphasis_eligible = crate::tui::probe::convert_cd_deemphasis_eligible(info);
             }
             None => {
                 let hint = self
@@ -7018,6 +7511,10 @@ impl ConvertState {
             None
         };
         self.format.source_is_lossless = source_info_is_lossless(info);
+        let SourceInfo { sample_rate: source_rate, .. } = info;
+        self.format.source_pcm_rate_hz = (!is_dsd).then_some(*source_rate);
+        self.format.source_pcm_bit_depth = (!is_dsd).then_some(info.bit_depth).flatten();
+        self.format.deemphasis_eligible = crate::tui::probe::convert_cd_deemphasis_eligible(info);
         self.format.apply_format_constraints();
         self.format.apply_auto_gain_defaults();
     }
@@ -7054,6 +7551,9 @@ impl ConvertState {
     /// Replace the convert source mode and reset metadata list state in one
     /// place so source changes cannot leave stale scroll or double-click state.
     pub fn set_source_mode(&mut self, mode: SourceMode) {
+        let previous_paths = self.source.mode.all_paths();
+        let next_paths = mode.all_paths();
+        let same_logical_source = previous_paths == next_paths;
         self.clear_pending_archive_preview();
         self.source.mode.cleanup_archive_preview_staging();
         let retained_paths = mode.all_paths();
@@ -7072,6 +7572,11 @@ impl ConvertState {
         self.source.cleanup_synthetic_cue_artifacts_not_in(&retained_paths);
         self.source.batch_probe_pending = None;
         self.source.batch_probe_debounce = None;
+        if !same_logical_source {
+            self.source.deemphasis_batch_preflight.clear();
+            self.source.deemphasis_batch_preflight_pending = false;
+            self.format.reset_deemphasis_for_source_replacement();
+        }
         self.source.explicit_cue_source_policy = None;
         self.reset_metadata_file_list_state();
         self.source.mode = mode;
@@ -7113,6 +7618,10 @@ impl ConvertState {
             None
         };
         self.format.source_is_lossless = source_info_is_lossless(info);
+        let SourceInfo { sample_rate: source_rate_for_policy, .. } = info;
+        self.format.source_pcm_rate_hz = (!is_dsd_source).then_some(*source_rate_for_policy);
+        self.format.source_pcm_bit_depth = (!is_dsd_source).then_some(info.bit_depth).flatten();
+        self.format.deemphasis_eligible = crate::tui::probe::convert_cd_deemphasis_eligible(info);
 
         if is_dsd_source {
             if !self.format.is_dsd_selected() {
@@ -14075,6 +14584,11 @@ pub struct AppState {
     /// resolves the source-relative DSD/PCM constraints. Generation and path
     /// bind the continuation to the exact source transition that created it.
     pub pending_browse_convert_preset_continuation: Option<PendingBrowseConvertPresetContinuation>,
+    /// Browse Last Used / preset post-load action deferred only until the
+    /// matching batch de-emphasis safety preflight completes.
+    pub pending_browse_convert_post_load_continuation: Option<
+        PendingBrowseConvertPostLoadContinuation,
+    >,
     /// Session-persistent advanced CUE choices keyed by folder. Normal quiet
     /// auto-selection remains the default for folders with no override.
     pub cue_selection_overrides: crate::convert::queue_expansion::QueueCueSelectionOverrides,
@@ -15306,6 +15820,7 @@ impl AppState {
             tui_tx: None,
             pending_browse_convert_expansion: None,
             pending_browse_convert_preset_continuation: None,
+            pending_browse_convert_post_load_continuation: None,
             cue_selection_overrides: crate::convert::queue_expansion::QueueCueSelectionOverrides::new(),
             browse_cue_inspection_generation: 0,
             preset: PresetState::default(),
@@ -19536,6 +20051,69 @@ FILE "album.flac" FLAC
         assert_eq!(
             tracks.first().and_then(|track| track.title.as_deref()),
             Some("Embedded One")
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn explicitly_selected_cue_flags_pre_promotes_deemphasis_but_keeps_it_off() {
+        use crate::convert::pipeline::CueSidecarPolicy;
+
+        let dir = temp_test_dir("direct_cue_flags_pre_convert");
+        let cue_path = dir.join("album.cue");
+        let image_path = dir.join("album.flac");
+        write_test_file(&image_path, "probe is mocked");
+        write_test_file(
+            &cue_path,
+            r#"PERFORMER "Artist"
+TITLE "Album"
+FILE "album.flac" FLAC
+  TRACK 01 AUDIO
+    FLAGS PRE
+    INDEX 01 00:00:00
+"#,
+        );
+
+        let mut eligible_info = source_info(44_100, Some(16), 2);
+        eligible_info.compression_is_lossless = Some(true);
+        eligible_info.sample_format_is_float = Some(false);
+        let mut hook = CueProxyProbeTestHook::default();
+        hook.probe_results
+            .insert(image_path.clone(), Ok(eligible_info));
+
+        let (result, hook) = with_cue_proxy_probe_test_hook(hook, || {
+            probe_cue_proxy_source(&cue_path, CueSidecarPolicy::SidecarOnly)
+                .expect("direct CUE proxy should succeed")
+        });
+        assert_eq!(hook.probed_paths, vec![image_path]);
+        assert!(result.metadata.convert_preemphasis.cue_flag);
+        assert!(!result.metadata.convert_preemphasis.explicit_affirmative);
+
+        let mode = SourceMode::from_single_with_probe_notice(
+            cue_path.clone(),
+            result.info,
+            result.metadata.clone(),
+            result.probe_notice,
+            CueSidecarPolicy::SidecarOnly,
+        );
+        let mut convert = ConvertState::new();
+        convert.set_source_mode(mode);
+        apply_source_metadata_to_convert(&mut convert, &result.metadata);
+        convert.apply_source_defaults();
+
+        assert_eq!(
+            convert.format.deemphasis_evidence,
+            ConvertDeemphasisEvidence::CueFlag
+        );
+        assert!(convert.format.deemphasis_eligible);
+        assert!(convert
+            .format
+            .pane_rows(false)
+            .contains(&FormatPaneRow::Field(FormatField::Deemphasis)));
+        assert!(
+            !convert.format.deemphasis_enabled,
+            "CUE FLAGS PRE is advisory and must never auto-enable processing"
         );
 
         let _ = std::fs::remove_dir_all(dir);

@@ -850,6 +850,15 @@ fn match_catalog_sources(tag_values: &[String], folder: Option<&str>) -> Option<
     folder.and_then(|folder| match_text(folder, CatalogMatchSource::Folder))
 }
 
+/// Match one actual catalog-tag value against the authoritative list.
+///
+/// This deliberately does not inspect the filesystem or a folder name. Convert's
+/// de-emphasis advisory uses it after the existing Lofty pass so only an actual
+/// source CATALOGNUMBER value can promote the control.
+pub(crate) fn match_catalog_tag_value(value: &str) -> Option<CatalogMatch> {
+    match_text(value.trim(), CatalogMatchSource::Tag)
+}
+
 /// Check tags first, then the containing folder, for an exact catalog ID from
 /// the bundled authoritative list. No prefix/range/series inference is made.
 pub fn check_catalog_evidence(audio_path: &Path) -> Option<CatalogMatch> {

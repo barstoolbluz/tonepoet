@@ -5716,8 +5716,24 @@ fn artifact_requires_authoritative_metadata_write(
     source_level_authoritative_tags_required
         || dvd_audio_artifact_has_authoritative_metadata(artifact, source)
         || sidecar_cue_artifact_has_authoritative_metadata(artifact, source, req)
+        || artifact_requires_preemphasis_signaling_cleanup(artifact, source, req)
         || prepared_artifact_requires_post_encode_metadata(artifact, source, req)
         || m4a_artifact_has_freeform_metadata(artifact, source)
+}
+
+fn artifact_requires_preemphasis_signaling_cleanup(
+    artifact: &TrackArtifact,
+    source: &PreparedSource,
+    req: &PipelineRequest,
+) -> bool {
+    let Some(track) = source.tracks.iter().find(|track| track.id == artifact.track_id) else {
+        return false;
+    };
+    suppress_preemphasis_signaling_for_track(req, track)
+        && tags_contain_preemphasis_signaling(&authoritative_metadata_tags(
+            &track.metadata,
+            &source.album_metadata,
+        ))
 }
 
 fn sidecar_cue_artifact_has_authoritative_metadata(
@@ -5882,6 +5898,7 @@ fn m4a_artifact_has_freeform_metadata(
                 &artifact.staged_path,
                 &track.metadata,
                 &source.album_metadata,
+                false,
             )
             .is_empty()
         })
@@ -5975,6 +5992,7 @@ async fn apply_metadata_to_track_artifact(
     metadata: Option<&TrackMetadata>,
     album: &AlbumMetadata,
     artwork: Option<&CueArtworkSidecar>,
+    suppress_preemphasis_signaling: bool,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
@@ -6000,6 +6018,7 @@ async fn apply_metadata_to_track_artifact(
                 metadata,
                 album,
                 artwork,
+                suppress_preemphasis_signaling,
                 &bound_runner,
                 cancel,
                 tool_concurrency_limits,
@@ -6021,6 +6040,7 @@ async fn apply_metadata_to_track_artifact(
             metadata,
             album,
             artwork,
+            suppress_preemphasis_signaling,
             runner,
             cancel,
             tool_concurrency_limits,
@@ -6302,11 +6322,14 @@ pub async fn apply_metadata_with_tool_limits(
                     }
                 }
                 let meta = prepared_track.map(|t| &t.metadata);
+                let suppress_preemphasis_signaling = prepared_track
+                    .is_some_and(|track| suppress_preemphasis_signaling_for_track(req, track));
                 apply_metadata_to_track_artifact(
                     artifact,
                     meta,
                     &source.album_metadata,
                     cue_artwork.as_ref(),
+                    suppress_preemphasis_signaling,
                     runner,
                     cancel,
                     tool_concurrency_limits.as_ref(),
@@ -6321,6 +6344,7 @@ pub async fn apply_metadata_with_tool_limits(
                 &album_as_track,
                 &source.album_metadata,
                 cue_artwork.as_ref(),
+                suppress_preemphasis_signaling_for_merged(req, source),
                 runner,
                 cancel,
                 tool_concurrency_limits.as_ref(),
@@ -6357,6 +6381,7 @@ fn merged_album_metadata_as_track(source: &PreparedSource) -> TrackMetadata {
 pub(crate) async fn restore_merged_mp4_terminal_metadata_after_structural_remux(
     path: &Path,
     source: &PreparedSource,
+    suppress_preemphasis_signaling: bool,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
@@ -6366,6 +6391,7 @@ pub(crate) async fn restore_merged_mp4_terminal_metadata_after_structural_remux(
         path,
         &album_as_track,
         &source.album_metadata,
+        suppress_preemphasis_signaling,
         runner,
         cancel,
         tool_concurrency_limits,
@@ -6375,6 +6401,7 @@ pub(crate) async fn restore_merged_mp4_terminal_metadata_after_structural_remux(
         path,
         &album_as_track,
         &source.album_metadata,
+        suppress_preemphasis_signaling,
         cancel,
     )
     .await
@@ -7071,6 +7098,88 @@ pub(crate) fn authoritative_metadata_tags(
     authoritative_metadata_tags_with_nul_projection(meta, album).0
 }
 
+fn preemphasis_signaling_key_kind(key: &str) -> Option<&'static str> {
+    let normalized = key
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .map(|character| character.to_ascii_uppercase())
+        .collect::<String>();
+    match normalized.as_str() {
+        "PREEMPHASIS" => Some("pre_emphasis"),
+        "CUEFLAGS" => Some("cue_flags"),
+        _ => None,
+    }
+}
+
+fn cue_flags_without_pre(value: &str) -> Option<String> {
+    let flags = value
+        .split_whitespace()
+        .filter(|token| !token.eq_ignore_ascii_case("PRE"))
+        .collect::<Vec<_>>();
+    (!flags.is_empty()).then(|| flags.join(" "))
+}
+
+fn tags_contain_preemphasis_signaling(tags: &[(String, String)]) -> bool {
+    tags.iter().any(|(key, value)| match preemphasis_signaling_key_kind(key) {
+        Some("pre_emphasis") => is_affirmative_preemphasis_value(value),
+        Some("cue_flags") => value
+            .split_whitespace()
+            .any(|token| token.eq_ignore_ascii_case("PRE")),
+        _ => false,
+    })
+}
+
+fn suppress_preemphasis_signaling_from_tags(
+    tags: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    tags.into_iter()
+        .filter_map(|(key, value)| match preemphasis_signaling_key_kind(&key) {
+            Some("pre_emphasis") => None,
+            Some("cue_flags") => cue_flags_without_pre(&value).map(|value| (key, value)),
+            _ => Some((key, value)),
+        })
+        .collect()
+}
+
+fn authoritative_metadata_tags_for_output(
+    meta: &TrackMetadata,
+    album: &AlbumMetadata,
+    suppress_preemphasis_signaling: bool,
+) -> Vec<(String, String)> {
+    let tags = authoritative_metadata_tags(meta, album);
+    if suppress_preemphasis_signaling {
+        suppress_preemphasis_signaling_from_tags(tags)
+    } else {
+        tags
+    }
+}
+
+#[cfg(test)]
+mod r18_preemphasis_output_policy_tests {
+    use super::*;
+
+    #[test]
+    fn suppression_removes_preemphasis_aliases_and_only_pre_cue_token() {
+        let filtered = suppress_preemphasis_signaling_from_tags(vec![
+            ("PRE_EMPHASIS".to_owned(), "1".to_owned()),
+            ("PRE-EMPHASIS".to_owned(), "YES".to_owned()),
+            ("CUE_FLAGS".to_owned(), "DCP PRE 4CH".to_owned()),
+            ("COMMENT".to_owned(), "keep".to_owned()),
+        ]);
+        assert!(!filtered.iter().any(|(key, _)| preemphasis_signaling_key_kind(key) == Some("pre_emphasis")));
+        assert!(filtered.iter().any(|(key, value)| key == "CUE_FLAGS" && value == "DCP 4CH"));
+        assert!(filtered.iter().any(|(key, value)| key == "COMMENT" && value == "keep"));
+    }
+
+    #[test]
+    fn signaling_detector_is_semantic_but_does_not_treat_negative_value_as_active() {
+        assert!(tags_contain_preemphasis_signaling(&[("PRE EMPHASIS".to_owned(), "YES".to_owned())]));
+        assert!(tags_contain_preemphasis_signaling(&[("CUE-FLAGS".to_owned(), "PRE DCP".to_owned())]));
+        assert!(!tags_contain_preemphasis_signaling(&[("PRE_EMPHASIS".to_owned(), "0".to_owned())]));
+        assert!(!tags_contain_preemphasis_signaling(&[("CUE_FLAGS".to_owned(), "DCP".to_owned())]));
+    }
+}
+
 fn tag_value<'a>(tags: &'a [(String, String)], key: &str) -> Option<&'a str> {
     tags.iter()
         .find(|(candidate, _)| candidate == key)
@@ -7496,6 +7605,7 @@ fn m4a_freeform_tag_pairs_for_file(
     path: &Path,
     meta: &TrackMetadata,
     album: &AlbumMetadata,
+    suppress_preemphasis_signaling: bool,
 ) -> Vec<(String, String)> {
     let ext = path
         .extension()
@@ -7505,7 +7615,11 @@ fn m4a_freeform_tag_pairs_for_file(
     if !matches!(ext.as_str(), "m4a" | "m4b" | "mp4") {
         return Vec::new();
     }
-    m4a_freeform_tag_pairs(&authoritative_metadata_tags(meta, album))
+    m4a_freeform_tag_pairs(&authoritative_metadata_tags_for_output(
+        meta,
+        album,
+        suppress_preemphasis_signaling,
+    ))
 }
 
 /// Write the non-native authoritative keys as iTunes freeform atoms
@@ -7548,11 +7662,17 @@ async fn apply_m4a_freeform_tags(
     path: &Path,
     meta: &TrackMetadata,
     album: &AlbumMetadata,
+    suppress_preemphasis_signaling: bool,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
 ) -> Result<(), MetadataError> {
-    let pairs = m4a_freeform_tag_pairs_for_file(path, meta, album);
+    let pairs = m4a_freeform_tag_pairs_for_file(
+        path,
+        meta,
+        album,
+        suppress_preemphasis_signaling,
+    );
     if pairs.is_empty() {
         return Ok(());
     }
@@ -8273,6 +8393,7 @@ async fn apply_pipeline_multivalue_overlay(
     path: &Path,
     meta: &TrackMetadata,
     album: &AlbumMetadata,
+    suppress_preemphasis_signaling: bool,
     cancel: &CancellationToken,
 ) -> Result<(), MetadataError> {
     let ext = path
@@ -8287,7 +8408,11 @@ async fn apply_pipeline_multivalue_overlay(
         return Ok(());
     }
 
-    let tags = authoritative_metadata_tags(meta, album);
+    let tags = authoritative_metadata_tags_for_output(
+        meta,
+        album,
+        suppress_preemphasis_signaling,
+    );
     let changes = pipeline_multivalue_overlay_changes_for_extension(&tags, &ext);
     if changes.is_empty() {
         // Critical scalar-compatibility invariant: do not invoke an in-process
@@ -8382,6 +8507,7 @@ async fn tag_audio_file(
     path: &Path,
     meta: &TrackMetadata,
     album: &AlbumMetadata,
+    suppress_preemphasis_signaling: bool,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
@@ -8392,8 +8518,17 @@ async fn tag_audio_file(
         .unwrap_or("")
         .to_lowercase();
 
-    let tags = authoritative_metadata_tags(meta, album);
-    if !authoritative_metadata_mutation_required(meta, album, &tags) {
+    let source_tags = authoritative_metadata_tags(meta, album);
+    let removes_preemphasis_signaling = suppress_preemphasis_signaling
+        && tags_contain_preemphasis_signaling(&source_tags);
+    let tags = if suppress_preemphasis_signaling {
+        suppress_preemphasis_signaling_from_tags(source_tags)
+    } else {
+        source_tags
+    };
+    if !authoritative_metadata_mutation_required(meta, album, &tags)
+        && !removes_preemphasis_signaling
+    {
         return Ok(None);
     }
 
@@ -8479,6 +8614,7 @@ pub(crate) async fn write_authority_matrix_tags_for_test(
         path,
         meta,
         album,
+        false,
         &runner,
         &CancellationToken::new(),
         None,
@@ -8492,6 +8628,7 @@ async fn apply_production_metadata_to_file(
     meta: &TrackMetadata,
     album: &AlbumMetadata,
     artwork: Option<&CueArtworkSidecar>,
+    suppress_preemphasis_signaling: bool,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
@@ -8500,6 +8637,7 @@ async fn apply_production_metadata_to_file(
         path,
         meta,
         album,
+        suppress_preemphasis_signaling,
         runner,
         cancel,
         tool_concurrency_limits,
@@ -8517,11 +8655,18 @@ async fn apply_production_metadata_to_file(
         .await?;
     }
 
-    let m4a_freeform_mutator_applied = !m4a_freeform_tag_pairs_for_file(path, meta, album).is_empty();
+    let m4a_freeform_mutator_applied = !m4a_freeform_tag_pairs_for_file(
+        path,
+        meta,
+        album,
+        suppress_preemphasis_signaling,
+    )
+    .is_empty();
     apply_m4a_freeform_tags(
         path,
         meta,
         album,
+        suppress_preemphasis_signaling,
         runner,
         cancel,
         tool_concurrency_limits,
@@ -8536,7 +8681,14 @@ async fn apply_production_metadata_to_file(
     // whenever repeated fields require that primary carrier. RF64 remains on
     // its validated FFmpeg INFO carrier; unsupported RF64 fields are rejected
     // before the primary rewrite because Lofty 0.21.1 cannot parse RF64.
-    apply_pipeline_multivalue_overlay(path, meta, album, cancel).await?;
+    apply_pipeline_multivalue_overlay(
+        path,
+        meta,
+        album,
+        suppress_preemphasis_signaling,
+        cancel,
+    )
+    .await?;
 
     Ok(ProductionMetadataMutationOutcome {
         primary_mutator,
@@ -8571,7 +8723,7 @@ pub async fn qualify_production_metadata_mutation(
             ),
         ));
     }
-    apply_production_metadata_to_file(path, meta, album, None, runner, cancel, None).await
+    apply_production_metadata_to_file(path, meta, album, None, false, runner, cancel, None).await
 }
 
 #[cfg(test)]
@@ -8672,6 +8824,7 @@ mod metadata_writer_command_tests {
             &path,
             &track,
             &AlbumMetadata::default(),
+            false,
             &cancel,
         )
         .await
@@ -9320,6 +9473,7 @@ mod metadata_writer_command_tests {
                 &path,
                 &track,
                 &AlbumMetadata::default(),
+                false,
                 &runner,
                 &CancellationToken::new(),
                 None,
@@ -9357,6 +9511,7 @@ mod metadata_writer_command_tests {
             &path,
             &track,
             &AlbumMetadata::default(),
+            false,
             &CancellationToken::new(),
         )
             .await
@@ -10164,13 +10319,13 @@ mod metadata_writer_command_tests {
         insert_source_text_tag(&mut track.extra, "MY_NOTE", "keep me");
         let album = AlbumMetadata::default();
 
-        let m4a = m4a_freeform_tag_pairs_for_file(Path::new("track.m4a"), &track, &album);
-        let m4b = m4a_freeform_tag_pairs_for_file(Path::new("book.m4b"), &track, &album);
-        let mp4 = m4a_freeform_tag_pairs_for_file(Path::new("track.mp4"), &track, &album);
+        let m4a = m4a_freeform_tag_pairs_for_file(Path::new("track.m4a"), &track, &album, false);
+        let m4b = m4a_freeform_tag_pairs_for_file(Path::new("book.m4b"), &track, &album, false);
+        let mp4 = m4a_freeform_tag_pairs_for_file(Path::new("track.mp4"), &track, &album, false);
         assert_eq!(m4b, m4a);
         assert_eq!(mp4, m4a);
         assert!(m4b.iter().any(|(key, value)| key == "MY_NOTE" && value == "keep me"));
-        assert!(m4a_freeform_tag_pairs_for_file(Path::new("track.aac"), &track, &album).is_empty());
+        assert!(m4a_freeform_tag_pairs_for_file(Path::new("track.aac"), &track, &album, false).is_empty());
 
         let command = m4a_freeform_tag_command(Path::new("book.m4b"), &m4b);
         assert_eq!(command.binary, ToolBinary::AtomicParsley);
@@ -10818,6 +10973,7 @@ mod metadata_writer_command_tests {
             &track,
             &AlbumMetadata::default(),
             None,
+            false,
             &runner,
             &CancellationToken::new(),
             None,
@@ -10861,6 +11017,7 @@ mod metadata_writer_command_tests {
             &track,
             &AlbumMetadata::default(),
             None,
+            false,
             &runner,
             &CancellationToken::new(),
             None,
@@ -10916,6 +11073,7 @@ mod metadata_writer_command_tests {
             &track,
             &album,
             None,
+            false,
             &runner,
             &CancellationToken::new(),
             None,
@@ -11011,6 +11169,7 @@ mod metadata_writer_command_tests {
             &track,
             &AlbumMetadata::default(),
             None,
+            false,
             &runner,
             &CancellationToken::new(),
             None,
@@ -11061,6 +11220,7 @@ mod metadata_writer_command_tests {
             &track,
             &album,
             None,
+            false,
             &runner,
             &cancel,
             None,
@@ -11097,6 +11257,7 @@ mod metadata_writer_command_tests {
             &track,
             &album,
             None,
+            false,
             &runner,
             &cancel,
             None,
@@ -11189,6 +11350,7 @@ mod metadata_writer_command_tests {
                 &track,
                 &AlbumMetadata::default(),
                 None,
+                false,
                 &runner,
                 &CancellationToken::new(),
                 None,
@@ -11222,6 +11384,7 @@ mod metadata_writer_command_tests {
             &supported_track,
             &AlbumMetadata::default(),
             None,
+            false,
             &runner,
             &CancellationToken::new(),
             None,
@@ -11316,6 +11479,7 @@ mod metadata_writer_command_tests {
             &track,
             &album,
             None,
+            false,
             &runner,
             &CancellationToken::new(),
             None,
@@ -11360,6 +11524,7 @@ mod metadata_writer_command_tests {
             &track,
             &album,
             None,
+            false,
             &runner,
             &CancellationToken::new(),
             None,
@@ -11410,6 +11575,7 @@ mod metadata_writer_command_tests {
             &wav_metadata,
             &reread_album,
             None,
+            false,
             &runner,
             &CancellationToken::new(),
             None,
@@ -11483,6 +11649,7 @@ mod metadata_writer_command_tests {
             &track,
             &album,
             Some(&artwork),
+            false,
             &runner,
             &CancellationToken::new(),
             None,
@@ -11544,6 +11711,7 @@ mod metadata_writer_command_tests {
             &track,
             &album,
             Some(&artwork),
+            false,
             &runner,
             &CancellationToken::new(),
             None,
@@ -11600,6 +11768,7 @@ mod metadata_writer_command_tests {
             &track,
             &album,
             None,
+            false,
             &runner,
             &CancellationToken::new(),
             None,
@@ -12627,7 +12796,20 @@ FILE "album.flac" WAVE
         }
         let tags = format_tag_map(probe);
         let context = format!("{} {pass}", case.name);
-        assert_tag_value(&tags, "PRE_EMPHASIS", "1", &context);
+        if case.format.is_pcm_lossless() {
+            // Matrix inputs are integer 16/44.1 and WavPack is non-hybrid, so
+            // lossless targets remain inside the CD pre-emphasis signalling
+            // domain and must preserve the source flag.
+            assert_tag_value(&tags, "PRE_EMPHASIS", "1", &context);
+        } else {
+            // R18 intentionally strips the flag once the target leaves that
+            // domain. Retaining it on a lossy output could make a compliant
+            // player apply de-emphasis to already transformed audio.
+            assert!(
+                !tags.contains_key("PRE_EMPHASIS"),
+                "{context} must suppress PRE_EMPHASIS outside the 16/44.1 lossless signalling domain; tags were {tags:?}"
+            );
+        }
         assert_tag_value(&tags, "MY_NOTE", "keep me", &context);
     }
 
@@ -12730,7 +12912,13 @@ FILE "album.flac" WAVE
             tonepoet_pipeline::AudioFormat::Opus => {
                 let stdout = run_output("opustags", &[path.display().to_string()]);
                 let counts = key_value_line_counts(&stdout);
-                assert_managed_key_counts_once(case.name, &counts, &["TITLE", "ARTIST", "ALBUM", "GENRE", "DATE", "TRACKNUMBER", "PRE_EMPHASIS", "MY_NOTE"]);
+                assert_managed_key_counts_once(case.name, &counts, &["TITLE", "ARTIST", "ALBUM", "GENRE", "DATE", "TRACKNUMBER", "MY_NOTE"]);
+                assert_eq!(
+                    counts.get("PRE_EMPHASIS").copied().unwrap_or(0),
+                    0,
+                    "{} must suppress PRE_EMPHASIS on lossy Opus output: {counts:?}",
+                    case.name
+                );
             }
             tonepoet_pipeline::AudioFormat::WavPack => {
                 let counts = apev2_item_key_counts(&std::fs::read(path).expect("read WavPack output"));
@@ -23915,6 +24103,7 @@ fn metadata_satisfaction_label(
                 &artifact.staged_path,
                 &track.metadata,
                 &source.album_metadata,
+                false,
             )
             .is_empty()
         });
@@ -24754,6 +24943,115 @@ fn resolved_target_bit_depth(
     settings: &tonepoet_pipeline::PipelineSettings,
 ) -> Option<u32> {
     resolved_target_pcm_depth(track, settings).map(tonepoet_pipeline::PcmBitDepth::bits)
+}
+
+fn request_applies_cd_deemphasis(req: &PipelineRequest) -> bool {
+    req.registered_effects.iter().any(|intent| {
+        matches!(
+            intent.effect,
+            tonepoet_pipeline::RegisteredUnaryEffect::CdDeemphasis
+        )
+    })
+}
+
+fn track_preserves_cd_preemphasis_signaling_domain(
+    track: &PreparedTrack,
+    settings: &tonepoet_pipeline::PipelineSettings,
+) -> bool {
+    if !settings.target_format.is_pcm_lossless()
+        || (settings.target_format == tonepoet_pipeline::AudioFormat::WavPack
+            && settings.wavpack.hybrid)
+    {
+        return false;
+    }
+    resolved_target_rate_hz(track, settings) == Some(44_100)
+        && resolved_target_pcm_depth(track, settings)
+            == Some(tonepoet_pipeline::PcmBitDepth::Int16)
+}
+
+fn suppress_preemphasis_signaling_for_track(
+    req: &PipelineRequest,
+    track: &PreparedTrack,
+) -> bool {
+    request_applies_cd_deemphasis(req)
+        || !track_preserves_cd_preemphasis_signaling_domain(track, &req.settings)
+}
+
+fn suppress_preemphasis_signaling_for_merged(
+    req: &PipelineRequest,
+    source: &PreparedSource,
+) -> bool {
+    request_applies_cd_deemphasis(req)
+        || source.tracks.is_empty()
+        || source
+            .tracks
+            .iter()
+            .any(|track| !track_preserves_cd_preemphasis_signaling_domain(track, &req.settings))
+}
+
+#[cfg(test)]
+mod r18_preemphasis_target_domain_tests {
+    use super::*;
+
+    fn eligible_cd_track() -> PreparedTrack {
+        PreparedTrack {
+            id: TrackId {
+                source_ordinal: 0,
+                disc_number: None,
+                track_number: 1,
+            },
+            source_ref: TrackSourceRef::StagedFile(PathBuf::from("source.flac")),
+            metadata: TrackMetadata::default(),
+            expected_samples: None,
+            sample_rate: Some(44_100),
+            source_audio: SourceAudioDescriptor::from_scalar(
+                Some(44_100),
+                Some(16),
+                Some(SourceAudioCoding::Pcm),
+            ),
+            bit_depth: Some(16),
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn output_signaling_preservation_domain_is_only_lossless_integer_16_44100() {
+        let track = eligible_cd_track();
+        let mut settings = tonepoet_pipeline::PipelineSettings::default();
+        settings.target_format = tonepoet_pipeline::AudioFormat::Flac;
+        settings.target_sample_rate = tonepoet_pipeline::RateTarget::Source;
+        settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Source;
+        assert!(track_preserves_cd_preemphasis_signaling_domain(&track, &settings));
+
+        settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(
+            tonepoet_pipeline::PcmBitDepth::Int24,
+        );
+        assert!(!track_preserves_cd_preemphasis_signaling_domain(&track, &settings));
+
+        settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(
+            tonepoet_pipeline::PcmBitDepth::Int32,
+        );
+        assert!(!track_preserves_cd_preemphasis_signaling_domain(&track, &settings));
+
+        settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(
+            tonepoet_pipeline::PcmBitDepth::Float32,
+        );
+        assert!(!track_preserves_cd_preemphasis_signaling_domain(&track, &settings));
+
+        settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(
+            tonepoet_pipeline::PcmBitDepth::Int16,
+        );
+        settings.target_sample_rate = tonepoet_pipeline::RateTarget::PcmHz(48_000);
+        assert!(!track_preserves_cd_preemphasis_signaling_domain(&track, &settings));
+
+        settings.target_sample_rate = tonepoet_pipeline::RateTarget::PcmHz(44_100);
+        settings.target_format = tonepoet_pipeline::AudioFormat::Mp3;
+        assert!(!track_preserves_cd_preemphasis_signaling_domain(&track, &settings));
+
+        settings.target_format = tonepoet_pipeline::AudioFormat::WavPack;
+        settings.wavpack.hybrid = true;
+        assert!(!track_preserves_cd_preemphasis_signaling_domain(&track, &settings));
+    }
 }
 
 fn source_depth_policy_tpdf_for_track(
@@ -38201,10 +38499,23 @@ fn registered_resampler_output_representation(
                         ))
                     }
                 };
-                if realization.kind != tonepoet_pipeline::PcmTerminalRealizationKind::SsrcDirectWav
+                let expected_dither_owner = if effective_dither.dither_id.is_some()
+                    || effective_dither.pdf_type.is_some()
+                {
+                    tonepoet_pipeline::PcmTerminalDitherOwner::SsrcResampler
+                } else {
+                    tonepoet_pipeline::PcmTerminalDitherOwner::None
+                };
+                if !matches!(
+                    realization.kind,
+                    tonepoet_pipeline::PcmTerminalRealizationKind::SsrcDirectWav
+                        | tonepoet_pipeline::PcmTerminalRealizationKind::SsrcPreterminalFfmpegPackage
+                        | tonepoet_pipeline::PcmTerminalRealizationKind::SsrcPreterminalSoxPackage
+                )
                     || realization.selected_tool != tonepoet_pipeline::ToolIdentifier::Ssrc
                     || realization.target_bit_depth != *effective_output_depth
                     || realization.ssrc_dither.as_ref() != Some(effective_dither)
+                    || realization.dither_owner != expected_dither_owner
                 {
                     return Err(format!(
                         "typed terminal SSRC resampler {} disagrees with its terminal realization",
@@ -40254,6 +40565,190 @@ fn registered_effect_f64le_command(
         expected_duration,
         "Phase-3 registered pre-gain effect",
     ))
+}
+
+#[cfg(test)]
+mod r18_deemphasis_lowering_tests {
+    use super::*;
+
+    fn forced_ssrc_deemphasis_request(
+        target_format: tonepoet_pipeline::AudioFormat,
+        output_path: &str,
+    ) -> tonepoet_pipeline::PlanRequest {
+        let mut settings = tonepoet_pipeline::PipelineSettings::default();
+        settings.target_format = target_format;
+        settings.target_sample_rate = tonepoet_pipeline::RateTarget::PcmHz(88_200);
+        settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(
+            tonepoet_pipeline::PcmBitDepth::Int24,
+        );
+        settings.preferred_tool = tonepoet_pipeline::PreferredTool::Ssrc;
+        settings.ssrc.force = true;
+        settings.dither_type = tonepoet_pipeline::DitherType::None;
+        settings.metadata.transfer_tags = false;
+        settings.metadata.preserve_artwork = false;
+        tonepoet_pipeline::PlanRequest {
+            input_path: PathBuf::from("source.flac"),
+            output_path: PathBuf::from(output_path),
+            source: tonepoet_pipeline::SourceInfo {
+                format: tonepoet_pipeline::AudioFormat::Flac,
+                codec: tonepoet_pipeline::AudioCodec::Flac,
+                sample_rate_hz: Some(44_100),
+                bit_depth: Some(tonepoet_pipeline::PcmBitDepth::Int16),
+                true_source_depth: Some(tonepoet_pipeline::PcmBitDepth::Int16),
+                source_representation: tonepoet_pipeline::SourceRepresentationKind::Pcm,
+                sample_kind: Some(tonepoet_pipeline::SampleKind::SignedInteger),
+                channels: Some(2),
+                duration: None,
+                frame_extent: None,
+                dsd_source_kind: None,
+                audio_md5: None,
+            },
+            settings,
+            plan_scope: tonepoet_pipeline::PlanScope::track("r18-stage-bridge"),
+            intermediate_dir: Some(PathBuf::from("work")),
+            container_ffmpeg_flags: Vec::new(),
+            resolved_output_target: None,
+            reference_programme_scope: Default::default(),
+            planned_riff_non_audio_upper_bound_bytes: None,
+        }
+    }
+
+    fn cd_deemphasis_intent() -> tonepoet_pipeline::EffectIntent {
+        tonepoet_pipeline::EffectIntent {
+            id: tonepoet_pipeline::EffectInstanceId(9002),
+            effect: tonepoet_pipeline::RegisteredUnaryEffect::CdDeemphasis,
+            after: Vec::new(),
+            placement: tonepoet_pipeline::EffectPlacement::SourceRate,
+        }
+    }
+
+    #[test]
+    fn cd_deemphasis_lowerings_do_not_smuggle_a_rate_conversion() {
+        let candidates = tonepoet_pipeline::registered_effect_candidates(
+            &tonepoet_pipeline::RegisteredUnaryEffect::CdDeemphasis,
+        )
+        .expect("CD de-emphasis candidates");
+        for lowering in candidates {
+            let planned = registered_effect_f64le_command(
+                &lowering,
+                Path::new("input.wav"),
+                false,
+                Path::new("output.wav"),
+                RegisteredEffectOutputCarrier::WavFloat64,
+                44_100,
+                2,
+                None,
+            )
+            .expect("lower de-emphasis command");
+            match lowering.tool {
+                tonepoet_pipeline::ToolIdentifier::Sox => {
+                    assert!(planned.args.iter().any(|arg| arg == "deemph"));
+                    assert!(!planned.args.iter().any(|arg| arg == "rate"));
+                }
+                tonepoet_pipeline::ToolIdentifier::Ffmpeg => {
+                    let filter = planned.args.windows(2).find_map(|pair| {
+                        (pair[0] == "-af").then_some(pair[1].as_str())
+                    });
+                    assert_eq!(filter, Some("aemphasis=mode=reproduction:type=cd"));
+                    assert!(!planned.args.iter().any(|arg| arg.contains("aresample")));
+                    assert!(!planned.args.iter().any(|arg| arg == "-ar"));
+                }
+                other => panic!("unexpected CD de-emphasis backend: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn registered_resampler_output_accepts_ssrc_ffmpeg_package_terminal() {
+        let request = forced_ssrc_deemphasis_request(
+            tonepoet_pipeline::AudioFormat::Flac,
+            "out.flac",
+        );
+        let contract = crate::convert::pipeline::plan_bridge::registered_effect_execution_contract(
+            &request,
+            &[cd_deemphasis_intent()],
+        )
+        .expect("forced SSRC FLAC registered-effect contract");
+        let resampler = contract.resampler.expect("selected SSRC resampler");
+        let Some(tonepoet_pipeline::SelectedTerminalRealization::Pcm(realization)) =
+            resampler.selected.terminal_realization.as_ref()
+        else {
+            panic!("SSRC FLAC route must retain package-only terminal realization")
+        };
+        assert_eq!(
+            realization.kind,
+            tonepoet_pipeline::PcmTerminalRealizationKind::SsrcPreterminalFfmpegPackage,
+        );
+        let lowered = selected_registered_resampler_command(
+            &request,
+            &resampler,
+            Path::new("after-deemphasis.wav"),
+            Path::new("after-ssrc.wav"),
+            None,
+        )
+        .expect("lower selected SSRC resampler");
+        assert_eq!(lowered.tool, tonepoet_pipeline::ToolIdentifier::Ssrc);
+        assert_eq!(lowered.args.iter().filter(|arg| arg.as_str() == "--rate").count(), 1);
+        assert!(lowered
+            .args
+            .windows(2)
+            .any(|pair| pair[0] == "--rate" && pair[1] == "88200"));
+        let representation = registered_resampler_output_representation(&resampler)
+            .expect("FFmpeg package-only SSRC terminal must cross carrier boundary");
+        assert!(matches!(
+            representation,
+            RegisteredEffectCarrierRepresentation::TerminalPcmWav {
+                bit_depth: tonepoet_pipeline::PcmBitDepth::Int24,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn registered_resampler_output_accepts_ssrc_sox_package_terminal() {
+        let request = forced_ssrc_deemphasis_request(
+            tonepoet_pipeline::AudioFormat::WavPack,
+            "out.wv",
+        );
+        let contract = crate::convert::pipeline::plan_bridge::registered_effect_execution_contract(
+            &request,
+            &[cd_deemphasis_intent()],
+        )
+        .expect("forced SSRC WavPack registered-effect contract");
+        let resampler = contract.resampler.expect("selected SSRC resampler");
+        let Some(tonepoet_pipeline::SelectedTerminalRealization::Pcm(realization)) =
+            resampler.selected.terminal_realization.as_ref()
+        else {
+            panic!("SSRC WavPack route must retain package-only terminal realization")
+        };
+        assert_eq!(
+            realization.kind,
+            tonepoet_pipeline::PcmTerminalRealizationKind::SsrcPreterminalSoxPackage,
+        );
+        let lowered = selected_registered_resampler_command(
+            &request,
+            &resampler,
+            Path::new("after-deemphasis.wav"),
+            Path::new("after-ssrc.wav"),
+            None,
+        )
+        .expect("lower selected SSRC resampler");
+        assert_eq!(lowered.tool, tonepoet_pipeline::ToolIdentifier::Ssrc);
+        assert_eq!(lowered.args.iter().filter(|arg| arg.as_str() == "--rate").count(), 1);
+        assert!(lowered
+            .args
+            .windows(2)
+            .any(|pair| pair[0] == "--rate" && pair[1] == "88200"));
+        let representation = registered_resampler_output_representation(&resampler)
+            .expect("SoX package-only SSRC terminal must cross carrier boundary");
+        assert!(matches!(
+            representation,
+            RegisteredEffectCarrierRepresentation::TerminalPcmWav {
+                bit_depth: tonepoet_pipeline::PcmBitDepth::Int24,
+                ..
+            }
+        ));
+    }
 }
 
 fn fusible_ordinary_sox_highpass_lowpass_pair(
@@ -44648,6 +45143,7 @@ pub(crate) async fn finish_pipeline_album_for_scheduler_with_tool_limits_and_ret
             runner,
             cancel,
             req.stages.metadata != StageRequirement::Disabled,
+            suppress_preemphasis_signaling_for_merged(&req, &source_value),
             tool_concurrency_limits.as_ref(),
         )
         .await
@@ -45828,6 +46324,7 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_once(
             runner,
             cancel,
             req.stages.metadata != StageRequirement::Disabled,
+            suppress_preemphasis_signaling_for_merged(&req, source_ref),
             None,
         )
         .await
@@ -69417,6 +69914,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             &fixture.album.source.tracks[0].metadata,
             &fixture.album.source.album_metadata,
             None,
+            false,
             &runner,
             &CancellationToken::new(),
             None,
@@ -69515,6 +70013,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             &fixture.album.source.tracks[0].metadata,
             &fixture.album.source.album_metadata,
             None,
+            false,
             &runner,
             &CancellationToken::new(),
             None,
@@ -69669,6 +70168,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             &w64_path,
             &fixture.album.source.tracks[0].metadata,
             &fixture.album.source.album_metadata,
+            false,
             &runner,
             &cancel,
             None,

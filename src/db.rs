@@ -6308,6 +6308,7 @@ impl CachedProbeRow {
             year: self.year.clone(),
             track_number: self.track_number,
             catalog_number: self.catalog_number.clone(),
+            convert_preemphasis: Default::default(), // Narrow Convert evidence is not persisted in this cache row.
             rg_track_gain: self.rg_track_gain.clone(),
             rg_track_peak: self.rg_track_peak.clone(),
             rg_album_gain: self.rg_album_gain.clone(),
