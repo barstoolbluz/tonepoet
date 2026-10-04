@@ -2332,7 +2332,11 @@ fn resolve_ssrc_terminal_realization(
             input_precision: input_state.precision.clone(),
             input_value_domain: input_state.value_domain.clone(),
             target_format: request.settings.target_format.clone(),
-            target_rate_hz: Some(target_rate_hz),
+            // SSRC itself owns the rate change. Only direct WAV output is a
+            // terminal rate-changing realization; the FLAC/WavPack paths are
+            // sample-preserving package-only continuations.
+            target_rate_hz: (kind == PcmTerminalRealizationKind::SsrcDirectWav)
+                .then_some(target_rate_hz),
             target_bit_depth,
             wavpack_hybrid: false,
             effective_dither,
@@ -3703,12 +3707,16 @@ fn plan_typed_with_effects_and_policy(
     // not allowed to hide the quantizer/encoder/modulator boundary from
     // observations, claims, or plan identity.
     if !intent.reference_delivery && !bridge_passthrough && !pcm_terminal_owned_by_resampler {
-        if let Some(operation) = semantic_terminal_operation(request, &lowering_bridge_operations) {
-            let input_state = states
-                .iter()
-                .find(|state| state.id == working_signal)
-                .cloned()
-                .expect("working signal must have a typed state");
+        let input_state = states
+            .iter()
+            .find(|state| state.id == working_signal)
+            .cloned()
+            .expect("working signal must have a typed state");
+        if let Some(operation) = semantic_terminal_operation(
+            request,
+            &lowering_bridge_operations,
+            &input_state,
+        ) {
             let terminal = SignalId(next_signal);
             next_signal += 1;
             let terminal_state = terminal_audio_state(request, terminal, &input_state, &operation);
@@ -6037,6 +6045,7 @@ fn target_pcm_depth_fact(request: &PlanRequest) -> Fact<PcmBitDepth> {
 fn semantic_terminal_operation(
     request: &PlanRequest,
     bridge_operations: &[PlanOperation],
+    input_state: &AudioState,
 ) -> Option<PlanOperation> {
     if let Some(operation) = bridge_operations.iter().rev().find(|operation| {
         matches!(
@@ -6086,6 +6095,12 @@ fn semantic_terminal_operation(
             return None;
         };
         let target_rate_hz = match target_pcm_rate_fact(request) {
+            // The semantic spine may already have performed the requested
+            // rate change even when the Phase-2 bridge is intentionally empty
+            // (for example, a registered-effect Phase-3 route). Do not make
+            // the terminal claim a second resample when its input is already
+            // at the requested rate.
+            Fact::Known(rate) if input_state.sample_rate_hz == Fact::Known(rate) => None,
             Fact::Known(rate) => Some(rate),
             Fact::Pending(_) | Fact::Unavailable(_) => None,
         };

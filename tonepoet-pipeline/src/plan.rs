@@ -1796,6 +1796,28 @@ fn validate_selected_terminal_lowering(
             _ => None,
         })
         .collect::<Vec<_>>();
+    // Package-only SSRC terminal realizations deliberately carry no terminal
+    // rate: the rate-changing owner is the selected semantic ResamplePcm node.
+    // Recover that node's exact rate for lowering validation rather than
+    // weakening the binding to "some" brick-wall resampler.
+    let selected_ssrc_rate_hz = typed.nodes.iter().find_map(|node| {
+        let crate::semantic_plan::TypedPlanNode::Operation {
+            operation: PlanOperation::ResamplePcm { target_rate_hz, .. },
+            candidates,
+            selected_candidate,
+            ..
+        } = node
+        else {
+            return None;
+        };
+        let candidate = candidates.get(*selected_candidate)?;
+        matches!(
+            candidate.contract.terminal_realization.as_ref(),
+            Some(SelectedTerminalRealization::Pcm(candidate_realization))
+                if candidate_realization == realization
+        )
+        .then_some(*target_rate_hz)
+    });
     let ssrc_indices = steps
         .iter()
         .enumerate()
@@ -1804,8 +1826,17 @@ fn validate_selected_terminal_lowering(
                 target_rate_hz,
                 target_bit_depth: Some(target_bit_depth),
                 ..
-            } if Some(*target_rate_hz) == realization.target_rate_hz
-                && target_bit_depth == &realization.target_bit_depth => Some(index),
+            } if target_bit_depth == &realization.target_bit_depth
+                && match realization.kind {
+                    PcmTerminalRealizationKind::SsrcDirectWav => {
+                        Some(*target_rate_hz) == realization.target_rate_hz
+                    }
+                    PcmTerminalRealizationKind::SsrcPreterminalFfmpegPackage
+                    | PcmTerminalRealizationKind::SsrcPreterminalSoxPackage => {
+                        Some(*target_rate_hz) == selected_ssrc_rate_hz
+                    }
+                    _ => false,
+                } => Some(index),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -1958,7 +1989,7 @@ fn validate_selected_terminal_lowering(
             ) {
                 return Err(PlanningError::invalid_settings(
                     "terminal_realization",
-                    "SSRC preterminal package must lower as an exact-depth/rate EncodePcm operation with apply_processing=false",
+                    "SSRC preterminal package must lower as a sample-preserving exact-depth EncodePcm operation with apply_processing=false",
                 ));
             }
             if commands[ssrc_index].output.as_path() != package.input.as_path() {
@@ -3037,7 +3068,7 @@ fn plan_from_pcm(
                 steps,
                 current_input,
                 final_work,
-                Some(ssrc_target_rate_hz),
+                None,
                 target_depth,
                 false,
             )?;

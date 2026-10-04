@@ -140,6 +140,7 @@ pub fn draw_format_pane(
                         } else {
                             match format_state.deemphasis_evidence {
                                 ConvertDeemphasisEvidence::ExplicitTag => "Pre-emphasis detected",
+                                ConvertDeemphasisEvidence::CueFlag => "ⓘ CUE flags pre-emphasis",
                                 ConvertDeemphasisEvidence::CatalogExact => "ⓘ Possible pre-emphasis",
                                 ConvertDeemphasisEvidence::None => "",
                             }

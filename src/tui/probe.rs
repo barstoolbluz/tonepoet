@@ -72,12 +72,17 @@ impl Default for ArtworkInfo {
     }
 }
 
-/// Narrow Convert-only evidence extracted from tags already opened by Lofty.
-/// This is intentionally stricter than the generic pre-emphasis detector.
+/// Narrow Convert-only evidence used by the CD de-emphasis control.
+///
+/// Tag/catalog facts are extracted from the source's ordinary metadata pass;
+/// `cue_flag` is populated separately, after technical CD eligibility is
+/// established, by the bounded sidecar association scan.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ConvertPreemphasisTagEvidence {
+pub struct ConvertPreemphasisEvidence {
     /// Exact `PRE_EMPHASIS` field with trimmed value `1` or case-insensitive `YES`.
     pub explicit_affirmative: bool,
+    /// A reliably associated parsed CUE track carries a real `FLAGS PRE` directive.
+    pub cue_flag: bool,
     /// Actual source CATALOGNUMBER value, if present.
     pub catalog_number: Option<String>,
     /// Whether that actual tag value is an exact authoritative catalog hit.
@@ -107,8 +112,10 @@ pub struct SourceMetadata {
     /// field. Used by the bulk rename wizard for `%CATALOG%`.
     pub catalog_number: Option<String>,
 
-    /// Convert-only narrow pre-emphasis evidence from this same tag pass.
-    pub convert_preemphasis: ConvertPreemphasisTagEvidence,
+    /// Convert-only narrow pre-emphasis evidence. Tag/catalog facts come from
+    /// this metadata pass; associated CUE evidence is added later, only after
+    /// technical CD eligibility is established.
+    pub convert_preemphasis: ConvertPreemphasisEvidence,
 
     /// Gain/peak values from REPLAYGAIN_* tags. Raw strings as stored in the
     /// file (e.g. `"-6.57 dB"` for gain, `"0.988281"` for peak).
@@ -8668,12 +8675,12 @@ fn source_metadata_tool_from_tag(tag: &lofty::tag::Tag) -> Option<String> {
 /// detector used by Details and other callers.
 pub(crate) fn convert_preemphasis_evidence_from_tags(
     tags: &[lofty::tag::Tag],
-) -> ConvertPreemphasisTagEvidence {
+) -> ConvertPreemphasisEvidence {
     use lofty::tag::ItemKey;
 
     let pre_key = ItemKey::Unknown("PRE_EMPHASIS".to_string());
     let catalog_key = ItemKey::Unknown("CATALOGNUMBER".to_string());
-    let mut evidence = ConvertPreemphasisTagEvidence::default();
+    let mut evidence = ConvertPreemphasisEvidence::default();
 
     for tag in tags {
         if !evidence.explicit_affirmative {
@@ -8704,7 +8711,7 @@ pub(crate) fn convert_preemphasis_evidence_from_tags(
 /// Technical eligibility must be established by the caller before invoking it.
 pub(crate) fn read_convert_preemphasis_tag_evidence(
     path: &Path,
-) -> Result<ConvertPreemphasisTagEvidence, String> {
+) -> Result<ConvertPreemphasisEvidence, String> {
     use lofty::file::TaggedFileExt;
     let tagged = lofty::read_from_path(path)
         .map_err(|error| format!("failed to read Convert pre-emphasis tags: {error}"))?;
@@ -8726,7 +8733,11 @@ mod convert_deemphasis_evidence_tests {
 
     fn tag_with(key: ItemKey, value: &str) -> Tag {
         let mut tag = Tag::new(TagType::VorbisComments);
-        tag.push(TagItem::new(key, ItemValue::Text(value.to_owned())));
+        // These tests deliberately exercise exact unknown/native field names.
+        // Lofty's checked `push` rejects an ItemKey::Unknown that cannot be
+        // mapped through the generic-key table, so use the API intended for
+        // preserving such format-native keys.
+        tag.push_unchecked(TagItem::new(key, ItemValue::Text(value.to_owned())));
         tag
     }
 

@@ -12796,7 +12796,20 @@ FILE "album.flac" WAVE
         }
         let tags = format_tag_map(probe);
         let context = format!("{} {pass}", case.name);
-        assert_tag_value(&tags, "PRE_EMPHASIS", "1", &context);
+        if case.format.is_pcm_lossless() {
+            // Matrix inputs are integer 16/44.1 and WavPack is non-hybrid, so
+            // lossless targets remain inside the CD pre-emphasis signalling
+            // domain and must preserve the source flag.
+            assert_tag_value(&tags, "PRE_EMPHASIS", "1", &context);
+        } else {
+            // R18 intentionally strips the flag once the target leaves that
+            // domain. Retaining it on a lossy output could make a compliant
+            // player apply de-emphasis to already transformed audio.
+            assert!(
+                !tags.contains_key("PRE_EMPHASIS"),
+                "{context} must suppress PRE_EMPHASIS outside the 16/44.1 lossless signalling domain; tags were {tags:?}"
+            );
+        }
         assert_tag_value(&tags, "MY_NOTE", "keep me", &context);
     }
 
@@ -12899,7 +12912,13 @@ FILE "album.flac" WAVE
             tonepoet_pipeline::AudioFormat::Opus => {
                 let stdout = run_output("opustags", &[path.display().to_string()]);
                 let counts = key_value_line_counts(&stdout);
-                assert_managed_key_counts_once(case.name, &counts, &["TITLE", "ARTIST", "ALBUM", "GENRE", "DATE", "TRACKNUMBER", "PRE_EMPHASIS", "MY_NOTE"]);
+                assert_managed_key_counts_once(case.name, &counts, &["TITLE", "ARTIST", "ALBUM", "GENRE", "DATE", "TRACKNUMBER", "MY_NOTE"]);
+                assert_eq!(
+                    counts.get("PRE_EMPHASIS").copied().unwrap_or(0),
+                    0,
+                    "{} must suppress PRE_EMPHASIS on lossy Opus output: {counts:?}",
+                    case.name
+                );
             }
             tonepoet_pipeline::AudioFormat::WavPack => {
                 let counts = apev2_item_key_counts(&std::fs::read(path).expect("read WavPack output"));

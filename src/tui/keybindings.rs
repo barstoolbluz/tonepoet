@@ -71930,6 +71930,10 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 app.convert.focus = ConvertFocus::Format;
                 let message = if app.convert.format.deemphasis_override_warning_active() {
                     "De-emphasis is Off for a non-preservation target. The output waveform will remain pre-emphasized, but TonePoet will suppress pre-emphasis playback signaling for this target.".to_string()
+                } else if app.convert.format.deemphasis_evidence
+                    == ConvertDeemphasisEvidence::CueFlag
+                {
+                    "An associated CUE track contains FLAGS PRE. TonePoet treats this as advisory evidence only, so de-emphasis has not been enabled automatically. Turn De-emphasis On to process the flagged source.".to_string()
                 } else {
                     "This catalog number matches a release known to use CD pre-emphasis. TonePoet did not find an affirmative PRE_EMPHASIS tag, so de-emphasis has not been enabled automatically.".to_string()
                 };

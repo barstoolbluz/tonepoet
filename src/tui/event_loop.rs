@@ -855,31 +855,7 @@ fn check_batch_probe_debounce(app: &mut AppState, tx: &mpsc::Sender<AppMessage>)
 }
 
 fn check_deemphasis_batch_preflight(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
-    if app.convert.source.deemphasis_batch_preflight_pending {
-        return;
-    }
-    let (paths, known_info) = match &app.convert.source.mode {
-        super::app::SourceMode::Batch { paths, cursor, cursor_info, .. } if !paths.is_empty() => {
-            if app.convert.source.deemphasis_batch_preflight.len() == paths.len()
-                && paths.iter().all(|path| app.convert.source.deemphasis_batch_preflight.contains_key(path))
-            {
-                return;
-            }
-            let mut known = std::collections::BTreeMap::new();
-            if let (Some(path), Some(info)) = (paths.get(*cursor), cursor_info.as_ref()) {
-                known.insert(path.clone(), info.clone());
-            }
-            (paths.clone(), known)
-        }
-        _ => return,
-    };
-    app.convert.source.deemphasis_batch_preflight_pending = true;
-    super::app::spawn_convert_deemphasis_batch_preflight(
-        app.probe_generation,
-        paths,
-        known_info,
-        tx.clone(),
-    );
+    let _ = super::app::ensure_convert_deemphasis_batch_preflight(app, tx);
 }
 
 fn check_browse_probe_debounce(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
@@ -6556,10 +6532,17 @@ fn handle_convert_audio_probe_complete(
 
 fn handle_convert_deemphasis_batch_preflight_complete(
     app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
     generation: u64,
     paths: Vec<std::path::PathBuf>,
     results: Vec<(std::path::PathBuf, super::app::ConvertDeemphasisPathState)>,
 ) {
+    let pending_post_load_matches = app
+        .pending_browse_convert_post_load_continuation
+        .as_ref()
+        .is_some_and(|pending| {
+            pending.generation == generation && pending.paths.as_slice() == paths.as_slice()
+        });
     if generation != app.probe_generation {
         // A same-path generation refresh can obsolete an in-flight inventory.
         // Clear only that matching pending marker so the next event-loop tick
@@ -6571,13 +6554,24 @@ fn handle_convert_deemphasis_batch_preflight_complete(
         ) {
             app.convert.source.deemphasis_batch_preflight_pending = false;
         }
+        if pending_post_load_matches {
+            app.pending_browse_convert_post_load_continuation = None;
+        }
         return;
     }
     let current_paths = match &app.convert.source.mode {
         super::app::SourceMode::Batch { paths, .. } => paths,
-        _ => return,
+        _ => {
+            if pending_post_load_matches {
+                app.pending_browse_convert_post_load_continuation = None;
+            }
+            return;
+        }
     };
     if *current_paths != paths {
+        if pending_post_load_matches {
+            app.pending_browse_convert_post_load_continuation = None;
+        }
         return;
     }
     app.convert.source.deemphasis_batch_preflight_pending = false;
@@ -6596,18 +6590,42 @@ fn handle_convert_deemphasis_batch_preflight_complete(
         .values()
         .filter(|state| state.eligible && state.evidence.explicit_affirmative)
         .count();
+    let cue_count = app
+        .convert
+        .source
+        .deemphasis_batch_preflight
+        .values()
+        .filter(|state| {
+            state.eligible
+                && !state.evidence.explicit_affirmative
+                && state.evidence.cue_flag
+        })
+        .count();
     let catalog_count = app
         .convert
         .source
         .deemphasis_batch_preflight
         .values()
-        .filter(|state| state.eligible && !state.evidence.explicit_affirmative && state.evidence.catalog_exact)
+        .filter(|state| {
+            state.eligible
+                && !state.evidence.explicit_affirmative
+                && !state.evidence.cue_flag
+                && state.evidence.catalog_exact
+        })
         .count();
     app.convert.format.set_batch_convert_deemphasis_summary(
         eligible_count,
         explicit_count,
+        cue_count,
         catalog_count,
         paths.len(),
+    );
+
+    let _ = super::command::complete_pending_browse_convert_post_load_after_deemphasis_preflight(
+        app,
+        tx,
+        generation,
+        &paths,
     );
 }
 
@@ -7857,7 +7875,13 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             );
         }
         AppMessage::ConvertDeemphasisBatchPreflightComplete { generation, paths, results } => {
-            handle_convert_deemphasis_batch_preflight_complete(app, generation, paths, results);
+            handle_convert_deemphasis_batch_preflight_complete(
+                app,
+                tx,
+                generation,
+                paths,
+                results,
+            );
         }
         AppMessage::ProbeCacheWarmComplete { tab_id, generation, path, rows } => {
             // Do not merge here. Queue rows on the owning tab and let the

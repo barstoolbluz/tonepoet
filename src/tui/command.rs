@@ -9333,6 +9333,7 @@ fn finish_browse_queue_review_after_expansion(
     }
     let preset_failure_expansion_warning = expansion_errors.first().cloned();
     app.pending_browse_convert_preset_continuation = None;
+    app.pending_browse_convert_post_load_continuation = None;
 
     // Queue review settings are part of the same user-visible operation as
     // source installation. Preserve them until the source transition reports
@@ -9451,11 +9452,74 @@ fn apply_browse_convert_post_load_action(
     match post_load {
         BrowseConvertPostLoad::ReviewOnly => {}
         BrowseConvertPostLoad::Commit { start } => {
-            if app.current_screen == AppScreen::Convert {
-                execute_commit_with_disc_selection_bridge(app, start, tx);
+            if app.current_screen != AppScreen::Convert {
+                return;
             }
+
+            let batch_paths = match &app.convert.source.mode {
+                super::app::SourceMode::Batch { paths, .. } if !paths.is_empty() => {
+                    Some(paths.clone())
+                }
+                _ => None,
+            };
+            if let Some(paths) = batch_paths {
+                if !super::app::ensure_convert_deemphasis_batch_preflight(app, tx) {
+                    app.pending_browse_convert_post_load_continuation = Some(
+                        super::app::PendingBrowseConvertPostLoadContinuation {
+                            generation: app.probe_generation,
+                            paths,
+                            post_load,
+                        },
+                    );
+                    app.set_status(
+                        "pre-emphasis source scan is completing — conversion will queue automatically",
+                    );
+                    return;
+                }
+            }
+
+            app.pending_browse_convert_post_load_continuation = None;
+            execute_commit_with_disc_selection_bridge(app, start, tx);
         }
     }
+}
+
+/// Resume a Browse post-load commit only after the exact batch safety scan that
+/// deferred it has completed. Returns true when a matching continuation was
+/// consumed, including the case where the user has since left Convert and the
+/// action is therefore discarded rather than replayed elsewhere.
+pub(crate) fn complete_pending_browse_convert_post_load_after_deemphasis_preflight(
+    app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
+    generation: u64,
+    paths: &[PathBuf],
+) -> bool {
+    let matches = app
+        .pending_browse_convert_post_load_continuation
+        .as_ref()
+        .is_some_and(|pending| {
+            pending.generation == generation && pending.paths.as_slice() == paths
+        });
+    if !matches {
+        return false;
+    }
+
+    let pending = app
+        .pending_browse_convert_post_load_continuation
+        .take()
+        .expect("matching deferred post-load continuation must exist");
+    if app.current_screen != AppScreen::Convert {
+        return true;
+    }
+    let current_paths_match = matches!(
+        &app.convert.source.mode,
+        super::app::SourceMode::Batch { paths: current, .. }
+            if current.as_slice() == pending.paths.as_slice()
+    );
+    if current_paths_match {
+        apply_browse_convert_post_load_action(app, tx, pending.post_load);
+    }
+    true
 }
 
 pub(crate) fn execute_queue_with_post_load_commit(

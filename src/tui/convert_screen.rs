@@ -305,7 +305,11 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
             FormatField::Deemphasis => {
                 buttons.record_button(TuiButton::DeemphasisPill(0), Rect::new(label_col, y, 5, 1));
                 buttons.record_button(TuiButton::DeemphasisPill(1), Rect::new(label_col + 7, y, 4, 1));
-                if state.deemphasis_evidence == super::app::ConvertDeemphasisEvidence::CatalogExact
+                if matches!(
+                    state.deemphasis_evidence,
+                    super::app::ConvertDeemphasisEvidence::CatalogExact
+                        | super::app::ConvertDeemphasisEvidence::CueFlag
+                )
                     || state.deemphasis_override_warning_active()
                 {
                     buttons.record_button(TuiButton::DeemphasisInfo, Rect::new(label_col + 13, y, 2, 1));
@@ -892,6 +896,43 @@ mod format_render_registration_tests {
         assert!(matches!(
             app.active_overlay,
             ActiveOverlay::Notice { ref title, .. } if title == "CD pre-emphasis"
+        ));
+    }
+
+    #[test]
+    fn cue_flag_deemphasis_info_hitbox_tracks_rendered_icon_and_opens_notice() {
+        const WIDTH: u16 = 120;
+        const HEIGHT: u16 = 48;
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.convert.format.deemphasis_eligible = true;
+        app.convert.format.deemphasis_evidence = ConvertDeemphasisEvidence::CueFlag;
+        app.convert.format.deemphasis_enabled = false;
+        app.convert.format.deemphasis_overridden = false;
+
+        let terminal = render_deemphasis_info_case(&mut app, WIDTH, HEIGHT);
+        let row = rendered_row(&terminal, WIDTH, HEIGHT, "CUE flags pre-emphasis");
+        let icon_x = rendered_symbol_x(&terminal, WIDTH, row, "ⓘ");
+        assert_eq!(
+            app.button_map.find_button_at(icon_x, row),
+            Some(TuiButton::DeemphasisInfo),
+            "the visible CUE advisory icon must own its screen cell",
+        );
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        crate::tui::keybindings::handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: icon_x,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+            &tx,
+        );
+        assert!(matches!(
+            app.active_overlay,
+            ActiveOverlay::Notice { ref title, ref message, .. }
+                if title == "CD pre-emphasis" && message.contains("FLAGS PRE")
         ));
     }
 
