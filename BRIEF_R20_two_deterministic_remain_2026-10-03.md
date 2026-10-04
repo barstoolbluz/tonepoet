@@ -1,4 +1,4 @@
-# Brief R20 — eight of ten cleared, two deterministic failures remain
+# Brief R20 — seven of eight cleared, one remains, one new
 
 Date: 2026-10-03
 Base: the supplied `tonepoet-src.tar.gz` is the `auto-deemphasis` branch with
@@ -6,6 +6,9 @@ the R19 corrective and CUE `FLAGS PRE` evidence R1–R3 snapshot applied
 unchanged. It compiles with zero warnings; no edits were needed.
 
 The gate went from 7267 passed / 10 failed to 7291 passed / 4 failed.
+
+Of the eight deterministic failures in R19, seven are cleared. One still fails,
+with a different assertion than before. One test that was passing now fails.
 
 ## Correction to the previous brief
 
