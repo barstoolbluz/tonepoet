@@ -6880,6 +6880,8 @@ mod tests {
     fn pipeline_request_for_processor_limit_test(root: &std::path::Path) -> PipelineRequest {
         PipelineRequest {
             registered_effects: Vec::new(),
+            deemphasis_choice_origin: Default::default(),
+            deemphasis_evidence_origin: Default::default(),
             actions: crate::convert::pipeline::ActionPipeline::default(),
             job_id: "processor-limit-job".to_string(),
             item_id: "processor-limit-item".to_string(),

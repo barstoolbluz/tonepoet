@@ -707,7 +707,20 @@ fn pill_row<'a>(
 
     if !suffix.is_empty() {
         spans.push(Span::raw("  "));
-        spans.push(Span::styled(suffix, theme.muted()));
+        if let Some(rest) = suffix.strip_prefix('ⓘ') {
+            spans.push(Span::styled(
+                "ⓘ",
+                Style::default()
+                    .fg(theme.pill_active_fg)
+                    .bg(theme.pill_active_bg)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            if !rest.is_empty() {
+                spans.push(Span::styled(rest, theme.muted()));
+            }
+        } else {
+            spans.push(Span::styled(suffix, theme.muted()));
+        }
     }
 
     let content_width: usize = spans.iter().map(|s| s.width()).sum();
@@ -787,4 +800,34 @@ fn row_with_settings_pill<'a>(
     }
     spans.push(Span::styled("│", theme.border(border_color)));
     Line::from(spans)
+}
+
+#[cfg(test)]
+mod r24_deemphasis_info_affordance_tests {
+    use super::*;
+
+    #[test]
+    fn deemphasis_info_glyph_has_a_solid_control_style() {
+        let theme = super::super::theme::theme_by_slug_or_default(
+            super::super::theme::default_theme_slug(),
+        );
+        let line = pill_row(
+            theme.green,
+            96,
+            "De-emphasis",
+            "ⓘ pre-emphasis will be corrected.",
+            &[],
+            false,
+            theme,
+        );
+        let info = line
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "ⓘ")
+            .expect("information glyph span");
+
+        assert_eq!(info.style.fg, Some(theme.pill_active_fg));
+        assert_eq!(info.style.bg, Some(theme.pill_active_bg));
+        assert!(info.style.add_modifier.contains(Modifier::BOLD));
+    }
 }

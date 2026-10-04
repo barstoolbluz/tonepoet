@@ -245,7 +245,10 @@ pub fn try_pills_to_options(
 
     // Keep legacy fields consistent with the unified settings. Hidden DSD and
     // lossy-codec rows do not leak stale bit-depth, dither, or ReplayGain values.
-    let dither_type = if legacy_bit_depth_applies && !is_dsd {
+    let dither_type = if legacy_bit_depth_applies
+        && !is_dsd
+        && !matches!(bit_depth, BitDepthChoice::Float32 | BitDepthChoice::Float64)
+    {
         Some(dither)
     } else {
         None
@@ -320,6 +323,48 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
     let selected_rate = *format.sample_rate.selected_value();
     let is_dsd = format.is_dsd_selected();
 
+    let selected_dither_enabled = format.dither.options[format.dither.selected].enabled;
+    let format_has_no_generic_pcm_dither_terminal = matches!(
+        *format.format.selected_value(),
+        AudioFormat::Mp3
+            | AudioFormat::Aac
+            | AudioFormat::Opus
+            | AudioFormat::Dts
+            | AudioFormat::Ac3
+            | AudioFormat::Ogg
+    );
+    let target_makes_generic_dither_inactive = is_dsd
+        || format_has_no_generic_pcm_dither_terminal
+        || format.dsd_reference_path_selected()
+        || matches!(
+            *format.bit_depth.selected_value(),
+            BitDepthChoice::Float32 | BitDepthChoice::Float64
+        );
+
+    // Preserve an explicit dither selection across temporary target constraints,
+    // but do not submit a disabled ordinary Int32 PCM cell. Scope this refusal to
+    // targets where generic PCM dither is actually active: a stale Int32 selector
+    // on AAC/DSD/Reference is irrelevant and must not turn an inactive stored
+    // choice into an error.
+    if !target_makes_generic_dither_inactive
+        && *format.bit_depth.selected_value() == BitDepthChoice::Int32
+        && format.dither_overridden
+        && !selected_dither_enabled
+    {
+        return Err(format!(
+            "{} dither is unavailable for the selected Int32 output",
+            format.dither.selected_label()
+        ));
+    }
+
+    // One authoritative UI choice may remain selected while temporarily
+    // inapplicable. Projection, not state mutation, decides whether it is active.
+    // Keep the stored choice for a later compatible PCM target, but forward no
+    // dither authority into the current request. A disabled lossless Int32 cell is
+    // handled by the fail-closed guard above rather than silently becoming None.
+    let dither_inactive_for_request =
+        target_makes_generic_dither_inactive || !selected_dither_enabled;
+
     let (target_sample_rate, target_bit_depth, dither_type, preferred_tool, nyquist_transition) =
         if is_dsd {
             let rate_target = if selected_rate == crate::tui::app::SOURCE_SAMPLE_RATE_SENTINEL {
@@ -371,7 +416,23 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
                     pipeline_enums::RateTarget::PcmHz(selected_rate)
                 },
                 target_depth,
-                map_dither(*format.dither.selected_value()),
+                if dither_inactive_for_request {
+                    pipeline_enums::DitherType::None
+                } else if format.deemphasis_auto_tpdf_applicable() && !format.dither_overridden {
+                    // R24 automatic TPDF is derived per request only when the
+                    // CD de-emphasis effect is registered. Preserve the ordinary
+                    // representative-source automatic value as the non-explicit
+                    // nominal request setting so unrelated mixed-batch members
+                    // keep their pre-R24 dither policy.
+                    let source_bits = if format.source_is_dsd {
+                        Some(1)
+                    } else {
+                        format.source_pcm_bit_depth
+                    };
+                    map_dither(format.ordinary_auto_dither(source_bits))
+                } else {
+                    map_dither(*format.dither.selected_value())
+                },
                 tool,
                 transition,
             )
@@ -482,7 +543,7 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
         resample_quality: format.resample_quality,
         nyquist_transition,
         dither_type,
-        dither_explicit: !is_dsd && format.dither_overridden,
+        dither_explicit: format.dither_overridden && !dither_inactive_for_request,
         preferred_tool,
         force_encode: false,
         flac: tonepoet_pipeline::FlacSettings {
@@ -1114,22 +1175,321 @@ mod lifecycle_forwarder_tests {
     }
 
     #[test]
-    fn dsd_targets_never_forward_pcm_dither_explicitness() {
+    fn r24_deemphasis_auto_tpdf_display_is_derived_per_request_not_serialized_globally() {
+        use crate::tui::app::BitDepthChoice;
+
         let mut format = FormatState::new();
+        format.format.select_value(&AudioFormat::Flac);
+        format.bit_depth.select_value(&BitDepthChoice::Int16);
+        format.source_pcm_bit_depth = Some(16);
+        format.source_pcm_float_bits = None;
+        format.deemphasis_eligible = true;
+        format.deemphasis_enabled = true;
+        format.apply_auto_dither(Some(16));
+
+        assert_eq!(
+            *format.dither.selected_value(),
+            crate::convert::simple_wizard::DitherType::TPDF,
+        );
+        assert!(format.deemphasis_auto_tpdf_applicable());
+        let automatic = format_state_to_pipeline_settings(&format).unwrap();
+        assert_eq!(automatic.dither_type, pipeline_enums::DitherType::None);
+        assert!(!automatic.dither_explicit);
+
+        format.mark_dither_overridden();
+        let explicit = format_state_to_pipeline_settings(&format).unwrap();
+        assert_eq!(explicit.dither_type, pipeline_enums::DitherType::Tpdf);
+        assert!(explicit.dither_explicit);
+    }
+
+    #[test]
+    fn r24_mixed_batch_projects_ordinary_nominal_dither_under_visible_auto_tpdf() {
+        use crate::tui::app::BitDepthChoice;
+
+        let mut format = FormatState::new();
+        format.format.select_value(&AudioFormat::Flac);
+        format.sample_rate.select_value(&88_200);
+        format.bit_depth.select_value(&BitDepthChoice::Int16);
+        format.source_pcm_rate_hz = Some(96_000);
+        format.source_pcm_bit_depth = Some(24);
+        format.source_pcm_float_bits = None;
+        format.set_batch_convert_deemphasis_summary(1, 1, 0, 0, 2);
+
+        assert!(format.deemphasis_enabled);
+        assert!(format.deemphasis_auto_tpdf_applicable());
+        assert_eq!(
+            *format.dither.selected_value(),
+            crate::convert::simple_wizard::DitherType::TPDF,
+            "the aggregate UI must still present the R24 automatic TPDF choice",
+        );
+
+        let projected = format_state_to_pipeline_settings(&format).unwrap();
+        assert_eq!(projected.dither_type, pipeline_enums::DitherType::Shibata);
+        assert!(!projected.dither_explicit);
+
+        // Control: an ordinary represented 16 -> 16 member has no pre-R24
+        // automatic dither to preserve. Its non-explicit nominal remains None;
+        // an actual CdDeemphasis request will derive TPDF in the semantic planner.
+        format.source_pcm_rate_hz = Some(44_100);
+        format.source_pcm_bit_depth = Some(16);
+        format.apply_auto_dither(Some(16));
+        assert_eq!(
+            *format.dither.selected_value(),
+            crate::convert::simple_wizard::DitherType::TPDF,
+        );
+        let projected = format_state_to_pipeline_settings(&format).unwrap();
+        assert_eq!(projected.dither_type, pipeline_enums::DitherType::None);
+        assert!(!projected.dither_explicit);
+    }
+
+    #[test]
+    fn explicit_unavailable_int32_shibata_refuses_submission_without_silent_rewrite() {
+        use crate::tui::app::BitDepthChoice;
+
+        let mut format = FormatState::new();
+        format.bit_depth.select_value(&BitDepthChoice::Int16);
+        format
+            .dither
+            .select_value(&crate::convert::simple_wizard::DitherType::Shibata);
+        format.dither_overridden = true;
+        format.apply_format_constraints();
+
+        format.bit_depth.select_value(&BitDepthChoice::Int32);
+        format.apply_format_constraints();
+        assert_eq!(
+            *format.dither.selected_value(),
+            crate::convert::simple_wizard::DitherType::Shibata,
+        );
+        let error = format_state_to_pipeline_settings(&format).expect_err(
+            "an unavailable explicit Int32 dither must fail closed without rewriting state",
+        );
+        assert!(error.contains("Shibata"), "{error}");
+        assert!(error.contains("Int32"), "{error}");
+        assert_eq!(
+            *format.dither.selected_value(),
+            crate::convert::simple_wizard::DitherType::Shibata,
+        );
+        assert!(format.dither_overridden);
+
+        format.bit_depth.select_value(&BitDepthChoice::Int16);
+        format.apply_format_constraints();
+        let restored = format_state_to_pipeline_settings(&format).unwrap();
+        assert_eq!(restored.dither_type, pipeline_enums::DitherType::Shibata);
+        assert!(restored.dither_explicit);
+    }
+
+    #[test]
+    fn dsd_targets_preserve_stored_explicit_dither_but_never_project_it() {
+        let mut format = FormatState::new();
+        format
+            .dither
+            .select_value(&crate::convert::simple_wizard::DitherType::Shibata);
+        format.dither_overridden = true;
         format.format.select_value(&AudioFormat::Dsf);
         // Mirror the UI cascade so a valid DSD target rate is armed; without it
         // the sample-rate pill keeps its PCM default (44.1 kHz) and settings
-        // conversion fails before the DSD dither-explicitness guard under test
-        // is ever reached.
+        // conversion fails before the DSD dither guard under test is reached.
         format.apply_format_constraints();
-        // Arm the override AFTER the cascade so the test genuinely exercises the
-        // `!is_dsd && dither_overridden` guard rather than an empty override.
-        format.dither_overridden = true;
+
+        assert_eq!(
+            *format.dither.selected_value(),
+            crate::convert::simple_wizard::DitherType::Shibata,
+        );
+        assert!(format.dither_overridden);
+        assert!(!format.dither.options[format.dither.selected].enabled);
 
         let settings = format_state_to_pipeline_settings(&format).unwrap();
 
         assert_eq!(settings.dither_type, pipeline_enums::DitherType::None);
         assert!(!settings.dither_explicit);
+    }
+
+    #[test]
+    fn lossy_target_keeps_explicit_sox_only_choice_stored_but_projects_no_pcm_dither() {
+        use crate::convert::simple_wizard::DitherType as UiDitherType;
+        use crate::tui::app::{BitDepthChoice, FormatField};
+
+        let mut format = FormatState::new();
+        format.format.select_value(&AudioFormat::Flac);
+        format.bit_depth.select_value(&BitDepthChoice::Int16);
+        format.dither.select_value(&UiDitherType::Lipshitz);
+        format.dither_overridden = true;
+        format.apply_format_constraints();
+
+        let before_format = *format.format.selected_value();
+        let before_depth = *format.bit_depth.selected_value();
+        assert!(format.format.select_value(&AudioFormat::Aac));
+        format.after_user_selection(
+            FormatField::Format,
+            before_format,
+            before_depth,
+            Some(24),
+            Some(44_100),
+        );
+
+        assert_eq!(*format.dither.selected_value(), UiDitherType::Lipshitz);
+        assert!(format.dither_overridden);
+        assert!(
+            !format.dither.options[format.dither.selected].enabled,
+            "lossy targets must leave the stored PCM dither choice inactive",
+        );
+
+        let settings = format_state_to_pipeline_settings(&format).unwrap();
+        assert_eq!(settings.target_format, pipeline_enums::AudioFormat::Aac);
+        assert_eq!(settings.dither_type, pipeline_enums::DitherType::None);
+        assert!(
+            !settings.dither_explicit,
+            "an inactive stored choice must not request terminal PCM dither",
+        );
+
+        let request = tonepoet_pipeline::PlanRequest {
+            input_path: PathBuf::from("source.wav"),
+            output_path: PathBuf::from("output.m4a"),
+            source: tonepoet_pipeline::SourceInfo {
+                format: tonepoet_pipeline::AudioFormat::Wav,
+                codec: tonepoet_pipeline::AudioCodec::PcmSigned,
+                sample_rate_hz: Some(44_100),
+                bit_depth: Some(tonepoet_pipeline::PcmBitDepth::Int24),
+                true_source_depth: Some(tonepoet_pipeline::PcmBitDepth::Int24),
+                source_representation: tonepoet_pipeline::SourceRepresentationKind::Pcm,
+                sample_kind: Some(tonepoet_pipeline::SampleKind::SignedInteger),
+                channels: Some(2),
+                duration: Some(std::time::Duration::from_secs(60)),
+                frame_extent: None,
+                dsd_source_kind: None,
+                audio_md5: None,
+            },
+            settings,
+            plan_scope: tonepoet_pipeline::PlanScope::track("lossy-dither-inactive"),
+            intermediate_dir: Some(PathBuf::from("work")),
+            container_ffmpeg_flags: Vec::new(),
+            resolved_output_target: Some(tonepoet_pipeline::ResolvedOutputTarget::AacM4a),
+            reference_programme_scope: tonepoet_pipeline::ReferenceProgrammeScope::Singleton,
+            planned_riff_non_audio_upper_bound_bytes: None,
+        };
+
+        let topology = tonepoet_pipeline::plan_topology(&request)
+            .expect("AAC plan with inactive stored dither must remain valid");
+        let tonepoet_pipeline::TopologyPlan::Execute { steps, .. } = topology else {
+            panic!("AAC target must execute");
+        };
+        assert!(
+            steps.iter().all(|step| !matches!(
+                &step.operation,
+                tonepoet_pipeline::PlanOperation::EncodePcm { .. }
+            )),
+            "inactive stored dither must not add an Int16 PCM quantization stage: {steps:#?}",
+        );
+        assert!(
+            steps.iter().any(|step| matches!(
+                &step.operation,
+                tonepoet_pipeline::PlanOperation::EncodeLossy {
+                    target_format: tonepoet_pipeline::AudioFormat::Aac,
+                    ..
+                }
+            )),
+            "AAC must remain the terminal encode: {steps:#?}",
+        );
+
+        let plan = tonepoet_pipeline::plan_conversion(&request)
+            .expect("inactive stored dither must not force a SoX preprocessing route");
+        let tonepoet_pipeline::PlanAction::Execute { commands, .. } = plan.action else {
+            panic!("AAC target must execute commands");
+        };
+        assert!(
+            commands
+                .iter()
+                .all(|command| command.tool != tonepoet_pipeline::ToolIdentifier::Sox),
+            "inactive stored dither must not insert SoX solely for dither: {commands:#?}",
+        );
+
+        let before_format = *format.format.selected_value();
+        let before_depth = *format.bit_depth.selected_value();
+        assert!(format.format.select_value(&AudioFormat::Flac));
+        format.after_user_selection(
+            FormatField::Format,
+            before_format,
+            before_depth,
+            Some(24),
+            Some(44_100),
+        );
+        assert_eq!(*format.dither.selected_value(), UiDitherType::Lipshitz);
+        assert!(format.dither_overridden);
+        assert!(
+            format.dither.options[format.dither.selected].enabled,
+            "returning to compatible lossless PCM must reactivate the stored choice",
+        );
+
+        // Control: explicit None remains authoritative but inert on the lossy leg.
+        let mut none_format = FormatState::new();
+        none_format.format.select_value(&AudioFormat::Aac);
+        none_format
+            .dither
+            .select_value(&crate::convert::simple_wizard::DitherType::None);
+        none_format.dither_overridden = true;
+        none_format.apply_format_constraints();
+        let none_settings = format_state_to_pipeline_settings(&none_format).unwrap();
+        assert_eq!(none_settings.dither_type, pipeline_enums::DitherType::None);
+        assert!(!none_settings.dither_explicit);
+        assert!(none_format.dither_overridden);
+
+        // A stale Int32 selector on the lossy leg is still inactive, not an
+        // Int32 capability error. The R2 fail-closed rule remains scoped to
+        // ordinary PCM targets where generic dither would actually be active.
+        let mut stale_int32 = FormatState::new();
+        stale_int32.format.select_value(&AudioFormat::Wav);
+        stale_int32.bit_depth.select_value(&BitDepthChoice::Int16);
+        stale_int32.dither.select_value(&UiDitherType::Lipshitz);
+        stale_int32.dither_overridden = true;
+        stale_int32.bit_depth.select_value(&BitDepthChoice::Int32);
+        stale_int32.apply_format_constraints();
+        stale_int32.format.select_value(&AudioFormat::Aac);
+        stale_int32.apply_format_constraints();
+        assert!(
+            stale_int32.dither.options.iter().all(|option| !option.enabled),
+            "lossy applicability must win over the stale Int32 capability matrix",
+        );
+        let stale_settings = format_state_to_pipeline_settings(&stale_int32)
+            .expect("lossy target must suppress an inactive stale Int32 dither choice");
+        assert_eq!(stale_settings.dither_type, pipeline_enums::DitherType::None);
+        assert!(!stale_settings.dither_explicit);
+        assert_eq!(
+            *stale_int32.dither.selected_value(),
+            UiDitherType::Lipshitz,
+        );
+    }
+
+    #[test]
+    fn float_pcm_target_preserves_explicit_dither_choice_but_projects_it_inactive() {
+        use crate::convert::simple_wizard::DitherType as UiDitherType;
+        use crate::tui::app::BitDepthChoice;
+
+        let mut format = FormatState::new();
+        format.format.select_value(&AudioFormat::Wav);
+        format.bit_depth.select_value(&BitDepthChoice::Float64);
+        format.dither.select_value(&UiDitherType::Lipshitz);
+        format.dither_overridden = true;
+        format.apply_format_constraints();
+
+        assert_eq!(*format.dither.selected_value(), UiDitherType::Lipshitz);
+        assert!(format.dither_overridden);
+        assert!(!format.dither.options[format.dither.selected].enabled);
+
+        let settings = format_state_to_pipeline_settings(&format).unwrap();
+        assert_eq!(
+            settings.target_bit_depth,
+            pipeline_enums::BitDepthTarget::Pcm(pipeline_enums::PcmBitDepth::Float64),
+        );
+        assert_eq!(settings.dither_type, pipeline_enums::DitherType::None);
+        assert!(!settings.dither_explicit);
+
+        let options = try_pills_to_options(
+            &format,
+            &OutputOptionsState::new(),
+            &TonepoetConfig::default(),
+        )
+        .expect("float target should keep legacy and unified dither projection consistent");
+        assert_eq!(options.dither_type, None);
     }
 
     #[test]

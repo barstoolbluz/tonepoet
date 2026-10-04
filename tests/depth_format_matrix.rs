@@ -270,6 +270,8 @@ fn assert_measurement(path: &Path, requested: PcmBitDepth) -> Result<(), String>
 fn base_request(container: PathBuf, output_root: PathBuf, log_root: PathBuf) -> PipelineRequest {
     PipelineRequest {
         registered_effects: Vec::new(),
+        deemphasis_choice_origin: Default::default(),
+        deemphasis_evidence_origin: Default::default(),
         actions: ActionPipeline::default(),
         job_id: "depth-matrix".to_string(),
         item_id: "depth-matrix".to_string(),

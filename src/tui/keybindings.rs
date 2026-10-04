@@ -10534,7 +10534,12 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 }
                 _ => {}
             }
-            let scroll = update_scrollable_message_offset(scroll, key.code, &message, 66, 9);
+            let (width, height) = crossterm::terminal::size().unwrap_or((80, 24));
+            let max_scroll = super::draw_overlays::notice_message_max_scroll(
+                Rect::new(0, 0, width, height),
+                &message,
+            );
+            let scroll = bounded_scroll_offset(scroll, key.code, max_scroll);
             app.active_overlay = ActiveOverlay::Notice { title, message, scroll };
         }
         ActiveOverlay::ItemInfo { .. } => {
@@ -71599,6 +71604,12 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
     // replaces the overlay and loses the pending edit.
     // Exception: Confirmation overlay allows its own Yes/No pill clicks.
     if !matches!(app.active_overlay, ActiveOverlay::None) {
+        if matches!(app.active_overlay, ActiveOverlay::Notice { .. }) {
+            if matches!(app.button_map.find_button_at(x, y), Some(TuiButton::OverlayCancel)) {
+                app.active_overlay = ActiveOverlay::None;
+            }
+            return;
+        }
         if matches!(app.active_overlay, ActiveOverlay::Confirmation { .. }) {
             // Allow OverlayConfirm/OverlayCancel buttons through.
             if let Some(button) = app.button_map.find_button_at(x, y) {
@@ -81912,6 +81923,32 @@ ignored".to_string()),
 
         assert!(matches!(app.active_overlay, ActiveOverlay::MetadataEditor(_)));
         assert!(app.pending_metadata_editor.is_none());
+    }
+
+    #[test]
+    fn r24_notice_overlay_cancel_hitbox_closes_the_notice() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::Notice {
+            title: "Pre-emphasis".to_string(),
+            message: "Information".to_string(),
+            scroll: 0,
+        };
+        app.button_map
+            .record_button(TuiButton::OverlayCancel, Rect::new(10, 10, 9, 1));
+        let (tx, _rx) = mpsc::channel(1);
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 11,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            },
+            &tx,
+        );
+
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
     }
 
     #[test]

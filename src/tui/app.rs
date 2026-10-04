@@ -3670,27 +3670,27 @@ mod clamp_pill_tests {
     }
 
     #[test]
-    fn changing_bit_depth_resets_dither_explicitness_before_auto_selection() {
+    fn changing_bit_depth_preserves_explicit_dither_authority() {
         use super::{BitDepthChoice, DitherType, FormatField};
 
         let mut format = FormatState::new();
         format.bit_depth.select_value(&BitDepthChoice::Int24);
         format.dither.select_value(&DitherType::TPDF);
-        format.dither_overridden = true;
+        format.mark_dither_overridden();
         let before_format = format.format.selected_value().clone();
         let before_depth = *format.bit_depth.selected_value();
-        format.bit_depth.select_value(&BitDepthChoice::Int32);
+        format.bit_depth.select_value(&BitDepthChoice::Int16);
 
         format.after_user_selection(
             FormatField::BitDepth,
             before_format,
             before_depth,
-            Some(32),
+            Some(24),
             Some(96_000),
         );
 
-        assert!(!format.dither_overridden);
-        assert_eq!(*format.dither.selected_value(), DitherType::None);
+        assert!(format.dither_overridden);
+        assert_eq!(*format.dither.selected_value(), DitherType::TPDF);
     }
 
     #[test]
@@ -3754,17 +3754,89 @@ mod clamp_pill_tests {
     }
 
     #[test]
-    fn unqualified_int32_dither_selection_is_clamped_before_submission() {
+    fn explicit_shibata_survives_temporary_unqualified_int32_target() {
         use super::{BitDepthChoice, DitherType};
 
         let mut format = FormatState::new();
-        format.bit_depth.select_value(&BitDepthChoice::Int32);
-        format.dither.select_value(&DitherType::Shibata);
+        assert!(format.bit_depth.select_value(&BitDepthChoice::Int16));
+        assert!(format.dither.select_value(&DitherType::Shibata));
+        format.dither_overridden = true;
+        format.apply_format_constraints();
+        assert_eq!(*format.dither.selected_value(), DitherType::Shibata);
+
+        assert!(format.bit_depth.select_value(&BitDepthChoice::Int32));
+        format.apply_format_constraints();
+
+        let shibata = format
+            .dither
+            .options
+            .iter()
+            .find(|option| option.value == DitherType::Shibata)
+            .expect("Shibata option");
+        assert_eq!(*format.dither.selected_value(), DitherType::Shibata);
+        assert!(format.dither_overridden);
+        assert!(
+            !shibata.enabled,
+            "Int32 must expose explicit Shibata as unavailable, not erase it",
+        );
+
+        assert!(format.bit_depth.select_value(&BitDepthChoice::Int16));
+        format.apply_format_constraints();
+
+        let shibata = format
+            .dither
+            .options
+            .iter()
+            .find(|option| option.value == DitherType::Shibata)
+            .expect("Shibata option");
+        assert_eq!(*format.dither.selected_value(), DitherType::Shibata);
+        assert!(format.dither_overridden);
+        assert!(
+            shibata.enabled,
+            "returning to Int16 must restore the same explicit choice",
+        );
+    }
+
+    #[test]
+    fn explicit_shibata_survives_dsd_target_round_trip() {
+        use super::{BitDepthChoice, DitherType};
+
+        let mut format = FormatState::new();
+        assert!(format.format.select_value(&AudioFormat::Flac));
+        assert!(format.bit_depth.select_value(&BitDepthChoice::Int16));
+        assert!(format.dither.select_value(&DitherType::Shibata));
         format.dither_overridden = true;
         format.apply_format_constraints();
 
-        assert_eq!(*format.dither.selected_value(), DitherType::None);
-        assert!(!format.dither_overridden);
+        format_round_trip(&mut format, AudioFormat::Dsf, 44_100);
+
+        let shibata = format
+            .dither
+            .options
+            .iter()
+            .find(|option| option.value == DitherType::Shibata)
+            .expect("Shibata option");
+        assert_eq!(*format.dither.selected_value(), DitherType::Shibata);
+        assert!(format.dither_overridden);
+        assert!(
+            !shibata.enabled,
+            "DSD must make PCM dither inactive without erasing the explicit choice",
+        );
+
+        format_round_trip(&mut format, AudioFormat::Flac, 44_100);
+
+        let shibata = format
+            .dither
+            .options
+            .iter()
+            .find(|option| option.value == DitherType::Shibata)
+            .expect("Shibata option");
+        assert_eq!(*format.dither.selected_value(), DitherType::Shibata);
+        assert!(format.dither_overridden);
+        assert!(
+            shibata.enabled,
+            "returning to compatible PCM Int16 must reactivate the same explicit choice",
+        );
     }
 
     #[test]
@@ -4098,6 +4170,118 @@ mod clamp_pill_tests {
         format.sample_rate.select_value(&44_100);
         format.bit_depth.select_value(&super::BitDepthChoice::Int16);
         format
+    }
+
+    #[test]
+    fn r24_active_deemphasis_int16_automatic_dither_is_plain_tpdf() {
+        let mut format = eligible_deemphasis_state();
+        format.deemphasis_enabled = true;
+        format.deemphasis_overridden = true;
+        format.dither.select_value(&super::DitherType::None);
+        format.dither_overridden = false;
+
+        format.apply_auto_dither(Some(16));
+
+        assert_eq!(*format.dither.selected_value(), super::DitherType::TPDF);
+        assert!(format.deemphasis_auto_tpdf_applicable());
+        assert!(!format.dither_overridden);
+    }
+
+    #[test]
+    fn r24_disabling_deemphasis_restores_the_ordinary_auto_dither_rule() {
+        let mut format = eligible_deemphasis_state();
+        format.deemphasis_enabled = true;
+        format.apply_auto_dither(Some(16));
+        assert_eq!(*format.dither.selected_value(), super::DitherType::TPDF);
+        assert!(format.deemphasis_auto_tpdf_applicable());
+
+        format.deemphasis_enabled = false;
+        format.apply_auto_dither(Some(16));
+
+        assert_eq!(*format.dither.selected_value(), super::DitherType::None);
+        assert!(!format.deemphasis_auto_tpdf_applicable());
+    }
+
+    #[test]
+    fn r24_source_relative_int16_target_uses_the_same_automatic_tpdf() {
+        let mut format = eligible_deemphasis_state();
+        format.bit_depth.select_value(&super::BitDepthChoice::Source);
+        format.deemphasis_enabled = true;
+        format.apply_auto_dither(Some(16));
+
+        assert_eq!(*format.dither.selected_value(), super::DitherType::TPDF);
+        assert!(format.deemphasis_auto_tpdf_applicable());
+    }
+
+    #[test]
+    fn r24_explicit_dither_survives_deemphasis_and_target_recalculation() {
+        let mut format = eligible_deemphasis_state();
+        format.deemphasis_enabled = true;
+        format.dither.select_value(&super::DitherType::Shibata);
+        format.mark_dither_overridden();
+
+        format.apply_auto_dither(Some(16));
+        assert_eq!(*format.dither.selected_value(), super::DitherType::Shibata);
+        assert!(format.dither_overridden);
+
+        format.sample_rate.select_value(&88_200);
+        format.apply_format_constraints();
+        assert_eq!(*format.dither.selected_value(), super::DitherType::Shibata);
+        assert!(format.dither_overridden);
+
+        format.deemphasis_enabled = false;
+        format.apply_auto_dither(Some(16));
+        assert_eq!(*format.dither.selected_value(), super::DitherType::Shibata);
+        assert!(format.dither_overridden);
+    }
+
+    #[test]
+    fn r24_explicit_none_is_authoritative() {
+        let mut format = eligible_deemphasis_state();
+        format.deemphasis_enabled = true;
+        format.dither.select_value(&super::DitherType::None);
+        format.mark_dither_overridden();
+
+        format.apply_auto_dither(Some(16));
+
+        assert_eq!(*format.dither.selected_value(), super::DitherType::None);
+        assert!(format.dither_overridden);
+    }
+
+    #[test]
+    fn r24_target_driven_deemphasis_transition_recomputes_dither_after_deemphasis() {
+        let mut format = eligible_deemphasis_state();
+        format.set_convert_deemphasis_evidence(&super::ConvertPreemphasisEvidence {
+            explicit_affirmative: true,
+            cue_flag: false,
+            catalog_number: None,
+            catalog_exact: false,
+        });
+        assert!(!format.deemphasis_enabled);
+        assert_eq!(*format.dither.selected_value(), super::DitherType::None);
+
+        format.sample_rate.select_value(&88_200);
+        format.apply_format_constraints();
+
+        assert!(format.deemphasis_enabled);
+        assert_eq!(*format.dither.selected_value(), super::DitherType::TPDF);
+        assert!(format.deemphasis_auto_tpdf_applicable());
+    }
+
+    #[test]
+    fn r24_deemphasis_does_not_inject_automatic_dither_for_non_int16_targets() {
+        let mut format = eligible_deemphasis_state();
+        format.deemphasis_enabled = true;
+
+        format.bit_depth.select_value(&super::BitDepthChoice::Int24);
+        format.apply_auto_dither(Some(16));
+        assert_eq!(*format.dither.selected_value(), super::DitherType::None);
+        assert!(!format.deemphasis_auto_tpdf_applicable());
+
+        format.format.select_value(&AudioFormat::Aac);
+        format.apply_format_constraints();
+        format.apply_auto_dither(Some(16));
+        assert!(!format.deemphasis_auto_tpdf_applicable());
     }
 
     #[test]
@@ -5774,6 +5958,7 @@ impl FormatState {
         if self.field_focus == FormatField::Deemphasis {
             self.deemphasis_enabled = !self.deemphasis_enabled;
             self.deemphasis_overridden = true;
+            self.apply_auto_dither(source_bits);
             return;
         }
         if self.field_focus == FormatField::Container {
@@ -5805,6 +5990,7 @@ impl FormatState {
         if self.field_focus == FormatField::Deemphasis {
             self.deemphasis_enabled = !self.deemphasis_enabled;
             self.deemphasis_overridden = true;
+            self.apply_auto_dither(source_bits);
             return;
         }
         if self.field_focus == FormatField::Container {
@@ -6039,7 +6225,13 @@ impl FormatState {
                 if !rate_before_was_dsd && rate_before != SOURCE_SAMPLE_RATE_SENTINEL {
                     self.pcm_rate_before_dsd = Some(rate_before);
                 }
-                self.dither.select_value(&DitherType::None);
+                // DSD has no PCM terminal dither, but visiting a DSD target must
+                // not destroy an explicit PCM dither choice. Keep one authoritative
+                // user selection stored (and disabled by the DSD constraints); only
+                // automatic state is normalized to None while DSD is active.
+                if !self.dither_overridden {
+                    self.dither.select_value(&DitherType::None);
+                }
                 self.cascade_dsd_rate_defaults();
             } else {
                 // A DSD-rate selection just fell back to the lowest PCM rate
@@ -6072,7 +6264,6 @@ impl FormatState {
         }
 
         if row == FormatField::BitDepth && before_depth != *self.bit_depth.selected_value() {
-            self.dither_overridden = false;
             self.apply_auto_dither(source_bits);
         }
 
@@ -6085,20 +6276,50 @@ impl FormatState {
         self.apply_auto_gain_defaults();
     }
 
-    /// Applies the default dither rule while preserving manual user choice.
-    /// `source_bits` should come from the selected source probe when available.
-    pub fn apply_auto_dither(&mut self, source_bits: Option<u32>) {
-        if self.dither_overridden || self.is_dsd_selected() {
-            return;
+    pub(crate) fn deemphasis_auto_tpdf_applicable(&self) -> bool {
+        if !self.deemphasis_enabled {
+            return false;
         }
+        let format = *self.format.selected_value();
+        let lossless_pcm = matches!(
+            format,
+            AudioFormat::Flac
+                | AudioFormat::Wav
+                | AudioFormat::Aiff
+                | AudioFormat::WavPack
+                | AudioFormat::Alac
+                | AudioFormat::Lpcm
+        ) && !(format == AudioFormat::WavPack && self.wavpack_hybrid);
+        if !lossless_pcm {
+            return false;
+        }
+        match *self.bit_depth.selected_value() {
+            BitDepthChoice::Int16 => true,
+            // CD de-emphasis eligibility already establishes integer 16-bit
+            // source audio. Keep the source-relative selector usable for batch
+            // presentation even when no single representative probe owns it.
+            BitDepthChoice::Source => self.deemphasis_eligible
+                || (self.source_pcm_bit_depth == Some(16)
+                    && self.source_pcm_float_bits.is_none()),
+            BitDepthChoice::Int24
+            | BitDepthChoice::Int32
+            | BitDepthChoice::Float32
+            | BitDepthChoice::Float64 => false,
+        }
+    }
 
+    /// Compute the ordinary automatic dither choice without the R24
+    /// CD-de-emphasis override. This remains the single implementation of the
+    /// pre-existing source/target dither policy and is also the nominal value
+    /// serialized for mixed batches before request-local effect derivation.
+    pub(crate) fn ordinary_auto_dither(&self, source_bits: Option<u32>) -> DitherType {
         let target = *self.bit_depth.selected_value();
         if target.is_source() {
             // Source-depth policy has its own authoritative float-depth fact.
             // Do not require the generic source_bits argument as a second copy
             // of that state; the probe may populate these fields on different
             // UI update paths.
-            let desired = self
+            return self
                 .source_float_depth()
                 .filter(|source_depth| {
                     let target_format = crate::convert::pipeline::planner_format_from_main(
@@ -6112,37 +6333,46 @@ impl FormatState {
                 })
                 .map(|_| DitherType::TPDF)
                 .unwrap_or(DitherType::None);
-            self.dither.select_value(&desired);
-            return;
         }
 
         let Some(source_bits) = source_bits else {
             // Unknown source depth is not evidence of bit-depth reduction.
             // Prefer the non-destructive default until probing supplies a value.
-            self.dither.select_value(&DitherType::None);
-            return;
+            return DitherType::None;
         };
 
         // DSD and PCM are incommensurable encoding schemes — the conversion
         // is a reconstruction, not a truncation. Always dither at the PCM
         // output stage: TPDF for ≥24-bit, Shibata for ≤16-bit.
         if source_bits == 1 {
-            let desired = if target.bits() <= 16 {
+            return if target.bits() <= 16 {
                 DitherType::Shibata
             } else {
                 DitherType::TPDF
             };
-            self.dither.select_value(&desired);
-            return;
         }
 
         let target_bits = target.bits();
-        let desired = if source_bits > target_bits && target_bits <= 16 {
+        if source_bits > target_bits && target_bits <= 16 {
             DitherType::Shibata
         } else if source_bits > target_bits && target_bits == 24 {
             DitherType::TPDF
         } else {
             DitherType::None
+        }
+    }
+
+    /// Applies the default dither rule while preserving manual user choice.
+    /// `source_bits` should come from the selected source probe when available.
+    pub fn apply_auto_dither(&mut self, source_bits: Option<u32>) {
+        if self.dither_overridden || self.is_dsd_selected() {
+            return;
+        }
+
+        let desired = if self.deemphasis_auto_tpdf_applicable() {
+            DitherType::TPDF
+        } else {
+            self.ordinary_auto_dither(source_bits)
         };
         self.dither.select_value(&desired);
     }
@@ -6271,12 +6501,17 @@ impl FormatState {
     /// matches remain advisory evidence: they expose the control and guidance,
     /// but never opt the user into destructive processing.
     pub fn recompute_auto_deemphasis(&mut self) {
-        if self.deemphasis_overridden {
-            return;
+        if !self.deemphasis_overridden {
+            self.deemphasis_enabled = self.deemphasis_eligible
+                && self.deemphasis_evidence == ConvertDeemphasisEvidence::ExplicitTag
+                && !self.deemphasis_target_is_preservation_domain();
         }
-        self.deemphasis_enabled = self.deemphasis_eligible
-            && self.deemphasis_evidence == ConvertDeemphasisEvidence::ExplicitTag
-            && !self.deemphasis_target_is_preservation_domain();
+        let source_bits = if self.source_is_dsd {
+            Some(1)
+        } else {
+            self.source_pcm_bit_depth
+        };
+        self.apply_auto_dither(source_bits);
     }
 
     /// Reset only the user-policy provenance when a genuinely different source
@@ -6679,15 +6914,34 @@ impl FormatState {
             }
         }
 
+        // Floating-point targets have no integer quantization boundary. Keep an
+        // explicit stored dither choice visible but inactive so visiting a float
+        // target cannot make that choice alter the signal or erase user intent.
+        if matches!(
+            *self.bit_depth.selected_value(),
+            BitDepthChoice::Float32 | BitDepthChoice::Float64
+        ) {
+            self.dither.set_all_enabled(false);
+        }
+
         // Int32 dither authority is backend-specific. Ordinary SoX Int32
         // dither remains unqualified and FFmpeg admits only its commissioned
-        // triangular cell. SSRC is different: supported destination rates own
-        // their native Int32 dither/PDF stage directly, while unsupported rates
-        // remain selected so the planner can refuse them explicitly instead of
-        // silently transferring ownership or clamping user intent. Reference
-        // owns its terminal dither separately and its generic dither row is
-        // already disabled above.
-        if !reference_selected
+        // triangular cell. Automatic unsupported choices may clamp to None;
+        // explicit unsupported choices remain selected but disabled so
+        // submission can fail closed without erasing user intent. SSRC-supported
+        // rates own their native Int32 dither/PDF stage directly. Reference owns
+        // its terminal dither separately and its generic dither row is disabled.
+        if !is_dsd
+            && !reference_selected
+            && !matches!(
+                fmt,
+                AudioFormat::Mp3
+                    | AudioFormat::Aac
+                    | AudioFormat::Opus
+                    | AudioFormat::Dts
+                    | AudioFormat::Ac3
+                    | AudioFormat::Ogg
+            )
             && *self.bit_depth.selected_value() == BitDepthChoice::Int32
             && !matches!(*self.resampler.selected_value(), ResamplerChoice::Ssrc)
         {
@@ -6697,9 +6951,11 @@ impl FormatState {
                 &DitherType::TPDF,
                 tonepoet_pipeline::ffmpeg_int32_triangular_terminal_commissioned_for_current_arch(),
             );
-            if !self.dither.options[self.dither.selected].enabled {
+            if !self.dither_overridden && !self.dither.options[self.dither.selected].enabled {
+                // Automatic choices may clamp to an available neutral value.
+                // Explicit choices remain selected (but disabled) so temporary
+                // target constraints cannot destroy user authority.
                 self.dither.select_value(&DitherType::None);
-                self.dither_overridden = false;
             }
         }
 
@@ -6785,7 +7041,9 @@ impl FormatState {
         clamp_sample_rate_pill(&mut self.sample_rate, retain_disabled_sentinel);
         clamp_pill_excluding(&mut self.bit_depth, |option| option.value.is_source());
         clamp_pill(&mut self.resampler);
-        clamp_pill(&mut self.dither);
+        if !self.dither_overridden {
+            clamp_pill(&mut self.dither);
+        }
         clamp_pill(&mut self.replaygain);
         clamp_pill(&mut self.pcm_gain_mode);
         clamp_pill(&mut self.pcm_true_peak_scope);

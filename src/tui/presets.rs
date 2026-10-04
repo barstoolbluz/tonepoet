@@ -838,7 +838,7 @@ impl TuiPreset {
                         let applied = Self::select_enabled(&mut format_state.dither, &value);
                         report.record("dither", applied);
                         if applied {
-                            format_state.dither_overridden = true;
+                            format_state.mark_dither_overridden();
                         }
                     }
                     None => report.record("dither", false),

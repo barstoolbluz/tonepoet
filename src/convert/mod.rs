@@ -3197,6 +3197,8 @@ mod bluray_queue_admission_tests {
 
         crate::convert::pipeline::PipelineRequest {
             registered_effects: Vec::new(),
+            deemphasis_choice_origin: Default::default(),
+            deemphasis_evidence_origin: Default::default(),
             actions: crate::convert::pipeline::ActionPipeline::default(),
             job_id: format!("job-{item_id}"),
             item_id: item_id.to_string(),

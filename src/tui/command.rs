@@ -9989,6 +9989,46 @@ pub fn apply_convert_source_disc_selection_to_pipeline_request(
     apply_convert_source_disc_selection_to_source_options(mode, &mut request.source);
 }
 
+fn deemphasis_evidence_origin_for_log(
+    evidence: &crate::tui::probe::ConvertPreemphasisEvidence,
+) -> crate::convert::pipeline::DeemphasisEvidenceOrigin {
+    use crate::convert::pipeline::DeemphasisEvidenceOrigin;
+    if evidence.explicit_affirmative {
+        DeemphasisEvidenceOrigin::ExplicitTag
+    } else if evidence.cue_flag {
+        DeemphasisEvidenceOrigin::CueFlag
+    } else if evidence.catalog_exact {
+        DeemphasisEvidenceOrigin::CatalogExact
+    } else {
+        DeemphasisEvidenceOrigin::None
+    }
+}
+
+fn uniform_batch_deemphasis_evidence_origin_for_log(
+    batch: &[std::path::PathBuf],
+    states: &std::collections::BTreeMap<
+        std::path::PathBuf,
+        super::app::ConvertDeemphasisPathState,
+    >,
+) -> crate::convert::pipeline::DeemphasisEvidenceOrigin {
+    use crate::convert::pipeline::DeemphasisEvidenceOrigin;
+
+    let mut origins = batch.iter().map(|path| {
+        states
+            .get(path)
+            .map(|state| deemphasis_evidence_origin_for_log(&state.evidence))
+            .unwrap_or(DeemphasisEvidenceOrigin::None)
+    });
+    let Some(first) = origins.next() else {
+        return DeemphasisEvidenceOrigin::None;
+    };
+    if first == DeemphasisEvidenceOrigin::None || origins.any(|origin| origin != first) {
+        DeemphasisEvidenceOrigin::None
+    } else {
+        first
+    }
+}
+
 /// Install or remove the request-local semantic CD de-emphasis effect. The TUI
 /// never chooses a physical backend; Phase 2 selects a qualified candidate.
 fn set_request_cd_deemphasis(
@@ -10143,6 +10183,13 @@ fn execute_commit_with_source_options_transform(
             );
         }
     }
+    let batch_deemphasis_evidence_origin = matches!(
+        &app.convert.source.mode,
+        SourceMode::Batch { .. }
+    )
+    .then(|| {
+        uniform_batch_deemphasis_evidence_origin_for_log(&batch, &deemphasis_path_states)
+    });
     let deemphasis_enabled = app.convert.format.deemphasis_enabled;
     let deemphasis_overridden = app.convert.format.deemphasis_overridden;
 
@@ -10327,13 +10374,22 @@ fn execute_commit_with_source_options_transform(
             }
             apply_queue_item_cue_sidecar_override_to_source_options(item, &mut item_source);
 
+            let deemphasis_path_state = deemphasis_path_states.get(&item.input_path);
+            let path_deemphasis_evidence_origin = deemphasis_path_state
+                .map(|state| deemphasis_evidence_origin_for_log(&state.evidence))
+                .unwrap_or(DeemphasisEvidenceOrigin::None);
+            // Independent-file album logs are assembled from per-track fragments.
+            // Only claim the brief's "all N source tracks" evidence wording when
+            // the bounded batch preflight proved one uniform evidence class across
+            // the whole batch. Mixed evidence stays unclaimed rather than letting
+            // an arbitrary representative fragment overstate album-wide facts.
+            let deemphasis_evidence_origin = batch_deemphasis_evidence_origin
+                .unwrap_or(path_deemphasis_evidence_origin);
             let apply_cd_deemphasis = deemphasis_enabled
-                && deemphasis_path_states
-                    .get(&item.input_path)
-                    .is_some_and(|state| {
-                        state.eligible
-                            && (deemphasis_overridden || state.evidence.explicit_affirmative)
-                    });
+                && deemphasis_path_state.is_some_and(|state| {
+                    state.eligible
+                        && (deemphasis_overridden || state.evidence.explicit_affirmative)
+                });
 
             if let Some(existing_req) = item.pipeline_request.as_mut() {
                 // `commit_batch_with_cue_metadata_artifacts()` may already have attached
@@ -10355,6 +10411,12 @@ fn execute_commit_with_source_options_transform(
                 existing_req.merge = options.merge_to_single;
                 existing_req.companion = companion_policy.clone();
                 existing_req.actions = options.actions.clone();
+                existing_req.deemphasis_choice_origin = if deemphasis_overridden {
+                    DeemphasisChoiceOrigin::User
+                } else {
+                    DeemphasisChoiceOrigin::Automatic
+                };
+                existing_req.deemphasis_evidence_origin = deemphasis_evidence_origin;
                 set_request_cd_deemphasis(existing_req, apply_cd_deemphasis);
             } else {
                 let output_root = options.output_dir.clone()
@@ -10367,6 +10429,12 @@ fn execute_commit_with_source_options_transform(
                     });
                 item.pipeline_request = Some(PipelineRequest {
                     registered_effects: Vec::new(),
+                    deemphasis_choice_origin: if deemphasis_overridden {
+                        DeemphasisChoiceOrigin::User
+                    } else {
+                        DeemphasisChoiceOrigin::Automatic
+                    },
+                    deemphasis_evidence_origin,
                     actions: options.actions.clone(),
                     worker_count: None,
                     scratch_staging: None,

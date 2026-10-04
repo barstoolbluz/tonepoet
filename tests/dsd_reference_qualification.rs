@@ -250,6 +250,8 @@ fn w64_planner_request(root: &Path, sample_rate_hz: u32, depth: PcmBitDepth) -> 
 
     PipelineRequest {
         registered_effects: Vec::new(),
+        deemphasis_choice_origin: Default::default(),
+        deemphasis_evidence_origin: Default::default(),
         job_id: "reference-w64-matrix".to_string(),
         actions: ActionPipeline::default(),
         item_id: "reference-w64-matrix".to_string(),

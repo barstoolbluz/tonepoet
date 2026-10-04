@@ -82,6 +82,8 @@ fn request(container: PathBuf, output_root: PathBuf, log_root: PathBuf) -> Pipel
     settings.metadata.preserve_artwork = false;
     PipelineRequest {
         registered_effects: Vec::new(),
+        deemphasis_choice_origin: Default::default(),
+        deemphasis_evidence_origin: Default::default(),
         actions: ActionPipeline::default(),
         job_id: "ssrc-strong-field-check".to_string(),
         item_id: "overloaded-float".to_string(),

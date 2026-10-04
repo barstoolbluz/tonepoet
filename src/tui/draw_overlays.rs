@@ -13,7 +13,7 @@ use super::app::{
     FileOperationSettingsFocus, FileOperationSettingsState, FormatSettingsFocus,
     FormatSettingsKind, MbSelectState, SourceMode,
 };
-use super::button_map::TuiButton;
+use super::button_map::{ButtonRenderMap, TuiButton};
 use crate::convert::ConversionStatus;
 
 
@@ -601,7 +601,7 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState, theme: super::theme::Them
             draw_error_detail(f, &error, scroll, theme);
         }
         ActiveOverlay::Notice { title, message, scroll } => {
-            draw_notice(f, &title, &message, scroll, theme);
+            draw_notice(f, &title, &message, scroll, &mut app.button_map, theme);
         }
         ActiveOverlay::ItemInfo { ref item } => {
             draw_item_info(f, item, theme);
@@ -1614,6 +1614,26 @@ pub(super) fn scrollable_message_max_scroll(
     (wrapped_row_count(message, text_width) as usize).saturating_sub(body_height)
 }
 
+fn notice_popup_dimensions(area: Rect) -> (u16, u16) {
+    let max_w = area.width.saturating_sub(2).max(1);
+    let max_h = area.height.saturating_sub(2).max(1);
+    // Notice text benefits from the same terminal-relative sizing used by the
+    // larger interactive prompts. Keep a useful minimum on normal terminals,
+    // but always yield to the available screen on small ones.
+    let preferred_width = (area.width.saturating_mul(78) / 100)
+        .max(50u16.min(max_w))
+        .min(max_w);
+    let min_height = (area.height.saturating_mul(55) / 100)
+        .max(9u16.min(max_h))
+        .min(max_h);
+    (preferred_width, min_height)
+}
+
+pub(super) fn notice_message_max_scroll(area: Rect, message: &str) -> usize {
+    let (preferred_width, min_height) = notice_popup_dimensions(area);
+    scrollable_message_max_scroll(area, preferred_width, min_height, message)
+}
+
 const ARCHIVE_PASSWORD_PROMPT_HINT: &str = "Enter a password to open this archive. Saved passwords are tried automatically first; successful passwords remain available for later archive opens.";
 
 pub(super) fn text_edit_popup_rect(area: Rect, label: &str) -> Rect {
@@ -1790,6 +1810,7 @@ fn draw_scrollable_message_popup(
     min_height: u16,
     accent: Color,
     text_color: Color,
+    mut button_map: Option<&mut ButtonRenderMap>,
     theme: super::theme::Theme,
 ) {
     let area = f.size();
@@ -1828,9 +1849,20 @@ fn draw_scrollable_message_popup(
         spans.push(footer_pill("PgDn", theme.blue, theme));
         spans.push(pill_gap());
     }
-    spans.push(footer_pill("Esc close", theme.purple, theme));
+    let esc_pill = footer_pill("Esc close", theme.purple, theme);
+    let esc_width = esc_pill.width() as u16;
+    let esc_offset = spans.iter().map(|span| span.width() as u16).sum::<u16>();
+    spans.push(esc_pill);
+    let total_width = spans.iter().map(|span| span.width() as u16).sum::<u16>();
     let hint = Paragraph::new(Line::from(spans)).alignment(Alignment::Center);
     f.render_widget(hint, chunks[1]);
+    if let Some(map) = button_map.as_deref_mut() {
+        let start_x = chunks[1].x + chunks[1].width.saturating_sub(total_width) / 2;
+        map.record_button(
+            TuiButton::OverlayCancel,
+            Rect::new(start_x.saturating_add(esc_offset), chunks[1].y, esc_width, 1),
+        );
+    }
 }
 
 /// Draw an error detail popup.
@@ -1849,6 +1881,7 @@ fn draw_error_detail(
         10,
         theme.destructive,
         theme.destructive,
+        None,
         theme,
     );
 }
@@ -1858,17 +1891,20 @@ fn draw_notice(
     title: &str,
     message: &str,
     scroll: usize,
+    button_map: &mut ButtonRenderMap,
     theme: super::theme::Theme,
 ) {
+    let (preferred_width, min_height) = notice_popup_dimensions(f.size());
     draw_scrollable_message_popup(
         f,
         title,
         message,
         scroll,
-        66,
-        9,
+        preferred_width,
+        min_height,
         theme.amber,
         theme.text,
+        Some(button_map),
         theme,
     );
 }
@@ -10783,6 +10819,76 @@ mod tests {
         );
     }
 
+}
+
+#[cfg(test)]
+mod r24_notice_popup_contract_tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    #[test]
+    fn notice_popup_dimensions_scale_with_the_terminal() {
+        let small_area = Rect::new(0, 0, 80, 24);
+        let large_area = Rect::new(0, 0, 160, 50);
+        let (small_w, small_h) = notice_popup_dimensions(small_area);
+        let (large_w, large_h) = notice_popup_dimensions(large_area);
+
+        assert!(large_w > small_w, "notice width should follow terminal width");
+        assert!(large_h > small_h, "notice height should follow terminal height");
+        assert!(small_w < small_area.width && small_h < small_area.height);
+        assert!(large_w < large_area.width && large_h < large_area.height);
+    }
+
+    #[test]
+    fn notice_footer_registers_the_visible_esc_pill_as_overlay_cancel() {
+        let theme = super::super::theme::theme_by_slug_or_default(
+            super::super::theme::default_theme_slug(),
+        );
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let mut buttons = ButtonRenderMap::new();
+
+        terminal
+            .draw(|frame| {
+                draw_notice(
+                    frame,
+                    "Pre-emphasis",
+                    "A long enough information message to exercise the responsive notice chrome.",
+                    0,
+                    &mut buttons,
+                    theme,
+                );
+            })
+            .expect("draw notice");
+
+        let mut found = false;
+        'rows: for y in 0..30 {
+            for x in 0..100 {
+                if buttons.find_button_at(x, y) == Some(TuiButton::OverlayCancel) {
+                    found = true;
+                    break 'rows;
+                }
+            }
+        }
+        assert!(found, "rendered Esc close pill must expose a clickable hitbox");
+    }
+
+    #[test]
+    fn notice_scroll_limit_uses_the_same_responsive_geometry_as_rendering() {
+        let area = Rect::new(0, 0, 90, 20);
+        let message = (0..80)
+            .map(|index| format!("notice line {index} with wrapped explanatory text"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (width, height) = notice_popup_dimensions(area);
+
+        assert_eq!(
+            notice_message_max_scroll(area, &message),
+            scrollable_message_max_scroll(area, width, height, &message),
+        );
+        assert!(notice_message_max_scroll(area, &message) > 0);
+    }
 }
 
 #[cfg(test)]

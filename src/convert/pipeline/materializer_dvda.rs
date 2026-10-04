@@ -5910,6 +5910,8 @@ mod tests {
             .unwrap_or(DvdaGroupSelection::Default);
         PipelineRequest {
             registered_effects: Vec::new(),
+            deemphasis_choice_origin: Default::default(),
+            deemphasis_evidence_origin: Default::default(),
             job_id: "dvda-detect-test".to_string(),
             actions: crate::convert::pipeline::ActionPipeline::default(),
             item_id: "dvda-detect-test".to_string(),

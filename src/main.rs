@@ -2529,6 +2529,8 @@ fn build_pipeline_request_template(
 
     let mut request = PipelineRequest {
         registered_effects: Vec::new(),
+        deemphasis_choice_origin: Default::default(),
+        deemphasis_evidence_origin: Default::default(),
         actions: options.actions.clone(),
         worker_count: None,
         scratch_staging: None,

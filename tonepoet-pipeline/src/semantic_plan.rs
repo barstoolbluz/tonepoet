@@ -26,7 +26,7 @@ use crate::settings::{
     AacSettings, DsdGeneralExportLevel, DsdGeneralReconstruction, DsdToPcmSettings,
     DsdToPcmSincSettings, FlacSettings, Mp3Settings, OpusSettings, PcmToDsdSettings,
     PcmToDsdSincSettings, ReplayGainExistingTagPolicy, SampleGainPolicy, SoxResamplerSettings,
-    SoxrResamplerSettings, SsrcSettings, WavPackSettings,
+    SoxrResamplerSettings, SsrcSettings, WavPackSettings, source_pcm_depth_for_target,
 };
 use crate::source::SourceRepresentationKind;
 use crate::tools::{ToolIdentifier, ToolRegistry};
@@ -2369,11 +2369,85 @@ pub fn plan_typed_with_effects(
     plan_typed_with_effects_and_policy(request, effects, &CandidateSearchPolicy::default())
 }
 
+fn cd_deemphasis_auto_tpdf_requested(
+    request: &PlanRequest,
+    effects: &[EffectIntent],
+) -> bool {
+    if request.settings.dither_explicit
+        || !effects
+            .iter()
+            .any(|effect| matches!(&effect.effect, RegisteredUnaryEffect::CdDeemphasis))
+        || !request.settings.target_format.is_pcm_lossless()
+        || (request.settings.target_format == AudioFormat::WavPack
+            && request.settings.wavpack.hybrid)
+    {
+        return false;
+    }
+
+    let target_depth = match request.settings.target_bit_depth {
+        BitDepthTarget::Pcm(depth) => Some(depth),
+        BitDepthTarget::Source => request.source.authoritative_pcm_depth().map(|source_depth| {
+            source_pcm_depth_for_target(
+                &request.settings.target_format,
+                request.settings.wavpack.hybrid,
+                source_depth,
+            )
+        }),
+    };
+
+    target_depth == Some(PcmBitDepth::Int16)
+}
+
+fn cd_deemphasis_explicit_shibata_ssrc_approximation_refusal(
+    request: &PlanRequest,
+    effects: &[EffectIntent],
+    candidate: &PhysicalCandidate,
+) -> Option<PlanRefusal> {
+    if !request.settings.dither_explicit
+        || request.settings.dither_type != DitherType::Shibata
+        || !effects
+            .iter()
+            .any(|effect| matches!(&effect.effect, RegisteredUnaryEffect::CdDeemphasis))
+        || candidate.tool.as_ref() != Some(&ToolIdentifier::Ssrc)
+    {
+        return None;
+    }
+
+    let Some(SelectedTerminalRealization::Pcm(realization)) =
+        candidate.contract.terminal_realization.as_ref()
+    else {
+        return None;
+    };
+    let Some(ssrc_dither) = realization.ssrc_dither.as_ref() else {
+        return None;
+    };
+    if ssrc_dither.origin != crate::plugins::SsrcDitherOrigin::GlobalApproximation {
+        return None;
+    }
+
+    Some(PlanRefusal {
+        code: "cd_deemphasis_shibata_ssrc_unavailable".to_owned(),
+        reason: "explicit Shibata after CD de-emphasis requires a terminal that realizes Shibata exactly; SSRC's named-family mapping is an approximation, so this terminal cell is unavailable rather than silently substituting another shaper".to_owned(),
+    })
+}
+
 fn plan_typed_with_effects_and_policy(
     request: &PlanRequest,
     effects: &[EffectIntent],
     search_policy: &CandidateSearchPolicy,
 ) -> Result<PlanningOutcome<TypedConversionPlan>, PlanningResourceLimit> {
+    // CD de-emphasis is performed in Float64, so an automatic Int16 landing
+    // needs one neutral TPDF quantization even when the original source was
+    // already Int16.  Derive that policy at the semantic boundary so callers
+    // that bypass the TUI cannot accidentally omit it.  Keep the caller's
+    // request immutable and preserve every explicit dither choice.
+    let derived_request = cd_deemphasis_auto_tpdf_requested(request, effects).then(|| {
+        let mut request = request.clone();
+        request.settings.dither_type = DitherType::Tpdf;
+        request
+    });
+    let request = derived_request.as_ref().unwrap_or(request);
+
     let mut intent = match normalize_intent(request) {
         Ok(intent) => intent,
         Err(error) => {
@@ -3059,6 +3133,13 @@ fn plan_typed_with_effects_and_policy(
                     Err(CandidateSelectionError::Resource(limit)) => return Err(limit),
                 };
                 let selected_resampler_tool = candidates[selected_candidate].tool.clone();
+                if let Some(refusal) = cd_deemphasis_explicit_shibata_ssrc_approximation_refusal(
+                    request,
+                    effects,
+                    &candidates[selected_candidate],
+                ) {
+                    return Ok(PlanningOutcome::Refused(refusal));
+                }
 
                 // Retain the pre-R18 protected-route rule for historical
                 // tool-specific pre-resample effects. CD de-emphasis is
@@ -3810,6 +3891,13 @@ fn plan_typed_with_effects_and_policy(
                 }
                 Err(CandidateSelectionError::Resource(limit)) => return Err(limit),
             };
+            if let Some(refusal) = cd_deemphasis_explicit_shibata_ssrc_approximation_refusal(
+                request,
+                effects,
+                &candidates[selected_candidate],
+            ) {
+                return Ok(PlanningOutcome::Refused(refusal));
+            }
             if current_route.is_some()
                 && candidates[selected_candidate].tool.as_ref() != current_route.as_ref()
                 && capability == ExecutionCapability::ExecutableNow
@@ -10087,6 +10175,315 @@ mod tests {
             node,
             TypedPlanNode::Operation { operation: PlanOperation::ResamplePcm { .. }, .. }
         )), "same-rate de-emphasis must not manufacture a no-op resampler");
+    }
+
+    fn r24_int16_deemphasis_request() -> PlanRequest {
+        let mut request = pcm_request(SampleGainPolicy::Off);
+        request.source.sample_rate_hz = Some(44_100);
+        request.source.bit_depth = Some(PcmBitDepth::Int16);
+        request.source.true_source_depth = Some(PcmBitDepth::Int16);
+        request.source.sample_kind = Some(SampleKind::SignedInteger);
+        request.settings.target_format = AudioFormat::Flac;
+        request.output_path = PathBuf::from("out.flac");
+        request.settings.target_sample_rate = RateTarget::PcmHz(44_100);
+        request.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int16);
+        request
+    }
+
+    #[test]
+    fn r24_cd_deemphasis_int16_derives_plain_tpdf_at_the_terminal_boundary() {
+        let mut request = r24_int16_deemphasis_request();
+        // Model a stale non-explicit UI/global automatic value. R24 must derive
+        // neutral TPDF from the actual registered effect, not trust this field.
+        request.settings.dither_type = DitherType::Shibata;
+        request.settings.dither_explicit = false;
+
+        let Ok(PlanningOutcome::Ready(plan)) =
+            plan_typed_with_effects(&request, &[cd_deemphasis_source_rate_effect()])
+        else {
+            panic!("R24 Int16 CD de-emphasis route must be admitted")
+        };
+
+        // The semantic derivation is request-local; caller state remains intact.
+        assert_eq!(request.settings.dither_type, DitherType::Shibata);
+        assert!(!request.settings.dither_explicit);
+
+        let (terminal, resolved) = selected_pcm_terminal(&plan);
+        let Some(SelectedTerminalRealization::Pcm(realization)) =
+            terminal.contract.terminal_realization.as_ref()
+        else {
+            panic!("R24 Int16 route must select a PCM terminal realization")
+        };
+        assert_eq!(
+            realization.input_precision,
+            StoragePrecision::Pcm(PcmBitDepth::Float64),
+            "CD de-emphasis must remain Float64 until the terminal landing",
+        );
+        assert_eq!(realization.effective_dither, Some(DitherType::Tpdf));
+        assert_eq!(
+            realization.dither_owner,
+            PcmTerminalDitherOwner::SelectedTerminal,
+        );
+        match resolved {
+            ResolvedOperationParameters::EncodeFlac { effective_dither, .. } => {
+                assert_eq!(*effective_dither, Some(DitherType::Tpdf));
+            }
+            other => panic!("expected FLAC terminal parameters, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn r24_mixed_batch_nominal_dither_is_overridden_only_by_actual_deemphasis() {
+        // The representative 24 -> 16 automatic policy is Shibata. An eligible
+        // 16/44.1 member that actually receives CdDeemphasis derives TPDF from
+        // the same non-explicit nominal request, while the unrelated 24-bit
+        // member keeps the ordinary Shibata terminal behavior.
+        let mut eligible = r24_int16_deemphasis_request();
+        eligible.settings.target_sample_rate = RateTarget::PcmHz(88_200);
+        eligible.settings.dither_type = DitherType::Shibata;
+        eligible.settings.dither_explicit = false;
+        let Ok(PlanningOutcome::Ready(eligible_plan)) =
+            plan_typed_with_effects(&eligible, &[cd_deemphasis_source_rate_effect()])
+        else {
+            panic!("eligible mixed-batch member must be admitted")
+        };
+        let (eligible_terminal, _) = selected_pcm_terminal(&eligible_plan);
+        let Some(SelectedTerminalRealization::Pcm(eligible_realization)) =
+            eligible_terminal.contract.terminal_realization.as_ref()
+        else {
+            panic!("eligible member terminal realization")
+        };
+        assert_eq!(eligible_realization.effective_dither, Some(DitherType::Tpdf));
+
+        let mut unrelated = r24_int16_deemphasis_request();
+        unrelated.source.bit_depth = Some(PcmBitDepth::Int24);
+        unrelated.source.true_source_depth = Some(PcmBitDepth::Int24);
+        unrelated.settings.target_sample_rate = RateTarget::PcmHz(88_200);
+        unrelated.settings.dither_type = DitherType::Shibata;
+        unrelated.settings.dither_explicit = false;
+        let Ok(PlanningOutcome::Ready(unrelated_plan)) = plan_typed(&unrelated) else {
+            panic!("unrelated 24 -> 16 mixed-batch member must be admitted")
+        };
+        let (unrelated_terminal, _) = selected_pcm_terminal(&unrelated_plan);
+        let Some(SelectedTerminalRealization::Pcm(unrelated_realization)) =
+            unrelated_terminal.contract.terminal_realization.as_ref()
+        else {
+            panic!("unrelated member terminal realization")
+        };
+        assert_eq!(unrelated_realization.effective_dither, Some(DitherType::Shibata));
+
+        let mut ordinary_16 = r24_int16_deemphasis_request();
+        ordinary_16.settings.target_sample_rate = RateTarget::PcmHz(88_200);
+        ordinary_16.settings.dither_type = DitherType::None;
+        ordinary_16.settings.dither_explicit = false;
+        let Ok(PlanningOutcome::Ready(control_plan)) = plan_typed(&ordinary_16) else {
+            panic!("ordinary 16 -> 16 control must be admitted")
+        };
+        let (control_terminal, _) = selected_pcm_terminal(&control_plan);
+        let Some(SelectedTerminalRealization::Pcm(control_realization)) =
+            control_terminal.contract.terminal_realization.as_ref()
+        else {
+            panic!("ordinary 16 -> 16 control terminal realization")
+        };
+        assert_eq!(control_realization.effective_dither, None);
+
+        let Ok(PlanningOutcome::Ready(deemphasized_plan)) =
+            plan_typed_with_effects(&ordinary_16, &[cd_deemphasis_source_rate_effect()])
+        else {
+            panic!("de-emphasized 16 -> 16 control must be admitted")
+        };
+        let (deemphasized_terminal, _) = selected_pcm_terminal(&deemphasized_plan);
+        let Some(SelectedTerminalRealization::Pcm(deemphasized_realization)) =
+            deemphasized_terminal.contract.terminal_realization.as_ref()
+        else {
+            panic!("de-emphasized 16 -> 16 terminal realization")
+        };
+        assert_eq!(deemphasized_realization.effective_dither, Some(DitherType::Tpdf));
+    }
+
+    #[test]
+    fn r24_cd_deemphasis_source_int16_depth_also_derives_tpdf() {
+        let mut request = r24_int16_deemphasis_request();
+        request.settings.target_bit_depth = BitDepthTarget::Source;
+        request.settings.dither_type = DitherType::None;
+
+        assert!(cd_deemphasis_auto_tpdf_requested(
+            &request,
+            &[cd_deemphasis_source_rate_effect()],
+        ));
+        let Ok(PlanningOutcome::Ready(plan)) =
+            plan_typed_with_effects(&request, &[cd_deemphasis_source_rate_effect()])
+        else {
+            panic!("R24 Source->Int16 CD de-emphasis route must be admitted")
+        };
+        let (terminal, _) = selected_pcm_terminal(&plan);
+        let Some(SelectedTerminalRealization::Pcm(realization)) =
+            terminal.contract.terminal_realization.as_ref()
+        else {
+            panic!("Source->Int16 route must select a PCM terminal realization")
+        };
+        assert_eq!(realization.effective_dither, Some(DitherType::Tpdf));
+    }
+
+    #[test]
+    fn r24_cd_deemphasis_explicit_dither_authority_is_never_replaced() {
+        for explicit in [DitherType::None, DitherType::Tpdf, DitherType::Shibata] {
+            let mut request = r24_int16_deemphasis_request();
+            request.settings.dither_type = explicit;
+            request.settings.dither_explicit = true;
+
+            assert!(!cd_deemphasis_auto_tpdf_requested(
+                &request,
+                &[cd_deemphasis_source_rate_effect()],
+            ));
+            let Ok(PlanningOutcome::Ready(plan)) =
+                plan_typed_with_effects(&request, &[cd_deemphasis_source_rate_effect()])
+            else {
+                panic!("explicit R24 dither {explicit:?} must remain plannable")
+            };
+            let (terminal, _) = selected_pcm_terminal(&plan);
+            let Some(SelectedTerminalRealization::Pcm(realization)) =
+                terminal.contract.terminal_realization.as_ref()
+            else {
+                panic!("explicit R24 route must select a PCM terminal realization")
+            };
+            let expected = (explicit != DitherType::None).then_some(explicit);
+            assert_eq!(realization.effective_dither, expected, "{explicit:?}");
+        }
+    }
+
+    #[test]
+    fn r24_cd_deemphasis_automatic_tpdf_scope_is_narrow() {
+        let effect = cd_deemphasis_source_rate_effect();
+        let mut request = r24_int16_deemphasis_request();
+        assert!(cd_deemphasis_auto_tpdf_requested(
+            &request,
+            std::slice::from_ref(&effect),
+        ));
+
+        request.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
+        assert!(!cd_deemphasis_auto_tpdf_requested(
+            &request,
+            std::slice::from_ref(&effect),
+        ));
+        request.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Float32);
+        assert!(!cd_deemphasis_auto_tpdf_requested(
+            &request,
+            std::slice::from_ref(&effect),
+        ));
+
+        request.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int16);
+        request.settings.target_format = AudioFormat::Mp3;
+        assert!(!cd_deemphasis_auto_tpdf_requested(
+            &request,
+            std::slice::from_ref(&effect),
+        ));
+
+        request.settings.target_format = AudioFormat::WavPack;
+        request.settings.wavpack.hybrid = true;
+        assert!(!cd_deemphasis_auto_tpdf_requested(
+            &request,
+            std::slice::from_ref(&effect),
+        ));
+
+        request.settings.target_format = AudioFormat::Flac;
+        request.settings.wavpack.hybrid = false;
+        assert!(!cd_deemphasis_auto_tpdf_requested(&request, &[]));
+    }
+
+    #[test]
+    fn r24_cd_deemphasis_ssrc_int16_keeps_one_resampler_and_one_dither_owner() {
+        let mut request = forced_ssrc_wav_request(PcmBitDepth::Int16, DitherType::None);
+        request.source.sample_rate_hz = Some(44_100);
+        request.source.bit_depth = Some(PcmBitDepth::Int16);
+        request.source.true_source_depth = Some(PcmBitDepth::Int16);
+        request.source.sample_kind = Some(SampleKind::SignedInteger);
+        request.settings.target_sample_rate = RateTarget::PcmHz(88_200);
+        request.settings.dither_explicit = false;
+
+        let Ok(PlanningOutcome::Ready(plan)) =
+            plan_typed_with_effects(&request, &[cd_deemphasis_source_rate_effect()])
+        else {
+            panic!("R24 CD de-emphasis -> SSRC -> Int16 WAV route must be admitted")
+        };
+        let effect_index = plan
+            .nodes
+            .iter()
+            .position(|node| matches!(
+                node,
+                TypedPlanNode::ApplyEffect { instance, .. }
+                    if instance.effect == RegisteredUnaryEffect::CdDeemphasis
+            ))
+            .expect("de-emphasis node");
+        let resamplers = plan
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| match node {
+                TypedPlanNode::Operation {
+                    operation: PlanOperation::ResamplePcm { .. },
+                    candidates,
+                    selected_candidate,
+                    ..
+                } => Some((index, &candidates[*selected_candidate])),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(resamplers.len(), 1, "one semantic rate change");
+        let (resample_index, selected) = resamplers[0];
+        assert!(effect_index < resample_index, "de-emphasis precedes resampling");
+        assert_eq!(selected.tool, Some(ToolIdentifier::Ssrc));
+        let Some(SelectedTerminalRealization::Pcm(realization)) =
+            selected.contract.terminal_realization.as_ref()
+        else {
+            panic!("SSRC Int16 terminal realization")
+        };
+        assert_eq!(realization.kind, PcmTerminalRealizationKind::SsrcDirectWav);
+        assert_eq!(realization.effective_dither, Some(DitherType::Tpdf));
+        assert_eq!(realization.dither_owner, PcmTerminalDitherOwner::SsrcResampler);
+        assert_eq!(realization.target_rate_hz, Some(88_200));
+    }
+
+    #[test]
+    fn r24_explicit_shibata_does_not_silently_accept_ssrc_approximation() {
+        let mut request = forced_ssrc_wav_request(PcmBitDepth::Int16, DitherType::Shibata);
+        request.source.sample_rate_hz = Some(44_100);
+        request.source.bit_depth = Some(PcmBitDepth::Int16);
+        request.source.true_source_depth = Some(PcmBitDepth::Int16);
+        request.source.sample_kind = Some(SampleKind::SignedInteger);
+        request.settings.target_sample_rate = RateTarget::PcmHz(88_200);
+        request.settings.dither_explicit = true;
+
+        let Ok(PlanningOutcome::Refused(refusal)) =
+            plan_typed_with_effects(&request, &[cd_deemphasis_source_rate_effect()])
+        else {
+            panic!("CD de-emphasis + explicit Shibata must not relabel an SSRC approximation")
+        };
+        assert_eq!(refusal.code, "cd_deemphasis_shibata_ssrc_unavailable");
+
+        // Scope stays narrow: R24 does not rewrite the pre-existing global
+        // SSRC approximation contract for unrelated conversions.
+        let Ok(PlanningOutcome::Ready(control)) = plan_typed(&request) else {
+            panic!("unrelated explicit Shibata SSRC behavior must remain unchanged")
+        };
+        let selected = control.nodes.iter().find_map(|node| match node {
+            TypedPlanNode::Operation {
+                operation: PlanOperation::ResamplePcm { .. },
+                candidates,
+                selected_candidate,
+                ..
+            } => Some(&candidates[*selected_candidate]),
+            _ => None,
+        }).expect("SSRC control resampler");
+        let Some(SelectedTerminalRealization::Pcm(realization)) =
+            selected.contract.terminal_realization.as_ref()
+        else {
+            panic!("SSRC control terminal realization")
+        };
+        assert_eq!(
+            realization.ssrc_dither.as_ref().map(|dither| dither.origin),
+            Some(crate::plugins::SsrcDitherOrigin::GlobalApproximation),
+        );
     }
 
     #[test]

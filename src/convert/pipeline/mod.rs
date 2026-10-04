@@ -90,6 +90,8 @@ mod tests {
     fn sample_request() -> PipelineRequest {
         PipelineRequest {
             registered_effects: Vec::new(),
+            deemphasis_choice_origin: Default::default(),
+            deemphasis_evidence_origin: Default::default(),
             actions: crate::convert::pipeline::ActionPipeline::default(),
             job_id: "job-1".into(),
             item_id: "item-1".into(),

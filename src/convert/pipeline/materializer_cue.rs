@@ -4908,6 +4908,8 @@ FILE "album.flac" WAVE
     pub(super) fn test_request(container: &Path) -> PipelineRequest {
         PipelineRequest {
             registered_effects: Vec::new(),
+            deemphasis_choice_origin: Default::default(),
+            deemphasis_evidence_origin: Default::default(),
             job_id: "test-job".to_string(),
             actions: crate::convert::pipeline::ActionPipeline::default(),
             item_id: "test-item".to_string(),

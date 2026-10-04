@@ -97,6 +97,8 @@ fn request_for_fixture(
         .unwrap_or(DvdaGroupSelection::Default);
     PipelineRequest {
         registered_effects: Vec::new(),
+        deemphasis_choice_origin: Default::default(),
+        deemphasis_evidence_origin: Default::default(),
         job_id: "dvda-phase2-fixture-test".to_string(),
         actions: crate::convert::pipeline::ActionPipeline::default(),
         item_id: normalized_fixture_name(fixture),

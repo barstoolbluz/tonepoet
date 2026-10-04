@@ -491,6 +491,44 @@ impl RequestMetadataOverrides {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum DeemphasisChoiceOrigin {
+    #[default]
+    Automatic,
+    User,
+}
+
+impl DeemphasisChoiceOrigin {
+    #[must_use]
+    pub fn is_automatic(&self) -> bool {
+        *self == Self::Automatic
+    }
+
+    #[must_use]
+    pub fn log_label(self) -> &'static str {
+        match self {
+            Self::Automatic => "automatic",
+            Self::User => "user",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum DeemphasisEvidenceOrigin {
+    #[default]
+    None,
+    ExplicitTag,
+    CueFlag,
+    CatalogExact,
+}
+
+impl DeemphasisEvidenceOrigin {
+    #[must_use]
+    pub fn is_none(&self) -> bool {
+        *self == Self::None
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineRequest {
     pub job_id: String,
@@ -510,6 +548,14 @@ pub struct PipelineRequest {
     /// inventing command syntax or another route selector.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub registered_effects: Vec<tonepoet_pipeline::EffectIntent>,
+    /// Provenance for the Convert-screen CD de-emphasis decision. This is
+    /// audit/log metadata only; audio semantics remain owned by `registered_effects`.
+    #[serde(default, skip_serializing_if = "DeemphasisChoiceOrigin::is_automatic")]
+    pub deemphasis_choice_origin: DeemphasisChoiceOrigin,
+    /// Source evidence that made the CD de-emphasis decision relevant. This is
+    /// kept independent of whether the filter was ultimately applied.
+    #[serde(default, skip_serializing_if = "DeemphasisEvidenceOrigin::is_none")]
+    pub deemphasis_evidence_origin: DeemphasisEvidenceOrigin,
     /// Worker pool size for this job. None means cores-1.
     pub worker_count: Option<usize>,
     /// Optional RAM/scratch staging configuration injected by processor entry points.
@@ -983,6 +1029,14 @@ pub struct RedactedPipelineRequest {
     pub settings: PipelineSettings,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub registered_effects: Vec<tonepoet_pipeline::EffectIntent>,
+    /// Provenance for the Convert-screen CD de-emphasis decision. This is
+    /// audit/log metadata only; audio semantics remain owned by `registered_effects`.
+    #[serde(default, skip_serializing_if = "DeemphasisChoiceOrigin::is_automatic")]
+    pub deemphasis_choice_origin: DeemphasisChoiceOrigin,
+    /// Source evidence that made the CD de-emphasis decision relevant. This is
+    /// kept independent of whether the filter was ultimately applied.
+    #[serde(default, skip_serializing_if = "DeemphasisEvidenceOrigin::is_none")]
+    pub deemphasis_evidence_origin: DeemphasisEvidenceOrigin,
     /// Worker pool size for this job. None means cores-1.
     pub worker_count: Option<usize>,
     pub merge: bool,
@@ -1074,6 +1128,8 @@ impl From<&PipelineRequest> for RedactedPipelineRequest {
             },
             settings: req.settings.clone(),
             registered_effects: req.registered_effects.clone(),
+            deemphasis_choice_origin: req.deemphasis_choice_origin,
+            deemphasis_evidence_origin: req.deemphasis_evidence_origin,
             worker_count: req.worker_count,
             merge: req.merge,
             output_root: req.output_root.clone(),

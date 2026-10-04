@@ -14015,6 +14015,8 @@ mod tests {
     fn metadata_test_request(root: &Path) -> PipelineRequest {
         PipelineRequest {
             registered_effects: Vec::new(),
+            deemphasis_choice_origin: Default::default(),
+            deemphasis_evidence_origin: Default::default(),
             job_id: "metadata-job".to_string(),
             actions: crate::convert::pipeline::ActionPipeline::default(),
             item_id: "metadata-item".to_string(),

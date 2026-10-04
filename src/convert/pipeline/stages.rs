@@ -12506,6 +12506,8 @@ FILE "album.flac" WAVE
 
         PipelineRequest {
             registered_effects: Vec::new(),
+            deemphasis_choice_origin: Default::default(),
+            deemphasis_evidence_origin: Default::default(),
             actions: crate::convert::pipeline::ActionPipeline::default(),
             job_id: format!("matrix-{}", case.name),
             item_id: format!("matrix-{}", case.name),
@@ -23029,8 +23031,9 @@ fn append_conversion_settings_section(
     push_kv_line(
         log,
         "Dither",
-        dither_log_line(source, settings, tracks, dithering_applies),
+        dither_log_line(source, req, tracks, dithering_applies),
     );
+    append_deemphasis_conversion_log_lines(log, source, req);
     push_kv_line(log, "Force encode", yes_no(settings.force_encode));
     push_kv_line(log, "Merge mode", yes_no(req.merge));
 
@@ -23611,12 +23614,138 @@ fn source_depth_reduction_requires_dither(
         .any(|track| track_depth_reduction_requires_dither(track, settings))
 }
 
+fn cd_deemphasis_auto_tpdf_for_source(source: &PreparedSource, req: &PipelineRequest) -> bool {
+    let settings = &req.settings;
+    if settings.dither_explicit
+        || !request_applies_cd_deemphasis(req)
+        || !settings.target_format.is_pcm_lossless()
+        || (settings.target_format == PlannerAudioFormat::WavPack && settings.wavpack.hybrid)
+        || source.tracks.is_empty()
+    {
+        return false;
+    }
+    source.tracks.iter().all(|track| {
+        resolved_target_pcm_depth(track, settings) == Some(PcmBitDepth::Int16)
+    })
+}
+
+fn effective_dither_for_request(source: &PreparedSource, req: &PipelineRequest) -> DitherType {
+    if req.settings.dither_explicit {
+        return req.settings.dither_type;
+    }
+    if cd_deemphasis_auto_tpdf_for_source(source, req) {
+        return DitherType::Tpdf;
+    }
+    effective_dither_for_source(source, &req.settings)
+}
+
+fn deemphasis_log_evidence(
+    source: &PreparedSource,
+    req: &PipelineRequest,
+) -> Option<String> {
+    if source.tracks.is_empty() {
+        return None;
+    }
+    // Independent-file album logs are assembled from one-track fragments. The
+    // dispatcher-authored album count, not the representative fragment's local
+    // PreparedSource length, is the authoritative N for the final "all N" line.
+    let track_count = req
+        .album_batch
+        .as_ref()
+        .map(|batch| batch.expected_track_count)
+        .filter(|count| *count > 0)
+        .unwrap_or(source.tracks.len());
+    let all_explicit = source.tracks.iter().all(|track| {
+        source_text_tags_indicate_pre_emphasis(&track.metadata.extra)
+    });
+    let all_preemphasis = source.tracks.iter().all(|track| track.metadata.pre_emphasis);
+
+    match req.deemphasis_evidence_origin {
+        DeemphasisEvidenceOrigin::ExplicitTag if all_explicit => Some(format!(
+            "PRE_EMPHASIS tag on all {track_count} source tracks"
+        )),
+        DeemphasisEvidenceOrigin::CueFlag if all_preemphasis => {
+            Some(format!("CUE FLAGS PRE on all {track_count} source tracks"))
+        }
+        DeemphasisEvidenceOrigin::CatalogExact => {
+            Some("exact catalog match in the bundled pre-emphasis reference".to_string())
+        }
+        // Older/non-TUI single-source callers did not carry explicit evidence
+        // provenance. Preserve truthful local inference there, but fail closed
+        // for album-fragment requests: an arbitrary one-track representative
+        // must never be promoted into an album-wide "all N" claim.
+        DeemphasisEvidenceOrigin::None if req.album_batch.is_none() && all_explicit => Some(format!(
+            "PRE_EMPHASIS tag on all {track_count} source tracks"
+        )),
+        DeemphasisEvidenceOrigin::None if req.album_batch.is_none() && all_preemphasis => {
+            Some(format!("CUE FLAGS PRE on all {track_count} source tracks"))
+        }
+        DeemphasisEvidenceOrigin::ExplicitTag
+        | DeemphasisEvidenceOrigin::CueFlag
+        | DeemphasisEvidenceOrigin::None => None,
+    }
+}
+
+fn append_deemphasis_conversion_log_lines(
+    log: &mut String,
+    source: &PreparedSource,
+    req: &PipelineRequest,
+) {
+    let Some(evidence) = deemphasis_log_evidence(source, req) else {
+        return;
+    };
+    if request_applies_cd_deemphasis(req) {
+        push_kv_line(
+            log,
+            "De-emphasis",
+            "yes (CD pre-emphasis filtered out of the audio)",
+        );
+        push_kv_line(log, "De-emphasis evidence", evidence);
+        push_kv_line(
+            log,
+            "De-emphasis chosen by",
+            req.deemphasis_choice_origin.log_label(),
+        );
+        push_kv_line(
+            log,
+            "De-emphasis effect",
+            "audio altered; output is not bit-identical to the source, and will not match AccurateRip or any checksum taken from the pre-emphasised disc",
+        );
+        return;
+    }
+
+    push_kv_line(
+        log,
+        "De-emphasis",
+        "no (pre-emphasis evidence present; filter not applied)",
+    );
+    push_kv_line(log, "De-emphasis evidence", evidence);
+    push_kv_line(
+        log,
+        "De-emphasis chosen by",
+        req.deemphasis_choice_origin.log_label(),
+    );
+    let signaling_preserved = req.stages.metadata == StageRequirement::Enabled
+        && !source.tracks.is_empty()
+        && source
+            .tracks
+            .iter()
+            .all(|track| track_preserves_cd_preemphasis_signaling_domain(track, &req.settings));
+    let effect = if signaling_preserved {
+        "pre-emphasis remains in the audio; the pre-emphasis flag is preserved in the output format"
+    } else {
+        "pre-emphasis remains in the audio; the pre-emphasis flag cannot be carried by the output format"
+    };
+    push_kv_line(log, "De-emphasis effect", effect);
+}
+
 fn dither_log_line(
     source: &PreparedSource,
-    settings: &tonepoet_pipeline::PipelineSettings,
+    req: &PipelineRequest,
     tracks: &[&TrackRecord],
     applies: bool,
 ) -> String {
+    let settings = &req.settings;
     if tonepoet_pipeline::selects_reference_dsd_to_pcm(settings, source_is_dsd(source)) {
         if source_has_float_target(source, settings) {
             return "no (float terminal; Reference policy)".to_string();
@@ -23632,10 +23761,17 @@ fn dither_log_line(
         return "yes (TPDF, sox_ng, Reference policy)".to_string();
     }
     if applies {
+        if request_applies_cd_deemphasis(req) {
+            let effective_dither = effective_dither_for_request(source, req);
+            if effective_dither != DitherType::None {
+                return format!("yes ({})", dither_type_label(effective_dither));
+            }
+        }
         return format!("yes ({})", applied_dither_description(source, tracks, settings));
     }
-    let policy_tpdf = source_depth_policy_tpdf_for_source(source, settings);
-    let effective_dither = effective_dither_for_source(source, settings);
+    let policy_tpdf = source_depth_policy_tpdf_for_source(source, settings)
+        || cd_deemphasis_auto_tpdf_for_source(source, req);
+    let effective_dither = effective_dither_for_request(source, req);
     if effective_dither == DitherType::None {
         return "no (not requested)".to_string();
     }
@@ -23683,7 +23819,9 @@ fn dither_log_line(
             "requested ({requested}) — not applied (executed command did not emit a dither stage)"
         );
     }
-    if source_depth_reduction_requires_dither(source, settings) {
+    if cd_deemphasis_auto_tpdf_for_source(source, req)
+        || source_depth_reduction_requires_dither(source, settings)
+    {
         return format!(
             "requested ({requested}) — not applied (executed command did not emit a dither stage)"
         );
@@ -50144,6 +50282,8 @@ mod companion_copy_hardening_tests {
     fn test_request(root: &Path, container: PathBuf) -> PipelineRequest {
         PipelineRequest {
             registered_effects: Vec::new(),
+            deemphasis_choice_origin: Default::default(),
+            deemphasis_evidence_origin: Default::default(),
             actions: crate::convert::pipeline::ActionPipeline::default(),
             job_id: "companion-test-job".to_string(),
             item_id: "companion-test-item".to_string(),
@@ -61233,6 +61373,8 @@ mod pipeline_test_helpers {
     pub(super) fn log_test_request() -> PipelineRequest {
         PipelineRequest {
             registered_effects: Vec::new(),
+            deemphasis_choice_origin: Default::default(),
+            deemphasis_evidence_origin: Default::default(),
             actions: crate::convert::pipeline::ActionPipeline::default(),
             job_id: "job-1".to_string(),
             item_id: "item-1".to_string(),
@@ -62547,6 +62689,246 @@ mod conversion_log_tests {
         assert!(!mp3_log.contains("AAC profile"));
     }
 
+    fn r24_cd_preemphasis_source(explicit_tag: bool) -> PreparedSource {
+        let mut source = log_test_source();
+        for track in &mut source.tracks {
+            track.sample_rate = Some(44_100);
+            track.source_audio = SourceAudioDescriptor::from_scalar(
+                Some(44_100),
+                Some(16),
+                Some(SourceAudioCoding::Pcm),
+            );
+            track.bit_depth = Some(16);
+            track.metadata.pre_emphasis = true;
+            if explicit_tag {
+                crate::convert::pipeline::types::insert_source_text_tag(
+                    &mut track.metadata.extra,
+                    "PRE_EMPHASIS",
+                    "1",
+                );
+            }
+        }
+        source
+    }
+
+    fn r24_cd_deemphasis_intent() -> tonepoet_pipeline::EffectIntent {
+        tonepoet_pipeline::EffectIntent {
+            id: tonepoet_pipeline::EffectInstanceId(24),
+            effect: tonepoet_pipeline::RegisteredUnaryEffect::CdDeemphasis,
+            after: Vec::new(),
+            placement: tonepoet_pipeline::EffectPlacement::SourceRate,
+        }
+    }
+
+    fn r24_int16_deemphasis_log_request() -> PipelineRequest {
+        let mut req = log_test_request();
+        req.settings.target_format = PlannerAudioFormat::Flac;
+        req.settings.target_sample_rate = RateTarget::Source;
+        req.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int16);
+        req.settings.dither_type = DitherType::None;
+        req.settings.dither_explicit = false;
+        req.registered_effects = vec![r24_cd_deemphasis_intent()];
+        req.deemphasis_choice_origin = DeemphasisChoiceOrigin::Automatic;
+        req.deemphasis_evidence_origin = DeemphasisEvidenceOrigin::ExplicitTag;
+        req
+    }
+
+    fn r24_sox_dither_record(shibata: bool) -> TrackRecord {
+        let mut record = ok_record();
+        record.verified_output_bit_depth = Some(PcmBitDepth::Int16);
+        let mut command = command_record_for(ToolBinary::Sox);
+        command.sanitized_args = if shibata {
+            vec!["dither".to_string(), "-s".to_string()]
+        } else {
+            vec!["dither".to_string()]
+        };
+        record.commands = vec![command];
+        record
+    }
+
+    #[test]
+    fn r24_conversion_log_names_automatic_cd_deemphasis_evidence_and_plain_tpdf() {
+        let source = r24_cd_preemphasis_source(true);
+        let req = r24_int16_deemphasis_log_request();
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![r24_sox_dither_record(false)],
+            stages: stage_records(),
+        };
+        let log = build_conversion_log(
+            &outcome,
+            &source,
+            &req,
+            &log_test_artifacts(),
+            None,
+        );
+
+        assert!(log.contains("Dither: yes (TPDF)"), "{log}");
+        assert!(log.contains(
+            "De-emphasis: yes (CD pre-emphasis filtered out of the audio)"
+        ));
+        assert!(log.contains("De-emphasis evidence: PRE_EMPHASIS tag on all 2 source tracks"));
+        assert!(log.contains("De-emphasis chosen by: automatic"));
+        assert!(log.contains(
+            "De-emphasis effect: audio altered; output is not bit-identical to the source, and will not match AccurateRip or any checksum taken from the pre-emphasised disc"
+        ));
+    }
+
+    #[test]
+    fn r24_album_fragment_log_uses_dispatcher_track_count_for_uniform_evidence() {
+        let mut source = r24_cd_preemphasis_source(true);
+        source.tracks.truncate(1);
+        let mut req = r24_int16_deemphasis_log_request();
+        req.album_batch = Some(AlbumBatchContext::new(
+            "r24-log-batch",
+            8,
+            PathBuf::from("out/album"),
+            PathBuf::from("source/album"),
+        ));
+        let log = build_conversion_log(
+            &AlbumOutcome::Complete {
+                tracks: vec![r24_sox_dither_record(false)],
+                stages: stage_records(),
+            },
+            &source,
+            &req,
+            &log_test_artifacts(),
+            None,
+        );
+
+        assert!(log.contains(
+            "De-emphasis evidence: PRE_EMPHASIS tag on all 8 source tracks"
+        ), "{log}");
+        assert!(!log.contains("all 1 source tracks"), "{log}");
+    }
+
+    #[test]
+    fn r24_album_fragment_without_uniform_evidence_provenance_does_not_overclaim() {
+        let mut source = r24_cd_preemphasis_source(true);
+        source.tracks.truncate(1);
+        let mut req = r24_int16_deemphasis_log_request();
+        req.deemphasis_evidence_origin = DeemphasisEvidenceOrigin::None;
+        req.album_batch = Some(AlbumBatchContext::new(
+            "r24-mixed-log-batch",
+            8,
+            PathBuf::from("out/album"),
+            PathBuf::from("source/album"),
+        ));
+        let log = build_conversion_log(
+            &AlbumOutcome::Complete {
+                tracks: vec![r24_sox_dither_record(false)],
+                stages: stage_records(),
+            },
+            &source,
+            &req,
+            &log_test_artifacts(),
+            None,
+        );
+
+        assert!(!log.contains("De-emphasis evidence:"), "{log}");
+    }
+
+    #[test]
+    fn r24_conversion_log_names_explicit_shibata_without_calling_it_automatic() {
+        let source = r24_cd_preemphasis_source(true);
+        let mut req = r24_int16_deemphasis_log_request();
+        req.settings.dither_type = DitherType::Shibata;
+        req.settings.dither_explicit = true;
+        req.deemphasis_choice_origin = DeemphasisChoiceOrigin::User;
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![r24_sox_dither_record(true)],
+            stages: stage_records(),
+        };
+        let log = build_conversion_log(
+            &outcome,
+            &source,
+            &req,
+            &log_test_artifacts(),
+            None,
+        );
+
+        assert!(log.contains("Dither: yes (Shibata)"), "{log}");
+        assert!(log.contains("De-emphasis chosen by: user"), "{log}");
+        assert!(!log.contains("Dither: yes (TPDF)"), "{log}");
+    }
+
+    #[test]
+    fn r24_conversion_log_records_user_declined_cue_evidence_and_preserved_flag() {
+        let source = r24_cd_preemphasis_source(false);
+        let mut req = r24_int16_deemphasis_log_request();
+        req.registered_effects.clear();
+        req.deemphasis_choice_origin = DeemphasisChoiceOrigin::User;
+        req.deemphasis_evidence_origin = DeemphasisEvidenceOrigin::CueFlag;
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![ok_record()],
+            stages: stage_records(),
+        };
+        let log = build_conversion_log(
+            &outcome,
+            &source,
+            &req,
+            &log_test_artifacts(),
+            None,
+        );
+
+        assert!(log.contains(
+            "De-emphasis: no (pre-emphasis evidence present; filter not applied)"
+        ));
+        assert!(log.contains("De-emphasis evidence: CUE FLAGS PRE on all 2 source tracks"));
+        assert!(log.contains("De-emphasis chosen by: user"));
+        assert!(log.contains(
+            "De-emphasis effect: pre-emphasis remains in the audio; the pre-emphasis flag is preserved in the output format"
+        ));
+    }
+
+    #[test]
+    fn r24_conversion_log_says_when_target_cannot_carry_the_remaining_flag() {
+        let source = r24_cd_preemphasis_source(false);
+        let mut req = r24_int16_deemphasis_log_request();
+        req.registered_effects.clear();
+        req.settings.target_format = PlannerAudioFormat::Aac;
+        req.deemphasis_choice_origin = DeemphasisChoiceOrigin::User;
+        req.deemphasis_evidence_origin = DeemphasisEvidenceOrigin::CueFlag;
+        let log = build_conversion_log(
+            &AlbumOutcome::Complete {
+                tracks: vec![ok_record()],
+                stages: stage_records(),
+            },
+            &source,
+            &req,
+            &log_test_artifacts(),
+            None,
+        );
+
+        assert!(log.contains(
+            "De-emphasis effect: pre-emphasis remains in the audio; the pre-emphasis flag cannot be carried by the output format"
+        ));
+    }
+
+    #[test]
+    fn r24_conversion_log_emits_no_deemphasis_lines_without_source_evidence() {
+        let mut source = r24_cd_preemphasis_source(false);
+        for track in &mut source.tracks {
+            track.metadata.pre_emphasis = false;
+        }
+        let mut req = r24_int16_deemphasis_log_request();
+        req.deemphasis_evidence_origin = DeemphasisEvidenceOrigin::None;
+        let log = build_conversion_log(
+            &AlbumOutcome::Complete {
+                tracks: vec![r24_sox_dither_record(false)],
+                stages: stage_records(),
+            },
+            &source,
+            &req,
+            &log_test_artifacts(),
+            None,
+        );
+
+        assert!(!log.contains("De-emphasis:"), "{log}");
+        assert!(!log.contains("De-emphasis evidence:"), "{log}");
+        assert!(!log.contains("De-emphasis chosen by:"), "{log}");
+        assert!(!log.contains("De-emphasis effect:"), "{log}");
+    }
+
     #[test]
     fn dsp_settings_are_affirmative_and_resampler_details_follow_actual_rate_changes() {
         let source = log_test_source();
@@ -63755,6 +64137,8 @@ mod naming_template_tests {
     pub(super) fn template_request(folder_template: Option<String>) -> PipelineRequest {
         PipelineRequest {
             registered_effects: Vec::new(),
+            deemphasis_choice_origin: Default::default(),
+            deemphasis_evidence_origin: Default::default(),
             actions: crate::convert::pipeline::ActionPipeline::default(),
             job_id: "job-test".to_string(),
             item_id: "item-test".to_string(),
@@ -66449,6 +66833,8 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
     ) -> PipelineRequest {
         PipelineRequest {
             registered_effects: Vec::new(),
+            deemphasis_choice_origin: Default::default(),
+            deemphasis_evidence_origin: Default::default(),
             actions: crate::convert::pipeline::ActionPipeline::default(),
             job_id: "job-2-1-3".to_string(),
             item_id: format!("item-{:?}", policy),

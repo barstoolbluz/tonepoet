@@ -110,6 +110,8 @@ pub fn build_pipeline_request_from_settings(
 
     Ok(PipelineRequest {
         registered_effects: Vec::new(),
+        deemphasis_choice_origin: Default::default(),
+        deemphasis_evidence_origin: Default::default(),
         job_id: format!("job-{}", item.id),
         item_id: item.id.clone(),
         submission_id: item.submission_id.clone(),
