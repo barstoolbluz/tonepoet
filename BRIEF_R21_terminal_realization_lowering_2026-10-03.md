@@ -16,8 +16,10 @@ tui::context_menu::tests::context_menu_convert_last_used_audio_directory_commits
 
 ## Expected
 
-`installed_reference_qualification_binds_the_current_locked_sources`.
-`semantic_plan.rs` is Reference-locked. Requalification runs on this host.
+`installed_reference_qualification_binds_the_current_locked_sources`. The
+branch changes five Reference-locked files: `plan_bridge.rs`, `stages.rs`,
+`fingerprint.rs`, `plan.rs`, `semantic_plan.rs`. Requalification runs on this
+host.
 
 ## Pass in isolation
 
