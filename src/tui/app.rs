@@ -4111,15 +4111,80 @@ mod clamp_pill_tests {
         });
         assert!(!format.deemphasis_enabled, "lossless integer 16/44.1 preserves emphasized source");
 
+        format.format.select_value(&AudioFormat::Aac);
+        format.apply_format_constraints();
+        assert!(format.deemphasis_enabled, "lossy target defaults De-emphasis On");
+
+        format.format.select_value(&AudioFormat::Wav);
+        format.sample_rate.select_value(&44_100);
+        format.bit_depth.select_value(&super::BitDepthChoice::Int16);
+        format.apply_format_constraints();
+        assert!(!format.deemphasis_enabled, "lossless integer 16/44.1 returns the default to Off");
+
+        format.sample_rate.select_value(&88_200);
+        format.apply_format_constraints();
+        assert!(format.deemphasis_enabled, "88.2 kHz leaves the preservation domain");
+
+        format.sample_rate.select_value(&44_100);
+        format.apply_format_constraints();
+        assert!(!format.deemphasis_enabled, "returning to 44.1 kHz re-decides the default");
+
         format.bit_depth.select_value(&super::BitDepthChoice::Int24);
         format.apply_format_constraints();
         assert!(format.deemphasis_enabled, "24/44.1 leaves the preservation domain");
 
-        format.deemphasis_enabled = false;
-        format.deemphasis_overridden = true;
+        assert!(format.select_row_index(
+            super::FormatField::Deemphasis,
+            0,
+            Some(16),
+            Some(44_100),
+        ));
+        assert!(format.deemphasis_overridden, "manual selection records user authority");
+        assert!(!format.deemphasis_enabled, "manual Off replaces the automatic On default");
+
         format.sample_rate.select_value(&88_200);
         format.apply_format_constraints();
         assert!(!format.deemphasis_enabled, "explicit user override must survive target changes");
+    }
+
+    #[test]
+    fn deemphasis_auto_default_uses_final_pcm_rate_after_dsd_round_trip() {
+        let mut format = eligible_deemphasis_state();
+        format.set_convert_deemphasis_evidence(&super::ConvertPreemphasisEvidence {
+            explicit_affirmative: true,
+            cue_flag: false,
+            catalog_number: None,
+            catalog_exact: false,
+        });
+        assert!(!format.deemphasis_enabled);
+
+        let before_depth = *format.bit_depth.selected_value();
+        assert!(format.format.select_value(&AudioFormat::Dsf));
+        format.after_user_selection(
+            super::FormatField::Format,
+            AudioFormat::Flac,
+            before_depth,
+            Some(16),
+            Some(44_100),
+        );
+        assert!(format.deemphasis_enabled, "DSD target cannot preserve CD playback signaling");
+        assert_eq!(format.pcm_rate_before_dsd, Some(44_100));
+
+        let before_depth = *format.bit_depth.selected_value();
+        assert!(format.format.select_value(&AudioFormat::Wav));
+        format.after_user_selection(
+            super::FormatField::Format,
+            AudioFormat::Dsf,
+            before_depth,
+            Some(16),
+            Some(44_100),
+        );
+        assert_eq!(*format.sample_rate.selected_value(), 44_100);
+        assert_eq!(*format.bit_depth.selected_value(), super::BitDepthChoice::Int16);
+        assert!(
+            !format.deemphasis_enabled,
+            "restored lossless integer 16/44.1 target must return the automatic default to Off",
+        );
     }
 
     #[test]
@@ -5995,6 +6060,10 @@ impl FormatState {
                 self.apply_auto_resampler(source_rate);
             }
             self.apply_auto_gain_defaults();
+            // A DSD -> PCM format transition may restore `pcm_rate_before_dsd`
+            // after the constraint pass above. Re-evaluate the source/target
+            // default from that final rate rather than the transient clamp.
+            self.recompute_auto_deemphasis();
             return;
         }
 
@@ -6195,6 +6264,12 @@ impl FormatState {
         rate == Some(44_100) && integer_16
     }
 
+    /// Follow the output target only while the field remains automatic.
+    ///
+    /// Applying de-emphasis changes the waveform, so only an affirmative
+    /// PRE_EMPHASIS tag owns the automatic On/Off policy. CUE and catalog
+    /// matches remain advisory evidence: they expose the control and guidance,
+    /// but never opt the user into destructive processing.
     pub fn recompute_auto_deemphasis(&mut self) {
         if self.deemphasis_overridden {
             return;
@@ -6202,14 +6277,6 @@ impl FormatState {
         self.deemphasis_enabled = self.deemphasis_eligible
             && self.deemphasis_evidence == ConvertDeemphasisEvidence::ExplicitTag
             && !self.deemphasis_target_is_preservation_domain();
-    }
-
-    pub fn deemphasis_override_warning_active(&self) -> bool {
-        self.deemphasis_eligible
-            && self.deemphasis_evidence == ConvertDeemphasisEvidence::ExplicitTag
-            && self.deemphasis_overridden
-            && !self.deemphasis_enabled
-            && !self.deemphasis_target_is_preservation_domain()
     }
 
     /// Reset only the user-policy provenance when a genuinely different source

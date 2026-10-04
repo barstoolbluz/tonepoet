@@ -17,6 +17,12 @@ use super::draw_browse::{
 use super::message::AppMessage;
 use crate::convert::{AudioFormat, ConversionOptions, ConversionStatus};
 
+pub(crate) const DEEMPHASIS_INFO_MESSAGE: &str = concat!(
+    "This disc was mastered with pre-emphasis: the treble was boosted on the CD, and the player is meant to cut it back on playback.\n\n",
+    "On — tonepoet removes the boost now, so the file plays correctly anywhere. This is a filter, not a tag change: the audio is altered, and the output will not be bit-identical to the source even when both sides are lossless at 16-bit/44.1 kHz.\n\n",
+    "Off — the boost stays in the audio, and tonepoet keeps the pre-emphasis flag wherever the format can carry it. CD players and some software — foobar2000, JRiver, iTunes, cmus — read that flag and correct playback. Where the flag cannot travel, such as a lossy target or anything outside 16-bit/44.1 kHz, the file will sound bright everywhere."
+);
+
 /// Handle a key event, dispatching to the appropriate screen handler
 pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessage>) {
     // User interaction is an ownership boundary for a pending generic
@@ -71928,18 +71934,9 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             }
             TuiButton::DeemphasisInfo => {
                 app.convert.focus = ConvertFocus::Format;
-                let message = if app.convert.format.deemphasis_override_warning_active() {
-                    "De-emphasis is Off for a non-preservation target. The output waveform will remain pre-emphasized, but TonePoet will suppress pre-emphasis playback signaling for this target.".to_string()
-                } else if app.convert.format.deemphasis_evidence
-                    == ConvertDeemphasisEvidence::CueFlag
-                {
-                    "An associated CUE track contains FLAGS PRE. TonePoet treats this as advisory evidence only, so de-emphasis has not been enabled automatically. Turn De-emphasis On to process the flagged source.".to_string()
-                } else {
-                    "This catalog number matches a release known to use CD pre-emphasis. TonePoet did not find an affirmative PRE_EMPHASIS tag, so de-emphasis has not been enabled automatically.".to_string()
-                };
                 app.active_overlay = ActiveOverlay::Notice {
                     title: "CD pre-emphasis".to_string(),
-                    message,
+                    message: DEEMPHASIS_INFO_MESSAGE.to_string(),
                     scroll: 0,
                 };
             }

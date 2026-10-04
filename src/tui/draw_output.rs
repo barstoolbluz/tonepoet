@@ -135,16 +135,7 @@ pub fn draw_format_pane(
                         ));
                     }
                     FormatField::Deemphasis => {
-                        let suffix = if format_state.deemphasis_override_warning_active() {
-                            "ⓘ ⚠ pre-emphasis retained; playback signaling suppressed"
-                        } else {
-                            match format_state.deemphasis_evidence {
-                                ConvertDeemphasisEvidence::ExplicitTag => "Pre-emphasis detected",
-                                ConvertDeemphasisEvidence::CueFlag => "ⓘ CUE flags pre-emphasis",
-                                ConvertDeemphasisEvidence::CatalogExact => "ⓘ Possible pre-emphasis",
-                                ConvertDeemphasisEvidence::None => "",
-                            }
-                        };
+                        let suffix = deemphasis_status_suffix(format_state);
                         lines.push(pill_row(
                             border_color,
                             w,
@@ -445,6 +436,25 @@ pub fn draw_format_pane(
     }
     lines.push(bot_line);
     f.render_widget(Paragraph::new(lines), area);
+}
+
+fn deemphasis_status_suffix(format_state: &FormatState) -> &'static str {
+    match (
+        format_state.deemphasis_enabled,
+        format_state.deemphasis_evidence,
+    ) {
+        (_, ConvertDeemphasisEvidence::None) => "",
+        (true, _) => "ⓘ pre-emphasis will be corrected.",
+        (false, ConvertDeemphasisEvidence::ExplicitTag) => {
+            "ⓘ pre-emphasis detected: turn on to correct it."
+        }
+        (false, ConvertDeemphasisEvidence::CueFlag) => {
+            "ⓘ pre-emphasis flagged in the CUE: turn on to correct it."
+        }
+        (false, ConvertDeemphasisEvidence::CatalogExact) => {
+            "ⓘ this pressing is known pre-emphasised: turn on to correct it."
+        }
+    }
 }
 
 fn deemphasis_pill_spans(

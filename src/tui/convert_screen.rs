@@ -305,13 +305,7 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
             FormatField::Deemphasis => {
                 buttons.record_button(TuiButton::DeemphasisPill(0), Rect::new(label_col, y, 5, 1));
                 buttons.record_button(TuiButton::DeemphasisPill(1), Rect::new(label_col + 7, y, 4, 1));
-                if matches!(
-                    state.deemphasis_evidence,
-                    super::app::ConvertDeemphasisEvidence::CatalogExact
-                        | super::app::ConvertDeemphasisEvidence::CueFlag
-                )
-                    || state.deemphasis_override_warning_active()
-                {
+                if state.deemphasis_evidence != super::app::ConvertDeemphasisEvidence::None {
                     buttons.record_button(TuiButton::DeemphasisInfo, Rect::new(label_col + 13, y, 2, 1));
                 }
             }
@@ -805,8 +799,8 @@ mod format_render_registration_tests {
     use crate::config::TonepoetConfig;
     use crate::convert::formats::AudioFormat;
     use crate::tui::app::{
-        ActiveOverlay, AppScreen, BitDepthChoice, ConvertDeemphasisEvidence, DsdGainMode,
-        FormatField, ResamplerChoice,
+        ActiveOverlay, AppScreen, ConvertDeemphasisEvidence, DsdGainMode, FormatField,
+        ResamplerChoice,
     };
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::backend::TestBackend;
@@ -866,7 +860,12 @@ mod format_render_registration_tests {
         app.convert.format.deemphasis_overridden = false;
 
         let terminal = render_deemphasis_info_case(&mut app, WIDTH, HEIGHT);
-        let row = rendered_row(&terminal, WIDTH, HEIGHT, "Possible pre-emphasis");
+        let row = rendered_row(
+            &terminal,
+            WIDTH,
+            HEIGHT,
+            "this pressing is known pre-emphasised",
+        );
         let icon_x = rendered_symbol_x(&terminal, WIDTH, row, "ⓘ");
         assert_eq!(
             app.button_map.find_button_at(icon_x, row),
@@ -895,7 +894,9 @@ mod format_render_registration_tests {
         );
         assert!(matches!(
             app.active_overlay,
-            ActiveOverlay::Notice { ref title, .. } if title == "CD pre-emphasis"
+            ActiveOverlay::Notice { ref title, ref message, .. }
+                if title == "CD pre-emphasis"
+                    && message == crate::tui::keybindings::DEEMPHASIS_INFO_MESSAGE
         ));
     }
 
@@ -910,7 +911,12 @@ mod format_render_registration_tests {
         app.convert.format.deemphasis_overridden = false;
 
         let terminal = render_deemphasis_info_case(&mut app, WIDTH, HEIGHT);
-        let row = rendered_row(&terminal, WIDTH, HEIGHT, "CUE flags pre-emphasis");
+        let row = rendered_row(
+            &terminal,
+            WIDTH,
+            HEIGHT,
+            "pre-emphasis flagged in the CUE",
+        );
         let icon_x = rendered_symbol_x(&terminal, WIDTH, row, "ⓘ");
         assert_eq!(
             app.button_map.find_button_at(icon_x, row),
@@ -932,12 +938,13 @@ mod format_render_registration_tests {
         assert!(matches!(
             app.active_overlay,
             ActiveOverlay::Notice { ref title, ref message, .. }
-                if title == "CD pre-emphasis" && message.contains("FLAGS PRE")
+                if title == "CD pre-emphasis"
+                    && message == crate::tui::keybindings::DEEMPHASIS_INFO_MESSAGE
         ));
     }
 
     #[test]
-    fn manual_off_warning_info_hitbox_tracks_rendered_icon_and_opens_notice() {
+    fn explicit_tag_off_info_hitbox_tracks_rendered_icon_and_opens_notice() {
         const WIDTH: u16 = 140;
         const HEIGHT: u16 = 48;
         let mut app = AppState::new_for_test(TonepoetConfig::default());
@@ -945,19 +952,23 @@ mod format_render_registration_tests {
         app.convert.format.deemphasis_evidence = ConvertDeemphasisEvidence::ExplicitTag;
         app.convert.format.deemphasis_enabled = false;
         app.convert.format.deemphasis_overridden = true;
-        assert!(app.convert.format.format.select_value(&AudioFormat::Flac));
-        assert!(app.convert.format.sample_rate.select_value(&44_100));
-        assert!(app.convert.format.bit_depth.select_value(&BitDepthChoice::Int24));
-        app.convert.format.apply_format_constraints();
-        assert!(app.convert.format.deemphasis_override_warning_active());
 
         let terminal = render_deemphasis_info_case(&mut app, WIDTH, HEIGHT);
-        let row = rendered_row(&terminal, WIDTH, HEIGHT, "pre-emphasis retained");
+        let row = rendered_row(
+            &terminal,
+            WIDTH,
+            HEIGHT,
+            "pre-emphasis detected: turn on to correct it.",
+        );
+        assert!(
+            !row_text(&terminal, row, WIDTH).contains('⚠'),
+            "R23 keeps the information glyph but drops the warning glyph",
+        );
         let icon_x = rendered_symbol_x(&terminal, WIDTH, row, "ⓘ");
         assert_eq!(
             app.button_map.find_button_at(icon_x, row),
             Some(TuiButton::DeemphasisInfo),
-            "the visible manual-Off warning icon must own its screen cell",
+            "the visible explicit-tag information icon must own its screen cell",
         );
 
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
@@ -974,7 +985,56 @@ mod format_render_registration_tests {
         assert!(matches!(
             app.active_overlay,
             ActiveOverlay::Notice { ref title, ref message, .. }
-                if title == "CD pre-emphasis" && message.contains("playback signaling")
+                if title == "CD pre-emphasis"
+                    && message == crate::tui::keybindings::DEEMPHASIS_INFO_MESSAGE
+        ));
+    }
+
+    #[test]
+    fn deemphasis_on_uses_corrected_guidance_and_keeps_info_popup_reachable() {
+        const WIDTH: u16 = 120;
+        const HEIGHT: u16 = 48;
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.convert.format.deemphasis_eligible = true;
+        app.convert.format.deemphasis_evidence = ConvertDeemphasisEvidence::ExplicitTag;
+        app.convert.format.deemphasis_enabled = true;
+        app.convert.format.deemphasis_overridden = false;
+
+        let terminal = render_deemphasis_info_case(&mut app, WIDTH, HEIGHT);
+        let row = rendered_row(
+            &terminal,
+            WIDTH,
+            HEIGHT,
+            "pre-emphasis will be corrected.",
+        );
+        let rendered = row_text(&terminal, row, WIDTH);
+        assert!(
+            !rendered.contains("turn on"),
+            "an enabled control must not tell the user to enable it",
+        );
+        let icon_x = rendered_symbol_x(&terminal, WIDTH, row, "ⓘ");
+        assert_eq!(
+            app.button_map.find_button_at(icon_x, row),
+            Some(TuiButton::DeemphasisInfo),
+            "the information popup remains reachable while De-emphasis is On",
+        );
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        crate::tui::keybindings::handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: icon_x,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+            &tx,
+        );
+        assert!(matches!(
+            app.active_overlay,
+            ActiveOverlay::Notice { ref title, ref message, .. }
+                if title == "CD pre-emphasis"
+                    && message == crate::tui::keybindings::DEEMPHASIS_INFO_MESSAGE
         ));
     }
 
