@@ -6288,11 +6288,15 @@ impl CachedProbeRow {
     /// Returns None if essential fields (format_name, sample_rate, channels) are missing.
     pub fn to_cached_info(&self, file_size: u64) -> Option<crate::tui::browse::CachedInfo> {
         use crate::tui::probe::{SourceInfo, SourceMetadata};
+        let codec = self.codec.clone().unwrap_or_default();
+        let compression_is_lossless = self
+            .compression_is_lossless
+            .or_else(|| crate::tui::probe::known_codec_compression_is_lossless(&codec));
         let source = SourceInfo {
             sample_format_is_float: self.sample_format_is_float,
-            compression_is_lossless: self.compression_is_lossless,
+            compression_is_lossless,
             format_name: self.format_name.clone()?,
-            codec: self.codec.clone().unwrap_or_default(),
+            codec,
             bit_depth: self.bit_depth,
             sample_rate: self.sample_rate?,
             channels: self.channels?,
@@ -10070,6 +10074,43 @@ mod tests {
         db.invalidate_probe("/music/float.wv").unwrap();
         let cached = db.get_cached_probe("/music/float.wv", 1000, 5000000);
         assert!(cached.is_none());
+    }
+
+    #[test]
+    fn legacy_probe_cache_rehydrates_codec_proven_losslessness_without_guessing_wavpack() {
+        let cached_flac = CachedProbeRow {
+            format_name: Some("FLAC".into()),
+            codec: Some("FLAC".into()),
+            bit_depth: Some(16),
+            sample_format_is_float: Some(false),
+            compression_is_lossless: None,
+            sample_rate: Some(44_100),
+            channels: Some(2),
+            ..Default::default()
+        };
+        let flac_info = cached_flac.to_cached_info(1).expect("legacy cached FLAC info");
+        assert_eq!(flac_info.source.compression_is_lossless, Some(true));
+        assert!(crate::tui::probe::convert_cd_deemphasis_eligible(
+            &flac_info.source
+        ));
+
+        let cached_hybrid_unknown = CachedProbeRow {
+            format_name: Some("WavPack".into()),
+            codec: Some("WavPack".into()),
+            bit_depth: Some(16),
+            sample_format_is_float: Some(false),
+            compression_is_lossless: None,
+            sample_rate: Some(44_100),
+            channels: Some(2),
+            ..Default::default()
+        };
+        let wavpack_info = cached_hybrid_unknown
+            .to_cached_info(1)
+            .expect("legacy cached WavPack info");
+        assert_eq!(wavpack_info.source.compression_is_lossless, None);
+        assert!(!crate::tui::probe::convert_cd_deemphasis_eligible(
+            &wavpack_info.source
+        ));
     }
 
     #[test]

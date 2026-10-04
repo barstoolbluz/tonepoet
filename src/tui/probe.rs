@@ -415,6 +415,36 @@ fn wavpack_compression_is_lossless(path: &Path) -> Option<bool> {
     }
 }
 
+/// Compression losslessness implied by a codec identity alone.
+///
+/// This is intentionally narrower than "the decoder produced PCM": lossy
+/// codecs also decode to PCM. The shared source-audio classifier already owns
+/// the ffmpeg codec-name taxonomy, so reuse it here while leaving ambiguous
+/// codec tokens fail-neutral: WavPack needs its encoded hybrid-mode bit and a
+/// bare DTS token does not distinguish core DTS from DTS-HD Master Audio.
+pub(crate) fn known_codec_compression_is_lossless(codec_name: &str) -> Option<bool> {
+    let codec = codec_name.trim().to_ascii_lowercase();
+    if matches!(codec.as_str(), "wavpack" | "dts") {
+        return None;
+    }
+
+    // Cached SourceInfo stores presentation labels rather than ffmpeg codec
+    // names. Preserve the ordinary uncompressed PCM labels used by that cache.
+    if matches!(codec.as_str(), "pcm" | "pcm float" | "lpcm") {
+        return Some(true);
+    }
+
+    let (coding, _) =
+        crate::convert::pipeline::classify_source_audio_probe(Some(codec_name), None, None);
+    match coding {
+        crate::convert::pipeline::SourceAudioCoding::Pcm
+        | crate::convert::pipeline::SourceAudioCoding::Dsd => Some(true),
+        crate::convert::pipeline::SourceAudioCoding::Lossy => Some(false),
+        crate::convert::pipeline::SourceAudioCoding::DvdaUnknown
+        | crate::convert::pipeline::SourceAudioCoding::Unknown => None,
+    }
+}
+
 fn parse_wavpack_probe_header(
     header: &[u8],
     offset: u64,
@@ -755,7 +785,7 @@ pub fn probe_audio(path: &Path) -> Result<SourceInfo, String> {
     let compression_is_lossless = if codec_name.eq_ignore_ascii_case("wavpack") {
         wavpack_compression_is_lossless(path)
     } else {
-        None
+        known_codec_compression_is_lossless(&codec_name)
     };
 
     // ffmpeg-next reports DSF/DFF dsd_u8 rates in bytes/second. Normalize
@@ -8794,6 +8824,57 @@ mod convert_deemphasis_evidence_tests {
         ] {
             assert!(!convert_cd_deemphasis_eligible(&ineligible));
         }
+    }
+
+    #[test]
+    fn flac_file_probe_supplies_truthful_lossless_fact_and_cd_eligibility() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/deemphasis/preemphasis_16_44100.flac");
+        let info = probe_audio(&path).expect("probe tagged 16-bit/44.1-kHz FLAC fixture");
+        let evidence = read_convert_preemphasis_tag_evidence(&path)
+            .expect("read PRE_EMPHASIS evidence from FLAC fixture");
+
+        assert_eq!(info.codec, "FLAC");
+        assert_eq!(info.bit_depth, Some(16));
+        assert_eq!(info.sample_format_is_float, Some(false));
+        assert_eq!(info.compression_is_lossless, Some(true));
+        assert_eq!(info.sample_rate, 44_100);
+        assert!(evidence.explicit_affirmative);
+        assert!(
+            convert_cd_deemphasis_eligible(&info),
+            "a probed lossless integer 16-bit/44.1-kHz FLAC source is in the CD de-emphasis domain",
+        );
+    }
+
+    #[test]
+    fn codec_losslessness_is_positive_only_when_codec_identity_proves_it() {
+        for codec in [
+            "flac", "ALAC", "ape", "shorten", "tta", "pcm_s16le", "PCM",
+        ] {
+            assert_eq!(
+                known_codec_compression_is_lossless(codec),
+                Some(true),
+                "{codec}"
+            );
+        }
+        for codec in ["mp3", "aac", "vorbis", "opus", "ac3"] {
+            assert_eq!(
+                known_codec_compression_is_lossless(codec),
+                Some(false),
+                "{codec}"
+            );
+        }
+        assert_eq!(
+            known_codec_compression_is_lossless("wavpack"),
+            None,
+            "WavPack hybrid mode cannot be inferred from the codec token",
+        );
+        assert_eq!(
+            known_codec_compression_is_lossless("dts"),
+            None,
+            "the DTS codec token alone does not distinguish DTS-HD MA",
+        );
+        assert_eq!(known_codec_compression_is_lossless("unknown-codec"), None);
     }
 }
 
