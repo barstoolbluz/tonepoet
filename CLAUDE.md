@@ -27,7 +27,8 @@ cargo test --workspace --no-fail-fast --exclude tonepoet-true-peak   # THE GATE
                              # rare coordination-contention flake.
 cargo test -p tonepoet-backend   # Backend tests only
 cargo test -p tonepoet-features  # Features tests only
-cargo test -p tonepoet-true-peak # True-peak + loudness core (~41 min)
+cargo test -p tonepoet-true-peak # True-peak + loudness core (~30 s on this AVX2 box;
+                             #   ~41 min on the old pre-AVX2 Xeon — see ## The true-peak crate)
 cargo check                  # Fast type check
 
 # Run the binary
@@ -140,9 +141,13 @@ tonepoet (main binary + lib)
 
 ## The true-peak crate (`crates/tonepoet-true-peak`)
 
-Separately gated, ~41 min, **160 passed / 0 failed** (was 136 before the portable-Reference
-dispatch-tier work added 24). Excluded from the routine workspace gate; run it explicitly
-whenever the crate itself changes.
+**160 passed / 0 failed** (was 136 before the portable-Reference dispatch-tier work added
+24). Runtime is hardware-dependent and the spread is enormous: **~30 s on this
+32-core/64-thread AVX2 host** (measured 2026-10-03: 160/0 in 29 s, the heaviest
+constant-carrier test 1.15 s in isolation), against the **~41 min** recorded on the
+previous 14-year-old pre-AVX2 Xeon. The crate carries AVX dispatch, so a host without it
+pays the old price. It is still excluded from the routine workspace gate — that exclusion
+is worth revisiting on AVX2 hardware, where including it would cost seconds.
 
 - **Its public API is frozen.** Additions are allowed, removals and signature changes are
   not.
@@ -155,8 +160,9 @@ whenever the crate itself changes.
   them yet**.
 - Those are the crate's first `pub mod` declarations, so an API-freeze audit can no longer
   stop at `lib.rs` — it must descend into the modules.
-- Two constant-carrier reference tests account for ~40 of the ~41 minutes. Slow is expected
-  there, not a hang.
+- Two constant-carrier reference tests accounted for ~40 of the ~41 minutes on the old
+  Xeon. On AVX2 they are about a second each. If this crate ever takes tens of minutes
+  again, suspect the host's SIMD support rather than a hang.
 
 ## Key Types & Entry Points
 
