@@ -5201,9 +5201,12 @@ mod tests {
                     paths,
                     results,
                 } => return (generation, paths, results),
-                // Source installation can also start the ordinary cursor probe.
-                // Its completion is independent of the commit safety preflight.
-                AppMessage::ConvertAudioProbeComplete { .. } => continue,
+                // Source installation can also start the first-source probe,
+                // while cursor movement can start the Convert-owned cursor probe.
+                // Both completions are independent of the commit safety preflight.
+                AppMessage::ProbeResult { .. } | AppMessage::ConvertAudioProbeComplete { .. } => {
+                    continue;
+                }
                 other => panic!(
                     "expected ConvertDeemphasisBatchPreflightComplete, got {other:?}"
                 ),

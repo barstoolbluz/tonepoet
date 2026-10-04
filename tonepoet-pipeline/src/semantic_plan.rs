@@ -6075,9 +6075,17 @@ fn semantic_terminal_operation(
             .find(|operation| matches!(operation, PlanOperation::DsdToPcm { .. }))
         {
             if target_format == &request.settings.target_format {
+                // Reconstruction has already established the DSD-to-PCM rate in
+                // the semantic spine. Preserve the fused legacy bridge only as
+                // terminal packaging/quantization when that input is already at
+                // the requested rate; otherwise the terminal proof would claim a
+                // second rate change that the physical route does not perform.
+                let terminal_rate_hz =
+                    (input_state.sample_rate_hz != Fact::Known(*target_rate_hz))
+                        .then_some(*target_rate_hz);
                 return Some(PlanOperation::EncodePcm {
                     target_format: target_format.clone(),
-                    target_rate_hz: Some(*target_rate_hz),
+                    target_rate_hz: terminal_rate_hz,
                     target_bit_depth: *target_bit_depth,
                     apply_processing: false,
                 });
