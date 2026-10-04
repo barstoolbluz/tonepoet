@@ -31,11 +31,26 @@ set the field by hand keeps their choice.
 The row and the pop-up describe internal bookkeeping rather than what happens
 to the music.
 
-Row, when pre-emphasis is detected:
+All three evidence states carry the same guidance, differing only in what is
+known. When De-emphasis is Off:
 
 ```
 pre-emphasis detected: turn on to correct it.
+pre-emphasis flagged in the CUE: turn on to correct it.
+this pressing is known pre-emphasised: turn on to correct it.
 ```
+
+for a tag on the file, a CUE `FLAGS PRE`, and a catalog match respectively.
+
+When De-emphasis is On, the row does not tell the user to turn on something
+already on:
+
+```
+pre-emphasis will be corrected.
+```
+
+The suffix is currently computed without reference to whether the field is
+enabled.
 
 Pop-up:
 
