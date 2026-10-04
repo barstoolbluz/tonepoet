@@ -40,15 +40,45 @@ No string matching `deemphas` or `pre-emphas` appears anywhere in
 
 ## The outcome we want
 
-The log records that de-emphasis was applied, what evidence it was applied on,
-and whether that was the automatic default or the user's choice.
+The log records de-emphasis when there is pre-emphasis evidence for the
+source, and says nothing about it otherwise. A conversion with no evidence
+gets no de-emphasis lines at all.
 
-It also records what the filter means for the output: the audio has been
-altered, it is no longer bit-identical to the source, and it will not match
-AccurateRip or any other checksum taken from the pre-emphasised disc.
+Where there is evidence, the Conversion Settings section carries these four
+lines, in the log's existing one-fact-per-line style.
 
-A conversion where de-emphasis was available and left off says so too, so the
-log distinguishes "not applicable" from "declined".
+Applied:
+
+```
+De-emphasis: yes (CD pre-emphasis filtered out of the audio)
+De-emphasis evidence: PRE_EMPHASIS tag on all 8 source tracks
+De-emphasis chosen by: automatic — target is not lossless 16-bit/44.1 kHz
+De-emphasis effect: audio altered; output is not bit-identical to the source, and will not match AccurateRip or any checksum taken from the pre-emphasised disc
+```
+
+Evidence present, filter not applied:
+
+```
+De-emphasis: no (pre-emphasis evidence present; filter not applied)
+De-emphasis evidence: CUE FLAGS PRE on all 8 source tracks
+De-emphasis chosen by: user
+De-emphasis effect: pre-emphasis remains in the audio; the pre-emphasis flag is preserved in the output format
+```
+
+The `evidence` value is one of:
+
+```
+PRE_EMPHASIS tag on all N source tracks
+CUE FLAGS PRE on all N source tracks
+exact catalog match in the bundled pre-emphasis reference
+```
+
+The `chosen by` value is either `user` or `automatic — <reason>`.
+
+The final line of the not-applied case reads `the pre-emphasis flag cannot be
+carried by the output format` where that is so.
+
+Use this wording. Do not paraphrase it.
 
 ## Build capability
 
