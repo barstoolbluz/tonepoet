@@ -52,7 +52,7 @@ Applied:
 ```
 De-emphasis: yes (CD pre-emphasis filtered out of the audio)
 De-emphasis evidence: PRE_EMPHASIS tag on all 8 source tracks
-De-emphasis chosen by: automatic — target is not lossless 16-bit/44.1 kHz
+De-emphasis chosen by: automatic
 De-emphasis effect: audio altered; output is not bit-identical to the source, and will not match AccurateRip or any checksum taken from the pre-emphasised disc
 ```
 
@@ -73,7 +73,7 @@ CUE FLAGS PRE on all N source tracks
 exact catalog match in the bundled pre-emphasis reference
 ```
 
-The `chosen by` value is either `user` or `automatic — <reason>`.
+The `chosen by` value is either `user` or `automatic`, with no reason appended.
 
 The final line of the not-applied case reads `the pre-emphasis flag cannot be
 carried by the output format` where that is so.
