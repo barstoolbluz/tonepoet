@@ -358,6 +358,7 @@ fn plan_request_for_track_impl(
     }
 
     let mut settings = request.settings.clone();
+    apply_registered_effect_terminal_dither_authority(request, track, &mut settings);
     let registered_effect_terminal = match &track.source_ref {
         TrackSourceRef::RegisteredEffectCarrier {
             representation:
@@ -3189,6 +3190,54 @@ fn request_applies_cd_deemphasis(request: &PipelineRequest) -> bool {
     })
 }
 
+fn apply_registered_effect_terminal_dither_authority(
+    request: &PipelineRequest,
+    track: &PreparedTrack,
+    settings: &mut PipelineSettings,
+) {
+    if request.settings.dither_explicit
+        || !request_applies_cd_deemphasis(request)
+        || !request.settings.target_format.is_pcm_lossless()
+        || (request.settings.target_format == PlannerFormat::WavPack
+            && request.settings.wavpack.hybrid)
+    {
+        return;
+    }
+
+    let TrackSourceRef::RegisteredEffectCarrier { representation, .. } = &track.source_ref else {
+        return;
+    };
+    if !matches!(
+        representation,
+        RegisteredEffectCarrierRepresentation::RawFloat64
+            | RegisteredEffectCarrierRepresentation::Float64Wav
+    ) {
+        // A terminal SSRC carrier already owns quantization/dither. Reasserting
+        // TPDF here would duplicate sample processing during package-only work.
+        return;
+    }
+
+    let target_depth = match request.settings.target_bit_depth {
+        BitDepthTarget::Source => resolve_source_pcm_depth(track).map(|source_depth| {
+            tonepoet_pipeline::source_pcm_depth_for_target(
+                &request.settings.target_format,
+                request.settings.wavpack.hybrid,
+                source_depth,
+            )
+        }),
+        BitDepthTarget::Pcm(depth) => Some(depth),
+    };
+    if target_depth == Some(PcmBitDepth::Int16) {
+        // R24 derives this TPDF in the common semantic plan only for the
+        // concrete request that actually applies CD De-emphasis. Phase 3 then
+        // realizes the effect into a Float64 carrier and replans the terminal
+        // encode. Carry the same automatic authority across that private
+        // carrier boundary without turning it into a user-explicit setting or
+        // contaminating unrelated mixed-batch members.
+        settings.dither_type = tonepoet_pipeline::DitherType::Tpdf;
+    }
+}
+
 fn planner_output_preserves_cd_preemphasis_signaling_domain(
     track: &PreparedTrack,
     source: &SourceInfo,
@@ -4469,6 +4518,228 @@ mod tests {
             !corrected.settings.metadata.transfer_tags,
             "successfully corrected output must not carry raw source pre-emphasis signaling through the encoder"
         );
+    }
+
+    fn raw_registered_effect_carrier(
+        carrier: PathBuf,
+        source_path: PathBuf,
+        representation: RegisteredEffectCarrierRepresentation,
+    ) -> PreparedTrack {
+        let mut prepared = track(TrackSourceRef::RegisteredEffectCarrier {
+            path: carrier,
+            source_path,
+            sample_rate_hz: 44_100,
+            channels: 2,
+            duration: None,
+            source_was_dsd: false,
+            resampler_consumed: false,
+            representation,
+        });
+        prepared.sample_rate = Some(44_100);
+        prepared.bit_depth = Some(16);
+        prepared.source_audio = SourceAudioDescriptor::from_scalar(
+            Some(44_100),
+            Some(16),
+            Some(SourceAudioCoding::Pcm),
+        );
+        prepared
+    }
+
+    #[test]
+    fn r28_cd_deemphasis_raw_float64_carrier_reasserts_automatic_tpdf_at_terminal() {
+        let temp = TempDir::new().expect("temp dir");
+        let carrier = temp.path().join("deemphasis.f64le");
+        std::fs::write(&carrier, [0_u8; 32]).expect("raw Float64 carrier");
+        let source_path = temp.path().join("source.flac");
+        let output = temp.path().join("out.flac");
+
+        for (target_depth, label) in [
+            (
+                tonepoet_pipeline::BitDepthTarget::Pcm(PcmBitDepth::Int16),
+                "explicit-int16",
+            ),
+            (tonepoet_pipeline::BitDepthTarget::Source, "source-int16"),
+        ] {
+            let mut req = request(temp.path());
+            req.settings.target_format = PlannerFormat::Flac;
+            req.settings.target_sample_rate = tonepoet_pipeline::RateTarget::PcmHz(44_100);
+            req.settings.target_bit_depth = target_depth;
+            req.settings.preferred_tool = PreferredTool::Sox;
+            req.settings.dither_type = tonepoet_pipeline::DitherType::None;
+            req.settings.dither_explicit = false;
+            req.settings.metadata.transfer_tags = false;
+            req.settings.metadata.preserve_artwork = false;
+            req.registered_effects = vec![cd_deemphasis_effect()];
+
+            let prepared = raw_registered_effect_carrier(
+                carrier.clone(),
+                source_path.clone(),
+                RegisteredEffectCarrierRepresentation::RawFloat64,
+            );
+            let downstream = plan_request_for_track(
+                &req,
+                &prepared,
+                &carrier,
+                &output,
+                temp.path().join(format!("work-{label}")),
+            )
+            .unwrap_or_else(|error| panic!("{label} R28 terminal request: {error}"));
+
+            assert_eq!(
+                downstream.settings.dither_type,
+                tonepoet_pipeline::DitherType::Tpdf,
+                "{label} must preserve the semantic De-emphasis TPDF decision",
+            );
+            assert!(
+                !downstream.settings.dither_explicit,
+                "automatic De-emphasis TPDF must not masquerade as explicit user authority",
+            );
+
+            let plan = tonepoet_pipeline::plan_conversion(&downstream)
+                .unwrap_or_else(|error| panic!("{label} R28 terminal plan: {error}"));
+            let PlanAction::Execute { commands, .. } = plan.action else {
+                panic!("{label} Float64 De-emphasis carrier must execute a terminal encode")
+            };
+            let sox = commands
+                .iter()
+                .find(|command| command.tool == tonepoet_pipeline::ToolIdentifier::Sox)
+                .expect("forced SoX terminal");
+            assert_eq!(
+                sox.args.iter().filter(|arg| arg.as_str() == "dither").count(),
+                1,
+                "{label}: TonePoet must request exactly one explicit plain-TPDF SoX dither effect",
+            );
+            assert!(
+                !sox.args.iter().any(|arg| arg == "-D"),
+                "{label}: the terminal owns dither explicitly rather than suppressing it",
+            );
+        }
+    }
+
+    #[test]
+    fn r28_cd_deemphasis_carrier_preserves_explicit_dither_authority() {
+        let temp = TempDir::new().expect("temp dir");
+        let carrier = temp.path().join("deemphasis.f64le");
+        std::fs::write(&carrier, [0_u8; 32]).expect("raw Float64 carrier");
+        let source_path = temp.path().join("source.flac");
+        let output = temp.path().join("out.flac");
+
+        for explicit in [
+            tonepoet_pipeline::DitherType::None,
+            tonepoet_pipeline::DitherType::Shibata,
+        ] {
+            let mut req = request(temp.path());
+            req.settings.target_format = PlannerFormat::Flac;
+            req.settings.target_bit_depth =
+                tonepoet_pipeline::BitDepthTarget::Pcm(PcmBitDepth::Int16);
+            req.settings.preferred_tool = PreferredTool::Sox;
+            req.settings.dither_type = explicit;
+            req.settings.dither_explicit = true;
+            req.settings.metadata.transfer_tags = false;
+            req.settings.metadata.preserve_artwork = false;
+            req.registered_effects = vec![cd_deemphasis_effect()];
+            let prepared = raw_registered_effect_carrier(
+                carrier.clone(),
+                source_path.clone(),
+                RegisteredEffectCarrierRepresentation::RawFloat64,
+            );
+            let downstream = plan_request_for_track(
+                &req,
+                &prepared,
+                &carrier,
+                &output,
+                temp.path().join(format!("work-{explicit:?}")),
+            )
+            .expect("explicit dither authority survives carrier bridge");
+            assert_eq!(downstream.settings.dither_type, explicit);
+            assert!(downstream.settings.dither_explicit);
+
+            let plan = tonepoet_pipeline::plan_conversion(&downstream)
+                .unwrap_or_else(|error| panic!("explicit {explicit:?} terminal plan: {error}"));
+            let PlanAction::Execute { commands, .. } = plan.action else {
+                panic!("explicit {explicit:?} De-emphasis carrier must execute")
+            };
+            let sox = commands
+                .iter()
+                .find(|command| command.tool == tonepoet_pipeline::ToolIdentifier::Sox)
+                .expect("forced SoX terminal");
+            if explicit == tonepoet_pipeline::DitherType::None {
+                assert!(sox.args.iter().any(|arg| arg == "-D"));
+                assert!(!sox.args.iter().any(|arg| arg == "dither"));
+            } else {
+                assert!(!sox.args.iter().any(|arg| arg == "-D"));
+                assert!(sox.args.iter().any(|arg| arg == "dither"));
+            }
+        }
+    }
+
+    #[test]
+    fn r28_cd_deemphasis_carrier_auto_tpdf_scope_stays_int16_lossless_only() {
+        let temp = TempDir::new().expect("temp dir");
+        let carrier = temp.path().join("deemphasis.f64le");
+        std::fs::write(&carrier, [0_u8; 32]).expect("raw Float64 carrier");
+        let source_path = temp.path().join("source.flac");
+        let output = temp.path().join("out.flac");
+
+        let cases = [
+            (PlannerFormat::Flac, PcmBitDepth::Int24, false, "int24"),
+            (PlannerFormat::WavPack, PcmBitDepth::Int16, true, "hybrid"),
+        ];
+        for (format, depth, hybrid, label) in cases {
+            let mut req = request(temp.path());
+            req.settings.target_format = format;
+            req.settings.wavpack.hybrid = hybrid;
+            req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(depth);
+            req.settings.dither_type = tonepoet_pipeline::DitherType::None;
+            req.settings.dither_explicit = false;
+            req.registered_effects = vec![cd_deemphasis_effect()];
+            let prepared = raw_registered_effect_carrier(
+                carrier.clone(),
+                source_path.clone(),
+                RegisteredEffectCarrierRepresentation::RawFloat64,
+            );
+            let downstream = plan_request_for_track(
+                &req,
+                &prepared,
+                &carrier,
+                &output,
+                temp.path().join(format!("work-{label}")),
+            )
+            .unwrap_or_else(|error| panic!("{label} carrier bridge: {error}"));
+            assert_eq!(
+                downstream.settings.dither_type,
+                tonepoet_pipeline::DitherType::None,
+                "{label} must stay outside R24 automatic De-emphasis TPDF scope",
+            );
+        }
+    }
+
+    #[test]
+    fn r28_nonterminal_float64_carrier_without_cd_deemphasis_does_not_invent_dither() {
+        let temp = TempDir::new().expect("temp dir");
+        let carrier = temp.path().join("ordinary-effect.f64le");
+        std::fs::write(&carrier, [0_u8; 32]).expect("raw Float64 carrier");
+        let source_path = temp.path().join("source.flac");
+        let output = temp.path().join("out.flac");
+        let mut req = request(temp.path());
+        req.settings.target_format = PlannerFormat::Flac;
+        req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(PcmBitDepth::Int16);
+        req.settings.dither_type = tonepoet_pipeline::DitherType::None;
+        req.settings.dither_explicit = false;
+        let prepared = raw_registered_effect_carrier(
+            carrier.clone(),
+            source_path,
+            RegisteredEffectCarrierRepresentation::RawFloat64,
+        );
+        let downstream = plan_request_for_track(
+            &req,
+            &prepared,
+            &carrier,
+            &output,
+            temp.path().join("work"),
+        )
+        .expect("ordinary carrier bridge");
+        assert_eq!(downstream.settings.dither_type, tonepoet_pipeline::DitherType::None);
     }
 
     #[test]

@@ -306,6 +306,10 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
                 buttons.record_button(TuiButton::DeemphasisPill(0), Rect::new(label_col, y, 5, 1));
                 buttons.record_button(TuiButton::DeemphasisPill(1), Rect::new(label_col + 7, y, 4, 1));
                 if state.deemphasis_evidence != super::app::ConvertDeemphasisEvidence::None {
+                    // Two logical cells intentionally cover the U+24D8 glyph
+                    // plus its same-style guard cell. That remains clickable
+                    // whether the terminal renders the ambiguous-width glyph
+                    // as one cell or two.
                     buttons.record_button(TuiButton::DeemphasisInfo, Rect::new(label_col + 13, y, 2, 1));
                 }
             }
@@ -871,6 +875,11 @@ mod format_render_registration_tests {
             app.button_map.find_button_at(icon_x, row),
             Some(TuiButton::DeemphasisInfo),
             "the visible catalog advisory icon must own its screen cell",
+        );
+        assert_eq!(
+            app.button_map.find_button_at(icon_x + 1, row),
+            Some(TuiButton::DeemphasisInfo),
+            "the same-style guard cell must remain part of the information hitbox",
         );
         assert!(app
             .button_map

@@ -23311,11 +23311,55 @@ fn command_record_proves_dither_for_target(
     command_record_emits_dither(command)
 }
 
+// `TerminalPcmWav` is installed only after the selected registered resampler
+// has executed successfully and its terminal contract has been validated.
+fn track_record_has_realized_terminal_ssrc_dither(record: &TrackRecord) -> bool {
+    let TrackSourceRef::RegisteredEffectCarrier {
+        representation:
+            RegisteredEffectCarrierRepresentation::TerminalPcmWav {
+                bit_depth,
+                terminal_candidate,
+            },
+        ..
+    } = &record.source_ref
+    else {
+        return false;
+    };
+    let Some(tonepoet_pipeline::SelectedTerminalRealization::Pcm(realization)) =
+        terminal_candidate.terminal_realization.as_ref()
+    else {
+        return false;
+    };
+    let active_ssrc_dither = realization.ssrc_dither.as_ref().is_some_and(|dither| {
+        matches!(
+            &dither.availability,
+            tonepoet_pipeline::plugins::SsrcDitherAvailability::Active
+        ) && (dither.dither_id.is_some() || dither.pdf_type.is_some())
+    });
+
+    realization.selected_tool == tonepoet_pipeline::ToolIdentifier::Ssrc
+        && matches!(
+            realization.kind,
+            tonepoet_pipeline::PcmTerminalRealizationKind::SsrcDirectWav
+                | tonepoet_pipeline::PcmTerminalRealizationKind::SsrcPreterminalFfmpegPackage
+                | tonepoet_pipeline::PcmTerminalRealizationKind::SsrcPreterminalSoxPackage
+        )
+        && realization.target_bit_depth == *bit_depth
+        && realization.dither_owner == tonepoet_pipeline::PcmTerminalDitherOwner::SsrcResampler
+        && realization
+            .effective_dither
+            .is_some_and(|dither| dither != DitherType::None)
+        && active_ssrc_dither
+}
+
 fn command_records_prove_dither_for_track(
     track: &PreparedTrack,
     record: &TrackRecord,
     settings: &tonepoet_pipeline::PipelineSettings,
 ) -> bool {
+    if track_record_has_realized_terminal_ssrc_dither(record) {
+        return true;
+    }
     let target_depth = resolved_target_pcm_depth(track, settings)
         .or_else(|| source_default_pcm_depth_for_track(track, settings).map(|(depth, _)| depth));
     let reference_dsd = tonepoet_pipeline::selects_reference_dsd_to_pcm(
@@ -23397,6 +23441,9 @@ fn applied_dither_tool_label(
 ) -> String {
     let mut tools = BTreeSet::new();
     for (index, record) in tracks.iter().enumerate() {
+        if track_record_has_realized_terminal_ssrc_dither(record) {
+            tools.insert("SSRC");
+        }
         let prepared = source.tracks.get(index);
         let target_depth = prepared
             .and_then(|track| resolved_target_pcm_depth(track, settings)
@@ -23706,11 +23753,6 @@ fn append_deemphasis_conversion_log_lines(
             "De-emphasis chosen by",
             req.deemphasis_choice_origin.log_label(),
         );
-        push_kv_line(
-            log,
-            "De-emphasis effect",
-            "audio altered; output is not bit-identical to the source, and will not match AccurateRip or any checksum taken from the pre-emphasised disc",
-        );
         return;
     }
 
@@ -23725,18 +23767,6 @@ fn append_deemphasis_conversion_log_lines(
         "De-emphasis chosen by",
         req.deemphasis_choice_origin.log_label(),
     );
-    let signaling_preserved = req.stages.metadata == StageRequirement::Enabled
-        && !source.tracks.is_empty()
-        && source
-            .tracks
-            .iter()
-            .all(|track| track_preserves_cd_preemphasis_signaling_domain(track, &req.settings));
-    let effect = if signaling_preserved {
-        "pre-emphasis remains in the audio; the pre-emphasis flag is preserved in the output format"
-    } else {
-        "pre-emphasis remains in the audio; the pre-emphasis flag cannot be carried by the output format"
-    };
-    push_kv_line(log, "De-emphasis effect", effect);
 }
 
 fn dither_log_line(
@@ -23764,7 +23794,11 @@ fn dither_log_line(
         if request_applies_cd_deemphasis(req) {
             let effective_dither = effective_dither_for_request(source, req);
             if effective_dither != DitherType::None {
-                return format!("yes ({})", dither_type_label(effective_dither));
+                return format!(
+                    "yes ({} via {})",
+                    dither_type_label(effective_dither),
+                    applied_dither_tool_label(source, tracks, settings),
+                );
             }
         }
         return format!("yes ({})", applied_dither_description(source, tracks, settings));
@@ -62746,6 +62780,73 @@ mod conversion_log_tests {
         record
     }
 
+    fn r28_terminal_ssrc_dither_record(
+        kind: tonepoet_pipeline::PcmTerminalRealizationKind,
+        target_format: PlannerAudioFormat,
+        owns_dither: bool,
+    ) -> TrackRecord {
+        let mut record = ok_record();
+        record.verified_output_bit_depth = Some(PcmBitDepth::Int16);
+        record.commands.clear();
+        let ssrc_dither = tonepoet_pipeline::plugins::ResolvedSsrcDither {
+            requested_global: if owns_dither {
+                DitherType::Tpdf
+            } else {
+                DitherType::None
+            },
+            dither_id: owns_dither.then_some(99),
+            pdf_type: owns_dither.then_some(tonepoet_pipeline::SsrcPdfType::Triangular),
+            origin: if owns_dither {
+                tonepoet_pipeline::plugins::SsrcDitherOrigin::GlobalExact
+            } else {
+                tonepoet_pipeline::plugins::SsrcDitherOrigin::None
+            },
+            availability: if owns_dither {
+                tonepoet_pipeline::plugins::SsrcDitherAvailability::Active
+            } else {
+                tonepoet_pipeline::plugins::SsrcDitherAvailability::Inactive
+            },
+        };
+        let terminal_candidate = SelectedPhysicalCandidateBinding {
+            identity: "registered:resample_pcm:ssrc:r28-log-evidence".to_string(),
+            tool: tonepoet_pipeline::ToolIdentifier::Ssrc,
+            terminal_realization: Some(tonepoet_pipeline::SelectedTerminalRealization::Pcm(
+                tonepoet_pipeline::SelectedPcmTerminalRealization {
+                    kind,
+                    selected_tool: tonepoet_pipeline::ToolIdentifier::Ssrc,
+                    input_precision: tonepoet_pipeline::StoragePrecision::Pcm(PcmBitDepth::Float64),
+                    input_value_domain: tonepoet_pipeline::ValueDomain::FiniteFloating,
+                    target_format,
+                    target_rate_hz: Some(88_200),
+                    target_bit_depth: PcmBitDepth::Int16,
+                    wavpack_hybrid: false,
+                    effective_dither: owns_dither.then_some(DitherType::Tpdf),
+                    ssrc_dither: Some(ssrc_dither),
+                    dither_owner: if owns_dither {
+                        tonepoet_pipeline::PcmTerminalDitherOwner::SsrcResampler
+                    } else {
+                        tonepoet_pipeline::PcmTerminalDitherOwner::None
+                    },
+                },
+            )),
+            strong_ssrc_resampler: None,
+        };
+        record.source_ref = TrackSourceRef::RegisteredEffectCarrier {
+            path: PathBuf::from("/stage/r28-terminal.wav"),
+            source_path: PathBuf::from("/music/preemphasis.flac"),
+            sample_rate_hz: 88_200,
+            channels: 2,
+            duration: None,
+            source_was_dsd: false,
+            resampler_consumed: true,
+            representation: RegisteredEffectCarrierRepresentation::TerminalPcmWav {
+                bit_depth: PcmBitDepth::Int16,
+                terminal_candidate,
+            },
+        };
+        record
+    }
+
     #[test]
     fn r24_conversion_log_names_automatic_cd_deemphasis_evidence_and_plain_tpdf() {
         let source = r24_cd_preemphasis_source(true);
@@ -62762,15 +62863,117 @@ mod conversion_log_tests {
             None,
         );
 
-        assert!(log.contains("Dither: yes (TPDF)"), "{log}");
+        assert!(log.contains("Dither: yes (TPDF via SoX)"), "{log}");
         assert!(log.contains(
             "De-emphasis: yes (CD pre-emphasis filtered out of the audio)"
         ));
         assert!(log.contains("De-emphasis evidence: PRE_EMPHASIS tag on all 2 source tracks"));
         assert!(log.contains("De-emphasis chosen by: automatic"));
+        assert!(!log.contains("De-emphasis effect:"), "{log}");
+    }
+
+    #[test]
+    fn r28_deemphasis_log_accepts_successful_direct_terminal_ssrc_dither_evidence() {
+        let mut source = r24_cd_preemphasis_source(true);
+        source.tracks.truncate(1);
+        let mut req = r24_int16_deemphasis_log_request();
+        req.settings.target_format = PlannerAudioFormat::Wav;
+        req.settings.target_sample_rate = RateTarget::PcmHz(88_200);
+        req.settings.preferred_tool = PreferredTool::Ssrc;
+        let record = r28_terminal_ssrc_dither_record(
+            tonepoet_pipeline::PcmTerminalRealizationKind::SsrcDirectWav,
+            PlannerAudioFormat::Wav,
+            true,
+        );
+        assert!(record.commands.is_empty());
+        assert!(track_record_has_realized_terminal_ssrc_dither(&record));
+
+        let log = build_conversion_log(
+            &AlbumOutcome::Complete {
+                tracks: vec![record],
+                stages: stage_records(),
+            },
+            &source,
+            &req,
+            &log_test_artifacts(),
+            None,
+        );
+
+        assert!(log.contains("Dither: yes (TPDF via SSRC)"), "{log}");
+        assert!(!log.contains("requested (TPDF) — not applied"), "{log}");
+    }
+
+    #[test]
+    fn r28_deemphasis_package_only_terminal_ssrc_names_ssrc_as_dither_owner() {
+        let mut source = r24_cd_preemphasis_source(true);
+        source.tracks.truncate(1);
+        let mut req = r24_int16_deemphasis_log_request();
+        req.settings.target_format = PlannerAudioFormat::Flac;
+        req.settings.target_sample_rate = RateTarget::PcmHz(88_200);
+        req.settings.preferred_tool = PreferredTool::Ssrc;
+        let mut record = r28_terminal_ssrc_dither_record(
+            tonepoet_pipeline::PcmTerminalRealizationKind::SsrcPreterminalFfmpegPackage,
+            PlannerAudioFormat::Flac,
+            true,
+        );
+        let mut package = command_record_for(ToolBinary::Ffmpeg);
+        package.description = Some("Package terminal SSRC PCM as FLAC".to_string());
+        package.sanitized_args = vec![
+            "-i".to_string(),
+            "/stage/r28-terminal.wav".to_string(),
+            "-c:a".to_string(),
+            "flac".to_string(),
+            "/stage/out.flac".to_string(),
+        ];
+        record.commands = vec![package];
+        assert!(track_record_has_realized_terminal_ssrc_dither(&record));
+
+        let log = build_conversion_log(
+            &AlbumOutcome::Complete {
+                tracks: vec![record],
+                stages: stage_records(),
+            },
+            &source,
+            &req,
+            &log_test_artifacts(),
+            None,
+        );
+
+        assert!(log.contains("Dither: yes (TPDF via SSRC)"), "{log}");
+        assert!(!log.contains("Dither: yes (TPDF via ffmpeg aresample)"), "{log}");
+        assert!(!log.contains("requested (TPDF) — not applied"), "{log}");
+    }
+
+    #[test]
+    fn r28_inactive_terminal_ssrc_realization_is_not_dither_execution_evidence() {
+        let mut source = r24_cd_preemphasis_source(true);
+        source.tracks.truncate(1);
+        let mut req = r24_int16_deemphasis_log_request();
+        req.settings.target_format = PlannerAudioFormat::Wav;
+        req.settings.target_sample_rate = RateTarget::PcmHz(88_200);
+        req.settings.preferred_tool = PreferredTool::Ssrc;
+        let record = r28_terminal_ssrc_dither_record(
+            tonepoet_pipeline::PcmTerminalRealizationKind::SsrcDirectWav,
+            PlannerAudioFormat::Wav,
+            false,
+        );
+        assert!(!track_record_has_realized_terminal_ssrc_dither(&record));
+
+        let log = build_conversion_log(
+            &AlbumOutcome::Complete {
+                tracks: vec![record],
+                stages: stage_records(),
+            },
+            &source,
+            &req,
+            &log_test_artifacts(),
+            None,
+        );
+
+        assert!(!log.contains("Dither: yes (TPDF via SSRC)"), "{log}");
         assert!(log.contains(
-            "De-emphasis effect: audio altered; output is not bit-identical to the source, and will not match AccurateRip or any checksum taken from the pre-emphasised disc"
-        ));
+            "Dither: requested (TPDF) — not applied (executed command did not emit a dither stage)"
+        ), "{log}");
     }
 
     #[test]
@@ -62846,7 +63049,7 @@ mod conversion_log_tests {
             None,
         );
 
-        assert!(log.contains("Dither: yes (Shibata)"), "{log}");
+        assert!(log.contains("Dither: yes (Shibata via SoX)"), "{log}");
         assert!(log.contains("De-emphasis chosen by: user"), "{log}");
         assert!(!log.contains("Dither: yes (TPDF)"), "{log}");
     }
@@ -62875,9 +63078,7 @@ mod conversion_log_tests {
         ));
         assert!(log.contains("De-emphasis evidence: CUE FLAGS PRE on all 2 source tracks"));
         assert!(log.contains("De-emphasis chosen by: user"));
-        assert!(log.contains(
-            "De-emphasis effect: pre-emphasis remains in the audio; the pre-emphasis flag is preserved in the output format"
-        ));
+        assert!(!log.contains("De-emphasis effect:"), "{log}");
     }
 
     #[test]
@@ -62899,9 +63100,7 @@ mod conversion_log_tests {
             None,
         );
 
-        assert!(log.contains(
-            "De-emphasis effect: pre-emphasis remains in the audio; the pre-emphasis flag cannot be carried by the output format"
-        ));
+        assert!(!log.contains("De-emphasis effect:"), "{log}");
     }
 
     #[test]

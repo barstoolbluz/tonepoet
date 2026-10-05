@@ -1428,15 +1428,21 @@ fn build_sox_encode_pcm(
         && context.request.source.bit_depth == Some(PcmBitDepth::Int32)
         && context.request.source.authoritative_pcm_depth() == Some(target_depth)
         && matches!(target_depth, PcmBitDepth::Int16 | PcmBitDepth::Int24);
+    let explicit_no_dither = apply_processing
+        && context.request.settings.dither_explicit
+        && context.request.settings.dither_type == DitherType::None
+        && matches!(
+            target_depth,
+            PcmBitDepth::Int8 | PcmBitDepth::Int16 | PcmBitDepth::Int24
+        );
     let mut args = vec!["-S".into()];
-    if carrier_width_restoration_without_dither {
-        // SoX automatically inserts dither for some precision reductions (in
-        // particular s32 -> 16-bit) even when no explicit `dither` effect is
-        // present. A widened CUE carrier is not a real precision reduction:
-        // its lower bits contain no source information, and DitherType::None
-        // must remain literal. Disable only SoX's implicit dither for this
-        // source-depth restoration cell; explicit depth changes retain the
-        // established planner behavior.
+    if carrier_width_restoration_without_dither || explicit_no_dither {
+        // SoX automatically inserts dither for some precision reductions even
+        // when no explicit `dither` effect is present. Keep widened-carrier
+        // restoration literal, and also honor an explicit user choice of None:
+        // in both cases TonePoet, rather than SoX's implicit policy, owns the
+        // dither decision. Automatic/selected dither still uses the established
+        // explicit terminal effect below.
         args.push("-D".into());
     }
     add_sox_input_args(context, step, &mut args, input)?;
@@ -4948,10 +4954,27 @@ mod tests {
         target_depth: PcmBitDepth,
         dither_type: DitherType,
     ) -> PlannedCommand {
+        sox_pcm_encode_command_for_depth_case_with_explicit(
+            source_depth,
+            true_source_depth,
+            target_depth,
+            dither_type,
+            false,
+        )
+    }
+
+    fn sox_pcm_encode_command_for_depth_case_with_explicit(
+        source_depth: PcmBitDepth,
+        true_source_depth: PcmBitDepth,
+        target_depth: PcmBitDepth,
+        dither_type: DitherType,
+        dither_explicit: bool,
+    ) -> PlannedCommand {
         let mut settings = PipelineSettings::default();
         settings.target_format = AudioFormat::Flac;
         settings.target_bit_depth = BitDepthTarget::Pcm(target_depth);
         settings.dither_type = dither_type;
+        settings.dither_explicit = dither_explicit;
         let source = SourceInfo {
             dsd_source_kind: None,
             format: AudioFormat::Wav,
@@ -5030,6 +5053,21 @@ mod tests {
         );
         assert_eq!(configured_dither.args[0], "-S");
         assert_ne!(configured_dither.args.get(1).map(String::as_str), Some("-D"));
+
+        let explicit_none = sox_pcm_encode_command_for_depth_case_with_explicit(
+            PcmBitDepth::Int32,
+            PcmBitDepth::Int24,
+            PcmBitDepth::Int16,
+            DitherType::None,
+            true,
+        );
+        assert_eq!(explicit_none.args[0], "-S");
+        assert_eq!(
+            explicit_none.args.get(1).map(String::as_str),
+            Some("-D"),
+            "an explicit None must suppress SoX's implicit reduction dither",
+        );
+        assert!(!explicit_none.args.iter().any(|arg| arg == "dither"));
     }
 
     #[test]

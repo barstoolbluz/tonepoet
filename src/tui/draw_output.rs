@@ -708,13 +708,16 @@ fn pill_row<'a>(
     if !suffix.is_empty() {
         spans.push(Span::raw("  "));
         if let Some(rest) = suffix.strip_prefix('ⓘ') {
-            // The semantic info accent has strong contrast on every shipped
-            // dark palette. Some light palettes intentionally use a brighter
-            // info hue, so use their existing high-contrast value foreground
-            // rather than adding a background or inventing a new color.
+            // U+24D8 is East Asian Width=Ambiguous. Ratatui/unicode-width
+            // treats it as one cell, while some terminals paint it across two.
+            // Give the immediately following delimiter cell the same style so
+            // either rendering width paints the entire glyph with one
+            // foreground color. Consuming the suffix's existing space keeps
+            // layout width unchanged on one-cell terminals.
+            let rest = rest.strip_prefix(' ').unwrap_or(rest);
             let info_fg = if theme.dark { theme.info } else { theme.value };
             spans.push(Span::styled(
-                "ⓘ",
+                "ⓘ ",
                 Style::default()
                     .fg(info_fg)
                     .add_modifier(Modifier::BOLD),
@@ -828,8 +831,8 @@ mod r24_deemphasis_info_affordance_tests {
                 let info = line
                     .spans
                     .iter()
-                    .find(|span| span.content.as_ref() == "ⓘ")
-                    .expect("information glyph span");
+                    .find(|span| span.content.as_ref() == "ⓘ ")
+                    .expect("information glyph + guard-cell span");
 
                 assert_eq!(
                     info.style.fg,
@@ -855,6 +858,25 @@ mod r24_deemphasis_info_affordance_tests {
                     palette.slug,
                 );
                 assert!(info.style.add_modifier.contains(Modifier::BOLD));
+                assert_eq!(
+                    info.width(),
+                    2,
+                    "glyph guard span must reserve the existing delimiter cell",
+                );
+                let info_index = line
+                    .spans
+                    .iter()
+                    .position(|span| span.content.as_ref() == "ⓘ ")
+                    .expect("information span index");
+                let guidance = line
+                    .spans
+                    .get(info_index + 1)
+                    .expect("guidance after information span");
+                assert_eq!(
+                    guidance.content.as_ref(),
+                    "pre-emphasis will be corrected.",
+                    "the guard cell must consume, not add, the existing delimiter",
+                );
             }
         }
     }
