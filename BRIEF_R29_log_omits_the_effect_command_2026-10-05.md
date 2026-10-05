@@ -1,9 +1,8 @@
 # Brief R29 — the conversion log omits the command that filters the audio
 
 Date: 2026-10-05
-Base: the supplied `tonepoet-src.tar.gz` is `main` with R28 applied. Gate 7345
-passed / 1 failed, the one being the Reference requalification R28's locked
-files require.
+Base: the supplied `tonepoet-src.tar.gz` is `main` with R28 applied and
+Reference requalified. Gate 7346 passed / 0 failed.
 
 R28 is accepted. The dither line, the dither stage, the glyph and the removed
 line are all correct in the field.
@@ -32,9 +31,9 @@ ran.
 
 ## Open question
 
-`registered_effect_f64le_command()` selects SoX or FFmpeg per lowering. In
-this conversion the log reports `Tool versions: sox 14.8.0.1`, so both the
-effect pass and the terminal pass were SoX.
+The effect pass is lowered to either SoX or FFmpeg. In this conversion the log
+reports `Tool versions: sox 14.8.0.1`, so both the effect pass and the terminal
+pass were SoX.
 
 Whether the effect and the terminal need to be separate invocations, rather
 than one command carrying both the filter and the terminal dither, is not
