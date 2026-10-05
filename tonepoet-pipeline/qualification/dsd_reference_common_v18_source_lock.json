@@ -6,9 +6,9 @@
     "reference_source_lock.rs": "0b1bc863c63024806cd87d8c34ead48e8d8b08118d4be73e6e205d966b99b2b9",
     "src/convert/pipeline/coordination_name.rs": "02e0e1817e9806e5c8f8efdf52dc647f223d8d0c5fdf79d23bd10f2b11eab891",
     "src/convert/pipeline/manifest_builder.rs": "74e4ef54ed509397259c02880a64d5d390007b0b1918645cbcb165d0b9a976b9",
-    "src/convert/pipeline/plan_bridge.rs": "e0dce531e7554add18d9ec77aeeb8d66282837cf1c0dbe7f21fb7e814db17a0f",
-    "src/convert/pipeline/stages.rs": "a5d5956904091357184239b461d8e24e48da6e74625b207a7fb371efff381e8b",
-    "src/convert/pipeline/track_executor.rs": "e7b9bf6e1389d98f7580b3bea3bc797b26efa173af8782f188675fe50713e59d",
+    "src/convert/pipeline/plan_bridge.rs": "904e5598fbfc367336ff9a79ce54a26f789ed324b06177109bad53efd1edd642",
+    "src/convert/pipeline/stages.rs": "b52f11e56261ac1eb7ca468de8d3235cd53cedf5174620a2eebc501345854bbf",
+    "src/convert/pipeline/track_executor.rs": "6005655231bacf7c856a2e95d55f5cebd4e8097e7ac83b494cef13663919e2b8",
     "src/convert/replaygain.rs": "cfa021f5fc480edd86ca1fdc506e133d5ac0057847b04b692f3e66ee3a509978",
     "src/fs_limits.rs": "1f53208b4ef74b08efb00719ec70ad442b74c2cf455ad311a65c9082df57f19e",
     "tonepoet-pipeline/Cargo.toml": "29caa6c045c357d818f5f180e0a6e93f24e0c90e9f9c1f109585478d5831a558",
@@ -19,12 +19,12 @@
     "tonepoet-pipeline/src/plan.rs": "078eaf9e479dbca6eebe17a8d69ec2df5e8e73972cf2139635c2eee75ed5afba",
     "tonepoet-pipeline/src/plugins.rs": "fafcca25a1b84e571eb943d3e0fb82b83e2ac5cb885cd0b302a5078cfb3fe54e",
     "tonepoet-pipeline/src/qualification_schema.rs": "ef6a147c324237c87afa7bd00753b569162569b5933866a6a7bd5abc6ce91adb",
-    "tonepoet-pipeline/src/semantic_plan.rs": "02a189d12c0251235104aee49ba640db2686ee94f6cedba07635c4a8bb3af00c",
+    "tonepoet-pipeline/src/semantic_plan.rs": "0d2bda9d84a995a52aae9f2e0e79fe1699c0007337c1ceaf90a1fa5cc588f702",
     "tonepoet-pipeline/src/settings.rs": "c73e889abee47528094c038d51bd3b90015f0e2cdb1ceb11fbafcb19e5b0bb4e",
     "tonepoet-pipeline/src/source.rs": "b20c8b28e4b06e1a1b8e353576a7e5dc3b0ac48eabff92b91ccbb14b48cdabee",
     "tonepoet-pipeline/src/tools.rs": "aedd497da07bb9d6d4fe04942109a4983a1590f87e64b1f73dc25d8e7e372bf4",
     "tonepoet-pipeline/src/w64.rs": "caa669e1e323a36dce7aa7154abed1dabff77865a391fe2530fe5b5fd960ebdb"
   },
-  "runtime_closure_fingerprint_sha256": "f12605c5a895afdd06bcc6766a381230d369dd66ee62ee51c315fcfe75ad336f",
+  "runtime_closure_fingerprint_sha256": "9e7ac5708404a056fd144c0a323accadc6620fbd9086c676917719da1ff3720b",
   "schema_version": 1
 }
