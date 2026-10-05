@@ -1465,10 +1465,16 @@ mod lifecycle_forwarder_tests {
         use crate::tui::app::BitDepthChoice;
 
         let mut format = FormatState::new();
-        format.format.select_value(&AudioFormat::Wav);
-        format.bit_depth.select_value(&BitDepthChoice::Float64);
-        format.dither.select_value(&UiDitherType::Lipshitz);
+        assert!(format.format.select_value(&AudioFormat::Wav));
+        // `FormatState::new()` has already applied FLAC constraints, which
+        // disable Float64. Settle the WAV constraints, establish an explicit
+        // dither choice on the still-compatible Int16 target, then visit the
+        // float target. This models the user-authority round trip the test is
+        // intended to cover instead of selecting through stale FLAC state.
+        format.apply_format_constraints();
+        assert!(format.dither.select_value(&UiDitherType::Lipshitz));
         format.dither_overridden = true;
+        assert!(format.bit_depth.select_value(&BitDepthChoice::Float64));
         format.apply_format_constraints();
 
         assert_eq!(*format.dither.selected_value(), UiDitherType::Lipshitz);

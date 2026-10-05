@@ -708,11 +708,15 @@ fn pill_row<'a>(
     if !suffix.is_empty() {
         spans.push(Span::raw("  "));
         if let Some(rest) = suffix.strip_prefix('ⓘ') {
+            // The semantic info accent has strong contrast on every shipped
+            // dark palette. Some light palettes intentionally use a brighter
+            // info hue, so use their existing high-contrast value foreground
+            // rather than adding a background or inventing a new color.
+            let info_fg = if theme.dark { theme.info } else { theme.value };
             spans.push(Span::styled(
                 "ⓘ",
                 Style::default()
-                    .fg(theme.pill_active_fg)
-                    .bg(theme.pill_active_bg)
+                    .fg(info_fg)
                     .add_modifier(Modifier::BOLD),
             ));
             if !rest.is_empty() {
@@ -807,27 +811,51 @@ mod r24_deemphasis_info_affordance_tests {
     use super::*;
 
     #[test]
-    fn deemphasis_info_glyph_has_a_solid_control_style() {
-        let theme = super::super::theme::theme_by_slug_or_default(
-            super::super::theme::default_theme_slug(),
-        );
-        let line = pill_row(
-            theme.green,
-            96,
-            "De-emphasis",
-            "ⓘ pre-emphasis will be corrected.",
-            &[],
-            false,
-            theme,
-        );
-        let info = line
-            .spans
-            .iter()
-            .find(|span| span.content.as_ref() == "ⓘ")
-            .expect("information glyph span");
+    fn deemphasis_info_glyph_uses_foreground_only_high_contrast_theme_color() {
+        for palette in super::super::theme::palettes() {
+            let theme = super::super::theme::theme_by_slug(palette.slug).expect("shipped theme");
+            let expected_fg = if theme.dark { theme.info } else { theme.value };
+            for focused in [false, true] {
+                let line = pill_row(
+                    theme.green,
+                    96,
+                    "De-emphasis",
+                    "ⓘ pre-emphasis will be corrected.",
+                    &[],
+                    focused,
+                    theme,
+                );
+                let info = line
+                    .spans
+                    .iter()
+                    .find(|span| span.content.as_ref() == "ⓘ")
+                    .expect("information glyph span");
 
-        assert_eq!(info.style.fg, Some(theme.pill_active_fg));
-        assert_eq!(info.style.bg, Some(theme.pill_active_bg));
-        assert!(info.style.add_modifier.contains(Modifier::BOLD));
+                assert_eq!(
+                    info.style.fg,
+                    Some(expected_fg),
+                    "theme {}, focused={focused}",
+                    palette.slug,
+                );
+                assert_eq!(
+                    info.style.bg,
+                    None,
+                    "theme {}, focused={focused}",
+                    palette.slug,
+                );
+                assert_ne!(
+                    expected_fg,
+                    theme.text_muted,
+                    "theme {} needs a distinct affordance color",
+                    palette.slug,
+                );
+                assert!(
+                    super::super::theme::contrast_ratio(expected_fg, theme.panel_bg) >= 4.5,
+                    "theme {} needs a legible information glyph",
+                    palette.slug,
+                );
+                assert!(info.style.add_modifier.contains(Modifier::BOLD));
+            }
+        }
     }
 }

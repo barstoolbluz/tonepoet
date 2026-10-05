@@ -838,7 +838,7 @@ impl TuiPreset {
                         let applied = Self::select_enabled(&mut format_state.dither, &value);
                         report.record("dither", applied);
                         if applied {
-                            format_state.mark_dither_overridden();
+                            format_state.mark_dither_override_from_preset();
                         }
                     }
                     None => report.record("dither", false),
@@ -1749,6 +1749,167 @@ mod companion_preset_tests {
             &OutputOptionsState::new(),
             &MetadataState::default(),
         )
+    }
+
+    fn eligible_preemphasized_16441_state() -> FormatState {
+        let mut format = FormatState::new();
+        assert!(format.format.select_value(&AudioFormat::Flac));
+        assert!(format.sample_rate.select_value(&SOURCE_SAMPLE_RATE_SENTINEL));
+        assert!(format.bit_depth.select_value(&BitDepthChoice::Source));
+        format.source_pcm_rate_hz = Some(44_100);
+        format.source_pcm_bit_depth = Some(16);
+        format.source_pcm_float_bits = None;
+        format.deemphasis_eligible = true;
+        format.deemphasis_evidence = ConvertDeemphasisEvidence::ExplicitTag;
+        format.apply_format_constraints();
+        assert!(format.deemphasis_target_is_preservation_domain());
+        assert!(!format.deemphasis_enabled);
+        format
+    }
+
+    fn source_preserving_dither_off_preset() -> TuiPreset {
+        let mut format = FormatState::new();
+        assert!(format.format.select_value(&AudioFormat::Flac));
+        assert!(format.sample_rate.select_value(&SOURCE_SAMPLE_RATE_SENTINEL));
+        assert!(format.bit_depth.select_value(&BitDepthChoice::Source));
+        assert!(format.dither.select_value(&DitherType::None));
+        TuiPreset::from_pill_state(
+            "source-preserving-off",
+            &format,
+            &OutputOptionsState::new(),
+            &MetadataState::default(),
+        )
+    }
+
+    fn dither_index(format: &FormatState, value: DitherType) -> usize {
+        format
+            .dither
+            .options
+            .iter()
+            .position(|option| option.value == value)
+            .expect("dither option")
+    }
+
+    #[test]
+    fn preset_dither_off_yields_to_later_manual_deemphasis_auto_tpdf() {
+        let preset = source_preserving_dither_off_preset();
+        let mut format = eligible_preemphasized_16441_state();
+        let mut output = OutputOptionsState::new();
+        let mut metadata = MetadataState::default();
+
+        let report = preset.apply_to_pills(&mut format, &mut output, &mut metadata);
+        assert!(report.is_complete(), "unexpected refusals: {:?}", report.refused_fields);
+        assert_eq!(*format.dither.selected_value(), DitherType::None);
+        assert!(format.dither_overridden);
+        assert!(format.dither_override_from_preset);
+
+        format.field_focus = FormatField::Deemphasis;
+        format.select_focused_next(Some(16), Some(44_100));
+
+        assert!(format.deemphasis_enabled);
+        assert_eq!(*format.dither.selected_value(), DitherType::TPDF);
+        assert!(!format.dither_overridden);
+        assert!(!format.dither_override_from_preset);
+
+        let options = super::super::convert_actions::try_pills_to_options(
+            &format,
+            &output,
+            &crate::config::TonepoetConfig::default(),
+        )
+        .expect("automatic R24 request");
+        let settings = options.pipeline_settings.expect("pipeline settings");
+        assert!(!settings.dither_explicit, "preset None must not leak through as direct-user authority");
+        assert_eq!(settings.dither_type, tonepoet_pipeline::DitherType::None);
+    }
+
+    #[test]
+    fn later_preset_dither_off_wins_over_existing_manual_deemphasis_auto_tpdf() {
+        let mut preset = source_preserving_dither_off_preset();
+        // Keep De-emphasis On through preset application so this proves the
+        // preset dither value wins by ordering, not merely because the preset
+        // returned De-emphasis to automatic preservation-domain Off.
+        preset.deemphasis = Some(true);
+        let mut format = eligible_preemphasized_16441_state();
+        format.field_focus = FormatField::Deemphasis;
+        format.select_focused_next(Some(16), Some(44_100));
+        assert!(format.deemphasis_enabled);
+        assert_eq!(*format.dither.selected_value(), DitherType::TPDF);
+        assert!(!format.dither_overridden);
+
+        let mut output = OutputOptionsState::new();
+        let mut metadata = MetadataState::default();
+        let report = preset.apply_to_pills(&mut format, &mut output, &mut metadata);
+
+        assert!(report.is_complete(), "unexpected refusals: {:?}", report.refused_fields);
+        assert!(format.deemphasis_enabled);
+        assert_eq!(*format.dither.selected_value(), DitherType::None);
+        assert!(format.dither_overridden, "the newly loaded preset owns the current value until a later direct action");
+        assert!(format.dither_override_from_preset);
+    }
+
+    #[test]
+    fn direct_none_after_preset_survives_later_deemphasis_toggles() {
+        let preset = source_preserving_dither_off_preset();
+        let mut format = eligible_preemphasized_16441_state();
+        let mut output = OutputOptionsState::new();
+        let mut metadata = MetadataState::default();
+        assert!(preset.apply_to_pills(&mut format, &mut output, &mut metadata).is_complete());
+
+        let none = dither_index(&format, DitherType::None);
+        assert!(format.select_row_index(FormatField::Dither, none, Some(16), Some(44_100)));
+        assert!(format.dither_overridden);
+        assert!(!format.dither_override_from_preset);
+
+        assert!(format.select_row_index(FormatField::Deemphasis, 0, Some(16), Some(44_100)));
+        assert!(format.select_row_index(FormatField::Deemphasis, 1, Some(16), Some(44_100)));
+        assert!(format.deemphasis_enabled);
+        assert_eq!(*format.dither.selected_value(), DitherType::None);
+        assert!(format.dither_overridden);
+    }
+
+    #[test]
+    fn direct_shibata_after_preset_survives_later_deemphasis_toggles() {
+        let preset = source_preserving_dither_off_preset();
+        let mut format = eligible_preemphasized_16441_state();
+        let mut output = OutputOptionsState::new();
+        let mut metadata = MetadataState::default();
+        assert!(preset.apply_to_pills(&mut format, &mut output, &mut metadata).is_complete());
+
+        let shibata = dither_index(&format, DitherType::Shibata);
+        assert!(format.select_row_index(FormatField::Dither, shibata, Some(16), Some(44_100)));
+        assert_eq!(*format.dither.selected_value(), DitherType::Shibata);
+        assert!(format.dither_overridden);
+        assert!(!format.dither_override_from_preset);
+
+        assert!(format.select_row_index(FormatField::Deemphasis, 1, Some(16), Some(44_100)));
+        assert!(format.select_row_index(FormatField::Deemphasis, 0, Some(16), Some(44_100)));
+        assert!(format.select_row_index(FormatField::Deemphasis, 1, Some(16), Some(44_100)));
+        assert_eq!(*format.dither.selected_value(), DitherType::Shibata);
+        assert!(format.dither_overridden);
+    }
+
+    #[test]
+    fn preset_then_manual_deemphasis_does_not_force_tpdf_for_non_int16_terminal() {
+        let preset = source_preserving_dither_off_preset();
+        let mut format = eligible_preemphasized_16441_state();
+        let mut output = OutputOptionsState::new();
+        let mut metadata = MetadataState::default();
+        assert!(preset.apply_to_pills(&mut format, &mut output, &mut metadata).is_complete());
+
+        let int24 = format
+            .bit_depth
+            .options
+            .iter()
+            .position(|option| option.value == BitDepthChoice::Int24)
+            .expect("Int24 option");
+        assert!(format.select_row_index(FormatField::BitDepth, int24, Some(16), Some(44_100)));
+        assert!(format.select_row_index(FormatField::Deemphasis, 1, Some(16), Some(44_100)));
+
+        assert!(format.deemphasis_enabled);
+        assert!(!format.deemphasis_auto_tpdf_applicable());
+        assert_ne!(*format.dither.selected_value(), DitherType::TPDF);
+        assert!(!format.dither_overridden);
+        assert!(!format.dither_override_from_preset);
     }
 
     #[test]

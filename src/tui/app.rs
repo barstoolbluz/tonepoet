@@ -921,6 +921,7 @@ pub struct ConvertProbeFormatSnapshot {
     pub sample_rate_overridden: bool,
     pub bit_depth_overridden: bool,
     pub dither_overridden: bool,
+    pub dither_override_from_preset: bool,
     pub resampler_overridden: bool,
     pub deemphasis_enabled: bool,
     pub deemphasis_overridden: bool,
@@ -941,6 +942,7 @@ impl ConvertProbeFormatSnapshot {
             sample_rate_overridden: format.sample_rate_overridden,
             bit_depth_overridden: format.bit_depth_overridden,
             dither_overridden: format.dither_overridden,
+            dither_override_from_preset: format.dither_override_from_preset,
             resampler_overridden: format.resampler_overridden,
             deemphasis_enabled: format.deemphasis_enabled,
             deemphasis_overridden: format.deemphasis_overridden,
@@ -3694,6 +3696,30 @@ mod clamp_pill_tests {
     }
 
     #[test]
+    fn automatic_dither_uses_live_source_depth_after_constraint_recompute() {
+        use super::{BitDepthChoice, DitherType, FormatField};
+
+        let mut format = FormatState::new();
+        assert_eq!(format.source_pcm_bit_depth, None);
+        assert!(format.bit_depth.select_value(&BitDepthChoice::Int24));
+        format.apply_format_constraints();
+
+        let before_format = *format.format.selected_value();
+        let before_depth = *format.bit_depth.selected_value();
+        assert!(format.bit_depth.select_value(&BitDepthChoice::Int16));
+        format.after_user_selection(
+            FormatField::BitDepth,
+            before_format,
+            before_depth,
+            Some(24),
+            Some(44_100),
+        );
+
+        assert_eq!(*format.dither.selected_value(), DitherType::Shibata);
+        assert!(!format.dither_overridden);
+    }
+
+    #[test]
     fn non_ssrc_int32_dither_options_match_the_planners_commissioned_terminal() {
         use super::{BitDepthChoice, DitherType};
 
@@ -4965,9 +4991,13 @@ pub struct FormatState {
     pub source_rate_identity: SourceRateIdentity,
     pub field_focus: FormatField,
     pub advanced_open: bool,
-    /// False until the user or a preset explicitly picks a dither algorithm.
-    /// Automatic source/bit-depth decisions may update the row only while false.
+    /// False until an explicit dither authority owns the row. Automatic
+    /// source/bit-depth decisions may update the row only while false.
     pub dither_overridden: bool,
+    /// True only when the current dither authority came from preset application.
+    /// A later direct De-emphasis choice may release that preset authority so
+    /// R24 automatic TPDF can be recomputed; direct Dither control choices clear it.
+    pub(crate) dither_override_from_preset: bool,
     /// False until the user or a preset explicitly picks a resampler.
     /// Automatic source/rate decisions may update the row only while false.
     pub resampler_overridden: bool,
@@ -5306,6 +5336,7 @@ impl FormatState {
             field_focus: FormatField::Format,
             advanced_open: false,
             dither_overridden: false,
+            dither_override_from_preset: false,
             resampler_overridden: false,
             sample_rate_overridden: false,
             bit_depth_overridden: false,
@@ -5693,6 +5724,21 @@ impl FormatState {
 
     pub fn mark_dither_overridden(&mut self) {
         self.dither_overridden = true;
+        self.dither_override_from_preset = false;
+    }
+
+    pub(crate) fn mark_dither_override_from_preset(&mut self) {
+        self.dither_overridden = true;
+        self.dither_override_from_preset = true;
+    }
+
+    fn record_manual_deemphasis_choice(&mut self, enabled: bool) {
+        self.deemphasis_enabled = enabled;
+        self.deemphasis_overridden = true;
+        if self.dither_override_from_preset {
+            self.dither_overridden = false;
+            self.dither_override_from_preset = false;
+        }
     }
 
     pub(crate) fn mark_sample_rate_user_policy(&mut self) {
@@ -5708,8 +5754,14 @@ impl FormatState {
     pub fn select_bit_depth(&mut self, bit_depth: BitDepthChoice, source_bits: Option<u32>) {
         self.mark_bit_depth_user_policy();
         self.bit_depth.select_value(&bit_depth);
-        self.apply_auto_dither(source_bits);
+        // Constraints may change the final De-emphasis state and therefore the
+        // R24 automatic-dither policy. Settle them first, then apply the
+        // caller's authoritative source depth so the constraint cascade cannot
+        // replace a valid ordinary 24 -> 16 default with an "unknown source"
+        // None decision.
+        let source_bits = self.auto_dither_source_bits(source_bits);
         self.apply_format_constraints();
+        self.apply_auto_dither(source_bits);
         self.apply_auto_gain_defaults();
     }
 
@@ -5956,8 +6008,7 @@ impl FormatState {
     /// Key and mouse handlers should use this instead of calling `focused_pill_mut()` directly.
     pub fn select_focused_next(&mut self, source_bits: Option<u32>, source_rate: Option<u32>) {
         if self.field_focus == FormatField::Deemphasis {
-            self.deemphasis_enabled = !self.deemphasis_enabled;
-            self.deemphasis_overridden = true;
+            self.record_manual_deemphasis_choice(!self.deemphasis_enabled);
             self.apply_auto_dither(source_bits);
             return;
         }
@@ -5988,8 +6039,7 @@ impl FormatState {
     /// Select the previous enabled pill in the focused row and run row-specific side effects.
     pub fn select_focused_prev(&mut self, source_bits: Option<u32>, source_rate: Option<u32>) {
         if self.field_focus == FormatField::Deemphasis {
-            self.deemphasis_enabled = !self.deemphasis_enabled;
-            self.deemphasis_overridden = true;
+            self.record_manual_deemphasis_choice(!self.deemphasis_enabled);
             self.apply_auto_dither(source_bits);
             return;
         }
@@ -6050,8 +6100,7 @@ impl FormatState {
                 if !self.deemphasis_eligible {
                     false
                 } else if index < 2 {
-                    self.deemphasis_enabled = index == 1;
-                    self.deemphasis_overridden = true;
+                    self.record_manual_deemphasis_choice(index == 1);
                     true
                 } else {
                     false
@@ -6246,9 +6295,6 @@ impl FormatState {
                         self.sample_rate.select_value(&rate);
                     }
                 }
-                if !self.dither_overridden {
-                    self.apply_auto_dither(source_bits);
-                }
                 self.apply_auto_resampler(source_rate);
             }
             self.apply_auto_gain_defaults();
@@ -6256,15 +6302,16 @@ impl FormatState {
             // after the constraint pass above. Re-evaluate the source/target
             // default from that final rate rather than the transient clamp.
             self.recompute_auto_deemphasis();
+            // `recompute_auto_deemphasis` derives source depth from stored probe
+            // facts. During a live interaction the caller may already have a
+            // newer authoritative depth, so let that value win after every
+            // target-dependent policy has settled.
+            self.apply_auto_dither(self.auto_dither_source_bits(source_bits));
             return;
         }
 
         if row == FormatField::DsdRate {
             self.cascade_dsd_rate_defaults();
-        }
-
-        if row == FormatField::BitDepth && before_depth != *self.bit_depth.selected_value() {
-            self.apply_auto_dither(source_bits);
         }
 
         if row == FormatField::SampleRate {
@@ -6273,6 +6320,16 @@ impl FormatState {
         }
 
         self.apply_format_constraints();
+        if matches!(row, FormatField::BitDepth | FormatField::SampleRate)
+            && (row != FormatField::BitDepth
+                || before_depth != *self.bit_depth.selected_value())
+        {
+            // The constraint pass above owns the final target-dependent
+            // De-emphasis state. Reapply automatic dither afterward using the
+            // source depth supplied by the live UI when available, falling back
+            // to stored probe facts only when the caller has none.
+            self.apply_auto_dither(self.auto_dither_source_bits(source_bits));
+        }
         self.apply_auto_gain_defaults();
     }
 
@@ -6360,6 +6417,16 @@ impl FormatState {
         } else {
             DitherType::None
         }
+    }
+
+    fn auto_dither_source_bits(&self, source_bits: Option<u32>) -> Option<u32> {
+        source_bits.or_else(|| {
+            if self.source_is_dsd {
+                Some(1)
+            } else {
+                self.source_pcm_bit_depth
+            }
+        })
     }
 
     /// Applies the default dither rule while preserving manual user choice.

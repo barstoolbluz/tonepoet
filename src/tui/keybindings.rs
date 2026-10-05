@@ -71024,6 +71024,20 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
         return;
     }
 
+    // `Notice` renders its Esc/close control into the shared button map.
+    // Honor that exact rendered hitbox before generic overlay geometry can
+    // consume the click as an ordinary content-area event.
+    if matches!(app.active_overlay, ActiveOverlay::Notice { .. })
+        && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        && matches!(
+            app.button_map.find_button_at(mouse.column, mouse.row),
+            Some(TuiButton::OverlayCancel)
+        )
+    {
+        app.active_overlay = ActiveOverlay::None;
+        return;
+    }
+
     // Generic overlay mouse: click-outside-to-close + footer pill clicks
     // for all overlays (except MetadataEditor which has its own handler,
     // and ContextMenu which has its own hover/click system).
@@ -71605,9 +71619,6 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
     // Exception: Confirmation overlay allows its own Yes/No pill clicks.
     if !matches!(app.active_overlay, ActiveOverlay::None) {
         if matches!(app.active_overlay, ActiveOverlay::Notice { .. }) {
-            if matches!(app.button_map.find_button_at(x, y), Some(TuiButton::OverlayCancel)) {
-                app.active_overlay = ActiveOverlay::None;
-            }
             return;
         }
         if matches!(app.active_overlay, ActiveOverlay::Confirmation { .. }) {

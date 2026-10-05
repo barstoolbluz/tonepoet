@@ -16087,6 +16087,7 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
             };
             if let Some(d) = dt {
                 if app.convert.format.dither.select_value(&d) {
+                    app.convert.format.mark_dither_overridden();
                     app.preset.mark_modified();
                     app.set_status(format!("dither = {}", value));
                 } else {
@@ -23513,6 +23514,20 @@ mod source_relative_set_command_tests {
 
         assert_eq!(*app.convert.format.bit_depth.selected_value(), BitDepthChoice::Int16);
         assert_eq!(*app.convert.format.dither.selected_value(), DitherType::Shibata);
+    }
+
+    #[test]
+    fn set_dither_records_direct_user_authority_after_preset_application() {
+        let mut app = app_with_pcm_source();
+        app.convert.format.dither.select_value(&DitherType::None);
+        app.convert.format.mark_dither_override_from_preset();
+        assert!(app.convert.format.dither_override_from_preset);
+
+        execute_set(&mut app, "dither", "shibata");
+
+        assert_eq!(*app.convert.format.dither.selected_value(), DitherType::Shibata);
+        assert!(app.convert.format.dither_overridden);
+        assert!(!app.convert.format.dither_override_from_preset);
     }
 
     #[test]
