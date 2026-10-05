@@ -40,8 +40,9 @@ across two, and the second cell carries the following span's colour.
 The hitbox for the same glyph is registered two columns wide
 (`convert_screen.rs:309`).
 
-Nothing in the workspace handles ambiguous-width characters. `⚠` and the
-bullet and diamond glyphs are in the same class.
+Nothing in the workspace handles ambiguous-width characters. The bullet and
+diamond glyphs are in the same class; `tui-file-picker` pins
+`unicode-width = "0.1"`, which counts Ambiguous as one cell.
 
 ## 4. Drop one log line
 
