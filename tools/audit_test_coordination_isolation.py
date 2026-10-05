@@ -11,10 +11,18 @@ tests; it does not try to infer arbitrary call graphs.
 """
 from __future__ import annotations
 
+from bisect import bisect_right
 from pathlib import Path
 import re
 
 ROOT = Path(__file__).resolve().parents[1]
+
+PUBLIC_METADATA_WRITER_ENTRYPOINTS = {
+    "public metadata scalar write": re.compile(r"\bwrite_all_tags(?:_with_cancel)?\s*\("),
+    "public metadata list write": re.compile(
+        r"\bwrite_all_tag_value_lists(?:_with_cancel|_to_id3v2_with_cancel)?\s*\("
+    ),
+}
 
 DIRECT_ENTRYPOINTS = {
     "mutation claim": re.compile(r"\bMutationClaimGuard::acquire(?:_ephemeral|_grouped)?\s*\("),
@@ -31,6 +39,15 @@ DIRECT_ENTRYPOINTS = {
     "queue scope": re.compile(r"\.ensure_queue_scope\s*\("),
     "queue execution": re.compile(r"\.queue_execution_coordinator\s*\("),
     "metadata recovery": re.compile(r"\.recover_stale_metadata_writes\s*\("),
+    # Native metadata recovery may retire/reacquire durable coordination claims
+    # even though the public call is read-facing. R30 observed one of these
+    # tests flaking under the process-visible test registry.
+    "native metadata pre-read recovery": re.compile(
+        r"\b(?:recover_flac_metadata_before_read|recover_metadata_before_read)\s*\("
+    ),
+    "native metadata directory recovery": re.compile(
+        r"\b(?:recover_stale_flac_metadata_journals_in_dir|recover_stale_ape_tail_journals_in_dir)\s*\("
+    ),
     "lifecycle scan": re.compile(
         r"\b(?:find_family_descriptor|lifecycle_descriptor_hints|descriptor_availability|"
         r"retire_setup_orphan_by_path_identity)\s*\("
@@ -41,6 +58,10 @@ DIRECT_ENTRYPOINTS = {
     # Including their call sites catches tests that enter coordination indirectly.
     "metadata admission": re.compile(r"\badmit_metadata_mutation_paths\s*\("),
     "metadata save": re.compile(r"\bmetadata_editor_save\s*\("),
+    # Public metadata writer APIs acquire the same admission/journal/lease
+    # machinery internally. Tests that invoke them directly must participate
+    # in the process-visible test registry serialization discipline too.
+    **PUBLIC_METADATA_WRITER_ENTRYPOINTS,
     "tag maintenance": re.compile(r"\bstart_tag_maintenance\s*\("),
     "artwork write": re.compile(r"\bwrite_artwork_to_files_with_cancel\s*\("),
     "artwork remove": re.compile(r"\bremove_artwork_from_files_with_cancel\s*\("),
@@ -87,6 +108,10 @@ SCOPE_MARKERS = (
     "JournalDirGuard::install(",
     "FileTaskTestEnvironment::install(",
     "TestFileTaskJournalEnvironment::install(",
+    # Probe metadata fixtures already own the process-wide coordination guard
+    # before installing their XDG home. Treat the fixture itself as the single
+    # approved scope marker so callers do not nest the non-reentrant guard.
+    "isolated_metadata_journal_home(",
 )
 
 # These are deliberately re-executed libtest child entrypoints. Their parents
@@ -204,6 +229,51 @@ def test_functions(path: Path):
         yield name, source[start : closing + 1], line
 
 
+def public_metadata_writer_helpers(path: Path) -> set[str]:
+    """Find same-file functions that directly call a public metadata writer.
+
+    This is deliberately occurrence-driven rather than scanning every function
+    body: large test modules have thousands of functions, while direct writer
+    call sites are sparse. The nearest enclosing Rust function is validated by
+    its matching closing brace before it is admitted as a one-hop helper.
+    """
+    source = path.read_text(encoding="utf-8")
+    functions = list(
+        re.finditer(
+            r"(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+"
+            r"([A-Za-z0-9_]+)\b[^\{]*\{",
+            source,
+        )
+    )
+    if not functions:
+        return set()
+
+    starts = [function.start() for function in functions]
+    closing_cache: dict[int, int] = {}
+    helpers: set[str] = set()
+    writer_matches = sorted(
+        match.start()
+        for pattern in PUBLIC_METADATA_WRITER_ENTRYPOINTS.values()
+        for match in pattern.finditer(source)
+    )
+    for writer_start in writer_matches:
+        function_index = bisect_right(starts, writer_start) - 1
+        while function_index >= 0:
+            function = functions[function_index]
+            opening = source.find("{", function.start(), function.end())
+            closing = closing_cache.get(opening)
+            if closing is None:
+                closing = matching_brace(source, opening)
+                closing_cache[opening] = closing
+            if opening < writer_start < closing:
+                name = function.group(1)
+                if not name.startswith(("write_all_tags", "write_all_tag_value_lists")):
+                    helpers.add(name)
+                break
+            function_index -= 1
+    return helpers
+
+
 failures: list[str] = []
 reviewed = 0
 paths = list((ROOT / "src").rglob("*.rs"))
@@ -211,12 +281,54 @@ if (ROOT / "tests").is_dir():
     paths.extend((ROOT / "tests").rglob("*.rs"))
 for path in sorted(paths):
     rel = path.relative_to(ROOT).as_posix()
+    # Keep this intentionally bounded: infer only one same-file helper hop, and
+    # only when that helper directly invokes a public metadata writer. This
+    # catches reviewed fixture/assertion wrappers (including the R30-observed
+    # ID3 numbering test) without attempting a general Rust call graph.
+    metadata_writer_helpers = public_metadata_writer_helpers(path)
     for name, body, line in test_functions(path):
         hits = [label for label, pattern in DIRECT_ENTRYPOINTS.items() if pattern.search(body)]
+        hits.extend(
+            f"public metadata writer helper {helper}"
+            for helper in sorted(metadata_writer_helpers)
+            if helper != name and re.search(rf"\b{re.escape(helper)}\s*\(", body)
+        )
         if not hits:
             continue
         reviewed += 1
-        scoped = any(marker in body for marker in SCOPE_MARKERS)
+        scope_markers = [marker for marker in SCOPE_MARKERS if marker in body]
+        direct_scope_count = body.count("scoped_test_coordination_root()")
+        if direct_scope_count > 1:
+            failures.append(
+                f"{rel}:{line} {name}: nested/repeated non-reentrant direct coordination scopes"
+            )
+            continue
+        if direct_scope_count == 1 and len(scope_markers) > 1:
+            failures.append(
+                f"{rel}:{line} {name}: direct coordination scope is redundantly nested with "
+                + ", ".join(marker for marker in scope_markers if marker != "scoped_test_coordination_root()")
+            )
+            continue
+        if direct_scope_count == 1:
+            # The repository's established hierarchy is coordination first,
+            # then process-global XDG/file-task environment serialization.
+            # Enforce it here because R30 adds scopes to tests that may already
+            # own one of those secondary guards; reversing the order can turn a
+            # flake fix into a test-only lock-order deadlock.
+            scope_index = body.index("scoped_test_coordination_root()")
+            order_failure = False
+            for later_guard in ("XdgConfigHomeGuard::new(", "test_environment_lock()"):
+                guard_index = body.find(later_guard)
+                if 0 <= guard_index < scope_index:
+                    failures.append(
+                        f"{rel}:{line} {name}: {later_guard} must be acquired after "
+                        "scoped_test_coordination_root()"
+                    )
+                    order_failure = True
+                    break
+            if order_failure:
+                continue
+        scoped = bool(scope_markers)
         if (rel, name) in CROSS_PROCESS_CHILD_EXEMPTIONS:
             scoped = True
         if not scoped:
@@ -224,7 +336,7 @@ for path in sorted(paths):
 
 if failures:
     for failure in failures:
-        print(f"[FAIL] unscoped coordination-touching test: {failure}")
+        print(f"[FAIL] coordination test isolation: {failure}")
     raise SystemExit(1)
 
 print(f"[ok] {reviewed} reviewed coordination-touching tests are isolated or explicit child handoffs")

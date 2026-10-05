@@ -5747,11 +5747,16 @@ fn artifact_requires_preemphasis_signaling_cleanup(
     let Some(track) = source.tracks.iter().find(|track| track.id == artifact.track_id) else {
         return false;
     };
-    suppress_preemphasis_signaling_for_track(req, track)
-        && tags_contain_preemphasis_signaling(&authoritative_metadata_tags(
-            &track.metadata,
-            &source.album_metadata,
-        ))
+    match preemphasis_output_policy_for_track(req, track) {
+        PreemphasisOutputPolicy::Preserve => false,
+        PreemphasisOutputPolicy::Strip => tags_contain_preemphasis_signaling(
+            &authoritative_metadata_tags(&track.metadata, &source.album_metadata),
+        ),
+        // R30: a performed de-emphasis operation must materialize an explicit
+        // categorical negative even when its source evidence was only a CUE or
+        // catalog match and there is therefore no positive source tag to remove.
+        PreemphasisOutputPolicy::Negative => true,
+    }
 }
 
 fn sidecar_cue_artifact_has_authoritative_metadata(
@@ -5916,7 +5921,7 @@ fn m4a_artifact_has_freeform_metadata(
                 &artifact.staged_path,
                 &track.metadata,
                 &source.album_metadata,
-                false,
+                PreemphasisOutputPolicy::Preserve,
             )
             .is_empty()
         })
@@ -6010,7 +6015,7 @@ async fn apply_metadata_to_track_artifact(
     metadata: Option<&TrackMetadata>,
     album: &AlbumMetadata,
     artwork: Option<&CueArtworkSidecar>,
-    suppress_preemphasis_signaling: bool,
+    preemphasis_output_policy: PreemphasisOutputPolicy,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
@@ -6036,7 +6041,7 @@ async fn apply_metadata_to_track_artifact(
                 metadata,
                 album,
                 artwork,
-                suppress_preemphasis_signaling,
+                preemphasis_output_policy,
                 &bound_runner,
                 cancel,
                 tool_concurrency_limits,
@@ -6058,7 +6063,7 @@ async fn apply_metadata_to_track_artifact(
             metadata,
             album,
             artwork,
-            suppress_preemphasis_signaling,
+            preemphasis_output_policy,
             runner,
             cancel,
             tool_concurrency_limits,
@@ -6340,14 +6345,15 @@ pub async fn apply_metadata_with_tool_limits(
                     }
                 }
                 let meta = prepared_track.map(|t| &t.metadata);
-                let suppress_preemphasis_signaling = prepared_track
-                    .is_some_and(|track| suppress_preemphasis_signaling_for_track(req, track));
+                let preemphasis_output_policy = prepared_track
+                    .map(|track| preemphasis_output_policy_for_track(req, track))
+                    .unwrap_or(PreemphasisOutputPolicy::Preserve);
                 apply_metadata_to_track_artifact(
                     artifact,
                     meta,
                     &source.album_metadata,
                     cue_artwork.as_ref(),
-                    suppress_preemphasis_signaling,
+                    preemphasis_output_policy,
                     runner,
                     cancel,
                     tool_concurrency_limits.as_ref(),
@@ -6362,7 +6368,7 @@ pub async fn apply_metadata_with_tool_limits(
                 &album_as_track,
                 &source.album_metadata,
                 cue_artwork.as_ref(),
-                suppress_preemphasis_signaling_for_merged(req, source),
+                preemphasis_output_policy_for_merged(req, source),
                 runner,
                 cancel,
                 tool_concurrency_limits.as_ref(),
@@ -6399,7 +6405,7 @@ fn merged_album_metadata_as_track(source: &PreparedSource) -> TrackMetadata {
 pub(crate) async fn restore_merged_mp4_terminal_metadata_after_structural_remux(
     path: &Path,
     source: &PreparedSource,
-    suppress_preemphasis_signaling: bool,
+    preemphasis_output_policy: PreemphasisOutputPolicy,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
@@ -6409,7 +6415,7 @@ pub(crate) async fn restore_merged_mp4_terminal_metadata_after_structural_remux(
         path,
         &album_as_track,
         &source.album_metadata,
-        suppress_preemphasis_signaling,
+        preemphasis_output_policy,
         runner,
         cancel,
         tool_concurrency_limits,
@@ -6419,7 +6425,7 @@ pub(crate) async fn restore_merged_mp4_terminal_metadata_after_structural_remux(
         path,
         &album_as_track,
         &source.album_metadata,
-        suppress_preemphasis_signaling,
+        preemphasis_output_policy,
         cancel,
     )
     .await
@@ -7147,11 +7153,30 @@ fn tags_contain_preemphasis_signaling(tags: &[(String, String)]) -> bool {
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreemphasisOutputPolicy {
+    /// Preserve source signaling inside the native lossless 16-bit/44.1-kHz domain.
+    Preserve,
+    /// Remove stale positive signaling when the output leaves that domain but
+    /// de-emphasis itself was not applied. R30 deliberately does not define a
+    /// categorical negative for this case.
+    Strip,
+    /// De-emphasis was actually applied: remove contradictory positive
+    /// signaling and write the canonical categorical negative.
+    Negative,
+}
+
 fn suppress_preemphasis_signaling_from_tags(
     tags: Vec<(String, String)>,
+    preserve_existing_negative: bool,
 ) -> Vec<(String, String)> {
     tags.into_iter()
         .filter_map(|(key, value)| match preemphasis_signaling_key_kind(&key) {
+            Some("pre_emphasis")
+                if preserve_existing_negative && is_negative_preemphasis_value(&value) =>
+            {
+                Some((key, value))
+            }
             Some("pre_emphasis") => None,
             Some("cue_flags") => cue_flags_without_pre(&value).map(|value| (key, value)),
             _ => Some((key, value)),
@@ -7159,17 +7184,34 @@ fn suppress_preemphasis_signaling_from_tags(
         .collect()
 }
 
+fn apply_preemphasis_output_policy(
+    tags: Vec<(String, String)>,
+    policy: PreemphasisOutputPolicy,
+) -> Vec<(String, String)> {
+    match policy {
+        PreemphasisOutputPolicy::Preserve => tags,
+        // R30 does not authorize inventing a new negative when no de-emphasis
+        // ran, but an already-present categorical negative remains true and
+        // must survive subsequent conversions or stale CUE/catalog evidence
+        // becomes visible again.
+        PreemphasisOutputPolicy::Strip => suppress_preemphasis_signaling_from_tags(tags, true),
+        PreemphasisOutputPolicy::Negative => {
+            let mut tags = suppress_preemphasis_signaling_from_tags(tags, false);
+            tags.push(("PRE_EMPHASIS".to_owned(), "0".to_owned()));
+            tags
+        }
+    }
+}
+
 fn authoritative_metadata_tags_for_output(
     meta: &TrackMetadata,
     album: &AlbumMetadata,
-    suppress_preemphasis_signaling: bool,
+    preemphasis_output_policy: PreemphasisOutputPolicy,
 ) -> Vec<(String, String)> {
-    let tags = authoritative_metadata_tags(meta, album);
-    if suppress_preemphasis_signaling {
-        suppress_preemphasis_signaling_from_tags(tags)
-    } else {
-        tags
-    }
+    apply_preemphasis_output_policy(
+        authoritative_metadata_tags(meta, album),
+        preemphasis_output_policy,
+    )
 }
 
 #[cfg(test)]
@@ -7178,12 +7220,15 @@ mod r18_preemphasis_output_policy_tests {
 
     #[test]
     fn suppression_removes_preemphasis_aliases_and_only_pre_cue_token() {
-        let filtered = suppress_preemphasis_signaling_from_tags(vec![
-            ("PRE_EMPHASIS".to_owned(), "1".to_owned()),
-            ("PRE-EMPHASIS".to_owned(), "YES".to_owned()),
-            ("CUE_FLAGS".to_owned(), "DCP PRE 4CH".to_owned()),
-            ("COMMENT".to_owned(), "keep".to_owned()),
-        ]);
+        let filtered = suppress_preemphasis_signaling_from_tags(
+            vec![
+                ("PRE_EMPHASIS".to_owned(), "1".to_owned()),
+                ("PRE-EMPHASIS".to_owned(), "YES".to_owned()),
+                ("CUE_FLAGS".to_owned(), "DCP PRE 4CH".to_owned()),
+                ("COMMENT".to_owned(), "keep".to_owned()),
+            ],
+            false,
+        );
         assert!(!filtered.iter().any(|(key, _)| preemphasis_signaling_key_kind(key) == Some("pre_emphasis")));
         assert!(filtered.iter().any(|(key, value)| key == "CUE_FLAGS" && value == "DCP 4CH"));
         assert!(filtered.iter().any(|(key, value)| key == "COMMENT" && value == "keep"));
@@ -7195,6 +7240,117 @@ mod r18_preemphasis_output_policy_tests {
         assert!(tags_contain_preemphasis_signaling(&[("CUE-FLAGS".to_owned(), "PRE DCP".to_owned())]));
         assert!(!tags_contain_preemphasis_signaling(&[("PRE_EMPHASIS".to_owned(), "0".to_owned())]));
         assert!(!tags_contain_preemphasis_signaling(&[("CUE_FLAGS".to_owned(), "DCP".to_owned())]));
+    }
+
+    #[test]
+    fn wav_id3v2_projection_can_carry_the_canonical_negative() {
+        use lofty::tag::ItemKey;
+
+        let tags = apply_preemphasis_output_policy(
+            vec![("PRE_EMPHASIS".to_owned(), "1".to_owned())],
+            PreemphasisOutputPolicy::Negative,
+        );
+        let changes = pipeline_authoritative_id3v2_write_changes(&tags);
+        assert!(changes.iter().any(|(key, values)| {
+            key == &ItemKey::Unknown("PRE_EMPHASIS".to_owned())
+                && values == &vec!["0".to_owned()]
+        }));
+    }
+
+    #[test]
+    fn unqualified_w64_and_rf64_carriers_fall_back_to_strip_without_weakening_riff_wav() {
+        let temp = tempfile::tempdir().expect("R30 carrier tempdir");
+        let riff = temp.path().join("track.wav");
+        std::fs::write(&riff, b"RIFF\0\0\0\0WAVE").expect("write RIFF marker");
+        let rf64 = temp.path().join("track-rf64.wav");
+        std::fs::write(&rf64, b"RF64\0\0\0\0WAVE").expect("write RF64 marker");
+
+        assert_eq!(
+            preemphasis_output_policy_for_metadata_carrier(
+                std::path::Path::new("track.w64"),
+                "w64",
+                PreemphasisOutputPolicy::Negative,
+            )
+            .expect("W64 policy"),
+            PreemphasisOutputPolicy::Strip,
+        );
+        assert_eq!(
+            preemphasis_output_policy_for_metadata_carrier(
+                &rf64,
+                "wav",
+                PreemphasisOutputPolicy::Negative,
+            )
+            .expect("RF64 policy"),
+            PreemphasisOutputPolicy::Strip,
+        );
+        assert_eq!(
+            preemphasis_output_policy_for_metadata_carrier(
+                &riff,
+                "wav",
+                PreemphasisOutputPolicy::Negative,
+            )
+            .expect("RIFF WAV policy"),
+            PreemphasisOutputPolicy::Negative,
+        );
+    }
+
+    #[test]
+    fn negative_policy_replaces_all_positive_signaling_with_one_canonical_zero() {
+        let filtered = apply_preemphasis_output_policy(
+            vec![
+                ("PRE_EMPHASIS".to_owned(), "1".to_owned()),
+                ("PRE-EMPHASIS".to_owned(), "YES".to_owned()),
+                ("CUE_FLAGS".to_owned(), "DCP PRE 4CH".to_owned()),
+                ("COMMENT".to_owned(), "keep".to_owned()),
+            ],
+            PreemphasisOutputPolicy::Negative,
+        );
+
+        assert_eq!(
+            filtered
+                .iter()
+                .filter(|(key, _)| preemphasis_signaling_key_kind(key) == Some("pre_emphasis"))
+                .map(|(key, value)| (key.as_str(), value.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("PRE_EMPHASIS", "0")],
+        );
+        assert!(filtered
+            .iter()
+            .any(|(key, value)| key == "CUE_FLAGS" && value == "DCP 4CH"));
+        assert!(filtered
+            .iter()
+            .any(|(key, value)| key == "COMMENT" && value == "keep"));
+    }
+
+    #[test]
+    fn negative_policy_is_idempotent_and_strip_does_not_invent_a_negative() {
+        let once = apply_preemphasis_output_policy(
+            vec![("PRE_EMPHASIS".to_owned(), "0".to_owned())],
+            PreemphasisOutputPolicy::Negative,
+        );
+        let twice = apply_preemphasis_output_policy(once.clone(), PreemphasisOutputPolicy::Negative);
+        assert_eq!(twice, once);
+
+        let stripped = apply_preemphasis_output_policy(
+            vec![("PRE_EMPHASIS".to_owned(), "1".to_owned())],
+            PreemphasisOutputPolicy::Strip,
+        );
+        assert!(stripped.is_empty());
+
+        let existing_negative = apply_preemphasis_output_policy(
+            vec![
+                ("PRE_EMPHASIS".to_owned(), "NO".to_owned()),
+                ("CUE_FLAGS".to_owned(), "DCP PRE".to_owned()),
+            ],
+            PreemphasisOutputPolicy::Strip,
+        );
+        assert_eq!(
+            existing_negative,
+            vec![
+                ("PRE_EMPHASIS".to_owned(), "NO".to_owned()),
+                ("CUE_FLAGS".to_owned(), "DCP".to_owned()),
+            ],
+        );
     }
 }
 
@@ -7623,7 +7779,7 @@ fn m4a_freeform_tag_pairs_for_file(
     path: &Path,
     meta: &TrackMetadata,
     album: &AlbumMetadata,
-    suppress_preemphasis_signaling: bool,
+    preemphasis_output_policy: PreemphasisOutputPolicy,
 ) -> Vec<(String, String)> {
     let ext = path
         .extension()
@@ -7636,7 +7792,7 @@ fn m4a_freeform_tag_pairs_for_file(
     m4a_freeform_tag_pairs(&authoritative_metadata_tags_for_output(
         meta,
         album,
-        suppress_preemphasis_signaling,
+        preemphasis_output_policy,
     ))
 }
 
@@ -7680,7 +7836,7 @@ async fn apply_m4a_freeform_tags(
     path: &Path,
     meta: &TrackMetadata,
     album: &AlbumMetadata,
-    suppress_preemphasis_signaling: bool,
+    preemphasis_output_policy: PreemphasisOutputPolicy,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
@@ -7689,7 +7845,7 @@ async fn apply_m4a_freeform_tags(
         path,
         meta,
         album,
-        suppress_preemphasis_signaling,
+        preemphasis_output_policy,
     );
     if pairs.is_empty() {
         return Ok(());
@@ -7716,6 +7872,20 @@ fn metadata_uses_rf64_carrier(path: &Path, ext: &str) -> Result<bool, MetadataEr
         "wav" => wave_metadata_is_rf64(path),
         _ => Ok(false),
     }
+}
+
+fn preemphasis_output_policy_for_metadata_carrier(
+    path: &Path,
+    ext: &str,
+    requested: PreemphasisOutputPolicy,
+) -> Result<PreemphasisOutputPolicy, MetadataError> {
+    if requested != PreemphasisOutputPolicy::Negative {
+        return Ok(requested);
+    }
+    if ext == "w64" || metadata_uses_rf64_carrier(path, ext)? {
+        return Ok(PreemphasisOutputPolicy::Strip);
+    }
+    Ok(PreemphasisOutputPolicy::Negative)
 }
 
 fn rf64_metadata_key_is_supported(key: &str, tags: &[(String, String)]) -> bool {
@@ -8411,7 +8581,7 @@ async fn apply_pipeline_multivalue_overlay(
     path: &Path,
     meta: &TrackMetadata,
     album: &AlbumMetadata,
-    suppress_preemphasis_signaling: bool,
+    preemphasis_output_policy: PreemphasisOutputPolicy,
     cancel: &CancellationToken,
 ) -> Result<(), MetadataError> {
     let ext = path
@@ -8429,12 +8599,17 @@ async fn apply_pipeline_multivalue_overlay(
     let tags = authoritative_metadata_tags_for_output(
         meta,
         album,
-        suppress_preemphasis_signaling,
+        preemphasis_output_policy,
     );
     let changes = pipeline_multivalue_overlay_changes_for_extension(&tags, &ext);
-    if changes.is_empty() {
+    let force_wav_negative_projection =
+        ext == "wav" && preemphasis_output_policy == PreemphasisOutputPolicy::Negative;
+    if changes.is_empty() && !force_wav_negative_projection {
         // Critical scalar-compatibility invariant: do not invoke an in-process
-        // tag writer at all when every logical field is scalar.
+        // tag writer at all when every logical field is scalar. R30's one
+        // exception is ordinary RIFF WAV: FFmpeg's RIFF INFO muxer silently
+        // drops unknown PRE_EMPHASIS, while the already-qualified ID3v2 overlay
+        // can preserve that custom key without touching the audio stream.
         return Ok(());
     }
 
@@ -8525,7 +8700,7 @@ async fn tag_audio_file(
     path: &Path,
     meta: &TrackMetadata,
     album: &AlbumMetadata,
-    suppress_preemphasis_signaling: bool,
+    preemphasis_output_policy: PreemphasisOutputPolicy,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
@@ -8537,13 +8712,34 @@ async fn tag_audio_file(
         .to_lowercase();
 
     let source_tags = authoritative_metadata_tags(meta, album);
-    let removes_preemphasis_signaling = suppress_preemphasis_signaling
+
+    // R30 defines the logical negative tag but explicitly does not establish a
+    // new physical carrier for formats that cannot already preserve arbitrary
+    // metadata. Do not turn de-emphasis into a new conversion failure on W64
+    // or RF64 by asking their qualified metadata paths to persist a field they
+    // cannot represent. Those carriers retain R18's strip behavior until a
+    // carrier contract is commissioned. Ordinary RIFF WAV is handled below by
+    // its existing ID3v2 overlay and therefore can carry the categorical tag.
+    let effective_preemphasis_output_policy =
+        preemphasis_output_policy_for_metadata_carrier(
+            path,
+            &ext,
+            preemphasis_output_policy,
+        )?;
+    if effective_preemphasis_output_policy != preemphasis_output_policy {
+        log::warn!(
+            "Metadata warning for '{}': this carrier has no qualified PRE_EMPHASIS custom-tag representation; removing stale positive signaling but not inventing a physical negative carrier",
+            path.display()
+        );
+    }
+
+    let removes_preemphasis_signaling = effective_preemphasis_output_policy
+        != PreemphasisOutputPolicy::Preserve
         && tags_contain_preemphasis_signaling(&source_tags);
-    let tags = if suppress_preemphasis_signaling {
-        suppress_preemphasis_signaling_from_tags(source_tags)
-    } else {
-        source_tags
-    };
+    let tags = apply_preemphasis_output_policy(
+        source_tags,
+        effective_preemphasis_output_policy,
+    );
     if !authoritative_metadata_mutation_required(meta, album, &tags)
         && !removes_preemphasis_signaling
     {
@@ -8632,7 +8828,7 @@ pub(crate) async fn write_authority_matrix_tags_for_test(
         path,
         meta,
         album,
-        false,
+        PreemphasisOutputPolicy::Preserve,
         &runner,
         &CancellationToken::new(),
         None,
@@ -8646,7 +8842,7 @@ async fn apply_production_metadata_to_file(
     meta: &TrackMetadata,
     album: &AlbumMetadata,
     artwork: Option<&CueArtworkSidecar>,
-    suppress_preemphasis_signaling: bool,
+    preemphasis_output_policy: PreemphasisOutputPolicy,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
@@ -8655,7 +8851,7 @@ async fn apply_production_metadata_to_file(
         path,
         meta,
         album,
-        suppress_preemphasis_signaling,
+        preemphasis_output_policy,
         runner,
         cancel,
         tool_concurrency_limits,
@@ -8677,14 +8873,14 @@ async fn apply_production_metadata_to_file(
         path,
         meta,
         album,
-        suppress_preemphasis_signaling,
+        preemphasis_output_policy,
     )
     .is_empty();
     apply_m4a_freeform_tags(
         path,
         meta,
         album,
-        suppress_preemphasis_signaling,
+        preemphasis_output_policy,
         runner,
         cancel,
         tool_concurrency_limits,
@@ -8703,7 +8899,7 @@ async fn apply_production_metadata_to_file(
         path,
         meta,
         album,
-        suppress_preemphasis_signaling,
+        preemphasis_output_policy,
         cancel,
     )
     .await?;
@@ -8741,7 +8937,17 @@ pub async fn qualify_production_metadata_mutation(
             ),
         ));
     }
-    apply_production_metadata_to_file(path, meta, album, None, false, runner, cancel, None).await
+    apply_production_metadata_to_file(
+        path,
+        meta,
+        album,
+        None,
+        PreemphasisOutputPolicy::Preserve,
+        runner,
+        cancel,
+        None,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -8842,7 +9048,7 @@ mod metadata_writer_command_tests {
             &path,
             &track,
             &AlbumMetadata::default(),
-            false,
+            PreemphasisOutputPolicy::Preserve,
             &cancel,
         )
         .await
@@ -9491,7 +9697,7 @@ mod metadata_writer_command_tests {
                 &path,
                 &track,
                 &AlbumMetadata::default(),
-                false,
+                PreemphasisOutputPolicy::Preserve,
                 &runner,
                 &CancellationToken::new(),
                 None,
@@ -9529,7 +9735,7 @@ mod metadata_writer_command_tests {
             &path,
             &track,
             &AlbumMetadata::default(),
-            false,
+            PreemphasisOutputPolicy::Preserve,
             &CancellationToken::new(),
         )
             .await
@@ -10337,13 +10543,13 @@ mod metadata_writer_command_tests {
         insert_source_text_tag(&mut track.extra, "MY_NOTE", "keep me");
         let album = AlbumMetadata::default();
 
-        let m4a = m4a_freeform_tag_pairs_for_file(Path::new("track.m4a"), &track, &album, false);
-        let m4b = m4a_freeform_tag_pairs_for_file(Path::new("book.m4b"), &track, &album, false);
-        let mp4 = m4a_freeform_tag_pairs_for_file(Path::new("track.mp4"), &track, &album, false);
+        let m4a = m4a_freeform_tag_pairs_for_file(Path::new("track.m4a"), &track, &album, PreemphasisOutputPolicy::Preserve);
+        let m4b = m4a_freeform_tag_pairs_for_file(Path::new("book.m4b"), &track, &album, PreemphasisOutputPolicy::Preserve);
+        let mp4 = m4a_freeform_tag_pairs_for_file(Path::new("track.mp4"), &track, &album, PreemphasisOutputPolicy::Preserve);
         assert_eq!(m4b, m4a);
         assert_eq!(mp4, m4a);
         assert!(m4b.iter().any(|(key, value)| key == "MY_NOTE" && value == "keep me"));
-        assert!(m4a_freeform_tag_pairs_for_file(Path::new("track.aac"), &track, &album, false).is_empty());
+        assert!(m4a_freeform_tag_pairs_for_file(Path::new("track.aac"), &track, &album, PreemphasisOutputPolicy::Preserve).is_empty());
 
         let command = m4a_freeform_tag_command(Path::new("book.m4b"), &m4b);
         assert_eq!(command.binary, ToolBinary::AtomicParsley);
@@ -10991,7 +11197,7 @@ mod metadata_writer_command_tests {
             &track,
             &AlbumMetadata::default(),
             None,
-            false,
+            PreemphasisOutputPolicy::Preserve,
             &runner,
             &CancellationToken::new(),
             None,
@@ -11035,7 +11241,7 @@ mod metadata_writer_command_tests {
             &track,
             &AlbumMetadata::default(),
             None,
-            false,
+            PreemphasisOutputPolicy::Preserve,
             &runner,
             &CancellationToken::new(),
             None,
@@ -11091,7 +11297,7 @@ mod metadata_writer_command_tests {
             &track,
             &album,
             None,
-            false,
+            PreemphasisOutputPolicy::Preserve,
             &runner,
             &CancellationToken::new(),
             None,
@@ -11187,7 +11393,7 @@ mod metadata_writer_command_tests {
             &track,
             &AlbumMetadata::default(),
             None,
-            false,
+            PreemphasisOutputPolicy::Preserve,
             &runner,
             &CancellationToken::new(),
             None,
@@ -11238,7 +11444,7 @@ mod metadata_writer_command_tests {
             &track,
             &album,
             None,
-            false,
+            PreemphasisOutputPolicy::Preserve,
             &runner,
             &cancel,
             None,
@@ -11275,7 +11481,7 @@ mod metadata_writer_command_tests {
             &track,
             &album,
             None,
-            false,
+            PreemphasisOutputPolicy::Preserve,
             &runner,
             &cancel,
             None,
@@ -11368,7 +11574,7 @@ mod metadata_writer_command_tests {
                 &track,
                 &AlbumMetadata::default(),
                 None,
-                false,
+                PreemphasisOutputPolicy::Preserve,
                 &runner,
                 &CancellationToken::new(),
                 None,
@@ -11402,7 +11608,7 @@ mod metadata_writer_command_tests {
             &supported_track,
             &AlbumMetadata::default(),
             None,
-            false,
+            PreemphasisOutputPolicy::Preserve,
             &runner,
             &CancellationToken::new(),
             None,
@@ -11497,7 +11703,7 @@ mod metadata_writer_command_tests {
             &track,
             &album,
             None,
-            false,
+            PreemphasisOutputPolicy::Preserve,
             &runner,
             &CancellationToken::new(),
             None,
@@ -11542,7 +11748,7 @@ mod metadata_writer_command_tests {
             &track,
             &album,
             None,
-            false,
+            PreemphasisOutputPolicy::Preserve,
             &runner,
             &CancellationToken::new(),
             None,
@@ -11593,7 +11799,7 @@ mod metadata_writer_command_tests {
             &wav_metadata,
             &reread_album,
             None,
-            false,
+            PreemphasisOutputPolicy::Preserve,
             &runner,
             &CancellationToken::new(),
             None,
@@ -11667,7 +11873,7 @@ mod metadata_writer_command_tests {
             &track,
             &album,
             Some(&artwork),
-            false,
+            PreemphasisOutputPolicy::Preserve,
             &runner,
             &CancellationToken::new(),
             None,
@@ -11729,7 +11935,7 @@ mod metadata_writer_command_tests {
             &track,
             &album,
             Some(&artwork),
-            false,
+            PreemphasisOutputPolicy::Preserve,
             &runner,
             &CancellationToken::new(),
             None,
@@ -11786,7 +11992,7 @@ mod metadata_writer_command_tests {
             &track,
             &album,
             None,
-            false,
+            PreemphasisOutputPolicy::Preserve,
             &runner,
             &CancellationToken::new(),
             None,
@@ -24293,7 +24499,7 @@ fn metadata_satisfaction_label(
                 &artifact.staged_path,
                 &track.metadata,
                 &source.album_metadata,
-                false,
+                PreemphasisOutputPolicy::Preserve,
             )
             .is_empty()
         });
@@ -25159,24 +25365,39 @@ fn track_preserves_cd_preemphasis_signaling_domain(
             == Some(tonepoet_pipeline::PcmBitDepth::Int16)
 }
 
-fn suppress_preemphasis_signaling_for_track(
-    req: &PipelineRequest,
-    track: &PreparedTrack,
-) -> bool {
-    request_applies_cd_deemphasis(req)
-        || !track_preserves_cd_preemphasis_signaling_domain(track, &req.settings)
+fn preemphasis_output_policy(
+    applies_cd_deemphasis: bool,
+    preserves_cd_preemphasis_signaling_domain: bool,
+) -> PreemphasisOutputPolicy {
+    if applies_cd_deemphasis {
+        PreemphasisOutputPolicy::Negative
+    } else if preserves_cd_preemphasis_signaling_domain {
+        PreemphasisOutputPolicy::Preserve
+    } else {
+        PreemphasisOutputPolicy::Strip
+    }
 }
 
-fn suppress_preemphasis_signaling_for_merged(
+fn preemphasis_output_policy_for_track(
+    req: &PipelineRequest,
+    track: &PreparedTrack,
+) -> PreemphasisOutputPolicy {
+    preemphasis_output_policy(
+        request_applies_cd_deemphasis(req),
+        track_preserves_cd_preemphasis_signaling_domain(track, &req.settings),
+    )
+}
+
+fn preemphasis_output_policy_for_merged(
     req: &PipelineRequest,
     source: &PreparedSource,
-) -> bool {
-    request_applies_cd_deemphasis(req)
-        || source.tracks.is_empty()
-        || source
+) -> PreemphasisOutputPolicy {
+    let preserves_domain = !source.tracks.is_empty()
+        && source
             .tracks
             .iter()
-            .any(|track| !track_preserves_cd_preemphasis_signaling_domain(track, &req.settings))
+            .all(|track| track_preserves_cd_preemphasis_signaling_domain(track, &req.settings));
+    preemphasis_output_policy(request_applies_cd_deemphasis(req), preserves_domain)
 }
 
 #[cfg(test)]
@@ -25202,6 +25423,26 @@ mod r18_preemphasis_target_domain_tests {
             bit_depth: Some(16),
             warnings: Vec::new(),
         }
+    }
+
+    #[test]
+    fn r30_negative_policy_requires_actual_deemphasis_not_merely_domain_exit() {
+        assert_eq!(
+            preemphasis_output_policy(true, true),
+            PreemphasisOutputPolicy::Negative,
+        );
+        assert_eq!(
+            preemphasis_output_policy(true, false),
+            PreemphasisOutputPolicy::Negative,
+        );
+        assert_eq!(
+            preemphasis_output_policy(false, true),
+            PreemphasisOutputPolicy::Preserve,
+        );
+        assert_eq!(
+            preemphasis_output_policy(false, false),
+            PreemphasisOutputPolicy::Strip,
+        );
     }
 
     #[test]
@@ -45542,7 +45783,7 @@ pub(crate) async fn finish_pipeline_album_for_scheduler_with_tool_limits_and_ret
             runner,
             cancel,
             req.stages.metadata != StageRequirement::Disabled,
-            suppress_preemphasis_signaling_for_merged(&req, &source_value),
+            preemphasis_output_policy_for_merged(&req, &source_value),
             tool_concurrency_limits.as_ref(),
         )
         .await
@@ -46723,7 +46964,7 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_once(
             runner,
             cancel,
             req.stages.metadata != StageRequirement::Disabled,
-            suppress_preemphasis_signaling_for_merged(&req, source_ref),
+            preemphasis_output_policy_for_merged(&req, source_ref),
             None,
         )
         .await
@@ -70726,7 +70967,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             &fixture.album.source.tracks[0].metadata,
             &fixture.album.source.album_metadata,
             None,
-            false,
+            PreemphasisOutputPolicy::Preserve,
             &runner,
             &CancellationToken::new(),
             None,
@@ -70825,7 +71066,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             &fixture.album.source.tracks[0].metadata,
             &fixture.album.source.album_metadata,
             None,
-            false,
+            PreemphasisOutputPolicy::Preserve,
             &runner,
             &CancellationToken::new(),
             None,
@@ -70980,7 +71221,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             &w64_path,
             &fixture.album.source.tracks[0].metadata,
             &fixture.album.source.album_metadata,
-            false,
+            PreemphasisOutputPolicy::Preserve,
             &runner,
             &cancel,
             None,

@@ -90,7 +90,7 @@ pub(crate) async fn finalize_structured_chapters_before_publish(
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     restore_authoritative_mp4_metadata: bool,
-    suppress_preemphasis_signaling: bool,
+    preemphasis_output_policy: super::stages::PreemphasisOutputPolicy,
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
 ) -> Result<(), PublishError> {
     let merged = match &artifacts.audio {
@@ -143,7 +143,7 @@ pub(crate) async fn finalize_structured_chapters_before_publish(
             super::stages::restore_merged_mp4_terminal_metadata_after_structural_remux(
                 &merged.staged_path,
                 source,
-                suppress_preemphasis_signaling,
+                preemphasis_output_policy,
                 runner,
                 cancel,
                 tool_concurrency_limits,
@@ -1161,7 +1161,7 @@ mod tests {
                 &runner,
                 &CancellationToken::new(),
                 false,
-                false,
+                super::super::stages::PreemphasisOutputPolicy::Preserve,
                 None,
             )
             .await
@@ -1194,7 +1194,7 @@ mod tests {
                 &runner,
                 &CancellationToken::new(),
                 false,
-                false,
+                super::super::stages::PreemphasisOutputPolicy::Preserve,
                 None,
             )
             .await
@@ -1239,7 +1239,7 @@ mod tests {
             &runner,
             &CancellationToken::new(),
             false,
-            false,
+            super::super::stages::PreemphasisOutputPolicy::Preserve,
             None,
         )
         .await

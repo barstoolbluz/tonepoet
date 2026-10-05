@@ -9993,7 +9993,9 @@ fn deemphasis_evidence_origin_for_log(
     evidence: &crate::tui::probe::ConvertPreemphasisEvidence,
 ) -> crate::convert::pipeline::DeemphasisEvidenceOrigin {
     use crate::convert::pipeline::DeemphasisEvidenceOrigin;
-    if evidence.explicit_affirmative {
+    if evidence.explicit_negative {
+        DeemphasisEvidenceOrigin::None
+    } else if evidence.explicit_affirmative {
         DeemphasisEvidenceOrigin::ExplicitTag
     } else if evidence.cue_flag {
         DeemphasisEvidenceOrigin::CueFlag

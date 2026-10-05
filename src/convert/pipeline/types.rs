@@ -2304,13 +2304,37 @@ pub fn insert_source_text_tag(
     if key.is_empty() || value.trim().is_empty() {
         return;
     }
+
+    // Source text provenance is intentionally scalar/first-wins for ordinary
+    // fields, but R30 gives an explicit PRE_EMPHASIS=0/NO categorical
+    // authority. Preserve that authority even when a malformed carrier repeats
+    // the same physical key with an affirmative value before or after it.
+    let normalized_key = key
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .map(|character| character.to_ascii_lowercase())
+        .collect::<String>();
+    let marker_key = format!("{SOURCE_TEXT_TAG_EXTRA_PREFIX}{key}");
+    if normalized_key == "preemphasis" {
+        let incoming_is_negative = is_negative_preemphasis_value(value);
+        let retained_is_negative = extra
+            .get(&key)
+            .is_some_and(|retained| is_negative_preemphasis_value(retained));
+        if incoming_is_negative {
+            extra.insert(key, value.to_string());
+            extra.insert(marker_key, value.to_string());
+            return;
+        }
+        if retained_is_negative {
+            return;
+        }
+    }
+
     let retained_value = extra
-        .entry(key.clone())
+        .entry(key)
         .or_insert_with(|| value.to_string())
         .clone();
-    extra
-        .entry(format!("{SOURCE_TEXT_TAG_EXTRA_PREFIX}{key}"))
-        .or_insert(retained_value);
+    extra.entry(marker_key).or_insert(retained_value);
 }
 
 pub fn source_text_tag_key_from_extra<'a>(
@@ -2334,17 +2358,37 @@ pub fn is_affirmative_preemphasis_value(value: &str) -> bool {
     )
 }
 
+/// Return true only for the categorical negative values authorized by R30.
+///
+/// Keep this deliberately narrower than the affirmative compatibility parser:
+/// `0` and `NO` are the interoperable negative markers that suppress weaker
+/// CUE/catalog evidence. Values such as `false` are not promoted into new
+/// semantics without an explicit contract.
+pub fn is_negative_preemphasis_value(value: &str) -> bool {
+    let value = value.trim();
+    value == "0" || value.eq_ignore_ascii_case("NO")
+}
+
 pub fn source_text_tags_indicate_pre_emphasis(extra: &BTreeMap<String, String>) -> bool {
-    extra.iter().any(|(key, value)| {
-        source_text_tag_key_from_extra(extra, key, value).is_some_and(|source_key| {
-            let normalized = source_key
-                .chars()
-                .filter(|character| character.is_ascii_alphanumeric())
-                .map(|character| character.to_ascii_lowercase())
-                .collect::<String>();
-            normalized == "preemphasis" && is_affirmative_preemphasis_value(value)
-        })
-    })
+    let mut affirmative = false;
+    for (key, value) in extra {
+        let Some(source_key) = source_text_tag_key_from_extra(extra, key, value) else {
+            continue;
+        };
+        let normalized = source_key
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .map(|character| character.to_ascii_lowercase())
+            .collect::<String>();
+        if normalized != "preemphasis" {
+            continue;
+        }
+        if is_negative_preemphasis_value(value) {
+            return false;
+        }
+        affirmative |= is_affirmative_preemphasis_value(value);
+    }
+    affirmative
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2722,6 +2766,42 @@ mod source_identity_tests {
         assert!(warning.contains("'.flac'"));
         assert!(warning.contains("decoded codec 'flac'"));
         assert!(warning.contains("decoder format 'ogg'"));
+    }
+}
+
+#[cfg(test)]
+mod r30_source_text_preemphasis_tests {
+    use super::{
+        insert_source_text_tag, is_negative_preemphasis_value,
+        source_text_tags_indicate_pre_emphasis,
+    };
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn categorical_negative_source_text_tag_vetoes_affirmative_aliases() {
+        let mut extra = BTreeMap::new();
+        insert_source_text_tag(&mut extra, "PRE_EMPHASIS", "YES");
+        assert!(source_text_tags_indicate_pre_emphasis(&extra));
+
+        insert_source_text_tag(&mut extra, "PRE-EMPHASIS", "NO");
+        assert!(!source_text_tags_indicate_pre_emphasis(&extra));
+
+        let mut duplicate = BTreeMap::new();
+        insert_source_text_tag(&mut duplicate, "PRE_EMPHASIS", "YES");
+        insert_source_text_tag(&mut duplicate, "PRE_EMPHASIS", "0");
+        insert_source_text_tag(&mut duplicate, "PRE_EMPHASIS", "YES");
+        assert!(!source_text_tags_indicate_pre_emphasis(&duplicate));
+        assert_eq!(duplicate.get("pre_emphasis").map(String::as_str), Some("0"));
+    }
+
+    #[test]
+    fn negative_value_parser_is_intentionally_narrow_and_case_insensitive() {
+        for value in ["0", "NO", "no", " No "] {
+            assert!(is_negative_preemphasis_value(value), "{value}");
+        }
+        for value in ["false", "off", "n", ""] {
+            assert!(!is_negative_preemphasis_value(value), "{value}");
+        }
     }
 }
 

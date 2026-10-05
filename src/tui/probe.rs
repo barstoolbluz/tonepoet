@@ -81,6 +81,10 @@ impl Default for ArtworkInfo {
 pub struct ConvertPreemphasisEvidence {
     /// Exact `PRE_EMPHASIS` field with trimmed value `1` or case-insensitive `YES`.
     pub explicit_affirmative: bool,
+    /// `PRE_EMPHASIS` field (field-name case-insensitive) with trimmed value `0`
+    /// or case-insensitive `NO`. This is categorical and suppresses weaker
+    /// CUE/catalog evidence. Affirmative authority remains exact-key only.
+    pub explicit_negative: bool,
     /// A reliably associated parsed CUE track carries a real `FLAGS PRE` directive.
     pub cue_flag: bool,
     /// Actual source CATALOGNUMBER value, if present.
@@ -8701,22 +8705,47 @@ fn source_metadata_tool_from_tag(tag: &lofty::tag::Tag) -> Option<String> {
 /// Extract only the evidence authorized for Convert CD de-emphasis.
 ///
 /// No CUE, folder, COMMENT, spectral, artwork, or generic advisory work occurs
-/// here. The exact-key/value rule is deliberately narrower than the historical
-/// detector used by Details and other callers.
+/// here. Affirmative authority remains exact-key/value; only the categorical
+/// negative field name is case-insensitive so Convert can reread FFmpeg-backed
+/// TonePoet output. This remains narrower than the historical detector used by
+/// Details and other callers.
 pub(crate) fn convert_preemphasis_evidence_from_tags(
     tags: &[lofty::tag::Tag],
 ) -> ConvertPreemphasisEvidence {
-    use lofty::tag::ItemKey;
+    use lofty::tag::{ItemKey, ItemValue};
 
     let pre_key = ItemKey::Unknown("PRE_EMPHASIS".to_string());
     let catalog_key = ItemKey::Unknown("CATALOGNUMBER".to_string());
     let mut evidence = ConvertPreemphasisEvidence::default();
 
     for tag in tags {
-        if !evidence.explicit_affirmative {
-            if let Some(value) = tag.get_string(&pre_key) {
-                let value = value.trim();
-                evidence.explicit_affirmative = value == "1" || value.eq_ignore_ascii_case("YES");
+        for item in tag.items() {
+            let exact_pre_key = item.key() == &pre_key;
+            let negative_pre_key = match item.key() {
+                ItemKey::Unknown(field_name) => field_name.eq_ignore_ascii_case("PRE_EMPHASIS"),
+                _ => false,
+            };
+            if !exact_pre_key && !negative_pre_key {
+                continue;
+            }
+
+            let value = match item.value() {
+                ItemValue::Text(value) | ItemValue::Locator(value) => value.trim(),
+                ItemValue::Binary(_) => continue,
+            };
+
+            // R30 corrective: FFmpeg-backed metadata writes the canonical
+            // PRE_EMPHASIS field as `pre_emphasis` for carriers such as ID3.
+            // Accept field-name casing only for the categorical negative veto
+            // so TonePoet can reread its own output without broadening the
+            // existing exact-key affirmative authority.
+            if negative_pre_key {
+                evidence.explicit_negative |=
+                    crate::convert::pipeline::is_negative_preemphasis_value(value);
+            }
+            if exact_pre_key {
+                evidence.explicit_affirmative |=
+                    value == "1" || value.eq_ignore_ascii_case("YES");
             }
         }
         if evidence.catalog_number.is_none() {
@@ -8729,11 +8758,16 @@ pub(crate) fn convert_preemphasis_evidence_from_tags(
         }
     }
 
-    evidence.catalog_exact = evidence
-        .catalog_number
-        .as_deref()
-        .and_then(super::preemphasis::catalog::match_catalog_tag_value)
-        .is_some();
+    if evidence.explicit_negative {
+        evidence.explicit_affirmative = false;
+        evidence.catalog_exact = false;
+    } else {
+        evidence.catalog_exact = evidence
+            .catalog_number
+            .as_deref()
+            .and_then(super::preemphasis::catalog::match_catalog_tag_value)
+            .is_some();
+    }
     evidence
 }
 
@@ -8781,10 +8815,97 @@ mod convert_deemphasis_evidence_tests {
             let tag = tag_with(ItemKey::Unknown("PRE_EMPHASIS".to_owned()), value);
             assert!(!convert_preemphasis_evidence_from_tags(&[tag]).explicit_affirmative, "{value}");
         }
-        for key in ["PRE-EMPHASIS", "PRE EMPHASIS", "PREEMPHASIS"] {
+        for key in [
+            "pre_emphasis",
+            "Pre_Emphasis",
+            "PRE-EMPHASIS",
+            "PRE EMPHASIS",
+            "PREEMPHASIS",
+        ] {
             let tag = tag_with(ItemKey::Unknown(key.to_owned()), "YES");
-            assert!(!convert_preemphasis_evidence_from_tags(&[tag]).explicit_affirmative, "{key}");
+            let evidence = convert_preemphasis_evidence_from_tags(&[tag]);
+            assert!(!evidence.explicit_affirmative, "{key}");
+            assert!(!evidence.explicit_negative, "{key}");
         }
+    }
+
+    #[test]
+    fn convert_negative_tag_is_categorical_over_positive_and_catalog_evidence() {
+        for value in ["0", "NO", "no", " No "] {
+            let negative = tag_with(ItemKey::Unknown("PRE_EMPHASIS".to_owned()), value);
+            let catalog = tag_with(
+                ItemKey::Unknown("CATALOGNUMBER".to_owned()),
+                "35DP 150",
+            );
+            let evidence = convert_preemphasis_evidence_from_tags(&[negative, catalog]);
+            assert!(evidence.explicit_negative, "{value}");
+            assert!(!evidence.explicit_affirmative, "{value}");
+            assert!(!evidence.catalog_exact, "{value}");
+        }
+
+        for value in ["0", "NO", "no", " No "] {
+            let negative = tag_with(ItemKey::Unknown("pre_emphasis".to_owned()), value);
+            let catalog = tag_with(
+                ItemKey::Unknown("CATALOGNUMBER".to_owned()),
+                "35DP 150",
+            );
+            let evidence = convert_preemphasis_evidence_from_tags(&[negative, catalog]);
+            assert!(evidence.explicit_negative, "lowercase key with {value}");
+            assert!(!evidence.explicit_affirmative, "lowercase key with {value}");
+            assert!(!evidence.catalog_exact, "lowercase key with {value}");
+        }
+
+        let mixed_case_negative = tag_with(
+            ItemKey::Unknown("PrE_eMpHaSiS".to_owned()),
+            "0",
+        );
+        assert!(
+            convert_preemphasis_evidence_from_tags(&[mixed_case_negative]).explicit_negative,
+            "categorical negative field-name matching is case-insensitive",
+        );
+
+        for value in ["", "OFF", "FALSE", "N"] {
+            let tag = tag_with(ItemKey::Unknown("pre_emphasis".to_owned()), value);
+            assert!(
+                !convert_preemphasis_evidence_from_tags(&[tag]).explicit_negative,
+                "uncontracted negative spelling must remain non-authoritative: {value}",
+            );
+        }
+
+        let positive = tag_with(ItemKey::Unknown("PRE_EMPHASIS".to_owned()), "YES");
+        let negative = tag_with(ItemKey::Unknown("PRE_EMPHASIS".to_owned()), "0");
+        let evidence = convert_preemphasis_evidence_from_tags(&[positive, negative]);
+        assert!(evidence.explicit_negative);
+        assert!(!evidence.explicit_affirmative);
+
+        let mut duplicate = tag_with(ItemKey::Unknown("PRE_EMPHASIS".to_owned()), "YES");
+        duplicate.push_unchecked(TagItem::new(
+            ItemKey::Unknown("PRE_EMPHASIS".to_owned()),
+            ItemValue::Text("0".to_owned()),
+        ));
+        let evidence = convert_preemphasis_evidence_from_tags(&[duplicate]);
+        assert!(evidence.explicit_negative);
+        assert!(!evidence.explicit_affirmative);
+    }
+
+    #[test]
+    fn lowercase_negative_reread_suppresses_stale_cue_advisory() {
+        let negative = tag_with(ItemKey::Unknown("pre_emphasis".to_owned()), "0");
+        let mut evidence = convert_preemphasis_evidence_from_tags(&[negative]);
+        evidence.cue_flag = true;
+
+        let mut format = crate::tui::app::FormatState::new();
+        format.set_convert_deemphasis_evidence(&evidence);
+
+        assert!(evidence.explicit_negative);
+        assert!(!evidence.explicit_affirmative);
+        assert_eq!(
+            format.deemphasis_evidence,
+            crate::tui::app::ConvertDeemphasisEvidence::None,
+        );
+        assert_eq!(format.deemphasis_explicit_count, 0);
+        assert_eq!(format.deemphasis_cue_count, 0);
+        assert_eq!(format.deemphasis_catalog_count, 0);
     }
 
     #[test]

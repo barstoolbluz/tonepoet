@@ -773,6 +773,7 @@ pub(crate) fn probe_cue_proxy_source(
     }
 
     if crate::tui::probe::convert_cd_deemphasis_eligible(&first_info)
+        && !metadata.convert_preemphasis.explicit_negative
         && crate::tui::preemphasis::metadata::cue_sheet_has_pre_flag(&sheet)
     {
         metadata.convert_preemphasis.cue_flag = true;
@@ -1115,6 +1116,7 @@ pub(crate) fn probe_convert_source_for_message(
                 return match transferred_sidecar_metadata_for_preview(source, carrier_metadata) {
                     Ok(mut metadata) => {
                         if crate::tui::probe::convert_cd_deemphasis_eligible(&info)
+                            && !metadata.convert_preemphasis.explicit_negative
                             && crate::tui::preemphasis::metadata::convert_cue_flag_evidence_for_path(path)
                         {
                             metadata.convert_preemphasis.cue_flag = true;
@@ -1164,6 +1166,7 @@ pub(crate) fn probe_convert_source_for_message(
                 }
             };
             if crate::tui::probe::convert_cd_deemphasis_eligible(&info)
+                && !metadata.convert_preemphasis.explicit_negative
                 && crate::tui::preemphasis::metadata::convert_cue_flag_evidence_for_path(path)
             {
                 metadata.convert_preemphasis.cue_flag = true;
@@ -2100,7 +2103,9 @@ pub(crate) fn spawn_convert_deemphasis_batch_preflight(
                 } else {
                     ConvertPreemphasisEvidence::default()
                 };
-                evidence.cue_flag = eligible && cue_evidence.contains(&path);
+                evidence.cue_flag = eligible
+                    && !evidence.explicit_negative
+                    && cue_evidence.contains(&path);
                 results.push((
                     path,
                     ConvertDeemphasisPathState { eligible, evidence },
@@ -4279,6 +4284,7 @@ mod clamp_pill_tests {
         let mut format = eligible_deemphasis_state();
         format.set_convert_deemphasis_evidence(&super::ConvertPreemphasisEvidence {
             explicit_affirmative: true,
+            explicit_negative: false,
             cue_flag: false,
             catalog_number: None,
             catalog_exact: false,
@@ -4315,6 +4321,7 @@ mod clamp_pill_tests {
         let mut format = eligible_deemphasis_state();
         format.set_convert_deemphasis_evidence(&super::ConvertPreemphasisEvidence {
             explicit_affirmative: true,
+            explicit_negative: false,
             cue_flag: false,
             catalog_number: None,
             catalog_exact: false,
@@ -4362,6 +4369,7 @@ mod clamp_pill_tests {
         let mut format = eligible_deemphasis_state();
         format.set_convert_deemphasis_evidence(&super::ConvertPreemphasisEvidence {
             explicit_affirmative: true,
+            explicit_negative: false,
             cue_flag: false,
             catalog_number: None,
             catalog_exact: false,
@@ -4403,6 +4411,7 @@ mod clamp_pill_tests {
         format.bit_depth.select_value(&super::BitDepthChoice::Int24);
         format.set_convert_deemphasis_evidence(&super::ConvertPreemphasisEvidence {
             explicit_affirmative: false,
+            explicit_negative: false,
             cue_flag: false,
             catalog_number: Some("35DP 150".to_owned()),
             catalog_exact: true,
@@ -4417,6 +4426,7 @@ mod clamp_pill_tests {
         format.bit_depth.select_value(&super::BitDepthChoice::Int24);
         format.set_convert_deemphasis_evidence(&super::ConvertPreemphasisEvidence {
             explicit_affirmative: false,
+            explicit_negative: false,
             cue_flag: true,
             catalog_number: Some("35DP 150".to_owned()),
             catalog_exact: true,
@@ -4440,12 +4450,35 @@ mod clamp_pill_tests {
         format.bit_depth.select_value(&super::BitDepthChoice::Int24);
         format.set_convert_deemphasis_evidence(&super::ConvertPreemphasisEvidence {
             explicit_affirmative: true,
+            explicit_negative: false,
             cue_flag: true,
             catalog_number: Some("35DP 150".to_owned()),
             catalog_exact: true,
         });
         assert_eq!(format.deemphasis_evidence, super::ConvertDeemphasisEvidence::ExplicitTag);
         assert!(format.deemphasis_enabled);
+    }
+
+    #[test]
+    fn explicit_negative_tag_suppresses_all_convert_advisory_evidence() {
+        let mut format = eligible_deemphasis_state();
+        format.bit_depth.select_value(&super::BitDepthChoice::Int24);
+        format.set_convert_deemphasis_evidence(&super::ConvertPreemphasisEvidence {
+            explicit_affirmative: true,
+            explicit_negative: true,
+            cue_flag: true,
+            catalog_number: Some("35DP 150".to_owned()),
+            catalog_exact: true,
+        });
+
+        assert_eq!(format.deemphasis_evidence, super::ConvertDeemphasisEvidence::None);
+        assert_eq!(format.deemphasis_explicit_count, 0);
+        assert_eq!(format.deemphasis_cue_count, 0);
+        assert_eq!(format.deemphasis_catalog_count, 0);
+        assert!(!format.deemphasis_enabled);
+        assert!(!format
+            .pane_rows(false)
+            .contains(&super::FormatPaneRow::Field(super::FormatField::Deemphasis)));
     }
 
     #[test]
@@ -4456,6 +4489,7 @@ mod clamp_pill_tests {
 
         format.set_convert_deemphasis_evidence(&super::ConvertPreemphasisEvidence {
             explicit_affirmative: true,
+            explicit_negative: false,
             cue_flag: false,
             catalog_number: None,
             catalog_exact: false,
@@ -6465,7 +6499,9 @@ impl FormatState {
 
     /// Install narrow source evidence without broadening the generic detector.
     pub fn set_convert_deemphasis_evidence(&mut self, evidence: &ConvertPreemphasisEvidence) {
-        self.deemphasis_evidence = if evidence.explicit_affirmative {
+        self.deemphasis_evidence = if evidence.explicit_negative {
+            ConvertDeemphasisEvidence::None
+        } else if evidence.explicit_affirmative {
             ConvertDeemphasisEvidence::ExplicitTag
         } else if evidence.cue_flag {
             ConvertDeemphasisEvidence::CueFlag
@@ -6474,13 +6510,22 @@ impl FormatState {
         } else {
             ConvertDeemphasisEvidence::None
         };
-        self.deemphasis_explicit_count = if evidence.explicit_affirmative { 1 } else { 0 };
-        self.deemphasis_cue_count = if !evidence.explicit_affirmative && evidence.cue_flag {
+        self.deemphasis_explicit_count =
+            if !evidence.explicit_negative && evidence.explicit_affirmative {
+                1
+            } else {
+                0
+            };
+        self.deemphasis_cue_count = if !evidence.explicit_negative
+            && !evidence.explicit_affirmative
+            && evidence.cue_flag
+        {
             1
         } else {
             0
         };
-        self.deemphasis_catalog_count = if !evidence.explicit_affirmative
+        self.deemphasis_catalog_count = if !evidence.explicit_negative
+            && !evidence.explicit_affirmative
             && !evidence.cue_flag
             && evidence.catalog_exact
         {
@@ -19701,7 +19746,6 @@ mod app_startup_options_tests {
         // Build a complete current schema first, then reconstruct the v23
         // queue authority exactly enough to exercise the real v23 -> v24
         // activation boundary rather than relying on a version-only stub.
-        let _coordination = crate::concurrency::scoped_test_coordination_root();
         drop(crate::db::Database::open_path(&db_path).expect("initialize current database"));
         {
             let conn = rusqlite::Connection::open(&db_path).expect("open database for v23 fixture");

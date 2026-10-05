@@ -6588,7 +6588,11 @@ fn handle_convert_deemphasis_batch_preflight_complete(
         .source
         .deemphasis_batch_preflight
         .values()
-        .filter(|state| state.eligible && state.evidence.explicit_affirmative)
+        .filter(|state| {
+            state.eligible
+                && !state.evidence.explicit_negative
+                && state.evidence.explicit_affirmative
+        })
         .count();
     let cue_count = app
         .convert
@@ -6597,6 +6601,7 @@ fn handle_convert_deemphasis_batch_preflight_complete(
         .values()
         .filter(|state| {
             state.eligible
+                && !state.evidence.explicit_negative
                 && !state.evidence.explicit_affirmative
                 && state.evidence.cue_flag
         })
@@ -6608,6 +6613,7 @@ fn handle_convert_deemphasis_batch_preflight_complete(
         .values()
         .filter(|state| {
             state.eligible
+                && !state.evidence.explicit_negative
                 && !state.evidence.explicit_affirmative
                 && !state.evidence.cue_flag
                 && state.evidence.catalog_exact

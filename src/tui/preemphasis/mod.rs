@@ -143,13 +143,17 @@ pub(crate) fn detect_preemphasis_metadata_catalog_for_cue_track(
 /// callers must apply `preemphasis_advisory_for_source` once `SourceInfo` is
 /// available.
 pub fn detect_preemphasis_advisory(path: &std::path::Path) -> Option<PreemphasisAdvisory> {
-    if metadata::check_pre_flag_tag_evidence(path).is_some() {
-        return Some(PreemphasisAdvisory {
-            evidence: PreemphasisAdvisoryEvidence::ExplicitTag,
-            confidence: PreemphasisConfidence::Detected,
-            catalog: None,
-            detail: "PRE tag".to_string(),
-        });
+    match metadata::check_pre_flag_tag_disposition(path) {
+        metadata::PreemphasisTagDisposition::Negative => return None,
+        metadata::PreemphasisTagDisposition::Affirmative => {
+            return Some(PreemphasisAdvisory {
+                evidence: PreemphasisAdvisoryEvidence::ExplicitTag,
+                confidence: PreemphasisConfidence::Detected,
+                catalog: None,
+                detail: "PRE tag".to_string(),
+            });
+        }
+        metadata::PreemphasisTagDisposition::None => {}
     }
     if metadata::check_cue_evidence(path).is_some() {
         return Some(PreemphasisAdvisory {
@@ -178,13 +182,17 @@ fn detect_preemphasis_advisory_for_cue_track(
     path: &std::path::Path,
     cue_track_has_pre: bool,
 ) -> Option<PreemphasisAdvisory> {
-    if metadata::check_pre_flag_tag_evidence(path).is_some() {
-        return Some(PreemphasisAdvisory {
-            evidence: PreemphasisAdvisoryEvidence::ExplicitTag,
-            confidence: PreemphasisConfidence::Detected,
-            catalog: None,
-            detail: "PRE tag".to_string(),
-        });
+    match metadata::check_pre_flag_tag_disposition(path) {
+        metadata::PreemphasisTagDisposition::Negative => return None,
+        metadata::PreemphasisTagDisposition::Affirmative => {
+            return Some(PreemphasisAdvisory {
+                evidence: PreemphasisAdvisoryEvidence::ExplicitTag,
+                confidence: PreemphasisConfidence::Detected,
+                catalog: None,
+                detail: "PRE tag".to_string(),
+            });
+        }
+        metadata::PreemphasisTagDisposition::None => {}
     }
     if cue_track_has_pre {
         return Some(PreemphasisAdvisory {

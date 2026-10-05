@@ -43,8 +43,10 @@ impl PreemphasisEvidence {
 /// Check audio file tags for pre-emphasis indicators via lofty.
 /// Returns the evidence type if found.
 pub fn check_tag_evidence(audio_path: &Path) -> Option<PreemphasisEvidence> {
-    if let Some(evidence) = check_pre_flag_tag_evidence(audio_path) {
-        return Some(evidence);
+    match check_pre_flag_tag_disposition(audio_path) {
+        PreemphasisTagDisposition::Negative => return None,
+        PreemphasisTagDisposition::Affirmative => return Some(PreemphasisEvidence::Tag),
+        PreemphasisTagDisposition::None => {}
     }
 
     use lofty::file::TaggedFileExt;
@@ -64,36 +66,75 @@ pub fn check_tag_evidence(audio_path: &Path) -> Option<PreemphasisEvidence> {
     None
 }
 
+/// Categorical state of explicit PRE metadata.
+///
+/// A negative value wins even if the same carrier also contains an affirmative
+/// alias. This fail-closed rule prevents stale/duplicated metadata from
+/// resurrecting CUE or catalog advisories after TonePoet has applied
+/// de-emphasis and written `PRE_EMPHASIS=0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreemphasisTagDisposition {
+    None,
+    Affirmative,
+    Negative,
+}
+
 /// Check only explicit metadata PRE flag fields, excluding COMMENT heuristics.
 /// This is the tag-tier function used by the Phase 2 metadata editor path.
 pub fn check_pre_flag_tag_evidence(audio_path: &Path) -> Option<PreemphasisEvidence> {
-    use lofty::file::TaggedFileExt;
-    use lofty::tag::ItemKey;
+    (check_pre_flag_tag_disposition(audio_path) == PreemphasisTagDisposition::Affirmative)
+        .then_some(PreemphasisEvidence::Tag)
+}
 
-    let tagged = lofty::read_from_path(audio_path).ok()?;
-    for tag in tagged.tags() {
-        let pe_keys = [
-            ItemKey::Unknown("PRE_EMPHASIS".to_string()),
-            ItemKey::Unknown("PRE-EMPHASIS".to_string()),
-            ItemKey::Unknown("PRE EMPHASIS".to_string()),
-            ItemKey::Unknown("PREEMPHASIS".to_string()),
-            ItemKey::Unknown("Pre-emphasis".to_string()),
-            ItemKey::Unknown("Pre Emphasis".to_string()),
-            ItemKey::Unknown("Preemphasis".to_string()),
-            ItemKey::Unknown("pre_emphasis".to_string()),
-            ItemKey::Unknown("pre-emphasis".to_string()),
-            ItemKey::Unknown("pre emphasis".to_string()),
-            ItemKey::Unknown("preemphasis".to_string()),
-        ];
-        for key in &pe_keys {
-            if let Some(val) = tag.get_string(key) {
-                if is_affirmative_preemphasis_value(val) {
-                    return Some(PreemphasisEvidence::Tag);
-                }
+/// Inspect explicit metadata PRE fields once and retain a categorical negative.
+pub(crate) fn check_pre_flag_tag_disposition(audio_path: &Path) -> PreemphasisTagDisposition {
+    use lofty::file::TaggedFileExt;
+
+    let Ok(tagged) = lofty::read_from_path(audio_path) else {
+        return PreemphasisTagDisposition::None;
+    };
+    preemphasis_tag_disposition_from_tags(tagged.tags())
+}
+
+fn preemphasis_tag_disposition_from_tags(
+    tags: &[lofty::tag::Tag],
+) -> PreemphasisTagDisposition {
+    use lofty::tag::{ItemKey, ItemValue};
+
+    let pe_keys = [
+        ItemKey::Unknown("PRE_EMPHASIS".to_string()),
+        ItemKey::Unknown("PRE-EMPHASIS".to_string()),
+        ItemKey::Unknown("PRE EMPHASIS".to_string()),
+        ItemKey::Unknown("PREEMPHASIS".to_string()),
+        ItemKey::Unknown("Pre-emphasis".to_string()),
+        ItemKey::Unknown("Pre Emphasis".to_string()),
+        ItemKey::Unknown("Preemphasis".to_string()),
+        ItemKey::Unknown("pre_emphasis".to_string()),
+        ItemKey::Unknown("pre-emphasis".to_string()),
+        ItemKey::Unknown("pre emphasis".to_string()),
+        ItemKey::Unknown("preemphasis".to_string()),
+    ];
+    let mut affirmative = false;
+    for tag in tags {
+        for item in tag
+            .items()
+            .filter(|item| pe_keys.iter().any(|key| item.key() == key))
+        {
+            let value = match item.value() {
+                ItemValue::Text(value) | ItemValue::Locator(value) => value,
+                ItemValue::Binary(_) => continue,
+            };
+            if is_negative_preemphasis_value(value) {
+                return PreemphasisTagDisposition::Negative;
             }
+            affirmative |= is_affirmative_preemphasis_value(value);
         }
     }
-    None
+    if affirmative {
+        PreemphasisTagDisposition::Affirmative
+    } else {
+        PreemphasisTagDisposition::None
+    }
 }
 
 /// Check associated CUE files for explicit FLAGS PRE evidence.
@@ -971,6 +1012,10 @@ fn is_affirmative_preemphasis_value(value: &str) -> bool {
     crate::convert::pipeline::is_affirmative_preemphasis_value(value)
 }
 
+fn is_negative_preemphasis_value(value: &str) -> bool {
+    crate::convert::pipeline::is_negative_preemphasis_value(value)
+}
+
 fn comment_has_positive_preemphasis(comment: &str) -> bool {
     text_has_positive_preemphasis_statement(comment) || is_bare_preemphasis_text(comment)
 }
@@ -1212,8 +1257,59 @@ fn normalized_path_text(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lofty::tag::{ItemKey, ItemValue, Tag, TagItem, TagType};
     use std::env;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn native_tag(key: &str, value: &str) -> Tag {
+        let mut tag = Tag::new(TagType::VorbisComments);
+        tag.push_unchecked(TagItem::new(
+            ItemKey::Unknown(key.to_owned()),
+            ItemValue::Text(value.to_owned()),
+        ));
+        tag
+    }
+
+    #[test]
+    fn explicit_negative_preemphasis_tag_is_categorical_over_positive_aliases() {
+        for value in ["0", "NO", "no", " No "] {
+            let negative = native_tag("PRE_EMPHASIS", value);
+            assert_eq!(
+                preemphasis_tag_disposition_from_tags(&[negative]),
+                PreemphasisTagDisposition::Negative,
+                "{value}",
+            );
+        }
+
+        let positive = native_tag("PRE-EMPHASIS", "YES");
+        let negative = native_tag("PRE_EMPHASIS", "0");
+        assert_eq!(
+            preemphasis_tag_disposition_from_tags(&[positive, negative]),
+            PreemphasisTagDisposition::Negative,
+        );
+
+        let mut duplicate = native_tag("PRE_EMPHASIS", "YES");
+        duplicate.push_unchecked(TagItem::new(
+            ItemKey::Unknown("PRE_EMPHASIS".to_owned()),
+            ItemValue::Text("0".to_owned()),
+        ));
+        assert_eq!(
+            preemphasis_tag_disposition_from_tags(&[duplicate]),
+            PreemphasisTagDisposition::Negative,
+        );
+    }
+
+    #[test]
+    fn unsupported_negative_spellings_do_not_invent_new_semantics() {
+        for value in ["false", "off", "n", ""] {
+            let tag = native_tag("PRE_EMPHASIS", value);
+            assert_eq!(
+                preemphasis_tag_disposition_from_tags(&[tag]),
+                PreemphasisTagDisposition::None,
+                "{value}",
+            );
+        }
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let mut path = env::temp_dir();

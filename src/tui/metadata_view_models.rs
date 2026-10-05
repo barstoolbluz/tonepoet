@@ -617,7 +617,9 @@ fn metadata_preemphasis_status(state: &MetadataEditorState) -> String {
     let values: Vec<String> = metadata_details_files_for_display(state)
         .iter()
         .map(|file| {
-            if explicit_preemphasis_tag_for_file(state, &file.file_facts.path) {
+            if explicit_negative_preemphasis_tag_for_file(state, &file.file_facts.path) {
+                "Not detected".to_string()
+            } else if explicit_preemphasis_tag_for_file(state, &file.file_facts.path) {
                 "Detected (PRE flag)".to_string()
             } else {
                 preemphasis_status_for_file(file)
@@ -625,6 +627,20 @@ fn metadata_preemphasis_status(state: &MetadataEditorState) -> String {
         })
         .collect();
     same_or_multiple(values)
+}
+
+fn explicit_negative_preemphasis_tag_for_file(state: &MetadataEditorState, path: &Path) -> bool {
+    let surface = state.active_surface();
+    let Some(file_index) = surface.paths.iter().position(|candidate| candidate == path) else {
+        return false;
+    };
+
+    surface.entries.iter().any(|entry| {
+        entry.display_key.eq_ignore_ascii_case("PRE_EMPHASIS")
+            && entry.per_file_values.get(file_index).is_some_and(|value| {
+                crate::convert::pipeline::is_negative_preemphasis_value(value)
+            })
+    })
 }
 
 fn explicit_preemphasis_tag_for_file(state: &MetadataEditorState, path: &Path) -> bool {
@@ -1907,6 +1923,21 @@ mod tests {
 
         assert_eq!(details_value(&vm, "Pre-emphasis"), Some("Detected (PRE flag)"));
         assert!(!cue_flags_contain_pre_token("PRESENT DCPRE"));
+    }
+
+    #[test]
+    fn explicit_negative_preemphasis_tag_suppresses_stale_cue_and_analysis_evidence() {
+        let mut file = file_with_probe("/tmp/deemphasized.flac", "flac", "flac", Some(16));
+        file.analysis_facts.preemphasis =
+            Some(crate::tui::preemphasis::PreemphasisConfidence::Detected);
+        file.analysis_facts.preemphasis_detail = Some("CUE FLAGS PRE".to_string());
+        let mut state = details_state_for_file(file);
+        push_file_tag(&mut state, "CUE_FLAGS", "DCP PRE");
+        push_file_tag(&mut state, "PRE_EMPHASIS", "NO");
+
+        let vm = build_details_view_model(&state);
+
+        assert_eq!(details_value(&vm, "Pre-emphasis"), Some("Not detected"));
     }
 
     #[test]

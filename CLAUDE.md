@@ -279,7 +279,8 @@ cargo test -p tonepoet-true-peak   # BS.1770 true-peak + loudness core (~41 min)
 Tests are in `crates/*/tests/` directories, `src/` (inline `#[cfg(test)]` modules), and `tests/` (integration/contract/sentinel tests). The workspace suite is ~7,210 tests across 57 targets, plus 160 in `tonepoet-true-peak`.
 NEVER truncate failure output.
 
-**The suite is 7348 tests across 63 targets.** As of 2026-10-05 three consecutive
+**The suite is 7361 tests across 63 targets.** A fully clean 7361/0 was observed on
+2026-10-05 after the R30 pre-emphasis work landed. As of 2026-10-05 three consecutive
 runs each came back 7347 / 1 with a *different* contention flake, every one passing
 3/3 in isolation — `tui::probe::id3_numbering_alias_conflicts…`,
 `tui::keybindings::permanent_delete_is_blocked_by_recovery_reserved_claim`,

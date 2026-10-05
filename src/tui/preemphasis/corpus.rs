@@ -389,11 +389,19 @@ fn train_corpus_blocking(dir: &std::path::Path) -> Result<CorpusModel, String> {
         return Err(format!("no audio files found in {}", dir.display()));
     }
 
-    // Filter out files with pre-emphasis indicators.
+    // Filter out files with pre-emphasis indicators. An explicit R30 negative
+    // is categorical here too: stale CUE/log evidence must not exclude an
+    // already-de-emphasized output from the non-PE corpus.
     let mut non_pe_files: Vec<std::path::PathBuf> = Vec::new();
     for path in &audio_files {
-        let has_pe = super::metadata::check_tag_evidence(path).is_some()
-            || super::metadata::check_file_evidence(path).is_some();
+        let has_pe = match super::metadata::check_pre_flag_tag_disposition(path) {
+            super::metadata::PreemphasisTagDisposition::Negative => false,
+            super::metadata::PreemphasisTagDisposition::Affirmative => true,
+            super::metadata::PreemphasisTagDisposition::None => {
+                super::metadata::check_tag_evidence(path).is_some()
+                    || super::metadata::check_file_evidence(path).is_some()
+            }
+        };
         if !has_pe {
             non_pe_files.push(path.clone());
         }
