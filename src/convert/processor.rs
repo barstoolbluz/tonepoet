@@ -12776,6 +12776,7 @@ FILE "disc2.flac" WAVE
             realized_path: temp.path().join("realized.wav"),
             realized_dsd_dst_stats: None,
             scalar_pump: None,
+            preparation_commands: Vec::new(),
             req: request,
             staging_root: temp.path().join("staging"),
             staging_job: "processor-limit-job".to_string(),

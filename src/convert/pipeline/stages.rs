@@ -3875,6 +3875,11 @@ pub struct ScheduledRealizedTrack {
     pub realized_path: PathBuf,
     pub realized_dsd_dst_stats: Option<DsdDstPipelineStats>,
     pub(crate) scalar_pump: Option<RetainedPcmScalarPump>,
+    /// Audio-processing commands that already ran while preparing this track
+    /// for the encode work unit (currently registered-effect carrier work).
+    /// They must stay ordered ahead of the later terminal commands in the
+    /// durable conversion log.
+    pub(crate) preparation_commands: Vec<CommandRecord>,
     pub req: PipelineRequest,
     pub staging_root: PathBuf,
     pub staging_job: String,
@@ -4815,6 +4820,7 @@ async fn convert_one_track_work(
 ) -> Result<ScheduledTrackOutput, String> {
     let staging = StagingDir::borrowed(staging_root, staging_job);
     let staged_path = staged_audio_path(&convert_root, &final_path, &track.id, &req.settings.target_format);
+    let mut preparation_commands = Vec::new();
     let track = match prepare_track_scoped_certified_true_peak_carrier(
         &req,
         track.clone(),
@@ -4824,6 +4830,7 @@ async fn convert_one_track_work(
         &cancel,
         &tool_paths,
         tool_concurrency_limits.clone(),
+        &mut preparation_commands,
     )
     .await
     {
@@ -4833,7 +4840,7 @@ async fn convert_one_track_work(
                 &track,
                 None,
                 Some(staged_path),
-                Vec::new(),
+                preparation_commands,
                 err,
             );
             return Ok(ScheduledTrackOutput {
@@ -4861,7 +4868,13 @@ async fn convert_one_track_work(
     {
         Ok(realized) => realized,
         Err(err) => {
-            let record = failed_track_record(&track, None, Some(staged_path), Vec::new(), err.to_string());
+            let record = failed_track_record(
+                &track,
+                None,
+                Some(staged_path),
+                preparation_commands,
+                err.to_string(),
+            );
             return Ok(ScheduledTrackOutput { index: track_index, record, artifact: None, ok: false, metadata_satisfaction: PlannedMetadataSatisfaction::none() });
         }
     };
@@ -4882,7 +4895,7 @@ async fn convert_one_track_work(
                 &track,
                 None,
                 Some(staged_path),
-                Vec::new(),
+                preparation_commands,
                 err.to_string(),
             );
             return Ok(ScheduledTrackOutput {
@@ -4908,11 +4921,13 @@ async fn convert_one_track_work(
     {
         Ok(input) => input,
         Err((error, commands)) => {
+            let mut all_commands = preparation_commands;
+            all_commands.extend(commands);
             let record = failed_track_record(
                 &track,
                 None,
                 Some(staged_path),
-                commands,
+                all_commands,
                 error,
             );
             return Ok(ScheduledTrackOutput {
@@ -4929,9 +4944,12 @@ async fn convert_one_track_work(
         realized_input,
         scalar_pump,
         certified_true_peak_execution,
-        prefix_commands,
-        prefix_elapsed,
+        prefix_commands: final_prefix_commands,
+        prefix_elapsed: final_prefix_elapsed,
     } = final_input;
+    let mut prefix_commands = preparation_commands;
+    prefix_commands.extend(final_prefix_commands);
+    let prefix_elapsed = final_prefix_elapsed;
 
     if let Some(parent) = staged_path.parent() {
         if let Err(err) = fs::create_dir_all(parent) {
@@ -4939,7 +4957,7 @@ async fn convert_one_track_work(
                 &track,
                 Some(realized_input),
                 Some(staged_path),
-                Vec::new(),
+                prefix_commands,
                 format!("could not create output directory: {err}"),
             );
             return Ok(ScheduledTrackOutput { index: track_index, record, artifact: None, ok: false, metadata_satisfaction: PlannedMetadataSatisfaction::none() });
@@ -40052,6 +40070,7 @@ async fn prepare_registered_effect_carrier_for_track(
     cancel: &CancellationToken,
     tool_paths: &HashMap<String, PathBuf>,
     tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
+    preparation_commands: &mut Vec<CommandRecord>,
 ) -> Result<PreparedTrack, String> {
     if req.registered_effects.is_empty() {
         return Ok(track);
@@ -40193,11 +40212,12 @@ async fn prepare_registered_effect_carrier_for_track(
                     base_rate_hz,
                 )
                 .map_err(|error| error.to_string())?;
-                run_dsd_true_peak_planned_command(
+                run_recorded_planned_command(
                     &planned,
                     runner,
                     cancel,
                     tool_concurrency_limits.as_ref(),
+                    preparation_commands,
                 )
                 .await
                 .map_err(|error| {
@@ -40232,11 +40252,12 @@ async fn prepare_registered_effect_carrier_for_track(
                     profile,
                     source.duration,
                 );
-                run_dsd_true_peak_planned_command(
+                run_recorded_planned_command(
                     &protected,
                     runner,
                     cancel,
                     tool_concurrency_limits.as_ref(),
+                    preparation_commands,
                 )
                 .await
                 .map_err(|error| {
@@ -40256,11 +40277,12 @@ async fn prepare_registered_effect_carrier_for_track(
                     let _ = fs::remove_file(&protected_path);
                     error.to_string()
                 })?;
-                let export_result = run_dsd_true_peak_planned_command(
+                let export_result = run_recorded_planned_command(
                     &export,
                     runner,
                     cancel,
                     tool_concurrency_limits.as_ref(),
+                    preparation_commands,
                 )
                 .await;
                 let _ = fs::remove_file(&protected_path);
@@ -40286,7 +40308,7 @@ async fn prepare_registered_effect_carrier_for_track(
             PipelineStage::Convert,
             None,
         );
-        execute_planned_track_conversion(
+        let base_execution = execute_planned_track_conversion(
             &carrier_req,
             &track,
             &realized.path,
@@ -40300,14 +40322,19 @@ async fn prepare_registered_effect_carrier_for_track(
             0.0,
             1.0,
         )
-        .await
-        .map_err(|error| {
-            let _ = fs::remove_file(&carrier_path);
-            format!(
-                "PCM track {} could not realize its no-rate-change Float64 pre-resample carrier: {error}",
-                track.id.source_ordinal,
-            )
-        })?;
+        .await;
+        match base_execution {
+            Ok(executed) => preparation_commands.extend(executed.commands),
+            Err(error) => {
+                let message = error.to_string();
+                preparation_commands.extend(error.commands);
+                let _ = fs::remove_file(&carrier_path);
+                return Err(format!(
+                    "PCM track {} could not realize its no-rate-change Float64 pre-resample carrier: {message}",
+                    track.id.source_ordinal,
+                ));
+            }
+        }
         first_input_is_raw_f64le = false;
     }
 
@@ -40321,7 +40348,7 @@ async fn prepare_registered_effect_carrier_for_track(
                 let _ = fs::remove_file(&carrier_path);
                 return Err("typed pre-resample effect geometry changed after execution binding".to_string());
             }
-            realize_registered_effect_chain(
+            realize_registered_effect_chain_recorded(
                 &pre.lowerings,
                 pre.sample_rate_hz,
                 pre.channels,
@@ -40334,6 +40361,7 @@ async fn prepare_registered_effect_carrier_for_track(
                 runner,
                 cancel,
                 tool_concurrency_limits.as_ref(),
+                preparation_commands,
             )
             .await
             .map_err(|error| {
@@ -40356,11 +40384,12 @@ async fn prepare_registered_effect_carrier_for_track(
             &resampled_path,
             source.duration,
         )?;
-        run_dsd_true_peak_planned_command(
+        run_recorded_planned_command(
             &planned,
             runner,
             cancel,
             tool_concurrency_limits.as_ref(),
+            preparation_commands,
         )
         .await
         .map_err(|error| {
@@ -40390,7 +40419,7 @@ async fn prepare_registered_effect_carrier_for_track(
                 let _ = fs::remove_file(&carrier_path);
                 return Err("typed terminal SSRC resampler cannot feed a post-resample sample-changing effect".to_string());
             }
-            realize_registered_effect_chain(
+            realize_registered_effect_chain_recorded(
                 &post.lowerings,
                 post.sample_rate_hz,
                 post.channels,
@@ -40403,6 +40432,7 @@ async fn prepare_registered_effect_carrier_for_track(
                 runner,
                 cancel,
                 tool_concurrency_limits.as_ref(),
+                preparation_commands,
             )
             .await
             .map_err(|error| {
@@ -40422,7 +40452,7 @@ async fn prepare_registered_effect_carrier_for_track(
         let post = execution.post_resample.as_ref().ok_or_else(|| {
             "registered-effect execution contains neither an effect segment nor a resampler".to_string()
         })?;
-        realize_registered_effect_chain(
+        realize_registered_effect_chain_recorded(
             &post.lowerings,
             post.sample_rate_hz,
             post.channels,
@@ -40435,6 +40465,7 @@ async fn prepare_registered_effect_carrier_for_track(
             runner,
             cancel,
             tool_concurrency_limits.as_ref(),
+            preparation_commands,
         )
         .await
         .map_err(|error| {
@@ -40502,6 +40533,7 @@ async fn prepare_track_scoped_certified_true_peak_carrier(
     cancel: &CancellationToken,
     tool_paths: &HashMap<String, PathBuf>,
     tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
+    preparation_commands: &mut Vec<CommandRecord>,
 ) -> Result<PreparedTrack, String> {
     if !track_scoped_certified_true_peak_requested(req, &track) {
         let source_is_dsd = prepared_track_uses_dsd_source(&track);
@@ -40520,6 +40552,7 @@ async fn prepare_track_scoped_certified_true_peak_carrier(
                 cancel,
                 tool_paths,
                 tool_concurrency_limits,
+                preparation_commands,
             )
             .await;
         }
@@ -40742,6 +40775,7 @@ fn registered_effect_f64le_command(
 #[cfg(test)]
 mod r18_deemphasis_lowering_tests {
     use super::*;
+    use crate::convert::pipeline::tool::{ProcessExit, StubToolRunner, ToolBinary};
 
     fn forced_ssrc_deemphasis_request(
         target_format: tonepoet_pipeline::AudioFormat,
@@ -40921,6 +40955,82 @@ mod r18_deemphasis_lowering_tests {
             }
         ));
     }
+
+    #[tokio::test]
+    async fn r29_recorded_effect_command_keeps_the_actual_successful_invocation() {
+        let planned = registered_sox_effect_f64le_command(
+            &["deemph".to_string()],
+            Path::new("input.f64le"),
+            true,
+            Path::new("effect-001.f64le"),
+            RegisteredEffectOutputCarrier::RawFloat64,
+            44_100,
+            2,
+            None,
+            "Phase-3 registered pre-gain effect",
+        )
+        .expect("de-emphasis command");
+        let runner = StubToolRunner::new();
+        let mut commands = Vec::new();
+
+        run_recorded_planned_command(
+            &planned,
+            &runner,
+            &CancellationToken::new(),
+            None,
+            &mut commands,
+        )
+        .await
+        .expect("recorded de-emphasis command");
+
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].binary, ToolBinary::Sox);
+        assert_eq!(commands[0].sanitized_args, planned.args);
+        assert_eq!(
+            commands[0].description.as_deref(),
+            Some("Phase-3 registered pre-gain effect"),
+        );
+        assert_eq!(commands[0].exit, Some(ProcessExit::Code(0)));
+    }
+
+    #[tokio::test]
+    async fn r29_recorded_effect_command_keeps_the_failed_invocation() {
+        let planned = registered_sox_effect_f64le_command(
+            &["deemph".to_string()],
+            Path::new("input.f64le"),
+            true,
+            Path::new("effect-001.f64le"),
+            RegisteredEffectOutputCarrier::RawFloat64,
+            44_100,
+            2,
+            None,
+            "Phase-3 registered pre-gain effect",
+        )
+        .expect("de-emphasis command");
+        let runner = StubToolRunner::new();
+        runner.push_failure("effect backend failed");
+        let mut commands = Vec::new();
+
+        let error = run_recorded_planned_command(
+            &planned,
+            &runner,
+            &CancellationToken::new(),
+            None,
+            &mut commands,
+        )
+        .await
+        .expect_err("effect command must fail");
+
+        assert!(error.contains("effect backend failed"));
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].binary, ToolBinary::Sox);
+        assert_eq!(commands[0].sanitized_args, planned.args);
+        assert_eq!(
+            commands[0].description.as_deref(),
+            Some("Phase-3 registered pre-gain effect"),
+        );
+        assert_eq!(commands[0].exit, Some(ProcessExit::Code(1)));
+    }
 }
 
 fn fusible_ordinary_sox_highpass_lowpass_pair(
@@ -40967,6 +41077,7 @@ async fn realize_registered_effect_chain(
     cancel: &CancellationToken,
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
 ) -> Result<Duration, String> {
+    let mut ignored_commands = Vec::new();
     realize_registered_effect_chain_impl(
         lowerings,
         sample_rate_hz,
@@ -40980,6 +41091,43 @@ async fn realize_registered_effect_chain(
         runner,
         cancel,
         tool_concurrency_limits,
+        &mut ignored_commands,
+        false,
+        false,
+    )
+    .await
+}
+
+async fn realize_registered_effect_chain_recorded(
+    lowerings: &[tonepoet_pipeline::EffectLowering],
+    sample_rate_hz: u32,
+    channels: u16,
+    first_input_is_raw_f64le: bool,
+    final_output_carrier: RegisteredEffectOutputCarrier,
+    carrier_path: &mut PathBuf,
+    carrier_dir: &Path,
+    track_stem: &str,
+    expected_duration: Option<Duration>,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
+    recorded_commands: &mut Vec<CommandRecord>,
+) -> Result<Duration, String> {
+    realize_registered_effect_chain_impl(
+        lowerings,
+        sample_rate_hz,
+        channels,
+        first_input_is_raw_f64le,
+        final_output_carrier,
+        carrier_path,
+        carrier_dir,
+        track_stem,
+        expected_duration,
+        runner,
+        cancel,
+        tool_concurrency_limits,
+        recorded_commands,
+        true,
         false,
     )
     .await
@@ -41001,6 +41149,8 @@ async fn realize_registered_effect_chain_impl(
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
+    recorded_commands: &mut Vec<CommandRecord>,
+    record_commands: bool,
     allow_ordinary_sox_pair_fusion: bool,
 ) -> Result<Duration, String> {
     if lowerings.is_empty() {
@@ -41044,17 +41194,29 @@ async fn realize_registered_effect_chain_impl(
                 expected_duration,
                 "Phase-3 fused ordinary SoX high/low-pass pair",
             )?;
-            let elapsed = run_dsd_true_peak_planned_command(
-                &planned,
-                runner,
-                cancel,
-                tool_concurrency_limits,
-            )
-            .await
-            .map_err(|error| {
-                let _ = fs::remove_file(&next);
-                format!("registered fused effect pair failed: {error}")
-            })?;
+            let elapsed_result = if record_commands {
+                run_recorded_planned_command(
+                    &planned,
+                    runner,
+                    cancel,
+                    tool_concurrency_limits,
+                    recorded_commands,
+                )
+                .await
+            } else {
+                run_dsd_true_peak_planned_command(
+                    &planned,
+                    runner,
+                    cancel,
+                    tool_concurrency_limits,
+                )
+                .await
+            };
+            let elapsed = elapsed_result
+                .map_err(|error| {
+                    let _ = fs::remove_file(&next);
+                    format!("registered fused effect pair failed: {error}")
+                })?;
             let len = fs::metadata(&next)
                 .map_err(|error| format!("could not stat registered fused effect output {}: {error}", next.display()))?
                 .len();
@@ -41145,17 +41307,29 @@ async fn realize_registered_effect_chain_impl(
             channels,
             expected_duration,
         )?;
-        let effect_elapsed = run_dsd_true_peak_planned_command(
-            &planned,
-            runner,
-            cancel,
-            tool_concurrency_limits,
-        )
-        .await
-        .map_err(|error| {
-            let _ = fs::remove_file(&next);
-            format!("registered effect {} failed: {error}", index + 1)
-        })?;
+        let effect_result = if record_commands {
+            run_recorded_planned_command(
+                &planned,
+                runner,
+                cancel,
+                tool_concurrency_limits,
+                recorded_commands,
+            )
+            .await
+        } else {
+            run_dsd_true_peak_planned_command(
+                &planned,
+                runner,
+                cancel,
+                tool_concurrency_limits,
+            )
+            .await
+        };
+        let effect_elapsed = effect_result
+            .map_err(|error| {
+                let _ = fs::remove_file(&next);
+                format!("registered effect {} failed: {error}", index + 1)
+            })?;
         let len = fs::metadata(&next)
             .map_err(|error| format!("could not stat registered effect output {}: {error}", next.display()))?
             .len();
@@ -41293,6 +41467,45 @@ async fn run_dsd_true_peak_planned_command(
     .await
     .map_err(|error| error.to_string())?;
     Ok(output.elapsed)
+}
+
+async fn run_recorded_planned_command(
+    planned: &tonepoet_pipeline::PlannedCommand,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
+    recorded_commands: &mut Vec<CommandRecord>,
+) -> Result<std::time::Duration, String> {
+    let command = planned_command_to_tool_command(planned, DEFAULT_PLANNED_COMMAND_TIMEOUT)
+        .map_err(|error| error.to_string())?;
+    match run_tool_command_with_concurrency(
+        command,
+        runner,
+        cancel,
+        tool_concurrency_limits,
+    )
+    .await
+    {
+        Ok(mut output) => {
+            let description = planned.description.trim();
+            if !description.is_empty() {
+                output.command.description = Some(description.to_string());
+            }
+            let elapsed = output.elapsed;
+            recorded_commands.push(output.command);
+            Ok(elapsed)
+        }
+        Err(error) => {
+            if let Some(mut command) = command_from_tool_error(&error) {
+                let description = planned.description.trim();
+                if !description.is_empty() {
+                    command.description = Some(description.to_string());
+                }
+                recorded_commands.push(command);
+            }
+            Err(error.to_string())
+        }
+    }
 }
 
 async fn prepare_dsd_true_peak_carrier_for_track(
@@ -44374,6 +44587,7 @@ pub async fn realize_track_for_scheduler_with_tool_limits_and_version_cache(
     let staging = StagingDir::borrowed(staging_root.clone(), staging_job.clone());
     let runner = real_tool_runner_with_optional_version_cache(tool_paths.clone(), version_cache, &req);
     let staged_path = staged_audio_path(&convert_root, &final_path, &track.id, &req.settings.target_format);
+    let mut preparation_commands = Vec::new();
     let track = match prepare_track_scoped_certified_true_peak_carrier(
         &req,
         track.clone(),
@@ -44383,6 +44597,7 @@ pub async fn realize_track_for_scheduler_with_tool_limits_and_version_cache(
         &cancel,
         &tool_paths,
         tool_concurrency_limits.clone(),
+        &mut preparation_commands,
     )
     .await
     {
@@ -44392,7 +44607,7 @@ pub async fn realize_track_for_scheduler_with_tool_limits_and_version_cache(
                 &track,
                 None,
                 Some(staged_path),
-                Vec::new(),
+                preparation_commands,
                 err,
             );
             return Err(ScheduledTrackOutput {
@@ -44436,6 +44651,7 @@ pub async fn realize_track_for_scheduler_with_tool_limits_and_version_cache(
                 realized_path: realized.path,
                 realized_dsd_dst_stats: realized.dsd_dst_stats,
                 scalar_pump: realized.scalar_pump,
+                preparation_commands,
                 req,
                 staging_root,
                 staging_job,
@@ -44447,7 +44663,7 @@ pub async fn realize_track_for_scheduler_with_tool_limits_and_version_cache(
                     &track,
                     None,
                     Some(staged_path),
-                    Vec::new(),
+                    preparation_commands,
                     err.to_string(),
                 );
                 Err(ScheduledTrackOutput {
@@ -44460,7 +44676,13 @@ pub async fn realize_track_for_scheduler_with_tool_limits_and_version_cache(
             }
         },
         Err(err) => {
-            let record = failed_track_record(&track, None, Some(staged_path), Vec::new(), err.to_string());
+            let record = failed_track_record(
+                &track,
+                None,
+                Some(staged_path),
+                preparation_commands,
+                err.to_string(),
+            );
             Err(ScheduledTrackOutput { index: track_index, record, artifact: None, ok: false, metadata_satisfaction: PlannedMetadataSatisfaction::none() })
         }
     }
@@ -44515,7 +44737,7 @@ pub async fn encode_realized_track_for_scheduler_with_tool_limits_and_version_ca
                 &realized.track,
                 Some(realized.realized_path),
                 Some(staged_path),
-                Vec::new(),
+                realized.preparation_commands,
                 format!("could not create output directory: {err}"),
             );
             return Ok(ScheduledTrackOutput { index: realized.index, record, artifact: None, ok: false, metadata_satisfaction: PlannedMetadataSatisfaction::none() });
@@ -44539,11 +44761,13 @@ pub async fn encode_realized_track_for_scheduler_with_tool_limits_and_version_ca
     {
         Ok(input) => input,
         Err((error, commands)) => {
+            let mut all_commands = realized.preparation_commands;
+            all_commands.extend(commands);
             let record = failed_track_record(
                 &realized.track,
                 Some(realized.realized_path.clone()),
                 Some(staged_path),
-                commands,
+                all_commands,
                 error,
             );
             return Ok(ScheduledTrackOutput {
@@ -44560,9 +44784,12 @@ pub async fn encode_realized_track_for_scheduler_with_tool_limits_and_version_ca
         realized_input,
         scalar_pump,
         certified_true_peak_execution,
-        prefix_commands,
-        prefix_elapsed,
+        prefix_commands: final_prefix_commands,
+        prefix_elapsed: final_prefix_elapsed,
     } = final_input;
+    let mut prefix_commands = realized.preparation_commands;
+    prefix_commands.extend(final_prefix_commands);
+    let prefix_elapsed = final_prefix_elapsed;
     let bytes_in = file_len(&realized_input);
     let executed = execute_planned_track_conversion_with_scalar_pump(
         &realized.req,
