@@ -4159,6 +4159,13 @@ Still unknown: whether `lofty` 0.21 can read RF64 at all, or whether the tag
 read for such a file has to be satisfied another way — for instance by the
 same route FFmpeg already uses successfully here.
 
+### Workaround
+
+Convert the album normally and rename the one affected file; its embedded tags
+are already correct. Or rewrite the container first — the payload is under the
+4 GB RIFF ceiling, so `ffmpeg -i in.wav -c copy out.wav` produces a plain RIFF
+file that every path reads.
+
 ### Required
 
 A `.wav` file containing RF64 is treated as the RF64 it is. Its tags and
