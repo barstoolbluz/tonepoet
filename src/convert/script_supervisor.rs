@@ -5156,17 +5156,16 @@ mod tests {
     fn retained_descriptor_executes_reviewed_script_after_path_replacement() {
         use std::io::Read;
         use std::os::fd::{AsRawFd, FromRawFd};
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().unwrap();
         let script = temp.path().join("reviewed.sh");
         let replacement = temp.path().join("replacement.sh");
-        fs::write(&script, b"#!/bin/sh\nprintf 'reviewed-code'\n").unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/test-bin");
+        symlink(fixture_root.join("reviewed-code.sh"), &script).unwrap();
         let retained = File::open(&script).unwrap();
 
-        fs::write(&replacement, b"#!/bin/sh\nprintf 'replacement-code'\n").unwrap();
-        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(fixture_root.join("replacement-code.sh"), &replacement).unwrap();
         fs::rename(&replacement, &script).unwrap();
 
         let mut pipe_fds = [-1_i32; 2];

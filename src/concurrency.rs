@@ -2442,17 +2442,19 @@ pub(crate) fn wait_for_close_driven_lifecycle_release(
     }
 }
 
-/// Wait for a test-created malformed descriptor's transient probe lock to
-/// quiesce without parsing its intentionally invalid body. This is test-only:
-/// production lifecycle cleanup remains fail-closed and does not gain a retry.
+/// Wait for a test-created descriptor's transient probe lock to quiesce.
+/// This is test-only: production lifecycle cleanup remains fail-closed and does
+/// not gain a retry.
 ///
-/// A generic admission scan can successfully lock the malformed descriptor and
-/// then reject its body. Under default parallel libtest execution, an unrelated
+/// A generic admission scan can successfully lock a descriptor while it probes
+/// published authority. Under default parallel libtest execution, an unrelated
 /// fork can inherit that scanner fd before the scanner closes it. Once this
 /// helper acquires the lock, explicitly unlock the shared OFD before closing so
-/// the helper cannot manufacture the same inheritance race itself.
+/// the helper cannot manufacture the same inheritance race itself. A genuine
+/// live owner remains visible until the bounded deadline and therefore still
+/// fails the test.
 #[cfg(all(test, unix))]
-fn wait_for_close_driven_untyped_descriptor_release(path: &Path, context: &str) {
+pub(crate) fn wait_for_close_driven_untyped_descriptor_release(path: &Path, context: &str) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let file = open_existing_descriptor(path)
@@ -2970,6 +2972,15 @@ pub(crate) fn scoped_test_coordination_root() -> ScopedTestCoordinationRootGuard
 pub(crate) fn install_scoped_test_coordination_root(
     path: &Path,
 ) -> ScopedTestCoordinationRootGuard {
+    let process_root = cargo_test_coordination_root()
+        .expect("unit tests must have a process-private coordination root");
+    assert!(
+        path.starts_with(&process_root),
+        "process-visible scoped test coordination roots must live beneath the process-private test root so an unrelated fork/thread cannot retain a path that its owning TempDir later removes: {} (process root {})",
+        path.display(),
+        process_root.display(),
+    );
+    create_private_dir(path).expect("create explicit scoped test coordination root");
     ScopedTestCoordinationRootGuard::install(path.to_path_buf())
 }
 
@@ -4069,9 +4080,13 @@ mod tests {
 
     #[test]
     fn scoped_test_coordination_roots_isolate_durable_state_between_tests() {
-        let parent = tempfile::tempdir().expect("test root parent");
-        let root_a = parent.path().join("test-a");
-        let root_b = parent.path().join("test-b");
+        let parent = cargo_test_coordination_root()
+            .expect("unit tests must have a process-private coordination root")
+            .join("explicit-scope-isolation")
+            .join(Uuid::new_v4().to_string());
+        create_private_dir(&parent).expect("stable explicit-scope test parent");
+        let root_a = parent.join("test-a");
+        let root_b = parent.join("test-b");
         let family = LeaseFamily::JournalOperation {
             job_id: Uuid::new_v4(),
         };

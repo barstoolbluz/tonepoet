@@ -455,17 +455,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn executable_test_script(path: &Path, body: &str) {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::write(path, body).expect("write editor fixture");
-        let mut permissions = std::fs::metadata(path)
-            .expect("stat editor fixture")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(path, permissions).expect("chmod editor fixture");
-    }
-
-    #[cfg(unix)]
     fn wait_for_file(path: &Path) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !path.exists() {
@@ -487,20 +476,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let target = dir.path().join("notes.txt");
         std::fs::write(&target, b"notes\n").expect("write target");
-        let editor = dir.path().join("editor.sh");
-        executable_test_script(
-            &editor,
-            r#"#!/bin/sh
-set -eu
-folder=$(dirname "$1")
-self_pgid=$(ps -o pgid= -p $$ | tr -d ' ')
-parent_pgid=$(ps -o pgid= -p "$PPID" | tr -d ' ')
-printf '%s %s\n' "$self_pgid" "$parent_pgid" > "$folder/pgids"
-: > "$folder/started"
-while [ ! -e "$folder/release" ]; do sleep 0.01; done
-kill -TERM $$
-"#,
-        );
+        let editor = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/test-bin/foreground-editor-signal.sh");
 
         let terminal_state = std::sync::Arc::new(FakeTerminalState::default());
         terminal_state.raw_mode.store(true, Ordering::SeqCst);
@@ -560,8 +537,8 @@ kill -TERM $$
         let target = dir.path().join("notes.md");
         std::fs::write(&target, b"notes\n").expect("write target");
 
-        let nonzero = dir.path().join("nonzero.sh");
-        executable_test_script(&nonzero, "#!/bin/sh\nexit 7\n");
+        let nonzero = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/test-bin/exit-7.sh");
         let state = std::sync::Arc::new(FakeTerminalState::default());
         state.raw_mode.store(true, Ordering::SeqCst);
         state.alternate_screen.store(true, Ordering::SeqCst);

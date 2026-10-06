@@ -279,11 +279,22 @@ cargo test -p tonepoet-true-peak   # BS.1770 true-peak + loudness core (~41 min)
 Tests are in `crates/*/tests/` directories, `src/` (inline `#[cfg(test)]` modules), and `tests/` (integration/contract/sentinel tests). The workspace suite is ~7,210 tests across 57 targets, plus 160 in `tonepoet-true-peak`.
 NEVER truncate failure output.
 
-**The suite is 7363 tests across 63 targets.** A fully clean 7363/0 was observed on
-2026-10-06 after R31-R34. The long-standing coordination flake is much reduced but
-not gone: measured per-run failure rates across twelve-run samples fell 0.40 (R31),
-0.30 (R32), 0.25 (R33), 0.17 (R34). Expect an occasional single failure that passes
-in isolation; rerun rather than 'fixing' it by serializing the suite. As of 2026-10-05 three consecutive
+**The suite is 7363 tests across 63 targets.** As of 2026-10-06, after R31-R35, the
+long-standing coordination flake appears resolved: **12/12 consecutive unserialized
+`-p tonepoet --lib` runs clean**, and a full gate at 7363/0. Measured per-run failure
+rates fell across the series: 0.40 (R31), 0.30 (R32), 0.25 (R33), 0.17 (R34), 0.00
+over twelve runs (R35).
+
+Root causes, all test-only, none a production defect:
+- tests asserted immediate observation of state driven by a descriptor closing, which
+  an unrelated worker's fork could falsify by holding an inherited copy until exec;
+- some tests observed a lock their own probe had created;
+- tests wrote an executable at runtime and immediately exec'd it, racing to ETXTBSY;
+- a process-visible coordination root under a TempDir could be removed while another
+  worker still held the path, giving ENOENT on lease staging.
+
+If a single failure reappears, rerun and check whether it passes in isolation before
+treating it as a regression. Do not serialize the harness. As of 2026-10-05 three consecutive
 runs each came back 7347 / 1 with a *different* contention flake, every one passing
 3/3 in isolation — `tui::probe::id3_numbering_alias_conflicts…`,
 `tui::keybindings::permanent_delete_is_blocked_by_recovery_reserved_claim`,

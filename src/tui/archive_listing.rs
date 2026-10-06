@@ -1161,8 +1161,6 @@ Encrypted = -
 
     #[cfg(unix)]
     fn fake_password_listing_tool(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
-
         let tool = temp.path().join("fake-7z");
         let log = temp.path().join("attempts.log");
         let script = format!(
@@ -1214,19 +1212,12 @@ esac
 "#,
             log.display()
         );
-        std::fs::write(&tool, script).expect("fake 7z script");
-        let mut permissions = std::fs::metadata(&tool)
-            .expect("fake 7z metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&tool, permissions).expect("make fake 7z executable");
+        crate::convert::pipeline::tool::install_executable_test_script(&tool, &script);
         (tool, log)
     }
 
     #[cfg(unix)]
     fn fake_plaintext_listing_tool(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
-
         let tool = temp.path().join("fake-plaintext-7z");
         let log = temp.path().join("plaintext-attempts.log");
         let script = format!(
@@ -1254,19 +1245,12 @@ exit 0
 "#,
             log.display()
         );
-        std::fs::write(&tool, script).expect("fake plaintext 7z script");
-        let mut permissions = std::fs::metadata(&tool)
-            .expect("fake plaintext 7z metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&tool, permissions).expect("make fake plaintext 7z executable");
+        crate::convert::pipeline::tool::install_executable_test_script(&tool, &script);
         (tool, log)
     }
 
     #[cfg(unix)]
     fn fake_header_encrypted_listing_tool(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
-
         let tool = temp.path().join("fake-header-encrypted-7z");
         let log = temp.path().join("header-encrypted-attempts.log");
         let script = format!(
@@ -1301,13 +1285,7 @@ exit 0
 "#,
             log.display()
         );
-        std::fs::write(&tool, script).expect("fake header-encrypted 7z script");
-        let mut permissions = std::fs::metadata(&tool)
-            .expect("fake header-encrypted 7z metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&tool, permissions)
-            .expect("make fake header-encrypted 7z executable");
+        crate::convert::pipeline::tool::install_executable_test_script(&tool, &script);
         (tool, log)
     }
 

@@ -22,6 +22,7 @@ static TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
 struct Fixture {
     _temp: TempDir,
     script: PathBuf,
+    script_body: PathBuf,
     runtime: PathBuf,
     runtime_identity: RuntimeDirectoryIdentity,
 }
@@ -29,12 +30,20 @@ struct Fixture {
 impl Fixture {
     fn new(body: &str) -> Self {
         let temp = tempfile::tempdir().expect("create fixture directory");
-        let script = temp.path().join("fixture-script");
-        fs::write(&script, format!("#!/bin/sh\nset -eu\n{body}\n"))
-            .expect("write executable fixture");
-        let mut permissions = fs::metadata(&script).expect("script metadata").permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&script, permissions).expect("chmod executable fixture");
+        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/test-bin/runtime-script-launcher.sh");
+        let script_body = temp.path().join("fixture-script.body");
+        fs::write(&script_body, format!("#!/bin/sh\nset -eu\n{body}\n"))
+            .expect("write non-executable fixture body");
+        assert_eq!(
+            fs::metadata(&script_body)
+                .expect("fixture body metadata")
+                .permissions()
+                .mode()
+                & 0o111,
+            0,
+            "runtime-written fixture body must not be executable",
+        );
 
         let runtime = temp.path().join("runtime");
         fs::create_dir(&runtime).expect("create private runtime directory");
@@ -47,6 +56,7 @@ impl Fixture {
         Self {
             _temp: temp,
             script,
+            script_body,
             runtime,
             runtime_identity: RuntimeDirectoryIdentity {
                 device: metadata.dev(),
@@ -74,6 +84,10 @@ impl Fixture {
             environment: BTreeMap::from([
                 ("PATH".to_string(), "/usr/bin:/bin".to_string()),
                 ("TONEPOET_TEST".to_string(), "literal value".to_string()),
+                (
+                    "TONEPOET_TEST_SCRIPT_BODY".to_string(),
+                    self.script_body.to_string_lossy().into_owned(),
+                ),
             ]),
             timeout,
             runtime_identity: self.runtime_identity,
@@ -437,6 +451,8 @@ fn application_crash_driver() {
     );
     let released_path = PathBuf::from(std::env::var_os("TONEPOET_CRASH_RELEASED").unwrap());
     let heartbeat = PathBuf::from(std::env::var_os("TONEPOET_CRASH_HEARTBEAT").unwrap());
+    let script_body =
+        PathBuf::from(std::env::var_os("TONEPOET_CRASH_SCRIPT_BODY").unwrap());
     let metadata = fs::metadata(&runtime).unwrap();
     let script_file = Arc::new(File::open(&script).expect("open retained crash-driver script"));
     let working_directory_file = Arc::new(
@@ -455,6 +471,10 @@ fn application_crash_driver() {
             (
                 "TONEPOET_HEARTBEAT".to_string(),
                 heartbeat.to_string_lossy().into_owned(),
+            ),
+            (
+                "TONEPOET_TEST_SCRIPT_BODY".to_string(),
+                script_body.to_string_lossy().into_owned(),
             ),
         ]),
         timeout: Duration::from_secs(60),
@@ -511,6 +531,7 @@ done
         .arg("--nocapture")
         .env("TONEPOET_CRASH_DRIVER", "1")
         .env("TONEPOET_CRASH_SCRIPT", &fixture.script)
+        .env("TONEPOET_CRASH_SCRIPT_BODY", &fixture.script_body)
         .env("TONEPOET_CRASH_RUNTIME", &fixture.runtime)
         .env("TONEPOET_CRASH_WORKING", fixture._temp.path())
         .env("TONEPOET_CRASH_DESCRIPTOR", &descriptor_path)

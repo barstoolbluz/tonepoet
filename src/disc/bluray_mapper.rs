@@ -1843,47 +1843,26 @@ bits_per_raw_sample=24
     #[cfg(unix)]
     #[test]
     fn ffprobe_command_uses_injected_path_and_playlist_wide_audio_entries() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = existing_source_path(
             "ffprobe_command_uses_injected_path_and_playlist_wide_audio_entries",
         );
         let ffprobe = dir.join("ffprobe-records-args.sh");
         let args_file = dir.join("args.txt");
-        std::fs::write(
+        crate::convert::pipeline::tool::install_executable_test_script(
             &ffprobe,
-            format!(
+            &format!(
                 "#!/bin/sh\nprintf '%s\n' \"$@\" > '{}'\ncat <<'EOF'\n[STREAM]\nindex=7\nid=0x1102\ncodec_name=truehd\nsample_rate=192000\nchannels=2\nbits_per_raw_sample=24\n[/STREAM]\nEOF\n",
                 args_file.display()
             ),
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&ffprobe).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&ffprobe, permissions).unwrap();
+        );
 
-        // Executing a just-written script races with concurrent test threads
-        // forking: a child forked between our write and exec can briefly hold
-        // the script's fd open, so exec fails with ETXTBSY (observed once
-        // under full-suite load, hypothesis unconfirmed). Retry spawn-level
-        // errors only; assertion substance below is untouched.
-        let mut attempt = 0;
-        let facts = loop {
-            match ffprobe_bluray_playlist_audio_streams(
-                &ffprobe,
-                &dir,
-                777,
-                &BlurayProbeControl::bounded_default(),
-            ) {
-                Ok(facts) => break facts,
-                Err(err) if attempt < 3 => {
-                    attempt += 1;
-                    eprintln!("retrying fixture ffprobe spawn (attempt {attempt}): {err}");
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-                Err(err) => panic!("fixture ffprobe failed after retries: {err}"),
-            }
-        };
+        let facts = ffprobe_bluray_playlist_audio_streams(
+            &ffprobe,
+            &dir,
+            777,
+            &BlurayProbeControl::bounded_default(),
+        )
+        .expect("fixture ffprobe");
 
         let args = std::fs::read_to_string(args_file).unwrap();
         assert!(args.contains("-playlist\n777\n"));
@@ -1917,18 +1896,12 @@ bits_per_raw_sample=24
     #[cfg(unix)]
     #[test]
     fn ffprobe_probe_times_out_and_terminates_child() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = existing_source_path("ffprobe_probe_times_out_and_terminates_child");
         let ffprobe = dir.join("ffprobe-hangs.sh");
-        std::fs::write(
+        crate::convert::pipeline::tool::install_executable_test_script(
             &ffprobe,
             "#!/bin/sh\nwhile :; do :; done\n",
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&ffprobe).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&ffprobe, permissions).unwrap();
+        );
 
         let control = BlurayProbeControl::bounded_default()
             .with_timeout(Duration::from_millis(50));

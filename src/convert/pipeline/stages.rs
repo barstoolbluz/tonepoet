@@ -51424,7 +51424,6 @@ mod companion_copy_hardening_tests {
     #[tokio::test]
     async fn post_script_runs_after_publication_lock_release_under_action_authority() {
         use crate::convert::pipeline::actions::RunScriptAction;
-        use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().expect("temp dir");
         let source_path = temp.path().join("source.flac");
@@ -51435,24 +51434,15 @@ mod companion_copy_hardening_tests {
         let publication_lock = album_lock_path(&album);
         let script_marker = temp.path().join("script-observed-unlocked-publication.marker");
         let environment_marker = temp.path().join("script-album-environment.txt");
-        let script = temp.path().join("probe-publication-lock.sh");
-        std::fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\nset -eu\nexec 9>\"{}\"\nflock -n 9\nrm -f \"{}\"\nprintf ok > \"{}\"\nprintf %s \"$TONEPOET_ALBUM_DIR\" > \"{}\"\n",
-                publication_lock.display(),
-                publication_lock.display(),
-                script_marker.display(),
-                environment_marker.display(),
-            ),
-        )
-        .expect("script");
-        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&script, permissions).unwrap();
+        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/test-bin/action-publication-lock-probe.sh");
         request.actions.post.push(ConversionAction::Runscript(RunScriptAction {
             script,
-            args: Vec::new(),
+            args: vec![
+                publication_lock.to_string_lossy().into_owned(),
+                script_marker.to_string_lossy().into_owned(),
+                environment_marker.to_string_lossy().into_owned(),
+            ],
             timeout_seconds: 30,
             continue_on_error: false,
         }));
@@ -80040,8 +80030,6 @@ mod publish_lock_soundness_tests {
     #[cfg(target_os = "linux")]
     impl PrePostLifecycleE2eFixture {
         fn new(label: &str, participant_count: usize) -> Self {
-            use std::os::unix::fs::PermissionsExt;
-
             let temp = tempfile::tempdir().expect("temp dir");
             let output_root = temp.path().join("out");
             let source_root = temp.path().join("source");
@@ -80057,31 +80045,10 @@ mod publish_lock_soundness_tests {
 
             let pre_marker = temp.path().join(format!("{label}.pre.invocations"));
             let post_marker = temp.path().join(format!("{label}.post.invocations"));
-            let pre_script = temp.path().join(format!("{label}.pre.sh"));
-            let post_script = temp.path().join(format!("{label}.post.sh"));
-            std::fs::write(
-                &pre_script,
-                format!(
-                    "#!/bin/sh\nset -eu\nprintf 'pre:%s\\n' \"${{TONEPOET_ACTION_PHASE:-unknown}}\" >> '{}'\n",
-                    pre_marker.display()
-                ),
-            )
-            .expect("pre script");
-            std::fs::write(
-                &post_script,
-                format!(
-                    "#!/bin/sh\nset -eu\nprintf 'post:%s\\n' \"${{TONEPOET_ACTION_PHASE:-unknown}}\" >> '{}'\n",
-                    post_marker.display()
-                ),
-            )
-            .expect("post script");
-            for script in [&pre_script, &post_script] {
-                let mut permissions = std::fs::metadata(script)
-                    .expect("script metadata")
-                    .permissions();
-                permissions.set_mode(0o700);
-                std::fs::set_permissions(script, permissions).expect("script executable");
-            }
+            let action_phase_script = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("fixtures/test-bin/action-phase-marker.sh");
+            let pre_script = action_phase_script.clone();
+            let post_script = action_phase_script;
 
             Self {
                 album_dir: output_root.join("Album"),
@@ -80119,7 +80086,10 @@ mod publish_lock_soundness_tests {
             req.actions.pre = vec![super::super::actions::ConversionAction::Runscript(
                 super::super::actions::RunScriptAction {
                     script: self.pre_script.clone(),
-                    args: Vec::new(),
+                    args: vec![
+                        "pre".to_string(),
+                        self.pre_marker.to_string_lossy().into_owned(),
+                    ],
                     timeout_seconds: 30,
                     continue_on_error: false,
                 },
@@ -80127,7 +80097,10 @@ mod publish_lock_soundness_tests {
             req.actions.post = vec![super::super::actions::ConversionAction::Runscript(
                 super::super::actions::RunScriptAction {
                     script: self.post_script.clone(),
-                    args: Vec::new(),
+                    args: vec![
+                        "post".to_string(),
+                        self.post_marker.to_string_lossy().into_owned(),
+                    ],
                     timeout_seconds: 30,
                     continue_on_error: false,
                 },

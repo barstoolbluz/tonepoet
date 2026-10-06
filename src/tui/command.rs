@@ -1206,7 +1206,6 @@ async fn authenticate_expanded_archive_paths_with_candidates(
 mod archive_password_bulk_auth_tests {
     use super::*;
     use std::collections::HashMap;
-    use std::os::unix::fs::PermissionsExt;
 
     fn expansion_for_archive(path: &Path) -> BrowseConvertExpansion {
         let mut queue = QueueExpansionResult::default();
@@ -1261,12 +1260,7 @@ esac
 "#,
             log.display()
         );
-        std::fs::write(&tool, script).expect("fake 7z script");
-        let mut permissions = std::fs::metadata(&tool)
-            .expect("fake 7z metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&tool, permissions).expect("make fake 7z executable");
+        crate::convert::pipeline::tool::install_executable_test_script(&tool, &script);
         (tool, log)
     }
 

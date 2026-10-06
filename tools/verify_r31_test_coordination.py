@@ -165,10 +165,11 @@ def main() -> int:
         require("isolated_test_coordination_root()" not in body,
                 f"background-save regression {name} must not use a thread-local coordination root")
 
-    # Guard against reintroducing the R30 remedy wholesale. This count includes
-    # the R31 fixture self-test and the one restored parallel-writer scope. A
-    # legitimate future change can deliberately update this verifier, but a
-    # mechanical return of ~150 process-visible scopes will fail immediately.
+    # Guard against reintroducing the R30 remedy wholesale. Count both the
+    # ordinary scoped helper and explicit scoped-root installation: both are
+    # process-visible coordination, and ignoring the explicit form undercounted
+    # the actual R31 population. R35 migrates six TempDir-backed explicit roots
+    # to the stable helper without changing that true population.
     audit_prefix = audit.split("\nfailures: list[str] = []", 1)[0]
     namespace: dict[str, object] = {"__file__": str((ROOT / "tools/audit_test_coordination_isolation.py").resolve())}
     exec(audit_prefix, namespace)
@@ -176,9 +177,12 @@ def main() -> int:
     process_scoped_tests = 0
     for path in (ROOT / "src").rglob("*.rs"):
         for _name, body, _line in test_functions(path):
-            if "scoped_test_coordination_root()" in body:
+            if (
+                "scoped_test_coordination_root()" in body
+                or "install_scoped_test_coordination_root(" in body
+            ):
                 process_scoped_tests += 1
-    require(process_scoped_tests == 226,
+    require(process_scoped_tests == 233,
             f"R31 process-visible test-scope population changed unexpectedly: {process_scoped_tests}")
 
     print("[ok] R31 nonblocking test coordination isolation static verification passed")

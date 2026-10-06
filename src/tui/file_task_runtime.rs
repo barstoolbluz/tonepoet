@@ -2711,9 +2711,7 @@ mod tests {
 
     impl JournalDirGuard {
         fn install(path: &Path) -> Self {
-            let concurrency = crate::concurrency::install_scoped_test_coordination_root(
-                &path.join("claims"),
-            );
+            let concurrency = crate::concurrency::scoped_test_coordination_root();
             std::env::set_var("TONEPOET_FILE_OPERATION_JOURNAL_DIR", path);
             Self {
                 _concurrency: concurrency,

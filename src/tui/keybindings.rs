@@ -61177,7 +61177,6 @@ pub fn run_internal_file_task_worker(journal_path: &std::path::Path, lease_fd: i
 #[cfg(all(test, unix))]
 mod file_task_supervisor_tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, Instant};
 
     struct FileTaskTestEnvironment {
@@ -61186,9 +61185,7 @@ mod file_task_supervisor_tests {
 
     impl FileTaskTestEnvironment {
         fn install(journal_dir: &std::path::Path, helper: &std::path::Path) -> Self {
-            let coordination = crate::concurrency::install_scoped_test_coordination_root(
-                &journal_dir.join("claims"),
-            );
+            let coordination = crate::concurrency::scoped_test_coordination_root();
             std::env::set_var("TONEPOET_FILE_OPERATION_JOURNAL_DIR", journal_dir);
             std::env::set_var("TONEPOET_TEST_FILE_TASK_HELPER", helper);
             Self {
@@ -61209,17 +61206,12 @@ mod file_task_supervisor_tests {
         // Publish a readiness marker immediately before entering the deliberate
         // wedge. Cancellation tests can then measure cancellation/reaping from
         // an actually-running helper instead of racing process startup under
-        // full-workspace scheduler load. `$0` is the helper pathname.
-        std::fs::write(
+        // full-workspace scheduler load. The static launcher exposes the
+        // fixture pathname as TONEPOET_TEST_SCRIPT_PATH.
+        crate::convert::pipeline::tool::install_executable_test_script(
             &helper,
-            "#!/bin/sh\nprintf '' > \"$0.started\"\nexec sleep 30\n",
-        )
-        .expect("write helper");
-        let mut permissions = std::fs::metadata(&helper)
-            .expect("helper metadata")
-            .permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&helper, permissions).expect("helper permissions");
+            "#!/bin/sh\nprintf '' > \"$TONEPOET_TEST_SCRIPT_PATH.started\"\nexec sleep 30\n",
+        );
         helper
     }
 
@@ -61241,12 +61233,7 @@ mod file_task_supervisor_tests {
         let script = format!(
             "#!/bin/sh\nwhile :; do\n  printf '%s\\n' '{heartbeat}'\n  sleep 0.05\ndone\n"
         );
-        std::fs::write(&helper, script).expect("write heartbeat helper");
-        let mut permissions = std::fs::metadata(&helper)
-            .expect("helper metadata")
-            .permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&helper, permissions).expect("helper permissions");
+        crate::convert::pipeline::tool::install_executable_test_script(&helper, &script);
         helper
     }
 
@@ -69284,6 +69271,11 @@ mod permanent_delete_tests {
         assert!(summary.busy, "RecoveryReserved path must block permanent delete");
         assert!(path.exists(), "recovery-reserved file must remain untouched");
 
+        #[cfg(unix)]
+        crate::concurrency::wait_for_close_driven_untyped_descriptor_release(
+            &descriptor,
+            "permanent-delete recovery-reservation probe",
+        );
         crate::concurrency::retire_descriptor_after_lifecycle_release(&descriptor, &family)
             .expect("retire test recovery reservation");
     }
@@ -110379,9 +110371,7 @@ mod file_picker_browse_parity_regression_tests {
 
     impl TestFileTaskJournalEnvironment {
         pub(super) fn install(path: &std::path::Path) -> Self {
-            let coordination = crate::concurrency::install_scoped_test_coordination_root(
-                &path.join("claims"),
-            );
+            let coordination = crate::concurrency::scoped_test_coordination_root();
             let previous = std::env::var_os("TONEPOET_FILE_OPERATION_JOURNAL_DIR");
             std::env::set_var("TONEPOET_FILE_OPERATION_JOURNAL_DIR", path);
             Self {

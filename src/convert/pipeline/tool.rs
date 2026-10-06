@@ -750,9 +750,65 @@ impl ToolRunner for StubToolRunner {
 }
 
 #[cfg(all(test, unix))]
+fn runtime_test_script_body_path(path: &Path) -> PathBuf {
+    let mut body_name = path.as_os_str().to_os_string();
+    body_name.push(".tonepoet-body");
+    PathBuf::from(body_name)
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn install_executable_test_script(path: &Path, body: &str) {
+    use std::fs;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let launcher = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures/test-bin/runtime-script-launcher.sh");
+    let launcher_metadata = fs::symlink_metadata(&launcher).unwrap_or_else(|error| {
+        panic!(
+            "static test launcher metadata {}: {error}",
+            launcher.display()
+        )
+    });
+    assert!(
+        launcher_metadata.file_type().is_file(),
+        "static test launcher must be a regular file: {}",
+        launcher.display()
+    );
+    assert!(
+        launcher_metadata.permissions().mode() & 0o111 != 0,
+        "static test launcher must be executable before the test harness starts: {}",
+        launcher.display()
+    );
+
+    let body_path = runtime_test_script_body_path(path);
+    fs::write(&body_path, body).unwrap_or_else(|error| {
+        panic!(
+            "write non-executable fixture body {}: {error}",
+            body_path.display()
+        )
+    });
+    assert_eq!(
+        fs::metadata(&body_path)
+            .expect("fixture body metadata")
+            .permissions()
+            .mode()
+            & 0o111,
+        0,
+        "runtime-written fixture body must never be executable: {}",
+        body_path.display()
+    );
+    symlink(&launcher, path).unwrap_or_else(|error| {
+        panic!(
+            "link static executable fixture {} -> {}: {error}",
+            path.display(),
+            launcher.display()
+        )
+    });
+}
+
+#[cfg(all(test, unix))]
 pub(crate) fn write_executable_test_script(name: &str, body: &str) -> PathBuf {
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
 
     let unique = format!(
         "tonepoet-{name}-{}-{}",
@@ -765,47 +821,7 @@ pub(crate) fn write_executable_test_script(name: &str, body: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(unique);
     fs::create_dir_all(&dir).expect("script temp dir");
     let path = dir.join(name);
-    // Inject a side-effect-free selfcheck arm right after the shebang so
-    // the ETXTBSY verify loop below can execute the script without
-    // touching any fixture state (several bodies mutate count files
-    // unconditionally).
-    let (shebang, rest) = body
-        .split_once('\n')
-        .expect("fixture scripts start with a shebang line");
-    let guarded = format!(
-        "{shebang}\nif [ \"$1\" = \"--tonepoet-fixture-selfcheck\" ]; then exit 0; fi\n{rest}"
-    );
-    fs::write(&path, guarded).expect("write script");
-    let mut perms = fs::metadata(&path).expect("script metadata").permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&path, perms).expect("chmod script");
-    // Write-then-exec is racy in a threaded test process: a concurrent
-    // test's fork can inherit this file's write fd for a moment, and a
-    // direct exec then fails with ETXTBSY ("Text file busy"). Verify the
-    // script is executable before handing it out; one successful exec
-    // proves no writer fd survives, and nothing rewrites the file after.
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    loop {
-        match std::process::Command::new(&path)
-            .arg("--tonepoet-fixture-selfcheck")
-            .output()
-        {
-            Ok(output) if output.status.success() => break,
-            Ok(output) => panic!(
-                "fixture script selfcheck failed for {}: {:?}",
-                path.display(),
-                output.status
-            ),
-            // ETXTBSY (errno 26): a racing fork still holds the write fd.
-            Err(err) if err.raw_os_error() == Some(26) && std::time::Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(err) => panic!(
-                "fixture script selfcheck could not execute {}: {err}",
-                path.display()
-            ),
-        }
-    }
+    install_executable_test_script(&path, body);
     path
 }
 
@@ -1615,6 +1631,20 @@ impl RealToolRunner {
             };
             for entry in &cmd.env {
                 environment.insert(entry.key.clone(), entry.value.expose().to_string());
+            }
+            #[cfg(test)]
+            {
+                let body_path = runtime_test_script_body_path(&launch_path);
+                if body_path.is_file() {
+                    environment.insert(
+                        "TONEPOET_TEST_SCRIPT_BODY".to_string(),
+                        body_path.to_string_lossy().into_owned(),
+                    );
+                    environment.insert(
+                        "TONEPOET_TEST_SCRIPT_PATH".to_string(),
+                        launch_path.to_string_lossy().into_owned(),
+                    );
+                }
             }
 
             let explicit_execution_item = self.execution_item_id.clone();
@@ -3256,6 +3286,19 @@ mod real_tool_runner_tests {
     }
 
     #[cfg(unix)]
+    fn static_bound_executable_fixture(name: &str) -> PathBuf {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/test-bin")
+            .join(name);
+        assert!(
+            path.is_file(),
+            "missing static bound executable fixture: {}",
+            path.display()
+        );
+        path
+    }
+
+    #[cfg(unix)]
     fn bound_scalar_pump_fixture(directory: &std::path::Path) -> RetainedPcmScalarPump {
         let bytes = 0.25_f64.to_le_bytes();
         let input = directory.join("bound-scalar-input.f64le");
@@ -3521,7 +3564,7 @@ mod real_tool_runner_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn real_pipeline_connects_producer_stdout_directly_to_consumer_stdin() {
-        let producer_script = write_executable_script(
+        let producer_script = write_executable_test_script(
             "fake-sox-pipeline",
             r#"#!/bin/sh
 if [ "$1" = "--help" ]; then
@@ -3532,7 +3575,7 @@ printf 'exact-pipeline-payload'
 printf 'producer diagnostic\n' >&2
 "#,
         );
-        let consumer_script = write_executable_script(
+        let consumer_script = write_executable_test_script(
             "fake-ffmpeg-pipeline",
             r#"#!/bin/sh
 if [ "$1" = "--version" ]; then
@@ -3693,11 +3736,11 @@ printf 'consumer diagnostic\n' >&2
     #[cfg(unix)]
     #[tokio::test]
     async fn segmented_pipeline_splits_ordered_ranges_with_one_producer() {
-        let producer = write_executable_script(
+        let producer = write_executable_test_script(
             "segmented-producer",
             "#!/bin/sh\nprintf 'abcdefghijklmnop'\n",
         );
-        let consumer = write_executable_script(
+        let consumer = write_executable_test_script(
             "segmented-consumer",
             "#!/bin/sh\nexec /bin/cat\n",
         );
@@ -3747,11 +3790,11 @@ printf 'consumer diagnostic\n' >&2
     #[cfg(unix)]
     #[tokio::test]
     async fn segmented_pipeline_idle_watchdog_breaks_a_stalled_transport_without_cancelling_parent() {
-        let producer = write_executable_script(
+        let producer = write_executable_test_script(
             "segmented-stall-producer",
             "#!/bin/sh\nexec /bin/dd if=/dev/zero bs=200000 count=1 2>/dev/null\n",
         );
-        let consumer = write_executable_script(
+        let consumer = write_executable_test_script(
             "segmented-stall-consumer",
             "#!/bin/sh\n/bin/dd bs=16 count=1 of=/dev/null 2>/dev/null\nexec /bin/sleep 3600\n",
         );
@@ -3801,11 +3844,11 @@ printf 'consumer diagnostic\n' >&2
     #[cfg(unix)]
     #[tokio::test]
     async fn segmented_pipeline_idle_watchdog_allows_slow_continuous_progress() {
-        let producer = write_executable_script(
+        let producer = write_executable_test_script(
             "segmented-slow-progress-producer",
             "#!/bin/sh\ni=0\nwhile [ \"$i\" -lt 8 ]; do\n  /bin/dd if=/dev/zero bs=8192 count=1 2>/dev/null\n  /bin/sleep 0.05\n  i=$((i + 1))\ndone\n",
         );
-        let consumer = write_executable_script(
+        let consumer = write_executable_test_script(
             "segmented-slow-progress-consumer",
             "#!/bin/sh\nexec /bin/cat\n",
         );
@@ -3846,7 +3889,7 @@ printf 'consumer diagnostic\n' >&2
     #[cfg(unix)]
     #[tokio::test]
     async fn segmented_pipeline_intentional_final_bounded_stop_is_success_and_skips_tail() {
-        let producer = write_executable_script(
+        let producer = write_executable_test_script(
             "segmented-early-stop-producer",
             "#!/bin/sh\nprintf 'abcd'\nsleep 0.2\nprintf 'tail-reached' > \"$1\"\nprintf 'efghijklmnop'\n",
         );
@@ -3854,7 +3897,7 @@ printf 'consumer diagnostic\n' >&2
             .parent()
             .expect("producer parent")
             .join("tail-reached");
-        let consumer = write_executable_script(
+        let consumer = write_executable_test_script(
             "segmented-early-stop-consumer",
             "#!/bin/sh\n/bin/cat\nsleep 1\n",
         );
@@ -3897,11 +3940,11 @@ printf 'consumer diagnostic\n' >&2
     #[cfg(unix)]
     #[tokio::test]
     async fn segmented_pipeline_required_region_decoder_failure_still_fails_with_early_stop_enabled() {
-        let producer = write_executable_script(
+        let producer = write_executable_test_script(
             "segmented-early-stop-short-producer",
             "#!/bin/sh\nprintf 'ab'\nexit 7\n",
         );
-        let consumer = write_executable_script(
+        let consumer = write_executable_test_script(
             "segmented-early-stop-short-consumer",
             "#!/bin/sh\nexec /bin/cat\n",
         );
@@ -3942,7 +3985,7 @@ printf 'consumer diagnostic\n' >&2
     #[cfg(unix)]
     #[tokio::test]
     async fn segmented_pipeline_full_range_still_runs_producer_to_natural_eof() {
-        let producer = write_executable_script(
+        let producer = write_executable_test_script(
             "segmented-full-range-producer",
             "#!/bin/sh\nprintf 'abcd'\nprintf 'eof-reached' > \"$1\"\n",
         );
@@ -3950,7 +3993,7 @@ printf 'consumer diagnostic\n' >&2
             .parent()
             .expect("producer parent")
             .join("eof-reached");
-        let consumer = write_executable_script(
+        let consumer = write_executable_test_script(
             "segmented-full-range-consumer",
             "#!/bin/sh\nexec /bin/cat\n",
         );
@@ -3990,11 +4033,11 @@ printf 'consumer diagnostic\n' >&2
     #[cfg(unix)]
     #[tokio::test]
     async fn segmented_pipeline_error_preserves_only_fully_completed_consumer_prefix() {
-        let producer = write_executable_script(
+        let producer = write_executable_test_script(
             "segmented-prefix-producer",
             "#!/bin/sh\nprintf 'abcdefghijklmnop'\n",
         );
-        let consumer = write_executable_script(
+        let consumer = write_executable_test_script(
             "segmented-prefix-consumer",
             "#!/bin/sh\n/bin/cat\n[ \"${1-}\" != fail ]\n",
         );
@@ -4063,11 +4106,11 @@ printf 'consumer diagnostic\n' >&2
     #[cfg(unix)]
     #[tokio::test]
     async fn segmented_pipeline_producer_error_preserves_completed_consumer_prefix() {
-        let producer = write_executable_script(
+        let producer = write_executable_test_script(
             "segmented-prefix-producer-fails",
             "#!/bin/sh\nprintf 'abcdefgh'\nexit 7\n",
         );
-        let consumer = write_executable_script(
+        let consumer = write_executable_test_script(
             "segmented-prefix-consumer-cat",
             "#!/bin/sh\nexec /bin/cat\n",
         );
@@ -4121,7 +4164,7 @@ printf 'consumer diagnostic\n' >&2
     #[cfg(unix)]
     #[tokio::test]
     async fn clear_and_set_command_excludes_ambient_environment_and_records_identity() {
-        let script = write_executable_script(
+        let script = write_executable_test_script(
             "closed-env-command",
             r#"#!/bin/sh
 printf 'home=%s path=%s lc_all=%s\n' "${HOME-unset}" "${PATH-unset}" "${LC_ALL-unset}"
@@ -4159,13 +4202,13 @@ printf 'home=%s path=%s lc_all=%s\n' "${HOME-unset}" "${PATH-unset}" "${LC_ALL-u
     #[cfg(unix)]
     #[tokio::test]
     async fn clear_and_set_pipeline_excludes_ambient_environment_in_both_stages() {
-        let producer_script = write_executable_script(
+        let producer_script = write_executable_test_script(
             "closed-env-producer",
             r#"#!/bin/sh
 printf 'producer-home=%s producer-path=%s producer-lc=%s\n' "${HOME-unset}" "${PATH-unset}" "${LC_ALL-unset}"
 "#,
         );
-        let consumer_script = write_executable_script(
+        let consumer_script = write_executable_test_script(
             "closed-env-consumer",
             r#"#!/bin/sh
 IFS= read -r payload
@@ -4220,14 +4263,14 @@ printf '%s consumer-home=%s consumer-path=%s consumer-lc=%s\n' "$payload" "${HOM
                 .unwrap()
                 .as_nanos()
         ));
-        let producer = write_executable_script(
+        let producer = write_executable_test_script(
             "timeout-producer",
             r#"#!/bin/sh
 printf '%s\n' "$$" > "$1"
 exec /bin/sleep 30
 "#,
         );
-        let consumer = write_executable_script(
+        let consumer = write_executable_test_script(
             "timeout-consumer",
             r#"#!/bin/sh
 exec /bin/cat >/dev/null
@@ -4273,11 +4316,11 @@ exec /bin/cat >/dev/null
                 .unwrap()
                 .as_nanos()
         ));
-        let producer = write_executable_script(
+        let producer = write_executable_test_script(
             "finite-producer",
             "#!/bin/sh\nprintf 'payload'\n",
         );
-        let consumer = write_executable_script(
+        let consumer = write_executable_test_script(
             "timeout-consumer",
             r#"#!/bin/sh
 printf '%s\n' "$$" > "$1"
@@ -4326,14 +4369,14 @@ exec /bin/sleep 30
             .join(format!("tonepoet-pipeline-cancel-producer-pid-{unique}"));
         let consumer_pid_path = std::env::temp_dir()
             .join(format!("tonepoet-pipeline-cancel-consumer-pid-{unique}"));
-        let producer = write_executable_script(
+        let producer = write_executable_test_script(
             "cancel-producer",
             r#"#!/bin/sh
 printf '%s\n' "$$" > "$1"
 exec /bin/sleep 30
 "#,
         );
-        let consumer = write_executable_script(
+        let consumer = write_executable_test_script(
             "cancel-consumer",
             r#"#!/bin/sh
 printf '%s\n' "$$" > "$1"
@@ -4389,8 +4432,8 @@ exec /bin/cat >/dev/null
     #[cfg(unix)]
     #[tokio::test]
     async fn pipeline_reports_producer_nonzero_after_reaping_consumer() {
-        let producer = write_executable_script("failing-producer", "#!/bin/sh\nexit 7\n");
-        let consumer = write_executable_script(
+        let producer = write_executable_test_script("failing-producer", "#!/bin/sh\nexit 7\n");
+        let consumer = write_executable_test_script(
             "draining-consumer",
             "#!/bin/sh\nexec /bin/cat >/dev/null\n",
         );
@@ -4472,11 +4515,11 @@ exec /bin/cat >/dev/null
     #[cfg(unix)]
     #[tokio::test]
     async fn pipeline_reports_consumer_nonzero_and_closes_producer() {
-        let producer = write_executable_script(
+        let producer = write_executable_test_script(
             "infinite-producer",
             "#!/bin/sh\nwhile :; do printf x; done\n",
         );
-        let consumer = write_executable_script("failing-consumer", "#!/bin/sh\nexit 9\n");
+        let consumer = write_executable_test_script("failing-consumer", "#!/bin/sh\nexit 9\n");
         let mut paths = HashMap::new();
         paths.insert(ToolBinary::Sox.canonical_name().to_string(), producer);
         paths.insert(ToolBinary::Ffmpeg.canonical_name().to_string(), consumer);
@@ -4501,7 +4544,7 @@ exec /bin/cat >/dev/null
     #[cfg(unix)]
     #[tokio::test]
     async fn consumer_spawn_failure_reaps_started_producer() {
-        let producer = write_executable_script(
+        let producer = write_executable_test_script(
             "spawn-failure-producer",
             "#!/bin/sh\nexec /bin/sleep 30\n",
         );
@@ -4570,17 +4613,9 @@ exec /bin/cat >/dev/null
     }
 
     #[cfg(unix)]
-    use super::write_executable_test_script as write_executable_script;
-
-    #[cfg(unix)]
     #[tokio::test]
     async fn bound_execution_spawns_the_exact_attested_executable() {
-        let script = write_executable_script(
-            "bound-exact",
-            "#!/bin/sh
-printf 'bound-exact\n'
-",
-        );
+        let script = static_bound_executable_fixture("bound-exact.sh");
         let canonical = std::fs::canonicalize(&script).expect("canonical bound script");
         let authority = BoundToolExecutable {
             canonical_path: canonical.clone(),
@@ -4614,12 +4649,8 @@ printf 'bound-exact\n'
     #[cfg(unix)]
     #[tokio::test]
     async fn bound_execution_rejects_runner_path_override_drift() {
-        let certified = write_executable_script("bound-certified", "#!/bin/sh
-exit 0
-");
-        let replacement = write_executable_script("bound-replacement", "#!/bin/sh
-exit 0
-");
+        let certified = static_bound_executable_fixture("bound-exit-0-a.sh");
+        let replacement = static_bound_executable_fixture("bound-exit-0-b.sh");
         let certified = std::fs::canonicalize(certified).expect("canonical certified script");
         let replacement = std::fs::canonicalize(replacement).expect("canonical replacement script");
         let authority = BoundToolExecutable {
@@ -4649,9 +4680,7 @@ exit 0
     #[cfg(unix)]
     #[tokio::test]
     async fn bound_execution_rejects_executable_content_drift() {
-        let script = write_executable_script("bound-digest", "#!/bin/sh
-exit 0
-");
+        let script = static_bound_executable_fixture("bound-exit-0-a.sh");
         let canonical = std::fs::canonicalize(script).expect("canonical bound script");
         let authority = BoundToolExecutable {
             canonical_path: canonical.clone(),
@@ -4680,13 +4709,7 @@ exit 0
     #[cfg(unix)]
     #[tokio::test]
     async fn bound_scalar_pump_spawns_the_exact_attested_executable() {
-        let script = write_executable_script(
-            "bound-pump-exact",
-            "#!/bin/sh
-cat >/dev/null
-printf 'bound-pump-exact\n'
-",
-        );
+        let script = static_bound_executable_fixture("bound-pump-exact.sh");
         let canonical = std::fs::canonicalize(&script).expect("canonical bound pump script");
         let authority = BoundToolExecutable {
             canonical_path: canonical.clone(),
@@ -4713,10 +4736,7 @@ printf 'bound-pump-exact\n'
     #[cfg(unix)]
     #[tokio::test]
     async fn bound_scalar_pump_rejects_inherited_environment() {
-        let script = write_executable_script(
-            "bound-pump-inherited-env",
-            "#!/bin/sh\ncat >/dev/null\n",
-        );
+        let script = static_bound_executable_fixture("bound-pump-noop-a.sh");
         let canonical = std::fs::canonicalize(&script).expect("canonical bound pump script");
         let authority = BoundToolExecutable {
             canonical_path: canonical.clone(),
@@ -4747,18 +4767,8 @@ printf 'bound-pump-exact\n'
     #[cfg(unix)]
     #[tokio::test]
     async fn bound_scalar_pump_rejects_runner_path_override_drift() {
-        let certified = write_executable_script(
-            "bound-pump-certified",
-            "#!/bin/sh
-cat >/dev/null
-",
-        );
-        let replacement = write_executable_script(
-            "bound-pump-replacement",
-            "#!/bin/sh
-cat >/dev/null
-",
-        );
+        let certified = static_bound_executable_fixture("bound-pump-noop-a.sh");
+        let replacement = static_bound_executable_fixture("bound-pump-noop-b.sh");
         let certified = std::fs::canonicalize(certified).expect("canonical certified pump script");
         let replacement = std::fs::canonicalize(replacement).expect("canonical replacement pump script");
         let authority = BoundToolExecutable {
@@ -4784,12 +4794,7 @@ cat >/dev/null
     #[cfg(unix)]
     #[tokio::test]
     async fn bound_scalar_pump_rejects_executable_content_drift() {
-        let script = write_executable_script(
-            "bound-pump-digest",
-            "#!/bin/sh
-cat >/dev/null
-",
-        );
+        let script = static_bound_executable_fixture("bound-pump-noop-a.sh");
         let canonical = std::fs::canonicalize(script).expect("canonical bound pump script");
         let authority = BoundToolExecutable {
             canonical_path: canonical.clone(),
@@ -4819,7 +4824,7 @@ cat >/dev/null
             std::process::id()
         ));
         let _ = std::fs::remove_file(&count_file);
-        let script = write_executable_script(
+        let script = write_executable_test_script(
             "fake-ffmpeg",
             &format!(
                 r#"#!/bin/sh
@@ -4850,7 +4855,7 @@ printf 'ffmpeg version 9.9.%s\n' "$n"
             std::process::id()
         ));
         let _ = std::fs::remove_file(&count_file);
-        let script = write_executable_script(
+        let script = write_executable_test_script(
             "fake-ffmpeg-first-use",
             &format!(
                 r#"#!/bin/sh
@@ -4904,7 +4909,7 @@ exit 0
             std::process::id()
         ));
         let _ = std::fs::remove_file(&count_file);
-        let script = write_executable_script(
+        let script = write_executable_test_script(
             "fake-ffmpeg-no-version",
             &format!(
                 r#"#!/bin/sh
@@ -4942,7 +4947,7 @@ printf 'ffmpeg build metadata unavailable\n'
             std::process::id()
         ));
         let _ = std::fs::remove_file(&count_file);
-        let script = write_executable_script(
+        let script = write_executable_test_script(
             "fake-ffmpeg-concurrent-version",
             &format!(
                 r#"#!/bin/sh
@@ -4992,7 +4997,7 @@ exit 0
     #[cfg(unix)]
     #[test]
     fn version_probe_captures_verbose_output_without_pipe_backpressure() {
-        let script = write_executable_script(
+        let script = write_executable_test_script(
             "fake-sox-verbose-help",
             r#"#!/bin/sh
 printf 'sox:      SoX_ng v14.6.1\n'
