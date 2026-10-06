@@ -1823,21 +1823,10 @@ bits_per_raw_sample=24
     #[cfg(unix)]
     #[test]
     fn ffprobe_command_failure_reports_status_and_stderr() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = existing_source_path("ffprobe_command_failure_reports_status_and_stderr");
-        let ffprobe = dir.join("ffprobe-fails.sh");
-        std::fs::write(
-            &ffprobe,
-            "#!/bin/sh
-echo synthetic ffprobe failure >&2
-exit 42
-",
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&ffprobe).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&ffprobe, permissions).unwrap();
+        let ffprobe = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/test-bin/ffprobe-fails.sh");
+        assert!(ffprobe.is_file(), "static ffprobe failure fixture must exist");
 
         let err = ffprobe_bluray_playlist_audio_streams(
             &ffprobe,

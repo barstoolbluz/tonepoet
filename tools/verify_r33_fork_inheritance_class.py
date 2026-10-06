@@ -184,9 +184,11 @@ def main() -> int:
         "JournalOperation final logical-owner regression remains genuinely immediate",
     )
     require(
-        "descriptor_availability(&path)" in immediate
-        and "ClaimAvailability::RecoveryReserved" in immediate,
-        "R33 preserves the immediate JournalOperation product guarantee",
+        "descriptor_availability(&path)" not in immediate
+        and "retire_descriptor_after_lifecycle_release(&path, &family)" in immediate
+        and immediate.index("drop(lease);")
+        < immediate.index("retire_descriptor_after_lifecycle_release(&path, &family)"),
+        "R33/R34 preserves the immediate JournalOperation product guarantee without a self-locking pre-probe",
     )
 
     staging_retry = section(

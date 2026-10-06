@@ -113,9 +113,11 @@ def main() -> int:
         "unexported JournalOperation immediate-unlock regression stays immediate",
     )
     require(
-        "descriptor_availability(&path)" in immediate
-        and "ClaimAvailability::RecoveryReserved" in immediate,
-        "R32 preserves the immediate unexported logical-owner contract",
+        "descriptor_availability(&path)" not in immediate
+        and "retire_descriptor_after_lifecycle_release(&path, &family)" in immediate
+        and immediate.index("drop(lease);")
+        < immediate.index("retire_descriptor_after_lifecycle_release(&path, &family)"),
+        "R32/R34 preserves the immediate unexported logical-owner contract without a self-locking pre-probe",
     )
 
     poll_control = section(supervisor, "fn poll_control(fd: RawFd)", "fn send_control(")

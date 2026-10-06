@@ -2442,6 +2442,40 @@ pub(crate) fn wait_for_close_driven_lifecycle_release(
     }
 }
 
+/// Wait for a test-created malformed descriptor's transient probe lock to
+/// quiesce without parsing its intentionally invalid body. This is test-only:
+/// production lifecycle cleanup remains fail-closed and does not gain a retry.
+///
+/// A generic admission scan can successfully lock the malformed descriptor and
+/// then reject its body. Under default parallel libtest execution, an unrelated
+/// fork can inherit that scanner fd before the scanner closes it. Once this
+/// helper acquires the lock, explicitly unlock the shared OFD before closing so
+/// the helper cannot manufacture the same inheritance race itself.
+#[cfg(all(test, unix))]
+fn wait_for_close_driven_untyped_descriptor_release(path: &Path, context: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let file = open_existing_descriptor(path)
+            .unwrap_or_else(|error| panic!("{context}: open {}: {error}", path.display()));
+        match file.try_lock_exclusive() {
+            Ok(()) => {
+                FileExt::unlock(&file).unwrap_or_else(|error| {
+                    panic!("{context}: unlock quiescence probe {}: {error}", path.display())
+                });
+                return;
+            }
+            Err(error) if is_lock_contended(&error) && Instant::now() < deadline => {
+                drop(file);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(error) if is_lock_contended(&error) => {
+                panic!("{context}: timed out waiting for transient holder of {}", path.display())
+            }
+            Err(error) => panic!("{context}: lock {}: {error}", path.display()),
+        }
+    }
+}
+
 /// Classify a descriptor after the owning subsystem has durably established
 /// a same-process recovery handoff. A foreign owner remains `Live`; only the
 /// exact locally-created locked OFD can be treated by its post-owner lifecycle
@@ -4572,11 +4606,20 @@ mod tests {
             };
             unsafe { libc::close(ready[0]) };
 
-            let mut availability = None;
+            let mut logical_owner_released = None;
             let mut retired = None;
             if ready_result == 1 {
                 drop(lease);
-                availability = Some(descriptor_availability(&path));
+                logical_owner_released = Some(local_persistent_lease_file(&path).is_none());
+
+                // This call is the observable product boundary. Do not precede
+                // it with `descriptor_availability`: a successful availability
+                // probe takes a fresh flock, and an unrelated parallel fork can
+                // inherit that *probe* lock before its local fd closes. A second
+                // immediate lock attempt would then measure the observer's own
+                // transient authority rather than the final logical owner's
+                // unlock. JournalOperation retirement itself has no retry, so a
+                // missing production unlock still fails this test immediately.
                 retired = Some(retire_descriptor_after_lifecycle_release(&path, &family));
             } else {
                 drop(lease);
@@ -4605,13 +4648,10 @@ mod tests {
             assert_eq!(waited, child, "reap journal fork child");
             assert!(libc::WIFEXITED(status), "journal fork child must exit normally");
             assert_eq!(libc::WEXITSTATUS(status), 0, "journal fork child exit status");
-            assert_eq!(
-                availability
-                    .expect("fork synchronization must produce availability")
-                    .expect("probe now-ownerless durable descriptor")
-                    .1,
-                ClaimAvailability::RecoveryReserved,
-                "accidental fork copy must not retain live JournalOperation authority",
+            assert!(
+                logical_owner_released
+                    .expect("fork synchronization must observe logical-owner release"),
+                "final JournalOperation logical owner must retire process-local handoff authority",
             );
             retired
                 .expect("fork synchronization must attempt lifecycle retirement")
@@ -5375,6 +5415,11 @@ mod tests {
             std::fs::write(&path, b"{\"schema\":1").unwrap();
             let error = MutationClaimGuard::acquire_ephemeral(Vec::new()).unwrap_err();
             assert!(error.contains("lifecycle repair"), "generic admission must not infer durable malformed state: {error}");
+            #[cfg(unix)]
+            wait_for_close_driven_untyped_descriptor_release(
+                &path,
+                "malformed-descriptor admission probe must quiesce before lifecycle cleanup",
+            );
             retire_setup_orphan_by_path_identity(&path, &LeaseFamily::JournalOperation { job_id }).unwrap();
             assert!(!path.exists());
         });
