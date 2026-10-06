@@ -4066,3 +4066,78 @@ Where a conversion genuinely cannot proceed, the user is told what is wrong
 with their album in terms they can act on — not an internal message about
 namespace redirection, repeated once per track.
 
+
+## 62. A `.wav` file whose container is RF64 fails tag and artwork reading
+
+Filed 2026-10-06. Reported from the field; reproduced by inspection of the album.
+
+### Symptom
+
+One track of a ten-track album reports, in the metadata pane:
+
+```
+A1 Reel Around The Fountain: tags/artwork: failed to read Wav: WAV file doesn't
+contain a RIFF chunk
+```
+
+The other nine tracks are fine.
+
+### Cause
+
+The message is literally true. That one file begins with the magic `RF64`, not
+`RIFF`; the other nine begin with `RIFF`. All ten are named `.wav`.
+
+```
+A1 Reel Around The Fountain.wav   2187972872 bytes   magic=RF64
+A2 … B5 (nine files)                               magic=RIFF
+```
+
+RF64 is the BWF 64-bit extension used when a writer cannot bound the file below
+the 4 GB RIFF ceiling. These are 384 kHz 64-bit-float stereo transfers running
+~6.1 MB/s, so a six-minute side lands near 2.2 GB and a recorder may emit RF64
+for one track and RIFF for its shorter neighbours.
+
+FFmpeg reads the file without complaint — `ffprobe` reports
+`format_name=wav, codec_name=pcm_f64le, 384000 Hz, 2 ch, 356 s`. Only the tag
+and artwork read fails. That read goes through `lofty::read_from_path`, which
+requires a literal `RIFF` chunk. The issue surfaces as `MetadataIssue::TagRead`
+and is rendered by `metadata_view_models.rs:978`.
+
+Routing is by extension, so a `.wav`-named RF64 file reaches the WAV tag reader.
+`.rf64` is already an accepted input extension (`is_single_audio_extension`,
+`stages.rs:643`), but the extension here is `.wav`.
+
+### Already correct elsewhere
+
+Three places in the tree accept either magic rather than trusting the name:
+
+- `materializer_cue.rs:177` — `let rf64 = &riff[..4] == b"RF64";`
+- `bluray_realize.rs:929` — `&riff[0..4] != b"RIFF" && &riff[0..4] != b"RF64"`
+- `materializer_dvda.rs:392` — the same test
+
+The write side also knows about the carrier: `metadata_uses_rf64_carrier` in
+`stages.rs` downgrades the pre-emphasis negative tag to a strip for RF64 and
+W64, because those carriers cannot represent it.
+
+So this is an inconsistency between the tag-read path and the rest of the
+codebase, not a missing capability.
+
+### Unknown
+
+Whether conversion of this album succeeds and only the metadata pane complains,
+or whether the track also fails to convert. Not yet tested — the report is from
+the metadata pane only.
+
+Whether `lofty` 0.21 can read RF64 at all, or whether the tag read for such a
+file has to be satisfied another way.
+
+### Required
+
+A `.wav` file containing RF64 is treated as the RF64 it is. Its tags and
+artwork are read if the container can carry them; if the carrier genuinely
+cannot, the user is told that in terms that name the container, not told that
+their file lacks a chunk it was never supposed to have.
+
+Container identity should come from the file's magic, not its extension,
+wherever the distinction matters — the pattern already used in the three
+materializers above.
