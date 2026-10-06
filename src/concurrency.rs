@@ -3702,6 +3702,33 @@ mod tests {
         }
     }
 
+    fn wait_for_recovery_reserved_after_deliberate_export_closes(
+        path: &Path,
+        context: &str,
+    ) {
+        // A deliberate lifetime export intentionally delegates release to the
+        // final kernel fd holder. Under the default parallel test harness, an
+        // unrelated fork can transiently inherit that CLOEXEC fd before exec
+        // and keep the flock live after this test drops its own exported copy.
+        // Retry only that exact `Live` state; any other classification or I/O
+        // error is a real failure. Production coordination code is unchanged.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match descriptor_availability(path) {
+                Ok((_, ClaimAvailability::RecoveryReserved)) => return,
+                Ok((_, ClaimAvailability::Live)) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Ok((_, availability)) => {
+                    panic!(
+                        "{context}: expected RecoveryReserved after deliberate export close, found {availability:?}"
+                    );
+                }
+                Err(error) => panic!("{context}: {error}"),
+            }
+        }
+    }
+
     #[test]
     fn registry_contention_waits_for_holder_instead_of_timing_out() {
         // Deliberately does NOT install a process-visible coordination-root
@@ -4565,14 +4592,12 @@ mod tests {
             assert!(error.contains("live-owned"), "unexpected retirement error: {error}");
 
             drop(exported);
-            assert_eq!(
-                descriptor_availability(&path)
-                    .expect("probe journal descriptor after deliberate export closes")
-                    .1,
-                ClaimAvailability::RecoveryReserved,
+            wait_for_recovery_reserved_after_deliberate_export_closes(
+                &path,
+                "probe journal descriptor after deliberate export closes",
             );
             retire_descriptor_after_lifecycle_release(&path, &family)
-                .expect("journal descriptor retires immediately after deliberate export closes");
+                .expect("journal descriptor retires after deliberate export authority fully closes");
             assert!(!path.exists());
         });
     }
@@ -5498,11 +5523,9 @@ mod tests {
             );
 
             drop(exported);
-            assert_eq!(
-                descriptor_availability(&path)
-                    .expect("probe journal authority after shared export closes")
-                    .1,
-                ClaimAvailability::RecoveryReserved,
+            wait_for_recovery_reserved_after_deliberate_export_closes(
+                &path,
+                "probe journal authority after shared export closes",
             );
             retire_descriptor_after_lifecycle_release(&path, &family)
                 .expect("shared exported journal descriptor retires after the export closes");

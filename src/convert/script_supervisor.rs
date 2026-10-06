@@ -5376,10 +5376,27 @@ mod tests {
         let (supervisor, parent) = UnixStream::pair().unwrap();
         set_nonblocking(supervisor.as_raw_fd()).unwrap();
         drop(parent);
-        assert_eq!(
-            poll_control(supervisor.as_raw_fd()).unwrap(),
-            Some(CONTROL_PARENT_GONE)
-        );
+
+        // CLOEXEC closes a copied socket at exec, not at fork. Another libtest
+        // worker can therefore transiently fork while `parent` is open and
+        // keep that peer alive until the child reaches exec/_exit. Production
+        // polls this nonblocking channel repeatedly; model that contract here
+        // without turning a persistent missing-EOF defect into a pass.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match poll_control(supervisor.as_raw_fd()).unwrap() {
+                Some(control) => {
+                    assert_eq!(control, CONTROL_PARENT_GONE);
+                    break;
+                }
+                None if Instant::now() < deadline => {
+                    thread::sleep(CONTROL_POLL_INTERVAL);
+                }
+                None => panic!(
+                    "control-channel EOF remained hidden after the parallel-fork grace window"
+                ),
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
