@@ -5531,6 +5531,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_menu_explicit_cue_convert_carries_sidecar_only_authority() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let image = temp.path().join("album.flac");
         let cue = temp.path().join("album.cue");
@@ -5611,6 +5612,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_menu_embedded_cue_carrier_convert_carries_embedded_only_authority() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let image = temp.path().join("album.flac");
         let sidecar = temp.path().join("album.cue");
@@ -7616,6 +7618,7 @@ mod tests {
 
     #[test]
     fn single_image_embedded_cue_enables_menu_and_view_dispatches_embedded_text() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -7646,6 +7649,7 @@ mod tests {
 
     #[test]
     fn second_image_native_multi_file_embedded_cue_enables_and_resolves_from_actual_menu() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -7696,6 +7700,7 @@ mod tests {
 
     #[test]
     fn sidecar_authority_with_valid_embedded_cue_keeps_explicit_embedded_action_live() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;

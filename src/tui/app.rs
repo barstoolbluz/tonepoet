@@ -19736,6 +19736,7 @@ mod app_startup_options_tests {
 
     #[test]
     fn quiescent_v23_startup_activates_v24_protocol_then_current_schema_without_fallback() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let _serial = crate::tui::file_task_runtime::test_environment_lock();
         let temp = tempfile::tempdir().expect("temp dir");
         let db_path = temp.path().join("tonepoet.db");
@@ -20403,6 +20404,7 @@ mod cue_proxy_probe_tests {
 
     #[test]
     fn direct_cue_preview_consumes_embedded_exact_authority_and_overrides_carrier_album() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         use crate::config::AggregateMetadataTarget::{EmbeddedCue, IndividualFiles, SidecarCue};
         use crate::convert::pipeline::CueSidecarPolicy;
 
@@ -20557,6 +20559,7 @@ FILE "album.flac" FLAC
 
     #[test]
     fn transferred_metadata_sidecar_preview_consumes_same_admitted_track_mapping_as_conversion() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         use crate::config::AggregateMetadataTarget::{EmbeddedCue, IndividualFiles, SidecarCue};
         use crate::convert::pipeline::{CueSidecarPolicy, SidecarCueTrackMetadataSource};
 
@@ -20632,6 +20635,7 @@ FILE "track.flac" FLAC
 
     #[test]
     fn malformed_embedded_preview_falls_back_to_same_valid_sidecar_as_queue_admission() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         use crate::config::AggregateMetadataTarget::{EmbeddedCue, IndividualFiles, SidecarCue};
         use crate::convert::pipeline::CueSidecarPolicy;
 

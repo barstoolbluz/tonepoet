@@ -69178,6 +69178,7 @@ mod permanent_delete_tests {
 
     #[test]
     fn delete_path_permanently_removes_file_and_missing_is_idempotent() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let file = temp.path().join("track.flac");
         std::fs::write(&file, b"audio").expect("fixture");
@@ -69194,6 +69195,7 @@ mod permanent_delete_tests {
 
     #[test]
     fn delete_path_permanently_removes_directory_tree() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let dir = temp.path().join("album");
         std::fs::create_dir_all(dir.join("disc-1")).expect("fixture dir");
@@ -69348,6 +69350,7 @@ mod permanent_delete_tests {
 
     #[test]
     fn delete_path_permanently_rejects_unstable_dot_components() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         for unsafe_path in [
             std::path::PathBuf::from("."),
             std::path::PathBuf::from(".."),
@@ -69367,6 +69370,7 @@ mod permanent_delete_tests {
     #[cfg(unix)]
     #[test]
     fn delete_path_permanently_removes_symlink_not_target() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let target = temp.path().join("target");
         let link = temp.path().join("link");
@@ -90859,6 +90863,7 @@ mod single_image_metadata_editor_regression_tests {
 
     #[test]
     fn planner_and_editor_embedded_authority_acceptance_stay_in_lockstep() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -90935,6 +90940,7 @@ mod single_image_metadata_editor_regression_tests {
 
     #[test]
     fn unified_editor_uses_plain_editor_canonical_order_and_alias_deduplication() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -91023,6 +91029,7 @@ mod single_image_metadata_editor_regression_tests {
 
     #[test]
     fn unified_reopen_after_regenerated_read_only_embedded_save_keeps_writable_sidecar_authority() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -91097,6 +91104,7 @@ mod single_image_metadata_editor_regression_tests {
 
     #[test]
     fn unified_reopen_differing_member_embedded_sheets_falls_back_to_sidecar_repair() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -91323,6 +91331,7 @@ mod single_image_metadata_editor_regression_tests {
 
     #[test]
     fn embedded_cuesheet_delete_decline_does_not_remove_real_tag_or_sidecar() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -91374,6 +91383,7 @@ mod single_image_metadata_editor_regression_tests {
 
     #[test]
     fn embedded_cuesheet_delete_stages_save_path_tombstone_and_deletes_real_tag_via_helper() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -91419,6 +91429,7 @@ mod single_image_metadata_editor_regression_tests {
 
     #[test]
     fn embedded_cuesheet_edit_stages_real_embedded_tag_diff_and_writes_via_helper() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -91639,6 +91650,7 @@ mod single_image_metadata_editor_regression_tests {
 
     #[test]
     fn mb_apply_two_track_two_image_rows_save_without_whole_file_title_writes() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -91863,6 +91875,7 @@ mod single_image_metadata_editor_regression_tests {
 
     #[test]
     fn mb_apply_ignores_stale_embedded_subset_cuesheet_and_opens_one_unified_ten_row_surface() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -93531,6 +93544,7 @@ mod single_image_metadata_editor_regression_tests {
 
     #[test]
     fn multipart_album_exposes_read_only_global_embedded_authority_without_fake_side_writers() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -93659,6 +93673,7 @@ mod single_image_metadata_editor_regression_tests {
 
     #[test]
     fn cue_image_album_priority_allows_read_only_native_multifile_embedded_authority() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -95422,6 +95437,7 @@ mod single_image_metadata_editor_regression_tests {
 
     #[test]
     fn foxy_folder_and_explicit_cue_routes_retain_sidecar_and_write_back_album_fields() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
 
         for route in ["folder", "cue"] {
@@ -95494,6 +95510,7 @@ mod single_image_metadata_editor_regression_tests {
 
     #[test]
     fn single_image_sidecar_albumartist_edit_clear_and_delete_round_trip() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let open_sidecar = |album: &std::path::Path, parent: &std::path::Path| {
             let mut app = AppState::new_for_test(TonepoetConfig::default());
             select_foxy_route(&mut app, album, parent);
@@ -95660,6 +95677,7 @@ mod single_image_metadata_editor_regression_tests {
 
     #[test]
     fn single_image_sidecar_album_field_deletions_persist_and_do_not_resurrect() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         struct AlbumFieldDeletionCase {
             route: &'static str,
             key: &'static str,
@@ -95812,6 +95830,7 @@ mod single_image_metadata_editor_regression_tests {
 
     #[test]
     fn foxy_alternative_cues_select_exact_sidecar_and_persist_save() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let (album, image, exact_cue, exact_sidecar) =
             create_foxy_route_fixture(temp.path(), "alternative-selection");
@@ -95985,6 +96004,7 @@ mod single_image_metadata_editor_regression_tests {
 
     #[test]
     fn foxy_explicit_cue_pins_sidecar_and_image_uses_configured_authority() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
 
         let (cue_album, cue_image, cue_path, cue_sidecar) =
@@ -96229,6 +96249,7 @@ mod single_image_metadata_editor_regression_tests {
 
     #[test]
     fn multiple_same_image_sidecars_choose_one_stably_across_preview_editor_and_conversion() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         use crate::convert::pipeline::CueSidecarPolicy;
 
         let temp = tempfile::tempdir().expect("tempdir");
@@ -96325,6 +96346,7 @@ mod single_image_metadata_editor_regression_tests {
 
     #[test]
     fn direct_audio_without_cue_still_uses_explicit_ignore_cue_authority() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         use crate::convert::pipeline::CueSidecarPolicy;
 
         let temp = tempfile::tempdir().expect("tempdir");
@@ -96478,6 +96500,7 @@ mod single_image_metadata_editor_regression_tests {
 
     #[tokio::test]
     async fn configured_metadata_authority_agrees_across_editor_queue_conversion_and_save_matrix() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         use crate::config::AggregateMetadataTarget::{EmbeddedCue, IndividualFiles, SidecarCue};
         use crate::convert::pipeline::{AlbumMetadata, CueSidecarPolicy, SourceKind};
 
@@ -97387,6 +97410,7 @@ mod single_image_metadata_editor_regression_tests {
 
     #[test]
     fn explicit_sidecar_projection_reuses_existing_non_stem_sidecar() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let (album, image, original_cue_path, _) =
             create_foxy_route_fixture(temp.path(), "sidecar-override-name");
@@ -97436,6 +97460,7 @@ mod single_image_metadata_editor_regression_tests {
 
     #[test]
     fn explicit_embedded_projection_snapshots_lower_priority_existing_carrier() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -97618,6 +97643,7 @@ mod metadata_cue_source_coverage_tests {
 
     #[test]
     fn single_image_multitrack_sidecar_builds_clean_synthetic_album_with_or_without_embedded_cue() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -97663,6 +97689,7 @@ mod metadata_cue_source_coverage_tests {
 
     #[test]
     fn genuine_single_track_single_image_cue_remains_flat() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -97897,6 +97924,7 @@ mod metadata_cue_source_coverage_tests {
 
     #[test]
     fn presplit_metadata_sidecar_priority_materializes_the_selected_source() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -97968,6 +97996,7 @@ mod metadata_cue_source_coverage_tests {
 
     #[test]
     fn explicit_presplit_sidecar_is_active_and_keeps_file_tags_accessible() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -98010,6 +98039,7 @@ mod metadata_cue_source_coverage_tests {
 
     #[test]
     fn presplit_read_only_native_multifile_embedded_obeys_authority_without_faking_writability() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -98169,6 +98199,7 @@ mod metadata_cue_source_coverage_tests {
 
     #[test]
     fn presplit_sidecar_first_keeps_only_the_uncovered_bonus_as_ordinary_audio() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -98231,6 +98262,7 @@ mod metadata_cue_source_coverage_tests {
 
     #[test]
     fn presplit_transfer_priority_materializes_cue_order_metadata_and_uncovered_bonus() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -99484,6 +99516,7 @@ FILE "a.flac" WAVE
 
     #[test]
     fn configured_tag_transfer_entry_uses_live_priority_for_directory_and_explicit_image() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let album = temp.path().join("album");
         std::fs::create_dir_all(&album).expect("album");
@@ -99700,6 +99733,7 @@ FILE "a.flac" WAVE
 
     #[test]
     fn mixed_folder_resolves_each_independent_album_group_before_aggregation() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -99777,6 +99811,7 @@ FILE "a.flac" WAVE
 
     #[test]
     fn metadata_editor_resolves_sidecar_and_embedded_album_groups_independently() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -99876,6 +99911,7 @@ FILE "a.flac" WAVE
 
     #[test]
     fn metadata_editor_presplit_files_and_embedded_image_do_not_influence_each_other() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -99949,6 +99985,7 @@ FILE "a.flac" WAVE
 
     #[test]
     fn heterogeneous_metadata_tabs_route_saves_only_to_their_own_authority() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -100216,6 +100253,7 @@ FILE "a.flac" WAVE
 
     #[test]
     fn metadata_editor_directory_uses_configured_priority_and_explicit_cue_pins_sidecar() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -100848,6 +100886,7 @@ FILE "a.flac" WAVE
 
     #[test]
     fn explicit_cue_or_image_in_multi_surface_folder_scopes_to_selected_content_and_exposes_its_sources() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -100949,6 +100988,7 @@ FILE "a.flac" WAVE
 
     #[test]
     fn single_image_folder_with_embedded_only_cue_classifies_as_embedded_carrier() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -101472,6 +101512,7 @@ FILE "a.flac" WAVE
 
     #[test]
     fn musicbrainz_split_cue_reconstruction_retains_configured_authority_and_fallback() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -101643,6 +101684,7 @@ FILE "a.flac" WAVE
 
     #[test]
     fn unrelated_embedded_albums_open_as_separate_tabs_and_save_independently() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -101745,6 +101787,7 @@ FILE "a.flac" WAVE
 
     #[test]
     fn embedded_sides_of_one_album_open_as_one_coherent_tab() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -102980,6 +103023,7 @@ FILE "a.flac" WAVE
 
     #[test]
     fn invalid_lower_priority_embedded_cue_does_not_block_valid_folder_source() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -103065,6 +103109,7 @@ FILE "a.flac" WAVE
 
     #[test]
     fn aggregate_embedded_priority_collects_all_usable_images_in_stable_order() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -103164,6 +103209,7 @@ FILE "a.flac" WAVE
 
     #[test]
     fn aggregate_target_falls_through_and_sidecar_still_outranks_embedded() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -103222,6 +103268,7 @@ FILE "a.flac" WAVE
 
     #[test]
     fn read_only_embedded_musepack_remains_automatic_authority_when_embedded_is_first() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         use crate::config::AggregateMetadataTarget::{EmbeddedCue, IndividualFiles, SidecarCue};
         use crate::convert::pipeline::{CueSidecarPolicy, SourceKind};
 
@@ -103343,6 +103390,7 @@ FILE "a.flac" WAVE
 
     #[test]
     fn read_only_embedded_remains_explicitly_readable_for_transfer_source_use() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let image = temp.path().join("disc.mpc");
         write_read_only_embedded_mpc_fixture(&image, "Read-only Embedded");
@@ -103364,6 +103412,7 @@ FILE "a.flac" WAVE
 
     #[test]
     fn exact_embedded_only_conversion_read_is_preserved_for_read_only_carrier() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let image = temp.path().join("disc.mpc");
         write_read_only_embedded_mpc_fixture(&image, "Read-only Embedded");
@@ -103380,6 +103429,7 @@ FILE "a.flac" WAVE
 
     #[test]
     fn directory_editor_uses_all_embedded_carriers_and_regenerates_them_separately() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -103530,6 +103580,7 @@ FILE "a.flac" WAVE
 
     #[test]
     fn explicit_multi_audio_selection_stays_individual_even_when_files_have_embedded_cues() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
             return;
@@ -104708,6 +104759,7 @@ mod untaggable_carrier_sidecar_regression_tests {
 
     #[tokio::test]
     async fn multifile_sidecar_untagged_carriers_save_album_performer_and_comment() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         fn write_minimal_pcm_wav(path: &std::path::Path) {
             let mut wav = Vec::with_capacity(46);
             wav.extend_from_slice(b"RIFF");
@@ -104821,6 +104873,7 @@ mod untaggable_carrier_sidecar_regression_tests {
 
     #[tokio::test]
     async fn sidecar_albumartist_multivalue_projection_warns_without_failing_or_staying_dirty() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         use crate::config::AggregateMetadataTarget::{
             EmbeddedCue, IndividualFiles, SidecarCue,
         };
@@ -105179,6 +105232,7 @@ mod untaggable_carrier_sidecar_regression_tests {
 
     #[test]
     fn single_image_save_authority_flips_only_with_configured_priority() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         use crate::config::AggregateMetadataTarget::{
             EmbeddedCue, IndividualFiles, SidecarCue,
         };
@@ -105309,6 +105363,7 @@ mod untaggable_carrier_sidecar_regression_tests {
 
     #[test]
     fn new_sidecar_generation_replaces_stale_embedded_file_token_without_claiming_authority() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         use crate::config::AggregateMetadataTarget::{
             EmbeddedCue, IndividualFiles, SidecarCue,
         };
@@ -105422,6 +105477,7 @@ mod untaggable_carrier_sidecar_regression_tests {
 
     #[test]
     fn taggable_single_image_sidecar_stages_arbitrary_field_without_native_tag_io() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         use crate::config::AggregateMetadataTarget::{
             EmbeddedCue, IndividualFiles, SidecarCue,
         };
@@ -105941,6 +105997,7 @@ mod untaggable_carrier_sidecar_regression_tests {
     /// the production asynchronous save path, then reopen from disk.
     #[tokio::test]
     async fn nine_file_dff_headerless_sidecar_edits_apply_persist_and_reopen_clean() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let names = [
             "01 - Wanna Be Startin' Somethin'.dff",
@@ -106064,6 +106121,7 @@ mod untaggable_carrier_sidecar_regression_tests {
 
     #[tokio::test]
     async fn single_image_multitrack_dff_edits_persist_through_production_save() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let audio = temp.path().join("album.dff");
         let cue = temp.path().join("album.cue");
@@ -106120,6 +106178,7 @@ mod untaggable_carrier_sidecar_regression_tests {
 
     #[tokio::test]
     async fn multifile_shn_sidecar_exercises_edit_and_save_without_format_special_cases() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let first = temp.path().join("01 - First.shn");
         let second = temp.path().join("02 - Second.shn");
@@ -106189,6 +106248,7 @@ mod untaggable_carrier_sidecar_regression_tests {
 
     #[tokio::test]
     async fn extra_unreferenced_dff_stays_separate_while_sidecar_album_saves_cleanly() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         use crate::config::AggregateMetadataTarget::{EmbeddedCue, IndividualFiles, SidecarCue};
 
         let temp = tempfile::tempdir().expect("tempdir");

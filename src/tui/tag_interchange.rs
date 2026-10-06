@@ -2146,6 +2146,7 @@ mod tests {
 
     #[test]
     fn mixed_wavpack_transfer_empty_slot_deletes_native_fallback_target_field() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         // Strong-mode writes consult the metadata journal DB; isolate
         // XDG dirs (and serialize with other env-redirecting tests) so a
         // concurrent guard user cannot swap the journal path mid-write.

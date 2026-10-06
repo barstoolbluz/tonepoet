@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
-"""Audit tests that enter the shared coordination registry.
+"""Audit tests that enter TonePoet's coordination registry.
 
-The 2026-08-18 corrective requires each coordination-touching test to own one
-serialized, per-test registry root. This static audit covers direct registry,
-queue, and recovery entrypoints plus reviewed higher-level mutation boundaries
-that acquire coordination internally. It recognizes ordinary and Tokio unit
-tests and also scans top-level integration tests. The approved fixture helpers
-all install the same serialized isolation discipline. This supplements Rust
-tests; it does not try to infer arbitrary call graphs.
+R31 splits test isolation into two deliberately different fixtures:
+
+* ordinary single-threaded coordination tests use a nonblocking thread-local
+  registry root, so they remain parallel and cannot be redirected by another
+  test's process-visible fixture;
+* tests that intentionally coordinate across worker threads/tasks or re-exec a
+  test child use the older serialized process-visible root (or an established
+  explicit fixture that provides equivalent handoff semantics).
+
+This audit covers direct registry, queue, and recovery entrypoints plus reviewed
+higher-level mutation boundaries that acquire coordination internally. It
+recognizes ordinary and Tokio unit tests and scans top-level integration tests.
+It is intentionally bounded and supplements Rust tests rather than attempting a
+general Rust call graph.
 """
 from __future__ import annotations
 
@@ -21,6 +28,22 @@ PUBLIC_METADATA_WRITER_ENTRYPOINTS = {
     "public metadata scalar write": re.compile(r"\bwrite_all_tags(?:_with_cancel)?\s*\("),
     "public metadata list write": re.compile(
         r"\bwrite_all_tag_value_lists(?:_with_cancel|_to_id3v2_with_cancel)?\s*\("
+    ),
+}
+
+# These boundaries launch coordination-touching work on a worker thread/task.
+# A thread-local root on the calling libtest thread cannot follow that work, so
+# tests exercising them require the process-visible fixture. The two
+# save_through_* names are deliberately narrow test helpers in keybindings.rs;
+# including them closes the one-hop gap that let sidecar-save tests escape the
+# R30 audit.
+PROCESS_VISIBLE_ENTRYPOINTS = {
+    "background metadata save": re.compile(r"\bmetadata_editor_save\s*\("),
+    "background CUE carrier save": re.compile(
+        r"\bmetadata_editor_write_tags_to_(?:sidecar|embedded)_cue\s*\("
+    ),
+    "background metadata save test helper": re.compile(
+        r"\bsave_through_(?:production_path|explicit_embedded_cue_path)\s*\("
     ),
 }
 
@@ -54,13 +77,18 @@ DIRECT_ENTRYPOINTS = {
     ),
     "coordination root handoff": re.compile(r"crate::concurrency::coordination_root\s*\("),
     "file-operation journal": re.compile(r"\bFileTaskJournalHandle::create\s*\("),
+    # Startup activation can acquire/reconcile concurrency protocol authority even
+    # before later queue entrypoints are reached. R30 moved this test's existing
+    # scope earlier for lock order, but the recovery edit removed the moved line;
+    # keep the audit aware of this boundary so that omission cannot recur.
+    "app startup activation": re.compile(r"\bAppState::try_new_with_startup_options\s*\("),
     # Reviewed production mutation boundaries from audit_concurrent_mutation_entrypoints.py.
     # Including their call sites catches tests that enter coordination indirectly.
     "metadata admission": re.compile(r"\badmit_metadata_mutation_paths\s*\("),
-    "metadata save": re.compile(r"\bmetadata_editor_save\s*\("),
+    **PROCESS_VISIBLE_ENTRYPOINTS,
     # Public metadata writer APIs acquire the same admission/journal/lease
-    # machinery internally. Tests that invoke them directly must participate
-    # in the process-visible test registry serialization discipline too.
+    # machinery internally. Tests that invoke them directly must therefore use
+    # an appropriate R31 test-registry isolation fixture too.
     **PUBLIC_METADATA_WRITER_ENTRYPOINTS,
     "tag maintenance": re.compile(r"\bstart_tag_maintenance\s*\("),
     "artwork write": re.compile(r"\bwrite_artwork_to_files_with_cancel\s*\("),
@@ -99,10 +127,14 @@ DIRECT_ENTRYPOINTS = {
 }
 
 SCOPE_MARKERS = (
+    # R31 default: a nonblocking thread-local root for ordinary tests.
+    "isolated_test_coordination_root()",
+    # Process-visible roots are reserved for tests whose coordination really
+    # crosses a worker/task/process boundary. They deliberately serialize.
     "scoped_test_coordination_root()",
     "install_scoped_test_coordination_root(",
     # The legacy narrow fixture remains valid for tests proven to remain on one
-    # thread; it shares the same global serial mutex with the process-wide scope.
+    # thread; it shares the older global serial mutex with process-visible scope.
     "install_test_coordination_root(",
     "with_root(",
     "JournalDirGuard::install(",
@@ -120,6 +152,20 @@ SCOPE_MARKERS = (
 CROSS_PROCESS_CHILD_EXEMPTIONS = {
     ("src/db.rs", "cross_process_database_open_child"),
     ("src/db.rs", "concurrent_queue_scope_process_child"),
+}
+
+# Fixture self-tests intentionally exercise interactions that ordinary tests
+# are forbidden to compose directly. Their invariants are pinned by the R31
+# static verifier and focused Rust regressions.
+COORDINATION_FIXTURE_SELF_TEST_EXEMPTIONS = {
+    (
+        "src/concurrency.rs",
+        "isolated_test_coordination_root_outranks_unrelated_process_scope_without_waiting",
+    ),
+    (
+        "src/concurrency.rs",
+        "nested_isolated_test_coordination_root_reuses_one_thread_registry",
+    ),
 }
 
 
@@ -296,25 +342,59 @@ for path in sorted(paths):
         if not hits:
             continue
         reviewed += 1
+        if (rel, name) in COORDINATION_FIXTURE_SELF_TEST_EXEMPTIONS:
+            continue
         scope_markers = [marker for marker in SCOPE_MARKERS if marker in body]
-        direct_scope_count = body.count("scoped_test_coordination_root()")
+        direct_process_scope_count = body.count("scoped_test_coordination_root()")
+        direct_local_scope_count = body.count("isolated_test_coordination_root()")
+        direct_scope_count = direct_process_scope_count + direct_local_scope_count
+        if direct_process_scope_count > 1:
+            failures.append(
+                f"{rel}:{line} {name}: nested/repeated non-reentrant process-visible coordination scopes"
+            )
+            continue
+        if direct_local_scope_count > 1:
+            failures.append(
+                f"{rel}:{line} {name}: repeated direct thread-local coordination scopes"
+            )
+            continue
         if direct_scope_count > 1:
             failures.append(
-                f"{rel}:{line} {name}: nested/repeated non-reentrant direct coordination scopes"
+                f"{rel}:{line} {name}: mixes thread-local and process-visible coordination scopes"
             )
             continue
         if direct_scope_count == 1 and len(scope_markers) > 1:
+            direct_marker = (
+                "scoped_test_coordination_root()"
+                if direct_process_scope_count
+                else "isolated_test_coordination_root()"
+            )
             failures.append(
                 f"{rel}:{line} {name}: direct coordination scope is redundantly nested with "
-                + ", ".join(marker for marker in scope_markers if marker != "scoped_test_coordination_root()")
+                + ", ".join(marker for marker in scope_markers if marker != direct_marker)
             )
             continue
-        if direct_scope_count == 1:
-            # The repository's established hierarchy is coordination first,
-            # then process-global XDG/file-task environment serialization.
-            # Enforce it here because R30 adds scopes to tests that may already
-            # own one of those secondary guards; reversing the order can turn a
-            # flake fix into a test-only lock-order deadlock.
+        explicit_fanout = re.search(
+            r"\b(?:std::thread::spawn|thread::spawn|tokio::spawn|tokio::task::spawn|spawn_blocking)\s*\(",
+            body,
+        )
+        process_visible_hits = [
+            label for label, pattern in PROCESS_VISIBLE_ENTRYPOINTS.items() if pattern.search(body)
+        ]
+        if direct_local_scope_count == 1 and (explicit_fanout or process_visible_hits):
+            reason = (
+                "explicit worker/task fan-out"
+                if explicit_fanout
+                else ", ".join(process_visible_hits)
+            )
+            failures.append(
+                f"{rel}:{line} {name}: thread-local coordination scope cannot cover {reason}"
+            )
+            continue
+        if direct_process_scope_count == 1:
+            # Process-visible scope still participates in the legacy serial lock,
+            # so preserve the established ordering with other process-global
+            # fixture locks. R31 avoids applying this scope to ordinary tests.
             scope_index = body.index("scoped_test_coordination_root()")
             order_failure = False
             for later_guard in ("XdgConfigHomeGuard::new(", "test_environment_lock()"):
@@ -339,4 +419,6 @@ if failures:
         print(f"[FAIL] coordination test isolation: {failure}")
     raise SystemExit(1)
 
-print(f"[ok] {reviewed} reviewed coordination-touching tests are isolated or explicit child handoffs")
+print(
+    f"[ok] {reviewed} reviewed coordination-touching tests use thread-local/process-visible isolation or explicit child handoffs"
+)

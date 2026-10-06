@@ -1442,6 +1442,7 @@ mod tests {
 
     #[test]
     fn single_file_writer_round_trips_ordered_performer_and_arranger_lists() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         use lofty::tag::ItemKey;
 
         let temp = tempfile::tempdir().expect("single-file multi-value tempdir");
@@ -1628,6 +1629,7 @@ mod tests {
 
     #[test]
     fn invalid_ape_fallback_marks_recovery_and_preserves_full_valid_tag_set() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         use lofty::tag::ItemKey;
 
         let temp = tempfile::tempdir().expect("invalid APE materializer tempdir");

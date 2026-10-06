@@ -2747,9 +2747,24 @@ fn test_coordination_override_state() -> &'static Mutex<Option<TestCoordinationR
 }
 
 #[cfg(test)]
-fn scoped_test_coordination_state() -> &'static Mutex<Option<PathBuf>> {
-    static STATE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+struct ScopedTestCoordinationRootState {
+    owner: std::thread::ThreadId,
+    path: PathBuf,
+}
+
+#[cfg(test)]
+fn scoped_test_coordination_state() -> &'static Mutex<Option<ScopedTestCoordinationRootState>> {
+    static STATE: OnceLock<Mutex<Option<ScopedTestCoordinationRootState>>> = OnceLock::new();
     STATE.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Nonblocking per-test registry override for ordinary unit tests. Unlike
+    /// `scoped_test_coordination_root`, this never mutates process-global
+    /// environment or participates in the global serial fixture lock.
+    static ISOLATED_TEST_COORDINATION_ROOT_STACK: std::cell::RefCell<Vec<PathBuf>> =
+        std::cell::RefCell::new(Vec::new());
 }
 
 /// Thread-owned root override for narrowly local descriptor fixtures. This is
@@ -2808,11 +2823,10 @@ fn current_test_coordination_root_override() -> Option<PathBuf> {
         .map(|current| current.path.clone())
 }
 
-/// Process-visible, serialized coordination root for one coordination-touching
-/// unit test. The guard owns the environment override for the whole test so
-/// worker threads/tasks and production-like helper subprocesses inherit the
-/// same registry. Every coordination-touching unit test must hold this serial
-/// scope; unrelated tests need not.
+/// Process-visible, serialized coordination root for a unit test that
+/// intentionally coordinates across worker threads/tasks or helper subprocesses.
+/// Ordinary coordination-touching tests use `isolated_test_coordination_root`
+/// instead so default libtest parallelism never queues behind this mutex.
 #[cfg(test)]
 pub(crate) struct ScopedTestCoordinationRootGuard {
     _serial: std::sync::MutexGuard<'static, ()>,
@@ -2835,7 +2849,10 @@ impl ScopedTestCoordinationRootGuard {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             assert!(state.is_none(), "test coordination scope must be singular");
-            *state = Some(path.clone());
+            *state = Some(ScopedTestCoordinationRootState {
+                owner: std::thread::current().id(),
+                path: path.clone(),
+            });
         }
         std::env::set_var("TONEPOET_CONCURRENCY_DIR", &path);
         std::env::remove_var(TEST_CONCURRENCY_INHERIT_ENV);
@@ -2887,7 +2904,10 @@ impl Drop for ScopedTestCoordinationRootGuard {
         let mut state = scoped_test_coordination_state()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.as_deref() == Some(self.root.as_path()) {
+        if state
+            .as_ref()
+            .is_some_and(|current| current.path == self.root)
+        {
             *state = None;
         }
         drop(state);
@@ -2908,7 +2928,96 @@ fn current_scoped_test_coordination_root() -> Option<PathBuf> {
     scoped_test_coordination_state()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone()
+        .as_ref()
+        .map(|current| current.path.clone())
+}
+
+#[cfg(test)]
+fn current_owned_scoped_test_coordination_root() -> Option<PathBuf> {
+    let owner = std::thread::current().id();
+    scoped_test_coordination_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .filter(|current| current.owner == owner)
+        .map(|current| current.path.clone())
+}
+
+/// Nonblocking, thread-local registry isolation for ordinary coordination-
+/// touching unit tests. This is deliberately different from
+/// `scoped_test_coordination_root`: it does not serialize libtest workers and
+/// it does not make a root process-visible. Tests that intentionally exercise
+/// coordination across worker threads or re-executed test subprocesses must
+/// continue to use the process-visible fixture (or explicitly install the same
+/// root in each participant).
+#[cfg(test)]
+pub(crate) struct IsolatedTestCoordinationRootGuard {
+    root: PathBuf,
+    // The stack lives in OS-thread-local storage. Refuse to move its guard to a
+    // different thread, where Drop would otherwise pop the wrong stack.
+    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(test)]
+impl IsolatedTestCoordinationRootGuard {
+    fn install(path: PathBuf) -> Self {
+        ISOLATED_TEST_COORDINATION_ROOT_STACK.with(|stack| {
+            stack.borrow_mut().push(path.clone());
+        });
+        Self {
+            root: path,
+            _not_send: std::marker::PhantomData,
+        }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.root
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn isolated_test_coordination_root() -> IsolatedTestCoordinationRootGuard {
+    if let Some(root) = ISOLATED_TEST_COORDINATION_ROOT_STACK
+        .with(|stack| stack.borrow().last().cloned())
+    {
+        return IsolatedTestCoordinationRootGuard::install(root);
+    }
+
+    // If the current test already owns the process-visible fixture, a nested
+    // ordinary helper must stay in that same registry rather than silently
+    // partitioning the test. An unrelated libtest worker cannot satisfy this
+    // owner check, which is the R31 isolation boundary.
+    if let Some(root) = current_owned_scoped_test_coordination_root() {
+        return IsolatedTestCoordinationRootGuard::install(root);
+    }
+
+    let process_root = cargo_test_coordination_root()
+        .expect("unit tests must have a process-private coordination root");
+    let root = process_root
+        .join("isolated")
+        .join(Uuid::new_v4().to_string());
+    create_private_dir(&root).expect("create isolated thread-local test coordination root");
+    IsolatedTestCoordinationRootGuard::install(root)
+}
+
+#[cfg(test)]
+impl Drop for IsolatedTestCoordinationRootGuard {
+    fn drop(&mut self) {
+        ISOLATED_TEST_COORDINATION_ROOT_STACK.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            let current = stack.pop().expect("isolated test coordination root stack underflow");
+            assert_eq!(
+                current, self.root,
+                "isolated test coordination roots must retire in LIFO order"
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+fn current_isolated_test_coordination_root() -> Option<PathBuf> {
+    ISOLATED_TEST_COORDINATION_ROOT_STACK
+        .with(|stack| stack.borrow().last().cloned())
 }
 
 /// Cargo's test executables live under `target/{profile}/deps` and carry a
@@ -2948,10 +3057,11 @@ pub(crate) fn running_under_cargo_test_harness() -> bool {
 }
 
 fn cargo_test_coordination_root() -> Option<PathBuf> {
-    // Safety fallback only: coordination-touching unit tests are required to
-    // hold `scoped_test_coordination_root` (or an approved explicit fixture).
-    // Keeping a process-private fallback prevents an accidentally unscoped
-    // future test from ever consulting the user's real ~/.config registry;
+    // Safety fallback only: reviewed coordination-touching unit tests use either
+    // `isolated_test_coordination_root`, the process-visible scoped fixture, or
+    // an approved explicit fixture. Keeping a process-private fallback prevents
+    // an accidentally unscoped future test from ever consulting the user's real
+    // ~/.config registry;
     // it is not the isolation boundary for reviewed coordination tests.
     if !running_under_cargo_test_harness() {
         return None;
@@ -2974,6 +3084,14 @@ fn cargo_test_coordination_root() -> Option<PathBuf> {
 
 pub fn coordination_root() -> PathBuf {
     if running_under_cargo_test_harness() {
+        // R31: an ordinary unit test's thread-local root must outrank any
+        // process-visible scoped fixture owned by another concurrently running
+        // libtest worker. This prevents the process fixture from redirecting
+        // unrelated tests into its registry without adding any blocking lock.
+        #[cfg(test)]
+        if let Some(path) = current_isolated_test_coordination_root() {
+            return path;
+        }
         #[cfg(test)]
         if let Some(path) = current_scoped_test_coordination_root() {
             return path;
@@ -3706,6 +3824,74 @@ mod tests {
     }
 
     #[test]
+    fn isolated_test_coordination_root_outranks_unrelated_process_scope_without_waiting() {
+        let process_scope = scoped_test_coordination_root();
+        let process_root = process_scope.path().to_path_buf();
+        assert_eq!(coordination_root(), process_root);
+
+        let (root_tx, root_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            // Model a different libtest worker that needs ordinary local
+            // coordination while another test owns the process-visible scope.
+            // R30 blocked here on the shared serial mutex; R31 must not.
+            let isolated = isolated_test_coordination_root();
+            let isolated_root = isolated.path().to_path_buf();
+            let resolved = coordination_root();
+            root_tx
+                .send((isolated_root, resolved))
+                .expect("publish isolated worker root");
+        });
+
+        let roots = root_rx.recv_timeout(Duration::from_secs(2));
+        let (isolated_root, resolved) = match roots {
+            Ok(roots) => roots,
+            Err(error) => {
+                // Release the legacy serial scope before joining so this
+                // regression itself can never strand the suite if it fails.
+                drop(process_scope);
+                worker
+                    .join()
+                    .expect("isolated coordination worker after timeout");
+                panic!(
+                    "thread-local coordination isolation waited on the process scope: {error}"
+                );
+            }
+        };
+
+        worker.join().expect("isolated coordination worker");
+        assert_eq!(resolved, isolated_root);
+        assert_ne!(
+            isolated_root, process_root,
+            "an unrelated test thread must not be redirected into the process-visible registry"
+        );
+        assert_eq!(
+            coordination_root(),
+            process_root,
+            "the process-scope owner must retain its own registry"
+        );
+        drop(process_scope);
+    }
+
+    #[test]
+    fn nested_isolated_test_coordination_root_reuses_one_thread_registry() {
+        let outer = isolated_test_coordination_root();
+        let expected = outer.path().to_path_buf();
+        assert_eq!(coordination_root(), expected);
+
+        {
+            let inner = isolated_test_coordination_root();
+            assert_eq!(inner.path(), expected.as_path());
+            assert_eq!(coordination_root(), expected);
+        }
+
+        assert_eq!(
+            coordination_root(),
+            expected,
+            "retiring a nested local scope must restore the same outer registry"
+        );
+    }
+
+    #[test]
     fn scoped_test_coordination_root_retirement_keeps_captured_family_path_alive() {
         let scope = scoped_test_coordination_root();
         let expected_root = scope.path().to_path_buf();
@@ -3713,9 +3899,9 @@ mod tests {
         let (retired_tx, retired_rx) = std::sync::mpsc::channel();
 
         let worker = std::thread::spawn(move || {
-            // This is the problematic libtest interleaving: an unrelated worker
-            // resolves the process-visible scoped root while the owner is live,
-            // but does not create its lease staging file until after retirement.
+            // A worker spawned by the scoped test resolves the process-visible
+            // root while the owner is live, but does not create its lease staging
+            // file until after the owner retires the scope.
             let root = coordination_root();
             assert_eq!(root, expected_root);
             let family_dir = root.join(LeaseFamily::EphemeralMutation {

@@ -20042,6 +20042,7 @@ mod tests {
 
     #[test]
     fn pipeline_public_value_list_writer_rejects_invalid_requests_before_io() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         use lofty::tag::ItemKey;
 
         let missing = std::path::Path::new("/definitely/missing/tonepoet-phase4-validation.flac");
@@ -23181,6 +23182,7 @@ mod tests {
     // XDG dirs (and serialize with other env-redirecting tests) so a
     // concurrent guard user cannot swap the journal path mid-write.
     fn native_wavpack_write_preserves_invalid_ape_item_byte_exactly() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
             "tonepoet-wavpack-invalid-preserve",
         );
@@ -23219,6 +23221,7 @@ mod tests {
 
     #[test]
     fn invalid_ape_repair_removes_only_invalid_items_and_restores_lofty_route() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
             "tonepoet-wavpack-invalid-repair",
         );
@@ -23339,6 +23342,7 @@ mod tests {
     // XDG dirs (and serialize with other env-redirecting tests) so a
     // concurrent guard user cannot swap the journal path mid-write.
     fn native_wavpack_empty_string_deletes_ordinary_ape_item() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
             "tonepoet-wavpack-empty-delete",
         );
@@ -23381,6 +23385,7 @@ mod tests {
     // XDG dirs (and serialize with other env-redirecting tests) so a
     // concurrent guard user cannot swap the journal path mid-write.
     fn native_wavpack_empty_numbering_deletes_or_reduces_combined_item() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
             "tonepoet-wavpack-numbering-delete",
         );
@@ -23436,6 +23441,7 @@ mod tests {
 
     #[test]
     fn healthy_wavpack_write_is_bounded_to_the_ape_tail() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
             "tonepoet-healthy-wavpack-tail-write",
         );
@@ -23522,6 +23528,7 @@ mod tests {
 
     #[test]
     fn monkeys_audio_write_is_enabled_and_bounded_to_the_ape_tail() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
             "tonepoet-monkeys-audio-tail-write",
         );
@@ -23574,6 +23581,7 @@ mod tests {
 
     #[test]
     fn prepared_ape_tail_journal_restores_the_exact_original_tail() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         use std::io::{Read, Seek, SeekFrom, Write};
 
         let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
@@ -23642,6 +23650,7 @@ mod tests {
 
     #[test]
     fn committed_ape_tail_journal_adopts_the_durable_new_tail() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         use std::io::{Read, Seek, SeekFrom, Write};
 
         let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
@@ -23730,6 +23739,7 @@ mod tests {
 
     #[test]
     fn healthy_wavpack_native_tail_deletion_observes_combined_numbering_state() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
             "tonepoet-wavpack-healthy-tail-delete",
         );
@@ -23772,6 +23782,7 @@ mod tests {
     // XDG dirs (and serialize with other env-redirecting tests) so a
     // concurrent guard user cannot swap the journal path mid-write.
     fn native_wavpack_write_is_byte_idempotent_for_matching_read_only_item() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
             "tonepoet-wavpack-idempotent",
         );
@@ -24664,6 +24675,7 @@ mod tests {
 
     #[test]
     fn lofty_vorbis_numbering_capability_matches_production_round_trip() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         assert_textual_numbering_backend_round_trip(
             "numbering.ogg",
             VORBIS_NUMBERING_FIXTURE,
@@ -24673,6 +24685,7 @@ mod tests {
 
     #[test]
     fn native_flac_numbering_repetition_is_byte_identical() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("native FLAC numbering tempdir");
         let path = temp.path().join("numbering.flac");
         let blocks = vec![
@@ -24732,6 +24745,7 @@ mod tests {
 
     #[test]
     fn native_flac_disk_aliases_canonicalize_conflict_close_and_repeat_as_noop() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let (_temp, path) =
             copy_numbering_fixture("disk-aliases.flac", NATIVE_FLAC_NUMBERING_FIXTURE);
         flac_metadata_writer::test_replace_vorbis_comments(
@@ -24874,6 +24888,7 @@ mod tests {
 
     #[test]
     fn lofty_vorbis_disk_aliases_canonicalize_conflict_close_and_repeat_as_noop() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let (_temp, path) = copy_numbering_fixture("disk-aliases.ogg", VORBIS_NUMBERING_FIXTURE);
         seed_lofty_vorbis_comments(
             &path,
@@ -25065,6 +25080,7 @@ mod tests {
 
     #[test]
     fn id3v2_numbering_capability_matches_production_round_trip() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         assert_plain_unsigned_numbering_backend_round_trip(
             "numbering.mp3",
             ID3V2_NUMBERING_FIXTURE,
@@ -25087,6 +25103,7 @@ mod tests {
 
     #[test]
     fn id3_punctuation_custom_fields_remain_independent_on_real_carrier() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let (_temp, path) = copy_numbering_fixture("custom.mp3", ID3V2_NUMBERING_FIXTURE);
         let custom_changes = [
             (
@@ -25127,6 +25144,7 @@ mod tests {
 
     #[test]
     fn ape_punctuation_custom_fields_remain_independent_on_real_carrier() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
             "tonepoet-ape-punctuation-custom-fields",
         );
@@ -25170,6 +25188,7 @@ mod tests {
 
     #[test]
     fn mp4_punctuation_custom_fields_remain_independent_on_real_carrier() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         const NATIVE_LIKE_KEY: &str = "----:com.tonepoet:T-R-K-N";
         const LOGICAL_LIKE_KEY: &str = "----:com.tonepoet:TRACK-NUMBER";
 
@@ -25219,6 +25238,7 @@ mod tests {
 
     #[test]
     fn lofty_noop_preflight_never_serializes_a_stale_carrier_snapshot() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let (temp, path) = copy_numbering_fixture("preflight-race.mp3", ID3V2_NUMBERING_FIXTURE);
         write_all_tags(
             &path,
@@ -25260,6 +25280,7 @@ mod tests {
 
     #[test]
     fn id3_numbering_alias_conflicts_fail_closed_and_equal_aliases_coalesce() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         assert_typed_numbering_conflicts_fail_closed(
             "aliases.mp3",
             ID3V2_NUMBERING_FIXTURE,
@@ -25394,6 +25415,7 @@ mod tests {
 
     #[test]
     fn dsf_numeric_numbering_round_trips_and_lexical_write_is_atomic() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("DSF metadata persistence tempdir");
         let path = temp.path().join("numbering.dsf");
         crate::dsf_tags::write_test_dsf_fixture(&path, None).expect("write DSF fixture");
@@ -25495,6 +25517,7 @@ mod tests {
 
     #[test]
     fn unknown_carrier_capability_and_production_write_fail_closed() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("unknown metadata carrier tempdir");
         let path = temp.path().join("unknown.bin");
         let original = b"not an audio carrier";
@@ -25819,6 +25842,7 @@ mod tests {
 
     #[test]
     fn dff_tag_write_is_rejected_before_backup_or_fallback_writer() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("unsupported.dff");
         let original = b"synthetic DFF bytes";
@@ -25910,6 +25934,7 @@ mod tests {
 
     #[test]
     fn inline_non_flac_writer_uses_one_database_transaction_and_restores_exact_bytes() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let db = crate::db::Database::open_memory().expect("memory database");
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("corrupt.opus");
@@ -25929,6 +25954,7 @@ mod tests {
 
     #[test]
     fn inline_dsf_writer_bypasses_the_legacy_database_transaction() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let db = crate::db::Database::open_memory().expect("memory database");
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("corrupt.dsf");
@@ -25957,6 +25983,7 @@ mod tests {
     // XDG dirs (and serialize with other env-redirecting tests) so a
     // concurrent guard user cannot swap the journal path mid-write.
     fn inline_wavpack_dispatch_bypasses_legacy_database_and_selects_serializer() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let _xdg = crate::tui::test_support::XdgConfigHomeGuard::new(
             "tonepoet-wavpack-inline-dispatch",
         );
@@ -26017,6 +26044,7 @@ mod tests {
 
     #[test]
     fn editing_totals_removes_legacy_alias_spellings() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         // A FLAC tagged with legacy TOTALTRACKS reads as ItemKey::TrackTotal;
         // an edit must not leave the stale spelling beside the new
         // TRACKTOTAL — alias-complete deletion.
@@ -26568,6 +26596,7 @@ mod tests {
 
     #[test]
     fn native_flac_tag_refusal_does_not_fall_back_to_lofty_full_rewrite() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         use lofty::tag::ItemKey;
         use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
@@ -27292,6 +27321,7 @@ mod tests {
 
     #[test]
     fn flac_native_tag_write_preserves_real_world_non_target_blocks_byte_identical() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("layout-matrix.flac");
         let huge_comment = "x".repeat(96 * 1024);
@@ -27361,6 +27391,7 @@ mod tests {
 
     #[test]
     fn unrelated_flac_edit_preserves_distinct_multi_value_items() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("multi-value.flac");
         let blocks = vec![
@@ -27393,6 +27424,7 @@ mod tests {
 
     #[test]
     fn flac_native_tag_write_inserts_vorbis_comment_when_missing() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("missing-vorbis.flac");
         let application = b"tpstno-vorbis-application".to_vec();
@@ -27539,6 +27571,7 @@ mod tests {
 
     #[test]
     fn id3v23_prefixed_flac_metadata_journal_recovers_at_recorded_stream_offset() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("prefixed-journal.flac");
         let _audio = write_synthetic_flac(&path, &[("TITLE", "Original")], 8 * 1024, 64 * 1024);
@@ -27562,6 +27595,7 @@ mod tests {
 
     #[test]
     fn id3v23_prefixed_flac_artwork_rollback_recovers_at_recorded_stream_offset() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("prefixed-artwork-journal.flac");
         write_synthetic_flac(&path, &[("TITLE", "Original")], 8 * 1024, 64 * 1024);
@@ -27598,6 +27632,7 @@ mod tests {
 
     #[test]
     fn malformed_id3v2_prefix_is_refused_without_mutation() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("malformed-prefix.flac");
         write_synthetic_flac(&path, &[("TITLE", "Original")], 4096, 4096);
@@ -27618,6 +27653,7 @@ mod tests {
 
     #[test]
     fn flac_tag_only_write_uses_padding_without_full_backup_and_preserves_audio() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("padded.flac");
         let audio = write_synthetic_flac(&path, &[("TITLE", "Old"), ("ARTIST", "The Band")], 4096, 256 * 1024);
@@ -27670,6 +27706,7 @@ mod tests {
 
     #[test]
     fn flac_overflow_rewrite_streams_audio_and_grows_padding_for_next_save() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("overflow.flac");
         let audio = write_synthetic_flac(&path, &[("TITLE", "Old")], 0, 2 * 1024 * 1024);
@@ -28567,6 +28604,7 @@ mod tests {
 
     #[test]
     fn flac_overflow_rewrites_are_serialized_across_parallel_workers() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
         use std::sync::{Arc, Barrier};
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -28640,6 +28678,7 @@ mod tests {
 
     #[test]
     fn flac_overflow_rewrite_preserves_mode_and_timestamps() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("overflow-metadata.flac");
@@ -28665,6 +28704,7 @@ mod tests {
     #[cfg(all(target_os = "linux", unix))]
     #[test]
     fn flac_overflow_rewrite_preserves_user_xattrs_when_supported() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("overflow-xattr.flac");
         let _ = write_synthetic_flac(&path, &[("TITLE", "Old")], 0, 64 * 1024);
@@ -28691,6 +28731,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn flac_overflow_rewrite_acl_preservation_is_exercised_when_tools_exist() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !command_available("getfacl") || !command_available("setfacl") {
             eprintln!("skipping ACL preservation assertion: getfacl/setfacl not available");
             return;
@@ -28738,6 +28779,7 @@ mod tests {
     #[cfg(all(target_os = "linux", unix))]
     #[test]
     fn flac_overflow_rewrite_aborts_on_xattr_capture_failure_without_replacing_original() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("overflow-xattr-capture-fail.flac");
         let _ = write_synthetic_flac(&path, &[("TITLE", "Old")], 0, 64 * 1024);
@@ -28768,6 +28810,7 @@ mod tests {
     #[cfg(all(target_os = "linux", unix))]
     #[test]
     fn flac_overflow_rewrite_aborts_on_xattr_restore_failure_without_replacing_original() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("overflow-xattr-restore-fail.flac");
         let _ = write_synthetic_flac(&path, &[("TITLE", "Old")], 0, 64 * 1024);
@@ -28811,6 +28854,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn flac_overflow_rewrite_aborts_on_acl_capture_failure_without_replacing_original() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("overflow-acl-capture-fail.flac");
         let _ = write_synthetic_flac(&path, &[("TITLE", "Old")], 0, 64 * 1024);
@@ -28841,6 +28885,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn flac_overflow_rewrite_aborts_on_acl_restore_failure_without_replacing_original() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("overflow-acl-restore-fail.flac");
         let _ = write_synthetic_flac(&path, &[("TITLE", "Old")], 0, 64 * 1024);
@@ -28887,6 +28932,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn flac_overflow_rewrite_refuses_to_break_hardlinks() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("hardlinked.flac");
         let link = temp.path().join("hardlinked-copy.flac");
@@ -28919,6 +28965,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn flac_overflow_rewrite_refuses_symlink_path_without_replacing_link() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         use std::os::unix::fs as unix_fs;
 
         let temp = tempfile::tempdir().expect("tempdir");
@@ -28959,6 +29006,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn flac_padded_fast_path_refuses_symlink_path_without_journal_or_target_mutation() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         use std::os::unix::fs as unix_fs;
 
         let temp = tempfile::tempdir().expect("tempdir");
@@ -29000,6 +29048,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn flac_recover_before_read_through_symlink_recovers_target_local_journal() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         use flac_metadata_writer::TestInPlaceKillPoint;
         use std::os::unix::fs as unix_fs;
 
@@ -29040,6 +29089,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn flac_recover_before_read_through_symlink_recovers_target_local_artwork_rollback() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         use std::os::unix::fs as unix_fs;
 
         let temp = tempfile::tempdir().expect("tempdir");
@@ -29137,6 +29187,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn flac_padded_fast_path_refuses_hardlinked_file_without_journal_or_mutation() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("hardlinked-fast.flac");
         let link = temp.path().join("hardlinked-fast-copy.flac");
@@ -29203,6 +29254,7 @@ mod tests {
 
     #[test]
     fn flac_overflow_preservation_failure_keeps_original_and_cleans_temp() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("overflow-fail.flac");
         let before_audio = write_synthetic_flac(&path, &[("TITLE", "Old")], 0, 64 * 1024);
@@ -29240,6 +29292,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn flac_overflow_rewrite_revalidates_source_before_commit() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("overflow-concurrent-change.flac");
         let _ = write_synthetic_flac(&path, &[("TITLE", "Old")], 0, 64 * 1024);
@@ -29286,6 +29339,7 @@ mod tests {
 
     #[test]
     fn offsetless_v5_metadata_journal_remains_recoverable() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("legacy-v5-journal.flac");
         write_synthetic_flac(&path, &[("TITLE", "Original")], 4096, 4096);
@@ -29303,6 +29357,7 @@ mod tests {
 
     #[test]
     fn offsetless_v4_artwork_rollback_journal_remains_recoverable() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("legacy-v4-artwork-journal.flac");
         write_synthetic_flac(&path, &[("TITLE", "Original")], 4096, 4096);
@@ -29336,6 +29391,7 @@ mod tests {
 
     #[test]
     fn flac_metadata_journal_recovers_before_later_read_or_write() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         use std::io::{Seek, SeekFrom, Write};
 
         let temp = tempfile::tempdir().expect("tempdir");
@@ -29433,6 +29489,7 @@ mod tests {
 
     #[test]
     fn native_flac_write_reuses_its_shared_authority_for_stale_journal_recovery() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("writer-reuses-recovery-authority.flac");
         write_synthetic_flac(&path, &[("TITLE", "Original")], 4096, 4096);
@@ -29531,6 +29588,7 @@ mod tests {
 
     #[test]
     fn parsed_artwork_rollback_recovers_while_retiring_stale_common_write_lock() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("artwork-stale-common-lock.flac");
         write_synthetic_flac(&path, &[("TITLE", "Original")], 4096, 4096);
@@ -29597,6 +29655,7 @@ mod tests {
 
     #[test]
     fn active_metadata_journal_is_not_consumed_when_current_metadata_is_original() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("active-original.flac");
         let _ = write_synthetic_flac(&path, &[("TITLE", "Original")], 4096, 64 * 1024);
@@ -29837,6 +29896,7 @@ mod tests {
 
     #[test]
     fn stale_common_write_lock_is_recovered_before_native_write() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("common-stale.flac");
         let _ = write_synthetic_flac(&path, &[("TITLE", "Original")], 4096, 64 * 1024);
@@ -29925,6 +29985,7 @@ mod tests {
 
     #[test]
     fn active_metadata_journal_is_not_restored_over_parseable_torn_metadata() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("active-torn.flac");
         let _ = write_synthetic_flac(&path, &[("TITLE", "Original")], 4096, 64 * 1024);
@@ -29964,6 +30025,7 @@ mod tests {
 
     #[test]
     fn metadata_journal_pid_reuse_owner_mismatch_recovers_as_stale() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         use std::io::{Seek, SeekFrom, Write};
 
         let temp = tempfile::tempdir().expect("tempdir");
@@ -29993,6 +30055,7 @@ mod tests {
 
     #[test]
     fn flac_in_place_kill_points_recover_original_bytes_before_reads_or_writes() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         use flac_metadata_writer::TestInPlaceKillPoint;
 
         for point in [
@@ -30042,6 +30105,7 @@ mod tests {
 
     #[test]
     fn flac_metadata_journal_recovers_parseable_wrong_audio_offset_torn_write() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("wrong-offset.flac");
         let _audio = write_synthetic_flac(&path, &[("TITLE", "Original")], 4096, 64 * 1024);
@@ -30074,6 +30138,7 @@ mod tests {
 
     #[test]
     fn flac_real_journal_recovers_parseable_wrong_audio_offset_before_lofty_read() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !command_available("ffmpeg") {
             eprintln!("skipping real wrong-offset recovery test because ffmpeg is unavailable");
             return;
@@ -30163,6 +30228,7 @@ mod tests {
 
     #[test]
     fn sort_paths_by_track_recovers_real_flac_journal_before_tag_ordering() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !command_available("ffmpeg") {
             eprintln!("skipping real sort recovery test because ffmpeg is unavailable");
             return;
@@ -30344,6 +30410,7 @@ mod tests {
 
     #[test]
     fn flac_overflow_rewrite_cancellation_before_commit_preserves_original_and_cleans_temp() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("cancel-before-commit.flac");
         let _ = write_synthetic_flac(&path, &[("TITLE", "Old")], 0, 512 * 1024);
@@ -30378,6 +30445,7 @@ mod tests {
 
     #[test]
     fn flac_overflow_rewrite_cancellation_between_stream_chunks_preserves_original() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("cancel-between-chunks.flac");
         let _ = write_synthetic_flac(&path, &[("TITLE", "Old")], 0, 3 * 1024 * 1024);
@@ -30415,6 +30483,7 @@ mod tests {
 
     #[test]
     fn non_flac_cancellation_before_fallback_does_not_create_backup() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("cancel-before-fallback.mp3");
         std::fs::write(&path, b"not really an mp3; cancellation must fire before Lofty").expect("write fixture");
@@ -30434,6 +30503,7 @@ mod tests {
 
     #[test]
     fn non_flac_list_overlay_cancellation_after_preflight_preserves_original() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         use lofty::tag::ItemKey;
 
         let (temp, path) =
@@ -30475,6 +30545,7 @@ mod tests {
 
     #[test]
     fn flac_stream_rewrite_kill_point_cleans_temp_without_touching_original() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("stream-kill.flac");
         let _audio = write_synthetic_flac(&path, &[("TITLE", "Original")], 0, 512 * 1024);
@@ -30492,6 +30563,7 @@ mod tests {
 
     #[test]
     fn flac_stream_rewrite_commit_point_leaves_valid_file_and_preserves_audio() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("stream-commit.flac");
         let audio = write_synthetic_flac(&path, &[("TITLE", "Original")], 0, 512 * 1024);
@@ -30551,6 +30623,7 @@ mod tests {
 
     #[test]
     fn flac_real_fixture_fast_path_is_semantically_readable_and_bounded() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !command_available("ffmpeg") {
             eprintln!("skipping real FLAC acceptance test because ffmpeg is unavailable");
             return;
@@ -30619,6 +30692,7 @@ mod tests {
     #[test]
     #[ignore = "manual benchmark: set TONEPOET_BENCH_FLAC to a scratch FLAC copy"]
     fn flac_tag_write_manual_benchmark_at_env_path() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let Some(path) = std::env::var_os("TONEPOET_BENCH_FLAC") else {
             eprintln!("TONEPOET_BENCH_FLAC not set; nothing to benchmark");
             return;
@@ -30645,6 +30719,7 @@ mod tests {
     #[test]
     #[ignore = "requires ffmpeg and creates a >=100 MB FLAC fixture"]
     fn flac_large_real_fixture_acceptance_uses_padding_without_backup_and_reads_back() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !command_available("ffmpeg") {
             eprintln!("skipping large FLAC acceptance test because ffmpeg is unavailable");
             return;
@@ -31554,6 +31629,7 @@ mod tests {
 
     #[test]
     fn flac_artwork_rollback_recovery_is_idempotent_after_torn_in_place_restore() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let td = tempfile::tempdir().expect("tempdir");
         let path = td.path().join("artwork-torn-restore.flac");
         let _audio = write_synthetic_flac(&path, &[("TITLE", "original")], 4096, 4096);
@@ -31615,6 +31691,7 @@ mod tests {
 
     #[test]
     fn flac_artwork_rollback_cleanup_is_idempotent_after_overflow_restore_commit() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let td = tempfile::tempdir().expect("tempdir");
         let path = td.path().join("artwork-overflow-restore-committed.flac");
         let _audio = write_synthetic_flac(&path, &[("TITLE", "original")], 0, 4096);
@@ -31677,6 +31754,7 @@ mod tests {
 
     #[test]
     fn flac_artwork_stale_rollback_journal_restores_after_process_death() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let td = tempfile::tempdir().expect("tempdir");
         let path = td.path().join("artwork-crash-rollback.flac");
         let audio = write_synthetic_flac(&path, &[("TITLE", "original")], 4096, 4096);
@@ -31732,6 +31810,7 @@ mod tests {
 
     #[test]
     fn flac_artwork_stale_rollback_refuses_external_replacement() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let td = tempfile::tempdir().expect("tempdir");
         let path = td.path().join("artwork-external-replace.flac");
         let _ = write_synthetic_flac(&path, &[("TITLE", "original")], 4096, 4096);
@@ -31927,6 +32006,7 @@ mod tests {
 
     #[test]
     fn artwork_rollback_pid_reuse_identity_mismatch_does_not_suppress_recovery() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let td = tempfile::tempdir().expect("tempdir");
         let path = td.path().join("artwork-pid-reuse.flac");
         let _ = write_synthetic_flac(&path, &[("TITLE", "original")], 4096, 4096);
@@ -32057,6 +32137,7 @@ mod tests {
 
     #[test]
     fn same_process_old_artwork_rollback_journal_does_not_authorize_new_claim() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let td = tempfile::tempdir().expect("tempdir");
         let path = td.path().join("artwork-old-claim-token.flac");
         let _ = write_synthetic_flac(&path, &[("TITLE", "original")], 4096, 4096);
@@ -32136,6 +32217,7 @@ mod tests {
 
     #[test]
     fn active_flac_artwork_rollback_journal_is_not_restored_inside_live_process() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let td = tempfile::tempdir().expect("tempdir");
         let path = td.path().join("artwork-active-rollback.flac");
         let _ = write_synthetic_flac(&path, &[("TITLE", "original")], 4096, 4096);

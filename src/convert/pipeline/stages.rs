@@ -9026,6 +9026,7 @@ mod metadata_writer_command_tests {
 
     #[tokio::test]
     async fn final_multivalue_overlay_rejects_preexisting_cancellation_without_mutation() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("metadata cancellation tempdir");
         let path = temp.path().join("cancelled-overlay.m4a");
         fs::write(
@@ -9721,6 +9722,7 @@ mod metadata_writer_command_tests {
 
     #[tokio::test]
     async fn rf64_content_named_wav_skips_riff_only_in_process_overlay() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         let temp = tempfile::tempdir().expect("metadata test tempdir");
         let path = temp.path().join("track.wav");
         let marker = b"RF64\0\0\0\0WAVE";
@@ -65484,6 +65486,7 @@ mod naming_template_tests {
 
     #[test]
     fn saved_side_prefixed_flac_reopens_materializes_and_renders_exact_output_path() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         use lofty::tag::ItemKey;
 
         let temp = tempfile::tempdir().expect("tempdir");

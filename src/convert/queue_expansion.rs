@@ -7270,6 +7270,7 @@ mod planner_embedded_authority_tests {
 
     #[test]
     fn directly_queued_audio_honors_applicable_one_track_sidecar_priority() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
         if !require_flac_fixture_tool(
             "directly_queued_audio_honors_applicable_one_track_sidecar_priority",
         ) {
