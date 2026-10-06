@@ -4122,21 +4122,50 @@ W64, because those carriers cannot represent it.
 So this is an inconsistency between the tag-read path and the rest of the
 codebase, not a missing capability.
 
-### Unknown
+### Measured 2026-10-06
 
-Whether conversion of this album succeeds and only the metadata pane complains,
-or whether the track also fails to convert. Not yet tested — the report is from
-the metadata pane only.
+Converted the affected track alone to FLAC, isolated config/data/cache, release
+binary at `5f253d0`. **It succeeds**: `1/1 succeeded, 0 failed`, 2.19 GB in,
+774 MB FLAC out, in about 19 s.
 
-Whether `lofty` 0.21 can read RF64 at all, or whether the tag read for such a
-file has to be satisfied another way.
+The audio is intact — 384 kHz, 2 ch, duration `356.115289` identical to the
+source.
+
+The tags also survive. The output FLAC carries `title=Reel Around The
+Fountain`, `artist=The Smiths`, the album, `date=1984`, `genre=Indie Rock` and
+ReplayGain. FFmpeg read what lofty could not.
+
+So the impact is narrower than the symptom suggests, but two things are wrong:
+
+1. **The output filename is a placeholder.** The track is written as
+   `01 - Track 01.flac` rather than from its title. Naming is driven by the
+   lofty read, which failed, while the tags actually embedded in the output
+   are correct. A user converting this album gets nine correctly named files
+   and one `Track 01`.
+
+2. **The warning is false.** The run logs
+
+   ```
+   Tag read: FAILED (Wav: WAV file doesn't contain a RIFF chunk)
+     - converted without metadata; audio conversion will continue
+   ```
+
+   Metadata was not lost. The statement is untrue of the file it describes.
+
+A third, cosmetic: `materializer_cue` logs `embedded CUESHEET metadata
+unavailable` for the same reason, before conversion starts.
+
+Still unknown: whether `lofty` 0.21 can read RF64 at all, or whether the tag
+read for such a file has to be satisfied another way — for instance by the
+same route FFmpeg already uses successfully here.
 
 ### Required
 
 A `.wav` file containing RF64 is treated as the RF64 it is. Its tags and
-artwork are read if the container can carry them; if the carrier genuinely
-cannot, the user is told that in terms that name the container, not told that
-their file lacks a chunk it was never supposed to have.
+artwork are read — they are demonstrably readable, since FFmpeg reads them in
+the same run — so the file is named from its title like any other.
+
+No message claims metadata was lost when it was preserved.
 
 Container identity should come from the file's magic, not its extension,
 wherever the distinction matters — the pattern already used in the three
