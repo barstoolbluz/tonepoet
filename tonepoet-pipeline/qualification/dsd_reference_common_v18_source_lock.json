@@ -7,7 +7,7 @@
     "src/convert/pipeline/coordination_name.rs": "02e0e1817e9806e5c8f8efdf52dc647f223d8d0c5fdf79d23bd10f2b11eab891",
     "src/convert/pipeline/manifest_builder.rs": "74e4ef54ed509397259c02880a64d5d390007b0b1918645cbcb165d0b9a976b9",
     "src/convert/pipeline/plan_bridge.rs": "248b95b277ff61ed0e127b6d651b509e1bfed41061a2957b83dc023140ff3e22",
-    "src/convert/pipeline/stages.rs": "0af5e896d952402aafdffe98cc8aa3d33f315e591d8fcbc258c8f1bf725016f3",
+    "src/convert/pipeline/stages.rs": "66a147d8813221bbf0c0ba3190b5c801ba4103871004a2f17f4f190f900ca59a",
     "src/convert/pipeline/track_executor.rs": "6005655231bacf7c856a2e95d55f5cebd4e8097e7ac83b494cef13663919e2b8",
     "src/convert/replaygain.rs": "cfa021f5fc480edd86ca1fdc506e133d5ac0057847b04b692f3e66ee3a509978",
     "src/fs_limits.rs": "1f53208b4ef74b08efb00719ec70ad442b74c2cf455ad311a65c9082df57f19e",
@@ -25,6 +25,6 @@
     "tonepoet-pipeline/src/tools.rs": "aedd497da07bb9d6d4fe04942109a4983a1590f87e64b1f73dc25d8e7e372bf4",
     "tonepoet-pipeline/src/w64.rs": "caa669e1e323a36dce7aa7154abed1dabff77865a391fe2530fe5b5fd960ebdb"
   },
-  "runtime_closure_fingerprint_sha256": "0144b0f935202d88d666be006bbad2f12d54266a7b7934436c1b0f799142c9a9",
+  "runtime_closure_fingerprint_sha256": "d841d3c15e694869d7fa08ee2a60877bec3be24dcd08bca65c1e9ae285c9d554",
   "schema_version": 1
 }
