@@ -7456,6 +7456,50 @@ mod tests {
         }
         drop(dead_scope_lease);
 
+        // Queue lifecycle families are close-driven. Under parallel libtest an
+        // unrelated fork may transiently retain their CLOEXEC fds after these
+        // fixture owners drop. Wait for actual kernel release before testing
+        // recovery semantics; the recovery itself must still retire rows and
+        // descriptors immediately once ownership is genuinely dead.
+        crate::concurrency::wait_for_close_driven_lifecycle_release(
+            &dead_scope_descriptor,
+            &crate::concurrency::LeaseFamily::QueueScope {
+                scope_id: dead_scope_id,
+            },
+            "wait for recovered fixture QueueScope owner close",
+        );
+        for fixture in &fixtures {
+            for (descriptor, family, label) in [
+                (
+                    &fixture.queue_descriptor,
+                    crate::concurrency::LeaseFamily::QueueExecution {
+                        execution_id: fixture.execution_id,
+                    },
+                    "QueueExecution",
+                ),
+                (
+                    &fixture.claim_descriptor,
+                    crate::concurrency::LeaseFamily::ExecutionClaim {
+                        execution_id: fixture.execution_id,
+                    },
+                    "ExecutionClaim",
+                ),
+                (
+                    &fixture.staging_descriptor,
+                    crate::concurrency::LeaseFamily::ExecutionStaging {
+                        execution_id: fixture.execution_id,
+                    },
+                    "ExecutionStaging",
+                ),
+            ] {
+                crate::concurrency::wait_for_close_driven_lifecycle_release(
+                    descriptor,
+                    &family,
+                    &format!("wait for recovered fixture {label} owner close"),
+                );
+            }
+        }
+
         let mut recovered = db
             .recover_dead_queue_items()
             .expect("recover dead Processing rows");
@@ -8075,6 +8119,11 @@ mod tests {
         assert!(descriptor.exists());
 
         drop(db_owner);
+        crate::concurrency::wait_for_close_driven_lifecycle_release(
+            &descriptor,
+            &crate::concurrency::LeaseFamily::QueueScope { scope_id },
+            "wait for empty QueueScope owner close before recovery",
+        );
         let after_owner_exit = db_observer
             .load_queue_items()
             .expect("load after empty scope owner exits");
@@ -8113,6 +8162,13 @@ mod tests {
         let old_descriptor = PathBuf::from(old_descriptor);
         db_owner.sync_queue(&[]).expect("drain first queue scope");
         drop(db_owner);
+        crate::concurrency::wait_for_close_driven_lifecycle_release(
+            &old_descriptor,
+            &crate::concurrency::LeaseFamily::QueueScope {
+                scope_id: old_scope,
+            },
+            "wait for abandoned QueueScope owner close before new scope creation",
+        );
 
         // Model the CLI path: it opens the DB and publishes a new durable
         // queue directly through sync_queue, without first load_queue_items.

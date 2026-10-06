@@ -52695,6 +52695,11 @@ mod companion_copy_hardening_tests {
 
         crate::concurrency::unregister_runtime_execution(&req.item_id);
         drop(queue_lease);
+        crate::concurrency::wait_for_close_driven_lifecycle_release(
+            &queue_descriptor,
+            &queue_family,
+            "wait for scratch companion QueueExecution owner close",
+        );
         crate::concurrency::retire_descriptor_after_lifecycle_release(
             &queue_descriptor,
             &queue_family,

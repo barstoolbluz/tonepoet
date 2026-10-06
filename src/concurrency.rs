@@ -2401,6 +2401,47 @@ pub fn descriptor_availability(path: &Path) -> Result<(LeaseFamily, ClaimAvailab
     }
 }
 
+#[cfg(test)]
+pub(crate) fn wait_for_close_driven_lifecycle_release(
+    path: &Path,
+    expected_family: &LeaseFamily,
+    context: &str,
+) {
+    assert!(
+        matches!(
+            expected_family,
+            LeaseFamily::QueueScope { .. }
+                | LeaseFamily::QueueExecution { .. }
+                | LeaseFamily::ExecutionClaim { .. }
+                | LeaseFamily::ExecutionStaging { .. }
+        ),
+        "close-driven wait is only for durable families without JournalOperation logical-owner unlock",
+    );
+
+    // These families release live authority only when the final kernel fd
+    // closes. Under the default parallel harness, an unrelated fork can retain
+    // a CLOEXEC copy until exec/_exit. Wait out only that bounded interval.
+    // Once this probe acquires the recovery lock, explicitly unlock its shared
+    // OFD before dropping it: otherwise this very probe could be forked and
+    // manufacture a fresh transient holder after it had declared quiescence.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match PersistentLease::acquire_existing_recovery(path, expected_family) {
+            Ok(lease) => {
+                FileExt::unlock(lease.file.as_ref()).unwrap_or_else(|error| {
+                    panic!("{context}: unlock quiescence probe {}: {error}", path.display())
+                });
+                drop(lease);
+                return;
+            }
+            Err(error) if error.contains("live-owned") && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(error) => panic!("{context}: {error}"),
+        }
+    }
+}
+
 /// Classify a descriptor after the owning subsystem has durably established
 /// a same-process recovery handoff. A foreign owner remains `Live`; only the
 /// exact locally-created locked OFD can be treated by its post-owner lifecycle
@@ -3683,17 +3724,30 @@ mod tests {
 
     fn reacquire_after_intentional_ephemeral_authority_closes(
         claim: PathClaim,
+        retired_descriptor: &Path,
         context: &str,
     ) -> MutationClaimGuard {
         // An explicitly exported or detached fd can itself be inherited by an
-        // unrelated concurrent fork. Its public descriptor must stay visible
-        // while any such kernel co-holder exists, so final-close reclamation is
-        // intentionally eventual rather than lexical. Bound the wait so the
-        // regression tolerates only that pre-exec window, never a real leak.
+        // unrelated concurrent fork. A scanner that later acquires the old
+        // descriptor's flock can also be forked before it removes the pathname.
+        // Therefore successful competing admission alone is not proof that the
+        // old descriptor has been retired. Require both outcomes, and retry only
+        // the bounded pre-exec inheritance window rather than accepting a leak.
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             match MutationClaimGuard::acquire_ephemeral(vec![claim.clone()]) {
-                Ok(guard) => return guard,
+                Ok(guard) if !retired_descriptor.exists() => return guard,
+                Ok(guard) if Instant::now() < deadline => {
+                    drop(guard);
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Ok(guard) => {
+                    drop(guard);
+                    panic!(
+                        "{context}: competing admission succeeded but retired descriptor remained published after the parallel-fork grace window: {}",
+                        retired_descriptor.display(),
+                    );
+                }
                 Err(error) if error.contains("live owner") && Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(2));
                 }
@@ -3704,25 +3758,29 @@ mod tests {
 
     fn wait_for_recovery_reserved_after_deliberate_export_closes(
         path: &Path,
+        expected_family: &LeaseFamily,
         context: &str,
     ) {
         // A deliberate lifetime export intentionally delegates release to the
         // final kernel fd holder. Under the default parallel test harness, an
         // unrelated fork can transiently inherit that CLOEXEC fd before exec
         // and keep the flock live after this test drops its own exported copy.
-        // Retry only that exact `Live` state; any other classification or I/O
-        // error is a real failure. Production coordination code is unchanged.
+        // Acquire the actual recovery lock rather than merely classifying it.
+        // Once acquired, explicitly unlock the shared OFD before returning so
+        // this probe cannot create a fresh fork-inherited holder of its own.
+        // Retry only live-owner contention; every other error is a real failure.
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            match descriptor_availability(path) {
-                Ok((_, ClaimAvailability::RecoveryReserved)) => return,
-                Ok((_, ClaimAvailability::Live)) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(2));
+            match PersistentLease::acquire_existing_recovery(path, expected_family) {
+                Ok(lease) => {
+                    FileExt::unlock(lease.file.as_ref()).unwrap_or_else(|error| {
+                        panic!("{context}: unlock recovery probe {}: {error}", path.display())
+                    });
+                    drop(lease);
+                    return;
                 }
-                Ok((_, availability)) => {
-                    panic!(
-                        "{context}: expected RecoveryReserved after deliberate export close, found {availability:?}"
-                    );
+                Err(error) if error.contains("live-owned") && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(2));
                 }
                 Err(error) => panic!("{context}: {error}"),
             }
@@ -4594,6 +4652,7 @@ mod tests {
             drop(exported);
             wait_for_recovery_reserved_after_deliberate_export_closes(
                 &path,
+                &family,
                 "probe journal descriptor after deliberate export closes",
             );
             retire_descriptor_after_lifecycle_release(&path, &family)
@@ -4699,6 +4758,7 @@ mod tests {
             drop(exported);
             let replacement = reacquire_after_intentional_ephemeral_authority_closes(
                 claim,
+                &descriptor,
                 "scanner must reclaim the exported descriptor after its final holder closes",
             );
             assert!(
@@ -4738,6 +4798,7 @@ mod tests {
             unsafe { libc::close(exported) };
             let replacement = reacquire_after_intentional_ephemeral_authority_closes(
                 claim,
+                &descriptor,
                 "scanner must reclaim raw-export descriptor after duplicate closes",
             );
 
@@ -4784,6 +4845,7 @@ mod tests {
             );
             let replacement = reacquire_after_intentional_ephemeral_authority_closes(
                 claim,
+                &descriptor,
                 "scanner must reclaim a closed detached ephemeral lease",
             );
             assert!(!descriptor.exists());
@@ -5525,6 +5587,7 @@ mod tests {
             drop(exported);
             wait_for_recovery_reserved_after_deliberate_export_closes(
                 &path,
+                &family,
                 "probe journal authority after shared export closes",
             );
             retire_descriptor_after_lifecycle_release(&path, &family)
@@ -5532,7 +5595,6 @@ mod tests {
             assert!(!path.exists());
         });
     }
-
 
     fn synthetic_descriptor_claims(count: usize, tail_len: usize) -> Vec<PathClaim> {
         let common_ancestor = PathBuf::from("/tmp");

@@ -39,16 +39,16 @@ def main() -> int:
         "#[test]\n    fn registry_contention_waits_for_holder_instead_of_timing_out()",
     )
     require(
-        "descriptor_availability(path)" in wait_helper,
-        "R32 wait observes the real descriptor availability classifier",
+        "PersistentLease::acquire_existing_recovery(path, expected_family)" in wait_helper,
+        "R32 wait crosses the real recovery-lock boundary",
     )
     require(
-        "ClaimAvailability::RecoveryReserved" in wait_helper,
-        "R32 wait succeeds only at recovery-reserved durable authority",
+        "FileExt::unlock(lease.file.as_ref())" in wait_helper,
+        "R32 recovery probe explicitly unlocks its own OFD before returning",
     )
     require(
-        "ClaimAvailability::Live" in wait_helper,
-        "R32 wait retries the transient live classification",
+        'error.contains("live-owned")' in wait_helper,
+        "R32 wait retries only transient live-owner contention",
     )
     require(
         "Duration::from_secs(5)" in wait_helper
@@ -79,6 +79,10 @@ def main() -> int:
         "ClaimAvailability::Live" in deliberate.split("drop(exported);", 1)[0],
         "deliberate export remains synchronously live while the exported fd is owned",
     )
+    require(
+        "&family," in deliberate.split("wait_for_recovery_reserved_after_deliberate_export_closes(", 1)[1],
+        "deliberate-export wait verifies the exact JournalOperation family",
+    )
 
     coholder = section(
         concurrency,
@@ -93,6 +97,10 @@ def main() -> int:
     require(
         "ClaimAvailability::Live" in coholder.split("drop(exported);", 1)[0],
         "same-OFD export still proves live authority before final close",
+    )
+    require(
+        "&family," in coholder.split("wait_for_recovery_reserved_after_deliberate_export_closes(", 1)[1],
+        "same-OFD wait verifies the exact JournalOperation family",
     )
 
     immediate = section(
