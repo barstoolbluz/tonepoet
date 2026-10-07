@@ -4177,3 +4177,52 @@ No message claims metadata was lost when it was preserved.
 Container identity should come from the file's magic, not its extension,
 wherever the distinction matters — the pattern already used in the three
 materializers above.
+
+## 63. The sox_ng the build uses and the sox_ng repo on disk are unrelated histories
+
+Filed 2026-10-07. Not a conversion defect. A build-provenance question, deferred
+until the logging/evidence work is finished.
+
+### What was observed
+
+`flake.nix` takes `sox_ng` from `github:barstoolbluz/sox_ng` and `flake.lock`
+pins `9ed22fb3d813d6c02f67c254e57d162cee014a30` (2026-08-08). The local clone at
+`~/dev/sox_ng` tracks `https://codeberg.org/barstoolbluz/sox_ng`, head
+`16aa7e17` (2026-07-23), clean and current with its own upstream.
+
+The two have **no merge base**. GitHub is a squashed or re-imported history
+rather than a fork. Commit counts: 44 on GitHub absent from codeberg, 4562 on
+codeberg absent from GitHub.
+
+### What this is not
+
+It is not missing fixes. The W64/MAT4 digital-silence, >4 GB RIFF ChunkSize wrap
+and `MS_UNSPEC` sentinel work is present on both — `src/wav.c` is byte-identical
+across the two heads. Equivalent commit subjects appear on codeberg, in several
+cases more often.
+
+The only content differences found in `.c`/`.h` are Opus encoding support and a
+playlist piped-command guard, and the direction is the surprise: codeberg is the
+*fuller* tree. `coreaudio.c` is ~248 lines larger there, `opus.c` ~190 larger,
+with further differences in `spectrogram.c`, `util.c`, `mod.c`, `rate.c`,
+`effects_i.c`, `chorus.c`, `sox_ng.c`.
+
+So the tree the build actually consumes is the thinner of the two.
+
+### Why it matters
+
+`sox_ng` is the Reference DSD decimation path and the Gesemann dither source.
+Reading `~/dev/sox_ng` to reason about sox behaviour describes a different
+codebase from the one in the binaries. Nothing is known to be wrong in the
+pinned build, but the divergence is unexplained and the pin is to the smaller
+history.
+
+### What to decide
+
+Whether `flake.lock` should track codeberg instead, whether the GitHub squash is
+deliberate and should stay, and whether anything in the codeberg-only content
+matters to the DSD or dither paths. Requires looking at what the GitHub tree
+lacks rather than assuming either way.
+
+Changing the sox_ng input changes the sox binary, which the Reference
+qualification records. Expect requalification.
