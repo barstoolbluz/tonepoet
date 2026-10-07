@@ -29,6 +29,7 @@ pub mod actions;
 pub(crate) mod baseline;
 pub(crate) mod chapter_write;
 pub mod errors;
+pub mod execution_evidence;
 pub mod label_resolver;
 pub mod manifest;
 pub mod manifest_builder;
@@ -59,6 +60,7 @@ pub mod unified_request;
 
 pub use actions::*;
 pub use errors::*;
+pub use execution_evidence::*;
 pub use label_resolver::*;
 pub use materializer_single::*;
 pub use memory_budget::*;
@@ -177,6 +179,7 @@ mod tests {
             realized_input: None,
             output_file: None,
             commands: Vec::new(),
+            execution_evidence: Default::default(),
             bytes_in: None,
             bytes_out: None,
             duration: None,

@@ -10188,6 +10188,7 @@ fn execute_commit_with_source_options_transform(
     });
     let deemphasis_enabled = app.convert.format.deemphasis_enabled;
     let deemphasis_overridden = app.convert.format.deemphasis_overridden;
+    let deemphasis_override_from_preset = app.convert.format.deemphasis_override_from_preset;
 
     // Block commit when no destination path is set.
     if app.convert.output_options.dest_path.is_none() {
@@ -10407,7 +10408,9 @@ fn execute_commit_with_source_options_transform(
                 existing_req.merge = options.merge_to_single;
                 existing_req.companion = companion_policy.clone();
                 existing_req.actions = options.actions.clone();
-                existing_req.deemphasis_choice_origin = if deemphasis_overridden {
+                existing_req.deemphasis_choice_origin = if deemphasis_override_from_preset {
+                    DeemphasisChoiceOrigin::Preset
+                } else if deemphasis_overridden {
                     DeemphasisChoiceOrigin::User
                 } else {
                     DeemphasisChoiceOrigin::Automatic
@@ -10425,7 +10428,9 @@ fn execute_commit_with_source_options_transform(
                     });
                 item.pipeline_request = Some(PipelineRequest {
                     registered_effects: Vec::new(),
-                    deemphasis_choice_origin: if deemphasis_overridden {
+                    deemphasis_choice_origin: if deemphasis_override_from_preset {
+                        DeemphasisChoiceOrigin::Preset
+                    } else if deemphasis_overridden {
                         DeemphasisChoiceOrigin::User
                     } else {
                         DeemphasisChoiceOrigin::Automatic

@@ -41,6 +41,11 @@ use tonepoet_pipeline::fingerprint::{
 };
 
 use super::errors::{ConvertError, ToolRunnerError};
+use super::execution_evidence::{
+    attempt_plan_evidence_or_fallback, completed_plan_evidence_or_fallback,
+    record_native_scalar_attempt_materialization, EvidenceArtifactRef, ExecutionBackend,
+    OperationRecord, TrackExecutionEvidence,
+};
 use super::plan_bridge::{
     certified_terminal_candidate_binding, plan_request_for_track,
     planner_metadata_obligations_for_track, reference_sacd_source_kind,
@@ -556,6 +561,8 @@ pub struct ReferenceExecutionEvidence {
 #[derive(Debug, Clone)]
 pub struct ExecutedTrackPlan {
     pub commands: Vec<CommandRecord>,
+    /// Semantic evidence captured from the typed plan only after execution completes.
+    pub execution_evidence: TrackExecutionEvidence,
     pub elapsed: Duration,
     /// Metadata obligations satisfied by the planner-owned per-track plan.
     /// This is tracked dimensionally so source tag transfer, artwork_transferred, source
@@ -576,6 +583,7 @@ pub struct ExecutedTrackPlan {
 pub struct TrackExecutionError {
     pub error: ConvertError,
     pub commands: Vec<CommandRecord>,
+    pub execution_evidence: TrackExecutionEvidence,
     message: Option<String>,
 }
 
@@ -588,6 +596,9 @@ pub struct TrackExecutionError {
 /// of the authoritative Int16/Int24 source width from the raw s32 transport.
 #[derive(Debug, Clone)]
 pub(crate) struct CueStreamDirectTrackPlan {
+    /// Typed semantic plan retained until the consumer command actually completes.
+    /// It is projected into completed evidence only at that execution boundary.
+    pub semantic_plan_request: PlanRequest,
     pub planned_command: PlannedCommand,
     pub finalization: Finalization,
     pub cleanup_paths: Vec<PathBuf>,
@@ -645,8 +656,14 @@ impl TrackExecutionError {
         Self {
             error,
             commands,
+            execution_evidence: TrackExecutionEvidence::default(),
             message: None,
         }
+    }
+
+    fn with_execution_evidence(mut self, execution_evidence: TrackExecutionEvidence) -> Self {
+        self.execution_evidence = execution_evidence;
+        self
     }
 
     fn with_message(mut self, message: impl Into<String>) -> Self {
@@ -674,6 +691,19 @@ impl std::fmt::Display for TrackExecutionError {
 }
 
 impl std::error::Error for TrackExecutionError {}
+
+fn attach_attempt_execution_evidence(
+    mut error: TrackExecutionError,
+    plan_request: &PlanRequest,
+    scalar_pump: Option<&RetainedPcmScalarPump>,
+) -> TrackExecutionError {
+    let mut evidence = attempt_plan_evidence_or_fallback(plan_request, &error.commands);
+    if let Some(pump) = scalar_pump {
+        record_native_scalar_attempt_materialization(&mut evidence, pump);
+    }
+    error.execution_evidence = evidence;
+    error
+}
 
 #[derive(Debug, Clone)]
 pub struct ToolConcurrencyLimits {
@@ -1523,6 +1553,7 @@ pub(crate) fn prepare_cue_stream_direct_track_plan(
     };
 
     Ok(Some(CueStreamDirectTrackPlan {
+        semantic_plan_request: plan_request,
         planned_command: command,
         finalization,
         cleanup_paths: cleanup_paths.clone(),
@@ -2807,8 +2838,21 @@ pub(crate) async fn execute_planned_track_conversion_with_scalar_pump(
                         format!("Finished passthrough track {}", track.id.source_ordinal),
                     )
                     .await;
+                let mut execution_evidence = completed_plan_evidence_or_fallback(&plan_request, &[]);
+                if execution_evidence.operations.is_empty() {
+                    let mut operation = OperationRecord::completed(
+                        "passthrough-copy",
+                        "passthrough_copy",
+                        "Passthrough copy",
+                        ExecutionBackend::native("TonePoet file copy"),
+                    );
+                    operation.inputs.push(EvidenceArtifactRef::path("source", input));
+                    operation.outputs.push(EvidenceArtifactRef::path("staged-output", staged_output));
+                    execution_evidence.operations.push(operation);
+                }
                 Ok(ExecutedTrackPlan {
                     commands: Vec::new(),
+                    execution_evidence,
                     elapsed: started.elapsed(),
                     metadata_satisfaction,
                     metadata_required,
@@ -2862,7 +2906,14 @@ pub(crate) async fn execute_planned_track_conversion_with_scalar_pump(
                             end_fraction,
                             track_label(track),
                         )
-                        .await?
+                        .await
+                        .map_err(|error| {
+                            attach_attempt_execution_evidence(
+                                error,
+                                &plan_request,
+                                scalar_pump.as_ref(),
+                            )
+                        })?
                     } else {
                         execute_commands(
                             commands,
@@ -2876,19 +2927,47 @@ pub(crate) async fn execute_planned_track_conversion_with_scalar_pump(
                             end_fraction,
                             track_label(track),
                         )
-                        .await?
+                        .await
+                        .map_err(|error| {
+                            attach_attempt_execution_evidence(
+                                error,
+                                &plan_request,
+                                scalar_pump.as_ref(),
+                            )
+                        })?
                     };
                     (records, None)
                 };
+                let mut execution_evidence = completed_plan_evidence_or_fallback(&plan_request, &commands);
+                if scalar_pump.is_some() {
+                    if let Some(operation) = execution_evidence
+                        .operations
+                        .iter_mut()
+                        .find(|operation| operation.kind == "apply_gain")
+                    {
+                        operation.backend = ExecutionBackend::native("TonePoet Float64 scalar pump");
+                    }
+                }
                 if let Some(finalization) = finalization {
                     #[cfg(test)]
-                    inject_track_execution_failure(
+                    if let Err(mut error) = inject_track_execution_failure(
                         TrackExecutionFailurePoint::Finalization,
                         &work_dir,
                         plan.cleanup_paths(),
-                    )?;
+                    ) {
+                        let mut failure_evidence = execution_evidence.clone();
+                        failure_evidence.mark_discarded_attempt();
+                        error.commands = commands;
+                        error.execution_evidence = failure_evidence;
+                        return Err(error);
+                    }
                     if let Err(err) = apply_finalization(finalization) {
-                        return Err(TrackExecutionError::new(err, commands));
+                        let mut failure_evidence = execution_evidence.clone();
+                        failure_evidence.mark_discarded_attempt();
+                        return Err(
+                            TrackExecutionError::new(err, commands)
+                                .with_execution_evidence(failure_evidence),
+                        );
                     }
                 }
                 progress
@@ -2943,6 +3022,7 @@ pub(crate) async fn execute_planned_track_conversion_with_scalar_pump(
                 };
                 Ok(ExecutedTrackPlan {
                     commands,
+                    execution_evidence,
                     elapsed: started.elapsed(),
                     metadata_satisfaction,
                     metadata_required,
@@ -2974,10 +3054,13 @@ fn finish_track_execution(
             let message = format!(
                 "track conversion completed, but governed scratch cleanup failed: {cleanup_error}"
             );
+            let mut execution_evidence = value.execution_evidence;
+            execution_evidence.mark_discarded_attempt();
             Err(TrackExecutionError::new(
                 ConvertError::Io(cleanup_error),
                 value.commands,
             )
+            .with_execution_evidence(execution_evidence)
             .with_message(message))
         }
         (Err(error), Ok(())) => Err(error),
@@ -16413,9 +16496,21 @@ mod tests {
     fn successful_command_transcript_is_preserved_when_final_cleanup_fails() {
         let command = test_tool_command(ToolBinary::Ffmpeg);
         let record = command_record_for_unstarted_command(&command);
+        let mut semantic_operation = OperationRecord::completed(
+            "cleanup-test-terminal",
+            "encode_pcm",
+            "PCM encoding / terminal realization",
+            ExecutionBackend::external("ffmpeg"),
+        );
+        semantic_operation.invocation_indices.push(0);
+        let execution_evidence = TrackExecutionEvidence {
+            operations: vec![semantic_operation],
+            ..TrackExecutionEvidence::default()
+        };
         let error = finish_track_execution(
             Ok(ExecutedTrackPlan {
                 commands: vec![record.clone()],
+                execution_evidence,
                 elapsed: Duration::from_millis(10),
                 metadata_satisfaction: PlannedMetadataSatisfaction::default(),
                 metadata_required: PlannedMetadataSatisfaction::default(),
@@ -16429,9 +16524,16 @@ mod tests {
         assert_eq!(error.commands.len(), 1);
         assert_eq!(error.commands[0].binary, record.binary);
         assert_eq!(error.commands[0].sanitized_args, record.sanitized_args);
+        assert_eq!(error.execution_evidence.operations.len(), 1);
+        assert_eq!(error.execution_evidence.operations[0].kind, "encode_pcm");
+        assert_eq!(error.execution_evidence.operations[0].invocation_indices, vec![0]);
+        assert_eq!(
+            error.execution_evidence.operations[0].lineage,
+            crate::convert::pipeline::execution_evidence::OperationLineage::DiscardedAttempt,
+        );
         assert!(
             error.to_string().contains("governed scratch cleanup failed"),
-            "cleanup failure remains explicit while preserving the transcript"
+            "cleanup failure remains explicit while preserving transcript and typed evidence"
         );
     }
 
@@ -16559,7 +16661,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let mut progress = fixture.progress();
 
-        TRACK_EXECUTION_USE_INJECTED_RUNNER
+        let error = TRACK_EXECUTION_USE_INJECTED_RUNNER
             .scope(
                 (),
                 execute_planned_track_conversion(
@@ -16580,6 +16682,16 @@ mod tests {
             .await
             .expect_err("missing command output must fail finalization");
 
+        assert!(
+            error.execution_evidence.operations.iter().any(|operation| {
+                operation.kind != "external_invocation"
+                    && !operation.invocation_indices.is_empty()
+                    && operation.lineage
+                        == crate::convert::pipeline::execution_evidence::OperationLineage::DiscardedAttempt
+            }),
+            "finalization failure must retain typed completed work and its invocation linkage: {:?}",
+            error.execution_evidence,
+        );
         fixture.assert_clean();
     }
 
@@ -16947,6 +17059,7 @@ mod chunk_2_1_3_mid_chain_failure_and_cancel_tests {
                 realized_input: Some(chain._temp.path().join("source.flac")),
                 output_file: Some(chain.final_output.clone()),
                 commands,
+                execution_evidence: Default::default(),
                 bytes_in: None,
                 bytes_out: None,
                 duration: None,

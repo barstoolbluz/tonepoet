@@ -20,6 +20,14 @@ use fs2::FileExt;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
+use super::execution_evidence::{
+    append_prior_attempt_bounded, completed_registered_effects_from_plan,
+    discarded_attempt_evidence_from_invocations, record_native_scalar_materialization,
+    render_discarded_attempt_processing, render_track_artifact_work, render_track_processing,
+    render_track_verifications, summarize_prior_attempt, DecisionAuthority, DecisionRecord, EvidenceValue,
+    ObservationRecord, OperationRecord,
+    SizeDomain, SizeEvidence, TrackExecutionEvidence, VerificationRecord, VerificationStatus,
+};
 use super::errors::{
     ConvertError, FeatureError, LogError, MaterializeError, MergeError, MetadataError, PlanError,
     PublishError, ReplayGainError, RequestValidationError, SourceDetectError, SourceDispatchError,
@@ -110,10 +118,9 @@ use crate::convert::cap_fs::PinnedDirectoryCapability;
 use crate::convert::ConversionStatus;
 use crate::metadata_persistence::native_ape_canonical_key;
 use tonepoet_pipeline::{
-    AacProfile, AudioFormat as PlannerAudioFormat, BitDepthTarget, DitherType,
-    DsdLowpassMethod, DsdRate, Mp3Mode, NyquistTransition,
-    OpusContentType, PcmBitDepth, PreferredTool, RateTarget, ResampleQuality, SampleGainPolicy,
-    SourceFrameExtent, SoxSincPhase, SsrcPdfType, SsrcProfile, WavPackMode,
+    AudioFormat as PlannerAudioFormat, BitDepthTarget, DitherType, DsdRate, NyquistTransition,
+    PcmBitDepth, PreferredTool, RateTarget, SampleGainPolicy, SourceFrameExtent, SsrcPdfType,
+    SsrcProfile,
 };
 use crate::tui::sacd::{
     parse_sacd_iso, AreaInfo, PlayTime, SacdError, SacdMetadata, TrackEntry, SACD_FRAME_RATE,
@@ -125,8 +132,7 @@ use sacd_rs::iso_reader::IsoReader;
 
 const DEFAULT_CONVERT_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 const STAGING_PARENT_NAME: &str = ".tonepoet-staging";
-const CONVERSION_LOG_TIMING_MODEL: &str = "wall-clock-v2";
-const CONVERSION_LOG_FRAGMENT_SCHEMA_VERSION: u8 = 13;
+const CONVERSION_LOG_FRAGMENT_SCHEMA_VERSION: u8 = 14;
 const CONVERSION_LOG_FRAGMENT_DIR: &str = ".tonepoet-log-fragments";
 const CONVERSION_LOG_FRAGMENT_QUARANTINE_DIR: &str = ".tonepoet-log-fragments.quarantine";
 const CONVERSION_LOG_FRAGMENT_SIDE_KIND: &str = "tonepoet-conversion-log-fragment";
@@ -1190,6 +1196,7 @@ async fn realize_track_with_tool_limits_and_stats(
                 path: path.clone(),
                 dsd_dst_stats: dsd_dst_stats_from_file(path, Some(file_len(path).unwrap_or(0)), None),
                 scalar_pump: None,
+                materialized_scalar: None,
             })
         }
         TrackSourceRef::DsdReferenceAutoGainCarrier {
@@ -1324,6 +1331,7 @@ async fn realize_track_with_tool_limits_and_stats(
                         expected_bytes,
                         expected_sha256,
                     }),
+                    materialized_scalar: None,
                 });
             }
 
@@ -1351,7 +1359,19 @@ async fn realize_track_with_tool_limits_and_stats(
                 ))
             })?
             .map_err(ConvertError::Realize)?;
-            Ok(RealizedTrackInfo::without_stats(output))
+            Ok(RealizedTrackInfo {
+                path: output,
+                dsd_dst_stats: None,
+                scalar_pump: None,
+                materialized_scalar: Some(RetainedPcmScalarPump {
+                    input_path: path.clone(),
+                    sample_rate_hz: *sample_rate_hz,
+                    channels: *channels,
+                    gain_db,
+                    expected_bytes,
+                    expected_sha256,
+                }),
+            })
         }
         TrackSourceRef::RegisteredEffectCarrier {
             path,
@@ -3031,6 +3051,7 @@ where
             path: out_path,
             dsd_dst_stats: stats,
             scalar_pump: None,
+            materialized_scalar: None,
         });
     }
 
@@ -3099,6 +3120,7 @@ where
                 path: out_path,
                 dsd_dst_stats,
                 scalar_pump: None,
+                materialized_scalar: None,
             })
         }
         Err(first_err) if out_path.exists() => {
@@ -3121,6 +3143,7 @@ where
                 path: out_path,
                 dsd_dst_stats,
                 scalar_pump: None,
+                materialized_scalar: None,
             })
         }
         Err(err) => {
@@ -3875,6 +3898,9 @@ pub struct ScheduledRealizedTrack {
     pub realized_path: PathBuf,
     pub realized_dsd_dst_stats: Option<DsdDstPipelineStats>,
     pub(crate) scalar_pump: Option<RetainedPcmScalarPump>,
+    pub(crate) materialized_scalar: Option<RetainedPcmScalarPump>,
+    /// Semantic receipts for work that completed before the terminal encode unit.
+    pub(crate) preparation_evidence: TrackExecutionEvidence,
     /// Audio-processing commands that already ran while preparing this track
     /// for the encode work unit (currently registered-effect carrier work).
     /// They must stay ordered ahead of the later terminal commands in the
@@ -3892,6 +3918,9 @@ struct RealizedTrackInfo {
     path: PathBuf,
     dsd_dst_stats: Option<DsdDstPipelineStats>,
     scalar_pump: Option<RetainedPcmScalarPump>,
+    /// Receipt retained when native scalar DSP is materialized to disk before
+    /// the terminal executor, so the operation remains visible without a fake command.
+    materialized_scalar: Option<RetainedPcmScalarPump>,
 }
 
 impl RealizedTrackInfo {
@@ -3900,6 +3929,7 @@ impl RealizedTrackInfo {
             path,
             dsd_dst_stats: None,
             scalar_pump: None,
+            materialized_scalar: None,
         }
     }
 }
@@ -3954,6 +3984,7 @@ async fn select_scalar_transport_or_materialized_baseline(
     })?
     .map_err(ConvertError::Realize)?;
     realized.path = output;
+    realized.materialized_scalar = Some(pump);
     realized.scalar_pump = None;
     Ok(realized)
 }
@@ -3963,6 +3994,7 @@ struct FinalExecutionInput {
     planner_track: PreparedTrack,
     realized_input: PathBuf,
     scalar_pump: Option<RetainedPcmScalarPump>,
+    materialized_scalar: Option<RetainedPcmScalarPump>,
     certified_true_peak_execution: Option<CertifiedTruePeakTerminalExecutionState>,
     prefix_commands: Vec<CommandRecord>,
     prefix_elapsed: Duration,
@@ -4045,6 +4077,7 @@ async fn prepare_final_execution_input(
             planner_track: track.clone(),
             realized_input: realized.path,
             scalar_pump: realized.scalar_pump,
+            materialized_scalar: realized.materialized_scalar,
             certified_true_peak_execution,
             prefix_commands: Vec::new(),
             prefix_elapsed: Duration::ZERO,
@@ -4128,6 +4161,7 @@ async fn prepare_final_execution_input(
         planner_track,
         realized_input: terminal_path,
         scalar_pump: None,
+        materialized_scalar: realized.materialized_scalar,
         certified_true_peak_execution,
         prefix_commands: vec![terminal_command],
         prefix_elapsed: terminal_elapsed,
@@ -4155,6 +4189,7 @@ pub fn scheduled_worker_failure_output(
             realized_input,
             output_file,
             commands: Vec::new(),
+            execution_evidence: Default::default(),
             bytes_in: None,
             bytes_out: None,
             duration: None,
@@ -4182,6 +4217,7 @@ fn track_records_for_terminal_source_issue(
             realized_input: None,
             output_file: None,
             commands: Vec::new(),
+            execution_evidence: Default::default(),
             bytes_in: None,
             bytes_out: None,
             duration: None,
@@ -4572,6 +4608,7 @@ mod convert_stage_failure_message_tests {
             realized_input: None,
             output_file: None,
             commands: Vec::new(),
+            execution_evidence: Default::default(),
             bytes_in: None,
             bytes_out: None,
             duration: None,
@@ -4821,6 +4858,7 @@ async fn convert_one_track_work(
     let staging = StagingDir::borrowed(staging_root, staging_job);
     let staged_path = staged_audio_path(&convert_root, &final_path, &track.id, &req.settings.target_format);
     let mut preparation_commands = Vec::new();
+    let mut preparation_evidence = TrackExecutionEvidence::default();
     let track = match prepare_track_scoped_certified_true_peak_carrier(
         &req,
         track.clone(),
@@ -4831,6 +4869,7 @@ async fn convert_one_track_work(
         &tool_paths,
         tool_concurrency_limits.clone(),
         &mut preparation_commands,
+        &mut preparation_evidence,
     )
     .await
     {
@@ -4943,6 +4982,7 @@ async fn convert_one_track_work(
         planner_track,
         realized_input,
         scalar_pump,
+        materialized_scalar,
         certified_true_peak_execution,
         prefix_commands: final_prefix_commands,
         prefix_elapsed: final_prefix_elapsed,
@@ -4985,10 +5025,31 @@ async fn convert_one_track_work(
 
     match executed {
         Ok(executed) => {
+            let mut completed_execution_evidence = preparation_evidence.clone();
+            completed_execution_evidence.append(executed.execution_evidence.clone(), prefix_commands.len());
+            if let Some(materialized_scalar) = materialized_scalar.as_ref() {
+                record_native_scalar_materialization(&mut completed_execution_evidence, materialized_scalar);
+            }
             let bytes_out = file_len(&staged_path);
+            record_track_size_evidence(
+                &mut completed_execution_evidence,
+                &realized_input,
+                &staged_path,
+                bytes_in,
+                bytes_out,
+            );
             if bytes_out.unwrap_or(0) == 0 {
                 let error = format!("planner did not produce output: {}", staged_path.display());
-                let record = failed_track_record(
+                let mut failure_evidence = completed_execution_evidence.clone();
+                failure_evidence.verifications.push(VerificationRecord {
+                    id: "nonempty-output".to_string(),
+                    kind: "output_nonempty".to_string(),
+                    statement: "Encoded output is nonempty".to_string(),
+                    status: VerificationStatus::Failed,
+                    invocation_indices: Vec::new(),
+                });
+                failure_evidence.mark_discarded_attempt();
+                let record = failed_track_record_with_execution_evidence(
                     &track,
                     Some(realized_input),
                     Some(staged_path),
@@ -4998,6 +5059,7 @@ async fn convert_one_track_work(
                         commands
                     },
                     error,
+                    failure_evidence,
                 );
                 Ok(ScheduledTrackOutput { index: track_index, record, artifact: None, ok: false, metadata_satisfaction: PlannedMetadataSatisfaction::none() })
             } else {
@@ -5014,13 +5076,24 @@ async fn convert_one_track_work(
                     Ok(samples) => samples,
                     Err(err) => {
                         let mut commands = prefix_commands.clone();
+                        commands.extend(executed.commands.clone());
                         commands.extend(command_from_convert_error(&err));
-                        let record = failed_track_record(
+                        let mut failure_evidence = completed_execution_evidence.clone();
+                        failure_evidence.verifications.push(VerificationRecord {
+                            id: "expected-samples".to_string(),
+                            kind: "expected_samples".to_string(),
+                            statement: "Expected post-encode sample extent was established".to_string(),
+                            status: VerificationStatus::Failed,
+                            invocation_indices: Vec::new(),
+                        });
+                        failure_evidence.mark_discarded_attempt();
+                        let record = failed_track_record_with_execution_evidence(
                             &track,
                             Some(realized_input),
                             Some(staged_path),
                             commands,
                             err.to_string(),
+                            failure_evidence,
                         );
                         return Ok(ScheduledTrackOutput { index: track_index, record, artifact: None, ok: false, metadata_satisfaction: PlannedMetadataSatisfaction::none() });
                     }
@@ -5040,18 +5113,36 @@ async fn convert_one_track_work(
                     Ok(validation) => validation,
                     Err(err) => {
                         let mut commands = prefix_commands.clone();
+                        commands.extend(executed.commands.clone());
                         commands.extend(command_from_convert_error(&err));
-                        let record = failed_track_record(
+                        let mut failure_evidence = completed_execution_evidence.clone();
+                        failure_evidence.verifications.push(VerificationRecord {
+                            id: "post-encode-validation".to_string(),
+                            kind: "post_encode_validation".to_string(),
+                            statement: "Encoded output passed post-encode validation".to_string(),
+                            status: VerificationStatus::Failed,
+                            invocation_indices: Vec::new(),
+                        });
+                        failure_evidence.mark_discarded_attempt();
+                        let record = failed_track_record_with_execution_evidence(
                             &track,
                             Some(realized_input),
                             Some(staged_path),
                             commands,
                             err.to_string(),
+                            failure_evidence,
                         );
                         return Ok(ScheduledTrackOutput { index: track_index, record, artifact: None, ok: false, metadata_satisfaction: PlannedMetadataSatisfaction::none() });
                     }
                 };
                 let actual_samples = post_encode_validation.samples;
+                completed_execution_evidence.verifications.push(VerificationRecord {
+                    id: "post-encode-validation".to_string(),
+                    kind: "post_encode_validation".to_string(),
+                    statement: "Encoded output passed post-encode validation".to_string(),
+                    status: VerificationStatus::Passed,
+                    invocation_indices: Vec::new(),
+                });
                 let mut dsd_dst_stats = realized_dsd_dst_stats;
                 merge_optional_dsd_dst_stats(
                     &mut dsd_dst_stats,
@@ -5068,6 +5159,7 @@ async fn convert_one_track_work(
                     realized_input: Some(realized_input),
                     output_file: Some(staged_path.clone()),
                     commands,
+                    execution_evidence: completed_execution_evidence,
                     bytes_in,
                     bytes_out,
                     duration: Some(prefix_elapsed.saturating_add(executed.elapsed)),
@@ -5091,14 +5183,23 @@ async fn convert_one_track_work(
         }
         Err(err) => {
             let error = err.to_string();
+            let invocation_offset = prefix_commands.len();
+            let mut executor_evidence = err.execution_evidence;
+            if executor_evidence == TrackExecutionEvidence::default() && !err.commands.is_empty() {
+                executor_evidence = discarded_attempt_evidence_from_invocations(&err.commands);
+            }
+            let mut failure_evidence = preparation_evidence.clone();
+            failure_evidence.append(executor_evidence, invocation_offset);
+            failure_evidence.mark_discarded_attempt();
             let mut commands = prefix_commands;
             commands.extend(err.commands);
-            let record = failed_track_record(
+            let record = failed_track_record_with_execution_evidence(
                 &track,
                 Some(realized_input),
                 Some(staged_path),
                 commands,
                 error,
+                failure_evidence,
             );
             Ok(ScheduledTrackOutput { index: track_index, record, artifact: None, ok: false, metadata_satisfaction: PlannedMetadataSatisfaction::none() })
         }
@@ -15378,99 +15479,7 @@ pub(super) fn normalized_container_extension(req: &PipelineRequest) -> String {
         .trim_start_matches('.')
         .to_ascii_lowercase()
 }
-fn replaygain_request_policy_log_label(req: &PipelineRequest) -> String {
-    if req.stages.replaygain == StageRequirement::Disabled {
-        return "disabled by pipeline settings".to_string();
-    }
-    if req.settings.replay_gain.existing_tags
-        == tonepoet_pipeline::ReplayGainExistingTagPolicy::Rescan
-    {
-        return "recompute: explicit rescan policy".to_string();
-    }
-    "conditional: trust only a complete inherited tag set on signal-equivalent output; otherwise recompute"
-        .to_string()
-}
 
-fn replaygain_policy_log_label(
-    source: &PreparedSource,
-    req: &PipelineRequest,
-    successful_output_count: usize,
-    stage_outcome: Option<&StageOutcome>,
-) -> String {
-    if req.stages.replaygain == StageRequirement::Disabled {
-        return "disabled by pipeline settings".to_string();
-    }
-
-
-    let planned_policy = if req.settings.replay_gain.existing_tags
-        == tonepoet_pipeline::ReplayGainExistingTagPolicy::Rescan
-    {
-        ReplayGainInheritedTagPolicy::Recompute {
-            reason: "explicit rescan policy".to_string(),
-        }
-    } else {
-        inherited_replaygain_tag_policy(Some(source), req)
-    };
-
-    match stage_outcome {
-        Some(StageOutcome::OkWithDetail(detail)) => {
-            let base = match planned_policy {
-                ReplayGainInheritedTagPolicy::Recompute { reason } => {
-                    format!("recomputed: {reason}")
-                }
-                ReplayGainInheritedTagPolicy::Trust => {
-                    "recomputed: inherited requested tag set was absent, incomplete, or unreadable on signal-equivalent output"
-                        .to_string()
-                }
-            };
-            format!("{base}; {}", escape_log_value(detail))
-        }
-        Some(StageOutcome::Ok) => match planned_policy {
-            ReplayGainInheritedTagPolicy::Recompute { reason } => {
-                format!("recomputed: {reason}")
-            }
-            ReplayGainInheritedTagPolicy::Trust => {
-                "recomputed: inherited requested tag set was absent, incomplete, or unreadable on signal-equivalent output"
-                    .to_string()
-            }
-        },
-        Some(StageOutcome::Skipped) if successful_output_count == 0 => {
-            "skipped: no successful output audio".to_string()
-        }
-        Some(StageOutcome::Skipped) => match planned_policy {
-            ReplayGainInheritedTagPolicy::Trust => {
-                "trusted inherited tags: output is signal-equivalent and every successful output has the complete requested tag set"
-                    .to_string()
-            }
-            ReplayGainInheritedTagPolicy::Recompute { reason } => {
-                format!("skipped unexpectedly despite recompute policy: {reason}")
-            }
-        },
-        Some(StageOutcome::SkippedWithReason(reason)) => {
-            format!("skipped: {}", escape_log_value(reason))
-        }
-        Some(StageOutcome::NotRequested) => {
-            "not requested despite enabled ReplayGain settings".to_string()
-        }
-        Some(StageOutcome::Failed(reason)) => match planned_policy {
-            ReplayGainInheritedTagPolicy::Trust => format!(
-                "failed before provenance decision completed: {reason}; planned to trust only complete inherited tags on signal-equivalent output"
-            ),
-            ReplayGainInheritedTagPolicy::Recompute { reason: policy_reason } => format!(
-                "failed while recomputing ({policy_reason}): {reason}"
-            ),
-        },
-        None => match planned_policy {
-            ReplayGainInheritedTagPolicy::Trust => {
-                "outcome unavailable: policy would trust only complete inherited tags on signal-equivalent output"
-                    .to_string()
-            }
-            ReplayGainInheritedTagPolicy::Recompute { reason } => {
-                format!("outcome unavailable: policy requires recompute ({reason})")
-            }
-        },
-    }
-}
 
 fn apply_cue_source_replaygain_if_eligible(
     artifacts: &ArtifactSet,
@@ -15901,7 +15910,6 @@ fn stage_conversion_log_sidecars_with_timing(
             staging,
             runner,
             album_gain_scope_disclosure,
-            dsd_true_peak_timings,
             run_timing,
         )? {
             artifacts.sidecars.push(SidecarArtifact {
@@ -16357,20 +16365,8 @@ fn stage_pre_materialization_conversion_log_fragment(
         duration: None,
         verified_output_bit_depth: None,
         dsd_dst_stats: None,
+        execution_evidence: TrackExecutionEvidence::default(),
     };
-
-    let mut track_section = String::new();
-    append_track_log(
-        &mut track_section,
-        &track_record,
-        None,
-        None,
-        None,
-        req,
-        metadata_stage_outcome(outcome),
-        None,
-        None,
-    );
 
     let fragment = ConversionLogFragment {
         version: CONVERSION_LOG_FRAGMENT_SCHEMA_VERSION,
@@ -16382,10 +16378,17 @@ fn stage_pre_materialization_conversion_log_fragment(
         batch_identity,
         rendered_album_dir: None,
         common: build_pre_materialization_conversion_log_common_fragment(req),
-        track: ConversionLogTrackFragment {
-            section: track_section,
-        },
+        track: structured_conversion_log_track_fragment(
+            &track_record,
+            None,
+            None,
+            None,
+            req,
+            metadata_stage_outcome(outcome),
+            None,
+        ),
         summary: ConversionLogTrackSummary::from_track_record(&track_record),
+        album_block_reason: outcome_block_reason(outcome).cloned(),
         stages: outcome_stage_records(outcome).to_vec(),
     };
 
@@ -16422,8 +16425,6 @@ fn pre_materialization_failure_message(outcome: &AlbumOutcome) -> String {
 fn build_pre_materialization_conversion_log_common_fragment(
     req: &PipelineRequest,
 ) -> ConversionLogCommonFragment {
-    let mut conversion_settings_section = String::new();
-    append_request_only_conversion_settings_section(&mut conversion_settings_section, req);
     ConversionLogCommonFragment {
         representative_job_id: req.job_id.clone(),
         representative_item_id: req.item_id.clone(),
@@ -16435,34 +16436,7 @@ fn build_pre_materialization_conversion_log_common_fragment(
         source_blocking_lines: String::new(),
         provenance_section: String::new(),
         artwork_section: String::new(),
-        conversion_settings_section,
     }
-}
-
-fn append_request_only_conversion_settings_section(log: &mut String, req: &PipelineRequest) {
-    let settings = &req.settings;
-    push_kv_line(log, "Target format", settings.target_format.display_name());
-    push_kv_line(log, "Force encode", yes_no(settings.force_encode));
-    push_kv_line(log, "Merge mode", yes_no(req.merge));
-    append_target_format_settings(log, settings);
-    push_kv_line(log, "Metadata", stage_requirement_label(req.stages.metadata));
-    push_kv_line(log, "ReplayGain", stage_requirement_label(req.stages.replaygain));
-    push_kv_line(
-        log,
-        "ReplayGain policy",
-        replaygain_request_policy_log_label(req),
-    );
-    push_kv_line(
-        log,
-        "ReplayGain clipping prevention",
-        yes_no(settings.replay_gain.prevent_clipping),
-    );
-    push_kv_line(log, "Features", stage_requirement_label(req.stages.features));
-    match &req.naming.folder_template {
-        Some(template) => push_kv_line(log, "Folder template", template),
-        None => push_kv_line(log, "Folder template", "album-name fallback"),
-    }
-    push_kv_line(log, "Filename template", &req.naming.template);
 }
 
 /// Runtime-only wall-clock timing for one live pipeline request.
@@ -16586,36 +16560,34 @@ fn build_conversion_log_at_with_runner_and_timing(
     let source_tracks_by_ordinal = build_source_track_index(source);
     let artifacts_by_track_id = build_track_artifact_index(artifacts);
     let metadata_stage_result = metadata_stage_outcome(outcome);
-    let resampling_applies = resampling_applies_for_source(source, &req.settings);
-    let bit_depth_change_applies = bit_depth_change_applies_for_source(source, &req.settings);
-    let dithering_applies = dithering_applies_for_source(source, &req.settings, &tracks);
     let successful_count = tracks
         .iter()
         .filter(|track| matches!(track.outcome, TrackOutcome::Ok))
         .count();
     let failed_count = tracks.len().saturating_sub(successful_count);
     let total_track_count = source.tracks.len().max(tracks.len());
-    let total_bytes_in = tracks
-        .iter()
-        .filter_map(|track| track.bytes_in)
-        .fold(0_u64, u64::saturating_add);
-    let total_bytes_out = tracks
-        .iter()
-        .filter_map(|track| track.bytes_out)
-        .fold(0_u64, u64::saturating_add);
-    let missing_input_sizes = tracks
-        .iter()
-        .filter(|track| track.bytes_in.is_none())
-        .count();
-    let missing_output_sizes = tracks
-        .iter()
-        .filter(|track| track.bytes_out.is_none())
-        .count();
-    let missing_encode_durations = tracks
-        .iter()
-        .filter(|track| track.duration.is_none())
-        .count();
-    let encode_duration_sum = total_track_duration(&tracks);
+    let mut total_bytes_in = 0_u64;
+    let mut total_bytes_out = 0_u64;
+    let mut missing_input_sizes = 0_usize;
+    let mut missing_output_sizes = 0_usize;
+    for record in &tracks {
+        let prepared = source_tracks_by_ordinal
+            .get(&record.track_id.source_ordinal)
+            .copied();
+        let artifact = artifacts_by_track_id.get(&record.track_id).copied();
+        let (source_bytes, output_bytes) = prepared
+            .zip(artifact)
+            .map(|(prepared, artifact)| conversion_log_comparable_track_sizes(source, prepared, artifact))
+            .unwrap_or((None, None));
+        match source_bytes {
+            Some(bytes) => total_bytes_in = total_bytes_in.saturating_add(bytes),
+            None => missing_input_sizes = missing_input_sizes.saturating_add(1),
+        }
+        match output_bytes {
+            Some(bytes) => total_bytes_out = total_bytes_out.saturating_add(bytes),
+            None => missing_output_sizes = missing_output_sizes.saturating_add(1),
+        }
+    }
     let timing_checkpoint = run_timing.map(ConversionRunTiming::snapshot);
     let elapsed_wall_time = timing_checkpoint
         .as_ref()
@@ -16631,17 +16603,7 @@ fn build_conversion_log_at_with_runner_and_timing(
     let mut artwork_section = String::new();
     append_artwork_section(&mut artwork_section, source, req, outcome, artifacts);
 
-    let mut conversion_settings_section = String::new();
-    append_conversion_settings_section(
-        &mut conversion_settings_section,
-        source,
-        req,
-        &tracks,
-        replaygain_stage_outcome(outcome),
-        resampling_applies,
-        bit_depth_change_applies,
-        dithering_applies,
-    );
+    // Performed processing is rendered exclusively from execution evidence.
 
     let mut track_sections = Vec::with_capacity(tracks.len());
     for record in &tracks {
@@ -16678,9 +16640,7 @@ fn build_conversion_log_at_with_runner_and_timing(
         source_blocking_lines,
         provenance_section,
         artwork_section,
-        conversion_settings_section,
         track_sections,
-        stage_records: outcome_stage_records(outcome).to_vec(),
         total_summary: ConversionLogTotalSummary {
             successful_count,
             failed_count,
@@ -16689,15 +16649,10 @@ fn build_conversion_log_at_with_runner_and_timing(
             total_bytes_out,
             missing_input_sizes,
             missing_output_sizes,
-            encode_duration_sum,
-            missing_encode_durations,
             elapsed_wall_time,
             timing_started_at_utc: timing_checkpoint
                 .as_ref()
                 .map(|timing| timing.started_at_utc.clone()),
-            timing_checkpoint_finished_at_utc: timing_checkpoint
-                .as_ref()
-                .map(|timing| timing.finished_at_utc.clone()),
             missing_wall_timings: usize::from(run_timing.is_none()),
         },
         batch_status: None,
@@ -16722,9 +16677,7 @@ struct ConversionLogRenderInput {
     source_blocking_lines: String,
     provenance_section: String,
     artwork_section: String,
-    conversion_settings_section: String,
     track_sections: Vec<String>,
-    stage_records: Vec<StageRecord>,
     total_summary: ConversionLogTotalSummary,
     batch_status: Option<String>,
     result_label: String,
@@ -16739,11 +16692,8 @@ struct ConversionLogTotalSummary {
     total_bytes_out: u64,
     missing_input_sizes: usize,
     missing_output_sizes: usize,
-    encode_duration_sum: Duration,
-    missing_encode_durations: usize,
     elapsed_wall_time: Option<Duration>,
     timing_started_at_utc: Option<chrono::DateTime<chrono::Utc>>,
-    timing_checkpoint_finished_at_utc: Option<chrono::DateTime<chrono::Utc>>,
     missing_wall_timings: usize,
 }
 
@@ -16781,41 +16731,16 @@ fn render_conversion_log(input: &ConversionLogRenderInput) -> String {
     log.push_str(&input.provenance_section);
     log.push_str(&input.artwork_section);
 
-    log.push_str("Conversion Settings\n");
-    log.push_str("-------------------\n");
-    log.push_str(&input.conversion_settings_section);
-    log.push('\n');
-
     log.push_str("Per-Track Results\n");
     log.push_str("-----------------\n");
     if input.track_sections.is_empty() {
-        log.push_str("No track records were produced.\n");
+        log.push_str("No track execution records were produced.\n");
     } else {
         for section in &input.track_sections {
             log.push_str(section);
             if !section.ends_with('\n') {
                 log.push('\n');
             }
-        }
-    }
-    log.push('\n');
-
-    log.push_str("Stage Summary\n");
-    log.push_str("-------------\n");
-    if input.stage_records.is_empty() {
-        log.push_str("No stage records were produced.\n");
-    } else {
-        for stage in &input.stage_records {
-            let mut summary = stage_outcome_label(&stage.outcome);
-            if let Some(stats) = stage.dsd_dst_stats.as_ref() {
-                summary.push_str("; ");
-                summary.push_str(&format_dsd_dst_stats_inline(stats));
-            }
-            push_kv_line(
-                &mut log,
-                pipeline_stage_label(stage.stage),
-                summary,
-            );
         }
     }
     log.push('\n');
@@ -16835,55 +16760,53 @@ fn render_conversion_log(input: &ConversionLogRenderInput) -> String {
     if let Some(batch_status) = input.batch_status.as_deref() {
         push_kv_line(&mut log, "Batch status", batch_status);
     }
-    append_total_size_line(
-        &mut log,
-        input.total_summary.total_bytes_in,
-        input.total_summary.total_bytes_out,
-        input.total_summary.missing_input_sizes,
-        input.total_summary.missing_output_sizes,
-    );
-    push_kv_line(&mut log, "Timing model", CONVERSION_LOG_TIMING_MODEL);
+    // A reduction percentage is meaningful only when every included track has
+    // an original-storage comparator with the same scope as its produced staged file.
+    if input.total_summary.missing_input_sizes == 0
+        && input.total_summary.missing_output_sizes == 0
+        && input.total_summary.total_bytes_in > 0
+    {
+        push_kv_line(
+            &mut log,
+            "Produced size",
+            format!(
+                "{} -> {} ({})",
+                format_bytes(input.total_summary.total_bytes_in),
+                format_bytes(input.total_summary.total_bytes_out),
+                compression_ratio(
+                    input.total_summary.total_bytes_in,
+                    input.total_summary.total_bytes_out,
+                ),
+            ),
+        );
+    } else if input.total_summary.total_bytes_out > 0 {
+        push_kv_line(
+            &mut log,
+            "Produced output size",
+            format_bytes(input.total_summary.total_bytes_out),
+        );
+    }
     if input.total_summary.missing_wall_timings == 0 {
         if let Some(started_at) = input.total_summary.timing_started_at_utc.as_ref() {
             push_kv_line(
                 &mut log,
-                "Timing started (UTC)",
+                "Started (UTC)",
                 started_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             );
         }
     }
-    append_elapsed_processing_wall_time_line(
-        &mut log,
-        input.total_summary.elapsed_wall_time,
-        input.total_summary.missing_wall_timings,
-    );
-    if input.total_summary.missing_wall_timings == 0 {
-        if let Some(checkpoint) = input
-            .total_summary
-            .timing_checkpoint_finished_at_utc
-            .as_ref()
-        {
-            push_kv_line(
-                &mut log,
-                "Timing checkpoint (UTC)",
-                checkpoint.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-            );
-        }
+    match input.total_summary.elapsed_wall_time {
+        Some(elapsed) if input.total_summary.missing_wall_timings == 0 => push_kv_line(
+            &mut log,
+            "Elapsed",
+            format!("pending finalization (checkpoint {})", format_duration_precise(elapsed)),
+        ),
+        _ => push_kv_line(&mut log, "Elapsed", "unavailable"),
     }
-    append_encode_duration_sum_line(
-        &mut log,
-        input.total_summary.encode_duration_sum,
-        input.total_summary.missing_encode_durations,
-    );
-    push_kv_line(
-        &mut log,
-        "Timing scope",
-        "processing wall time starts when pipeline execution begins and is finalized immediately before durable-log and terminal-report bookkeeping, after publication and post-actions; queue wait before pipeline entry is excluded; album-batch wall time spans the earliest participant start through the finalizing participant; per-track Encode duration retains its existing meaning and times the executed track plan after source realization, so it includes DSD-to-PCM work when that work is part of the plan and excludes DSD album-gain prepass work; DSD album-gain prepass timings are reported separately; per-track and prepass timings may overlap across workers and must not be summed as wall time",
-    );
     push_kv_line(&mut log, "Result", &input.result_label);
     log.push('\n');
 
-    log.push_str("Log generated by tonepoet\n");
+    log.push_str("Log generated by TonePoet\n");
     log
 }
 
@@ -16902,6 +16825,16 @@ struct ConversionLogFragment {
     common: ConversionLogCommonFragment,
     track: ConversionLogTrackFragment,
     summary: ConversionLogTrackSummary,
+    /// Authoritative album-level terminal block state captured when this
+    /// fragment is created. Older version-14 fragments deserialize with no
+    /// value and retain the legacy count-derived fallback during assembly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    album_block_reason: Option<BlockReason>,
+    /// Version-14 wire compatibility only. Performed processing is rendered
+    /// exclusively from `track.execution_evidence`; these stage records remain
+    /// outside the human processing-description authority.
+    #[serde(default)]
+    #[allow(dead_code)]
     stages: Vec<StageRecord>,
 }
 
@@ -16920,12 +16853,49 @@ struct ConversionLogCommonFragment {
     source_blocking_lines: String,
     provenance_section: String,
     artwork_section: String,
-    conversion_settings_section: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
 struct ConversionLogTrackFragment {
+    /// Transitional text field retained for fragment-level diagnostics/tests.
+    /// Version-14 production fragments leave this empty; performed processing
+    /// is authoritative only in `execution_evidence`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     section: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    block_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    artist: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    composer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_audio: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    output_target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    shared_decision_scope: Option<String>,
+    /// Bound runtime album-gain decision. This is decision evidence, not a
+    /// reconstruction of performed processing from settings or argv.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    album_gain_decision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    metadata: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    metadata_source: Option<String>,
+    #[serde(default)]
+    reference_evidence_recorded: bool,
+    #[serde(default)]
+    execution_evidence: TrackExecutionEvidence,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dsd_dst_stats: Option<DsdDstPipelineStats>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -17247,7 +17217,6 @@ fn stage_conversion_log_fragment(
         runner,
         None,
         None,
-        None,
     )?;
     if fragments.len() != 1 {
         return Err(io::Error::new(
@@ -17272,7 +17241,6 @@ fn stage_conversion_log_fragments(
     staging: &StagingDir,
     runner: Option<&dyn ToolRunner>,
     album_gain_scope_disclosure: Option<&DsdAlbumGainScopeDisclosure>,
-    dsd_true_peak_timings: Option<&BTreeMap<TrackId, DsdAlbumGainTiming>>,
     run_timing: Option<&ConversionRunTiming>,
 ) -> io::Result<Vec<(PathBuf, String)>> {
     let track_records = conversion_log_fragment_track_records(outcome);
@@ -17320,21 +17288,10 @@ fn stage_conversion_log_fragments(
             ));
         }
         let fragment_name = conversion_log_fragment_file_name(sort_key, &batch_identity);
-        let mut track_section = String::new();
-        append_track_log(
-            &mut track_section,
-            track_record,
-            source_tracks_by_ordinal
-                .get(&track_id.source_ordinal)
-                .copied(),
-            Some(source),
-            artifacts_by_track_id.get(&track_id).copied(),
-            req,
-            metadata_stage_result,
-            album_gain_scope_disclosure,
-            dsd_true_peak_timings,
-        );
-
+        let prepared = source_tracks_by_ordinal
+            .get(&track_id.source_ordinal)
+            .copied();
+        let artifact = artifacts_by_track_id.get(&track_id).copied();
         let fragment = ConversionLogFragment {
             version: CONVERSION_LOG_FRAGMENT_SCHEMA_VERSION,
             expected_track_count,
@@ -17346,10 +17303,22 @@ fn stage_conversion_log_fragments(
             rendered_album_dir: conversion_log_rendered_album_dir_for_track(source, req, artifacts, &track_id)
                 .map(|path| normalize_path(&path).to_string_lossy().to_string()),
             common: common.clone(),
-            track: ConversionLogTrackFragment {
-                section: track_section,
-            },
-            summary: ConversionLogTrackSummary::from_track_record(track_record),
+            track: structured_conversion_log_track_fragment(
+                track_record,
+                prepared,
+                Some(source),
+                artifact,
+                req,
+                metadata_stage_result,
+                album_gain_scope_disclosure,
+            ),
+            summary: ConversionLogTrackSummary::from_track_record_with_context(
+                track_record,
+                source,
+                prepared,
+                artifact,
+            ),
+            album_block_reason: outcome_block_reason(outcome).cloned(),
             stages: stages.clone(),
         };
         let fragment_staged = staging
@@ -17371,6 +17340,155 @@ fn conversion_log_fragment_track_records(outcome: &AlbumOutcome) -> Vec<&TrackRe
     collect_outcome_tracks(outcome)
 }
 
+fn structured_conversion_log_track_fragment(
+    record: &TrackRecord,
+    prepared: Option<&PreparedTrack>,
+    source: Option<&PreparedSource>,
+    artifact: Option<&TrackArtifact>,
+    req: &PipelineRequest,
+    metadata_stage_result: Option<&StageOutcome>,
+    album_gain_scope_disclosure: Option<&DsdAlbumGainScopeDisclosure>,
+) -> ConversionLogTrackFragment {
+    let (error, block_reason) = match &record.outcome {
+        TrackOutcome::Ok => (None, None),
+        TrackOutcome::Err(error) => (Some(error.clone()), None),
+        TrackOutcome::Blocked(reason) => (None, Some(reason.clone())),
+    };
+    ConversionLogTrackFragment {
+        section: String::new(),
+        label: track_display_label(record, prepared),
+        error,
+        block_reason,
+        artist: prepared
+            .and_then(|track| conversion_log_metadata_values(&track.metadata.artist)),
+        composer: prepared
+            .and_then(|track| conversion_log_metadata_values(&track.metadata.composer)),
+        source_path: prepared.map(|track| path_log_value(track_source_identity_path(track))),
+        source_audio: prepared.map(source_audio_description),
+        warnings: prepared.map(|track| track.warnings.clone()).unwrap_or_default(),
+        output_target: artifact.map(|artifact| path_log_value(&artifact.final_path)),
+        shared_decision_scope: album_gain_scope_disclosure.map(dsd_album_gain_scope_disclosure_label),
+        album_gain_decision: prepared.and_then(|track| dsd_album_gain_decision_label(track, req)),
+        metadata: metadata_satisfaction_label(
+            artifact,
+            prepared,
+            source,
+            req.stages.metadata,
+            metadata_stage_result,
+        ),
+        metadata_source: req.source.sidecar_cue_track_metadata.as_ref().map(|metadata_source| {
+            format!(
+                "Sidecar CUE: {} (track {})",
+                path_log_value(&metadata_source.cue_path),
+                metadata_source.cue_track_number,
+            )
+        }),
+        reference_evidence_recorded: artifact
+            .and_then(|artifact| artifact.reference_evidence.as_ref())
+            .is_some(),
+        execution_evidence: record.execution_evidence.clone(),
+        dsd_dst_stats: record.dsd_dst_stats.clone(),
+    }
+}
+
+fn render_structured_conversion_log_track_fragment(
+    fragment: &ConversionLogTrackFragment,
+    summary: &ConversionLogTrackSummary,
+) -> String {
+    // Older on-disk fragments may contain only the legacy rendered section.
+    // New fragments never populate it, so there is no competing authority for
+    // performed processing in a current conversion.
+    if fragment.label.is_empty() {
+        return fragment.section.clone();
+    }
+    let mut log = String::new();
+    log.push_str(&escape_log_value(&fragment.label));
+    log.push('\n');
+    match summary.outcome {
+        ConversionLogTrackOutcome::Success => log.push_str("  Status: Success\n"),
+        ConversionLogTrackOutcome::Failure => {
+            log.push_str("  Status: Failure\n");
+            if let Some(error) = fragment.error.as_deref() {
+                push_kv_line(&mut log, "  Error", error);
+            }
+        }
+        ConversionLogTrackOutcome::Blocked => {
+            log.push_str("  Status: Blocked\n");
+            if let Some(reason) = fragment.block_reason.as_deref() {
+                push_kv_line(&mut log, "  Block reason", reason);
+            }
+        }
+    }
+    push_optional_kv_line(&mut log, "  Album gain scope", fragment.shared_decision_scope.as_deref());
+    push_optional_kv_line(&mut log, "  Album gain decision", fragment.album_gain_decision.as_deref());
+    push_optional_kv_line(&mut log, "  Artist", fragment.artist.as_deref());
+    push_optional_kv_line(&mut log, "  Composer", fragment.composer.as_deref());
+    push_optional_kv_line(&mut log, "  Source", fragment.source_path.as_deref());
+    push_optional_kv_line(&mut log, "  Source audio", fragment.source_audio.as_deref());
+    for warning in &fragment.warnings {
+        push_kv_line(&mut log, "  Warning", warning);
+    }
+    push_optional_kv_line(&mut log, "  Output target", fragment.output_target.as_deref());
+
+    let processing = if summary.outcome == ConversionLogTrackOutcome::Success {
+        render_track_processing(&fragment.execution_evidence)
+    } else {
+        render_discarded_attempt_processing(&fragment.execution_evidence)
+    };
+    if !processing.is_empty() {
+        log.push_str(if summary.outcome == ConversionLogTrackOutcome::Success {
+            "  Processing:\n"
+        } else {
+            "  Attempt processing (not delivered):\n"
+        });
+        for line in processing {
+            log.push_str("    ");
+            log.push_str(&escape_log_value(&line));
+            log.push('\n');
+        }
+    } else if summary.outcome == ConversionLogTrackOutcome::Success {
+        log.push_str("  Processing: no completed delivered-audio operations recorded\n");
+    }
+    if summary.outcome == ConversionLogTrackOutcome::Success {
+        let artifact_work = render_track_artifact_work(&fragment.execution_evidence);
+        if !artifact_work.is_empty() {
+            log.push_str("  Artifact work:\n");
+            for line in artifact_work {
+                log.push_str("    ");
+                log.push_str(&escape_log_value(&line));
+                log.push('\n');
+            }
+        }
+    }
+    push_optional_kv_line(&mut log, "  Metadata", fragment.metadata.as_deref());
+    push_optional_kv_line(&mut log, "  Metadata source", fragment.metadata_source.as_deref());
+    let verifications = render_track_verifications(&fragment.execution_evidence);
+    if !verifications.is_empty() {
+        log.push_str("  Verification:\n");
+        for verification in verifications {
+            log.push_str("    ");
+            log.push_str(&escape_log_value(&verification));
+            log.push('\n');
+        }
+    }
+    if fragment.reference_evidence_recorded {
+        log.push_str("  Verification: qualified Reference execution/PCM evidence recorded\n");
+    }
+    match (summary.bytes_in, summary.bytes_out) {
+        (Some(input), Some(output)) => push_kv_line(
+            &mut log,
+            "  Produced size",
+            format!("{} -> {} ({})", format_bytes(input), format_bytes(output), compression_ratio(input, output)),
+        ),
+        (_, Some(output)) => push_kv_line(&mut log, "  Produced output size", format_bytes(output)),
+        _ => {}
+    }
+    if let Some(stats) = fragment.dsd_dst_stats.as_ref() {
+        push_kv_line(&mut log, "  DSD/DST stats", format_dsd_dst_stats_inline(stats));
+    }
+    log.push('\n');
+    log
+}
 
 impl ConversionLogTrackSummary {
     fn from_track_record(record: &TrackRecord) -> Self {
@@ -17380,10 +17498,29 @@ impl ConversionLogTrackSummary {
                 TrackOutcome::Err(_) => ConversionLogTrackOutcome::Failure,
                 TrackOutcome::Blocked(_) => ConversionLogTrackOutcome::Blocked,
             },
-            bytes_in: record.bytes_in,
-            bytes_out: record.bytes_out,
-            duration_millis: record.duration.map(duration_to_millis_saturating),
+            // A bare TrackRecord has only legacy execution-input bytes, whose
+            // domain can be a decoded/materialized carrier. Never promote them
+            // to source-storage accounting without source/artifact context.
+            bytes_in: None,
+            bytes_out: None,
+            duration_millis: None,
         }
+    }
+
+    fn from_track_record_with_context(
+        record: &TrackRecord,
+        source: &PreparedSource,
+        prepared: Option<&PreparedTrack>,
+        artifact: Option<&TrackArtifact>,
+    ) -> Self {
+        let mut summary = Self::from_track_record(record);
+        if let (Some(prepared), Some(artifact)) = (prepared, artifact) {
+            let (source_bytes, output_bytes) =
+                conversion_log_comparable_track_sizes(source, prepared, artifact);
+            summary.bytes_in = source_bytes;
+            summary.bytes_out = output_bytes;
+        }
+        summary
     }
 }
 
@@ -17416,18 +17553,7 @@ fn build_conversion_log_common_fragment_with_runner(
     let mut artwork_section = String::new();
     append_artwork_section(&mut artwork_section, source, req, outcome, artifacts);
 
-    let mut conversion_settings_section = String::new();
-    append_conversion_settings_section(
-        &mut conversion_settings_section,
-        source,
-        req,
-        &tracks,
-        replaygain_stage_outcome(outcome),
-        resampling_applies_for_source(source, &req.settings),
-        bit_depth_change_applies_for_source(source, &req.settings),
-        dithering_applies_for_source(source, &req.settings, &tracks),
-    );
-
+    // Requested settings are not evidence that processing executed.
     ConversionLogCommonFragment {
         representative_job_id: req.job_id.clone(),
         representative_item_id: req.item_id.clone(),
@@ -17439,7 +17565,6 @@ fn build_conversion_log_common_fragment_with_runner(
         source_blocking_lines,
         provenance_section,
         artwork_section,
-        conversion_settings_section,
     }
 }
 
@@ -21725,36 +21850,21 @@ fn build_conversion_log_from_fragments_with_status(
         .iter()
         .filter(|fragment| fragment.summary.bytes_out.is_none())
         .count();
-    let missing_encode_durations = ordered
-        .iter()
-        .filter(|fragment| fragment.summary.duration_millis.is_none())
-        .count();
-    let encode_duration_sum = total_fragment_duration(&ordered);
     let absent_fragments = total_track_count.saturating_sub(ordered.len());
-    let (
-        timing_started_at_utc,
-        elapsed_wall_time,
-        timing_checkpoint_finished_at_utc,
-        invalid_or_missing_wall_timings,
-    ) = fragment_elapsed_wall_time(&ordered);
+    let (timing_started_at_utc, elapsed_wall_time, _, invalid_or_missing_wall_timings) =
+        fragment_elapsed_wall_time(&ordered);
     let missing_wall_timings = invalid_or_missing_wall_timings
         .saturating_add(absent_fragments)
         .saturating_add(usize::from(assembly_status.is_some() && absent_fragments == 0));
-    let (timing_started_at_utc, elapsed_wall_time, timing_checkpoint_finished_at_utc) =
-        if missing_wall_timings == 0 {
-            (
-                timing_started_at_utc,
-                elapsed_wall_time,
-                timing_checkpoint_finished_at_utc,
-            )
-        } else {
-            (None, None, None)
-        };
+    let (timing_started_at_utc, elapsed_wall_time) = if missing_wall_timings == 0 {
+        (timing_started_at_utc, elapsed_wall_time)
+    } else {
+        (None, None)
+    };
     let track_sections = ordered
         .iter()
-        .map(|fragment| fragment.track.section.clone())
+        .map(|fragment| render_structured_conversion_log_track_fragment(&fragment.track, &fragment.summary))
         .collect();
-    let stage_records = aggregate_fragment_stage_records(&ordered);
     let batch_status = assembly_status.map(|status| match status {
         ConversionLogAssemblyStatus::CancelledPartial { expected_track_count } => {
             format!(
@@ -21796,9 +21906,7 @@ fn build_conversion_log_from_fragments_with_status(
         source_blocking_lines: common.source_blocking_lines,
         provenance_section: common.provenance_section,
         artwork_section: common.artwork_section,
-        conversion_settings_section: common.conversion_settings_section,
         track_sections,
-        stage_records,
         total_summary: ConversionLogTotalSummary {
             successful_count,
             failed_count,
@@ -21807,11 +21915,8 @@ fn build_conversion_log_from_fragments_with_status(
             total_bytes_out,
             missing_input_sizes,
             missing_output_sizes,
-            encode_duration_sum,
-            missing_encode_durations,
             elapsed_wall_time,
             timing_started_at_utc,
-            timing_checkpoint_finished_at_utc,
             missing_wall_timings,
         },
         batch_status,
@@ -21824,11 +21929,6 @@ fn merge_conversion_log_common_fragments(
     ordering_common: &ConversionLogCommonFragment,
 ) -> ConversionLogCommonFragment {
     debug_assert!(!ordered.is_empty());
-
-    let best_source_aware_common = ordered
-        .iter()
-        .map(|fragment| &fragment.common)
-        .find(|common| conversion_log_common_has_source_context(common));
 
     ConversionLogCommonFragment {
         // Keep job/item identity anchored to the canonical first sorted
@@ -21860,27 +21960,9 @@ fn merge_conversion_log_common_fragments(
             ordered.iter().map(|fragment| fragment.common.artwork_section.as_str()),
         )
         .unwrap_or_default(),
-        conversion_settings_section: best_source_aware_common
-            .and_then(|common| non_empty_common_string(&common.conversion_settings_section).map(str::to_string))
-            .or_else(|| {
-                first_non_empty_common_string(
-                    ordered.iter().map(|fragment| fragment.common.conversion_settings_section.as_str()),
-                )
-            })
-            .unwrap_or_else(|| ordering_common.conversion_settings_section.clone()),
     }
 }
 
-fn conversion_log_common_has_source_context(common: &ConversionLogCommonFragment) -> bool {
-    non_empty_optional_common_string(common.album_artist.as_deref()).is_some()
-        || non_empty_optional_common_string(common.album.as_deref()).is_some()
-        || non_empty_optional_common_string(common.year.as_deref()).is_some()
-        || non_empty_optional_common_string(common.genre.as_deref()).is_some()
-        || non_empty_optional_common_string(common.catalog_number.as_deref()).is_some()
-        || non_empty_common_string(&common.source_blocking_lines).is_some()
-        || non_empty_common_string(&common.provenance_section).is_some()
-        || non_empty_common_string(&common.artwork_section).is_some()
-}
 
 fn merge_conversion_log_provenance_sections(ordered: &[ConversionLogFragment]) -> String {
     let mut merged_tool_versions = BTreeMap::new();
@@ -22020,9 +22102,6 @@ fn first_non_empty_common_string<'a>(values: impl Iterator<Item = &'a str>) -> O
         .next()
 }
 
-fn non_empty_optional_common_string(value: Option<&str>) -> Option<&str> {
-    value.and_then(non_empty_common_string)
-}
 
 fn non_empty_common_string(value: &str) -> Option<&str> {
     if value.trim().is_empty() {
@@ -22030,19 +22109,6 @@ fn non_empty_common_string(value: &str) -> Option<&str> {
     } else {
         Some(value)
     }
-}
-
-fn total_fragment_duration(fragments: &[ConversionLogFragment]) -> Duration {
-    let mut total = Duration::ZERO;
-    for duration in fragments
-        .iter()
-        .filter_map(|fragment| fragment.summary.duration_millis.map(duration_from_millis))
-    {
-        total = total
-            .checked_add(duration)
-            .unwrap_or_else(|| Duration::from_secs(u64::MAX));
-    }
-    total
 }
 
 /// Compute one elapsed album span from independently timed fragments.
@@ -22124,6 +22190,16 @@ fn fragment_result_label(
         None => {}
     }
 
+    if let Some(reason) = fragments
+        .iter()
+        .find_map(|fragment| fragment.album_block_reason.as_ref())
+    {
+        return format!("Blocked ({})", block_reason_label(reason));
+    }
+
+    // Legacy version-14 fragments did not preserve album-level block authority.
+    // Keep their all-blocked fallback so old in-flight fragment sets remain
+    // renderable without inventing a successful terminal outcome.
     // Match the canonical AlbumOutcome result semantics for the all-blocked
     // fragment case instead of reducing it to a generic Partial label. A folder
     // batch whose completed fragment set contains only blocked track records is
@@ -22147,77 +22223,6 @@ fn fragment_result_label(
         format!(
             "Partial ({successful_count}/{total_track_count} ok, {failed_count} failed, {missing_count} missing)"
         )
-    }
-}
-
-fn aggregate_fragment_stage_records(fragments: &[ConversionLogFragment]) -> Vec<StageRecord> {
-    let mut stages = Vec::new();
-    for fragment in fragments {
-        for stage in &fragment.stages {
-            if let Some(index) = stages.iter().position(|existing: &StageRecord| existing.stage == stage.stage) {
-                merge_stage_record(&mut stages[index], stage);
-            } else {
-                stages.push(stage.clone());
-            }
-        }
-    }
-    stages
-}
-
-fn merge_stage_record(existing: &mut StageRecord, next: &StageRecord) {
-    existing.outcome = merge_stage_outcome(&existing.outcome, &next.outcome);
-    match (&mut existing.dsd_dst_stats, &next.dsd_dst_stats) {
-        (Some(existing_stats), Some(next_stats)) => existing_stats.merge(next_stats),
-        (None, Some(next_stats)) => existing.dsd_dst_stats = Some(next_stats.clone()),
-        _ => {}
-    }
-}
-
-fn merge_stage_outcome(existing: &StageOutcome, next: &StageOutcome) -> StageOutcome {
-    match (existing, next) {
-        (StageOutcome::Failed(left), StageOutcome::Failed(right)) if left != right => {
-            StageOutcome::Failed(format!("{left}; {right}"))
-        }
-        (StageOutcome::Failed(reason), _) | (_, StageOutcome::Failed(reason)) => {
-            StageOutcome::Failed(reason.clone())
-        }
-        (StageOutcome::OkWithDetail(left), StageOutcome::OkWithDetail(right)) => {
-            if left == right {
-                StageOutcome::OkWithDetail(left.clone())
-            } else {
-                StageOutcome::OkWithDetail(format!("{left}; {right}"))
-            }
-        }
-        (StageOutcome::OkWithDetail(detail), StageOutcome::Ok)
-        | (StageOutcome::Ok, StageOutcome::OkWithDetail(detail)) => {
-            StageOutcome::OkWithDetail(detail.clone())
-        }
-        (StageOutcome::OkWithDetail(detail), _)
-        | (_, StageOutcome::OkWithDetail(detail)) => StageOutcome::OkWithDetail(detail.clone()),
-        (StageOutcome::Ok, _) | (_, StageOutcome::Ok) => StageOutcome::Ok,
-        (StageOutcome::SkippedWithReason(left), StageOutcome::SkippedWithReason(right)) => {
-            if left == right {
-                StageOutcome::SkippedWithReason(left.clone())
-            } else {
-                StageOutcome::SkippedWithReason(format!("{left}; {right}"))
-            }
-        }
-        (StageOutcome::SkippedWithReason(reason), StageOutcome::Skipped)
-        | (StageOutcome::Skipped, StageOutcome::SkippedWithReason(reason)) => {
-            StageOutcome::SkippedWithReason(format!(
-                "{reason}; reason unavailable for one or more inputs"
-            ))
-        }
-        (StageOutcome::SkippedWithReason(reason), StageOutcome::NotRequested)
-        | (StageOutcome::NotRequested, StageOutcome::SkippedWithReason(reason)) => {
-            StageOutcome::SkippedWithReason(format!(
-                "{reason}; not requested for one or more inputs"
-            ))
-        }
-        (StageOutcome::Skipped, StageOutcome::Skipped) => StageOutcome::Skipped,
-        (StageOutcome::Skipped, StageOutcome::NotRequested)
-        | (StageOutcome::NotRequested, StageOutcome::Skipped) => StageOutcome::Skipped,
-        (StageOutcome::NotRequested, StageOutcome::NotRequested) => StageOutcome::NotRequested,
     }
 }
 
@@ -22961,7 +22966,7 @@ fn append_track_log(
     req: &PipelineRequest,
     metadata_stage_result: Option<&StageOutcome>,
     album_gain_scope_disclosure: Option<&DsdAlbumGainScopeDisclosure>,
-    dsd_true_peak_timings: Option<&BTreeMap<TrackId, DsdAlbumGainTiming>>,
+    _dsd_true_peak_timings: Option<&BTreeMap<TrackId, DsdAlbumGainTiming>>,
 ) {
     log.push_str(&escape_log_value(&track_display_label(record, prepared)));
     log.push('\n');
@@ -22984,49 +22989,57 @@ fn append_track_log(
             dsd_album_gain_scope_disclosure_label(disclosure),
         );
     }
-
-    if let Some(timing) = dsd_true_peak_timings
-        .and_then(|timings| timings.get(&record.track_id))
-        .copied()
-    {
-        push_kv_line(
-            log,
-            "  DSD album-gain prepass",
-            format!(
-                "source realization {}; DSD-to-PCM decode {}; true-peak scan {}",
-                format_duration_precise(timing.realization),
-                format_duration_precise(timing.dsd_to_pcm_decode),
-                format_duration_precise(timing.true_peak_scan),
-            ),
-        );
+    if let Some(decision) = prepared.and_then(|track| dsd_album_gain_decision_label(track, req)) {
+        push_kv_line(log, "  Album gain decision", decision);
     }
 
     if let Some(track) = prepared {
-        push_optional_kv_line(log, "  Artist", track.metadata.artist.as_deref());
-        push_optional_kv_line(log, "  Composer", track.metadata.composer.as_deref());
+        let artist = conversion_log_metadata_values(&track.metadata.artist);
+        let composer = conversion_log_metadata_values(&track.metadata.composer);
+        push_optional_kv_line(log, "  Artist", artist.as_deref());
+        push_optional_kv_line(log, "  Composer", composer.as_deref());
+        push_kv_line(log, "  Source", path_log_value(track_source_identity_path(track)));
         push_kv_line(log, "  Source audio", source_audio_description(track));
-        push_kv_line(
-            log,
-            "  Conversion",
-            conversion_summary(
-                track,
-                req,
-                record.verified_output_bit_depth,
-                Some(command_records_prove_dither_for_track(track, record, &req.settings)),
-            ),
-        );
         for warning in &track.warnings {
             push_kv_line(log, "  Warning", warning);
         }
-        if let Some(disclosure) = per_track_dither_disclosure(track, record, req) {
-            push_kv_line(log, "  Warning", disclosure);
+    }
+    if let Some(artifact) = artifact {
+        push_kv_line(log, "  Output target", path_log_value(&artifact.final_path));
+    }
+
+    let processing = if matches!(record.outcome, TrackOutcome::Ok) {
+        render_track_processing(&record.execution_evidence)
+    } else {
+        render_discarded_attempt_processing(&record.execution_evidence)
+    };
+    if processing.is_empty() {
+        if matches!(record.outcome, TrackOutcome::Ok) {
+            log.push_str("  Processing: no completed delivered-audio operations recorded\n");
+        }
+    } else {
+        log.push_str(if matches!(record.outcome, TrackOutcome::Ok) {
+            "  Processing:\n"
+        } else {
+            "  Attempt processing (not delivered):\n"
+        });
+        for line in processing {
+            log.push_str("    ");
+            log.push_str(&escape_log_value(&line));
+            log.push('\n');
         }
     }
 
-    if let Some(pipeline) = planned_pipeline_label(&record.commands)
-        .or_else(|| passthrough_pipeline_label(record, prepared, req))
-    {
-        push_kv_line(log, "  Pipeline", pipeline);
+    if matches!(record.outcome, TrackOutcome::Ok) {
+        let artifact_work = render_track_artifact_work(&record.execution_evidence);
+        if !artifact_work.is_empty() {
+            log.push_str("  Artifact work:\n");
+            for line in artifact_work {
+                log.push_str("    ");
+                log.push_str(&escape_log_value(&line));
+                log.push('\n');
+            }
+        }
     }
 
     if let Some(metadata) = metadata_satisfaction_label(
@@ -23050,57 +23063,59 @@ fn append_track_log(
         );
     }
 
-    push_kv_line(
-        log,
-        "  Source ref",
-        track_source_ref_label(&record.source_ref),
-    );
-    if let Some(realized_input) = &record.realized_input {
-        push_kv_line(log, "  Realized input", path_log_value(realized_input));
+    let verifications = render_track_verifications(&record.execution_evidence);
+    if !verifications.is_empty() {
+        log.push_str("  Verification:\n");
+        for verification in verifications {
+            log.push_str("    ");
+            log.push_str(&escape_log_value(&verification));
+            log.push('\n');
+        }
     }
-    if let Some(output_file) = &record.output_file {
-        push_kv_line(log, "  Output file", path_log_value(output_file));
+    if artifact.and_then(|artifact| artifact.reference_evidence.as_ref()).is_some() {
+        log.push_str("  Verification: qualified Reference execution/PCM evidence recorded\n");
     }
 
-    match (record.bytes_in, record.bytes_out) {
-        (Some(bytes_in), Some(bytes_out)) => push_kv_line(
-            log,
-            "  Size",
-            format!(
-                "{} -> {} ({})",
-                format_bytes(bytes_in),
-                format_bytes(bytes_out),
-                compression_ratio(bytes_in, bytes_out)
+    if let (Some(source), Some(prepared), Some(artifact)) = (source, prepared, artifact) {
+        let (source_bytes, output_bytes) =
+            conversion_log_comparable_track_sizes(source, prepared, artifact);
+        match (source_bytes, output_bytes) {
+            (Some(input), Some(output)) => push_kv_line(
+                log,
+                "  Produced size",
+                format!(
+                    "{} -> {} ({})",
+                    format_bytes(input),
+                    format_bytes(output),
+                    compression_ratio(input, output),
+                ),
             ),
-        ),
-        (Some(bytes_in), None) => push_kv_line(log, "  Input size", format_bytes(bytes_in)),
-        (None, Some(bytes_out)) => push_kv_line(log, "  Output size", format_bytes(bytes_out)),
-        (None, None) => log.push_str("  Size: unknown\n"),
+            (_, Some(output)) => push_kv_line(log, "  Produced output size", format_bytes(output)),
+            _ => {}
+        }
     }
 
     if let Some(stats) = record.dsd_dst_stats.as_ref() {
         push_kv_line(log, "  DSD/DST stats", format_dsd_dst_stats_inline(stats));
     }
-
-    if let Some(duration) = record.duration {
-        push_kv_line(log, "  Encode duration", format_duration_precise(duration));
-    }
-
-    if record.commands.is_empty() {
-        log.push_str("  Commands: none recorded\n");
-    } else {
-        log.push_str("  Commands:\n");
-        for (index, command) in record.commands.iter().enumerate() {
-            log.push_str(&format!(
-                "    {}. {} [{}; {}]\n",
-                index + 1,
-                command_line_label(command),
-                format_duration_precise(command.elapsed),
-                process_exit_label(command.exit)
-            ));
-        }
-    }
     log.push('\n');
+}
+
+fn conversion_log_comparable_track_sizes(
+    source: &PreparedSource,
+    _prepared: &PreparedTrack,
+    artifact: &TrackArtifact,
+) -> (Option<u64>, Option<u64>) {
+    // Only a simple one-source-file -> one-output-file track has a truthful
+    // storage-to-storage reduction percentage. The source-side comparator is
+    // the original container itself: a prepared track may legitimately point
+    // at a materialized or registered-effect carrier, which is not original
+    // storage. Shared images, selected ranges, CUE/SACD/DVD sources and
+    // multi-track containers deliberately return no source-side comparator.
+    if source.kind != SourceKind::SingleFile || source.tracks.len() != 1 {
+        return (None, file_len(&artifact.staged_path));
+    }
+    (file_len(&source.container), file_len(&artifact.staged_path))
 }
 
 
@@ -23232,1256 +23247,39 @@ fn append_artwork_section(
     log.push('\n');
 }
 
-fn append_conversion_settings_section(
-    log: &mut String,
-    source: &PreparedSource,
-    req: &PipelineRequest,
-    tracks: &[&TrackRecord],
-    replaygain_stage_result: Option<&StageOutcome>,
-    resampling_applies: bool,
-    bit_depth_change_applies: bool,
-    dithering_applies: bool,
-) {
-    let settings = &req.settings;
-    push_kv_line(log, "Target format", settings.target_format.display_name());
-    push_kv_line(
-        log,
-        "Resampling",
-        resampling_log_line(source, settings, tracks, resampling_applies),
-    );
-    push_kv_line(
-        log,
-        "Bit-depth conversion",
-        bit_depth_conversion_log_line(source, settings, tracks, bit_depth_change_applies),
-    );
-    push_kv_line(
-        log,
-        "Dither",
-        dither_log_line(source, req, tracks, dithering_applies),
-    );
-    append_deemphasis_conversion_log_lines(log, source, req);
-    push_kv_line(log, "Force encode", yes_no(settings.force_encode));
-    push_kv_line(log, "Merge mode", yes_no(req.merge));
 
-    append_target_format_settings(log, settings);
-    if resampling_applies {
-        append_resampler_settings(log, settings);
-    }
-    if source_is_dsd(source) || settings.target_format.is_dsd() {
-        append_dsd_settings(log, source, settings);
-    }
 
-    push_kv_line(log, "Metadata", stage_requirement_label(req.stages.metadata));
-    push_kv_line(log, "ReplayGain", stage_requirement_label(req.stages.replaygain));
-    let successful_output_count = tracks
-        .iter()
-        .filter(|track| matches!(track.outcome, TrackOutcome::Ok))
-        .count();
-    push_kv_line(
-        log,
-        "ReplayGain policy",
-        replaygain_policy_log_label(
-            source,
-            req,
-            successful_output_count,
-            replaygain_stage_result,
-        ),
-    );
-    push_kv_line(
-        log,
-        "ReplayGain clipping prevention",
-        yes_no(settings.replay_gain.prevent_clipping),
-    );
-    push_kv_line(log, "Features", stage_requirement_label(req.stages.features));
-    match &req.naming.folder_template {
-        Some(template) => push_kv_line(log, "Folder template", template),
-        None => push_kv_line(log, "Folder template", "album-name fallback"),
-    }
-    push_kv_line(log, "Filename template", &req.naming.template);
-    if let Ok((_, notices)) = plan_outputs_with_name_shortening_notices(source, req) {
-        for notice in notices {
-            push_kv_line(log, "Output name shortened", notice.log_value());
-        }
-    }
-}
 
-fn sample_rate_transition_log_label(
-    source: &PreparedSource,
-    settings: &tonepoet_pipeline::PipelineSettings,
-) -> String {
-    let transitions = source
-        .tracks
-        .iter()
-        .filter_map(|track| {
-            let source_rate = track.scalar_sample_rate()?;
-            let target_rate = resolved_target_rate_hz(track, settings)?;
-            (source_rate != target_rate).then(|| {
-                let source_label = source_track_dsd_rate(track)
-                    .map(dsd_rate_label)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| format_sample_rate(source_rate));
-                let target_label = if settings.target_format.is_dsd() {
-                    DsdRate::from_hz(target_rate)
-                        .map(dsd_rate_label)
-                        .map(str::to_string)
-                        .unwrap_or_else(|| format_sample_rate(target_rate))
-                } else {
-                    format_sample_rate(target_rate)
-                };
-                format!("{source_label} → {target_label}")
-            })
-        })
-        .collect::<BTreeSet<_>>();
-    if transitions.is_empty() {
-        target_sample_rate_setting_label(source, settings)
-    } else {
-        transitions.into_iter().collect::<Vec<_>>().join(", ")
-    }
-}
 
-fn resampling_log_line(
-    source: &PreparedSource,
-    settings: &tonepoet_pipeline::PipelineSettings,
-    tracks: &[&TrackRecord],
-    applies: bool,
-) -> String {
-    if !applies {
-        return "no (source rate preserved)".to_string();
-    }
 
-    let transition = sample_rate_transition_log_label(source, settings);
-    if tonepoet_pipeline::selects_reference_dsd_to_pcm(settings, source_is_dsd(source)) {
-        return format!("yes (sox_ng rate, Reference policy, {transition})");
-    }
-    let detail = match actual_resampler_label(tracks, settings) {
-        "soxr" => {
-            let precision = tonepoet_pipeline::mapping::soxr_precision(settings.resample_quality);
-            let cutoff = settings
-                .soxr_resampler
-                .cutoff
-                .unwrap_or_else(|| {
-                    tonepoet_pipeline::mapping::ffmpeg_cutoff(settings.nyquist_transition)
-                });
-            let mut fields = vec![
-                "soxr via ffmpeg aresample".to_string(),
-                format!("precision={precision}"),
-                format!("cutoff={cutoff:.3}"),
-            ];
-            if settings.soxr_resampler.chebyshev {
-                fields.push("cheby=1".to_string());
-            }
-            if let Some(phase) = settings.soxr_resampler.phase {
-                fields.push(format!("phase_shift={phase}"));
-            }
-            fields.join(", ")
-        }
-        "SoX" => {
-            let sox = settings.sox_resampler;
-            let mut fields = vec![format!(
-                "SoX rate {}",
-                tonepoet_pipeline::mapping::sox_rate_quality_flag(settings.resample_quality)
-            )];
-            if sox.chebyshev {
-                fields.push("chebyshev".to_string());
-            } else if let Some(bandwidth) = sox.bandwidth_pct {
-                fields.push(format!("bandwidth={}", decimal_label(bandwidth)));
-            } else if let Some(bandwidth) =
-                tonepoet_pipeline::mapping::sox_bandwidth_percent(settings.nyquist_transition)
-            {
-                fields.push(format!("bandwidth={bandwidth}"));
-            }
-            if let Some(phase) = sox.phase {
-                fields.push(format!("phase={phase}"));
-            }
-            if sox.allow_aliasing {
-                fields.push("allow_aliasing=yes".to_string());
-            }
-            if let Some(taps) = sox.sinc_taps {
-                fields.push(format!("sinc_taps={taps}"));
-            }
-            if let Some(attenuation) = sox.sinc_attenuation_db {
-                fields.push(format!("sinc_attenuation={attenuation} dB"));
-            }
-            if let Some(passband) = sox.sinc_passband_hz {
-                fields.push(format!("sinc_passband={} Hz", decimal_label(passband)));
-            }
-            if let Some(transition) = sox.sinc_transition_hz {
-                fields.push(format!(
-                    "sinc_transition={} Hz",
-                    decimal_label(transition)
-                ));
-            }
-            if let Some(beta) = sox.sinc_kaiser_beta {
-                fields.push(format!("sinc_kaiser_beta={}", decimal_label(beta)));
-            }
-            if let Some(phase) = sox.sinc_phase {
-                fields.push(format!("sinc_phase={}", sox_sinc_phase_label(phase)));
-            }
-            fields.join(", ")
-        }
-        "SSRC" => {
-            let mut fields = vec![format!(
-                "SSRC profile={}",
-                ssrc_profile_label(
-                    settings.ssrc.profile,
-                    settings.resample_quality,
-                    settings.ssrc.insane_mode,
-                )
-            )];
-            if let Some(attenuation) = settings.ssrc.attenuation_db {
-                fields.push(format!(
-                    "attenuation={} dB",
-                    decimal_label(attenuation)
-                ));
-            }
-            fields.push(format!(
-                "phase={}",
-                if settings.ssrc.min_phase {
-                    "minimum"
-                } else {
-                    "linear"
-                }
-            ));
-            fields.join(", ")
-        }
-        other => other.to_string(),
-    };
-    format!("yes ({detail}, {transition})")
-}
 
-fn bit_depth_transition_log_label(
-    source: &PreparedSource,
-    settings: &tonepoet_pipeline::PipelineSettings,
-) -> String {
-    let transitions = source
-        .tracks
-        .iter()
-        .filter_map(|track| {
-            let target_depth = resolved_target_pcm_depth(track, settings)
-                .or_else(|| {
-                    source_default_pcm_depth_for_track(track, settings).map(|(depth, _)| depth)
-                })?;
-            let target_label = pcm_bit_depth_label(target_depth);
-            match super::plan_bridge::resolve_source_pcm_depth(track) {
-                Some(source_depth) if source_depth != target_depth => Some(format!(
-                    "{} → {target_label}",
-                    pcm_bit_depth_label(source_depth)
-                )),
-                Some(_) => None,
-                None => match track
-                    .source_audio
-                    .coding
-                    .unwrap_or(SourceAudioCoding::Unknown)
-                {
-                    SourceAudioCoding::Dsd => Some(format!("DSD → {target_label}")),
-                    SourceAudioCoding::Lossy => {
-                        Some(format!("decoded lossy source → {target_label}"))
-                    }
-                    SourceAudioCoding::Pcm
-                    | SourceAudioCoding::DvdaUnknown
-                    | SourceAudioCoding::Unknown => (settings.target_bit_depth
-                        != BitDepthTarget::Source)
-                        .then(|| format!("unknown source depth → {target_label}")),
-                },
-            }
-        })
-        .collect::<BTreeSet<_>>();
-    if transitions.is_empty() {
-        bit_depth_target_label(settings.target_bit_depth)
-    } else {
-        transitions.into_iter().collect::<Vec<_>>().join(", ")
-    }
-}
 
-fn command_record_emits_dither(command: &CommandRecord) -> bool {
-    match command.binary {
-        ToolBinary::Ffmpeg => command
-            .sanitized_args
-            .iter()
-            .any(|arg| arg.contains("dither_method=")),
-        ToolBinary::Sox => command.sanitized_args.iter().any(|arg| arg == "dither"),
-        ToolBinary::Ssrc => {
-            let dither_id = command
-                .sanitized_args
-                .windows(2)
-                .find(|pair| pair[0] == "--dither")
-                .map(|pair| pair[1].as_str());
-            let has_pdf = command
-                .sanitized_args
-                .windows(2)
-                .any(|pair| pair[0] == "--pdf");
-            // SSRC ID 99 is the no-shaper terminal quantizer. It represents
-            // actual dither only when paired with an explicit PDF; all other
-            // IDs select a dither/noise-shaping stage themselves.
-            dither_id.is_some_and(|id| id != "99" || has_pdf)
-        }
-        _ => false,
-    }
-}
 
-fn command_record_proves_dither_for_target(
-    command: &CommandRecord,
-    target_depth: Option<tonepoet_pipeline::PcmBitDepth>,
-    reference_dsd: bool,
-) -> bool {
-    // A trailing SoX `dither` token is not sufficient evidence for ordinary
-    // Int32 output: SoX 14.4.2 accepts that command while producing
-    // byte-identical samples. The qualified DSD Reference route is separately
-    // identity-bound and may use command evidence for its policy-fixed stage.
-    if command.binary == ToolBinary::Sox
-        && target_depth == Some(tonepoet_pipeline::PcmBitDepth::Int32)
-        && !reference_dsd
-    {
-        return false;
-    }
-    command_record_emits_dither(command)
-}
 
-// `TerminalPcmWav` is installed only after the selected registered resampler
-// has executed successfully and its terminal contract has been validated.
-fn track_record_has_realized_terminal_ssrc_dither(record: &TrackRecord) -> bool {
-    let TrackSourceRef::RegisteredEffectCarrier {
-        representation:
-            RegisteredEffectCarrierRepresentation::TerminalPcmWav {
-                bit_depth,
-                terminal_candidate,
-            },
-        ..
-    } = &record.source_ref
-    else {
-        return false;
-    };
-    let Some(tonepoet_pipeline::SelectedTerminalRealization::Pcm(realization)) =
-        terminal_candidate.terminal_realization.as_ref()
-    else {
-        return false;
-    };
-    let active_ssrc_dither = realization.ssrc_dither.as_ref().is_some_and(|dither| {
-        matches!(
-            &dither.availability,
-            tonepoet_pipeline::plugins::SsrcDitherAvailability::Active
-        ) && (dither.dither_id.is_some() || dither.pdf_type.is_some())
-    });
 
-    realization.selected_tool == tonepoet_pipeline::ToolIdentifier::Ssrc
-        && matches!(
-            realization.kind,
-            tonepoet_pipeline::PcmTerminalRealizationKind::SsrcDirectWav
-                | tonepoet_pipeline::PcmTerminalRealizationKind::SsrcPreterminalFfmpegPackage
-                | tonepoet_pipeline::PcmTerminalRealizationKind::SsrcPreterminalSoxPackage
-        )
-        && realization.target_bit_depth == *bit_depth
-        && realization.dither_owner == tonepoet_pipeline::PcmTerminalDitherOwner::SsrcResampler
-        && realization
-            .effective_dither
-            .is_some_and(|dither| dither != DitherType::None)
-        && active_ssrc_dither
-}
 
-fn command_records_prove_dither_for_track(
-    track: &PreparedTrack,
-    record: &TrackRecord,
-    settings: &tonepoet_pipeline::PipelineSettings,
-) -> bool {
-    if track_record_has_realized_terminal_ssrc_dither(record) {
-        return true;
-    }
-    let target_depth = resolved_target_pcm_depth(track, settings)
-        .or_else(|| source_default_pcm_depth_for_track(track, settings).map(|(depth, _)| depth));
-    let reference_dsd = tonepoet_pipeline::selects_reference_dsd_to_pcm(
-        settings,
-        track.source_audio.coding == Some(SourceAudioCoding::Dsd),
-    );
-    record
-        .commands
-        .iter()
-        .any(|command| command_record_proves_dither_for_target(command, target_depth, reference_dsd))
-}
 
-fn command_records_prove_dither_for_source(
-    source: &PreparedSource,
-    settings: &tonepoet_pipeline::PipelineSettings,
-    tracks: &[&TrackRecord],
-) -> bool {
-    tracks.iter().enumerate().any(|(index, record)| {
-        if let Some(prepared) = source.tracks.get(index) {
-            return command_records_prove_dither_for_track(prepared, record, settings);
-        }
-        // A malformed or partial record/source pairing must not let an
-        // unqualified SoX Int32 token become affirmative evidence. Fall back
-        // to the global target only, with no Reference-policy exemption.
-        let target_depth = source_has_int32_target(source, settings)
-            .then_some(tonepoet_pipeline::PcmBitDepth::Int32);
-        record.commands.iter().any(|command| {
-            command_record_proves_dither_for_target(command, target_depth, false)
-        })
-    })
-}
 
-fn command_records_use_tool(tracks: &[&TrackRecord], binary: ToolBinary) -> bool {
-    tracks
-        .iter()
-        .any(|track| track.commands.iter().any(|command| command.binary == binary))
-}
 
-fn processing_tool_label(
-    tracks: &[&TrackRecord],
-    settings: &tonepoet_pipeline::PipelineSettings,
-) -> &'static str {
-    // Prefer the terminal resampler over preparatory decode commands. SSRC
-    // pipelines commonly contain an ffmpeg decode before the SSRC process,
-    // and Reference/SoX paths may likewise contain auxiliary commands.
-    if command_records_use_tool(tracks, ToolBinary::Ssrc) {
-        return "SSRC";
-    }
-    for track in tracks {
-        for command in &track.commands {
-            if !command_record_performs_resampling(command) {
-                continue;
-            }
-            return match command.binary {
-                ToolBinary::Sox => "SoX",
-                ToolBinary::Ffmpeg => "ffmpeg aresample",
-                ToolBinary::Ssrc => "SSRC",
-                _ => preferred_resampler_label(settings),
-            };
-        }
-    }
-    if command_records_use_tool(tracks, ToolBinary::Sox) {
-        "SoX"
-    } else if command_records_use_tool(tracks, ToolBinary::Ffmpeg) {
-        "ffmpeg aresample"
-    } else {
-        match preferred_resampler_family(settings) {
-            ResamplerFamily::Sox => "SoX",
-            ResamplerFamily::Ssrc => "SSRC",
-            ResamplerFamily::Soxr | ResamplerFamily::Auto => "ffmpeg aresample",
-        }
-    }
-}
 
-fn applied_dither_tool_label(
-    source: &PreparedSource,
-    tracks: &[&TrackRecord],
-    settings: &tonepoet_pipeline::PipelineSettings,
-) -> String {
-    let mut tools = BTreeSet::new();
-    for (index, record) in tracks.iter().enumerate() {
-        if track_record_has_realized_terminal_ssrc_dither(record) {
-            tools.insert("SSRC");
-        }
-        let prepared = source.tracks.get(index);
-        let target_depth = prepared
-            .and_then(|track| resolved_target_pcm_depth(track, settings)
-                .or_else(|| source_default_pcm_depth_for_track(track, settings).map(|(depth, _)| depth)))
-            .or_else(|| source_has_int32_target(source, settings)
-                .then_some(tonepoet_pipeline::PcmBitDepth::Int32));
-        let reference_dsd = prepared.is_some_and(|track| {
-            tonepoet_pipeline::selects_reference_dsd_to_pcm(
-                settings,
-                track.source_audio.coding == Some(SourceAudioCoding::Dsd),
-            )
-        });
-        for command in &record.commands {
-            if command_record_proves_dither_for_target(command, target_depth, reference_dsd) {
-                tools.insert(match command.binary {
-                    ToolBinary::Ffmpeg => "ffmpeg aresample",
-                    ToolBinary::Sox => "SoX",
-                    ToolBinary::Ssrc => "SSRC",
-                    _ => unreachable!("only dither-capable tools are inserted"),
-                });
-            }
-        }
-    }
-    if tools.is_empty() {
-        processing_tool_label(tracks, settings).to_string()
-    } else {
-        tools.into_iter().collect::<Vec<_>>().join(" + ")
-    }
-}
 
-fn ssrc_dither_command_settings(command: &CommandRecord) -> Option<String> {
-    if command.binary != ToolBinary::Ssrc || !command_record_emits_dither(command) {
-        return None;
-    }
-    let dither_id = command
-        .sanitized_args
-        .windows(2)
-        .find(|pair| pair[0] == "--dither")
-        .map(|pair| pair[1].as_str())?;
-    let mut fields = vec![format!("dither_id={dither_id}")];
-    if let Some(pdf) = command
-        .sanitized_args
-        .windows(2)
-        .find(|pair| pair[0] == "--pdf")
-        .map(|pair| pair[1].as_str())
-    {
-        fields.push(format!("pdf={pdf}"));
-    }
-    Some(fields.join(", "))
-}
 
-fn applied_dither_description(
-    source: &PreparedSource,
-    tracks: &[&TrackRecord],
-    settings: &tonepoet_pipeline::PipelineSettings,
-) -> String {
-    let effective_dither = effective_dither_for_source(source, settings);
-    let algorithm = if effective_dither == DitherType::None {
-        "command-selected dither/noise shaping".to_string()
-    } else {
-        dither_type_label(effective_dither).to_string()
-    };
-    let tools = applied_dither_tool_label(source, tracks, settings);
-    let ssrc_settings = tracks
-        .iter()
-        .flat_map(|track| track.commands.iter())
-        .filter_map(ssrc_dither_command_settings)
-        .collect::<BTreeSet<_>>();
-    let mut description = format!("{algorithm} via {tools}");
-    if !ssrc_settings.is_empty() {
-        if let Some(note) =
-            tonepoet_pipeline::mapping::ssrc_dither_approximation_note(effective_dither)
-        {
-            description.push_str("; ");
-            description.push_str(note);
-        }
-        description.push_str(", ");
-        description.push_str(&ssrc_settings.into_iter().collect::<Vec<_>>().join(" + "));
-    }
-    description
-}
 
-fn bit_depth_processing_label(
-    source: &PreparedSource,
-    settings: &tonepoet_pipeline::PipelineSettings,
-    tracks: &[&TrackRecord],
-) -> String {
-    let tool = processing_tool_label(tracks, settings);
-    let mut all_known_integer_changes_are_widening = true;
-    let mut saw_known_integer_change = false;
-    let mut has_float_target = false;
 
-    for track in &source.tracks {
-        let target_depth = resolved_target_pcm_depth(track, settings)
-            .or_else(|| {
-                source_default_pcm_depth_for_track(track, settings).map(|(depth, _)| depth)
-            });
-        let Some(target_depth) = target_depth else {
-            continue;
-        };
-        if target_depth.is_float() {
-            has_float_target = true;
-            continue;
-        }
-        match super::plan_bridge::resolve_source_pcm_depth(track) {
-            Some(source_depth) if source_depth != target_depth => {
-                saw_known_integer_change = true;
-                if target_depth.bits() <= source_depth.bits() {
-                    all_known_integer_changes_are_widening = false;
-                }
-            }
-            Some(_) => {}
-            None => {
-                // DSD, decoded lossy, and unknown-width PCM sources require an
-                // actual terminal integer quantization step, not mere widening.
-                all_known_integer_changes_are_widening = false;
-            }
-        }
-    }
 
-    if has_float_target {
-        match tool {
-            "SoX" => "SoX floating-point sample-format conversion".to_string(),
-            "SSRC" => "SSRC floating-point sample-format conversion".to_string(),
-            _ => "swresample floating-point sample-format conversion".to_string(),
-        }
-    } else if saw_known_integer_change && all_known_integer_changes_are_widening {
-        match tool {
-            "SoX" => "SoX integer widening".to_string(),
-            "SSRC" => "SSRC integer widening".to_string(),
-            _ => "swresample integer widening".to_string(),
-        }
-    } else {
-        match tool {
-            "SoX" => "SoX output quantization".to_string(),
-            "SSRC" => "SSRC quantization".to_string(),
-            _ => "swresample quantization".to_string(),
-        }
-    }
-}
 
-fn bit_depth_conversion_log_line(
-    source: &PreparedSource,
-    settings: &tonepoet_pipeline::PipelineSettings,
-    tracks: &[&TrackRecord],
-    applies: bool,
-) -> String {
-    if settings.target_format.is_dsd() {
-        return "no (PCM bit depth not applicable — DSD target)".to_string();
-    }
-    if settings.target_format.is_lossy() {
-        return "no (not applicable — lossy encoder has no fixed PCM output depth)".to_string();
-    }
-    if !applies {
-        return "no (source depth preserved)".to_string();
-    }
-    format!(
-        "yes ({}, {})",
-        bit_depth_transition_log_label(source, settings),
-        bit_depth_processing_label(source, settings, tracks)
-    )
-}
 
-fn source_has_float_target(
-    source: &PreparedSource,
-    settings: &tonepoet_pipeline::PipelineSettings,
-) -> bool {
-    source.tracks.iter().any(|track| {
-        resolved_target_pcm_depth(track, settings)
-            .or_else(|| source_default_pcm_depth_for_track(track, settings).map(|(depth, _)| depth))
-            .is_some_and(PcmBitDepth::is_float)
-    })
-}
 
-fn source_has_int32_target(
-    source: &PreparedSource,
-    settings: &tonepoet_pipeline::PipelineSettings,
-) -> bool {
-    source.tracks.iter().any(|track| {
-        resolved_target_pcm_depth(track, settings)
-            .or_else(|| source_default_pcm_depth_for_track(track, settings).map(|(depth, _)| depth))
-            == Some(PcmBitDepth::Int32)
-    })
-}
 
-fn track_depth_reduction_requires_dither(
-    track: &PreparedTrack,
-    settings: &tonepoet_pipeline::PipelineSettings,
-) -> bool {
-    let target_depth = resolved_target_pcm_depth(track, settings)
-        .or_else(|| source_default_pcm_depth_for_track(track, settings).map(|(depth, _)| depth));
-    let Some(target) = target_depth else {
-        return false;
-    };
-    if !matches!(
-        target,
-        tonepoet_pipeline::PcmBitDepth::Int8
-            | tonepoet_pipeline::PcmBitDepth::Int16
-            | tonepoet_pipeline::PcmBitDepth::Int24
-    ) {
-        return false;
-    }
-    super::plan_bridge::resolve_dither_source_pcm_depth(track)
-        .map(|source| target.bits() < source.bits())
-        .unwrap_or(true)
-}
 
-fn source_depth_reduction_requires_dither(
-    source: &PreparedSource,
-    settings: &tonepoet_pipeline::PipelineSettings,
-) -> bool {
-    source
-        .tracks
-        .iter()
-        .any(|track| track_depth_reduction_requires_dither(track, settings))
-}
 
-fn cd_deemphasis_auto_tpdf_for_source(source: &PreparedSource, req: &PipelineRequest) -> bool {
-    let settings = &req.settings;
-    if settings.dither_explicit
-        || !request_applies_cd_deemphasis(req)
-        || !settings.target_format.is_pcm_lossless()
-        || (settings.target_format == PlannerAudioFormat::WavPack && settings.wavpack.hybrid)
-        || source.tracks.is_empty()
-    {
-        return false;
-    }
-    source.tracks.iter().all(|track| {
-        resolved_target_pcm_depth(track, settings) == Some(PcmBitDepth::Int16)
-    })
-}
 
-fn effective_dither_for_request(source: &PreparedSource, req: &PipelineRequest) -> DitherType {
-    if req.settings.dither_explicit {
-        return req.settings.dither_type;
-    }
-    if cd_deemphasis_auto_tpdf_for_source(source, req) {
-        return DitherType::Tpdf;
-    }
-    effective_dither_for_source(source, &req.settings)
-}
 
-fn deemphasis_log_evidence(
-    source: &PreparedSource,
-    req: &PipelineRequest,
-) -> Option<String> {
-    if source.tracks.is_empty() {
-        return None;
-    }
-    // Independent-file album logs are assembled from one-track fragments. The
-    // dispatcher-authored album count, not the representative fragment's local
-    // PreparedSource length, is the authoritative N for the final "all N" line.
-    let track_count = req
-        .album_batch
-        .as_ref()
-        .map(|batch| batch.expected_track_count)
-        .filter(|count| *count > 0)
-        .unwrap_or(source.tracks.len());
-    let all_explicit = source.tracks.iter().all(|track| {
-        source_text_tags_indicate_pre_emphasis(&track.metadata.extra)
-    });
-    let all_preemphasis = source.tracks.iter().all(|track| track.metadata.pre_emphasis);
 
-    match req.deemphasis_evidence_origin {
-        DeemphasisEvidenceOrigin::ExplicitTag if all_explicit => Some(format!(
-            "PRE_EMPHASIS tag on all {track_count} source tracks"
-        )),
-        DeemphasisEvidenceOrigin::CueFlag if all_preemphasis => {
-            Some(format!("CUE FLAGS PRE on all {track_count} source tracks"))
-        }
-        DeemphasisEvidenceOrigin::CatalogExact => {
-            Some("exact catalog match in the bundled pre-emphasis reference".to_string())
-        }
-        // Older/non-TUI single-source callers did not carry explicit evidence
-        // provenance. Preserve truthful local inference there, but fail closed
-        // for album-fragment requests: an arbitrary one-track representative
-        // must never be promoted into an album-wide "all N" claim.
-        DeemphasisEvidenceOrigin::None if req.album_batch.is_none() && all_explicit => Some(format!(
-            "PRE_EMPHASIS tag on all {track_count} source tracks"
-        )),
-        DeemphasisEvidenceOrigin::None if req.album_batch.is_none() && all_preemphasis => {
-            Some(format!("CUE FLAGS PRE on all {track_count} source tracks"))
-        }
-        DeemphasisEvidenceOrigin::ExplicitTag
-        | DeemphasisEvidenceOrigin::CueFlag
-        | DeemphasisEvidenceOrigin::None => None,
-    }
-}
 
-fn append_deemphasis_conversion_log_lines(
-    log: &mut String,
-    source: &PreparedSource,
-    req: &PipelineRequest,
-) {
-    let Some(evidence) = deemphasis_log_evidence(source, req) else {
-        return;
-    };
-    if request_applies_cd_deemphasis(req) {
-        push_kv_line(
-            log,
-            "De-emphasis",
-            "yes (CD pre-emphasis filtered out of the audio)",
-        );
-        push_kv_line(log, "De-emphasis evidence", evidence);
-        push_kv_line(
-            log,
-            "De-emphasis chosen by",
-            req.deemphasis_choice_origin.log_label(),
-        );
-        return;
-    }
 
-    push_kv_line(
-        log,
-        "De-emphasis",
-        "no (pre-emphasis evidence present; filter not applied)",
-    );
-    push_kv_line(log, "De-emphasis evidence", evidence);
-    push_kv_line(
-        log,
-        "De-emphasis chosen by",
-        req.deemphasis_choice_origin.log_label(),
-    );
-}
 
-fn dither_log_line(
-    source: &PreparedSource,
-    req: &PipelineRequest,
-    tracks: &[&TrackRecord],
-    applies: bool,
-) -> String {
-    let settings = &req.settings;
-    if tonepoet_pipeline::selects_reference_dsd_to_pcm(settings, source_is_dsd(source)) {
-        if source_has_float_target(source, settings) {
-            return "no (float terminal; Reference policy)".to_string();
-        }
-        if !tracks.is_empty() && !applies {
-            return "requested (TPDF, Reference policy) — not applied (executed command did not emit the policy dither stage)"
-                .to_string();
-        }
-        if source_has_int32_target(source, settings) {
-            return "yes (TPDF, commissioned FFmpeg/libswresample Int32 triangular terminal, Reference policy)"
-                .to_string();
-        }
-        return "yes (TPDF, sox_ng, Reference policy)".to_string();
-    }
-    if applies {
-        if request_applies_cd_deemphasis(req) {
-            let effective_dither = effective_dither_for_request(source, req);
-            if effective_dither != DitherType::None {
-                return format!(
-                    "yes ({} via {})",
-                    dither_type_label(effective_dither),
-                    applied_dither_tool_label(source, tracks, settings),
-                );
-            }
-        }
-        return format!("yes ({})", applied_dither_description(source, tracks, settings));
-    }
-    let policy_tpdf = source_depth_policy_tpdf_for_source(source, settings)
-        || cd_deemphasis_auto_tpdf_for_source(source, req);
-    let effective_dither = effective_dither_for_request(source, req);
-    if effective_dither == DitherType::None {
-        return "no (not requested)".to_string();
-    }
-    let requested = dither_type_label(effective_dither);
-    if settings.target_format.is_dsd() {
-        return format!(
-            "requested ({requested}) — not applied (PCM dither is not applicable to a DSD target)"
-        );
-    }
-    if settings.target_format.is_lossy() {
-        return format!(
-            "requested ({requested}) — not applied (lossy encoder has no fixed PCM target depth)"
-        );
-    }
-    if source_has_float_target(source, settings) {
-        return format!(
-            "requested ({requested}) — not applied (float targets are not dithered)"
-        );
-    }
-    if source_has_int32_target(source, settings) {
-        if !(settings.dither_explicit || policy_tpdf) {
-            return format!(
-                "requested ({requested}) — not applied (32-bit default gate; selection was not explicit or Source-policy selected)"
-            );
-        }
-        let tool = processing_tool_label(tracks, settings);
-        if tool == "SSRC" {
-            return format!(
-                "requested ({requested}) — not applied (executed SSRC command did not emit the resolved dither stage)"
-            );
-        }
-        if tool == "SoX" {
-            return format!(
-                "requested ({requested}) — not applied (ordinary SoX Int32 dither is not behavior-qualified)"
-            );
-        }
-        if tool == "ffmpeg aresample"
-            && tonepoet_pipeline::mapping::soxr_dither_method(effective_dither).is_none()
-        {
-            return format!(
-                "requested ({requested}) — not applied (not supported by the ffmpeg/soxr resampler)"
-            );
-        }
-        return format!(
-            "requested ({requested}) — not applied (executed command did not emit a dither stage)"
-        );
-    }
-    if cd_deemphasis_auto_tpdf_for_source(source, req)
-        || source_depth_reduction_requires_dither(source, settings)
-    {
-        return format!(
-            "requested ({requested}) — not applied (executed command did not emit a dither stage)"
-        );
-    }
-    format!(
-        "requested ({requested}) — not applied (not needed — no bit-depth reduction)"
-    )
-}
 
-fn append_target_format_settings(log: &mut String, settings: &tonepoet_pipeline::PipelineSettings) {
-    match &settings.target_format {
-        PlannerAudioFormat::Flac => {
-            push_kv_line(log, "FLAC compression", settings.flac.compression_level.to_string());
-        }
-        PlannerAudioFormat::Mp3 => {
-            push_kv_line(log, "MP3 mode", mp3_mode_label(settings.mp3.mode));
-            push_kv_line(log, "MP3 bitrate", format!("{} kbps", settings.mp3.bitrate_kbps));
-            match settings.mp3.mode {
-                Mp3Mode::Vbr => push_kv_line(log, "MP3 VBR quality", settings.mp3.vbr_quality.to_string()),
-                Mp3Mode::Cbr | Mp3Mode::Abr => {}
-            }
-        }
-        PlannerAudioFormat::Aac => {
-            push_kv_line(log, "AAC profile", aac_profile_label(settings.aac.profile));
-            push_kv_line(log, "AAC bitrate", format!("{} kbps", settings.aac.bitrate_kbps));
-        }
-        PlannerAudioFormat::Opus => {
-            push_kv_line(log, "Opus bitrate", format!("{} kbps", settings.opus.bitrate_kbps));
-            push_kv_line(log, "Opus application", opus_content_type_label(settings.opus.content_type));
-            push_kv_line(log, "Opus complexity", settings.opus.complexity.to_string());
-        }
-        PlannerAudioFormat::WavPack => {
-            push_kv_line(log, "WavPack mode", wavpack_mode_label(settings.wavpack.mode));
-            if settings.wavpack.hybrid {
-                push_kv_line(
-                    log,
-                    "WavPack hybrid bitrate",
-                    format!("{} kbps/ch", settings.wavpack.hybrid_bitrate_kbps),
-                );
-                push_kv_line(
-                    log,
-                    "WavPack correction file",
-                    yes_no(settings.wavpack.correction_file),
-                );
-            }
-        }
-        PlannerAudioFormat::Alac
-        | PlannerAudioFormat::Wav
-        | PlannerAudioFormat::Aiff
-        | PlannerAudioFormat::Dsf
-        | PlannerAudioFormat::Dff
-        | PlannerAudioFormat::Dts
-        | PlannerAudioFormat::Ac3
-        | PlannerAudioFormat::Custom { .. } => {}
-    }
-}
-
-fn append_resampler_settings(log: &mut String, settings: &tonepoet_pipeline::PipelineSettings) {
-    match preferred_resampler_family(settings) {
-        ResamplerFamily::Ssrc => append_ssrc_settings(log, settings),
-        ResamplerFamily::Sox => append_sox_resampler_settings(log, settings),
-        ResamplerFamily::Soxr => append_soxr_resampler_settings(log, settings),
-        ResamplerFamily::Auto => {
-            push_kv_line(log, "Resample quality", resample_quality_label(settings.resample_quality));
-            push_kv_line(log, "Nyquist transition", nyquist_transition_label(settings.nyquist_transition));
-            append_non_default_resampler_overrides(log, settings);
-        }
-    }
-}
-
-fn append_ssrc_settings(log: &mut String, settings: &tonepoet_pipeline::PipelineSettings) {
-    let ssrc = settings.ssrc;
-    push_kv_line(log, "SSRC profile", ssrc_profile_label(ssrc.profile, settings.resample_quality, ssrc.insane_mode));
-    if let Some(attenuation) = ssrc.attenuation_db {
-        push_kv_line(log, "SSRC attenuation", format!("{} dB", decimal_label(attenuation)));
-    }
-    push_kv_line(log, "SSRC minimum phase", yes_no(ssrc.min_phase));
-    if let Some(dither_id) = ssrc.dither_id {
-        push_kv_line(log, "SSRC dither ID", dither_id.to_string());
-    }
-    if let Some(pdf_type) = ssrc.pdf_type {
-        push_kv_line(log, "SSRC PDF type", ssrc_pdf_type_label(pdf_type));
-    }
-}
-
-fn append_sox_resampler_settings(log: &mut String, settings: &tonepoet_pipeline::PipelineSettings) {
-    let sox = settings.sox_resampler;
-    push_kv_line(log, "SoX quality", resample_quality_label(settings.resample_quality));
-    push_kv_line(log, "SoX Nyquist transition", nyquist_transition_label(settings.nyquist_transition));
-    if sox.chebyshev {
-        push_kv_line(log, "SoX steep/Chebyshev", "yes");
-    }
-    if let Some(bandwidth) = sox.bandwidth_pct {
-        push_kv_line(log, "SoX bandwidth", format!("{}%", decimal_label(bandwidth)));
-    }
-    if let Some(phase) = sox.phase {
-        push_kv_line(log, "SoX phase response", phase.to_string());
-    }
-    if sox.allow_aliasing {
-        push_kv_line(log, "SoX allow aliasing", "yes");
-    }
-    append_sox_sinc_settings(log, settings);
-}
-
-fn append_soxr_resampler_settings(log: &mut String, settings: &tonepoet_pipeline::PipelineSettings) {
-    let soxr = settings.soxr_resampler;
-    push_kv_line(
-        log,
-        "Soxr quality preset",
-        resample_quality_label(settings.resample_quality),
-    );
-    if let Some(phase) = soxr.phase {
-        push_kv_line(log, "Soxr phase response", phase.to_string());
-    }
-    if let Some(cutoff) = soxr.cutoff {
-        push_kv_line(log, "Soxr cutoff override", decimal_label(cutoff));
-    }
-    if soxr.chebyshev {
-        push_kv_line(log, "Soxr Chebyshev", "yes");
-    }
-}
-
-fn append_non_default_resampler_overrides(log: &mut String, settings: &tonepoet_pipeline::PipelineSettings) {
-    if settings.ssrc.force
-        || settings.ssrc.insane_mode
-        || settings.ssrc.profile.is_some()
-        || settings.ssrc.attenuation_db.is_some()
-        || settings.ssrc.min_phase
-        || settings.ssrc.dither_id.is_some()
-        || settings.ssrc.pdf_type.is_some()
-    {
-        append_ssrc_settings(log, settings);
-    }
-    if settings.sox_resampler.chebyshev
-        || settings.sox_resampler.bandwidth_pct.is_some()
-        || settings.sox_resampler.phase.is_some()
-        || settings.sox_resampler.allow_aliasing
-        || settings.sox_resampler.sinc_taps.is_some()
-        || settings.sox_resampler.sinc_attenuation_db.is_some()
-        || settings.sox_resampler.sinc_passband_hz.is_some()
-        || settings.sox_resampler.sinc_transition_hz.is_some()
-        || settings.sox_resampler.sinc_kaiser_beta.is_some()
-        || settings.sox_resampler.sinc_phase.is_some()
-    {
-        append_sox_resampler_settings(log, settings);
-    }
-    if settings.soxr_resampler.chebyshev
-        || settings.soxr_resampler.cutoff.is_some()
-        || settings.soxr_resampler.phase.is_some()
-    {
-        append_soxr_resampler_settings(log, settings);
-    }
-}
-
-fn append_sox_sinc_settings(log: &mut String, settings: &tonepoet_pipeline::PipelineSettings) {
-    let sox = settings.sox_resampler;
-    if sox.sinc_taps.is_none()
-        && sox.sinc_attenuation_db.is_none()
-        && sox.sinc_passband_hz.is_none()
-        && sox.sinc_transition_hz.is_none()
-        && sox.sinc_kaiser_beta.is_none()
-        && sox.sinc_phase.is_none()
-    {
-        return;
-    }
-    if let Some(taps) = sox.sinc_taps {
-        push_kv_line(log, "SoX sinc taps", taps.to_string());
-    }
-    if let Some(attenuation) = sox.sinc_attenuation_db {
-        push_kv_line(log, "SoX sinc attenuation", format!("{attenuation} dB"));
-    }
-    if let Some(passband) = sox.sinc_passband_hz {
-        push_kv_line(log, "SoX sinc passband", format!("{} Hz", decimal_label(passband)));
-    }
-    if let Some(transition) = sox.sinc_transition_hz {
-        push_kv_line(log, "SoX sinc transition", format!("{} Hz", decimal_label(transition)));
-    }
-    if let Some(beta) = sox.sinc_kaiser_beta {
-        push_kv_line(log, "SoX sinc Kaiser beta", decimal_label(beta));
-    }
-    if let Some(phase) = sox.sinc_phase {
-        push_kv_line(log, "SoX sinc phase", sox_sinc_phase_label(phase));
-    }
-}
-
-fn append_dsd_settings(
-    log: &mut String,
-    source: &PreparedSource,
-    settings: &tonepoet_pipeline::PipelineSettings,
-) {
-    if source_is_dsd(source) && !settings.target_format.is_dsd() {
-        if tonepoet_pipeline::selects_reference_dsd_to_pcm(settings, true) {
-            let reference = settings.dsd.from_dsd;
-            push_kv_line(log, "DSD path", "reference");
-            push_kv_line(
-                log,
-                "DSD profile",
-                match reference.profile {
-                    tonepoet_pipeline::DsdReconstructionSelection::Reference => "reference",
-                    tonepoet_pipeline::DsdReconstructionSelection::Wideband => "wideband",
-                },
-            );
-            push_kv_line(
-                log,
-                "DSD gain mode",
-                match reference.gain {
-                    tonepoet_pipeline::SampleGainPolicy::TruePeakNormalize { .. } => {
-                        "certified true-peak normalize"
-                    }
-                    tonepoet_pipeline::SampleGainPolicy::Off => "off",
-                    tonepoet_pipeline::SampleGainPolicy::TruePeakGuard { .. } => {
-                        "invalid true-peak guard"
-                    }
-                    tonepoet_pipeline::SampleGainPolicy::FixedGain { .. } => "invalid fixed gain",
-                },
-            );
-            if reference.reference_auto_gain_selected() {
-                push_kv_line(
-                    log,
-                    "DSD Reference true-peak target",
-                    format!(
-                        "{} dBTP",
-                        reference
-                            .reference_true_peak_target_dbtp()
-                            .unwrap_or(tonepoet_pipeline::DbNano::DEFAULT_REFERENCE_TRUE_PEAK_TARGET)
-                    ),
-                );
-                push_kv_line(
-                    log,
-                    "DSD Reference gain scope",
-                    match reference.gain.scope().unwrap_or(tonepoet_pipeline::TruePeakScope::Track) {
-                        tonepoet_pipeline::TruePeakScope::Track => "track",
-                        tonepoet_pipeline::TruePeakScope::Album => "album",
-                    },
-                );
-                push_kv_line(
-                    log,
-                    "DSD Reference scan tier",
-                    tonepoet_pipeline::qualification_schema::reference_certified_scan_tier_name(
-                        reference.reference_certified_scan_tier(),
-                    ),
-                );
-            }
-            push_kv_line(
-                log,
-                "DSD Reference policy",
-                reference.reference_policy.key(),
-            );
-        } else {
-            push_kv_line(log, "DSD path", "custom");
-            push_kv_line(
-                log,
-                "DSD reconstruction",
-                match settings.dsd.general_from_dsd.reconstruction {
-                    tonepoet_pipeline::DsdGeneralReconstruction::General => "general native-level",
-                    tonepoet_pipeline::DsdGeneralReconstruction::ReferenceProtected => "reference protected R64",
-                },
-            );
-            push_kv_line(
-                log,
-                "DSD export level",
-                match settings.dsd.general_from_dsd.export_level {
-                    tonepoet_pipeline::DsdGeneralExportLevel::Native => "native".to_string(),
-                    tonepoet_pipeline::DsdGeneralExportLevel::NominalCompensated => "nominal compensated".to_string(),
-                    tonepoet_pipeline::DsdGeneralExportLevel::ProtectedR64 => "protected R64".to_string(),
-                    tonepoet_pipeline::DsdGeneralExportLevel::NativeWithOffset { offset_db } => {
-                        format!("native {:+} dB", offset_db)
-                    }
-                },
-            );
-            push_kv_line(
-                log,
-                "DSD gain mode",
-                match settings.dsd.gain_policy() {
-                    tonepoet_pipeline::SampleGainPolicy::Off => "off",
-                    tonepoet_pipeline::SampleGainPolicy::TruePeakGuard { .. } => "true-peak guard",
-                    tonepoet_pipeline::SampleGainPolicy::TruePeakNormalize { .. } => "true-peak normalize",
-                    tonepoet_pipeline::SampleGainPolicy::FixedGain { .. } => "fixed gain",
-                },
-            );
-            if let Some(gain) = settings.dsd.gain_policy().fixed_gain_db() {
-                push_kv_line(log, "DSD fixed gain", format!("{} dB", gain));
-            }
-            if let Some(target) = settings.dsd.gain_policy().target_dbtp() {
-                push_kv_line(log, "DSD true-peak target", format!("{} dBTP", target));
-            }
-            if let Some(scope) = settings.dsd.true_peak_scope() {
-                push_kv_line(log, "DSD true-peak scope", match scope {
-                    tonepoet_pipeline::TruePeakScope::Track => "track",
-                    tonepoet_pipeline::TruePeakScope::Album => "album",
-                });
-            }
-            if let Some(scan) = settings.dsd.true_peak_scan_tier() {
-                push_kv_line(log, "DSD true-peak scan", match scan {
-                    tonepoet_pipeline::TruePeakScanTier::Reference => "reference",
-                    tonepoet_pipeline::TruePeakScanTier::Standard => "standard",
-                    tonepoet_pipeline::TruePeakScanTier::Fast => "fast",
-                });
-            }
-            push_kv_line(
-                log,
-                "DSD->PCM lowpass method",
-                dsd_lowpass_method_label(settings.dsd.general_from_dsd.lowpass),
-            );
-        }
-    }
-
-    if settings.target_format.is_dsd() {
-        push_kv_line(
-            log,
-            "PCM->DSD filter preset",
-            format!("{:?}", settings.dsd.pcm_to_dsd.filter),
-        );
-    }
-}
-
-fn planned_pipeline_label(commands: &[CommandRecord]) -> Option<String> {
-    if commands.is_empty() {
-        return None;
-    }
-    let parts = commands
-        .iter()
-        .map(|command| {
-            command
-                .description
-                .as_deref()
-                .map(str::trim)
-                .filter(|description| !description.is_empty())
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(|| command_line_label(command))
-        })
-        .collect::<Vec<_>>();
-    Some(parts.join(" → "))
-}
-
-fn passthrough_pipeline_label(
-    record: &TrackRecord,
-    prepared: Option<&PreparedTrack>,
-    req: &PipelineRequest,
-) -> Option<String> {
-    if !record.commands.is_empty() || !matches!(record.outcome, TrackOutcome::Ok) {
-        return None;
-    }
-
-    let track = prepared?;
-    if source_audio_matches_target_for_passthrough(track, &req.settings) {
-        Some("passthrough copy".to_string())
-    } else {
-        None
-    }
-}
-
-fn source_audio_matches_target_for_passthrough(
-    track: &PreparedTrack,
-    settings: &tonepoet_pipeline::PipelineSettings,
-) -> bool {
-    if settings.force_encode || !source_track_format_matches_target(track, &settings.target_format) {
-        return false;
-    }
-
-    let Some(target_rate) = resolved_target_rate_hz(track, settings) else {
-        return false;
-    };
-    if track.scalar_sample_rate() != Some(target_rate) {
-        return false;
-    }
-
-    if settings.target_format.is_dsd() {
-        return true;
-    }
-
-    match settings.target_bit_depth {
-        BitDepthTarget::Source => true,
-        BitDepthTarget::Pcm(target_depth) => {
-            super::plan_bridge::resolve_source_pcm_depth(track) == Some(target_depth)
-        }
-    }
-}
-
-fn source_track_format_matches_target(track: &PreparedTrack, target: &PlannerAudioFormat) -> bool {
-    let extension = source_ref_extension(&track.source_ref)
-        .unwrap_or_default()
-        .trim_start_matches('.')
-        .to_ascii_lowercase();
-
-    match target {
-        PlannerAudioFormat::Flac => extension == "flac",
-        PlannerAudioFormat::Mp3 => extension == "mp3",
-        PlannerAudioFormat::Aac | PlannerAudioFormat::Alac => false,
-        PlannerAudioFormat::Opus => matches!(extension.as_str(), "opus" | "ogg"),
-        PlannerAudioFormat::WavPack => extension == "wv",
-        PlannerAudioFormat::Wav => matches!(extension.as_str(), "wav" | "wave" | "rf64"),
-        PlannerAudioFormat::Aiff => matches!(extension.as_str(), "aiff" | "aif"),
-        PlannerAudioFormat::Dsf => extension == "dsf",
-        PlannerAudioFormat::Dff => extension == "dff",
-        PlannerAudioFormat::Dts => extension == "dts",
-        PlannerAudioFormat::Ac3 => extension == "ac3",
-        PlannerAudioFormat::Custom { .. } => false,
-    }
-}
 
 fn metadata_satisfaction_label(
     artifact: Option<&TrackArtifact>,
@@ -24679,433 +23477,12 @@ fn metadata_dimension_labels(value: PlannedMetadataSatisfaction) -> Vec<&'static
     labels
 }
 
-fn per_track_dither_disclosure(
-    track: &PreparedTrack,
-    record: &TrackRecord,
-    req: &PipelineRequest,
-) -> Option<String> {
-    let settings = &req.settings;
-    let policy_tpdf = source_depth_policy_tpdf_for_track(track, settings);
-    let effective_dither = effective_dither_for_track(track, settings);
-    if effective_dither == DitherType::None
-        || tonepoet_pipeline::selects_reference_dsd_to_pcm(
-            settings,
-            track.source_audio.coding == Some(SourceAudioCoding::Dsd),
-        )
-    {
-        return None;
-    }
 
-    let target_depth = resolved_target_pcm_depth(track, settings)
-        .or_else(|| source_default_pcm_depth_for_track(track, settings).map(|(depth, _)| depth));
-    if command_records_prove_dither_for_track(track, record, settings) {
-        return None;
-    }
 
-    let requested = dither_type_label(effective_dither);
-    if settings.target_format.is_dsd() {
-        return Some(format!(
-            "Dither requested ({requested}) — not applied (PCM dither is not applicable to a DSD target)"
-        ));
-    }
-    if settings.target_format.is_lossy() {
-        return Some(format!(
-            "Dither requested ({requested}) — not applied (lossy encoder has no fixed PCM target depth)"
-        ));
-    }
 
-    let reason = match target_depth {
-        Some(depth) if depth.is_float() => "float targets are not dithered",
-        Some(tonepoet_pipeline::PcmBitDepth::Int32)
-            if !(settings.dither_explicit || policy_tpdf) =>
-        {
-            "32-bit default gate; selection was not explicit or Source-policy selected"
-        }
-        Some(tonepoet_pipeline::PcmBitDepth::Int32)
-            if command_records_use_tool(&[record], ToolBinary::Ssrc) =>
-        {
-            "executed SSRC command did not emit the resolved dither stage"
-        }
-        Some(tonepoet_pipeline::PcmBitDepth::Int32)
-            if command_records_use_tool(&[record], ToolBinary::Sox) =>
-        {
-            "ordinary SoX Int32 dither is not behavior-qualified"
-        }
-        Some(tonepoet_pipeline::PcmBitDepth::Int32)
-            if command_records_use_tool(&[record], ToolBinary::Ffmpeg)
-                && tonepoet_pipeline::mapping::soxr_dither_method(effective_dither).is_none() =>
-        {
-            "not supported by the ffmpeg/soxr resampler"
-        }
-        Some(tonepoet_pipeline::PcmBitDepth::Int32)
-            if settings.dither_explicit || policy_tpdf =>
-        {
-            "executed command did not emit a dither stage"
-        }
-        _ if track_depth_reduction_requires_dither(track, settings) => {
-            "executed command did not emit a dither stage"
-        }
-        _ => "not needed — no bit-depth reduction",
-    };
-    Some(format!(
-        "Dither requested ({requested}) — not applied ({reason})"
-    ))
-}
 
-fn conversion_summary(
-    track: &PreparedTrack,
-    req: &PipelineRequest,
-    verified_output_bit_depth: Option<tonepoet_pipeline::PcmBitDepth>,
-    actual_dither_applied: Option<bool>,
-) -> String {
-    let source_rate = track.scalar_sample_rate();
-    let source_depth_bits = track.bit_depth.or(track.source_audio.bit_depth);
-    let source_pcm_depth = super::plan_bridge::resolve_source_pcm_depth(track);
-    let source_depth = source_pcm_depth
-        .map(tonepoet_pipeline::PcmBitDepth::bits)
-        .or_else(|| source_depth_bits.filter(|bits| *bits < 100));
-    let source_format = source_track_format_label(track);
-    let target_rate = resolved_target_rate_hz(track, &req.settings).or(source_rate);
-    let defaulted_source_target = source_default_pcm_depth_for_track(track, &req.settings);
-    let planned_target_pcm_depth = if req.settings.target_format.is_dsd() {
-        None
-    } else {
-        resolved_target_pcm_depth(track, &req.settings)
-            .or(defaulted_source_target.map(|(depth, _)| depth))
-    };
-    let planned_target_depth = planned_target_pcm_depth.map(tonepoet_pipeline::PcmBitDepth::bits);
-    let target_depth = verified_output_bit_depth
-        .map(tonepoet_pipeline::PcmBitDepth::bits)
-        .or(planned_target_depth);
-    let planned_float_target = planned_target_pcm_depth.filter(|depth| depth.is_float());
-    let output_depth_unverified = verified_output_bit_depth.is_none()
-        && req.settings.target_format.is_pcm_lossless();
-    let target_stream = verified_output_bit_depth
-        .or(planned_float_target)
-        .map(|depth| measured_target_stream_description(depth, target_rate))
-        .unwrap_or_else(|| target_stream_description(track, target_depth, target_rate, &req.settings));
-    let target_stream = if let Some((depth, reason)) = defaulted_source_target {
-        if verified_output_bit_depth.is_some() {
-            // The output WAS measured: keep the measured description and
-            // note the default as the plan choice it is — the label must
-            // accompany the verified fact, never replace it.
-            format!("{target_stream} ({}-bit default for {reason} source)", depth.bits())
-        } else {
-            let rate = target_rate
-                .map(|hz| format!(" at {}", format_sample_rate(hz)))
-                .unwrap_or_default();
-            format!(
-                "requested {}-bit (default for {reason} source){rate}",
-                depth.bits()
-            )
-        }
-    } else if output_depth_unverified {
-        format!("requested {target_stream}")
-    } else {
-        target_stream
-    };
-    let mut summary = format!(
-        "{} {} → {} {}",
-        source_pcm_depth
-            .map(|depth| measured_target_stream_description(depth, source_rate))
-            .unwrap_or_else(|| stream_description(source_depth, source_rate, Some(&source_format))),
-        source_format,
-        target_stream,
-        req.settings.target_format.display_name(),
-    );
-    if output_depth_unverified {
-        summary.push_str(" [output depth unverified]");
-    }
-    if req.settings.target_bit_depth == BitDepthTarget::Source
-        && req.settings.target_format.is_pcm_lossless()
-        && matches!(track.bit_depth.or(track.source_audio.bit_depth), Some(20))
-    {
-        // Only PCM-lossless targets actually store a 24-bit container; lossy
-        // targets have no stored width and must not carry this claim.
-        summary.push_str(" [source is 20-bit; stored as 24-bit]");
-    }
-    let mut transforms = Vec::new();
-    if matches!(
-        &track.source_ref,
-        TrackSourceRef::DsdTruePeakCarrier { .. }
-    ) {
-        if let Some(gain_db) = req.settings.dsd.runtime_album_gain_db() {
-            let target = req
-                .settings
-                .dsd
-                .album_true_peak_target_dbtp()
-                .map(|value| value.render(false))
-                .unwrap_or_else(|| "unknown".to_string());
-            let scope = match (
-                req.settings.dsd.runtime_album_track_count(),
-                req.settings.dsd.runtime_album_loudest_peak_dbfs(),
-            ) {
-                (Some(track_count), Some(loudest)) => format!(
-                    "{track_count} measured DSD track(s), loudest true peak {} dBTP",
-                    loudest.render(false),
-                ),
-                (Some(track_count), None) => {
-                    format!("{track_count} verified-silent DSD track(s)")
-                }
-                _ => "submitted DSD batch".to_string(),
-            };
-            transforms.push(format!(
-                "submitted-batch DSD true-peak album gain {} dB ({scope}; target {} dBTP)",
-                gain_db.render(true),
-                target,
-            ));
-            if let Some(target_rate_hz) = target_rate {
-                if let Ok(Some(reserve_db)) =
-                    album_gain_terminal_headroom_reserve_db(&req.settings, target_rate_hz)
-                {
-                    transforms.push(format!(
-                        "hard-ceiling terminal reserve {reserve_db:.6} dB below requested {target} dBTP (dither/quantization safety bound)",
-                    ));
-                }
-            }
-        }
-    }
-    if let TrackSourceRef::DsdReferenceAutoGainCarrier { target_dbtp, .. } = &track.source_ref {
-        if let Some(gain_db) = req.settings.dsd.runtime_album_gain_db() {
-            let scope = match (
-                req.settings.dsd.runtime_album_track_count(),
-                req.settings.dsd.runtime_album_loudest_peak_dbfs(),
-            ) {
-                (Some(track_count), Some(loudest)) => format!(
-                    "{track_count} measured DSD track(s), loudest true peak {} dBTP",
-                    loudest.render(false),
-                ),
-                (Some(track_count), None) => {
-                    format!("{track_count} verified-silent DSD track(s)")
-                }
-                _ => "submitted DSD batch".to_string(),
-            };
-            transforms.push(format!(
-                "submitted-batch DSD Reference album gain {} dB ({scope}; target {} dBTP)",
-                gain_db.render(true),
-                target_dbtp.render(false),
-            ));
-        }
-    }
-    if let Some(gain_db) = req.settings.pcm_true_peak.fixed_gain_db() {
-        transforms.push(format!(
-            "user-supplied PCM fixed gain {} dB (unclamped; may clip)",
-            gain_db.render(true),
-        ));
-    }
-    if let Some((requested_hz, effective_hz)) =
-        ordinary_lossy_rate_divergence(track, &req.settings)
-    {
-        transforms.push(format!(
-            "sample-rate request {} adjusted to {} because {} cannot encode the requested rate directly",
-            format_sample_rate(requested_hz),
-            format_sample_rate(effective_hz),
-            req.settings.target_format.display_name(),
-        ));
-    }
-    if let (Some(source_rate), Some(target_rate)) = (source_rate, target_rate) {
-        if source_rate != target_rate {
-            transforms.push(format!("{} resampling", preferred_resampler_label(&req.settings)));
-        }
-    }
-    let policy_tpdf = source_depth_policy_tpdf_for_track(track, &req.settings);
-    let effective_dither = effective_dither_for_track(track, &req.settings);
-    let dither_applied = actual_dither_applied.unwrap_or_else(|| {
-        dither_applies(
-            super::plan_bridge::resolve_dither_source_pcm_depth(track),
-            planned_target_pcm_depth,
-            effective_dither,
-            req.settings.dither_explicit || policy_tpdf,
-            preferred_resampler_family(&req.settings),
-        )
-    });
-    if dither_applied {
-        let label = if effective_dither == DitherType::None {
-            "command-selected".to_string()
-        } else {
-            dither_type_label(effective_dither).to_string()
-        };
-        transforms.push(format!("{label} dither"));
-    } else if actual_dither_applied == Some(false)
-        && effective_dither != DitherType::None
-        && !tonepoet_pipeline::selects_reference_dsd_to_pcm(
-            &req.settings,
-            track.source_audio.coding == Some(SourceAudioCoding::Dsd),
-        )
-    {
-        transforms.push("dither requested but not applied".to_string());
-    }
-    if !transforms.is_empty() {
-        summary.push_str(&format!(" ({})", transforms.join(", ")));
-    }
-    summary
-}
 
-fn stream_description(
-    bit_depth: Option<u32>,
-    sample_rate: Option<u32>,
-    dsd_format_hint: Option<&str>,
-) -> String {
-    if dsd_format_hint == Some("DSD") {
-        if let Some(rate) = sample_rate.and_then(DsdRate::from_hz) {
-            return dsd_rate_label(rate).to_string();
-        }
-    }
-    let rate = sample_rate
-        .map(format_sample_rate)
-        .unwrap_or_else(|| "unknown rate".to_string());
-    match bit_depth {
-        Some(bits) => format!("{bits}-bit/{rate}"),
-        None => rate,
-    }
-}
 
-fn target_stream_description(
-    track: &PreparedTrack,
-    bit_depth: Option<u32>,
-    sample_rate: Option<u32>,
-    settings: &tonepoet_pipeline::PipelineSettings,
-) -> String {
-    if settings.target_format.is_dsd() {
-        let target_dsd_rate = match settings.target_sample_rate {
-            RateTarget::Dsd(rate) => Some(rate),
-            RateTarget::Source => source_track_dsd_rate(track),
-            RateTarget::PcmHz(_) => None,
-        }
-        .or_else(|| sample_rate.and_then(DsdRate::from_hz));
-        if let Some(rate) = target_dsd_rate {
-            return dsd_rate_label(rate).to_string();
-        }
-    }
-    stream_description(bit_depth, sample_rate, None)
-}
-
-fn measured_target_stream_description(
-    depth: tonepoet_pipeline::PcmBitDepth,
-    sample_rate: Option<u32>,
-) -> String {
-    let rate = sample_rate
-        .map(format_sample_rate)
-        .unwrap_or_else(|| "unknown rate".to_string());
-    match depth {
-        tonepoet_pipeline::PcmBitDepth::Float32 | tonepoet_pipeline::PcmBitDepth::Float64 => {
-            format!("{}/{rate}", pcm_bit_depth_label(depth))
-        }
-        _ => format!("{}-bit/{rate}", depth.bits()),
-    }
-}
-
-fn resampling_applies_for_source(
-    source: &PreparedSource,
-    settings: &tonepoet_pipeline::PipelineSettings,
-) -> bool {
-    source.tracks.iter().any(|track| {
-        match (track.scalar_sample_rate(), resolved_target_rate_hz(track, settings)) {
-            (Some(source_rate), Some(target_rate)) => source_rate != target_rate,
-            _ => false,
-        }
-    })
-}
-
-fn bit_depth_change_applies_for_source(
-    source: &PreparedSource,
-    settings: &tonepoet_pipeline::PipelineSettings,
-) -> bool {
-    if settings.target_format.is_dsd() {
-        return false;
-    }
-    source.tracks.iter().any(|track| {
-        let target_depth = resolved_target_pcm_depth(track, settings)
-            .or_else(|| source_default_pcm_depth_for_track(track, settings).map(|(depth, _)| depth));
-        let Some(target_depth) = target_depth else {
-            return false;
-        };
-        match super::plan_bridge::resolve_source_pcm_depth(track) {
-            Some(source_depth) => source_depth != target_depth,
-            None => match track
-                .source_audio
-                .coding
-                .unwrap_or(SourceAudioCoding::Unknown)
-            {
-                SourceAudioCoding::Dsd | SourceAudioCoding::Lossy => true,
-                SourceAudioCoding::Pcm
-                | SourceAudioCoding::DvdaUnknown
-                | SourceAudioCoding::Unknown => {
-                    settings.target_bit_depth != BitDepthTarget::Source
-                }
-            },
-        }
-    })
-}
-
-fn dithering_applies_for_source(
-    source: &PreparedSource,
-    settings: &tonepoet_pipeline::PipelineSettings,
-    tracks: &[&TrackRecord],
-) -> bool {
-    if settings.target_format.is_dsd() {
-        return false;
-    }
-    if !tracks.is_empty() {
-        return command_records_prove_dither_for_source(source, settings, tracks);
-    }
-    if source.tracks.iter().any(|track| {
-        tonepoet_pipeline::selects_reference_dsd_to_pcm(
-            settings,
-            track.source_audio.coding == Some(SourceAudioCoding::Dsd),
-        )
-    }) {
-        return !source_has_float_target(source, settings);
-    }
-    source.tracks.iter().any(|track| {
-        let policy_tpdf = source_depth_policy_tpdf_for_track(track, settings);
-        dither_applies(
-            super::plan_bridge::resolve_dither_source_pcm_depth(track),
-            resolved_target_pcm_depth(track, settings)
-                .or_else(|| source_default_pcm_depth_for_track(track, settings).map(|(depth, _)| depth)),
-            effective_dither_for_track(track, settings),
-            settings.dither_explicit || policy_tpdf,
-            preferred_resampler_family(settings),
-        )
-    })
-}
-
-fn dither_applies(
-    source_depth: Option<tonepoet_pipeline::PcmBitDepth>,
-    target_depth: Option<tonepoet_pipeline::PcmBitDepth>,
-    dither: DitherType,
-    dither_explicit: bool,
-    resampler: ResamplerFamily,
-) -> bool {
-    if dither == DitherType::None {
-        return false;
-    }
-    match target_depth {
-        Some(
-            target @ (tonepoet_pipeline::PcmBitDepth::Int8
-            | tonepoet_pipeline::PcmBitDepth::Int16
-            | tonepoet_pipeline::PcmBitDepth::Int24),
-        ) => source_depth
-            .map(|source| target.bits() < source.bits())
-            .unwrap_or(true),
-        Some(tonepoet_pipeline::PcmBitDepth::Int32) => {
-            // Ordinary SoX Int32 dither is not behavior-qualified: supported
-            // installations may accept the effect while producing unchanged
-            // samples. FFmpeg may claim its commissioned mapped cell without
-            // command records; SSRC Int32 ownership is destination-rate-specific,
-            // so actual SSRC command records remain the authority for logging.
-            // Reference DSD is handled by its separate qualified-policy branch above.
-            dither_explicit
-                && matches!(resampler, ResamplerFamily::Soxr | ResamplerFamily::Auto)
-                && tonepoet_pipeline::mapping::soxr_dither_method(dither).is_some()
-        }
-        Some(
-            tonepoet_pipeline::PcmBitDepth::Float32
-            | tonepoet_pipeline::PcmBitDepth::Float64,
-        )
-        | None => false,
-    }
-}
 
 fn source_default_pcm_depth_for_track(
     track: &PreparedTrack,
@@ -25487,63 +23864,9 @@ mod r18_preemphasis_target_domain_tests {
     }
 }
 
-fn source_depth_policy_tpdf_for_track(
-    track: &PreparedTrack,
-    settings: &tonepoet_pipeline::PipelineSettings,
-) -> bool {
-    if settings.target_bit_depth != BitDepthTarget::Source
-        || settings.dither_explicit
-        || !matches!(
-            track.source_audio.coding,
-            Some(SourceAudioCoding::Pcm) | Some(SourceAudioCoding::DvdaUnknown)
-        )
-    {
-        return false;
-    }
-    super::plan_bridge::resolve_source_pcm_depth(track).is_some_and(|source_depth| {
-        tonepoet_pipeline::source_depth_policy_requires_tpdf(
-            &settings.target_format,
-            settings.wavpack.hybrid,
-            source_depth,
-        )
-    })
-}
 
-fn effective_dither_for_track(
-    track: &PreparedTrack,
-    settings: &tonepoet_pipeline::PipelineSettings,
-) -> DitherType {
-    if settings.dither_type != DitherType::None {
-        settings.dither_type
-    } else if source_depth_policy_tpdf_for_track(track, settings) {
-        DitherType::Tpdf
-    } else {
-        DitherType::None
-    }
-}
 
-fn source_depth_policy_tpdf_for_source(
-    source: &PreparedSource,
-    settings: &tonepoet_pipeline::PipelineSettings,
-) -> bool {
-    source
-        .tracks
-        .iter()
-        .any(|track| source_depth_policy_tpdf_for_track(track, settings))
-}
 
-fn effective_dither_for_source(
-    source: &PreparedSource,
-    settings: &tonepoet_pipeline::PipelineSettings,
-) -> DitherType {
-    if settings.dither_type != DitherType::None {
-        settings.dither_type
-    } else if source_depth_policy_tpdf_for_source(source, settings) {
-        DitherType::Tpdf
-    } else {
-        DitherType::None
-    }
-}
 
 fn source_is_dsd(source: &PreparedSource) -> bool {
     source.kind == SourceKind::SacdIso
@@ -25638,201 +23961,15 @@ fn channel_group_description(group: &ChannelGroupDescriptor) -> String {
     format!("group {}: {channels}, {depth}/{rate}", group.group_nr)
 }
 
-fn source_track_format_label(track: &PreparedTrack) -> String {
-    if source_track_dsd_rate(track).is_some() {
-        return "DSD".to_string();
-    }
-    source_ref_extension(&track.source_ref)
-        .as_deref()
-        .map(audio_extension_label)
-        .unwrap_or("source")
-        .to_string()
-}
 
-fn source_ref_extension(source_ref: &TrackSourceRef) -> Option<String> {
-    let path = match source_ref {
-        TrackSourceRef::StagedFile(path) => path,
-        TrackSourceRef::DsdTruePeakCarrier { source_path, .. }
-        | TrackSourceRef::DsdReferenceAutoGainCarrier { source_path, .. }
-        | TrackSourceRef::PcmTruePeakCarrier { source_path, .. }
-        | TrackSourceRef::RegisteredEffectCarrier { source_path, .. } => source_path,
-        TrackSourceRef::CueStreamSegment { source_image, .. }
-        | TrackSourceRef::CueSegmentCarrier { source_image, .. }
-        | TrackSourceRef::EmbeddedChapterCarrier { source_image, .. } => source_image,
-        TrackSourceRef::ImageSegment { image, .. } => image,
-        TrackSourceRef::SacdTrack { .. } => return Some("dsd".to_string()),
-        TrackSourceRef::DvdaTrack { .. } => return Some("dvda".to_string()),
-        TrackSourceRef::DvdVideoTrack { .. } => return Some("dvdv".to_string()),
-        TrackSourceRef::BluRayTrack { .. } => return Some("bluray".to_string()),
-    };
-    path.extension()
-        .and_then(|value| value.to_str())
-        .map(|value| value.to_ascii_lowercase())
-}
 
-fn audio_extension_label(extension: &str) -> &'static str {
-    match extension.trim_start_matches('.').to_ascii_lowercase().as_str() {
-        "flac" => "FLAC",
-        "wav" | "wave" => "WAV",
-        "aiff" | "aif" => "AIFF",
-        "wv" => "WavPack",
-        "mp3" => "MP3",
-        "m4a" | "m4b" | "mp4" | "aac" => "AAC/ALAC",
-        "opus" | "ogg" => "Opus",
-        "dsf" | "dff" | "dsd" | "iso" => "DSD",
-        _ => "source",
-    }
-}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ResamplerFamily {
-    Auto,
-    Ssrc,
-    Sox,
-    Soxr,
-}
 
-fn preferred_resampler_family(settings: &tonepoet_pipeline::PipelineSettings) -> ResamplerFamily {
-    if settings.ssrc.force || settings.nyquist_transition == NyquistTransition::BrickWall {
-        return ResamplerFamily::Ssrc;
-    }
-    match &settings.preferred_tool {
-        PreferredTool::Ssrc => ResamplerFamily::Ssrc,
-        PreferredTool::Sox => ResamplerFamily::Sox,
-        PreferredTool::Ffmpeg => ResamplerFamily::Soxr,
-        PreferredTool::Auto | PreferredTool::Custom(_) => ResamplerFamily::Auto,
-    }
-}
 
-fn preferred_resampler_label(settings: &tonepoet_pipeline::PipelineSettings) -> &'static str {
-    match preferred_resampler_family(settings) {
-        ResamplerFamily::Ssrc => "SSRC",
-        ResamplerFamily::Sox => "SoX",
-        ResamplerFamily::Soxr => "soxr",
-        ResamplerFamily::Auto => "Auto",
-    }
-}
 
-/// Derive the actual resampler tool from executed track commands.
-///
-/// Scans track records for the command that performed PCM resampling, DSD→PCM,
-/// or PCM→DSD rate conversion and returns its tool name. Falls back to the user's preference
-/// if no resampling command is found (defensive — shouldn't happen when
-/// `resampling_applies` is true).
-fn command_record_performs_resampling(command: &CommandRecord) -> bool {
-    let description_matches = command
-        .description
-        .as_deref()
-        .map(str::to_ascii_lowercase)
-        .is_some_and(|description| {
-            description.contains("resampl")
-                || description.contains("dsd to pcm")
-                || description.contains("pcm to dsd")
-        });
-    if description_matches {
-        return true;
-    }
 
-    match command.binary {
-        ToolBinary::Ssrc => true,
-        ToolBinary::Sox => command.sanitized_args.iter().any(|arg| arg == "rate"),
-        ToolBinary::Ffmpeg => command.sanitized_args.iter().any(|arg| {
-            arg.contains("aresample=") || arg.contains("out_sample_rate=")
-        }),
-        _ => false,
-    }
-}
 
-fn actual_resampler_label(
-    tracks: &[&TrackRecord],
-    settings: &tonepoet_pipeline::PipelineSettings,
-) -> &'static str {
-    // SSRC is unambiguous: if the SSRC binary ran, it was the resampler.
-    // Check this first to avoid false-matching on preprocessing commands
-    // like "Decode to PCM for SSRC" which use ffmpeg, not SSRC itself.
-    for track in tracks {
-        if track
-            .commands
-            .iter()
-            .any(|command| command.binary == ToolBinary::Ssrc)
-        {
-            return "SSRC";
-        }
-    }
-    for track in tracks {
-        for command in &track.commands {
-            if !command_record_performs_resampling(command) {
-                continue;
-            }
-            return match command.binary {
-                ToolBinary::Sox => "SoX",
-                ToolBinary::Ffmpeg => "soxr",
-                _ => preferred_resampler_label(settings),
-            };
-        }
-    }
-    preferred_resampler_label(settings)
-}
 
-fn target_sample_rate_setting_label(
-    source: &PreparedSource,
-    settings: &tonepoet_pipeline::PipelineSettings,
-) -> String {
-    match settings.target_sample_rate {
-        RateTarget::PcmHz(hz) => {
-            let hard_ceiling_rate_is_exact = source
-                .tracks
-                .iter()
-                .any(|track| track_requires_dsd_hard_ceiling_rate_exactness(track, settings));
-            let effective_hz = if settings.target_format.is_lossy()
-                && !hard_ceiling_rate_is_exact
-            {
-                tonepoet_pipeline::mapping::ffmpeg_lossy_encoder_rate_for_request(
-                    &settings.target_format,
-                    hz,
-                )
-                .unwrap_or(hz)
-            } else {
-                hz
-            };
-            format_sample_rate(effective_hz)
-        }
-        RateTarget::Dsd(rate) => dsd_rate_label(rate).to_string(),
-        RateTarget::Source => {
-            let labels = source
-                .tracks
-                .iter()
-                .filter_map(|track| {
-                    resolved_target_rate_hz(track, settings)
-                        .filter(|target_rate| Some(*target_rate) != track.scalar_sample_rate())
-                        .map(|target_rate| target_rate_setting_label_for_hz(target_rate, settings))
-                })
-                .collect::<BTreeSet<_>>();
-            match labels.len() {
-                0 => "source".to_string(),
-                1 => labels.into_iter().next().unwrap_or_else(|| "source".to_string()),
-                _ => format!(
-                    "source-derived ({})",
-                    labels.into_iter().collect::<Vec<_>>().join(", ")
-                ),
-            }
-        }
-    }
-}
-
-fn target_rate_setting_label_for_hz(
-    rate_hz: u32,
-    settings: &tonepoet_pipeline::PipelineSettings,
-) -> String {
-    if settings.target_format.is_dsd() {
-        DsdRate::from_hz(rate_hz)
-            .map(dsd_rate_label)
-            .map(str::to_string)
-            .unwrap_or_else(|| format_sample_rate(rate_hz))
-    } else {
-        format_sample_rate(rate_hz)
-    }
-}
 
 fn bit_depth_target_label(target: BitDepthTarget) -> String {
     match target {
@@ -25852,129 +23989,18 @@ fn pcm_bit_depth_label(depth: PcmBitDepth) -> &'static str {
     }
 }
 
-fn dsd_rate_label(rate: DsdRate) -> &'static str {
-    match rate {
-        DsdRate::Dsd64 => "DSD64",
-        DsdRate::Dsd128 => "DSD128",
-        DsdRate::Dsd256 => "DSD256",
-        DsdRate::Dsd512 => "DSD512",
-        DsdRate::Dsd1024 => "DSD1024",
-    }
-}
-
-fn dither_type_label(value: DitherType) -> &'static str {
-    match value {
-        DitherType::None => "none",
-        DitherType::Tpdf => "TPDF",
-        DitherType::SlopedTpdf => "sloped TPDF",
-        DitherType::Shibata => "Shibata",
-        DitherType::Lipshitz => "Lipshitz",
-        DitherType::FWeighted => "F-weighted",
-        DitherType::ModifiedEWeighted => "modified E-weighted",
-        DitherType::ImprovedEWeighted => "improved E-weighted",
-        DitherType::Gesemann => "Gesemann",
-        DitherType::LowShibata => "low-Shibata",
-        DitherType::HighShibata => "high-Shibata",
-    }
-}
-
-fn resample_quality_label(value: ResampleQuality) -> &'static str {
-    match value {
-        ResampleQuality::Low => "low",
-        ResampleQuality::Medium => "medium",
-        ResampleQuality::High => "high",
-        ResampleQuality::VeryHigh => "very high",
-        ResampleQuality::Ultra => "ultra",
-        ResampleQuality::Insane => "insane",
-    }
-}
-
-fn nyquist_transition_label(value: NyquistTransition) -> &'static str {
-    match value {
-        NyquistTransition::Gentle => "gentle",
-        NyquistTransition::Medium => "medium",
-        NyquistTransition::Steep => "steep",
-        NyquistTransition::Sharp => "sharp",
-        NyquistTransition::BrickWall => "brick-wall",
-    }
-}
-
-fn mp3_mode_label(value: Mp3Mode) -> &'static str {
-    match value {
-        Mp3Mode::Cbr => "CBR",
-        Mp3Mode::Vbr => "VBR",
-        Mp3Mode::Abr => "ABR",
-    }
-}
-
-fn aac_profile_label(value: AacProfile) -> &'static str {
-    match value {
-        AacProfile::LcAac => "LC-AAC",
-        AacProfile::HeAac => "HE-AAC",
-        AacProfile::HeAacV2 => "HE-AAC v2",
-    }
-}
-
-fn opus_content_type_label(value: OpusContentType) -> &'static str {
-    match value {
-        OpusContentType::Auto => "auto",
-        OpusContentType::Music => "music",
-        OpusContentType::Speech => "speech",
-    }
-}
-
-fn wavpack_mode_label(value: WavPackMode) -> &'static str {
-    match value {
-        WavPackMode::Normal => "normal",
-        WavPackMode::Fast => "fast",
-        WavPackMode::High => "high",
-        WavPackMode::VeryHigh => "very high",
-    }
-}
-
-fn ssrc_profile_label(
-    profile: Option<SsrcProfile>,
-    quality: ResampleQuality,
-    insane_mode: bool,
-) -> &'static str {
-    if insane_mode {
-        return "insane";
-    }
-    match profile {
-        Some(SsrcProfile::Insane) => "insane",
-        Some(SsrcProfile::High) => "high",
-        Some(SsrcProfile::Long) => "long",
-        Some(SsrcProfile::Standard) => "standard",
-        Some(SsrcProfile::Short) => "short",
-        Some(SsrcProfile::Fast) => "fast",
-        Some(SsrcProfile::Lightning) => "lightning",
-        None => resample_quality_label(quality),
-    }
-}
-
-fn ssrc_pdf_type_label(value: SsrcPdfType) -> &'static str {
-    match value {
-        SsrcPdfType::Rectangular => "rectangular",
-        SsrcPdfType::Triangular => "triangular",
-    }
-}
-
-fn sox_sinc_phase_label(value: SoxSincPhase) -> &'static str {
-    match value {
-        SoxSincPhase::Linear => "linear",
-        SoxSincPhase::Minimum => "minimum",
-        SoxSincPhase::Intermediate => "intermediate",
-    }
-}
 
 
-fn dsd_lowpass_method_label(value: DsdLowpassMethod) -> &'static str {
-    match value {
-        DsdLowpassMethod::Auto => "auto",
-        DsdLowpassMethod::SoxUltra => "SoX ultra",
-        DsdLowpassMethod::Sinc => "sinc",
-    }
-}
+
+
+
+
+
+
+
+
+
+
 
 fn artwork_mime_label(mime: &str) -> &'static str {
     match mime.trim().to_ascii_lowercase().as_str() {
@@ -26099,16 +24125,6 @@ fn cue_artwork_supported_by_target(format: &PlannerAudioFormat) -> bool {
     )
 }
 
-fn decimal_label(value: f32) -> String {
-    let mut text = format!("{value:.3}");
-    while text.contains('.') && text.ends_with('0') {
-        text.pop();
-    }
-    if text.ends_with('.') {
-        text.pop();
-    }
-    text
-}
 
 fn collect_outcome_tracks(outcome: &AlbumOutcome) -> Vec<&TrackRecord> {
     let mut tracks: Vec<&TrackRecord> = match outcome {
@@ -26130,98 +24146,19 @@ fn collect_outcome_tracks(outcome: &AlbumOutcome) -> Vec<&TrackRecord> {
     tracks
 }
 
+fn outcome_block_reason(outcome: &AlbumOutcome) -> Option<&BlockReason> {
+    match outcome {
+        AlbumOutcome::Blocked { reason, .. } => Some(reason),
+        AlbumOutcome::Complete { .. } | AlbumOutcome::Partial { .. } => None,
+    }
+}
+
 fn outcome_stage_records(outcome: &AlbumOutcome) -> &[StageRecord] {
     match outcome {
         AlbumOutcome::Complete { stages, .. }
         | AlbumOutcome::Partial { stages, .. }
         | AlbumOutcome::Blocked { stages, .. } => stages,
     }
-}
-
-fn total_track_duration(tracks: &[&TrackRecord]) -> Duration {
-    let mut total = Duration::ZERO;
-    for duration in tracks.iter().filter_map(|track| track.duration) {
-        total = total
-            .checked_add(duration)
-            .unwrap_or_else(|| Duration::from_secs(u64::MAX));
-    }
-    total
-}
-
-fn append_total_size_line(
-    log: &mut String,
-    total_bytes_in: u64,
-    total_bytes_out: u64,
-    missing_input_sizes: usize,
-    missing_output_sizes: usize,
-) {
-    if total_bytes_in == 0 && total_bytes_out == 0 {
-        log.push_str("Total size: unknown\n");
-        return;
-    }
-
-    let mut line = format!(
-        "{} -> {}",
-        format_bytes(total_bytes_in),
-        format_bytes(total_bytes_out)
-    );
-    if total_bytes_in > 0 {
-        line.push_str(&format!(
-            " ({})",
-            compression_ratio(total_bytes_in, total_bytes_out)
-        ));
-    } else {
-        line.push_str(" (ratio unavailable)");
-    }
-    if missing_input_sizes > 0 || missing_output_sizes > 0 {
-        line.push_str(&format!(
-            " [partial data: {missing_input_sizes} missing input size(s), {missing_output_sizes} missing output size(s)]"
-        ));
-    }
-    push_kv_line(log, "Total size", line);
-}
-
-fn append_elapsed_processing_wall_time_line(
-    log: &mut String,
-    elapsed_wall_time: Option<Duration>,
-    missing_wall_timings: usize,
-) {
-    match elapsed_wall_time {
-        Some(elapsed) if missing_wall_timings == 0 => {
-            push_kv_line(
-                log,
-                "Elapsed processing wall time",
-                format!(
-                    "pending finalization (checkpoint {})",
-                    format_duration_precise(elapsed),
-                ),
-            );
-        }
-        _ if missing_wall_timings > 0 => {
-            push_kv_line(
-                log,
-                "Elapsed processing wall time",
-                format!(
-                    "unavailable [{missing_wall_timings} missing or incompatible timing span(s)]"
-                ),
-            );
-        }
-        _ => push_kv_line(log, "Elapsed processing wall time", "unavailable"),
-    }
-}
-
-fn append_encode_duration_sum_line(
-    log: &mut String,
-    encode_duration_sum: Duration,
-    missing_encode_durations: usize,
-) {
-    let mut line = format_duration_precise(encode_duration_sum);
-    if missing_encode_durations > 0 {
-        line.push_str(&format!(
-            " [partial data: {missing_encode_durations} missing encode duration(s)]"
-        ));
-    }
-    push_kv_line(log, "Per-track Encode duration sum", line);
 }
 
 fn unique_conversion_log_value<'a>(log: &'a str, label: &str) -> io::Result<Option<&'a str>> {
@@ -26255,121 +24192,62 @@ fn parse_conversion_log_utc_timestamp(value: &str, label: &str) -> io::Result<ch
 
 /// Finalize the wall-clock checkpoint already embedded in a conversion log.
 ///
-/// This is intentionally idempotent. A completed wall-clock-v2 log is left
-/// byte-for-byte alone, while a legacy/incomplete log without timing authority
-/// is never upgraded from an encode-duration sum.
+/// This is intentionally idempotent. A completed evidence-first log is left
+/// byte-for-byte alone, while a legacy/incomplete log without run-level timing
+/// authority is never upgraded from per-track duration data.
 fn finalize_conversion_log_timing_text(
     log: &str,
     terminal_timing: &ConversionLogFragmentTiming,
 ) -> io::Result<Option<String>> {
-    let Some(model) = unique_conversion_log_value(log, "Timing model")? else {
+    let Some(elapsed_value) = unique_conversion_log_value(log, "Elapsed")? else {
+        // Legacy logs use a different timing schema. Never synthesize new
+        // authority from their per-track duration sums.
         return Ok(None);
     };
-    if model != CONVERSION_LOG_TIMING_MODEL {
+    if elapsed_value == "unavailable" || !elapsed_value.starts_with("pending finalization") {
         return Ok(None);
     }
-
-    let Some(elapsed_value) = unique_conversion_log_value(log, "Elapsed processing wall time")? else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "wall-clock-v2 conversion log is missing Elapsed processing wall time",
-        ));
+    if unique_conversion_log_value(log, "Finished (UTC)")?.is_some() {
+        return Ok(None);
+    }
+    let Some(started_value) = unique_conversion_log_value(log, "Started (UTC)")? else {
+        return Ok(None);
     };
-    let existing_finished = unique_conversion_log_value(log, "Timing finished (UTC)")?;
-    let existing_checkpoint = unique_conversion_log_value(log, "Timing checkpoint (UTC)")?;
-
-    if existing_finished.is_some() {
-        if existing_checkpoint.is_some() || elapsed_value.starts_with("pending finalization") {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "wall-clock-v2 conversion log mixes finalized and pending timing fields",
-            ));
-        }
-        return Ok(None);
-    }
-    if elapsed_value.starts_with("unavailable") {
-        return Ok(None);
-    }
-    if !elapsed_value.starts_with("pending finalization") {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "wall-clock-v2 conversion log has unrecognized elapsed timing value {elapsed_value:?}"
-            ),
-        ));
-    }
-
-    let started_value = unique_conversion_log_value(log, "Timing started (UTC)")?.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "pending wall-clock-v2 conversion log is missing Timing started (UTC)",
-        )
-    })?;
-    let checkpoint_value = existing_checkpoint.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "pending wall-clock-v2 conversion log is missing Timing checkpoint (UTC)",
-        )
-    })?;
     let started = parse_conversion_log_utc_timestamp(started_value, "start")?;
-    let checkpoint = parse_conversion_log_utc_timestamp(checkpoint_value, "checkpoint")?;
-    if checkpoint < started {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "wall-clock-v2 conversion log checkpoint precedes its start",
-        ));
-    }
-
-    // The terminal snapshot is derived from Instant for the finalizing request.
-    // For a multi-part album the latest fragment checkpoint can have a later
-    // UTC anchor than that request's endpoint if the wall clock moved between
-    // participant starts; never let finalization shorten an already observed
-    // interval.
-    let finished = if terminal_timing.finished_at_utc < checkpoint {
-        checkpoint
+    let finished = if terminal_timing.finished_at_utc < started {
+        // The monotonic duration is authoritative inside the terminal request;
+        // use it to repair a wall-clock discontinuity rather than report a
+        // negative elapsed interval.
+        chrono::Duration::from_std(duration_from_millis(terminal_timing.elapsed_millis))
+            .ok()
+            .and_then(|delta| started.checked_add_signed(delta))
+            .unwrap_or_else(|| started.clone())
     } else {
         terminal_timing.finished_at_utc.clone()
     };
     let elapsed = finished
         .signed_duration_since(started)
         .to_std()
-        .map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "wall-clock-v2 conversion log finish precedes its start",
-            )
-        })?;
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "conversion log finish precedes its start"))?;
 
-    let elapsed_prefix = "Elapsed processing wall time: ";
-    let checkpoint_prefix = "Timing checkpoint (UTC): ";
-    let mut replaced_elapsed = false;
-    let mut replaced_checkpoint = false;
     let had_trailing_newline = log.ends_with('\n');
+    let mut replaced_elapsed = false;
     let mut lines = Vec::new();
     for line in log.lines() {
-        if line.starts_with(elapsed_prefix) {
+        if line.starts_with("Elapsed: ") {
+            lines.push(format!("Elapsed: {}", format_duration_precise(elapsed)));
             lines.push(format!(
-                "Elapsed processing wall time: {}",
-                format_duration_precise(elapsed),
-            ));
-            replaced_elapsed = true;
-        } else if line.starts_with(checkpoint_prefix) {
-            lines.push(format!(
-                "Timing finished (UTC): {}",
+                "Finished (UTC): {}",
                 finished.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             ));
-            replaced_checkpoint = true;
+            replaced_elapsed = true;
         } else {
             lines.push(line.to_string());
         }
     }
-    if !replaced_elapsed || !replaced_checkpoint {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "wall-clock-v2 conversion log timing fields changed during finalization",
-        ));
+    if !replaced_elapsed {
+        return Ok(None);
     }
-
     let mut finalized = lines.join("\n");
     if had_trailing_newline {
         finalized.push('\n');
@@ -26395,43 +24273,8 @@ fn track_display_label(record: &TrackRecord, prepared: Option<&PreparedTrack>) -
     }
 }
 
-fn command_line_label(command: &CommandRecord) -> String {
-    let mut parts = Vec::with_capacity(command.sanitized_args.len() + 1);
-    parts.push(command.binary.default_name().to_string());
-    parts.extend(
-        command
-            .sanitized_args
-            .iter()
-            .map(|arg| quote_command_arg(arg)),
-    );
-    parts.join(" ")
-}
 
-fn quote_command_arg(arg: &str) -> String {
-    let arg = escape_log_value(arg);
-    if arg.is_empty() {
-        return "''".to_string();
-    }
-    if arg.chars().all(|ch| {
-        ch.is_ascii_alphanumeric()
-            || matches!(
-                ch,
-                '/' | '.' | '_' | '-' | '=' | ':' | ',' | '+' | '@' | '%'
-            )
-    }) {
-        return arg;
-    }
-    format!("'{}'", arg.replace('\'', "'\\''"))
-}
 
-fn process_exit_label(exit: Option<super::tool::ProcessExit>) -> String {
-    match exit {
-        Some(super::tool::ProcessExit::Code(0)) => "exit 0".to_string(),
-        Some(super::tool::ProcessExit::Code(code)) => format!("exit {code} (error)"),
-        Some(super::tool::ProcessExit::Signal(signal)) => format!("killed by signal {signal}"),
-        Some(super::tool::ProcessExit::Unknown) | None => "exit unknown".to_string(),
-    }
-}
 
 fn outcome_result_label(
     outcome: &AlbumOutcome,
@@ -26483,27 +24326,7 @@ fn pipeline_stage_label(stage: PipelineStage) -> &'static str {
     }
 }
 
-fn stage_outcome_label(outcome: &StageOutcome) -> String {
-    match outcome {
-        StageOutcome::Ok => "Ok".to_string(),
-        StageOutcome::OkWithDetail(detail) => {
-            format!("Ok ({})", escape_log_value(detail))
-        }
-        StageOutcome::NotRequested => "Not requested".to_string(),
-        StageOutcome::Skipped => "Skipped".to_string(),
-        StageOutcome::SkippedWithReason(reason) => {
-            format!("Skipped ({})", escape_log_value(reason))
-        }
-        StageOutcome::Failed(error) => format!("Failed ({})", escape_log_value(error)),
-    }
-}
 
-fn stage_requirement_label(requirement: StageRequirement) -> &'static str {
-    match requirement {
-        StageRequirement::Enabled => "Enabled",
-        StageRequirement::Disabled => "Disabled",
-    }
-}
 
 fn source_kind_label(kind: SourceKind) -> &'static str {
     match kind {
@@ -26517,207 +24340,6 @@ fn source_kind_label(kind: SourceKind) -> &'static str {
     }
 }
 
-fn track_source_ref_label(source_ref: &TrackSourceRef) -> String {
-    match source_ref {
-        TrackSourceRef::StagedFile(path) => format!("staged file {}", path_log_value(path)),
-        TrackSourceRef::DsdTruePeakCarrier {
-            path,
-            source_path,
-            sample_rate_hz,
-            channels,
-            ..
-        } => format!(
-            "album-gain raw Float64 carrier {} ({sample_rate_hz} Hz, {channels}ch; DSD authority {})",
-            path_log_value(path),
-            path_log_value(source_path),
-        ),
-        TrackSourceRef::DsdReferenceAutoGainCarrier {
-            path,
-            source_path,
-            sample_rate_hz,
-            channels,
-            ..
-        } => format!(
-            "Reference auto-gain raw Float64 carrier {} ({sample_rate_hz} Hz, {channels}ch; DSD authority {})",
-            path_log_value(path),
-            path_log_value(source_path),
-        ),
-        TrackSourceRef::PcmTruePeakCarrier {
-            path,
-            source_path,
-            sample_rate_hz,
-            channels,
-            gain_db,
-            point_dbtp,
-            effective_target_dbtp,
-            lossy_target_capped,
-            ..
-        } => format!(
-            "PCM true-peak raw Float64 carrier {} ({sample_rate_hz} Hz, {channels}ch; source {}; target {} dBTP; point {}; gain {}; lossy cap {})",
-            path_log_value(path),
-            path_log_value(source_path),
-            effective_target_dbtp.render(false),
-            point_dbtp
-                .map(|value| value.render(false))
-                .unwrap_or_else(|| "silence".to_string()),
-            gain_db
-                .map(|value| value.render(false))
-                .unwrap_or_else(|| "pending album authority".to_string()),
-            if *lossy_target_capped { "yes" } else { "no" },
-        ),
-        TrackSourceRef::RegisteredEffectCarrier {
-            path,
-            source_path,
-            sample_rate_hz,
-            channels,
-            source_was_dsd,
-            ..
-        } => format!(
-            "registered-effect raw Float64 carrier {} ({sample_rate_hz} Hz, {channels}ch; source {}; source domain {})",
-            path_log_value(path),
-            path_log_value(source_path),
-            if *source_was_dsd { "DSD" } else { "PCM" },
-        ),
-        TrackSourceRef::CueStreamSegment {
-            fallback_path,
-            source_image,
-            decode_path,
-            start_sample,
-            samples,
-            carrier,
-            channels,
-            ..
-        } => format!(
-            "streamable CUE segment source {} via {} ({:?}, {channels}ch, start sample {start_sample}, {samples} samples; lazy fallback {})",
-            path_log_value(source_image),
-            path_log_value(decode_path),
-            carrier,
-            path_log_value(fallback_path)
-        ),
-        TrackSourceRef::CueSegmentCarrier {
-            path,
-            source_image,
-            start_sample,
-            samples,
-            carrier,
-        } => format!(
-            "typed CUE segment carrier {} ({:?}, source {}, start sample {start_sample}, {samples} samples)",
-            path_log_value(path),
-            carrier,
-            path_log_value(source_image)
-        ),
-        TrackSourceRef::EmbeddedChapterCarrier {
-            path,
-            source_image,
-            start_sample,
-            samples,
-            carrier,
-        } => format!(
-            "embedded-chapter PCM carrier {} ({:?}, source {}, start sample {start_sample}, {samples} samples)",
-            path_log_value(path),
-            carrier,
-            path_log_value(source_image)
-        ),
-        TrackSourceRef::ImageSegment {
-            image,
-            start_sample,
-            samples,
-        } => format!(
-            "image segment {} (start sample {start_sample}, {samples} samples)",
-            path_log_value(image)
-        ),
-        TrackSourceRef::SacdTrack {
-            iso,
-            track_index,
-            area,
-        } => format!(
-            "SACD track {} from {} ({:?})",
-            track_index + 1,
-            path_log_value(iso),
-            area
-        ),
-        TrackSourceRef::DvdVideoTrack {
-            source,
-            vts_number,
-            title_number,
-            angle_number,
-            chapter_number,
-            audio_stream_index,
-            audio_coding,
-            ..
-        } => format!(
-            "DVD-Video VTS {vts_number} title {title_number} angle {angle_number} chapter {chapter_number} stream {} ({}) from {}",
-            crate::disc::model::dvd_video_audio_stream_display_number(*audio_stream_index),
-            audio_coding.label(),
-            path_log_value(source)
-        ),
-        TrackSourceRef::BluRayTrack {
-            source,
-            playlist_number,
-            title_index,
-            angle_number,
-            chapter_number,
-            audio_pid,
-            audio_stream_index,
-            audio_coding,
-            ..
-        } => format!(
-            "Blu-ray playlist {playlist_number:05} title index {title_index} angle {angle_number} chapter {chapter_number} stream {} PID 0x{audio_pid:04x} ({}) from {}",
-            crate::disc::model::blu_ray_audio_stream_display_number(*audio_stream_index),
-            audio_coding.label(),
-            path_log_value(source)
-        ),
-        TrackSourceRef::DvdaTrack {
-            volume_source,
-            group_nr,
-            title_set_nr,
-            title_ordinal,
-            group_track_ordinal,
-            ats_track_nr,
-            samg_track_nr,
-            samg_ordinal,
-            sector_address_space,
-            ..
-        } => match sector_address_space {
-            DvdaSectorAddressSpace::AtsAobRelative { .. } => format!(
-                "DVD-Audio group {group_nr} track {group_track_ordinal} ATS {} title {} chapter {} from {}",
-                title_set_nr
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "unknown".to_string()),
-                title_ordinal
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "unknown".to_string()),
-                ats_track_nr
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "unknown".to_string()),
-                path_log_value(volume_source.original_container())
-            ),
-            DvdaSectorAddressSpace::DiscAbsolute { .. } => format!(
-                "DVD-Audio group {group_nr} track {group_track_ordinal} disc-absolute ATS {} title {} chapter {} from {}",
-                title_set_nr
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "unknown".to_string()),
-                title_ordinal
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "unknown".to_string()),
-                ats_track_nr
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "unknown".to_string()),
-                path_log_value(volume_source.original_container())
-            ),
-            DvdaSectorAddressSpace::SamgAbsolute => format!(
-                "DVD-Audio group {group_nr} track {group_track_ordinal} SAMG track {} ordinal {} from {}",
-                samg_track_nr
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "unknown".to_string()),
-                samg_ordinal
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "unknown".to_string()),
-                path_log_value(volume_source.original_container())
-            ),
-        },
-    }
-}
 
 fn push_kv_line(log: &mut String, label: &str, value: impl AsRef<str>) {
     log.push_str(label);
@@ -26729,6 +24351,62 @@ fn push_kv_line(log: &mut String, label: &str, value: impl AsRef<str>) {
 fn push_optional_kv_line(log: &mut String, label: &str, value: Option<&str>) {
     if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
         push_kv_line(log, label, value);
+    }
+}
+
+/// Project ordered set-valued metadata into the scalar human conversion-log
+/// field without discarding value boundaries. A single value keeps the legacy
+/// presentation. Multiple values use JSON-array syntax so delimiters inside a
+/// value, duplicates, ordering, quotes, and control characters remain
+/// distinguishable in the evidence log.
+fn conversion_log_metadata_values(values: &MetadataValueList) -> Option<String> {
+    match values.values() {
+        [] => None,
+        [value] => Some(value.clone()),
+        multiple => Some(
+            serde_json::to_string(multiple)
+                .expect("serializing an in-memory string slice to JSON cannot fail"),
+        ),
+    }
+}
+
+fn dsd_album_gain_decision_label(
+    track: &PreparedTrack,
+    req: &PipelineRequest,
+) -> Option<String> {
+    let gain_db = req.settings.dsd.runtime_album_gain_db()?;
+    let scope = match (
+        req.settings.dsd.runtime_album_track_count(),
+        req.settings.dsd.runtime_album_loudest_peak_dbfs(),
+    ) {
+        (Some(track_count), Some(loudest)) => format!(
+            "{track_count} measured DSD track(s), loudest true peak {} dBTP",
+            loudest.render(false),
+        ),
+        (Some(track_count), None) => format!("{track_count} verified-silent DSD track(s)"),
+        _ => "submitted DSD batch".to_string(),
+    };
+
+    match &track.source_ref {
+        TrackSourceRef::DsdTruePeakCarrier { .. } => {
+            let target = req
+                .settings
+                .dsd
+                .album_true_peak_target_dbtp()
+                .map(|value| value.render(false))
+                .unwrap_or_else(|| "unknown".to_string());
+            Some(format!(
+                "submitted-batch DSD true-peak album gain {} dB ({scope}; target {} dBTP)",
+                gain_db.render(true),
+                target,
+            ))
+        }
+        TrackSourceRef::DsdReferenceAutoGainCarrier { target_dbtp, .. } => Some(format!(
+            "submitted-batch DSD Reference album gain {} dB ({scope}; target {} dBTP)",
+            gain_db.render(true),
+            target_dbtp.render(false),
+        )),
+        _ => None,
     }
 }
 
@@ -26836,13 +24514,6 @@ fn normalize_extra_key(key: &str) -> String {
         .collect()
 }
 
-fn yes_no(value: bool) -> &'static str {
-    if value {
-        "Yes"
-    } else {
-        "No"
-    }
-}
 
 fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
@@ -29644,18 +27315,39 @@ fn write_incremental_manifest(
 // Durable log  (PR 6 body; PR 4 ships a minimal interim body)
 // ===========================================================================
 
-/// Write the interim durable JSON report used by PR 4.
+/// Write the intentionally portable structured execution record.
+///
+/// This is not a dump of `PipelineReport`: command diagnostics and arbitrary
+/// internal fields stay private, while semantic operation evidence, sanitized
+/// argv/environment, bounded retry history, delivery facts, and typed action
+/// outcomes remain available for audit/reconstruction.
 pub fn write_durable_log(report: &PipelineReport, log: &LogPolicy) -> Result<PathBuf, LogError> {
     fs::create_dir_all(&log.root).map_err(LogError::Io)?;
     let job = sanitize_component(&report.request.job_id);
     let item = sanitize_component(&report.request.item_id);
     let path = log.root.join(format!("{job}-{item}.json"));
-    let mut report_to_write = report.clone();
-    report_to_write.durable_log = Some(path.clone());
-    let bytes = serde_json::to_vec_pretty(&report_to_write)
+    let portable = super::execution_evidence::portable_execution_record(report);
+    let bytes = serde_json::to_vec_pretty(&portable)
         .map_err(|err| LogError::Serialization(err.to_string()))?;
     write_bytes_atomically(&path, &bytes).map_err(LogError::Io)?;
     Ok(path)
+}
+
+pub(crate) fn refresh_portable_durable_log_best_effort(report: &PipelineReport) {
+    let Some(path) = report.durable_log.as_deref() else {
+        return;
+    };
+    let portable = super::execution_evidence::portable_execution_record(report);
+    let bytes = match serde_json::to_vec_pretty(&portable) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            log::warn!("could not serialize refreshed execution evidence at {}: {error}", path.display());
+            return;
+        }
+    };
+    if let Err(error) = write_bytes_atomically(path, &bytes) {
+        log::warn!("could not refresh execution evidence with retry history at {}: {error}", path.display());
+    }
 }
 
 // ===========================================================================
@@ -38430,6 +36122,7 @@ mod protected_ssrc_runtime_tests {
             realized_input: None,
             output_file: None,
             commands: Vec::new(),
+            execution_evidence: Default::default(),
             bytes_in: None,
             bytes_out: None,
             duration: None,
@@ -40314,6 +38007,7 @@ async fn prepare_registered_effect_carrier_for_track(
     tool_paths: &HashMap<String, PathBuf>,
     tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
     preparation_commands: &mut Vec<CommandRecord>,
+    preparation_evidence: &mut TrackExecutionEvidence,
 ) -> Result<PreparedTrack, String> {
     if req.registered_effects.is_empty() {
         return Ok(track);
@@ -40567,7 +38261,11 @@ async fn prepare_registered_effect_carrier_for_track(
         )
         .await;
         match base_execution {
-            Ok(executed) => preparation_commands.extend(executed.commands),
+            Ok(executed) => {
+                let offset = preparation_commands.len();
+                preparation_evidence.append(executed.execution_evidence, offset);
+                preparation_commands.extend(executed.commands);
+            },
             Err(error) => {
                 let message = error.to_string();
                 preparation_commands.extend(error.commands);
@@ -40582,6 +38280,8 @@ async fn prepare_registered_effect_carrier_for_track(
     }
 
     let mut representation = RegisteredEffectCarrierRepresentation::RawFloat64;
+    let mut effect_invocation_indices = Vec::with_capacity(req.registered_effects.len());
+    let mut resampler_invocation_index = None;
     if let Some(resampler) = execution.resampler.as_ref() {
         if source_is_dsd {
             unreachable!("DSD resampler was rejected above");
@@ -40605,6 +38305,7 @@ async fn prepare_registered_effect_carrier_for_track(
                 cancel,
                 tool_concurrency_limits.as_ref(),
                 preparation_commands,
+                &mut effect_invocation_indices,
             )
             .await
             .map_err(|error| {
@@ -40627,6 +38328,7 @@ async fn prepare_registered_effect_carrier_for_track(
             &resampled_path,
             source.duration,
         )?;
+        let selected_resampler_invocation_index = preparation_commands.len();
         run_recorded_planned_command(
             &planned,
             runner,
@@ -40642,6 +38344,7 @@ async fn prepare_registered_effect_carrier_for_track(
                 track.id.source_ordinal, resampler.selected.identity,
             )
         })?;
+        resampler_invocation_index = Some(selected_resampler_invocation_index);
         if let Err(error) = fs::remove_file(&carrier_path) {
             if error.kind() != std::io::ErrorKind::NotFound {
                 let _ = fs::remove_file(&resampled_path);
@@ -40676,6 +38379,7 @@ async fn prepare_registered_effect_carrier_for_track(
                 cancel,
                 tool_concurrency_limits.as_ref(),
                 preparation_commands,
+                &mut effect_invocation_indices,
             )
             .await
             .map_err(|error| {
@@ -40709,6 +38413,7 @@ async fn prepare_registered_effect_carrier_for_track(
             cancel,
             tool_concurrency_limits.as_ref(),
             preparation_commands,
+            &mut effect_invocation_indices,
         )
         .await
         .map_err(|error| {
@@ -40748,6 +38453,16 @@ async fn prepare_registered_effect_carrier_for_track(
         }
     }
 
+    let mut semantic_effect_evidence = completed_registered_effects_from_plan(
+        &plan_request,
+        &req.registered_effects,
+        &effect_invocation_indices,
+        resampler_invocation_index,
+    )
+    .map_err(|error| format!("could not project completed registered-effect evidence: {error}"))?;
+    annotate_deemphasis_execution_evidence(req, &mut semantic_effect_evidence);
+    preparation_evidence.append(semantic_effect_evidence, 0);
+
     track.source_ref = TrackSourceRef::RegisteredEffectCarrier {
         path: carrier_path,
         source_path: original_source_path,
@@ -40777,6 +38492,7 @@ async fn prepare_track_scoped_certified_true_peak_carrier(
     tool_paths: &HashMap<String, PathBuf>,
     tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
     preparation_commands: &mut Vec<CommandRecord>,
+    preparation_evidence: &mut TrackExecutionEvidence,
 ) -> Result<PreparedTrack, String> {
     if !track_scoped_certified_true_peak_requested(req, &track) {
         let source_is_dsd = prepared_track_uses_dsd_source(&track);
@@ -40796,6 +38512,7 @@ async fn prepare_track_scoped_certified_true_peak_carrier(
                 tool_paths,
                 tool_concurrency_limits,
                 preparation_commands,
+                preparation_evidence,
             )
             .await;
         }
@@ -40870,6 +38587,74 @@ async fn prepare_track_scoped_certified_true_peak_carrier(
     }
     track.source_ref = carrier.source_ref;
     Ok(track)
+}
+
+
+fn annotate_deemphasis_execution_evidence(
+    req: &PipelineRequest,
+    evidence: &mut TrackExecutionEvidence,
+) {
+    if !evidence.operations.iter().any(|operation| operation.kind == "cd_deemphasis") {
+        return;
+    }
+    let decision_id = "deemphasis-selection".to_string();
+    let authority = match req.deemphasis_choice_origin {
+        DeemphasisChoiceOrigin::User => DecisionAuthority::User,
+        DeemphasisChoiceOrigin::Preset => DecisionAuthority::Preset,
+        DeemphasisChoiceOrigin::Automatic => DecisionAuthority::AutomaticPolicy,
+    };
+    evidence.decisions.retain(|decision| decision.id != decision_id);
+    let mut observation_ids = Vec::new();
+    let observation = match req.deemphasis_evidence_origin {
+        DeemphasisEvidenceOrigin::None => None,
+        DeemphasisEvidenceOrigin::ExplicitTag => Some(ObservationRecord {
+            id: "deemphasis-source-evidence".to_string(),
+            kind: "pre_emphasis_tag".to_string(),
+            name: "PRE_EMPHASIS".to_string(),
+            value: Some(EvidenceValue::Text("1".to_string())),
+            source: "source metadata".to_string(),
+        }),
+        DeemphasisEvidenceOrigin::CueFlag => Some(ObservationRecord {
+            id: "deemphasis-source-evidence".to_string(),
+            kind: "cue_pre_emphasis_flag".to_string(),
+            name: "FLAGS PRE".to_string(),
+            value: Some(EvidenceValue::Bool(true)),
+            source: "CUE sheet".to_string(),
+        }),
+        DeemphasisEvidenceOrigin::CatalogExact => Some(ObservationRecord {
+            id: "deemphasis-source-evidence".to_string(),
+            kind: "catalog_pre_emphasis_match".to_string(),
+            name: "Pre-emphasis catalog match".to_string(),
+            value: Some(EvidenceValue::Bool(true)),
+            source: "catalog advisory".to_string(),
+        }),
+    };
+    if let Some(observation) = observation {
+        observation_ids.push(observation.id.clone());
+        evidence
+            .observations
+            .retain(|existing| existing.id != observation.id);
+        evidence.observations.push(observation);
+    }
+    evidence.decisions.push(DecisionRecord {
+        id: decision_id.clone(),
+        kind: "deemphasis_selection".to_string(),
+        summary: "Apply CD de-emphasis".to_string(),
+        authority,
+        observation_ids: observation_ids.clone(),
+    });
+    for operation in &mut evidence.operations {
+        if operation.kind == "cd_deemphasis" {
+            if !operation.decision_ids.contains(&decision_id) {
+                operation.decision_ids.push(decision_id.clone());
+            }
+            for observation_id in &observation_ids {
+                if !operation.observation_ids.contains(observation_id) {
+                    operation.observation_ids.push(observation_id.clone());
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41321,6 +39106,7 @@ async fn realize_registered_effect_chain(
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
 ) -> Result<Duration, String> {
     let mut ignored_commands = Vec::new();
+    let mut ignored_effect_invocation_indices = Vec::new();
     realize_registered_effect_chain_impl(
         lowerings,
         sample_rate_hz,
@@ -41335,6 +39121,7 @@ async fn realize_registered_effect_chain(
         cancel,
         tool_concurrency_limits,
         &mut ignored_commands,
+        &mut ignored_effect_invocation_indices,
         false,
         false,
     )
@@ -41355,6 +39142,7 @@ async fn realize_registered_effect_chain_recorded(
     cancel: &CancellationToken,
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
     recorded_commands: &mut Vec<CommandRecord>,
+    effect_invocation_indices: &mut Vec<usize>,
 ) -> Result<Duration, String> {
     realize_registered_effect_chain_impl(
         lowerings,
@@ -41370,6 +39158,7 @@ async fn realize_registered_effect_chain_recorded(
         cancel,
         tool_concurrency_limits,
         recorded_commands,
+        effect_invocation_indices,
         true,
         false,
     )
@@ -41393,6 +39182,7 @@ async fn realize_registered_effect_chain_impl(
     cancel: &CancellationToken,
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
     recorded_commands: &mut Vec<CommandRecord>,
+    effect_invocation_indices: &mut Vec<usize>,
     record_commands: bool,
     allow_ordinary_sox_pair_fusion: bool,
 ) -> Result<Duration, String> {
@@ -41437,6 +39227,7 @@ async fn realize_registered_effect_chain_impl(
                 expected_duration,
                 "Phase-3 fused ordinary SoX high/low-pass pair",
             )?;
+            let invocation_index = recorded_commands.len();
             let elapsed_result = if record_commands {
                 run_recorded_planned_command(
                     &planned,
@@ -41460,6 +39251,9 @@ async fn realize_registered_effect_chain_impl(
                     let _ = fs::remove_file(&next);
                     format!("registered fused effect pair failed: {error}")
                 })?;
+            if record_commands {
+                effect_invocation_indices.extend([invocation_index, invocation_index]);
+            }
             let len = fs::metadata(&next)
                 .map_err(|error| format!("could not stat registered fused effect output {}: {error}", next.display()))?
                 .len();
@@ -41550,6 +39344,7 @@ async fn realize_registered_effect_chain_impl(
             channels,
             expected_duration,
         )?;
+        let invocation_index = recorded_commands.len();
         let effect_result = if record_commands {
             run_recorded_planned_command(
                 &planned,
@@ -41573,6 +39368,9 @@ async fn realize_registered_effect_chain_impl(
                 let _ = fs::remove_file(&next);
                 format!("registered effect {} failed: {error}", index + 1)
             })?;
+        if record_commands {
+            effect_invocation_indices.push(invocation_index);
+        }
         let len = fs::metadata(&next)
             .map_err(|error| format!("could not stat registered effect output {}: {error}", next.display()))?
             .len();
@@ -44081,6 +41879,49 @@ async fn finalize_cue_stream_consumer_output(
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
 ) -> ScheduledTrackOutput {
     let metadata_satisfaction = plan.metadata_satisfaction;
+    let consumer_elapsed = consumer_output.elapsed;
+    let mut consumer_record = consumer_output.command;
+    consumer_record.description = Some(format!(
+        "Direct encode from shared CUE PCM stream for track {}",
+        input.track.id.source_ordinal
+    ));
+
+    // The consumer has already completed before any finalization/sample check
+    // below. Freeze that fact now so a later verification failure cannot erase
+    // the successful invocation or masquerade it as never attempted.
+    let mut completed_evidence = TrackExecutionEvidence::default();
+    let mut decode = OperationRecord::completed(
+        "shared-cue-decode",
+        "shared_cue_decode",
+        "Decode shared CUE image",
+        super::execution_evidence::ExecutionBackend::external(producer_record.binary.default_name()),
+    );
+    decode.inputs.push(super::execution_evidence::EvidenceArtifactRef::path(
+        "shared-source-image",
+        source_decode_path,
+    ));
+    decode.invocation_indices.push(0);
+    completed_evidence.operations.push(decode);
+    let mut consumer_evidence = super::execution_evidence::completed_plan_evidence_or_fallback(
+        &plan.semantic_plan_request,
+        std::slice::from_ref(&consumer_record),
+    );
+    if consumer_evidence.operations.is_empty() {
+        let mut encode = OperationRecord::completed(
+            "shared-cue-consumer",
+            "encode_output",
+            "Encode track output",
+            super::execution_evidence::ExecutionBackend::external(consumer_record.binary.default_name()),
+        );
+        encode.outputs.push(super::execution_evidence::EvidenceArtifactRef::path(
+            "staged-output",
+            &staged_path,
+        ));
+        encode.invocation_indices.push(0);
+        consumer_evidence.operations.push(encode);
+    }
+    completed_evidence.append(consumer_evidence, 1);
+
     let output = async {
         finalize_cue_stream_direct_track_plan(&plan)?;
         let bytes_out = file_len(&staged_path);
@@ -44121,21 +41962,41 @@ async fn finalize_cue_stream_consumer_output(
                 .and_then(|value| value.checked_mul(carrier.bytes_per_sample())),
             _ => None,
         };
-        let mut consumer_record = consumer_output.command;
-        consumer_record.description = Some(format!(
-            "Direct encode from shared CUE PCM stream for track {}",
-            input.track.id.source_ordinal
-        ));
+        let mut evidence = completed_evidence.clone();
+        if let Some(bytes) = bytes_in {
+            evidence.sizes.push(SizeEvidence {
+                domain: SizeDomain::WorkingArtifact,
+                bytes,
+                path: None,
+                note: Some("selected shared-CUE decoded PCM extent; not original stored bytes".to_string()),
+            });
+        }
+        if let Some(bytes) = bytes_out {
+            evidence.sizes.push(SizeEvidence {
+                domain: SizeDomain::StagedArtifact,
+                bytes,
+                path: Some(staged_path.clone()),
+                note: Some("staged encoded artifact before publication".to_string()),
+            });
+        }
+        evidence.verifications.push(VerificationRecord {
+            id: "post-encode-validation".to_string(),
+            kind: "post_encode_validation".to_string(),
+            statement: "Encoded output passed post-encode validation".to_string(),
+            status: VerificationStatus::Passed,
+            invocation_indices: Vec::new(),
+        });
         let record = TrackRecord {
             track_id: input.track.id.clone(),
             outcome: TrackOutcome::Ok,
             source_ref: input.track.source_ref.clone(),
             realized_input: None,
             output_file: Some(staged_path.clone()),
-            commands: vec![producer_record.clone(), consumer_record],
+            commands: vec![producer_record.clone(), consumer_record.clone()],
+            execution_evidence: evidence,
             bytes_in,
             bytes_out,
-            duration: Some(consumer_output.elapsed),
+            duration: Some(consumer_elapsed),
             verified_output_bit_depth: validation.measured_depth,
             dsd_dst_stats: None,
         };
@@ -44165,19 +42026,31 @@ async fn finalize_cue_stream_consumer_output(
             ok: true,
             metadata_satisfaction,
         },
-        Err(error) => ScheduledTrackOutput {
-            index: input.index,
-            record: failed_track_record(
-                &input.track,
-                None,
-                Some(staged_path),
-                vec![producer_record.clone()],
-                error.to_string(),
-            ),
-            artifact: None,
-            ok: false,
-            metadata_satisfaction: PlannedMetadataSatisfaction::none(),
-        },
+        Err(error) => {
+            let mut evidence = completed_evidence;
+            evidence.verifications.push(VerificationRecord {
+                id: "post-consumer-finalization".to_string(),
+                kind: "post_consumer_finalization".to_string(),
+                statement: "Completed consumer output passed finalization and validation".to_string(),
+                status: VerificationStatus::Failed,
+                invocation_indices: Vec::new(),
+            });
+            evidence.mark_discarded_attempt();
+            ScheduledTrackOutput {
+                index: input.index,
+                record: failed_track_record_with_execution_evidence(
+                    &input.track,
+                    None,
+                    Some(staged_path),
+                    vec![producer_record.clone(), consumer_record],
+                    error.to_string(),
+                    evidence,
+                ),
+                artifact: None,
+                ok: false,
+                metadata_satisfaction: PlannedMetadataSatisfaction::none(),
+            }
+        }
     }
 }
 
@@ -44831,6 +42704,7 @@ pub async fn realize_track_for_scheduler_with_tool_limits_and_version_cache(
     let runner = real_tool_runner_with_optional_version_cache(tool_paths.clone(), version_cache, &req);
     let staged_path = staged_audio_path(&convert_root, &final_path, &track.id, &req.settings.target_format);
     let mut preparation_commands = Vec::new();
+    let mut preparation_evidence = TrackExecutionEvidence::default();
     let track = match prepare_track_scoped_certified_true_peak_carrier(
         &req,
         track.clone(),
@@ -44841,6 +42715,7 @@ pub async fn realize_track_for_scheduler_with_tool_limits_and_version_cache(
         &tool_paths,
         tool_concurrency_limits.clone(),
         &mut preparation_commands,
+        &mut preparation_evidence,
     )
     .await
     {
@@ -44894,6 +42769,8 @@ pub async fn realize_track_for_scheduler_with_tool_limits_and_version_cache(
                 realized_path: realized.path,
                 realized_dsd_dst_stats: realized.dsd_dst_stats,
                 scalar_pump: realized.scalar_pump,
+                materialized_scalar: realized.materialized_scalar,
+                preparation_evidence,
                 preparation_commands,
                 req,
                 staging_root,
@@ -44993,6 +42870,7 @@ pub async fn encode_realized_track_for_scheduler_with_tool_limits_and_version_ca
             path: realized.realized_path.clone(),
             dsd_dst_stats: realized.realized_dsd_dst_stats.clone(),
             scalar_pump: realized.scalar_pump.clone(),
+            materialized_scalar: realized.materialized_scalar.clone(),
         },
         &realized.convert_root,
         &runner,
@@ -45026,6 +42904,7 @@ pub async fn encode_realized_track_for_scheduler_with_tool_limits_and_version_ca
         planner_track,
         realized_input,
         scalar_pump,
+        materialized_scalar,
         certified_true_peak_execution,
         prefix_commands: final_prefix_commands,
         prefix_elapsed: final_prefix_elapsed,
@@ -45054,10 +42933,31 @@ pub async fn encode_realized_track_for_scheduler_with_tool_limits_and_version_ca
 
     match executed {
         Ok(executed) => {
+            let mut completed_execution_evidence = realized.preparation_evidence.clone();
+            completed_execution_evidence.append(executed.execution_evidence.clone(), prefix_commands.len());
+            if let Some(materialized_scalar) = materialized_scalar.as_ref() {
+                record_native_scalar_materialization(&mut completed_execution_evidence, materialized_scalar);
+            }
             let bytes_out = file_len(&staged_path);
+            record_track_size_evidence(
+                &mut completed_execution_evidence,
+                &realized_input,
+                &staged_path,
+                bytes_in,
+                bytes_out,
+            );
             if bytes_out.unwrap_or(0) == 0 {
                 let error = format!("planner did not produce output: {}", staged_path.display());
-                let record = failed_track_record(
+                let mut failure_evidence = completed_execution_evidence.clone();
+                failure_evidence.verifications.push(VerificationRecord {
+                    id: "nonempty-output".to_string(),
+                    kind: "output_nonempty".to_string(),
+                    statement: "Encoded output is nonempty".to_string(),
+                    status: VerificationStatus::Failed,
+                    invocation_indices: Vec::new(),
+                });
+                failure_evidence.mark_discarded_attempt();
+                let record = failed_track_record_with_execution_evidence(
                     &realized.track,
                     Some(realized_input.clone()),
                     Some(staged_path),
@@ -45067,6 +42967,7 @@ pub async fn encode_realized_track_for_scheduler_with_tool_limits_and_version_ca
                         commands
                     },
                     error,
+                    failure_evidence,
                 );
                 Ok(ScheduledTrackOutput { index: realized.index, record, artifact: None, ok: false, metadata_satisfaction: PlannedMetadataSatisfaction::none() })
             } else {
@@ -45083,13 +42984,24 @@ pub async fn encode_realized_track_for_scheduler_with_tool_limits_and_version_ca
                     Ok(samples) => samples,
                     Err(err) => {
                         let mut commands = prefix_commands.clone();
+                        commands.extend(executed.commands.clone());
                         commands.extend(command_from_convert_error(&err));
-                        let record = failed_track_record(
+                        let mut failure_evidence = completed_execution_evidence.clone();
+                        failure_evidence.verifications.push(VerificationRecord {
+                            id: "expected-samples".to_string(),
+                            kind: "expected_samples".to_string(),
+                            statement: "Expected post-encode sample extent was established".to_string(),
+                            status: VerificationStatus::Failed,
+                            invocation_indices: Vec::new(),
+                        });
+                        failure_evidence.mark_discarded_attempt();
+                        let record = failed_track_record_with_execution_evidence(
                             &realized.track,
                             Some(realized_input.clone()),
                             Some(staged_path),
                             commands,
                             err.to_string(),
+                            failure_evidence,
                         );
                         return Ok(ScheduledTrackOutput { index: realized.index, record, artifact: None, ok: false, metadata_satisfaction: PlannedMetadataSatisfaction::none() });
                     }
@@ -45109,18 +43021,36 @@ pub async fn encode_realized_track_for_scheduler_with_tool_limits_and_version_ca
                     Ok(validation) => validation,
                     Err(err) => {
                         let mut commands = prefix_commands.clone();
+                        commands.extend(executed.commands.clone());
                         commands.extend(command_from_convert_error(&err));
-                        let record = failed_track_record(
+                        let mut failure_evidence = completed_execution_evidence.clone();
+                        failure_evidence.verifications.push(VerificationRecord {
+                            id: "post-encode-validation".to_string(),
+                            kind: "post_encode_validation".to_string(),
+                            statement: "Encoded output passed post-encode validation".to_string(),
+                            status: VerificationStatus::Failed,
+                            invocation_indices: Vec::new(),
+                        });
+                        failure_evidence.mark_discarded_attempt();
+                        let record = failed_track_record_with_execution_evidence(
                             &realized.track,
                             Some(realized_input.clone()),
                             Some(staged_path),
                             commands,
                             err.to_string(),
+                            failure_evidence,
                         );
                         return Ok(ScheduledTrackOutput { index: realized.index, record, artifact: None, ok: false, metadata_satisfaction: PlannedMetadataSatisfaction::none() });
                     }
                 };
                 let actual_samples = post_encode_validation.samples;
+                completed_execution_evidence.verifications.push(VerificationRecord {
+                    id: "post-encode-validation".to_string(),
+                    kind: "post_encode_validation".to_string(),
+                    statement: "Encoded output passed post-encode validation".to_string(),
+                    status: VerificationStatus::Passed,
+                    invocation_indices: Vec::new(),
+                });
                 let mut dsd_dst_stats = realized.realized_dsd_dst_stats.clone();
                 merge_optional_dsd_dst_stats(
                     &mut dsd_dst_stats,
@@ -45137,6 +43067,7 @@ pub async fn encode_realized_track_for_scheduler_with_tool_limits_and_version_ca
                     realized_input: Some(realized_input.clone()),
                     output_file: Some(staged_path.clone()),
                     commands,
+                    execution_evidence: completed_execution_evidence,
                     bytes_in,
                     bytes_out,
                     duration: Some(prefix_elapsed.saturating_add(executed.elapsed)),
@@ -45160,14 +43091,23 @@ pub async fn encode_realized_track_for_scheduler_with_tool_limits_and_version_ca
         }
         Err(err) => {
             let error = err.to_string();
+            let invocation_offset = prefix_commands.len();
+            let mut executor_evidence = err.execution_evidence;
+            if executor_evidence == TrackExecutionEvidence::default() && !err.commands.is_empty() {
+                executor_evidence = discarded_attempt_evidence_from_invocations(&err.commands);
+            }
+            let mut failure_evidence = realized.preparation_evidence.clone();
+            failure_evidence.append(executor_evidence, invocation_offset);
+            failure_evidence.mark_discarded_attempt();
             let mut commands = prefix_commands;
             commands.extend(err.commands);
-            let record = failed_track_record(
+            let record = failed_track_record_with_execution_evidence(
                 &realized.track,
                 Some(realized_input),
                 Some(staged_path),
                 commands,
                 error,
+                failure_evidence,
             );
             Ok(ScheduledTrackOutput { index: realized.index, record, artifact: None, ok: false, metadata_satisfaction: PlannedMetadataSatisfaction::none() })
         }
@@ -46097,7 +44037,8 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_scoped_inner(
         disk_staging_parent_for(&disk_req).display(),
         original_error,
     );
-    Box::pin(run_pipeline_item_with_tool_paths_and_tool_limits_once(
+    let prior_attempt = summarize_prior_attempt(&report, format!("scratch storage retry: {original_error}"));
+    let mut retry_report = Box::pin(run_pipeline_item_with_tool_paths_and_tool_limits_once(
         disk_req,
         runner,
         reporter,
@@ -46106,7 +44047,15 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_scoped_inner(
         tool_concurrency_limits,
         &run_timing,
     ))
-    .await
+    .await;
+    let mut attempts = report.prior_attempts.clone();
+    append_prior_attempt_bounded(&mut attempts, prior_attempt);
+    for attempt in std::mem::take(&mut retry_report.prior_attempts) {
+        append_prior_attempt_bounded(&mut attempts, attempt);
+    }
+    retry_report.prior_attempts = attempts;
+    refresh_portable_durable_log_best_effort(&retry_report);
+    retry_report
 }
 
 async fn run_pipeline_item_with_tool_paths_and_tool_limits_once(
@@ -54641,6 +52590,9 @@ fn finalize_published_conversion_log_timing_best_effort(
     published: &mut Option<PublishedAlbum>,
     binding: Option<&PublicationCapabilityBinding>,
     run_timing: &ConversionRunTiming,
+    durable_log: Option<&Path>,
+    action_reports: &[ActionPhaseReport],
+    outcome: &AlbumOutcome,
 ) {
     let Some(album) = published.as_mut() else {
         return;
@@ -54649,6 +52601,12 @@ fn finalize_published_conversion_log_timing_best_effort(
         return;
     }
 
+    let delivered_audio = album
+        .entries
+        .iter()
+        .filter(|entry| matches!(entry.role, PublishRole::Audio))
+        .map(|entry| entry.final_path.clone())
+        .collect::<Vec<_>>();
     let terminal_timing = run_timing.snapshot();
     for entry in album
         .entries
@@ -54662,7 +52620,7 @@ fn finalize_published_conversion_log_timing_best_effort(
             Ok(bytes) => bytes,
             Err(error) => {
                 log::warn!(
-                    "could not read published conversion.log to finalize timing for {} at {}: {error}",
+                    "could not read published conversion.log to finalize report for {} at {}: {error}",
                     req.item_id,
                     entry.final_path.display(),
                 );
@@ -54673,34 +52631,149 @@ fn finalize_published_conversion_log_timing_best_effort(
             Ok(text) => text,
             Err(error) => {
                 log::warn!(
-                    "published conversion.log is not UTF-8 while finalizing timing for {} at {}: {error}",
+                    "published conversion.log is not UTF-8 while finalizing report for {} at {}: {error}",
                     req.item_id,
                     entry.final_path.display(),
                 );
                 continue;
             }
         };
-        let finalized = match finalize_conversion_log_timing_text(&text, &terminal_timing) {
+        let mut finalized = match finalize_conversion_log_timing_text(&text, &terminal_timing) {
             Ok(Some(finalized)) => finalized,
-            Ok(None) => continue,
+            Ok(None) => text,
             Err(error) => {
                 log::warn!(
                     "could not finalize published conversion.log timing for {} at {}: {error}",
                     req.item_id,
                     entry.final_path.display(),
                 );
-                continue;
+                text
             }
         };
+        append_terminal_delivery_evidence_section(
+            &mut finalized,
+            &delivered_audio,
+            durable_log,
+            action_reports,
+            outcome,
+        );
         if let Err(error) = write_bytes_atomically(&runtime_path, finalized.as_bytes()) {
             log::warn!(
-                "could not atomically rewrite published conversion.log timing for {} at {}: {error}",
+                "could not atomically rewrite published conversion.log final report for {} at {}: {error}",
                 req.item_id,
                 entry.final_path.display(),
             );
             continue;
         }
         entry.bytes = u64::try_from(finalized.len()).unwrap_or(u64::MAX);
+    }
+}
+
+fn append_terminal_delivery_evidence_section(
+    log: &mut String,
+    delivered_audio: &[PathBuf],
+    durable_log: Option<&Path>,
+    action_reports: &[ActionPhaseReport],
+    outcome: &AlbumOutcome,
+) {
+    const HEADING: &str = "Delivery & Evidence\n-------------------\n";
+    // Idempotent terminal rewrite: replace a prior terminal section rather than
+    // appending duplicates after restart/recovery.
+    if let Some(index) = log.find(HEADING) {
+        log.truncate(index);
+        while log.ends_with('\n') {
+            log.pop();
+        }
+        log.push_str("\n\n");
+    } else if !log.ends_with("\n\n") {
+        if !log.ends_with('\n') {
+            log.push('\n');
+        }
+        log.push('\n');
+    }
+    log.push_str(HEADING);
+    if delivered_audio.is_empty() {
+        push_kv_line(log, "Published audio", "none recorded");
+    } else {
+        for (index, path) in delivered_audio.iter().enumerate() {
+            push_kv_line(
+                log,
+                if index == 0 { "Published audio" } else { "Published audio (continued)" },
+                path_log_value(path),
+            );
+        }
+    }
+
+    let actions = action_reports
+        .iter()
+        .flat_map(|phase| phase.actions.iter())
+        .collect::<Vec<_>>();
+    if actions.is_empty() {
+        push_kv_line(log, "Post-actions", "none recorded");
+    } else {
+        let failures = actions
+            .iter()
+            .filter(|action| {
+                matches!(
+                    action.status,
+                    super::actions::ActionResultStatus::Failed
+                        | super::actions::ActionResultStatus::Interrupted
+                        | super::actions::ActionResultStatus::ManualRecoveryRequired
+                )
+            })
+            .count();
+        push_kv_line(
+            log,
+            "Post-actions",
+            format!("{} recorded; {failures} failed/interrupted", actions.len()),
+        );
+        let location_may_have_changed = actions.iter().any(|action| {
+            let kind = action.kind.to_ascii_lowercase();
+            matches!(action.status, super::actions::ActionResultStatus::Completed)
+                && (kind.contains("move")
+                    || kind.contains("rename")
+                    || kind.contains("delete")
+                    || kind.contains("script"))
+        });
+        if location_may_have_changed {
+            push_kv_line(
+                log,
+                "Current location",
+                "may differ from the publish-time path after post-actions; see structured action evidence",
+            );
+        }
+    }
+    append_terminal_postprocessing_evidence(log, outcome);
+    match durable_log {
+        Some(path) => push_kv_line(log, "Structured execution evidence", path_log_value(path)),
+        None => push_kv_line(log, "Structured execution evidence", "unavailable"),
+    }
+    log.push('\n');
+}
+
+fn append_terminal_postprocessing_evidence(log: &mut String, outcome: &AlbumOutcome) {
+    for (label, stage_outcome) in [
+        ("Metadata", metadata_stage_outcome(outcome)),
+        ("ReplayGain", replaygain_stage_outcome(outcome)),
+    ] {
+        let Some(stage_outcome) = stage_outcome else {
+            continue;
+        };
+        let value = match stage_outcome {
+            StageOutcome::Ok => "completed".to_string(),
+            StageOutcome::OkWithDetail(detail) => {
+                format!("completed ({})", escape_log_value(detail))
+            }
+            StageOutcome::NotRequested => continue,
+            StageOutcome::Skipped => "skipped".to_string(),
+            StageOutcome::SkippedWithReason(reason) => {
+                format!("skipped ({})", escape_log_value(reason))
+            }
+            StageOutcome::Failed(error) => {
+                format!("failed ({})", escape_log_value(error))
+            }
+        };
+        push_kv_line(log, label, value);
     }
 }
 
@@ -54761,20 +52834,22 @@ async fn finalize_report_with_binding_and_timing(
     binding: Option<PublicationCapabilityBinding>,
     run_timing: Option<&ConversionRunTiming>,
 ) -> PipelineReport {
-    if let Some(run_timing) = run_timing {
-        finalize_published_conversion_log_timing_best_effort(
-            req,
-            &mut published,
-            binding.as_ref(),
-            run_timing,
-        );
-    }
+    let action_reports = collect_durable_action_reports_with_binding(
+        req,
+        source.as_ref(),
+        published.as_ref(),
+        binding.as_ref(),
+    );
 
     let item_id = req.item_id.clone();
     let mut durable_log = None;
     let mut terminal_error_override: Option<String> = None;
     let settings_fingerprint = tonepoet_pipeline::fingerprint::settings_fingerprint(&req.settings);
-    let should_write = req.log.write_json_log
+    // The structured companion is part of the conversion-log contract. The
+    // TUI historically enables the human log independently of JSON logging;
+    // write the portable execution record whenever either output is requested
+    // so removing command transcripts from conversion.log never loses evidence.
+    let should_write = (req.log.write_json_log || req.log.write_conversion_log)
         && match &outcome {
             AlbumOutcome::Complete { .. } | AlbumOutcome::Partial { .. } => true,
             AlbumOutcome::Blocked { .. } => req.log.write_for_blocked,
@@ -54796,7 +52871,8 @@ async fn finalize_report_with_binding_and_timing(
             scratch_retry_intent: None,
             settings_fingerprint: Some(settings_fingerprint),
             manifest_path: pipeline_report_manifest_path(&published),
-            action_reports: collect_durable_action_reports_with_binding(req, source.as_ref(), published.as_ref(), binding.as_ref()),
+            prior_attempts: Vec::new(),
+            action_reports: action_reports.clone(),
         };
         // Write the log alongside the album artifacts when possible,
         // fall back to the configured log root for blocked/failed jobs.
@@ -54844,6 +52920,18 @@ async fn finalize_report_with_binding_and_timing(
         let record = stage_record(PipelineStage::DurableLog, StageOutcome::Skipped);
         push_stage(&mut outcome, record.clone());
         emit_stage_finished(reporter, &item_id, record).await;
+    }
+
+    if let Some(run_timing) = run_timing {
+        finalize_published_conversion_log_timing_best_effort(
+            req,
+            &mut published,
+            binding.as_ref(),
+            run_timing,
+            durable_log.as_deref(),
+            &action_reports,
+            &outcome,
+        );
     }
 
     // Stage failures are already user-visible in the report/TUI, but without a
@@ -54894,7 +52982,6 @@ async fn finalize_report_with_binding_and_timing(
         .emit(PipelineEvent::Terminal { item_id, status })
         .await;
 
-    let action_reports = collect_durable_action_reports_with_binding(req, source.as_ref(), published.as_ref(), binding.as_ref());
     let coordination_io_dir = binding
         .as_ref()
         .and_then(|binding| binding.coordination_dir(req).ok());
@@ -55060,6 +53147,7 @@ async fn finalize_report_with_binding_and_timing(
         scratch_retry_intent: None,
         settings_fingerprint: Some(settings_fingerprint),
         action_reports,
+        prior_attempts: Vec::new(),
     }
 }
 
@@ -57752,16 +55840,6 @@ impl OutputNameShorteningNotice {
         )
     }
 
-    fn log_value(&self) -> String {
-        format!(
-            "{} bytes -> {} bytes (limit {}): {:?} -> {:?}",
-            self.original_bytes,
-            self.shortened.len(),
-            self.limit_bytes,
-            self.original,
-            self.shortened
-        )
-    }
 }
 
 fn utf8_prefix_with_max_bytes(value: &str, max_bytes: usize) -> &str {
@@ -58271,6 +56349,7 @@ fn failed_track_record(
     commands: Vec<CommandRecord>,
     error: String,
 ) -> TrackRecord {
+    let execution_evidence = discarded_attempt_evidence_from_invocations(&commands);
     TrackRecord {
         track_id: track.id.clone(),
         outcome: TrackOutcome::Err(non_empty_error(error)),
@@ -58278,6 +56357,7 @@ fn failed_track_record(
         realized_input,
         output_file,
         commands,
+        execution_evidence,
         bytes_in: None,
         bytes_out: None,
         duration: None,
@@ -58285,6 +56365,45 @@ fn failed_track_record(
         dsd_dst_stats: None,
     }
 }
+
+fn failed_track_record_with_execution_evidence(
+    track: &PreparedTrack,
+    realized_input: Option<PathBuf>,
+    output_file: Option<PathBuf>,
+    commands: Vec<CommandRecord>,
+    error: String,
+    execution_evidence: TrackExecutionEvidence,
+) -> TrackRecord {
+    let mut record = failed_track_record(track, realized_input, output_file, commands, error);
+    record.execution_evidence = execution_evidence;
+    record
+}
+
+fn record_track_size_evidence(
+    evidence: &mut TrackExecutionEvidence,
+    realized_input: &Path,
+    staged_output: &Path,
+    bytes_in: Option<u64>,
+    bytes_out: Option<u64>,
+) {
+    if let Some(bytes) = bytes_in {
+        evidence.sizes.push(SizeEvidence {
+            domain: SizeDomain::WorkingArtifact,
+            bytes,
+            path: Some(realized_input.to_path_buf()),
+            note: Some("realized execution input; not necessarily original source storage".to_string()),
+        });
+    }
+    if let Some(bytes) = bytes_out {
+        evidence.sizes.push(SizeEvidence {
+            domain: SizeDomain::StagedArtifact,
+            bytes,
+            path: Some(staged_output.to_path_buf()),
+            note: Some("staged encoded artifact before publication".to_string()),
+        });
+    }
+}
+
 
 fn non_empty_error(error: String) -> String {
     if error.trim().is_empty() {
@@ -60171,6 +58290,7 @@ fn retryable_scratch_failure_report_without_publication(
         settings_fingerprint: Some(tonepoet_pipeline::fingerprint::settings_fingerprint(&req.settings)),
         manifest_path: None,
         action_reports,
+        prior_attempts: Vec::new(),
     }
 }
 
@@ -61614,7 +59734,7 @@ mod pipeline_test_helpers {
     }
 
     #[test]
-    fn ordinary_lossy_rate_divergence_is_predeclared_and_durable_in_the_summary() {
+    fn ordinary_lossy_rate_divergence_is_predeclared_and_uses_the_effective_rate() {
         let mut source = log_test_source();
         source.tracks.truncate(1);
         let track = &mut source.tracks[0];
@@ -61640,14 +59760,15 @@ mod pipeline_test_helpers {
                 && message.contains("will use")
         }), "{messages:#?}");
 
-        let summary = conversion_summary(&source.tracks[0], &req, None, None);
-        assert!(summary.contains("24-bit/96kHz AAC"), "{summary}");
-        assert!(summary.contains("sample-rate request 192kHz adjusted to 96kHz"), "{summary}");
+        assert_eq!(
+            ordinary_lossy_rate_divergence(&source.tracks[0], &req.settings),
+            Some((192_000, 96_000)),
+        );
 
         // An explicit request can need no physical resample when the source is
-        // already at the fallback rate. The settings summary must still name
-        // the effective 96 kHz delivery rather than contradicting the plan with
-        // the impossible requested 192 kHz.
+        // already at the fallback rate. The production target resolver must
+        // still retain the effective 96 kHz delivery rather than the impossible
+        // requested 192 kHz.
         source.tracks[0].sample_rate = Some(96_000);
         source.tracks[0].source_audio = SourceAudioDescriptor::from_scalar(
             Some(96_000),
@@ -61656,12 +59777,8 @@ mod pipeline_test_helpers {
         );
         req.settings.target_sample_rate = RateTarget::PcmHz(192_000);
         assert_eq!(
-            target_sample_rate_setting_label(&source, &req.settings),
-            "96kHz"
-        );
-        assert_eq!(
-            sample_rate_transition_log_label(&source, &req.settings),
-            "96kHz"
+            resolved_target_rate_hz(&source.tracks[0], &req.settings),
+            Some(96_000),
         );
     }
 
@@ -61745,8 +59862,8 @@ mod pipeline_test_helpers {
             "non-DSD tracks must not receive DSD hard-ceiling headroom disclosure: {messages:#?}",
         );
         assert_eq!(
-            target_sample_rate_setting_label(&source, &req.settings),
-            "96kHz"
+            resolved_target_rate_hz(&source.tracks[0], &req.settings),
+            Some(96_000),
         );
     }
 
@@ -61822,53 +59939,6 @@ mod pipeline_test_helpers {
             "sub-millidB no-dither reserve should remain in the durable log without creating a noisy preflight warning: {quiet:#?}",
         );
     }
-
-    #[test]
-    fn conversion_summary_records_hard_ceiling_terminal_reserve() {
-        let mut source = log_test_source();
-        source.tracks.truncate(1);
-        let track = &mut source.tracks[0];
-        track.sample_rate = Some(44_100);
-        track.source_audio = SourceAudioDescriptor::from_scalar(
-            Some(44_100),
-            Some(64),
-            Some(SourceAudioCoding::Dsd),
-        );
-        track.bit_depth = Some(64);
-        track.source_ref = TrackSourceRef::DsdTruePeakCarrier {
-            path: PathBuf::from("/stage/album-gain.f64le"),
-            source_path: PathBuf::from("/music/source.dsf"),
-            sample_rate_hz: 44_100,
-            channels: 2,
-            duration: None,
-                    gain_db: Some(tonepoet_pipeline::DbNano::ZERO),
-            point_dbtp: None,
-            effective_target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
-            lossy_target_capped: false,
-            terminal_candidate: None,
-        };
-
-        let mut req = log_test_request();
-        req.settings.target_format = tonepoet_pipeline::AudioFormat::Flac;
-        configure_general_album_hard_ceiling(
-            &mut req,
-            44_100,
-            tonepoet_pipeline::PcmBitDepth::Int16,
-            tonepoet_pipeline::DitherType::HighShibata,
-        );
-        req.settings.dsd.bind_runtime_album_gain(
-            tonepoet_pipeline::DbNano::ZERO,
-            Some("-1.000000000".parse().unwrap()),
-            1,
-        );
-
-        let summary = conversion_summary(track, &req, None, None);
-        assert!(
-            summary.contains("hard-ceiling terminal reserve 0.194444 dB below requested 0.000000000 dBTP"),
-            "{summary}",
-        );
-    }
-
     pub(super) fn log_test_request() -> PipelineRequest {
         PipelineRequest {
             registered_effects: Vec::new(),
@@ -61980,6 +60050,7 @@ mod pipeline_test_helpers {
             realized_input: Some(PathBuf::from("/realized/01.wav")),
             output_file: Some(PathBuf::from("/encoded/01.flac")),
             commands: vec![command_record()],
+            execution_evidence: Default::default(),
             bytes_in: Some(2048),
             bytes_out: Some(1024),
             duration: Some(Duration::from_secs(65)),
@@ -62000,6 +60071,7 @@ mod pipeline_test_helpers {
             realized_input: Some(PathBuf::from("/realized/02.wav")),
             output_file: None,
             commands: vec![],
+            execution_evidence: Default::default(),
             bytes_in: Some(4096),
             bytes_out: None,
             duration: None,
@@ -62745,13 +60817,6 @@ mod conversion_log_tests {
     use super::*;
     use super::pipeline_test_helpers::*;
 
-    fn dsd_settings_with_gain(
-        policy: tonepoet_pipeline::SampleGainPolicy,
-    ) -> tonepoet_pipeline::DsdSettings {
-        let mut settings = tonepoet_pipeline::DsdSettings::default();
-        settings.set_gain_policy(policy);
-        settings
-    }
 
     struct VersionOnlyRunner(HashMap<ToolBinary, String>);
 
@@ -62783,16 +60848,55 @@ mod conversion_log_tests {
 
         assert!(log.contains("TONEPOET CONVERSION LOG"));
         assert!(log.contains("Source Information"));
-        assert!(log.contains("Conversion Settings"));
         assert!(log.contains("Per-Track Results"));
-        assert!(log.contains("Stage Summary"));
         assert!(log.contains("Overall Summary"));
         assert!(log.contains("Job ID: job-1"));
         assert!(log.contains("Item ID: item-1"));
         assert!(log.contains("Catalog number: CAT-123"));
-        assert!(log.contains("Target format: FLAC"));
         assert!(log.contains("Result: Complete"));
-        assert!(log.contains("Log generated by tonepoet"));
+        assert!(log.contains("Log generated by TonePoet"));
+        assert!(!log.contains("Conversion Settings"));
+        assert!(!log.contains("Stage Summary"));
+    }
+
+    #[test]
+    fn conversion_log_preserves_ordered_multivalue_artist_and_composer_boundaries() {
+        let mut source = log_test_source();
+        source.tracks[0].metadata.artist = vec![
+            "Artist; One".to_string(),
+            "Artist Two".to_string(),
+            "Artist; One".to_string(),
+        ]
+        .into();
+        source.tracks[0].metadata.composer = vec![
+            "Composer One".to_string(),
+            "Line\nBreak".to_string(),
+        ]
+        .into();
+
+        assert_eq!(
+            conversion_log_metadata_values(&MetadataValueList::from_scalar("Solo")),
+            Some("Solo".to_string()),
+        );
+        assert_eq!(
+            conversion_log_metadata_values(&MetadataValueList::default()),
+            None,
+        );
+
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![ok_record()],
+            stages: stage_records(),
+        };
+        let log = build_conversion_log(
+            &outcome,
+            &source,
+            &log_test_request(),
+            &log_test_artifacts(),
+            None,
+        );
+
+        assert!(log.contains(r#"Artist: ["Artist; One","Artist Two","Artist; One"]"#));
+        assert!(log.contains(r#"Composer: ["Composer One","Line\nBreak"]"#));
     }
 
     #[test]
@@ -62811,7 +60915,7 @@ mod conversion_log_tests {
     }
 
     #[test]
-    fn conversion_log_separates_processing_wall_time_from_encode_occupancy() {
+    fn conversion_log_never_substitutes_encode_occupancy_for_elapsed_time() {
         let source = log_test_source();
         let req = log_test_request();
         let mut record = ok_record();
@@ -62827,16 +60931,17 @@ mod conversion_log_tests {
         // fail closed rather than relabeling the per-track encode sum as wall time.
         let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
 
-        assert!(log.contains("Timing model: wall-clock-v2"));
-        assert!(log.contains("Elapsed processing wall time: unavailable"));
-        assert!(log.contains("Per-track Encode duration sum: 1m 5.432s"));
-        assert!(log.contains("Encode duration: 1m 5.432s"));
-        assert!(log.contains("[1m 5.432s; exit 0]"));
+        assert!(log.contains("Elapsed: unavailable"));
+        assert!(!log.contains("Timing model"));
+        assert!(!log.contains("wall-clock-v2"));
+        assert!(!log.contains("Per-track Encode duration sum"));
+        assert!(!log.contains("Encode duration"));
+        assert!(!log.contains("[1m 5.432s; exit 0]"));
         assert!(!log.contains("Total conversion time:"));
     }
 
     #[test]
-    fn conversion_log_discloses_dsd_album_gain_prepass_components() {
+    fn conversion_log_does_not_restore_dsd_album_gain_timing_essay() {
         let source = log_test_source();
         let req = log_test_request();
         let record = ok_record();
@@ -62867,9 +60972,10 @@ mod conversion_log_tests {
             None,
         );
 
-        assert!(log.contains(
-            "DSD album-gain prepass: source realization 0.125s; DSD-to-PCM decode 1m 5.250s; true-peak scan 2.500s"
-        ));
+        assert!(log.contains("Elapsed: unavailable"));
+        assert!(!log.contains("DSD album-gain prepass:"));
+        assert!(!log.contains("wall-clock-v2"));
+        assert!(!log.contains("Per-track Encode duration sum"));
     }
 
     #[test]
@@ -62879,12 +60985,10 @@ mod conversion_log_tests {
             "test start",
         )
         .expect("test start timestamp");
-        let checkpoint = started.clone() + chrono::Duration::seconds(5);
         let finished = started.clone() + chrono::Duration::milliseconds(65_432);
         let log = format!(
-            "Timing model: wall-clock-v2\nTiming started (UTC): {}\nElapsed processing wall time: pending finalization (checkpoint 5s)\nTiming checkpoint (UTC): {}\nPer-track Encode duration sum: 2m 10s\n",
+            "Started (UTC): {}\nElapsed: pending finalization (checkpoint 5s)\n",
             started.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-            checkpoint.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         );
         let terminal = ConversionLogFragmentTiming {
             started_at_utc: started,
@@ -62895,13 +60999,12 @@ mod conversion_log_tests {
         let finalized = finalize_conversion_log_timing_text(&log, &terminal)
             .expect("timing finalization")
             .expect("pending log should finalize");
-        assert!(finalized.contains("Elapsed processing wall time: 1m 5.432s"));
+        assert!(finalized.contains("Elapsed: 1m 5.432s"));
         assert!(finalized.contains(&format!(
-            "Timing finished (UTC): {}",
+            "Finished (UTC): {}",
             finished.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         )));
         assert!(!finalized.contains("pending finalization"));
-        assert!(!finalized.contains("Timing checkpoint (UTC):"));
         assert!(
             finalize_conversion_log_timing_text(&finalized, &terminal)
                 .expect("idempotent finalized timing read")
@@ -62909,12 +61012,40 @@ mod conversion_log_tests {
             "a finalized log must be left byte-for-byte alone on retry",
         );
 
-        let unavailable = "Timing model: wall-clock-v2\nElapsed processing wall time: unavailable [1 missing or incompatible timing span(s)]\nPer-track Encode duration sum: 2m 10s\n";
+        let unavailable = "Elapsed: unavailable\n";
         assert!(
             finalize_conversion_log_timing_text(unavailable, &terminal)
                 .expect("unavailable timing remains readable")
                 .is_none(),
             "legacy or partial timing must never be synthesized during finalization",
+        );
+    }
+
+    #[test]
+    fn terminal_report_projects_actual_postprocessing_outcomes_idempotently() {
+        let outcome = AlbumOutcome::Complete {
+            tracks: Vec::new(),
+            stages: vec![
+                stage_record(PipelineStage::Metadata, StageOutcome::Ok),
+                stage_record(
+                    PipelineStage::ReplayGain,
+                    StageOutcome::OkWithDetail("album gain unavailable for one member".to_string()),
+                ),
+            ],
+        };
+        let mut log = "TONEPOET CONVERSION LOG\n".to_string();
+        append_terminal_delivery_evidence_section(&mut log, &[], None, &[], &outcome);
+        assert!(log.contains("Metadata: completed"));
+        assert!(log.contains(
+            "ReplayGain: completed (album gain unavailable for one member)"
+        ));
+        assert!(log.contains("Structured execution evidence: unavailable"));
+
+        append_terminal_delivery_evidence_section(&mut log, &[], None, &[], &outcome);
+        assert_eq!(
+            log.matches("Delivery & Evidence").count(),
+            1,
+            "terminal finalization must replace its own section on retry",
         );
     }
 
@@ -62963,6 +61094,60 @@ mod conversion_log_tests {
     }
 
     #[test]
+    fn fragment_log_preserves_exact_sidecar_cue_metadata_source() {
+        let source = log_test_source();
+        let mut req = log_test_request();
+        req.source.cue_sidecar = CueSidecarPolicy::IgnoreCue;
+        req.source.sidecar_cue_track_metadata = Some(SidecarCueTrackMetadataSource {
+            cue_path: PathBuf::from("/music/Thriller/album.cue"),
+            track_index: 0,
+            cue_track_number: 1,
+            cue_file_reference: Some("01.dff".to_string()),
+        });
+        let record = ok_record();
+        let artifacts = log_test_artifacts();
+        let AudioArtifacts::Tracks(track_artifacts) = &artifacts.audio else {
+            panic!("test fixture must use track artifacts");
+        };
+        let fragment = structured_conversion_log_track_fragment(
+            &record,
+            Some(&source.tracks[0]),
+            Some(&source),
+            Some(&track_artifacts[0]),
+            &req,
+            None,
+            None,
+        );
+        let summary = ConversionLogTrackSummary::from_track_record_with_context(
+            &record,
+            &source,
+            Some(&source.tracks[0]),
+            Some(&track_artifacts[0]),
+        );
+
+        let log = render_structured_conversion_log_track_fragment(&fragment, &summary);
+        assert!(log.contains("Metadata source: Sidecar CUE: /music/Thriller/album.cue (track 1)"));
+    }
+
+    #[test]
+    fn conversion_log_uses_delivered_target_not_staging_path() {
+        let source = log_test_source();
+        let req = log_test_request();
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![ok_record()],
+            stages: stage_records(),
+        };
+        let artifacts = log_test_artifacts();
+        let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
+
+        assert!(log.contains("Output target: /out/01.flac"), "{log}");
+        assert!(
+            !log.contains("Output target: /encoded/01.flac"),
+            "the staged TrackRecord output path must not masquerade as the delivered target: {log}",
+        );
+    }
+
+    #[test]
     fn build_conversion_log_partial_shows_successful_and_failed_tracks() {
         let source = log_test_source();
         let req = log_test_request();
@@ -63000,11 +61185,12 @@ mod conversion_log_tests {
         let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
 
         assert!(log.contains("Result: Blocked (required stage failed: Convert)"));
-        assert!(log.contains("Convert: Failed (convert failed)"));
+        assert!(!log.contains("Stage Summary"));
+        assert!(!log.contains("Convert: Failed (convert failed)"));
     }
 
     #[test]
-    fn per_track_details_include_sizes_duration_command_info_and_materializer_warnings() {
+    fn per_track_details_omit_untruthful_archive_size_and_command_trace() {
         let mut source = log_test_source();
         source.tracks[0].warnings = vec![
             "declared DSF file size differed from the actual size; metadata was read tolerantly"
@@ -63019,18 +61205,132 @@ mod conversion_log_tests {
         let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
 
         assert!(log.contains("Source audio: 44.1kHz, 24-bit, 44100 expected samples"));
-        assert!(log.contains("Size: 2.0 KB -> 1.0 KB (50.0% smaller)"));
-        assert!(log.contains("Encode duration: 1m 5s"));
+        assert!(
+            !log.contains("Size: 2.0 KB -> 1.0 KB"),
+            "archive/materialized carrier bytes must not masquerade as original source storage: {log}"
+        );
         assert!(log.contains(
             "Warning: declared DSF file size differed from the actual size; metadata was read tolerantly"
         ));
-        assert!(log.contains("ffmpeg -i '/tmp/in file.wav' /tmp/out.flac [1m 5s; exit 0]"));
+        assert!(!log.contains("Encode duration:"));
+        assert!(!log.contains("ffmpeg -i '/tmp/in file.wav' /tmp/out.flac"));
         assert!(!log.contains("ignored stdout"));
         assert!(!log.contains("ignored stderr"));
     }
 
     #[test]
-    fn stage_summary_includes_all_stage_records() {
+    fn size_comparison_uses_original_storage_not_expanded_working_carrier() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_path = temp.path().join("source.flac");
+        let carrier_path = temp.path().join("working.f64le");
+        let output_path = temp.path().join("output.flac");
+        std::fs::write(&source_path, vec![0_u8; 2_048]).expect("source bytes");
+        std::fs::write(&carrier_path, vec![0_u8; 16_384]).expect("expanded carrier bytes");
+        std::fs::write(&output_path, vec![0_u8; 1_024]).expect("output bytes");
+
+        let mut source = log_test_source();
+        source.kind = SourceKind::SingleFile;
+        source.container = source_path.clone();
+        source.tracks.truncate(1);
+        let prepared = &mut source.tracks[0];
+        prepared.source_ref = TrackSourceRef::RegisteredEffectCarrier {
+            path: carrier_path,
+            source_path: source_path.clone(),
+            sample_rate_hz: 44_100,
+            channels: 2,
+            duration: None,
+            source_was_dsd: false,
+            resampler_consumed: false,
+            representation: RegisteredEffectCarrierRepresentation::RawFloat64,
+        };
+        let artifact = TrackArtifact {
+            reference_evidence: None,
+            track_id: prepared.id.clone(),
+            staged_path: output_path.clone(),
+            final_path: output_path,
+            samples: Some(44_100),
+            metadata_satisfaction: PlannedMetadataSatisfaction::none(),
+            metadata_required: PlannedMetadataSatisfaction::none(),
+            planned_command_hash: None,
+        };
+
+        assert_eq!(
+            conversion_log_comparable_track_sizes(&source, &source.tracks[0], &artifact),
+            (Some(2_048), Some(1_024)),
+            "the 16 KiB working carrier must never become the source side of the comparison",
+        );
+
+        source.kind = SourceKind::CueImage;
+        assert_eq!(
+            conversion_log_comparable_track_sizes(&source, &source.tracks[0], &artifact),
+            (None, Some(1_024)),
+            "shared/image-shaped sources must omit the percentage rather than fabricate per-track source bytes",
+        );
+    }
+
+    #[test]
+    fn final_report_scopes_staged_size_when_completed_script_post_action_may_rewrite_audio() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source_path = temp.path().join("source.flac");
+        let staged_path = temp.path().join("staged.flac");
+        let delivered_path = temp.path().join("delivered.flac");
+        std::fs::write(&source_path, vec![0_u8; 2_048]).expect("source bytes");
+        std::fs::write(&staged_path, vec![0_u8; 1_024]).expect("staged output bytes");
+        std::fs::write(&delivered_path, vec![0_u8; 1_024]).expect("delivered output bytes");
+
+        let mut source = log_test_source();
+        source.kind = SourceKind::SingleFile;
+        source.provenance.source_kind = SourceKind::SingleFile;
+        source.container = source_path;
+        source.tracks.truncate(1);
+        let req = log_test_request();
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![ok_record()],
+            stages: stage_records(),
+        };
+        let mut artifacts = log_test_artifacts();
+        let AudioArtifacts::Tracks(track_artifacts) = &mut artifacts.audio else {
+            panic!("test fixture must use track artifacts");
+        };
+        track_artifacts.truncate(1);
+        track_artifacts[0].staged_path = staged_path;
+        track_artifacts[0].final_path = delivered_path.clone();
+
+        let mut log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
+        assert!(log.contains("Produced size: 2.0 KB -> 1.0 KB (50.0% smaller)"), "{log}");
+
+        let action_reports = vec![ActionPhaseReport {
+            phase: Some(ActionPhase::Post),
+            actions: vec![ActionResult {
+                index: 0,
+                kind: "run_script".to_string(),
+                status: ActionResultStatus::Completed,
+                operations: Vec::new(),
+                error: None,
+                notices: Vec::new(),
+            }],
+            notices: Vec::new(),
+            recovery_required: false,
+            cancelled: false,
+        }];
+        append_terminal_delivery_evidence_section(
+            &mut log,
+            std::slice::from_ref(&delivered_path),
+            None,
+            &action_reports,
+            &outcome,
+        );
+
+        assert!(log.contains("Produced size: 2.0 KB -> 1.0 KB (50.0% smaller)"), "{log}");
+        assert!(log.contains("Current location: may differ from the publish-time path after post-actions"), "{log}");
+        assert!(
+            !log.lines().any(|line| line.trim_start().starts_with("Size:")),
+            "a pre-post-action staged measurement must not be presented as an unqualified final Size: {log}",
+        );
+    }
+
+    #[test]
+    fn human_log_omits_internal_stage_summary() {
         let source = log_test_source();
         let req = log_test_request();
         let outcome = AlbumOutcome::Complete {
@@ -63040,9 +61340,10 @@ mod conversion_log_tests {
         let artifacts = log_test_artifacts();
         let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
 
-        assert!(log.contains("Materialize: Ok"));
-        assert!(log.contains("ReplayGain: Not requested"));
-        assert!(log.contains("Features: Ok"));
+        assert!(!log.contains("Stage Summary"));
+        assert!(!log.contains("Materialize: Ok"));
+        assert!(!log.contains("ReplayGain: Not requested"));
+        assert!(!log.contains("Features: Ok"));
     }
 
     #[test]
@@ -63074,23 +61375,14 @@ mod conversion_log_tests {
             None,
         );
 
-        for setting in [
-            "Metadata: Disabled",
-            "ReplayGain: Disabled",
-            "Features: Disabled",
-        ] {
-            assert!(log.contains(setting), "missing settings line {setting:?}");
-        }
-        for stage in ["Merge", "Metadata", "ReplayGain", "Features"] {
-            assert!(
-                log.contains(&format!("{stage}: Not requested")),
-                "missing honest stage summary for {stage}"
-            );
-            assert!(
-                !log.contains(&format!("{stage}: Skipped")),
-                "disabled stage must not render as skipped: {stage}"
-            );
-        }
+        assert!(!log.contains("Metadata: Disabled"));
+        assert!(!log.contains("ReplayGain: Disabled"));
+        assert!(!log.contains("Features: Disabled"));
+        assert!(!log.contains("Stage Summary"));
+        assert!(!log.contains("Merge: Not requested"));
+        assert!(!log.contains("Metadata: Not requested"));
+        assert!(!log.contains("ReplayGain: Not requested"));
+        assert!(!log.contains("Features: Not requested"));
         assert!(log.contains("Result: Complete"));
     }
 
@@ -63118,11 +61410,9 @@ mod conversion_log_tests {
             None,
         );
 
-        assert!(log.contains("Metadata: Enabled"));
-        assert!(log.contains(
-            "Metadata: Skipped (already satisfied by the output planner)"
-        ));
-        assert!(!log.contains("Metadata: Not requested"));
+        assert!(!log.contains("Metadata: Enabled"));
+        assert!(!log.contains("Metadata: Skipped (already satisfied by the output planner)"));
+        assert!(!log.contains("Stage Summary"));
         assert!(log.contains("Result: Complete"));
     }
 
@@ -63152,657 +61442,16 @@ mod conversion_log_tests {
             None,
         );
 
-        assert!(log.contains("ReplayGain: Enabled"));
-        assert!(log.contains(
-            "ReplayGain: Skipped (ReplayGain writer is unavailable for this output)"
-        ));
-        assert!(!log.contains("ReplayGain: Not requested"));
+        assert!(!log.contains("ReplayGain: Enabled"));
+        assert!(!log.contains("ReplayGain: Skipped (ReplayGain writer is unavailable for this output)"));
+        assert!(!log.contains("Stage Summary"));
         assert!(log.contains("Result: Complete"));
     }
 
-    #[test]
-    fn format_aware_settings_include_only_target_codec_family() {
-        let source = log_test_source();
-        let artifacts = log_test_artifacts();
-        let outcome = AlbumOutcome::Complete {
-            tracks: vec![ok_record()],
-            stages: stage_records(),
-        };
 
-        let mut flac_req = log_test_request();
-        flac_req.settings.target_format = PlannerAudioFormat::Flac;
-        let flac_log = build_conversion_log(&outcome, &source, &flac_req, &artifacts, None);
-        assert!(flac_log.contains("FLAC compression"));
-        assert!(!flac_log.contains("MP3 mode"));
-        assert!(!flac_log.contains("AAC profile"));
-        assert!(!flac_log.contains("Opus bitrate"));
-        assert!(!flac_log.contains("WavPack mode"));
 
-        let mut mp3_req = log_test_request();
-        mp3_req.settings.target_format = PlannerAudioFormat::Mp3;
-        mp3_req.settings.mp3.mode = Mp3Mode::Cbr;
-        let mp3_log = build_conversion_log(&outcome, &source, &mp3_req, &artifacts, None);
-        assert!(mp3_log.contains("MP3 mode: CBR"));
-        assert!(mp3_log.contains("MP3 bitrate: 320 kbps"));
-        assert!(!mp3_log.contains("FLAC compression"));
-        assert!(!mp3_log.contains("AAC profile"));
-    }
 
-    fn r24_cd_preemphasis_source(explicit_tag: bool) -> PreparedSource {
-        let mut source = log_test_source();
-        for track in &mut source.tracks {
-            track.sample_rate = Some(44_100);
-            track.source_audio = SourceAudioDescriptor::from_scalar(
-                Some(44_100),
-                Some(16),
-                Some(SourceAudioCoding::Pcm),
-            );
-            track.bit_depth = Some(16);
-            track.metadata.pre_emphasis = true;
-            if explicit_tag {
-                crate::convert::pipeline::types::insert_source_text_tag(
-                    &mut track.metadata.extra,
-                    "PRE_EMPHASIS",
-                    "1",
-                );
-            }
-        }
-        source
-    }
 
-    fn r24_cd_deemphasis_intent() -> tonepoet_pipeline::EffectIntent {
-        tonepoet_pipeline::EffectIntent {
-            id: tonepoet_pipeline::EffectInstanceId(24),
-            effect: tonepoet_pipeline::RegisteredUnaryEffect::CdDeemphasis,
-            after: Vec::new(),
-            placement: tonepoet_pipeline::EffectPlacement::SourceRate,
-        }
-    }
-
-    fn r24_int16_deemphasis_log_request() -> PipelineRequest {
-        let mut req = log_test_request();
-        req.settings.target_format = PlannerAudioFormat::Flac;
-        req.settings.target_sample_rate = RateTarget::Source;
-        req.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int16);
-        req.settings.dither_type = DitherType::None;
-        req.settings.dither_explicit = false;
-        req.registered_effects = vec![r24_cd_deemphasis_intent()];
-        req.deemphasis_choice_origin = DeemphasisChoiceOrigin::Automatic;
-        req.deemphasis_evidence_origin = DeemphasisEvidenceOrigin::ExplicitTag;
-        req
-    }
-
-    fn r24_sox_dither_record(shibata: bool) -> TrackRecord {
-        let mut record = ok_record();
-        record.verified_output_bit_depth = Some(PcmBitDepth::Int16);
-        let mut command = command_record_for(ToolBinary::Sox);
-        command.sanitized_args = if shibata {
-            vec!["dither".to_string(), "-s".to_string()]
-        } else {
-            vec!["dither".to_string()]
-        };
-        record.commands = vec![command];
-        record
-    }
-
-    fn r28_terminal_ssrc_dither_record(
-        kind: tonepoet_pipeline::PcmTerminalRealizationKind,
-        target_format: PlannerAudioFormat,
-        owns_dither: bool,
-    ) -> TrackRecord {
-        let mut record = ok_record();
-        record.verified_output_bit_depth = Some(PcmBitDepth::Int16);
-        record.commands.clear();
-        let ssrc_dither = tonepoet_pipeline::plugins::ResolvedSsrcDither {
-            requested_global: if owns_dither {
-                DitherType::Tpdf
-            } else {
-                DitherType::None
-            },
-            dither_id: owns_dither.then_some(99),
-            pdf_type: owns_dither.then_some(tonepoet_pipeline::SsrcPdfType::Triangular),
-            origin: if owns_dither {
-                tonepoet_pipeline::plugins::SsrcDitherOrigin::GlobalExact
-            } else {
-                tonepoet_pipeline::plugins::SsrcDitherOrigin::None
-            },
-            availability: if owns_dither {
-                tonepoet_pipeline::plugins::SsrcDitherAvailability::Active
-            } else {
-                tonepoet_pipeline::plugins::SsrcDitherAvailability::Inactive
-            },
-        };
-        let terminal_candidate = SelectedPhysicalCandidateBinding {
-            identity: "registered:resample_pcm:ssrc:r28-log-evidence".to_string(),
-            tool: tonepoet_pipeline::ToolIdentifier::Ssrc,
-            terminal_realization: Some(tonepoet_pipeline::SelectedTerminalRealization::Pcm(
-                tonepoet_pipeline::SelectedPcmTerminalRealization {
-                    kind,
-                    selected_tool: tonepoet_pipeline::ToolIdentifier::Ssrc,
-                    input_precision: tonepoet_pipeline::StoragePrecision::Pcm(PcmBitDepth::Float64),
-                    input_value_domain: tonepoet_pipeline::ValueDomain::FiniteFloating,
-                    target_format,
-                    target_rate_hz: Some(88_200),
-                    target_bit_depth: PcmBitDepth::Int16,
-                    wavpack_hybrid: false,
-                    effective_dither: owns_dither.then_some(DitherType::Tpdf),
-                    ssrc_dither: Some(ssrc_dither),
-                    dither_owner: if owns_dither {
-                        tonepoet_pipeline::PcmTerminalDitherOwner::SsrcResampler
-                    } else {
-                        tonepoet_pipeline::PcmTerminalDitherOwner::None
-                    },
-                },
-            )),
-            strong_ssrc_resampler: None,
-        };
-        record.source_ref = TrackSourceRef::RegisteredEffectCarrier {
-            path: PathBuf::from("/stage/r28-terminal.wav"),
-            source_path: PathBuf::from("/music/preemphasis.flac"),
-            sample_rate_hz: 88_200,
-            channels: 2,
-            duration: None,
-            source_was_dsd: false,
-            resampler_consumed: true,
-            representation: RegisteredEffectCarrierRepresentation::TerminalPcmWav {
-                bit_depth: PcmBitDepth::Int16,
-                terminal_candidate,
-            },
-        };
-        record
-    }
-
-    #[test]
-    fn r24_conversion_log_names_automatic_cd_deemphasis_evidence_and_plain_tpdf() {
-        let source = r24_cd_preemphasis_source(true);
-        let req = r24_int16_deemphasis_log_request();
-        let outcome = AlbumOutcome::Complete {
-            tracks: vec![r24_sox_dither_record(false)],
-            stages: stage_records(),
-        };
-        let log = build_conversion_log(
-            &outcome,
-            &source,
-            &req,
-            &log_test_artifacts(),
-            None,
-        );
-
-        assert!(log.contains("Dither: yes (TPDF via SoX)"), "{log}");
-        assert!(log.contains(
-            "De-emphasis: yes (CD pre-emphasis filtered out of the audio)"
-        ));
-        assert!(log.contains("De-emphasis evidence: PRE_EMPHASIS tag on all 2 source tracks"));
-        assert!(log.contains("De-emphasis chosen by: automatic"));
-        assert!(!log.contains("De-emphasis effect:"), "{log}");
-    }
-
-    #[test]
-    fn r28_deemphasis_log_accepts_successful_direct_terminal_ssrc_dither_evidence() {
-        let mut source = r24_cd_preemphasis_source(true);
-        source.tracks.truncate(1);
-        let mut req = r24_int16_deemphasis_log_request();
-        req.settings.target_format = PlannerAudioFormat::Wav;
-        req.settings.target_sample_rate = RateTarget::PcmHz(88_200);
-        req.settings.preferred_tool = PreferredTool::Ssrc;
-        let record = r28_terminal_ssrc_dither_record(
-            tonepoet_pipeline::PcmTerminalRealizationKind::SsrcDirectWav,
-            PlannerAudioFormat::Wav,
-            true,
-        );
-        assert!(record.commands.is_empty());
-        assert!(track_record_has_realized_terminal_ssrc_dither(&record));
-
-        let log = build_conversion_log(
-            &AlbumOutcome::Complete {
-                tracks: vec![record],
-                stages: stage_records(),
-            },
-            &source,
-            &req,
-            &log_test_artifacts(),
-            None,
-        );
-
-        assert!(log.contains("Dither: yes (TPDF via SSRC)"), "{log}");
-        assert!(!log.contains("requested (TPDF) — not applied"), "{log}");
-    }
-
-    #[test]
-    fn r28_deemphasis_package_only_terminal_ssrc_names_ssrc_as_dither_owner() {
-        let mut source = r24_cd_preemphasis_source(true);
-        source.tracks.truncate(1);
-        let mut req = r24_int16_deemphasis_log_request();
-        req.settings.target_format = PlannerAudioFormat::Flac;
-        req.settings.target_sample_rate = RateTarget::PcmHz(88_200);
-        req.settings.preferred_tool = PreferredTool::Ssrc;
-        let mut record = r28_terminal_ssrc_dither_record(
-            tonepoet_pipeline::PcmTerminalRealizationKind::SsrcPreterminalFfmpegPackage,
-            PlannerAudioFormat::Flac,
-            true,
-        );
-        let mut package = command_record_for(ToolBinary::Ffmpeg);
-        package.description = Some("Package terminal SSRC PCM as FLAC".to_string());
-        package.sanitized_args = vec![
-            "-i".to_string(),
-            "/stage/r28-terminal.wav".to_string(),
-            "-c:a".to_string(),
-            "flac".to_string(),
-            "/stage/out.flac".to_string(),
-        ];
-        record.commands = vec![package];
-        assert!(track_record_has_realized_terminal_ssrc_dither(&record));
-
-        let log = build_conversion_log(
-            &AlbumOutcome::Complete {
-                tracks: vec![record],
-                stages: stage_records(),
-            },
-            &source,
-            &req,
-            &log_test_artifacts(),
-            None,
-        );
-
-        assert!(log.contains("Dither: yes (TPDF via SSRC)"), "{log}");
-        assert!(!log.contains("Dither: yes (TPDF via ffmpeg aresample)"), "{log}");
-        assert!(!log.contains("requested (TPDF) — not applied"), "{log}");
-    }
-
-    #[test]
-    fn r28_inactive_terminal_ssrc_realization_is_not_dither_execution_evidence() {
-        let mut source = r24_cd_preemphasis_source(true);
-        source.tracks.truncate(1);
-        let mut req = r24_int16_deemphasis_log_request();
-        req.settings.target_format = PlannerAudioFormat::Wav;
-        req.settings.target_sample_rate = RateTarget::PcmHz(88_200);
-        req.settings.preferred_tool = PreferredTool::Ssrc;
-        let record = r28_terminal_ssrc_dither_record(
-            tonepoet_pipeline::PcmTerminalRealizationKind::SsrcDirectWav,
-            PlannerAudioFormat::Wav,
-            false,
-        );
-        assert!(!track_record_has_realized_terminal_ssrc_dither(&record));
-
-        let log = build_conversion_log(
-            &AlbumOutcome::Complete {
-                tracks: vec![record],
-                stages: stage_records(),
-            },
-            &source,
-            &req,
-            &log_test_artifacts(),
-            None,
-        );
-
-        assert!(!log.contains("Dither: yes (TPDF via SSRC)"), "{log}");
-        assert!(log.contains(
-            "Dither: requested (TPDF) — not applied (executed command did not emit a dither stage)"
-        ), "{log}");
-    }
-
-    #[test]
-    fn r24_album_fragment_log_uses_dispatcher_track_count_for_uniform_evidence() {
-        let mut source = r24_cd_preemphasis_source(true);
-        source.tracks.truncate(1);
-        let mut req = r24_int16_deemphasis_log_request();
-        req.album_batch = Some(AlbumBatchContext::new(
-            "r24-log-batch",
-            8,
-            PathBuf::from("out/album"),
-            PathBuf::from("source/album"),
-        ));
-        let log = build_conversion_log(
-            &AlbumOutcome::Complete {
-                tracks: vec![r24_sox_dither_record(false)],
-                stages: stage_records(),
-            },
-            &source,
-            &req,
-            &log_test_artifacts(),
-            None,
-        );
-
-        assert!(log.contains(
-            "De-emphasis evidence: PRE_EMPHASIS tag on all 8 source tracks"
-        ), "{log}");
-        assert!(!log.contains("all 1 source tracks"), "{log}");
-    }
-
-    #[test]
-    fn r24_album_fragment_without_uniform_evidence_provenance_does_not_overclaim() {
-        let mut source = r24_cd_preemphasis_source(true);
-        source.tracks.truncate(1);
-        let mut req = r24_int16_deemphasis_log_request();
-        req.deemphasis_evidence_origin = DeemphasisEvidenceOrigin::None;
-        req.album_batch = Some(AlbumBatchContext::new(
-            "r24-mixed-log-batch",
-            8,
-            PathBuf::from("out/album"),
-            PathBuf::from("source/album"),
-        ));
-        let log = build_conversion_log(
-            &AlbumOutcome::Complete {
-                tracks: vec![r24_sox_dither_record(false)],
-                stages: stage_records(),
-            },
-            &source,
-            &req,
-            &log_test_artifacts(),
-            None,
-        );
-
-        assert!(!log.contains("De-emphasis evidence:"), "{log}");
-    }
-
-    #[test]
-    fn r24_conversion_log_names_explicit_shibata_without_calling_it_automatic() {
-        let source = r24_cd_preemphasis_source(true);
-        let mut req = r24_int16_deemphasis_log_request();
-        req.settings.dither_type = DitherType::Shibata;
-        req.settings.dither_explicit = true;
-        req.deemphasis_choice_origin = DeemphasisChoiceOrigin::User;
-        let outcome = AlbumOutcome::Complete {
-            tracks: vec![r24_sox_dither_record(true)],
-            stages: stage_records(),
-        };
-        let log = build_conversion_log(
-            &outcome,
-            &source,
-            &req,
-            &log_test_artifacts(),
-            None,
-        );
-
-        assert!(log.contains("Dither: yes (Shibata via SoX)"), "{log}");
-        assert!(log.contains("De-emphasis chosen by: user"), "{log}");
-        assert!(!log.contains("Dither: yes (TPDF)"), "{log}");
-    }
-
-    #[test]
-    fn r24_conversion_log_records_user_declined_cue_evidence_and_preserved_flag() {
-        let source = r24_cd_preemphasis_source(false);
-        let mut req = r24_int16_deemphasis_log_request();
-        req.registered_effects.clear();
-        req.deemphasis_choice_origin = DeemphasisChoiceOrigin::User;
-        req.deemphasis_evidence_origin = DeemphasisEvidenceOrigin::CueFlag;
-        let outcome = AlbumOutcome::Complete {
-            tracks: vec![ok_record()],
-            stages: stage_records(),
-        };
-        let log = build_conversion_log(
-            &outcome,
-            &source,
-            &req,
-            &log_test_artifacts(),
-            None,
-        );
-
-        assert!(log.contains(
-            "De-emphasis: no (pre-emphasis evidence present; filter not applied)"
-        ));
-        assert!(log.contains("De-emphasis evidence: CUE FLAGS PRE on all 2 source tracks"));
-        assert!(log.contains("De-emphasis chosen by: user"));
-        assert!(!log.contains("De-emphasis effect:"), "{log}");
-    }
-
-    #[test]
-    fn r24_conversion_log_says_when_target_cannot_carry_the_remaining_flag() {
-        let source = r24_cd_preemphasis_source(false);
-        let mut req = r24_int16_deemphasis_log_request();
-        req.registered_effects.clear();
-        req.settings.target_format = PlannerAudioFormat::Aac;
-        req.deemphasis_choice_origin = DeemphasisChoiceOrigin::User;
-        req.deemphasis_evidence_origin = DeemphasisEvidenceOrigin::CueFlag;
-        let log = build_conversion_log(
-            &AlbumOutcome::Complete {
-                tracks: vec![ok_record()],
-                stages: stage_records(),
-            },
-            &source,
-            &req,
-            &log_test_artifacts(),
-            None,
-        );
-
-        assert!(!log.contains("De-emphasis effect:"), "{log}");
-    }
-
-    #[test]
-    fn r24_conversion_log_emits_no_deemphasis_lines_without_source_evidence() {
-        let mut source = r24_cd_preemphasis_source(false);
-        for track in &mut source.tracks {
-            track.metadata.pre_emphasis = false;
-        }
-        let mut req = r24_int16_deemphasis_log_request();
-        req.deemphasis_evidence_origin = DeemphasisEvidenceOrigin::None;
-        let log = build_conversion_log(
-            &AlbumOutcome::Complete {
-                tracks: vec![r24_sox_dither_record(false)],
-                stages: stage_records(),
-            },
-            &source,
-            &req,
-            &log_test_artifacts(),
-            None,
-        );
-
-        assert!(!log.contains("De-emphasis:"), "{log}");
-        assert!(!log.contains("De-emphasis evidence:"), "{log}");
-        assert!(!log.contains("De-emphasis chosen by:"), "{log}");
-        assert!(!log.contains("De-emphasis effect:"), "{log}");
-    }
-
-    #[test]
-    fn dsp_settings_are_affirmative_and_resampler_details_follow_actual_rate_changes() {
-        let source = log_test_source();
-        let artifacts = log_test_artifacts();
-        let outcome = AlbumOutcome::Complete {
-            tracks: vec![ok_record()],
-            stages: stage_records(),
-        };
-
-        let req = log_test_request();
-        let no_resample_log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
-        assert!(no_resample_log.contains("Resampling: no (source rate preserved)"));
-        assert!(no_resample_log.contains("Bit-depth conversion: no (source depth preserved)"));
-        assert!(no_resample_log.contains("Dither: no (not requested)"));
-        assert!(!no_resample_log.contains("SSRC profile"));
-
-        let mut resample_req = log_test_request();
-        resample_req.settings.target_sample_rate = RateTarget::PcmHz(48_000);
-        resample_req.settings.preferred_tool = PreferredTool::Ssrc;
-        resample_req.settings.ssrc.attenuation_db = Some(1.5);
-        resample_req.settings.ssrc.min_phase = true;
-        resample_req.settings.ssrc.dither_id = Some(2);
-        resample_req.settings.ssrc.pdf_type = Some(SsrcPdfType::Triangular);
-        let resample_log = build_conversion_log(&outcome, &source, &resample_req, &artifacts, None);
-        assert!(resample_log.contains("Resampling: yes (SSRC profile="));
-        assert!(resample_log.contains("attenuation=1.5 dB, phase=minimum"));
-        assert!(resample_log.contains("96kHz → 48kHz"));
-        assert!(resample_log.contains("Bit-depth conversion: no (source depth preserved)"));
-        assert!(resample_log.contains("Dither: no (not requested)"));
-        assert!(resample_log.contains("SSRC attenuation: 1.5 dB"));
-        assert!(resample_log.contains("SSRC minimum phase: Yes"));
-        assert!(resample_log.contains("SSRC dither ID: 2"));
-        assert!(resample_log.contains("SSRC PDF type: triangular"));
-
-        let mut sox_req = log_test_request();
-        sox_req.settings.target_sample_rate = RateTarget::PcmHz(48_000);
-        sox_req.settings.preferred_tool = PreferredTool::Sox;
-        sox_req.settings.sox_resampler.allow_aliasing = true;
-        sox_req.settings.sox_resampler.sinc_taps = Some(4096);
-        sox_req.settings.sox_resampler.sinc_attenuation_db = Some(120);
-        sox_req.settings.sox_resampler.sinc_passband_hz = Some(20_000.0);
-        sox_req.settings.sox_resampler.sinc_transition_hz = Some(2_000.0);
-        sox_req.settings.sox_resampler.sinc_kaiser_beta = Some(8.5);
-        sox_req.settings.sox_resampler.sinc_phase = Some(SoxSincPhase::Linear);
-        let sox_log = build_conversion_log(&outcome, &source, &sox_req, &artifacts, None);
-        let sox_line = sox_log
-            .lines()
-            .find(|line| line.starts_with("Resampling: yes (SoX rate"))
-            .expect("affirmative SoX resampling line");
-        for expected in [
-            "allow_aliasing=yes",
-            "sinc_taps=4096",
-            "sinc_attenuation=120 dB",
-            "sinc_passband=20000 Hz",
-            "sinc_transition=2000 Hz",
-            "sinc_kaiser_beta=8.5",
-            "sinc_phase=linear",
-            "96kHz → 48kHz",
-        ] {
-            assert!(sox_line.contains(expected), "missing {expected:?} in {sox_line}");
-        }
-    }
-
-    #[test]
-    fn soxr_settings_use_precise_labels_and_do_not_invent_stopband() {
-        let source = log_test_source();
-        let artifacts = log_test_artifacts();
-        let outcome = AlbumOutcome::Complete {
-            tracks: vec![ok_record()],
-            stages: stage_records(),
-        };
-
-        let mut req = log_test_request();
-        req.settings.target_sample_rate = RateTarget::PcmHz(48_000);
-        req.settings.preferred_tool = PreferredTool::Ffmpeg;
-        req.settings.resample_quality = ResampleQuality::VeryHigh;
-        req.settings.soxr_resampler.cutoff = Some(0.97);
-        req.settings.soxr_resampler.phase = Some(45);
-        let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
-
-        // The log fixture (log_test_source) carries two tracks at 44.1 kHz and
-        // 96 kHz; targeting 48 kHz renders both distinct transitions in sorted
-        // order after the soxr label detail.
-        assert!(log.contains(
-            "Resampling: yes (soxr via ffmpeg aresample, precision=28, cutoff=0.970, phase_shift=45, 44.1kHz → 48kHz, 96kHz → 48kHz)"
-        ));
-        assert!(log.contains("Soxr quality preset: very high"));
-        assert!(log.contains("Soxr cutoff override: 0.97"));
-        assert!(log.contains("Soxr phase response: 45"));
-        assert!(!log.contains("Soxr precision"));
-        assert!(!log.contains("Soxr passband end"));
-        assert!(!log.contains("Soxr stopband begin"));
-    }
-
-    #[test]
-    fn soxr_log_does_not_claim_identical_passband_and_stopband_from_single_cutoff() {
-        let source = log_test_source();
-        let artifacts = log_test_artifacts();
-        let outcome = AlbumOutcome::Complete {
-            tracks: vec![ok_record()],
-            stages: stage_records(),
-        };
-
-        let mut req = log_test_request();
-        req.settings.target_sample_rate = RateTarget::PcmHz(48_000);
-        req.settings.preferred_tool = PreferredTool::Ffmpeg;
-        req.settings.soxr_resampler.cutoff = Some(0.91);
-        let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
-
-        assert!(log.contains("Soxr cutoff override: 0.91"));
-        assert!(!log.contains("Soxr passband end: 0.91"));
-        assert!(!log.contains("Soxr stopband begin: 0.91"));
-    }
-
-    #[test]
-    fn dsd_settings_are_printed_only_for_dsd_sources() {
-        let artifacts = log_test_artifacts();
-        let outcome = AlbumOutcome::Complete {
-            tracks: vec![ok_record()],
-            stages: stage_records(),
-        };
-        let req = log_test_request();
-        let pcm_log = build_conversion_log(&outcome, &log_test_source(), &req, &artifacts, None);
-        assert!(!pcm_log.contains("DSD gain mode"));
-
-        let mut dsd_source = log_test_source();
-        dsd_source.kind = SourceKind::SacdIso;
-        dsd_source.tracks[0].sample_rate = Some(2_822_400);
-        dsd_source.tracks[0].bit_depth = None;
-        let mut dsd_req = log_test_request();
-        dsd_req.settings.dsd = dsd_settings_with_gain(
-            tonepoet_pipeline::SampleGainPolicy::dsd_guard_default(),
-        );
-        let guard_log = build_conversion_log(&outcome, &dsd_source, &dsd_req, &artifacts, None);
-        assert!(guard_log.contains("DSD path: custom"));
-        assert!(guard_log.contains("DSD gain mode: true-peak guard"));
-        assert!(guard_log.contains("DSD true-peak target: -0.100000000 dBTP"));
-        assert!(guard_log.contains("DSD true-peak scope: track"));
-        assert!(guard_log.contains("DSD true-peak scan: reference"));
-        assert!(guard_log.contains("DSD->PCM lowpass method"));
-        assert!(!guard_log.contains("DSD fixed gain"));
-
-        dsd_req.settings.dsd.set_gain_policy(
-            tonepoet_pipeline::SampleGainPolicy::dsd_normalize_default()
-                .with_scope(tonepoet_pipeline::TruePeakScope::Album)
-                .with_scan(tonepoet_pipeline::TruePeakScanTier::Fast),
-        );
-        let normalize_log = build_conversion_log(&outcome, &dsd_source, &dsd_req, &artifacts, None);
-        assert!(normalize_log.contains("DSD gain mode: true-peak normalize"));
-        assert!(normalize_log.contains("DSD true-peak scope: album"));
-        assert!(normalize_log.contains("DSD true-peak scan: fast"));
-
-        dsd_req.settings.dsd.set_gain_policy(tonepoet_pipeline::SampleGainPolicy::Off);
-        let off_log = build_conversion_log(&outcome, &dsd_source, &dsd_req, &artifacts, None);
-        assert!(off_log.contains("DSD gain mode: off"));
-        assert!(!off_log.contains("DSD true-peak target"));
-
-        dsd_req.settings.dsd.set_gain_policy(tonepoet_pipeline::SampleGainPolicy::FixedGain {
-            gain_db: "6.000000000".parse().expect("fixed gain"),
-        });
-        let fixed_log = build_conversion_log(&outcome, &dsd_source, &dsd_req, &artifacts, None);
-        assert!(fixed_log.contains("DSD gain mode: fixed gain"));
-        assert!(fixed_log.contains("DSD fixed gain: 6.000000000 dB"));
-        assert!(!fixed_log.contains("DSD true-peak target"));
-    }
-
-    #[test]
-    fn pcm_to_dsd_settings_use_specific_filter_preset_label() {
-        let mut source = log_test_source();
-        source.tracks[0].source_ref = TrackSourceRef::StagedFile(PathBuf::from("/stage/01.wav"));
-        source.tracks[0].sample_rate = Some(88_200);
-        source.tracks[0].bit_depth = Some(24);
-
-        let mut req = log_test_request();
-        req.settings.target_format = PlannerAudioFormat::Dsf;
-        req.settings.target_sample_rate = RateTarget::Dsd(DsdRate::Dsd64);
-
-        let artifacts = log_test_artifacts();
-        let outcome = AlbumOutcome::Complete {
-            tracks: vec![ok_record()],
-            stages: stage_records(),
-        };
-        let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
-
-        assert!(log.contains("PCM->DSD filter preset"));
-        // "DSD filter preset" without the PCM→ prefix must not appear
-        assert!(!log.lines().any(|line| {
-            line.contains("DSD filter preset") && !line.contains("PCM->DSD filter preset")
-        }));
-        assert!(!log.contains("DSD->PCM lowpass method"));
-    }
-
-    #[test]
-    fn pipeline_line_prefers_planned_command_descriptions() {
-        let source = log_test_source();
-        let req = log_test_request();
-        let artifacts = log_test_artifacts();
-        let mut record = ok_record();
-        record.commands[0].description = Some("Decode FLAC to PCM".to_string());
-        let mut second = command_record();
-        second.description = Some("Encode FLAC level 8".to_string());
-        record.commands.push(second);
-        let outcome = AlbumOutcome::Complete {
-            tracks: vec![record],
-            stages: stage_records(),
-        };
-        let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
-
-        assert!(log.contains("Pipeline: Decode FLAC to PCM → Encode FLAC level 8"));
-    }
 
     #[test]
     fn dsd_dst_stats_are_written_to_track_stage_and_command_log() {
@@ -63845,532 +61494,7 @@ mod conversion_log_tests {
         assert!(log.contains("CRC checked 1 (passed 1, failed 0, missing 1)"));
         assert!(log.contains("DST passthrough 1, decoded 1, reencoded 0, raw 0"));
         assert!(log.contains("bytes read 8192, written 4096"));
-        assert!(log.contains("Convert: Ok; DSD/DST stats"));
-    }
-
-    #[test]
-    fn passthrough_copy_tracks_get_pipeline_line_without_command_records() {
-        let mut source = log_test_source();
-        source.tracks[0].source_ref = TrackSourceRef::StagedFile(PathBuf::from("/stage/01.flac"));
-        source.tracks[0].sample_rate = Some(44_100);
-        source.tracks[0].bit_depth = Some(24);
-
-        let mut req = log_test_request();
-        req.settings.target_format = PlannerAudioFormat::Flac;
-        req.settings.target_sample_rate = RateTarget::Source;
-        req.settings.target_bit_depth = BitDepthTarget::Source;
-        req.settings.force_encode = false;
-
-        let artifacts = log_test_artifacts();
-        let mut record = ok_record();
-        record.commands = Vec::new();
-        record.realized_input = Some(PathBuf::from("/stage/01.flac"));
-        record.output_file = Some(PathBuf::from("/encoded/01.flac"));
-        let outcome = AlbumOutcome::Complete {
-            tracks: vec![record],
-            stages: stage_records(),
-        };
-        let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
-
-        assert!(log.contains("Pipeline: passthrough copy"));
-        assert!(log.contains("Commands: none recorded"));
-    }
-
-    #[test]
-    fn empty_command_tracks_do_not_claim_passthrough_when_audio_changes() {
-        let mut source = log_test_source();
-        source.tracks[0].source_ref = TrackSourceRef::StagedFile(PathBuf::from("/stage/01.wav"));
-        source.tracks[0].sample_rate = Some(96_000);
-        source.tracks[0].bit_depth = Some(24);
-
-        let mut req = log_test_request();
-        req.settings.target_format = PlannerAudioFormat::Flac;
-        req.settings.target_sample_rate = RateTarget::PcmHz(44_100);
-
-        let artifacts = log_test_artifacts();
-        let mut record = ok_record();
-        record.commands = Vec::new();
-        let outcome = AlbumOutcome::Complete {
-            tracks: vec![record],
-            stages: stage_records(),
-        };
-        let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
-
-        assert!(!log.contains("Pipeline: passthrough copy"));
-        assert!(log.contains("Commands: none recorded"));
-    }
-
-    #[test]
-    fn conversion_summary_shows_rate_depth_and_processing_changes() {
-        let mut source = log_test_source();
-        source.tracks[0].source_ref = TrackSourceRef::StagedFile(PathBuf::from("/stage/01.flac"));
-        source.tracks[0].sample_rate = Some(96_000);
-        source.tracks[0].bit_depth = Some(24);
-        let mut req = log_test_request();
-        req.settings.target_sample_rate = RateTarget::PcmHz(44_100);
-        req.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int16);
-        req.settings.preferred_tool = PreferredTool::Ssrc;
-        req.settings.dither_type = DitherType::Tpdf;
-        let artifacts = log_test_artifacts();
-        let mut record = ok_record();
-        record.verified_output_bit_depth = Some(PcmBitDepth::Int16);
-        record.commands = vec![command_record_for(ToolBinary::Ssrc)];
-        record.commands[0].sanitized_args = vec![
-            "--dither".to_string(),
-            "99".to_string(),
-            "--pdf".to_string(),
-            "1".to_string(),
-        ];
-        let outcome = AlbumOutcome::Complete {
-            tracks: vec![record],
-            stages: stage_records(),
-        };
-        let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
-
-        assert!(log.contains(
-            "Conversion: 24-bit/96kHz FLAC → 16-bit/44.1kHz FLAC (SSRC resampling, TPDF dither)"
-        ));
-        assert!(!log.contains("output depth unverified"));
-        assert!(log.contains("Resampling: yes (SSRC profile="));
-        assert!(log.contains("96kHz → 44.1kHz"));
-        assert!(log.contains("Bit-depth conversion: yes (24-bit → 16-bit, SSRC quantization)"));
-        assert!(log.contains("Dither: yes (TPDF via SSRC"));
-        assert!(log.contains("dither_id=99, pdf=1"));
-    }
-
-    #[test]
-    fn certified_ssrc_true_peak_terminal_log_names_ssrc_as_dither_owner() {
-        let mut source = log_test_source();
-        source.tracks.truncate(1);
-        source.tracks[0].sample_rate = Some(176_400);
-        source.tracks[0].bit_depth = Some(32);
-        source.tracks[0].source_audio = SourceAudioDescriptor::from_scalar(
-            Some(176_400),
-            Some(32),
-            Some(SourceAudioCoding::Pcm),
-        );
-
-        let mut req = log_test_request();
-        req.settings.target_format = PlannerAudioFormat::Flac;
-        req.settings.target_sample_rate = RateTarget::PcmHz(88_200);
-        req.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
-        req.settings.preferred_tool = PreferredTool::Ssrc;
-        req.settings.dither_type = DitherType::Tpdf;
-        req.settings.dither_explicit = true;
-        req.settings.pcm_true_peak.set_policy(tonepoet_pipeline::SampleGainPolicy::TruePeakGuard {
-            target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
-            scope: tonepoet_pipeline::TruePeakScope::Track,
-            scan: tonepoet_pipeline::TruePeakScanTier::Standard,
-        });
-
-        let artifacts = log_test_artifacts();
-        let mut terminal = command_record_for(ToolBinary::Ssrc);
-        terminal.description = Some(
-            "SSRC certified true-peak terminal: resample + bound gain + dither/noise shaping + quantization"
-                .to_string(),
-        );
-        terminal.sanitized_args = vec![
-            "--rate".to_string(),
-            "88200".to_string(),
-            "--bits".to_string(),
-            "24".to_string(),
-            "--mixChannels".to_string(),
-            "0.9,0;0,0.9".to_string(),
-            "--dither".to_string(),
-            "99".to_string(),
-            "--seed".to_string(),
-            "1".to_string(),
-            "--pdf".to_string(),
-            "1".to_string(),
-            "--dstContainer".to_string(),
-            "w64".to_string(),
-        ];
-        let mut package = command_record_for(ToolBinary::Ffmpeg);
-        package.description = Some("Encode FLAC from certified integer PCM".to_string());
-        package.sanitized_args = vec![
-            "-i".to_string(),
-            "/stage/terminal.w64".to_string(),
-            "-c:a".to_string(),
-            "flac".to_string(),
-            "/stage/out.flac".to_string(),
-        ];
-        let mut record = ok_record();
-        record.verified_output_bit_depth = Some(PcmBitDepth::Int24);
-        record.commands = vec![terminal, package];
-        let outcome = AlbumOutcome::Complete {
-            tracks: vec![record],
-            stages: stage_records(),
-        };
-        let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
-
-        assert!(log.contains("Dither: yes (TPDF via SSRC"), "{log}");
-        assert!(log.contains("dither_id=99, pdf=1"), "{log}");
-        assert!(!log.contains("Dither: yes (TPDF via SoX)"), "{log}");
-        assert!(log.contains("SSRC certified true-peak terminal"), "{log}");
-    }
-
-    #[test]
-    fn requested_but_unapplied_dither_is_disclosed_by_settings_and_track_lines() {
-        fn render(
-            source: &PreparedSource,
-            req: &PipelineRequest,
-            record: TrackRecord,
-        ) -> String {
-            build_conversion_log(
-                &AlbumOutcome::Complete {
-                    tracks: vec![record],
-                    stages: stage_records(),
-                },
-                source,
-                req,
-                &log_test_artifacts(),
-                None,
-            )
-        }
-
-        let source = log_test_source();
-
-        let mut automatic_int32 = log_test_request();
-        automatic_int32.settings.target_bit_depth =
-            BitDepthTarget::Pcm(PcmBitDepth::Int32);
-        automatic_int32.settings.dither_type = DitherType::Tpdf;
-        automatic_int32.settings.preferred_tool = PreferredTool::Ffmpeg;
-        let mut automatic_record = ok_record();
-        automatic_record.verified_output_bit_depth = Some(PcmBitDepth::Int32);
-        let automatic_log = render(&source, &automatic_int32, automatic_record);
-        assert!(automatic_log.contains(
-            "Dither: requested (TPDF) — not applied (32-bit default gate; selection was not explicit or Source-policy selected)"
-        ));
-        assert!(automatic_log.contains(
-            "Warning: Dither requested (TPDF) — not applied (32-bit default gate; selection was not explicit or Source-policy selected)"
-        ));
-        assert!(automatic_log.contains("dither requested but not applied"));
-
-        let mut ssrc_int32 = automatic_int32.clone();
-        ssrc_int32.settings.dither_explicit = true;
-        ssrc_int32.settings.preferred_tool = PreferredTool::Ssrc;
-        let mut ssrc_record = ok_record();
-        ssrc_record.verified_output_bit_depth = Some(PcmBitDepth::Int32);
-        let mut ssrc_command = command_record_for(ToolBinary::Ssrc);
-        ssrc_command.sanitized_args = vec![
-            "--bits".to_string(),
-            "32".to_string(),
-            "--dither".to_string(),
-            "99".to_string(),
-            "--pdf".to_string(),
-            "1".to_string(),
-        ];
-        ssrc_record.commands = vec![ssrc_command];
-        let ssrc_log = render(&source, &ssrc_int32, ssrc_record);
-        assert!(ssrc_log.contains("Dither: yes (TPDF via SSRC"));
-        assert!(ssrc_log.contains("dither_id=99, pdf=1"));
-        assert!(!ssrc_log.contains("via FFmpeg"));
-
-        let mut missing_ssrc_stage = ok_record();
-        missing_ssrc_stage.verified_output_bit_depth = Some(PcmBitDepth::Int32);
-        missing_ssrc_stage.commands = vec![command_record_for(ToolBinary::Ssrc)];
-        let missing_ssrc_log = render(&source, &ssrc_int32, missing_ssrc_stage);
-        assert!(missing_ssrc_log.contains(
-            "Dither: requested (TPDF) — not applied (executed SSRC command did not emit the resolved dither stage)"
-        ));
-        assert!(missing_ssrc_log.contains(
-            "Warning: Dither requested (TPDF) — not applied (executed SSRC command did not emit the resolved dither stage)"
-        ));
-
-        let mut sox_int32 = automatic_int32.clone();
-        sox_int32.settings.dither_explicit = true;
-        sox_int32.settings.preferred_tool = PreferredTool::Sox;
-        let mut sox_record = ok_record();
-        sox_record.verified_output_bit_depth = Some(PcmBitDepth::Int32);
-        sox_record.commands = vec![command_record_for(ToolBinary::Sox)];
-        sox_record.commands[0].sanitized_args = vec!["dither".to_string()];
-        let sox_log = render(&source, &sox_int32, sox_record);
-        assert!(sox_log.contains(
-            "Dither: requested (TPDF) — not applied (ordinary SoX Int32 dither is not behavior-qualified)"
-        ));
-        assert!(sox_log.contains(
-            "Warning: Dither requested (TPDF) — not applied (ordinary SoX Int32 dither is not behavior-qualified)"
-        ));
-        assert!(!sox_log.contains("Dither: yes (TPDF via SoX)"));
-
-        let mut gesemann_int32 = automatic_int32.clone();
-        gesemann_int32.settings.dither_explicit = true;
-        gesemann_int32.settings.dither_type = DitherType::Gesemann;
-        let mut gesemann_record = ok_record();
-        gesemann_record.verified_output_bit_depth = Some(PcmBitDepth::Int32);
-        gesemann_record.commands = vec![command_record_for(ToolBinary::Ffmpeg)];
-        let gesemann_log = render(&source, &gesemann_int32, gesemann_record);
-        assert!(gesemann_log.contains(
-            "Dither: requested (Gesemann) — not applied (not supported by the ffmpeg/soxr resampler)"
-        ));
-        assert!(gesemann_log.contains(
-            "Warning: Dither requested (Gesemann) — not applied (not supported by the ffmpeg/soxr resampler)"
-        ));
-
-        let mut float_target = automatic_int32.clone();
-        float_target.settings.dither_explicit = true;
-        float_target.settings.target_bit_depth =
-            BitDepthTarget::Pcm(PcmBitDepth::Float32);
-        let mut float_record = ok_record();
-        float_record.verified_output_bit_depth = Some(PcmBitDepth::Float32);
-        let float_log = render(&source, &float_target, float_record);
-        assert!(float_log.contains(
-            "Dither: requested (TPDF) — not applied (float targets are not dithered)"
-        ));
-        assert!(float_log.contains(
-            "Warning: Dither requested (TPDF) — not applied (float targets are not dithered)"
-        ));
-
-        let mut missing_reduction_stage = log_test_request();
-        missing_reduction_stage.settings.target_bit_depth =
-            BitDepthTarget::Pcm(PcmBitDepth::Int16);
-        missing_reduction_stage.settings.dither_type = DitherType::Tpdf;
-        let mut missing_stage_record = ok_record();
-        missing_stage_record.verified_output_bit_depth = Some(PcmBitDepth::Int16);
-        missing_stage_record.commands.clear();
-        let missing_stage_log = render(&source, &missing_reduction_stage, missing_stage_record);
-        assert!(missing_stage_log.contains(
-            "Dither: requested (TPDF) — not applied (executed command did not emit a dither stage)"
-        ));
-        assert!(missing_stage_log.contains(
-            "Warning: Dither requested (TPDF) — not applied (executed command did not emit a dither stage)"
-        ));
-
-        let mut unchanged_depth = log_test_request();
-        unchanged_depth.settings.target_bit_depth =
-            BitDepthTarget::Pcm(PcmBitDepth::Int24);
-        unchanged_depth.settings.dither_type = DitherType::Tpdf;
-        let unchanged_log = render(&source, &unchanged_depth, ok_record());
-        assert!(unchanged_log.contains(
-            "Dither: requested (TPDF) — not applied (not needed — no bit-depth reduction)"
-        ));
-    }
-
-    #[test]
-    fn conversion_summary_never_presents_unverified_planned_depth_as_measured() {
-        let mut source = log_test_source();
-        source.tracks[0].source_ref = TrackSourceRef::StagedFile(PathBuf::from("/stage/01.wav"));
-        source.tracks[0].sample_rate = Some(96_000);
-        source.tracks[0].bit_depth = Some(24);
-        let mut req = log_test_request();
-        req.settings.target_format = PlannerAudioFormat::WavPack;
-        req.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int32);
-
-        let summary = conversion_summary(&source.tracks[0], &req, None, None);
-
-        assert!(summary.contains("requested 32-bit/96kHz WavPack"), "{summary}");
-        assert!(summary.contains("[output depth unverified]"), "{summary}");
-    }
-
-    #[test]
-    fn dsd_source_rate_target_source_logs_planner_default_pcm_rate() {
-        let mut source = log_test_source();
-        source.kind = SourceKind::SacdIso;
-        source.tracks[0].sample_rate = Some(DsdRate::Dsd64.hz());
-        source.tracks[0].bit_depth = None;
-        // The PCM fixture's descriptor carries a 24-bit depth; a real SACD
-        // track would not, and the source-depth fallback must not resolve a
-        // PCM depth for a DSD source.
-        source.tracks[0].source_audio.bit_depth = None;
-        source.tracks[0].source_audio.coding = Some(SourceAudioCoding::Dsd);
-        source.tracks[0].source_ref = TrackSourceRef::SacdTrack {
-            iso: PathBuf::from("/music/source.iso"),
-            track_index: 0,
-            area: SacdArea::Stereo,
-        };
-
-        let mut req = log_test_request();
-        req.settings.target_format = PlannerAudioFormat::Flac;
-        req.settings.target_sample_rate = RateTarget::Source;
-        // Select the qualified Reference pathway explicitly so the log exercises
-        // Reference policy wording rather than ordinary general DSD processing.
-        req.settings.dsd = tonepoet_pipeline::DsdSettings::reference();
-
-        let artifacts = log_test_artifacts();
-        let mut record = ok_record();
-        record.commands = vec![command_record_for(ToolBinary::Sox)];
-        record.commands[0].description = Some("Reference DSD to PCM conversion".to_string());
-        record.commands[0].sanitized_args = vec![
-            "rate".to_string(),
-            "88200".to_string(),
-            "dither".to_string(),
-        ];
-        let outcome = AlbumOutcome::Complete {
-            tracks: vec![record],
-            stages: stage_records(),
-        };
-        let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
-
-        assert!(log.contains("Resampling: yes (sox_ng rate, Reference policy, DSD64 → 88.2kHz)"));
-        assert!(log.contains("Bit-depth conversion: yes (DSD → 24-bit"));
-        assert!(log.contains("Dither: yes (TPDF, sox_ng, Reference policy)"));
-        // The record has no verified output depth, so the PCM-lossless target
-        // is labelled as requested and flagged unverified (D6 honesty).
-        assert!(
-            log.contains(
-                "Conversion: DSD64 DSD → requested 24-bit (default for DSD source) at 88.2kHz FLAC"
-            ),
-            "{log}"
-        );
-        assert!(!log.contains("2822.4kHz FLAC"), "{log}");
-    }
-
-    #[test]
-    fn reference_int32_conversion_log_names_commissioned_ffmpeg_triangular_terminal() {
-        let mut source = log_test_source();
-        source.kind = SourceKind::SacdIso;
-        source.tracks[0].sample_rate = Some(DsdRate::Dsd64.hz());
-        source.tracks[0].bit_depth = None;
-        source.tracks[0].source_audio.bit_depth = None;
-        source.tracks[0].source_audio.coding = Some(SourceAudioCoding::Dsd);
-        source.tracks[0].source_ref = TrackSourceRef::SacdTrack {
-            iso: PathBuf::from("/music/source.iso"),
-            track_index: 0,
-            area: SacdArea::Stereo,
-        };
-
-        let mut req = log_test_request();
-        req.settings.target_format = PlannerAudioFormat::Wav;
-        req.settings.target_sample_rate = RateTarget::Source;
-        req.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int32);
-        req.settings.dsd = tonepoet_pipeline::DsdSettings::reference();
-
-        let mut record = ok_record();
-        record.verified_output_bit_depth = Some(PcmBitDepth::Int32);
-        record.commands = vec![
-            command_record_for(ToolBinary::Sox),
-            command_record_for(ToolBinary::Ffmpeg),
-        ];
-        record.commands[0].description =
-            Some("Normalize protected Reference Wave64 to true-scale Float64 carrier".to_string());
-        record.commands[0].sanitized_args = vec![
-            "-t".to_string(),
-            "raw".to_string(),
-            "-e".to_string(),
-            "floating-point".to_string(),
-            "-b".to_string(),
-            "64".to_string(),
-            "-L".to_string(),
-        ];
-        record.commands[1].description =
-            Some("Commissioned Reference FFmpeg Int32 triangular terminal".to_string());
-        record.commands[1].sanitized_args = vec![
-            "-af".to_string(),
-            "aresample=resampler=soxr:out_sample_rate=88200:precision=33:cutoff=0.95:dither_method=triangular:out_sample_fmt=s32".to_string(),
-            "-c:a".to_string(),
-            "pcm_s32le".to_string(),
-        ];
-
-        let outcome = AlbumOutcome::Complete {
-            tracks: vec![record],
-            stages: stage_records(),
-        };
-        let log = build_conversion_log(
-            &outcome,
-            &source,
-            &req,
-            &log_test_artifacts(),
-            None,
-        );
-
-        assert!(log.contains(
-            "Dither: yes (TPDF, commissioned FFmpeg/libswresample Int32 triangular terminal, Reference policy)"
-        ), "{log}");
-        assert!(!log.contains("Dither: yes (TPDF, sox_ng, Reference policy)"), "{log}");
-    }
-
-    #[test]
-    fn explicit_dsd_to_pcm_depth_does_not_claim_default_policy() {
-        let mut source = log_test_source();
-        source.kind = SourceKind::SacdIso;
-        source.tracks[0].sample_rate = Some(DsdRate::Dsd64.hz());
-        source.tracks[0].bit_depth = None;
-        source.tracks[0].source_audio.bit_depth = None;
-        source.tracks[0].source_audio.coding = Some(SourceAudioCoding::Dsd);
-        source.tracks[0].source_ref = TrackSourceRef::SacdTrack {
-            iso: PathBuf::from("/music/source.iso"),
-            track_index: 0,
-            area: SacdArea::Stereo,
-        };
-
-        let mut req = log_test_request();
-        req.settings.target_format = PlannerAudioFormat::Flac;
-        req.settings.target_sample_rate = RateTarget::Source;
-        req.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
-
-        let outcome = AlbumOutcome::Complete {
-            tracks: vec![ok_record()],
-            stages: stage_records(),
-        };
-        let log = build_conversion_log(
-            &outcome,
-            &source,
-            &req,
-            &log_test_artifacts(),
-            None,
-        );
-
-        assert!(log.contains("requested 24-bit/88.2kHz FLAC"), "{log}");
-        assert!(!log.contains("default for DSD source"), "{log}");
-    }
-
-    #[test]
-    fn target_dsd_rates_are_logged_as_dsd_rate_labels() {
-        let mut source = log_test_source();
-        source.tracks[0].sample_rate = Some(96_000);
-        source.tracks[0].bit_depth = Some(24);
-
-        let mut req = log_test_request();
-        req.settings.target_format = PlannerAudioFormat::Dsf;
-        req.settings.target_sample_rate = RateTarget::Dsd(DsdRate::Dsd128);
-
-        let artifacts = log_test_artifacts();
-        let mut record = ok_record();
-        record.commands = vec![command_record_for(ToolBinary::Sox)];
-        record.commands[0].description = Some("Convert PCM to DSD".to_string());
-        record.commands[0].sanitized_args = vec!["rate".to_string(), "5644800".to_string()];
-        let outcome = AlbumOutcome::Complete {
-            tracks: vec![record],
-            stages: stage_records(),
-        };
-        let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
-
-        assert!(log.contains("Resampling: yes (SoX rate"));
-        assert!(log.contains("96kHz → DSD128"));
-        assert!(log.contains("Bit-depth conversion: no (PCM bit depth not applicable — DSD target)"));
-        assert!(log.contains("Dither: no (not requested)"));
-        assert!(log.contains("Conversion: 24-bit/96kHz WAV → DSD128 DSF"));
-        assert!(!log.contains("Conversion: 24-bit/96kHz WAV → 5644.8kHz DSF"));
-    }
-
-    #[test]
-    fn pcm_to_dsd64_target_summary_uses_dsd_rate_label_not_hz() {
-        let mut source = log_test_source();
-        source.tracks[0].sample_rate = Some(96_000);
-        source.tracks[0].bit_depth = Some(24);
-        source.tracks[0].source_ref = TrackSourceRef::StagedFile(PathBuf::from("/stage/01.wav"));
-
-        let mut req = log_test_request();
-        req.settings.target_format = PlannerAudioFormat::Dsf;
-        req.settings.target_sample_rate = RateTarget::Dsd(DsdRate::Dsd64);
-
-        let artifacts = log_test_artifacts();
-        let mut record = ok_record();
-        record.commands = vec![command_record_for(ToolBinary::Sox)];
-        record.commands[0].description = Some("Convert PCM to DSD".to_string());
-        record.commands[0].sanitized_args = vec!["rate".to_string(), "2822400".to_string()];
-        let outcome = AlbumOutcome::Complete {
-            tracks: vec![record],
-            stages: stage_records(),
-        };
-        let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
-
-        assert!(log.contains("Resampling: yes (SoX rate"));
-        assert!(log.contains("96kHz → DSD64"));
-        assert!(log.contains("Bit-depth conversion: no (PCM bit depth not applicable — DSD target)"));
-        assert!(log.contains("Dither: no (not requested)"));
-        assert!(log.contains("Conversion: 24-bit/96kHz WAV → DSD64 DSF"));
-        assert!(!log.contains("2822.4kHz DSF"));
+        assert!(!log.contains("Stage Summary"));
     }
 
     #[test]
@@ -64618,7 +61742,7 @@ mod conversion_log_tests {
         };
         let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
 
-        assert!(log.contains("Metadata: Not requested"));
+        assert!(!log.contains("Metadata: Not requested"));
         assert!(log.contains(
             "Artwork: extracted JPEG from source image → not requested (metadata stage disabled)"
         ));
@@ -64694,26 +61818,31 @@ mod conversion_log_tests {
     }
 
     #[test]
-    fn log_values_escape_control_characters_without_dropping_text() {
+    fn log_values_escape_control_characters_without_dropping_rendered_text() {
         assert_eq!(
             escape_log_value("line1\nline2\ttail"),
             "line1\\nline2\\ttail"
         );
         let mut record = ok_record();
         record.outcome = TrackOutcome::Err("first line\nsecond line".to_string());
+        // Raw argv is intentionally no longer a human-log processing authority;
+        // it remains in the structured execution record. Exercise escaping on
+        // values the human log still renders instead of reviving command traces.
         record.commands[0].sanitized_args = vec!["arg\nnext".to_string()];
         let outcome = AlbumOutcome::Partial {
             successful: vec![],
             failed: vec![record],
             stages: vec![],
         };
-        let source = log_test_source();
+        let mut source = log_test_source();
+        source.tracks[0].warnings = vec!["warning line\nnext".to_string()];
         let req = log_test_request();
         let artifacts = log_test_artifacts();
         let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
 
         assert!(log.contains("Error: first line\\nsecond line"));
-        assert!(log.contains("'arg\\nnext'"));
+        assert!(log.contains("Warning: warning line\\nnext"));
+        assert!(!log.contains("arg\\nnext"));
     }
 
     #[test]
@@ -69120,6 +66249,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             realized_input: None,
             output_file,
             commands: Vec::new(),
+            execution_evidence: Default::default(),
             bytes_in: None,
             bytes_out: None,
             duration: None,
@@ -69510,6 +66640,14 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             "terminal log must retain the bound album gain; actual log:\n{log}"
         );
         assert!(log.contains("2 measured DSD track(s)"));
+        assert!(
+            log.contains("Result: Blocked (required stage failed: ReplayGain)"),
+            "terminal log must retain the authoritative blocked album outcome; actual log:\n{log}"
+        );
+        assert!(
+            !log.contains("Result: Complete"),
+            "a failed required stage must never be reported as a complete album; actual log:\n{log}"
+        );
     }
 
     #[test]
@@ -72989,7 +70127,6 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             source_blocking_lines: String::new(),
             provenance_section: "Provenance\n----------\nNo provenance details were recorded.\n\n".to_string(),
             artwork_section: "Artwork\n-------\nNo artwork was embedded.\n\n".to_string(),
-            conversion_settings_section: "Target format: FLAC\n".to_string(),
         }
     }
 
@@ -73019,6 +70156,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             common: fragment_test_common(batch_id),
             track: ConversionLogTrackFragment {
                 section: section.to_string(),
+                ..ConversionLogTrackFragment::default()
             },
             summary: ConversionLogTrackSummary {
                 outcome,
@@ -73030,6 +70168,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                 },
                 duration_millis: Some(1_000 * u64::from(track_number)),
             },
+            album_block_reason: None,
             stages: vec![StageRecord {
                 stage: PipelineStage::Convert,
                 outcome: if outcome == ConversionLogTrackOutcome::Success {
@@ -73422,8 +70561,12 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             rendered_album_dir: conversion_log_rendered_album_dir_for_track(source, req, artifacts, &record.track_id)
                 .map(|path| normalize_path(&path).to_string_lossy().to_string()),
             common: build_conversion_log_common_fragment(outcome, source, req, artifacts),
-            track: ConversionLogTrackFragment { section },
+            track: ConversionLogTrackFragment {
+                section,
+                ..ConversionLogTrackFragment::default()
+            },
             summary: ConversionLogTrackSummary::from_track_record(record),
+            album_block_reason: outcome_block_reason(outcome).cloned(),
             stages: outcome_stage_records(outcome).to_vec(),
         }
     }
@@ -74470,7 +71613,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
     }
 
     #[test]
-    fn fragment_assembled_log_preserves_not_requested_and_skip_reasons() {
+    fn fragment_assembled_log_omits_non_events_and_stage_summary_lines() {
         let mut source = log_test_source();
         source.tracks.truncate(1);
         let mut req = log_test_request();
@@ -74518,16 +71661,17 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
 
         let assembled = build_conversion_log_from_fragments(&[fragment]);
 
-        assert!(assembled.contains("Merge: Not requested"));
-        assert!(assembled.contains(
-            "Metadata: Skipped (already satisfied by the output planner)"
-        ));
-        assert!(assembled.contains(
-            "ReplayGain: Skipped (ReplayGain writer is unavailable for this output)"
-        ));
-        assert!(assembled.contains("Features: Not requested"));
+        assert!(!assembled.contains("Stage Summary"));
+        assert!(!assembled.contains("Merge: Not requested"));
+        assert!(!assembled.contains("Features: Not requested"));
         assert!(!assembled.contains("Metadata: Not requested"));
         assert!(!assembled.contains("ReplayGain: Not requested"));
+        assert!(!assembled.contains(
+            "Metadata: Skipped (already satisfied by the output planner)"
+        ));
+        assert!(!assembled.contains(
+            "ReplayGain: Skipped (ReplayGain writer is unavailable for this output)"
+        ));
     }
 
     #[test]
@@ -75103,9 +72247,6 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         failed_first.common.source_blocking_lines.clear();
         failed_first.common.provenance_section.clear();
         failed_first.common.artwork_section.clear();
-        failed_first.common.conversion_settings_section = "Target format: FLAC
-Request-only setting: yes
-".to_string();
 
         let mut successful_later = fragment_test_fragment(
             &album_dir,
@@ -75134,9 +72275,6 @@ Recovered provenance
         successful_later.common.artwork_section = "Artwork: recovered cover
 
 ".to_string();
-        successful_later.common.conversion_settings_section = "Target format: FLAC
-Source-aware setting: yes
-".to_string();
 
         let log = build_conversion_log_from_fragments(&[successful_later, failed_first]);
 
@@ -75152,8 +72290,8 @@ Source-aware setting: yes
         assert!(log.contains("Recovered provenance"));
         assert!(log.contains("Artwork: recovered cover"));
         assert!(
-            log.contains("Source-aware setting: yes"),
-            "conversion settings should prefer the first source-aware common fragment over request-only settings"
+            !log.contains("Request-only setting") && !log.contains("Source-aware setting"),
+            "requested settings are not rendered as performed processing"
         );
         assert!(
             log.find("Track 1").expect("track 1 section")
@@ -78479,42 +75617,6 @@ mod validate_encoded_output_tests {
 
         assert_eq!(validation.measured_depth, Some(tonepoet_pipeline::PcmBitDepth::Int24));
     }
-
-    #[test]
-    fn conversion_summary_uses_measured_float_kind_and_source_audio_depth_fallback() {
-        let mut track = non_dvda_validation_test_track(Some(1_000), Some(192_000));
-        track.bit_depth = None;
-        track.source_audio.bit_depth = Some(24);
-        let mut req = super::pipeline_test_helpers::log_test_request();
-        req.settings.target_format = tonepoet_pipeline::AudioFormat::Aiff;
-        req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(
-            tonepoet_pipeline::PcmBitDepth::Float32,
-        );
-
-        let summary = conversion_summary(
-            &track,
-            &req,
-            Some(tonepoet_pipeline::PcmBitDepth::Float32),
-            None,
-        );
-
-        assert!(summary.contains("24-bit/192kHz WAV"), "{summary}");
-        assert!(summary.contains("32-bit float/192kHz AIFF"), "{summary}");
-
-        track.source_audio.bit_depth = Some(320);
-        let float_source_summary = conversion_summary(
-            &track,
-            &req,
-            Some(tonepoet_pipeline::PcmBitDepth::Float32),
-            None,
-        );
-
-        assert!(
-            float_source_summary.contains("32-bit float/192kHz WAV"),
-            "{float_source_summary}"
-        );
-    }
-
     #[tokio::test]
     async fn post_encode_depth_validation_rejects_silent_flac_32_to_24_substitution() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -79258,10 +76360,10 @@ mod publish_lock_soundness_tests {
                 source_blocking_lines: String::new(),
                 provenance_section: String::new(),
                 artwork_section: String::new(),
-                conversion_settings_section: "Target format: FLAC\n".to_string(),
             },
             track: ConversionLogTrackFragment {
                 section: format!("Track {track_number}\n  Result: OK\n"),
+                ..ConversionLogTrackFragment::default()
             },
             summary: ConversionLogTrackSummary {
                 outcome: ConversionLogTrackOutcome::Success,
@@ -79269,6 +76371,7 @@ mod publish_lock_soundness_tests {
                 bytes_out: Some(5),
                 duration_millis: Some(1000),
             },
+            album_block_reason: None,
             stages: Vec::new(),
         }
     }

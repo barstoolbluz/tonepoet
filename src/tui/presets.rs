@@ -851,6 +851,7 @@ impl TuiPreset {
                 Some(value) => {
                     format_state.deemphasis_enabled = value;
                     format_state.deemphasis_overridden = true;
+                    format_state.deemphasis_override_from_preset = true;
                     report.record("deemphasis", true);
                 }
                 None => {
@@ -858,6 +859,7 @@ impl TuiPreset {
                     // control to automatic policy rather than retaining a
                     // stale explicit override from the current session.
                     format_state.deemphasis_overridden = false;
+                    format_state.deemphasis_override_from_preset = false;
                     format_state.recompute_auto_deemphasis();
                 }
             }

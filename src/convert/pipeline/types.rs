@@ -496,6 +496,7 @@ pub enum DeemphasisChoiceOrigin {
     #[default]
     Automatic,
     User,
+    Preset,
 }
 
 impl DeemphasisChoiceOrigin {
@@ -509,6 +510,7 @@ impl DeemphasisChoiceOrigin {
         match self {
             Self::Automatic => "automatic",
             Self::User => "user",
+            Self::Preset => "preset",
         }
     }
 }
@@ -3349,6 +3351,9 @@ pub struct TrackRecord {
     pub realized_input: Option<PathBuf>,
     pub output_file: Option<PathBuf>,
     pub commands: Vec<crate::convert::pipeline::tool::CommandRecord>,
+    /// Authoritative semantic evidence captured at execution/result boundaries.
+    #[serde(default)]
+    pub execution_evidence: super::execution_evidence::TrackExecutionEvidence,
     pub bytes_in: Option<u64>,
     pub bytes_out: Option<u64>,
     pub duration: Option<Duration>,
@@ -3467,6 +3472,10 @@ pub struct PipelineReport {
     /// requests with no configured actions, preserving prior serialized output.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub action_reports: Vec<super::actions::ActionPhaseReport>,
+    /// Bounded summaries of discarded scratch-backed attempts retained across
+    /// the one existing scratch-to-disk retry boundary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prior_attempts: Vec<super::execution_evidence::PriorAttemptSummary>,
 }
 
 /// Lifetime owner for a foreground FUSE mount used by a materialized source.

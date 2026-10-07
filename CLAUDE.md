@@ -279,7 +279,16 @@ cargo test -p tonepoet-true-peak   # BS.1770 true-peak + loudness core (~41 min)
 Tests are in `crates/*/tests/` directories, `src/` (inline `#[cfg(test)]` modules), and `tests/` (integration/contract/sentinel tests). The workspace suite is ~7,210 tests across 57 targets, plus 160 in `tonepoet-true-peak`.
 NEVER truncate failure output.
 
-**The suite is 7363 tests across 63 targets.** As of 2026-10-06, after R31-R35, the
+**The suite is 7340 tests across 63 targets.** The count fell from 7363 when the
+logging/evidence redesign removed tests that asserted log content inferred from
+argv rather than from execution receipts.
+
+**Conversion log evidence.** As of 2026-10-07 the conversion log is projected from
+`src/convert/pipeline/execution_evidence.rs` using typed execution receipts. It does
+not parse argv to infer what happened. Failure paths retain typed semantic evidence;
+quantization ownership and dither ownership are distinct facts; compound terminals
+link every physical invocation that realized them. Multi-value metadata renders as a
+JSON array rather than silently keeping the first value. As of 2026-10-06, after R31-R35, the
 long-standing coordination flake appears resolved: **12/12 consecutive unserialized
 `-p tonepoet --lib` runs clean**, and a full gate at 7363/0. Measured per-run failure
 rates fell across the series: 0.40 (R31), 0.30 (R32), 0.25 (R33), 0.17 (R34), 0.00

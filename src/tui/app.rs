@@ -926,6 +926,7 @@ pub struct ConvertProbeFormatSnapshot {
     pub resampler_overridden: bool,
     pub deemphasis_enabled: bool,
     pub deemphasis_overridden: bool,
+    pub deemphasis_override_from_preset: bool,
 }
 
 impl ConvertProbeFormatSnapshot {
@@ -947,6 +948,7 @@ impl ConvertProbeFormatSnapshot {
             resampler_overridden: format.resampler_overridden,
             deemphasis_enabled: format.deemphasis_enabled,
             deemphasis_overridden: format.deemphasis_overridden,
+            deemphasis_override_from_preset: format.deemphasis_override_from_preset,
         }
     }
 }
@@ -5012,6 +5014,9 @@ pub struct FormatState {
     pub deemphasis_evidence: ConvertDeemphasisEvidence,
     pub deemphasis_enabled: bool,
     pub deemphasis_overridden: bool,
+    /// True only when the explicit de-emphasis choice came from preset application.
+    /// Direct user changes and automatic policy clear this bit.
+    pub(crate) deemphasis_override_from_preset: bool,
     /// Aggregate batch counts for promoted warning text.
     pub deemphasis_explicit_count: usize,
     pub deemphasis_cue_count: usize,
@@ -5361,6 +5366,7 @@ impl FormatState {
             deemphasis_evidence: ConvertDeemphasisEvidence::None,
             deemphasis_enabled: false,
             deemphasis_overridden: false,
+            deemphasis_override_from_preset: false,
             deemphasis_explicit_count: 0,
             deemphasis_cue_count: 0,
             deemphasis_catalog_count: 0,
@@ -5769,6 +5775,7 @@ impl FormatState {
     fn record_manual_deemphasis_choice(&mut self, enabled: bool) {
         self.deemphasis_enabled = enabled;
         self.deemphasis_overridden = true;
+        self.deemphasis_override_from_preset = false;
         if self.dither_override_from_preset {
             self.dither_overridden = false;
             self.dither_override_from_preset = false;
@@ -6633,6 +6640,7 @@ impl FormatState {
         self.deemphasis_evidence = ConvertDeemphasisEvidence::None;
         self.deemphasis_enabled = false;
         self.deemphasis_overridden = false;
+        self.deemphasis_override_from_preset = false;
         self.deemphasis_explicit_count = 0;
         self.deemphasis_cue_count = 0;
         self.deemphasis_catalog_count = 0;

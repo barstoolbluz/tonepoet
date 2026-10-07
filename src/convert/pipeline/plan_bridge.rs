@@ -3332,13 +3332,6 @@ pub(crate) fn resolve_wavpack_hybrid_source_working_depth(
         .unwrap_or_else(|| default_pcm_depth_for_format(&PlannerFormat::WavPack))
 }
 
-/// Resolve the original-source width used by the planner's dither decision.
-/// The realized carrier is deliberately excluded: the planner treats a missing
-/// authoritative width conservatively and applies dither for integer targets
-/// below 32 bits, so the conversion log must make the same decision.
-pub(super) fn resolve_dither_source_pcm_depth(track: &PreparedTrack) -> Option<PcmBitDepth> {
-    resolve_source_pcm_depth(track)
-}
 
 fn pcm_segment_carrier_depth_descriptor(track: &PreparedTrack) -> Option<u32> {
     match &track.source_ref {

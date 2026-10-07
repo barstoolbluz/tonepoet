@@ -38,6 +38,7 @@ use crate::convert::pipeline::{
     encode_realized_track_for_scheduler_with_tool_limits_and_version_cache,
     encode_track_for_scheduler_with_tool_limits_and_version_cache,
     map_album_outcome,
+    append_prior_attempt_bounded, summarize_prior_attempt, summarize_track_records_prior_attempt,
     prepare_pipeline_item_for_scheduler_with_tool_limits,
     PreparedSource,
     realize_track_for_scheduler_with_tool_limits_and_version_cache,
@@ -56,7 +57,7 @@ use crate::convert::pipeline::{
 use crate::convert::pipeline::stages::{
     DsdAlbumGainScopeDisclosure, DsdAlbumGainScopeParticipant,
     disk_staging_parent_for, independent_single_file_album_batch_lifecycle_key,
-    pipeline_report_requests_scratch_disk_retry, plan_album_dir_from_dispatch_metadata,
+    pipeline_report_requests_scratch_disk_retry, refresh_portable_durable_log_best_effort, plan_album_dir_from_dispatch_metadata,
     prepare_independent_single_file_album_batch_for_completion_order_dispatch,
     prepare_verified_single_file_album_batch_completion_order_fallback,
     resolve_dsd_album_gain_post_barrier_rerun,
@@ -6041,6 +6042,10 @@ fn run_album_postprocess_work_scoped(
                 )
             {
                 let original_error = scratch_track_retry_original_error(&outputs);
+                let prior_attempt = summarize_track_records_prior_attempt(
+                    outputs.iter().map(|output| &output.record),
+                    format!("scratch storage retry: {original_error}"),
+                );
                 retry_req.scratch_staging = None;
                 log::warn!(
                     "scratch retrying on disk: job_id={}, item_id={}, disk_staging_path={}, original_error={}",
@@ -6051,7 +6056,7 @@ fn run_album_postprocess_work_scoped(
                 );
                 drop(outputs);
                 drop(album);
-                let report = Box::pin(retry_scratch_backed_item_once_on_disk_for_scheduler(
+                let mut report = Box::pin(retry_scratch_backed_item_once_on_disk_for_scheduler(
                     retry_req,
                     &runner,
                     &reporter,
@@ -6060,6 +6065,8 @@ fn run_album_postprocess_work_scoped(
                     Some(tool_concurrency_limits),
                 ))
                 .await;
+                append_prior_attempt_bounded(&mut report.prior_attempts, prior_attempt);
+                refresh_portable_durable_log_best_effort(&report);
                 let warning_count = source_warning_count(report.source.as_ref());
                 let status = map_album_outcome(
                     &report.outcome,
@@ -6109,7 +6116,11 @@ fn run_album_postprocess_work_scoped(
                             disk_staging_parent_for(&retry_req).display(),
                             original_error
                         );
-                        Box::pin(retry_scratch_backed_item_once_on_disk_for_scheduler(
+                        let prior_attempt = summarize_prior_attempt(
+                            &report,
+                            format!("scratch storage retry: {original_error}"),
+                        );
+                        let mut retry_report = Box::pin(retry_scratch_backed_item_once_on_disk_for_scheduler(
                             retry_req,
                             &runner,
                             &reporter,
@@ -6117,7 +6128,15 @@ fn run_album_postprocess_work_scoped(
                             &tool_paths,
                             Some(tool_concurrency_limits),
                         ))
-                        .await
+                        .await;
+                        let mut attempts = report.prior_attempts.clone();
+                        append_prior_attempt_bounded(&mut attempts, prior_attempt);
+                        for attempt in std::mem::take(&mut retry_report.prior_attempts) {
+                            append_prior_attempt_bounded(&mut attempts, attempt);
+                        }
+                        retry_report.prior_attempts = attempts;
+                        refresh_portable_durable_log_best_effort(&retry_report);
+                        retry_report
                     }
                 } else {
                     report
@@ -6535,6 +6554,7 @@ mod tests {
                 duration: None,
                 verified_output_bit_depth: None,
                 dsd_dst_stats: None,
+                execution_evidence: Default::default(),
             },
             artifact: None,
             ok: false,
@@ -9188,6 +9208,7 @@ FILE "track.flac" WAVE
                 realized_input: Some(realized_path),
                 output_file: Some(failed_staged_path),
                 commands: Vec::new(),
+                execution_evidence: Default::default(),
                 bytes_in: None,
                 bytes_out: None,
                 duration: None,
@@ -9251,6 +9272,7 @@ FILE "track.flac" WAVE
                     &disk_req.settings,
                 )),
                 manifest_path: None,
+                prior_attempts: Vec::new(),
                 action_reports: Vec::new(),
             })
         }));
@@ -9486,6 +9508,7 @@ FILE "track.flac" WAVE
                 realized_input: None,
                 output_file: Some(failed_staged_path),
                 commands: Vec::new(),
+                execution_evidence: Default::default(),
                 bytes_in: None,
                 bytes_out: None,
                 duration: None,
@@ -9578,6 +9601,7 @@ FILE "track.flac" WAVE
                         tonepoet_pipeline::fingerprint::settings_fingerprint(&hook_req.settings),
                     ),
                     manifest_path: None,
+                    prior_attempts: Vec::new(),
                     action_reports: Vec::new(),
                 })
             },
@@ -9804,6 +9828,7 @@ FILE "track.flac" WAVE
                 realized_input: None,
                 output_file: Some(staged_path.clone()),
                 commands: Vec::new(),
+                execution_evidence: Default::default(),
                 bytes_in: Some(1024),
                 bytes_out: Some(1024),
                 duration: None,
@@ -9925,6 +9950,7 @@ FILE "track.flac" WAVE
                         tonepoet_pipeline::fingerprint::settings_fingerprint(&hook_req.settings),
                     ),
                     manifest_path: None,
+                    prior_attempts: Vec::new(),
                     action_reports: Vec::new(),
                 })
             },
@@ -10102,6 +10128,7 @@ FILE "track.flac" WAVE
                         realized_input: Some(realized_path.clone()),
                         output_file: Some(staged_path.clone()),
                         commands: Vec::new(),
+                        execution_evidence: Default::default(),
                         bytes_in: Some(1024),
                         bytes_out: Some(1024),
                         duration: None,
@@ -10230,6 +10257,7 @@ FILE "track.flac" WAVE
                         &disk_req.settings,
                     )),
                     manifest_path: None,
+                    prior_attempts: Vec::new(),
                     action_reports: Vec::new(),
                 })
             }));
@@ -10445,6 +10473,7 @@ FILE "track.flac" WAVE
                 realized_input: Some(realized_path),
                 output_file: Some(staged_path.clone()),
                 commands: Vec::new(),
+                execution_evidence: Default::default(),
                 bytes_in: Some(1024),
                 bytes_out: Some(1024),
                 duration: None,
@@ -10452,7 +10481,7 @@ FILE "track.flac" WAVE
                 verified_output_bit_depth: None,
             },
             artifact: Some(TrackArtifact {
-                    reference_evidence: None,
+                reference_evidence: None,
                 track_id,
                 staged_path,
                 final_path,
@@ -10505,6 +10534,7 @@ FILE "track.flac" WAVE
                     &disk_req.settings,
                 )),
                 manifest_path: None,
+                prior_attempts: Vec::new(),
                 action_reports: Vec::new(),
             })
         }));
@@ -12776,6 +12806,8 @@ FILE "disc2.flac" WAVE
             realized_path: temp.path().join("realized.wav"),
             realized_dsd_dst_stats: None,
             scalar_pump: None,
+            materialized_scalar: None,
+            preparation_evidence: Default::default(),
             preparation_commands: Vec::new(),
             req: request,
             staging_root: temp.path().join("staging"),

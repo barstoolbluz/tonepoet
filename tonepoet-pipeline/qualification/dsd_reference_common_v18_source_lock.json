@@ -6,9 +6,9 @@
     "reference_source_lock.rs": "0b1bc863c63024806cd87d8c34ead48e8d8b08118d4be73e6e205d966b99b2b9",
     "src/convert/pipeline/coordination_name.rs": "02e0e1817e9806e5c8f8efdf52dc647f223d8d0c5fdf79d23bd10f2b11eab891",
     "src/convert/pipeline/manifest_builder.rs": "74e4ef54ed509397259c02880a64d5d390007b0b1918645cbcb165d0b9a976b9",
-    "src/convert/pipeline/plan_bridge.rs": "248b95b277ff61ed0e127b6d651b509e1bfed41061a2957b83dc023140ff3e22",
-    "src/convert/pipeline/stages.rs": "ebeae26b22e9faa056056d9dbe3d6e189e1d1b540454519e60a2f491a382e245",
-    "src/convert/pipeline/track_executor.rs": "6005655231bacf7c856a2e95d55f5cebd4e8097e7ac83b494cef13663919e2b8",
+    "src/convert/pipeline/plan_bridge.rs": "bc66276f7234430a551cfa8609565c63affa5f4235dbcc0e696726caabddafb2",
+    "src/convert/pipeline/stages.rs": "52647d81a464b8bcad0f51bb66abd0a8870e801d04422708d6f01ac56e11dfff",
+    "src/convert/pipeline/track_executor.rs": "f5fdeb2669afa715902f4d7296d389468de901076a18a928b52b3dfb803b8b2b",
     "src/convert/replaygain.rs": "cfa021f5fc480edd86ca1fdc506e133d5ac0057847b04b692f3e66ee3a509978",
     "src/fs_limits.rs": "1f53208b4ef74b08efb00719ec70ad442b74c2cf455ad311a65c9082df57f19e",
     "tonepoet-pipeline/Cargo.toml": "29caa6c045c357d818f5f180e0a6e93f24e0c90e9f9c1f109585478d5831a558",
@@ -25,6 +25,6 @@
     "tonepoet-pipeline/src/tools.rs": "aedd497da07bb9d6d4fe04942109a4983a1590f87e64b1f73dc25d8e7e372bf4",
     "tonepoet-pipeline/src/w64.rs": "caa669e1e323a36dce7aa7154abed1dabff77865a391fe2530fe5b5fd960ebdb"
   },
-  "runtime_closure_fingerprint_sha256": "7d567651773d9ea6753d3ff8f1f629a5884bbbb2e68ee4de03d51228b4338909",
+  "runtime_closure_fingerprint_sha256": "27818fbbfa418c5f5fc6fb8facb7324d306b050abcb43cfe419aac82417f78d6",
   "schema_version": 1
 }
