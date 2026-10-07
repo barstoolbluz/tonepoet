@@ -155,3 +155,106 @@ fn sidecar_covers_exactly_the_locked_source_set() {
         );
     }
 }
+
+/// Gate: the embedded in-process attestation must still describe this tree.
+///
+/// `sacd-rs` is deliberately NOT in `REFERENCE_COMMON_SOURCE_PATHS`, so the
+/// source-lock tests above cannot see it. But `sacd_rs::REFERENCE_BUILD_ID` is a
+/// SHA-256 of that crate's own source, computed in its `build.rs`, and
+/// `realize_track` compares it against the `sacd_rs_build_identity` recorded in
+/// the qualification manifest it embeds at compile time. The DST fixture, its
+/// manifest, its provenance, the commission attestation and the standards-literal
+/// oracle are compared the same way.
+///
+/// So editing any `sacd-rs` source file, or any of those assets, invalidates the
+/// installed qualification exactly as touching a locked file does — every
+/// compressed-DSD source then refuses at runtime with "Reference production
+/// promotion is inactive" — and nothing else in the gate notices. This closes
+/// that second door.
+///
+/// Mirrors the production comparison in `realize_track`; it is string and digest
+/// equality only, needs no audio tools, and names what drifted.
+#[test]
+fn embedded_in_process_attestation_binds_the_current_sacd_rs_build() {
+    use sha2::{Digest, Sha256};
+
+    const MANIFEST: &str = "tonepoet-pipeline/qualification/dsd_reference_sox_ng_14_8_0_1_v18.json";
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let raw = std::fs::read_to_string(root.join(MANIFEST))
+        .unwrap_or_else(|error| panic!("read {MANIFEST}: {error}"));
+    let manifest: serde_json::Value =
+        serde_json::from_str(&raw).unwrap_or_else(|error| panic!("parse {MANIFEST}: {error}"));
+    let in_process = manifest
+        .get("in_process")
+        .expect("qualification manifest must carry an in_process attestation");
+    let field = |key: &str| -> String {
+        in_process
+            .get(key)
+            .and_then(|value| value.as_str())
+            .unwrap_or_else(|| panic!("in_process.{key} must be a string"))
+            .to_owned()
+    };
+    let sha256_of = |relative: &str| -> String {
+        let path = root.join(relative);
+        let bytes = std::fs::read(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        format!("{:x}", Sha256::digest(&bytes))
+    };
+
+    // (what the manifest recorded, what this tree actually is, what drifted)
+    let checks: Vec<(String, String, &str)> = vec![
+        (
+            field("sacd_rs_build_identity"),
+            sacd_rs::REFERENCE_BUILD_ID.to_owned(),
+            "crates/sacd-rs/ source (its build identity is a hash of its own source)",
+        ),
+        (
+            format!("sha256:{}", field("dst_fixture_digest")),
+            sacd_rs::DST_REFERENCE_FIXTURE_CORPUS_ID.to_owned(),
+            "the DST reference fixture corpus",
+        ),
+        (
+            format!("sha256:{}", field("dst_fixture_manifest_digest")),
+            sacd_rs::DST_REFERENCE_FIXTURE_MANIFEST_ID.to_owned(),
+            "the DST reference fixture manifest",
+        ),
+        (
+            format!("sha256:{}", field("dst_fixture_provenance_digest")),
+            sacd_rs::DST_REFERENCE_FIXTURE_PROVENANCE_ID.to_owned(),
+            "the DST reference fixture provenance",
+        ),
+        (
+            field("commission_attestation_digest"),
+            sha256_of("assets/dsd_reference/brief_dsd_reference_p0_scope_and_commission.md"),
+            "assets/dsd_reference/brief_dsd_reference_p0_scope_and_commission.md",
+        ),
+        (
+            field("standards_literal_oracle_sha256"),
+            sha256_of("crates/sacd-rs/src/dst/fixtures/verify_p0_raw_oracle.py"),
+            "crates/sacd-rs/src/dst/fixtures/verify_p0_raw_oracle.py",
+        ),
+    ];
+
+    let drifted: Vec<&str> = checks
+        .iter()
+        .filter(|(recorded, actual, _)| recorded != actual)
+        .map(|(_, _, what)| *what)
+        .collect();
+
+    assert!(
+        drifted.is_empty(),
+        "The embedded in-process attestation no longer describes this tree, so Reference \
+         will refuse every compressed-DSD source at runtime with \"Reference production \
+         promotion is inactive\".\n\n\
+         Drifted:\n{}\n\n\
+         Note that `sacd-rs` is not in REFERENCE_COMMON_SOURCE_PATHS, so the source-lock \
+         tests in this file cannot catch this.\n\n\
+         Requalify and reinstall the sidecars:\n{REQUALIFY}",
+        drifted
+            .iter()
+            .map(|what| format!("  - {what}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}

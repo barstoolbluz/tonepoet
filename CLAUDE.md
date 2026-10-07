@@ -364,7 +364,18 @@ with "Reference production promotion is inactive". That is the certification mac
 working, not a bug.
 
 `tests/reference_qualification_freshness.rs` catches this in the ordinary gate and names
-the drifted files. It needs no audio tools and runs in milliseconds. If it fails,
+the drifted files. It needs no audio tools and runs in milliseconds.
+
+**There is a second door, and it is not the source lock.** `crates/sacd-rs/` is
+deliberately NOT in `REFERENCE_COMMON_SOURCE_PATHS`, but `sacd_rs::REFERENCE_BUILD_ID`
+is a SHA-256 of that crate's own source computed in its `build.rs`, and `realize_track`
+compares it against the `sacd_rs_build_identity` embedded in the qualification manifest.
+The DST fixture, its manifest and provenance, the commission attestation asset, and the
+standards-literal oracle are compared the same way. So editing any `sacd-rs` source file
+or any of those assets invalidates the installed qualification exactly as touching a
+locked file does. `embedded_in_process_attestation_binds_the_current_sacd_rs_build` in
+the same test file closes that door; it was verified to fail by perturbing a hashed
+asset, while the two source-lock tests stayed green. It needs no audio tools and runs in milliseconds. If it fails,
 requalify — do not edit the sidecar by hand:
 
 ```bash
