@@ -17426,7 +17426,13 @@ fn structured_conversion_log_track_fragment(
         warnings: prepared.map(|track| track.warnings.clone()).unwrap_or_default(),
         output_target: artifact.map(|artifact| path_log_value(&artifact.final_path)),
         shared_decision_scope: album_gain_scope_disclosure.map(dsd_album_gain_scope_disclosure_label),
-        album_gain_decision: prepared.and_then(|track| dsd_album_gain_decision_label(track, req)),
+        album_gain_decision: prepared.and_then(|track| {
+            dsd_album_gain_decision_label(
+                track,
+                req,
+                artifact.and_then(|artifact| artifact.reference_evidence.as_ref()),
+            )
+        }),
         metadata: metadata_satisfaction_label(
             artifact,
             prepared,
@@ -23390,7 +23396,13 @@ fn append_track_log(
             dsd_album_gain_scope_disclosure_label(disclosure),
         );
     }
-    if let Some(decision) = prepared.and_then(|track| dsd_album_gain_decision_label(track, req)) {
+    if let Some(decision) = prepared.and_then(|track| {
+        dsd_album_gain_decision_label(
+            track,
+            req,
+            artifact.and_then(|artifact| artifact.reference_evidence.as_ref()),
+        )
+    }) {
         push_kv_line(log, "  Album gain decision", decision);
     }
 
@@ -24781,8 +24793,8 @@ fn conversion_log_metadata_values(values: &MetadataValueList) -> Option<String> 
 fn dsd_album_gain_decision_label(
     track: &PreparedTrack,
     req: &PipelineRequest,
+    reference: Option<&ReferenceExecutionEvidence>,
 ) -> Option<String> {
-    let gain_db = req.settings.dsd.runtime_album_gain_db()?;
     let scope = match (
         req.settings.dsd.runtime_album_track_count(),
         req.settings.dsd.runtime_album_loudest_peak_dbfs(),
@@ -24797,6 +24809,7 @@ fn dsd_album_gain_decision_label(
 
     match &track.source_ref {
         TrackSourceRef::DsdTruePeakCarrier { .. } => {
+            let gain_db = req.settings.dsd.runtime_album_gain_db()?;
             let target = req
                 .settings
                 .dsd
@@ -24809,11 +24822,39 @@ fn dsd_album_gain_decision_label(
                 target,
             ))
         }
-        TrackSourceRef::DsdReferenceAutoGainCarrier { target_dbtp, .. } => Some(format!(
-            "submitted-batch DSD Reference album gain {} dB ({scope}; target {} dBTP)",
-            gain_db.render(true),
-            target_dbtp.render(false),
-        )),
+        TrackSourceRef::DsdReferenceAutoGainCarrier {
+            gain_db: carrier_gain,
+            target_dbtp,
+            ..
+        } => {
+            let reference = reference?;
+            let applied_gain = reference.applied_gain_db?;
+            if carrier_gain != &Some(applied_gain) {
+                return None;
+            }
+            if req
+                .settings
+                .dsd
+                .runtime_album_gain_db()
+                .is_some_and(|configured| configured != applied_gain)
+            {
+                return None;
+            }
+            match reference.plan.gain_policy {
+                tonepoet_pipeline::ResolvedGainPolicy::TruePeakNormalize {
+                    target_dbtp: planned_target,
+                    scope: tonepoet_pipeline::TruePeakScope::Album,
+                    bound_gain: Some(planned_gain),
+                    ..
+                } if planned_target == *target_dbtp && planned_gain == applied_gain => {}
+                _ => return None,
+            }
+            Some(format!(
+                "submitted-batch DSD Reference album gain {} dB ({scope}; target {} dBTP)",
+                applied_gain.render(true),
+                target_dbtp.render(false),
+            ))
+        }
         _ => None,
     }
 }
@@ -39056,6 +39097,7 @@ fn annotate_deemphasis_execution_evidence(
         kind: "deemphasis_selection".to_string(),
         summary: "Apply CD de-emphasis".to_string(),
         authority,
+        parameters: Vec::new(),
         observation_ids: observation_ids.clone(),
     });
     for operation in &mut evidence.operations {
@@ -61611,6 +61653,10 @@ mod conversion_log_tests {
                     kind: "reference_gain".to_string(),
                     summary: "Resolved qualified Reference gain policy".to_string(),
                     authority: DecisionAuthority::AutomaticPolicy,
+                    parameters: vec![OperationParameter::new(
+                        "Applied gain",
+                        EvidenceValue::Text("+18.019421188 dB".to_string()),
+                    )],
                     observation_ids: Vec::new(),
                 }],
                 ..TrackExecutionEvidence::default()
@@ -61636,6 +61682,11 @@ mod conversion_log_tests {
         assert_eq!(presentation.section.matches("Tracks extracted: 2").count(), 1);
         assert!(!presentation.section.contains("  Track:"));
         assert_eq!(presentation.section.matches("Album gain decision:").count(), 1);
+        assert_eq!(
+            presentation.section.matches("+18.019421188 dB").count(),
+            1,
+            "the hoisted album scalar must be stated exactly once",
+        );
         assert_eq!(presentation.section.matches("DSD-to-PCM conversion").count(), 1);
         assert_eq!(
             presentation

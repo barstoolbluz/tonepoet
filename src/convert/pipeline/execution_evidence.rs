@@ -11,8 +11,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tonepoet_pipeline::{
     plan_topology, plan_typed, stage_a_selected_vs_emitted_diagnostics, DecisionKind, EffectIntent,
-    FinalPcmContract, PcmBitDepth, PlanOperation, PlanRequest, PlanningOutcome, ReferenceDither,
-    RegisteredUnaryEffect, ResolvedOperationParameters, SampleKind, TopologyPlan, TypedPlanNode,
+    DbNano, DsdReferenceOperation, DsdReferencePlanSummary, FinalPcmContract, PcmBitDepth,
+    PlanOperation, PlanRequest, PlanningOutcome, ReferenceDither, RegisteredUnaryEffect,
+    ResolvedOperationParameters, SampleKind, TopologyPlan, TypedPlanNode,
 };
 
 use super::tool::{CommandRecord, ProcessExit, RetainedPcmScalarPump};
@@ -269,12 +270,14 @@ pub struct ObservationRecord {
     pub source: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DecisionRecord {
     pub id: String,
     pub kind: String,
     pub summary: String,
     pub authority: DecisionAuthority,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parameters: Vec<OperationParameter>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub observation_ids: Vec<String>,
 }
@@ -567,9 +570,216 @@ pub fn render_track_verifications(evidence: &TrackExecutionEvidence) -> Vec<Stri
                 VerificationStatus::Failed => "failed",
                 VerificationStatus::Incomplete => "incomplete",
             };
+            if matches!(
+                verification.kind.as_str(),
+                "semantic_evidence_projection" | "semantic_attempt_evidence_projection"
+            ) {
+                return format!(
+                    "Structured processing evidence is incomplete; see portable execution evidence — {status}"
+                );
+            }
             format!("{} — {status}", verification.statement)
         })
         .collect()
+}
+
+/// Project a successfully completed qualified Reference execution into the
+/// common semantic evidence model. Reference execution deliberately bypasses
+/// the ordinary Stage-A command topology, so Stage-A selected-vs-emitted
+/// diagnostics are not an execution receipt for this path. The qualified
+/// Reference executor supplies explicit physical invocation coordinates instead.
+///
+/// `applied_gain` is the scalar returned by the same sealed gain authority that
+/// was passed to the terminal lowerer. It is therefore execution evidence, not
+/// a reconstruction from settings.
+pub fn completed_reference_plan_evidence(
+    summary: &DsdReferencePlanSummary,
+    protected_r64_path: &Path,
+    applied_gain: DbNano,
+    invocation_count: usize,
+    dsd_to_pcm_invocation_indices: &[usize],
+    terminal_invocation_indices: &[usize],
+    package_invocation_indices: &[usize],
+) -> Result<TrackExecutionEvidence, String> {
+    fn validate_invocation_indices(
+        label: &str,
+        indices: &[usize],
+        invocation_count: usize,
+    ) -> Result<(), String> {
+        if indices.iter().any(|index| *index >= invocation_count) {
+            return Err(format!(
+                "{label} semantic receipt references an invocation outside the completed transcript"
+            ));
+        }
+        if indices.windows(2).any(|window| window[0] >= window[1]) {
+            return Err(format!(
+                "{label} semantic receipt invocation indices are not strictly increasing"
+            ));
+        }
+        Ok(())
+    }
+
+    validate_invocation_indices(
+        "Reference DSD-to-PCM",
+        dsd_to_pcm_invocation_indices,
+        invocation_count,
+    )?;
+    validate_invocation_indices(
+        "Reference terminal",
+        terminal_invocation_indices,
+        invocation_count,
+    )?;
+    validate_invocation_indices(
+        "Reference package",
+        package_invocation_indices,
+        invocation_count,
+    )?;
+
+    let render_count = summary
+        .operations
+        .iter()
+        .filter(|operation| matches!(operation, DsdReferenceOperation::DsdReferenceRender { .. }))
+        .count();
+    let gain_count = summary
+        .operations
+        .iter()
+        .filter(|operation| matches!(operation, DsdReferenceOperation::ResolveReferenceGain { .. }))
+        .count();
+    let terminal_count = summary
+        .operations
+        .iter()
+        .filter(|operation| matches!(operation, DsdReferenceOperation::DsdReferenceFinalize { .. }))
+        .count();
+    let package_count = summary
+        .operations
+        .iter()
+        .filter(|operation| matches!(operation, DsdReferenceOperation::PackageLossless { .. }))
+        .count();
+    if render_count != 1 || gain_count != 1 || terminal_count != 1 || package_count > 1 {
+        return Err(format!(
+            "qualified Reference semantic summary is incomplete or ambiguous: render={render_count}, gain={gain_count}, terminal={terminal_count}, package={package_count}"
+        ));
+    }
+    if terminal_invocation_indices.is_empty() {
+        return Err(
+            "qualified Reference terminal completed without a physical invocation receipt"
+                .to_string(),
+        );
+    }
+    if package_count == 0 && !package_invocation_indices.is_empty() {
+        return Err(
+            "direct Reference delivery unexpectedly carries package invocation receipts"
+                .to_string(),
+        );
+    }
+    if package_count == 1 && package_invocation_indices.is_empty() {
+        return Err(
+            "qualified Reference packaging completed without a physical invocation receipt"
+                .to_string(),
+        );
+    }
+
+    let mut evidence = TrackExecutionEvidence::default();
+    let mut gain_decision_id = None::<String>;
+
+    for operation in &summary.operations {
+        match operation {
+            DsdReferenceOperation::DsdReferenceRender { target_rate_hz, .. } => {
+                let mut record = OperationRecord::completed(
+                    "reference-dsd-to-pcm",
+                    "dsd_to_pcm",
+                    "DSD-to-PCM conversion",
+                    ExecutionBackend::external("sox"),
+                );
+                record.outputs.push(EvidenceArtifactRef::path(
+                    "reference-protected-r64",
+                    protected_r64_path,
+                ));
+                record.parameters.push(OperationParameter::new(
+                    "Target rate",
+                    EvidenceValue::SampleRateHz(*target_rate_hz),
+                ));
+                record.parameters.push(OperationParameter::new(
+                    "Target precision",
+                    EvidenceValue::BitDepth("Float64".to_string()),
+                ));
+                record.invocation_indices = dsd_to_pcm_invocation_indices.to_vec();
+                evidence.operations.push(record);
+            }
+            DsdReferenceOperation::ResolveReferenceGain { .. } => {
+                let id = "reference-gain-decision".to_string();
+                evidence.decisions.push(DecisionRecord {
+                    id: id.clone(),
+                    kind: "reference_gain".to_string(),
+                    summary: "Resolved qualified Reference gain policy".to_string(),
+                    authority: DecisionAuthority::AutomaticPolicy,
+                    parameters: vec![OperationParameter::new(
+                        "Applied gain",
+                        EvidenceValue::Text(format!("{} dB", applied_gain.render(true))),
+                    )],
+                    // The certified observation remains part of the qualified
+                    // Reference execution record. Do not invent a duplicate
+                    // common-evidence ObservationRecord without its full typed
+                    // measurement payload merely to satisfy presentation.
+                    observation_ids: Vec::new(),
+                });
+                gain_decision_id = Some(id);
+            }
+            DsdReferenceOperation::DsdReferenceFinalize { sample_contract, .. } => {
+                let decision_id = gain_decision_id.as_ref().ok_or_else(|| {
+                    "qualified Reference terminal precedes its gain decision in the semantic summary"
+                        .to_string()
+                })?;
+                let mut record = OperationRecord::completed(
+                    "reference-terminal-realization",
+                    "reference_terminal_realization",
+                    "Qualified Reference terminal realization",
+                    ExecutionBackend::native("TonePoet qualified Reference path"),
+                );
+                record.inputs.push(EvidenceArtifactRef::path(
+                    "reference-protected-r64",
+                    protected_r64_path,
+                ));
+                record.outputs.push(EvidenceArtifactRef::path(
+                    "reference-terminal-qpcm",
+                    &summary.qpcm_path,
+                ));
+                record.parameters.push(OperationParameter::new(
+                    "Sample contract",
+                    EvidenceValue::Text(render_final_pcm_contract(*sample_contract)),
+                ));
+                record.decision_ids.push(decision_id.clone());
+                record.invocation_indices = terminal_invocation_indices.to_vec();
+                evidence.operations.push(record);
+            }
+            DsdReferenceOperation::PackageLossless { target, .. } => {
+                let mut record = OperationRecord::completed(
+                    "reference-package-output",
+                    "package_output",
+                    "Package output",
+                    ExecutionBackend::Unknown,
+                );
+                record.inputs.push(EvidenceArtifactRef::path(
+                    "reference-terminal-qpcm",
+                    &summary.qpcm_path,
+                ));
+                record.outputs.push(EvidenceArtifactRef::path(
+                    "reference-packaged-output",
+                    &summary.packaged_path,
+                ));
+                record.parameters.push(OperationParameter::new(
+                    "Target",
+                    EvidenceValue::Text(format!("{target:?}")),
+                ));
+                record.invocation_indices = package_invocation_indices.to_vec();
+                record.domain = OperationDomain::Artifact;
+                evidence.operations.push(record);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(evidence)
 }
 
 /// Project the typed planner contract into completed semantic evidence only
@@ -804,6 +1014,7 @@ pub fn completed_plan_evidence(
                     kind: decision_kind_name(&decision.kind).to_string(),
                     summary: decision_summary(&decision.kind),
                     authority: DecisionAuthority::AutomaticPolicy,
+                    parameters: Vec::new(),
                     observation_ids: decision
                         .observations
                         .iter()
@@ -2609,5 +2820,29 @@ mod tests {
         assert!(no_dither_text.contains("Dither owner: none"));
         assert!(no_dither_text.contains("Effective terminal dither: None"));
         assert!(!no_dither_text.contains("Dither/quantization owner"));
+    }
+
+    #[test]
+    fn human_verification_hides_internal_semantic_projection_diagnostic() {
+        let internal = "Semantic execution evidence incomplete: invalid settings for stage_a_selected_vs_emitted: typed built-in operation node 0 (dsd_to_pcm) has no emitted realization";
+        let evidence = TrackExecutionEvidence {
+            verifications: vec![VerificationRecord {
+                id: "semantic-evidence-projection".to_string(),
+                kind: "semantic_evidence_projection".to_string(),
+                statement: internal.to_string(),
+                status: VerificationStatus::Incomplete,
+                invocation_indices: Vec::new(),
+            }],
+            ..TrackExecutionEvidence::default()
+        };
+
+        let human = render_track_verifications(&evidence).join("\n");
+        assert!(human.contains("Structured processing evidence is incomplete"));
+        assert!(!human.contains("stage_a_selected_vs_emitted"));
+        assert!(!human.contains("typed built-in operation node"));
+
+        let portable = serde_json::to_string(&evidence).expect("portable evidence serializes");
+        assert!(portable.contains("stage_a_selected_vs_emitted"));
+        assert!(portable.contains("typed built-in operation node"));
     }
 }

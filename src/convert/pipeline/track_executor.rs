@@ -43,7 +43,8 @@ use tonepoet_pipeline::fingerprint::{
 use super::errors::{ConvertError, ToolRunnerError};
 use super::execution_evidence::{
     attempt_plan_evidence_or_fallback, completed_plan_evidence_or_fallback,
-    record_native_scalar_attempt_materialization, EvidenceArtifactRef, ExecutionBackend,
+    completed_reference_plan_evidence, record_native_scalar_attempt_materialization,
+    EvidenceArtifactRef, ExecutionBackend,
     OperationRecord, TrackExecutionEvidence,
 };
 use super::plan_bridge::{
@@ -538,6 +539,10 @@ pub struct ReferencePcmVerificationEvidence {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ReferenceExecutionEvidence {
+    /// Gain scalar actually selected by the sealed Reference runtime and passed
+    /// to terminal lowering. Older evidence predating this receipt leaves it absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_gain_db: Option<tonepoet_pipeline::DbNano>,
     /// Qualified original DSD source/container identity.
     pub original_source_kind: DsdSourceKind,
     /// SHA-256 of the original admitted source authority (the ISO for SACD).
@@ -2608,6 +2613,32 @@ pub(crate) async fn execute_planned_track_conversion_with_scalar_pump(
         let admitted_source_probe_digest = reference_source_probe_digest_v1(&plan_request.source);
         let admitted_plan = plan_conversion(&plan_request)
             .map_err(|err| ConvertError::Backend(format!("planner failed: {err}")))?;
+        let reference_selected = tonepoet_pipeline::selects_reference_dsd_to_pcm(
+            &plan_request.settings,
+            plan_request.source.is_dsd(),
+        );
+        if matches!(
+            &track.source_ref,
+            TrackSourceRef::DsdReferenceAutoGainCarrier { .. }
+        ) && !reference_selected
+        {
+            return Err(TrackExecutionError::new(
+                ConvertError::Backend(
+                    "retained Reference album carrier reached execution after qualified Reference selection authority was lost"
+                        .to_string(),
+                ),
+                Vec::new(),
+            ));
+        }
+        if reference_selected != admitted_plan.reference.is_some() {
+            return Err(TrackExecutionError::new(
+                ConvertError::Backend(
+                    "planner Reference selection authority disagrees with the admitted executable plan"
+                        .to_string(),
+                ),
+                Vec::new(),
+            ));
+        }
         super::baseline::selected_vs_emitted(&plan_request);
         cleanup_guard.add_planner_paths(admitted_plan.cleanup_paths());
         let reference_scratch = if admitted_plan.reference.is_some() {
@@ -2954,7 +2985,35 @@ pub(crate) async fn execute_planned_track_conversion_with_scalar_pump(
                     };
                     (records, None)
                 };
-                let mut execution_evidence = completed_plan_evidence_or_fallback(&plan_request, &commands);
+                let mut execution_evidence = match (plan.reference.as_ref(), reference_runtime.as_ref()) {
+                    (Some(summary), Some(runtime)) => completed_reference_plan_evidence(
+                        summary,
+                        &runtime.protected_r64_path,
+                        runtime.selected_gain,
+                        commands.len(),
+                        &runtime.dsd_to_pcm_invocation_indices,
+                        &runtime.terminal_invocation_indices,
+                        &runtime.package_invocation_indices,
+                    )
+                    .map_err(|reason| {
+                        TrackExecutionError::new(
+                            ConvertError::Backend(format!(
+                                "qualified Reference semantic evidence projection failed: {reason}"
+                            )),
+                            commands.clone(),
+                        )
+                    })?,
+                    (None, None) => completed_plan_evidence_or_fallback(&plan_request, &commands),
+                    _ => {
+                        return Err(TrackExecutionError::new(
+                            ConvertError::Backend(
+                                "Reference plan/runtime authority is incomplete before semantic evidence projection"
+                                    .to_string(),
+                            ),
+                            commands,
+                        ));
+                    }
+                };
                 if scalar_pump.is_some() {
                     if let Some(operation) = execution_evidence
                         .operations
@@ -3001,6 +3060,7 @@ pub(crate) async fn execute_planned_track_conversion_with_scalar_pump(
                 ) {
                     (Some(source_evidence), Some(toolchain), Some(runtime), Some(summary)) => {
                         Some(ReferenceExecutionEvidence {
+                            applied_gain_db: Some(runtime.selected_gain),
                             original_source_kind: plan_request
                                 .source
                                 .dsd_source_kind
@@ -8560,6 +8620,11 @@ struct ReferenceRuntimeResult {
     measurements: BTreeMap<MeasurementId, tonepoet_pipeline::ReferenceCertifiedPeakObservation>,
     resolved_command_hash: String,
     pcm_verification: ReferencePcmVerificationEvidence,
+    protected_r64_path: PathBuf,
+    selected_gain: tonepoet_pipeline::DbNano,
+    dsd_to_pcm_invocation_indices: Vec<usize>,
+    terminal_invocation_indices: Vec<usize>,
+    package_invocation_indices: Vec<usize>,
 }
 
 /// Result returned only by the offline Phase-5 Reference candidate harness.
@@ -9530,6 +9595,9 @@ async fn execute_reference_common_plan(
 
     let mut records = Vec::new();
     let mut measurements = BTreeMap::new();
+    let mut dsd_to_pcm_invocation_indices = Vec::new();
+    let mut terminal_invocation_indices = Vec::new();
+    let mut package_invocation_indices = Vec::new();
     let total_width = (end_fraction - start_fraction).max(0.0);
     let window = |index: usize, count: usize| {
         let start = start_fraction + total_width * (index as f32 / count as f32);
@@ -9549,6 +9617,7 @@ async fn execute_reference_common_plan(
     // retains the exact already-certified protected R64 from its submitted-
     // batch prepass; all other Reference executions reconstruct normally.
     if retained_reference.is_none() {
+        let invocation_start = records.len();
         let render = tonepoet_pipeline::build_reference_protected_reconstruction_command(
             &plan_request.input_path,
             &summary.r64_path,
@@ -9571,6 +9640,7 @@ async fn execute_reference_common_plan(
         )
         .await?;
         records.append(&mut render_records);
+        dsd_to_pcm_invocation_indices.extend(invocation_start..records.len());
     }
 
     // 2. Independent structural/decoder validation of protected R64.
@@ -9658,6 +9728,7 @@ async fn execute_reference_common_plan(
         )
     })?;
     let (w4s, w4e) = window(4, total_steps);
+    let terminal_invocation_start = records.len();
     let mut terminal_records = execute_reference_terminal_lowering(
         &terminal,
         r64_structure.sample_frames,
@@ -9679,6 +9750,7 @@ async fn execute_reference_common_plan(
         error
     })?;
     records.append(&mut terminal_records);
+    terminal_invocation_indices.extend(terminal_invocation_start..records.len());
 
     // 6. QPCM structure/extent + independent decode/hash authority.
     let (w5s, w5e) = window(5, total_steps);
@@ -9786,6 +9858,7 @@ async fn execute_reference_common_plan(
             )
         })?;
         let (w7s, w7e) = window(7, total_steps);
+        let package_invocation_start = records.len();
         match lowering {
             tonepoet_pipeline::ReferencePackageLowering::Command(command) => {
                 let mut package_records = execute_commands(
@@ -9826,6 +9899,7 @@ async fn execute_reference_common_plan(
                 records.append(&mut package_records);
             }
         }
+        package_invocation_indices.extend(package_invocation_start..records.len());
         let (mut verification_records, digest) =
             reference_decoded_sample_hash_with_plan_carrier(
                 summary,
@@ -9899,6 +9973,11 @@ async fn execute_reference_common_plan(
         measurements,
         resolved_command_hash,
         pcm_verification,
+        protected_r64_path: summary.r64_path.clone(),
+        selected_gain: gain_authority.selected_gain,
+        dsd_to_pcm_invocation_indices,
+        terminal_invocation_indices,
+        package_invocation_indices,
     })
 }
 
@@ -13344,6 +13423,74 @@ mod tests {
     }
 
     #[test]
+    fn completed_reference_execution_projects_processing_without_stage_a_emission() {
+        let plan = reference_w64_plan(tonepoet_pipeline::PcmBitDepth::Int24);
+        let summary = plan.reference.as_ref().expect("Reference summary");
+        let applied_gain = tonepoet_pipeline::DbNano(1_250_000_000);
+        let protected_r64_path = PathBuf::from("retained/reference-protected.w64");
+        let evidence = completed_reference_plan_evidence(
+            summary,
+            &protected_r64_path,
+            applied_gain,
+            5,
+            &[0],
+            &[4],
+            &[],
+        )
+        .expect("qualified Reference completion should project complete semantic evidence");
+
+        let dsd = evidence
+            .operations
+            .iter()
+            .find(|operation| operation.kind == "dsd_to_pcm")
+            .expect("Reference DSD-to-PCM semantic receipt");
+        assert_eq!(dsd.invocation_indices, vec![0]);
+        assert_eq!(
+            dsd.outputs.first().and_then(|output| output.path.as_ref()),
+            Some(&protected_r64_path),
+            "semantic evidence must name the protected carrier actually consumed by final Reference execution",
+        );
+        assert!(dsd
+            .parameters
+            .iter()
+            .any(|parameter| parameter.name == "Target rate"));
+
+        let terminal = evidence
+            .operations
+            .iter()
+            .find(|operation| operation.kind == "reference_terminal_realization")
+            .expect("Reference terminal semantic receipt");
+        assert_eq!(terminal.invocation_indices, vec![4]);
+        assert_eq!(
+            terminal.inputs.first().and_then(|input| input.path.as_ref()),
+            Some(&protected_r64_path),
+        );
+        let rendered = crate::convert::pipeline::execution_evidence::render_operation_with_context(
+            &evidence,
+            terminal,
+        )
+        .join("\n");
+        assert!(rendered.contains("24-bit signed-integer PCM"), "{rendered}");
+        assert!(rendered.contains("TPDF dither"), "{rendered}");
+        assert!(
+            !rendered.contains("+1.250000000 dB"),
+            "the terminal rendering must not duplicate the album gain fact: {rendered}"
+        );
+        let gain = evidence
+            .decisions
+            .iter()
+            .find(|decision| decision.kind == "reference_gain")
+            .expect("Reference gain semantic receipt");
+        assert!(gain.parameters.iter().any(|parameter| {
+            parameter.name == "Applied gain"
+                && parameter.value.render() == "+1.250000000 dB"
+        }));
+        let portable = serde_json::to_string(&evidence).expect("semantic evidence serializes");
+        assert!(portable.contains("+1.250000000 dB"));
+        assert!(evidence.verifications.is_empty());
+    }
+
+    #[test]
     fn reference_common_operations_bind_independent_reader_and_observer_authorities() {
         let plan = reference_w64_plan(tonepoet_pipeline::PcmBitDepth::Float64);
         let summary = plan.reference.as_ref().expect("Reference summary");
@@ -16043,6 +16190,19 @@ mod tests {
                     ),
                 },
             },
+        );
+        let plan_request = plan_request_for_track(
+            &request,
+            &track,
+            &carrier,
+            &staged_output,
+            work_dir.clone(),
+        )
+        .expect("retained Reference carrier plan request");
+        let retained_plan = plan_conversion(&plan_request).expect("retained Reference carrier plan");
+        assert!(
+            retained_plan.reference.is_some(),
+            "a bound retained Reference album carrier must never lower to the ordinary executor",
         );
         let runner = StubToolRunner::new();
         let cancel = CancellationToken::new();
