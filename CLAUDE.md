@@ -430,6 +430,23 @@ Compile-time embedded reference data lives under `assets/` (`include_str!`/`incl
 
 ## Important Notes
 
+- **STANDING RULE — nothing goes in the destination that the user did not ask for.**
+  A conversion writes the audio files, and when enabled the conversion log, CUE sheet
+  and companion artwork. Nothing else: no hidden files, no dotfiles, no manifests, no
+  markers, no locks, no staging directories, no machine-readable evidence, on any route
+  including Reference. Working files live in TonePoet's own cache or data storage and are
+  cleaned up on every exit path.
+
+  This has now been violated four times — issue #27, then #53 twice (Reference manifest,
+  then the staging directory), then #64 (structured execution evidence, 2026-10-08, which
+  arrived with the logging redesign while #53 was still open). As of 2026-10-08 the
+  library holds `.tonepoet-manifest.json` in 26 album folders and 14 `job-<uuid>-<uuid>.json`
+  evidence files, about 1.3 MB of debris.
+
+  **Check every change that writes a file against this rule before delivering it**, and
+  say in the delivery that you did. There is still no test asserting the destination's
+  file set, which is why the pattern keeps returning; #64 asks for one.
+
 - **The giant files** (re-measured 2026-10-07 on `04b649f`; they grow steadily, so
   re-measure rather than trusting these): `src/tui/keybindings.rs` 113K lines / 4.5 MB,
   `tonepoet-pipeline/src/ssrc_true_peak_terminal_commissioned.rs` 87K / 4.4 MB,

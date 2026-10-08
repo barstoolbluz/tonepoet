@@ -4226,3 +4226,150 @@ lacks rather than assuming either way.
 
 Changing the sox_ng input changes the sox binary, which the Reference
 qualification records. Expect requalification.
+
+## 64. Destination pollution, fourth variant: structured execution evidence; and #53's manifest half is reproducing widely
+
+Filed 2026-10-08. This is #53 again, which was already "the third time the same
+pattern has been discovered in the field". Read #53 first; its stated requirement
+is unchanged and is the standing rule.
+
+### Two findings, both from one album folder
+
+`~/library/skynyrd/Lynyrd Skynyrd - One More from the Road (1976) [FLAC] {Japan MCA VIM-9501~02 LP  32-176.4}`
+
+```
+14 x job-<uuid>-<uuid>.json      277,080 bytes   written 2026-10-08 00:47
+ 1 x .tonepoet-manifest.json       5,335 bytes   written 2026-10-08 00:47
+```
+
+Both from the same conversion, beside the 14 FLACs the user asked for.
+
+**New: structured execution evidence is published into the destination.** One
+file per conversion item — 14 single-file items here, so 14 files, each
+describing one track. `write_durable_log` (`stages.rs:27328`) writes
+`log.root.join(format!("{job}-{item}.json"))`. These are not hidden; they are
+visible UUID-named JSON sitting in a library folder.
+
+The gate is `LogPolicy::write_json_log`, and `unified_request.rs:180` sets it to
+`item.options.write_log_file`. So **asking for a conversion log silently also
+publishes the evidence JSON**. Confirmed by experiment: a CLI conversion with
+`--write-log` produces the JSON, the same conversion without it produces none.
+The user asked for a log and received a log plus per-item machine evidence.
+
+This arrived with the logging/evidence redesign (`b7aebe0`, 2026-10-07), which
+means a feature landed in direct violation of #53 while #53 was open and while
+#53's own Required section says `docs/` and briefs carry this as a standing rule
+for every future delivery.
+
+Note also `unified_request.rs:178` sets `root: output_root.join(".tonepoet-logs")`.
+That is itself a dotfile directory in the user's output root, and so also
+forbidden — but it is not where these files landed. They landed in the album
+folder. Whatever reassigns `log.root` between there and the write is part of this.
+
+**#53's manifest half is not unreproducible.** #53 records that
+`.tonepoet-manifest.json` "never reproduced on any route tried, before or after
+R15". A scan of `~/library` to depth 3 finds it in **26 album folders**,
+1,019,304 bytes total:
+
+```
+2026-09-24  2        2026-09-27  3        2026-09-30  15
+2026-09-25  2        2026-09-28  1        2026-10-08   1
+2026-09-26  2
+```
+
+Fifteen on one day, and one today. The forcing code in `stages.rs`
+(`reference_manifest_required`) is still unchanged, as #53 says.
+
+### Required
+
+Everything #53 requires, unchanged. In addition:
+
+- Structured execution evidence does not go in the destination. If it is worth
+  keeping, it belongs in tonepoet's own data or cache storage, keyed so a user
+  can find the record for a conversion if they ever want it. If it is not worth
+  keeping outside the destination, it is not worth writing.
+- Enabling the conversion log enables the conversion log. It does not enable a
+  second machine-readable artifact as a side effect. Any such artifact is its own
+  explicit opt-in, defaulting off.
+- A test asserts the destination's file set after a conversion equals exactly the
+  audio plus the enabled user-visible artifacts, on every route, and fails on any
+  extra entry. #53 asked for this and it does not exist; its absence is why this
+  recurred.
+- Clean up the 26 existing manifests and the 14 evidence files, or provide a
+  command that does.
+
+### Why this keeps happening
+
+Four variants now: #27's manifest, #53's Reference manifest, #53's staging
+directory, and this. Each was fixed or declared fixed in isolation. There is no
+test that answers the only question that matters — "what files are in the
+destination after a conversion, and did the user ask for each one" — so every new
+feature that writes a file is free to reintroduce the pattern, and one just did.
+
+## 65. Nothing asserts what files a conversion leaves in the destination
+
+Filed 2026-10-08. This is the omission that lets #27, #53 and #64 keep recurring.
+It is recorded separately because it is not a defect in any one route — it is a
+missing guard, and every variant of destination pollution has gone undetected
+because of it.
+
+### The gap
+
+There is no test anywhere in the suite that answers: *after a conversion, what
+files exist in the destination, and did the user ask for each one?*
+
+The suite has 7341 tests. It checks audio correctness, metadata, naming,
+templates, publication atomicity, recovery, concurrency, Reference
+qualification, log content, and evidence structure. None of them enumerate the
+destination directory and compare it against the set the user requested.
+
+#53's Required section asked for exactly this on 2026-09-28:
+
+> A test asserts the destination's file set after a Reference album publish, and
+> after every other route, equals the user-visible artifacts and nothing else,
+> so this cannot come back silently.
+
+It was never written. #64 then happened: the logging redesign added a new
+destination artifact, the full gate stayed green, and it was found by a user
+noticing UUID-named files next to his music.
+
+### Why each previous fix did not hold
+
+Each was a point fix to the thing that had been noticed:
+
+- #27 — defaulted `PublishPolicy::write_manifest` to false. The Reference route
+  ignores that default, so the manifest kept being written.
+- #53 staging half — R15 moved staging into TonePoet cache storage, with a
+  sweep. That held; it is field-verified.
+- #53 manifest half — untouched; `reference_manifest_required` still forces it,
+  and it is in 26 album folders as of 2026-10-08.
+- #64 — new artifact, new code path, no relationship to any of the above.
+
+A guard on the destination's file set would have caught all four, including the
+two that were never noticed until a user complained. A guard on any individual
+writer catches only that writer.
+
+### Required
+
+A test, run in the ordinary gate, that for each publication route:
+
+- performs a conversion into a scratch destination;
+- enumerates every entry in that destination recursively, including dotfiles and
+  directories;
+- asserts the set equals exactly the audio outputs plus whichever of the conversion
+  log, CUE sheet and companion artwork were enabled for that run;
+- fails naming the unexpected entries.
+
+Routes to cover: ordinary single-file, folder album, CUE image, archive, SACD ISO,
+DVD-Audio, Blu-ray, and the Reference path, with the log both enabled and
+disabled so a log-gated artifact cannot hide behind the log being on.
+
+It needs no audio tools for the negative case — a conversion that produces one
+file and nothing else is enough to catch a stray writer. Real-tool coverage for
+the Reference route can follow.
+
+### Note
+
+This can be written independently of #64's fix, and should be, so that the fix
+has something to be verified by. If the test lands first it will fail, which is
+the correct starting state.
