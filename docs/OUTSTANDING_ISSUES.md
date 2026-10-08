@@ -3404,7 +3404,18 @@ fix — but `reference_manifest_required` (`stages.rs:43788`) forces it on for a
 track carrying Reference evidence, with the comment "Native Reference publication
 always carries manifest-v2 authority". As of 2026-10-08 that had produced 26
 manifests totalling 1,019,304 bytes in the user's library. They were deleted that
-day; the forcing condition is unchanged, so the next DSD conversion recreates one.
+day.
+
+**Update 2026-10-08, `8358ecc`:** R16 gates the sidecar's publication, so a
+Reference conversion no longer recreates one. `reference_manifest_required`
+(`stages.rs:44320`) still forces the manifest to be *built* and validated; only
+the handoff to publish is gated (`stages.rs:44345`). Verified in production on a
+real SACD ISO with `--dsd-path reference`: 1/1 succeeded, zero
+`.tonepoet-manifest.json` and zero dotfiles in the destination, and with the
+qualification perturbed the same request refused and published nothing. What
+remains open is this issue's own decision below — the manifest is still built on
+every Reference album and then discarded, and the rerun gate it fed now has
+nothing to read.
 
 Scope, measured 2026-10-08: `rerun.rs` 990 lines, `manifest.rs` 1530,
 `manifest_builder.rs` 726, `orchestrator_rerun_gate.rs` 86 — about 3330 lines in
