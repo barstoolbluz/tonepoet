@@ -279,7 +279,7 @@ cargo test -p tonepoet-true-peak   # BS.1770 true-peak + loudness core (~41 min)
 Tests are in `crates/*/tests/` directories, `src/` (inline `#[cfg(test)]` modules), and `tests/` (integration/contract/sentinel tests). The workspace suite is ~7,210 tests across 57 targets, plus 160 in `tonepoet-true-peak`.
 NEVER truncate failure output.
 
-**The suite is 7340 tests across 63 targets.** The count fell from 7363 when the
+**The suite is 7341 tests across 63 targets** (measured on `bae7758`, 7341/0). The count fell from 7363 when the
 logging/evidence redesign removed tests that asserted log content inferred from
 argv rather than from execution receipts.
 
