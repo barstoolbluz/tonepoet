@@ -3873,8 +3873,26 @@ fn plan_typed_with_effects_and_policy(
             // encoder silently substitutes 32-bit storage; that split remains
             // SoX-owned. The command lowerer binds this already-selected tool
             // rather than re-ranking the terminal step a second time.
+            // General DSD can fuse reconstruction and PCM packaging into one
+            // retained SoX command. Its synthetic EncodePcm node must inherit
+            // that physical owner instead of independently selecting an encoder
+            // which cannot realize the fused DSD step (e.g. FFmpeg for FLAC).
+            // Do not affect split gain/effect routes or Reference delivery.
+            let fused_dsd_terminal_tool = (!intent.gain_policy.is_active()
+                && ordered_effects.is_empty())
+                .then(|| {
+                    retained_fused_dsd_terminal_tool(
+                        request,
+                        &operation,
+                        &lowering_bridge_operations,
+                        &input_state,
+                    )
+                })
+                .flatten();
             let current_route = if ssrc_split_ffmpeg_terminal {
                 Some(ToolIdentifier::Ffmpeg)
+            } else if let Some(tool) = fused_dsd_terminal_tool {
+                Some(tool)
             } else {
                 current_terminal_registered_tool(request, &operation, intent.gain_policy)
             };
@@ -4173,6 +4191,57 @@ pub fn require_current_executor(plan: &TypedConversionPlan) -> Result<(), Planni
             ),
         ),
     }
+}
+
+/// Bind the synthetic terminal of a retained, *physically fused* general
+/// DSD-to-PCM command to its real backend. The typed reconstruction is a
+/// separate WAV-boundary operation; it must not be matched to the final FLAC,
+/// AIFF, or WAV container by format or bit-depth equality.
+///
+/// This is an ownership lookup, not a new lowering choice. The retained bridge
+/// already made the one-command decision. A split reconstruction/encode route
+/// remains governed by the normal PCM terminal selector.
+fn retained_fused_dsd_terminal_tool(
+    request: &PlanRequest,
+    terminal: &PlanOperation,
+    bridge_operations: &[PlanOperation],
+    input_state: &AudioState,
+) -> Option<ToolIdentifier> {
+    if !request.source.is_dsd() || !request.settings.target_format.is_pcm_lossless() {
+        return None;
+    }
+    let PlanOperation::EncodePcm {
+        target_format,
+        target_rate_hz,
+        target_bit_depth,
+        ..
+    } = terminal
+    else {
+        return None;
+    };
+    // A None terminal rate means reconstruction has already established it;
+    // binding to the typed terminal *input* prevents a wildcard match.
+    let physical_rate = (*target_rate_hz).or_else(|| match &input_state.sample_rate_hz {
+        Fact::Known(rate) => Some(*rate),
+        Fact::Pending(_) | Fact::Unavailable(_) => None,
+    })?;
+    let matching_fused_steps = bridge_operations
+        .iter()
+        .filter(|step| {
+            matches!(
+                step,
+                PlanOperation::DsdToPcm {
+                    target_format: emitted_format,
+                    target_rate_hz: emitted_rate,
+                    target_bit_depth: emitted_depth,
+                    ..
+                } if emitted_format == target_format
+                    && *emitted_rate == physical_rate
+                    && emitted_depth == target_bit_depth
+            )
+        })
+        .count();
+    (matching_fused_steps == 1).then_some(ToolIdentifier::Sox)
 }
 
 fn current_terminal_registered_tool(
@@ -6753,14 +6822,75 @@ mod tests {
             ),
             "a preference for an unconnected DSD backend must not change resolved sample semantics",
         );
-        assert_ne!(
+        assert_eq!(
             crate::fingerprint::common_execution_plan_fingerprint_v1(&sox_request, &sox_plan),
             crate::fingerprint::common_execution_plan_fingerprint_v1(
                 &ffmpeg_request,
                 &ffmpeg_plan
             ),
-            "the preference may still change a connected physical terminal even though DSD reconstruction semantics remain SoX",
+            "unconnected FFmpeg preference must not change the physical identity of a fused SoX DSD terminal",
         );
+    }
+
+    #[test]
+    fn fused_general_dsd_terminal_inherits_actual_sox_backend() {
+        // The retained bridge fuses these logical nodes into one real SoX
+        // DSD-to-FLAC conversion, including optional reconstruction dither.
+        // Test the hostile backend preference as well as the default, without
+        // changing any command lowering or Reference qualification semantics.
+        for preferred_tool in [PreferredTool::Auto, PreferredTool::Sox, PreferredTool::Ffmpeg] {
+            for dither in [DitherType::None, DitherType::Tpdf, DitherType::Shibata] {
+                let mut request = dsd_request(SampleGainPolicy::Off);
+                request.settings.target_sample_rate = RateTarget::PcmHz(88_200);
+                request.settings.preferred_tool = preferred_tool.clone();
+                request.settings.dither_type = dither;
+
+                let TopologyPlan::Execute { steps, .. } =
+                    crate::plan::plan_topology(&request).expect("fused general DSD topology")
+                else {
+                    panic!("general DSD to FLAC must not passthrough");
+                };
+                assert_eq!(
+                    steps.iter().filter(|step| matches!(
+                        &step.operation,
+                        PlanOperation::DsdToPcm {
+                            target_format: AudioFormat::Flac,
+                            target_rate_hz: 88_200,
+                            target_bit_depth: PcmBitDepth::Int24,
+                            ..
+                        }
+                    )).count(),
+                    1,
+                    "the retained topology must have one fused physical DSD owner",
+                );
+                let Ok(PlanningOutcome::Ready(typed)) = plan_typed(&request) else {
+                    panic!("general DSD terminal must remain plannable");
+                };
+                let selected_terminal = typed.nodes.iter().find_map(|node| match node {
+                    TypedPlanNode::Operation {
+                        operation: PlanOperation::EncodePcm { .. },
+                        candidates,
+                        selected_candidate,
+                        ..
+                    } => candidates.get(*selected_candidate),
+                    _ => None,
+                }).expect("semantic terminal candidate");
+                assert_eq!(selected_terminal.tool, Some(ToolIdentifier::Sox));
+
+                let lowered = crate::plan::plan_conversion(&request)
+                    .expect("retained fused DSD conversion must plan");
+                let dsd_commands = lowered.commands().iter().filter(|command| {
+                    command.tool == ToolIdentifier::Sox
+                        && command.args.iter().any(|arg| arg == "88200")
+                }).collect::<Vec<_>>();
+                assert_eq!(dsd_commands.len(), 1, "one SoX command must realize the fused DSD output");
+                assert_eq!(
+                    dsd_commands[0].args.iter().filter(|arg| arg.as_str() == "dither").count(),
+                    usize::from(dither != DitherType::None),
+                    "the physically fused reconstruction must emit dither exactly once when requested",
+                );
+            }
+        }
     }
 
     #[test]
