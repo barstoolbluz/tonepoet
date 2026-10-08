@@ -17697,6 +17697,49 @@ fn build_conversion_log_album_presentation(
         AlbumUniformOperation::AbsentOrIncomplete => {}
     }
 
+    // Non-Reference DSD reconstruction has a typed level/export gain fact.
+    // Report its bound value once instead of showing a per-track debug value,
+    // or explicitly preserve per-track values if they disagree.
+    if tracks.iter().all(|(fragment, _)| {
+        fragment.execution_evidence.delivered_operations()
+            .any(|operation| operation.kind == "dsd_to_pcm")
+    }) {
+        match album_uniform_operation(tracks, "dsd_export_level") {
+            AlbumUniformOperation::Uniform(lines) => {
+                body.extend(lines);
+                presentation.suppressed_operation_kinds.insert("dsd_export_level".to_string());
+                promoted_uniform_fact = true;
+            }
+            AlbumUniformOperation::Divergent => body.push(
+                "DIVERGENCE — DSD reconstruction export gain differs across tracks; see per-track results."
+                    .to_string(),
+            ),
+            AlbumUniformOperation::AbsentOrIncomplete => {}
+        }
+    }
+
+    // A general DSD-to-PCM route may fuse the final encoder into the same
+    // physical reconstruction command. Its typed terminal evidence (including
+    // quantization and dither ownership) remains distinct and should also be
+    // promoted once when it is common across a complete DSD album.
+    if tracks.iter().all(|(fragment, _)| {
+        fragment.execution_evidence.delivered_operations()
+            .any(|operation| operation.kind == "dsd_to_pcm")
+    }) {
+        match album_uniform_operation(tracks, "encode_pcm") {
+            AlbumUniformOperation::Uniform(lines) => {
+                body.extend(lines);
+                presentation.suppressed_operation_kinds.insert("encode_pcm".to_string());
+                promoted_uniform_fact = true;
+            }
+            AlbumUniformOperation::Divergent => body.push(
+                "DIVERGENCE — PCM terminal realization or dither differs across tracks; see per-track results."
+                    .to_string(),
+            ),
+            AlbumUniformOperation::AbsentOrIncomplete => {}
+        }
+    }
+
     match album_uniform_reference_terminal_static(tracks) {
         AlbumUniformOperation::Uniform(lines) => {
             body.extend(lines);
@@ -53306,6 +53349,22 @@ async fn finalize_report_with_binding(
     .await
 }
 
+// A human conversion log does not authorize a portable JSON sidecar. When
+// machine evidence is independently enabled, it must not land in the user's
+// output tree, even if an older configuration placed its root there.
+fn portable_evidence_log_root(requested: &Path, output_root: &Path) -> PathBuf {
+    let output_root = absolute_normalized_action_path(output_root);
+    if !absolute_normalized_action_path(requested).starts_with(&output_root) {
+        return requested.to_path_buf();
+    }
+    [dirs::data_local_dir(), dirs::cache_dir(), Some(std::env::temp_dir())]
+        .into_iter()
+        .flatten()
+        .map(|root| root.join("tonepoet").join("execution-evidence"))
+        .find(|candidate| !absolute_normalized_action_path(candidate).starts_with(&output_root))
+        .unwrap_or_else(|| std::env::temp_dir().join("tonepoet").join("execution-evidence"))
+}
+
 async fn finalize_report_with_binding_and_timing(
     req: &PipelineRequest,
     reporter: &dyn PipelineReporter,
@@ -53328,11 +53387,10 @@ async fn finalize_report_with_binding_and_timing(
     let mut durable_log = None;
     let mut terminal_error_override: Option<String> = None;
     let settings_fingerprint = tonepoet_pipeline::fingerprint::settings_fingerprint(&req.settings);
-    // The structured companion is part of the conversion-log contract. The
-    // TUI historically enables the human log independently of JSON logging;
-    // write the portable execution record whenever either output is requested
-    // so removing command transcripts from conversion.log never loses evidence.
-    let should_write = (req.log.write_json_log || req.log.write_conversion_log)
+    // Portable execution evidence is optional machine output, not an implicit
+    // sidecar of the human conversion log. A request for conversion.log alone
+    // must not create JSON in the user's destination (issue #64).
+    let should_write = req.log.write_json_log
         && match &outcome {
             AlbumOutcome::Complete { .. } | AlbumOutcome::Partial { .. } => true,
             AlbumOutcome::Blocked { .. } => req.log.write_for_blocked,
@@ -53357,18 +53415,11 @@ async fn finalize_report_with_binding_and_timing(
             prior_attempts: Vec::new(),
             action_reports: action_reports.clone(),
         };
-        // Write the log alongside the album artifacts when possible,
-        // fall back to the configured log root for blocked/failed jobs.
-        let effective_log = match &published {
-            Some(album) => LogPolicy {
-                root: binding
-                    .as_ref()
-                    .and_then(|binding| binding.io_path(&album.album_dir).ok())
-                    .unwrap_or_else(|| album.album_dir.clone()),
-                ..req.log.clone()
-            },
-            None => req.log.clone(),
-        };
+        // Do not redirect portable evidence into a successfully published
+        // album. The configured root is the independent machine-log destination;
+        // a root within the output tree is redirected to private app storage.
+        let mut effective_log = req.log.clone();
+        effective_log.root = portable_evidence_log_root(&req.log.root, &req.output_root);
         match write_durable_log(&report_to_write, &effective_log) {
             Ok(path) => {
                 durable_log = Some(
@@ -61777,6 +61828,117 @@ mod conversion_log_tests {
             &presentation,
         );
         assert!(first_track.contains("DSD-to-PCM conversion"));
+    }
+
+    fn add_fused_sox_terminal_fact(fragment: &mut ConversionLogTrackFragment, dither: &str) {
+        // The general SoX fused route has a distinct typed PCM terminal but
+        // shares its physical invocation with DSD reconstruction. The terminal
+        // owns the format/precision/dither facts; it does not resample again.
+        let mut terminal = OperationRecord::completed(
+            "fused-encode",
+            "encode_pcm",
+            "PCM terminal encoding",
+            ExecutionBackend::external("sox"),
+        );
+        terminal.parameters.extend([
+            OperationParameter::new("Terminal realization", EvidenceValue::Text("SoxDirect".to_owned())),
+            OperationParameter::new("Terminal output format", EvidenceValue::Text("Flac".to_owned())),
+            OperationParameter::new("Terminal output precision", EvidenceValue::BitDepth("Int24".to_owned())),
+            OperationParameter::new("Effective terminal dither", EvidenceValue::Text(dither.to_owned())),
+        ]);
+        fragment.execution_evidence.operations.retain(|operation| {
+            operation.kind != "reference_terminal_realization"
+        });
+        fragment.execution_evidence.operations.push(terminal);
+        let mut level = OperationRecord::completed(
+            "dsd-level-export",
+            "dsd_export_level",
+            "DSD reconstruction level export",
+            ExecutionBackend::native("TonePoet DSD realization"),
+        );
+        level.parameters.extend([
+            OperationParameter::new("Level", EvidenceValue::Text("Native".to_owned())),
+            OperationParameter::new("Gain", EvidenceValue::Text("+0.000000000 dB".to_owned())),
+        ]);
+        fragment.execution_evidence.operations.push(level);
+        fragment.album_gain_decision = None;
+        fragment.shared_decision_scope = None;
+        fragment.execution_evidence.decisions.clear();
+    }
+
+    #[test]
+    fn album_scope_promotes_fused_dsd_terminal_and_explicit_dither_exactly_once() {
+        let mut first = album_scope_test_fragment(1, 88_200);
+        let mut second = album_scope_test_fragment(2, 88_200);
+        add_fused_sox_terminal_fact(&mut first, "Tpdf");
+        add_fused_sox_terminal_fact(&mut second, "Tpdf");
+        let first_summary = successful_log_summary();
+        let second_summary = successful_log_summary();
+        let tracks = vec![(&first, &first_summary), (&second, &second_summary)];
+        let presentation = build_conversion_log_album_presentation(&tracks, true);
+        assert_eq!(presentation.section.matches("Target rate: 88200 Hz").count(), 1);
+        assert_eq!(presentation.section.matches("PCM terminal encoding").count(), 1);
+        assert_eq!(presentation.section.matches("Effective terminal dither: Tpdf").count(), 1);
+        assert_eq!(presentation.section.matches("Gain: +0.000000000 dB").count(), 1);
+        assert!(presentation.suppressed_operation_kinds.contains("dsd_export_level"));
+        assert!(presentation.suppressed_operation_kinds.contains("encode_pcm"));
+        let first_rendered = render_structured_conversion_log_track_fragment(
+            &first, &first_summary, &presentation,
+        );
+        assert!(!first_rendered.contains("PCM terminal encoding"));
+        assert!(!first_rendered.contains("Effective terminal dither"));
+    }
+
+    #[test]
+    fn album_scope_calls_out_dsd_export_gain_divergence() {
+        let mut first = album_scope_test_fragment(1, 88_200);
+        let mut second = album_scope_test_fragment(2, 88_200);
+        add_fused_sox_terminal_fact(&mut first, "None");
+        add_fused_sox_terminal_fact(&mut second, "None");
+        let level = second.execution_evidence.operations.iter_mut()
+            .find(|operation| operation.kind == "dsd_export_level").expect("level fact");
+        level.parameters.iter_mut().find(|parameter| parameter.name == "Gain")
+            .expect("bound gain").value = EvidenceValue::Text("+6.000000000 dB".to_owned());
+        let first_summary = successful_log_summary();
+        let second_summary = successful_log_summary();
+        let tracks = vec![(&first, &first_summary), (&second, &second_summary)];
+        let presentation = build_conversion_log_album_presentation(&tracks, true);
+        assert!(presentation.section.contains(
+            "DIVERGENCE — DSD reconstruction export gain differs across tracks"
+        ));
+        assert!(!presentation.suppressed_operation_kinds.contains("dsd_export_level"));
+        let first_rendered = render_structured_conversion_log_track_fragment(
+            &first, &first_summary, &presentation,
+        );
+        let second_rendered = render_structured_conversion_log_track_fragment(
+            &second, &second_summary, &presentation,
+        );
+        assert!(first_rendered.contains("Gain: +0.000000000 dB"));
+        assert!(second_rendered.contains("Gain: +6.000000000 dB"));
+    }
+
+    #[test]
+    fn album_scope_calls_out_terminal_dither_divergence_and_preserves_each_track() {
+        let mut first = album_scope_test_fragment(1, 88_200);
+        let mut second = album_scope_test_fragment(2, 88_200);
+        add_fused_sox_terminal_fact(&mut first, "Tpdf");
+        add_fused_sox_terminal_fact(&mut second, "None");
+        let first_summary = successful_log_summary();
+        let second_summary = successful_log_summary();
+        let tracks = vec![(&first, &first_summary), (&second, &second_summary)];
+        let presentation = build_conversion_log_album_presentation(&tracks, true);
+        assert!(presentation.section.contains(
+            "DIVERGENCE — PCM terminal realization or dither differs across tracks"
+        ));
+        assert!(!presentation.suppressed_operation_kinds.contains("encode_pcm"));
+        let first_rendered = render_structured_conversion_log_track_fragment(
+            &first, &first_summary, &presentation,
+        );
+        let second_rendered = render_structured_conversion_log_track_fragment(
+            &second, &second_summary, &presentation,
+        );
+        assert!(first_rendered.contains("Effective terminal dither: Tpdf"));
+        assert!(second_rendered.contains("Effective terminal dither: None"));
     }
 
     #[test]
@@ -70518,6 +70680,76 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
     }
 
 
+
+    #[tokio::test]
+    async fn requested_human_log_does_not_publish_implicit_machine_evidence() {
+        let mut fixture = fixture(
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            1,
+            stage_policy(false, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        fixture.album.req.publish.write_manifest = false;
+        fixture.album.req.log.write_conversion_log = true;
+        fixture.album.req.log.write_json_log = false;
+        let outputs = vec![successful_output(&fixture, 0)];
+        let album_dir = fixture.album_dir.clone();
+        let log_root = fixture.log_root.clone();
+        let runner = BlockingToolRunner::new();
+        let reporter = RecordingReporter::new();
+        let cancel = CancellationToken::new();
+        let report = finish_pipeline_album_for_scheduler(
+            fixture.album, outputs, &runner, &reporter, &cancel,
+        ).await;
+        assert!(matches!(&report.outcome, AlbumOutcome::Complete { .. }), "{:?}", report.outcome);
+        assert!(report.durable_log.is_none(), "JSON evidence needs independent consent");
+        let mut names = std::fs::read_dir(&album_dir).expect("published album")
+            .map(|entry| entry.expect("directory entry").file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, vec!["01.flac", "conversion.log"]);
+        assert!(std::fs::read_dir(&log_root).expect("private log root").next().is_none());
+    }
+
+    #[tokio::test]
+    async fn explicitly_requested_machine_evidence_stays_outside_destination_tree() {
+        let mut fixture = fixture(
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            1,
+            stage_policy(false, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        fixture.album.req.publish.write_manifest = false;
+        fixture.album.req.log.write_conversion_log = true;
+        fixture.album.req.log.write_json_log = true;
+        let output_root = fixture.album.req.output_root.clone();
+        let obsolete_in_output_root = output_root.join(".tonepoet-logs");
+        assert!(!portable_evidence_log_root(&obsolete_in_output_root, &output_root)
+            .starts_with(&output_root), "an in-output machine root must redirect into app storage");
+        // The integration run writes only to the fixture's isolated private root;
+        // no test may deposit machine evidence in the developer's own app data.
+        let private_root = fixture.log_root.clone();
+        fixture.album.req.log.root = private_root.clone();
+        let outputs = vec![successful_output(&fixture, 0)];
+        let album_dir = fixture.album_dir.clone();
+        let runner = BlockingToolRunner::new();
+        let reporter = RecordingReporter::new();
+        let cancel = CancellationToken::new();
+        let report = finish_pipeline_album_for_scheduler(
+            fixture.album, outputs, &runner, &reporter, &cancel,
+        ).await;
+        assert!(matches!(&report.outcome, AlbumOutcome::Complete { .. }), "{:?}", report.outcome);
+        let durable = report.durable_log.as_ref().expect("explicit portable evidence");
+        assert!(durable.is_file());
+        assert!(durable.starts_with(&private_root), "portable JSON must use isolated app storage");
+        assert!(!durable.starts_with(&output_root), "portable JSON must stay outside output");
+        let mut names = std::fs::read_dir(&album_dir).expect("published album")
+            .map(|entry| entry.expect("directory entry").file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, vec!["01.flac", "conversion.log"]);
+        assert!(!output_root.join(".tonepoet-logs").exists());
+    }
 
     #[tokio::test]
     async fn five_track_fail_fast_blocks_after_convert_and_runs_no_postprocessing_tools() {

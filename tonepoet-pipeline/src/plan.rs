@@ -1184,6 +1184,31 @@ fn stage_a_associated_step_index(
     }
 
     match operation {
+        // The common semantic spine models DSD reconstruction into a PCM
+        // signal (nominally WAV), but the retained bridge can write the final
+        // lossless container directly from the same SoX invocation. Match the
+        // reconstruction by its processing contract, not by its synthetic
+        // intermediate container. The exact-match branch above still owns
+        // split reconstructions and all other ordinary operations.
+        PlanOperation::DsdToPcm {
+            target_format: AudioFormat::Wav,
+            target_rate_hz,
+            target_bit_depth,
+            lowpass,
+        } => steps.iter().position(|step| {
+            matches!(
+                &step.operation,
+                PlanOperation::DsdToPcm {
+                    target_format: emitted_format,
+                    target_rate_hz: emitted_rate_hz,
+                    target_bit_depth: emitted_bit_depth,
+                    lowpass: emitted_lowpass,
+                } if emitted_format != &AudioFormat::Wav
+                    && emitted_rate_hz == target_rate_hz
+                    && emitted_bit_depth == target_bit_depth
+                    && emitted_lowpass == lowpass
+            )
+        }),
         // The retained bridge can fold an ordinary PCM resample into the
         // terminal encoder command. Associate the typed resampler with that
         // physical realization instead of silently dropping the node.
@@ -1207,7 +1232,7 @@ fn stage_a_associated_step_index(
         // as distinct typed operations.
         PlanOperation::EncodePcm {
             target_format,
-            target_rate_hz: Some(target_rate_hz),
+            target_rate_hz,
             target_bit_depth,
             ..
         } => steps.iter().position(|step| {
@@ -1219,7 +1244,7 @@ fn stage_a_associated_step_index(
                     target_bit_depth: emitted_bit_depth,
                     ..
                 } if emitted_format == target_format
-                    && emitted_rate_hz == target_rate_hz
+                    && target_rate_hz.is_none_or(|rate| emitted_rate_hz == &rate)
                     && emitted_bit_depth == target_bit_depth
             )
         }),
@@ -4800,6 +4825,51 @@ mod stage_a_lowering_selection_diagnostics {
                 assert!(matches!(&resample.emitted_operation, PlanOperation::ResamplePcm { .. }));
             }
         }
+    }
+
+    fn fused_dsd_flac_request() -> PlanRequest {
+        let mut request = pcm_request(
+            "dsd-flac-fused-sox",
+            DsdRate::Dsd64.hz(),
+            AudioFormat::Flac,
+            88_200,
+            PreferredTool::Sox,
+        );
+        request.input_path = PathBuf::from("input.dsf");
+        request.source.format = AudioFormat::Dsf;
+        request.source.codec = AudioCodec::Dsd;
+        request.source.source_representation = SourceRepresentationKind::Dsd;
+        request.source.sample_kind = Some(SampleKind::Dsd);
+        request.source.bit_depth = None;
+        request.source.true_source_depth = None;
+        request.settings.dsd.set_gain_policy(crate::settings::SampleGainPolicy::Off);
+        request.settings.dither_type = DitherType::None;
+        request.settings.metadata.transfer_tags = false;
+        request.settings.metadata.preserve_artwork = false;
+        request
+    }
+
+    #[test]
+    fn fused_dsd_to_flac_receipts_cover_both_typed_processing_operations() {
+        let request = fused_dsd_flac_request();
+        let lowered = plan_conversion(&request).expect("ordinary DSD->FLAC fused path must plan");
+        let PlanAction::Execute { commands, .. } = lowered.action else {
+            panic!("DSD->FLAC must execute")
+        };
+        assert_eq!(commands.len(), 1, "ordinary SoX reconstruction and packaging are fused");
+        assert_eq!(commands[0].tool, ToolIdentifier::Sox);
+
+        let records = assert_no_selected_vs_emitted_divergence("dsd-flac-fused-sox", &request);
+        let reconstruction = records.iter().find(|record| {
+            matches!(&record.operation, PlanOperation::DsdToPcm { .. })
+        }).expect("typed DSD reconstruction receipt");
+        let terminal = records.iter().find(|record| {
+            matches!(&record.operation, PlanOperation::EncodePcm { .. })
+        }).expect("typed terminal encoder receipt");
+        assert_eq!(reconstruction.emitted_step_index, 0);
+        assert_eq!(terminal.emitted_step_index, 0);
+        assert!(matches!(&terminal.operation, PlanOperation::EncodePcm { target_rate_hz: None, .. }));
+        assert!(matches!(&terminal.emitted_operation, PlanOperation::DsdToPcm { target_format: AudioFormat::Flac, .. }));
     }
 
     #[test]

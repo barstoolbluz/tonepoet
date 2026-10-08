@@ -952,7 +952,7 @@ pub fn completed_plan_evidence(
                 ));
                 record.parameters.push(OperationParameter::new(
                     "Gain",
-                    EvidenceValue::Text(format!("{gain_db:?}")),
+                    EvidenceValue::Text(format!("{} dB", gain_db.render(true))),
                 ));
                 evidence.operations.push(record);
             }
@@ -2492,6 +2492,69 @@ mod tests {
             reference_programme_scope: Default::default(),
             planned_riff_non_audio_upper_bound_bytes: None,
         }
+    }
+
+    fn ordinary_fused_dsd_flac_request() -> PlanRequest {
+        let mut request = float_source_terminal_request(
+            tonepoet_pipeline::PcmBitDepth::Float64,
+            tonepoet_pipeline::AudioFormat::Flac,
+        );
+        request.input_path = PathBuf::from("input.dsf");
+        request.source.format = tonepoet_pipeline::AudioFormat::Dsf;
+        request.source.codec = tonepoet_pipeline::AudioCodec::Dsd;
+        request.source.sample_rate_hz = Some(tonepoet_pipeline::DsdRate::Dsd64.hz());
+        request.source.bit_depth = None;
+        request.source.true_source_depth = None;
+        request.source.sample_kind = Some(tonepoet_pipeline::SampleKind::Dsd);
+        request.source.source_representation = tonepoet_pipeline::SourceRepresentationKind::Dsd;
+        request.settings.target_sample_rate = tonepoet_pipeline::RateTarget::PcmHz(88_200);
+        request.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(
+            tonepoet_pipeline::PcmBitDepth::Int24,
+        );
+        request.settings.preferred_tool = tonepoet_pipeline::PreferredTool::Sox;
+        request.settings.dsd.set_gain_policy(tonepoet_pipeline::SampleGainPolicy::Off);
+        request
+    }
+
+    #[test]
+    fn ordinary_fused_dsd_conversion_emits_complete_typed_processing_evidence() {
+        let request = ordinary_fused_dsd_flac_request();
+        let plan = tonepoet_pipeline::plan_conversion(&request).expect("fused SoX plan");
+        let tonepoet_pipeline::PlanAction::Execute { commands, .. } = plan.action else {
+            panic!("ordinary DSD conversion must execute")
+        };
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].tool, tonepoet_pipeline::ToolIdentifier::Sox);
+        let mut invocation = test_invocation(Some(ProcessExit::Code(0)));
+        invocation.binary = super::super::tool::ToolBinary::Sox;
+
+        let projected = completed_plan_evidence(&request, &[invocation])
+            .expect("fused SoX physical command must map to both typed nodes");
+        let reconstruction = projected.operations.iter().find(|operation| operation.kind == "dsd_to_pcm")
+            .expect("authoritative DSD reconstruction");
+        let terminal = projected.operations.iter().find(|operation| operation.kind == "encode_pcm")
+            .expect("authoritative PCM terminal");
+        assert_eq!(reconstruction.invocation_indices, vec![0]);
+        assert_eq!(terminal.invocation_indices, vec![0]);
+        assert!(reconstruction.parameters.iter().any(|parameter| {
+            parameter.name == "Target rate"
+                && parameter.value == EvidenceValue::SampleRateHz(88_200)
+        }));
+        assert!(terminal.parameters.iter().any(|parameter| parameter.name == "Terminal realization"));
+        assert!(terminal.parameters.iter().any(|parameter| {
+            parameter.name == "Effective terminal dither"
+                && parameter.value == EvidenceValue::Text("None".to_owned())
+        }));
+        let export = projected.operations.iter()
+            .find(|operation| operation.kind == "dsd_export_level")
+            .expect("typed DSD level export fact");
+        assert!(export.parameters.iter().any(|parameter| {
+            parameter.name == "Gain"
+                && parameter.value == EvidenceValue::Text("+0.000000000 dB".to_owned())
+        }));
+        assert!(!projected.verifications.iter().any(|record| {
+            record.status == VerificationStatus::Incomplete
+        }));
     }
 
     fn sox_preterminal_ffmpeg_package_request() -> PlanRequest {
