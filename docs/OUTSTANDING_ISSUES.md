@@ -3383,6 +3383,52 @@ orphaned. The output root ends a conversion with no `.tonepoet-*` entry in it.
 > on any route tried, before or after R15, and R15 did not touch it. The
 > forcing code in `stages.rs` (`reference_manifest_required`) is unchanged.
 
+### DECISION 2026-10-08: rerun detection is not wanted. Remove it.
+
+The user's decision, asked and answered directly: "i don't want re-run detection."
+
+This settles the manifest half. The earlier framing — move the fingerprints into
+the database — is superseded. There is nothing to move.
+
+What rerun detection is: the manifest records per-track settings-snapshot,
+semantic-plan and execution fingerprints so that converting into the same folder
+again can skip tracks whose inputs and settings are unchanged. That is the whole
+payoff, and it pays only when someone converts the same album twice into the same
+destination with identical settings. foobar2000 has no equivalent. For library
+curation the case does not arise, and when a re-convert does happen it is usually
+because something changed, which invalidates the skip anyway.
+
+What it costs: `.tonepoet-manifest.json` in every Reference album folder, written
+past its own policy flag. `req.publish.write_manifest` defaults to false — #27's
+fix — but `reference_manifest_required` (`stages.rs:43788`) forces it on for any
+track carrying Reference evidence, with the comment "Native Reference publication
+always carries manifest-v2 authority". As of 2026-10-08 that had produced 26
+manifests totalling 1,019,304 bytes in the user's library. They were deleted that
+day; the forcing condition is unchanged, so the next DSD conversion recreates one.
+
+Scope, measured 2026-10-08: `rerun.rs` 990 lines, `manifest.rs` 1530,
+`manifest_builder.rs` 726, `orchestrator_rerun_gate.rs` 86 — about 3330 lines in
+dedicated files, plus call sites in 15 others. **There is no user-facing control
+for any of it**: no CLI flag, no config key, no TUI command. It is entirely
+internal machinery for a behaviour the user never requested and cannot disable.
+
+The only reader of the on-disk manifest that can be found is `rerun.rs`.
+`manifest_path` is `None` at every site in `processor.rs`. The "P0-020 authority
+check" named earlier in this issue appears nowhere in the source — only in this
+issue's own text — so no Reference correctness role for the manifest is visible in
+the code. If one exists it must be identified before removal; if none does,
+removing rerun detection removes the need for the manifest entirely.
+
+### Required, superseding the manifest-half requirements above
+
+- Remove rerun detection and the album manifest with it. No `.tonepoet-manifest.json`
+  on any route, including Reference, and not relocated elsewhere either — there is no
+  consumer to relocate it for.
+- A re-conversion into the same destination simply does the work again. That is the
+  expected behaviour.
+- If removal turns out to break a Reference guarantee that genuinely depends on the
+  manifest, stop and say which guarantee and where, rather than keeping the file.
+
 ### Reproduced 2026-10-02 on a default configuration
 
 A 22-track DSD64 SACD ISO, `SIGKILL`ed about fifteen seconds in, no
