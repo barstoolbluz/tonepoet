@@ -44309,8 +44309,10 @@ pub(crate) async fn finish_pipeline_album_for_scheduler_with_tool_limits_and_ret
         }
     }
 
-    // Native Reference publication always carries manifest-v2 authority.
-    // Existing routes retain the opt-in legacy manifest policy.
+    // Preserve Reference manifest-v2 *validation* (including decoded-sample
+    // continuity and execution authority), even when publication did not ask
+    // for the private rerun sidecar. Consent controls only its publication.
+    // Without a manifest, the existing rerun gate conservatively redoes work.
     let reference_manifest_required = artifacts.as_ref().is_some_and(|artifact_set| match &artifact_set.audio {
         AudioArtifacts::Tracks(tracks) => tracks.iter().any(|track| track.reference_evidence.is_some()),
         AudioArtifacts::Merged(_) => false,
@@ -44338,7 +44340,13 @@ pub(crate) async fn finish_pipeline_album_for_scheduler_with_tool_limits_and_ret
                 &req,
                 &plan_value,
                 req.publish.clone(),
-                conversion_manifest.as_ref(),
+                // A qualified Reference conversion still validates its manifest
+                // authority above, but never writes an unrequested sidecar.
+                if req.publish.write_manifest {
+                    conversion_manifest.as_ref()
+                } else {
+                    None
+                },
                 identity_lock.lock(),
                 identity_lock.multi_root_locks(),
                 identity_lock.reject_late_action_authority(),
@@ -70686,7 +70694,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         let mut fixture = fixture(
             FailurePolicy::FailAlbumOnAnyTrackFailure,
             1,
-            stage_policy(false, false, false),
+            stage_policy(false, false, true),
             OverwritePolicy::FailIfExists,
         );
         fixture.album.req.publish.write_manifest = false;
@@ -70716,7 +70724,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         let mut fixture = fixture(
             FailurePolicy::FailAlbumOnAnyTrackFailure,
             1,
-            stage_policy(false, false, false),
+            stage_policy(false, false, true),
             OverwritePolicy::FailIfExists,
         );
         fixture.album.req.publish.write_manifest = false;
@@ -70749,6 +70757,473 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         names.sort();
         assert_eq!(names, vec!["01.flac", "conversion.log"]);
         assert!(!output_root.join(".tonepoet-logs").exists());
+    }
+
+    // Issue #65: a destination is a *recursive set*, not just the visible
+    // entries in the album folder. Include directories, dotfiles, and special
+    // entries so adding a new writer cannot silently pollute a music library.
+    fn destination_inventory(root: &Path) -> std::collections::BTreeSet<String> {
+        let mut found = std::collections::BTreeSet::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            let entries = std::fs::read_dir(&dir)
+                .unwrap_or_else(|error| panic!("cannot enumerate {}: {error}", dir.display()));
+            for entry in entries {
+                let entry = entry.expect("destination directory entry");
+                let path = entry.path();
+                let relative = path.strip_prefix(root).expect("entry under destination");
+                let kind = entry.file_type().expect("destination entry file type");
+                let name = relative.to_string_lossy();
+                if kind.is_dir() {
+                    found.insert(format!("{name}/"));
+                    pending.push(path);
+                } else if kind.is_file() {
+                    found.insert(name.into_owned());
+                } else {
+                    // Symlinks, devices, and other surprise entries must be
+                    // reported, not followed or silently dropped.
+                    found.insert(format!("{name} [special entry]"));
+                }
+            }
+        }
+        found
+    }
+
+    fn assert_destination_inventory(
+        root: &Path,
+        expected: &std::collections::BTreeSet<String>,
+        route: &str,
+    ) {
+        let actual = destination_inventory(root);
+        let unexpected: Vec<_> = actual.difference(expected).cloned().collect();
+        let missing: Vec<_> = expected.difference(&actual).cloned().collect();
+        assert!(
+            unexpected.is_empty() && missing.is_empty(),
+            "issue #65 destination inventory mismatch ({route}); unexpected entries: {unexpected:?}; missing entries: {missing:?}; full inventory: {actual:?}"
+        );
+    }
+
+    #[test]
+    fn destination_inventory_detects_hidden_files_nested_directories_and_unrequested_evidence() {
+        let scratch = tempfile::tempdir().expect("inventory scratch");
+        let root = scratch.path();
+        std::fs::write(root.join("01.flac"), b"audio").expect("audio fixture");
+        let expected = std::collections::BTreeSet::from(["01.flac".to_string()]);
+        assert_destination_inventory(root, &expected, "clean baseline");
+
+        std::fs::write(root.join(".tonepoet-manifest.json"), b"unexpected")
+            .expect("unrequested manifest");
+        std::fs::create_dir(root.join(".tonepoet-logs")).expect("unrequested hidden directory");
+        std::fs::write(root.join(".tonepoet-logs/job-item.json"), b"unexpected")
+            .expect("unrequested machine evidence");
+        std::fs::write(root.join("job-item.json"), b"unexpected")
+            .expect("unrequested evidence beside audio");
+        let actual = destination_inventory(root);
+        for unwanted in [
+            ".tonepoet-manifest.json",
+            ".tonepoet-logs/",
+            ".tonepoet-logs/job-item.json",
+            "job-item.json",
+        ] {
+            assert!(actual.contains(unwanted), "scanner missed {unwanted}");
+            assert!(!expected.contains(unwanted), "test fixture unexpectedly permits {unwanted}");
+        }
+        let caught = std::panic::catch_unwind(|| {
+            assert_destination_inventory(root, &expected, "deliberate pollution");
+        }).expect_err("recursive destination check must reject unrequested files");
+        let message = caught.downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| caught.downcast_ref::<&str>().copied())
+            .expect("diagnostic is text");
+        for unwanted in [
+            ".tonepoet-manifest.json",
+            ".tonepoet-logs/",
+            ".tonepoet-logs/job-item.json",
+            "job-item.json",
+        ] {
+            assert!(message.contains(unwanted), "missing explicit offender {unwanted}: {message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_65_postconversion_destination_inventory_covers_source_routes_and_log_consent() {
+        // All real source materializers converge on this post-conversion
+        // scheduler finisher. Provide already-converted tracks (no external
+        // audio binaries) and run the *actual* feature, publication, companion,
+        // and evidence paths for each source classification. The Reference
+        // request case checks the common post-conversion boundary; qualified
+        // Reference evidence/manifest policy needs a separate route-specific
+        // test and must not be inferred from these synthetic tracks.
+        let routes = [
+            ("single-file", SourceKind::SingleFile, 1_usize, false, false, false),
+            ("folder-album", SourceKind::SingleFile, 2, false, false, true),
+            ("cue-image", SourceKind::CueImage, 2, true, false, false),
+            ("archive", SourceKind::Archive, 1, false, false, false),
+            ("sacd-iso", SourceKind::SacdIso, 1, false, false, false),
+            ("dvd-audio", SourceKind::DvdAudio, 1, false, false, false),
+            ("dvd-video", SourceKind::DvdVideo, 1, false, false, false),
+            ("blu-ray", SourceKind::BluRay, 1, false, false, false),
+            ("reference-request", SourceKind::SacdIso, 1, false, true, false),
+        ];
+        for (route, kind, track_count, cue, reference_request, copy_artwork) in routes {
+            for human_log in [false, true] {
+                for machine_evidence in [false, true] {
+                    let case = format!("{route}: human_log={human_log}, machine_evidence={machine_evidence}");
+                    let mut f = fixture(
+                        FailurePolicy::FailAlbumOnAnyTrackFailure,
+                        track_count,
+                        stage_policy(false, false, true),
+                        OverwritePolicy::FailIfExists,
+                    );
+                    f.album.req.publish.write_manifest = false;
+                    f.album.req.log.write_conversion_log = human_log;
+                    f.album.req.log.write_json_log = machine_evidence;
+                    f.album.req.stages.generate_cue = cue;
+                    f.album.source.kind = kind;
+                    f.album.source.provenance.source_kind = kind;
+                    if reference_request {
+                        f.album.req.settings.dsd = tonepoet_pipeline::DsdSettings::reference();
+                    }
+                    if copy_artwork {
+                        std::fs::write(f._temp.path().join("cover.jpg"), b"artwork")
+                            .expect("requested companion artwork");
+                        f.album.req.companion.extensions.push(".jpg".to_string());
+                    }
+                    let outputs = (0..track_count)
+                        .map(|index| successful_output(&f, index))
+                        .collect::<Vec<_>>();
+                    let destination = f.album.req.output_root.clone();
+                    let log_root = f.log_root.clone();
+                    let runner = BlockingToolRunner::new();
+                    let reporter = RecordingReporter::new();
+                    let cancel = CancellationToken::new();
+                    let report = finish_pipeline_album_for_scheduler(
+                        f.album, outputs, &runner, &reporter, &cancel,
+                    ).await;
+                    assert!(matches!(&report.outcome, AlbumOutcome::Complete { .. }),
+                        "{case}: conversion outcome: {:?}", report.outcome);
+                    assert!(runner.transcript().is_empty(),
+                        "{case}: post-conversion fixture must not require audio tools");
+
+                    let mut expected = std::collections::BTreeSet::from(["Gate Test/".to_string()]);
+                    for index in 0..track_count {
+                        expected.insert(format!("Gate Test/{:02}.flac", index + 1));
+                    }
+                    if human_log {
+                        expected.insert("Gate Test/conversion.log".to_string());
+                    }
+                    if cue {
+                        expected.insert("Gate Test/album.cue".to_string());
+                    }
+                    if copy_artwork {
+                        expected.insert("Gate Test/cover.jpg".to_string());
+                    }
+                    assert_destination_inventory(&destination, &expected, &case);
+                    match (machine_evidence, report.durable_log.as_ref()) {
+                        (true, Some(path)) => {
+                            assert!(path.is_file(), "{case}: independently requested evidence missing");
+                            assert!(path.starts_with(&log_root),
+                                "{case}: machine evidence escaped private storage: {}", path.display());
+                            assert!(!path.starts_with(&destination),
+                                "{case}: machine evidence polluted destination: {}", path.display());
+                        }
+                        (false, None) => assert!(
+                            std::fs::read_dir(&log_root).expect("private evidence root").next().is_none(),
+                            "{case}: machine evidence created without consent"
+                        ),
+                        other => panic!("{case}: incorrect independent evidence consent: {other:?}"),
+                    }
+                }
+            }
+        }
+    }
+
+    // Issue #65 / #53: unlike the `reference-request` row above, this
+    // post-conversion fixture carries an accepted typed Reference plan and
+    // non-None execution evidence. The post-metadata sample hash is returned
+    // by a bound in-memory ToolRunner: no audio executable is invoked. Its
+    // identity records are fixture values, not a claim of release qualification.
+    struct ReferenceInventoryHashRunner {
+        decoded_hash: tonepoet_pipeline::Sha256Digest,
+        calls: Mutex<Vec<ToolBinary>>,
+    }
+
+    #[async_trait]
+    impl ToolRunner for ReferenceInventoryHashRunner {
+        async fn run(
+            &self,
+            command: ToolCommand,
+            _cancel: &CancellationToken,
+        ) -> Result<ToolOutput, ToolRunnerError> {
+            assert_eq!(command.binary, ToolBinary::Ffmpeg,
+                "post-metadata FLAC sample verification must use FFmpeg");
+            self.calls.lock().expect("reference call lock").push(command.binary);
+            let sanitized_args = command.sanitized_args();
+            let environment = command.sanitized_environment();
+            let env_keys = command.env_keys();
+            let record = CommandRecord {
+                description: None,
+                binary: command.binary,
+                sanitized_args,
+                cwd: command.cwd,
+                environment_policy: command.environment_policy,
+                environment,
+                env_keys,
+                exit: Some(ProcessExit::Code(0)),
+                stdout_tail: String::new(),
+                stderr_tail: String::new(),
+                elapsed: Duration::ZERO,
+            };
+            Ok(ToolOutput {
+                exit: ProcessExit::Code(0),
+                stdout_tail: format!("SHA256={}\n", self.decoded_hash.to_hex()),
+                stderr_tail: String::new(),
+                elapsed: Duration::ZERO,
+                command: record,
+            })
+        }
+
+        fn resolved_tool_path(&self, binary: ToolBinary) -> Option<PathBuf> {
+            match binary {
+                ToolBinary::Ffmpeg => Some(PathBuf::from("/test/ffmpeg")),
+                ToolBinary::Sox => Some(PathBuf::from("/test/sox")),
+                _ => None,
+            }
+        }
+    }
+
+    fn reference_inventory_tool_identity(
+        binary: ToolBinary,
+        name: &str,
+    ) -> crate::convert::pipeline::track_executor::ReferenceToolIdentity {
+        let digest = tonepoet_pipeline::Sha256Digest::of_bytes(name.as_bytes());
+        let command = CommandRecord {
+            description: Some(format!("Fixture {name} attestation")),
+            binary,
+            sanitized_args: vec!["--version".to_string()],
+            cwd: None,
+            environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet,
+            environment: BTreeMap::from([("LC_ALL".to_string(), "C".to_string())]),
+            env_keys: vec!["LC_ALL".to_string()],
+            exit: Some(ProcessExit::Code(0)),
+            stdout_tail: String::new(),
+            stderr_tail: String::new(),
+            elapsed: Duration::ZERO,
+        };
+        crate::convert::pipeline::track_executor::ReferenceToolIdentity {
+            canonical_path: PathBuf::from(format!("/test/{name}")),
+            executable_sha256: digest,
+            reported_version: format!("{name}-fixture"),
+            version_probe_command: command.clone(),
+            closure_digest: digest,
+            behavior_probe_digest: digest,
+            behavior_probe_command: command,
+        }
+    }
+
+    fn reference_inventory_fixture(
+        human_log: bool,
+    ) -> (AlbumFixture, Vec<ScheduledTrackOutput>, tonepoet_pipeline::Sha256Digest) {
+        use tonepoet_pipeline::{
+            AudioCodec, AudioFormat, BitDepthTarget, DsdInputFrontEnd,
+            DsdSourceKind, PcmBitDepth, PlanRequest, RateTarget,
+            ReferenceProgrammeScope, ResolvedOutputTarget, SampleGainPolicy,
+            SacdAreaKind, SacdFrameEncoding, SacdTrackSelection,
+            Sha256Digest, SourceInfo, SourceRepresentationKind, SampleKind,
+        };
+        use crate::convert::pipeline::track_executor::{
+            ReferenceExecutionEvidence, ReferencePackagedSampleIdentityMode,
+            ReferencePcmVerificationEvidence, ReferenceToolchainEvidence,
+        };
+
+        let mut f = fixture(
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            1,
+            stage_policy(false, false, true),
+            OverwritePolicy::FailIfExists,
+        );
+        f.album.req.publish.write_manifest = false;
+        f.album.req.log.write_conversion_log = human_log;
+        f.album.req.log.write_json_log = false;
+        f.album.req.settings.dsd = tonepoet_pipeline::DsdSettings::reference();
+        f.album.req.settings.dsd.from_dsd.gain = SampleGainPolicy::Off;
+        // The planner and scheduler both describe a no-metadata-mutation route.
+        f.album.req.settings.metadata.transfer_tags = false;
+        f.album.req.settings.metadata.preserve_artwork = false;
+        f.album.req.settings.metadata.store_source_audio_md5 = false;
+        f.album.req.settings.target_format = AudioFormat::Flac;
+        f.album.req.settings.target_sample_rate = RateTarget::PcmHz(88_200);
+        f.album.req.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
+        f.album.source.kind = SourceKind::SacdIso;
+        f.album.source.provenance.source_kind = SourceKind::SacdIso;
+        let iso = f._temp.path().join("input.iso");
+        std::fs::write(&iso, b"fixture ISO source authority").expect("synthetic source");
+        f.album.req.container = iso.clone();
+        f.album.source.tracks[0].source_ref = TrackSourceRef::SacdTrack {
+            iso: iso.clone(),
+            track_index: 0,
+            area: SacdArea::Stereo,
+        };
+        let original_source_kind = DsdSourceKind::SacdTrack {
+            frame_format: SacdFrameEncoding::Dsd,
+            selection: SacdTrackSelection {
+                area: SacdAreaKind::Stereo,
+                track_index_zero_based: 0,
+                start_frame: 0,
+                frame_count: 75,
+                channels: 2,
+                toc_digest: Sha256Digest::of_bytes(b"fixture SACD TOC"),
+            },
+        };
+        let plan = tonepoet_pipeline::plan_reference_dsd(&PlanRequest {
+            input_path: iso,
+            output_path: f.staged_paths[0].clone(),
+            source: SourceInfo {
+                format: AudioFormat::Dsf,
+                codec: AudioCodec::Dsd,
+                sample_rate_hz: Some(2_822_400),
+                bit_depth: None,
+                true_source_depth: None,
+                source_representation: SourceRepresentationKind::Dsd,
+                sample_kind: Some(SampleKind::Dsd),
+                channels: Some(2),
+                duration: Some(Duration::from_secs(1)),
+                frame_extent: None,
+                dsd_source_kind: Some(original_source_kind.clone()),
+                audio_md5: None,
+            },
+            settings: f.album.req.settings.clone(),
+            plan_scope: tonepoet_pipeline::PlanScope::track("issue-65-reference"),
+            intermediate_dir: Some(f._temp.path().join("reference-work")),
+            container_ffmpeg_flags: Vec::new(),
+            resolved_output_target: Some(ResolvedOutputTarget::FlacNative),
+            reference_programme_scope: ReferenceProgrammeScope::Singleton,
+            planned_riff_non_audio_upper_bound_bytes: Some(0),
+        }).expect("Reference policy must admit this SACD-to-FLAC fixture");
+        let summary = plan.reference.expect("accepted Reference planner summary");
+        assert_eq!(summary.front_end, DsdInputFrontEnd::SacdDsd {
+            extractor: tonepoet_pipeline::QualifiedSacdExtractorVersion::SacdRsP0V1,
+        });
+        let decoded_hash = Sha256Digest::of_bytes(b"Reference fixture decoded PCM");
+        let candidate = summary.qualification_candidate_manifest_digest;
+        let verification_command = CommandRecord {
+            description: Some("Fixture post-metadata sample verification".to_string()),
+            binary: ToolBinary::Ffmpeg,
+            sanitized_args: vec!["-f".to_string(), "hash".to_string()],
+            cwd: None,
+            environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet,
+            environment: BTreeMap::from([("LC_ALL".to_string(), "C".to_string())]),
+            env_keys: vec!["LC_ALL".to_string()],
+            exit: Some(ProcessExit::Code(0)),
+            stdout_tail: String::new(),
+            stderr_tail: String::new(),
+            elapsed: Duration::ZERO,
+        };
+        let evidence = ReferenceExecutionEvidence {
+            applied_gain_db: None,
+            original_source_kind,
+            source_content_sha256: Sha256Digest::of_bytes(b"fixture ISO source authority"),
+            source_probe_digest: Sha256Digest::of_bytes(b"fixture SACD source probe"),
+            canonical_materialization_sha256: Sha256Digest::of_bytes(b"fixture selected DSD track"),
+            plan: summary,
+            measurements: BTreeMap::new(),
+            toolchain: ReferenceToolchainEvidence {
+                qualification_candidate_manifest_digest: candidate,
+                common_runtime_closure_fingerprint_sha256: "ab".repeat(32),
+                metadata_mutation_closure_fingerprint_sha256: None,
+                sox_ng: reference_inventory_tool_identity(ToolBinary::Sox, "sox"),
+                ffmpeg: reference_inventory_tool_identity(ToolBinary::Ffmpeg, "ffmpeg"),
+                metadata_mutators: None,
+                sacd_rs_build_identity: "fixture-sacd-rs".to_string(),
+                dst_fixture_digest: Sha256Digest::of_bytes(b"fixture DST"),
+                platform_abi_digest: Sha256Digest::of_bytes(b"fixture ABI"),
+                runtime_dispatch_digest: Sha256Digest::of_bytes(b"fixture CPU"),
+                portable_runtime_closure_digest: None,
+            },
+            resolved_command_hash: "fixture-Reference-command-transcript".to_string(),
+            pcm_verification: ReferencePcmVerificationEvidence {
+                r64_contract_digest: Sha256Digest::of_bytes(b"fixture R64 probe"),
+                qpcm_contract_digest: Sha256Digest::of_bytes(b"fixture QPCM probe"),
+                qpcm_sample_sha256: decoded_hash,
+                packaged_sample_sha256: decoded_hash,
+                packaged_sample_identity_mode: ReferencePackagedSampleIdentityMode::IndependentDecodeComparison,
+                post_metadata_sample_sha256: Some(decoded_hash),
+                post_metadata_verification_command: Some(verification_command.clone()),
+                post_metadata_verification_commands: vec![verification_command],
+            },
+        };
+        let mut outputs = vec![successful_output(&f, 0)];
+        outputs[0].artifact.as_mut().expect("success artifact").reference_evidence = Some(evidence);
+        (f, outputs, decoded_hash)
+    }
+
+    #[tokio::test]
+    async fn issue_65_reference_execution_evidence_does_not_force_unrequested_manifest() {
+        // The no-manifest cases would publish .tonepoet-manifest.json before
+        // this correction. The explicit-consent cases guard retained rerun
+        // authority without allowing that sidecar to become implicit again.
+        for requested_manifest in [false, true] {
+            for human_log in [false, true] {
+                let (mut f, outputs, decoded_hash) = reference_inventory_fixture(human_log);
+                f.album.req.publish.write_manifest = requested_manifest;
+                assert!(outputs[0].artifact.as_ref().expect("track").reference_evidence.is_some(),
+                    "Reference publication must exercise the execution-evidence branch");
+                let destination = f.album.req.output_root.clone();
+                let runner = ReferenceInventoryHashRunner {
+                    decoded_hash,
+                    calls: Mutex::new(Vec::new()),
+                };
+                let report = finish_pipeline_album_for_scheduler(
+                    f.album, outputs, &runner, &RecordingReporter::new(), &CancellationToken::new(),
+                ).await;
+                assert!(matches!(&report.outcome, AlbumOutcome::Complete { .. }),
+                    "Reference manifest={requested_manifest}, log={human_log}: {:?}", report.outcome);
+                assert_eq!(runner.calls.lock().expect("reference call lock").as_slice(),
+                    &[ToolBinary::Ffmpeg], "Reference post-metadata verification must execute");
+                assert_eq!(
+                    report.published.as_ref().and_then(|album| album.manifest_path.as_ref()).is_some(),
+                    requested_manifest,
+                    "Reference manifest publication must follow explicit consent only",
+                );
+                assert!(report.durable_log.is_none(),
+                    "unrequested machine evidence must remain unpublished");
+                let mut expected = std::collections::BTreeSet::from([
+                    "Gate Test/".to_string(), "Gate Test/01.flac".to_string(),
+                ]);
+                if human_log {
+                    expected.insert("Gate Test/conversion.log".to_string());
+                }
+                if requested_manifest {
+                    expected.insert("Gate Test/.tonepoet-manifest.json".to_string());
+                }
+                assert_destination_inventory(&destination, &expected,
+                    &format!("Reference execution evidence, manifest={requested_manifest}, log={human_log}"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_65_reference_execution_still_validates_sample_identity_without_manifest() {
+        let (f, mut outputs, decoded_hash) = reference_inventory_fixture(false);
+        outputs[0].artifact.as_mut().unwrap().reference_evidence.as_mut().unwrap()
+            .pcm_verification.packaged_sample_sha256 =
+            tonepoet_pipeline::Sha256Digest::of_bytes(b"incorrect packaged audio");
+        let destination = f.album.req.output_root.clone();
+        let runner = ReferenceInventoryHashRunner {
+            decoded_hash,
+            calls: Mutex::new(Vec::new()),
+        };
+        let report = finish_pipeline_album_for_scheduler(
+            f.album, outputs, &runner, &RecordingReporter::new(), &CancellationToken::new(),
+        ).await;
+        assert!(matches!(&report.outcome, AlbumOutcome::Blocked { reason: BlockReason::PublishFailed, .. }),
+            "Reference validation must remain publication-blocking: {:?}", report.outcome);
+        let detail = format!("{:?}", report.outcome);
+        assert!(detail.contains("decoded-sample identity continuity"),
+            "failure must be a Reference sample-authority rejection: {detail}");
+        assert_eq!(runner.calls.lock().expect("reference call lock").as_slice(), &[ToolBinary::Ffmpeg]);
+        assert_destination_inventory(&destination, &std::collections::BTreeSet::new(),
+            "invalid Reference evidence must publish nothing");
     }
 
     #[tokio::test]
@@ -75100,6 +75575,81 @@ Recovered provenance
             !conversion_log_fragment_dir(&album_dir).exists(),
             "successful final assembly cleans active fragment state"
         );
+    }
+
+    #[tokio::test]
+    async fn issue_65_independent_folder_album_publish_has_no_extra_entries_with_log_on_or_off() {
+        // A folder album is not one multi-track source: independently dispatched
+        // single-file jobs share one output tree and assemble the log after the
+        // last fragment. Exercise that actual publisher, including its cleanup.
+        for human_log in [false, true] {
+            let scratch = tempfile::tempdir().expect("folder album destination scratch");
+            let root = scratch.path();
+            let batch_id = "issue-65-folder-inventory";
+            let requests = ["issue65-first", "issue65-second"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, suffix)| {
+                    let track = u32::try_from(index + 1).expect("two tracks");
+                    let mut req = real_fragment_unbatched_request_with_track(
+                        root, suffix, track, None, track,
+                    );
+                    // Batch identity must be derived from the final policy,
+                    // not mutated after the dispatcher locks its contract.
+                    req.publish.write_manifest = false;
+                    req.log.write_conversion_log = human_log;
+                    req.log.write_json_log = false;
+                    req
+                })
+                .collect::<Vec<_>>();
+            let dispatched = prepare_independent_single_file_album_batch_for_dispatch_with_batch_id(
+                requests,
+                generated_test_batch_id(batch_id),
+                real_fragment_album_dir(root),
+                real_fragment_source_root(root),
+            ).expect("folder requests dispatched with final log policy").requests;
+            for index in [1_usize, 0] {
+                let req = dispatched[index].clone();
+                let number = u32::try_from(index + 1).expect("two tracks");
+                let name = format!("{number:02}.flac");
+                let album_dir = real_fragment_album_dir(root);
+                let source = real_fragment_source(root, None, number, number, 2);
+                let audio_staging = StagingDir::new(
+                    root.join(format!("issue65-audio-{index}")),
+                    format!("issue65-audio-{index}"),
+                );
+                std::fs::create_dir_all(&audio_staging.root).expect("audio staging");
+                let artifacts = real_fragment_audio_artifacts(
+                    &audio_staging, &album_dir, None, number, number,
+                    &name, b"encoded placeholder",
+                );
+                let outcome = AlbumOutcome::Complete {
+                    tracks: vec![real_fragment_record(
+                        None, number, number, true, Some(album_dir.join(&name)),
+                    )],
+                    stages: stage_records(),
+                };
+                let stage = format!("issue65-features-{index}");
+                let (feature_staging, plan) = real_fragment_plan_through_features(
+                    root, &stage, &req, &source, &outcome, artifacts,
+                ).await;
+                publish_album_output(feature_staging, &plan, req.publish.clone(), None)
+                    .expect("independently dispatched folder audio published");
+            }
+            let mut expected = std::collections::BTreeSet::from([
+                "Test Artist/".to_string(),
+                "Test Artist/Test Album/".to_string(),
+                "Test Artist/Test Album/01.flac".to_string(),
+                "Test Artist/Test Album/02.flac".to_string(),
+            ]);
+            if human_log {
+                expected.insert("Test Artist/Test Album/conversion.log".to_string());
+            }
+            assert_destination_inventory(
+                &root.join("out"), &expected,
+                &format!("independent folder album, log={human_log}"),
+            );
+        }
     }
 
     #[tokio::test]
