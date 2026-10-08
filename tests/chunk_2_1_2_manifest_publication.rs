@@ -1,18 +1,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
-use async_trait::async_trait;
 use tonepoet::convert::pipeline::manifest::{
     file_sha256, read_manifest, refresh_manifest_output_facts_for_publish,
     validate_album_relative_output_path, write_manifest, write_manifest_for_publish,
     ConversionManifest, ConversionManifestTrack, ManifestError, TrackIdentity, ValidationStatus,
 };
-use tonepoet::convert::pipeline::rerun::{
-    decide_rerun, delete_stale_publish_temp_dirs, verify_manifest_outputs_at_album_dir,
-    ExistingOutputVerificationError, ExistingOutputVerifier, RerunDecision,
-};
-use tonepoet::convert::pipeline::types::OverwritePolicy;
 use tonepoet_pipeline::fingerprint::settings_fingerprint;
 use tonepoet_pipeline::settings::PipelineSettings;
 
@@ -150,91 +143,79 @@ fn manifest_survives_temp_dir_atomic_publish_rename() {
     assert_eq!(reread.tracks[0].output_path, PathBuf::from("01.flac"));
 }
 
-#[test]
-fn matching_manifest_skips_without_conversion() {
-    let temp = tempfile::tempdir().unwrap();
-    let album_dir = temp.path().join("Album");
-    fs::create_dir_all(&album_dir).unwrap();
-    let manifest = make_manifest(&album_dir);
-    write_manifest(&album_dir, &manifest).unwrap();
+// Issue #53: legacy manifests remain readable provenance but no longer
+// authorize skipping a conversion or overriding an explicit collision policy.
+// These tests exercise the actual publisher's destination behavior; the old
+// orchestrator reuse gate and its tests are intentionally absent.
+use tonepoet::convert::pipeline::{
+    publish_album_output, OverwritePolicy, PublishEntry, PublishError, PublishPlan,
+    PublishPolicy, PublishRole, StagingDir,
+};
 
-    let conversion_count = AtomicUsize::new(0);
-    match decide_rerun(&album_dir, &settings(), OverwritePolicy::SkipIfManifestMatch) {
-        RerunDecision::Skip { .. } => {}
-        other => panic!("expected skip, got {other:?}"),
-    }
-    assert_eq!(conversion_count.load(Ordering::SeqCst), 0);
-}
-
-#[test]
-fn changed_source_forces_redo() {
-    let temp = tempfile::tempdir().unwrap();
-    let album_dir = temp.path().join("Album");
-    fs::create_dir_all(&album_dir).unwrap();
-    let manifest = make_manifest(&album_dir);
-    write_manifest(&album_dir, &manifest).unwrap();
-
-    fs::write(album_dir.join("source.wav"), b"source changed length").unwrap();
-    match decide_rerun(&album_dir, &settings(), OverwritePolicy::SkipIfManifestMatch) {
-        RerunDecision::Redo { .. } => {}
-        other => panic!("expected redo, got {other:?}"),
-    }
-}
-
-#[test]
-fn stale_publish_temp_cleanup_matches_real_tmp_prefix() {
-    let temp = tempfile::tempdir().unwrap();
-    let album_dir = temp.path().join("Album");
-    let legacy_publish_tmp = temp.path().join(".Album.tmp-123");
-    let compact_token = {
-        use sha2::{Digest, Sha256};
-        let digest = hex::encode(Sha256::digest(b"Album"));
-        digest[..24].to_owned()
+fn stage_fresh_audio(root: &Path, label: &str) -> (StagingDir, PublishPlan) {
+    let staging = StagingDir::new(root.join(format!("stage-{label}")), label.to_string());
+    fs::create_dir_all(&staging.root).expect("create encoded output staging");
+    let staged = staging.root.join("01.flac");
+    fs::write(&staged, b"fresh converted audio").expect("fresh encoded output");
+    let album_dir = root.join("Album");
+    let plan = PublishPlan {
+        album_dir: album_dir.clone(),
+        entries: vec![PublishEntry {
+            staged_path: staged,
+            final_path: album_dir.join("01.flac"),
+            role: PublishRole::Audio,
+        }],
+        source_audio_track_count: 1,
+        expected_album_track_count: 1,
+        suppress_incremental_conversion_log_append: false,
+        album_batch_completion_order: false,
+        write_conversion_log: false,
     };
-    let compact_publish_tmp = temp
-        .path()
-        .join(format!(".tonepoet-tmp-{compact_token}-123"));
-    let unrelated_partial = temp.path().join(".Album.partial-123");
-    fs::create_dir_all(&legacy_publish_tmp).unwrap();
-    fs::create_dir_all(&compact_publish_tmp).unwrap();
-    fs::create_dir_all(&unrelated_partial).unwrap();
-
-    let mut deleted = delete_stale_publish_temp_dirs(&album_dir).unwrap();
-    deleted.sort();
-    let mut expected = vec![legacy_publish_tmp.clone(), compact_publish_tmp.clone()];
-    expected.sort();
-    assert_eq!(deleted, expected);
-    assert!(!legacy_publish_tmp.exists());
-    assert!(!compact_publish_tmp.exists());
-    assert!(unrelated_partial.exists());
+    (staging, plan)
 }
 
-struct CountingVerifier {
-    calls: AtomicUsize,
-}
-
-#[async_trait]
-impl ExistingOutputVerifier for CountingVerifier {
-    async fn verify_existing_output(
-        &self,
-        _path: &Path,
-        _settings: &PipelineSettings,
-    ) -> Result<(), ExistingOutputVerificationError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    }
-}
-
-#[tokio::test]
-async fn verify_uses_actual_album_dir_not_manifest_album_dir() {
-    let temp = tempfile::tempdir().unwrap();
-    let album_dir = temp.path().join("Album");
+#[test]
+fn matching_prior_manifest_cannot_override_fail_if_exists() {
+    let root = tempfile::tempdir().unwrap();
+    let album_dir = root.path().join("Album");
     fs::create_dir_all(&album_dir).unwrap();
-    let manifest = make_manifest(&album_dir);
-    let verifier = CountingVerifier { calls: AtomicUsize::new(0) };
+    let old = make_manifest(&album_dir);
+    write_manifest(&album_dir, &old).unwrap();
+    assert_eq!(old.legacy_settings_fingerprint(), Some(settings_fingerprint(&settings())));
 
-    verify_manifest_outputs_at_album_dir(&album_dir, &manifest, &settings(), &verifier)
-        .await
-        .unwrap();
-    assert_eq!(verifier.calls.load(Ordering::SeqCst), 1);
+    let (staging, plan) = stage_fresh_audio(root.path(), "collision");
+    let failure = publish_album_output(staging, &plan, PublishPolicy {
+        overwrite: OverwritePolicy::FailIfExists,
+        same_filesystem_required: false,
+        write_manifest: false,
+    }, None).expect_err("existing album must not be silently overwritten or skipped");
+    assert!(matches!(&failure, PublishError::DestinationExists(_)), "{failure:?}");
+    assert_eq!(fs::read(album_dir.join("01.flac")).unwrap(), b"audio".to_vec());
+    assert!(album_dir.join(".tonepoet-manifest.json").exists());
+}
+
+#[test]
+fn matching_prior_manifest_does_not_suppress_fresh_publish_with_backup() {
+    let root = tempfile::tempdir().unwrap();
+    let album_dir = root.path().join("Album");
+    fs::create_dir_all(&album_dir).unwrap();
+    let old = make_manifest(&album_dir);
+    write_manifest(&album_dir, &old).unwrap();
+    assert_eq!(old.legacy_settings_fingerprint(), Some(settings_fingerprint(&settings())));
+
+    let (staging, plan) = stage_fresh_audio(root.path(), "replace");
+    let published = publish_album_output(staging, &plan, PublishPolicy {
+        overwrite: OverwritePolicy::ReplaceWithBackup,
+        same_filesystem_required: false,
+        write_manifest: false,
+    }, None).expect("explicit replacement must publish, even with matching old manifest");
+    assert_eq!(fs::read(album_dir.join("01.flac")).unwrap(), b"fresh converted audio".to_vec());
+    assert!(published.manifest_path.is_none());
+    assert!(!album_dir.join(".tonepoet-manifest.json").exists(),
+        "a new manifest requires opt-in; the old one belongs to the backup");
+    let backups = fs::read_dir(root.path()).unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_dir() && path != &album_dir && path.join(".tonepoet-manifest.json").exists())
+        .collect::<Vec<_>>();
+    assert_eq!(backups.len(), 1, "one backup must retain old manifest authority: {backups:?}");
 }

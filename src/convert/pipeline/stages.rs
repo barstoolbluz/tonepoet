@@ -87,7 +87,7 @@ use super::track_executor::{
     finalize_cue_stream_direct_track_plan, prepare_cue_stream_direct_track_plan,
     retained_pcm_scalar_stream_plan_admitted,
     run_segmented_tool_pipeline_with_concurrency, SegmentedPipelineExecutionError,
-    preflight_reference_rerun_authority, materialize_reference_source_for_album_gain,
+    materialize_reference_source_for_album_gain,
     reference_bound_metadata_executable,
     reference_metadata_toolchains_match, run_bound_tool_command_with_concurrency,
     run_tool_command_with_concurrency,
@@ -3752,7 +3752,7 @@ fn plan_outputs_with_name_shortening_notices(
 /// output planner used by the real conversion path.
 ///
 /// This exists for one load-bearing reason: batch pre-actions must be elected
-/// and completed before any worker materializes, while manifest rerun skips
+/// and completed before any worker materializes, while early conversion exits
 /// must suppress those actions. A provisional source-folder guess cannot
 /// satisfy both requirements. Callers must compare the result for every member
 /// of a batch and only mark the batch directory planner-resolved when all
@@ -5717,7 +5717,7 @@ pub async fn merge_tracks_with_tool_limits(
         Vec::new()
     };
 
-    // Compute a stable hash of the merge command plan for manifest rerun identity.
+    // Compute a stable hash of the merge command plan for requested manifest provenance.
     // Source track identities, per-track planned hashes, and target format capture
     // the merge identity. The concat list content is excluded because it contains
     // volatile staging paths that change on every run.
@@ -25885,10 +25885,7 @@ impl MultiRootPublishTransaction {
                 OverwritePolicy::FailIfExists => {
                     return Err(PublishError::DestinationExists(root.display().to_string()));
                 }
-                OverwritePolicy::ReplaceWithBackup
-                | OverwritePolicy::AlwaysRedo
-                | OverwritePolicy::SkipIfManifestMatch
-                | OverwritePolicy::VerifyIfManifestMatch => {
+                OverwritePolicy::ReplaceWithBackup | OverwritePolicy::AlwaysRedo => {
                     let backup = unique_path(
                         &self.output_root,
                         &format!(
@@ -26840,27 +26837,6 @@ fn publish_album_output_bound(
                 ));
             }
             OverwritePolicy::ReplaceWithBackup | OverwritePolicy::AlwaysRedo => {
-                if let Err(err) = write_publish_marker(&plan.album_dir, &marker_path, &backup_dir) {
-                    let _ = fs::remove_dir_all(&temp_dir);
-                    return Err(err);
-                }
-                fs::rename(&plan.album_dir, &backup_dir).map_err(|err| {
-                    let _ = fs::remove_dir_all(&temp_dir);
-                    let _ = fs::remove_file(&marker_path);
-                    PublishError::BackupFailed(format!(
-                        "{} -> {}: {err}",
-                        plan.album_dir.display(),
-                        backup_dir.display()
-                    ))
-                })?;
-                backup_made = true;
-            }
-            // Manifest-based policies are handled by the orchestrator rerun gate
-            // before reaching publish. If we get here, proceed with publish.
-            OverwritePolicy::SkipIfManifestMatch
-            | OverwritePolicy::VerifyIfManifestMatch => {
-                // The rerun gate already decided to proceed (not skip).
-                // Treat as replace-with-backup for the publish step.
                 if let Err(err) = write_publish_marker(&plan.album_dir, &marker_path, &backup_dir) {
                     let _ = fs::remove_dir_all(&temp_dir);
                     return Err(err);
@@ -28386,269 +28362,14 @@ fn post_action_context_with_capabilities(
     })
 }
 
-fn published_album_from_manifest_skip(
-    album_dir: &Path,
-    manifest: &super::manifest::ConversionManifest,
-    manifest_path: PathBuf,
-) -> Result<PublishedAlbum, String> {
-    let mut entries = Vec::with_capacity(manifest.tracks.len());
-    for track in &manifest.tracks {
-        let final_path = super::manifest::resolve_manifest_output_path(album_dir, &track.output_path)
-            .map_err(|error| format!(
-                "manifest skip contains an unsafe output path {}: {error}",
-                track.output_path.display()
-            ))?;
-        entries.push(PublishedEntry {
-            final_path,
-            role: PublishRole::Audio,
-            bytes: track.output_size,
-        });
-    }
-    Ok(PublishedAlbum {
-        album_dir: album_dir.to_path_buf(),
-        entries,
-        manifest_path: Some(manifest_path),
-        batch_completion: None,
-    })
-}
-
-async fn finalize_manifest_skip(
-    req: &PipelineRequest,
-    reporter: &dyn PipelineReporter,
-    source: PreparedSource,
-    plan: AlbumPlan,
-    mut stages: Vec<StageRecord>,
-    manifest: super::manifest::ConversionManifest,
-    manifest_path: PathBuf,
-) -> PipelineReport {
-    let published = match published_album_from_manifest_skip(
-        &plan.album_dir,
-        &manifest,
-        manifest_path,
-    ) {
-        Ok(published) => Some(published),
-        Err(error) => {
-            let record = stage_record(PipelineStage::Publish, StageOutcome::Failed(error));
-            emit_stage_finished(reporter, &req.item_id, record.clone()).await;
-            stages.push(record);
-            None
-        }
-    };
-    if published.is_some() {
-        if !req.actions.pre.is_empty() {
-            let record = stage_record(PipelineStage::PreActions, StageOutcome::Skipped);
-            emit_stage_finished(reporter, &req.item_id, record.clone()).await;
-            stages.push(record);
-        }
-        let publish_record = stage_record(PipelineStage::Publish, StageOutcome::Skipped);
-        emit_stage_finished(reporter, &req.item_id, publish_record.clone()).await;
-        stages.push(publish_record);
-        if !req.actions.post.is_empty() {
-            let outcome = post_action_outcome_with_terminal_authority(
-                req,
-                None,
-                StageOutcome::Skipped,
-                true,
-            );
-            let record = stage_record(PipelineStage::PostActions, outcome);
-            emit_stage_finished(reporter, &req.item_id, record.clone()).await;
-            stages.push(record);
-        }
-    }
-    let outcome = if published.is_some() {
-        AlbumOutcome::Complete {
-            tracks: Vec::new(),
-            stages,
-        }
-    } else {
-        AlbumOutcome::Blocked {
-            successful: Vec::new(),
-            failed: Vec::new(),
-            stages,
-            reason: BlockReason::PublishFailed,
-        }
-    };
-    finalize_report(
-        req,
-        reporter,
-        Some(source),
-        Some(plan),
-        None,
-        published,
-        outcome,
-    )
-    .await
-}
-
 enum PreMaterializationActionOutcome {
     Continue { ran_pre_actions: bool },
     Finished(PipelineReport),
 }
 
-async fn finalize_pre_materialization_manifest_skip(
-    req: &PipelineRequest,
-    reporter: &dyn PipelineReporter,
-    album_dir: PathBuf,
-    manifest: super::manifest::ConversionManifest,
-    manifest_path: PathBuf,
-    mut stages: Vec<StageRecord>,
-) -> PipelineReport {
-    let published = match published_album_from_manifest_skip(
-        &album_dir,
-        &manifest,
-        manifest_path,
-    ) {
-        Ok(published) => Some(published),
-        Err(error) => {
-            let record = stage_record(PipelineStage::Publish, StageOutcome::Failed(error));
-            emit_stage_finished(reporter, &req.item_id, record.clone()).await;
-            stages.push(record);
-            None
-        }
-    };
-
-    if published.is_some() {
-        for stage in [
-            PipelineStage::PreActions,
-            PipelineStage::Materialize,
-            PipelineStage::PlanOutputs,
-            PipelineStage::Publish,
-            PipelineStage::PostActions,
-        ] {
-            let configured = match stage {
-                PipelineStage::PreActions => !req.actions.pre.is_empty(),
-                PipelineStage::PostActions => !req.actions.post.is_empty(),
-                _ => true,
-            };
-            if configured {
-                let outcome = if stage == PipelineStage::PostActions {
-                    post_action_outcome_with_terminal_authority(
-                        req,
-                        None,
-                        StageOutcome::Skipped,
-                        true,
-                    )
-                } else {
-                    StageOutcome::Skipped
-                };
-                let record = stage_record(stage, outcome);
-                emit_stage_finished(reporter, &req.item_id, record.clone()).await;
-                stages.push(record);
-            }
-        }
-    }
-
-    let plan = AlbumPlan {
-        album_dir,
-        album_dirs: Vec::new(),
-        entries: Vec::new(),
-    };
-    let outcome = if published.is_some() {
-        AlbumOutcome::Complete {
-            tracks: Vec::new(),
-            stages,
-        }
-    } else {
-        AlbumOutcome::Blocked {
-            successful: Vec::new(),
-            failed: Vec::new(),
-            stages,
-            reason: BlockReason::PublishFailed,
-        }
-    };
-    finalize_report(req, reporter, None, Some(plan), None, published, outcome).await
-}
-
-async fn decide_rerun_after_reference_preflight(
-    req: &PipelineRequest,
-    source: &PreparedSource,
-    album_plan: &AlbumPlan,
-    runner: &dyn ToolRunner,
-    cancel: &CancellationToken,
-) -> super::rerun::RerunDecision {
-    let prepared_source_is_dsd = source_is_dsd(source);
-    if !tonepoet_pipeline::selects_reference_dsd_to_pcm(
-        &req.settings,
-        prepared_source_is_dsd,
-    ) || req.settings.dsd.from_dsd.pathway
-        != tonepoet_pipeline::DsdSourcePathway::Reference
-    {
-        return super::rerun::decide_rerun_with_effects(
-            &album_plan.album_dir,
-            &req.settings,
-            &req.registered_effects,
-            req.publish.overwrite,
-        );
-    }
-    let Some(track) = source.tracks.first().filter(|_| source.tracks.len() == 1) else {
-        return super::rerun::RerunDecision::Redo {
-            reason: super::rerun::RerunReason::NativePreflightFailed(
-                "P0 Reference rerun preflight requires exactly one singleton track".to_string(),
-            ),
-            warning: Some(
-                "native Reference rerun preflight could not establish singleton authority; conversion will be replanned"
-                    .to_string(),
-            ),
-            publish_overwrite: OverwritePolicy::ReplaceWithBackup,
-        };
-    };
-    let Some(entry) = album_plan
-        .entries
-        .iter()
-        .find(|entry| entry.track_id == track.id)
-    else {
-        return super::rerun::RerunDecision::Redo {
-            reason: super::rerun::RerunReason::NativePreflightFailed(
-                "P0 Reference album plan has no output for its singleton track".to_string(),
-            ),
-            warning: Some(
-                "native Reference rerun preflight could not bind the planned output; conversion will be replanned"
-                    .to_string(),
-            ),
-            publish_overwrite: OverwritePolicy::ReplaceWithBackup,
-        };
-    };
-
-    match preflight_reference_rerun_authority(
-        req,
-        track,
-        &entry.final_path,
-        runner,
-        cancel,
-    )
-    .await
-    {
-        Ok(Some(authority)) => super::rerun::decide_rerun_with_reference_preflight(
-            &album_plan.album_dir,
-            &req.settings,
-            req.publish.overwrite,
-            &authority,
-        ),
-        Ok(None) => super::rerun::RerunDecision::Redo {
-            reason: super::rerun::RerunReason::NativePreflightFailed(
-                "the Reference request did not produce qualified preflight authority".to_string(),
-            ),
-            warning: Some(
-                "native Reference rerun authority was unavailable; conversion will be replanned"
-                    .to_string(),
-            ),
-            publish_overwrite: OverwritePolicy::ReplaceWithBackup,
-        },
-        Err(err) => super::rerun::RerunDecision::Redo {
-            reason: super::rerun::RerunReason::NativePreflightFailed(err.to_string()),
-            warning: Some(format!(
-                "native Reference rerun preflight failed; conversion will proceed through the same fail-closed execution gate: {err}"
-            )),
-            publish_overwrite: OverwritePolicy::ReplaceWithBackup,
-        },
-    }
-}
-
-/// For a batch with pre-actions, perform the rerun decision and elected pre
-/// phase before any worker enters source materialization. The dispatcher must
-/// have persisted an album directory produced by the canonical planner; a
-/// provisional directory is rejected rather than allowing pre-actions to race
-/// a later manifest skip or run against the wrong album identity.
+/// For a batch with pre-actions, execute the elected pre phase before source
+/// materialization. The dispatcher must supply the canonical planner output
+/// directory so pre-actions cannot run against a provisional album identity.
 async fn prepare_batch_pre_actions_before_materialization(
     req: &PipelineRequest,
     retained_output: Option<&PipelineOutputCapability>,
@@ -28657,17 +28378,6 @@ async fn prepare_batch_pre_actions_before_materialization(
     stages: &mut Vec<StageRecord>,
 ) -> PreMaterializationActionOutcome {
     if req.actions.pre.is_empty() || req.album_batch.is_none() {
-        return PreMaterializationActionOutcome::Continue {
-            ran_pre_actions: false,
-        };
-    }
-    if tonepoet_pipeline::selects_reference_dsd_to_pcm(&req.settings, true)
-        && req.settings.dsd.from_dsd.pathway
-            == tonepoet_pipeline::DsdSourcePathway::Reference
-    {
-        // Native Reference skip authority cannot be established from settings
-        // alone. Defer PRE actions until source planning and the exact
-        // source/toolchain preflight have proved this is not a manifest skip.
         return PreMaterializationActionOutcome::Continue {
             ran_pre_actions: false,
         };
@@ -28694,30 +28404,6 @@ async fn prepare_batch_pre_actions_before_materialization(
         );
         return PreMaterializationActionOutcome::Finished(
             finalize_report(req, reporter, None, None, None, published, outcome).await,
-        );
-    }
-
-    let album_dir = normalize_path(&batch.album_output_dir);
-    if let super::rerun::RerunDecision::Skip {
-        manifest,
-        manifest_path,
-    } = super::rerun::decide_rerun_with_effects(
-        &album_dir,
-        &req.settings,
-        &req.registered_effects,
-        req.publish.overwrite,
-    )
-    {
-        return PreMaterializationActionOutcome::Finished(
-            finalize_pre_materialization_manifest_skip(
-                req,
-                reporter,
-                album_dir,
-                manifest,
-                manifest_path,
-                std::mem::take(stages),
-            )
-            .await,
         );
     }
 
@@ -29554,7 +29240,6 @@ pub struct ScheduledAlbum {
     dsd_true_peak_timings: BTreeMap<TrackId, DsdAlbumGainTiming>,
     pub(crate) album_gain_scope_disclosure: Option<DsdAlbumGainScopeDisclosure>,
     run_timing: ConversionRunTiming,
-    pub(crate) pre_actions_completed_before_album_gain_rerun: bool,
     action_output: Option<PipelineOutputCapability>,
     _run_lock: FileLock,
 }
@@ -29600,7 +29285,6 @@ struct CertifiedTruePeakScratchRetrySeed {
     dsd_true_peak_timings: BTreeMap<TrackId, DsdAlbumGainTiming>,
     album_gain_scope_disclosure: Option<DsdAlbumGainScopeDisclosure>,
     run_timing: ConversionRunTiming,
-    pre_actions_completed_before_album_gain_rerun: bool,
     action_output: Option<PipelineOutputCapability>,
     dsd_runtime_album_gain_db: Option<tonepoet_pipeline::DbNano>,
     pcm_runtime_album_gain_db: Option<tonepoet_pipeline::DbNano>,
@@ -29728,8 +29412,6 @@ impl CertifiedTruePeakScratchRetrySeed {
             dsd_true_peak_timings: album.dsd_true_peak_timings.clone(),
             album_gain_scope_disclosure: album.album_gain_scope_disclosure.clone(),
             run_timing: album.run_timing.clone(),
-            pre_actions_completed_before_album_gain_rerun: album
-                .pre_actions_completed_before_album_gain_rerun,
             action_output,
             dsd_runtime_album_gain_db: album.req.settings.dsd.runtime_album_gain_db(),
             pcm_runtime_album_gain_db: album.req.settings.pcm_true_peak.runtime_album_gain_db(),
@@ -29928,8 +29610,6 @@ async fn retry_resolved_certified_true_peak_once_on_disk(
         dsd_true_peak_timings: seed.dsd_true_peak_timings,
         album_gain_scope_disclosure: seed.album_gain_scope_disclosure,
         run_timing: seed.run_timing,
-        pre_actions_completed_before_album_gain_rerun: seed
-            .pre_actions_completed_before_album_gain_rerun,
         action_output: seed.action_output,
         _run_lock,
     };
@@ -30006,76 +29686,9 @@ pub(crate) fn scheduled_album_for_test(
         dsd_true_peak_timings: BTreeMap::new(),
         album_gain_scope_disclosure: None,
         run_timing: ConversionRunTiming::start(),
-        pre_actions_completed_before_album_gain_rerun: false,
         action_output: None,
         _run_lock: run_lock,
     }
-}
-
-/// Re-run the ordinary manifest decision only after submitted-batch album gain
-/// has been measured and bound into settings. This intentionally handles only
-/// SkipIfManifestMatch: Verify retains its established baseline behavior.
-/// The processor schedules this helper as worker work so manifest reads and
-/// output/source hashing never run in the central scheduler loop.
-pub(crate) async fn resolve_dsd_album_gain_post_barrier_rerun(
-    album: ScheduledAlbum,
-    reporter: &dyn PipelineReporter,
-) -> ScheduledMaterialization {
-    let post_barrier_gain_is_bound = (album.req.settings.dsd.reference_auto_album_gain_possible()
-        && album.req.settings.dsd.runtime_album_gain_db().is_some())
-        || album.req.settings.dsd.album_true_peak_gain_selected()
-        || (album.req.settings.pcm_true_peak.album_true_peak_gain_selected()
-            && album.req.settings.pcm_true_peak.runtime_album_gain_db().is_some());
-    if album.req.publish.overwrite != OverwritePolicy::SkipIfManifestMatch
-        || !post_barrier_gain_is_bound
-    {
-        return ScheduledMaterialization::Ready(album);
-    }
-
-    let decision = super::rerun::decide_rerun_with_effects(
-        &album.plan.album_dir,
-        &album.req.settings,
-        &album.req.registered_effects,
-        album.req.publish.overwrite,
-    );
-    let super::rerun::RerunDecision::Skip {
-        manifest,
-        manifest_path,
-    } = decision
-    else {
-        return ScheduledMaterialization::Ready(album);
-    };
-
-    if album.pre_actions_completed_before_album_gain_rerun {
-        log::warn!(
-            "manifest became skippable after this run durably completed pre-actions; proceeding with publication so actions are never attributed to an all-skipped run: job_id={}, item_id={}, album_dir={}",
-            album.req.job_id,
-            album.req.item_id,
-            album.plan.album_dir.display(),
-        );
-        return ScheduledMaterialization::Ready(album);
-    }
-
-    let ScheduledAlbum {
-        req,
-        staging: _,
-        source,
-        plan,
-        stages,
-        ..
-    } = album;
-    ScheduledMaterialization::Finished(
-        finalize_manifest_skip(
-            &req,
-            reporter,
-            source,
-            plan,
-            stages,
-            manifest,
-            manifest_path,
-        )
-        .await,
-    )
 }
 
 async fn execute_pre_actions_stage_with_runner(
@@ -40991,59 +40604,6 @@ async fn prepare_pipeline_item_for_scheduler_scoped_inner(
         return ScheduledMaterialization::Finished(finalize_report(&req, reporter, Some(prepared), Some(album_plan), None, published, outcome).await);
     }
 
-    // Album-scoped DSD gain is not known until the submitted-batch barrier has
-    // seen every measured DSD participant. A pre-analysis settings fingerprint
-    // therefore cannot prove byte identity for this execution. Do not let the
-    // ordinary per-item rerun gate skip one participant before the aggregate is
-    // bound; doing so could silently reuse an output normalized against a
-    // different submitted set.
-    let reference_auto_album_selected = req.settings.dsd.reference_auto_album_gain_possible()
-        && (req
-            .album_batch
-            .as_ref()
-            .is_some_and(|batch| batch.expected_track_count > 1)
-            || contained_sacd_reference_album_member_count(&prepared, &album_plan) > 1);
-    let submitted_album_gain_selected = reference_auto_album_selected
-        || req.settings.dsd.album_true_peak_gain_selected()
-        || req.settings.pcm_true_peak.album_true_peak_gain_selected();
-    if !submitted_album_gain_selected {
-        if let super::rerun::RerunDecision::Skip {
-            manifest,
-            manifest_path,
-        } = decide_rerun_after_reference_preflight(
-            &req,
-            &prepared,
-            &album_plan,
-            runner,
-            cancel,
-        )
-        .await
-        {
-            if !pre_actions_ran_before_materialization {
-                return ScheduledMaterialization::Finished(
-                    finalize_manifest_skip(
-                        &req,
-                        reporter,
-                        prepared,
-                        album_plan,
-                        stages,
-                        manifest,
-                        manifest_path,
-                    )
-                    .await,
-                );
-            }
-            log::warn!(
-                "manifest became skippable after this run durably completed pre-actions; proceeding with publication so actions are never attributed to an all-skipped run: job_id={}, item_id={}, album_dir={}",
-                req.job_id,
-                req.item_id,
-                album_plan.album_dir.display(),
-            );
-        }
-    }
-
-    let mut pre_actions_completed_before_album_gain_rerun =
-        pre_actions_ran_before_materialization;
     if !req.actions.pre.is_empty() && !pre_actions_ran_before_materialization {
         let record = execute_pre_actions_stage(&req, action_output.as_ref(), reporter, cancel).await;
         let failed = matches!(record.outcome, StageOutcome::Failed(_));
@@ -41076,7 +40636,6 @@ async fn prepare_pipeline_item_for_scheduler_scoped_inner(
                 .await,
             );
         }
-        pre_actions_completed_before_album_gain_rerun = true;
     }
 
     let prepared_reference_auto_gain_carriers = match prepare_reference_auto_gain_carriers(
@@ -41254,7 +40813,6 @@ async fn prepare_pipeline_item_for_scheduler_scoped_inner(
         dsd_true_peak_timings,
         album_gain_scope_disclosure: None,
         run_timing,
-        pre_actions_completed_before_album_gain_rerun,
         action_output,
         _run_lock,
     })
@@ -44309,17 +43867,20 @@ pub(crate) async fn finish_pipeline_album_for_scheduler_with_tool_limits_and_ret
         }
     }
 
-    // Preserve Reference manifest-v2 *validation* (including decoded-sample
-    // continuity and execution authority), even when publication did not ask
-    // for the private rerun sidecar. Consent controls only its publication.
-    // Without a manifest, the existing rerun gate conservatively redoes work.
-    let reference_manifest_required = artifacts.as_ref().is_some_and(|artifact_set| match &artifact_set.audio {
+    // A manifest is strictly opt-in. Qualified Reference execution must still
+    // pass its route, evidence, and decoded-sample continuity checks even when
+    // no manifest was requested. Do not build a manifest simply to validate.
+    let reference_execution = artifacts.as_ref().is_some_and(|artifact_set| match &artifact_set.audio {
         AudioArtifacts::Tracks(tracks) => tracks.iter().any(|track| track.reference_evidence.is_some()),
         AudioArtifacts::Merged(_) => false,
     });
-    let conversion_manifest = if req.publish.write_manifest || reference_manifest_required {
+    let conversion_manifest = if req.publish.write_manifest {
         build_manifest_for_album(&req, &source_value, &artifacts, &plan_value)
             .map(Some)
+            .map_err(PublishError::Manifest)
+    } else if reference_execution {
+        validate_reference_for_album(&req, &source_value, &artifacts, &plan_value)
+            .map(|()| None)
             .map_err(PublishError::Manifest)
     } else {
         Ok(None)
@@ -44340,13 +43901,7 @@ pub(crate) async fn finish_pipeline_album_for_scheduler_with_tool_limits_and_ret
                 &req,
                 &plan_value,
                 req.publish.clone(),
-                // A qualified Reference conversion still validates its manifest
-                // authority above, but never writes an unrequested sidecar.
-                if req.publish.write_manifest {
-                    conversion_manifest.as_ref()
-                } else {
-                    None
-                },
+                conversion_manifest.as_ref(),
                 identity_lock.lock(),
                 identity_lock.multi_root_locks(),
                 identity_lock.reject_late_action_authority(),
@@ -44944,38 +44499,6 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_once(
         let outcome = AlbumOutcome::Blocked { successful: Vec::new(), failed: Vec::new(), stages, reason: BlockReason::PlanFailed };
         published = publish_terminal_conversion_log_fragment_if_needed(&req, source.as_ref(), artifacts.as_ref(), &outcome, staging, Some(runner));
         return finalize_report(&req, reporter, source, plan, artifacts, published, outcome).await;
-    }
-
-    if let super::rerun::RerunDecision::Skip {
-        manifest,
-        manifest_path,
-    } = decide_rerun_after_reference_preflight(
-        &req,
-        source.as_ref().expect("source present"),
-        plan.as_ref().expect("plan present"),
-        runner,
-        cancel,
-    )
-    .await
-    {
-        if !pre_actions_ran_before_materialization {
-            return finalize_manifest_skip(
-                &req,
-                reporter,
-                source.take().expect("source present"),
-                plan.take().expect("plan present"),
-                stages,
-                manifest,
-                manifest_path,
-            )
-            .await;
-        }
-        log::warn!(
-            "manifest became skippable after this run durably completed pre-actions; proceeding with publication so actions are never attributed to an all-skipped run: job_id={}, item_id={}, album_dir={}",
-            req.job_id,
-            req.item_id,
-            plan.as_ref().expect("plan present").album_dir.display(),
-        );
     }
 
     if !req.actions.pre.is_empty() && !pre_actions_ran_before_materialization {
@@ -53188,6 +52711,7 @@ fn finalize_published_conversion_log_timing_best_effort(
             &mut finalized,
             &delivered_audio,
             durable_log,
+            req.log.write_json_log,
             action_reports,
             outcome,
         );
@@ -53207,6 +52731,7 @@ fn append_terminal_delivery_evidence_section(
     log: &mut String,
     delivered_audio: &[PathBuf],
     durable_log: Option<&Path>,
+    machine_evidence_requested: bool,
     action_reports: &[ActionPhaseReport],
     outcome: &AlbumOutcome,
 ) {
@@ -53278,9 +52803,11 @@ fn append_terminal_delivery_evidence_section(
         }
     }
     append_terminal_postprocessing_evidence(log, outcome);
-    match durable_log {
-        Some(path) => push_kv_line(log, "Structured execution evidence", path_log_value(path)),
-        None => push_kv_line(log, "Structured execution evidence", "unavailable"),
+    if machine_evidence_requested {
+        match durable_log {
+            Some(path) => push_kv_line(log, "Structured execution evidence", path_log_value(path)),
+            None => push_kv_line(log, "Structured execution evidence", "unavailable"),
+        }
     }
     log.push('\n');
 }
@@ -60255,16 +59782,39 @@ async fn verify_reference_artifacts_after_metadata(
     Ok(())
 }
 
-/// Build a conversion manifest from audio artifacts and source metadata.
-/// Handles both per-track and merged artifact sets.
+/// Build an optional conversion manifest from the same inputs used for
+/// consent-independent Reference validation.
 fn build_manifest_for_album(
     req: &PipelineRequest,
     source: &PreparedSource,
     artifacts: &Option<ArtifactSet>,
     album_plan: &AlbumPlan,
 ) -> Result<super::manifest::ConversionManifest, String> {
+    let input = manifest_inputs_for_album(req, source, artifacts, album_plan)?;
+    super::manifest_builder::build_conversion_manifest(input)
+        .map_err(|err| format!("manifest build: {err}"))
+}
+
+fn validate_reference_for_album(
+    req: &PipelineRequest,
+    source: &PreparedSource,
+    artifacts: &Option<ArtifactSet>,
+    album_plan: &AlbumPlan,
+) -> Result<(), String> {
+    let input = manifest_inputs_for_album(req, source, artifacts, album_plan)?;
+    super::manifest_builder::validate_reference_execution_authority(&input)
+        .map_err(|err| format!("Reference execution authority: {err}"))
+}
+
+/// Gather track identity and staged paths without generating or hashing a manifest.
+fn manifest_inputs_for_album(
+    req: &PipelineRequest,
+    source: &PreparedSource,
+    artifacts: &Option<ArtifactSet>,
+    album_plan: &AlbumPlan,
+) -> Result<super::manifest_builder::ManifestBuildInput, String> {
     use super::manifest::{TrackIdentity, ValidationStatus};
-    use super::manifest_builder::{build_conversion_manifest, ManifestBuildInput, ManifestTrackBuildInput};
+    use super::manifest_builder::{ManifestBuildInput, ManifestTrackBuildInput};
 
     let artifact_set = artifacts.as_ref().ok_or("no artifacts available for manifest")?;
     let album_relative = |final_path: &std::path::Path| -> Result<std::path::PathBuf, String> {
@@ -60341,13 +59891,12 @@ fn build_manifest_for_album(
         }
     };
 
-    build_conversion_manifest(ManifestBuildInput {
+    Ok(ManifestBuildInput {
         album_dir: album_plan.album_dir.clone(),
         settings: req.settings.clone(),
         registered_effects: req.registered_effects.clone(),
         tracks: track_inputs,
     })
-    .map_err(|err| format!("manifest build: {err}"))
 }
 
 fn audio_artifact_count(artifacts: &ArtifactSet) -> usize {
@@ -62522,19 +62071,45 @@ mod conversion_log_tests {
             ],
         };
         let mut log = "TONEPOET CONVERSION LOG\n".to_string();
-        append_terminal_delivery_evidence_section(&mut log, &[], None, &[], &outcome);
+        append_terminal_delivery_evidence_section(&mut log, &[], None, false, &[], &outcome);
         assert!(log.contains("Metadata: completed"));
         assert!(log.contains(
             "ReplayGain: completed (album gain unavailable for one member)"
         ));
-        assert!(log.contains("Structured execution evidence: unavailable"));
+        assert!(!log.contains("Structured execution evidence"),
+            "unrequested evidence must not be described as missing");
 
-        append_terminal_delivery_evidence_section(&mut log, &[], None, &[], &outcome);
+        append_terminal_delivery_evidence_section(&mut log, &[], None, false, &[], &outcome);
         assert_eq!(
             log.matches("Delivery & Evidence").count(),
             1,
             "terminal finalization must replace its own section on retry",
         );
+    }
+
+    #[test]
+    fn terminal_delivery_evidence_reflects_independent_request_and_result() {
+        let outcome = AlbumOutcome::Complete { tracks: Vec::new(), stages: Vec::new() };
+        let path = Path::new("/private/tonepoet/execution-evidence/test.json");
+        for (requested, written, expected) in [
+            (false, None, None),
+            (true, Some(path), Some("Structured execution evidence: /private/tonepoet/execution-evidence/test.json")),
+            (true, None, Some("Structured execution evidence: unavailable")),
+        ] {
+            let mut log = "TONEPOET CONVERSION LOG\n".to_string();
+            append_terminal_delivery_evidence_section(
+                &mut log, &[], written, requested, &[], &outcome,
+            );
+            match expected {
+                Some(line) => assert!(log.contains(line), "{log}"),
+                None => assert!(!log.contains("Structured execution evidence"), "{log}"),
+            }
+            let first = log.clone();
+            append_terminal_delivery_evidence_section(
+                &mut log, &[], written, requested, &[], &outcome,
+            );
+            assert_eq!(log, first, "terminal section rewrite must be idempotent");
+        }
     }
 
     #[test]
@@ -62809,6 +62384,7 @@ mod conversion_log_tests {
             &mut log,
             std::slice::from_ref(&delivered_path),
             None,
+            false,
             &action_reports,
             &outcome,
         );
@@ -67848,8 +67424,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                 dsd_true_peak_timings: BTreeMap::new(),
                 album_gain_scope_disclosure: None,
                 run_timing: ConversionRunTiming::start(),
-                pre_actions_completed_before_album_gain_rerun: false,
-                _run_lock: run_lock,
+                        _run_lock: run_lock,
             },
             track_ids,
             staged_paths,
@@ -67887,153 +67462,6 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             ok: false,
             metadata_satisfaction: PlannedMetadataSatisfaction::none(),
         }
-    }
-
-    fn configure_album_gain_manifest_skip(fixture: &mut AlbumFixture, gain_db: &str) {
-        fixture.album.req.publish.overwrite = OverwritePolicy::SkipIfManifestMatch;
-        fixture.album.req.settings.dsd.set_gain_policy(
-            tonepoet_pipeline::SampleGainPolicy::dsd_guard_default()
-                .with_target("-0.150000000".parse().expect("target"))
-                .with_scope(tonepoet_pipeline::TruePeakScope::Album),
-        );
-        fixture.album.req.settings.dsd.bind_runtime_album_gain(
-            gain_db.parse().expect("gain db"),
-            Some("-0.500000000".parse().expect("peak db")),
-            1,
-        );
-    }
-
-    fn write_matching_album_gain_manifest(fixture: &AlbumFixture) {
-        let source_path = match &fixture.album.source.tracks[0].source_ref {
-            TrackSourceRef::StagedFile(path) => path.clone(),
-            other => panic!("manifest-skip fixture expected staged source, got {other:?}"),
-        };
-        let final_path = fixture.final_paths[0].clone();
-        std::fs::create_dir_all(&fixture.album_dir).expect("album dir");
-        std::fs::write(&final_path, b"published-audio").expect("published output");
-        let source_metadata = std::fs::metadata(&source_path).expect("source metadata");
-        let output_size = std::fs::metadata(&final_path).expect("output metadata").len();
-        let output_rel = final_path
-            .strip_prefix(&fixture.album_dir)
-            .expect("relative output")
-            .to_path_buf();
-        let settings_fingerprint =
-            tonepoet_pipeline::fingerprint::settings_fingerprint(&fixture.album.req.settings);
-        let manifest = ConversionManifest::new(
-            fixture.album_dir.clone(),
-            fixture.album.req.settings.clone(),
-            vec![ConversionManifestTrack {
-                source_path,
-                source_size: source_metadata.len(),
-                source_mtime_secs: metadata_mtime_secs(&source_metadata).expect("source mtime"),
-                source_audio_md5: None,
-                source_content_sha256: None,
-                source_probe_digest: None,
-                original_dsd_source_kind: None,
-                dsd_front_end: None,
-                canonical_materialization_sha256: None,
-                track_identity: TrackIdentity {
-                    source_ordinal: fixture.album.source.tracks[0].id.source_ordinal as usize,
-                    disc_number: fixture.album.source.tracks[0].id.disc_number,
-                    track_number: Some(fixture.album.source.tracks[0].id.track_number),
-                },
-                execution_identity: ManifestTrackExecutionIdentityV2::LegacyPipelineV1 {
-                    settings_fingerprint_v1: settings_fingerprint,
-                    planner_version: "album-gain-rerun-test".to_string(),
-                    planned_command_hash: "album-gain-rerun-test-plan".to_string(),
-                },
-                output_path: output_rel,
-                output_size,
-                output_hash: None,
-                validation_status: ValidationStatus::Passed,
-                publish_timestamp: chrono::Utc::now(),
-            }],
-        );
-        write_manifest(&fixture.album_dir, &manifest).expect("matching manifest");
-    }
-
-    #[tokio::test]
-    async fn album_gain_post_barrier_manifest_match_finishes_without_encode_fanout() {
-        let mut fixture = fixture(
-            FailurePolicy::FailAlbumOnAnyTrackFailure,
-            1,
-            stage_policy(false, false, false),
-            OverwritePolicy::SkipIfManifestMatch,
-        );
-        configure_album_gain_manifest_skip(&mut fixture, "-0.750000000");
-        write_matching_album_gain_manifest(&fixture);
-        let published_before = std::fs::read(&fixture.final_paths[0]).expect("published bytes");
-
-        let reporter = RecordingReporter::new();
-        let result = resolve_dsd_album_gain_post_barrier_rerun(fixture.album, &reporter).await;
-        let ScheduledMaterialization::Finished(report) = result else {
-            panic!("matching post-barrier album manifest must finish as a skip");
-        };
-        assert!(matches!(report.outcome, AlbumOutcome::Complete { .. }));
-        assert_eq!(
-            std::fs::read(&fixture.final_paths[0]).expect("published bytes after skip"),
-            published_before,
-            "post-barrier manifest skip must not replace the published album",
-        );
-    }
-
-    #[tokio::test]
-    async fn album_gain_post_barrier_manifest_mismatch_or_pre_actions_proceeds() {
-        let mut gain_changed = fixture(
-            FailurePolicy::FailAlbumOnAnyTrackFailure,
-            1,
-            stage_policy(false, false, false),
-            OverwritePolicy::SkipIfManifestMatch,
-        );
-        configure_album_gain_manifest_skip(&mut gain_changed, "-0.750000000");
-        write_matching_album_gain_manifest(&gain_changed);
-        gain_changed.album.req.settings.dsd.bind_runtime_album_gain(
-            "-1.250000000".parse().unwrap(),
-            Some("-0.500000000".parse().unwrap()),
-            1,
-        );
-        let reporter = RecordingReporter::new();
-        assert!(matches!(
-            resolve_dsd_album_gain_post_barrier_rerun(gain_changed.album, &reporter).await,
-            ScheduledMaterialization::Ready(_)
-        ));
-
-        let mut pre_actions = fixture(
-            FailurePolicy::FailAlbumOnAnyTrackFailure,
-            1,
-            stage_policy(false, false, false),
-            OverwritePolicy::SkipIfManifestMatch,
-        );
-        configure_album_gain_manifest_skip(&mut pre_actions, "-0.750000000");
-        write_matching_album_gain_manifest(&pre_actions);
-        pre_actions.album.pre_actions_completed_before_album_gain_rerun = true;
-        let reporter = RecordingReporter::new();
-        assert!(matches!(
-            resolve_dsd_album_gain_post_barrier_rerun(pre_actions.album, &reporter).await,
-            ScheduledMaterialization::Ready(_)
-        ));
-    }
-
-    #[tokio::test]
-    async fn album_gain_post_barrier_source_fact_change_does_not_skip() {
-        let mut fixture = fixture(
-            FailurePolicy::FailAlbumOnAnyTrackFailure,
-            1,
-            stage_policy(false, false, false),
-            OverwritePolicy::SkipIfManifestMatch,
-        );
-        configure_album_gain_manifest_skip(&mut fixture, "-0.750000000");
-        write_matching_album_gain_manifest(&fixture);
-        let source_path = match &fixture.album.source.tracks[0].source_ref {
-            TrackSourceRef::StagedFile(path) => path.clone(),
-            _ => unreachable!(),
-        };
-        std::fs::write(source_path, b"changed source bytes").expect("change source facts");
-        let reporter = RecordingReporter::new();
-        assert!(matches!(
-            resolve_dsd_album_gain_post_barrier_rerun(fixture.album, &reporter).await,
-            ScheduledMaterialization::Ready(_)
-        ));
     }
 
     #[tokio::test]
@@ -70875,6 +70303,13 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                         stage_policy(false, false, true),
                         OverwritePolicy::FailIfExists,
                     );
+                    // The metadata-disposition stage always examines the staged
+                    // FLAC when the signal changes, even when RG scanning is off.
+                    // Exercise it with real audio, not an invalid placeholder.
+                    for path in &f.staged_paths {
+                        std::fs::write(path, include_bytes!("../../../tests/fixtures/silence.flac"))
+                            .expect("valid FLAC for metadata disposition");
+                    }
                     f.album.req.publish.write_manifest = false;
                     f.album.req.log.write_conversion_log = human_log;
                     f.album.req.log.write_json_log = machine_evidence;
@@ -71042,6 +70477,8 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             stage_policy(false, false, true),
             OverwritePolicy::FailIfExists,
         );
+        std::fs::write(&f.staged_paths[0], include_bytes!("../../../tests/fixtures/silence.flac"))
+            .expect("valid Reference delivery FLAC for metadata disposition");
         f.album.req.publish.write_manifest = false;
         f.album.req.log.write_conversion_log = human_log;
         f.album.req.log.write_json_log = false;
@@ -71160,8 +70597,8 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
     #[tokio::test]
     async fn issue_65_reference_execution_evidence_does_not_force_unrequested_manifest() {
         // The no-manifest cases would publish .tonepoet-manifest.json before
-        // this correction. The explicit-consent cases guard retained rerun
-        // authority without allowing that sidecar to become implicit again.
+        // this correction. Explicit consent still permits provenance publication
+        // without allowing that sidecar to become implicit again.
         for requested_manifest in [false, true] {
             for human_log in [false, true] {
                 let (mut f, outputs, decoded_hash) = reference_inventory_fixture(human_log);
@@ -71609,10 +71046,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                         plan.album_dir.display().to_string(),
                     ));
                 }
-                OverwritePolicy::ReplaceWithBackup
-                | OverwritePolicy::AlwaysRedo
-                | OverwritePolicy::SkipIfManifestMatch
-                | OverwritePolicy::VerifyIfManifestMatch => {
+                OverwritePolicy::ReplaceWithBackup | OverwritePolicy::AlwaysRedo => {
                     if let Err(err) =
                         write_publish_marker(&plan.album_dir, &marker_path, &backup_dir)
                     {
@@ -75633,8 +75067,21 @@ Recovered provenance
                 let (feature_staging, plan) = real_fragment_plan_through_features(
                     root, &stage, &req, &source, &outcome, artifacts,
                 ).await;
-                publish_album_output(feature_staging, &plan, req.publish.clone(), None)
+                let published = publish_album_output(feature_staging, &plan, req.publish.clone(), None)
                     .expect("independently dispatched folder audio published");
+                let report = finalize_report_with_binding_and_timing(
+                    &req,
+                    &RecordingReporter::new(),
+                    Some(source),
+                    None,
+                    None,
+                    Some(published),
+                    outcome,
+                    None,
+                    None,
+                ).await;
+                assert!(matches!(report.outcome, AlbumOutcome::Complete { .. }),
+                    "folder participant must complete terminal lifecycle");
             }
             let mut expected = std::collections::BTreeSet::from([
                 "Test Artist/".to_string(),

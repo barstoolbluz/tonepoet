@@ -33,11 +33,8 @@ use tonepoet_pipeline::{
     inspect_exact_w64_pcm, validate_exact_w64_pcm, TruePeakPurpose,
 };
 use tonepoet_pipeline::fingerprint::{
-    conversion_behavior_fingerprint_v1, execution_fingerprint_v1,
-    reference_source_probe_digest_v1, settings_snapshot_fingerprint_v2,
-    BehaviorFingerprintV1, ExecutionFingerprintV1, ReferenceExecutionIdentityInput,
+    reference_source_probe_digest_v1, ReferenceExecutionIdentityInput,
     ReferenceMetadataMutatorIdentityInput, ReferenceMetadataMutatorToolchainInput,
-    SemanticPlanHashV1, SettingsSnapshotFingerprintV2,
 };
 
 use super::errors::{ConvertError, ToolRunnerError};
@@ -483,22 +480,6 @@ pub(crate) fn reference_execution_identity_input(
     }
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct ReferenceRerunPreflightAuthority {
-    pub track_identity: super::manifest::TrackIdentity,
-    pub settings_snapshot_fingerprint_v2: SettingsSnapshotFingerprintV2,
-    pub resolved_output_target: tonepoet_pipeline::ResolvedOutputTarget,
-    pub policy: tonepoet_pipeline::DsdReferencePolicyVersion,
-    pub qualification_candidate_manifest_digest: Sha256Digest,
-    pub source_content_sha256: Sha256Digest,
-    pub source_probe_digest: Sha256Digest,
-    pub original_source_kind: DsdSourceKind,
-    pub front_end: tonepoet_pipeline::DsdInputFrontEnd,
-    pub behavior_fingerprint_v1: BehaviorFingerprintV1,
-    pub execution_fingerprint_v1: ExecutionFingerprintV1,
-    pub semantic_plan_hash_v1: SemanticPlanHashV1,
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReferencePackagedSampleIdentityMode {
@@ -578,7 +559,7 @@ pub struct ExecutedTrackPlan {
     /// compares planner satisfaction against this per-track requirement instead
     /// of inferring source-MD5 support from file names.
     pub metadata_required: PlannedMetadataSatisfaction,
-    /// SHA-256 of the planned command sequence, for legacy manifest rerun identity.
+    /// SHA-256 of the planned command sequence, for optional legacy manifest provenance.
     pub command_hash: Option<String>,
     /// Qualified Reference execution authority, absent for ordinary routes.
     pub reference: Option<ReferenceExecutionEvidence>,
@@ -830,133 +811,6 @@ fn reference_metadata_attestation_required(request: &PipelineRequest) -> bool {
         super::types::StageRequirement::Enabled
     )
 }
-
-pub(crate) async fn preflight_reference_rerun_authority(
-    request: &PipelineRequest,
-    track: &PreparedTrack,
-    planned_output: &Path,
-    runner: &dyn ToolRunner,
-    cancel: &CancellationToken,
-) -> Result<Option<ReferenceRerunPreflightAuthority>, TrackExecutionError> {
-    if !tonepoet_pipeline::selects_reference_dsd_to_pcm(&request.settings, true)
-        || request.settings.dsd.from_dsd.pathway
-            != tonepoet_pipeline::DsdSourcePathway::Reference
-    {
-        return Ok(None);
-    }
-
-    let presented_input = match &track.source_ref {
-        super::types::TrackSourceRef::StagedFile(path) => path.clone(),
-        super::types::TrackSourceRef::SacdTrack {
-            iso,
-            track_index,
-            ..
-        } => iso.with_file_name(format!(
-            ".tonepoet-reference-preflight-{track_index}.dsf"
-        )),
-        _ => {
-            return Ok(None);
-        }
-    };
-    let intermediate_dir = planned_output
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(".tonepoet-reference-preflight");
-    let plan_request = plan_request_for_track(
-        request,
-        track,
-        &presented_input,
-        planned_output,
-        intermediate_dir,
-    )?;
-    let plan = plan_conversion(&plan_request)
-        .map_err(|err| ConvertError::Backend(format!("planner failed: {err}")))?;
-    let Some(summary) = plan.reference else {
-        return Ok(None);
-    };
-    validate_reference_production_promotion_preflight(&summary)?;
-    let metadata_enabled = reference_metadata_attestation_required(request);
-    let toolchain = attest_reference_toolchain(
-        runner,
-        cancel,
-        summary.front_end,
-        metadata_enabled,
-        usize::from(summary.final_pcm.channels),
-        summary.certified_scan_tier(),
-    )
-    .await?;
-    let original_authority = match &track.source_ref {
-        super::types::TrackSourceRef::SacdTrack { iso, .. } => iso.as_path(),
-        _ => presented_input.as_path(),
-    };
-    let source_content_sha256 = stable_file_sha256_cancel(original_authority, cancel)
-        .map_err(|err| {
-            reference_materialization_error(
-                format!(
-                    "failed to admit Reference source {} for rerun preflight",
-                    original_authority.display()
-                ),
-                err,
-            )
-        })?;
-    let original_source_kind = plan_request.source.dsd_source_kind.clone().ok_or_else(|| {
-        TrackExecutionError::new(
-            ConvertError::Backend(
-                "Reference rerun preflight is missing DSD source identity".to_string(),
-            ),
-            Vec::new(),
-        )
-    })?;
-    if let super::types::TrackSourceRef::SacdTrack {
-        iso,
-        track_index,
-        area,
-    } = &track.source_ref
-    {
-        let current_source_kind = reference_sacd_source_kind(iso, *track_index, *area)?;
-        if current_source_kind != original_source_kind {
-            return Err(TrackExecutionError::new(
-                ConvertError::Backend(
-                    "Reference SACD TOC selection changed during rerun admission".to_string(),
-                ),
-                Vec::new(),
-            ));
-        }
-        // Re-parse and bind the selected TOC identity, but do not read the full
-        // ISO a second time solely to detect a same-user mutation race. The
-        // provenance/content authority is the SHA-256 already computed above.
-    }
-    let source_probe_digest = reference_source_probe_digest_v1(&plan_request.source);
-    let behavior_fingerprint_v1 =
-        conversion_behavior_fingerprint_v1(&summary, &original_source_kind);
-    let semantic_plan_hash_v1 = SemanticPlanHashV1(summary.semantic_plan_hash_v1);
-    let execution_fingerprint_v1 = execution_fingerprint_v1(
-        behavior_fingerprint_v1,
-        semantic_plan_hash_v1,
-        summary.qualification_candidate_manifest_digest,
-        &reference_execution_identity_input(&toolchain),
-    );
-
-    Ok(Some(ReferenceRerunPreflightAuthority {
-        track_identity: super::manifest::TrackIdentity {
-            source_ordinal: track.id.source_ordinal as usize,
-            disc_number: track.id.disc_number,
-            track_number: Some(track.id.track_number),
-        },
-        settings_snapshot_fingerprint_v2: settings_snapshot_fingerprint_v2(&request.settings),
-        resolved_output_target: summary.target,
-        policy: summary.policy,
-        qualification_candidate_manifest_digest: summary.qualification_candidate_manifest_digest,
-        source_content_sha256,
-        source_probe_digest,
-        original_source_kind,
-        front_end: summary.front_end,
-        behavior_fingerprint_v1,
-        execution_fingerprint_v1,
-        semantic_plan_hash_v1,
-    }))
-}
-
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

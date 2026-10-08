@@ -177,7 +177,7 @@ pub fn build_pipeline_request_from_settings(
         log: LogPolicy {
             root: output_root.join(".tonepoet-logs"),
             write_for_blocked: true,
-            write_json_log: item.options.write_log_file,
+            write_json_log: false,
             write_conversion_log: item.options.write_log_file,
         },
         stages: StagePolicy {
@@ -793,6 +793,29 @@ mod cue_sidecar_override_request_tests {
         item.options.pipeline_settings = Some(PipelineSettings::default());
         item.pipeline_settings = Some(PipelineSettings::default());
         item
+    }
+
+    #[test]
+    fn human_log_flag_does_not_request_machine_evidence() {
+        for human_log in [false, true] {
+            let mut item = item_with_settings("/tmp/album/01.flac");
+            item.options.write_log_file = human_log;
+            let req = build_pipeline_request(&item).expect("unified request");
+            assert_eq!(req.log.write_conversion_log, human_log);
+            assert!(!req.log.write_json_log, "human log does not authorize machine evidence");
+        }
+    }
+
+    #[test]
+    fn independently_requested_machine_evidence_survives_prebuilt_request() {
+        let mut item = item_with_settings("/tmp/album/01.flac");
+        let mut prebuilt = build_pipeline_request(&item).expect("unified request");
+        prebuilt.log.write_json_log = true;
+        prebuilt.log.write_conversion_log = false;
+        item.pipeline_request = Some(prebuilt);
+        let req = build_pipeline_request(&item).expect("prebuilt request");
+        assert!(req.log.write_json_log);
+        assert!(!req.log.write_conversion_log);
     }
 
     #[test]

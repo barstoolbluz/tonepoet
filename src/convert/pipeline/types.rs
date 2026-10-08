@@ -969,8 +969,8 @@ pub enum NamingCollisionPolicy {
 pub struct PublishPolicy {
     pub overwrite: OverwritePolicy,
     pub same_filesystem_required: bool,
-    /// Write `.tonepoet-manifest.json` to the output directory. Used by the
-    /// rerun gate to detect identical conversions. Default: false.
+    /// Publish the optional `.tonepoet-manifest.json` provenance sidecar.
+    /// Default: false.
     #[serde(default)]
     pub write_manifest: bool,
 }
@@ -979,8 +979,6 @@ pub struct PublishPolicy {
 pub enum OverwritePolicy {
     FailIfExists,
     ReplaceWithBackup,
-    SkipIfManifestMatch,
-    VerifyIfManifestMatch,
     AlwaysRedo,
 }
 
@@ -3090,7 +3088,7 @@ pub struct TrackArtifact {
     #[serde(default)]
     pub metadata_required: PlannedMetadataSatisfaction,
     /// SHA-256 of the planned command sequence, computed during encoding.
-    /// Used by the manifest for rerun identity.
+    /// Retained for explicitly requested legacy manifest provenance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub planned_command_hash: Option<String>,
     /// Qualified Reference source, plan, measurement, and toolchain authority.

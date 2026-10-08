@@ -46,7 +46,7 @@ use crate::convert::pipeline::{
     scheduled_worker_failure_output,
     AlbumBatchTrackContext, AlbumCompletionTracker, BatchResolvedAlbumIdentity,
     AlbumOutcome, AlbumReadiness, BroadcastReporter, CompanionCopyPolicy, MetadataTextOverride,
-    OverwritePolicy, PipelineReport, PipelineRequest, PoolLimits,
+    PipelineReport, PipelineRequest, PoolLimits,
     RealToolRunner, ScheduledAlbum, ScheduledMaterialization,
     ScheduledCueStreamTrack, ScheduledRealizedTrack, ScheduledTrackOutput, SchedulerMetrics, SchedulerMetricsSnapshot,
     ScratchStagingConfig, SharedWorkerPool, SourceAudioCoding, SourceKind, StageOutcome, ToolBinary,
@@ -60,7 +60,6 @@ use crate::convert::pipeline::stages::{
     pipeline_report_requests_scratch_disk_retry, refresh_portable_durable_log_best_effort, plan_album_dir_from_dispatch_metadata,
     prepare_independent_single_file_album_batch_for_completion_order_dispatch,
     prepare_verified_single_file_album_batch_completion_order_fallback,
-    resolve_dsd_album_gain_post_barrier_rerun,
     finish_pipeline_album_for_scheduler_with_tool_limits_and_retry_paths,
     CertifiedTruePeakPreparedMeasurement, ScheduledAlbumFailureCause, ScheduledAlbumFailureContext,
 };
@@ -1001,7 +1000,7 @@ fn folder_template_needs_materialized_audio_for_dispatch(req: &PipelineRequest) 
 /// be planned from queue-time metadata through the canonical output planner
 /// and every result agrees. Any uncertainty deliberately leaves the batch
 /// provisional; the pipeline will then refuse unsafe early pre-action
-/// execution rather than racing a guessed destination against rerun recovery.
+/// execution rather than racing a guessed destination against competing publication.
 fn planner_resolved_album_output_dir_for_dispatch(
     requests: &[PipelineRequest],
 ) -> Option<PathBuf> {
@@ -2480,10 +2479,6 @@ enum QueueWorkOutput {
         item_id: String,
         result: ScheduledMaterialization,
     },
-    AlbumGainRerunChecked {
-        item_id: String,
-        result: ScheduledMaterialization,
-    },
     Realized {
         job_id: String,
         track: ScheduledRealizedTrack,
@@ -2528,7 +2523,6 @@ struct DeferredSubmission {
 
 struct SubmissionPump {
     initial_items: VecDeque<ConversionItem>,
-    album_gain_rerun: VecDeque<ScheduledAlbum>,
     album_fanout: VecDeque<String>,
     realized_encodes: VecDeque<(String, ScheduledRealizedTrack, CancellationToken)>,
     replaygain_batch_measurement: VecDeque<(String, Vec<ReplayGainBatchReadyMember>)>,
@@ -2550,7 +2544,6 @@ impl SubmissionPump {
     fn new(items: Vec<ConversionItem>) -> Self {
         Self {
             initial_items: items.into_iter().collect(),
-            album_gain_rerun: VecDeque::new(),
             album_fanout: VecDeque::new(),
             realized_encodes: VecDeque::new(),
             replaygain_batch_measurement: VecDeque::new(),
@@ -2564,10 +2557,6 @@ impl SubmissionPump {
 
     fn enqueue_album_fanout(&mut self, job_id: String) {
         self.album_fanout.push_back(job_id);
-    }
-
-    fn enqueue_album_gain_rerun(&mut self, album: ScheduledAlbum) {
-        self.album_gain_rerun.push_back(album);
     }
 
     fn enqueue_realized_encode(
@@ -2755,14 +2744,6 @@ impl SubmissionPump {
                 continue;
             }
 
-            if let Some(album) = self.album_gain_rerun.pop_front() {
-                let unit = build_album_gain_rerun_work(album, progress_tx);
-                if !self.try_submit_unit(pool, unit, true) {
-                    return;
-                }
-                continue;
-            }
-
             if let Some((job_id, realized, job_cancel)) = self.realized_encodes.pop_front() {
                 let unit = build_realized_encode_work(
                     job_id,
@@ -2914,7 +2895,6 @@ impl SubmissionPump {
         self.initial_items
             .len()
             .saturating_add(usize::from(self.deferred_unit.is_some()))
-            .saturating_add(self.album_gain_rerun.len())
             .saturating_add(self.realized_encodes.len())
             .saturating_add(self.replaygain_batch_measurement.len())
             .saturating_add(self.album_postprocess.len())
@@ -4595,26 +4575,14 @@ fn apply_dsd_album_gain_barrier_resolution(
     match resolution {
         Ok(albums) => {
             for album in albums {
-                if album.req.publish.overwrite == OverwritePolicy::SkipIfManifestMatch
-                    && ((album.req.settings.dsd.reference_auto_album_gain_possible()
-                        && album.req.settings.dsd.runtime_album_gain_db().is_some())
-                        || album.req.settings.dsd.album_true_peak_gain_selected()
-                        || (album.req.settings.pcm_true_peak.is_true_peak()
-                            && album.req.settings.pcm_true_peak.scope()
-                                == Some(tonepoet_pipeline::TruePeakScope::Album)))
-                {
-                    pool.metrics().record_jobs_queued(1);
-                    submissions.enqueue_album_gain_rerun(album);
-                } else {
-                    release_scheduled_album(
-                        album,
-                        pool,
-                        tracker,
-                        pending_albums,
-                        submissions,
-                        cancel,
-                    );
-                }
+                release_scheduled_album(
+                    album,
+                    pool,
+                    tracker,
+                    pending_albums,
+                    submissions,
+                    cancel,
+                );
             }
         }
         Err((reason, albums)) => {
@@ -4917,33 +4885,6 @@ async fn run_queue_with_shared_orchestrator(
                                     );
                                     submissions.record_backlog(pool.metrics(), &pending_albums);
                                 }
-                            }
-                        }
-                    }
-                    Ok(QueueWorkOutput::AlbumGainRerunChecked { item_id, result }) => {
-                        match result {
-                            ScheduledMaterialization::Finished(report) => {
-                                let warning_count = source_warning_count(report.source.as_ref());
-                                let status = map_album_outcome(
-                                    &report.outcome,
-                                    report.published.as_ref(),
-                                    report.durable_log.as_deref(),
-                                    warning_count,
-                                );
-                                if terminal.insert(item_id, status.clone()).is_none() {
-                                    record_terminal_status(&pool, &status);
-                                }
-                            }
-                            ScheduledMaterialization::Ready(album) => {
-                                release_scheduled_album(
-                                    album,
-                                    &pool,
-                                    &mut tracker,
-                                    &mut pending_albums,
-                                    &mut submissions,
-                                    &cancel,
-                                );
-                                submissions.record_backlog(pool.metrics(), &pending_albums);
                             }
                         }
                     }
@@ -5908,27 +5849,6 @@ fn build_album_postprocess_work(
     }
 }
 
-fn build_album_gain_rerun_work(
-    album: ScheduledAlbum,
-    progress_tx: &broadcast::Sender<ProgressUpdate>,
-) -> WorkUnit<QueueWorkOutput> {
-    let item_id = album.req.item_id.clone();
-    let job_id = album.req.job_id.clone();
-    let unit_id = format!("album-gain-rerun:{item_id}");
-    let progress_tx = progress_tx.clone();
-    WorkUnit {
-        job_id,
-        unit_id,
-        kind: WorkKind::PipelineItem,
-        task: boxed_work(move |_worker_cancel| async move {
-            let reporter = BroadcastReporter::new(progress_tx, None, item_id.clone(), None);
-            let result = resolve_dsd_album_gain_post_barrier_rerun(album, &reporter).await;
-            Ok(QueueWorkOutput::AlbumGainRerunChecked { item_id, result })
-        }),
-    }
-}
-
-
 fn scratch_track_retry_original_error(outputs: &[ScheduledTrackOutput]) -> String {
     outputs
         .iter()
@@ -6527,6 +6447,7 @@ mod tests {
 
     use super::*;
     use crate::convert::pipeline::DvdaDownmixPolicy;
+    use crate::convert::pipeline::OverwritePolicy;
 
     fn scheduler_failure_test_output(
         index: usize,
@@ -6937,7 +6858,7 @@ mod tests {
                 folder_template: None,
                 per_album_subdir: true,
                 collision_policy: NamingCollisionPolicy::Fail,
-            windows_portable: false,
+                windows_portable: false,
             },
             publish: PublishPolicy {
                 overwrite: OverwritePolicy::FailIfExists,

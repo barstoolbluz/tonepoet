@@ -118,6 +118,80 @@ fn build_legacy_manifest(input: ManifestBuildInput) -> Result<ConversionManifest
 fn build_reference_manifest(
     input: ManifestBuildInput,
 ) -> Result<ConversionManifest, ManifestError> {
+    let route_identity = reference_route_identity(&input)?;
+    let mut manifest_tracks = Vec::with_capacity(input.tracks.len());
+    for track in input.tracks {
+        manifest_tracks.push(build_reference_manifest_track(track)?);
+    }
+    ConversionManifest::new_reference(
+        input.album_dir,
+        input.settings,
+        route_identity,
+        manifest_tracks,
+    )
+}
+
+/// Validate the execution's Reference authority even without a requested
+/// manifest. This runs the same route and executed-sample continuity checks
+/// used by the manifest builder, but does not construct, hash or publish one.
+pub fn validate_reference_execution_authority(
+    input: &ManifestBuildInput,
+) -> Result<(), ManifestError> {
+    let native_count = input.tracks.iter().filter(|track| track.reference_evidence.is_some()).count();
+    if native_count == 0 {
+        return Ok(());
+    }
+    if native_count != input.tracks.len() {
+        return Err(ManifestError::InvalidAuthority(
+            "manifest cannot mix legacy and native Reference track authority".to_string(),
+        ));
+    }
+    if input.tracks.iter().any(|track| track.track_identity.is_merged_output()) {
+        return Err(ManifestError::InvalidAuthority(
+            "Reference manifests carry one or more singleton tracks and no merged output".to_string(),
+        ));
+    }
+    reference_route_identity(input)?;
+    for track in &input.tracks {
+        validate_album_relative_output_path(&track.album_relative_output_path)?;
+        let evidence = track.reference_evidence.as_ref().expect("native_count matches track count");
+        // The published manifest previously ran these checks in its native
+        // authority validator; make them independent of publication consent.
+        if evidence.plan.front_end != DsdInputFrontEnd::NativeUncompressed
+            && evidence.canonical_materialization_sha256 == Sha256Digest([0; 32])
+        {
+            return Err(ManifestError::InvalidAuthority(
+                "decoded Reference front-end is missing canonical materialization authority".to_string(),
+            ));
+        }
+        if let tonepoet_pipeline::DsdSourceKind::SacdTrack { selection, .. } = &evidence.original_source_kind {
+            if selection.frame_count == 0 || selection.channels == 0
+                || selection.toc_digest == Sha256Digest([0; 32]) {
+                return Err(ManifestError::InvalidAuthority(
+                    "SACD Reference identity has an incomplete track selection".to_string(),
+                ));
+            }
+        }
+        if reference_uses_v3(evidence.plan.policy) {
+            reference_executed_evidence_digest_v3(evidence)?;
+        } else {
+            reference_executed_evidence_digest_v2(evidence)?;
+        }
+    }
+    Ok(())
+}
+
+fn reference_route_identity(
+    input: &ManifestBuildInput,
+) -> Result<ManifestRouteIdentityV2, ManifestError> {
+    if input.tracks.is_empty() {
+        return Err(ManifestError::InvalidAuthority("Reference manifest has no track".to_string()));
+    }
+    if input.settings.dsd.from_dsd.pathway != tonepoet_pipeline::DsdSourcePathway::Reference {
+        return Err(ManifestError::InvalidAuthority(
+            "Reference route settings do not match the qualified Reference policy".to_string(),
+        ));
+    }
     if !input.registered_effects.is_empty() {
         return Err(ManifestError::InvalidAuthority(
             "qualified Reference manifest cannot include ordinary registered effects before Phase 5"
@@ -162,16 +236,21 @@ fn build_reference_manifest(
     let route_identity = route_identity.ok_or_else(|| {
         ManifestError::InvalidAuthority("Reference manifest has no track".to_string())
     })?;
-    let mut manifest_tracks = Vec::with_capacity(input.tracks.len());
-    for track in input.tracks {
-        manifest_tracks.push(build_reference_manifest_track(track)?);
+    if let ManifestRouteIdentityV2::DsdReferenceV2 {
+        resolved_output_target, qualification_candidate_manifest_digest, ..
+    } = &route_identity {
+        if !resolved_output_target.is_p0_reference_lossless() {
+            return Err(ManifestError::InvalidAuthority(
+                "Reference route target is not a P0 lossless target".to_string(),
+            ));
+        }
+        if *qualification_candidate_manifest_digest == Sha256Digest([0; 32]) {
+            return Err(ManifestError::InvalidAuthority(
+                "Reference qualification digest is empty".to_string(),
+            ));
+        }
     }
-    ConversionManifest::new_reference(
-        input.album_dir,
-        input.settings,
-        route_identity,
-        manifest_tracks,
-    )
+    Ok(route_identity)
 }
 
 pub fn build_legacy_manifest_track(
@@ -246,21 +325,7 @@ fn build_reference_manifest_track(
     let executed_evidence_digest_v1 = reference_executed_evidence_digest_v1(&evidence)?;
     let executed_evidence_digest_v2 = reference_executed_evidence_digest_v2(&evidence)?;
     let executed_evidence_digest_v3 =
-        if matches!(
-            evidence.plan.policy,
-            tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V7
-                | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V8
-                | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V9
-                | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V10
-                | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V11
-                | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V12
-                | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V13
-                | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V14
-                | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V15
-                | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V16
-                | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V17
-                | tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V18
-        ) {
+        if reference_uses_v3(evidence.plan.policy) {
             reference_executed_evidence_digest_v3(&evidence)?
         } else {
             Sha256Digest([0; 32])
@@ -411,6 +476,23 @@ fn reference_executed_evidence_digest_v2(
     hasher.update(v1.0);
     hasher.update(materialization.0);
     Ok(Sha256Digest(hasher.finalize().into()))
+}
+
+fn reference_uses_v3(policy: tonepoet_pipeline::DsdReferencePolicyVersion) -> bool {
+    matches!(policy,
+            tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V7 |
+            tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V8 |
+            tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V9 |
+            tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V10 |
+            tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V11 |
+            tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V12 |
+            tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V13 |
+            tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V14 |
+            tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V15 |
+            tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V16 |
+            tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V17 |
+            tonepoet_pipeline::DsdReferencePolicyVersion::SoxNg14801V18
+    )
 }
 
 fn reference_executed_evidence_digest_v3(
