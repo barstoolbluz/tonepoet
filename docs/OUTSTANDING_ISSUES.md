@@ -4419,3 +4419,54 @@ the Reference route can follow.
 This can be written independently of #64's fix, and should be, so that the fix
 has something to be verified by. If the test lands first it will fail, which is
 the correct starting state.
+
+## 66. "Structured execution evidence: unavailable", and the same conversion requested two ways differs
+
+Filed 2026-10-08, from a field run on the current build (`4fb99ba`). Two related
+observations, one cosmetic and one not.
+
+### The log reports a non-event as a failure
+
+A 64-cantata SACD conversion run from the TUI ends with:
+
+```
+Structured execution evidence: unavailable
+```
+
+Nothing was unavailable. No machine evidence was requested, so none was written.
+The line is the same category this log has already had removed from it — `backend
+not recorded`, `unknown depth`, `Not requested` — a sentence reporting the absence
+of something nobody asked for, phrased as though an attempt had failed.
+
+### The same conversion requested two ways produces different artifacts
+
+On `4fb99ba`, `LogPolicy::write_json_log` is set in four places:
+
+```
+src/convert/pipeline/unified_request.rs:180   write_json_log: item.options.write_log_file
+src/main.rs:2594                              write_json_log: false
+src/convert/mod.rs:3253                       write_json_log: false
+src/tui/command.rs:10466                      write_json_log: false
+```
+
+Measured on the same build: a TUI conversion writes no evidence and logs
+`unavailable`. A CLI conversion of a SACD ISO with `--write-log`, which routes
+through `unified_request.rs`, writes the evidence and logs its path.
+
+`unified_request.rs:180` is the coupling #64 identifies as the defect — asking for
+a human log silently also producing machine evidence. R14 corrected where that
+evidence is written, and defaulted the TUI and CLI entry points off, but left the
+coupling in place.
+
+### Required
+
+No line about structured execution evidence when none was requested. When it was
+requested, the line names its path.
+
+One answer to "was machine evidence produced" for a given set of options,
+whichever entry point asked. Machine evidence is its own explicit opt-in, as #64
+requires, and `write_log_file` does not imply it.
+
+### Note
+
+Not included in the R15 brief, which had already been sent when this was found.
