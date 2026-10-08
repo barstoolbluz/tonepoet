@@ -675,6 +675,20 @@ impl TrackExecutionError {
     }
 }
 
+fn prepend_reference_preparation_evidence(
+    mut error: TrackExecutionError,
+    preparation: &TrackExecutionEvidence,
+) -> TrackExecutionError {
+    if preparation == &TrackExecutionEvidence::default() {
+        return error;
+    }
+    let mut combined = preparation.clone();
+    combined.append(error.execution_evidence, 0);
+    combined.mark_discarded_attempt();
+    error.execution_evidence = combined;
+    error
+}
+
 impl From<ConvertError> for TrackExecutionError {
     fn from(error: ConvertError) -> Self {
         Self::new(error, Vec::new())
@@ -2571,6 +2585,7 @@ pub(crate) async fn execute_planned_track_conversion_with_scalar_pump(
     }
     let work_dir = convert_root.join(format!(".track-{:04}.work", track.id.source_ordinal));
     let cleanup_guard = TrackExecutionCleanupGuard::acquire(work_dir.clone(), cancel).await?;
+    let mut reference_preparation_evidence = TrackExecutionEvidence::default();
     let result = async {
         reset_track_work_dir(&work_dir)?;
 
@@ -2679,6 +2694,7 @@ pub(crate) async fn execute_planned_track_conversion_with_scalar_pump(
                     cleanup_guard.blocking_worker_lease()?,
                 )
                 .await?;
+                reference_preparation_evidence = materialization.preparation_evidence.clone();
                 let admitted_source_kind = plan_request.source.dsd_source_kind.clone();
                 let admitted_target = plan_request.resolved_output_target;
                 let admitted_scope = plan_request.reference_programme_scope.clone();
@@ -3033,6 +3049,21 @@ pub(crate) async fn execute_planned_track_conversion_with_scalar_pump(
         }
     }
     .await;
+
+    let result = match result {
+        Ok(mut value) => {
+            if reference_preparation_evidence != TrackExecutionEvidence::default() {
+                let mut combined = reference_preparation_evidence.clone();
+                combined.append(value.execution_evidence, 0);
+                value.execution_evidence = combined;
+            }
+            Ok(value)
+        }
+        Err(error) => Err(prepend_reference_preparation_evidence(
+            error,
+            &reference_preparation_evidence,
+        )),
+    };
 
     let cleanup_result = match cleanup_guard.cleanup_now() {
         Ok(TrackCleanupOutcome::Complete) => Ok(()),
@@ -8318,6 +8349,7 @@ pub(super) struct ReferenceMaterialization {
     pub(super) path: PathBuf,
     pub(super) source_content_sha256: Sha256Digest,
     pub(super) canonical_materialization_sha256: Sha256Digest,
+    pub(super) preparation_evidence: TrackExecutionEvidence,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8737,20 +8769,29 @@ fn materialize_reference_source_blocking(
             err,
         ))?;
 
+    let mut source_extraction_evidence = TrackExecutionEvidence::default();
     let presented_source = match &track.source_ref {
         super::types::TrackSourceRef::SacdTrack {
             iso,
             track_index,
             area,
-        } => extract_reference_sacd_presented_source_blocking(
-            iso,
-            *track_index,
-            *area,
-            source_kind,
-            scratch,
-            cancel,
-            _materialization_pause,
-        )?,
+        } => {
+            let extracted = extract_reference_sacd_presented_source_blocking(
+                iso,
+                *track_index,
+                *area,
+                source_kind,
+                scratch,
+                cancel,
+                _materialization_pause,
+            )?;
+            super::stages::record_completed_sacd_extraction_for_source_kind(
+                &mut source_extraction_evidence,
+                track,
+                Some(source_kind),
+            );
+            extracted
+        }
         _ => realized_input.to_path_buf(),
     };
 
@@ -8762,7 +8803,7 @@ fn materialize_reference_source_blocking(
         _materialization_pause,
     )
     .map_err(|err| {
-        if err.kind() == io::ErrorKind::Interrupted {
+        let error = if err.kind() == io::ErrorKind::Interrupted {
             reference_cancelled_error()
         } else {
             reference_materialization_error(
@@ -8772,7 +8813,8 @@ fn materialize_reference_source_blocking(
                 ),
                 err,
             )
-        }
+        };
+        prepend_reference_preparation_evidence(error, &source_extraction_evidence)
     })?;
     let copied_sha256 = materialized.source_content_sha256;
     let path = materialized.path;
@@ -8784,12 +8826,15 @@ fn materialize_reference_source_blocking(
     if !matches!(source_kind, DsdSourceKind::SacdTrack { .. })
         && source_content_sha256 != copied_sha256
     {
-        return Err(TrackExecutionError::new(
-            ConvertError::Backend(
-                "Reference source changed between admission and private materialization"
-                    .to_string(),
+        return Err(prepend_reference_preparation_evidence(
+            TrackExecutionError::new(
+                ConvertError::Backend(
+                    "Reference source changed between admission and private materialization"
+                        .to_string(),
+                ),
+                Vec::new(),
             ),
-            Vec::new(),
+            &source_extraction_evidence,
         ));
     }
 
@@ -8797,6 +8842,7 @@ fn materialize_reference_source_blocking(
         path,
         source_content_sha256,
         canonical_materialization_sha256,
+        preparation_evidence: source_extraction_evidence,
     })
 }
 
@@ -8890,6 +8936,7 @@ fn materialize_reference_presented_source(
         path,
         source_content_sha256: copied_sha256,
         canonical_materialization_sha256,
+        preparation_evidence: TrackExecutionEvidence::default(),
     })
 }
 
@@ -16040,6 +16087,78 @@ mod tests {
             "retained SACD protected R64 must never be presented to the source materializer: {error}",
         );
         assert!(!work_dir.exists(), "failed retained-carrier execution must clean work state");
+    }
+
+    #[test]
+    fn reference_preflight_failure_before_private_sacd_extraction_has_no_extraction_receipt() {
+        let error = prepend_reference_preparation_evidence(
+            TrackExecutionError::new(
+                ConvertError::Backend("forced Reference preflight failure".to_string()),
+                Vec::new(),
+            ),
+            &TrackExecutionEvidence::default(),
+        );
+        assert!(
+            error
+                .execution_evidence
+                .operations
+                .iter()
+                .all(|operation| operation.kind != "source_extraction"),
+            "preflight/attestation failure occurs before private SACD extraction",
+        );
+    }
+
+    #[test]
+    fn deferred_reference_sacd_extraction_receipt_survives_later_reference_failure() {
+        let source_kind = tonepoet_pipeline::DsdSourceKind::SacdTrack {
+            frame_format: tonepoet_pipeline::SacdFrameEncoding::Dst,
+            selection: tonepoet_pipeline::SacdTrackSelection {
+                area: tonepoet_pipeline::SacdAreaKind::Stereo,
+                track_index_zero_based: 0,
+                start_frame: 650,
+                frame_count: 8,
+                channels: 2,
+                toc_digest: tonepoet_pipeline::Sha256Digest::of_bytes(b"deferred-reference-toc"),
+            },
+        };
+        let track = reference_materialization_track(TrackSourceRef::SacdTrack {
+            iso: PathBuf::from("/music/album.iso"),
+            track_index: 0,
+            area: SacdArea::Stereo,
+        });
+        let mut completed_materialization_evidence = TrackExecutionEvidence::default();
+        crate::convert::pipeline::stages::record_completed_sacd_extraction_for_source_kind(
+            &mut completed_materialization_evidence,
+            &track,
+            Some(&source_kind),
+        );
+        let error = prepend_reference_preparation_evidence(
+            TrackExecutionError::new(
+                ConvertError::Backend("forced later Reference operation failure".to_string()),
+                Vec::new(),
+            ),
+            &completed_materialization_evidence,
+        );
+        let extraction = error
+            .execution_evidence
+            .operations
+            .iter()
+            .find(|operation| operation.kind == "source_extraction")
+            .expect("completed private extraction must survive later Reference failure");
+        assert_eq!(
+            extraction.lineage,
+            crate::convert::pipeline::execution_evidence::OperationLineage::DiscardedAttempt,
+            "failed Reference execution keeps completed extraction as discarded-attempt history",
+        );
+        let rendered = crate::convert::pipeline::execution_evidence::render_operation_with_context(
+            &error.execution_evidence,
+            extraction,
+        )
+        .join("\n");
+        assert!(rendered.contains("SACD source extraction — sacd-rs"), "{rendered}");
+        assert!(rendered.contains("Area: stereo"), "{rendered}");
+        assert!(rendered.contains("Frame encoding: DST-compressed DSD"), "{rendered}");
+        assert!(rendered.contains("DST decoding: performed"), "{rendered}");
     }
 
     #[test]

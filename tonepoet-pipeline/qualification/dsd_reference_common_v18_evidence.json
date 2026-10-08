@@ -14,7 +14,7 @@
     "v16_manifest_sha256": "cbea231eb727598ac547dc7346c5ab9a0f6182aeaacdc3e205ec916517ae2b53",
     "v16_policy": "sox_ng_14_8_0_1_v16"
   },
-  "metadata_mutation_closure_fingerprint_sha256": "201dca85c4e273ca56ddf3f974be4ccd61f83937564166d9f9b8f83f283ab23e",
+  "metadata_mutation_closure_fingerprint_sha256": "7860f30990a0e90fd79cad28e7930bb366c364596de2214c6dbaba12eaf63e8d",
   "qualification_counts": {
     "expected_negative_case_count": 34,
     "positive_case_count": 3903,
@@ -30,21 +30,21 @@
       "record": {
         "candidate_manifest_sha256": "64d4fda1ef4bf8d1d680e201fe7d4e6681a79d635d8b36ad4fb1bf1af611a3ed",
         "commands": [
-          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/materialized/reference-admitted-source.dsf\",\"-t\",\"w64\",\"-e\",\"floating-point\",\"-b\",\"64\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\",\"gain\",\"-12.000000000\",\"rate\",\"-u\",\"88200\",\"sinc\",\"-a\",\"180\",\"-L\",\"-t\",\"10000\",\"-30000\"],\"cwd\":null,\"description\":\"Render qualified Reference DSD reconstruction\",\"elapsed_nanos\":456839605,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-r\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample rate\",\"elapsed_nanos\":83515376,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-c\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 channel count\",\"elapsed_nanos\":83194146,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-b\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 bit depth\",\"elapsed_nanos\":83240536,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-s\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample count\",\"elapsed_nanos\":114410281,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-e\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample encoding\",\"elapsed_nanos\":114225479,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\",\"-t\",\"w64\",\"-e\",\"floating-point\",\"-b\",\"64\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\",\"gain\",\"+22.943844673\"],\"cwd\":null,\"description\":\"Apply one qualified Reference terminal realization\",\"elapsed_nanos\":94600132,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-r\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample rate\",\"elapsed_nanos\":93364274,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-c\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM channel count\",\"elapsed_nanos\":82796471,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-b\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM bit depth\",\"elapsed_nanos\":114305893,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-s\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample count\",\"elapsed_nanos\":92713925,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-e\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample encoding\",\"elapsed_nanos\":104052188,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"-cpuflags\",\"sse+sse2\",\"-hide_banner\",\"-nostdin\",\"-loglevel\",\"error\",\"-xerror\",\"-i\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\",\"-map\",\"0:a:0\",\"-map_metadata\",\"-1\",\"-vn\",\"-sn\",\"-dn\",\"-f\",\"null\",\"-\"],\"cwd\":null,\"description\":\"Verify complete QPCM Wave64 traversal with FFmpeg\",\"elapsed_nanos\":154180728,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"ffmpeg\"}",
-          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\",\"-t\",\"raw\",\"-e\",\"floating-point\",\"-b\",\"64\",\"-L\",\"-\"],\"cwd\":null,\"description\":\"Hash QPCM decoded samples: stream exact Float64 W64\",\"elapsed_nanos\":143224999,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"-cpuflags\",\"sse+sse2\",\"-hide_banner\",\"-nostdin\",\"-loglevel\",\"error\",\"-f\",\"f64le\",\"-ar\",\"88200\",\"-ac\",\"2\",\"-i\",\"pipe:0\",\"-map\",\"0:a:0\",\"-map_metadata\",\"-1\",\"-vn\",\"-sn\",\"-dn\",\"-c:a\",\"pcm_f64le\",\"-f\",\"hash\",\"-hash\",\"sha256\",\"-\"],\"cwd\":null,\"description\":\"Hash QPCM decoded samples\",\"elapsed_nanos\":196656597,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"ffmpeg\"}"
+          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/materialized/reference-admitted-source.dsf\",\"-t\",\"w64\",\"-e\",\"floating-point\",\"-b\",\"64\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\",\"gain\",\"-12.000000000\",\"rate\",\"-u\",\"88200\",\"sinc\",\"-a\",\"180\",\"-L\",\"-t\",\"10000\",\"-30000\"],\"cwd\":null,\"description\":\"Render qualified Reference DSD reconstruction\",\"elapsed_nanos\":447217124,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-r\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample rate\",\"elapsed_nanos\":113539699,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-c\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 channel count\",\"elapsed_nanos\":113606221,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-b\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 bit depth\",\"elapsed_nanos\":102923650,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-s\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample count\",\"elapsed_nanos\":94040679,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-e\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample encoding\",\"elapsed_nanos\":63042054,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\",\"-t\",\"w64\",\"-e\",\"floating-point\",\"-b\",\"64\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\",\"gain\",\"+22.943844673\"],\"cwd\":null,\"description\":\"Apply one qualified Reference terminal realization\",\"elapsed_nanos\":113705081,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-r\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample rate\",\"elapsed_nanos\":114269041,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-c\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM channel count\",\"elapsed_nanos\":114779307,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-b\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM bit depth\",\"elapsed_nanos\":114862985,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-s\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample count\",\"elapsed_nanos\":114224013,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-e\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample encoding\",\"elapsed_nanos\":113092929,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"-cpuflags\",\"sse+sse2\",\"-hide_banner\",\"-nostdin\",\"-loglevel\",\"error\",\"-xerror\",\"-i\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\",\"-map\",\"0:a:0\",\"-map_metadata\",\"-1\",\"-vn\",\"-sn\",\"-dn\",\"-f\",\"null\",\"-\"],\"cwd\":null,\"description\":\"Verify complete QPCM Wave64 traversal with FFmpeg\",\"elapsed_nanos\":184279578,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"ffmpeg\"}",
+          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\",\"-t\",\"raw\",\"-e\",\"floating-point\",\"-b\",\"64\",\"-L\",\"-\"],\"cwd\":null,\"description\":\"Hash QPCM decoded samples: stream exact Float64 W64\",\"elapsed_nanos\":173509074,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"-cpuflags\",\"sse+sse2\",\"-hide_banner\",\"-nostdin\",\"-loglevel\",\"error\",\"-f\",\"f64le\",\"-ar\",\"88200\",\"-ac\",\"2\",\"-i\",\"pipe:0\",\"-map\",\"0:a:0\",\"-map_metadata\",\"-1\",\"-vn\",\"-sn\",\"-dn\",\"-c:a\",\"pcm_f64le\",\"-f\",\"hash\",\"-hash\",\"sha256\",\"-\"],\"cwd\":null,\"description\":\"Hash QPCM decoded samples\",\"elapsed_nanos\":226781216,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"ffmpeg\"}"
         ],
         "gate": "GAIN08",
         "measurements": {
@@ -70,14 +70,14 @@
           "terminal_gain_db": "+22.943844673",
           "terminal_realization_count": 1
         },
-        "runtime_closure_fingerprint_sha256": "8af3013971a040fce3c7466243695fc08628589b0994cdd4372e1bd168c556bc",
+        "runtime_closure_fingerprint_sha256": "c22d3ba772abcea286e2f131bce5e1e6ae650d0bca05c4253ec77b0530734fd2",
         "schema": "tonepoet-reference-external-release-gate-evidence/v1",
         "status": "passed"
       },
-      "runtime_closure_fingerprint_sha256": "8af3013971a040fce3c7466243695fc08628589b0994cdd4372e1bd168c556bc",
+      "runtime_closure_fingerprint_sha256": "c22d3ba772abcea286e2f131bce5e1e6ae650d0bca05c4253ec77b0530734fd2",
       "schema": "tonepoet-reference-bound-release-gate-evidence/v1",
       "source_path": "/home/daedalus/dev/tonepoet/target/dsd_reference_common_v18_release_gates/GAIN08.json",
-      "source_sha256": "8b80de0a5b9b8849c8353b4c3e4e892e912c96b7205258f302bbb35d5ce0e662",
+      "source_sha256": "1840fdaa485f18abca00e5f9581d579cc57be294e7cb7f246015801f22061147",
       "status": "passed"
     },
     "GAIN09": {
@@ -86,21 +86,21 @@
       "record": {
         "candidate_manifest_sha256": "64d4fda1ef4bf8d1d680e201fe7d4e6681a79d635d8b36ad4fb1bf1af611a3ed",
         "commands": [
-          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.f1WEOx/.tmpGwwELy/historical-dc-root-cause/materialized/reference-admitted-source.dsf\",\"-t\",\"w64\",\"-e\",\"floating-point\",\"-b\",\"64\",\"/tmp/nix-shell.f1WEOx/.tmpGwwELy/historical-dc-root-cause/work/.candidate-delivered.tonepoet-stage-01.w64\",\"gain\",\"-12.000000000\",\"rate\",\"-u\",\"88200\",\"sinc\",\"-a\",\"180\",\"-L\",\"-t\",\"10000\",\"-30000\"],\"cwd\":null,\"description\":\"Render qualified Reference DSD reconstruction\",\"elapsed_nanos\":447823331,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-r\",\"/tmp/nix-shell.f1WEOx/.tmpGwwELy/historical-dc-root-cause/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample rate\",\"elapsed_nanos\":124661642,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-c\",\"/tmp/nix-shell.f1WEOx/.tmpGwwELy/historical-dc-root-cause/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 channel count\",\"elapsed_nanos\":94052879,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-b\",\"/tmp/nix-shell.f1WEOx/.tmpGwwELy/historical-dc-root-cause/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 bit depth\",\"elapsed_nanos\":114432603,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-s\",\"/tmp/nix-shell.f1WEOx/.tmpGwwELy/historical-dc-root-cause/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample count\",\"elapsed_nanos\":94355679,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-e\",\"/tmp/nix-shell.f1WEOx/.tmpGwwELy/historical-dc-root-cause/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample encoding\",\"elapsed_nanos\":104186611,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.f1WEOx/.tmpGwwELy/historical-dc-root-cause/work/.candidate-delivered.tonepoet-stage-01.w64\",\"-t\",\"w64\",\"-e\",\"floating-point\",\"-b\",\"64\",\"/tmp/nix-shell.f1WEOx/.tmpGwwELy/historical-dc-root-cause/work/.candidate-delivered.tonepoet-final.w64\",\"gain\",\"+10.052937578\"],\"cwd\":null,\"description\":\"Apply one qualified Reference terminal realization\",\"elapsed_nanos\":114812810,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-r\",\"/tmp/nix-shell.f1WEOx/.tmpGwwELy/historical-dc-root-cause/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample rate\",\"elapsed_nanos\":104114312,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-c\",\"/tmp/nix-shell.f1WEOx/.tmpGwwELy/historical-dc-root-cause/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM channel count\",\"elapsed_nanos\":104497575,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-b\",\"/tmp/nix-shell.f1WEOx/.tmpGwwELy/historical-dc-root-cause/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM bit depth\",\"elapsed_nanos\":72695360,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-s\",\"/tmp/nix-shell.f1WEOx/.tmpGwwELy/historical-dc-root-cause/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample count\",\"elapsed_nanos\":82714165,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-e\",\"/tmp/nix-shell.f1WEOx/.tmpGwwELy/historical-dc-root-cause/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample encoding\",\"elapsed_nanos\":93032872,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"-cpuflags\",\"sse+sse2\",\"-hide_banner\",\"-nostdin\",\"-loglevel\",\"error\",\"-xerror\",\"-i\",\"/tmp/nix-shell.f1WEOx/.tmpGwwELy/historical-dc-root-cause/work/.candidate-delivered.tonepoet-final.w64\",\"-map\",\"0:a:0\",\"-map_metadata\",\"-1\",\"-vn\",\"-sn\",\"-dn\",\"-f\",\"null\",\"-\"],\"cwd\":null,\"description\":\"Verify complete QPCM Wave64 traversal with FFmpeg\",\"elapsed_nanos\":214975411,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"ffmpeg\"}",
-          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.f1WEOx/.tmpGwwELy/historical-dc-root-cause/work/.candidate-delivered.tonepoet-final.w64\",\"-t\",\"raw\",\"-e\",\"floating-point\",\"-b\",\"64\",\"-L\",\"-\"],\"cwd\":null,\"description\":\"Hash QPCM decoded samples: stream exact Float64 W64\",\"elapsed_nanos\":193742891,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"-cpuflags\",\"sse+sse2\",\"-hide_banner\",\"-nostdin\",\"-loglevel\",\"error\",\"-f\",\"f64le\",\"-ar\",\"88200\",\"-ac\",\"2\",\"-i\",\"pipe:0\",\"-map\",\"0:a:0\",\"-map_metadata\",\"-1\",\"-vn\",\"-sn\",\"-dn\",\"-c:a\",\"pcm_f64le\",\"-f\",\"hash\",\"-hash\",\"sha256\",\"-\"],\"cwd\":null,\"description\":\"Hash QPCM decoded samples\",\"elapsed_nanos\":237437100,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"ffmpeg\"}"
+          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.Q61fJu/.tmpMnopA6/historical-dc-root-cause/materialized/reference-admitted-source.dsf\",\"-t\",\"w64\",\"-e\",\"floating-point\",\"-b\",\"64\",\"/tmp/nix-shell.Q61fJu/.tmpMnopA6/historical-dc-root-cause/work/.candidate-delivered.tonepoet-stage-01.w64\",\"gain\",\"-12.000000000\",\"rate\",\"-u\",\"88200\",\"sinc\",\"-a\",\"180\",\"-L\",\"-t\",\"10000\",\"-30000\"],\"cwd\":null,\"description\":\"Render qualified Reference DSD reconstruction\",\"elapsed_nanos\":445895071,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-r\",\"/tmp/nix-shell.Q61fJu/.tmpMnopA6/historical-dc-root-cause/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample rate\",\"elapsed_nanos\":103764902,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-c\",\"/tmp/nix-shell.Q61fJu/.tmpMnopA6/historical-dc-root-cause/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 channel count\",\"elapsed_nanos\":103997534,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-b\",\"/tmp/nix-shell.Q61fJu/.tmpMnopA6/historical-dc-root-cause/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 bit depth\",\"elapsed_nanos\":114686105,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-s\",\"/tmp/nix-shell.Q61fJu/.tmpMnopA6/historical-dc-root-cause/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample count\",\"elapsed_nanos\":114527363,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-e\",\"/tmp/nix-shell.Q61fJu/.tmpMnopA6/historical-dc-root-cause/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample encoding\",\"elapsed_nanos\":93845993,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.Q61fJu/.tmpMnopA6/historical-dc-root-cause/work/.candidate-delivered.tonepoet-stage-01.w64\",\"-t\",\"w64\",\"-e\",\"floating-point\",\"-b\",\"64\",\"/tmp/nix-shell.Q61fJu/.tmpMnopA6/historical-dc-root-cause/work/.candidate-delivered.tonepoet-final.w64\",\"gain\",\"+10.052937578\"],\"cwd\":null,\"description\":\"Apply one qualified Reference terminal realization\",\"elapsed_nanos\":103948801,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-r\",\"/tmp/nix-shell.Q61fJu/.tmpMnopA6/historical-dc-root-cause/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample rate\",\"elapsed_nanos\":114391797,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-c\",\"/tmp/nix-shell.Q61fJu/.tmpMnopA6/historical-dc-root-cause/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM channel count\",\"elapsed_nanos\":103857944,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-b\",\"/tmp/nix-shell.Q61fJu/.tmpMnopA6/historical-dc-root-cause/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM bit depth\",\"elapsed_nanos\":93487937,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-s\",\"/tmp/nix-shell.Q61fJu/.tmpMnopA6/historical-dc-root-cause/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample count\",\"elapsed_nanos\":103720814,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-e\",\"/tmp/nix-shell.Q61fJu/.tmpMnopA6/historical-dc-root-cause/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample encoding\",\"elapsed_nanos\":134696254,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"-cpuflags\",\"sse+sse2\",\"-hide_banner\",\"-nostdin\",\"-loglevel\",\"error\",\"-xerror\",\"-i\",\"/tmp/nix-shell.Q61fJu/.tmpMnopA6/historical-dc-root-cause/work/.candidate-delivered.tonepoet-final.w64\",\"-map\",\"0:a:0\",\"-map_metadata\",\"-1\",\"-vn\",\"-sn\",\"-dn\",\"-f\",\"null\",\"-\"],\"cwd\":null,\"description\":\"Verify complete QPCM Wave64 traversal with FFmpeg\",\"elapsed_nanos\":183757454,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"ffmpeg\"}",
+          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.Q61fJu/.tmpMnopA6/historical-dc-root-cause/work/.candidate-delivered.tonepoet-final.w64\",\"-t\",\"raw\",\"-e\",\"floating-point\",\"-b\",\"64\",\"-L\",\"-\"],\"cwd\":null,\"description\":\"Hash QPCM decoded samples: stream exact Float64 W64\",\"elapsed_nanos\":176491655,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"-cpuflags\",\"sse+sse2\",\"-hide_banner\",\"-nostdin\",\"-loglevel\",\"error\",\"-f\",\"f64le\",\"-ar\",\"88200\",\"-ac\",\"2\",\"-i\",\"pipe:0\",\"-map\",\"0:a:0\",\"-map_metadata\",\"-1\",\"-vn\",\"-sn\",\"-dn\",\"-c:a\",\"pcm_f64le\",\"-f\",\"hash\",\"-hash\",\"sha256\",\"-\"],\"cwd\":null,\"description\":\"Hash QPCM decoded samples\",\"elapsed_nanos\":224794939,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"ffmpeg\"}"
         ],
         "gate": "GAIN09",
         "measurements": {
@@ -147,14 +147,14 @@
             "sanitized_args": [
               "-S",
               "-D",
-              "/tmp/nix-shell.f1WEOx/.tmpGwwELy/historical-dc-root-cause/work/.candidate-delivered.tonepoet-stage-01.w64",
+              "/tmp/nix-shell.Q61fJu/.tmpMnopA6/historical-dc-root-cause/work/.candidate-delivered.tonepoet-stage-01.w64",
               "-t",
               "w64",
               "-e",
               "floating-point",
               "-b",
               "64",
-              "/tmp/nix-shell.f1WEOx/.tmpGwwELy/historical-dc-root-cause/work/.candidate-delivered.tonepoet-final.w64",
+              "/tmp/nix-shell.Q61fJu/.tmpMnopA6/historical-dc-root-cause/work/.candidate-delivered.tonepoet-final.w64",
               "gain",
               "+10.052937578"
             ]
@@ -179,43 +179,43 @@
             "unique_sample_bit_patterns": 99
           }
         },
-        "runtime_closure_fingerprint_sha256": "8af3013971a040fce3c7466243695fc08628589b0994cdd4372e1bd168c556bc",
+        "runtime_closure_fingerprint_sha256": "c22d3ba772abcea286e2f131bce5e1e6ae650d0bca05c4253ec77b0530734fd2",
         "schema": "tonepoet-reference-external-release-gate-evidence/v1",
         "status": "passed"
       },
-      "runtime_closure_fingerprint_sha256": "8af3013971a040fce3c7466243695fc08628589b0994cdd4372e1bd168c556bc",
+      "runtime_closure_fingerprint_sha256": "c22d3ba772abcea286e2f131bce5e1e6ae650d0bca05c4253ec77b0530734fd2",
       "schema": "tonepoet-reference-bound-release-gate-evidence/v1",
       "source_path": "/home/daedalus/dev/tonepoet/target/dsd_reference_common_v18_release_gates/GAIN09.json",
-      "source_sha256": "55efb1687074e468c29d246862f98dbd401aa0b7bcf560639ceb435fea0a5fe4",
+      "source_sha256": "575267cb74710d68c37b250f296e8c109a7a0d8912cc1321bc63174dbafe39f9",
       "status": "passed"
     },
     "Q01": {
       "candidate_manifest_sha256": "64d4fda1ef4bf8d1d680e201fe7d4e6681a79d635d8b36ad4fb1bf1af611a3ed",
       "candidate_publication_attempted": false,
-      "common_runtime_closure_fingerprint_sha256": "8af3013971a040fce3c7466243695fc08628589b0994cdd4372e1bd168c556bc",
+      "common_runtime_closure_fingerprint_sha256": "c22d3ba772abcea286e2f131bce5e1e6ae650d0bca05c4253ec77b0530734fd2",
       "delivered_path_created": false,
       "ffmpeg_canonical_path": "/nix/store/5iawqc7p20fpg5k04m9srjkwxv3kyh1m-ffmpeg-full-7.1.3-bin/bin/ffmpeg",
       "ffmpeg_executable_sha256": "8bc4cbb02479983b40efe57c014f8041b62f941635364c02c3adc5bf64cd8d53",
       "materialization_identity_digest": "4a1ffe5793244a5f19f19470cf36ec20145b637b3a61c953305d323bddd64cde",
       "measurement_count": 2,
-      "metadata_mutation_closure_fingerprint_sha256": "201dca85c4e273ca56ddf3f974be4ccd61f83937564166d9f9b8f83f283ab23e",
+      "metadata_mutation_closure_fingerprint_sha256": "7860f30990a0e90fd79cad28e7930bb366c364596de2214c6dbaba12eaf63e8d",
       "non_silent_automatic_gain_applied": true,
       "non_silent_commands": [
-        "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/materialized/reference-admitted-source.dsf\",\"-t\",\"w64\",\"-e\",\"floating-point\",\"-b\",\"64\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\",\"gain\",\"-12.000000000\",\"rate\",\"-u\",\"88200\",\"sinc\",\"-a\",\"180\",\"-L\",\"-t\",\"10000\",\"-30000\"],\"cwd\":null,\"description\":\"Render qualified Reference DSD reconstruction\",\"elapsed_nanos\":456839605,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-        "{\"args\":[\"--i\",\"-r\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample rate\",\"elapsed_nanos\":83515376,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-        "{\"args\":[\"--i\",\"-c\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 channel count\",\"elapsed_nanos\":83194146,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-        "{\"args\":[\"--i\",\"-b\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 bit depth\",\"elapsed_nanos\":83240536,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-        "{\"args\":[\"--i\",\"-s\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample count\",\"elapsed_nanos\":114410281,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-        "{\"args\":[\"--i\",\"-e\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample encoding\",\"elapsed_nanos\":114225479,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-        "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\",\"-t\",\"w64\",\"-e\",\"floating-point\",\"-b\",\"64\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\",\"gain\",\"+22.943844673\"],\"cwd\":null,\"description\":\"Apply one qualified Reference terminal realization\",\"elapsed_nanos\":94600132,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-        "{\"args\":[\"--i\",\"-r\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample rate\",\"elapsed_nanos\":93364274,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-        "{\"args\":[\"--i\",\"-c\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM channel count\",\"elapsed_nanos\":82796471,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-        "{\"args\":[\"--i\",\"-b\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM bit depth\",\"elapsed_nanos\":114305893,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-        "{\"args\":[\"--i\",\"-s\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample count\",\"elapsed_nanos\":92713925,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-        "{\"args\":[\"--i\",\"-e\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample encoding\",\"elapsed_nanos\":104052188,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-        "{\"args\":[\"-cpuflags\",\"sse+sse2\",\"-hide_banner\",\"-nostdin\",\"-loglevel\",\"error\",\"-xerror\",\"-i\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\",\"-map\",\"0:a:0\",\"-map_metadata\",\"-1\",\"-vn\",\"-sn\",\"-dn\",\"-f\",\"null\",\"-\"],\"cwd\":null,\"description\":\"Verify complete QPCM Wave64 traversal with FFmpeg\",\"elapsed_nanos\":154180728,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"ffmpeg\"}",
-        "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\",\"-t\",\"raw\",\"-e\",\"floating-point\",\"-b\",\"64\",\"-L\",\"-\"],\"cwd\":null,\"description\":\"Hash QPCM decoded samples: stream exact Float64 W64\",\"elapsed_nanos\":143224999,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-        "{\"args\":[\"-cpuflags\",\"sse+sse2\",\"-hide_banner\",\"-nostdin\",\"-loglevel\",\"error\",\"-f\",\"f64le\",\"-ar\",\"88200\",\"-ac\",\"2\",\"-i\",\"pipe:0\",\"-map\",\"0:a:0\",\"-map_metadata\",\"-1\",\"-vn\",\"-sn\",\"-dn\",\"-c:a\",\"pcm_f64le\",\"-f\",\"hash\",\"-hash\",\"sha256\",\"-\"],\"cwd\":null,\"description\":\"Hash QPCM decoded samples\",\"elapsed_nanos\":196656597,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"ffmpeg\"}"
+        "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/materialized/reference-admitted-source.dsf\",\"-t\",\"w64\",\"-e\",\"floating-point\",\"-b\",\"64\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\",\"gain\",\"-12.000000000\",\"rate\",\"-u\",\"88200\",\"sinc\",\"-a\",\"180\",\"-L\",\"-t\",\"10000\",\"-30000\"],\"cwd\":null,\"description\":\"Render qualified Reference DSD reconstruction\",\"elapsed_nanos\":447217124,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+        "{\"args\":[\"--i\",\"-r\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample rate\",\"elapsed_nanos\":113539699,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+        "{\"args\":[\"--i\",\"-c\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 channel count\",\"elapsed_nanos\":113606221,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+        "{\"args\":[\"--i\",\"-b\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 bit depth\",\"elapsed_nanos\":102923650,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+        "{\"args\":[\"--i\",\"-s\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample count\",\"elapsed_nanos\":94040679,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+        "{\"args\":[\"--i\",\"-e\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample encoding\",\"elapsed_nanos\":63042054,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+        "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\",\"-t\",\"w64\",\"-e\",\"floating-point\",\"-b\",\"64\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\",\"gain\",\"+22.943844673\"],\"cwd\":null,\"description\":\"Apply one qualified Reference terminal realization\",\"elapsed_nanos\":113705081,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+        "{\"args\":[\"--i\",\"-r\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample rate\",\"elapsed_nanos\":114269041,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+        "{\"args\":[\"--i\",\"-c\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM channel count\",\"elapsed_nanos\":114779307,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+        "{\"args\":[\"--i\",\"-b\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM bit depth\",\"elapsed_nanos\":114862985,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+        "{\"args\":[\"--i\",\"-s\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample count\",\"elapsed_nanos\":114224013,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+        "{\"args\":[\"--i\",\"-e\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample encoding\",\"elapsed_nanos\":113092929,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+        "{\"args\":[\"-cpuflags\",\"sse+sse2\",\"-hide_banner\",\"-nostdin\",\"-loglevel\",\"error\",\"-xerror\",\"-i\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\",\"-map\",\"0:a:0\",\"-map_metadata\",\"-1\",\"-vn\",\"-sn\",\"-dn\",\"-f\",\"null\",\"-\"],\"cwd\":null,\"description\":\"Verify complete QPCM Wave64 traversal with FFmpeg\",\"elapsed_nanos\":184279578,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"ffmpeg\"}",
+        "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\",\"-t\",\"raw\",\"-e\",\"floating-point\",\"-b\",\"64\",\"-L\",\"-\"],\"cwd\":null,\"description\":\"Hash QPCM decoded samples: stream exact Float64 W64\",\"elapsed_nanos\":173509074,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+        "{\"args\":[\"-cpuflags\",\"sse+sse2\",\"-hide_banner\",\"-nostdin\",\"-loglevel\",\"error\",\"-f\",\"f64le\",\"-ar\",\"88200\",\"-ac\",\"2\",\"-i\",\"pipe:0\",\"-map\",\"0:a:0\",\"-map_metadata\",\"-1\",\"-vn\",\"-sn\",\"-dn\",\"-c:a\",\"pcm_f64le\",\"-f\",\"hash\",\"-hash\",\"sha256\",\"-\"],\"cwd\":null,\"description\":\"Hash QPCM decoded samples\",\"elapsed_nanos\":226781216,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"ffmpeg\"}"
       ],
       "non_silent_gain_authority_interval": {
         "kind": "finite",
@@ -244,7 +244,7 @@
         "sigma_delta_stereo_tones"
       ],
       "q01_candidate_executes_without_prior_promotion": true,
-      "resolved_command_hash": "5ed44c144a923660b741fa8aa02d5f1bc186679f874ffa485d3d29ed0f46b228",
+      "resolved_command_hash": "677ce1744bb7e6f57573d3be72e718b9addc493702fa3c32002f709dbce77ccf",
       "resource_measurements": {
         "allocation_scope": "test-process allocation events on the current qualification thread during each Q01 execution; child-process and other-thread allocators are intentionally outside this counter",
         "enabled_kernels": {
@@ -264,10 +264,10 @@
         },
         "full_read_scope": "exact protected-R64 plus terminal-QPCM carrier bytes consumed by the two complete certified readers",
         "non_silent": {
-          "command_elapsed_nanos": 2011320630,
+          "command_elapsed_nanos": 2203872651,
           "decode_reconstruction_passes": 1,
           "full_read_bytes": 262416,
-          "host_thread_allocations": 566482,
+          "host_thread_allocations": 566486,
           "process_count": 15,
           "programme": "sigma_delta_stereo_tones",
           "programme_duration_nanos": 92879819,
@@ -275,14 +275,14 @@
           "retained_output_tail_capacity_bytes": 1966080,
           "scratch_bytes": 262416,
           "source_bytes": 65628,
-          "wall_clock_nanos": 2719276623
+          "wall_clock_nanos": 3026977360
         },
         "scratch_scope": "retained regular-file bytes under the per-programme work directory after candidate execution",
         "silent": {
-          "command_elapsed_nanos": 1657369711,
+          "command_elapsed_nanos": 1833417173,
           "decode_reconstruction_passes": 1,
           "full_read_bytes": 262416,
-          "host_thread_allocations": 566362,
+          "host_thread_allocations": 566355,
           "process_count": 15,
           "programme": "exact_silence_0x69",
           "programme_duration_nanos": 92879819,
@@ -290,31 +290,31 @@
           "retained_output_tail_capacity_bytes": 1966080,
           "scratch_bytes": 262416,
           "source_bytes": 65628,
-          "wall_clock_nanos": 2277817546
+          "wall_clock_nanos": 2407171035
         }
       },
       "runtime_dispatch_digest": "911e129d2d5bb4dda82b1a884dc2610c7cf02622e0048200876c58e716dda636",
       "silent_commands": [
-        "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/materialized/reference-admitted-source.dsf\",\"-t\",\"w64\",\"-e\",\"floating-point\",\"-b\",\"64\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\",\"gain\",\"-12.000000000\",\"rate\",\"-u\",\"88200\",\"sinc\",\"-a\",\"180\",\"-L\",\"-t\",\"10000\",\"-30000\"],\"cwd\":null,\"description\":\"Render qualified Reference DSD reconstruction\",\"elapsed_nanos\":427253766,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-        "{\"args\":[\"--i\",\"-r\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample rate\",\"elapsed_nanos\":64466781,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-        "{\"args\":[\"--i\",\"-c\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 channel count\",\"elapsed_nanos\":52363355,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-        "{\"args\":[\"--i\",\"-b\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 bit depth\",\"elapsed_nanos\":62788892,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-        "{\"args\":[\"--i\",\"-s\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample count\",\"elapsed_nanos\":52888514,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-        "{\"args\":[\"--i\",\"-e\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample encoding\",\"elapsed_nanos\":52282713,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-        "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\",\"-t\",\"w64\",\"-e\",\"floating-point\",\"-b\",\"64\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-final.w64\",\"gain\",\"+0.000000000\"],\"cwd\":null,\"description\":\"Apply one qualified Reference terminal realization\",\"elapsed_nanos\":82928934,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-        "{\"args\":[\"--i\",\"-r\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample rate\",\"elapsed_nanos\":53654225,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-        "{\"args\":[\"--i\",\"-c\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM channel count\",\"elapsed_nanos\":52906221,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-        "{\"args\":[\"--i\",\"-b\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM bit depth\",\"elapsed_nanos\":52290465,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-        "{\"args\":[\"--i\",\"-s\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample count\",\"elapsed_nanos\":73034914,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-        "{\"args\":[\"--i\",\"-e\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample encoding\",\"elapsed_nanos\":93821437,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-        "{\"args\":[\"-cpuflags\",\"sse+sse2\",\"-hide_banner\",\"-nostdin\",\"-loglevel\",\"error\",\"-xerror\",\"-i\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-final.w64\",\"-map\",\"0:a:0\",\"-map_metadata\",\"-1\",\"-vn\",\"-sn\",\"-dn\",\"-f\",\"null\",\"-\"],\"cwd\":null,\"description\":\"Verify complete QPCM Wave64 traversal with FFmpeg\",\"elapsed_nanos\":175017921,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"ffmpeg\"}",
-        "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-final.w64\",\"-t\",\"raw\",\"-e\",\"floating-point\",\"-b\",\"64\",\"-L\",\"-\"],\"cwd\":null,\"description\":\"Hash QPCM decoded samples: stream exact Float64 W64\",\"elapsed_nanos\":156495745,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-        "{\"args\":[\"-cpuflags\",\"sse+sse2\",\"-hide_banner\",\"-nostdin\",\"-loglevel\",\"error\",\"-f\",\"f64le\",\"-ar\",\"88200\",\"-ac\",\"2\",\"-i\",\"pipe:0\",\"-map\",\"0:a:0\",\"-map_metadata\",\"-1\",\"-vn\",\"-sn\",\"-dn\",\"-c:a\",\"pcm_f64le\",\"-f\",\"hash\",\"-hash\",\"sha256\",\"-\"],\"cwd\":null,\"description\":\"Hash QPCM decoded samples\",\"elapsed_nanos\":205175828,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"ffmpeg\"}"
+        "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/materialized/reference-admitted-source.dsf\",\"-t\",\"w64\",\"-e\",\"floating-point\",\"-b\",\"64\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\",\"gain\",\"-12.000000000\",\"rate\",\"-u\",\"88200\",\"sinc\",\"-a\",\"180\",\"-L\",\"-t\",\"10000\",\"-30000\"],\"cwd\":null,\"description\":\"Render qualified Reference DSD reconstruction\",\"elapsed_nanos\":405968287,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+        "{\"args\":[\"--i\",\"-r\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample rate\",\"elapsed_nanos\":53438455,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+        "{\"args\":[\"--i\",\"-c\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 channel count\",\"elapsed_nanos\":52393996,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+        "{\"args\":[\"--i\",\"-b\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 bit depth\",\"elapsed_nanos\":62990665,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+        "{\"args\":[\"--i\",\"-s\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample count\",\"elapsed_nanos\":62983042,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+        "{\"args\":[\"--i\",\"-e\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample encoding\",\"elapsed_nanos\":94353136,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+        "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\",\"-t\",\"w64\",\"-e\",\"floating-point\",\"-b\",\"64\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-final.w64\",\"gain\",\"+0.000000000\"],\"cwd\":null,\"description\":\"Apply one qualified Reference terminal realization\",\"elapsed_nanos\":134832331,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+        "{\"args\":[\"--i\",\"-r\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample rate\",\"elapsed_nanos\":62991105,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+        "{\"args\":[\"--i\",\"-c\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM channel count\",\"elapsed_nanos\":112675744,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+        "{\"args\":[\"--i\",\"-b\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM bit depth\",\"elapsed_nanos\":63369532,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+        "{\"args\":[\"--i\",\"-s\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample count\",\"elapsed_nanos\":63303401,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+        "{\"args\":[\"--i\",\"-e\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample encoding\",\"elapsed_nanos\":94580851,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+        "{\"args\":[\"-cpuflags\",\"sse+sse2\",\"-hide_banner\",\"-nostdin\",\"-loglevel\",\"error\",\"-xerror\",\"-i\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-final.w64\",\"-map\",\"0:a:0\",\"-map_metadata\",\"-1\",\"-vn\",\"-sn\",\"-dn\",\"-f\",\"null\",\"-\"],\"cwd\":null,\"description\":\"Verify complete QPCM Wave64 traversal with FFmpeg\",\"elapsed_nanos\":165082077,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"ffmpeg\"}",
+        "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-final.w64\",\"-t\",\"raw\",\"-e\",\"floating-point\",\"-b\",\"64\",\"-L\",\"-\"],\"cwd\":null,\"description\":\"Hash QPCM decoded samples: stream exact Float64 W64\",\"elapsed_nanos\":175464541,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+        "{\"args\":[\"-cpuflags\",\"sse+sse2\",\"-hide_banner\",\"-nostdin\",\"-loglevel\",\"error\",\"-f\",\"f64le\",\"-ar\",\"88200\",\"-ac\",\"2\",\"-i\",\"pipe:0\",\"-map\",\"0:a:0\",\"-map_metadata\",\"-1\",\"-vn\",\"-sn\",\"-dn\",\"-c:a\",\"pcm_f64le\",\"-f\",\"hash\",\"-hash\",\"sha256\",\"-\"],\"cwd\":null,\"description\":\"Hash QPCM decoded samples\",\"elapsed_nanos\":228990010,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"ffmpeg\"}"
       ],
       "silent_programme_verified_silence": true,
       "sox_ng_canonical_path": "/nix/store/4iv8acvx82c201r92136zaf1brfzh1s5-sox_ng-14.8.0.1-custom/bin/sox_ng",
       "sox_ng_executable_sha256": "43d48b78b31c92c4ad758fa15583283ef97a2ad965eaaaa972fc4b24d3b838a0",
-      "staged_artifact": "/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-final.w64",
+      "staged_artifact": "/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-final.w64",
       "status": "passed"
     },
     "Q02": {
@@ -323,9 +323,9 @@
       "metadata_closure_mismatch_rejected": true,
       "metadata_disabled_variant_validated": true,
       "metadata_enabled_variant_validated": true,
-      "metadata_mutation_closure_fingerprint_sha256": "201dca85c4e273ca56ddf3f974be4ccd61f83937564166d9f9b8f83f283ab23e",
+      "metadata_mutation_closure_fingerprint_sha256": "7860f30990a0e90fd79cad28e7930bb366c364596de2214c6dbaba12eaf63e8d",
       "qualification_and_production_share_runtime_fingerprint_source": true,
-      "runtime_closure_fingerprint_sha256": "8af3013971a040fce3c7466243695fc08628589b0994cdd4372e1bd168c556bc",
+      "runtime_closure_fingerprint_sha256": "c22d3ba772abcea286e2f131bce5e1e6ae650d0bca05c4253ec77b0530734fd2",
       "runtime_closure_mismatch_rejected": true,
       "status": "passed",
       "status_only_certification_promotion_rejected": true,
@@ -366,8 +366,8 @@
       "record": {
         "candidate_manifest_sha256": "64d4fda1ef4bf8d1d680e201fe7d4e6681a79d635d8b36ad4fb1bf1af611a3ed",
         "commands": [
-          "{\"args\":[\"-S\",\"/tmp/nix-shell.f1WEOx/.tmpWEtN8R/default-settings-dsd64.dsf\",\"-b\",\"24\",\"-C\",\"8\",\"/tmp/nix-shell.f1WEOx/.tmpWEtN8R/work/.default-settings.tonepoet-final.flac\",\"rate\",\"-u\",\"88200\",\"sinc\",\"-a\",\"180\",\"-25000\"],\"description\":\"Convert DSD to PCM output\",\"environment\":{},\"environment_policy\":\"InheritAndSet\",\"program\":\"sox\"}",
-          "{\"args\":[\"-y\",\"-hide_banner\",\"-nostdin\",\"-i\",\"/tmp/nix-shell.f1WEOx/.tmpWEtN8R/work/.default-settings.tonepoet-final.flac\",\"-i\",\"/tmp/nix-shell.f1WEOx/.tmpWEtN8R/default-settings-dsd64.dsf\",\"-map\",\"0:a:0\",\"-c:a\",\"copy\",\"-map_metadata\",\"1\",\"-map\",\"1:v?\",\"-c:v\",\"png\",\"-disposition:v\",\"attached_pic\",\"/tmp/nix-shell.f1WEOx/.tmpWEtN8R/work/.default-settings.tonepoet-stage-01.flac\"],\"description\":\"Apply metadata and artwork policy; normalize embedded artwork to PNG for FLAC container compatibility\",\"environment\":{},\"environment_policy\":\"InheritAndSet\",\"program\":\"ffmpeg\"}"
+          "{\"args\":[\"-S\",\"/tmp/nix-shell.Q61fJu/.tmpX8q5y7/default-settings-dsd64.dsf\",\"-b\",\"24\",\"-C\",\"8\",\"/tmp/nix-shell.Q61fJu/.tmpX8q5y7/work/.default-settings.tonepoet-final.flac\",\"rate\",\"-u\",\"88200\",\"sinc\",\"-a\",\"180\",\"-25000\"],\"description\":\"Convert DSD to PCM output\",\"environment\":{},\"environment_policy\":\"InheritAndSet\",\"program\":\"sox\"}",
+          "{\"args\":[\"-y\",\"-hide_banner\",\"-nostdin\",\"-i\",\"/tmp/nix-shell.Q61fJu/.tmpX8q5y7/work/.default-settings.tonepoet-final.flac\",\"-i\",\"/tmp/nix-shell.Q61fJu/.tmpX8q5y7/default-settings-dsd64.dsf\",\"-map\",\"0:a:0\",\"-c:a\",\"copy\",\"-map_metadata\",\"1\",\"-map\",\"1:v?\",\"-c:v\",\"png\",\"-disposition:v\",\"attached_pic\",\"/tmp/nix-shell.Q61fJu/.tmpX8q5y7/work/.default-settings.tonepoet-stage-01.flac\"],\"description\":\"Apply metadata and artwork policy; normalize embedded artwork to PNG for FLAC container compatibility\",\"environment\":{},\"environment_policy\":\"InheritAndSet\",\"program\":\"ffmpeg\"}"
         ],
         "gate": "ordinary_workspace_regression",
         "measurements": {
@@ -395,16 +395,16 @@
               "executable_sha256": "43d48b78b31c92c4ad758fa15583283ef97a2ad965eaaaa972fc4b24d3b838a0"
             }
           },
-          "wall_clock_nanos": 474624901
+          "wall_clock_nanos": 476732060
         },
-        "runtime_closure_fingerprint_sha256": "8af3013971a040fce3c7466243695fc08628589b0994cdd4372e1bd168c556bc",
+        "runtime_closure_fingerprint_sha256": "c22d3ba772abcea286e2f131bce5e1e6ae650d0bca05c4253ec77b0530734fd2",
         "schema": "tonepoet-reference-external-release-gate-evidence/v1",
         "status": "passed"
       },
-      "runtime_closure_fingerprint_sha256": "8af3013971a040fce3c7466243695fc08628589b0994cdd4372e1bd168c556bc",
+      "runtime_closure_fingerprint_sha256": "c22d3ba772abcea286e2f131bce5e1e6ae650d0bca05c4253ec77b0530734fd2",
       "schema": "tonepoet-reference-bound-release-gate-evidence/v1",
       "source_path": "/home/daedalus/dev/tonepoet/target/dsd_reference_common_v18_release_gates/ordinary_workspace_regression.json",
-      "source_sha256": "7a20ac4590b51035a767265b0d5c319607465f143b02a1e60e7aa04a7a8b36dc",
+      "source_sha256": "f25d3c709cee6eac613519fbe323c30dd35b61b972d9a37b12a6e39e93b60f7b",
       "status": "passed"
     },
     "package_identity": {
@@ -675,8 +675,8 @@
       "terminal_observed_max_error_by_depth": {
         "float32": 0.0,
         "float64": 0.0,
-        "int16": 0.00004432676360011101,
-        "int24": 1.7043203115463257e-7,
+        "int16": 0.000042079947888851166,
+        "int24": 1.708976924419403e-7,
         "int32": 4.656612873077393e-10
       }
     },
@@ -686,43 +686,43 @@
       "record": {
         "candidate_manifest_sha256": "64d4fda1ef4bf8d1d680e201fe7d4e6681a79d635d8b36ad4fb1bf1af611a3ed",
         "commands": [
-          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/materialized/reference-admitted-source.dsf\",\"-t\",\"w64\",\"-e\",\"floating-point\",\"-b\",\"64\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\",\"gain\",\"-12.000000000\",\"rate\",\"-u\",\"88200\",\"sinc\",\"-a\",\"180\",\"-L\",\"-t\",\"10000\",\"-30000\"],\"cwd\":null,\"description\":\"Render qualified Reference DSD reconstruction\",\"elapsed_nanos\":427253766,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-r\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample rate\",\"elapsed_nanos\":64466781,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-c\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 channel count\",\"elapsed_nanos\":52363355,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-b\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 bit depth\",\"elapsed_nanos\":62788892,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-s\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample count\",\"elapsed_nanos\":52888514,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-e\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample encoding\",\"elapsed_nanos\":52282713,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\",\"-t\",\"w64\",\"-e\",\"floating-point\",\"-b\",\"64\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-final.w64\",\"gain\",\"+0.000000000\"],\"cwd\":null,\"description\":\"Apply one qualified Reference terminal realization\",\"elapsed_nanos\":82928934,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-r\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample rate\",\"elapsed_nanos\":53654225,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-c\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM channel count\",\"elapsed_nanos\":52906221,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-b\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM bit depth\",\"elapsed_nanos\":52290465,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-s\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample count\",\"elapsed_nanos\":73034914,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-e\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample encoding\",\"elapsed_nanos\":93821437,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"-cpuflags\",\"sse+sse2\",\"-hide_banner\",\"-nostdin\",\"-loglevel\",\"error\",\"-xerror\",\"-i\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-final.w64\",\"-map\",\"0:a:0\",\"-map_metadata\",\"-1\",\"-vn\",\"-sn\",\"-dn\",\"-f\",\"null\",\"-\"],\"cwd\":null,\"description\":\"Verify complete QPCM Wave64 traversal with FFmpeg\",\"elapsed_nanos\":175017921,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"ffmpeg\"}",
-          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-final.w64\",\"-t\",\"raw\",\"-e\",\"floating-point\",\"-b\",\"64\",\"-L\",\"-\"],\"cwd\":null,\"description\":\"Hash QPCM decoded samples: stream exact Float64 W64\",\"elapsed_nanos\":156495745,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"-cpuflags\",\"sse+sse2\",\"-hide_banner\",\"-nostdin\",\"-loglevel\",\"error\",\"-f\",\"f64le\",\"-ar\",\"88200\",\"-ac\",\"2\",\"-i\",\"pipe:0\",\"-map\",\"0:a:0\",\"-map_metadata\",\"-1\",\"-vn\",\"-sn\",\"-dn\",\"-c:a\",\"pcm_f64le\",\"-f\",\"hash\",\"-hash\",\"sha256\",\"-\"],\"cwd\":null,\"description\":\"Hash QPCM decoded samples\",\"elapsed_nanos\":205175828,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"ffmpeg\"}",
-          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/materialized/reference-admitted-source.dsf\",\"-t\",\"w64\",\"-e\",\"floating-point\",\"-b\",\"64\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\",\"gain\",\"-12.000000000\",\"rate\",\"-u\",\"88200\",\"sinc\",\"-a\",\"180\",\"-L\",\"-t\",\"10000\",\"-30000\"],\"cwd\":null,\"description\":\"Render qualified Reference DSD reconstruction\",\"elapsed_nanos\":456839605,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-r\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample rate\",\"elapsed_nanos\":83515376,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-c\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 channel count\",\"elapsed_nanos\":83194146,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-b\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 bit depth\",\"elapsed_nanos\":83240536,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-s\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample count\",\"elapsed_nanos\":114410281,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-e\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample encoding\",\"elapsed_nanos\":114225479,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\",\"-t\",\"w64\",\"-e\",\"floating-point\",\"-b\",\"64\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\",\"gain\",\"+22.943844673\"],\"cwd\":null,\"description\":\"Apply one qualified Reference terminal realization\",\"elapsed_nanos\":94600132,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-r\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample rate\",\"elapsed_nanos\":93364274,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-c\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM channel count\",\"elapsed_nanos\":82796471,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-b\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM bit depth\",\"elapsed_nanos\":114305893,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-s\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample count\",\"elapsed_nanos\":92713925,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-e\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample encoding\",\"elapsed_nanos\":104052188,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"-cpuflags\",\"sse+sse2\",\"-hide_banner\",\"-nostdin\",\"-loglevel\",\"error\",\"-xerror\",\"-i\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\",\"-map\",\"0:a:0\",\"-map_metadata\",\"-1\",\"-vn\",\"-sn\",\"-dn\",\"-f\",\"null\",\"-\"],\"cwd\":null,\"description\":\"Verify complete QPCM Wave64 traversal with FFmpeg\",\"elapsed_nanos\":154180728,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"ffmpeg\"}",
-          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\",\"-t\",\"raw\",\"-e\",\"floating-point\",\"-b\",\"64\",\"-L\",\"-\"],\"cwd\":null,\"description\":\"Hash QPCM decoded samples: stream exact Float64 W64\",\"elapsed_nanos\":143224999,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"-cpuflags\",\"sse+sse2\",\"-hide_banner\",\"-nostdin\",\"-loglevel\",\"error\",\"-f\",\"f64le\",\"-ar\",\"88200\",\"-ac\",\"2\",\"-i\",\"pipe:0\",\"-map\",\"0:a:0\",\"-map_metadata\",\"-1\",\"-vn\",\"-sn\",\"-dn\",\"-c:a\",\"pcm_f64le\",\"-f\",\"hash\",\"-hash\",\"sha256\",\"-\"],\"cwd\":null,\"description\":\"Hash QPCM decoded samples\",\"elapsed_nanos\":196656597,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"ffmpeg\"}"
+          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/materialized/reference-admitted-source.dsf\",\"-t\",\"w64\",\"-e\",\"floating-point\",\"-b\",\"64\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\",\"gain\",\"-12.000000000\",\"rate\",\"-u\",\"88200\",\"sinc\",\"-a\",\"180\",\"-L\",\"-t\",\"10000\",\"-30000\"],\"cwd\":null,\"description\":\"Render qualified Reference DSD reconstruction\",\"elapsed_nanos\":405968287,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-r\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample rate\",\"elapsed_nanos\":53438455,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-c\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 channel count\",\"elapsed_nanos\":52393996,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-b\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 bit depth\",\"elapsed_nanos\":62990665,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-s\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample count\",\"elapsed_nanos\":62983042,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-e\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample encoding\",\"elapsed_nanos\":94353136,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\",\"-t\",\"w64\",\"-e\",\"floating-point\",\"-b\",\"64\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-final.w64\",\"gain\",\"+0.000000000\"],\"cwd\":null,\"description\":\"Apply one qualified Reference terminal realization\",\"elapsed_nanos\":134832331,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-r\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample rate\",\"elapsed_nanos\":62991105,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-c\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM channel count\",\"elapsed_nanos\":112675744,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-b\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM bit depth\",\"elapsed_nanos\":63369532,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-s\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample count\",\"elapsed_nanos\":63303401,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-e\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample encoding\",\"elapsed_nanos\":94580851,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"-cpuflags\",\"sse+sse2\",\"-hide_banner\",\"-nostdin\",\"-loglevel\",\"error\",\"-xerror\",\"-i\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-final.w64\",\"-map\",\"0:a:0\",\"-map_metadata\",\"-1\",\"-vn\",\"-sn\",\"-dn\",\"-f\",\"null\",\"-\"],\"cwd\":null,\"description\":\"Verify complete QPCM Wave64 traversal with FFmpeg\",\"elapsed_nanos\":165082077,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"ffmpeg\"}",
+          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-final.w64\",\"-t\",\"raw\",\"-e\",\"floating-point\",\"-b\",\"64\",\"-L\",\"-\"],\"cwd\":null,\"description\":\"Hash QPCM decoded samples: stream exact Float64 W64\",\"elapsed_nanos\":175464541,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"-cpuflags\",\"sse+sse2\",\"-hide_banner\",\"-nostdin\",\"-loglevel\",\"error\",\"-f\",\"f64le\",\"-ar\",\"88200\",\"-ac\",\"2\",\"-i\",\"pipe:0\",\"-map\",\"0:a:0\",\"-map_metadata\",\"-1\",\"-vn\",\"-sn\",\"-dn\",\"-c:a\",\"pcm_f64le\",\"-f\",\"hash\",\"-hash\",\"sha256\",\"-\"],\"cwd\":null,\"description\":\"Hash QPCM decoded samples\",\"elapsed_nanos\":228990010,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"ffmpeg\"}",
+          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/materialized/reference-admitted-source.dsf\",\"-t\",\"w64\",\"-e\",\"floating-point\",\"-b\",\"64\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\",\"gain\",\"-12.000000000\",\"rate\",\"-u\",\"88200\",\"sinc\",\"-a\",\"180\",\"-L\",\"-t\",\"10000\",\"-30000\"],\"cwd\":null,\"description\":\"Render qualified Reference DSD reconstruction\",\"elapsed_nanos\":447217124,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-r\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample rate\",\"elapsed_nanos\":113539699,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-c\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 channel count\",\"elapsed_nanos\":113606221,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-b\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 bit depth\",\"elapsed_nanos\":102923650,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-s\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample count\",\"elapsed_nanos\":94040679,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-e\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample encoding\",\"elapsed_nanos\":63042054,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\",\"-t\",\"w64\",\"-e\",\"floating-point\",\"-b\",\"64\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\",\"gain\",\"+22.943844673\"],\"cwd\":null,\"description\":\"Apply one qualified Reference terminal realization\",\"elapsed_nanos\":113705081,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-r\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample rate\",\"elapsed_nanos\":114269041,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-c\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM channel count\",\"elapsed_nanos\":114779307,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-b\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM bit depth\",\"elapsed_nanos\":114862985,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-s\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample count\",\"elapsed_nanos\":114224013,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-e\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample encoding\",\"elapsed_nanos\":113092929,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"-cpuflags\",\"sse+sse2\",\"-hide_banner\",\"-nostdin\",\"-loglevel\",\"error\",\"-xerror\",\"-i\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\",\"-map\",\"0:a:0\",\"-map_metadata\",\"-1\",\"-vn\",\"-sn\",\"-dn\",\"-f\",\"null\",\"-\"],\"cwd\":null,\"description\":\"Verify complete QPCM Wave64 traversal with FFmpeg\",\"elapsed_nanos\":184279578,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"ffmpeg\"}",
+          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\",\"-t\",\"raw\",\"-e\",\"floating-point\",\"-b\",\"64\",\"-L\",\"-\"],\"cwd\":null,\"description\":\"Hash QPCM decoded samples: stream exact Float64 W64\",\"elapsed_nanos\":173509074,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"-cpuflags\",\"sse+sse2\",\"-hide_banner\",\"-nostdin\",\"-loglevel\",\"error\",\"-f\",\"f64le\",\"-ar\",\"88200\",\"-ac\",\"2\",\"-i\",\"pipe:0\",\"-map\",\"0:a:0\",\"-map_metadata\",\"-1\",\"-vn\",\"-sn\",\"-dn\",\"-c:a\",\"pcm_f64le\",\"-f\",\"hash\",\"-hash\",\"sha256\",\"-\"],\"cwd\":null,\"description\":\"Hash QPCM decoded samples\",\"elapsed_nanos\":226781216,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"ffmpeg\"}"
         ],
         "gate": "paired_performance_resource",
         "measurements": {
           "allocations": {
-            "non_silent": 566482,
+            "non_silent": 566486,
             "scope": "test-process allocation events on the current qualification thread during each Q01 execution; child-process and other-thread allocators are intentionally outside this counter",
-            "silent": 566362
+            "silent": 566355
           },
           "decode_reconstruction_passes": {
             "non_silent": 1,
@@ -771,22 +771,22 @@
           },
           "wall_clock_timing": {
             "existing_qualification_pipeline_timeout_nanos": 3600000000000,
-            "non_silent_command_elapsed_nanos": 2011320630,
+            "non_silent_command_elapsed_nanos": 2203872651,
             "non_silent_programme_duration_nanos": 92879819,
-            "non_silent_wall_clock_nanos": 2719276623,
-            "silent_command_elapsed_nanos": 1657369711,
+            "non_silent_wall_clock_nanos": 3026977360,
+            "silent_command_elapsed_nanos": 1833417173,
             "silent_programme_duration_nanos": 92879819,
-            "silent_wall_clock_nanos": 2277817546
+            "silent_wall_clock_nanos": 2407171035
           }
         },
-        "runtime_closure_fingerprint_sha256": "8af3013971a040fce3c7466243695fc08628589b0994cdd4372e1bd168c556bc",
+        "runtime_closure_fingerprint_sha256": "c22d3ba772abcea286e2f131bce5e1e6ae650d0bca05c4253ec77b0530734fd2",
         "schema": "tonepoet-reference-external-release-gate-evidence/v1",
         "status": "passed"
       },
-      "runtime_closure_fingerprint_sha256": "8af3013971a040fce3c7466243695fc08628589b0994cdd4372e1bd168c556bc",
+      "runtime_closure_fingerprint_sha256": "c22d3ba772abcea286e2f131bce5e1e6ae650d0bca05c4253ec77b0530734fd2",
       "schema": "tonepoet-reference-bound-release-gate-evidence/v1",
       "source_path": "/home/daedalus/dev/tonepoet/target/dsd_reference_common_v18_release_gates/paired_performance_resource.json",
-      "source_sha256": "abbc88908448ee9994f9ba0b16be6c30fcda493be335055d51aebecb5ceea9c3",
+      "source_sha256": "77b512022ef917630fe216f86a9db627dee42e7c367486e45bf9c95d246ff459",
       "status": "passed"
     },
     "post_metadata_identity": {
@@ -825,30 +825,30 @@
       "common_candidate_execution": {
         "candidate_manifest_sha256": "64d4fda1ef4bf8d1d680e201fe7d4e6681a79d635d8b36ad4fb1bf1af611a3ed",
         "candidate_publication_attempted": false,
-        "common_runtime_closure_fingerprint_sha256": "8af3013971a040fce3c7466243695fc08628589b0994cdd4372e1bd168c556bc",
+        "common_runtime_closure_fingerprint_sha256": "c22d3ba772abcea286e2f131bce5e1e6ae650d0bca05c4253ec77b0530734fd2",
         "delivered_path_created": false,
         "ffmpeg_canonical_path": "/nix/store/5iawqc7p20fpg5k04m9srjkwxv3kyh1m-ffmpeg-full-7.1.3-bin/bin/ffmpeg",
         "ffmpeg_executable_sha256": "8bc4cbb02479983b40efe57c014f8041b62f941635364c02c3adc5bf64cd8d53",
         "materialization_identity_digest": "4a1ffe5793244a5f19f19470cf36ec20145b637b3a61c953305d323bddd64cde",
         "measurement_count": 2,
-        "metadata_mutation_closure_fingerprint_sha256": "201dca85c4e273ca56ddf3f974be4ccd61f83937564166d9f9b8f83f283ab23e",
+        "metadata_mutation_closure_fingerprint_sha256": "7860f30990a0e90fd79cad28e7930bb366c364596de2214c6dbaba12eaf63e8d",
         "non_silent_automatic_gain_applied": true,
         "non_silent_commands": [
-          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/materialized/reference-admitted-source.dsf\",\"-t\",\"w64\",\"-e\",\"floating-point\",\"-b\",\"64\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\",\"gain\",\"-12.000000000\",\"rate\",\"-u\",\"88200\",\"sinc\",\"-a\",\"180\",\"-L\",\"-t\",\"10000\",\"-30000\"],\"cwd\":null,\"description\":\"Render qualified Reference DSD reconstruction\",\"elapsed_nanos\":456839605,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-r\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample rate\",\"elapsed_nanos\":83515376,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-c\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 channel count\",\"elapsed_nanos\":83194146,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-b\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 bit depth\",\"elapsed_nanos\":83240536,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-s\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample count\",\"elapsed_nanos\":114410281,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-e\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample encoding\",\"elapsed_nanos\":114225479,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\",\"-t\",\"w64\",\"-e\",\"floating-point\",\"-b\",\"64\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\",\"gain\",\"+22.943844673\"],\"cwd\":null,\"description\":\"Apply one qualified Reference terminal realization\",\"elapsed_nanos\":94600132,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-r\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample rate\",\"elapsed_nanos\":93364274,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-c\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM channel count\",\"elapsed_nanos\":82796471,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-b\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM bit depth\",\"elapsed_nanos\":114305893,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-s\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample count\",\"elapsed_nanos\":92713925,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-e\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample encoding\",\"elapsed_nanos\":104052188,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"-cpuflags\",\"sse+sse2\",\"-hide_banner\",\"-nostdin\",\"-loglevel\",\"error\",\"-xerror\",\"-i\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\",\"-map\",\"0:a:0\",\"-map_metadata\",\"-1\",\"-vn\",\"-sn\",\"-dn\",\"-f\",\"null\",\"-\"],\"cwd\":null,\"description\":\"Verify complete QPCM Wave64 traversal with FFmpeg\",\"elapsed_nanos\":154180728,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"ffmpeg\"}",
-          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\",\"-t\",\"raw\",\"-e\",\"floating-point\",\"-b\",\"64\",\"-L\",\"-\"],\"cwd\":null,\"description\":\"Hash QPCM decoded samples: stream exact Float64 W64\",\"elapsed_nanos\":143224999,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"-cpuflags\",\"sse+sse2\",\"-hide_banner\",\"-nostdin\",\"-loglevel\",\"error\",\"-f\",\"f64le\",\"-ar\",\"88200\",\"-ac\",\"2\",\"-i\",\"pipe:0\",\"-map\",\"0:a:0\",\"-map_metadata\",\"-1\",\"-vn\",\"-sn\",\"-dn\",\"-c:a\",\"pcm_f64le\",\"-f\",\"hash\",\"-hash\",\"sha256\",\"-\"],\"cwd\":null,\"description\":\"Hash QPCM decoded samples\",\"elapsed_nanos\":196656597,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"ffmpeg\"}"
+          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/materialized/reference-admitted-source.dsf\",\"-t\",\"w64\",\"-e\",\"floating-point\",\"-b\",\"64\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\",\"gain\",\"-12.000000000\",\"rate\",\"-u\",\"88200\",\"sinc\",\"-a\",\"180\",\"-L\",\"-t\",\"10000\",\"-30000\"],\"cwd\":null,\"description\":\"Render qualified Reference DSD reconstruction\",\"elapsed_nanos\":447217124,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-r\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample rate\",\"elapsed_nanos\":113539699,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-c\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 channel count\",\"elapsed_nanos\":113606221,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-b\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 bit depth\",\"elapsed_nanos\":102923650,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-s\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample count\",\"elapsed_nanos\":94040679,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-e\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample encoding\",\"elapsed_nanos\":63042054,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-stage-01.w64\",\"-t\",\"w64\",\"-e\",\"floating-point\",\"-b\",\"64\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\",\"gain\",\"+22.943844673\"],\"cwd\":null,\"description\":\"Apply one qualified Reference terminal realization\",\"elapsed_nanos\":113705081,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-r\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample rate\",\"elapsed_nanos\":114269041,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-c\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM channel count\",\"elapsed_nanos\":114779307,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-b\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM bit depth\",\"elapsed_nanos\":114862985,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-s\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample count\",\"elapsed_nanos\":114224013,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-e\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample encoding\",\"elapsed_nanos\":113092929,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"-cpuflags\",\"sse+sse2\",\"-hide_banner\",\"-nostdin\",\"-loglevel\",\"error\",\"-xerror\",\"-i\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\",\"-map\",\"0:a:0\",\"-map_metadata\",\"-1\",\"-vn\",\"-sn\",\"-dn\",\"-f\",\"null\",\"-\"],\"cwd\":null,\"description\":\"Verify complete QPCM Wave64 traversal with FFmpeg\",\"elapsed_nanos\":184279578,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"ffmpeg\"}",
+          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/non-silent/work/.candidate-delivered.tonepoet-final.w64\",\"-t\",\"raw\",\"-e\",\"floating-point\",\"-b\",\"64\",\"-L\",\"-\"],\"cwd\":null,\"description\":\"Hash QPCM decoded samples: stream exact Float64 W64\",\"elapsed_nanos\":173509074,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"-cpuflags\",\"sse+sse2\",\"-hide_banner\",\"-nostdin\",\"-loglevel\",\"error\",\"-f\",\"f64le\",\"-ar\",\"88200\",\"-ac\",\"2\",\"-i\",\"pipe:0\",\"-map\",\"0:a:0\",\"-map_metadata\",\"-1\",\"-vn\",\"-sn\",\"-dn\",\"-c:a\",\"pcm_f64le\",\"-f\",\"hash\",\"-hash\",\"sha256\",\"-\"],\"cwd\":null,\"description\":\"Hash QPCM decoded samples\",\"elapsed_nanos\":226781216,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"ffmpeg\"}"
         ],
         "non_silent_gain_authority_interval": {
           "kind": "finite",
@@ -877,7 +877,7 @@
           "sigma_delta_stereo_tones"
         ],
         "q01_candidate_executes_without_prior_promotion": true,
-        "resolved_command_hash": "5ed44c144a923660b741fa8aa02d5f1bc186679f874ffa485d3d29ed0f46b228",
+        "resolved_command_hash": "677ce1744bb7e6f57573d3be72e718b9addc493702fa3c32002f709dbce77ccf",
         "resource_measurements": {
           "allocation_scope": "test-process allocation events on the current qualification thread during each Q01 execution; child-process and other-thread allocators are intentionally outside this counter",
           "enabled_kernels": {
@@ -897,10 +897,10 @@
           },
           "full_read_scope": "exact protected-R64 plus terminal-QPCM carrier bytes consumed by the two complete certified readers",
           "non_silent": {
-            "command_elapsed_nanos": 2011320630,
+            "command_elapsed_nanos": 2203872651,
             "decode_reconstruction_passes": 1,
             "full_read_bytes": 262416,
-            "host_thread_allocations": 566482,
+            "host_thread_allocations": 566486,
             "process_count": 15,
             "programme": "sigma_delta_stereo_tones",
             "programme_duration_nanos": 92879819,
@@ -908,14 +908,14 @@
             "retained_output_tail_capacity_bytes": 1966080,
             "scratch_bytes": 262416,
             "source_bytes": 65628,
-            "wall_clock_nanos": 2719276623
+            "wall_clock_nanos": 3026977360
           },
           "scratch_scope": "retained regular-file bytes under the per-programme work directory after candidate execution",
           "silent": {
-            "command_elapsed_nanos": 1657369711,
+            "command_elapsed_nanos": 1833417173,
             "decode_reconstruction_passes": 1,
             "full_read_bytes": 262416,
-            "host_thread_allocations": 566362,
+            "host_thread_allocations": 566355,
             "process_count": 15,
             "programme": "exact_silence_0x69",
             "programme_duration_nanos": 92879819,
@@ -923,31 +923,31 @@
             "retained_output_tail_capacity_bytes": 1966080,
             "scratch_bytes": 262416,
             "source_bytes": 65628,
-            "wall_clock_nanos": 2277817546
+            "wall_clock_nanos": 2407171035
           }
         },
         "runtime_dispatch_digest": "911e129d2d5bb4dda82b1a884dc2610c7cf02622e0048200876c58e716dda636",
         "silent_commands": [
-          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/materialized/reference-admitted-source.dsf\",\"-t\",\"w64\",\"-e\",\"floating-point\",\"-b\",\"64\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\",\"gain\",\"-12.000000000\",\"rate\",\"-u\",\"88200\",\"sinc\",\"-a\",\"180\",\"-L\",\"-t\",\"10000\",\"-30000\"],\"cwd\":null,\"description\":\"Render qualified Reference DSD reconstruction\",\"elapsed_nanos\":427253766,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-r\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample rate\",\"elapsed_nanos\":64466781,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-c\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 channel count\",\"elapsed_nanos\":52363355,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-b\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 bit depth\",\"elapsed_nanos\":62788892,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-s\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample count\",\"elapsed_nanos\":52888514,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-e\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample encoding\",\"elapsed_nanos\":52282713,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\",\"-t\",\"w64\",\"-e\",\"floating-point\",\"-b\",\"64\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-final.w64\",\"gain\",\"+0.000000000\"],\"cwd\":null,\"description\":\"Apply one qualified Reference terminal realization\",\"elapsed_nanos\":82928934,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-r\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample rate\",\"elapsed_nanos\":53654225,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-c\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM channel count\",\"elapsed_nanos\":52906221,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-b\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM bit depth\",\"elapsed_nanos\":52290465,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-s\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample count\",\"elapsed_nanos\":73034914,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-e\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample encoding\",\"elapsed_nanos\":93821437,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"-cpuflags\",\"sse+sse2\",\"-hide_banner\",\"-nostdin\",\"-loglevel\",\"error\",\"-xerror\",\"-i\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-final.w64\",\"-map\",\"0:a:0\",\"-map_metadata\",\"-1\",\"-vn\",\"-sn\",\"-dn\",\"-f\",\"null\",\"-\"],\"cwd\":null,\"description\":\"Verify complete QPCM Wave64 traversal with FFmpeg\",\"elapsed_nanos\":175017921,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"ffmpeg\"}",
-          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-final.w64\",\"-t\",\"raw\",\"-e\",\"floating-point\",\"-b\",\"64\",\"-L\",\"-\"],\"cwd\":null,\"description\":\"Hash QPCM decoded samples: stream exact Float64 W64\",\"elapsed_nanos\":156495745,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"-cpuflags\",\"sse+sse2\",\"-hide_banner\",\"-nostdin\",\"-loglevel\",\"error\",\"-f\",\"f64le\",\"-ar\",\"88200\",\"-ac\",\"2\",\"-i\",\"pipe:0\",\"-map\",\"0:a:0\",\"-map_metadata\",\"-1\",\"-vn\",\"-sn\",\"-dn\",\"-c:a\",\"pcm_f64le\",\"-f\",\"hash\",\"-hash\",\"sha256\",\"-\"],\"cwd\":null,\"description\":\"Hash QPCM decoded samples\",\"elapsed_nanos\":205175828,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"ffmpeg\"}"
+          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/materialized/reference-admitted-source.dsf\",\"-t\",\"w64\",\"-e\",\"floating-point\",\"-b\",\"64\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\",\"gain\",\"-12.000000000\",\"rate\",\"-u\",\"88200\",\"sinc\",\"-a\",\"180\",\"-L\",\"-t\",\"10000\",\"-30000\"],\"cwd\":null,\"description\":\"Render qualified Reference DSD reconstruction\",\"elapsed_nanos\":405968287,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-r\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample rate\",\"elapsed_nanos\":53438455,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-c\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 channel count\",\"elapsed_nanos\":52393996,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-b\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 bit depth\",\"elapsed_nanos\":62990665,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-s\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample count\",\"elapsed_nanos\":62983042,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-e\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample encoding\",\"elapsed_nanos\":94353136,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-stage-01.w64\",\"-t\",\"w64\",\"-e\",\"floating-point\",\"-b\",\"64\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-final.w64\",\"gain\",\"+0.000000000\"],\"cwd\":null,\"description\":\"Apply one qualified Reference terminal realization\",\"elapsed_nanos\":134832331,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-r\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample rate\",\"elapsed_nanos\":62991105,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-c\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM channel count\",\"elapsed_nanos\":112675744,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-b\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM bit depth\",\"elapsed_nanos\":63369532,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-s\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample count\",\"elapsed_nanos\":63303401,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-e\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample encoding\",\"elapsed_nanos\":94580851,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"-cpuflags\",\"sse+sse2\",\"-hide_banner\",\"-nostdin\",\"-loglevel\",\"error\",\"-xerror\",\"-i\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-final.w64\",\"-map\",\"0:a:0\",\"-map_metadata\",\"-1\",\"-vn\",\"-sn\",\"-dn\",\"-f\",\"null\",\"-\"],\"cwd\":null,\"description\":\"Verify complete QPCM Wave64 traversal with FFmpeg\",\"elapsed_nanos\":165082077,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"ffmpeg\"}",
+          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-final.w64\",\"-t\",\"raw\",\"-e\",\"floating-point\",\"-b\",\"64\",\"-L\",\"-\"],\"cwd\":null,\"description\":\"Hash QPCM decoded samples: stream exact Float64 W64\",\"elapsed_nanos\":175464541,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"-cpuflags\",\"sse+sse2\",\"-hide_banner\",\"-nostdin\",\"-loglevel\",\"error\",\"-f\",\"f64le\",\"-ar\",\"88200\",\"-ac\",\"2\",\"-i\",\"pipe:0\",\"-map\",\"0:a:0\",\"-map_metadata\",\"-1\",\"-vn\",\"-sn\",\"-dn\",\"-c:a\",\"pcm_f64le\",\"-f\",\"hash\",\"-hash\",\"sha256\",\"-\"],\"cwd\":null,\"description\":\"Hash QPCM decoded samples\",\"elapsed_nanos\":228990010,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"ffmpeg\"}"
         ],
         "silent_programme_verified_silence": true,
         "sox_ng_canonical_path": "/nix/store/4iv8acvx82c201r92136zaf1brfzh1s5-sox_ng-14.8.0.1-custom/bin/sox_ng",
         "sox_ng_executable_sha256": "43d48b78b31c92c4ad758fa15583283ef97a2ad965eaaaa972fc4b24d3b838a0",
-        "staged_artifact": "/tmp/nix-shell.f1WEOx/.tmpMa8CaR/candidate/work/.candidate-delivered.tonepoet-final.w64",
+        "staged_artifact": "/tmp/nix-shell.Q61fJu/.tmpoNjhWN/candidate/work/.candidate-delivered.tonepoet-final.w64",
         "status": "passed"
       },
       "default_general_processing_smoke": {
@@ -955,19 +955,19 @@
         "channels": 2,
         "command_count": 2,
         "command_evidence": [
-          "{\"args\":[\"-S\",\"/tmp/nix-shell.f1WEOx/.tmpWEtN8R/default-settings-dsd64.dsf\",\"-b\",\"24\",\"-C\",\"8\",\"/tmp/nix-shell.f1WEOx/.tmpWEtN8R/work/.default-settings.tonepoet-final.flac\",\"rate\",\"-u\",\"88200\",\"sinc\",\"-a\",\"180\",\"-25000\"],\"description\":\"Convert DSD to PCM output\",\"environment\":{},\"environment_policy\":\"InheritAndSet\",\"program\":\"sox\"}",
-          "{\"args\":[\"-y\",\"-hide_banner\",\"-nostdin\",\"-i\",\"/tmp/nix-shell.f1WEOx/.tmpWEtN8R/work/.default-settings.tonepoet-final.flac\",\"-i\",\"/tmp/nix-shell.f1WEOx/.tmpWEtN8R/default-settings-dsd64.dsf\",\"-map\",\"0:a:0\",\"-c:a\",\"copy\",\"-map_metadata\",\"1\",\"-map\",\"1:v?\",\"-c:v\",\"png\",\"-disposition:v\",\"attached_pic\",\"/tmp/nix-shell.f1WEOx/.tmpWEtN8R/work/.default-settings.tonepoet-stage-01.flac\"],\"description\":\"Apply metadata and artwork policy; normalize embedded artwork to PNG for FLAC container compatibility\",\"environment\":{},\"environment_policy\":\"InheritAndSet\",\"program\":\"ffmpeg\"}"
+          "{\"args\":[\"-S\",\"/tmp/nix-shell.Q61fJu/.tmpX8q5y7/default-settings-dsd64.dsf\",\"-b\",\"24\",\"-C\",\"8\",\"/tmp/nix-shell.Q61fJu/.tmpX8q5y7/work/.default-settings.tonepoet-final.flac\",\"rate\",\"-u\",\"88200\",\"sinc\",\"-a\",\"180\",\"-25000\"],\"description\":\"Convert DSD to PCM output\",\"environment\":{},\"environment_policy\":\"InheritAndSet\",\"program\":\"sox\"}",
+          "{\"args\":[\"-y\",\"-hide_banner\",\"-nostdin\",\"-i\",\"/tmp/nix-shell.Q61fJu/.tmpX8q5y7/work/.default-settings.tonepoet-final.flac\",\"-i\",\"/tmp/nix-shell.Q61fJu/.tmpX8q5y7/default-settings-dsd64.dsf\",\"-map\",\"0:a:0\",\"-c:a\",\"copy\",\"-map_metadata\",\"1\",\"-map\",\"1:v?\",\"-c:v\",\"png\",\"-disposition:v\",\"attached_pic\",\"/tmp/nix-shell.Q61fJu/.tmpX8q5y7/work/.default-settings.tonepoet-stage-01.flac\"],\"description\":\"Apply metadata and artwork policy; normalize embedded artwork to PNG for FLAC container compatibility\",\"environment\":{},\"environment_policy\":\"InheritAndSet\",\"program\":\"ffmpeg\"}"
         ],
         "commands": [
           {
             "args": [
               "-S",
-              "/tmp/nix-shell.f1WEOx/.tmpWEtN8R/default-settings-dsd64.dsf",
+              "/tmp/nix-shell.Q61fJu/.tmpX8q5y7/default-settings-dsd64.dsf",
               "-b",
               "24",
               "-C",
               "8",
-              "/tmp/nix-shell.f1WEOx/.tmpWEtN8R/work/.default-settings.tonepoet-final.flac",
+              "/tmp/nix-shell.Q61fJu/.tmpX8q5y7/work/.default-settings.tonepoet-final.flac",
               "rate",
               "-u",
               "88200",
@@ -985,9 +985,9 @@
               "-hide_banner",
               "-nostdin",
               "-i",
-              "/tmp/nix-shell.f1WEOx/.tmpWEtN8R/work/.default-settings.tonepoet-final.flac",
+              "/tmp/nix-shell.Q61fJu/.tmpX8q5y7/work/.default-settings.tonepoet-final.flac",
               "-i",
-              "/tmp/nix-shell.f1WEOx/.tmpWEtN8R/default-settings-dsd64.dsf",
+              "/tmp/nix-shell.Q61fJu/.tmpX8q5y7/default-settings-dsd64.dsf",
               "-map",
               "0:a:0",
               "-c:a",
@@ -1000,7 +1000,7 @@
               "png",
               "-disposition:v",
               "attached_pic",
-              "/tmp/nix-shell.f1WEOx/.tmpWEtN8R/work/.default-settings.tonepoet-stage-01.flac"
+              "/tmp/nix-shell.Q61fJu/.tmpX8q5y7/work/.default-settings.tonepoet-stage-01.flac"
             ],
             "environment_policy": "inherit_and_set",
             "tool": "ffmpeg"
@@ -1026,7 +1026,7 @@
             "executable_sha256": "43d48b78b31c92c4ad758fa15583283ef97a2ad965eaaaa972fc4b24d3b838a0"
           }
         },
-        "wall_clock_nanos": 474624901
+        "wall_clock_nanos": 476732060
       },
       "dst_independent_oracle": {
         "fixture_corpus_id": "sha256:34345951590102f3095390dba47822cadf6612c6edceefe3a7fcc62f7b310652",
@@ -1053,21 +1053,21 @@
       "historical_dc_root_cause": {
         "candidate_manifest_sha256": "64d4fda1ef4bf8d1d680e201fe7d4e6681a79d635d8b36ad4fb1bf1af611a3ed",
         "commands": [
-          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.f1WEOx/.tmpGwwELy/historical-dc-root-cause/materialized/reference-admitted-source.dsf\",\"-t\",\"w64\",\"-e\",\"floating-point\",\"-b\",\"64\",\"/tmp/nix-shell.f1WEOx/.tmpGwwELy/historical-dc-root-cause/work/.candidate-delivered.tonepoet-stage-01.w64\",\"gain\",\"-12.000000000\",\"rate\",\"-u\",\"88200\",\"sinc\",\"-a\",\"180\",\"-L\",\"-t\",\"10000\",\"-30000\"],\"cwd\":null,\"description\":\"Render qualified Reference DSD reconstruction\",\"elapsed_nanos\":447823331,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-r\",\"/tmp/nix-shell.f1WEOx/.tmpGwwELy/historical-dc-root-cause/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample rate\",\"elapsed_nanos\":124661642,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-c\",\"/tmp/nix-shell.f1WEOx/.tmpGwwELy/historical-dc-root-cause/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 channel count\",\"elapsed_nanos\":94052879,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-b\",\"/tmp/nix-shell.f1WEOx/.tmpGwwELy/historical-dc-root-cause/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 bit depth\",\"elapsed_nanos\":114432603,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-s\",\"/tmp/nix-shell.f1WEOx/.tmpGwwELy/historical-dc-root-cause/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample count\",\"elapsed_nanos\":94355679,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-e\",\"/tmp/nix-shell.f1WEOx/.tmpGwwELy/historical-dc-root-cause/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample encoding\",\"elapsed_nanos\":104186611,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.f1WEOx/.tmpGwwELy/historical-dc-root-cause/work/.candidate-delivered.tonepoet-stage-01.w64\",\"-t\",\"w64\",\"-e\",\"floating-point\",\"-b\",\"64\",\"/tmp/nix-shell.f1WEOx/.tmpGwwELy/historical-dc-root-cause/work/.candidate-delivered.tonepoet-final.w64\",\"gain\",\"+10.052937578\"],\"cwd\":null,\"description\":\"Apply one qualified Reference terminal realization\",\"elapsed_nanos\":114812810,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-r\",\"/tmp/nix-shell.f1WEOx/.tmpGwwELy/historical-dc-root-cause/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample rate\",\"elapsed_nanos\":104114312,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-c\",\"/tmp/nix-shell.f1WEOx/.tmpGwwELy/historical-dc-root-cause/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM channel count\",\"elapsed_nanos\":104497575,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-b\",\"/tmp/nix-shell.f1WEOx/.tmpGwwELy/historical-dc-root-cause/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM bit depth\",\"elapsed_nanos\":72695360,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-s\",\"/tmp/nix-shell.f1WEOx/.tmpGwwELy/historical-dc-root-cause/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample count\",\"elapsed_nanos\":82714165,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"--i\",\"-e\",\"/tmp/nix-shell.f1WEOx/.tmpGwwELy/historical-dc-root-cause/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample encoding\",\"elapsed_nanos\":93032872,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"-cpuflags\",\"sse+sse2\",\"-hide_banner\",\"-nostdin\",\"-loglevel\",\"error\",\"-xerror\",\"-i\",\"/tmp/nix-shell.f1WEOx/.tmpGwwELy/historical-dc-root-cause/work/.candidate-delivered.tonepoet-final.w64\",\"-map\",\"0:a:0\",\"-map_metadata\",\"-1\",\"-vn\",\"-sn\",\"-dn\",\"-f\",\"null\",\"-\"],\"cwd\":null,\"description\":\"Verify complete QPCM Wave64 traversal with FFmpeg\",\"elapsed_nanos\":214975411,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"ffmpeg\"}",
-          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.f1WEOx/.tmpGwwELy/historical-dc-root-cause/work/.candidate-delivered.tonepoet-final.w64\",\"-t\",\"raw\",\"-e\",\"floating-point\",\"-b\",\"64\",\"-L\",\"-\"],\"cwd\":null,\"description\":\"Hash QPCM decoded samples: stream exact Float64 W64\",\"elapsed_nanos\":193742891,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
-          "{\"args\":[\"-cpuflags\",\"sse+sse2\",\"-hide_banner\",\"-nostdin\",\"-loglevel\",\"error\",\"-f\",\"f64le\",\"-ar\",\"88200\",\"-ac\",\"2\",\"-i\",\"pipe:0\",\"-map\",\"0:a:0\",\"-map_metadata\",\"-1\",\"-vn\",\"-sn\",\"-dn\",\"-c:a\",\"pcm_f64le\",\"-f\",\"hash\",\"-hash\",\"sha256\",\"-\"],\"cwd\":null,\"description\":\"Hash QPCM decoded samples\",\"elapsed_nanos\":237437100,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"ffmpeg\"}"
+          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.Q61fJu/.tmpMnopA6/historical-dc-root-cause/materialized/reference-admitted-source.dsf\",\"-t\",\"w64\",\"-e\",\"floating-point\",\"-b\",\"64\",\"/tmp/nix-shell.Q61fJu/.tmpMnopA6/historical-dc-root-cause/work/.candidate-delivered.tonepoet-stage-01.w64\",\"gain\",\"-12.000000000\",\"rate\",\"-u\",\"88200\",\"sinc\",\"-a\",\"180\",\"-L\",\"-t\",\"10000\",\"-30000\"],\"cwd\":null,\"description\":\"Render qualified Reference DSD reconstruction\",\"elapsed_nanos\":445895071,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-r\",\"/tmp/nix-shell.Q61fJu/.tmpMnopA6/historical-dc-root-cause/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample rate\",\"elapsed_nanos\":103764902,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-c\",\"/tmp/nix-shell.Q61fJu/.tmpMnopA6/historical-dc-root-cause/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 channel count\",\"elapsed_nanos\":103997534,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-b\",\"/tmp/nix-shell.Q61fJu/.tmpMnopA6/historical-dc-root-cause/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 bit depth\",\"elapsed_nanos\":114686105,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-s\",\"/tmp/nix-shell.Q61fJu/.tmpMnopA6/historical-dc-root-cause/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample count\",\"elapsed_nanos\":114527363,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-e\",\"/tmp/nix-shell.Q61fJu/.tmpMnopA6/historical-dc-root-cause/work/.candidate-delivered.tonepoet-stage-01.w64\"],\"cwd\":null,\"description\":\"Verify R64 sample encoding\",\"elapsed_nanos\":93845993,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.Q61fJu/.tmpMnopA6/historical-dc-root-cause/work/.candidate-delivered.tonepoet-stage-01.w64\",\"-t\",\"w64\",\"-e\",\"floating-point\",\"-b\",\"64\",\"/tmp/nix-shell.Q61fJu/.tmpMnopA6/historical-dc-root-cause/work/.candidate-delivered.tonepoet-final.w64\",\"gain\",\"+10.052937578\"],\"cwd\":null,\"description\":\"Apply one qualified Reference terminal realization\",\"elapsed_nanos\":103948801,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-r\",\"/tmp/nix-shell.Q61fJu/.tmpMnopA6/historical-dc-root-cause/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample rate\",\"elapsed_nanos\":114391797,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-c\",\"/tmp/nix-shell.Q61fJu/.tmpMnopA6/historical-dc-root-cause/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM channel count\",\"elapsed_nanos\":103857944,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-b\",\"/tmp/nix-shell.Q61fJu/.tmpMnopA6/historical-dc-root-cause/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM bit depth\",\"elapsed_nanos\":93487937,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-s\",\"/tmp/nix-shell.Q61fJu/.tmpMnopA6/historical-dc-root-cause/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample count\",\"elapsed_nanos\":103720814,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"--i\",\"-e\",\"/tmp/nix-shell.Q61fJu/.tmpMnopA6/historical-dc-root-cause/work/.candidate-delivered.tonepoet-final.w64\"],\"cwd\":null,\"description\":\"Verify QPCM sample encoding\",\"elapsed_nanos\":134696254,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"-cpuflags\",\"sse+sse2\",\"-hide_banner\",\"-nostdin\",\"-loglevel\",\"error\",\"-xerror\",\"-i\",\"/tmp/nix-shell.Q61fJu/.tmpMnopA6/historical-dc-root-cause/work/.candidate-delivered.tonepoet-final.w64\",\"-map\",\"0:a:0\",\"-map_metadata\",\"-1\",\"-vn\",\"-sn\",\"-dn\",\"-f\",\"null\",\"-\"],\"cwd\":null,\"description\":\"Verify complete QPCM Wave64 traversal with FFmpeg\",\"elapsed_nanos\":183757454,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"ffmpeg\"}",
+          "{\"args\":[\"-S\",\"-D\",\"/tmp/nix-shell.Q61fJu/.tmpMnopA6/historical-dc-root-cause/work/.candidate-delivered.tonepoet-final.w64\",\"-t\",\"raw\",\"-e\",\"floating-point\",\"-b\",\"64\",\"-L\",\"-\"],\"cwd\":null,\"description\":\"Hash QPCM decoded samples: stream exact Float64 W64\",\"elapsed_nanos\":176491655,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"sox\"}",
+          "{\"args\":[\"-cpuflags\",\"sse+sse2\",\"-hide_banner\",\"-nostdin\",\"-loglevel\",\"error\",\"-f\",\"f64le\",\"-ar\",\"88200\",\"-ac\",\"2\",\"-i\",\"pipe:0\",\"-map\",\"0:a:0\",\"-map_metadata\",\"-1\",\"-vn\",\"-sn\",\"-dn\",\"-c:a\",\"pcm_f64le\",\"-f\",\"hash\",\"-hash\",\"sha256\",\"-\"],\"cwd\":null,\"description\":\"Hash QPCM decoded samples\",\"elapsed_nanos\":224794939,\"environment\":{\"LC_ALL\":\"C\",\"SOXR_USE_SIMD\":\"0\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(0))\",\"program\":\"ffmpeg\"}"
         ],
         "execution_error": null,
         "execution_outcome": "accepted",
@@ -1125,14 +1125,14 @@
           "sanitized_args": [
             "-S",
             "-D",
-            "/tmp/nix-shell.f1WEOx/.tmpGwwELy/historical-dc-root-cause/work/.candidate-delivered.tonepoet-stage-01.w64",
+            "/tmp/nix-shell.Q61fJu/.tmpMnopA6/historical-dc-root-cause/work/.candidate-delivered.tonepoet-stage-01.w64",
             "-t",
             "w64",
             "-e",
             "floating-point",
             "-b",
             "64",
-            "/tmp/nix-shell.f1WEOx/.tmpGwwELy/historical-dc-root-cause/work/.candidate-delivered.tonepoet-final.w64",
+            "/tmp/nix-shell.Q61fJu/.tmpMnopA6/historical-dc-root-cause/work/.candidate-delivered.tonepoet-final.w64",
             "gain",
             "+10.052937578"
           ]
@@ -1385,7 +1385,7 @@
       },
       "runtime_rooting_attestation": {
         "authority": {
-          "common_runtime_closure_fingerprint_sha256": "8af3013971a040fce3c7466243695fc08628589b0994cdd4372e1bd168c556bc",
+          "common_runtime_closure_fingerprint_sha256": "c22d3ba772abcea286e2f131bce5e1e6ae650d0bca05c4253ec77b0530734fd2",
           "executables": {
             "AtomicParsley": {
               "build_provenance_store_path": "/nix/store/d6179ijv53vsnr1zhy1mjyycj7g5qsbm-atomicparsley-20240608.083822.1ed9031",
@@ -1424,11 +1424,11 @@
               "runtime_closure_path": "rkg45gypd5xa4fgxdjwvg292yxi0chm3-wavpack-5.8.1/bin/wvtag"
             }
           },
-          "metadata_mutation_closure_fingerprint_sha256": "201dca85c4e273ca56ddf3f974be4ccd61f83937564166d9f9b8f83f283ab23e",
+          "metadata_mutation_closure_fingerprint_sha256": "7860f30990a0e90fd79cad28e7930bb366c364596de2214c6dbaba12eaf63e8d",
           "root": "/nix/store",
           "schema": "tonepoet-reference-nix-runtime-attestation/v1"
         },
-        "digest": "3d8fbd67d5fac942776119dfa22f4bd594aabbcb127b6b81ce85c085c019565d",
+        "digest": "7cf8e3978c26f3dcacbea383ed923f13e38fdd8376b5cae5d1cad3196ec68486",
         "rooting": "nix-store",
         "schema": "tonepoet-reference-nix-runtime-attestation/v1"
       },
@@ -1444,7 +1444,7 @@
           "materialization_identity_tamper_rejected": true,
           "oracle_dsd_sha256": "4ba636974ba4217e348137a0ff9dda2df3f5ec1d80df03ad71c369a7a4f45ef7",
           "planner_render": "passed",
-          "render_args_sha256": "a09a2aa75bcfc8fb19f6879332754b6e22a6837be60abe3bee65a8116717ffe3",
+          "render_args_sha256": "3db536ad981d0bc2ee0a1edc5bf44033182a14b6ce2708091368aeca73c2aab2",
           "source_rate_hz": 2822400,
           "source_sha256": "e587a853556696324d9388b44ad62bbb1c12c7dc3ae6c71c051d00a77eed580d"
         },
@@ -1457,7 +1457,7 @@
           "materialization_identity_digest": "269124c4ed11d005bef146988872eb64ff6470546cd09381054d3679ad8c1cb0",
           "oracle_dsd_sha256": "f5a8b3f86aad452c166ab3f86a71d8355222f92735458f959328271f9f33765c",
           "planner_render": "passed",
-          "render_args_sha256": "5b68db86a724cf3c98063415d9e41584b2b9da07e7dfd5330a9df7c4bcc7cb7f",
+          "render_args_sha256": "01be23781420f2aef26010d415d00cd4a6af09c03010da360ef7e5fc53ebe6e3",
           "source_rate_hz": 2822400,
           "source_sha256": "02664b239e76dae33ee149363237584d3fecc27f007f40c8d037d4318fce5923"
         },
@@ -1469,7 +1469,7 @@
             "materialization_identity_digest": "96656d0e53dec86f3409ef30361a2c0832efb9e5970f17a4454995cfb6f9ad3a",
             "materialized_sha256": "caefffc4cb47c2b458de9dc329b5a6a38616439dbcb19a7d8b013b8f207828c8",
             "planner_render": "passed",
-            "render_args_sha256": "91d0149189611f0efdc8e0ee635e2b042818bcf18a2380badba862a364bd86a7",
+            "render_args_sha256": "0d789880f51f532dc602fed9a9747dec75af19cc5fb8549f3c046564de9b251a",
             "source_kind": "dsf_uncompressed",
             "source_rate_hz": 2822400,
             "source_sha256": "caefffc4cb47c2b458de9dc329b5a6a38616439dbcb19a7d8b013b8f207828c8"
@@ -1480,7 +1480,7 @@
             "materialization_identity_digest": "624e0f7d3a9f0a10068200a1c6e714ca04db05dbf4b42338748dd7339fec6f88",
             "materialized_sha256": "38b4c0ba63b6219768cd17668c698320181adef348f177b4dd312584b829dca7",
             "planner_render": "passed",
-            "render_args_sha256": "a83cf7eb1f72c0d3c619789e83715b9360634a3d8dac92a20152a04d3a3d2578",
+            "render_args_sha256": "504dc78af7591274857a1df6ce9b79bdf0b9ae64f0e064bd976ce474a3a9e028",
             "source_kind": "dsf_uncompressed",
             "source_rate_hz": 2822400,
             "source_sha256": "38b4c0ba63b6219768cd17668c698320181adef348f177b4dd312584b829dca7"
@@ -1491,7 +1491,7 @@
             "materialization_identity_digest": "961b9ab840580a09cab74c9c31e9b0033d67956a0a0269cda5355798e3f8fb46",
             "materialized_sha256": "adb1f1e68725a28c47938d723d3d81c3fda7599edf856d473bf4a01a5f6c9b9a",
             "planner_render": "passed",
-            "render_args_sha256": "37c2d585c6352ff9d898fd1f417f3c029f6b33b6a674947f12c216f1425589e5",
+            "render_args_sha256": "e7aa8574c91d2f0f74522388954b9cd2c939ca1d3010d311fb4b74b05074eb14",
             "source_kind": "dsf_uncompressed",
             "source_rate_hz": 2822400,
             "source_sha256": "adb1f1e68725a28c47938d723d3d81c3fda7599edf856d473bf4a01a5f6c9b9a"
@@ -1502,7 +1502,7 @@
             "materialization_identity_digest": "c7d573b3452cbe5ad9579b2b949a4152a00050b0968a7b7ed7e4d9163cc3d250",
             "materialized_sha256": "c9835a29325b2b47c36cc453ea137d94a0f48ed4c504f49b6e4503f9fa0b4cf8",
             "planner_render": "passed",
-            "render_args_sha256": "9f9edf994153a517c6dbdf6a3cdd43e250338630037a803000ef50c8867dd7c5",
+            "render_args_sha256": "488909cd37fef47e9f60ebcf2720e59bb46ee69329bcffdd1bce001cfb0463cf",
             "source_kind": "dsf_uncompressed",
             "source_rate_hz": 2822400,
             "source_sha256": "c9835a29325b2b47c36cc453ea137d94a0f48ed4c504f49b6e4503f9fa0b4cf8"
@@ -1513,7 +1513,7 @@
             "materialization_identity_digest": "b8610d7ef18255c0818b155631feb8b90c2cd6586ab8a3629ad7cac00a14d617",
             "materialized_sha256": "783e81acfe39f99f662ea27b2c363f56766409f80782c6a40e6269581ad1ea1f",
             "planner_render": "passed",
-            "render_args_sha256": "9d58129c170f23f8295b0f6a641d85de2062c60bdc050c5fc04e9011ce657153",
+            "render_args_sha256": "11865cd178e4d68a9d9e2bac1c177a095011b46475c958239938084747d17740",
             "source_kind": "dsf_uncompressed",
             "source_rate_hz": 2822400,
             "source_sha256": "783e81acfe39f99f662ea27b2c363f56766409f80782c6a40e6269581ad1ea1f"
@@ -1524,7 +1524,7 @@
             "materialization_identity_digest": "c46a204a9feff33dd6e676e03b64c1118b41b84a8ff2ea12e5237a27665a9782",
             "materialized_sha256": "96a2a45f970b1bd7bc4d95afd04702ef4f4e47f068765f2407a3e79e0c9fdd7a",
             "planner_render": "passed",
-            "render_args_sha256": "1ce27ee2d51c7730350a3d1368e0330dac50be3697f5af8f5329f3504df90c0b",
+            "render_args_sha256": "9e9685ebe3af19071d8d73f068b145133e0c59f7c3bf3272a9c2689ee5cfe501",
             "source_kind": "dsf_uncompressed",
             "source_rate_hz": 2822400,
             "source_sha256": "96a2a45f970b1bd7bc4d95afd04702ef4f4e47f068765f2407a3e79e0c9fdd7a"
@@ -1535,7 +1535,7 @@
             "materialization_identity_digest": "0cade6808cdc9579c442f63ceb68899e399f783148c94ff75a1a02280eb10d70",
             "materialized_sha256": "690f8e09905afef9784c45a3e777a776bf527b632074ecdec080d88d778b961a",
             "planner_render": "passed",
-            "render_args_sha256": "252e11c43a1a9af8d9db1eec544c09be11a94e23741124471b6e9c47149864f0",
+            "render_args_sha256": "fd6dcbe408b56047f569f23b7e8112ba903f7da88ade9b5b5270c64b7b1de4e8",
             "source_kind": "dsf_uncompressed",
             "source_rate_hz": 5644800,
             "source_sha256": "690f8e09905afef9784c45a3e777a776bf527b632074ecdec080d88d778b961a"
@@ -1546,7 +1546,7 @@
             "materialization_identity_digest": "fd3ddd2689f4d873617134cb76eb7c1bd047639325353d779fe45e4179ffd3e4",
             "materialized_sha256": "f33d55b4fa172c8280c2b47b8d37dab21b4e1d06a45d20c56b189d2fe0097b68",
             "planner_render": "passed",
-            "render_args_sha256": "b1826ce35905c79a3c98d815258ab969a080f48fe9768c34e0fe20bf0af8356f",
+            "render_args_sha256": "541c5c9df3b515e5920c0e1da7d2c97e656ce591ef39c30c8ee0e1322827f0d9",
             "source_kind": "dsf_uncompressed",
             "source_rate_hz": 5644800,
             "source_sha256": "f33d55b4fa172c8280c2b47b8d37dab21b4e1d06a45d20c56b189d2fe0097b68"
@@ -1557,7 +1557,7 @@
             "materialization_identity_digest": "53171a951c5bea16bee99f1d385a7656009ee54fa1fcc4b4a156757232a323b6",
             "materialized_sha256": "42f6aea29a93776f505e6bb0e31d64fcfb32b6e764f04e0c0d0da11b4ce41413",
             "planner_render": "passed",
-            "render_args_sha256": "bbdb3f2858a87ae68ea31d3a5f7350ebd720c2abd480a3f1177daf9ad58407da",
+            "render_args_sha256": "17058ddb0cfa3b08500b7be24a8d0fc02ab6d49f11c79f5739c22f255459fa1d",
             "source_kind": "dsf_uncompressed",
             "source_rate_hz": 5644800,
             "source_sha256": "42f6aea29a93776f505e6bb0e31d64fcfb32b6e764f04e0c0d0da11b4ce41413"
@@ -1568,7 +1568,7 @@
             "materialization_identity_digest": "fb6989b5c1efe3e14551859fe0050034008e0094b21f41fe2ff109fba08f6a80",
             "materialized_sha256": "331da13e36de70150b741401187dd91ddd3a16430b347919c0e254c7db5269f0",
             "planner_render": "passed",
-            "render_args_sha256": "5f9a82f1ace629ad15d23c60b6a1d4b066c572b5a21cb56ce0264f9024ce98fb",
+            "render_args_sha256": "6a3e8ca718df893145618de53fbcf2bc7b069902b8003ca97d0b009af30c4a64",
             "source_kind": "dsf_uncompressed",
             "source_rate_hz": 5644800,
             "source_sha256": "331da13e36de70150b741401187dd91ddd3a16430b347919c0e254c7db5269f0"
@@ -1579,7 +1579,7 @@
             "materialization_identity_digest": "3279725706045df9f6b517ef5cb52b84055534b08e6661e841a296a288f43362",
             "materialized_sha256": "5a469d0c4efa9638a31c25d3f182f7db29c38dbb8f4c399bbd41c4a7e2fb0dd2",
             "planner_render": "passed",
-            "render_args_sha256": "7fb75b7e60c50e1edeabc3448276270ed3c979c95697b6c97add78759e2cdd95",
+            "render_args_sha256": "bff4956f8e2c520298d2a733b35f8e8f49f63dd5e9ce8ce6d544db974a4f6358",
             "source_kind": "dsf_uncompressed",
             "source_rate_hz": 5644800,
             "source_sha256": "5a469d0c4efa9638a31c25d3f182f7db29c38dbb8f4c399bbd41c4a7e2fb0dd2"
@@ -1590,7 +1590,7 @@
             "materialization_identity_digest": "9cad9506cd3f5e3ae451f20db51127c09045e45cde66c0f93302f19e0c4098fa",
             "materialized_sha256": "af618c5ea1b1cf6bf90f91f6165641d727c6aaedeb37de8b2258766d29feffaf",
             "planner_render": "passed",
-            "render_args_sha256": "9355258ec5d67e039b3c100dbef04555a702c71eca271c741c34122df3a4ec83",
+            "render_args_sha256": "b3730a08720f85a64a889a41d7c861800ff6ad6f4e414d21d7bafc606df19fbc",
             "source_kind": "dsf_uncompressed",
             "source_rate_hz": 5644800,
             "source_sha256": "af618c5ea1b1cf6bf90f91f6165641d727c6aaedeb37de8b2258766d29feffaf"
@@ -1601,7 +1601,7 @@
             "materialization_identity_digest": "6cef26b7934ff8c77a3185a5ad99036bfd14664a258011cfaf7d6c06baf57194",
             "materialized_sha256": "143b67e3d7e9a43635989a95e1e125e52246dd837ddf2a60c67322fe079551a4",
             "planner_render": "passed",
-            "render_args_sha256": "d5b078d0d98f1ab1a33a13e1899ccc8fbb505a8e99931c591880a12cd917fcc5",
+            "render_args_sha256": "2c55cc3dc2672d822c8ba3b2a63404d51d8c1394bfe6cfa7a902ff924d38e8fc",
             "source_kind": "dsf_uncompressed",
             "source_rate_hz": 11289600,
             "source_sha256": "143b67e3d7e9a43635989a95e1e125e52246dd837ddf2a60c67322fe079551a4"
@@ -1612,7 +1612,7 @@
             "materialization_identity_digest": "8b38591ce05a3656e8151faaf50368e80dca947cecbe7f28daa60f65b7aa7060",
             "materialized_sha256": "11700b3ca6d1e694136ce3e03bd9c9134f13bb1e738019ac6b17a90bde18ef03",
             "planner_render": "passed",
-            "render_args_sha256": "a69cb6afa25f718219fd3755c22af11f5f95e9c2a4aaa1572cfb9d1d702297ce",
+            "render_args_sha256": "937547be1beb3c0211860da49df0a0f86a1f4626fdc9c679eb778ad988ac362c",
             "source_kind": "dsf_uncompressed",
             "source_rate_hz": 11289600,
             "source_sha256": "11700b3ca6d1e694136ce3e03bd9c9134f13bb1e738019ac6b17a90bde18ef03"
@@ -1623,7 +1623,7 @@
             "materialization_identity_digest": "a3b7aee1c685e49a6a78260e484b6843048df73e3fcc05fde2cfdbed04db5a09",
             "materialized_sha256": "62a0ff2b9b259cc95efc86b94ee5fb5c1650f650879f4bc545b7b9e2d97deeba",
             "planner_render": "passed",
-            "render_args_sha256": "bc07d3534e615770e5a0578995101d14e2897c972b989deebda7a8084acf43f2",
+            "render_args_sha256": "4eac3b460adc65c96f5c41b5c98f14e64ad24a5c68c3cad944043857e7493af2",
             "source_kind": "dsf_uncompressed",
             "source_rate_hz": 11289600,
             "source_sha256": "62a0ff2b9b259cc95efc86b94ee5fb5c1650f650879f4bc545b7b9e2d97deeba"
@@ -1634,7 +1634,7 @@
             "materialization_identity_digest": "6ff8258ac095895e95efeddc7c8691c331891947250ee03e6d2e129a3b9fc9aa",
             "materialized_sha256": "adb5b4b08543ae8776c2f16a3014c2b52184a21f3aef329b518cf17a77cb41fd",
             "planner_render": "passed",
-            "render_args_sha256": "e9777b4dbea0d2df87126c08ad9d4168982e84b5508726fa7a8a7b1fa14ffb07",
+            "render_args_sha256": "b132bc5ba8f22054275ae3b8dbba68e63f28e810162a7f68c1f722f115491ceb",
             "source_kind": "dsf_uncompressed",
             "source_rate_hz": 11289600,
             "source_sha256": "adb5b4b08543ae8776c2f16a3014c2b52184a21f3aef329b518cf17a77cb41fd"
@@ -1645,7 +1645,7 @@
             "materialization_identity_digest": "f31482559d9cc62dd70758754408594b8ba3fe90ddda3d9223a44b0919df35e7",
             "materialized_sha256": "7a6ee961565a186c25691b8a5eed9eb7adcb81f2fc7d378cac18f8bad3a7ae80",
             "planner_render": "passed",
-            "render_args_sha256": "0877f07d4e4ce3ede792e35ce609d26172fd40f765c52053e17b738dc7f57f30",
+            "render_args_sha256": "e17c8a900b91bcb13110e6dcad76ef25a7b18daa6c11d5554d724eef6d36a029",
             "source_kind": "dsf_uncompressed",
             "source_rate_hz": 11289600,
             "source_sha256": "7a6ee961565a186c25691b8a5eed9eb7adcb81f2fc7d378cac18f8bad3a7ae80"
@@ -1656,7 +1656,7 @@
             "materialization_identity_digest": "827015f04b8fc2eefce6e7a5c0c05b0eef7f4dac0acac28279624a5a12cdc94f",
             "materialized_sha256": "ceb18124da8ffb9dbee564a795479c42587cc2f5f2ff248cb85600d632a98c80",
             "planner_render": "passed",
-            "render_args_sha256": "0c47e77fbd82d8351f563e48950cc0c1339b348045316d169def7830768d34ea",
+            "render_args_sha256": "1489e2fa3395683850f48c96ae2b6bd8a073aa3a52965aed6ea2896934d18585",
             "source_kind": "dsf_uncompressed",
             "source_rate_hz": 11289600,
             "source_sha256": "ceb18124da8ffb9dbee564a795479c42587cc2f5f2ff248cb85600d632a98c80"
@@ -1667,7 +1667,7 @@
             "materialization_identity_digest": "0919ee4ecf44bb8ef788cf292cd18d57aba2f03cfa63dea428078be315ef410f",
             "materialized_sha256": "6e673f409c0fc6521793c1e2cd44b91563f2a8a115e2395d3480cae2945f3c08",
             "planner_render": "passed",
-            "render_args_sha256": "5a6417ff11d97bfa271902de92b8056875c67fa531baa60a4b5811c1410ed252",
+            "render_args_sha256": "44b34757c883fe45796d99e54c75e9277e5ba41d483f9256cbd307c492c79e0d",
             "source_kind": "dsdiff_uncompressed",
             "source_rate_hz": 2822400,
             "source_sha256": "6e673f409c0fc6521793c1e2cd44b91563f2a8a115e2395d3480cae2945f3c08"
@@ -1678,7 +1678,7 @@
             "materialization_identity_digest": "36bd2c2aa700c705f8c589f260182a7346a560b29e9e703d6b98be552df2a836",
             "materialized_sha256": "1b14f43d69f08bd5ef84bac50646dbdd52df175d5e839bb039f1ada390d43fb0",
             "planner_render": "passed",
-            "render_args_sha256": "a6bd4e674df4b6d084b55a6a380b9b151f2dabbe824a905cf20472340eed9c0d",
+            "render_args_sha256": "956c1b2d1bbfdf27481aec55765d8d8512844f8935b3bccae6778b95892642cc",
             "source_kind": "dsdiff_uncompressed",
             "source_rate_hz": 2822400,
             "source_sha256": "1b14f43d69f08bd5ef84bac50646dbdd52df175d5e839bb039f1ada390d43fb0"
@@ -1689,7 +1689,7 @@
             "materialization_identity_digest": "fcb23be3ad04eb9a05f8dd02d1fad728e52458a3097d9751571aa3f35a3c7b64",
             "materialized_sha256": "30764e1da5d3a0b0f07a5fba321c9332d3bf279290b35880a20777821b425a66",
             "planner_render": "passed",
-            "render_args_sha256": "b589245be0689658cd12d76f411ef6f53ed17975813fe98ac16b55dd2e4fa941",
+            "render_args_sha256": "1bca0beb154cf5651afd8620188e971ba278ed7f4a46d4ad456247f8b5763ee2",
             "source_kind": "dsdiff_uncompressed",
             "source_rate_hz": 2822400,
             "source_sha256": "30764e1da5d3a0b0f07a5fba321c9332d3bf279290b35880a20777821b425a66"
@@ -1700,7 +1700,7 @@
             "materialization_identity_digest": "84bcd51a64cab6b9320a0740dc5ddcbb5af441eb48c0ad5e7805d807d60c42dc",
             "materialized_sha256": "dc42926262f66166dc6855362fc9dd3e9a0648f1aa6c2f210497dbbe9ec6aeec",
             "planner_render": "passed",
-            "render_args_sha256": "bb116fc0bb91644e2819ff0c1e446b7637ea2f821760f56c2be1f8898aa9ae40",
+            "render_args_sha256": "025b3f90465e3e1043d067d254f0e5746b568fd7211c45a7da495ede3caa7fbc",
             "source_kind": "dsdiff_uncompressed",
             "source_rate_hz": 2822400,
             "source_sha256": "dc42926262f66166dc6855362fc9dd3e9a0648f1aa6c2f210497dbbe9ec6aeec"
@@ -1711,7 +1711,7 @@
             "materialization_identity_digest": "c569fa593dfe2d308a28ea79524523c905a939a8d7273e494a7ce5f7110f7840",
             "materialized_sha256": "cf4e04b46659fe06f56b014aaff03bbb52eed77a61425fc31840e661cc5220df",
             "planner_render": "passed",
-            "render_args_sha256": "dd8026c6eda2616cc08a120d968a5b43b66909729288d4fca737d037633c56b6",
+            "render_args_sha256": "573f68d9abb105ff7be4c0182dc56d5a43a334caea172addee9f126caddd8030",
             "source_kind": "dsdiff_uncompressed",
             "source_rate_hz": 2822400,
             "source_sha256": "cf4e04b46659fe06f56b014aaff03bbb52eed77a61425fc31840e661cc5220df"
@@ -1722,7 +1722,7 @@
             "materialization_identity_digest": "cd866bd9196f5689885459cf5c46dfd82fd3b002c2ed29512ea1c932a8fc7e95",
             "materialized_sha256": "004efce6c2c257423d9a41953886974c32c589724a6ea872d6e696c0aea483ef",
             "planner_render": "passed",
-            "render_args_sha256": "823fc4883ea45022410760326fb07e369bed7335a64ae496a972edbdf3d9ee5a",
+            "render_args_sha256": "0150db4686622a25606eb85fb285e8fb907189ec06a2cf478f95be55dc634ea8",
             "source_kind": "dsdiff_uncompressed",
             "source_rate_hz": 2822400,
             "source_sha256": "004efce6c2c257423d9a41953886974c32c589724a6ea872d6e696c0aea483ef"
@@ -1733,7 +1733,7 @@
             "materialization_identity_digest": "286ee0743b17267a8b419e604cfced3d5068b0697f2d93b80311ecb91ce8ebe6",
             "materialized_sha256": "0e2885a777d9f8c804ac838a2c1180e5020d1bd56cc69ac6f434ead430928d01",
             "planner_render": "passed",
-            "render_args_sha256": "9e6a5cacb05fffefa30df302666f4215314913ceb97f7028b318ba4987bf443f",
+            "render_args_sha256": "c3029972799f78dbb290eb6ee15fb192a3a5b284e64bebc9ca124f23f378ce03",
             "source_kind": "dsdiff_uncompressed",
             "source_rate_hz": 5644800,
             "source_sha256": "0e2885a777d9f8c804ac838a2c1180e5020d1bd56cc69ac6f434ead430928d01"
@@ -1744,7 +1744,7 @@
             "materialization_identity_digest": "e84c3e7aa9456a1008684a04b7d40dc43ca9af988f3877038f9501ad3dc3f386",
             "materialized_sha256": "033d71e0650cc4b629a08403fe28b4bce5de19de63150dcf0b62b655b11a8592",
             "planner_render": "passed",
-            "render_args_sha256": "396cda9f8556840a69a6b77939e28b50abed5191b5e16b7fe8cc0c1cf4869e2b",
+            "render_args_sha256": "64e2179f5ff3b21bc0671e6b31c8e65181d293ad5a255ee84e4ec44b21bb5097",
             "source_kind": "dsdiff_uncompressed",
             "source_rate_hz": 5644800,
             "source_sha256": "033d71e0650cc4b629a08403fe28b4bce5de19de63150dcf0b62b655b11a8592"
@@ -1755,7 +1755,7 @@
             "materialization_identity_digest": "84e5e6a259bc66aa45f1c04d9329390a6cfc55963dff259b5f967f480cb85317",
             "materialized_sha256": "034afd3c365370dd3fd007d9267f0336c69d7029785cb68b7a76d91e317d5fca",
             "planner_render": "passed",
-            "render_args_sha256": "ecbe83c9dd2d899f961fc1fb659af3e5c290a28fcd667d9bce6ddd1d477623bb",
+            "render_args_sha256": "bd66fd22fc8d6c1b2ccb0af6a8d7fe2abd406f9d401f4c8b899e81605e95327f",
             "source_kind": "dsdiff_uncompressed",
             "source_rate_hz": 5644800,
             "source_sha256": "034afd3c365370dd3fd007d9267f0336c69d7029785cb68b7a76d91e317d5fca"
@@ -1766,7 +1766,7 @@
             "materialization_identity_digest": "9fd6007c4e9e96b6ce7df176bb5ee6f57d74373fc0f5bc5ccc48feb959e6a040",
             "materialized_sha256": "1e185dcef88e53219eca4e885f3d5815bdc8c43e05047184b3f7272eec2580e0",
             "planner_render": "passed",
-            "render_args_sha256": "4f06d683065f992b689e3a460dde3ba18aed826bf7f05ce91b7de6ecd7dc760b",
+            "render_args_sha256": "3e619a911f6ea3218517766a0b0f08fe325f992a7d7b72a7c79c96371fbb65f1",
             "source_kind": "dsdiff_uncompressed",
             "source_rate_hz": 5644800,
             "source_sha256": "1e185dcef88e53219eca4e885f3d5815bdc8c43e05047184b3f7272eec2580e0"
@@ -1777,7 +1777,7 @@
             "materialization_identity_digest": "6fb0f716b84849c03aac4c07c9228158b080f6f347311fde58203cbff8a1fb0e",
             "materialized_sha256": "ee0430436f7515b4bfc444bfaede039ef5b8afaaaa8eb44349a4c4b45136b3b2",
             "planner_render": "passed",
-            "render_args_sha256": "1961e04a2ca842134115a3ed4bca7e6e5e4780b850f52de7d85a116ddf73b038",
+            "render_args_sha256": "568b2a5a87447245ad79916b74852bcc8b0260be5c70ecc7f9843abdb2cb0231",
             "source_kind": "dsdiff_uncompressed",
             "source_rate_hz": 5644800,
             "source_sha256": "ee0430436f7515b4bfc444bfaede039ef5b8afaaaa8eb44349a4c4b45136b3b2"
@@ -1788,7 +1788,7 @@
             "materialization_identity_digest": "df18467868f500cfd242cad10647b05535f6af8ee4063e63a57cb5df2b3c7d6b",
             "materialized_sha256": "7c44c2efa48e5ba5bf8e0342062066dadd47ae08c16219a82c73869d0f3f1493",
             "planner_render": "passed",
-            "render_args_sha256": "e4faf7847d5acaed7964ec07e4fc089436dacaafcad312483ed0468ef32959ce",
+            "render_args_sha256": "16d4d417113ec53aec7a985843a2b3bfd70b54ffcb9f3ff8840ef82711175eaf",
             "source_kind": "dsdiff_uncompressed",
             "source_rate_hz": 5644800,
             "source_sha256": "7c44c2efa48e5ba5bf8e0342062066dadd47ae08c16219a82c73869d0f3f1493"
@@ -1799,7 +1799,7 @@
             "materialization_identity_digest": "c49a03f10d6fb66f9c59452916f55f0481b931e4f01205805ec71fe55c19dd14",
             "materialized_sha256": "1766047cd063f9fcab79e96cf4bbd0e76d79c5963c4fb9461cd8eadeaf6bd376",
             "planner_render": "passed",
-            "render_args_sha256": "b3dbf1424c807087d27c52decefc0ac898390244568fb0094cb4e691c8a9e749",
+            "render_args_sha256": "0e5a7b493af44764006c10fb4fd0891307f9bc08f02d80afa5fd8e12df8147b3",
             "source_kind": "dsdiff_uncompressed",
             "source_rate_hz": 11289600,
             "source_sha256": "1766047cd063f9fcab79e96cf4bbd0e76d79c5963c4fb9461cd8eadeaf6bd376"
@@ -1810,7 +1810,7 @@
             "materialization_identity_digest": "f70853c7b3d9c512bf40dd7fee43b49352a1fbfcaa8d3c631cd18cd256a09611",
             "materialized_sha256": "f4fff1c7d3ac7121fb48ec64b83ab0ae5414f573b3036f0126f254e7d0aae7d6",
             "planner_render": "passed",
-            "render_args_sha256": "d3208fe0c2e8f6f362240027329617bcdfee9a8d27515061732e804560b6bd4e",
+            "render_args_sha256": "1ebe8a3b9ce96e2bc0e9d11be1c607c35243aa1ac4f49a8a1c712bc20cb5d13d",
             "source_kind": "dsdiff_uncompressed",
             "source_rate_hz": 11289600,
             "source_sha256": "f4fff1c7d3ac7121fb48ec64b83ab0ae5414f573b3036f0126f254e7d0aae7d6"
@@ -1821,7 +1821,7 @@
             "materialization_identity_digest": "f6eab62d2ea71102b6a21cf48e78a97e5483fdff90d6d4f751c5b0f7f8c382e1",
             "materialized_sha256": "da765c8ee8a29b7cae7f77c6906e1a8df9f9e5186a87a0f0647c0f9b2f655c1d",
             "planner_render": "passed",
-            "render_args_sha256": "a5d039ee0b3cf7cf318289481b6f9029fd269bcd111b15e0aa528c54c5f24a34",
+            "render_args_sha256": "915a36ecfc1ab68fafdadcb3db726a8221ded8f992466342d97bc8e6b328ca80",
             "source_kind": "dsdiff_uncompressed",
             "source_rate_hz": 11289600,
             "source_sha256": "da765c8ee8a29b7cae7f77c6906e1a8df9f9e5186a87a0f0647c0f9b2f655c1d"
@@ -1832,7 +1832,7 @@
             "materialization_identity_digest": "c04f7714c4fbc323792fad5f3b5cfba999df664818599cdd46bcc268fd42d34d",
             "materialized_sha256": "bcc98dd2e492e59b2f89d42c6e5909140d516e24a7329c22dcbc15f40af95c47",
             "planner_render": "passed",
-            "render_args_sha256": "bd08535adc81cb571f2fdc70452886afbe267f00afbbcaf51ec4c45df0ae314c",
+            "render_args_sha256": "a77f4975c3a60d2ee336cac26a592d6bd6a5f83fb6018674534c281054e0a501",
             "source_kind": "dsdiff_uncompressed",
             "source_rate_hz": 11289600,
             "source_sha256": "bcc98dd2e492e59b2f89d42c6e5909140d516e24a7329c22dcbc15f40af95c47"
@@ -1843,7 +1843,7 @@
             "materialization_identity_digest": "56105e454e6b3153cdd4666f2c1f81aa4f9379d61cdf5391110321ac8fd38144",
             "materialized_sha256": "25d0b3b091a5db52a5e41452502036c52e5d444ec38d881f9bdbefc95d78af8f",
             "planner_render": "passed",
-            "render_args_sha256": "9c4116faf5d418331fe1974c57693cb193c75111f49e24781ab1ec62af11d4c8",
+            "render_args_sha256": "c8c2cb06ba0fb7cf4c7b3b1c936eb7058a92a3e67fa3bdd0662cdadb0ddd7ca2",
             "source_kind": "dsdiff_uncompressed",
             "source_rate_hz": 11289600,
             "source_sha256": "25d0b3b091a5db52a5e41452502036c52e5d444ec38d881f9bdbefc95d78af8f"
@@ -1854,7 +1854,7 @@
             "materialization_identity_digest": "376e60ec701b5880855f39dc6da8b736e5c5f722f377b593a51ae7ab4d1325d7",
             "materialized_sha256": "8b5948db3cafd7f3e206340647c5de1f01df09b510d752aec9c3ffc05297df0e",
             "planner_render": "passed",
-            "render_args_sha256": "bdcf879cfe199445d9cc6894071ea93ef9d938b8f3c5dc3bf15815029a23c746",
+            "render_args_sha256": "24651c3890f849bb4f4df0c3ba91c1c113d992abfc6a90341f05225e075523df",
             "source_kind": "dsdiff_uncompressed",
             "source_rate_hz": 11289600,
             "source_sha256": "8b5948db3cafd7f3e206340647c5de1f01df09b510d752aec9c3ffc05297df0e"
@@ -1872,7 +1872,7 @@
             "planner_render": "passed",
             "production_iso_content_hash_bound": true,
             "production_toc_selection_revalidated_before_extraction": true,
-            "render_args_sha256": "ff18fa28fd5b62bb3b6df00ed9b010b149d289e5c876db110c526ad407c6d87c",
+            "render_args_sha256": "01b29306aa5698e8d64dc388a40be9225948713e0f2819c61c396473ed20ecc7",
             "source_iso_sha256": "e3f190938eabcd1e6dae9631309e6755cf2be7d086fa0084fe9b3c4b831503c8",
             "status": "passed"
           },
@@ -1887,7 +1887,7 @@
             "planner_render": "passed",
             "production_iso_content_hash_bound": true,
             "production_toc_selection_revalidated_before_extraction": true,
-            "render_args_sha256": "4320323c461e24dfa4c372454e8596c467d57bc7e677af8db0ea2d2fb74d4da1",
+            "render_args_sha256": "d4c73f14f4d2980951a9f8ac4835320c1aa69fba9504c52531b9571b0849fa5f",
             "source_iso_sha256": "c613ca6ce82cc84935773806721ff16688672e241c8ecefc131023c70c94366e",
             "status": "passed"
           },
@@ -1902,7 +1902,7 @@
             "planner_render": "passed",
             "production_iso_content_hash_bound": true,
             "production_toc_selection_revalidated_before_extraction": true,
-            "render_args_sha256": "052facef130f2f3c403f6c886af8b431881ee190a3484f8c72c560489170a4ba",
+            "render_args_sha256": "06aa693bf14ad6b17d98fba2e86dd23c1313736bbbc1146a217d9c37bba729db",
             "source_iso_sha256": "4d70fd65f7036cda32d0cf0c1b9907ce16fd5c664bf343234981e83fe31b19bf",
             "status": "passed"
           },
@@ -1917,7 +1917,7 @@
             "planner_render": "passed",
             "production_iso_content_hash_bound": true,
             "production_toc_selection_revalidated_before_extraction": true,
-            "render_args_sha256": "4f39f28bcb30ea5ea996f6ed6e53a610fbfac24c6b3af35c1941defd114f7a3e",
+            "render_args_sha256": "ebb3486072a04d9dfbd287e14a46755379c9e1bba992e924a5c2e86cc20d3208",
             "source_iso_sha256": "8a0305f14e7b66589c24e673f47cc42cac0d119095bf4befbc4621c2098bb005",
             "status": "passed"
           },
@@ -1935,7 +1935,7 @@
                 "deferred_placeholder_absent": true,
                 "initial_plan_ready": true,
                 "materialized_sha256": "156f5e7fee464e11880dcf366e1f5a007b1111ee10f5be648c8c0286af565f0a",
-                "render_args_sha256": "df0d24ba56ddf2709300d941f7e7b5d7b81c5e659ac8801da9c253f8dc84c0c0",
+                "render_args_sha256": "27193dea562175e02358f166b3703c609ccde0166f2cc964bbad43826e80b037",
                 "replan_ready": true,
                 "toc_duration_ns": 13333333,
                 "track_index_zero_based": 0
@@ -1945,7 +1945,7 @@
                 "deferred_placeholder_absent": true,
                 "initial_plan_ready": true,
                 "materialized_sha256": "19c0f1310622061f5be71ad3478a142bec08a2c9771b86c8af935f6984036f1c",
-                "render_args_sha256": "61e4f892e922f8e3ff489da26409cc4d17957036b53a6f242e50faa7521dbc32",
+                "render_args_sha256": "d1a63a164605b842ec4dc5d521491d92c287e87d8fa39d2c14fe0720c8f72e2d",
                 "replan_ready": true,
                 "toc_duration_ns": 13333333,
                 "track_index_zero_based": 1
@@ -1966,7 +1966,7 @@
                 "deferred_placeholder_absent": true,
                 "initial_plan_ready": true,
                 "materialized_sha256": "11f6a3c01d9b095544c9befe0f325d0d185da1033321ac2278a6b7045565790c",
-                "render_args_sha256": "e113af846d44a8bfe6464624e6810951225ff05031b3dbbef3e2617a7c1e355d",
+                "render_args_sha256": "b88808140681d516c5885c806d1109bbc7230178895575a390aa9c9bdc0d42a3",
                 "replan_ready": true,
                 "toc_duration_ns": 13333333,
                 "track_index_zero_based": 0
@@ -1976,7 +1976,7 @@
                 "deferred_placeholder_absent": true,
                 "initial_plan_ready": true,
                 "materialized_sha256": "074d25b9eae04ea3a2924c33c5b5b332bb76e2da01b0750fedfd7e3e2db4bc4d",
-                "render_args_sha256": "26a7b38e22419af757a3d561510ba0125aec6a6797d4a9c1d78e3d4af75b64a5",
+                "render_args_sha256": "12656a003c98e00fae7dcad2cecac95f0a557087838fbf24c0742ddba0b96f41",
                 "replan_ready": true,
                 "toc_duration_ns": 13333333,
                 "track_index_zero_based": 1
@@ -1994,7 +1994,7 @@
             "planner_render": "passed",
             "production_iso_content_hash_bound": true,
             "production_toc_selection_revalidated_before_extraction": true,
-            "render_args_sha256": "cd7f56a1261bea0992f83a453b3e33b02b3fe6512b17b070b41fa0f4b93647e9",
+            "render_args_sha256": "90f4ddf1abff1b1898ceca32f9d371c78da7252896df15fee669c1b332b2694f",
             "source_iso_sha256": "d7426a39d48e02011042d237fd7c0ce6805b89ae85c1a7f506cfeb3ec3cfc245",
             "status": "passed"
           },
@@ -2009,7 +2009,7 @@
             "planner_render": "passed",
             "production_iso_content_hash_bound": true,
             "production_toc_selection_revalidated_before_extraction": true,
-            "render_args_sha256": "bc8fbe7d49964c7016222d221ad9d017fdefd66903eb50cbd1cde5aa613286c2",
+            "render_args_sha256": "bed496e32823dd9b2b155a97d5275e66f3385c414b1979896d64809758827cd5",
             "source_iso_sha256": "dbba8351a680be2531bf47f99c3ac37c9648b8bf58771755f4dea5b71148ccaf",
             "status": "passed"
           }
@@ -2036,8 +2036,8 @@
       "record": {
         "candidate_manifest_sha256": "64d4fda1ef4bf8d1d680e201fe7d4e6681a79d635d8b36ad4fb1bf1af611a3ed",
         "commands": [
-          "{\"args\":[\"-nostdin\",\"-hide_banner\",\"-loglevel\",\"error\",\"-f\",\"lavfi\",\"-i\",\"anullsrc=r=48000:cl=stereo\",\"-f\",\"null\",\"-\"],\"cwd\":null,\"description\":null,\"elapsed_nanos\":651155692,\"environment\":{\"LC_ALL\":\"C\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(123))\",\"program\":\"ffmpeg\"}",
-          "{\"args\":[\"-nostdin\",\"-hide_banner\",\"-loglevel\",\"error\",\"-f\",\"lavfi\",\"-i\",\"anullsrc=r=48000:cl=stereo\",\"-f\",\"null\",\"-\"],\"cwd\":null,\"description\":null,\"elapsed_nanos\":1105341234,\"environment\":{\"LC_ALL\":\"C\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(123))\",\"program\":\"ffmpeg\"}"
+          "{\"args\":[\"-nostdin\",\"-hide_banner\",\"-loglevel\",\"error\",\"-f\",\"lavfi\",\"-i\",\"anullsrc=r=48000:cl=stereo\",\"-f\",\"null\",\"-\"],\"cwd\":null,\"description\":null,\"elapsed_nanos\":618852792,\"environment\":{\"LC_ALL\":\"C\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(123))\",\"program\":\"ffmpeg\"}",
+          "{\"args\":[\"-nostdin\",\"-hide_banner\",\"-loglevel\",\"error\",\"-f\",\"lavfi\",\"-i\",\"anullsrc=r=48000:cl=stereo\",\"-f\",\"null\",\"-\"],\"cwd\":null,\"description\":null,\"elapsed_nanos\":1103285757,\"environment\":{\"LC_ALL\":\"C\"},\"environment_policy\":\"ClearAndSet\",\"exit\":\"Some(Code(123))\",\"program\":\"ffmpeg\"}"
         ],
         "gate": "timeout_cancellation_resource",
         "measurements": {
@@ -2048,8 +2048,8 @@
             "reaped": true,
             "retained_stderr_bytes": 42,
             "retained_stdout_bytes": 0,
-            "runner_elapsed_nanos": 1105341234,
-            "wall_clock_nanos": 1105867073
+            "runner_elapsed_nanos": 1103285757,
+            "wall_clock_nanos": 1103769843
           },
           "definition": "the production RealToolRunner terminates and reaps the pinned qualified tool on both its command deadline and caller cancellation while retaining bounded output tails",
           "ffmpeg_canonical_path": "/nix/store/5iawqc7p20fpg5k04m9srjkwxv3kyh1m-ffmpeg-full-7.1.3-bin/bin/ffmpeg",
@@ -2064,18 +2064,18 @@
             "reaped": true,
             "retained_stderr_bytes": 42,
             "retained_stdout_bytes": 0,
-            "runner_elapsed_nanos": 651155692,
-            "wall_clock_nanos": 651513967
+            "runner_elapsed_nanos": 618852792,
+            "wall_clock_nanos": 619223445
           }
         },
-        "runtime_closure_fingerprint_sha256": "8af3013971a040fce3c7466243695fc08628589b0994cdd4372e1bd168c556bc",
+        "runtime_closure_fingerprint_sha256": "c22d3ba772abcea286e2f131bce5e1e6ae650d0bca05c4253ec77b0530734fd2",
         "schema": "tonepoet-reference-external-release-gate-evidence/v1",
         "status": "passed"
       },
-      "runtime_closure_fingerprint_sha256": "8af3013971a040fce3c7466243695fc08628589b0994cdd4372e1bd168c556bc",
+      "runtime_closure_fingerprint_sha256": "c22d3ba772abcea286e2f131bce5e1e6ae650d0bca05c4253ec77b0530734fd2",
       "schema": "tonepoet-reference-bound-release-gate-evidence/v1",
       "source_path": "/home/daedalus/dev/tonepoet/target/dsd_reference_common_v18_release_gates/timeout_cancellation_resource.json",
-      "source_sha256": "c7177e4684ed5266aadcdf9fa44d1ecee5a89878c436122fff6c736337a2e043",
+      "source_sha256": "19de48ec722ba3f6b0e726e956303664fbc8bb2620238c1ad4aa031a4bdbb4a4",
       "status": "passed"
     },
     "wave64_integrity_300_cell": {
@@ -10842,7 +10842,7 @@
       "writer_trigger_classification": "encoded_all_zero_after_depth_and_effects_quantization; input_threshold_is_cell_specific_and_empirically_bounded"
     }
   },
-  "runtime_closure_fingerprint_sha256": "8af3013971a040fce3c7466243695fc08628589b0994cdd4372e1bd168c556bc",
+  "runtime_closure_fingerprint_sha256": "c22d3ba772abcea286e2f131bce5e1e6ae650d0bca05c4253ec77b0530734fd2",
   "schema": "tonepoet-reference-common-v18-evidence/v1",
   "status": "passed"
 }

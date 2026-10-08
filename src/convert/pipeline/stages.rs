@@ -23,9 +23,10 @@ use tokio_util::sync::CancellationToken;
 use super::execution_evidence::{
     append_prior_attempt_bounded, completed_registered_effects_from_plan,
     discarded_attempt_evidence_from_invocations, record_native_scalar_materialization,
-    render_discarded_attempt_processing, render_track_artifact_work, render_track_processing,
-    render_track_verifications, summarize_prior_attempt, DecisionAuthority, DecisionRecord, EvidenceValue,
-    ObservationRecord, OperationRecord,
+    render_discarded_attempt_processing, render_operation_with_context, render_track_artifact_work,
+    render_track_processing, render_track_verifications, summarize_prior_attempt, DecisionAuthority,
+    DecisionRecord, EvidenceValue, ExecutionBackend, ObservationRecord, OperationParameter,
+    OperationRecord,
     SizeDomain, SizeEvidence, TrackExecutionEvidence, VerificationRecord, VerificationStatus,
 };
 use super::errors::{
@@ -92,6 +93,7 @@ use super::track_executor::{
     run_tool_command_with_concurrency,
     verify_reference_metadata_toolchain_before_mutation, verify_reference_output_after_metadata,
     CertifiedTruePeakTerminalExecutionState, CueStreamDirectTrackPlan, ReferenceToolchainEvidence,
+    ReferenceExecutionEvidence,
 };
 pub use super::track_executor::ToolConcurrencyLimits;
 use super::plan_bridge::{
@@ -4859,6 +4861,10 @@ async fn convert_one_track_work(
     let staged_path = staged_audio_path(&convert_root, &final_path, &track.id, &req.settings.target_format);
     let mut preparation_commands = Vec::new();
     let mut preparation_evidence = TrackExecutionEvidence::default();
+    // A retained SACD-derived carrier is already proof that extraction completed
+    // before this conversion attempt begins. Capture that fact before any further
+    // preparation can fail so failure evidence cannot lose prior completed work.
+    record_completed_sacd_extraction_for_retained_input(&mut preparation_evidence, &track);
     let track = match prepare_track_scoped_certified_true_peak_carrier(
         &req,
         track.clone(),
@@ -4875,12 +4881,13 @@ async fn convert_one_track_work(
     {
         Ok(track) => track,
         Err(err) => {
-            let record = failed_track_record(
+            let record = failed_track_record_with_execution_evidence(
                 &track,
                 None,
                 Some(staged_path),
                 preparation_commands,
                 err,
+                discarded_preparation_evidence(&preparation_evidence),
             );
             return Ok(ScheduledTrackOutput {
                 index: track_index,
@@ -4905,14 +4912,22 @@ async fn convert_one_track_work(
     ))
     .await
     {
-        Ok(realized) => realized,
+        Ok(realized) => {
+            record_completed_sacd_extraction_after_realization(
+                &mut preparation_evidence,
+                &track,
+                &req,
+            );
+            realized
+        }
         Err(err) => {
-            let record = failed_track_record(
+            let record = failed_track_record_with_execution_evidence(
                 &track,
                 None,
                 Some(staged_path),
                 preparation_commands,
                 err.to_string(),
+                discarded_preparation_evidence(&preparation_evidence),
             );
             return Ok(ScheduledTrackOutput { index: track_index, record, artifact: None, ok: false, metadata_satisfaction: PlannedMetadataSatisfaction::none() });
         }
@@ -4930,12 +4945,13 @@ async fn convert_one_track_work(
     {
         Ok(realized) => realized,
         Err(err) => {
-            let record = failed_track_record(
+            let record = failed_track_record_with_execution_evidence(
                 &track,
                 None,
                 Some(staged_path),
                 preparation_commands,
                 err.to_string(),
+                discarded_preparation_evidence(&preparation_evidence),
             );
             return Ok(ScheduledTrackOutput {
                 index: track_index,
@@ -4962,12 +4978,13 @@ async fn convert_one_track_work(
         Err((error, commands)) => {
             let mut all_commands = preparation_commands;
             all_commands.extend(commands);
-            let record = failed_track_record(
+            let record = failed_track_record_with_execution_evidence(
                 &track,
                 None,
                 Some(staged_path),
                 all_commands,
                 error,
+                discarded_preparation_evidence(&preparation_evidence),
             );
             return Ok(ScheduledTrackOutput {
                 index: track_index,
@@ -4993,12 +5010,13 @@ async fn convert_one_track_work(
 
     if let Some(parent) = staged_path.parent() {
         if let Err(err) = fs::create_dir_all(parent) {
-            let record = failed_track_record(
+            let record = failed_track_record_with_execution_evidence(
                 &track,
                 Some(realized_input),
                 Some(staged_path),
                 prefix_commands,
                 format!("could not create output directory: {err}"),
+                discarded_preparation_evidence(&preparation_evidence),
             );
             return Ok(ScheduledTrackOutput { index: track_index, record, artifact: None, ok: false, metadata_satisfaction: PlannedMetadataSatisfaction::none() });
         }
@@ -5027,6 +5045,11 @@ async fn convert_one_track_work(
         Ok(executed) => {
             let mut completed_execution_evidence = preparation_evidence.clone();
             completed_execution_evidence.append(executed.execution_evidence.clone(), prefix_commands.len());
+            record_completed_sacd_extraction(
+                &mut completed_execution_evidence,
+                &track,
+                executed.reference.as_ref(),
+            );
             if let Some(materialized_scalar) = materialized_scalar.as_ref() {
                 record_native_scalar_materialization(&mut completed_execution_evidence, materialized_scalar);
             }
@@ -16553,7 +16576,7 @@ fn build_conversion_log_at_with_runner_and_timing(
     generated_at: chrono::DateTime<chrono::Utc>,
     runner: Option<&dyn ToolRunner>,
     album_gain_scope_disclosure: Option<&DsdAlbumGainScopeDisclosure>,
-    dsd_true_peak_timings: Option<&BTreeMap<TrackId, DsdAlbumGainTiming>>,
+    _dsd_true_peak_timings: Option<&BTreeMap<TrackId, DsdAlbumGainTiming>>,
     run_timing: Option<&ConversionRunTiming>,
 ) -> String {
     let tracks = collect_outcome_tracks(outcome);
@@ -16604,25 +16627,48 @@ fn build_conversion_log_at_with_runner_and_timing(
     append_artwork_section(&mut artwork_section, source, req, outcome, artifacts);
 
     // Performed processing is rendered exclusively from execution evidence.
-
-    let mut track_sections = Vec::with_capacity(tracks.len());
-    for record in &tracks {
-        let mut section = String::new();
-        append_track_log(
-            &mut section,
-            record,
-            source_tracks_by_ordinal
+    // Build the same structured track projection used by fragment assembly so
+    // album-vs-track scoping cannot drift between the two log paths.
+    let structured_tracks = tracks
+        .iter()
+        .map(|record| {
+            let prepared = source_tracks_by_ordinal
                 .get(&record.track_id.source_ordinal)
-                .copied(),
-            Some(source),
-            artifacts_by_track_id.get(&record.track_id).copied(),
-            req,
-            metadata_stage_result,
-            album_gain_scope_disclosure,
-            dsd_true_peak_timings,
-        );
-        track_sections.push(section);
-    }
+                .copied();
+            let artifact = artifacts_by_track_id.get(&record.track_id).copied();
+            (
+                structured_conversion_log_track_fragment(
+                    record,
+                    prepared,
+                    Some(source),
+                    artifact,
+                    req,
+                    metadata_stage_result,
+                    album_gain_scope_disclosure,
+                ),
+                ConversionLogTrackSummary::from_track_record_with_context(
+                    record, source, prepared, artifact,
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    let structured_refs = structured_tracks
+        .iter()
+        .map(|(fragment, summary)| (fragment, summary))
+        .collect::<Vec<_>>();
+    let complete_album = structured_tracks.len() == total_track_count;
+    let album_presentation =
+        build_conversion_log_album_presentation(&structured_refs, complete_album);
+    let track_sections = structured_tracks
+        .iter()
+        .map(|(fragment, summary)| {
+            render_structured_conversion_log_track_fragment(
+                fragment,
+                summary,
+                &album_presentation,
+            )
+        })
+        .collect();
 
     render_conversion_log(&ConversionLogRenderInput {
         generated_at,
@@ -16640,6 +16686,7 @@ fn build_conversion_log_at_with_runner_and_timing(
         source_blocking_lines,
         provenance_section,
         artwork_section,
+        album_processing_section: album_presentation.section,
         track_sections,
         total_summary: ConversionLogTotalSummary {
             successful_count,
@@ -16677,6 +16724,7 @@ struct ConversionLogRenderInput {
     source_blocking_lines: String,
     provenance_section: String,
     artwork_section: String,
+    album_processing_section: String,
     track_sections: Vec<String>,
     total_summary: ConversionLogTotalSummary,
     batch_status: Option<String>,
@@ -16730,6 +16778,7 @@ fn render_conversion_log(input: &ConversionLogRenderInput) -> String {
 
     log.push_str(&input.provenance_section);
     log.push_str(&input.artwork_section);
+    log.push_str(&input.album_processing_section);
 
     log.push_str("Per-Track Results\n");
     log.push_str("-----------------\n");
@@ -16896,6 +16945,15 @@ struct ConversionLogTrackFragment {
     execution_evidence: TrackExecutionEvidence,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     dsd_dst_stats: Option<DsdDstPipelineStats>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ConversionLogAlbumPresentation {
+    section: String,
+    suppressed_operation_kinds: BTreeSet<String>,
+    reference_terminal_static_promoted: bool,
+    suppress_album_gain_scope: bool,
+    suppress_album_gain_decision: bool,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -17394,6 +17452,7 @@ fn structured_conversion_log_track_fragment(
 fn render_structured_conversion_log_track_fragment(
     fragment: &ConversionLogTrackFragment,
     summary: &ConversionLogTrackSummary,
+    album_presentation: &ConversionLogAlbumPresentation,
 ) -> String {
     // Older on-disk fragments may contain only the legacy rendered section.
     // New fragments never populate it, so there is no competing authority for
@@ -17419,8 +17478,12 @@ fn render_structured_conversion_log_track_fragment(
             }
         }
     }
-    push_optional_kv_line(&mut log, "  Album gain scope", fragment.shared_decision_scope.as_deref());
-    push_optional_kv_line(&mut log, "  Album gain decision", fragment.album_gain_decision.as_deref());
+    if !album_presentation.suppress_album_gain_scope {
+        push_optional_kv_line(&mut log, "  Album gain scope", fragment.shared_decision_scope.as_deref());
+    }
+    if !album_presentation.suppress_album_gain_decision {
+        push_optional_kv_line(&mut log, "  Album gain decision", fragment.album_gain_decision.as_deref());
+    }
     push_optional_kv_line(&mut log, "  Artist", fragment.artist.as_deref());
     push_optional_kv_line(&mut log, "  Composer", fragment.composer.as_deref());
     push_optional_kv_line(&mut log, "  Source", fragment.source_path.as_deref());
@@ -17430,10 +17493,14 @@ fn render_structured_conversion_log_track_fragment(
     }
     push_optional_kv_line(&mut log, "  Output target", fragment.output_target.as_deref());
 
+    let scoped_evidence = execution_evidence_for_album_scope(
+        &fragment.execution_evidence,
+        album_presentation,
+    );
     let processing = if summary.outcome == ConversionLogTrackOutcome::Success {
-        render_track_processing(&fragment.execution_evidence)
+        render_track_processing(&scoped_evidence)
     } else {
-        render_discarded_attempt_processing(&fragment.execution_evidence)
+        render_discarded_attempt_processing(&scoped_evidence)
     };
     if !processing.is_empty() {
         log.push_str(if summary.outcome == ConversionLogTrackOutcome::Success {
@@ -17446,7 +17513,9 @@ fn render_structured_conversion_log_track_fragment(
             log.push_str(&escape_log_value(&line));
             log.push('\n');
         }
-    } else if summary.outcome == ConversionLogTrackOutcome::Success {
+    } else if summary.outcome == ConversionLogTrackOutcome::Success
+        && render_track_processing(&fragment.execution_evidence).is_empty()
+    {
         log.push_str("  Processing: no completed delivered-audio operations recorded\n");
     }
     if summary.outcome == ConversionLogTrackOutcome::Success {
@@ -17488,6 +17557,323 @@ fn render_structured_conversion_log_track_fragment(
     }
     log.push('\n');
     log
+}
+
+fn execution_evidence_for_album_scope(
+    evidence: &TrackExecutionEvidence,
+    presentation: &ConversionLogAlbumPresentation,
+) -> TrackExecutionEvidence {
+    if presentation.suppressed_operation_kinds.is_empty()
+        && !presentation.reference_terminal_static_promoted
+    {
+        return evidence.clone();
+    }
+
+    let mut scoped = evidence.clone();
+    scoped.operations.retain(|operation| {
+        !presentation
+            .suppressed_operation_kinds
+            .contains(&operation.kind)
+    });
+
+    if presentation.reference_terminal_static_promoted {
+        for operation in scoped
+            .operations
+            .iter_mut()
+            .filter(|operation| operation.kind == "reference_terminal_realization")
+        {
+            // The terminal realization, sample contract and automatic-policy
+            // decision are album-level when their static projection is uniform.
+            // Certified observations remain track-scoped even if two tracks
+            // happen to measure the same value. Keep only that per-track
+            // evidence here instead of repeating the uniform realization facts.
+            operation.name = "Per-track Reference terminal evidence".to_string();
+            operation.backend = ExecutionBackend::Unknown;
+            operation.parameters.clear();
+            operation.decision_ids.clear();
+            operation.detail = None;
+        }
+        scoped.operations.retain(|operation| {
+            operation.kind != "reference_terminal_realization"
+                || !operation.observation_ids.is_empty()
+        });
+    }
+
+    scoped
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AlbumUniformOperation {
+    AbsentOrIncomplete,
+    Uniform(Vec<String>),
+    Divergent,
+}
+
+/// Build the album-level human projection from the same typed evidence used by
+/// per-track processing. This is presentation scoping only: portable evidence
+/// stays per track, and no stage/argv text is reintroduced as another source of
+/// performed-processing truth.
+fn build_conversion_log_album_presentation(
+    tracks: &[(&ConversionLogTrackFragment, &ConversionLogTrackSummary)],
+    complete_album: bool,
+) -> ConversionLogAlbumPresentation {
+    let mut presentation = ConversionLogAlbumPresentation::default();
+    if tracks.is_empty()
+        || !complete_album
+        || tracks
+            .iter()
+            .any(|(_, summary)| summary.outcome != ConversionLogTrackOutcome::Success)
+    {
+        return presentation;
+    }
+
+    let mut body = Vec::<String>::new();
+    let mut promoted_uniform_fact = false;
+
+    match album_uniform_source_extraction(tracks) {
+        AlbumUniformOperation::Uniform(mut lines) => {
+            lines.push(format!("  Tracks extracted: {}", tracks.len()));
+            body.extend(lines);
+            presentation
+                .suppressed_operation_kinds
+                .insert("source_extraction".to_string());
+            promoted_uniform_fact = true;
+        }
+        AlbumUniformOperation::Divergent => body.push(
+            "DIVERGENCE — SACD extraction source, area, channel layout, or encoding differs across tracks; see per-track results."
+                .to_string(),
+        ),
+        AlbumUniformOperation::AbsentOrIncomplete => {}
+    }
+
+    match uniform_optional_track_fact(
+        tracks,
+        |fragment| fragment.shared_decision_scope.as_deref(),
+    ) {
+        UniformOptionalFact::Uniform(value) => {
+            body.push(format!("Album gain scope: {value}"));
+            presentation.suppress_album_gain_scope = true;
+            promoted_uniform_fact = true;
+        }
+        UniformOptionalFact::Divergent => body.push(
+            "DIVERGENCE — album gain scope differs across tracks; see per-track results.".to_string(),
+        ),
+        UniformOptionalFact::AbsentOrIncomplete => {}
+    }
+
+    match uniform_optional_track_fact(tracks, |fragment| {
+        fragment.album_gain_decision.as_deref()
+    }) {
+        UniformOptionalFact::Uniform(value) => {
+            body.push(format!("Album gain decision: {value}"));
+            presentation.suppress_album_gain_decision = true;
+            promoted_uniform_fact = true;
+        }
+        UniformOptionalFact::Divergent => body.push(
+            "DIVERGENCE — album gain decision differs across tracks; see per-track results."
+                .to_string(),
+        ),
+        UniformOptionalFact::AbsentOrIncomplete => {}
+    }
+
+    match album_uniform_operation(tracks, "dsd_to_pcm") {
+        AlbumUniformOperation::Uniform(lines) => {
+            body.extend(lines);
+            presentation
+                .suppressed_operation_kinds
+                .insert("dsd_to_pcm".to_string());
+            promoted_uniform_fact = true;
+        }
+        AlbumUniformOperation::Divergent => body.push(
+            "DIVERGENCE — DSD-to-PCM conversion differs across tracks; see per-track results."
+                .to_string(),
+        ),
+        AlbumUniformOperation::AbsentOrIncomplete => {}
+    }
+
+    match album_uniform_reference_terminal_static(tracks) {
+        AlbumUniformOperation::Uniform(lines) => {
+            body.extend(lines);
+            presentation.reference_terminal_static_promoted = true;
+            promoted_uniform_fact = true;
+        }
+        AlbumUniformOperation::Divergent => body.push(
+            "DIVERGENCE — qualified Reference terminal realization differs across tracks; see per-track results."
+                .to_string(),
+        ),
+        AlbumUniformOperation::AbsentOrIncomplete => {}
+    }
+
+    if body.is_empty() {
+        return presentation;
+    }
+    if promoted_uniform_fact {
+        body.insert(
+            0,
+            format!("Uniform across all {} successful track(s):", tracks.len()),
+        );
+    }
+
+    let mut section = String::from("Album Processing\n----------------\n");
+    for line in body {
+        section.push_str(&escape_log_value(&line));
+        section.push('\n');
+    }
+    section.push('\n');
+    presentation.section = section;
+    presentation
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UniformOptionalFact {
+    AbsentOrIncomplete,
+    Uniform(String),
+    Divergent,
+}
+
+fn uniform_optional_track_fact<'a>(
+    tracks: &'a [(&'a ConversionLogTrackFragment, &'a ConversionLogTrackSummary)],
+    value: impl Fn(&'a ConversionLogTrackFragment) -> Option<&'a str>,
+) -> UniformOptionalFact {
+    let values = tracks
+        .iter()
+        .map(|(fragment, _)| value(fragment).map(str::trim).filter(|item| !item.is_empty()))
+        .collect::<Vec<_>>();
+    let missing = values.iter().filter(|value| value.is_none()).count();
+    if missing == values.len() {
+        return UniformOptionalFact::AbsentOrIncomplete;
+    }
+    if missing > 0 {
+        return UniformOptionalFact::Divergent;
+    }
+    let first = values[0].expect("non-empty album facts were checked above");
+    if values
+        .iter()
+        .skip(1)
+        .all(|candidate| *candidate == Some(first))
+    {
+        UniformOptionalFact::Uniform(first.to_string())
+    } else {
+        UniformOptionalFact::Divergent
+    }
+}
+
+fn album_uniform_operation(
+    tracks: &[(&ConversionLogTrackFragment, &ConversionLogTrackSummary)],
+    kind: &str,
+) -> AlbumUniformOperation {
+    let mut rendered = Vec::<Vec<String>>::with_capacity(tracks.len());
+    let mut missing = 0usize;
+    for (fragment, _) in tracks {
+        let operations = fragment
+            .execution_evidence
+            .delivered_operations()
+            .filter(|operation| operation.kind == kind)
+            .collect::<Vec<_>>();
+        match operations.as_slice() {
+            [] => missing += 1,
+            [operation] => rendered.push(render_operation_with_context(
+                &fragment.execution_evidence,
+                operation,
+            )),
+            _ => return AlbumUniformOperation::Divergent,
+        }
+    }
+    if missing == tracks.len() {
+        AlbumUniformOperation::AbsentOrIncomplete
+    } else if missing > 0 {
+        AlbumUniformOperation::Divergent
+    } else {
+        uniform_rendered_operations(rendered)
+    }
+}
+
+fn album_uniform_reference_terminal_static(
+    tracks: &[(&ConversionLogTrackFragment, &ConversionLogTrackSummary)],
+) -> AlbumUniformOperation {
+    let mut rendered = Vec::<Vec<String>>::with_capacity(tracks.len());
+    let mut missing = 0usize;
+    for (fragment, _) in tracks {
+        let operations = fragment
+            .execution_evidence
+            .delivered_operations()
+            .filter(|operation| operation.kind == "reference_terminal_realization")
+            .collect::<Vec<_>>();
+        let operation = match operations.as_slice() {
+            [] => {
+                missing += 1;
+                continue;
+            }
+            [operation] => *operation,
+            _ => return AlbumUniformOperation::Divergent,
+        };
+        let mut operation = operation.clone();
+        // Certified measurements are track-scoped evidence. Compare only the
+        // static terminal realization/configuration and policy decision for
+        // album promotion; observations remain in the per-track projection.
+        operation.observation_ids.clear();
+        rendered.push(render_operation_with_context(
+            &fragment.execution_evidence,
+            &operation,
+        ));
+    }
+    if missing == tracks.len() {
+        AlbumUniformOperation::AbsentOrIncomplete
+    } else if missing > 0 {
+        AlbumUniformOperation::Divergent
+    } else {
+        uniform_rendered_operations(rendered)
+    }
+}
+
+fn album_uniform_source_extraction(
+    tracks: &[(&ConversionLogTrackFragment, &ConversionLogTrackSummary)],
+) -> AlbumUniformOperation {
+    let mut rendered = Vec::<Vec<String>>::with_capacity(tracks.len());
+    let mut missing = 0usize;
+    for (fragment, _) in tracks {
+        let operations = fragment
+            .execution_evidence
+            .delivered_operations()
+            .filter(|operation| operation.kind == "source_extraction")
+            .collect::<Vec<_>>();
+        let operation = match operations.as_slice() {
+            [] => {
+                missing += 1;
+                continue;
+            }
+            [operation] => *operation,
+            _ => return AlbumUniformOperation::Divergent,
+        };
+        let mut operation = operation.clone();
+        // Track identity is per-track by definition. Compare and promote only
+        // the extraction facts whose scope can legitimately be album-wide.
+        operation
+            .parameters
+            .retain(|parameter| parameter.name != "Track");
+        rendered.push(render_operation_with_context(
+            &fragment.execution_evidence,
+            &operation,
+        ));
+    }
+    if missing == tracks.len() {
+        AlbumUniformOperation::AbsentOrIncomplete
+    } else if missing > 0 {
+        AlbumUniformOperation::Divergent
+    } else {
+        uniform_rendered_operations(rendered)
+    }
+}
+
+fn uniform_rendered_operations(rendered: Vec<Vec<String>>) -> AlbumUniformOperation {
+    let Some(first) = rendered.first() else {
+        return AlbumUniformOperation::AbsentOrIncomplete;
+    };
+    if rendered.iter().skip(1).all(|candidate| candidate == first) {
+        AlbumUniformOperation::Uniform(first.clone())
+    } else {
+        AlbumUniformOperation::Divergent
+    }
 }
 
 impl ConversionLogTrackSummary {
@@ -21861,9 +22247,22 @@ fn build_conversion_log_from_fragments_with_status(
     } else {
         (None, None)
     };
+    let structured_refs = ordered
+        .iter()
+        .map(|fragment| (&fragment.track, &fragment.summary))
+        .collect::<Vec<_>>();
+    let complete_album = assembly_status.is_none() && ordered.len() == total_track_count;
+    let album_presentation =
+        build_conversion_log_album_presentation(&structured_refs, complete_album);
     let track_sections = ordered
         .iter()
-        .map(|fragment| render_structured_conversion_log_track_fragment(&fragment.track, &fragment.summary))
+        .map(|fragment| {
+            render_structured_conversion_log_track_fragment(
+                &fragment.track,
+                &fragment.summary,
+                &album_presentation,
+            )
+        })
         .collect();
     let batch_status = assembly_status.map(|status| match status {
         ConversionLogAssemblyStatus::CancelledPartial { expected_track_count } => {
@@ -21906,6 +22305,7 @@ fn build_conversion_log_from_fragments_with_status(
         source_blocking_lines: common.source_blocking_lines,
         provenance_section: common.provenance_section,
         artwork_section: common.artwork_section,
+        album_processing_section: album_presentation.section,
         track_sections,
         total_summary: ConversionLogTotalSummary {
             successful_count,
@@ -22957,6 +23357,7 @@ fn build_track_artifact_index<'a>(artifacts: &'a ArtifactSet) -> BTreeMap<TrackI
     artifacts_by_track_id
 }
 
+#[cfg(test)]
 fn append_track_log(
     log: &mut String,
     record: &TrackRecord,
@@ -23902,11 +24303,12 @@ fn source_audio_description(track: &PreparedTrack) -> String {
             .coding
             .map(source_audio_coding_label)
             .unwrap_or("source");
+        let source_is_dsd = prepared_track_uses_dsd_source(track);
         let groups = track
             .source_audio
             .channel_groups
             .iter()
-            .map(channel_group_description)
+            .map(|group| channel_group_description(group, source_is_dsd))
             .collect::<Vec<_>>()
             .join("; ");
         let mut label = format!("{coding} [{groups}]");
@@ -23921,7 +24323,9 @@ fn source_audio_description(track: &PreparedTrack) -> String {
         .map(format_sample_rate)
         .unwrap_or_else(|| "unknown rate".to_string());
     let mut parts = vec![rate];
-    if let Some(depth) = super::plan_bridge::resolve_source_pcm_depth(track) {
+    if prepared_track_uses_dsd_source(track) {
+        parts.push("1-bit DSD".to_string());
+    } else if let Some(depth) = super::plan_bridge::resolve_source_pcm_depth(track) {
         parts.push(pcm_bit_depth_label(depth).to_string());
     } else {
         parts.push("unknown depth".to_string());
@@ -23943,15 +24347,19 @@ fn source_audio_coding_label(coding: SourceAudioCoding) -> &'static str {
     }
 }
 
-fn channel_group_description(group: &ChannelGroupDescriptor) -> String {
+fn channel_group_description(group: &ChannelGroupDescriptor, source_is_dsd: bool) -> String {
     let rate = group
         .sample_rate
         .map(format_sample_rate)
         .unwrap_or_else(|| "unknown rate".to_string());
-    let depth = group
-        .bit_depth
-        .map(|bits| format!("{bits}-bit"))
-        .unwrap_or_else(|| "unknown depth".to_string());
+    let depth = if source_is_dsd {
+        "1-bit DSD".to_string()
+    } else {
+        group
+            .bit_depth
+            .map(|bits| format!("{bits}-bit"))
+            .unwrap_or_else(|| "unknown depth".to_string())
+    };
     let channels = group
         .assignment
         .as_deref()
@@ -32521,6 +32929,7 @@ mod album_true_peak_carrier_tests {
             &runner,
             &CancellationToken::new(),
             None,
+            None,
         )
         .await
         {
@@ -38048,6 +38457,11 @@ async fn prepare_registered_effect_carrier_for_track(
             track.id.source_ordinal,
         )
     })?;
+    record_completed_sacd_extraction_after_realization(
+        preparation_evidence,
+        &track,
+        req,
+    );
     let source = source_info_for_true_peak_realized_track(
         &track,
         &realized.path,
@@ -38555,6 +38969,7 @@ async fn prepare_track_scoped_certified_true_peak_carrier(
             runner,
             cancel,
             tool_concurrency_limits,
+            Some(preparation_evidence),
         )
         .await?;
         if carrier.measurement.execution.scope != tonepoet_pipeline::TruePeakScope::Track {
@@ -39558,6 +39973,7 @@ async fn prepare_dsd_true_peak_carrier_for_track(
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
+    preparation_evidence: Option<&mut TrackExecutionEvidence>,
 ) -> Result<PreparedDsdTruePeakCarrier, String> {
     if cancel.is_cancelled() {
         return Err("DSD certified true-peak analysis cancelled".to_string());
@@ -39584,6 +40000,9 @@ async fn prepare_dsd_true_peak_carrier_for_track(
             track.id.source_ordinal,
         )
     })?;
+    if let Some(preparation_evidence) = preparation_evidence {
+        record_completed_sacd_extraction_after_realization(preparation_evidence, &track, req);
+    }
     let realization_elapsed = realization_started.elapsed();
     let source = source_info_for_true_peak_realized_track(
         &track,
@@ -40058,6 +40477,7 @@ async fn prepare_dsd_true_peak_carriers(
                     runner,
                     &task_cancel,
                     task_tool_limits,
+                    None,
                 )
                 .await;
                 (index, result)
@@ -42705,6 +43125,10 @@ pub async fn realize_track_for_scheduler_with_tool_limits_and_version_cache(
     let staged_path = staged_audio_path(&convert_root, &final_path, &track.id, &req.settings.target_format);
     let mut preparation_commands = Vec::new();
     let mut preparation_evidence = TrackExecutionEvidence::default();
+    // A retained SACD-derived carrier is already proof that extraction completed
+    // before this conversion attempt begins. Capture that fact before any further
+    // preparation can fail so failure evidence cannot lose prior completed work.
+    record_completed_sacd_extraction_for_retained_input(&mut preparation_evidence, &track);
     let track = match prepare_track_scoped_certified_true_peak_carrier(
         &req,
         track.clone(),
@@ -42721,12 +43145,13 @@ pub async fn realize_track_for_scheduler_with_tool_limits_and_version_cache(
     {
         Ok(track) => track,
         Err(err) => {
-            let record = failed_track_record(
+            let record = failed_track_record_with_execution_evidence(
                 &track,
                 None,
                 Some(staged_path),
                 preparation_commands,
                 err,
+                discarded_preparation_evidence(&preparation_evidence),
             );
             return Err(ScheduledTrackOutput {
                 index: track_index,
@@ -42751,57 +43176,66 @@ pub async fn realize_track_for_scheduler_with_tool_limits_and_version_cache(
     )
     .await
     {
-        Ok(realized) => match select_scalar_transport_or_materialized_baseline(
-            realized,
-            &req,
-            &track,
-            &staged_path,
-            &convert_root,
-            &runner,
-            &cancel,
-        )
-        .await
-        {
-            Ok(realized) => Ok(ScheduledRealizedTrack {
-                index: track_index,
-                track,
-                final_path,
-                realized_path: realized.path,
-                realized_dsd_dst_stats: realized.dsd_dst_stats,
-                scalar_pump: realized.scalar_pump,
-                materialized_scalar: realized.materialized_scalar,
-                preparation_evidence,
-                preparation_commands,
-                req,
-                staging_root,
-                staging_job,
-                convert_root,
-                cancel,
-            }),
-            Err(err) => {
-                let record = failed_track_record(
-                    &track,
-                    None,
-                    Some(staged_path),
-                    preparation_commands,
-                    err.to_string(),
-                );
-                Err(ScheduledTrackOutput {
+        Ok(realized) => {
+            record_completed_sacd_extraction_after_realization(
+                &mut preparation_evidence,
+                &track,
+                &req,
+            );
+            match select_scalar_transport_or_materialized_baseline(
+                realized,
+                &req,
+                &track,
+                &staged_path,
+                &convert_root,
+                &runner,
+                &cancel,
+            )
+            .await
+            {
+                Ok(realized) => Ok(ScheduledRealizedTrack {
                     index: track_index,
-                    record,
-                    artifact: None,
-                    ok: false,
-                    metadata_satisfaction: PlannedMetadataSatisfaction::none(),
-                })
+                    track,
+                    final_path,
+                    realized_path: realized.path,
+                    realized_dsd_dst_stats: realized.dsd_dst_stats,
+                    scalar_pump: realized.scalar_pump,
+                    materialized_scalar: realized.materialized_scalar,
+                    preparation_evidence,
+                    preparation_commands,
+                    req,
+                    staging_root,
+                    staging_job,
+                    convert_root,
+                    cancel,
+                }),
+                Err(err) => {
+                    let record = failed_track_record_with_execution_evidence(
+                        &track,
+                        None,
+                        Some(staged_path),
+                        preparation_commands,
+                        err.to_string(),
+                        discarded_preparation_evidence(&preparation_evidence),
+                    );
+                    Err(ScheduledTrackOutput {
+                        index: track_index,
+                        record,
+                        artifact: None,
+                        ok: false,
+                        metadata_satisfaction: PlannedMetadataSatisfaction::none(),
+                    })
+                }
             }
-        },
+        }
         Err(err) => {
-            let record = failed_track_record(
+            let record = failed_track_record_with_execution_evidence(
                 &track,
                 None,
                 Some(staged_path),
                 preparation_commands,
                 err.to_string(),
+                discarded_preparation_evidence(&preparation_evidence),
             );
             Err(ScheduledTrackOutput { index: track_index, record, artifact: None, ok: false, metadata_satisfaction: PlannedMetadataSatisfaction::none() })
         }
@@ -42853,12 +43287,13 @@ pub async fn encode_realized_track_for_scheduler_with_tool_limits_and_version_ca
 
     if let Some(parent) = staged_path.parent() {
         if let Err(err) = fs::create_dir_all(parent) {
-            let record = failed_track_record(
+            let record = failed_track_record_with_execution_evidence(
                 &realized.track,
                 Some(realized.realized_path),
                 Some(staged_path),
                 realized.preparation_commands,
                 format!("could not create output directory: {err}"),
+                discarded_preparation_evidence(&realized.preparation_evidence),
             );
             return Ok(ScheduledTrackOutput { index: realized.index, record, artifact: None, ok: false, metadata_satisfaction: PlannedMetadataSatisfaction::none() });
         }
@@ -42884,12 +43319,13 @@ pub async fn encode_realized_track_for_scheduler_with_tool_limits_and_version_ca
         Err((error, commands)) => {
             let mut all_commands = realized.preparation_commands;
             all_commands.extend(commands);
-            let record = failed_track_record(
+            let record = failed_track_record_with_execution_evidence(
                 &realized.track,
                 Some(realized.realized_path.clone()),
                 Some(staged_path),
                 all_commands,
                 error,
+                discarded_preparation_evidence(&realized.preparation_evidence),
             );
             return Ok(ScheduledTrackOutput {
                 index: realized.index,
@@ -42935,6 +43371,11 @@ pub async fn encode_realized_track_for_scheduler_with_tool_limits_and_version_ca
         Ok(executed) => {
             let mut completed_execution_evidence = realized.preparation_evidence.clone();
             completed_execution_evidence.append(executed.execution_evidence.clone(), prefix_commands.len());
+            record_completed_sacd_extraction(
+                &mut completed_execution_evidence,
+                &realized.track,
+                executed.reference.as_ref(),
+            );
             if let Some(materialized_scalar) = materialized_scalar.as_ref() {
                 record_native_scalar_materialization(&mut completed_execution_evidence, materialized_scalar);
             }
@@ -56404,6 +56845,276 @@ fn record_track_size_evidence(
     }
 }
 
+/// Record successful in-process SACD extraction as typed execution evidence.
+///
+/// The source materializer knows which TOC area/track was selected, but that is
+/// only source description.  This operation is added only after extraction has
+/// actually completed (or, for the deferred Reference path, after the returned
+/// qualified execution evidence proves that its private extraction completed).
+/// Human and portable logs can therefore describe extraction without reviving
+/// stage-text aggregation as a second performed-processing authority.
+fn sacd_extraction_deferred_to_reference_executor(
+    req: &PipelineRequest,
+    track: &PreparedTrack,
+) -> bool {
+    matches!(&track.source_ref, TrackSourceRef::SacdTrack { .. })
+        && tonepoet_pipeline::selects_reference_dsd_to_pcm(&req.settings, true)
+        && req.settings.dsd.from_dsd.pathway == tonepoet_pipeline::DsdSourcePathway::Reference
+}
+
+fn record_completed_sacd_extraction_for_retained_input(
+    evidence: &mut TrackExecutionEvidence,
+    track: &PreparedTrack,
+) {
+    let retained_sacd_provenance = match &track.source_ref {
+        TrackSourceRef::DsdReferenceAutoGainCarrier {
+            source_kind: tonepoet_pipeline::DsdSourceKind::SacdTrack { .. },
+            ..
+        } => true,
+        TrackSourceRef::DsdTruePeakCarrier { .. }
+        | TrackSourceRef::RegisteredEffectCarrier {
+            source_was_dsd: true,
+            ..
+        } => track
+            .metadata
+            .extra
+            .get("sacd_area")
+            .is_some_and(|area| matches!(area.as_str(), "stereo" | "multichannel")),
+        _ => false,
+    };
+    if retained_sacd_provenance {
+        record_completed_sacd_extraction_for_source_kind(evidence, track, None);
+    }
+}
+
+fn record_completed_sacd_extraction_after_realization(
+    evidence: &mut TrackExecutionEvidence,
+    track: &PreparedTrack,
+    req: &PipelineRequest,
+) {
+    if matches!(&track.source_ref, TrackSourceRef::SacdTrack { .. }) {
+        if !sacd_extraction_deferred_to_reference_executor(req, track) {
+            record_completed_sacd_extraction_for_source_kind(evidence, track, None);
+        }
+    } else {
+        record_completed_sacd_extraction_for_retained_input(evidence, track);
+    }
+}
+
+fn discarded_preparation_evidence(
+    evidence: &TrackExecutionEvidence,
+) -> TrackExecutionEvidence {
+    let mut evidence = evidence.clone();
+    evidence.mark_discarded_attempt();
+    evidence
+}
+
+fn record_completed_sacd_extraction(
+    evidence: &mut TrackExecutionEvidence,
+    track: &PreparedTrack,
+    reference: Option<&ReferenceExecutionEvidence>,
+) {
+    record_completed_sacd_extraction_for_source_kind(
+        evidence,
+        track,
+        reference.map(|reference| &reference.original_source_kind),
+    );
+}
+
+/// Add completed SACD extraction evidence once the caller has independently
+/// proven that extraction finished. The optional source kind is a stronger
+/// authority used by the private Reference materializer to cross-check the
+/// selected area/track/channel/frame facts without depending on whole-track
+/// success.
+pub(super) fn record_completed_sacd_extraction_for_source_kind(
+    evidence: &mut TrackExecutionEvidence,
+    track: &PreparedTrack,
+    authoritative_source_kind: Option<&tonepoet_pipeline::DsdSourceKind>,
+) {
+    if evidence
+        .operations
+        .iter()
+        .any(|operation| operation.kind == "source_extraction")
+    {
+        return;
+    }
+    if let Some(operation) =
+        completed_sacd_extraction_operation(track, authoritative_source_kind)
+    {
+        // Extraction happens before every planner-owned transform. Keep the
+        // typed operation in execution order for both the human projection and JSON.
+        evidence.operations.insert(0, operation);
+    }
+}
+
+/// Build the semantic SACD extraction receipt. This function describes a fact;
+/// it does not decide whether extraction happened. Callers must invoke it only
+/// at an extraction-completion boundary or for a retained carrier whose typed
+/// provenance proves that boundary has already been crossed.
+pub(super) fn completed_sacd_extraction_operation(
+    track: &PreparedTrack,
+    authoritative_source_kind: Option<&tonepoet_pipeline::DsdSourceKind>,
+) -> Option<OperationRecord> {
+    let metadata_channel_count = track
+        .metadata
+        .extra
+        .get("sacd_channel_count")
+        .and_then(|value| value.parse::<u64>().ok());
+    let metadata_dst_encoded = track
+        .metadata
+        .extra
+        .get("sacd_dst_encoded")
+        .and_then(|value| value.parse::<bool>().ok());
+
+    // A raw SACD source keeps the exact selection in TrackSourceRef. Reference
+    // album auto-gain replaces that source with a retained protected carrier,
+    // but deliberately preserves the original typed SACD selection in
+    // DsdSourceKind. Other SACD-derived carriers preserve the materializer's
+    // SACD metadata and original source identity.
+    let (source_path, source_track_number, mut area_label, mut channel_count, mut dst_encoded) =
+        match &track.source_ref {
+            TrackSourceRef::SacdTrack {
+                iso,
+                track_index,
+                area,
+            } => (
+                iso.as_path(),
+                Some(u64::from(*track_index) + 1),
+                sacd_area_label(*area).to_string(),
+                metadata_channel_count,
+                metadata_dst_encoded,
+            ),
+            TrackSourceRef::DsdReferenceAutoGainCarrier {
+                source_path,
+                source_kind:
+                    tonepoet_pipeline::DsdSourceKind::SacdTrack {
+                        frame_format,
+                        selection,
+                    },
+                ..
+            } => (
+                source_path.as_path(),
+                Some(u64::from(selection.track_index_zero_based) + 1),
+                match selection.area {
+                    tonepoet_pipeline::SacdAreaKind::Stereo => "stereo",
+                    tonepoet_pipeline::SacdAreaKind::Multichannel => "multichannel",
+                }
+                .to_string(),
+                Some(u64::from(selection.channels)),
+                Some(matches!(
+                    frame_format,
+                    tonepoet_pipeline::SacdFrameEncoding::Dst
+                )),
+            ),
+            TrackSourceRef::DsdTruePeakCarrier { source_path, .. }
+            | TrackSourceRef::RegisteredEffectCarrier {
+                source_path,
+                source_was_dsd: true,
+                ..
+            } => {
+                let area = track
+                    .metadata
+                    .extra
+                    .get("sacd_area")
+                    .map(String::as_str)
+                    .filter(|area| matches!(*area, "stereo" | "multichannel"))?;
+                (
+                    source_path.as_path(),
+                    Some(u64::from(track.id.source_ordinal)),
+                    area.to_string(),
+                    metadata_channel_count,
+                    metadata_dst_encoded,
+                )
+            }
+            _ => return None,
+        };
+
+    // When the Reference executor supplies its independently admitted source
+    // kind, use it as a cross-check and as the strongest authority for
+    // area/channel/frame facts. A mismatch suppresses the receipt rather than
+    // manufacturing a plausible extraction statement.
+    if let Some(authoritative_source_kind) = authoritative_source_kind {
+        let tonepoet_pipeline::DsdSourceKind::SacdTrack {
+            frame_format,
+            selection,
+        } = authoritative_source_kind
+        else {
+            return None;
+        };
+        let reference_area = match selection.area {
+            tonepoet_pipeline::SacdAreaKind::Stereo => "stereo",
+            tonepoet_pipeline::SacdAreaKind::Multichannel => "multichannel",
+        };
+        if source_track_number != Some(u64::from(selection.track_index_zero_based) + 1)
+            || area_label != reference_area
+        {
+            return None;
+        }
+        area_label = reference_area.to_string();
+        channel_count = Some(u64::from(selection.channels));
+        dst_encoded = Some(matches!(
+            frame_format,
+            tonepoet_pipeline::SacdFrameEncoding::Dst
+        ));
+    }
+
+    let frame_encoding = dst_encoded.map(|is_dst| {
+        if is_dst {
+            "DST-compressed DSD"
+        } else {
+            "uncompressed DSD"
+        }
+    });
+
+    let mut operation = OperationRecord::completed(
+        format!("source-extraction-{}", track.id.source_ordinal),
+        "source_extraction",
+        "SACD source extraction",
+        ExecutionBackend::native("sacd-rs"),
+    );
+    operation
+        .inputs
+        .push(super::execution_evidence::EvidenceArtifactRef::path(
+            "sacd-iso",
+            source_path,
+        ));
+    operation.parameters.push(OperationParameter::new(
+        "Source",
+        EvidenceValue::Text(path_log_value(source_path)),
+    ));
+    operation.parameters.push(OperationParameter::new(
+        "Area",
+        EvidenceValue::Text(area_label),
+    ));
+    if let Some(track_number) = source_track_number {
+        operation.parameters.push(OperationParameter::new(
+            "Track",
+            EvidenceValue::Unsigned(track_number),
+        ));
+    }
+    if let Some(channels) = channel_count {
+        operation
+            .parameters
+            .push(OperationParameter::new("Channels", EvidenceValue::Unsigned(channels)));
+    }
+    if let Some(frame_encoding) = frame_encoding {
+        operation.parameters.push(OperationParameter::new(
+            "Frame encoding",
+            EvidenceValue::Text(frame_encoding.to_string()),
+        ));
+    }
+    if let Some(dst_encoded) = dst_encoded {
+        operation.parameters.push(OperationParameter::new(
+            "DST decoding",
+            EvidenceValue::Text(if dst_encoded {
+                "performed".to_string()
+            } else {
+                "not required".to_string()
+            }),
+        ));
+    }
+    Some(operation)
+}
 
 fn non_empty_error(error: String) -> String {
     if error.trim().is_empty() {
@@ -60820,6 +61531,562 @@ mod conversion_log_tests {
 
     struct VersionOnlyRunner(HashMap<ToolBinary, String>);
 
+    fn successful_log_summary() -> ConversionLogTrackSummary {
+        ConversionLogTrackSummary {
+            outcome: ConversionLogTrackOutcome::Success,
+            bytes_in: None,
+            bytes_out: None,
+            duration_millis: None,
+        }
+    }
+
+    fn album_scope_test_fragment(track_number: u32, dsd_target_rate_hz: u32) -> ConversionLogTrackFragment {
+        let mut extraction = OperationRecord::completed(
+            format!("extract-{track_number}"),
+            "source_extraction",
+            "SACD source extraction",
+            ExecutionBackend::native("sacd-rs"),
+        );
+        extraction.parameters.extend([
+            OperationParameter::new(
+                "Source",
+                EvidenceValue::Text("/music/album.iso".to_string()),
+            ),
+            OperationParameter::new("Area", EvidenceValue::Text("stereo".to_string())),
+            OperationParameter::new("Track", EvidenceValue::Unsigned(u64::from(track_number))),
+            OperationParameter::new("Channels", EvidenceValue::Unsigned(2)),
+            OperationParameter::new(
+                "Frame encoding",
+                EvidenceValue::Text("DST-compressed DSD".to_string()),
+            ),
+            OperationParameter::new(
+                "DST decoding",
+                EvidenceValue::Text("performed".to_string()),
+            ),
+        ]);
+
+        let mut dsd_to_pcm = OperationRecord::completed(
+            format!("dsd-to-pcm-{track_number}"),
+            "dsd_to_pcm",
+            "DSD-to-PCM conversion",
+            ExecutionBackend::external("sox"),
+        );
+        dsd_to_pcm.parameters.extend([
+            OperationParameter::new(
+                "Target rate",
+                EvidenceValue::SampleRateHz(dsd_target_rate_hz),
+            ),
+            OperationParameter::new(
+                "Target precision",
+                EvidenceValue::BitDepth("24-bit".to_string()),
+            ),
+        ]);
+
+        let mut terminal = OperationRecord::completed(
+            format!("reference-terminal-{track_number}"),
+            "reference_terminal_realization",
+            "Qualified Reference terminal realization",
+            ExecutionBackend::native("TonePoet qualified Reference path"),
+        );
+        terminal.parameters.push(OperationParameter::new(
+            "Sample contract",
+            EvidenceValue::Text(
+                "88200 Hz, 2 channels, 24-bit signed-integer PCM, TPDF dither".to_string(),
+            ),
+        ));
+        terminal
+            .decision_ids
+            .push("decision-reference-gain".to_string());
+
+        ConversionLogTrackFragment {
+            label: format!("Track {track_number}"),
+            shared_decision_scope: Some("submitted album batch".to_string()),
+            album_gain_decision: Some(
+                "submitted-batch DSD Reference album gain +18.019421188 dB".to_string(),
+            ),
+            execution_evidence: TrackExecutionEvidence {
+                operations: vec![extraction, dsd_to_pcm, terminal],
+                decisions: vec![DecisionRecord {
+                    id: "decision-reference-gain".to_string(),
+                    kind: "reference_gain".to_string(),
+                    summary: "Resolved qualified Reference gain policy".to_string(),
+                    authority: DecisionAuthority::AutomaticPolicy,
+                    observation_ids: Vec::new(),
+                }],
+                ..TrackExecutionEvidence::default()
+            },
+            ..ConversionLogTrackFragment::default()
+        }
+    }
+
+    #[test]
+    fn album_scope_promotes_only_uniform_complete_success_facts_once() {
+        let first = album_scope_test_fragment(1, 88_200);
+        let second = album_scope_test_fragment(2, 88_200);
+        let first_summary = successful_log_summary();
+        let second_summary = successful_log_summary();
+        let tracks = vec![(&first, &first_summary), (&second, &second_summary)];
+
+        let presentation = build_conversion_log_album_presentation(&tracks, true);
+        assert!(presentation.section.contains("Album Processing"));
+        assert!(presentation
+            .section
+            .contains("Uniform across all 2 successful track(s):"));
+        assert_eq!(presentation.section.matches("SACD source extraction").count(), 1);
+        assert_eq!(presentation.section.matches("Tracks extracted: 2").count(), 1);
+        assert!(!presentation.section.contains("  Track:"));
+        assert_eq!(presentation.section.matches("Album gain decision:").count(), 1);
+        assert_eq!(presentation.section.matches("DSD-to-PCM conversion").count(), 1);
+        assert_eq!(
+            presentation
+                .section
+                .matches("Qualified Reference terminal realization")
+                .count(),
+            1
+        );
+        assert_eq!(
+            presentation
+                .section
+                .matches("Selected by automatic policy: Resolved qualified Reference gain policy")
+                .count(),
+            1
+        );
+        assert!(presentation
+            .suppressed_operation_kinds
+            .contains("source_extraction"));
+        assert!(presentation
+            .suppressed_operation_kinds
+            .contains("dsd_to_pcm"));
+        assert!(presentation.reference_terminal_static_promoted);
+        assert!(presentation.suppress_album_gain_scope);
+        assert!(presentation.suppress_album_gain_decision);
+
+        let first_track = render_structured_conversion_log_track_fragment(
+            &first,
+            &first_summary,
+            &presentation,
+        );
+        assert!(!first_track.contains("Album gain decision:"));
+        assert!(!first_track.contains("SACD source extraction"));
+        assert!(!first_track.contains("DSD-to-PCM conversion"));
+        assert!(!first_track.contains("Qualified Reference terminal realization"));
+    }
+
+    #[test]
+    fn album_scope_keeps_real_processing_divergence_per_track_and_calls_it_out() {
+        let first = album_scope_test_fragment(1, 88_200);
+        let second = album_scope_test_fragment(2, 96_000);
+        let first_summary = successful_log_summary();
+        let second_summary = successful_log_summary();
+        let tracks = vec![(&first, &first_summary), (&second, &second_summary)];
+
+        let presentation = build_conversion_log_album_presentation(&tracks, true);
+        assert!(presentation
+            .section
+            .contains("DIVERGENCE — DSD-to-PCM conversion differs across tracks"));
+        assert!(!presentation.suppressed_operation_kinds.contains("dsd_to_pcm"));
+
+        let first_track = render_structured_conversion_log_track_fragment(
+            &first,
+            &first_summary,
+            &presentation,
+        );
+        let second_track = render_structured_conversion_log_track_fragment(
+            &second,
+            &second_summary,
+            &presentation,
+        );
+        assert!(first_track.contains("DSD-to-PCM conversion"));
+        assert!(first_track.contains("Target rate: 88200 Hz"));
+        assert!(second_track.contains("DSD-to-PCM conversion"));
+        assert!(second_track.contains("Target rate: 96000 Hz"));
+    }
+
+    #[test]
+    fn album_scope_calls_out_missing_normally_uniform_processing() {
+        let first = album_scope_test_fragment(1, 88_200);
+        let mut second = album_scope_test_fragment(2, 88_200);
+        second
+            .execution_evidence
+            .operations
+            .retain(|operation| operation.kind != "dsd_to_pcm");
+        let first_summary = successful_log_summary();
+        let second_summary = successful_log_summary();
+        let tracks = vec![(&first, &first_summary), (&second, &second_summary)];
+
+        let presentation = build_conversion_log_album_presentation(&tracks, true);
+        assert!(presentation
+            .section
+            .contains("DIVERGENCE — DSD-to-PCM conversion differs across tracks"));
+        assert!(!presentation.suppressed_operation_kinds.contains("dsd_to_pcm"));
+
+        let first_track = render_structured_conversion_log_track_fragment(
+            &first,
+            &first_summary,
+            &presentation,
+        );
+        assert!(first_track.contains("DSD-to-PCM conversion"));
+    }
+
+    #[test]
+    fn album_scope_promotes_reference_terminal_static_facts_but_keeps_track_observations() {
+        let mut first = album_scope_test_fragment(1, 88_200);
+        let mut second = album_scope_test_fragment(2, 88_200);
+        for (fragment, value) in [(&mut first, -18.11), (&mut second, -20.42)] {
+            let terminal = fragment
+                .execution_evidence
+                .operations
+                .iter_mut()
+                .find(|operation| operation.kind == "reference_terminal_realization")
+                .expect("fixture terminal");
+            terminal
+                .observation_ids
+                .push("reference-pre-terminal-peak".to_string());
+            fragment.execution_evidence.observations.push(ObservationRecord {
+                id: "reference-pre-terminal-peak".to_string(),
+                kind: "certified_true_peak".to_string(),
+                name: "protected true peak".to_string(),
+                value: Some(EvidenceValue::Db(value)),
+                source: "certified Reference scan".to_string(),
+            });
+        }
+        let first_summary = successful_log_summary();
+        let second_summary = successful_log_summary();
+        let tracks = vec![(&first, &first_summary), (&second, &second_summary)];
+
+        let presentation = build_conversion_log_album_presentation(&tracks, true);
+        assert!(presentation.reference_terminal_static_promoted);
+        assert_eq!(
+            presentation
+                .section
+                .matches("Qualified Reference terminal realization")
+                .count(),
+            1
+        );
+        assert_eq!(presentation.section.matches("Sample contract:").count(), 1);
+        assert!(!presentation.section.contains("protected true peak"));
+
+        let first_track = render_structured_conversion_log_track_fragment(
+            &first,
+            &first_summary,
+            &presentation,
+        );
+        let second_track = render_structured_conversion_log_track_fragment(
+            &second,
+            &second_summary,
+            &presentation,
+        );
+        for rendered in [&first_track, &second_track] {
+            assert!(rendered.contains("Per-track Reference terminal evidence"));
+            assert!(rendered.contains("Evidence: protected true peak="));
+            assert!(!rendered.contains("Qualified Reference terminal realization"));
+            assert!(!rendered.contains("Sample contract:"));
+        }
+        assert_ne!(first_track, second_track);
+    }
+
+    #[test]
+    fn album_scope_does_not_promote_partial_batch_facts() {
+        let first = album_scope_test_fragment(1, 88_200);
+        let first_summary = successful_log_summary();
+        let tracks = vec![(&first, &first_summary)];
+
+        let presentation = build_conversion_log_album_presentation(&tracks, false);
+        assert!(presentation.section.is_empty());
+        assert!(presentation.suppressed_operation_kinds.is_empty());
+        assert!(!presentation.suppress_album_gain_scope);
+        assert!(!presentation.suppress_album_gain_decision);
+    }
+
+    #[test]
+    fn dsd_source_audio_states_one_bit_instead_of_unknown_pcm_depth() {
+        let mut source = log_test_source();
+        let track = &mut source.tracks[0];
+        track.sample_rate = Some(SACD_SAMPLE_RATE_HZ);
+        track.source_audio = SourceAudioDescriptor::from_scalar(
+            Some(SACD_SAMPLE_RATE_HZ),
+            None,
+            Some(SourceAudioCoding::Dsd),
+        );
+        track.bit_depth = None;
+
+        let rendered = source_audio_description(track);
+        assert!(rendered.contains("DSD64"), "{rendered}");
+        assert!(rendered.contains("1-bit DSD"), "{rendered}");
+        assert!(!rendered.contains("unknown depth"), "{rendered}");
+    }
+
+    fn configure_sacd_extraction_test_track(track: &mut PreparedTrack) {
+        track.source_ref = TrackSourceRef::SacdTrack {
+            iso: PathBuf::from("/music/album.iso"),
+            track_index: 0,
+            area: SacdArea::Stereo,
+        };
+        track
+            .metadata
+            .extra
+            .insert("sacd_channel_count".to_string(), "2".to_string());
+        track
+            .metadata
+            .extra
+            .insert("sacd_frame_format".to_string(), "Dst".to_string());
+        track
+            .metadata
+            .extra
+            .insert("sacd_dst_encoded".to_string(), "true".to_string());
+    }
+
+    fn failed_sacd_attempt_log_after_completed_extraction(error: &str) -> (TrackRecord, String) {
+        let mut source = log_test_source();
+        source.tracks.truncate(1);
+        configure_sacd_extraction_test_track(&mut source.tracks[0]);
+        let track = source.tracks[0].clone();
+        let req = log_test_request();
+        let mut preparation_evidence = TrackExecutionEvidence::default();
+
+        // This is the production boundary immediately after ordinary SACD
+        // realization returns successfully. Later failures must inherit it.
+        record_completed_sacd_extraction_after_realization(
+            &mut preparation_evidence,
+            &track,
+            &req,
+        );
+        let record = failed_track_record_with_execution_evidence(
+            &track,
+            Some(PathBuf::from("/scratch/extracted-track.dsf")),
+            Some(PathBuf::from("/scratch/output.flac")),
+            Vec::new(),
+            error.to_string(),
+            discarded_preparation_evidence(&preparation_evidence),
+        );
+        let fragment = structured_conversion_log_track_fragment(
+            &record,
+            Some(&track),
+            Some(&source),
+            None,
+            &req,
+            None,
+            None,
+        );
+        let summary = ConversionLogTrackSummary::from_track_record_with_context(
+            &record,
+            &source,
+            Some(&track),
+            None,
+        );
+        let rendered = render_structured_conversion_log_track_fragment(
+            &fragment,
+            &summary,
+            &ConversionLogAlbumPresentation::default(),
+        );
+        (record, rendered)
+    }
+
+    #[test]
+    fn ordinary_sacd_extraction_survives_later_converter_failure_as_discarded_attempt() {
+        let (record, rendered) = failed_sacd_attempt_log_after_completed_extraction(
+            "forced converter failure after extraction",
+        );
+        let extraction = record
+            .execution_evidence
+            .operations
+            .iter()
+            .find(|operation| operation.kind == "source_extraction")
+            .expect("completed extraction remains in failure evidence");
+        assert_eq!(
+            extraction.lineage,
+            crate::convert::pipeline::execution_evidence::OperationLineage::DiscardedAttempt,
+            "a failed conversion must not present extraction as delivered audio",
+        );
+        assert!(rendered.contains("Status: Failure"), "{rendered}");
+        assert!(
+            rendered.contains("Attempt processing (not delivered):"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("SACD source extraction — sacd-rs"), "{rendered}");
+        assert!(rendered.contains("Area: stereo"), "{rendered}");
+        assert!(rendered.contains("Frame encoding: DST-compressed DSD"), "{rendered}");
+        assert!(rendered.contains("DST decoding: performed"), "{rendered}");
+    }
+
+    #[test]
+    fn ordinary_sacd_extraction_survives_post_realization_pre_executor_failure() {
+        let (record, rendered) = failed_sacd_attempt_log_after_completed_extraction(
+            "forced final-input preparation failure",
+        );
+        assert_eq!(
+            record
+                .execution_evidence
+                .operations
+                .iter()
+                .filter(|operation| operation.kind == "source_extraction")
+                .count(),
+            1,
+            "post-realization preparation failure must retain exactly one extraction receipt",
+        );
+        assert!(rendered.contains("SACD source extraction — sacd-rs"), "{rendered}");
+        assert!(rendered.contains("Attempt processing (not delivered):"), "{rendered}");
+    }
+
+    #[test]
+    fn deferred_reference_placeholder_does_not_claim_extraction_before_executor_materialization() {
+        let mut source = log_test_source();
+        let track = &mut source.tracks[0];
+        configure_sacd_extraction_test_track(track);
+        let mut req = log_test_request();
+        req.settings.dsd = tonepoet_pipeline::DsdSettings::reference();
+        let mut evidence = TrackExecutionEvidence::default();
+
+        // `realize_track_with_tool_limits_and_stats` returns only a deterministic
+        // placeholder for this path; private extraction happens later, after
+        // Reference attestation, inside the track executor.
+        record_completed_sacd_extraction_after_realization(&mut evidence, track, &req);
+
+        assert!(
+            evidence
+                .operations
+                .iter()
+                .all(|operation| operation.kind != "source_extraction"),
+            "a deferred Reference placeholder must not masquerade as completed extraction",
+        );
+    }
+
+    #[test]
+    fn sacd_extraction_evidence_records_area_encoding_and_dst_once() {
+        let mut source = log_test_source();
+        let track = &mut source.tracks[0];
+        configure_sacd_extraction_test_track(track);
+
+        let mut evidence = TrackExecutionEvidence::default();
+        record_completed_sacd_extraction(&mut evidence, track, None);
+        record_completed_sacd_extraction(&mut evidence, track, None);
+
+        let extraction = evidence
+            .operations
+            .iter()
+            .filter(|operation| operation.kind == "source_extraction")
+            .collect::<Vec<_>>();
+        assert_eq!(extraction.len(), 1, "extraction evidence must be idempotent");
+        let rendered = render_operation_with_context(&evidence, extraction[0]).join("\n");
+        assert!(rendered.contains("SACD source extraction — sacd-rs"));
+        assert!(rendered.contains("Source: /music/album.iso"));
+        assert!(rendered.contains("Area: stereo"));
+        assert!(rendered.contains("Track: 1"));
+        assert!(rendered.contains("Channels: 2"));
+        assert!(rendered.contains("Frame encoding: DST-compressed DSD"));
+        assert!(rendered.contains("DST decoding: performed"));
+        assert!(!rendered.contains("FrameFormat"));
+    }
+
+    #[test]
+    fn sacd_extraction_metadata_alone_does_not_reclassify_an_ordinary_file() {
+        let mut source = log_test_source();
+        let track = &mut source.tracks[0];
+        track.source_ref = TrackSourceRef::StagedFile(PathBuf::from("/music/not-a-sacd.flac"));
+        track
+            .metadata
+            .extra
+            .insert("sacd_area".to_string(), "stereo".to_string());
+        track
+            .metadata
+            .extra
+            .insert("sacd_dst_encoded".to_string(), "true".to_string());
+
+        let mut evidence = TrackExecutionEvidence::default();
+        record_completed_sacd_extraction(&mut evidence, track, None);
+
+        assert!(
+            evidence
+                .operations
+                .iter()
+                .all(|operation| operation.kind != "source_extraction"),
+            "metadata-shaped input must not manufacture SACD extraction evidence"
+        );
+    }
+
+    #[test]
+    fn sacd_extraction_evidence_survives_reference_album_carrier_replacement() {
+        let mut source = log_test_source();
+        let track = &mut source.tracks[0];
+        let digest = tonepoet_pipeline::Sha256Digest::of_bytes(b"reference-carrier-extraction-test");
+        track.source_ref = TrackSourceRef::DsdReferenceAutoGainCarrier {
+            path: PathBuf::from("/tmp/reference-protected.w64"),
+            source_path: PathBuf::from("/music/album.iso"),
+            source_sample_rate_hz: SACD_SAMPLE_RATE_HZ,
+            sample_rate_hz: 88_200,
+            channels: 2,
+            duration: Some(Duration::from_secs(1)),
+            source_kind: tonepoet_pipeline::DsdSourceKind::SacdTrack {
+                frame_format: tonepoet_pipeline::SacdFrameEncoding::Dst,
+                selection: tonepoet_pipeline::SacdTrackSelection {
+                    area: tonepoet_pipeline::SacdAreaKind::Stereo,
+                    track_index_zero_based: 0,
+                    start_frame: 500,
+                    frame_count: 100,
+                    channels: 2,
+                    toc_digest: digest,
+                },
+            },
+            gain_db: Some(tonepoet_pipeline::DbNano::ZERO),
+            target_dbtp: tonepoet_pipeline::DbNano::DEFAULT_REFERENCE_TRUE_PEAK_TARGET,
+            unbound_semantic_plan_hash: digest,
+            source_content_sha256: digest,
+            canonical_materialization_sha256: digest,
+            carrier_sha256: digest,
+            observation: tonepoet_pipeline::ReferenceCertifiedPeakObservation {
+                id: tonepoet_pipeline::MeasurementId(1),
+                scope: tonepoet_pipeline::MeasurementScope::Plan,
+                purpose: tonepoet_pipeline::TruePeakPurpose::GainAuthority,
+                subject: tonepoet_pipeline::ReferenceObservationSubject::ProtectedR64,
+                observer_identity: "test-observer".to_string(),
+                reconstruction: "test-reconstruction".to_string(),
+                edge_policy: "test-edge-policy".to_string(),
+                scan_tier: "standard".to_string(),
+                authority_endpoint: "test-authority".to_string(),
+                reader_authority: "test-reader".to_string(),
+                sample_rate_hz: 88_200,
+                channels: 2,
+                sample_frames: 1,
+                programme_sha256: digest,
+                complete_reader: true,
+                result: tonepoet_pipeline::ReferenceCertifiedPeakResult::VerifiedSilence,
+                certificate_sha256: digest,
+            },
+        };
+        // Prove this path does not depend on the materializer metadata snapshot:
+        // the protected Reference carrier itself retains the typed SACD source.
+        track.metadata.extra.clear();
+
+        let mut evidence = TrackExecutionEvidence::default();
+        record_completed_sacd_extraction_for_retained_input(&mut evidence, track);
+
+        let extraction = evidence
+            .operations
+            .iter()
+            .find(|operation| operation.kind == "source_extraction")
+            .expect("Reference SACD carrier must retain extraction facts");
+        let rendered = render_operation_with_context(&evidence, extraction).join("\n");
+        assert!(rendered.contains("Source: /music/album.iso"), "{rendered}");
+        assert!(rendered.contains("Area: stereo"), "{rendered}");
+        assert!(rendered.contains("Track: 1"), "{rendered}");
+        assert!(rendered.contains("Channels: 2"), "{rendered}");
+        assert!(rendered.contains("Frame encoding: DST-compressed DSD"), "{rendered}");
+        assert!(rendered.contains("DST decoding: performed"), "{rendered}");
+        assert!(!rendered.contains("reference-protected.w64"), "{rendered}");
+
+        let failure_evidence = discarded_preparation_evidence(&evidence);
+        let failure_extraction = failure_evidence
+            .operations
+            .iter()
+            .find(|operation| operation.kind == "source_extraction")
+            .expect("retained input extraction survives preparation failure");
+        assert_eq!(
+            failure_extraction.lineage,
+            crate::convert::pipeline::execution_evidence::OperationLineage::DiscardedAttempt,
+            "retained carrier extraction is attached before later preparation can fail",
+        );
+    }
+
     #[async_trait::async_trait]
     impl ToolRunner for VersionOnlyRunner {
         async fn run(
@@ -61125,7 +62392,11 @@ mod conversion_log_tests {
             Some(&track_artifacts[0]),
         );
 
-        let log = render_structured_conversion_log_track_fragment(&fragment, &summary);
+        let log = render_structured_conversion_log_track_fragment(
+            &fragment,
+            &summary,
+            &ConversionLogAlbumPresentation::default(),
+        );
         assert!(log.contains("Metadata source: Sidecar CUE: /music/Thriller/album.cue (track 1)"));
     }
 

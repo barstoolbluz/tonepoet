@@ -11,8 +11,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tonepoet_pipeline::{
     plan_topology, plan_typed, stage_a_selected_vs_emitted_diagnostics, DecisionKind, EffectIntent,
-    PlanOperation, PlanRequest, PlanningOutcome, RegisteredUnaryEffect,
-    ResolvedOperationParameters, TopologyPlan, TypedPlanNode,
+    FinalPcmContract, PcmBitDepth, PlanOperation, PlanRequest, PlanningOutcome, ReferenceDither,
+    RegisteredUnaryEffect, ResolvedOperationParameters, SampleKind, TopologyPlan, TypedPlanNode,
 };
 
 use super::tool::{CommandRecord, ProcessExit, RetainedPcmScalarPump};
@@ -412,6 +412,44 @@ pub fn duration_millis(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
+fn render_final_pcm_contract(contract: FinalPcmContract) -> String {
+    let channels = match contract.channels {
+        1 => "1 channel".to_string(),
+        channels => format!("{channels} channels"),
+    };
+    let sample_format = match (contract.sample_kind, contract.bit_depth) {
+        (SampleKind::SignedInteger, PcmBitDepth::Int8) => "8-bit signed-integer PCM".to_string(),
+        (SampleKind::SignedInteger, PcmBitDepth::Int16) => "16-bit signed-integer PCM".to_string(),
+        (SampleKind::SignedInteger, PcmBitDepth::Int24) => "24-bit signed-integer PCM".to_string(),
+        (SampleKind::SignedInteger, PcmBitDepth::Int32) => "32-bit signed-integer PCM".to_string(),
+        (SampleKind::UnsignedInteger, depth) => {
+            format!("{}-bit unsigned-integer PCM", depth.bits())
+        }
+        (SampleKind::Float, PcmBitDepth::Float32) => "32-bit floating-point PCM".to_string(),
+        (SampleKind::Float, PcmBitDepth::Float64) => "64-bit floating-point PCM".to_string(),
+        (SampleKind::Dsd, depth) => format!("{}-bit DSD", depth.bits()),
+        (kind, depth) => format!("{}-bit {} samples", depth.bits(), sample_kind_label(kind)),
+    };
+    let dither = match contract.dither {
+        ReferenceDither::None => "no dither",
+        ReferenceDither::Tpdf => "TPDF dither",
+        ReferenceDither::Shibata => "Shibata dither",
+    };
+    format!(
+        "{} Hz, {channels}, {sample_format}, {dither}",
+        contract.sample_rate_hz,
+    )
+}
+
+fn sample_kind_label(kind: SampleKind) -> &'static str {
+    match kind {
+        SampleKind::SignedInteger => "signed-integer PCM",
+        SampleKind::UnsignedInteger => "unsigned-integer PCM",
+        SampleKind::Float => "floating-point PCM",
+        SampleKind::Dsd => "DSD",
+    }
+}
+
 #[must_use]
 pub fn render_operation_generic(operation: &OperationRecord) -> Vec<String> {
     let suffix = match operation.status {
@@ -419,12 +457,16 @@ pub fn render_operation_generic(operation: &OperationRecord) -> Vec<String> {
         OperationStatus::Failed => " — failed".to_string(),
         OperationStatus::Incomplete => " — incomplete".to_string(),
     };
-    let mut lines = vec![format!(
-        "{} — {}{}",
-        operation.name,
-        operation.backend.human_label(),
-        suffix,
-    )];
+    let heading = match &operation.backend {
+        ExecutionBackend::Unknown => format!("{}{}", operation.name, suffix),
+        _ => format!(
+            "{} — {}{}",
+            operation.name,
+            operation.backend.human_label(),
+            suffix,
+        ),
+    };
+    let mut lines = vec![heading];
     for parameter in &operation.parameters {
         lines.push(format!("  {}: {}", parameter.name, parameter.render()));
     }
@@ -492,6 +534,13 @@ pub fn render_track_artifact_work(evidence: &TrackExecutionEvidence) -> Vec<Stri
     for operation in evidence
         .delivered_operations()
         .filter(|operation| operation.domain == OperationDomain::Artifact)
+        .filter(|operation| {
+            !matches!(&operation.backend, ExecutionBackend::Unknown)
+                || !operation.parameters.is_empty()
+                || operation.detail.as_deref().is_some_and(|value| !value.is_empty())
+                || !operation.decision_ids.is_empty()
+                || !operation.observation_ids.is_empty()
+        })
     {
         lines.extend(render_operation_with_context(evidence, operation));
     }
@@ -714,7 +763,7 @@ pub fn completed_plan_evidence(
                 record.decision_ids.push(format!("decision-{}", decision.0));
                 record.parameters.push(OperationParameter::new(
                     "Sample contract",
-                    EvidenceValue::Text(format!("{sample_contract:?}")),
+                    EvidenceValue::Text(render_final_pcm_contract(*sample_contract)),
                 ));
                 evidence.operations.push(record);
             }
@@ -1949,6 +1998,76 @@ pub fn append_prior_attempt_bounded(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reference_sample_contract_renders_as_human_audio_terms() {
+        let rendered = render_final_pcm_contract(FinalPcmContract {
+            sample_rate_hz: 88_200,
+            channels: 2,
+            sample_kind: SampleKind::SignedInteger,
+            bit_depth: PcmBitDepth::Int24,
+            dither: ReferenceDither::Tpdf,
+        });
+
+        assert_eq!(
+            rendered,
+            "88200 Hz, 2 channels, 24-bit signed-integer PCM, TPDF dither"
+        );
+        assert!(!rendered.contains("FinalPcmContract"));
+        assert!(!rendered.contains("sample_rate_hz"));
+        assert!(!rendered.contains('{'));
+    }
+
+    #[test]
+    fn unknown_backend_does_not_print_an_absence_placeholder() {
+        let operation = OperationRecord::completed(
+            "package-1",
+            "package_output",
+            "Package output",
+            ExecutionBackend::Unknown,
+        );
+        let rendered = render_operation_generic(&operation).join("\n");
+
+        assert_eq!(rendered, "Package output");
+        assert!(!rendered.contains("backend not recorded"));
+    }
+
+    #[test]
+    fn artifact_work_omits_unknown_backend_when_it_has_no_other_human_fact() {
+        let mut evidence = TrackExecutionEvidence::default();
+        let mut package = OperationRecord::completed(
+            "package-1",
+            "package_output",
+            "Package output",
+            ExecutionBackend::Unknown,
+        );
+        package.domain = OperationDomain::Artifact;
+        evidence.operations.push(package);
+
+        assert!(render_track_artifact_work(&evidence).is_empty());
+    }
+
+    #[test]
+    fn artifact_work_keeps_unknown_backend_when_known_parameters_are_useful() {
+        let mut evidence = TrackExecutionEvidence::default();
+        let mut operation = OperationRecord::completed(
+            "future-artifact-1",
+            "future_artifact",
+            "Future artifact work",
+            ExecutionBackend::Unknown,
+        );
+        operation.domain = OperationDomain::Artifact;
+        operation.parameters.push(OperationParameter::new(
+            "Known fact",
+            EvidenceValue::Text("value".to_string()),
+        ));
+        evidence.operations.push(operation);
+
+        let rendered = render_track_artifact_work(&evidence).join("\n");
+        assert!(rendered.contains("Future artifact work"));
+        assert!(rendered.contains("Known fact: value"));
+        assert!(!rendered.contains("backend not recorded"));
+    }
 
     #[test]
     fn generic_future_operation_is_visible_without_special_renderer() {
