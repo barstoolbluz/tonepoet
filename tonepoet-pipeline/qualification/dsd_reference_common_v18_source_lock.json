@@ -5,10 +5,10 @@
     "build.rs": "38748bfd625b167a575e37db96c6a8a86bfb129ee8713a515a7a60e47985284f",
     "reference_source_lock.rs": "0b1bc863c63024806cd87d8c34ead48e8d8b08118d4be73e6e205d966b99b2b9",
     "src/convert/pipeline/coordination_name.rs": "02e0e1817e9806e5c8f8efdf52dc647f223d8d0c5fdf79d23bd10f2b11eab891",
-    "src/convert/pipeline/manifest_builder.rs": "74e4ef54ed509397259c02880a64d5d390007b0b1918645cbcb165d0b9a976b9",
+    "src/convert/pipeline/manifest_builder.rs": "06c5ee3aac3b97333c62d18b003390a197c0f570dc1774dd2de1f363cf836faa",
     "src/convert/pipeline/plan_bridge.rs": "bc66276f7234430a551cfa8609565c63affa5f4235dbcc0e696726caabddafb2",
-    "src/convert/pipeline/stages.rs": "758e7ca6562b86a4ca2e40ed7b298a66999e5f520a35c7b2fc8037ad824739cf",
-    "src/convert/pipeline/track_executor.rs": "c3e4789816b9bef275441629d8cbeaf0b0cdf1dccb2492c4ca5f0b1be377869c",
+    "src/convert/pipeline/stages.rs": "aa61180ff783ca84b64b8ed284fb2d8b043eaae08c17df3ea1f18d630098cfd8",
+    "src/convert/pipeline/track_executor.rs": "1dfd8a77d267bc25c502e865f5be34469d50b557e23b53b616b83374903c731a",
     "src/convert/replaygain.rs": "cfa021f5fc480edd86ca1fdc506e133d5ac0057847b04b692f3e66ee3a509978",
     "src/fs_limits.rs": "1f53208b4ef74b08efb00719ec70ad442b74c2cf455ad311a65c9082df57f19e",
     "tonepoet-pipeline/Cargo.toml": "29caa6c045c357d818f5f180e0a6e93f24e0c90e9f9c1f109585478d5831a558",
@@ -25,6 +25,6 @@
     "tonepoet-pipeline/src/tools.rs": "aedd497da07bb9d6d4fe04942109a4983a1590f87e64b1f73dc25d8e7e372bf4",
     "tonepoet-pipeline/src/w64.rs": "caa669e1e323a36dce7aa7154abed1dabff77865a391fe2530fe5b5fd960ebdb"
   },
-  "runtime_closure_fingerprint_sha256": "a9c36e4da4e1850b9b4fed7029c1ff14b46cd808c6d0c7b1bd6282dec53a610a",
+  "runtime_closure_fingerprint_sha256": "2709df7bda9221a8d74e6ea682fd5376f9fc87c1a39bd296c810f43d7c515dbf",
   "schema_version": 1
 }
