@@ -212,7 +212,7 @@ enum Commands {
         #[arg(long)]
         no_cue: bool,
 
-        /// Allow partial album output on track failures
+        /// Allow partial album output on track failures (exit remains nonzero)
         #[arg(long)]
         partial: bool,
 
@@ -2205,26 +2205,57 @@ async fn run_convert(
     // Wait for progress display to finish
     let _ = progress_handle.await;
 
-    // Print summary
-    {
+    // The scheduler's Ok(()) means the batch ran, not that every queued
+    // conversion succeeded. Take the CLI outcome only after terminal state has
+    // been published and the progress task has drained.
+    let outcome = {
         let q = queue.read().await;
-        let completed = q.completed_items();
-        let failed = q.failed_items();
-        let total = q.total_items();
+        let outcome = cli_conversion_outcome(&q);
         println!(
             "\nConversion complete: {}/{} succeeded, {} failed",
-            completed, total, failed
+            outcome.succeeded,
+            outcome.total(),
+            outcome.failed
         );
-        // A bare count is undiagnosable; name each failure once.
+        if outcome.partial > 0 {
+            println!("  {} partially completed", outcome.partial);
+        }
+        if outcome.incomplete > 0 {
+            println!("  {} not completed", outcome.incomplete);
+        }
+        // A bare count is undiagnosable; name each unsuccessful item once.
         for item in q.all_items() {
-            if let tonepoet::convert::ConversionStatus::Failed { error, .. } = &item.status {
-                eprintln!("  failed: {} — {}", item.input_path.display(), error);
+            match &item.status {
+                ConversionStatus::Failed { error, .. } => {
+                    eprintln!("  failed: {} — {}", item.input_path.display(), error);
+                }
+                ConversionStatus::Partial { successful, failed, .. } => {
+                    eprintln!(
+                        "  partial: {} — {successful} track(s) succeeded, {failed} failed",
+                        item.input_path.display()
+                    );
+                }
+                ConversionStatus::Completed { .. }
+                | ConversionStatus::CompletedWithActionErrors { .. } => {}
+                status => {
+                    let reason = match status {
+                        ConversionStatus::NotConfigured => "not configured",
+                        ConversionStatus::Queued => "queued",
+                        ConversionStatus::Processing { .. } => "processing",
+                        ConversionStatus::Paused => "paused",
+                        ConversionStatus::Interrupted => "interrupted",
+                        ConversionStatus::Cancelled => "cancelled",
+                        _ => unreachable!("completed, failed, and partial handled above"),
+                    };
+                    eprintln!("  not completed: {} — {reason}", item.input_path.display());
+                }
             }
         }
-    }
+        outcome
+    };
 
     match (result, terminal_sync) {
-        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Ok(())) => outcome.require_success(),
         (Err(process_error), Ok(())) => Err(anyhow::anyhow!("{}", process_error)),
         (Ok(()), Err(sync_error)) => Err(sync_error),
         (Err(process_error), Err(sync_error)) => Err(anyhow::anyhow!(
@@ -2232,6 +2263,165 @@ async fn run_convert(
             process_error,
             sync_error
         )),
+    }
+}
+
+/// Headless conversion succeeds only when every admitted item produced its
+/// complete audio output. A partial album is not a successful conversion;
+/// nonfatal action warnings do not invalidate already published audio.
+/// Read all queue buckets: a terminal item can still be in the pending bucket
+/// when the processor returns early, before settle_finished().
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CliConversionOutcome {
+    succeeded: usize,
+    failed: usize,
+    partial: usize,
+    incomplete: usize,
+}
+
+impl CliConversionOutcome {
+    fn total(&self) -> usize {
+        self.succeeded + self.failed + self.partial + self.incomplete
+    }
+
+    fn require_success(&self) -> anyhow::Result<()> {
+        if self.total() == 0 || self.failed > 0 || self.partial > 0 || self.incomplete > 0 {
+            anyhow::bail!(
+                "conversion did not fully succeed: {} failed, {} partial, {} not completed",
+                self.failed,
+                self.partial,
+                self.incomplete
+            );
+        }
+        Ok(())
+    }
+}
+
+fn cli_conversion_outcome(queue: &ConversionQueue) -> CliConversionOutcome {
+    let mut outcome = CliConversionOutcome::default();
+    for item in queue.all_items() {
+        match &item.status {
+            ConversionStatus::Completed { .. }
+            | ConversionStatus::CompletedWithActionErrors { .. } => outcome.succeeded += 1,
+            ConversionStatus::Failed { .. } => outcome.failed += 1,
+            ConversionStatus::Partial { .. } => outcome.partial += 1,
+            _ => outcome.incomplete += 1,
+        }
+    }
+    outcome
+}
+
+#[cfg(test)]
+mod cli_conversion_exit_tests {
+    use super::*;
+
+    fn queue_with_statuses(statuses: Vec<ConversionStatus>) -> ConversionQueue {
+        let mut queue = ConversionQueue::new();
+        for (index, status) in statuses.into_iter().enumerate() {
+            let path = PathBuf::from(format!("/nonexistent/cli-exit-{index}.flac"));
+            queue.add_item(
+                path,
+                FileFormat::Audio(AudioFormat::Flac),
+                ConversionOptions::default(),
+            );
+            let mut items = queue.all_items_mut();
+            items[index].status = status;
+        }
+        queue
+    }
+
+    fn completed() -> ConversionStatus {
+        ConversionStatus::Completed {
+            output_path: PathBuf::from("output.flac"),
+            log_path: None,
+            warning_count: 0,
+        }
+    }
+
+    fn failed() -> ConversionStatus {
+        ConversionStatus::Failed {
+            error: "decoder rejected input".to_string(),
+            log_path: None,
+        }
+    }
+
+    #[test]
+    fn cli_exit_succeeds_when_all_items_completed_even_with_nonfatal_action_warnings() {
+        let q = queue_with_statuses(vec![
+            completed(),
+            ConversionStatus::CompletedWithActionErrors {
+                output_path: PathBuf::from("with-warning.flac"),
+                log_path: None,
+                errors: vec!["nonfatal action warning".into()],
+            },
+        ]);
+        let outcome = cli_conversion_outcome(&q);
+        assert_eq!(outcome.succeeded, 2);
+        assert_eq!(outcome.total(), 2);
+        outcome.require_success().unwrap();
+    }
+
+    #[test]
+    fn cli_exit_fails_when_every_queued_item_failed() {
+        let q = queue_with_statuses(vec![failed(), failed()]);
+        let outcome = cli_conversion_outcome(&q);
+        assert_eq!(outcome.failed, 2);
+        assert_eq!(outcome.succeeded, 0);
+        assert!(outcome.require_success().is_err());
+    }
+
+    #[test]
+    fn cli_exit_fails_on_mixed_success_and_failure() {
+        let q = queue_with_statuses(vec![completed(), failed(), completed()]);
+        let outcome = cli_conversion_outcome(&q);
+        assert_eq!((outcome.succeeded, outcome.failed), (2, 1));
+        assert!(outcome.require_success().is_err());
+    }
+
+    #[test]
+    fn cli_exit_fails_for_partially_published_album() {
+        let q = queue_with_statuses(vec![ConversionStatus::Partial {
+            output_path: PathBuf::from("partial-album"),
+            successful: 2,
+            failed: 1,
+            log_path: PathBuf::from("conversion.log"),
+        }]);
+        let outcome = cli_conversion_outcome(&q);
+        assert_eq!(outcome.partial, 1);
+        assert!(outcome.require_success().is_err());
+    }
+
+    #[test]
+    fn cli_exit_fails_for_unfinished_or_cancelled_items() {
+        for status in [
+            ConversionStatus::Queued,
+            ConversionStatus::Interrupted,
+            ConversionStatus::Cancelled,
+        ] {
+            let q = queue_with_statuses(vec![completed(), status]);
+            let outcome = cli_conversion_outcome(&q);
+            assert_eq!(outcome.incomplete, 1);
+            assert!(outcome.require_success().is_err());
+        }
+    }
+
+    #[test]
+    fn cli_exit_works_before_queue_terminal_items_are_settled() {
+        let mut q = queue_with_statuses(vec![completed(), failed()]);
+        assert_eq!(q.completed_items(), 0);
+        assert_eq!(q.failed_items(), 0);
+        let before = cli_conversion_outcome(&q);
+        q.settle_finished();
+        let after = cli_conversion_outcome(&q);
+        assert_eq!(before, after);
+        assert!(after.require_success().is_err());
+    }
+
+    #[test]
+    fn cli_exit_does_not_accept_empty_queued_batch() {
+        assert!(cli_conversion_outcome(&ConversionQueue::new())
+            .require_success()
+            .is_err());
     }
 }
 

@@ -4484,6 +4484,15 @@ Not included in the R15 brief, which had already been sent when this was found.
 
 ## 67. `tonepoet convert` exits 0 when every queued item fails
 
+> **✅ RESOLVED by R19 (`src/main.rs` only), verified 2026-10-09.** `CliConversionOutcome`
+> classifies every queue item from `all_items()` and `require_success()` decides the exit.
+> Measured on the R19 release binary: corrupt FLAC exits 1 (was 0), unsupported extension
+> exits 1 (was 0), a successful conversion still exits 0, and an empty selection exits 1,
+> refused earlier by the planner with "No supported files found in the provided paths".
+> Gate 7376 passed / 0 failed, with seven new `cli_conversion_exit_tests`. The negative
+> Reference smoke from R18's handoff now returns nonzero as intended. See #68 for the
+> separate behaviour R19's smoke script uncovered.
+
 Filed 2026-10-08, found while running R18's own release-acceptance negative smoke
 on `2563643`.
 
@@ -4541,3 +4550,55 @@ A conversion that fails should exit nonzero, so callers can tell success from
 failure without parsing stdout. Partial success needs a defined answer too: some
 tools reserve a distinct code for "some items failed". Whatever is chosen, the
 release-acceptance procedure should be adjusted to match it.
+
+## 68. One unreadable file costs every healthy file in its batch, under default ReplayGain
+
+Filed 2026-10-09, found when R19's own smoke script failed on its mixed case.
+
+Convert two files at once where one is unreadable. The healthy file converts,
+then fails at ReplayGain because its batch partner died, and nothing is
+published:
+
+```
+Conversion complete: 0/2 succeeded, 2 failed
+  failed: .../valid.wav — ReplayGain: io error: album ReplayGain participant
+    <id> ended before the complete batch reached the post-encode reduction
+    barrier: Failed { error: "Materialize: tool error: ffprobe: ... Invalid
+    data found when processing input" }
+  failed: .../corrupt.flac — Materialize: tool error: ffprobe: ...
+```
+
+The ReplayGain mode decides it. Same two inputs, same invocation otherwise:
+
+| `--replaygain` | summary | FLACs published |
+| --- | --- | --- |
+| default (unset) | 0/2 succeeded, 2 failed | 0 |
+| `off` | 1/2 succeeded, 1 failed | 1 |
+| `track` | 1/2 succeeded, 1 failed | 1 |
+
+So the album-gain barrier is what propagates the failure. A file that converted
+successfully is discarded because an unrelated file in the same batch could not
+be read. `--partial` does not help: with default ReplayGain it still reports
+0/2 and publishes nothing, because it governs tracks within one multi-track
+source rather than separate queue items.
+
+This is pre-existing, not introduced by R19 — R19's diff is `src/main.rs` only.
+It became visible because R19's smoke script asserts the mixed case publishes
+one FLAC, which is what happens under `track` or `off` and not under the
+default.
+
+### Why it matters
+
+Point `convert` at a folder where one file is damaged and, with default
+settings, you get nothing — not even the files that converted cleanly. The
+files are grouped into one batch automatically; nobody asked for them to share
+a fate.
+
+### What we want
+
+A file that converted successfully should survive a sibling's failure.
+Album-wide ReplayGain genuinely needs every track, so the open question is what
+it should do when a member is unreadable — fall back to track gain for the
+survivors, publish them without album gain, or something else — but discarding
+completed audio is the wrong answer. R19's smoke expectation should then match
+whatever that behaviour becomes.
