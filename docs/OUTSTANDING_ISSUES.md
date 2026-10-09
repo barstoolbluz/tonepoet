@@ -4578,7 +4578,30 @@ The ReplayGain mode decides it. Same two inputs, same invocation otherwise:
 
 So the album-gain barrier is what propagates the failure. A file that converted
 successfully is discarded because an unrelated file in the same batch could not
-be read. `--partial` does not help: with default ReplayGain it still reports
+be read.
+
+Corroborated 2026-10-09 across five cases, default ReplayGain unless stated:
+
+| case | result | files kept |
+| --- | --- | --- |
+| same folder: 1 good + 1 corrupt | 0/2 succeeded | 0 |
+| **separate folders: 1 good + 1 corrupt, one command** | 1/2 succeeded | **1** |
+| same folder: 2 good + 1 corrupt | 0/3 succeeded | 0 |
+| same folder: 2 good, none corrupt | 2/2 succeeded | 2 |
+| the good file alone | 1/1 succeeded | 1 |
+
+Two things follow. The trigger is **co-location in a directory**, not being named
+in one command: the same two files in separate folders are never grouped (no
+"one structural album batch" in the log) and the healthy file survives. And the
+loss **scales** — two clean files destroyed by one damaged one — so this is not a
+two-file edge case. Grouping alone is harmless; it needs a failure to propagate,
+which is why it has gone unnoticed.
+
+The run shows two distinct job ids inside one album batch, and the ReplayGain
+error names a dead *job* id as a batch *participant* — separate jobs, one
+album-gain barrier. `account_terminal_replaygain_batch_participants`
+(`src/convert/processor.rs:3232`) records the dead participant as a batch-wide
+`failure`. `--partial` does not help: with default ReplayGain it still reports
 0/2 and publishes nothing, because it governs tracks within one multi-track
 source rather than separate queue items.
 

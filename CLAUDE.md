@@ -23,7 +23,7 @@ cargo test --workspace --no-fail-fast --exclude tonepoet-true-peak   # THE GATE
                              # without --no-fail-fast, --workspace stops at the
                              # first failing binary; tonepoet-true-peak costs
                              # ~41 min and is gated separately. See ## Testing —
-                             # the suite is 7348 tests; see ## Testing for the
+                             # the suite is 7376 tests; see ## Testing for the
                              # rare coordination-contention flake.
 cargo test -p tonepoet-backend   # Backend tests only
 cargo test -p tonepoet-features  # Features tests only
@@ -279,7 +279,8 @@ cargo test -p tonepoet-true-peak   # BS.1770 true-peak + loudness core (~41 min)
 Tests are in `crates/*/tests/` directories, `src/` (inline `#[cfg(test)]` modules), and `tests/` (integration/contract/sentinel tests). The workspace suite is ~7,210 tests across 57 targets, plus 160 in `tonepoet-true-peak`.
 NEVER truncate failure output.
 
-**The suite is 7341 tests across 63 targets** (measured on `bae7758`, 7341/0). The count fell from 7363 when the
+**The suite is 7376 tests, and the gate is clean** (measured 2026-10-09 on `da2710a`: 7376 passed / 0 failed, no
+freshness failure). Earlier it was 7341 across 63 targets on `bae7758`. The count fell from 7363 when the
 logging/evidence redesign removed tests that asserted log content inferred from
 argv rather than from execution receipts.
 
@@ -439,9 +440,15 @@ Compile-time embedded reference data lives under `assets/` (`include_str!`/`incl
 
   This has now been violated four times — issue #27, then #53 twice (Reference manifest,
   then the staging directory), then #64 (structured execution evidence, 2026-10-08, which
-  arrived with the logging redesign while #53 was still open). As of 2026-10-08 the
-  library holds `.tonepoet-manifest.json` in 26 album folders and 14 `job-<uuid>-<uuid>.json`
-  evidence files, about 1.3 MB of debris.
+  arrived with the logging redesign while #53 was still open).
+
+  **Status 2026-10-09 (`da2710a`):** all four are closed in code and verified on real
+  audio. R16 gated manifest publication; R18 withdrew rerun detection entirely and
+  validates Reference authority without a manifest. A qualified Reference SACD conversion
+  (`--dsd-path reference`, log requested) now leaves only the audio, `conversion.log` and
+  requested artwork — zero `.tonepoet-manifest.json`, zero dotfiles. The #65 destination
+  inventory tests assert the destination's file set directly, which is the guard that was
+  missing every previous time this regressed.
 
   **Check every change that writes a file against this rule before delivering it**, and
   say in the delivery that you did. There is still no test asserting the destination's
@@ -463,10 +470,13 @@ Compile-time embedded reference data lives under `assets/` (`include_str!`/`incl
   `@generated` by `promote_ssrc_true_peak_terminal.py` — never hand-edit it; re-run
   qualification and promotion instead.
 
-  For scale, the tracked Rust tree is **955,274 lines across 395 files** (was ~946K /
-  393 on 2026-10-01), of which that one generated file is 9.1%. By area: `src/` 686,687
-  lines in 190 files, `tonepoet-pipeline/` 130,774 in 24, `crates/` 114,795 in 140,
-  `tests/` 19,407 in 30.
+  For scale, the tracked Rust tree is **956,542 lines across 392 files** (re-measured
+  2026-10-09; was 955,274 / 395 on 2026-10-07), of which that one generated file is 9.1%.
+  By area: `src/` 687,924 lines in 188 files, `tonepoet-pipeline/` 130,974 in 24,
+  `crates/` 114,795 in 140, `tests/` 19,238 in 29. The file count fell because R18
+  withdrew rerun detection, deleting `src/convert/pipeline/rerun.rs`,
+  `src/convert/pipeline/orchestrator_rerun_gate.rs`, `tests/chunk_2_1_2_manifest_rerun.rs`
+  and `tests/chunk_2_1_2_orchestrator_gate.rs` (issue #53).
 - **CUE text encoding is guessed, and path resolution is the deciding signal.** `decode_cue_bytes_for_path` (`src/convert/cue_parser.rs`) is the only decoder production uses; the path-blind `decode_cue_bytes` is test-only. It tries UTF-8/BOM first, then scores legacy candidates — CP932/Shift-JIS, EUC-JP, GBK, Big5, Windows-1251, Windows-1252 — and sorts by score descending, then by priority ascending (Windows-1252 is priority 0, the Western default on a pure tie). Resolving a decoded `FILE` reference is worth up to +5,000 and dominates everything else; the +10 CJK/kana bonus applies *only* when that same candidate actually resolved a file (R14). Consequence worth knowing before touching the scorer: when no candidate resolves, the decision comes down to the tiebreak and the -500-per-control-character penalty — see issue #60.
 - The wizard crate has its own `main.rs` for standalone use but tonepoet's `main.rs` embeds the wizard directly
 - The new TUI (`src/tui/`) is the primary interface; the wizard crate is kept as-is for legacy/preset access

@@ -1,5 +1,15 @@
 # Design Brief: DSD→PCM Reference Pathway and Manual/Expert Workflows
 
+> **PARTLY SUPERSEDED 2026-10-09.** Rerun detection was withdrawn in R18 (issue #53,
+> the user's decision: "i don't want re-run detection"). `src/convert/pipeline/rerun.rs`
+> and `src/convert/pipeline/orchestrator_rerun_gate.rs` no longer exist, so every
+> reference below to rerun authority, rerun admission or the rerun gate describes a
+> design that is no longer implemented. Reference execution authority is now validated
+> without a manifest by `validate_reference_execution_authority`
+> (`src/convert/pipeline/manifest_builder.rs`), and a manifest is built only when
+> `req.publish.write_manifest` is set. The rest of the brief still stands.
+
+
 **Status:** implementation-authoritative design commission deliverable  
 **Date:** 2026-07-18  
 **Evidence baseline:** SoX-ng 14.8.0.1 (`sox_ng-14.8.0.1`, commit `266aa9e777829a1b60959a1250b4c42597558639`)  
