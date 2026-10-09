@@ -4481,3 +4481,63 @@ requires, and `write_log_file` does not imply it.
 ### Note
 
 Not included in the R15 brief, which had already been sent when this was found.
+
+## 67. `tonepoet convert` exits 0 when every queued item fails
+
+Filed 2026-10-08, found while running R18's own release-acceptance negative smoke
+on `2563643`.
+
+A conversion whose items all fail prints the failures and exits **0**. Measured
+on the R18 release binary:
+
+```
+$ tonepoet convert <sacd.iso> --track 1 --area stereo --dsd-path reference \
+    --format flac --output <dir>
+0/1 succeeded, 1 failed
+  failed: ... qualification unavailable: Reference production promotion is inactive: ...
+exit code: 0
+```
+
+Three probes separate the two regimes:
+
+| failure | exit |
+| --- | --- |
+| nonexistent input path | 1 |
+| unsupported source extension (`.dts`) | 0 |
+| corrupt FLAC — reports `0/1 succeeded, 1 failed` | 0 |
+
+So failures detected before the queue runs exit nonzero, and failures of queued
+items do not affect the exit status however many fail. The summary at
+`src/main.rs:2215` prints `failed` and names each failure, but the return value
+immediately below depends only on the processor's own `Result` and the terminal
+sync — `failed_items()` is never consulted.
+
+### Why it matters now
+
+R18's release-acceptance procedure
+(`R18_REFERENCE_REQUALIFICATION_HANDOFF_2026-10-08.md`) detects a correct
+Reference refusal by exit status:
+
+```bash
+if cargo run --release -- convert "$iso" ... ; then
+  echo 'ERROR: changed Reference runtime was accepted' >&2
+  exit 1
+fi
+```
+
+With exit 0 this inverts: a build that refuses correctly is reported as having
+accepted a mismatched runtime. The negative smoke cannot pass as written on any
+build. When run on `2563643`, the Reference behaviour was correct on all three
+substantive checks — the freshness gate failed, the refusal reason was
+`Reference production promotion is inactive`, and nothing was published — and
+only the exit-code check misfired.
+
+Any script or CI step that shells out to `tonepoet convert` has the same blind
+spot.
+
+### What we want
+
+A conversion that fails should exit nonzero, so callers can tell success from
+failure without parsing stdout. Partial success needs a defined answer too: some
+tools reserve a distinct code for "some items failed". Whatever is chosen, the
+release-acceptance procedure should be adjusted to match it.
