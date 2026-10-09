@@ -168,7 +168,7 @@ is worth revisiting on AVX2 hardware, where including it would cost seconds.
 
 **CLI subcommands** (src/main.rs, `enum Commands` — 15 variants; the user-facing ones):
 - `tui` — launches the new TUI (default convert screen)
-- `convert <PATHS>... [--format --output --workers --replaygain --preset --bitrate --track --track-range --area --no-cue --partial --overwrite --naming --no-metadata --no-features ...]`
+- `convert <PATHS>... [--format --output --workers --replaygain --preset --bitrate --track --track-range --area --no-cue --partial --overwrite-output --naming --no-metadata --no-features ...]`
 - `wizard` — launches legacy TUI wizard
 - `check-tools` — probes for ffmpeg, sox, ssrc, 7z, loudgain, opustags, etc.
 - `config --show | --reset | --path`

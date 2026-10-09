@@ -4625,3 +4625,93 @@ it should do when a member is unreadable — fall back to track gain for the
 survivors, publish them without album gain, or something else — but discarding
 completed audio is the wrong answer. R19's smoke expectation should then match
 whatever that behaviour becomes.
+
+## 69. `--overwrite-output` destroys the album and hides the audio in dotfolders, reporting success
+
+Filed 2026-10-09 on `43f275e`, found while checking whether `conversion.log` is
+overwritten on re-conversion (it is — see #70).
+
+Convert a folder of separate files, then convert it again with
+`--overwrite-output`. The album keeps **one** track. The rest are moved into
+hidden backup directories at the output root and are no longer part of the
+album. The command exits **0**.
+
+Reproduced from a clean destination each time, three files from one folder:
+
+```
+after a normal convert:
+  ./Inventory Probe/01 - Track 1.flac
+  ./Inventory Probe/02 - Track 2.flac
+  ./Inventory Probe/03 - Track 3.flac
+  ./Inventory Probe/conversion.log
+
+after the same convert again with --overwrite-output (exit 0):
+  ./Inventory Probe/03 - Track 3.flac
+  ./Inventory Probe/conversion.log
+  ./.tonepoet-backup-<hash>-<ns>-0/01 - Track 1.flac
+  ./.tonepoet-backup-<hash>-<ns>-0/02 - Track 2.flac
+  ./.tonepoet-backup-<hash>-<ns>-0/03 - Track 3.flac
+  ./.tonepoet-backup-<hash>-<ns>-0/conversion.log
+  ./.tonepoet-backup-<hash>-<ns>-0/02 - Track 2.flac
+  ./.tonepoet-backup-<hash>-<ns>-0/01 - Track 1.flac
+```
+
+It scales with album size, always leaving exactly one track:
+
+| files converted | tracks left in the album | hidden backup dirs | tracks stranded |
+| --- | --- | --- | --- |
+| 1 | 1 (correct) | 1 | 0 |
+| 2 | 1 | 2 | 1 |
+| 3 | 1 | 3 | 2 |
+
+A folder of separate files is dispatched as independent single-file jobs sharing
+one album batch (see #68). Each job appears to back up the whole album directory
+and republish it containing only its own track, so the last publisher's album
+wins and every other track survives only inside a backup directory.
+
+### Why this is severe
+
+- **Silent data loss from the user's point of view.** The audio still exists on
+  disk, but the album is incomplete and the missing tracks are in hidden
+  directories a user browsing their library will not see. Nothing in the output
+  says so; the exit status is 0 and the summary says every file succeeded.
+- **A fifth violation of the standing rule.** `.tonepoet-backup-*` directories
+  are unrequested hidden state written into the destination, after #27, #53
+  twice, and #64. The #65 inventory tests do not cover the `--overwrite-output`
+  path, which is why they did not catch it.
+
+### What we want
+
+Re-converting with `--overwrite-output` should leave the album complete, with
+every track the conversion produced. Whatever backup mechanism protects the
+previous copy belongs outside the destination, like execution evidence and
+staging already do, and should be removed once the publish succeeds. A
+conversion that leaves the destination incomplete should not report success.
+
+## 70. `conversion.log` is overwritten by the next conversion into the same folder
+
+Filed 2026-10-09 on `43f275e`.
+
+Re-converting into an existing album folder succeeds and rewrites
+`conversion.log` in place. Measured: three successive conversions of the same
+three-file folder, each `3/3 succeeded, exit 0`, with the log's SHA-256 changing
+every run (`9de9a7cb78bd` → `f77735f53d06` → `7399f84d6adf`). The log carries
+`Generated (UTC)` and per-track timestamps, so each run's record is complete and
+each run's record replaces the last.
+
+The consequence is that the log only ever describes the most recent conversion
+into that folder. Any earlier record is gone — including the one case where it
+matters most, a run whose log recorded something that cannot be reconstructed
+later, such as which files were excluded from an album ReplayGain calculation
+(#68) or which tracks failed.
+
+### What we want
+
+A conversion should not erase the record of an earlier one. A per-run log named
+with its date and time, written alongside the existing `conversion.log`, keeps
+the history while leaving the familiar filename in place. The timestamp needs
+enough resolution that two conversions on the same day do not collide.
+
+The standing rule still applies: the second log is written only when the user
+asked for a log at all, and the #65 destination-inventory tests have to be
+extended to expect it, since they assert the destination's exact file set.
