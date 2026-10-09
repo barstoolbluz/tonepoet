@@ -1,0 +1,26 @@
+TonePoet R22C OFFLINE CORRECTIVE VERIFICATION - 2026-10-09
+Base: TonePoet_R22_complete_source_2026-10-09.tar.gz
+
+PASS  Original R22 archive extracted and individual files compared by bytes
+PASS  Only previously present changed executable-source file: src/convert/pipeline/execution_evidence.rs
+PASS  Executable-source difference entirely inside r22_direct_encode_preserves_sample_facts_without_debug_or_duplicate_fields
+PASS  Projector called exactly once inside that test; unsupported repeat-projection assertion absent
+PASS  Single-pass test still asserts direct-encode input, output, 96kHz rate, unchanged samples, processing and dither ownership
+PASS  Single-pass test still rejects Rust-internal enum words and counts duplicate sample-conversion/dither labels
+PASS  All other Rust files, test fixtures, scripts, and qualification sidecars byte-identical to original R22
+PASS  git diff --check clean for test-only patch
+PASS  git apply --check on pristine original-R22 test file
+PASS  git apply then byte-for-byte comparison to corrected test source
+PASS  bash -n scripts/smoke_r20_album_publication.sh
+PASS  bash -n scripts/requalify_reference_r20.sh
+
+NOT RUN  Rust compiler, rustfmt, cargo tests and build: tools unavailable
+NOT RUN  Real FLAC/SACD conversions, Browse ISO preset end-to-end, performance gate
+NOT RUN  Qualified Reference requalification (R22 stages.rs source-lock remains stale)
+
+Build-host acceptance gates and requalification procedure:
+  R22C_TEST_ONLY_HANDOFF_2026-10-09.md
+
+Updated R22_SOURCE_TREE_SHA256SUMS.txt is generated from the corrected
+archive tree excluding the manifest itself. Validate at the extracted repo root:
+  sha256sum -c R22_SOURCE_TREE_SHA256SUMS.txt

@@ -18559,10 +18559,8 @@ fn write_batch_conversion_log_to_rendered_album_dirs(
         return Err(err);
     }
 
-    for write in &writes {
-        archive_conversion_log_for_run(&write.log_path, &identity.conversion_log_batch_id)
-            .map_err(PublishError::io_at("archiving conversion.log for batch", &write.log_path))?;
-    }
+    // The first run has no displaced report. Committed backups, when present,
+    // are retained by cleanup before their temporary paths are removed.
     cleanup_committed_visible_conversion_log_writes(&writes, &marker_path)?;
 
     Ok(writes
@@ -18734,22 +18732,51 @@ fn commit_visible_conversion_log_writes(
     Ok(())
 }
 
-// R20: Retain a human-readable audit trail beside the current conversion.log.
-// Snapshot creation is exclusive: another run never overwrites an archive.
-fn conversion_log_snapshot_name() -> String {
-    format!("conversion-{}.log", chrono::Utc::now().format("%Y%m%dT%H%M%S%.9fZ"))
+// The archive is named for the displaced log, not the conversion that replaces it.
+// Rendered human reports carry a second-resolution UTC generation time. The
+// content digest disambiguates different runs generated within that second;
+// a legacy report without a header falls back to its filesystem modification
+// time (also from the displaced file, never the current clock).
+fn conversion_log_snapshot_name(bytes: &[u8], modified: Option<std::time::SystemTime>) -> String {
+    let generated = std::str::from_utf8(bytes).ok().and_then(|report| {
+        report.lines().take(12).find_map(|line| {
+            line.strip_prefix("Generated (UTC): ").and_then(|value| {
+                chrono::NaiveDateTime::parse_from_str(value.trim(), "%Y-%m-%d %H:%M:%S UTC")
+                    .ok()
+            })
+        })
+    });
+    let stamp = if let Some(generated) = generated {
+        generated.format("%Y%m%dT%H%M%SZ").to_string()
+    } else {
+        let generated = modified.map(chrono::DateTime::<chrono::Utc>::from)
+            .unwrap_or_else(chrono::Utc::now);
+        generated.format("%Y%m%dT%H%M%S%.9fZ").to_string()
+    };
+    let digest = super::manifest::sha256_hex(bytes);
+    format!("conversion-{stamp}-{}.log", &digest[..16])
 }
 
-fn create_conversion_log_snapshot(album_dir: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
+fn create_conversion_log_snapshot(
+    album_dir: &Path,
+    bytes: &[u8],
+    modified: Option<std::time::SystemTime>,
+) -> io::Result<PathBuf> {
     use std::io::Write;
+    let base = conversion_log_snapshot_name(bytes, modified);
+    let stem = base.strip_suffix(".log").unwrap_or(&base);
     for attempt in 0..1000 {
-        let base = conversion_log_snapshot_name();
-        let stem = base.strip_suffix(".log").unwrap_or(&base);
-        let name = if attempt == 0 { base } else { format!("{stem}-{attempt}.log") };
+        let name = if attempt == 0 { base.clone() } else { format!("{stem}-{attempt}.log") };
         let path = album_dir.join(name);
         let mut file = match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                // A repeated cleanup/retry must not create another copy.
+                if read_regular_file_no_follow(&path)? == bytes {
+                    return Ok(path);
+                }
+                continue;
+            }
             Err(error) => return Err(error),
         };
         if let Err(error) = (|| -> io::Result<()> {
@@ -18789,54 +18816,17 @@ fn preserve_previous_conversion_log(log_path: &Path) -> io::Result<()> {
     };
     let parent = parent_dir_or_current(log_path);
     for archived in conversion_log_archive_files(parent)? {
-        if read_regular_file_no_follow(&archived)? == bytes {
+        // Most old histories differ in length. A cheap size check avoids
+        // repeatedly reading every earlier log as a collection grows.
+        if fs::symlink_metadata(&archived)?.len() == bytes.len() as u64
+            && read_regular_file_no_follow(&archived)? == bytes
+        {
             return Ok(());
         }
     }
-    create_conversion_log_snapshot(parent, &bytes)?;
+    let modified = fs::metadata(log_path).ok().and_then(|metadata| metadata.modified().ok());
+    create_conversion_log_snapshot(parent, &bytes, modified)?;
     Ok(())
-}
-
-// Each run gets exactly one snapshot, rewritten when final delivery evidence
-// replaces the initial assembled report. A batch's identity is shared by all
-// its tracks, so their finalizer does not create N redundant history files.
-fn archive_conversion_log_for_run(log_path: &Path, run_identity: &str) -> io::Result<PathBuf> {
-    let bytes = read_regular_file_no_follow(log_path)?;
-    let parent = parent_dir_or_current(log_path);
-    let token = super::manifest::sha256_hex(run_identity.as_bytes());
-    let run_suffix = format!("-{}.log", &token[..16]);
-    for existing in conversion_log_archive_files(parent)? {
-        if existing.file_name().and_then(|name| name.to_str())
-            .is_some_and(|name| name.ends_with(&run_suffix))
-        {
-            if read_regular_file_no_follow(&existing)? != bytes {
-                write_bytes_atomically(&existing, &bytes)?;
-            }
-            return Ok(existing);
-        }
-    }
-    use std::io::Write;
-    for attempt in 0..1000 {
-        let time = chrono::Utc::now().format("%Y%m%dT%H%M%S%.9fZ");
-        let name = if attempt == 0 {
-            format!("conversion-{time}{run_suffix}")
-        } else {
-            format!("conversion-{time}-{attempt}{run_suffix}")
-        };
-        let path = parent.join(name);
-        let mut file = match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        };
-        if let Err(error) = (|| -> io::Result<()> { file.write_all(&bytes)?; file.sync_all() })() {
-            let _ = fs::remove_file(&path);
-            return Err(error);
-        }
-        sync_parent_dir_best_effort(&path);
-        return Ok(path);
-    }
-    Err(io::Error::new(io::ErrorKind::AlreadyExists, "unable to allocate per-run log filename"))
 }
 
 // Called while a whole-album backup remains available. A legacy pre-R20
@@ -23368,11 +23358,6 @@ fn finalize_incomplete_conversion_log_batch_if_needed(
                 break;
             }
             sync_parent_dir_best_effort(&log_path);
-            if let Err(err) = archive_conversion_log_for_run(&log_path, &target_identity_ref.conversion_log_batch_id) {
-                log::warn!("conversion log {context} could not archive report at {}: {err}", log_path.display());
-                write_failed = true;
-                break;
-            }
             entries.push(PublishedEntry {
                 final_path: log_path,
                 role: PublishRole::Sidecar(SidecarKind::ConversionLog),
@@ -53007,13 +52992,8 @@ fn finalize_published_conversion_log_timing_best_effort(
             );
             continue;
         }
-        let run_identity = req.album_batch.as_ref()
-            .map(|batch| batch.conversion_log_batch_id.as_str())
-            .unwrap_or(req.item_id.as_str());
-        if let Err(error) = archive_conversion_log_for_run(&runtime_path, run_identity) {
-            log::warn!("could not retain conversion log snapshot for {} at {}: {error}",
-                req.item_id, entry.final_path.display());
-        }
+        // Updating delivery evidence is an in-place finalization of the same
+        // run, not a new conversion displacing a historical conversion.log.
         entry.bytes = u64::try_from(finalized.len()).unwrap_or(u64::MAX);
     }
 }
@@ -70435,15 +70415,8 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         names.sort();
         let history = conversion_log_archive_files(&album_dir)
             .expect("enumerate requested conversion-log history");
-        assert_eq!(history.len(), 1, "one requested human log must have one per-run history snapshot");
-        let history_name = history[0].file_name().unwrap().to_string_lossy().to_string();
-        assert!(history_name.starts_with("conversion-20") && history_name.ends_with(".log"),
-            "human log history must use a timestamped filename: {history_name}");
-        let mut expected_names = vec!["01.flac".to_string(), "conversion.log".to_string(), history_name];
-        expected_names.sort();
-        assert_eq!(names, expected_names);
-        assert_eq!(std::fs::read(&history[0]).expect("archived human log"),
-            std::fs::read(album_dir.join("conversion.log")).expect("current human log"));
+        assert!(history.is_empty(), "a first logged run has no displaced report to archive: {history:?}");
+        assert_eq!(names, vec!["01.flac", "conversion.log"]);
         assert!(std::fs::read_dir(&log_root).expect("private log root").next().is_none());
     }
 
@@ -70485,15 +70458,8 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         names.sort();
         let history = conversion_log_archive_files(&album_dir)
             .expect("enumerate requested conversion-log history");
-        assert_eq!(history.len(), 1, "one requested human log must have one per-run history snapshot");
-        let history_name = history[0].file_name().unwrap().to_string_lossy().to_string();
-        assert!(history_name.starts_with("conversion-20") && history_name.ends_with(".log"),
-            "human log history must use a timestamped filename: {history_name}");
-        let mut expected_names = vec!["01.flac".to_string(), "conversion.log".to_string(), history_name];
-        expected_names.sort();
-        assert_eq!(names, expected_names);
-        assert_eq!(std::fs::read(&history[0]).expect("archived human log"),
-            std::fs::read(album_dir.join("conversion.log")).expect("current human log"));
+        assert!(history.is_empty(), "a first logged run has no displaced report to archive: {history:?}");
+        assert_eq!(names, vec!["01.flac", "conversion.log"]);
         assert!(!output_root.join(".tonepoet-logs").exists());
     }
 
@@ -70541,31 +70507,17 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         );
     }
 
-    // Explicitly enumerate the ONE human-log history artifact for this run;
-    // keep the recursive inventory closed to everything else, including dotfiles.
+    // The first logged run has only its current human log. Strict recursive
+    // inventories must reject any dated file until a later run displaces it.
     fn expected_r20_history_entry(
         root: &Path,
         album_relative: &str,
-        human_log: bool,
-        expected: &mut std::collections::BTreeSet<String>,
+        _human_log: bool,
+        _expected: &mut std::collections::BTreeSet<String>,
     ) {
-        let album = root.join(album_relative);
-        let archives = conversion_log_archive_files(&album)
-            .expect("enumerate exact R20 conversion log history");
-        if !human_log {
-            assert!(archives.is_empty(), "logging disabled cannot produce history: {archives:?}");
-            return;
-        }
-        assert_eq!(archives.len(), 1, "one finished conversion batch needs exactly one history snapshot: {archives:?}");
-        let archive = &archives[0];
-        let name = archive.file_name().and_then(|name| name.to_str())
-            .expect("valid history archive filename");
-        assert!(name.starts_with("conversion-20") && name.ends_with(".log"),
-            "human-readable timestamped archive name: {name}");
-        assert_eq!(std::fs::read(archive).expect("archived log"),
-            std::fs::read(album.join("conversion.log")).expect("current log"),
-            "the per-run snapshot must contain the final visible log");
-        expected.insert(format!("{album_relative}/{name}"));
+        let archives = conversion_log_archive_files(&root.join(album_relative))
+            .expect("enumerate fresh album conversion log history");
+        assert!(archives.is_empty(), "a first run must not create a dated snapshot: {archives:?}");
     }
 
     #[test]
@@ -76243,36 +76195,43 @@ Recovered provenance
     }
 
     #[test]
-    fn r20_distinct_runs_retain_distinct_log_snapshots_and_legacy_history() {
+    fn r22_history_archives_only_displaced_reports_with_original_run_time() {
         let scratch = tempfile::tempdir().expect("history scratch");
         let visible = scratch.path().join("conversion.log");
-        std::fs::write(&visible, b"run one").expect("first log");
-        let first = archive_conversion_log_for_run(&visible, "run-one")
-            .expect("first archived run");
-        assert!(first.exists());
-        std::fs::write(&visible, b"run one, finalized").expect("final log");
-        assert_eq!(archive_conversion_log_for_run(&visible, "run-one")
-            .expect("same run updates its snapshot"), first);
-        assert_eq!(std::fs::read(&first).expect("updated archive"), b"run one, finalized");
+        let run_one = b"TONEPOET CONVERSION LOG\nGenerated (UTC): 2026-10-09 10:11:12 UTC\nJob ID: first\n";
+        let run_two = b"TONEPOET CONVERSION LOG\nGenerated (UTC): 2026-10-09 10:11:12 UTC\nJob ID: second\n";
+        let run_three = b"TONEPOET CONVERSION LOG\nGenerated (UTC): 2026-10-09 10:11:12 UTC\nJob ID: third\n";
 
-        std::fs::write(&visible, b"run one, finalized").expect("second, identical log");
-        let second = archive_conversion_log_for_run(&visible, "run-two")
-            .expect("separate conversion archived even with matching bytes");
-        assert_ne!(first, second, "different runs must not alias an archive");
-        assert_eq!(conversion_log_archive_files(scratch.path()).unwrap().len(), 2);
+        // A first run never archives itself, including its final-delivery edit.
+        std::fs::write(&visible, run_one).expect("first report");
+        assert!(conversion_log_archive_files(scratch.path()).unwrap().is_empty());
+        // The second publish preserves the old visible report before writing
+        // the replacement; the helper must never create a snapshot by itself
+        // for a freshly published first report.
+        preserve_previous_conversion_log(&visible).expect("preserve first report");
+        let first_history = conversion_log_archive_files(scratch.path()).unwrap();
+        assert_eq!(first_history.len(), 1);
+        let name = first_history[0].file_name().unwrap().to_string_lossy();
+        assert!(name.starts_with("conversion-20261009T101112Z-"), "timestamp must be from the displaced run: {name}");
+        assert_eq!(std::fs::read(&first_history[0]).unwrap(), run_one);
+        std::fs::write(&visible, run_two).expect("second run installed");
+        preserve_previous_conversion_log(&visible).expect("preserve second run");
+        preserve_previous_conversion_log(&visible).expect("idempotent retry");
+        let history = conversion_log_archive_files(scratch.path()).unwrap();
+        assert_eq!(history.len(), 2, "distinct same-second runs need collision-free history");
+        assert_ne!(history[0], history[1]);
+        assert!(history.iter().any(|path| std::fs::read(path).unwrap() == run_one));
+        assert!(history.iter().any(|path| std::fs::read(path).unwrap() == run_two));
 
-        std::fs::write(&visible, b"legacy-visible-not-yet-archived").unwrap();
-        preserve_previous_conversion_log(&visible).expect("retain legacy conversion.log before replacement");
-        preserve_previous_conversion_log(&visible).expect("repeat is idempotent");
-        assert_eq!(conversion_log_archive_files(scratch.path()).unwrap().len(), 3);
-
+        std::fs::write(&visible, run_three).unwrap();
+        // The latest run must remain visible even when carrying history into a
+        // new whole-album destination.
         let next_album = scratch.path().join("next-album");
         std::fs::create_dir_all(&next_album).unwrap();
         carry_previous_album_log_history(scratch.path(), &next_album)
-            .expect("whole-album replacement retains all history");
+            .expect("whole-album replacement retains displaced report and older history");
         assert_eq!(conversion_log_archive_files(&next_album).unwrap().len(), 3);
-        assert_eq!(std::fs::read(next_album.join("conversion.log")).unwrap(),
-            b"legacy-visible-not-yet-archived");
+        assert_eq!(std::fs::read(next_album.join("conversion.log")).unwrap(), run_three);
     }
 
     #[test]
@@ -78511,6 +78470,8 @@ mod publish_lock_soundness_tests {
             !coord_dir.join("conversion.log").exists(),
             "the hidden coordination workspace must not become the user-visible log destination"
         );
+        assert!(conversion_log_archive_files(&disc_one).unwrap().is_empty());
+        assert!(conversion_log_archive_files(&disc_two).unwrap().is_empty());
     }
 
     #[cfg(unix)]
@@ -81290,6 +81251,11 @@ mod publish_lock_soundness_tests {
             std::fs::read(disc_two.join("conversion.log")).expect("disc two log"),
             b"new assembled log\n"
         );
+        for (album, old) in [(&disc_one, b"old one".as_slice()), (&disc_two, b"old two".as_slice())] {
+            let archived = conversion_log_archive_files(album).expect("displaced report retained");
+            assert_eq!(archived.len(), 1, "only old report is archived");
+            assert_eq!(std::fs::read(&archived[0]).unwrap(), old);
+        }
         assert!(
             !coord_dir.join(CONVERSION_LOG_VISIBLE_COMMIT_MARKER_FILE).exists(),
             "successful visible-log set commit removes its recovery marker"

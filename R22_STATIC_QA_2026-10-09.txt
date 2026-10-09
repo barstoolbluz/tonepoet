@@ -1,0 +1,21 @@
+PASS src/convert/pipeline/stages.rs: balanced delimiters (lexical, not Rust parser)
+PASS src/convert/pipeline/execution_evidence.rs: balanced delimiters (lexical, not Rust parser)
+PASS src/tui/command.rs: balanced delimiters (lexical, not Rust parser)
+PASS human typed evidence before portable JSON has no Debug formats ([2225, 2272, 2282, 2290])
+PASS direct encoder regression present
+PASS ISO probe gates present
+PASS ISO reducer regressions present
+PASS per-run duplicate log archiver removed
+PASS displaced-run preservation with source timestamp
+PASS history test present
+PASS modified expected file: src/convert/pipeline/stages.rs
+PASS modified expected file: src/convert/pipeline/execution_evidence.rs
+PASS modified expected file: src/tui/command.rs
+PASS modified expected file: scripts/smoke_r20_album_publication.sh
+PASS Reference sidecar unchanged (must requalify): dsd_reference_common_v18_report.json
+PASS Reference sidecar unchanged (must requalify): dsd_reference_common_v18_certification.json
+PASS Reference sidecar unchanged (must requalify): dsd_reference_common_v18_evidence.json
+PASS Reference sidecar unchanged (must requalify): dsd_reference_common_v18_source_lock.json
+PASS Reference source lock correctly identifies unqualified changed stages.rs
+PASS Bash scripts syntax
+OFFLINE GATES: 20/20 PASS

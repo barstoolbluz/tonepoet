@@ -9379,7 +9379,16 @@ fn finish_browse_queue_review_after_expansion(
     // DSD availability, so applying now would interpret the preset against the
     // previous/placeholder source and either drop or refuse valid DSD fields.
     if let Some(name) = preset {
-        if app.convert.source.mode.probe_in_progress() {
+        // A generic .iso has no DSD/PCM extension authority. A worker is
+        // launched for it during source installation, so retain the preset
+        // until the source probe establishes its identity. Do not treat an
+        // absent probe notice as proof that the ISO contains PCM.
+        let unresolved_iso = app.convert.source.mode.current_path().is_some_and(|path| {
+            path.extension().and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("iso"))
+                && app.convert.source.mode.current_info().is_none()
+        });
+        if app.convert.source.mode.probe_in_progress() || unresolved_iso {
             let Some(path) = app.convert.source.mode.current_path().cloned() else {
                 app.set_status("preset application refused: probed source has no current path");
                 return false;
@@ -9430,6 +9439,27 @@ pub(crate) fn complete_pending_browse_convert_preset_after_probe(
         .pending_browse_convert_preset_continuation
         .take()
         .expect("matching deferred preset continuation must exist");
+
+    // A completed worker event is not by itself a successful probe. A failed
+    // ISO probe still leaves an extension hint (which says "not DSD"); never
+    // interpret source-dependent preset fields against that placeholder.
+    // Refresh from available typed facts before strict atomic application;
+    // the source may have been published as MultiTrack by the async mapper.
+    if app.convert.source.mode.current_path().map(PathBuf::as_path) == Some(path) {
+        if let Some(info) = app.convert.source.mode.current_info().cloned() {
+            app.convert.refresh_source_info_constraints_preserving_format_selection(&info);
+        }
+    }
+    let is_iso = path.extension().and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("iso"));
+    if is_iso && app.convert.format.source_rate_identity != super::app::SourceRateIdentity::Known {
+        app.set_status(format!(
+            "preset '{}' not applied: ISO source type could not be established by the audio probe",
+            pending.preset,
+        ));
+        return true;
+    }
+
     match load_queue_preset_into_pills(app, &pending.preset) {
         Ok(report) => {
             app.set_status(format!(
@@ -20503,6 +20533,161 @@ mod execute_queue_state_consistency_tests {
         );
         assert!(app.pending_browse_convert_expansion.is_none());
         assert_eq!(app.current_screen, AppScreen::Browse);
+    }
+
+    fn r22_iso_reference_preset(name: &str) -> super::super::presets::TuiPreset {
+        let mut format = super::super::app::FormatState::new();
+        format.sample_rate.select_value(&88_200);
+        format.bit_depth.select_value(&super::super::app::BitDepthChoice::Int24);
+        let output = super::super::app::OutputOptionsState::new();
+        let metadata = super::super::app::MetadataState::default();
+        let mut preset = super::super::presets::TuiPreset::from_pill_state(
+            name, &format, &output, &metadata,
+        );
+        preset.dsd_path = Some("reference".to_string());
+        preset.dsd_profile = Some("reference".to_string());
+        preset.dsd_gain = Some("auto".to_string());
+        preset.dsd_true_peak_target_dbtp = Some("-1.000000000".to_string());
+        preset.dsd_true_peak_scope = Some("track".to_string());
+        preset.dsd_true_peak_scan = Some("fast066v2_reference".to_string());
+        preset
+    }
+
+    #[tokio::test]
+    async fn r22_folder_iso_reference_preset_applies_only_after_dsd64_probe_facts() {
+        let _home = crate::tui::test_support::XdgConfigHomeGuard::new("r22-iso-reference");
+        let temp = tempfile::tempdir().expect("temporary source directory");
+        let iso = temp.path().join("album.iso");
+        std::fs::write(&iso, b"iso probe dispatch fixture").expect("write source path");
+        let name = "r22-iso-reference-preset";
+        let preset = r22_iso_reference_preset(name);
+        super::super::presets::save_preset(&preset).expect("save DSD Reference preset");
+
+        let (tx, _rx) = mpsc::channel(8);
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        assert!(finish_browse_queue_review_after_expansion(
+            &mut app, &tx, Some(name.to_string()), BrowseConvertPostLoad::ReviewOnly,
+            QueueExpansionResult {
+                paths: vec![iso.clone()],
+                ..QueueExpansionResult::default()
+            },
+            1, true,
+        ));
+        assert!(!app.convert.format.source_is_dsd, "unprobed ISO must not imply DSD");
+        assert!(app.pending_browse_convert_preset_continuation.is_some());
+        assert!(app.preset.active_preset.is_none());
+        let generation = app.probe_generation;
+        assert!(!complete_pending_browse_convert_preset_after_probe(
+            &mut app, &tx, generation.saturating_sub(1), &iso,
+        ), "stale probe must not consume the preset continuation");
+
+        // Simulate the successful blocking probe publication. Its authoritative
+        // DSD64 facts are identical whether source is Single or SACD MultiTrack.
+        app.convert.set_source_mode(SourceMode::Single {
+            path: iso.clone(),
+            info: Some(crate::tui::probe::SourceInfo {
+                format_name: "SACD ISO".to_string(),
+                codec: "DSD64".to_string(),
+                bit_depth: Some(1),
+                sample_format_is_float: None,
+                compression_is_lossless: None,
+                sample_rate: 2_822_400,
+                channels: 2,
+                channel_layout: "stereo".to_string(),
+                duration_secs: 180.0,
+                file_size: 10_000,
+            }),
+            metadata: crate::tui::probe::SourceMetadata::default(),
+            probe_notice: None,
+        });
+        assert!(complete_pending_browse_convert_preset_after_probe(
+            &mut app, &tx, generation, &iso,
+        ));
+        assert!(app.pending_browse_convert_preset_continuation.is_none());
+        assert_eq!(app.preset.active_preset.as_deref(), Some(name));
+        assert!(app.convert.format.dsd_reference_path_selected());
+        let status = app.status_message.as_ref().map(|(s, _)| s.as_str()).unwrap_or("");
+        assert!(status.contains("preset loaded"), "{status}");
+        assert!(!status.contains("refused fields"), "{status}");
+    }
+
+    #[tokio::test]
+    async fn r22_proven_pcm_iso_keeps_strict_preset_refusal_atomic() {
+        let _home = crate::tui::test_support::XdgConfigHomeGuard::new("r22-pcm-iso-refusal");
+        let temp = tempfile::tempdir().expect("temporary source directory");
+        let iso = temp.path().join("ordinary-disc.iso");
+        std::fs::write(&iso, b"non SACD ISO fixture").expect("write source path");
+        let name = "r22-reference-for-pcm-iso";
+        super::super::presets::save_preset(&r22_iso_reference_preset(name))
+            .expect("save Reference preset");
+        let (tx, _rx) = mpsc::channel(8);
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        assert!(finish_browse_queue_review_after_expansion(
+            &mut app, &tx, Some(name.to_string()), BrowseConvertPostLoad::ReviewOnly,
+            QueueExpansionResult { paths: vec![iso.clone()], ..QueueExpansionResult::default() },
+            1, true,
+        ));
+        let generation = app.probe_generation;
+        app.convert.set_source_mode(SourceMode::Single {
+            path: iso.clone(),
+            info: Some(crate::tui::probe::SourceInfo {
+                format_name: "DVD image".to_string(),
+                codec: "PCM signed 16-bit little-endian".to_string(),
+                bit_depth: Some(16),
+                sample_format_is_float: Some(false),
+                compression_is_lossless: Some(true),
+                sample_rate: 48_000,
+                channels: 2,
+                channel_layout: "stereo".to_string(),
+                duration_secs: 90.0,
+                file_size: 10_000,
+            }),
+            metadata: crate::tui::probe::SourceMetadata::default(),
+            probe_notice: None,
+        });
+        let previous_pathway = *app.convert.format.dsd_pathway.selected_value();
+        assert!(complete_pending_browse_convert_preset_after_probe(
+            &mut app, &tx, generation, &iso,
+        ));
+        assert!(app.pending_browse_convert_preset_continuation.is_none());
+        assert!(app.preset.active_preset.is_none());
+        assert_eq!(*app.convert.format.dsd_pathway.selected_value(), previous_pathway);
+        let status = app.status_message.as_ref().map(|(s, _)| s.as_str()).unwrap_or("");
+        assert!(status.contains("refused fields"), "{status}");
+        assert!(status.contains("dsd_path"), "{status}");
+    }
+
+    #[tokio::test]
+    async fn r22_iso_probe_failure_does_not_interpret_reference_preset_against_hint() {
+        let temp = tempfile::tempdir().expect("temporary source directory");
+        let iso = temp.path().join("unknown.iso");
+        std::fs::write(&iso, b"unrecognized ISO").expect("write source path");
+        let (tx, _rx) = mpsc::channel(8);
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        assert!(finish_browse_queue_review_after_expansion(
+            &mut app, &tx, Some("reference-when-probed".to_string()),
+            BrowseConvertPostLoad::ReviewOnly,
+            QueueExpansionResult { paths: vec![iso.clone()], ..QueueExpansionResult::default() },
+            1, true,
+        ));
+        let generation = app.probe_generation;
+        app.convert.set_source_mode(SourceMode::Single {
+            path: iso.clone(),
+            info: None,
+            metadata: crate::tui::probe::SourceMetadata::default(),
+            probe_notice: Some("probe failed".to_string()),
+        });
+        assert!(complete_pending_browse_convert_preset_after_probe(
+            &mut app, &tx, generation, &iso,
+        ));
+        assert!(app.preset.active_preset.is_none());
+        assert!(app.pending_browse_convert_preset_continuation.is_none());
+        let status = app.status_message.as_ref().map(|(s, _)| s.as_str()).unwrap_or("");
+        assert!(status.contains("source type could not be established"), "{status}");
+        assert!(!status.contains("refused fields"), "{status}");
     }
 
     #[test]

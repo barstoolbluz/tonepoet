@@ -70,6 +70,10 @@ for count in 1 2 3; do
         >"$work/initial-$count.log" 2>&1 || status=$?
     if [[ $status -ne 0 ]]; then cat "$work/initial-$count.log" >&2; fail "first pass N=$count failed"; fi
     assert_one_album "$output" "$album" "$count" "first pass N=$count"
+    [[ -f "$album/conversion.log" ]] || fail "N=$count: first run omitted conversion.log"
+    [[ $(find "$album" -maxdepth 1 -type f -name 'conversion-*.log' | wc -l) -eq 0 ]] || \
+        fail "N=$count: first run created duplicate log history"
+    cp "$album/conversion.log" "$work/displaced-$count.log"
     status=0
     "$binary" convert "$input" --format flac --output "$output" \
         --folder-naming "$album_name" --replaygain off --write-log --workers 2 --no-cue --overwrite-output \
@@ -81,7 +85,11 @@ for count in 1 2 3; do
     [[ -z $(find "$output" -type d -name '.tonepoet-backup-*' -print -quit) ]] || \
         fail "successful overwrite N=$count left a recovery backup"
     log_count=$(find "$output" -type f -name 'conversion-*.log' | wc -l)
-    [[ $log_count -ge 2 ]] || fail "N=$count: a second run did not retain both conversion logs ($log_count)"
+    [[ $log_count -eq 1 ]] || fail "N=$count: second run must archive exactly the displaced report ($log_count)"
+    mapfile -d '' -t history < <(find "$album" -maxdepth 1 -type f -name 'conversion-*.log' -print0)
+    [[ ${#history[@]} -eq 1 ]] || fail "N=$count: lost historical album log"
+    cmp -s "$work/displaced-$count.log" "${history[0]}" || \
+        fail "N=$count: historical snapshot differs from displaced conversion.log"
     printf 'PASS overwrite N=%s: all audio survives, no backup remains, history retained\n' "$count"
 done
 

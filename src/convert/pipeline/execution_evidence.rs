@@ -51,6 +51,210 @@ impl EvidenceValue {
     }
 }
 
+// Human-report spellings are an explicit projection of typed planner evidence.
+// Avoid Rust Debug output here: enum variant names are not public UI language.
+fn pcm_depth_label(depth: PcmBitDepth) -> String {
+    let kind = if depth.is_float() { "floating-point" } else { "integer" };
+    format!("{}-bit {kind}", depth.bits())
+}
+
+fn storage_precision_label(precision: &tonepoet_pipeline::StoragePrecision) -> String {
+    use tonepoet_pipeline::StoragePrecision;
+    match precision {
+        StoragePrecision::Pcm(depth) => pcm_depth_label(*depth),
+        StoragePrecision::OneBit => "1-bit DSD".to_string(),
+        StoragePrecision::Encoded => "encoded samples".to_string(),
+        StoragePrecision::Pending => "not yet established".to_string(),
+    }
+}
+
+fn value_domain_label(domain: &tonepoet_pipeline::ValueDomain) -> String {
+    use tonepoet_pipeline::ValueDomain;
+    match domain {
+        ValueDomain::IntegerLattice(depth) => format!("exact {} samples", pcm_depth_label(*depth)),
+        ValueDomain::FiniteFloating => "finite floating-point samples".to_string(),
+        ValueDomain::Q1_31DerivedBinary64 =>
+            "64-bit floating-point, exact Q1.31-derived samples".to_string(),
+        ValueDomain::OneBit => "1-bit DSD samples".to_string(),
+        ValueDomain::Encoded => "encoded samples (decoded precision not specified)".to_string(),
+        ValueDomain::Pending(reason) => format!("not yet established ({reason})"),
+    }
+}
+
+fn dither_label(mode: tonepoet_pipeline::DitherType) -> &'static str {
+    use tonepoet_pipeline::DitherType;
+    match mode {
+        DitherType::None => "none",
+        DitherType::Tpdf => "triangular (TPDF)",
+        DitherType::SlopedTpdf => "sloped triangular (TPDF)",
+        DitherType::Shibata => "Shibata noise shaping",
+        DitherType::Lipshitz => "Lipshitz noise shaping",
+        DitherType::FWeighted => "F-weighted noise shaping",
+        DitherType::ModifiedEWeighted => "modified E-weighted noise shaping",
+        DitherType::ImprovedEWeighted => "improved E-weighted noise shaping",
+        DitherType::Gesemann => "Gesemann noise shaping",
+        DitherType::LowShibata => "low-Shibata noise shaping",
+        DitherType::HighShibata => "high-Shibata noise shaping",
+    }
+}
+
+fn ssrc_pdf_label(pdf: tonepoet_pipeline::SsrcPdfType) -> &'static str {
+    match pdf {
+        tonepoet_pipeline::SsrcPdfType::Rectangular => "rectangular",
+        tonepoet_pipeline::SsrcPdfType::Triangular => "triangular",
+    }
+}
+
+fn ssrc_origin_label(origin: tonepoet_pipeline::plugins::SsrcDitherOrigin) -> &'static str {
+    use tonepoet_pipeline::plugins::SsrcDitherOrigin;
+    match origin {
+        SsrcDitherOrigin::None => "none",
+        SsrcDitherOrigin::GlobalExact => "global choice (exact mapping)",
+        SsrcDitherOrigin::GlobalApproximation => "global choice (SSRC approximation)",
+        SsrcDitherOrigin::NativeOverride => "explicit SSRC controls",
+    }
+}
+
+fn ssrc_dither_label(resolved: &tonepoet_pipeline::plugins::ResolvedSsrcDither) -> String {
+    match (resolved.dither_id, resolved.pdf_type) {
+        (None, None) => "none".to_string(),
+        (id, pdf) => {
+            let algorithm = id.map(|value| format!("algorithm {value}"))
+                .unwrap_or_else(|| "no named algorithm".to_string());
+            let distribution = pdf.map(|value| format!(", {} distribution", ssrc_pdf_label(value)))
+                .unwrap_or_default();
+            format!("{algorithm}{distribution}")
+        }
+    }
+}
+
+fn sample_gain_policy_label(policy: &tonepoet_pipeline::SampleGainPolicy) -> String {
+    use tonepoet_pipeline::SampleGainPolicy;
+    match policy {
+        SampleGainPolicy::Off => "no additional gain".to_string(),
+        SampleGainPolicy::FixedGain { gain_db } => format!("fixed gain {gain_db} dB"),
+        SampleGainPolicy::TruePeakGuard { target_dbtp, scope, scan } =>
+            format!("true-peak protection at {target_dbtp} dBTP ({}, {} scan)",
+                true_peak_scope_label(*scope), true_peak_scan_label(*scan)),
+        SampleGainPolicy::TruePeakNormalize { target_dbtp, scope, scan } =>
+            format!("true-peak normalization to {target_dbtp} dBTP ({}, {} scan)",
+                true_peak_scope_label(*scope), true_peak_scan_label(*scan)),
+    }
+}
+
+fn true_peak_scope_label(scope: tonepoet_pipeline::TruePeakScope) -> &'static str {
+    match scope {
+        tonepoet_pipeline::TruePeakScope::Track => "per track",
+        tonepoet_pipeline::TruePeakScope::Album => "per album",
+    }
+}
+
+fn true_peak_scan_label(scan: tonepoet_pipeline::TruePeakScanTier) -> &'static str {
+    match scan {
+        tonepoet_pipeline::TruePeakScanTier::Fast => "fast",
+        tonepoet_pipeline::TruePeakScanTier::Standard => "standard",
+        tonepoet_pipeline::TruePeakScanTier::Reference => "reference",
+    }
+}
+
+fn dsd_export_level_label(level: tonepoet_pipeline::DsdGeneralExportLevel) -> String {
+    use tonepoet_pipeline::DsdGeneralExportLevel;
+    match level {
+        DsdGeneralExportLevel::Native => "native reconstructed level".to_string(),
+        DsdGeneralExportLevel::NominalCompensated => "nominal compensated level".to_string(),
+        DsdGeneralExportLevel::ProtectedR64 => "protected R64 level".to_string(),
+        DsdGeneralExportLevel::NativeWithOffset { offset_db } =>
+            format!("native reconstructed level with {offset_db} dB offset"),
+    }
+}
+
+fn dsd_lowpass_label(value: tonepoet_pipeline::DsdLowpassMethod) -> &'static str {
+    match value {
+        tonepoet_pipeline::DsdLowpassMethod::Auto => "automatic low-pass",
+        tonepoet_pipeline::DsdLowpassMethod::SoxUltra => "SoX ultra-quality low-pass",
+        tonepoet_pipeline::DsdLowpassMethod::Sinc => "custom sinc low-pass",
+    }
+}
+
+fn dsd_sinc_label(value: &tonepoet_pipeline::DsdToPcmSincSettings) -> String {
+    format!("{} taps, {} Hz passband, {} Hz transition, Kaiser beta {}, {} phase, aliasing {}",
+        value.taps, value.passband_hz, value.transition_hz, value.kaiser_beta,
+        if value.linear_phase { "linear" } else { "minimum" },
+        if value.allow_aliasing { "allowed" } else { "prohibited" })
+}
+
+fn pcm_dsd_sinc_label(value: &tonepoet_pipeline::PcmToDsdSincSettings) -> String {
+    format!("{}x oversampling, {} taps, {} Hz passband, {} Hz transition, Kaiser beta {}, {} phase, aliasing {}",
+        value.oversample_factor, value.taps, value.passband_hz, value.transition_hz,
+        value.kaiser_beta, if value.linear_phase { "linear" } else { "minimum" },
+        if value.allow_aliasing { "allowed" } else { "prohibited" })
+}
+
+fn gain_compensation_label(value: tonepoet_pipeline::GainCompensation) -> String {
+    match value {
+        tonepoet_pipeline::GainCompensation::Auto => "automatic".to_string(),
+        tonepoet_pipeline::GainCompensation::Disabled => "disabled".to_string(),
+        tonepoet_pipeline::GainCompensation::Linear(value) => format!("linear gain factor {value}"),
+        tonepoet_pipeline::GainCompensation::Decibels(value) => format!("{value} dB"),
+    }
+}
+
+fn reference_package_target_label(target: tonepoet_pipeline::ResolvedOutputTarget) -> &'static str {
+    use tonepoet_pipeline::ResolvedOutputTarget as Target;
+    match target {
+        Target::FlacNative => "FLAC (native)",
+        Target::FlacOgg => "FLAC (Ogg)",
+        Target::FlacMka => "FLAC (Matroska audio)",
+        Target::FlacMkv => "FLAC (Matroska)",
+        Target::WavRiff => "WAV (RIFF)",
+        Target::WavRf64 => "WAV (RF64)",
+        Target::WavW64 => "Wave64",
+        Target::WavMka => "WAV (Matroska audio)",
+        Target::WavMkv => "WAV (Matroska)",
+        Target::AiffNative => "AIFF",
+        Target::AiffMka => "AIFF (Matroska audio)",
+        Target::AiffMkv => "AIFF (Matroska)",
+        Target::WavPackNative => "WavPack (native)",
+        Target::WavPackMka => "WavPack (Matroska audio)",
+        Target::WavPackMkv => "WavPack (Matroska)",
+        Target::Mp3Native => "MP3",
+        Target::Mp3Mka => "MP3 (Matroska audio)",
+        Target::Mp3Mkv => "MP3 (Matroska)",
+        Target::AacM4a => "AAC (M4A)",
+        Target::AacMp4 => "AAC (MP4)",
+        Target::AacM4b => "AAC (M4B)",
+        Target::AacMka => "AAC (Matroska audio)",
+        Target::AacMkv => "AAC (Matroska)",
+        Target::OpusNative => "Opus",
+        Target::OpusWebM => "Opus (WebM)",
+        Target::OpusWebA => "Opus (WebA)",
+        Target::OpusMka => "Opus (Matroska audio)",
+        Target::OpusMkv => "Opus (Matroska)",
+        Target::AlacM4a => "ALAC (M4A)",
+        Target::AlacMp4 => "ALAC (MP4)",
+        Target::DsfNative => "DSF",
+        Target::DsfAsDff => "DSF source delivered as DFF",
+        Target::DffNative => "DFF",
+        Target::DtsNative => "DTS",
+        Target::DtsMka => "DTS (Matroska audio)",
+        Target::DtsMkv => "DTS (Matroska)",
+        Target::DtsMp4 => "DTS (MP4)",
+        Target::Ac3Native => "AC-3",
+        Target::Ac3Mka => "AC-3 (Matroska audio)",
+        Target::Ac3Mkv => "AC-3 (Matroska)",
+        Target::Ac3Mp4 => "AC-3 (MP4)",
+        Target::LpcmRiff => "LPCM (RIFF)",
+        Target::LpcmAiff => "LPCM (AIFF)",
+    }
+}
+
+fn required_facts_label(facts: &[tonepoet_pipeline::RequiredFact]) -> String {
+    facts.iter()
+        .map(|fact| format!("{}: {}", fact.key, fact.reason))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 fn trim_decimal(value: f64) -> String {
     let mut rendered = format!("{value:.6}");
     while rendered.contains('.') && rendered.ends_with('0') {
@@ -625,7 +829,7 @@ pub fn completed_reference_plan_evidence(
         invocation_count,
     )?;
     validate_invocation_indices(
-        "Reference terminal",
+        "Reference audio encoding",
         terminal_invocation_indices,
         invocation_count,
     )?;
@@ -701,7 +905,7 @@ pub fn completed_reference_plan_evidence(
                 ));
                 record.parameters.push(OperationParameter::new(
                     "Target precision",
-                    EvidenceValue::BitDepth("Float64".to_string()),
+                    EvidenceValue::BitDepth("64-bit floating-point".to_string()),
                 ));
                 record.invocation_indices = dsd_to_pcm_invocation_indices.to_vec();
                 evidence.operations.push(record);
@@ -733,7 +937,7 @@ pub fn completed_reference_plan_evidence(
                 let mut record = OperationRecord::completed(
                     "reference-terminal-realization",
                     "reference_terminal_realization",
-                    "Qualified Reference terminal realization",
+                    "Qualified Reference audio encoding",
                     ExecutionBackend::native("TonePoet qualified Reference path"),
                 );
                 record.inputs.push(EvidenceArtifactRef::path(
@@ -769,7 +973,7 @@ pub fn completed_reference_plan_evidence(
                 ));
                 record.parameters.push(OperationParameter::new(
                     "Target",
-                    EvidenceValue::Text(format!("{target:?}")),
+                    EvidenceValue::Text(reference_package_target_label(*target).to_string()),
                 ));
                 record.invocation_indices = package_invocation_indices.to_vec();
                 record.domain = OperationDomain::Artifact;
@@ -795,7 +999,7 @@ pub fn completed_plan_evidence(
     let typed = match plan_typed(request).map_err(|error| error.to_string())? {
         PlanningOutcome::Ready(plan) => plan,
         PlanningOutcome::NeedFacts(facts) => {
-            return Err(format!("typed plan still needs facts: {facts:?}"));
+            return Err(format!("typed plan still needs facts: {}", required_facts_label(&facts)));
         }
         PlanningOutcome::Refused(refusal) => {
             return Err(format!("typed plan refused: {}: {}", refusal.code, refusal.reason));
@@ -826,7 +1030,7 @@ pub fn completed_plan_evidence(
                     evidence.verifications.push(VerificationRecord {
                         id: format!("plan-node-{node_index}"),
                         kind: operation.label().to_string(),
-                        statement: "Planner-requested terminal verification completed".to_string(),
+                        statement: "Planned output verification completed".to_string(),
                         status: VerificationStatus::Passed,
                         invocation_indices: indices,
                     });
@@ -925,7 +1129,7 @@ pub fn completed_plan_evidence(
                 record.outputs.push(EvidenceArtifactRef::signal(output.0));
                 record.parameters.push(OperationParameter::new(
                     "Policy",
-                    EvidenceValue::Text(format!("{policy:?}")),
+                    EvidenceValue::Text(sample_gain_policy_label(policy)),
                 ));
                 if let Some(decision) = decision {
                     record.decision_ids.push(format!("decision-{}", decision.0));
@@ -948,7 +1152,7 @@ pub fn completed_plan_evidence(
                 record.outputs.push(EvidenceArtifactRef::signal(output.0));
                 record.parameters.push(OperationParameter::new(
                     "Level",
-                    EvidenceValue::Text(format!("{level:?}")),
+                    EvidenceValue::Text(dsd_export_level_label(*level)),
                 ));
                 record.parameters.push(OperationParameter::new(
                     "Gain",
@@ -965,7 +1169,7 @@ pub fn completed_plan_evidence(
                 let mut record = OperationRecord::completed(
                     format!("plan-node-{node_index}"),
                     "reference_terminal_realization",
-                    "Qualified Reference terminal realization",
+                    "Qualified Reference audio encoding",
                     ExecutionBackend::native("TonePoet qualified Reference path"),
                 );
                 record.inputs.push(EvidenceArtifactRef::signal(input.0));
@@ -1071,7 +1275,7 @@ pub fn completed_registered_effects_from_plan(
     {
         PlanningOutcome::Ready(plan) => plan,
         PlanningOutcome::NeedFacts(facts) => {
-            return Err(format!("effect-aware typed plan still needs facts: {facts:?}"));
+            return Err(format!("effect-aware typed plan still needs facts: {}", required_facts_label(&facts)));
         }
         PlanningOutcome::Refused(refusal) => {
             return Err(format!("effect-aware typed plan refused: {}: {}", refusal.code, refusal.reason));
@@ -1363,7 +1567,7 @@ pub fn completed_effect_operation(
             "Sample-peak normalization",
             vec![OperationParameter::new(
                 "Target",
-                EvidenceValue::Text(format!("{target_dbfs:?}")),
+                EvidenceValue::Text(format!("{target_dbfs} dBFS")),
             )],
         ),
         RegisteredUnaryEffect::CdDeemphasis => (
@@ -1390,7 +1594,7 @@ pub fn record_native_scalar_materialization(
         if !operation.parameters.iter().any(|parameter| parameter.name == "Gain") {
             operation.parameters.push(OperationParameter::new(
                 "Gain",
-                EvidenceValue::Text(format!("{:?}", pump.gain_db)),
+                EvidenceValue::Text(format!("{} dB", pump.gain_db)),
             ));
         }
         return;
@@ -1408,7 +1612,7 @@ pub fn record_native_scalar_materialization(
     ));
     operation.parameters.push(OperationParameter::new(
         "Gain",
-        EvidenceValue::Text(format!("{:?}", pump.gain_db)),
+        EvidenceValue::Text(format!("{} dB", pump.gain_db)),
     ));
     evidence.operations.push(operation);
 }
@@ -1424,7 +1628,7 @@ pub fn record_native_scalar_attempt_materialization(
         if !operation.parameters.iter().any(|parameter| parameter.name == "Gain") {
             operation.parameters.push(OperationParameter::new(
                 "Gain",
-                EvidenceValue::Text(format!("{:?}", pump.gain_db)),
+                EvidenceValue::Text(format!("{} dB", pump.gain_db)),
             ));
         }
         return;
@@ -1447,7 +1651,7 @@ pub fn record_native_scalar_attempt_materialization(
     ));
     operation.parameters.push(OperationParameter::new(
         "Gain",
-        EvidenceValue::Text(format!("{:?}", pump.gain_db)),
+        EvidenceValue::Text(format!("{} dB", pump.gain_db)),
     ));
     operation.status = OperationStatus::Incomplete;
     operation.lineage = OperationLineage::DiscardedAttempt;
@@ -1472,14 +1676,14 @@ fn operation_human_name(operation: &PlanOperation) -> &'static str {
     match operation {
         PlanOperation::DecodeToPcm { .. } => "Decode to PCM",
         PlanOperation::ResamplePcm { .. } => "Sample-rate conversion",
-        PlanOperation::EncodePcm { .. } => "PCM encoding / terminal realization",
+        PlanOperation::EncodePcm { .. } => "Encoding",
         PlanOperation::EncodeLossy { .. } => "Lossy encoding",
         PlanOperation::PcmToDsd { .. } => "PCM-to-DSD conversion",
         PlanOperation::DsdToPcm { .. } => "DSD-to-PCM conversion",
         PlanOperation::DsdRateChange { .. } => "DSD rate conversion",
         PlanOperation::MetadataTransfer { .. } => "Metadata transfer",
         PlanOperation::StoreSourceAudioMd5 { .. } => "Store source-audio MD5",
-        PlanOperation::Verify { .. } => "Terminal verification",
+        PlanOperation::Verify { .. } => "Output verification",
     }
 }
 
@@ -1630,91 +1834,100 @@ fn apply_pcm_terminal_realization(
     realization: &tonepoet_pipeline::SelectedPcmTerminalRealization,
 ) {
     use tonepoet_pipeline::PcmTerminalRealizationKind as Kind;
+    record.name = "Encoding".to_string();
     record.backend = match realization.kind {
         Kind::SsrcPreterminalFfmpegPackage => ExecutionBackend::Composite {
-            description: "SSRC terminal sample realization + FFmpeg packaging".to_string(),
+            description: "SSRC → FFmpeg".to_string(),
         },
         Kind::SsrcPreterminalSoxPackage => ExecutionBackend::Composite {
-            description: "SSRC terminal sample realization + SoX packaging".to_string(),
+            description: "SSRC → SoX".to_string(),
         },
         Kind::SoxPreterminalFfmpegPackage => ExecutionBackend::Composite {
-            description: "SoX terminal sample realization + FFmpeg packaging".to_string(),
+            description: "SoX → FFmpeg".to_string(),
         },
         Kind::SoxPreterminalWavPackHybrid => ExecutionBackend::Composite {
-            description: "SoX terminal sample realization + WavPack hybrid packaging".to_string(),
+            description: "SoX → WavPack hybrid encoder".to_string(),
         },
         Kind::FfmpegPreterminalWavPackHybrid => ExecutionBackend::Composite {
-            description: "FFmpeg/SoXR terminal sample realization + WavPack hybrid packaging".to_string(),
+            description: "FFmpeg/SoXR → WavPack hybrid encoder".to_string(),
         },
         _ => record.backend.clone(),
     };
 
+    // Earlier generic-plan fields are superseded by the selected typed
+    // physical route. Do not show two conflicting versions of the encoder's
+    // format, precision, dither or processing policy in one human report.
+    let processing = record.parameters.iter().find_map(|parameter| {
+        if parameter.name == "Audio processing" {
+            if let EvidenceValue::Text(value) = &parameter.value {
+                return Some(value.clone());
+            }
+        }
+        None
+    });
+    record.parameters.retain(|parameter| !matches!(parameter.name.as_str(),
+        "Format" | "Target precision" | "Target rate" | "Audio processing"
+        | "Input" | "Input sample values" | "Output" | "Sample conversion"
+        | "Sample/quantization owner" | "Output sample rate" | "Dither"
+        | "Dither owner" | "SSRC dither algorithm" | "SSRC dither distribution"
+        | "SSRC dither selection"));
+
+    let input = storage_precision_label(&realization.input_precision);
+    let output = pcm_depth_label(realization.target_bit_depth);
+    let sample_owner = terminal_sample_owner(realization.kind);
+    let direct_no_processing = processing.as_deref() == Some("none");
+    let conversion = if input == output && direct_no_processing {
+        "none (samples passed through unchanged)".to_string()
+    } else {
+        format!("{input} → {output}, by {sample_owner}")
+    };
+    let dither_owner = if realization.effective_dither.is_none()
+        || realization.effective_dither == Some(tonepoet_pipeline::DitherType::None)
+    {
+        "none".to_string()
+    } else {
+        match realization.dither_owner {
+            tonepoet_pipeline::PcmTerminalDitherOwner::SelectedTerminal => sample_owner.to_string(),
+            owner => terminal_dither_owner(owner).to_string(),
+        }
+    };
+    let dither = match realization.effective_dither {
+        Some(value) if value != tonepoet_pipeline::DitherType::None => {
+            format!("{}, by {dither_owner}", dither_label(value))
+        }
+        _ if direct_no_processing && input == output => "none (bit depth unchanged)".to_string(),
+        _ => "none".to_string(),
+    };
     record.parameters.extend([
-        OperationParameter::new(
-            "Terminal realization",
-            EvidenceValue::Text(format!("{:?}", realization.kind)),
-        ),
-        OperationParameter::new(
-            "Terminal input precision",
-            EvidenceValue::BitDepth(match &realization.input_precision {
-                tonepoet_pipeline::StoragePrecision::Pcm(depth) => format!("{depth:?}"),
-                other => format!("{other:?}"),
-            }),
-        ),
-        OperationParameter::new(
-            "Terminal input value domain",
-            EvidenceValue::Text(format!("{:?}", realization.input_value_domain)),
-        ),
-        OperationParameter::new(
-            "Terminal output format",
-            EvidenceValue::Text(format!("{:?}", realization.target_format)),
-        ),
-        OperationParameter::new(
-            "Terminal output precision",
-            EvidenceValue::BitDepth(format!("{:?}", realization.target_bit_depth)),
-        ),
-        OperationParameter::new(
-            "Terminal sample/quantization owner",
-            EvidenceValue::Text(terminal_sample_owner(realization.kind).to_string()),
-        ),
-        OperationParameter::new(
-            "Dither owner",
-            EvidenceValue::Text(terminal_dither_owner(realization.dither_owner).to_string()),
-        ),
-        OperationParameter::new(
-            "Effective terminal dither",
-            EvidenceValue::Text(
-                realization
-                    .effective_dither
-                    .map(|value| format!("{value:?}"))
-                    .unwrap_or_else(|| "None".to_string()),
-            ),
-        ),
+        OperationParameter::new("Input", EvidenceValue::Text(input)),
+        OperationParameter::new("Input sample values",
+            EvidenceValue::Text(value_domain_label(&realization.input_value_domain))),
+        OperationParameter::new("Output", EvidenceValue::Text(
+            format!("{}, {output}", realization.target_format.display_name()))),
+        OperationParameter::new("Sample conversion", EvidenceValue::Text(conversion)),
+        OperationParameter::new("Sample/quantization owner", EvidenceValue::Text(sample_owner.to_string())),
+        OperationParameter::new("Dither", EvidenceValue::Text(dither)),
+        OperationParameter::new("Dither owner", EvidenceValue::Text(dither_owner)),
     ]);
     if let Some(rate) = realization.target_rate_hz {
         record.parameters.push(OperationParameter::new(
-            "Terminal output rate",
-            EvidenceValue::SampleRateHz(rate),
+            "Output sample rate", EvidenceValue::SampleRateHz(rate),
         ));
     }
     if let Some(ssrc) = realization.ssrc_dither.as_ref() {
         if let Some(id) = ssrc.dither_id {
             record.parameters.push(OperationParameter::new(
-                "SSRC native dither id",
-                EvidenceValue::Unsigned(u64::from(id)),
+                "SSRC dither algorithm", EvidenceValue::Unsigned(u64::from(id)),
             ));
         }
         record.parameters.push(OperationParameter::new(
-            "SSRC PDF",
-            EvidenceValue::Text(
-                ssrc.pdf_type
-                    .map(|value| format!("{value:?}"))
-                    .unwrap_or_else(|| "None".to_string()),
+            "SSRC dither distribution", EvidenceValue::Text(
+                ssrc.pdf_type.map(|value| ssrc_pdf_label(value).to_string())
+                    .unwrap_or_else(|| "none".to_string()),
             ),
         ));
         record.parameters.push(OperationParameter::new(
-            "SSRC dither origin",
-            EvidenceValue::Text(format!("{:?}", ssrc.origin)),
+            "SSRC dither selection", EvidenceValue::Text(ssrc_origin_label(ssrc.origin).to_string()),
         ));
     }
 }
@@ -1738,10 +1951,22 @@ fn terminal_dither_owner(owner: tonepoet_pipeline::PcmTerminalDitherOwner) -> &'
     use tonepoet_pipeline::PcmTerminalDitherOwner as Owner;
     match owner {
         Owner::None => "none",
-        Owner::SelectedTerminal => "selected terminal backend",
-        Owner::SoxPreterminal => "SoX preterminal",
-        Owner::FfmpegPreterminal => "FFmpeg/SoXR preterminal",
-        Owner::SsrcResampler => "SSRC resampler",
+        Owner::SelectedTerminal => "selected encoder",
+        Owner::SoxPreterminal => "SoX",
+        Owner::FfmpegPreterminal => "FFmpeg/SoXR",
+        Owner::SsrcResampler => "SSRC",
+    }
+}
+
+fn resample_quality_label(quality: tonepoet_pipeline::ResampleQuality) -> &'static str {
+    use tonepoet_pipeline::ResampleQuality;
+    match quality {
+        ResampleQuality::Low => "low",
+        ResampleQuality::Medium => "medium",
+        ResampleQuality::High => "high",
+        ResampleQuality::VeryHigh => "very high",
+        ResampleQuality::Ultra => "ultra",
+        ResampleQuality::Insane => "maximum (insane profile)",
     }
 }
 
@@ -1752,96 +1977,64 @@ fn operation_parameters(
     let mut parameters = Vec::new();
     match operation {
         PlanOperation::DecodeToPcm { bit_depth } => parameters.push(OperationParameter::new(
-            "Output precision",
-            EvidenceValue::BitDepth(format!("{bit_depth:?}")),
+            "Output precision", EvidenceValue::BitDepth(pcm_depth_label(*bit_depth)),
         )),
         PlanOperation::ResamplePcm {
-            target_rate_hz,
-            target_bit_depth,
-            profile,
-            brick_wall,
+            target_rate_hz, target_bit_depth, profile, brick_wall,
         } => {
             parameters.push(OperationParameter::new(
-                "Target rate",
-                EvidenceValue::SampleRateHz(*target_rate_hz),
+                "Target rate", EvidenceValue::SampleRateHz(*target_rate_hz),
             ));
             if let Some(depth) = target_bit_depth {
                 parameters.push(OperationParameter::new(
-                    "Target precision",
-                    EvidenceValue::BitDepth(format!("{depth:?}")),
+                    "Target precision", EvidenceValue::BitDepth(pcm_depth_label(*depth)),
                 ));
             }
             if let Some(profile) = profile {
                 parameters.push(OperationParameter::new(
-                    "Profile",
-                    EvidenceValue::Text(format!("{profile:?}")),
+                    "Profile", EvidenceValue::Text(profile.as_arg().to_string()),
                 ));
             }
-            parameters.push(OperationParameter::new(
-                "Brick-wall",
-                EvidenceValue::Bool(*brick_wall),
-            ));
+            parameters.push(OperationParameter::new("Brick-wall", EvidenceValue::Bool(*brick_wall)));
         }
         PlanOperation::EncodePcm {
-            target_format,
-            target_rate_hz,
-            target_bit_depth,
-            apply_processing,
+            target_format, target_rate_hz, target_bit_depth, apply_processing,
         } => {
-            parameters.push(OperationParameter::new(
-                "Format",
-                EvidenceValue::Text(format!("{target_format:?}")),
-            ));
+            parameters.push(OperationParameter::new("Format", EvidenceValue::Text(target_format.display_name().to_string())));
             if let Some(rate) = target_rate_hz {
-                parameters.push(OperationParameter::new(
-                    "Target rate",
-                    EvidenceValue::SampleRateHz(*rate),
-                ));
+                parameters.push(OperationParameter::new("Target rate", EvidenceValue::SampleRateHz(*rate)));
             }
-            parameters.push(OperationParameter::new(
-                "Target precision",
-                EvidenceValue::BitDepth(format!("{target_bit_depth:?}")),
-            ));
-            parameters.push(OperationParameter::new(
-                "Terminal processing",
-                EvidenceValue::Bool(*apply_processing),
-            ));
+            parameters.push(OperationParameter::new("Target precision", EvidenceValue::BitDepth(pcm_depth_label(*target_bit_depth))));
+            parameters.push(OperationParameter::new("Audio processing", EvidenceValue::Text(
+                if *apply_processing { "applied" } else { "none" }.to_string(),
+            )));
         }
-        PlanOperation::EncodeLossy {
-            target_format,
-            target_rate_hz,
-            apply_processing,
-        } => {
-            parameters.push(OperationParameter::new(
-                "Format",
-                EvidenceValue::Text(format!("{target_format:?}")),
-            ));
+        PlanOperation::EncodeLossy { target_format, target_rate_hz, apply_processing } => {
+            parameters.push(OperationParameter::new("Format", EvidenceValue::Text(target_format.display_name().to_string())));
             if let Some(rate) = target_rate_hz {
-                parameters.push(OperationParameter::new(
-                    "Target rate",
-                    EvidenceValue::SampleRateHz(*rate),
-                ));
+                parameters.push(OperationParameter::new("Target rate", EvidenceValue::SampleRateHz(*rate)));
             }
-            parameters.push(OperationParameter::new(
-                "Terminal processing",
-                EvidenceValue::Bool(*apply_processing),
-            ));
+            parameters.push(OperationParameter::new("Audio processing", EvidenceValue::Text(
+                if *apply_processing { "applied" } else { "none" }.to_string(),
+            )));
         }
         PlanOperation::PcmToDsd { target_format, target_rate, filter } => {
-            parameters.push(OperationParameter::new("Format", EvidenceValue::Text(format!("{target_format:?}"))));
-            parameters.push(OperationParameter::new("DSD rate", EvidenceValue::Text(format!("{target_rate:?}"))));
-            parameters.push(OperationParameter::new("Filter", EvidenceValue::Text(format!("{filter:?}"))));
+            parameters.push(OperationParameter::new("Format", EvidenceValue::Text(target_format.display_name().to_string())));
+            parameters.push(OperationParameter::new("DSD rate", EvidenceValue::Text(format!("DSD{}", target_rate.hz() / 44_100))));
+            parameters.push(OperationParameter::new("Filter", EvidenceValue::Text(
+                match filter { tonepoet_pipeline::DsdFilterPreset::Auto => "automatic", tonepoet_pipeline::DsdFilterPreset::Sinc => "sinc FIR" }.to_string(),
+            )));
         }
         PlanOperation::DsdToPcm { target_format, target_rate_hz, target_bit_depth, lowpass } => {
-            parameters.push(OperationParameter::new("Format", EvidenceValue::Text(format!("{target_format:?}"))));
+            parameters.push(OperationParameter::new("Format", EvidenceValue::Text(target_format.display_name().to_string())));
             parameters.push(OperationParameter::new("Target rate", EvidenceValue::SampleRateHz(*target_rate_hz)));
-            parameters.push(OperationParameter::new("Target precision", EvidenceValue::BitDepth(format!("{target_bit_depth:?}"))));
-            parameters.push(OperationParameter::new("Low-pass", EvidenceValue::Text(format!("{lowpass:?}"))));
+            parameters.push(OperationParameter::new("Target precision", EvidenceValue::BitDepth(pcm_depth_label(*target_bit_depth))));
+            parameters.push(OperationParameter::new("Low-pass", EvidenceValue::Text(dsd_lowpass_label(*lowpass).to_string())));
         }
         PlanOperation::DsdRateChange { target_format, target_rate, lowpass } => {
-            parameters.push(OperationParameter::new("Format", EvidenceValue::Text(format!("{target_format:?}"))));
-            parameters.push(OperationParameter::new("DSD rate", EvidenceValue::Text(format!("{target_rate:?}"))));
-            parameters.push(OperationParameter::new("Low-pass", EvidenceValue::Text(format!("{lowpass:?}"))));
+            parameters.push(OperationParameter::new("Format", EvidenceValue::Text(target_format.display_name().to_string())));
+            parameters.push(OperationParameter::new("DSD rate", EvidenceValue::Text(format!("DSD{}", target_rate.hz() / 44_100))));
+            parameters.push(OperationParameter::new("Low-pass", EvidenceValue::Text(dsd_lowpass_label(*lowpass).to_string())));
         }
         PlanOperation::MetadataTransfer { transfer_tags, preserve_artwork, .. } => {
             parameters.push(OperationParameter::new("Tags", EvidenceValue::Bool(*transfer_tags)));
@@ -1853,42 +2046,46 @@ fn operation_parameters(
     match resolved {
         ResolvedOperationParameters::None => {}
         ResolvedOperationParameters::ResampleSsrc { effective_profile, effective_attenuation_db, effective_output_depth, computation_precision, effective_dither, authority_reason, .. } => {
-            parameters.push(OperationParameter::new("SSRC profile", EvidenceValue::Text(format!("{effective_profile:?}"))));
+            parameters.push(OperationParameter::new("SSRC profile", EvidenceValue::Text(effective_profile.as_arg().to_string())));
             if let Some(db) = effective_attenuation_db {
                 parameters.push(OperationParameter::new("Attenuation", EvidenceValue::Db(f64::from(*db))));
             }
-            parameters.push(OperationParameter::new("Output precision", EvidenceValue::BitDepth(format!("{effective_output_depth:?}"))));
-            parameters.push(OperationParameter::new("Computation precision", EvidenceValue::Text(format!("{computation_precision:?}"))));
-            parameters.push(OperationParameter::new("Dither", EvidenceValue::Text(format!("{effective_dither:?}"))));
-            parameters.push(OperationParameter::new("Authority", EvidenceValue::Text(format!("{authority_reason:?}"))));
+            parameters.push(OperationParameter::new("Output precision", EvidenceValue::BitDepth(pcm_depth_label(*effective_output_depth))));
+            parameters.push(OperationParameter::new("Computation precision", EvidenceValue::Text(
+                match computation_precision { tonepoet_pipeline::SsrcComputationPrecision::Single => "32-bit floating-point", tonepoet_pipeline::SsrcComputationPrecision::Double => "64-bit floating-point" }.to_string(),
+            )));
+            parameters.push(OperationParameter::new("Dither", EvidenceValue::Text(ssrc_dither_label(effective_dither))));
+            parameters.push(OperationParameter::new("Authority", EvidenceValue::Text(
+                match authority_reason { tonepoet_pipeline::SsrcAuthorityReason::ExplicitForce => "explicit SSRC selection", tonepoet_pipeline::SsrcAuthorityReason::CapabilitySelected => "planner capability selection" }.to_string(),
+            )));
         }
         ResolvedOperationParameters::ResampleSox { quality, effective_bandwidth_pct, effective_sinc_passband_hz, effective_dither, .. } => {
-            parameters.push(OperationParameter::new("Quality", EvidenceValue::Text(format!("{quality:?}"))));
+            parameters.push(OperationParameter::new("Quality", EvidenceValue::Text(resample_quality_label(*quality).to_string())));
             if let Some(value) = effective_bandwidth_pct { parameters.push(OperationParameter::new("Bandwidth", EvidenceValue::Percent(f64::from(*value)))); }
             if let Some(value) = effective_sinc_passband_hz { parameters.push(OperationParameter::new("Sinc passband", EvidenceValue::Decimal(f64::from(*value))).with_unit("Hz")); }
-            if let Some(value) = effective_dither { parameters.push(OperationParameter::new("Dither", EvidenceValue::Text(format!("{value:?}")))); }
+            if let Some(value) = effective_dither { parameters.push(OperationParameter::new("Dither", EvidenceValue::Text(dither_label(*value).to_string()))); }
         }
         ResolvedOperationParameters::ResampleSoxr { effective_precision, effective_cutoff, effective_phase, effective_dither, .. } => {
             parameters.push(OperationParameter::new("Precision", EvidenceValue::Unsigned(u64::from(*effective_precision))));
             parameters.push(OperationParameter::new("Cutoff", EvidenceValue::Decimal(f64::from(*effective_cutoff))));
             if let Some(value) = effective_phase { parameters.push(OperationParameter::new("Phase", EvidenceValue::Unsigned(u64::from(*value)))); }
-            if let Some(value) = effective_dither { parameters.push(OperationParameter::new("Dither", EvidenceValue::Text(format!("{value:?}")))); }
+            if let Some(value) = effective_dither { parameters.push(OperationParameter::new("Dither", EvidenceValue::Text(dither_label(*value).to_string()))); }
         }
         ResolvedOperationParameters::DsdToPcm { effective_sinc, effective_dither, .. } => {
-            if let Some(value) = effective_sinc { parameters.push(OperationParameter::new("Sinc", EvidenceValue::Text(format!("{value:?}")))); }
-            if let Some(value) = effective_dither { parameters.push(OperationParameter::new("Dither", EvidenceValue::Text(format!("{value:?}")))); }
+            if let Some(value) = effective_sinc { parameters.push(OperationParameter::new("Sinc", EvidenceValue::Text(dsd_sinc_label(value)))); }
+            if let Some(value) = effective_dither { parameters.push(OperationParameter::new("Dither", EvidenceValue::Text(dither_label(*value).to_string()))); }
         }
         ResolvedOperationParameters::PcmToDsd { effective_sinc, effective_gain_compensation, .. } => {
-            if let Some(value) = effective_sinc { parameters.push(OperationParameter::new("Sinc", EvidenceValue::Text(format!("{value:?}")))); }
-            parameters.push(OperationParameter::new("Gain compensation", EvidenceValue::Text(format!("{effective_gain_compensation:?}"))));
+            if let Some(value) = effective_sinc { parameters.push(OperationParameter::new("Sinc", EvidenceValue::Text(pcm_dsd_sinc_label(value)))); }
+            parameters.push(OperationParameter::new("Gain compensation", EvidenceValue::Text(gain_compensation_label(*effective_gain_compensation))));
         }
         ResolvedOperationParameters::DsdRateChange { effective_from_sinc, .. } => {
-            if let Some(value) = effective_from_sinc { parameters.push(OperationParameter::new("Sinc", EvidenceValue::Text(format!("{value:?}")))); }
+            if let Some(value) = effective_from_sinc { parameters.push(OperationParameter::new("Sinc", EvidenceValue::Text(dsd_sinc_label(value)))); }
         }
         ResolvedOperationParameters::EncodeFlac { effective_dither, .. }
         | ResolvedOperationParameters::EncodeWavPack { effective_dither, .. }
         | ResolvedOperationParameters::EncodePcm { effective_dither } => {
-            if let Some(value) = effective_dither { parameters.push(OperationParameter::new("Dither", EvidenceValue::Text(format!("{value:?}")))); }
+            if let Some(value) = effective_dither { parameters.push(OperationParameter::new("Dither", EvidenceValue::Text(dither_label(*value).to_string()))); }
         }
         ResolvedOperationParameters::EncodeMp3 { .. }
         | ResolvedOperationParameters::EncodeAac { .. }
@@ -2540,10 +2737,10 @@ mod tests {
             parameter.name == "Target rate"
                 && parameter.value == EvidenceValue::SampleRateHz(88_200)
         }));
-        assert!(terminal.parameters.iter().any(|parameter| parameter.name == "Terminal realization"));
+        assert!(terminal.parameters.iter().any(|parameter| parameter.name == "Output"));
         assert!(terminal.parameters.iter().any(|parameter| {
-            parameter.name == "Effective terminal dither"
-                && parameter.value == EvidenceValue::Text("None".to_owned())
+            parameter.name == "Dither"
+                && parameter.value == EvidenceValue::Text("none".to_owned())
         }));
         let export = projected.operations.iter()
             .find(|operation| operation.kind == "dsd_export_level")
@@ -2612,7 +2809,7 @@ mod tests {
                 matches!(
                     &operation.backend,
                     ExecutionBackend::Composite { description }
-                        if description == "SoX terminal sample realization + FFmpeg packaging"
+                        if description == "SoX → FFmpeg"
                 )
             })
             .expect("compound terminal operation");
@@ -2646,7 +2843,7 @@ mod tests {
                 matches!(
                     &operation.backend,
                     ExecutionBackend::Composite { description }
-                        if description == "SoX terminal sample realization + FFmpeg packaging"
+                        if description == "SoX → FFmpeg"
                 )
             })
             .expect("failed compound terminal operation");
@@ -2677,13 +2874,13 @@ mod tests {
         let evidence = completed_plan_evidence(&request, &invocations)
             .expect("undithered WavPack-hybrid evidence");
         let rendered = render_track_processing(&evidence).join("\n");
-        assert!(rendered.contains("Terminal sample/quantization owner: SoX"));
+        assert!(rendered.contains("Sample/quantization owner: SoX"));
         assert!(rendered.contains("Dither owner: none"));
-        assert!(rendered.contains("Effective terminal dither: None"));
+        assert!(rendered.contains("Dither: none"));
         assert!(!rendered.contains("Dither/quantization owner"));
 
         let portable = portable_test_track_json(&evidence, commands.len());
-        assert!(portable.contains("Terminal sample/quantization owner"));
+        assert!(portable.contains("Sample/quantization owner"));
         assert!(portable.contains("Dither owner"));
         assert!(!portable.contains("Dither/quantization owner"));
     }
@@ -2800,10 +2997,10 @@ mod tests {
             ..TrackExecutionEvidence::default()
         })
         .join("\n");
-        assert!(direct_text.contains("Terminal input precision: Float64"));
-        assert!(direct_text.contains("Terminal output precision: Int24"));
-        assert!(direct_text.contains("Terminal sample/quantization owner: FFmpeg"));
-        assert!(direct_text.contains("Dither owner: selected terminal backend"));
+        assert!(direct_text.contains("Input: 64-bit floating-point"));
+        assert!(direct_text.contains("Output: WAV, 24-bit integer"));
+        assert!(direct_text.contains("Sample/quantization owner: FFmpeg"));
+        assert!(direct_text.contains("Dither owner: FFmpeg"));
 
         let compound = projected_terminal_record(
             "ffmpeg",
@@ -2821,10 +3018,10 @@ mod tests {
             ..TrackExecutionEvidence::default()
         };
         let compound_text = render_track_processing(&compound_evidence).join("\n");
-        assert!(compound_text.contains("SoX terminal sample realization + FFmpeg packaging"));
-        assert!(compound_text.contains("Terminal sample/quantization owner: SoX"));
-        assert!(compound_text.contains("Dither owner: SoX preterminal"));
-        assert!(compound_text.contains("Effective terminal dither: SlopedTpdf"));
+        assert!(compound_text.contains("SoX → FFmpeg"));
+        assert!(compound_text.contains("Sample/quantization owner: SoX"));
+        assert!(compound_text.contains("Dither owner: SoX"));
+        assert!(compound_text.contains("Dither: sloped triangular (TPDF), by SoX"));
         let compound_portable = PortableTrackExecutionRecord {
             track_id: "track-1:source-1".to_string(),
             outcome: "success".to_string(),
@@ -2833,9 +3030,9 @@ mod tests {
         };
         let compound_json = serde_json::to_string(&compound_portable)
             .expect("serialize terminal portable evidence");
-        assert!(compound_json.contains("SoX preterminal"));
-        assert!(compound_json.contains("Float64"));
-        assert!(compound_json.contains("Int24"));
+        assert!(compound_json.contains("SoX"));
+        assert!(compound_json.contains("64-bit floating-point"));
+        assert!(compound_json.contains("24-bit integer"));
 
         let ssrc = projected_terminal_record(
             "ssrc",
@@ -2859,9 +3056,9 @@ mod tests {
             ..TrackExecutionEvidence::default()
         })
         .join("\n");
-        assert!(ssrc_text.contains("Dither owner: SSRC resampler"));
-        assert!(ssrc_text.contains("SSRC native dither id: 1"));
-        assert!(ssrc_text.contains("SSRC PDF: Triangular"));
+        assert!(ssrc_text.contains("Dither owner: SSRC"));
+        assert!(ssrc_text.contains("SSRC dither algorithm: 1"));
+        assert!(ssrc_text.contains("SSRC dither distribution: triangular"));
 
         let no_dither = projected_terminal_record(
             "sox",
@@ -2879,10 +3076,59 @@ mod tests {
             ..TrackExecutionEvidence::default()
         })
         .join("\n");
-        assert!(no_dither_text.contains("Terminal sample/quantization owner: SoX"));
+        assert!(no_dither_text.contains("Sample/quantization owner: SoX"));
         assert!(no_dither_text.contains("Dither owner: none"));
-        assert!(no_dither_text.contains("Effective terminal dither: None"));
+        assert!(no_dither_text.contains("Dither: none"));
         assert!(!no_dither_text.contains("Dither/quantization owner"));
+    }
+
+    #[test]
+    fn r22_direct_encode_preserves_sample_facts_without_debug_or_duplicate_fields() {
+        use tonepoet_pipeline::PcmTerminalRealizationKind as Kind;
+        let realization = tonepoet_pipeline::SelectedPcmTerminalRealization {
+            kind: Kind::FfmpegDirect,
+            selected_tool: tonepoet_pipeline::ToolIdentifier::Ffmpeg,
+            input_precision: tonepoet_pipeline::StoragePrecision::Pcm(tonepoet_pipeline::PcmBitDepth::Int24),
+            input_value_domain: tonepoet_pipeline::ValueDomain::IntegerLattice(tonepoet_pipeline::PcmBitDepth::Int24),
+            target_format: tonepoet_pipeline::AudioFormat::Flac,
+            target_rate_hz: Some(96_000),
+            target_bit_depth: tonepoet_pipeline::PcmBitDepth::Int24,
+            wavpack_hybrid: false,
+            effective_dither: None,
+            ssrc_dither: None,
+            dither_owner: tonepoet_pipeline::PcmTerminalDitherOwner::None,
+        };
+        let mut record = OperationRecord::completed(
+            "encode", "encode_pcm", "PCM encoding", ExecutionBackend::external("ffmpeg"),
+        );
+        // The planner explicitly establishes that direct FFmpeg leaves samples
+        // untouched; the UI must not infer a conversion from an enum name.
+        record.parameters.push(OperationParameter::new(
+            "Audio processing", EvidenceValue::Text("none".to_string()),
+        ));
+        // Production projects each freshly constructed operation once. A second
+        // projection would lack the consumed planner's "Audio processing" fact.
+        apply_pcm_terminal_realization(&mut record, &realization);
+        let rendered = render_track_processing(&TrackExecutionEvidence {
+            operations: vec![record],
+            ..TrackExecutionEvidence::default()
+        }).join("\n");
+        assert!(rendered.contains("Encoding — ffmpeg"));
+        assert!(rendered.contains("Input: 24-bit integer"));
+        assert!(rendered.contains("Input sample values: exact 24-bit integer samples"));
+        assert!(rendered.contains("Output: FLAC, 24-bit integer"));
+        assert!(rendered.contains("Output sample rate: 96000 Hz"));
+        assert!(rendered.contains("Sample conversion: none (samples passed through unchanged)"));
+        assert!(rendered.contains("Sample/quantization owner: FFmpeg"));
+        assert!(rendered.contains("Dither: none (bit depth unchanged)"));
+        assert!(rendered.contains("Dither owner: none"));
+        assert!(!rendered.contains("Terminal"));
+        assert!(!rendered.contains("terminal"));
+        assert!(!rendered.contains("IntegerLattice"));
+        assert!(!rendered.contains("FfmpegDirect"));
+        assert!(!rendered.contains("Int24"));
+        assert_eq!(rendered.matches("Sample conversion:").count(), 1);
+        assert_eq!(rendered.matches("Dither:").count(), 1);
     }
 
     #[test]
