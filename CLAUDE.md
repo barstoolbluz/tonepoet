@@ -23,7 +23,7 @@ cargo test --workspace --no-fail-fast --exclude tonepoet-true-peak   # THE GATE
                              # without --no-fail-fast, --workspace stops at the
                              # first failing binary; tonepoet-true-peak costs
                              # ~41 min and is gated separately. See ## Testing —
-                             # the suite is 7376 tests; see ## Testing for the
+                             # the suite is 7383 tests; see ## Testing for the
                              # rare coordination-contention flake.
 cargo test -p tonepoet-backend   # Backend tests only
 cargo test -p tonepoet-features  # Features tests only
@@ -279,8 +279,11 @@ cargo test -p tonepoet-true-peak   # BS.1770 true-peak + loudness core (~41 min)
 Tests are in `crates/*/tests/` directories, `src/` (inline `#[cfg(test)]` modules), and `tests/` (integration/contract/sentinel tests). The workspace suite is ~7,210 tests across 57 targets, plus 160 in `tonepoet-true-peak`.
 NEVER truncate failure output.
 
-**The suite is 7376 tests, and the gate is clean** (measured 2026-10-09 on `da2710a`: 7376 passed / 0 failed, no
-freshness failure). Earlier it was 7341 across 63 targets on `bae7758`. The count fell from 7363 when the
+**The suite is 7383 tests, and the gate is clean** (measured 2026-10-09 on `fb34d78`: 7382 passed with only
+`installed_reference_qualification_binds_the_current_locked_sources` failing, which requalification then cleared —
+`tests/reference_qualification_freshness.rs` is now 3/0, and the requalification runner's own post-install
+`cargo test --workspace` reported no failures). Earlier it was 7376 on `da2710a` and 7341 across 63 targets on
+`bae7758`. The count fell from 7363 when the
 logging/evidence redesign removed tests that asserted log content inferred from
 argv rather than from execution receipts.
 
