@@ -4391,7 +4391,8 @@ feature that writes a file is free to reintroduce the pattern, and one just did.
 > `issue_65_reference_execution_still_validates_sample_identity_without_manifest`, plus
 > `destination_inventory_detects_hidden_files_nested_directories_and_unrequested_evidence`.
 > They earned their keep immediately, catching the `.tonepoet-batch` leftover and the
-> snapshot-log change. They do **not** yet cover the `--overwrite-output` path (see #69).
+> snapshot-log change. They do **not** yet cover publishing over an existing album —
+> `--if-exists overwrite` or `keep-both` — which is tracked separately as #71.
 
 Filed 2026-10-08. This is the omission that lets #27, #53 and #64 keep recurring.
 It is recorded separately because it is not a defect in any one route — it is a
@@ -4681,7 +4682,8 @@ whatever that behaviour becomes.
 > backup. Verified on real audio, twice with fresh sources: after `--if-exists overwrite` a
 > three-track album retains **3** tracks with **0** backup directories and **0** dotfiles,
 > where this issue recorded 1 track surviving. The black-box smoke covers N=1, 2 and 3
-> (`all audio survives, no backup remains, history retained`).
+> (`all audio survives, no backup remains, history retained`). The strict
+> destination-inventory tests still do not reach this path; that gap is #71.
 
 Filed 2026-10-09 on `43f275e`, found while checking whether `conversion.log` is
 overwritten on re-conversion (it is — see #70).
@@ -4831,3 +4833,50 @@ enough resolution that two conversions on the same day do not collide.
 The standing rule still applies: the second log is written only when the user
 asked for a log at all, and the #65 destination-inventory tests have to be
 extended to expect it, since they assert the destination's exact file set.
+
+## 71. The strict destination-inventory tests never run against overwrite or keep-both
+
+Filed 2026-10-09, split out of #65 and #69 so the gap is tracked in its own right
+rather than as a note inside two closed issues.
+
+#65 is resolved: five strict inventory tests now assert the destination's exact
+file set and refuse any unexpected file. But every one of them pins
+`OverwritePolicy::FailIfExists`, so none ever publishes over an existing album:
+
+| test | FailIfExists | ReplaceWithBackup | keep-both |
+| --- | --- | --- | --- |
+| `issue_65_postconversion_destination_inventory_covers_source_routes_and_log_consent` | 1 | 0 | 0 |
+| `issue_65_independent_folder_album_publish_has_no_extra_entries_with_log_on_or_off` | 0 | 0 | 0 |
+| `issue_65_reference_execution_evidence_does_not_force_unrequested_manifest` | 1 | 0 | 0 |
+| `issue_65_reference_execution_still_validates_sample_identity_without_manifest` | 2 | 0 | 0 |
+
+That is exactly the path #69 broke on. `--overwrite-output` left a three-track
+album holding one track with the rest in hidden backup directories, and the gate
+was silent; the defect was found by hand in the field. The strict inventory is
+the mechanism that should have caught it, and it never reached the code.
+
+### What is covered today, so the gap is stated accurately
+
+`scripts/smoke_r20_album_publication.sh` does exercise these paths black-box. It
+asserts that after overwrite at N=1, 2 and 3 the album holds exactly N FLACs
+directly and N across the whole tree, that no `.tonepoet-backup-*` directory
+remains, and that keep-both produces one numbered sibling with three tracks and
+six FLACs in total.
+
+That is real coverage and it is not nothing. It is also not the same thing: it
+counts audio files and checks for backup directories by name, whereas the strict
+inventory enumerates **every** entry in the destination and fails on anything
+unexpected — which is how the `.tonepoet-batch` leftover and the snapshot log
+were both caught. A new artifact that is neither a FLAC nor a `.tonepoet-backup-*`
+directory would pass the smoke and fail the strict inventory.
+
+`keep-both` is also new in R20 and publishes a sibling album directory. Nothing
+asserts the exact file set of either directory after it runs.
+
+### What we want
+
+The strict destination-inventory coverage extends to publishing over an existing
+album: `--if-exists overwrite` and `--if-exists keep-both`, each asserting the
+complete file set of the destination afterwards, including the sibling directory
+keep-both creates. A conversion that publishes over existing output should be
+held to the same standard as one that publishes into an empty folder.
