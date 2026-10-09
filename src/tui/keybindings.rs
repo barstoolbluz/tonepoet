@@ -967,6 +967,39 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             app.preset.mark_modified();
         }
 
+        (KeyCode::Left | KeyCode::Char('h'), KeyModifiers::NONE)
+            if app.convert.focus == ConvertFocus::OutputOptions
+                && !app.convert.is_collapsed(ConvertFocus::OutputOptions)
+                && app.convert.output_options.field_focus == OutputOptionsField::Partial =>
+        {
+            app.convert.output_options.partial.select_prev();
+            app.preset.mark_modified();
+        }
+        (KeyCode::Right | KeyCode::Char('l'), KeyModifiers::NONE)
+            if app.convert.focus == ConvertFocus::OutputOptions
+                && !app.convert.is_collapsed(ConvertFocus::OutputOptions)
+                && app.convert.output_options.field_focus == OutputOptionsField::Partial =>
+        {
+            app.convert.output_options.partial.select_next();
+            app.preset.mark_modified();
+        }
+        (KeyCode::Left | KeyCode::Char('h'), KeyModifiers::NONE)
+            if app.convert.focus == ConvertFocus::OutputOptions
+                && !app.convert.is_collapsed(ConvertFocus::OutputOptions)
+                && app.convert.output_options.field_focus == OutputOptionsField::IfExists =>
+        {
+            app.convert.output_options.if_exists.select_prev();
+            app.preset.mark_modified();
+        }
+        (KeyCode::Right | KeyCode::Char('l'), KeyModifiers::NONE)
+            if app.convert.focus == ConvertFocus::OutputOptions
+                && !app.convert.is_collapsed(ConvertFocus::OutputOptions)
+                && app.convert.output_options.field_focus == OutputOptionsField::IfExists =>
+        {
+            app.convert.output_options.if_exists.select_next();
+            app.preset.mark_modified();
+        }
+
         // Output options inline edit: printable characters begin editing in place.
         // Keep the legacy `e` shortcut as a non-destructive edit action; any
         // other printable character replaces the selected value just like a
@@ -3703,6 +3736,8 @@ fn convert_output_options_field_value(
             Some(output.disc_subfolders.selected_label().to_string())
         }
         OutputOptionsField::WriteLog => Some(output.write_log.selected_label().to_string()),
+        OutputOptionsField::Partial => Some(output.partial.selected_label().to_string()),
+        OutputOptionsField::IfExists => Some(output.if_exists.selected_label().to_string()),
         OutputOptionsField::Actions => None,
     }
 }
@@ -4572,6 +4607,14 @@ fn open_output_options_text_edit(app: &mut AppState) {
             app.convert.output_options.write_log.select_next();
             app.preset.mark_modified();
         }
+        OutputOptionsField::Partial => {
+            app.convert.output_options.partial.select_next();
+            app.preset.mark_modified();
+        }
+        OutputOptionsField::IfExists => {
+            app.convert.output_options.if_exists.select_next();
+            app.preset.mark_modified();
+        }
         OutputOptionsField::Actions => open_conversion_actions_wizard(app),
         _ if field.is_text_field() => begin_output_options_inline_edit(app, field, None),
         _ => {}
@@ -4612,6 +4655,8 @@ fn output_options_field_value(app: &AppState, field: OutputOptionsField) -> Stri
         | OutputOptionsField::ForceEncode
         | OutputOptionsField::DiscSubfolders
         | OutputOptionsField::WriteLog
+        | OutputOptionsField::Partial
+        | OutputOptionsField::IfExists
         | OutputOptionsField::Actions => String::new(),
     }
 }
@@ -4678,6 +4723,8 @@ fn commit_output_options_inline_edit(app: &mut AppState) {
         | OutputOptionsField::ForceEncode
         | OutputOptionsField::DiscSubfolders
         | OutputOptionsField::WriteLog
+        | OutputOptionsField::Partial
+        | OutputOptionsField::IfExists
         | OutputOptionsField::Actions => {}
     }
 }
@@ -72128,6 +72175,27 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     && app.convert.output_options.write_log.options[i].enabled
                 {
                     app.convert.output_options.write_log.selected = i;
+                    app.preset.mark_modified();
+                }
+            }
+
+            TuiButton::PartialPill(i) => {
+                app.convert.focus = ConvertFocus::OutputOptions;
+                app.convert.output_options.field_focus = OutputOptionsField::Partial;
+                if i < app.convert.output_options.partial.options.len()
+                    && app.convert.output_options.partial.options[i].enabled
+                {
+                    app.convert.output_options.partial.selected = i;
+                    app.preset.mark_modified();
+                }
+            }
+            TuiButton::IfExistsPill(i) => {
+                app.convert.focus = ConvertFocus::OutputOptions;
+                app.convert.output_options.field_focus = OutputOptionsField::IfExists;
+                if i < app.convert.output_options.if_exists.options.len()
+                    && app.convert.output_options.if_exists.options[i].enabled
+                {
+                    app.convert.output_options.if_exists.selected = i;
                     app.preset.mark_modified();
                 }
             }

@@ -593,6 +593,12 @@ pub struct ConversionOptions {
 
     /// Whether to overwrite existing files
     pub overwrite: bool,
+    /// Three-state destination policy. None retains the historic overwrite bool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_if_exists: Option<crate::convert::pipeline::OverwritePolicy>,
+    /// Multi-track-source partial-output flag (not independent album survivors).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_output: Option<bool>,
 
     /// Output directory for converted files
     pub output_dir: Option<PathBuf>,
@@ -725,6 +731,8 @@ impl Default for ConversionOptions {
             naming_template: None,
             folder_template: None,
             overwrite: false,
+            output_if_exists: None,
+            partial_output: None,
             output_dir: None,
             resample_quality: None,
             nyquist_transition: None,

@@ -121,6 +121,10 @@ pub struct TuiPreset {
     pub disc_subfolders: bool,
     #[serde(default)]
     pub write_log: bool,
+    #[serde(default)]
+    pub partial: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub if_exists: Option<String>, // fail, overwrite, keep-both
     #[serde(default, skip_serializing_if = "crate::convert::pipeline::ActionPipeline::is_empty")]
     pub actions: crate::convert::pipeline::ActionPipeline,
 }
@@ -241,6 +245,8 @@ impl PresetWireLegacy {
             force_encode: self.force_encode,
             disc_subfolders: self.disc_subfolders,
             write_log: self.write_log,
+            partial: false,
+            if_exists: None,
             actions: self.actions,
         }
     }
@@ -524,6 +530,13 @@ impl TuiPreset {
             force_encode: *output_opts.force_encode.selected_value(),
             disc_subfolders: *output_opts.disc_subfolders.selected_value(),
             write_log: *output_opts.write_log.selected_value(),
+            partial: *output_opts.partial.selected_value(),
+            if_exists: Some(match output_opts.if_exists.selected_value() {
+                crate::convert::pipeline::OverwritePolicy::FailIfExists => "fail",
+                crate::convert::pipeline::OverwritePolicy::ReplaceWithBackup => "overwrite",
+                crate::convert::pipeline::OverwritePolicy::KeepBoth => "keep-both",
+                crate::convert::pipeline::OverwritePolicy::AlwaysRedo => "overwrite",
+            }.to_string()),
             actions: output_opts.actions.clone(),
         }
     }
@@ -1003,6 +1016,15 @@ impl TuiPreset {
             "write_log",
             Self::select_enabled(&mut output_opts.write_log, &self.write_log),
         );
+        report.record("partial", Self::select_enabled(&mut output_opts.partial, &self.partial));
+        let if_exists = match self.if_exists.as_deref().unwrap_or("fail") {
+            "fail" => Some(crate::convert::pipeline::OverwritePolicy::FailIfExists),
+            "overwrite" => Some(crate::convert::pipeline::OverwritePolicy::ReplaceWithBackup),
+            "keep-both" => Some(crate::convert::pipeline::OverwritePolicy::KeepBoth),
+            _ => None,
+        };
+        report.record("if_exists", if_exists.is_some_and(|policy|
+            Self::select_enabled(&mut output_opts.if_exists, &policy)));
         output_opts.actions = self.actions.clone();
 
         match parse_merge(&self.merge) {

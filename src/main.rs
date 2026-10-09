@@ -220,6 +220,10 @@ enum Commands {
         #[arg(long, name = "overwrite")]
         overwrite_output: bool,
 
+        /// Existing-album behavior: fail, overwrite with backup, or keep both.
+        #[arg(long = "if-exists", value_name = "fail|overwrite|keep-both")]
+        if_exists: Option<String>,
+
         /// Output naming template (e.g. "%NN% - %TITLE%"; disc tokens include %DISC_FOLDER%, %DISCNUMBER%, %NNDISCNUMBER%, %NNNDISCNUMBER%, %DISCTOTAL%)
         #[arg(long)]
         naming: Option<String>,
@@ -636,6 +640,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             no_cue,
             partial,
             overwrite_output,
+            if_exists,
             naming,
             folder_naming,
             no_metadata,
@@ -676,6 +681,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 disc_subfolders,
                 partial,
                 overwrite_output,
+                if_exists,
                 naming,
                 folder_naming,
                 no_metadata,
@@ -1578,6 +1584,7 @@ async fn run_convert(
     disc_subfolders: bool,
     partial: bool,
     overwrite_output: bool,
+    if_exists: Option<String>,
     naming: Option<String>,
     folder_naming: Option<String>,
     no_metadata: bool,
@@ -1618,6 +1625,27 @@ async fn run_convert(
         quality: output_format.default_quality(),
         ..ConversionOptions::default()
     });
+
+    // --overwrite-output remains a compatible alias, not a fourth mode.
+    let requested_destination_policy = match if_exists.as_deref() {
+        Some("fail") => Some(tonepoet::convert::pipeline::OverwritePolicy::FailIfExists),
+        Some("overwrite") => Some(tonepoet::convert::pipeline::OverwritePolicy::ReplaceWithBackup),
+        Some("keep-both") => Some(tonepoet::convert::pipeline::OverwritePolicy::KeepBoth),
+        Some(other) => anyhow::bail!("invalid --if-exists value {other:?}; expected fail, overwrite, or keep-both"),
+        None if overwrite_output => Some(tonepoet::convert::pipeline::OverwritePolicy::ReplaceWithBackup),
+        None => None,
+    };
+    if overwrite_output && matches!(requested_destination_policy,
+        Some(tonepoet::convert::pipeline::OverwritePolicy::FailIfExists | tonepoet::convert::pipeline::OverwritePolicy::KeepBoth)) {
+        anyhow::bail!("--overwrite-output conflicts with --if-exists when not overwrite");
+    }
+    if let Some(policy) = requested_destination_policy {
+        options.output_if_exists = Some(policy);
+        options.overwrite = matches!(policy, tonepoet::convert::pipeline::OverwritePolicy::ReplaceWithBackup);
+    }
+    if partial {
+        options.partial_output = Some(true);
+    }
 
     // Apply CLI overrides.  An explicit format selects that codec's default
     // container; do not retain a container override from a preset for a
@@ -2664,6 +2692,8 @@ fn build_pipeline_request_template(
         || no_cue
         || partial
         || overwrite_output
+        || options.output_if_exists.is_some()
+        || options.partial_output.is_some()
         || naming.is_some()
         || folder_naming.is_some()
         || no_metadata
@@ -2770,11 +2800,11 @@ fn build_pipeline_request_template(
             windows_portable,
         },
         publish: PublishPolicy {
-            overwrite: if overwrite_output {
+            overwrite: options.output_if_exists.unwrap_or(if overwrite_output {
                 OverwritePolicy::ReplaceWithBackup
             } else {
                 OverwritePolicy::FailIfExists
-            },
+            }),
             same_filesystem_required: false,
             write_manifest: false,
         },
@@ -2802,7 +2832,7 @@ fn build_pipeline_request_template(
             },
             generate_cue: false,
         },
-        failure_policy: if partial {
+        failure_policy: if partial || options.partial_output.unwrap_or(false) {
             FailurePolicy::AllowPartialAlbum
         } else {
             FailurePolicy::FailAlbumOnAnyTrackFailure

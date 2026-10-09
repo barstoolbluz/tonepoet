@@ -3555,7 +3555,7 @@ fn plan_outputs_with_name_shortening_notices(
         .folder_template
         .as_deref()
         .is_some_and(template_uses_track_scoped_disc_tokens);
-    let static_album_dir = if req.naming.per_album_subdir && !folder_template_uses_disc_tokens {
+    let mut static_album_dir = if req.naming.per_album_subdir && !folder_template_uses_disc_tokens {
         match &req.naming.folder_template {
             Some(tmpl) => {
                 let rendered = render_folder_template(tmpl, source, &req.settings);
@@ -3616,6 +3616,30 @@ fn plan_outputs_with_name_shortening_notices(
     } else {
         output_root.clone()
     };
+
+    if matches!(req.publish.overwrite, OverwritePolicy::KeepBoth) {
+        if !req.naming.per_album_subdir || folder_template_uses_disc_tokens {
+            return Err(PlanError::InvalidTemplate(
+                "keep-both requires one stable per-album folder; disc-scoped folder templates cannot be disambiguated as one album".to_string(),
+            ));
+        }
+        if let Some(batch) = req.album_batch.as_ref() {
+            if !batch.album_output_dir_is_planner_resolved() {
+                return Err(PlanError::InvalidTemplate(
+                    "keep-both requires a planner-resolved shared album destination".to_string(),
+                ));
+            }
+            // The dispatcher already chose this folder ONCE for every sibling.
+            // Do not generate a second suffix after an earlier sibling publishes.
+            static_album_dir = normalize_path(&batch.album_output_dir);
+        } else {
+            static_album_dir = crate::fs_limits::keep_both_album_folder(&static_album_dir)
+                .map_err(|error| PlanError::InvalidTemplate(error.to_string()))?;
+        }
+        if !path_is_under_root(&static_album_dir, &output_root) {
+            return Err(PlanError::PathOutsideOutputRoot(static_album_dir.display().to_string()));
+        }
+    }
 
     let mut entries = Vec::with_capacity(source.tracks.len());
     let mut dynamic_album_dirs = BTreeSet::new();
@@ -16445,6 +16469,27 @@ fn pre_materialization_failure_message(outcome: &AlbumOutcome) -> String {
         .unwrap_or_else(|| "source materialization failed before track metadata was available".to_string())
 }
 
+/// Executed album ReplayGain cohort, not the requested or planned set.
+/// Only the surviving member(s) carry this fact; terminal failures can have
+/// produced their fragment before the batch measurement was decided.
+fn replaygain_reduction_section(req: &PipelineRequest) -> String {
+    let Some(cohort) = req.album_batch.as_ref()
+        .and_then(|batch| batch.replaygain_cohort.as_ref()) else {
+        return String::new();
+    };
+    if cohort.excluded.is_empty() { return String::new(); }
+    let mut section = String::from("Album ReplayGain Cohort\n-----------------------\n");
+    push_kv_line(&mut section, "Scope", "reduced: measured only the successfully encoded contributors");
+    push_kv_line(&mut section, "Contributing files", cohort.contributors.to_string());
+    push_kv_line(&mut section, "Excluded files", cohort.excluded.len().to_string());
+    for excluded in &cohort.excluded {
+        push_kv_line(&mut section, "Excluded source", path_log_value(&excluded.source));
+        push_kv_line(&mut section, "  Reason", &excluded.reason);
+    }
+    section.push('\n');
+    section
+}
+
 fn build_pre_materialization_conversion_log_common_fragment(
     req: &PipelineRequest,
 ) -> ConversionLogCommonFragment {
@@ -16459,6 +16504,7 @@ fn build_pre_materialization_conversion_log_common_fragment(
         source_blocking_lines: String::new(),
         provenance_section: String::new(),
         artwork_section: String::new(),
+        replaygain_reduction_section: replaygain_reduction_section(req),
     }
 }
 
@@ -16687,6 +16733,7 @@ fn build_conversion_log_at_with_runner_and_timing(
         provenance_section,
         artwork_section,
         album_processing_section: album_presentation.section,
+        replaygain_reduction_section: replaygain_reduction_section(req),
         track_sections,
         total_summary: ConversionLogTotalSummary {
             successful_count,
@@ -16725,6 +16772,7 @@ struct ConversionLogRenderInput {
     provenance_section: String,
     artwork_section: String,
     album_processing_section: String,
+    replaygain_reduction_section: String,
     track_sections: Vec<String>,
     total_summary: ConversionLogTotalSummary,
     batch_status: Option<String>,
@@ -16779,6 +16827,7 @@ fn render_conversion_log(input: &ConversionLogRenderInput) -> String {
     log.push_str(&input.provenance_section);
     log.push_str(&input.artwork_section);
     log.push_str(&input.album_processing_section);
+    log.push_str(&input.replaygain_reduction_section);
 
     log.push_str("Per-Track Results\n");
     log.push_str("-----------------\n");
@@ -16902,6 +16951,8 @@ struct ConversionLogCommonFragment {
     source_blocking_lines: String,
     provenance_section: String,
     artwork_section: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    replaygain_reduction_section: String,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
@@ -18000,6 +18051,7 @@ fn build_conversion_log_common_fragment_with_runner(
         source_blocking_lines,
         provenance_section,
         artwork_section,
+        replaygain_reduction_section: replaygain_reduction_section(req),
     }
 }
 
@@ -18507,6 +18559,10 @@ fn write_batch_conversion_log_to_rendered_album_dirs(
         return Err(err);
     }
 
+    for write in &writes {
+        archive_conversion_log_for_run(&write.log_path, &identity.conversion_log_batch_id)
+            .map_err(PublishError::io_at("archiving conversion.log for batch", &write.log_path))?;
+    }
     cleanup_committed_visible_conversion_log_writes(&writes, &marker_path)?;
 
     Ok(writes
@@ -18678,6 +18734,145 @@ fn commit_visible_conversion_log_writes(
     Ok(())
 }
 
+// R20: Retain a human-readable audit trail beside the current conversion.log.
+// Snapshot creation is exclusive: another run never overwrites an archive.
+fn conversion_log_snapshot_name() -> String {
+    format!("conversion-{}.log", chrono::Utc::now().format("%Y%m%dT%H%M%S%.9fZ"))
+}
+
+fn create_conversion_log_snapshot(album_dir: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
+    use std::io::Write;
+    for attempt in 0..1000 {
+        let base = conversion_log_snapshot_name();
+        let stem = base.strip_suffix(".log").unwrap_or(&base);
+        let name = if attempt == 0 { base } else { format!("{stem}-{attempt}.log") };
+        let path = album_dir.join(name);
+        let mut file = match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        };
+        if let Err(error) = (|| -> io::Result<()> {
+            file.write_all(bytes)?;
+            file.sync_all()
+        })() {
+            let _ = fs::remove_file(&path);
+            return Err(error);
+        }
+        sync_parent_dir_best_effort(&path);
+        return Ok(path);
+    }
+    Err(io::Error::new(io::ErrorKind::AlreadyExists, "unable to allocate conversion history filename"))
+}
+
+fn conversion_log_archive_files(album_dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut archives = Vec::new();
+    for entry in fs::read_dir(album_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with("conversion-") && name.ends_with(".log") {
+            archives.push(entry.path());
+        }
+    }
+    archives.sort();
+    Ok(archives)
+}
+
+// Preserve the current visible log before replacing it, but don't create a
+// duplicate when the very same bytes were archived in a prior finalization.
+fn preserve_previous_conversion_log(log_path: &Path) -> io::Result<()> {
+    let bytes = match read_regular_file_no_follow(log_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let parent = parent_dir_or_current(log_path);
+    for archived in conversion_log_archive_files(parent)? {
+        if read_regular_file_no_follow(&archived)? == bytes {
+            return Ok(());
+        }
+    }
+    create_conversion_log_snapshot(parent, &bytes)?;
+    Ok(())
+}
+
+// Each run gets exactly one snapshot, rewritten when final delivery evidence
+// replaces the initial assembled report. A batch's identity is shared by all
+// its tracks, so their finalizer does not create N redundant history files.
+fn archive_conversion_log_for_run(log_path: &Path, run_identity: &str) -> io::Result<PathBuf> {
+    let bytes = read_regular_file_no_follow(log_path)?;
+    let parent = parent_dir_or_current(log_path);
+    let token = super::manifest::sha256_hex(run_identity.as_bytes());
+    let run_suffix = format!("-{}.log", &token[..16]);
+    for existing in conversion_log_archive_files(parent)? {
+        if existing.file_name().and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(&run_suffix))
+        {
+            if read_regular_file_no_follow(&existing)? != bytes {
+                write_bytes_atomically(&existing, &bytes)?;
+            }
+            return Ok(existing);
+        }
+    }
+    use std::io::Write;
+    for attempt in 0..1000 {
+        let time = chrono::Utc::now().format("%Y%m%dT%H%M%S%.9fZ");
+        let name = if attempt == 0 {
+            format!("conversion-{time}{run_suffix}")
+        } else {
+            format!("conversion-{time}-{attempt}{run_suffix}")
+        };
+        let path = parent.join(name);
+        let mut file = match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        };
+        if let Err(error) = (|| -> io::Result<()> { file.write_all(&bytes)?; file.sync_all() })() {
+            let _ = fs::remove_file(&path);
+            return Err(error);
+        }
+        sync_parent_dir_best_effort(&path);
+        return Ok(path);
+    }
+    Err(io::Error::new(io::ErrorKind::AlreadyExists, "unable to allocate per-run log filename"))
+}
+
+// Called while a whole-album backup remains available. A legacy pre-R20
+// conversion.log also receives a snapshot so the first new run cannot erase it.
+fn carry_previous_album_log_history(backup_dir: &Path, new_dir: &Path) -> io::Result<()> {
+    let old_visible = backup_dir.join("conversion.log");
+    preserve_previous_conversion_log(&old_visible)?;
+    for path in conversion_log_archive_files(backup_dir)? {
+        let dst = new_dir.join(path.file_name().ok_or_else(|| io::Error::new(
+            io::ErrorKind::InvalidData, "historical log has no filename"
+        ))?);
+        let bytes = read_regular_file_no_follow(&path)?;
+        match fs::OpenOptions::new().write(true).create_new(true).open(&dst) {
+            Ok(mut output) => {
+                use std::io::Write;
+                output.write_all(&bytes)?;
+                output.sync_all()?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if read_regular_file_no_follow(&dst)? != bytes { return Err(error); }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    if !new_dir.join("conversion.log").exists() && old_visible.exists() {
+        let bytes = read_regular_file_no_follow(&old_visible)?;
+        let dst = new_dir.join("conversion.log");
+        let mut output = fs::OpenOptions::new().write(true).create_new(true).open(&dst)?;
+        use std::io::Write;
+        output.write_all(&bytes)?;
+        output.sync_all()?;
+    }
+    sync_parent_dir_best_effort(new_dir);
+    Ok(())
+}
+
 fn cleanup_committed_visible_conversion_log_writes(
     writes: &[VisibleConversionLogWrite],
     marker_path: &Path,
@@ -18689,6 +18884,11 @@ fn cleanup_committed_visible_conversion_log_writes(
         ))?;
         sync_parent_dir_best_effort(&write.temp_path);
         if let Some(backup_path) = &write.backup_path {
+            if backup_path.exists() {
+                preserve_previous_conversion_log(backup_path).map_err(PublishError::io_at(
+                    "retaining preceding conversion.log history", backup_path,
+                ))?;
+            }
             remove_file_if_exists(backup_path).map_err(PublishError::io_at(
                 "removing committed visible conversion.log backup",
                 backup_path,
@@ -18721,6 +18921,11 @@ fn cleanup_committed_visible_conversion_log_marker_entries(
             .map(|path| resolve_visible_conversion_log_marker_entry(marker_path, marker, path))
             .transpose()?
         {
+            if backup_path.exists() {
+                preserve_previous_conversion_log(&backup_path).map_err(PublishError::io_at(
+                    "retaining previous conversion.log after interrupted commit", &backup_path,
+                ))?;
+            }
             remove_file_if_exists(&backup_path).map_err(PublishError::io_at(
                 "removing roll-forward visible conversion.log backup",
                 &backup_path,
@@ -22355,6 +22560,7 @@ fn build_conversion_log_from_fragments_with_status(
         provenance_section: common.provenance_section,
         artwork_section: common.artwork_section,
         album_processing_section: album_presentation.section,
+        replaygain_reduction_section: common.replaygain_reduction_section,
         track_sections,
         total_summary: ConversionLogTotalSummary {
             successful_count,
@@ -22409,6 +22615,9 @@ fn merge_conversion_log_common_fragments(
             ordered.iter().map(|fragment| fragment.common.artwork_section.as_str()),
         )
         .unwrap_or_default(),
+        replaygain_reduction_section: first_non_empty_common_string(
+            ordered.iter().map(|fragment| fragment.common.replaygain_reduction_section.as_str()),
+        ).unwrap_or_default(),
     }
 }
 
@@ -22785,6 +22994,8 @@ fn publish_incremental_assembled_conversion_log_from_fragments(
     }
 
     let log_path = album_dir.join("conversion.log");
+    preserve_previous_conversion_log(&log_path)
+        .map_err(PublishError::io_at("preserving previously assembled conversion.log", &log_path))?;
     rollback.snapshot_destination(&log_path)?;
     let log = build_conversion_log_from_fragments(&fragments);
     write_bytes_atomically(&log_path, log.as_bytes()).map_err(PublishError::io_at("writing assembled conversion log", &log_path))?;
@@ -23143,6 +23354,11 @@ fn finalize_incomplete_conversion_log_batch_if_needed(
                 break;
             }
             let log_path = visible_dir.join("conversion.log");
+            if let Err(err) = preserve_previous_conversion_log(&log_path) {
+                log::warn!("conversion log {context} could not preserve previous report at {}: {err}", log_path.display());
+                write_failed = true;
+                break;
+            }
             if let Err(err) = write_bytes_atomically(&log_path, log.as_bytes()) {
                 log::warn!(
                     "conversion log {context} failed to write {}: {err}",
@@ -23152,6 +23368,11 @@ fn finalize_incomplete_conversion_log_batch_if_needed(
                 break;
             }
             sync_parent_dir_best_effort(&log_path);
+            if let Err(err) = archive_conversion_log_for_run(&log_path, &target_identity_ref.conversion_log_batch_id) {
+                log::warn!("conversion log {context} could not archive report at {}: {err}", log_path.display());
+                write_failed = true;
+                break;
+            }
             entries.push(PublishedEntry {
                 final_path: log_path,
                 role: PublishRole::Sidecar(SidecarKind::ConversionLog),
@@ -25882,7 +26103,7 @@ impl MultiRootPublishTransaction {
 
         if root.exists() {
             match overwrite {
-                OverwritePolicy::FailIfExists => {
+                OverwritePolicy::FailIfExists | OverwritePolicy::KeepBoth => {
                     return Err(PublishError::DestinationExists(root.display().to_string()));
                 }
                 OverwritePolicy::ReplaceWithBackup | OverwritePolicy::AlwaysRedo => {
@@ -26805,32 +27026,57 @@ fn publish_album_output_bound(
         });
     }
 
+    // The queue's emergency ungrouped fallback deliberately suppresses
+    // incremental album publication. Treat its overwrite as a refusal, not
+    // permission for a one-track job to replace the shared album directory.
+    // Otherwise the less-common failed-dispatch path recreates issue #69.
+    if plan.suppress_incremental_conversion_log_append
+        && plan.source_audio_track_count <= 1
+        && plan.album_dir.exists()
+        && matches!(policy.overwrite, OverwritePolicy::ReplaceWithBackup | OverwritePolicy::AlwaysRedo)
+    {
+        let _ = fs::remove_dir_all(&temp_dir);
+        return Err(PublishError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "independent-file album ordering is unavailable; refusing an overwrite that would discard sibling audio",
+        )));
+    }
+
     let mut backup_made = false;
     if plan.album_dir.exists() {
+        // An independent file is not an entire album. Replacing the shared
+        // directory here discards previously published siblings while reporting
+        // them as successful. Reuse the durable per-file rollback journal for
+        // both append and replace; reserve directory backup for album payloads.
+        let overwrite_existing_audio = matches!(
+            policy.overwrite,
+            OverwritePolicy::ReplaceWithBackup | OverwritePolicy::AlwaysRedo
+        );
+        if is_incremental_single_audio_publish(plan, overwrite_existing_audio) {
+            let manifest_path = publish_incremental_album_output(
+                &temp_dir,
+                plan,
+                manifest,
+                manifest_album_dir,
+                &incremental_marker_path,
+                fragment_batch_identity.as_ref(),
+                overwrite_existing_audio,
+                &mut published_entries,
+                &mut batch_completion,
+            )?;
+            if let Some(guard) = batch_workspace_guard.as_mut() {
+                guard.disarm_failure_mark();
+            }
+            cleanup_successful_staging(staging);
+            return Ok(PublishedAlbum {
+                album_dir: plan.album_dir.clone(),
+                entries: published_entries,
+                manifest_path,
+                batch_completion,
+            });
+        }
         match policy.overwrite {
-            OverwritePolicy::FailIfExists => {
-                if is_incremental_single_audio_publish(plan) {
-                    let manifest_path = publish_incremental_album_output(
-                        &temp_dir,
-                        plan,
-                        manifest,
-                        manifest_album_dir,
-                        &incremental_marker_path,
-                        fragment_batch_identity.as_ref(),
-                        &mut published_entries,
-                        &mut batch_completion,
-                    )?;
-                    if let Some(guard) = batch_workspace_guard.as_mut() {
-                        guard.disarm_failure_mark();
-                    }
-                    cleanup_successful_staging(staging);
-                    return Ok(PublishedAlbum {
-                        album_dir: plan.album_dir.clone(),
-                        entries: published_entries,
-                        manifest_path,
-                        batch_completion,
-                    });
-                }
+            OverwritePolicy::FailIfExists | OverwritePolicy::KeepBoth => {
                 let _ = fs::remove_dir_all(&temp_dir);
                 return Err(PublishError::DestinationExists(
                     plan.album_dir.display().to_string(),
@@ -26851,6 +27097,18 @@ fn publish_album_output_bound(
                     ))
                 })?;
                 backup_made = true;
+                if let Err(err) = carry_previous_album_log_history(&backup_dir, &temp_dir) {
+                    // The old album is still intact in backup_dir. Restore it
+                    // before returning; never install an album with missing logs.
+                    let rollback = fs::rename(&backup_dir, &plan.album_dir);
+                    let _ = fs::remove_dir_all(&temp_dir);
+                    if rollback.is_ok() {
+                        let _ = fs::remove_file(&marker_path);
+                    }
+                    return Err(PublishError::Io(io::Error::new(err.kind(), format!(
+                        "preserving previous album log history failed: {err}; album restoration: {rollback:?}"
+                    ))));
+                }
             }
         }
     }
@@ -26906,9 +27164,8 @@ fn publish_album_output_bound(
             plan.album_dir.display()
         )));
     }
-    if backup_made {
-        let _ = fs::remove_file(&marker_path);
-    }
+    // Do not remove the recovery marker yet. A failure while assembling the
+    // log/coordination artifacts must retain the old album for manual recovery.
     sync_parent_dir_best_effort(&plan.album_dir);
     if !coordination_fragment_entries.is_empty() {
         publish_coordination_fragment_entries(&coordination_fragment_entries, &mut published_entries)?;
@@ -26928,6 +27185,16 @@ fn publish_album_output_bound(
         );
     }
 
+    if backup_made {
+        fs::remove_dir_all(&backup_dir).map_err(PublishError::io_at(
+            "cleaning successful whole-album backup", &backup_dir,
+        ))?;
+        sync_parent_dir_best_effort(&backup_dir);
+        remove_file_if_exists(&marker_path).map_err(PublishError::io_at(
+            "removing completed publish recovery marker", &marker_path,
+        ))?;
+        sync_parent_dir_best_effort(&marker_path);
+    }
     if let Some(guard) = batch_workspace_guard.as_mut() {
         guard.disarm_failure_mark();
     }
@@ -26942,7 +27209,10 @@ fn publish_album_output_bound(
     })
 }
 
-fn is_incremental_single_audio_publish(plan: &PublishPlan) -> bool {
+fn is_incremental_single_audio_publish(
+    plan: &PublishPlan,
+    overwrite_existing_audio: bool,
+) -> bool {
     if plan.suppress_incremental_conversion_log_append {
         return false;
     }
@@ -26982,9 +27252,14 @@ fn is_incremental_single_audio_publish(plan: &PublishPlan) -> bool {
     // Successful independent track jobs may publish one audio payload plus
     // either the legacy standalone conversion.log append or the newer hidden
     // ordered fragment. Failed independent track jobs may publish only the
-    // hidden fragment. All of those cases must append into an existing album
-    // directory instead of treating the directory itself as a collision.
-    has_fragment || (audio_entry_count == 1 && has_standalone_conversion_log)
+    // hidden fragment. Explicit overwrite must also preserve siblings when a
+    // single-file redo has logging disabled and neither log artifact exists.
+    // Default collision behavior and genuine multi-track payloads are unchanged.
+    has_fragment
+        || (audio_entry_count == 1 && has_standalone_conversion_log)
+        || (overwrite_existing_audio
+            && audio_entry_count == 1
+            && plan.source_audio_track_count == 1)
 }
 
 fn publish_incremental_album_output(
@@ -26994,6 +27269,7 @@ fn publish_incremental_album_output(
     manifest_album_dir: Option<&Path>,
     marker_path: &Path,
     fragment_batch_identity: Option<&ConversionLogBatchIdentity>,
+    overwrite_existing_audio: bool,
     published_entries: &mut Vec<PublishedEntry>,
     batch_completion: &mut Option<PublishedBatchCompletion>,
 ) -> Result<Option<PathBuf>, PublishError> {
@@ -27034,7 +27310,7 @@ fn publish_incremental_album_output(
         match &entry.role {
             PublishRole::Audio => {
                 has_audio = true;
-                if entry.final_path.exists() {
+                if entry.final_path.exists() && !overwrite_existing_audio {
                     if !coordination_fragment_entries.is_empty() {
                         if let Some(bytes) = staged_file_matches_existing_final(&temp_entry_path, &entry.final_path)? {
                             repaired_existing_audio_payload = true;
@@ -27092,11 +27368,19 @@ fn publish_incremental_album_output(
         for entry in incremental_entries.iter().filter(|entry| {
             incremental_publish_phase(&entry.role) == IncrementalPublishPhase::AudioPayload
         }) {
-            publish_incremental_audio_entry(
-                &entry.temp_path,
-                &entry.final_path,
-                &mut rollback,
-            )?;
+            if overwrite_existing_audio && entry.final_path.exists() {
+                replace_incremental_sidecar_entry(
+                    &entry.temp_path,
+                    &entry.final_path,
+                    &mut rollback,
+                )?;
+            } else {
+                publish_incremental_audio_entry(
+                    &entry.temp_path,
+                    &entry.final_path,
+                    &mut rollback,
+                )?;
+            }
         }
 
         for entry in incremental_entries.iter().filter(|entry| {
@@ -52723,6 +53007,13 @@ fn finalize_published_conversion_log_timing_best_effort(
             );
             continue;
         }
+        let run_identity = req.album_batch.as_ref()
+            .map(|batch| batch.conversion_log_batch_id.as_str())
+            .unwrap_or(req.item_id.as_str());
+        if let Err(error) = archive_conversion_log_for_run(&runtime_path, run_identity) {
+            log::warn!("could not retain conversion log snapshot for {} at {}: {error}",
+                req.item_id, entry.final_path.display());
+        }
         entry.bytes = u64::try_from(finalized.len()).unwrap_or(u64::MAX);
     }
 }
@@ -70143,7 +70434,17 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             .map(|entry| entry.expect("directory entry").file_name().to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         names.sort();
-        assert_eq!(names, vec!["01.flac", "conversion.log"]);
+        let history = conversion_log_archive_files(&album_dir)
+            .expect("enumerate requested conversion-log history");
+        assert_eq!(history.len(), 1, "one requested human log must have one per-run history snapshot");
+        let history_name = history[0].file_name().unwrap().to_string_lossy().to_string();
+        assert!(history_name.starts_with("conversion-20") && history_name.ends_with(".log"),
+            "human log history must use a timestamped filename: {history_name}");
+        let mut expected_names = vec!["01.flac".to_string(), "conversion.log".to_string(), history_name];
+        expected_names.sort();
+        assert_eq!(names, expected_names);
+        assert_eq!(std::fs::read(&history[0]).expect("archived human log"),
+            std::fs::read(album_dir.join("conversion.log")).expect("current human log"));
         assert!(std::fs::read_dir(&log_root).expect("private log root").next().is_none());
     }
 
@@ -70183,7 +70484,17 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             .map(|entry| entry.expect("directory entry").file_name().to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         names.sort();
-        assert_eq!(names, vec!["01.flac", "conversion.log"]);
+        let history = conversion_log_archive_files(&album_dir)
+            .expect("enumerate requested conversion-log history");
+        assert_eq!(history.len(), 1, "one requested human log must have one per-run history snapshot");
+        let history_name = history[0].file_name().unwrap().to_string_lossy().to_string();
+        assert!(history_name.starts_with("conversion-20") && history_name.ends_with(".log"),
+            "human log history must use a timestamped filename: {history_name}");
+        let mut expected_names = vec!["01.flac".to_string(), "conversion.log".to_string(), history_name];
+        expected_names.sort();
+        assert_eq!(names, expected_names);
+        assert_eq!(std::fs::read(&history[0]).expect("archived human log"),
+            std::fs::read(album_dir.join("conversion.log")).expect("current human log"));
         assert!(!output_root.join(".tonepoet-logs").exists());
     }
 
@@ -70229,6 +70540,33 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             unexpected.is_empty() && missing.is_empty(),
             "issue #65 destination inventory mismatch ({route}); unexpected entries: {unexpected:?}; missing entries: {missing:?}; full inventory: {actual:?}"
         );
+    }
+
+    // Explicitly enumerate the ONE human-log history artifact for this run;
+    // keep the recursive inventory closed to everything else, including dotfiles.
+    fn expected_r20_history_entry(
+        root: &Path,
+        album_relative: &str,
+        human_log: bool,
+        expected: &mut std::collections::BTreeSet<String>,
+    ) {
+        let album = root.join(album_relative);
+        let archives = conversion_log_archive_files(&album)
+            .expect("enumerate exact R20 conversion log history");
+        if !human_log {
+            assert!(archives.is_empty(), "logging disabled cannot produce history: {archives:?}");
+            return;
+        }
+        assert_eq!(archives.len(), 1, "one finished conversion batch needs exactly one history snapshot: {archives:?}");
+        let archive = &archives[0];
+        let name = archive.file_name().and_then(|name| name.to_str())
+            .expect("valid history archive filename");
+        assert!(name.starts_with("conversion-20") && name.ends_with(".log"),
+            "human-readable timestamped archive name: {name}");
+        assert_eq!(std::fs::read(archive).expect("archived log"),
+            std::fs::read(album.join("conversion.log")).expect("current log"),
+            "the per-run snapshot must contain the final visible log");
+        expected.insert(format!("{album_relative}/{name}"));
     }
 
     #[test]
@@ -70347,6 +70685,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                     if human_log {
                         expected.insert("Gate Test/conversion.log".to_string());
                     }
+                    expected_r20_history_entry(&destination, "Gate Test", human_log, &mut expected);
                     if cue {
                         expected.insert("Gate Test/album.cue".to_string());
                     }
@@ -71040,7 +71379,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
 
         if plan.album_dir.exists() {
             match policy.overwrite {
-                OverwritePolicy::FailIfExists => {
+                OverwritePolicy::FailIfExists | OverwritePolicy::KeepBoth => {
                     let _ = std::fs::remove_dir_all(&temp_dir);
                     return Err(PublishError::DestinationExists(
                         plan.album_dir.display().to_string(),
@@ -71590,6 +71929,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             source_blocking_lines: String::new(),
             provenance_section: "Provenance\n----------\nNo provenance details were recorded.\n\n".to_string(),
             artwork_section: "Artwork\n-------\nNo artwork was embedded.\n\n".to_string(),
+            replaygain_reduction_section: String::new(),
         }
     }
 
@@ -73312,7 +73652,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
 
         assert_eq!(plan.source_audio_track_count, 1, "payload count remains the current single-track job");
         assert_eq!(plan.expected_album_track_count, 2, "album expected count is the last-track threshold");
-        assert!(is_incremental_single_audio_publish(&plan), "fragment-backed single-track jobs remain incremental even for multi-track albums");
+        assert!(is_incremental_single_audio_publish(&plan, false), "fragment-backed single-track jobs remain incremental even for multi-track albums");
 
         let (_failed_stage, failed_plan) = incremental_fragment_test_plan(
             temp.path(),
@@ -73324,7 +73664,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         );
         assert_eq!(failed_plan.source_audio_track_count, 0, "a failed-track fragment has no audio payload");
         assert_eq!(failed_plan.expected_album_track_count, 2);
-        assert!(is_incremental_single_audio_publish(&failed_plan));
+        assert!(is_incremental_single_audio_publish(&failed_plan, false));
     }
 
     #[test]
@@ -73356,13 +73696,13 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         plan.expected_album_track_count = 7;
 
         assert!(
-            is_incremental_single_audio_publish(&plan),
+            is_incremental_single_audio_publish(&plan, false),
             "completion-order membership, not conversion-log presence, owns shared-root publication"
         );
 
         plan.suppress_incremental_conversion_log_append = true;
         assert!(
-            !is_incremental_single_audio_publish(&plan),
+            !is_incremental_single_audio_publish(&plan, false),
             "the emergency fail-closed suppression remains authoritative"
         );
     }
@@ -75092,6 +75432,7 @@ Recovered provenance
             if human_log {
                 expected.insert("Test Artist/Test Album/conversion.log".to_string());
             }
+            expected_r20_history_entry(&root.join("out"), "Test Artist/Test Album", human_log, &mut expected);
             assert_destination_inventory(
                 &root.join("out"), &expected,
                 &format!("independent folder album, log={human_log}"),
@@ -75261,7 +75602,7 @@ Recovered provenance
             "failed fragment-only jobs carry zero audio payload in the real publish plan"
         );
         assert_eq!(failed_plan.expected_album_track_count, 2);
-        assert!(is_incremental_single_audio_publish(&failed_plan));
+        assert!(is_incremental_single_audio_publish(&failed_plan, false));
 
         let terminal_staging = StagingDir::new(temp.path().join("real-failed-terminal-stage"), "real-failed-terminal-stage".to_string());
         std::fs::create_dir_all(&terminal_staging.root).expect("failed terminal staging root");
@@ -75735,6 +76076,200 @@ Recovered provenance
         let log = std::fs::read_to_string(album_dir.join("conversion.log")).expect("conversion log");
         assert!(log.contains("first log without trailing newline\nsecond log"));
         assert_eq!(conversion_related_file_names(&album_dir), vec!["conversion.log".to_string()]);
+    }
+
+    #[test]
+    fn r20_independent_overwrite_preserves_one_two_and_three_track_albums() {
+        for count in 1..=3_usize {
+            let scratch = tempfile::tempdir().expect("R20 overwrite scratch");
+            let out = scratch.path().join("out");
+            let album = out.join("Album");
+            std::fs::create_dir_all(&out).expect("output root");
+            let mut normal = incremental_test_publish_policy();
+            normal.overwrite = OverwritePolicy::FailIfExists;
+            let mut overwrite = incremental_test_publish_policy();
+            overwrite.overwrite = OverwritePolicy::ReplaceWithBackup;
+
+            for pass in 0..2 {
+                for ordinal in 1..=count {
+                    let name = format!("{ordinal:02}.flac");
+                    let bytes = format!("r20-audio-pass-{pass}-track-{ordinal}");
+                    let stage = format!("r20-stage-{count}-{pass}-{ordinal}");
+                    let (staging, audio, log) = incremental_test_staging(
+                        scratch.path(), &stage, &name,
+                        bytes.as_bytes(), format!("pass {pass}, track {ordinal}\n").as_bytes(),
+                    );
+                    let plan = incremental_single_track_plan(&album, audio, &name, log);
+                    publish_album_output(
+                        staging, &plan,
+                        if pass == 0 { normal.clone() } else { overwrite.clone() },
+                        None,
+                    ).unwrap_or_else(|error| panic!(
+                        "R20 pass={pass}, track={ordinal}, count={count}: {error}"
+                    ));
+                }
+                for ordinal in 1..=count {
+                    let expected = format!("r20-audio-pass-{pass}-track-{ordinal}");
+                    assert_eq!(
+                        std::fs::read(album.join(format!("{ordinal:02}.flac")))
+                            .expect("every sibling remains published"),
+                        expected.as_bytes(),
+                        "overwrite must preserve all {count} tracks across both passes",
+                    );
+                }
+                let backups = std::fs::read_dir(&out).expect("backup inventory")
+                    .map(|entry| entry.expect("entry").file_name().to_string_lossy().into_owned())
+                    .filter(|name| name.starts_with(".tonepoet-backup-"))
+                    .collect::<Vec<_>>();
+                assert!(backups.is_empty(),
+                    "successful publication cannot retain backup folders: {backups:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn r20_single_file_overwrite_without_logging_preserves_other_album_tracks() {
+        let scratch = tempfile::tempdir().expect("overwrite scratch");
+        let out = scratch.path().join("out");
+        let album = out.join("Album");
+        std::fs::create_dir_all(&album).expect("existing album");
+        std::fs::write(album.join("01.flac"), b"old first track").unwrap();
+        std::fs::write(album.join("02.flac"), b"untouched second track").unwrap();
+
+        // A single selected source file has no dispatcher album batch, and
+        // disabling the human log leaves no log sidecar or hidden fragment.
+        let stage_no_log = |name: &str| {
+            let staging = StagingDir::new(scratch.path().join(name), name.to_string());
+            std::fs::create_dir_all(&staging.root).expect("staging directory");
+            let audio = staging.root.join("01.flac");
+            std::fs::write(&audio, b"new first track").expect("staged audio");
+            let plan = PublishPlan {
+                album_dir: album.clone(),
+                entries: vec![PublishEntry {
+                    staged_path: audio,
+                    final_path: album.join("01.flac"),
+                    role: PublishRole::Audio,
+                }],
+                source_audio_track_count: 1,
+                expected_album_track_count: 1,
+                suppress_incremental_conversion_log_append: false,
+                album_batch_completion_order: false,
+                write_conversion_log: false,
+            };
+            (staging, plan)
+        };
+
+        let (fail_staging, fail_plan) = stage_no_log("no-log-default");
+        assert!(!is_incremental_single_audio_publish(&fail_plan, false));
+        assert!(is_incremental_single_audio_publish(&fail_plan, true));
+        let mut merged = fail_plan.clone();
+        merged.source_audio_track_count = 2;
+        assert!(!is_incremental_single_audio_publish(&merged, true),
+            "one merged output representing two tracks is a whole-album payload");
+        let mut suppressed = fail_plan.clone();
+        suppressed.suppress_incremental_conversion_log_append = true;
+        assert!(!is_incremental_single_audio_publish(&suppressed, true),
+            "emergency publication refusal must not be bypassed");
+
+        let default_error = publish_album_output(
+            fail_staging, &fail_plan, incremental_test_publish_policy(), None,
+        ).expect_err("default collision policy must still refuse this overwrite");
+        assert!(matches!(&default_error, PublishError::DestinationExists(_)),
+            "unexpected collision error: {default_error}");
+        assert_eq!(std::fs::read(album.join("01.flac")).unwrap(), b"old first track");
+        assert_eq!(std::fs::read(album.join("02.flac")).unwrap(), b"untouched second track");
+
+        let (overwrite_staging, overwrite_plan) = stage_no_log("no-log-overwrite");
+        let mut policy = incremental_test_publish_policy();
+        policy.overwrite = OverwritePolicy::ReplaceWithBackup;
+        publish_album_output(overwrite_staging, &overwrite_plan, policy, None)
+            .expect("unlogged single-file overwrite publishes incrementally");
+        assert_eq!(std::fs::read(album.join("01.flac")).unwrap(), b"new first track");
+        assert_eq!(std::fs::read(album.join("02.flac")).unwrap(), b"untouched second track");
+        assert!(!album.join("conversion.log").exists(), "logging remains optional");
+        assert!(!std::fs::read_dir(&out).unwrap().any(|entry| {
+            entry.unwrap().file_name().to_string_lossy().starts_with(".tonepoet-backup-")
+        }), "successful per-file overwrite must not create an album backup");
+    }
+
+    #[test]
+    fn r20_reduced_album_gain_log_names_excluded_source_and_measurement_size() {
+        let mut req = log_test_request();
+        let mut batch = AlbumBatchContext::new(
+            generated_test_batch_id("r20-reduced-log"), 3,
+            PathBuf::from("/output/album"), PathBuf::from("/inputs/album"),
+        );
+        batch.replaygain_cohort = Some(crate::convert::pipeline::ReplayGainCohortDisclosure {
+            contributors: 2,
+            excluded: vec![crate::convert::pipeline::ReplayGainExcludedSource {
+                source: PathBuf::from("/inputs/album/03-damaged.flac"),
+                reason: "invalid FLAC frame".to_string(),
+            }],
+        });
+        req.album_batch = Some(batch);
+        let section = replaygain_reduction_section(&req);
+        assert!(section.contains("Contributing files: 2"), "{section}");
+        assert!(section.contains("Excluded files: 1"), "{section}");
+        assert!(section.contains("03-damaged.flac"), "{section}");
+        assert!(section.contains("invalid FLAC frame"), "{section}");
+        assert!(section.contains("reduced"), "{section}");
+    }
+
+    #[test]
+    fn r20_ungrouped_overwrite_refuses_directory_replacement_and_preserves_siblings() {
+        let scratch = tempfile::tempdir().unwrap();
+        let out = scratch.path().join("out");
+        let album = out.join("Album");
+        std::fs::create_dir_all(&album).unwrap();
+        std::fs::write(album.join("01.flac"), b"older first track").unwrap();
+        std::fs::write(album.join("02.flac"), b"older second track").unwrap();
+        let (staging, audio, log) = incremental_test_staging(
+            scratch.path(), "ungrouped-overwrite", "01.flac", b"new first track", b"new log",
+        );
+        let mut plan = incremental_single_track_plan(&album, audio, "01.flac", log);
+        plan.suppress_incremental_conversion_log_append = true;
+        let mut policy = incremental_test_publish_policy();
+        policy.overwrite = OverwritePolicy::ReplaceWithBackup;
+        let error = publish_album_output(staging, &plan, policy, None)
+            .expect_err("unproven album grouping must reject destructive overwrite");
+        assert!(error.to_string().contains("refusing an overwrite"), "{error}");
+        assert_eq!(std::fs::read(album.join("01.flac")).unwrap(), b"older first track");
+        assert_eq!(std::fs::read(album.join("02.flac")).unwrap(), b"older second track");
+        assert!(!std::fs::read_dir(&out).unwrap().any(|entry|
+            entry.unwrap().file_name().to_string_lossy().starts_with(".tonepoet-backup-")));
+    }
+
+    #[test]
+    fn r20_distinct_runs_retain_distinct_log_snapshots_and_legacy_history() {
+        let scratch = tempfile::tempdir().expect("history scratch");
+        let visible = scratch.path().join("conversion.log");
+        std::fs::write(&visible, b"run one").expect("first log");
+        let first = archive_conversion_log_for_run(&visible, "run-one")
+            .expect("first archived run");
+        assert!(first.exists());
+        std::fs::write(&visible, b"run one, finalized").expect("final log");
+        assert_eq!(archive_conversion_log_for_run(&visible, "run-one")
+            .expect("same run updates its snapshot"), first);
+        assert_eq!(std::fs::read(&first).expect("updated archive"), b"run one, finalized");
+
+        std::fs::write(&visible, b"run one, finalized").expect("second, identical log");
+        let second = archive_conversion_log_for_run(&visible, "run-two")
+            .expect("separate conversion archived even with matching bytes");
+        assert_ne!(first, second, "different runs must not alias an archive");
+        assert_eq!(conversion_log_archive_files(scratch.path()).unwrap().len(), 2);
+
+        std::fs::write(&visible, b"legacy-visible-not-yet-archived").unwrap();
+        preserve_previous_conversion_log(&visible).expect("retain legacy conversion.log before replacement");
+        preserve_previous_conversion_log(&visible).expect("repeat is idempotent");
+        assert_eq!(conversion_log_archive_files(scratch.path()).unwrap().len(), 3);
+
+        let next_album = scratch.path().join("next-album");
+        std::fs::create_dir_all(&next_album).unwrap();
+        carry_previous_album_log_history(scratch.path(), &next_album)
+            .expect("whole-album replacement retains all history");
+        assert_eq!(conversion_log_archive_files(&next_album).unwrap().len(), 3);
+        assert_eq!(std::fs::read(next_album.join("conversion.log")).unwrap(),
+            b"legacy-visible-not-yet-archived");
     }
 
     #[test]
@@ -77911,6 +78446,7 @@ mod publish_lock_soundness_tests {
                 source_blocking_lines: String::new(),
                 provenance_section: String::new(),
                 artwork_section: String::new(),
+                replaygain_reduction_section: String::new(),
             },
             track: ConversionLogTrackFragment {
                 section: format!("Track {track_number}\n  Result: OK\n"),

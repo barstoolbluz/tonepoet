@@ -21,7 +21,9 @@ use crate::convert::formats::AudioFormat;
 pub const OUTPUT_OPTIONS_FORCE_ENCODE_ROW: u16 = 13;
 pub const OUTPUT_OPTIONS_DISC_SUBFOLDERS_ROW: u16 = 14;
 pub const OUTPUT_OPTIONS_WRITE_LOG_ROW: u16 = 15;
-pub const OUTPUT_OPTIONS_ACTIONS_ROW: u16 = 18;
+pub const OUTPUT_OPTIONS_PARTIAL_ROW: u16 = 16;
+pub const OUTPUT_OPTIONS_IF_EXISTS_ROW: u16 = 17;
+pub const OUTPUT_OPTIONS_ACTIONS_ROW: u16 = 20;
 
 const OUTPUT_OPTIONS_TEMPLATE_LOAD_WIDTH: u16 = 6;
 const OUTPUT_OPTIONS_TEMPLATE_BUILD_WIDTH: u16 = 8;
@@ -111,7 +113,14 @@ pub fn register_output_options_mouse_targets(
         );
     }
 
-    if show_actions && maximized && area.height >= 20 && row_visible(OUTPUT_OPTIONS_ACTIONS_ROW) {
+    if maximized && area.height >= 19 {
+        register_output_options_pills(buttons, area, OUTPUT_OPTIONS_PARTIAL_ROW,
+            "partial (source) ", &opts.partial, TuiButton::PartialPill);
+        register_output_options_pills(buttons, area, OUTPUT_OPTIONS_IF_EXISTS_ROW,
+            "if exists ", &opts.if_exists, TuiButton::IfExistsPill);
+    }
+
+    if show_actions && maximized && area.height >= 22 && row_visible(OUTPUT_OPTIONS_ACTIONS_ROW) {
         buttons.record_button(TuiButton::ActionsPipelineField, row_rect(OUTPUT_OPTIONS_ACTIONS_ROW));
     }
 }
@@ -261,6 +270,8 @@ pub fn draw_output_options_pane(
     let is_force_encode_focused = focused && opts.field_focus == OutputOptionsField::ForceEncode;
     let is_disc_subfolders_focused = focused && opts.field_focus == OutputOptionsField::DiscSubfolders;
     let is_write_log_focused = focused && opts.field_focus == OutputOptionsField::WriteLog;
+    let is_partial_focused = focused && opts.field_focus == OutputOptionsField::Partial;
+    let is_if_exists_focused = focused && opts.field_focus == OutputOptionsField::IfExists;
     let is_actions_focused = focused && opts.field_focus == OutputOptionsField::Actions;
 
     let is_editing = |field| opts.editing == Some(field);
@@ -450,7 +461,20 @@ pub fn draw_output_options_pane(
         ));
     }
 
-    if show_actions && maximized && area.height >= 20 {
+    if maximized && area.height >= 19 {
+        lines.push(pill_row(
+            border_color, w, "partial (source) ", "",
+            &render_pill_spans(&opts.partial, is_partial_focused, theme),
+            is_partial_focused, theme,
+        ));
+        lines.push(pill_row(
+            border_color, w, "if exists ", "",
+            &render_pill_spans(&opts.if_exists, is_if_exists_focused, theme),
+            is_if_exists_focused, theme,
+        ));
+    }
+
+    if show_actions && maximized && area.height >= 22 {
         lines.push(bordered_line(border_color, w, vec![], theme));
         lines.push(bordered_line(
             border_color,

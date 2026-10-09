@@ -72,6 +72,8 @@ pub enum TuiButton {
     ForceEncodePill(usize),
     DiscSubfoldersPill(usize),
     WriteLogPill(usize),
+    PartialPill(usize),
+    IfExistsPill(usize),
     ContainerPill(usize),
     /// Settings pill on the container row (below the fold).
     FormatSettingsButton,
@@ -623,6 +625,8 @@ impl TuiButton {
             | Self::ForceEncodePill(_)
             | Self::DiscSubfoldersPill(_)
             | Self::WriteLogPill(_)
+            | Self::PartialPill(_)
+            | Self::IfExistsPill(_)
             | Self::ContainerPill(_)
             | Self::FormatSettingsButton
             | Self::ResampleQualityPill(_)

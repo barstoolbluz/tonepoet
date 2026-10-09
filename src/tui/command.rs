@@ -344,6 +344,8 @@ pub struct BrowseConvertQueueCommitOptions {
     actions: crate::convert::pipeline::ActionPipeline,
     force_encode: bool,
     create_disc_subfolders: bool,
+    output_if_exists: Option<crate::convert::pipeline::OverwritePolicy>,
+    partial_output: Option<bool>,
 }
 
 impl BrowseConvertQueueCommitOptions {
@@ -362,6 +364,8 @@ impl BrowseConvertQueueCommitOptions {
             actions: options.actions,
             force_encode: options.force_encode,
             create_disc_subfolders: options.create_disc_subfolders,
+            output_if_exists: options.output_if_exists,
+            partial_output: options.partial_output,
         }
     }
 
@@ -379,6 +383,10 @@ impl BrowseConvertQueueCommitOptions {
         options.actions = self.actions;
         options.force_encode = self.force_encode;
         options.create_disc_subfolders = self.create_disc_subfolders;
+        options.output_if_exists = self.output_if_exists;
+        options.overwrite = matches!(self.output_if_exists,
+            Some(crate::convert::pipeline::OverwritePolicy::ReplaceWithBackup));
+        options.partial_output = self.partial_output;
         options
     }
 }

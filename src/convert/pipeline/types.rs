@@ -126,6 +126,20 @@ pub enum AlbumBatchOrdering {
     CompletionOrder,
 }
 
+/// True cohort used for a dispatcher-coordinated ReplayGain album measurement.
+/// This is execution evidence, never an instruction to redo earlier members.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayGainExcludedSource {
+    pub source: PathBuf,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayGainCohortDisclosure {
+    pub contributors: usize,
+    pub excluded: Vec<ReplayGainExcludedSource>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AlbumBatchContext {
     /// Explicit shared conversion-log batch id assigned once by the folder/album
@@ -188,6 +202,11 @@ pub struct AlbumBatchContext {
     /// publication lock and never pretends synthetic ordinals are metadata.
     #[serde(default)]
     pub(crate) ordering: AlbumBatchOrdering,
+    /// Set at the post-encode barrier, on successful members only. Failure
+    /// fragments may predate this decision; the album assembler selects a
+    /// populated disclosure from a surviving member.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) replaygain_cohort: Option<ReplayGainCohortDisclosure>,
 }
 
 impl AlbumBatchContext {
@@ -215,6 +234,7 @@ impl AlbumBatchContext {
             resolved_identity: None,
             source_paths: Vec::new(),
             ordering: AlbumBatchOrdering::ProvenTrackOrder,
+            replaygain_cohort: None,
             source_grouping_root,
         }
     }
@@ -980,6 +1000,7 @@ pub enum OverwritePolicy {
     FailIfExists,
     ReplaceWithBackup,
     AlwaysRedo,
+    KeepBoth,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -166,11 +166,11 @@ pub fn build_pipeline_request_from_settings(
             windows_portable: false,
         },
         publish: PublishPolicy {
-            overwrite: if item.options.overwrite {
+            overwrite: item.options.output_if_exists.unwrap_or(if item.options.overwrite {
                 OverwritePolicy::ReplaceWithBackup
             } else {
                 OverwritePolicy::FailIfExists
-            },
+            }),
             same_filesystem_required: false,
             write_manifest: false,
         },
@@ -194,7 +194,11 @@ pub fn build_pipeline_request_from_settings(
             features: StageRequirement::Enabled,
             generate_cue: item.options.generate_cue_files,
         },
-        failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
+        failure_policy: if item.options.partial_output.unwrap_or(false) {
+            FailurePolicy::AllowPartialAlbum
+        } else {
+            FailurePolicy::FailAlbumOnAnyTrackFailure
+        },
         container_extension: item.options.container_extension.clone(),
         container_ffmpeg_flags: item.options.container_ffmpeg_flags.clone(),
         companion: super::types::CompanionCopyPolicy {

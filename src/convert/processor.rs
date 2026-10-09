@@ -275,6 +275,16 @@ fn apply_conversion_options_request_contract(
     item: &ConversionItem,
 ) {
     request.actions = item.options.actions.clone();
+    if let Some(policy) = item.options.output_if_exists {
+        request.publish.overwrite = policy;
+    }
+    if let Some(partial) = item.options.partial_output {
+        request.failure_policy = if partial {
+            crate::convert::pipeline::FailurePolicy::AllowPartialAlbum
+        } else {
+            crate::convert::pipeline::FailurePolicy::FailAlbumOnAnyTrackFailure
+        };
+    }
     if item.options.create_disc_subfolders {
         request.naming.template = naming_template_with_disc_subfolder(
             std::mem::take(&mut request.naming.template),
@@ -2453,16 +2463,18 @@ struct PendingReplayGainAlbumBatch {
     expected_items: usize,
     completed_item_ids: BTreeSet<String>,
     ready_members: BTreeMap<String, ReplayGainBatchReadyMember>,
-    failure: Option<String>,
+    source_by_item: BTreeMap<String, PathBuf>,
+    excluded_by_item: BTreeMap<String, crate::convert::pipeline::ReplayGainExcludedSource>,
 }
 
 impl PendingReplayGainAlbumBatch {
-    fn new(expected_items: usize) -> Self {
+    fn new(expected_items: usize, source_by_item: BTreeMap<String, PathBuf>) -> Self {
         Self {
             expected_items,
             completed_item_ids: BTreeSet::new(),
             ready_members: BTreeMap::new(),
-            failure: None,
+            source_by_item,
+            excluded_by_item: BTreeMap::new(),
         }
     }
 }
@@ -2471,6 +2483,7 @@ impl PendingReplayGainAlbumBatch {
 struct ReplayGainBatchPreflight {
     item_to_batch: BTreeMap<String, String>,
     expected_by_batch: BTreeMap<String, usize>,
+    source_by_batch: BTreeMap<String, BTreeMap<String, PathBuf>>,
     failures: BTreeMap<String, String>,
 }
 
@@ -3220,9 +3233,10 @@ fn preflight_replaygain_album_batches(items: &[ConversionItem]) -> ReplayGainBat
 
         result.expected_by_batch.insert(batch_id.clone(), members.len());
         for item in members {
-            result
-                .item_to_batch
-                .insert(item.id.clone(), batch_id.clone());
+            let Some(request) = item.pipeline_request.as_ref() else { continue; };
+            result.source_by_batch.entry(batch_id.clone()).or_default()
+                .insert(item.id.clone(), request.container.clone());
+            result.item_to_batch.insert(item.id.clone(), batch_id.clone());
         }
     }
 
@@ -3243,11 +3257,16 @@ fn account_terminal_replaygain_batch_participants(
             continue;
         };
         if state.completed_item_ids.insert(item_id.clone()) {
-            state.failure.get_or_insert_with(|| {
-                format!(
-                    "album ReplayGain participant {item_id} ended before the complete batch reached the post-encode reduction barrier: {status:?}"
-                )
-            });
+            let reason = match status {
+                ConversionStatus::Failed { error, .. } => error.clone(),
+                ConversionStatus::Interrupted => "conversion interrupted".to_string(),
+                ConversionStatus::Paused => "conversion paused".to_string(),
+                other => format!("participant ended before the post-encode barrier: {other:?}"),
+            };
+            let source = state.source_by_item.get(item_id)
+                .cloned().unwrap_or_else(|| PathBuf::from(item_id));
+            state.excluded_by_item.insert(item_id.clone(),
+                crate::convert::pipeline::ReplayGainExcludedSource { source, reason });
         }
         if state.completed_item_ids.len() >= state.expected_items {
             completed.insert(batch_id.clone());
@@ -3270,33 +3289,53 @@ fn release_completed_replaygain_batch(
         return;
     }
 
-    let mut members = state.ready_members.into_values().collect::<Vec<_>>();
-    members.sort_by_key(|(album, _)| {
-        album
-            .req
-            .album_batch_track
-            .as_ref()
-            .map(|track| track.source_ordinal)
-            .unwrap_or(u32::MAX)
-    });
-
-    if members.len() == state.expected_items && state.failure.is_none() {
-        pool.metrics().record_jobs_queued(1);
-        submissions.enqueue_replaygain_batch_measurement(batch_id.to_string(), members);
-        return;
+    let mut survivors = Vec::new();
+    let mut failed_ready = Vec::new();
+    for (item_id, (album, outputs)) in state.ready_members {
+        if outputs.len() == 1 && outputs[0].ok && outputs[0].artifact.is_some() {
+            survivors.push((album, outputs));
+        } else {
+            let reason = if outputs.len() != 1 {
+                format!("participant had {} encoded outputs, expected one", outputs.len())
+            } else {
+                format!("conversion did not produce an encoded artifact: {:?}", outputs[0].record.outcome)
+            };
+            state.excluded_by_item.insert(item_id.clone(),
+                crate::convert::pipeline::ReplayGainExcludedSource {
+                    source: state.source_by_item.get(&item_id).cloned()
+                        .unwrap_or_else(|| album.req.container.clone()),
+                    reason: reason.clone(),
+                });
+            failed_ready.push((album, outputs, reason));
+        }
     }
-
-    let reason = state.failure.take().unwrap_or_else(|| {
-        format!(
-            "album ReplayGain batch reached the reduction barrier with {} ready member(s), expected {}",
-            members.len(), state.expected_items,
-        )
-    });
-    for (mut album, outputs) in members {
-        album.batch_replaygain = Some(Err(reason.clone()));
+    for (mut album, outputs, reason) in failed_ready {
+        // Preserve this item's own failure, not a synthesized batch-wide error.
+        album.batch_replaygain = Some(Err(reason));
         pool.metrics().record_jobs_queued(1);
         submissions.enqueue_album_postprocess(album, outputs);
     }
+    if survivors.is_empty() {
+        return;
+    }
+    let excluded = state.excluded_by_item.into_values().collect::<Vec<_>>();
+    let contributors = survivors.len();
+    if !excluded.is_empty() {
+        for (album, _) in &mut survivors {
+            if let Some(batch) = album.req.album_batch.as_mut() {
+                batch.replaygain_cohort = Some(crate::convert::pipeline::ReplayGainCohortDisclosure {
+                    contributors,
+                    excluded: excluded.clone(),
+                });
+            }
+        }
+    }
+    survivors.sort_by_key(|(album, _)| {
+        album.req.album_batch_track.as_ref()
+            .map(|track| track.source_ordinal).unwrap_or(u32::MAX)
+    });
+    pool.metrics().record_jobs_queued(1);
+    submissions.enqueue_replaygain_batch_measurement(batch_id.to_string(), survivors);
 }
 
 fn enqueue_album_postprocess_with_replaygain_barrier(
@@ -4708,11 +4747,13 @@ async fn run_queue_with_shared_orchestrator(
         })
         .collect::<BTreeMap<_, _>>();
     let replaygain_batch_by_item = replaygain_preflight.item_to_batch;
+    let mut replaygain_sources = replaygain_preflight.source_by_batch;
     let mut pending_replaygain_batches = replaygain_preflight
         .expected_by_batch
         .into_iter()
         .map(|(batch_id, expected)| {
-            (batch_id, PendingReplayGainAlbumBatch::new(expected))
+            let sources = replaygain_sources.remove(&batch_id).unwrap_or_default();
+            (batch_id, PendingReplayGainAlbumBatch::new(expected, sources))
         })
         .collect::<BTreeMap<_, _>>();
     let mut job_to_item: BTreeMap<String, String> = BTreeMap::new();
@@ -12223,6 +12264,41 @@ FILE "disc2.flac" WAVE
         assert_eq!(work.job_id, "prepared-job-01");
         assert_eq!(job_to_item.get("prepared-job-01").map(String::as_str), Some("item-01"));
         assert!(terminal.is_empty());
+    }
+
+    #[test]
+    fn r20_terminal_failure_is_excluded_without_releasing_replaygain_barrier_early() {
+        let source_by_item = BTreeMap::from([
+            ("healthy".to_string(), PathBuf::from("/inputs/01-good.flac")),
+            ("broken".to_string(), PathBuf::from("/inputs/02-bad.flac")),
+        ]);
+        let batch_id = "r20-reduced-replaygain".to_string();
+        let mut pending = BTreeMap::from([(
+            batch_id.clone(), PendingReplayGainAlbumBatch::new(2, source_by_item),
+        )]);
+        let item_to_batch = BTreeMap::from([
+            ("healthy".to_string(), batch_id.clone()),
+            ("broken".to_string(), batch_id.clone()),
+        ]);
+        let terminal = BTreeMap::from([(
+            "broken".to_string(), ConversionStatus::Failed {
+                error: "invalid audio stream".to_string(),
+                log_path: None,
+            },
+        )]);
+        assert!(account_terminal_replaygain_batch_participants(
+            &terminal, &item_to_batch, &mut pending,
+        ).is_empty(), "failed member cannot prematurely release encoded survivor");
+        let state = pending.get(&batch_id).expect("pending batch");
+        assert_eq!(state.completed_item_ids.len(), 1);
+        assert_eq!(state.excluded_by_item.len(), 1);
+        assert_eq!(state.excluded_by_item["broken"].source, PathBuf::from("/inputs/02-bad.flac"));
+        assert_eq!(state.excluded_by_item["broken"].reason, "invalid audio stream");
+        assert!(!state.excluded_by_item.contains_key("healthy"));
+        // In production the healthy member enters ready_members at the encode
+        // barrier; only then does the two-member rendezvous complete.
+        pending.get_mut(&batch_id).unwrap().completed_item_ids.insert("healthy".to_string());
+        assert_eq!(pending[&batch_id].completed_item_ids.len(), 2);
     }
 
     #[test]

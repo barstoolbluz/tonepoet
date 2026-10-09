@@ -4794,6 +4794,8 @@ pub enum OutputOptionsField {
     ForceEncode,
     DiscSubfolders,
     WriteLog,
+    Partial,
+    IfExists,
     Actions,
 }
 
@@ -4804,7 +4806,7 @@ impl OutputOptionsField {
         Self::FilenameTemplate,
         Self::MergeMode,
     ];
-    const MAXIMIZED_FIELDS: [Self; 11] = [
+    const MAXIMIZED_FIELDS: [Self; 13] = [
         Self::DestPath,
         Self::FolderTemplate,
         Self::FilenameTemplate,
@@ -4815,9 +4817,11 @@ impl OutputOptionsField {
         Self::ForceEncode,
         Self::DiscSubfolders,
         Self::WriteLog,
+        Self::Partial,
+        Self::IfExists,
         Self::Actions,
     ];
-    const MAXIMIZED_FIELDS_WITHOUT_ACTIONS: [Self; 10] = [
+    const MAXIMIZED_FIELDS_WITHOUT_ACTIONS: [Self; 12] = [
         Self::DestPath,
         Self::FolderTemplate,
         Self::FilenameTemplate,
@@ -4828,6 +4832,14 @@ impl OutputOptionsField {
         Self::ForceEncode,
         Self::DiscSubfolders,
         Self::WriteLog,
+        Self::Partial,
+        Self::IfExists,
+    ];
+    // Height 17/18: keep old three pills reachable; new rows need >= 19.
+    const MAXIMIZED_FIELDS_WITHOUT_NEW_OR_ACTIONS: [Self; 10] = [
+        Self::DestPath, Self::FolderTemplate, Self::FilenameTemplate,
+        Self::MergeMode, Self::CompanionExtensions, Self::CompanionFolders,
+        Self::ExcludeFiles, Self::ForceEncode, Self::DiscSubfolders, Self::WriteLog,
     ];
     const MAXIMIZED_FIELDS_WITHOUT_CONVERSION_OR_ACTIONS: [Self; 7] = [
         Self::DestPath,
@@ -4866,10 +4878,12 @@ impl OutputOptionsField {
         if !maximized {
             return &Self::COLLAPSED_FIELDS;
         }
-        if area_height >= 20 && show_actions {
+        if area_height >= 22 && show_actions {
             &Self::MAXIMIZED_FIELDS
-        } else if area_height >= 17 {
+        } else if area_height >= 19 {
             &Self::MAXIMIZED_FIELDS_WITHOUT_ACTIONS
+        } else if area_height >= 17 {
+            &Self::MAXIMIZED_FIELDS_WITHOUT_NEW_OR_ACTIONS
         } else if area_height >= 12 {
             &Self::MAXIMIZED_FIELDS_WITHOUT_CONVERSION_OR_ACTIONS
         } else if area_height >= 11 {
@@ -7615,6 +7629,9 @@ pub struct OutputOptionsState {
     pub force_encode: PillState<bool>,
     pub disc_subfolders: PillState<bool>,
     pub write_log: PillState<bool>,
+    /// Partial applies only to tracks within a single multi-track source.
+    pub partial: PillState<bool>,
+    pub if_exists: PillState<crate::convert::pipeline::OverwritePolicy>,
     pub actions: crate::convert::pipeline::ActionPipeline,
     pub field_focus: OutputOptionsField,
     pub editing: Option<OutputOptionsField>,
@@ -7634,6 +7651,15 @@ impl OutputOptionsState {
         disc_subfolders.select_value(&false);
         let mut write_log = PillState::new(vec![(true, "yes"), (false, "no")]);
         write_log.select_value(&false);
+        let mut partial = PillState::new(vec![(false, "off"), (true, "on")]);
+        partial.select_value(&false);
+        use crate::convert::pipeline::OverwritePolicy;
+        let mut if_exists = PillState::new(vec![
+            (OverwritePolicy::FailIfExists, "fail"),
+            (OverwritePolicy::ReplaceWithBackup, "overwrite"),
+            (OverwritePolicy::KeepBoth, "keep both"),
+        ]);
+        if_exists.select_value(&OverwritePolicy::FailIfExists);
 
         Self {
             dest_path: None,
@@ -7646,6 +7672,8 @@ impl OutputOptionsState {
             force_encode,
             disc_subfolders,
             write_log,
+            partial,
+            if_exists,
             actions: crate::convert::pipeline::ActionPipeline::default(),
             field_focus: OutputOptionsField::DestPath,
             editing: None,
@@ -7711,6 +7739,10 @@ impl OutputOptionsState {
             settings.force_encode = *self.force_encode.selected_value();
         }
         options.write_log_file = *self.write_log.selected_value();
+        options.partial_output = Some(*self.partial.selected_value());
+        options.output_if_exists = Some(*self.if_exists.selected_value());
+        options.overwrite = matches!(*self.if_exists.selected_value(),
+            crate::convert::pipeline::OverwritePolicy::ReplaceWithBackup);
     }
 }
 
