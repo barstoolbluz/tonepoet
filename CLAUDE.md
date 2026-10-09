@@ -284,6 +284,21 @@ freshness failure). Earlier it was 7341 across 63 targets on `bae7758`. The coun
 logging/evidence redesign removed tests that asserted log content inferred from
 argv rather than from execution receipts.
 
+**ReplayGain test fixtures must be at least 400 ms.** Integrated loudness is
+measured in 400 ms gating blocks, so audio shorter than one block has no
+computable gain — TonePoet writes `REPLAYGAIN_*_PEAK` and omits
+`REPLAYGAIN_*_GAIN`. That is correct behaviour, and it reads as a ReplayGain bug.
+Measured 2026-10-09 with a mono 44.1 kHz tone, everything else held constant:
+
+| frames | duration | album gain |
+| --- | --- | --- |
+| 11025 | 0.250 s | missing |
+| 17640 | 0.400 s | 8.15 dB |
+| 44100 | 1.000 s | 8.15 dB |
+
+R20's `scripts/smoke_r20_album_publication.sh` generated 11025-frame WAVs and
+asserted album gain tags, so it failed against a correct build.
+
 **Conversion log evidence.** As of 2026-10-07 the conversion log is projected from
 `src/convert/pipeline/execution_evidence.rs` using typed execution receipts. It does
 not parse argv to infer what happened. Failure paths retain typed semantic evidence;
