@@ -3328,6 +3328,16 @@ and extend them rather than demand its own two-area layout.
 
 ## 53. tonepoet writes hidden files into the user's output folders. This must never happen.
 
+> **✅ RESOLVED 2026-10-09.** Two halves, both closed. R16 (`7ab0739`) gated manifest
+> publication on `req.publish.write_manifest`; R18 (`15519c3`) withdrew rerun detection
+> entirely per the decision below, deleting `rerun.rs` and `orchestrator_rerun_gate.rs`,
+> and validating Reference authority without a manifest. Verified on real audio: a
+> qualified Reference SACD conversion (`--dsd-path reference`, log requested) leaves only
+> audio, `conversion.log` and requested artwork — zero `.tonepoet-manifest.json`. Re-checked
+> after R20/R21 across clean convert, `--if-exists overwrite` and `keep-both`: **zero
+> manifests created and zero dotfiles** in the destination. A pre-existing manifest is left
+> untouched, which is intended — the run did not create it.
+
 Filed 2026-09-28, the third time the same pattern has been discovered in the field. #27 was
 declared resolved on 2026-09-26 by defaulting `PublishPolicy::write_manifest` to false; the
 Reference route ignores that default (`stages.rs`: "Native Reference publication always
@@ -4286,6 +4296,13 @@ qualification records. Expect requalification.
 
 ## 64. Destination pollution, fourth variant: structured execution evidence; and #53's manifest half is reproducing widely
 
+> **✅ RESOLVED 2026-10-09.** R14 (`4fb99ba`) moved structured execution evidence out of the
+> destination into `XDG_DATA_HOME/tonepoet/execution-evidence/`, and
+> `portable_evidence_log_root` (`stages.rs`) redirects any requested root that falls inside
+> the output tree. R18 (`15519c3`) then removed the consent coupling that produced it
+> unasked — see #66. Verified: a three-track conversion with the log requested creates
+> evidence only when independently asked for, and the destination carries zero dotfiles.
+
 Filed 2026-10-08. This is #53 again, which was already "the third time the same
 pattern has been discovered in the field". Read #53 first; its stated requirement
 is unchanged and is the standing rule.
@@ -4365,6 +4382,17 @@ feature that writes a file is free to reintroduce the pattern, and one just did.
 
 ## 65. Nothing asserts what files a conversion leaves in the destination
 
+> **✅ RESOLVED 2026-10-09.** The guard this issue asked for exists and is in the gate. The
+> strict destination-inventory tests assert the destination's exact file set across source
+> routes and log-consent combinations, refusing any unexpected file:
+> `issue_65_postconversion_destination_inventory_covers_source_routes_and_log_consent`,
+> `issue_65_independent_folder_album_publish_has_no_extra_entries_with_log_on_or_off`,
+> `issue_65_reference_execution_evidence_does_not_force_unrequested_manifest`,
+> `issue_65_reference_execution_still_validates_sample_identity_without_manifest`, plus
+> `destination_inventory_detects_hidden_files_nested_directories_and_unrequested_evidence`.
+> They earned their keep immediately, catching the `.tonepoet-batch` leftover and the
+> snapshot-log change. They do **not** yet cover the `--overwrite-output` path (see #69).
+
 Filed 2026-10-08. This is the omission that lets #27, #53 and #64 keep recurring.
 It is recorded separately because it is not a defect in any one route — it is a
 missing guard, and every variant of destination pollution has gone undetected
@@ -4432,6 +4460,15 @@ has something to be verified by. If the test lands first it will fail, which is
 the correct starting state.
 
 ## 66. "Structured execution evidence: unavailable", and the same conversion requested two ways differs
+
+> **✅ RESOLVED 2026-10-09 by R18 (`15519c3`).** Both halves. `unified_request.rs:180` is now
+> `write_json_log: false`, so asking for a human log no longer authorizes machine evidence;
+> a caller supplying a complete `PipelineRequest` can still request JSON independently. And
+> the terminal section is gated on `machine_evidence_requested` (`stages.rs`), so the line is
+> omitted entirely when nothing was requested and reads `unavailable` only when evidence was
+> requested and is absent. Pinned by `human_log_flag_does_not_request_machine_evidence`,
+> `independently_requested_machine_evidence_survives_prebuilt_request` and
+> `terminal_delivery_evidence_reflects_independent_request_and_result`.
 
 Filed 2026-10-08, from a field run on the current build (`4fb99ba`). Two related
 observations, one cosmetic and one not.
@@ -4553,6 +4590,15 @@ release-acceptance procedure should be adjusted to match it.
 
 ## 68. One unreadable file costs every healthy file in its batch, under default ReplayGain
 
+> **✅ RESOLVED 2026-10-09 by R20 (`075946c`).** Failed members are counted as terminal but
+> excluded from the album measurement; survivors are published, keep their album tags, and
+> the log names what was excluded. Verified on real audio with one good and one unreadable
+> input: exit 1, the survivor carries `REPLAYGAIN_ALBUM_GAIN=3.91 dB`, and the log reads
+> `Contributing files: 1` / `Excluded files: 1` / `Excluded source: ...`. The black-box smoke
+> covers it (`PASS ReplayGain: surviving audio, reduced album tags and exclusion
+> disclosure`), and the #67 exit smoke's `mixed` case — which could not pass while this bug
+> stood — now reports `1/2 succeeded, 1 failed`.
+
 Filed 2026-10-09, found when R19's own smoke script failed on its mixed case.
 
 Convert two files at once where one is unreadable. The healthy file converts,
@@ -4627,6 +4673,15 @@ completed audio is the wrong answer. R19's smoke expectation should then match
 whatever that behaviour becomes.
 
 ## 69. `--overwrite-output` destroys the album and hides the audio in dotfolders, reporting success
+
+> **✅ RESOLVED 2026-10-09 by R20 (`075946c`).** One-track independent publishes now use the
+> journalled incremental path with per-file rollback instead of replacing the whole shared
+> album directory; whole-album backup-and-rename is retained for genuine multi-track
+> payloads and for interrupt recovery, and a successful whole-album publish removes its
+> backup. Verified on real audio, twice with fresh sources: after `--if-exists overwrite` a
+> three-track album retains **3** tracks with **0** backup directories and **0** dotfiles,
+> where this issue recorded 1 track surviving. The black-box smoke covers N=1, 2 and 3
+> (`all audio survives, no backup remains, history retained`).
 
 Filed 2026-10-09 on `43f275e`, found while checking whether `conversion.log` is
 overwritten on re-conversion (it is — see #70).
@@ -4714,6 +4769,42 @@ destination entirely is a separate question from this defect; its interrupted
 and recovery behaviour is tested and should not be disturbed.
 
 ## 70. `conversion.log` is overwritten by the next conversion into the same folder
+
+> **⚠ SPECIFICATION CORRECTED 2026-10-09 — implemented, but to the wrong spec.** R20
+> (`075946c`) delivered this faithfully to the R20 brief, which asked for "a per-run log
+> named with its date and time, written alongside the existing `conversion.log`". That
+> wording was wrong, and it was wrong in the brief rather than in the delivery. A *per-run*
+> log means a greenfield conversion — one into a folder with no prior log — writes two files
+> with identical bytes.
+>
+> Observed on three fresh field conversions on `c08886d`, two SACD ISO sources and one FLAC
+> folder album:
+>
+> ```
+> Duke Jordan - Flight To Jordan (2010) [FLAC]
+>   conversion-20261009T190432.062253035Z-8a9db71204a56f8a.log   7655 bytes
+>   conversion.log                                               7655 bytes
+>   distinct sha256 across both: 1
+> ```
+>
+> The purpose was narrower: this issue is that `conversion.log` is *overwritten*, and the
+> point was to stop losing the earlier one. A folder with no prior log has nothing to
+> preserve.
+>
+> **Corrected requirement.** A dated copy is written only when an existing `conversion.log`
+> is about to be replaced, and it holds the log being displaced. A conversion into a folder
+> with no prior log writes `conversion.log` and nothing else. The timestamp belongs to the
+> run whose log the file contains, not to the run that displaced it, and still needs enough
+> resolution that two conversions on the same day cannot collide. So a first conversion
+> leaves one file; a second leaves the new `conversion.log` plus one dated file holding the
+> first run.
+>
+> Consequence for the tests: R21 extended the strict #65 destination-inventory tests to
+> expect exactly one dated snapshot on a first human-log run. That expectation inverts — a
+> first logged run must have **no** dated log. Naming is written at
+> `src/convert/pipeline/stages.rs:18740`, `:18822` and `:18824`, which is source-locked, so
+> the fix requires requalification.
+
 
 Filed 2026-10-09 on `43f275e`.
 
