@@ -4878,7 +4878,7 @@ impl OutputOptionsField {
         if !maximized {
             return &Self::COLLAPSED_FIELDS;
         }
-        if area_height >= 22 && show_actions {
+        if area_height >= super::draw_output_options::OUTPUT_OPTIONS_ACTIONS_MIN_HEIGHT && show_actions {
             &Self::MAXIMIZED_FIELDS
         } else if area_height >= 19 {
             &Self::MAXIMIZED_FIELDS_WITHOUT_ACTIONS
@@ -7812,10 +7812,14 @@ mod output_options_companion_projection_tests {
         assert_eq!(ExcludeFiles.next_for(true), ForceEncode);
         assert_eq!(ForceEncode.next_for(true), DiscSubfolders);
         assert_eq!(DiscSubfolders.next_for(true), WriteLog);
-        assert_eq!(WriteLog.next_for(true), Actions);
+        assert_eq!(WriteLog.next_for(true), Partial);
+        assert_eq!(Partial.next_for(true), IfExists);
+        assert_eq!(IfExists.next_for(true), Actions);
         assert_eq!(Actions.next_for(true), DestPath);
         assert_eq!(DestPath.prev_for(true), Actions);
-        assert_eq!(Actions.prev_for(true), WriteLog);
+        assert_eq!(Actions.prev_for(true), IfExists);
+        assert_eq!(IfExists.prev_for(true), Partial);
+        assert_eq!(Partial.prev_for(true), WriteLog);
         assert_eq!(WriteLog.prev_for(true), DiscSubfolders);
         assert_eq!(DiscSubfolders.prev_for(true), ForceEncode);
         assert_eq!(CompanionExtensions.clamp_for(true), CompanionExtensions);
@@ -7834,14 +7838,28 @@ mod output_options_companion_projection_tests {
         assert_eq!(DestPath.prev_for_area(true, 17, true), WriteLog);
         assert_eq!(Actions.clamp_for_area(true, 17, true), MergeMode);
 
-        assert_eq!(WriteLog.next_for_area(true, 20, true), Actions);
-        assert_eq!(Actions.next_for_area(true, 20, true), DestPath);
+        // Height 19 fits the two new pills but not the Actions row.
+        assert_eq!(WriteLog.next_for_area(true, 19, true), Partial);
+        assert_eq!(Partial.next_for_area(true, 19, true), IfExists);
+        assert_eq!(IfExists.next_for_area(true, 19, true), DestPath);
+        assert_eq!(Actions.clamp_for_area(true, 19, true), MergeMode);
 
-        // Feature gate OFF: the Actions row never joins the cycle, even at
-        // full height, and stale Actions focus clamps away.
-        assert_eq!(WriteLog.next_for_area(true, 20, false), DestPath);
-        assert_eq!(Actions.clamp_for_area(true, 20, false), MergeMode);
-        assert_eq!(DestPath.prev_for_area(true, 20, false), WriteLog);
+        // Heights 20/21 render the compact Actions row; >=22 shows its
+        // section header as well. Both remain keyboard-reachable.
+        for height in [20, 21, 22] {
+            assert_eq!(WriteLog.next_for_area(true, height, true), Partial);
+            assert_eq!(Partial.next_for_area(true, height, true), IfExists);
+            assert_eq!(IfExists.next_for_area(true, height, true), Actions);
+            assert_eq!(Actions.next_for_area(true, height, true), DestPath);
+            assert_eq!(Actions.prev_for_area(true, height, true), IfExists);
+            assert_eq!(DestPath.prev_for_area(true, height, true), Actions);
+
+            // Feature gate OFF must hide Actions, not the two new pills.
+            assert_eq!(WriteLog.next_for_area(true, height, false), Partial);
+            assert_eq!(IfExists.next_for_area(true, height, false), DestPath);
+            assert_eq!(Actions.clamp_for_area(true, height, false), MergeMode);
+            assert_eq!(DestPath.prev_for_area(true, height, false), IfExists);
+        }
     }
 }
 

@@ -195,12 +195,13 @@ fn matching_prior_manifest_cannot_override_fail_if_exists() {
 }
 
 #[test]
-fn matching_prior_manifest_does_not_suppress_fresh_publish_with_backup() {
+fn matching_prior_manifest_does_not_suppress_incremental_overwrite() {
     let root = tempfile::tempdir().unwrap();
     let album_dir = root.path().join("Album");
     fs::create_dir_all(&album_dir).unwrap();
     let old = make_manifest(&album_dir);
-    write_manifest(&album_dir, &old).unwrap();
+    let legacy_path = write_manifest(&album_dir, &old).unwrap();
+    let legacy_bytes = fs::read(&legacy_path).unwrap();
     assert_eq!(old.legacy_settings_fingerprint(), Some(settings_fingerprint(&settings())));
 
     let (staging, plan) = stage_fresh_audio(root.path(), "replace");
@@ -210,12 +211,13 @@ fn matching_prior_manifest_does_not_suppress_fresh_publish_with_backup() {
         write_manifest: false,
     }, None).expect("explicit replacement must publish, even with matching old manifest");
     assert_eq!(fs::read(album_dir.join("01.flac")).unwrap(), b"fresh converted audio".to_vec());
-    assert!(published.manifest_path.is_none());
-    assert!(!album_dir.join(".tonepoet-manifest.json").exists(),
-        "a new manifest requires opt-in; the old one belongs to the backup");
+    assert!(published.manifest_path.is_none(), "no newly published manifest without opt-in");
+    assert_eq!(fs::read(&legacy_path).unwrap(), legacy_bytes,
+        "incremental overwrite must leave the pre-existing manifest untouched");
     let backups = fs::read_dir(root.path()).unwrap()
         .map(|entry| entry.unwrap().path())
-        .filter(|path| path.is_dir() && path != &album_dir && path.join(".tonepoet-manifest.json").exists())
+        .filter(|path| path.is_dir() && path != &album_dir &&
+            path.file_name().unwrap().to_string_lossy().starts_with(".tonepoet-backup-"))
         .collect::<Vec<_>>();
-    assert_eq!(backups.len(), 1, "one backup must retain old manifest authority: {backups:?}");
+    assert!(backups.is_empty(), "incremental overwrite must not create an album backup: {backups:?}");
 }

@@ -23,7 +23,22 @@ pub const OUTPUT_OPTIONS_DISC_SUBFOLDERS_ROW: u16 = 14;
 pub const OUTPUT_OPTIONS_WRITE_LOG_ROW: u16 = 15;
 pub const OUTPUT_OPTIONS_PARTIAL_ROW: u16 = 16;
 pub const OUTPUT_OPTIONS_IF_EXISTS_ROW: u16 = 17;
+pub const OUTPUT_OPTIONS_ACTIONS_MIN_HEIGHT: u16 = 20;
+const OUTPUT_OPTIONS_COMPACT_ACTIONS_ROW: u16 = 18;
 pub const OUTPUT_OPTIONS_ACTIONS_ROW: u16 = 20;
+
+/// A 20/21-row maximized pane fits the Actions field only without the two
+/// decorative rows preceding its section. Taller panes retain that spacing.
+/// Drawing, mouse registration, and tests all use this one placement rule.
+fn actions_row_for_height(height: u16) -> Option<u16> {
+    if height >= 22 {
+        Some(OUTPUT_OPTIONS_ACTIONS_ROW)
+    } else if height >= OUTPUT_OPTIONS_ACTIONS_MIN_HEIGHT {
+        Some(OUTPUT_OPTIONS_COMPACT_ACTIONS_ROW)
+    } else {
+        None
+    }
+}
 
 const OUTPUT_OPTIONS_TEMPLATE_LOAD_WIDTH: u16 = 6;
 const OUTPUT_OPTIONS_TEMPLATE_BUILD_WIDTH: u16 = 8;
@@ -120,8 +135,12 @@ pub fn register_output_options_mouse_targets(
             "if exists ", &opts.if_exists, TuiButton::IfExistsPill);
     }
 
-    if show_actions && maximized && area.height >= 22 && row_visible(OUTPUT_OPTIONS_ACTIONS_ROW) {
-        buttons.record_button(TuiButton::ActionsPipelineField, row_rect(OUTPUT_OPTIONS_ACTIONS_ROW));
+    if show_actions && maximized {
+        if let Some(row) = actions_row_for_height(area.height) {
+            if row_visible(row) {
+                buttons.record_button(TuiButton::ActionsPipelineField, row_rect(row));
+            }
+        }
     }
 }
 
@@ -474,22 +493,26 @@ pub fn draw_output_options_pane(
         ));
     }
 
-    if show_actions && maximized && area.height >= 22 {
-        lines.push(bordered_line(border_color, w, vec![], theme));
-        lines.push(bordered_line(
-            border_color,
-            w,
-            vec![Span::styled("   Actions", output_options_section_header_style(theme))],
-            theme,
-        ));
-        lines.push(actions_row(
-            border_color,
-            w,
-            &output_options_actions_summary(&opts.actions),
-            opts.actions.is_empty(),
-            is_actions_focused,
-            theme,
-        ));
+    if show_actions && maximized {
+        if let Some(row) = actions_row_for_height(area.height) {
+            if row == OUTPUT_OPTIONS_ACTIONS_ROW {
+                lines.push(bordered_line(border_color, w, vec![], theme));
+                lines.push(bordered_line(
+                    border_color,
+                    w,
+                    vec![Span::styled("   Actions", output_options_section_header_style(theme))],
+                    theme,
+                ));
+            }
+            lines.push(actions_row(
+                border_color,
+                w,
+                &output_options_actions_summary(&opts.actions),
+                opts.actions.is_empty(),
+                is_actions_focused,
+                theme,
+            ));
+        }
     }
 
     let target_len_before_bottom = area.height.saturating_sub(1) as usize;
@@ -906,66 +929,71 @@ mod output_options_companion_render_tests {
             },
         ));
         let format = FormatState::new();
-        let backend = TestBackend::new(80, 20);
-        let mut terminal = Terminal::new(backend).expect("terminal");
+        for height in [20, 21, 22] {
+            let backend = TestBackend::new(80, height);
+            let mut terminal = Terminal::new(backend).expect("terminal");
 
-        terminal
-            .draw(|frame| {
-                draw_output_options_pane(
-                    frame,
-                    Rect::new(0, 0, 80, 20),
-                    &opts,
-                    None,
-                    0,
-                    &format,
-                    true,
-                    true,
-                    true,
-                    theme,
-                )
-            })
-            .expect("draw output options");
+            terminal
+                .draw(|frame| {
+                    draw_output_options_pane(
+                        frame,
+                        Rect::new(0, 0, 80, height),
+                        &opts,
+                        None,
+                        0,
+                        &format,
+                        true,
+                        true,
+                        true,
+                        theme,
+                    )
+                })
+                .expect("draw output options");
 
-        let mut row = String::new();
-        for x in 0..80 {
-            row.push_str(terminal.backend().buffer().get(x, OUTPUT_OPTIONS_ACTIONS_ROW).symbol());
+            let mut row = String::new();
+            let offset = actions_row_for_height(height).expect("Actions row fits");
+            for x in 0..80 {
+                row.push_str(terminal.backend().buffer().get(x, offset).symbol());
+            }
+            assert!(row.contains("pipeline"), "height {height}: actions label: {row}");
+            assert!(row.contains("1 post"), "height {height}: live summary: {row}");
+            assert!(row.contains("Enter/click edit"), "height {height}: edit affordance: {row}");
+            for (offset, expected) in [(OUTPUT_OPTIONS_PARTIAL_ROW, "partial (source)"),
+                                       (OUTPUT_OPTIONS_IF_EXISTS_ROW, "if exists")] {
+                let mut text = String::new();
+                for x in 0..80 {
+                    text.push_str(terminal.backend().buffer().get(x, offset).symbol());
+                }
+                assert!(text.contains(expected), "height {height}: {expected} missing: {text}");
+            }
         }
-        assert!(row.contains("pipeline"), "actions row should render pipeline label: {row}");
-        assert!(row.contains("1 post"), "actions row should summarize post actions: {row}");
-        assert!(row.contains("Enter/click edit"), "actions row should advertise edit affordance: {row}");
     }
 
     #[test]
     fn maximized_actions_row_registers_button_map_target_inside_pane_only() {
         let opts = OutputOptionsState::new();
-        let mut buttons = ButtonRenderMap::new();
-        register_output_options_mouse_targets(
-            &mut buttons,
-            Rect::new(10, 4, 80, 20),
-            &opts,
-            true,
-            true,
-        );
+        for height in [20, 21, 22] {
+            let mut buttons = ButtonRenderMap::new();
+            register_output_options_mouse_targets(
+                &mut buttons,
+                Rect::new(10, 4, 80, height),
+                &opts,
+                true,
+                true,
+            );
 
-        assert_eq!(
-            buttons.find_button_at(11, 4 + OUTPUT_OPTIONS_ACTIONS_ROW),
-            Some(TuiButton::ActionsPipelineField)
-        );
-        assert_eq!(
-            buttons.find_button_at(9, 4 + OUTPUT_OPTIONS_ACTIONS_ROW),
-            None,
-            "clicks outside the Output Options pane must not open the actions wizard"
-        );
-        assert_eq!(
-            buttons.find_button_at(89, 4 + OUTPUT_OPTIONS_ACTIONS_ROW),
-            None,
-            "right border must not be treated as the actions row"
-        );
-        assert_eq!(
-            buttons.find_button_at(90, 4 + OUTPUT_OPTIONS_ACTIONS_ROW),
-            None,
-            "outside cells must not be treated as the actions row"
-        );
+            let y = 4 + actions_row_for_height(height).expect("Actions row fits");
+            assert_eq!(buttons.find_button_at(11, y), Some(TuiButton::ActionsPipelineField));
+            assert_eq!(buttons.find_button_at(9, y), None, "outside left pane border");
+            assert_eq!(buttons.find_button_at(89, y), None, "right pane border");
+            assert_eq!(buttons.find_button_at(90, y), None, "outside right pane border");
+        }
+        assert!(actions_row_for_height(19).is_none());
+        let mut short = ButtonRenderMap::new();
+        register_output_options_mouse_targets(&mut short, Rect::new(10, 4, 80, 19), &opts, true, true);
+        assert!(short.recorded_buttons().iter().all(|(button, _)|
+            !matches!(button, TuiButton::ActionsPipelineField)),
+            "too-short panes must not create invisible Actions targets");
     }
 
     #[test]
@@ -973,36 +1001,38 @@ mod output_options_companion_render_tests {
         let theme = crate::tui::theme::theme_by_slug(crate::tui::theme::default_theme_slug())
             .expect("default theme");
         let opts = OutputOptionsState::new();
-        let area = Rect::new(10, 4, 80, 20);
         let format = FormatState::new();
-        let backend = TestBackend::new(100, 30);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        let mut buttons = ButtonRenderMap::new();
+        for height in [20, 21, 22] {
+            let area = Rect::new(10, 4, 80, height);
+            let backend = TestBackend::new(100, 30);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+            let mut buttons = ButtonRenderMap::new();
 
-        terminal
-            .draw(|frame| {
-                draw_output_options_pane_with_mouse_targets(
-                    frame,
-                    area,
-                    &opts,
-                    None,
-                    0,
-                    &format,
-                    true,
-                    true,
-                    true,
-                    &mut buttons,
-                    theme,
-                );
-            })
-            .expect("draw output options");
+            terminal
+                .draw(|frame| {
+                    draw_output_options_pane_with_mouse_targets(
+                        frame,
+                        area,
+                        &opts,
+                        None,
+                        0,
+                        &format,
+                        true,
+                        true,
+                        true,
+                        &mut buttons,
+                        theme,
+                    );
+                })
+                .expect("draw output options");
 
-        assert_eq!(
-            buttons.find_button_at(11, 4 + OUTPUT_OPTIONS_ACTIONS_ROW),
-            Some(TuiButton::ActionsPipelineField),
-            "the production Output Options draw path must register the rendered Actions row"
-        );
-        assert_eq!(buttons.find_button_at(9, 4 + OUTPUT_OPTIONS_ACTIONS_ROW), None);
+            let y = 4 + actions_row_for_height(height).expect("Actions row fits");
+            assert_eq!(
+                buttons.find_button_at(11, y), Some(TuiButton::ActionsPipelineField),
+                "height {height}: production draw must register the rendered Actions row"
+            );
+            assert_eq!(buttons.find_button_at(9, y), None);
+        }
     }
 
     #[test]
@@ -1062,6 +1092,14 @@ mod output_options_companion_render_tests {
                 .all(|(button, _)| !matches!(button, TuiButton::ForceEncodePill(usize::MAX) | TuiButton::DiscSubfoldersPill(usize::MAX) | TuiButton::WriteLogPill(usize::MAX))),
             "Output Options registration must not create synthetic full-row sentinel pill targets"
         );
+        assert!(buttons.recorded_buttons().iter().any(|(button, rect)|
+            matches!(button, TuiButton::PartialPill(index) if *index < opts.partial.options.len())
+                && rect.y == area.y + OUTPUT_OPTIONS_PARTIAL_ROW),
+            "the compact pane must expose concrete Partial targets");
+        assert!(buttons.recorded_buttons().iter().any(|(button, rect)|
+            matches!(button, TuiButton::IfExistsPill(index) if *index < opts.if_exists.options.len())
+                && rect.y == area.y + OUTPUT_OPTIONS_IF_EXISTS_ROW),
+            "the compact pane must expose concrete IfExists targets");
     }
 
     #[test]
@@ -1077,7 +1115,7 @@ mod output_options_companion_render_tests {
         );
 
         assert_eq!(
-            buttons.find_button_at(11, 4 + OUTPUT_OPTIONS_ACTIONS_ROW),
+            buttons.find_button_at(11, 4 + actions_row_for_height(20).unwrap()),
             None,
             "non-maximized Output Options must not expose invisible Actions-row hitboxes"
         );

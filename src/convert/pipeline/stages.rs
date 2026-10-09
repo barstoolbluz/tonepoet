@@ -121,7 +121,7 @@ use crate::convert::ConversionStatus;
 use crate::metadata_persistence::native_ape_canonical_key;
 use tonepoet_pipeline::{
     AudioFormat as PlannerAudioFormat, BitDepthTarget, DitherType, DsdRate, NyquistTransition,
-    PcmBitDepth, PreferredTool, RateTarget, SampleGainPolicy, SourceFrameExtent, SsrcPdfType,
+    PcmBitDepth, PreferredTool, RateTarget, SampleGainPolicy, SourceFrameExtent,
     SsrcProfile,
 };
 use crate::tui::sacd::{
@@ -36370,7 +36370,7 @@ mod protected_ssrc_runtime_tests {
         } else {
             (
                 Some(2),
-                Some(SsrcPdfType::Triangular),
+                Some(tonepoet_pipeline::SsrcPdfType::Triangular),
                 tonepoet_pipeline::SsrcTruePeakStoredSampleErrorBound::TargetLsbNano(
                     8_000_000_000,
                 ),
@@ -65939,8 +65939,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
     use super::companion_copy_hardening_tests::resolved_companion_test_identity;
     use super::pipeline_test_helpers::*;
     use crate::convert::pipeline::manifest::{
-        manifest_path, metadata_mtime_secs, read_manifest, write_manifest, ConversionManifest,
-        ConversionManifestTrack, ManifestTrackExecutionIdentityV2, TrackIdentity, ValidationStatus,
+        manifest_path, read_manifest, ValidationStatus,
     };
     use crate::convert::pipeline::reporter::{PipelineEvent, PipelineReporter, RecordingReporter};
     use crate::convert::pipeline::tool::blocking_test_runner::{
@@ -70969,6 +70968,10 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                 if human_log {
                     expected.insert("Gate Test/conversion.log".to_string());
                 }
+                // The opt-in human log includes exactly one per-run snapshot.
+                // Keep this Reference inventory as strict as the source-route
+                // inventory: do not permit arbitrary extra destination files.
+                expected_r20_history_entry(&destination, "Gate Test", human_log, &mut expected);
                 if requested_manifest {
                     expected.insert("Gate Test/.tonepoet-manifest.json".to_string());
                 }

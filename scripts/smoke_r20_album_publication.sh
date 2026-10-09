@@ -28,8 +28,10 @@ for index in range(1, count + 1):
     path = root / f'{index:02} - Track {index}.wav'
     with wave.open(str(path), 'wb') as wav:
         wav.setnchannels(1); wav.setsampwidth(2); wav.setframerate(44100)
+        # One second of audio exceeds the 400 ms ReplayGain gating window.
+        # A 0.25-second fixture can produce peaks but no album gain.
         samples = (int(2500 * math.sin(2.0 * math.pi * (220 + 70 * index) * frame / 44100))
-                   for frame in range(11025))
+                   for frame in range(44100))
         wav.writeframes(b''.join(struct.pack('<h', sample) for sample in samples))
 PY
 }
