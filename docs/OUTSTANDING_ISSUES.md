@@ -4675,18 +4675,43 @@ wins and every other track survives only inside a backup directory.
   disk, but the album is incomplete and the missing tracks are in hidden
   directories a user browsing their library will not see. Nothing in the output
   says so; the exit status is 0 and the summary says every file succeeded.
-- **A fifth violation of the standing rule.** `.tonepoet-backup-*` directories
-  are unrequested hidden state written into the destination, after #27, #53
-  twice, and #64. The #65 inventory tests do not cover the `--overwrite-output`
-  path, which is why they did not catch it.
+- **The backups are left behind after a success.** This is the narrower
+  complaint, and it is not that the backups exist.
+
+### The backup mechanism itself is deliberate — corrected 2026-10-09
+
+An earlier draft of this entry called `.tonepoet-backup-*` a fifth violation of
+the standing rule, alongside #27, #53 and #64. That was wrong and is withdrawn.
+The backup is documented behaviour — `--overwrite-output` is described as
+"Overwrite existing output (with backup)" — and it is crash-safety machinery
+with tests of its own:
+
+```
+cancellation_during_publish_after_backup_leaves_recoverable_state_and_no_corrupt_final_output
+  asserts "old album contents are backed up"
+interrupted_publish_recovery_restores_backup_before_new_publish
+  asserts recovery restores from the backup before republishing
+```
+
+Those cover the interrupted and cancelled cases, where a surviving backup is
+correct and wanted. What nothing covers is the **successful** multi-job publish:
+no test asserts that once publication succeeds the backups are gone and the
+album holds every track. The #65 inventory tests pin
+`OverwritePolicy::FailIfExists`, so they never reach this path at all.
+
+So the defect is the lifecycle and the album contents, not the existence of a
+backup: a backup taken for safety should be removed once the publish it was
+protecting has succeeded, and it should never end up holding tracks that are
+missing from the album.
 
 ### What we want
 
 Re-converting with `--overwrite-output` should leave the album complete, with
-every track the conversion produced. Whatever backup mechanism protects the
-previous copy belongs outside the destination, like execution evidence and
-staging already do, and should be removed once the publish succeeds. A
-conversion that leaves the destination incomplete should not report success.
+every track the conversion produced, and no backup directories surviving a
+successful publish. A conversion that leaves the destination incomplete should
+not report success. Whether the transient backup should live outside the
+destination entirely is a separate question from this defect; its interrupted
+and recovery behaviour is tested and should not be disturbed.
 
 ## 70. `conversion.log` is overwritten by the next conversion into the same folder
 
