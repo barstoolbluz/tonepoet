@@ -4924,3 +4924,46 @@ album: `--if-exists overwrite` and `--if-exists keep-both`, each asserting the
 complete file set of the destination afterwards, including the sibling directory
 keep-both creates. A conversion that publishes over existing output should be
 held to the same standard as one that publishes into an empty folder.
+
+## 72. A destination collision is discovered only after all the work is done
+
+Filed 2026-10-10 from the field. Reported for SACD conversions and for CUE
+extraction from a 32/192 image, where the wait before the failure is five to
+eight minutes.
+
+Without `--if-exists overwrite`, a conversion whose album directory already holds
+differing output runs materialization, conversion and ReplayGain to completion
+and only then fails, at publish. `PublishError::DestinationExists` is raised
+solely from the publish sites (`src/convert/pipeline/stages.rs:18201`, `:18218`,
+`:26101`, `:26272`). The two existing preflights cover tools
+(`preflight_album_conversion_tools`) and multi-root destinations
+(`preflight_multi_root_destinations`); neither asks whether this album's files
+would collide.
+
+Reproduced with three short FLAC sources, converted at 24-bit and then again at
+16-bit into the same destination:
+
+```
+exit=1  elapsed=1.6s
+destination already exists: .../01 - Track 1.flac
+stages that ran before the failure: stage=Publish
+```
+
+The elapsed time is trivial for three sine files and is the whole complaint for
+an SACD ISO: every sample is extracted and converted before the answer arrives,
+and the answer was available from the destination path alone.
+
+### The behaviour that must survive a fix
+
+An *identical* re-conversion currently succeeds and leaves the audio untouched.
+Measured: a second run with the same sources and settings exits 0, reports
+`3/3 succeeded`, and the output files keep their original SHA-256 and mtime. So
+publish distinguishes "already present and identical" from "already present and
+different", and only the latter is a collision. A preflight must preserve that
+distinction or it will refuse idempotent redos that work today.
+
+### What we want
+
+A conversion that cannot publish its output fails before it does the work.
+Whether a collision exists is knowable from the destination and the naming
+policy before any audio is read.
