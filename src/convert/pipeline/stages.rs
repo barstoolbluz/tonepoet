@@ -6674,7 +6674,8 @@ const EXPLICIT_ALBUM_ARTIST_CLEAR_EXTRA_KEY: &str =
     "\0tonepoet_explicit_metadata_clear:ALBUMARTIST";
 
 fn is_internal_metadata_extra_key(key: &str) -> bool {
-    key == PRESERVED_SOURCE_ALBUM_TAG_EXTRA_KEY
+    key.starts_with("tonepoet_log_album_origin_")
+        || key == PRESERVED_SOURCE_ALBUM_TAG_EXTRA_KEY
         || key == PRESERVED_SOURCE_ALBUM_ARTIST_TAG_EXTRA_KEY
         || key == PRESERVED_SOURCE_NAMING_ARTIST_EXTRA_KEY
         || key == LEGACY_ALBUM_TAG_OVERRIDE_EXTRA_KEY
@@ -16501,6 +16502,7 @@ fn build_pre_materialization_conversion_log_common_fragment(
         year: None,
         genre: None.into(),
         catalog_number: None,
+        metadata_origins: BTreeMap::new(),
         source_blocking_lines: String::new(),
         provenance_section: String::new(),
         artwork_section: String::new(),
@@ -16729,6 +16731,7 @@ fn build_conversion_log_at_with_runner_and_timing(
         year: conversion_log_album_year(&source.album_metadata).map(str::to_string),
         genre: source.album_metadata.genre.as_deref().map(str::to_string),
         catalog_number: conversion_log_catalog_number(&source.album_metadata.extra).map(str::to_string),
+        metadata_origins: conversion_log_album_metadata_origins(source),
         source_blocking_lines,
         provenance_section,
         artwork_section,
@@ -16768,6 +16771,7 @@ struct ConversionLogRenderInput {
     year: Option<String>,
     genre: Option<String>,
     catalog_number: Option<String>,
+    metadata_origins: BTreeMap<String, String>,
     source_blocking_lines: String,
     provenance_section: String,
     artwork_section: String,
@@ -16816,11 +16820,24 @@ fn render_conversion_log(input: &ConversionLogRenderInput) -> String {
     push_kv_line(&mut log, "Container path", &input.container_path);
     push_kv_line(&mut log, "Source kind", &input.source_kind);
     push_kv_line(&mut log, "Track count", input.track_count.to_string());
-    push_optional_kv_line(&mut log, "Album artist", input.album_artist.as_deref());
-    push_optional_kv_line(&mut log, "Album", input.album.as_deref());
-    push_optional_kv_line(&mut log, "Year", input.year.as_deref());
-    push_optional_kv_line(&mut log, "Genre", input.genre.as_deref());
-    push_optional_kv_line(&mut log, "Catalog number", input.catalog_number.as_deref());
+    for (key, label, value) in [
+        ("album_artist", "Album artist", input.album_artist.as_deref()),
+        ("album", "Album", input.album.as_deref()),
+        ("year", "Year", input.year.as_deref()),
+        ("genre", "Genre", input.genre.as_deref()),
+        ("catalog_number", "Catalog number", input.catalog_number.as_deref()),
+    ] {
+        // Absence is displayed as a blank value, never silently omitted.
+        // Provenance qualifies only values actually present in the selected
+        // album metadata; request/sidecar precedence is not re-guessed here.
+        let display = match value.map(str::trim).filter(|v| !v.is_empty()) {
+            Some(value) => format!("{value} [from: {}]",
+                input.metadata_origins.get(key).map(String::as_str)
+                    .unwrap_or(&input.source_kind)),
+            None => String::new(),
+        };
+        push_kv_line(&mut log, label, display);
+    }
     log.push_str(&input.source_blocking_lines);
     log.push('\n');
 
@@ -16948,6 +16965,8 @@ struct ConversionLogCommonFragment {
     year: Option<String>,
     genre: Option<String>,
     catalog_number: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    metadata_origins: BTreeMap<String, String>,
     source_blocking_lines: String,
     provenance_section: String,
     artwork_section: String,
@@ -17578,7 +17597,7 @@ fn render_structured_conversion_log_track_fragment(
     if summary.outcome == ConversionLogTrackOutcome::Success {
         let artifact_work = render_track_artifact_work(&fragment.execution_evidence);
         if !artifact_work.is_empty() {
-            log.push_str("  Artifact work:\n");
+            log.push_str("  Output file:\n");
             for line in artifact_work {
                 log.push_str("    ");
                 log.push_str(&escape_log_value(&line));
@@ -17789,6 +17808,18 @@ fn build_conversion_log_album_presentation(
             ),
             AlbumUniformOperation::AbsentOrIncomplete => {}
         }
+    }
+
+    // Promote only a completed uniform applied gain. Unlike the selected
+    // decision, this is execution evidence: unequal track gains must remain
+    // visible under their individual tracks.
+    match album_uniform_operation(tracks, "apply_gain") {
+        AlbumUniformOperation::Uniform(lines) => {
+            body.extend(lines);
+            presentation.suppressed_operation_kinds.insert("apply_gain".to_string());
+            promoted_uniform_fact = true;
+        }
+        AlbumUniformOperation::Divergent | AlbumUniformOperation::AbsentOrIncomplete => {}
     }
 
     match album_uniform_reference_terminal_static(tracks) {
@@ -18020,6 +18051,17 @@ fn build_conversion_log_common_fragment(
     build_conversion_log_common_fragment_with_runner(outcome, source, req, artifacts, None)
 }
 
+fn conversion_log_album_metadata_origins(source: &PreparedSource) -> BTreeMap<String, String> {
+    ["album_artist", "album", "year", "genre", "catalog_number"]
+        .into_iter()
+        .filter_map(|field| {
+            source.album_metadata.extra
+                .get(&format!("tonepoet_log_album_origin_{field}"))
+                .map(|value| (field.to_string(), value.clone()))
+        })
+        .collect()
+}
+
 fn build_conversion_log_common_fragment_with_runner(
     outcome: &AlbumOutcome,
     source: &PreparedSource,
@@ -18048,6 +18090,7 @@ fn build_conversion_log_common_fragment_with_runner(
         year: conversion_log_album_year(&source.album_metadata).map(str::to_string),
         genre: source.album_metadata.genre.as_deref().map(str::to_string),
         catalog_number: conversion_log_catalog_number(&source.album_metadata.extra).map(str::to_string),
+        metadata_origins: conversion_log_album_metadata_origins(source),
         source_blocking_lines,
         provenance_section,
         artwork_section,
@@ -22546,6 +22589,7 @@ fn build_conversion_log_from_fragments_with_status(
         year: common.year,
         genre: common.genre,
         catalog_number: common.catalog_number,
+        metadata_origins: common.metadata_origins,
         source_blocking_lines: common.source_blocking_lines,
         provenance_section: common.provenance_section,
         artwork_section: common.artwork_section,
@@ -22596,6 +22640,20 @@ fn merge_conversion_log_common_fragments(
         catalog_number: first_non_empty_common_option(
             ordered.iter().filter_map(|fragment| fragment.common.catalog_number.as_deref()),
         ),
+        metadata_origins: [
+            "album_artist", "album", "year", "genre", "catalog_number",
+        ].into_iter().filter_map(|field| {
+            ordered.iter().find(|fragment| match field {
+                "album_artist" => fragment.common.album_artist.as_deref(),
+                "album" => fragment.common.album.as_deref(),
+                "year" => fragment.common.year.as_deref(),
+                "genre" => fragment.common.genre.as_deref(),
+                _ => fragment.common.catalog_number.as_deref(),
+            }
+                .is_some_and(|v| !v.trim().is_empty()))
+                .and_then(|fragment| fragment.common.metadata_origins.get(field))
+                .map(|origin| (field.to_string(), origin.clone()))
+        }).collect(),
         source_blocking_lines: first_non_empty_common_string(
             ordered.iter().map(|fragment| fragment.common.source_blocking_lines.as_str()),
         )
@@ -23695,7 +23753,7 @@ fn append_track_log(
     if matches!(record.outcome, TrackOutcome::Ok) {
         let artifact_work = render_track_artifact_work(&record.execution_evidence);
         if !artifact_work.is_empty() {
-            log.push_str("  Artifact work:\n");
+            log.push_str("  Output file:\n");
             for line in artifact_work {
                 log.push_str("    ");
                 log.push_str(&escape_log_value(&line));
@@ -25107,14 +25165,47 @@ fn dsd_album_gain_decision_label(
                 } if planned_target == *target_dbtp && planned_gain == applied_gain => {}
                 _ => return None,
             }
-            Some(format!(
-                "submitted-batch DSD Reference album gain {} dB ({scope}; target {} dBTP)",
-                human_log_db(applied_gain, true),
-                human_log_db(*target_dbtp, false),
-            ))
+            reference_music_level_album_gain_label(
+                applied_gain,
+                *target_dbtp,
+                req.settings.dsd.runtime_album_track_count(),
+                req.settings.dsd.runtime_album_loudest_peak_dbfs(),
+            )
         }
         _ => None,
     }
+}
+
+// Qualified Reference reconstruction attenuates its intermediate by 12 dB.
+// Its terminal gain scalar restores exactly that attenuation in addition to
+// the music-level normalization. The unrelated +6.0206 dB *general export*
+// compensation must not be subtracted from Reference. This is a display-only
+// decomposition; the sealed gain authority and delivered samples stay intact.
+fn reference_music_level_album_gain_label(
+    applied_gain: tonepoet_pipeline::DbNano,
+    target_dbtp: tonepoet_pipeline::DbNano,
+    track_count: Option<usize>,
+    protected_peak: Option<tonepoet_pipeline::DbNano>,
+) -> Option<String> {
+    let protection = tonepoet_pipeline::DbNano::HEADROOM_RESTORATION;
+    let music_gain = applied_gain.checked_sub(protection)?;
+    let music_scope = match (track_count, protected_peak) {
+        (Some(count), Some(protected_peak)) => {
+            let native_peak = protected_peak.checked_add(protection)?;
+            format!(
+                "{count} measured DSD track(s), music-level loudest true peak {} dBTP",
+                human_log_db(native_peak, false),
+            )
+        }
+        (Some(count), None) => format!("{count} verified-silent DSD track(s)"),
+        _ => "submitted DSD batch".to_string(),
+    };
+    Some(format!(
+        "submitted-batch DSD Reference music-level album gain {} dB ({music_scope}; target {} dBTP; excluded fixed Reference R64 protection/restore 12.000 dB; terminal applied {} dB)",
+        human_log_db(music_gain, true),
+        human_log_db(target_dbtp, false),
+        human_log_db(applied_gain, true),
+    ))
 }
 
 fn dsd_album_gain_scope_disclosure_label(disclosure: &DsdAlbumGainScopeDisclosure) -> String {
@@ -25204,6 +25295,7 @@ fn conversion_log_catalog_number(extra: &BTreeMap<String, String>) -> Option<&st
                 | "catalogueno"
                 | "cataloguenumber"
                 | "sacdalbumcatalognumber"
+                | "sacddisccatalognumber"
         ) {
             let trimmed = value.trim();
             if !trimmed.is_empty() {
@@ -28167,18 +28259,47 @@ pub(crate) fn refresh_portable_durable_log_best_effort(report: &PipelineReport) 
 // Orchestrator  (PR 4 body, final shape)
 // ===========================================================================
 
+// Mark a field only when an enrichment step actually changes its value. This
+// avoids misattributing an untouched SACD sidecar value to the label resolver.
+fn label_changed_album_metadata_origins(
+    before: &AlbumMetadata,
+    after: &mut AlbumMetadata,
+    origin: &str,
+) {
+    let changed = [
+        ("album", before.album.as_deref() != after.album.as_deref()),
+        ("album_artist", before.album_artist.as_deref() != after.album_artist.as_deref()),
+        ("year", before.date.as_deref() != after.date.as_deref()),
+        ("genre", before.genre.as_deref() != after.genre.as_deref()),
+        ("catalog_number", conversion_log_catalog_number(&before.extra)
+            != conversion_log_catalog_number(&after.extra)),
+    ];
+    for (field, did_change) in changed {
+        if did_change {
+            after.extra.insert(
+                format!("tonepoet_log_album_origin_{field}"),
+                origin.to_string(),
+            );
+        }
+    }
+}
+
 fn enrich_source_with_label_info(source: &mut PreparedSource, container: &Path, req: &PipelineRequest) {
+    let before = source.album_metadata.clone();
     super::source_heuristics::maybe_enrich(
         source,
         container,
         req.source.archive_password.as_ref().map(|s| s.expose()),
         req.naming.folder_template.as_deref(),
     );
+    label_changed_album_metadata_origins(&before, &mut source.album_metadata, "source filename/folder heuristics");
+    let before = source.album_metadata.clone();
     super::label_resolver::enrich_with_label_info(
         &mut source.album_metadata,
         container,
         super::label_resolver::dictionary_label_resolver(),
     );
+    label_changed_album_metadata_origins(&before, &mut source.album_metadata, "label metadata dictionary");
 }
 
 fn request_batch_resolved_identity(req: &PipelineRequest) -> Option<&BatchResolvedAlbumIdentity> {
@@ -29246,12 +29367,24 @@ fn apply_batch_identity_and_request_metadata(source: &mut PreparedSource, req: &
         preserve_source_tags_for_organizational_identity(source);
         if let Some(album) = identity.album.as_ref() {
             source.album_metadata.album = Some(album.clone());
+            source.album_metadata.extra.insert(
+                "tonepoet_log_album_origin_album".to_string(),
+                "resolved batch identity".to_string(),
+            );
         }
         if let Some(album_artist) = identity.album_artist.as_ref() {
             source.album_metadata.album_artist = Some(album_artist.clone()).into();
+            source.album_metadata.extra.insert(
+                "tonepoet_log_album_origin_album_artist".to_string(),
+                "resolved batch identity".to_string(),
+            );
         }
         if let Some(date) = identity.date.as_ref() {
             source.album_metadata.date = Some(date.clone());
+            source.album_metadata.extra.insert(
+                "tonepoet_log_album_origin_year".to_string(),
+                "resolved batch identity".to_string(),
+            );
         }
         if let Some(total_discs) = identity.total_discs {
             source.album_metadata.total_discs = Some(total_discs);
@@ -29275,6 +29408,10 @@ fn apply_batch_identity_and_request_metadata(source: &mut PreparedSource, req: &
         MetadataTextOverride::Keep => {}
         MetadataTextOverride::Clear => {
             source.album_metadata.album_artist = None.into();
+            source.album_metadata.extra.insert(
+                "tonepoet_log_album_origin_album_artist".to_string(),
+                "explicit metadata clear".to_string(),
+            );
             remove_preserved_source_album_artist_tag(&mut source.album_metadata);
             source
                 .album_metadata
@@ -29300,6 +29437,10 @@ fn apply_batch_identity_and_request_metadata(source: &mut PreparedSource, req: &
             let value = value.trim();
             if !value.is_empty() {
                 source.album_metadata.album_artist = Some(value.to_string()).into();
+                source.album_metadata.extra.insert(
+                    "tonepoet_log_album_origin_album_artist".to_string(),
+                    "explicit metadata override".to_string(),
+                );
                 remove_preserved_source_album_artist_tag(&mut source.album_metadata);
                 source
                     .album_metadata
@@ -31014,11 +31155,52 @@ fn admit_planner_resolved_output_claim(req: &mut PipelineRequest) -> Result<Opti
     Ok(Some(admitted))
 }
 
+// A pre-conversion refusal is sound only when the planned destination's
+// filesystem *shape* proves that even an identical payload cannot be
+// installed. Existing regular files are deliberately inconclusive: publish
+// compares their bytes with the newly encoded payload and accepts identical
+// re-conversions without rewriting audio. Treating existence as a collision
+// would silently break that established contract.
+fn preflight_proven_destination_obstruction(
+    req: &PipelineRequest,
+    plan: &AlbumPlan,
+) -> Result<(), String> {
+    if req.publish.overwrite != OverwritePolicy::FailIfExists {
+        return Ok(());
+    }
+    for directory in std::iter::once(&plan.album_dir).chain(plan.album_dirs.iter()) {
+        if directory.is_file() {
+            return Err(format!(
+                "destination cannot be published: required album directory is a file: {}",
+                directory.display(),
+            ));
+        }
+    }
+    for entry in &plan.entries {
+        if entry.final_path.is_dir() {
+            return Err(format!(
+                "destination cannot be published: planned output file is a directory: {}",
+                entry.final_path.display(),
+            ));
+        }
+        if let Some(parent) = entry.final_path.parent() {
+            if parent.is_file() {
+                return Err(format!(
+                    "destination cannot be published: output parent is a file: {}",
+                    parent.display(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn admit_planned_output_claim(
     req: &PipelineRequest,
     plan: &AlbumPlan,
     already_admitted: Option<&Path>,
 ) -> Result<(), String> {
+    preflight_proven_destination_obstruction(req, plan)?;
     let Some(execution_id) = crate::concurrency::runtime_execution_id(&req.item_id) else {
         return Ok(());
     };
@@ -61528,7 +61710,7 @@ mod conversion_log_tests {
 
     struct VersionOnlyRunner(HashMap<ToolBinary, String>);
 
-    fn successful_log_summary() -> ConversionLogTrackSummary {
+    pub(super) fn successful_log_summary() -> ConversionLogTrackSummary {
         ConversionLogTrackSummary {
             outcome: ConversionLogTrackOutcome::Success,
             bytes_in: None,
@@ -61537,7 +61719,7 @@ mod conversion_log_tests {
         }
     }
 
-    fn album_scope_test_fragment(track_number: u32, dsd_target_rate_hz: u32) -> ConversionLogTrackFragment {
+    pub(super) fn album_scope_test_fragment(track_number: u32, dsd_target_rate_hz: u32) -> ConversionLogTrackFragment {
         let mut extraction = OperationRecord::completed(
             format!("extract-{track_number}"),
             "source_extraction",
@@ -71957,6 +72139,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             year: Some("2026".to_string()),
             genre: Some("Rock".to_string()).into(),
             catalog_number: None,
+            metadata_origins: BTreeMap::new(),
             source_blocking_lines: String::new(),
             provenance_section: "Provenance\n----------\nNo provenance details were recorded.\n\n".to_string(),
             artwork_section: "Artwork\n-------\nNo artwork was embedded.\n\n".to_string(),
@@ -76301,6 +76484,140 @@ Recovered provenance
     }
 
     #[test]
+    fn r24_reference_protection_is_twelve_db_not_general_export_compensation() {
+        use tonepoet_pipeline::DbNano;
+        let protection = DbNano::HEADROOM_RESTORATION;
+        assert_eq!(human_log_db(protection, false), "12.000");
+        for (gain, peak, music_gain, music_peak) in [
+            ("18.095", "-18.195", "+6.095", "-6.195"),
+            ("17.988", "-18.088", "+5.988", "-6.088"),
+            ("19.028", "-19.128", "+7.028", "-7.128"),
+        ] {
+            let applied: DbNano = gain.parse().expect("logged applied scalar");
+            let protected: DbNano = peak.parse().expect("logged protected peak");
+            let music_scalar = applied.checked_sub(protection).expect("music scalar in range");
+            let music_true_peak = protected.checked_add(protection).expect("music peak in range");
+            assert_eq!(human_log_db(music_scalar, true), music_gain);
+            assert_eq!(human_log_db(music_true_peak, false), music_peak);
+            let rendered = reference_music_level_album_gain_label(
+                applied,
+                "-0.100".parse().unwrap(),
+                Some(7),
+                Some(protected),
+            ).expect("qualified Reference report");
+            assert!(rendered.contains(&format!("music-level album gain {music_gain} dB")), "{rendered}");
+            assert!(rendered.contains(&format!("music-level loudest true peak {music_peak} dBTP")), "{rendered}");
+            assert!(rendered.contains("excluded fixed Reference R64 protection/restore 12.000 dB"), "{rendered}");
+            assert!(rendered.contains(&format!("terminal applied +{gain} dB")), "{rendered}");
+            assert!(!rendered.contains("18.0206"), "general export compensation is not on this route: {rendered}");
+            assert_eq!(
+                human_log_db(music_scalar.checked_add(music_true_peak).unwrap(), false),
+                "-0.100",
+                "music-level peak plus gain resolves the selected album target",
+            );
+        }
+    }
+
+    #[test]
+    fn r24_applied_gain_appears_once_when_uniform_and_on_each_track_when_divergent() {
+        let mut first = super::conversion_log_tests::album_scope_test_fragment(1, 88_200);
+        let mut second = super::conversion_log_tests::album_scope_test_fragment(2, 88_200);
+        let gain_operation = |track: u32, scalar: &str| {
+            let mut op = OperationRecord::completed(
+                format!("reference-gain-{track}"),
+                "apply_gain", "Waveform gain", ExecutionBackend::external("sox"),
+            );
+            op.parameters.push(OperationParameter::new(
+                "Applied terminal scalar", EvidenceValue::Text(scalar.to_string()),
+            ));
+            op
+        };
+        first.execution_evidence.operations.push(gain_operation(1, "+18.095 dB"));
+        second.execution_evidence.operations.push(gain_operation(2, "+18.095 dB"));
+        let success_a = super::conversion_log_tests::successful_log_summary();
+        let success_b = super::conversion_log_tests::successful_log_summary();
+        let tracks = vec![(&first, &success_a), (&second, &success_b)];
+        let album = build_conversion_log_album_presentation(&tracks, true);
+        assert_eq!(album.section.matches("Waveform gain — sox").count(), 1);
+        assert!(album.suppressed_operation_kinds.contains("apply_gain"));
+        assert!(!render_structured_conversion_log_track_fragment(&first, &success_a, &album)
+            .contains("Waveform gain — sox"));
+
+        second.execution_evidence.operations.pop();
+        second.execution_evidence.operations.push(gain_operation(2, "+17.500 dB"));
+        let tracks = vec![(&first, &success_a), (&second, &success_b)];
+        let album = build_conversion_log_album_presentation(&tracks, true);
+        assert!(!album.suppressed_operation_kinds.contains("apply_gain"));
+        let track_a = render_structured_conversion_log_track_fragment(&first, &success_a, &album);
+        let track_b = render_structured_conversion_log_track_fragment(&second, &success_b, &album);
+        assert!(track_a.contains("Applied terminal scalar: +18.095 dB"), "{track_a}");
+        assert!(track_b.contains("Applied terminal scalar: +17.500 dB"), "{track_b}");
+    }
+
+    #[test]
+    fn r24_source_information_shows_selected_origins_and_explicit_blank_fields() {
+        let mut source = log_test_source();
+        source.album_metadata.album = Some("Sidecar album".to_string());
+        source.album_metadata.album_artist = Some("Sidecar artist".to_string()).into();
+        source.album_metadata.date = None;
+        source.album_metadata.genre = None.into();
+        source.album_metadata.extra.insert(
+            "tonepoet_log_album_origin_album".to_string(),
+            "SACD sidecar XML".to_string(),
+        );
+        source.album_metadata.extra.insert(
+            "tonepoet_log_album_origin_album_artist".to_string(),
+            "SACD sidecar XML".to_string(),
+        );
+        let outcome = AlbumOutcome::Complete {
+            tracks: vec![ok_record()], stages: stage_records(),
+        };
+        let log = build_conversion_log(
+            &outcome, &source, &log_test_request(), &log_test_artifacts(), None,
+        );
+        assert!(log.contains("Album: Sidecar album [from: SACD sidecar XML]"), "{log}");
+        assert!(log.contains("Album artist: Sidecar artist [from: SACD sidecar XML]"));
+        for field in ["Year: ", "Genre: "] {
+            assert!(log.lines().any(|line| line == field), "missing explicit blank {field}");
+        }
+        assert!(is_internal_metadata_extra_key("tonepoet_log_album_origin_album"),
+            "log provenance must never be exported as an audio metadata tag");
+    }
+
+    #[test]
+    fn r24_destination_preflight_refuses_only_proven_obstructions() {
+        let temp = tempfile::tempdir().expect("preflight scratch");
+        let album_dir = temp.path().join("Album");
+        std::fs::create_dir_all(&album_dir).unwrap();
+        let output_file = album_dir.join("01.flac");
+        let req = log_test_request();
+        let plan = AlbumPlan {
+            album_dir: album_dir.clone(),
+            album_dirs: Vec::new(),
+            entries: vec![PlannedTrackOutput {
+                track_id: log_test_source().tracks[0].id.clone(),
+                final_path: output_file.clone(),
+            }],
+        };
+        assert!(preflight_proven_destination_obstruction(&req, &plan).is_ok());
+        std::fs::write(&output_file, b"possibly identical existing audio").unwrap();
+        assert!(preflight_proven_destination_obstruction(&req, &plan).is_ok(),
+            "regular existing audio is inconclusive and must reach byte-wise publish comparison");
+        std::fs::remove_file(&output_file).unwrap();
+        std::fs::create_dir(&output_file).unwrap();
+        assert!(preflight_proven_destination_obstruction(&req, &plan).is_err(),
+            "a planned output file cannot replace a directory under fail-if-exists");
+        let mut overwrite = req.clone();
+        overwrite.publish.overwrite = OverwritePolicy::ReplaceWithBackup;
+        assert!(preflight_proven_destination_obstruction(&overwrite, &plan).is_ok(),
+            "fail-if-exists preflight cannot redefine overwrite semantics");
+        std::fs::remove_dir(&output_file).unwrap();
+        std::fs::remove_dir(&album_dir).unwrap();
+        std::fs::write(&album_dir, b"not a directory").unwrap();
+        assert!(preflight_proven_destination_obstruction(&req, &plan).is_err());
+    }
+
+    #[test]
     fn r23_one_file_redo_refreshes_log_and_archives_only_the_displaced_report() {
         let scratch = tempfile::tempdir().expect("R23 single-file conversion scratch");
         let out = scratch.path().join("out");
@@ -78770,6 +79087,7 @@ mod publish_lock_soundness_tests {
                 year: Some("2026".to_string()),
                 genre: None.into(),
                 catalog_number: None,
+                metadata_origins: BTreeMap::new(),
                 source_blocking_lines: String::new(),
                 provenance_section: String::new(),
                 artwork_section: String::new(),

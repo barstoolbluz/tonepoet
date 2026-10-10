@@ -271,6 +271,42 @@ fn album_metadata(
         }
     }
 
+    let sidecar_catalog_selected = extra.iter().any(|(key, value)| {
+        let normalized = key.chars().filter(|ch| ch.is_ascii_alphanumeric())
+            .flat_map(char::to_lowercase).collect::<String>();
+        !value.trim().is_empty() && matches!(normalized.as_str(),
+            "catno" | "catnumber" | "catalog" | "catalogid" | "catalogno"
+            | "catalognumber" | "catalogue" | "catalogueid"
+            | "catalogueno" | "cataloguenumber")
+    });
+    // Only label provenance for actual selected values. Later filename/folder
+    // heuristics and label-dictionary enrichment may fill missing fields and
+    // will then replace the origin marker at their respective boundaries.
+    for (field, origin, present) in [
+        ("album", if sc("ALBUM").is_some() { "SACD sidecar XML" }
+            else if metadata.album_title().is_some() { "SACD disc text" }
+            else { "SACD area description" },
+            sc("ALBUM").is_some() || metadata.album_title().is_some() || area.header.description.is_some()),
+        ("album_artist", if sc_values("ALBUMARTIST").is_some() || sc_values("ARTIST").is_some() {
+            "SACD sidecar XML"
+        } else { "SACD disc text" },
+            sc_values("ALBUMARTIST").is_some() || sc_values("ARTIST").is_some()
+                || metadata.album_artist().is_some()),
+        ("year", if sc("DATE").is_some() { "SACD sidecar XML" }
+            else { "SACD disc TOC" },
+            sc("DATE").is_some() || format_disc_date(metadata.master_toc.disc_date).is_some()),
+        ("genre", if sc_values("GENRE").is_some() { "SACD sidecar XML" }
+            else { "SACD disc TOC" },
+            sc_values("GENRE").is_some() || first_genre(metadata).is_some()),
+        ("catalog_number", if sidecar_catalog_selected { "SACD sidecar XML" }
+            else { "SACD disc TOC" },
+            sidecar_catalog_selected || extra.contains_key("sacd_disc_catalog_number")),
+    ] {
+        if present {
+            extra.insert(format!("tonepoet_log_album_origin_{field}"), origin.to_string());
+        }
+    }
+
     AlbumMetadata {
         album: sc("ALBUM")
             .or_else(|| metadata.album_title().map(str::to_string))
@@ -834,6 +870,40 @@ mod tests {
             consistency: Default::default(),
         };
         (metadata, area)
+    }
+
+    #[test]
+    fn r24_sidecar_field_origins_follow_selected_values_without_exporting_log_markers() {
+        let (mut metadata, area) = composer_test_context(1);
+        metadata.master_toc.album_catalog_number = "DISC-CATALOG".to_string();
+        let sidecar = sidecar_track(&[
+            ("ALBUM", "Sidecar album"),
+            ("ALBUMARTIST", "Sidecar artist"),
+            ("DATE", "1994"),
+            ("GENRE", "Rock"),
+            ("CATALOGNUMBER", "SC-456"),
+        ]);
+        let album = album_metadata(&metadata, &area, SacdArea::Stereo, 1, Some(&sidecar));
+        assert_eq!(album.album.as_deref(), Some("Sidecar album"));
+        assert_eq!(album.album_artist.as_deref(), Some("Sidecar artist"));
+        assert_eq!(album.extra.get("catalognumber").map(String::as_str), Some("SC-456"));
+        for key in ["album", "album_artist", "year", "genre", "catalog_number"] {
+            assert_eq!(
+                album.extra.get(&format!("tonepoet_log_album_origin_{key}")).map(String::as_str),
+                Some("SACD sidecar XML"), "origin for {key}",
+            );
+        }
+        let tags = authoritative_metadata_tags(&TrackMetadata::default(), &album);
+        assert!(tags.iter().all(|(key, _)| !key.to_ascii_lowercase()
+            .contains("tonepoet_log_album_origin")), "internal log markers leaked: {tags:?}");
+
+        let without_sidecar = album_metadata(&metadata, &area, SacdArea::Stereo, 1, None);
+        assert_eq!(
+            without_sidecar.extra.get("tonepoet_log_album_origin_catalog_number")
+                .map(String::as_str),
+            Some("SACD disc TOC"),
+        );
+        assert!(!without_sidecar.extra.contains_key("tonepoet_log_album_origin_album"));
     }
 
     #[test]

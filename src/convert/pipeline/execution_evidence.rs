@@ -954,13 +954,48 @@ pub fn completed_reference_plan_evidence(
                 ));
                 record.decision_ids.push(decision_id.clone());
                 record.invocation_indices = terminal_invocation_indices.to_vec();
+
+                // The completed terminal physically applies this scalar. Its
+                // decision record alone is not performed-operation evidence.
+                // Int32 uses TonePoet's Float64 scalar pump ahead of the
+                // commissioned FFmpeg terminal; other admitted depths use
+                // SoX's gain effect within the terminal command.
+                let backend = if sample_contract.bit_depth == tonepoet_pipeline::PcmBitDepth::Int32 {
+                    ExecutionBackend::native("TonePoet Float64 scalar pump")
+                } else {
+                    ExecutionBackend::external("sox")
+                };
+                let mut gain = OperationRecord::completed(
+                    "reference-waveform-gain",
+                    "apply_gain",
+                    "Waveform gain",
+                    backend,
+                );
+                gain.inputs.push(EvidenceArtifactRef::path(
+                    "reference-protected-r64",
+                    protected_r64_path,
+                ));
+                gain.outputs.push(EvidenceArtifactRef::path(
+                    "reference-terminal-qpcm",
+                    &summary.qpcm_path,
+                ));
+                gain.parameters.push(OperationParameter::new(
+                    "Applied terminal scalar",
+                    EvidenceValue::Text(format!("{} dB", applied_gain.render(true))),
+                ));
+                gain.parameters.push(OperationParameter::new(
+                    "Fixed Reference protection restored",
+                    EvidenceValue::Text("+12.000 dB".to_string()),
+                ));
+                gain.invocation_indices = terminal_invocation_indices.to_vec();
+                evidence.operations.push(gain);
                 evidence.operations.push(record);
             }
             DsdReferenceOperation::PackageLossless { target, .. } => {
                 let mut record = OperationRecord::completed(
                     "reference-package-output",
                     "package_output",
-                    "Package output",
+                    "Write output file",
                     ExecutionBackend::Unknown,
                 );
                 record.inputs.push(EvidenceArtifactRef::path(
@@ -1185,7 +1220,7 @@ pub fn completed_plan_evidence(
                 let mut record = OperationRecord::completed(
                     format!("plan-node-{node_index}"),
                     "package_output",
-                    "Package output",
+                    "Write output file",
                     ExecutionBackend::Unknown,
                 );
                 record.inputs.push(EvidenceArtifactRef::signal(input.0));
@@ -2431,12 +2466,12 @@ mod tests {
         let operation = OperationRecord::completed(
             "package-1",
             "package_output",
-            "Package output",
+            "Write output file",
             ExecutionBackend::Unknown,
         );
         let rendered = render_operation_generic(&operation).join("\n");
 
-        assert_eq!(rendered, "Package output");
+        assert_eq!(rendered, "Write output file");
         assert!(!rendered.contains("backend not recorded"));
     }
 
@@ -2446,7 +2481,7 @@ mod tests {
         let mut package = OperationRecord::completed(
             "package-1",
             "package_output",
-            "Package output",
+            "Write output file",
             ExecutionBackend::Unknown,
         );
         package.domain = OperationDomain::Artifact;
