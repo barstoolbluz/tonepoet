@@ -1,0 +1,741 @@
+--- a/src/convert/pipeline/stages.rs
++++ b/src/convert/pipeline/stages.rs
+@@ -25038,8 +25038,17 @@
+         ),
+     }
+ }
+ 
++// Human log presentation only. DbNano remains exact in planning and portable
++// execution evidence; show millidecibels instead of its nine-digit storage scale.
++fn human_log_db(value: tonepoet_pipeline::DbNano, mandatory_sign: bool) -> String {
++    let negative = value.0 < 0;
++    let milli = (u128::from(value.0.unsigned_abs()) + 500_000) / 1_000_000;
++    let sign = if negative { "-" } else if mandatory_sign { "+" } else { "" };
++    format!("{sign}{}.{:03}", milli / 1_000, milli % 1_000)
++}
++
+ fn dsd_album_gain_decision_label(
+     track: &PreparedTrack,
+     req: &PipelineRequest,
+     reference: Option<&ReferenceExecutionEvidence>,
+@@ -25049,9 +25058,9 @@
+         req.settings.dsd.runtime_album_loudest_peak_dbfs(),
+     ) {
+         (Some(track_count), Some(loudest)) => format!(
+             "{track_count} measured DSD track(s), loudest true peak {} dBTP",
+-            loudest.render(false),
++            human_log_db(loudest, false),
+         ),
+         (Some(track_count), None) => format!("{track_count} verified-silent DSD track(s)"),
+         _ => "submitted DSD batch".to_string(),
+     };
+@@ -25062,13 +25071,13 @@
+             let target = req
+                 .settings
+                 .dsd
+                 .album_true_peak_target_dbtp()
+-                .map(|value| value.render(false))
++                .map(|value| human_log_db(value, false))
+                 .unwrap_or_else(|| "unknown".to_string());
+             Some(format!(
+                 "submitted-batch DSD true-peak album gain {} dB ({scope}; target {} dBTP)",
+-                gain_db.render(true),
++                human_log_db(gain_db, true),
+                 target,
+             ))
+         }
+         TrackSourceRef::DsdReferenceAutoGainCarrier {
+@@ -25099,10 +25108,10 @@
+                 _ => return None,
+             }
+             Some(format!(
+                 "submitted-batch DSD Reference album gain {} dB ({scope}; target {} dBTP)",
+-                applied_gain.render(true),
+-                target_dbtp.render(false),
++                human_log_db(applied_gain, true),
++                human_log_db(*target_dbtp, false),
+             ))
+         }
+         _ => None,
+     }
+@@ -27340,8 +27349,14 @@
+     let mut rollback = match IncrementalPublishRollback::new(marker_path, &plan.album_dir, temp_dir) {
+         Ok(rollback) => rollback,
+         Err(err) => return cleanup_publish_temp(temp_dir, err),
+     };
++    // A redo of an already published audio file is a new conversion, not
++    // another member being appended to a still-growing album. Retain the
++    // standalone append contract for distinct independent siblings.
++    let displaced_audio = overwrite_existing_audio && incremental_entries.iter().any(|entry| {
++        matches!(&entry.role, PublishRole::Audio) && entry.final_path.exists()
++    });
+     let mut assembled_conversion_log = false;
+     let publish_result = (|| -> Result<(), PublishError> {
+         // Publish the track audio before the hidden conversion-log fragment can
+         // trigger final album log assembly. This prevents a visible forensic
+@@ -27377,8 +27392,19 @@
+                     // conversion.log as an assembly trigger. If an older caller
+                     // still staged one, discard it and let the fragment-count
+                     // path below decide whether the unified log is ready.
+                     remove_file_if_exists(&entry.temp_path).map_err(PublishError::io_at("removing incremental temp entry", &entry.temp_path))?;
++                }
++                PublishRole::Sidecar(SidecarKind::ConversionLog) if displaced_audio => {
++                    // Snapshot the fully finalized previous report before
++                    // installing this run's standalone log. The archive itself
++                    // participates in crash recovery and publication rollback.
++                    preserve_incremental_conversion_log_history(&entry.final_path, &mut rollback)?;
++                    replace_incremental_sidecar_entry(
++                        &entry.temp_path,
++                        &entry.final_path,
++                        &mut rollback,
++                    )?;
+                 }
+                 PublishRole::Sidecar(SidecarKind::ConversionLog) => {
+                     publish_incremental_conversion_log(
+                         &entry.temp_path,
+@@ -27867,8 +27893,58 @@
+     result
+ }
+ 
+ 
++// The legacy standalone-log path retains append for NEW independent siblings,
++// but an overwrite of an existing audio member must install the latest run's
++// complete report. This snapshot is journaled before its first filesystem
++// mutation so an interrupted or failed publish cannot leave stray history.
++fn preserve_incremental_conversion_log_history(
++    log_path: &Path,
++    rollback: &mut IncrementalPublishRollback,
++) -> Result<(), PublishError> {
++    use std::io::Write;
++
++    let bytes = match read_regular_file_no_follow(log_path) {
++        Ok(bytes) => bytes,
++        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
++        Err(error) => return Err(PublishError::Io(error)),
++    };
++    let parent = parent_dir_or_current(log_path);
++    for archived in conversion_log_archive_files(parent).map_err(PublishError::Io)? {
++        if fs::symlink_metadata(&archived).map_err(PublishError::Io)?.len() == bytes.len() as u64
++            && read_regular_file_no_follow(&archived).map_err(PublishError::Io)? == bytes
++        {
++            return Ok(());
++        }
++    }
++    let modified = fs::metadata(log_path).ok().and_then(|metadata| metadata.modified().ok());
++    let base = conversion_log_snapshot_name(&bytes, modified);
++    let stem = base.strip_suffix(".log").unwrap_or(&base);
++    for attempt in 0..1000 {
++        let name = if attempt == 0 { base.clone() } else { format!("{stem}-{attempt}.log") };
++        let snapshot = parent.join(name);
++        match read_regular_file_no_follow(&snapshot) {
++            Ok(existing) if existing == bytes => return Ok(()),
++            Ok(_) => continue,
++            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
++            Err(error) => return Err(PublishError::Io(error)),
++        }
++        rollback.record_created_file(&snapshot)?;
++        let mut file = fs::OpenOptions::new()
++            .write(true).create_new(true).open(&snapshot)
++            .map_err(PublishError::Io)?;
++        file.write_all(&bytes).map_err(PublishError::Io)?;
++        file.sync_all().map_err(PublishError::Io)?;
++        sync_parent_dir_best_effort(&snapshot);
++        return Ok(());
++    }
++    Err(PublishError::Io(io::Error::new(
++        io::ErrorKind::AlreadyExists,
++        "unable to allocate conversion history filename",
++    )))
++}
++
+ fn publish_incremental_conversion_log(
+     src: &Path,
+     dst: &Path,
+     rollback: &mut IncrementalPublishRollback,
+@@ -27876,12 +27952,12 @@
+     if dst.is_dir() {
+         return Err(PublishError::DestinationExists(dst.display().to_string()));
+     }
+ 
+-    // Legacy/non-fragment incremental jobs still append their staged standalone
+-    // logs. Fragment-backed jobs never reach this path for assembly: their
+-    // hidden fragment sidecar triggers count-and-maybe-assemble directly after
+-    // fragment publication.
++    // Append only when a distinct independent file joins a folder. An audio
++    // redo replaces the standalone log (and archives the displaced report)
++    // before reaching this helper. Fragment-backed jobs assemble a unified
++    // report through their hidden batch fragments instead.
+     append_incremental_conversion_log(src, dst, rollback)
+ }
+ 
+ fn append_incremental_conversion_log(
+@@ -75394,8 +75470,199 @@
+             );
+         }
+     }
+ 
++    // #71: run the actual planner and publisher on an existing album, then
++    // inspect EVERY destination entry, not just the FLAC count. N=3 is
++    // deliberate: it would expose the previous whole-folder overwrite loss.
++    #[test]
++    fn issue_71_strict_inventory_covers_album_overwrite_and_keep_both() {
++        for human_log in [false, true] {
++            for policy in [OverwritePolicy::ReplaceWithBackup, OverwritePolicy::KeepBoth] {
++                let scratch = tempfile::tempdir().expect("issue 71 scratch");
++                let root = scratch.path();
++                let out = root.join("out");
++                std::fs::create_dir_all(&out).expect("issue 71 output root");
++                let source = prepared_source(root, &[track_id(0), track_id(1), track_id(2)]);
++                let first_report: &[u8] = b"Generated (UTC): 2026-10-09 20:00:00 UTC\nFirst album run\n";
++                let second_report: &[u8] = b"Generated (UTC): 2026-10-09 20:01:00 UTC\nSecond album run\n";
++                let mut expected = std::collections::BTreeSet::new();
++
++                for pass in 0..2_usize {
++                    let mut req = request(
++                        root, FailurePolicy::FailAlbumOnAnyTrackFailure,
++                        stage_policy(false, false, false),
++                        if pass == 0 { OverwritePolicy::FailIfExists } else { policy },
++                    );
++                    req.publish.write_manifest = false;
++                    req.log.write_conversion_log = human_log;
++                    req.log.write_json_log = false;
++                    req.naming.template = "%NN%".to_string();
++                    let album_plan = plan_outputs(&source, &req).expect("output planner");
++                    let expected_album = if pass == 1 && policy == OverwritePolicy::KeepBoth {
++                        "Gate Test (2)"
++                    } else {
++                        "Gate Test"
++                    };
++                    assert_eq!(album_plan.album_dir, out.join(expected_album),
++                        "planner must select one coherent shared album directory");
++                    assert_eq!(album_plan.entries.len(), 3, "full source has three tracks");
++
++                    let staging = StagingDir::new(
++                        root.join(format!("issue71-{human_log}-{policy:?}-{pass}")),
++                        format!("issue71-{pass}"),
++                    );
++                    std::fs::create_dir_all(&staging.root).expect("album staging");
++                    let mut entries = Vec::new();
++                    for (index, track) in album_plan.entries.iter().enumerate() {
++                        let name = format!("{:02}.flac", index + 1);
++                        let staged = staging.root.join(&name);
++                        std::fs::write(&staged, format!("encoded-pass-{pass}-track-{index}"))
++                            .expect("staged album audio");
++                        assert_eq!(track.final_path, album_plan.album_dir.join(&name));
++                        entries.push(PublishEntry {
++                            staged_path: staged,
++                            final_path: track.final_path.clone(),
++                            role: PublishRole::Audio,
++                        });
++                    }
++                    if human_log {
++                        let staged = staging.root.join("conversion.log");
++                        std::fs::write(&staged, if pass == 0 { first_report } else { second_report })
++                            .expect("staged human log");
++                        entries.push(PublishEntry {
++                            staged_path: staged,
++                            final_path: album_plan.album_dir.join("conversion.log"),
++                            role: PublishRole::Sidecar(SidecarKind::ConversionLog),
++                        });
++                    }
++                    let publish_plan = PublishPlan {
++                        album_dir: album_plan.album_dir,
++                        entries,
++                        source_audio_track_count: 3,
++                        expected_album_track_count: 3,
++                        suppress_incremental_conversion_log_append: false,
++                        album_batch_completion_order: false,
++                        write_conversion_log: human_log,
++                    };
++                    publish_album_output(staging, &publish_plan, req.publish, None)
++                        .expect("whole-album publication");
++
++                    expected.insert(format!("{expected_album}/"));
++                    for index in 1..=3_usize {
++                        expected.insert(format!("{expected_album}/{index:02}.flac"));
++                    }
++                    if human_log {
++                        expected.insert(format!("{expected_album}/conversion.log"));
++                        assert_eq!(
++                            std::fs::read(out.join(expected_album).join("conversion.log")).unwrap().as_slice(),
++                            if pass == 0 { first_report } else { second_report },
++                        );
++                    }
++                    if pass == 1 && policy == OverwritePolicy::ReplaceWithBackup && human_log {
++                        let history = conversion_log_snapshot_name(first_report, None);
++                        assert_eq!(
++                            std::fs::read(out.join("Gate Test").join(&history)).unwrap().as_slice(), first_report,
++                            "overwrite must retain exactly the former visible report",
++                        );
++                        expected.insert(format!("Gate Test/{history}"));
++                    }
++                    assert_destination_inventory(
++                        &out, &expected,
++                        &format!("policy={policy:?}, log={human_log}, pass={pass}"),
++                    );
++                }
++            }
++        }
++    }
++
++    #[tokio::test]
++    async fn issue_71_independent_folder_overwrite_has_an_exact_complete_inventory() {
++        let scratch = tempfile::tempdir().expect("issue 71 independent album scratch");
++        let root = scratch.path();
++        let out = root.join("out");
++        let album = real_fragment_album_dir(root);
++        let mut expected = std::collections::BTreeSet::from([
++            "Test Artist/".to_string(),
++            "Test Artist/Test Album/".to_string(),
++            "Test Artist/Test Album/01.flac".to_string(),
++            "Test Artist/Test Album/02.flac".to_string(),
++            "Test Artist/Test Album/conversion.log".to_string(),
++        ]);
++        let mut first_visible_log: Option<Vec<u8>> = None;
++        for pass in 0..2_usize {
++            let batch = format!("issue71-independent-batch-{pass}");
++            let requests = ["first", "second"].into_iter().enumerate().map(|(index, name)| {
++                let number = u32::try_from(index + 1).unwrap();
++                let mut req = real_fragment_unbatched_request_with_track(
++                    root, &format!("{name}-{pass}"), number, None, number,
++                );
++                req.publish.overwrite = if pass == 0 {
++                    OverwritePolicy::FailIfExists
++                } else {
++                    OverwritePolicy::ReplaceWithBackup
++                };
++                req.publish.write_manifest = false;
++                req.log.write_conversion_log = true;
++                req.log.write_json_log = false;
++                req
++            }).collect::<Vec<_>>();
++            let requests = prepare_independent_single_file_album_batch_for_dispatch_with_batch_id(
++                requests, generated_test_batch_id(&batch),
++                album.clone(), real_fragment_source_root(root),
++            ).expect("independent folder dispatcher").requests;
++            for index in [1_usize, 0] {
++                let req = &requests[index];
++                let number = u32::try_from(index + 1).unwrap();
++                let name = format!("{number:02}.flac");
++                let source = real_fragment_source(root, None, number, number, 2);
++                let audio_staging = StagingDir::new(
++                    root.join(format!("issue71-audio-{pass}-{index}")),
++                    format!("issue71-audio-{pass}-{index}"),
++                );
++                std::fs::create_dir_all(&audio_staging.root).expect("audio staging");
++                let artifacts = real_fragment_audio_artifacts(
++                    &audio_staging, &album, None, number, number, &name,
++                    format!("encoded-pass-{pass}-{number}").as_bytes(),
++                );
++                let outcome = AlbumOutcome::Complete {
++                    tracks: vec![real_fragment_record(
++                        None, number, number, true, Some(album.join(&name)),
++                    )],
++                    stages: stage_records(),
++                };
++                let stage = format!("issue71-features-{pass}-{index}");
++                let (feature_staging, plan) = real_fragment_plan_through_features(
++                    root, &stage, req, &source, &outcome, artifacts,
++                ).await;
++                let published = publish_album_output(
++                    feature_staging, &plan, req.publish.clone(), None,
++                ).expect("publish independently converted folder member");
++                let report = finalize_report_with_binding_and_timing(
++                    req, &RecordingReporter::new(), Some(source), None, None,
++                    Some(published), outcome, None, None,
++                ).await;
++                assert!(matches!(report.outcome, AlbumOutcome::Complete { .. }),
++                    "each fragment participant must complete");
++            }
++            if pass == 0 {
++                first_visible_log = Some(std::fs::read(album.join("conversion.log"))
++                    .expect("assembled first-batch report"));
++            } else {
++                let history_bytes = first_visible_log.as_ref().expect("previous full report");
++                let archive = conversion_log_snapshot_name(history_bytes, None);
++                assert_eq!(std::fs::read(album.join(&archive)).unwrap().as_slice(), history_bytes.as_slice(),
++                    "the entire previous two-track album report must be archived");
++                expected.insert(format!("Test Artist/Test Album/{archive}"));
++                assert_ne!(&std::fs::read(album.join("conversion.log")).unwrap(), history_bytes,
++                    "the second batch must generate a new visible report");
++            }
++            assert_destination_inventory(
++                &out, &expected, &format!("dispatched independent overwrite pass={pass}"),
++            );
++        }
++    }
++
+     #[tokio::test]
+     async fn real_fragment_pipeline_uses_dispatcher_count_not_totaltracks_tags() {
+         let temp = tempfile::tempdir().expect("temp dir");
+         let album_dir = real_fragment_album_dir(temp.path());
+@@ -76030,8 +76297,106 @@
+         assert_eq!(std::fs::read(album_dir.join("02.flac")).unwrap(), b"audio-two");
+         let log = std::fs::read_to_string(album_dir.join("conversion.log")).expect("conversion log");
+         assert!(log.contains("first log without trailing newline\nsecond log"));
+         assert_eq!(conversion_related_file_names(&album_dir), vec!["conversion.log".to_string()]);
++    }
++
++    #[test]
++    fn r23_one_file_redo_refreshes_log_and_archives_only_the_displaced_report() {
++        let scratch = tempfile::tempdir().expect("R23 single-file conversion scratch");
++        let out = scratch.path().join("out");
++        let album = out.join("Album");
++        std::fs::create_dir_all(&out).expect("output root");
++        let mut expected = std::collections::BTreeSet::from([
++            "Album/".to_string(),
++            "Album/01.flac".to_string(),
++            "Album/conversion.log".to_string(),
++        ]);
++        let mut previous_report: Option<Vec<u8>> = None;
++        let mut previous_archive_name: Option<String> = None;
++        for pass in 0..3_usize {
++            let audio_bytes = format!("r23-encoded-audio-pass-{pass}");
++            let generated = format!("2026-10-09 20:{pass:02}:00 UTC");
++            let report = format!(
++                "Generated (UTC): {generated}\nJob: r23-single-file-{pass}\n"
++            );
++            let (staging, staged_audio, staged_log) = incremental_test_staging(
++                scratch.path(), &format!("r23-stage-{pass}"), "01.flac",
++                audio_bytes.as_bytes(), report.as_bytes(),
++            );
++            let plan = incremental_single_track_plan(&album, staged_audio, "01.flac", staged_log);
++            let mut policy = incremental_test_publish_policy();
++            policy.overwrite = if pass == 0 {
++                OverwritePolicy::FailIfExists
++            } else {
++                OverwritePolicy::ReplaceWithBackup
++            };
++            publish_album_output(staging, &plan, policy, None)
++                .expect("single-file publish, including replacement and log history");
++            assert_eq!(std::fs::read(album.join("01.flac")).unwrap().as_slice(), audio_bytes.as_bytes());
++            assert_eq!(std::fs::read(album.join("conversion.log")).unwrap().as_slice(), report.as_bytes(),
++                "visible human report must be newly generated, never appended to the previous run");
++
++            if let Some(old) = previous_report.as_ref() {
++                let archive_name = conversion_log_snapshot_name(old, None);
++                let archive_path = album.join(&archive_name);
++                assert_eq!(std::fs::read(&archive_path).expect("exact displaced report").as_slice(), old.as_slice(),
++                    "history must contain the displaced report byte for byte");
++                expected.insert(format!("Album/{archive_name}"));
++                previous_archive_name = Some(archive_name);
++            }
++            assert_destination_inventory(&out, &expected, &format!("one-file pass {pass}"));
++            previous_report = Some(report.into_bytes());
++        }
++        assert!(previous_archive_name.is_some(), "repeated conversions must archive history");
++    }
++
++    #[test]
++    fn r23_incremental_history_is_idempotent_and_removed_on_rollback() {
++        let scratch = tempfile::tempdir().expect("rollback scratch");
++        let album = scratch.path().join("out").join("Album");
++        let staging = scratch.path().join("out").join(".r23-journal-work");
++        std::fs::create_dir_all(&album).expect("album");
++        std::fs::create_dir_all(&staging).expect("journal working directory");
++        let original = b"Generated (UTC): 2026-10-09 19:01:02 UTC\nOld report\n";
++        let log = album.join("conversion.log");
++        std::fs::write(&log, original).expect("visible log");
++        let marker = scratch.path().join("out").join(".r23-incremental-journal.json");
++        let mut rollback = IncrementalPublishRollback::new(&marker, &album, &staging)
++            .expect("durable journal");
++        preserve_incremental_conversion_log_history(&log, &mut rollback)
++            .expect("preserve previous log");
++        preserve_incremental_conversion_log_history(&log, &mut rollback)
++            .expect("repeat preservation is a no-op");
++        let archives = conversion_log_archive_files(&album).expect("enumerate journaled history");
++        assert_eq!(archives.len(), 1, "same displaced bytes cannot create duplicate archives");
++        assert_eq!(std::fs::read(&archives[0]).unwrap().as_slice(), &original[..]);
++        assert!(marker.is_file(), "history creation must be recorded for crash recovery");
++        rollback.rollback_best_effort().expect("failed publication reverts new archive");
++        assert!(conversion_log_archive_files(&album).unwrap().is_empty());
++        assert_eq!(std::fs::read(&log).unwrap().as_slice(), &original[..],
++            "rollback must preserve the unmodified visible report");
++        assert!(!marker.exists(), "successful rollback clears recovery state");
++    }
++
++    #[test]
++    fn r23_human_dsd_gain_values_are_rounded_only_at_the_display_boundary() {
++        use tonepoet_pipeline::DbNano;
++
++        let gain = DbNano(19_028_069_515);
++        let peak = DbNano(-19_128_079_335);
++        let target = DbNano(-100_000_000);
++        assert_eq!(human_log_db(gain, true), "+19.028");
++        assert_eq!(human_log_db(peak, false), "-19.128");
++        assert_eq!(human_log_db(target, false), "-0.100");
++        assert_eq!(human_log_db(DbNano(999_500_000), false), "1.000",
++            "rounding must carry across the decimal boundary");
++        assert_eq!(human_log_db(DbNano(-999_500_000), false), "-1.000");
++        assert_eq!(human_log_db(DbNano(i64::MIN), false), "-9223372036.855",
++            "absolute-value formatting must not overflow on the narrowest signed value");
++        assert_eq!(gain.0, 19_028_069_515, "human presentation cannot mutate stored precision");
++        assert_eq!(peak.0, -19_128_079_335);
++        assert_eq!(target.0, -100_000_000);
+     }
+ 
+     #[test]
+     fn r20_independent_overwrite_preserves_one_two_and_three_track_albums() {
+--- a/src/tui/app.rs
++++ b/src/tui/app.rs
+@@ -7650,9 +7650,9 @@
+         let mut disc_subfolders = PillState::new(vec![(false, "off"), (true, "on")]);
+         disc_subfolders.select_value(&false);
+         let mut write_log = PillState::new(vec![(true, "yes"), (false, "no")]);
+         write_log.select_value(&false);
+-        let mut partial = PillState::new(vec![(false, "off"), (true, "on")]);
++        let mut partial = PillState::new(vec![(false, "fail source"), (true, "keep successes")]);
+         partial.select_value(&false);
+         use crate::convert::pipeline::OverwritePolicy;
+         let mut if_exists = PillState::new(vec![
+             (OverwritePolicy::FailIfExists, "fail"),
+--- a/src/tui/draw_output_options.rs
++++ b/src/tui/draw_output_options.rs
+@@ -129,9 +129,9 @@
+     }
+ 
+     if maximized && area.height >= 19 {
+         register_output_options_pills(buttons, area, OUTPUT_OPTIONS_PARTIAL_ROW,
+-            "partial (source) ", &opts.partial, TuiButton::PartialPill);
++            "source track fails ", &opts.partial, TuiButton::PartialPill);
+         register_output_options_pills(buttons, area, OUTPUT_OPTIONS_IF_EXISTS_ROW,
+             "if exists ", &opts.if_exists, TuiButton::IfExistsPill);
+     }
+ 
+@@ -481,9 +481,9 @@
+     }
+ 
+     if maximized && area.height >= 19 {
+         lines.push(pill_row(
+-            border_color, w, "partial (source) ", "",
++            border_color, w, "source track fails ", "",
+             &render_pill_spans(&opts.partial, is_partial_focused, theme),
+             is_partial_focused, theme,
+         ));
+         lines.push(pill_row(
+@@ -957,15 +957,21 @@
+             }
+             assert!(row.contains("pipeline"), "height {height}: actions label: {row}");
+             assert!(row.contains("1 post"), "height {height}: live summary: {row}");
+             assert!(row.contains("Enter/click edit"), "height {height}: edit affordance: {row}");
+-            for (offset, expected) in [(OUTPUT_OPTIONS_PARTIAL_ROW, "partial (source)"),
++            for (offset, expected) in [(OUTPUT_OPTIONS_PARTIAL_ROW, "source track fails"),
+                                        (OUTPUT_OPTIONS_IF_EXISTS_ROW, "if exists")] {
+                 let mut text = String::new();
+                 for x in 0..80 {
+                     text.push_str(terminal.backend().buffer().get(x, offset).symbol());
+                 }
+                 assert!(text.contains(expected), "height {height}: {expected} missing: {text}");
++                if offset == OUTPUT_OPTIONS_PARTIAL_ROW {
++                    for label in ["fail source", "keep successes"] {
++                        assert!(text.contains(label),
++                            "height {height}: source failure outcome {label} missing: {text}");
++                    }
++                }
+             }
+         }
+     }
+ 
+--- a/scripts/smoke_r20_album_publication.sh
++++ b/scripts/smoke_r20_album_publication.sh
+@@ -47,8 +47,63 @@
+     [[ $(find "$output" -type f -iname '*.flac' | wc -l) -eq $expected ]] || \
+         fail "$label: album tracks missing or published to other directories"
+ }
+ 
++# Strictly enumerate files AND directories after publication. Count-only smoke
++# previously missed unexpected sidecars, hidden batch state, and other debris.
++# Audio names are read from the already count-checked album to tolerate naming
++# template variations, while everything else is an explicit closed set.
++assert_exact_inventory() {
++    local output=$1; shift
++    python3 - "$output" "$@" <<'PYINV'
++import os
++import sys
++
++root = os.path.abspath(sys.argv[1])
++expected = set(sys.argv[2:])
++actual = set()
++
++def visit(directory):
++    with os.scandir(directory) as iterator:
++        for item in iterator:
++            relative = os.path.relpath(item.path, root).replace(os.sep, '/')
++            if item.is_dir(follow_symlinks=False):
++                actual.add(relative + '/')
++                visit(item.path)
++            elif item.is_file(follow_symlinks=False):
++                actual.add(relative)
++            else:
++                actual.add(relative + ' [special entry]')
++
++visit(root)
++missing = sorted(expected - actual)
++unexpected = sorted(actual - expected)
++if missing or unexpected:
++    raise SystemExit(
++        'strict destination inventory mismatch\n'
++        f'missing: {missing!r}\n'
++        f'unexpected: {unexpected!r}\n'
++        f'complete actual: {sorted(actual)!r}'
++    )
++PYINV
++}
++
++# Construct the exact album file names from the existing, count-validated
++# audio fixture. The caller names the expected human and historical logs.
++assert_album_inventory() {
++    local output=$1; shift
++    local -a expected=("$@")
++    local album_dir
++    for album_dir in "${album_dirs_for_inventory[@]}"; do
++        expected+=("${album_dir#$output/}/")
++        local file
++        while IFS= read -r -d '' file; do
++            expected+=("${file#$output/}")
++        done < <(find "$album_dir" -maxdepth 1 -type f -iname '*.flac' -print0)
++    done
++    assert_exact_inventory "$output" "${expected[@]}"
++}
++
+ run_convert() {
+     local label=$1; shift
+     local status=0
+     "$binary" convert "$@" --format flac --workers 2 --no-cue \
+@@ -72,8 +127,11 @@
+     assert_one_album "$output" "$album" "$count" "first pass N=$count"
+     [[ -f "$album/conversion.log" ]] || fail "N=$count: first run omitted conversion.log"
+     [[ $(find "$album" -maxdepth 1 -type f -name 'conversion-*.log' | wc -l) -eq 0 ]] || \
+         fail "N=$count: first run created duplicate log history"
++    album_dirs_for_inventory=("$album")
++    assert_album_inventory "$output" "$album_name/conversion.log" || \
++        fail "N=$count: greenfield destination has unexpected entries"
+     cp "$album/conversion.log" "$work/displaced-$count.log"
+     status=0
+     "$binary" convert "$input" --format flac --output "$output" \
+         --folder-naming "$album_name" --replaygain off --write-log --workers 2 --no-cue --overwrite-output \
+@@ -89,8 +147,14 @@
+     mapfile -d '' -t history < <(find "$album" -maxdepth 1 -type f -name 'conversion-*.log' -print0)
+     [[ ${#history[@]} -eq 1 ]] || fail "N=$count: lost historical album log"
+     cmp -s "$work/displaced-$count.log" "${history[0]}" || \
+         fail "N=$count: historical snapshot differs from displaced conversion.log"
++    if cmp -s "$work/displaced-$count.log" "$album/conversion.log"; then
++        fail "N=$count: visible conversion.log did not refresh on overwrite"
++    fi
++    album_dirs_for_inventory=("$album")
++    assert_album_inventory "$output" "$album_name/conversion.log" "$album_name/$(basename "${history[0]}")" || \
++        fail "N=$count: overwrite destination has unexpected entries"
+     printf 'PASS overwrite N=%s: all audio survives, no backup remains, history retained\n' "$count"
+ done
+ 
+ # A subsequent selection of ONE source file is not a shared album batch.
+@@ -129,8 +193,13 @@
+ [[ $(sha256sum "$visible_log" | cut -d ' ' -f 1) == "$visible_log_before" ]] || \
+     fail 'an unlogged conversion modified the previous visible log'
+ [[ -z $(find "$output" -type d -name '.tonepoet-backup-*' -print -quit) ]] || \
+     fail 'unlogged single-file overwrite left a whole-album backup'
++album_dirs_for_inventory=("$album")
++mapfile -d '' -t history < <(find "$album" -maxdepth 1 -type f -name 'conversion-*.log' -print0)
++[[ ${#history[@]} -eq 1 ]] || fail 'unlogged redo changed conversion history inventory'
++assert_album_inventory "$output" "$album_name/conversion.log" "$album_name/$(basename "${history[0]}")" || \
++    fail 'unlogged redo polluted album destination'
+ printf 'PASS unlogged single-file overwrite: both unselected tracks and log history survive\n'
+ 
+ # Keep both must choose one album sibling, never one numbered folder per item.
+ output="$work/output-3"
+@@ -149,8 +218,13 @@
+ [[ $(find "$numbered" -maxdepth 1 -type f -iname '*.flac' | wc -l) -eq 3 ]] || \
+     fail 'keep both did not publish three tracks together in the numbered album'
+ [[ $(find "$output" -type f -iname '*.flac' | wc -l) -eq 6 ]] || \
+     fail 'keep both split tracks into unexpected folders or lost original audio'
++album_dirs_for_inventory=("$album" "$numbered")
++assert_album_inventory "$output" \
++    "$album_name/conversion.log" "$album_name/$(basename "${history[0]}")" \
++    "$album_name (2)/conversion.log" || \
++    fail 'keep-both polluted original album or numbered sibling'
+ printf 'PASS keep-both: one numbered sibling contains all three tracks\n'
+ 
+ # Reproduce the partial ReplayGain cohort: same physical album directory,
+ # one clean member and one invalid FLAC. Failed input must not erase survivor.
+--- a/docs/OUTSTANDING_ISSUES.md
++++ b/docs/OUTSTANDING_ISSUES.md
+@@ -2908,8 +2908,22 @@
+ Dark Side ISO still owed by the user. The preset is deferred until the source probe resolves;
+ inapplicable DSD fields are refused, not skipped; saved PCM presets carry no DSD fields; Int32
+ dither is limited to what the planner admits.
+ 
++**Status 2026-10-09 — recurrence; NOT field-closed.** The same six preset-field
++refusals recurred through Browse -> Convert -> SACD-to-PCM Reference on a different
++SACD ISO. The 2026-09-26 correction deferred preset application while the probe was
++in progress, but the ISO placeholder did not advertise that the probe was in
++progress. R22C now defers application until the ISO's DSD64 source facts are known;
++`r22_folder_iso_reference_preset_applies_only_after_dsd64_probe_facts` covers the
++logic in an automated regression. This is the original #43, not a newly resolved
++issue. The real Browse context-menu gesture against a SACD ISO has **not** been
++rerun after R22C and is an explicit acceptance prerequisite. Do not relabel #43
++"fixed" until that TUI gesture completes without refusing the six fields and
++the conversion uses the intended Reference pathway. #46's separate CLI behavior,
++which treats inapplicable fields from the other source class as dormant, did not
++cover this Browse lifecycle bug.
++
+ Found 2026-09-24 converting the stereo area of a Dark Side of the Moon SACD ISO with the
+ preset `SACD-to-PCM Reference` (`dsd_path = "reference"`, 176.4 kHz, 32-bit,
+ `dither = "tpdf"`, `resampler = "soxr"`). From the Browse context menu the conversion
+ fails at planning:
+@@ -3182,8 +3196,18 @@
+ is honoured on this route, the log names the tool that dithered and the shaping used, and
+ the qualification evidence for the new terminal is execution evidence from this machine.
+ 
+ ## 49. The conversion log buries the essential facts under useless ones
++
++**Status 2026-10-09 — R23 presentation correction implemented; build-host check owed.**
++Two observed logs now have 296/182 lines, 153/168-character longest lines, no
++staging-path-only lines, and no `Source ref` lines. Measured gains are explicitly
++labelled. The remaining human readability defect was that DSD Reference album
++gain, loudest true peak, and target displayed all nine nano-decibel decimals.
++R23 renders these three figures to 0.001 dB/dBTP *only at the human-log boundary*;
++`DbNano` values used for decisions and structured evidence remain unchanged.
++The new formatting regression is included, but this bundle cannot mark #49
++fully validated without compilation and a representative generated log.
+ 
+ Filed 2026-09-26 from the same Journey conversion log: 292 lines for 16 tracks, longest
+ line 702 characters, 48 lines that are nothing but staging paths. Issue #47 records the
+ specific omission (the preparation stage's commands, so the SSRC step is invisible); this
+@@ -4770,8 +4794,18 @@
+ destination entirely is a separate question from this defect; its interrupted
+ and recovery behaviour is tested and should not be disturbed.
+ 
+ ## 70. `conversion.log` is overwritten by the next conversion into the same folder
++
++**Status 2026-10-09 — R23 single-file residual addressed; field smoke owed.**
++R22C's multi-file album fragment finalizer retained exact displaced reports,
++but a standalone N=1 redo used the legacy incremental append path. It rewrote
++`conversion.log` without replacing its first-run `Generated (UTC)` header, so
++neither the new report nor the expected dated archive appeared. R23 explicitly
++replaces the report when audio at the same destination is displaced, snapshots
++the old report into the incremental rollback/recovery journal, and preserves
++the legacy append path for new distinct siblings. The original N=1,N=2,N=3
++black-box acceptance smoke remains the release check.
+ 
+ > **⚠ SPECIFICATION CORRECTED 2026-10-09 — implemented, but to the wrong spec.** R20
+ > (`075946c`) delivered this faithfully to the R20 brief, which asked for "a per-run log
+ > named with its date and time, written alongside the existing `conversion.log`". That
+@@ -4835,8 +4869,18 @@
+ extended to expect it, since they assert the destination's exact file set.
+ 
+ ## 71. The strict destination-inventory tests never run against overwrite or keep-both
+ 
++**Status 2026-10-09 — R23 coverage implemented; build-host gate owed.** Added
++strict all-entry inventory cases for a three-track whole-album overwrite, a
++three-track keep-both publication (both original and numbered sibling), and a
++two-track independently dispatched folder overwrite. Each checks the full output
++root, with logging on/off where applicable, and accounts for the exact displaced
++log archive rather than merely counting FLAC files. The R20 black-box smoke
++also checks every output entry after initial publish, overwrite, unlogged
++single-file redo, and keep-both. These are source changes awaiting compilation,
++test execution, and Reference requalification.
++
+ Filed 2026-10-09, split out of #65 and #69 so the gap is tracked in its own right
+ rather than as a note inside two closed issues.
+ 
+ #65 is resolved: five strict inventory tests now assert the destination's exact

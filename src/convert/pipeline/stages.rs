@@ -25039,6 +25039,15 @@ fn conversion_log_metadata_values(values: &MetadataValueList) -> Option<String> 
     }
 }
 
+// Human log presentation only. DbNano remains exact in planning and portable
+// execution evidence; show millidecibels instead of its nine-digit storage scale.
+fn human_log_db(value: tonepoet_pipeline::DbNano, mandatory_sign: bool) -> String {
+    let negative = value.0 < 0;
+    let milli = (u128::from(value.0.unsigned_abs()) + 500_000) / 1_000_000;
+    let sign = if negative { "-" } else if mandatory_sign { "+" } else { "" };
+    format!("{sign}{}.{:03}", milli / 1_000, milli % 1_000)
+}
+
 fn dsd_album_gain_decision_label(
     track: &PreparedTrack,
     req: &PipelineRequest,
@@ -25050,7 +25059,7 @@ fn dsd_album_gain_decision_label(
     ) {
         (Some(track_count), Some(loudest)) => format!(
             "{track_count} measured DSD track(s), loudest true peak {} dBTP",
-            loudest.render(false),
+            human_log_db(loudest, false),
         ),
         (Some(track_count), None) => format!("{track_count} verified-silent DSD track(s)"),
         _ => "submitted DSD batch".to_string(),
@@ -25063,11 +25072,11 @@ fn dsd_album_gain_decision_label(
                 .settings
                 .dsd
                 .album_true_peak_target_dbtp()
-                .map(|value| value.render(false))
+                .map(|value| human_log_db(value, false))
                 .unwrap_or_else(|| "unknown".to_string());
             Some(format!(
                 "submitted-batch DSD true-peak album gain {} dB ({scope}; target {} dBTP)",
-                gain_db.render(true),
+                human_log_db(gain_db, true),
                 target,
             ))
         }
@@ -25100,8 +25109,8 @@ fn dsd_album_gain_decision_label(
             }
             Some(format!(
                 "submitted-batch DSD Reference album gain {} dB ({scope}; target {} dBTP)",
-                applied_gain.render(true),
-                target_dbtp.render(false),
+                human_log_db(applied_gain, true),
+                human_log_db(*target_dbtp, false),
             ))
         }
         _ => None,
@@ -27341,6 +27350,12 @@ fn publish_incremental_album_output(
         Ok(rollback) => rollback,
         Err(err) => return cleanup_publish_temp(temp_dir, err),
     };
+    // A redo of an already published audio file is a new conversion, not
+    // another member being appended to a still-growing album. Retain the
+    // standalone append contract for distinct independent siblings.
+    let displaced_audio = overwrite_existing_audio && incremental_entries.iter().any(|entry| {
+        matches!(&entry.role, PublishRole::Audio) && entry.final_path.exists()
+    });
     let mut assembled_conversion_log = false;
     let publish_result = (|| -> Result<(), PublishError> {
         // Publish the track audio before the hidden conversion-log fragment can
@@ -27378,6 +27393,17 @@ fn publish_incremental_album_output(
                     // still staged one, discard it and let the fragment-count
                     // path below decide whether the unified log is ready.
                     remove_file_if_exists(&entry.temp_path).map_err(PublishError::io_at("removing incremental temp entry", &entry.temp_path))?;
+                }
+                PublishRole::Sidecar(SidecarKind::ConversionLog) if displaced_audio => {
+                    // Snapshot the fully finalized previous report before
+                    // installing this run's standalone log. The archive itself
+                    // participates in crash recovery and publication rollback.
+                    preserve_incremental_conversion_log_history(&entry.final_path, &mut rollback)?;
+                    replace_incremental_sidecar_entry(
+                        &entry.temp_path,
+                        &entry.final_path,
+                        &mut rollback,
+                    )?;
                 }
                 PublishRole::Sidecar(SidecarKind::ConversionLog) => {
                     publish_incremental_conversion_log(
@@ -27868,6 +27894,56 @@ fn copy_file_create_new_synced_io(src: &Path, dst: &Path) -> io::Result<()> {
 }
 
 
+// The legacy standalone-log path retains append for NEW independent siblings,
+// but an overwrite of an existing audio member must install the latest run's
+// complete report. This snapshot is journaled before its first filesystem
+// mutation so an interrupted or failed publish cannot leave stray history.
+fn preserve_incremental_conversion_log_history(
+    log_path: &Path,
+    rollback: &mut IncrementalPublishRollback,
+) -> Result<(), PublishError> {
+    use std::io::Write;
+
+    let bytes = match read_regular_file_no_follow(log_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(PublishError::Io(error)),
+    };
+    let parent = parent_dir_or_current(log_path);
+    for archived in conversion_log_archive_files(parent).map_err(PublishError::Io)? {
+        if fs::symlink_metadata(&archived).map_err(PublishError::Io)?.len() == bytes.len() as u64
+            && read_regular_file_no_follow(&archived).map_err(PublishError::Io)? == bytes
+        {
+            return Ok(());
+        }
+    }
+    let modified = fs::metadata(log_path).ok().and_then(|metadata| metadata.modified().ok());
+    let base = conversion_log_snapshot_name(&bytes, modified);
+    let stem = base.strip_suffix(".log").unwrap_or(&base);
+    for attempt in 0..1000 {
+        let name = if attempt == 0 { base.clone() } else { format!("{stem}-{attempt}.log") };
+        let snapshot = parent.join(name);
+        match read_regular_file_no_follow(&snapshot) {
+            Ok(existing) if existing == bytes => return Ok(()),
+            Ok(_) => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(PublishError::Io(error)),
+        }
+        rollback.record_created_file(&snapshot)?;
+        let mut file = fs::OpenOptions::new()
+            .write(true).create_new(true).open(&snapshot)
+            .map_err(PublishError::Io)?;
+        file.write_all(&bytes).map_err(PublishError::Io)?;
+        file.sync_all().map_err(PublishError::Io)?;
+        sync_parent_dir_best_effort(&snapshot);
+        return Ok(());
+    }
+    Err(PublishError::Io(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "unable to allocate conversion history filename",
+    )))
+}
+
 fn publish_incremental_conversion_log(
     src: &Path,
     dst: &Path,
@@ -27877,10 +27953,10 @@ fn publish_incremental_conversion_log(
         return Err(PublishError::DestinationExists(dst.display().to_string()));
     }
 
-    // Legacy/non-fragment incremental jobs still append their staged standalone
-    // logs. Fragment-backed jobs never reach this path for assembly: their
-    // hidden fragment sidecar triggers count-and-maybe-assemble directly after
-    // fragment publication.
+    // Append only when a distinct independent file joins a folder. An audio
+    // redo replaces the standalone log (and archives the displaced report)
+    // before reaching this helper. Fragment-backed jobs assemble a unified
+    // report through their hidden batch fragments instead.
     append_incremental_conversion_log(src, dst, rollback)
 }
 
@@ -67826,7 +67902,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         assert!(log.contains("A.dsf [source ordinal 0, disc none, track 1]"));
         assert!(log.contains("B.dsf [source ordinal 0, disc none, track 1]"));
         assert!(
-            log.contains("submitted-batch DSD true-peak album gain +0.340000000 dB"),
+            log.contains("submitted-batch DSD true-peak album gain +0.340 dB"),
             "terminal log must retain the bound album gain; actual log:\n{log}"
         );
         assert!(log.contains("2 measured DSD track(s)"));
@@ -75395,6 +75471,197 @@ Recovered provenance
         }
     }
 
+    // #71: run the actual planner and publisher on an existing album, then
+    // inspect EVERY destination entry, not just the FLAC count. N=3 is
+    // deliberate: it would expose the previous whole-folder overwrite loss.
+    #[test]
+    fn issue_71_strict_inventory_covers_album_overwrite_and_keep_both() {
+        for human_log in [false, true] {
+            for policy in [OverwritePolicy::ReplaceWithBackup, OverwritePolicy::KeepBoth] {
+                let scratch = tempfile::tempdir().expect("issue 71 scratch");
+                let root = scratch.path();
+                let out = root.join("out");
+                std::fs::create_dir_all(&out).expect("issue 71 output root");
+                let source = prepared_source(root, &[track_id(0), track_id(1), track_id(2)]);
+                let first_report: &[u8] = b"Generated (UTC): 2026-10-09 20:00:00 UTC\nFirst album run\n";
+                let second_report: &[u8] = b"Generated (UTC): 2026-10-09 20:01:00 UTC\nSecond album run\n";
+                let mut expected = std::collections::BTreeSet::new();
+
+                for pass in 0..2_usize {
+                    let mut req = request(
+                        root, FailurePolicy::FailAlbumOnAnyTrackFailure,
+                        stage_policy(false, false, false),
+                        if pass == 0 { OverwritePolicy::FailIfExists } else { policy },
+                    );
+                    req.publish.write_manifest = false;
+                    req.log.write_conversion_log = human_log;
+                    req.log.write_json_log = false;
+                    req.naming.template = "%NN%".to_string();
+                    let album_plan = plan_outputs(&source, &req).expect("output planner");
+                    let expected_album = if pass == 1 && policy == OverwritePolicy::KeepBoth {
+                        "Gate Test (2)"
+                    } else {
+                        "Gate Test"
+                    };
+                    assert_eq!(album_plan.album_dir, out.join(expected_album),
+                        "planner must select one coherent shared album directory");
+                    assert_eq!(album_plan.entries.len(), 3, "full source has three tracks");
+
+                    let staging = StagingDir::new(
+                        root.join(format!("issue71-{human_log}-{policy:?}-{pass}")),
+                        format!("issue71-{pass}"),
+                    );
+                    std::fs::create_dir_all(&staging.root).expect("album staging");
+                    let mut entries = Vec::new();
+                    for (index, track) in album_plan.entries.iter().enumerate() {
+                        let name = format!("{:02}.flac", index + 1);
+                        let staged = staging.root.join(&name);
+                        std::fs::write(&staged, format!("encoded-pass-{pass}-track-{index}"))
+                            .expect("staged album audio");
+                        assert_eq!(track.final_path, album_plan.album_dir.join(&name));
+                        entries.push(PublishEntry {
+                            staged_path: staged,
+                            final_path: track.final_path.clone(),
+                            role: PublishRole::Audio,
+                        });
+                    }
+                    if human_log {
+                        let staged = staging.root.join("conversion.log");
+                        std::fs::write(&staged, if pass == 0 { first_report } else { second_report })
+                            .expect("staged human log");
+                        entries.push(PublishEntry {
+                            staged_path: staged,
+                            final_path: album_plan.album_dir.join("conversion.log"),
+                            role: PublishRole::Sidecar(SidecarKind::ConversionLog),
+                        });
+                    }
+                    let publish_plan = PublishPlan {
+                        album_dir: album_plan.album_dir,
+                        entries,
+                        source_audio_track_count: 3,
+                        expected_album_track_count: 3,
+                        suppress_incremental_conversion_log_append: false,
+                        album_batch_completion_order: false,
+                        write_conversion_log: human_log,
+                    };
+                    publish_album_output(staging, &publish_plan, req.publish, None)
+                        .expect("whole-album publication");
+
+                    expected.insert(format!("{expected_album}/"));
+                    for index in 1..=3_usize {
+                        expected.insert(format!("{expected_album}/{index:02}.flac"));
+                    }
+                    if human_log {
+                        expected.insert(format!("{expected_album}/conversion.log"));
+                        assert_eq!(
+                            std::fs::read(out.join(expected_album).join("conversion.log")).unwrap().as_slice(),
+                            if pass == 0 { first_report } else { second_report },
+                        );
+                    }
+                    if pass == 1 && policy == OverwritePolicy::ReplaceWithBackup && human_log {
+                        let history = conversion_log_snapshot_name(first_report, None);
+                        assert_eq!(
+                            std::fs::read(out.join("Gate Test").join(&history)).unwrap().as_slice(), first_report,
+                            "overwrite must retain exactly the former visible report",
+                        );
+                        expected.insert(format!("Gate Test/{history}"));
+                    }
+                    assert_destination_inventory(
+                        &out, &expected,
+                        &format!("policy={policy:?}, log={human_log}, pass={pass}"),
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_71_independent_folder_overwrite_has_an_exact_complete_inventory() {
+        let scratch = tempfile::tempdir().expect("issue 71 independent album scratch");
+        let root = scratch.path();
+        let out = root.join("out");
+        let album = real_fragment_album_dir(root);
+        let mut expected = std::collections::BTreeSet::from([
+            "Test Artist/".to_string(),
+            "Test Artist/Test Album/".to_string(),
+            "Test Artist/Test Album/01.flac".to_string(),
+            "Test Artist/Test Album/02.flac".to_string(),
+            "Test Artist/Test Album/conversion.log".to_string(),
+        ]);
+        let mut first_visible_log: Option<Vec<u8>> = None;
+        for pass in 0..2_usize {
+            let batch = format!("issue71-independent-batch-{pass}");
+            let requests = ["first", "second"].into_iter().enumerate().map(|(index, name)| {
+                let number = u32::try_from(index + 1).unwrap();
+                let mut req = real_fragment_unbatched_request_with_track(
+                    root, &format!("{name}-{pass}"), number, None, number,
+                );
+                req.publish.overwrite = if pass == 0 {
+                    OverwritePolicy::FailIfExists
+                } else {
+                    OverwritePolicy::ReplaceWithBackup
+                };
+                req.publish.write_manifest = false;
+                req.log.write_conversion_log = true;
+                req.log.write_json_log = false;
+                req
+            }).collect::<Vec<_>>();
+            let requests = prepare_independent_single_file_album_batch_for_dispatch_with_batch_id(
+                requests, generated_test_batch_id(&batch),
+                album.clone(), real_fragment_source_root(root),
+            ).expect("independent folder dispatcher").requests;
+            for index in [1_usize, 0] {
+                let req = &requests[index];
+                let number = u32::try_from(index + 1).unwrap();
+                let name = format!("{number:02}.flac");
+                let source = real_fragment_source(root, None, number, number, 2);
+                let audio_staging = StagingDir::new(
+                    root.join(format!("issue71-audio-{pass}-{index}")),
+                    format!("issue71-audio-{pass}-{index}"),
+                );
+                std::fs::create_dir_all(&audio_staging.root).expect("audio staging");
+                let artifacts = real_fragment_audio_artifacts(
+                    &audio_staging, &album, None, number, number, &name,
+                    format!("encoded-pass-{pass}-{number}").as_bytes(),
+                );
+                let outcome = AlbumOutcome::Complete {
+                    tracks: vec![real_fragment_record(
+                        None, number, number, true, Some(album.join(&name)),
+                    )],
+                    stages: stage_records(),
+                };
+                let stage = format!("issue71-features-{pass}-{index}");
+                let (feature_staging, plan) = real_fragment_plan_through_features(
+                    root, &stage, req, &source, &outcome, artifacts,
+                ).await;
+                let published = publish_album_output(
+                    feature_staging, &plan, req.publish.clone(), None,
+                ).expect("publish independently converted folder member");
+                let report = finalize_report_with_binding_and_timing(
+                    req, &RecordingReporter::new(), Some(source), None, None,
+                    Some(published), outcome, None, None,
+                ).await;
+                assert!(matches!(report.outcome, AlbumOutcome::Complete { .. }),
+                    "each fragment participant must complete");
+            }
+            if pass == 0 {
+                first_visible_log = Some(std::fs::read(album.join("conversion.log"))
+                    .expect("assembled first-batch report"));
+            } else {
+                let history_bytes = first_visible_log.as_ref().expect("previous full report");
+                let archive = conversion_log_snapshot_name(history_bytes, None);
+                assert_eq!(std::fs::read(album.join(&archive)).unwrap().as_slice(), history_bytes.as_slice(),
+                    "the entire previous two-track album report must be archived");
+                expected.insert(format!("Test Artist/Test Album/{archive}"));
+                assert_ne!(&std::fs::read(album.join("conversion.log")).unwrap(), history_bytes,
+                    "the second batch must generate a new visible report");
+            }
+            assert_destination_inventory(
+                &out, &expected, &format!("dispatched independent overwrite pass={pass}"),
+            );
+        }
+    }
+
     #[tokio::test]
     async fn real_fragment_pipeline_uses_dispatcher_count_not_totaltracks_tags() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -76031,6 +76298,104 @@ Recovered provenance
         let log = std::fs::read_to_string(album_dir.join("conversion.log")).expect("conversion log");
         assert!(log.contains("first log without trailing newline\nsecond log"));
         assert_eq!(conversion_related_file_names(&album_dir), vec!["conversion.log".to_string()]);
+    }
+
+    #[test]
+    fn r23_one_file_redo_refreshes_log_and_archives_only_the_displaced_report() {
+        let scratch = tempfile::tempdir().expect("R23 single-file conversion scratch");
+        let out = scratch.path().join("out");
+        let album = out.join("Album");
+        std::fs::create_dir_all(&out).expect("output root");
+        let mut expected = std::collections::BTreeSet::from([
+            "Album/".to_string(),
+            "Album/01.flac".to_string(),
+            "Album/conversion.log".to_string(),
+        ]);
+        let mut previous_report: Option<Vec<u8>> = None;
+        let mut previous_archive_name: Option<String> = None;
+        for pass in 0..3_usize {
+            let audio_bytes = format!("r23-encoded-audio-pass-{pass}");
+            let generated = format!("2026-10-09 20:{pass:02}:00 UTC");
+            let report = format!(
+                "Generated (UTC): {generated}\nJob: r23-single-file-{pass}\n"
+            );
+            let (staging, staged_audio, staged_log) = incremental_test_staging(
+                scratch.path(), &format!("r23-stage-{pass}"), "01.flac",
+                audio_bytes.as_bytes(), report.as_bytes(),
+            );
+            let plan = incremental_single_track_plan(&album, staged_audio, "01.flac", staged_log);
+            let mut policy = incremental_test_publish_policy();
+            policy.overwrite = if pass == 0 {
+                OverwritePolicy::FailIfExists
+            } else {
+                OverwritePolicy::ReplaceWithBackup
+            };
+            publish_album_output(staging, &plan, policy, None)
+                .expect("single-file publish, including replacement and log history");
+            assert_eq!(std::fs::read(album.join("01.flac")).unwrap().as_slice(), audio_bytes.as_bytes());
+            assert_eq!(std::fs::read(album.join("conversion.log")).unwrap().as_slice(), report.as_bytes(),
+                "visible human report must be newly generated, never appended to the previous run");
+
+            if let Some(old) = previous_report.as_ref() {
+                let archive_name = conversion_log_snapshot_name(old, None);
+                let archive_path = album.join(&archive_name);
+                assert_eq!(std::fs::read(&archive_path).expect("exact displaced report").as_slice(), old.as_slice(),
+                    "history must contain the displaced report byte for byte");
+                expected.insert(format!("Album/{archive_name}"));
+                previous_archive_name = Some(archive_name);
+            }
+            assert_destination_inventory(&out, &expected, &format!("one-file pass {pass}"));
+            previous_report = Some(report.into_bytes());
+        }
+        assert!(previous_archive_name.is_some(), "repeated conversions must archive history");
+    }
+
+    #[test]
+    fn r23_incremental_history_is_idempotent_and_removed_on_rollback() {
+        let scratch = tempfile::tempdir().expect("rollback scratch");
+        let album = scratch.path().join("out").join("Album");
+        let staging = scratch.path().join("out").join(".r23-journal-work");
+        std::fs::create_dir_all(&album).expect("album");
+        std::fs::create_dir_all(&staging).expect("journal working directory");
+        let original = b"Generated (UTC): 2026-10-09 19:01:02 UTC\nOld report\n";
+        let log = album.join("conversion.log");
+        std::fs::write(&log, original).expect("visible log");
+        let marker = scratch.path().join("out").join(".r23-incremental-journal.json");
+        let mut rollback = IncrementalPublishRollback::new(&marker, &album, &staging)
+            .expect("durable journal");
+        preserve_incremental_conversion_log_history(&log, &mut rollback)
+            .expect("preserve previous log");
+        preserve_incremental_conversion_log_history(&log, &mut rollback)
+            .expect("repeat preservation is a no-op");
+        let archives = conversion_log_archive_files(&album).expect("enumerate journaled history");
+        assert_eq!(archives.len(), 1, "same displaced bytes cannot create duplicate archives");
+        assert_eq!(std::fs::read(&archives[0]).unwrap().as_slice(), &original[..]);
+        assert!(marker.is_file(), "history creation must be recorded for crash recovery");
+        rollback.rollback_best_effort().expect("failed publication reverts new archive");
+        assert!(conversion_log_archive_files(&album).unwrap().is_empty());
+        assert_eq!(std::fs::read(&log).unwrap().as_slice(), &original[..],
+            "rollback must preserve the unmodified visible report");
+        assert!(!marker.exists(), "successful rollback clears recovery state");
+    }
+
+    #[test]
+    fn r23_human_dsd_gain_values_are_rounded_only_at_the_display_boundary() {
+        use tonepoet_pipeline::DbNano;
+
+        let gain = DbNano(19_028_069_515);
+        let peak = DbNano(-19_128_079_335);
+        let target = DbNano(-100_000_000);
+        assert_eq!(human_log_db(gain, true), "+19.028");
+        assert_eq!(human_log_db(peak, false), "-19.128");
+        assert_eq!(human_log_db(target, false), "-0.100");
+        assert_eq!(human_log_db(DbNano(999_500_000), false), "1.000",
+            "rounding must carry across the decimal boundary");
+        assert_eq!(human_log_db(DbNano(-999_500_000), false), "-1.000");
+        assert_eq!(human_log_db(DbNano(i64::MIN), false), "-9223372036.855",
+            "absolute-value formatting must not overflow on the narrowest signed value");
+        assert_eq!(gain.0, 19_028_069_515, "human presentation cannot mutate stored precision");
+        assert_eq!(peak.0, -19_128_079_335);
+        assert_eq!(target.0, -100_000_000);
     }
 
     #[test]

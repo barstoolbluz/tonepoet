@@ -7651,7 +7651,7 @@ impl OutputOptionsState {
         disc_subfolders.select_value(&false);
         let mut write_log = PillState::new(vec![(true, "yes"), (false, "no")]);
         write_log.select_value(&false);
-        let mut partial = PillState::new(vec![(false, "off"), (true, "on")]);
+        let mut partial = PillState::new(vec![(false, "fail source"), (true, "keep successes")]);
         partial.select_value(&false);
         use crate::convert::pipeline::OverwritePolicy;
         let mut if_exists = PillState::new(vec![

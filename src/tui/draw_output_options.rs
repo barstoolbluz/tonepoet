@@ -130,7 +130,7 @@ pub fn register_output_options_mouse_targets(
 
     if maximized && area.height >= 19 {
         register_output_options_pills(buttons, area, OUTPUT_OPTIONS_PARTIAL_ROW,
-            "partial (source) ", &opts.partial, TuiButton::PartialPill);
+            "source track fails ", &opts.partial, TuiButton::PartialPill);
         register_output_options_pills(buttons, area, OUTPUT_OPTIONS_IF_EXISTS_ROW,
             "if exists ", &opts.if_exists, TuiButton::IfExistsPill);
     }
@@ -482,7 +482,7 @@ pub fn draw_output_options_pane(
 
     if maximized && area.height >= 19 {
         lines.push(pill_row(
-            border_color, w, "partial (source) ", "",
+            border_color, w, "source track fails ", "",
             &render_pill_spans(&opts.partial, is_partial_focused, theme),
             is_partial_focused, theme,
         ));
@@ -958,13 +958,19 @@ mod output_options_companion_render_tests {
             assert!(row.contains("pipeline"), "height {height}: actions label: {row}");
             assert!(row.contains("1 post"), "height {height}: live summary: {row}");
             assert!(row.contains("Enter/click edit"), "height {height}: edit affordance: {row}");
-            for (offset, expected) in [(OUTPUT_OPTIONS_PARTIAL_ROW, "partial (source)"),
+            for (offset, expected) in [(OUTPUT_OPTIONS_PARTIAL_ROW, "source track fails"),
                                        (OUTPUT_OPTIONS_IF_EXISTS_ROW, "if exists")] {
                 let mut text = String::new();
                 for x in 0..80 {
                     text.push_str(terminal.backend().buffer().get(x, offset).symbol());
                 }
                 assert!(text.contains(expected), "height {height}: {expected} missing: {text}");
+                if offset == OUTPUT_OPTIONS_PARTIAL_ROW {
+                    for label in ["fail source", "keep successes"] {
+                        assert!(text.contains(label),
+                            "height {height}: source failure outcome {label} missing: {text}");
+                    }
+                }
             }
         }
     }

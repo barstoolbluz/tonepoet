@@ -48,6 +48,61 @@ assert_one_album() {
         fail "$label: album tracks missing or published to other directories"
 }
 
+# Strictly enumerate files AND directories after publication. Count-only smoke
+# previously missed unexpected sidecars, hidden batch state, and other debris.
+# Audio names are read from the already count-checked album to tolerate naming
+# template variations, while everything else is an explicit closed set.
+assert_exact_inventory() {
+    local output=$1; shift
+    python3 - "$output" "$@" <<'PYINV'
+import os
+import sys
+
+root = os.path.abspath(sys.argv[1])
+expected = set(sys.argv[2:])
+actual = set()
+
+def visit(directory):
+    with os.scandir(directory) as iterator:
+        for item in iterator:
+            relative = os.path.relpath(item.path, root).replace(os.sep, '/')
+            if item.is_dir(follow_symlinks=False):
+                actual.add(relative + '/')
+                visit(item.path)
+            elif item.is_file(follow_symlinks=False):
+                actual.add(relative)
+            else:
+                actual.add(relative + ' [special entry]')
+
+visit(root)
+missing = sorted(expected - actual)
+unexpected = sorted(actual - expected)
+if missing or unexpected:
+    raise SystemExit(
+        'strict destination inventory mismatch\n'
+        f'missing: {missing!r}\n'
+        f'unexpected: {unexpected!r}\n'
+        f'complete actual: {sorted(actual)!r}'
+    )
+PYINV
+}
+
+# Construct the exact album file names from the existing, count-validated
+# audio fixture. The caller names the expected human and historical logs.
+assert_album_inventory() {
+    local output=$1; shift
+    local -a expected=("$@")
+    local album_dir
+    for album_dir in "${album_dirs_for_inventory[@]}"; do
+        expected+=("${album_dir#$output/}/")
+        local file
+        while IFS= read -r -d '' file; do
+            expected+=("${file#$output/}")
+        done < <(find "$album_dir" -maxdepth 1 -type f -iname '*.flac' -print0)
+    done
+    assert_exact_inventory "$output" "${expected[@]}"
+}
+
 run_convert() {
     local label=$1; shift
     local status=0
@@ -73,6 +128,9 @@ for count in 1 2 3; do
     [[ -f "$album/conversion.log" ]] || fail "N=$count: first run omitted conversion.log"
     [[ $(find "$album" -maxdepth 1 -type f -name 'conversion-*.log' | wc -l) -eq 0 ]] || \
         fail "N=$count: first run created duplicate log history"
+    album_dirs_for_inventory=("$album")
+    assert_album_inventory "$output" "$album_name/conversion.log" || \
+        fail "N=$count: greenfield destination has unexpected entries"
     cp "$album/conversion.log" "$work/displaced-$count.log"
     status=0
     "$binary" convert "$input" --format flac --output "$output" \
@@ -90,6 +148,12 @@ for count in 1 2 3; do
     [[ ${#history[@]} -eq 1 ]] || fail "N=$count: lost historical album log"
     cmp -s "$work/displaced-$count.log" "${history[0]}" || \
         fail "N=$count: historical snapshot differs from displaced conversion.log"
+    if cmp -s "$work/displaced-$count.log" "$album/conversion.log"; then
+        fail "N=$count: visible conversion.log did not refresh on overwrite"
+    fi
+    album_dirs_for_inventory=("$album")
+    assert_album_inventory "$output" "$album_name/conversion.log" "$album_name/$(basename "${history[0]}")" || \
+        fail "N=$count: overwrite destination has unexpected entries"
     printf 'PASS overwrite N=%s: all audio survives, no backup remains, history retained\n' "$count"
 done
 
@@ -130,6 +194,11 @@ assert_one_album "$output" "$album" 3 'unlogged single-file overwrite'
     fail 'an unlogged conversion modified the previous visible log'
 [[ -z $(find "$output" -type d -name '.tonepoet-backup-*' -print -quit) ]] || \
     fail 'unlogged single-file overwrite left a whole-album backup'
+album_dirs_for_inventory=("$album")
+mapfile -d '' -t history < <(find "$album" -maxdepth 1 -type f -name 'conversion-*.log' -print0)
+[[ ${#history[@]} -eq 1 ]] || fail 'unlogged redo changed conversion history inventory'
+assert_album_inventory "$output" "$album_name/conversion.log" "$album_name/$(basename "${history[0]}")" || \
+    fail 'unlogged redo polluted album destination'
 printf 'PASS unlogged single-file overwrite: both unselected tracks and log history survive\n'
 
 # Keep both must choose one album sibling, never one numbered folder per item.
@@ -150,6 +219,11 @@ numbered="$output/$album_name (2)"
     fail 'keep both did not publish three tracks together in the numbered album'
 [[ $(find "$output" -type f -iname '*.flac' | wc -l) -eq 6 ]] || \
     fail 'keep both split tracks into unexpected folders or lost original audio'
+album_dirs_for_inventory=("$album" "$numbered")
+assert_album_inventory "$output" \
+    "$album_name/conversion.log" "$album_name/$(basename "${history[0]}")" \
+    "$album_name (2)/conversion.log" || \
+    fail 'keep-both polluted original album or numbered sibling'
 printf 'PASS keep-both: one numbered sibling contains all three tracks\n'
 
 # Reproduce the partial ReplayGain cohort: same physical album directory,

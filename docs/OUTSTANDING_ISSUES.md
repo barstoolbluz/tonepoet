@@ -2909,6 +2909,20 @@ Dark Side ISO still owed by the user. The preset is deferred until the source pr
 inapplicable DSD fields are refused, not skipped; saved PCM presets carry no DSD fields; Int32
 dither is limited to what the planner admits.
 
+**Status 2026-10-09 — recurrence; NOT field-closed.** The same six preset-field
+refusals recurred through Browse -> Convert -> SACD-to-PCM Reference on a different
+SACD ISO. The 2026-09-26 correction deferred preset application while the probe was
+in progress, but the ISO placeholder did not advertise that the probe was in
+progress. R22C now defers application until the ISO's DSD64 source facts are known;
+`r22_folder_iso_reference_preset_applies_only_after_dsd64_probe_facts` covers the
+logic in an automated regression. This is the original #43, not a newly resolved
+issue. The real Browse context-menu gesture against a SACD ISO has **not** been
+rerun after R22C and is an explicit acceptance prerequisite. Do not relabel #43
+"fixed" until that TUI gesture completes without refusing the six fields and
+the conversion uses the intended Reference pathway. #46's separate CLI behavior,
+which treats inapplicable fields from the other source class as dormant, did not
+cover this Browse lifecycle bug.
+
 Found 2026-09-24 converting the stereo area of a Dark Side of the Moon SACD ISO with the
 preset `SACD-to-PCM Reference` (`dsd_path = "reference"`, 176.4 kHz, 32-bit,
 `dither = "tpdf"`, `resampler = "soxr"`). From the Browse context menu the conversion
@@ -3183,6 +3197,16 @@ is honoured on this route, the log names the tool that dithered and the shaping 
 the qualification evidence for the new terminal is execution evidence from this machine.
 
 ## 49. The conversion log buries the essential facts under useless ones
+
+**Status 2026-10-09 — R23 presentation correction implemented; build-host check owed.**
+Two observed logs now have 296/182 lines, 153/168-character longest lines, no
+staging-path-only lines, and no `Source ref` lines. Measured gains are explicitly
+labelled. The remaining human readability defect was that DSD Reference album
+gain, loudest true peak, and target displayed all nine nano-decibel decimals.
+R23 renders these three figures to 0.001 dB/dBTP *only at the human-log boundary*;
+`DbNano` values used for decisions and structured evidence remain unchanged.
+The new formatting regression is included, but this bundle cannot mark #49
+fully validated without compilation and a representative generated log.
 
 Filed 2026-09-26 from the same Journey conversion log: 292 lines for 16 tracks, longest
 line 702 characters, 48 lines that are nothing but staging paths. Issue #47 records the
@@ -4772,6 +4796,16 @@ and recovery behaviour is tested and should not be disturbed.
 
 ## 70. `conversion.log` is overwritten by the next conversion into the same folder
 
+**Status 2026-10-09 — R23 single-file residual addressed; field smoke owed.**
+R22C's multi-file album fragment finalizer retained exact displaced reports,
+but a standalone N=1 redo used the legacy incremental append path. It rewrote
+`conversion.log` without replacing its first-run `Generated (UTC)` header, so
+neither the new report nor the expected dated archive appeared. R23 explicitly
+replaces the report when audio at the same destination is displaced, snapshots
+the old report into the incremental rollback/recovery journal, and preserves
+the legacy append path for new distinct siblings. The original N=1,N=2,N=3
+black-box acceptance smoke remains the release check.
+
 > **⚠ SPECIFICATION CORRECTED 2026-10-09 — implemented, but to the wrong spec.** R20
 > (`075946c`) delivered this faithfully to the R20 brief, which asked for "a per-run log
 > named with its date and time, written alongside the existing `conversion.log`". That
@@ -4835,6 +4869,16 @@ asked for a log at all, and the #65 destination-inventory tests have to be
 extended to expect it, since they assert the destination's exact file set.
 
 ## 71. The strict destination-inventory tests never run against overwrite or keep-both
+
+**Status 2026-10-09 — R23 coverage implemented; build-host gate owed.** Added
+strict all-entry inventory cases for a three-track whole-album overwrite, a
+three-track keep-both publication (both original and numbered sibling), and a
+two-track independently dispatched folder overwrite. Each checks the full output
+root, with logging on/off where applicable, and accounts for the exact displaced
+log archive rather than merely counting FLAC files. The R20 black-box smoke
+also checks every output entry after initial publish, overwrite, unlogged
+single-file redo, and keep-both. These are source changes awaiting compilation,
+test execution, and Reference requalification.
 
 Filed 2026-10-09, split out of #65 and #69 so the gap is tracked in its own right
 rather than as a note inside two closed issues.
