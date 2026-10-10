@@ -1,0 +1,10 @@
+R25C STATIC INTEGRITY (2026-10-10)
+- Delivered R25 source baseline: /mnt/data/TonePoet_LOGGING_R25_CORRECTIVE_2026-10-10.tar.gz
+- Existing source file differences vs delivered R25: src/convert/pipeline/stages.rs ONLY.
+- New package metadata: R25C_CODE_CHANGES.patch, R25C_DELIVERY_NOTES_2026-10-10.md, R25C_RESUME_CHECKPOINT_2026-10-10.md, R25C_CHANGED_SHA256SUMS.txt, this QA file.
+- git diff --check on one-file delta: PASS.
+- git apply --check against pristine delivered R25 stages.rs: PASS.
+- git apply reproduction of exact modified stages.rs: PASS.
+- Focused regression tests in source (5 R25C tests + updated dead-owner journal fixture): PRESENT, NOT EXECUTED.
+- Rust compiler, Cargo, rustfmt and Nix: NOT AVAILABLE. Network DNS unavailable; no toolchain installation attempted.
+- Real SACD ISO / Reference requalification / #43 TUI manual acceptance: NOT EXECUTED.

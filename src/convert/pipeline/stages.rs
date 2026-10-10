@@ -18110,7 +18110,17 @@ fn conversion_log_fragment_file_name(
     sort_key: ConversionLogTrackSortKey,
     batch_identity: &ConversionLogBatchIdentity,
 ) -> String {
-    let batch_id = sanitize_component(&batch_identity.conversion_log_batch_id);
+    conversion_log_fragment_file_name_for_batch_id(
+        sort_key,
+        &batch_identity.conversion_log_batch_id,
+    )
+}
+
+fn conversion_log_fragment_file_name_for_batch_id(
+    sort_key: ConversionLogTrackSortKey,
+    batch_id: &str,
+) -> String {
+    let batch_id = sanitize_component(batch_id);
     format!(
         "{batch_id}-d{:03}-t{:05}-s{:05}.json",
         sort_key.disc_number,
@@ -18291,6 +18301,8 @@ fn file_bytes_match(path: &Path, expected: &[u8]) -> io::Result<bool> {
     Ok(actual == expected)
 }
 
+// This helper is used only for retrying a provably unfinished publish. Do not
+// call it from the fresh-conversion FailIfExists path.
 fn staged_file_matches_existing_final(staged_path: &Path, final_path: &Path) -> Result<Option<u64>, PublishError> {
     let final_metadata = match fs::metadata(final_path) {
         Ok(metadata) => metadata,
@@ -20932,6 +20944,113 @@ struct ConversionLogBatchWorkspaceState {
 
 fn conversion_log_batch_workspace_state_path(coord_dir: &Path) -> PathBuf {
     coord_dir.join(CONVERSION_LOG_BATCH_WORKSPACE_STATE_FILE)
+}
+
+// A new batch creates an ACTIVE workspace *before* publication checks. ACTIVE
+// by itself is therefore not evidence of a retry. A previously FAILED batch
+// or a provably dead owner's ACTIVE batch can be resumed under the workspace
+// ownership protocol; the latter becomes a takeover generation once claimed.
+fn unfinished_conversion_log_batch_workspace(
+    coord_dir: &Path,
+    batch_id: &str,
+) -> bool {
+    let Ok(Some(state)) = read_conversion_log_batch_workspace_state(coord_dir) else {
+        return false;
+    };
+    if state.batch_id != batch_id
+        || coord_dir.join(CONVERSION_LOG_BATCH_COMPLETION_MARKER_FILE).exists()
+    {
+        return false;
+    }
+    if !matches!(state.status.as_str(),
+        CONVERSION_LOG_BATCH_WORKSPACE_STATUS_ACTIVE
+            | CONVERSION_LOG_BATCH_WORKSPACE_STATUS_FAILED)
+    {
+        return false;
+    }
+    let Some(owner) = state.owner.as_ref() else {
+        return false;
+    };
+    match owner_is_current_process(owner) {
+        Ok(true) => state.status == CONVERSION_LOG_BATCH_WORKSPACE_STATUS_FAILED
+            || (state.ownership_generation > 1
+                && state.previous_owner_claim_id.is_some()),
+        Ok(false) => matches!(owner_liveness(owner), Ok(OwnerLiveness::DeadLocal)),
+        Err(_) => false,
+    }
+}
+
+fn is_unfinished_publish_retry(identity: Option<&ConversionLogBatchIdentity>) -> bool {
+    identity.is_some_and(|identity| {
+        unfinished_conversion_log_batch_workspace(
+            &conversion_log_batch_coordination_album_dir_from_identity(identity),
+            &identity.conversion_log_batch_id,
+        )
+    })
+}
+
+// Batch status proves only an unfinished BATCH. Reusing an occupied audio
+// target additionally requires the successfully installed fragment for that
+// exact track, batch and target. An unrelated failed sibling cannot supply
+// this evidence. Missing/invalid/legacy fragments fail closed.
+fn installed_batch_fragment_attests_audio(
+    fragment_path: &Path,
+    batch_id: &str,
+    sort_key: ConversionLogTrackSortKey,
+    album_dir: &Path,
+    audio_target: &Path,
+) -> bool {
+    let Ok(fragment) = read_conversion_log_fragment_file(fragment_path) else {
+        return false;
+    };
+    if fragment.batch_identity.conversion_log_batch_id != batch_id
+        || fragment.sort_key != sort_key
+        || fragment.summary.outcome != ConversionLogTrackOutcome::Success
+    {
+        return false;
+    }
+    let Some(recorded_target) = fragment.track.output_target.as_deref() else {
+        return false;
+    };
+    if recorded_target == path_log_value(audio_target) {
+        return true;
+    }
+    // Publishing through a descriptor-bound authority can rebase the final
+    // path. The fragment records the logical rendered root, not that route.
+    let (Some(root), Ok(relative)) = (
+        fragment.rendered_album_dir.as_deref(),
+        audio_target.strip_prefix(album_dir),
+    ) else {
+        return false;
+    };
+    recorded_target == path_log_value(&Path::new(root).join(relative))
+}
+
+// A durable fragment must also be the fragment being retried. This byte
+// comparison is confined to same-batch recovery metadata, never ordinary
+// existing audio. A newly staged fragment alone is not publication evidence.
+fn staged_and_installed_fragment_attest_audio(
+    fragment_entry: &PublishEntry,
+    batch_id: &str,
+    album_dir: &Path,
+    audio_target: &Path,
+) -> bool {
+    if !matches!(
+        staged_file_matches_existing_final(&fragment_entry.staged_path, &fragment_entry.final_path),
+        Ok(Some(_))
+    ) {
+        return false;
+    }
+    let Ok(staged) = read_conversion_log_fragment_file(&fragment_entry.staged_path) else {
+        return false;
+    };
+    installed_batch_fragment_attests_audio(
+        &fragment_entry.final_path,
+        batch_id,
+        staged.sort_key,
+        album_dir,
+        audio_target,
+    )
 }
 
 fn conversion_log_batch_workspace_ownership_lock_path(
@@ -25279,7 +25398,13 @@ fn first_four_digit_run(value: &str) -> Option<&str> {
     None
 }
 
-fn conversion_log_catalog_number(extra: &BTreeMap<String, String>) -> Option<&str> {
+// Keep the catalog value and its source key selected by ONE rule. The SACD
+// provenance writer uses the same entry as the human conversion log, so a
+// TOC album catalog, TOC disc catalog, or sidecar alias cannot disagree about
+// which value was actually printed.
+pub(super) fn conversion_log_catalog_number_entry(
+    extra: &BTreeMap<String, String>,
+) -> Option<(&str, &str)> {
     for (key, value) in extra {
         let normalized = normalize_extra_key(key);
         if matches!(
@@ -25299,11 +25424,15 @@ fn conversion_log_catalog_number(extra: &BTreeMap<String, String>) -> Option<&st
         ) {
             let trimmed = value.trim();
             if !trimmed.is_empty() {
-                return Some(trimmed);
+                return Some((key.as_str(), trimmed));
             }
         }
     }
     None
+}
+
+fn conversion_log_catalog_number(extra: &BTreeMap<String, String>) -> Option<&str> {
+    conversion_log_catalog_number_entry(extra).map(|(_, value)| value)
 }
 
 fn normalize_extra_key(key: &str) -> String {
@@ -25952,7 +26081,28 @@ fn publish_album_output_for_plan_with_authority(
         );
     }
 
-    if matches!(policy.overwrite, OverwritePolicy::FailIfExists) {
+    // Resume only the SAME unfinished batch after its roots and coordination
+    // fragments were committed but log finalization did not finish. A real
+    // crash leaves the durable workspace ACTIVE; a handled failure leaves
+    // it FAILED. Neither case is a new conversion. Both the
+    // durable failed workspace and the already-published fragments prove this
+    // is recovery, not an opportunistic byte-identical new conversion.
+    let recovery_fragments_match = if matches!(policy.overwrite, OverwritePolicy::FailIfExists)
+        && is_unfinished_publish_retry(coordination_fragment_identity.as_ref())
+        && !coordination_fragment_entries.is_empty()
+    {
+        let mut all_match = true;
+        for entry in &coordination_fragment_entries {
+            if staged_file_matches_existing_final(&entry.staged_path, &entry.final_path)?.is_none() {
+                all_match = false;
+                break;
+            }
+        }
+        all_match
+    } else {
+        false
+    };
+    if recovery_fragments_match {
         match existing_multi_root_payload_matches_destinations(&groups)? {
             Some(mut existing_entries) => {
                 published_entries.append(&mut existing_entries);
@@ -27366,6 +27516,8 @@ fn publish_incremental_album_output(
         .filter(|entry| is_out_of_album_conversion_log_fragment_entry(entry, &plan.album_dir))
         .cloned()
         .collect();
+    let unfinished_publish_retry = !coordination_fragment_entries.is_empty()
+        && is_unfinished_publish_retry(fragment_batch_identity);
     let mut already_published_audio_entries = Vec::new();
     let mut repaired_existing_audio_payload = false;
     let mut has_audio = false;
@@ -27397,7 +27549,18 @@ fn publish_incremental_album_output(
             PublishRole::Audio => {
                 has_audio = true;
                 if entry.final_path.exists() && !overwrite_existing_audio {
-                    if !coordination_fragment_entries.is_empty() {
+                    let target_has_recovery_evidence = unfinished_publish_retry
+                        && fragment_batch_identity.is_some_and(|identity| {
+                            coordination_fragment_entries.iter().any(|fragment_entry| {
+                                staged_and_installed_fragment_attest_audio(
+                                    fragment_entry,
+                                    &identity.conversion_log_batch_id,
+                                    &plan.album_dir,
+                                    &entry.final_path,
+                                )
+                            })
+                        });
+                    if target_has_recovery_evidence {
                         if let Some(bytes) = staged_file_matches_existing_final(&temp_entry_path, &entry.final_path)? {
                             repaired_existing_audio_payload = true;
                             already_published_audio_entries.push(PublishedEntry {
@@ -31155,12 +31318,66 @@ fn admit_planner_resolved_output_claim(req: &mut PipelineRequest) -> Result<Opti
     Ok(Some(admitted))
 }
 
-// A pre-conversion refusal is sound only when the planned destination's
-// filesystem *shape* proves that even an identical payload cannot be
-// installed. Existing regular files are deliberately inconclusive: publish
-// compares their bytes with the newly encoded payload and accepts identical
-// re-conversions without rewriting audio. Treating existence as a collision
-// would silently break that established contract.
+
+// A crash may leave an audio file visible with an incremental rollback action
+// for THAT file. The publisher rolls that incomplete action back under the
+// album lock before publishing again; the marker is not evidence permitting
+// byte-identical reuse. A marker for some other sibling is not an exception.
+fn incremental_rollback_marker_covers_target(album_dir: &Path, target: &Path) -> bool {
+    let parent = parent_dir_or_current(album_dir);
+    let token = super::coordination_name::album_coordination_token(album_dir);
+    let marker_path = parent.join(format!(".tonepoet-incremental-{token}.json"));
+    let Ok(bytes) = fs::read(&marker_path) else {
+        return false;
+    };
+    let Ok(marker) = serde_json::from_slice::<IncrementalPublishRecoveryMarker>(&bytes) else {
+        return false;
+    };
+    if validate_incremental_marker(album_dir, &marker_path, &marker).is_err() {
+        return false;
+    }
+    marker.actions.iter().any(|action| {
+        if let IncrementalRecoveryActionMarker::RemoveCreatedFile { final_rel } = action {
+            return marker_relative_path(&marker_path, final_rel)
+                .is_ok_and(|relative| normalize_path(&album_dir.join(relative)) == normalize_path(target));
+        }
+        false
+    })
+}
+
+fn installed_batch_fragment_covers_planned_target(
+    req: &PipelineRequest,
+    plan: &AlbumPlan,
+    track_id: &TrackId,
+    target: &Path,
+) -> bool {
+    let (Some(batch), Some(coord_dir)) = (
+        req.album_batch.as_ref(),
+        conversion_log_batch_coordination_album_dir(req),
+    ) else {
+        return false;
+    };
+    let sort_key = ConversionLogTrackSortKey::from(track_id);
+    let fragment_path = conversion_log_fragment_dir(&coord_dir).join(
+        conversion_log_fragment_file_name_for_batch_id(
+            sort_key,
+            &batch.conversion_log_batch_id,
+        ),
+    );
+    installed_batch_fragment_attests_audio(
+        &fragment_path,
+        &batch.conversion_log_batch_id,
+        sort_key,
+        &plan.album_dir,
+        target,
+    )
+}
+
+// A fresh conversion with FailIfExists cannot install its output on an
+// occupied destination, irrespective of the encoded bytes. The existence
+// probe is advisory; publication repeats the check under its own lock.
+// Batch-level failure never excuses a target collision: only that target's
+// durable recovery marker or installed same-batch success fragment may do so.
 fn preflight_proven_destination_obstruction(
     req: &PipelineRequest,
     plan: &AlbumPlan,
@@ -31192,7 +31409,97 @@ fn preflight_proven_destination_obstruction(
             }
         }
     }
-    Ok(())
+
+    // Do no recovery I/O in the common case of an unoccupied destination.
+    // The publication path itself decides whether a single-track job may
+    // append a new sibling file or instead replaces a whole album root.
+    // A dangling symlink still occupies its destination name; Path::exists()
+    // follows it and would let a doomed conversion reach extraction.
+    let occupied = |path: &Path| match fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => false,
+        Err(_) => true, // Unreadable destination: refuse early, then recheck under lock.
+    };
+    let incremental_track = planned_album_dirs(plan).len() <= 1
+        && plan.entries.len() == 1
+        && !req.suppress_incremental_conversion_log_append
+        && (req.log.write_conversion_log
+            || req.album_batch.as_ref().is_some_and(AlbumBatchContext::uses_completion_order)
+            // Ordered independent-track batches use a hidden coordination
+            // fragment even with the visible conversion.log disabled. They
+            // still require the dispatcher's per-track ordering context.
+            || (req.album_batch_track.is_some()
+                && req.album_batch.as_ref().is_some_and(|batch| !batch.uses_completion_order())));
+    let occupied_root = if incremental_track {
+        None
+    } else {
+        std::iter::once(&plan.album_dir)
+            .chain(plan.album_dirs.iter())
+            .find(|directory| occupied(directory))
+    };
+    let occupied_file = plan.entries.iter()
+        .find(|entry| occupied(&entry.final_path));
+    let collision_path = match (occupied_root, occupied_file) {
+        (Some(directory), _) => directory,
+        (None, Some(entry)) => &entry.final_path,
+        (None, None) => return Ok(()),
+    };
+
+    // The only permitted deferral of a *known* collision is a genuine publish
+    // recovery. The transaction owner validates the durable journal under its
+    // publication lock and either repairs the partial publish or refuses it.
+    let has_recovery_marker = if incremental_track {
+        // Incremental journal actions name individual files; a marker for a
+        // failed sibling cannot admit this track's occupied destination.
+        plan.entries.iter().any(|entry| {
+            occupied(&entry.final_path)
+                && incremental_rollback_marker_covers_target(&plan.album_dir, &entry.final_path)
+        })
+    } else {
+        std::iter::once(&plan.album_dir)
+            .chain(plan.album_dirs.iter())
+            .any(|dir| {
+                let parent = parent_dir_or_current(dir);
+                let token = super::coordination_name::album_coordination_token(dir);
+                parent.join(format!(".tonepoet-publish-{token}.json")).exists()
+            })
+    };
+    let has_multi_root_recovery_marker = planned_album_dirs(plan).len() > 1
+        && multi_root_publish_marker_path(&req.output_root, &req.job_id, &req.item_id).exists();
+    let unfinished_same_batch = req.album_batch.as_ref().is_some_and(|batch| {
+        conversion_log_batch_coordination_album_dir(req).is_some_and(|coord_dir| {
+            unfinished_conversion_log_batch_workspace(
+                &coord_dir,
+                &batch.conversion_log_batch_id,
+            )
+        })
+    });
+    let has_target_specific_retry = unfinished_same_batch && if incremental_track {
+        occupied_file.is_some_and(|entry| {
+            let track_id = req.album_batch_track.as_ref()
+                .map(AlbumBatchTrackContext::track_id)
+                .unwrap_or_else(|| entry.track_id.clone());
+            installed_batch_fragment_covers_planned_target(
+                req, plan, &track_id, &entry.final_path,
+            )
+        })
+    } else if planned_album_dirs(plan).len() > 1 {
+        // Multi-root recovery already requires the matching staged fragments
+        // and existing payload for every root at the publisher. Preflight
+        // admits that possible recovery only if EACH planned output is
+        // attested by its installed same-batch success fragment.
+        !plan.entries.is_empty() && plan.entries.iter().all(|entry| {
+            installed_batch_fragment_covers_planned_target(
+                req, plan, &entry.track_id, &entry.final_path,
+            )
+        })
+    } else {
+        false
+    };
+    if has_recovery_marker || has_multi_root_recovery_marker || has_target_specific_retry {
+        return Ok(());
+    }
+    Err(format!("destination already exists: {}", collision_path.display()))
 }
 
 fn admit_planned_output_claim(
@@ -41123,7 +41430,7 @@ async fn prepare_pipeline_item_for_scheduler_scoped_inner(
     };
 
     if let Err(error) = admit_planned_output_claim(&req, &album_plan, admitted_planner_output.as_deref()) {
-        let record = stage_record(PipelineStage::PlanOutputs, StageOutcome::Failed(format!("output concurrency admission failed: {error}")));
+        let record = stage_record(PipelineStage::PlanOutputs, StageOutcome::Failed(format!("output admission failed: {error}")));
         emit_stage_finished(reporter, &item_id, record.clone()).await;
         stages.push(record);
         let outcome = AlbumOutcome::Blocked { successful: Vec::new(), failed: Vec::new(), stages, reason: BlockReason::PlanFailed };
@@ -45020,7 +45327,7 @@ async fn run_pipeline_item_with_tool_paths_and_tool_limits_once(
     }
 
     if let Err(error) = admit_planned_output_claim(&req, plan.as_ref().expect("plan present"), admitted_planner_output.as_deref()) {
-        let record = stage_record(PipelineStage::PlanOutputs, StageOutcome::Failed(format!("output concurrency admission failed: {error}")));
+        let record = stage_record(PipelineStage::PlanOutputs, StageOutcome::Failed(format!("output admission failed: {error}")));
         emit_stage_finished(reporter, &item_id, record.clone()).await;
         stages.push(record);
         let outcome = AlbumOutcome::Blocked { successful: Vec::new(), failed: Vec::new(), stages, reason: BlockReason::PlanFailed };
@@ -64865,7 +65172,7 @@ mod naming_template_tests {
 
         let (_source, retry_req, retry_plan, retry_staging, mut retry_artifacts) =
             multi_root_template_fixture(&temp, "multi-root-before-finalization-retry");
-        let retry_batch_id = generated_current_process_test_batch_id("multi-root-before-finalization-new");
+        let retry_batch_id = old_batch_id.clone();
         let retry_coord_dir = attach_multi_root_batch_fragments(
             &retry_req,
             &retry_plan,
@@ -64882,7 +65189,7 @@ mod naming_template_tests {
             retry_req.publish.clone(),
             None,
         )
-        .expect("retry treats byte-identical existing roots as published and repairs missing batch finalization");
+        .expect("same failed batch repairs its already-committed roots and finishes finalization");
 
         assert!(published.entries.iter().any(|entry| {
             matches!(&entry.role, PublishRole::Sidecar(SidecarKind::ConversionLog))
@@ -64891,10 +65198,8 @@ mod naming_template_tests {
         assert!(retry_req.output_root.join("A Tribute to Jack Johnson (CD1)/conversion.log").exists());
         assert!(retry_req.output_root.join("A Tribute to Jack Johnson (CD2)/conversion.log").exists());
         assert!(retry_coord_dir.join(CONVERSION_LOG_BATCH_COMPLETION_MARKER_FILE).exists());
-        assert!(
-            !old_coord_dir.exists(),
-            "retry in the same live process must sweep the old failed generated batch workspace, not keep it because its PID is still live"
-        );
+        assert_eq!(old_coord_dir, retry_coord_dir,
+            "resumed publish must retain the interrupted batch identity");
         assert!(
             !conversion_log_fragment_dir(&retry_coord_dir).exists()
                 || std::fs::read_dir(conversion_log_fragment_dir(&retry_coord_dir))
@@ -64903,6 +65208,30 @@ mod naming_template_tests {
                     .is_none(),
             "retry finalization consumes the new batch's hidden fragments"
         );
+    }
+
+    #[test]
+    fn r25_fresh_multi_root_with_identical_audio_is_not_a_publish_retry() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let (_source, req, plan, staging, mut artifacts) =
+            multi_root_template_fixture(&temp, "r25-original-multi-root");
+        let old_batch = generated_current_process_test_batch_id("r25-original");
+        attach_multi_root_batch_fragments(&req, &plan, &staging, &mut artifacts, &old_batch);
+        publish_album_output_for_plan(staging, &artifacts, &req, &plan, req.publish.clone(), None)
+            .expect("first publish completes");
+
+        let (_source, req, plan, staging, mut artifacts) =
+            multi_root_template_fixture(&temp, "r25-fresh-multi-root");
+        let new_batch = generated_current_process_test_batch_id("r25-fresh");
+        let new_coord_dir = attach_multi_root_batch_fragments(
+            &req, &plan, &staging, &mut artifacts, &new_batch,
+        );
+        let err = publish_album_output_for_plan(
+            staging, &artifacts, &req, &plan, req.publish.clone(), None,
+        ).expect_err("fresh batch must not treat identical incumbent as successful publish");
+        assert!(matches!(err, PublishError::DestinationExists(_)), "{err:?}");
+        assert!(!new_coord_dir.join(CONVERSION_LOG_BATCH_COMPLETION_MARKER_FILE).exists(),
+            "a refused fresh batch must not fabricate completion");
     }
 
     #[test]
@@ -74500,7 +74829,25 @@ Recovered provenance
             .join(CONVERSION_LOG_BATCH_COORDINATION_DIR)
             .join(&batch_id);
         std::fs::create_dir_all(&album_dir).expect("album dir");
-        std::fs::write(album_dir.join("01.flac"), b"deterministic audio").expect("preexisting audio");
+        std::fs::write(album_dir.join("01.flac"), b"crash-installed audio")
+            .expect("incomplete prior publish audio");
+        // Before installing the audio, R23 records a durable per-file rollback
+        // action. A genuine crash in this window leaves the marker behind;
+        // repairing it first removes only this attempt's incomplete audio.
+        let token = crate::convert::pipeline::coordination_name::album_coordination_token(&album_dir);
+        let journal_name = format!(".tonepoet-tmp-{token}-crashed");
+        std::fs::create_dir_all(output_root.join(&journal_name)).expect("crashed temp dir");
+        let marker_path = output_root.join(format!(".tonepoet-incremental-{token}.json"));
+        let marker = IncrementalPublishRecoveryMarker {
+            version: 1,
+            album_dir_name: album_dir_marker_name(&album_dir).unwrap(),
+            temp_dir_name: journal_name,
+            actions: vec![IncrementalRecoveryActionMarker::RemoveCreatedFile {
+                final_rel: PathBuf::from("01.flac"),
+            }],
+        };
+        std::fs::write(&marker_path, serde_json::to_vec_pretty(&marker).unwrap())
+            .expect("persist exact target recovery marker");
 
         let mut fragment = fragment_test_fragment(
             &album_dir,
@@ -74530,8 +74877,41 @@ Recovered provenance
             }
         }
 
+        // Simulate the durable state left by a crashed process, not an ACTIVE
+        // workspace created by this new conversion. Ownership takeover is
+        // authoritative only when the original local owner is provably dead.
+        super::publish_lock_soundness_tests::write_test_workspace_state_with_owner(
+            &coord_dir,
+            &batch_id,
+            CONVERSION_LOG_BATCH_WORKSPACE_STATUS_ACTIVE,
+            super::publish_lock_soundness_tests::provably_dead_local_test_owner(),
+        );
+        // A hard process crash cannot run failure-on-drop: its persistent
+        // workspace is ACTIVE even though some payload was committed.
+        assert_eq!(
+            read_conversion_log_batch_workspace_state(&coord_dir).unwrap().unwrap().status,
+            CONVERSION_LOG_BATCH_WORKSPACE_STATUS_ACTIVE,
+        );
+        assert!(incremental_rollback_marker_covers_target(&album_dir, &album_dir.join("01.flac")));
+        let mut req = log_test_request();
+        req.output_root = output_root;
+        req.album_batch = Some(AlbumBatchContext::new(
+            batch_id.clone(), 1, album_dir.clone(), temp.path().join("source"),
+        ));
+        req.album_batch_track = Some(AlbumBatchTrackContext::new(1, Some(1), 1));
+        let album_plan = AlbumPlan {
+            album_dir: album_dir.clone(),
+            album_dirs: Vec::new(),
+            entries: vec![PlannedTrackOutput {
+                track_id: req.album_batch_track.as_ref().unwrap().track_id(),
+                final_path: album_dir.join("01.flac"),
+            }],
+        };
+        assert!(preflight_proven_destination_obstruction(&req, &album_plan).is_ok(),
+            "the target's own durable rollback action permits journal-driven crash repair");
         let published = publish_album_output(stage, &plan, incremental_test_publish_policy(), None)
-            .expect("retry repairs missing coordination fragment instead of failing on existing audio");
+            .expect("dead-owner crash rolls back its incomplete audio and republishes the fragment");
+        assert!(!marker_path.exists(), "successful crash repair retires the rollback marker");
 
         assert_eq!(
             std::fs::read(album_dir.join("01.flac")).expect("audio after repair"),
@@ -74548,6 +74928,88 @@ Recovered provenance
             !conversion_log_fragment_dir(&coord_dir).exists(),
             "complete repaired batch cleans hidden fragments"
         );
+    }
+
+    #[test]
+    fn r25c_dead_owner_without_target_publication_evidence_cannot_claim_old_audio() {
+        let temp = tempfile::tempdir().expect("unmarked crash collision");
+        let output_root = temp.path().join("out");
+        let album_dir = output_root.join("Album");
+        let target = album_dir.join("01.flac");
+        let batch_id = generated_test_batch_id("r25c-dead-owner-ambiguous");
+        let coord_dir = output_root.join(CONVERSION_LOG_BATCH_COORDINATION_DIR).join(&batch_id);
+        std::fs::create_dir_all(&album_dir).unwrap();
+        std::fs::write(&target, b"prior conversion").unwrap();
+        let mut fragment = fragment_test_fragment(
+            &album_dir, &batch_id, None, 1, 2, "Track 1",
+            ConversionLogTrackOutcome::Success, fragment_test_time(1),
+        );
+        fragment.batch_identity.output_album_dir = normalize_path(&coord_dir).display().to_string();
+        fragment.track.output_target = Some(path_log_value(&target));
+        let (stage, plan) = incremental_fragment_test_plan(
+            temp.path(), &album_dir, "r25c-unmarked-crash", &fragment,
+            Some(("01.flac", b"prior conversion")), b"suppressed\n",
+        );
+        super::publish_lock_soundness_tests::write_test_workspace_state_with_owner(
+            &coord_dir, &batch_id, CONVERSION_LOG_BATCH_WORKSPACE_STATUS_ACTIVE,
+            super::publish_lock_soundness_tests::provably_dead_local_test_owner(),
+        );
+        let mut req = log_test_request();
+        req.output_root = output_root;
+        req.album_batch = Some(AlbumBatchContext::new(
+            batch_id, 2, album_dir.clone(), temp.path().join("source"),
+        ));
+        req.album_batch_track = Some(AlbumBatchTrackContext::new(1, Some(1), 1));
+        let album_plan = AlbumPlan {
+            album_dir: album_dir.clone(),
+            album_dirs: Vec::new(),
+            entries: vec![PlannedTrackOutput {
+                track_id: req.album_batch_track.as_ref().unwrap().track_id(),
+                final_path: target.clone(),
+            }],
+        };
+        assert!(preflight_proven_destination_obstruction(&req, &album_plan).is_err(),
+            "dead batch ownership by itself does not attest which track installed the old audio");
+        let err = publish_album_output(stage, &plan, incremental_test_publish_policy(), None)
+            .expect_err("without target evidence, identical audio is an occupied destination");
+        assert!(matches!(err, PublishError::DestinationExists(_)), "{err:?}");
+        assert_eq!(std::fs::read(target).unwrap(), b"prior conversion");
+    }
+
+    #[test]
+    fn r25_fresh_fragment_conversion_with_identical_audio_is_refused() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let output_root = temp.path().join("out");
+        let album_dir = output_root.join("Album (CD1)");
+        let batch_id = generated_test_batch_id("r25-fresh-identical");
+        let coord_dir = output_root
+            .join(CONVERSION_LOG_BATCH_COORDINATION_DIR)
+            .join(&batch_id);
+        std::fs::create_dir_all(&album_dir).expect("album dir");
+        std::fs::write(album_dir.join("01.flac"), b"deterministic audio")
+            .expect("incumbent output");
+        let mut fragment = fragment_test_fragment(
+            &album_dir, &batch_id, None, 1, 1, "Track 1\n  Result: ok\n",
+            ConversionLogTrackOutcome::Success, fragment_test_time(1),
+        );
+        fragment.batch_identity.output_album_dir = normalize_path(&coord_dir).display().to_string();
+        fragment.rendered_album_dir = Some(normalize_path(&album_dir).to_string_lossy().to_string());
+        let (stage, mut plan) = incremental_fragment_test_plan(
+            temp.path(), &album_dir, "r25-fresh-fragment", &fragment,
+            Some(("01.flac", b"deterministic audio")), b"standalone log suppressed\n",
+        );
+        let fragment_name = fragment_file_name(&fragment);
+        for entry in &mut plan.entries {
+            if is_conversion_log_fragment_role(&entry.role) {
+                entry.final_path = conversion_log_fragment_dir(&coord_dir).join(&fragment_name);
+            }
+        }
+        let err = publish_album_output(stage, &plan, incremental_test_publish_policy(), None)
+            .expect_err("a new conversion cannot claim success by comparing identical audio");
+        assert!(matches!(err, PublishError::DestinationExists(_)), "{err:?}");
+        assert_eq!(std::fs::read(album_dir.join("01.flac")).unwrap(), b"deterministic audio");
+        assert!(!conversion_log_fragment_dir(&coord_dir).exists(),
+            "a refused fresh conversion must not publish a success fragment");
     }
 
     #[test]
@@ -74590,8 +75052,13 @@ Recovered provenance
             }
         }
 
+        ensure_conversion_log_batch_workspace_owned(&coord_dir, &batch_id)
+            .expect("establish same-batch retry ownership");
+        write_conversion_log_batch_workspace_state(
+            &coord_dir, &batch_id, CONVERSION_LOG_BATCH_WORKSPACE_STATUS_FAILED,
+        ).expect("record incomplete publish");
         let err = publish_album_output(stage, &plan, incremental_test_publish_policy(), None)
-            .expect_err("conflicting existing audio is not treated as a repairable retry");
+            .expect_err("even a failed same-batch retry must refuse different incumbent audio");
         assert!(matches!(err, PublishError::DestinationExists(path) if path == album_dir.join("01.flac").display().to_string()));
         assert!(
             !conversion_log_fragment_dir(&coord_dir).exists(),
@@ -76584,8 +77051,248 @@ Recovered provenance
             "log provenance must never be exported as an audio metadata tag");
     }
 
+    #[tokio::test]
+    async fn r25c_ordered_two_track_batch_with_log_disabled_appends_and_refuses_reconversion() {
+        let temp = tempfile::tempdir().expect("R25C no-log album batch");
+        let album_dir = real_fragment_album_dir(temp.path());
+        let mut requests = real_fragment_dispatched_requests(
+            temp.path(), "r25c-no-log-ordered-batch", &["no-log-first", "no-log-second"],
+        );
+        let mut planned = Vec::new();
+        for (index, req) in requests.iter_mut().enumerate() {
+            req.log.write_conversion_log = false;
+            let ordinal = u32::try_from(index + 1).unwrap();
+            let audio_name = format!("{ordinal:02}.flac");
+            let source = real_fragment_source(temp.path(), None, ordinal, ordinal, 2);
+            let track_id = source.tracks[0].id.clone();
+            let target = album_dir.join(&audio_name);
+            let album_plan = AlbumPlan {
+                album_dir: album_dir.clone(),
+                album_dirs: Vec::new(),
+                entries: vec![PlannedTrackOutput {
+                    track_id,
+                    final_path: target.clone(),
+                }],
+            };
+            assert!(preflight_proven_destination_obstruction(req, &album_plan).is_ok(),
+                "ordered fragment-backed job {ordinal} must append its unoccupied sibling with logging disabled");
+            let audio_stage = StagingDir::new(
+                temp.path().join(format!("no-log-audio-{ordinal}")),
+                format!("no-log-audio-{ordinal}"),
+            );
+            std::fs::create_dir_all(&audio_stage.root).unwrap();
+            let artifacts = real_fragment_audio_artifacts(
+                &audio_stage, &album_dir, None, ordinal, ordinal,
+                &audio_name, format!("audio-{ordinal}").as_bytes(),
+            );
+            let outcome = AlbumOutcome::Complete {
+                tracks: vec![real_fragment_record(None, ordinal, ordinal, true, Some(target.clone()))],
+                stages: stage_records(),
+            };
+            let (staging, pub_plan) = real_fragment_plan_through_features(
+                temp.path(), &format!("r25c-no-log-feature-{ordinal}"),
+                req, &source, &outcome, artifacts,
+            ).await;
+            assert!(plan_has_conversion_log_fragment(&pub_plan),
+                "hidden coordination fragment must survive disabled visible logging");
+            assert!(!pub_plan.entries.iter().any(|entry| {
+                matches!(&entry.role, PublishRole::Sidecar(SidecarKind::ConversionLog))
+            }));
+            publish_album_output(staging, &pub_plan, req.publish.clone(), None)
+                .expect("ordered, no-log independent track publication");
+            assert_eq!(std::fs::read(&target).unwrap(), format!("audio-{ordinal}").into_bytes());
+            assert!(!album_dir.join("conversion.log").exists(), "visible log is disabled");
+            planned.push((req.clone(), album_plan));
+        }
+        assert_eq!(std::fs::read(album_dir.join("01.flac")).unwrap(), b"audio-1");
+        assert_eq!(std::fs::read(album_dir.join("02.flac")).unwrap(), b"audio-2");
+        assert!(!album_dir.join("conversion.log").exists());
+        for (req, plan) in &planned {
+            let err = preflight_proven_destination_obstruction(req, plan)
+                .expect_err("retry with occupied original track must refuse before extraction");
+            assert!(err.contains("destination already exists"), "{err}");
+        }
+    }
+
     #[test]
-    fn r24_destination_preflight_refuses_only_proven_obstructions() {
+    fn r25c_failed_sibling_cannot_authorize_prior_batch_audio_reuse() {
+        let temp = tempfile::tempdir().expect("failed sibling collision");
+        let output_root = temp.path().join("out");
+        let album_dir = output_root.join("Album");
+        let old_target = album_dir.join("02.flac");
+        std::fs::create_dir_all(&album_dir).unwrap();
+        std::fs::write(&old_target, b"prior-batch-audio").unwrap();
+        let prior_history = album_dir.join("conversion.log");
+        std::fs::write(&prior_history, b"previous successful conversion\n").unwrap();
+        let batch_id = generated_current_process_test_batch_id("r25c-unrelated-failed-sibling");
+        let coord_dir = output_root.join(CONVERSION_LOG_BATCH_COORDINATION_DIR).join(&batch_id);
+
+        // The first sibling genuinely fails during publication, leaving the
+        // current batch workspace FAILED without publishing track 2.
+        std::fs::create_dir(album_dir.join("01.flac")).unwrap();
+        let mut first_fragment = fragment_test_fragment(
+            &album_dir, &batch_id, None, 1, 2, "Track 1",
+            ConversionLogTrackOutcome::Success, fragment_test_time(1),
+        );
+        first_fragment.batch_identity.output_album_dir = normalize_path(&coord_dir).display().to_string();
+        first_fragment.track.output_target = Some(path_log_value(&album_dir.join("01.flac")));
+        let (failed_stage, failed_plan) = incremental_fragment_test_plan(
+            temp.path(), &album_dir, "r25c-failed-first", &first_fragment,
+            Some(("01.flac", b"first-audio")), b"not visible\n",
+        );
+        let first_error = publish_album_output(
+            failed_stage, &failed_plan, incremental_test_publish_policy(), None,
+        ).expect_err("track 1 must fail at its occupied file");
+        assert!(matches!(first_error, PublishError::DestinationExists(_)), "{first_error:?}");
+        assert!(unfinished_conversion_log_batch_workspace(&coord_dir, &batch_id),
+            "the failed sibling leaves a resumable batch, not track-2 publication evidence");
+        std::fs::remove_dir(album_dir.join("01.flac")).unwrap();
+
+        let mut second_fragment = fragment_test_fragment(
+            &album_dir, &batch_id, None, 2, 2, "Track 2",
+            ConversionLogTrackOutcome::Success, fragment_test_time(2),
+        );
+        second_fragment.batch_identity.output_album_dir = normalize_path(&coord_dir).display().to_string();
+        second_fragment.track.output_target = Some(path_log_value(&old_target));
+        let (second_stage, second_plan) = incremental_fragment_test_plan(
+            temp.path(), &album_dir, "r25c-second-identical", &second_fragment,
+            Some(("02.flac", b"prior-batch-audio")), b"not visible\n",
+        );
+        let mut req = log_test_request();
+        req.output_root = output_root;
+        req.publish = incremental_test_publish_policy();
+        req.album_batch = Some(AlbumBatchContext::new(
+            batch_id.clone(), 2, album_dir.clone(), temp.path().join("source"),
+        ));
+        req.album_batch_track = Some(AlbumBatchTrackContext::new(2, Some(1), 2));
+        let plan = AlbumPlan {
+            album_dir: album_dir.clone(),
+            album_dirs: Vec::new(),
+            entries: vec![PlannedTrackOutput {
+                track_id: req.album_batch_track.as_ref().unwrap().track_id(),
+                final_path: old_target.clone(),
+            }],
+        };
+        assert!(preflight_proven_destination_obstruction(&req, &plan).is_err(),
+            "the other sibling's FAILED workspace must not defer refusal until extraction");
+        let second_error = publish_album_output(
+            second_stage, &second_plan, incremental_test_publish_policy(), None,
+        ).expect_err("direct publication must refuse prior-batch incumbent despite equal bytes");
+        assert!(matches!(second_error, PublishError::DestinationExists(_)), "{second_error:?}");
+        assert_eq!(std::fs::read(&old_target).unwrap(), b"prior-batch-audio");
+        assert_eq!(std::fs::read(&prior_history).unwrap(), b"previous successful conversion\n");
+        let second_fragment_path = conversion_log_fragment_dir(&coord_dir)
+            .join(fragment_file_name(&second_fragment));
+        assert!(!second_fragment_path.exists(),
+            "a refused track cannot publish a success fragment into the new batch");
+    }
+
+    #[test]
+    fn r25c_recovery_requires_matching_installed_track_fragment() {
+        let temp = tempfile::tempdir().expect("target-specific fragment recovery");
+        let output_root = temp.path().join("out");
+        let album_dir = output_root.join("Album");
+        let target = album_dir.join("02.flac");
+        let batch_id = generated_current_process_test_batch_id("r25c-target-fragment-retry");
+        let coord_dir = output_root.join(CONVERSION_LOG_BATCH_COORDINATION_DIR).join(&batch_id);
+        std::fs::create_dir_all(&album_dir).unwrap();
+        std::fs::write(&target, b"same-batch-audio").unwrap();
+        let mut fragment = fragment_test_fragment(
+            &album_dir, &batch_id, None, 2, 3, "Track 2",
+            ConversionLogTrackOutcome::Success, fragment_test_time(2),
+        );
+        fragment.batch_identity.output_album_dir = normalize_path(&coord_dir).display().to_string();
+        fragment.track.output_target = Some(path_log_value(&target));
+        let installed = conversion_log_fragment_dir(&coord_dir).join(fragment_file_name(&fragment));
+        write_fragment_json(&installed, &fragment);
+        ensure_conversion_log_batch_workspace_owned(&coord_dir, &batch_id).unwrap();
+        write_conversion_log_batch_workspace_state(
+            &coord_dir, &batch_id, CONVERSION_LOG_BATCH_WORKSPACE_STATUS_FAILED,
+        ).unwrap();
+        let (stage, plan) = incremental_fragment_test_plan(
+            temp.path(), &album_dir, "r25c-same-track-repair", &fragment,
+            Some(("02.flac", b"same-batch-audio")), b"not visible\n",
+        );
+        let mut req = log_test_request();
+        req.output_root = output_root;
+        req.album_batch = Some(AlbumBatchContext::new(
+            batch_id.clone(), 3, album_dir.clone(), temp.path().join("source"),
+        ));
+        req.album_batch_track = Some(AlbumBatchTrackContext::new(2, Some(1), 2));
+        let album_plan = AlbumPlan {
+            album_dir: album_dir.clone(),
+            album_dirs: Vec::new(),
+            entries: vec![PlannedTrackOutput {
+                track_id: req.album_batch_track.as_ref().unwrap().track_id(),
+                final_path: target.clone(),
+            }],
+        };
+        assert!(preflight_proven_destination_obstruction(&req, &album_plan).is_ok(),
+            "matching installed success fragment attests the exact unfinished track");
+        publish_album_output(stage, &plan, incremental_test_publish_policy(), None)
+            .expect("target-attested retry may complete without overwriting audio");
+        assert_eq!(std::fs::read(&target).unwrap(), b"same-batch-audio");
+    }
+
+    #[test]
+    fn r25c_multi_root_retry_preflight_requires_every_installed_target_fragment() {
+        let temp = tempfile::tempdir().expect("multi-root attestation");
+        let output_root = temp.path().join("out");
+        let first_root = output_root.join("Album (Disc 1)");
+        let second_root = output_root.join("Album (Disc 2)");
+        let batch_id = generated_current_process_test_batch_id("r25c-multi-root-proof");
+        let coord_dir = output_root.join(CONVERSION_LOG_BATCH_COORDINATION_DIR).join(&batch_id);
+        let targets = [first_root.join("01.flac"), second_root.join("01.flac")];
+        let mut entries = Vec::new();
+        let mut fragment_paths = Vec::new();
+        for (index, target) in targets.iter().enumerate() {
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(target, format!("disc-{}", index + 1)).unwrap();
+            let ordinal = u32::try_from(index + 1).unwrap();
+            let track_id = TrackId {
+                source_ordinal: ordinal,
+                disc_number: Some(ordinal),
+                track_number: 1,
+            };
+            let mut fragment = fragment_test_fragment(
+                target.parent().unwrap(), &batch_id, None, 1, 2, "Track 1",
+                ConversionLogTrackOutcome::Success, fragment_test_time(i64::from(ordinal)),
+            );
+            fragment.sort_key = ConversionLogTrackSortKey::from(&track_id);
+            fragment.batch_identity.output_album_dir = normalize_path(&coord_dir).display().to_string();
+            fragment.rendered_album_dir = Some(
+                normalize_path(target.parent().unwrap()).display().to_string(),
+            );
+            fragment.track.output_target = Some(path_log_value(target));
+            let fragment_path = conversion_log_fragment_dir(&coord_dir)
+                .join(fragment_file_name(&fragment));
+            write_fragment_json(&fragment_path, &fragment);
+            fragment_paths.push(fragment_path);
+            entries.push(PlannedTrackOutput { track_id, final_path: target.clone() });
+        }
+        ensure_conversion_log_batch_workspace_owned(&coord_dir, &batch_id).unwrap();
+        write_conversion_log_batch_workspace_state(
+            &coord_dir, &batch_id, CONVERSION_LOG_BATCH_WORKSPACE_STATUS_FAILED,
+        ).unwrap();
+        let mut req = log_test_request();
+        req.output_root = output_root;
+        req.album_batch = Some(AlbumBatchContext::new(
+            batch_id, 2, first_root.clone(), temp.path().join("source"),
+        ));
+        let plan = AlbumPlan {
+            album_dir: first_root.clone(),
+            album_dirs: vec![first_root, second_root],
+            entries,
+        };
+        assert!(preflight_proven_destination_obstruction(&req, &plan).is_ok(),
+            "recovery may reach the multi-root publisher only with every root attested");
+        std::fs::remove_file(&fragment_paths[1]).unwrap();
+        assert!(preflight_proven_destination_obstruction(&req, &plan).is_err(),
+            "an unfinished batch with one missing target fragment cannot bypass early refusal");
+    }
+
+    #[test]
+    fn r25_fail_if_exists_preflight_refuses_occupied_paths_before_extraction() {
         let temp = tempfile::tempdir().expect("preflight scratch");
         let album_dir = temp.path().join("Album");
         std::fs::create_dir_all(&album_dir).unwrap();
@@ -76601,9 +77308,17 @@ Recovered provenance
         };
         assert!(preflight_proven_destination_obstruction(&req, &plan).is_ok());
         std::fs::write(&output_file, b"possibly identical existing audio").unwrap();
-        assert!(preflight_proven_destination_obstruction(&req, &plan).is_ok(),
-            "regular existing audio is inconclusive and must reach byte-wise publish comparison");
+        assert!(preflight_proven_destination_obstruction(&req, &plan).is_err(),
+            "a fresh conversion must refuse an existing file even if its bytes might match");
         std::fs::remove_file(&output_file).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(album_dir.join("absent-target"), &output_file)
+                .expect("dangling symlink");
+            assert!(preflight_proven_destination_obstruction(&req, &plan).is_err(),
+                "dangling symlink occupies the target filename before extraction");
+            std::fs::remove_file(&output_file).unwrap();
+        }
         std::fs::create_dir(&output_file).unwrap();
         assert!(preflight_proven_destination_obstruction(&req, &plan).is_err(),
             "a planned output file cannot replace a directory under fail-if-exists");
@@ -76612,6 +77327,17 @@ Recovered provenance
         assert!(preflight_proven_destination_obstruction(&overwrite, &plan).is_ok(),
             "fail-if-exists preflight cannot redefine overwrite semantics");
         std::fs::remove_dir(&output_file).unwrap();
+        // One independent track may append a NEW filename under a published
+        // sibling folder; the folder alone is not a collision in that mode.
+        assert!(preflight_proven_destination_obstruction(&req, &plan).is_ok());
+        let mut no_log = req.clone();
+        no_log.log.write_conversion_log = false;
+        assert!(preflight_proven_destination_obstruction(&no_log, &plan).is_err(),
+            "a whole-album publish without incremental logging would collide at the root");
+        let mut multi_root = plan.clone();
+        multi_root.album_dirs = vec![album_dir.clone(), temp.path().join("Other")];
+        assert!(preflight_proven_destination_obstruction(&req, &multi_root).is_err(),
+            "a multi-root transaction cannot replace an existing root");
         std::fs::remove_dir(&album_dir).unwrap();
         std::fs::write(&album_dir, b"not a directory").unwrap();
         assert!(preflight_proven_destination_obstruction(&req, &plan).is_err());
@@ -79521,6 +80247,42 @@ mod publish_lock_soundness_tests {
             CONVERSION_LOG_BATCH_WORKSPACE_STATUS_FAILED,
             "late same-batch hooks must not resurrect a terminal failed workspace as active"
         );
+    }
+
+    #[test]
+    fn r25_publish_retry_requires_unfinished_prior_attempt_not_fresh_active_state() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().join(CONVERSION_LOG_BATCH_COORDINATION_DIR);
+        let fresh_id = generated_current_process_test_batch_id("r25-fresh-active");
+        let fresh_dir = root.join(&fresh_id);
+        ensure_conversion_log_batch_workspace_owned(&fresh_dir, &fresh_id)
+            .expect("fresh batch ownership");
+        assert!(!unfinished_conversion_log_batch_workspace(&fresh_dir, &fresh_id),
+            "a freshly active batch is not a retry authorization");
+        write_conversion_log_batch_workspace_state(
+            &fresh_dir, &fresh_id, CONVERSION_LOG_BATCH_WORKSPACE_STATUS_FAILED,
+        ).expect("record handled publish failure");
+        assert!(unfinished_conversion_log_batch_workspace(&fresh_dir, &fresh_id));
+        assert!(!unfinished_conversion_log_batch_workspace(&fresh_dir, "different-batch"));
+        std::fs::write(fresh_dir.join(CONVERSION_LOG_BATCH_COMPLETION_MARKER_FILE), b"completed")
+            .expect("completion marker");
+        assert!(!unfinished_conversion_log_batch_workspace(&fresh_dir, &fresh_id));
+
+        let crashed_id = generated_current_process_test_batch_id("r25-crashed-active");
+        let crashed_dir = root.join(&crashed_id);
+        write_test_workspace_state_with_owner(
+            &crashed_dir, &crashed_id, CONVERSION_LOG_BATCH_WORKSPACE_STATUS_ACTIVE,
+            provably_dead_local_test_owner(),
+        );
+        assert!(unfinished_conversion_log_batch_workspace(&crashed_dir, &crashed_id),
+            "dead-owner unfinished ACTIVE workspace must reach crash recovery");
+        ensure_conversion_log_batch_workspace_owned(&crashed_dir, &crashed_id)
+            .expect("take over crashed batch");
+        let state = read_conversion_log_batch_workspace_state(&crashed_dir)
+            .unwrap().expect("taken-over state");
+        assert_eq!(state.ownership_generation, 2);
+        assert!(unfinished_conversion_log_batch_workspace(&crashed_dir, &crashed_id),
+            "a proven takeover must retain retry authority");
     }
 
     #[test]

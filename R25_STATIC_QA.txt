@@ -1,0 +1,13 @@
+R25 STATIC SOURCE VERIFICATION — 2026-10-10
+PASS: Original tarball extracted and compared to modified source tree; exactly two original Rust files modified.
+PASS: git diff --check on generated patch.
+PASS: git apply --check to untouched baseline files.
+PASS: Apply generated patch to untouched baseline; byte-for-byte comparison of both edited files succeeded.
+PASS: Shared SACD conversion.log catalog selector used for origin; old disc-only presence test removed.
+PASS: Multi-root equal-byte acceptance gated to verified unfinished batch + matching fragments.
+PASS: Incremental equal-byte acceptance gated to verified unfinished batch.
+PASS: Fresh ACTIVE workspace not recognized as retry; dead local owner and FAILED state are recognized conditionally.
+PASS: Required new R25 test names and inherited R24 test declarations present.
+PASS: Preflight FailIfExists collision check present before conversion execution; symlink_metadata catches dangling symlinks.
+NOT RUN: cargo fmt; cargo test; cargo build; qualified Reference; CLI smokes; live TUI ISO/preset gesture.
+ENVIRONMENT: cargo/rustc/rustfmt/nix unavailable.

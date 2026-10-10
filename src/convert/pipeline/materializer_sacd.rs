@@ -271,14 +271,21 @@ fn album_metadata(
         }
     }
 
-    let sidecar_catalog_selected = extra.iter().any(|(key, value)| {
-        let normalized = key.chars().filter(|ch| ch.is_ascii_alphanumeric())
-            .flat_map(char::to_lowercase).collect::<String>();
-        !value.trim().is_empty() && matches!(normalized.as_str(),
-            "catno" | "catnumber" | "catalog" | "catalogid" | "catalogno"
-            | "catalognumber" | "catalogue" | "catalogueid"
-            | "catalogueno" | "cataloguenumber")
-    });
+    // Provenance follows the SAME selected entry as the conversion log,
+    // including the TOC album-before-disc fallback and sidecar aliases.
+    // Recognize an explicit sidecar override even when it uses a SACD-prefixed
+    // key that also exists in the TOC.
+    let catalog_origin = super::stages::conversion_log_catalog_number_entry(&extra)
+        .map(|(selected_key, _)| {
+            let from_sidecar = sidecar_first_track.is_some_and(|sidecar| {
+                sidecar.meta.iter().any(|(key, value)| {
+                    !is_standard_sidecar_album_key(key)
+                        && key.to_lowercase() == selected_key
+                        && !value.trim().is_empty()
+                })
+            });
+            if from_sidecar { "SACD sidecar XML" } else { "SACD disc TOC" }
+        });
     // Only label provenance for actual selected values. Later filename/folder
     // heuristics and label-dictionary enrichment may fill missing fields and
     // will then replace the origin marker at their respective boundaries.
@@ -298,9 +305,8 @@ fn album_metadata(
         ("genre", if sc_values("GENRE").is_some() { "SACD sidecar XML" }
             else { "SACD disc TOC" },
             sc_values("GENRE").is_some() || first_genre(metadata).is_some()),
-        ("catalog_number", if sidecar_catalog_selected { "SACD sidecar XML" }
-            else { "SACD disc TOC" },
-            sidecar_catalog_selected || extra.contains_key("sacd_disc_catalog_number")),
+        ("catalog_number", catalog_origin.unwrap_or("SACD disc TOC"),
+            catalog_origin.is_some()),
     ] {
         if present {
             extra.insert(format!("tonepoet_log_album_origin_{field}"), origin.to_string());
@@ -904,6 +910,61 @@ mod tests {
             Some("SACD disc TOC"),
         );
         assert!(!without_sidecar.extra.contains_key("tonepoet_log_album_origin_album"));
+    }
+
+    #[test]
+    fn r25_catalog_origin_follows_the_value_printed_by_the_conversion_log() {
+        let (mut toc, area) = composer_test_context(1);
+        // Album and disc catalog numbers are distinct TOC fields. The human
+        // renderer selects the album value first; the provenance must agree.
+        toc.master_toc.album_catalog_number = "ALBUM-CAT".to_string();
+        toc.master_toc.disc_catalog_number = "DISC-CAT".to_string();
+        let from_toc = album_metadata(&toc, &area, SacdArea::Stereo, 1, None);
+        assert_eq!(
+            super::super::stages::conversion_log_catalog_number_entry(&from_toc.extra),
+            Some(("sacd_album_catalog_number", "ALBUM-CAT")),
+        );
+        assert_eq!(from_toc.extra.get("tonepoet_log_album_origin_catalog_number")
+            .map(String::as_str), Some("SACD disc TOC"));
+
+        toc.master_toc.album_catalog_number.clear();
+        let disc_only = album_metadata(&toc, &area, SacdArea::Stereo, 1, None);
+        assert_eq!(
+            super::super::stages::conversion_log_catalog_number_entry(&disc_only.extra),
+            Some(("sacd_disc_catalog_number", "DISC-CAT")),
+        );
+        assert_eq!(disc_only.extra.get("tonepoet_log_album_origin_catalog_number")
+            .map(String::as_str), Some("SACD disc TOC"));
+
+        let sidecar = sidecar_track(&[("CATALOGNUMBER", "SC-CAT")]);
+        let from_sidecar = album_metadata(&toc, &area, SacdArea::Stereo, 1, Some(&sidecar));
+        assert_eq!(super::super::stages::conversion_log_catalog_number_entry(&from_sidecar.extra),
+            Some(("catalognumber", "SC-CAT")));
+        assert_eq!(from_sidecar.extra.get("tonepoet_log_album_origin_catalog_number")
+            .map(String::as_str), Some("SACD sidecar XML"));
+
+        let blank_sidecar = sidecar_track(&[("CATALOGNUMBER", "  ")]);
+        let ignored_blank = album_metadata(&toc, &area, SacdArea::Stereo, 1, Some(&blank_sidecar));
+        assert_eq!(ignored_blank.extra.get("tonepoet_log_album_origin_catalog_number")
+            .map(String::as_str), Some("SACD disc TOC"));
+
+        // A nonstandard sidecar can intentionally override a TOC-named extra
+        // key; the chosen value comes from the sidecar, not the TOC.
+        let override_toc = sidecar_track(&[("SACD_DISC_CATALOG_NUMBER", "OVERRIDE")]);
+        let overridden = album_metadata(&toc, &area, SacdArea::Stereo, 1, Some(&override_toc));
+        assert_eq!(super::super::stages::conversion_log_catalog_number_entry(&overridden.extra),
+            Some(("sacd_disc_catalog_number", "OVERRIDE")));
+        assert_eq!(overridden.extra.get("tonepoet_log_album_origin_catalog_number")
+            .map(String::as_str), Some("SACD sidecar XML"));
+
+        toc.master_toc.disc_catalog_number.clear();
+        let absent = album_metadata(&toc, &area, SacdArea::Stereo, 1, None);
+        assert_eq!(super::super::stages::conversion_log_catalog_number_entry(&absent.extra), None);
+        assert!(!absent.extra.contains_key("tonepoet_log_album_origin_catalog_number"));
+        let tags = authoritative_metadata_tags(&TrackMetadata::default(), &overridden);
+        assert!(tags.iter().all(|(key, _)|
+            !key.to_ascii_lowercase().contains("tonepoet_log_album_origin")),
+            "no log-only origin may leak into metadata tags");
     }
 
     #[test]
