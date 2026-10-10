@@ -1,0 +1,44 @@
+diff --git a/src/convert/pipeline/stages.rs b/src/convert/pipeline/stages.rs
+index b331164..992c490 100644
+--- a/src/convert/pipeline/stages.rs
++++ b/src/convert/pipeline/stages.rs
+@@ -77196,6 +77196,11 @@ Recovered provenance
+         let batch_id = generated_current_process_test_batch_id("r25c-target-fragment-retry");
+         let coord_dir = output_root.join(CONVERSION_LOG_BATCH_COORDINATION_DIR).join(&batch_id);
+         std::fs::create_dir_all(&album_dir).unwrap();
++        // A real batch claims its coordination workspace before publishing
++        // fragments. Otherwise this fixture fabricates unowned payload that
++        // the ownership protocol correctly refuses to adopt.
++        ensure_conversion_log_batch_workspace_owned(&coord_dir, &batch_id)
++            .expect("claim batch before installing its success fragment");
+         std::fs::write(&target, b"same-batch-audio").unwrap();
+         let mut fragment = fragment_test_fragment(
+             &album_dir, &batch_id, None, 2, 3, "Track 2",
+@@ -77205,7 +77210,6 @@ Recovered provenance
+         fragment.track.output_target = Some(path_log_value(&target));
+         let installed = conversion_log_fragment_dir(&coord_dir).join(fragment_file_name(&fragment));
+         write_fragment_json(&installed, &fragment);
+-        ensure_conversion_log_batch_workspace_owned(&coord_dir, &batch_id).unwrap();
+         write_conversion_log_batch_workspace_state(
+             &coord_dir, &batch_id, CONVERSION_LOG_BATCH_WORKSPACE_STATUS_FAILED,
+         ).unwrap();
+@@ -77242,6 +77246,11 @@ Recovered provenance
+         let second_root = output_root.join("Album (Disc 2)");
+         let batch_id = generated_current_process_test_batch_id("r25c-multi-root-proof");
+         let coord_dir = output_root.join(CONVERSION_LOG_BATCH_COORDINATION_DIR).join(&batch_id);
++        std::fs::create_dir_all(&output_root).unwrap();
++        // Own the workspace before either disc installs its success fragment.
++        // The later FAILED status then represents a genuine owned batch retry.
++        ensure_conversion_log_batch_workspace_owned(&coord_dir, &batch_id)
++            .expect("claim multi-root batch before installing fragments");
+         let targets = [first_root.join("01.flac"), second_root.join("01.flac")];
+         let mut entries = Vec::new();
+         let mut fragment_paths = Vec::new();
+@@ -77270,7 +77279,6 @@ Recovered provenance
+             fragment_paths.push(fragment_path);
+             entries.push(PlannedTrackOutput { track_id, final_path: target.clone() });
+         }
+-        ensure_conversion_log_batch_workspace_owned(&coord_dir, &batch_id).unwrap();
+         write_conversion_log_batch_workspace_state(
+             &coord_dir, &batch_id, CONVERSION_LOG_BATCH_WORKSPACE_STATUS_FAILED,
+         ).unwrap();

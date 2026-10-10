@@ -1,0 +1,27 @@
+R26 STATIC QA — 2026-10-10
+
+PASS  Intake archive inspection: 876 regular files and 1 symlink inspected.
+PASS  Exactly ONE existing source file differs from intake:
+      src/convert/pipeline/stages.rs.
+PASS  Changed source regions: the TWO named R25C test fixture bodies only.
+PASS  Both fixtures claim a generated, current-process batch workspace before
+      writing any success fragment; they transition that owned workspace to
+      FAILED after fragment publication and before positive/negative admission.
+PASS  Matching-fragment test retains positive preflight + direct-publisher retry.
+PASS  Multi-root test retains all-fragments positive preflight and one-missing
+      fragment negative preflight.
+PASS  Other R25C regression fixtures, production implementation, and
+      nonempty_unowned_workspace_cannot_be_claimed remain byte-for-byte intact.
+PASS  Previously reported album_coordination_token test module path is already
+      the corrected crate::convert::pipeline::coordination_name path in intake.
+PASS  git diff --check.
+PASS  git apply --check on untouched intake-stage source.
+PASS  git apply produces an EXACT byte-for-byte reproduction of delivered source.
+PASS  Reverse patch returns EXACT untouched intake-stage source.
+
+NOT RUN  rustc / Cargo / rustfmt / Nix absent; DNS unavailable for toolchain fetch.
+NOT RUN  Focused Rust fixtures, workspace gate, binaries, CLI smoke, SACD Reference
+         requalification and manual TUI Browse -> Convert -> preset gesture (#43).
+
+The reported intake gate (7403 passed / 3 failed) comes from the user brief,
+not from this static environment. No runtime passing result is claimed.
