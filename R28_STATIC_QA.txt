@@ -1,0 +1,25 @@
+TonePoet R28 backend-label static verification (2026-10-11)
+===========================================================
+Input archive: TonePoet_LOGGING_R28_backend_names_2026-10-11.tar.gz
+Input SHA-256: 35752ad292912150cc17b81642be2d00c1698a065e7af47f0ff1c1a164e153b1
+Authority brief SHA-256: 0cc6d135ac9f0bd6f7070bd411988f783b26b06524d217cea1c35afd4d2b0a22
+Regular files compared to original input archive: 893
+Modified existing source files: src/convert/pipeline/execution_evidence.rs (only one)
+Original regular files missing: 0
+Original regular file mode mismatches: 0
+Patch: R28_CODE_CHANGES_FROM_INPUT.patch (76 lines)
+Patch SHA-256: 5044d5d46c7b473d68d38fd142f8a7d51f14a85ae6418afae3ec453f60521c2e
+Modified source SHA-256: 01ed2e6aa062dacad835846b9b249f169c1e696792db4511a58e868ce30cca32
+Git diff --check: PASS
+Git apply --check to clean input copy: PASS
+Git apply to clean input copy and byte-for-byte comparison: PASS
+Pygments Rust lexer error tokens: 0
+Edited source delimiter stack: 0 unclosed, 0 mismatched
+Reference source lock: execution_evidence.rs is not a locked path
+Reference source lock: locked stages.rs unchanged from input; remains stale from R27C
+Reference source lock: all other directly hashed non-Cargo entries match
+New focused Rust test: r28_native_backend_labels_identify_tonepoet_without_rewriting_evidence
+New test executed: NO - no compiler/cargo
+Cargo/rustc/rustfmt/nix present: NO
+Compiled tests / formatter / workspace builds: NOT RUN
+Reference requalification / real ISO smokes / Browse UX: NOT RUN

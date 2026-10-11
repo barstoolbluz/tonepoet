@@ -349,7 +349,15 @@ impl ExecutionBackend {
                 .filter(|value| !value.trim().is_empty())
                 .map(|version| format!("{tool} {version}"))
                 .unwrap_or_else(|| tool.clone()),
-            Self::Native { implementation } => implementation.clone(),
+            // The execution record retains the implementation identity. Only
+            // the human log substitutes the author of in-process audio work
+            // for these historical, mechanism-specific backend labels.
+            Self::Native { implementation } => match implementation.as_str() {
+                "TonePoet Float64 scalar pump"
+                | "TonePoet Float64 scalar materializer"
+                | "TonePoet DSD realization" => "TonePoet".to_string(),
+                _ => implementation.clone(),
+            },
             Self::Composite { description } => description.clone(),
             Self::Unknown => "backend not recorded".to_string(),
         }
@@ -2459,6 +2467,54 @@ mod tests {
         assert!(!rendered.contains("FinalPcmContract"));
         assert!(!rendered.contains("sample_rate_hz"));
         assert!(!rendered.contains('{'));
+    }
+
+    #[test]
+    fn r28_native_backend_labels_identify_tonepoet_without_rewriting_evidence() {
+        let cases = [
+            ("TonePoet Float64 scalar pump", "Album gain"),
+            ("TonePoet Float64 scalar materializer", "Waveform gain"),
+            ("TonePoet DSD realization", "DSD reconstruction level export"),
+        ];
+        let mut evidence = TrackExecutionEvidence::default();
+        for (index, (backend, operation)) in cases.iter().enumerate() {
+            evidence.operations.push(OperationRecord::completed(
+                format!("r28-{index}"),
+                "audio_processing",
+                *operation,
+                ExecutionBackend::native(*backend),
+            ));
+        }
+
+        let forensic_before = serde_json::to_string(&evidence).expect("serialize evidence");
+        let human = render_track_processing(&evidence).join("\n");
+        for (backend, operation) in cases {
+            let expected = format!("{operation} — TonePoet");
+            assert!(human.lines().any(|line| line == expected.as_str()), "{human}");
+            assert!(!human.contains(backend), "{human}");
+            assert!(forensic_before.contains(backend), "{forensic_before}");
+        }
+        assert_eq!(
+            serde_json::to_string(&evidence).expect("serialize evidence after rendering"),
+            forensic_before
+        );
+
+        // Do not rename external tools, the qualified path, or the future
+        // extension stub. Only the three known native backend labels change.
+        for (backend, expected) in [
+            (ExecutionBackend::external("sox"), "sox"),
+            (ExecutionBackend::external("ffmpeg"), "ffmpeg"),
+            (ExecutionBackend::external("ssrc"), "ssrc"),
+            (ExecutionBackend::external("sacd-rs"), "sacd-rs"),
+            (ExecutionBackend::native("TonePoet file copy"), "TonePoet file copy"),
+            (
+                ExecutionBackend::native("TonePoet qualified Reference path"),
+                "TonePoet qualified Reference path",
+            ),
+            (ExecutionBackend::native("tonepoet::future_dsp"), "tonepoet::future_dsp"),
+        ] {
+            assert_eq!(backend.human_label(), expected);
+        }
     }
 
     #[test]
