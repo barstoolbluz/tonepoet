@@ -38,12 +38,18 @@ as delivered.
 
 ## 2. The analysis reports clipping on signals that reach 0 dBFS
 
+Observed in the field: with the true-peak margin set to 0.0000, 0.001, 0.0001
+or 0.00001, the analysis reports some number of clipped samples. Every one of
+those margins puts the converted peaks right up against full scale, and the
+analysis then counts those samples as clipped.
+
 **What we want:** content that reaches 0 dBFS without exceeding it is not
 reported as clipped. Analysis time should not appreciably increase.
 
 The clipping count in `src/tui/analyze.rs` is a sample-domain test against a
-single constant, `abs_val >= 0.9999695`, which is -0.000265 dBFS. We measured
-it on 22,050 full-scale 16-bit samples per case:
+single constant, `abs_val >= 0.9999695`, which is -0.000265 dBFS. It never sees
+the margin; the coupling is through the audio. We measured the counter on
+22,050 full-scale 16-bit samples per case:
 
 | 16-bit content | clipping_count | peak_db |
 | --- | --- | --- |
@@ -54,8 +60,8 @@ it on 22,050 full-scale 16-bit samples per case:
 
 i16 is normalised by 32768, so positive full scale is 0.9999694824 and sits
 1.76e-08 below the threshold while negative full scale is exactly 1.0. The
-count is therefore sign-asymmetric at 16-bit: in a track mastered to 0 dBFS,
-every negative full-scale sample is counted and no positive one is.
+count is therefore sign-asymmetric at 16-bit: negative full-scale samples are
+counted and positive ones are not.
 
 The constant is also depth-blind. The band it calls clipped spans about one
 code at 16-bit, 256 at 24-bit and 65,500 at 32-bit, so the number means
