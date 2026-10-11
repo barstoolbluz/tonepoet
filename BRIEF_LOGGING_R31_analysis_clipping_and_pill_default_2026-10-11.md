@@ -5,8 +5,9 @@ decimals, the `custom` pill opens an in-row editor, and unsigned input commits
 as headroom. One test fails, and a separate defect is described in item 2.
 
 This is how it reads to us from the outside. We misapprehend this codebase
-routinely; where we are wrong, trust your own reading. Both measurements below
-we ran ourselves.
+routinely; where we are wrong, trust your own reading. The measurements below
+we ran ourselves; the field report opening item 2 is the user's own
+observation, and the mechanism we offer for it is a guess.
 
 ## What is verified
 
@@ -38,18 +39,19 @@ as delivered.
 
 ## 2. The analysis reports clipping on signals that reach 0 dBFS
 
-Observed in the field: with the true-peak margin set to 0.0000, 0.001, 0.0001
-or 0.00001, the analysis reports some number of clipped samples. Every one of
-those margins puts the converted peaks right up against full scale, and the
-analysis then counts those samples as clipped.
+Observed in the field, and the whole of what is known for certain: with the
+true-peak margin set to 0.0000, 0.001, 0.0001 or 0.00001, the analysis reports
+some number of clipped samples. Our guess is that each of those margins places
+peaks against full scale, where the counter below flags them, which would make
+the margin's resolution irrelevant to the report. We have not confirmed that.
 
 **What we want:** content that reaches 0 dBFS without exceeding it is not
 reported as clipped. Analysis time should not appreciably increase.
 
 The clipping count in `src/tui/analyze.rs` is a sample-domain test against a
-single constant, `abs_val >= 0.9999695`, which is -0.000265 dBFS. It never sees
-the margin; the coupling is through the audio. We measured the counter on
-22,050 full-scale 16-bit samples per case:
+single constant, `abs_val >= 0.9999695`, which is -0.000265 dBFS. `analyze_file`
+takes a path and a sample range and nothing else, so the margin is not an input
+to it. We measured the counter on 22,050 full-scale 16-bit samples per case:
 
 | 16-bit content | clipping_count | peak_db |
 | --- | --- | --- |
