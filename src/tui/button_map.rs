@@ -54,6 +54,8 @@ pub enum TuiButton {
     TruePeakScopePill(usize),
     PcmTruePeakScanPill(usize),
     PcmTruePeakTargetField,
+    /// Open the editable PCM dBTP ceiling at its displayed row.
+    PcmTruePeakCustomPill,
     PcmGainDbField,
     NoiseShaperPill(usize),
     ModulatorOrderPill(usize),
@@ -68,6 +70,8 @@ pub enum TuiButton {
     DsdTruePeakScanPill(usize),
     DsdGainDbField,
     DsdTruePeakTargetField,
+    /// Open the editable DSD dBTP ceiling at its displayed row.
+    DsdTruePeakCustomPill,
     MergePill(usize),
     ForceEncodePill(usize),
     DiscSubfoldersPill(usize),
@@ -607,6 +611,7 @@ impl TuiButton {
             | Self::TruePeakScopePill(_)
             | Self::PcmTruePeakScanPill(_)
             | Self::PcmTruePeakTargetField
+            | Self::PcmTruePeakCustomPill
             | Self::PcmGainDbField
             | Self::NoiseShaperPill(_)
             | Self::ModulatorOrderPill(_)
@@ -621,6 +626,7 @@ impl TuiButton {
             | Self::DsdTruePeakScanPill(_)
             | Self::DsdGainDbField
             | Self::DsdTruePeakTargetField
+            | Self::DsdTruePeakCustomPill
             | Self::MergePill(_)
             | Self::ForceEncodePill(_)
             | Self::DiscSubfoldersPill(_)

@@ -24,19 +24,25 @@ use crate::error::{PlanningError, Result};
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(rename_all = "snake_case"))]
 pub enum TruePeakTargetOrigin {
+    /// Provenance absent from a legacy or unannotated request.
     #[default]
     Unknown,
+    /// The application installed its normal default ceiling.
     Default,
+    /// The user explicitly selected a ceiling.
     User,
+    /// A preset supplied the selected ceiling.
     Preset,
 }
 
 impl TruePeakTargetOrigin {
+    /// Whether a request predates explicit ceiling provenance.
     #[must_use]
     pub const fn is_unknown(&self) -> bool {
         matches!(self, Self::Unknown)
     }
 
+    /// Human-readable description of the recorded ceiling origin.
     #[must_use]
     pub const fn human_label(self) -> &'static str {
         match self {
@@ -97,6 +103,7 @@ pub struct PipelineSettings {
     /// Omitted in older requests, whose origin must not be fabricated.
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "TruePeakTargetOrigin::is_unknown"))]
     pub pcm_true_peak_target_origin: TruePeakTargetOrigin,
+    /// DSD ceiling provenance, independent of the DSD gain mode.
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "TruePeakTargetOrigin::is_unknown"))]
     pub dsd_true_peak_target_origin: TruePeakTargetOrigin,
     /// Metadata and tag behavior.

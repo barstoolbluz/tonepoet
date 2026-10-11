@@ -4990,6 +4990,11 @@ pub struct FormatState {
     pub pcm_true_peak_target_dbtp: DbNano,
     /// User/default/preset provenance of the numeric ceiling, separate from gain mode.
     pub pcm_true_peak_target_origin: tonepoet_pipeline::TruePeakTargetOrigin,
+    /// Ephemeral in-place editing state for a PCM or DSD custom ceiling.
+    /// The selected value is unchanged until a valid commit.
+    pub true_peak_target_editing: Option<FormatField>,
+    /// Uncommitted numeric draft, shared by the mutually exclusive target rows.
+    pub true_peak_target_input: crate::tui::text_input::TextInputState,
     pub pcm_fixed_gain_db: DbNano,
     pub noise_shaper: PillState<DsdNoiseShaper>,
     pub modulator_order: PillState<ModulatorOrder>,
@@ -5361,6 +5366,8 @@ impl FormatState {
             pcm_true_peak_scan_mode,
             pcm_true_peak_target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
             pcm_true_peak_target_origin: tonepoet_pipeline::TruePeakTargetOrigin::Default,
+            true_peak_target_editing: None,
+            true_peak_target_input: crate::tui::text_input::TextInputState::empty(),
             pcm_fixed_gain_db: DbNano::ZERO,
             noise_shaper,
             modulator_order,

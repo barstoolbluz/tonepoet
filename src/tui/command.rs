@@ -16385,43 +16385,28 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
             Ok(_) => app.set_status("dsd-gain-db must be between -24 and +24 dB"),
             Err(error) => app.set_status(format!("Invalid dsd-gain-db: {error}")),
         },
-        "pcm-true-peak-target" => match value.parse::<tonepoet_pipeline::DbNano>() {
-            Ok(parsed) if (tonepoet_pipeline::DbNano::MIN_NORMALIZE_TARGET..=tonepoet_pipeline::DbNano::MAX_NORMALIZE_TARGET).contains(&parsed) => {
-                if !matches!(
-                    *app.convert.format.pcm_gain_mode.selected_value(),
-                    PcmGainMode::TruePeakGuard | PcmGainMode::TruePeakNormalize
-                ) && !app.convert.format.pcm_gain_mode.select_value(&PcmGainMode::TruePeakGuard) {
-                    app.set_status("PCM true-peak gain is unavailable for the selected output");
-                    return;
+        "pcm-true-peak-target" => match super::format_interactions::parse_true_peak_target(value) {
+            Ok(parsed) => match super::format_interactions::set_true_peak_target(
+                &mut app.convert.format, crate::tui::app::FormatField::PcmTruePeakTarget, parsed,
+            ) {
+                Ok(()) => {
+                    app.preset.mark_modified();
+                    app.set_status(format!("pcm-true-peak-target = {} dBTP", parsed.render(false)));
                 }
-                app.convert.format.pcm_true_peak_target_dbtp = parsed;
-                app.convert.format.pcm_true_peak_target_origin = tonepoet_pipeline::TruePeakTargetOrigin::User;
-                app.preset.mark_modified();
-                app.set_status(format!("pcm-true-peak-target = {} dBTP", parsed.render(false)));
-            }
-            Ok(_) => app.set_status("pcm-true-peak-target must be between -12 and 0 dBTP"),
+                Err(message) => app.set_status(message),
+            },
             Err(error) => app.set_status(format!("Invalid pcm-true-peak-target: {error}")),
         },
-        "dsd-true-peak-target" => match value.parse::<tonepoet_pipeline::DbNano>() {
-            Ok(parsed) if (tonepoet_pipeline::DbNano::MIN_NORMALIZE_TARGET..=tonepoet_pipeline::DbNano::MAX_NORMALIZE_TARGET).contains(&parsed) => {
-                if *app.convert.format.dsd_pathway.selected_value()
-                    == tonepoet_pipeline::DsdSourcePathway::Reference
-                    && !app
-                        .convert
-                        .format
-                        .dsd_gain_mode
-                        .select_value(&DsdGainMode::ReferenceAuto)
-                {
-                    app.set_status("Reference true-peak gain is unavailable for the current settings");
-                    return;
+        "dsd-true-peak-target" => match super::format_interactions::parse_true_peak_target(value) {
+            Ok(parsed) => match super::format_interactions::set_true_peak_target(
+                &mut app.convert.format, crate::tui::app::FormatField::DsdTruePeakTarget, parsed,
+            ) {
+                Ok(()) => {
+                    app.preset.mark_modified();
+                    app.set_status(format!("dsd-true-peak-target = {} dBTP", parsed.render(false)));
                 }
-                app.convert.format.dsd_true_peak_target_dbtp = parsed;
-                app.convert.format.dsd_true_peak_target_origin = tonepoet_pipeline::TruePeakTargetOrigin::User;
-                app.convert.format.dsd_gain_overridden = true;
-                app.preset.mark_modified();
-                app.set_status(format!("dsd-true-peak-target = {} dBTP", parsed.render(false)));
-            }
-            Ok(_) => app.set_status("dsd-true-peak-target must be between -12 and 0 dBTP"),
+                Err(message) => app.set_status(message),
+            },
             Err(error) => app.set_status(format!("Invalid dsd-true-peak-target: {error}")),
         },
         _ => {
@@ -23810,6 +23795,33 @@ mod source_relative_set_command_tests {
             *app.convert.format.dsd_true_peak_scan_mode.selected_value(),
             tonepoet_pipeline::TruePeakScanTier::Reference
         );
+    }
+
+    #[test]
+    fn r30_set_unsigned_headroom_supports_pcm_and_dsd_without_losing_target_authority() {
+        use tonepoet_pipeline::{DbNano, TruePeakTargetOrigin};
+
+        let mut pcm = app_with_pcm_source();
+        execute_set(&mut pcm, "pcm-true-peak-target", "0.0001");
+        assert_eq!(pcm.convert.format.pcm_true_peak_target_dbtp, DbNano(-100_000));
+        assert_eq!(pcm.convert.format.pcm_true_peak_target_origin, TruePeakTargetOrigin::User);
+        let previous_gain = *pcm.convert.format.pcm_gain_mode.selected_value();
+        execute_set(&mut pcm, "pcm-true-peak-target", "+0.2");
+        assert_eq!(pcm.convert.format.pcm_true_peak_target_dbtp, DbNano(-100_000));
+        assert_eq!(*pcm.convert.format.pcm_gain_mode.selected_value(), previous_gain);
+        assert!(pcm.status_message.as_ref().is_some_and(|(text, _)| text.contains("positive dBTP")));
+        execute_set(&mut pcm, "pcm-true-peak-target", "0");
+        assert_eq!(pcm.convert.format.pcm_true_peak_target_dbtp, DbNano::ZERO);
+
+        let mut dsd = AppState::new_for_test(TonepoetConfig::default());
+        dsd.convert.format.set_source_is_dsd(true);
+        assert!(dsd.convert.format.format.select_value(&AudioFormat::Flac));
+        dsd.convert.format.apply_format_constraints();
+        execute_set(&mut dsd, "dsd-true-peak-target", "0.000000001");
+        assert_eq!(dsd.convert.format.dsd_true_peak_target_dbtp, DbNano(-1));
+        assert_eq!(dsd.convert.format.dsd_true_peak_target_origin, TruePeakTargetOrigin::User);
+        execute_set(&mut dsd, "dsd-true-peak-target", "13");
+        assert_eq!(dsd.convert.format.dsd_true_peak_target_dbtp, DbNano(-1));
     }
 }
 

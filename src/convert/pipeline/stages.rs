@@ -25833,11 +25833,17 @@ fn conversion_log_metadata_values(values: &MetadataValueList) -> Option<String> 
     }
 }
 
-// A selected ceiling is displayed in its canonical decimal form, without
-// padding or rounding away finer values accepted by DbNano.
+// A selected ceiling keeps at least two decimal places for the human log,
+// without rounding away any finer nanodecibel precision accepted by DbNano.
 fn human_log_ceiling(value: tonepoet_pipeline::DbNano) -> String {
     let exact = value.render(false);
-    exact.trim_end_matches('0').trim_end_matches('.').to_string()
+    let (whole, fraction) = exact.split_once('.').expect("DbNano renders a decimal");
+    let significant = fraction.trim_end_matches('0');
+    if significant.len() < 2 {
+        format!("{whole}.{:0<2}", significant)
+    } else {
+        format!("{whole}.{significant}")
+    }
 }
 
 fn qualified_reference_album_gain_facts(
@@ -62770,7 +62776,7 @@ mod conversion_log_tests {
             let a = successful_log_summary();
             let b = successful_log_summary();
             let album = build_conversion_log_album_presentation(&[(&first, &a), (&second, &b)], true);
-            assert!(album.section.contains(&format!("Ceiling: -0.1 dBTP ({expected})")), "{}", album.section);
+            assert!(album.section.contains(&format!("Ceiling: -0.10 dBTP ({expected})")), "{}", album.section);
             assert!(album.section.contains("Gain calculated from measured album true peak"), "{}", album.section);
             assert!(!album.section.contains("Chosen automatically"), "{}", album.section);
         }
@@ -63040,7 +63046,7 @@ mod conversion_log_tests {
             "Album gain — sox\n",
             "  Applied: +4.072834475 dB\n",
             "  Loudest true peak: -4.172834475 dBTP, across 2 tracks\n",
-            "  Ceiling: -0.1 dBTP (origin not recorded)\n",
+            "  Ceiling: -0.10 dBTP (origin not recorded)\n",
             "  Gain calculated from measured album true peak and selected ceiling\n\n",
             "Converted to PCM — sox, TonePoet qualified Reference path\n",
             "  Output: 88.2 kHz, 24-bit integer, stereo\n",
@@ -78611,10 +78617,13 @@ Recovered provenance
         let target = DbNano(-100_000_000);
         assert_eq!(gain.render(true), "+19.028069515");
         assert_eq!(peak.render(false), "-19.128079335");
-        assert_eq!(human_log_ceiling(target), "-0.1");
+        assert_eq!(human_log_ceiling(target), "-0.10");
         assert_eq!(human_log_ceiling(DbNano(-125_000_000)), "-0.125");
         assert_eq!(human_log_ceiling(DbNano(-123_456_789)), "-0.123456789");
-        assert_eq!(human_log_ceiling(DbNano(0)), "0");
+        assert_eq!(human_log_ceiling(DbNano(-12_000_000_000)), "-12.00");
+        assert_eq!(human_log_ceiling(DbNano(-100_000)), "-0.0001");
+        assert_eq!(human_log_ceiling(DbNano(-1)), "-0.000000001");
+        assert_eq!(human_log_ceiling(DbNano(0)), "0.00");
         assert_eq!(human_log_ceiling(DbNano(i64::MIN)), "-9223372036.854775808");
         assert_eq!(gain.0, 19_028_069_515, "human presentation cannot mutate stored precision");
         assert_eq!(peak.0, -19_128_079_335);

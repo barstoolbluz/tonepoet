@@ -13,7 +13,7 @@ use super::button_map::{ButtonRenderMap, MetadataFieldKind, TuiButton};
 use super::draw_footer::draw_footer;
 use super::draw_header::draw_header;
 use super::draw_metadata::{draw_metadata_pane, draw_metadata_title_bar};
-use super::draw_output::{draw_format_pane, draw_format_title_bar};
+use super::draw_output::{draw_format_pane, draw_format_title_bar, true_peak_custom_pill_offset};
 use super::draw_output_options::{
     draw_output_options_pane, draw_output_options_title_bar,
     register_output_options_mouse_targets,
@@ -339,10 +339,16 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
                 label_col,
                 TuiButton::PcmTruePeakScanPill,
             ),
-            FormatField::PcmTruePeakTarget => buttons.record_button(
-                TuiButton::PcmTruePeakTargetField,
-                ratatui::layout::Rect::new(area.x, y, area.width, 1),
-            ),
+            FormatField::PcmTruePeakTarget => {
+                buttons.record_button(TuiButton::PcmTruePeakTargetField, Rect::new(area.x, y, area.width, 1));
+                if let Some(offset) = true_peak_custom_pill_offset(
+                    state.pcm_true_peak_target_dbtp,
+                    state.true_peak_target_editing == Some(field),
+                    area.width as usize,
+                ) {
+                    buttons.record_button(TuiButton::PcmTruePeakCustomPill, Rect::new(area.x + offset, y, 8, 1));
+                }
+            }
             FormatField::NoiseShaper => register_pill_row(buttons, &state.noise_shaper, y, label_col, TuiButton::NoiseShaperPill),
             FormatField::ModulatorOrder => register_pill_row(buttons, &state.modulator_order, y, label_col, TuiButton::ModulatorOrderPill),
             FormatField::ConversionPreset => register_pill_row(buttons, &state.conversion_preset, y, label_col, TuiButton::ConversionPresetPill),
@@ -358,10 +364,16 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
                 TuiButton::DsdGainDbField,
                 ratatui::layout::Rect::new(area.x, y, area.width, 1),
             ),
-            FormatField::DsdTruePeakTarget => buttons.record_button(
-                TuiButton::DsdTruePeakTargetField,
-                ratatui::layout::Rect::new(area.x, y, area.width, 1),
-            ),
+            FormatField::DsdTruePeakTarget => {
+                buttons.record_button(TuiButton::DsdTruePeakTargetField, Rect::new(area.x, y, area.width, 1));
+                if let Some(offset) = true_peak_custom_pill_offset(
+                    state.dsd_true_peak_target_dbtp,
+                    state.true_peak_target_editing == Some(field),
+                    area.width as usize,
+                ) {
+                    buttons.record_button(TuiButton::DsdTruePeakCustomPill, Rect::new(area.x + offset, y, 8, 1));
+                }
+            }
             FormatField::Container => {
                 let containers = state.format.selected_value().available_containers();
                 let mut x = label_col;
@@ -1179,5 +1191,71 @@ mod format_render_registration_tests {
             .button_map
             .find_button_rect(&TuiButton::DsdTruePeakTargetField)
             .is_none());
+    }
+
+    #[test]
+    fn r30_pcm_and_dsd_custom_pills_have_real_hit_targets_and_inline_inputs() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        use tonepoet_pipeline::{DbNano, TruePeakTargetOrigin};
+
+        const WIDTH: u16 = 120;
+        const HEIGHT: u16 = 48;
+        let theme = crate::tui::theme::theme_by_slug(crate::tui::theme::default_theme_slug())
+            .expect("default theme");
+        for dsd in [false, true] {
+            let mut app = AppState::new_for_test(TonepoetConfig::default());
+            app.current_screen = AppScreen::Convert;
+            app.convert.focus = ConvertFocus::Format;
+            app.convert.layout = ConvertLayout::Maximized(ConvertFocus::Format);
+            app.convert.format.set_source_is_dsd(dsd);
+            assert!(app.convert.format.format.select_value(&AudioFormat::Flac));
+            app.convert.format.apply_format_constraints();
+            let (field, pill) = if dsd {
+                assert!(app.convert.format.dsd_gain_mode.select_value(&DsdGainMode::TruePeakGuard));
+                (FormatField::DsdTruePeakTarget, TuiButton::DsdTruePeakCustomPill)
+            } else {
+                assert!(app.convert.format.pcm_gain_mode.select_value(&crate::tui::app::PcmGainMode::TruePeakGuard));
+                (FormatField::PcmTruePeakTarget, TuiButton::PcmTruePeakCustomPill)
+            };
+
+            let backend = TestBackend::new(WIDTH, HEIGHT);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+            app.button_map.clear();
+            terminal.draw(|f| draw_convert_screen(f, f.size(), &mut app, theme))
+                .expect("draw true-peak target");
+            let y = rendered_row(&terminal, WIDTH, HEIGHT, "TP target");
+            let rendered = row_text(&terminal, y, WIDTH);
+            assert!(rendered.contains("-1.00 dBTP"), "minimum two-decimal display: {rendered}");
+            assert!(rendered.contains("custom"), "custom must be a visible pill: {rendered}");
+            let rect = app.button_map.find_button_rect(&pill).expect("custom pill hit region");
+            assert_eq!(rect.y, y);
+            assert_eq!(rect.width, 8);
+            assert_eq!(app.button_map.find_button_at(rect.x + 2, y), Some(pill));
+
+            let (tx, _rx) = tokio::sync::mpsc::channel(8);
+            crate::tui::keybindings::handle_mouse(&mut app, MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: rect.x + 2, row: y, modifiers: KeyModifiers::NONE,
+            }, &tx);
+            assert_eq!(app.convert.format.true_peak_target_editing, Some(field));
+            app.button_map.clear();
+            terminal.draw(|f| draw_convert_screen(f, f.size(), &mut app, theme))
+                .expect("draw active inline editor");
+            assert!(row_text(&terminal, y, WIDTH).contains("custom"));
+            assert!(app.button_map.find_button_rect(&pill).is_some(), "pill remains visible during editing");
+
+            for ch in "0.0001".chars() {
+                crate::tui::keybindings::handle_key(&mut app, KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &tx);
+            }
+            crate::tui::keybindings::handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+            assert_eq!(app.convert.format.true_peak_target_editing, None);
+            let (value, origin) = if dsd {
+                (app.convert.format.dsd_true_peak_target_dbtp, app.convert.format.dsd_true_peak_target_origin)
+            } else {
+                (app.convert.format.pcm_true_peak_target_dbtp, app.convert.format.pcm_true_peak_target_origin)
+            };
+            assert_eq!(value, DbNano(-100_000));
+            assert_eq!(origin, TruePeakTargetOrigin::User);
+        }
     }
 }

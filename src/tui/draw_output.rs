@@ -166,6 +166,8 @@ pub fn draw_format_pane(
                         w,
                         "TP target  ",
                         format_state.pcm_true_peak_target_dbtp,
+                        (format_state.true_peak_target_editing == Some(field))
+                            .then_some(&format_state.true_peak_target_input),
                         row_focused,
                         format_state.pcm_true_peak_target_is_capped(),
                         "pcm-true-peak-target",
@@ -308,6 +310,8 @@ pub fn draw_format_pane(
                         w,
                         "TP target  ",
                         format_state.dsd_true_peak_target_dbtp,
+                        (format_state.true_peak_target_editing == Some(field))
+                            .then_some(&format_state.true_peak_target_input),
                         row_focused,
                         false,
                         "dsd-true-peak-target",
@@ -559,11 +563,45 @@ fn format_title_line<'a>(border_color: ratatui::style::Color, width: usize, maxi
     Line::from(spans)
 }
 
+const TRUE_PEAK_EDITOR_WIDTH: usize = 12;
+const TRUE_PEAK_CUSTOM_PILL: &str = " custom ";
+
+/// Exact human-readable ceiling: at least two decimals, all significant
+/// nanodecimals. A numeric format specifier must not round an exact target.
+pub(super) fn true_peak_ceiling_label(value: tonepoet_pipeline::DbNano) -> String {
+    let exact = value.render(false);
+    let (whole, fraction) = exact.split_once('.').expect("DbNano renders a decimal");
+    let significant = fraction.trim_end_matches('0');
+    if significant.len() < 2 {
+        format!("{whole}.{:0<2}", significant)
+    } else {
+        format!("{whole}.{significant}")
+    }
+}
+
+/// Offset of the visible `custom` pill from the left edge of its format row.
+/// Drawing and mouse hit registration use this exact layout calculation.
+pub(super) fn true_peak_custom_pill_offset(
+    value: tonepoet_pipeline::DbNano,
+    editing: bool,
+    row_width: usize,
+) -> Option<u16> {
+    let value_width = if editing {
+        TRUE_PEAK_EDITOR_WIDTH + " dBTP".len()
+    } else {
+        true_peak_ceiling_label(value).len() + " dBTP".len()
+    };
+    let offset = "│   TP target  < ".chars().count() + value_width + " >  ".len();
+    (offset + TRUE_PEAK_CUSTOM_PILL.len() + 1 <= row_width)
+        .then_some(offset as u16)
+}
+
 fn pcm_true_peak_db_value_row(
     border_color: ratatui::style::Color,
     width: usize,
     label: &'static str,
     value: tonepoet_pipeline::DbNano,
+    edit_input: Option<&super::text_input::TextInputState>,
     focused: bool,
     lossy_capped: bool,
     custom_key: &'static str,
@@ -579,20 +617,45 @@ fn pcm_true_peak_db_value_row(
         Span::styled("│", theme.border(border_color)),
         Span::styled(format!("   {label}"), label_style),
         Span::styled("< ", control_style),
-        Span::styled(format!("{} dBTP", {
-            let exact = value.render(false);
-            exact.trim_end_matches('0').trim_end_matches('.').to_string()
-        }), control_style),
-        Span::styled(" >", control_style),
-        Span::raw("  "),
     ];
-    let hint = if lossy_capped {
+    if let Some(input) = edit_input {
+        spans.extend(super::inline_edit::render_inline_value_with_embedded_cursor(
+            input,
+            TRUE_PEAK_EDITOR_WIDTH,
+            theme,
+        ));
+        spans.push(Span::styled(" dBTP", control_style));
+    } else {
+        spans.push(Span::styled(
+            format!("{} dBTP", true_peak_ceiling_label(value)),
+            control_style,
+        ));
+    }
+    spans.push(Span::styled(" >", control_style));
+    spans.push(Span::raw("  "));
+    if true_peak_custom_pill_offset(value, edit_input.is_some(), width).is_some() {
+        let custom_style = if edit_input.is_some() {
+            Style::default()
+                .fg(theme.pill_active_fg)
+                .bg(theme.pill_active_bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(if focused { theme.text_bright } else { theme.text_muted })
+                .bg(theme.pill_dim_bg)
+                .add_modifier(Modifier::BOLD)
+        };
+        spans.push(Span::styled(TRUE_PEAK_CUSTOM_PILL, custom_style));
+    }
+    let hint = if edit_input.is_some() {
+        "  Enter: apply  Esc: cancel  unsigned = headroom".to_string()
+    } else if lossy_capped {
         format!(
-            "lossy encoder input capped at {} dBTP; custom: :set {custom_key} <dBTP>",
+            "  lossy encoder input capped at {} dBTP; :set {custom_key} <dBTP>",
             tonepoet_pipeline::PCM_TRUE_PEAK_LOSSY_MAX_TARGET_DBTP.render(true),
         )
     } else {
-        format!("0.25 dB steps; custom: :set {custom_key} <dBTP>")
+        format!("  0.25 dB steps; :set {custom_key} <dBTP>")
     };
     let room = width.saturating_sub(spans.iter().map(|span| span.width()).sum::<usize>() + 1);
     let hint = hint.chars().take(room).collect::<String>();
@@ -883,6 +946,68 @@ mod r24_deemphasis_info_affordance_tests {
                     "the guard cell must consume, not add, the existing delimiter",
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod r30_true_peak_custom_control_tests {
+    use super::*;
+    use tonepoet_pipeline::DbNano;
+
+    #[test]
+    fn r30_true_peak_labels_have_two_decimals_without_losing_nano_precision() {
+        for (value, expected) in [
+            (DbNano(-100_000_000), "-0.10"),
+            (DbNano(-12_000_000_000), "-12.00"),
+            (DbNano(-125_000_000), "-0.125"),
+            (DbNano(-100_000), "-0.0001"),
+            (DbNano(-1), "-0.000000001"),
+            (DbNano::ZERO, "0.00"),
+            (DbNano(i64::MIN), "-9223372036.854775808"),
+        ] {
+            assert_eq!(true_peak_ceiling_label(value), expected);
+        }
+    }
+
+    #[test]
+    fn r30_custom_pill_hit_offset_matches_drawn_span_for_both_display_modes() {
+        let theme = super::super::theme::theme_by_slug(
+            super::super::theme::default_theme_slug(),
+        )
+        .expect("default theme");
+        for value in [DbNano(-100_000_000), DbNano(-1)] {
+            for editing in [false, true] {
+                let input = editing.then(|| {
+                    super::super::text_input::TextInputState::new_selected(
+                        true_peak_ceiling_label(value),
+                    )
+                });
+                let line = pcm_true_peak_db_value_row(
+                    theme.border,
+                    120,
+                    "TP target  ",
+                    value,
+                    input.as_ref(),
+                    true,
+                    false,
+                    "pcm-true-peak-target",
+                    theme,
+                );
+                let pill_idx = line.spans.iter().position(|span| {
+                    span.content.as_ref() == TRUE_PEAK_CUSTOM_PILL
+                }).expect("clickable custom pill");
+                let drawn_offset: usize = line.spans[..pill_idx]
+                    .iter()
+                    .map(Span::width)
+                    .sum();
+                assert_eq!(
+                    true_peak_custom_pill_offset(value, editing, 120),
+                    Some(drawn_offset as u16),
+                );
+                assert_eq!(line.spans[pill_idx].width(), TRUE_PEAK_CUSTOM_PILL.len());
+            }
+            assert_eq!(true_peak_custom_pill_offset(value, false, 34), None);
         }
     }
 }

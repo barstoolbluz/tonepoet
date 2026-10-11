@@ -1,0 +1,54 @@
+TonePoet R30 corrective source — offline static QA — 2026-10-11
+===========================================================
+SOURCE BASELINE:
+  Input archive: TonePoet_LOGGING_R30_ceiling_two_decimals_and_custom_pill_2026-10-11.tar.gz
+  SHA256: 50192aadb4b39479cf8356aa63b48ae9934c9a32d38e56c49f9b0a18b38ee330
+  Input brief SHA256: d3d36c7ae90e8d6a75fa2af65cc112e905380340bb25688f5aafb7b56d768ca8
+  Scratch baseline Git import: f2c3891 (not equivalent to downstream SHA 572063d)
+
+CHECKS RUN:
+  PASS  git diff --check (no whitespace/conflict marker errors)
+  PASS  bash -n R30_ACCEPTANCE.sh
+  PASS  Lexical delimiter scan of 9 modified Rust files with Pygments RustLexer.
+        This tests bracket balance only, NOT Rust syntax/types/borrowing/compilation.
+  PASS  R30_FROM_R29C.patch independently applied to clean imported baseline;
+        all nine patched Rust files compared byte-for-byte to corrected source.
+  PASS  Original Reference qualification sidecars and requalification script
+        not modified (all source changes confined to nine listed Rust files).
+  PASS  Exact source checksums/inventory generated; verified using sha256sum.
+  PASS  Archive integrity check with tar -tzf (after packaging).
+
+PATCH:
+  R30_FROM_R29C.patch
+  SHA256: 2cfc7369da3aee7078db5b4a913d47f86352eb6e102b35728e261032907eaf5f
+  Size: 43939 bytes
+
+REGRESSION TESTS ADDED (SOURCE ONLY; NOT EXECUTED):
+  src/convert/pipeline/stages.rs:
+    existing r27_reference_music_gain_excludes_only_internal_protection_without_exposing_it
+  src/tui/draw_output.rs:
+    r30_true_peak_labels_have_two_decimals_without_losing_nano_precision
+    r30_custom_pill_hit_offset_matches_drawn_span_for_both_display_modes
+  src/tui/format_interactions.rs:
+    r30_unsigned_headroom_and_signed_ceilings_are_exact
+  src/tui/command.rs:
+    r30_set_unsigned_headroom_supports_pcm_and_dsd_without_losing_target_authority
+  src/tui/convert_screen.rs:
+    r30_pcm_and_dsd_custom_pills_have_real_hit_targets_and_inline_inputs
+  src/tui/keybindings.rs:
+    r30_format_custom_enter_validates_in_place_and_escape_cancels
+    r30_format_custom_mouse_blur_commits_valid_and_discards_invalid_drafts
+
+MANDATORY UNRUN GATES:
+  NOT RUN  cargo/rustc/rustfmt: absent from this container.
+  NOT RUN  Compiled focused/unit/workspace tests and release build.
+  NOT RUN  scripts/requalify_reference_r20.sh (needs compiler, tools, source lock).
+  NOT RUN  Source-lock freshness acceptance against new source hashes.
+  NOT RUN  Positive real-SACD and negative runtime-closure mismatch smokes.
+  NOT RUN  Real audio log inspection and performance check.
+
+QUALIFICATION STATUS:
+  The included four installed Reference qualification JSON sidecars predate
+  changes in source-locked stages.rs and tonepoet-pipeline/src/settings.rs.
+  Their prior certification cannot certify this candidate. No override used.
+  RELEASE HOLD until R30_ACCEPTANCE.sh passes on a configured build host.

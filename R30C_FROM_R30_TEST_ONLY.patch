@@ -1,0 +1,24 @@
+--- a/src/convert/pipeline/stages.rs
++++ b/src/convert/pipeline/stages.rs
+@@ -62775,9 +62775,9 @@
+             second.reference_ceiling_origin = Some(origin);
+             let a = successful_log_summary();
+             let b = successful_log_summary();
+             let album = build_conversion_log_album_presentation(&[(&first, &a), (&second, &b)], true);
+-            assert!(album.section.contains(&format!("Ceiling: -0.1 dBTP ({expected})")), "{}", album.section);
++            assert!(album.section.contains(&format!("Ceiling: -0.10 dBTP ({expected})")), "{}", album.section);
+             assert!(album.section.contains("Gain calculated from measured album true peak"), "{}", album.section);
+             assert!(!album.section.contains("Chosen automatically"), "{}", album.section);
+         }
+         let mut first = r27_qualified_reference_fragment(1);
+@@ -63045,9 +63045,9 @@
+             "  Tracks extracted: 2\n\n",
+             "Album gain — sox\n",
+             "  Applied: +4.072834475 dB\n",
+             "  Loudest true peak: -4.172834475 dBTP, across 2 tracks\n",
+-            "  Ceiling: -0.1 dBTP (origin not recorded)\n",
++            "  Ceiling: -0.10 dBTP (origin not recorded)\n",
+             "  Gain calculated from measured album true peak and selected ceiling\n\n",
+             "Converted to PCM — sox, TonePoet qualified Reference path\n",
+             "  Output: 88.2 kHz, 24-bit integer, stereo\n",
+             "  Dither: TPDF\n\n",

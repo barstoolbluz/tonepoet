@@ -153,6 +153,14 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
         return;
     }
 
+    if app.current_screen == AppScreen::Convert
+        && app.convert.focus == ConvertFocus::Format
+        && app.convert.format.true_peak_target_editing.is_some()
+    {
+        handle_format_true_peak_inline_edit_key(app, key);
+        return;
+    }
+
     if app.current_screen == AppScreen::Browse && app.browse_inline_edit.is_some() {
         handle_browse_inline_edit_key(app, key, tx);
         return;
@@ -847,6 +855,16 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
         }
 
         // Format pane navigation.
+        (KeyCode::Enter | KeyCode::Char('e'), KeyModifiers::NONE)
+            if app.convert.focus == ConvertFocus::Format
+                && !app.convert.is_collapsed(ConvertFocus::Format)
+                && matches!(
+                    app.convert.format.field_focus,
+                    FormatField::PcmTruePeakTarget | FormatField::DsdTruePeakTarget
+                ) =>
+        {
+            begin_format_true_peak_inline_edit(app, app.convert.format.field_focus);
+        }
         (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE)
             if app.convert.focus == ConvertFocus::Format
                 && !app.convert.is_collapsed(ConvertFocus::Format) =>
@@ -1080,6 +1098,7 @@ enum InlineEditResolution {
 fn has_active_inline_edit(app: &AppState) -> bool {
     app.convert.output_options.editing.is_some()
         || app.convert.metadata.editing.is_some()
+        || app.convert.format.true_peak_target_editing.is_some()
         || app.browse_inline_edit.is_some()
 }
 
@@ -1116,6 +1135,19 @@ fn finish_hidden_inline_edits(app: &mut AppState, tx: &mpsc::Sender<AppMessage>)
         commit_convert_metadata_inline_edit(app);
     }
 
+    if let Some(field) = app.convert.format.true_peak_target_editing {
+        let format_visible = app.current_screen == AppScreen::Convert
+            && app.convert.focus == ConvertFocus::Format
+            && !app.convert.is_collapsed(ConvertFocus::Format)
+            && app.convert.format.visible_fields(app.convert.is_maximized(ConvertFocus::Format))
+                .contains(&field);
+        if !format_visible {
+            // Never strand a numeric editor on a hidden row. A bad draft is
+            // discarded with feedback; only validated values are published.
+            commit_format_true_peak_inline_edit(app, true);
+        }
+    }
+
     if app.browse_inline_edit.is_some() && app.current_screen != AppScreen::Browse {
         commit_browse_inline_edit(app, tx);
     }
@@ -1133,11 +1165,13 @@ fn finish_active_inline_edit(
         InlineEditResolution::Commit => {
             commit_output_options_inline_edit(app);
             commit_convert_metadata_inline_edit(app);
+            commit_format_true_peak_inline_edit(app, true);
             commit_browse_inline_edit(app, tx);
         }
         InlineEditResolution::Cancel => {
             app.convert.output_options.editing = None;
             app.convert.metadata.editing = None;
+            app.convert.format.true_peak_target_editing = None;
             app.browse_inline_edit = None;
         }
     }
@@ -1158,6 +1192,21 @@ fn active_inline_edit_matches_button(app: &AppState, button: Option<&TuiButton>)
         _ => None,
     };
     if output_field.is_some() && app.convert.output_options.editing == output_field {
+        return true;
+    }
+
+    let target_editor_button = match button {
+        TuiButton::PcmTruePeakTargetField | TuiButton::PcmTruePeakCustomPill => {
+            Some(FormatField::PcmTruePeakTarget)
+        }
+        TuiButton::DsdTruePeakTargetField | TuiButton::DsdTruePeakCustomPill => {
+            Some(FormatField::DsdTruePeakTarget)
+        }
+        _ => None,
+    };
+    if target_editor_button.is_some()
+        && app.convert.format.true_peak_target_editing == target_editor_button
+    {
         return true;
     }
 
@@ -1249,6 +1298,7 @@ fn finish_inline_edit_before_focus_change(
     }
     commit_output_options_inline_edit(app);
     commit_convert_metadata_inline_edit(app);
+    commit_format_true_peak_inline_edit(app, true);
     false
 }
 
@@ -4755,6 +4805,82 @@ fn handle_output_options_inline_edit_key(app: &mut AppState, key: KeyEvent) {
     }
 }
 
+fn begin_format_true_peak_inline_edit(app: &mut AppState, field: FormatField) {
+    let current = match field {
+        FormatField::PcmTruePeakTarget => app.convert.format.pcm_true_peak_target_dbtp,
+        FormatField::DsdTruePeakTarget => app.convert.format.dsd_true_peak_target_dbtp,
+        _ => return,
+    };
+    app.convert.focus = ConvertFocus::Format;
+    app.convert.format.field_focus = field;
+    app.convert.format.true_peak_target_input = super::text_input::TextInputState::new_selected(
+        super::draw_output::true_peak_ceiling_label(current),
+    );
+    app.convert.format.true_peak_target_editing = Some(field);
+}
+
+/// Returns true only after a valid numeric value and the active gain mode
+/// have both been admitted. An invalid Enter retains the editor for repair;
+/// a focus change discards the draft but never changes conversion policy.
+fn commit_format_true_peak_inline_edit(app: &mut AppState, discard_invalid: bool) -> bool {
+    let Some(field) = app.convert.format.true_peak_target_editing else {
+        return true;
+    };
+    let raw = app.convert.format.true_peak_target_input.text.clone();
+    let label = match field {
+        FormatField::PcmTruePeakTarget => "pcm-true-peak-target",
+        FormatField::DsdTruePeakTarget => "dsd-true-peak-target",
+        _ => return false,
+    };
+    let result = super::format_interactions::parse_true_peak_target(&raw).and_then(|target| {
+        super::format_interactions::set_true_peak_target(&mut app.convert.format, field, target)
+            .map_err(|error| error.to_string())?;
+        Ok(target)
+    });
+    match result {
+        Ok(target) => {
+            app.convert.format.true_peak_target_editing = None;
+            app.preset.mark_modified();
+            app.set_status(format!("{label} = {} dBTP", target.render(false)));
+            true
+        }
+        Err(error) => {
+            if discard_invalid {
+                app.convert.format.true_peak_target_editing = None;
+                app.set_status(format!("{label}: invalid custom value not applied ({error})"));
+            } else {
+                app.set_status(format!("{label}: {error}; edit or press Esc to cancel"));
+            }
+            false
+        }
+    }
+}
+
+fn handle_format_true_peak_inline_edit_key(app: &mut AppState, key: KeyEvent) {
+    match (key.code, key.modifiers) {
+        (KeyCode::Enter, KeyModifiers::NONE) => {
+            commit_format_true_peak_inline_edit(app, false);
+        }
+        (KeyCode::Esc, _) => {
+            app.convert.format.true_peak_target_editing = None;
+        }
+        (KeyCode::Tab, KeyModifiers::NONE) => {
+            if commit_format_true_peak_inline_edit(app, false) {
+                app.convert.focus = app.convert.focus.next();
+            }
+        }
+        _ => {
+            let had_selection = app.convert.format.true_peak_target_input.has_selection();
+            let was_empty = app.convert.format.true_peak_target_input.text.is_empty();
+            let handled = super::text_input::handle_text_input_key(
+                &mut app.convert.format.true_peak_target_input,
+                &key,
+            );
+            report_scoped_text_clipboard_status(app, &key, had_selection, was_empty, handled);
+        }
+    }
+}
+
 fn handle_browse_tree_node_click(
     app: &mut AppState,
     index: usize,
@@ -5298,6 +5424,70 @@ mod inline_edit_behavior_tests {
         app.current_screen = AppScreen::Convert;
         app.convert.focus = ConvertFocus::OutputOptions;
         app
+    }
+
+    #[test]
+    fn r30_format_custom_enter_validates_in_place_and_escape_cancels() {
+        use tonepoet_pipeline::{DbNano, TruePeakTargetOrigin};
+        let (tx, _rx) = channel();
+        let mut app = convert_output_app();
+        app.convert.focus = ConvertFocus::Format;
+        app.convert.format.apply_format_constraints();
+        assert!(app.convert.format.pcm_gain_mode.select_value(&PcmGainMode::TruePeakGuard));
+        app.convert.format.field_focus = FormatField::PcmTruePeakTarget;
+
+        handle_key(&mut app, key(KeyCode::Enter), &tx);
+        assert_eq!(app.convert.format.true_peak_target_editing, Some(FormatField::PcmTruePeakTarget));
+        assert!(app.convert.format.true_peak_target_input.has_selection());
+        for ch in "0.0001".chars() {
+            handle_key(&mut app, key(KeyCode::Char(ch)), &tx);
+        }
+        handle_key(&mut app, key(KeyCode::Enter), &tx);
+        assert_eq!(app.convert.format.true_peak_target_editing, None);
+        assert_eq!(app.convert.format.pcm_true_peak_target_dbtp, DbNano(-100_000));
+        assert_eq!(app.convert.format.pcm_true_peak_target_origin, TruePeakTargetOrigin::User);
+        assert!(app.convert.format.pcm_gain_overridden);
+
+        handle_key(&mut app, key(KeyCode::Enter), &tx);
+        app.convert.format.true_peak_target_input.set_text_and_cursor("+0.25".to_string(), 5);
+        handle_key(&mut app, key(KeyCode::Enter), &tx);
+        assert_eq!(app.convert.format.pcm_true_peak_target_dbtp, DbNano(-100_000));
+        assert_eq!(app.convert.format.true_peak_target_editing, Some(FormatField::PcmTruePeakTarget));
+        assert!(app.status_message.as_ref().is_some_and(|(text, _)| text.contains("positive dBTP")));
+        handle_key(&mut app, key(KeyCode::Esc), &tx);
+        assert_eq!(app.convert.format.true_peak_target_editing, None);
+        assert_eq!(app.convert.format.pcm_true_peak_target_dbtp, DbNano(-100_000));
+    }
+
+    #[test]
+    fn r30_format_custom_mouse_blur_commits_valid_and_discards_invalid_drafts() {
+        use tonepoet_pipeline::DbNano;
+        let (tx, _rx) = channel();
+        let mut app = convert_output_app();
+        app.convert.focus = ConvertFocus::Format;
+        app.convert.format.apply_format_constraints();
+        assert!(app.convert.format.pcm_gain_mode.select_value(&PcmGainMode::TruePeakGuard));
+        begin_format_true_peak_inline_edit(&mut app, FormatField::PcmTruePeakTarget);
+        app.convert.format.true_peak_target_input.set_text_and_cursor("-0.375".to_string(), 6);
+        app.button_map.record_button(TuiButton::Pane(ConvertFocus::Source), Rect::new(2, 2, 12, 1));
+
+        handle_mouse(&mut app, MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3, row: 2, modifiers: KeyModifiers::NONE,
+        }, &tx);
+        assert_eq!(app.convert.format.pcm_true_peak_target_dbtp, DbNano(-375_000_000));
+        assert_eq!(app.convert.format.true_peak_target_editing, None);
+        assert_eq!(app.convert.focus, ConvertFocus::Source);
+
+        begin_format_true_peak_inline_edit(&mut app, FormatField::PcmTruePeakTarget);
+        app.convert.format.true_peak_target_input.set_text_and_cursor("13".to_string(), 2);
+        handle_mouse(&mut app, MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3, row: 2, modifiers: KeyModifiers::NONE,
+        }, &tx);
+        assert_eq!(app.convert.format.pcm_true_peak_target_dbtp, DbNano(-375_000_000));
+        assert_eq!(app.convert.format.true_peak_target_editing, None);
+        assert!(app.status_message.as_ref().is_some_and(|(text, _)| text.contains("not applied")));
     }
 
     fn browse_app_with_disc_directory(
@@ -71965,6 +72155,12 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             }
 
             // ── Convert screen: format pane pills ──
+            TuiButton::PcmTruePeakCustomPill => {
+                begin_format_true_peak_inline_edit(app, FormatField::PcmTruePeakTarget);
+            }
+            TuiButton::DsdTruePeakCustomPill => {
+                begin_format_true_peak_inline_edit(app, FormatField::DsdTruePeakTarget);
+            }
             TuiButton::FormatPill(_)
             | TuiButton::RatePill(_)
             | TuiButton::DepthPill(_)

@@ -6,6 +6,84 @@
 
 use super::app::{ConvertState, FormatField, FormatState};
 use super::button_map::TuiButton;
+use tonepoet_pipeline::{DbNano, TruePeakTargetOrigin};
+
+/// Parse an interactive true-peak ceiling. An unsigned positive decimal means
+/// headroom *below* 0 dBTP; an explicit minus is already a signed ceiling.
+/// Keep `+` explicit rather than silently accepting a positive dBTP ceiling.
+/// Zero remains valid, as it was before this interaction was introduced.
+pub(super) fn parse_true_peak_target(raw: &str) -> Result<DbNano, String> {
+    let raw = raw.trim();
+    let parsed = raw.parse::<DbNano>()?;
+    if parsed.0 > 0 && raw.starts_with('+') {
+        return Err("a positive dBTP ceiling is not supported; omit '+' for headroom below zero, or use '-'".to_string());
+    }
+    let target = if parsed.0 > 0 { DbNano(-parsed.0) } else { parsed };
+    if !(DbNano::MIN_NORMALIZE_TARGET..=DbNano::MAX_NORMALIZE_TARGET).contains(&target) {
+        return Err("true-peak headroom must be between 0 and 12 dB (ceiling -12 through 0 dBTP)".to_string());
+    }
+    Ok(target)
+}
+
+/// Shared user-setting path for both `:set` and the in-place custom editor.
+/// Validation precedes every state mutation; failed admission retains the
+/// selected gain mode, value, and provenance intact.
+pub(super) fn set_true_peak_target(
+    format: &mut FormatState,
+    field: FormatField,
+    target: DbNano,
+) -> Result<(), &'static str> {
+    if !(DbNano::MIN_NORMALIZE_TARGET..=DbNano::MAX_NORMALIZE_TARGET).contains(&target) {
+        return Err("true-peak ceiling must be between -12 and 0 dBTP");
+    }
+    match field {
+        FormatField::PcmTruePeakTarget => {
+            if !matches!(
+                *format.pcm_gain_mode.selected_value(),
+                super::app::PcmGainMode::TruePeakGuard | super::app::PcmGainMode::TruePeakNormalize
+            ) && !format.pcm_gain_mode.select_value(&super::app::PcmGainMode::TruePeakGuard) {
+                return Err("PCM true-peak gain is unavailable for the selected output");
+            }
+            format.pcm_true_peak_target_dbtp = target;
+            format.pcm_true_peak_target_origin = TruePeakTargetOrigin::User;
+            format.pcm_gain_overridden = true;
+        }
+        FormatField::DsdTruePeakTarget => {
+            if *format.dsd_pathway.selected_value() == tonepoet_pipeline::DsdSourcePathway::Reference
+                && !format.dsd_gain_mode.select_value(&super::app::DsdGainMode::ReferenceAuto)
+            {
+                return Err("Reference true-peak gain is unavailable for the current settings");
+            }
+            format.dsd_true_peak_target_dbtp = target;
+            format.dsd_true_peak_target_origin = TruePeakTargetOrigin::User;
+            format.dsd_gain_overridden = true;
+        }
+        _ => return Err("not a true-peak ceiling control"),
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod r30_tests {
+    use super::*;
+
+    #[test]
+    fn r30_unsigned_headroom_and_signed_ceilings_are_exact() {
+        for (input, expected) in [
+            ("0.0001", -100_000),
+            ("-0.0001", -100_000),
+            ("0.000000001", -1),
+            ("0", 0),
+            ("-12", -12_000_000_000),
+            ("+0", 0),
+        ] {
+            assert_eq!(parse_true_peak_target(input).unwrap(), DbNano(expected), "{input}");
+        }
+        for input in ["+0.0001", "12.000000001", "-12.000000001", "12.1", "x", "-", "0.0000000001"] {
+            assert!(parse_true_peak_target(input).is_err(), "{input} must be refused");
+        }
+    }
+}
 
 /// Apply a keyboard-style next/previous action to the focused format row.
 pub fn handle_format_row_step(format: &mut FormatState, forward: bool, source_bits: Option<u32>, source_rate: Option<u32>) {
