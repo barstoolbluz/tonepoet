@@ -54,8 +54,8 @@ it on 22,050 full-scale 16-bit samples per case:
 
 i16 is normalised by 32768, so positive full scale is 0.9999694824 and sits
 1.76e-08 below the threshold while negative full scale is exactly 1.0. The
-count therefore appears sign-asymmetric at 16-bit, and a track mastered to 0
-dBFS reads as fully clipped.
+count is therefore sign-asymmetric at 16-bit: in a track mastered to 0 dBFS,
+every negative full-scale sample is counted and no positive one is.
 
 The constant is also depth-blind. The band it calls clipped spans about one
 code at 16-bit, 256 at 24-bit and 65,500 at 32-bit, so the number means
