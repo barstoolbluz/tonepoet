@@ -15821,7 +15821,7 @@ fn execute_rename(app: &mut AppState, new_name: &str, tx: &mpsc::Sender<AppMessa
 fn execute_set(app: &mut AppState, key: &str, value: &str) {
     if key.is_empty() {
         app.set_status(
-            "Usage: :set <key> <value>  (format, rate, depth, dither, rg, dsd-path, dsd-reconstruction, dsd-lowpass, dsd-profile, dsd-export-level, dsd-gain, dsd-true-peak-target, dsd-true-peak-scope, dsd-true-peak-scan, dsd-gain-db, verification)",
+            "Usage: :set <key> <value>  (format, rate, depth, dither, rg, dsd-path, dsd-reconstruction, dsd-lowpass, dsd-profile, dsd-export-level, dsd-gain, pcm-true-peak-target, dsd-true-peak-target, dsd-true-peak-scope, dsd-true-peak-scan, dsd-gain-db, verification)",
         );
         return;
     }
@@ -15935,6 +15935,12 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
                 app.set_status(format!(
                     "dsd-true-peak-scan = {}",
                     app.convert.format.dsd_true_peak_scan_mode.selected_label()
+                ));
+            }
+            "pcm-true-peak-target" => {
+                app.set_status(format!(
+                    "pcm-true-peak-target = {} dBTP",
+                    app.convert.format.pcm_true_peak_target_dbtp.render(false)
                 ));
             }
             "dsd-true-peak-target" => {
@@ -16379,6 +16385,23 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
             Ok(_) => app.set_status("dsd-gain-db must be between -24 and +24 dB"),
             Err(error) => app.set_status(format!("Invalid dsd-gain-db: {error}")),
         },
+        "pcm-true-peak-target" => match value.parse::<tonepoet_pipeline::DbNano>() {
+            Ok(parsed) if (tonepoet_pipeline::DbNano::MIN_NORMALIZE_TARGET..=tonepoet_pipeline::DbNano::MAX_NORMALIZE_TARGET).contains(&parsed) => {
+                if !matches!(
+                    *app.convert.format.pcm_gain_mode.selected_value(),
+                    PcmGainMode::TruePeakGuard | PcmGainMode::TruePeakNormalize
+                ) && !app.convert.format.pcm_gain_mode.select_value(&PcmGainMode::TruePeakGuard) {
+                    app.set_status("PCM true-peak gain is unavailable for the selected output");
+                    return;
+                }
+                app.convert.format.pcm_true_peak_target_dbtp = parsed;
+                app.convert.format.pcm_true_peak_target_origin = tonepoet_pipeline::TruePeakTargetOrigin::User;
+                app.preset.mark_modified();
+                app.set_status(format!("pcm-true-peak-target = {} dBTP", parsed.render(false)));
+            }
+            Ok(_) => app.set_status("pcm-true-peak-target must be between -12 and 0 dBTP"),
+            Err(error) => app.set_status(format!("Invalid pcm-true-peak-target: {error}")),
+        },
         "dsd-true-peak-target" => match value.parse::<tonepoet_pipeline::DbNano>() {
             Ok(parsed) if (tonepoet_pipeline::DbNano::MIN_NORMALIZE_TARGET..=tonepoet_pipeline::DbNano::MAX_NORMALIZE_TARGET).contains(&parsed) => {
                 if *app.convert.format.dsd_pathway.selected_value()
@@ -16393,6 +16416,7 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
                     return;
                 }
                 app.convert.format.dsd_true_peak_target_dbtp = parsed;
+                app.convert.format.dsd_true_peak_target_origin = tonepoet_pipeline::TruePeakTargetOrigin::User;
                 app.convert.format.dsd_gain_overridden = true;
                 app.preset.mark_modified();
                 app.set_status(format!("dsd-true-peak-target = {} dBTP", parsed.render(false)));
@@ -16402,7 +16426,7 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
         },
         _ => {
             app.set_status(format!(
-                "Unknown setting: {}. Try: format, rate, depth, dither, rg, dsd-path, dsd-reconstruction, dsd-lowpass, dsd-profile, dsd-export-level, dsd-gain, dsd-true-peak-target, dsd-true-peak-scope, dsd-true-peak-scan, dsd-gain-db",
+                "Unknown setting: {}. Try: format, rate, depth, dither, rg, dsd-path, dsd-reconstruction, dsd-lowpass, dsd-profile, dsd-export-level, dsd-gain, pcm-true-peak-target, dsd-true-peak-target, dsd-true-peak-scope, dsd-true-peak-scan, dsd-gain-db",
                 key
             ));
         }

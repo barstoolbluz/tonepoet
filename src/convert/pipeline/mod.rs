@@ -30,6 +30,7 @@ pub(crate) mod baseline;
 pub(crate) mod chapter_write;
 pub mod errors;
 pub mod execution_evidence;
+pub(crate) mod stored_audio_checksum;
 pub mod label_resolver;
 pub mod manifest;
 pub mod manifest_builder;

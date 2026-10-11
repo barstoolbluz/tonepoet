@@ -102,6 +102,8 @@ fn rich_common_settings() -> PipelineSettings {
         },
         dsd: DsdSettings::default(),
         pcm_true_peak: Default::default(),
+        pcm_true_peak_target_origin: tonepoet_pipeline::TruePeakTargetOrigin::Unknown,
+        dsd_true_peak_target_origin: tonepoet_pipeline::TruePeakTargetOrigin::Unknown,
         metadata: MetadataSettings {
             transfer_tags: true,
             preserve_artwork: false,

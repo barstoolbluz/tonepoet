@@ -745,10 +745,23 @@ pub fn render_track_processing(evidence: &TrackExecutionEvidence) -> Vec<String>
 
 #[must_use]
 pub fn render_track_artifact_work(evidence: &TrackExecutionEvidence) -> Vec<String> {
+    render_track_artifact_work_filtered(evidence, false)
+}
+
+/// Human-log projection of ancillary artifact work. The completed output
+/// package is represented once by the delivered path/writer line; no other
+/// artifact operation or structured receipt is suppressed.
+#[must_use]
+pub fn render_other_track_artifact_work(evidence: &TrackExecutionEvidence) -> Vec<String> {
+    render_track_artifact_work_filtered(evidence, true)
+}
+
+fn render_track_artifact_work_filtered(evidence: &TrackExecutionEvidence, omit_package: bool) -> Vec<String> {
     let mut lines = Vec::new();
     for operation in evidence
         .delivered_operations()
         .filter(|operation| operation.domain == OperationDomain::Artifact)
+        .filter(|operation| !omit_package || operation.kind != "package_output")
         .filter(|operation| {
             !matches!(&operation.backend, ExecutionBackend::Unknown)
                 || !operation.parameters.is_empty()

@@ -18,6 +18,36 @@ use crate::dsd_reference::{
 };
 use crate::error::{PlanningError, Result};
 
+/// Provenance of a selected true-peak ceiling, independent of how gain is
+/// calculated. This is presentation metadata, not an audio-processing input.
+/// `Unknown` is the safe interpretation of requests predating this field.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(rename_all = "snake_case"))]
+pub enum TruePeakTargetOrigin {
+    #[default]
+    Unknown,
+    Default,
+    User,
+    Preset,
+}
+
+impl TruePeakTargetOrigin {
+    #[must_use]
+    pub const fn is_unknown(&self) -> bool {
+        matches!(self, Self::Unknown)
+    }
+
+    #[must_use]
+    pub const fn human_label(self) -> &'static str {
+        match self {
+            Self::Default => "default target",
+            Self::User => "set explicitly",
+            Self::Preset => "from preset",
+            Self::Unknown => "origin not recorded",
+        }
+    }
+}
+
 /// Single source of truth for all conversion parameters.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -63,6 +93,12 @@ pub struct PipelineSettings {
     /// True-peak measurement and linear-gain policy for ordinary PCM conversions.
     #[cfg_attr(feature = "serde", serde(default))]
     pub pcm_true_peak: PcmTruePeakGainSettings,
+    /// Presentation-only origins; never inferred from numeric equality with a default.
+    /// Omitted in older requests, whose origin must not be fabricated.
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "TruePeakTargetOrigin::is_unknown"))]
+    pub pcm_true_peak_target_origin: TruePeakTargetOrigin,
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "TruePeakTargetOrigin::is_unknown"))]
+    pub dsd_true_peak_target_origin: TruePeakTargetOrigin,
     /// Metadata and tag behavior.
     pub metadata: MetadataSettings,
     /// Post-encode verification behavior.
@@ -93,6 +129,8 @@ impl Default for PipelineSettings {
             soxr_resampler: SoxrResamplerSettings::default(),
             dsd: DsdSettings::default(),
             pcm_true_peak: PcmTruePeakGainSettings::default(),
+            pcm_true_peak_target_origin: TruePeakTargetOrigin::Unknown,
+            dsd_true_peak_target_origin: TruePeakTargetOrigin::Unknown,
             metadata: MetadataSettings::default(),
             verification: VerificationSettings::default(),
             replay_gain: ReplayGainSettings::default(),
@@ -927,6 +965,11 @@ impl Default for SampleGainPolicy {
 }
 
 impl SampleGainPolicy {
+    /// Grid for the PCM and DSD true-peak ceiling selectors. Custom values
+    /// remain representable at DbNano precision; this does not restrict the
+    /// settings schema or the certified measurement algorithm.
+    pub const TARGET_SELECT_STEP: DbNano = DbNano(250_000_000);
+
     /// Construct PCM Guard with the raw PCM defaults.
     #[must_use]
     pub const fn pcm_guard_default() -> Self {

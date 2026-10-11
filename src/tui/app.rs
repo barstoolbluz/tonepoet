@@ -4988,6 +4988,8 @@ pub struct FormatState {
     pub pcm_true_peak_scope: PillState<TruePeakScope>,
     pub pcm_true_peak_scan_mode: PillState<TruePeakScanTier>,
     pub pcm_true_peak_target_dbtp: DbNano,
+    /// User/default/preset provenance of the numeric ceiling, separate from gain mode.
+    pub pcm_true_peak_target_origin: tonepoet_pipeline::TruePeakTargetOrigin,
     pub pcm_fixed_gain_db: DbNano,
     pub noise_shaper: PillState<DsdNoiseShaper>,
     pub modulator_order: PillState<ModulatorOrder>,
@@ -5009,6 +5011,7 @@ pub struct FormatState {
     pub dsd_true_peak_scan_mode: PillState<TruePeakScanTier>,
     /// Certified Custom/Reference DSD true-peak target in dBTP.
     pub dsd_true_peak_target_dbtp: DbNano,
+    pub dsd_true_peak_target_origin: tonepoet_pipeline::TruePeakTargetOrigin,
     /// Fixed DSD-to-PCM gain in dB.
     pub dsd_gain_db: DbNano,
     /// Whether the currently previewed source is DSD. Drives visibility and
@@ -5357,6 +5360,7 @@ impl FormatState {
             pcm_true_peak_scope,
             pcm_true_peak_scan_mode,
             pcm_true_peak_target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            pcm_true_peak_target_origin: tonepoet_pipeline::TruePeakTargetOrigin::Default,
             pcm_fixed_gain_db: DbNano::ZERO,
             noise_shaper,
             modulator_order,
@@ -5370,6 +5374,7 @@ impl FormatState {
             dsd_true_peak_scope,
             dsd_true_peak_scan_mode,
             dsd_true_peak_target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            dsd_true_peak_target_origin: tonepoet_pipeline::TruePeakTargetOrigin::Default,
             dsd_gain_db: DbNano(0),
             source_is_dsd: false,
             source_pcm_float_bits: None,
@@ -6261,6 +6266,7 @@ impl FormatState {
     pub(crate) fn apply_reference_gain_defaults(&mut self) {
         self.dsd_gain_mode.select_value(&DsdGainMode::ReferenceAuto);
         self.dsd_true_peak_target_dbtp = DbNano::DEFAULT_REFERENCE_TRUE_PEAK_TARGET;
+        self.dsd_true_peak_target_origin = tonepoet_pipeline::TruePeakTargetOrigin::Default;
         self.dsd_true_peak_scope.select_value(&TruePeakScope::Album);
         self.dsd_true_peak_scan_mode.select_value(&TruePeakScanTier::Standard);
     }
@@ -6293,6 +6299,12 @@ impl FormatState {
         }
         if row == FormatField::Resampler {
             self.resampler_overridden = true;
+        }
+        if row == FormatField::PcmTruePeakTarget {
+            self.pcm_true_peak_target_origin = tonepoet_pipeline::TruePeakTargetOrigin::User;
+        }
+        if row == FormatField::DsdTruePeakTarget {
+            self.dsd_true_peak_target_origin = tonepoet_pipeline::TruePeakTargetOrigin::User;
         }
         if matches!(
             row,
@@ -7259,8 +7271,21 @@ fn clamp_pcm_true_peak_target(value: DbNano) -> DbNano {
     ))
 }
 
-fn step_pcm_true_peak_target(value: &mut DbNano, delta_nano: i64) {
-    *value = clamp_pcm_true_peak_target(DbNano(value.0.saturating_add(delta_nano)));
+fn step_pcm_true_peak_target(value: &mut DbNano, direction: i8) {
+    // Move on the 0.25 dB grid, even when the starting value was entered
+    // through the custom decimal command or restored from an old preset.
+    // Thus -0.10 goes to 0.00 or -0.25, not to +0.15 or -0.35.
+    let current = clamp_pcm_true_peak_target(*value).0;
+    let step = tonepoet_pipeline::SampleGainPolicy::TARGET_SELECT_STEP.0;
+    let remainder = current.rem_euclid(step);
+    let delta = if direction > 0 {
+        if remainder == 0 { step } else { step - remainder }
+    } else if remainder == 0 {
+        -step
+    } else {
+        -remainder
+    };
+    *value = clamp_pcm_true_peak_target(DbNano(current.saturating_add(delta)));
 }
 
 fn clamp_dsd_to_pcm_gain_db(value: DbNano) -> DbNano {
@@ -7463,7 +7488,7 @@ impl FocusedPill<'_> {
             Self::PcmTruePeakScan(p) => p.select_next(),
             Self::PcmTruePeakTarget { target_dbtp, gain_mode } => {
                 preserve_pcm_true_peak_mode(gain_mode);
-                step_pcm_true_peak_target(*target_dbtp, 50_000_000);
+                step_pcm_true_peak_target(*target_dbtp, 1);
             }
             Self::NoiseShaper(p) => p.select_next(),
             Self::ModulatorOrder(p) => p.select_next(),
@@ -7478,7 +7503,7 @@ impl FocusedPill<'_> {
             Self::DsdTruePeakScan(p) => p.select_next(),
             Self::DsdTruePeakTarget { target_dbtp, gain_mode } => {
                 preserve_dsd_true_peak_mode(gain_mode);
-                step_pcm_true_peak_target(*target_dbtp, 50_000_000);
+                step_pcm_true_peak_target(*target_dbtp, 1);
             }
             Self::DsdGainDb { gain_db } => {
                 step_dsd_to_pcm_gain_db(*gain_db, DSD_TO_PCM_GAIN_DB_STEP_NANO);
@@ -7503,7 +7528,7 @@ impl FocusedPill<'_> {
             Self::PcmTruePeakScan(p) => p.select_prev(),
             Self::PcmTruePeakTarget { target_dbtp, gain_mode } => {
                 preserve_pcm_true_peak_mode(gain_mode);
-                step_pcm_true_peak_target(*target_dbtp, -50_000_000);
+                step_pcm_true_peak_target(*target_dbtp, -1);
             }
             Self::NoiseShaper(p) => p.select_prev(),
             Self::ModulatorOrder(p) => p.select_prev(),
@@ -7518,7 +7543,7 @@ impl FocusedPill<'_> {
             Self::DsdTruePeakScan(p) => p.select_prev(),
             Self::DsdTruePeakTarget { target_dbtp, gain_mode } => {
                 preserve_dsd_true_peak_mode(gain_mode);
-                step_pcm_true_peak_target(*target_dbtp, -50_000_000);
+                step_pcm_true_peak_target(*target_dbtp, -1);
             }
             Self::DsdGainDb { gain_db } => {
                 step_dsd_to_pcm_gain_db(*gain_db, -DSD_TO_PCM_GAIN_DB_STEP_NANO);
@@ -20180,7 +20205,8 @@ mod dsd_gain_format_state_tests {
         state.field_focus = FormatField::DsdTruePeakTarget;
         state.select_focused_next(None, None);
         assert_eq!(*state.dsd_gain_mode.selected_value(), DsdGainMode::TruePeakGuard);
-        assert_eq!(state.dsd_true_peak_target_dbtp, "-0.050000000".parse().unwrap());
+        assert_eq!(state.dsd_true_peak_target_dbtp, DbNano::ZERO);
+        assert_eq!(state.dsd_true_peak_target_origin, tonepoet_pipeline::TruePeakTargetOrigin::User);
     }
 
     #[test]
@@ -20196,7 +20222,7 @@ mod dsd_gain_format_state_tests {
         state.field_focus = FormatField::DsdTruePeakTarget;
         state.select_focused_prev(None, None);
         assert_eq!(*state.dsd_gain_mode.selected_value(), DsdGainMode::ReferenceAuto);
-        assert_eq!(state.dsd_true_peak_target_dbtp, "-1.050000000".parse().unwrap());
+        assert_eq!(state.dsd_true_peak_target_dbtp, "-1.250000000".parse().unwrap());
     }
 
     #[test]
@@ -24425,5 +24451,31 @@ mod browse_convert_expansion_lifecycle_tests {
         assert!(app.cancel_browse_convert_expansion());
         assert!(cancel.is_cancelled());
         assert!(!app.browse_convert_expansion_pending_for(generation, &request));
+    }
+}
+
+#[cfg(test)]
+mod r29_shared_ceiling_grid_tests {
+    use super::*;
+
+    #[test]
+    fn quarter_db_grid_is_bounded_and_snaps_custom_values() {
+        let cases = [
+            ("-0.100000000", 1, "0.000000000"),
+            ("-0.100000000", -1, "-0.250000000"),
+            ("-1.000000000", 1, "-0.750000000"),
+            ("-1.000000000", -1, "-1.250000000"),
+            ("-0.250000001", 1, "-0.250000000"),
+            ("-0.250000001", -1, "-0.500000000"),
+            ("-12.000000000", -1, "-12.000000000"),
+            ("0.000000000", 1, "0.000000000"),
+        ];
+        for (start, direction, expected) in cases {
+            let mut value = start.parse().unwrap();
+            step_pcm_true_peak_target(&mut value, direction);
+            assert_eq!(value, expected.parse().unwrap(), "from {start} in direction {direction}");
+        }
+        assert_eq!(tonepoet_pipeline::SampleGainPolicy::TARGET_SELECT_STEP,
+            tonepoet_pipeline::DbNano(250_000_000));
     }
 }

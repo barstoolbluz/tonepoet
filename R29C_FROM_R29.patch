@@ -1,0 +1,333 @@
+diff --git a/src/convert/pipeline/stages.rs b/src/convert/pipeline/stages.rs
+index 6b9cfe5..ee0c40e 100644
+--- a/src/convert/pipeline/stages.rs
++++ b/src/convert/pipeline/stages.rs
+@@ -16999,6 +16999,11 @@ struct ConversionLogTrackFragment {
+     warnings: Vec<String>,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     output_target: Option<String>,
++    /// Presentation-only attribution from the completed Reference package or
++    /// direct Wave64 terminal and its linked, successful command transcript.
++    /// Older fragments omit it; forensic records remain untouched.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    reference_delivery_description: Option<String>,
+     /// Encoder-authored audio checksum read from the completed staged file,
+     /// never computed from decoded audio or inferred from file content.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+@@ -17531,6 +17536,17 @@ fn structured_conversion_log_track_fragment(
+         source_audio: prepared.map(source_audio_description),
+         warnings: prepared.map(|track| track.warnings.clone()).unwrap_or_default(),
+         output_target: artifact.map(|artifact| path_log_value(&artifact.final_path)),
++        reference_delivery_description: if matches!(record.outcome, TrackOutcome::Ok) {
++            artifact.and_then(|artifact| {
++                completed_reference_delivery_description(
++                    &record.execution_evidence,
++                    &record.commands,
++                    &artifact.staged_path,
++                )
++            })
++        } else {
++            None
++        },
+         stored_audio_md5: if matches!(record.outcome, TrackOutcome::Ok) {
+             artifact.and_then(|artifact| stored_audio_md5_for_artifact(artifact, req))
+         } else {
+@@ -17630,6 +17646,7 @@ fn render_structured_conversion_log_track_fragment(
+         fragment.output_target.as_deref(),
+         &fragment.execution_evidence,
+         summary.outcome == ConversionLogTrackOutcome::Success,
++        fragment.reference_delivery_description.as_deref(),
+     );
+     push_optional_kv_line(&mut log, "  Stored audio MD5", fragment.stored_audio_md5.as_deref());
+ 
+@@ -24260,11 +24277,21 @@ fn append_track_log(
+         }
+     }
+     if let Some(artifact) = artifact {
++        let reference_delivery = if matches!(record.outcome, TrackOutcome::Ok) {
++            completed_reference_delivery_description(
++                &record.execution_evidence,
++                &record.commands,
++                &artifact.staged_path,
++            )
++        } else {
++            None
++        };
+         render_written_output(
+             log,
+             Some(&path_log_value(&artifact.final_path)),
+             &record.execution_evidence,
+             matches!(record.outcome, TrackOutcome::Ok),
++            reference_delivery.as_deref(),
+         );
+         if matches!(record.outcome, TrackOutcome::Ok) {
+             if let Some(md5) = stored_audio_md5_for_artifact(artifact, req) {
+@@ -25661,6 +25688,88 @@ fn completed_output_writer(evidence: &TrackExecutionEvidence) -> Option<String>
+     }
+ }
+ 
++/// The qualified Reference execution binds each performed package/terminal
++/// to physical command indices. For a single command it is the writer; for
++/// the certified two-process SoX -> FFmpeg route the final *consumer* writes
++/// the file. Never use an unlinked/planned invocation, a probe, or a failed
++/// command to infer an encoder. Indices include any preparation-command offset.
++fn completed_reference_command_writer(
++    operation: &OperationRecord,
++    commands: &[CommandRecord],
++) -> Option<ToolBinary> {
++    let completed = |index: usize| {
++        commands.get(index).filter(|command| {
++            matches!(command.exit, Some(super::tool::ProcessExit::Code(0)))
++        })
++    };
++    match operation.invocation_indices.as_slice() {
++        [index] => {
++            let writer = completed(*index)?;
++            matches!(writer.binary, ToolBinary::Ffmpeg | ToolBinary::Sox)
++                .then_some(writer.binary)
++        }
++        [producer_index, consumer_index] if producer_index < consumer_index => {
++            let producer = completed(*producer_index)?;
++            let consumer = completed(*consumer_index)?;
++            (producer.binary == ToolBinary::Sox && consumer.binary == ToolBinary::Ffmpeg)
++                .then_some(consumer.binary)
++        }
++        _ => None,
++    }
++}
++
++/// Human-only output attribution from completed, linked Reference receipts.
++/// Physical output identity must match the staged file before publication.
++/// A terminal is a *delivered writer* only when no separate package exists
++/// and its QPCM output is the delivered Wave64 file itself.
++fn completed_reference_delivery_description(
++    evidence: &TrackExecutionEvidence,
++    commands: &[CommandRecord],
++    staged_path: &Path,
++) -> Option<String> {
++    let mut packages = evidence.delivered_operations()
++        .filter(|operation| operation.kind == "package_output");
++    if let Some(package) = packages.next() {
++        if packages.next().is_some()
++            || package.id != "reference-package-output"
++            || package.domain != OperationDomain::Artifact
++            || !matches!(package.backend, ExecutionBackend::Unknown)
++            || !package.outputs.iter().any(|output| output.path.as_deref() == Some(staged_path))
++        {
++            return None;
++        }
++        let writer = completed_reference_command_writer(package, commands)?;
++        let format = completed_output_writer(evidence)?;
++        // Reference packaging records a format but no forensic backend.
++        // Do not double-credit another recorded encoder or writer.
++        if format.contains(';') {
++            return None;
++        }
++        let name = match writer {
++            ToolBinary::Ffmpeg => "FFmpeg",
++            ToolBinary::Sox => "SoX",
++            _ => return None,
++        };
++        return Some(format!("{format}; encoded by {name}"));
++    }
++
++    let mut terminals = evidence.delivered_operations()
++        .filter(|operation| operation.id == "reference-terminal-realization"
++            && operation.kind == "reference_terminal_realization");
++    let terminal = terminals.next()?;
++    if terminals.next().is_some()
++        || !terminal.outputs.iter().any(|output| output.path.as_deref() == Some(staged_path))
++    {
++        return None;
++    }
++    let name = match completed_reference_command_writer(terminal, commands)? {
++        ToolBinary::Ffmpeg => "FFmpeg",
++        ToolBinary::Sox => "SoX",
++        _ => return None,
++    };
++    Some(format!("Wave64; written by {name}"))
++}
++
+ /// One delivery statement rather than a duplicate path and a nested package
+ /// operation. Failed/blocked records never claim that an output was written.
+ fn render_written_output(
+@@ -25668,11 +25777,15 @@ fn render_written_output(
+     path: Option<&str>,
+     evidence: &TrackExecutionEvidence,
+     delivered: bool,
++    reference_delivery_description: Option<&str>,
+ ) {
+     let Some(path) = path else { return; };
+     if !delivered {
+         push_kv_line(log, "  Intended output (not delivered)", path);
+-    } else if let Some(writer) = completed_output_writer(evidence) {
++    } else if let Some(writer) = reference_delivery_description
++        .map(str::to_owned)
++        .or_else(|| completed_output_writer(evidence))
++    {
+         push_kv_line(log, "  Written to", format!("{path} — {writer}"));
+     } else {
+         push_kv_line(log, "  Written to", path);
+@@ -62734,6 +62847,149 @@ mod conversion_log_tests {
+         assert!(!failed.contains("Written to:"), "{failed}");
+     }
+ 
++    #[test]
++    fn r29c_reference_flac_writer_uses_completed_package_command_not_terminal() {
++        use crate::convert::pipeline::execution_evidence::EvidenceArtifactRef;
++
++        let AudioArtifacts::Tracks(mut tracks) = log_test_artifacts().audio else {
++            panic!("expected track artifacts");
++        };
++        let artifact = tracks.remove(0);
++        let mut record = ok_record();
++        let mut terminal = OperationRecord::completed(
++            "reference-terminal-realization", "reference_terminal_realization",
++            "Qualified Reference audio encoding",
++            ExecutionBackend::native("TonePoet qualified Reference path"),
++        );
++        terminal.invocation_indices = vec![1];
++        terminal.outputs.push(EvidenceArtifactRef::path(
++            "reference-terminal-qpcm", Path::new("/encoded/terminal-qpcm.w64"),
++        ));
++        let mut package = OperationRecord::completed(
++            "reference-package-output", "package_output", "Write output file",
++            ExecutionBackend::Unknown,
++        );
++        package.domain = OperationDomain::Artifact;
++        package.invocation_indices = vec![2];
++        package.inputs.push(EvidenceArtifactRef::path(
++            "reference-terminal-qpcm", Path::new("/encoded/terminal-qpcm.w64"),
++        ));
++        package.outputs.push(EvidenceArtifactRef::path(
++            "reference-packaged-output", &artifact.staged_path,
++        ));
++        package.parameters.push(OperationParameter::new(
++            "Target", EvidenceValue::Text("FLAC (native)".to_string()),
++        ));
++        record.execution_evidence.operations = vec![terminal, package];
++        // An unrelated, earlier probe plus a completed SoX PCM terminal must
++        // never be mistaken for the FFmpeg package writer.
++        record.commands = vec![
++            command_record_for(ToolBinary::Ffprobe),
++            command_record_for(ToolBinary::Sox),
++            command_record_for(ToolBinary::Ffmpeg),
++        ];
++        let req = log_test_request();
++        let fragment = structured_conversion_log_track_fragment(
++            &record, None, None, Some(&artifact), &req, None, None,
++        );
++        let rendered = render_structured_conversion_log_track_fragment(
++            &fragment, &successful_log_summary(), &ConversionLogAlbumPresentation::default(),
++        );
++        assert!(rendered.contains(
++            "Written to: /out/01.flac — FLAC (native); encoded by FFmpeg"
++        ), "{rendered}");
++        assert_eq!(rendered.matches("/out/01.flac").count(), 1, "{rendered}");
++        assert!(!rendered.contains("Write output file"), "{rendered}");
++        assert!(!rendered.contains("encoded by SoX"), "{rendered}");
++        assert_eq!(fragment.execution_evidence, record.execution_evidence,
++            "projection must not mutate forensic evidence");
++
++        // The linked SoX -> FFmpeg package consumes stdout from SoX and
++        // writes the delivered file with the FFmpeg consumer, not the producer.
++        record.commands.insert(2, command_record_for(ToolBinary::Sox));
++        record.execution_evidence.operations[1].invocation_indices = vec![2, 3];
++        let streamed = structured_conversion_log_track_fragment(
++            &record, None, None, Some(&artifact), &req, None, None,
++        );
++        assert_eq!(streamed.reference_delivery_description.as_deref(),
++            Some("FLAC (native); encoded by FFmpeg"));
++
++        // No successfully completed consumer, no guessed writer attribution.
++        record.commands[3].exit = Some(super::super::tool::ProcessExit::Code(1));
++        let incomplete = structured_conversion_log_track_fragment(
++            &record, None, None, Some(&artifact), &req, None, None,
++        );
++        assert!(incomplete.reference_delivery_description.is_none());
++        let incomplete_log = render_structured_conversion_log_track_fragment(
++            &incomplete, &successful_log_summary(), &ConversionLogAlbumPresentation::default(),
++        );
++        assert!(incomplete_log.contains("Written to: /out/01.flac — FLAC (native)"),
++            "{incomplete_log}");
++        assert!(!incomplete_log.contains("encoded by"), "{incomplete_log}");
++
++        let failed = render_structured_conversion_log_track_fragment(
++            &fragment,
++            &ConversionLogTrackSummary {
++                outcome: ConversionLogTrackOutcome::Failure,
++                ..successful_log_summary()
++            },
++            &ConversionLogAlbumPresentation::default(),
++        );
++        assert!(failed.contains("Intended output (not delivered): /out/01.flac"), "{failed}");
++        assert!(!failed.contains("Written to:"), "{failed}");
++    }
++
++    #[test]
++    fn r29c_direct_reference_wave64_writer_is_terminal_only_when_it_delivers_file() {
++        use crate::convert::pipeline::execution_evidence::EvidenceArtifactRef;
++        let staged = Path::new("/encoded/direct.w64");
++        let mut terminal = OperationRecord::completed(
++            "reference-terminal-realization", "reference_terminal_realization",
++            "Qualified Reference audio encoding",
++            ExecutionBackend::native("TonePoet qualified Reference path"),
++        );
++        terminal.outputs.push(EvidenceArtifactRef::path("reference-terminal-qpcm", staged));
++        terminal.invocation_indices = vec![1];
++        let mut evidence = TrackExecutionEvidence {
++            operations: vec![terminal],
++            ..TrackExecutionEvidence::default()
++        };
++        let mut commands = vec![
++            command_record_for(ToolBinary::Ffprobe),
++            command_record_for(ToolBinary::Sox),
++        ];
++        let description = completed_reference_delivery_description(&evidence, &commands, staged);
++        assert_eq!(description.as_deref(), Some("Wave64; written by SoX"));
++        let fragment = ConversionLogTrackFragment {
++            label: "Track 1".to_string(),
++            output_target: Some("/published/direct.w64".to_string()),
++            reference_delivery_description: description,
++            execution_evidence: evidence.clone(),
++            ..ConversionLogTrackFragment::default()
++        };
++        let log = render_structured_conversion_log_track_fragment(
++            &fragment, &successful_log_summary(), &ConversionLogAlbumPresentation::default(),
++        );
++        assert!(log.contains("Written to: /published/direct.w64 — Wave64; written by SoX"), "{log}");
++        assert_eq!(log.matches("/published/direct.w64").count(), 1, "{log}");
++
++        // The commissioned Int32 terminal has a SoX normalization command
++        // followed by the FFmpeg writer. Use the *completed* second invocation.
++        commands.push(command_record_for(ToolBinary::Ffmpeg));
++        evidence.operations[0].invocation_indices = vec![1, 2];
++        assert_eq!(completed_reference_delivery_description(&evidence, &commands, staged)
++            .as_deref(), Some("Wave64; written by FFmpeg"));
++
++        // A terminal which emitted an intermediate QPCM path is NOT the
++        // delivered writer. This also guards Reference FLAC without a package
++        // receipt from being incorrectly credited to the SoX PCM producer.
++        assert!(completed_reference_delivery_description(
++            &evidence, &commands, Path::new("/encoded/other-output.flac")
++        ).is_none());
++        evidence.operations[0].invocation_indices = vec![1, 9];
++        assert!(completed_reference_delivery_description(&evidence, &commands, staged).is_none());
++    }
++
+     #[test]
+     fn r29_lossless_stored_md5_is_captured_from_staged_file_before_publication() {
+         let temp = tempfile::tempdir().unwrap();
+diff --git a/tests/settings_sentinel.rs b/tests/settings_sentinel.rs
+index 4a3c4e0..8673f8e 100644
+--- a/tests/settings_sentinel.rs
++++ b/tests/settings_sentinel.rs
+@@ -102,6 +102,8 @@ fn rich_common_settings() -> PipelineSettings {
+         },
+         dsd: DsdSettings::default(),
+         pcm_true_peak: Default::default(),
++        pcm_true_peak_target_origin: tonepoet_pipeline::TruePeakTargetOrigin::Unknown,
++        dsd_true_peak_target_origin: tonepoet_pipeline::TruePeakTargetOrigin::Unknown,
+         metadata: MetadataSettings {
+             transfer_tags: true,
+             preserve_artwork: false,

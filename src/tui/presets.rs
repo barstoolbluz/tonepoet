@@ -771,6 +771,8 @@ impl TuiPreset {
                                     .contains(&value) =>
                             {
                                 format_state.dsd_true_peak_target_dbtp = value;
+                                format_state.dsd_true_peak_target_origin =
+                                    tonepoet_pipeline::TruePeakTargetOrigin::Preset;
                                 report.record("dsd_true_peak_target_dbtp", true);
                             }
                             _ => report.record("dsd_true_peak_target_dbtp", false),
@@ -925,6 +927,8 @@ impl TuiPreset {
                             .contains(&value) =>
                     {
                         format_state.pcm_true_peak_target_dbtp = value;
+                        format_state.pcm_true_peak_target_origin =
+                            tonepoet_pipeline::TruePeakTargetOrigin::Preset;
                         report.record("pcm_true_peak_target_dbtp", true);
                     }
                     _ => report.record("pcm_true_peak_target_dbtp", false),
@@ -1192,6 +1196,7 @@ impl TuiPreset {
                 // DSD source has been probed in the TUI.
                 settings.dsd.from_dsd = dsd_settings.dsd.from_dsd.clone();
                 settings.dsd.general_from_dsd = dsd_settings.dsd.general_from_dsd.clone();
+                settings.dsd_true_peak_target_origin = dsd_settings.dsd_true_peak_target_origin;
             }
             _ => return Err(format!("preset '{}' did not produce pipeline settings", self.name)),
         }

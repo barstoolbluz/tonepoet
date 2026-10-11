@@ -611,6 +611,8 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
         },
         dsd,
         pcm_true_peak,
+        pcm_true_peak_target_origin: format.pcm_true_peak_target_origin,
+        dsd_true_peak_target_origin: format.dsd_true_peak_target_origin,
         // settings-sentinel-allow: metadata/verification defaults until TUI exposes them
         metadata: Default::default(),
         verification: Default::default(),

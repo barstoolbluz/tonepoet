@@ -178,6 +178,26 @@ enum Commands {
         #[arg(long = "dsd-true-peak-scan", value_name = "reference|standard|fast")]
         dsd_true_peak_scan: Option<String>,
 
+        /// PCM sample-domain gain mode; applies to ordinary PCM sources.
+        #[arg(long = "pcm-gain", value_name = "off|true-peak-guard|true-peak-normalize|fixed-gain")]
+        pcm_gain: Option<String>,
+
+        /// Fixed PCM gain in dB; requires --pcm-gain fixed-gain.
+        #[arg(long = "pcm-gain-db", value_name = "DB")]
+        pcm_gain_db: Option<String>,
+
+        /// PCM certified true-peak ceiling in dBTP (-12 to 0 inclusive).
+        #[arg(long = "pcm-true-peak-target-dbtp", value_name = "DBTP")]
+        pcm_true_peak_target_dbtp: Option<String>,
+
+        /// PCM certified true-peak scope.
+        #[arg(long = "pcm-true-peak-scope", value_name = "track|album")]
+        pcm_true_peak_scope: Option<String>,
+
+        /// PCM certified true-peak scan tier.
+        #[arg(long = "pcm-true-peak-scan", value_name = "reference|standard|fast")]
+        pcm_true_peak_scan: Option<String>,
+
         /// Append Lineage.txt content to COMMENT tag
         #[arg(long)]
         append_lineage: bool,
@@ -630,6 +650,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             dsd_true_peak_target_dbtp,
             dsd_true_peak_scope,
             dsd_true_peak_scan,
+            pcm_gain,
+            pcm_gain_db,
+            pcm_true_peak_target_dbtp,
+            pcm_true_peak_scope,
+            pcm_true_peak_scan,
             append_lineage,
             write_log,
             disc_subfolders,
@@ -671,6 +696,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 dsd_true_peak_target_dbtp,
                 dsd_true_peak_scope,
                 dsd_true_peak_scan,
+                pcm_gain,
+                pcm_gain_db,
+                pcm_true_peak_target_dbtp,
+                pcm_true_peak_scope,
+                pcm_true_peak_scan,
                 append_lineage,
                 write_log,
                 generate_cue,
@@ -1156,6 +1186,8 @@ fn apply_cli_dsd_reference_settings(
         PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
     };
 
+    use tonepoet_pipeline::TruePeakTargetOrigin;
+
     let any_flag = pathway.is_some()
         || profile.is_some()
         || gain.is_some()
@@ -1210,6 +1242,7 @@ fn apply_cli_dsd_reference_settings(
                     reference_policy: policy,
                     ..tonepoet_pipeline::DsdSourceSettings::default()
                 };
+                settings.dsd_true_peak_target_origin = TruePeakTargetOrigin::Default;
                 DsdSourcePathway::Reference
             }
             other => anyhow::bail!(
@@ -1257,6 +1290,7 @@ fn apply_cli_dsd_reference_settings(
                     anyhow::bail!("--dsd-true-peak-target-dbtp must be between -12 and 0 dBTP");
                 }
                 settings.dsd.from_dsd.gain = settings.dsd.from_dsd.gain.with_target(target);
+                settings.dsd_true_peak_target_origin = TruePeakTargetOrigin::User;
             }
             if let Some(scope) = parsed_scope {
                 settings.dsd.from_dsd.gain = settings.dsd.from_dsd.gain.with_scope(scope);
@@ -1316,6 +1350,9 @@ fn apply_cli_dsd_reference_settings(
             ),
         };
         settings.dsd.set_gain_policy(policy);
+        if parsed_true_peak_target.is_some() {
+            settings.dsd_true_peak_target_origin = TruePeakTargetOrigin::User;
+        }
     } else if parsed_fixed_gain.is_some() {
         anyhow::bail!("--dsd-gain-db requires --dsd-gain fixed-gain");
     } else if parsed_true_peak_target.is_some() || parsed_scope.is_some() || parsed_scan.is_some() {
@@ -1335,7 +1372,123 @@ fn apply_cli_dsd_reference_settings(
             policy = policy.with_scan(scan);
         }
         settings.dsd.set_gain_policy(policy);
+        if parsed_true_peak_target.is_some() {
+            settings.dsd_true_peak_target_origin = TruePeakTargetOrigin::User;
+        }
     }
+    Ok(())
+}
+
+/// Apply PCM sample gain without routing it through the DSD gain policy. Flags
+/// override a loaded preset; target/scope/scan alone may refine only an active
+/// true-peak preset, never silently turn an Off or Fixed policy into Normalize.
+fn apply_cli_pcm_true_peak_settings(
+    settings: &mut tonepoet_pipeline::PipelineSettings,
+    output_format: AudioFormat,
+    gain: Option<&str>,
+    fixed_gain: Option<&str>,
+    target: Option<&str>,
+    scope: Option<&str>,
+    scan: Option<&str>,
+) -> anyhow::Result<()> {
+    use tonepoet_pipeline::{
+        DbNano, SampleGainPolicy, TruePeakScanTier, TruePeakScope, TruePeakTargetOrigin,
+        PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+    };
+    if [gain, fixed_gain, target, scope, scan].iter().all(|flag| flag.is_none()) {
+        return Ok(());
+    }
+    if matches!(output_format, AudioFormat::Dsf | AudioFormat::Dff) {
+        anyhow::bail!("PCM gain controls are not valid for a DSD output target");
+    }
+    let fixed = fixed_gain
+        .map(|value| value.parse::<DbNano>().map_err(anyhow::Error::msg))
+        .transpose()?;
+    let target_dbtp = target
+        .map(|value| value.parse::<DbNano>().map_err(anyhow::Error::msg))
+        .transpose()?;
+    if target_dbtp.is_some_and(|v| !(DbNano::MIN_NORMALIZE_TARGET..=DbNano::MAX_NORMALIZE_TARGET).contains(&v)) {
+        anyhow::bail!("--pcm-true-peak-target-dbtp must be between -12 and 0 dBTP");
+    }
+    let parsed_scope = match scope.map(|value| value.trim().to_ascii_lowercase()) {
+        Some(value) if value == "track" => Some(TruePeakScope::Track),
+        Some(value) if value == "album" => Some(TruePeakScope::Album),
+        Some(value) => anyhow::bail!("invalid --pcm-true-peak-scope '{value}'; expected track or album"),
+        None => None,
+    };
+    let parsed_scan = match scan.map(|value| value.trim().to_ascii_lowercase()) {
+        Some(value) if value == "reference" => Some(TruePeakScanTier::Reference),
+        Some(value) if value == "standard" => Some(TruePeakScanTier::Standard),
+        Some(value) if value == "fast" => Some(TruePeakScanTier::Fast),
+        Some(value) => anyhow::bail!("invalid --pcm-true-peak-scan '{value}'; expected reference, standard, or fast"),
+        None => None,
+    };
+    let old = settings.pcm_true_peak.policy;
+    let mut origin = settings.pcm_true_peak_target_origin;
+    let parsed_mode = gain.map(|value| value.trim().to_ascii_lowercase());
+    let policy = match parsed_mode.as_deref() {
+        Some("off") => {
+            if fixed.is_some() || target_dbtp.is_some() || parsed_scope.is_some() || parsed_scan.is_some() {
+                anyhow::bail!("--pcm-gain off does not accept gain/target/scope/scan controls");
+            }
+            origin = TruePeakTargetOrigin::Unknown;
+            SampleGainPolicy::Off
+        }
+        Some("fixed-gain") => {
+            if target_dbtp.is_some() || parsed_scope.is_some() || parsed_scan.is_some() {
+                anyhow::bail!("--pcm-gain fixed-gain does not accept true-peak controls");
+            }
+            origin = TruePeakTargetOrigin::Unknown;
+            SampleGainPolicy::FixedGain {
+                gain_db: fixed.ok_or_else(|| anyhow::anyhow!("--pcm-gain fixed-gain requires --pcm-gain-db"))?,
+            }
+        }
+        Some("true-peak-guard") | Some("true-peak-normalize") => {
+            if fixed.is_some() {
+                anyhow::bail!("--pcm-gain-db requires --pcm-gain fixed-gain");
+            }
+            let ceiling = target_dbtp.or_else(|| old.target_dbtp()).unwrap_or(PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP);
+            let scope = parsed_scope.or_else(|| old.scope()).unwrap_or(TruePeakScope::Track);
+            let scan = parsed_scan.or_else(|| old.scan()).unwrap_or(TruePeakScanTier::Fast);
+            if target_dbtp.is_some() {
+                origin = TruePeakTargetOrigin::User;
+            } else if old.target_dbtp().is_none() {
+                origin = TruePeakTargetOrigin::Default;
+            }
+            if parsed_mode.as_deref() == Some("true-peak-guard") {
+                SampleGainPolicy::TruePeakGuard { target_dbtp: ceiling, scope, scan }
+            } else {
+                SampleGainPolicy::TruePeakNormalize { target_dbtp: ceiling, scope, scan }
+            }
+        }
+        Some(other) => anyhow::bail!(
+            "invalid --pcm-gain '{other}'; expected off, true-peak-guard, true-peak-normalize, or fixed-gain"
+        ),
+        None => {
+            if fixed.is_some() {
+                anyhow::bail!("--pcm-gain-db requires --pcm-gain fixed-gain");
+            }
+            if !old.is_true_peak() {
+                anyhow::bail!(
+                    "PCM true-peak target/scope/scan controls require --pcm-gain true-peak-guard or true-peak-normalize (or an active true-peak preset)"
+                );
+            }
+            let mut policy = old;
+            if let Some(v) = target_dbtp {
+                policy = policy.with_target(v);
+                origin = TruePeakTargetOrigin::User;
+            }
+            if let Some(v) = parsed_scope { policy = policy.with_scope(v); }
+            if let Some(v) = parsed_scan { policy = policy.with_scan(v); }
+            policy
+        }
+    };
+    // Validate the candidate before mutating settings or runtime album authority.
+    let mut candidate = settings.clone();
+    candidate.pcm_true_peak.set_policy(policy);
+    candidate.pcm_true_peak_target_origin = origin;
+    candidate.validate().map_err(|error| anyhow::anyhow!("invalid PCM gain settings: {error}"))?;
+    *settings = candidate;
     Ok(())
 }
 
@@ -1501,6 +1654,105 @@ mod dsd_reference_cli_settings_tests {
 }
 
 
+#[cfg(test)]
+mod pcm_true_peak_cli_settings_tests {
+    use super::*;
+    use tonepoet_pipeline::{SampleGainPolicy, TruePeakScanTier, TruePeakScope, TruePeakTargetOrigin};
+
+    fn apply(
+        settings: &mut tonepoet_pipeline::PipelineSettings,
+        mode: Option<&str>, fixed: Option<&str>, target: Option<&str>,
+        scope: Option<&str>, scan: Option<&str>,
+    ) -> anyhow::Result<()> {
+        apply_cli_pcm_true_peak_settings(
+            settings, AudioFormat::Flac, mode, fixed, target, scope, scan,
+        )
+    }
+
+    #[test]
+    fn ordinary_pcm_flags_activate_guard_and_normalize_with_exact_targets() {
+        let mut settings = tonepoet_pipeline::PipelineSettings::default();
+        apply(&mut settings, Some("true-peak-guard"), None, Some("-0.125000001"),
+            Some("album"), Some("standard")).unwrap();
+        assert_eq!(settings.pcm_true_peak.policy, SampleGainPolicy::TruePeakGuard {
+            target_dbtp: "-0.125000001".parse().unwrap(),
+            scope: TruePeakScope::Album, scan: TruePeakScanTier::Standard,
+        });
+        assert_eq!(settings.pcm_true_peak_target_origin, TruePeakTargetOrigin::User);
+        apply(&mut settings, Some("true-peak-normalize"), None, None, None, None).unwrap();
+        assert_eq!(settings.pcm_true_peak.policy, SampleGainPolicy::TruePeakNormalize {
+            target_dbtp: "-0.125000001".parse().unwrap(),
+            scope: TruePeakScope::Album, scan: TruePeakScanTier::Standard,
+        });
+        assert_eq!(settings.pcm_true_peak_target_origin, TruePeakTargetOrigin::User);
+    }
+
+    #[test]
+    fn default_pcm_mode_uses_fast_scan_and_supports_zero_ceiling() {
+        let mut settings = tonepoet_pipeline::PipelineSettings::default();
+        apply(&mut settings, Some("true-peak-guard"), None, None, None, None).unwrap();
+        assert_eq!(settings.pcm_true_peak.policy.scan(), Some(TruePeakScanTier::Fast));
+        assert_eq!(settings.pcm_true_peak_target_origin, TruePeakTargetOrigin::Default);
+        apply(&mut settings, None, None, Some("0.000000000"), None, None).unwrap();
+        assert_eq!(settings.pcm_true_peak.policy.target_dbtp(), Some(tonepoet_pipeline::DbNano::ZERO));
+        assert_eq!(settings.pcm_true_peak_target_origin, TruePeakTargetOrigin::User);
+        apply(&mut settings, None, None, Some("-12.000000000"), None, None).unwrap();
+        assert_eq!(settings.pcm_true_peak.policy.target_dbtp(),
+            Some(tonepoet_pipeline::DbNano::MIN_NORMALIZE_TARGET));
+    }
+
+    #[test]
+    fn true_peak_flags_only_refine_a_valid_active_policy() {
+        let mut settings = tonepoet_pipeline::PipelineSettings::default();
+        let error = apply(&mut settings, None, None, Some("-1"), None, None).unwrap_err();
+        assert!(error.to_string().contains("require --pcm-gain"), "{error}");
+        assert_eq!(settings.pcm_true_peak.policy, SampleGainPolicy::Off);
+        let error = apply(&mut settings, Some("off"), None, Some("-1"), None, None).unwrap_err();
+        assert!(error.to_string().contains("does not accept"), "{error}");
+        let error = apply(&mut settings, Some("true-peak-guard"), None, Some("-12.000000001"), None, None).unwrap_err();
+        assert!(error.to_string().contains("between -12 and 0"), "{error}");
+        assert_eq!(settings.pcm_true_peak.policy, SampleGainPolicy::Off);
+    }
+
+    #[test]
+    fn pcm_fixed_mode_does_not_masquerade_as_true_peak() {
+        let mut settings = tonepoet_pipeline::PipelineSettings::default();
+        apply(&mut settings, Some("fixed-gain"), Some("+2.000000000"), None, None, None).unwrap();
+        assert_eq!(settings.pcm_true_peak.policy, SampleGainPolicy::FixedGain {
+            gain_db: "+2.000000000".parse().unwrap(),
+        });
+        assert_eq!(settings.pcm_true_peak_target_origin, TruePeakTargetOrigin::Unknown);
+        let error = apply(&mut settings, Some("fixed-gain"), Some("0"), Some("-1"), None, None)
+            .unwrap_err();
+        assert!(error.to_string().contains("does not accept"));
+        assert_eq!(settings.pcm_true_peak.policy.fixed_gain_db(), Some("+2.000000000".parse().unwrap()));
+        assert!(apply(&mut settings, Some("off"), None, None, None, None).is_ok());
+        assert_eq!(settings.pcm_true_peak.policy, SampleGainPolicy::Off);
+    }
+
+    #[test]
+    fn pcm_cli_rejects_dsd_output_target_without_mutation() {
+        let mut settings = tonepoet_pipeline::PipelineSettings::default();
+        assert!(apply_cli_pcm_true_peak_settings(
+            &mut settings, AudioFormat::Dsf, Some("true-peak-guard"),
+            None, None, None, None,
+        ).is_err());
+        assert_eq!(settings.pcm_true_peak.policy, SampleGainPolicy::Off);
+    }
+
+    #[test]
+    fn missing_provenance_is_backward_compatible_when_deserializing_settings() {
+        let original = tonepoet_pipeline::PipelineSettings::default();
+        let mut value = serde_json::to_value(original).unwrap();
+        let object = value.as_object_mut().unwrap();
+        assert!(!object.contains_key("dsd_true_peak_target_origin"));
+        assert!(!object.contains_key("pcm_true_peak_target_origin"));
+        let restored: tonepoet_pipeline::PipelineSettings = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.dsd_true_peak_target_origin, TruePeakTargetOrigin::Unknown);
+        assert_eq!(restored.pcm_true_peak_target_origin, TruePeakTargetOrigin::Unknown);
+    }
+}
+
 fn pipeline_audio_format_for_cli(format: AudioFormat) -> tonepoet_pipeline::AudioFormat {
     use tonepoet_pipeline::AudioFormat as PipelineFormat;
     match format {
@@ -1574,6 +1826,11 @@ async fn run_convert(
     dsd_true_peak_target_dbtp: Option<String>,
     dsd_true_peak_scope: Option<String>,
     dsd_true_peak_scan: Option<String>,
+    pcm_gain: Option<String>,
+    pcm_gain_db: Option<String>,
+    pcm_true_peak_target_dbtp: Option<String>,
+    pcm_true_peak_scope: Option<String>,
+    pcm_true_peak_scan: Option<String>,
     append_lineage: bool,
     write_log: bool,
     generate_cue: bool,
@@ -1816,6 +2073,15 @@ async fn run_convert(
         dsd_true_peak_target_dbtp.as_deref(),
         dsd_true_peak_scope.as_deref(),
         dsd_true_peak_scan.as_deref(),
+    )?;
+    apply_cli_pcm_true_peak_settings(
+        &mut cli_pipeline_settings,
+        output_format,
+        pcm_gain.as_deref(),
+        pcm_gain_db.as_deref(),
+        pcm_true_peak_target_dbtp.as_deref(),
+        pcm_true_peak_scope.as_deref(),
+        pcm_true_peak_scan.as_deref(),
     )?;
     options.pipeline_settings = Some(cli_pipeline_settings);
 

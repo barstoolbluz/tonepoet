@@ -168,6 +168,7 @@ pub fn draw_format_pane(
                         format_state.pcm_true_peak_target_dbtp,
                         row_focused,
                         format_state.pcm_true_peak_target_is_capped(),
+                        "pcm-true-peak-target",
                         theme,
                     )),
                     FormatField::TruePeakScope => lines.push(pill_row(
@@ -302,14 +303,14 @@ pub fn draw_format_pane(
                         "",
                         theme,
                     )),
-                    FormatField::DsdTruePeakTarget => lines.push(dsd_db_value_row(
+                    FormatField::DsdTruePeakTarget => lines.push(pcm_true_peak_db_value_row(
                         border_color,
                         w,
                         "TP target  ",
                         format_state.dsd_true_peak_target_dbtp,
-                        true,
                         row_focused,
-                        "",
+                        false,
+                        "dsd-true-peak-target",
                         theme,
                     )),
                     FormatField::Container => {
@@ -565,6 +566,7 @@ fn pcm_true_peak_db_value_row(
     value: tonepoet_pipeline::DbNano,
     focused: bool,
     lossy_capped: bool,
+    custom_key: &'static str,
     theme: super::theme::Theme,
 ) -> Line<'static> {
     let label_style = if focused { theme.bright() } else { theme.muted() };
@@ -577,21 +579,24 @@ fn pcm_true_peak_db_value_row(
         Span::styled("│", theme.border(border_color)),
         Span::styled(format!("   {label}"), label_style),
         Span::styled("< ", control_style),
-        Span::styled(format!("{} dBTP", value.render(true)), control_style),
+        Span::styled(format!("{} dBTP", {
+            let exact = value.render(false);
+            exact.trim_end_matches('0').trim_end_matches('.').to_string()
+        }), control_style),
         Span::styled(" >", control_style),
         Span::raw("  "),
-        Span::styled(
-            if lossy_capped {
-                format!(
-                    "lossy encoder input capped at {} dBTP",
-                    tonepoet_pipeline::PCM_TRUE_PEAK_LOSSY_MAX_TARGET_DBTP.render(true),
-                )
-            } else {
-                "left/right adjust".to_string()
-            },
-            theme.muted(),
-        ),
     ];
+    let hint = if lossy_capped {
+        format!(
+            "lossy encoder input capped at {} dBTP; custom: :set {custom_key} <dBTP>",
+            tonepoet_pipeline::PCM_TRUE_PEAK_LOSSY_MAX_TARGET_DBTP.render(true),
+        )
+    } else {
+        format!("0.25 dB steps; custom: :set {custom_key} <dBTP>")
+    };
+    let room = width.saturating_sub(spans.iter().map(|span| span.width()).sum::<usize>() + 1);
+    let hint = hint.chars().take(room).collect::<String>();
+    spans.push(Span::styled(hint, theme.muted()));
     let content_width: usize = spans.iter().map(|span| span.width()).sum();
     spans.push(Span::raw(" ".repeat(width.saturating_sub(content_width + 1))));
     spans.push(Span::styled("│", theme.border(border_color)));

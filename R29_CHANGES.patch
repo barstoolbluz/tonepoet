@@ -1,0 +1,1450 @@
+diff --git a/src/convert/pipeline/execution_evidence.rs b/src/convert/pipeline/execution_evidence.rs
+index cb159be..9f3eb0e 100644
+--- a/src/convert/pipeline/execution_evidence.rs
++++ b/src/convert/pipeline/execution_evidence.rs
+@@ -745,10 +745,23 @@ pub fn render_track_processing(evidence: &TrackExecutionEvidence) -> Vec<String>
+ 
+ #[must_use]
+ pub fn render_track_artifact_work(evidence: &TrackExecutionEvidence) -> Vec<String> {
++    render_track_artifact_work_filtered(evidence, false)
++}
++
++/// Human-log projection of ancillary artifact work. The completed output
++/// package is represented once by the delivered path/writer line; no other
++/// artifact operation or structured receipt is suppressed.
++#[must_use]
++pub fn render_other_track_artifact_work(evidence: &TrackExecutionEvidence) -> Vec<String> {
++    render_track_artifact_work_filtered(evidence, true)
++}
++
++fn render_track_artifact_work_filtered(evidence: &TrackExecutionEvidence, omit_package: bool) -> Vec<String> {
+     let mut lines = Vec::new();
+     for operation in evidence
+         .delivered_operations()
+         .filter(|operation| operation.domain == OperationDomain::Artifact)
++        .filter(|operation| !omit_package || operation.kind != "package_output")
+         .filter(|operation| {
+             !matches!(&operation.backend, ExecutionBackend::Unknown)
+                 || !operation.parameters.is_empty()
+diff --git a/src/convert/pipeline/mod.rs b/src/convert/pipeline/mod.rs
+index 54944d7..54b3953 100644
+--- a/src/convert/pipeline/mod.rs
++++ b/src/convert/pipeline/mod.rs
+@@ -30,6 +30,7 @@ pub(crate) mod baseline;
+ pub(crate) mod chapter_write;
+ pub mod errors;
+ pub mod execution_evidence;
++pub(crate) mod stored_audio_checksum;
+ pub mod label_resolver;
+ pub mod manifest;
+ pub mod manifest_builder;
+diff --git a/src/convert/pipeline/stages.rs b/src/convert/pipeline/stages.rs
+index 5038383..6b9cfe5 100644
+--- a/src/convert/pipeline/stages.rs
++++ b/src/convert/pipeline/stages.rs
+@@ -23,9 +23,9 @@ use tokio_util::sync::CancellationToken;
+ use super::execution_evidence::{
+     append_prior_attempt_bounded, completed_registered_effects_from_plan,
+     discarded_attempt_evidence_from_invocations, record_native_scalar_materialization,
+-    render_discarded_attempt_processing, render_operation_with_context, render_track_artifact_work,
++    render_discarded_attempt_processing, render_operation_with_context, render_other_track_artifact_work,
+     render_track_processing, render_track_verifications, summarize_prior_attempt, DecisionAuthority,
+-    DecisionRecord, EvidenceValue, ExecutionBackend, ObservationRecord, OperationParameter,
++    DecisionRecord, EvidenceValue, ExecutionBackend, ObservationRecord, OperationDomain, OperationParameter,
+     OperationRecord,
+     SizeDomain, SizeEvidence, TrackExecutionEvidence, VerificationRecord, VerificationStatus,
+ };
+@@ -16999,6 +16999,10 @@ struct ConversionLogTrackFragment {
+     warnings: Vec<String>,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     output_target: Option<String>,
++    /// Encoder-authored audio checksum read from the completed staged file,
++    /// never computed from decoded audio or inferred from file content.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    stored_audio_md5: Option<String>,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     shared_decision_scope: Option<String>,
+     /// Bound runtime album-gain decision. This is decision evidence, not a
+@@ -17010,6 +17014,10 @@ struct ConversionLogTrackFragment {
+     /// execution_evidence; these values do not claim that gain was performed.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     reference_album_gain: Option<ReferenceAlbumGainLogFacts>,
++    /// Origin is distinct from the automatic calculation of album gain.
++    /// Legacy fragments have no provenance and must not be relabelled.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    reference_ceiling_origin: Option<tonepoet_pipeline::TruePeakTargetOrigin>,
+     /// The selected Reference gain mode is a display hint, not evidence of
+     /// execution. The completed typed operations remain the sole authority for
+     /// whether processing was performed. None supports older fragments.
+@@ -17523,6 +17531,11 @@ fn structured_conversion_log_track_fragment(
+         source_audio: prepared.map(source_audio_description),
+         warnings: prepared.map(|track| track.warnings.clone()).unwrap_or_default(),
+         output_target: artifact.map(|artifact| path_log_value(&artifact.final_path)),
++        stored_audio_md5: if matches!(record.outcome, TrackOutcome::Ok) {
++            artifact.and_then(|artifact| stored_audio_md5_for_artifact(artifact, req))
++        } else {
++            None
++        },
+         shared_decision_scope: album_gain_scope_disclosure.map(dsd_album_gain_scope_disclosure_label),
+         album_gain_decision: prepared.and_then(|track| {
+             dsd_album_gain_decision_label(
+@@ -17538,6 +17551,10 @@ fn structured_conversion_log_track_fragment(
+                 artifact.and_then(|artifact| artifact.reference_evidence.as_ref()),
+             )
+         }),
++        reference_ceiling_origin: match req.settings.dsd_true_peak_target_origin {
++            tonepoet_pipeline::TruePeakTargetOrigin::Unknown => None,
++            known => Some(known),
++        },
+         reference_gain_is_off: artifact
+             .and_then(|artifact| artifact.reference_evidence.as_ref())
+             .map(|reference| matches!(
+@@ -17608,7 +17625,13 @@ fn render_structured_conversion_log_track_fragment(
+     for warning in &fragment.warnings {
+         push_kv_line(&mut log, "  Warning", warning);
+     }
+-    push_optional_kv_line(&mut log, "  Output target", fragment.output_target.as_deref());
++    render_written_output(
++        &mut log,
++        fragment.output_target.as_deref(),
++        &fragment.execution_evidence,
++        summary.outcome == ConversionLogTrackOutcome::Success,
++    );
++    push_optional_kv_line(&mut log, "  Stored audio MD5", fragment.stored_audio_md5.as_deref());
+ 
+     let mut scoped_evidence = execution_evidence_for_album_scope(
+         &fragment.execution_evidence,
+@@ -17641,9 +17664,9 @@ fn render_structured_conversion_log_track_fragment(
+         log.push_str("  Processing: no completed delivered-audio operations recorded\n");
+     }
+     if summary.outcome == ConversionLogTrackOutcome::Success {
+-        let artifact_work = render_track_artifact_work(&fragment.execution_evidence);
++        let artifact_work = render_other_track_artifact_work(&fragment.execution_evidence);
+         if !artifact_work.is_empty() {
+-            log.push_str("  Output file:\n");
++            log.push_str("  Other output operations:\n");
+             for line in artifact_work {
+                 log.push_str("    ");
+                 log.push_str(&escape_log_value(&line));
+@@ -17914,15 +17937,20 @@ fn album_uniform_reference_gain(
+     } else if let Some(count) = facts.measured_track_count {
+         lines.push(format!("  Loudest true peak: verified silence across {count} tracks"));
+     }
++    let origin = tracks.iter().map(|(fragment, _)| fragment.reference_ceiling_origin)
++        .reduce(|left, right| if left == right { left } else { None })
++        .flatten()
++        .unwrap_or(tonepoet_pipeline::TruePeakTargetOrigin::Unknown);
+     lines.push(format!(
+-        "  Ceiling: {} dBTP",
++        "  Ceiling: {} dBTP ({})",
+         human_log_ceiling(tonepoet_pipeline::DbNano(facts.target_nano)),
++        origin.human_label(),
+     ));
+-    lines.push(if facts.music_peak_nano.is_some() {
+-        "  Chosen automatically, to approach the ceiling without exceeding it".to_string()
+-    } else {
+-        "  Chosen automatically under the qualified Reference gain policy".to_string()
+-    });
++    lines.push(match facts.music_peak_nano {
++        Some(i64::MIN) => "  Gain selected under the qualified Reference near-silence policy",
++        Some(_) => "  Gain calculated from measured album true peak and selected ceiling",
++        None => "  Gain selected by the qualified Reference silence policy",
++    }.to_string());
+     AlbumUniformOperation::Uniform(lines)
+ }
+ 
+@@ -24232,7 +24260,17 @@ fn append_track_log(
+         }
+     }
+     if let Some(artifact) = artifact {
+-        push_kv_line(log, "  Output target", path_log_value(&artifact.final_path));
++        render_written_output(
++            log,
++            Some(&path_log_value(&artifact.final_path)),
++            &record.execution_evidence,
++            matches!(record.outcome, TrackOutcome::Ok),
++        );
++        if matches!(record.outcome, TrackOutcome::Ok) {
++            if let Some(md5) = stored_audio_md5_for_artifact(artifact, req) {
++                push_kv_line(log, "  Stored audio MD5", md5);
++            }
++        }
+     }
+ 
+     let processing = if matches!(record.outcome, TrackOutcome::Ok) {
+@@ -24258,9 +24296,9 @@ fn append_track_log(
+     }
+ 
+     if matches!(record.outcome, TrackOutcome::Ok) {
+-        let artifact_work = render_track_artifact_work(&record.execution_evidence);
++        let artifact_work = render_other_track_artifact_work(&record.execution_evidence);
+         if !artifact_work.is_empty() {
+-            log.push_str("  Output file:\n");
++            log.push_str("  Other output operations:\n");
+             for line in artifact_work {
+                 log.push_str("    ");
+                 log.push_str(&escape_log_value(&line));
+@@ -25575,6 +25613,84 @@ fn source_kind_label(kind: SourceKind) -> &'static str {
+ }
+ 
+ 
++/// Single delivery descriptor from completed package/encoding evidence. A
++/// format target is not an encoder: a qualified Reference terminal realization
++/// emits PCM and must never be credited with writing a subsequent FLAC file.
++fn completed_output_writer(evidence: &TrackExecutionEvidence) -> Option<String> {
++    let mut packages = evidence.delivered_operations()
++        .filter(|op| op.kind == "package_output" && op.domain == OperationDomain::Artifact);
++    let package = packages.next()?;
++    if packages.next().is_some() {
++        return None; // Conflicting package claims cannot choose an authoritative writer.
++    }
++    let mut target = None::<&str>;
++    for descriptor in package.parameters.iter()
++        .filter(|parameter| parameter.name == "Target")
++        .filter_map(|parameter| match &parameter.value {
++            EvidenceValue::Text(value) if !value.is_empty() => Some(value.as_str()),
++            _ => None,
++        })
++    {
++        if target.is_some_and(|prior| prior != descriptor) {
++            return None;
++        }
++        target = Some(descriptor);
++    }
++    let package_writer = (!matches!(package.backend, ExecutionBackend::Unknown))
++        .then(|| format!("written by {}", package.backend.human_label()));
++    // A typed producer must connect directly to the package's encoded input.
++    // Do not label a Reference PCM terminal as the container encoder.
++    let encoder_writer = if package.inputs.len() == 1 {
++        let mut encoders = evidence.delivered_operations()
++            .filter(|op| op.kind == "encode_pcm")
++            .filter(|op| !matches!(op.backend, ExecutionBackend::Unknown))
++            .filter(|op| op.outputs.iter().any(|out| out.id == package.inputs[0].id));
++        encoders.next().and_then(|encoder| {
++            if encoders.next().is_none() {
++                Some(format!("encoded by {}", encoder.backend.human_label()))
++            } else {
++                None
++            }
++        })
++    } else { None };
++    match (target, package_writer.or(encoder_writer)) {
++        (Some(format), Some(writer)) => Some(format!("{format}; {writer}")),
++        (Some(format), None) => Some(format.to_string()),
++        (None, Some(writer)) => Some(writer),
++        (None, None) => None,
++    }
++}
++
++/// One delivery statement rather than a duplicate path and a nested package
++/// operation. Failed/blocked records never claim that an output was written.
++fn render_written_output(
++    log: &mut String,
++    path: Option<&str>,
++    evidence: &TrackExecutionEvidence,
++    delivered: bool,
++) {
++    let Some(path) = path else { return; };
++    if !delivered {
++        push_kv_line(log, "  Intended output (not delivered)", path);
++    } else if let Some(writer) = completed_output_writer(evidence) {
++        push_kv_line(log, "  Written to", format!("{path} — {writer}"));
++    } else {
++        push_kv_line(log, "  Written to", path);
++    }
++}
++
++/// Read the encoder-stored checksum from the staged completed artifact, before
++/// it can be moved into a shared album directory by publication. Do not fall
++/// back to an unrelated path if the staging file no longer exists.
++fn stored_audio_md5_for_artifact(artifact: &TrackArtifact, req: &PipelineRequest) -> Option<String> {
++    let value = super::stored_audio_checksum::inspect_stored_audio_md5(
++        &artifact.staged_path,
++        &req.settings.target_format,
++        req.settings.wavpack.hybrid,
++    )?;
++    Some(format!("{}: {}", value.kind, value.hex))
++}
++
+ fn push_kv_line(log: &mut String, label: &str, value: impl AsRef<str>) {
+     log.push_str(label);
+     log.push_str(": ");
+@@ -25604,15 +25720,11 @@ fn conversion_log_metadata_values(values: &MetadataValueList) -> Option<String>
+     }
+ }
+ 
+-// Measurement values use the full nanodecibel precision already retained by
+-// the certified observer. A configured ceiling is printed with at least two
+-// decimals, but finer accepted CLI/TUI/preset inputs must not be falsified.
++// A selected ceiling is displayed in its canonical decimal form, without
++// padding or rounding away finer values accepted by DbNano.
+ fn human_log_ceiling(value: tonepoet_pipeline::DbNano) -> String {
+     let exact = value.render(false);
+-    let (whole, fraction) = exact.split_once('.').expect("DbNano decimal rendering");
+-    let significant = fraction.trim_end_matches('0');
+-    let displayed = &fraction[..significant.len().max(2)];
+-    format!("{whole}.{displayed}")
++    exact.trim_end_matches('0').trim_end_matches('.').to_string()
+ }
+ 
+ fn qualified_reference_album_gain_facts(
+@@ -62530,6 +62642,127 @@ mod conversion_log_tests {
+         fragment
+     }
+ 
++    #[test]
++    fn r29_album_ceiling_source_is_independent_of_automatic_gain() {
++        use tonepoet_pipeline::TruePeakTargetOrigin;
++        for (origin, expected) in [
++            (TruePeakTargetOrigin::User, "set explicitly"),
++            (TruePeakTargetOrigin::Default, "default target"),
++            (TruePeakTargetOrigin::Preset, "from preset"),
++        ] {
++            let mut first = r27_qualified_reference_fragment(1);
++            let mut second = r27_qualified_reference_fragment(2);
++            first.reference_ceiling_origin = Some(origin);
++            second.reference_ceiling_origin = Some(origin);
++            let a = successful_log_summary();
++            let b = successful_log_summary();
++            let album = build_conversion_log_album_presentation(&[(&first, &a), (&second, &b)], true);
++            assert!(album.section.contains(&format!("Ceiling: -0.1 dBTP ({expected})")), "{}", album.section);
++            assert!(album.section.contains("Gain calculated from measured album true peak"), "{}", album.section);
++            assert!(!album.section.contains("Chosen automatically"), "{}", album.section);
++        }
++        let mut first = r27_qualified_reference_fragment(1);
++        let second = r27_qualified_reference_fragment(2);
++        first.reference_ceiling_origin = Some(TruePeakTargetOrigin::User);
++        let a = successful_log_summary();
++        let b = successful_log_summary();
++        let album = build_conversion_log_album_presentation(&[(&first, &a), (&second, &b)], true);
++        assert!(album.section.contains("(origin not recorded)"), "{}", album.section);
++    }
++
++    #[test]
++    fn r29_completed_writer_is_rendered_once_and_failed_output_is_not_delivered() {
++        let mut evidence = TrackExecutionEvidence::default();
++        let mut package = OperationRecord::completed(
++            "package", "package_output", "Write output file", ExecutionBackend::Unknown,
++        );
++        package.domain = OperationDomain::Artifact;
++        package.parameters.push(OperationParameter::new(
++            "Target", EvidenceValue::Text("FLAC (native)".to_string()),
++        ));
++        evidence.operations.push(package);
++        let mut ancillary = OperationRecord::completed(
++            "tags", "metadata_mutation", "Write metadata tags", ExecutionBackend::native("TonePoet tag writer"),
++        );
++        ancillary.domain = OperationDomain::Artifact;
++        evidence.operations.push(ancillary);
++        let mut fragment = ConversionLogTrackFragment {
++            label: "Track 1".to_string(),
++            output_target: Some("/published/01.flac".to_string()),
++            execution_evidence: evidence,
++            ..ConversionLogTrackFragment::default()
++        };
++        let summary = successful_log_summary();
++        let rendered = render_structured_conversion_log_track_fragment(
++            &fragment, &summary, &ConversionLogAlbumPresentation::default(),
++        );
++        assert!(rendered.contains("Written to: /published/01.flac — FLAC (native)"), "{rendered}");
++        assert_eq!(rendered.matches("/published/01.flac").count(), 1, "{rendered}");
++        assert!(!rendered.contains("Write output file"), "{rendered}");
++        assert!(!rendered.contains("Output file:"), "{rendered}");
++        assert!(rendered.contains("Write metadata tags"), "{rendered}");
++
++        // Encoder credit is permitted only for a completed, linked typed
++        // encoder. A Reference terminal which emits PCM is not the FLAC writer.
++        let mut typed = fragment.execution_evidence.clone();
++        let mut terminal = OperationRecord::completed(
++            "terminal", "reference_terminal_realization", "Reference terminal",
++            ExecutionBackend::native("TonePoet qualified Reference path"),
++        );
++        terminal.outputs.push(crate::convert::pipeline::execution_evidence::EvidenceArtifactRef::signal(42));
++        typed.operations[0].inputs.push(crate::convert::pipeline::execution_evidence::EvidenceArtifactRef::signal(42));
++        typed.operations.push(terminal);
++        assert_eq!(completed_output_writer(&typed).as_deref(), Some("FLAC (native)"));
++        typed.operations.pop();
++        let mut encoder = OperationRecord::completed(
++            "encode", "encode_pcm", "PCM encoding", ExecutionBackend::external("ffmpeg"),
++        );
++        encoder.outputs.push(crate::convert::pipeline::execution_evidence::EvidenceArtifactRef::signal(42));
++        typed.operations.push(encoder);
++        assert_eq!(completed_output_writer(&typed).as_deref(),
++            Some("FLAC (native); encoded by ffmpeg"));
++
++        let failure = ConversionLogTrackSummary {
++            outcome: ConversionLogTrackOutcome::Failure,
++            ..successful_log_summary()
++        };
++        fragment.error = Some("encoder failed".to_string());
++        let failed = render_structured_conversion_log_track_fragment(
++            &fragment, &failure, &ConversionLogAlbumPresentation::default(),
++        );
++        assert!(failed.contains("Intended output (not delivered): /published/01.flac"), "{failed}");
++        assert!(!failed.contains("Written to:"), "{failed}");
++    }
++
++    #[test]
++    fn r29_lossless_stored_md5_is_captured_from_staged_file_before_publication() {
++        let temp = tempfile::tempdir().unwrap();
++        let mut wav = b"fLaC".to_vec();
++        wav.extend_from_slice(&[0x80, 0, 0, 34]);
++        wav.extend_from_slice(&[0; 18]);
++        wav.extend_from_slice(&[0x8c; 16]);
++        let staged = temp.path().join("staged.flac");
++        std::fs::write(&staged, wav).unwrap();
++        let AudioArtifacts::Tracks(mut tracks) = log_test_artifacts().audio else {
++            panic!("expected track artifacts");
++        };
++        let mut artifact = tracks.remove(0);
++        artifact.staged_path = staged.clone();
++        let req = log_test_request();
++        let fragment = structured_conversion_log_track_fragment(
++            &ok_record(), None, None, Some(&artifact), &req, None, None,
++        );
++        assert_eq!(fragment.stored_audio_md5.as_deref(),
++            Some("FLAC STREAMINFO: 8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c"));
++        std::fs::remove_file(staged).unwrap();
++        let log = render_structured_conversion_log_track_fragment(
++            &fragment, &successful_log_summary(), &ConversionLogAlbumPresentation::default(),
++        );
++        assert!(log.contains("Stored audio MD5: FLAC STREAMINFO: 8c8c8c8c"), "{log}");
++        assert!(stored_audio_md5_for_artifact(&artifact, &req).is_none(),
++            "do not read another file after staging is gone");
++    }
++
+     #[test]
+     fn r27_album_log_is_one_read_level_write_summary_without_reference_plumbing() {
+         let first = r27_qualified_reference_fragment(1);
+@@ -62551,8 +62784,8 @@ mod conversion_log_tests {
+             "Album gain — sox\n",
+             "  Applied: +4.072834475 dB\n",
+             "  Loudest true peak: -4.172834475 dBTP, across 2 tracks\n",
+-            "  Ceiling: -0.10 dBTP\n",
+-            "  Chosen automatically, to approach the ceiling without exceeding it\n\n",
++            "  Ceiling: -0.1 dBTP (origin not recorded)\n",
++            "  Gain calculated from measured album true peak and selected ceiling\n\n",
+             "Converted to PCM — sox, TonePoet qualified Reference path\n",
+             "  Output: 88.2 kHz, 24-bit integer, stereo\n",
+             "  Dither: TPDF\n\n",
+@@ -63721,9 +63954,9 @@ mod conversion_log_tests {
+         let artifacts = log_test_artifacts();
+         let log = build_conversion_log(&outcome, &source, &req, &artifacts, None);
+ 
+-        assert!(log.contains("Output target: /out/01.flac"), "{log}");
++        assert!(log.contains("Written to: /out/01.flac"), "{log}");
+         assert!(
+-            !log.contains("Output target: /encoded/01.flac"),
++            !log.contains("Written to: /encoded/01.flac"),
+             "the staged TrackRecord output path must not masquerade as the delivered target: {log}",
+         );
+     }
+@@ -78122,10 +78355,10 @@ Recovered provenance
+         let target = DbNano(-100_000_000);
+         assert_eq!(gain.render(true), "+19.028069515");
+         assert_eq!(peak.render(false), "-19.128079335");
+-        assert_eq!(human_log_ceiling(target), "-0.10");
++        assert_eq!(human_log_ceiling(target), "-0.1");
+         assert_eq!(human_log_ceiling(DbNano(-125_000_000)), "-0.125");
+         assert_eq!(human_log_ceiling(DbNano(-123_456_789)), "-0.123456789");
+-        assert_eq!(human_log_ceiling(DbNano(0)), "0.00");
++        assert_eq!(human_log_ceiling(DbNano(0)), "0");
+         assert_eq!(human_log_ceiling(DbNano(i64::MIN)), "-9223372036.854775808");
+         assert_eq!(gain.0, 19_028_069_515, "human presentation cannot mutate stored precision");
+         assert_eq!(peak.0, -19_128_079_335);
+diff --git a/src/convert/pipeline/stored_audio_checksum.rs b/src/convert/pipeline/stored_audio_checksum.rs
+new file mode 100644
+index 0000000..69fd810
+--- /dev/null
++++ b/src/convert/pipeline/stored_audio_checksum.rs
+@@ -0,0 +1,215 @@
++//! Read container-declared audio MD5 without decoding or hashing the file.
++//!
++//! These values are encoder-authored metadata, not proof that decoding was
++//! correct. Absence, malformed metadata, and unsupported formats are silent:
++//! no fabricated digest is written into the human conversion log.
++
++use std::fs::File;
++use std::io::{Read, Seek, SeekFrom};
++use std::path::Path;
++
++use tonepoet_pipeline::AudioFormat;
++
++/// A container-embedded digest, already qualified for human presentation.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub(crate) struct StoredAudioMd5 {
++    pub kind: &'static str,
++    pub hex: String,
++}
++
++pub(crate) fn inspect_stored_audio_md5(
++    path: &Path,
++    format: &AudioFormat,
++    wavpack_hybrid: bool,
++) -> Option<StoredAudioMd5> {
++    let mut file = File::open(path).ok()?;
++    let (kind, digest) = match format {
++        AudioFormat::Flac => ("FLAC STREAMINFO", flac_streaminfo_md5(&mut file)?),
++        // Hybrid without its correction file does not carry a lossless PCM
++        // identity, even if an MD5-like item is encountered in the metadata.
++        AudioFormat::WavPack if !wavpack_hybrid => {
++            ("WavPack", wavpack_declared_md5(&mut file)?)
++        }
++        _ => return None,
++    };
++    Some(StoredAudioMd5 {
++        kind,
++        hex: digest.iter().map(|byte| format!("{byte:02x}")).collect(),
++    })
++}
++
++fn flac_streaminfo_md5<R: Read + Seek>(reader: &mut R) -> Option<[u8; 16]> {
++    let stream_start = crate::metadata_persistence::detect_flac_stream_offset(reader).ok()??;
++    reader.seek(SeekFrom::Start(stream_start.checked_add(4)?)).ok()?;
++    let mut metadata_header = [0u8; 4];
++    reader.read_exact(&mut metadata_header).ok()?;
++    let block_len = u32::from_be_bytes([
++        0, metadata_header[1], metadata_header[2], metadata_header[3],
++    ]);
++    if metadata_header[0] & 0x7f != 0 || block_len != 34 {
++        return None;
++    }
++    let mut streaminfo = [0u8; 34];
++    reader.read_exact(&mut streaminfo).ok()?;
++    let mut digest = [0u8; 16];
++    digest.copy_from_slice(&streaminfo[18..34]);
++    // FLAC specifies zero as "unset", not an MD5 of silent PCM.
++    (digest != [0u8; 16]).then_some(digest)
++}
++
++// WavPack4/5 metadata: two-byte header, optional 2-byte extended size;
++// payload length in two-byte words, with an optional odd-byte flag. The
++// trailing MD5 is typically in the final block, so move by checked block
++// extents instead of reading/decoding the (potentially enormous) bitstream.
++fn wavpack_declared_md5<R: Read + Seek>(reader: &mut R) -> Option<[u8; 16]> {
++    const HEADER_SIZE: u64 = 32;
++    const LARGE: u8 = 0x80;
++    const ODD: u8 = 0x40;
++    const UNIQUE: u8 = 0x3f;
++    const MD5: u8 = 0x26;
++    const ALT_MD5: u8 = 0x29;
++    const MAX_BLOCKS: usize = 1_000_000;
++
++    let file_len = reader.seek(SeekFrom::End(0)).ok()?;
++    let mut block_start = 0u64;
++    let mut found: Option<[u8; 16]> = None;
++    let mut blocks = 0;
++    while block_start.checked_add(HEADER_SIZE)? <= file_len && blocks < MAX_BLOCKS {
++        reader.seek(SeekFrom::Start(block_start)).ok()?;
++        let mut header = [0u8; 32];
++        reader.read_exact(&mut header).ok()?;
++        if &header[..4] != b"wvpk" {
++            // APEv2/ID3 trailing tags are not WavPack blocks. A first-block
++            // mismatch is invalid; after valid blocks, trailing tags are fine.
++            return if blocks > 0 { found } else { None };
++        }
++        let ck_size = u32::from_le_bytes(header[4..8].try_into().ok()?) as u64;
++        let version = u16::from_le_bytes(header[8..10].try_into().ok()?);
++        if ck_size < 24 || !(0x0402..0x0600).contains(&version) {
++            return None;
++        }
++        let block_end = block_start.checked_add(ck_size)?.checked_add(8)?;
++        if block_end > file_len {
++            return None;
++        }
++        // The WavPack HYBRID_FLAG is defined in the block flags, even if the
++        // caller's settings were obtained from an older request.
++        let flags = u32::from_le_bytes(header[24..28].try_into().ok()?);
++        if flags & 0x8 != 0 {
++            return None;
++        }
++        blocks += 1;
++        let mut offset = block_start + HEADER_SIZE;
++        while offset < block_end {
++            if block_end - offset < 2 {
++                return None;
++            }
++            reader.seek(SeekFrom::Start(offset)).ok()?;
++            let mut meta = [0u8; 2];
++            reader.read_exact(&mut meta).ok()?;
++            offset += 2;
++            let mut length = u64::from(meta[1]) * 2;
++            if meta[0] & LARGE != 0 {
++                if block_end - offset < 2 {
++                    return None;
++                }
++                let mut extra = [0u8; 2];
++                reader.read_exact(&mut extra).ok()?;
++                offset += 2;
++                length = length.checked_add(u64::from(extra[0]) << 9)?
++                    .checked_add(u64::from(extra[1]) << 17)?;
++            }
++            if (meta[0] & ODD != 0 && length == 0) || length > block_end - offset {
++                return None;
++            }
++            let data_len = length - u64::from(meta[0] & ODD != 0);
++            if matches!(meta[0] & UNIQUE, MD5 | ALT_MD5) && data_len == 16 {
++                let mut digest = [0u8; 16];
++                reader.read_exact(&mut digest).ok()?;
++                if let Some(previous) = found {
++                    if previous != digest { return None; }
++                }
++                found = Some(digest);
++            }
++            offset = offset.checked_add(length)?;
++        }
++        block_start = block_end;
++    }
++    if blocks == MAX_BLOCKS || blocks == 0 { None } else { found }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::io::Cursor;
++
++    fn streaminfo(digest: [u8; 16]) -> Vec<u8> {
++        let mut bytes = b"fLaC".to_vec();
++        bytes.extend_from_slice(&[0x80, 0, 0, 34]);
++        bytes.extend_from_slice(&[0; 18]);
++        bytes.extend_from_slice(&digest);
++        bytes
++    }
++
++    #[test]
++    fn flac_reads_only_stored_streaminfo_and_ignores_unset_digest() {
++        let digest = [0x8c; 16];
++        assert_eq!(flac_streaminfo_md5(&mut Cursor::new(streaminfo(digest))), Some(digest));
++        assert_eq!(flac_streaminfo_md5(&mut Cursor::new(streaminfo([0; 16]))), None);
++        let mut malformed = streaminfo(digest);
++        malformed[7] = 33;
++        assert_eq!(flac_streaminfo_md5(&mut Cursor::new(malformed)), None);
++        assert_eq!(flac_streaminfo_md5(&mut Cursor::new(b"not flac")), None);
++    }
++
++    fn block(meta_id: u8, digest: &[u8], odd: bool, hybrid: bool) -> Vec<u8> {
++        let padded = digest.len() + usize::from(odd);
++        assert_eq!(padded % 2, 0);
++        let mut bytes = vec![0u8; 32];
++        bytes[0..4].copy_from_slice(b"wvpk");
++        bytes[8..10].copy_from_slice(&0x410u16.to_le_bytes());
++        if hybrid { bytes[24] |= 8; }
++        bytes.extend_from_slice(&[meta_id | if odd { 0x40 } else { 0 }, (padded / 2) as u8]);
++        bytes.extend_from_slice(digest);
++        if odd { bytes.push(0); }
++        let ck = (bytes.len() - 8) as u32;
++        bytes[4..8].copy_from_slice(&ck.to_le_bytes());
++        bytes
++    }
++
++    #[test]
++    fn wavpack_reads_md5_from_later_block_not_audio_bits() {
++        let mut bytes = block(0x0a, &[0xa5; 16], false, false);
++        let expected = [0x37; 16];
++        bytes.extend(block(0x26, &expected, false, false));
++        bytes.extend_from_slice(b"APETAGEX");
++        assert_eq!(wavpack_declared_md5(&mut Cursor::new(bytes)), Some(expected));
++        assert_eq!(wavpack_declared_md5(&mut Cursor::new(block(0x0a, &[0x42; 16], false, false))), None);
++        assert_eq!(wavpack_declared_md5(&mut Cursor::new(block(0x29, &expected, false, false))), Some(expected));
++        assert_eq!(wavpack_declared_md5(&mut Cursor::new(block(0x26, &expected, false, true))), None);
++    }
++
++    #[test]
++    fn wavpack_refuses_malformed_metadata_and_conflicting_checksums() {
++        let mut bytes = block(0x26, &[0x37; 16], false, false);
++        bytes.extend(block(0x26, &[0x38; 16], false, false));
++        assert_eq!(wavpack_declared_md5(&mut Cursor::new(bytes)), None);
++        let mut truncated = block(0x26, &[0x37; 16], false, false);
++        truncated.truncate(40);
++        assert_eq!(wavpack_declared_md5(&mut Cursor::new(truncated)), None);
++        let mut bad_size = block(0x26, &[0x37; 16], false, false);
++        bad_size[33] = 250;
++        assert_eq!(wavpack_declared_md5(&mut Cursor::new(bad_size)), None);
++    }
++
++    #[test]
++    fn on_disk_filter_avoids_mislabeling_non_audio_file_md5() {
++        let tmp = tempfile::tempdir().unwrap();
++        let path = tmp.path().join("audio.flac");
++        std::fs::write(&path, streaminfo([0xab; 16])).unwrap();
++        let md5 = inspect_stored_audio_md5(&path, &AudioFormat::Flac, false).unwrap();
++        assert_eq!(md5.kind, "FLAC STREAMINFO");
++        assert_eq!(md5.hex, "abababababababababababababababab");
++        assert!(inspect_stored_audio_md5(&path, &AudioFormat::Alac, false).is_none());
++    }
++}
+diff --git a/src/main.rs b/src/main.rs
+index b156d46..77fa69e 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -178,6 +178,26 @@ enum Commands {
+         #[arg(long = "dsd-true-peak-scan", value_name = "reference|standard|fast")]
+         dsd_true_peak_scan: Option<String>,
+ 
++        /// PCM sample-domain gain mode; applies to ordinary PCM sources.
++        #[arg(long = "pcm-gain", value_name = "off|true-peak-guard|true-peak-normalize|fixed-gain")]
++        pcm_gain: Option<String>,
++
++        /// Fixed PCM gain in dB; requires --pcm-gain fixed-gain.
++        #[arg(long = "pcm-gain-db", value_name = "DB")]
++        pcm_gain_db: Option<String>,
++
++        /// PCM certified true-peak ceiling in dBTP (-12 to 0 inclusive).
++        #[arg(long = "pcm-true-peak-target-dbtp", value_name = "DBTP")]
++        pcm_true_peak_target_dbtp: Option<String>,
++
++        /// PCM certified true-peak scope.
++        #[arg(long = "pcm-true-peak-scope", value_name = "track|album")]
++        pcm_true_peak_scope: Option<String>,
++
++        /// PCM certified true-peak scan tier.
++        #[arg(long = "pcm-true-peak-scan", value_name = "reference|standard|fast")]
++        pcm_true_peak_scan: Option<String>,
++
+         /// Append Lineage.txt content to COMMENT tag
+         #[arg(long)]
+         append_lineage: bool,
+@@ -630,6 +650,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
+             dsd_true_peak_target_dbtp,
+             dsd_true_peak_scope,
+             dsd_true_peak_scan,
++            pcm_gain,
++            pcm_gain_db,
++            pcm_true_peak_target_dbtp,
++            pcm_true_peak_scope,
++            pcm_true_peak_scan,
+             append_lineage,
+             write_log,
+             disc_subfolders,
+@@ -671,6 +696,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
+                 dsd_true_peak_target_dbtp,
+                 dsd_true_peak_scope,
+                 dsd_true_peak_scan,
++                pcm_gain,
++                pcm_gain_db,
++                pcm_true_peak_target_dbtp,
++                pcm_true_peak_scope,
++                pcm_true_peak_scan,
+                 append_lineage,
+                 write_log,
+                 generate_cue,
+@@ -1156,6 +1186,8 @@ fn apply_cli_dsd_reference_settings(
+         PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+     };
+ 
++    use tonepoet_pipeline::TruePeakTargetOrigin;
++
+     let any_flag = pathway.is_some()
+         || profile.is_some()
+         || gain.is_some()
+@@ -1210,6 +1242,7 @@ fn apply_cli_dsd_reference_settings(
+                     reference_policy: policy,
+                     ..tonepoet_pipeline::DsdSourceSettings::default()
+                 };
++                settings.dsd_true_peak_target_origin = TruePeakTargetOrigin::Default;
+                 DsdSourcePathway::Reference
+             }
+             other => anyhow::bail!(
+@@ -1257,6 +1290,7 @@ fn apply_cli_dsd_reference_settings(
+                     anyhow::bail!("--dsd-true-peak-target-dbtp must be between -12 and 0 dBTP");
+                 }
+                 settings.dsd.from_dsd.gain = settings.dsd.from_dsd.gain.with_target(target);
++                settings.dsd_true_peak_target_origin = TruePeakTargetOrigin::User;
+             }
+             if let Some(scope) = parsed_scope {
+                 settings.dsd.from_dsd.gain = settings.dsd.from_dsd.gain.with_scope(scope);
+@@ -1316,6 +1350,9 @@ fn apply_cli_dsd_reference_settings(
+             ),
+         };
+         settings.dsd.set_gain_policy(policy);
++        if parsed_true_peak_target.is_some() {
++            settings.dsd_true_peak_target_origin = TruePeakTargetOrigin::User;
++        }
+     } else if parsed_fixed_gain.is_some() {
+         anyhow::bail!("--dsd-gain-db requires --dsd-gain fixed-gain");
+     } else if parsed_true_peak_target.is_some() || parsed_scope.is_some() || parsed_scan.is_some() {
+@@ -1335,7 +1372,123 @@ fn apply_cli_dsd_reference_settings(
+             policy = policy.with_scan(scan);
+         }
+         settings.dsd.set_gain_policy(policy);
++        if parsed_true_peak_target.is_some() {
++            settings.dsd_true_peak_target_origin = TruePeakTargetOrigin::User;
++        }
++    }
++    Ok(())
++}
++
++/// Apply PCM sample gain without routing it through the DSD gain policy. Flags
++/// override a loaded preset; target/scope/scan alone may refine only an active
++/// true-peak preset, never silently turn an Off or Fixed policy into Normalize.
++fn apply_cli_pcm_true_peak_settings(
++    settings: &mut tonepoet_pipeline::PipelineSettings,
++    output_format: AudioFormat,
++    gain: Option<&str>,
++    fixed_gain: Option<&str>,
++    target: Option<&str>,
++    scope: Option<&str>,
++    scan: Option<&str>,
++) -> anyhow::Result<()> {
++    use tonepoet_pipeline::{
++        DbNano, SampleGainPolicy, TruePeakScanTier, TruePeakScope, TruePeakTargetOrigin,
++        PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
++    };
++    if [gain, fixed_gain, target, scope, scan].iter().all(|flag| flag.is_none()) {
++        return Ok(());
+     }
++    if matches!(output_format, AudioFormat::Dsf | AudioFormat::Dff) {
++        anyhow::bail!("PCM gain controls are not valid for a DSD output target");
++    }
++    let fixed = fixed_gain
++        .map(|value| value.parse::<DbNano>().map_err(anyhow::Error::msg))
++        .transpose()?;
++    let target_dbtp = target
++        .map(|value| value.parse::<DbNano>().map_err(anyhow::Error::msg))
++        .transpose()?;
++    if target_dbtp.is_some_and(|v| !(DbNano::MIN_NORMALIZE_TARGET..=DbNano::MAX_NORMALIZE_TARGET).contains(&v)) {
++        anyhow::bail!("--pcm-true-peak-target-dbtp must be between -12 and 0 dBTP");
++    }
++    let parsed_scope = match scope.map(|value| value.trim().to_ascii_lowercase()) {
++        Some(value) if value == "track" => Some(TruePeakScope::Track),
++        Some(value) if value == "album" => Some(TruePeakScope::Album),
++        Some(value) => anyhow::bail!("invalid --pcm-true-peak-scope '{value}'; expected track or album"),
++        None => None,
++    };
++    let parsed_scan = match scan.map(|value| value.trim().to_ascii_lowercase()) {
++        Some(value) if value == "reference" => Some(TruePeakScanTier::Reference),
++        Some(value) if value == "standard" => Some(TruePeakScanTier::Standard),
++        Some(value) if value == "fast" => Some(TruePeakScanTier::Fast),
++        Some(value) => anyhow::bail!("invalid --pcm-true-peak-scan '{value}'; expected reference, standard, or fast"),
++        None => None,
++    };
++    let old = settings.pcm_true_peak.policy;
++    let mut origin = settings.pcm_true_peak_target_origin;
++    let parsed_mode = gain.map(|value| value.trim().to_ascii_lowercase());
++    let policy = match parsed_mode.as_deref() {
++        Some("off") => {
++            if fixed.is_some() || target_dbtp.is_some() || parsed_scope.is_some() || parsed_scan.is_some() {
++                anyhow::bail!("--pcm-gain off does not accept gain/target/scope/scan controls");
++            }
++            origin = TruePeakTargetOrigin::Unknown;
++            SampleGainPolicy::Off
++        }
++        Some("fixed-gain") => {
++            if target_dbtp.is_some() || parsed_scope.is_some() || parsed_scan.is_some() {
++                anyhow::bail!("--pcm-gain fixed-gain does not accept true-peak controls");
++            }
++            origin = TruePeakTargetOrigin::Unknown;
++            SampleGainPolicy::FixedGain {
++                gain_db: fixed.ok_or_else(|| anyhow::anyhow!("--pcm-gain fixed-gain requires --pcm-gain-db"))?,
++            }
++        }
++        Some("true-peak-guard") | Some("true-peak-normalize") => {
++            if fixed.is_some() {
++                anyhow::bail!("--pcm-gain-db requires --pcm-gain fixed-gain");
++            }
++            let ceiling = target_dbtp.or_else(|| old.target_dbtp()).unwrap_or(PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP);
++            let scope = parsed_scope.or_else(|| old.scope()).unwrap_or(TruePeakScope::Track);
++            let scan = parsed_scan.or_else(|| old.scan()).unwrap_or(TruePeakScanTier::Fast);
++            if target_dbtp.is_some() {
++                origin = TruePeakTargetOrigin::User;
++            } else if old.target_dbtp().is_none() {
++                origin = TruePeakTargetOrigin::Default;
++            }
++            if parsed_mode.as_deref() == Some("true-peak-guard") {
++                SampleGainPolicy::TruePeakGuard { target_dbtp: ceiling, scope, scan }
++            } else {
++                SampleGainPolicy::TruePeakNormalize { target_dbtp: ceiling, scope, scan }
++            }
++        }
++        Some(other) => anyhow::bail!(
++            "invalid --pcm-gain '{other}'; expected off, true-peak-guard, true-peak-normalize, or fixed-gain"
++        ),
++        None => {
++            if fixed.is_some() {
++                anyhow::bail!("--pcm-gain-db requires --pcm-gain fixed-gain");
++            }
++            if !old.is_true_peak() {
++                anyhow::bail!(
++                    "PCM true-peak target/scope/scan controls require --pcm-gain true-peak-guard or true-peak-normalize (or an active true-peak preset)"
++                );
++            }
++            let mut policy = old;
++            if let Some(v) = target_dbtp {
++                policy = policy.with_target(v);
++                origin = TruePeakTargetOrigin::User;
++            }
++            if let Some(v) = parsed_scope { policy = policy.with_scope(v); }
++            if let Some(v) = parsed_scan { policy = policy.with_scan(v); }
++            policy
++        }
++    };
++    // Validate the candidate before mutating settings or runtime album authority.
++    let mut candidate = settings.clone();
++    candidate.pcm_true_peak.set_policy(policy);
++    candidate.pcm_true_peak_target_origin = origin;
++    candidate.validate().map_err(|error| anyhow::anyhow!("invalid PCM gain settings: {error}"))?;
++    *settings = candidate;
+     Ok(())
+ }
+ 
+@@ -1501,6 +1654,105 @@ mod dsd_reference_cli_settings_tests {
+ }
+ 
+ 
++#[cfg(test)]
++mod pcm_true_peak_cli_settings_tests {
++    use super::*;
++    use tonepoet_pipeline::{SampleGainPolicy, TruePeakScanTier, TruePeakScope, TruePeakTargetOrigin};
++
++    fn apply(
++        settings: &mut tonepoet_pipeline::PipelineSettings,
++        mode: Option<&str>, fixed: Option<&str>, target: Option<&str>,
++        scope: Option<&str>, scan: Option<&str>,
++    ) -> anyhow::Result<()> {
++        apply_cli_pcm_true_peak_settings(
++            settings, AudioFormat::Flac, mode, fixed, target, scope, scan,
++        )
++    }
++
++    #[test]
++    fn ordinary_pcm_flags_activate_guard_and_normalize_with_exact_targets() {
++        let mut settings = tonepoet_pipeline::PipelineSettings::default();
++        apply(&mut settings, Some("true-peak-guard"), None, Some("-0.125000001"),
++            Some("album"), Some("standard")).unwrap();
++        assert_eq!(settings.pcm_true_peak.policy, SampleGainPolicy::TruePeakGuard {
++            target_dbtp: "-0.125000001".parse().unwrap(),
++            scope: TruePeakScope::Album, scan: TruePeakScanTier::Standard,
++        });
++        assert_eq!(settings.pcm_true_peak_target_origin, TruePeakTargetOrigin::User);
++        apply(&mut settings, Some("true-peak-normalize"), None, None, None, None).unwrap();
++        assert_eq!(settings.pcm_true_peak.policy, SampleGainPolicy::TruePeakNormalize {
++            target_dbtp: "-0.125000001".parse().unwrap(),
++            scope: TruePeakScope::Album, scan: TruePeakScanTier::Standard,
++        });
++        assert_eq!(settings.pcm_true_peak_target_origin, TruePeakTargetOrigin::User);
++    }
++
++    #[test]
++    fn default_pcm_mode_uses_fast_scan_and_supports_zero_ceiling() {
++        let mut settings = tonepoet_pipeline::PipelineSettings::default();
++        apply(&mut settings, Some("true-peak-guard"), None, None, None, None).unwrap();
++        assert_eq!(settings.pcm_true_peak.policy.scan(), Some(TruePeakScanTier::Fast));
++        assert_eq!(settings.pcm_true_peak_target_origin, TruePeakTargetOrigin::Default);
++        apply(&mut settings, None, None, Some("0.000000000"), None, None).unwrap();
++        assert_eq!(settings.pcm_true_peak.policy.target_dbtp(), Some(tonepoet_pipeline::DbNano::ZERO));
++        assert_eq!(settings.pcm_true_peak_target_origin, TruePeakTargetOrigin::User);
++        apply(&mut settings, None, None, Some("-12.000000000"), None, None).unwrap();
++        assert_eq!(settings.pcm_true_peak.policy.target_dbtp(),
++            Some(tonepoet_pipeline::DbNano::MIN_NORMALIZE_TARGET));
++    }
++
++    #[test]
++    fn true_peak_flags_only_refine_a_valid_active_policy() {
++        let mut settings = tonepoet_pipeline::PipelineSettings::default();
++        let error = apply(&mut settings, None, None, Some("-1"), None, None).unwrap_err();
++        assert!(error.to_string().contains("require --pcm-gain"), "{error}");
++        assert_eq!(settings.pcm_true_peak.policy, SampleGainPolicy::Off);
++        let error = apply(&mut settings, Some("off"), None, Some("-1"), None, None).unwrap_err();
++        assert!(error.to_string().contains("does not accept"), "{error}");
++        let error = apply(&mut settings, Some("true-peak-guard"), None, Some("-12.000000001"), None, None).unwrap_err();
++        assert!(error.to_string().contains("between -12 and 0"), "{error}");
++        assert_eq!(settings.pcm_true_peak.policy, SampleGainPolicy::Off);
++    }
++
++    #[test]
++    fn pcm_fixed_mode_does_not_masquerade_as_true_peak() {
++        let mut settings = tonepoet_pipeline::PipelineSettings::default();
++        apply(&mut settings, Some("fixed-gain"), Some("+2.000000000"), None, None, None).unwrap();
++        assert_eq!(settings.pcm_true_peak.policy, SampleGainPolicy::FixedGain {
++            gain_db: "+2.000000000".parse().unwrap(),
++        });
++        assert_eq!(settings.pcm_true_peak_target_origin, TruePeakTargetOrigin::Unknown);
++        let error = apply(&mut settings, Some("fixed-gain"), Some("0"), Some("-1"), None, None)
++            .unwrap_err();
++        assert!(error.to_string().contains("does not accept"));
++        assert_eq!(settings.pcm_true_peak.policy.fixed_gain_db(), Some("+2.000000000".parse().unwrap()));
++        assert!(apply(&mut settings, Some("off"), None, None, None, None).is_ok());
++        assert_eq!(settings.pcm_true_peak.policy, SampleGainPolicy::Off);
++    }
++
++    #[test]
++    fn pcm_cli_rejects_dsd_output_target_without_mutation() {
++        let mut settings = tonepoet_pipeline::PipelineSettings::default();
++        assert!(apply_cli_pcm_true_peak_settings(
++            &mut settings, AudioFormat::Dsf, Some("true-peak-guard"),
++            None, None, None, None,
++        ).is_err());
++        assert_eq!(settings.pcm_true_peak.policy, SampleGainPolicy::Off);
++    }
++
++    #[test]
++    fn missing_provenance_is_backward_compatible_when_deserializing_settings() {
++        let original = tonepoet_pipeline::PipelineSettings::default();
++        let mut value = serde_json::to_value(original).unwrap();
++        let object = value.as_object_mut().unwrap();
++        assert!(!object.contains_key("dsd_true_peak_target_origin"));
++        assert!(!object.contains_key("pcm_true_peak_target_origin"));
++        let restored: tonepoet_pipeline::PipelineSettings = serde_json::from_value(value).unwrap();
++        assert_eq!(restored.dsd_true_peak_target_origin, TruePeakTargetOrigin::Unknown);
++        assert_eq!(restored.pcm_true_peak_target_origin, TruePeakTargetOrigin::Unknown);
++    }
++}
++
+ fn pipeline_audio_format_for_cli(format: AudioFormat) -> tonepoet_pipeline::AudioFormat {
+     use tonepoet_pipeline::AudioFormat as PipelineFormat;
+     match format {
+@@ -1574,6 +1826,11 @@ async fn run_convert(
+     dsd_true_peak_target_dbtp: Option<String>,
+     dsd_true_peak_scope: Option<String>,
+     dsd_true_peak_scan: Option<String>,
++    pcm_gain: Option<String>,
++    pcm_gain_db: Option<String>,
++    pcm_true_peak_target_dbtp: Option<String>,
++    pcm_true_peak_scope: Option<String>,
++    pcm_true_peak_scan: Option<String>,
+     append_lineage: bool,
+     write_log: bool,
+     generate_cue: bool,
+@@ -1817,6 +2074,15 @@ async fn run_convert(
+         dsd_true_peak_scope.as_deref(),
+         dsd_true_peak_scan.as_deref(),
+     )?;
++    apply_cli_pcm_true_peak_settings(
++        &mut cli_pipeline_settings,
++        output_format,
++        pcm_gain.as_deref(),
++        pcm_gain_db.as_deref(),
++        pcm_true_peak_target_dbtp.as_deref(),
++        pcm_true_peak_scope.as_deref(),
++        pcm_true_peak_scan.as_deref(),
++    )?;
+     options.pipeline_settings = Some(cli_pipeline_settings);
+ 
+     // Build pipeline request template from CLI flags (PR 10).
+diff --git a/src/tui/app.rs b/src/tui/app.rs
+index 5265389..37f9b28 100644
+--- a/src/tui/app.rs
++++ b/src/tui/app.rs
+@@ -4988,6 +4988,8 @@ pub struct FormatState {
+     pub pcm_true_peak_scope: PillState<TruePeakScope>,
+     pub pcm_true_peak_scan_mode: PillState<TruePeakScanTier>,
+     pub pcm_true_peak_target_dbtp: DbNano,
++    /// User/default/preset provenance of the numeric ceiling, separate from gain mode.
++    pub pcm_true_peak_target_origin: tonepoet_pipeline::TruePeakTargetOrigin,
+     pub pcm_fixed_gain_db: DbNano,
+     pub noise_shaper: PillState<DsdNoiseShaper>,
+     pub modulator_order: PillState<ModulatorOrder>,
+@@ -5009,6 +5011,7 @@ pub struct FormatState {
+     pub dsd_true_peak_scan_mode: PillState<TruePeakScanTier>,
+     /// Certified Custom/Reference DSD true-peak target in dBTP.
+     pub dsd_true_peak_target_dbtp: DbNano,
++    pub dsd_true_peak_target_origin: tonepoet_pipeline::TruePeakTargetOrigin,
+     /// Fixed DSD-to-PCM gain in dB.
+     pub dsd_gain_db: DbNano,
+     /// Whether the currently previewed source is DSD. Drives visibility and
+@@ -5357,6 +5360,7 @@ impl FormatState {
+             pcm_true_peak_scope,
+             pcm_true_peak_scan_mode,
+             pcm_true_peak_target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
++            pcm_true_peak_target_origin: tonepoet_pipeline::TruePeakTargetOrigin::Default,
+             pcm_fixed_gain_db: DbNano::ZERO,
+             noise_shaper,
+             modulator_order,
+@@ -5370,6 +5374,7 @@ impl FormatState {
+             dsd_true_peak_scope,
+             dsd_true_peak_scan_mode,
+             dsd_true_peak_target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
++            dsd_true_peak_target_origin: tonepoet_pipeline::TruePeakTargetOrigin::Default,
+             dsd_gain_db: DbNano(0),
+             source_is_dsd: false,
+             source_pcm_float_bits: None,
+@@ -6261,6 +6266,7 @@ impl FormatState {
+     pub(crate) fn apply_reference_gain_defaults(&mut self) {
+         self.dsd_gain_mode.select_value(&DsdGainMode::ReferenceAuto);
+         self.dsd_true_peak_target_dbtp = DbNano::DEFAULT_REFERENCE_TRUE_PEAK_TARGET;
++        self.dsd_true_peak_target_origin = tonepoet_pipeline::TruePeakTargetOrigin::Default;
+         self.dsd_true_peak_scope.select_value(&TruePeakScope::Album);
+         self.dsd_true_peak_scan_mode.select_value(&TruePeakScanTier::Standard);
+     }
+@@ -6294,6 +6300,12 @@ impl FormatState {
+         if row == FormatField::Resampler {
+             self.resampler_overridden = true;
+         }
++        if row == FormatField::PcmTruePeakTarget {
++            self.pcm_true_peak_target_origin = tonepoet_pipeline::TruePeakTargetOrigin::User;
++        }
++        if row == FormatField::DsdTruePeakTarget {
++            self.dsd_true_peak_target_origin = tonepoet_pipeline::TruePeakTargetOrigin::User;
++        }
+         if matches!(
+             row,
+             FormatField::PcmTruePeak
+@@ -7259,8 +7271,21 @@ fn clamp_pcm_true_peak_target(value: DbNano) -> DbNano {
+     ))
+ }
+ 
+-fn step_pcm_true_peak_target(value: &mut DbNano, delta_nano: i64) {
+-    *value = clamp_pcm_true_peak_target(DbNano(value.0.saturating_add(delta_nano)));
++fn step_pcm_true_peak_target(value: &mut DbNano, direction: i8) {
++    // Move on the 0.25 dB grid, even when the starting value was entered
++    // through the custom decimal command or restored from an old preset.
++    // Thus -0.10 goes to 0.00 or -0.25, not to +0.15 or -0.35.
++    let current = clamp_pcm_true_peak_target(*value).0;
++    let step = tonepoet_pipeline::SampleGainPolicy::TARGET_SELECT_STEP.0;
++    let remainder = current.rem_euclid(step);
++    let delta = if direction > 0 {
++        if remainder == 0 { step } else { step - remainder }
++    } else if remainder == 0 {
++        -step
++    } else {
++        -remainder
++    };
++    *value = clamp_pcm_true_peak_target(DbNano(current.saturating_add(delta)));
+ }
+ 
+ fn clamp_dsd_to_pcm_gain_db(value: DbNano) -> DbNano {
+@@ -7463,7 +7488,7 @@ impl FocusedPill<'_> {
+             Self::PcmTruePeakScan(p) => p.select_next(),
+             Self::PcmTruePeakTarget { target_dbtp, gain_mode } => {
+                 preserve_pcm_true_peak_mode(gain_mode);
+-                step_pcm_true_peak_target(*target_dbtp, 50_000_000);
++                step_pcm_true_peak_target(*target_dbtp, 1);
+             }
+             Self::NoiseShaper(p) => p.select_next(),
+             Self::ModulatorOrder(p) => p.select_next(),
+@@ -7478,7 +7503,7 @@ impl FocusedPill<'_> {
+             Self::DsdTruePeakScan(p) => p.select_next(),
+             Self::DsdTruePeakTarget { target_dbtp, gain_mode } => {
+                 preserve_dsd_true_peak_mode(gain_mode);
+-                step_pcm_true_peak_target(*target_dbtp, 50_000_000);
++                step_pcm_true_peak_target(*target_dbtp, 1);
+             }
+             Self::DsdGainDb { gain_db } => {
+                 step_dsd_to_pcm_gain_db(*gain_db, DSD_TO_PCM_GAIN_DB_STEP_NANO);
+@@ -7503,7 +7528,7 @@ impl FocusedPill<'_> {
+             Self::PcmTruePeakScan(p) => p.select_prev(),
+             Self::PcmTruePeakTarget { target_dbtp, gain_mode } => {
+                 preserve_pcm_true_peak_mode(gain_mode);
+-                step_pcm_true_peak_target(*target_dbtp, -50_000_000);
++                step_pcm_true_peak_target(*target_dbtp, -1);
+             }
+             Self::NoiseShaper(p) => p.select_prev(),
+             Self::ModulatorOrder(p) => p.select_prev(),
+@@ -7518,7 +7543,7 @@ impl FocusedPill<'_> {
+             Self::DsdTruePeakScan(p) => p.select_prev(),
+             Self::DsdTruePeakTarget { target_dbtp, gain_mode } => {
+                 preserve_dsd_true_peak_mode(gain_mode);
+-                step_pcm_true_peak_target(*target_dbtp, -50_000_000);
++                step_pcm_true_peak_target(*target_dbtp, -1);
+             }
+             Self::DsdGainDb { gain_db } => {
+                 step_dsd_to_pcm_gain_db(*gain_db, -DSD_TO_PCM_GAIN_DB_STEP_NANO);
+@@ -20180,7 +20205,8 @@ mod dsd_gain_format_state_tests {
+         state.field_focus = FormatField::DsdTruePeakTarget;
+         state.select_focused_next(None, None);
+         assert_eq!(*state.dsd_gain_mode.selected_value(), DsdGainMode::TruePeakGuard);
+-        assert_eq!(state.dsd_true_peak_target_dbtp, "-0.050000000".parse().unwrap());
++        assert_eq!(state.dsd_true_peak_target_dbtp, DbNano::ZERO);
++        assert_eq!(state.dsd_true_peak_target_origin, tonepoet_pipeline::TruePeakTargetOrigin::User);
+     }
+ 
+     #[test]
+@@ -20196,7 +20222,7 @@ mod dsd_gain_format_state_tests {
+         state.field_focus = FormatField::DsdTruePeakTarget;
+         state.select_focused_prev(None, None);
+         assert_eq!(*state.dsd_gain_mode.selected_value(), DsdGainMode::ReferenceAuto);
+-        assert_eq!(state.dsd_true_peak_target_dbtp, "-1.050000000".parse().unwrap());
++        assert_eq!(state.dsd_true_peak_target_dbtp, "-1.250000000".parse().unwrap());
+     }
+ 
+     #[test]
+@@ -24427,3 +24453,29 @@ mod browse_convert_expansion_lifecycle_tests {
+         assert!(!app.browse_convert_expansion_pending_for(generation, &request));
+     }
+ }
++
++#[cfg(test)]
++mod r29_shared_ceiling_grid_tests {
++    use super::*;
++
++    #[test]
++    fn quarter_db_grid_is_bounded_and_snaps_custom_values() {
++        let cases = [
++            ("-0.100000000", 1, "0.000000000"),
++            ("-0.100000000", -1, "-0.250000000"),
++            ("-1.000000000", 1, "-0.750000000"),
++            ("-1.000000000", -1, "-1.250000000"),
++            ("-0.250000001", 1, "-0.250000000"),
++            ("-0.250000001", -1, "-0.500000000"),
++            ("-12.000000000", -1, "-12.000000000"),
++            ("0.000000000", 1, "0.000000000"),
++        ];
++        for (start, direction, expected) in cases {
++            let mut value = start.parse().unwrap();
++            step_pcm_true_peak_target(&mut value, direction);
++            assert_eq!(value, expected.parse().unwrap(), "from {start} in direction {direction}");
++        }
++        assert_eq!(tonepoet_pipeline::SampleGainPolicy::TARGET_SELECT_STEP,
++            tonepoet_pipeline::DbNano(250_000_000));
++    }
++}
+diff --git a/src/tui/command.rs b/src/tui/command.rs
+index ed93bdc..52132f4 100644
+--- a/src/tui/command.rs
++++ b/src/tui/command.rs
+@@ -15821,7 +15821,7 @@ fn execute_rename(app: &mut AppState, new_name: &str, tx: &mpsc::Sender<AppMessa
+ fn execute_set(app: &mut AppState, key: &str, value: &str) {
+     if key.is_empty() {
+         app.set_status(
+-            "Usage: :set <key> <value>  (format, rate, depth, dither, rg, dsd-path, dsd-reconstruction, dsd-lowpass, dsd-profile, dsd-export-level, dsd-gain, dsd-true-peak-target, dsd-true-peak-scope, dsd-true-peak-scan, dsd-gain-db, verification)",
++            "Usage: :set <key> <value>  (format, rate, depth, dither, rg, dsd-path, dsd-reconstruction, dsd-lowpass, dsd-profile, dsd-export-level, dsd-gain, pcm-true-peak-target, dsd-true-peak-target, dsd-true-peak-scope, dsd-true-peak-scan, dsd-gain-db, verification)",
+         );
+         return;
+     }
+@@ -15937,6 +15937,12 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
+                     app.convert.format.dsd_true_peak_scan_mode.selected_label()
+                 ));
+             }
++            "pcm-true-peak-target" => {
++                app.set_status(format!(
++                    "pcm-true-peak-target = {} dBTP",
++                    app.convert.format.pcm_true_peak_target_dbtp.render(false)
++                ));
++            }
+             "dsd-true-peak-target" => {
+                 app.set_status(format!(
+                     "dsd-true-peak-target = {} dBTP",
+@@ -16379,6 +16385,23 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
+             Ok(_) => app.set_status("dsd-gain-db must be between -24 and +24 dB"),
+             Err(error) => app.set_status(format!("Invalid dsd-gain-db: {error}")),
+         },
++        "pcm-true-peak-target" => match value.parse::<tonepoet_pipeline::DbNano>() {
++            Ok(parsed) if (tonepoet_pipeline::DbNano::MIN_NORMALIZE_TARGET..=tonepoet_pipeline::DbNano::MAX_NORMALIZE_TARGET).contains(&parsed) => {
++                if !matches!(
++                    *app.convert.format.pcm_gain_mode.selected_value(),
++                    PcmGainMode::TruePeakGuard | PcmGainMode::TruePeakNormalize
++                ) && !app.convert.format.pcm_gain_mode.select_value(&PcmGainMode::TruePeakGuard) {
++                    app.set_status("PCM true-peak gain is unavailable for the selected output");
++                    return;
++                }
++                app.convert.format.pcm_true_peak_target_dbtp = parsed;
++                app.convert.format.pcm_true_peak_target_origin = tonepoet_pipeline::TruePeakTargetOrigin::User;
++                app.preset.mark_modified();
++                app.set_status(format!("pcm-true-peak-target = {} dBTP", parsed.render(false)));
++            }
++            Ok(_) => app.set_status("pcm-true-peak-target must be between -12 and 0 dBTP"),
++            Err(error) => app.set_status(format!("Invalid pcm-true-peak-target: {error}")),
++        },
+         "dsd-true-peak-target" => match value.parse::<tonepoet_pipeline::DbNano>() {
+             Ok(parsed) if (tonepoet_pipeline::DbNano::MIN_NORMALIZE_TARGET..=tonepoet_pipeline::DbNano::MAX_NORMALIZE_TARGET).contains(&parsed) => {
+                 if *app.convert.format.dsd_pathway.selected_value()
+@@ -16393,6 +16416,7 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
+                     return;
+                 }
+                 app.convert.format.dsd_true_peak_target_dbtp = parsed;
++                app.convert.format.dsd_true_peak_target_origin = tonepoet_pipeline::TruePeakTargetOrigin::User;
+                 app.convert.format.dsd_gain_overridden = true;
+                 app.preset.mark_modified();
+                 app.set_status(format!("dsd-true-peak-target = {} dBTP", parsed.render(false)));
+@@ -16402,7 +16426,7 @@ fn execute_set(app: &mut AppState, key: &str, value: &str) {
+         },
+         _ => {
+             app.set_status(format!(
+-                "Unknown setting: {}. Try: format, rate, depth, dither, rg, dsd-path, dsd-reconstruction, dsd-lowpass, dsd-profile, dsd-export-level, dsd-gain, dsd-true-peak-target, dsd-true-peak-scope, dsd-true-peak-scan, dsd-gain-db",
++                "Unknown setting: {}. Try: format, rate, depth, dither, rg, dsd-path, dsd-reconstruction, dsd-lowpass, dsd-profile, dsd-export-level, dsd-gain, pcm-true-peak-target, dsd-true-peak-target, dsd-true-peak-scope, dsd-true-peak-scan, dsd-gain-db",
+                 key
+             ));
+         }
+diff --git a/src/tui/convert_actions.rs b/src/tui/convert_actions.rs
+index 854c83f..b611296 100644
+--- a/src/tui/convert_actions.rs
++++ b/src/tui/convert_actions.rs
+@@ -611,6 +611,8 @@ pub fn format_state_to_pipeline_settings(format: &FormatState) -> Result<Pipelin
+         },
+         dsd,
+         pcm_true_peak,
++        pcm_true_peak_target_origin: format.pcm_true_peak_target_origin,
++        dsd_true_peak_target_origin: format.dsd_true_peak_target_origin,
+         // settings-sentinel-allow: metadata/verification defaults until TUI exposes them
+         metadata: Default::default(),
+         verification: Default::default(),
+diff --git a/src/tui/draw_output.rs b/src/tui/draw_output.rs
+index e09333f..d432277 100644
+--- a/src/tui/draw_output.rs
++++ b/src/tui/draw_output.rs
+@@ -168,6 +168,7 @@ pub fn draw_format_pane(
+                         format_state.pcm_true_peak_target_dbtp,
+                         row_focused,
+                         format_state.pcm_true_peak_target_is_capped(),
++                        "pcm-true-peak-target",
+                         theme,
+                     )),
+                     FormatField::TruePeakScope => lines.push(pill_row(
+@@ -302,14 +303,14 @@ pub fn draw_format_pane(
+                         "",
+                         theme,
+                     )),
+-                    FormatField::DsdTruePeakTarget => lines.push(dsd_db_value_row(
++                    FormatField::DsdTruePeakTarget => lines.push(pcm_true_peak_db_value_row(
+                         border_color,
+                         w,
+                         "TP target  ",
+                         format_state.dsd_true_peak_target_dbtp,
+-                        true,
+                         row_focused,
+-                        "",
++                        false,
++                        "dsd-true-peak-target",
+                         theme,
+                     )),
+                     FormatField::Container => {
+@@ -565,6 +566,7 @@ fn pcm_true_peak_db_value_row(
+     value: tonepoet_pipeline::DbNano,
+     focused: bool,
+     lossy_capped: bool,
++    custom_key: &'static str,
+     theme: super::theme::Theme,
+ ) -> Line<'static> {
+     let label_style = if focused { theme.bright() } else { theme.muted() };
+@@ -577,21 +579,24 @@ fn pcm_true_peak_db_value_row(
+         Span::styled("│", theme.border(border_color)),
+         Span::styled(format!("   {label}"), label_style),
+         Span::styled("< ", control_style),
+-        Span::styled(format!("{} dBTP", value.render(true)), control_style),
++        Span::styled(format!("{} dBTP", {
++            let exact = value.render(false);
++            exact.trim_end_matches('0').trim_end_matches('.').to_string()
++        }), control_style),
+         Span::styled(" >", control_style),
+         Span::raw("  "),
+-        Span::styled(
+-            if lossy_capped {
+-                format!(
+-                    "lossy encoder input capped at {} dBTP",
+-                    tonepoet_pipeline::PCM_TRUE_PEAK_LOSSY_MAX_TARGET_DBTP.render(true),
+-                )
+-            } else {
+-                "left/right adjust".to_string()
+-            },
+-            theme.muted(),
+-        ),
+     ];
++    let hint = if lossy_capped {
++        format!(
++            "lossy encoder input capped at {} dBTP; custom: :set {custom_key} <dBTP>",
++            tonepoet_pipeline::PCM_TRUE_PEAK_LOSSY_MAX_TARGET_DBTP.render(true),
++        )
++    } else {
++        format!("0.25 dB steps; custom: :set {custom_key} <dBTP>")
++    };
++    let room = width.saturating_sub(spans.iter().map(|span| span.width()).sum::<usize>() + 1);
++    let hint = hint.chars().take(room).collect::<String>();
++    spans.push(Span::styled(hint, theme.muted()));
+     let content_width: usize = spans.iter().map(|span| span.width()).sum();
+     spans.push(Span::raw(" ".repeat(width.saturating_sub(content_width + 1))));
+     spans.push(Span::styled("│", theme.border(border_color)));
+diff --git a/src/tui/presets.rs b/src/tui/presets.rs
+index 4b50221..38127c0 100644
+--- a/src/tui/presets.rs
++++ b/src/tui/presets.rs
+@@ -771,6 +771,8 @@ impl TuiPreset {
+                                     .contains(&value) =>
+                             {
+                                 format_state.dsd_true_peak_target_dbtp = value;
++                                format_state.dsd_true_peak_target_origin =
++                                    tonepoet_pipeline::TruePeakTargetOrigin::Preset;
+                                 report.record("dsd_true_peak_target_dbtp", true);
+                             }
+                             _ => report.record("dsd_true_peak_target_dbtp", false),
+@@ -925,6 +927,8 @@ impl TuiPreset {
+                             .contains(&value) =>
+                     {
+                         format_state.pcm_true_peak_target_dbtp = value;
++                        format_state.pcm_true_peak_target_origin =
++                            tonepoet_pipeline::TruePeakTargetOrigin::Preset;
+                         report.record("pcm_true_peak_target_dbtp", true);
+                     }
+                     _ => report.record("pcm_true_peak_target_dbtp", false),
+@@ -1192,6 +1196,7 @@ impl TuiPreset {
+                 // DSD source has been probed in the TUI.
+                 settings.dsd.from_dsd = dsd_settings.dsd.from_dsd.clone();
+                 settings.dsd.general_from_dsd = dsd_settings.dsd.general_from_dsd.clone();
++                settings.dsd_true_peak_target_origin = dsd_settings.dsd_true_peak_target_origin;
+             }
+             _ => return Err(format!("preset '{}' did not produce pipeline settings", self.name)),
+         }
+diff --git a/tonepoet-pipeline/src/settings.rs b/tonepoet-pipeline/src/settings.rs
+index edc88c3..5b1a501 100644
+--- a/tonepoet-pipeline/src/settings.rs
++++ b/tonepoet-pipeline/src/settings.rs
+@@ -18,6 +18,36 @@ use crate::dsd_reference::{
+ };
+ use crate::error::{PlanningError, Result};
+ 
++/// Provenance of a selected true-peak ceiling, independent of how gain is
++/// calculated. This is presentation metadata, not an audio-processing input.
++/// `Unknown` is the safe interpretation of requests predating this field.
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize), serde(rename_all = "snake_case"))]
++pub enum TruePeakTargetOrigin {
++    #[default]
++    Unknown,
++    Default,
++    User,
++    Preset,
++}
++
++impl TruePeakTargetOrigin {
++    #[must_use]
++    pub const fn is_unknown(&self) -> bool {
++        matches!(self, Self::Unknown)
++    }
++
++    #[must_use]
++    pub const fn human_label(self) -> &'static str {
++        match self {
++            Self::Default => "default target",
++            Self::User => "set explicitly",
++            Self::Preset => "from preset",
++            Self::Unknown => "origin not recorded",
++        }
++    }
++}
++
+ /// Single source of truth for all conversion parameters.
+ #[derive(Debug, Clone, PartialEq)]
+ #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+@@ -63,6 +93,12 @@ pub struct PipelineSettings {
+     /// True-peak measurement and linear-gain policy for ordinary PCM conversions.
+     #[cfg_attr(feature = "serde", serde(default))]
+     pub pcm_true_peak: PcmTruePeakGainSettings,
++    /// Presentation-only origins; never inferred from numeric equality with a default.
++    /// Omitted in older requests, whose origin must not be fabricated.
++    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "TruePeakTargetOrigin::is_unknown"))]
++    pub pcm_true_peak_target_origin: TruePeakTargetOrigin,
++    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "TruePeakTargetOrigin::is_unknown"))]
++    pub dsd_true_peak_target_origin: TruePeakTargetOrigin,
+     /// Metadata and tag behavior.
+     pub metadata: MetadataSettings,
+     /// Post-encode verification behavior.
+@@ -93,6 +129,8 @@ impl Default for PipelineSettings {
+             soxr_resampler: SoxrResamplerSettings::default(),
+             dsd: DsdSettings::default(),
+             pcm_true_peak: PcmTruePeakGainSettings::default(),
++            pcm_true_peak_target_origin: TruePeakTargetOrigin::Unknown,
++            dsd_true_peak_target_origin: TruePeakTargetOrigin::Unknown,
+             metadata: MetadataSettings::default(),
+             verification: VerificationSettings::default(),
+             replay_gain: ReplayGainSettings::default(),
+@@ -927,6 +965,11 @@ impl Default for SampleGainPolicy {
+ }
+ 
+ impl SampleGainPolicy {
++    /// Grid for the PCM and DSD true-peak ceiling selectors. Custom values
++    /// remain representable at DbNano precision; this does not restrict the
++    /// settings schema or the certified measurement algorithm.
++    pub const TARGET_SELECT_STEP: DbNano = DbNano(250_000_000);
++
+     /// Construct PCM Guard with the raw PCM defaults.
+     #[must_use]
+     pub const fn pcm_guard_default() -> Self {
