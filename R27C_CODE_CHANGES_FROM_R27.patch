@@ -1,0 +1,300 @@
+diff --git a/src/convert/pipeline/stages.rs b/src/convert/pipeline/stages.rs
+index ce0924a..5038383 100644
+--- a/src/convert/pipeline/stages.rs
++++ b/src/convert/pipeline/stages.rs
+@@ -17010,6 +17010,11 @@ struct ConversionLogTrackFragment {
+     /// execution_evidence; these values do not claim that gain was performed.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     reference_album_gain: Option<ReferenceAlbumGainLogFacts>,
++    /// The selected Reference gain mode is a display hint, not evidence of
++    /// execution. The completed typed operations remain the sole authority for
++    /// whether processing was performed. None supports older fragments.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    reference_gain_is_off: Option<bool>,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     metadata: Option<String>,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+@@ -17533,6 +17538,12 @@ fn structured_conversion_log_track_fragment(
+                 artifact.and_then(|artifact| artifact.reference_evidence.as_ref()),
+             )
+         }),
++        reference_gain_is_off: artifact
++            .and_then(|artifact| artifact.reference_evidence.as_ref())
++            .map(|reference| matches!(
++                reference.plan.gain_policy,
++                tonepoet_pipeline::ResolvedGainPolicy::Off { .. }
++            )),
+         metadata: metadata_satisfaction_label(
+             artifact,
+             prepared,
+@@ -17603,8 +17614,10 @@ fn render_structured_conversion_log_track_fragment(
+         &fragment.execution_evidence,
+         album_presentation,
+     );
+-    if fragment.reference_album_gain.is_some() {
+-        humanize_reference_processing(&mut scoped_evidence);
++    if summary.outcome == ConversionLogTrackOutcome::Success
++        && completed_reference_processing(&fragment.execution_evidence)
++    {
++        humanize_reference_processing(&mut scoped_evidence, fragment.reference_gain_is_off);
+     }
+     let processing = if summary.outcome == ConversionLogTrackOutcome::Success {
+         render_track_processing(&scoped_evidence)
+@@ -17711,14 +17724,41 @@ fn execution_evidence_for_album_scope(
+     scoped
+ }
+ 
+-/// Hide internal Reference carrier precision and 12 dB restore only in the
+-/// transient human projection. For a nonuniform/partial batch, retain each
+-/// track's actually executed gain, computed from its own completed scalar.
+-fn humanize_reference_processing(evidence: &mut TrackExecutionEvidence) {
+-    // The caller has already confirmed qualified Reference gain facts on the
+-    // original track; album promotion may have removed the terminal operation
+-    // from this temporary clone before we reach the remaining per-track gain.
+-    for operation in &mut evidence.operations {
++/// Recognize a completed qualified Reference reconstruction without relying
++/// on the album-auto gain carrier. Other DSD routes do not carry this terminal
++/// kind plus the protected R64 conversion contract.
++fn completed_reference_processing(evidence: &TrackExecutionEvidence) -> bool {
++    let mut terminals = evidence.delivered_operations()
++        .filter(|operation| operation.kind == "reference_terminal_realization");
++    if terminals.next().is_none() || terminals.next().is_some() {
++        return false;
++    }
++    let mut conversions = evidence.delivered_operations()
++        .filter(|operation| operation.kind == "dsd_to_pcm");
++    let Some(conversion) = conversions.next() else {
++        return false;
++    };
++    conversions.next().is_none() && conversion.parameters.iter().any(|parameter| {
++        parameter.name == "Target precision"
++            && parameter.value == EvidenceValue::BitDepth("64-bit floating-point".to_string())
++    })
++}
++
++/// Hide the protected Reference carrier and its fixed restoration only in the
++/// temporary human view. Gain Off has no user-selected music-level gain step;
++/// automatic Track gain still reports its completed music-level scalar (even
++/// when that scalar is zero). The original execution record is untouched.
++fn humanize_reference_processing(
++    evidence: &mut TrackExecutionEvidence,
++    gain_is_off: Option<bool>,
++) {
++    // Album promotion may already have removed the gain and terminal records
++    // from this clone. Never infer or manufacture their execution here.
++    let reference_gain_decision_ids = evidence.decisions.iter()
++        .filter(|decision| decision.kind == "reference_gain")
++        .map(|decision| decision.id.clone())
++        .collect::<BTreeSet<_>>();
++    evidence.operations.retain_mut(|operation| {
+         match operation.kind.as_str() {
+             "apply_gain" => {
+                 let has_fixed_restore = operation.parameters.iter().any(|parameter| {
+@@ -17726,7 +17766,7 @@ fn humanize_reference_processing(evidence: &mut TrackExecutionEvidence) {
+                         && parameter.value == EvidenceValue::Text("+12.000 dB".to_string())
+                 });
+                 if !has_fixed_restore {
+-                    continue;
++                    return true;
+                 }
+                 let music_gain = operation.parameters.iter().find_map(|parameter| {
+                     if parameter.name != "Applied terminal scalar" {
+@@ -17740,6 +17780,12 @@ fn humanize_reference_processing(evidence: &mut TrackExecutionEvidence) {
+                         .checked_sub(tonepoet_pipeline::DbNano::HEADROOM_RESTORATION)
+                 });
+                 if let Some(gain) = music_gain {
++                    // An old on-disk fragment has no mode hint. Suppressing
++                    // zero then avoids falsely advertising Reference plumbing
++                    // as requested gain; new Track auto records preserve zero.
++                    if gain.0 == 0 && gain_is_off != Some(false) {
++                        return false;
++                    }
+                     operation.parameters.retain(|parameter| {
+                         parameter.name != "Fixed Reference protection restored"
+                     });
+@@ -17756,6 +17802,12 @@ fn humanize_reference_processing(evidence: &mut TrackExecutionEvidence) {
+                     || parameter.value != EvidenceValue::BitDepth("64-bit floating-point".to_string())
+             }),
+             "reference_terminal_realization" => {
++                if gain_is_off != Some(false) {
++                    // A pre-R27C fragment cannot distinguish Off from auto;
++                    // do not advertise an automatic gain choice for its
++                    // fixed-only restoration.
++                    operation.decision_ids.retain(|id| !reference_gain_decision_ids.contains(id));
++                }
+                 if let Some(position) = operation.parameters.iter().position(|parameter| {
+                     parameter.name == "Sample contract"
+                 }) {
+@@ -17771,7 +17823,8 @@ fn humanize_reference_processing(evidence: &mut TrackExecutionEvidence) {
+             }
+             _ => {}
+         }
+-    }
++        true
++    });
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -17994,12 +18047,13 @@ fn build_conversion_log_album_presentation(
+     let mut body = Vec::<String>::new();
+     let reference_gain = album_uniform_reference_gain(tracks);
+     let reference_gain_promoted = matches!(&reference_gain, AlbumUniformOperation::Uniform(_));
+-    let reference_pcm = if reference_gain_promoted {
+-        album_uniform_reference_pcm_output(tracks)
+-    } else {
+-        None
+-    };
++    // A delivered Reference PCM contract is independent of the gain choice:
++    // Off and Track auto use the same qualified terminal as Album auto.
++    let reference_pcm = album_uniform_reference_pcm_output(tracks);
+     let reference_pcm_promoted = reference_pcm.is_some();
++    let completed_reference = tracks.iter().any(|(fragment, _)| {
++        completed_reference_processing(&fragment.execution_evidence)
++    });
+     let mut promoted_uniform_fact = false;
+ 
+     match album_uniform_source_extraction(tracks) {
+@@ -18134,7 +18188,7 @@ fn build_conversion_log_album_presentation(
+     // visible under their individual tracks.
+     // An incomplete/mismatched Reference promotion must not fall back to
+     // hoisting a raw terminal scalar as an album-level performed gain.
+-    if !reference_gain_promoted && !tracks.iter().any(|(fragment, _)| {
++    if !reference_gain_promoted && !completed_reference && !tracks.iter().any(|(fragment, _)| {
+         fragment.reference_album_gain.is_some()
+     }) {
+         match album_uniform_operation(tracks, "apply_gain") {
+@@ -18172,7 +18226,7 @@ fn build_conversion_log_album_presentation(
+     if body.is_empty() {
+         return presentation;
+     }
+-    if promoted_uniform_fact && !reference_gain_promoted {
++    if promoted_uniform_fact && !reference_gain_promoted && !reference_pcm_promoted {
+         body.insert(
+             0,
+             format!("Uniform across all {} successful track(s):", tracks.len()),
+@@ -62614,6 +62668,125 @@ mod conversion_log_tests {
+             Some((96_000, "96 kHz, 32-bit float, mono".to_string(), "none".to_string())));
+     }
+ 
++    #[test]
++    fn r27c_reference_gain_off_hides_private_restore_but_keeps_delivered_pcm() {
++        let mut first = r27_qualified_reference_fragment(1);
++        let mut second = r27_qualified_reference_fragment(2);
++        for fragment in [&mut first, &mut second] {
++            // The terminal still performs a fixed restoration with gain Off;
++            // it is not a user-selected music-level gain operation.
++            fragment.reference_album_gain = None;
++            fragment.reference_gain_is_off = Some(true);
++            fragment.album_gain_decision = None;
++            fragment.shared_decision_scope = None;
++            fragment.execution_evidence.decisions[0].parameters[0].value =
++                EvidenceValue::Text("+12.000000000 dB".to_string());
++            let gain = fragment.execution_evidence.operations.iter_mut()
++                .find(|operation| operation.kind == "apply_gain").unwrap();
++            gain.parameters[0].value = EvidenceValue::Text("+12.000000000 dB".to_string());
++            gain.invocation_indices = vec![3];
++        }
++        let original_first = first.execution_evidence.clone();
++        let original_second = second.execution_evidence.clone();
++        let success_a = successful_log_summary();
++        let success_b = successful_log_summary();
++        let tracks = vec![(&first, &success_a), (&second, &success_b)];
++        let album = build_conversion_log_album_presentation(&tracks, true);
++        assert!(album.section.contains("Tracks extracted: 2"), "{}", album.section);
++        assert!(album.section.contains("Converted to PCM — sox, TonePoet qualified Reference path"), "{}", album.section);
++        assert!(album.section.contains("Output: 88.2 kHz, 24-bit integer, stereo"));
++        assert!(album.section.contains("Dither: TPDF"));
++        assert!(!album.section.contains("Album gain"), "{}", album.section);
++        assert!(!album.section.contains("Uniform across all"), "{}", album.section);
++        assert!(album.reference_terminal_static_promoted);
++        assert!(album.suppressed_operation_kinds.contains("dsd_to_pcm"));
++        assert!(!album.suppressed_operation_kinds.contains("apply_gain"));
++        for (fragment, summary) in tracks {
++            let rendered = render_structured_conversion_log_track_fragment(fragment, summary, &album);
++            for forbidden in ["Waveform gain", "Applied music-level gain", "Applied terminal scalar",
++                "Fixed Reference protection restored", "12.000", "64-bit floating-point",
++                "Target precision", "Selected by automatic policy: Resolved qualified Reference gain policy"] {
++                assert!(!rendered.contains(forbidden), "private or false gain {forbidden}: {rendered}");
++            }
++            // A per-track human fallback must also suppress the fixed-only
++            // restoration when the album was not eligible for promotion.
++            let standalone = render_structured_conversion_log_track_fragment(
++                fragment, summary, &ConversionLogAlbumPresentation::default(),
++            );
++            assert!(!standalone.contains("Waveform gain"), "{standalone}");
++            assert!(!standalone.contains("Applied terminal scalar"), "{standalone}");
++            assert!(!standalone.contains("Fixed Reference protection restored"), "{standalone}");
++            assert!(!standalone.contains("64-bit floating-point"), "{standalone}");
++            assert!(standalone.contains("Output: 88.2 kHz, 24-bit integer, stereo"), "{standalone}");
++            assert!(standalone.contains("Dither: TPDF"), "{standalone}");
++        }
++        let mut legacy = first.clone();
++        legacy.reference_gain_is_off = None; // pre-R27C coordination fragment
++        let legacy_human = render_structured_conversion_log_track_fragment(
++            &legacy, &success_a, &ConversionLogAlbumPresentation::default(),
++        );
++        assert!(!legacy_human.contains("Waveform gain"), "{legacy_human}");
++        assert!(!legacy_human.contains("Selected by automatic policy: Resolved qualified Reference gain policy"), "{legacy_human}");
++        assert_eq!(first.execution_evidence, original_first);
++        assert_eq!(second.execution_evidence, original_second);
++        let forensic = serde_json::to_string(&first.execution_evidence).unwrap();
++        assert!(forensic.contains("+12.000000000 dB"));
++        assert!(forensic.contains("+12.000 dB"));
++        assert!(forensic.contains("64-bit floating-point"));
++        assert_eq!(first.execution_evidence.operations.iter()
++            .find(|operation| operation.kind == "apply_gain").unwrap().invocation_indices, vec![3]);
++    }
++
++    #[test]
++    fn r27c_reference_track_auto_is_not_promoted_as_album_gain() {
++        let mut first = r27_qualified_reference_fragment(1);
++        let mut second = r27_qualified_reference_fragment(2);
++        for fragment in [&mut first, &mut second] {
++            fragment.reference_album_gain = None;
++            fragment.reference_gain_is_off = Some(false);
++            fragment.album_gain_decision = None;
++            fragment.shared_decision_scope = None;
++        }
++        // The second track's selected automatic music gain is exactly zero,
++        // which is distinct from an explicit Off selection.
++        second.execution_evidence.decisions[0].parameters[0].value =
++            EvidenceValue::Text("+12.000000000 dB".to_string());
++        second.execution_evidence.operations.iter_mut()
++            .find(|operation| operation.kind == "apply_gain").unwrap().parameters[0].value =
++            EvidenceValue::Text("+12.000000000 dB".to_string());
++
++        let success_a = successful_log_summary();
++        let success_b = successful_log_summary();
++        let tracks = vec![(&first, &success_a), (&second, &success_b)];
++        let album = build_conversion_log_album_presentation(&tracks, true);
++        assert!(album.section.contains("Converted to PCM —"), "{}", album.section);
++        assert!(!album.section.contains("Album gain"), "{}", album.section);
++        assert!(!album.section.contains("Waveform gain"), "{}", album.section);
++        assert!(!album.section.contains("Applied terminal scalar"), "{}", album.section);
++        assert!(!album.section.contains("64-bit floating-point"), "{}", album.section);
++        assert!(!album.suppressed_operation_kinds.contains("apply_gain"));
++        let rendered_first = render_structured_conversion_log_track_fragment(&first, &success_a, &album);
++        let rendered_second = render_structured_conversion_log_track_fragment(&second, &success_b, &album);
++        assert!(rendered_first.contains("Applied music-level gain: +4.072834475 dB"), "{rendered_first}");
++        assert!(rendered_second.contains("Applied music-level gain: +0.000000000 dB"), "{rendered_second}");
++        for rendered in [&rendered_first, &rendered_second] {
++            assert!(!rendered.contains("Album gain"), "{rendered}");
++            assert!(!rendered.contains("Applied terminal scalar"), "{rendered}");
++            assert!(!rendered.contains("Fixed Reference protection restored"), "{rendered}");
++            assert!(!rendered.contains("64-bit floating-point"), "{rendered}");
++        }
++
++        // A singleton track-scoped programme has no album-wide applied gain;
++        // its own completed gain must still be reported.
++        let singleton = vec![(&first, &success_a)];
++        let singleton_album = build_conversion_log_album_presentation(&singleton, true);
++        assert!(!singleton_album.section.contains("Album gain"), "{}", singleton_album.section);
++        assert!(singleton_album.section.contains("Output: 88.2 kHz, 24-bit integer, stereo"));
++        assert!(singleton_album.section.contains("Dither: TPDF"));
++        let singleton_track = render_structured_conversion_log_track_fragment(&first, &success_a, &singleton_album);
++        assert!(singleton_track.contains("Applied music-level gain: +4.072834475 dB"), "{singleton_track}");
++    }
++
+     #[test]
+     fn album_scope_promotes_only_uniform_complete_success_facts_once() {
+         let first = album_scope_test_fragment(1, 88_200);

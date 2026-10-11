@@ -1,0 +1,23 @@
+TonePoet R27C static quality gate (2026-10-10)
+===============================================
+Source baseline: TonePoet_LOGGING_R27_album_processing_corrective_2026-10-10.tar.gz
+Baseline archive SHA256: 14a0497b652014c3cc7cd1ab5c593ecdb0e56657fcf8d5dcc2209a7419aebe4a
+Original R27 regular files checked: 888
+Changed existing source files: ['src/convert/pipeline/stages.rs']
+Missing original files: []
+Source-file modification scope: PASS
+Edited source SHA256: e06832674e5466826a6da20d77dca21af462d597451f71cc4621c34b27d8be04
+Code-only patch SHA256: 01fe8385e770c3c38555040ce5dc9e4f7de77cd8c009473d3873018970b5b3e3
+Git whitespace/diff-check: PASS
+Patch applied to source independently extracted from R27 archive: PASS
+Patch reproduces edited file byte-for-byte: PASS
+Pygments RustLexer error tokens: 0
+Unclosed/mismatched syntax delimiters: 0
+Lexical/delimiter static scan: PASS (NOT a compiler)
+Regression tests added: r27c_reference_gain_off_hides_private_restore_but_keeps_delivered_pcm; r27c_reference_track_auto_is_not_promoted_as_album_gain
+R27 album-auto test bodies retained: YES
+Cargo/rustc/rustfmt/nix: NOT PRESENT
+Compiled Rust tests: NOT RUN
+Build-host and real SACD smokes: NOT RUN
+Reference source requalification: NOT RUN
+Browse -> Convert -> preset SACD acceptance (#43): NOT RUN

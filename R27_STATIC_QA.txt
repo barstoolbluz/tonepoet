@@ -1,0 +1,23 @@
+TonePoet R27 static QA (October 10, 2026)
+===================================================
+Intake archive SHA-256: 97c433e7e7bd95bc0e73c2c4ad3a69e6517f99201a74a2465e50ca9332b7a623
+Archive regular files compared: 882
+Existing files changed: ['src/convert/pipeline/stages.rs']
+Archive source-file scope: PASS
+Changed source SHA-256: 63aa7d5cfae8cf4ae4112313dfa3518d3be08cf73736782d6b3c5f9a2508a7ba
+Source line count: 83395
+Pygments RustLexer errors: 0
+Unclosed syntax delimiters: 0
+Static lexer/delimiter gate: PASS (not a compiler)
+Fresh baseline patch byte-for-byte reproduction: PASS
+Command: git -C /mnt/data/r27_work/r27_patch_baseline diff --check
+Exit code: 0
+Command: git -C /mnt/data/r27_work/r27_patch_repro apply --check --reverse /mnt/data/r27_work/tonepoet/R27_CODE_CHANGES.patch
+Exit code: 0
+Git patch validation: PASS
+cargo: UNAVAILABLE
+rustc: UNAVAILABLE
+rustfmt: UNAVAILABLE
+nix: UNAVAILABLE
+Compiled tests and Reference host requalification: NOT RUN
+Real SACD browse/preset gesture (#43): NOT RUN
