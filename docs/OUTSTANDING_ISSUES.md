@@ -4967,3 +4967,31 @@ distinction or it will refuse idempotent redos that work today.
 A conversion that cannot publish its output fails before it does the work.
 Whether a collision exists is knowable from the destination and the naming
 policy before any audio is read.
+
+## 73. Popup body text has no emphasis, and the shared row count is what constrains adding it
+
+Logged 2026-10-11, pulled out of the R32 brief so the true-peak help text can
+ship without waiting on it.
+
+`draw_scrollable_message_popup` renders its body as
+`Paragraph::new(message).wrap(Wrap { trim: true })` under a single uniform
+style, so help text arrives as one undifferentiated block. Markdown in a
+message would render literally: `**Target**` shows its asterisks. `trim: true`
+also drops leading whitespace on wrapped lines, so an indented continuation
+cannot hold its indent.
+
+Two call sites today, both in `src/tui/draw_overlays.rs`. The constraint is not
+there, it is in the measurement: `wrapped_row_count` bounds scrolling in
+sixteen places and derives rows from raw text by whitespace wrapping. A layout
+that strips markers, indents continuations or styles spans has to be the same
+code that counts rows, or the scroll bound stops matching the drawn body —
+either the end becomes unreachable or scrolling runs past it.
+
+No markdown crate is in the workspace, so this is a new dependency or a small
+inline subset. Which subset is worth supporting is open; links, tables and
+images are not. Existing plain-text messages must look unchanged, so stray
+punctuation must not become emphasis.
+
+Worth doing once several help messages exist rather than against the first one,
+so the subset is shaped by more than a single consumer. More Convert-screen
+help text is planned.
