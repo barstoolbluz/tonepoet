@@ -2856,7 +2856,8 @@ impl Database {
 
     /// Bump this when the analysis algorithm changes to invalidate
     /// cached results computed by an older version.
-    const ANALYSIS_ALGO_VERSION: i32 = 27;
+    // R31: over-range means strictly > 0 dBFS, not near/at the ceiling.
+    const ANALYSIS_ALGO_VERSION: i32 = 28;
 
     /// Look up cached analysis. Returns None if not cached, stale,
     /// or computed by an older algorithm version.
@@ -2993,6 +2994,8 @@ impl Database {
     /// metrics are preserved when the file identity is unchanged, but are
     /// cleared if the same path now points at different bytes. This prevents
     /// the narrow Details analyzer from poisoning the full DR/peak/RMS cache.
+    /// An old algorithm's clipping count is also cleared: otherwise this
+    /// metadata-only upsert could promote obsolete full analysis into a cache hit.
     pub fn store_metadata_analysis_facts(
         &self,
         file_path: &str,
@@ -3030,6 +3033,7 @@ impl Database {
                               THEN analysis_cache.rms_db ELSE NULL END,
                 clipping_count = CASE WHEN analysis_cache.file_mtime = excluded.file_mtime
                                         AND analysis_cache.file_size = excluded.file_size
+                                        AND analysis_cache.algo_version = excluded.algo_version
                                       THEN analysis_cache.clipping_count ELSE NULL END,
                 dc_bias = CASE WHEN analysis_cache.file_mtime = excluded.file_mtime
                                  AND analysis_cache.file_size = excluded.file_size
@@ -10258,6 +10262,84 @@ mod tests {
         assert_eq!(
             changed_identity.preemphasis,
             Some(PreemphasisConfidence::NotDetected),
+        );
+    }
+
+    #[test]
+    fn r31_metadata_fact_refresh_does_not_resurrect_old_clipping_count() {
+        use crate::tui::app::MetadataAnalysisFacts;
+        use crate::tui::preemphasis::PreemphasisConfidence;
+
+        let db = Database::open_memory().expect("database");
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/regression/id3_wrapped_flac/id3v2_id3v1_48000.flac");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("album.flac");
+        std::fs::copy(&source, &path).expect("copy analysis fixture");
+        let key = path.to_string_lossy().into_owned();
+        let size = std::fs::metadata(&path).unwrap().len();
+        let mut current = crate::tui::analyze::analyze_file(&path, None, None)
+            .expect("decode analysis fixture");
+        current.loudness_status = crate::tui::analyze::LoudnessAnalysisStatus::Available;
+        db.store_analysis(&key, 1000, size, &current)
+            .expect("seed legacy analysis row");
+        db.conn
+            .execute(
+                "UPDATE analysis_cache SET algo_version = ?1, clipping_count = 12345
+                 WHERE file_path = ?2",
+                params![Database::ANALYSIS_ALGO_VERSION - 1, &key],
+            )
+            .expect("simulate old near-ceiling counter");
+        assert!(db.get_cached_analysis(&key, 1000, size).is_none());
+
+        // The Details tab can update narrow metadata facts before Analyze runs.
+        // It must not mark old full-file PCM facts as current on the same path.
+        db.store_metadata_analysis_facts(
+            &key,
+            1000,
+            size,
+            &MetadataAnalysisFacts {
+                preemphasis: Some(PreemphasisConfidence::NotDetected),
+                preemphasis_detail: Some("no PRE evidence".to_string()),
+                hdcd_detected: None,
+                hdcd_detail: None,
+            },
+        )
+        .expect("refresh metadata facts");
+        let carried_clipping: Option<i64> = db
+            .conn
+            .query_row(
+                "SELECT clipping_count FROM analysis_cache WHERE file_path = ?1",
+                params![&key],
+                |row| row.get(0),
+            )
+            .expect("read post-refresh counter");
+        assert_eq!(carried_clipping, None, "obsolete count cannot be promoted");
+        assert!(db.get_cached_analysis(&key, 1000, size).is_none());
+
+        db.store_analysis(&key, 1000, size, &current)
+            .expect("rescan replaces old PCM facts");
+        let refreshed = db
+            .get_cached_analysis(&key, 1000, size)
+            .expect("fresh analysis is cacheable");
+        assert_eq!(refreshed.clipping_count, current.clipping_count);
+        db.store_metadata_analysis_facts(
+            &key,
+            1000,
+            size,
+            &MetadataAnalysisFacts {
+                preemphasis: Some(PreemphasisConfidence::NotDetected),
+                preemphasis_detail: None,
+                hdcd_detected: None,
+                hdcd_detail: None,
+            },
+        )
+        .expect("same-version metadata refresh");
+        assert_eq!(
+            db.get_cached_analysis(&key, 1000, size)
+                .expect("current algorithm metrics remain cached")
+                .clipping_count,
+            current.clipping_count,
         );
     }
 

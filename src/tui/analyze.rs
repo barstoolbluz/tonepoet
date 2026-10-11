@@ -1,4 +1,4 @@
-//! Audio analysis: DR meter, peak, RMS, clipping, DC bias, bit depth.
+//! Audio analysis: DR meter, peak, RMS, over-scale samples, DC bias, bit depth.
 //!
 //! Single-pass PCM decode via ffmpeg-next computes DR-family metrics.
 //! Production LUFS and ReplayGain reporting peak use the same native
@@ -82,7 +82,10 @@ pub struct AnalysisResult {
     pub peak_db: f64,
     /// Overall RMS level in dBFS.
     pub rms_db: f64,
-    /// Number of samples at digital ceiling (potential clipping).
+    /// Number of decoded samples strictly above digital full scale (|sample| > 1).
+    /// The legacy field name is retained for database compatibility. A sample
+    /// *at* full scale is not over-range; integer PCM cannot represent values
+    /// above it, and this is not a detector of historical hard clipping.
     pub clipping_count: u64,
     /// Mean sample value (0.0 = centered, nonzero = DC offset).
     pub dc_bias: f64,
@@ -193,7 +196,7 @@ pub fn analyze_file(
 
     // ── Process a batch of samples (one channel) ─────────────────
 
-    // Global-stats accumulator: peak, RMS, DC, clipping, bit depth.
+    // Global-stats accumulator: peak, RMS, DC, over-range samples, bit depth.
     // Does NOT touch per-block DR accumulators — those are handled
     // by the split-accumulate loop below.
     macro_rules! accumulate_global {
@@ -207,7 +210,9 @@ pub fn analyze_file(
                 rms_sum += s * s;
                 dc_sum += s;
                 sample_count += 1;
-                if abs_val >= 0.9999695 {
+                // A full-scale sample is representable, not evidence of clipping.
+                // Floating PCM may exceed unity; integer PCM never can.
+                if abs_val > 1.0 {
                     clipping_count += 1;
                 }
 
@@ -1030,6 +1035,95 @@ mod loudness_status_tests {
         file.write_all(&data_len.to_le_bytes()).expect("data size");
         for sample in samples {
             file.write_all(&sample.to_le_bytes()).expect("sample");
+        }
+    }
+
+    // These WAVs go through the real Analyze decoder and its sample-format
+    // branches; the old threshold was asymmetric for signed integer samples.
+    fn write_r31_mono_wav(path: &Path, encoding: u16, bits: u16, data: &[u8]) {
+        use std::io::Write;
+
+        let bytes_per_sample = usize::from(bits / 8);
+        assert!(matches!(bits, 16 | 24 | 32 | 64));
+        assert_eq!(data.len() % bytes_per_sample, 0);
+        let size = u32::try_from(data.len()).expect("small WAV fixture");
+        let sample_rate = 44_100u32;
+        let mut file = std::fs::File::create(path).expect("create WAV fixture");
+        file.write_all(b"RIFF").unwrap();
+        file.write_all(&(36 + size).to_le_bytes()).unwrap();
+        file.write_all(b"WAVEfmt ").unwrap();
+        file.write_all(&16u32.to_le_bytes()).unwrap();
+        file.write_all(&encoding.to_le_bytes()).unwrap();
+        file.write_all(&1u16.to_le_bytes()).unwrap();
+        file.write_all(&sample_rate.to_le_bytes()).unwrap();
+        file.write_all(&(sample_rate * bytes_per_sample as u32).to_le_bytes())
+            .unwrap();
+        file.write_all(&(bits / 8).to_le_bytes()).unwrap();
+        file.write_all(&bits.to_le_bytes()).unwrap();
+        file.write_all(b"data").unwrap();
+        file.write_all(&size.to_le_bytes()).unwrap();
+        file.write_all(data).unwrap();
+    }
+
+    #[test]
+    fn r31_signed_integer_full_scale_is_not_clipping_at_any_supported_depth() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for bits in [16u16, 24, 32] {
+            let full = 1i64 << (bits - 1);
+            let min = (-full) as i32;
+            let max = (full - 1) as i32;
+            let mut bytes = Vec::new();
+            for _ in 0..1_024 {
+                for sample in [min, max, min + 1, max - 1] {
+                    bytes.extend_from_slice(&sample.to_le_bytes()[..usize::from(bits / 8)]);
+                }
+            }
+            let path = temp.path().join(format!("signed-{bits}.wav"));
+            write_r31_mono_wav(&path, 1, bits, &bytes);
+            let result = analyze_file(&path, None, None).expect("Analyze integer PCM");
+            assert_eq!(result.clipping_count, 0, "{bits}-bit integer PCM");
+            assert_eq!(result.peak_db, 0.0, "negative full scale is exactly 0 dBFS");
+        }
+    }
+
+    #[test]
+    fn r31_float_full_scale_is_not_clipping_but_actual_overs_are_counted() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for bits in [32u16, 64] {
+            let (above, below) = if bits == 32 {
+                (
+                    f64::from(f32::from_bits(1.0f32.to_bits() + 1)),
+                    f64::from(f32::from_bits(1.0f32.to_bits() - 1)),
+                )
+            } else {
+                (
+                    f64::from_bits(1.0f64.to_bits() + 1),
+                    f64::from_bits(1.0f64.to_bits() - 1),
+                )
+            };
+            let mut bytes = Vec::new();
+            for group in [[1.0, -1.0, below, -below], [above, -above, below, -below]] {
+                for _ in 0..11_025 {
+                    for sample in group {
+                        if bits == 32 {
+                            bytes.extend_from_slice(&(sample as f32).to_le_bytes());
+                        } else {
+                            bytes.extend_from_slice(&sample.to_le_bytes());
+                        }
+                    }
+                }
+            }
+            let path = temp.path().join(format!("float-{bits}.wav"));
+            write_r31_mono_wav(&path, 3, bits, &bytes);
+            let full = analyze_file(&path, None, None).expect("Analyze floating PCM");
+            assert_eq!(full.clipping_count, 22_050, "{bits}-bit over-range PCM");
+            assert!(full.peak_db > 0.0);
+            let at_ceiling = analyze_file(&path, None, Some(44_100))
+                .expect("first segment at full scale");
+            assert_eq!(at_ceiling.clipping_count, 0, "{bits}-bit full-scale samples");
+            let above_ceiling = analyze_file(&path, Some(44_100), Some(44_100))
+                .expect("seeked segment above full scale");
+            assert_eq!(above_ceiling.clipping_count, 22_050);
         }
     }
 

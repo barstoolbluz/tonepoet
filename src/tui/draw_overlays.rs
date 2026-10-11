@@ -4377,7 +4377,7 @@ fn draw_analysis(
                 theme.text_bright,
             ),
             (
-                "Clipping",
+                "Samples > 0 dBFS",
                 if r.clipping_count == 0 {
                     "None".into()
                 } else {

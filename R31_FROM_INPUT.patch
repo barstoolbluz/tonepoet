@@ -1,0 +1,280 @@
+diff --git a/src/db.rs b/src/db.rs
+index 9e3f3ec..a13030f 100644
+--- a/src/db.rs
++++ b/src/db.rs
+@@ -2856,7 +2856,8 @@ impl Database {
+ 
+     /// Bump this when the analysis algorithm changes to invalidate
+     /// cached results computed by an older version.
+-    const ANALYSIS_ALGO_VERSION: i32 = 27;
++    // R31: over-range means strictly > 0 dBFS, not near/at the ceiling.
++    const ANALYSIS_ALGO_VERSION: i32 = 28;
+ 
+     /// Look up cached analysis. Returns None if not cached, stale,
+     /// or computed by an older algorithm version.
+@@ -2993,6 +2994,8 @@ impl Database {
+     /// metrics are preserved when the file identity is unchanged, but are
+     /// cleared if the same path now points at different bytes. This prevents
+     /// the narrow Details analyzer from poisoning the full DR/peak/RMS cache.
++    /// An old algorithm's clipping count is also cleared: otherwise this
++    /// metadata-only upsert could promote obsolete full analysis into a cache hit.
+     pub fn store_metadata_analysis_facts(
+         &self,
+         file_path: &str,
+@@ -3030,6 +3033,7 @@ impl Database {
+                               THEN analysis_cache.rms_db ELSE NULL END,
+                 clipping_count = CASE WHEN analysis_cache.file_mtime = excluded.file_mtime
+                                         AND analysis_cache.file_size = excluded.file_size
++                                        AND analysis_cache.algo_version = excluded.algo_version
+                                       THEN analysis_cache.clipping_count ELSE NULL END,
+                 dc_bias = CASE WHEN analysis_cache.file_mtime = excluded.file_mtime
+                                  AND analysis_cache.file_size = excluded.file_size
+@@ -10261,6 +10265,84 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn r31_metadata_fact_refresh_does_not_resurrect_old_clipping_count() {
++        use crate::tui::app::MetadataAnalysisFacts;
++        use crate::tui::preemphasis::PreemphasisConfidence;
++
++        let db = Database::open_memory().expect("database");
++        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
++            .join("fixtures/regression/id3_wrapped_flac/id3v2_id3v1_48000.flac");
++        let temp = tempfile::tempdir().expect("tempdir");
++        let path = temp.path().join("album.flac");
++        std::fs::copy(&source, &path).expect("copy analysis fixture");
++        let key = path.to_string_lossy().into_owned();
++        let size = std::fs::metadata(&path).unwrap().len();
++        let mut current = crate::tui::analyze::analyze_file(&path, None, None)
++            .expect("decode analysis fixture");
++        current.loudness_status = crate::tui::analyze::LoudnessAnalysisStatus::Available;
++        db.store_analysis(&key, 1000, size, &current)
++            .expect("seed legacy analysis row");
++        db.conn
++            .execute(
++                "UPDATE analysis_cache SET algo_version = ?1, clipping_count = 12345
++                 WHERE file_path = ?2",
++                params![Database::ANALYSIS_ALGO_VERSION - 1, &key],
++            )
++            .expect("simulate old near-ceiling counter");
++        assert!(db.get_cached_analysis(&key, 1000, size).is_none());
++
++        // The Details tab can update narrow metadata facts before Analyze runs.
++        // It must not mark old full-file PCM facts as current on the same path.
++        db.store_metadata_analysis_facts(
++            &key,
++            1000,
++            size,
++            &MetadataAnalysisFacts {
++                preemphasis: Some(PreemphasisConfidence::NotDetected),
++                preemphasis_detail: Some("no PRE evidence".to_string()),
++                hdcd_detected: None,
++                hdcd_detail: None,
++            },
++        )
++        .expect("refresh metadata facts");
++        let carried_clipping: Option<i64> = db
++            .conn
++            .query_row(
++                "SELECT clipping_count FROM analysis_cache WHERE file_path = ?1",
++                params![&key],
++                |row| row.get(0),
++            )
++            .expect("read post-refresh counter");
++        assert_eq!(carried_clipping, None, "obsolete count cannot be promoted");
++        assert!(db.get_cached_analysis(&key, 1000, size).is_none());
++
++        db.store_analysis(&key, 1000, size, &current)
++            .expect("rescan replaces old PCM facts");
++        let refreshed = db
++            .get_cached_analysis(&key, 1000, size)
++            .expect("fresh analysis is cacheable");
++        assert_eq!(refreshed.clipping_count, current.clipping_count);
++        db.store_metadata_analysis_facts(
++            &key,
++            1000,
++            size,
++            &MetadataAnalysisFacts {
++                preemphasis: Some(PreemphasisConfidence::NotDetected),
++                preemphasis_detail: None,
++                hdcd_detected: None,
++                hdcd_detail: None,
++            },
++        )
++        .expect("same-version metadata refresh");
++        assert_eq!(
++            db.get_cached_analysis(&key, 1000, size)
++                .expect("current algorithm metrics remain cached")
++                .clipping_count,
++            current.clipping_count,
++        );
++    }
++
+     #[test]
+     fn cached_analysis_rebuilds_wrapped_flac_repair_provenance_from_physical_path() {
+         let db = Database::open_memory().expect("database");
+diff --git a/src/tui/analyze.rs b/src/tui/analyze.rs
+index 123cfbd..ddd52e0 100644
+--- a/src/tui/analyze.rs
++++ b/src/tui/analyze.rs
+@@ -1,4 +1,4 @@
+-//! Audio analysis: DR meter, peak, RMS, clipping, DC bias, bit depth.
++//! Audio analysis: DR meter, peak, RMS, over-scale samples, DC bias, bit depth.
+ //!
+ //! Single-pass PCM decode via ffmpeg-next computes DR-family metrics.
+ //! Production LUFS and ReplayGain reporting peak use the same native
+@@ -82,7 +82,10 @@ pub struct AnalysisResult {
+     pub peak_db: f64,
+     /// Overall RMS level in dBFS.
+     pub rms_db: f64,
+-    /// Number of samples at digital ceiling (potential clipping).
++    /// Number of decoded samples strictly above digital full scale (|sample| > 1).
++    /// The legacy field name is retained for database compatibility. A sample
++    /// *at* full scale is not over-range; integer PCM cannot represent values
++    /// above it, and this is not a detector of historical hard clipping.
+     pub clipping_count: u64,
+     /// Mean sample value (0.0 = centered, nonzero = DC offset).
+     pub dc_bias: f64,
+@@ -193,7 +196,7 @@ pub fn analyze_file(
+ 
+     // ── Process a batch of samples (one channel) ─────────────────
+ 
+-    // Global-stats accumulator: peak, RMS, DC, clipping, bit depth.
++    // Global-stats accumulator: peak, RMS, DC, over-range samples, bit depth.
+     // Does NOT touch per-block DR accumulators — those are handled
+     // by the split-accumulate loop below.
+     macro_rules! accumulate_global {
+@@ -207,7 +210,9 @@ pub fn analyze_file(
+                 rms_sum += s * s;
+                 dc_sum += s;
+                 sample_count += 1;
+-                if abs_val >= 0.9999695 {
++                // A full-scale sample is representable, not evidence of clipping.
++                // Floating PCM may exceed unity; integer PCM never can.
++                if abs_val > 1.0 {
+                     clipping_count += 1;
+                 }
+ 
+@@ -1033,6 +1038,95 @@ mod loudness_status_tests {
+         }
+     }
+ 
++    // These WAVs go through the real Analyze decoder and its sample-format
++    // branches; the old threshold was asymmetric for signed integer samples.
++    fn write_r31_mono_wav(path: &Path, encoding: u16, bits: u16, data: &[u8]) {
++        use std::io::Write;
++
++        let bytes_per_sample = usize::from(bits / 8);
++        assert!(matches!(bits, 16 | 24 | 32 | 64));
++        assert_eq!(data.len() % bytes_per_sample, 0);
++        let size = u32::try_from(data.len()).expect("small WAV fixture");
++        let sample_rate = 44_100u32;
++        let mut file = std::fs::File::create(path).expect("create WAV fixture");
++        file.write_all(b"RIFF").unwrap();
++        file.write_all(&(36 + size).to_le_bytes()).unwrap();
++        file.write_all(b"WAVEfmt ").unwrap();
++        file.write_all(&16u32.to_le_bytes()).unwrap();
++        file.write_all(&encoding.to_le_bytes()).unwrap();
++        file.write_all(&1u16.to_le_bytes()).unwrap();
++        file.write_all(&sample_rate.to_le_bytes()).unwrap();
++        file.write_all(&(sample_rate * bytes_per_sample as u32).to_le_bytes())
++            .unwrap();
++        file.write_all(&(bits / 8).to_le_bytes()).unwrap();
++        file.write_all(&bits.to_le_bytes()).unwrap();
++        file.write_all(b"data").unwrap();
++        file.write_all(&size.to_le_bytes()).unwrap();
++        file.write_all(data).unwrap();
++    }
++
++    #[test]
++    fn r31_signed_integer_full_scale_is_not_clipping_at_any_supported_depth() {
++        let temp = tempfile::tempdir().expect("tempdir");
++        for bits in [16u16, 24, 32] {
++            let full = 1i64 << (bits - 1);
++            let min = (-full) as i32;
++            let max = (full - 1) as i32;
++            let mut bytes = Vec::new();
++            for _ in 0..1_024 {
++                for sample in [min, max, min + 1, max - 1] {
++                    bytes.extend_from_slice(&sample.to_le_bytes()[..usize::from(bits / 8)]);
++                }
++            }
++            let path = temp.path().join(format!("signed-{bits}.wav"));
++            write_r31_mono_wav(&path, 1, bits, &bytes);
++            let result = analyze_file(&path, None, None).expect("Analyze integer PCM");
++            assert_eq!(result.clipping_count, 0, "{bits}-bit integer PCM");
++            assert_eq!(result.peak_db, 0.0, "negative full scale is exactly 0 dBFS");
++        }
++    }
++
++    #[test]
++    fn r31_float_full_scale_is_not_clipping_but_actual_overs_are_counted() {
++        let temp = tempfile::tempdir().expect("tempdir");
++        for bits in [32u16, 64] {
++            let (above, below) = if bits == 32 {
++                (
++                    f64::from(f32::from_bits(1.0f32.to_bits() + 1)),
++                    f64::from(f32::from_bits(1.0f32.to_bits() - 1)),
++                )
++            } else {
++                (
++                    f64::from_bits(1.0f64.to_bits() + 1),
++                    f64::from_bits(1.0f64.to_bits() - 1),
++                )
++            };
++            let mut bytes = Vec::new();
++            for group in [[1.0, -1.0, below, -below], [above, -above, below, -below]] {
++                for _ in 0..11_025 {
++                    for sample in group {
++                        if bits == 32 {
++                            bytes.extend_from_slice(&(sample as f32).to_le_bytes());
++                        } else {
++                            bytes.extend_from_slice(&sample.to_le_bytes());
++                        }
++                    }
++                }
++            }
++            let path = temp.path().join(format!("float-{bits}.wav"));
++            write_r31_mono_wav(&path, 3, bits, &bytes);
++            let full = analyze_file(&path, None, None).expect("Analyze floating PCM");
++            assert_eq!(full.clipping_count, 22_050, "{bits}-bit over-range PCM");
++            assert!(full.peak_db > 0.0);
++            let at_ceiling = analyze_file(&path, None, Some(44_100))
++                .expect("first segment at full scale");
++            assert_eq!(at_ceiling.clipping_count, 0, "{bits}-bit full-scale samples");
++            let above_ceiling = analyze_file(&path, Some(44_100), Some(44_100))
++                .expect("seeked segment above full scale");
++            assert_eq!(above_ceiling.clipping_count, 22_050);
++        }
++    }
++
+     #[test]
+     fn seeked_analysis_matches_exact_isolated_region() {
+         let temp = tempfile::tempdir().expect("tempdir");
+diff --git a/src/tui/convert_screen.rs b/src/tui/convert_screen.rs
+index af6769a..0f9632a 100644
+--- a/src/tui/convert_screen.rs
++++ b/src/tui/convert_screen.rs
+@@ -1225,7 +1225,7 @@ mod format_render_registration_tests {
+                 .expect("draw true-peak target");
+             let y = rendered_row(&terminal, WIDTH, HEIGHT, "TP target");
+             let rendered = row_text(&terminal, y, WIDTH);
+-            assert!(rendered.contains("-1.00 dBTP"), "minimum two-decimal display: {rendered}");
++            assert!(rendered.contains("-0.10 dBTP"), "default target must display at least two decimals: {rendered}");
+             assert!(rendered.contains("custom"), "custom must be a visible pill: {rendered}");
+             let rect = app.button_map.find_button_rect(&pill).expect("custom pill hit region");
+             assert_eq!(rect.y, y);
+diff --git a/src/tui/draw_overlays.rs b/src/tui/draw_overlays.rs
+index 371714a..bc2ae94 100644
+--- a/src/tui/draw_overlays.rs
++++ b/src/tui/draw_overlays.rs
+@@ -4377,7 +4377,7 @@ fn draw_analysis(
+                 theme.text_bright,
+             ),
+             (
+-                "Clipping",
++                "Samples > 0 dBFS",
+                 if r.clipping_count == 0 {
+                     "None".into()
+                 } else {

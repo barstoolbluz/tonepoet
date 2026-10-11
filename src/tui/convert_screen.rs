@@ -1225,7 +1225,7 @@ mod format_render_registration_tests {
                 .expect("draw true-peak target");
             let y = rendered_row(&terminal, WIDTH, HEIGHT, "TP target");
             let rendered = row_text(&terminal, y, WIDTH);
-            assert!(rendered.contains("-1.00 dBTP"), "minimum two-decimal display: {rendered}");
+            assert!(rendered.contains("-0.10 dBTP"), "default target must display at least two decimals: {rendered}");
             assert!(rendered.contains("custom"), "custom must be a visible pill: {rendered}");
             let rect = app.button_map.find_button_rect(&pill).expect("custom pill hit region");
             assert_eq!(rect.y, y);
