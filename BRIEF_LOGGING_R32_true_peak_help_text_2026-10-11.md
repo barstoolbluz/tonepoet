@@ -26,20 +26,23 @@ read as complete.
 
 ## 1. The true-peak row advertises a command instead of explaining itself
 
-The row currently ends with:
+Both true-peak target rows, PCM and DSD, end with the same trailing text from
+one shared site:
 
 ```
   0.25 dB steps; :set dsd-true-peak-target <dBTP>
+  0.25 dB steps; :set pcm-true-peak-target <dBTP>
 ```
 
 **What we want:** that text gone. The step size is evident from using the
 control, and the row should not advertise a command. The `:set` keys keep
 working exactly as they do now.
 
-In its place a clickable `ⓘ` beside the row label, opening a popup that
-explains what true peak is. `TuiButton::DeemphasisInfo` is the pattern: a
-two-cell region registered in `convert_screen.rs`, opening
-`ActiveOverlay::Notice` with a title and message.
+In its place a clickable `ⓘ` beside the row label, on both rows, opening a
+popup that explains what true peak is. One message serves both; the concept
+does not differ. `TuiButton::DeemphasisInfo` is the pattern: a two-cell region
+registered in `convert_screen.rs`, opening `ActiveOverlay::Notice` with a title
+and message.
 
 The text:
 
@@ -79,8 +82,8 @@ asserts that. And we could not confirm whether a quiet track is raised to the
 ceiling under Track scope, so the text says only that each track gets its own
 gain.
 
-More of these help messages are coming to the Convert screen, so a convention
-worth settling here rather than retrofitting.
+More of these help messages are coming to the Convert screen, so whatever
+convention this one sets is worth settling now rather than retrofitting.
 
 ## Requalification
 
