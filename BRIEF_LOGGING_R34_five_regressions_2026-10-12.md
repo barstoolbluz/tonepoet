@@ -1,8 +1,10 @@
 # BRIEF — R33/R33C landed the three items and broke five tests, two of them in multichannel SACD
 
-R33 and R33C are applied and gated. All three brief items are implemented. Five
-tests fail that did not fail before, and two of them look like real behaviour
-regressions in areas the brief did not ask to be touched.
+R33 and R33C are applied and gated. The nine `r33_` tests pass, so the three
+brief items are implemented as far as those tests reach; none of it has been
+exercised by hand here. Five tests fail that passed on the previous tree, and
+two of them look like real behaviour regressions in areas the brief did not ask
+to be touched.
 
 This is how it reads from the outside; we misapprehend this codebase routinely,
 so where our framing is wrong, trust your own reading. Everything below we
@@ -46,8 +48,8 @@ sidecar_hybrid_disc_routes_mch_tracks_when_mch_area_selected
   right [MCH T1, MCH T2]
 ```
 
-Both pre-existing. Asking for the multichannel area appears to yield the stereo
-area's values.
+Both pre-existing: present on the previous tree and passing there. Asking for
+the multichannel area appears to yield the stereo area's values.
 
 **What we want:** the selected area's content is the content that is read and
 written. The brief asked for SACD tag transfer, not for area routing to change.
@@ -61,9 +63,10 @@ multifile_sidecar_untagged_carriers_save_album_performer_and_comment
   right Some(["John Bonham", "John Paul Jones", "Jimmy Page", "Robert Plant"])
 ```
 
-Pre-existing, and in the ordered-list machinery R33 rewrote to project
-performer, composer, lyricist and arranger credits into the CUE extension
-blocks.
+Pre-existing; it is in `keybindings.rs` on the previous tree and passed there.
+We think it sits in the ordered-list machinery R33 rewrote to project performer,
+composer, lyricist and arranger credits into the CUE extension blocks, but that
+connection is our inference.
 
 **What we want:** an ordered multi-value list survives the save intact. This is
 the same property #76 was about, in a different field.
@@ -85,11 +88,11 @@ holds, or the test says what does.
 
 ## 4. The transfer filter now admits `iso`
 
-```
-transfer_picker_filter_is_canonical_audio_plus_cue_without_widening_global_audio
-  transfer filter must equal canonical audio coverage plus only CUE
-  the filter now also contains "iso"
-```
+`transfer_picker_filter_is_canonical_audio_plus_cue_without_widening_global_audio`
+fails on "transfer filter must equal canonical audio coverage plus only CUE".
+The two sets it prints differ by one element: the actual filter contains `iso`
+and the expected set does not. (Summarized rather than quoted; the assertion
+prints both thirty-element sets.)
 
 We believe this one is the intended #75 behaviour meeting a test that forbids
 it: canonical audio coverage itself did not change, so only the transfer filter
