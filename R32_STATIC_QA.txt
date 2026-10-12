@@ -1,0 +1,7 @@
+PASS 1: six Notice paragraphs are byte-for-byte equivalent to brief copy
+PASS 2: shared row no longer advertises commands; cap and editing hints preserved
+PASS 3: shared icon geometry, row control alignment, and four Rust regressions present
+PASS 4: one true-peak button variant and one shared Notice dispatch
+PASS 5: both :set keys still map to the existing validation/parser
+PASS 6: 929 R31 baseline files present; only four intended source edits plus inherited issue-ledger checksum mismatch
+INPUT WARNING: ./docs/OUTSTANDING_ISSUES.md mismatch predates R32 (issue #73 appended)

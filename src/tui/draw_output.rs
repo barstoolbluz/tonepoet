@@ -164,13 +164,11 @@ pub fn draw_format_pane(
                     FormatField::PcmTruePeakTarget => lines.push(pcm_true_peak_db_value_row(
                         border_color,
                         w,
-                        "TP target  ",
                         format_state.pcm_true_peak_target_dbtp,
                         (format_state.true_peak_target_editing == Some(field))
                             .then_some(&format_state.true_peak_target_input),
                         row_focused,
                         format_state.pcm_true_peak_target_is_capped(),
-                        "pcm-true-peak-target",
                         theme,
                     )),
                     FormatField::TruePeakScope => lines.push(pill_row(
@@ -308,13 +306,11 @@ pub fn draw_format_pane(
                     FormatField::DsdTruePeakTarget => lines.push(pcm_true_peak_db_value_row(
                         border_color,
                         w,
-                        "TP target  ",
                         format_state.dsd_true_peak_target_dbtp,
                         (format_state.true_peak_target_editing == Some(field))
                             .then_some(&format_state.true_peak_target_input),
                         row_focused,
                         false,
-                        "dsd-true-peak-target",
                         theme,
                     )),
                     FormatField::Container => {
@@ -565,6 +561,14 @@ fn format_title_line<'a>(border_color: ratatui::style::Color, width: usize, maxi
 
 const TRUE_PEAK_EDITOR_WIDTH: usize = 12;
 const TRUE_PEAK_CUSTOM_PILL: &str = " custom ";
+// Shared by rendering, the information hit target, and the custom pill offset.
+// The initial border occupies one cell; the label ends with one separator.
+const TRUE_PEAK_ROW_BEFORE_INFO: &str = "   TP target ";
+
+/// Display-cell offset of the true-peak information icon from the row origin.
+pub(super) fn true_peak_info_offset() -> u16 {
+    (1 + TRUE_PEAK_ROW_BEFORE_INFO.len()) as u16
+}
 
 /// Exact human-readable ceiling: at least two decimals, all significant
 /// nanodecimals. A numeric format specifier must not round an exact target.
@@ -591,7 +595,8 @@ pub(super) fn true_peak_custom_pill_offset(
     } else {
         true_peak_ceiling_label(value).len() + " dBTP".len()
     };
-    let offset = "│   TP target  < ".chars().count() + value_width + " >  ".len();
+    let offset = true_peak_info_offset() as usize + "ⓘ  < ".chars().count()
+        + value_width + " >  ".len();
     (offset + TRUE_PEAK_CUSTOM_PILL.len() + 1 <= row_width)
         .then_some(offset as u16)
 }
@@ -599,12 +604,10 @@ pub(super) fn true_peak_custom_pill_offset(
 fn pcm_true_peak_db_value_row(
     border_color: ratatui::style::Color,
     width: usize,
-    label: &'static str,
     value: tonepoet_pipeline::DbNano,
     edit_input: Option<&super::text_input::TextInputState>,
     focused: bool,
     lossy_capped: bool,
-    custom_key: &'static str,
     theme: super::theme::Theme,
 ) -> Line<'static> {
     let label_style = if focused { theme.bright() } else { theme.muted() };
@@ -615,7 +618,17 @@ fn pcm_true_peak_db_value_row(
     };
     let mut spans = vec![
         Span::styled("│", theme.border(border_color)),
-        Span::styled(format!("   {label}"), label_style),
+        Span::styled(TRUE_PEAK_ROW_BEFORE_INFO, label_style),
+        // U+24D8 can paint across two terminal cells. Style its guard cell
+        // identically, as on the existing De-emphasis information affordance.
+        Span::styled(
+            "ⓘ ",
+            Style::default()
+                .fg(if theme.dark { theme.info } else { theme.value })
+                .add_modifier(Modifier::BOLD),
+        ),
+        // Keep the editor aligned with the other Format-row controls.
+        Span::raw(" "),
         Span::styled("< ", control_style),
     ];
     if let Some(input) = edit_input {
@@ -651,11 +664,11 @@ fn pcm_true_peak_db_value_row(
         "  Enter: apply  Esc: cancel  unsigned = headroom".to_string()
     } else if lossy_capped {
         format!(
-            "  lossy encoder input capped at {} dBTP; :set {custom_key} <dBTP>",
+            "  lossy encoder input capped at {} dBTP",
             tonepoet_pipeline::PCM_TRUE_PEAK_LOSSY_MAX_TARGET_DBTP.render(true),
         )
     } else {
-        format!("  0.25 dB steps; :set {custom_key} <dBTP>")
+        String::new()
     };
     let room = width.saturating_sub(spans.iter().map(|span| span.width()).sum::<usize>() + 1);
     let hint = hint.chars().take(room).collect::<String>();
@@ -986,12 +999,10 @@ mod r30_true_peak_custom_control_tests {
                 let line = pcm_true_peak_db_value_row(
                     theme.border,
                     120,
-                    "TP target  ",
                     value,
                     input.as_ref(),
                     true,
                     false,
-                    "pcm-true-peak-target",
                     theme,
                 );
                 let pill_idx = line.spans.iter().position(|span| {
@@ -1008,6 +1019,74 @@ mod r30_true_peak_custom_control_tests {
                 assert_eq!(line.spans[pill_idx].width(), TRUE_PEAK_CUSTOM_PILL.len());
             }
             assert_eq!(true_peak_custom_pill_offset(value, false, 34), None);
+        }
+    }
+
+}
+
+#[cfg(test)]
+mod r32_true_peak_help_renderer_tests {
+    use super::*;
+    use tonepoet_pipeline::DbNano;
+
+    #[test]
+    fn r32_help_glyph_matches_registered_cell_offset_and_existing_affordance_contrast() {
+        for palette in super::super::theme::palettes() {
+            let theme = super::super::theme::theme_by_slug(palette.slug).expect("shipped theme");
+            for focused in [false, true] {
+                let row = pcm_true_peak_db_value_row(
+                    theme.green,
+                    120,
+                    DbNano(-100_000_000),
+                    None,
+                    focused,
+                    false,
+                    theme,
+                );
+                let idx = row.spans.iter().position(|s| s.content.as_ref() == "\u{24d8} ")
+                    .expect("true-peak info affordance");
+                let x: usize = row.spans[..idx].iter().map(Span::width).sum();
+                assert_eq!(x, true_peak_info_offset() as usize);
+                let icon = &row.spans[idx];
+                assert_eq!(icon.width(), 2);
+                assert_eq!(icon.style.fg, Some(if theme.dark { theme.info } else { theme.value }));
+                assert_eq!(icon.style.bg, None);
+                assert!(icon.style.add_modifier.contains(Modifier::BOLD));
+                assert!(
+                    super::super::theme::contrast_ratio(
+                        icon.style.fg.expect("information foreground"), theme.panel_bg,
+                    ) >= 4.5,
+                    "theme {} must show the glyph clearly",
+                    palette.slug,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn r32_no_true_peak_row_advertises_set_and_lossy_warning_survives() {
+        let theme = super::super::theme::theme_by_slug(
+            super::super::theme::default_theme_slug(),
+        ).expect("default theme");
+        let value = DbNano(-100_000_000);
+        let edit = super::super::text_input::TextInputState::new_selected("-0.10".to_string());
+        for (editing, lossy_capped) in [(false, false), (false, true), (true, false)] {
+            let line = pcm_true_peak_db_value_row(
+                theme.green,
+                120,
+                value,
+                editing.then_some(&edit),
+                true,
+                lossy_capped,
+                theme,
+            );
+            let text: String = line.spans.iter().map(|span| span.content.as_ref()).collect();
+            assert!(!text.contains(":set "), "{text}");
+            assert!(!text.contains("0.25 dB steps"), "{text}");
+            assert_eq!(text.contains("lossy encoder input capped"), lossy_capped && !editing);
+            if editing {
+                assert!(text.contains("Enter: apply"));
+            }
         }
     }
 }

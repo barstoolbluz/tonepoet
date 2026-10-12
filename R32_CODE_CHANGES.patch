@@ -1,0 +1,478 @@
+--- a/src/tui/button_map.rs
++++ b/src/tui/button_map.rs
+@@ -47,10 +47,12 @@
+     DepthPill(usize),
+     ResamplerPill(usize),
+     DitherPill(usize),
+     DeemphasisPill(usize),
+     DeemphasisInfo,
++    /// Shared true-peak explanation on PCM and DSD target rows.
++    TruePeakInfo,
+     ReplayGainPill(usize),
+     PcmTruePeakPill(usize),
+     TruePeakScopePill(usize),
+     PcmTruePeakScanPill(usize),
+     PcmTruePeakTargetField,
+@@ -604,10 +606,11 @@
+             | Self::DepthPill(_)
+             | Self::ResamplerPill(_)
+             | Self::DitherPill(_)
+             | Self::DeemphasisPill(_)
+             | Self::DeemphasisInfo
++            | Self::TruePeakInfo
+             | Self::ReplayGainPill(_)
+             | Self::PcmTruePeakPill(_)
+             | Self::TruePeakScopePill(_)
+             | Self::PcmTruePeakScanPill(_)
+             | Self::PcmTruePeakTargetField
+--- a/src/tui/convert_screen.rs
++++ b/src/tui/convert_screen.rs
+@@ -11,11 +11,11 @@
+ use super::app::{AppState, ConvertFocus, ConvertLayout, FormatField, FormatPaneRow, ResamplerChoice, SourceMode};
+ use super::button_map::{ButtonRenderMap, MetadataFieldKind, TuiButton};
+ use super::draw_footer::draw_footer;
+ use super::draw_header::draw_header;
+ use super::draw_metadata::{draw_metadata_pane, draw_metadata_title_bar};
+-use super::draw_output::{draw_format_pane, draw_format_title_bar, true_peak_custom_pill_offset};
++use super::draw_output::{draw_format_pane, draw_format_title_bar, true_peak_custom_pill_offset, true_peak_info_offset};
+ use super::draw_output_options::{
+     draw_output_options_pane, draw_output_options_title_bar,
+     register_output_options_mouse_targets,
+ };
+ use super::draw_preset_bar::draw_preset_bar;
+@@ -346,10 +346,11 @@
+                     state.true_peak_target_editing == Some(field),
+                     area.width as usize,
+                 ) {
+                     buttons.record_button(TuiButton::PcmTruePeakCustomPill, Rect::new(area.x + offset, y, 8, 1));
+                 }
++                register_true_peak_info_button(buttons, area, y);
+             }
+             FormatField::NoiseShaper => register_pill_row(buttons, &state.noise_shaper, y, label_col, TuiButton::NoiseShaperPill),
+             FormatField::ModulatorOrder => register_pill_row(buttons, &state.modulator_order, y, label_col, TuiButton::ModulatorOrderPill),
+             FormatField::ConversionPreset => register_pill_row(buttons, &state.conversion_preset, y, label_col, TuiButton::ConversionPresetPill),
+             FormatField::DsdPath => register_pill_row(buttons, &state.dsd_pathway, y, label_col, TuiButton::DsdPathPill),
+@@ -371,10 +372,11 @@
+                     state.true_peak_target_editing == Some(field),
+                     area.width as usize,
+                 ) {
+                     buttons.record_button(TuiButton::DsdTruePeakCustomPill, Rect::new(area.x + offset, y, 8, 1));
+                 }
++                register_true_peak_info_button(buttons, area, y);
+             }
+             FormatField::Container => {
+                 let containers = state.format.selected_value().available_containers();
+                 let mut x = label_col;
+                 for (index, container) in containers.iter().enumerate() {
+@@ -442,10 +444,21 @@
+             }
+         }
+     }
+ }
+ 
++// Concrete hit target is recorded after the whole-row target so the icon
++// opens help instead of entering the value editor. Match the draw guard.
++fn register_true_peak_info_button(buttons: &mut ButtonRenderMap, area: Rect, y: u16) {
++    if area.width >= 30 && area.height >= 6 {
++        buttons.record_button(
++            TuiButton::TruePeakInfo,
++            Rect::new(area.x + true_peak_info_offset(), y, 2, 1),
++        );
++    }
++}
++
+ fn right_settings_pill_fits(area: Rect, left_content_end_x: u16, pill_width: u16) -> bool {
+     let left_content_width = left_content_end_x.saturating_sub(area.x);
+     left_content_width
+         .saturating_add(pill_width)
+         .saturating_add(2)
+@@ -1256,6 +1269,113 @@
+             };
+             assert_eq!(value, DbNano(-100_000));
+             assert_eq!(origin, TruePeakTargetOrigin::User);
+         }
+     }
+-}
++
++    #[test]
++    fn r32_pcm_and_dsd_true_peak_info_clicks_open_shared_notice_without_editing() {
++        const WIDTH: u16 = 120;
++        const HEIGHT: u16 = 48;
++        let theme = crate::tui::theme::theme_by_slug(
++            crate::tui::theme::default_theme_slug(),
++        )
++        .expect("default theme");
++        for dsd in [false, true] {
++            let mut app = AppState::new_for_test(TonepoetConfig::default());
++            app.current_screen = AppScreen::Convert;
++            app.convert.focus = ConvertFocus::Format;
++            app.convert.layout = ConvertLayout::Maximized(ConvertFocus::Format);
++            app.convert.format.set_source_is_dsd(dsd);
++            assert!(app.convert.format.format.select_value(&AudioFormat::Flac));
++            app.convert.format.apply_format_constraints();
++            let target_field = if dsd {
++                assert!(app.convert.format.dsd_gain_mode.select_value(&DsdGainMode::TruePeakGuard));
++                TuiButton::DsdTruePeakTargetField
++            } else {
++                assert!(app.convert.format.pcm_gain_mode.select_value(
++                    &crate::tui::app::PcmGainMode::TruePeakGuard,
++                ));
++                TuiButton::PcmTruePeakTargetField
++            };
++            let initial_target = if dsd {
++                app.convert.format.dsd_true_peak_target_dbtp
++            } else {
++                app.convert.format.pcm_true_peak_target_dbtp
++            };
++            let backend = TestBackend::new(WIDTH, HEIGHT);
++            let mut terminal = Terminal::new(backend).expect("terminal");
++            app.button_map.clear();
++            terminal
++                .draw(|frame| draw_convert_screen(frame, frame.size(), &mut app, theme))
++                .expect("draw true-peak information row");
++
++            let y = rendered_row(&terminal, WIDTH, HEIGHT, "TP target");
++            let icon_x = rendered_symbol_x(&terminal, WIDTH, y, "\u{24d8}");
++            let rendered = row_text(&terminal, y, WIDTH);
++            assert!(!rendered.contains("0.25 dB steps"), "{rendered}");
++            assert!(!rendered.contains(":set"), "{rendered}");
++            let info_rect = app.button_map.find_button_rect(&TuiButton::TruePeakInfo)
++                .expect("visible icon must have a hitbox");
++            assert_eq!((info_rect.x, info_rect.y, info_rect.width), (icon_x, y, 2));
++            for x in icon_x..icon_x + 2 {
++                assert_eq!(app.button_map.find_button_at(x, y), Some(TuiButton::TruePeakInfo));
++            }
++            assert_eq!(app.button_map.find_button_at(icon_x + 2, y), Some(target_field));
++
++            let (tx, _rx) = tokio::sync::mpsc::channel(1);
++            crate::tui::keybindings::handle_mouse(
++                &mut app,
++                MouseEvent {
++                    kind: MouseEventKind::Down(MouseButton::Left),
++                    column: icon_x,
++                    row: y,
++                    modifiers: KeyModifiers::NONE,
++                },
++                &tx,
++            );
++            assert!(matches!(
++                app.active_overlay,
++                ActiveOverlay::Notice { ref title, ref message, scroll }
++                    if title == "True peak"
++                        && message == crate::tui::keybindings::TRUE_PEAK_INFO_MESSAGE
++                        && scroll == 0
++            ));
++            assert_eq!(app.convert.format.true_peak_target_editing, None);
++            let target_after = if dsd {
++                app.convert.format.dsd_true_peak_target_dbtp
++            } else {
++                app.convert.format.pcm_true_peak_target_dbtp
++            };
++            assert_eq!(target_after, initial_target, "help must not mutate the gain target");
++        }
++    }
++
++    #[test]
++    fn r32_true_peak_help_is_not_registered_when_target_row_is_hidden() {
++        const WIDTH: u16 = 120;
++        const HEIGHT: u16 = 48;
++        let theme = crate::tui::theme::theme_by_slug(
++            crate::tui::theme::default_theme_slug(),
++        )
++        .expect("default theme");
++        let mut app = AppState::new_for_test(TonepoetConfig::default());
++        app.current_screen = AppScreen::Convert;
++        app.convert.focus = ConvertFocus::Format;
++        app.convert.layout = ConvertLayout::Maximized(ConvertFocus::Format);
++        app.convert.format.set_source_is_dsd(true);
++        assert!(app.convert.format.format.select_value(&AudioFormat::Flac));
++        assert!(app.convert.format.dsd_gain_mode.select_value(&DsdGainMode::FixedGain));
++        app.convert.format.apply_format_constraints();
++        let backend = TestBackend::new(WIDTH, HEIGHT);
++        let mut terminal = Terminal::new(backend).expect("terminal");
++        app.button_map.clear();
++        terminal
++            .draw(|frame| draw_convert_screen(frame, frame.size(), &mut app, theme))
++            .expect("draw fixed-gain mode");
++        assert!(app.button_map.find_button_rect(&TuiButton::TruePeakInfo).is_none());
++        let all_text: String = (0..HEIGHT)
++            .map(|y| row_text(&terminal, y, WIDTH))
++            .collect();
++        assert!(!all_text.contains("TP target"));
++    }
++}
+--- a/src/tui/draw_output.rs
++++ b/src/tui/draw_output.rs
+@@ -162,17 +162,15 @@
+                         theme,
+                     )),
+                     FormatField::PcmTruePeakTarget => lines.push(pcm_true_peak_db_value_row(
+                         border_color,
+                         w,
+-                        "TP target  ",
+                         format_state.pcm_true_peak_target_dbtp,
+                         (format_state.true_peak_target_editing == Some(field))
+                             .then_some(&format_state.true_peak_target_input),
+                         row_focused,
+                         format_state.pcm_true_peak_target_is_capped(),
+-                        "pcm-true-peak-target",
+                         theme,
+                     )),
+                     FormatField::TruePeakScope => lines.push(pill_row(
+                         border_color, w, "TP scope   ", "",
+                         &render_pill_spans(&format_state.pcm_true_peak_scope, row_focused, theme),
+@@ -306,17 +304,15 @@
+                         theme,
+                     )),
+                     FormatField::DsdTruePeakTarget => lines.push(pcm_true_peak_db_value_row(
+                         border_color,
+                         w,
+-                        "TP target  ",
+                         format_state.dsd_true_peak_target_dbtp,
+                         (format_state.true_peak_target_editing == Some(field))
+                             .then_some(&format_state.true_peak_target_input),
+                         row_focused,
+                         false,
+-                        "dsd-true-peak-target",
+                         theme,
+                     )),
+                     FormatField::Container => {
+                         let containers = format_state.format.selected_value().available_containers();
+                         let spans: Vec<Span> = containers
+@@ -563,10 +559,18 @@
+     Line::from(spans)
+ }
+ 
+ const TRUE_PEAK_EDITOR_WIDTH: usize = 12;
+ const TRUE_PEAK_CUSTOM_PILL: &str = " custom ";
++// Shared by rendering, the information hit target, and the custom pill offset.
++// The initial border occupies one cell; the label ends with one separator.
++const TRUE_PEAK_ROW_BEFORE_INFO: &str = "   TP target ";
++
++/// Display-cell offset of the true-peak information icon from the row origin.
++pub(super) fn true_peak_info_offset() -> u16 {
++    (1 + TRUE_PEAK_ROW_BEFORE_INFO.len()) as u16
++}
+ 
+ /// Exact human-readable ceiling: at least two decimals, all significant
+ /// nanodecimals. A numeric format specifier must not round an exact target.
+ pub(super) fn true_peak_ceiling_label(value: tonepoet_pipeline::DbNano) -> String {
+     let exact = value.render(false);
+@@ -589,35 +593,44 @@
+     let value_width = if editing {
+         TRUE_PEAK_EDITOR_WIDTH + " dBTP".len()
+     } else {
+         true_peak_ceiling_label(value).len() + " dBTP".len()
+     };
+-    let offset = "│   TP target  < ".chars().count() + value_width + " >  ".len();
++    let offset = true_peak_info_offset() as usize + "ⓘ  < ".chars().count()
++        + value_width + " >  ".len();
+     (offset + TRUE_PEAK_CUSTOM_PILL.len() + 1 <= row_width)
+         .then_some(offset as u16)
+ }
+ 
+ fn pcm_true_peak_db_value_row(
+     border_color: ratatui::style::Color,
+     width: usize,
+-    label: &'static str,
+     value: tonepoet_pipeline::DbNano,
+     edit_input: Option<&super::text_input::TextInputState>,
+     focused: bool,
+     lossy_capped: bool,
+-    custom_key: &'static str,
+     theme: super::theme::Theme,
+ ) -> Line<'static> {
+     let label_style = if focused { theme.bright() } else { theme.muted() };
+     let control_style = if focused {
+         theme.bright().add_modifier(Modifier::BOLD)
+     } else {
+         theme.muted()
+     };
+     let mut spans = vec![
+         Span::styled("│", theme.border(border_color)),
+-        Span::styled(format!("   {label}"), label_style),
++        Span::styled(TRUE_PEAK_ROW_BEFORE_INFO, label_style),
++        // U+24D8 can paint across two terminal cells. Style its guard cell
++        // identically, as on the existing De-emphasis information affordance.
++        Span::styled(
++            "ⓘ ",
++            Style::default()
++                .fg(if theme.dark { theme.info } else { theme.value })
++                .add_modifier(Modifier::BOLD),
++        ),
++        // Keep the editor aligned with the other Format-row controls.
++        Span::raw(" "),
+         Span::styled("< ", control_style),
+     ];
+     if let Some(input) = edit_input {
+         spans.extend(super::inline_edit::render_inline_value_with_embedded_cursor(
+             input,
+@@ -649,15 +662,15 @@
+     }
+     let hint = if edit_input.is_some() {
+         "  Enter: apply  Esc: cancel  unsigned = headroom".to_string()
+     } else if lossy_capped {
+         format!(
+-            "  lossy encoder input capped at {} dBTP; :set {custom_key} <dBTP>",
++            "  lossy encoder input capped at {} dBTP",
+             tonepoet_pipeline::PCM_TRUE_PEAK_LOSSY_MAX_TARGET_DBTP.render(true),
+         )
+     } else {
+-        format!("  0.25 dB steps; :set {custom_key} <dBTP>")
++        String::new()
+     };
+     let room = width.saturating_sub(spans.iter().map(|span| span.width()).sum::<usize>() + 1);
+     let hint = hint.chars().take(room).collect::<String>();
+     spans.push(Span::styled(hint, theme.muted()));
+     let content_width: usize = spans.iter().map(|span| span.width()).sum();
+@@ -984,16 +997,14 @@
+                     )
+                 });
+                 let line = pcm_true_peak_db_value_row(
+                     theme.border,
+                     120,
+-                    "TP target  ",
+                     value,
+                     input.as_ref(),
+                     true,
+                     false,
+-                    "pcm-true-peak-target",
+                     theme,
+                 );
+                 let pill_idx = line.spans.iter().position(|span| {
+                     span.content.as_ref() == TRUE_PEAK_CUSTOM_PILL
+                 }).expect("clickable custom pill");
+@@ -1008,6 +1019,74 @@
+                 assert_eq!(line.spans[pill_idx].width(), TRUE_PEAK_CUSTOM_PILL.len());
+             }
+             assert_eq!(true_peak_custom_pill_offset(value, false, 34), None);
+         }
+     }
+-}
++
++}
++
++#[cfg(test)]
++mod r32_true_peak_help_renderer_tests {
++    use super::*;
++    use tonepoet_pipeline::DbNano;
++
++    #[test]
++    fn r32_help_glyph_matches_registered_cell_offset_and_existing_affordance_contrast() {
++        for palette in super::super::theme::palettes() {
++            let theme = super::super::theme::theme_by_slug(palette.slug).expect("shipped theme");
++            for focused in [false, true] {
++                let row = pcm_true_peak_db_value_row(
++                    theme.green,
++                    120,
++                    DbNano(-100_000_000),
++                    None,
++                    focused,
++                    false,
++                    theme,
++                );
++                let idx = row.spans.iter().position(|s| s.content.as_ref() == "\u{24d8} ")
++                    .expect("true-peak info affordance");
++                let x: usize = row.spans[..idx].iter().map(Span::width).sum();
++                assert_eq!(x, true_peak_info_offset() as usize);
++                let icon = &row.spans[idx];
++                assert_eq!(icon.width(), 2);
++                assert_eq!(icon.style.fg, Some(if theme.dark { theme.info } else { theme.value }));
++                assert_eq!(icon.style.bg, None);
++                assert!(icon.style.add_modifier.contains(Modifier::BOLD));
++                assert!(
++                    super::super::theme::contrast_ratio(
++                        icon.style.fg.expect("information foreground"), theme.panel_bg,
++                    ) >= 4.5,
++                    "theme {} must show the glyph clearly",
++                    palette.slug,
++                );
++            }
++        }
++    }
++
++    #[test]
++    fn r32_no_true_peak_row_advertises_set_and_lossy_warning_survives() {
++        let theme = super::super::theme::theme_by_slug(
++            super::super::theme::default_theme_slug(),
++        ).expect("default theme");
++        let value = DbNano(-100_000_000);
++        let edit = super::super::text_input::TextInputState::new_selected("-0.10".to_string());
++        for (editing, lossy_capped) in [(false, false), (false, true), (true, false)] {
++            let line = pcm_true_peak_db_value_row(
++                theme.green,
++                120,
++                value,
++                editing.then_some(&edit),
++                true,
++                lossy_capped,
++                theme,
++            );
++            let text: String = line.spans.iter().map(|span| span.content.as_ref()).collect();
++            assert!(!text.contains(":set "), "{text}");
++            assert!(!text.contains("0.25 dB steps"), "{text}");
++            assert_eq!(text.contains("lossy encoder input capped"), lossy_capped && !editing);
++            if editing {
++                assert!(text.contains("Enter: apply"));
++            }
++        }
++    }
++}
+--- a/src/tui/keybindings.rs
++++ b/src/tui/keybindings.rs
+@@ -19,10 +19,36 @@
+ 
+ pub(crate) const DEEMPHASIS_INFO_MESSAGE: &str = concat!(
+     "This disc was mastered with pre-emphasis: the treble was boosted on the CD, and the player is meant to cut it back on playback.\n\n",
+     "On — tonepoet removes the boost now, so the file plays correctly anywhere. This is a filter, not a tag change: the audio is altered, and the output will not be bit-identical to the source even when both sides are lossless at 16-bit/44.1 kHz.\n\n",
+     "Off — the boost stays in the audio, and tonepoet keeps the pre-emphasis flag wherever the format can carry it. CD players and some software — foobar2000, JRiver, iTunes, cmus — read that flag and correct playback. Where the flag cannot travel, such as a lossy target or anything outside 16-bit/44.1 kHz, the file will sound bright everywhere."
++);
++
++/// Help shared by PCM and DSD true-peak target rows; the Notice popup is
++/// unformatted, so paragraph breaks and label prefixes are deliberate.
++pub(crate) const TRUE_PEAK_INFO_MESSAGE: &str = concat!(
++    "True peak is the highest level the reconstructed waveform reaches, in decibels relative to",
++    " digital full scale. 0 dBTP is full scale.",
++    "\n\n",
++    "It is not the same as the highest sample value. Samples are individual points. When audio is",
++    " reconstructed for playback or for sample-rate conversion, the signal between those points can",
++    " rise higher than the samples themselves. These intersample peaks can exceed full scale even when",
++    " no single sample does, and that is what clips.",
++    "\n\n",
++    "Target — the highest true peak the output may reach. TonePoet measures the audio and derives the",
++    " gain from an upper bound on that measurement, one that cannot read low, so the output's true",
++    " peak lands at or below the figure you set. A faster scan tier costs a little extra headroom,",
++    " never safety. Encoding to a lossy format afterwards can move the peak again, because the decoder",
++    " reconstructs the signal differently.",
++    "\n\n",
++    "Scope — which tracks share one gain calculation.",
++    "\n\n",
++    "Track — each track is measured on its own and gets its own gain to meet the target.",
++    "\n\n",
++    "Album — every track in this job is measured together and the same gain is applied to all of",
++    " them, preserving the relative levels between them. Album means the tracks grouped into this job,",
++    " not album metadata or tags.",
+ );
+ 
+ /// Handle a key event, dispatching to the appropriate screen handler
+ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessage>) {
+     // User interaction is an ownership boundary for a pending generic
+@@ -72199,10 +72225,18 @@
+                     title: "CD pre-emphasis".to_string(),
+                     message: DEEMPHASIS_INFO_MESSAGE.to_string(),
+                     scroll: 0,
+                 };
+             }
++            TuiButton::TruePeakInfo => {
++                app.convert.focus = ConvertFocus::Format;
++                app.active_overlay = ActiveOverlay::Notice {
++                    title: "True peak".to_string(),
++                    message: TRUE_PEAK_INFO_MESSAGE.to_string(),
++                    scroll: 0,
++                };
++            }
+             TuiButton::FormatSettingsButton => {
+                 app.convert.focus = ConvertFocus::Format;
+                 let fmt = &app.convert.format;
+                 let selected = *fmt.format.selected_value();
+                 let (kind, focus) = match selected {

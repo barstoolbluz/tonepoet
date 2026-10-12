@@ -4995,3 +4995,39 @@ punctuation must not become emphasis.
 Worth doing once several help messages exist rather than against the first one,
 so the subset is shaped by more than a single consumer. More Convert-screen
 help text is planned.
+
+## 74. Album gain and loudest true peak do not sum to the ceiling, and the log never says why
+
+Filed 2026-10-11 from the field, on a qualified Reference SACD conversion.
+
+```
+  Applied: +6.338115084 dB
+  Loudest true peak: -6.338124793 dBTP, across 8 tracks
+```
+
+Those sum to -0.000009709, not to the ceiling. Reading the log, the arithmetic
+looks wrong: the natural expectation is that the applied gain is the peak's
+magnitude, give or take the last digit.
+
+It is not wrong. The two lines are different quantities.
+`Loudest true peak` reports `loudest_peak_dbfs`, the measured figure. The gain
+is solved in `tonepoet-pipeline/src/dsd_album_gain.rs:186-196` against the peak
+plus `pre_gain_reconstructed_error_linear`, toward a ceiling reduced by
+`post_gain_reconstructed_error_linear`, with every rounding step directed
+outward — `next_down_positive`, `next_up_nonnegative`,
+`linear_gain_to_db_nano_down`. The shortfall is the terminal error budget,
+about 9.7 microdecibels on this album. If the two figures summed exactly to the
+ceiling, that budget would be zero and the no-overshoot guarantee with it.
+
+So the defect is legibility, not arithmetic. The log presents two numbers that
+invite a subtraction it does not support, and names nothing that accounts for
+the difference. A reader checking the work concludes the product has a bug.
+
+What to do is open. The log could name the allowance, or state that the gain is
+solved against a certified bound rather than against the reported peak, or
+report the bound alongside the measurement. Whichever, a reader should be able
+to account for every digit on the page.
+
+Related: the same error budget is the concrete answer to how much headroom the
+guarantee costs — roughly 1e-5 dB here — which the true-peak help text
+(R32) describes qualitatively as "a little extra headroom".

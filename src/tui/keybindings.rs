@@ -23,6 +23,32 @@ pub(crate) const DEEMPHASIS_INFO_MESSAGE: &str = concat!(
     "Off — the boost stays in the audio, and tonepoet keeps the pre-emphasis flag wherever the format can carry it. CD players and some software — foobar2000, JRiver, iTunes, cmus — read that flag and correct playback. Where the flag cannot travel, such as a lossy target or anything outside 16-bit/44.1 kHz, the file will sound bright everywhere."
 );
 
+/// Help shared by PCM and DSD true-peak target rows; the Notice popup is
+/// unformatted, so paragraph breaks and label prefixes are deliberate.
+pub(crate) const TRUE_PEAK_INFO_MESSAGE: &str = concat!(
+    "True peak is the highest level the reconstructed waveform reaches, in decibels relative to",
+    " digital full scale. 0 dBTP is full scale.",
+    "\n\n",
+    "It is not the same as the highest sample value. Samples are individual points. When audio is",
+    " reconstructed for playback or for sample-rate conversion, the signal between those points can",
+    " rise higher than the samples themselves. These intersample peaks can exceed full scale even when",
+    " no single sample does, and that is what clips.",
+    "\n\n",
+    "Target — the highest true peak the output may reach. TonePoet measures the audio and derives the",
+    " gain from an upper bound on that measurement, one that cannot read low, so the output's true",
+    " peak lands at or below the figure you set. A faster scan tier costs a little extra headroom,",
+    " never safety. Encoding to a lossy format afterwards can move the peak again, because the decoder",
+    " reconstructs the signal differently.",
+    "\n\n",
+    "Scope — which tracks share one gain calculation.",
+    "\n\n",
+    "Track — each track is measured on its own and gets its own gain to meet the target.",
+    "\n\n",
+    "Album — every track in this job is measured together and the same gain is applied to all of",
+    " them, preserving the relative levels between them. Album means the tracks grouped into this job,",
+    " not album metadata or tags.",
+);
+
 /// Handle a key event, dispatching to the appropriate screen handler
 pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessage>) {
     // User interaction is an ownership boundary for a pending generic
@@ -72198,6 +72224,14 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 app.active_overlay = ActiveOverlay::Notice {
                     title: "CD pre-emphasis".to_string(),
                     message: DEEMPHASIS_INFO_MESSAGE.to_string(),
+                    scroll: 0,
+                };
+            }
+            TuiButton::TruePeakInfo => {
+                app.convert.focus = ConvertFocus::Format;
+                app.active_overlay = ActiveOverlay::Notice {
+                    title: "True peak".to_string(),
+                    message: TRUE_PEAK_INFO_MESSAGE.to_string(),
                     scroll: 0,
                 };
             }

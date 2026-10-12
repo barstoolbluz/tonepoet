@@ -13,7 +13,7 @@ use super::button_map::{ButtonRenderMap, MetadataFieldKind, TuiButton};
 use super::draw_footer::draw_footer;
 use super::draw_header::draw_header;
 use super::draw_metadata::{draw_metadata_pane, draw_metadata_title_bar};
-use super::draw_output::{draw_format_pane, draw_format_title_bar, true_peak_custom_pill_offset};
+use super::draw_output::{draw_format_pane, draw_format_title_bar, true_peak_custom_pill_offset, true_peak_info_offset};
 use super::draw_output_options::{
     draw_output_options_pane, draw_output_options_title_bar,
     register_output_options_mouse_targets,
@@ -348,6 +348,7 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
                 ) {
                     buttons.record_button(TuiButton::PcmTruePeakCustomPill, Rect::new(area.x + offset, y, 8, 1));
                 }
+                register_true_peak_info_button(buttons, area, y);
             }
             FormatField::NoiseShaper => register_pill_row(buttons, &state.noise_shaper, y, label_col, TuiButton::NoiseShaperPill),
             FormatField::ModulatorOrder => register_pill_row(buttons, &state.modulator_order, y, label_col, TuiButton::ModulatorOrderPill),
@@ -373,6 +374,7 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
                 ) {
                     buttons.record_button(TuiButton::DsdTruePeakCustomPill, Rect::new(area.x + offset, y, 8, 1));
                 }
+                register_true_peak_info_button(buttons, area, y);
             }
             FormatField::Container => {
                 let containers = state.format.selected_value().available_containers();
@@ -441,6 +443,17 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
                 }
             }
         }
+    }
+}
+
+// Concrete hit target is recorded after the whole-row target so the icon
+// opens help instead of entering the value editor. Match the draw guard.
+fn register_true_peak_info_button(buttons: &mut ButtonRenderMap, area: Rect, y: u16) {
+    if area.width >= 30 && area.height >= 6 {
+        buttons.record_button(
+            TuiButton::TruePeakInfo,
+            Rect::new(area.x + true_peak_info_offset(), y, 2, 1),
+        );
     }
 }
 
@@ -1257,5 +1270,112 @@ mod format_render_registration_tests {
             assert_eq!(value, DbNano(-100_000));
             assert_eq!(origin, TruePeakTargetOrigin::User);
         }
+    }
+
+    #[test]
+    fn r32_pcm_and_dsd_true_peak_info_clicks_open_shared_notice_without_editing() {
+        const WIDTH: u16 = 120;
+        const HEIGHT: u16 = 48;
+        let theme = crate::tui::theme::theme_by_slug(
+            crate::tui::theme::default_theme_slug(),
+        )
+        .expect("default theme");
+        for dsd in [false, true] {
+            let mut app = AppState::new_for_test(TonepoetConfig::default());
+            app.current_screen = AppScreen::Convert;
+            app.convert.focus = ConvertFocus::Format;
+            app.convert.layout = ConvertLayout::Maximized(ConvertFocus::Format);
+            app.convert.format.set_source_is_dsd(dsd);
+            assert!(app.convert.format.format.select_value(&AudioFormat::Flac));
+            app.convert.format.apply_format_constraints();
+            let target_field = if dsd {
+                assert!(app.convert.format.dsd_gain_mode.select_value(&DsdGainMode::TruePeakGuard));
+                TuiButton::DsdTruePeakTargetField
+            } else {
+                assert!(app.convert.format.pcm_gain_mode.select_value(
+                    &crate::tui::app::PcmGainMode::TruePeakGuard,
+                ));
+                TuiButton::PcmTruePeakTargetField
+            };
+            let initial_target = if dsd {
+                app.convert.format.dsd_true_peak_target_dbtp
+            } else {
+                app.convert.format.pcm_true_peak_target_dbtp
+            };
+            let backend = TestBackend::new(WIDTH, HEIGHT);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+            app.button_map.clear();
+            terminal
+                .draw(|frame| draw_convert_screen(frame, frame.size(), &mut app, theme))
+                .expect("draw true-peak information row");
+
+            let y = rendered_row(&terminal, WIDTH, HEIGHT, "TP target");
+            let icon_x = rendered_symbol_x(&terminal, WIDTH, y, "\u{24d8}");
+            let rendered = row_text(&terminal, y, WIDTH);
+            assert!(!rendered.contains("0.25 dB steps"), "{rendered}");
+            assert!(!rendered.contains(":set"), "{rendered}");
+            let info_rect = app.button_map.find_button_rect(&TuiButton::TruePeakInfo)
+                .expect("visible icon must have a hitbox");
+            assert_eq!((info_rect.x, info_rect.y, info_rect.width), (icon_x, y, 2));
+            for x in icon_x..icon_x + 2 {
+                assert_eq!(app.button_map.find_button_at(x, y), Some(TuiButton::TruePeakInfo));
+            }
+            assert_eq!(app.button_map.find_button_at(icon_x + 2, y), Some(target_field));
+
+            let (tx, _rx) = tokio::sync::mpsc::channel(1);
+            crate::tui::keybindings::handle_mouse(
+                &mut app,
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: icon_x,
+                    row: y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &tx,
+            );
+            assert!(matches!(
+                app.active_overlay,
+                ActiveOverlay::Notice { ref title, ref message, scroll }
+                    if title == "True peak"
+                        && message == crate::tui::keybindings::TRUE_PEAK_INFO_MESSAGE
+                        && scroll == 0
+            ));
+            assert_eq!(app.convert.format.true_peak_target_editing, None);
+            let target_after = if dsd {
+                app.convert.format.dsd_true_peak_target_dbtp
+            } else {
+                app.convert.format.pcm_true_peak_target_dbtp
+            };
+            assert_eq!(target_after, initial_target, "help must not mutate the gain target");
+        }
+    }
+
+    #[test]
+    fn r32_true_peak_help_is_not_registered_when_target_row_is_hidden() {
+        const WIDTH: u16 = 120;
+        const HEIGHT: u16 = 48;
+        let theme = crate::tui::theme::theme_by_slug(
+            crate::tui::theme::default_theme_slug(),
+        )
+        .expect("default theme");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Convert;
+        app.convert.focus = ConvertFocus::Format;
+        app.convert.layout = ConvertLayout::Maximized(ConvertFocus::Format);
+        app.convert.format.set_source_is_dsd(true);
+        assert!(app.convert.format.format.select_value(&AudioFormat::Flac));
+        assert!(app.convert.format.dsd_gain_mode.select_value(&DsdGainMode::FixedGain));
+        app.convert.format.apply_format_constraints();
+        let backend = TestBackend::new(WIDTH, HEIGHT);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        app.button_map.clear();
+        terminal
+            .draw(|frame| draw_convert_screen(frame, frame.size(), &mut app, theme))
+            .expect("draw fixed-gain mode");
+        assert!(app.button_map.find_button_rect(&TuiButton::TruePeakInfo).is_none());
+        let all_text: String = (0..HEIGHT)
+            .map(|y| row_text(&terminal, y, WIDTH))
+            .collect();
+        assert!(!all_text.contains("TP target"));
     }
 }
