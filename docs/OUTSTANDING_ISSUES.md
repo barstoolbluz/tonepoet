@@ -5031,3 +5031,78 @@ to account for every digit on the page.
 Related: the same error budget is the concrete answer to how much headroom the
 guarantee costs — roughly 1e-5 dB here — which the true-peak help text
 (R32) describes qualitatively as "a little extra headroom".
+
+## 75. Transfer tags cannot see an SACD ISO, in either direction
+
+Filed 2026-10-11 from the field.
+
+Right-click a folder containing an SACD ISO and an XML sidecar, Tags and
+tagging, Transfer tags from, pick a source folder of individually tagged FLAC
+files. The status bar answers:
+
+```
+Transfer tags: selected folder contains no audio files
+```
+
+The refusals are `src/tui/keybindings.rs:27462` for a folder and `:28034` for a
+carrier, reached when `expand_audio_paths_for_transfer_limited` returns nothing.
+That expansion admits a path only when
+`classify_file(path) == EntryKind::AudioFile(_)` (`src/tui/command.rs:157`). An
+SACD ISO is `EntryKind::SacdIso` or, on the extension fallback,
+`EntryKind::Archive` (`src/convert/classify.rs:185`) — never `AudioFile`. So a
+folder whose only audio is inside an ISO expands to zero paths and the operation
+refuses.
+
+The reverse direction, transferring from an ISO-plus-sidecar folder onto
+individual files, was not tried in the field and we expect it to fail the same
+way, through the same predicate. Unverified.
+
+The message is also misleading rather than merely unhelpful: the folder does
+contain audio, in a container the operation does not open.
+
+**What we want:** tag transfer works in both directions for SACD ISO sources
+and targets. Where it genuinely cannot, the refusal should say what it could
+not read rather than claim there is no audio.
+
+## 76. Album-scoped COMPOSER refuses to save on any multi-composer album that has a CUE beside it
+
+Filed 2026-10-11 from the field, on `1994 - Reality Bites (OST) (FLAC)`.
+
+```
+save aborted: album-scoped COMPOSER has different values on audio files covered
+by the same CUE; make the COMPOSER values match before saving; no carrier was
+changed
+```
+
+Reported on any various-artists album with multiple composers. The field report
+is that the tags nonetheless appear written, and are still there on reopening —
+so the message's "no carrier was changed" may be false, at least for the audio
+files. We did not confirm the write ordering and cannot say which carrier the
+claim refers to.
+
+What we understand of the mechanism, which may be wrong:
+
+- That folder does contain a CUE, `Reality Bites.cue`, beside fourteen
+  individually tagged FLACs. So the CUE in the message is real, not inferred.
+- `COMPOSER` carries `unified_cue_scope: Cue::None`
+  (`src/metadata_persistence.rs:97`), deliberately, so that these fields "keep
+  that declared shape rather than forcing every occurrence through the
+  unified-CUE Track invariant".
+- With no declared shape to consult, `unified_cue_entry_is_track_scoped`
+  (`src/tui/keybindings.rs:13835`) falls back to the row's own scope. Presented
+  album-scoped, COMPOSER then has to hold one value for every file the CUE
+  covers, and the uniformity check at `:29505` refuses when it does not.
+
+Two things make this read as a bug from the outside. A soundtrack has a
+different composer per track; that is the normal case, not a conflict to be
+reconciled. And the user's metadata source is configured as tagged files when
+available, which we believe governs reading and not this CUE write invariant —
+so the refusal appears to come from a carrier the user did not ask to write.
+
+**What we want:** per-track composers save without being refused. Whether that
+means COMPOSER is track-scoped in this presentation, or the CUE carrier is not
+written when the authoritative source is tagged files, or the uniformity
+invariant applies only to what is actually being written, is open.
+
+A refusal that says no carrier was changed should also be true, or say which
+carrier it means.
