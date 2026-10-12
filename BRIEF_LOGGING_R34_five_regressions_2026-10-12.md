@@ -2,9 +2,9 @@
 
 R33 and R33C are applied and gated. The nine `r33_` tests pass, so the three
 brief items are implemented as far as those tests reach; none of it has been
-exercised by hand here. Five tests fail that passed on the previous tree, and
-two of them look like real behaviour regressions in areas the brief did not ask
-to be touched.
+exercised by hand here. Five tests fail. Four of them passed on the previous
+tree; the fifth is R33C's own new test. Two of the four look like real
+behaviour regressions in areas the brief did not ask to be touched.
 
 This is how it reads from the outside; we misapprehend this codebase routinely,
 so where our framing is wrong, trust your own reading. Everything below we
@@ -108,9 +108,10 @@ R31 and R30 runners and `scripts/requalify_reference_r20.sh`; it has not been
 run, because the failures above come first and it needs a real SACD ISO path we
 do not have in hand.
 
-## Still unexercised by any test
+## Still unexercised against a real disc
 
-The SACD tag transfer round trip on a real disc. The delivery notes record that
-no SACD fixture existed in the authoring environment, and we have not run it
-either. Items 1 and 2 above are the only signal we have in that area, and both
-are negative.
+R33 added `r33_` tests for SACD field preservation, write idempotency, stale
+XML snapshot rejection and unmapped track IDs, and they pass. None of that has
+met an actual SACD ISO: the delivery notes record that no fixture existed in
+the authoring environment, and we have not run one either. Items 1 and 2 are
+the only other signal in that area, and both are negative.
