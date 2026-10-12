@@ -1,0 +1,35 @@
+TonePoet R34D validation and qualification report
+Date: 2026-10-12
+
+Actually verified on this authoring host:
+  PASS  Exact R34C parent SHA-256:
+        48c0e53631beae3b714ee75972c4db8bdbfa1bd72815834ffa572e8c6deefc69
+  PASS  Parent R34C source-inventory hashes and R34C_OFFLINE_VERIFY.sh.
+  PASS  Compare R34C archive to corrected tree: only inherited file modified
+        is src/tui/keybindings.rs. All other inherited bytes are unchanged.
+  PASS  R34D source patch is one file; applies to extracted R34C baseline
+        with --fuzz=0, gives byte-identical edited file, and reverses cleanly.
+  PASS  git apply --check --whitespace=error and shell bash -n.
+  PASS  Full old/new Rust lexical scan (Pygments) and punctuation matching.
+  PASS  Independent mapping-model checks: duplicate numbering, repair,
+        correctly mapped MCH IDs, refusal of missing physical ID.
+  PASS  Existing R34C out-of-order/unequal-count XML fixture remains valid;
+        TOC-authoritative strict ordering remains applicable.
+  PASS  R34D new focused Rust test is present in the source.
+
+Independent archive extraction, full-tree manifest verification, and
+byte-identical archive rebuild are performed on the final sealed delivery;
+see the separate delivery SHA-256 manifest and the engineering checkpoint.
+
+Not verified here (required on qualified build host):
+  OPEN  cargo check --locked --workspace --all-targets
+  OPEN  cargo test --locked --lib r34d_multitab_save_can_repair_duplicate_track_numbers_without_cross_area_writes
+  OPEN  R34C and R34 acceptance chains (including R33C, prior suites)
+  OPEN  Real SACD ISO and source-locked Reference requalification
+
+This host has no rustc, cargo, nix, or physical SACD ISO.
+STATIC VERIFICATION DOES NOT ESTABLISH A COMPILING OR WORKING BINARY.
+
+Scope: ONE Rust source file changed. No other inherited files changed;
+new files are a source-only patch, one test embedded in that Rust file,
+acceptance/offline scripts, checkpoint, and this verification report.

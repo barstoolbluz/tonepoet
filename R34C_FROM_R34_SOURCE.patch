@@ -1,0 +1,121 @@
+--- a/src/tui/keybindings.rs
++++ b/src/tui/keybindings.rs
+@@ -45970,6 +45970,16 @@
+     };
+ 
+     if state.has_multiple_presentations() {
++        // These presentation sizes come from the ISO TOC, not from the XML.
++        // XML track elements can be out of order and each area's TOTALTRACKS
++        // is local to that area; the first XML row cannot define the split.
++        let count_for_area = |area| {
++            state.presentation_tabs.iter()
++                .find(|tab| tab.id == crate::disc::model::PresentationId::SacdArea(area))
++                .map_or(0, |tab| tab.paths.len())
++        };
++        let stereo_count = count_for_area(crate::disc::model::SacdAreaId::Stereo);
++        let mch_count = count_for_area(crate::disc::model::SacdAreaId::MultiChannel);
+         let mut updated_areas = 0usize;
+         for tab in &state.presentation_tabs {
+             let area_idx = match &tab.id {
+@@ -45981,11 +45991,9 @@
+                 ) => 2u8,
+                 _ => continue,
+             };
+-            let area_track_ids: Vec<u32> = sidecar
+-                .tracks_for_area(area_idx)
+-                .iter()
+-                .map(|t| t.id)
+-                .collect();
++            let area_track_ids = super::tag_interchange::sacd_transfer_area_track_ids(
++                &sidecar, stereo_count, mch_count, area_idx,
++            )?;
+             if area_track_ids.len() != tab.paths.len() {
+                 return Err(format!(
+                     "sidecar area {} has {} track(s) but presentation '{}' has {}; refusing to map",
+@@ -87031,6 +87039,86 @@
+     }
+ 
+     #[test]
++    fn r34c_multitab_save_uses_iso_area_counts_for_out_of_order_xml() {
++        let _coordination = crate::concurrency::scoped_test_coordination_root();
++        use crate::disc::model::{PresentationId, SacdAreaId};
++        use crate::tui::sacd_sidecar::parse_sidecar;
++
++        // The multichannel XML rows precede the stereo rows. TOTALTRACKS
++        // is local to each area (2 MCH, 3 stereo), never a disc-wide split.
++        let xml = r#"<root><store id="X" type="SACD" version="1.1">
++<track id="4"><meta name="TITLE" value="MC-1"/><meta name="TRACKNUMBER" value="01"/><meta name="TOTALTRACKS" value="2"/><meta name="ALBUM" value="Disc Album"/><meta name="FOREIGN" value="Keep-MC"/></track>
++<track id="5"><meta name="TITLE" value="MC-2"/><meta name="TRACKNUMBER" value="02"/><meta name="TOTALTRACKS" value="2"/><meta name="ALBUM" value="Disc Album"/></track>
++<track id="1"><meta name="TITLE" value="St-1"/><meta name="TRACKNUMBER" value="01"/><meta name="TOTALTRACKS" value="3"/><meta name="ALBUM" value="Disc Album"/></track>
++<track id="2"><meta name="TITLE" value="St-2"/><meta name="TRACKNUMBER" value="02"/><meta name="TOTALTRACKS" value="3"/><meta name="ALBUM" value="Disc Album"/><meta name="FOREIGN" value="Keep-St"/></track>
++<track id="3"><meta name="TITLE" value="St-3"/><meta name="TRACKNUMBER" value="03"/><meta name="TOTALTRACKS" value="3"/><meta name="ALBUM" value="Disc Album"/></track>
++</store></root>"#;
++        let md = synth_hybrid_sacd_metadata(
++            Some("Disc Album"),
++            &["SB-St1", "SB-St2", "SB-St3"],
++            &["SB-MC1", "SB-MC2"],
++        );
++        let td = tempfile::tempdir().expect("tempdir");
++        let iso_path = td.path().join("disc.iso");
++        let xml_path = td.path().join("disc.xml");
++        std::fs::write(&iso_path, b"\0").expect("ISO anchor");
++        std::fs::write(&xml_path, xml).expect("sidecar");
++        let sidecar = parse_sidecar(&xml_path).expect("parse");
++        assert_eq!(sidecar.tracks.iter().map(|track| track.id).collect::<Vec<_>>(),
++            vec![4, 5, 1, 2, 3]);
++
++        let (mut state, _, _) = build_sacd_multitab_editor_state(
++            &iso_path, &md, Some(&sidecar),
++        ).expect("editor");
++        assert_eq!(state.presentation_tabs.len(), 2);
++        let stereo = state.presentation_tabs.iter_mut()
++            .find(|tab| matches!(&tab.id, PresentationId::SacdArea(SacdAreaId::Stereo)))
++            .expect("stereo");
++        let title = stereo.entries.iter_mut()
++            .find(|entry| entry.display_key == "TITLE").expect("stereo TITLE");
++        assert_eq!(title.per_file_values, vec!["St-1", "St-2", "St-3"]);
++        title.per_file_values[1].replace_scalar("St-2 Edited");
++        stereo.dirty = true;
++
++        let mch = state.presentation_tabs.iter_mut()
++            .find(|tab| matches!(&tab.id, PresentationId::SacdArea(SacdAreaId::MultiChannel)))
++            .expect("multichannel");
++        let title = mch.entries.iter_mut()
++            .find(|entry| entry.display_key == "TITLE").expect("MCH TITLE");
++        assert_eq!(title.per_file_values, vec!["MC-1", "MC-2"]);
++        title.per_file_values[0].replace_scalar("MC-1 Edited");
++        mch.dirty = true;
++
++        state.read_only = false;
++        super::save_sacd_sidecar(&state, &xml_path).expect("save different edits to both areas");
++        let saved = parse_sidecar(&xml_path).expect("reparse saved metabase");
++        let lookup = |id: u32, key: &str| saved.tracks.iter()
++            .find(|track| track.id == id)
++            .and_then(|track| track.meta.get(key)).map(String::as_str);
++        assert_eq!((1..=5).map(|id| lookup(id, "TITLE")).collect::<Vec<_>>(),
++            vec![Some("St-1"), Some("St-2 Edited"), Some("St-3"),
++                 Some("MC-1 Edited"), Some("MC-2")]);
++        assert_eq!(lookup(4, "FOREIGN"), Some("Keep-MC"));
++        assert_eq!(lookup(2, "FOREIGN"), Some("Keep-St"));
++        for id in 1..=5 {
++            assert_eq!(lookup(id, "ALBUM"), Some("Disc Album"));
++            assert_eq!(lookup(id, "TOTALTRACKS"), Some(if id <= 3 { "3" } else { "2" }));
++        }
++
++        let (reopened, _, _) = build_sacd_multitab_editor_state(
++            &iso_path, &md, Some(&saved),
++        ).expect("reopen saved metadata");
++        let reopened_titles = |area| reopened.presentation_tabs.iter()
++            .find(|tab| tab.id == area)
++            .and_then(|tab| tab.entries.iter().find(|entry| entry.display_key == "TITLE"))
++            .expect("reopened titles").per_file_values.clone();
++        assert_eq!(reopened_titles(PresentationId::SacdArea(SacdAreaId::Stereo)),
++            vec!["St-1", "St-2 Edited", "St-3"]);
++        assert_eq!(reopened_titles(PresentationId::SacdArea(SacdAreaId::MultiChannel)),
++            vec!["MC-1 Edited", "MC-2"]);
++    }
++
++    #[test]
+     fn r34_single_area_mch_sidecar_ids_start_at_one_and_save_without_mirror() {
+         let _coordination = crate::concurrency::scoped_test_coordination_root();
+         let mut md = synth_sacd_metadata(

@@ -29337,7 +29337,23 @@ fn cue_album_user_metadata_for_track_indices(
             continue;
         }
         let row_deleted = deleted.contains(&entry_index);
+        // A CUE album PERFORMER is distinct from a credit authored on each
+        // physical member. R33's 1:1 file/track projection must not move a
+        // shared album performer list into individual track metadata merely
+        // because this CUE also happens to use one file per track.
+        let album_performer_list = key == "PERFORMER"
+            && sheet.album_performer.is_some()
+            && entry.per_file_values.len() == sheet.audio_paths.len()
+            && entry.per_file_values.windows(2).all(|pair| pair[0] == pair[1])
+            && track_indices.iter().all(|index| {
+                sheet.track_sources.get(*index).is_some_and(|source| {
+                    crate::convert::cue_parser::cue_user_metadata_values(
+                        &source.user_metadata, "PERFORMER",
+                    ).is_none()
+                })
+            });
         let file_scoped_credit_slots = (!unified_cue_entry_is_track_scoped(entry)
+            && !album_performer_list
             && cue_album_file_scoped_track_credit(&key)
             && entry.per_file_values.len() == sheet.audio_paths.len()
             && entry.per_file_originals.len() == sheet.audio_paths.len())
@@ -44877,14 +44893,27 @@ pub fn build_sacd_editor_state(
     md: &super::sacd::SacdMetadata,
     sidecar: Option<&super::sacd_sidecar::SidecarMetadata>,
 ) -> Result<(super::app::MetadataEditorState, &'static str, usize), String> {
+    build_sacd_editor_state_for_area(iso_path, md, sidecar, None)
+}
+
+/// Select the requested area without deleting the sibling's physical TOC.
+/// The sidecar XML uses disc-wide track IDs, so the stereo count must remain
+/// available even when the displayed tab is the multichannel area.
+fn build_sacd_editor_state_for_area(
+    iso_path: &std::path::Path,
+    md: &super::sacd::SacdMetadata,
+    sidecar: Option<&super::sacd_sidecar::SidecarMetadata>,
+    selected_area: Option<super::sacd::AreaKind>,
+) -> Result<(super::app::MetadataEditorState, &'static str, usize), String> {
     use super::probe::TagEntry;
     use lofty::tag::ItemKey;
 
-    let area = md
-        .stereo
-        .as_ref()
-        .or(md.multi_channel.as_ref())
-        .ok_or_else(|| "SACD: no readable area".to_string())?;
+    let area = match selected_area {
+        Some(super::sacd::AreaKind::Stereo) => md.stereo.as_ref(),
+        Some(super::sacd::AreaKind::MultiChannel) => md.multi_channel.as_ref(),
+        None => md.stereo.as_ref().or(md.multi_channel.as_ref()),
+    }
+    .ok_or_else(|| "SACD: no readable area".to_string())?;
 
     let n_tracks = area.tracks.len();
     if n_tracks == 0 {
@@ -44910,9 +44939,17 @@ pub fn build_sacd_editor_state(
                 .map(|area| usize::from(area.header.track_count)).unwrap_or(0);
             let mch_count = md.multi_channel.as_ref()
                 .map(|area| usize::from(area.header.track_count)).unwrap_or(0);
-            super::tag_interchange::sacd_transfer_area_track_ids(
-                s, stereo_count, mch_count, sidecar_area_idx,
-            ).ok().map(|ids| {
+            // An XML with more rows than the ISO's physical count may be a
+            // legacy hybrid metabase viewed with only one area available.
+            // Don't let its first N stereo IDs masquerade as MCH metadata.
+            // Prefer the legacy area split for this *read-only projection*;
+            // SACD Transfer writes still require their strict TOC mapping.
+            let ids = (s.tracks.len() == stereo_count + mch_count)
+                .then(|| super::tag_interchange::sacd_transfer_area_track_ids(
+                    s, stereo_count, mch_count, sidecar_area_idx,
+                ).ok())
+                .flatten();
+            ids.map(|ids| {
                 ids.into_iter().filter_map(|id| s.tracks.iter().find(|track| track.id == id))
                     .collect::<Vec<_>>()
             }).unwrap_or_else(|| s.tracks_for_area(sidecar_area_idx))
@@ -45305,16 +45342,12 @@ pub fn build_sacd_multitab_editor_state(
     md: &super::sacd::SacdMetadata,
     sidecar: Option<&super::sacd_sidecar::SidecarMetadata>,
 ) -> Result<(super::app::MetadataEditorState, &'static str, usize), String> {
-    let mut area_views: Vec<(super::sacd::AreaKind, super::sacd::SacdMetadata)> = Vec::new();
+    let mut area_views = Vec::new();
     if md.stereo.is_some() {
-        let mut view = md.clone();
-        view.multi_channel = None;
-        area_views.push((super::sacd::AreaKind::Stereo, view));
+        area_views.push(super::sacd::AreaKind::Stereo);
     }
     if md.multi_channel.is_some() {
-        let mut view = md.clone();
-        view.stereo = None;
-        area_views.push((super::sacd::AreaKind::MultiChannel, view));
+        area_views.push(super::sacd::AreaKind::MultiChannel);
     }
 
     if area_views.is_empty() {
@@ -45324,8 +45357,9 @@ pub fn build_sacd_multitab_editor_state(
     let mut tabs: Vec<super::app::PresentationTab> = Vec::new();
     let mut states: Vec<(super::app::MetadataEditorState, &'static str, usize)> = Vec::new();
 
-    for (kind, view) in area_views {
-        let (state, label, n_tracks) = build_sacd_editor_state(iso_path, &view, sidecar)?;
+    for kind in area_views {
+        let (state, label, n_tracks) =
+            build_sacd_editor_state_for_area(iso_path, md, sidecar, Some(kind))?;
         let (id, tab_label) = match kind {
             super::sacd::AreaKind::Stereo => (
                 crate::disc::model::PresentationId::SacdArea(
@@ -45629,19 +45663,10 @@ pub(super) fn switch_sacd_editor_area(
             }
         });
 
-    // Build a synthetic SacdMetadata that forces the parser's
-    // area-selection (which prefers stereo) to pick the requested
-    // area. Easiest way: when the user wants MCH, hide the stereo
-    // area by replacing md.stereo with None before passing to the
-    // builder; vice versa for stereo.
-    let mut md_view = md.clone();
-    match want_kind {
-        AreaKind::Stereo => md_view.multi_channel = None,
-        AreaKind::MultiChannel => md_view.stereo = None,
-    }
-
+    // Preserve both physical TOCs while choosing the requested editor area.
+    // Discarding the stereo count would rebase MCH XML IDs onto stereo rows.
     let (new_state, area_label, _n) =
-        build_sacd_editor_state(iso_path, &md_view, sidecar.as_ref())?;
+        build_sacd_editor_state_for_area(iso_path, &md, sidecar.as_ref(), Some(want_kind))?;
 
     // Preserve cursor position within bounds (best-effort — entries
     // may have different counts if e.g. an MCH area has tracks the
@@ -45945,6 +45970,16 @@ pub fn save_sacd_sidecar(
     };
 
     if state.has_multiple_presentations() {
+        // These presentation sizes come from the ISO TOC, not from the XML.
+        // XML track elements can be out of order and each area's TOTALTRACKS
+        // is local to that area; the first XML row cannot define the split.
+        let count_for_area = |area| {
+            state.presentation_tabs.iter()
+                .find(|tab| tab.id == crate::disc::model::PresentationId::SacdArea(area))
+                .map_or(0, |tab| tab.paths.len())
+        };
+        let stereo_count = count_for_area(crate::disc::model::SacdAreaId::Stereo);
+        let mch_count = count_for_area(crate::disc::model::SacdAreaId::MultiChannel);
         let mut updated_areas = 0usize;
         for tab in &state.presentation_tabs {
             let area_idx = match &tab.id {
@@ -45956,11 +45991,31 @@ pub fn save_sacd_sidecar(
                 ) => 2u8,
                 _ => continue,
             };
-            let area_track_ids: Vec<u32> = sidecar
-                .tracks_for_area(area_idx)
-                .iter()
-                .map(|t| t.id)
-                .collect();
+            let area_track_ids = super::tag_interchange::sacd_transfer_area_track_ids(
+                &sidecar, stereo_count, mch_count, area_idx,
+            ).or_else(|strict_error| {
+                // The editor itself falls back to tracks_for_area when XML
+                // TRACKNUMBER values are duplicated or invalid. A Save must
+                // still be able to repair those tags, but only when that
+                // fallback maps every physical TOC track ID exactly once.
+                // Keep the stricter mapper unchanged for tag transfers.
+                let fallback_ids: Vec<u32> = sidecar.tracks_for_area(area_idx)
+                    .iter().map(|track| track.id).collect();
+                let base = if area_idx == 1 { 0 } else { stereo_count };
+                let expected_ids = base.checked_add(tab.paths.len()).and_then(|end| {
+                    (base + 1..=end).map(u32::try_from)
+                        .collect::<Result<Vec<_>, _>>().ok()
+                });
+                let mut sorted_ids = fallback_ids.clone();
+                sorted_ids.sort_unstable();
+                if expected_ids.as_ref().is_some_and(|expected| {
+                    !expected.is_empty() && *expected == sorted_ids
+                }) {
+                    Ok(fallback_ids)
+                } else {
+                    Err(strict_error)
+                }
+            })?;
             if area_track_ids.len() != tab.paths.len() {
                 return Err(format!(
                     "sidecar area {} has {} track(s) but presentation '{}' has {}; refusing to map",
@@ -45996,11 +46051,20 @@ pub fn save_sacd_sidecar(
         None => return Err("editor has no SACD area kind".into()),
     };
 
-    let area_track_ids: Vec<u32> = sidecar
+    let mut area_track_ids: Vec<u32> = sidecar
         .tracks_for_area(area_idx)
         .iter()
         .map(|t| t.id)
         .collect();
+    let single_mch_ids = area_idx == 2
+        && area_track_ids.is_empty()
+        && state.active_surface().sacd_stereo_durations.is_none()
+        && sidecar.tracks.len() == state.active_surface().paths.len();
+    if single_mch_ids {
+        // Genuine single-area MCH discs number their XML IDs from 1;
+        // the legacy TOTALTRACKS heuristic wrongly labels them stereo.
+        area_track_ids = sidecar.tracks_for_area(1).iter().map(|t| t.id).collect();
+    }
 
     if area_track_ids.len() != state.active_surface().paths.len() {
         return Err(format!(
@@ -46023,17 +46087,21 @@ pub fn save_sacd_sidecar(
         2 => 1u8,
         _ => unreachable!("area_idx must be 1 or 2 by construction above"),
     };
-    let sibling_track_info: Vec<(u32, Option<u32>)> = sidecar
-        .tracks_for_area(sibling_area_idx)
-        .iter()
-        .map(|t| {
-            let tn = t
-                .meta
-                .get("TRACKNUMBER")
-                .and_then(|s| s.trim().parse::<u32>().ok());
-            (t.id, tn)
-        })
-        .collect();
+    let sibling_track_info: Vec<(u32, Option<u32>)> = if single_mch_ids {
+        Vec::new()
+    } else {
+        sidecar
+            .tracks_for_area(sibling_area_idx)
+            .iter()
+            .map(|t| {
+                let tn = t
+                    .meta
+                    .get("TRACKNUMBER")
+                    .and_then(|s| s.trim().parse::<u32>().ok());
+                (t.id, tn)
+            })
+            .collect()
+    };
     let mirror = if sibling_track_info.is_empty() {
         MirrorOutcome {
             sibling_present: false,
@@ -86970,6 +87038,247 @@ ignored".to_string()),
         assert_eq!(title_for(4), Some("MC-2"));
     }
 
+
+    #[test]
+    fn r34_multitab_hybrid_reads_mch_xml_using_disc_wide_id_offset() {
+        let md = synth_hybrid_sacd_metadata(Some("Album"), &["St-SB1", "St-SB2"], &["MC-SB1", "MC-SB2"]);
+        let sidecar = parse_sidecar_for_test(SAMPLE_HYBRID_2X2);
+        let (state, _, _) = build_sacd_multitab_editor_state(
+            std::path::Path::new("/tmp/r34-hybrid.iso"), &md, Some(&sidecar),
+        ).expect("hybrid editor");
+        assert_eq!(state.presentation_tabs.len(), 2);
+        for (index, expected) in [
+            (0usize, vec!["St-1", "St-2"]),
+            (1usize, vec!["MC-1", "MC-2"]),
+        ] {
+            let tab = &state.presentation_tabs[index];
+            let title = tab.entries.iter().find(|entry| entry.display_key == "TITLE")
+                .expect("selected area's TITLE");
+            assert_eq!(title.per_file_values, expected, "presentation {}", index);
+            assert!(tab.sacd_stereo_durations.is_some());
+            assert!(tab.sacd_multi_channel_durations.is_some());
+        }
+    }
+
+    #[test]
+    fn r34c_multitab_save_uses_iso_area_counts_for_out_of_order_xml() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        use crate::disc::model::{PresentationId, SacdAreaId};
+        use crate::tui::sacd_sidecar::parse_sidecar;
+
+        // The multichannel XML rows precede the stereo rows. TOTALTRACKS
+        // is local to each area (2 MCH, 3 stereo), never a disc-wide split.
+        let xml = r#"<root><store id="X" type="SACD" version="1.1">
+<track id="4"><meta name="TITLE" value="MC-1"/><meta name="TRACKNUMBER" value="01"/><meta name="TOTALTRACKS" value="2"/><meta name="ALBUM" value="Disc Album"/><meta name="FOREIGN" value="Keep-MC"/></track>
+<track id="5"><meta name="TITLE" value="MC-2"/><meta name="TRACKNUMBER" value="02"/><meta name="TOTALTRACKS" value="2"/><meta name="ALBUM" value="Disc Album"/></track>
+<track id="1"><meta name="TITLE" value="St-1"/><meta name="TRACKNUMBER" value="01"/><meta name="TOTALTRACKS" value="3"/><meta name="ALBUM" value="Disc Album"/></track>
+<track id="2"><meta name="TITLE" value="St-2"/><meta name="TRACKNUMBER" value="02"/><meta name="TOTALTRACKS" value="3"/><meta name="ALBUM" value="Disc Album"/><meta name="FOREIGN" value="Keep-St"/></track>
+<track id="3"><meta name="TITLE" value="St-3"/><meta name="TRACKNUMBER" value="03"/><meta name="TOTALTRACKS" value="3"/><meta name="ALBUM" value="Disc Album"/></track>
+</store></root>"#;
+        let md = synth_hybrid_sacd_metadata(
+            Some("Disc Album"),
+            &["SB-St1", "SB-St2", "SB-St3"],
+            &["SB-MC1", "SB-MC2"],
+        );
+        let td = tempfile::tempdir().expect("tempdir");
+        let iso_path = td.path().join("disc.iso");
+        let xml_path = td.path().join("disc.xml");
+        std::fs::write(&iso_path, b"\0").expect("ISO anchor");
+        std::fs::write(&xml_path, xml).expect("sidecar");
+        let sidecar = parse_sidecar(&xml_path).expect("parse");
+        assert_eq!(sidecar.tracks.iter().map(|track| track.id).collect::<Vec<_>>(),
+            vec![4, 5, 1, 2, 3]);
+
+        let (mut state, _, _) = build_sacd_multitab_editor_state(
+            &iso_path, &md, Some(&sidecar),
+        ).expect("editor");
+        assert_eq!(state.presentation_tabs.len(), 2);
+        let stereo = state.presentation_tabs.iter_mut()
+            .find(|tab| matches!(&tab.id, PresentationId::SacdArea(SacdAreaId::Stereo)))
+            .expect("stereo");
+        let title = stereo.entries.iter_mut()
+            .find(|entry| entry.display_key == "TITLE").expect("stereo TITLE");
+        assert_eq!(title.per_file_values, vec!["St-1", "St-2", "St-3"]);
+        title.per_file_values[1].replace_scalar("St-2 Edited");
+        stereo.dirty = true;
+
+        let mch = state.presentation_tabs.iter_mut()
+            .find(|tab| matches!(&tab.id, PresentationId::SacdArea(SacdAreaId::MultiChannel)))
+            .expect("multichannel");
+        let title = mch.entries.iter_mut()
+            .find(|entry| entry.display_key == "TITLE").expect("MCH TITLE");
+        assert_eq!(title.per_file_values, vec!["MC-1", "MC-2"]);
+        title.per_file_values[0].replace_scalar("MC-1 Edited");
+        mch.dirty = true;
+
+        state.read_only = false;
+        super::save_sacd_sidecar(&state, &xml_path).expect("save different edits to both areas");
+        let saved = parse_sidecar(&xml_path).expect("reparse saved metabase");
+        let lookup = |id: u32, key: &str| saved.tracks.iter()
+            .find(|track| track.id == id)
+            .and_then(|track| track.meta.get(key)).map(String::as_str);
+        assert_eq!((1..=5).map(|id| lookup(id, "TITLE")).collect::<Vec<_>>(),
+            vec![Some("St-1"), Some("St-2 Edited"), Some("St-3"),
+                 Some("MC-1 Edited"), Some("MC-2")]);
+        assert_eq!(lookup(4, "FOREIGN"), Some("Keep-MC"));
+        assert_eq!(lookup(2, "FOREIGN"), Some("Keep-St"));
+        for id in 1..=5 {
+            assert_eq!(lookup(id, "ALBUM"), Some("Disc Album"));
+            assert_eq!(lookup(id, "TOTALTRACKS"), Some(if id <= 3 { "3" } else { "2" }));
+        }
+
+        let (reopened, _, _) = build_sacd_multitab_editor_state(
+            &iso_path, &md, Some(&saved),
+        ).expect("reopen saved metadata");
+        let reopened_titles = |area| reopened.presentation_tabs.iter()
+            .find(|tab| tab.id == area)
+            .and_then(|tab| tab.entries.iter().find(|entry| entry.display_key == "TITLE"))
+            .expect("reopened titles").per_file_values.clone();
+        assert_eq!(reopened_titles(PresentationId::SacdArea(SacdAreaId::Stereo)),
+            vec!["St-1", "St-2 Edited", "St-3"]);
+        assert_eq!(reopened_titles(PresentationId::SacdArea(SacdAreaId::MultiChannel)),
+            vec!["MC-1 Edited", "MC-2"]);
+    }
+
+    #[test]
+    fn r34d_multitab_save_can_repair_duplicate_track_numbers_without_cross_area_writes() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        use crate::disc::model::{PresentationId, SacdAreaId};
+        use crate::tui::sacd_sidecar::parse_sidecar;
+
+        let md = synth_hybrid_sacd_metadata(
+            Some("Album"), &["St-1", "St-2"], &["MC-1", "MC-2"],
+        );
+        let td = tempfile::tempdir().expect("tempdir");
+        let iso_path = td.path().join("disc.iso");
+        let xml_path = td.path().join("disc.xml");
+        std::fs::write(&iso_path, b"\0").expect("ISO anchor");
+        std::fs::write(&xml_path, SAMPLE_HYBRID_2X2).expect("sidecar");
+        let initial = parse_sidecar(&xml_path).expect("parse");
+        let stereo_id = PresentationId::SacdArea(SacdAreaId::Stereo);
+        let mch_id = PresentationId::SacdArea(SacdAreaId::MultiChannel);
+
+        // First Save is allowed to create invalid stored ordinals; it must
+        // not make a subsequent repair of that very metadata impossible.
+        let (mut first, _, _) = build_sacd_multitab_editor_state(
+            &iso_path, &md, Some(&initial),
+        ).expect("initial editor");
+        first.read_only = false;
+        let stereo = first.presentation_tabs.iter_mut()
+            .find(|tab| tab.id == stereo_id).expect("stereo tab");
+        let numbering = stereo.entries.iter_mut()
+            .find(|entry| entry.display_key == "TRACKNUMBER").expect("numbering");
+        assert_eq!(numbering.per_file_values, vec!["01", "02"]);
+        numbering.per_file_values[1].replace_scalar("01");
+        stereo.dirty = true;
+        super::save_sacd_sidecar(&first, &xml_path).expect("write duplicate numbering");
+        let duplicated = parse_sidecar(&xml_path).expect("reparse duplicate numbering");
+        let value = |id: u32, key: &str| duplicated.tracks.iter()
+            .find(|track| track.id == id)
+            .and_then(|track| track.meta.get(key)).map(String::as_str);
+        assert_eq!(value(1, "TRACKNUMBER"), Some("01"));
+        assert_eq!(value(2, "TRACKNUMBER"), Some("01"));
+        assert!(super::super::tag_interchange::sacd_transfer_area_track_ids(
+            &duplicated, 2, 2, 1,
+        ).is_err(), "strict transfer must still reject duplicate ordinals");
+
+        // Reopen via the editor's established read fallback, repair stereo
+        // numbering, and make an independent MCH edit in the same Save.
+        let (mut second, _, _) = build_sacd_multitab_editor_state(
+            &iso_path, &md, Some(&duplicated),
+        ).expect("reopen duplicated numbering");
+        second.read_only = false;
+        let stereo = second.presentation_tabs.iter_mut()
+            .find(|tab| tab.id == stereo_id).expect("reopened stereo");
+        let numbering = stereo.entries.iter_mut()
+            .find(|entry| entry.display_key == "TRACKNUMBER").expect("reopened numbering");
+        assert_eq!(numbering.per_file_values, vec!["01", "01"]);
+        numbering.per_file_values[1].replace_scalar("02");
+        let title = stereo.entries.iter_mut()
+            .find(|entry| entry.display_key == "TITLE").expect("stereo titles");
+        assert_eq!(title.per_file_values, vec!["St-1", "St-2"]);
+        title.per_file_values[1].replace_scalar("St-2 Repaired");
+        stereo.dirty = true;
+        let mch = second.presentation_tabs.iter_mut()
+            .find(|tab| tab.id == mch_id).expect("reopened MCH");
+        let title = mch.entries.iter_mut()
+            .find(|entry| entry.display_key == "TITLE").expect("MCH titles");
+        assert_eq!(title.per_file_values, vec!["MC-1", "MC-2"]);
+        title.per_file_values[0].replace_scalar("MC-1 Edited");
+        mch.dirty = true;
+        super::save_sacd_sidecar(&second, &xml_path).expect("repair and save both areas");
+
+        let repaired = parse_sidecar(&xml_path).expect("reparse repaired sidecar");
+        let value = |id: u32, key: &str| repaired.tracks.iter()
+            .find(|track| track.id == id)
+            .and_then(|track| track.meta.get(key)).map(String::as_str);
+        assert_eq!((1..=4).map(|id| value(id, "TRACKNUMBER")).collect::<Vec<_>>(),
+            vec![Some("01"), Some("02"), Some("01"), Some("02")]);
+        assert_eq!((1..=4).map(|id| value(id, "TITLE")).collect::<Vec<_>>(),
+            vec![Some("St-1"), Some("St-2 Repaired"), Some("MC-1 Edited"), Some("MC-2")]);
+        assert_eq!(value(1, "ALBUM"), Some("StereoAlbum"));
+        assert_eq!(value(3, "ALBUM"), Some("MCHAlbum"));
+        let (reopened, _, _) = build_sacd_multitab_editor_state(
+            &iso_path, &md, Some(&repaired),
+        ).expect("reopen repaired sidecar");
+        for (area, titles) in [
+            (stereo_id, vec!["St-1", "St-2 Repaired"]),
+            (mch_id, vec!["MC-1 Edited", "MC-2"]),
+        ] {
+            let tab = reopened.presentation_tabs.iter()
+                .find(|tab| tab.id == area).expect("reopened area");
+            let title = tab.entries.iter()
+                .find(|entry| entry.display_key == "TITLE").expect("reopened title");
+            assert_eq!(title.per_file_values, titles);
+        }
+
+        // An incomplete physical ID range must not gain the repair fallback.
+        let mut incomplete = duplicated.clone();
+        incomplete.tracks.retain(|track| track.id != 2);
+        let invalid_path = td.path().join("incomplete.xml");
+        crate::tui::sacd_sidecar::write_sidecar(&invalid_path, &incomplete)
+            .expect("create incomplete fixture");
+        let before = std::fs::read(&invalid_path).expect("snapshot incomplete fixture");
+        assert!(super::save_sacd_sidecar(&second, &invalid_path).is_err());
+        assert_eq!(std::fs::read(&invalid_path).expect("unmodified fixture"), before);
+    }
+
+    #[test]
+    fn r34_single_area_mch_sidecar_ids_start_at_one_and_save_without_mirror() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let mut md = synth_sacd_metadata(
+            None, None, 0, None, &["Scarlet MC1", "Scarlet MC2"], &["", ""], &[None, None],
+        );
+        let mut mch = md.stereo.take().expect("synthetic SACD area");
+        mch.header.kind = crate::tui::sacd::AreaKind::MultiChannel;
+        mch.header.channel_count = 6;
+        md.multi_channel = Some(mch);
+        let td = tempfile::tempdir().expect("tempdir");
+        let iso = td.path().join("single-mch.iso");
+        let xml = td.path().join("single-mch.xml");
+        std::fs::write(&iso, b"\0").expect("synthetic ISO anchor");
+        std::fs::write(&xml, r#"<root><store id="X" type="SACD" version="1.1">
+<track id="1"><meta name="TITLE" value="MC-1"/><meta name="TRACKNUMBER" value="01"/><meta name="TOTALTRACKS" value="2"/></track>
+<track id="2"><meta name="TITLE" value="MC-2"/><meta name="TRACKNUMBER" value="02"/><meta name="TOTALTRACKS" value="2"/></track>
+</store></root>"#).expect("sidecar");
+        let sidecar = crate::tui::sacd_sidecar::parse_sidecar(&xml).expect("parse");
+        let (mut state, label, _) = build_sacd_editor_state(&iso, &md, Some(&sidecar))
+            .expect("single-MCH editor");
+        assert_eq!(label, "MCH");
+        let title = state.active_surface().entries.iter().find(|entry| entry.display_key == "TITLE")
+            .expect("TITLE");
+        assert_eq!(title.per_file_values, vec!["MC-1", "MC-2"]);
+        state.read_only = false;
+        let title = state.active_surface_mut().entries.iter_mut()
+            .find(|entry| entry.display_key == "TITLE").expect("TITLE row");
+        title.per_file_values[1].replace_scalar("MC-2 Edited");
+        let outcome = super::save_sacd_sidecar(&state, &xml).expect("MCH-only save");
+        assert!(!outcome.mirror.sibling_present, "a single-area disc has no stereo sibling");
+        let reparsed = crate::tui::sacd_sidecar::parse_sidecar(&xml).expect("reparse");
+        assert_eq!(reparsed.tracks.iter().map(|track| track.meta.get("TITLE").map(String::as_str))
+            .collect::<Vec<_>>(), vec![Some("MC-1"), Some("MC-2 Edited")]);
+    }
+
     #[test]
     fn save_sacd_sidecar_mirrors_album_level_edits_across_areas() {
         let md =
@@ -102779,9 +103088,23 @@ FILE "a.flac" WAVE
         assert_cue_discnumber(&lp1_cue, None);
         assert_cue_discnumber(&lp2_cue, None);
 
-        // Priority 2: IndividualFiles. The same Album-view edit must instead
-        // mutate the two FLAC images, leaving the non-authoritative CUEs byte-
-        // identical and preserving native per-side DISCNUMBER on reopen.
+        // Priority 2: IndividualFiles is viable only with one logical track
+        // per physical FLAC. The first half deliberately used two-track image
+        // CUEs, for which native tags cannot be authoritative. Re-author the
+        // CUEs as 1:1 sidecars before testing individual-file priority.
+        for (cue, image, title) in [
+            (&lp1_cue, &lp1_image, "LP1 One"),
+            (&lp2_cue, &lp2_image, "LP2 One"),
+        ] {
+            let file = image.file_name().expect("FLAC filename").to_string_lossy();
+            std::fs::write(
+                cue,
+                format!(
+                    "TITLE \"Native Disc Album\"\nFILE \"{file}\" FLAC\n  TRACK 01 AUDIO\n    TITLE \"{title}\"\n    INDEX 01 00:00:00\n"
+                ),
+            )
+            .expect("one-track-per-file CUE");
+        }
         let cue_after_deletion = [
             std::fs::read(&lp1_cue).expect("LP1 CUE baseline"),
             std::fs::read(&lp2_cue).expect("LP2 CUE baseline"),
@@ -102860,7 +103183,7 @@ FILE "a.flac" WAVE
         assert_eq!(reopened.row_scope, crate::tui::probe::RowScope::Track);
         assert_eq!(
             reopened.per_file_values.iter().map(|value| value.as_str()).collect::<Vec<_>>(),
-            vec!["1", "1", "2", "2"],
+            vec!["1", "2"],
         );
         assert_eq!(reopened.per_file_values, reopened.per_file_originals);
         assert!(!state.active_surface().dirty);
@@ -113898,6 +114221,66 @@ mod r33_metadata_authority_regressions {
             &parsed.tracks[1].user_metadata, "COMPOSER"), Some(["Composer Beta".to_string()].as_slice()));
         assert!(crate::convert::cue_parser::cue_user_metadata_values(
             &parsed.user_metadata, "COMPOSER").is_none());
+    }
+
+
+    #[test]
+    fn r34_shared_album_performer_list_survives_in_inert_album_block() {
+        let state = super::phase4_tests::single_image_unified_cue_state(vec![], 2);
+        let mut sheet = state.active_surface().cue_album_synthetic_sheet.clone().unwrap();
+        let second = std::path::PathBuf::from("/tmp/second.flac");
+        sheet.audio_paths.push(second.clone());
+        sheet.track_sources[1].audio_path = second;
+        sheet.track_sources[1].file_ref = "second.flac".into();
+        sheet.album_performer = Some("Original Album Performer".into());
+        let mut entry = composer(&["Old", "Old"], &["Old", "Old"]);
+        entry.display_key = "PERFORMER".into();
+        let credits = MetadataFieldValues::from_stored_texts([
+            "John Bonham", "John Paul Jones", "Jimmy Page", "Robert Plant",
+        ]);
+        entry.per_file_values = vec![credits.clone(), credits];
+        let cue = cue_album_generate_cuesheet_for_track_indices(
+            &sheet, &[entry], &[], &[0, 1], false, true,
+            cue_album_preserved_file_ref_for_source, cue_album_format_tag_for_audio,
+        ).expect("shared album performer must be representable");
+        let parsed = crate::convert::cue_parser::parse_cue(&cue);
+        let expected = vec![
+            "John Bonham".to_string(), "John Paul Jones".to_string(),
+            "Jimmy Page".to_string(), "Robert Plant".to_string(),
+        ];
+        assert_eq!(crate::convert::cue_parser::cue_user_metadata_values(
+            &parsed.user_metadata, "PERFORMER"), Some(expected.as_slice()));
+        assert!(parsed.tracks.iter().all(|track| {
+            crate::convert::cue_parser::cue_user_metadata_values(
+                &track.user_metadata, "PERFORMER").is_none()
+        }));
+    }
+
+    #[test]
+    fn r34_distinct_file_performers_remain_independent_track_credits() {
+        let state = super::phase4_tests::single_image_unified_cue_state(vec![], 2);
+        let mut sheet = state.active_surface().cue_album_synthetic_sheet.clone().unwrap();
+        let second = std::path::PathBuf::from("/tmp/second.flac");
+        sheet.audio_paths.push(second.clone());
+        sheet.track_sources[1].audio_path = second;
+        sheet.track_sources[1].file_ref = "second.flac".into();
+        sheet.album_performer = Some("Album Performer".into());
+        let mut entry = composer(&["Performer A", "Performer B"], &["Old", "Old"]);
+        entry.display_key = "PERFORMER".into();
+        let cue = cue_album_generate_cuesheet_for_track_indices(
+            &sheet, &[entry], &[], &[0, 1], false, true,
+            cue_album_preserved_file_ref_for_source, cue_album_format_tag_for_audio,
+        ).expect("distinct member performers must be representable");
+        let parsed = crate::convert::cue_parser::parse_cue(&cue);
+        assert!(crate::convert::cue_parser::cue_user_metadata_values(
+            &parsed.user_metadata, "PERFORMER").is_none());
+        for (index, expected) in ["Performer A", "Performer B"].iter().enumerate() {
+            let values = crate::convert::cue_parser::cue_user_metadata_values(
+                &parsed.tracks[index].user_metadata, "PERFORMER")
+                .expect("distinct track performer");
+            assert_eq!(values.first().map(String::as_str), Some(*expected));
+            assert_eq!(values.len(), 1);
+        }
     }
 
     #[test]

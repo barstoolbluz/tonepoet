@@ -2321,9 +2321,10 @@ mod tests {
             .map(|extension| (*extension).to_string())
             .collect::<std::collections::BTreeSet<_>>();
         expected_extensions.insert("cue".to_string());
+        expected_extensions.insert("iso".to_string());
         assert_eq!(
             actual_extensions, expected_extensions,
-            "transfer filter must equal canonical audio coverage plus only CUE"
+            "transfer filter must equal canonical audio coverage plus CUE and SACD ISO"
         );
 
         for extension in crate::convert::classify::SUPPORTED_AUDIO_FILE_EXTENSIONS {
@@ -2338,6 +2339,8 @@ mod tests {
             );
         }
         assert!(transfer.accepts_path(std::path::Path::new("album.CUE"), false));
+        assert!(transfer.accepts_path(std::path::Path::new("album.ISO"), false));
+        assert!(!crate::convert::classify::is_audio_file_path(std::path::Path::new("album.iso")));
         assert!(!transfer.accepts_path(std::path::Path::new("notes.txt"), false));
         assert!(!tui_file_picker::FilePickerFilter::Audio
             .accepts_path(std::path::Path::new("album.cue"), false));

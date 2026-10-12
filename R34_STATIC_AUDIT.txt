@@ -1,0 +1,24 @@
+R34 OFFLINE SOURCE VERIFICATION — 2026-10-12
+==========================================
+Scope: five reported R33/R33C regressions; narrow production source corrections
+and regression tests. Complete source archive, not an incremental overwrite.
+
+PASS  Input source identified by SHA-256 (see checkpoint).
+PASS  Exactly two Rust source files changed against input baseline.
+PASS  Source `git diff --check`.
+PASS  `bash -n R34_ACCEPTANCE.sh`.
+PASS  Pygments RustLexer: no Error tokens in source/baseline changed files.
+PASS  Structural delimiter balance (Rust lexical approximation).
+PASS  Source diff forward replay, exact-byte comparisons, and reverse replay.
+PASS  Previously supplied `TransferCarrier::SacdIso` arm retained in browse.rs.
+PASS  Source-locked DSP stages.rs unchanged against input baseline.
+PASS  SHA-256 tree manifest verified in source tree and re-extracted bundle.
+PASS  Full source archive excludes local `.git` workspace metadata.
+NOT RUN  Cargo/Rust compilation or `cargo test`: toolchain absent.
+NOT RUN  Rustfmt: toolchain absent.
+NOT RUN  Real SACD ISO metadata and save/reopen tests: no real fixture.
+NOT RUN  Reference source-lock freshness or requalification: real build host/ISO
+         required; prior R33 `stages.rs` edit requires fresh certification.
+
+Build-host instructions: see R34_IMPLEMENTATION_CHECKPOINT.md and
+R34_ACCEPTANCE.sh. This source-level PASS is *not* integration approval.

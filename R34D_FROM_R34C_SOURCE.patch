@@ -1,0 +1,143 @@
+--- a/src/tui/keybindings.rs
++++ b/src/tui/keybindings.rs
+@@ -45993,7 +45993,29 @@
+             };
+             let area_track_ids = super::tag_interchange::sacd_transfer_area_track_ids(
+                 &sidecar, stereo_count, mch_count, area_idx,
+-            )?;
++            ).or_else(|strict_error| {
++                // The editor itself falls back to tracks_for_area when XML
++                // TRACKNUMBER values are duplicated or invalid. A Save must
++                // still be able to repair those tags, but only when that
++                // fallback maps every physical TOC track ID exactly once.
++                // Keep the stricter mapper unchanged for tag transfers.
++                let fallback_ids: Vec<u32> = sidecar.tracks_for_area(area_idx)
++                    .iter().map(|track| track.id).collect();
++                let base = if area_idx == 1 { 0 } else { stereo_count };
++                let expected_ids = base.checked_add(tab.paths.len()).and_then(|end| {
++                    (base + 1..=end).map(u32::try_from)
++                        .collect::<Result<Vec<_>, _>>().ok()
++                });
++                let mut sorted_ids = fallback_ids.clone();
++                sorted_ids.sort_unstable();
++                if expected_ids.as_ref().is_some_and(|expected| {
++                    !expected.is_empty() && *expected == sorted_ids
++                }) {
++                    Ok(fallback_ids)
++                } else {
++                    Err(strict_error)
++                }
++            })?;
+             if area_track_ids.len() != tab.paths.len() {
+                 return Err(format!(
+                     "sidecar area {} has {} track(s) but presentation '{}' has {}; refusing to map",
+@@ -87119,6 +87141,109 @@
+     }
+ 
+     #[test]
++    fn r34d_multitab_save_can_repair_duplicate_track_numbers_without_cross_area_writes() {
++        let _coordination = crate::concurrency::scoped_test_coordination_root();
++        use crate::disc::model::{PresentationId, SacdAreaId};
++        use crate::tui::sacd_sidecar::parse_sidecar;
++
++        let md = synth_hybrid_sacd_metadata(
++            Some("Album"), &["St-1", "St-2"], &["MC-1", "MC-2"],
++        );
++        let td = tempfile::tempdir().expect("tempdir");
++        let iso_path = td.path().join("disc.iso");
++        let xml_path = td.path().join("disc.xml");
++        std::fs::write(&iso_path, b"\0").expect("ISO anchor");
++        std::fs::write(&xml_path, SAMPLE_HYBRID_2X2).expect("sidecar");
++        let initial = parse_sidecar(&xml_path).expect("parse");
++        let stereo_id = PresentationId::SacdArea(SacdAreaId::Stereo);
++        let mch_id = PresentationId::SacdArea(SacdAreaId::MultiChannel);
++
++        // First Save is allowed to create invalid stored ordinals; it must
++        // not make a subsequent repair of that very metadata impossible.
++        let (mut first, _, _) = build_sacd_multitab_editor_state(
++            &iso_path, &md, Some(&initial),
++        ).expect("initial editor");
++        first.read_only = false;
++        let stereo = first.presentation_tabs.iter_mut()
++            .find(|tab| tab.id == stereo_id).expect("stereo tab");
++        let numbering = stereo.entries.iter_mut()
++            .find(|entry| entry.display_key == "TRACKNUMBER").expect("numbering");
++        assert_eq!(numbering.per_file_values, vec!["01", "02"]);
++        numbering.per_file_values[1].replace_scalar("01");
++        stereo.dirty = true;
++        super::save_sacd_sidecar(&first, &xml_path).expect("write duplicate numbering");
++        let duplicated = parse_sidecar(&xml_path).expect("reparse duplicate numbering");
++        let value = |id: u32, key: &str| duplicated.tracks.iter()
++            .find(|track| track.id == id)
++            .and_then(|track| track.meta.get(key)).map(String::as_str);
++        assert_eq!(value(1, "TRACKNUMBER"), Some("01"));
++        assert_eq!(value(2, "TRACKNUMBER"), Some("01"));
++        assert!(super::tag_interchange::sacd_transfer_area_track_ids(
++            &duplicated, 2, 2, 1,
++        ).is_err(), "strict transfer must still reject duplicate ordinals");
++
++        // Reopen via the editor's established read fallback, repair stereo
++        // numbering, and make an independent MCH edit in the same Save.
++        let (mut second, _, _) = build_sacd_multitab_editor_state(
++            &iso_path, &md, Some(&duplicated),
++        ).expect("reopen duplicated numbering");
++        second.read_only = false;
++        let stereo = second.presentation_tabs.iter_mut()
++            .find(|tab| tab.id == stereo_id).expect("reopened stereo");
++        let numbering = stereo.entries.iter_mut()
++            .find(|entry| entry.display_key == "TRACKNUMBER").expect("reopened numbering");
++        assert_eq!(numbering.per_file_values, vec!["01", "01"]);
++        numbering.per_file_values[1].replace_scalar("02");
++        let title = stereo.entries.iter_mut()
++            .find(|entry| entry.display_key == "TITLE").expect("stereo titles");
++        assert_eq!(title.per_file_values, vec!["St-1", "St-2"]);
++        title.per_file_values[1].replace_scalar("St-2 Repaired");
++        stereo.dirty = true;
++        let mch = second.presentation_tabs.iter_mut()
++            .find(|tab| tab.id == mch_id).expect("reopened MCH");
++        let title = mch.entries.iter_mut()
++            .find(|entry| entry.display_key == "TITLE").expect("MCH titles");
++        assert_eq!(title.per_file_values, vec!["MC-1", "MC-2"]);
++        title.per_file_values[0].replace_scalar("MC-1 Edited");
++        mch.dirty = true;
++        super::save_sacd_sidecar(&second, &xml_path).expect("repair and save both areas");
++
++        let repaired = parse_sidecar(&xml_path).expect("reparse repaired sidecar");
++        let value = |id: u32, key: &str| repaired.tracks.iter()
++            .find(|track| track.id == id)
++            .and_then(|track| track.meta.get(key)).map(String::as_str);
++        assert_eq!((1..=4).map(|id| value(id, "TRACKNUMBER")).collect::<Vec<_>>(),
++            vec![Some("01"), Some("02"), Some("01"), Some("02")]);
++        assert_eq!((1..=4).map(|id| value(id, "TITLE")).collect::<Vec<_>>(),
++            vec![Some("St-1"), Some("St-2 Repaired"), Some("MC-1 Edited"), Some("MC-2")]);
++        assert_eq!(value(1, "ALBUM"), Some("StereoAlbum"));
++        assert_eq!(value(3, "ALBUM"), Some("MCHAlbum"));
++        let (reopened, _, _) = build_sacd_multitab_editor_state(
++            &iso_path, &md, Some(&repaired),
++        ).expect("reopen repaired sidecar");
++        for (area, titles) in [
++            (stereo_id, vec!["St-1", "St-2 Repaired"]),
++            (mch_id, vec!["MC-1 Edited", "MC-2"]),
++        ] {
++            let tab = reopened.presentation_tabs.iter()
++                .find(|tab| tab.id == area).expect("reopened area");
++            let title = tab.entries.iter()
++                .find(|entry| entry.display_key == "TITLE").expect("reopened title");
++            assert_eq!(title.per_file_values, titles);
++        }
++
++        // An incomplete physical ID range must not gain the repair fallback.
++        let mut incomplete = duplicated.clone();
++        incomplete.tracks.retain(|track| track.id != 2);
++        let invalid_path = td.path().join("incomplete.xml");
++        crate::tui::sacd_sidecar::write_sidecar(&invalid_path, &incomplete)
++            .expect("create incomplete fixture");
++        let before = std::fs::read(&invalid_path).expect("snapshot incomplete fixture");
++        assert!(super::save_sacd_sidecar(&second, &invalid_path).is_err());
++        assert_eq!(std::fs::read(&invalid_path).expect("unmodified fixture"), before);
++    }
++
++    #[test]
+     fn r34_single_area_mch_sidecar_ids_start_at_one_and_save_without_mirror() {
+         let _coordination = crate::concurrency::scoped_test_coordination_root();
+         let mut md = synth_sacd_metadata(
