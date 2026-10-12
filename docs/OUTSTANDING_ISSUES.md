@@ -5036,37 +5036,28 @@ guarantee costs — roughly 1e-5 dB here — which the true-peak help text
 
 Filed 2026-10-11 from the field.
 
-Right-click a folder containing an SACD ISO and an XML sidecar, Tags and
-tagging, Transfer tags from, pick a source folder of individually tagged FLAC
-files. The status bar answers:
+Right-click a folder holding an SACD ISO and its XML sidecar, Tags and tagging,
+Transfer tags from, pick a source folder of individually tagged FLAC files. The
+status bar answers:
 
 ```
 Transfer tags: selected folder contains no audio files
 ```
 
-The refusals are `src/tui/keybindings.rs:27462` for a folder and `:28034` for a
-carrier, reached when `expand_audio_paths_for_transfer_limited` returns nothing.
-That expansion admits a path only when
-`classify_file(path) == EntryKind::AudioFile(_)` (`src/tui/command.rs:157`). An
-SACD ISO is `EntryKind::SacdIso` or, on the extension fallback,
-`EntryKind::Archive` (`src/convert/classify.rs:185`) — never `AudioFile`. So a
-folder whose only audio is inside an ISO expands to zero paths and the operation
-refuses.
+The folder does contain audio. Transferring the other way, from an
+ISO-and-sidecar folder onto individual files, was not tried and is expected to
+fail the same way.
 
-The reverse direction, transferring from an ISO-plus-sidecar folder onto
-individual files, was not tried in the field and we expect it to fail the same
-way, through the same predicate. Unverified.
+**Fix this.** Tag transfer works in both directions with an SACD ISO as source
+or as target. Where it genuinely cannot, the refusal names what it could not
+read rather than claiming there is no audio.
 
-The message is also misleading rather than merely unhelpful: the folder does
-contain audio, in a container the operation does not open.
+## 76. The authoritative metadata settings are not honored
 
-**What we want:** tag transfer works in both directions for SACD ISO sources
-and targets. Where it genuinely cannot, the refusal should say what it could
-not read rather than claim there is no audio.
+Filed 2026-10-11 from the field, on `1994 - Reality Bites (OST) (FLAC)`, and
+standing well beyond this instance.
 
-## 76. Album-scoped COMPOSER refuses to save on multi-composer albums, and no configuration can stop the CUE from governing the save
-
-Filed 2026-10-11 from the field, on `1994 - Reality Bites (OST) (FLAC)`.
+Saving tags on a folder of individually tagged FLAC files is refused:
 
 ```
 save aborted: album-scoped COMPOSER has different values on audio files covered
@@ -5074,12 +5065,8 @@ by the same CUE; make the COMPOSER values match before saving; no carrier was
 changed
 ```
 
-Reported on any various-artists album with multiple composers. The field report
-is that the tags nonetheless appear written and are still there on reopening, so
-"no carrier was changed" may be false for the audio files. We did not confirm the
-write ordering and cannot say which carrier the claim refers to.
-
-The user's configuration asks for individual files first:
+This happens on any various-artists album with several composers. The
+configuration asks for individual files first:
 
 ```toml
 aggregate_metadata_target_priority = [
@@ -5089,47 +5076,24 @@ aggregate_metadata_target_priority = [
 ]
 ```
 
-That is the reverse of the default, which leads with `sidecar-cue`
-(`src/config.rs:460`). The save is refused anyway, by a rule belonging to the
-carrier the user demoted.
+The save is refused anyway, by a rule belonging to a carrier that was demoted.
+The tags then appear written and are still present on reopening, so the claim
+that no carrier was changed may also be untrue.
 
-Our reading of why the setting cannot help, which may be wrong:
+**What is wanted, and has been wanted for four months:** the authoritative
+metadata settings are honored. Not this case patched. The setting decides which
+carriers are written and in what order, and nothing outside that order refuses,
+overrides or quietly writes.
 
-- The gates that admit CUE work test **membership**, not precedence.
-  `metadata_album_view_dirty_unsupported_fields`
-  (`src/tui/keybindings.rs:15612`) and
-  `cue_tonepoet_metadata_edits_for_album_sidecars` (`:15279`) both ask whether
-  the configured list contains `SidecarCue`. It does, in second place, so they
-  proceed.
-- The target cannot be omitted either.
-  `normalized_aggregate_metadata_target_priority` (`src/config.rs:469`) chains
-  the defaults onto the configured order, so any omitted target is appended
-  back. `SidecarCue` is therefore always present, and that membership test
-  always passes.
-
-So an ordered list cannot express "do not write the CUE", and the ordering the
-user did express has no effect on whether the CUE's invariants govern the save.
-
-The invariant itself: that folder holds a real `Reality Bites.cue` beside
-fourteen individually tagged FLACs. `COMPOSER` carries
-`unified_cue_scope: Cue::None` (`src/metadata_persistence.rs:97`), deliberately,
-so these fields "keep that declared shape rather than forcing every occurrence
-through the unified-CUE Track invariant". With no declared shape to consult,
-`unified_cue_entry_is_track_scoped` (`src/tui/keybindings.rs:13835`) falls back
-to the row's own scope; presented album-scoped under
-`synthetic_album_view = true`, COMPOSER must then hold one value across every
-file the CUE covers, and the check at `:29505` refuses when it does not. We did
-not trace the call chain from the save entry point to `:29505`, so the link
-between those gates and this particular refusal is inferred.
-
-A soundtrack having a different composer per track is the normal case, not a
-conflict to reconcile.
-
-**What we want:** per-track composers save without refusal, and the configured
-metadata target order is obeyed — including the ability to say that a CUE beside
-the files is not a write target at all. Whether that means COMPOSER becomes
-track-scoped in this presentation, or the gates respect precedence rather than
-membership, or omission becomes expressible, is open.
+This has arrived as a run of separate edge cases across many rounds. Each fix
+held and the next case appeared, which suggests the settings are consulted in
+some paths and not others rather than being the single authority they are meant
+to be. The outcome wanted is that authority, established once.
 
 A refusal that says no carrier was changed should also be true, or should say
 which carrier it means.
+
+**Second, and possibly the same work:** if COMPOSER is not currently supported
+in TonePoet's extended CUE formatting — the proprietary `REM` comment blocks —
+fix that too. Per-track composers are the normal case on a soundtrack, and they
+should survive a round trip through our own CUE extension.
