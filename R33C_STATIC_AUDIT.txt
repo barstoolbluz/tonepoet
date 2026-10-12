@@ -1,0 +1,14 @@
+R33C corrective static audit — 2026-10-11
+PASS: exactly 2 Rust files changed relative to R33: src/tui/keybindings.rs, src/tui/command.rs
+PASS: sidecar-authoritative plan has no audio write branch; it uses the editor's current entries/deletions for CUE regeneration
+PASS: sidecar DISCNUMBER no longer bypasses extended-CUE consent or unsupported-field checks
+PASS: native IndividualFiles/EmbeddedCue plan branch preserved byte-for-byte
+PASS: R30 DSD positive target uses grid-aligned 0.0001 and rejects 0.000000001 while retaining target/provenance
+PASS: focused test updates cover sidecar-first and native-first plan, on-disk bytes, CUE representation, deletion, reopen
+PASS: Pygments Rust lexical delimiter checks for edited code and baseline both passed
+PASS: bash -n R33C_ACCEPTANCE.sh
+PASS: R33C_FROM_R33_SOURCE.patch applied and reversed with -p1 --fuzz=0; both files cmp byte-identical
+PENDING: rustc/Cargo compilation, rustfmt check and runtime tests (toolchain unavailable)
+PENDING: full acceptance and real-SACD Reference requalification (toolchain/fixture unavailable)
+PASS: original R33 full-tree manifest cross-checked against original two baseline Rust files: 944 / 944 records
+PASS: corrected source manifest generated and verified before archive publication; archive to be verified by extraction

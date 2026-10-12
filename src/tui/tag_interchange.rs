@@ -18,8 +18,9 @@ pub(crate) fn tag_transfer_picker_filter() -> tui_file_picker::FilePickerFilter 
         .map(|extension| (*extension).to_string())
         .collect::<Vec<_>>();
     extensions.push("cue".to_string());
+    extensions.push("iso".to_string());
     tui_file_picker::FilePickerFilter::Custom {
-        label: "Audio and CUE".to_string(),
+        label: "Audio, CUE, and SACD ISO".to_string(),
         extensions,
     }
 }
@@ -84,6 +85,15 @@ pub struct EmbeddedCueCarrier {
 #[derive(Debug, Clone)]
 pub enum TransferCarrier {
     Files { paths: Vec<std::path::PathBuf> },
+    /// A parsed SACD ISO is read-only. Only its same-stem metabase XML is
+    /// writable, with the classification-time XML bytes used as a CAS guard.
+    SacdIso {
+        iso_path: std::path::PathBuf,
+        sidecar_path: std::path::PathBuf,
+        area: u8,
+        track_count: usize,
+        expected_sidecar: Option<Vec<u8>>,
+    },
     SidecarCue {
         cue_path: std::path::PathBuf,
         /// Distinct referenced member images in first-reference order. For an
@@ -128,6 +138,7 @@ impl TransferCarrier {
     fn metadata_mutation_paths(&self, out: &mut Vec<std::path::PathBuf>) {
         match self {
             Self::Files { paths } => out.extend(paths.iter().cloned()),
+            Self::SacdIso { sidecar_path, .. } => out.push(sidecar_path.clone()),
             Self::SidecarCue {
                 cue_path,
                 track_audio_paths,
@@ -164,6 +175,13 @@ impl TransferCarrier {
         match self {
             Self::Files { paths } => Self::Files {
                 paths: paths.iter().map(map).collect(),
+            },
+            Self::SacdIso { iso_path, sidecar_path, area, track_count, expected_sidecar } => Self::SacdIso {
+                iso_path: iso_path.clone(),
+                sidecar_path: map(sidecar_path),
+                area: *area,
+                track_count: *track_count,
+                expected_sidecar: expected_sidecar.clone(),
             },
             Self::SidecarCue {
                 cue_path,
@@ -216,6 +234,7 @@ impl TransferCarrier {
     pub(crate) fn dimension(&self) -> TransferDimension {
         match self {
             Self::Files { paths } => TransferDimension::Files(paths.len()),
+            Self::SacdIso { track_count, .. } => TransferDimension::Tracks(*track_count),
             Self::SidecarCue {
                 image_paths,
                 track_audio_paths,
@@ -250,6 +269,7 @@ impl TransferCarrier {
     pub(crate) fn label(&self) -> &'static str {
         match self {
             Self::Files { .. } => "files",
+            Self::SacdIso { .. } => "SACD ISO / XML sidecar",
             Self::SidecarCue { .. } => "sidecar CUE",
             Self::EmbeddedCue { .. } | Self::EmbeddedCues { .. } => "embedded CUE",
             Self::Aggregate { .. } => "aggregate metadata",
@@ -259,6 +279,7 @@ impl TransferCarrier {
     pub(crate) fn authored_track_numbers(&self) -> Option<Vec<u32>> {
         match self {
             Self::Files { .. } => None,
+            Self::SacdIso { track_count, .. } => Some((1..=u32::try_from(*track_count).ok()?).collect()),
             Self::SidecarCue {
                 image_paths,
                 track_audio_paths,
@@ -318,6 +339,7 @@ impl TransferCarrier {
     fn write_operation_count(&self) -> usize {
         match self {
             Self::Files { paths } => paths.len(),
+            Self::SacdIso { .. } => 1,
             Self::SidecarCue {
                 track_audio_paths,
                 write_method: SidecarCueWriteMethod::PerFileAndSidecar,
@@ -4628,6 +4650,20 @@ pub(crate) fn read_transfer_carrier_entries(
 ) -> Result<Vec<TagEntry>, String> {
     match carrier {
         TransferCarrier::Files { paths } => read_transfer_source_entries(paths, scope, cancel),
+        TransferCarrier::SacdIso { iso_path, sidecar_path, track_count, expected_sidecar, .. } => {
+            if cancel.is_cancelled() { return Err("tag transfer cancelled before reading SACD".into()); }
+            revalidate_sacd_sidecar_snapshot(sidecar_path, expected_sidecar)?;
+            let entries = super::keybindings::read_sacd_tag_entries_for_copy(iso_path)?;
+            revalidate_sacd_sidecar_snapshot(sidecar_path, expected_sidecar)?;
+            // Unlike Files, SACD's logical positions are tracks; retain
+            // per-track TITLE, ARTIST, COMPOSER and other track-owned rows.
+            for entry in &entries {
+                if entry.per_file_values.len() != *track_count {
+                    return Err(format!("SACD '{}': field {} has {} entries, expected {} tracks", iso_path.display(), entry.display_key, entry.per_file_values.len(), track_count));
+                }
+            }
+            Ok(entries.into_iter().filter(|entry| transfer_entry_selected(entry, scope, TransferDimension::Tracks(*track_count))).collect())
+        },
         TransferCarrier::SidecarCue {
             image_paths,
             track_audio_paths,
@@ -5719,7 +5755,7 @@ fn validate_transfer_target_for_write(target: &TransferCarrier) -> Result<(), St
             }
             Ok(())
         }
-        TransferCarrier::Files { .. } | TransferCarrier::SidecarCue { .. } => Ok(()),
+        TransferCarrier::Files { .. } | TransferCarrier::SidecarCue { .. } | TransferCarrier::SacdIso { .. } => Ok(()),
     }
 }
 
@@ -5742,6 +5778,228 @@ fn append_transfer_report(target: &mut TagTransferReport, mut child: TagTransfer
     target
         .durability_warnings
         .append(&mut child.durability_warnings);
+}
+
+// SACD transfers use the standard file-dimensional value planner, not CUE's
+// much narrower scalar field cap. A distinct XML <track> carries every position.
+fn plan_sacd_transfer_values(
+    entries: &[TagEntry],
+    source: TransferDimension,
+    track_count: usize,
+    scope: super::app::TagTransferScope,
+) -> Result<TransferValuePlan, String> {
+    let mut plan = plan_transfer_values_for_dimensions(
+        entries, source, TransferDimension::Files(track_count), scope,
+    )?;
+    let mut retained = Vec::with_capacity(plan.fields.len());
+    for field in std::mem::take(&mut plan.fields) {
+        if is_transfer_numbering_key(&field.canonical_key) {
+            plan.skipped_numbering_keys.push(field.canonical_key);
+            continue;
+        }
+        if super::keybindings::editor_key_to_sidecar_key(&field.canonical_key).is_none() {
+            plan.skipped_fields.push(format!(
+                "{} skipped: not an SACD XML metadata field", field.canonical_key,
+            ));
+            continue;
+        }
+        for (index, value) in field.values.iter().enumerate() {
+            // Metabase stores ordered credit lists as one `; `-delimited
+            // attribute. No escaping exists for that separator. Refuse only
+            // values the existing metabase reader cannot round-trip.
+            let list_key = crate::metadata_persistence::field_is_in_contract(
+                &field.canonical_key,
+                crate::metadata_persistence::PIPELINE_ORDERED_LIST_FIELDS,
+            );
+            let texts = value.normalized_list_texts();
+            if (texts.len() > 1 && !list_key)
+                || (list_key && texts.iter().any(|text| text.contains("; ")))
+            {
+                return Err(format!(
+                    "SACD XML cannot losslessly represent {} on track {}",
+                    field.canonical_key, index + 1,
+                ));
+            }
+        }
+        retained.push(field);
+    }
+    plan.fields = retained;
+    Ok(plan)
+}
+
+/// Bind metabase track IDs to the TOC's physical area layout. The generic
+/// metabase `tracks_for_area` uses the first TOTALTRACKS entry to infer the
+/// stereo split; that heuristic does not work on single-area MCH discs and
+/// can silently misassign track metadata. ISO TOC counts are authoritative.
+pub(crate) fn sacd_transfer_area_track_ids(
+    sidecar: &super::sacd_sidecar::SidecarMetadata,
+    stereo_count: usize,
+    mch_count: usize,
+    area: u8,
+) -> Result<Vec<u32>, String> {
+    let (base, count) = match area {
+        1 if stereo_count > 0 => (0usize, stereo_count),
+        2 if mch_count > 0 => (stereo_count, mch_count),
+        _ => return Err(format!("SACD area {area} has no readable tracks")),
+    };
+    let end = base.checked_add(count)
+        .ok_or_else(|| "SACD area track count overflow".to_string())?;
+    let mut rows = sidecar.tracks.iter()
+        .filter(|track| usize::try_from(track.id).ok()
+            .is_some_and(|id| id > base && id <= end))
+        .collect::<Vec<_>>();
+    if rows.len() != count {
+        return Err(format!(
+            "SACD XML has {} tracks with ISO-authoritative IDs for area {area}; expected {count}; no carrier was changed",
+            rows.len(),
+        ));
+    }
+    let mut seen_ids = std::collections::BTreeSet::new();
+    let mut seen_numbers = std::collections::BTreeSet::new();
+    let use_numbers = rows.iter().any(|track| track.meta.contains_key("TRACKNUMBER"));
+    for track in &rows {
+        if !seen_ids.insert(track.id) {
+            return Err(format!("SACD XML duplicates track ID {} in area {area}; no carrier was changed", track.id));
+        }
+        if use_numbers {
+            let number = track.meta.get("TRACKNUMBER")
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .filter(|number| (1..=count).contains(number))
+                .ok_or_else(|| format!("SACD XML area {area} has an absent or invalid TRACKNUMBER for track ID {}; no carrier was changed", track.id))?;
+            if !seen_numbers.insert(number) {
+                return Err(format!("SACD XML area {area} has duplicate TRACKNUMBER {number}; no carrier was changed"));
+            }
+        }
+    }
+    if use_numbers {
+        rows.sort_by_key(|track| track.meta.get("TRACKNUMBER")
+            .and_then(|value| value.trim().parse::<usize>().ok()).unwrap_or(usize::MAX));
+    } else {
+        rows.sort_by_key(|track| track.id);
+    }
+    Ok(rows.iter().map(|track| track.id).collect())
+}
+
+/// Refuse incomplete TOCs before projecting the sidecar to one logical source
+/// per track. Header counts are used to construct XML ID ranges.
+pub(crate) fn sacd_transfer_toc_counts(
+    md: &super::sacd::SacdMetadata,
+) -> Result<(usize, usize), String> {
+    let stereo_count = md.stereo.as_ref()
+        .map(|area| usize::from(area.header.track_count)).unwrap_or(0);
+    let mch_count = md.multi_channel.as_ref()
+        .map(|area| usize::from(area.header.track_count)).unwrap_or(0);
+    if md.stereo.as_ref().is_some_and(|area| area.tracks.len() != stereo_count)
+        || md.multi_channel.as_ref().is_some_and(|area| area.tracks.len() != mch_count)
+    {
+        return Err("SACD ISO has incomplete TOC track rows; tag transfer cannot establish a lossless track map".into());
+    }
+    Ok((stereo_count, mch_count))
+}
+
+fn apply_sacd_xml_transfer_fields(
+    sidecar: &mut super::sacd_sidecar::SidecarMetadata,
+    area_track_ids: &[u32],
+    fields: &[PlannedTransferField],
+) -> Result<bool, String> {
+    let mut changed = false;
+    for field in fields {
+        let key = super::keybindings::editor_key_to_sidecar_key(&field.canonical_key)
+            .ok_or_else(|| format!("SACD XML field {} is not supported", field.canonical_key))?;
+        if field.values.len() != area_track_ids.len() {
+            return Err(format!(
+                "SACD XML field {} has {} values for {} tracks",
+                field.canonical_key, field.values.len(), area_track_ids.len(),
+            ));
+        }
+        for (index, &id) in area_track_ids.iter().enumerate() {
+            let track = sidecar.tracks.iter_mut().find(|track| track.id == id)
+                .ok_or_else(|| format!("SACD XML track ID {id} disappeared before transfer"))?;
+            let next = field.values[index].normalized_list_texts().join("; ");
+            if track.meta.get(key).map(String::as_str).unwrap_or("") == next { continue; }
+            if next.is_empty() { track.meta.remove(key); }
+            else { track.meta.insert(key.to_string(), next); }
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
+fn revalidate_sacd_sidecar_snapshot(
+    path: &std::path::Path,
+    original: &Option<Vec<u8>>,
+) -> Result<(), String> {
+    let current = match std::fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("SACD sidecar '{}': {error}", path.display())),
+    };
+    if &current != original {
+        return Err(format!(
+            "SACD sidecar '{}' was created, removed or modified after transfer classification; retry the transfer",
+            path.display(),
+        ));
+    }
+    Ok(())
+}
+
+fn execute_tag_transfer_to_sacd_sidecar(
+    source_entries: &[TagEntry],
+    source_dimension: TransferDimension,
+    iso_path: &std::path::Path,
+    sidecar_path: &std::path::Path,
+    area: u8,
+    track_count: usize,
+    original: &Option<Vec<u8>>,
+    scope: super::app::TagTransferScope,
+    cancel: &super::probe::MetadataWriteCancelFlag,
+    progress: Option<&(dyn Fn(usize, usize, &std::path::Path) + Send + Sync)>,
+) -> Result<TagTransferReport, String> {
+    let plan = plan_sacd_transfer_values(source_entries, source_dimension, track_count, scope)?;
+    let mut report = TagTransferReport {
+        source_count: source_dimension.count(), target_count: track_count,
+        source_carrier: Some(if source_dimension.is_tracks() { "tracks" } else { "files" }.into()),
+        target_carrier: Some("SACD XML sidecar".into()),
+        target_paths: vec![sidecar_path.to_path_buf()],
+        written_fields: plan.fields.len(),
+        skipped_numbering_keys: plan.skipped_numbering_keys,
+        skipped_fields: plan.skipped_fields,
+        cardinality_warnings: plan.cardinality_warnings,
+        ..TagTransferReport::default()
+    };
+    if cancel.is_cancelled() { return Err("tag transfer cancelled before SACD XML write".into()); }
+    revalidate_sacd_sidecar_snapshot(sidecar_path, original)?;
+    let md = super::sacd::parse_sacd_iso(iso_path)
+        .map_err(|error| format!("SACD ISO '{}': {error}", iso_path.display()))?;
+    let (stereo_count, mch_count) = sacd_transfer_toc_counts(&md)?;
+    let current_area = if stereo_count > 0 { 1u8 } else { 2u8 };
+    let current_count = if current_area == 1 { stereo_count } else { mch_count };
+    if current_area != area || current_count != track_count {
+        return Err(format!("SACD ISO '{}' track configuration changed since classification", iso_path.display()));
+    }
+    let mut sidecar = match original {
+        Some(_) => super::sacd_sidecar::parse_sidecar(sidecar_path)
+            .map_err(|error| format!("SACD sidecar '{}': {error}", sidecar_path.display()))?,
+        None => {
+            let mut seeded = super::sacd_sidecar::seed_sidecar_from_scarletbook(&md);
+            seeded.store_id = super::sacd_sidecar::mint_disc_id(iso_path)
+                .map_err(|error| format!("SACD ISO '{}': unable to mint XML disc id: {error}", iso_path.display()))?;
+            seeded
+        }
+    };
+    let ids = sacd_transfer_area_track_ids(&sidecar, stereo_count, mch_count, area)
+        .map_err(|error| format!("SACD XML '{}': {error}", sidecar_path.display()))?;
+    let changed = apply_sacd_xml_transfer_fields(&mut sidecar, &ids, &plan.fields)?;
+    if changed {
+        if cancel.is_cancelled() { return Err("tag transfer cancelled before SACD XML publication".into()); }
+        revalidate_sacd_sidecar_snapshot(sidecar_path, original)?;
+        super::sacd_sidecar::write_sidecar(sidecar_path, &sidecar)
+            .map_err(|error| format!("SACD XML write '{}': {error}", sidecar_path.display()))?;
+        report.written = 1;
+        report.written_paths.push(sidecar_path.to_path_buf());
+    } else { report.unchanged = 1; }
+    if let Some(progress) = progress { progress(1, 1, sidecar_path); }
+    Ok(report)
 }
 
 fn execute_tag_transfer_to_aggregate(
@@ -5870,6 +6128,7 @@ fn execute_tag_transfer_to_cue(
         TransferCarrier::SidecarCue { cue_path, sheet, .. } => (sheet, cue_path.as_path()),
         TransferCarrier::EmbeddedCue { image_path, sheet, .. } => (sheet, image_path.as_path()),
         TransferCarrier::Files { .. }
+        | TransferCarrier::SacdIso { .. }
         | TransferCarrier::EmbeddedCues { .. }
         | TransferCarrier::Aggregate { .. } => {
             return Err("internal error: CUE writer received unsupported carrier".to_string())
@@ -6136,6 +6395,7 @@ fn execute_tag_transfer_to_cue(
             cancel,
         ),
         TransferCarrier::Files { .. }
+        | TransferCarrier::SacdIso { .. }
         | TransferCarrier::EmbeddedCues { .. }
         | TransferCarrier::Aggregate { .. } => unreachable!(),
     };
@@ -6216,6 +6476,11 @@ fn execute_tag_transfer_from_entries_to_carrier_admitted(
     progress: Option<&(dyn Fn(usize, usize, &std::path::Path) + Send + Sync)>,
 ) -> Result<TagTransferReport, String> {
     match target {
+        TransferCarrier::SacdIso { iso_path, sidecar_path, area, track_count, expected_sidecar } =>
+            execute_tag_transfer_to_sacd_sidecar(
+                source_entries, source_dimension, iso_path, sidecar_path,
+                *area, *track_count, expected_sidecar, scope, cancel, progress,
+            ),
         TransferCarrier::Files { paths } => execute_tag_transfer_to_files_with_writer(
             source_entries,
             source_dimension,
@@ -6268,6 +6533,9 @@ pub(crate) fn preview_tag_transfer(
     scope: super::app::TagTransferScope,
 ) -> Result<usize, String> {
     validate_transfer_target_for_write(target)?;
+    if let TransferCarrier::SacdIso { track_count, .. } = target {
+        return Ok(plan_sacd_transfer_values(source_entries, source_dimension, *track_count, scope)?.fields.len());
+    }
     if let TransferCarrier::Aggregate { carriers } = target {
         let aggregate_count = target.count();
         let mut offset = 0usize;
@@ -7042,4 +7310,135 @@ pub(crate) fn metadata_editor_transfer_fingerprint(
         feed(&mut hash, deleted.to_string().as_bytes());
     }
     hash
+}
+
+
+#[cfg(test)]
+mod r33_sacd_transfer_regressions {
+    use super::*;
+    use crate::tui::sacd_sidecar::{SidecarMetadata, SidecarTrack};
+    use crate::tui::probe::{MetadataFieldValues, RowScope};
+
+    fn entry(key: &str, values: &[&str]) -> TagEntry {
+        let values: Vec<MetadataFieldValues> = values.iter()
+            .map(|text| MetadataFieldValues::from_stored_text(*text)).collect();
+        TagEntry {
+            display_key: key.to_string(),
+            item_key: super::super::probe::item_key_for_new_editor_row(key),
+            value: "<multiple values>".to_string(),
+            original: "".to_string(),
+            is_binary: false,
+            is_mixed: true,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: Vec::new(),
+            row_scope: RowScope::File,
+            per_file_originals: values.clone(),
+            per_file_values: values,
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        }
+    }
+
+    #[test]
+    fn r33_sacd_transfer_preserves_distinct_track_composers_and_existing_metadata() {
+        let input = [
+            entry("COMPOSER", &["Composer Alpha", "Composer Beta"]),
+            entry("TITLE", &["Song One", "Song Two"]),
+            entry("TRACKNUMBER", &["1", "2"]),
+        ];
+        let plan = plan_sacd_transfer_values(
+            &input, TransferDimension::Files(2), 2,
+            super::super::app::TagTransferScope::All,
+        ).expect("SACD transfer plan");
+        assert!(plan.skipped_numbering_keys.iter().any(|key| key == "TRACKNUMBER"));
+        assert_eq!(plan.fields.len(), 2);
+        let mut sidecar = SidecarMetadata {
+            tracks: vec![SidecarTrack { id: 1, ..Default::default() },
+                         SidecarTrack { id: 2, ..Default::default() }],
+            ..Default::default()
+        };
+        sidecar.tracks[0].meta.insert("FOREIGN_TAG".into(), "keep this".into());
+        assert!(apply_sacd_xml_transfer_fields(&mut sidecar, &[1, 2], &plan.fields)
+            .expect("first application"));
+        assert_eq!(sidecar.tracks[0].meta_value("COMPOSER"), Some("Composer Alpha"));
+        assert_eq!(sidecar.tracks[1].meta_value("COMPOSER"), Some("Composer Beta"));
+        assert_eq!(sidecar.tracks[0].meta_value("FOREIGN_TAG"), Some("keep this"));
+        assert!(!apply_sacd_xml_transfer_fields(&mut sidecar, &[1, 2], &plan.fields)
+            .expect("replayed application must be idempotent"));
+        assert_eq!(sidecar.tracks[0].meta_value("TITLE"), Some("Song One"));
+        assert_eq!(sidecar.tracks[1].meta_value("TITLE"), Some("Song Two"));
+    }
+
+    #[test]
+    fn r33_sacd_transfer_preserves_ordered_list_fields_and_refuses_lossy_scalars() {
+        let input = entry("COMPOSER", &["Composers", "Single"]);
+        let mut input = input;
+        input.per_file_values[0] = MetadataFieldValues::from_stored_texts(["Alice", "Bob"]);
+        let plan = plan_sacd_transfer_values(
+            &[input], TransferDimension::Files(2), 2,
+            super::super::app::TagTransferScope::All,
+        ).expect("ordered metadata is representable by metabase");
+        let mut sidecar = SidecarMetadata {
+            tracks: vec![SidecarTrack { id: 1, ..Default::default() },
+                         SidecarTrack { id: 2, ..Default::default() }],
+            ..Default::default()
+        };
+        assert!(apply_sacd_xml_transfer_fields(&mut sidecar, &[1, 2], &plan.fields).unwrap());
+        assert_eq!(sidecar.tracks[0].meta_values("COMPOSER"), Some(vec!["Alice".into(), "Bob".into()]));
+        let invalid = entry("COMPOSER", &["Alice; Bob", "Carol"]);
+        assert!(plan_sacd_transfer_values(
+            &[invalid], TransferDimension::Files(2), 2,
+            super::super::app::TagTransferScope::All,
+        ).is_err(), "an ambiguous metabase list separator must be refused");
+    }
+
+    #[test]
+    fn r33_sacd_track_id_mapping_handles_mch_only_and_out_of_order_xml() {
+        let mut sidecar = SidecarMetadata {
+            tracks: vec![
+                SidecarTrack { id: 2, ..Default::default() },
+                SidecarTrack { id: 1, ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(sacd_transfer_area_track_ids(&sidecar, 0, 2, 2).unwrap(), vec![1, 2]);
+        assert_eq!(sacd_transfer_area_track_ids(&sidecar, 2, 0, 1).unwrap(), vec![1, 2]);
+        sidecar.tracks[0].meta.insert("TRACKNUMBER".into(), "1".into());
+        sidecar.tracks[1].meta.insert("TRACKNUMBER".into(), "2".into());
+        assert_eq!(sacd_transfer_area_track_ids(&sidecar, 0, 2, 2).unwrap(), vec![2, 1]);
+        sidecar.tracks[1].meta.insert("TRACKNUMBER".into(), "1".into());
+        assert!(sacd_transfer_area_track_ids(&sidecar, 0, 2, 2).is_err());
+        sidecar.tracks[1].id = 2;
+        assert!(sacd_transfer_area_track_ids(&sidecar, 0, 2, 2).is_err());
+    }
+
+    #[test]
+    fn r33_sacd_transfer_snapshot_refuses_concurrent_xml_change() {
+        let temp = tempfile::tempdir().expect("test directory");
+        let path = temp.path().join("disc.xml");
+        revalidate_sacd_sidecar_snapshot(&path, &None).unwrap();
+        std::fs::write(&path, b"a").unwrap();
+        assert!(revalidate_sacd_sidecar_snapshot(&path, &None)
+            .unwrap_err().contains("modified after transfer classification"));
+        let expected = Some(b"a".to_vec());
+        revalidate_sacd_sidecar_snapshot(&path, &expected).unwrap();
+        std::fs::write(&path, b"b").unwrap();
+        assert!(revalidate_sacd_sidecar_snapshot(&path, &expected).is_err());
+    }
+
+    #[test]
+    fn r33_sacd_transfer_rejects_target_value_dimension_before_mutation() {
+        let mut sidecar = SidecarMetadata {
+            tracks: vec![SidecarTrack { id: 1, ..Default::default() },
+                         SidecarTrack { id: 2, ..Default::default() }],
+            ..Default::default()
+        };
+        let plan = plan_sacd_transfer_values(
+            &[entry("TITLE", &["Only one"])], TransferDimension::Files(1), 2,
+            super::super::app::TagTransferScope::All,
+        ).unwrap();
+        assert_eq!(plan.fields[0].values.len(), 2, "single source broadcasts to both tracks");
+        assert!(apply_sacd_xml_transfer_fields(&mut sidecar, &[1], &plan.fields).is_err());
+        assert!(sidecar.tracks.iter().all(|track| track.meta.is_empty()));
+    }
 }

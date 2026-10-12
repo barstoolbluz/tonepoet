@@ -2509,6 +2509,13 @@ impl PreparedTagTransfer {
                     sheet.tracks.len(),
                 ),
             },
+            crate::tui::tag_interchange::TransferCarrier::SacdIso { track_count, .. } => format!(
+                "Write {} field{} to the SACD XML sidecar ({} track{})?",
+                self.field_count,
+                if self.field_count == 1 { "" } else { "s" },
+                track_count,
+                if *track_count == 1 { "" } else { "s" },
+            ),
             crate::tui::tag_interchange::TransferCarrier::EmbeddedCue { sheet, .. } => format!(
                 "Write {} field{} to embedded CUE ({} tracks)?",
                 self.field_count,

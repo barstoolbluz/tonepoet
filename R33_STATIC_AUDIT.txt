@@ -1,0 +1,10 @@
+PASS: exactly six intended original Rust source files changed
+PASS: Rust lexically balanced: src/convert/pipeline/stages.rs
+SKIP: main.rs delimiter lexer (pre-existing macro_rules! punctuation confuses Pygments in original and edited source)
+PASS: Rust lexically balanced: src/tui/format_interactions.rs
+PASS: Rust lexically balanced: src/tui/keybindings.rs
+PASS: Rust lexically balanced: src/tui/presets.rs
+PASS: Rust lexically balanced: src/tui/tag_interchange.rs
+PASS: intended critical source anchors and acceptance shell syntax
+CHECKS: 5 Rust lexical balance (main.rs skipped because the baseline lexer also fails on unchanged macro_rules!), 1 diff scope, 1 file shape, anchors: PASS
+NOT VERIFIED: rustc compilation, Rust-format check, cargo tests, real SACD/Reference requalification

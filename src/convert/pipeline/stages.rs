@@ -17963,6 +17963,26 @@ fn album_uniform_reference_gain(
         human_log_ceiling(tonepoet_pipeline::DbNano(facts.target_nano)),
         origin.human_label(),
     ));
+    // The displayed true peak is a measurement, not the upper bound used by
+    // the solver. Present the exact fixed-point residual instead of implying
+    // that subtracting the displayed point from the ceiling yields the
+    // conservatively bounded gain. This is derived from delivered log facts,
+    // not a second guess at the qualified terminal's error bound.
+    if let Some(peak) = facts.music_peak_nano.filter(|peak| *peak != i64::MIN) {
+        if let Some(residual) = facts.target_nano.checked_sub(peak)
+            .and_then(|remaining| remaining.checked_sub(music_gain.0))
+        {
+            // No reconciliation line is needed when the displayed quantities
+            // already add up; keeping this conditional also preserves the
+            // existing compact log for exact-ceiling routes.
+            if residual != 0 {
+                lines.push(format!(
+                    "  Ceiling − (reported peak + applied gain): {} dB",
+                    tonepoet_pipeline::DbNano(residual).render(true),
+                ));
+            }
+        }
+    }
     lines.push(match facts.music_peak_nano {
         Some(i64::MIN) => "  Gain selected under the qualified Reference near-silence policy",
         Some(_) => "  Gain calculated from measured album true peak and selected ceiling",
@@ -84063,4 +84083,27 @@ mod publish_lock_soundness_tests {
             .collect()
     }
 
+}
+
+
+#[cfg(test)]
+mod r33_ceiling_reconciliation_regressions {
+    use super::*;
+
+    #[test]
+    fn r33_reported_reference_gain_residual_accounts_for_every_nanodecibel() {
+        // Reproduce issue #74 exactly, with the qualified Reference's fixed
+        // 12 dB protection restored only in terminal_gain_nano.
+        let facts = ReferenceAlbumGainLogFacts {
+            terminal_gain_nano: 18_338_115_084,
+            music_peak_nano: Some(-6_338_124_793),
+            target_nano: 0,
+            measured_track_count: Some(8),
+        };
+        let music_gain = facts.music_gain().unwrap();
+        assert_eq!(music_gain.0, 6_338_115_084);
+        let gap = facts.target_nano - facts.music_peak_nano.unwrap() - music_gain.0;
+        assert_eq!(gap, 9_709);
+        assert_eq!(tonepoet_pipeline::DbNano(gap).render(true), "+0.000009709");
+    }
 }

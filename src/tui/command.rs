@@ -23817,11 +23817,18 @@ mod source_relative_set_command_tests {
         dsd.convert.format.set_source_is_dsd(true);
         assert!(dsd.convert.format.format.select_value(&AudioFormat::Flac));
         dsd.convert.format.apply_format_constraints();
+        execute_set(&mut dsd, "dsd-true-peak-target", "0.0001");
+        assert_eq!(dsd.convert.format.dsd_true_peak_target_dbtp, DbNano(-100_000));
+        assert_eq!(dsd.convert.format.dsd_true_peak_target_origin, TruePeakTargetOrigin::User);
         execute_set(&mut dsd, "dsd-true-peak-target", "0.000000001");
-        assert_eq!(dsd.convert.format.dsd_true_peak_target_dbtp, DbNano(-1));
+        assert!(dsd.status_message.as_ref().is_some_and(|(text, _)| {
+            text.contains("four decimal places")
+        }));
+        assert_eq!(dsd.convert.format.dsd_true_peak_target_dbtp, DbNano(-100_000));
         assert_eq!(dsd.convert.format.dsd_true_peak_target_origin, TruePeakTargetOrigin::User);
         execute_set(&mut dsd, "dsd-true-peak-target", "13");
-        assert_eq!(dsd.convert.format.dsd_true_peak_target_dbtp, DbNano(-1));
+        assert_eq!(dsd.convert.format.dsd_true_peak_target_dbtp, DbNano(-100_000));
+        assert_eq!(dsd.convert.format.dsd_true_peak_target_origin, TruePeakTargetOrigin::User);
     }
 }
 

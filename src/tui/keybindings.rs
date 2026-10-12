@@ -15259,7 +15259,6 @@ fn cue_tonepoet_metadata_edits_for_dedicated_sidecar(
 fn cue_tonepoet_metadata_edits_for_album_sidecars(
     state: &super::app::MetadataEditorState,
     targets: &[crate::config::AggregateMetadataTarget],
-    mode: MetadataAlbumCarrierWriteMode,
 ) -> Result<Vec<CueTonepoetMetadataRevert>, String> {
     let surface = state.active_surface();
     let sheet = surface.cue_album_synthetic_sheet.as_ref().ok_or_else(|| {
@@ -15296,15 +15295,6 @@ fn cue_tonepoet_metadata_edits_for_album_sidecars(
         }
 
         for (entry_index, entry) in surface.entries.iter().enumerate() {
-            // Under ordinary Album-view authority, side-scoped DISCNUMBER is
-            // deliberately projected to the native audio carrier even when the
-            // side's aggregate authority is SidecarCue. Only the explicit
-            // sidecar-only action may opt into Tonepoet inert DISCNUMBER.
-            if mode == MetadataAlbumCarrierWriteMode::Authoritative
-                && metadata_album_view_discnumber_is_side_scoped(surface, entry)
-            {
-                continue;
-            }
             let slots = if unified_cue_entry_is_track_scoped_on_surface(surface, entry) {
                 track_indices.as_slice()
             } else {
@@ -15610,7 +15600,6 @@ fn metadata_album_view_sidecar_deletion_intent(
 fn metadata_album_view_dirty_unsupported_fields(
     state: &super::app::MetadataEditorState,
     targets: &[crate::config::AggregateMetadataTarget],
-    mode: MetadataAlbumCarrierWriteMode,
 ) -> std::collections::BTreeSet<String> {
     if !targets
         .iter()
@@ -15634,12 +15623,8 @@ fn metadata_album_view_dirty_unsupported_fields(
                 || entry.value != entry.original
         })
         .filter(|(_, entry)| {
-            let authoritative_native_discnumber = mode
-                == MetadataAlbumCarrierWriteMode::Authoritative
-                && metadata_album_view_discnumber_is_side_scoped(surface, entry);
-            !authoritative_native_discnumber
-                && (!super::probe::cue_sidecar_representable_key(&entry.display_key)
-                    || entry.display_key.eq_ignore_ascii_case("CUESHEET"))
+            !super::probe::cue_sidecar_representable_key(&entry.display_key)
+                || entry.display_key.eq_ignore_ascii_case("CUESHEET")
         })
         .map(|(_, entry)| entry.display_key.clone())
         .collect()
@@ -15957,77 +15942,6 @@ fn metadata_album_view_audio_snapshots(
     Ok(snapshots)
 }
 
-fn metadata_album_view_sidecar_discnumber_audio_snapshot(
-    surface: &super::app::PresentationTab,
-    sheet: &super::app::CueAlbumSyntheticSheet,
-    side_track_indices: &[usize],
-    path: &std::path::Path,
-) -> Result<Option<(crate::tui::probe::MetadataEditorTagSnapshot, bool)>, String> {
-    let Some((entry_index, entry)) = surface
-        .entries
-        .iter()
-        .enumerate()
-        .find(|(_, entry)| metadata_album_view_discnumber_is_side_scoped(surface, entry))
-    else {
-        return Ok(None);
-    };
-    let deleted = surface.deleted.contains(&entry_index);
-    if !deleted && entry.per_file_values == entry.per_file_originals {
-        return Ok(None);
-    }
-
-    // Validate the current logical side value across the full side before any
-    // native mutation is planned. A Sidecar-CUE authority does not make a
-    // physically inconsistent DISCNUMBER partition writable.
-    let value = metadata_album_view_side_scoped_discnumber_value(
-        entry,
-        side_track_indices,
-        false,
-    )?;
-    let path_key = metadata_cue_surface_key(path);
-    let tracks_on_path = side_track_indices
-        .iter()
-        .copied()
-        .filter(|track_index| {
-            sheet
-                .track_sources
-                .get(*track_index)
-                .is_some_and(|source| metadata_cue_surface_key(&source.audio_path) == path_key)
-        })
-        .collect::<Vec<_>>();
-    if tracks_on_path.is_empty() {
-        return Err(format!(
-            "save aborted: Album-view audio carrier '{}' has no mapped tracks; no carrier was changed",
-            path.display()
-        ));
-    }
-    let original = metadata_album_view_side_scoped_discnumber_value(
-        entry,
-        &tracks_on_path,
-        true,
-    )?;
-    if !deleted && value == original {
-        return Ok(None);
-    }
-
-    Ok(Some((
-        crate::tui::probe::MetadataEditorTagSnapshot {
-            display_key: "DISCNUMBER".to_string(),
-            // The add-key path deliberately permits unknown/custom keys.
-            // DISCNUMBER is not unknown, however: normalize the targeted
-            // native projection so fixed-key backends never receive the
-            // add-row's generic Unknown("DISCNUMBER") placeholder.
-            item_key: super::probe::item_key_for_new_editor_row("DISCNUMBER"),
-            row_scope: crate::tui::probe::RowScope::File,
-            tag_type: crate::tui::probe::editor_tag_origin(&entry.display_key),
-            existed: vec![!original.as_str().is_empty()],
-            values: vec![value],
-            originals: vec![original],
-        },
-        deleted,
-    )))
-}
-
 fn metadata_album_view_expected_cuesheet_value(
     surface: &super::app::PresentationTab,
     path: &std::path::Path,
@@ -16064,43 +15978,6 @@ fn metadata_album_audio_write_has_changes(
     })
 }
 
-fn metadata_album_view_authoritative_sidecar_projection(
-    surface: &super::app::PresentationTab,
-    mode: MetadataAlbumCarrierWriteMode,
-) -> Option<(Vec<super::probe::TagEntry>, Vec<usize>)> {
-    if mode != MetadataAlbumCarrierWriteMode::Authoritative
-        || !surface
-            .cue_album_view_sides
-            .iter()
-            .any(|side| {
-                side.authoritative_target == crate::config::AggregateMetadataTarget::SidecarCue
-            })
-    {
-        return None;
-    }
-    let discnumber_index = surface
-        .entries
-        .iter()
-        .position(|entry| metadata_album_view_discnumber_is_side_scoped(surface, entry))?;
-
-    // DISCNUMBER is a native-carrier sub-route for an ordinary authoritative
-    // Album-view save. Regenerate the sidecar as though that row were untouched
-    // so the CUE neither gains nor loses Tonepoet-only DISCNUMBER metadata.
-    // Explicit SidecarCue mode bypasses this projection and may intentionally
-    // persist DISCNUMBER in the inert block.
-    let mut entries = surface.entries.clone();
-    entries[discnumber_index].per_file_values =
-        entries[discnumber_index].per_file_originals.clone();
-    cue_album_recompute_entry_display(&mut entries[discnumber_index]);
-    let deleted = surface
-        .deleted
-        .iter()
-        .copied()
-        .filter(|index| *index != discnumber_index)
-        .collect();
-    Some((entries, deleted))
-}
-
 fn metadata_album_view_plan(
     state: &super::app::MetadataEditorState,
     mode: MetadataAlbumCarrierWriteMode,
@@ -16123,8 +16000,6 @@ fn metadata_album_view_plan_with_structure_policy(
     let mut audio = Vec::new();
     let mut targets = Vec::with_capacity(sides.len());
     let mut mutation_targets = std::collections::BTreeSet::new();
-    let authoritative_sidecar_projection =
-        metadata_album_view_authoritative_sidecar_projection(surface, mode);
 
     let eligibility_by_path = surface
         .technical_details
@@ -16163,21 +16038,17 @@ fn metadata_album_view_plan_with_structure_policy(
                         cue_path.display()
                     ));
                 }
-                let (sidecar_entries, sidecar_deleted) = authoritative_sidecar_projection
-                    .as_ref()
-                    .map(|(entries, deleted)| (entries.as_slice(), deleted.as_slice()))
-                    .unwrap_or((surface.entries.as_slice(), surface.deleted.as_slice()));
                 let fidelity_warnings = cue_album_scalar_projection_warnings_for_track_indices(
                     sheet,
-                    sidecar_entries,
-                    sidecar_deleted,
+                    &surface.entries,
+                    &surface.deleted,
                     track_indices,
                     true,
                 );
                 let replacement_cuesheet = cue_album_generate_cuesheet_for_track_indices(
                     sheet,
-                    sidecar_entries,
-                    sidecar_deleted,
+                    &surface.entries,
+                    &surface.deleted,
                     track_indices,
                     false,
                     true,
@@ -16211,69 +16082,6 @@ fn metadata_album_view_plan_with_structure_policy(
                         .cloned()
                         .ok_or_else(|| "save aborted: Album-view side has no audio carrier".to_string())?,
                 });
-
-                // DISCNUMBER has no standard CUE directive (the inert Tonepoet
-                // block can preserve it). For an ordinary authoritative save
-                // whose configured target is a sidecar, Album-view side semantics
-                // nevertheless make it a
-                // well-defined native carrier tag. Explicit "Write tags to
-                // sidecar cue" remains sidecar-only and must not mutate audio.
-                if mode == MetadataAlbumCarrierWriteMode::Authoritative {
-                    for path in &side.audio_paths {
-                        let Some((snapshot, delete_discnumber)) =
-                            metadata_album_view_sidecar_discnumber_audio_snapshot(
-                                surface,
-                                sheet,
-                                track_indices,
-                                path,
-                            )?
-                        else {
-                            continue;
-                        };
-                        let path_key = metadata_cue_surface_key(path);
-                        if !mutation_targets.insert(path_key.clone()) {
-                            return Err(format!(
-                                "save aborted: Album-view audio carrier '{}' belongs to more than one side; no carrier was changed",
-                                path.display()
-                            ));
-                        }
-                        let blocked = eligibility_by_path
-                            .get(&path_key)
-                            .cloned()
-                            .flatten()
-                            .or_else(|| {
-                                (!eligibility_by_path.contains_key(&path_key)).then(|| {
-                                    format!(
-                                        "metadata editor has no write-eligibility facts for '{}'",
-                                        path.display()
-                                    )
-                                })
-                            });
-                        if let Some(reason) = blocked {
-                            return Err(format!(
-                                "save aborted: Album-view carrier '{}' is not writable: {reason}; no carrier was changed",
-                                path.display()
-                            ));
-                        }
-
-                        let snapshots = vec![snapshot];
-                        let deleted = if delete_discnumber {
-                            vec![0usize]
-                        } else {
-                            Vec::new()
-                        };
-                        if metadata_album_audio_write_has_changes(&snapshots, &deleted, &[]) {
-                            audio.push(MetadataAlbumAudioWrite {
-                                path: path.clone(),
-                                snapshots,
-                                deleted,
-                                forced_deletes: Vec::new(),
-                                expected_embedded_cuesheet: None,
-                                fidelity_warnings: Vec::new(),
-                            });
-                        }
-                    }
-                }
             }
             crate::config::AggregateMetadataTarget::EmbeddedCue
             | crate::config::AggregateMetadataTarget::IndividualFiles => {
@@ -17021,7 +16829,6 @@ fn metadata_editor_write_tags_to_cue_carrier(
         let edits = match cue_tonepoet_metadata_edits_for_album_sidecars(
             &projection,
             &targets,
-            mode,
         ) {
             Ok(edits) => edits,
             Err(reason) => {
@@ -17071,7 +16878,7 @@ fn metadata_editor_write_tags_to_cue_carrier(
         });
         return;
     }
-    let unsupported = metadata_album_view_dirty_unsupported_fields(&projection, &targets, mode);
+    let unsupported = metadata_album_view_dirty_unsupported_fields(&projection, &targets);
     if !unsupported.is_empty() {
         if app.config.metadata.sidecar_save_with_warnings {
             metadata_editor_revert_entries_by_key(state, &unsupported);
@@ -17195,7 +17002,6 @@ fn metadata_editor_save_album_view(
         let edits = match cue_tonepoet_metadata_edits_for_album_sidecars(
             state,
             &targets,
-            mode,
         ) {
             Ok(edits) => edits,
             Err(reason) => {
@@ -17235,7 +17041,7 @@ fn metadata_editor_save_album_view(
         }
     }
 
-    let unsupported = metadata_album_view_dirty_unsupported_fields(state, &targets, mode);
+    let unsupported = metadata_album_view_dirty_unsupported_fields(state, &targets);
     if !unsupported.is_empty() {
         if app.config.metadata.sidecar_save_with_warnings {
             metadata_editor_revert_entries_by_key(state, &unsupported);
@@ -26121,6 +25927,42 @@ impl TransferTraversalLimits {
     }
 }
 
+fn classify_sacd_transfer_carrier(
+    iso_path: &std::path::Path,
+    cancel: &super::probe::MetadataWriteCancelFlag,
+) -> Result<super::tag_interchange::TransferCarrier, String> {
+    if cancel.is_cancelled() { return Err("Transfer tags: cancelled before SACD classification".into()); }
+    let md = super::sacd::parse_sacd_iso(iso_path)
+        .map_err(|error| format!("Transfer tags: cannot read SACD ISO '{}': {error}", iso_path.display()))?;
+    let (area, track_count) = if let Some(stereo) = &md.stereo {
+        (1, usize::from(stereo.header.track_count))
+    } else if let Some(mch) = &md.multi_channel {
+        (2, usize::from(mch.header.track_count))
+    } else {
+        return Err(format!("Transfer tags: SACD ISO '{}' has no readable area", iso_path.display()));
+    };
+    if track_count == 0 { return Err(format!("Transfer tags: SACD ISO '{}' has no tracks", iso_path.display())); }
+    let (stereo_count, mch_count) = super::tag_interchange::sacd_transfer_toc_counts(&md)
+        .map_err(|error| format!("Transfer tags: SACD ISO '{}': {error}", iso_path.display()))?;
+    let sidecar_path = super::sacd_sidecar::expected_sidecar_path_for_iso(iso_path)
+        .ok_or_else(|| format!("Transfer tags: SACD ISO '{}' has no valid XML sidecar destination", iso_path.display()))?;
+    let sidecar_snapshot = match std::fs::read(&sidecar_path) {
+        Ok(bytes) => {
+            let sidecar = super::sacd_sidecar::parse_sidecar(&sidecar_path)
+                .map_err(|error| format!("Transfer tags: cannot read SACD XML '{}': {error}", sidecar_path.display()))?;
+            super::tag_interchange::sacd_transfer_area_track_ids(&sidecar, stereo_count, mch_count, area)
+                .map_err(|error| format!("Transfer tags: SACD XML '{}': {error}", sidecar_path.display()))?;
+            Some(bytes)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("Transfer tags: cannot read SACD XML '{}': {error}", sidecar_path.display())),
+    };
+    Ok(super::tag_interchange::TransferCarrier::SacdIso {
+        iso_path: iso_path.to_path_buf(), sidecar_path, area, track_count,
+        expected_sidecar: sidecar_snapshot,
+    })
+}
+
 fn classify_single_transfer_root(
     root: &std::path::Path,
     cancel: &super::probe::MetadataWriteCancelFlag,
@@ -26133,8 +25975,11 @@ fn classify_single_transfer_root(
     if super::cue_parser::is_user_visible_cue_path(root) {
         return transfer_carrier_from_explicit_cue(root, cancel);
     }
+    if super::sacd::is_sacd_iso(root) {
+        return classify_sacd_transfer_carrier(root, cancel);
+    }
     if transfer_path_is_disc_source(root) {
-        return Err("Transfer tags: disc-image sources and targets are not supported this round"
+        return Err("Transfer tags: this disc-image format is not a supported tag-transfer carrier"
             .to_string());
     }
     if root.is_dir() {
@@ -27458,8 +27303,31 @@ fn classify_transfer_directory(
         traversal_limits.max_audio_files,
         || cancel.is_cancelled(),
     )?;
+    // The ordinary audio expander intentionally does not materialize SACD ISO
+    // tracks. Identify one immediate SACD as a logical audio carrier instead
+    // of reporting a folder with a valid ISO + XML as empty. Mixed carriers
+    // require an explicit selection rather than silently ignoring the ISO.
+    let sacds = std::fs::read_dir(root)
+        .map_err(|error| format!("Transfer tags: cannot read folder '{}': {error}", root.display()))?
+        .map(|entry| {
+            entry.map(|entry| entry.path()).map_err(|error| {
+                format!("Transfer tags: cannot enumerate folder '{}': {error}", root.display())
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?
+        .into_iter()
+        .filter(|path| path.is_file()
+            && path.extension().and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("iso")))
+        .collect::<Vec<_>>();
+    if !sacds.is_empty() {
+        if sacds.len() == 1 && paths.is_empty() {
+            return classify_sacd_transfer_carrier(&sacds[0], cancel);
+        }
+        return Err("Transfer tags: folder contains multiple audio representations including SACD ISO; select one SACD ISO or ordinary audio files explicitly".into());
+    }
     if paths.is_empty() {
-        return Err("Transfer tags: selected folder contains no audio files".to_string());
+        return Err("Transfer tags: selected folder contains no audio files or readable SACD ISO".to_string());
     }
 
     let admission = collect_transfer_metadata_cue_admission(&[root.to_path_buf()]);
@@ -27895,6 +27763,9 @@ fn classify_tag_transfer_roots_with_priority_and_limits(
                 crate::convert::classify::EntryKind::AudioFile(_)
             )
     });
+    if roots.len() == 1 && super::sacd::is_sacd_iso(&roots[0]) {
+        return classify_sacd_transfer_carrier(&roots[0], cancel);
+    }
     if roots.len() == 1 && roots[0].is_dir() {
         return classify_transfer_directory(
             &roots[0],
@@ -29363,6 +29234,39 @@ fn cue_user_metadata_replace(
     }
 }
 
+/// For a one-track-per-file CUE, the native file dimension and the authored
+/// track dimension describe the same physical members. Ordered credit fields
+/// remain declared File-scope in the general metadata taxonomy, but when
+/// writing that CUE's extended metadata they must be projected to each track,
+/// not collapsed into one album value. Image CUEs (multiple tracks per file)
+/// are not eligible; they retain their separate track-dimension contract.
+fn cue_album_one_track_per_file_slot_map(
+    sheet: &super::app::CueAlbumSyntheticSheet,
+    track_indices: &[usize],
+) -> Option<Vec<usize>> {
+    // A side-local slice of an image album can have unique paths even when
+    // some other CUE track shares those images. Require a globally bijective
+    // file/track mapping before treating file credits as track credits.
+    if sheet.track_sources.len() != sheet.audio_paths.len() {
+        return None;
+    }
+    let mut full_mapping = Vec::with_capacity(sheet.track_sources.len());
+    let mut used = std::collections::BTreeSet::new();
+    for source in &sheet.track_sources {
+        let key = metadata_cue_surface_key(&source.audio_path);
+        let slot = sheet.audio_paths.iter()
+            .position(|path| metadata_cue_surface_key(path) == key)?;
+        if !used.insert(slot) { return None; }
+        full_mapping.push(slot);
+    }
+    if used.len() != sheet.audio_paths.len() { return None; }
+    track_indices.iter().map(|index| full_mapping.get(*index).copied()).collect()
+}
+
+fn cue_album_file_scoped_track_credit(key: &str) -> bool {
+    matches!(key, "COMPOSER" | "PERFORMER" | "LYRICIST" | "ARRANGER")
+}
+
 fn cue_album_user_metadata_for_track_indices(
     sheet: &super::app::CueAlbumSyntheticSheet,
     entries: &[super::probe::TagEntry],
@@ -29433,16 +29337,24 @@ fn cue_album_user_metadata_for_track_indices(
             continue;
         }
         let row_deleted = deleted.contains(&entry_index);
-        if unified_cue_entry_is_track_scoped(entry) {
+        let file_scoped_credit_slots = (!unified_cue_entry_is_track_scoped(entry)
+            && cue_album_file_scoped_track_credit(&key)
+            && entry.per_file_values.len() == sheet.audio_paths.len()
+            && entry.per_file_originals.len() == sheet.audio_paths.len())
+            .then(|| cue_album_one_track_per_file_slot_map(sheet, track_indices))
+            .flatten();
+        if unified_cue_entry_is_track_scoped(entry) || file_scoped_credit_slots.is_some() {
             for (local_index, track_index) in track_indices.iter().copied().enumerate() {
-                let current = entry.per_file_values.get(track_index).ok_or_else(|| {
+                let value_index = file_scoped_credit_slots.as_ref()
+                    .map_or(track_index, |slots| slots[local_index]);
+                let current = entry.per_file_values.get(value_index).ok_or_else(|| {
                     format!(
                         "save aborted: per-track {key} has {} values for {} CUE tracks",
                         entry.per_file_values.len(),
                         sheet.track_sources.len()
                     )
                 })?;
-                let original = entry.per_file_originals.get(track_index);
+                let original = entry.per_file_originals.get(value_index);
                 if !row_deleted && original.is_some_and(|original| original == current) {
                     continue;
                 }
@@ -44988,12 +44900,23 @@ pub fn build_sacd_editor_state(
         super::sacd::AreaKind::MultiChannel => 2,
     };
 
-    // Sidecar tracks for the selected area, sorted by TRACKNUMBER.
-    // Length may differ from n_tracks (a sidecar from a partial rip
-    // or a different area-count assumption could mismatch); we
-    // index defensively below.
+    // Prefer ISO TOC area boundaries over the legacy XML TOTALTRACKS
+    // heuristic, which misclassifies single-area multichannel discs.
+    // The editor remains read-tolerant of incomplete user sidecars, while
+    // tag transfer independently refuses an ambiguous write mapping.
     let sidecar_tracks: Vec<&super::sacd_sidecar::SidecarTrack> = sidecar
-        .map(|s| s.tracks_for_area(sidecar_area_idx))
+        .map(|s| {
+            let stereo_count = md.stereo.as_ref()
+                .map(|area| usize::from(area.header.track_count)).unwrap_or(0);
+            let mch_count = md.multi_channel.as_ref()
+                .map(|area| usize::from(area.header.track_count)).unwrap_or(0);
+            super::tag_interchange::sacd_transfer_area_track_ids(
+                s, stereo_count, mch_count, sidecar_area_idx,
+            ).ok().map(|ids| {
+                ids.into_iter().filter_map(|id| s.tracks.iter().find(|track| track.id == id))
+                    .collect::<Vec<_>>()
+            }).unwrap_or_else(|| s.tracks_for_area(sidecar_area_idx))
+        })
         .unwrap_or_default();
 
     // Pull a per-track sidecar value by index, falling back to a
@@ -45453,13 +45376,49 @@ pub(crate) fn read_sacd_tag_entries_for_copy(
             }
         });
     let (state, _area, _count) = build_sacd_editor_state(iso_path, &md, sidecar.as_ref())?;
-    Ok(state
+    let mut entries = state
         .active_surface()
         .entries
         .iter()
         .filter(|entry| !is_synthetic_disc_numbering_placeholder(entry))
         .cloned()
-        .collect())
+        .collect::<Vec<_>>();
+
+    // The ordinary SACD editor projects the metabase's `; `-encoded credit
+    // fields as display scalars. Transfer must recover their ordered values,
+    // not write "Composer A; Composer B" as one native metadata item. Build
+    // this projection only when a sidecar exists and its area/track mapping is
+    // fully established; the classifier already refuses incomplete carriers.
+    if let Some(sidecar) = sidecar.as_ref() {
+        let (stereo_count, mch_count) = super::tag_interchange::sacd_transfer_toc_counts(&md)?;
+        let area = if stereo_count > 0 { 1 } else { 2 };
+        let ids = super::tag_interchange::sacd_transfer_area_track_ids(
+            sidecar, stereo_count, mch_count, area,
+        )?;
+        for entry in &mut entries {
+            if !crate::metadata_persistence::field_is_in_contract(
+                &entry.display_key,
+                crate::metadata_persistence::PIPELINE_ORDERED_LIST_FIELDS,
+            ) {
+                continue;
+            }
+            for (position, id) in ids.iter().enumerate() {
+                let Some(track) = sidecar.tracks.iter().find(|track| track.id == *id) else {
+                    continue;
+                };
+                if let Some(values) = track.meta_values(&entry.display_key) {
+                    let values = super::probe::MetadataFieldValues::from_stored_texts(values);
+                    entry.per_file_values[position] = values.clone();
+                    entry.per_file_originals[position] = values;
+                }
+            }
+            entry.has_multiple_stored_values = entry.per_file_values.iter()
+                .any(|values| values.value_count() > 1);
+            entry.is_mixed = entry.per_file_values.windows(2)
+                .any(|pair| pair[0] != pair[1]);
+        }
+    }
+    Ok(entries)
 }
 
 pub(crate) fn read_sacd_track_durations_for_gnudb(
@@ -45768,7 +45727,7 @@ mod sidecar_editor_eligibility_tests {
 /// `build_sacd_editor_state`: ARTIST → "ARTIST", LYRICIST →
 /// "LYRICIST", etc. ALBUM ARTIST normalises to the spaceless
 /// canonical "ALBUMARTIST" because that's what most sidecars use.
-fn editor_key_to_sidecar_key(display_key: &str) -> Option<&'static str> {
+pub(crate) fn editor_key_to_sidecar_key(display_key: &str) -> Option<&'static str> {
     match display_key {
         "ALBUM" => Some("ALBUM"),
         "ALBUMARTIST" => Some("ALBUMARTIST"),
@@ -89928,7 +89887,7 @@ mod single_image_metadata_editor_regression_tests {
     }
 
     #[test]
-    fn album_view_discnumber_projection_maps_every_multi_file_side_carrier() {
+    fn r33c_album_view_discnumber_projection_maps_multi_file_sides_to_cue_only() {
         let mut state = unified_cue_album_edit_state();
         let mut sheet = state
             .active_surface()
@@ -90003,25 +89962,33 @@ mod single_image_metadata_editor_regression_tests {
         }
         recalc_dirty(&mut state);
 
-        for (track_indices, path, expected) in [
-            (vec![0usize, 1usize], a1, "1"),
-            (vec![0usize, 1usize], a2, "1"),
-            (vec![2usize, 3usize], b1, "2"),
-            (vec![2usize, 3usize], b2, "2"),
-        ] {
-            let (snapshot, deleted) = metadata_album_view_sidecar_discnumber_audio_snapshot(
-                state.active_surface(),
-                &sheet,
-                &track_indices,
-                &path,
-            )
-            .expect("multi-file side DISCNUMBER snapshot")
-            .expect("dirty carrier must receive a targeted native snapshot");
-            assert!(!deleted);
-            assert_eq!(snapshot.display_key, "DISCNUMBER");
-            assert_eq!(snapshot.row_scope, crate::tui::probe::RowScope::File);
-            assert_eq!(snapshot.values.len(), 1);
-            assert_eq!(snapshot.values[0].as_str(), expected);
+        let (plan, targets) = metadata_album_view_plan(
+            &state,
+            MetadataAlbumCarrierWriteMode::Authoritative,
+        )
+        .expect("sidecar-authoritative multi-file partition plan");
+        assert_eq!(
+            targets,
+            vec![
+                crate::config::AggregateMetadataTarget::SidecarCue,
+                crate::config::AggregateMetadataTarget::SidecarCue,
+            ],
+        );
+        assert!(plan.audio.is_empty(), "sidecar authority must not write any audio member");
+        assert_eq!(plan.sidecars.len(), 2);
+        for (sidecar, expected) in plan.sidecars.iter().zip(["1", "2"]) {
+            let parsed = crate::tui::cue_parser::parse_cue(&sidecar.replacement_cuesheet);
+            assert_eq!(parsed.tracks.len(), 2);
+            assert!(parsed.tracks.iter().all(|track| {
+                crate::convert::cue_parser::cue_user_metadata_values(
+                    &track.user_metadata,
+                    "DISCNUMBER",
+                )
+                .is_some_and(|values| {
+                    values.len() == 1
+                        && values.first().is_some_and(|value| value.as_str() == expected)
+                })
+            }), "every track on the side must retain DISCNUMBER={expected}");
         }
     }
 
@@ -90148,9 +90115,9 @@ mod single_image_metadata_editor_regression_tests {
             vec!["1", "1", "2", "2"],
         );
 
-        // A Sidecar-CUE authority still needs a writable native carrier for
-        // DISCNUMBER. Refuse before mutation when that carrier has no native
-        // tag implementation, and keep the edit dirty for correction/retry.
+        // With Sidecar-CUE authority the audio member is not a write target,
+        // even if its metadata tag format cannot be written. The edit belongs
+        // exclusively to the sidecar's Tonepoet extended metadata.
         let audio_paths = state
             .active_surface()
             .cue_album_synthetic_sheet
@@ -90188,17 +90155,21 @@ mod single_image_metadata_editor_regression_tests {
                     })
                     .collect(),
             );
-        let error = metadata_album_view_plan(
+        let (plan, targets) = metadata_album_view_plan(
             &state,
             MetadataAlbumCarrierWriteMode::Authoritative,
         )
-        .expect_err("untaggable Sidecar-CUE carrier must reject native DISCNUMBER");
-        assert!(error.contains("is not writable"), "{error}");
-        assert!(error.contains("no writable tag implementation"), "{error}");
-        assert!(
-            state.active_surface().dirty,
-            "rejected native projection must leave DISCNUMBER dirty",
+        .expect("sidecar authority must not depend on native audio write eligibility");
+        assert_eq!(
+            targets,
+            vec![
+                crate::config::AggregateMetadataTarget::SidecarCue,
+                crate::config::AggregateMetadataTarget::SidecarCue,
+            ],
         );
+        assert_eq!(plan.sidecars.len(), 2);
+        assert!(plan.audio.is_empty(), "blocked audio is not authoritative");
+        assert!(state.active_surface().dirty, "unsaved sidecar edit remains dirty");
     }
 
     #[test]
@@ -99719,8 +99690,8 @@ FILE "a.flac" WAVE
             .expect("write SACD magic");
         drop(iso);
         assert!(classify_tag_transfer_roots_with_default_priority_for_test(std::slice::from_ref(&disc), &cancel)
-            .expect_err("disc image must refuse")
-            .contains("disc-image"));
+            .expect_err("incomplete SACD TOC cannot represent logical audio tracks")
+            .contains("cannot read SACD ISO"));
     }
 
     #[test]
@@ -102592,7 +102563,7 @@ FILE "a.flac" WAVE
     }
 
     #[tokio::test]
-    async fn album_view_sidecar_authority_persists_discnumber_to_native_carriers() {
+    async fn r33c_album_view_discnumber_follows_selected_carrier_authority() {
         let _coordination = crate::concurrency::scoped_test_coordination_root();
         if !fixture_tool_available("ffmpeg") {
             eprintln!("skipping: ffmpeg unavailable");
@@ -102613,87 +102584,85 @@ FILE "a.flac" WAVE
         let lp2_cue = folder.join("Native Disc Album LP2.cue");
         std::fs::write(
             &lp1_cue,
-            two_track_image_cue(
-                &lp1_image,
-                "Native Disc Album",
-                "LP1 One",
-                "LP1 Two",
-            ),
+            two_track_image_cue(&lp1_image, "Native Disc Album", "LP1 One", "LP1 Two"),
         )
         .expect("LP1 sidecar");
         std::fs::write(
             &lp2_cue,
-            two_track_image_cue(
-                &lp2_image,
-                "Native Disc Album",
-                "LP2 One",
-                "LP2 Two",
-            ),
+            two_track_image_cue(&lp2_image, "Native Disc Album", "LP2 One", "LP2 Two"),
         )
         .expect("LP2 sidecar");
+        let original_audio = [
+            std::fs::read(&lp1_image).expect("LP1 original bytes"),
+            std::fs::read(&lp2_image).expect("LP2 original bytes"),
+        ];
+        let assert_cue_discnumber = |path: &std::path::Path, expected: Option<&str>| {
+            let cue_text = std::fs::read_to_string(path).expect("CUE text");
+            let parsed = crate::tui::cue_parser::parse_cue(&cue_text);
+            assert_eq!(parsed.tracks.len(), 2, "{}", path.display());
+            for track in &parsed.tracks {
+                let stored = crate::convert::cue_parser::cue_user_metadata_values(
+                    &track.user_metadata,
+                    "DISCNUMBER",
+                );
+                match expected {
+                    Some(expected) => assert!(
+                        stored.is_some_and(|values| {
+                            values.len() == 1
+                                && values.first().is_some_and(|value| value.as_str() == expected)
+                        }),
+                        "{} should store DISCNUMBER={expected} for each track",
+                        path.display(),
+                    ),
+                    None => assert!(
+                        stored.is_none(),
+                        "{} should not have stale DISCNUMBER data",
+                        path.display(),
+                    ),
+                }
+            }
+        };
+
+        // Priority 1: SidecarCue. Ordinary Save must be indistinguishable
+        // from the existing explicit sidecar-only projection, including its
+        // Tonepoet-extension consent policy.
         let (mut app, mut state) = open_folder_editor_with_priority(
             &folder,
             temp.path(),
             vec![SidecarCue, EmbeddedCue, IndividualFiles],
         );
+        app.config.metadata.cue_tonepoet_metadata =
+            Some(crate::config::CueTonepoetMetadataPreference::Always);
         assert_eq!(state.active_surface().label, "Album view");
         assert_eq!(state.active_surface().cue_album_view_sides.len(), 2);
-        assert!(state
-            .active_surface()
-            .cue_album_view_sides
-            .iter()
-            .all(|side| side.authoritative_target == SidecarCue));
-
-        // The production Album-view constructor must expose DISCNUMBER in
-        // the logical track dimension. Do not reshape this fixture in the
-        // test: this is the row a user reaches immediately after opening.
-        let natural_disc = state
-            .active_surface()
-            .entries
-            .iter()
-            .find(|entry| entry.display_key.eq_ignore_ascii_case("DISCNUMBER"))
-            .expect("naturally projected DISCNUMBER row");
-        assert_eq!(natural_disc.row_scope, crate::tui::probe::RowScope::Track);
-        assert_eq!(natural_disc.per_file_values.len(), 4);
-        assert_eq!(natural_disc.per_file_originals.len(), 4);
-        assert!(natural_disc
-            .per_file_values
-            .iter()
-            .all(|value| value.as_str().is_empty()));
-        assert!(natural_disc
-            .per_file_originals
-            .iter()
-            .all(|value| value.as_str().is_empty()));
-        assert!(
-            unified_cue_album_per_track_add_key_refusal(&state, "DISCNUMBER").is_some(),
-            "the naturally managed DISCNUMBER row must prevent a duplicate add-key row",
-        );
-
+        assert!(state.active_surface().cue_album_view_sides.iter().all(|side| {
+            side.authoritative_target == SidecarCue
+        }));
         let disc_index = state
             .active_surface()
             .entries
             .iter()
             .position(|entry| entry.display_key.eq_ignore_ascii_case("DISCNUMBER"))
-            .expect("side-scoped DISCNUMBER fixture row");
+            .expect("naturally projected DISCNUMBER row");
+        {
+            let row = &state.active_surface().entries[disc_index];
+            assert_eq!(row.row_scope, crate::tui::probe::RowScope::Track);
+            assert_eq!(row.per_file_values.len(), 4);
+            assert!(row.per_file_values.iter().all(|value| value.as_str().is_empty()));
+        }
+        assert!(
+            unified_cue_album_per_track_add_key_refusal(&state, "DISCNUMBER").is_some(),
+            "the managed DISCNUMBER row must reject duplicate add-key",
+        );
         state.cursor = disc_index;
         assert_eq!(metadata_editor_begin_cursor_value_edit(&mut state, true), None);
-        assert_eq!(state.phase, crate::tui::app::MetadataEditorPhase::InlineEdit);
         state.edit_input = Some(super::super::text_input::TextInputState::new(
             "1; !".to_string(),
         ));
         assert!(metadata_editor_commit_inline_edit(&mut app, &mut state));
-        let disc = state
-            .active_surface()
-            .entries
-            .iter()
-            .find(|entry| entry.display_key.eq_ignore_ascii_case("DISCNUMBER"))
-            .expect("side-scoped DISCNUMBER row");
-        assert_eq!(disc.row_scope, crate::tui::probe::RowScope::Track);
+        let disc = &state.active_surface().entries[disc_index];
         assert_eq!(
-            disc.per_file_values
-                .iter()
-                .map(|value| value.as_str())
-                .collect::<Vec<_>>(),
+            disc.per_file_values.iter().map(|value| value.as_str()).collect::<Vec<_>>(),
             vec!["1", "1", "2", "2"],
         );
 
@@ -102704,69 +102673,43 @@ FILE "a.flac" WAVE
         .expect("sidecar-authoritative DISCNUMBER plan");
         assert_eq!(targets, vec![SidecarCue, SidecarCue]);
         assert_eq!(plan.sidecars.len(), 2);
-        assert_eq!(plan.audio.len(), 2);
-        for audio in &plan.audio {
-            assert_eq!(audio.snapshots.len(), 1);
-            assert_eq!(audio.snapshots[0].display_key, "DISCNUMBER");
-            assert_eq!(audio.snapshots[0].row_scope, crate::tui::probe::RowScope::File);
-            assert!(audio.deleted.is_empty());
-            assert!(audio.forced_deletes.is_empty());
-        }
+        assert!(plan.audio.is_empty(), "ordinary Save must not write to FLAC carriers");
         assert!(
-            metadata_album_view_dirty_unsupported_fields(
-                &state,
-                &targets,
-                MetadataAlbumCarrierWriteMode::Authoritative,
-            )
-            .is_empty(),
-            "validated side-scoped DISCNUMBER has a native carrier route under Sidecar-CUE authority",
+            metadata_album_view_dirty_unsupported_fields(&state, &targets).is_empty(),
+            "extended CUE can represent DISCNUMBER",
         );
-
-        // The explicit sidecar-only action is a carrier override. Arbitrary
-        // non-empty keys are now losslessly representable in Tonepoet inert
-        // metadata, so DISCNUMBER is valid there even though standard CUE has
-        // no DISCNUMBER directive. The explicit plan must remain sidecar-only.
-        let (sidecar_only_plan, sidecar_only_targets) = metadata_album_view_plan(
+        assert!(cue_tonepoet_metadata_edits_for_album_sidecars(&state, &targets)
+            .expect("consent edits")
+            .iter()
+            .any(|edit| edit.key.eq_ignore_ascii_case("DISCNUMBER")),
+            "ordinary Save must not bypass extended-CUE consent",
+        );
+        let (sidecar_only_plan, explicit_targets) = metadata_album_view_plan(
             &state,
             MetadataAlbumCarrierWriteMode::SidecarCue,
         )
-        .expect("explicit sidecar-only plan");
-        assert_eq!(sidecar_only_plan.sidecars.len(), 2);
-        assert!(
-            sidecar_only_plan.audio.is_empty(),
-            "explicit sidecar-only mode must never stage native DISCNUMBER writes",
-        );
-        assert_eq!(sidecar_only_targets, vec![SidecarCue, SidecarCue]);
-        assert!(
-            metadata_album_view_dirty_unsupported_fields(
-                &state,
-                &sidecar_only_targets,
-                MetadataAlbumCarrierWriteMode::SidecarCue,
-            )
-            .is_empty(),
-            "DISCNUMBER must be representable in inert sidecar metadata",
-        );
-        for (sidecar_write, expected) in sidecar_only_plan
+        .expect("explicit CUE-only plan");
+        assert_eq!(explicit_targets, targets);
+        assert!(sidecar_only_plan.audio.is_empty());
+        for ((ordinary, explicit), expected) in plan
             .sidecars
             .iter()
+            .zip(sidecar_only_plan.sidecars.iter())
             .zip(["1", "2"])
         {
-            let parsed = crate::tui::cue_parser::parse_cue(&sidecar_write.replacement_cuesheet);
-            assert!(
-                parsed.tracks.iter().all(|track| {
-                    crate::convert::cue_parser::cue_user_metadata_values(
-                        &track.user_metadata,
-                        "DISCNUMBER",
-                    )
-                    .is_some_and(|values| {
-                        values.len() == 1
-                            && values
-                                .first()
-                                .is_some_and(|value| value.as_str() == expected)
-                    })
-                }),
-                "explicit sidecar projection must preserve side DISCNUMBER={expected}",
-            );
+            assert_eq!(ordinary.replacement_cuesheet, explicit.replacement_cuesheet);
+            let parsed = crate::tui::cue_parser::parse_cue(&ordinary.replacement_cuesheet);
+            assert_eq!(parsed.tracks.len(), 2);
+            assert!(parsed.tracks.iter().all(|track| {
+                crate::convert::cue_parser::cue_user_metadata_values(
+                    &track.user_metadata,
+                    "DISCNUMBER",
+                )
+                .is_some_and(|values| {
+                    values.len() == 1
+                        && values.first().is_some_and(|value| value.as_str() == expected)
+                })
+            }));
         }
 
         let (state, results, status) = save_through_production_path(&mut app, state).await;
@@ -102776,58 +102719,33 @@ FILE "a.flac" WAVE
                 crate::tui::app::MetadataEditorWriteOutcome::Failed { .. }
                     | crate::tui::app::MetadataEditorWriteOutcome::Skipped { .. }
             )),
-            "ordinary Sidecar-CUE save failed: {results:?}; status={status}",
+            "ordinary sidecar-authoritative Save failed: {results:?}; status={status}",
         );
-        assert!(!status.to_ascii_lowercase().contains("unsupported"), "{status}");
-        assert!(!state.active_surface().dirty, "successful native projection must reduce the edit");
+        assert!(!state.active_surface().dirty);
+        assert_eq!(std::fs::read(&lp1_image).expect("LP1 after sidecar save"), original_audio[0]);
+        assert_eq!(std::fs::read(&lp2_image).expect("LP2 after sidecar save"), original_audio[1]);
+        assert_cue_discnumber(&lp1_cue, Some("1"));
+        assert_cue_discnumber(&lp2_cue, Some("2"));
 
-        for (path, expected) in [(&lp1_image, "1"), (&lp2_image, "2")] {
-            let tags = crate::tui::probe::read_all_tags(path)
-                .unwrap_or_else(|error| panic!("re-read {}: {error}", path.display()));
-            let disc = tags
-                .iter()
-                .find(|entry| entry.display_key.eq_ignore_ascii_case("DISCNUMBER"))
-                .expect("native DISCNUMBER row after save");
-            assert_eq!(disc.stored_value_count_for_slot(0), 1);
-            assert_eq!(disc.per_file_values[0].as_str(), expected);
-        }
-        for cue_path in [&lp1_cue, &lp2_cue] {
-            let cue_text = std::fs::read_to_string(cue_path)
-                .unwrap_or_else(|error| panic!("re-read {}: {error}", cue_path.display()));
-            assert!(
-                !cue_text.to_ascii_uppercase().contains("DISCNUMBER"),
-                "native DISCNUMBER projection must never fabricate a CUE directive in {}",
-                cue_path.display(),
-            );
-        }
-
-        // Reopen from disk before deletion. Native carrier values must be
-        // projected back into the same logical track dimension rather than
-        // regressing to the generic file-scoped standard-field placeholder.
         let (mut app, mut state) = open_folder_editor_with_priority(
             &folder,
             temp.path(),
             vec![SidecarCue, EmbeddedCue, IndividualFiles],
         );
+        app.config.metadata.cue_tonepoet_metadata =
+            Some(crate::config::CueTonepoetMetadataPreference::Always);
         let reopened_disc = state
             .active_surface()
             .entries
             .iter()
             .find(|entry| entry.display_key.eq_ignore_ascii_case("DISCNUMBER"))
-            .expect("reopened side-scoped DISCNUMBER row");
+            .expect("reopened sidecar DISCNUMBER");
         assert_eq!(reopened_disc.row_scope, crate::tui::probe::RowScope::Track);
         assert_eq!(
-            reopened_disc
-                .per_file_values
-                .iter()
-                .map(|value| value.as_str())
-                .collect::<Vec<_>>(),
+            reopened_disc.per_file_values.iter().map(|value| value.as_str()).collect::<Vec<_>>(),
             vec!["1", "1", "2", "2"],
         );
-        assert_eq!(
-            reopened_disc.per_file_values,
-            reopened_disc.per_file_originals
-        );
+        assert_eq!(reopened_disc.per_file_values, reopened_disc.per_file_originals);
         assert!(!state.active_surface().dirty);
 
         let disc_index = state
@@ -102842,15 +102760,10 @@ FILE "a.flac" WAVE
             &state,
             MetadataAlbumCarrierWriteMode::Authoritative,
         )
-        .expect("sidecar-authoritative DISCNUMBER deletion plan");
+        .expect("sidecar-authoritative deletion plan");
         assert_eq!(delete_targets, vec![SidecarCue, SidecarCue]);
-        assert_eq!(delete_plan.audio.len(), 2);
-        assert!(delete_plan.audio.iter().all(|audio| {
-            audio.snapshots.len() == 1
-                && audio.snapshots[0].display_key == "DISCNUMBER"
-                && audio.deleted == vec![0usize]
-        }));
-
+        assert_eq!(delete_plan.sidecars.len(), 2);
+        assert!(delete_plan.audio.is_empty(), "deletion must not touch audio");
         let (state, results, status) = save_through_production_path(&mut app, state).await;
         assert!(
             !results.iter().any(|result| matches!(
@@ -102858,28 +102771,99 @@ FILE "a.flac" WAVE
                 crate::tui::app::MetadataEditorWriteOutcome::Failed { .. }
                     | crate::tui::app::MetadataEditorWriteOutcome::Skipped { .. }
             )),
-            "ordinary Sidecar-CUE DISCNUMBER deletion failed: {results:?}; status={status}",
+            "sidecar DISCNUMBER deletion failed: {results:?}; status={status}",
         );
-        assert!(!state.active_surface().dirty, "successful deletion must reduce the edit");
-        for path in [&lp1_image, &lp2_image] {
+        assert!(!state.active_surface().dirty);
+        assert_eq!(std::fs::read(&lp1_image).expect("LP1 after deletion"), original_audio[0]);
+        assert_eq!(std::fs::read(&lp2_image).expect("LP2 after deletion"), original_audio[1]);
+        assert_cue_discnumber(&lp1_cue, None);
+        assert_cue_discnumber(&lp2_cue, None);
+
+        // Priority 2: IndividualFiles. The same Album-view edit must instead
+        // mutate the two FLAC images, leaving the non-authoritative CUEs byte-
+        // identical and preserving native per-side DISCNUMBER on reopen.
+        let cue_after_deletion = [
+            std::fs::read(&lp1_cue).expect("LP1 CUE baseline"),
+            std::fs::read(&lp2_cue).expect("LP2 CUE baseline"),
+        ];
+        let (mut app, mut state) = open_folder_editor_with_priority(
+            &folder,
+            temp.path(),
+            vec![IndividualFiles, SidecarCue, EmbeddedCue],
+        );
+        assert_eq!(state.active_surface().label, "Album view");
+        assert!(state.active_surface().cue_album_view_sides.iter().all(|side| {
+            side.authoritative_target == IndividualFiles
+        }));
+        let disc_index = state
+            .active_surface()
+            .entries
+            .iter()
+            .position(|entry| entry.display_key.eq_ignore_ascii_case("DISCNUMBER"))
+            .expect("native DISCNUMBER edit row");
+        state.cursor = disc_index;
+        assert_eq!(metadata_editor_begin_cursor_value_edit(&mut state, true), None);
+        state.edit_input = Some(super::super::text_input::TextInputState::new(
+            "1; !".to_string(),
+        ));
+        assert!(metadata_editor_commit_inline_edit(&mut app, &mut state));
+        let (native_plan, targets) = metadata_album_view_plan(
+            &state,
+            MetadataAlbumCarrierWriteMode::Authoritative,
+        )
+        .expect("native-authoritative DISCNUMBER plan");
+        assert_eq!(targets, vec![IndividualFiles, IndividualFiles]);
+        assert!(native_plan.sidecars.is_empty());
+        assert_eq!(native_plan.audio.len(), 2);
+        assert!(native_plan.audio.iter().all(|audio| {
+            audio.snapshots.iter().any(|snapshot| {
+                snapshot.display_key == "DISCNUMBER"
+                    && snapshot.row_scope == crate::tui::probe::RowScope::File
+                    && snapshot.values != snapshot.originals
+            })
+        }));
+        let (state, results, status) = save_through_production_path(&mut app, state).await;
+        assert!(
+            !results.iter().any(|result| matches!(
+                &result.outcome,
+                crate::tui::app::MetadataEditorWriteOutcome::Failed { .. }
+                    | crate::tui::app::MetadataEditorWriteOutcome::Skipped { .. }
+            )),
+            "native-authoritative DISCNUMBER save failed: {results:?}; status={status}",
+        );
+        assert!(!state.active_surface().dirty);
+        assert_ne!(std::fs::read(&lp1_image).expect("LP1 native save"), original_audio[0]);
+        assert_ne!(std::fs::read(&lp2_image).expect("LP2 native save"), original_audio[1]);
+        assert_eq!(std::fs::read(&lp1_cue).expect("LP1 CUE unchanged"), cue_after_deletion[0]);
+        assert_eq!(std::fs::read(&lp2_cue).expect("LP2 CUE unchanged"), cue_after_deletion[1]);
+        for (path, expected) in [(&lp1_image, "1"), (&lp2_image, "2")] {
             let tags = crate::tui::probe::read_all_tags(path)
-                .unwrap_or_else(|error| panic!("re-read {} after deletion: {error}", path.display()));
+                .unwrap_or_else(|error| panic!("re-read {}: {error}", path.display()));
             let disc = tags
                 .iter()
                 .find(|entry| entry.display_key.eq_ignore_ascii_case("DISCNUMBER"))
-                .expect("core DISCNUMBER row after deletion");
-            assert_eq!(disc.stored_value_count_for_slot(0), 0);
-            assert_eq!(disc.per_file_values[0].as_str(), "");
+                .expect("native DISCNUMBER row after save");
+            assert_eq!(disc.stored_value_count_for_slot(0), 1);
+            assert_eq!(disc.per_file_values[0].as_str(), expected);
         }
-        for cue_path in [&lp1_cue, &lp2_cue] {
-            let cue_text = std::fs::read_to_string(cue_path)
-                .unwrap_or_else(|error| panic!("re-read {} after deletion: {error}", cue_path.display()));
-            assert!(
-                !cue_text.to_ascii_uppercase().contains("DISCNUMBER"),
-                "DISCNUMBER deletion must remain a native-tag operation for {}",
-                cue_path.display(),
-            );
-        }
+        let (_, state) = open_folder_editor_with_priority(
+            &folder,
+            temp.path(),
+            vec![IndividualFiles, SidecarCue, EmbeddedCue],
+        );
+        let reopened = state
+            .active_surface()
+            .entries
+            .iter()
+            .find(|entry| entry.display_key.eq_ignore_ascii_case("DISCNUMBER"))
+            .expect("reopened native DISCNUMBER");
+        assert_eq!(reopened.row_scope, crate::tui::probe::RowScope::Track);
+        assert_eq!(
+            reopened.per_file_values.iter().map(|value| value.as_str()).collect::<Vec<_>>(),
+            vec!["1", "1", "2", "2"],
+        );
+        assert_eq!(reopened.per_file_values, reopened.per_file_originals);
+        assert!(!state.active_surface().dirty);
     }
 
     #[tokio::test]
@@ -113860,5 +113844,66 @@ mod browse_tab_input_tests {
         assert!(restored.staging.is_none());
         assert!(app.browse.entries.iter().any(|entry| entry.name == "renamed-after-save.flac"));
         assert!(!app.browse.entries.iter().any(|entry| entry.name == "old-name.flac"));
+    }
+}
+
+
+#[cfg(test)]
+mod r33_metadata_authority_regressions {
+    use super::*;
+    use crate::tui::probe::{MetadataFieldValues, RowScope, TagEntry};
+
+    fn composer(values: &[&str], originals: &[&str]) -> TagEntry {
+        let values = values.iter().map(|value| MetadataFieldValues::from_stored_text(*value))
+            .collect::<Vec<_>>();
+        let originals = originals.iter().map(|value| MetadataFieldValues::from_stored_text(*value))
+            .collect::<Vec<_>>();
+        TagEntry {
+            row_scope: RowScope::File,
+            display_key: "COMPOSER".into(),
+            item_key: lofty::tag::ItemKey::Composer,
+            value: "<multiple values>".into(),
+            original: "<multiple values>".into(),
+            is_binary: false,
+            is_mixed: true,
+            has_multiple_stored_values: false,
+            per_file_stored_value_counts: Vec::new(),
+            per_file_values: values,
+            per_file_originals: originals,
+            mb_proposed_value: None,
+            mb_proposed_per_file: None,
+        }
+    }
+
+    #[test]
+    fn r33_one_file_per_track_composers_survive_extended_cue_roundtrip() {
+        let state = super::phase4_tests::single_image_unified_cue_state(vec![], 2);
+        let mut sheet = state.active_surface().cue_album_synthetic_sheet.clone().unwrap();
+        let second = std::path::PathBuf::from("/tmp/second.flac");
+        sheet.audio_paths.push(second.clone());
+        sheet.track_sources[1].audio_path = second;
+        sheet.track_sources[1].file_ref = "second.flac".into();
+        assert_eq!(cue_album_one_track_per_file_slot_map(&sheet, &[0, 1]), Some(vec![0, 1]));
+        let values = composer(&["Composer Alpha", "Composer Beta"], &["Old A", "Old B"]);
+        let cue = cue_album_generate_cuesheet_for_track_indices(
+            &sheet, &[values], &[], &[0, 1], false, true,
+            cue_album_preserved_file_ref_for_source, cue_album_format_tag_for_audio,
+        ).expect("different track composers are valid extended metadata");
+        assert!(cue.contains("TONEPOET_META_V1"));
+        let parsed = crate::convert::cue_parser::parse_cue(&cue);
+        assert_eq!(parsed.tracks.len(), 2);
+        assert_eq!(crate::convert::cue_parser::cue_user_metadata_values(
+            &parsed.tracks[0].user_metadata, "COMPOSER"), Some(["Composer Alpha".to_string()].as_slice()));
+        assert_eq!(crate::convert::cue_parser::cue_user_metadata_values(
+            &parsed.tracks[1].user_metadata, "COMPOSER"), Some(["Composer Beta".to_string()].as_slice()));
+        assert!(crate::convert::cue_parser::cue_user_metadata_values(
+            &parsed.user_metadata, "COMPOSER").is_none());
+    }
+
+    #[test]
+    fn r33_image_cue_never_projects_independent_file_composers_as_tracks() {
+        let state = super::phase4_tests::single_image_unified_cue_state(vec![], 2);
+        let sheet = state.active_surface().cue_album_synthetic_sheet.as_ref().unwrap();
+        assert_eq!(cue_album_one_track_per_file_slot_map(sheet, &[0, 1]), None);
     }
 }

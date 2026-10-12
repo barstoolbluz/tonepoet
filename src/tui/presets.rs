@@ -768,7 +768,8 @@ impl TuiPreset {
                             Ok(value)
                                 if (tonepoet_pipeline::DbNano::MIN_NORMALIZE_TARGET
                                     ..=tonepoet_pipeline::DbNano::MAX_NORMALIZE_TARGET)
-                                    .contains(&value) =>
+                                    .contains(&value)
+                                    && super::format_interactions::validate_true_peak_input_precision(value).is_ok() =>
                             {
                                 format_state.dsd_true_peak_target_dbtp = value;
                                 format_state.dsd_true_peak_target_origin =
@@ -924,7 +925,8 @@ impl TuiPreset {
                     Ok(value)
                         if (tonepoet_pipeline::DbNano::MIN_NORMALIZE_TARGET
                             ..=tonepoet_pipeline::DbNano::MAX_NORMALIZE_TARGET)
-                            .contains(&value) =>
+                            .contains(&value)
+                            && super::format_interactions::validate_true_peak_input_precision(value).is_ok() =>
                     {
                         format_state.pcm_true_peak_target_dbtp = value;
                         format_state.pcm_true_peak_target_origin =

@@ -1214,6 +1214,9 @@ fn apply_cli_dsd_reference_settings(
     let parsed_true_peak_target = true_peak_target
         .map(|value| value.parse::<DbNano>().map_err(anyhow::Error::msg))
         .transpose()?;
+    if parsed_true_peak_target.is_some_and(|target| target.0 % 100_000 != 0) {
+        anyhow::bail!("--dsd-true-peak-target-dbtp accepts 0.0001 dBTP increments (at most four decimal places)");
+    }
     let parsed_scope = match true_peak_scope.map(|value| value.trim().to_ascii_lowercase()) {
         Some(value) if value == "track" => Some(TruePeakScope::Track),
         Some(value) if value == "album" => Some(TruePeakScope::Album),
@@ -1409,6 +1412,9 @@ fn apply_cli_pcm_true_peak_settings(
         .transpose()?;
     if target_dbtp.is_some_and(|v| !(DbNano::MIN_NORMALIZE_TARGET..=DbNano::MAX_NORMALIZE_TARGET).contains(&v)) {
         anyhow::bail!("--pcm-true-peak-target-dbtp must be between -12 and 0 dBTP");
+    }
+    if target_dbtp.is_some_and(|target| target.0 % 100_000 != 0) {
+        anyhow::bail!("--pcm-true-peak-target-dbtp accepts 0.0001 dBTP increments (at most four decimal places)");
     }
     let parsed_scope = match scope.map(|value| value.trim().to_ascii_lowercase()) {
         Some(value) if value == "track" => Some(TruePeakScope::Track),
@@ -1672,19 +1678,30 @@ mod pcm_true_peak_cli_settings_tests {
     #[test]
     fn ordinary_pcm_flags_activate_guard_and_normalize_with_exact_targets() {
         let mut settings = tonepoet_pipeline::PipelineSettings::default();
-        apply(&mut settings, Some("true-peak-guard"), None, Some("-0.125000001"),
+        apply(&mut settings, Some("true-peak-guard"), None, Some("-0.125000000"),
             Some("album"), Some("standard")).unwrap();
         assert_eq!(settings.pcm_true_peak.policy, SampleGainPolicy::TruePeakGuard {
-            target_dbtp: "-0.125000001".parse().unwrap(),
+            target_dbtp: "-0.125000000".parse().unwrap(),
             scope: TruePeakScope::Album, scan: TruePeakScanTier::Standard,
         });
         assert_eq!(settings.pcm_true_peak_target_origin, TruePeakTargetOrigin::User);
         apply(&mut settings, Some("true-peak-normalize"), None, None, None, None).unwrap();
         assert_eq!(settings.pcm_true_peak.policy, SampleGainPolicy::TruePeakNormalize {
-            target_dbtp: "-0.125000001".parse().unwrap(),
+            target_dbtp: "-0.125000000".parse().unwrap(),
             scope: TruePeakScope::Album, scan: TruePeakScanTier::Standard,
         });
         assert_eq!(settings.pcm_true_peak_target_origin, TruePeakTargetOrigin::User);
+    }
+
+    #[test]
+    fn r33_pcm_cli_refuses_sub_grid_ceiling_without_mutating_settings() {
+        let mut settings = tonepoet_pipeline::PipelineSettings::default();
+        let original = settings.clone();
+        let error = apply(&mut settings, Some("true-peak-guard"), None,
+            Some("-0.125000001"), None, None).unwrap_err();
+        assert!(error.to_string().contains("0.0001 dBTP"), "{error}");
+        assert_eq!(settings.pcm_true_peak.policy, original.pcm_true_peak.policy);
+        assert_eq!(settings.pcm_true_peak_target_origin, original.pcm_true_peak_target_origin);
     }
 
     #[test]

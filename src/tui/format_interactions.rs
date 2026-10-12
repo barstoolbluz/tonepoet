@@ -12,6 +12,13 @@ use tonepoet_pipeline::{DbNano, TruePeakTargetOrigin};
 /// headroom *below* 0 dBTP; an explicit minus is already a signed ceiling.
 /// Keep `+` explicit rather than silently accepting a positive dBTP ceiling.
 /// Zero remains valid, as it was before this interaction was introduced.
+/// Custom input is quantized to a 0.0001 dB grid (four decimals). This avoids
+/// offering arbitrary nano-dB set points that cannot be usefully resolved by
+/// the true-peak terminal. A hard ceiling remains a maximum, not a promise to
+/// produce a sample exactly at that level; qualified terminal headroom varies
+/// with bit depth, dither, and processing path.
+const TRUE_PEAK_TARGET_GRID_NANO: i64 = 100_000;
+
 pub(super) fn parse_true_peak_target(raw: &str) -> Result<DbNano, String> {
     let raw = raw.trim();
     let parsed = raw.parse::<DbNano>()?;
@@ -22,7 +29,15 @@ pub(super) fn parse_true_peak_target(raw: &str) -> Result<DbNano, String> {
     if !(DbNano::MIN_NORMALIZE_TARGET..=DbNano::MAX_NORMALIZE_TARGET).contains(&target) {
         return Err("true-peak headroom must be between 0 and 12 dB (ceiling -12 through 0 dBTP)".to_string());
     }
+    validate_true_peak_input_precision(target)?;
     Ok(target)
+}
+
+pub(super) fn validate_true_peak_input_precision(target: DbNano) -> Result<(), String> {
+    if target.0 % TRUE_PEAK_TARGET_GRID_NANO != 0 {
+        return Err("true-peak ceiling accepts at most four decimal places (0.0001 dBTP increments)".to_string());
+    }
+    Ok(())
 }
 
 /// Shared user-setting path for both `:set` and the in-place custom editor.
@@ -35,6 +50,9 @@ pub(super) fn set_true_peak_target(
 ) -> Result<(), &'static str> {
     if !(DbNano::MIN_NORMALIZE_TARGET..=DbNano::MAX_NORMALIZE_TARGET).contains(&target) {
         return Err("true-peak ceiling must be between -12 and 0 dBTP");
+    }
+    if target.0 % TRUE_PEAK_TARGET_GRID_NANO != 0 {
+        return Err("true-peak ceiling must be a multiple of 0.0001 dBTP");
     }
     match field {
         FormatField::PcmTruePeakTarget => {
@@ -72,14 +90,14 @@ mod r30_tests {
         for (input, expected) in [
             ("0.0001", -100_000),
             ("-0.0001", -100_000),
-            ("0.000000001", -1),
+            ("0.0010", -1_000_000),
             ("0", 0),
             ("-12", -12_000_000_000),
             ("+0", 0),
         ] {
             assert_eq!(parse_true_peak_target(input).unwrap(), DbNano(expected), "{input}");
         }
-        for input in ["+0.0001", "12.000000001", "-12.000000001", "12.1", "x", "-", "0.0000000001"] {
+        for input in ["+0.0001", "12.000000001", "-12.000000001", "12.1", "x", "-", "0.0000000001", "0.00001", "0.000000001"] {
             assert!(parse_true_peak_target(input).is_err(), "{input} must be refused");
         }
     }
@@ -286,5 +304,24 @@ pub(crate) fn cascade_dsd_source_to_pcm(convert: &mut ConvertState, was_dsd_befo
     }
     if let Some(source_rate) = convert.current_source_sample_rate() {
         convert.format.cascade_dsd_source_to_pcm_defaults(source_rate);
+    }
+}
+
+
+#[cfg(test)]
+mod r33_precision_regressions {
+    use super::*;
+
+    #[test]
+    fn r33_custom_true_peak_grid_accepts_four_decimals_and_rejects_unrealizable_resolution() {
+        for (text, value) in [
+            ("0", 0), ("0.0001", -100_000), ("-0.1234", -123_400_000),
+            ("11.9999", -11_999_900_000), ("-12.0000", -12_000_000_000),
+        ] {
+            assert_eq!(parse_true_peak_target(text).unwrap(), DbNano(value));
+        }
+        for input in ["0.00001", "-0.000000001", "-12.00001"] {
+            assert!(parse_true_peak_target(input).is_err(), "{input}");
+        }
     }
 }
