@@ -5064,7 +5064,7 @@ contain audio, in a container the operation does not open.
 and targets. Where it genuinely cannot, the refusal should say what it could
 not read rather than claim there is no audio.
 
-## 76. Album-scoped COMPOSER refuses to save on any multi-composer album that has a CUE beside it
+## 76. Album-scoped COMPOSER refuses to save on multi-composer albums, and no configuration can stop the CUE from governing the save
 
 Filed 2026-10-11 from the field, on `1994 - Reality Bites (OST) (FLAC)`.
 
@@ -5075,34 +5075,61 @@ changed
 ```
 
 Reported on any various-artists album with multiple composers. The field report
-is that the tags nonetheless appear written, and are still there on reopening —
-so the message's "no carrier was changed" may be false, at least for the audio
-files. We did not confirm the write ordering and cannot say which carrier the
-claim refers to.
+is that the tags nonetheless appear written and are still there on reopening, so
+"no carrier was changed" may be false for the audio files. We did not confirm the
+write ordering and cannot say which carrier the claim refers to.
 
-What we understand of the mechanism, which may be wrong:
+The user's configuration asks for individual files first:
 
-- That folder does contain a CUE, `Reality Bites.cue`, beside fourteen
-  individually tagged FLACs. So the CUE in the message is real, not inferred.
-- `COMPOSER` carries `unified_cue_scope: Cue::None`
-  (`src/metadata_persistence.rs:97`), deliberately, so that these fields "keep
-  that declared shape rather than forcing every occurrence through the
-  unified-CUE Track invariant".
-- With no declared shape to consult, `unified_cue_entry_is_track_scoped`
-  (`src/tui/keybindings.rs:13835`) falls back to the row's own scope. Presented
-  album-scoped, COMPOSER then has to hold one value for every file the CUE
-  covers, and the uniformity check at `:29505` refuses when it does not.
+```toml
+aggregate_metadata_target_priority = [
+    "individual-files",
+    "sidecar-cue",
+    "embedded-cue",
+]
+```
 
-Two things make this read as a bug from the outside. A soundtrack has a
-different composer per track; that is the normal case, not a conflict to be
-reconciled. And the user's metadata source is configured as tagged files when
-available, which we believe governs reading and not this CUE write invariant —
-so the refusal appears to come from a carrier the user did not ask to write.
+That is the reverse of the default, which leads with `sidecar-cue`
+(`src/config.rs:460`). The save is refused anyway, by a rule belonging to the
+carrier the user demoted.
 
-**What we want:** per-track composers save without being refused. Whether that
-means COMPOSER is track-scoped in this presentation, or the CUE carrier is not
-written when the authoritative source is tagged files, or the uniformity
-invariant applies only to what is actually being written, is open.
+Our reading of why the setting cannot help, which may be wrong:
 
-A refusal that says no carrier was changed should also be true, or say which
-carrier it means.
+- The gates that admit CUE work test **membership**, not precedence.
+  `metadata_album_view_dirty_unsupported_fields`
+  (`src/tui/keybindings.rs:15612`) and
+  `cue_tonepoet_metadata_edits_for_album_sidecars` (`:15279`) both ask whether
+  the configured list contains `SidecarCue`. It does, in second place, so they
+  proceed.
+- The target cannot be omitted either.
+  `normalized_aggregate_metadata_target_priority` (`src/config.rs:469`) chains
+  the defaults onto the configured order, so any omitted target is appended
+  back. `SidecarCue` is therefore always present, and that membership test
+  always passes.
+
+So an ordered list cannot express "do not write the CUE", and the ordering the
+user did express has no effect on whether the CUE's invariants govern the save.
+
+The invariant itself: that folder holds a real `Reality Bites.cue` beside
+fourteen individually tagged FLACs. `COMPOSER` carries
+`unified_cue_scope: Cue::None` (`src/metadata_persistence.rs:97`), deliberately,
+so these fields "keep that declared shape rather than forcing every occurrence
+through the unified-CUE Track invariant". With no declared shape to consult,
+`unified_cue_entry_is_track_scoped` (`src/tui/keybindings.rs:13835`) falls back
+to the row's own scope; presented album-scoped under
+`synthetic_album_view = true`, COMPOSER must then hold one value across every
+file the CUE covers, and the check at `:29505` refuses when it does not. We did
+not trace the call chain from the save entry point to `:29505`, so the link
+between those gates and this particular refusal is inferred.
+
+A soundtrack having a different composer per track is the normal case, not a
+conflict to reconcile.
+
+**What we want:** per-track composers save without refusal, and the configured
+metadata target order is obeyed — including the ability to say that a CUE beside
+the files is not a write target at all. Whether that means COMPOSER becomes
+track-scoped in this presentation, or the gates respect precedence rather than
+membership, or omission becomes expressible, is open.
+
+A refusal that says no carrier was changed should also be true, or should say
+which carrier it means.
