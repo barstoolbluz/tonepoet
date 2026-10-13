@@ -103114,37 +103114,90 @@ FILE "a.flac" WAVE
             temp.path(),
             vec![IndividualFiles, SidecarCue, EmbeddedCue],
         );
-        assert_eq!(state.active_surface().label, "Album view");
-        assert!(state.active_surface().cue_album_view_sides.iter().all(|side| {
-            side.authoritative_target == IndividualFiles
+        // One logical track per FLAC makes these metadata sidecars, not
+        // structural image CUEs. Their native authority is File tags; an
+        // Album view would incorrectly promote file-level tags to image tracks.
+        assert_eq!(state.active_surface().label, "File tags");
+        assert!(state.presentation_tabs.iter().all(|tab| tab.label != "Album view"));
+        assert!(state.active_surface().cue_source.is_none());
+        assert!(state.active_surface().cue_album_synthetic_sheet.is_none());
+        assert!(state.active_surface().cue_album_view_sides.is_empty());
+        assert_eq!(
+            state
+                .active_surface()
+                .paths
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            [lp1_image.clone(), lp2_image.clone()].into_iter().collect(),
+            "individual-file authority must include both FLACs",
+        );
+        for cue in [&lp1_cue, &lp2_cue] {
+            assert!(
+                state.presentation_tabs.iter().any(|tab| matches!(
+                    &tab.cue_source,
+                    Some(super::super::app::MetadataCueSource::Sidecar(path)) if path == cue
+                )),
+                "metadata sidecar '{}' must remain separately selectable",
+                cue.display(),
+            );
+        }
+
+        // A File tags presentation does not fabricate the Album view's
+        // DISCNUMBER row. Add it through the user-facing editor route instead
+        // of seeding the carriers or manually inserting a test-only row.
+        assert!(state.active_surface().entries.iter().all(|entry| {
+            !entry.display_key.eq_ignore_ascii_case("DISCNUMBER")
         }));
+        assert_eq!(metadata_editor_open_add(&mut state), None);
+        state.add_key_input = Some(super::super::text_input::TextInputState::new(
+            "DISCNUMBER".to_string(),
+        ));
+        let (tx, _rx) = mpsc::channel(1);
+        handle_metadata_editor_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut state,
+            &tx,
+        );
         let disc_index = state
             .active_surface()
             .entries
             .iter()
             .position(|entry| entry.display_key.eq_ignore_ascii_case("DISCNUMBER"))
-            .expect("native DISCNUMBER edit row");
-        state.cursor = disc_index;
-        assert_eq!(metadata_editor_begin_cursor_value_edit(&mut state, true), None);
+            .expect("user-added native DISCNUMBER row");
+        assert_eq!(state.cursor, disc_index);
+        assert_eq!(state.phase, crate::tui::app::MetadataEditorPhase::InlineEdit);
+        let disc = &state.active_surface().entries[disc_index];
+        assert_eq!(disc.row_scope, crate::tui::probe::RowScope::File);
+        assert_eq!(disc.per_file_values.len(), 2);
+        let expected_disc_values = state
+            .active_surface()
+            .paths
+            .iter()
+            .map(|path| {
+                if path == &lp1_image {
+                    "1"
+                } else if path == &lp2_image {
+                    "2"
+                } else {
+                    panic!("unexpected native DISCNUMBER target: {}", path.display());
+                }
+            })
+            .collect::<Vec<_>>();
         state.edit_input = Some(super::super::text_input::TextInputState::new(
-            "1; !".to_string(),
+            expected_disc_values.join("; "),
         ));
         assert!(metadata_editor_commit_inline_edit(&mut app, &mut state));
-        let (native_plan, targets) = metadata_album_view_plan(
-            &state,
-            MetadataAlbumCarrierWriteMode::Authoritative,
-        )
-        .expect("native-authoritative DISCNUMBER plan");
-        assert_eq!(targets, vec![IndividualFiles, IndividualFiles]);
-        assert!(native_plan.sidecars.is_empty());
-        assert_eq!(native_plan.audio.len(), 2);
-        assert!(native_plan.audio.iter().all(|audio| {
-            audio.snapshots.iter().any(|snapshot| {
-                snapshot.display_key == "DISCNUMBER"
-                    && snapshot.row_scope == crate::tui::probe::RowScope::File
-                    && snapshot.values != snapshot.originals
-            })
-        }));
+        let disc = &state.active_surface().entries[disc_index];
+        assert_eq!(
+            disc.per_file_values
+                .iter()
+                .map(|value| value.as_str())
+                .collect::<Vec<_>>(),
+            expected_disc_values,
+        );
+        assert_ne!(disc.per_file_values, disc.per_file_originals);
         let (state, results, status) = save_through_production_path(&mut app, state).await;
         assert!(
             !results.iter().any(|result| matches!(
@@ -103174,16 +103227,34 @@ FILE "a.flac" WAVE
             temp.path(),
             vec![IndividualFiles, SidecarCue, EmbeddedCue],
         );
+        assert_eq!(state.active_surface().label, "File tags");
         let reopened = state
             .active_surface()
             .entries
             .iter()
             .find(|entry| entry.display_key.eq_ignore_ascii_case("DISCNUMBER"))
             .expect("reopened native DISCNUMBER");
-        assert_eq!(reopened.row_scope, crate::tui::probe::RowScope::Track);
+        assert_eq!(reopened.row_scope, crate::tui::probe::RowScope::File);
         assert_eq!(
-            reopened.per_file_values.iter().map(|value| value.as_str()).collect::<Vec<_>>(),
-            vec!["1", "2"],
+            reopened
+                .per_file_values
+                .iter()
+                .map(|value| value.as_str())
+                .collect::<Vec<_>>(),
+            state
+                .active_surface()
+                .paths
+                .iter()
+                .map(|path| {
+                    if path == &lp1_image {
+                        "1"
+                    } else if path == &lp2_image {
+                        "2"
+                    } else {
+                        panic!("unexpected reopened native carrier: {}", path.display());
+                    }
+                })
+                .collect::<Vec<_>>(),
         );
         assert_eq!(reopened.per_file_values, reopened.per_file_originals);
         assert!(!state.active_surface().dirty);
