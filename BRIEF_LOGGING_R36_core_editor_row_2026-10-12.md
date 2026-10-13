@@ -14,8 +14,10 @@ assertion failed: entries.iter().all(|e| !e.display_key.eq_ignore_ascii_case("DI
 
 `ensure_standard_fields_present` (`src/tui/probe.rs:8556`) pushes an empty entry
 for every member of `CORE_EDITOR_FIELDS` that a file lacks, and `DISCNUMBER` is
-one of its thirteen. It runs on the ordinary read path. So a DISCNUMBER row is
-present on every File tags surface, and the assertion cannot hold for any file.
+one of its thirteen. `read_all_tags_merged` reaches it through
+`sort_entries_standard_first_with_file_count`, so a DISCNUMBER row is present on
+every File tags surface and the assertion cannot hold for any file.
+`sort_entries_standard_first_existing_only` is the variant that does not inject.
 
 The row is not coming from disk. The fixture FLACs are bare sine tones with no
 tags, and the byte-identity assertions at `:103034` and `:103086` pass.
