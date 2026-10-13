@@ -17,9 +17,10 @@ section 24.
 
 **Six of the files named in section 26 are source-locked:**
 `semantic_plan.rs`, `plan.rs`, `plugins.rs`, `fingerprint.rs`,
-`plan_bridge.rs`, `stages.rs`. The planner work cannot avoid them, so this
-round will unbind the installed Reference qualification and require a full
-requalification on acceptance. The UI-side files it names are not locked.
+`plan_bridge.rs`, `stages.rs`. Section 26 lists them as files to inspect;
+inspecting costs nothing, but editing any of them unbinds the installed
+Reference qualification and requires a full requalification on acceptance. The
+UI-side files it names are not locked.
 
 ## State of the tree
 
