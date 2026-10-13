@@ -103143,34 +103143,26 @@ FILE "a.flac" WAVE
             );
         }
 
-        // A File tags presentation does not fabricate the Album view's
-        // DISCNUMBER row. Add it through the user-facing editor route instead
-        // of seeding the carriers or manually inserting a test-only row.
-        assert!(state.active_surface().entries.iter().all(|entry| {
-            !entry.display_key.eq_ignore_ascii_case("DISCNUMBER")
-        }));
-        assert_eq!(metadata_editor_open_add(&mut state), None);
-        state.add_key_input = Some(super::super::text_input::TextInputState::new(
-            "DISCNUMBER".to_string(),
-        ));
-        let (tx, _rx) = mpsc::channel(1);
-        handle_metadata_editor_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            &mut state,
-            &tx,
-        );
+        // File tags always exposes a synthesized empty DISCNUMBER core row,
+        // even when neither FLAC stores the tag. Edit that existing row via
+        // the editor rather than trying to add a duplicate key.
         let disc_index = state
             .active_surface()
             .entries
             .iter()
             .position(|entry| entry.display_key.eq_ignore_ascii_case("DISCNUMBER"))
-            .expect("user-added native DISCNUMBER row");
-        assert_eq!(state.cursor, disc_index);
+            .expect("empty native DISCNUMBER core row");
+        {
+            let disc = &state.active_surface().entries[disc_index];
+            assert_eq!(disc.row_scope, crate::tui::probe::RowScope::File);
+            assert_eq!(disc.per_file_values.len(), 2);
+            assert_eq!(disc.per_file_stored_value_counts, vec![0, 0]);
+            assert!(disc.per_file_values.iter().all(|value| value.as_str().is_empty()));
+            assert_eq!(disc.per_file_values, disc.per_file_originals);
+        }
+        state.cursor = disc_index;
+        assert_eq!(metadata_editor_begin_cursor_value_edit(&mut state, true), None);
         assert_eq!(state.phase, crate::tui::app::MetadataEditorPhase::InlineEdit);
-        let disc = &state.active_surface().entries[disc_index];
-        assert_eq!(disc.row_scope, crate::tui::probe::RowScope::File);
-        assert_eq!(disc.per_file_values.len(), 2);
         let expected_disc_values = state
             .active_surface()
             .paths
