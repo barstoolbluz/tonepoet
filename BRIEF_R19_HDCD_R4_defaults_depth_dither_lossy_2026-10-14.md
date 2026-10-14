@@ -23,8 +23,10 @@ five more sat behind it.
 ## Gate: 7466 passed / 14 failed
 
 One is the expected source-lock freshness failure: `semantic_plan.rs`,
-`fingerprint.rs` and `stages.rs` all moved, so requalification is owed. The
-rest are real — each fails 1 of 1 alone.
+`fingerprint.rs` and `stages.rs` all moved, so requalification is owed. Of the
+remaining thirteen we ran ten in isolation and each failed 1 of 1; the three we
+did not run alone are `db::` v23 migration tests in the same family as the
+rest. None look like the known contention flake.
 
 ### Ten failures, one cause: the v28 migration assumes a table that does not exist yet
 
@@ -34,11 +36,16 @@ migrate v25 database through current schema:
   "v28 HDCD migration: no such table: analysis_cache"
 ```
 
-Every upgrade path from v21 through v27 dies at v28. It takes with it eight
-`db::` migration tests, the v23-to-v24 startup protocol test, and
-`recent_files::remove_with_db_failure_preserves_memory_for_restart_consistency`.
+`migrate_v28` runs `ALTER TABLE analysis_cache ADD COLUMN`, while that table's
+`CREATE` lives in the schema-creation path, so a stepwise migration reaches the
+ALTER first. Every upgrade path the tests cover — v21 through v27 — dies there,
+taking eight `db::` migration tests, the v23-to-v24 startup protocol test and
+`recent_files::remove_with_db_failure_preserves_memory_for_restart_consistency`
+with it.
 
-Any existing installation would fail to open its database after this change.
+We did not open a real installed database, so the blast radius is inferred from
+those tests rather than observed. On their evidence any database going through
+stepwise migration fails to open; a fresh install should be unaffected.
 
 ### One more: the HDCD preset provenance test
 
@@ -54,12 +61,12 @@ below depends on.
 
 ## One field observation, relevant to section 3 of the assignment
 
-Turning HDCD Decode on does not widen the bit depth in practice. The widening
-exists and works: with an untouched depth we measured `Int16` become `Int24`
-with `hdcd_promoted_from_depth = Some(Int16)`. It is suppressed by
+Reported from the field: turning HDCD Decode on does not widen the bit depth.
+The widening does work — with an untouched depth we measured `Int16` become
+`Int24` with `hdcd_promoted_from_depth = Some(Int16)`. It requires
 `!self.bit_depth_overridden`, and applying a preset that carries a bit depth
 calls `mark_bit_depth_user_policy()` (`src/tui/presets.rs:876`), which sets that
-flag. A preset written before HDCD existed therefore silences the promotion,
+flag and so suppresses the promotion for the rest of the session. A preset written before HDCD existed therefore silences the promotion,
 and the user learns only at conversion time, from the refusal in
 `execute_commit_with_source_options_transform`.
 
