@@ -642,6 +642,26 @@ pub enum RegisteredUnaryEffect {
     /// Backend-neutral Red Book CD de-emphasis intent. Physical planning may
     /// realize this with a qualified SoX-ng or FFmpeg candidate.
     CdDeemphasis,
+    /// Source-control-bit HDCD decode. The identity prevents queuing a
+    /// source that was replaced after an effectual HDCD scan.
+    HdcdDecode {
+        source_size_bytes: u64,
+        source_modified_ns: i64,
+        /// Empty for an ordinary single-track file. For a CUE image, only the
+        /// listed, independently scanned tracks may consume the decoder.
+        #[cfg_attr(feature = "serde", serde(default))]
+        cue_segments: Vec<HdcdCueSegment>,
+    },
+}
+
+/// Sample-exact CUE member authorized by an effectual, bounded HDCD scan.
+/// A track's ordinal, not its mutable display name, binds its source range.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct HdcdCueSegment {
+    pub source_ordinal: u32,
+    pub start_sample: u64,
+    pub sample_count: u64,
 }
 
 /// Placement of a registered effect relative to the one semantic PCM resampler.
@@ -658,6 +678,9 @@ pub enum EffectPlacement {
     /// Run at the source rate before the one PCM resampler when present, or
     /// before terminal encoding when no rate conversion is required.
     SourceRate,
+    /// Strictly first sample-domain transform, before other source-rate
+    /// effects and before a PCM resampler. Valid only for HDCD decoding.
+    SourceBitstreamDecode,
 }
 
 /// One effect instance plus explicit predecessor constraints.
@@ -2463,6 +2486,44 @@ fn plan_typed_with_effects_and_policy(
             code: "invalid_request".to_owned(),
             reason: error.to_string(),
         }));
+    }
+
+    if effects.iter().any(|intent| matches!(intent.effect, RegisteredUnaryEffect::HdcdDecode { .. })) {
+        let source = &request.source;
+        let original_int16 = source.authoritative_pcm_depth() == Some(PcmBitDepth::Int16);
+        let is_integer_pcm = matches!(source.sample_kind,
+            Some(crate::enums::SampleKind::SignedInteger | crate::enums::SampleKind::UnsignedInteger));
+        if source.is_dsd()
+            || source.representation_kind() != SourceRepresentationKind::Pcm
+            || source.codec.is_lossy()
+            || !original_int16 || !is_integer_pcm
+            || source.sample_rate_hz != Some(44_100)
+            || !matches!(source.channels, Some(1 | 2))
+        {
+            return Ok(PlanningOutcome::Refused(PlanRefusal {
+                code: "hdcd_source_ineligible".to_owned(),
+                reason: "HDCD Decode requires an identified lossless integer PCM 16-bit/44.1-kHz mono/stereo source".to_owned(),
+            }));
+        }
+        if true_peak_policy(intent.gain_policy).is_some() {
+            return Ok(PlanningOutcome::Refused(PlanRefusal {
+                code: "hdcd_certified_true_peak_unqualified".to_owned(),
+                reason: "HDCD Decode with certified true-peak Guard/Normalize is not qualified; turn off one option".to_owned(),
+            }));
+        }
+        let lossless = request.settings.target_format.is_pcm_lossless()
+            && !(request.settings.target_format == AudioFormat::WavPack && request.settings.wavpack.hybrid);
+        let target_int16 = match request.settings.target_bit_depth {
+            BitDepthTarget::Pcm(PcmBitDepth::Int16) => true,
+            BitDepthTarget::Source => source.authoritative_pcm_depth() == Some(PcmBitDepth::Int16),
+            _ => false,
+        };
+        if lossless && target_int16 {
+            return Ok(PlanningOutcome::Refused(PlanRefusal {
+                code: "hdcd_decoded_int16_truncation".to_owned(),
+                reason: "HDCD Decode restores up to 20-bit signal precision; choose Int24 or a wider lossless target".to_owned(),
+            }));
+        }
     }
 
     let (pre_resample_effects, post_resample_effects) =
@@ -5468,7 +5529,32 @@ fn validate_effect_dependencies(
             });
         }
     }
+    let hdcd = effects.iter().filter(|effect| {
+        matches!(effect.effect, RegisteredUnaryEffect::HdcdDecode { .. })
+    }).collect::<Vec<_>>();
+    if hdcd.len() > 1 {
+        return Err(PlanRefusal {
+            code: "hdcd_duplicate_decoder".to_owned(),
+            reason: "only one source-bitstream HDCD decoder may be registered".to_owned(),
+        });
+    }
+    if let Some(decoder) = hdcd.first() {
+        if decoder.placement != EffectPlacement::SourceBitstreamDecode || !decoder.after.is_empty() {
+            return Err(PlanRefusal {
+                code: "hdcd_must_execute_first".to_owned(),
+                reason: "HDCD Decode must be placed before every other sample-domain effect".to_owned(),
+            });
+        }
+    }
     for effect in effects {
+        if effect.placement == EffectPlacement::SourceBitstreamDecode
+            && !matches!(effect.effect, RegisteredUnaryEffect::HdcdDecode { .. })
+        {
+            return Err(PlanRefusal {
+                code: "hdcd_phase_reserved".to_owned(),
+                reason: "source-bitstream decode placement is reserved for HDCD".to_owned(),
+            });
+        }
         for dependency in &effect.after {
             if *dependency == effect.id {
                 return Err(PlanRefusal {
@@ -5556,7 +5642,18 @@ fn order_registered_effect_partitions(
         Ok(ordered)
     };
 
-    Ok((strict_order(&pre_members)?, strict_order(&post_members)?))
+    let before = strict_order(&pre_members)?;
+    if effects.iter().any(|effect| {
+        matches!(effect.effect, RegisteredUnaryEffect::HdcdDecode { .. })
+    }) && !matches!(before.first().map(|effect| &effect.effect),
+        Some(RegisteredUnaryEffect::HdcdDecode { .. }))
+    {
+        return Err(PlanRefusal {
+            code: "hdcd_must_execute_first".to_owned(),
+            reason: "source-bitstream HDCD must be the first ordered effect".to_owned(),
+        });
+    }
+    Ok((before, strict_order(&post_members)?))
 }
 
 /// Resolve effect constraints to one deterministic semantic order.
@@ -5666,6 +5763,13 @@ pub fn registered_effect_candidates(
                 contract: plain,
             }]
         }
+        RegisteredUnaryEffect::HdcdDecode { .. } => vec![EffectLowering {
+            tool: ToolIdentifier::Ffmpeg,
+            arguments: EffectArgumentMapping::FfmpegAudioFilter(
+                "hdcd=bits_per_sample=16:disable_autoconvert=1".to_owned(),
+            ),
+            contract: deemphasis_contract(),
+        }],
         RegisteredUnaryEffect::CdDeemphasis => vec![
             EffectLowering {
                 tool: ToolIdentifier::Sox,
@@ -10872,5 +10976,149 @@ mod tests {
             panic!("BeforePcmResample without a resample must refuse")
         };
         assert_eq!(refusal.code, "effect_before_resample_without_resample");
+    }
+
+    fn hdcd_16_44100_request() -> PlanRequest {
+        let mut request = pcm_request(SampleGainPolicy::Off);
+        request.source.sample_rate_hz = Some(44_100);
+        request.source.bit_depth = Some(PcmBitDepth::Int16);
+        request.source.true_source_depth = Some(PcmBitDepth::Int16);
+        request.settings.target_sample_rate = RateTarget::PcmHz(44_100);
+        request.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
+        request
+    }
+
+    fn hdcd_effect() -> EffectIntent {
+        EffectIntent {
+            id: EffectInstanceId(901),
+            effect: RegisteredUnaryEffect::HdcdDecode {
+                source_size_bytes: 4096,
+                source_modified_ns: 1_234_567_890,
+                cue_segments: Vec::new(),
+            },
+            after: Vec::new(),
+            placement: EffectPlacement::SourceBitstreamDecode,
+        }
+    }
+
+    #[test]
+    fn hdcd_ordinary_same_rate_lossless_and_lossy_have_no_resampler() {
+        for (format, output) in [
+            (AudioFormat::Flac, "out.flac"),
+            (AudioFormat::Mp3, "out.mp3"),
+        ] {
+            let mut request = hdcd_16_44100_request();
+            request.settings.target_format = format;
+            request.output_path = PathBuf::from(output);
+            let Ok(PlanningOutcome::Ready(plan)) =
+                plan_typed_with_effects(&request, &[hdcd_effect()])
+            else { panic!("HDCD same-rate route must be admitted: {output}") };
+            let decoders = plan.nodes.iter().filter(|node| matches!(node,
+                TypedPlanNode::ApplyEffect { instance, lowering, .. }
+                    if matches!(instance.effect, RegisteredUnaryEffect::HdcdDecode { .. })
+                        && lowering.tool == ToolIdentifier::Ffmpeg
+                        && matches!(&lowering.arguments,
+                            EffectArgumentMapping::FfmpegAudioFilter(filter)
+                                if filter == "hdcd=bits_per_sample=16:disable_autoconvert=1")
+            )).count();
+            assert_eq!(decoders, 1, "one source-first HDCD decode");
+            assert!(!plan.nodes.iter().any(|node| matches!(node,
+                TypedPlanNode::Operation { operation: PlanOperation::ResamplePcm { .. }, .. }
+            )), "same-rate HDCD must not resample");
+        }
+    }
+
+    #[test]
+    fn hdcd_keeps_frozen_ssrc_and_backend_selected_resamplers() {
+        for backend in [PreferredTool::Ssrc, PreferredTool::Sox, PreferredTool::Ffmpeg] {
+            let mut request = if backend == PreferredTool::Ssrc {
+                forced_ssrc_wav_request(PcmBitDepth::Int24, DitherType::None)
+            } else {
+                hdcd_16_44100_request()
+            };
+            request.source.sample_rate_hz = Some(44_100);
+            request.source.bit_depth = Some(PcmBitDepth::Int16);
+            request.source.true_source_depth = Some(PcmBitDepth::Int16);
+            request.settings.target_format = AudioFormat::Flac;
+            request.output_path = PathBuf::from("out.flac");
+            request.settings.target_sample_rate = RateTarget::PcmHz(88_200);
+            request.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
+            request.settings.preferred_tool = backend.clone();
+            let Ok(PlanningOutcome::Ready(plan)) =
+                plan_typed_with_effects(&request, &[hdcd_effect()])
+            else { panic!("HDCD must compose with the user-selected resampler") };
+            let decoder_index = plan.nodes.iter().position(|node| matches!(node,
+                TypedPlanNode::ApplyEffect { instance, .. }
+                    if matches!(instance.effect, RegisteredUnaryEffect::HdcdDecode { .. })
+            )).expect("HDCD effect node");
+            let resamplers = plan.nodes.iter().enumerate().filter_map(|(idx, node)| match node {
+                TypedPlanNode::Operation {
+                    operation: PlanOperation::ResamplePcm { .. },
+                    candidates, selected_candidate, ..
+                } => Some((idx, candidates[*selected_candidate].tool.clone())),
+                _ => None,
+            }).collect::<Vec<_>>();
+            assert_eq!(resamplers.len(), 1);
+            assert!(decoder_index < resamplers[0].0);
+            let expected = match backend {
+                PreferredTool::Ssrc => ToolIdentifier::Ssrc,
+                PreferredTool::Sox => ToolIdentifier::Sox,
+                PreferredTool::Ffmpeg => ToolIdentifier::Ffmpeg,
+                _ => unreachable!(),
+            };
+            assert_eq!(resamplers[0].1, Some(expected));
+        }
+    }
+
+    #[test]
+    fn hdcd_precedes_deemphasis_and_the_one_selected_resampler() {
+        let mut request = hdcd_16_44100_request();
+        request.settings.target_sample_rate = RateTarget::PcmHz(88_200);
+        let mut deemphasis = cd_deemphasis_source_rate_effect();
+        deemphasis.after.push(hdcd_effect().id);
+        let Ok(PlanningOutcome::Ready(plan)) =
+            plan_typed_with_effects(&request, &[deemphasis, hdcd_effect()])
+        else { panic!("HDCD must precede de-emphasis on the source signal") };
+        let hdcd_index = plan.nodes.iter().position(|node| matches!(node,
+            TypedPlanNode::ApplyEffect { instance, .. }
+                if matches!(instance.effect, RegisteredUnaryEffect::HdcdDecode { .. })
+        )).expect("HDCD node");
+        let deemphasis_index = plan.nodes.iter().position(|node| matches!(node,
+            TypedPlanNode::ApplyEffect { instance, .. }
+                if instance.effect == RegisteredUnaryEffect::CdDeemphasis
+        )).expect("de-emphasis node");
+        let resample_index = plan.nodes.iter().position(|node| matches!(node,
+            TypedPlanNode::Operation { operation: PlanOperation::ResamplePcm { .. }, .. }
+        )).expect("one resampler");
+        assert!(hdcd_index < deemphasis_index && deemphasis_index < resample_index);
+    }
+
+    #[test]
+    fn hdcd_refuses_narrow_terminal_unqualified_observation_and_ineligible_input() {
+        let mut request = hdcd_16_44100_request();
+        request.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int16);
+        let Ok(PlanningOutcome::Refused(refusal)) =
+            plan_typed_with_effects(&request, &[hdcd_effect()])
+        else { panic!("HDCD must refuse lossless Int16 truncation") };
+        assert_eq!(refusal.code, "hdcd_decoded_int16_truncation");
+
+        request.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
+        request.settings.pcm_true_peak.policy = SampleGainPolicy::TruePeakGuard {
+            target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            scope: TruePeakScope::Track,
+            scan: TruePeakScanTier::Standard,
+        };
+        let Ok(PlanningOutcome::Refused(refusal)) =
+            plan_typed_with_effects(&request, &[hdcd_effect()])
+        else { panic!("HDCD must not precede unqualified certified observations") };
+        assert_eq!(refusal.code, "hdcd_certified_true_peak_unqualified");
+
+        request.settings.pcm_true_peak.policy = SampleGainPolicy::Off;
+        request.source.true_source_depth = Some(PcmBitDepth::Int24);
+        request.source.bit_depth = Some(PcmBitDepth::Int24);
+        let Ok(PlanningOutcome::Refused(refusal)) =
+            plan_typed_with_effects(&request, &[hdcd_effect()])
+        else { panic!("HDCD cannot be inserted on unqualified bit depths") };
+        assert_eq!(refusal.code, "hdcd_source_ineligible");
     }
 }

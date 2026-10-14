@@ -136,6 +136,7 @@ pub async fn run_app(
         check_pending_browse_rename(app);
         check_batch_probe_debounce(app, &tx);
         check_deemphasis_batch_preflight(app, &tx);
+        let _ = super::app::ensure_convert_hdcd_scan(app, &tx);
         if !input_waiting_at_frame_start {
             check_browse_probe_debounce(app, &tx);
         }
@@ -6530,6 +6531,75 @@ fn handle_convert_audio_probe_complete(
     publish_probe_status_with_sentinel_clamp(app, status, was_sentinel_selected);
 }
 
+
+/// Commit Details analysis using the file identity captured before its HDCD
+/// worker ran. Only facts returned by this worker can authorize a structured
+/// cache write; previously merged display facts are not a new HDCD scan.
+fn store_details_analysis_facts(
+    db: &crate::db::Database,
+    path: &std::path::Path,
+    modified: std::time::SystemTime,
+    size: u64,
+    merged: &super::app::MetadataAnalysisFacts,
+    scanned_hdcd: Option<super::analyze::HdcdCapabilities>,
+) -> Result<(), String> {
+    if let Some(capabilities) = scanned_hdcd {
+        let nanos = modified.duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| "HDCD scan timestamp precedes Unix epoch")?
+            .as_nanos();
+        let modified_ns = i64::try_from(nanos)
+            .map_err(|_| "HDCD scan timestamp exceeds identity range")?;
+        db.store_cached_hdcd_capabilities(
+            path,
+            capabilities,
+            super::analyze::HdcdFileIdentity { byte_len: size, modified_ns },
+        )?;
+    }
+    // The narrow metadata write follows the typed write so it retains the
+    // detector's human-readable detail as well as any PRE facts.
+    db.store_metadata_analysis_facts(
+        &path.to_string_lossy(), crate::db::systemtime_to_unix(modified), size, merged,
+    )
+}
+
+fn handle_convert_hdcd_scan_complete(
+    app: &mut AppState,
+    generation: u64,
+    paths: Vec<std::path::PathBuf>,
+    results: Vec<(std::path::PathBuf, super::app::ConvertHdcdPathState)>,
+) {
+    if generation != app.probe_generation || app.convert.source.mode.all_paths() != paths {
+        // A same-path generation refresh invalidates in-flight worker state.
+        if app.convert.source.mode.all_paths() == paths
+            && app.convert.source.hdcd_scan_generation == Some(generation)
+        {
+            app.convert.source.hdcd_scan_pending = false;
+        }
+        return;
+    }
+    if app.convert.source.hdcd_scan_generation != Some(generation) {
+        return;
+    }
+    app.convert.source.hdcd_scan_pending = false;
+    let mut accepted = std::collections::BTreeMap::new();
+    for (path, mut state) in results {
+        if !state.identity_current(&path) {
+            state.capabilities = None;
+            for track in &mut state.cue_tracks { track.capabilities = None; }
+        }
+        if let (Some(identity), Some(capabilities)) = (state.identity, state.capabilities) {
+            if let Err(error) = app.db.store_cached_hdcd_capabilities(
+                &path, capabilities, identity,
+            ) {
+                log::debug!("HDCD capability cache write skipped for {}: {error}", path.display());
+            }
+        }
+        accepted.insert(path, state);
+    }
+    app.convert.source.hdcd_scan_results = accepted;
+    app.convert.format.set_convert_hdcd_summary(&app.convert.source.hdcd_scan_results);
+}
+
 fn handle_convert_deemphasis_batch_preflight_complete(
     app: &mut AppState,
     tx: &mpsc::Sender<AppMessage>,
@@ -7879,6 +7949,9 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 probe_notice,
                 baseline,
             );
+        }
+        AppMessage::ConvertHdcdScanComplete { generation, paths, results } => {
+            handle_convert_hdcd_scan_complete(app, generation, paths, results);
         }
         AppMessage::ConvertDeemphasisBatchPreflightComplete { generation, paths, results } => {
             handle_convert_deemphasis_batch_preflight_complete(
@@ -9472,12 +9545,13 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                                 if let (Some(modified), Some(size)) =
                                     (item.modified.clone(), item.file_size)
                                 {
-                                    let mtime = crate::db::systemtime_to_unix(modified);
-                                    if let Err(err) = app.db.store_metadata_analysis_facts(
-                                        &item.path.display().to_string(),
-                                        mtime,
+                                    if let Err(err) = store_details_analysis_facts(
+                                        &app.db,
+                                        &item.path,
+                                        modified,
                                         size,
                                         &facts_to_store,
+                                        item.facts.hdcd_capabilities,
                                     ) {
                                         store_errors = store_errors.saturating_add(1);
                                         log::error!("analysis facts cache store failed: {}", err);
@@ -23464,5 +23538,140 @@ mod host_clipboard_picker_ownership_tests {
             tui_file_picker::FilePickerAction::None,
         );
         assert_eq!(session.picker.current_dir(), destination.as_path());
+    }
+}
+
+
+#[cfg(test)]
+mod hdcd_scan_lifecycle_and_details_cache_tests {
+    use super::*;
+    use crate::config::TonepoetConfig;
+    use crate::tui::analyze::{hdcd_file_identity, HdcdCapabilities};
+
+    fn facts() -> HdcdCapabilities {
+        HdcdCapabilities {
+            detected: true,
+            peak_extend: true,
+            low_level_gain_adjustment: false,
+            transient_filter: false,
+            max_gain_adjustment_db: 0.0,
+        }
+    }
+
+    #[test]
+    fn completed_hdcd_batch_stays_idle_without_member_filesystem_access() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let paths: Vec<_> = (0..512).map(|n| temp.path().join(format!("missing-{n}.flac")))
+            .collect();
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Convert;
+        app.probe_generation = 93;
+        app.convert.set_source_mode(super::super::app::SourceMode::from_paths(paths.clone()));
+        app.convert.source.hdcd_scan_generation = Some(app.probe_generation);
+        for path in &paths {
+            app.convert.source.hdcd_scan_results.insert(path.clone(),
+                super::super::app::ConvertHdcdPathState {
+                    eligible: true,
+                    // The phantom paths cannot be statted successfully. A
+                    // completed generation must not try to restat or rescan.
+                    identity: Some(super::super::analyze::HdcdFileIdentity {
+                        byte_len: 12, modified_ns: 1_700_000_000_000_000_000,
+                    }),
+                    capabilities: Some(facts()),
+                    ..Default::default()
+                });
+        }
+        let (tx, _rx) = mpsc::channel(8);
+        for _ in 0..100 {
+            assert!(super::super::app::ensure_convert_hdcd_scan(&mut app, &tx));
+            assert!(!app.convert.source.hdcd_scan_pending);
+        }
+        assert_eq!(app.convert.source.hdcd_scan_results.len(), paths.len());
+        assert_eq!(app.convert.source.hdcd_scan_generation, Some(93));
+    }
+
+    #[tokio::test]
+    async fn same_path_reload_or_replacement_requests_new_hdcd_generation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("song.flac");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Convert;
+        app.probe_generation = 7;
+        app.convert.set_source_mode(super::super::app::SourceMode::from_single_pending_probe(
+            path.clone(), None,
+        ));
+        app.convert.source.hdcd_scan_generation = Some(7);
+        app.convert.source.hdcd_scan_results.insert(path.clone(), Default::default());
+
+        // Reloading the identical path increments the source generation.
+        app.probe_generation = 8;
+        app.convert.set_source_mode(super::super::app::SourceMode::from_single_pending_probe(
+            path.clone(), None,
+        ));
+        let (tx, _rx) = mpsc::channel(8);
+        assert!(!super::super::app::ensure_convert_hdcd_scan(&mut app, &tx));
+        assert!(app.convert.source.hdcd_scan_pending);
+        assert_eq!(app.convert.source.hdcd_scan_generation, Some(8));
+
+        // A different source clears the old inventory and starts its own scan.
+        app.probe_generation = 9;
+        let replacement = temp.path().join("replacement.flac");
+        app.convert.set_source_mode(super::super::app::SourceMode::from_single_pending_probe(
+            replacement, None,
+        ));
+        assert!(app.convert.source.hdcd_scan_results.is_empty());
+        assert_eq!(app.convert.source.hdcd_scan_generation, None);
+        assert!(!super::super::app::ensure_convert_hdcd_scan(&mut app, &tx));
+        assert_eq!(app.convert.source.hdcd_scan_generation, Some(9));
+    }
+
+    #[test]
+    fn details_analysis_populates_convert_cache_using_scan_time_identity() {
+        let db = crate::db::Database::open_memory().expect("database");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("song.flac");
+        std::fs::write(&path, b"HDCD fixture identity").expect("source bytes");
+        let metadata = std::fs::metadata(&path).expect("source metadata");
+        let modified = metadata.modified().expect("source timestamp");
+        let size = metadata.len();
+        let merged = super::super::app::MetadataAnalysisFacts {
+            hdcd_detected: Some(true),
+            hdcd_detail: Some("Peak Extend detected".to_string()),
+            hdcd_capabilities: Some(facts()),
+            ..Default::default()
+        };
+        // This is the same persistence function called by the real Details
+        // completion handler. Convert reads the structured row directly.
+        store_details_analysis_facts(&db, &path, modified, size, &merged, Some(facts()))
+            .expect("Details completion cache write");
+        assert_eq!(db.get_cached_hdcd_capabilities(&path), Some(facts()));
+        let cached = db.get_cached_metadata_analysis_facts(
+            &path.to_string_lossy(), crate::db::systemtime_to_unix(modified), size,
+        ).expect("Details human-readable cache facts");
+        assert_eq!(cached.hdcd_detail.as_deref(), Some("Peak Extend detected"));
+
+        std::fs::write(&path, b"changed bytes and length").expect("source replacement");
+        assert!(store_details_analysis_facts(
+            &db, &path, modified, size, &merged, Some(facts()),
+        ).is_err(), "stale Details facts cannot authorize a new Convert cache entry");
+        assert_eq!(db.get_cached_hdcd_capabilities(&path), None);
+    }
+
+    #[test]
+    fn completed_scan_identity_is_still_checked_at_commit_boundary() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("changed.flac");
+        std::fs::write(&path, b"initial").expect("source");
+        let identity = hdcd_file_identity(&path).expect("scan identity");
+        let state = super::super::app::ConvertHdcdPathState {
+            eligible: true,
+            identity: Some(identity),
+            capabilities: Some(facts()),
+            ..Default::default()
+        };
+        assert!(state.identity_current(&path));
+        std::fs::write(&path, b"replacement is longer").expect("mutate source");
+        assert!(!state.identity_current(&path),
+            "commit's existing identity-current predicate must reject stale scan facts");
     }
 }

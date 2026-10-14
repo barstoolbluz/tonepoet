@@ -10104,6 +10104,45 @@ fn set_request_cd_deemphasis(
     });
 }
 
+/// Install a guarded source-bitstream HDCD decode only for a member whose
+/// current scan proves actionable PE/LLE. Remove old decoder dependencies on
+/// every commit to keep the transformation idempotent.
+fn set_request_hdcd_decode(
+    request: &mut crate::convert::pipeline::PipelineRequest,
+    binding: Option<(crate::tui::analyze::HdcdFileIdentity, Vec<tonepoet_pipeline::HdcdCueSegment>)>,
+) {
+    use tonepoet_pipeline::{EffectInstanceId, EffectIntent, EffectPlacement, RegisteredUnaryEffect};
+    let old_id = request.registered_effects.iter().find_map(|intent| {
+        matches!(intent.effect, RegisteredUnaryEffect::HdcdDecode { .. }).then_some(intent.id)
+    });
+    request.registered_effects.retain(|intent| {
+        !matches!(intent.effect, RegisteredUnaryEffect::HdcdDecode { .. })
+    });
+    if let Some(old_id) = old_id {
+        for intent in &mut request.registered_effects {
+            intent.after.retain(|dependency| *dependency != old_id);
+        }
+    }
+    let Some((identity, cue_segments)) = binding else { return; };
+    let id = EffectInstanceId(request.registered_effects.iter().map(|effect| effect.id.0)
+        .max().unwrap_or(0).saturating_add(1));
+    for intent in &mut request.registered_effects {
+        if intent.placement != EffectPlacement::AfterPcmResample {
+            intent.after.push(id);
+        }
+    }
+    request.registered_effects.push(EffectIntent {
+        id,
+        effect: RegisteredUnaryEffect::HdcdDecode {
+            source_size_bytes: identity.byte_len,
+            source_modified_ns: identity.modified_ns,
+            cue_segments,
+        },
+        after: Vec::new(),
+        placement: EffectPlacement::SourceBitstreamDecode,
+    });
+}
+
 /// Return `request` after applying the Convert-screen selected presentation to
 /// `request.source`.
 #[must_use]
@@ -10200,6 +10239,46 @@ fn execute_commit_with_source_options_transform(
     {
         app.set_status("pre-emphasis source scan is still completing — commit again when it finishes");
         return;
+    }
+
+    // Every member must have completed its HDCD scan before an automatic
+    // policy can be frozen. An explicit Off also waits for these facts so the
+    // batch cannot misattribute another member's decoder to this request.
+    if app.convert.source.hdcd_scan_pending || batch.iter().any(|path| {
+        !app.convert.source.hdcd_scan_results.contains_key(path)
+    }) {
+        app.set_status("HDCD source scan is still completing — commit again when it finishes");
+        return;
+    }
+    if batch.iter().any(|path| {
+        let state = &app.convert.source.hdcd_scan_results[path];
+        !state.identity_current(path) || !state.resolved()
+    }) {
+        app.set_status("HDCD source analysis is incomplete or stale — reselect the source before committing");
+        return;
+    }
+    let hdcd_path_states = app.convert.source.hdcd_scan_results.clone();
+    let hdcd_decode_enabled = app.convert.format.hdcd_decode_enabled;
+    let hdcd_actionable = hdcd_path_states.values().any(|state| state.has_actionable());
+    if hdcd_decode_enabled && hdcd_actionable {
+        let format = &app.convert.format;
+        let lossless = matches!(*format.format.selected_value(),
+            crate::convert::formats::AudioFormat::Flac | crate::convert::formats::AudioFormat::Wav
+            | crate::convert::formats::AudioFormat::Aiff | crate::convert::formats::AudioFormat::WavPack
+            | crate::convert::formats::AudioFormat::Alac | crate::convert::formats::AudioFormat::Lpcm)
+            && !(*format.format.selected_value() == crate::convert::formats::AudioFormat::WavPack && format.wavpack_hybrid);
+        let depth16 = matches!(*format.bit_depth.selected_value(),
+            super::app::BitDepthChoice::Source | super::app::BitDepthChoice::Int16);
+        if lossless && depth16 {
+            app.set_status("HDCD Decode restores up to 20-bit precision; select Int24 or a wider lossless output");
+            return;
+        }
+        if matches!(*format.pcm_gain_mode.selected_value(),
+            super::app::PcmGainMode::TruePeakGuard | super::app::PcmGainMode::TruePeakNormalize)
+        {
+            app.set_status("HDCD Decode plus certified true-peak gain is not qualified; disable one option");
+            return;
+        }
     }
 
     let mut deemphasis_path_states = app.convert.source.deemphasis_batch_preflight.clone();
@@ -10420,6 +10499,27 @@ fn execute_commit_with_source_options_transform(
             // an arbitrary representative fragment overstate album-wide facts.
             let deemphasis_evidence_origin = batch_deemphasis_evidence_origin
                 .unwrap_or(path_deemphasis_evidence_origin);
+            let hdcd_binding = hdcd_decode_enabled.then(|| {
+                hdcd_path_states.get(&item.input_path).and_then(|state| {
+                    // Re-check at admission time in the carrier executor,
+                    // not by dropping the decoder on a late identity change.
+                    // A mismatch must fail rather than silently skip HDCD.
+                    if !state.eligible || !state.has_actionable() { return None; }
+                    let identity = if state.cue_image.is_some() {
+                        state.cue_image_identity?
+                    } else {
+                        state.identity?
+                    };
+                    let segments = state.cue_tracks.iter().enumerate()
+                        .filter(|(_, track)| track.capabilities.is_some_and(|facts| facts.actionable()))
+                        .map(|(index, track)| tonepoet_pipeline::HdcdCueSegment {
+                            source_ordinal: (index + 1) as u32,
+                            start_sample: track.start_sample,
+                            sample_count: track.sample_count,
+                        }).collect();
+                    Some((identity, segments))
+                })
+            }).flatten();
             let apply_cd_deemphasis = deemphasis_enabled
                 && deemphasis_path_state.is_some_and(|state| {
                     state.eligible
@@ -10454,6 +10554,7 @@ fn execute_commit_with_source_options_transform(
                     DeemphasisChoiceOrigin::Automatic
                 };
                 existing_req.deemphasis_evidence_origin = deemphasis_evidence_origin;
+                set_request_hdcd_decode(existing_req, hdcd_binding.clone());
                 set_request_cd_deemphasis(existing_req, apply_cd_deemphasis);
             } else {
                 let output_root = options.output_dir.clone()
@@ -10532,6 +10633,7 @@ fn execute_commit_with_source_options_transform(
                     companion: companion_policy.clone(),
                 });
                 if let Some(request) = item.pipeline_request.as_mut() {
+                    set_request_hdcd_decode(request, hdcd_binding);
                     set_request_cd_deemphasis(request, apply_cd_deemphasis);
                 }
             }

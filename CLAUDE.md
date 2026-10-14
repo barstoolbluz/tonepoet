@@ -247,6 +247,44 @@ All of the above are match arms in `FormatState::apply_format_constraints()` (`s
 - Module-level re-exports in `mod.rs` files — consumers import from `tonepoet::convert::` not submodules directly
 - TUI draw functions take immutable state refs; mouse buttons registered in a second pass via `ButtonRenderMap`
 
+## Deliveries arrive uncompiled — this gate is the first compile
+
+Code bundles come from a reasoning-model session running in a **4 GB container
+with no Rust toolchain**. It cannot run `cargo`, `rustc`, `rustfmt` or Nix, and
+cannot build TonePoet at all. Everything it reports is static source review.
+Its delivery notes say so, and they are accurate: "no compiled test has been
+represented as passing" means exactly that.
+
+**Consequence: every delivery must be compiled here before anything else, and
+mechanical compile errors are common rather than exceptional.** Seven rounds
+between R18 and the R19 HDCD work arrived uncompilable — R18, R22C, R24, R25C,
+R33, R34D and R19-HDCD — while R29C through R32, R35 and R36 built as received.
+They do not come in an unbroken run, so do not assume the next one is broken or
+that a clean one means the pattern has stopped. The R19 HDCD round alone
+carried fourteen errors across five defects, four of them in code that round
+added.
+
+The recurring classes, all of which a single `cargo check` would have caught:
+
+- a path that does not resolve from where it is written — `super::x` inside a
+  nested test module needing `super::super::x` (R25C, R34D, same error twice);
+- a type named from the wrong crate — matching a `crate::convert::formats`
+  value against `tonepoet_pipeline`'s same-named enum;
+- a new enum variant without its arm in an exhaustive `match`;
+- a non-`Copy` value moved and then used;
+- a `String` built inside a match arm and borrowed beyond its scope.
+
+**Fix these locally rather than bouncing them.** Match the form already used on
+neighbouring lines — that is what the correct spelling almost always turns out
+to be. Record each fix in the commit message, and report the count and classes
+in the bounce brief so the pattern stays visible. Bounce only behaviour
+defects and failing assertions.
+
+Do not read a delivery's static-audit claims as verification. An audit that
+looks for one class of error finds one class of error: the HDCD round's notes
+described finding and fixing "a compilation blocker" while five more sat
+behind it.
+
 ## Testing
 
 ```bash

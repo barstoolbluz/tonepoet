@@ -8782,6 +8782,16 @@ pub(crate) fn read_convert_preemphasis_tag_evidence(
     Ok(convert_preemphasis_evidence_from_tags(tagged.tags()))
 }
 
+/// The HDCD filter requires a *known* lossless, integer 16-bit, 44.1-kHz
+/// mono/stereo PCM carrier. Unknown facts are not permission to scan.
+pub(crate) fn convert_hdcd_eligible(info: &SourceInfo) -> bool {
+    info.compression_is_lossless == Some(true)
+        && info.sample_format_is_float == Some(false)
+        && info.bit_depth == Some(16)
+        && info.sample_rate == 44_100
+        && (info.channels == 1 || info.channels == 2)
+}
+
 /// Positive technical gate for the destructive Convert de-emphasis feature.
 pub(crate) fn convert_cd_deemphasis_eligible(info: &SourceInfo) -> bool {
     info.compression_is_lossless == Some(true)

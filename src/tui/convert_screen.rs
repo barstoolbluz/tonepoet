@@ -313,6 +313,15 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
                     buttons.record_button(TuiButton::DeemphasisInfo, Rect::new(label_col + 13, y, 2, 1));
                 }
             }
+            FormatField::HdcdDecode => {
+                if state.hdcd_is_actionable() {
+                    buttons.record_button(TuiButton::HdcdPill(0), Rect::new(label_col, y, 5, 1));
+                    buttons.record_button(TuiButton::HdcdPill(1), Rect::new(label_col + 7, y, 4, 1));
+                }
+                if state.hdcd_detected_count > 0 {
+                    buttons.record_button(TuiButton::HdcdInfo, Rect::new(label_col + 13, y, 2, 1));
+                }
+            }
             FormatField::ReplayGain => register_pill_row(buttons, &state.replaygain, y, label_col, TuiButton::ReplayGainPill),
             FormatField::PcmTruePeak => register_pill_row(
                 buttons,

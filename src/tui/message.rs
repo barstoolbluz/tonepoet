@@ -565,6 +565,12 @@ pub enum AppMessage {
         paths: Vec<std::path::PathBuf>,
         results: Vec<(std::path::PathBuf, crate::tui::app::ConvertDeemphasisPathState)>,
     },
+    /// Source-identity-guarded, bounded HDCD inventory for Convert.
+    ConvertHdcdScanComplete {
+        generation: u64,
+        paths: Vec<std::path::PathBuf>,
+        results: Vec<(std::path::PathBuf, crate::tui::app::ConvertHdcdPathState)>,
+    },
     /// Result of an asynchronous optical-disc probe launched by the Browse
     /// info pane or the Audio Streams action. The payload uses the unified
     /// DiscContents model shared by DVD-Audio and SACD, plus an optional

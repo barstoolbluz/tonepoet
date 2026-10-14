@@ -229,6 +229,9 @@ pub fn settings_and_effects_fingerprint(
             EffectPlacement::SourceRate => {
                 writer.field_static(&format!("{prefix}.placement"), "source_rate");
             }
+            EffectPlacement::SourceBitstreamDecode => {
+                writer.field_static(&format!("{prefix}.placement"), "source_bitstream_decode");
+            }
         }
     }
     SettingsFingerprint(writer.finish())
@@ -832,6 +835,8 @@ fn push_semantic_node(writer: &mut FingerprintWriter, index: usize, node: &Typed
             push_registered_effect(writer, &format!("{prefix}.effect"), &instance.effect);
             if instance.placement == EffectPlacement::SourceRate {
                 writer.field_static(&format!("{prefix}.placement"), "source_rate");
+            } else if instance.placement == EffectPlacement::SourceBitstreamDecode {
+                writer.field_static(&format!("{prefix}.placement"), "source_bitstream_decode");
             }
             writer.field_static(&format!("{prefix}.tool"), lowering.tool.program());
             match &lowering.arguments {
@@ -2042,6 +2047,16 @@ fn push_registered_effect(
         }
         RegisteredUnaryEffect::CdDeemphasis => {
             writer.field_static(&format!("{prefix}.kind"), "cd_deemphasis");
+        }
+        RegisteredUnaryEffect::HdcdDecode { source_size_bytes, source_modified_ns, cue_segments } => {
+            writer.field_static(&format!("{prefix}.kind"), "hdcd_decode");
+            writer.field_string(&format!("{prefix}.source_size_bytes"), source_size_bytes.to_string());
+            writer.field_string(&format!("{prefix}.source_modified_ns"), source_modified_ns.to_string());
+            for (index, segment) in cue_segments.iter().enumerate() {
+                writer.field_string(&format!("{prefix}.cue.{index}.ordinal"), segment.source_ordinal.to_string());
+                writer.field_string(&format!("{prefix}.cue.{index}.start"), segment.start_sample.to_string());
+                writer.field_string(&format!("{prefix}.cue.{index}.samples"), segment.sample_count.to_string());
+            }
         }
     }
 }

@@ -47,6 +47,13 @@ pub struct TuiPreset {
     /// Explicit user de-emphasis override. None means follow source/target automatic policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deemphasis: Option<bool>,
+    /// Explicit HDCD Decode override. Source evidence is never serialized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hdcd_decode: Option<bool>,
+    /// Only set when HDCD automatically widened a source-derived depth.
+    /// Distinguishes that policy from a user/preset choice of the same value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hdcd_auto_depth: Option<bool>,
     #[serde(default)]
     pub noise_shaper: Option<String>, // "clans", "sdm", "crfb"
     #[serde(default)]
@@ -215,6 +222,8 @@ impl PresetWireLegacy {
             replaygain: self.replaygain,
             resampler: self.resampler,
             deemphasis: None,
+            hdcd_decode: None,
+            hdcd_auto_depth: None,
             noise_shaper: self.noise_shaper,
             modulator_order: self.modulator_order,
             dsd_filter_preset: self.dsd_filter_preset,
@@ -404,11 +413,20 @@ impl TuiPreset {
             // durable, unambiguous identifiers.
             format: format_key(*format.format.selected_value()).to_string(),
             sample_rate: *format.sample_rate.selected_value(),
-            bit_depth: format.bit_depth.selected_label().to_string(),
+            // An automatically widened HDCD target is a source-derived display
+            // choice, not the user's saved output policy. Persist the original
+            // selection so another source can recompute its own HDCD default.
+            bit_depth: match format.hdcd_promoted_from_depth {
+                Some(BitDepthChoice::Source) => "source".to_string(),
+                Some(BitDepthChoice::Int16) => "16".to_string(),
+                _ => format.bit_depth.selected_label().to_string(),
+            },
             dither: format.dither.selected_label().to_lowercase(),
             replaygain: format.replaygain.selected_label().to_lowercase(),
             resampler: format.resampler.selected_label().to_lowercase(),
             deemphasis: format.deemphasis_overridden.then_some(format.deemphasis_enabled),
+            hdcd_decode: format.hdcd_decode_overridden.then_some(format.hdcd_decode_enabled),
+            hdcd_auto_depth: format.hdcd_promoted_from_depth.map(|_| true),
             noise_shaper: Some(format.noise_shaper.selected_label().to_lowercase()),
             modulator_order: Some(format.modulator_order.selected_value().value()),
             dsd_filter_preset: Some(format.conversion_preset.selected_label().to_lowercase()),
@@ -843,7 +861,20 @@ impl TuiPreset {
                     let applied = Self::select_enabled(&mut format_state.bit_depth, &value);
                     report.record("bit_depth", applied);
                     if applied {
-                        format_state.mark_bit_depth_user_policy();
+                        // Saving HDCD's automatic Int24 promotion writes the
+                        // original depth, not an explicit Int24 selection. On
+                        // restore preserve its automatic provenance so the
+                        // next source can widen without claiming user intent.
+                        if self.hdcd_auto_depth == Some(true)
+                            && self.hdcd_decode.is_none()
+                            && matches!(value, BitDepthChoice::Source | BitDepthChoice::Int16)
+                        {
+                            format_state.bit_depth_overridden = false;
+                            format_state.source_derived_bit_depth =
+                                (!value.is_source()).then_some(value);
+                        } else {
+                            format_state.mark_bit_depth_user_policy();
+                        }
                     }
                 }
                 None => report.record("bit_depth", false),
@@ -863,6 +894,20 @@ impl TuiPreset {
         }
 
         if !is_dsd {
+            match self.hdcd_decode {
+                Some(enabled) => {
+                    format_state.hdcd_decode_enabled = enabled;
+                    format_state.hdcd_decode_overridden = true;
+                    format_state.hdcd_override_from_preset = true;
+                    format_state.recompute_auto_hdcd();
+                    report.record("hdcd_decode", true);
+                }
+                None => {
+                    format_state.hdcd_decode_overridden = false;
+                    format_state.hdcd_override_from_preset = false;
+                    format_state.recompute_auto_hdcd();
+                }
+            }
             match self.deemphasis {
                 Some(value) => {
                     format_state.deemphasis_enabled = value;
@@ -1049,7 +1094,11 @@ impl TuiPreset {
         // that was accepted remains selected. A constraint snap is a refusal,
         // not a silent substitution.
         let expected_sample_rate = self.sample_rate;
-        let expected_bit_depth = pcm_depth_is_meaningful
+        let expected_bit_depth = (pcm_depth_is_meaningful
+            && !(self.hdcd_auto_depth == Some(true)
+                && self.hdcd_decode.is_none()
+                && format_state.hdcd_decode_enabled
+                && format_state.hdcd_is_actionable()))
             .then(|| parse_bit_depth(&self.bit_depth))
             .flatten();
         let expected_dither = (pcm_depth_is_meaningful && !reference_dsd_to_pcm)
@@ -2774,6 +2823,49 @@ merge = "multi-file"
         assert!(report.is_complete(), "unexpected refusals: {:?}", report.refused_fields);
         assert_eq!(restored.pcm_gain_mode.selected_value(), &PcmGainMode::FixedGain);
         assert_eq!(restored.pcm_fixed_gain_db, "3.250000000".parse().unwrap());
+    }
+
+    #[test]
+    fn hdcd_auto_promoted_depth_does_not_become_preset_user_policy() {
+        let mut format = FormatState::new();
+        assert!(format.format.select_value(&AudioFormat::Flac));
+        assert!(format.sample_rate.select_value(&SOURCE_SAMPLE_RATE_SENTINEL));
+        assert!(format.bit_depth.select_value(&BitDepthChoice::Source));
+        format.hdcd_eligible_count = 1;
+        format.hdcd_actionable_count = 1;
+        assert!(format.sample_rate.select_value(&88_200));
+        format.recompute_auto_hdcd();
+        assert!(format.hdcd_decode_enabled);
+        assert_eq!(*format.bit_depth.selected_value(), BitDepthChoice::Int24);
+        assert_eq!(format.hdcd_promoted_from_depth, Some(BitDepthChoice::Source));
+        let preset = TuiPreset::from_pill_state(
+            "hdcd-derived", &format, &OutputOptionsState::new(), &MetadataState::default(),
+        );
+        assert_eq!(preset.bit_depth, "source");
+        assert!(preset.hdcd_decode.is_none());
+        assert_eq!(preset.hdcd_auto_depth, Some(true));
+        let encoded = serde_json::to_string(&preset).expect("serialize HDCD preset");
+        let decoded: TuiPreset = serde_json::from_str(&encoded).expect("deserialize HDCD preset");
+        let mut restored = FormatState::new();
+        restored.hdcd_eligible_count = 1;
+        restored.hdcd_actionable_count = 1;
+        let report = decoded.apply_to_pills(
+            &mut restored, &mut OutputOptionsState::new(), &mut MetadataState::default(),
+        );
+        assert!(report.is_complete(), "unexpected refusals: {:?}", report.refused_fields);
+        assert!(!restored.bit_depth_overridden);
+        assert!(restored.hdcd_decode_enabled);
+        assert_eq!(*restored.bit_depth.selected_value(), BitDepthChoice::Int24);
+        assert_eq!(restored.hdcd_promoted_from_depth, Some(BitDepthChoice::Source));
+
+        // By contrast, an explicit wide output is genuinely persistent.
+        format.mark_bit_depth_user_policy();
+        assert!(format.bit_depth.select_value(&BitDepthChoice::Int24));
+        let explicit = TuiPreset::from_pill_state(
+            "hdcd-explicit", &format, &OutputOptionsState::new(), &MetadataState::default(),
+        );
+        assert_eq!(explicit.bit_depth, "24");
+        assert_eq!(explicit.hdcd_auto_depth, None);
     }
 
     #[test]

@@ -49,6 +49,8 @@ pub enum TuiButton {
     DitherPill(usize),
     DeemphasisPill(usize),
     DeemphasisInfo,
+    HdcdPill(usize),
+    HdcdInfo,
     /// Shared true-peak explanation on PCM and DSD target rows.
     TruePeakInfo,
     ReplayGainPill(usize),
@@ -608,6 +610,8 @@ impl TuiButton {
             | Self::DitherPill(_)
             | Self::DeemphasisPill(_)
             | Self::DeemphasisInfo
+            | Self::HdcdPill(_)
+            | Self::HdcdInfo
             | Self::TruePeakInfo
             | Self::ReplayGainPill(_)
             | Self::PcmTruePeakPill(_)

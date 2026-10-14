@@ -3759,6 +3759,7 @@ fn convert_format_field_value(app: &AppState, field: FormatField) -> String {
         FormatField::Resampler => format.resampler.selected_label().to_string(),
         FormatField::Dither => format.dither.selected_label().to_string(),
         FormatField::Deemphasis => if format.deemphasis_enabled { "on" } else { "off" }.to_string(),
+        FormatField::HdcdDecode => if format.hdcd_decode_enabled { "on" } else { "off" }.to_string(),
         FormatField::ReplayGain => format.replaygain.selected_label().to_string(),
         FormatField::PcmTruePeak => format.pcm_gain_mode.selected_label().to_string(),
         FormatField::PcmGainDb => format!("{} dB", format.pcm_fixed_gain_db.render(true)),
@@ -38233,6 +38234,7 @@ async fn metadata_editor_analyze_details_target(
         match hdcd {
             Some(result) => {
                 facts.hdcd_detected = Some(result.detected);
+                facts.hdcd_capabilities = Some((&result).into());
                 facts.hdcd_detail = if result.detected && !result.detail.trim().is_empty() {
                     Some(result.detail)
                 } else {
@@ -72220,6 +72222,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::ResamplerPill(_)
             | TuiButton::DitherPill(_)
             | TuiButton::DeemphasisPill(_)
+            | TuiButton::HdcdPill(_)
             | TuiButton::ReplayGainPill(_)
             | TuiButton::PcmTruePeakPill(_)
             | TuiButton::TruePeakScopePill(_)
@@ -72245,6 +72248,22 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 if super::format_interactions::handle_convert_format_button(&mut app.convert, button) {
                     app.preset.mark_modified();
                 }
+            }
+            TuiButton::HdcdInfo => {
+                use super::app::ActiveOverlay;
+                let format = &app.convert.format;
+                let explanation = if format.hdcd_actionable_count > 0 {
+                    "HDCD uses control codes in the original 16-bit CD samples. FFmpeg can restore Peak Extend and Low-Level Gain Adjustment. Leave Decode off for a lossless 16/44.1 preservation copy; enable it before other audio processing. Decoding expands the waveform beyond 16-bit precision. FFmpeg detects Transient Filter signaling but does not reconstruct it."
+                } else if format.hdcd_transient_only_count > 0 {
+                    "HDCD Transient Filter signaling was detected, but no Peak Extend or Low-Level Gain Adjustment. FFmpeg detects Transient Filter but does not reconstruct that feature, so there is no supported transformation to apply."
+                } else {
+                    "HDCD packets were detected without supported output-changing Peak Extend or Low-Level Gain Adjustment. The FFmpeg decoder is not applied to passive HDCD."
+                };
+                app.active_overlay = ActiveOverlay::Notice {
+                    title: "HDCD decoding".to_owned(),
+                    message: explanation.to_owned(),
+                    scroll: 0,
+                };
             }
             TuiButton::DeemphasisInfo => {
                 app.convert.focus = ConvertFocus::Format;

@@ -758,10 +758,81 @@ pub(crate) async fn measure_loudness(path: &Path) -> Result<NativeLoudnessScan, 
 pub struct HdcdResult {
     pub detected: bool,
     pub peak_extend: bool,
+    pub transient_filter: bool,
+    pub low_level_gain_adjustment: bool,
     pub total_packets: u64,
     pub max_gain: f64,
     pub packet_type: String,
     pub detail: String,
+}
+
+/// High-resolution identity for scan/commit attribution.  A whole-second
+/// modification stamp is insufficient when an album member is replaced quickly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HdcdFileIdentity {
+    pub byte_len: u64,
+    pub modified_ns: i64,
+}
+
+pub fn hdcd_file_identity(path: &Path) -> Option<HdcdFileIdentity> {
+    use std::time::UNIX_EPOCH;
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() { return None; }
+    let modified = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+    Some(HdcdFileIdentity {
+        byte_len: metadata.len(),
+        modified_ns: i64::try_from(modified.as_nanos()).ok()?,
+    })
+}
+
+/// Facts about the control stream, not a UI or conversion-policy choice.
+/// A no-effect packet stream and TF-only stream are present but not decodable
+/// into an improved waveform by the pinned FFmpeg decoder.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HdcdCapabilities {
+    pub detected: bool,
+    pub peak_extend: bool,
+    pub low_level_gain_adjustment: bool,
+    pub transient_filter: bool,
+    pub max_gain_adjustment_db: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HdcdClassification {
+    NotDetected,
+    Effectual,
+    TransientOnly,
+    Passive,
+}
+
+impl HdcdCapabilities {
+    pub fn classify(self) -> HdcdClassification {
+        if !self.detected {
+            HdcdClassification::NotDetected
+        } else if self.peak_extend || self.low_level_gain_adjustment {
+            HdcdClassification::Effectual
+        } else if self.transient_filter {
+            HdcdClassification::TransientOnly
+        } else {
+            HdcdClassification::Passive
+        }
+    }
+
+    pub fn actionable(self) -> bool {
+        self.classify() == HdcdClassification::Effectual
+    }
+}
+
+impl From<&HdcdResult> for HdcdCapabilities {
+    fn from(value: &HdcdResult) -> Self {
+        Self {
+            detected: value.detected,
+            peak_extend: value.peak_extend,
+            low_level_gain_adjustment: value.low_level_gain_adjustment,
+            transient_filter: value.transient_filter,
+            max_gain_adjustment_db: value.max_gain,
+        }
+    }
 }
 
 pub(crate) fn known_bit_depth(result: &AnalysisResult) -> Option<u32> {
@@ -828,17 +899,55 @@ pub async fn detect_hdcd(
     seek_secs: Option<f64>,
     duration_secs: Option<f64>,
 ) -> Option<HdcdResult> {
+    detect_hdcd_with_filter(
+        path,
+        hdcd_ffmpeg_args(seek_secs, duration_secs),
+        "hdcd=bits_per_sample=16:disable_autoconvert=1".to_owned(),
+    ).await
+}
+
+/// Scan an authoritative CUE range using integer sample positions. The
+/// Details scanner's historical six-decimal -ss/-t arguments can round the
+/// first or last source sample, changing which HDCD packets are observed.
+/// No sample-changing operation precedes the HDCD filter: atrim discards
+/// samples, and asetpts only resets presentation timestamps.
+pub async fn detect_hdcd_cue_samples(
+    path: &Path,
+    start_sample: u64,
+    sample_count: u64,
+) -> Option<HdcdResult> {
+    if sample_count == 0 { return None; }
+    let coarse_seconds = start_sample / 44_100;
+    let residual = start_sample % 44_100;
+    let end = residual.checked_add(sample_count)?;
+    let mut args = hdcd_ffmpeg_args(None, None);
+    if coarse_seconds > 0 {
+        args.extend(["-ss".to_owned(), coarse_seconds.to_string()]);
+    }
+    detect_hdcd_with_filter(path, args, format!(
+        "atrim=start_sample={residual}:end_sample={end},asetpts=PTS-STARTPTS,hdcd=bits_per_sample=16:disable_autoconvert=1"
+    )).await
+}
+
+async fn detect_hdcd_with_filter(
+    path: &Path,
+    args: Vec<String>,
+    filter: String,
+) -> Option<HdcdResult> {
     use tokio::process::Command;
 
     let mut cmd = Command::new("ffmpeg");
-    cmd.args(hdcd_ffmpeg_args(seek_secs, duration_secs));
+    cmd.args(args);
     cmd.arg("-i").arg(path);
-    cmd.args(["-af", "hdcd", "-f", "s24le", "/dev/null"]);
+    cmd.args(["-af", filter.as_str(), "-f", "s24le", "/dev/null"]);
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::piped());
 
     let output = cmd.output().await.ok()?;
 
+    if !output.status.success() {
+        return None;
+    }
     let stderr = String::from_utf8_lossy(&output.stderr);
     parse_hdcd_output(&stderr)
 }
@@ -913,6 +1022,8 @@ fn parse_hdcd_output(stderr: &str) -> Option<HdcdResult> {
     Some(HdcdResult {
         detected,
         peak_extend,
+        transient_filter,
+        low_level_gain_adjustment: detected && max_gain != 0.0,
         total_packets: 0, // not reported at info level
         max_gain,
         packet_type: String::new(), // not reported at info level
@@ -1155,6 +1266,23 @@ mod loudness_status_tests {
         assert_eq!(seeked.clipping_count, direct.clipping_count);
         assert_eq!(seeked.actual_bit_depth, direct.actual_bit_depth);
         assert!((seeked.duration_secs - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn hdcd_classification_respects_supported_features() {
+        let parse = |line: &str| HdcdCapabilities::from(&parse_hdcd_output(line).unwrap());
+        let no = parse("HDCD detected: no");
+        assert_eq!(no.classify(), HdcdClassification::NotDetected);
+        let passive = parse("HDCD detected: yes, peak_extend: disabled, max_gain_adj: 0.0 dB, transient_filter: not detected");
+        assert_eq!(passive.classify(), HdcdClassification::Passive);
+        let tf = parse("HDCD detected: yes, peak_extend: disabled, max_gain_adj: 0.0 dB, transient_filter: detected");
+        assert_eq!(tf.classify(), HdcdClassification::TransientOnly);
+        let pe = parse("HDCD detected: yes, peak_extend: enabled intermittently, max_gain_adj: 0.0 dB, transient_filter: detected");
+        assert_eq!(pe.classify(), HdcdClassification::Effectual);
+        assert!(pe.transient_filter);
+        let lle = parse("HDCD detected: yes, peak_extend: disabled, max_gain_adj: -3.0 dB, transient_filter: not detected");
+        assert_eq!(lle.classify(), HdcdClassification::Effectual);
+        assert!(lle.low_level_gain_adjustment);
     }
 
     #[test]

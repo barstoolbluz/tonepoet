@@ -1631,6 +1631,11 @@ pub fn completed_effect_operation(
             "CD de-emphasis",
             Vec::new(),
         ),
+        RegisteredUnaryEffect::HdcdDecode { .. } => (
+            "hdcd_decode",
+            "HDCD decoding",
+            Vec::new(),
+        ),
     };
     let mut record = OperationRecord::completed(id, kind, name, ExecutionBackend::external(backend));
     record.parameters = parameters;
@@ -3257,5 +3262,29 @@ mod tests {
         let portable = serde_json::to_string(&evidence).expect("portable evidence serializes");
         assert!(portable.contains("stage_a_selected_vs_emitted"));
         assert!(portable.contains("typed built-in operation node"));
+    }
+}
+
+#[cfg(test)]
+mod hdcd_execution_evidence_tests {
+    use super::*;
+    use tonepoet_pipeline::{EffectInstanceId, EffectPlacement};
+
+    #[test]
+    fn hdcd_decoder_is_reported_as_a_distinct_completed_effect() {
+        let effect = EffectIntent {
+            id: EffectInstanceId(41),
+            effect: RegisteredUnaryEffect::HdcdDecode {
+                source_size_bytes: 32_768,
+                source_modified_ns: 1_700_000_000_123_000_000,
+                cue_segments: Vec::new(),
+            },
+            after: Vec::new(),
+            placement: EffectPlacement::SourceBitstreamDecode,
+        };
+        let operation = completed_effect_operation("hdcd-41", &effect, "ffmpeg");
+        assert_eq!(operation.kind, "hdcd_decode");
+        assert_eq!(operation.name, "HDCD decoding");
+        assert_eq!(operation.status, OperationStatus::Completed);
     }
 }

@@ -37,6 +37,22 @@ pub fn draw_format_pane(
     ));
 
     let mut lines = vec![top_line];
+    // Owned outside the loop: `pill_row` borrows its suffix for as long as
+    // `lines` lives, and the HDCD suffix is computed rather than borrowed.
+    let hdcd_suffix: String = if let Some(warning) = format_state.hdcd_manual_off_warning() {
+        warning.to_string()
+    } else if format_state.hdcd_detected_count > 0 {
+        format!(
+            "\u{24d8} HDCD: {} of {} tracks ({} decode-capable)",
+            format_state.hdcd_detected_count,
+            format_state.hdcd_total_count,
+            format_state.hdcd_actionable_count
+        )
+    } else if format_state.hdcd_unresolved_count > 0 {
+        "scanning / unavailable".to_string()
+    } else {
+        String::new()
+    };
     for row in format_state.pane_rows(maximized) {
         use super::app::FormatPaneRow;
         match row {
@@ -144,6 +160,19 @@ pub fn draw_format_pane(
                             &deemphasis_pill_spans(format_state.deemphasis_enabled, row_focused, theme),
                             row_focused,
                             theme,
+                        ));
+                    }
+                    FormatField::HdcdDecode => {
+                        let spans = deemphasis_pill_spans(
+                            format_state.hdcd_decode_enabled && format_state.hdcd_is_actionable(), row_focused, theme);
+                        let spans = if format_state.hdcd_is_actionable() {
+                            spans
+                        } else {
+                            dim_pill_spans(&spans, theme)
+                        };
+                        lines.push(pill_row(
+                            border_color, w, "HDCD Decode", hdcd_suffix.as_str(), &spans,
+                            row_focused && format_state.hdcd_is_actionable(), theme,
                         ));
                     }
                     FormatField::PcmTruePeak => lines.push(pill_row(

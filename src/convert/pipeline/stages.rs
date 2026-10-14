@@ -39580,6 +39580,210 @@ fn track_scoped_certified_true_peak_requested(
     }
 }
 
+/// The typed HDCD lowering identifies the decoder and its options, while the
+/// source-first carrier uses integer PCM rather than the generic Float64 input.
+/// No rate or channel conversion is requested before the decoded S32 WAV.
+fn hdcd_source_first_command(
+    input: &Path,
+    output: &Path,
+    filter: &str,
+    duration: Option<Duration>,
+    cue_span: Option<(u64, u64)>,
+) -> Result<tonepoet_pipeline::PlannedCommand, String> {
+    let mut args = vec![
+        "-y".into(), "-nostdin".into(), "-hide_banner".into(),
+        "-loglevel".into(), "error".into(),
+    ];
+    let source_filter = if let Some((start_sample, sample_count)) = cue_span {
+        if sample_count == 0 {
+            return Err("HDCD CUE segment has zero samples".into());
+        }
+        // Seek only at whole-second boundaries so the subsequent atrim has
+        // integer sample offsets. FFmpeg performs accurate input seeking for
+        // transcoded audio; the exact output count is independently checked.
+        let coarse_seconds = start_sample / 44_100;
+        let residual = start_sample % 44_100;
+        let end_sample = residual.checked_add(sample_count)
+            .ok_or_else(|| "HDCD CUE sample end overflowed".to_string())?;
+        if coarse_seconds > 0 {
+            args.extend(["-ss".into(), coarse_seconds.to_string()]);
+        }
+        format!("atrim=start_sample={residual}:end_sample={end_sample},asetpts=PTS-STARTPTS,{filter}")
+    } else {
+        filter.to_string()
+    };
+    args.extend([
+        "-i".into(), input.to_string_lossy().into_owned(),
+        "-map".into(), "0:a:0".into(),
+        "-vn".into(), "-sn".into(), "-dn".into(),
+        "-af".into(), source_filter,
+        "-c:a".into(), "pcm_s32le".into(),
+        "-f".into(), "wav".into(), output.to_string_lossy().into_owned(),
+    ]);
+    Ok(tonepoet_pipeline::PlannedCommand::new(
+        tonepoet_pipeline::ToolIdentifier::Ffmpeg,
+        args,
+        tonepoet_pipeline::InputSource::Path(input.to_path_buf()),
+        tonepoet_pipeline::OutputSink::Path(output.to_path_buf()),
+        duration,
+        "source-first HDCD decode to signed 32-bit PCM",
+    ))
+}
+
+/// A queued HDCD decision is bound to scan-time source bytes, not a path or
+/// a whole-second mtime. Re-check on both sides of the FFmpeg read.
+fn check_hdcd_source_identity(
+    path: &Path,
+    expected_size: u64,
+    expected_modified_ns: i64,
+) -> Result<(), String> {
+    let actual = crate::tui::analyze::hdcd_file_identity(path).ok_or_else(|| {
+        format!("HDCD source is no longer a readable regular file: {}", path.display())
+    })?;
+    if actual.byte_len != expected_size || actual.modified_ns != expected_modified_ns {
+        return Err(format!(
+            "HDCD source identity changed after scanning: {} (expected {} bytes, {} ns; got {} bytes, {} ns)",
+            path.display(), expected_size, expected_modified_ns,
+            actual.byte_len, actual.modified_ns,
+        ));
+    }
+    Ok(())
+}
+
+/// Bind a submitted CUE's effect graph to one physical track. An inactive
+/// member must have neither the HDCD node nor a dangling dependency on it.
+fn registered_effects_for_hdcd_cue_member(
+    effects: &[tonepoet_pipeline::EffectIntent],
+    source_ordinal: u32,
+) -> Result<(Vec<tonepoet_pipeline::EffectIntent>, Option<(u64, u64)>), String> {
+    let mut specialized = effects.to_vec();
+    let mut cue_span = None;
+    if let Some((hdcd_id, cue_segments)) = specialized.iter().find_map(|intent| {
+        match &intent.effect {
+            tonepoet_pipeline::RegisteredUnaryEffect::HdcdDecode { cue_segments, .. }
+                if !cue_segments.is_empty() => Some((intent.id, cue_segments.clone())),
+            _ => None,
+        }
+    }) {
+        let mut matched = cue_segments.iter()
+            .filter(|segment| segment.source_ordinal == source_ordinal);
+        if let Some(span) = matched.next() {
+            if matched.next().is_some() || span.sample_count == 0 {
+                return Err(format!(
+                    "track {source_ordinal} has ambiguous or empty HDCD CUE authorization"
+                ));
+            }
+            cue_span = Some((span.start_sample, span.sample_count));
+        } else {
+            specialized.retain(|intent| intent.id != hdcd_id);
+            for intent in &mut specialized {
+                intent.after.retain(|dependency| *dependency != hdcd_id);
+            }
+        }
+    }
+    Ok((specialized, cue_span))
+}
+
+#[cfg(test)]
+mod hdcd_source_first_tests {
+    use super::{hdcd_source_first_command, registered_effects_for_hdcd_cue_member};
+    use std::path::Path;
+    use tonepoet_pipeline::{
+        EffectInstanceId, EffectIntent, EffectPlacement, HdcdCueSegment, RegisteredUnaryEffect,
+    };
+
+    fn cue_effects() -> Vec<EffectIntent> {
+        vec![
+            EffectIntent {
+                id: EffectInstanceId(12),
+                effect: RegisteredUnaryEffect::CdDeemphasis,
+                after: vec![EffectInstanceId(11)],
+                placement: EffectPlacement::SourceRate,
+            },
+            EffectIntent {
+                id: EffectInstanceId(11),
+                effect: RegisteredUnaryEffect::HdcdDecode {
+                    source_size_bytes: 10_000,
+                    source_modified_ns: 10,
+                    cue_segments: vec![HdcdCueSegment {
+                        source_ordinal: 2,
+                        start_sample: 44_100 * 30 + 588,
+                        sample_count: 44_100 * 60,
+                    }],
+                },
+                after: Vec::new(),
+                placement: EffectPlacement::SourceBitstreamDecode,
+            },
+        ]
+    }
+
+    #[test]
+    fn cue_effects_run_only_on_actionable_ordinals() {
+        let effects = cue_effects();
+        let (track_one, span) = registered_effects_for_hdcd_cue_member(&effects, 1)
+            .expect("non-HDCD cue member");
+        assert!(span.is_none());
+        assert_eq!(track_one.len(), 1);
+        assert!(track_one[0].after.is_empty());
+        assert_eq!(track_one[0].effect, RegisteredUnaryEffect::CdDeemphasis);
+
+        let (track_two, span) = registered_effects_for_hdcd_cue_member(&effects, 2)
+            .expect("scanned effectual cue member");
+        assert_eq!(span, Some((44_100 * 30 + 588, 44_100 * 60)));
+        assert_eq!(track_two, effects);
+    }
+
+    #[test]
+    fn duplicate_or_empty_cue_authorization_fails_closed() {
+        let mut effects = cue_effects();
+        {
+            let RegisteredUnaryEffect::HdcdDecode { cue_segments, .. } =
+                &mut effects[1].effect else { panic!("fixture") };
+            cue_segments[0].sample_count = 0;
+        }
+        assert!(registered_effects_for_hdcd_cue_member(&effects, 2).is_err());
+        {
+            let RegisteredUnaryEffect::HdcdDecode { cue_segments, .. } =
+                &mut effects[1].effect else { panic!("fixture") };
+            cue_segments[0].sample_count = 100;
+            let duplicate = cue_segments[0].clone();
+            cue_segments.push(duplicate);
+        }
+        assert!(registered_effects_for_hdcd_cue_member(&effects, 2).is_err());
+    }
+
+    #[test]
+    fn hdcd_command_has_no_hidden_rate_or_channel_conversion() {
+        let filter = "hdcd=bits_per_sample=16:disable_autoconvert=1";
+        let command = hdcd_source_first_command(
+            Path::new("source.flac"), Path::new("decoded.wav"), filter, None, None,
+        ).expect("ordinary HDCD command");
+        assert_eq!(command.tool, tonepoet_pipeline::ToolIdentifier::Ffmpeg);
+        assert!(!command.args.iter().any(|arg| ["-ar", "-ac", "-sample_fmt", "-ss", "-t"]
+            .contains(&arg.as_str())));
+        assert!(command.args.windows(2).any(|pair| pair[0] == "-af" && pair[1] == filter));
+        assert!(command.args.windows(2).any(|pair| pair[0] == "-c:a" && pair[1] == "pcm_s32le"));
+    }
+
+    #[test]
+    fn cue_command_binds_sample_exact_range_before_the_hdcd_filter() {
+        let command = hdcd_source_first_command(
+            Path::new("album.flac"), Path::new("decoded.wav"),
+            "hdcd=bits_per_sample=16:disable_autoconvert=1", None,
+            Some((44_100 * 30 + 588, 44_100 * 60)),
+        ).expect("CUE HDCD command");
+        assert!(command.args.windows(2).any(|pair| pair[0] == "-ss" && pair[1] == "30"));
+        assert!(command.args.windows(2).any(|pair| pair[0] == "-af"
+            && pair[1] == "atrim=start_sample=588:end_sample=2646588,asetpts=PTS-STARTPTS,hdcd=bits_per_sample=16:disable_autoconvert=1"));
+        assert!(!command.args.iter().any(|arg| arg == "-ar" || arg == "-ac"));
+        assert!(hdcd_source_first_command(
+            Path::new("album.flac"), Path::new("decoded.wav"),
+            "hdcd=bits_per_sample=16:disable_autoconvert=1", None,
+            Some((u64::MAX, u64::MAX)),
+        ).is_err());
+    }
+}
+
 async fn prepare_registered_effect_carrier_for_track(
     req: &PipelineRequest,
     mut track: PreparedTrack,
@@ -39595,8 +39799,47 @@ async fn prepare_registered_effect_carrier_for_track(
     if req.registered_effects.is_empty() {
         return Ok(track);
     }
-    if matches!(&track.source_ref, TrackSourceRef::RegisteredEffectCarrier { .. }) {
+    // The request has a batch-wide semantic effect graph, but CUE source
+    // segments are independently scanned and only effectual members may
+    // consume HDCD. Specialize the graph before making a per-track plan.
+    let (track_effects, cue_hdcd_span) = registered_effects_for_hdcd_cue_member(
+        &req.registered_effects, track.id.source_ordinal,
+    )?;
+    if track_effects.is_empty() {
         return Ok(track);
+    }
+    let hdcd_guard = track_effects.iter().find_map(|intent| {
+        if let tonepoet_pipeline::RegisteredUnaryEffect::HdcdDecode {
+            source_size_bytes,
+            source_modified_ns,
+            ..
+        } = &intent.effect {
+            Some((*source_size_bytes, *source_modified_ns))
+        } else {
+            None
+        }
+    });
+    if matches!(&track.source_ref, TrackSourceRef::RegisteredEffectCarrier { .. }) {
+        if hdcd_guard.is_some() {
+            return Err("HDCD Decode cannot be applied to an already processed carrier".into());
+        }
+        return Ok(track);
+    }
+    if let Some((size, modified_ns)) = hdcd_guard {
+        match (&track.source_ref, cue_hdcd_span) {
+            (TrackSourceRef::StagedFile(_), None) => {},
+            (TrackSourceRef::CueStreamSegment {start_sample, samples, ..},
+                Some((start, count)))
+            | (TrackSourceRef::CueSegmentCarrier {start_sample, samples, ..},
+                Some((start, count))) if *start_sample == start && *samples == count => {},
+            _ => return Err(format!(
+                "track {} HDCD scan range does not match its original source-bitstream segment",
+                track.id.source_ordinal,
+            )),
+        }
+        check_hdcd_source_identity(
+            track_source_identity_path(&track), size, modified_ns,
+        )?;
     }
     let source_is_dsd = prepared_track_uses_dsd_source(&track);
     let policy = if source_is_dsd {
@@ -39605,6 +39848,9 @@ async fn prepare_registered_effect_carrier_for_track(
         req.settings.pcm_true_peak.policy
     };
     if policy.is_true_peak() {
+        if hdcd_guard.is_some() {
+            return Err("HDCD Decode with certified true-peak gain is not qualified".into());
+        }
         return Ok(track);
     }
     if cancel.is_cancelled() {
@@ -39613,24 +39859,31 @@ async fn prepare_registered_effect_carrier_for_track(
 
     let original_source_path = track_source_identity_path(&track).to_path_buf();
     let source_ref = track.source_ref.clone();
-    let realized = realize_track_with_tool_limits_and_stats(
-        &source_ref,
-        Some(&track),
-        req,
-        staging,
-        runner,
-        cancel,
-        tool_concurrency_limits.clone(),
-        false,
-        None,
-    )
-    .await
-    .map_err(|error| {
-        format!(
-            "could not realize track {} for registered-effect execution: {error}",
-            track.id.source_ordinal,
+    // A scanned CUE member must go directly from the original 16-bit image
+    // into FFmpeg HDCD. Materializing the usual S32 CUE fallback first both
+    // wastes an additional decode and loses the control-stream input contract.
+    let realized = if cue_hdcd_span.is_some() {
+        RealizedTrackInfo::without_stats(original_source_path.clone())
+    } else {
+        realize_track_with_tool_limits_and_stats(
+            &source_ref,
+            Some(&track),
+            req,
+            staging,
+            runner,
+            cancel,
+            tool_concurrency_limits.clone(),
+            false,
+            None,
         )
-    })?;
+        .await
+        .map_err(|error| {
+            format!(
+                "could not realize track {} for registered-effect execution: {error}",
+                track.id.source_ordinal,
+            )
+        })?
+    };
     record_completed_sacd_extraction_after_realization(
         preparation_evidence,
         &track,
@@ -39675,7 +39928,7 @@ async fn prepare_registered_effect_carrier_for_track(
             track.id.source_ordinal,
         )
     })?;
-    let execution = registered_effect_execution_contract(&plan_request, &req.registered_effects)
+    let mut execution = registered_effect_execution_contract(&plan_request, &track_effects)
         .map_err(|error| {
             format!(
                 "could not bind track {} registered-effect execution contract: {error}",
@@ -39713,12 +39966,112 @@ async fn prepare_registered_effect_carrier_for_track(
         ));
     }
 
+    // The decoder has a typed effect node, but its physical input is the
+    // original S16 bitstream. Consume its selected lowering once, before the
+    // ordinary Float64 ingress; do not run it again on decoded samples.
+    let hdcd_filter = if hdcd_guard.is_some() {
+        let segment = if execution.resampler.is_some() {
+            execution.pre_resample.as_mut()
+        } else {
+            execution.post_resample.as_mut()
+        }.ok_or_else(|| "HDCD typed plan has no source-first effect segment".to_string())?;
+        let lowering = segment.lowerings.first().ok_or_else(|| {
+            "HDCD typed plan has no source-first physical lowering".to_string()
+        })?;
+        let filter = match (&lowering.tool, &lowering.arguments) {
+            (tonepoet_pipeline::ToolIdentifier::Ffmpeg, tonepoet_pipeline::EffectArgumentMapping::FfmpegAudioFilter(filter))
+                if filter == "hdcd=bits_per_sample=16:disable_autoconvert=1" => filter.clone(),
+            _ => return Err("HDCD typed source-first lowering is unsupported".to_string()),
+        };
+        segment.lowerings.remove(0);
+        Some(filter)
+    } else {
+        None
+    };
+
     let carrier_hash = stable_path_hash(&original_source_path);
     let base_rate_hz = execution
         .resampler
         .as_ref()
         .map(|resampler| resampler.input_rate_hz)
         .unwrap_or(execution.sample_rate_hz);
+    let mut hdcd_decoded_input = None;
+    let mut hdcd_invocation_index = None;
+    if let (Some((expected_size, expected_modified_ns)), Some(filter)) =
+        (hdcd_guard, hdcd_filter.as_deref())
+    {
+        if source_is_dsd || base_rate_hz != 44_100 || !matches!(source_channels, 1 | 2) {
+            return Err("HDCD typed decode input geometry is not integer PCM 16/44.1 mono/stereo".into());
+        }
+        // Nothing may change the scanned file after it is admitted and before
+        // the actual decode, including the track-realization prelude.
+        check_hdcd_source_identity(&original_source_path, expected_size, expected_modified_ns)?;
+        let decoded_path = carrier_dir.join(format!(
+            "track-{track_stem}-{carrier_hash}.hdcd.s32.wav"
+        ));
+        let _ = fs::remove_file(&decoded_path);
+        let command = hdcd_source_first_command(
+            &realized.path, &decoded_path, filter, source.duration, cue_hdcd_span,
+        )?;
+        let invocation_index = preparation_commands.len();
+        run_recorded_planned_command(
+            &command,
+            runner,
+            cancel,
+            tool_concurrency_limits.as_ref(),
+            preparation_commands,
+        )
+        .await
+        .map_err(|error| {
+            let _ = fs::remove_file(&decoded_path);
+            format!("track {} HDCD source-first decode failed: {error}", track.id.source_ordinal)
+        })?;
+        check_hdcd_source_identity(&original_source_path, expected_size, expected_modified_ns)
+            .inspect_err(|_| { let _ = fs::remove_file(&decoded_path); })?;
+        let decoded = probe_realized_segment_with_tool_limits(
+            &decoded_path, runner, cancel, tool_concurrency_limits.as_ref(),
+        )
+        .await
+        .map_err(|error| {
+            let _ = fs::remove_file(&decoded_path);
+            format!("track {} HDCD decoded carrier could not be probed: {error}", track.id.source_ordinal)
+        })?;
+        if decoded.sample_rate != 44_100
+            || decoded.channels != Some(u32::from(source_channels))
+            || decoded.codec_name.as_deref() != Some("pcm_s32le")
+            || decoded.sample_fmt.as_deref() != Some("s32")
+        {
+            let _ = fs::remove_file(&decoded_path);
+            return Err(format!(
+                "track {} HDCD decoder output is not 44.1-kHz S32 PCM with unchanged channels",
+                track.id.source_ordinal,
+            ));
+        }
+        let expected_frames = cue_hdcd_span.map(|(_, count)| count)
+            .or_else(|| match source.frame_extent {
+                Some(tonepoet_pipeline::SourceFrameExtent::Exact(frames)) => Some(frames),
+                _ => None,
+            });
+        if cue_hdcd_span.is_some() && (!decoded.exact || decoded.samples.is_none()) {
+            let _ = fs::remove_file(&decoded_path);
+            return Err(format!(
+                "track {} HDCD CUE segment has no exact decoded frame count",
+                track.id.source_ordinal,
+            ));
+        }
+        if let (Some(expected), Some(actual)) = (expected_frames, decoded.samples.filter(|_| decoded.exact)) {
+            if expected != actual {
+                let _ = fs::remove_file(&decoded_path);
+                return Err(format!(
+                    "track {} HDCD decoder changed frame count: {} -> {}",
+                    track.id.source_ordinal, expected, actual,
+                ));
+            }
+        }
+        hdcd_decoded_input = Some(decoded_path);
+        hdcd_invocation_index = Some(invocation_index);
+    }
+
     let mut carrier_path;
     let first_input_is_raw_f64le;
     if source_is_dsd {
@@ -39836,7 +40189,7 @@ async fn prepare_registered_effect_carrier_for_track(
         let base_execution = execute_planned_track_conversion(
             &carrier_req,
             &track,
-            &realized.path,
+            hdcd_decoded_input.as_deref().unwrap_or(&realized.path),
             &carrier_path,
             &convert_root,
             runner,
@@ -39858,17 +40211,26 @@ async fn prepare_registered_effect_carrier_for_track(
                 let message = error.to_string();
                 preparation_commands.extend(error.commands);
                 let _ = fs::remove_file(&carrier_path);
+                if let Some(decoded_path) = hdcd_decoded_input.as_ref() {
+                    let _ = fs::remove_file(decoded_path);
+                }
                 return Err(format!(
                     "PCM track {} could not realize its no-rate-change Float64 pre-resample carrier: {message}",
                     track.id.source_ordinal,
                 ));
             }
         }
+        if let Some(decoded_path) = hdcd_decoded_input.as_ref() {
+            let _ = fs::remove_file(decoded_path);
+        }
         first_input_is_raw_f64le = false;
     }
 
     let mut representation = RegisteredEffectCarrierRepresentation::RawFloat64;
-    let mut effect_invocation_indices = Vec::with_capacity(req.registered_effects.len());
+    let mut effect_invocation_indices = Vec::with_capacity(track_effects.len());
+    if let Some(index) = hdcd_invocation_index {
+        effect_invocation_indices.push(index);
+    }
     let mut resampler_invocation_index = None;
     if let Some(resampler) = execution.resampler.as_ref() {
         if source_is_dsd {
@@ -39987,6 +40349,11 @@ async fn prepare_registered_effect_carrier_for_track(
         let post = execution.post_resample.as_ref().ok_or_else(|| {
             "registered-effect execution contains neither an effect segment nor a resampler".to_string()
         })?;
+        if post.lowerings.is_empty() && hdcd_invocation_index.is_some() {
+            // The source decoder was the sole effect. The Float64 WAV base
+            // already contains its decoded samples without quantization.
+            representation = RegisteredEffectCarrierRepresentation::Float64Wav;
+        } else {
         realize_registered_effect_chain_recorded(
             &post.lowerings,
             post.sample_rate_hz,
@@ -40011,6 +40378,7 @@ async fn prepare_registered_effect_carrier_for_track(
                 track.id.source_ordinal,
             )
         })?;
+        }
     }
 
     let carrier_len = fs::metadata(&carrier_path)
@@ -40043,7 +40411,7 @@ async fn prepare_registered_effect_carrier_for_track(
 
     let mut semantic_effect_evidence = completed_registered_effects_from_plan(
         &plan_request,
-        &req.registered_effects,
+        &track_effects,
         &effect_invocation_indices,
         resampler_invocation_index,
     )

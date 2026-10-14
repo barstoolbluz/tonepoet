@@ -8,7 +8,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
 /// Schema version — bump when adding migrations.
-const CURRENT_VERSION: u32 = 27;
+const CURRENT_VERSION: u32 = 28;
 
 const LEGACY_IMPORT_STATE_ROW_ID: i64 = 1;
 pub(crate) const RECENT_FILES_RETENTION_LIMIT: usize = 50;
@@ -1069,6 +1069,10 @@ impl Database {
             self.run_migration_step(27, Self::migrate_v27)?;
         }
 
+        if version < 28 {
+            self.run_migration_step(28, Self::migrate_v28)?;
+        }
+
         Ok(())
     }
 
@@ -1732,6 +1736,21 @@ impl Database {
                 "ALTER TABLE analysis_cache ADD COLUMN hdcd_detail TEXT;",
             )
             .map_err(|e| format!("v15 migration failed: {}", e))?;
+        }
+        Ok(())
+    }
+
+    /// v28: preserve machine-readable HDCD features and high-resolution file
+    /// identity without disturbing legacy DR/loudness cache keys.
+    fn migrate_v28(conn: &Connection) -> Result<(), String> {
+        for (name, sql) in [
+            ("hdcd_capabilities", "ALTER TABLE analysis_cache ADD COLUMN hdcd_capabilities TEXT"),
+            ("hdcd_mtime_ns", "ALTER TABLE analysis_cache ADD COLUMN hdcd_mtime_ns INTEGER"),
+        ] {
+            if !Self::legacy_add_column_present(conn, "v28", "analysis_cache", name,
+                if name == "hdcd_capabilities" { "TEXT" } else { "INTEGER" }, false, None)? {
+                conn.execute_batch(sql).map_err(|error| format!("v28 HDCD migration: {error}"))?;
+            }
         }
         Ok(())
     }
@@ -2978,6 +2997,7 @@ impl Database {
                         preemphasis_detail: row.get(1)?,
                         hdcd_detected: hdcd_int.map(|value| value != 0),
                         hdcd_detail: row.get(3)?,
+                        hdcd_capabilities: None,
                     };
                     if facts.has_any_result() {
                         Ok(Some(facts))
@@ -2988,6 +3008,61 @@ impl Database {
             )
             .ok()
             .flatten()
+    }
+
+    /// Return structured HDCD facts only when the high-resolution source identity
+    /// still matches. Legacy bool/detail rows cannot authorize a conversion.
+    pub fn get_cached_hdcd_capabilities(
+        &self, path: &std::path::Path,
+    ) -> Option<crate::tui::analyze::HdcdCapabilities> {
+        let (secs, size, nanos) = Self::hdcd_file_identity(path)?;
+        let json: String = self.conn.query_row(
+            "SELECT hdcd_capabilities FROM analysis_cache
+             WHERE file_path = ?1 AND file_mtime = ?2 AND file_size = ?3
+               AND algo_version = ?4 AND hdcd_mtime_ns = ?5
+               AND hdcd_capabilities IS NOT NULL",
+            params![path.to_str()?, secs, size as i64, Self::ANALYSIS_ALGO_VERSION, nanos],
+            |row| row.get(0),
+        ).ok()?;
+        serde_json::from_str(&json).ok()
+    }
+
+    fn hdcd_file_identity(path: &std::path::Path) -> Option<(i64, u64, i64)> {
+        use std::time::UNIX_EPOCH;
+        let meta = std::fs::metadata(path).ok()?;
+        if !meta.is_file() { return None; }
+        let elapsed = meta.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+        let nanos = i64::try_from(elapsed.as_nanos()).ok()?;
+        Some((i64::try_from(elapsed.as_secs()).ok()?, meta.len(), nanos))
+    }
+
+    pub fn store_cached_hdcd_capabilities(
+        &self, path: &std::path::Path,
+        capabilities: crate::tui::analyze::HdcdCapabilities,
+        expected: crate::tui::analyze::HdcdFileIdentity,
+    ) -> Result<(), String> {
+        let (secs, size, nanos) = Self::hdcd_file_identity(path)
+            .ok_or("HDCD source identity no longer available")?;
+        if size != expected.byte_len || nanos != expected.modified_ns {
+            return Err("HDCD source changed during analysis".to_owned());
+        }
+        let json = serde_json::to_string(&capabilities).map_err(|e| e.to_string())?;
+        // The ordinary metadata-fact UPSERT already owns clearing stale full
+        // analysis on file replacement; then store the typed facts against the
+        // same identity, only if the file still matches.
+        let facts = crate::tui::app::MetadataAnalysisFacts {
+            hdcd_detected: Some(capabilities.detected),
+            hdcd_detail: None,
+            hdcd_capabilities: Some(capabilities),
+            ..Default::default()
+        };
+        self.store_metadata_analysis_facts(path.to_str().ok_or("non-UTF-8 HDCD source path")?, secs, size, &facts)?;
+        self.conn.execute(
+            "UPDATE analysis_cache SET hdcd_capabilities = ?1, hdcd_mtime_ns = ?2
+             WHERE file_path = ?3 AND file_mtime = ?4 AND file_size = ?5 AND algo_version = ?6",
+            params![json, nanos, path.to_str(), secs, size as i64, Self::ANALYSIS_ALGO_VERSION],
+        ).map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     /// Store only HDCD / Phase-2-safe pre-emphasis facts. Existing full analysis
@@ -3124,14 +3199,27 @@ impl Database {
         ) {
             return Ok(());
         }
+        // The full analysis replaces the row, but a prior Convert/Details HDCD
+        // scan is still valid for the same file identity and algorithm version.
+        // Copy both structured columns atomically from that row before REPLACE
+        // deletes it. A changed size/mtime/version leaves them NULL; the
+        // nanosecond identity is checked again whenever the cache is read.
         self.conn.execute(
             "INSERT OR REPLACE INTO analysis_cache (
                 file_path, file_mtime, file_size, algo_version,
                 dr_value, peak_db, rms_db, clipping_count, dc_bias,
                 actual_bit_depth, declared_bit_depth, sample_rate, channels,
                 duration_secs, lufs, true_peak_dbtp, preemphasis, preemphasis_corr,
-                preemphasis_detail, hdcd_detected, hdcd_detail, analyzed_at
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
+                preemphasis_detail, hdcd_detected, hdcd_detail,
+                hdcd_capabilities, hdcd_mtime_ns, analyzed_at
+            ) VALUES (
+                ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,
+                (SELECT hdcd_capabilities FROM analysis_cache
+                 WHERE file_path = ?1 AND file_mtime = ?2 AND file_size = ?3 AND algo_version = ?4),
+                (SELECT hdcd_mtime_ns FROM analysis_cache
+                 WHERE file_path = ?1 AND file_mtime = ?2 AND file_size = ?3 AND algo_version = ?4),
+                ?22
+            )",
             params![
                 file_path, mtime, size as i64, Self::ANALYSIS_ALGO_VERSION,
                 r.dr_value, r.peak_db, r.rms_db, r.clipping_count as i64, r.dc_bias,
@@ -10222,6 +10310,7 @@ mod tests {
             hdcd_detail: Some("HDCD detected".into()),
             preemphasis: Some(PreemphasisConfidence::Detected),
             preemphasis_detail: Some("CUE FLAGS PRE".into()),
+            hdcd_capabilities: None,
         };
         db.store_metadata_analysis_facts(path, 1000, 5000000, &complete)
             .unwrap();
@@ -10231,6 +10320,7 @@ mod tests {
             hdcd_detail: None,
             preemphasis: Some(PreemphasisConfidence::NotDetected),
             preemphasis_detail: Some("no PRE tag, CUE flag, or catalog match".into()),
+            hdcd_capabilities: None,
         };
         db.store_metadata_analysis_facts(path, 1000, 5000000, &pre_only)
             .unwrap();
@@ -10303,7 +10393,8 @@ mod tests {
                 preemphasis_detail: Some("no PRE evidence".to_string()),
                 hdcd_detected: None,
                 hdcd_detail: None,
-            },
+            hdcd_capabilities: None,
+        },
         )
         .expect("refresh metadata facts");
         let carried_clipping: Option<i64> = db
@@ -10332,7 +10423,8 @@ mod tests {
                 preemphasis_detail: None,
                 hdcd_detected: None,
                 hdcd_detail: None,
-            },
+            hdcd_capabilities: None,
+        },
         )
         .expect("same-version metadata refresh");
         assert_eq!(
@@ -10476,6 +10568,7 @@ mod tests {
             ),
             hdcd_detected: None,
             hdcd_detail: None,
+            hdcd_capabilities: None,
         };
         db.store_metadata_analysis_facts(path, 1000, 5_000_000, &current)
             .unwrap();
@@ -10617,4 +10710,119 @@ mod tests {
         assert_eq!(bm.len(), 1);
         assert_eq!(bm[0].1, "Downloads");
     }
+}
+
+#[cfg(test)]
+mod hdcd_cache_precision_tests {
+    use super::*;
+    use crate::tui::analyze::{hdcd_file_identity, HdcdCapabilities};
+    use std::fs::{FileTimes, OpenOptions};
+    use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn structured_hdcd_cache_requires_full_source_identity_and_round_trips() {
+        let db = Database::open_memory().expect("database");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("album.wav");
+        std::fs::write(&path, b"1234").expect("first file bytes");
+        let set_mtime = |nanos| {
+            OpenOptions::new().write(true).open(&path).expect("file handle")
+                .set_times(FileTimes::new().set_modified(
+                    UNIX_EPOCH + Duration::new(1_700_000_000, nanos)
+                )).expect("set file mtime");
+        };
+        set_mtime(123_000_000);
+        let first = hdcd_file_identity(&path).expect("first identity");
+        let capabilities = HdcdCapabilities {
+            detected: true,
+            peak_extend: true,
+            low_level_gain_adjustment: false,
+            transient_filter: true,
+            max_gain_adjustment_db: 0.0,
+        };
+        db.store_cached_hdcd_capabilities(&path, capabilities, first)
+            .expect("store typed HDCD facts");
+        assert_eq!(db.get_cached_hdcd_capabilities(&path), Some(capabilities));
+
+        // Same path, same size, same whole-second mtime, changed bytes and
+        // nanosecond identity. It cannot inherit a previously effectual scan.
+        std::fs::write(&path, b"5678").expect("replacement file bytes");
+        set_mtime(456_000_000);
+        let second = hdcd_file_identity(&path).expect("replacement identity");
+        assert_eq!(first.byte_len, second.byte_len);
+        assert_eq!(first.modified_ns / 1_000_000_000, second.modified_ns / 1_000_000_000);
+        assert_ne!(first.modified_ns, second.modified_ns);
+        assert_eq!(db.get_cached_hdcd_capabilities(&path), None);
+        assert!(db.store_cached_hdcd_capabilities(&path, capabilities, first).is_err());
+
+        let negative = HdcdCapabilities {
+            detected: false,
+            peak_extend: false,
+            low_level_gain_adjustment: false,
+            transient_filter: false,
+            max_gain_adjustment_db: 0.0,
+        };
+        db.store_cached_hdcd_capabilities(&path, negative, second)
+            .expect("cache negative scan for changed file");
+        assert_eq!(db.get_cached_hdcd_capabilities(&path), Some(negative));
+    }
+    #[test]
+    fn structured_hdcd_facts_survive_full_analysis_for_matching_identity_and_version() {
+        use crate::tui::analyze::{hdcd_file_identity, HdcdCapabilities};
+
+        let db = Database::open_memory().expect("database");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/regression/id3_wrapped_flac/id3v2_id3v1_48000.flac");
+        let path = temp.path().join("album.flac");
+        std::fs::copy(&fixture, &path).expect("copy FLAC fixture");
+        let identity = hdcd_file_identity(&path).expect("source identity");
+        let mtime = identity.modified_ns / 1_000_000_000;
+        let key = path.to_string_lossy().into_owned();
+        let caps = HdcdCapabilities {
+            detected: true,
+            peak_extend: true,
+            low_level_gain_adjustment: false,
+            transient_filter: false,
+            max_gain_adjustment_db: 0.0,
+        };
+        db.store_cached_hdcd_capabilities(&path, caps, identity)
+            .expect("store Convert HDCD facts");
+        let mut analysis = crate::tui::analyze::analyze_file(&path, None, None)
+            .expect("full analysis fixture");
+        analysis.loudness_status = crate::tui::analyze::LoudnessAnalysisStatus::Available;
+        db.store_analysis(&key, mtime, identity.byte_len, &analysis)
+            .expect("store full analysis");
+        assert_eq!(db.get_cached_hdcd_capabilities(&path), Some(caps));
+        assert!(db.get_cached_analysis(&key, mtime, identity.byte_len).is_some());
+
+        // Both the algorithm version and source identity are part of the
+        // preserved-column predicate. Neither may promote old HDCD facts.
+        db.conn.execute(
+            "UPDATE analysis_cache SET algo_version = ?1 WHERE file_path = ?2",
+            params![Database::ANALYSIS_ALGO_VERSION - 1, &key],
+        ).expect("simulate older algorithm row");
+        db.store_analysis(&key, mtime, identity.byte_len, &analysis)
+            .expect("refresh after version change");
+        assert_eq!(db.get_cached_hdcd_capabilities(&path), None);
+        let cleared: (Option<String>, Option<i64>) = db.conn.query_row(
+            "SELECT hdcd_capabilities, hdcd_mtime_ns FROM analysis_cache WHERE file_path = ?1",
+            params![&key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).expect("check version-invalidation columns");
+        assert_eq!(cleared, (None, None));
+
+        db.store_cached_hdcd_capabilities(&path, caps, identity)
+            .expect("refresh current-version HDCD facts");
+        db.store_analysis(&key, mtime + 1, identity.byte_len, &analysis)
+            .expect("replace row with different whole-second file identity");
+        assert_eq!(db.get_cached_hdcd_capabilities(&path), None);
+        let cleared: (Option<String>, Option<i64>) = db.conn.query_row(
+            "SELECT hdcd_capabilities, hdcd_mtime_ns FROM analysis_cache WHERE file_path = ?1",
+            params![&key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).expect("check identity-invalidation columns");
+        assert_eq!(cleared, (None, None));
+    }
+
 }

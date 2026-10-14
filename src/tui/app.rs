@@ -901,6 +901,54 @@ pub enum ConvertDeemphasisEvidence {
     ExplicitTag,
 }
 
+/// Per-path HDCD scan state; the source identity is checked again at commit.
+/// `capabilities: None` on an eligible member is an unresolved analysis failure,
+/// not a negative detection result.
+#[derive(Debug, Clone, Default)]
+pub struct ConvertHdcdPathState {
+    pub eligible: bool,
+    pub identity: Option<crate::tui::analyze::HdcdFileIdentity>,
+    pub capabilities: Option<crate::tui::analyze::HdcdCapabilities>,
+    /// A CUE's independent underlying image and track decisions. Image/CUE
+    /// identity must both still match before any of these decisions can run.
+    pub cue_image: Option<PathBuf>,
+    pub cue_image_identity: Option<crate::tui::analyze::HdcdFileIdentity>,
+    pub cue_tracks: Vec<ConvertHdcdCueTrack>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConvertHdcdCueTrack {
+    pub start_sample: u64,
+    pub sample_count: u64,
+    pub capabilities: Option<crate::tui::analyze::HdcdCapabilities>,
+}
+
+impl ConvertHdcdPathState {
+    pub fn resolved(&self) -> bool {
+        !self.eligible || (if self.cue_image.is_some() {
+            self.cue_image_identity.is_some()
+                && !self.cue_tracks.is_empty()
+                && self.cue_tracks.iter().all(|track| track.capabilities.is_some())
+        } else {
+            self.capabilities.is_some()
+        })
+    }
+
+    pub fn identity_current(&self, path: &Path) -> bool {
+        self.identity == crate::tui::analyze::hdcd_file_identity(path)
+            && self.cue_image.as_ref().is_none_or(|image| {
+                self.cue_image_identity == crate::tui::analyze::hdcd_file_identity(image)
+            })
+    }
+
+    pub fn has_actionable(&self) -> bool {
+        self.capabilities.is_some_and(|capabilities| capabilities.actionable())
+            || self.cue_tracks.iter().any(|track| {
+                track.capabilities.is_some_and(|capabilities| capabilities.actionable())
+            })
+    }
+}
+
 /// Per-path result retained by the bounded batch preflight.
 #[derive(Debug, Clone, Default)]
 pub struct ConvertDeemphasisPathState {
@@ -2162,6 +2210,149 @@ pub(crate) fn ensure_convert_deemphasis_batch_preflight(
 
     app.convert.source.deemphasis_batch_preflight_pending = true;
     spawn_convert_deemphasis_batch_preflight(app.probe_generation, paths, known_info, tx.clone());
+    false
+}
+
+
+/// Scan a Convert source inventory with concurrency exactly one.  Probe
+/// eligibility before consulting cached HDCD facts; never launch an FFmpeg
+/// detector on unknown or ineligible audio.  Database writes belong to the UI
+/// completion reducer, after it has checked generation and file identity.
+pub(crate) fn spawn_convert_hdcd_scan(
+    generation: u64,
+    paths: Vec<PathBuf>,
+    multitrack_paths: std::collections::BTreeSet<PathBuf>,
+    known_info: BTreeMap<PathBuf, SourceInfo>,
+    cached: BTreeMap<PathBuf, crate::tui::analyze::HdcdCapabilities>,
+    tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
+) {
+    tokio::spawn(async move {
+        let result_paths = paths.clone();
+        let mut results = Vec::with_capacity(paths.len());
+        for path in paths {
+            let is_multitrack = multitrack_paths.contains(&path);
+            let is_cue = path.extension().and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("cue"));
+            if is_multitrack || is_cue {
+                // CUE track boundaries are already authoritative in this
+                // front end. Probe the underlying image rather than asking
+                // ffmpeg to open a text .cue as an audio stream.
+                let cue_path = path.clone();
+                let layout = tokio::task::spawn_blocking(move || {
+                    if is_cue {
+                        crate::tui::cue_parser::detect_single_image_cue(&cue_path)
+                    } else {
+                        cue_path.parent().and_then(|parent| {
+                            crate::tui::cue_parser::detect_single_image_cues(parent)
+                                .into_iter().find(|info| info.audio_path == cue_path)
+                        })
+                    }
+                }).await.ok().flatten();
+                let mut state = ConvertHdcdPathState::default();
+                state.identity = crate::tui::analyze::hdcd_file_identity(&path);
+                if let Some(layout) = layout {
+                    let image = layout.audio_path;
+                    let image_probe = image.clone();
+                    let eligible = tokio::task::spawn_blocking(move || {
+                        crate::tui::probe::probe_audio(&image_probe).ok()
+                            .as_ref().is_some_and(crate::tui::probe::convert_hdcd_eligible)
+                            && crate::tui::cue_parser::can_ffmpeg_read(&image_probe)
+                    }).await.unwrap_or(false);
+                    state.eligible = eligible && layout.sample_rate == 44_100;
+                    state.cue_image_identity = crate::tui::analyze::hdcd_file_identity(&image);
+                    state.cue_image = Some(image.clone());
+                    if state.eligible && state.cue_image_identity.is_some() {
+                        for (start, count) in layout.track_boundaries {
+                            let detected = crate::tui::analyze::detect_hdcd_cue_samples(
+                                &image, start, count,
+                            ).await;
+                            state.cue_tracks.push(ConvertHdcdCueTrack {
+                                start_sample: start,
+                                sample_count: count,
+                                capabilities: detected.as_ref().map(Into::into),
+                            });
+                        }
+                        if crate::tui::analyze::hdcd_file_identity(&image)
+                            != state.cue_image_identity
+                        {
+                            for track in &mut state.cue_tracks {
+                                track.capabilities = None;
+                            }
+                        }
+                    }
+                }
+                results.push((path, state));
+                continue;
+            }
+            let known = known_info.get(&path).cloned();
+            let probe_path = path.clone();
+            let info = match known {
+                Some(info) => Some(info),
+                None => tokio::task::spawn_blocking(move || {
+                    crate::tui::probe::probe_audio(&probe_path).ok()
+                }).await.ok().flatten(),
+            };
+            let eligible = info.as_ref()
+                .is_some_and(crate::tui::probe::convert_hdcd_eligible);
+            let mut state = ConvertHdcdPathState { eligible, ..Default::default() };
+            state.identity = crate::tui::analyze::hdcd_file_identity(&path);
+            if eligible {
+                if let Some(identity) = state.identity {
+                    state.capabilities = match cached.get(&path).copied() {
+                        Some(value) => Some(value),
+                        None => crate::tui::analyze::detect_hdcd(&path, None, None)
+                            .await.as_ref().map(Into::into),
+                    };
+                    if crate::tui::analyze::hdcd_file_identity(&path) != Some(identity) {
+                        state.capabilities = None;
+                    }
+                }
+            }
+            results.push((path, state));
+        }
+        let _ = tx.send(
+            crate::tui::message::AppMessage::ConvertHdcdScanComplete {
+                generation, paths: result_paths, results,
+            }
+        ).await;
+    });
+}
+
+/// Reuse the UI connection to fetch valid cache hits before dispatching a
+/// worker. A completed source generation is stable until source replacement
+/// or reload; only scan admission, commit and execution check file identity.
+pub(crate) fn ensure_convert_hdcd_scan(
+    app: &mut AppState,
+    tx: &tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
+) -> bool {
+    if app.current_screen != AppScreen::Convert { return true; }
+    if app.convert.source.hdcd_scan_generation == Some(app.probe_generation) {
+        // Neither clone the inventory nor stat its files on ordinary UI ticks.
+        return !app.convert.source.hdcd_scan_pending;
+    }
+    // A same-path reload supersedes an in-flight worker; its old completion
+    // cannot clear the new generation's pending marker.
+    app.convert.source.hdcd_scan_pending = false;
+    let paths = app.convert.source.mode.all_paths();
+    if paths.is_empty() { return true; }
+    app.convert.source.hdcd_scan_results.clear();
+    let mut known_info = BTreeMap::new();
+    if let (Some(path), Some(info)) = (
+        app.convert.source.mode.current_path(), app.convert.source.mode.current_info(),
+    ) {
+        known_info.insert(path.clone(), info.clone());
+    }
+    let cached = paths.iter().filter_map(|path| {
+        app.db.get_cached_hdcd_capabilities(path).map(|facts| (path.clone(), facts))
+    }).collect();
+    app.convert.source.hdcd_scan_pending = true;
+    app.convert.source.hdcd_scan_generation = Some(app.probe_generation);
+    let multitrack_paths = if matches!(&app.convert.source.mode, SourceMode::MultiTrack { .. }) {
+        paths.iter().cloned().collect()
+    } else {
+        Default::default()
+    };
+    spawn_convert_hdcd_scan(app.probe_generation, paths, multitrack_paths, known_info, cached, tx.clone());
     false
 }
 
@@ -4585,6 +4776,10 @@ pub struct SourceState {
     pub deemphasis_batch_preflight: BTreeMap<PathBuf, ConvertDeemphasisPathState>,
     /// True while the current source generation has a bounded batch preflight in flight.
     pub deemphasis_batch_preflight_pending: bool,
+    /// One bounded HDCD inventory for the current source generation.
+    pub hdcd_scan_results: BTreeMap<PathBuf, ConvertHdcdPathState>,
+    pub hdcd_scan_pending: bool,
+    pub hdcd_scan_generation: Option<u64>,
     /// Audio paths whose sibling sidecar CUE was already evaluated by browse
     /// queue expansion and classified as a metadata artifact. This metadata is
     /// part of the Convert source payload, not process-global state: the user
@@ -4659,6 +4854,9 @@ impl Clone for SourceState {
             batch_probe_debounce: self.batch_probe_debounce.clone(),
             deemphasis_batch_preflight: self.deemphasis_batch_preflight.clone(),
             deemphasis_batch_preflight_pending: self.deemphasis_batch_preflight_pending,
+            hdcd_scan_results: self.hdcd_scan_results.clone(),
+            hdcd_scan_pending: self.hdcd_scan_pending,
+            hdcd_scan_generation: self.hdcd_scan_generation,
             cue_artifact_audio: self.cue_artifact_audio.clone(),
             cue_artifact_metadata: self.cue_artifact_metadata.clone(),
             explicit_cue_source_policy: self.explicit_cue_source_policy,
@@ -4682,6 +4880,9 @@ impl Default for SourceState {
             batch_probe_debounce: None,
             deemphasis_batch_preflight: BTreeMap::new(),
             deemphasis_batch_preflight_pending: false,
+            hdcd_scan_results: BTreeMap::new(),
+            hdcd_scan_pending: false,
+            hdcd_scan_generation: None,
             cue_artifact_audio: std::collections::HashSet::new(),
             cue_artifact_metadata: std::collections::BTreeMap::new(),
             explicit_cue_source_policy: None,
@@ -4730,6 +4931,8 @@ pub enum FormatField {
     Dither,
     /// CD source-rate de-emphasis correction.
     Deemphasis,
+    /// Source-control-bit HDCD decoding, separately gated from EQ.
+    HdcdDecode,
     ReplayGain,
     /// Enable the ordinary-PCM true-peak measure/gain step.
     PcmTruePeak,
@@ -5044,6 +5247,19 @@ pub struct FormatState {
     pub deemphasis_cue_count: usize,
     pub deemphasis_catalog_count: usize,
     pub deemphasis_total_count: usize,
+    /// Source-sensitive HDCD facts, never stored in a preset.
+    pub hdcd_eligible_count: usize,
+    pub hdcd_detected_count: usize,
+    pub hdcd_actionable_count: usize,
+    pub hdcd_transient_only_count: usize,
+    pub hdcd_passive_count: usize,
+    pub hdcd_total_count: usize,
+    pub hdcd_unresolved_count: usize,
+    pub hdcd_decode_enabled: bool,
+    pub hdcd_decode_overridden: bool,
+    pub(crate) hdcd_override_from_preset: bool,
+    /// Depth selected by the ordinary automatic policy before HDCD widened it.
+    pub hdcd_promoted_from_depth: Option<BitDepthChoice>,
     /// Probe-established DSD source sample rate used to disable impossible
     /// profile choices without replacing planner-grade validation.
     pub source_dsd_rate_hz: Option<u32>,
@@ -5397,6 +5613,17 @@ impl FormatState {
             deemphasis_cue_count: 0,
             deemphasis_catalog_count: 0,
             deemphasis_total_count: 0,
+            hdcd_eligible_count: 0,
+            hdcd_detected_count: 0,
+            hdcd_actionable_count: 0,
+            hdcd_transient_only_count: 0,
+            hdcd_passive_count: 0,
+            hdcd_total_count: 0,
+            hdcd_unresolved_count: 0,
+            hdcd_decode_enabled: false,
+            hdcd_decode_overridden: false,
+            hdcd_override_from_preset: false,
+            hdcd_promoted_from_depth: None,
             source_dsd_rate_hz: None,
             source_rate_identity: SourceRateIdentity::Unstaged,
             field_focus: FormatField::Format,
@@ -5682,6 +5909,9 @@ impl FormatState {
             if self.deemphasis_eligible && self.deemphasis_evidence != ConvertDeemphasisEvidence::None {
                 rows.push(FormatPaneRow::Field(FormatField::Deemphasis));
             }
+            if self.hdcd_detected_count > 0 {
+                rows.push(FormatPaneRow::Field(FormatField::HdcdDecode));
+            }
             if !self.source_is_dsd {
                 rows.push(FormatPaneRow::Field(FormatField::PcmTruePeak));
                 match *self.pcm_gain_mode.selected_value() {
@@ -5742,6 +5972,10 @@ impl FormatState {
             rows.push(FormatPaneRow::Spacer);
             rows.push(FormatPaneRow::Field(FormatField::Deemphasis));
         }
+        if maximized && self.hdcd_eligible_count > 0 && self.hdcd_detected_count == 0 {
+            rows.push(FormatPaneRow::Spacer);
+            rows.push(FormatPaneRow::Field(FormatField::HdcdDecode));
+        }
 
         if maximized && self.format.selected_value().available_containers().len() > 1 {
             rows.push(FormatPaneRow::Spacer);
@@ -5798,6 +6032,19 @@ impl FormatState {
         self.dither_override_from_preset = true;
     }
 
+    pub(crate) fn hdcd_is_actionable(&self) -> bool {
+        self.hdcd_actionable_count > 0 && self.hdcd_unresolved_count == 0
+    }
+
+    /// Preserve an explicit Off/On choice across all later scan and target
+    /// updates, but refuse interaction on passive/TF-only source evidence.
+    fn record_manual_hdcd_choice(&mut self, enabled: bool) {
+        self.hdcd_decode_enabled = enabled;
+        self.hdcd_decode_overridden = true;
+        self.hdcd_override_from_preset = false;
+        self.recompute_auto_hdcd();
+    }
+
     fn record_manual_deemphasis_choice(&mut self, enabled: bool) {
         self.deemphasis_enabled = enabled;
         self.deemphasis_overridden = true;
@@ -5814,6 +6061,7 @@ impl FormatState {
     }
 
     pub(crate) fn mark_bit_depth_user_policy(&mut self) {
+        self.hdcd_promoted_from_depth = None;
         self.bit_depth_overridden = true;
         self.source_derived_bit_depth = None;
     }
@@ -6079,6 +6327,12 @@ impl FormatState {
             self.apply_auto_dither(source_bits);
             return;
         }
+        if self.field_focus == FormatField::HdcdDecode {
+            if self.hdcd_is_actionable() {
+                self.record_manual_hdcd_choice(!self.hdcd_decode_enabled);
+            }
+            return;
+        }
         if self.field_focus == FormatField::Container {
             self.select_container_next();
             return;
@@ -6108,6 +6362,12 @@ impl FormatState {
         if self.field_focus == FormatField::Deemphasis {
             self.record_manual_deemphasis_choice(!self.deemphasis_enabled);
             self.apply_auto_dither(source_bits);
+            return;
+        }
+        if self.field_focus == FormatField::HdcdDecode {
+            if self.hdcd_is_actionable() {
+                self.record_manual_hdcd_choice(!self.hdcd_decode_enabled);
+            }
             return;
         }
         if self.field_focus == FormatField::Container {
@@ -6163,6 +6423,14 @@ impl FormatState {
             FormatField::BitDepth => select_enabled_index(&mut self.bit_depth, index),
             FormatField::Resampler => select_enabled_index(&mut self.resampler, index),
             FormatField::Dither => select_enabled_index(&mut self.dither, index),
+            FormatField::HdcdDecode => {
+                if !self.hdcd_is_actionable() || index > 1 {
+                    false
+                } else {
+                    self.record_manual_hdcd_choice(index == 1);
+                    true
+                }
+            }
             FormatField::Deemphasis => {
                 if !self.deemphasis_eligible {
                     false
@@ -6376,6 +6644,7 @@ impl FormatState {
             // after the constraint pass above. Re-evaluate the source/target
             // default from that final rate rather than the transient clamp.
             self.recompute_auto_deemphasis();
+            self.recompute_auto_hdcd();
             // `recompute_auto_deemphasis` derives source depth from stored probe
             // facts. During a live interaction the caller may already have a
             // newer authoritative depth, so let that value win after every
@@ -6604,6 +6873,145 @@ impl FormatState {
         self.recompute_auto_deemphasis();
     }
 
+    /// Install only facts from the current source generation. Per-member
+    /// capability/identity remain in SourceState and govern execution.
+    pub fn set_convert_hdcd_summary(
+        &mut self,
+        items: &BTreeMap<PathBuf, ConvertHdcdPathState>,
+    ) {
+        use crate::tui::analyze::HdcdClassification;
+        self.hdcd_total_count = items.values().map(|state| {
+            if state.cue_image.is_some() && !state.cue_tracks.is_empty() {
+                state.cue_tracks.len()
+            } else {
+                1
+            }
+        }).sum();
+        self.hdcd_eligible_count = 0;
+        self.hdcd_detected_count = 0;
+        self.hdcd_actionable_count = 0;
+        self.hdcd_transient_only_count = 0;
+        self.hdcd_passive_count = 0;
+        self.hdcd_unresolved_count = 0;
+        for state in items.values().filter(|state| state.eligible) {
+            let facts = if state.cue_image.is_some() {
+                state.cue_tracks.iter().map(|track| track.capabilities).collect::<Vec<_>>()
+            } else {
+                vec![state.capabilities]
+            };
+            for facts in facts {
+                self.hdcd_eligible_count += 1;
+                match facts.map(|capabilities| capabilities.classify()) {
+                    None => self.hdcd_unresolved_count += 1,
+                    Some(HdcdClassification::NotDetected) => {}
+                    Some(HdcdClassification::Effectual) => {
+                        self.hdcd_detected_count += 1;
+                        self.hdcd_actionable_count += 1;
+                    }
+                    Some(HdcdClassification::TransientOnly) => {
+                        self.hdcd_detected_count += 1;
+                        self.hdcd_transient_only_count += 1;
+                    }
+                    Some(HdcdClassification::Passive) => {
+                        self.hdcd_detected_count += 1;
+                        self.hdcd_passive_count += 1;
+                    }
+                }
+            }
+        }
+        self.recompute_auto_hdcd();
+    }
+
+    /// Automatic preservation applies ONLY to a lossless 16-bit integer
+    /// target at 44.1 kHz; all other targets restore detected PE/LLE.
+    fn hdcd_target_preserves_cd_domain(&self) -> bool {
+        let format = *self.format.selected_value();
+        let lossless = matches!(format,
+            AudioFormat::Flac | AudioFormat::Wav | AudioFormat::Aiff
+                | AudioFormat::WavPack | AudioFormat::Alac | AudioFormat::Lpcm)
+            && !(format == AudioFormat::WavPack && self.wavpack_hybrid);
+        if !lossless { return false; }
+        let source_rate = self.source_pcm_rate_hz;
+        let rate = match *self.sample_rate.selected_value() {
+            SOURCE_SAMPLE_RATE_SENTINEL if self.hdcd_eligible_count > 0 => Some(44_100),
+            SOURCE_SAMPLE_RATE_SENTINEL => source_rate,
+            target => Some(target),
+        };
+        let effective_depth = if !self.bit_depth_overridden {
+            self.hdcd_promoted_from_depth
+                .unwrap_or(*self.bit_depth.selected_value())
+        } else {
+            *self.bit_depth.selected_value()
+        };
+        let depth_16 = match effective_depth {
+            BitDepthChoice::Source => self.hdcd_eligible_count > 0 ||
+                (self.source_pcm_bit_depth == Some(16)
+                    && self.source_pcm_float_bits.is_none()),
+            BitDepthChoice::Int16 => true,
+            _ => false,
+        };
+        rate == Some(44_100) && depth_16
+    }
+
+    /// HDCD's automatic bit-depth widening never overwrites a user-owned
+    /// bit-depth setting and returns its previous source-derived choice when
+    /// the decoder is no longer selected.
+    pub fn recompute_auto_hdcd(&mut self) {
+        if !self.hdcd_decode_overridden {
+            self.hdcd_decode_enabled = self.hdcd_actionable_count > 0
+                && self.hdcd_unresolved_count == 0
+                && !self.hdcd_target_preserves_cd_domain();
+        }
+        let needs_widening = self.hdcd_decode_enabled && self.hdcd_is_actionable()
+            && !self.is_lossy_codec_selected()
+            && !self.bit_depth_overridden
+            && matches!(*self.bit_depth.selected_value(),
+                BitDepthChoice::Source | BitDepthChoice::Int16);
+        if needs_widening {
+            if self.hdcd_promoted_from_depth.is_none() {
+                self.hdcd_promoted_from_depth = Some(*self.bit_depth.selected_value());
+            }
+            self.bit_depth.select_value(&BitDepthChoice::Int24);
+            self.source_derived_bit_depth = Some(BitDepthChoice::Int24);
+        } else if let Some(previous) = self.hdcd_promoted_from_depth.take() {
+            if !self.bit_depth_overridden
+                && *self.bit_depth.selected_value() == BitDepthChoice::Int24
+            {
+                self.bit_depth.select_value(&previous);
+                self.source_derived_bit_depth = (!previous.is_source()).then_some(previous);
+            }
+        }
+    }
+
+    /// Visible Convert warning when explicit Decode Off risks losing
+    /// supported HDCD correction data. Pure lossless 44.1-kHz widening only
+    /// changes the expected CD playback representation, not the source bits.
+    pub(crate) fn hdcd_manual_off_warning(&self) -> Option<&'static str> {
+        if !self.hdcd_is_actionable()
+            || !self.hdcd_decode_overridden
+            || self.hdcd_decode_enabled
+            || self.hdcd_target_preserves_cd_domain()
+        {
+            return None;
+        }
+        let rate = match *self.sample_rate.selected_value() {
+            SOURCE_SAMPLE_RATE_SENTINEL => self.source_pcm_rate_hz.or(Some(44_100)),
+            value => Some(value),
+        };
+        let output = *self.format.selected_value();
+        let lossless = matches!(output,
+            AudioFormat::Flac | AudioFormat::Wav | AudioFormat::Aiff
+            | AudioFormat::WavPack | AudioFormat::Alac | AudioFormat::Lpcm)
+            && !(output == AudioFormat::WavPack && self.wavpack_hybrid);
+        if lossless && rate == Some(44_100) && !self.deemphasis_enabled
+            && *self.dither.selected_value() == DitherType::None
+            && matches!(*self.pcm_gain_mode.selected_value(), PcmGainMode::Off)
+        {
+            return Some("ⓘ HDCD Decode Off: wider PCM may not be recognized by HDCD players.");
+        }
+        Some("⚠ HDCD Decode Off: conversion may destroy HDCD control codes.")
+    }
+
     /// True only for the one output domain that may retain a pre-emphasized
     /// waveform and CD playback signaling.
     pub fn deemphasis_target_is_preservation_domain(&self) -> bool {
@@ -6678,6 +7086,27 @@ impl FormatState {
         self.deemphasis_cue_count = 0;
         self.deemphasis_catalog_count = 0;
         self.deemphasis_total_count = 0;
+        self.hdcd_eligible_count = 0;
+        self.hdcd_detected_count = 0;
+        self.hdcd_actionable_count = 0;
+        self.hdcd_transient_only_count = 0;
+        self.hdcd_passive_count = 0;
+        self.hdcd_total_count = 0;
+        self.hdcd_unresolved_count = 0;
+        self.hdcd_decode_enabled = false;
+        self.hdcd_decode_overridden = false;
+        self.hdcd_override_from_preset = false;
+        // Undo only HDCD's source-derived precision widening before the
+        // ordinary source-reset path examines the bit-depth pill. Otherwise
+        // a new source can inherit the previous source's Int24 promotion.
+        if let Some(previous) = self.hdcd_promoted_from_depth.take() {
+            if !self.bit_depth_overridden
+                && *self.bit_depth.selected_value() == BitDepthChoice::Int24
+            {
+                self.bit_depth.select_value(&previous);
+                self.source_derived_bit_depth = (!previous.is_source()).then_some(previous);
+            }
+        }
         self.source_pcm_rate_hz = None;
         self.source_pcm_bit_depth = None;
     }
@@ -7183,6 +7612,7 @@ impl FormatState {
             }
         }
         self.recompute_auto_deemphasis();
+        self.recompute_auto_hdcd();
         if !self.visible_fields(true).contains(&self.field_focus) {
             self.field_focus = FormatField::Format;
         }
@@ -7231,6 +7661,7 @@ impl FormatState {
             FormatField::Resampler => FocusedPill::Resampler(&mut self.resampler),
             FormatField::Dither => FocusedPill::Dither(&mut self.dither),
             FormatField::Deemphasis => unreachable!("de-emphasis uses its dedicated boolean selector"),
+            FormatField::HdcdDecode => unreachable!("HDCD uses its dedicated boolean selector"),
             FormatField::ReplayGain => FocusedPill::ReplayGain(&mut self.replaygain),
             FormatField::PcmTruePeak => FocusedPill::PcmTruePeak(&mut self.pcm_gain_mode),
             FormatField::PcmGainDb => FocusedPill::PcmGainDb {
@@ -8102,6 +8533,9 @@ impl ConvertState {
         if !same_logical_source {
             self.source.deemphasis_batch_preflight.clear();
             self.source.deemphasis_batch_preflight_pending = false;
+            self.source.hdcd_scan_results.clear();
+            self.source.hdcd_scan_pending = false;
+            self.source.hdcd_scan_generation = None;
             self.format.reset_deemphasis_for_source_replacement();
         }
         self.source.explicit_cue_source_policy = None;
@@ -9864,6 +10298,8 @@ pub struct MetadataAnalysisFacts {
     /// None means HDCD has not been scanned or is not applicable.
     pub hdcd_detected: Option<bool>,
     pub hdcd_detail: Option<String>,
+    /// Structured HDCD feature bits. None for unscanned/legacy cache entries.
+    pub hdcd_capabilities: Option<crate::tui::analyze::HdcdCapabilities>,
     /// None means pre-emphasis has not been scanned.
     pub preemphasis: Option<crate::tui::preemphasis::PreemphasisConfidence>,
     pub preemphasis_detail: Option<String>,
@@ -9871,7 +10307,7 @@ pub struct MetadataAnalysisFacts {
 
 impl MetadataAnalysisFacts {
     pub fn has_any_result(&self) -> bool {
-        self.hdcd_detected.is_some() || self.preemphasis.is_some()
+        self.hdcd_detected.is_some() || self.hdcd_capabilities.is_some() || self.preemphasis.is_some()
     }
 }
 
@@ -10069,6 +10505,7 @@ impl MetadataFileDetails {
         if facts.hdcd_detected.is_some() {
             self.analysis_facts.hdcd_detected = facts.hdcd_detected;
             self.analysis_facts.hdcd_detail = facts.hdcd_detail.clone();
+            self.analysis_facts.hdcd_capabilities = facts.hdcd_capabilities;
         }
         if facts.preemphasis.is_some() {
             self.analysis_facts.preemphasis = facts.preemphasis;
@@ -24484,5 +24921,104 @@ mod r29_shared_ceiling_grid_tests {
         }
         assert_eq!(tonepoet_pipeline::SampleGainPolicy::TARGET_SELECT_STEP,
             tonepoet_pipeline::DbNano(250_000_000));
+    }
+}
+
+#[cfg(test)]
+mod hdcd_format_policy_tests {
+    use super::*;
+    use crate::tui::analyze::HdcdCapabilities;
+
+    fn state_for(capabilities: HdcdCapabilities) -> FormatState {
+        let mut format = FormatState::new();
+        assert!(format.format.select_value(&AudioFormat::Flac));
+        assert!(format.sample_rate.select_value(&SOURCE_SAMPLE_RATE_SENTINEL));
+        assert!(format.bit_depth.select_value(&BitDepthChoice::Source));
+        format.set_convert_hdcd_summary(&BTreeMap::from([(
+            PathBuf::from("track.flac"),
+            ConvertHdcdPathState {
+                eligible: true,
+                capabilities: Some(capabilities),
+                ..Default::default()
+            },
+        )]));
+        format
+    }
+
+    fn capabilities(detected: bool, pe: bool, gain: bool, tf: bool) -> HdcdCapabilities {
+        HdcdCapabilities {
+            detected, peak_extend: pe, low_level_gain_adjustment: gain,
+            transient_filter: tf, max_gain_adjustment_db: if gain { -3.0 } else { 0.0 },
+        }
+    }
+
+    #[test]
+    fn hdcd_detection_promotes_only_detected_rows_and_defaults_preservation_off() {
+        let format = state_for(capabilities(false, false, false, false));
+        assert!(!format.hdcd_decode_enabled);
+        assert!(!format.visible_fields(false).contains(&FormatField::HdcdDecode));
+        assert!(format.visible_fields(true).contains(&FormatField::HdcdDecode));
+
+        let format = state_for(capabilities(true, true, false, false));
+        assert!(format.visible_fields(false).contains(&FormatField::HdcdDecode));
+        assert!(!format.hdcd_decode_enabled);
+
+        for (pe, gain, tf) in [(false, false, true), (false, false, false)] {
+            let mut format = state_for(capabilities(true, pe, gain, tf));
+            assert!(format.visible_fields(false).contains(&FormatField::HdcdDecode));
+            assert!(!format.hdcd_is_actionable());
+            assert!(!format.select_row_index(FormatField::HdcdDecode, 1, None, None));
+            assert!(!format.hdcd_decode_enabled);
+        }
+    }
+
+    #[test]
+    fn hdcd_target_defaults_widen_auto_depth_and_preserve_manual_selection() {
+        let mut format = state_for(capabilities(true, false, true, true));
+        assert!(!format.hdcd_decode_enabled);
+        assert!(format.sample_rate.select_value(&88_200));
+        format.recompute_auto_hdcd();
+        assert!(format.hdcd_decode_enabled);
+        assert_eq!(*format.bit_depth.selected_value(), BitDepthChoice::Int24);
+        assert_eq!(format.hdcd_promoted_from_depth, Some(BitDepthChoice::Source));
+
+        // A later explicit Off remains Off when the target changes again.
+        assert!(format.select_row_index(FormatField::HdcdDecode, 0, None, Some(44_100)));
+        assert!(!format.hdcd_decode_enabled);
+        assert!(format.hdcd_decode_overridden);
+        assert!(format.sample_rate.select_value(&96_000));
+        format.recompute_auto_hdcd();
+        assert!(!format.hdcd_decode_enabled);
+        assert_eq!(*format.bit_depth.selected_value(), BitDepthChoice::Source);
+
+        // Replacing the source must clear the choice and any auto promotion.
+        format.reset_deemphasis_for_source_replacement();
+        assert!(!format.hdcd_decode_overridden);
+        assert!(!format.hdcd_decode_enabled);
+        assert_eq!(*format.bit_depth.selected_value(), BitDepthChoice::Source);
+    }
+
+    #[test]
+    fn source_replacement_reverts_active_hdcd_auto_precision_promotion() {
+        let mut format = state_for(capabilities(true, true, false, false));
+        assert!(format.sample_rate.select_value(&88_200));
+        format.recompute_auto_hdcd();
+        assert_eq!(*format.bit_depth.selected_value(), BitDepthChoice::Int24);
+        format.reset_deemphasis_for_source_replacement();
+        format.clear_source_derived_defaults();
+        assert_eq!(*format.bit_depth.selected_value(), BitDepthChoice::Source);
+        assert!(format.hdcd_promoted_from_depth.is_none());
+    }
+
+    #[test]
+    fn hdcd_manual_off_warning_distinguishes_widening_from_sample_dsp() {
+        let mut format = state_for(capabilities(true, true, false, false));
+        assert!(format.select_row_index(FormatField::HdcdDecode, 0, None, Some(44_100)));
+        assert!(format.bit_depth.select_value(&BitDepthChoice::Int24));
+        format.recompute_auto_hdcd();
+        assert!(format.hdcd_manual_off_warning().is_some_and(|text| text.contains("wider PCM")));
+        assert!(format.sample_rate.select_value(&88_200));
+        format.recompute_auto_hdcd();
+        assert!(format.hdcd_manual_off_warning().is_some_and(|text| text.contains("destroy")));
     }
 }
