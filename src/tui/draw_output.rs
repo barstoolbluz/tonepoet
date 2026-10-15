@@ -42,7 +42,7 @@ pub fn draw_format_pane(
     let hdcd_suffix: String = if let Some(warning) = format_state.hdcd_manual_off_warning() {
         warning.to_string()
     } else if format_state.hdcd_is_actionable() {
-        "\u{24d8} HDCD present".to_string()
+        "\u{24d8} HDCD detected".to_string()
     } else {
         String::new()
     };
