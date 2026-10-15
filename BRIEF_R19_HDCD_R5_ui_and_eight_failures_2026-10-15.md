@@ -1,4 +1,4 @@
-# BRIEF — R4D: the migration defect is fixed, eight tests fail, and four UI changes
+# BRIEF — R4D: the migration defect is fixed, eight tests fail, and five UI changes
 
 R4/R4C/R4D applied. It compiled as delivered. The v28 migration defect is
 resolved: `db::tests` is 83 of 83, and the whole upgrade matrix passes.
@@ -8,7 +8,7 @@ Gate: **7490 passed / 9 failed**. One is the expected source-lock freshness
 failure — `plan_bridge.rs`, `plugins.rs` and `semantic_plan.rs` moved, so
 requalification is owed. The other eight each fail 1 of 1 alone.
 
-## 1. Two AAC tests die on a container check before reaching their assertions
+## 1. Two new AAC tests die on their own fixture's output path
 
 ```
 plugins::tests::libfdk_aac_quantizes_a_wide_carrier_once_at_its_terminal_boundary
@@ -19,9 +19,10 @@ InvalidSettings { field: "output_path", reason: "AAC output must use an .m4a,
 implemented" }
 ```
 
-Both are pre-existing and both passed before this round.
+Both are new in this round. They never reach the terminal-boundary and
+dither-boundary behaviour they were written to check.
 
-## 2. A certified DSD route changed its arguments
+## 2. A certified DSD route changed its arguments — pre-existing test
 
 ```
 plugins::tests::ffmpeg_lossy_album_gain_pins_measured_encoder_input_rate
@@ -51,8 +52,11 @@ src/tui/app.rs:25102
   assertion failed: state.bit_depth.select_value(&depth)
 ```
 
-The format constraint cascade disables bit depth for MP3, AAC and Opus, so the
-selection is refused. This is the round's own test for the revised defaults.
+The failing line is `:25102`, inside the float loop: the test selects
+`AudioFormat::Wav` at `:25100`, then selects `Float32` at `:25102`, and only
+calls `apply_format_constraints()` at `:25103`. The pill is still carrying the
+previous format's constraints, which disable float, so the selection is
+refused. This is the round's own test for the revised defaults.
 
 ## 5. Three failures carried over unfixed from the last brief
 
