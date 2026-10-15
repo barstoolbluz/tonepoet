@@ -33,8 +33,9 @@ certified DSD carrier must retain its previously qualified gain/rate path:
   -ar 96000 -sample_fmt s16 -c:a libfdk_aac
 ```
 
-A dither and an s16 conversion now appear inside a qualified DSD gain/rate
-path.
+The assertion is that a certified DSD carrier's command contains no
+`aresample=` at all. It now contains one, carrying a soxr resample, triangular
+dither and an s16 conversion.
 
 ## 3. Lossy targets lost their direct route
 
@@ -52,13 +53,16 @@ src/tui/app.rs:25102
   assertion failed: state.bit_depth.select_value(&depth)
 ```
 
-The failing line is `:25102`, inside the float loop: the test selects
+Our reading: the failing line is `:25102`, inside the float loop. The test selects
 `AudioFormat::Wav` at `:25100`, then selects `Float32` at `:25102`, and only
 calls `apply_format_constraints()` at `:25103`. The pill is still carrying the
 previous format's constraints, which disable float, so the selection is
 refused. This is the round's own test for the revised defaults.
 
-## 5. Three failures carried over unfixed from the last brief
+## 5. Three failures also present in the previous gate, still failing
+
+The first was described in the last brief as part of the migration cluster; the
+other two were in that gate's output but were not written up.
 
 ```
 tui::app::app_startup_options_tests::quiescent_v23_startup_activates_v24_protocol_then_current_schema_without_fallback
