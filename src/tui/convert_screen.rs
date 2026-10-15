@@ -318,9 +318,7 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
                     buttons.record_button(TuiButton::HdcdPill(0), Rect::new(label_col, y, 5, 1));
                     buttons.record_button(TuiButton::HdcdPill(1), Rect::new(label_col + 7, y, 4, 1));
                 }
-                if state.hdcd_detected_count > 0 {
-                    buttons.record_button(TuiButton::HdcdInfo, Rect::new(label_col + 13, y, 2, 1));
-                }
+                buttons.record_button(TuiButton::HdcdInfo, Rect::new(label_col + 13, y, 2, 1));
             }
             FormatField::ReplayGain => register_pill_row(buttons, &state.replaygain, y, label_col, TuiButton::ReplayGainPill),
             FormatField::PcmTruePeak => register_pill_row(
@@ -357,7 +355,10 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
                 ) {
                     buttons.record_button(TuiButton::PcmTruePeakCustomPill, Rect::new(area.x + offset, y, 8, 1));
                 }
-                register_true_peak_info_button(buttons, area, y);
+                register_true_peak_info_button(
+                    buttons, area, y, state.pcm_true_peak_target_dbtp,
+                    state.true_peak_target_editing == Some(field),
+                );
             }
             FormatField::NoiseShaper => register_pill_row(buttons, &state.noise_shaper, y, label_col, TuiButton::NoiseShaperPill),
             FormatField::ModulatorOrder => register_pill_row(buttons, &state.modulator_order, y, label_col, TuiButton::ModulatorOrderPill),
@@ -383,7 +384,10 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
                 ) {
                     buttons.record_button(TuiButton::DsdTruePeakCustomPill, Rect::new(area.x + offset, y, 8, 1));
                 }
-                register_true_peak_info_button(buttons, area, y);
+                register_true_peak_info_button(
+                    buttons, area, y, state.dsd_true_peak_target_dbtp,
+                    state.true_peak_target_editing == Some(field),
+                );
             }
             FormatField::Container => {
                 let containers = state.format.selected_value().available_containers();
@@ -457,11 +461,20 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
 
 // Concrete hit target is recorded after the whole-row target so the icon
 // opens help instead of entering the value editor. Match the draw guard.
-fn register_true_peak_info_button(buttons: &mut ButtonRenderMap, area: Rect, y: u16) {
-    if area.width >= 30 && area.height >= 6 {
+fn register_true_peak_info_button(
+    buttons: &mut ButtonRenderMap,
+    area: Rect,
+    y: u16,
+    value: tonepoet_pipeline::DbNano,
+    editing: bool,
+) {
+    if area.width < 30 || area.height < 6 {
+        return; // Matches draw_format_pane's visibility guard.
+    }
+    if let Some(offset) = true_peak_info_offset(value, editing, area.width as usize) {
         buttons.record_button(
             TuiButton::TruePeakInfo,
-            Rect::new(area.x + true_peak_info_offset(), y, 2, 1),
+            Rect::new(area.x + offset, y, 2, 1),
         );
     }
 }

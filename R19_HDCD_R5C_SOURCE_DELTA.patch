@@ -1,0 +1,262 @@
+--- a/src/tui/app.rs
++++ b/src/tui/app.rs
+@@ -2541,10 +2541,13 @@
+ pub struct PendingBrowseConvertPresetContinuation {
+     pub generation: u64,
+     pub path: PathBuf,
+     pub preset: String,
+     pub post_load: crate::tui::command::BrowseConvertPostLoad,
++    /// Expansion warnings must survive the source probe before a post-load
++    /// commit continuation (if needed) can own them.
++    pub status_notes: Vec<String>,
+ }
+ 
+ /// Deferred Browse post-load action waiting for both source-level scan gates.
+ /// Generation plus the complete path vector prevents stale background work
+ /// from committing a replacement source.
+--- a/src/tui/command.rs
++++ b/src/tui/command.rs
+@@ -1585,25 +1585,33 @@
+                 post_load,
+                 expansion.queue,
+                 expansion.expanded_folder_count,
+                 true,
+             ) {
+-                // A post-load commit may be suspended on the de-emphasis and
+-                // HDCD workers. Save these notes with that exact continuation
+-                // so the eventual queue status cannot erase them.
+-                if let Some(pending) = app.pending_browse_convert_post_load_continuation.as_mut() {
+-                    for note in [first_warning.as_deref(), cue_warning.as_deref()].into_iter().flatten() {
+-                        if !pending.status_notes.iter().any(|existing| existing.as_str() == note) {
+-                            pending.status_notes.push(note.to_owned());
++                // The named-preset source probe may precede the two source
++                // scans. Keep these at-most-two expansion notes with whichever
++                // continuation owns this review so that no intermediate status
++                // (preset loaded / scans pending) can erase the final warning.
++                for note in [first_warning.as_deref(), cue_warning.as_deref()]
++                    .into_iter()
++                    .flatten()
++                {
++                    let pending_notes = if let Some(pending) =
++                        app.pending_browse_convert_preset_continuation.as_mut()
++                    {
++                        Some(&mut pending.status_notes)
++                    } else {
++                        app.pending_browse_convert_post_load_continuation
++                            .as_mut()
++                            .map(|pending| &mut pending.status_notes)
++                    };
++                    if let Some(notes) = pending_notes {
++                        if !notes.iter().any(|existing| existing.as_str() == note) {
++                            notes.push(note.to_owned());
+                         }
+                     }
+-                }
+-                if let Some(warning) = first_warning.as_deref() {
+-                    append_current_status_note_if_missing(app, warning);
+-                }
+-                if let Some(warning) = cue_warning.as_deref() {
+-                    append_current_status_note_if_missing(app, warning);
++                    append_current_status_note_if_missing(app, note);
+                 }
+             }
+             prefix_current_status_with_stale_selection_notice(
+                 app,
+                 request.dropped_stale_selection_count,
+@@ -9407,10 +9415,11 @@
+                 super::app::PendingBrowseConvertPresetContinuation {
+                     generation: app.probe_generation,
+                     path,
+                     preset: name,
+                     post_load,
++                    status_notes: Vec::new(),
+                 },
+             );
+             return true;
+         }
+         if let Err(msg) = load_queue_preset_into_pills(app, &name) {
+@@ -9465,10 +9474,13 @@
+     if is_iso && app.convert.format.source_rate_identity != super::app::SourceRateIdentity::Known {
+         app.set_status(format!(
+             "preset '{}' not applied: ISO source type could not be established by the audio probe",
+             pending.preset,
+         ));
++        for note in pending.status_notes {
++            append_current_status_note_if_missing(app, &note);
++        }
+         return true;
+     }
+ 
+     match load_queue_preset_into_pills(app, &pending.preset) {
+         Ok(report) => {
+@@ -9480,10 +9492,20 @@
+             apply_browse_convert_post_load_action(app, tx, pending.post_load);
+         }
+         Err(message) => {
+             app.set_status(message);
+         }
++    }
++    // An immediate commit (or a preset refusal) owns the final status now.
++    // Otherwise hand the same notes to the existing scan-gated continuation.
++    for note in pending.status_notes {
++        if let Some(post_load) = app.pending_browse_convert_post_load_continuation.as_mut() {
++            if !post_load.status_notes.contains(&note) {
++                post_load.status_notes.push(note.clone());
++            }
++        }
++        append_current_status_note_if_missing(app, &note);
+     }
+     true
+ }
+ 
+ fn apply_browse_convert_post_load_action(
+@@ -21510,10 +21532,149 @@
+             "final commit status must retain the quiet-auto CUE warning even when it is not first: {status}"
+         );
+     }
+ 
+     #[tokio::test]
++    async fn async_named_preset_commit_preserves_both_cue_warnings_across_probe_and_scans() {
++        let _home = crate::tui::test_support::XdgConfigHomeGuard::new("r5c-preset-cue-warning");
++        let temp = tempfile::tempdir().expect("tempdir");
++        let album = temp.path().join("album");
++        std::fs::create_dir_all(&album).expect("album dir");
++        let track = album.join("01 - One.wav");
++        // A small, valid PCM WAV keeps the source probe meaningful without a
++        // test-time encoder dependency. Probe publication remains asynchronous.
++        let pcm = vec![0_u8; 4096];
++        let mut wav = Vec::with_capacity(44 + pcm.len());
++        wav.extend_from_slice(b"RIFF");
++        wav.extend_from_slice(&(36 + pcm.len() as u32).to_le_bytes());
++        wav.extend_from_slice(b"WAVEfmt ");
++        wav.extend_from_slice(&16_u32.to_le_bytes());
++        wav.extend_from_slice(&1_u16.to_le_bytes());
++        wav.extend_from_slice(&2_u16.to_le_bytes());
++        wav.extend_from_slice(&44_100_u32.to_le_bytes());
++        wav.extend_from_slice(&176_400_u32.to_le_bytes());
++        wav.extend_from_slice(&4_u16.to_le_bytes());
++        wav.extend_from_slice(&16_u16.to_le_bytes());
++        wav.extend_from_slice(b"data");
++        wav.extend_from_slice(&(pcm.len() as u32).to_le_bytes());
++        wav.extend_from_slice(&pcm);
++        std::fs::write(&track, wav).expect("PCM WAV fixture");
++
++        let preset_name = "r5c-named-preset-cue-warning";
++        let mut preset_output = super::super::app::OutputOptionsState::new();
++        preset_output.dest_path = Some(temp.path().join("out"));
++        let preset = super::super::presets::TuiPreset::from_pill_state(
++            preset_name,
++            &super::super::app::FormatState::new(),
++            &preset_output,
++            &super::super::app::MetadataState::default(),
++        );
++        super::super::presets::save_preset(&preset).expect("save named preset");
++
++        let ordinary_warning = "some unrelated expansion warning".to_string();
++        let cue_warning =
++            "Ignored malformed cumulative multi-FILE CUE combined.cue: later FILE sections use cumulative timestamps"
++                .to_string();
++        let (tx, mut rx) = mpsc::channel(8);
++        let mut config = TonepoetConfig::default();
++        config.conversion.default_destination = Some(temp.path().join("out"));
++        let mut app = AppState::new_for_test(config);
++        app.current_screen = AppScreen::Browse;
++        app.browse.current_dir = temp.path().to_path_buf();
++        app.browse.entries = vec![BrowseEntry::new(
++            album.clone(),
++            "album".to_string(),
++            EntryKind::Directory,
++            0,
++            None,
++        )];
++        app.browse.selected_index = 0;
++
++        let request = BrowseConvertExpansionRequest {
++            target: BrowseConvertExpansionTarget::ConvertReview {
++                preset: Some(preset_name.to_string()),
++                post_load: BrowseConvertPostLoad::Commit { start: false },
++            },
++            selection_snapshot: vec![album.clone()],
++            queue_input_paths: vec![album],
++            selection_owned_by_context_menu: false,
++            browse_tab_id: app.browse.active_tab_id(),
++            browse_directory: app.browse.current_dir.clone(),
++            browse_archive_inner_path: None,
++            browse_scan_generation: app.browse.scan_generation,
++            cached_regular_folder_count: 1,
++            browse_in_archive: false,
++            dropped_stale_selection_count: 0,
++            cue_selection_overrides: QueueCueSelectionOverrides::new(),
++        };
++        let (generation, _cancel) = app.begin_browse_convert_expansion(request.clone());
++        handle_browse_convert_expansion_complete(
++            &mut app,
++            &tx,
++            generation,
++            request,
++            BrowseConvertExpansion {
++                queue: QueueExpansionResult {
++                    paths: vec![track],
++                    expansion_errors: vec![ordinary_warning.clone(), cue_warning.clone()],
++                    ..QueueExpansionResult::default()
++                },
++                resolved_archive_passwords: BTreeMap::new(),
++                refused_explicit_paths: Vec::new(),
++                expanded_folder_count: 1,
++                empty_audio_folders: Vec::new(),
++                expansion_errors: Vec::new(),
++                visited: 1,
++                cancelled: false,
++            },
++        );
++        let pending = app.pending_browse_convert_preset_continuation.as_ref()
++            .expect("named preset must defer until source probe event");
++        assert_eq!(pending.status_notes, vec![ordinary_warning.clone(), cue_warning.clone()]);
++        assert!(app.pending_browse_convert_post_load_continuation.is_none());
++
++        let (mut saw_probe, mut saw_hdcd) = (false, false);
++        for _ in 0..32 {
++            if saw_probe && saw_hdcd
++                && app.pending_browse_convert_preset_continuation.is_none()
++                && app.pending_browse_convert_post_load_continuation.is_none()
++            {
++                break;
++            }
++            let message = tokio::time::timeout(
++                std::time::Duration::from_secs(5), rx.recv(),
++            ).await.expect("probe or source scan event").expect("scan channel open");
++            let is_probe = matches!(&message, AppMessage::ProbeResult { .. });
++            match &message {
++                AppMessage::ProbeResult { .. } => saw_probe = true,
++                AppMessage::ConvertHdcdScanComplete { .. } => saw_hdcd = true,
++                AppMessage::ConvertDeemphasisBatchPreflightComplete { .. }
++                | AppMessage::ConvertAudioProbeComplete { .. } => {},
++                _ => panic!("unexpected event before named-preset commit: {message:?}"),
++            }
++            super::event_loop::handle_message(&mut app, message, &tx);
++            if is_probe {
++                let pending = app.pending_browse_convert_post_load_continuation.as_ref()
++                    .expect("HDCD scan must now own the deferred commit");
++                assert_eq!(pending.status_notes, vec![ordinary_warning.clone(), cue_warning.clone()]);
++            }
++        }
++        // A one-file source has no batch de-emphasis worker: its preflight
++        // completes synchronously. HDCD is still scan-gated, and the existing
++        // multi-file tests exercise both independent scan completions.
++        assert!(saw_probe && saw_hdcd, "probe and HDCD scan must complete");
++        assert!(app.pending_browse_convert_preset_continuation.is_none());
++        assert!(app.pending_browse_convert_post_load_continuation.is_none());
++        assert_eq!(app.preset.active_preset.as_deref(), Some(preset_name));
++        let status = app.status_message.as_ref()
++            .map(|(message, _)| message.as_str()).unwrap_or_default();
++        assert!(status.contains("Queued"), "the queued result must remain primary: {status}");
++        assert_eq!(status.matches(ordinary_warning.as_str()).count(), 1, "{status}");
++        assert_eq!(status.matches(cue_warning.as_str()).count(), 1, "{status}");
++    }
++
++    #[tokio::test]
+     async fn async_browse_queue_review_review_only_does_not_duplicate_cue_warning() {
+         let temp = tempfile::tempdir().expect("tempdir");
+         let album = temp.path().join("album");
+         std::fs::create_dir_all(&album).expect("album dir");
+         let track = album.join("01 - One.flac");

@@ -68883,6 +68883,17 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                 tonepoet_pipeline::ToolIdentifier::Ffmpeg,
                 "{format:?} should retain its existing FFmpeg direct route under Auto"
             );
+            if format == tonepoet_pipeline::AudioFormat::Aac {
+                let filter = plan.planned_command.args.windows(2)
+                    .find(|pair| pair[0] == "-af")
+                    .map(|pair| pair[1].as_str())
+                    .expect("wide AAC CUE carrier must quantize at its final encoder");
+                assert!(filter.starts_with("aresample=resampler=soxr:"), "{filter}");
+                assert!(filter.contains("dither_method=triangular"), "{filter}");
+                assert!(filter.contains("out_sample_fmt=s16"), "{filter}");
+                assert_eq!(filter.matches("aresample=").count(), 1, "{filter}");
+                assert_eq!(plan.planned_command.args.iter().filter(|arg| *arg == "-af").count(), 1);
+            }
             cleanup_cue_stream_direct_track_plan(&plan);
         }
     }

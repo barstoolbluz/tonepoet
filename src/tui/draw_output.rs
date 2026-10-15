@@ -38,18 +38,11 @@ pub fn draw_format_pane(
 
     let mut lines = vec![top_line];
     // Owned outside the loop: `pill_row` borrows its suffix for as long as
-    // `lines` lives, and the HDCD suffix is computed rather than borrowed.
+    // `lines` lives.
     let hdcd_suffix: String = if let Some(warning) = format_state.hdcd_manual_off_warning() {
         warning.to_string()
-    } else if format_state.hdcd_detected_count > 0 {
-        format!(
-            "\u{24d8} HDCD: {} of {} tracks ({} decode-capable)",
-            format_state.hdcd_detected_count,
-            format_state.hdcd_total_count,
-            format_state.hdcd_actionable_count
-        )
-    } else if format_state.hdcd_unresolved_count > 0 {
-        "scanning / unavailable".to_string()
+    } else if format_state.hdcd_is_actionable() {
+        "\u{24d8} HDCD present".to_string()
     } else {
         String::new()
     };
@@ -164,15 +157,10 @@ pub fn draw_format_pane(
                     }
                     FormatField::HdcdDecode => {
                         let spans = deemphasis_pill_spans(
-                            format_state.hdcd_decode_enabled && format_state.hdcd_is_actionable(), row_focused, theme);
-                        let spans = if format_state.hdcd_is_actionable() {
-                            spans
-                        } else {
-                            dim_pill_spans(&spans, theme)
-                        };
+                            format_state.hdcd_decode_enabled, row_focused, theme);
                         lines.push(pill_row(
                             border_color, w, "HDCD Decode", hdcd_suffix.as_str(), &spans,
-                            row_focused && format_state.hdcd_is_actionable(), theme,
+                            row_focused, theme,
                         ));
                     }
                     FormatField::PcmTruePeak => lines.push(pill_row(
@@ -590,14 +578,9 @@ fn format_title_line<'a>(border_color: ratatui::style::Color, width: usize, maxi
 
 const TRUE_PEAK_EDITOR_WIDTH: usize = 12;
 const TRUE_PEAK_CUSTOM_PILL: &str = " custom ";
-// Shared by rendering, the information hit target, and the custom pill offset.
-// The initial border occupies one cell; the label ends with one separator.
-const TRUE_PEAK_ROW_BEFORE_INFO: &str = "   TP target ";
-
-/// Display-cell offset of the true-peak information icon from the row origin.
-pub(super) fn true_peak_info_offset() -> u16 {
-    (1 + TRUE_PEAK_ROW_BEFORE_INFO.len()) as u16
-}
+// Shared by drawing and button registration. The initial border occupies
+// one cell; the value begins in the same control column as the other rows.
+const TRUE_PEAK_ROW_BEFORE_VALUE: &str = "   TP target    ";
 
 /// Exact human-readable ceiling: at least two decimals, all significant
 /// nanodecimals. A numeric format specifier must not round an exact target.
@@ -619,15 +602,31 @@ pub(super) fn true_peak_custom_pill_offset(
     editing: bool,
     row_width: usize,
 ) -> Option<u16> {
+    let offset = true_peak_value_end_offset(value, editing);
+    (offset + TRUE_PEAK_CUSTOM_PILL.len() + 1 <= row_width)
+        .then_some(offset as u16)
+}
+
+fn true_peak_value_end_offset(value: tonepoet_pipeline::DbNano, editing: bool) -> usize {
     let value_width = if editing {
         TRUE_PEAK_EDITOR_WIDTH + " dBTP".len()
     } else {
         true_peak_ceiling_label(value).len() + " dBTP".len()
     };
-    let offset = true_peak_info_offset() as usize + "ⓘ  < ".chars().count()
-        + value_width + " >  ".len();
-    (offset + TRUE_PEAK_CUSTOM_PILL.len() + 1 <= row_width)
-        .then_some(offset as u16)
+    1 + TRUE_PEAK_ROW_BEFORE_VALUE.len() + "< ".len() + value_width + " >  ".len()
+}
+
+/// Display-cell offset of the end-of-controls glyph, or None if it cannot
+/// fit. Custom-pill and glyph hit targets follow precisely the drawn row.
+pub(super) fn true_peak_info_offset(
+    value: tonepoet_pipeline::DbNano,
+    editing: bool,
+    row_width: usize,
+) -> Option<u16> {
+    let offset = true_peak_custom_pill_offset(value, editing, row_width)
+        .map(|start| start as usize + TRUE_PEAK_CUSTOM_PILL.len() + 2)
+        .unwrap_or_else(|| true_peak_value_end_offset(value, editing));
+    (offset + 2 + 1 <= row_width).then_some(offset as u16)
 }
 
 fn pcm_true_peak_db_value_row(
@@ -647,17 +646,7 @@ fn pcm_true_peak_db_value_row(
     };
     let mut spans = vec![
         Span::styled("│", theme.border(border_color)),
-        Span::styled(TRUE_PEAK_ROW_BEFORE_INFO, label_style),
-        // U+24D8 can paint across two terminal cells. Style its guard cell
-        // identically, as on the existing De-emphasis information affordance.
-        Span::styled(
-            "ⓘ ",
-            Style::default()
-                .fg(if theme.dark { theme.info } else { theme.value })
-                .add_modifier(Modifier::BOLD),
-        ),
-        // Keep the editor aligned with the other Format-row controls.
-        Span::raw(" "),
+        Span::styled(TRUE_PEAK_ROW_BEFORE_VALUE, label_style),
         Span::styled("< ", control_style),
     ];
     if let Some(input) = edit_input {
@@ -688,6 +677,19 @@ fn pcm_true_peak_db_value_row(
                 .add_modifier(Modifier::BOLD)
         };
         spans.push(Span::styled(TRUE_PEAK_CUSTOM_PILL, custom_style));
+    }
+    if true_peak_info_offset(value, edit_input.is_some(), width).is_some() {
+        if true_peak_custom_pill_offset(value, edit_input.is_some(), width).is_some() {
+            spans.push(Span::raw("  "));
+        }
+        // U+24D8 may paint across two cells; its guard cell uses the same
+        // contrasting foreground, as on the de-emphasis and HDCD controls.
+        spans.push(Span::styled(
+            "ⓘ ",
+            Style::default()
+                .fg(if theme.dark { theme.info } else { theme.value })
+                .add_modifier(Modifier::BOLD),
+        ));
     }
     let hint = if edit_input.is_some() {
         "  Enter: apply  Esc: cancel  unsigned = headroom".to_string()
@@ -1075,7 +1077,10 @@ mod r32_true_peak_help_renderer_tests {
                 let idx = row.spans.iter().position(|s| s.content.as_ref() == "\u{24d8} ")
                     .expect("true-peak info affordance");
                 let x: usize = row.spans[..idx].iter().map(Span::width).sum();
-                assert_eq!(x, true_peak_info_offset() as usize);
+                assert_eq!(
+                    Some(x as u16),
+                    true_peak_info_offset(DbNano(-100_000_000), false, 120),
+                );
                 let icon = &row.spans[idx];
                 assert_eq!(icon.width(), 2);
                 assert_eq!(icon.style.fg, Some(if theme.dark { theme.info } else { theme.value }));
@@ -1090,6 +1095,33 @@ mod r32_true_peak_help_renderer_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn r5_true_peak_help_follows_the_custom_pill_and_tracks_editor_width() {
+        let theme = super::super::theme::theme_by_slug(
+            super::super::theme::default_theme_slug(),
+        ).expect("default theme");
+        for value in [DbNano(-100_000_000), DbNano(-1)] {
+            for editing in [false, true] {
+                let input = editing.then(|| {
+                    super::super::text_input::TextInputState::new_selected(
+                        true_peak_ceiling_label(value),
+                    )
+                });
+                let row = pcm_true_peak_db_value_row(
+                    theme.green, 120, value, input.as_ref(), true, false, theme,
+                );
+                let custom_idx = row.spans.iter().position(|s| s.content.as_ref() == TRUE_PEAK_CUSTOM_PILL)
+                    .expect("custom pill");
+                let icon_idx = row.spans.iter().position(|s| s.content.as_ref() == "ⓘ ")
+                    .expect("end-of-controls info glyph");
+                assert!(icon_idx > custom_idx, "info glyph must follow custom pill");
+                let drawn_offset: usize = row.spans[..icon_idx].iter().map(Span::width).sum();
+                assert_eq!(true_peak_info_offset(value, editing, 120), Some(drawn_offset as u16));
+            }
+        }
+        assert_eq!(true_peak_info_offset(DbNano(-100_000_000), false, 34), None);
     }
 
     #[test]

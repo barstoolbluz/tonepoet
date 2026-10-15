@@ -1,0 +1,25 @@
+PASS R5C source scope: 2 modified files, no original file removed
+PASS all newly introduced files are R5C delivery artifacts
+PASS preset continuation persists bounded warning notes
+PASS preset continuation starts with empty warning notes
+PASS expansion records first and cumulative warnings
+PASS notes bound to deferred named-preset path
+PASS notes bound to deferred post-load path
+PASS preset identity check retained
+PASS preset continuation remains single consumer
+PASS probe completion transfers notes to scan continuation
+PASS probe completion restores notes to displayed status
+PASS source-scan continuation still uses generation and path identity
+PASS source-scan continuation still restores notes after queue commit
+PASS no-preset CUE warning regression kept unchanged
+PASS named preset regression exercises async source probe
+PASS named preset regression asserts transfer before scan
+PASS named preset regression asserts final queued result
+PASS named preset regression checks each warning exactly once
+TOTAL 16 static source contract checks PASS (not a Rust compile/test).
+
+PATCH REPRODUCTION (executed):
+PASS git apply --check --whitespace=error on independent R5 extraction.
+PASS applied patch reproduces both modified source files byte-for-byte.
+PASS reverse application restores all 1,011 R5 manifest hashes.
+CAVEAT: structural checks are not Rust compilation or test execution.

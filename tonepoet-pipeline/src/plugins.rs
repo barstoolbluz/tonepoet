@@ -1897,7 +1897,11 @@ fn ffmpeg_lossy_processing_filter(
     // restriction applies to PCM certified true-peak lossy gain, whose
     // validator explicitly disallows an unproved dither terminal.
     let aac_int16_boundary = *target_format == AudioFormat::Aac
-        && !context.request.source.is_dsd()
+        // A reconstructed PCM carrier is no longer a DSD codec/format, but
+        // its source representation still identifies the certified DSD path.
+        // Do not add a new dither boundary after that measured realization.
+        && context.request.source.representation_kind()
+            != crate::source::SourceRepresentationKind::Dsd
         && !context.request.settings.pcm_true_peak.is_true_peak()
         && (context.request.source.authoritative_pcm_depth() != Some(PcmBitDepth::Int16)
             || sample_changes);
@@ -3056,6 +3060,7 @@ mod tests {
             settings.dither_type = selected;
             let mut request = pcm_request_with(settings, PcmBitDepth::Int32);
             request.source.sample_rate_hz = Some(44_100);
+            request.output_path = PathBuf::from("output.m4a");
             let step = PlanStep::new(
                 0, PlanOperation::EncodeLossy {
                     target_format: AudioFormat::Aac, target_rate_hz: Some(44_100),
@@ -3079,6 +3084,7 @@ mod tests {
         let mut request = pcm_request_with(PipelineSettings::default(), PcmBitDepth::Int16);
         request.source.sample_rate_hz = Some(44_100);
         request.settings.target_format = AudioFormat::Aac;
+        request.output_path = PathBuf::from("output.m4a");
         let step = PlanStep::new(
             0, PlanOperation::EncodeLossy {
                 target_format: AudioFormat::Aac, target_rate_hz: Some(44_100),
@@ -3101,7 +3107,8 @@ mod tests {
             scope: crate::enums::TruePeakScope::Track,
             scan: crate::enums::TruePeakScanTier::Standard,
         });
-        let request = pcm_request_with(settings, PcmBitDepth::Int32);
+        let mut request = pcm_request_with(settings, PcmBitDepth::Int32);
+        request.output_path = PathBuf::from("output.m4a");
         let step = PlanStep::new(
             0, PlanOperation::EncodeLossy {
                 target_format: AudioFormat::Aac, target_rate_hz: Some(96_000),

@@ -1105,6 +1105,70 @@ fn cue_stream_ffmpeg_filter_is_only_lossy_rate_conversion(
     filter == &format!("aresample={}", expected_options.join(":"))
 }
 
+/// AAC's libfdk encoder accepts only signed Int16. The ordinary planner now
+/// makes its single terminal quantization explicit, even for an unchanged
+/// sample rate. Admit that exact terminal filter on a Phase-1 CUE stream;
+/// do not accidentally admit gain, multiple filters, or other processing.
+fn cue_stream_ffmpeg_filter_is_only_aac_terminal_quantization(
+    plan_request: &PlanRequest,
+    command: &PlannedCommand,
+    target_rate_hz: u32,
+) -> bool {
+    use tonepoet_pipeline::{AudioFormat, PcmBitDepth, SourceRepresentationKind};
+
+    let settings = &plan_request.settings;
+    if settings.target_format != AudioFormat::Aac
+        || plan_request.source.representation_kind() == SourceRepresentationKind::Dsd
+        || settings.pcm_true_peak.is_true_peak()
+    {
+        return false;
+    }
+    let rate_change = plan_request.source.sample_rate_hz != Some(target_rate_hz);
+    if !rate_change
+        && plan_request.source.authoritative_pcm_depth() == Some(PcmBitDepth::Int16)
+    {
+        return false;
+    }
+    let mut af = command.args.windows(2).filter(|pair| pair[0] == "-af");
+    let Some(filter) = af.next().map(|pair| pair[1].as_str()) else {
+        return false;
+    };
+    if af.next().is_some() {
+        return false;
+    }
+
+    let mut opts = vec!["resampler=soxr".to_string()];
+    if rate_change {
+        opts.push(format!("out_sample_rate={target_rate_hz}"));
+    }
+    opts.push(format!(
+        "precision={}",
+        tonepoet_pipeline::soxr_precision(settings.resample_quality)
+    ));
+    let cutoff = settings
+        .soxr_resampler
+        .cutoff
+        .unwrap_or_else(|| tonepoet_pipeline::ffmpeg_cutoff(settings.nyquist_transition));
+    opts.push(format!("cutoff={cutoff:.3}"));
+    if settings.soxr_resampler.chebyshev {
+        opts.push("cheby=1".to_string());
+    }
+    if let Some(phase) = settings.soxr_resampler.phase {
+        opts.push(format!("phase_shift={phase}"));
+    }
+    let dither = if settings.dither_explicit {
+        settings.dither_type
+    } else {
+        tonepoet_pipeline::DitherType::Tpdf
+    };
+    let Some(method) = tonepoet_pipeline::mapping::soxr_dither_method(dither) else {
+        return false;
+    };
+    opts.push(format!("dither_method={method}"));
+    opts.push("out_sample_fmt=s16".to_string());
+    filter == format!("aresample={}", opts.join(":"))
+}
+
 fn cue_stream_ffmpeg_lossy_plan_is_phase1_direct(
     plan_request: &PlanRequest,
     command: &PlannedCommand,
@@ -1150,6 +1214,13 @@ fn cue_stream_ffmpeg_lossy_plan_is_phase1_direct(
     }
 
     let af_count = command.args.iter().filter(|arg| arg.as_str() == "-af").count();
+    if cue_stream_ffmpeg_filter_is_only_aac_terminal_quantization(
+        plan_request,
+        command,
+        target_rate_hz,
+    ) {
+        return true;
+    }
     if plan_request.source.sample_rate_hz == Some(target_rate_hz) {
         af_count == 0
     } else {

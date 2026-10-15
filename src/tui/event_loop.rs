@@ -6564,6 +6564,7 @@ fn store_details_analysis_facts(
 
 fn handle_convert_hdcd_scan_complete(
     app: &mut AppState,
+    tx: &mpsc::Sender<AppMessage>,
     generation: u64,
     paths: Vec<std::path::PathBuf>,
     results: Vec<(std::path::PathBuf, super::app::ConvertHdcdPathState)>,
@@ -6598,6 +6599,9 @@ fn handle_convert_hdcd_scan_complete(
     }
     app.convert.source.hdcd_scan_results = accepted;
     app.convert.format.set_convert_hdcd_summary(&app.convert.source.hdcd_scan_results);
+    let _ = super::command::complete_pending_browse_convert_post_load_after_source_scans(
+        app, tx, generation, &paths,
+    );
 }
 
 fn handle_convert_deemphasis_batch_preflight_complete(
@@ -6697,7 +6701,7 @@ fn handle_convert_deemphasis_batch_preflight_complete(
         paths.len(),
     );
 
-    let _ = super::command::complete_pending_browse_convert_post_load_after_deemphasis_preflight(
+    let _ = super::command::complete_pending_browse_convert_post_load_after_source_scans(
         app,
         tx,
         generation,
@@ -7951,7 +7955,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             );
         }
         AppMessage::ConvertHdcdScanComplete { generation, paths, results } => {
-            handle_convert_hdcd_scan_complete(app, generation, paths, results);
+            handle_convert_hdcd_scan_complete(app, tx, generation, paths, results);
         }
         AppMessage::ConvertDeemphasisBatchPreflightComplete { generation, paths, results } => {
             handle_convert_deemphasis_batch_preflight_complete(

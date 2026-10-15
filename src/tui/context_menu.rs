@@ -5183,35 +5183,31 @@ mod tests {
         }
     }
 
-    async fn next_convert_deemphasis_batch_preflight(
+    async fn finish_browse_post_load_after_source_scans(
+        app: &mut AppState,
+        tx: &mpsc::Sender<AppMessage>,
         rx: &mut mpsc::Receiver<AppMessage>,
-    ) -> (
-        u64,
-        Vec<std::path::PathBuf>,
-        Vec<(std::path::PathBuf, crate::tui::app::ConvertDeemphasisPathState)>,
     ) {
-        loop {
-            match timeout(Duration::from_secs(5), rx.recv())
+        for _ in 0..24 {
+            if app.pending_browse_convert_post_load_continuation.is_none() {
+                return;
+            }
+            let message = timeout(Duration::from_secs(5), rx.recv())
                 .await
-                .expect("batch de-emphasis preflight message should arrive")
-                .expect("batch de-emphasis preflight channel should stay open")
-            {
-                AppMessage::ConvertDeemphasisBatchPreflightComplete {
-                    generation,
-                    paths,
-                    results,
-                } => return (generation, paths, results),
-                // Source installation can also start the first-source probe,
-                // while cursor movement can start the Convert-owned cursor probe.
-                // Both completions are independent of the commit safety preflight.
-                AppMessage::ProbeResult { .. } | AppMessage::ConvertAudioProbeComplete { .. } => {
-                    continue;
-                }
-                other => panic!(
-                    "expected ConvertDeemphasisBatchPreflightComplete, got {other:?}"
-                ),
+                .expect("source scan completion should arrive")
+                .expect("source scan channel should stay open");
+            if matches!(&message,
+                AppMessage::ConvertDeemphasisBatchPreflightComplete { .. }
+                | AppMessage::ConvertHdcdScanComplete { .. }
+                | AppMessage::ProbeResult { .. }
+                | AppMessage::ConvertAudioProbeComplete { .. }
+            ) {
+                crate::tui::event_loop::handle_message(app, message, tx);
+            } else {
+                panic!("unexpected message during source scans: {message:?}");
             }
         }
+        panic!("post-load commit did not complete after processing 24 source events");
     }
 
     #[test]
@@ -6014,23 +6010,12 @@ mod tests {
             expansion,
         );
 
-        // R18 added a batch-wide de-emphasis safety gate. Last Used must wait
-        // for that exact async inventory, then resume automatically rather
-        // than requiring the user to issue a second commit.
+        // Batch-wide de-emphasis and HDCD analyses both gate automatic commit.
+        // Last Used waits for both, regardless of event completion order.
         assert_eq!(app.current_screen, AppScreen::Convert);
         assert!(app.pending_browse_convert_post_load_continuation.is_some());
         assert!(app.convert.source.deemphasis_batch_preflight_pending);
-        let (generation, paths, results) =
-            next_convert_deemphasis_batch_preflight(&mut rx).await;
-        crate::tui::event_loop::handle_message(
-            &mut app,
-            AppMessage::ConvertDeemphasisBatchPreflightComplete {
-                generation,
-                paths,
-                results,
-            },
-            &tx,
-        );
+        finish_browse_post_load_after_source_scans(&mut app, &tx, &mut rx).await;
 
         assert_eq!(app.current_screen, AppScreen::Browse);
         assert!(matches!(app.convert.source.mode, SourceMode::Empty));

@@ -1,0 +1,21 @@
+TonePoet R19 HDCD R5C - local compile-free verification, 2026-10-15.
+
+BASELINE:
+PASS independent R5 extraction verified against all 1,011 manifest entries.
+PASS base archive SHA-256 ae99786572e2314a3813eb22b91b6e3002cdac7ef6e049bfb8cc760b643ca98e.
+
+EXECUTED on R5C source tree:
+- python3 tests/verify_hdcd_analysis_cache_sql.py
+  PASS HDCD analysis cache SQLite SQL.
+- python3 tests/verify_hdcd_v28_migration_sql.py
+  PASS v21-v27 model cases and v28 replays, 14 cases.
+- python3 tests/hdcd_source_first_ffmpeg_smoke.py
+  PASS source-first HDCD and independent sample-bounded FLAC/CUE.
+- python3 tests/hdcd_lossy_precision_ffmpeg_smoke.py
+  PASS libopus Float32, libmp3lame Float32, SoXR TPDF/Int16.
+  NOT RUN pinned libfdk_aac (unavailable).
+
+NOT RUN: Rust compilation, targeted Rust tests, full Rust workspace gate,
+         and Reference requalification (cargo/rustc/nix/qualified host unavailable).
+The new named-preset regression has NOT been executed.
+The earlier R5 Reference source-lock staleness is still open.

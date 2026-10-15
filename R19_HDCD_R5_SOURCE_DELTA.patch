@@ -1,0 +1,808 @@
+--- a/src/convert/pipeline/stages.rs
++++ b/src/convert/pipeline/stages.rs
+@@ -68883,6 +68883,17 @@
+                 tonepoet_pipeline::ToolIdentifier::Ffmpeg,
+                 "{format:?} should retain its existing FFmpeg direct route under Auto"
+             );
++            if format == tonepoet_pipeline::AudioFormat::Aac {
++                let filter = plan.planned_command.args.windows(2)
++                    .find(|pair| pair[0] == "-af")
++                    .map(|pair| pair[1].as_str())
++                    .expect("wide AAC CUE carrier must quantize at its final encoder");
++                assert!(filter.starts_with("aresample=resampler=soxr:"), "{filter}");
++                assert!(filter.contains("dither_method=triangular"), "{filter}");
++                assert!(filter.contains("out_sample_fmt=s16"), "{filter}");
++                assert_eq!(filter.matches("aresample=").count(), 1, "{filter}");
++                assert_eq!(plan.planned_command.args.iter().filter(|arg| *arg == "-af").count(), 1);
++            }
+             cleanup_cue_stream_direct_track_plan(&plan);
+         }
+     }
+--- a/src/convert/pipeline/track_executor.rs
++++ b/src/convert/pipeline/track_executor.rs
+@@ -1105,6 +1105,70 @@
+     filter == &format!("aresample={}", expected_options.join(":"))
+ }
+ 
++/// AAC's libfdk encoder accepts only signed Int16. The ordinary planner now
++/// makes its single terminal quantization explicit, even for an unchanged
++/// sample rate. Admit that exact terminal filter on a Phase-1 CUE stream;
++/// do not accidentally admit gain, multiple filters, or other processing.
++fn cue_stream_ffmpeg_filter_is_only_aac_terminal_quantization(
++    plan_request: &PlanRequest,
++    command: &PlannedCommand,
++    target_rate_hz: u32,
++) -> bool {
++    use tonepoet_pipeline::{AudioFormat, PcmBitDepth, SourceRepresentationKind};
++
++    let settings = &plan_request.settings;
++    if settings.target_format != AudioFormat::Aac
++        || plan_request.source.representation_kind() == SourceRepresentationKind::Dsd
++        || settings.pcm_true_peak.is_true_peak()
++    {
++        return false;
++    }
++    let rate_change = plan_request.source.sample_rate_hz != Some(target_rate_hz);
++    if !rate_change
++        && plan_request.source.authoritative_pcm_depth() == Some(PcmBitDepth::Int16)
++    {
++        return false;
++    }
++    let mut af = command.args.windows(2).filter(|pair| pair[0] == "-af");
++    let Some(filter) = af.next().map(|pair| pair[1].as_str()) else {
++        return false;
++    };
++    if af.next().is_some() {
++        return false;
++    }
++
++    let mut opts = vec!["resampler=soxr".to_string()];
++    if rate_change {
++        opts.push(format!("out_sample_rate={target_rate_hz}"));
++    }
++    opts.push(format!(
++        "precision={}",
++        tonepoet_pipeline::soxr_precision(settings.resample_quality)
++    ));
++    let cutoff = settings
++        .soxr_resampler
++        .cutoff
++        .unwrap_or_else(|| tonepoet_pipeline::ffmpeg_cutoff(settings.nyquist_transition));
++    opts.push(format!("cutoff={cutoff:.3}"));
++    if settings.soxr_resampler.chebyshev {
++        opts.push("cheby=1".to_string());
++    }
++    if let Some(phase) = settings.soxr_resampler.phase {
++        opts.push(format!("phase_shift={phase}"));
++    }
++    let dither = if settings.dither_explicit {
++        settings.dither_type
++    } else {
++        tonepoet_pipeline::DitherType::Tpdf
++    };
++    let Some(method) = tonepoet_pipeline::mapping::soxr_dither_method(dither) else {
++        return false;
++    };
++    opts.push(format!("dither_method={method}"));
++    opts.push("out_sample_fmt=s16".to_string());
++    filter == format!("aresample={}", opts.join(":"))
++}
++
+ fn cue_stream_ffmpeg_lossy_plan_is_phase1_direct(
+     plan_request: &PlanRequest,
+     command: &PlannedCommand,
+@@ -1150,6 +1214,13 @@
+     }
+ 
+     let af_count = command.args.iter().filter(|arg| arg.as_str() == "-af").count();
++    if cue_stream_ffmpeg_filter_is_only_aac_terminal_quantization(
++        plan_request,
++        command,
++        target_rate_hz,
++    ) {
++        return true;
++    }
+     if plan_request.source.sample_rate_hz == Some(target_rate_hz) {
+         af_count == 0
+     } else {
+--- a/src/tui/app.rs
++++ b/src/tui/app.rs
+@@ -2545,14 +2545,17 @@
+     pub post_load: crate::tui::command::BrowseConvertPostLoad,
+ }
+ 
+-/// Deferred Browse post-load action waiting for the exact batch de-emphasis
+-/// preflight that guards Convert commit. Generation plus the complete path
+-/// vector prevents stale background work from committing a replacement source.
++/// Deferred Browse post-load action waiting for both source-level scan gates.
++/// Generation plus the complete path vector prevents stale background work
++/// from committing a replacement source.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct PendingBrowseConvertPostLoadContinuation {
+     pub generation: u64,
+     pub paths: Vec<PathBuf>,
+     pub post_load: crate::tui::command::BrowseConvertPostLoad,
++    /// Expansion warnings must outlive both asynchronous source scans; the
++    /// final queue result replaces earlier transient status messages.
++    pub status_notes: Vec<String>,
+ }
+ 
+ impl PendingBrowseConvertExpansion {
+@@ -5909,7 +5912,7 @@
+             if self.deemphasis_eligible && self.deemphasis_evidence != ConvertDeemphasisEvidence::None {
+                 rows.push(FormatPaneRow::Field(FormatField::Deemphasis));
+             }
+-            if self.hdcd_detected_count > 0 {
++            if self.hdcd_is_actionable() {
+                 rows.push(FormatPaneRow::Field(FormatField::HdcdDecode));
+             }
+             if !self.source_is_dsd {
+@@ -5972,11 +5975,6 @@
+             rows.push(FormatPaneRow::Spacer);
+             rows.push(FormatPaneRow::Field(FormatField::Deemphasis));
+         }
+-        if maximized && self.hdcd_eligible_count > 0 && self.hdcd_detected_count == 0 {
+-            rows.push(FormatPaneRow::Spacer);
+-            rows.push(FormatPaneRow::Field(FormatField::HdcdDecode));
+-        }
+-
+         if maximized && self.format.selected_value().available_containers().len() > 1 {
+             rows.push(FormatPaneRow::Spacer);
+             rows.push(FormatPaneRow::Field(FormatField::Container));
+@@ -7079,7 +7077,7 @@
+         {
+             return Some("ⓘ HDCD Decode Off: wider PCM may not be recognized by HDCD players.");
+         }
+-        Some("⚠ HDCD Decode Off: conversion may destroy HDCD control codes.")
++        Some("ⓘ HDCD Decode Off: conversion may destroy HDCD control codes.")
+     }
+ 
+     /// True only for the one output domain that may retain a pre-emphasized
+@@ -20369,7 +20367,7 @@
+             .pragma_query_value(None, "user_version", |row| row.get(0))
+             .expect("read activated schema version");
+         assert_eq!(
+-            version, 27,
++            version, 28,
+             "quiescent startup must durably advance through the current schema"
+         );
+         let protocol_version: u32 = conn
+@@ -25027,15 +25025,17 @@
+         let format = state_for(capabilities(false, false, false, false));
+         assert!(!format.hdcd_decode_enabled);
+         assert!(!format.visible_fields(false).contains(&FormatField::HdcdDecode));
+-        assert!(format.visible_fields(true).contains(&FormatField::HdcdDecode));
++        assert!(!format.visible_fields(true).contains(&FormatField::HdcdDecode));
+ 
+         let format = state_for(capabilities(true, true, false, false));
+         assert!(format.visible_fields(false).contains(&FormatField::HdcdDecode));
++        assert!(format.visible_fields(true).contains(&FormatField::HdcdDecode));
+         assert!(!format.hdcd_decode_enabled);
+ 
+         for (pe, gain, tf) in [(false, false, true), (false, false, false)] {
+             let mut format = state_for(capabilities(true, pe, gain, tf));
+-            assert!(format.visible_fields(false).contains(&FormatField::HdcdDecode));
++            assert!(!format.visible_fields(false).contains(&FormatField::HdcdDecode));
++            assert!(!format.visible_fields(true).contains(&FormatField::HdcdDecode));
+             assert!(!format.hdcd_is_actionable());
+             assert!(!format.select_row_index(FormatField::HdcdDecode, 1, None, None));
+             assert!(!format.hdcd_decode_enabled);
+@@ -25098,6 +25098,7 @@
+             assert!(state.hdcd_promoted_from_depth.is_none());
+         }
+         assert!(state.format.select_value(&AudioFormat::Wav));
++        state.apply_format_constraints(); // Enable WAV float options before selecting them.
+         for depth in [BitDepthChoice::Float32, BitDepthChoice::Float64] {
+             assert!(state.bit_depth.select_value(&depth));
+             state.apply_format_constraints();
+--- a/src/tui/command.rs
++++ b/src/tui/command.rs
+@@ -1587,6 +1587,16 @@
+                 expansion.expanded_folder_count,
+                 true,
+             ) {
++                // A post-load commit may be suspended on the de-emphasis and
++                // HDCD workers. Save these notes with that exact continuation
++                // so the eventual queue status cannot erase them.
++                if let Some(pending) = app.pending_browse_convert_post_load_continuation.as_mut() {
++                    for note in [first_warning.as_deref(), cue_warning.as_deref()].into_iter().flatten() {
++                        if !pending.status_notes.iter().any(|existing| existing.as_str() == note) {
++                            pending.status_notes.push(note.to_owned());
++                        }
++                    }
++                }
+                 if let Some(warning) = first_warning.as_deref() {
+                     append_current_status_note_if_missing(app, warning);
+                 }
+@@ -9488,26 +9498,22 @@
+                 return;
+             }
+ 
+-            let batch_paths = match &app.convert.source.mode {
+-                super::app::SourceMode::Batch { paths, .. } if !paths.is_empty() => {
+-                    Some(paths.clone())
+-                }
+-                _ => None,
+-            };
+-            if let Some(paths) = batch_paths {
+-                if !super::app::ensure_convert_deemphasis_batch_preflight(app, tx) {
+-                    app.pending_browse_convert_post_load_continuation = Some(
+-                        super::app::PendingBrowseConvertPostLoadContinuation {
+-                            generation: app.probe_generation,
+-                            paths,
+-                            post_load,
+-                        },
+-                    );
+-                    app.set_status(
+-                        "pre-emphasis source scan is completing — conversion will queue automatically",
+-                    );
+-                    return;
+-                }
++            let paths = app.convert.source.mode.all_paths();
++            let deemphasis_ready = super::app::ensure_convert_deemphasis_batch_preflight(app, tx);
++            let hdcd_ready = super::app::ensure_convert_hdcd_scan(app, tx);
++            if !deemphasis_ready || !hdcd_ready {
++                app.pending_browse_convert_post_load_continuation = Some(
++                    super::app::PendingBrowseConvertPostLoadContinuation {
++                        generation: app.probe_generation,
++                        paths,
++                        post_load,
++                        status_notes: Vec::new(),
++                    },
++                );
++                app.set_status(
++                    "source audio scans are completing — conversion will queue automatically",
++                );
++                return;
+             }
+ 
+             app.pending_browse_convert_post_load_continuation = None;
+@@ -9516,11 +9522,10 @@
+     }
+ }
+ 
+-/// Resume a Browse post-load commit only after the exact batch safety scan that
+-/// deferred it has completed. Returns true when a matching continuation was
+-/// consumed, including the case where the user has since left Convert and the
+-/// action is therefore discarded rather than replayed elsewhere.
+-pub(crate) fn complete_pending_browse_convert_post_load_after_deemphasis_preflight(
++/// Resume only after BOTH source scans have resolved for the exact generation
++/// and paths. Either worker may complete first. Taking the continuation
++/// before committing gives the resumed action single-consumer semantics.
++pub(crate) fn complete_pending_browse_convert_post_load_after_source_scans(
+     app: &mut AppState,
+     tx: &mpsc::Sender<AppMessage>,
+     generation: u64,
+@@ -9536,20 +9541,28 @@
+         return false;
+     }
+ 
++    if app.current_screen != AppScreen::Convert {
++        app.pending_browse_convert_post_load_continuation = None;
++        return true;
++    }
++    if app.convert.source.mode.all_paths().as_slice() != paths {
++        app.pending_browse_convert_post_load_continuation = None;
++        return true;
++    }
++    if !super::app::ensure_convert_deemphasis_batch_preflight(app, tx)
++        || !super::app::ensure_convert_hdcd_scan(app, tx)
++    {
++        return false;
++    }
+     let pending = app
+         .pending_browse_convert_post_load_continuation
+         .take()
+         .expect("matching deferred post-load continuation must exist");
+-    if app.current_screen != AppScreen::Convert {
+-        return true;
+-    }
+-    let current_paths_match = matches!(
+-        &app.convert.source.mode,
+-        super::app::SourceMode::Batch { paths: current, .. }
+-            if current.as_slice() == pending.paths.as_slice()
+-    );
+-    if current_paths_match {
+-        apply_browse_convert_post_load_action(app, tx, pending.post_load);
++    apply_browse_convert_post_load_action(app, tx, pending.post_load);
++    // Keep genuine commit/refusal status primary; warnings are append-only and
++    // de-duplicated, regardless of which scan completed last.
++    for note in pending.status_notes {
++        append_current_status_note_if_missing(app, &note);
+     }
+     true
+ }
+@@ -21397,7 +21410,7 @@
+             "Ignored malformed cumulative multi-FILE CUE combined.cue: later FILE sections use cumulative timestamps"
+                 .to_string();
+ 
+-        let (tx, _rx) = mpsc::channel(8);
++        let (tx, mut rx) = mpsc::channel(8);
+         let mut config = TonepoetConfig::default();
+         config.conversion.default_destination = Some(temp.path().join("out"));
+         let mut app = AppState::new_for_test(config);
+@@ -21459,6 +21472,29 @@
+             },
+         );
+ 
++        // Both scans are asynchronous; the HDCD detector can finish before
++        // or after the de-emphasis inventory. The final status belongs to the
++        // one resumed commit, not to the provisional source-review notice.
++        for _ in 0..24 {
++            if app.pending_browse_convert_post_load_continuation.is_none() {
++                break;
++            }
++            let message = tokio::time::timeout(
++                std::time::Duration::from_secs(5), rx.recv(),
++            ).await.expect("source scan event").expect("scan channel open");
++            if matches!(&message,
++                AppMessage::ConvertDeemphasisBatchPreflightComplete { .. }
++                | AppMessage::ConvertHdcdScanComplete { .. }
++                | AppMessage::ProbeResult { .. }
++                | AppMessage::ConvertAudioProbeComplete { .. }
++            ) {
++                super::event_loop::handle_message(&mut app, message, &tx);
++            } else {
++                panic!("unexpected event before final commit: {message:?}");
++            }
++        }
++        assert!(app.pending_browse_convert_post_load_continuation.is_none());
++
+         let status = app
+             .status_message
+             .as_ref()
+--- a/src/tui/context_menu.rs
++++ b/src/tui/context_menu.rs
+@@ -5183,35 +5183,31 @@
+         }
+     }
+ 
+-    async fn next_convert_deemphasis_batch_preflight(
++    async fn finish_browse_post_load_after_source_scans(
++        app: &mut AppState,
++        tx: &mpsc::Sender<AppMessage>,
+         rx: &mut mpsc::Receiver<AppMessage>,
+-    ) -> (
+-        u64,
+-        Vec<std::path::PathBuf>,
+-        Vec<(std::path::PathBuf, crate::tui::app::ConvertDeemphasisPathState)>,
+     ) {
+-        loop {
+-            match timeout(Duration::from_secs(5), rx.recv())
++        for _ in 0..24 {
++            if app.pending_browse_convert_post_load_continuation.is_none() {
++                return;
++            }
++            let message = timeout(Duration::from_secs(5), rx.recv())
+                 .await
+-                .expect("batch de-emphasis preflight message should arrive")
+-                .expect("batch de-emphasis preflight channel should stay open")
+-            {
+-                AppMessage::ConvertDeemphasisBatchPreflightComplete {
+-                    generation,
+-                    paths,
+-                    results,
+-                } => return (generation, paths, results),
+-                // Source installation can also start the first-source probe,
+-                // while cursor movement can start the Convert-owned cursor probe.
+-                // Both completions are independent of the commit safety preflight.
+-                AppMessage::ProbeResult { .. } | AppMessage::ConvertAudioProbeComplete { .. } => {
+-                    continue;
+-                }
+-                other => panic!(
+-                    "expected ConvertDeemphasisBatchPreflightComplete, got {other:?}"
+-                ),
++                .expect("source scan completion should arrive")
++                .expect("source scan channel should stay open");
++            if matches!(&message,
++                AppMessage::ConvertDeemphasisBatchPreflightComplete { .. }
++                | AppMessage::ConvertHdcdScanComplete { .. }
++                | AppMessage::ProbeResult { .. }
++                | AppMessage::ConvertAudioProbeComplete { .. }
++            ) {
++                crate::tui::event_loop::handle_message(app, message, tx);
++            } else {
++                panic!("unexpected message during source scans: {message:?}");
+             }
+         }
++        panic!("post-load commit did not complete after processing 24 source events");
+     }
+ 
+     #[test]
+@@ -6014,23 +6010,12 @@
+             expansion,
+         );
+ 
+-        // R18 added a batch-wide de-emphasis safety gate. Last Used must wait
+-        // for that exact async inventory, then resume automatically rather
+-        // than requiring the user to issue a second commit.
++        // Batch-wide de-emphasis and HDCD analyses both gate automatic commit.
++        // Last Used waits for both, regardless of event completion order.
+         assert_eq!(app.current_screen, AppScreen::Convert);
+         assert!(app.pending_browse_convert_post_load_continuation.is_some());
+         assert!(app.convert.source.deemphasis_batch_preflight_pending);
+-        let (generation, paths, results) =
+-            next_convert_deemphasis_batch_preflight(&mut rx).await;
+-        crate::tui::event_loop::handle_message(
+-            &mut app,
+-            AppMessage::ConvertDeemphasisBatchPreflightComplete {
+-                generation,
+-                paths,
+-                results,
+-            },
+-            &tx,
+-        );
++        finish_browse_post_load_after_source_scans(&mut app, &tx, &mut rx).await;
+ 
+         assert_eq!(app.current_screen, AppScreen::Browse);
+         assert!(matches!(app.convert.source.mode, SourceMode::Empty));
+--- a/src/tui/convert_screen.rs
++++ b/src/tui/convert_screen.rs
+@@ -318,9 +318,7 @@
+                     buttons.record_button(TuiButton::HdcdPill(0), Rect::new(label_col, y, 5, 1));
+                     buttons.record_button(TuiButton::HdcdPill(1), Rect::new(label_col + 7, y, 4, 1));
+                 }
+-                if state.hdcd_detected_count > 0 {
+-                    buttons.record_button(TuiButton::HdcdInfo, Rect::new(label_col + 13, y, 2, 1));
+-                }
++                buttons.record_button(TuiButton::HdcdInfo, Rect::new(label_col + 13, y, 2, 1));
+             }
+             FormatField::ReplayGain => register_pill_row(buttons, &state.replaygain, y, label_col, TuiButton::ReplayGainPill),
+             FormatField::PcmTruePeak => register_pill_row(
+@@ -357,7 +355,10 @@
+                 ) {
+                     buttons.record_button(TuiButton::PcmTruePeakCustomPill, Rect::new(area.x + offset, y, 8, 1));
+                 }
+-                register_true_peak_info_button(buttons, area, y);
++                register_true_peak_info_button(
++                    buttons, area, y, state.pcm_true_peak_target_dbtp,
++                    state.true_peak_target_editing == Some(field),
++                );
+             }
+             FormatField::NoiseShaper => register_pill_row(buttons, &state.noise_shaper, y, label_col, TuiButton::NoiseShaperPill),
+             FormatField::ModulatorOrder => register_pill_row(buttons, &state.modulator_order, y, label_col, TuiButton::ModulatorOrderPill),
+@@ -383,7 +384,10 @@
+                 ) {
+                     buttons.record_button(TuiButton::DsdTruePeakCustomPill, Rect::new(area.x + offset, y, 8, 1));
+                 }
+-                register_true_peak_info_button(buttons, area, y);
++                register_true_peak_info_button(
++                    buttons, area, y, state.dsd_true_peak_target_dbtp,
++                    state.true_peak_target_editing == Some(field),
++                );
+             }
+             FormatField::Container => {
+                 let containers = state.format.selected_value().available_containers();
+@@ -457,11 +461,20 @@
+ 
+ // Concrete hit target is recorded after the whole-row target so the icon
+ // opens help instead of entering the value editor. Match the draw guard.
+-fn register_true_peak_info_button(buttons: &mut ButtonRenderMap, area: Rect, y: u16) {
+-    if area.width >= 30 && area.height >= 6 {
++fn register_true_peak_info_button(
++    buttons: &mut ButtonRenderMap,
++    area: Rect,
++    y: u16,
++    value: tonepoet_pipeline::DbNano,
++    editing: bool,
++) {
++    if area.width < 30 || area.height < 6 {
++        return; // Matches draw_format_pane's visibility guard.
++    }
++    if let Some(offset) = true_peak_info_offset(value, editing, area.width as usize) {
+         buttons.record_button(
+             TuiButton::TruePeakInfo,
+-            Rect::new(area.x + true_peak_info_offset(), y, 2, 1),
++            Rect::new(area.x + offset, y, 2, 1),
+         );
+     }
+ }
+--- a/src/tui/draw_output.rs
++++ b/src/tui/draw_output.rs
+@@ -38,18 +38,11 @@
+ 
+     let mut lines = vec![top_line];
+     // Owned outside the loop: `pill_row` borrows its suffix for as long as
+-    // `lines` lives, and the HDCD suffix is computed rather than borrowed.
++    // `lines` lives.
+     let hdcd_suffix: String = if let Some(warning) = format_state.hdcd_manual_off_warning() {
+         warning.to_string()
+-    } else if format_state.hdcd_detected_count > 0 {
+-        format!(
+-            "\u{24d8} HDCD: {} of {} tracks ({} decode-capable)",
+-            format_state.hdcd_detected_count,
+-            format_state.hdcd_total_count,
+-            format_state.hdcd_actionable_count
+-        )
+-    } else if format_state.hdcd_unresolved_count > 0 {
+-        "scanning / unavailable".to_string()
++    } else if format_state.hdcd_is_actionable() {
++        "\u{24d8} HDCD present".to_string()
+     } else {
+         String::new()
+     };
+@@ -164,15 +157,10 @@
+                     }
+                     FormatField::HdcdDecode => {
+                         let spans = deemphasis_pill_spans(
+-                            format_state.hdcd_decode_enabled && format_state.hdcd_is_actionable(), row_focused, theme);
+-                        let spans = if format_state.hdcd_is_actionable() {
+-                            spans
+-                        } else {
+-                            dim_pill_spans(&spans, theme)
+-                        };
++                            format_state.hdcd_decode_enabled, row_focused, theme);
+                         lines.push(pill_row(
+                             border_color, w, "HDCD Decode", hdcd_suffix.as_str(), &spans,
+-                            row_focused && format_state.hdcd_is_actionable(), theme,
++                            row_focused, theme,
+                         ));
+                     }
+                     FormatField::PcmTruePeak => lines.push(pill_row(
+@@ -590,14 +578,9 @@
+ 
+ const TRUE_PEAK_EDITOR_WIDTH: usize = 12;
+ const TRUE_PEAK_CUSTOM_PILL: &str = " custom ";
+-// Shared by rendering, the information hit target, and the custom pill offset.
+-// The initial border occupies one cell; the label ends with one separator.
+-const TRUE_PEAK_ROW_BEFORE_INFO: &str = "   TP target ";
+-
+-/// Display-cell offset of the true-peak information icon from the row origin.
+-pub(super) fn true_peak_info_offset() -> u16 {
+-    (1 + TRUE_PEAK_ROW_BEFORE_INFO.len()) as u16
+-}
++// Shared by drawing and button registration. The initial border occupies
++// one cell; the value begins in the same control column as the other rows.
++const TRUE_PEAK_ROW_BEFORE_VALUE: &str = "   TP target    ";
+ 
+ /// Exact human-readable ceiling: at least two decimals, all significant
+ /// nanodecimals. A numeric format specifier must not round an exact target.
+@@ -619,15 +602,31 @@
+     editing: bool,
+     row_width: usize,
+ ) -> Option<u16> {
++    let offset = true_peak_value_end_offset(value, editing);
++    (offset + TRUE_PEAK_CUSTOM_PILL.len() + 1 <= row_width)
++        .then_some(offset as u16)
++}
++
++fn true_peak_value_end_offset(value: tonepoet_pipeline::DbNano, editing: bool) -> usize {
+     let value_width = if editing {
+         TRUE_PEAK_EDITOR_WIDTH + " dBTP".len()
+     } else {
+         true_peak_ceiling_label(value).len() + " dBTP".len()
+     };
+-    let offset = true_peak_info_offset() as usize + "ⓘ  < ".chars().count()
+-        + value_width + " >  ".len();
+-    (offset + TRUE_PEAK_CUSTOM_PILL.len() + 1 <= row_width)
+-        .then_some(offset as u16)
++    1 + TRUE_PEAK_ROW_BEFORE_VALUE.len() + "< ".len() + value_width + " >  ".len()
++}
++
++/// Display-cell offset of the end-of-controls glyph, or None if it cannot
++/// fit. Custom-pill and glyph hit targets follow precisely the drawn row.
++pub(super) fn true_peak_info_offset(
++    value: tonepoet_pipeline::DbNano,
++    editing: bool,
++    row_width: usize,
++) -> Option<u16> {
++    let offset = true_peak_custom_pill_offset(value, editing, row_width)
++        .map(|start| start as usize + TRUE_PEAK_CUSTOM_PILL.len() + 2)
++        .unwrap_or_else(|| true_peak_value_end_offset(value, editing));
++    (offset + 2 + 1 <= row_width).then_some(offset as u16)
+ }
+ 
+ fn pcm_true_peak_db_value_row(
+@@ -647,17 +646,7 @@
+     };
+     let mut spans = vec![
+         Span::styled("│", theme.border(border_color)),
+-        Span::styled(TRUE_PEAK_ROW_BEFORE_INFO, label_style),
+-        // U+24D8 can paint across two terminal cells. Style its guard cell
+-        // identically, as on the existing De-emphasis information affordance.
+-        Span::styled(
+-            "ⓘ ",
+-            Style::default()
+-                .fg(if theme.dark { theme.info } else { theme.value })
+-                .add_modifier(Modifier::BOLD),
+-        ),
+-        // Keep the editor aligned with the other Format-row controls.
+-        Span::raw(" "),
++        Span::styled(TRUE_PEAK_ROW_BEFORE_VALUE, label_style),
+         Span::styled("< ", control_style),
+     ];
+     if let Some(input) = edit_input {
+@@ -689,6 +678,19 @@
+         };
+         spans.push(Span::styled(TRUE_PEAK_CUSTOM_PILL, custom_style));
+     }
++    if true_peak_info_offset(value, edit_input.is_some(), width).is_some() {
++        if true_peak_custom_pill_offset(value, edit_input.is_some(), width).is_some() {
++            spans.push(Span::raw("  "));
++        }
++        // U+24D8 may paint across two cells; its guard cell uses the same
++        // contrasting foreground, as on the de-emphasis and HDCD controls.
++        spans.push(Span::styled(
++            "ⓘ ",
++            Style::default()
++                .fg(if theme.dark { theme.info } else { theme.value })
++                .add_modifier(Modifier::BOLD),
++        ));
++    }
+     let hint = if edit_input.is_some() {
+         "  Enter: apply  Esc: cancel  unsigned = headroom".to_string()
+     } else if lossy_capped {
+@@ -1075,7 +1077,10 @@
+                 let idx = row.spans.iter().position(|s| s.content.as_ref() == "\u{24d8} ")
+                     .expect("true-peak info affordance");
+                 let x: usize = row.spans[..idx].iter().map(Span::width).sum();
+-                assert_eq!(x, true_peak_info_offset() as usize);
++                assert_eq!(
++                    Some(x as u16),
++                    true_peak_info_offset(DbNano(-100_000_000), false, 120),
++                );
+                 let icon = &row.spans[idx];
+                 assert_eq!(icon.width(), 2);
+                 assert_eq!(icon.style.fg, Some(if theme.dark { theme.info } else { theme.value }));
+@@ -1093,6 +1098,33 @@
+     }
+ 
+     #[test]
++    fn r5_true_peak_help_follows_the_custom_pill_and_tracks_editor_width() {
++        let theme = super::super::theme::theme_by_slug(
++            super::super::theme::default_theme_slug(),
++        ).expect("default theme");
++        for value in [DbNano(-100_000_000), DbNano(-1)] {
++            for editing in [false, true] {
++                let input = editing.then(|| {
++                    super::super::text_input::TextInputState::new_selected(
++                        true_peak_ceiling_label(value),
++                    )
++                });
++                let row = pcm_true_peak_db_value_row(
++                    theme.green, 120, value, input.as_ref(), true, false, theme,
++                );
++                let custom_idx = row.spans.iter().position(|s| s.content.as_ref() == TRUE_PEAK_CUSTOM_PILL)
++                    .expect("custom pill");
++                let icon_idx = row.spans.iter().position(|s| s.content.as_ref() == "ⓘ ")
++                    .expect("end-of-controls info glyph");
++                assert!(icon_idx > custom_idx, "info glyph must follow custom pill");
++                let drawn_offset: usize = row.spans[..icon_idx].iter().map(Span::width).sum();
++                assert_eq!(true_peak_info_offset(value, editing, 120), Some(drawn_offset as u16));
++            }
++        }
++        assert_eq!(true_peak_info_offset(DbNano(-100_000_000), false, 34), None);
++    }
++
++    #[test]
+     fn r32_no_true_peak_row_advertises_set_and_lossy_warning_survives() {
+         let theme = super::super::theme::theme_by_slug(
+             super::super::theme::default_theme_slug(),
+--- a/src/tui/event_loop.rs
++++ b/src/tui/event_loop.rs
+@@ -6564,6 +6564,7 @@
+ 
+ fn handle_convert_hdcd_scan_complete(
+     app: &mut AppState,
++    tx: &mpsc::Sender<AppMessage>,
+     generation: u64,
+     paths: Vec<std::path::PathBuf>,
+     results: Vec<(std::path::PathBuf, super::app::ConvertHdcdPathState)>,
+@@ -6598,6 +6599,9 @@
+     }
+     app.convert.source.hdcd_scan_results = accepted;
+     app.convert.format.set_convert_hdcd_summary(&app.convert.source.hdcd_scan_results);
++    let _ = super::command::complete_pending_browse_convert_post_load_after_source_scans(
++        app, tx, generation, &paths,
++    );
+ }
+ 
+ fn handle_convert_deemphasis_batch_preflight_complete(
+@@ -6697,7 +6701,7 @@
+         paths.len(),
+     );
+ 
+-    let _ = super::command::complete_pending_browse_convert_post_load_after_deemphasis_preflight(
++    let _ = super::command::complete_pending_browse_convert_post_load_after_source_scans(
+         app,
+         tx,
+         generation,
+@@ -7951,7 +7955,7 @@
+             );
+         }
+         AppMessage::ConvertHdcdScanComplete { generation, paths, results } => {
+-            handle_convert_hdcd_scan_complete(app, generation, paths, results);
++            handle_convert_hdcd_scan_complete(app, tx, generation, paths, results);
+         }
+         AppMessage::ConvertDeemphasisBatchPreflightComplete { generation, paths, results } => {
+             handle_convert_deemphasis_batch_preflight_complete(
+--- a/src/tui/keybindings.rs
++++ b/src/tui/keybindings.rs
+@@ -23,6 +23,26 @@
+     "Off — the boost stays in the audio, and tonepoet keeps the pre-emphasis flag wherever the format can carry it. CD players and some software — foobar2000, JRiver, iTunes, cmus — read that flag and correct playback. Where the flag cannot travel, such as a lossy target or anything outside 16-bit/44.1 kHz, the file will sound bright everywhere."
+ );
+ 
++/// HDCD is shown only when a detected feature can change decoded audio.
++/// The Notice popup is plain text, so keep paragraph breaks and On/Off labels.
++pub(crate) const HDCD_INFO_MESSAGE: &str = concat!(
++    "Some CDs were mastered with HDCD, which encodes additional dynamic-range ",
++    "information in ordinary 16-bit audio. The disc plays normally without an HDCD ",
++    "decoder, but decoding can restore dynamics in loud and quiet passages.\n\n",
++    "HDCD decoding recovers up to 20-bit precision. For lossless output, TonePoet ",
++    "automatically selects 24-bit to preserve the recovered precision. If you ",
++    "choose 16-bit instead, TonePoet applies TPDF dither by default. You can turn ",
++    "it off.\n\n",
++    "On — TonePoet decodes supported HDCD features before other processing, ",
++    "restoring the available dynamics. Recommended for listening copies and lossy ",
++    "conversion, because lossy encoding destroys the embedded HDCD information.\n\n",
++    "Off — TonePoet leaves HDCD decoding disabled. A lossless copy that preserves ",
++    "the original 16-bit, 44.1 kHz samples without modification also preserves the ",
++    "HDCD information for later decoding. Resampling, dithering, other ",
++    "sample-altering processing, or lossy encoding can destroy that information. ",
++    "Simply increasing bit depth without altering the samples does not."
++);
++
+ /// Help shared by PCM and DSD true-peak target rows; the Notice popup is
+ /// unformatted, so paragraph breaks and label prefixes are deliberate.
+ pub(crate) const TRUE_PEAK_INFO_MESSAGE: &str = concat!(
+@@ -72251,17 +72271,10 @@
+             }
+             TuiButton::HdcdInfo => {
+                 use super::app::ActiveOverlay;
+-                let format = &app.convert.format;
+-                let explanation = if format.hdcd_actionable_count > 0 {
+-                    "HDCD uses control codes in the original 16-bit CD samples. FFmpeg can restore Peak Extend and Low-Level Gain Adjustment. Leave Decode off for a lossless 16/44.1 preservation copy; enable it before other audio processing. Decoding expands the waveform beyond 16-bit precision. FFmpeg detects Transient Filter signaling but does not reconstruct it."
+-                } else if format.hdcd_transient_only_count > 0 {
+-                    "HDCD Transient Filter signaling was detected, but no Peak Extend or Low-Level Gain Adjustment. FFmpeg detects Transient Filter but does not reconstruct that feature, so there is no supported transformation to apply."
+-                } else {
+-                    "HDCD packets were detected without supported output-changing Peak Extend or Low-Level Gain Adjustment. The FFmpeg decoder is not applied to passive HDCD."
+-                };
++                app.convert.focus = ConvertFocus::Format;
+                 app.active_overlay = ActiveOverlay::Notice {
+                     title: "HDCD decoding".to_owned(),
+-                    message: explanation.to_owned(),
++                    message: HDCD_INFO_MESSAGE.to_owned(),
+                     scroll: 0,
+                 };
+             }
+--- a/tonepoet-pipeline/src/plugins.rs
++++ b/tonepoet-pipeline/src/plugins.rs
+@@ -1897,7 +1897,11 @@
+     // restriction applies to PCM certified true-peak lossy gain, whose
+     // validator explicitly disallows an unproved dither terminal.
+     let aac_int16_boundary = *target_format == AudioFormat::Aac
+-        && !context.request.source.is_dsd()
++        // A reconstructed PCM carrier is no longer a DSD codec/format, but
++        // its source representation still identifies the certified DSD path.
++        // Do not add a new dither boundary after that measured realization.
++        && context.request.source.representation_kind()
++            != crate::source::SourceRepresentationKind::Dsd
+         && !context.request.settings.pcm_true_peak.is_true_peak()
+         && (context.request.source.authoritative_pcm_depth() != Some(PcmBitDepth::Int16)
+             || sample_changes);
+@@ -3056,6 +3060,7 @@
+             settings.dither_type = selected;
+             let mut request = pcm_request_with(settings, PcmBitDepth::Int32);
+             request.source.sample_rate_hz = Some(44_100);
++            request.output_path = PathBuf::from("output.m4a");
+             let step = PlanStep::new(
+                 0, PlanOperation::EncodeLossy {
+                     target_format: AudioFormat::Aac, target_rate_hz: Some(44_100),
+@@ -3079,6 +3084,7 @@
+         let mut request = pcm_request_with(PipelineSettings::default(), PcmBitDepth::Int16);
+         request.source.sample_rate_hz = Some(44_100);
+         request.settings.target_format = AudioFormat::Aac;
++        request.output_path = PathBuf::from("output.m4a");
+         let step = PlanStep::new(
+             0, PlanOperation::EncodeLossy {
+                 target_format: AudioFormat::Aac, target_rate_hz: Some(44_100),
+@@ -3101,7 +3107,8 @@
+             scope: crate::enums::TruePeakScope::Track,
+             scan: crate::enums::TruePeakScanTier::Standard,
+         });
+-        let request = pcm_request_with(settings, PcmBitDepth::Int32);
++        let mut request = pcm_request_with(settings, PcmBitDepth::Int32);
++        request.output_path = PathBuf::from("output.m4a");
+         let step = PlanStep::new(
+             0, PlanOperation::EncodeLossy {
+                 target_format: AudioFormat::Aac, target_rate_hz: Some(96_000),

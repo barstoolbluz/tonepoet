@@ -23,6 +23,26 @@ pub(crate) const DEEMPHASIS_INFO_MESSAGE: &str = concat!(
     "Off — the boost stays in the audio, and tonepoet keeps the pre-emphasis flag wherever the format can carry it. CD players and some software — foobar2000, JRiver, iTunes, cmus — read that flag and correct playback. Where the flag cannot travel, such as a lossy target or anything outside 16-bit/44.1 kHz, the file will sound bright everywhere."
 );
 
+/// HDCD is shown only when a detected feature can change decoded audio.
+/// The Notice popup is plain text, so keep paragraph breaks and On/Off labels.
+pub(crate) const HDCD_INFO_MESSAGE: &str = concat!(
+    "Some CDs were mastered with HDCD, which encodes additional dynamic-range ",
+    "information in ordinary 16-bit audio. The disc plays normally without an HDCD ",
+    "decoder, but decoding can restore dynamics in loud and quiet passages.\n\n",
+    "HDCD decoding recovers up to 20-bit precision. For lossless output, TonePoet ",
+    "automatically selects 24-bit to preserve the recovered precision. If you ",
+    "choose 16-bit instead, TonePoet applies TPDF dither by default. You can turn ",
+    "it off.\n\n",
+    "On — TonePoet decodes supported HDCD features before other processing, ",
+    "restoring the available dynamics. Recommended for listening copies and lossy ",
+    "conversion, because lossy encoding destroys the embedded HDCD information.\n\n",
+    "Off — TonePoet leaves HDCD decoding disabled. A lossless copy that preserves ",
+    "the original 16-bit, 44.1 kHz samples without modification also preserves the ",
+    "HDCD information for later decoding. Resampling, dithering, other ",
+    "sample-altering processing, or lossy encoding can destroy that information. ",
+    "Simply increasing bit depth without altering the samples does not."
+);
+
 /// Help shared by PCM and DSD true-peak target rows; the Notice popup is
 /// unformatted, so paragraph breaks and label prefixes are deliberate.
 pub(crate) const TRUE_PEAK_INFO_MESSAGE: &str = concat!(
@@ -72251,17 +72271,10 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             }
             TuiButton::HdcdInfo => {
                 use super::app::ActiveOverlay;
-                let format = &app.convert.format;
-                let explanation = if format.hdcd_actionable_count > 0 {
-                    "HDCD uses control codes in the original 16-bit CD samples. FFmpeg can restore Peak Extend and Low-Level Gain Adjustment. Leave Decode off for a lossless 16/44.1 preservation copy; enable it before other audio processing. Decoding expands the waveform beyond 16-bit precision. FFmpeg detects Transient Filter signaling but does not reconstruct it."
-                } else if format.hdcd_transient_only_count > 0 {
-                    "HDCD Transient Filter signaling was detected, but no Peak Extend or Low-Level Gain Adjustment. FFmpeg detects Transient Filter but does not reconstruct that feature, so there is no supported transformation to apply."
-                } else {
-                    "HDCD packets were detected without supported output-changing Peak Extend or Low-Level Gain Adjustment. The FFmpeg decoder is not applied to passive HDCD."
-                };
+                app.convert.focus = ConvertFocus::Format;
                 app.active_overlay = ActiveOverlay::Notice {
                     title: "HDCD decoding".to_owned(),
-                    message: explanation.to_owned(),
+                    message: HDCD_INFO_MESSAGE.to_owned(),
                     scroll: 0,
                 };
             }

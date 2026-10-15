@@ -1,0 +1,20 @@
+2026-10-15T19:17:23Z
+
+RUN tests/verify_hdcd_analysis_cache_sql.py
+PASS: actual store_analysis SQLite SQL preserves matching HDCD data and clears on version or identity changes
+
+RUN tests/verify_hdcd_v28_migration_sql.py
+PASS: v21-v27 modeled cache-present/cache-missing cases, two v28 replays, identity columns and row preservation (14 cases)
+
+RUN tests/hdcd_source_first_ffmpeg_smoke.py
+PASS: late HDCD detection and independent sample-bounded FLAC/CUE members
+PASS: FLAC source-first HDCD decode, 44159 exact stereo S32 frames, no rate change
+
+RUN tests/hdcd_lossy_precision_ffmpeg_smoke.py
+PASS: S32 source -> explicit SoXR 44.1/48 -> Float32-input libopus
+PASS: S32 source -> planar Float32-input libmp3lame
+PASS: S32 source -> one no-rate-change SoXR TPDF/Int16 terminal
+NOT RUN: libfdk_aac unavailable (pinned-host gate required)
+
+SYNTAX CHECK
+PASS

@@ -1,0 +1,31 @@
+PASS HDCD popup constant exists
+PASS HDCD help exactly matches all four requested paragraphs
+PASS HDCD On and Off use em dash
+PASS HDCD row follows actionable predicate
+PASS HDCD informational suffix has no counts
+PASS HDCD manual-off warning has no warning emoji
+PASS true peak is positioned via shared value-aware glyph helper
+PASS drawn true-peak info follows custom pill
+PASS HDCD row hidden in maximized ordinary layout
+PASS AAC fixture output path set to M4A
+PASS certified DSD origin gates AAC Int16 boundary
+PASS AAC CUE allows exact terminal quantization only
+PASS current schema assertion 28 matches database migration
+PASS deferred auto-commit waits on de-emphasis and HDCD
+PASS both worker reducers resume same generation-scoped continuation
+PASS warnings retained and reinstated after last source scan
+PASS pending continuation single-consumer ownership
+PASS exactly 10 relevant source files changed
+PASS historical 999 inventory files retained
+SCOPE
+  src/convert/pipeline/stages.rs
+  src/convert/pipeline/track_executor.rs
+  src/tui/app.rs
+  src/tui/command.rs
+  src/tui/context_menu.rs
+  src/tui/convert_screen.rs
+  src/tui/draw_output.rs
+  src/tui/event_loop.rs
+  src/tui/keybindings.rs
+  tonepoet-pipeline/src/plugins.rs
+TOTAL 19 static audit checks PASS; no Rust build was run.

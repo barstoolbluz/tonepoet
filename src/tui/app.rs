@@ -2543,16 +2543,22 @@ pub struct PendingBrowseConvertPresetContinuation {
     pub path: PathBuf,
     pub preset: String,
     pub post_load: crate::tui::command::BrowseConvertPostLoad,
+    /// Expansion warnings must survive the source probe before a post-load
+    /// commit continuation (if needed) can own them.
+    pub status_notes: Vec<String>,
 }
 
-/// Deferred Browse post-load action waiting for the exact batch de-emphasis
-/// preflight that guards Convert commit. Generation plus the complete path
-/// vector prevents stale background work from committing a replacement source.
+/// Deferred Browse post-load action waiting for both source-level scan gates.
+/// Generation plus the complete path vector prevents stale background work
+/// from committing a replacement source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingBrowseConvertPostLoadContinuation {
     pub generation: u64,
     pub paths: Vec<PathBuf>,
     pub post_load: crate::tui::command::BrowseConvertPostLoad,
+    /// Expansion warnings must outlive both asynchronous source scans; the
+    /// final queue result replaces earlier transient status messages.
+    pub status_notes: Vec<String>,
 }
 
 impl PendingBrowseConvertExpansion {
@@ -5909,7 +5915,7 @@ impl FormatState {
             if self.deemphasis_eligible && self.deemphasis_evidence != ConvertDeemphasisEvidence::None {
                 rows.push(FormatPaneRow::Field(FormatField::Deemphasis));
             }
-            if self.hdcd_detected_count > 0 {
+            if self.hdcd_is_actionable() {
                 rows.push(FormatPaneRow::Field(FormatField::HdcdDecode));
             }
             if !self.source_is_dsd {
@@ -5972,11 +5978,6 @@ impl FormatState {
             rows.push(FormatPaneRow::Spacer);
             rows.push(FormatPaneRow::Field(FormatField::Deemphasis));
         }
-        if maximized && self.hdcd_eligible_count > 0 && self.hdcd_detected_count == 0 {
-            rows.push(FormatPaneRow::Spacer);
-            rows.push(FormatPaneRow::Field(FormatField::HdcdDecode));
-        }
-
         if maximized && self.format.selected_value().available_containers().len() > 1 {
             rows.push(FormatPaneRow::Spacer);
             rows.push(FormatPaneRow::Field(FormatField::Container));
@@ -7079,7 +7080,7 @@ impl FormatState {
         {
             return Some("ⓘ HDCD Decode Off: wider PCM may not be recognized by HDCD players.");
         }
-        Some("⚠ HDCD Decode Off: conversion may destroy HDCD control codes.")
+        Some("ⓘ HDCD Decode Off: conversion may destroy HDCD control codes.")
     }
 
     /// True only for the one output domain that may retain a pre-emphasized
@@ -20369,7 +20370,7 @@ mod app_startup_options_tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("read activated schema version");
         assert_eq!(
-            version, 27,
+            version, 28,
             "quiescent startup must durably advance through the current schema"
         );
         let protocol_version: u32 = conn
@@ -25027,15 +25028,17 @@ mod hdcd_format_policy_tests {
         let format = state_for(capabilities(false, false, false, false));
         assert!(!format.hdcd_decode_enabled);
         assert!(!format.visible_fields(false).contains(&FormatField::HdcdDecode));
-        assert!(format.visible_fields(true).contains(&FormatField::HdcdDecode));
+        assert!(!format.visible_fields(true).contains(&FormatField::HdcdDecode));
 
         let format = state_for(capabilities(true, true, false, false));
         assert!(format.visible_fields(false).contains(&FormatField::HdcdDecode));
+        assert!(format.visible_fields(true).contains(&FormatField::HdcdDecode));
         assert!(!format.hdcd_decode_enabled);
 
         for (pe, gain, tf) in [(false, false, true), (false, false, false)] {
             let mut format = state_for(capabilities(true, pe, gain, tf));
-            assert!(format.visible_fields(false).contains(&FormatField::HdcdDecode));
+            assert!(!format.visible_fields(false).contains(&FormatField::HdcdDecode));
+            assert!(!format.visible_fields(true).contains(&FormatField::HdcdDecode));
             assert!(!format.hdcd_is_actionable());
             assert!(!format.select_row_index(FormatField::HdcdDecode, 1, None, None));
             assert!(!format.hdcd_decode_enabled);
@@ -25098,6 +25101,7 @@ mod hdcd_format_policy_tests {
             assert!(state.hdcd_promoted_from_depth.is_none());
         }
         assert!(state.format.select_value(&AudioFormat::Wav));
+        state.apply_format_constraints(); // Enable WAV float options before selecting them.
         for depth in [BitDepthChoice::Float32, BitDepthChoice::Float64] {
             assert!(state.bit_depth.select_value(&depth));
             state.apply_format_constraints();
