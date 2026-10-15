@@ -10262,17 +10262,8 @@ fn execute_commit_with_source_options_transform(
     let hdcd_actionable = hdcd_path_states.values().any(|state| state.has_actionable());
     if hdcd_decode_enabled && hdcd_actionable {
         let format = &app.convert.format;
-        let lossless = matches!(*format.format.selected_value(),
-            crate::convert::formats::AudioFormat::Flac | crate::convert::formats::AudioFormat::Wav
-            | crate::convert::formats::AudioFormat::Aiff | crate::convert::formats::AudioFormat::WavPack
-            | crate::convert::formats::AudioFormat::Alac | crate::convert::formats::AudioFormat::Lpcm)
-            && !(*format.format.selected_value() == crate::convert::formats::AudioFormat::WavPack && format.wavpack_hybrid);
-        let depth16 = matches!(*format.bit_depth.selected_value(),
-            super::app::BitDepthChoice::Source | super::app::BitDepthChoice::Int16);
-        if lossless && depth16 {
-            app.set_status("HDCD Decode restores up to 20-bit precision; select Int24 or a wider lossless output");
-            return;
-        }
+        // Explicit 16-bit lossless output is valid: the registered-effect
+        // carrier retains HDCD precision until the selected final quantizer.
         if matches!(*format.pcm_gain_mode.selected_value(),
             super::app::PcmGainMode::TruePeakGuard | super::app::PcmGainMode::TruePeakNormalize)
         {

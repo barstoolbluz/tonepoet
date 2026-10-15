@@ -1,0 +1,612 @@
+diff --git a/src/tui/app.rs b/src/tui/app.rs
+--- a/src/tui/app.rs
++++ b/src/tui/app.rs
+@@ -6075,9 +6075,25 @@
+         self.source_derived_bit_depth = None;
+     }
+ 
++    /// Selecting 16-bit *after* Decode became On is a user request to retain
++    /// decoding at lower output precision, not a request to recompute Decode
++    /// Off. Use the existing manual-override authority without calling the
++    /// Decode-On handler, which would widen the depth back to 24 bits.
++    fn preserve_hdcd_on_explicit_int16_selection(&mut self) {
++        if *self.bit_depth.selected_value() == BitDepthChoice::Int16
++            && self.hdcd_decode_enabled
++            && self.hdcd_is_actionable()
++            && self.hdcd_output_is_lossless_int16()
++        {
++            self.hdcd_decode_overridden = true;
++            self.hdcd_override_from_preset = false;
++        }
++    }
++
+     pub fn select_bit_depth(&mut self, bit_depth: BitDepthChoice, source_bits: Option<u32>) {
+         self.mark_bit_depth_user_policy();
+         self.bit_depth.select_value(&bit_depth);
++        self.preserve_hdcd_on_explicit_int16_selection();
+         // Constraints may change the final De-emphasis state and therefore the
+         // R24 automatic-dither policy. Settle them first, then apply the
+         // caller's authoritative source depth so the constraint cascade cannot
+@@ -6577,6 +6593,7 @@
+         }
+         if row == FormatField::BitDepth {
+             self.mark_bit_depth_user_policy();
++            self.preserve_hdcd_on_explicit_int16_selection();
+         }
+         if row == FormatField::Dither {
+             self.mark_dither_overridden();
+@@ -6781,6 +6798,15 @@
+         })
+     }
+ 
++    /// HDCD-derived TPDF is a display default, not a batch-wide dither
++    /// instruction. The concrete effect owns TPDF at its final Int16 terminal.
++    pub(crate) fn hdcd_auto_tpdf_applicable(&self) -> bool {
++        self.hdcd_decode_enabled
++            && self.hdcd_is_actionable()
++            && self.hdcd_output_is_lossless_int16()
++            && self.hdcd_promoted_from_depth.is_none()
++    }
++
+     /// Applies the default dither rule while preserving manual user choice.
+     /// `source_bits` should come from the selected source probe when available.
+     pub fn apply_auto_dither(&mut self, source_bits: Option<u32>) {
+@@ -6789,9 +6815,7 @@
+         }
+ 
+         let desired = if self.deemphasis_auto_tpdf_applicable()
+-            || (self.hdcd_decode_enabled && self.hdcd_is_actionable()
+-                && self.hdcd_output_is_lossless_int16()
+-                && self.hdcd_promoted_from_depth.is_none())
++            || self.hdcd_auto_tpdf_applicable()
+         {
+             DitherType::TPDF
+         } else {
+@@ -25077,6 +25101,55 @@
+     }
+ 
+     #[test]
++    fn r4c_explicit_int16_after_automatic_hdcd_on_keeps_decode_on_in_both_entry_points() {
++        for direct in [true, false] {
++            let mut state = state_for(capabilities(true, true, false, false));
++            assert!(state.bit_depth.select_value(&BitDepthChoice::Int24));
++            state.apply_format_constraints();
++            assert!(state.hdcd_decode_enabled, "Int24 must automatically enable HDCD");
++            assert!(!state.hdcd_decode_overridden);
++
++            if direct {
++                state.select_bit_depth(BitDepthChoice::Int16, Some(16));
++            } else {
++                let index = state.bit_depth.options.iter()
++                    .position(|option| option.value == BitDepthChoice::Int16)
++                    .expect("Int16 option");
++                assert!(state.select_row_index(
++                    FormatField::BitDepth, index, Some(16), Some(44_100)
++                ));
++            }
++            assert_eq!(*state.bit_depth.selected_value(), BitDepthChoice::Int16);
++            assert!(state.hdcd_decode_enabled, "{direct}: explicit Int16 does not toggle Decode Off");
++            assert!(state.hdcd_decode_overridden, "Decode On is now an explicit user policy");
++            assert!(state.bit_depth_overridden);
++            assert!(state.hdcd_promoted_from_depth.is_none());
++            assert_eq!(*state.dither.selected_value(), DitherType::TPDF);
++            assert!(!state.dither_overridden, "TPDF is automatic, not user-explicit");
++
++            let off_index = state.dither.options.iter()
++                .position(|option| option.value == DitherType::None).unwrap();
++            assert!(state.select_row_index(
++                FormatField::Dither, off_index, Some(16), Some(44_100)
++            ));
++            assert!(state.dither_overridden);
++            assert_eq!(*state.dither.selected_value(), DitherType::None);
++            let previous_format = *state.format.selected_value();
++            let previous_depth = *state.bit_depth.selected_value();
++            assert!(state.format.select_value(&AudioFormat::Wav));
++            state.after_user_selection(FormatField::Format, previous_format,
++                previous_depth, Some(16), Some(44_100));
++            assert!(state.hdcd_decode_enabled);
++            assert_eq!(*state.bit_depth.selected_value(), BitDepthChoice::Int16);
++            assert_eq!(*state.dither.selected_value(), DitherType::None);
++
++            state.reset_deemphasis_for_source_replacement();
++            assert!(!state.hdcd_decode_overridden);
++            assert!(!state.hdcd_decode_enabled);
++        }
++    }
++
++    #[test]
+     fn manual_hdcd_int16_tpdf_override_and_preset_depth_are_stable() {
+         let mut state = state_for(capabilities(true, true, false, false));
+         state.select_bit_depth(BitDepthChoice::Int16, Some(16));
+diff --git a/src/tui/convert_actions.rs b/src/tui/convert_actions.rs
+--- a/src/tui/convert_actions.rs
++++ b/src/tui/convert_actions.rs
+@@ -340,6 +340,13 @@
+             *format.bit_depth.selected_value(),
+             BitDepthChoice::Float32 | BitDepthChoice::Float64
+         );
++    // AAC's libfdk terminal is a special case: a high-precision input may
++    // require final signed-Int16 quantization. Keep stored manual dither
++    // authority (including Off) even while the lossy UI disables the dither
++    // pill. Float-input MP3/Opus and DSD keep their ordinary inactive policy.
++    let aac_terminal_dither_override = *format.format.selected_value() == AudioFormat::Aac
++        && !format.source_is_dsd
++        && format.dither_overridden;
+ 
+     // Preserve an explicit dither selection across temporary target constraints,
+     // but do not submit a disabled ordinary Int32 PCM cell. Scope this refusal to
+@@ -362,8 +369,8 @@
+     // Keep the stored choice for a later compatible PCM target, but forward no
+     // dither authority into the current request. A disabled lossless Int32 cell is
+     // handled by the fail-closed guard above rather than silently becoming None.
+-    let dither_inactive_for_request =
+-        target_makes_generic_dither_inactive || !selected_dither_enabled;
++    let dither_inactive_for_request = !aac_terminal_dither_override
++        && (target_makes_generic_dither_inactive || !selected_dither_enabled);
+ 
+     let (target_sample_rate, target_bit_depth, dither_type, preferred_tool, nyquist_transition) =
+         if is_dsd {
+@@ -418,12 +425,14 @@
+                 target_depth,
+                 if dither_inactive_for_request {
+                     pipeline_enums::DitherType::None
+-                } else if format.deemphasis_auto_tpdf_applicable() && !format.dither_overridden {
+-                    // R24 automatic TPDF is derived per request only when the
+-                    // CD de-emphasis effect is registered. Preserve the ordinary
+-                    // representative-source automatic value as the non-explicit
+-                    // nominal request setting so unrelated mixed-batch members
+-                    // keep their pre-R24 dither policy.
++                } else if !format.dither_overridden
++                    && (format.deemphasis_auto_tpdf_applicable()
++                        || format.hdcd_auto_tpdf_applicable())
++                {
++                    // Effect-derived TPDF belongs to the actual CD de-emphasis
++                    // or HDCD member, never the entire submitted batch. The
++                    // typed planner and carrier-terminal bridge restore it for
++                    // each eligible member. Others keep ordinary auto dither.
+                     let source_bits = if format.source_is_dsd {
+                         Some(1)
+                     } else {
+@@ -1177,6 +1186,139 @@
+     }
+ 
+     #[test]
++    fn r4c_hdcd_mixed_batch_auto_tpdf_is_not_projected_to_ordinary_members() {
++        use crate::convert::simple_wizard::DitherType as UiDitherType;
++        use crate::tui::analyze::HdcdCapabilities;
++        use std::collections::BTreeMap;
++
++        let mut format = FormatState::new();
++        format.format.select_value(&AudioFormat::Flac);
++        format.bit_depth.select_value(&BitDepthChoice::Int16);
++        // The representative batch source is 24-bit, even though one member
++        // is individually authorized as 16/44.1 effectual HDCD.
++        format.source_pcm_bit_depth = Some(24);
++        format.source_pcm_float_bits = None;
++        format.set_convert_hdcd_summary(&BTreeMap::from([
++            (PathBuf::from("hdcd.flac"), ConvertHdcdPathState {
++                eligible: true,
++                capabilities: Some(HdcdCapabilities {
++                    detected: true, peak_extend: true,
++                    low_level_gain_adjustment: false, transient_filter: false,
++                    max_gain_adjustment_db: 0.0,
++                }),
++                ..Default::default()
++            }),
++            (PathBuf::from("ordinary.flac"), ConvertHdcdPathState::default()),
++        ]));
++        assert!(!format.hdcd_decode_enabled);
++        assert!(format.select_row_index(FormatField::HdcdDecode, 1, Some(24), Some(44_100)));
++        assert_eq!(*format.bit_depth.selected_value(), BitDepthChoice::Int24);
++        format.select_bit_depth(BitDepthChoice::Int16, Some(24));
++        assert!(format.hdcd_decode_enabled);
++        assert_eq!(*format.dither.selected_value(), UiDitherType::TPDF);
++        assert!(format.hdcd_auto_tpdf_applicable());
++
++        let projected = format_state_to_pipeline_settings(&format).unwrap();
++        assert_eq!(projected.dither_type, pipeline_enums::DitherType::Shibata,
++            "non-HDCD 24 -> 16 batch members retain ordinary Shibata");
++        assert!(!projected.dither_explicit);
++
++        // The explicit manual choice is common policy; it must be forwarded,
++        // including Off, rather than being replaced by effect-local defaults.
++        format.mark_dither_overridden();
++        let explicit = format_state_to_pipeline_settings(&format).unwrap();
++        assert_eq!(explicit.dither_type, pipeline_enums::DitherType::Tpdf);
++        assert!(explicit.dither_explicit);
++    }
++
++    #[test]
++    fn r4c_aac_preserves_manual_dither_off_and_terminal_ffmpeg_lowering() {
++        use crate::convert::simple_wizard::DitherType as UiDitherType;
++        use crate::tui::analyze::HdcdCapabilities;
++        use std::collections::BTreeMap;
++
++        let mut format = FormatState::new();
++        format.set_convert_hdcd_summary(&BTreeMap::from([(
++            PathBuf::from("hdcd.flac"), ConvertHdcdPathState {
++                eligible: true,
++                capabilities: Some(HdcdCapabilities {
++                    detected: true, peak_extend: true,
++                    low_level_gain_adjustment: false, transient_filter: false,
++                    max_gain_adjustment_db: 0.0,
++                }),
++                ..Default::default()
++            },
++        )]));
++        assert!(format.select_row_index(FormatField::HdcdDecode, 1, Some(16), Some(44_100)));
++        format.select_bit_depth(BitDepthChoice::Int16, Some(16));
++        assert_eq!(*format.dither.selected_value(), UiDitherType::TPDF);
++        let off_index = format.dither.options.iter()
++            .position(|option| option.value == UiDitherType::None).unwrap();
++        assert!(format.select_row_index(FormatField::Dither, off_index, Some(16), Some(44_100)));
++        assert!(format.dither_overridden);
++
++        let before_aac = format.clone();
++        for (choice, expected) in [
++            (Some(UiDitherType::None), "dither_method=none"),
++            (Some(UiDitherType::TPDF), "dither_method=triangular"),
++            (None, "dither_method=triangular"), // automatic AAC terminal default
++        ] {
++            let mut format = before_aac.clone();
++            if let Some(choice) = choice {
++                assert!(format.dither.select_value(&choice));
++                format.mark_dither_overridden();
++            } else {
++                format.dither_overridden = false;
++            }
++            let before_format = *format.format.selected_value();
++            let before_depth = *format.bit_depth.selected_value();
++            assert!(format.format.select_value(&AudioFormat::Aac));
++            format.after_user_selection(FormatField::Format, before_format,
++                before_depth, Some(16), Some(44_100));
++            assert!(format.hdcd_decode_enabled);
++            assert!(!format.dither.options[format.dither.selected].enabled,
++                "AAC disables the user-facing PCM dither pill");
++            let settings = format_state_to_pipeline_settings(&format).unwrap();
++            assert_eq!(settings.dither_explicit, choice.is_some(),
++                "AAC terminal must retain manual authority but not invent it");
++            assert_eq!(settings.dither_type,
++                choice.map(map_dither).unwrap_or(pipeline_enums::DitherType::None));
++            let mut request = dsd_plan_request(settings);
++            request.input_path = PathBuf::from("decoded.wav");
++            request.output_path = PathBuf::from("output.m4a");
++            request.resolved_output_target = Some(
++                tonepoet_pipeline::ResolvedOutputTarget::AacM4a);
++            request.source = tonepoet_pipeline::SourceInfo {
++                format: tonepoet_pipeline::AudioFormat::Wav,
++                codec: tonepoet_pipeline::AudioCodec::PcmFloat,
++                sample_rate_hz: Some(44_100),
++                bit_depth: Some(tonepoet_pipeline::PcmBitDepth::Float64),
++                true_source_depth: None,
++                source_representation: tonepoet_pipeline::SourceRepresentationKind::Pcm,
++                sample_kind: Some(tonepoet_pipeline::SampleKind::Float),
++                channels: Some(2),
++                duration: Some(std::time::Duration::from_secs(60)),
++                frame_extent: None,
++                dsd_source_kind: None,
++                audio_md5: None,
++            };
++            let plan = tonepoet_pipeline::plan_conversion(&request)
++                .expect("AAC Float64/Int32 decoder carrier must plan");
++            let tonepoet_pipeline::PlanAction::Execute { commands, .. } = plan.action else {
++                panic!("AAC must execute for explicit {choice:?}");
++            };
++            let ffmpeg_args = commands.iter()
++                .filter(|command| command.tool == tonepoet_pipeline::ToolIdentifier::Ffmpeg)
++                .flat_map(|command| command.args.iter())
++                .collect::<Vec<_>>();
++            assert!(ffmpeg_args.iter().any(|arg| arg.contains(expected)),
++                "expected {expected} at AAC terminal: {ffmpeg_args:?}");
++            assert!(ffmpeg_args.iter().any(|arg| arg.contains("out_sample_fmt=s16")));
++        }
++
++    }
++
++    #[test]
+     fn r24_deemphasis_auto_tpdf_display_is_derived_per_request_not_serialized_globally() {
+         use crate::tui::app::BitDepthChoice;
+ 
+@@ -1307,7 +1449,7 @@
+     }
+ 
+     #[test]
+-    fn lossy_target_keeps_explicit_sox_only_choice_stored_but_projects_no_pcm_dither() {
++    fn mp3_target_keeps_explicit_sox_only_choice_stored_but_projects_no_pcm_dither() {
+         use crate::convert::simple_wizard::DitherType as UiDitherType;
+         use crate::tui::app::{BitDepthChoice, FormatField};
+ 
+@@ -1320,7 +1462,7 @@
+ 
+         let before_format = *format.format.selected_value();
+         let before_depth = *format.bit_depth.selected_value();
+-        assert!(format.format.select_value(&AudioFormat::Aac));
++        assert!(format.format.select_value(&AudioFormat::Mp3));
+         format.after_user_selection(
+             FormatField::Format,
+             before_format,
+@@ -1337,7 +1479,7 @@
+         );
+ 
+         let settings = format_state_to_pipeline_settings(&format).unwrap();
+-        assert_eq!(settings.target_format, pipeline_enums::AudioFormat::Aac);
++        assert_eq!(settings.target_format, pipeline_enums::AudioFormat::Mp3);
+         assert_eq!(settings.dither_type, pipeline_enums::DitherType::None);
+         assert!(
+             !settings.dither_explicit,
+@@ -1346,7 +1488,7 @@
+ 
+         let request = tonepoet_pipeline::PlanRequest {
+             input_path: PathBuf::from("source.wav"),
+-            output_path: PathBuf::from("output.m4a"),
++            output_path: PathBuf::from("output.mp3"),
+             source: tonepoet_pipeline::SourceInfo {
+                 format: tonepoet_pipeline::AudioFormat::Wav,
+                 codec: tonepoet_pipeline::AudioCodec::PcmSigned,
+@@ -1365,15 +1507,15 @@
+             plan_scope: tonepoet_pipeline::PlanScope::track("lossy-dither-inactive"),
+             intermediate_dir: Some(PathBuf::from("work")),
+             container_ffmpeg_flags: Vec::new(),
+-            resolved_output_target: Some(tonepoet_pipeline::ResolvedOutputTarget::AacM4a),
++            resolved_output_target: Some(tonepoet_pipeline::ResolvedOutputTarget::Mp3Native),
+             reference_programme_scope: tonepoet_pipeline::ReferenceProgrammeScope::Singleton,
+             planned_riff_non_audio_upper_bound_bytes: None,
+         };
+ 
+         let topology = tonepoet_pipeline::plan_topology(&request)
+-            .expect("AAC plan with inactive stored dither must remain valid");
++            .expect("MP3 plan with inactive stored dither must remain valid");
+         let tonepoet_pipeline::TopologyPlan::Execute { steps, .. } = topology else {
+-            panic!("AAC target must execute");
++            panic!("MP3 target must execute");
+         };
+         assert!(
+             steps.iter().all(|step| !matches!(
+@@ -1386,17 +1528,17 @@
+             steps.iter().any(|step| matches!(
+                 &step.operation,
+                 tonepoet_pipeline::PlanOperation::EncodeLossy {
+-                    target_format: tonepoet_pipeline::AudioFormat::Aac,
++                    target_format: tonepoet_pipeline::AudioFormat::Mp3,
+                     ..
+                 }
+             )),
+-            "AAC must remain the terminal encode: {steps:#?}",
++            "MP3 must remain the terminal encode: {steps:#?}",
+         );
+ 
+         let plan = tonepoet_pipeline::plan_conversion(&request)
+             .expect("inactive stored dither must not force a SoX preprocessing route");
+         let tonepoet_pipeline::PlanAction::Execute { commands, .. } = plan.action else {
+-            panic!("AAC target must execute commands");
++            panic!("MP3 target must execute commands");
+         };
+         assert!(
+             commands
+@@ -1424,7 +1566,7 @@
+ 
+         // Control: explicit None remains authoritative but inert on the lossy leg.
+         let mut none_format = FormatState::new();
+-        none_format.format.select_value(&AudioFormat::Aac);
++        none_format.format.select_value(&AudioFormat::Mp3);
+         none_format
+             .dither
+             .select_value(&crate::convert::simple_wizard::DitherType::None);
+@@ -1445,7 +1587,7 @@
+         stale_int32.dither_overridden = true;
+         stale_int32.bit_depth.select_value(&BitDepthChoice::Int32);
+         stale_int32.apply_format_constraints();
+-        stale_int32.format.select_value(&AudioFormat::Aac);
++        stale_int32.format.select_value(&AudioFormat::Mp3);
+         stale_int32.apply_format_constraints();
+         assert!(
+             stale_int32.dither.options.iter().all(|option| !option.enabled),
+diff --git a/src/convert/pipeline/plan_bridge.rs b/src/convert/pipeline/plan_bridge.rs
+--- a/src/convert/pipeline/plan_bridge.rs
++++ b/src/convert/pipeline/plan_bridge.rs
+@@ -3190,13 +3190,30 @@
+     })
+ }
+ 
++fn request_applies_hdcd_to_track(request: &PipelineRequest, track: &PreparedTrack) -> bool {
++    request.registered_effects.iter().any(|intent| {
++        match &intent.effect {
++            tonepoet_pipeline::RegisteredUnaryEffect::HdcdDecode { cue_segments, .. } => {
++                // The batch request can contain CUE authorization for *other*
++                // members. Mirror Phase-3's source-ordinal specialization so
++                // an unrelated Float64 effect carrier never inherits TPDF.
++                cue_segments.is_empty() || cue_segments.iter().any(|segment| {
++                    segment.source_ordinal == track.id.source_ordinal
++                })
++            }
++            _ => false,
++        }
++    })
++}
++
+ fn apply_registered_effect_terminal_dither_authority(
+     request: &PipelineRequest,
+     track: &PreparedTrack,
+     settings: &mut PipelineSettings,
+ ) {
+     if request.settings.dither_explicit
+-        || !request_applies_cd_deemphasis(request)
++        || !(request_applies_cd_deemphasis(request)
++            || request_applies_hdcd_to_track(request, track))
+         || !request.settings.target_format.is_pcm_lossless()
+         || (request.settings.target_format == PlannerFormat::WavPack
+             && request.settings.wavpack.hybrid)
+@@ -3228,12 +3245,10 @@
+         BitDepthTarget::Pcm(depth) => Some(depth),
+     };
+     if target_depth == Some(PcmBitDepth::Int16) {
+-        // R24 derives this TPDF in the common semantic plan only for the
+-        // concrete request that actually applies CD De-emphasis. Phase 3 then
+-        // realizes the effect into a Float64 carrier and replans the terminal
+-        // encode. Carry the same automatic authority across that private
+-        // carrier boundary without turning it into a user-explicit setting or
+-        // contaminating unrelated mixed-batch members.
++        // The typed planner derives automatic TPDF for the member actually
++        // receiving CD de-emphasis or HDCD. Phase 3 replans the terminal after
++        // realizing that effect into Float64: carry the non-explicit decision
++        // across the private carrier, without imposing it on other members.
+         settings.dither_type = tonepoet_pipeline::DitherType::Tpdf;
+     }
+ }
+@@ -3749,6 +3764,19 @@
+         }
+     }
+ 
++    fn hdcd_decode_effect(cue_segments: Vec<tonepoet_pipeline::HdcdCueSegment>) -> EffectIntent {
++        EffectIntent {
++            id: EffectInstanceId(9002),
++            effect: RegisteredUnaryEffect::HdcdDecode {
++                source_size_bytes: 4096,
++                source_modified_ns: 123,
++                cue_segments,
++            },
++            after: Vec::new(),
++            placement: EffectPlacement::SourceBitstreamDecode,
++        }
++    }
++
+     fn forced_ssrc_terminal_fixture(
+         root: &Path,
+         target_format: PlannerFormat,
+@@ -4607,6 +4635,136 @@
+                 "{label}: the terminal owns dither explicitly rather than suppressing it",
+             );
+         }
++    }
++
++    #[test]
++    fn r4c_hdcd_float64_carrier_reasserts_one_terminal_tpdf() {
++        let temp = TempDir::new().expect("temp dir");
++        let carrier = temp.path().join("hdcd.f64le");
++        std::fs::write(&carrier, [0_u8; 32]).expect("raw Float64 carrier");
++        let source_path = temp.path().join("hdcd.flac");
++        let output = temp.path().join("out.flac");
++
++        for (target_depth, label) in [
++            (tonepoet_pipeline::BitDepthTarget::Pcm(PcmBitDepth::Int16), "int16"),
++            (tonepoet_pipeline::BitDepthTarget::Source, "source-int16"),
++        ] {
++            let mut req = request(temp.path());
++            req.settings.target_format = PlannerFormat::Flac;
++            req.settings.target_sample_rate = tonepoet_pipeline::RateTarget::PcmHz(44_100);
++            req.settings.target_bit_depth = target_depth;
++            req.settings.preferred_tool = PreferredTool::Sox;
++            req.settings.dither_type = tonepoet_pipeline::DitherType::Shibata;
++            req.settings.dither_explicit = false;
++            req.settings.metadata.transfer_tags = false;
++            req.settings.metadata.preserve_artwork = false;
++            req.registered_effects = vec![hdcd_decode_effect(Vec::new())];
++
++            let prepared = raw_registered_effect_carrier(
++                carrier.clone(), source_path.clone(),
++                RegisteredEffectCarrierRepresentation::RawFloat64,
++            );
++            let downstream = plan_request_for_track(
++                &req, &prepared, &carrier, &output,
++                temp.path().join(format!("work-{label}")),
++            ).unwrap_or_else(|error| panic!("{label} HDCD terminal bridge: {error}"));
++            assert_eq!(downstream.settings.dither_type, tonepoet_pipeline::DitherType::Tpdf);
++            assert!(!downstream.settings.dither_explicit);
++            let plan = tonepoet_pipeline::plan_conversion(&downstream)
++                .unwrap_or_else(|error| panic!("{label} HDCD terminal plan: {error}"));
++            let PlanAction::Execute { commands, .. } = plan.action else {
++                panic!("{label} must execute an Int16 HDCD terminal")
++            };
++            let sox = commands.iter()
++                .find(|command| command.tool == tonepoet_pipeline::ToolIdentifier::Sox)
++                .expect("one selected SoX terminal");
++            assert_eq!(sox.args.iter().filter(|arg| arg.as_str() == "dither").count(), 1);
++            assert!(!sox.args.iter().any(|arg| arg == "-D"));
++        }
++    }
++
++    #[test]
++    fn r4c_hdcd_cue_dither_bridge_is_effectual_member_only() {
++        let temp = TempDir::new().expect("temp dir");
++        let carrier = temp.path().join("cue.f64le");
++        std::fs::write(&carrier, [0_u8; 32]).expect("raw Float64 carrier");
++        let source_path = temp.path().join("album.flac");
++        let mut req = request(temp.path());
++        req.settings.target_format = PlannerFormat::Flac;
++        req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(PcmBitDepth::Int16);
++        req.settings.dither_type = tonepoet_pipeline::DitherType::Shibata;
++        req.settings.dither_explicit = false;
++        req.registered_effects = vec![hdcd_decode_effect(vec![
++            tonepoet_pipeline::HdcdCueSegment {
++                source_ordinal: 2, start_sample: 44_100, sample_count: 44_100,
++            },
++        ])];
++        for (ordinal, expected) in [(1, tonepoet_pipeline::DitherType::Shibata),
++            (2, tonepoet_pipeline::DitherType::Tpdf)] {
++            let mut prepared = raw_registered_effect_carrier(
++                carrier.clone(), source_path.clone(),
++                RegisteredEffectCarrierRepresentation::RawFloat64,
++            );
++            prepared.id.source_ordinal = ordinal;
++            let downstream = plan_request_for_track(
++                &req, &prepared, &carrier, &temp.path().join(format!("out-{ordinal}.flac")),
++                temp.path().join(format!("work-{ordinal}")),
++            ).expect("CUE member terminal bridge");
++            assert_eq!(downstream.settings.dither_type, expected,
++                "CUE member {ordinal} must keep its own dither authority");
++        }
++    }
++
++    #[test]
++    fn r4c_hdcd_carrier_dither_respects_explicit_off_and_terminal_ownership() {
++        let temp = TempDir::new().expect("temp dir");
++        let carrier = temp.path().join("carrier.f64le");
++        let mut req = request(temp.path());
++        req.settings.target_format = PlannerFormat::Flac;
++        req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(PcmBitDepth::Int16);
++        req.settings.dither_type = tonepoet_pipeline::DitherType::None;
++        req.registered_effects = vec![hdcd_decode_effect(Vec::new())];
++        let raw = raw_registered_effect_carrier(
++            carrier.clone(), temp.path().join("source.flac"),
++            RegisteredEffectCarrierRepresentation::RawFloat64,
++        );
++        // A user Off choice suppresses the automatic HDCD terminal TPDF.
++        req.settings.dither_explicit = true;
++        let mut settings = req.settings.clone();
++        super::apply_registered_effect_terminal_dither_authority(&req, &raw, &mut settings);
++        assert_eq!(settings.dither_type, tonepoet_pipeline::DitherType::None);
++        assert!(settings.dither_explicit);
++
++        // An SSRC terminal carrier has already quantized/dithered: package-only
++        // continuation must not receive a second dither instruction.
++        req.settings.dither_explicit = false;
++        req.settings.dither_type = tonepoet_pipeline::DitherType::Shibata;
++        let float_wav = raw_registered_effect_carrier(
++            carrier.clone(), temp.path().join("source.flac"),
++            RegisteredEffectCarrierRepresentation::Float64Wav,
++        );
++        let mut float_wav_settings = req.settings.clone();
++        super::apply_registered_effect_terminal_dither_authority(
++            &req, &float_wav, &mut float_wav_settings);
++        assert_eq!(float_wav_settings.dither_type, tonepoet_pipeline::DitherType::Tpdf);
++
++        let ssrc = raw_registered_effect_carrier(
++            carrier.clone(), temp.path().join("source.flac"),
++            RegisteredEffectCarrierRepresentation::TerminalPcmWav {
++                bit_depth: PcmBitDepth::Int16,
++                terminal_candidate: selected_terminal(tonepoet_pipeline::ToolIdentifier::Ssrc),
++            },
++        );
++        let mut settings = req.settings.clone();
++        super::apply_registered_effect_terminal_dither_authority(&req, &ssrc, &mut settings);
++        assert_eq!(settings.dither_type, tonepoet_pipeline::DitherType::Shibata);
++
++        // Hybrid WavPack is not an Int16 lossless terminal.
++        req.settings.target_format = PlannerFormat::WavPack;
++        req.settings.wavpack.hybrid = true;
++        let mut settings = req.settings.clone();
++        super::apply_registered_effect_terminal_dither_authority(&req, &raw, &mut settings);
++        assert_eq!(settings.dither_type, tonepoet_pipeline::DitherType::Shibata);
+     }
+ 
+     #[test]

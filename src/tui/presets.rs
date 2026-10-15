@@ -54,6 +54,10 @@ pub struct TuiPreset {
     /// Distinguishes that policy from a user/preset choice of the same value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hdcd_auto_depth: Option<bool>,
+    /// The saved TPDF was automatically selected for HDCD-to-Int16, rather
+    /// than an explicit dither policy that should follow unrelated sources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hdcd_auto_dither: Option<bool>,
     #[serde(default)]
     pub noise_shaper: Option<String>, // "clans", "sdm", "crfb"
     #[serde(default)]
@@ -224,6 +228,7 @@ impl PresetWireLegacy {
             deemphasis: None,
             hdcd_decode: None,
             hdcd_auto_depth: None,
+            hdcd_auto_dither: None,
             noise_shaper: self.noise_shaper,
             modulator_order: self.modulator_order,
             dsd_filter_preset: self.dsd_filter_preset,
@@ -427,6 +432,11 @@ impl TuiPreset {
             deemphasis: format.deemphasis_overridden.then_some(format.deemphasis_enabled),
             hdcd_decode: format.hdcd_decode_overridden.then_some(format.hdcd_decode_enabled),
             hdcd_auto_depth: format.hdcd_promoted_from_depth.map(|_| true),
+            hdcd_auto_dither: (!format.dither_overridden
+                && format.hdcd_decode_enabled && format.hdcd_is_actionable()
+                && format.hdcd_output_is_lossless_int16()
+                && format.hdcd_promoted_from_depth.is_none()
+                && *format.dither.selected_value() == DitherType::TPDF).then_some(true),
             noise_shaper: Some(format.noise_shaper.selected_label().to_lowercase()),
             modulator_order: Some(format.modulator_order.selected_value().value()),
             dsd_filter_preset: Some(format.conversion_preset.selected_label().to_lowercase()),
@@ -866,7 +876,6 @@ impl TuiPreset {
                         // restore preserve its automatic provenance so the
                         // next source can widen without claiming user intent.
                         if self.hdcd_auto_depth == Some(true)
-                            && self.hdcd_decode.is_none()
                             && matches!(value, BitDepthChoice::Source | BitDepthChoice::Int16)
                         {
                             format_state.bit_depth_overridden = false;
@@ -885,7 +894,12 @@ impl TuiPreset {
                         let applied = Self::select_enabled(&mut format_state.dither, &value);
                         report.record("dither", applied);
                         if applied {
-                            format_state.mark_dither_override_from_preset();
+                            if self.hdcd_auto_dither == Some(true) {
+                                format_state.dither_overridden = false;
+                                format_state.dither_override_from_preset = false;
+                            } else {
+                                format_state.mark_dither_override_from_preset();
+                            }
                         }
                     }
                     None => report.record("dither", false),
@@ -1096,12 +1110,12 @@ impl TuiPreset {
         let expected_sample_rate = self.sample_rate;
         let expected_bit_depth = (pcm_depth_is_meaningful
             && !(self.hdcd_auto_depth == Some(true)
-                && self.hdcd_decode.is_none()
                 && format_state.hdcd_decode_enabled
                 && format_state.hdcd_is_actionable()))
             .then(|| parse_bit_depth(&self.bit_depth))
             .flatten();
-        let expected_dither = (pcm_depth_is_meaningful && !reference_dsd_to_pcm)
+        let expected_dither = (pcm_depth_is_meaningful && !reference_dsd_to_pcm
+            && self.hdcd_auto_dither != Some(true))
             .then(|| parse_dither(&self.dither))
             .flatten();
         let expected_replaygain = (!is_dsd)
@@ -2833,8 +2847,7 @@ merge = "multi-file"
         assert!(format.bit_depth.select_value(&BitDepthChoice::Source));
         format.hdcd_eligible_count = 1;
         format.hdcd_actionable_count = 1;
-        assert!(format.sample_rate.select_value(&88_200));
-        format.recompute_auto_hdcd();
+        assert!(format.select_row_index(FormatField::HdcdDecode, 1, None, Some(44_100)));
         assert!(format.hdcd_decode_enabled);
         assert_eq!(*format.bit_depth.selected_value(), BitDepthChoice::Int24);
         assert_eq!(format.hdcd_promoted_from_depth, Some(BitDepthChoice::Source));
@@ -2842,7 +2855,7 @@ merge = "multi-file"
             "hdcd-derived", &format, &OutputOptionsState::new(), &MetadataState::default(),
         );
         assert_eq!(preset.bit_depth, "source");
-        assert!(preset.hdcd_decode.is_none());
+        assert_eq!(preset.hdcd_decode, Some(true));
         assert_eq!(preset.hdcd_auto_depth, Some(true));
         let encoded = serde_json::to_string(&preset).expect("serialize HDCD preset");
         let decoded: TuiPreset = serde_json::from_str(&encoded).expect("deserialize HDCD preset");
@@ -2866,6 +2879,42 @@ merge = "multi-file"
         );
         assert_eq!(explicit.bit_depth, "24");
         assert_eq!(explicit.hdcd_auto_depth, None);
+    }
+
+    #[test]
+    fn hdcd_int16_automatic_tpdf_does_not_turn_into_preset_user_dither_policy() {
+        let mut format = FormatState::new();
+        assert!(format.format.select_value(&AudioFormat::Flac));
+        format.hdcd_eligible_count = 1;
+        format.hdcd_actionable_count = 1;
+        assert!(format.select_row_index(FormatField::HdcdDecode, 1, Some(16), Some(44_100)));
+        format.select_bit_depth(BitDepthChoice::Int16, Some(16));
+        assert!(format.hdcd_decode_enabled);
+        assert_eq!(*format.dither.selected_value(), DitherType::TPDF);
+        let preset = TuiPreset::from_pill_state(
+            "hdcd-tpdf", &format, &OutputOptionsState::new(), &MetadataState::default(),
+        );
+        assert_eq!(preset.hdcd_auto_dither, Some(true));
+        let mut restored = FormatState::new();
+        restored.hdcd_eligible_count = 1;
+        restored.hdcd_actionable_count = 1;
+        let report = preset.apply_to_pills(
+            &mut restored, &mut OutputOptionsState::new(), &mut MetadataState::default(),
+        );
+        assert!(report.is_complete(), "unexpected refusal: {:?}", report.refused_fields);
+        assert!(!restored.dither_overridden, "automatic dither is not manual policy");
+        assert_eq!(*restored.dither.selected_value(), DitherType::TPDF);
+        restored.reset_deemphasis_for_source_replacement();
+        restored.apply_auto_dither(Some(16));
+        assert_eq!(*restored.dither.selected_value(), DitherType::None);
+
+        format.mark_dither_overridden();
+        assert!(format.dither.select_value(&DitherType::None));
+        let explicit = TuiPreset::from_pill_state(
+            "hdcd-dither-off", &format, &OutputOptionsState::new(), &MetadataState::default(),
+        );
+        assert!(explicit.hdcd_auto_dither.is_none());
+        assert_eq!(explicit.dither, "none");
     }
 
     #[test]

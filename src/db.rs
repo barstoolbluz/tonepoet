@@ -1743,6 +1743,29 @@ impl Database {
     /// v28: preserve machine-readable HDCD features and high-resolution file
     /// identity without disturbing legacy DR/loudness cache keys.
     fn migrate_v28(conn: &Connection) -> Result<(), String> {
+        // Some supported legacy databases carry user_version without the
+        // optional analysis cache (for example after old cache invalidation).
+        // Creating its current schema before the narrow ADD COLUMN steps is
+        // safe: the cache has no durable user data, and IF NOT EXISTS leaves
+        // every pre-existing row untouched. Keep the creation in this same
+        // migration transaction, so the v28 version is never committed before
+        // the table is usable.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS analysis_cache (
+                file_path TEXT PRIMARY KEY,
+                file_mtime INTEGER NOT NULL,
+                file_size INTEGER NOT NULL,
+                algo_version INTEGER NOT NULL,
+                dr_value INTEGER, peak_db REAL, rms_db REAL,
+                clipping_count INTEGER, dc_bias REAL,
+                actual_bit_depth INTEGER, declared_bit_depth INTEGER,
+                sample_rate INTEGER, channels INTEGER, duration_secs REAL,
+                lufs REAL, true_peak_dbtp REAL,
+                preemphasis INTEGER, preemphasis_corr REAL,
+                preemphasis_detail TEXT, hdcd_detected INTEGER,
+                hdcd_detail TEXT, analyzed_at TEXT NOT NULL
+            );"
+        ).map_err(|error| format!("v28 HDCD migration create cache: {error}"))?;
         for (name, sql) in [
             ("hdcd_capabilities", "ALTER TABLE analysis_cache ADD COLUMN hdcd_capabilities TEXT"),
             ("hdcd_mtime_ns", "ALTER TABLE analysis_cache ADD COLUMN hdcd_mtime_ns INTEGER"),
@@ -10825,4 +10848,47 @@ mod hdcd_cache_precision_tests {
         assert_eq!(cleared, (None, None));
     }
 
+}
+
+#[cfg(test)]
+mod r19_hdcd_v28_migration_tests {
+    use super::*;
+
+    #[test]
+    fn v28_creates_missing_analysis_cache_and_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        // A supported partial legacy schema can legitimately lack this cache.
+        Database::migrate_v28(&conn).expect("first migration");
+        Database::migrate_v28(&conn).expect("replayed migration");
+        conn.execute(
+            "INSERT INTO analysis_cache (file_path, file_mtime, file_size, algo_version, analyzed_at, hdcd_capabilities, hdcd_mtime_ns)
+             VALUES ('album.flac', 1, 2, 3, 'now', 'test', 100)",
+            [],
+        ).expect("new schema must be usable");
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM analysis_cache WHERE hdcd_capabilities='test' AND hdcd_mtime_ns=100",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn v28_retains_existing_analysis_rows_and_can_be_replayed() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE analysis_cache (
+                file_path TEXT PRIMARY KEY, file_mtime INTEGER NOT NULL,
+                file_size INTEGER NOT NULL, algo_version INTEGER NOT NULL,
+                analyzed_at TEXT NOT NULL
+            );
+            INSERT INTO analysis_cache VALUES ('existing.flac', 20, 30, 40, 'prior');",
+        ).unwrap();
+        Database::migrate_v28(&conn).expect("upgrade existing cache");
+        Database::migrate_v28(&conn).expect("idempotent replay");
+        let record: (String, i64, Option<String>) = conn.query_row(
+            "SELECT analyzed_at, algo_version, hdcd_capabilities FROM analysis_cache WHERE file_path='existing.flac'",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(record, ("prior".to_owned(), 40, None));
+    }
 }

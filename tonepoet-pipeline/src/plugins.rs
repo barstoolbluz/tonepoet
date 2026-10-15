@@ -1071,17 +1071,25 @@ fn build_ffmpeg_encode_lossy(
     let output = required_output_path(step)?;
     let mut args = ffmpeg_base_input_args(context, step, &input)?;
     add_ffmpeg_metadata_args(context, &mut args, target_format);
-    if apply_processing {
-        let filter = ffmpeg_lossy_processing_filter(context, encoder_rate_hz);
-        if !filter.is_empty() {
-            args.push("-af".into());
-            args.push(filter);
-        }
+    let filter = ffmpeg_lossy_processing_filter(
+        context, target_format, encoder_rate_hz, apply_processing,
+    )?;
+    if !filter.is_empty() {
+        args.push("-af".into());
+        args.push(filter);
     }
     args.push("-ar".into());
     args.push(encoder_rate_hz.to_string());
     match target_format {
         AudioFormat::Mp3 => {
+            // The HDCD carrier is signed Int32 (20 meaningful bits); other
+            // DSP carriers may be floating. Feed libmp3lame planar Float32,
+            // not an implicit Int16 conversion, for all wider-than-CD inputs.
+            if context.request.source.authoritative_pcm_depth()
+                != Some(PcmBitDepth::Int16)
+            {
+                args.extend(["-sample_fmt".into(), "fltp".into()]);
+            }
             args.push("-c:a".into());
             args.push("libmp3lame".into());
             match context.request.settings.mp3.mode {
@@ -1102,6 +1110,10 @@ fn build_ffmpeg_encode_lossy(
             }
         }
         AudioFormat::Aac => {
+            // The selected libfdk_aac backend accepts signed Int16, unlike
+            // libopus/libmp3lame. Any necessary precision reduction is already
+            // dithered once in the final aresample filter above.
+            args.extend(["-sample_fmt".into(), "s16".into()]);
             args.push("-c:a".into());
             args.push("libfdk_aac".into());
             args.push("-profile:a".into());
@@ -1110,6 +1122,13 @@ fn build_ffmpeg_encode_lossy(
             args.push(format!("{}k", context.request.settings.aac.bitrate_kbps));
         }
         AudioFormat::Opus => {
+            // libopus accepts Float32 directly. Decode's S32/20-bit carrier
+            // must not silently negotiate a 16-bit PCM encoder input.
+            if context.request.source.authoritative_pcm_depth()
+                != Some(PcmBitDepth::Int16)
+            {
+                args.extend(["-sample_fmt".into(), "flt".into()]);
+            }
             args.push("-c:a".into());
             args.push("libopus".into());
             args.push("-application".into());
@@ -1850,21 +1869,60 @@ fn ffmpeg_soxr_resample_options(
     opts
 }
 
-fn ffmpeg_lossy_processing_filter(context: &PlanContext<'_>, encoder_rate_hz: u32) -> String {
+/// Build the one terminal filter chain. libfdk_aac is a 16-bit-only
+/// encoder: high-precision PCM must be reduced with exactly one user-selected
+/// (or default TPDF) dither immediately before that encoder. Float-capable
+/// lossy codecs have no integer quantization or dither stage at all.
+fn ffmpeg_lossy_processing_filter(
+    context: &PlanContext<'_>,
+    target_format: &AudioFormat,
+    encoder_rate_hz: u32,
+    apply_processing: bool,
+) -> Result<String> {
     let mut filters = Vec::new();
-    if let Some(gain) = context.request.settings.dsd.runtime_album_gain_db() {
-        filters.push(format!("volume={}dB:precision=double", gain.render(false)));
+    if apply_processing {
+        if let Some(gain) = context.request.settings.dsd.runtime_album_gain_db() {
+            filters.push(format!("volume={}dB:precision=double", gain.render(false)));
+        }
+        if let Some(gain) = context.request.settings.pcm_true_peak.fixed_gain_db() {
+            filters.push(format!("volume={}dB:precision=double", gain.render(false)));
+        }
     }
-    if let Some(gain) = context.request.settings.pcm_true_peak.fixed_gain_db() {
-        filters.push(format!("volume={}dB:precision=double", gain.render(false)));
+    let rate_change = apply_processing
+        && context.request.source.sample_rate_hz != Some(encoder_rate_hz);
+    let sample_changes = rate_change || !filters.is_empty();
+    // Certified DSD routes have their own measured/qualified terminal
+    // contract. This focused HDCD/PCM correction must not silently add
+    // post-observation noise to those already admitted paths. The same
+    // restriction applies to PCM certified true-peak lossy gain, whose
+    // validator explicitly disallows an unproved dither terminal.
+    let aac_int16_boundary = *target_format == AudioFormat::Aac
+        && !context.request.source.is_dsd()
+        && !context.request.settings.pcm_true_peak.is_true_peak()
+        && (context.request.source.authoritative_pcm_depth() != Some(PcmBitDepth::Int16)
+            || sample_changes);
+    if rate_change || aac_int16_boundary {
+        let mut opts = ffmpeg_soxr_resample_options(
+            context, rate_change.then_some(encoder_rate_hz),
+        );
+        if aac_int16_boundary {
+            let selected = if context.request.settings.dither_explicit {
+                context.request.settings.dither_type
+            } else {
+                DitherType::Tpdf
+            };
+            let method = mapping::soxr_dither_method(selected).ok_or_else(|| {
+                PlanningError::invalid_settings(
+                    "dither_type",
+                    "libfdk_aac's final Int16 quantization cannot realize the selected dither; choose a supported FFmpeg/SoXR method",
+                )
+            })?;
+            opts.push(format!("dither_method={method}"));
+            opts.push("out_sample_fmt=s16".into());
+        }
+        filters.push(format!("aresample={}", opts.join(":")));
     }
-    if context.request.source.sample_rate_hz != Some(encoder_rate_hz) {
-        filters.push(format!(
-            "aresample={}",
-            ffmpeg_soxr_resample_options(context, Some(encoder_rate_hz)).join(":")
-        ));
-    }
-    filters.join(",")
+    Ok(filters.join(","))
 }
 
 fn ffmpeg_audio_filter(
@@ -2955,6 +3013,110 @@ mod tests {
     }
 
     #[test]
+    fn high_precision_lossy_encoders_never_insert_a_16bit_terminal() {
+        for (codec, rate, expected_sample_fmt, expected_encoder) in [
+            (AudioFormat::Opus, 48_000, "flt", "libopus"),
+            (AudioFormat::Mp3, 44_100, "fltp", "libmp3lame"),
+        ] {
+            for input_depth in [PcmBitDepth::Int32, PcmBitDepth::Float64] {
+                let mut request = pcm_request_with(PipelineSettings::default(), input_depth);
+                request.source.sample_rate_hz = Some(rate);
+                request.settings.target_format = codec.clone();
+                let step = PlanStep::new(
+                    0,
+                    PlanOperation::EncodeLossy {
+                        target_format: codec.clone(), target_rate_hz: Some(rate),
+                        apply_processing: false,
+                    },
+                    InputSource::Path(PathBuf::from("decoded.wav")),
+                    OutputSink::Path(PathBuf::from("out.lossy")),
+                    "HDCD-decoded high precision lossy encode",
+                );
+                let cmd = build_ffmpeg_encode_lossy(
+                    &request.context(), &step, &codec, Some(rate), false,
+                ).expect("high precision encode must plan");
+                assert_arg(&cmd.args, "-c:a", expected_encoder);
+                assert_arg(&cmd.args, "-sample_fmt", expected_sample_fmt);
+                assert_no_arg(&cmd.args, "-af");
+                assert!(!cmd.args.iter().any(|arg| arg == "s16"), "{:?}", cmd.args);
+            }
+        }
+    }
+
+    #[test]
+    fn libfdk_aac_quantizes_a_wide_carrier_once_at_its_terminal_boundary() {
+        for (explicit, selected, expected) in [
+            (false, DitherType::None, "triangular"),
+            (true, DitherType::None, "none"),
+            (true, DitherType::Tpdf, "triangular"),
+        ] {
+            let mut settings = PipelineSettings::default();
+            settings.target_format = AudioFormat::Aac;
+            settings.dither_explicit = explicit;
+            settings.dither_type = selected;
+            let mut request = pcm_request_with(settings, PcmBitDepth::Int32);
+            request.source.sample_rate_hz = Some(44_100);
+            let step = PlanStep::new(
+                0, PlanOperation::EncodeLossy {
+                    target_format: AudioFormat::Aac, target_rate_hz: Some(44_100),
+                    apply_processing: false,
+                },
+                InputSource::Path(PathBuf::from("hdcd.s32.wav")),
+                OutputSink::Path(PathBuf::from("out.m4a")),
+                "HDCD AAC terminal dither",
+            );
+            let cmd = build_ffmpeg_encode_lossy(
+                &request.context(), &step, &AudioFormat::Aac, Some(44_100), false,
+            ).expect("AAC s16 encoder must plan final quantization");
+            assert_arg(&cmd.args, "-sample_fmt", "s16");
+            assert_arg(&cmd.args, "-c:a", "libfdk_aac");
+            let filter = arg_value(&cmd.args, "-af").expect("terminal conversion filter");
+            assert!(filter.contains(&format!("dither_method={expected}")), "{filter}");
+            assert!(filter.contains("out_sample_fmt=s16"), "{filter}");
+            assert!(!filter.contains("out_sample_rate="), "{filter}");
+            assert_eq!(filter.matches("aresample=").count(), 1, "{filter}");
+        }
+        let mut request = pcm_request_with(PipelineSettings::default(), PcmBitDepth::Int16);
+        request.source.sample_rate_hz = Some(44_100);
+        request.settings.target_format = AudioFormat::Aac;
+        let step = PlanStep::new(
+            0, PlanOperation::EncodeLossy {
+                target_format: AudioFormat::Aac, target_rate_hz: Some(44_100),
+                apply_processing: false,
+            }, InputSource::Path(PathBuf::from("ordinary-cd.wav")),
+            OutputSink::Path(PathBuf::from("out.m4a")), "ordinary Int16 AAC fast path",
+        );
+        let cmd = build_ffmpeg_encode_lossy(
+            &request.context(), &step, &AudioFormat::Aac, Some(44_100), false,
+        ).unwrap();
+        assert_no_arg(&cmd.args, "-af");
+    }
+
+    #[test]
+    fn certified_true_peak_lossy_aac_does_not_gain_an_unqualified_dither_boundary() {
+        let mut settings = PipelineSettings::default();
+        settings.target_format = AudioFormat::Aac;
+        settings.pcm_true_peak.set_policy(SampleGainPolicy::TruePeakGuard {
+            target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            scope: crate::enums::TruePeakScope::Track,
+            scan: crate::enums::TruePeakScanTier::Standard,
+        });
+        let request = pcm_request_with(settings, PcmBitDepth::Int32);
+        let step = PlanStep::new(
+            0, PlanOperation::EncodeLossy {
+                target_format: AudioFormat::Aac, target_rate_hz: Some(96_000),
+                apply_processing: false,
+            }, InputSource::Path(PathBuf::from("verified-truepeak.wav")),
+            OutputSink::Path(PathBuf::from("out.m4a")),
+            "certified AAC terminal must retain its original error contract",
+        );
+        let cmd = build_ffmpeg_encode_lossy(
+            &request.context(), &step, &AudioFormat::Aac, Some(96_000), false,
+        ).unwrap();
+        assert_no_arg(&cmd.args, "-af");
+    }
+
+    #[test]
     fn ffmpeg_ordinary_lossy_rate_change_uses_explicit_soxr_before_the_rate_pin() {
         let mut request = pcm_request_with(PipelineSettings::default(), PcmBitDepth::Int24);
         request.settings.target_format = AudioFormat::Opus;
@@ -3017,13 +3179,13 @@ mod tests {
             command
                 .args
                 .iter()
-                .any(|arg| arg == "volume=2.125000000dB:precision=double"),
+                .any(|arg| arg.starts_with("volume=2.125000000dB:precision=double")),
             "album gain must precede a rate-pinned encoder input: {:?}",
             command.args,
         );
         assert!(
             !command.args.iter().any(|arg| arg.contains("aresample=")),
-            "hard-ceiling carrier must not be resampled after the proved gain: {:?}",
+            "certified DSD carrier must retain its previously qualified gain/rate path: {:?}",
             command.args,
         );
 

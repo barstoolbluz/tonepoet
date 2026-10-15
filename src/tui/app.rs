@@ -6042,6 +6042,15 @@ impl FormatState {
         self.hdcd_decode_enabled = enabled;
         self.hdcd_decode_overridden = true;
         self.hdcd_override_from_preset = false;
+        // A preset-owned Int16 is not an obstacle when the user *turns on*
+        // decoding. Conversely, a deliberate Int16 selection *afterward*
+        // must survive later recomputations; only this On interaction (not
+        // arbitrary constraint passes) can override a user-owned depth.
+        if enabled && self.hdcd_is_actionable()
+            && self.hdcd_output_is_lossless_int16()
+        {
+            self.promote_hdcd_output_depth();
+        }
         self.recompute_auto_hdcd();
     }
 
@@ -6066,9 +6075,25 @@ impl FormatState {
         self.source_derived_bit_depth = None;
     }
 
+    /// Selecting 16-bit *after* Decode became On is a user request to retain
+    /// decoding at lower output precision, not a request to recompute Decode
+    /// Off. Use the existing manual-override authority without calling the
+    /// Decode-On handler, which would widen the depth back to 24 bits.
+    fn preserve_hdcd_on_explicit_int16_selection(&mut self) {
+        if *self.bit_depth.selected_value() == BitDepthChoice::Int16
+            && self.hdcd_decode_enabled
+            && self.hdcd_is_actionable()
+            && self.hdcd_output_is_lossless_int16()
+        {
+            self.hdcd_decode_overridden = true;
+            self.hdcd_override_from_preset = false;
+        }
+    }
+
     pub fn select_bit_depth(&mut self, bit_depth: BitDepthChoice, source_bits: Option<u32>) {
         self.mark_bit_depth_user_policy();
         self.bit_depth.select_value(&bit_depth);
+        self.preserve_hdcd_on_explicit_int16_selection();
         // Constraints may change the final De-emphasis state and therefore the
         // R24 automatic-dither policy. Settle them first, then apply the
         // caller's authoritative source depth so the constraint cascade cannot
@@ -6141,7 +6166,17 @@ impl FormatState {
             let float_to_integer = self.source_pcm_float_bits.is_some()
                 && self.auto_gain_target_is_integer_pcm();
             let lossless_to_lossy = self.source_is_lossless == Some(true) && lossy_target;
-            if !self.source_is_dsd && (float_to_integer || lossless_to_lossy) {
+            // An effectual HDCD decode cannot be combined with certified
+            // true-peak gain. Prefer the source-derived HDCD recovery over an
+            // incompatible *automatic* guard; explicit gain remains authoritative
+            // and the commit-time refusal still protects that combination.
+            let hdcd_lossy_decode = lossy_target
+                && self.hdcd_decode_enabled
+                && self.hdcd_is_actionable();
+            if !self.source_is_dsd
+                && (float_to_integer || lossless_to_lossy)
+                && !hdcd_lossy_decode
+            {
                 self.pcm_gain_mode.select_value(&PcmGainMode::TruePeakGuard);
                 self.pcm_true_peak_scan_mode
                     .select_value(&TruePeakScanTier::Fast);
@@ -6568,6 +6603,7 @@ impl FormatState {
         }
         if row == FormatField::BitDepth {
             self.mark_bit_depth_user_policy();
+            self.preserve_hdcd_on_explicit_int16_selection();
         }
         if row == FormatField::Dither {
             self.mark_dither_overridden();
@@ -6772,6 +6808,15 @@ impl FormatState {
         })
     }
 
+    /// HDCD-derived TPDF is a display default, not a batch-wide dither
+    /// instruction. The concrete effect owns TPDF at its final Int16 terminal.
+    pub(crate) fn hdcd_auto_tpdf_applicable(&self) -> bool {
+        self.hdcd_decode_enabled
+            && self.hdcd_is_actionable()
+            && self.hdcd_output_is_lossless_int16()
+            && self.hdcd_promoted_from_depth.is_none()
+    }
+
     /// Applies the default dither rule while preserving manual user choice.
     /// `source_bits` should come from the selected source probe when available.
     pub fn apply_auto_dither(&mut self, source_bits: Option<u32>) {
@@ -6779,7 +6824,9 @@ impl FormatState {
             return;
         }
 
-        let desired = if self.deemphasis_auto_tpdf_applicable() {
+        let desired = if self.deemphasis_auto_tpdf_applicable()
+            || self.hdcd_auto_tpdf_applicable()
+        {
             DitherType::TPDF
         } else {
             self.ordinary_auto_dither(source_bits)
@@ -6922,64 +6969,88 @@ impl FormatState {
         self.recompute_auto_hdcd();
     }
 
-    /// Automatic preservation applies ONLY to a lossless 16-bit integer
-    /// target at 44.1 kHz; all other targets restore detected PE/LLE.
-    fn hdcd_target_preserves_cd_domain(&self) -> bool {
+    /// Resolve the output representation before applying any HDCD-derived
+    /// Int24 promotion. Source means the probed source precision, not a
+    /// second, mutable policy value; the original choice is retained while a
+    /// displayed Int24 auto-promotion is active.
+    pub(crate) fn hdcd_output_is_lossless_int16(&self) -> bool {
         let format = *self.format.selected_value();
-        let lossless = matches!(format,
+        if !matches!(format,
             AudioFormat::Flac | AudioFormat::Wav | AudioFormat::Aiff
-                | AudioFormat::WavPack | AudioFormat::Alac | AudioFormat::Lpcm)
-            && !(format == AudioFormat::WavPack && self.wavpack_hybrid);
-        if !lossless { return false; }
-        let source_rate = self.source_pcm_rate_hz;
-        let rate = match *self.sample_rate.selected_value() {
-            SOURCE_SAMPLE_RATE_SENTINEL if self.hdcd_eligible_count > 0 => Some(44_100),
-            SOURCE_SAMPLE_RATE_SENTINEL => source_rate,
-            target => Some(target),
-        };
-        let effective_depth = if !self.bit_depth_overridden {
-            self.hdcd_promoted_from_depth
-                .unwrap_or(*self.bit_depth.selected_value())
-        } else {
-            *self.bit_depth.selected_value()
-        };
-        let depth_16 = match effective_depth {
-            BitDepthChoice::Source => self.hdcd_eligible_count > 0 ||
-                (self.source_pcm_bit_depth == Some(16)
-                    && self.source_pcm_float_bits.is_none()),
+            | AudioFormat::WavPack | AudioFormat::Alac | AudioFormat::Lpcm)
+            || (format == AudioFormat::WavPack && self.wavpack_hybrid)
+        {
+            return false;
+        }
+        let depth = self.hdcd_promoted_from_depth
+            .unwrap_or(*self.bit_depth.selected_value());
+        match depth {
             BitDepthChoice::Int16 => true,
+            BitDepthChoice::Source => self.hdcd_eligible_count > 0
+                || (self.source_pcm_bit_depth == Some(16)
+                    && self.source_pcm_float_bits.is_none()),
             _ => false,
-        };
-        rate == Some(44_100) && depth_16
+        }
     }
 
-    /// HDCD's automatic bit-depth widening never overwrites a user-owned
-    /// bit-depth setting and returns its previous source-derived choice when
-    /// the decoder is no longer selected.
+    /// Preservation is a narrower warning distinction than the decode default:
+    /// bit-exact 16/44.1 without later DSP can retain HDCD control codes,
+    /// whereas converting 16-bit to another sample rate generally cannot.
+    fn hdcd_target_preserves_cd_domain(&self) -> bool {
+        if !self.hdcd_output_is_lossless_int16() { return false; }
+        match *self.sample_rate.selected_value() {
+            SOURCE_SAMPLE_RATE_SENTINEL if self.hdcd_eligible_count > 0 => true,
+            SOURCE_SAMPLE_RATE_SENTINEL => self.source_pcm_rate_hz == Some(44_100),
+            rate => rate == 44_100,
+        }
+    }
+
+    /// One visible automatic promotion, preserving the previous selection's
+    /// provenance. A later explicit bit-depth selection clears this marker.
+    fn promote_hdcd_output_depth(&mut self) {
+        if self.hdcd_promoted_from_depth.is_none() {
+            let previous = *self.bit_depth.selected_value();
+            self.hdcd_promoted_from_depth = Some(previous);
+            self.bit_depth.select_value(&BitDepthChoice::Int24);
+            if !self.bit_depth_overridden {
+                self.source_derived_bit_depth = Some(BitDepthChoice::Int24);
+            }
+        }
+    }
+
+    /// Recompute the source-derived Decode default against the *unpromoted*
+    /// resolved output, then update any visible precision promotion exactly
+    /// once. Manual Decode On over a selected lossless Int16 target deliberately
+    /// widens its pill even if the original depth came from a preset: the
+    /// user can explicitly select Int16 afterward without disabling Decode.
     pub fn recompute_auto_hdcd(&mut self) {
         if !self.hdcd_decode_overridden {
-            self.hdcd_decode_enabled = self.hdcd_actionable_count > 0
-                && self.hdcd_unresolved_count == 0
-                && !self.hdcd_target_preserves_cd_domain();
+            self.hdcd_decode_enabled = self.hdcd_is_actionable()
+                && !self.hdcd_output_is_lossless_int16();
         }
         let needs_widening = self.hdcd_decode_enabled && self.hdcd_is_actionable()
-            && !self.is_lossy_codec_selected()
-            && !self.bit_depth_overridden
-            && matches!(*self.bit_depth.selected_value(),
-                BitDepthChoice::Source | BitDepthChoice::Int16);
+            && self.hdcd_output_is_lossless_int16()
+            && !self.bit_depth_overridden;
         if needs_widening {
-            if self.hdcd_promoted_from_depth.is_none() {
-                self.hdcd_promoted_from_depth = Some(*self.bit_depth.selected_value());
+            self.promote_hdcd_output_depth();
+        } else if !self.hdcd_decode_enabled {
+            if let Some(previous) = self.hdcd_promoted_from_depth.take() {
+                if *self.bit_depth.selected_value() == BitDepthChoice::Int24 {
+                    self.bit_depth.select_value(&previous);
+                    if !self.bit_depth_overridden {
+                        self.source_derived_bit_depth = (!previous.is_source()).then_some(previous);
+                    }
+                }
             }
-            self.bit_depth.select_value(&BitDepthChoice::Int24);
-            self.source_derived_bit_depth = Some(BitDepthChoice::Int24);
-        } else if let Some(previous) = self.hdcd_promoted_from_depth.take() {
-            if !self.bit_depth_overridden
-                && *self.bit_depth.selected_value() == BitDepthChoice::Int24
-            {
-                self.bit_depth.select_value(&previous);
-                self.source_derived_bit_depth = (!previous.is_source()).then_some(previous);
-            }
+        }
+        // The existing dither provenance authority also owns HDCD's Int16
+        // default. This is idempotent and never overwrites a user/preset pick.
+        self.apply_auto_dither(self.auto_dither_source_bits(None));
+        // HDCD scan completion and manual Decode changes can happen *after*
+        // lossy-format selection. Reconcile the conflicting automatic gain
+        // there without changing any DSD or lossless-target gain transitions.
+        if !self.source_is_dsd && self.auto_gain_target_is_lossy() {
+            self.apply_auto_gain_defaults();
         }
     }
 
@@ -6988,7 +7059,6 @@ impl FormatState {
     /// changes the expected CD playback representation, not the source bits.
     pub(crate) fn hdcd_manual_off_warning(&self) -> Option<&'static str> {
         if !self.hdcd_is_actionable()
-            || !self.hdcd_decode_overridden
             || self.hdcd_decode_enabled
             || self.hdcd_target_preserves_cd_domain()
         {
@@ -7100,11 +7170,11 @@ impl FormatState {
         // ordinary source-reset path examines the bit-depth pill. Otherwise
         // a new source can inherit the previous source's Int24 promotion.
         if let Some(previous) = self.hdcd_promoted_from_depth.take() {
-            if !self.bit_depth_overridden
-                && *self.bit_depth.selected_value() == BitDepthChoice::Int24
-            {
+            if *self.bit_depth.selected_value() == BitDepthChoice::Int24 {
                 self.bit_depth.select_value(&previous);
-                self.source_derived_bit_depth = (!previous.is_source()).then_some(previous);
+                if !self.bit_depth_overridden {
+                    self.source_derived_bit_depth = (!previous.is_source()).then_some(previous);
+                }
             }
         }
         self.source_pcm_rate_hz = None;
@@ -24978,6 +25048,8 @@ mod hdcd_format_policy_tests {
         assert!(!format.hdcd_decode_enabled);
         assert!(format.sample_rate.select_value(&88_200));
         format.recompute_auto_hdcd();
+        assert!(!format.hdcd_decode_enabled, "Int16 at any rate defaults Off");
+        assert!(format.select_row_index(FormatField::HdcdDecode, 1, None, Some(44_100)));
         assert!(format.hdcd_decode_enabled);
         assert_eq!(*format.bit_depth.selected_value(), BitDepthChoice::Int24);
         assert_eq!(format.hdcd_promoted_from_depth, Some(BitDepthChoice::Source));
@@ -25001,13 +25073,153 @@ mod hdcd_format_policy_tests {
     #[test]
     fn source_replacement_reverts_active_hdcd_auto_precision_promotion() {
         let mut format = state_for(capabilities(true, true, false, false));
-        assert!(format.sample_rate.select_value(&88_200));
-        format.recompute_auto_hdcd();
+        assert!(format.select_row_index(FormatField::HdcdDecode, 1, None, Some(44_100)));
         assert_eq!(*format.bit_depth.selected_value(), BitDepthChoice::Int24);
         format.reset_deemphasis_for_source_replacement();
         format.clear_source_derived_defaults();
         assert_eq!(*format.bit_depth.selected_value(), BitDepthChoice::Source);
         assert!(format.hdcd_promoted_from_depth.is_none());
+    }
+
+    #[test]
+    fn hdcd_defaults_follow_resolved_precision_and_lossy_codec() {
+        let mut state = state_for(capabilities(true, true, false, false));
+        assert!(!state.hdcd_decode_enabled);
+        assert!(state.sample_rate.select_value(&48_000));
+        state.recompute_auto_hdcd();
+        assert!(!state.hdcd_decode_enabled, "resampled Int16 remains Off by default");
+        assert!(state.hdcd_manual_off_warning().is_some_and(|s| s.contains("destroy")));
+
+        for depth in [BitDepthChoice::Int24, BitDepthChoice::Int32] {
+            assert!(state.bit_depth.select_value(&depth));
+            state.recompute_auto_hdcd();
+            assert!(state.hdcd_decode_enabled, "lossless high-precision {depth:?}");
+            assert_eq!(*state.bit_depth.selected_value(), depth);
+            assert!(state.hdcd_promoted_from_depth.is_none());
+        }
+        assert!(state.format.select_value(&AudioFormat::Wav));
+        for depth in [BitDepthChoice::Float32, BitDepthChoice::Float64] {
+            assert!(state.bit_depth.select_value(&depth));
+            state.apply_format_constraints();
+            assert!(state.hdcd_decode_enabled, "float lossless {depth:?}");
+            assert_eq!(*state.bit_depth.selected_value(), depth);
+        }
+        assert!(state.bit_depth.select_value(&BitDepthChoice::Int16));
+        for format in [AudioFormat::Mp3, AudioFormat::Aac, AudioFormat::Opus] {
+            assert!(state.format.select_value(&format));
+            state.apply_format_constraints();
+            assert!(state.hdcd_decode_enabled, "lossy {format:?}");
+            assert!(state.hdcd_promoted_from_depth.is_none(), "no lossy PCM promotion");
+        }
+        assert!(state.format.select_value(&AudioFormat::Flac));
+        state.apply_format_constraints();
+        assert!(!state.hdcd_decode_enabled, "automatic policy recomputes lossy -> Int16");
+    }
+
+    #[test]
+    fn r4c_explicit_int16_after_automatic_hdcd_on_keeps_decode_on_in_both_entry_points() {
+        for direct in [true, false] {
+            let mut state = state_for(capabilities(true, true, false, false));
+            assert!(state.bit_depth.select_value(&BitDepthChoice::Int24));
+            state.apply_format_constraints();
+            assert!(state.hdcd_decode_enabled, "Int24 must automatically enable HDCD");
+            assert!(!state.hdcd_decode_overridden);
+
+            if direct {
+                state.select_bit_depth(BitDepthChoice::Int16, Some(16));
+            } else {
+                let index = state.bit_depth.options.iter()
+                    .position(|option| option.value == BitDepthChoice::Int16)
+                    .expect("Int16 option");
+                assert!(state.select_row_index(
+                    FormatField::BitDepth, index, Some(16), Some(44_100)
+                ));
+            }
+            assert_eq!(*state.bit_depth.selected_value(), BitDepthChoice::Int16);
+            assert!(state.hdcd_decode_enabled, "{direct}: explicit Int16 does not toggle Decode Off");
+            assert!(state.hdcd_decode_overridden, "Decode On is now an explicit user policy");
+            assert!(state.bit_depth_overridden);
+            assert!(state.hdcd_promoted_from_depth.is_none());
+            assert_eq!(*state.dither.selected_value(), DitherType::TPDF);
+            assert!(!state.dither_overridden, "TPDF is automatic, not user-explicit");
+
+            let off_index = state.dither.options.iter()
+                .position(|option| option.value == DitherType::None).unwrap();
+            assert!(state.select_row_index(
+                FormatField::Dither, off_index, Some(16), Some(44_100)
+            ));
+            assert!(state.dither_overridden);
+            assert_eq!(*state.dither.selected_value(), DitherType::None);
+            let previous_format = *state.format.selected_value();
+            let previous_depth = *state.bit_depth.selected_value();
+            assert!(state.format.select_value(&AudioFormat::Wav));
+            state.after_user_selection(FormatField::Format, previous_format,
+                previous_depth, Some(16), Some(44_100));
+            assert!(state.hdcd_decode_enabled);
+            assert_eq!(*state.bit_depth.selected_value(), BitDepthChoice::Int16);
+            assert_eq!(*state.dither.selected_value(), DitherType::None);
+
+            state.reset_deemphasis_for_source_replacement();
+            assert!(!state.hdcd_decode_overridden);
+            assert!(!state.hdcd_decode_enabled);
+        }
+    }
+
+    #[test]
+    fn manual_hdcd_int16_tpdf_override_and_preset_depth_are_stable() {
+        let mut state = state_for(capabilities(true, true, false, false));
+        state.select_bit_depth(BitDepthChoice::Int16, Some(16));
+        assert!(state.bit_depth_overridden, "preset/user Int16 is explicit");
+        assert!(!state.hdcd_decode_enabled);
+        assert!(state.select_row_index(FormatField::HdcdDecode, 1, Some(16), Some(44_100)));
+        assert!(state.hdcd_decode_enabled);
+        assert_eq!(*state.bit_depth.selected_value(), BitDepthChoice::Int24);
+        assert_eq!(state.hdcd_promoted_from_depth, Some(BitDepthChoice::Int16));
+        // The next Int16 choice is a new user policy and must not be re-promoted.
+        state.select_bit_depth(BitDepthChoice::Int16, Some(16));
+        assert_eq!(*state.bit_depth.selected_value(), BitDepthChoice::Int16);
+        assert!(state.hdcd_decode_enabled);
+        assert!(state.hdcd_promoted_from_depth.is_none());
+        assert_eq!(*state.dither.selected_value(), DitherType::TPDF);
+        let dither_off_index = state.dither.options.iter()
+            .position(|option| option.value == DitherType::None).unwrap();
+        assert!(state.select_row_index(FormatField::Dither,
+            dither_off_index, Some(16), Some(44_100)));
+        assert!(state.dither_overridden);
+        assert_eq!(*state.dither.selected_value(), DitherType::None);
+        state.apply_format_constraints();
+        state.recompute_auto_hdcd();
+        assert!(state.hdcd_decode_enabled);
+        assert_eq!(*state.bit_depth.selected_value(), BitDepthChoice::Int16);
+        assert_eq!(*state.dither.selected_value(), DitherType::None);
+        assert!(state.select_row_index(FormatField::HdcdDecode, 0, Some(16), Some(44_100)));
+        assert_eq!(*state.bit_depth.selected_value(), BitDepthChoice::Int16,
+            "turning off HDCD cannot revert a later manual depth");
+    }
+
+    #[test]
+    fn hdcd_manual_off_survives_lossy_changes_until_source_replacement() {
+        let mut state = state_for(capabilities(true, true, false, false));
+        assert!(state.format.select_value(&AudioFormat::Opus));
+        state.apply_format_constraints();
+        assert!(state.hdcd_decode_enabled);
+        assert!(state.select_row_index(FormatField::HdcdDecode, 0, None, Some(44_100)));
+        for format in [AudioFormat::Mp3, AudioFormat::Aac, AudioFormat::Opus] {
+            assert!(state.format.select_value(&format));
+            state.apply_format_constraints();
+            assert!(!state.hdcd_decode_enabled, "manual Off survives {format:?}");
+        }
+        state.reset_deemphasis_for_source_replacement();
+        state.set_convert_hdcd_summary(&BTreeMap::from([(
+            PathBuf::from("replacement.flac"),
+            ConvertHdcdPathState {
+                eligible: true,
+                capabilities: Some(capabilities(true, true, false, false)),
+                ..Default::default()
+            },
+        )]));
+        assert!(!state.hdcd_decode_overridden);
+        assert!(state.hdcd_decode_enabled, "new effectual source has new lossy default");
     }
 
     #[test]
@@ -25020,5 +25232,125 @@ mod hdcd_format_policy_tests {
         assert!(format.sample_rate.select_value(&88_200));
         format.recompute_auto_hdcd();
         assert!(format.hdcd_manual_off_warning().is_some_and(|text| text.contains("destroy")));
+    }
+
+    /// Match the known-lossless 16/44.1 probe facts supplied by a real FLAC,
+    /// not an unprobed synthetic Format state (which would miss auto gain).
+    fn r4d_probed_flac_state() -> FormatState {
+        let mut state = FormatState::new();
+        assert!(state.format.select_value(&AudioFormat::Flac));
+        assert!(state.sample_rate.select_value(&SOURCE_SAMPLE_RATE_SENTINEL));
+        assert!(state.bit_depth.select_value(&BitDepthChoice::Source));
+        state.source_pcm_rate_hz = Some(44_100);
+        state.source_pcm_bit_depth = Some(16);
+        state.source_pcm_float_bits = None;
+        state.source_is_lossless = Some(true);
+        state.source_rate_identity = SourceRateIdentity::Known;
+        state.apply_format_constraints();
+        state
+    }
+
+    fn r4d_scan(detected: bool, peak_extend: bool, transient_filter: bool)
+        -> BTreeMap<PathBuf, ConvertHdcdPathState>
+    {
+        BTreeMap::from([(
+            PathBuf::from("effectual-source.flac"),
+            ConvertHdcdPathState {
+                eligible: true,
+                capabilities: Some(capabilities(detected, peak_extend, false, transient_filter)),
+                ..Default::default()
+            },
+        )])
+    }
+
+    fn r4d_select_target(state: &mut FormatState, target: AudioFormat) {
+        let old_format = *state.format.selected_value();
+        let old_depth = *state.bit_depth.selected_value();
+        assert!(state.format.select_value(&target));
+        state.after_user_selection(
+            FormatField::Format, old_format, old_depth, Some(16), Some(44_100),
+        );
+    }
+
+    #[test]
+    fn r4d_effectual_hdcd_and_lossy_target_auto_defaults_are_compatible_in_both_orders() {
+        let result = r4d_scan(true, true, false);
+        for target in [AudioFormat::Mp3, AudioFormat::Aac, AudioFormat::Opus] {
+            for scan_first in [true, false] {
+                let mut state = r4d_probed_flac_state();
+                if scan_first {
+                    state.set_convert_hdcd_summary(&result);
+                    assert!(!state.hdcd_decode_enabled, "lossless Int16 retains HDCD Off");
+                }
+                r4d_select_target(&mut state, target);
+                if !scan_first {
+                    assert_eq!(*state.pcm_gain_mode.selected_value(), PcmGainMode::TruePeakGuard,
+                        "known lossless -> lossy initially retains its ordinary guard");
+                    state.set_convert_hdcd_summary(&result);
+                }
+                assert!(state.hdcd_is_actionable(), "confirmed source must be actionable");
+                assert!(state.hdcd_decode_enabled, "{target:?} scan-first={scan_first}");
+                assert!(!state.hdcd_decode_overridden, "Decode On is source-derived");
+                assert!(!state.pcm_gain_overridden, "gain choice is automatic");
+                assert_eq!(*state.pcm_gain_mode.selected_value(), PcmGainMode::Off,
+                    "no automatic certified gain can block HDCD -> {target:?}, scan-first={scan_first}");
+                state.recompute_auto_hdcd();
+                state.apply_auto_gain_defaults();
+                assert_eq!(*state.pcm_gain_mode.selected_value(), PcmGainMode::Off,
+                    "recomputation must be idempotent");
+            }
+        }
+    }
+
+    #[test]
+    fn r4d_manual_hdcd_toggle_reconciles_automatic_gain_but_explicit_gain_stays_authoritative() {
+        let mut state = r4d_probed_flac_state();
+        state.set_convert_hdcd_summary(&r4d_scan(true, true, false));
+        r4d_select_target(&mut state, AudioFormat::Aac);
+        assert_eq!(*state.pcm_gain_mode.selected_value(), PcmGainMode::Off);
+
+        // When the user disables HDCD, the original lossless-to-lossy safety
+        // default returns; re-enabling HDCD removes only that automatic guard.
+        assert!(state.select_row_index(FormatField::HdcdDecode, 0, Some(16), Some(44_100)));
+        assert!(!state.hdcd_decode_enabled);
+        assert_eq!(*state.pcm_gain_mode.selected_value(), PcmGainMode::TruePeakGuard);
+        assert!(state.select_row_index(FormatField::HdcdDecode, 1, Some(16), Some(44_100)));
+        assert_eq!(*state.pcm_gain_mode.selected_value(), PcmGainMode::Off);
+
+        // Explicit TruePeak Guard/Normalize must NOT be silently disabled:
+        // the existing commit-time HDCD/true-peak qualification refusal owns it.
+        for gain in [PcmGainMode::TruePeakGuard, PcmGainMode::TruePeakNormalize] {
+            let index = state.pcm_gain_mode.options.iter()
+                .position(|option| option.value == gain).expect("gain pill");
+            assert!(state.select_row_index(FormatField::PcmTruePeak, index, Some(16), Some(44_100)));
+            assert!(state.pcm_gain_overridden);
+            state.recompute_auto_hdcd();
+            assert!(state.hdcd_decode_enabled);
+            assert_eq!(*state.pcm_gain_mode.selected_value(), gain,
+                "explicit incompatible gain must still be refused at commit");
+        }
+        let off_index = state.pcm_gain_mode.options.iter()
+            .position(|option| option.value == PcmGainMode::Off).unwrap();
+        assert!(state.select_row_index(FormatField::PcmTruePeak, off_index, Some(16), Some(44_100)));
+        r4d_select_target(&mut state, AudioFormat::Mp3);
+        assert_eq!(*state.pcm_gain_mode.selected_value(), PcmGainMode::Off,
+            "explicit Off must remain authoritative across formats");
+    }
+
+    #[test]
+    fn r4d_passive_or_absent_hdcd_preserves_ordinary_lossless_to_lossy_gain_default() {
+        for (detected, pe, tf) in [
+            (false, false, false), // no HDCD
+            (true, false, false),  // passive
+            (true, false, true),   // unsupported Transient Filter only
+        ] {
+            let mut state = r4d_probed_flac_state();
+            r4d_select_target(&mut state, AudioFormat::Opus);
+            assert_eq!(*state.pcm_gain_mode.selected_value(), PcmGainMode::TruePeakGuard);
+            state.set_convert_hdcd_summary(&r4d_scan(detected, pe, tf));
+            assert!(!state.hdcd_is_actionable());
+            assert!(!state.hdcd_decode_enabled);
+            assert_eq!(*state.pcm_gain_mode.selected_value(), PcmGainMode::TruePeakGuard);
+        }
     }
 }

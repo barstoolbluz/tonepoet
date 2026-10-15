@@ -3190,13 +3190,30 @@ fn request_applies_cd_deemphasis(request: &PipelineRequest) -> bool {
     })
 }
 
+fn request_applies_hdcd_to_track(request: &PipelineRequest, track: &PreparedTrack) -> bool {
+    request.registered_effects.iter().any(|intent| {
+        match &intent.effect {
+            tonepoet_pipeline::RegisteredUnaryEffect::HdcdDecode { cue_segments, .. } => {
+                // The batch request can contain CUE authorization for *other*
+                // members. Mirror Phase-3's source-ordinal specialization so
+                // an unrelated Float64 effect carrier never inherits TPDF.
+                cue_segments.is_empty() || cue_segments.iter().any(|segment| {
+                    segment.source_ordinal == track.id.source_ordinal
+                })
+            }
+            _ => false,
+        }
+    })
+}
+
 fn apply_registered_effect_terminal_dither_authority(
     request: &PipelineRequest,
     track: &PreparedTrack,
     settings: &mut PipelineSettings,
 ) {
     if request.settings.dither_explicit
-        || !request_applies_cd_deemphasis(request)
+        || !(request_applies_cd_deemphasis(request)
+            || request_applies_hdcd_to_track(request, track))
         || !request.settings.target_format.is_pcm_lossless()
         || (request.settings.target_format == PlannerFormat::WavPack
             && request.settings.wavpack.hybrid)
@@ -3228,12 +3245,10 @@ fn apply_registered_effect_terminal_dither_authority(
         BitDepthTarget::Pcm(depth) => Some(depth),
     };
     if target_depth == Some(PcmBitDepth::Int16) {
-        // R24 derives this TPDF in the common semantic plan only for the
-        // concrete request that actually applies CD De-emphasis. Phase 3 then
-        // realizes the effect into a Float64 carrier and replans the terminal
-        // encode. Carry the same automatic authority across that private
-        // carrier boundary without turning it into a user-explicit setting or
-        // contaminating unrelated mixed-batch members.
+        // The typed planner derives automatic TPDF for the member actually
+        // receiving CD de-emphasis or HDCD. Phase 3 replans the terminal after
+        // realizing that effect into Float64: carry the non-explicit decision
+        // across the private carrier, without imposing it on other members.
         settings.dither_type = tonepoet_pipeline::DitherType::Tpdf;
     }
 }
@@ -3746,6 +3761,19 @@ mod tests {
             effect: RegisteredUnaryEffect::CdDeemphasis,
             after: Vec::new(),
             placement: EffectPlacement::SourceRate,
+        }
+    }
+
+    fn hdcd_decode_effect(cue_segments: Vec<tonepoet_pipeline::HdcdCueSegment>) -> EffectIntent {
+        EffectIntent {
+            id: EffectInstanceId(9002),
+            effect: RegisteredUnaryEffect::HdcdDecode {
+                source_size_bytes: 4096,
+                source_modified_ns: 123,
+                cue_segments,
+            },
+            after: Vec::new(),
+            placement: EffectPlacement::SourceBitstreamDecode,
         }
     }
 
@@ -4607,6 +4635,136 @@ mod tests {
                 "{label}: the terminal owns dither explicitly rather than suppressing it",
             );
         }
+    }
+
+    #[test]
+    fn r4c_hdcd_float64_carrier_reasserts_one_terminal_tpdf() {
+        let temp = TempDir::new().expect("temp dir");
+        let carrier = temp.path().join("hdcd.f64le");
+        std::fs::write(&carrier, [0_u8; 32]).expect("raw Float64 carrier");
+        let source_path = temp.path().join("hdcd.flac");
+        let output = temp.path().join("out.flac");
+
+        for (target_depth, label) in [
+            (tonepoet_pipeline::BitDepthTarget::Pcm(PcmBitDepth::Int16), "int16"),
+            (tonepoet_pipeline::BitDepthTarget::Source, "source-int16"),
+        ] {
+            let mut req = request(temp.path());
+            req.settings.target_format = PlannerFormat::Flac;
+            req.settings.target_sample_rate = tonepoet_pipeline::RateTarget::PcmHz(44_100);
+            req.settings.target_bit_depth = target_depth;
+            req.settings.preferred_tool = PreferredTool::Sox;
+            req.settings.dither_type = tonepoet_pipeline::DitherType::Shibata;
+            req.settings.dither_explicit = false;
+            req.settings.metadata.transfer_tags = false;
+            req.settings.metadata.preserve_artwork = false;
+            req.registered_effects = vec![hdcd_decode_effect(Vec::new())];
+
+            let prepared = raw_registered_effect_carrier(
+                carrier.clone(), source_path.clone(),
+                RegisteredEffectCarrierRepresentation::RawFloat64,
+            );
+            let downstream = plan_request_for_track(
+                &req, &prepared, &carrier, &output,
+                temp.path().join(format!("work-{label}")),
+            ).unwrap_or_else(|error| panic!("{label} HDCD terminal bridge: {error}"));
+            assert_eq!(downstream.settings.dither_type, tonepoet_pipeline::DitherType::Tpdf);
+            assert!(!downstream.settings.dither_explicit);
+            let plan = tonepoet_pipeline::plan_conversion(&downstream)
+                .unwrap_or_else(|error| panic!("{label} HDCD terminal plan: {error}"));
+            let PlanAction::Execute { commands, .. } = plan.action else {
+                panic!("{label} must execute an Int16 HDCD terminal")
+            };
+            let sox = commands.iter()
+                .find(|command| command.tool == tonepoet_pipeline::ToolIdentifier::Sox)
+                .expect("one selected SoX terminal");
+            assert_eq!(sox.args.iter().filter(|arg| arg.as_str() == "dither").count(), 1);
+            assert!(!sox.args.iter().any(|arg| arg == "-D"));
+        }
+    }
+
+    #[test]
+    fn r4c_hdcd_cue_dither_bridge_is_effectual_member_only() {
+        let temp = TempDir::new().expect("temp dir");
+        let carrier = temp.path().join("cue.f64le");
+        std::fs::write(&carrier, [0_u8; 32]).expect("raw Float64 carrier");
+        let source_path = temp.path().join("album.flac");
+        let mut req = request(temp.path());
+        req.settings.target_format = PlannerFormat::Flac;
+        req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(PcmBitDepth::Int16);
+        req.settings.dither_type = tonepoet_pipeline::DitherType::Shibata;
+        req.settings.dither_explicit = false;
+        req.registered_effects = vec![hdcd_decode_effect(vec![
+            tonepoet_pipeline::HdcdCueSegment {
+                source_ordinal: 2, start_sample: 44_100, sample_count: 44_100,
+            },
+        ])];
+        for (ordinal, expected) in [(1, tonepoet_pipeline::DitherType::Shibata),
+            (2, tonepoet_pipeline::DitherType::Tpdf)] {
+            let mut prepared = raw_registered_effect_carrier(
+                carrier.clone(), source_path.clone(),
+                RegisteredEffectCarrierRepresentation::RawFloat64,
+            );
+            prepared.id.source_ordinal = ordinal;
+            let downstream = plan_request_for_track(
+                &req, &prepared, &carrier, &temp.path().join(format!("out-{ordinal}.flac")),
+                temp.path().join(format!("work-{ordinal}")),
+            ).expect("CUE member terminal bridge");
+            assert_eq!(downstream.settings.dither_type, expected,
+                "CUE member {ordinal} must keep its own dither authority");
+        }
+    }
+
+    #[test]
+    fn r4c_hdcd_carrier_dither_respects_explicit_off_and_terminal_ownership() {
+        let temp = TempDir::new().expect("temp dir");
+        let carrier = temp.path().join("carrier.f64le");
+        let mut req = request(temp.path());
+        req.settings.target_format = PlannerFormat::Flac;
+        req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(PcmBitDepth::Int16);
+        req.settings.dither_type = tonepoet_pipeline::DitherType::None;
+        req.registered_effects = vec![hdcd_decode_effect(Vec::new())];
+        let raw = raw_registered_effect_carrier(
+            carrier.clone(), temp.path().join("source.flac"),
+            RegisteredEffectCarrierRepresentation::RawFloat64,
+        );
+        // A user Off choice suppresses the automatic HDCD terminal TPDF.
+        req.settings.dither_explicit = true;
+        let mut settings = req.settings.clone();
+        super::apply_registered_effect_terminal_dither_authority(&req, &raw, &mut settings);
+        assert_eq!(settings.dither_type, tonepoet_pipeline::DitherType::None);
+        assert!(settings.dither_explicit);
+
+        // An SSRC terminal carrier has already quantized/dithered: package-only
+        // continuation must not receive a second dither instruction.
+        req.settings.dither_explicit = false;
+        req.settings.dither_type = tonepoet_pipeline::DitherType::Shibata;
+        let float_wav = raw_registered_effect_carrier(
+            carrier.clone(), temp.path().join("source.flac"),
+            RegisteredEffectCarrierRepresentation::Float64Wav,
+        );
+        let mut float_wav_settings = req.settings.clone();
+        super::apply_registered_effect_terminal_dither_authority(
+            &req, &float_wav, &mut float_wav_settings);
+        assert_eq!(float_wav_settings.dither_type, tonepoet_pipeline::DitherType::Tpdf);
+
+        let ssrc = raw_registered_effect_carrier(
+            carrier.clone(), temp.path().join("source.flac"),
+            RegisteredEffectCarrierRepresentation::TerminalPcmWav {
+                bit_depth: PcmBitDepth::Int16,
+                terminal_candidate: selected_terminal(tonepoet_pipeline::ToolIdentifier::Ssrc),
+            },
+        );
+        let mut settings = req.settings.clone();
+        super::apply_registered_effect_terminal_dither_authority(&req, &ssrc, &mut settings);
+        assert_eq!(settings.dither_type, tonepoet_pipeline::DitherType::Shibata);
+
+        // Hybrid WavPack is not an Int16 lossless terminal.
+        req.settings.target_format = PlannerFormat::WavPack;
+        req.settings.wavpack.hybrid = true;
+        let mut settings = req.settings.clone();
+        super::apply_registered_effect_terminal_dither_authority(&req, &raw, &mut settings);
+        assert_eq!(settings.dither_type, tonepoet_pipeline::DitherType::Shibata);
     }
 
     #[test]

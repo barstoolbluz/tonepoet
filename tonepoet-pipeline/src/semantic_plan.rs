@@ -2392,14 +2392,15 @@ pub fn plan_typed_with_effects(
     plan_typed_with_effects_and_policy(request, effects, &CandidateSearchPolicy::default())
 }
 
-fn cd_deemphasis_auto_tpdf_requested(
+fn registered_decode_auto_tpdf_requested(
     request: &PlanRequest,
     effects: &[EffectIntent],
 ) -> bool {
     if request.settings.dither_explicit
-        || !effects
-            .iter()
-            .any(|effect| matches!(&effect.effect, RegisteredUnaryEffect::CdDeemphasis))
+        || !effects.iter().any(|effect| matches!(
+            &effect.effect,
+            RegisteredUnaryEffect::CdDeemphasis | RegisteredUnaryEffect::HdcdDecode { .. }
+        ))
         || !request.settings.target_format.is_pcm_lossless()
         || (request.settings.target_format == AudioFormat::WavPack
             && request.settings.wavpack.hybrid)
@@ -2459,12 +2460,12 @@ fn plan_typed_with_effects_and_policy(
     effects: &[EffectIntent],
     search_policy: &CandidateSearchPolicy,
 ) -> Result<PlanningOutcome<TypedConversionPlan>, PlanningResourceLimit> {
-    // CD de-emphasis is performed in Float64, so an automatic Int16 landing
-    // needs one neutral TPDF quantization even when the original source was
-    // already Int16.  Derive that policy at the semantic boundary so callers
-    // that bypass the TUI cannot accidentally omit it.  Keep the caller's
-    // request immutable and preserve every explicit dither choice.
-    let derived_request = cd_deemphasis_auto_tpdf_requested(request, effects).then(|| {
+    // Source-first HDCD and CD de-emphasis both feed a high-precision carrier.
+    // A subsequent Int16 lossless boundary needs one automatic terminal TPDF,
+    // even though the original CD source itself was only Int16. Explicit
+    // dither choices (including Off) remain authoritative. Do not mutate the
+    // caller's request or the source identity used for HDCD eligibility.
+    let derived_request = registered_decode_auto_tpdf_requested(request, effects).then(|| {
         let mut request = request.clone();
         request.settings.dither_type = DitherType::Tpdf;
         request
@@ -2509,19 +2510,6 @@ fn plan_typed_with_effects_and_policy(
             return Ok(PlanningOutcome::Refused(PlanRefusal {
                 code: "hdcd_certified_true_peak_unqualified".to_owned(),
                 reason: "HDCD Decode with certified true-peak Guard/Normalize is not qualified; turn off one option".to_owned(),
-            }));
-        }
-        let lossless = request.settings.target_format.is_pcm_lossless()
-            && !(request.settings.target_format == AudioFormat::WavPack && request.settings.wavpack.hybrid);
-        let target_int16 = match request.settings.target_bit_depth {
-            BitDepthTarget::Pcm(PcmBitDepth::Int16) => true,
-            BitDepthTarget::Source => source.authoritative_pcm_depth() == Some(PcmBitDepth::Int16),
-            _ => false,
-        };
-        if lossless && target_int16 {
-            return Ok(PlanningOutcome::Refused(PlanRefusal {
-                code: "hdcd_decoded_int16_truncation".to_owned(),
-                reason: "HDCD Decode restores up to 20-bit signal precision; choose Int24 or a wider lossless target".to_owned(),
             }));
         }
     }
@@ -10541,7 +10529,7 @@ mod tests {
         request.settings.target_bit_depth = BitDepthTarget::Source;
         request.settings.dither_type = DitherType::None;
 
-        assert!(cd_deemphasis_auto_tpdf_requested(
+        assert!(registered_decode_auto_tpdf_requested(
             &request,
             &[cd_deemphasis_source_rate_effect()],
         ));
@@ -10566,7 +10554,7 @@ mod tests {
             request.settings.dither_type = explicit;
             request.settings.dither_explicit = true;
 
-            assert!(!cd_deemphasis_auto_tpdf_requested(
+            assert!(!registered_decode_auto_tpdf_requested(
                 &request,
                 &[cd_deemphasis_source_rate_effect()],
             ));
@@ -10590,39 +10578,39 @@ mod tests {
     fn r24_cd_deemphasis_automatic_tpdf_scope_is_narrow() {
         let effect = cd_deemphasis_source_rate_effect();
         let mut request = r24_int16_deemphasis_request();
-        assert!(cd_deemphasis_auto_tpdf_requested(
+        assert!(registered_decode_auto_tpdf_requested(
             &request,
             std::slice::from_ref(&effect),
         ));
 
         request.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
-        assert!(!cd_deemphasis_auto_tpdf_requested(
+        assert!(!registered_decode_auto_tpdf_requested(
             &request,
             std::slice::from_ref(&effect),
         ));
         request.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Float32);
-        assert!(!cd_deemphasis_auto_tpdf_requested(
+        assert!(!registered_decode_auto_tpdf_requested(
             &request,
             std::slice::from_ref(&effect),
         ));
 
         request.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int16);
         request.settings.target_format = AudioFormat::Mp3;
-        assert!(!cd_deemphasis_auto_tpdf_requested(
+        assert!(!registered_decode_auto_tpdf_requested(
             &request,
             std::slice::from_ref(&effect),
         ));
 
         request.settings.target_format = AudioFormat::WavPack;
         request.settings.wavpack.hybrid = true;
-        assert!(!cd_deemphasis_auto_tpdf_requested(
+        assert!(!registered_decode_auto_tpdf_requested(
             &request,
             std::slice::from_ref(&effect),
         ));
 
         request.settings.target_format = AudioFormat::Flac;
         request.settings.wavpack.hybrid = false;
-        assert!(!cd_deemphasis_auto_tpdf_requested(&request, &[]));
+        assert!(!registered_decode_auto_tpdf_requested(&request, &[]));
     }
 
     #[test]
@@ -11094,13 +11082,56 @@ mod tests {
     }
 
     #[test]
-    fn hdcd_refuses_narrow_terminal_unqualified_observation_and_ineligible_input() {
+    fn hdcd_int16_terminal_derives_tpdf_without_mutating_caller_or_dithering_twice() {
         let mut request = hdcd_16_44100_request();
         request.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int16);
-        let Ok(PlanningOutcome::Refused(refusal)) =
+        request.settings.dither_type = DitherType::Shibata; // stale nominal auto selection
+        request.settings.dither_explicit = false;
+        assert!(registered_decode_auto_tpdf_requested(
+            &request, &[hdcd_effect()],
+        ));
+        let Ok(PlanningOutcome::Ready(plan)) =
             plan_typed_with_effects(&request, &[hdcd_effect()])
-        else { panic!("HDCD must refuse lossless Int16 truncation") };
-        assert_eq!(refusal.code, "hdcd_decoded_int16_truncation");
+        else { panic!("HDCD Int16 needs one admitted terminal TPDF owner") };
+        let (terminal, _) = selected_pcm_terminal(&plan);
+        let Some(SelectedTerminalRealization::Pcm(realization)) =
+            terminal.contract.terminal_realization.as_ref()
+        else { panic!("missing Int16 PCM terminal") };
+        assert_eq!(realization.input_precision,
+            StoragePrecision::Pcm(PcmBitDepth::Float64));
+        assert_eq!(realization.effective_dither, Some(DitherType::Tpdf));
+        assert_eq!(realization.dither_owner, PcmTerminalDitherOwner::SelectedTerminal);
+        assert_eq!(request.settings.dither_type, DitherType::Shibata,
+            "the automatic derivation must not change caller settings");
+
+        request.settings.dither_type = DitherType::None;
+        request.settings.dither_explicit = true;
+        assert!(!registered_decode_auto_tpdf_requested(
+            &request, &[hdcd_effect()],
+        ));
+        let Ok(PlanningOutcome::Ready(explicit_off_plan)) =
+            plan_typed_with_effects(&request, &[hdcd_effect()])
+        else { panic!("HDCD Int16 with explicit dither Off must be admitted") };
+        let (terminal, _) = selected_pcm_terminal(&explicit_off_plan);
+        let Some(SelectedTerminalRealization::Pcm(realization)) =
+            terminal.contract.terminal_realization.as_ref()
+        else { panic!("missing explicit-Off terminal") };
+        assert_eq!(realization.effective_dither, None);
+    }
+
+    #[test]
+    fn hdcd_admits_final_int16_quantization_but_retains_other_refusals() {
+        let mut request = hdcd_16_44100_request();
+        request.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int16);
+        let Ok(PlanningOutcome::Ready(plan)) =
+            plan_typed_with_effects(&request, &[hdcd_effect()])
+        else { panic!("HDCD must permit selected lossless Int16") };
+        assert!(plan.nodes.iter().any(|node| matches!(node,
+            TypedPlanNode::ApplyEffect { instance, .. }
+                if matches!(instance.effect, RegisteredUnaryEffect::HdcdDecode { .. })
+        )));
+        assert_eq!(request.settings.dither_type, DitherType::None,
+            "automatic policy cannot mutate the caller request");
 
         request.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int24);
         request.settings.pcm_true_peak.policy = SampleGainPolicy::TruePeakGuard {

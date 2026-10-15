@@ -1,0 +1,187 @@
+--- a/src/tui/app.rs
++++ b/src/tui/app.rs
+@@ -6166,7 +6166,17 @@
+             let float_to_integer = self.source_pcm_float_bits.is_some()
+                 && self.auto_gain_target_is_integer_pcm();
+             let lossless_to_lossy = self.source_is_lossless == Some(true) && lossy_target;
+-            if !self.source_is_dsd && (float_to_integer || lossless_to_lossy) {
++            // An effectual HDCD decode cannot be combined with certified
++            // true-peak gain. Prefer the source-derived HDCD recovery over an
++            // incompatible *automatic* guard; explicit gain remains authoritative
++            // and the commit-time refusal still protects that combination.
++            let hdcd_lossy_decode = lossy_target
++                && self.hdcd_decode_enabled
++                && self.hdcd_is_actionable();
++            if !self.source_is_dsd
++                && (float_to_integer || lossless_to_lossy)
++                && !hdcd_lossy_decode
++            {
+                 self.pcm_gain_mode.select_value(&PcmGainMode::TruePeakGuard);
+                 self.pcm_true_peak_scan_mode
+                     .select_value(&TruePeakScanTier::Fast);
+@@ -7036,6 +7046,12 @@
+         // The existing dither provenance authority also owns HDCD's Int16
+         // default. This is idempotent and never overwrites a user/preset pick.
+         self.apply_auto_dither(self.auto_dither_source_bits(None));
++        // HDCD scan completion and manual Decode changes can happen *after*
++        // lossy-format selection. Reconcile the conflicting automatic gain
++        // there without changing any DSD or lossless-target gain transitions.
++        if !self.source_is_dsd && self.auto_gain_target_is_lossy() {
++            self.apply_auto_gain_defaults();
++        }
+     }
+ 
+     /// Visible Convert warning when explicit Decode Off risks losing
+@@ -25217,4 +25233,124 @@
+         format.recompute_auto_hdcd();
+         assert!(format.hdcd_manual_off_warning().is_some_and(|text| text.contains("destroy")));
+     }
++
++    /// Match the known-lossless 16/44.1 probe facts supplied by a real FLAC,
++    /// not an unprobed synthetic Format state (which would miss auto gain).
++    fn r4d_probed_flac_state() -> FormatState {
++        let mut state = FormatState::new();
++        assert!(state.format.select_value(&AudioFormat::Flac));
++        assert!(state.sample_rate.select_value(&SOURCE_SAMPLE_RATE_SENTINEL));
++        assert!(state.bit_depth.select_value(&BitDepthChoice::Source));
++        state.source_pcm_rate_hz = Some(44_100);
++        state.source_pcm_bit_depth = Some(16);
++        state.source_pcm_float_bits = None;
++        state.source_is_lossless = Some(true);
++        state.source_rate_identity = SourceRateIdentity::Known;
++        state.apply_format_constraints();
++        state
++    }
++
++    fn r4d_scan(detected: bool, peak_extend: bool, transient_filter: bool)
++        -> BTreeMap<PathBuf, ConvertHdcdPathState>
++    {
++        BTreeMap::from([(
++            PathBuf::from("effectual-source.flac"),
++            ConvertHdcdPathState {
++                eligible: true,
++                capabilities: Some(capabilities(detected, peak_extend, false, transient_filter)),
++                ..Default::default()
++            },
++        )])
++    }
++
++    fn r4d_select_target(state: &mut FormatState, target: AudioFormat) {
++        let old_format = *state.format.selected_value();
++        let old_depth = *state.bit_depth.selected_value();
++        assert!(state.format.select_value(&target));
++        state.after_user_selection(
++            FormatField::Format, old_format, old_depth, Some(16), Some(44_100),
++        );
++    }
++
++    #[test]
++    fn r4d_effectual_hdcd_and_lossy_target_auto_defaults_are_compatible_in_both_orders() {
++        let result = r4d_scan(true, true, false);
++        for target in [AudioFormat::Mp3, AudioFormat::Aac, AudioFormat::Opus] {
++            for scan_first in [true, false] {
++                let mut state = r4d_probed_flac_state();
++                if scan_first {
++                    state.set_convert_hdcd_summary(&result);
++                    assert!(!state.hdcd_decode_enabled, "lossless Int16 retains HDCD Off");
++                }
++                r4d_select_target(&mut state, target);
++                if !scan_first {
++                    assert_eq!(*state.pcm_gain_mode.selected_value(), PcmGainMode::TruePeakGuard,
++                        "known lossless -> lossy initially retains its ordinary guard");
++                    state.set_convert_hdcd_summary(&result);
++                }
++                assert!(state.hdcd_is_actionable(), "confirmed source must be actionable");
++                assert!(state.hdcd_decode_enabled, "{target:?} scan-first={scan_first}");
++                assert!(!state.hdcd_decode_overridden, "Decode On is source-derived");
++                assert!(!state.pcm_gain_overridden, "gain choice is automatic");
++                assert_eq!(*state.pcm_gain_mode.selected_value(), PcmGainMode::Off,
++                    "no automatic certified gain can block HDCD -> {target:?}, scan-first={scan_first}");
++                state.recompute_auto_hdcd();
++                state.apply_auto_gain_defaults();
++                assert_eq!(*state.pcm_gain_mode.selected_value(), PcmGainMode::Off,
++                    "recomputation must be idempotent");
++            }
++        }
++    }
++
++    #[test]
++    fn r4d_manual_hdcd_toggle_reconciles_automatic_gain_but_explicit_gain_stays_authoritative() {
++        let mut state = r4d_probed_flac_state();
++        state.set_convert_hdcd_summary(&r4d_scan(true, true, false));
++        r4d_select_target(&mut state, AudioFormat::Aac);
++        assert_eq!(*state.pcm_gain_mode.selected_value(), PcmGainMode::Off);
++
++        // When the user disables HDCD, the original lossless-to-lossy safety
++        // default returns; re-enabling HDCD removes only that automatic guard.
++        assert!(state.select_row_index(FormatField::HdcdDecode, 0, Some(16), Some(44_100)));
++        assert!(!state.hdcd_decode_enabled);
++        assert_eq!(*state.pcm_gain_mode.selected_value(), PcmGainMode::TruePeakGuard);
++        assert!(state.select_row_index(FormatField::HdcdDecode, 1, Some(16), Some(44_100)));
++        assert_eq!(*state.pcm_gain_mode.selected_value(), PcmGainMode::Off);
++
++        // Explicit TruePeak Guard/Normalize must NOT be silently disabled:
++        // the existing commit-time HDCD/true-peak qualification refusal owns it.
++        for gain in [PcmGainMode::TruePeakGuard, PcmGainMode::TruePeakNormalize] {
++            let index = state.pcm_gain_mode.options.iter()
++                .position(|option| option.value == gain).expect("gain pill");
++            assert!(state.select_row_index(FormatField::PcmTruePeak, index, Some(16), Some(44_100)));
++            assert!(state.pcm_gain_overridden);
++            state.recompute_auto_hdcd();
++            assert!(state.hdcd_decode_enabled);
++            assert_eq!(*state.pcm_gain_mode.selected_value(), gain,
++                "explicit incompatible gain must still be refused at commit");
++        }
++        let off_index = state.pcm_gain_mode.options.iter()
++            .position(|option| option.value == PcmGainMode::Off).unwrap();
++        assert!(state.select_row_index(FormatField::PcmTruePeak, off_index, Some(16), Some(44_100)));
++        r4d_select_target(&mut state, AudioFormat::Mp3);
++        assert_eq!(*state.pcm_gain_mode.selected_value(), PcmGainMode::Off,
++            "explicit Off must remain authoritative across formats");
++    }
++
++    #[test]
++    fn r4d_passive_or_absent_hdcd_preserves_ordinary_lossless_to_lossy_gain_default() {
++        for (detected, pe, tf) in [
++            (false, false, false), // no HDCD
++            (true, false, false),  // passive
++            (true, false, true),   // unsupported Transient Filter only
++        ] {
++            let mut state = r4d_probed_flac_state();
++            r4d_select_target(&mut state, AudioFormat::Opus);
++            assert_eq!(*state.pcm_gain_mode.selected_value(), PcmGainMode::TruePeakGuard);
++            state.set_convert_hdcd_summary(&r4d_scan(detected, pe, tf));
++            assert!(!state.hdcd_is_actionable());
++            assert!(!state.hdcd_decode_enabled);
++            assert_eq!(*state.pcm_gain_mode.selected_value(), PcmGainMode::TruePeakGuard);
++        }
++    }
+ }
+--- a/src/tui/convert_actions.rs
++++ b/src/tui/convert_actions.rs
+@@ -1238,6 +1238,12 @@
+         use std::collections::BTreeMap;
+ 
+         let mut format = FormatState::new();
++        // Match the actual probe facts of effectual HDCD FLAC. Without the
++        // known-lossless flag, the old incompatible automatic guard never
++        // activates and this AAC planning regression misses commit refusal.
++        format.source_is_lossless = Some(true);
++        format.source_pcm_bit_depth = Some(16);
++        format.source_pcm_rate_hz = Some(44_100);
+         format.set_convert_hdcd_summary(&BTreeMap::from([(
+             PathBuf::from("hdcd.flac"), ConvertHdcdPathState {
+                 eligible: true,
+@@ -1276,9 +1282,12 @@
+             format.after_user_selection(FormatField::Format, before_format,
+                 before_depth, Some(16), Some(44_100));
+             assert!(format.hdcd_decode_enabled);
++            assert_eq!(format.pcm_gain_mode.selected_value(), &PcmGainMode::Off,
++                "known-lossless HDCD must not auto-enable an incompatible true-peak guard");
+             assert!(!format.dither.options[format.dither.selected].enabled,
+                 "AAC disables the user-facing PCM dither pill");
+             let settings = format_state_to_pipeline_settings(&format).unwrap();
++            assert_eq!(settings.pcm_true_peak.policy, tonepoet_pipeline::SampleGainPolicy::Off);
+             assert_eq!(settings.dither_explicit, choice.is_some(),
+                 "AAC terminal must retain manual authority but not invent it");
+             assert_eq!(settings.dither_type,
