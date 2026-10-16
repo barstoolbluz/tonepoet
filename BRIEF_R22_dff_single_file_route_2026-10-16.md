@@ -25,8 +25,9 @@ resolves to the embedded-only policy, so a real nine-DFF sidecar album takes a
 different conversion route than before.
 
 The test sets no target priority, so it runs on the defaults, and we could not
-establish which of this round's changes moves it. `CueSidecarPolicy` is decided
-in `main.rs` and `queue_expansion.rs`, neither of which changed.
+establish which of this round's changes moves it. `CueSidecarPolicy` is
+referenced across twenty-two files, including `keybindings.rs` and `app.rs`,
+both of which this round changed.
 
 **What we want:** a DFF with a metadata sidecar keeps the SingleFile route and
 the CUE stays metadata, as the test says — or, if the new authority rules
