@@ -4868,6 +4868,14 @@ The standing rule still applies: the second log is written only when the user
 asked for a log at all, and the #65 destination-inventory tests have to be
 extended to expect it, since they assert the destination's exact file set.
 
+**✅ RESOLVED IN CODE (R20/R23); the single-file field smoke above is still
+owed.** A dated snapshot is taken only when a `conversion.log` already exists:
+`conversion_log_snapshot_name` and `create_conversion_log_snapshot`
+(`src/convert/pipeline/stages.rs:19248`, `:19268`). The album case was verified
+on real audio — two runs produced two snapshots plus one `conversion.log`, and
+a greenfield run produced no snapshot. The R23 single-file residual was not
+re-smoked, so the earlier status line stands.
+
 ## 71. The strict destination-inventory tests never run against overwrite or keep-both
 
 **Status 2026-10-09 — R23 coverage implemented; build-host gate owed.** Added
@@ -4925,6 +4933,11 @@ complete file set of the destination afterwards, including the sibling directory
 keep-both creates. A conversion that publishes over existing output should be
 held to the same standard as one that publishes into an empty folder.
 
+**✅ RESOLVED (R20).** `issue_71_strict_inventory_covers_album_overwrite_and_keep_both`
+and `issue_71_independent_folder_overwrite_has_an_exact_complete_inventory`
+(`src/convert/pipeline/stages.rs:77700`, `:77801`) assert the destination file
+set under both policies.
+
 ## 72. A destination collision is discovered only after all the work is done
 
 Filed 2026-10-10 from the field. Reported for SACD conversions and for CUE
@@ -4967,6 +4980,11 @@ distinction or it will refuse idempotent redos that work today.
 A conversion that cannot publish its output fails before it does the work.
 Whether a collision exists is knowable from the destination and the naming
 policy before any audio is read.
+
+**✅ RESOLVED (R24).** `preflight_proven_destination_obstruction`
+(`src/convert/pipeline/stages.rs:32024`) runs before the work, alongside the
+existing tool and multi-root preflights. Verified on real audio: the collision
+is reported in ~1.6 s instead of after the full conversion.
 
 ## 73. Popup body text has no emphasis, and the shared row count is what constrains adding it
 
@@ -5044,6 +5062,12 @@ log line, not from the qualified terminal bound, so the real figure should set
 the cap. And the Reference path's pre-gain term is zero where other terminals'
 may not be, so the worst terminal should set it, not this one.
 
+**✅ RESOLVED (R33).** Both halves. The album-gain block now prints the exact
+fixed-point residual rather than implying the two figures subtract
+(`src/convert/pipeline/stages.rs:17967`). True-peak entry is restricted to the
+0.0001 dBTP grid in the TUI, presets and CLI, with `DbNano` keeping
+nanodecibel precision internally (`tonepoet-pipeline/src/settings.rs:975`).
+
 ## 75. Transfer tags cannot see an SACD ISO, in either direction
 
 Filed 2026-10-11 from the field.
@@ -5063,6 +5087,12 @@ fail the same way.
 **Fix this.** Tag transfer works in both directions with an SACD ISO as source
 or as target. Where it genuinely cannot, the refusal names what it could not
 read rather than claiming there is no audio.
+
+**⚠ IMPLEMENTED, NOT FIELD-VERIFIED (R33).** `TransferCarrier::SacdIso` carries
+the ISO with its same-stem XML sidecar; only the XML is writable and track IDs
+come from the ISO TOC. No test exercises a real disc, and the round trip in
+either direction has not been run against one. Close this after the field
+check, not before.
 
 ## 76. The authoritative metadata settings are not honored
 
@@ -5109,3 +5139,17 @@ which carrier it means.
 in TonePoet's extended CUE formatting — the proprietary `REM` comment blocks —
 fix that too. Per-track composers are the normal case on a soundtrack, and they
 should survive a round trip through our own CUE extension.
+
+**⚠ PARTIALLY ADDRESSED — STILL OPEN (R33/R33C).** The reported instance is
+fixed: a one-track-per-file CUE now projects file-scoped composer, performer,
+lyricist and arranger credits into track-specific `REM` blocks instead of
+requiring equal COMPOSER values, and R33C made a `SidecarCue` side admit no
+FLAC writes. The refusal string survives at `src/tui/keybindings.rs:29454` for
+genuinely multi-track images, which is intended.
+
+What this issue actually asks for is not done. The declared outcome is that the
+configured metadata target order is the single authority — that nothing outside
+it refuses, overrides or quietly writes, and that a CUE beside the files can be
+declared not a write target at all. The membership-versus-precedence gates and
+the non-omittable normalization described above have not been changed. Do not
+close this on the instance.
