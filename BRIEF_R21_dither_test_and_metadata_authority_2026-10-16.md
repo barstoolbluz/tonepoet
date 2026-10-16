@@ -82,14 +82,13 @@ established once, not this instance closed. Two observations that look relevant,
 though they are ours and may be wrong:
 
 - The gates that admit CUE work test **membership** of the configured list, not
-  precedence — `metadata_album_view_dirty_unsupported_fields`
-  (`src/tui/keybindings.rs:15612`) and
-  `cue_tonepoet_metadata_edits_for_album_sidecars` (`:15279`) ask only whether
-  `SidecarCue` appears anywhere in it.
+  precedence. `metadata_album_view_dirty_unsupported_fields` and
+  `cue_tonepoet_metadata_edits_for_album_sidecars`, both in
+  `src/tui/keybindings.rs`, ask only whether `SidecarCue` appears anywhere in
+  it.
 - A target cannot be omitted either.
-  `normalized_aggregate_metadata_target_priority` (`src/config.rs:469`) chains
-  the defaults onto the configured order, so anything left out is appended
-  back.
+  `normalized_aggregate_metadata_target_priority` in `src/config.rs` chains the
+  defaults onto the configured order, so anything left out is appended back.
 
 Together those mean no value of the setting can express "do not write the CUE".
 
