@@ -21,8 +21,8 @@ convert::pipeline::stages::cue_real_output_matrix_tests::nine_dff_metadata_sidec
 ```
 
 Pre-existing, 2 of 2 alone. A DFF track that should bypass CUE handling now
-resolves to the embedded-only policy, so a real nine-DFF sidecar album takes a
-different conversion route than before.
+resolves to the embedded-only policy. The test stops at that assertion, so what
+the conversion would actually produce was not reached.
 
 The test sets no target priority, so it runs on the defaults, and we could not
 establish which of this round's changes moves it. `CueSidecarPolicy` is
