@@ -1,7 +1,8 @@
 # BRIEF — HDCD dither does not revert, and RF64 `.wav` files fail tag reading
 
-The tree is clean: gate **7500 / 1** before requalification, Reference
-requalified on 2026-10-15, freshness 3 of 3. Two items.
+Last full gate: **7500 passed / 1 failed**, the failure being source-lock
+freshness. Reference was requalified on 2026-10-15 and freshness is now 3 of 3;
+the full suite has not been re-run since. Two items.
 
 ## 1. Automatic TPDF survives turning HDCD Decode off
 
@@ -41,13 +42,16 @@ it is RF64 — the format exists to carry what will not fit in a 32-bit RIFF
 size field.
 
 **What we want:** RF64 `.wav` files read their tags and artwork like any other
-WAV. TonePoet already writes and converts RF64; only this read path refuses.
+WAV. Only this read path refuses — `ffprobe` reads the file without complaint,
+`.rf64` is already an accepted input extension, and three places in the tree
+already accept either magic rather than trusting the name.
 
 The full entry is `## 62` in `docs/OUTSTANDING_ISSUES.md`.
 
 ## Ledger
 
-`docs/OUTSTANDING_ISSUES.md` now carries verified status for #70 through #76.
+`docs/OUTSTANDING_ISSUES.md` now carries verified status for #70, #71, #72,
+#74, #75 and #76. #73 is unchanged and still deliberately deferred.
 #71, #72 and #74 are resolved. #75 is implemented but has never been run
 against a real SACD, and #76 is only addressed for the reported instance — the
 configured metadata target order is still not the single authority it asks to
