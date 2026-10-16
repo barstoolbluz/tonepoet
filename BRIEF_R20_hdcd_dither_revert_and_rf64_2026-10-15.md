@@ -1,8 +1,7 @@
 # BRIEF — HDCD dither does not revert, and RF64 `.wav` files fail tag reading
 
-Last full gate: **7500 passed / 1 failed**, the failure being source-lock
-freshness. Reference was requalified on 2026-10-15 and freshness is now 3 of 3;
-the full suite has not been re-run since. Two items.
+The tree is clean: full gate **7501 passed / 0 failed**, run on this exact
+source after the 2026-10-15 Reference requalification. Two items.
 
 ## 1. Automatic TPDF survives turning HDCD Decode off
 
