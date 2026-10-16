@@ -247,6 +247,26 @@ All of the above are match arms in `FormatState::apply_format_constraints()` (`s
 - Module-level re-exports in `mod.rs` files — consumers import from `tonepoet::convert::` not submodules directly
 - TUI draw functions take immutable state refs; mouse buttons registered in a second pass via `ButtonRenderMap`
 
+## Never cite line numbers in a brief, an issue, or a commit message
+
+Name the function, the type, or the file. Not `foo.rs:15612`.
+
+Line numbers are wrong almost immediately. `keybindings.rs`, `stages.rs`,
+`app.rs` and `probe.rs` shift by hundreds of lines every round, so a number
+recorded in one round points at unrelated code in the next. A reader who
+follows a stale citation lands somewhere arbitrary and concludes the finding is
+wrong. This has already happened: #76's two citations drifted within a few
+rounds and had to be pulled out of a brief after they had been checked and
+found pointing at nothing.
+
+They also cost nothing to omit. A function name is searchable, survives every
+edit, and is shorter. The only place a line number is appropriate is a throwaway
+message in this session about code neither side will re-read.
+
+The same rule is why `## Workspace Structure` above says to `ls` rather than
+trust its tree, and why this file records measurements with the date they were
+taken.
+
 ## Deliveries arrive uncompiled — this gate is the first compile
 
 Code bundles come from a reasoning-model session running in a **4 GB container

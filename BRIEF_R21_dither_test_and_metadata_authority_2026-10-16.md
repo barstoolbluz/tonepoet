@@ -8,16 +8,15 @@ pre-emphasis evidence, both advisory entrypoints, Browse's tag reads and sort
 keys, and track-number sorting, and a successful empty read stays distinct
 from a failed one.
 
-It did not compile as received: `src/tui/rf64_metadata.rs:128` chained
-`guess_file_type()` into `probe.read()` through `and_then`, but those fail with
-`io::Error` and `LoftyError`. Split here into two steps with the same error
+It did not compile as received: in `src/tui/rf64_metadata.rs`, `read_tags`
+chained `guess_file_type()` into `probe.read()` through `and_then`, but those
+fail with `io::Error` and `LoftyError`. Split here into two steps with the same error
 text. Ninth delivery that did not compile.
 
 ## 1. The new de-emphasis dither test fails
 
 ```
 tui::app::hdcd_format_policy_tests::hdcd_off_preserves_user_dither_and_independent_deemphasis_tpdf
-src/tui/app.rs:25235
   HDCD Off must not remove independently automatic CD de-emphasis TPDF
   left  None
   right TPDF
