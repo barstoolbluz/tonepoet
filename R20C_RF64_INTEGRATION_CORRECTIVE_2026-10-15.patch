@@ -1,0 +1,400 @@
+diff --git a/docs/OUTSTANDING_ISSUES.md b/docs/OUTSTANDING_ISSUES.md
+index 3cd1674..933cf7e 100644
+--- a/docs/OUTSTANDING_ISSUES.md
++++ b/docs/OUTSTANDING_ISSUES.md
+@@ -4281,6 +4281,19 @@ multi-gigabyte carrier. **Build-host Rust compilation, regression execution,
+ and a real RF64 album conversion remain outstanding**, so issue #62 is not yet
+ verified closed. See `R20_HANDOFF_2026-10-15.md` for the acceptance recipe.
+ 
++### R20C reader-integration correction — 2026-10-15
++
++The R20 fallback is now also used by Convert's pre-emphasis tag inventory,
++both metadata-based pre-emphasis advisory readers, Browse tag search and tag
++sort, and track/disc ordering. Each uses Lofty first and retries through the
++existing RF64 metadata view only for genuine RF64 magic. Normal formats,
++metadata-recovery gates, and positive/negative PRE authority are unchanged.
++Equivalent RIFF/RF64 fixtures now exercise affirmative and negative PRE flags,
++the CUE negative veto, Browse searching and sorting, and TRACKNUMBER ordering.
++**Rust execution and the original album/user-UI reproduction are still
++outstanding; #62 is not verified closed.** See
++`R20C_RF64_INTEGRATION_HANDOFF_2026-10-15.md` for acceptance steps.
++
+ ## 63. The sox_ng the build uses and the sox_ng repo on disk are unrelated histories
+ 
+ Filed 2026-10-07. Not a conversion defect. A build-provenance question, deferred
+diff --git a/src/tui/browse.rs b/src/tui/browse.rs
+index adee2e6..0e762b2 100644
+--- a/src/tui/browse.rs
++++ b/src/tui/browse.rs
+@@ -13696,7 +13696,14 @@ fn read_tags_from_file_checked(path: &Path) -> Result<TagReadResult, String> {
+     use lofty::file::TaggedFileExt;
+     use lofty::tag::Accessor;
+ 
+-    let tagged = lofty::read_from_path(path).map_err(|err| format!("tag read failed: {err}"))?;
++    let tagged = match lofty::read_from_path(path) {
++        Ok(tagged) => tagged,
++        Err(_) if crate::tui::probe::is_rf64_metadata_carrier(path) => {
++            crate::tui::probe::read_rf64_metadata_tags(path)
++                .map_err(|err| format!("tag read failed: {err}"))?
++        }
++        Err(err) => return Err(format!("tag read failed: {err}")),
++    };
+     let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) else {
+         return Ok(TagReadResult::empty());
+     };
+@@ -14323,7 +14330,13 @@ fn extract_tag_sort_key(path: &Path, sort: SearchSort) -> String {
+     use lofty::tag::Accessor;
+ 
+     let tagged = match lofty::read_from_path(path) {
+-        Ok(t) => t,
++        Ok(tagged) => tagged,
++        Err(_) if crate::tui::probe::is_rf64_metadata_carrier(path) => {
++            match crate::tui::probe::read_rf64_metadata_tags(path) {
++                Ok(tagged) => tagged,
++                Err(_) => return String::new(),
++            }
++        }
+         Err(_) => return String::new(),
+     };
+     let tag = match tagged.primary_tag().or_else(|| tagged.first_tag()) {
+@@ -14767,6 +14780,76 @@ mod tests {
+     use std::sync::{atomic::AtomicBool, Arc};
+     use std::time::Duration;
+ 
++    #[test]
++    fn rf64_browse_tag_only_search_and_tag_sort_use_real_metadata() {
++        let dir = tempfile::tempdir().expect("temporary mixed RIFF/RF64 directory");
++        // The RF64 title deliberately does not occur in its filename, and
++        // title sorting must reverse lexical filename order.
++        let rf64 = dir.path().join("A5 Song.wav");
++        let riff = dir.path().join("B2 Song.wav");
++        crate::tui::probe::write_tagged_wav(&rf64, true, Some("Zephyr Needle"), Some(5), None);
++        crate::tui::probe::write_tagged_wav(&riff, false, Some("Alpha Control"), Some(2), None);
++
++        let extended = read_tags_from_file_checked(&rf64).expect("RF64 Browse tag read");
++        let ordinary = read_tags_from_file_checked(&riff).expect("RIFF Browse tag read");
++        assert_eq!(extended.title.as_deref(), Some("Zephyr Needle"));
++        assert_eq!(ordinary.title.as_deref(), Some("Alpha Control"));
++        assert!(extended.tag_string.contains("zephyr needle"));
++        for sort in [SearchSort::Artist, SearchSort::Album, SearchSort::Year] {
++            let key = extract_tag_sort_key(&rf64, sort);
++            assert!(!key.is_empty(), "RF64 {sort:?} must come from tags");
++            assert_eq!(key, extract_tag_sort_key(&riff, sort));
++        }
++        assert_eq!(extract_tag_sort_key(&rf64, SearchSort::Title), "zephyr needle");
++
++        let entry = |path: &Path| {
++            let metadata = std::fs::metadata(path).expect("fixture metadata");
++            BrowseEntry::new(
++                path.to_path_buf(),
++                path.file_name().unwrap().to_string_lossy().to_string(),
++                EntryKind::AudioFile(AudioFormat::Wav),
++                metadata.len(),
++                metadata.modified().ok(),
++            )
++        };
++        let mut state = BrowseState::new();
++        state.search.active = true;
++        state.search.fuzzy = false;
++        state.search.mode = SearchMode::Tags;
++        state.parent_entry = None;
++        state.all_dirs.clear();
++        state.all_files = vec![entry(&rf64), entry(&riff)];
++
++        state.execute_search_local("zephyr needle", true, false, FormatFilter::Off, SearchMode::Tags);
++        assert_eq!(state.entries.len(), 1, "tag-only search must find RF64 title, not filename");
++        assert_eq!(state.entries[0].path, rf64);
++
++        state.search.sort = SearchSort::Title;
++        state.search.sort_dir = SortDir::Asc;
++        state.execute_search_local("rf64 test artist", true, false, FormatFilter::Off, SearchMode::Tags);
++        assert_eq!(
++            state.entries.iter().map(|entry| entry.path.clone()).collect::<Vec<_>>(),
++            vec![riff, rf64],
++            "tag-title sort must override opposite filename ordering",
++        );
++    }
++
++    #[test]
++    fn rf64_browse_preserves_successful_empty_tags_vs_read_failure() {
++        let dir = tempfile::tempdir().expect("temporary RF64 fixtures");
++        let tagless = dir.path().join("tagless.wav");
++        crate::tui::probe::write_tagged_wav(&tagless, true, None, None, None);
++        let empty = read_tags_from_file_checked(&tagless).expect("valid tagless RF64 is readable");
++        assert!(!empty.has_tag_data());
++
++        let invalid = dir.path().join("invalid.wav");
++        std::fs::write(&invalid, b"RF64\xff\xff\xff\xffWAVE").expect("write truncated RF64");
++        assert!(read_tags_from_file_checked(&invalid).is_err());
++        let mut cache = std::collections::HashMap::new();
++        assert!(build_tag_search_string_cached(&invalid, &mut cache).is_empty());
++        assert!(!cache.contains_key(&invalid), "failed read must not create a negative cache entry");
++    }
++
+     fn canonical_equivalent_focus_path(real_path: &Path) -> PathBuf {
+         let parent = real_path.parent().expect("fixture parent");
+         let alias_dir = parent.join("alias-for-canonicalize-test");
+diff --git a/src/tui/preemphasis/metadata.rs b/src/tui/preemphasis/metadata.rs
+index 58f0a38..0a98226 100644
+--- a/src/tui/preemphasis/metadata.rs
++++ b/src/tui/preemphasis/metadata.rs
+@@ -52,7 +52,13 @@ pub fn check_tag_evidence(audio_path: &Path) -> Option<PreemphasisEvidence> {
+     use lofty::file::TaggedFileExt;
+     use lofty::tag::ItemKey;
+ 
+-    let tagged = lofty::read_from_path(audio_path).ok()?;
++    let tagged = match lofty::read_from_path(audio_path) {
++        Ok(tagged) => tagged,
++        Err(_) if crate::tui::probe::is_rf64_metadata_carrier(audio_path) => {
++            crate::tui::probe::read_rf64_metadata_tags(audio_path).ok()?
++        }
++        Err(_) => return None,
++    };
+     for tag in tagged.tags() {
+         // Historical broader detector: check COMMENT tag for a positive
+         // pre-emphasis statement. The Phase 2 metadata editor does not call
+@@ -90,8 +96,15 @@ pub fn check_pre_flag_tag_evidence(audio_path: &Path) -> Option<PreemphasisEvide
+ pub(crate) fn check_pre_flag_tag_disposition(audio_path: &Path) -> PreemphasisTagDisposition {
+     use lofty::file::TaggedFileExt;
+ 
+-    let Ok(tagged) = lofty::read_from_path(audio_path) else {
+-        return PreemphasisTagDisposition::None;
++    let tagged = match lofty::read_from_path(audio_path) {
++        Ok(tagged) => tagged,
++        Err(_) if crate::tui::probe::is_rf64_metadata_carrier(audio_path) => {
++            match crate::tui::probe::read_rf64_metadata_tags(audio_path) {
++                Ok(tagged) => tagged,
++                Err(_) => return PreemphasisTagDisposition::None,
++            }
++        }
++        Err(_) => return PreemphasisTagDisposition::None,
+     };
+     preemphasis_tag_disposition_from_tags(tagged.tags())
+ }
+@@ -1311,6 +1324,26 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn rf64_preemphasis_advisories_match_riff_for_yes_no_and_tagless() {
++        let dir = tempfile::tempdir().expect("temporary WAV fixture directory");
++        for (label, pre, expected) in [
++            ("yes", Some("YES"), PreemphasisTagDisposition::Affirmative),
++            ("no", Some("NO"), PreemphasisTagDisposition::Negative),
++            ("tagless", None, PreemphasisTagDisposition::None),
++        ] {
++            let riff = dir.path().join(format!("{label}-riff.wav"));
++            let rf64 = dir.path().join(format!("{label}-rf64.wav"));
++            crate::tui::probe::write_tagged_wav(&riff, false, None, None, pre);
++            crate::tui::probe::write_tagged_wav(&rf64, true, None, None, pre);
++
++            assert_eq!(check_pre_flag_tag_disposition(&riff), expected, "{label}: RIFF control");
++            assert_eq!(check_pre_flag_tag_disposition(&rf64), expected, "{label}: RF64 read");
++            assert_eq!(check_pre_flag_tag_evidence(&rf64), check_pre_flag_tag_evidence(&riff));
++            assert_eq!(check_tag_evidence(&rf64), check_tag_evidence(&riff));
++        }
++    }
++
+     fn temp_dir(name: &str) -> PathBuf {
+         let mut path = env::temp_dir();
+         let nanos = SystemTime::now()
+diff --git a/src/tui/probe.rs b/src/tui/probe.rs
+index 3c65570..132c273 100644
+--- a/src/tui/probe.rs
++++ b/src/tui/probe.rs
+@@ -945,6 +945,9 @@ fn probe_sacd(path: &Path) -> Result<SourceInfo, String> {
+ #[path = "rf64_metadata.rs"]
+ mod rf64_metadata;
+ 
++#[cfg(test)]
++pub(crate) use rf64_metadata::reader_test_fixture::write_tagged_wav;
++
+ // Keep the RF64 metadata adapter available to the conversion materializers.
+ // They must preserve typed Lofty errors for their existing APEv2 fallbacks.
+ pub(crate) fn is_rf64_metadata_carrier(path: &Path) -> bool {
+@@ -8049,6 +8052,11 @@ pub fn sort_paths_by_track(paths: &mut Vec<std::path::PathBuf>) {
+                     run_test_sort_after_recover_before_lofty_hook(p);
+                     lofty::read_from_path(p)
+                         .ok()
++                        .or_else(|| {
++                            is_rf64_metadata_carrier(p)
++                                .then(|| read_rf64_metadata_tags(p).ok())
++                                .flatten()
++                        })
+                         .and_then(|tagged| {
+                             let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
+                             let disc = tag
+@@ -8804,8 +8812,11 @@ pub(crate) fn read_convert_preemphasis_tag_evidence(
+     path: &Path,
+ ) -> Result<ConvertPreemphasisEvidence, String> {
+     use lofty::file::TaggedFileExt;
+-    let tagged = lofty::read_from_path(path)
+-        .map_err(|error| format!("failed to read Convert pre-emphasis tags: {error}"))?;
++    let tagged = match lofty::read_from_path(path) {
++        Ok(tagged) => tagged,
++        Err(_) if is_rf64_metadata_carrier(path) => read_rf64_metadata_tags(path)?,
++        Err(error) => return Err(format!("failed to read Convert pre-emphasis tags: {error}")),
++    };
+     Ok(convert_preemphasis_evidence_from_tags(tagged.tags()))
+ }
+ 
+@@ -8945,6 +8956,41 @@ mod convert_deemphasis_evidence_tests {
+         assert_eq!(format.deemphasis_catalog_count, 0);
+     }
+ 
++    #[test]
++    fn rf64_convert_preemphasis_matches_riff_yes_no_and_tagless() {
++        let dir = tempfile::tempdir().expect("temporary WAV fixture directory");
++        for (label, pre, affirmative, negative) in [
++            ("yes", Some("YES"), true, false),
++            ("no", Some("NO"), false, true),
++            ("tagless", None, false, false),
++        ] {
++            let riff = dir.path().join(format!("{label}-riff.wav"));
++            let rf64 = dir.path().join(format!("{label}-rf64.wav"));
++            write_tagged_wav(&riff, false, None, None, pre);
++            write_tagged_wav(&rf64, true, None, None, pre);
++
++            let ordinary = read_convert_preemphasis_tag_evidence(&riff)
++                .expect("read ordinary RIFF pre-emphasis evidence");
++            let extended = read_convert_preemphasis_tag_evidence(&rf64)
++                .expect("read extended RF64 pre-emphasis evidence");
++            assert_eq!(extended, ordinary, "{label}: metadata carrier must not change authority");
++            assert_eq!(extended.explicit_affirmative, affirmative, "{label}: positive authority");
++            assert_eq!(extended.explicit_negative, negative, "{label}: negative veto");
++
++            if negative {
++                let mut conflicting = extended;
++                conflicting.cue_flag = true;
++                let mut format = crate::tui::app::FormatState::new();
++                format.set_convert_deemphasis_evidence(&conflicting);
++                assert_eq!(
++                    format.deemphasis_evidence,
++                    crate::tui::app::ConvertDeemphasisEvidence::None,
++                    "explicit RF64 negative tag must veto conflicting CUE evidence",
++                );
++            }
++        }
++    }
++
+     #[test]
+     fn convert_catalog_advisory_requires_actual_exact_catalog_tag() {
+         let exact = tag_with(ItemKey::Unknown("CATALOGNUMBER".to_owned()), "35DP 150");
+@@ -30221,6 +30267,27 @@ mod tests {
+         assert_semantic_title_readback(&path, "Original after padding");
+     }
+ 
++    #[test]
++    fn sort_paths_by_track_honors_rf64_tracknumber_over_misleading_filename() {
++        let dir = tempfile::tempdir().expect("temporary mixed WAV directory");
++        let one = dir.path().join("01 - First.wav");
++        let two = dir.path().join("02 - Second.wav");
++        let five = dir.path().join("A5 Song.wav");
++        write_tagged_wav(&one, false, Some("First"), Some(1), None);
++        write_tagged_wav(&two, false, Some("Second"), Some(2), None);
++        write_tagged_wav(&five, true, Some("Fifth"), Some(5), None);
++
++        let mut paths = vec![five.clone(), two.clone(), one.clone()];
++        sort_paths_by_track(&mut paths);
++        assert_eq!(
++            paths,
++            vec![one.clone(), two.clone(), five.clone()],
++            "RF64 TRACKNUMBER=5 must beat A5 filename's zero fallback",
++        );
++        sort_paths_by_track(&mut paths);
++        assert_eq!(paths, vec![one, two, five], "repeated track ordering must be stable");
++    }
++
+     #[test]
+     fn sort_paths_by_track_recovers_stale_flac_journal_before_lofty_attempt() {
+         let temp = tempfile::tempdir().expect("tempdir");
+diff --git a/src/tui/rf64_metadata.rs b/src/tui/rf64_metadata.rs
+index 5605fa9..3462a93 100644
+--- a/src/tui/rf64_metadata.rs
++++ b/src/tui/rf64_metadata.rs
+@@ -129,6 +129,85 @@ pub(super) fn read_tags(path: &Path) -> Result<lofty::file::TaggedFile, String>
+         .map_err(|e| format!("parse RF64 metadata '{}': {e}", path.display()))
+ }
+ 
++/// Small, real RIFF/RF64 audio carriers for integration tests of the distinct
++/// metadata consumers. Both variants contain byte-identical ID3 tag chunks.
++#[cfg(test)]
++pub(crate) mod reader_test_fixture {
++    use std::path::Path;
++    use id3::TagLike as _;
++
++    fn chunk(id: &[u8; 4], body: &[u8]) -> Vec<u8> {
++        let mut out = id.to_vec();
++        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
++        out.extend_from_slice(body);
++        if body.len() & 1 != 0 {
++            out.push(0);
++        }
++        out
++    }
++
++    pub(crate) fn write_tagged_wav(
++        path: &Path,
++        rf64: bool,
++        title: Option<&str>,
++        track: Option<u32>,
++        pre_emphasis: Option<&str>,
++    ) {
++        let mut tags = id3::Tag::new();
++        if let Some(title) = title {
++            tags.set_title(title);
++            tags.set_artist("RF64 Test Artist");
++            tags.set_album("RF64 Test Album");
++            tags.set_date_recorded(id3::Timestamp {
++                year: 1994,
++                month: None,
++                day: None,
++                hour: None,
++                minute: None,
++                second: None,
++            });
++        }
++        if let Some(track) = track {
++            tags.set_track(track);
++        }
++        if let Some(value) = pre_emphasis {
++            tags.add_frame(id3::frame::ExtendedText {
++                description: "PRE_EMPHASIS".to_owned(),
++                value: value.to_owned(),
++            });
++        }
++
++        let fmt = chunk(b"fmt ", &[1, 0, 2, 0, 0x44, 0xAC, 0, 0, 0x10, 0xB1, 2, 0, 4, 0, 16, 0]);
++        let pcm = [0u8; 16];
++        let mut wav = if rf64 {
++            let mut bytes = b"RF64\xff\xff\xff\xffWAVE".to_vec();
++            let mut ds64 = [0u8; 28];
++            ds64[8..16].copy_from_slice(&(pcm.len() as u64).to_le_bytes());
++            bytes.extend(chunk(b"ds64", &ds64));
++            bytes
++        } else {
++            b"RIFF\0\0\0\0WAVE".to_vec()
++        };
++        wav.extend(fmt);
++        if title.is_some() || track.is_some() || pre_emphasis.is_some() {
++            let mut encoded = Vec::new();
++            tags.write_to(&mut encoded, id3::Version::Id3v24)
++                .expect("encode ID3 WAV tag fixture");
++            wav.extend(chunk(b"id3 ", &encoded));
++        }
++        wav.extend(chunk(b"data", &pcm));
++
++        if rf64 {
++            let riff_len = wav.len() as u64 - 8;
++            wav[20..28].copy_from_slice(&riff_len.to_le_bytes());
++        } else {
++            let riff_len = wav.len() as u32 - 8;
++            wav[4..8].copy_from_slice(&riff_len.to_le_bytes());
++        }
++        std::fs::write(path, wav).expect("write WAV metadata test fixture");
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;

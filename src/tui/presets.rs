@@ -2904,6 +2904,10 @@ merge = "multi-file"
         assert!(report.is_complete(), "unexpected refusal: {:?}", report.refused_fields);
         assert!(!restored.dither_overridden, "automatic dither is not manual policy");
         assert_eq!(*restored.dither.selected_value(), DitherType::TPDF);
+        assert!(restored.select_row_index(FormatField::HdcdDecode, 0, Some(16), Some(44_100)));
+        assert!(!restored.hdcd_decode_enabled);
+        assert_eq!(*restored.dither.selected_value(), DitherType::None,
+            "restored automatic HDCD TPDF must revert on user Decode Off");
         restored.reset_deemphasis_for_source_replacement();
         restored.apply_auto_dither(Some(16));
         assert_eq!(*restored.dither.selected_value(), DitherType::None);

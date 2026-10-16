@@ -25170,6 +25170,76 @@ mod hdcd_format_policy_tests {
     }
 
     #[test]
+    fn hdcd_owned_tpdf_reverts_on_manual_off_on_every_toggle_route() {
+        // Field sequence: Decode On auto-widens to 24; select Int16; Decode
+        // Off must remove only the *automatic* HDCD TPDF, not manual dither.
+        // The three UI entry points must have identical provenance semantics.
+        for route in 0..3 {
+            let mut state = state_for(capabilities(true, true, false, false));
+            match route {
+                0 => assert!(state.select_row_index(
+                    FormatField::HdcdDecode, 1, Some(16), Some(44_100))),
+                1 => {
+                    state.field_focus = FormatField::HdcdDecode;
+                    state.select_focused_next(Some(16), Some(44_100));
+                }
+                _ => {
+                    state.field_focus = FormatField::HdcdDecode;
+                    state.select_focused_prev(Some(16), Some(44_100));
+                }
+            }
+            assert!(state.hdcd_decode_enabled, "route {route}");
+            assert_eq!(*state.bit_depth.selected_value(), BitDepthChoice::Int24);
+            state.select_bit_depth(BitDepthChoice::Int16, Some(16));
+            assert!(state.hdcd_auto_tpdf_applicable());
+            assert_eq!(*state.dither.selected_value(), DitherType::TPDF);
+            assert!(!state.dither_overridden, "automatic TPDF must never become a manual choice");
+
+            match route {
+                0 => assert!(state.select_row_index(
+                    FormatField::HdcdDecode, 0, Some(16), Some(44_100))),
+                1 => state.select_focused_next(Some(16), Some(44_100)),
+                _ => state.select_focused_prev(Some(16), Some(44_100)),
+            }
+            assert!(!state.hdcd_decode_enabled, "route {route}");
+            assert!(!state.hdcd_auto_tpdf_applicable());
+            assert_eq!(*state.bit_depth.selected_value(), BitDepthChoice::Int16);
+            assert_eq!(*state.dither.selected_value(), DitherType::None,
+                "HDCD-generated TPDF must be removed on Decode Off, route {route}");
+            assert!(!state.dither_overridden);
+            state.recompute_auto_hdcd();
+            assert_eq!(*state.dither.selected_value(), DitherType::None,
+                "recomputation must be idempotent");
+        }
+    }
+
+    #[test]
+    fn hdcd_off_preserves_user_dither_and_independent_deemphasis_tpdf() {
+        for selected in [DitherType::TPDF, DitherType::Shibata, DitherType::None] {
+            let mut state = state_for(capabilities(true, true, false, false));
+            assert!(state.select_row_index(FormatField::HdcdDecode, 1, Some(16), Some(44_100)));
+            state.select_bit_depth(BitDepthChoice::Int16, Some(16));
+            let idx = state.dither.options.iter()
+                .position(|option| option.value == selected).unwrap();
+            assert!(state.select_row_index(FormatField::Dither, idx, Some(16), Some(44_100)));
+            assert!(state.dither_overridden);
+            assert!(state.select_row_index(FormatField::HdcdDecode, 0, Some(16), Some(44_100)));
+            assert_eq!(*state.dither.selected_value(), selected,
+                "explicitly chosen dither is not owned by HDCD");
+        }
+        let mut state = state_for(capabilities(true, true, false, false));
+        assert!(state.select_row_index(FormatField::HdcdDecode, 1, Some(16), Some(44_100)));
+        state.select_bit_depth(BitDepthChoice::Int16, Some(16));
+        state.deemphasis_enabled = true;
+        assert!(state.select_row_index(FormatField::HdcdDecode, 0, Some(16), Some(44_100)));
+        assert_eq!(*state.dither.selected_value(), DitherType::TPDF,
+            "HDCD Off must not remove independently automatic CD de-emphasis TPDF");
+        state.deemphasis_enabled = false;
+        state.apply_auto_dither(Some(16));
+        assert_eq!(*state.dither.selected_value(), DitherType::None);
+    }
+
+    #[test]
     fn manual_hdcd_int16_tpdf_override_and_preset_depth_are_stable() {
         let mut state = state_for(capabilities(true, true, false, false));
         state.select_bit_depth(BitDepthChoice::Int16, Some(16));

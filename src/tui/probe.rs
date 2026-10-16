@@ -942,6 +942,22 @@ fn probe_sacd(path: &Path) -> Result<SourceInfo, String> {
     })
 }
 
+#[path = "rf64_metadata.rs"]
+mod rf64_metadata;
+
+#[cfg(test)]
+pub(crate) use rf64_metadata::reader_test_fixture::write_tagged_wav;
+
+// Keep the RF64 metadata adapter available to the conversion materializers.
+// They must preserve typed Lofty errors for their existing APEv2 fallbacks.
+pub(crate) fn is_rf64_metadata_carrier(path: &Path) -> bool {
+    rf64_metadata::has_rf64_magic(path)
+}
+
+pub(crate) fn read_rf64_metadata_tags(path: &Path) -> Result<lofty::file::TaggedFile, String> {
+    rf64_metadata::read_tags(path)
+}
+
 /// Read metadata tags from an audio file using lofty
 pub fn read_metadata(path: &Path) -> Result<SourceMetadata, String> {
 
@@ -980,6 +996,10 @@ pub fn read_metadata(path: &Path) -> Result<SourceMetadata, String> {
 
     match lofty::read_from_path(path) {
         Ok(tagged_file) => Ok(source_metadata_from_tags(path, tagged_file.tags(), true)),
+        Err(_) if rf64_metadata::has_rf64_magic(path) => {
+            let tagged_file = rf64_metadata::read_tags(path)?;
+            Ok(source_metadata_from_tags(path, tagged_file.tags(), true))
+        }
         Err(error) if native_ape_fallback_is_eligible(path, &error) => {
             let outcome = read_native_ape_fallback(path).map_err(|native_error| {
                 format!(
@@ -1018,6 +1038,16 @@ pub fn read_embedded_picture_bytes(
                 if let Some(picture) = tag
                     .pictures()
                     .iter()
+                    .find(|picture| picture.pic_type() == picture_type)
+                {
+                    return Ok(picture.data().to_vec());
+                }
+            }
+        }
+        Err(_) if rf64_metadata::has_rf64_magic(path) => {
+            let tagged_file = rf64_metadata::read_tags(path)?;
+            for tag in tagged_file.tags() {
+                if let Some(picture) = tag.pictures().iter()
                     .find(|picture| picture.pic_type() == picture_type)
                 {
                     return Ok(picture.data().to_vec());
@@ -8022,6 +8052,11 @@ pub fn sort_paths_by_track(paths: &mut Vec<std::path::PathBuf>) {
                     run_test_sort_after_recover_before_lofty_hook(p);
                     lofty::read_from_path(p)
                         .ok()
+                        .or_else(|| {
+                            is_rf64_metadata_carrier(p)
+                                .then(|| read_rf64_metadata_tags(p).ok())
+                                .flatten()
+                        })
                         .and_then(|tagged| {
                             let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
                             let disc = tag
@@ -8777,8 +8812,11 @@ pub(crate) fn read_convert_preemphasis_tag_evidence(
     path: &Path,
 ) -> Result<ConvertPreemphasisEvidence, String> {
     use lofty::file::TaggedFileExt;
-    let tagged = lofty::read_from_path(path)
-        .map_err(|error| format!("failed to read Convert pre-emphasis tags: {error}"))?;
+    let tagged = match lofty::read_from_path(path) {
+        Ok(tagged) => tagged,
+        Err(_) if is_rf64_metadata_carrier(path) => read_rf64_metadata_tags(path)?,
+        Err(error) => return Err(format!("failed to read Convert pre-emphasis tags: {error}")),
+    };
     Ok(convert_preemphasis_evidence_from_tags(tagged.tags()))
 }
 
@@ -8916,6 +8954,41 @@ mod convert_deemphasis_evidence_tests {
         assert_eq!(format.deemphasis_explicit_count, 0);
         assert_eq!(format.deemphasis_cue_count, 0);
         assert_eq!(format.deemphasis_catalog_count, 0);
+    }
+
+    #[test]
+    fn rf64_convert_preemphasis_matches_riff_yes_no_and_tagless() {
+        let dir = tempfile::tempdir().expect("temporary WAV fixture directory");
+        for (label, pre, affirmative, negative) in [
+            ("yes", Some("YES"), true, false),
+            ("no", Some("NO"), false, true),
+            ("tagless", None, false, false),
+        ] {
+            let riff = dir.path().join(format!("{label}-riff.wav"));
+            let rf64 = dir.path().join(format!("{label}-rf64.wav"));
+            write_tagged_wav(&riff, false, None, None, pre);
+            write_tagged_wav(&rf64, true, None, None, pre);
+
+            let ordinary = read_convert_preemphasis_tag_evidence(&riff)
+                .expect("read ordinary RIFF pre-emphasis evidence");
+            let extended = read_convert_preemphasis_tag_evidence(&rf64)
+                .expect("read extended RF64 pre-emphasis evidence");
+            assert_eq!(extended, ordinary, "{label}: metadata carrier must not change authority");
+            assert_eq!(extended.explicit_affirmative, affirmative, "{label}: positive authority");
+            assert_eq!(extended.explicit_negative, negative, "{label}: negative veto");
+
+            if negative {
+                let mut conflicting = extended;
+                conflicting.cue_flag = true;
+                let mut format = crate::tui::app::FormatState::new();
+                format.set_convert_deemphasis_evidence(&conflicting);
+                assert_eq!(
+                    format.deemphasis_evidence,
+                    crate::tui::app::ConvertDeemphasisEvidence::None,
+                    "explicit RF64 negative tag must veto conflicting CUE evidence",
+                );
+            }
+        }
     }
 
     #[test]
@@ -9794,32 +9867,43 @@ fn augment_metadata_read_error(
     error
 }
 
+fn editor_result_from_tagged(
+    path: &std::path::Path,
+    tagged: lofty::file::TaggedFile,
+    identity_issue: Option<MetadataReadIssue>,
+) -> Result<(Vec<CanonicalEditorTagField>, SourceMetadata, Option<MetadataReadIssue>), MetadataReadIssue> {
+    use lofty::file::TaggedFileExt;
+    let metadata = source_metadata_from_tags(path, tagged.tags(), false);
+    let mut fields = editor_fields_from_tagged_file(path, &tagged);
+    if tagged.tag(lofty::tag::TagType::Mp4Ilst).is_some() {
+        let state = read_mp4_native_multivalue_state(path).map_err(|reason| {
+            augment_metadata_read_error(
+                MetadataReadIssue { kind: MetadataReadIssueKind::TagRead, reason },
+                identity_issue.clone(),
+            )
+        })?;
+        overlay_mp4_native_multivalue_editor_fields(&mut fields, &state);
+    }
+    Ok((fields, metadata, identity_issue))
+}
+
 fn read_editor_metadata_file(
     path: &std::path::Path,
 ) -> Result<(Vec<CanonicalEditorTagField>, SourceMetadata, Option<MetadataReadIssue>), MetadataReadIssue> {
-    use lofty::file::TaggedFileExt;
-
     // Probe once at the editor I/O boundary so a misleading filename is
     // disclosed even when the tag reader itself refuses the file.
     let identity_issue = editor_source_identity_issue(path);
 
     match lofty::read_from_path(path) {
-        Ok(tagged) => {
-            let metadata = source_metadata_from_tags(path, tagged.tags(), false);
-            let mut fields = editor_fields_from_tagged_file(path, &tagged);
-            if tagged.tag(lofty::tag::TagType::Mp4Ilst).is_some() {
-                let state = read_mp4_native_multivalue_state(path).map_err(|reason| {
-                    augment_metadata_read_error(
-                        MetadataReadIssue {
-                            kind: MetadataReadIssueKind::TagRead,
-                            reason,
-                        },
-                        identity_issue.clone(),
-                    )
-                })?;
-                overlay_mp4_native_multivalue_editor_fields(&mut fields, &state);
-            }
-            Ok((fields, metadata, identity_issue))
+        Ok(tagged) => editor_result_from_tagged(path, tagged, identity_issue),
+        Err(_) if rf64_metadata::has_rf64_magic(path) => {
+            let tagged = rf64_metadata::read_tags(path).map_err(|reason| {
+                augment_metadata_read_error(
+                    MetadataReadIssue { kind: MetadataReadIssueKind::TagRead, reason },
+                    identity_issue.clone(),
+                )
+            })?;
+            editor_result_from_tagged(path, tagged, identity_issue)
         }
         Err(err) if native_ape_fallback_is_eligible(path, &err) => match read_native_ape_fallback(path) {
             Ok(outcome) => Ok((
@@ -30181,6 +30265,27 @@ mod tests {
         let after_recovery = std::fs::read(&path).expect("read recovered real fixture");
         assert_eq!(after_recovery, before, "real wrong-offset recovery must restore original bytes before semantic reads");
         assert_semantic_title_readback(&path, "Original after padding");
+    }
+
+    #[test]
+    fn sort_paths_by_track_honors_rf64_tracknumber_over_misleading_filename() {
+        let dir = tempfile::tempdir().expect("temporary mixed WAV directory");
+        let one = dir.path().join("01 - First.wav");
+        let two = dir.path().join("02 - Second.wav");
+        let five = dir.path().join("A5 Song.wav");
+        write_tagged_wav(&one, false, Some("First"), Some(1), None);
+        write_tagged_wav(&two, false, Some("Second"), Some(2), None);
+        write_tagged_wav(&five, true, Some("Fifth"), Some(5), None);
+
+        let mut paths = vec![five.clone(), two.clone(), one.clone()];
+        sort_paths_by_track(&mut paths);
+        assert_eq!(
+            paths,
+            vec![one.clone(), two.clone(), five.clone()],
+            "RF64 TRACKNUMBER=5 must beat A5 filename's zero fallback",
+        );
+        sort_paths_by_track(&mut paths);
+        assert_eq!(paths, vec![one, two, five], "repeated track ordering must be stable");
     }
 
     #[test]

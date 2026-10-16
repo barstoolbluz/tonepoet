@@ -1353,6 +1353,15 @@ fn read_embedded_cuesheet(path: &Path) -> Result<Option<String>, MaterializeErro
 
     let tagged = match lofty::read_from_path(path) {
         Ok(tagged) => tagged,
+        Err(_) if crate::tui::probe::is_rf64_metadata_carrier(path) => {
+            match crate::tui::probe::read_rf64_metadata_tags(path) {
+                Ok(tagged) => tagged,
+                Err(error) => {
+                    log::warn!("embedded CUESHEET metadata unavailable for '{}': {error}", path.display());
+                    return Ok(None);
+                }
+            }
+        }
         Err(error) if crate::metadata_persistence::native_ape_fallback_is_eligible(path, &error) => {
             let outcome = match crate::metadata_persistence::read_native_ape_fallback(path) {
                 Ok(outcome) => outcome,
@@ -3710,6 +3719,15 @@ fn read_image_album_metadata(path: &Path) -> ImageAlbumMetadata {
 
     let tagged = match lofty::read_from_path(path) {
         Ok(tagged) => tagged,
+        Err(_) if crate::tui::probe::is_rf64_metadata_carrier(path) => {
+            match crate::tui::probe::read_rf64_metadata_tags(path) {
+                Ok(tagged) => tagged,
+                Err(error) => {
+                    log::warn!("unable to read RF64 CUE-image tags from '{}': {error}", path.display());
+                    return ImageAlbumMetadata::default();
+                }
+            }
+        }
         Err(err) => {
             log::warn!(
                 "unable to read album-level tags from CUE image '{}'; using CUE metadata without image tag fallback: {err}",

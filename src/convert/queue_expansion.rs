@@ -1846,6 +1846,15 @@ fn read_embedded_cuesheet_text_for_queue(path: &Path) -> Result<Option<String>, 
 
     let tagged = match lofty::read_from_path(path) {
         Ok(tagged) => tagged,
+        Err(_) if crate::tui::probe::is_rf64_metadata_carrier(path) => {
+            match crate::tui::probe::read_rf64_metadata_tags(path) {
+                Ok(tagged) => tagged,
+                Err(error) => {
+                    log::warn!("failed to read embedded RF64 CUE metadata from '{}': {error}", path.display());
+                    return Err(());
+                }
+            }
+        }
         Err(error) if crate::metadata_persistence::native_ape_fallback_is_eligible(path, &error) => {
             let outcome = match crate::metadata_persistence::read_native_ape_fallback(path) {
                 Ok(outcome) => outcome,

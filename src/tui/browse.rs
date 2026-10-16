@@ -13696,7 +13696,14 @@ fn read_tags_from_file_checked(path: &Path) -> Result<TagReadResult, String> {
     use lofty::file::TaggedFileExt;
     use lofty::tag::Accessor;
 
-    let tagged = lofty::read_from_path(path).map_err(|err| format!("tag read failed: {err}"))?;
+    let tagged = match lofty::read_from_path(path) {
+        Ok(tagged) => tagged,
+        Err(_) if crate::tui::probe::is_rf64_metadata_carrier(path) => {
+            crate::tui::probe::read_rf64_metadata_tags(path)
+                .map_err(|err| format!("tag read failed: {err}"))?
+        }
+        Err(err) => return Err(format!("tag read failed: {err}")),
+    };
     let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) else {
         return Ok(TagReadResult::empty());
     };
@@ -14323,7 +14330,13 @@ fn extract_tag_sort_key(path: &Path, sort: SearchSort) -> String {
     use lofty::tag::Accessor;
 
     let tagged = match lofty::read_from_path(path) {
-        Ok(t) => t,
+        Ok(tagged) => tagged,
+        Err(_) if crate::tui::probe::is_rf64_metadata_carrier(path) => {
+            match crate::tui::probe::read_rf64_metadata_tags(path) {
+                Ok(tagged) => tagged,
+                Err(_) => return String::new(),
+            }
+        }
         Err(_) => return String::new(),
     };
     let tag = match tagged.primary_tag().or_else(|| tagged.first_tag()) {
@@ -14766,6 +14779,76 @@ mod tests {
     use std::io::{Seek, SeekFrom, Write};
     use std::sync::{atomic::AtomicBool, Arc};
     use std::time::Duration;
+
+    #[test]
+    fn rf64_browse_tag_only_search_and_tag_sort_use_real_metadata() {
+        let dir = tempfile::tempdir().expect("temporary mixed RIFF/RF64 directory");
+        // The RF64 title deliberately does not occur in its filename, and
+        // title sorting must reverse lexical filename order.
+        let rf64 = dir.path().join("A5 Song.wav");
+        let riff = dir.path().join("B2 Song.wav");
+        crate::tui::probe::write_tagged_wav(&rf64, true, Some("Zephyr Needle"), Some(5), None);
+        crate::tui::probe::write_tagged_wav(&riff, false, Some("Alpha Control"), Some(2), None);
+
+        let extended = read_tags_from_file_checked(&rf64).expect("RF64 Browse tag read");
+        let ordinary = read_tags_from_file_checked(&riff).expect("RIFF Browse tag read");
+        assert_eq!(extended.title.as_deref(), Some("Zephyr Needle"));
+        assert_eq!(ordinary.title.as_deref(), Some("Alpha Control"));
+        assert!(extended.tag_string.contains("zephyr needle"));
+        for sort in [SearchSort::Artist, SearchSort::Album, SearchSort::Year] {
+            let key = extract_tag_sort_key(&rf64, sort);
+            assert!(!key.is_empty(), "RF64 {sort:?} must come from tags");
+            assert_eq!(key, extract_tag_sort_key(&riff, sort));
+        }
+        assert_eq!(extract_tag_sort_key(&rf64, SearchSort::Title), "zephyr needle");
+
+        let entry = |path: &Path| {
+            let metadata = std::fs::metadata(path).expect("fixture metadata");
+            BrowseEntry::new(
+                path.to_path_buf(),
+                path.file_name().unwrap().to_string_lossy().to_string(),
+                EntryKind::AudioFile(AudioFormat::Wav),
+                metadata.len(),
+                metadata.modified().ok(),
+            )
+        };
+        let mut state = BrowseState::new();
+        state.search.active = true;
+        state.search.fuzzy = false;
+        state.search.mode = SearchMode::Tags;
+        state.parent_entry = None;
+        state.all_dirs.clear();
+        state.all_files = vec![entry(&rf64), entry(&riff)];
+
+        state.execute_search_local("zephyr needle", true, false, FormatFilter::Off, SearchMode::Tags);
+        assert_eq!(state.entries.len(), 1, "tag-only search must find RF64 title, not filename");
+        assert_eq!(state.entries[0].path, rf64);
+
+        state.search.sort = SearchSort::Title;
+        state.search.sort_dir = SortDir::Asc;
+        state.execute_search_local("rf64 test artist", true, false, FormatFilter::Off, SearchMode::Tags);
+        assert_eq!(
+            state.entries.iter().map(|entry| entry.path.clone()).collect::<Vec<_>>(),
+            vec![riff, rf64],
+            "tag-title sort must override opposite filename ordering",
+        );
+    }
+
+    #[test]
+    fn rf64_browse_preserves_successful_empty_tags_vs_read_failure() {
+        let dir = tempfile::tempdir().expect("temporary RF64 fixtures");
+        let tagless = dir.path().join("tagless.wav");
+        crate::tui::probe::write_tagged_wav(&tagless, true, None, None, None);
+        let empty = read_tags_from_file_checked(&tagless).expect("valid tagless RF64 is readable");
+        assert!(!empty.has_tag_data());
+
+        let invalid = dir.path().join("invalid.wav");
+        std::fs::write(&invalid, b"RF64\xff\xff\xff\xffWAVE").expect("write truncated RF64");
+        assert!(read_tags_from_file_checked(&invalid).is_err());
+        let mut cache = std::collections::HashMap::new();
+        assert!(build_tag_search_string_cached(&invalid, &mut cache).is_empty());
+        assert!(!cache.contains_key(&invalid), "failed read must not create a negative cache entry");
+    }
 
     fn canonical_equivalent_focus_path(real_path: &Path) -> PathBuf {
         let parent = real_path.parent().expect("fixture parent");

@@ -4269,6 +4269,31 @@ Container identity should come from the file's magic, not its extension,
 wherever the distinction matters — the pattern already used in the three
 materializers above.
 
+### R20 read-path corrective candidate — 2026-10-15
+
+A read-only, bounded RF64 metadata-to-RIFF view now feeds the existing Lofty
+reader without copying or altering the audio payload. The normal RIFF path is
+unchanged. The shared fallback is wired into Browse/editor tag and artwork
+reads, the single-file conversion naming materializer, embedded-CUE detection,
+and CUE-image album-tag reads. Focused fixture regressions cover tags before
+and after audio, artwork, materializer naming, malformed ds64, and a sparse
+multi-gigabyte carrier. **Build-host Rust compilation, regression execution,
+and a real RF64 album conversion remain outstanding**, so issue #62 is not yet
+verified closed. See `R20_HANDOFF_2026-10-15.md` for the acceptance recipe.
+
+### R20C reader-integration correction — 2026-10-15
+
+The R20 fallback is now also used by Convert's pre-emphasis tag inventory,
+both metadata-based pre-emphasis advisory readers, Browse tag search and tag
+sort, and track/disc ordering. Each uses Lofty first and retries through the
+existing RF64 metadata view only for genuine RF64 magic. Normal formats,
+metadata-recovery gates, and positive/negative PRE authority are unchanged.
+Equivalent RIFF/RF64 fixtures now exercise affirmative and negative PRE flags,
+the CUE negative veto, Browse searching and sorting, and TRACKNUMBER ordering.
+**Rust execution and the original album/user-UI reproduction are still
+outstanding; #62 is not verified closed.** See
+`R20C_RF64_INTEGRATION_HANDOFF_2026-10-15.md` for acceptance steps.
+
 ## 63. The sox_ng the build uses and the sox_ng repo on disk are unrelated histories
 
 Filed 2026-10-07. Not a conversion defect. A build-provenance question, deferred

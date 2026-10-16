@@ -1040,6 +1040,9 @@ pub(crate) fn individual_file_metadata_source_is_viable(path: &Path) -> bool {
 
     match lofty::read_from_path(path) {
         Ok(_) => true,
+        // Lofty's WAV parser refuses the RF64 header, but our bounded
+        // read-only projection supports this carrier's metadata representation.
+        Err(_) if crate::tui::probe::is_rf64_metadata_carrier(path) => true,
         Err(error) if crate::metadata_persistence::native_ape_fallback_is_eligible(path, &error) => true,
         Err(error) => !crate::metadata_persistence::lofty_error_is_unsupported_metadata_format(&error),
     }
@@ -1069,23 +1072,21 @@ pub(crate) fn read_track_metadata_with_warnings_and_viability(
             true,
         ));
     }
-    use lofty::prelude::*;
-
     match lofty::read_from_path(path) {
-        Ok(tagged) => {
-            let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) else {
-                return Ok((
+        Ok(tagged) => Ok(track_metadata_from_tagged_file(path, &tagged)),
+        Err(_) if crate::tui::probe::is_rf64_metadata_carrier(path) => {
+            // This is the materializer that supplies output naming and the
+            // `converted without metadata` warning. Recover from RF64 here,
+            // not just in Browse's metadata inspector.
+            match crate::tui::probe::read_rf64_metadata_tags(path) {
+                Ok(tagged) => Ok(track_metadata_from_tagged_file(path, &tagged)),
+                Err(error) => Ok((
                     TrackMetadata::default(),
-                    vec![format!(
-                        "Tag read: FAILED (no readable metadata tag found in '{}') - converted without metadata",
-                        path.display()
-                    )],
+                    vec![format!("Tag read: FAILED ({error}) - converted without metadata")],
                     false,
                     true,
-                ));
-            };
-            let (metadata, warnings) = track_metadata_from_lofty_tag(path, tag);
-            Ok((metadata, warnings, false, true))
+                )),
+            }
         }
         Err(lofty_error)
             if crate::metadata_persistence::native_ape_fallback_is_eligible(path, &lofty_error) =>
@@ -1123,6 +1124,26 @@ pub(crate) fn read_track_metadata_with_warnings_and_viability(
             ))
         }
     }
+}
+
+fn track_metadata_from_tagged_file(
+    path: &Path,
+    tagged: &lofty::file::TaggedFile,
+) -> (TrackMetadata, Vec<String>, bool, bool) {
+    use lofty::prelude::*;
+    let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) else {
+        return (
+            TrackMetadata::default(),
+            vec![format!(
+                "Tag read: FAILED (no readable metadata tag found in '{}') - converted without metadata",
+                path.display()
+            )],
+            false,
+            true,
+        );
+    };
+    let (metadata, warnings) = track_metadata_from_lofty_tag(path, tag);
+    (metadata, warnings, false, true)
 }
 
 fn track_metadata_from_lofty_tag(
@@ -1333,6 +1354,44 @@ fn derive_album_metadata(tracks: &[PreparedTrack]) -> AlbumMetadata {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn rf64_wav_conversion_materializer_uses_source_title_not_placeholder() {
+        // The reported issue is specifically the materializer's naming source:
+        // FFmpeg preserved the tags but Lofty refused the RF64 WAVE signature.
+        // Exercise this route, not only Browse's metadata reader.
+        fn chunk(id: &[u8; 4], body: &[u8]) -> Vec<u8> {
+            let mut result = id.to_vec();
+            result.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            result.extend_from_slice(body);
+            if body.len() & 1 == 1 { result.push(0); }
+            result
+        }
+        let mut info = b"INFO".to_vec();
+        info.extend(chunk(b"INAM", b"Reel Around The Fountain\0"));
+        info.extend(chunk(b"IART", b"The Smiths\0"));
+        let mut file = b"RF64\xff\xff\xff\xffWAVE".to_vec();
+        file.extend(chunk(b"ds64", &[0u8; 28]));
+        file.extend(chunk(b"fmt ", &[1, 0, 2, 0, 0x44, 0xAC, 0, 0, 0x10, 0xB1, 2, 0, 4, 0, 16, 0]));
+        file.extend_from_slice(b"data\xff\xff\xff\xff");
+        file.extend_from_slice(&[0u8; 16]);
+        file.extend(chunk(b"LIST", &info)); // tags after audio must be recovered
+        let riff_size = file.len() as u64 - 8;
+        file[20..28].copy_from_slice(&riff_size.to_le_bytes());
+        file[28..36].copy_from_slice(&16u64.to_le_bytes());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("A1 Reel Around The Fountain.wav");
+        std::fs::write(&path, file).unwrap();
+
+        assert!(individual_file_metadata_source_is_viable(&path));
+        let (metadata, warnings, recovered, viable) =
+            read_track_metadata_with_warnings_and_viability(&path).unwrap();
+        assert!(viable);
+        assert!(!recovered, "RF64 metadata is ordinarily readable, not degraded APE recovery");
+        assert_eq!(metadata.title.as_deref(), Some("Reel Around The Fountain"));
+        assert_eq!(metadata.artist.as_deref(), Some("The Smiths"));
+        assert!(warnings.iter().all(|w| !w.contains("Tag read: FAILED")), "{warnings:?}");
+    }
 
     fn list_values(values: &MetadataValueList) -> Vec<&str> {
         values.values().iter().map(String::as_str).collect()

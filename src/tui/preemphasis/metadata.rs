@@ -52,7 +52,13 @@ pub fn check_tag_evidence(audio_path: &Path) -> Option<PreemphasisEvidence> {
     use lofty::file::TaggedFileExt;
     use lofty::tag::ItemKey;
 
-    let tagged = lofty::read_from_path(audio_path).ok()?;
+    let tagged = match lofty::read_from_path(audio_path) {
+        Ok(tagged) => tagged,
+        Err(_) if crate::tui::probe::is_rf64_metadata_carrier(audio_path) => {
+            crate::tui::probe::read_rf64_metadata_tags(audio_path).ok()?
+        }
+        Err(_) => return None,
+    };
     for tag in tagged.tags() {
         // Historical broader detector: check COMMENT tag for a positive
         // pre-emphasis statement. The Phase 2 metadata editor does not call
@@ -90,8 +96,15 @@ pub fn check_pre_flag_tag_evidence(audio_path: &Path) -> Option<PreemphasisEvide
 pub(crate) fn check_pre_flag_tag_disposition(audio_path: &Path) -> PreemphasisTagDisposition {
     use lofty::file::TaggedFileExt;
 
-    let Ok(tagged) = lofty::read_from_path(audio_path) else {
-        return PreemphasisTagDisposition::None;
+    let tagged = match lofty::read_from_path(audio_path) {
+        Ok(tagged) => tagged,
+        Err(_) if crate::tui::probe::is_rf64_metadata_carrier(audio_path) => {
+            match crate::tui::probe::read_rf64_metadata_tags(audio_path) {
+                Ok(tagged) => tagged,
+                Err(_) => return PreemphasisTagDisposition::None,
+            }
+        }
+        Err(_) => return PreemphasisTagDisposition::None,
     };
     preemphasis_tag_disposition_from_tags(tagged.tags())
 }
@@ -1308,6 +1321,26 @@ mod tests {
                 PreemphasisTagDisposition::None,
                 "{value}",
             );
+        }
+    }
+
+    #[test]
+    fn rf64_preemphasis_advisories_match_riff_for_yes_no_and_tagless() {
+        let dir = tempfile::tempdir().expect("temporary WAV fixture directory");
+        for (label, pre, expected) in [
+            ("yes", Some("YES"), PreemphasisTagDisposition::Affirmative),
+            ("no", Some("NO"), PreemphasisTagDisposition::Negative),
+            ("tagless", None, PreemphasisTagDisposition::None),
+        ] {
+            let riff = dir.path().join(format!("{label}-riff.wav"));
+            let rf64 = dir.path().join(format!("{label}-rf64.wav"));
+            crate::tui::probe::write_tagged_wav(&riff, false, None, None, pre);
+            crate::tui::probe::write_tagged_wav(&rf64, true, None, None, pre);
+
+            assert_eq!(check_pre_flag_tag_disposition(&riff), expected, "{label}: RIFF control");
+            assert_eq!(check_pre_flag_tag_disposition(&rf64), expected, "{label}: RF64 read");
+            assert_eq!(check_pre_flag_tag_evidence(&rf64), check_pre_flag_tag_evidence(&riff));
+            assert_eq!(check_tag_evidence(&rf64), check_tag_evidence(&riff));
         }
     }
 
