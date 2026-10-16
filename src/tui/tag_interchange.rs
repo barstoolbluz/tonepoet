@@ -902,13 +902,13 @@ mod tests {
                     embedded_cue: false,
                 },
             ),
-            Some(IndividualFiles),
-            "missing targets are appended in the stable default order",
+            None,
+            "an omitted target cannot become the fallback",
         );
         assert_eq!(
             resolve_aggregate_metadata_target(&[], all),
-            Some(SidecarCue),
-            "an empty configured list normalizes to the stable default order",
+            None,
+            "an explicitly empty target list disables aggregate authority",
         );
         assert_eq!(
             resolve_aggregate_metadata_target(

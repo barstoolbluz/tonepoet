@@ -1,0 +1,521 @@
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -465,16 +465,17 @@
+     ]
+ }
+ 
+-/// Deduplicate a configured order and append any omitted targets stably.
++/// Deduplicate the *explicit* order without re-enabling omitted targets.
++///
++/// A missing TOML key receives the historical default via `serde(default)`;
++/// an explicitly empty list intentionally admits no aggregate write target.
++/// Appending defaults here would silently authorize writes to carriers that
++/// the user expressly excluded.
+ pub fn normalized_aggregate_metadata_target_priority(
+     configured: &[AggregateMetadataTarget],
+ ) -> Vec<AggregateMetadataTarget> {
+-    let mut normalized = Vec::with_capacity(3);
+-    for target in configured
+-        .iter()
+-        .copied()
+-        .chain(default_aggregate_metadata_target_priority())
+-    {
++    let mut normalized = Vec::with_capacity(configured.len().min(3));
++    for target in configured.iter().copied() {
+         if !normalized.contains(&target) {
+             normalized.push(target);
+         }
+@@ -2316,11 +2317,16 @@
+                 IndividualFiles,
+                 EmbeddedCue,
+             ]),
+-            vec![IndividualFiles, EmbeddedCue, SidecarCue],
++            vec![IndividualFiles, EmbeddedCue],
+         );
+         assert_eq!(
+             normalized_aggregate_metadata_target_priority(&[]),
+-            default_aggregate_metadata_target_priority(),
++            Vec::<AggregateMetadataTarget>::new(),
++        );
++        assert_eq!(
++            normalized_aggregate_metadata_target_priority(&[IndividualFiles]),
++            vec![IndividualFiles],
++            "an omitted sidecar/embedded target must stay disabled",
+         );
+ 
+         let serialized = toml::to_string_pretty(&TonepoetConfig::default())
+@@ -2343,6 +2349,18 @@
+             parsed.conversion.aggregate_metadata_target_priority,
+             default_aggregate_metadata_target_priority(),
+         );
++
++        // An explicit exclusion must survive TOML save/load and remain
++        // distinguishable from the historical default for an absent key.
++        for explicit in [vec![IndividualFiles], Vec::new()] {
++            let mut config = TonepoetConfig::default();
++            config.conversion.aggregate_metadata_target_priority = explicit.clone();
++            let serialized = toml::to_string_pretty(&config)
++                .expect("serialize explicit metadata target exclusions");
++            let parsed: TonepoetConfig = toml::from_str(&serialized)
++                .expect("deserialize explicit metadata target exclusions");
++            assert_eq!(parsed.conversion.aggregate_metadata_target_priority, explicit);
++        }
+     }
+ 
+     #[test]
+--- a/src/metadata_authority.rs
++++ b/src/metadata_authority.rs
+@@ -17,8 +17,8 @@
+ }
+ 
+ /// Resolve the first configured target accepted by a caller-supplied viability
+-/// probe. Omitted/duplicate configured entries inherit the normalization rules
+-/// in `config::normalized_aggregate_metadata_target_priority`.
++/// probe. Duplicate entries are ignored; omitted targets are forbidden.
++/// Absence of the setting itself is handled by the config's serde default.
+ pub fn resolve_aggregate_metadata_target_by(
+     priority: &[AggregateMetadataTarget],
+     mut is_viable: impl FnMut(AggregateMetadataTarget) -> bool,
+@@ -26,6 +26,16 @@
+     crate::config::normalized_aggregate_metadata_target_priority(priority)
+         .into_iter()
+         .find(|target| is_viable(*target))
++}
++
++/// Whether a carrier class is explicitly admitted as a metadata-write target.
++/// A missing setting has already been supplied with the legacy defaults by
++/// deserialization; an omitted entry must never become writable by fallback.
++pub fn aggregate_metadata_target_enabled(
++    priority: &[AggregateMetadataTarget],
++    target: AggregateMetadataTarget,
++) -> bool {
++    priority.contains(&target)
+ }
+ 
+ /// Resolve the first viable representation in normalized configured order.
+@@ -69,17 +79,37 @@
+                     embedded_cue: false,
+                 },
+             ),
+-            Some(IndividualFiles),
+-            "missing targets are appended in the stable default order",
++            None,
++            "a disabled representation must never be reinstated as a fallback",
+         );
+         assert_eq!(
+             resolve_aggregate_metadata_target(&[], all),
+-            Some(SidecarCue),
+-            "an empty configured list normalizes to the stable default order",
++            None,
++            "explicitly disabling all aggregate targets is distinct from a missing TOML key",
+         );
+         assert_eq!(
+             resolve_aggregate_metadata_target(&[], AggregateMetadataAvailability::default()),
+             None,
++        );
++    }
++
++    #[test]
++    fn omissions_are_not_write_authorities() {
++        let individual_only = [IndividualFiles, IndividualFiles];
++        assert!(aggregate_metadata_target_enabled(&individual_only, IndividualFiles));
++        assert!(!aggregate_metadata_target_enabled(&individual_only, SidecarCue));
++        assert!(!aggregate_metadata_target_enabled(&individual_only, EmbeddedCue));
++        assert_eq!(
++            resolve_aggregate_metadata_target(
++                &individual_only,
++                AggregateMetadataAvailability {
++                    individual_files: false,
++                    sidecar_cue: true,
++                    embedded_cue: true,
++                },
++            ),
++            None,
++            "a sidecar may be available without being admitted",
+         );
+     }
+ 
+--- a/src/tui/app.rs
++++ b/src/tui/app.rs
+@@ -25230,12 +25230,18 @@
+         let mut state = state_for(capabilities(true, true, false, false));
+         assert!(state.select_row_index(FormatField::HdcdDecode, 1, Some(16), Some(44_100)));
+         state.select_bit_depth(BitDepthChoice::Int16, Some(16));
+-        state.deemphasis_enabled = true;
++        // Real UI precondition: an eligible CD source and an explicit user
++        // de-emphasis choice. Setting only `deemphasis_enabled` bypasses its
++        // provenance and a later constraint pass is allowed to reset it.
++        state.deemphasis_eligible = true;
++        assert!(state.select_row_index(FormatField::Deemphasis, 1, Some(16), Some(44_100)));
++        assert!(state.deemphasis_overridden);
++        assert_eq!(*state.dither.selected_value(), DitherType::TPDF);
+         assert!(state.select_row_index(FormatField::HdcdDecode, 0, Some(16), Some(44_100)));
++        assert!(state.deemphasis_enabled, "HDCD Off cannot override manual de-emphasis On");
+         assert_eq!(*state.dither.selected_value(), DitherType::TPDF,
+             "HDCD Off must not remove independently automatic CD de-emphasis TPDF");
+-        state.deemphasis_enabled = false;
+-        state.apply_auto_dither(Some(16));
++        assert!(state.select_row_index(FormatField::Deemphasis, 0, Some(16), Some(44_100)));
+         assert_eq!(*state.dither.selected_value(), DitherType::None);
+     }
+ 
+--- a/src/tui/keybindings.rs
++++ b/src/tui/keybindings.rs
+@@ -16811,6 +16811,23 @@
+     mode: MetadataAlbumCarrierWriteMode,
+     cue_consent_granted: bool,
+ ) {
++    let target = match mode {
++        MetadataAlbumCarrierWriteMode::SidecarCue => crate::config::AggregateMetadataTarget::SidecarCue,
++        MetadataAlbumCarrierWriteMode::EmbeddedCue => crate::config::AggregateMetadataTarget::EmbeddedCue,
++        MetadataAlbumCarrierWriteMode::Authoritative => {
++            app.set_status("metadata editor: explicit CUE write requires an explicit CUE destination");
++            return;
++        }
++    };
++    if !crate::metadata_authority::aggregate_metadata_target_enabled(
++        &app.config.conversion.aggregate_metadata_target_priority,
++        target,
++    ) {
++        app.set_status(format!(
++            "metadata editor: {target:?} is excluded by aggregate_metadata_target_priority; no carrier was changed"
++        ));
++        return;
++    }
+     if state.read_only {
+         app.set_status("read-only editor — cannot write CUE carriers");
+         return;
+@@ -17252,6 +17269,43 @@
+     if !metadata_editor_has_save_work(state, &forced_deletes_for_save) {
+         app.set_status("No changes to save");
+         return;
++    }
++    // Admit the actual resolved write classes, not just the presence of CUE
++    // paths beside the files. A configured omission remains an exclusion even
++    // if the editor was opened before the configuration changed. Disc-image
++    // metabases have separate explicit destinations, outside this setting.
++    if !metadata_editor_is_bluray_source(state)
++        && !metadata_editor_is_dvdv_source(state)
++        && state.sacd_sidecar_path.is_none()
++    {
++        let surface = state.active_surface();
++        let resolved = if !surface.cue_album_view_sides.is_empty()
++            && !surface.chapter_authoring.projection_only
++        {
++            surface.cue_album_view_sides.iter()
++                .map(|side| side.authoritative_target)
++                .collect::<Vec<_>>()
++        } else if metadata_editor_dedicated_sidecar_authority(state) {
++            vec![crate::config::AggregateMetadataTarget::SidecarCue]
++        } else if matches!(
++            &surface.cue_source,
++            Some(super::app::MetadataCueSource::Embedded(_))
++        ) {
++            vec![crate::config::AggregateMetadataTarget::EmbeddedCue]
++        } else {
++            vec![crate::config::AggregateMetadataTarget::IndividualFiles]
++        };
++        if let Some(excluded) = resolved.into_iter().find(|target| {
++            !crate::metadata_authority::aggregate_metadata_target_enabled(
++                &app.config.conversion.aggregate_metadata_target_priority,
++                *target,
++            )
++        }) {
++            app.set_status(format!(
++                "save aborted: resolved {excluded:?} carrier is excluded by aggregate_metadata_target_priority; no carrier was changed"
++            ));
++            return;
++        }
+     }
+     // Disc-image save: route sidecar-backed editors away from the lofty / per-file path.
+     if metadata_editor_is_bluray_source(state) {
+@@ -17492,6 +17546,17 @@
+         app.set_status(
+             "save aborted: sidecar-authoritative album has no valid CUE writeback plan; no audio file or sidecar was changed",
+         );
++        return;
++    }
++    // Previously this diagnostic was emitted only *after* ordinary file tags
++    // had been written. A preflight failure must abort the entire planned
++    // multi-carrier Save before the first mutation; otherwise its assertion
++    // that no carrier changed is false, and users can observe a partial save.
++    if let Some(reason) = cue_sidecar_writeback
++        .as_ref()
++        .and_then(|plan| plan.preflight_error.as_ref())
++    {
++        app.set_status(reason.clone());
+         return;
+     }
+     let sidecar_only_save = cue_sidecar_writeback
+@@ -17792,13 +17857,11 @@
+                         None
+                     }
+                     Ok(_) => Some(format!(
+-                        "sidecar CUE '{}' no longer describes the open image; image tags were \
+-                         saved but the sidecar was left unchanged",
++                        "save aborted: sidecar CUE '{}' no longer describes the open image; no audio file or sidecar was changed",
+                         cue_path.display()
+                     )),
+                     Err(err) => Some(format!(
+-                        "sidecar CUE '{}' could not be revalidated before save: {}; image tags \
+-                         were saved but the sidecar was left unchanged",
++                        "save aborted: sidecar CUE '{}' could not be revalidated before save: {}; no audio file or sidecar was changed",
+                         cue_path.display(),
+                         err
+                     )),
+@@ -27080,17 +27143,19 @@
+                             metadata_target_priority,
+                             availability,
+                         )
+-                        .unwrap_or(crate::config::AggregateMetadataTarget::IndividualFiles);
+-                    ResolvedAlbumSide {
++                        .ok_or_else(|| format!(
++                            "{operation}: embedded CUE side has no admitted metadata target"
++                        ))?;
++                    Ok(ResolvedAlbumSide {
+                         sidecar_surface: None,
+                         embedded_surface: (read_only_embedded_can_be_authority
+                             || embedded_writable)
+                             .then_some(embedded.clone()),
+                         covered_paths: side_paths,
+                         authoritative_target,
+-                    }
++                    })
+                 })
+-                .collect(),
++                .collect::<Result<Vec<_>, String>>()?,
+             newly_grouped_by_lp,
+             read_only_presentation: representation
+                 == crate::config::AggregateMetadataTarget::EmbeddedCue
+@@ -27104,6 +27169,15 @@
+ 
+     let uncovered = metadata_paths_outside_coverage(paths, &covered);
+     if !uncovered.is_empty() {
++        if !crate::metadata_authority::aggregate_metadata_target_enabled(
++            metadata_target_priority,
++            crate::config::AggregateMetadataTarget::IndividualFiles,
++        ) {
++            return Err(format!(
++                "{operation}: {} uncovered audio carrier(s) require individual-files, which the configured metadata target list excludes",
++                uncovered.len(),
++            ));
++        }
+         groups.push(ResolvedMetadataGroup {
+             order: metadata_group_order(&uncovered, &path_order),
+             representation: crate::config::AggregateMetadataTarget::IndividualFiles,
+@@ -99007,6 +99081,195 @@
+     }
+ 
+     #[tokio::test]
++    async fn r21_omitted_sidecar_is_never_written_during_file_first_composer_save() {
++        let _coordination = crate::concurrency::scoped_test_coordination_root();
++        if !fixture_tool_available("ffmpeg") {
++            eprintln!("skipping: ffmpeg unavailable");
++            return;
++        }
++        use crate::config::AggregateMetadataTarget::{IndividualFiles, SidecarCue};
++        for priority in [vec![IndividualFiles], vec![IndividualFiles, SidecarCue]] {
++            let temp = tempfile::tempdir().expect("tempdir");
++            let fixture = create_presplit_metadata_sidecar_fixture(temp.path(), false);
++            let mut app = open_presplit_metadata_sidecar_fixture(
++                &fixture,
++                temp.path(),
++                priority.clone(),
++            );
++            let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
++            let ActiveOverlay::MetadataEditor(mut state) = overlay else {
++                panic!("file-first folder must open the editor");
++            };
++            assert!(state.active_surface().cue_source.is_none());
++            // A demoted CUE is still a readable source; it must not become
++            // an *authorized write target*. The bytes assertion below is
++            // authoritative for this distinction.
++            let composer_index = state.active_surface().entries.iter()
++                .position(|entry| entry.display_key.eq_ignore_ascii_case("COMPOSER"))
++                .expect("per-file COMPOSER row");
++            assert_eq!(state.active_surface().entries[composer_index].per_file_values.len(), 3);
++            state.active_surface_mut().entries[composer_index].per_file_values[1]
++                .replace_scalar("R21 Distinct Composer".to_string());
++            cue_album_recompute_entry_display(
++                &mut state.active_surface_mut().entries[composer_index]
++            );
++            recalc_dirty(&mut state);
++            let before_cue = std::fs::read(&fixture.cue_path).expect("CUE before Save");
++            let before_files = fixture.file_order_paths.iter()
++                .map(|path| std::fs::read(path).expect("FLAC before Save"))
++                .collect::<Vec<_>>();
++
++            let (_saved, results, status) =
++                save_through_production_path(&mut app, state).await;
++            assert!(results.iter().all(|result| !matches!(
++                &result.outcome,
++                crate::tui::app::MetadataEditorWriteOutcome::Failed { .. }
++                    | crate::tui::app::MetadataEditorWriteOutcome::Skipped { .. }
++                    | crate::tui::app::MetadataEditorWriteOutcome::SidecarCueFailed { .. }
++            )), "Save failed under priority {priority:?}: {results:?}; {status}");
++            assert_eq!(std::fs::read(&fixture.cue_path).expect("CUE after Save"), before_cue,
++                "even an existing CUE must not be rewritten by individual-file authority");
++            for (index, path) in fixture.file_order_paths.iter().enumerate() {
++                let expected = if index == 1 {
++                    "R21 Distinct Composer"
++                } else if index == 0 {
++                    "Composer One"
++                } else {
++                    "Composer Three"
++                };
++                let tags = crate::tui::probe::read_all_tags(path)
++                    .expect("read saved file tags");
++                assert_eq!(tags.iter()
++                    .find(|entry| entry.display_key.eq_ignore_ascii_case("COMPOSER"))
++                    .map(|entry| entry.value.as_str()), Some(expected));
++                if index != 1 {
++                    assert_eq!(std::fs::read(path).expect("untouched FLAC"), before_files[index],
++                        "an unrelated member must not be mutated");
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn r21_direct_sidecar_write_refuses_a_disabled_carrier_without_mutation() {
++        let _coordination = crate::concurrency::isolated_test_coordination_root();
++        if !fixture_tool_available("ffmpeg") {
++            eprintln!("skipping: ffmpeg unavailable");
++            return;
++        }
++        use crate::config::AggregateMetadataTarget::IndividualFiles;
++        let temp = tempfile::tempdir().expect("tempdir");
++        let fixture = create_presplit_metadata_sidecar_fixture(temp.path(), false);
++        let mut app = open_presplit_metadata_sidecar_fixture(
++            &fixture, temp.path(), vec![IndividualFiles],
++        );
++        let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
++        let ActiveOverlay::MetadataEditor(mut state) = overlay else {
++            panic!("editor expected");
++        };
++        let before_cue = std::fs::read(&fixture.cue_path).expect("CUE before attempt");
++        let before_files = fixture.file_order_paths.iter()
++            .map(|path| std::fs::read(path).expect("FLAC before attempt"))
++            .collect::<Vec<_>>();
++        let (tx, _rx) = tokio::sync::mpsc::channel(16);
++        metadata_editor_write_tags_to_cue_carrier(
++            &mut app, &mut state, &tx,
++            MetadataAlbumCarrierWriteMode::SidecarCue, false,
++        );
++        let status = app.status_message.as_ref()
++            .map(|(text, _)| text.as_str()).unwrap_or("");
++        assert!(status.contains("excluded by aggregate_metadata_target_priority"),
++            "omission must refuse a direct CUE write: {status}");
++        assert_eq!(std::fs::read(&fixture.cue_path).expect("CUE after attempt"), before_cue);
++        for (path, expected) in fixture.file_order_paths.iter().zip(before_files.iter()) {
++            assert_eq!(&std::fs::read(path).expect("FLAC after refusal"), expected);
++        }
++    }
++
++    #[test]
++    fn r21_sidecar_preflight_refusal_never_writes_file_tags_first() {
++        let _coordination = crate::concurrency::isolated_test_coordination_root();
++        if !fixture_tool_available("ffmpeg") {
++            eprintln!("skipping: ffmpeg unavailable");
++            return;
++        }
++        use crate::config::AggregateMetadataTarget::{SidecarCue, IndividualFiles};
++        let temp = tempfile::tempdir().expect("tempdir");
++        let fixture = create_presplit_metadata_sidecar_fixture(temp.path(), false);
++        let mut app = open_presplit_metadata_sidecar_fixture(
++            &fixture, temp.path(), vec![SidecarCue, IndividualFiles],
++        );
++        let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
++        let ActiveOverlay::MetadataEditor(mut state) = overlay else {
++            panic!("sidecar-authoritative editor expected");
++        };
++        let composer_index = state.active_surface().entries.iter()
++            .position(|entry| entry.display_key.eq_ignore_ascii_case("COMPOSER"))
++            .expect("COMPOSER row");
++        // Build the same supported file-owned COMPOSER diff as the existing
++        // `presplit_metadata_sidecar_keeps_non_cue_track_fields_file_authoritative`
++        // integration test. One FLAC would actually be written if we reached
++        // the old preflight-after-write ordering.
++        {
++            let composer = &mut state.active_surface_mut().entries[composer_index];
++            composer.row_scope = crate::tui::probe::RowScope::Track;
++            composer.per_file_values = crate::tui::probe::metadata_field_values_from_scalars(vec![
++                "Composer Two".to_string(),
++                "Composer One".to_string(),
++                "Composer Three".to_string(),
++            ]);
++            composer.per_file_originals = composer.per_file_values.clone();
++            composer.per_file_stored_value_counts = vec![1, 1, 1];
++            composer.per_file_values[0].replace_scalar("Rejected Mutation".to_string());
++            cue_album_recompute_entry_display(composer);
++        }
++        recalc_dirty(&mut state);
++        assert_eq!(
++            metadata_editor_audio_paths_requiring_save(&state),
++            vec![fixture.file_order_paths[1].clone()],
++            "preflight regression requires a real pending FLAC modification",
++        );
++        let files_before = fixture.file_order_paths.iter()
++            .map(|path| std::fs::read(path).expect("original FLAC"))
++            .collect::<Vec<_>>();
++        // Make the admitted sidecar disappear after opening the editor; the
++        // production planner must refuse the entire save before any member
++        // writes, rather than reporting a failed sidecar after writing FLAC.
++        std::fs::remove_file(&fixture.cue_path).expect("remove sidecar before Save");
++        let planned = cue_sidecar_writeback_plan_for_state(&state)
++            .expect("sidecar-authoritative state must retain a writeback plan");
++        assert!(planned.preflight_error.is_some(),
++            "the deleted sidecar must be refused at preflight");
++        let (tx, _rx) = tokio::sync::mpsc::channel(16);
++        metadata_editor_save(&mut app, &mut state, &tx);
++        let status = app.status_message.as_ref()
++            .map(|(text, _)| text.as_str()).unwrap_or("");
++        assert!(status.contains("no audio file or sidecar was changed"),
++            "preflight status must state the actual no-write guarantee: {status}");
++        for (path, expected) in fixture.file_order_paths.iter().zip(files_before.iter()) {
++            assert_eq!(&std::fs::read(path).expect("FLAC after refusal"), expected);
++        }
++    }
++
++    #[test]
++    fn r21_uncovered_transfer_files_cannot_use_omitted_individual_target() {
++        let _coordination = crate::concurrency::isolated_test_coordination_root();
++        if !fixture_tool_available("ffmpeg") {
++            eprintln!("skipping: ffmpeg unavailable");
++            return;
++        }
++        use crate::config::AggregateMetadataTarget::SidecarCue;
++        let temp = tempfile::tempdir().expect("tempdir");
++        let fixture = create_presplit_metadata_sidecar_fixture(temp.path(), true);
++        let cancel = crate::tui::probe::MetadataWriteCancelFlag::new();
++        let error = classify_tag_transfer_roots(
++            std::slice::from_ref(&fixture.album),
++            &[SidecarCue], &cancel,
++        ).expect_err("the uncovered file must not fall back to disabled file tags");
++        assert!(error.contains("individual-files"), "unexpected authority refusal: {error}");
++    }
++
++    #[tokio::test]
+     async fn presplit_metadata_sidecar_keeps_non_cue_track_fields_file_authoritative() {
+         let _coordination = crate::concurrency::scoped_test_coordination_root();
+         if !fixture_tool_available("ffmpeg") {
+--- a/src/tui/tag_interchange.rs
++++ b/src/tui/tag_interchange.rs
+@@ -902,13 +902,13 @@
+                     embedded_cue: false,
+                 },
+             ),
+-            Some(IndividualFiles),
+-            "missing targets are appended in the stable default order",
++            None,
++            "an omitted target cannot become the fallback",
+         );
+         assert_eq!(
+             resolve_aggregate_metadata_target(&[], all),
+-            Some(SidecarCue),
+-            "an empty configured list normalizes to the stable default order",
++            None,
++            "an explicitly empty target list disables aggregate authority",
+         );
+         assert_eq!(
+             resolve_aggregate_metadata_target(

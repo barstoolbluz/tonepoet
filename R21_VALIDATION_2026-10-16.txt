@@ -1,0 +1,46 @@
+TonePoet R21 corrective — verification record, 2026-10-16
+===========================================================
+Input repository archive SHA-256:
+  358c1a51f2e54bc104f07c1d876dd25cdd0430c8578e1afd56dbce9db1012cb1
+
+Baseline (before any corrective edits)
+  SHA256SUMS: FAIL for exactly 2 files:
+    CLAUDE.md
+    src/tui/rf64_metadata.rs
+  Both are unmodified in the delivered corrective snapshot.
+  Original RF64 read_tags() has the io::Error / LoftyError calls split into
+  separate statements (the compile failure described in the brief was
+  already corrected in the supplied baseline).
+
+Corrective scope
+  Exactly 5 pre-existing source files modified:
+    src/config.rs
+    src/metadata_authority.rs
+    src/tui/app.rs
+    src/tui/keybindings.rs
+    src/tui/tag_interchange.rs
+  24/24 REFERENCE_COMMON_SOURCE_PATHS: byte-for-byte unchanged from baseline.
+  SACD source, Cargo.lock and qualification assets: unchanged.
+  R21_FOCUSED_SOURCE_DIFF.patch applies to the supplied baseline and
+  reproduces all 5 source files byte-for-byte: PASS.
+  Target-omission, direct save, preflight ordering, and new test markers:
+    STATIC PRESENCE/ORDER CHECK PASS (not runtime behavioral validation).
+
+Runtime/toolchain availability
+  Rust compiler: NOT AVAILABLE
+  Cargo: NOT AVAILABLE
+  rustfmt: NOT AVAILABLE
+  static.rust-lang.org: DNS UNAVAILABLE
+  Rust compilation: NOT RUN
+  Rust tests (new and existing): NOT RUN
+  Full workspace gate / performance / Reference freshness: NOT RUN
+  End-to-end real FLAC+CUE saves: NOT RUN
+  No evidence of new Rust compilation or Rust test pass is asserted.
+
+Package verification
+  Delivered repository SHA256SUMS: REGENERATED against actual delivered files;
+    sha256sum -c SHA256SUMS: PASS (rechecked before archive creation).
+  Complete source-tree archive: created and extraction/inventory checked.
+
+The corrected tree is a code handoff candidate; build-host acceptance remains
+pending the Rust test commands in R21_RESUME_CHECKPOINT_2026-10-16.md.

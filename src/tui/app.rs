@@ -11085,6 +11085,13 @@ pub struct PresentationTab {
     /// browsing remain I/O-free; the first explicit save materializes
     /// `cue_source` with create-only semantics.
     pub pending_sidecar_cue_creation: bool,
+    /// Save-time snapshot of the configured `individual-files` target. The
+    /// active surface refreshes this immediately before each Save. Both CUE
+    /// ownership planning and its asynchronous completion reducer consume the
+    /// same permission, rather than inferring authorization from taggability.
+    /// Legacy direct-model callers default to the existing dual-authority
+    /// behavior; this is never a replacement for the live configuration.
+    pub native_file_tags_authorized_for_save: bool,
     /// Unified multi-surface CUE state. Used by grouped sidecar albums and by
     /// selected sets of independent embedded-CUE carriers.
     pub cue_album_synthetic_sheet: Option<CueAlbumSyntheticSheet>,
@@ -11140,6 +11147,7 @@ impl Default for PresentationTab {
             pending_embedded_cuesheet_delete: false,
             cue_source: None,
             pending_sidecar_cue_creation: false,
+            native_file_tags_authorized_for_save: true,
             cue_album_synthetic_sheet: None,
             cue_album_view_sides: Vec::new(),
             per_carrier_embedded_cuesheets: false,
@@ -11227,6 +11235,7 @@ impl PresentationTab {
         tab.pending_embedded_cuesheet_delete = active.pending_embedded_cuesheet_delete;
         tab.cue_source = active.cue_source.clone();
         tab.pending_sidecar_cue_creation = active.pending_sidecar_cue_creation;
+        tab.native_file_tags_authorized_for_save = active.native_file_tags_authorized_for_save;
         tab.cue_album_synthetic_sheet = active.cue_album_synthetic_sheet.clone();
         tab.cue_album_view_sides = active.cue_album_view_sides.clone();
         tab.per_carrier_embedded_cuesheets = active.per_carrier_embedded_cuesheets;
@@ -13145,7 +13154,10 @@ fn cue_sidecar_user_metadata_contains_key(
 }
 
 fn taggable_metadata_sidecar_dual_authority_for_reduction(tab: &PresentationTab) -> bool {
-    if tab.paths.len() <= 1 || !dedicated_cue_sidecar_authority(tab) {
+    if !tab.native_file_tags_authorized_for_save
+        || tab.paths.len() <= 1
+        || !dedicated_cue_sidecar_authority(tab)
+    {
         return false;
     }
     let Some(sheet) = tab.cue_album_synthetic_sheet.as_ref() else {
@@ -25230,12 +25242,18 @@ mod hdcd_format_policy_tests {
         let mut state = state_for(capabilities(true, true, false, false));
         assert!(state.select_row_index(FormatField::HdcdDecode, 1, Some(16), Some(44_100)));
         state.select_bit_depth(BitDepthChoice::Int16, Some(16));
-        state.deemphasis_enabled = true;
+        // Real UI precondition: an eligible CD source and an explicit user
+        // de-emphasis choice. Setting only `deemphasis_enabled` bypasses its
+        // provenance and a later constraint pass is allowed to reset it.
+        state.deemphasis_eligible = true;
+        assert!(state.select_row_index(FormatField::Deemphasis, 1, Some(16), Some(44_100)));
+        assert!(state.deemphasis_overridden);
+        assert_eq!(*state.dither.selected_value(), DitherType::TPDF);
         assert!(state.select_row_index(FormatField::HdcdDecode, 0, Some(16), Some(44_100)));
+        assert!(state.deemphasis_enabled, "HDCD Off cannot override manual de-emphasis On");
         assert_eq!(*state.dither.selected_value(), DitherType::TPDF,
             "HDCD Off must not remove independently automatic CD de-emphasis TPDF");
-        state.deemphasis_enabled = false;
-        state.apply_auto_dither(Some(16));
+        assert!(state.select_row_index(FormatField::Deemphasis, 0, Some(16), Some(44_100)));
         assert_eq!(*state.dither.selected_value(), DitherType::None);
     }
 

@@ -1,0 +1,37 @@
+R21C DEDICATED-SIDECAR AUTHORITY CORRECTIVE - VALIDATION RECORD
+Date: 2026-10-16
+Baseline SHA-256: a575d77b1f27cb571c1f1e6b01ad6faafff693f8e2b5b9a0940af817254afbbb
+
+SOURCE SCOPE / PROVENANCE
+Unchanged baseline non-manifest files: 1028/1030
+Changed pre-existing files: src/tui/app.rs, src/tui/keybindings.rs
+New checkpoint and validation receipt: R21C_RESUME_CHECKPOINT_2026-10-16.md, R21C_VALIDATION_2026-10-16.txt
+Other baseline contents (Cargo.lock, RF64, R21 HDCD fix, other docs): byte-identical: PASS
+
+REFERENCE COMMON SOURCE CLOSURE
+24/24 Reference source-lock paths unchanged from R21: PASS
+Cargo.lock unchanged: PASS
+
+FOCUSED SOURCE AUDIT
+save-time authorization read from configured target list: STATIC PASS
+file-scoped CUE owner depends on authorized IndividualFiles: STATIC PASS
+dedicated-sidecar only native-dispatch guard: STATIC PASS
+secondary-write guard executes before async spawn: STATIC PASS
+completion reducer uses same authorization: STATIC PASS
+direct-model legacy default preserved: STATIC PASS
+end-to-end sidecar-only regression present: STATIC PASS
+sidecar-only test verifies byte identity and CUE roundtrip: STATIC PASS
+existing dual-authority regression retained: STATIC PASS
+
+BUILD / TEST LIMITATIONS
+No rustc, cargo, rustfmt, or nix available in delivery runtime.
+Rust compilation: NOT RUN
+Rust tests, including r21c_ and existing regressions: NOT RUN
+Workspace gate/benchmarks/Reference freshness execution: NOT RUN
+Cannot assert new source builds or tests pass; build-host acceptance REQUIRED.
+
+PATCH
+Unified source patch replays with patch -p1 --fuzz=0 and reproduces both source files byte-for-byte: PASS
+
+SHA256SUMS / PACKAGE
+Regenerated SHA256SUMS inventory: checked locally (clean extraction separately verified in package receipt).

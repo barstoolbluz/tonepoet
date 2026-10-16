@@ -465,16 +465,17 @@ pub fn default_aggregate_metadata_target_priority() -> Vec<AggregateMetadataTarg
     ]
 }
 
-/// Deduplicate a configured order and append any omitted targets stably.
+/// Deduplicate the *explicit* order without re-enabling omitted targets.
+///
+/// A missing TOML key receives the historical default via `serde(default)`;
+/// an explicitly empty list intentionally admits no aggregate write target.
+/// Appending defaults here would silently authorize writes to carriers that
+/// the user expressly excluded.
 pub fn normalized_aggregate_metadata_target_priority(
     configured: &[AggregateMetadataTarget],
 ) -> Vec<AggregateMetadataTarget> {
-    let mut normalized = Vec::with_capacity(3);
-    for target in configured
-        .iter()
-        .copied()
-        .chain(default_aggregate_metadata_target_priority())
-    {
+    let mut normalized = Vec::with_capacity(configured.len().min(3));
+    for target in configured.iter().copied() {
         if !normalized.contains(&target) {
             normalized.push(target);
         }
@@ -2316,11 +2317,16 @@ mod theme_config_tests {
                 IndividualFiles,
                 EmbeddedCue,
             ]),
-            vec![IndividualFiles, EmbeddedCue, SidecarCue],
+            vec![IndividualFiles, EmbeddedCue],
         );
         assert_eq!(
             normalized_aggregate_metadata_target_priority(&[]),
-            default_aggregate_metadata_target_priority(),
+            Vec::<AggregateMetadataTarget>::new(),
+        );
+        assert_eq!(
+            normalized_aggregate_metadata_target_priority(&[IndividualFiles]),
+            vec![IndividualFiles],
+            "an omitted sidecar/embedded target must stay disabled",
         );
 
         let serialized = toml::to_string_pretty(&TonepoetConfig::default())
@@ -2343,6 +2349,18 @@ mod theme_config_tests {
             parsed.conversion.aggregate_metadata_target_priority,
             default_aggregate_metadata_target_priority(),
         );
+
+        // An explicit exclusion must survive TOML save/load and remain
+        // distinguishable from the historical default for an absent key.
+        for explicit in [vec![IndividualFiles], Vec::new()] {
+            let mut config = TonepoetConfig::default();
+            config.conversion.aggregate_metadata_target_priority = explicit.clone();
+            let serialized = toml::to_string_pretty(&config)
+                .expect("serialize explicit metadata target exclusions");
+            let parsed: TonepoetConfig = toml::from_str(&serialized)
+                .expect("deserialize explicit metadata target exclusions");
+            assert_eq!(parsed.conversion.aggregate_metadata_target_priority, explicit);
+        }
     }
 
     #[test]

@@ -17,8 +17,8 @@ pub struct AggregateMetadataAvailability {
 }
 
 /// Resolve the first configured target accepted by a caller-supplied viability
-/// probe. Omitted/duplicate configured entries inherit the normalization rules
-/// in `config::normalized_aggregate_metadata_target_priority`.
+/// probe. Duplicate entries are ignored; omitted targets are forbidden.
+/// Absence of the setting itself is handled by the config's serde default.
 pub fn resolve_aggregate_metadata_target_by(
     priority: &[AggregateMetadataTarget],
     mut is_viable: impl FnMut(AggregateMetadataTarget) -> bool,
@@ -26,6 +26,16 @@ pub fn resolve_aggregate_metadata_target_by(
     crate::config::normalized_aggregate_metadata_target_priority(priority)
         .into_iter()
         .find(|target| is_viable(*target))
+}
+
+/// Whether a carrier class is explicitly admitted as a metadata-write target.
+/// A missing setting has already been supplied with the legacy defaults by
+/// deserialization; an omitted entry must never become writable by fallback.
+pub fn aggregate_metadata_target_enabled(
+    priority: &[AggregateMetadataTarget],
+    target: AggregateMetadataTarget,
+) -> bool {
+    priority.contains(&target)
 }
 
 /// Resolve the first viable representation in normalized configured order.
@@ -69,17 +79,37 @@ mod tests {
                     embedded_cue: false,
                 },
             ),
-            Some(IndividualFiles),
-            "missing targets are appended in the stable default order",
+            None,
+            "a disabled representation must never be reinstated as a fallback",
         );
         assert_eq!(
             resolve_aggregate_metadata_target(&[], all),
-            Some(SidecarCue),
-            "an empty configured list normalizes to the stable default order",
+            None,
+            "explicitly disabling all aggregate targets is distinct from a missing TOML key",
         );
         assert_eq!(
             resolve_aggregate_metadata_target(&[], AggregateMetadataAvailability::default()),
             None,
+        );
+    }
+
+    #[test]
+    fn omissions_are_not_write_authorities() {
+        let individual_only = [IndividualFiles, IndividualFiles];
+        assert!(aggregate_metadata_target_enabled(&individual_only, IndividualFiles));
+        assert!(!aggregate_metadata_target_enabled(&individual_only, SidecarCue));
+        assert!(!aggregate_metadata_target_enabled(&individual_only, EmbeddedCue));
+        assert_eq!(
+            resolve_aggregate_metadata_target(
+                &individual_only,
+                AggregateMetadataAvailability {
+                    individual_files: false,
+                    sidecar_cue: true,
+                    embedded_cue: true,
+                },
+            ),
+            None,
+            "a sidecar may be available without being admitted",
         );
     }
 

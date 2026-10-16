@@ -14580,7 +14580,8 @@ fn metadata_editor_cue_sidecar_representable_entry(
 fn metadata_editor_taggable_metadata_sidecar_dual_authority(
     state: &super::app::MetadataEditorState,
 ) -> bool {
-    metadata_editor_native_multi_file_metadata_sidecar_authority(state)
+    state.active_surface().native_file_tags_authorized_for_save
+        && metadata_editor_native_multi_file_metadata_sidecar_authority(state)
         && !metadata_editor_untaggable_sidecar_authority(state)
 }
 
@@ -14767,8 +14768,8 @@ fn metadata_editor_dedicated_sidecar_structural_error(
 
 /// Changed/deleted fields a dedicated sidecar-authoritative CUE save cannot
 /// persist into the CUE representation.
-/// Empty when the surface is exempt (dual-authority metadata sidecars) or not
-/// sidecar-authoritative at all.
+/// Empty when the surface has a configured dual-authority native file target,
+/// or when it is not sidecar-authoritative at all.
 fn metadata_editor_dedicated_sidecar_unsupported_fields(
     state: &super::app::MetadataEditorState,
 ) -> std::collections::BTreeSet<String> {
@@ -14779,9 +14780,7 @@ fn metadata_editor_dedicated_sidecar_unsupported_fields(
     // edits update the selected sidecar, while ordinary fields remain writable
     // through the member files. The CUE-specific structural checks still
     // apply, but the image-sidecar restriction to CUE-representable fields does not.
-    if metadata_editor_native_multi_file_metadata_sidecar_authority(state)
-        && !metadata_editor_untaggable_sidecar_authority(state)
-    {
+    if metadata_editor_taggable_metadata_sidecar_dual_authority(state) {
         return std::collections::BTreeSet::new();
     }
     let surface = state.active_surface();
@@ -14795,7 +14794,9 @@ fn metadata_editor_dedicated_sidecar_unsupported_fields(
                 || entry.per_file_values != entry.per_file_originals
                 || entry.value != entry.original
         })
-        .filter(|(_, entry)| !metadata_editor_cue_sidecar_representable_entry(state, entry))
+        .filter(|(_, entry)| {
+            entry.is_binary || !metadata_editor_cue_sidecar_representable_entry(state, entry)
+        })
         .map(|(_, entry)| entry.display_key.clone())
         .collect()
 }
@@ -16811,6 +16812,23 @@ fn metadata_editor_write_tags_to_cue_carrier(
     mode: MetadataAlbumCarrierWriteMode,
     cue_consent_granted: bool,
 ) {
+    let target = match mode {
+        MetadataAlbumCarrierWriteMode::SidecarCue => crate::config::AggregateMetadataTarget::SidecarCue,
+        MetadataAlbumCarrierWriteMode::EmbeddedCue => crate::config::AggregateMetadataTarget::EmbeddedCue,
+        MetadataAlbumCarrierWriteMode::Authoritative => {
+            app.set_status("metadata editor: explicit CUE write requires an explicit CUE destination");
+            return;
+        }
+    };
+    if !crate::metadata_authority::aggregate_metadata_target_enabled(
+        &app.config.conversion.aggregate_metadata_target_priority,
+        target,
+    ) {
+        app.set_status(format!(
+            "metadata editor: {target:?} is excluded by aggregate_metadata_target_priority; no carrier was changed"
+        ));
+        return;
+    }
     if state.read_only {
         app.set_status("read-only editor — cannot write CUE carriers");
         return;
@@ -17194,8 +17212,8 @@ fn metadata_editor_start_automatic_lone_image_cue_materialization(
 /// + per-track-edit overrides) before snapshotting; refuses save on a
 /// dirty per-track entry without a CUESHEET anchor. CUE-representable rows
 /// owned by a selected dedicated sidecar persist through the sidecar writer;
-/// one-track-per-file metadata sidecars retain their existing dual-authority
-/// member-file path for ordinary non-CUE fields.
+/// one-track-per-file metadata sidecars retain dual-authority member-file
+/// writes only when `individual-files` is an explicitly admitted target.
 pub(super) fn metadata_editor_save(
     app: &mut AppState,
     state: &mut super::app::MetadataEditorState,
@@ -17225,6 +17243,15 @@ fn metadata_editor_save_with_cue_consent(
         return;
     }
     state.begin_source_save_batch_if_needed();
+    // Authority is established by the live configured target list for every
+    // Save, including subsequent saves after a source-tab switch or config
+    // reload. Keep this permission with the active surface so the completion
+    // reducer agrees with the ownership used by the worker snapshot.
+    state.active_surface_mut().native_file_tags_authorized_for_save =
+        crate::metadata_authority::aggregate_metadata_target_enabled(
+            &app.config.conversion.aggregate_metadata_target_priority,
+            crate::config::AggregateMetadataTarget::IndividualFiles,
+        );
     let has_unsaved_chapter_structure = if state.source_selector_presentations {
         state.active_surface().chapter_authoring.dirty
             || metadata_editor_chapter_projection_owned_rows_dirty(state.active_surface())
@@ -17252,6 +17279,43 @@ fn metadata_editor_save_with_cue_consent(
     if !metadata_editor_has_save_work(state, &forced_deletes_for_save) {
         app.set_status("No changes to save");
         return;
+    }
+    // Admit the actual resolved write classes, not just the presence of CUE
+    // paths beside the files. A configured omission remains an exclusion even
+    // if the editor was opened before the configuration changed. Disc-image
+    // metabases have separate explicit destinations, outside this setting.
+    if !metadata_editor_is_bluray_source(state)
+        && !metadata_editor_is_dvdv_source(state)
+        && state.sacd_sidecar_path.is_none()
+    {
+        let surface = state.active_surface();
+        let resolved = if !surface.cue_album_view_sides.is_empty()
+            && !surface.chapter_authoring.projection_only
+        {
+            surface.cue_album_view_sides.iter()
+                .map(|side| side.authoritative_target)
+                .collect::<Vec<_>>()
+        } else if metadata_editor_dedicated_sidecar_authority(state) {
+            vec![crate::config::AggregateMetadataTarget::SidecarCue]
+        } else if matches!(
+            &surface.cue_source,
+            Some(super::app::MetadataCueSource::Embedded(_))
+        ) {
+            vec![crate::config::AggregateMetadataTarget::EmbeddedCue]
+        } else {
+            vec![crate::config::AggregateMetadataTarget::IndividualFiles]
+        };
+        if let Some(excluded) = resolved.into_iter().find(|target| {
+            !crate::metadata_authority::aggregate_metadata_target_enabled(
+                &app.config.conversion.aggregate_metadata_target_priority,
+                *target,
+            )
+        }) {
+            app.set_status(format!(
+                "save aborted: resolved {excluded:?} carrier is excluded by aggregate_metadata_target_priority; no carrier was changed"
+            ));
+            return;
+        }
     }
     // Disc-image save: route sidecar-backed editors away from the lofty / per-file path.
     if metadata_editor_is_bluray_source(state) {
@@ -17416,7 +17480,12 @@ fn metadata_editor_save_with_cue_consent(
     let sidecar_unsupported = metadata_editor_dedicated_sidecar_unsupported_fields(state);
     let mut sidecar_warning = None;
     if !sidecar_unsupported.is_empty() {
-        if app.config.metadata.sidecar_save_with_warnings {
+        if app.config.metadata.sidecar_save_with_warnings
+            && state.active_surface().native_file_tags_authorized_for_save
+        {
+            // The opt-in warning/revert path is retained for a dual-authority
+            // save. With SidecarCue alone configured, an unrepresentable edit
+            // has no permitted fallback carrier and must refuse before writes.
             // Opt-in ([metadata] sidecar_save_with_warnings): persist every
             // CUE-representable field, revert the rest VISIBLY (values return
             // to their originals in the grid), and continue the save.
@@ -17494,9 +17563,46 @@ fn metadata_editor_save_with_cue_consent(
         );
         return;
     }
+    // Previously this diagnostic was emitted only *after* ordinary file tags
+    // had been written. A preflight failure must abort the entire planned
+    // multi-carrier Save before the first mutation; otherwise its assertion
+    // that no carrier changed is false, and users can observe a partial save.
+    if let Some(reason) = cue_sidecar_writeback
+        .as_ref()
+        .and_then(|plan| plan.preflight_error.as_ref())
+    {
+        app.set_status(reason.clone());
+        return;
+    }
+    // Sidecar admission alone does not admit secondary native writes. All
+    // write paths, including native-origin rows, deletion markers, and forced
+    // tag cleanup, must be authorized before dispatching the first mutation.
+    if metadata_editor_dedicated_sidecar_authority(state)
+        && !state.active_surface().native_file_tags_authorized_for_save
+    {
+        let pending_native = metadata_editor_audio_paths_requiring_save(state);
+        if !pending_native.is_empty() || !forced_deletes_for_save.is_empty() {
+            app.set_status(format!(
+                "save aborted: individual-files is excluded by aggregate_metadata_target_priority, but {} native audio file write(s) remain; no audio file or sidecar was changed",
+                pending_native.len().max(forced_deletes_for_save.len()),
+            ));
+            return;
+        }
+    }
     let sidecar_only_save = cue_sidecar_writeback
         .as_ref()
         .is_some_and(|plan| plan.sidecar_only);
+    // A remaining file writer on a sidecar-only save is a planner defect,
+    // not a reason to override the user's configured destination policy.
+    if metadata_editor_dedicated_sidecar_authority(state)
+        && !state.active_surface().native_file_tags_authorized_for_save
+        && !sidecar_only_save
+    {
+        app.set_status(
+            "save aborted: native file writes are excluded by aggregate_metadata_target_priority; no audio file or sidecar was changed",
+        );
+        return;
+    }
     state.phase = super::app::MetadataEditorPhase::Saving;
     let (session_id, save_generation, cancel) = state.begin_cancellable_write();
     let paths = metadata_editor_audio_save_paths(state).to_vec();
@@ -17792,13 +17898,11 @@ fn cue_sidecar_writeback_plan_for_state(
                         None
                     }
                     Ok(_) => Some(format!(
-                        "sidecar CUE '{}' no longer describes the open image; image tags were \
-                         saved but the sidecar was left unchanged",
+                        "save aborted: sidecar CUE '{}' no longer describes the open image; no audio file or sidecar was changed",
                         cue_path.display()
                     )),
                     Err(err) => Some(format!(
-                        "sidecar CUE '{}' could not be revalidated before save: {}; image tags \
-                         were saved but the sidecar was left unchanged",
+                        "save aborted: sidecar CUE '{}' could not be revalidated before save: {}; no audio file or sidecar was changed",
                         cue_path.display(),
                         err
                     )),
@@ -27080,17 +27184,19 @@ where
                             metadata_target_priority,
                             availability,
                         )
-                        .unwrap_or(crate::config::AggregateMetadataTarget::IndividualFiles);
-                    ResolvedAlbumSide {
+                        .ok_or_else(|| format!(
+                            "{operation}: embedded CUE side has no admitted metadata target"
+                        ))?;
+                    Ok(ResolvedAlbumSide {
                         sidecar_surface: None,
                         embedded_surface: (read_only_embedded_can_be_authority
                             || embedded_writable)
                             .then_some(embedded.clone()),
                         covered_paths: side_paths,
                         authoritative_target,
-                    }
+                    })
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, String>>()?,
             newly_grouped_by_lp,
             read_only_presentation: representation
                 == crate::config::AggregateMetadataTarget::EmbeddedCue
@@ -27104,6 +27210,15 @@ where
 
     let uncovered = metadata_paths_outside_coverage(paths, &covered);
     if !uncovered.is_empty() {
+        if !crate::metadata_authority::aggregate_metadata_target_enabled(
+            metadata_target_priority,
+            crate::config::AggregateMetadataTarget::IndividualFiles,
+        ) {
+            return Err(format!(
+                "{operation}: {} uncovered audio carrier(s) require individual-files, which the configured metadata target list excludes",
+                uncovered.len(),
+            ));
+        }
         groups.push(ResolvedMetadataGroup {
             order: metadata_group_order(&uncovered, &path_order),
             representation: crate::config::AggregateMetadataTarget::IndividualFiles,
@@ -99003,6 +99118,335 @@ mod metadata_cue_source_coverage_tests {
                 "Bonus File".to_string(),
             ],
             "an all-files outcome must remain one ordinary carrier rather than an aggregate"
+        );
+    }
+
+    #[tokio::test]
+    async fn r21_omitted_sidecar_is_never_written_during_file_first_composer_save() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        use crate::config::AggregateMetadataTarget::{IndividualFiles, SidecarCue};
+        for priority in [vec![IndividualFiles], vec![IndividualFiles, SidecarCue]] {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let fixture = create_presplit_metadata_sidecar_fixture(temp.path(), false);
+            let mut app = open_presplit_metadata_sidecar_fixture(
+                &fixture,
+                temp.path(),
+                priority.clone(),
+            );
+            let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+            let ActiveOverlay::MetadataEditor(mut state) = overlay else {
+                panic!("file-first folder must open the editor");
+            };
+            assert!(state.active_surface().cue_source.is_none());
+            // A demoted CUE is still a readable source; it must not become
+            // an *authorized write target*. The bytes assertion below is
+            // authoritative for this distinction.
+            let composer_index = state.active_surface().entries.iter()
+                .position(|entry| entry.display_key.eq_ignore_ascii_case("COMPOSER"))
+                .expect("per-file COMPOSER row");
+            assert_eq!(state.active_surface().entries[composer_index].per_file_values.len(), 3);
+            state.active_surface_mut().entries[composer_index].per_file_values[1]
+                .replace_scalar("R21 Distinct Composer".to_string());
+            cue_album_recompute_entry_display(
+                &mut state.active_surface_mut().entries[composer_index]
+            );
+            recalc_dirty(&mut state);
+            let before_cue = std::fs::read(&fixture.cue_path).expect("CUE before Save");
+            let before_files = fixture.file_order_paths.iter()
+                .map(|path| std::fs::read(path).expect("FLAC before Save"))
+                .collect::<Vec<_>>();
+
+            let (_saved, results, status) =
+                save_through_production_path(&mut app, state).await;
+            assert!(results.iter().all(|result| !matches!(
+                &result.outcome,
+                crate::tui::app::MetadataEditorWriteOutcome::Failed { .. }
+                    | crate::tui::app::MetadataEditorWriteOutcome::Skipped { .. }
+                    | crate::tui::app::MetadataEditorWriteOutcome::SidecarCueFailed { .. }
+            )), "Save failed under priority {priority:?}: {results:?}; {status}");
+            assert_eq!(std::fs::read(&fixture.cue_path).expect("CUE after Save"), before_cue,
+                "even an existing CUE must not be rewritten by individual-file authority");
+            for (index, path) in fixture.file_order_paths.iter().enumerate() {
+                let expected = if index == 1 {
+                    "R21 Distinct Composer"
+                } else if index == 0 {
+                    "Composer One"
+                } else {
+                    "Composer Three"
+                };
+                let tags = crate::tui::probe::read_all_tags(path)
+                    .expect("read saved file tags");
+                assert_eq!(tags.iter()
+                    .find(|entry| entry.display_key.eq_ignore_ascii_case("COMPOSER"))
+                    .map(|entry| entry.value.as_str()), Some(expected));
+                if index != 1 {
+                    assert_eq!(std::fs::read(path).expect("untouched FLAC"), before_files[index],
+                        "an unrelated member must not be mutated");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn r21_direct_sidecar_write_refuses_a_disabled_carrier_without_mutation() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        use crate::config::AggregateMetadataTarget::IndividualFiles;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let fixture = create_presplit_metadata_sidecar_fixture(temp.path(), false);
+        let mut app = open_presplit_metadata_sidecar_fixture(
+            &fixture, temp.path(), vec![IndividualFiles],
+        );
+        let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+        let ActiveOverlay::MetadataEditor(mut state) = overlay else {
+            panic!("editor expected");
+        };
+        let before_cue = std::fs::read(&fixture.cue_path).expect("CUE before attempt");
+        let before_files = fixture.file_order_paths.iter()
+            .map(|path| std::fs::read(path).expect("FLAC before attempt"))
+            .collect::<Vec<_>>();
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        metadata_editor_write_tags_to_cue_carrier(
+            &mut app, &mut state, &tx,
+            MetadataAlbumCarrierWriteMode::SidecarCue, false,
+        );
+        let status = app.status_message.as_ref()
+            .map(|(text, _)| text.as_str()).unwrap_or("");
+        assert!(status.contains("excluded by aggregate_metadata_target_priority"),
+            "omission must refuse a direct CUE write: {status}");
+        assert_eq!(std::fs::read(&fixture.cue_path).expect("CUE after attempt"), before_cue);
+        for (path, expected) in fixture.file_order_paths.iter().zip(before_files.iter()) {
+            assert_eq!(&std::fs::read(path).expect("FLAC after refusal"), expected);
+        }
+    }
+
+    #[test]
+    fn r21_sidecar_preflight_refusal_never_writes_file_tags_first() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        use crate::config::AggregateMetadataTarget::{SidecarCue, IndividualFiles};
+        let temp = tempfile::tempdir().expect("tempdir");
+        let fixture = create_presplit_metadata_sidecar_fixture(temp.path(), false);
+        let mut app = open_presplit_metadata_sidecar_fixture(
+            &fixture, temp.path(), vec![SidecarCue, IndividualFiles],
+        );
+        let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+        let ActiveOverlay::MetadataEditor(mut state) = overlay else {
+            panic!("sidecar-authoritative editor expected");
+        };
+        let composer_index = state.active_surface().entries.iter()
+            .position(|entry| entry.display_key.eq_ignore_ascii_case("COMPOSER"))
+            .expect("COMPOSER row");
+        // Build the same supported file-owned COMPOSER diff as the existing
+        // `presplit_metadata_sidecar_keeps_non_cue_track_fields_file_authoritative`
+        // integration test. One FLAC would actually be written if we reached
+        // the old preflight-after-write ordering.
+        {
+            let composer = &mut state.active_surface_mut().entries[composer_index];
+            composer.row_scope = crate::tui::probe::RowScope::Track;
+            composer.per_file_values = crate::tui::probe::metadata_field_values_from_scalars(vec![
+                "Composer Two".to_string(),
+                "Composer One".to_string(),
+                "Composer Three".to_string(),
+            ]);
+            composer.per_file_originals = composer.per_file_values.clone();
+            composer.per_file_stored_value_counts = vec![1, 1, 1];
+            composer.per_file_values[0].replace_scalar("Rejected Mutation".to_string());
+            cue_album_recompute_entry_display(composer);
+        }
+        recalc_dirty(&mut state);
+        assert_eq!(
+            metadata_editor_audio_paths_requiring_save(&state),
+            vec![fixture.file_order_paths[1].clone()],
+            "preflight regression requires a real pending FLAC modification",
+        );
+        let files_before = fixture.file_order_paths.iter()
+            .map(|path| std::fs::read(path).expect("original FLAC"))
+            .collect::<Vec<_>>();
+        // Make the admitted sidecar disappear after opening the editor; the
+        // production planner must refuse the entire save before any member
+        // writes, rather than reporting a failed sidecar after writing FLAC.
+        std::fs::remove_file(&fixture.cue_path).expect("remove sidecar before Save");
+        let planned = cue_sidecar_writeback_plan_for_state(&state)
+            .expect("sidecar-authoritative state must retain a writeback plan");
+        assert!(planned.preflight_error.is_some(),
+            "the deleted sidecar must be refused at preflight");
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        metadata_editor_save(&mut app, &mut state, &tx);
+        let status = app.status_message.as_ref()
+            .map(|(text, _)| text.as_str()).unwrap_or("");
+        assert!(status.contains("no audio file or sidecar was changed"),
+            "preflight status must state the actual no-write guarantee: {status}");
+        for (path, expected) in fixture.file_order_paths.iter().zip(files_before.iter()) {
+            assert_eq!(&std::fs::read(path).expect("FLAC after refusal"), expected);
+        }
+    }
+
+    #[test]
+    fn r21_uncovered_transfer_files_cannot_use_omitted_individual_target() {
+        let _coordination = crate::concurrency::isolated_test_coordination_root();
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        use crate::config::AggregateMetadataTarget::SidecarCue;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let fixture = create_presplit_metadata_sidecar_fixture(temp.path(), true);
+        let cancel = crate::tui::probe::MetadataWriteCancelFlag::new();
+        let error = classify_tag_transfer_roots(
+            std::slice::from_ref(&fixture.album),
+            &[SidecarCue], &cancel,
+        ).expect_err("the uncovered file must not fall back to disabled file tags");
+        assert!(error.contains("individual-files"), "unexpected authority refusal: {error}");
+    }
+
+    #[tokio::test]
+    async fn r21c_sidecar_only_native_composer_save_never_writes_flac_tags() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        if !fixture_tool_available("ffmpeg") {
+            eprintln!("skipping: ffmpeg unavailable");
+            return;
+        }
+        use crate::config::AggregateMetadataTarget::SidecarCue;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let fixture = create_presplit_metadata_sidecar_fixture(temp.path(), false);
+        let mut app = open_presplit_metadata_sidecar_fixture(
+            &fixture,
+            temp.path(),
+            vec![SidecarCue],
+        );
+        app.config.metadata.cue_tonepoet_metadata =
+            Some(crate::config::CueTonepoetMetadataPreference::Always);
+        let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+        let ActiveOverlay::MetadataEditor(mut state) = overlay else {
+            panic!("sidecar-only pre-split directory must open the metadata editor");
+        };
+        assert!(matches!(
+            &state.active_surface().cue_source,
+            Some(super::super::app::MetadataCueSource::Sidecar(path))
+                if path == &fixture.cue_path
+        ));
+        assert!(metadata_editor_native_multi_file_metadata_sidecar_authority(&state));
+        assert_eq!(state.active_surface().paths, fixture.cue_order_paths);
+        let composer_index = state.active_surface().entries.iter()
+            .position(|entry| entry.display_key.eq_ignore_ascii_case("COMPOSER"))
+            .expect("loaded native-origin COMPOSER");
+        let composer = &state.active_surface().entries[composer_index];
+        assert_eq!(composer.row_scope, crate::tui::probe::RowScope::File);
+        assert_eq!(composer.per_file_values[0].as_str(), "Composer One");
+        // Preserve the real file-scoped native field and the fixture's
+        // nontrivial ordering: file 01 belongs to CUE TRACK 02. No synthetic
+        // Track-scope reclassification is needed for the existing 1:1 CUE
+        // user-metadata projection.
+        state.active_surface_mut().entries[composer_index]
+            .per_file_values[0]
+            .replace_scalar("Sidecar Composer Two".to_string());
+        cue_album_recompute_entry_display(
+            &mut state.active_surface_mut().entries[composer_index],
+        );
+        recalc_dirty(&mut state);
+        assert!(state.any_presentation_dirty());
+        let before_files = fixture.file_order_paths.iter()
+            .map(|path| std::fs::read(path).expect("FLAC before Save"))
+            .collect::<Vec<_>>();
+        let before_cue = std::fs::read(&fixture.cue_path).expect("CUE before Save");
+
+        state.close_after_successful_save = false;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        metadata_editor_save(&mut app, &mut state, &tx);
+        assert!(
+            !state.active_surface().native_file_tags_authorized_for_save,
+            "only the configured CUE target may own this save"
+        );
+        assert_eq!(state.phase, crate::tui::app::MetadataEditorPhase::Saving);
+        assert_eq!(metadata_editor_audio_paths_requiring_save(&state), Vec::<std::path::PathBuf>::new());
+        let plan = cue_sidecar_writeback_plan_for_state(&state)
+            .expect("CUE-authoritative save must plan a sidecar");
+        assert!(plan.sidecar_only);
+        assert!(plan.required_audio_paths.is_empty());
+        assert!(!plan.require_successful_image_save);
+        assert!(plan.preflight_error.is_none());
+        app.active_overlay = ActiveOverlay::MetadataEditor(state);
+        loop {
+            let message = tokio::time::timeout(
+                std::time::Duration::from_secs(30), rx.recv(),
+            )
+            .await
+            .expect("sidecar-only COMPOSER save timed out")
+            .expect("sidecar-only COMPOSER save channel closed");
+            let complete = if let AppMessage::MetadataEditorWriteComplete { results, .. } = &message {
+                assert_eq!(results.len(), 1, "no native-file results may be dispatched");
+                assert!(matches!(
+                    &results[0].outcome,
+                    crate::tui::app::MetadataEditorWriteOutcome::SidecarCueSaved { .. }
+                ), "only the authorized sidecar may be saved: {results:?}");
+                true
+            } else {
+                false
+            };
+            crate::tui::event_loop::handle_message(&mut app, message, &tx);
+            if complete {
+                break;
+            }
+        }
+        for (path, expected) in fixture.file_order_paths.iter().zip(before_files.iter()) {
+            assert_eq!(
+                &std::fs::read(path).expect("FLAC after Save"), expected,
+                "SidecarCue-only Save rewrote excluded native file {}",
+                path.display(),
+            );
+        }
+        assert_ne!(
+            std::fs::read(&fixture.cue_path).expect("CUE after Save"), before_cue,
+            "the edited COMPOSER must reach the authorized CUE carrier",
+        );
+        let reopened = crate::tui::cue_parser::parse_cue_file(&fixture.cue_path)
+            .expect("reopen saved CUE");
+        assert_eq!(reopened.tracks.len(), 3);
+        assert_eq!(
+            crate::convert::cue_parser::cue_user_metadata_values(
+                &reopened.tracks[1].user_metadata, "COMPOSER",
+            ),
+            Some(["Sidecar Composer Two".to_string()].as_slice()),
+            "file 01's edit must survive CUE reopening under logical TRACK 02",
+        );
+        let reopened_app = open_presplit_metadata_sidecar_fixture(
+            &fixture, temp.path(), vec![SidecarCue],
+        );
+        let ActiveOverlay::MetadataEditor(reopened_editor) = &reopened_app.active_overlay else {
+            panic!("reopened CUE must have a metadata editor");
+        };
+        let reopened_composer = metadata_entry(reopened_editor, "COMPOSER");
+        assert_eq!(reopened_composer.row_scope, crate::tui::probe::RowScope::Track);
+        assert_eq!(
+            reopened_composer.per_file_values[1].as_str(),
+            "Sidecar Composer Two",
+            "ordinary reopen must present the sidecar-authoritative track edit",
+        );
+        let ActiveOverlay::MetadataEditor(mut state) =
+            std::mem::replace(&mut app.active_overlay, ActiveOverlay::None)
+        else {
+            panic!("completed Save must retain the editor");
+        };
+        assert!(
+            !state.any_presentation_dirty(),
+            "completion must reduce CUE-owned native-origin edits as saved"
+        );
+        metadata_editor_save(&mut app, &mut state, &tx);
+        assert_eq!(
+            app.status_message.as_ref().map(|(message, _)| message.as_str()),
+            Some("No changes to save"),
+            "repeat Save must be a no-op, not a second carrier write",
         );
     }
 
