@@ -14213,13 +14213,17 @@ FILE "album.flac" WAVE
         assert_eq!(expansion.cue_artifact_metadata.len(), carriers.len());
         assert!(!expansion.paths.iter().any(|path| path == &cue));
 
+        // Model an omitted setting with its actual serde default. An explicit
+        // empty priority disables every metadata carrier under R21C; it must
+        // not be used as shorthand for the default in this integration case.
+        let metadata_target_priority = crate::config::default_aggregate_metadata_target_priority();
         for (index, (carrier, expected_title, expected_isrc)) in carriers.iter().enumerate() {
             let cue_decision =
                 crate::convert::queue_expansion::cue_artifact_commit_decision_for_path(
                     carrier,
                     &expansion.cue_artifact_audio,
                     &expansion.cue_artifact_metadata,
-                    &[],
+                    &metadata_target_priority,
                     CueSidecarPolicy::PreferSidecar,
                 );
             assert_eq!(

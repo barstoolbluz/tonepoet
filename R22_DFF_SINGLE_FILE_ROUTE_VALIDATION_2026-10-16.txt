@@ -1,0 +1,22 @@
+R22 DFF SINGLE-FILE ROUTE — OFFLINE VALIDATION
+Date: 2026-10-16
+Input archive SHA-256: 60e25d5e58b02e5cd81172ceed8620ba67d842e48c75d2cc3a0580fd668cb8d3
+Input SHA256SUMS SHA-256: 3efdcb0bdc518c6c59b71a83eadbd884d68fc04406fa39e9fc6bda3d3b1ffbd4
+
+BASELINE INTEGRITY: 1030/1030 SHA256SUMS entries PASS (input, before editing)
+ORIGINAL MEMBER DIFF: exactly two changed pre-existing files; others identical
+  src/convert/queue_expansion.rs
+  src/convert/pipeline/stages.rs
+PRODUCTION SOURCE DIFFERENCES: none
+CARGO.LOCK DIFFERENCE: none
+R21C AUTHORITY / SAVE LOGIC DIFFERENCE: none
+SOURCE-LOCK DIFFERENCE: none (all baseline non-test source bytes identical)
+PATCH REPLAY: patch -p1 --fuzz=0, exact byte reproduction PASS
+STATIC DFF DEFAULT SEMANTICS: PASS (actual default instead of explicit empty priority)
+STATIC UNIT COVERAGE: PASS (explicit empty vs configured default distinguished)
+RUSTC/CARGO/NIX/RUSTFMT: unavailable; compilation/tests/format check NOT RUN
+EXTERNAL RUST DOWNLOAD: unavailable (DNS resolution failed)
+RESULT: source-audited focused corrective candidate, NOT build-host accepted.
+
+MANDATORY FOLLOW-UP: Read R22_DFF_SINGLE_FILE_ROUTE_CHECKPOINT_2026-10-16.md,
+run focused Cargo tests (strict matrix mode), then the prescribed workspace gate.

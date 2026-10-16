@@ -6010,6 +6010,39 @@ mod limited_queue_expansion_tests {
         assert_eq!(decision.cue_sidecar_override, Some(CueSidecarPolicy::IgnoreCue));
         assert_eq!(decision.sidecar_cue_track_metadata, artifact_metadata.get(&untaggable).cloned());
 
+        // No configured target is not the same as an omitted setting. A
+        // transferred sidecar remains present but cannot supply metadata when
+        // the user explicitly disables every target.
+        let no_target = cue_artifact_commit_decision_for_path(
+            &untaggable,
+            &artifact_audio,
+            &artifact_metadata,
+            &[],
+            CueSidecarPolicy::PreferSidecar,
+        );
+        assert_eq!(
+            no_target.cue_sidecar_override,
+            Some(CueSidecarPolicy::EmbeddedOnly)
+        );
+        assert!(no_target.sidecar_cue_track_metadata.is_none());
+
+        let defaults = crate::config::default_aggregate_metadata_target_priority();
+        let default_decision = cue_artifact_commit_decision_for_path(
+            &untaggable,
+            &artifact_audio,
+            &artifact_metadata,
+            &defaults,
+            CueSidecarPolicy::PreferSidecar,
+        );
+        assert_eq!(
+            default_decision.cue_sidecar_override,
+            Some(CueSidecarPolicy::IgnoreCue)
+        );
+        assert_eq!(
+            default_decision.sidecar_cue_track_metadata,
+            artifact_metadata.get(&untaggable).cloned()
+        );
+
         // A structurally taggable carrier remains an IndividualFiles candidate;
         // with that target first, conversion must not silently override it.
         let taggable = td.path().join("track.wav");
