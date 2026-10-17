@@ -5,11 +5,13 @@ source-lock freshness, since `plan_bridge.rs`, `stages.rs`,
 `track_executor.rs` and `semantic_plan.rs` all moved; requalification follows
 once the tree is otherwise clean.
 
-The decode-before-cut ordering is the right correction and the physical
-witness is a good one — the 390-sample difference on the old route is what
-makes the comparison non-vacuous. Named suites pass: `hdcd` 47 of 47,
-`cue_stream_admission` and `grouped_cue_fallback` 1 of 1 each,
-`hdcd_true_peak` 3 of 3.
+The decode-before-cut ordering is the right correction. We ran
+`tests/hdcd_cue_continuity_ffmpeg_smoke.py` here and it reports what the
+handoff claims: 44,433 exact frames with zero mismatches after the correct
+cut, 390 mismatches on the old route, and an unaffected neighbouring member
+preserving its original 16-bit samples. The 390 is what makes the comparison
+non-vacuous. Named suites pass: `hdcd` 47 of 47, `cue_stream_admission` and
+`grouped_cue_fallback` 1 of 1 each, `hdcd_true_peak` 3 of 3.
 
 ## 1. A plan combining HDCD with certified gain selects no PCM terminal
 
