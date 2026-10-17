@@ -36,12 +36,16 @@ supervisor keeps an execution identity live was not determined.
 
 ## Why it could not be diagnosed
 
-Nothing logs claim registration or conflict. I checked: `src/concurrency.rs`
-has five log statements and all of them report failures. The application log
-from that session carried 5,824 lines mentioning the other instance's scope,
-every one the same five-second recovery poll, and not one recording what that
-scope claimed. The status-bar message is truncated before the overlapping path
-and owning execution, which is the only place that information appears at all.
+Nothing logs claim registration or conflict. Verified today:
+`src/concurrency.rs` contains exactly five logging calls, four warnings and one
+error, all reporting failures — no trace, debug or info at any level.
+
+From the original field session, recorded in the issue rather than measured
+here: the application log carried 5,824 lines mentioning the other instance's
+scope, every one the same five-second recovery poll, and not one recording what
+that scope claimed. The status-bar message is truncated before the overlapping
+path and owning execution, which is the only place that information appears at
+all.
 
 I believe this is why the issue cannot say what conflicted, and why a fix
 attempted without closing this gap would be guesswork.
