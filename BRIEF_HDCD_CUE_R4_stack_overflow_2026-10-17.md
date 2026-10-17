@@ -1,7 +1,9 @@
 # BRIEF — two CUE test binaries abort with stack overflow
 
-R3 applied. The plan-terminal adjudication is right and the five warnings are
-gone. Reference was requalified and the freshness gate passes.
+R3 applied. The plan-terminal adjudication holds — I checked that the helper
+matches only `EncodePcm`, so an MP3 conversion could not have satisfied the old
+assertion. The five warnings are gone. Reference was requalified and the
+freshness gate passes.
 
 Two test binaries abort rather than fail:
 
@@ -13,7 +15,7 @@ thread '...' has overflowed its stack
 fatal runtime error: stack overflow, aborting   (SIGABRT)
 ```
 
-Both reproduce every time. Both are CUE paths.
+Both reproduced on every run here, twice each. Both are CUE paths.
 
 Counting only the binaries that completed, the gate is 7517 passed / 1 failed,
 and that one failure passes alone and is the documented contention flake.
