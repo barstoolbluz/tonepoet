@@ -1,0 +1,34 @@
+Issue #59 — compile-free QA, October 17, 2026
+
+RESULT: 16 / 16 compile-free structural, policy-invariance, provenance,
+input-integrity and patch-replay checks PASSED.
+
+Evidence independently calculated against the original uploaded archive:
+- Original input archive SHA256:
+  77b92328b9a0d85c079a221159942155b626b30cc175bb8cf688b8f29c0f7fde
+- Original src/concurrency.rs SHA256:
+  2ef88b125ef8ee18cdd5218a1d1812c642b44aa3958b7254b5ce5f71bb4f7a62
+- Shipped src/concurrency.rs SHA256:
+  84a37121dfac925ce1591e7299ca69f84d55e026ed41afe53646f7457f8aab66
+- Existing regular files differing from original tar: src/concurrency.rs ONLY.
+- Delta patch replayed on the exact original source; byte-for-byte match PASS.
+- Collision comparisons, allowed claim-bearing families, recovery-state
+  classification and same-execution exemptions unchanged (byte comparisons).
+- Three focused issue_59_* Rust tests are present. They were NOT executed.
+
+In the inherited root SHA256SUMS, 18 entries had already diverged in the
+uploaded input; the derived tree has 19 historical mismatches, including the
+intentional concurrency.rs change. The new ISSUE59_SOURCE_TREE_SHA256SUMS.txt
+verifies the actual delivered files. The inherited root SHA256SUMS remains
+unmodified for audit/provenance.
+
+NOT PERFORMED / NOT CLAIMED:
+- No Rust compiler, cargo, or nix is installed in this environment.
+- Consequently no cargo test, cargo check, native compilation, clean 7526-gate
+  reproduction, end-to-end two-instance save, or Reference qualification.
+- The historical conflicting descriptor was destroyed before this analysis.
+  The precise field root cause (ancestor claim, surviving execution claim,
+  or another owner) is *not* established.
+
+Required build-host and live-reproduction steps appear in
+ISSUE59_ENGINEERING_DELIVERY.md and ISSUE59_RESUME_CHECKPOINT.md.
