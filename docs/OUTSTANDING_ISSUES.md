@@ -4294,6 +4294,18 @@ the CUE negative veto, Browse searching and sorting, and TRACKNUMBER ordering.
 outstanding; #62 is not verified closed.** See
 `R20C_RF64_INTEGRATION_HANDOFF_2026-10-15.md` for acceptance steps.
 
+**⚠ IMPLEMENTED, NOT FIELD-VERIFIED (R20/R20C, 2026-10-16).** A genuine `RF64`
+magic now triggers a retry after a failed Lofty read, and that retry reaches
+Convert's pre-emphasis tag evidence, both pre-emphasis advisory entrypoints,
+Browse's tag reads and sort keys, and track-number sorting. A successful empty
+read stays distinct from a failed one, so a malformed RF64 does not poison the
+tag-search cache. `rf64_` is 23 of 23.
+
+Nobody has opened the real album — the ten-track one whose single RF64 file is
+2.19 GB. Close this after checking there that the title and artwork are
+visible, a conversion uses the real title in the filename, and the
+"Tag read: FAILED ... converted without metadata" warning is gone.
+
 ## 63. The sox_ng the build uses and the sox_ng repo on disk are unrelated histories
 
 Filed 2026-10-07. Not a conversion defect. A build-provenance question, deferred
@@ -5178,3 +5190,20 @@ it refuses, overrides or quietly writes, and that a CUE beside the files can be
 declared not a write target at all. The membership-versus-precedence gates and
 the non-omittable normalization described above have not been changed. Do not
 close this on the instance.
+
+**⚠ SUBSTANTIALLY ADDRESSED (R21/R21C, 2026-10-16); FIELD CHECK OUTSTANDING.**
+Both obstacles named above are gone. `normalized_aggregate_metadata_target_priority`
+no longer chains the defaults onto the configured order, so an omitted target
+is genuinely omitted and a configuration can express "do not write this
+carrier". And native file writes are now permitted only when `IndividualFiles`
+is admitted for that save: with only `sidecar-cue` configured, a secondary
+classifier previously still treated FLAC tags as writable because they were
+taggable, so an edited native-origin COMPOSER could reach the files. A
+sidecar-only save now rejects any residual planned native mutation before
+dispatch, and its regression requires all three FLAC files byte-identical
+after a sidecar-only COMPOSER edit.
+
+What remains is the field check on the original album, and on any other
+configuration the user cares about. The declared outcome — the configured
+order as the single authority — is implemented but has not been exercised by
+hand.
