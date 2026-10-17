@@ -1,0 +1,87 @@
+--- a/tonepoet-pipeline/src/semantic_plan.rs
++++ b/tonepoet-pipeline/src/semantic_plan.rs
+@@ -645,7 +645,9 @@
+     /// Source-control-bit HDCD decode. The identity prevents queuing a
+     /// source that was replaced after an effectual HDCD scan.
+     HdcdDecode {
++        /// Physical source size at the scan boundary, used to reject stale input.
+         source_size_bytes: u64,
++        /// Physical source modification timestamp in Unix-epoch nanoseconds.
+         source_modified_ns: i64,
+         /// Empty for an ordinary single-track file. For a CUE image, only the
+         /// listed, independently scanned tracks may consume the decoder.
+@@ -659,8 +661,11 @@
+ #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+ #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct HdcdCueSegment {
++    /// One-based source CUE track ordinal as scanned for HDCD eligibility.
+     pub source_ordinal: u32,
++    /// Sample-exact start offset within the continuous source PCM image.
+     pub start_sample: u64,
++    /// Number of PCM frames in this member's source interval.
+     pub sample_count: u64,
+ }
+ 
+@@ -11147,14 +11152,57 @@
+                 assert_eq!(plan.nodes.iter().filter(|node| matches!(node,
+                     TypedPlanNode::ApplyGain { decision: Some(_), .. }
+                 )).count(), 1);
+-                let (terminal, _) = selected_pcm_terminal(&plan);
+-                match &terminal.contract.terminal_realization {
+-                    Some(SelectedTerminalRealization::Pcm(realization)) => {
++                let observation_subject = plan.nodes.iter().find_map(|node| match node {
++                    TypedPlanNode::Observe(Observation {
++                        kind: ObservationKind::CertifiedTruePeak { .. }, subject, ..
++                    }) => Some(*subject),
++                    _ => None,
++                }).expect("certified observation subject");
++                let observed = plan.audio_states.iter()
++                    .find(|state| state.id == observation_subject)
++                    .expect("certified observation must read a named state");
++                assert_eq!(observed.precision,
++                    StoragePrecision::Pcm(PcmBitDepth::Float64));
++                // Both products need a charged physical terminal, but MP3 is
++                // EncodeLossy, not EncodePcm. Check the selected terminal's
++                // actual input signal so the lossy cell cannot silently take
++                // the original S16 source or an extra lossy/PCM boundary.
++                let terminals = plan.nodes.iter().filter_map(|node| match node {
++                    TypedPlanNode::Operation {
++                        operation: operation @ (PlanOperation::EncodePcm { .. }
++                            | PlanOperation::EncodeLossy { .. }),
++                        input_signal: Some(input),
++                        candidates,
++                        selected_candidate,
++                        ..
++                    } => Some((operation, input, &candidates[*selected_candidate])),
++                    _ => None,
++                }).collect::<Vec<_>>();
++                assert_eq!(terminals.len(), 1, "one selected terminal for {path}");
++                let (operation, input, terminal) = terminals[0];
++                let terminal_input = plan.audio_states.iter()
++                    .find(|state| state.id == *input)
++                    .expect("terminal must consume a named audio state");
++                assert_eq!(terminal_input.precision,
++                    StoragePrecision::Pcm(PcmBitDepth::Float64));
++                assert_eq!(terminal_input.processing_domain,
++                    Fact::Known(ProcessingDomain::Binary64));
++                assert_eq!(terminal_input.value_domain, ValueDomain::FiniteFloating);
++                assert!(terminal.contract.terminal_proof.is_some(),
++                    "certified gain must charge its selected terminal");
++                match (operation, terminal.contract.terminal_realization.as_ref()) {
++                    (PlanOperation::EncodePcm { target_format: AudioFormat::Flac, .. },
++                     Some(SelectedTerminalRealization::Pcm(realization))) => {
+                         assert_eq!(realization.input_precision,
+                             StoragePrecision::Pcm(PcmBitDepth::Float64));
+                     }
+-                    Some(SelectedTerminalRealization::LossyFfmpegEncoderInput { .. }) => {}
+-                    other => panic!("missing certified terminal realization: {other:?}"),
++                    (PlanOperation::EncodeLossy { target_format: AudioFormat::Mp3, .. },
++                     Some(SelectedTerminalRealization::LossyFfmpegEncoderInput {
++                         target_format: AudioFormat::Mp3, ..
++                     })) => {
++                        assert_eq!(terminal.tool, Some(ToolIdentifier::Ffmpeg));
++                    }
++                    other => panic!("missing or wrong certified terminal for {path}: {other:?}"),
+                 }
+             }
+         }

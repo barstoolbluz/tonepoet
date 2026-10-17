@@ -316,6 +316,14 @@ cargo test --workspace --no-fail-fast --exclude tonepoet-true-peak
 # --no-fail-fast: without it, --workspace STOPS at the first failing test binary and
 #   every later target silently never runs.
 #
+# TRAP: A TEST BINARY THAT ABORTS REPORTS NOTHING. A stack overflow, panic in a
+#   destructor, or any SIGABRT kills the process before it prints "test result:"
+#   or a "failures:" block. Counting passed/failed lines therefore misses it
+#   entirely and the run looks clean. This went unreported for two rounds while
+#   two CUE binaries aborted every time. Always check the raw log:
+#     grep -cE 'SIGABRT|stack overflow|process didn.t exit successfully' <log>
+#   A nonzero count means the gate number is incomplete, however good it looks.
+#
 # TRAP, hit twice on 2026-10-02: `cargo test --lib <bare_fn_name> -- --exact`
 #   matches NOTHING. --exact requires the full module path. Cargo then prints
 #   "test result: ok. 0 passed; 0 failed; N filtered out", which reads as a pass

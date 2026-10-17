@@ -1,0 +1,37 @@
+
+=== tests/hdcd_cue_continuity_ffmpeg_smoke.py ===
+PASS: true HDCD CUE boundary (45097 samples), 44433 exact frames, zero mismatches after correct cut; 390 wrong-path sample mismatches
+PASS: unaffected neighboring CUE member preserves original 16-bit samples
+PASS
+
+=== tests/hdcd_source_first_ffmpeg_smoke.py ===
+PASS: late HDCD detection and independently classified FLAC/CUE scan members
+PASS: FLAC source-first HDCD decode, 44159 exact stereo S32 frames, no rate change
+PASS
+
+=== tests/hdcd_true_peak_composition_ffmpeg_smoke.py ===
+PASS source-first signed16 HDCD -> signed32 -> Float64, no compensating gain
+PASS CD de-emphasis consumes decoded Float64 without integer terminal
+PASS decoded -> Float64 de-emphasis -> one SoXR rate change -> Float64 scan input
+PASS independent processed-signal Track/Album Guard+Normalize scalar witnesses
+PASS exact original-source CUE range after continuous HDCD reconstruction
+PASS final-only Int16 TPDF/quantization from retained Float64
+PASS Float64 44.1-kHz -> MP3 terminal encoder without hidden rate change
+PASS
+
+=== tests/hdcd_lossy_precision_ffmpeg_smoke.py ===
+PASS: S32 source -> explicit SoXR 44.1/48 -> Float32-input libopus
+PASS: S32 source -> planar Float32-input libmp3lame
+PASS: S32 source -> one no-rate-change SoXR TPDF/Int16 terminal
+NOT RUN: libfdk_aac unavailable (pinned-host gate required)
+PASS
+
+=== tests/verify_hdcd_analysis_cache_sql.py ===
+PASS: actual store_analysis SQLite SQL preserves matching HDCD data and clears on version or identity changes
+PASS
+
+=== tests/verify_hdcd_v28_migration_sql.py ===
+PASS: v21-v27 modeled cache-present/cache-missing cases, two v28 replays, identity columns and row preservation (14 cases)
+PASS
+
+=== All six Python/FFmpeg/SQL smoke scripts PASS ===
