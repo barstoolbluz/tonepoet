@@ -10,20 +10,27 @@ elsewhere rather than being told which to use.
 
 ## 1. The output channel layout is a conversion setting
 
-TonePoet carries channel count from source to output untouched. There is no
-control for it in `FormatState` or in the pipeline settings, and the only
-channel logic I found rejects a mismatch rather than resolving one.
+There is no channel control in `FormatState` or in the pipeline settings, so
+an ordinary conversion carries channel count from source to output untouched.
+
+One family is an exception, and it is the precedent rather than the
+counter-example. `DvdaDownmixPolicy` already offers `Auto`, `None` and a
+foo_input_dvda-compatible conservative stereo matrix — but it is a DVD-Audio
+source option, hardcoded to `Auto` at every call site we found, and the user
+cannot choose it.
 
 Multichannel reaches TonePoet from at least: a SACD ISO's multichannel area,
 a DVD-Audio ISO, a Blu-ray ISO, DVD-Video, a multichannel FLAC or WavPack, and
-MKA or MKV. So a 5.1 source has no path to a stereo file, whatever carried it.
+MKA or MKV. Only the DVD-Audio path can fold, and only by a decision nobody
+makes.
 
 **What we want:** the user chooses the output channel layout, and that choice
 is independent of how the source was delivered. It belongs where bit depth and
-sample rate are decided, not inside any one source family's reader. The
-coefficients used for a fold are stated rather than implicit, and the choice
-participates in the typed plan, the fingerprint and the conversion log like any
-other effect.
+sample rate are decided rather than inside one source family's reader, and the
+existing DVD-Audio policy should be subsumed by it rather than left as a
+parallel mechanism. The coefficients used for a fold are stated rather than
+implicit, and the choice participates in the typed plan, the fingerprint and
+the conversion log like any other effect.
 
 One constraint. A fold sums contributing channels — five of them for 5.1 — so
 a default that simply adds them will clip. TonePoet already owns a certified
@@ -48,8 +55,8 @@ the gain applied. Any boost trips a fixed line.
 
 **What we want:** a DC-offset removal the user can apply during conversion, and
 a classification whose verdict does not change merely because the content got
-louder. A reading of 0.003 on loud material should not be called significant
-when the same master reads negligible when quieter.
+louder. The field reading was 0.001114 against a 0.001 line, where the same master
+reads 0.000353 untouched and the redbook CD reads 0.000706 negligible.
 
 sox `dcshift` and FFmpeg `dcshift` both do this; a high-pass is the other
 common approach and TonePoet already has registered high-pass effects.
