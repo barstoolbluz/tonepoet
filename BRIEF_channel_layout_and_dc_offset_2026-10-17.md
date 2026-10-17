@@ -54,6 +54,21 @@ when the same master reads negligible when quieter.
 sox `dcshift` and FFmpeg `dcshift` both do this; a high-pass is the other
 common approach and TonePoet already has registered high-pass effects.
 
+## Placement and ordering
+
+Both rows go **below the fold** — visible when the Format pane is maximized,
+like the other advanced controls. Neither is promoted.
+
+Ordering is the planner's job, against every supported effect and not just
+these two. A channel fold changes how many signals exist; a DC shift changes
+sample values; both interact with gain, resampling, de-emphasis, HDCD decoding
+and the terminal. We are not supplying a sequence for you to encode.
+
+More effects are coming. Whatever resolves the order here should hold for the
+next one without being rewritten, and without a new scheduler or DSP framework
+being invented for it — the existing typed plan, registered-effect ordering and
+terminal ownership are the mechanisms.
+
 ## Two things already in the tree
 
 `SoxHighPass`, `SoxLowPass`, `FfmpegHighPass`, `FfmpegLowPass` and
