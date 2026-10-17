@@ -353,8 +353,26 @@ fn published_audio_entries(published: &PublishedAlbum) -> Vec<&PublishedEntry> {
         .collect()
 }
 
-#[tokio::test]
-async fn folder_expansion_generated_synthetic_cue_publishes_one_album_boundary() {
+#[test]
+fn folder_expansion_generated_synthetic_cue_publishes_one_album_boundary() {
+    let worker = std::thread::Builder::new()
+        .name("cue-folder-expansion-stack-test".to_string())
+        .stack_size(tonepoet::convert::pipeline::CONVERSION_RUNTIME_WORKER_STACK_BYTES)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .thread_stack_size(tonepoet::convert::pipeline::CONVERSION_RUNTIME_WORKER_STACK_BYTES)
+                .enable_all()
+                .build()
+                .expect("build cue-folder-expansion-stack-test runtime");
+            runtime.block_on(folder_expansion_generated_synthetic_cue_publishes_one_album_boundary_body());
+        })
+        .expect("spawn cue-folder-expansion-stack-test worker");
+    if let Err(payload) = worker.join() {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+async fn folder_expansion_generated_synthetic_cue_publishes_one_album_boundary_body() {
     if !require_or_skip_boundary_tools("folder_expansion_generated_synthetic_cue_publishes_one_album_boundary") {
         return;
     }
@@ -464,8 +482,29 @@ FILE "side_b.flac" WAVE
     let _ = fs::remove_dir_all(root);
 }
 
-#[tokio::test]
-async fn explicit_single_cue_bypass_keeps_side_album_identity() {
+// This full CUE test was reported aborting on libtest's default stack.
+// Use the production worker-stack reservation while retaining the same
+// current-thread Tokio execution model and all of its original assertions.
+#[test]
+fn explicit_single_cue_bypass_keeps_side_album_identity() {
+    let worker = std::thread::Builder::new()
+        .name("cue-single-side-stack-test".to_string())
+        .stack_size(tonepoet::convert::pipeline::CONVERSION_RUNTIME_WORKER_STACK_BYTES)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .thread_stack_size(tonepoet::convert::pipeline::CONVERSION_RUNTIME_WORKER_STACK_BYTES)
+                .enable_all()
+                .build()
+                .expect("build single-side CUE test runtime");
+            runtime.block_on(explicit_single_cue_bypass_keeps_side_album_identity_body());
+        })
+        .expect("spawn single-side CUE test worker");
+    if let Err(payload) = worker.join() {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+async fn explicit_single_cue_bypass_keeps_side_album_identity_body() {
     if !require_or_skip_boundary_tools("explicit_single_cue_bypass_keeps_side_album_identity") {
         return;
     }
@@ -510,8 +549,26 @@ FILE "side_a.flac" WAVE
     let _ = fs::remove_dir_all(root);
 }
 
-#[tokio::test]
-async fn writable_sidecar_authority_drives_unified_album_output_when_embedded_is_read_only() {
+#[test]
+fn writable_sidecar_authority_drives_unified_album_output_when_embedded_is_read_only() {
+    let worker = std::thread::Builder::new()
+        .name("cue-writable-sidecar-stack-test".to_string())
+        .stack_size(tonepoet::convert::pipeline::CONVERSION_RUNTIME_WORKER_STACK_BYTES)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .thread_stack_size(tonepoet::convert::pipeline::CONVERSION_RUNTIME_WORKER_STACK_BYTES)
+                .enable_all()
+                .build()
+                .expect("build cue-writable-sidecar-stack-test runtime");
+            runtime.block_on(writable_sidecar_authority_drives_unified_album_output_when_embedded_is_read_only_body());
+        })
+        .expect("spawn cue-writable-sidecar-stack-test worker");
+    if let Err(payload) = worker.join() {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+async fn writable_sidecar_authority_drives_unified_album_output_when_embedded_is_read_only_body() {
     if !require_or_skip_metadata_boundary_tools("writable_sidecar_authority_drives_unified_album_output_when_embedded_is_read_only") {
         return;
     }

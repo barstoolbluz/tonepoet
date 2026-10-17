@@ -1,0 +1,20 @@
+R4 targeted shell gate validation, 2026-10-17
+
+Command: bash -n tests/hdcd_cue_stack_gate.sh
+RESULT: PASS
+
+The R4 gate was exercised with a temporary fake Cargo executable because
+there is no Rust toolchain in this environment. The executable checked the
+script's failure-accounting semantics, NOT the Rust tests themselves:
+
+mode=pass         : 1/1 passing footer for each target, return code 0  -> PASS
+mode=zero         : 0/0 footer, return code 0                     -> expected failure 1
+mode=abort        : stack overflow / SIGABRT, return code 134     -> expected failure 1
+mode=second_abort : first test passes; second SIGABRT, status 134 -> expected failure 1
+
+RESULT: all 4 scenarios behaved as expected.
+
+A real invocation with no Cargo installed returned status 2 with the message:
+"R4 CUE stack gate: cargo is required; no tests were run".
+
+The script must still run against real Cargo binaries on the build host.

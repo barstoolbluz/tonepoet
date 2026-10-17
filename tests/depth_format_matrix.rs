@@ -858,8 +858,29 @@ async fn supported_pcm_depth_format_cells_publish_exact_requested_representation
     );
 }
 
-#[tokio::test]
-async fn source_target_preserves_float32_cue_sample_class() {
+// The full CUE test was reported aborting on libtest's default stack.
+// Poll it with the production worker-stack reservation, without changing
+// its current-thread Tokio execution model or the original assertions.
+#[test]
+fn source_target_preserves_float32_cue_sample_class() {
+    let worker = std::thread::Builder::new()
+        .name("cue-source-float32-stack-test".to_string())
+        .stack_size(tonepoet::convert::pipeline::CONVERSION_RUNTIME_WORKER_STACK_BYTES)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .thread_stack_size(tonepoet::convert::pipeline::CONVERSION_RUNTIME_WORKER_STACK_BYTES)
+                .enable_all()
+                .build()
+                .expect("build Float32 CUE test runtime");
+            runtime.block_on(source_target_preserves_float32_cue_sample_class_body());
+        })
+        .expect("spawn Float32 CUE test worker");
+    if let Err(payload) = worker.join() {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+async fn source_target_preserves_float32_cue_sample_class_body() {
     const TEST: &str = "source_target_preserves_float32_cue_sample_class";
     if !require_tools_or_skip(TEST, &["ffmpeg", "ffprobe"]) {
         return;
