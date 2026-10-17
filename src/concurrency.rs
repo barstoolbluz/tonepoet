@@ -1630,7 +1630,10 @@ impl PersistentLease {
         let root = coordination_root();
         create_private_dir(&root)?;
         let _registry = RegistryLock::acquire(&root)?;
-        Self::create_while_registry_locked(&root, family, claims, None, false)
+        let lease = Self::create_while_registry_locked(&root, family, claims, None, false)?;
+        drop(_registry);
+        log_registered_mutation_claims(&lease);
+        Ok(lease)
     }
 
     fn create_while_registry_locked(
@@ -2221,23 +2224,27 @@ impl MutationClaimGuard {
         let descriptors = claim_descriptor_paths(&root)?;
         for path in descriptors {
             let probe = classify_descriptor(&path)?;
-            let Some((availability, existing_family, existing_claims, existing_group)) = probe else { continue };
-            if same_execution_lifecycle(&family, &existing_family)
-                || coordination_group.as_deref().is_some_and(|group| existing_group.as_deref() == Some(group))
+            let Some(probe) = probe else { continue };
+            let existing = &probe.descriptor;
+            if same_execution_lifecycle(&family, &existing.family)
+                || coordination_group.as_deref().is_some_and(|group| existing.coordination_group.as_deref() == Some(group))
             {
                 continue;
             }
-            if matches!(availability, ClaimAvailability::ReclaimableEphemeral) {
+            if matches!(probe.availability, ClaimAvailability::ReclaimableEphemeral) {
                 let _ = remove_reclaimable_ephemeral_locked(&path);
                 continue;
             }
-            if let Some((requested, existing)) = first_conflict(&claims, &existing_claims) {
-                let owner = match availability {
+            if let Some((requested, held)) = first_conflict(&claims, &existing.claims) {
+                let diagnostic = claim_conflict_diagnostic(
+                    &family, requested, held, &probe, &path,
+                );
+                let owner = match probe.availability {
                     ClaimAvailability::Live => "live owner",
                     ClaimAvailability::RecoveryReserved => "recovery reservation",
                     ClaimAvailability::ReclaimableEphemeral => unreachable!(),
                 };
-                let queue_execution = match &existing_family {
+                let queue_execution = match &existing.family {
                     LeaseFamily::QueueExecution { execution_id }
                     | LeaseFamily::ExecutionClaim { execution_id }
                     | LeaseFamily::ExecutionStaging { execution_id } => {
@@ -2248,19 +2255,23 @@ impl MutationClaimGuard {
                     | LeaseFamily::EphemeralMutation { .. } => String::new(),
                 };
                 let requested_path = requested.identity.original.display().to_string();
-                let existing_path = existing.identity.original.display().to_string();
+                let existing_path = held.identity.original.display().to_string();
                 let conflict = if requested_path == existing_path {
                     format!("path '{existing_path}' is already reserved")
                 } else {
                     format!("requested '{requested_path}' overlaps reserved '{existing_path}'")
                 };
-                let advice = match availability {
+                let advice = match probe.availability {
                     ClaimAvailability::Live => "; retry after the owning operation finishes",
                     ClaimAvailability::RecoveryReserved => {
                         "; retry after TonePoet finishes interrupted-operation recovery"
                     }
                     ClaimAvailability::ReclaimableEphemeral => unreachable!(),
                 };
+                // A log writer can block on disk I/O. Never hold the global
+                // admission registry lock while writing forensic evidence.
+                drop(_registry);
+                log::warn!("{diagnostic}");
                 return Err(format!(
                     "filesystem mutation conflicts with {owner}: {conflict}{advice}{queue_execution}"
                 ));
@@ -2273,6 +2284,8 @@ impl MutationClaimGuard {
             coordination_group,
             true,
         )?;
+        drop(_registry);
+        log_registered_mutation_claims(&lease);
         Ok(Self {
             lease: Some(lease),
             claims: claims.into(),
@@ -2527,9 +2540,18 @@ pub fn retire_descriptor_after_lifecycle_release(path: &Path, expected_family: &
             return Err(format!("persistent lease pathname rebound before retirement: {}", path.display()));
         }
     }
+    let retired_claim_count = lease.claims().len();
+    let retired_descriptor_id = lease.descriptor_id();
     std::fs::remove_file(path)
         .map_err(|e| format!("retire persistent lease {}: {e}", path.display()))?;
     drop(lease);
+    drop(_registry);
+    if retired_claim_count > 0 {
+        log::info!(
+            "filesystem mutation claim lease retired: family={expected_family:?} lifecycle={} descriptor_id={} descriptor_path={:?} claim_count={}",
+            expected_family.lifecycle_id(), retired_descriptor_id, path, retired_claim_count,
+        );
+    }
     Ok(())
 }
 
@@ -2539,7 +2561,74 @@ fn first_conflict<'a>(requested: &'a [PathClaim], existing: &'a [PathClaim]) -> 
     })
 }
 
-fn classify_descriptor(path: &Path) -> Result<Option<(ClaimAvailability, LeaseFamily, Vec<PathClaim>, Option<String>)>, String> {
+// Preserve provenance through classification. A transient conflict may clear
+// before the next registry inspection; the rejection log must not have to
+// reconstruct the owning process/descriptor from a pathname later.
+#[derive(Debug)]
+struct ClassifiedClaimDescriptor {
+    availability: ClaimAvailability,
+    descriptor: LeaseDescriptor,
+}
+
+/// Stable, lossless conflict evidence for the ordinary application log.
+/// PathBuf's Debug representation escapes embedded newlines and non-UTF8
+/// bytes, whereas Display can split a single forensic event across lines.
+fn claim_conflict_diagnostic(
+    requester: &LeaseFamily,
+    requested: &PathClaim,
+    held: &PathClaim,
+    owner: &ClassifiedClaimDescriptor,
+    descriptor_path: &Path,
+) -> String {
+    let descriptor = &owner.descriptor;
+    format!(
+        "filesystem mutation claim conflict: availability={:?} requester_family={requester:?} \
+         requested_mode={:?} requested_scope={:?} requested_path={:?} requested_resolved={:?} requested_namespace={:?} \
+         held_mode={:?} held_scope={:?} held_path={:?} held_resolved={:?} held_namespace={:?} \
+         owner_family={:?} owner_lifecycle={} owner_created_unix_ms={} origin_pid={} origin_start_ticks={} origin_boot_id_hash={} \
+         owner_descriptor_id={} owner_descriptor_path={:?} owner_coordination_group={:?}",
+        owner.availability,
+        requested.mode, requested.scope, requested.identity.original,
+        requested.identity.normalized_key(), requested.identity.namespace_path,
+        held.mode, held.scope, held.identity.original,
+        held.identity.normalized_key(), held.identity.namespace_path,
+        descriptor.family, descriptor.family.lifecycle_id(), descriptor.created_unix_ms,
+        descriptor.owner.pid, descriptor.owner.start_ticks, descriptor.owner.boot_id_hash,
+        descriptor.descriptor_id, descriptor_path, descriptor.coordination_group,
+    )
+}
+
+/// Default info logging records small claim sets in full and every broad
+/// subtree claim, without turning large exact-file batches into thousands of
+/// log writes. A rejected exact claim is always logged in full at WARN.
+fn log_registered_mutation_claims(lease: &PersistentLease) {
+    if lease.claims().is_empty() || !log::log_enabled!(log::Level::Info) {
+        return;
+    }
+    log::info!(
+        "filesystem mutation claim lease registered: family={:?} lifecycle={} descriptor_id={} descriptor_path={:?} origin_pid={} claim_count={}",
+        lease.family(), lease.family().lifecycle_id(), lease.descriptor_id(),
+        lease.descriptor_path(), std::process::id(), lease.claims().len(),
+    );
+    let debug_enabled = log::log_enabled!(log::Level::Debug);
+    for (index, claim) in lease.claims().iter().enumerate() {
+        if index < 8 || claim.scope == ClaimScope::Subtree {
+            log::info!(
+                "filesystem mutation claim registered: descriptor_id={} index={} mode={:?} scope={:?} path={:?} resolved={:?}",
+                lease.descriptor_id(), index, claim.mode, claim.scope,
+                claim.identity.original, claim.identity.normalized_key(),
+            );
+        } else if debug_enabled {
+            log::debug!(
+                "filesystem mutation claim registered: descriptor_id={} index={} mode={:?} scope={:?} path={:?} resolved={:?}",
+                lease.descriptor_id(), index, claim.mode, claim.scope,
+                claim.identity.original, claim.identity.normalized_key(),
+            );
+        }
+    }
+}
+
+fn classify_descriptor(path: &Path) -> Result<Option<ClassifiedClaimDescriptor>, String> {
     let file = match open_existing_descriptor(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -2562,7 +2651,7 @@ fn classify_opened_descriptor(
     mut file: File,
     path: &Path,
     lock_state: bool,
-) -> Result<Option<(ClaimAvailability, LeaseFamily, Vec<PathClaim>, Option<String>)>, String> {
+) -> Result<Option<ClassifiedClaimDescriptor>, String> {
     if !lock_state {
         // A scanner can open a live ephemeral descriptor just before lexical
         // guard teardown unpublishes it, then acquire the now-ownerless inode.
@@ -2598,7 +2687,7 @@ fn classify_opened_descriptor(
         }
     };
     let availability = classify_availability(&descriptor.family, lock_state);
-    Ok(Some((availability, descriptor.family, descriptor.claims, descriptor.coordination_group)))
+    Ok(Some(ClassifiedClaimDescriptor { availability, descriptor }))
 }
 
 /// A missing pathname is special only for structurally valid ephemeral
@@ -4236,6 +4325,110 @@ mod tests {
                 Some("album-batch:different-run".to_string()),
             ).unwrap_err();
             assert!(error.contains("live owner"));
+        });
+    }
+
+    #[test]
+    fn issue_59_idle_queue_sessions_do_not_claim_unopened_albums() {
+        with_root(|root| {
+            let albums = root.join("Albums");
+            let album = albums.join("Nine DSFs");
+            std::fs::create_dir_all(&album).unwrap();
+            let track = album.join("01.dsf");
+            std::fs::write(&track, b"track").unwrap();
+
+            // Another idle TUI can own a durable queue scope and an empty
+            // QueueExecution without reserving a single library pathname.
+            let _other_scope = PersistentLease::create(
+                LeaseFamily::QueueScope { scope_id: Uuid::new_v4() }, &[],
+            ).unwrap();
+            let _other_execution = PersistentLease::create(
+                LeaseFamily::QueueExecution { execution_id: Uuid::new_v4() }, &[],
+            ).unwrap();
+
+            let requested = PathClaim::resolve_with_semantics(
+                &track, ClaimMode::Write, ClaimScope::Exact,
+                PathResolutionSemantics::NamespaceObject,
+            ).unwrap();
+            let _save = MutationClaimGuard::acquire_ephemeral(vec![requested])
+                .expect("an unopened album must not be blocked by idle session leases");
+        });
+    }
+
+    #[test]
+    fn issue_59_disjoint_albums_coexist_with_live_execution_claims() {
+        with_root(|root| {
+            let albums = root.join("Albums");
+            let first_album = albums.join("A");
+            let other_album = albums.join("B");
+            std::fs::create_dir_all(&first_album).unwrap();
+            std::fs::create_dir_all(&other_album).unwrap();
+            let second_track = other_album.join("01.dsf");
+            std::fs::write(&second_track, b"track").unwrap();
+
+            let executing = PathClaim::resolve(
+                &first_album, ClaimMode::Write, ClaimScope::Subtree,
+            ).unwrap();
+            let _execution = MutationClaimGuard::acquire(
+                LeaseFamily::ExecutionClaim { execution_id: Uuid::new_v4() },
+                vec![executing],
+            ).unwrap();
+            let metadata = PathClaim::resolve_with_semantics(
+                &second_track, ClaimMode::Write, ClaimScope::Exact,
+                PathResolutionSemantics::NamespaceObject,
+            ).unwrap();
+            let _save = MutationClaimGuard::acquire_ephemeral(vec![metadata])
+                .expect("another active album must not reserve its sibling directory");
+        });
+    }
+
+    #[test]
+    fn issue_59_ancestor_conflict_diagnostic_retains_owning_execution_and_paths() {
+        with_root(|root| {
+            let library = root.join("Library");
+            let album = library.join("Unopened Album");
+            std::fs::create_dir_all(&album).unwrap();
+            let track = album.join("01.dsf");
+            std::fs::write(&track, b"track").unwrap();
+            let execution_id = Uuid::new_v4();
+            let family = LeaseFamily::ExecutionClaim { execution_id };
+            let broad = PathClaim::resolve(
+                &library, ClaimMode::Write, ClaimScope::Subtree,
+            ).unwrap();
+            let held = MutationClaimGuard::acquire(
+                family.clone(), vec![broad.clone()],
+            ).unwrap();
+            let descriptor_path = held.lease().descriptor_path().to_path_buf();
+            let descriptor_id = held.lease().descriptor_id();
+            let requested = PathClaim::resolve_with_semantics(
+                &track, ClaimMode::Write, ClaimScope::Exact,
+                PathResolutionSemantics::NamespaceObject,
+            ).unwrap();
+            let probe = classify_descriptor(&descriptor_path).unwrap().unwrap();
+            assert_eq!(probe.availability, ClaimAvailability::Live);
+            assert_eq!(probe.descriptor.family, family);
+            assert!(requested.conflicts_with(&broad));
+            let forensic = claim_conflict_diagnostic(
+                &LeaseFamily::EphemeralMutation { claim_id: Uuid::new_v4() },
+                &requested, &broad, &probe, &descriptor_path,
+            );
+            assert!(forensic.contains(&format!("owner_lifecycle={execution_id}")));
+            assert!(forensic.contains(&format!("owner_descriptor_id={descriptor_id}")));
+            assert!(forensic.contains(&format!("origin_pid={}", std::process::id())));
+            assert!(forensic.contains("owner_family=ExecutionClaim"));
+            assert!(forensic.contains("owner_created_unix_ms="));
+            assert!(forensic.contains("requested_namespace="));
+            assert!(forensic.contains("held_scope=Subtree"));
+            assert!(forensic.contains("requested_scope=Exact"));
+            assert!(forensic.contains(&format!("{:?}", library)));
+            assert!(forensic.contains(&format!("{:?}", track)));
+
+            let error = MutationClaimGuard::acquire_ephemeral(vec![requested])
+                .expect_err("a live ancestor subtree writer must still exclude metadata mutations");
+            assert!(error.contains("live owner"));
+            assert!(error.contains(&execution_id.to_string()));
+            assert!(error.contains(&library.display().to_string()));
+            assert!(error.contains(&track.display().to_string()));
         });
     }
 
