@@ -2506,12 +2506,10 @@ fn plan_typed_with_effects_and_policy(
                 reason: "HDCD Decode requires an identified lossless integer PCM 16-bit/44.1-kHz mono/stereo source".to_owned(),
             }));
         }
-        if true_peak_policy(intent.gain_policy).is_some() {
-            return Ok(PlanningOutcome::Refused(PlanRefusal {
-                code: "hdcd_certified_true_peak_unqualified".to_owned(),
-                reason: "HDCD Decode with certified true-peak Guard/Normalize is not qualified; turn off one option".to_owned(),
-            }));
-        }
+        // Certified observation must follow the source-bitstream decoder. The
+        // physical realizer binds HDCD to the original S16 source and retains
+        // the decoded waveform through the effect/resampler spine in Float64.
+        // The selected terminal proof is still charged by the same typed plan.
     }
 
     let (pre_resample_effects, post_resample_effects) =
@@ -3201,7 +3199,14 @@ fn plan_typed_with_effects_and_policy(
                     && selected_resampler_tool.as_ref() != Some(&ToolIdentifier::Ssrc)
                 {
                     for prepared in &prepared_pre_resample_effects {
-                        if matches!(prepared.instance.effect, RegisteredUnaryEffect::CdDeemphasis) {
+                        if matches!(prepared.instance.effect,
+                            RegisteredUnaryEffect::CdDeemphasis
+                                | RegisteredUnaryEffect::HdcdDecode { .. })
+                        {
+                            // HDCD is a source-bitstream decoder, not a
+                            // Float64 sample-domain effect. It runs once on
+                            // the untouched S16 input before the protected
+                            // resampler ingress is constructed.
                             continue;
                         }
                         let lowering = &prepared.candidates[0];
@@ -11082,6 +11087,123 @@ mod tests {
     }
 
     #[test]
+    fn hdcd_certified_gain_four_policies_measure_the_decoded_float64_signal() {
+        for (scope, normalize) in [
+            (TruePeakScope::Track, false),
+            (TruePeakScope::Track, true),
+            (TruePeakScope::Album, false),
+            (TruePeakScope::Album, true),
+        ] {
+            for (format, path) in [
+                (AudioFormat::Flac, "out.flac"),
+                (AudioFormat::Mp3, "out.mp3"),
+            ] {
+                let mut request = hdcd_16_44100_request();
+                request.settings.target_format = format;
+                request.output_path = PathBuf::from(path);
+                request.settings.pcm_true_peak.policy = if normalize {
+                    SampleGainPolicy::TruePeakNormalize {
+                        target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+                        scope,
+                        scan: TruePeakScanTier::Standard,
+                    }
+                } else {
+                    SampleGainPolicy::TruePeakGuard {
+                        target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+                        scope,
+                        scan: TruePeakScanTier::Standard,
+                    }
+                };
+                if scope == TruePeakScope::Album {
+                    request.plan_scope = PlanScope::submitted_batch(
+                        "hdcd-truepeak-album", "hdcd-member-1", Some(1),
+                    );
+                }
+                let Ok(PlanningOutcome::Ready(plan)) =
+                    plan_typed_with_effects(&request, &[hdcd_effect()])
+                else {
+                    panic!("HDCD+certified true-peak {:?} {:?} {path} must be ready", scope, normalize);
+                };
+                let effect_index = plan.nodes.iter().position(|node| matches!(node,
+                    TypedPlanNode::ApplyEffect { instance, .. }
+                        if matches!(instance.effect, RegisteredUnaryEffect::HdcdDecode { .. })
+                )).expect("one source-first decoder");
+                let observe_index = plan.nodes.iter().position(|node| matches!(node,
+                    TypedPlanNode::Observe(observation)
+                        if matches!(observation.kind, ObservationKind::CertifiedTruePeak { .. })
+                )).expect("certified post-HDCD observation");
+                let gain_index = plan.nodes.iter().position(|node| matches!(node,
+                    TypedPlanNode::ApplyGain { decision: Some(_), .. }
+                )).expect("single gain application");
+                assert!(effect_index < observe_index && observe_index < gain_index);
+                assert_eq!(plan.nodes.iter().filter(|node| matches!(node,
+                    TypedPlanNode::ApplyEffect { instance, .. }
+                        if matches!(instance.effect, RegisteredUnaryEffect::HdcdDecode { .. })
+                )).count(), 1);
+                assert_eq!(plan.nodes.iter().filter(|node| matches!(node,
+                    TypedPlanNode::Observe(observation)
+                        if matches!(observation.kind, ObservationKind::CertifiedTruePeak { .. })
+                )).count(), 1);
+                assert_eq!(plan.nodes.iter().filter(|node| matches!(node,
+                    TypedPlanNode::ApplyGain { decision: Some(_), .. }
+                )).count(), 1);
+                let (terminal, _) = selected_pcm_terminal(&plan);
+                match &terminal.contract.terminal_realization {
+                    Some(SelectedTerminalRealization::Pcm(realization)) => {
+                        assert_eq!(realization.input_precision,
+                            StoragePrecision::Pcm(PcmBitDepth::Float64));
+                    }
+                    Some(SelectedTerminalRealization::LossyFfmpegEncoderInput { .. }) => {}
+                    other => panic!("missing certified terminal realization: {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hdcd_certified_rate_change_precedes_measurement_once() {
+        for normalize in [false, true] {
+            let mut request = hdcd_16_44100_request();
+            request.settings.target_sample_rate = RateTarget::PcmHz(88_200);
+            request.settings.preferred_tool = PreferredTool::Ffmpeg;
+            request.settings.pcm_true_peak.policy = if normalize {
+                SampleGainPolicy::TruePeakNormalize {
+                    target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+                    scope: TruePeakScope::Track,
+                    scan: TruePeakScanTier::Standard,
+                }
+            } else {
+                SampleGainPolicy::TruePeakGuard {
+                    target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+                    scope: TruePeakScope::Track,
+                    scan: TruePeakScanTier::Standard,
+                }
+            };
+            let Ok(PlanningOutcome::Ready(plan)) =
+                plan_typed_with_effects(&request, &[hdcd_effect()])
+            else { panic!("HDCD+truepeak must admit a selected FFmpeg rate change"); };
+            let effect_index = plan.nodes.iter().position(|node| matches!(node,
+                TypedPlanNode::ApplyEffect { instance, .. }
+                    if matches!(instance.effect, RegisteredUnaryEffect::HdcdDecode { .. })
+            )).unwrap();
+            let resamplers = plan.nodes.iter().enumerate().filter_map(|(index, node)| match node {
+                TypedPlanNode::Operation {
+                    operation: PlanOperation::ResamplePcm { .. },
+                    candidates, selected_candidate, ..
+                } => Some((index, candidates[*selected_candidate].tool.clone())),
+                _ => None,
+            }).collect::<Vec<_>>();
+            assert_eq!(resamplers.len(), 1);
+            assert_eq!(resamplers[0].1, Some(ToolIdentifier::Ffmpeg));
+            let observe_index = plan.nodes.iter().position(|node| matches!(node,
+                TypedPlanNode::Observe(obs)
+                    if matches!(obs.kind, ObservationKind::CertifiedTruePeak { .. })
+            )).unwrap();
+            assert!(effect_index < resamplers[0].0 && resamplers[0].0 < observe_index);
+        }
+    }
+
+    #[test]
     fn hdcd_int16_terminal_derives_tpdf_without_mutating_caller_or_dithering_twice() {
         let mut request = hdcd_16_44100_request();
         request.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int16);
@@ -11139,10 +11261,18 @@ mod tests {
             scope: TruePeakScope::Track,
             scan: TruePeakScanTier::Standard,
         };
-        let Ok(PlanningOutcome::Refused(refusal)) =
+        let Ok(PlanningOutcome::Ready(certified)) =
             plan_typed_with_effects(&request, &[hdcd_effect()])
-        else { panic!("HDCD must not precede unqualified certified observations") };
-        assert_eq!(refusal.code, "hdcd_certified_true_peak_unqualified");
+        else { panic!("HDCD source-first decoding must precede certified observation") };
+        let decoder = certified.nodes.iter().position(|node| matches!(node,
+            TypedPlanNode::ApplyEffect { instance, .. }
+                if matches!(instance.effect, RegisteredUnaryEffect::HdcdDecode { .. })
+        )).expect("source-bitstream decoder");
+        let observation = certified.nodes.iter().position(|node| matches!(node,
+            TypedPlanNode::Observe(obs) if matches!(obs.kind,
+                ObservationKind::CertifiedTruePeak { .. })
+        )).expect("certified observation");
+        assert!(decoder < observation);
 
         request.settings.pcm_true_peak.policy = SampleGainPolicy::Off;
         request.source.true_source_depth = Some(PcmBitDepth::Int24);

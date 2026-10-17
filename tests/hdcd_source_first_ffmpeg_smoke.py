@@ -70,9 +70,9 @@ def verify_detector_scans_beyond_first_second(tmp: Path) -> None:
         assert detected is expected, f"{name}: unexpected HDCD classification: {summaries!r}"
         if expected:
             assert any("peak_extend: enabled" in line for line in summaries)
-    # The CUE member scan seeks only to whole seconds, then trims the exact
-    # residual sample count. This fixture splits at a non-second, packet-safe
-    # boundary. Neither member is allowed to inherit its neighbor's result.
+    # This is the *scan-time per-member classification*, not the conversion
+    # decoder. The scanner intentionally tests each member's own control bits;
+    # conversion must retain prior decoder state for authorized members.
     flac = tmp / "late-packet.flac"
     run("ffmpeg", "-v", "error", "-y", "-i", str(path), "-c:a", "flac", str(flac))
     split = 44_113
@@ -91,7 +91,7 @@ def verify_detector_scans_beyond_first_second(tmp: Path) -> None:
         assert summaries, f"{name}: missing HDCD classification"
         found = any("HDCD detected: yes" in line for line in summaries)
         assert found is expected, f"{name}: incorrect HDCD classification: {summaries!r}"
-    print("PASS: late HDCD detection and independent sample-bounded FLAC/CUE members")
+    print("PASS: late HDCD detection and independently classified FLAC/CUE scan members")
 
 
 def main() -> None:
@@ -113,26 +113,29 @@ def main() -> None:
             output.writeframes(pcm.tobytes())
         run("ffmpeg", "-v", "error", "-y", "-i", str(wav), "-c:a", "flac", str(flac))
 
-        # Non-second track start: one whole second plus 588 frames. FFmpeg
-        # decodes from the original 16-bit FLAC in both cases.
+        # CUE conversion must decode continuous source PCM first and cut the
+        # reconstructed signal afterwards. A non-second-aligned boundary must
+        # yield exactly the corresponding subset of the full decoder output.
         start = 44_100 + 588
         count = 44_159
-        seek = tmp / "seek.wav"
+        cue = tmp / "cue.wav"
         full = tmp / "full.wav"
         suffix = "hdcd=bits_per_sample=16:disable_autoconvert=1"
-        run("ffmpeg", "-nostdin", "-v", "error", "-y", "-ss", "1", "-i", str(flac),
-            "-map", "0:a:0", "-af", f"atrim=start_sample=588:end_sample={588 + count},asetpts=PTS-STARTPTS,{suffix}",
-            "-c:a", "pcm_s32le", "-f", "wav", str(seek))
         run("ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(flac),
-            "-map", "0:a:0", "-af", f"atrim=start_sample={start}:end_sample={start + count},asetpts=PTS-STARTPTS,{suffix}",
+            "-map", "0:a:0", "-af",
+            f"{suffix},atrim=start_sample={start}:end_sample={start + count},asetpts=PTS-STARTPTS",
+            "-c:a", "pcm_s32le", "-f", "wav", str(cue))
+        run("ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(flac),
+            "-map", "0:a:0", "-af", suffix,
             "-c:a", "pcm_s32le", "-f", "wav", str(full))
-        lhs, rhs = decoded_samples(seek), decoded_samples(full)
+        lhs = decoded_samples(cue)
+        rhs = decoded_samples(full)[start*8:(start + count)*8]
         assert len(lhs) == count * 2 * 4
-        assert lhs == rhs, "coarse seek and sample-exact CUE trim disagree"
+        assert lhs == rhs, "continuous HDCD -> exact CUE cut differs from full decode"
         probe = subprocess.check_output([
             "ffprobe", "-v", "error", "-select_streams", "a:0",
             "-show_entries", "stream=sample_rate,channels,sample_fmt,codec_name",
-            "-of", "json", str(seek),
+            "-of", "json", str(cue),
         ])
         audio = json.loads(probe)["streams"][0]
         assert audio == {

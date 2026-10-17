@@ -10294,18 +10294,9 @@ fn execute_commit_with_source_options_transform(
     }
     let hdcd_path_states = app.convert.source.hdcd_scan_results.clone();
     let hdcd_decode_enabled = app.convert.format.hdcd_decode_enabled;
-    let hdcd_actionable = hdcd_path_states.values().any(|state| state.has_actionable());
-    if hdcd_decode_enabled && hdcd_actionable {
-        let format = &app.convert.format;
-        // Explicit 16-bit lossless output is valid: the registered-effect
-        // carrier retains HDCD precision until the selected final quantizer.
-        if matches!(*format.pcm_gain_mode.selected_value(),
-            super::app::PcmGainMode::TruePeakGuard | super::app::PcmGainMode::TruePeakNormalize)
-        {
-            app.set_status("HDCD Decode plus certified true-peak gain is not qualified; disable one option");
-            return;
-        }
-    }
+    // HDCD/true-peak composition is admitted by the typed plan and the
+    // pre-observation execution contract, not by a blanket UI refusal.
+    // Source scan identity, per-member selection and other commit gates remain.
 
     let mut deemphasis_path_states = app.convert.source.deemphasis_batch_preflight.clone();
     if !matches!(&app.convert.source.mode, SourceMode::Batch { .. }) {

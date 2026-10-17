@@ -1,0 +1,1190 @@
+--- a/src/convert/pipeline/stages.rs
++++ b/src/convert/pipeline/stages.rs
+@@ -30532,8 +30532,9 @@
+     pub(crate) scheduler_failure_context: Option<ScheduledAlbumFailureContext>,
+     pub(crate) reference_auto_gain_measurements: Vec<ReferenceAutoGainPreparedMeasurement>,
+     pub(crate) dsd_true_peak_measurements: Vec<CertifiedTruePeakPreparedMeasurement>,
+     pub(crate) pcm_true_peak_measurements: Vec<CertifiedTruePeakPreparedMeasurement>,
++    pcm_effect_preludes: BTreeMap<TrackId, CertifiedEffectPrelude>,
+     dsd_true_peak_timings: BTreeMap<TrackId, DsdAlbumGainTiming>,
+     pub(crate) album_gain_scope_disclosure: Option<DsdAlbumGainScopeDisclosure>,
+     run_timing: ConversionRunTiming,
+     action_output: Option<PipelineOutputCapability>,
+@@ -30577,8 +30578,9 @@
+     source_replaygain: Option<crate::convert::replaygain::ReplayGainSourceScan>,
+     batch_replaygain: Option<Result<crate::convert::replaygain::ReplayGainSourceScan, String>>,
+     dsd_true_peak_measurements: Vec<CertifiedTruePeakPreparedMeasurement>,
+     pcm_true_peak_measurements: Vec<CertifiedTruePeakPreparedMeasurement>,
++    pcm_effect_preludes: BTreeMap<TrackId, CertifiedEffectPrelude>,
+     dsd_true_peak_timings: BTreeMap<TrackId, DsdAlbumGainTiming>,
+     album_gain_scope_disclosure: Option<DsdAlbumGainScopeDisclosure>,
+     run_timing: ConversionRunTiming,
+     action_output: Option<PipelineOutputCapability>,
+@@ -30704,8 +30706,9 @@
+             source_replaygain: album.source_replaygain.clone(),
+             batch_replaygain: album.batch_replaygain.clone(),
+             dsd_true_peak_measurements: album.dsd_true_peak_measurements.clone(),
+             pcm_true_peak_measurements: album.pcm_true_peak_measurements.clone(),
++            pcm_effect_preludes: album.pcm_effect_preludes.clone(),
+             dsd_true_peak_timings: album.dsd_true_peak_timings.clone(),
+             album_gain_scope_disclosure: album.album_gain_scope_disclosure.clone(),
+             run_timing: album.run_timing.clone(),
+             action_output,
+@@ -30902,8 +30905,9 @@
+         scheduler_failure_context: None,
+         reference_auto_gain_measurements: Vec::new(),
+         dsd_true_peak_measurements: seed.dsd_true_peak_measurements,
+         pcm_true_peak_measurements: seed.pcm_true_peak_measurements,
++        pcm_effect_preludes: seed.pcm_effect_preludes,
+         dsd_true_peak_timings: seed.dsd_true_peak_timings,
+         album_gain_scope_disclosure: seed.album_gain_scope_disclosure,
+         run_timing: seed.run_timing,
+         action_output: seed.action_output,
+@@ -30978,8 +30982,9 @@
+         scheduler_failure_context: None,
+         reference_auto_gain_measurements: Vec::new(),
+         dsd_true_peak_measurements: Vec::new(),
+         pcm_true_peak_measurements: Vec::new(),
++        pcm_effect_preludes: BTreeMap::new(),
+         dsd_true_peak_timings: BTreeMap::new(),
+         album_gain_scope_disclosure: None,
+         run_timing: ConversionRunTiming::start(),
+         action_output: None,
+@@ -35837,16 +35842,30 @@
+     pub terminal_bound: tonepoet_pipeline::AlbumTerminalBound,
+     pub execution: CertifiedTruePeakExecutionContract,
+ }
+ 
++/// Commands and semantic effects already realized in the submitted-batch
++/// prepass. Preserved separately from the retained measured carrier so the
++/// terminal track record can attribute them without executing them twice.
++#[derive(Debug, Clone, Default)]
++struct CertifiedEffectPrelude {
++    commands: Vec<CommandRecord>,
++    evidence: TrackExecutionEvidence,
++}
++
+ #[derive(Default)]
+ struct PreparedPcmTruePeakCarriers {
+     measurements: Vec<CertifiedTruePeakPreparedMeasurement>,
++    effect_preludes: BTreeMap<TrackId, CertifiedEffectPrelude>,
+ }
+ 
+ struct PreparedPcmTruePeakCarrier {
+     source_ref: TrackSourceRef,
+     measurement: CertifiedTruePeakPreparedMeasurement,
++    // The source-first effect prelude is executed before measurement, but its
++    // commands/evidence must precede terminal work in the final track record.
++    preparation_commands: Vec<CommandRecord>,
++    preparation_evidence: TrackExecutionEvidence,
+ }
+ 
+ fn pcm_true_peak_tier(
+     mode: tonepoet_pipeline::TruePeakScanTier,
+@@ -36044,8 +36063,14 @@
+         // This helper feeds terminal-bound validation after typed terminal
+         // selection, so it must describe the concrete physical landing depth
+         // rather than preserve the Source policy sentinel.
+         settings.target_bit_depth = BitDepthTarget::Pcm(depth);
++    }
++    // Planning derives source-effect TPDF per admitted member, rather than
++    // mutating batch settings. The certified terminal bound must read that
++    // same member-local dither decision as the eventual encoder replan.
++    if super::plan_bridge::registered_effect_auto_terminal_tpdf_requested(req, track, &settings) {
++        settings.dither_type = DitherType::Tpdf;
+     }
+     settings
+ }
+ 
+@@ -38270,26 +38295,38 @@
+         return Err("PCM true-peak analysis cancelled".to_string());
+     }
+     let original_source_path = track_source_identity_path(&track).to_path_buf();
+     let source_ref = track.source_ref.clone();
+-    let realized = realize_track_with_tool_limits_and_stats(
+-        &source_ref,
+-        Some(&track),
+-        req,
+-        staging,
+-        runner,
+-        cancel,
+-        tool_concurrency_limits.clone(),
+-        false,
+-        None,
+-    )
+-    .await
+-    .map_err(|error| {
+-        format!(
+-            "could not realize PCM track {} for true-peak analysis: {error}",
+-            track.id.source_ordinal,
++    let (track_effects, hdcd_cue_span) = registered_effects_for_hdcd_cue_member(
++        &req.registered_effects, track.id.source_ordinal,
++    )?;
++    let hdcd_active = track_effects.iter().any(|effect| matches!(
++        effect.effect, tonepoet_pipeline::RegisteredUnaryEffect::HdcdDecode { .. }
++    ));
++    // Never realize the ordinary S32 CUE fallback before an HDCD scan: its
++    // decoded samples have already lost the original HDCD bitstream contract.
++    let realized = if hdcd_active && hdcd_cue_span.is_some() {
++        RealizedTrackInfo::without_stats(original_source_path.clone())
++    } else {
++        realize_track_with_tool_limits_and_stats(
++            &source_ref,
++            Some(&track),
++            req,
++            staging,
++            runner,
++            cancel,
++            tool_concurrency_limits.clone(),
++            false,
++            None,
+         )
+-    })?;
++        .await
++        .map_err(|error| {
++            format!(
++                "could not realize PCM track {} for true-peak analysis: {error}",
++                track.id.source_ordinal,
++            )
++        })?
++    };
+     let source = source_info_for_true_peak_realized_track(
+         &track,
+         &realized.path,
+         runner,
+@@ -38327,14 +38364,14 @@
+             "could not bind PCM track {} to its common typed execution plan: {error}",
+             track.id.source_ordinal,
+         )
+     })?;
+-    let execution = if req.registered_effects.is_empty() {
++    let execution = if track_effects.is_empty() {
+         certified_true_peak_execution_contract(&typed_request)
+     } else {
+         certified_true_peak_execution_contract_with_effects(
+             &typed_request,
+-            &req.registered_effects,
++            &track_effects,
+         )
+     }
+     .map_err(|error| {
+         format!(
+@@ -38412,10 +38449,108 @@
+     let carrier_hash = stable_path_hash(&original_source_path);
+     let raw_carrier_path = carrier_dir.join(format!("track-{track_stem}-{carrier_hash}.f64le"));
+     let mut carrier_path = raw_carrier_path.clone();
+     let _ = fs::remove_file(&raw_carrier_path);
++    let mut preparation_commands = Vec::new();
++    let mut preparation_evidence = TrackExecutionEvidence::default();
+     let mut retained_ssrc_ingress: Option<RetainedSsrcTruePeakIngress> = None;
+-    if let Some(resampler) = execution
++    if hdcd_active {
++        // Qualify the whole plan before decoding. The registered-effect
++        // executor consumes the selected certified pre-observation spine,
++        // including exactly one frozen resampler and all ordered effects.
++        // A protected SSRC replay cannot begin at an HDCD-derived ingress
++        // under the existing commissioned evidence; it remains unavailable.
++        if ssrc_terminal_binding.is_some() {
++            return Err("HDCD-derived protected SSRC true-peak ingress/replay is not commissioned".into());
++        }
++        let prepared_effects = prepare_registered_effect_carrier_for_track(
++            req,
++            track.clone(),
++            planned_output,
++            staging,
++            runner,
++            cancel,
++            tool_paths,
++            tool_concurrency_limits.clone(),
++            Some(&execution),
++            &mut preparation_commands,
++            &mut preparation_evidence,
++        )
++        .await?;
++        let TrackSourceRef::RegisteredEffectCarrier {
++            path: effect_path,
++            sample_rate_hz: effected_rate,
++            channels: effected_channels,
++            representation,
++            resampler_consumed,
++            ..
++        } = prepared_effects.source_ref else {
++            return Err("HDCD pre-observation spine did not produce a registered-effect carrier".into());
++        };
++        if effected_rate != target_rate_hz || effected_channels != channels
++            || resampler_consumed != execution.pre_observation_resampler.is_some()
++        {
++            return Err("HDCD pre-observation carrier disagrees with the certified typed rate, channel geometry or resampler count".into());
++        }
++        match representation {
++            RegisteredEffectCarrierRepresentation::RawFloat64 => {
++                carrier_path = effect_path;
++            }
++            RegisteredEffectCarrierRepresentation::Float64Wav => {
++                // This is a container-only, bit-preserving Float64 unwrapping.
++                // No filter, rate change, channel operation, gain, or dither is
++                // permitted between the measured waveform and the effect spine.
++                let command = tonepoet_pipeline::PlannedCommand::new(
++                    tonepoet_pipeline::ToolIdentifier::Ffmpeg,
++                    vec![
++                        "-y".into(), "-nostdin".into(), "-hide_banner".into(),
++                        "-loglevel".into(), "error".into(), "-i".into(),
++                        effect_path.to_string_lossy().into_owned(),
++                        "-map".into(), "0:a:0".into(), "-vn".into(),
++                        "-sn".into(), "-dn".into(), "-c:a".into(),
++                        "pcm_f64le".into(), "-f".into(), "f64le".into(),
++                        carrier_path.to_string_lossy().into_owned(),
++                    ],
++                    tonepoet_pipeline::InputSource::Path(effect_path.clone()),
++                    tonepoet_pipeline::OutputSink::Path(carrier_path.clone()),
++                    source.duration,
++                    "unwrap certified post-HDCD Float64 WAV without sample processing",
++                );
++                let unwrap_invocation = preparation_commands.len();
++                run_recorded_planned_command(
++                    &command, runner, cancel, tool_concurrency_limits.as_ref(),
++                    &mut preparation_commands,
++                )
++                .await
++                .map_err(|error| {
++                    let _ = fs::remove_file(&carrier_path);
++                    format!("HDCD Float64 observation unwrapping failed: {error}")
++                })?;
++                let mut operation = OperationRecord::completed(
++                    "hdcd-true-peak-float64-unwrapping",
++                    "pcm_carrier_unwrap",
++                    "Float64 WAV to headerless Float64 carrier",
++                    ExecutionBackend::external("ffmpeg"),
++                );
++                operation.inputs.push(super::execution_evidence::EvidenceArtifactRef::path("float64-wave", &effect_path));
++                operation.outputs.push(super::execution_evidence::EvidenceArtifactRef::path("certified-scan-input", &carrier_path));
++                operation.invocation_indices.push(unwrap_invocation);
++                preparation_evidence.operations.push(operation);
++            }
++            _ => return Err(
++                "HDCD true-peak pre-observation path performed terminal quantization before measurement".into(),
++            ),
++        }
++        // Protect the observation from an accidentally truncated, empty, or
++        // invalid raw carrier before the certified meter sees any samples.
++        let bytes = fs::metadata(&carrier_path)
++            .map_err(|error| format!("HDCD Float64 observation carrier missing: {error}"))?
++            .len();
++        let frame_bytes = u64::from(channels) * 8;
++        if bytes == 0 || bytes % frame_bytes != 0 {
++            return Err("HDCD true-peak Float64 carrier is empty or frame-misaligned".into());
++        }
++    } else if let Some(resampler) = execution
+         .pre_observation_resampler
+         .as_ref()
+         .filter(|resampler| {
+             resampler.selected.tool == tonepoet_pipeline::ToolIdentifier::Ssrc
+@@ -38665,8 +38800,10 @@
+             measurement,
+             terminal_bound,
+             execution,
+         },
++        preparation_commands,
++        preparation_evidence,
+     })
+ }
+ 
+ #[cfg(test)]
+@@ -38819,19 +38956,31 @@
+         return Err(error);
+     }
+ 
+     let mut measurements = Vec::new();
++    let mut effect_preludes = BTreeMap::new();
+     for (track_index, carrier) in carriers.into_iter().enumerate() {
+         let Some(carrier) = carrier else {
+             continue;
+         };
+         let decision_scope = carrier.measurement.execution.scope;
+         prepared.tracks[track_index].source_ref = carrier.source_ref;
++        if !carrier.preparation_commands.is_empty()
++            || !carrier.preparation_evidence.operations.is_empty()
++        {
++            effect_preludes.insert(
++                carrier.measurement.track_id.clone(),
++                CertifiedEffectPrelude {
++                    commands: carrier.preparation_commands,
++                    evidence: carrier.preparation_evidence,
++                },
++            );
++        }
+         if decision_scope == tonepoet_pipeline::TruePeakScope::Album {
+             measurements.push(carrier.measurement);
+         }
+     }
+-    Ok(PreparedPcmTruePeakCarriers { measurements })
++    Ok(PreparedPcmTruePeakCarriers { measurements, effect_preludes })
+ }
+ 
+ fn certified_true_peak_gained_path(path: &Path, gain_db: tonepoet_pipeline::DbNano) -> PathBuf {
+     let stem = path
+@@ -39796,8 +39945,9 @@
+     runner: &dyn ToolRunner,
+     cancel: &CancellationToken,
+     tool_paths: &HashMap<String, PathBuf>,
+     tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
++    certified: Option<&CertifiedTruePeakExecutionContract>,
+     preparation_commands: &mut Vec<CommandRecord>,
+     preparation_evidence: &mut TrackExecutionEvidence,
+ ) -> Result<PreparedTrack, String> {
+     if req.registered_effects.is_empty() {
+@@ -39850,13 +40000,13 @@
+         req.settings.dsd.gain_policy()
+     } else {
+         req.settings.pcm_true_peak.policy
+     };
+-    if policy.is_true_peak() {
+-        if hdcd_guard.is_some() {
+-            return Err("HDCD Decode with certified true-peak gain is not qualified".into());
+-        }
+-        return Ok(track);
++    if policy.is_true_peak() && certified.is_none() {
++        return Err("certified true-peak registered effects require a bound pre-observation execution contract".into());
++    }
++    if !policy.is_true_peak() && certified.is_some() {
++        return Err("certified effect prelude requires an active certified gain decision".into());
+     }
+     if cancel.is_cancelled() {
+         return Err("registered-effect carrier preparation cancelled".to_string());
+     }
+@@ -39931,15 +40081,39 @@
+             "could not bind track {} registered effects to the common typed plan: {error}",
+             track.id.source_ordinal,
+         )
+     })?;
+-    let mut execution = registered_effect_execution_contract(&plan_request, &track_effects)
+-        .map_err(|error| {
+-            format!(
+-                "could not bind track {} registered-effect execution contract: {error}",
+-                track.id.source_ordinal,
+-            )
+-        })?;
++    let mut execution = if let Some(certified) = certified {
++        // Reuse the *same* typed pre-observation spine that authorizes the
++        // later certified gain decision. The separate effect-only planner is
++        // not an acceptable authority here: it can choose another resampler
++        // or terminal once its true-peak policy is removed.
++        let effect_count = certified.pre_resample.as_ref().map_or(0, |part| part.lowerings.len())
++            + certified.post_resample.as_ref().map_or(0, |part| part.lowerings.len());
++        if effect_count != track_effects.len() {
++            return Err(format!(
++                "track {} certified effect spine contains {} effect(s) for {} admitted intents",
++                track.id.source_ordinal, effect_count, track_effects.len(),
++            ));
++        }
++        super::plan_bridge::RegisteredEffectExecutionContract {
++            pre_resample: certified.pre_resample.clone(),
++            resampler: certified.pre_observation_resampler.clone(),
++            post_resample: certified.post_resample.clone(),
++            output: certified.observation_subject,
++            sample_rate_hz: certified.sample_rate_hz,
++            channels: certified.channels,
++            level_basis: certified.level_basis,
++        }
++    } else {
++        registered_effect_execution_contract(&plan_request, &track_effects)
++            .map_err(|error| {
++                format!(
++                    "could not bind track {} registered-effect execution contract: {error}",
++                    track.id.source_ordinal,
++                )
++            })?
++    };
+     let source_channels = source.channels.filter(|channels| *channels > 0).ok_or_else(|| {
+         format!(
+             "track {} has no authoritative channel geometry for registered effects",
+             track.id.source_ordinal,
+@@ -40470,8 +40644,9 @@
+                 runner,
+                 cancel,
+                 tool_paths,
+                 tool_concurrency_limits,
++                None,
+                 preparation_commands,
+                 preparation_evidence,
+             )
+             .await;
+@@ -40545,8 +40720,10 @@
+             "track {} certified PCM observation resolved {:?} scope inside a Track-scoped worker",
+             track.id.source_ordinal, carrier.measurement.execution.scope,
+         ));
+     }
++    preparation_evidence.append(carrier.preparation_evidence, preparation_commands.len());
++    preparation_commands.extend(carrier.preparation_commands);
+     track.source_ref = carrier.source_ref;
+     Ok(track)
+ }
+ 
+@@ -42644,8 +42821,9 @@
+             );
+         }
+     };
+     let pcm_true_peak_measurements = prepared_pcm_true_peak_carriers.measurements;
++    let pcm_effect_preludes = prepared_pcm_true_peak_carriers.effect_preludes;
+ 
+     ScheduledMaterialization::Ready(ScheduledAlbum {
+         item_id,
+         req,
+@@ -42658,8 +42836,9 @@
+         scheduler_failure_context: None,
+         reference_auto_gain_measurements,
+         dsd_true_peak_measurements,
+         pcm_true_peak_measurements,
++        pcm_effect_preludes,
+         dsd_true_peak_timings,
+         album_gain_scope_disclosure: None,
+         run_timing,
+         action_output,
+@@ -45179,8 +45358,9 @@
+     let action_output = album.action_output;
+     let source_replaygain = album.source_replaygain;
+     let batch_replaygain = album.batch_replaygain;
+     let dsd_true_peak_timings = album.dsd_true_peak_timings;
++    let album_pcm_effect_preludes = album.pcm_effect_preludes;
+     let album_gain_scope_disclosure = album.album_gain_scope_disclosure;
+     let req = album.req;
+     let item_id = req.item_id.clone();
+     let staging = album.staging;
+@@ -45194,8 +45374,27 @@
+     // value is ever read.
+     let publication_binding;
+ 
+     emit_stage_started(reporter, &item_id, PipelineStage::Convert).await;
++    let mut track_outputs = track_outputs;
++    // Album effects were executed before the album scalar existed. Attach
++    // their actual commands/receipts ahead of terminal commands, offsetting
++    // every terminal invocation reference. This applies equally on a retained
++    // scratch retry, without rerunning or double-reporting the effect prelude.
++    for output in &mut track_outputs {
++        if let Some(prelude) = album_pcm_effect_preludes.get(&output.record.track_id) {
++            let mut commands = prelude.commands.clone();
++            let offset = commands.len();
++            commands.append(&mut output.record.commands);
++            output.record.commands = commands;
++            let mut evidence = prelude.evidence.clone();
++            if !matches!(output.record.outcome, TrackOutcome::Ok) {
++                evidence.mark_discarded_attempt();
++            }
++            evidence.append(std::mem::take(&mut output.record.execution_evidence), offset);
++            output.record.execution_evidence = evidence;
++        }
++    }
+     let converted = convert_result_from_scheduled_outputs(
+         &source_value,
+         track_outputs,
+         &req,
+@@ -69853,8 +70052,9 @@
+                 scheduler_failure_context: None,
+                 reference_auto_gain_measurements: Vec::new(),
+                 dsd_true_peak_measurements: Vec::new(),
+                 pcm_true_peak_measurements: Vec::new(),
++                pcm_effect_preludes: BTreeMap::new(),
+                 dsd_true_peak_timings: BTreeMap::new(),
+                 album_gain_scope_disclosure: None,
+                 run_timing: ConversionRunTiming::start(),
+                         _run_lock: run_lock,
+--- a/src/convert/pipeline/plan_bridge.rs
++++ b/src/convert/pipeline/plan_bridge.rs
+@@ -1609,8 +1609,12 @@
+     pub level_basis: tonepoet_pipeline::LevelBasis,
+     pub read_contract: tonepoet_pipeline::ObservationReadContract,
+     pub terminal_subject: tonepoet_pipeline::SignalId,
+     pub terminal_proof: tonepoet_pipeline::TerminalProofContract,
++    /// Typed source-rate effects preceding the selected PCM resampler, if any.
++    /// HDCD is a source-bitstream decoder whose physical S16 lowering is
++    /// consumed before building a Float64 resampler ingress.
++    pub pre_resample: Option<RegisteredEffectSegment>,
+     /// Frozen selected PCM resampler before the certified observation, when a
+     /// rate change is part of the typed signal spine.
+     pub pre_observation_resampler: Option<SelectedPcmResamplerExecutionContract>,
+     /// Ordered registered effects after the selected PCM resampler and before
+@@ -2063,13 +2067,25 @@
+             observation_node_index,
+             "certified pre-observation",
+             true,
+         )?;
+-    if pre_resample.is_some() {
+-        return Err(ConvertError::Backend(
+-            "certified true-peak execution cannot consume an unqualified pre-resample registered effect"
+-                .to_string(),
+-        ));
++    if let Some(pre) = &pre_resample {
++        // Source-first HDCD may precede a qualified FFmpeg/soxr Float64
++        // resampler. This is not a general exception for unqualified
++        // sample-domain filters or for protected SSRC ingress/replay.
++        let source_bitstream_only = pre.lowerings.len() == 1
++            && pre.lowerings[0].tool == tonepoet_pipeline::ToolIdentifier::Ffmpeg
++            && matches!(&pre.lowerings[0].arguments,
++                tonepoet_pipeline::EffectArgumentMapping::FfmpegAudioFilter(filter)
++                    if filter == "hdcd=bits_per_sample=16:disable_autoconvert=1");
++        let qualified_resampler = pre_observation_resampler.as_ref().is_some_and(|resampler|
++            resampler.selected.tool == tonepoet_pipeline::ToolIdentifier::Ffmpeg);
++        if !source_bitstream_only || !qualified_resampler {
++            return Err(ConvertError::Backend(
++                "certified true-peak pre-resample effects require an admitted source-first HDCD and FFmpeg/soxr Float64 resampler; protected SSRC and other pre-effects remain unqualified"
++                    .to_string(),
++            ));
++        }
+     }
+     let pre_observation_output = post_resample
+         .as_ref()
+         .map(|segment| segment.output)
+@@ -2179,8 +2195,9 @@
+         level_basis: input_state.level_basis,
+         read_contract: observation.read_contract.clone(),
+         terminal_subject: gain_output,
+         terminal_proof,
++        pre_resample,
+         pre_observation_resampler,
+         post_resample,
+         charged_terminal,
+     })
+@@ -3205,51 +3222,59 @@
+         }
+     })
+ }
+ 
++/// The terminal observation proof and the concrete encoder must derive the
++/// same request-local automatic dither. CUE-scoped HDCD does not grant any
++/// terminal authority to unrelated batch members.
++pub(super) fn registered_effect_auto_terminal_tpdf_requested(
++    request: &PipelineRequest,
++    track: &PreparedTrack,
++    settings: &PipelineSettings,
++) -> bool {
++    if settings.dither_explicit
++        || !(request_applies_cd_deemphasis(request)
++            || request_applies_hdcd_to_track(request, track))
++        || !settings.target_format.is_pcm_lossless()
++        || (settings.target_format == PlannerFormat::WavPack
++            && settings.wavpack.hybrid)
++    {
++        return false;
++    }
++    let target_depth = match settings.target_bit_depth {
++        BitDepthTarget::Source => resolve_source_pcm_depth(track).map(|source_depth| {
++            tonepoet_pipeline::source_pcm_depth_for_target(
++                &settings.target_format,
++                settings.wavpack.hybrid,
++                source_depth,
++            )
++        }),
++        BitDepthTarget::Pcm(depth) => Some(depth),
++    };
++    target_depth == Some(PcmBitDepth::Int16)
++}
++
+ fn apply_registered_effect_terminal_dither_authority(
+     request: &PipelineRequest,
+     track: &PreparedTrack,
+     settings: &mut PipelineSettings,
+ ) {
+-    if request.settings.dither_explicit
+-        || !(request_applies_cd_deemphasis(request)
+-            || request_applies_hdcd_to_track(request, track))
+-        || !request.settings.target_format.is_pcm_lossless()
+-        || (request.settings.target_format == PlannerFormat::WavPack
+-            && request.settings.wavpack.hybrid)
+-    {
++    if !registered_effect_auto_terminal_tpdf_requested(request, track, settings) {
+         return;
+     }
+-
+-    let TrackSourceRef::RegisteredEffectCarrier { representation, .. } = &track.source_ref else {
+-        return;
++    let high_precision_carrier = match &track.source_ref {
++        TrackSourceRef::RegisteredEffectCarrier { representation, .. } => matches!(
++            representation,
++            RegisteredEffectCarrierRepresentation::RawFloat64
++                | RegisteredEffectCarrierRepresentation::Float64Wav
++        ),
++        TrackSourceRef::PcmTruePeakCarrier { .. } => true,
++        _ => false,
+     };
+-    if !matches!(
+-        representation,
+-        RegisteredEffectCarrierRepresentation::RawFloat64
+-            | RegisteredEffectCarrierRepresentation::Float64Wav
+-    ) {
+-        // A terminal SSRC carrier already owns quantization/dither. Reasserting
+-        // TPDF here would duplicate sample processing during package-only work.
+-        return;
+-    }
+-
+-    let target_depth = match request.settings.target_bit_depth {
+-        BitDepthTarget::Source => resolve_source_pcm_depth(track).map(|source_depth| {
+-            tonepoet_pipeline::source_pcm_depth_for_target(
+-                &request.settings.target_format,
+-                request.settings.wavpack.hybrid,
+-                source_depth,
+-            )
+-        }),
+-        BitDepthTarget::Pcm(depth) => Some(depth),
+-    };
+-    if target_depth == Some(PcmBitDepth::Int16) {
+-        // The typed planner derives automatic TPDF for the member actually
+-        // receiving CD de-emphasis or HDCD. Phase 3 replans the terminal after
+-        // realizing that effect into Float64: carry the non-explicit decision
+-        // across the private carrier, without imposing it on other members.
++    if high_precision_carrier {
++        // Terminal SSRC output owns its quantization and must not receive a
++        // second dither. For normal effects and certified true-peak carriers,
++        // the encoder is still the unique terminal quantization owner.
+         settings.dither_type = tonepoet_pipeline::DitherType::Tpdf;
+     }
+ }
+ 
+@@ -4683,8 +4708,78 @@
+         }
+     }
+ 
+     #[test]
++    fn hdcd_true_peak_contract_freezes_source_first_effect_and_one_resampler() {
++        let temp = TempDir::new().expect("temp dir");
++        let source_path = temp.path().join("source.flac");
++        let output_path = temp.path().join("out.flac");
++        let mut req = request(temp.path());
++        req.settings.target_format = PlannerFormat::Flac;
++        req.settings.target_sample_rate = tonepoet_pipeline::RateTarget::PcmHz(88_200);
++        req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(PcmBitDepth::Int24);
++        req.settings.preferred_tool = PreferredTool::Ffmpeg;
++        req.settings.pcm_true_peak.policy = tonepoet_pipeline::SampleGainPolicy::TruePeakGuard {
++            target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
++            scope: tonepoet_pipeline::TruePeakScope::Track,
++            scan: tonepoet_pipeline::TruePeakScanTier::Standard,
++        };
++        let mut prepared = track(TrackSourceRef::StagedFile(source_path.clone()));
++        prepared.sample_rate = Some(44_100);
++        prepared.bit_depth = Some(16);
++        prepared.source_audio = SourceAudioDescriptor::from_scalar(
++            Some(44_100), Some(16), Some(SourceAudioCoding::Pcm),
++        );
++        req.registered_effects = vec![hdcd_decode_effect(Vec::new())];
++        let planned = super::plan_request_for_track_with_resolved_source(
++            &req, &prepared, &source_path, &output_path,
++            temp.path().join("work"),
++            pcm_source_info(PlannerFormat::Flac,
++                PlannerCodec::PcmSigned, 44_100, PcmBitDepth::Int16),
++        ).expect("resolved source model");
++        let contract = certified_true_peak_execution_contract_with_effects(
++            &planned, &req.registered_effects,
++        ).expect("HDCD/true-peak effect spine");
++        let source_first = contract.pre_resample.as_ref().expect("HDCD source-first segment");
++        assert_eq!(source_first.lowerings.len(), 1);
++        assert_eq!(source_first.lowerings[0].tool, tonepoet_pipeline::ToolIdentifier::Ffmpeg);
++        assert_eq!(contract.pre_observation_resampler.as_ref().unwrap().selected.tool,
++            tonepoet_pipeline::ToolIdentifier::Ffmpeg);
++        assert!(contract.post_resample.is_none());
++        assert_eq!(contract.sample_rate_hz, 88_200);
++        assert_eq!(contract.scope, tonepoet_pipeline::TruePeakScope::Track);
++    }
++
++    #[test]
++    fn hdcd_true_peak_terminal_auto_tpdf_is_member_local_and_explicit_off_wins() {
++        let temp = TempDir::new().expect("temp dir");
++        let mut req = request(temp.path());
++        req.settings.target_format = PlannerFormat::Flac;
++        req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(PcmBitDepth::Int16);
++        req.registered_effects = vec![hdcd_decode_effect(vec![
++            tonepoet_pipeline::HdcdCueSegment {
++                source_ordinal: 2, start_sample: 44_100, sample_count: 44_100,
++            },
++        ])];
++        for (ordinal, expected) in [(1, false), (2, true)] {
++            let mut member = track(TrackSourceRef::StagedFile(temp.path().join("album.flac")));
++            member.id.source_ordinal = ordinal;
++            member.source_audio = SourceAudioDescriptor::from_scalar(
++                Some(44_100), Some(16), Some(SourceAudioCoding::Pcm),
++            );
++            assert_eq!(super::registered_effect_auto_terminal_tpdf_requested(
++                &req, &member, &req.settings,
++            ), expected, "member {ordinal} auto-dither authority");
++            req.settings.dither_explicit = true;
++            req.settings.dither_type = tonepoet_pipeline::DitherType::None;
++            assert!(!super::registered_effect_auto_terminal_tpdf_requested(
++                &req, &member, &req.settings,
++            ));
++            req.settings.dither_explicit = false;
++        }
++    }
++
++    #[test]
+     fn r4c_hdcd_cue_dither_bridge_is_effectual_member_only() {
+         let temp = TempDir::new().expect("temp dir");
+         let carrier = temp.path().join("cue.f64le");
+         std::fs::write(&carrier, [0_u8; 32]).expect("raw Float64 carrier");
+--- a/src/tui/command.rs
++++ b/src/tui/command.rs
+@@ -10292,21 +10292,11 @@
+         app.set_status("HDCD source analysis is incomplete or stale — reselect the source before committing");
+         return;
+     }
+     let hdcd_path_states = app.convert.source.hdcd_scan_results.clone();
+-    let hdcd_decode_enabled = app.convert.format.hdcd_decode_enabled;
+-    let hdcd_actionable = hdcd_path_states.values().any(|state| state.has_actionable());
+-    if hdcd_decode_enabled && hdcd_actionable {
+-        let format = &app.convert.format;
+-        // Explicit 16-bit lossless output is valid: the registered-effect
+-        // carrier retains HDCD precision until the selected final quantizer.
+-        if matches!(*format.pcm_gain_mode.selected_value(),
+-            super::app::PcmGainMode::TruePeakGuard | super::app::PcmGainMode::TruePeakNormalize)
+-        {
+-            app.set_status("HDCD Decode plus certified true-peak gain is not qualified; disable one option");
+-            return;
+-        }
+-    }
++    // HDCD/true-peak composition is admitted by the typed plan and the
++    // pre-observation execution contract, not by a blanket UI refusal.
++    // Source scan identity, per-member selection and other commit gates remain.
+ 
+     let mut deemphasis_path_states = app.convert.source.deemphasis_batch_preflight.clone();
+     if !matches!(&app.convert.source.mode, SourceMode::Batch { .. }) {
+         if let (Some(path), Some(info)) = (
+--- a/src/tui/app.rs
++++ b/src/tui/app.rs
+@@ -6166,12 +6166,11 @@
+         if !self.pcm_gain_overridden {
+             let float_to_integer = self.source_pcm_float_bits.is_some()
+                 && self.auto_gain_target_is_integer_pcm();
+             let lossless_to_lossy = self.source_is_lossless == Some(true) && lossy_target;
+-            // An effectual HDCD decode cannot be combined with certified
+-            // true-peak gain. Prefer the source-derived HDCD recovery over an
+-            // incompatible *automatic* guard; explicit gain remains authoritative
+-            // and the commit-time refusal still protects that combination.
++            // Keep the longstanding conservative auto-gain default when HDCD
++            // is selected. Manual Guard and Normalize are now composable with
++            // source-first HDCD and remain authoritative.
+             let hdcd_lossy_decode = lossy_target
+                 && self.hdcd_decode_enabled
+                 && self.hdcd_is_actionable();
+             if !self.source_is_dsd
+@@ -25408,19 +25407,19 @@
+         assert_eq!(*state.pcm_gain_mode.selected_value(), PcmGainMode::TruePeakGuard);
+         assert!(state.select_row_index(FormatField::HdcdDecode, 1, Some(16), Some(44_100)));
+         assert_eq!(*state.pcm_gain_mode.selected_value(), PcmGainMode::Off);
+ 
+-        // Explicit TruePeak Guard/Normalize must NOT be silently disabled:
+-        // the existing commit-time HDCD/true-peak qualification refusal owns it.
++        // Explicit TruePeak Guard/Normalize remain authoritative with HDCD;
++        // the typed planner qualifies their source-first execution route.
+         for gain in [PcmGainMode::TruePeakGuard, PcmGainMode::TruePeakNormalize] {
+             let index = state.pcm_gain_mode.options.iter()
+                 .position(|option| option.value == gain).expect("gain pill");
+             assert!(state.select_row_index(FormatField::PcmTruePeak, index, Some(16), Some(44_100)));
+             assert!(state.pcm_gain_overridden);
+             state.recompute_auto_hdcd();
+             assert!(state.hdcd_decode_enabled);
+             assert_eq!(*state.pcm_gain_mode.selected_value(), gain,
+-                "explicit incompatible gain must still be refused at commit");
++                "explicit gain must remain selected across HDCD recomputation");
+         }
+         let off_index = state.pcm_gain_mode.options.iter()
+             .position(|option| option.value == PcmGainMode::Off).unwrap();
+         assert!(state.select_row_index(FormatField::PcmTruePeak, off_index, Some(16), Some(44_100)));
+--- a/tonepoet-pipeline/src/semantic_plan.rs
++++ b/tonepoet-pipeline/src/semantic_plan.rs
+@@ -2505,14 +2505,12 @@
+                 code: "hdcd_source_ineligible".to_owned(),
+                 reason: "HDCD Decode requires an identified lossless integer PCM 16-bit/44.1-kHz mono/stereo source".to_owned(),
+             }));
+         }
+-        if true_peak_policy(intent.gain_policy).is_some() {
+-            return Ok(PlanningOutcome::Refused(PlanRefusal {
+-                code: "hdcd_certified_true_peak_unqualified".to_owned(),
+-                reason: "HDCD Decode with certified true-peak Guard/Normalize is not qualified; turn off one option".to_owned(),
+-            }));
+-        }
++        // Certified observation must follow the source-bitstream decoder. The
++        // physical realizer binds HDCD to the original S16 source and retains
++        // the decoded waveform through the effect/resampler spine in Float64.
++        // The selected terminal proof is still charged by the same typed plan.
+     }
+ 
+     let (pre_resample_effects, post_resample_effects) =
+         match order_registered_effect_partitions(effects) {
+@@ -3200,9 +3198,16 @@
+                     && !pre_resample_effects.is_empty()
+                     && selected_resampler_tool.as_ref() != Some(&ToolIdentifier::Ssrc)
+                 {
+                     for prepared in &prepared_pre_resample_effects {
+-                        if matches!(prepared.instance.effect, RegisteredUnaryEffect::CdDeemphasis) {
++                        if matches!(prepared.instance.effect,
++                            RegisteredUnaryEffect::CdDeemphasis
++                                | RegisteredUnaryEffect::HdcdDecode { .. })
++                        {
++                            // HDCD is a source-bitstream decoder, not a
++                            // Float64 sample-domain effect. It runs once on
++                            // the untouched S16 input before the protected
++                            // resampler ingress is constructed.
+                             continue;
+                         }
+                         let lowering = &prepared.candidates[0];
+                         if !effect_contract_preserves_protected_true_peak_input(&lowering.contract) {
+@@ -11081,8 +11086,125 @@
+         assert!(hdcd_index < deemphasis_index && deemphasis_index < resample_index);
+     }
+ 
+     #[test]
++    fn hdcd_certified_gain_four_policies_measure_the_decoded_float64_signal() {
++        for (scope, normalize) in [
++            (TruePeakScope::Track, false),
++            (TruePeakScope::Track, true),
++            (TruePeakScope::Album, false),
++            (TruePeakScope::Album, true),
++        ] {
++            for (format, path) in [
++                (AudioFormat::Flac, "out.flac"),
++                (AudioFormat::Mp3, "out.mp3"),
++            ] {
++                let mut request = hdcd_16_44100_request();
++                request.settings.target_format = format;
++                request.output_path = PathBuf::from(path);
++                request.settings.pcm_true_peak.policy = if normalize {
++                    SampleGainPolicy::TruePeakNormalize {
++                        target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
++                        scope,
++                        scan: TruePeakScanTier::Standard,
++                    }
++                } else {
++                    SampleGainPolicy::TruePeakGuard {
++                        target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
++                        scope,
++                        scan: TruePeakScanTier::Standard,
++                    }
++                };
++                if scope == TruePeakScope::Album {
++                    request.plan_scope = PlanScope::submitted_batch(
++                        "hdcd-truepeak-album", "hdcd-member-1", Some(1),
++                    );
++                }
++                let Ok(PlanningOutcome::Ready(plan)) =
++                    plan_typed_with_effects(&request, &[hdcd_effect()])
++                else {
++                    panic!("HDCD+certified true-peak {:?} {:?} {path} must be ready", scope, normalize);
++                };
++                let effect_index = plan.nodes.iter().position(|node| matches!(node,
++                    TypedPlanNode::ApplyEffect { instance, .. }
++                        if matches!(instance.effect, RegisteredUnaryEffect::HdcdDecode { .. })
++                )).expect("one source-first decoder");
++                let observe_index = plan.nodes.iter().position(|node| matches!(node,
++                    TypedPlanNode::Observe(observation)
++                        if matches!(observation.kind, ObservationKind::CertifiedTruePeak { .. })
++                )).expect("certified post-HDCD observation");
++                let gain_index = plan.nodes.iter().position(|node| matches!(node,
++                    TypedPlanNode::ApplyGain { decision: Some(_), .. }
++                )).expect("single gain application");
++                assert!(effect_index < observe_index && observe_index < gain_index);
++                assert_eq!(plan.nodes.iter().filter(|node| matches!(node,
++                    TypedPlanNode::ApplyEffect { instance, .. }
++                        if matches!(instance.effect, RegisteredUnaryEffect::HdcdDecode { .. })
++                )).count(), 1);
++                assert_eq!(plan.nodes.iter().filter(|node| matches!(node,
++                    TypedPlanNode::Observe(observation)
++                        if matches!(observation.kind, ObservationKind::CertifiedTruePeak { .. })
++                )).count(), 1);
++                assert_eq!(plan.nodes.iter().filter(|node| matches!(node,
++                    TypedPlanNode::ApplyGain { decision: Some(_), .. }
++                )).count(), 1);
++                let (terminal, _) = selected_pcm_terminal(&plan);
++                match &terminal.contract.terminal_realization {
++                    Some(SelectedTerminalRealization::Pcm(realization)) => {
++                        assert_eq!(realization.input_precision,
++                            StoragePrecision::Pcm(PcmBitDepth::Float64));
++                    }
++                    Some(SelectedTerminalRealization::LossyFfmpegEncoderInput { .. }) => {}
++                    other => panic!("missing certified terminal realization: {other:?}"),
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn hdcd_certified_rate_change_precedes_measurement_once() {
++        for normalize in [false, true] {
++            let mut request = hdcd_16_44100_request();
++            request.settings.target_sample_rate = RateTarget::PcmHz(88_200);
++            request.settings.preferred_tool = PreferredTool::Ffmpeg;
++            request.settings.pcm_true_peak.policy = if normalize {
++                SampleGainPolicy::TruePeakNormalize {
++                    target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
++                    scope: TruePeakScope::Track,
++                    scan: TruePeakScanTier::Standard,
++                }
++            } else {
++                SampleGainPolicy::TruePeakGuard {
++                    target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
++                    scope: TruePeakScope::Track,
++                    scan: TruePeakScanTier::Standard,
++                }
++            };
++            let Ok(PlanningOutcome::Ready(plan)) =
++                plan_typed_with_effects(&request, &[hdcd_effect()])
++            else { panic!("HDCD+truepeak must admit a selected FFmpeg rate change"); };
++            let effect_index = plan.nodes.iter().position(|node| matches!(node,
++                TypedPlanNode::ApplyEffect { instance, .. }
++                    if matches!(instance.effect, RegisteredUnaryEffect::HdcdDecode { .. })
++            )).unwrap();
++            let resamplers = plan.nodes.iter().enumerate().filter_map(|(index, node)| match node {
++                TypedPlanNode::Operation {
++                    operation: PlanOperation::ResamplePcm { .. },
++                    candidates, selected_candidate, ..
++                } => Some((index, candidates[*selected_candidate].tool.clone())),
++                _ => None,
++            }).collect::<Vec<_>>();
++            assert_eq!(resamplers.len(), 1);
++            assert_eq!(resamplers[0].1, Some(ToolIdentifier::Ffmpeg));
++            let observe_index = plan.nodes.iter().position(|node| matches!(node,
++                TypedPlanNode::Observe(obs)
++                    if matches!(obs.kind, ObservationKind::CertifiedTruePeak { .. })
++            )).unwrap();
++            assert!(effect_index < resamplers[0].0 && resamplers[0].0 < observe_index);
++        }
++    }
++
++    #[test]
+     fn hdcd_int16_terminal_derives_tpdf_without_mutating_caller_or_dithering_twice() {
+         let mut request = hdcd_16_44100_request();
+         request.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int16);
+         request.settings.dither_type = DitherType::Shibata; // stale nominal auto selection
+@@ -11138,12 +11260,20 @@
+             target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+             scope: TruePeakScope::Track,
+             scan: TruePeakScanTier::Standard,
+         };
+-        let Ok(PlanningOutcome::Refused(refusal)) =
++        let Ok(PlanningOutcome::Ready(certified)) =
+             plan_typed_with_effects(&request, &[hdcd_effect()])
+-        else { panic!("HDCD must not precede unqualified certified observations") };
+-        assert_eq!(refusal.code, "hdcd_certified_true_peak_unqualified");
++        else { panic!("HDCD source-first decoding must precede certified observation") };
++        let decoder = certified.nodes.iter().position(|node| matches!(node,
++            TypedPlanNode::ApplyEffect { instance, .. }
++                if matches!(instance.effect, RegisteredUnaryEffect::HdcdDecode { .. })
++        )).expect("source-bitstream decoder");
++        let observation = certified.nodes.iter().position(|node| matches!(node,
++            TypedPlanNode::Observe(obs) if matches!(obs.kind,
++                ObservationKind::CertifiedTruePeak { .. })
++        )).expect("certified observation");
++        assert!(decoder < observation);
+ 
+         request.settings.pcm_true_peak.policy = SampleGainPolicy::Off;
+         request.source.true_source_depth = Some(PcmBitDepth::Int24);
+         request.source.bit_depth = Some(PcmBitDepth::Int24);
+--- /dev/null
++++ b/tests/hdcd_true_peak_composition_ffmpeg_smoke.py
+@@ -0,0 +1,210 @@
++#!/usr/bin/env python3
++"""Compile-free *physical* HDCD/true-peak composition witness.
++
++Exercises the FFmpeg commands that the existing source-first, Float64 carrier,
++CD de-emphasis and selected-FFmpeg resampler branches use. Also checks a
++sample-level gain envelope, CUE slicing, encoder-input formats and single
++terminal quantization. This is NOT a Rust planner/executor test, not the
++TonePoet certified meter, and not pinned-Reference requalification.
++"""
++from __future__ import annotations
++
++import json
++import math
++import shutil
++import struct
++import subprocess
++import tempfile
++from pathlib import Path
++
++import numpy as np
++from scipy.signal import resample_poly
++
++
++def cmd(*args: str) -> subprocess.CompletedProcess[str]:
++    result = subprocess.run(args, capture_output=True, text=True, check=False)
++    if result.returncode:
++        raise AssertionError(f"FFmpeg command failed: {args!r}\n{result.stderr[-1800:]}")
++    return result
++
++
++def probe(path: Path) -> dict:
++    return json.loads(cmd("ffprobe", "-v", "error", "-select_streams", "a:0",
++                          "-show_entries", "stream=codec_name,sample_fmt,sample_rate,channels",
++                          "-of", "json", str(path)).stdout)["streams"][0]
++
++
++def raw(path: Path, channels: int = 2) -> np.ndarray:
++    samples = np.fromfile(path, dtype="<f8")
++    assert samples.size and samples.size % channels == 0
++    samples = samples.reshape(-1, channels)
++    assert np.isfinite(samples).all(), "nonfinite analysis carrier"
++    return samples
++
++
++def true_peak_approx(audio: np.ndarray) -> float:
++    # Independent 8x FIR reconstruction for this *smoke* test. Not a stand-in
++    # for TonePoet's certified true-peak scanner/error contract.
++    return float(np.max(np.abs(resample_poly(audio, 8, 1, axis=0))))
++
++
++def write_sample_exact_stereo(path: Path, frames: int = 44_100 * 2) -> None:
++    sr = 44_100
++    n = np.arange(frames, dtype=np.float64)
++    channel_a = 10_000 * np.sin(2 * math.pi * 1_013 * n / sr)
++    channel_b = 7_000 * np.sin(2 * math.pi * 9_971 * n / sr)
++    stereo = np.column_stack((channel_a, channel_b)).astype("<i2")
++    # HDCD control packets are embedded only in the least significant bit.
++    # The source stays genuine signed 16-bit PCM, including for CUE slices.
++    window, control = 0x7DE0A5D0, 0x53
++    bits = [((window >> bit) & 1) for bit in range(30, -1, -1)]
++    bits += [((control >> bit) & 1) for bit in range(7, -1, -1)]
++    for start in [32, 44_100 + 65]:
++        for offset, bit in enumerate(bits):
++            stereo[start + offset, :] = (stereo[start + offset, :] & ~1) | bit
++    pcm = stereo.tobytes()
++    import wave
++    with wave.open(str(path), "wb") as writer:
++        writer.setnchannels(2)
++        writer.setsampwidth(2)
++        writer.setframerate(sr)
++        writer.writeframes(pcm)
++
++
++def decode_hdcd(original: Path, output: Path, filter_prefix: str = "") -> None:
++    cmd("ffmpeg", "-y", "-nostdin", "-v", "error", "-i", str(original),
++        "-map", "0:a:0", "-af", filter_prefix + "hdcd=bits_per_sample=16:disable_autoconvert=1",
++        "-c:a", "pcm_s32le", "-f", "wav", str(output))
++    info = probe(output)
++    assert (info["sample_rate"], info["channels"], info["sample_fmt"], info["codec_name"]) == (
++        "44100", 2, "s32", "pcm_s32le"), info
++
++
++def to_double_wav(source: Path, dest: Path) -> None:
++    cmd("ffmpeg", "-y", "-nostdin", "-v", "error", "-i", str(source),
++        "-map", "0:a:0", "-c:a", "pcm_f64le", "-f", "wav", str(dest))
++    assert probe(dest)["codec_name"] == "pcm_f64le"
++
++
++def unwrap_double_wav(source: Path, dest: Path) -> np.ndarray:
++    cmd("ffmpeg", "-y", "-nostdin", "-v", "error", "-i", str(source),
++        "-map", "0:a:0", "-vn", "-sn", "-dn", "-c:a", "pcm_f64le",
++        "-f", "f64le", str(dest))
++    return raw(dest)
++
++
++def apply_effect(source: Path, dest: Path, name: str, rate: int = 44100) -> np.ndarray:
++    cmd("ffmpeg", "-y", "-nostdin", "-v", "error", "-f", "f64le",
++        "-ar", str(rate), "-ac", "2", "-i", str(source),
++        "-map", "0:a:0", "-vn", "-sn", "-dn", "-af", name,
++        "-c:a", "pcm_f64le", "-f", "f64le", str(dest))
++    return raw(dest)
++
++
++def main() -> None:
++    for program in ("ffmpeg", "ffprobe"):
++        if not shutil.which(program):
++            raise SystemExit(f"SKIP: {program} unavailable")
++
++    with tempfile.TemporaryDirectory(prefix="tp-hdcd-truepeak-") as dirname:
++        root = Path(dirname)
++        wav = root / "original-16.wav"
++        flac = root / "original-16.flac"
++        hdcd = root / "source-first-hdcd-s32.wav"
++        high_precision = root / "hdcd-f64.wav"
++        base_raw = root / "observed-base.f64le"
++        write_sample_exact_stereo(wav)
++        cmd("ffmpeg", "-y", "-nostdin", "-v", "error", "-i", str(wav),
++            "-c:a", "flac", str(flac))
++        decode_hdcd(flac, hdcd)
++        to_double_wav(hdcd, high_precision)
++        base = unwrap_double_wav(high_precision, base_raw)
++        assert base.shape == (88_200, 2)
++        # This is the actual post-HDCD signal. No +6 dB decoder compensation.
++        assert 0.01 < float(np.max(abs(base))) < 0.5
++        print("PASS source-first signed16 HDCD -> signed32 -> Float64, no compensating gain")
++
++        deemph_path = root / "post-deemphasis.f64le"
++        deemph = apply_effect(base_raw, deemph_path, "aemphasis=mode=reproduction:type=cd")
++        assert deemph.shape == base.shape
++        assert float(np.max(np.abs(deemph - base))) > 0.0001
++        assert 0.0 < true_peak_approx(deemph) < true_peak_approx(base) * 1.2
++        print("PASS CD de-emphasis consumes decoded Float64 without integer terminal")
++
++        resampled_path = root / "post-soxr-88200.f64le"
++        changed_rate = apply_effect(
++            deemph_path, resampled_path,
++            "aresample=resampler=soxr:precision=28:cutoff=0.95:out_sample_rate=88200",
++        )
++        assert abs(len(changed_rate) - len(deemph) * 2) < 80
++        assert float(np.max(np.abs(changed_rate))) > 0
++        assert not np.array_equal(changed_rate[:100], deemph[:100])
++        print("PASS decoded -> Float64 de-emphasis -> one SoXR rate change -> Float64 scan input")
++
++        # Track/Album scalar calculations deliberately use the *processed*
++        # data. The fidelity/ceiling witness uses independent FIR approximation
++        # and does not pretend to exercise TonePoet's certified scalar resolver.
++        members = [changed_rate[: len(changed_rate) // 2],
++                   changed_rate[len(changed_rate) // 2 :]]
++        peaks = [true_peak_approx(member) for member in members]
++        target_peak = 10.0 ** (-1.0 / 20.0)
++        track_guards = [min(1.0, target_peak / peak) for peak in peaks]
++        track_norms = [target_peak / peak for peak in peaks]
++        album_guard = min(track_guards)
++        album_norm = target_peak / max(peaks)
++        for gain in track_guards + track_norms + [album_guard, album_norm]:
++            assert math.isfinite(gain) and gain > 0
++        for member, gain in zip(members, track_guards):
++            assert true_peak_approx(member * gain) <= target_peak * 1.000_001
++        for member, gain in zip(members, track_norms):
++            assert abs(true_peak_approx(member * gain) - target_peak) < 1e-6
++        for member in members:
++            assert true_peak_approx(member * album_guard) <= target_peak * 1.000_001
++            assert true_peak_approx(member * album_norm) <= target_peak * 1.000_001
++        print("PASS independent processed-signal Track/Album Guard+Normalize scalar witnesses")
++
++        # The CUE fast-seek+residual-trim command must decode exactly the same
++        # source frames as the full-extent filter. This catches accidental S32
++        # CUE fallback before HDCD or off-by-one track boundaries.
++        start, count = 44_100 + 588, 43_000
++        actual_cue = root / "cue-source-first.wav"
++        expected_cue = root / "cue-full-extent.wav"
++        cmd("ffmpeg", "-y", "-nostdin", "-v", "error", "-ss", "1", "-i", str(flac),
++            "-map", "0:a:0", "-af", f"atrim=start_sample=588:end_sample={588+count},asetpts=PTS-STARTPTS,hdcd=bits_per_sample=16:disable_autoconvert=1",
++            "-c:a", "pcm_s32le", "-f", "wav", str(actual_cue))
++        cmd("ffmpeg", "-y", "-nostdin", "-v", "error", "-i", str(flac),
++            "-map", "0:a:0", "-af", f"atrim=start_sample={start}:end_sample={start+count},asetpts=PTS-STARTPTS,hdcd=bits_per_sample=16:disable_autoconvert=1",
++            "-c:a", "pcm_s32le", "-f", "wav", str(expected_cue))
++        import wave
++        with wave.open(str(actual_cue)) as f:
++            actual_bytes = f.readframes(f.getnframes())
++            assert f.getnframes() == count
++        with wave.open(str(expected_cue)) as f:
++            expected_bytes = f.readframes(f.getnframes())
++        assert actual_bytes == expected_bytes
++        print("PASS exact original-source CUE range; same decoded frames with or without coarse seek")
++
++        # Terminal conversion from the final-rate *measured* signal, not the
++        # encoded source. One Int16 dither/quantization, one lossy encoder.
++        f64_wav = root / "final-rate-64.wav"
++        cmd("ffmpeg", "-y", "-nostdin", "-v", "error", "-f", "f64le",
++            "-ar", "88200", "-ac", "2", "-i", str(resampled_path),
++            "-c:a", "pcm_f64le", str(f64_wav))
++        int16 = root / "out-int16.wav"
++        cmd("ffmpeg", "-y", "-nostdin", "-v", "error", "-i", str(f64_wav),
++            "-af", "aresample=dither_method=triangular:out_sample_fmt=s16",
++            "-c:a", "pcm_s16le", str(int16))
++        assert probe(int16)["codec_name"] == "pcm_s16le"
++        assert probe(int16)["sample_rate"] == "88200"
++        print("PASS final-only Int16 TPDF/quantization from retained Float64")
++
++        lossy = root / "out.mp3"
++        cmd("ffmpeg", "-y", "-nostdin", "-v", "error", "-i", str(high_precision),
++            "-c:a", "libmp3lame", "-b:a", "192k", str(lossy))
++        assert probe(lossy)["codec_name"] == "mp3"
++        assert probe(lossy)["sample_rate"] == "44100"
++        print("PASS Float64 44.1-kHz -> MP3 terminal encoder without hidden rate change")
++
++
++if __name__ == "__main__":
++    main()

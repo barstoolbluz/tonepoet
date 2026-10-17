@@ -6167,10 +6167,9 @@ impl FormatState {
             let float_to_integer = self.source_pcm_float_bits.is_some()
                 && self.auto_gain_target_is_integer_pcm();
             let lossless_to_lossy = self.source_is_lossless == Some(true) && lossy_target;
-            // An effectual HDCD decode cannot be combined with certified
-            // true-peak gain. Prefer the source-derived HDCD recovery over an
-            // incompatible *automatic* guard; explicit gain remains authoritative
-            // and the commit-time refusal still protects that combination.
+            // Keep the longstanding conservative auto-gain default when HDCD
+            // is selected. Manual Guard and Normalize are now composable with
+            // source-first HDCD and remain authoritative.
             let hdcd_lossy_decode = lossy_target
                 && self.hdcd_decode_enabled
                 && self.hdcd_is_actionable();
@@ -25409,8 +25408,8 @@ mod hdcd_format_policy_tests {
         assert!(state.select_row_index(FormatField::HdcdDecode, 1, Some(16), Some(44_100)));
         assert_eq!(*state.pcm_gain_mode.selected_value(), PcmGainMode::Off);
 
-        // Explicit TruePeak Guard/Normalize must NOT be silently disabled:
-        // the existing commit-time HDCD/true-peak qualification refusal owns it.
+        // Explicit TruePeak Guard/Normalize remain authoritative with HDCD;
+        // the typed planner qualifies their source-first execution route.
         for gain in [PcmGainMode::TruePeakGuard, PcmGainMode::TruePeakNormalize] {
             let index = state.pcm_gain_mode.options.iter()
                 .position(|option| option.value == gain).expect("gain pill");
@@ -25419,7 +25418,7 @@ mod hdcd_format_policy_tests {
             state.recompute_auto_hdcd();
             assert!(state.hdcd_decode_enabled);
             assert_eq!(*state.pcm_gain_mode.selected_value(), gain,
-                "explicit incompatible gain must still be refused at commit");
+                "explicit gain must remain selected across HDCD recomputation");
         }
         let off_index = state.pcm_gain_mode.options.iter()
             .position(|option| option.value == PcmGainMode::Off).unwrap();

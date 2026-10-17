@@ -1359,6 +1359,24 @@ fn cue_stream_phase1_direct_plan_for_paths(
     staged_output: &Path,
     work_dir: PathBuf,
 ) -> Result<Option<(PlanRequest, ConversionPlan)>, ConvertError> {
+    // The ordinary PlanRequest cannot express registered effects. Admit a
+    // direct CUE stream only if the *member-specialized* graph is empty; a
+    // registered HDCD decoder (or any other sample-changing effect) must be
+    // realized by the file-backed worker before terminal encoding. Leave
+    // unrelated CUE members on the existing zero-effect streaming fast path.
+    let (member_effects, _) = super::stages::registered_effects_for_hdcd_cue_member(
+        &request.registered_effects,
+        track.id.source_ordinal,
+    )
+    .map_err(|error| ConvertError::Backend(format!(
+        "CUE direct-stream effect admission failed: {error}"
+    )))?;
+    if !member_effects.is_empty() || request.settings.pcm_true_peak.is_true_peak() {
+        // Track true-peak requires a certified observation/gain boundary; an
+        // ordinary one-command CUE encoder has no such preparation. Album
+        // scope is likewise never a direct-stream source before its prepass.
+        return Ok(None);
+    }
     let plan_request = plan_request_for_track(
         request,
         track,

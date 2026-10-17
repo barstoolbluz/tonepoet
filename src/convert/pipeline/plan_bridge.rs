@@ -1610,6 +1610,10 @@ pub(crate) struct CertifiedTruePeakExecutionContract {
     pub read_contract: tonepoet_pipeline::ObservationReadContract,
     pub terminal_subject: tonepoet_pipeline::SignalId,
     pub terminal_proof: tonepoet_pipeline::TerminalProofContract,
+    /// Typed source-rate effects preceding the selected PCM resampler, if any.
+    /// HDCD is a source-bitstream decoder whose physical S16 lowering is
+    /// consumed before building a Float64 resampler ingress.
+    pub pre_resample: Option<RegisteredEffectSegment>,
     /// Frozen selected PCM resampler before the certified observation, when a
     /// rate change is part of the typed signal spine.
     pub pre_observation_resampler: Option<SelectedPcmResamplerExecutionContract>,
@@ -2064,11 +2068,23 @@ pub(crate) fn certified_true_peak_execution_contract_from_typed(
             "certified pre-observation",
             true,
         )?;
-    if pre_resample.is_some() {
-        return Err(ConvertError::Backend(
-            "certified true-peak execution cannot consume an unqualified pre-resample registered effect"
-                .to_string(),
-        ));
+    if let Some(pre) = &pre_resample {
+        // Source-first HDCD may precede a qualified FFmpeg/soxr Float64
+        // resampler. This is not a general exception for unqualified
+        // sample-domain filters or for protected SSRC ingress/replay.
+        let source_bitstream_only = pre.lowerings.len() == 1
+            && pre.lowerings[0].tool == tonepoet_pipeline::ToolIdentifier::Ffmpeg
+            && matches!(&pre.lowerings[0].arguments,
+                tonepoet_pipeline::EffectArgumentMapping::FfmpegAudioFilter(filter)
+                    if filter == "hdcd=bits_per_sample=16:disable_autoconvert=1");
+        let qualified_resampler = pre_observation_resampler.as_ref().is_some_and(|resampler|
+            resampler.selected.tool == tonepoet_pipeline::ToolIdentifier::Ffmpeg);
+        if !source_bitstream_only || !qualified_resampler {
+            return Err(ConvertError::Backend(
+                "certified true-peak pre-resample effects require an admitted source-first HDCD and FFmpeg/soxr Float64 resampler; protected SSRC and other pre-effects remain unqualified"
+                    .to_string(),
+            ));
+        }
     }
     let pre_observation_output = post_resample
         .as_ref()
@@ -2180,6 +2196,7 @@ pub(crate) fn certified_true_peak_execution_contract_from_typed(
         read_contract: observation.read_contract.clone(),
         terminal_subject: gain_output,
         terminal_proof,
+        pre_resample,
         pre_observation_resampler,
         post_resample,
         charged_terminal,
@@ -3206,49 +3223,57 @@ fn request_applies_hdcd_to_track(request: &PipelineRequest, track: &PreparedTrac
     })
 }
 
-fn apply_registered_effect_terminal_dither_authority(
+/// The terminal observation proof and the concrete encoder must derive the
+/// same request-local automatic dither. CUE-scoped HDCD does not grant any
+/// terminal authority to unrelated batch members.
+pub(super) fn registered_effect_auto_terminal_tpdf_requested(
     request: &PipelineRequest,
     track: &PreparedTrack,
-    settings: &mut PipelineSettings,
-) {
-    if request.settings.dither_explicit
+    settings: &PipelineSettings,
+) -> bool {
+    if settings.dither_explicit
         || !(request_applies_cd_deemphasis(request)
             || request_applies_hdcd_to_track(request, track))
-        || !request.settings.target_format.is_pcm_lossless()
-        || (request.settings.target_format == PlannerFormat::WavPack
-            && request.settings.wavpack.hybrid)
+        || !settings.target_format.is_pcm_lossless()
+        || (settings.target_format == PlannerFormat::WavPack
+            && settings.wavpack.hybrid)
     {
-        return;
+        return false;
     }
-
-    let TrackSourceRef::RegisteredEffectCarrier { representation, .. } = &track.source_ref else {
-        return;
-    };
-    if !matches!(
-        representation,
-        RegisteredEffectCarrierRepresentation::RawFloat64
-            | RegisteredEffectCarrierRepresentation::Float64Wav
-    ) {
-        // A terminal SSRC carrier already owns quantization/dither. Reasserting
-        // TPDF here would duplicate sample processing during package-only work.
-        return;
-    }
-
-    let target_depth = match request.settings.target_bit_depth {
+    let target_depth = match settings.target_bit_depth {
         BitDepthTarget::Source => resolve_source_pcm_depth(track).map(|source_depth| {
             tonepoet_pipeline::source_pcm_depth_for_target(
-                &request.settings.target_format,
-                request.settings.wavpack.hybrid,
+                &settings.target_format,
+                settings.wavpack.hybrid,
                 source_depth,
             )
         }),
         BitDepthTarget::Pcm(depth) => Some(depth),
     };
-    if target_depth == Some(PcmBitDepth::Int16) {
-        // The typed planner derives automatic TPDF for the member actually
-        // receiving CD de-emphasis or HDCD. Phase 3 replans the terminal after
-        // realizing that effect into Float64: carry the non-explicit decision
-        // across the private carrier, without imposing it on other members.
+    target_depth == Some(PcmBitDepth::Int16)
+}
+
+fn apply_registered_effect_terminal_dither_authority(
+    request: &PipelineRequest,
+    track: &PreparedTrack,
+    settings: &mut PipelineSettings,
+) {
+    if !registered_effect_auto_terminal_tpdf_requested(request, track, settings) {
+        return;
+    }
+    let high_precision_carrier = match &track.source_ref {
+        TrackSourceRef::RegisteredEffectCarrier { representation, .. } => matches!(
+            representation,
+            RegisteredEffectCarrierRepresentation::RawFloat64
+                | RegisteredEffectCarrierRepresentation::Float64Wav
+        ),
+        TrackSourceRef::PcmTruePeakCarrier { .. } => true,
+        _ => false,
+    };
+    if high_precision_carrier {
+        // Terminal SSRC output owns its quantization and must not receive a
+        // second dither. For normal effects and certified true-peak carriers,
+        // the encoder is still the unique terminal quantization owner.
         settings.dither_type = tonepoet_pipeline::DitherType::Tpdf;
     }
 }
@@ -4680,6 +4705,76 @@ mod tests {
                 .expect("one selected SoX terminal");
             assert_eq!(sox.args.iter().filter(|arg| arg.as_str() == "dither").count(), 1);
             assert!(!sox.args.iter().any(|arg| arg == "-D"));
+        }
+    }
+
+    #[test]
+    fn hdcd_true_peak_contract_freezes_source_first_effect_and_one_resampler() {
+        let temp = TempDir::new().expect("temp dir");
+        let source_path = temp.path().join("source.flac");
+        let output_path = temp.path().join("out.flac");
+        let mut req = request(temp.path());
+        req.settings.target_format = PlannerFormat::Flac;
+        req.settings.target_sample_rate = tonepoet_pipeline::RateTarget::PcmHz(88_200);
+        req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(PcmBitDepth::Int24);
+        req.settings.preferred_tool = PreferredTool::Ffmpeg;
+        req.settings.pcm_true_peak.policy = tonepoet_pipeline::SampleGainPolicy::TruePeakGuard {
+            target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            scope: tonepoet_pipeline::TruePeakScope::Track,
+            scan: tonepoet_pipeline::TruePeakScanTier::Standard,
+        };
+        let mut prepared = track(TrackSourceRef::StagedFile(source_path.clone()));
+        prepared.sample_rate = Some(44_100);
+        prepared.bit_depth = Some(16);
+        prepared.source_audio = SourceAudioDescriptor::from_scalar(
+            Some(44_100), Some(16), Some(SourceAudioCoding::Pcm),
+        );
+        req.registered_effects = vec![hdcd_decode_effect(Vec::new())];
+        let planned = super::plan_request_for_track_with_resolved_source(
+            &req, &prepared, &source_path, &output_path,
+            temp.path().join("work"),
+            pcm_source_info(PlannerFormat::Flac,
+                PlannerCodec::PcmSigned, 44_100, PcmBitDepth::Int16),
+        ).expect("resolved source model");
+        let contract = certified_true_peak_execution_contract_with_effects(
+            &planned, &req.registered_effects,
+        ).expect("HDCD/true-peak effect spine");
+        let source_first = contract.pre_resample.as_ref().expect("HDCD source-first segment");
+        assert_eq!(source_first.lowerings.len(), 1);
+        assert_eq!(source_first.lowerings[0].tool, tonepoet_pipeline::ToolIdentifier::Ffmpeg);
+        assert_eq!(contract.pre_observation_resampler.as_ref().unwrap().selected.tool,
+            tonepoet_pipeline::ToolIdentifier::Ffmpeg);
+        assert!(contract.post_resample.is_none());
+        assert_eq!(contract.sample_rate_hz, 88_200);
+        assert_eq!(contract.scope, tonepoet_pipeline::TruePeakScope::Track);
+    }
+
+    #[test]
+    fn hdcd_true_peak_terminal_auto_tpdf_is_member_local_and_explicit_off_wins() {
+        let temp = TempDir::new().expect("temp dir");
+        let mut req = request(temp.path());
+        req.settings.target_format = PlannerFormat::Flac;
+        req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(PcmBitDepth::Int16);
+        req.registered_effects = vec![hdcd_decode_effect(vec![
+            tonepoet_pipeline::HdcdCueSegment {
+                source_ordinal: 2, start_sample: 44_100, sample_count: 44_100,
+            },
+        ])];
+        for (ordinal, expected) in [(1, false), (2, true)] {
+            let mut member = track(TrackSourceRef::StagedFile(temp.path().join("album.flac")));
+            member.id.source_ordinal = ordinal;
+            member.source_audio = SourceAudioDescriptor::from_scalar(
+                Some(44_100), Some(16), Some(SourceAudioCoding::Pcm),
+            );
+            assert_eq!(super::registered_effect_auto_terminal_tpdf_requested(
+                &req, &member, &req.settings,
+            ), expected, "member {ordinal} auto-dither authority");
+            req.settings.dither_explicit = true;
+            req.settings.dither_type = tonepoet_pipeline::DitherType::None;
+            assert!(!super::registered_effect_auto_terminal_tpdf_requested(
+                &req, &member, &req.settings,
+            ));
+            req.settings.dither_explicit = false;
         }
     }
 

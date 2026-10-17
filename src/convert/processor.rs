@@ -7165,6 +7165,7 @@ mod tests {
                 ]),
                 requires_non_clipping_ingress: true,
             },
+            pre_resample: None,
             pre_observation_resampler: None,
             post_resample: None,
             charged_terminal: crate::convert::pipeline::SelectedPhysicalCandidateBinding {

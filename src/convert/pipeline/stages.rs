@@ -30533,6 +30533,7 @@ pub struct ScheduledAlbum {
     pub(crate) reference_auto_gain_measurements: Vec<ReferenceAutoGainPreparedMeasurement>,
     pub(crate) dsd_true_peak_measurements: Vec<CertifiedTruePeakPreparedMeasurement>,
     pub(crate) pcm_true_peak_measurements: Vec<CertifiedTruePeakPreparedMeasurement>,
+    pcm_effect_preludes: BTreeMap<TrackId, CertifiedEffectPrelude>,
     dsd_true_peak_timings: BTreeMap<TrackId, DsdAlbumGainTiming>,
     pub(crate) album_gain_scope_disclosure: Option<DsdAlbumGainScopeDisclosure>,
     run_timing: ConversionRunTiming,
@@ -30578,6 +30579,7 @@ struct CertifiedTruePeakScratchRetrySeed {
     batch_replaygain: Option<Result<crate::convert::replaygain::ReplayGainSourceScan, String>>,
     dsd_true_peak_measurements: Vec<CertifiedTruePeakPreparedMeasurement>,
     pcm_true_peak_measurements: Vec<CertifiedTruePeakPreparedMeasurement>,
+    pcm_effect_preludes: BTreeMap<TrackId, CertifiedEffectPrelude>,
     dsd_true_peak_timings: BTreeMap<TrackId, DsdAlbumGainTiming>,
     album_gain_scope_disclosure: Option<DsdAlbumGainScopeDisclosure>,
     run_timing: ConversionRunTiming,
@@ -30705,6 +30707,7 @@ impl CertifiedTruePeakScratchRetrySeed {
             batch_replaygain: album.batch_replaygain.clone(),
             dsd_true_peak_measurements: album.dsd_true_peak_measurements.clone(),
             pcm_true_peak_measurements: album.pcm_true_peak_measurements.clone(),
+            pcm_effect_preludes: album.pcm_effect_preludes.clone(),
             dsd_true_peak_timings: album.dsd_true_peak_timings.clone(),
             album_gain_scope_disclosure: album.album_gain_scope_disclosure.clone(),
             run_timing: album.run_timing.clone(),
@@ -30903,6 +30906,7 @@ async fn retry_resolved_certified_true_peak_once_on_disk(
         reference_auto_gain_measurements: Vec::new(),
         dsd_true_peak_measurements: seed.dsd_true_peak_measurements,
         pcm_true_peak_measurements: seed.pcm_true_peak_measurements,
+        pcm_effect_preludes: seed.pcm_effect_preludes,
         dsd_true_peak_timings: seed.dsd_true_peak_timings,
         album_gain_scope_disclosure: seed.album_gain_scope_disclosure,
         run_timing: seed.run_timing,
@@ -30979,6 +30983,7 @@ pub(crate) fn scheduled_album_for_test(
         reference_auto_gain_measurements: Vec::new(),
         dsd_true_peak_measurements: Vec::new(),
         pcm_true_peak_measurements: Vec::new(),
+        pcm_effect_preludes: BTreeMap::new(),
         dsd_true_peak_timings: BTreeMap::new(),
         album_gain_scope_disclosure: None,
         run_timing: ConversionRunTiming::start(),
@@ -34019,6 +34024,8 @@ mod album_true_peak_carrier_tests {
         // its transcript assertion and must not spawn a real FFmpeg process.
         let cancel = CancellationToken::new();
         let tool_paths = HashMap::new();
+        let mut preparation_commands = Vec::new();
+        let mut preparation_evidence = TrackExecutionEvidence::default();
         let preparation = prepare_pcm_true_peak_carrier_for_track(
             &req,
             track,
@@ -34029,6 +34036,8 @@ mod album_true_peak_carrier_tests {
             &cancel,
             &tool_paths,
             None,
+            &mut preparation_commands,
+            &mut preparation_evidence,
         );
         let error = match super::super::track_executor::with_injected_track_execution_runner_for_test(
             preparation,
@@ -35838,14 +35847,136 @@ pub(crate) struct CertifiedTruePeakPreparedMeasurement {
     pub execution: CertifiedTruePeakExecutionContract,
 }
 
+/// Commands and semantic effects already realized in the submitted-batch
+/// prepass. Preserved separately from the retained measured carrier so the
+/// terminal track record can attribute them without executing them twice.
+#[derive(Debug, Clone, Default)]
+struct CertifiedEffectPrelude {
+    commands: Vec<CommandRecord>,
+    evidence: TrackExecutionEvidence,
+}
+
 #[derive(Default)]
 struct PreparedPcmTruePeakCarriers {
     measurements: Vec<CertifiedTruePeakPreparedMeasurement>,
+    effect_preludes: BTreeMap<TrackId, CertifiedEffectPrelude>,
 }
 
+/// A failed submitted-batch prepass still owns the receipts of every member
+/// that ran. Retain them outside the atomic carrier publication transaction.
+struct FailedPcmTruePeakPreparation {
+    reason: String,
+    effect_preludes: BTreeMap<TrackId, CertifiedEffectPrelude>,
+}
+
+fn attach_failed_pcm_preludes(
+    failed: &mut [TrackRecord],
+    preludes: &BTreeMap<TrackId, CertifiedEffectPrelude>,
+) {
+    for record in failed {
+        if let Some(prelude) = preludes.get(&record.track_id) {
+            record.commands.extend(prelude.commands.clone());
+            let mut evidence = prelude.evidence.clone();
+            evidence.mark_discarded_attempt();
+            record.execution_evidence.append(evidence, 0);
+        }
+    }
+}
+
+// Commands/evidence are accumulated in caller-owned buffers instead of this
+// success-only result, so errors retain completed work for failure records.
 struct PreparedPcmTruePeakCarrier {
     source_ref: TrackSourceRef,
     measurement: CertifiedTruePeakPreparedMeasurement,
+}
+
+#[cfg(test)]
+mod hdcd_true_peak_partial_prelude_tests {
+    use super::*;
+    use super::super::execution_evidence::OperationLineage;
+
+    fn failed_track(source_ordinal: u32) -> TrackRecord {
+        TrackRecord {
+            track_id: TrackId {
+                source_ordinal,
+                disc_number: None,
+                track_number: source_ordinal,
+            },
+            outcome: TrackOutcome::Err("prepass failed".to_string()),
+            source_ref: TrackSourceRef::StagedFile(PathBuf::from("source.wav")),
+            realized_input: None,
+            output_file: None,
+            commands: Vec::new(),
+            execution_evidence: TrackExecutionEvidence::default(),
+            bytes_in: None,
+            bytes_out: None,
+            duration: None,
+            verified_output_bit_depth: None,
+            dsd_dst_stats: None,
+        }
+    }
+
+    fn completed_command(label: &str) -> CommandRecord {
+        CommandRecord {
+            environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
+            environment: BTreeMap::new(),
+            description: Some(label.to_string()),
+            binary: ToolBinary::Ffmpeg,
+            sanitized_args: vec!["-af".into(), label.into()],
+            cwd: None,
+            env_keys: Vec::new(),
+            exit: Some(super::super::tool::ProcessExit::Code(0)),
+            stdout_tail: String::new(),
+            stderr_tail: String::new(),
+            elapsed: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn album_prepass_failure_preserves_each_completed_hdcd_command_and_invocation() {
+        let mut completed = OperationRecord::completed(
+            "effect-7", "hdcd_decode", "HDCD decoding",
+            ExecutionBackend::external("ffmpeg"),
+        );
+        completed.invocation_indices.push(0);
+        let mut float64 = OperationRecord::completed(
+            "carrier-unwrap", "pcm_carrier_unwrap", "Float64 carrier unwrapping",
+            ExecutionBackend::external("ffmpeg"),
+        );
+        float64.invocation_indices.push(2);
+
+        let mut preludes = BTreeMap::new();
+        let first = failed_track(1);
+        let second = failed_track(2);
+        let unrelated = failed_track(3);
+        preludes.insert(first.track_id.clone(), CertifiedEffectPrelude {
+            commands: vec![completed_command("hdcd"), completed_command("pcm-to-f64"), completed_command("unwrap")],
+            evidence: TrackExecutionEvidence {
+                operations: vec![completed.clone(), float64],
+                ..TrackExecutionEvidence::default()
+            },
+        });
+        preludes.insert(second.track_id.clone(), CertifiedEffectPrelude {
+            commands: vec![completed_command("hdcd")],
+            evidence: TrackExecutionEvidence {
+                operations: vec![completed],
+                ..TrackExecutionEvidence::default()
+            },
+        });
+        let mut records = vec![first, second, unrelated];
+        attach_failed_pcm_preludes(&mut records, &preludes);
+        assert_eq!(records[0].commands.len(), 3);
+        assert_eq!(records[1].commands.len(), 1);
+        assert!(records[2].commands.is_empty());
+        assert_eq!(records[0].execution_evidence.operations[0].invocation_indices, vec![0]);
+        assert_eq!(records[0].execution_evidence.operations[1].invocation_indices, vec![2]);
+        assert_eq!(records[1].execution_evidence.operations[0].invocation_indices, vec![0]);
+        for record in &records[..2] {
+            assert!(record.execution_evidence.operations.iter().all(|operation| {
+                operation.lineage == OperationLineage::DiscardedAttempt
+            }));
+        }
+    }
 }
 
 fn pcm_true_peak_tier(
@@ -36045,6 +36176,12 @@ fn pcm_true_peak_terminal_settings(
         // selection, so it must describe the concrete physical landing depth
         // rather than preserve the Source policy sentinel.
         settings.target_bit_depth = BitDepthTarget::Pcm(depth);
+    }
+    // Planning derives source-effect TPDF per admitted member, rather than
+    // mutating batch settings. The certified terminal bound must read that
+    // same member-local dither decision as the eventual encoder replan.
+    if super::plan_bridge::registered_effect_auto_terminal_tpdf_requested(req, track, &settings) {
+        settings.dither_type = DitherType::Tpdf;
     }
     settings
 }
@@ -38265,30 +38402,44 @@ async fn prepare_pcm_true_peak_carrier_for_track(
     cancel: &CancellationToken,
     tool_paths: &HashMap<String, PathBuf>,
     tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
+    preparation_commands: &mut Vec<CommandRecord>,
+    preparation_evidence: &mut TrackExecutionEvidence,
 ) -> Result<PreparedPcmTruePeakCarrier, String> {
     if cancel.is_cancelled() {
         return Err("PCM true-peak analysis cancelled".to_string());
     }
     let original_source_path = track_source_identity_path(&track).to_path_buf();
     let source_ref = track.source_ref.clone();
-    let realized = realize_track_with_tool_limits_and_stats(
-        &source_ref,
-        Some(&track),
-        req,
-        staging,
-        runner,
-        cancel,
-        tool_concurrency_limits.clone(),
-        false,
-        None,
-    )
-    .await
-    .map_err(|error| {
-        format!(
-            "could not realize PCM track {} for true-peak analysis: {error}",
-            track.id.source_ordinal,
+    let (track_effects, hdcd_cue_span) = registered_effects_for_hdcd_cue_member(
+        &req.registered_effects, track.id.source_ordinal,
+    )?;
+    let hdcd_active = track_effects.iter().any(|effect| matches!(
+        effect.effect, tonepoet_pipeline::RegisteredUnaryEffect::HdcdDecode { .. }
+    ));
+    // Never realize the ordinary S32 CUE fallback before an HDCD scan: its
+    // decoded samples have already lost the original HDCD bitstream contract.
+    let realized = if hdcd_active && hdcd_cue_span.is_some() {
+        RealizedTrackInfo::without_stats(original_source_path.clone())
+    } else {
+        realize_track_with_tool_limits_and_stats(
+            &source_ref,
+            Some(&track),
+            req,
+            staging,
+            runner,
+            cancel,
+            tool_concurrency_limits.clone(),
+            false,
+            None,
         )
-    })?;
+        .await
+        .map_err(|error| {
+            format!(
+                "could not realize PCM track {} for true-peak analysis: {error}",
+                track.id.source_ordinal,
+            )
+        })?
+    };
     let source = source_info_for_true_peak_realized_track(
         &track,
         &realized.path,
@@ -38328,12 +38479,12 @@ async fn prepare_pcm_true_peak_carrier_for_track(
             track.id.source_ordinal,
         )
     })?;
-    let execution = if req.registered_effects.is_empty() {
+    let execution = if track_effects.is_empty() {
         certified_true_peak_execution_contract(&typed_request)
     } else {
         certified_true_peak_execution_contract_with_effects(
             &typed_request,
-            &req.registered_effects,
+            &track_effects,
         )
     }
     .map_err(|error| {
@@ -38414,7 +38565,103 @@ async fn prepare_pcm_true_peak_carrier_for_track(
     let mut carrier_path = raw_carrier_path.clone();
     let _ = fs::remove_file(&raw_carrier_path);
     let mut retained_ssrc_ingress: Option<RetainedSsrcTruePeakIngress> = None;
-    if let Some(resampler) = execution
+    if hdcd_active {
+        // Qualify the whole plan before decoding. The registered-effect
+        // executor consumes the selected certified pre-observation spine,
+        // including exactly one frozen resampler and all ordered effects.
+        // A protected SSRC replay cannot begin at an HDCD-derived ingress
+        // under the existing commissioned evidence; it remains unavailable.
+        if ssrc_terminal_binding.is_some() {
+            return Err("HDCD-derived protected SSRC true-peak ingress/replay is not commissioned".into());
+        }
+        let prepared_effects = prepare_registered_effect_carrier_for_track(
+            req,
+            track.clone(),
+            planned_output,
+            staging,
+            runner,
+            cancel,
+            tool_paths,
+            tool_concurrency_limits.clone(),
+            Some(&execution),
+            preparation_commands,
+            preparation_evidence,
+        )
+        .await?;
+        let TrackSourceRef::RegisteredEffectCarrier {
+            path: effect_path,
+            sample_rate_hz: effected_rate,
+            channels: effected_channels,
+            representation,
+            resampler_consumed,
+            ..
+        } = prepared_effects.source_ref else {
+            return Err("HDCD pre-observation spine did not produce a registered-effect carrier".into());
+        };
+        if effected_rate != target_rate_hz || effected_channels != channels
+            || resampler_consumed != execution.pre_observation_resampler.is_some()
+        {
+            return Err("HDCD pre-observation carrier disagrees with the certified typed rate, channel geometry or resampler count".into());
+        }
+        match representation {
+            RegisteredEffectCarrierRepresentation::RawFloat64 => {
+                carrier_path = effect_path;
+            }
+            RegisteredEffectCarrierRepresentation::Float64Wav => {
+                // This is a container-only, bit-preserving Float64 unwrapping.
+                // No filter, rate change, channel operation, gain, or dither is
+                // permitted between the measured waveform and the effect spine.
+                let command = tonepoet_pipeline::PlannedCommand::new(
+                    tonepoet_pipeline::ToolIdentifier::Ffmpeg,
+                    vec![
+                        "-y".into(), "-nostdin".into(), "-hide_banner".into(),
+                        "-loglevel".into(), "error".into(), "-i".into(),
+                        effect_path.to_string_lossy().into_owned(),
+                        "-map".into(), "0:a:0".into(), "-vn".into(),
+                        "-sn".into(), "-dn".into(), "-c:a".into(),
+                        "pcm_f64le".into(), "-f".into(), "f64le".into(),
+                        carrier_path.to_string_lossy().into_owned(),
+                    ],
+                    tonepoet_pipeline::InputSource::Path(effect_path.clone()),
+                    tonepoet_pipeline::OutputSink::Path(carrier_path.clone()),
+                    source.duration,
+                    "unwrap certified post-HDCD Float64 WAV without sample processing",
+                );
+                let unwrap_invocation = preparation_commands.len();
+                run_recorded_planned_command(
+                    &command, runner, cancel, tool_concurrency_limits.as_ref(),
+                    preparation_commands,
+                )
+                .await
+                .map_err(|error| {
+                    let _ = fs::remove_file(&carrier_path);
+                    format!("HDCD Float64 observation unwrapping failed: {error}")
+                })?;
+                let mut operation = OperationRecord::completed(
+                    "hdcd-true-peak-float64-unwrapping",
+                    "pcm_carrier_unwrap",
+                    "Float64 WAV to headerless Float64 carrier",
+                    ExecutionBackend::external("ffmpeg"),
+                );
+                operation.inputs.push(super::execution_evidence::EvidenceArtifactRef::path("float64-wave", &effect_path));
+                operation.outputs.push(super::execution_evidence::EvidenceArtifactRef::path("certified-scan-input", &carrier_path));
+                operation.invocation_indices.push(unwrap_invocation);
+                preparation_evidence.operations.push(operation);
+            }
+            _ => return Err(
+                "HDCD true-peak pre-observation path performed terminal quantization before measurement".into(),
+            ),
+        }
+        // Protect the observation from an accidentally truncated, empty, or
+        // invalid raw carrier before the certified meter sees any samples.
+        let bytes = fs::metadata(&carrier_path)
+            .map_err(|error| format!("HDCD Float64 observation carrier missing: {error}"))?
+            .len();
+        let frame_bytes = u64::from(channels) * 8;
+        if bytes == 0 || bytes % frame_bytes != 0 {
+            return Err("HDCD true-peak Float64 carrier is empty or frame-misaligned".into());
+        }
+    } else if let Some(resampler) = execution
         .pre_observation_resampler
         .as_ref()
         .filter(|resampler| {
@@ -38680,6 +38927,8 @@ pub(crate) async fn prepare_pcm_true_peak_carrier_for_regression(
     cancel: &CancellationToken,
     tool_paths: &HashMap<String, PathBuf>,
 ) -> Result<(TrackSourceRef, CertifiedTruePeakPreparedMeasurement), String> {
+    let mut preparation_commands = Vec::new();
+    let mut preparation_evidence = TrackExecutionEvidence::default();
     let prepared = prepare_pcm_true_peak_carrier_for_track(
         req,
         track,
@@ -38690,6 +38939,8 @@ pub(crate) async fn prepare_pcm_true_peak_carrier_for_regression(
         cancel,
         tool_paths,
         None,
+        &mut preparation_commands,
+        &mut preparation_evidence,
     )
     .await?;
     Ok((prepared.source_ref, prepared.measurement))
@@ -38704,7 +38955,7 @@ async fn prepare_pcm_true_peak_carriers(
     cancel: &CancellationToken,
     tool_paths: &HashMap<String, PathBuf>,
     tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
-) -> Result<PreparedPcmTruePeakCarriers, String> {
+) -> Result<PreparedPcmTruePeakCarriers, FailedPcmTruePeakPreparation> {
     if !req.settings.pcm_true_peak.is_true_peak()
         || req.settings.pcm_true_peak.scope()
             != Some(tonepoet_pipeline::TruePeakScope::Album)
@@ -38717,8 +38968,10 @@ async fn prepare_pcm_true_peak_carriers(
         .map(|entry| entry.track_id.clone())
         .collect::<BTreeSet<_>>();
     let carrier_dir = staging.root.join("pcm-true-peak");
-    fs::create_dir_all(&carrier_dir)
-        .map_err(|error| format!("could not create PCM true-peak staging: {error}"))?;
+    fs::create_dir_all(&carrier_dir).map_err(|error| FailedPcmTruePeakPreparation {
+        reason: format!("could not create PCM true-peak staging: {error}"),
+        effect_preludes: BTreeMap::new(),
+    })?;
     let jobs = prepared
         .tracks
         .iter()
@@ -38746,7 +38999,7 @@ async fn prepare_pcm_true_peak_carriers(
     let analysis_cancel = cancel.child_token();
     type PcmTruePeakFuture<'a> = std::pin::Pin<
         Box<
-            dyn std::future::Future<Output = (usize, Result<PreparedPcmTruePeakCarrier, String>)>
+            dyn std::future::Future<Output = (usize, Result<PreparedPcmTruePeakCarrier, String>, CertifiedEffectPrelude)>
                 + Send
                 + 'a,
         >,
@@ -38758,6 +39011,7 @@ async fn prepare_pcm_true_peak_carriers(
             let task_tool_limits = tool_concurrency_limits.clone();
             let task_carrier_dir = carrier_dir.as_path();
             Some(Box::pin(async move {
+                let mut prelude = CertifiedEffectPrelude::default();
                 let result = prepare_pcm_true_peak_carrier_for_track(
                     req,
                     track,
@@ -38768,9 +39022,11 @@ async fn prepare_pcm_true_peak_carriers(
                     &task_cancel,
                     tool_paths,
                     task_tool_limits,
+                    &mut prelude.commands,
+                    &mut prelude.evidence,
                 )
                 .await;
-                (index, result)
+                (index, result, prelude)
             }) as PcmTruePeakFuture<'_>)
         })
         .collect();
@@ -38783,9 +39039,10 @@ async fn prepare_pcm_true_peak_carriers(
     let mut carriers = std::iter::repeat_with(|| None)
         .take(prepared.tracks.len())
         .collect::<Vec<Option<PreparedPcmTruePeakCarrier>>>();
+    let mut effect_preludes = BTreeMap::new();
     let mut first_error = None;
     while remaining > 0 {
-        let (track_index, result) = std::future::poll_fn(|cx| {
+        let (track_index, result, prelude) = std::future::poll_fn(|cx| {
             for slot in &mut pending {
                 let ready = slot.as_mut().and_then(|future| {
                     match std::future::Future::poll(future.as_mut(), cx) {
@@ -38802,6 +39059,9 @@ async fn prepare_pcm_true_peak_carriers(
         })
         .await;
         remaining -= 1;
+        if !prelude.commands.is_empty() || !prelude.evidence.operations.is_empty() {
+            effect_preludes.insert(prepared.tracks[track_index].id.clone(), prelude);
+        }
         match result {
             Ok(carrier) if first_error.is_none() => {
                 carriers[track_index] = Some(carrier);
@@ -38815,8 +39075,11 @@ async fn prepare_pcm_true_peak_carriers(
             }
         }
     }
-    if let Some(error) = first_error {
-        return Err(error);
+    if let Some(reason) = first_error {
+        return Err(FailedPcmTruePeakPreparation {
+            reason,
+            effect_preludes,
+        });
     }
 
     let mut measurements = Vec::new();
@@ -38830,7 +39093,7 @@ async fn prepare_pcm_true_peak_carriers(
             measurements.push(carrier.measurement);
         }
     }
-    Ok(PreparedPcmTruePeakCarriers { measurements })
+    Ok(PreparedPcmTruePeakCarriers { measurements, effect_preludes })
 }
 
 fn certified_true_peak_gained_path(path: &Path, gain_db: tonepoet_pipeline::DbNano) -> PathBuf {
@@ -39602,17 +39865,13 @@ fn hdcd_source_first_command(
         if sample_count == 0 {
             return Err("HDCD CUE segment has zero samples".into());
         }
-        // Seek only at whole-second boundaries so the subsequent atrim has
-        // integer sample offsets. FFmpeg performs accurate input seeking for
-        // transcoded audio; the exact output count is independently checked.
-        let coarse_seconds = start_sample / 44_100;
-        let residual = start_sample % 44_100;
-        let end_sample = residual.checked_add(sample_count)
+        let end_sample = start_sample.checked_add(sample_count)
             .ok_or_else(|| "HDCD CUE sample end overflowed".to_string())?;
-        if coarse_seconds > 0 {
-            args.extend(["-ss".into(), coarse_seconds.to_string()]);
-        }
-        format!("atrim=start_sample={residual}:end_sample={end_sample},asetpts=PTS-STARTPTS,{filter}")
+        // HDCD's control state crosses CUE boundaries. Decode the *continuous*
+        // original S16 programme before trimming sample-exact member frames.
+        // Input seeking, atrim before HDCD, and arbitrary bounded preroll can
+        // each erase control history and change the reconstructed waveform.
+        format!("{filter},atrim=start_sample={start_sample}:end_sample={end_sample},asetpts=PTS-STARTPTS")
     } else {
         filter.to_string()
     };
@@ -39656,7 +39915,7 @@ fn check_hdcd_source_identity(
 
 /// Bind a submitted CUE's effect graph to one physical track. An inactive
 /// member must have neither the HDCD node nor a dangling dependency on it.
-fn registered_effects_for_hdcd_cue_member(
+pub(crate) fn registered_effects_for_hdcd_cue_member(
     effects: &[tonepoet_pipeline::EffectIntent],
     source_ordinal: u32,
 ) -> Result<(Vec<tonepoet_pipeline::EffectIntent>, Option<(u64, u64)>), String> {
@@ -39770,20 +40029,24 @@ mod hdcd_source_first_tests {
     }
 
     #[test]
-    fn cue_command_binds_sample_exact_range_before_the_hdcd_filter() {
+    fn cue_command_decodes_continuous_hdcd_before_sample_exact_cut() {
         let command = hdcd_source_first_command(
             Path::new("album.flac"), Path::new("decoded.wav"),
             "hdcd=bits_per_sample=16:disable_autoconvert=1", None,
             Some((44_100 * 30 + 588, 44_100 * 60)),
         ).expect("CUE HDCD command");
-        assert!(command.args.windows(2).any(|pair| pair[0] == "-ss" && pair[1] == "30"));
+        assert!(!command.args.iter().any(|arg| matches!(arg.as_str(), "-ss" | "-t" | "-ar" | "-ac")));
         assert!(command.args.windows(2).any(|pair| pair[0] == "-af"
-            && pair[1] == "atrim=start_sample=588:end_sample=2646588,asetpts=PTS-STARTPTS,hdcd=bits_per_sample=16:disable_autoconvert=1"));
-        assert!(!command.args.iter().any(|arg| arg == "-ar" || arg == "-ac"));
+            && pair[1] == "hdcd=bits_per_sample=16:disable_autoconvert=1,atrim=start_sample=1323588:end_sample=3969588,asetpts=PTS-STARTPTS"));
         assert!(hdcd_source_first_command(
             Path::new("album.flac"), Path::new("decoded.wav"),
             "hdcd=bits_per_sample=16:disable_autoconvert=1", None,
             Some((u64::MAX, u64::MAX)),
+        ).is_err());
+        assert!(hdcd_source_first_command(
+            Path::new("album.flac"), Path::new("decoded.wav"),
+            "hdcd=bits_per_sample=16:disable_autoconvert=1", None,
+            Some((0, 0)),
         ).is_err());
     }
 }
@@ -39797,6 +40060,7 @@ async fn prepare_registered_effect_carrier_for_track(
     cancel: &CancellationToken,
     tool_paths: &HashMap<String, PathBuf>,
     tool_concurrency_limits: Option<Arc<ToolConcurrencyLimits>>,
+    certified: Option<&CertifiedTruePeakExecutionContract>,
     preparation_commands: &mut Vec<CommandRecord>,
     preparation_evidence: &mut TrackExecutionEvidence,
 ) -> Result<PreparedTrack, String> {
@@ -39851,11 +40115,11 @@ async fn prepare_registered_effect_carrier_for_track(
     } else {
         req.settings.pcm_true_peak.policy
     };
-    if policy.is_true_peak() {
-        if hdcd_guard.is_some() {
-            return Err("HDCD Decode with certified true-peak gain is not qualified".into());
-        }
-        return Ok(track);
+    if policy.is_true_peak() && certified.is_none() {
+        return Err("certified true-peak registered effects require a bound pre-observation execution contract".into());
+    }
+    if !policy.is_true_peak() && certified.is_some() {
+        return Err("certified effect prelude requires an active certified gain decision".into());
     }
     if cancel.is_cancelled() {
         return Err("registered-effect carrier preparation cancelled".to_string());
@@ -39932,13 +40196,37 @@ async fn prepare_registered_effect_carrier_for_track(
             track.id.source_ordinal,
         )
     })?;
-    let mut execution = registered_effect_execution_contract(&plan_request, &track_effects)
-        .map_err(|error| {
-            format!(
-                "could not bind track {} registered-effect execution contract: {error}",
-                track.id.source_ordinal,
-            )
-        })?;
+    let mut execution = if let Some(certified) = certified {
+        // Reuse the *same* typed pre-observation spine that authorizes the
+        // later certified gain decision. The separate effect-only planner is
+        // not an acceptable authority here: it can choose another resampler
+        // or terminal once its true-peak policy is removed.
+        let effect_count = certified.pre_resample.as_ref().map_or(0, |part| part.lowerings.len())
+            + certified.post_resample.as_ref().map_or(0, |part| part.lowerings.len());
+        if effect_count != track_effects.len() {
+            return Err(format!(
+                "track {} certified effect spine contains {} effect(s) for {} admitted intents",
+                track.id.source_ordinal, effect_count, track_effects.len(),
+            ));
+        }
+        super::plan_bridge::RegisteredEffectExecutionContract {
+            pre_resample: certified.pre_resample.clone(),
+            resampler: certified.pre_observation_resampler.clone(),
+            post_resample: certified.post_resample.clone(),
+            output: certified.observation_subject,
+            sample_rate_hz: certified.sample_rate_hz,
+            channels: certified.channels,
+            level_basis: certified.level_basis,
+        }
+    } else {
+        registered_effect_execution_contract(&plan_request, &track_effects)
+            .map_err(|error| {
+                format!(
+                    "could not bind track {} registered-effect execution contract: {error}",
+                    track.id.source_ordinal,
+                )
+            })?
+    };
     let source_channels = source.channels.filter(|channels| *channels > 0).ok_or_else(|| {
         format!(
             "track {} has no authoritative channel geometry for registered effects",
@@ -40030,6 +40318,24 @@ async fn prepare_registered_effect_carrier_for_track(
             let _ = fs::remove_file(&decoded_path);
             format!("track {} HDCD source-first decode failed: {error}", track.id.source_ordinal)
         })?;
+        // A successful prelude is durable execution history even if a later
+        // carrier conversion, resampler, meter, or scratch write fails. Record
+        // its actual invocation *here*, not only after the full effect spine
+        // returns successfully. On failure the caller marks it discarded.
+        let hdcd_intent = track_effects.iter().find(|intent| matches!(
+            intent.effect, tonepoet_pipeline::RegisteredUnaryEffect::HdcdDecode { .. }
+        )).ok_or_else(|| "HDCD typed decode lost its registered effect".to_string())?;
+        let mut hdcd_operation = super::execution_evidence::completed_effect_operation(
+            format!("effect-{}", hdcd_intent.id.0), hdcd_intent, "ffmpeg",
+        );
+        hdcd_operation.inputs.push(super::execution_evidence::EvidenceArtifactRef::path(
+            "hdcd-original-source", &original_source_path,
+        ));
+        hdcd_operation.outputs.push(super::execution_evidence::EvidenceArtifactRef::path(
+            "hdcd-s32-decoded-cue-member", &decoded_path,
+        ));
+        hdcd_operation.invocation_indices.push(invocation_index);
+        preparation_evidence.operations.push(hdcd_operation);
         check_hdcd_source_identity(&original_source_path, expected_size, expected_modified_ns)
             .inspect_err(|_| { let _ = fs::remove_file(&decoded_path); })?;
         let decoded = probe_realized_segment_with_tool_limits(
@@ -40420,6 +40726,12 @@ async fn prepare_registered_effect_carrier_for_track(
         resampler_invocation_index,
     )
     .map_err(|error| format!("could not project completed registered-effect evidence: {error}"))?;
+    if hdcd_invocation_index.is_some() {
+        // The executed HDCD operation was recorded at its actual completion
+        // boundary, including its physical artifact identities. Avoid a
+        // second synthetic success receipt from the final graph projection.
+        semantic_effect_evidence.operations.retain(|operation| operation.kind != "hdcd_decode");
+    }
     annotate_deemphasis_execution_evidence(req, &mut semantic_effect_evidence);
     preparation_evidence.append(semantic_effect_evidence, 0);
 
@@ -40471,6 +40783,7 @@ async fn prepare_track_scoped_certified_true_peak_carrier(
                 cancel,
                 tool_paths,
                 tool_concurrency_limits,
+                None,
                 preparation_commands,
                 preparation_evidence,
             )
@@ -40538,6 +40851,8 @@ async fn prepare_track_scoped_certified_true_peak_carrier(
         cancel,
         tool_paths,
         tool_concurrency_limits,
+        preparation_commands,
+        preparation_evidence,
     )
     .await?;
     if carrier.measurement.execution.scope != tonepoet_pipeline::TruePeakScope::Track {
@@ -42611,11 +42926,12 @@ async fn prepare_pipeline_item_for_scheduler_scoped_inner(
         Err(error) => {
             let record = stage_record(
                 PipelineStage::Convert,
-                StageOutcome::Failed(format!("PCM true-peak analysis failed: {error}")),
+                StageOutcome::Failed(format!("PCM true-peak analysis failed: {}", error.reason)),
             );
             emit_stage_finished(reporter, &item_id, record.clone()).await;
             stages.push(record);
-            let failed = failed_track_records(&prepared, &error);
+            let mut failed = failed_track_records(&prepared, &error.reason);
+            attach_failed_pcm_preludes(&mut failed, &error.effect_preludes);
             let outcome = AlbumOutcome::Blocked {
                 successful: Vec::new(),
                 failed,
@@ -42645,6 +42961,7 @@ async fn prepare_pipeline_item_for_scheduler_scoped_inner(
         }
     };
     let pcm_true_peak_measurements = prepared_pcm_true_peak_carriers.measurements;
+    let pcm_effect_preludes = prepared_pcm_true_peak_carriers.effect_preludes;
 
     ScheduledMaterialization::Ready(ScheduledAlbum {
         item_id,
@@ -42659,6 +42976,7 @@ async fn prepare_pipeline_item_for_scheduler_scoped_inner(
         reference_auto_gain_measurements,
         dsd_true_peak_measurements,
         pcm_true_peak_measurements,
+        pcm_effect_preludes,
         dsd_true_peak_timings,
         album_gain_scope_disclosure: None,
         run_timing,
@@ -42682,6 +43000,7 @@ const CUE_FALLBACK_BATCH_MAX_OUTPUTS: usize = 32;
 
 async fn prepare_required_cue_fallback_batches(
     tracks: &[ScheduledCueStreamTrack],
+    req: &PipelineRequest,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
 ) -> BTreeMap<usize, String> {
@@ -42760,6 +43079,22 @@ async fn prepare_required_cue_fallback_batches(
     for input in tracks {
         if cancel.is_cancelled() {
             break;
+        }
+        // HDCD must read the original S16 programme with its continuous
+        // control history. Ordinary S32 CUE fallback carriers cannot be used
+        // as its input; staging them here would waste a decode and scratch.
+        // Specialize per member so unaffected tracks keep grouped batching.
+        match registered_effects_for_hdcd_cue_member(
+            &req.registered_effects, input.track.id.source_ordinal,
+        ) {
+            Ok((_, Some(_))) => continue,
+            Err(error) => {
+                failures.insert(input.index, format!(
+                    "CUE member registered-effect admission failed: {error}"
+                ));
+                continue;
+            }
+            Ok((_, None)) => {}
         }
         let TrackSourceRef::CueStreamSegment {
             fallback_path,
@@ -42887,7 +43222,7 @@ async fn encode_cue_stream_group_fallback(
     cancel: &CancellationToken,
 ) -> Vec<ScheduledTrackOutput> {
     let mut outputs = Vec::with_capacity(tracks.len());
-    let batch_failures = prepare_required_cue_fallback_batches(&tracks, runner, cancel).await;
+    let batch_failures = prepare_required_cue_fallback_batches(&tracks, req, runner, cancel).await;
     for input in tracks {
         if let Some(error) = batch_failures.get(&input.index) {
             outputs.push(scheduled_worker_failure_output(
@@ -45180,6 +45515,7 @@ pub(crate) async fn finish_pipeline_album_for_scheduler_with_tool_limits_and_ret
     let source_replaygain = album.source_replaygain;
     let batch_replaygain = album.batch_replaygain;
     let dsd_true_peak_timings = album.dsd_true_peak_timings;
+    let album_pcm_effect_preludes = album.pcm_effect_preludes;
     let album_gain_scope_disclosure = album.album_gain_scope_disclosure;
     let req = album.req;
     let item_id = req.item_id.clone();
@@ -45195,6 +45531,25 @@ pub(crate) async fn finish_pipeline_album_for_scheduler_with_tool_limits_and_ret
     let publication_binding;
 
     emit_stage_started(reporter, &item_id, PipelineStage::Convert).await;
+    let mut track_outputs = track_outputs;
+    // Album effects were executed before the album scalar existed. Attach
+    // their actual commands/receipts ahead of terminal commands, offsetting
+    // every terminal invocation reference. This applies equally on a retained
+    // scratch retry, without rerunning or double-reporting the effect prelude.
+    for output in &mut track_outputs {
+        if let Some(prelude) = album_pcm_effect_preludes.get(&output.record.track_id) {
+            let mut commands = prelude.commands.clone();
+            let offset = commands.len();
+            commands.append(&mut output.record.commands);
+            output.record.commands = commands;
+            let mut evidence = prelude.evidence.clone();
+            if !matches!(output.record.outcome, TrackOutcome::Ok) {
+                evidence.mark_discarded_attempt();
+            }
+            evidence.append(std::mem::take(&mut output.record.execution_evidence), offset);
+            output.record.execution_evidence = evidence;
+        }
+    }
     let converted = convert_result_from_scheduled_outputs(
         &source_value,
         track_outputs,
@@ -68855,6 +69210,115 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
     }
 
     #[test]
+    fn cue_stream_admission_is_per_member_and_rejects_hdcd_and_true_peak() {
+        use tonepoet_pipeline::{
+            EffectInstanceId, EffectIntent, EffectPlacement, HdcdCueSegment,
+            RegisteredUnaryEffect, SampleGainPolicy,
+        };
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut req = request(
+            temp.path(),
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            stage_policy(false, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        req.settings.target_format = tonepoet_pipeline::AudioFormat::Mp3;
+        req.settings.preferred_tool = tonepoet_pipeline::PreferredTool::Auto;
+        let (mut track, fallback) = cue_stream_source_depth_track(temp.path(), 16, "album.wav");
+        track.id.source_ordinal = 1;
+        let staged = temp.path().join("convert/track-01.mp3");
+        let work = temp.path().join("convert");
+        let ordinary = prepare_cue_stream_direct_track_plan(
+            &req, &track, &fallback, &staged, &work,
+        ).expect("ordinary MP3 plan");
+        assert!(ordinary.is_some(), "ordinary 16/44.1 CUE MP3 retains direct streaming");
+        cleanup_cue_stream_direct_track_plan(&ordinary.unwrap());
+
+        req.registered_effects = vec![EffectIntent {
+            id: EffectInstanceId(21),
+            effect: RegisteredUnaryEffect::HdcdDecode {
+                source_size_bytes: 1,
+                source_modified_ns: 1,
+                cue_segments: vec![HdcdCueSegment {
+                    source_ordinal: 1,
+                    start_sample: 0,
+                    sample_count: 44_100,
+                }],
+            },
+            after: Vec::new(),
+            placement: EffectPlacement::SourceBitstreamDecode,
+        }];
+        assert!(prepare_cue_stream_direct_track_plan(
+            &req, &track, &fallback, &staged, &work,
+        ).expect("HDCD admission").is_none(), "HDCD CUE member must enter registered-effect worker");
+
+        let mut unaffected = track.clone();
+        unaffected.id.source_ordinal = 0;
+        assert!(prepare_cue_stream_direct_track_plan(
+            &req, &unaffected, &fallback, &staged, &work,
+        ).expect("unaffected member admission").is_some(),
+            "unaffected member must keep the ordinary direct-stream route");
+
+        req.registered_effects.clear();
+        for policy in [SampleGainPolicy::pcm_guard_default(), SampleGainPolicy::pcm_normalize_default()] {
+            req.settings.pcm_true_peak.policy = policy;
+            assert!(prepare_cue_stream_direct_track_plan(
+                &req, &track, &fallback, &staged, &work,
+            ).expect("certified Track admission").is_none(),
+                "Track Guard/Normalize must cross the certified observation barrier");
+        }
+    }
+
+    #[tokio::test]
+    async fn grouped_cue_fallback_never_stages_unusable_hdcd_member_carriers() {
+        use crate::convert::pipeline::tool::StubToolRunner;
+        use tonepoet_pipeline::{
+            EffectInstanceId, EffectIntent, EffectPlacement, HdcdCueSegment,
+            RegisteredUnaryEffect,
+        };
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let (tracks, _) = cue_stream_three_track_group(temp.path(), 16);
+        let mut req = request(
+            temp.path(),
+            FailurePolicy::FailAlbumOnAnyTrackFailure,
+            stage_policy(false, false, false),
+            OverwritePolicy::FailIfExists,
+        );
+        req.registered_effects.push(EffectIntent {
+            id: EffectInstanceId(21),
+            effect: RegisteredUnaryEffect::HdcdDecode {
+                source_size_bytes: 1,
+                source_modified_ns: 1,
+                cue_segments: vec![HdcdCueSegment {
+                    source_ordinal: 1,
+                    start_sample: 44_100,
+                    sample_count: 44_100,
+                }],
+            },
+            after: Vec::new(),
+            placement: EffectPlacement::SourceBitstreamDecode,
+        });
+        let runner = StubToolRunner::new();
+        // The stub does not materialize output WAVs, so the ordinary members
+        // fail finalization. Its transcript still proves the grouped decoder
+        // *attempted only* members 0 and 2; member 1 is never staged.
+        let failures = prepare_required_cue_fallback_batches(
+            &tracks, &req, &runner, &CancellationToken::new(),
+        ).await;
+        assert!(!failures.contains_key(&1), "HDCD member needs no S32 fallback");
+        assert!(failures.contains_key(&0) && failures.contains_key(&2),
+            "ordinary members retain grouped fallback staging");
+        let calls = runner.transcript();
+        assert_eq!(calls.len(), 1, "two ordinary CUE members need one grouped decode attempt");
+        let args = calls[0].sanitized_args.join(" ");
+        assert!(args.contains("track-00") && args.contains("track-02"), "{args}");
+        assert!(!args.contains("track-01"), "HDCD member cannot be a fallback output: {args}");
+        assert!(!matches!(tracks[1].track.source_ref, TrackSourceRef::StagedFile(_)));
+    }
+
+    #[test]
     fn cue_stream_auto_alac_and_lossy_targets_remain_direct_ffmpeg() {
         let temp = tempfile::tempdir().expect("temp dir");
         for (format, extension) in [
@@ -69854,6 +70318,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                 reference_auto_gain_measurements: Vec::new(),
                 dsd_true_peak_measurements: Vec::new(),
                 pcm_true_peak_measurements: Vec::new(),
+                pcm_effect_preludes: BTreeMap::new(),
                 dsd_true_peak_timings: BTreeMap::new(),
                 album_gain_scope_disclosure: None,
                 run_timing: ConversionRunTiming::start(),
