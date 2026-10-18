@@ -4926,6 +4926,13 @@ mod source_state_synthetic_artifact_ownership_tests {
     }
 }
 
+/// Output PCM channel policy, independent of source container/reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputChannelLayoutChoice {
+    Source,
+    Stereo,
+}
+
 /// Which row in the format pane is focused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FormatField {
@@ -4935,6 +4942,10 @@ pub enum FormatField {
     BitDepth,
     Resampler,
     Dither,
+    /// Advanced output PCM layout policy.
+    OutputChannelLayout,
+    /// Advanced DC-bias suppression with an explicit 2 Hz high-pass.
+    RemoveDcOffset,
     /// CD source-rate de-emphasis correction.
     Deemphasis,
     /// Source-control-bit HDCD decoding, separately gated from EQ.
@@ -5193,6 +5204,8 @@ pub struct FormatState {
     pub resampler: PillState<ResamplerChoice>,
     pub dither: PillState<DitherType>,
     pub replaygain: PillState<ReplayGainChoice>,
+    pub output_channel_layout: PillState<OutputChannelLayoutChoice>,
+    pub remove_dc_offset: bool,
     pub pcm_gain_mode: PillState<PcmGainMode>,
     pub pcm_true_peak_scope: PillState<TruePeakScope>,
     pub pcm_true_peak_scan_mode: PillState<TruePeakScanTier>,
@@ -5473,6 +5486,11 @@ impl FormatState {
             (BitDepthChoice::Float64, "64f"),
         ]);
 
+        let output_channel_layout = PillState::new(vec![
+            (OutputChannelLayoutChoice::Source, "source"),
+            (OutputChannelLayoutChoice::Stereo, "stereo"),
+        ]);
+
         let resampler = PillState::new(vec![
             (ResamplerChoice::None, "none"),
             (ResamplerChoice::Soxr, "soxr"),
@@ -5583,6 +5601,8 @@ impl FormatState {
             resampler,
             dither,
             replaygain,
+            output_channel_layout,
+            remove_dc_offset: false,
             pcm_gain_mode,
             pcm_true_peak_scope,
             pcm_true_peak_scan_mode,
@@ -5971,6 +5991,11 @@ impl FormatState {
             }
         }
 
+        if maximized && !self.is_dsd_selected() {
+            rows.push(FormatPaneRow::Spacer);
+            rows.push(FormatPaneRow::Field(FormatField::OutputChannelLayout));
+            rows.push(FormatPaneRow::Field(FormatField::RemoveDcOffset));
+        }
         if maximized
             && self.deemphasis_eligible
             && self.deemphasis_evidence == ConvertDeemphasisEvidence::None
@@ -6357,6 +6382,14 @@ impl FormatState {
     /// Select the next enabled pill in the focused row and run row-specific side effects.
     /// Key and mouse handlers should use this instead of calling `focused_pill_mut()` directly.
     pub fn select_focused_next(&mut self, source_bits: Option<u32>, source_rate: Option<u32>) {
+        if self.field_focus == FormatField::OutputChannelLayout {
+            self.output_channel_layout.select_next();
+            return;
+        }
+        if self.field_focus == FormatField::RemoveDcOffset {
+            self.remove_dc_offset = !self.remove_dc_offset;
+            return;
+        }
         if self.field_focus == FormatField::Deemphasis {
             self.record_manual_deemphasis_choice(!self.deemphasis_enabled);
             self.apply_auto_dither(source_bits);
@@ -6394,6 +6427,14 @@ impl FormatState {
 
     /// Select the previous enabled pill in the focused row and run row-specific side effects.
     pub fn select_focused_prev(&mut self, source_bits: Option<u32>, source_rate: Option<u32>) {
+        if self.field_focus == FormatField::OutputChannelLayout {
+            self.output_channel_layout.select_prev();
+            return;
+        }
+        if self.field_focus == FormatField::RemoveDcOffset {
+            self.remove_dc_offset = !self.remove_dc_offset;
+            return;
+        }
         if self.field_focus == FormatField::Deemphasis {
             self.record_manual_deemphasis_choice(!self.deemphasis_enabled);
             self.apply_auto_dither(source_bits);
@@ -6458,6 +6499,12 @@ impl FormatState {
             FormatField::BitDepth => select_enabled_index(&mut self.bit_depth, index),
             FormatField::Resampler => select_enabled_index(&mut self.resampler, index),
             FormatField::Dither => select_enabled_index(&mut self.dither, index),
+            FormatField::OutputChannelLayout => {
+                select_enabled_index(&mut self.output_channel_layout, index)
+            }
+            FormatField::RemoveDcOffset => {
+                if index > 1 { false } else { self.remove_dc_offset = index == 1; true }
+            },
             FormatField::HdcdDecode => {
                 if !self.hdcd_is_actionable() || index > 1 {
                     false
@@ -7730,6 +7777,9 @@ impl FormatState {
             FormatField::BitDepth => FocusedPill::BitDepth(&mut self.bit_depth),
             FormatField::Resampler => FocusedPill::Resampler(&mut self.resampler),
             FormatField::Dither => FocusedPill::Dither(&mut self.dither),
+            FormatField::OutputChannelLayout | FormatField::RemoveDcOffset => {
+                unreachable!("channel/DC controls use dedicated selectors")
+            },
             FormatField::Deemphasis => unreachable!("de-emphasis uses its dedicated boolean selector"),
             FormatField::HdcdDecode => unreachable!("HDCD uses its dedicated boolean selector"),
             FormatField::ReplayGain => FocusedPill::ReplayGain(&mut self.replaygain),
@@ -25443,5 +25493,33 @@ mod hdcd_format_policy_tests {
             assert!(!state.hdcd_decode_enabled);
             assert_eq!(*state.pcm_gain_mode.selected_value(), PcmGainMode::TruePeakGuard);
         }
+    }
+}
+
+#[cfg(test)]
+mod channel_and_dc_format_controls_tests {
+    use super::{FormatField, FormatPaneRow, FormatState, OutputChannelLayoutChoice};
+
+    #[test]
+    fn advanced_rows_are_below_fold_and_keyboard_mouse_agree() {
+        let mut format = FormatState::new();
+        let advanced = format.pane_rows(true);
+        for field in [FormatField::OutputChannelLayout, FormatField::RemoveDcOffset] {
+            assert!(advanced.contains(&FormatPaneRow::Field(field)));
+            assert!(!format.pane_rows(false).contains(&FormatPaneRow::Field(field)));
+        }
+        assert_eq!(*format.output_channel_layout.selected_value(), OutputChannelLayoutChoice::Source);
+        assert!(!format.remove_dc_offset);
+        assert!(format.select_row_index(FormatField::OutputChannelLayout, 1, None, None));
+        assert_eq!(*format.output_channel_layout.selected_value(), OutputChannelLayoutChoice::Stereo);
+        format.field_focus = FormatField::OutputChannelLayout;
+        format.select_focused_next(None, None);
+        assert_eq!(*format.output_channel_layout.selected_value(), OutputChannelLayoutChoice::Source);
+        assert!(format.select_row_index(FormatField::RemoveDcOffset, 1, None, None));
+        assert!(format.remove_dc_offset);
+        format.field_focus = FormatField::RemoveDcOffset;
+        format.select_focused_prev(None, None);
+        assert!(!format.remove_dc_offset);
+        assert!(!format.select_row_index(FormatField::RemoveDcOffset, 2, None, None));
     }
 }

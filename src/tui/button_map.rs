@@ -47,6 +47,8 @@ pub enum TuiButton {
     DepthPill(usize),
     ResamplerPill(usize),
     DitherPill(usize),
+    ChannelLayoutPill(usize),
+    RemoveDcPill(usize),
     DeemphasisPill(usize),
     DeemphasisInfo,
     HdcdPill(usize),
@@ -608,6 +610,8 @@ impl TuiButton {
             | Self::DepthPill(_)
             | Self::ResamplerPill(_)
             | Self::DitherPill(_)
+            | Self::ChannelLayoutPill(_)
+            | Self::RemoveDcPill(_)
             | Self::DeemphasisPill(_)
             | Self::DeemphasisInfo
             | Self::HdcdPill(_)

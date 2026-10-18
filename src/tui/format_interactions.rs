@@ -165,6 +165,12 @@ pub fn handle_format_button(
             source_bits,
             source_rate,
         ),
+        TuiButton::ChannelLayoutPill(index) => format.select_row_index(
+            FormatField::OutputChannelLayout, index, source_bits, source_rate,
+        ),
+        TuiButton::RemoveDcPill(index) => format.select_row_index(
+            FormatField::RemoveDcOffset, index, source_bits, source_rate,
+        ),
         TuiButton::HdcdPill(index) => format.select_row_index(
             FormatField::HdcdDecode, index, source_bits, source_rate,
         ),

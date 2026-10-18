@@ -42,6 +42,11 @@ pub struct TuiPreset {
     pub bit_depth: String,  // "source", "16", "24", "32", "32f", "64f"
     pub dither: String,     // "tpdf", "none", "shibata", ...
     pub replaygain: String, // "album", "track", "both", optional "-if-missing", or "off"
+    /// Output channel geometry is a conversion property, not a source policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_channel_layout: Option<String>, // source | stereo
+    #[serde(default)]
+    pub remove_dc_offset: bool,
     #[serde(default = "default_resampler")]
     pub resampler: String, // "sox", "ssrc", "soxr"
     /// Explicit user de-emphasis override. None means follow source/target automatic policy.
@@ -226,6 +231,8 @@ impl PresetWireLegacy {
             replaygain: self.replaygain,
             resampler: self.resampler,
             deemphasis: None,
+            output_channel_layout: None,
+            remove_dc_offset: false,
             hdcd_decode: None,
             hdcd_auto_depth: None,
             hdcd_auto_dither: None,
@@ -272,6 +279,14 @@ fn validate_v5_preset(preset: &TuiPreset, path: &Path) -> Result<(), String> {
     }
     if preset.output_target.as_deref().is_none_or(|value| value.trim().is_empty()) {
         return Err(format!("Preset v5 '{}' has an empty required output_target", path.display()));
+    }
+    if let Some(layout) = preset.output_channel_layout.as_deref() {
+        if !matches!(layout, "source" | "stereo") {
+            return Err(format!(
+                "Preset v5 '{}' has unsupported output channel layout '{layout}'",
+                path.display()
+            ));
+        }
     }
     if let Some(mode) = preset.pcm_gain.as_deref() {
         if !matches!(mode, "off" | "true-peak-guard" | "true-peak-normalize" | "fixed-gain") {
@@ -429,6 +444,11 @@ impl TuiPreset {
             dither: format.dither.selected_label().to_lowercase(),
             replaygain: format.replaygain.selected_label().to_lowercase(),
             resampler: format.resampler.selected_label().to_lowercase(),
+            output_channel_layout: Some(match format.output_channel_layout.selected_value() {
+                crate::tui::app::OutputChannelLayoutChoice::Source => "source",
+                crate::tui::app::OutputChannelLayoutChoice::Stereo => "stereo",
+            }.to_string()),
+            remove_dc_offset: format.remove_dc_offset,
             deemphasis: format.deemphasis_overridden.then_some(format.deemphasis_enabled),
             hdcd_decode: format.hdcd_decode_overridden.then_some(format.hdcd_decode_enabled),
             hdcd_auto_depth: format.hdcd_promoted_from_depth.map(|_| true),
@@ -908,6 +928,15 @@ impl TuiPreset {
         }
 
         if !is_dsd {
+            let channel_choice = match self.output_channel_layout.as_deref().unwrap_or("source") {
+                "source" => Some(crate::tui::app::OutputChannelLayoutChoice::Source),
+                "stereo" => Some(crate::tui::app::OutputChannelLayoutChoice::Stereo),
+                _ => None,
+            };
+            report.record("output_channel_layout", channel_choice.is_some_and(|value|
+                format_state.output_channel_layout.select_value(&value)));
+            format_state.remove_dc_offset = self.remove_dc_offset;
+            report.record("remove_dc_offset", true);
             match self.hdcd_decode {
                 Some(enabled) => {
                     format_state.hdcd_decode_enabled = enabled;
@@ -1843,6 +1872,31 @@ mod companion_preset_tests {
             &OutputOptionsState::new(),
             &MetadataState::default(),
         )
+    }
+
+    #[test]
+    fn channel_and_dc_preset_round_trip_and_legacy_defaults() {
+        let mut format = FormatState::new();
+        assert!(format.output_channel_layout.select_value(
+            &crate::tui::app::OutputChannelLayoutChoice::Stereo,
+        ));
+        format.remove_dc_offset = true;
+        let preset = TuiPreset::from_pill_state(
+            "stereo-dc",
+            &format,
+            &OutputOptionsState::new(),
+            &MetadataState::default(),
+        );
+        let encoded = serde_json::to_string(&preset).expect("serialize preset");
+        let saved: TuiPreset = serde_json::from_str(&encoded).expect("deserialize preset");
+        assert_eq!(saved.output_channel_layout.as_deref(), Some("stereo"));
+        assert!(saved.remove_dc_offset);
+        let mut old: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        old.as_object_mut().unwrap().remove("output_channel_layout");
+        old.as_object_mut().unwrap().remove("remove_dc_offset");
+        let old: TuiPreset = serde_json::from_value(old).expect("legacy preset remains valid");
+        assert!(old.output_channel_layout.is_none());
+        assert!(!old.remove_dc_offset);
     }
 
     fn eligible_preemphasized_16441_state() -> FormatState {

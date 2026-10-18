@@ -1205,9 +1205,14 @@ pub(crate) struct RegisteredEffectSegment {
     pub input: tonepoet_pipeline::SignalId,
     pub output: tonepoet_pipeline::SignalId,
     pub sample_rate_hz: u32,
+    /// Input geometry is different from output geometry for a stereo fold.
+    pub input_channels: u16,
     pub channels: u16,
     pub level_basis: tonepoet_pipeline::LevelBasis,
     pub lowerings: Vec<tonepoet_pipeline::EffectLowering>,
+    /// Output interleave width for each ordered lowering, taken directly
+    /// from the authoritative typed graph (never parsed from filter text).
+    pub effect_output_channels: Vec<u16>,
 }
 
 /// Frozen selected PCM resampler between optional registered-effect segments.
@@ -1266,6 +1271,16 @@ fn registered_effect_segment_from_nodes(
                 output,
             ))
         })?;
+    let input_state = typed.audio_states.iter().find(|state| state.id == input)
+        .ok_or_else(|| ConvertError::Backend(format!(
+            "typed registered-effect input {:?} has no audio-state facts", input
+        )))?;
+    let input_channels = match &input_state.channels {
+        tonepoet_pipeline::Fact::Known(channels) if *channels > 0 => *channels,
+        fact => return Err(ConvertError::Backend(format!(
+            "typed registered-effect input {:?} has no authoritative channel geometry: {:?}", input, fact
+        ))),
+    };
     let sample_rate_hz = match &output_state.sample_rate_hz {
         tonepoet_pipeline::Fact::Known(rate) if *rate > 0 => *rate,
         fact => {
@@ -1288,12 +1303,25 @@ fn registered_effect_segment_from_nodes(
         input,
         output,
         sample_rate_hz,
+        input_channels,
         channels,
         level_basis: output_state.level_basis,
         lowerings: nodes
             .iter()
             .map(|(_, _, lowering)| lowering.clone())
             .collect(),
+        effect_output_channels: nodes.iter().map(|(_, node_output, _)| {
+            let state = typed.audio_states.iter().find(|state| state.id == *node_output)
+                .ok_or_else(|| ConvertError::Backend(format!(
+                    "typed effect output {:?} lacks audio state", node_output,
+                )))?;
+            match &state.channels {
+                tonepoet_pipeline::Fact::Known(count) if *count > 0 => Ok(*count),
+                fact => Err(ConvertError::Backend(format!(
+                    "typed effect output {:?} lacks known channel count: {:?}", node_output, fact,
+                ))),
+            }
+        }).collect::<Result<Vec<_>, _>>()?,
     }))
 }
 
@@ -1459,7 +1487,7 @@ fn segmented_registered_effect_execution_from_typed(
                 resampler.output, post.input,
             )));
         }
-        if resampler.output_rate_hz != post.sample_rate_hz || resampler.channels != post.channels {
+        if resampler.output_rate_hz != post.sample_rate_hz || resampler.channels != post.input_channels {
             return Err(ConvertError::Backend(
                 "typed selected resampler egress geometry disagrees with post-resample effects"
                     .to_string(),

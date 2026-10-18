@@ -1506,3 +1506,42 @@ mod loudness_status_tests {
         );
     }
 }
+
+/// Classify DC relative to the actual AC signal, not a fixed full-scale
+/// amplitude. Browse RMS is AES-17-corrected by sqrt(2), hence the inverse
+/// correction before subtracting the DC term. The 1% threshold is a modest
+/// 40-dB DC/AC separation, invariant under uniform linear gain. A silent or
+/// invalid measurement is never promoted to an alarming verdict.
+pub(crate) fn dc_bias_is_significant(dc: f64, aes17_rms_db: f64) -> bool {
+    if !dc.is_finite() || !aes17_rms_db.is_finite() {
+        return false;
+    }
+    let raw_rms = 10.0_f64.powf(aes17_rms_db / 20.0) / std::f64::consts::SQRT_2;
+    if raw_rms < 1e-12 {
+        return false;
+    }
+    let ac_rms = (raw_rms * raw_rms - dc * dc).max(0.0).sqrt();
+    dc.abs() > ac_rms * 0.01
+}
+
+#[cfg(test)]
+mod dc_bias_relative_classification_tests {
+    use super::dc_bias_is_significant;
+    fn aes_rms_db(ac_rms: f64, dc: f64) -> f64 {
+        20.0 * (std::f64::consts::SQRT_2 * ac_rms.hypot(dc)).log10()
+    }
+    #[test]
+    fn verdict_is_gain_invariant_and_not_an_absolute_dc_threshold() {
+        let ac = 0.3;
+        let dc = 0.00035;
+        let initial = dc_bias_is_significant(dc, aes_rms_db(ac, dc));
+        assert!(!initial);
+        for gain in [0.01, 0.1, 1.0, 3.0, 10.0] {
+            assert_eq!(dc_bias_is_significant(dc * gain, aes_rms_db(ac * gain, dc * gain)), initial);
+        }
+        assert!(dc_bias_is_significant(0.01, aes_rms_db(0.1, 0.01)));
+        assert!(!dc_bias_is_significant(0.0, aes_rms_db(0.3, 0.0)));
+        assert!(!dc_bias_is_significant(f64::NAN, aes_rms_db(0.3, 0.0)));
+        assert!(!dc_bias_is_significant(0.0, -120.0));
+    }
+}

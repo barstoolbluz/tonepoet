@@ -2045,6 +2045,15 @@ fn push_registered_effect(
             writer.field_static(&format!("{prefix}.kind"), "ffmpeg_lowpass");
             writer.field_string(&format!("{prefix}.frequency_hz"), frequency_hz.to_string());
         }
+        RegisteredUnaryEffect::StereoFold => {
+            writer.field_static(&format!("{prefix}.kind"), "stereo_fold");
+            writer.field_static(&format!("{prefix}.matrix"),
+                crate::semantic_plan::STEREO_FOLD_FFMPEG_FILTER);
+        }
+        RegisteredUnaryEffect::RemoveDcOffset => {
+            writer.field_static(&format!("{prefix}.kind"), "remove_dc_offset");
+            writer.field_static(&format!("{prefix}.filter"), "highpass_2hz_v1");
+        }
         RegisteredUnaryEffect::CdDeemphasis => {
             writer.field_static(&format!("{prefix}.kind"), "cd_deemphasis");
         }
