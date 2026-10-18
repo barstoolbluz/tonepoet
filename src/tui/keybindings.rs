@@ -3778,6 +3778,8 @@ fn convert_format_field_value(app: &AppState, field: FormatField) -> String {
         FormatField::BitDepth => format.bit_depth.selected_label().to_string(),
         FormatField::Resampler => format.resampler.selected_label().to_string(),
         FormatField::Dither => format.dither.selected_label().to_string(),
+        FormatField::OutputChannelLayout => format.output_channel_layout.selected_label().to_string(),
+        FormatField::RemoveDcOffset => if format.remove_dc_offset { "on" } else { "off" }.to_string(),
         FormatField::Deemphasis => if format.deemphasis_enabled { "on" } else { "off" }.to_string(),
         FormatField::HdcdDecode => if format.hdcd_decode_enabled { "on" } else { "off" }.to_string(),
         FormatField::ReplayGain => format.replaygain.selected_label().to_string(),
@@ -72356,6 +72358,8 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::DepthPill(_)
             | TuiButton::ResamplerPill(_)
             | TuiButton::DitherPill(_)
+            | TuiButton::ChannelLayoutPill(_)
+            | TuiButton::RemoveDcPill(_)
             | TuiButton::DeemphasisPill(_)
             | TuiButton::HdcdPill(_)
             | TuiButton::ReplayGainPill(_)

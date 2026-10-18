@@ -1626,6 +1626,16 @@ pub fn completed_effect_operation(
                 EvidenceValue::Text(format!("{target_dbfs} dBFS")),
             )],
         ),
+        RegisteredUnaryEffect::StereoFold => (
+            "stereo_fold", "Stereo fold (normalized, LFE omitted)",
+            vec![OperationParameter::new("Matrix", EvidenceValue::Text(
+                tonepoet_pipeline::STEREO_FOLD_FFMPEG_FILTER.to_owned(),
+            ))],
+        ),
+        RegisteredUnaryEffect::RemoveDcOffset => (
+            "dc_offset_removal", "DC offset removal (2 Hz high-pass)",
+            vec![OperationParameter::new("Cutoff", EvidenceValue::SampleRateHz(2))],
+        ),
         RegisteredUnaryEffect::CdDeemphasis => (
             "cd_deemphasis",
             "CD de-emphasis",

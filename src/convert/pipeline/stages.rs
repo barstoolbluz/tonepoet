@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{fs, io};
+use std::io::{Read, Seek, SeekFrom};
 
 use async_trait::async_trait;
 use fs2::FileExt;
@@ -80,6 +81,7 @@ use super::memory_budget::{
     estimate_streaming_cue_scratch_peak_bytes, write_staging_owner_marker,
     ScratchAdmissionFailureKind, ScratchReservation,
 };
+use super::dvda_channel_layout::{layout_for_assignment_code, DvdaChannelOrderPolicy};
 use super::dvda_realize::{realize_dvda_track, DvdaRealizationAudioPolicy, DvdaSourceAudioExpectation};
 use super::track_executor::{
     cleanup_cue_stream_direct_track_plan, execute_planned_track_conversion,
@@ -1580,11 +1582,20 @@ async fn realize_track_with_tool_limits_and_stats(
         .map(RealizedTrackInfo::without_stats),
         TrackSourceRef::DvdaTrack { dvda_downmix_policy, .. } => {
             let expected_audio = DvdaSourceAudioExpectation::from_prepared_track_and_source(prepared_track, src);
-            let audio_policy = DvdaRealizationAudioPolicy::new(
+            let mut audio_policy = DvdaRealizationAudioPolicy::new(
                 bit_depth_target_label(req.settings.target_bit_depth).to_string(),
                 prepared_track.and_then(|track| resolved_target_bit_depth(track, &req.settings)),
                 *dvda_downmix_policy,
             );
+            if req.registered_effects.iter().any(|intent| matches!(
+                &intent.effect, tonepoet_pipeline::RegisteredUnaryEffect::StereoFold
+            )) {
+                // The DVD-Audio LPCM carrier is *not* necessarily in WAV speaker
+                // order. Reorder the decoded samples before the fold's Float64
+                // ingress; merely supplying a WAV channel mask cannot do this.
+                // Unmodified DVD-Audio conversions retain their chosen policy.
+                audio_policy = audio_policy.for_stereo_fold();
+            }
             realize_dvda_track(
                 src,
                 expected_audio,
@@ -2098,6 +2109,8 @@ struct RealizedProbe {
     codec_name: Option<String>,
     sample_fmt: Option<String>,
     channels: Option<u32>,
+    // Probed before an intermediate can erase the source's speaker roles.
+    channel_layout: Option<String>,
     bits_per_raw_sample: Option<u32>,
     bits_per_sample: Option<u32>,
 }
@@ -2126,7 +2139,7 @@ async fn probe_realized_segment_with_tool_limits(
             "-select_streams".into(),
             "a:0".into(),
             "-show_entries".into(),
-            "stream=sample_rate,channels,duration_ts,time_base,duration,codec_name,sample_fmt,bits_per_raw_sample,bits_per_sample".into(),
+            "stream=sample_rate,channels,channel_layout,duration_ts,time_base,duration,codec_name,sample_fmt,bits_per_raw_sample,bits_per_sample".into(),
             "-show_entries".into(),
             "format=duration".into(),
             "-of".into(),
@@ -2296,6 +2309,7 @@ fn parse_realized_probe_json(json: &str) -> Result<RealizedProbe, ConvertError> 
             codec_name: json_string(stream, "codec_name"),
             sample_fmt: json_string(stream, "sample_fmt"),
             channels: json_u32_field(stream, "channels"),
+            channel_layout: json_string(stream, "channel_layout"),
             bits_per_raw_sample: json_u32_field(stream, "bits_per_raw_sample"),
             bits_per_sample: json_u32_field(stream, "bits_per_sample"),
         });
@@ -2319,6 +2333,7 @@ fn parse_realized_probe_json(json: &str) -> Result<RealizedProbe, ConvertError> 
         codec_name: json_string(stream, "codec_name"),
         sample_fmt: json_string(stream, "sample_fmt"),
         channels: json_u32_field(stream, "channels"),
+        channel_layout: json_string(stream, "channel_layout"),
         bits_per_raw_sample: json_u32_field(stream, "bits_per_raw_sample"),
         bits_per_sample: json_u32_field(stream, "bits_per_sample"),
     })
@@ -30533,7 +30548,7 @@ pub struct ScheduledAlbum {
     pub(crate) reference_auto_gain_measurements: Vec<ReferenceAutoGainPreparedMeasurement>,
     pub(crate) dsd_true_peak_measurements: Vec<CertifiedTruePeakPreparedMeasurement>,
     pub(crate) pcm_true_peak_measurements: Vec<CertifiedTruePeakPreparedMeasurement>,
-    pcm_effect_preludes: BTreeMap<TrackId, CertifiedEffectPrelude>,
+    certified_effect_preludes: BTreeMap<TrackId, CertifiedEffectPrelude>,
     dsd_true_peak_timings: BTreeMap<TrackId, DsdAlbumGainTiming>,
     pub(crate) album_gain_scope_disclosure: Option<DsdAlbumGainScopeDisclosure>,
     run_timing: ConversionRunTiming,
@@ -30579,7 +30594,7 @@ struct CertifiedTruePeakScratchRetrySeed {
     batch_replaygain: Option<Result<crate::convert::replaygain::ReplayGainSourceScan, String>>,
     dsd_true_peak_measurements: Vec<CertifiedTruePeakPreparedMeasurement>,
     pcm_true_peak_measurements: Vec<CertifiedTruePeakPreparedMeasurement>,
-    pcm_effect_preludes: BTreeMap<TrackId, CertifiedEffectPrelude>,
+    certified_effect_preludes: BTreeMap<TrackId, CertifiedEffectPrelude>,
     dsd_true_peak_timings: BTreeMap<TrackId, DsdAlbumGainTiming>,
     album_gain_scope_disclosure: Option<DsdAlbumGainScopeDisclosure>,
     run_timing: ConversionRunTiming,
@@ -30707,7 +30722,7 @@ impl CertifiedTruePeakScratchRetrySeed {
             batch_replaygain: album.batch_replaygain.clone(),
             dsd_true_peak_measurements: album.dsd_true_peak_measurements.clone(),
             pcm_true_peak_measurements: album.pcm_true_peak_measurements.clone(),
-            pcm_effect_preludes: album.pcm_effect_preludes.clone(),
+            certified_effect_preludes: album.certified_effect_preludes.clone(),
             dsd_true_peak_timings: album.dsd_true_peak_timings.clone(),
             album_gain_scope_disclosure: album.album_gain_scope_disclosure.clone(),
             run_timing: album.run_timing.clone(),
@@ -30906,7 +30921,7 @@ async fn retry_resolved_certified_true_peak_once_on_disk(
         reference_auto_gain_measurements: Vec::new(),
         dsd_true_peak_measurements: seed.dsd_true_peak_measurements,
         pcm_true_peak_measurements: seed.pcm_true_peak_measurements,
-        pcm_effect_preludes: seed.pcm_effect_preludes,
+        certified_effect_preludes: seed.certified_effect_preludes,
         dsd_true_peak_timings: seed.dsd_true_peak_timings,
         album_gain_scope_disclosure: seed.album_gain_scope_disclosure,
         run_timing: seed.run_timing,
@@ -30983,7 +30998,7 @@ pub(crate) fn scheduled_album_for_test(
         reference_auto_gain_measurements: Vec::new(),
         dsd_true_peak_measurements: Vec::new(),
         pcm_true_peak_measurements: Vec::new(),
-        pcm_effect_preludes: BTreeMap::new(),
+        certified_effect_preludes: BTreeMap::new(),
         dsd_true_peak_timings: BTreeMap::new(),
         album_gain_scope_disclosure: None,
         run_timing: ConversionRunTiming::start(),
@@ -38510,7 +38525,10 @@ async fn prepare_pcm_true_peak_carrier_for_track(
             track.id.source_ordinal,
         )
     })?;
-    if execution.channels != channels {
+    let expected_observed_channels = if req.registered_effects.iter().any(|intent|
+        matches!(&intent.effect, tonepoet_pipeline::RegisteredUnaryEffect::StereoFold))
+    { 2 } else { channels };
+    if execution.channels != expected_observed_channels {
         return Err(format!(
             "PCM track {} geometry changed after planning: typed observation expects {} channel(s), realized source has {}",
             track.id.source_ordinal, execution.channels, channels,
@@ -38560,13 +38578,24 @@ async fn prepare_pcm_true_peak_carrier_for_track(
             )
         })
         .transpose()?;
+    let output_effects_active = req.registered_effects.iter().any(|intent| matches!(
+        &intent.effect,
+        tonepoet_pipeline::RegisteredUnaryEffect::StereoFold
+            | tonepoet_pipeline::RegisteredUnaryEffect::RemoveDcOffset
+    ));
+    if output_effects_active && ssrc_terminal_binding.is_some() {
+        return Err(format!(
+            "PCM track {} cannot bind a post-resample channel/DC effect to the commissioned protected SSRC true-peak replay; select SoX/FFmpeg resampling or remove that effect",
+            track.id.source_ordinal,
+        ));
+    }
     let carrier_hash = stable_path_hash(&original_source_path);
     let raw_carrier_path = carrier_dir.join(format!("track-{track_stem}-{carrier_hash}.f64le"));
     let mut carrier_path = raw_carrier_path.clone();
     let _ = fs::remove_file(&raw_carrier_path);
     let mut retained_ssrc_ingress: Option<RetainedSsrcTruePeakIngress> = None;
-    if hdcd_active {
-        // Qualify the whole plan before decoding. The registered-effect
+    if hdcd_active || output_effects_active {
+        // Qualify the whole plan before processing. The registered-effect
         // executor consumes the selected certified pre-observation spine,
         // including exactly one frozen resampler and all ordered effects.
         // A protected SSRC replay cannot begin at an HDCD-derived ingress
@@ -38596,12 +38625,12 @@ async fn prepare_pcm_true_peak_carrier_for_track(
             resampler_consumed,
             ..
         } = prepared_effects.source_ref else {
-            return Err("HDCD pre-observation spine did not produce a registered-effect carrier".into());
+            return Err("certified pre-observation spine did not produce a registered-effect carrier".into());
         };
-        if effected_rate != target_rate_hz || effected_channels != channels
+        if effected_rate != target_rate_hz || effected_channels != execution.channels
             || resampler_consumed != execution.pre_observation_resampler.is_some()
         {
-            return Err("HDCD pre-observation carrier disagrees with the certified typed rate, channel geometry or resampler count".into());
+            return Err("registered-effect pre-observation carrier disagrees with the certified typed rate, channel geometry or resampler count".into());
         }
         match representation {
             RegisteredEffectCarrierRepresentation::RawFloat64 => {
@@ -38625,7 +38654,7 @@ async fn prepare_pcm_true_peak_carrier_for_track(
                     tonepoet_pipeline::InputSource::Path(effect_path.clone()),
                     tonepoet_pipeline::OutputSink::Path(carrier_path.clone()),
                     source.duration,
-                    "unwrap certified post-HDCD Float64 WAV without sample processing",
+                    "unwrap certified post-effect Float64 WAV without sample processing",
                 );
                 let unwrap_invocation = preparation_commands.len();
                 run_recorded_planned_command(
@@ -38635,7 +38664,7 @@ async fn prepare_pcm_true_peak_carrier_for_track(
                 .await
                 .map_err(|error| {
                     let _ = fs::remove_file(&carrier_path);
-                    format!("HDCD Float64 observation unwrapping failed: {error}")
+                    format!("registered-effect Float64 observation unwrapping failed: {error}")
                 })?;
                 let mut operation = OperationRecord::completed(
                     "hdcd-true-peak-float64-unwrapping",
@@ -38649,17 +38678,17 @@ async fn prepare_pcm_true_peak_carrier_for_track(
                 preparation_evidence.operations.push(operation);
             }
             _ => return Err(
-                "HDCD true-peak pre-observation path performed terminal quantization before measurement".into(),
+                "registered-effect true-peak path performed terminal quantization before measurement".into(),
             ),
         }
         // Protect the observation from an accidentally truncated, empty, or
         // invalid raw carrier before the certified meter sees any samples.
         let bytes = fs::metadata(&carrier_path)
-            .map_err(|error| format!("HDCD Float64 observation carrier missing: {error}"))?
+            .map_err(|error| format!("registered-effect Float64 observation carrier missing: {error}"))?
             .len();
-        let frame_bytes = u64::from(channels) * 8;
+        let frame_bytes = u64::from(execution.channels) * 8;
         if bytes == 0 || bytes % frame_bytes != 0 {
-            return Err("HDCD true-peak Float64 carrier is empty or frame-misaligned".into());
+            return Err("registered-effect true-peak Float64 carrier is empty or frame-misaligned".into());
         }
     } else if let Some(resampler) = execution
         .pre_observation_resampler
@@ -38745,6 +38774,7 @@ async fn prepare_pcm_true_peak_carrier_for_track(
         })?;
         realize_certified_post_resample_effects(
             &execution,
+            None,
             &mut carrier_path,
             carrier_dir,
             &track_stem,
@@ -38752,6 +38782,7 @@ async fn prepare_pcm_true_peak_carrier_for_track(
             runner,
             cancel,
             tool_concurrency_limits.as_ref(),
+            None,
         )
         .await
         .map_err(|error| {
@@ -38770,7 +38801,7 @@ async fn prepare_pcm_true_peak_carrier_for_track(
         scan_pcm_true_peak_f64le_identity(
             &scan_path,
             target_rate_hz,
-            channels,
+            execution.channels,
             scan_mode,
             &scan_cancel,
         )
@@ -38869,7 +38900,7 @@ async fn prepare_pcm_true_peak_carrier_for_track(
         gain_db,
         carrier_path.display(),
         target_rate_hz,
-        channels,
+        execution.channels,
         scan_mode,
     );
     Ok(PreparedPcmTruePeakCarrier {
@@ -38877,7 +38908,7 @@ async fn prepare_pcm_true_peak_carrier_for_track(
             path: carrier_path,
             source_path: original_source_path,
             sample_rate_hz: target_rate_hz,
-            channels,
+            channels: execution.channels,
             duration: source.duration,
             gain_db,
             point_dbtp,
@@ -39821,12 +39852,14 @@ struct PreparedDsdTruePeakCarrier {
     source_ref: TrackSourceRef,
     measurement: CertifiedTruePeakPreparedMeasurement,
     timing: DsdAlbumGainTiming,
+    effect_prelude: CertifiedEffectPrelude,
 }
 
 #[derive(Default)]
 struct PreparedDsdTruePeakCarriers {
     measurements: Vec<CertifiedTruePeakPreparedMeasurement>,
     timings: BTreeMap<TrackId, DsdAlbumGainTiming>,
+    effect_preludes: BTreeMap<TrackId, CertifiedEffectPrelude>,
 }
 
 fn track_scoped_certified_true_peak_requested(
@@ -40233,12 +40266,41 @@ async fn prepare_registered_effect_carrier_for_track(
             track.id.source_ordinal,
         )
     })?;
-    if execution.channels != source_channels {
+    let expected_output_channels = if track_effects.iter().any(|intent|
+        matches!(&intent.effect, tonepoet_pipeline::RegisteredUnaryEffect::StereoFold))
+    { 2 } else { source_channels };
+    if execution.channels != expected_output_channels {
         return Err(format!(
             "track {} registered-effect geometry changed after planning: typed output expects {} channel(s), realized source has {}",
             track.id.source_ordinal, execution.channels, source_channels,
         ));
     }
+    let stereo_fold_layout = if track_effects.iter().any(|intent| matches!(
+        &intent.effect, tonepoet_pipeline::RegisteredUnaryEffect::StereoFold
+    )) {
+        // Mono/stereo have unambiguous canonical speaker roles. For every
+        // multichannel fold, verify the source's speaker assignment *before*
+        // the no-rate-change Float64 WAV or raw carrier can erase it.
+        if source_channels == 1 {
+            Some("0x4".to_string())
+        } else if source_channels == 2 {
+            Some("0x3".to_string())
+        } else {
+            let probe = probe_realized_segment_with_tool_limits(
+                &realized.path, runner, cancel, tool_concurrency_limits.as_ref(),
+            ).await.map_err(|error| format!(
+                "track {} could not probe original stereo-fold speaker layout: {error}",
+                track.id.source_ordinal,
+            ))?;
+            Some(verified_stereo_fold_source_layout(
+                &track, &realized.path, &probe, source_channels,
+            ).map_err(|error| format!(
+                "track {} cannot safely fold channels: {error}", track.id.source_ordinal,
+            ))?)
+        }
+    } else {
+        None
+    };
     if source_is_dsd && execution.level_basis == tonepoet_pipeline::LevelBasis::Ordinary {
         return Err(format!(
             "track {} registered-effect execution lost its declared DSD level basis",
@@ -40276,6 +40338,7 @@ async fn prepare_registered_effect_carrier_for_track(
             _ => return Err("HDCD typed source-first lowering is unsupported".to_string()),
         };
         segment.lowerings.remove(0);
+        segment.effect_output_channels.remove(0);
         Some(filter)
     } else {
         None
@@ -40553,8 +40616,11 @@ async fn prepare_registered_effect_carrier_for_track(
             }
             realize_registered_effect_chain_recorded(
                 &pre.lowerings,
+                &pre.effect_output_channels,
                 pre.sample_rate_hz,
+                pre.input_channels,
                 pre.channels,
+                stereo_fold_layout.as_deref(),
                 first_input_is_raw_f64le,
                 RegisteredEffectOutputCarrier::WavFloat64,
                 &mut carrier_path,
@@ -40627,8 +40693,13 @@ async fn prepare_registered_effect_carrier_for_track(
             }
             realize_registered_effect_chain_recorded(
                 &post.lowerings,
+                &post.effect_output_channels,
                 post.sample_rate_hz,
+                post.input_channels,
                 post.channels,
+                if execution.pre_resample.as_ref().is_some_and(|pre|
+                    pre.lowerings.iter().any(is_stereo_fold_lowering)
+                ) { Some("0x3") } else { stereo_fold_layout.as_deref() },
                 false,
                 RegisteredEffectOutputCarrier::RawFloat64,
                 &mut carrier_path,
@@ -40666,8 +40737,11 @@ async fn prepare_registered_effect_carrier_for_track(
         } else {
         realize_registered_effect_chain_recorded(
             &post.lowerings,
+            &post.effect_output_channels,
             post.sample_rate_hz,
+            post.input_channels,
             post.channels,
+            stereo_fold_layout.as_deref(),
             first_input_is_raw_f64le,
             RegisteredEffectOutputCarrier::RawFloat64,
             &mut carrier_path,
@@ -40837,6 +40911,10 @@ async fn prepare_track_scoped_certified_true_peak_carrier(
                 track.id.source_ordinal, carrier.measurement.execution.scope,
             ));
         }
+        let mut prelude = carrier.effect_prelude;
+        let offset = preparation_commands.len();
+        preparation_commands.append(&mut prelude.commands);
+        preparation_evidence.append(prelude.evidence, offset);
         track.source_ref = carrier.source_ref;
         return Ok(track);
     }
@@ -40997,6 +41075,216 @@ fn registered_sox_effect_f64le_command(
     ))
 }
 
+// FFmpeg can infer a *different* channel layout after SoX has emitted an
+// unlabelled Float64 WAV. Bind the physical speaker mask once, at source
+// realization, and carry it to the registered stereo-fold lowering. Never
+// derive speaker roles from a channel count or an intermediate's guessed mask.
+const STEREO_FOLD_SUPPORTED_SPEAKERS: u32 = 0x7ff; // FL..SR; all roles in the pan matrix.
+
+fn fold_layout_mask(label: &str) -> Option<u32> {
+    // Common FFmpeg aliases (not channel counts). FLAC, WavPack and the
+    // designated decoders establish these from source coding/metadata.
+    let mask = match label.trim().to_ascii_lowercase().as_str() {
+        "mono" => 0x4,
+        "stereo" => 0x3,
+        "2.1" => 0xb,
+        "3.0" => 0x7,
+        "3.0(back)" => 0x103,
+        "quad" => 0x33,
+        "quad(side)" => 0x603,
+        "4.0" => 0x107,
+        "3.1" => 0xf,
+        "4.1" => 0x10f,
+        "5.0" => 0x37,
+        "5.0(side)" => 0x607,
+        "5.1" => 0x3f,
+        "5.1(side)" => 0x60f,
+        "6.0" => 0x137,
+        "6.1" => 0x13f,
+        "6.1(back)" => 0x70f,
+        "7.0" => 0x637,
+        "7.0(front)" => 0xf7,
+        "7.1" => 0x63f,
+        "7.1(wide)" => 0xff,
+        "7.1(wide-side)" => 0x6cf,
+        other if other.starts_with("0x") => u32::from_str_radix(&other[2..], 16).ok()?,
+        _ => return None,
+    };
+    Some(mask)
+}
+
+fn valid_fold_layout_mask(mask: u32, channels: u16) -> bool {
+    (1..=8).contains(&channels)
+        && mask != 0
+        && (mask & !STEREO_FOLD_SUPPORTED_SPEAKERS) == 0
+        && mask.count_ones() == u32::from(channels)
+}
+
+// A legacy multichannel WAV without WAVEFORMATEXTENSIBLE's dwChannelMask is
+// *not* role evidence: ffprobe may display its guessed 2.1/4.0 default.
+// Return None for non-RIFF inputs, Some(None) for WAV with no authoritative
+// mask, and Some(Some(mask)) for WAV with a nonzero explicit mask.
+fn source_wave_channel_mask(path: &Path) -> Result<Option<Option<u32>>, String> {
+    let mut file = fs::File::open(path)
+        .map_err(|error| format!("could not inspect fold source {}: {error}", path.display()))?;
+    let mut header = [0u8; 12];
+    file.read_exact(&mut header)
+        .map_err(|error| format!("could not read fold source header {}: {error}", path.display()))?;
+    if (&header[..4] != b"RIFF" && &header[..4] != b"RF64"
+        && &header[..4] != b"BW64")
+        || &header[8..12] != b"WAVE"
+    {
+        return Ok(None);
+    }
+    // Seek past metadata without reading it into memory. A bounded number of
+    // chunks is sufficient to find fmt, including RF64 ds64/JUNK prefixes.
+    for _ in 0..64 {
+        let mut chunk = [0u8; 8];
+        file.read_exact(&mut chunk).map_err(|error| {
+            format!("WAV source {} has no complete fmt chunk: {error}", path.display())
+        })?;
+        let length = u64::from(u32::from_le_bytes(chunk[4..8].try_into().unwrap()));
+        if &chunk[..4] == b"fmt " {
+            if length < 16 {
+                return Err(format!("WAV source {} has a truncated fmt chunk", path.display()));
+            }
+            let mut format = [0u8; 40];
+            let count = usize::try_from(length.min(40)).unwrap();
+            file.read_exact(&mut format[..count]).map_err(|error| {
+                format!("could not read WAV fmt chunk {}: {error}", path.display())
+            })?;
+            let format_tag = u16::from_le_bytes([format[0], format[1]]);
+            if format_tag != 0xfffe || length < 40 {
+                return Ok(Some(None));
+            }
+            let mask = u32::from_le_bytes(format[20..24].try_into().unwrap());
+            return Ok(Some((mask != 0).then_some(mask)));
+        }
+        if &chunk[..4] == b"data" {
+            return Ok(Some(None));
+        }
+        let skip = length.checked_add(length & 1)
+            .ok_or_else(|| "WAV source chunk length overflow".to_string())?;
+        file.seek(SeekFrom::Current(i64::try_from(skip).map_err(|_| {
+            "WAV source metadata chunk exceeds supported size".to_string()
+        })?)).map_err(|error| format!("could not seek WAV source {}: {error}", path.display()))?;
+    }
+    Err(format!("WAV source {} has no fmt chunk within 64 chunks", path.display()))
+}
+
+// This is a per-track *realization* fact, not a new scheduling policy. For
+// carriers that do not encode speaker identities we refuse only the fold,
+// leaving channel-preserving conversion and unrelated effects untouched.
+fn verified_stereo_fold_source_layout(
+    track: &PreparedTrack,
+    realized_path: &Path,
+    probe: &RealizedProbe,
+    channels: u16,
+) -> Result<String, String> {
+    if probe.channels != Some(u32::from(channels)) {
+        return Err(format!(
+            "stereo fold source channel count changed: planned {channels}, probed {:?}",
+            probe.channels,
+        ));
+    }
+    let mask = if let TrackSourceRef::DvdaTrack {
+        expected_channel_assignment_code, ..
+    } = &track.source_ref {
+        // The DVD-Audio decoder can emit channels in a different order from
+        // WAV. A WAVEFORMATEXTENSIBLE mask written by ffmpeg is not proof that
+        // the original samples had that order: its count-only guess can be
+        // wrong even when the mask is syntactically valid. Convert forces
+        // WaveExtensible sample *reordering* for this source family before
+        // the fold, in a separate cache namespace. Compare that carrier's
+        // physical mask against the actual disc assignment as well.
+        let metadata_code = track.metadata.extra.get("dvda_channel_assignment_code")
+            .and_then(|value| value.parse::<u8>().ok());
+        if let (Some(source_code), Some(metadata_code)) = (*expected_channel_assignment_code, metadata_code) {
+            if source_code != metadata_code {
+                return Err(format!(
+                    "stereo fold DVD-Audio channel assignment disagrees: source {source_code}, metadata {metadata_code}",
+                ));
+            }
+        }
+        let code = (*expected_channel_assignment_code).or(metadata_code)
+            .ok_or_else(|| "stereo fold needs DVD-Audio channel-assignment evidence; the realized WAV mask alone is not authoritative".to_string())?;
+        let layout = layout_for_assignment_code(code)
+            .filter(|layout| layout.total_channel_count() == u32::from(channels))
+            .ok_or_else(|| format!(
+                "stereo fold DVD-Audio channel assignment {code} does not match {channels} channels",
+            ))?;
+        let expected_mask = layout.ffmpeg_input_layout_for_policy(DvdaChannelOrderPolicy::WaveExtensible)
+            .and_then(fold_layout_mask)
+            .ok_or_else(|| format!(
+                "stereo fold cannot map DVD-Audio assignment {code} to a verified WAV layout",
+            ))?;
+        let actual_mask = source_wave_channel_mask(realized_path)?
+            .flatten()
+            .ok_or_else(|| "stereo fold needs a WAVEFORMATEXTENSIBLE speaker mask on the reordered DVD-Audio carrier".to_string())?;
+        if actual_mask != expected_mask {
+            return Err(format!(
+                "stereo fold DVD-Audio assignment {code} requires reordered WAV mask 0x{expected_mask:x}, but materialization emitted 0x{actual_mask:x}",
+            ));
+        }
+        actual_mask
+    } else if let Some(wave_mask) = source_wave_channel_mask(realized_path)? {
+        if let Some(mask) = wave_mask {
+            // For non-DVD sources an explicit original WAVEFORMATEXTENSIBLE
+            // mask binds the interleaved channel order. A guessed ffprobe
+            // layout is not substituted.
+            mask
+        } else {
+            return Err("stereo fold needs an explicit speaker/channel mask; multichannel WAV has none".to_string());
+        }
+    } else if matches!(&track.source_ref, TrackSourceRef::SacdTrack { .. }) {
+        // The SACD materializer's DSF channel-type and DSDIFF channel-ID
+        // writers emit the standard L/R/C/LFE/Ls/Rs order for six channels,
+        // and L/R/C/Ls/Rs for five. Unlike an arbitrary DSD file, this
+        // realization has an explicit, checked source family and writer.
+        let declared = track.metadata.extra.get("sacd_channel_count")
+            .and_then(|value| value.parse::<u16>().ok());
+        if declared != Some(channels) {
+            return Err("stereo fold cannot verify the SACD area's declared speaker geometry".to_string());
+        }
+        match channels {
+            2 => 0x3,
+            5 => 0x607,
+            6 => 0x60f,
+            _ => return Err("stereo fold does not recognize this SACD loudspeaker configuration".to_string()),
+        }
+    } else {
+        // These codecs declare a speaker/channel order in their bitstream or
+        // format metadata. Generic PCM/multichannel container counts do not.
+        // The value is taken from the *source* decoder, before SoX/FFmpeg
+        // scratch carriers can rewrite or discard it.
+        let trustworthy_decoder = matches!(probe.codec_name.as_deref(),
+            Some("flac" | "wavpack" | "alac" | "aac" | "ac3" | "eac3" |
+                 "dts" | "truehd" | "mlp" | "opus" | "vorbis"));
+        if !trustworthy_decoder {
+            return Err(format!(
+                "stereo fold cannot verify speaker roles for source codec {:?}; an explicit layout is required",
+                probe.codec_name,
+            ));
+        }
+        probe.channel_layout.as_deref().and_then(fold_layout_mask)
+            .ok_or_else(|| {
+                "stereo fold source decoder did not report a supported speaker layout".to_string()
+            })?
+    };
+    if !valid_fold_layout_mask(mask, channels) {
+        return Err(format!(
+            "stereo fold source speaker mask 0x{mask:x} is unsupported or disagrees with {channels} channels",
+        ));
+    }
+    Ok(format!("0x{mask:x}"))
+}
+
+fn is_stereo_fold_lowering(lowering: &tonepoet_pipeline::EffectLowering) -> bool {
+    matches!(&lowering.arguments,
+        tonepoet_pipeline::EffectArgumentMapping::FfmpegAudioFilter(filter)
+            if filter == tonepoet_pipeline::STEREO_FOLD_FFMPEG_FILTER)
+}
+
 fn registered_effect_f64le_command(
     lowering: &tonepoet_pipeline::EffectLowering,
     input: &Path,
@@ -41005,6 +41293,7 @@ fn registered_effect_f64le_command(
     output_carrier: RegisteredEffectOutputCarrier,
     sample_rate_hz: u32,
     channels: u16,
+    stereo_fold_input_layout: Option<&str>,
     expected_duration: Option<Duration>,
 ) -> Result<tonepoet_pipeline::PlannedCommand, String> {
     if sample_rate_hz == 0 || channels == 0 {
@@ -41041,6 +41330,22 @@ fn registered_effect_f64le_command(
                     "-ar".to_string(), sample_rate_hz.to_string(),
                     "-ac".to_string(), channels.to_string(),
                 ]);
+            }
+            if is_stereo_fold_lowering(lowering) {
+                let layout = stereo_fold_input_layout.ok_or_else(|| {
+                    "stereo fold has no verified source speaker layout".to_string()
+                })?;
+                let mask = fold_layout_mask(layout).ok_or_else(|| {
+                    "stereo fold received an invalid source speaker layout".to_string()
+                })?;
+                if !valid_fold_layout_mask(mask, channels) {
+                    return Err(format!(
+                        "stereo fold speaker layout {layout} does not match {channels} input channels",
+                    ));
+                }
+                // Per-input option. Overrides the guessed mask on *both*
+                // headerless Float64 and unlabelled SoX Float64 WAV carriers.
+                args.extend(["-channel_layout".to_string(), layout.to_string()]);
             }
             args.extend([
                 "-i".to_string(), input.display().to_string(),
@@ -41134,6 +41439,264 @@ mod r18_deemphasis_lowering_tests {
     }
 
     #[test]
+    fn stereo_fold_command_uses_source_width_and_canonical_matrix() {
+        let lowering = tonepoet_pipeline::registered_effect_candidates(
+            &tonepoet_pipeline::RegisteredUnaryEffect::StereoFold,
+        ).expect("role-aware stereo fold").remove(0);
+        let planned = registered_effect_f64le_command(
+            &lowering, Path::new("six-channel.f64le"), true,
+            Path::new("stereo.f64le"), RegisteredEffectOutputCarrier::RawFloat64,
+            48_000, 6, Some("0x60f"), None,
+        ).expect("physical stereo fold command");
+        assert!(planned.args.windows(2).any(|pair| pair[0] == "-ac" && pair[1] == "6"));
+        assert!(planned.args.windows(2).any(|pair|
+            pair[0] == "-af" && pair[1] == tonepoet_pipeline::STEREO_FOLD_FFMPEG_FILTER));
+        assert!(!planned.args.windows(2).any(|pair| pair[0] == "-ac" && pair[1] == "2"));
+    }
+
+    #[test]
+    fn fold_layouts_keep_center_lfe_quad_and_four_point_zero_distinct() {
+        assert_eq!(fold_layout_mask("3.0"), Some(0x7));
+        assert_eq!(fold_layout_mask("2.1"), Some(0xb));
+        assert_eq!(fold_layout_mask("quad"), Some(0x33));
+        assert_eq!(fold_layout_mask("4.0"), Some(0x107));
+        assert_ne!(fold_layout_mask("quad"), fold_layout_mask("4.0"));
+        assert_eq!(fold_layout_mask("5.1"), Some(0x3f));
+        assert_eq!(fold_layout_mask("5.1(side)"), Some(0x60f));
+        assert_eq!(fold_layout_mask("mono"), Some(0x4));
+        assert_eq!(fold_layout_mask("stereo"), Some(0x3));
+        assert!(valid_fold_layout_mask(0x7, 3));
+        assert!(valid_fold_layout_mask(0xb, 3));
+        assert!(!valid_fold_layout_mask(0x7, 4));
+        assert!(!valid_fold_layout_mask(0x800, 1)); // Unsupported speaker.
+    }
+
+    fn physical_fold_probe(channels: u32, layout: &str, codec: &str) -> RealizedProbe {
+        RealizedProbe {
+            sample_rate: 48_000,
+            samples: Some(4_800),
+            exact: false,
+            codec_name: Some(codec.to_string()),
+            sample_fmt: Some("s32".to_string()),
+            channels: Some(channels),
+            channel_layout: Some(layout.to_string()),
+            bits_per_raw_sample: Some(24),
+            bits_per_sample: Some(24),
+        }
+    }
+
+    fn physical_fold_track(path: &Path) -> PreparedTrack {
+        PreparedTrack {
+            id: TrackId {
+                source_ordinal: 1,
+                disc_number: None,
+                track_number: 1,
+            },
+            source_ref: TrackSourceRef::StagedFile(path.to_path_buf()),
+            metadata: TrackMetadata::default(),
+            expected_samples: None,
+            sample_rate: Some(48_000),
+            source_audio: SourceAudioDescriptor::default(),
+            bit_depth: Some(24),
+            warnings: Vec::new(),
+        }
+    }
+
+    fn test_wav_fmt(mask: Option<u32>, channels: u16) -> Vec<u8> {
+        let size: u32 = if mask.is_some() { 40 } else { 16 };
+        let mut result = b"RIFF".to_vec();
+        result.extend_from_slice(&(4 + 8 + size).to_le_bytes());
+        result.extend_from_slice(b"WAVEfmt ");
+        result.extend_from_slice(&size.to_le_bytes());
+        let mut fmt = [0u8; 40];
+        let format_tag: u16 = if mask.is_some() { 0xfffe } else { 1 };
+        fmt[0..2].copy_from_slice(&format_tag.to_le_bytes());
+        fmt[2..4].copy_from_slice(&channels.to_le_bytes());
+        fmt[4..8].copy_from_slice(&48_000_u32.to_le_bytes());
+        if let Some(mask) = mask {
+            fmt[16..18].copy_from_slice(&22_u16.to_le_bytes());
+            fmt[20..24].copy_from_slice(&mask.to_le_bytes());
+        }
+        result.extend_from_slice(&fmt[..size as usize]);
+        result
+    }
+
+    #[test]
+    fn source_layout_binding_refuses_guessed_wav_but_accepts_verified_masks() {
+        let tmp = tempfile::tempdir().expect("temp WAV fixture");
+        let wav = tmp.path().join("source.wav");
+        let track = physical_fold_track(&wav);
+        let probe = physical_fold_probe(3, "2.1", "pcm_s24le");
+        fs::write(&wav, test_wav_fmt(None, 3)).unwrap();
+        assert!(verified_stereo_fold_source_layout(&track, &wav, &probe, 3)
+            .unwrap_err().contains("explicit speaker/channel mask"));
+        // The stream reports a guessed 2.1; the original WAVEFORMATEXTENSIBLE
+        // source explicitly declares 3.0, so the original center is preserved.
+        fs::write(&wav, test_wav_fmt(Some(0x7), 3)).unwrap();
+        assert_eq!(verified_stereo_fold_source_layout(&track, &wav, &probe, 3).unwrap(), "0x7");
+        fs::write(&wav, test_wav_fmt(Some(0xb), 3)).unwrap();
+        assert_eq!(verified_stereo_fold_source_layout(&track, &wav, &probe, 3).unwrap(), "0xb");
+        fs::write(&wav, test_wav_fmt(Some(0x33), 4)).unwrap();
+        assert_eq!(verified_stereo_fold_source_layout(
+            &track, &wav, &physical_fold_probe(4, "4.0", "pcm_s24le"), 4,
+        ).unwrap(), "0x33");
+        fs::write(&wav, test_wav_fmt(Some(0x107), 4)).unwrap();
+        assert_eq!(verified_stereo_fold_source_layout(
+            &track, &wav, &physical_fold_probe(4, "4.0", "pcm_s24le"), 4,
+        ).unwrap(), "0x107");
+        fs::write(&wav, test_wav_fmt(Some(0x800), 1)).unwrap();
+        assert!(verified_stereo_fold_source_layout(
+            &track, &wav, &physical_fold_probe(1, "mono", "pcm_s24le"), 1,
+        ).is_err());
+    }
+
+    fn physical_dvda_fold_track(path: &Path, channels: u16, code: u8) -> PreparedTrack {
+        let mut track = physical_fold_track(path);
+        track.source_ref = TrackSourceRef::DvdaTrack {
+            volume_source: DvdaVolumeSourceRef::Directory { root: PathBuf::from("/dvd") },
+            group_nr: 1,
+            title_set_nr: Some(1),
+            title_nr: Some(1),
+            title_ordinal: Some(1),
+            group_track_ordinal: 1,
+            ats_track_nr: Some(1),
+            samg_track_nr: None,
+            samg_ordinal: None,
+            sector_address_space: DvdaSectorAddressSpace::AtsAobRelative { title_set_nr: 1 },
+            first_pts: 0,
+            len_in_pts: 90_000,
+            track_type: Some(0x01),
+            index_start: None,
+            downmix_matrix: None,
+            dvda_downmix_policy: DvdaDownmixPolicy::None,
+            title_table_offset: None,
+            title_len_in_pts: None,
+            title_track_count_declared: None,
+            title_index_count_declared: None,
+            audio_format_index: Some(0),
+            expected_sample_rate: Some(48_000),
+            expected_channel_count: Some(u32::from(channels)),
+            expected_bit_depth: Some(24),
+            expected_channel_assignment_code: Some(code),
+            expected_group1_sample_rate: Some(48_000),
+            expected_group2_sample_rate: None,
+            expected_group1_bit_depth: Some(24),
+            expected_group2_bit_depth: None,
+            expected_group1_channel_count: None,
+            expected_group2_channel_count: None,
+            sector_ranges: Vec::new(),
+            aob_files: Vec::new(),
+            elementary_stream_kind_hint: None,
+        };
+        track.metadata.extra.insert("dvda_channel_assignment_code".into(), code.to_string());
+        track
+    }
+
+    #[test]
+    fn dvda_fold_requires_assignment_and_wave_order_not_ffmpeg_guess() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wav = tmp.path().join("dvda.wav");
+        for (code, channels, canonical, wrong) in [
+            (3, 4, 0x33, 0x107), // DVD-A quad vs ffmpeg's guessed 4.0
+            (18, 5, 0x3b, 0x10f), // DVD-A L,R,Ls,Rs,LFE is not ffmpeg 4.1
+            (19, 5, 0x37, 0x3f), // DVD-A L,R,Ls,Rs,C -> WAV L,R,C,Ls,Rs
+        ] {
+            let track = physical_dvda_fold_track(&wav, channels, code);
+            let probe = physical_fold_probe(u32::from(channels), "unknown", "pcm_s32le");
+            fs::write(&wav, test_wav_fmt(Some(canonical), channels)).unwrap();
+            assert_eq!(
+                verified_stereo_fold_source_layout(&track, &wav, &probe, channels).unwrap(),
+                format!("0x{canonical:x}"),
+            );
+            fs::write(&wav, test_wav_fmt(Some(wrong), channels)).unwrap();
+            assert!(verified_stereo_fold_source_layout(&track, &wav, &probe, channels)
+                .unwrap_err().contains("requires reordered WAV mask"));
+            fs::write(&wav, test_wav_fmt(None, channels)).unwrap();
+            assert!(verified_stereo_fold_source_layout(&track, &wav, &probe, channels)
+                .unwrap_err().contains("WAVEFORMATEXTENSIBLE"));
+            fs::write(&wav, test_wav_fmt(Some(canonical), channels)).unwrap();
+            let mut lost_assignment = track.clone();
+            if let TrackSourceRef::DvdaTrack { expected_channel_assignment_code, .. } =
+                &mut lost_assignment.source_ref
+            {
+                *expected_channel_assignment_code = None;
+            }
+            lost_assignment.metadata.extra.remove("dvda_channel_assignment_code");
+            assert!(verified_stereo_fold_source_layout(&lost_assignment, &wav, &probe, channels)
+                .unwrap_err().contains("channel-assignment evidence"));
+        }
+    }
+
+    #[test]
+    fn source_layout_binding_accepts_declared_flac_and_wavpack_roles() {
+        let tmp = tempfile::tempdir().expect("temp compressed fixture");
+        let path = tmp.path().join("source.flac");
+        fs::write(&path, b"fLaC000000000000").unwrap();
+        let track = physical_fold_track(&path);
+        assert_eq!(verified_stereo_fold_source_layout(
+            &track, &path, &physical_fold_probe(3, "3.0", "flac"), 3,
+        ).unwrap(), "0x7");
+        assert_eq!(verified_stereo_fold_source_layout(
+            &track, &path, &physical_fold_probe(4, "quad", "wavpack"), 4,
+        ).unwrap(), "0x33");
+        assert!(verified_stereo_fold_source_layout(
+            &track, &path, &physical_fold_probe(4, "unknown", "pcm_s24le"), 4,
+        ).is_err());
+        assert!(verified_stereo_fold_source_layout(
+            &track, &path, &physical_fold_probe(3, "3.0", "flac"), 4,
+        ).is_err());
+    }
+
+    #[test]
+    fn sacd_fold_binds_the_materializers_declared_surround_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let realized = tmp.path().join("extracted.dsf");
+        fs::write(&realized, b"DSD 00000000").unwrap();
+        let mut track = physical_fold_track(&realized);
+        track.source_ref = TrackSourceRef::SacdTrack {
+            iso: tmp.path().join("disc.iso"),
+            track_index: 0,
+            area: SacdArea::MultiChannel,
+        };
+        track.metadata.extra.insert("sacd_channel_count".into(), "6".into());
+        assert_eq!(verified_stereo_fold_source_layout(
+            &track, &realized, &physical_fold_probe(6, "5.1", "dsd_lsbf"), 6,
+        ).unwrap(), "0x60f");
+        track.metadata.extra.insert("sacd_channel_count".into(), "5".into());
+        assert!(verified_stereo_fold_source_layout(
+            &track, &realized, &physical_fold_probe(6, "5.1", "dsd_lsbf"), 6,
+        ).is_err());
+    }
+
+    #[test]
+    fn stereo_fold_argv_binds_roles_before_input_for_raw_and_wav() {
+        let lowering = tonepoet_pipeline::registered_effect_candidates(
+            &tonepoet_pipeline::RegisteredUnaryEffect::StereoFold,
+        ).expect("fold lowering").remove(0);
+        for is_raw in [true, false] {
+            let planned = registered_effect_f64le_command(
+                &lowering, Path::new("source.wav"), is_raw,
+                Path::new("result.f64le"), RegisteredEffectOutputCarrier::RawFloat64,
+                48_000, 3, Some("0x7"), None,
+            ).expect("bound speaker layout");
+            let layout_index = planned.args.iter().position(|arg| arg == "-channel_layout").unwrap();
+            let input_index = planned.args.iter().position(|arg| arg == "-i").unwrap();
+            assert!(layout_index < input_index);
+            assert_eq!(planned.args[layout_index + 1], "0x7");
+        }
+        assert!(registered_effect_f64le_command(
+            &lowering, Path::new("source.wav"), true,
+            Path::new("result.f64le"), RegisteredEffectOutputCarrier::RawFloat64,
+            48_000, 3, None, None,
+        ).unwrap_err().contains("no verified source speaker layout"));
+        assert!(registered_effect_f64le_command(
+            &lowering, Path::new("source.wav"), true,
+            Path::new("result.f64le"), RegisteredEffectOutputCarrier::RawFloat64,
+            48_000, 3, Some("0x33"), None,
+        ).unwrap_err().contains("does not match"));
+    }
+
+    #[test]
     fn cd_deemphasis_lowerings_do_not_smuggle_a_rate_conversion() {
         let candidates = tonepoet_pipeline::registered_effect_candidates(
             &tonepoet_pipeline::RegisteredUnaryEffect::CdDeemphasis,
@@ -41148,6 +41711,7 @@ mod r18_deemphasis_lowering_tests {
                 RegisteredEffectOutputCarrier::WavFloat64,
                 44_100,
                 2,
+                None,
                 None,
             )
             .expect("lower de-emphasis command");
@@ -41370,8 +41934,11 @@ fn fusible_ordinary_sox_highpass_lowpass_pair(
 
 async fn realize_registered_effect_chain(
     lowerings: &[tonepoet_pipeline::EffectLowering],
+    effect_output_channels: &[u16],
     sample_rate_hz: u32,
+    input_channels: u16,
     channels: u16,
+    stereo_fold_input_layout: Option<&str>,
     first_input_is_raw_f64le: bool,
     final_output_carrier: RegisteredEffectOutputCarrier,
     carrier_path: &mut PathBuf,
@@ -41386,8 +41953,11 @@ async fn realize_registered_effect_chain(
     let mut ignored_effect_invocation_indices = Vec::new();
     realize_registered_effect_chain_impl(
         lowerings,
+        effect_output_channels,
         sample_rate_hz,
+        input_channels,
         channels,
+        stereo_fold_input_layout,
         first_input_is_raw_f64le,
         final_output_carrier,
         carrier_path,
@@ -41407,8 +41977,11 @@ async fn realize_registered_effect_chain(
 
 async fn realize_registered_effect_chain_recorded(
     lowerings: &[tonepoet_pipeline::EffectLowering],
+    effect_output_channels: &[u16],
     sample_rate_hz: u32,
+    input_channels: u16,
     channels: u16,
+    stereo_fold_input_layout: Option<&str>,
     first_input_is_raw_f64le: bool,
     final_output_carrier: RegisteredEffectOutputCarrier,
     carrier_path: &mut PathBuf,
@@ -41423,8 +41996,11 @@ async fn realize_registered_effect_chain_recorded(
 ) -> Result<Duration, String> {
     realize_registered_effect_chain_impl(
         lowerings,
+        effect_output_channels,
         sample_rate_hz,
+        input_channels,
         channels,
+        stereo_fold_input_layout,
         first_input_is_raw_f64le,
         final_output_carrier,
         carrier_path,
@@ -41447,8 +42023,11 @@ async fn realize_registered_effect_chain_recorded(
 // profile establishes multi-effect process/I/O segmentation as a material cost.
 async fn realize_registered_effect_chain_impl(
     lowerings: &[tonepoet_pipeline::EffectLowering],
+    effect_output_channels: &[u16],
     sample_rate_hz: u32,
+    input_channels: u16,
     channels: u16,
+    stereo_fold_input_layout: Option<&str>,
     first_input_is_raw_f64le: bool,
     final_output_carrier: RegisteredEffectOutputCarrier,
     carrier_path: &mut PathBuf,
@@ -41463,7 +42042,13 @@ async fn realize_registered_effect_chain_impl(
     record_commands: bool,
     allow_ordinary_sox_pair_fusion: bool,
 ) -> Result<Duration, String> {
+    if lowerings.len() != effect_output_channels.len() {
+        return Err("registered effect geometry length does not match selected lowerings".to_string());
+    }
     if lowerings.is_empty() {
+        if input_channels != channels {
+            return Err("empty effect segment changed channel geometry".to_string());
+        }
         return Ok(Duration::ZERO);
     }
     let _baseline_scope = super::baseline::scoped_event(
@@ -41477,12 +42062,18 @@ async fn realize_registered_effect_chain_impl(
     let mut baseline_generated_sizes = HashMap::<PathBuf, u64>::new();
     let mut baseline_live_generated_bytes = 0_u64;
     let mut baseline_scratch_high_water_bytes = 0_u64;
+    if channels == 0 || input_channels == 0 {
+        return Err("registered effect has zero channel geometry".to_string());
+    }
     let frame_bytes = u64::from(channels)
         .checked_mul(std::mem::size_of::<f64>() as u64)
         .ok_or_else(|| "registered effect frame size overflowed".to_string())?;
 
     if allow_ordinary_sox_pair_fusion {
         if let Some(effect_args) = fusible_ordinary_sox_highpass_lowpass_pair(lowerings) {
+            if input_channels != channels {
+                return Err("fusible high/low-pass pair cannot change channel geometry".to_string());
+            }
             if cancel.is_cancelled() {
                 return Err("registered effect chain cancelled".to_string());
             }
@@ -41592,10 +42183,19 @@ async fn realize_registered_effect_chain_impl(
     let mut elapsed = Duration::ZERO;
     let mut current = carrier_path.clone();
     let mut owned_intermediates = Vec::new();
+    let mut current_channels = input_channels;
+    let mut current_layout = stereo_fold_input_layout.map(str::to_owned);
     for (index, lowering) in lowerings.iter().enumerate() {
         if cancel.is_cancelled() {
             return Err("registered effect chain cancelled".to_string());
         }
+        let emitted_channels = effect_output_channels[index];
+        if emitted_channels == 0 {
+            return Err(format!("registered effect {} has zero typed output channels", index + 1));
+        }
+        let emitted_frame_bytes = u64::from(emitted_channels)
+            .checked_mul(std::mem::size_of::<f64>() as u64)
+            .ok_or_else(|| "registered effect output geometry overflowed".to_string())?;
         let is_last = index + 1 == lowerings.len();
         let output_carrier = if is_last {
             final_output_carrier
@@ -41618,7 +42218,8 @@ async fn realize_registered_effect_chain_impl(
             &next,
             output_carrier,
             sample_rate_hz,
-            channels,
+            current_channels,
+            current_layout.as_deref(),
             expected_duration,
         )?;
         let invocation_index = recorded_commands.len();
@@ -41653,7 +42254,7 @@ async fn realize_registered_effect_chain_impl(
             .len();
         if len == 0
             || (matches!(output_carrier, RegisteredEffectOutputCarrier::RawFloat64)
-                && (frame_bytes == 0 || len % frame_bytes != 0))
+                && (emitted_frame_bytes == 0 || len % emitted_frame_bytes != 0))
         {
             let _ = fs::remove_file(&next);
             return Err(format!(
@@ -41683,6 +42284,19 @@ async fn realize_registered_effect_chain_impl(
             owned_intermediates.push(current);
         }
         current = next;
+        if is_stereo_fold_lowering(lowering) {
+            current_layout = Some("0x3".to_string());
+        }
+        current_channels = emitted_channels;
+    }
+    if current_channels != channels {
+        let _ = fs::remove_file(&current);
+        for intermediate in &owned_intermediates {
+            let _ = fs::remove_file(intermediate);
+        }
+        return Err(format!(
+            "registered effects emitted {current_channels} channels; typed output requires {channels}"
+        ));
     }
 
     let original = std::mem::replace(carrier_path, current);
@@ -41734,6 +42348,7 @@ async fn realize_registered_effect_chain_impl(
 
 async fn realize_certified_post_resample_effects(
     execution: &CertifiedTruePeakExecutionContract,
+    stereo_fold_input_layout: Option<&str>,
     carrier_path: &mut PathBuf,
     carrier_dir: &Path,
     track_stem: &str,
@@ -41741,6 +42356,7 @@ async fn realize_certified_post_resample_effects(
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
+    receipts: Option<(&mut Vec<CommandRecord>, &mut Vec<usize>)>,
 ) -> Result<Duration, String> {
     let Some(post) = execution.post_resample.as_ref() else {
         return Ok(Duration::ZERO);
@@ -41751,21 +42367,44 @@ async fn realize_certified_post_resample_effects(
                 .to_string(),
         );
     }
-    realize_registered_effect_chain(
-        &post.lowerings,
-        post.sample_rate_hz,
-        post.channels,
-        true,
-        RegisteredEffectOutputCarrier::RawFloat64,
-        carrier_path,
-        carrier_dir,
-        track_stem,
-        expected_duration,
-        runner,
-        cancel,
-        tool_concurrency_limits,
-    )
-    .await
+    match receipts {
+        Some((commands, indices)) => realize_registered_effect_chain_recorded(
+            &post.lowerings,
+            &post.effect_output_channels,
+            post.sample_rate_hz,
+            post.input_channels,
+            post.channels,
+            stereo_fold_input_layout,
+            true,
+            RegisteredEffectOutputCarrier::RawFloat64,
+            carrier_path,
+            carrier_dir,
+            track_stem,
+            expected_duration,
+            runner,
+            cancel,
+            tool_concurrency_limits,
+            commands,
+            indices,
+        ).await,
+        None => realize_registered_effect_chain(
+            &post.lowerings,
+            &post.effect_output_channels,
+            post.sample_rate_hz,
+            post.input_channels,
+            post.channels,
+            stereo_fold_input_layout,
+            true,
+            RegisteredEffectOutputCarrier::RawFloat64,
+            carrier_path,
+            carrier_dir,
+            track_stem,
+            expected_duration,
+            runner,
+            cancel,
+            tool_concurrency_limits,
+        ).await,
+    }
 }
 
 async fn run_dsd_true_peak_planned_command(
@@ -41895,6 +42534,29 @@ async fn prepare_dsd_true_peak_carrier_for_track(
                 track.id.source_ordinal,
             )
         })?;
+    // The DSD certified observation is a separate source-to-Float64 ingress.
+    // Bind its original speaker roles before reconstruction also erases them.
+    let stereo_fold_layout = if req.registered_effects.iter().any(|intent|
+        matches!(&intent.effect, tonepoet_pipeline::RegisteredUnaryEffect::StereoFold))
+        && channels > 2
+    {
+        let probe = probe_realized_segment_with_tool_limits(
+            &realized.path, runner, cancel, tool_concurrency_limits.as_ref(),
+        ).await.map_err(|error| format!(
+            "DSD track {} could not probe original stereo-fold layout: {error}",
+            track.id.source_ordinal,
+        ))?;
+        Some(verified_stereo_fold_source_layout(&track, &realized.path, &probe, channels)
+            .map_err(|error| format!(
+                "DSD track {} cannot safely fold channels: {error}", track.id.source_ordinal,
+            ))?)
+    } else if req.registered_effects.iter().any(|intent|
+        matches!(&intent.effect, tonepoet_pipeline::RegisteredUnaryEffect::StereoFold))
+    {
+        Some(if channels == 1 { "0x4" } else { "0x3" }.to_string())
+    } else {
+        None
+    };
     let track_stem = pcm_true_peak_track_stem(&track.id);
     let typed_request = plan_request_for_track_with_resolved_source(
         req,
@@ -41952,7 +42614,10 @@ async fn prepare_dsd_true_peak_carrier_for_track(
             track.id.source_ordinal,
         )
     })?;
-    if execution.channels != channels {
+    let expected_observed_channels = if req.registered_effects.iter().any(|intent|
+        matches!(&intent.effect, tonepoet_pipeline::RegisteredUnaryEffect::StereoFold))
+    { 2 } else { channels };
+    if execution.channels != expected_observed_channels {
         return Err(format!(
             "DSD track {} geometry changed after planning: typed observation expects {} channel(s), realized source has {}",
             track.id.source_ordinal, execution.channels, channels,
@@ -42094,8 +42759,11 @@ async fn prepare_dsd_true_peak_carrier_for_track(
             reconstruction_elapsed.saturating_add(export_elapsed)
         }
     };
+    let mut effect_prelude = CertifiedEffectPrelude::default();
+    let mut effect_invocation_indices = Vec::new();
     let effect_elapsed = realize_certified_post_resample_effects(
         &execution,
+        stereo_fold_layout.as_deref(),
         &mut carrier_path,
         carrier_dir,
         &track_stem,
@@ -42103,6 +42771,7 @@ async fn prepare_dsd_true_peak_carrier_for_track(
         runner,
         cancel,
         tool_concurrency_limits.as_ref(),
+        Some((&mut effect_prelude.commands, &mut effect_invocation_indices)),
     )
     .await
     .map_err(|error| {
@@ -42112,6 +42781,17 @@ async fn prepare_dsd_true_peak_carrier_for_track(
             track.id.source_ordinal,
         )
     })?;
+    if !effect_invocation_indices.is_empty() {
+        let effect_evidence = completed_registered_effects_from_plan(
+            &typed_request,
+            &req.registered_effects,
+            &effect_invocation_indices,
+            None,
+        ).map_err(|error| format!(
+            "DSD certified effects executed but semantic evidence projection failed: {error}"
+        ))?;
+        effect_prelude.evidence.append(effect_evidence, 0);
+    }
     let dsd_to_pcm_decode_elapsed = reconstruction_elapsed.saturating_add(effect_elapsed);
 
     let carrier_len = fs::metadata(&carrier_path)
@@ -42122,7 +42802,7 @@ async fn prepare_dsd_true_peak_carrier_for_track(
             )
         })?
         .len();
-    let frame_bytes = u64::from(channels) * 8;
+    let frame_bytes = u64::from(execution.channels) * 8;
     if carrier_len == 0 || carrier_len % frame_bytes != 0 {
         let _ = fs::remove_file(&carrier_path);
         return Err(format!(
@@ -42140,7 +42820,7 @@ async fn prepare_dsd_true_peak_carrier_for_track(
         scan_album_gain_true_peak_carrier_identity(
             &scan_path,
             target_rate_hz,
-            channels,
+            execution.channels,
             scan_mode,
             &scan_cancel,
         )
@@ -42229,7 +42909,7 @@ async fn prepare_dsd_true_peak_carrier_for_track(
         gain_db,
         carrier_path.display(),
         target_rate_hz,
-        channels,
+        execution.channels,
         scan_mode,
     );
 
@@ -42239,7 +42919,7 @@ async fn prepare_dsd_true_peak_carrier_for_track(
             path: carrier_path,
             source_path: original_source_path,
             sample_rate_hz: target_rate_hz,
-            channels,
+            channels: execution.channels,
             duration: source.duration,
             gain_db,
             point_dbtp,
@@ -42258,6 +42938,7 @@ async fn prepare_dsd_true_peak_carrier_for_track(
             dsd_to_pcm_decode: dsd_to_pcm_decode_elapsed,
             true_peak_scan: true_peak_scan_elapsed,
         },
+        effect_prelude,
     })
 }
 
@@ -42389,12 +43070,18 @@ async fn prepare_dsd_true_peak_carriers(
 
     let mut measurements = Vec::new();
     let mut timings = BTreeMap::new();
+    let mut effect_preludes = BTreeMap::new();
     for (track_index, carrier) in carriers.into_iter().enumerate() {
         let Some(carrier) = carrier else {
             continue;
         };
         let track_id = prepared.tracks[track_index].id.clone();
         prepared.tracks[track_index].source_ref = carrier.source_ref;
+        if !carrier.effect_prelude.commands.is_empty()
+            || !carrier.effect_prelude.evidence.operations.is_empty()
+        {
+            effect_preludes.insert(track_id.clone(), carrier.effect_prelude);
+        }
         timings.insert(track_id, carrier.timing);
         if carrier.measurement.execution.scope == tonepoet_pipeline::TruePeakScope::Album {
             measurements.push(carrier.measurement);
@@ -42404,6 +43091,7 @@ async fn prepare_dsd_true_peak_carriers(
     Ok(PreparedDsdTruePeakCarriers {
         measurements,
         timings,
+        effect_preludes,
     })
 }
 
@@ -42908,6 +43596,7 @@ async fn prepare_pipeline_item_for_scheduler_scoped_inner(
     let PreparedDsdTruePeakCarriers {
         measurements: dsd_true_peak_measurements,
         timings: dsd_true_peak_timings,
+        effect_preludes: dsd_effect_preludes,
     } = prepared_album_gain_carriers;
 
     let prepared_pcm_true_peak_carriers = match prepare_pcm_true_peak_carriers(
@@ -42961,7 +43650,10 @@ async fn prepare_pipeline_item_for_scheduler_scoped_inner(
         }
     };
     let pcm_true_peak_measurements = prepared_pcm_true_peak_carriers.measurements;
-    let pcm_effect_preludes = prepared_pcm_true_peak_carriers.effect_preludes;
+    let mut certified_effect_preludes = prepared_pcm_true_peak_carriers.effect_preludes;
+    // A submitted album may contain PCM and DSD members. Both prepasses
+    // execute before terminal encoding and share the same receipt propagation.
+    certified_effect_preludes.extend(dsd_effect_preludes);
 
     ScheduledMaterialization::Ready(ScheduledAlbum {
         item_id,
@@ -42976,7 +43668,7 @@ async fn prepare_pipeline_item_for_scheduler_scoped_inner(
         reference_auto_gain_measurements,
         dsd_true_peak_measurements,
         pcm_true_peak_measurements,
-        pcm_effect_preludes,
+        certified_effect_preludes,
         dsd_true_peak_timings,
         album_gain_scope_disclosure: None,
         run_timing,
@@ -45515,7 +46207,7 @@ pub(crate) async fn finish_pipeline_album_for_scheduler_with_tool_limits_and_ret
     let source_replaygain = album.source_replaygain;
     let batch_replaygain = album.batch_replaygain;
     let dsd_true_peak_timings = album.dsd_true_peak_timings;
-    let album_pcm_effect_preludes = album.pcm_effect_preludes;
+    let album_certified_effect_preludes = album.certified_effect_preludes;
     let album_gain_scope_disclosure = album.album_gain_scope_disclosure;
     let req = album.req;
     let item_id = req.item_id.clone();
@@ -45537,7 +46229,7 @@ pub(crate) async fn finish_pipeline_album_for_scheduler_with_tool_limits_and_ret
     // every terminal invocation reference. This applies equally on a retained
     // scratch retry, without rerunning or double-reporting the effect prelude.
     for output in &mut track_outputs {
-        if let Some(prelude) = album_pcm_effect_preludes.get(&output.record.track_id) {
+        if let Some(prelude) = album_certified_effect_preludes.get(&output.record.track_id) {
             let mut commands = prelude.commands.clone();
             let offset = commands.len();
             commands.append(&mut output.record.commands);
@@ -70318,7 +71010,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
                 reference_auto_gain_measurements: Vec::new(),
                 dsd_true_peak_measurements: Vec::new(),
                 pcm_true_peak_measurements: Vec::new(),
-                pcm_effect_preludes: BTreeMap::new(),
+                certified_effect_preludes: BTreeMap::new(),
                 dsd_true_peak_timings: BTreeMap::new(),
                 album_gain_scope_disclosure: None,
                 run_timing: ConversionRunTiming::start(),
@@ -81367,6 +82059,7 @@ mod validate_encoded_output_tests {
             codec_name: Some("pcm_s24le".to_string()),
             sample_fmt: Some("s32".to_string()),
             channels: Some(2),
+            channel_layout: Some("stereo".to_string()),
             bits_per_raw_sample: Some(24),
             bits_per_sample: Some(24),
         };
@@ -81386,6 +82079,7 @@ mod validate_encoded_output_tests {
             codec_name: Some("pcm_f32le".to_string()),
             sample_fmt: Some("flt".to_string()),
             channels: Some(1),
+            channel_layout: Some("mono".to_string()),
             bits_per_raw_sample: Some(32),
             bits_per_sample: Some(32),
         };

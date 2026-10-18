@@ -302,6 +302,13 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
             FormatField::BitDepth => register_pill_row(buttons, &state.bit_depth, y, label_col, TuiButton::DepthPill),
             FormatField::Resampler => register_pill_row(buttons, &state.resampler, y, label_col, TuiButton::ResamplerPill),
             FormatField::Dither => register_pill_row(buttons, &state.dither, y, label_col, TuiButton::DitherPill),
+            FormatField::OutputChannelLayout => register_pill_row(
+                buttons, &state.output_channel_layout, y, label_col, TuiButton::ChannelLayoutPill,
+            ),
+            FormatField::RemoveDcOffset => {
+                buttons.record_button(TuiButton::RemoveDcPill(0), Rect::new(label_col, y, 5, 1));
+                buttons.record_button(TuiButton::RemoveDcPill(1), Rect::new(label_col + 7, y, 4, 1));
+            }
             FormatField::Deemphasis => {
                 buttons.record_button(TuiButton::DeemphasisPill(0), Rect::new(label_col, y, 5, 1));
                 buttons.record_button(TuiButton::DeemphasisPill(1), Rect::new(label_col + 7, y, 4, 1));

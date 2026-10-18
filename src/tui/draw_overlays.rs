@@ -4391,12 +4391,12 @@ fn draw_analysis(
             ),
             (
                 "DC Bias",
-                if r.dc_bias.abs() < 0.001 {
+                if !super::analyze::dc_bias_is_significant(r.dc_bias, r.rms_db) {
                     format!("{:.6} (negligible)", r.dc_bias)
                 } else {
-                    format!("{:.6} (significant!)", r.dc_bias)
+                    format!("{:.6} (significant)", r.dc_bias)
                 },
-                if r.dc_bias.abs() < 0.001 {
+                if !super::analyze::dc_bias_is_significant(r.dc_bias, r.rms_db) {
                     theme.text_muted
                 } else {
                     theme.amber

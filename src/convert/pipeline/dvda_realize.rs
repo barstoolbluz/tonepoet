@@ -90,7 +90,7 @@ pub(super) async fn realize_dvda_track(
     }
     let realized_dir = staging.root.join("realized-dvda-tracks");
     fs::create_dir_all(&realized_dir)?;
-    let out_path = realized_dir.join(track.output_file_name());
+    let out_path = realized_dir.join(track.output_file_name(audio_policy.lpcm_channel_order_policy));
 
     recover_stale_dvda_temp_artifacts(&realized_dir)?;
     recover_stale_dvda_temp_artifacts(&staging.root.join("dvda-elementary-audio"))?;
@@ -98,7 +98,8 @@ pub(super) async fn realize_dvda_track(
     let _output_lock = acquire_dvda_output_lock(&out_path, cancel).await?;
 
     let cache_source_wav_expectation = track.source_wav_expectation();
-    let base_wav_expectation = track.wav_expectation();
+    let base_wav_expectation = track.wav_expectation()
+        .with_channel_order_policy(audio_policy.lpcm_channel_order_policy);
     if base_wav_expectation.can_validate_existing_cache() {
         if let Some(probe) = dvda_wav_is_ready(
             &out_path,
@@ -183,8 +184,9 @@ pub(super) async fn realize_dvda_track(
     };
 
     let source_wav_expectation = extracted.source_wav_expectation(&track);
-    let final_wav_expectation =
-        source_wav_expectation.with_downmix_policy(audio_policy.downmix_policy);
+    let final_wav_expectation = source_wav_expectation
+        .with_downmix_policy(audio_policy.downmix_policy)
+        .with_channel_order_policy(audio_policy.lpcm_channel_order_policy);
 
     let authored_downmix_matrix = resolve_ifo_downmix_matrix_for_track(&track)?;
     let mut realization_metadata = extracted.realization_metadata(&track);
@@ -450,6 +452,15 @@ pub(super) struct DvdaRealizationAudioPolicy {
 }
 
 impl DvdaRealizationAudioPolicy {
+    /// Stereo folding needs conventional WAV speaker order *in the samples*,
+    /// not just a mask supplied to FFmpeg after LPCM unpacking. Do not change
+    /// the source-order policy for channel-preserving conversions.
+    #[must_use]
+    pub(super) fn for_stereo_fold(mut self) -> Self {
+        self.lpcm_channel_order_policy = DvdaChannelOrderPolicy::WaveExtensible;
+        self
+    }
+
     #[must_use]
     pub(super) fn new(
         final_encode_bit_depth_policy: String,
@@ -706,14 +717,21 @@ impl DvdaTrackRealizeInput {
         })
     }
 
-    fn output_file_name(&self) -> String {
+    fn output_file_name(&self, channel_order_policy: DvdaChannelOrderPolicy) -> String {
         let ats = self
             .title_set_nr
             .map(|value| format!("ats{value:02}"))
             .unwrap_or_else(|| "ats_unknown".to_string());
         let hash = self.stable_identity_hash();
+        // A source-ordered LPCM WAV may already be cached with ffmpeg's
+        // *guessed* mask. Never reuse its sample order for a WaveExtensible
+        // fold (or vice versa). Preserve the legacy filename for the default.
+        let order_suffix = match channel_order_policy {
+            DvdaChannelOrderPolicy::PreserveDvdAudio => "",
+            DvdaChannelOrderPolicy::WaveExtensible => "_wfx",
+        };
         format!(
-            "dvda_{ats}_g{:02}_t{:03}_{hash:016x}.wav",
+            "dvda_{ats}_g{:02}_t{:03}_{hash:016x}{order_suffix}.wav",
             self.group_nr, self.group_track_ordinal
         )
     }
@@ -5089,6 +5107,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn stereo_fold_channel_policy_is_ordered_and_cached_separately() {
+        let original = DvdaRealizationAudioPolicy::new(
+            "preserve".into(), None, DvdaDownmixPolicy::None,
+        );
+        let folded = original.clone().for_stereo_fold();
+        assert_eq!(folded.lpcm_channel_order_policy, DvdaChannelOrderPolicy::WaveExtensible);
+        // The legacy source-order WAV filename stays unchanged; an existing
+        // cached file under it must never satisfy a request for reordered PCM.
+        let track = DvdaTrackRealizeInput::try_from_source(
+            &sample_dvda_track_source(),
+            DvdaSourceAudioExpectation::default(),
+            DvdaDownmixPolicy::None,
+        ).unwrap();
+        let preserved = track.output_file_name(DvdaChannelOrderPolicy::PreserveDvdAudio);
+        let reordered = track.output_file_name(DvdaChannelOrderPolicy::WaveExtensible);
+        assert!(preserved.ends_with(".wav"));
+        assert!(!preserved.contains("_wfx.wav"));
+        assert!(reordered.ends_with("_wfx.wav"));
+        assert_ne!(preserved, reordered);
+        assert_eq!(
+            track.wav_expectation()
+                .with_channel_order_policy(folded.lpcm_channel_order_policy)
+                .channel_order_policy,
+            DvdaChannelOrderPolicy::WaveExtensible,
+        );
+    }
+
+    #[test]
+    fn stereo_fold_uses_dvda_quad_and_five_channel_sample_permutations() {
+        let quad = layout_for_assignment_code(3).unwrap();
+        assert_eq!(quad.order_label(), "L,R,Ls,Rs");
+        assert_eq!(quad.source_to_output_indices(DvdaChannelOrderPolicy::WaveExtensible), vec![0, 1, 2, 3]);
+        assert_eq!(quad.ffmpeg_input_layout_for_policy(DvdaChannelOrderPolicy::WaveExtensible), Some("quad"));
+
+        let five = layout_for_assignment_code(19).unwrap();
+        assert_eq!(five.order_label(), "L,R,Ls,Rs,C");
+        assert_eq!(five.source_to_output_indices(DvdaChannelOrderPolicy::WaveExtensible), vec![0, 1, 4, 2, 3]);
+        assert_eq!(five.ffmpeg_input_layout_for_policy(DvdaChannelOrderPolicy::WaveExtensible), Some("5.0"));
+        assert_eq!(five.ffmpeg_input_layout_for_policy(DvdaChannelOrderPolicy::PreserveDvdAudio), None);
+    }
+
     fn sample_dvda_track_realize_input() -> DvdaTrackRealizeInput {
         let source = sample_dvda_track_source();
         DvdaTrackRealizeInput::try_from_source(
@@ -5330,6 +5390,37 @@ mod tests {
 
         validate_dvda_wav_probe(Path::new("track.wav"), &probe, expectation)
             .expect("assignment 20 is safe to label 5.1 after LPCM samples are reordered into WAVEFORMATEXTENSIBLE order");
+    }
+
+    #[test]
+    fn assignment_18_wave_layout_accepts_explicit_mask_and_refuses_cached_4_1() {
+        let expectation = DvdaWavExpectation {
+            len_in_pts: 90_000,
+            sample_rate: Some(48_000),
+            channel_count: Some(5),
+            source_bit_depth: Some(24),
+            channel_assignment_code: Some(18),
+            channel_order_policy: DvdaChannelOrderPolicy::WaveExtensible,
+        };
+        let mut probe = DvdaWavProbe {
+            codec_name: Some("pcm_s32le".to_string()),
+            sample_rate: 48_000,
+            channels: 5,
+            channel_layout: Some("5 channels (FL+FR+LFE+BL+BR)".to_string()),
+            samples: Some(48_000),
+        };
+        validate_dvda_wav_probe(Path::new("assignment_18_wfx.wav"), &probe, expectation)
+            .expect("explicit 0x3b must survive ffprobe speaker-name formatting");
+        probe.channel_layout = Some("4.1".to_string());
+        assert!(validate_dvda_wav_probe(
+            Path::new("cached_assignment_18_wfx.wav"), &probe, expectation,
+        ).unwrap_err().to_string().contains("channel-layout mismatch"));
+        // Cache reuse calls this same validator and quarantines an invalid
+        // result instead of allowing an old mislabelled _wfx.wav to be reused.
+        probe.channel_layout = Some("5.0".to_string());
+        assert!(validate_dvda_wav_probe(
+            Path::new("cached_assignment_18_wfx.wav"), &probe, expectation,
+        ).is_err());
     }
 
     #[test]

@@ -607,6 +607,11 @@ pub struct EffectInstanceId(
     pub u32,
 );
 
+/// One canonical stereo downmix recipe. The physical command, fingerprint,
+/// and evidence all share this exact coefficient authority; a coefficient
+/// revision therefore changes the request identity automatically.
+pub const STEREO_FOLD_FFMPEG_FILTER: &str = "pan=stereo|FL<FL+0.7071067811865476*FC+0.7071067811865476*BL+0.7071067811865476*SL+0.7071067811865476*FLC+0.5*BC|FR<FR+0.7071067811865476*FC+0.7071067811865476*BR+0.7071067811865476*SR+0.7071067811865476*FRC+0.5*BC";
+
 /// Closed Phase-2 registry of unary sample-domain effects.
 ///
 /// This is deliberately not arbitrary command syntax. Each variant has a typed
@@ -639,6 +644,13 @@ pub enum RegisteredUnaryEffect {
         /// Low-pass cutoff frequency in hertz.
         frequency_hz: u32,
     },
+    /// Deliberate output stereo fold. Named FFmpeg channel roles are mixed with
+    /// a per-output convex (non-amplifying) matrix; LFE is deliberately omitted.
+    /// The typed signal changes channel geometry from the source count to two.
+    StereoFold,
+    /// Remove unknown DC bias with a 2-Hz high-pass, not a fixed dcshift gain.
+    /// This necessarily also filters content very close to 0 Hz.
+    RemoveDcOffset,
     /// Backend-neutral Red Book CD de-emphasis intent. Physical planning may
     /// realize this with a qualified SoX-ng or FFmpeg candidate.
     CdDeemphasis,
@@ -2001,14 +2013,30 @@ fn prepare_registered_effect_segment(
             .find(|state| state.id == *working_signal)
             .cloned()
             .expect("working signal must have a typed state");
+        let (channels, channel_layout) = if matches!(&instance.effect, RegisteredUnaryEffect::StereoFold) {
+            match input_state.channels {
+                Fact::Known(1..=8) => {},
+                Fact::Known(other) => return Err(PlanRefusal {
+                    code: "stereo_fold_unsupported_channel_count".to_owned(),
+                    reason: format!("stereo fold requires 1 through 8 input channels, got {other}"),
+                }),
+                Fact::Pending(_) | Fact::Unavailable(_) => return Err(PlanRefusal {
+                    code: "stereo_fold_requires_channel_facts".to_owned(),
+                    reason: "stereo fold requires an authoritative input channel count".to_owned(),
+                }),
+            }
+            (Fact::Known(2), Fact::Known(vec!["FL".to_owned(), "FR".to_owned()]))
+        } else {
+            (input_state.channels.clone(), input_state.channel_layout.clone())
+        };
         let effected = SignalId(*next_signal);
         *next_signal += 1;
         states.push(AudioState {
             id: effected,
             coding: SignalCoding::Pcm,
             sample_rate_hz: input_state.sample_rate_hz,
-            channels: input_state.channels,
-            channel_layout: input_state.channel_layout,
+            channels,
+            channel_layout,
             frame_extent: FrameExtent::Pending(format!(
                 "effect.{}.frame_extent",
                 instance.id.0
@@ -5761,6 +5789,33 @@ pub fn registered_effect_candidates(
                 contract: plain,
             }]
         }
+        RegisteredUnaryEffect::StereoFold => vec![EffectLowering {
+            // Role names are resolved against the physical input layout. The
+            // '<' form normalizes each output's coefficient sum, so coherent
+            // 5.1/7.1 inputs cannot cause a sample-domain gain increase. FFmpeg
+            // treats absent standard roles as zero. SoX remix uses positional
+            // indices and is not equivalent across 5.1(side)/5.1(back), hence
+            // it is not offered as a misleading interchangeable candidate.
+            tool: ToolIdentifier::Ffmpeg,
+            arguments: EffectArgumentMapping::FfmpegAudioFilter(
+                STEREO_FOLD_FFMPEG_FILTER.to_owned(),
+            ),
+            contract: plain,
+        }],
+        RegisteredUnaryEffect::RemoveDcOffset => vec![
+            EffectLowering {
+                tool: ToolIdentifier::Sox,
+                arguments: EffectArgumentMapping::SoxEffect(vec!["highpass".to_owned(), "2".to_owned()]),
+                contract: plain.clone(),
+            },
+            EffectLowering {
+                tool: ToolIdentifier::Ffmpeg,
+                arguments: EffectArgumentMapping::FfmpegAudioFilter(
+                    "highpass=f=2:p=2:precision=f64".to_owned(),
+                ),
+                contract: plain,
+            },
+        ],
         RegisteredUnaryEffect::HdcdDecode { .. } => vec![EffectLowering {
             tool: ToolIdentifier::Ffmpeg,
             arguments: EffectArgumentMapping::FfmpegAudioFilter(
@@ -11329,5 +11384,72 @@ mod tests {
             plan_typed_with_effects(&request, &[hdcd_effect()])
         else { panic!("HDCD cannot be inserted on unqualified bit depths") };
         assert_eq!(refusal.code, "hdcd_source_ineligible");
+    }
+
+    #[test]
+    fn stereo_fold_changes_typed_geometry_without_losing_following_dc_effect() {
+        let mut request = pcm_request(SampleGainPolicy::Off);
+        request.source.channels = Some(6);
+        let effects = vec![
+            EffectIntent {
+                id: EffectInstanceId(61),
+                effect: RegisteredUnaryEffect::StereoFold,
+                after: Vec::new(),
+                placement: EffectPlacement::AfterPcmResample,
+            },
+            EffectIntent {
+                id: EffectInstanceId(62),
+                effect: RegisteredUnaryEffect::RemoveDcOffset,
+                after: vec![EffectInstanceId(61)],
+                placement: EffectPlacement::AfterPcmResample,
+            },
+        ];
+        let Ok(PlanningOutcome::Ready(plan)) = plan_typed_with_effects(&request, &effects) else {
+            panic!("six-channel PCM must admit the normalized stereo fold and DC high-pass")
+        };
+        let effect_outputs: Vec<_> = plan.nodes.iter().filter_map(|node| match node {
+            TypedPlanNode::ApplyEffect { output, .. } => Some(*output),
+            _ => None,
+        }).collect();
+        assert_eq!(effect_outputs.len(), 2);
+        for id in effect_outputs {
+            let state = plan.audio_states.iter().find(|state| state.id == id)
+                .expect("every effect has typed output state");
+            assert_eq!(state.channels, Fact::Known(2));
+            assert_eq!(state.channel_layout,
+                Fact::Known(vec!["FL".to_owned(), "FR".to_owned()]));
+        }
+        assert_eq!(registered_effect_candidates(&RegisteredUnaryEffect::StereoFold)
+            .expect("fold lowering")[0].tool, ToolIdentifier::Ffmpeg);
+        assert_eq!(registered_effect_candidates(&RegisteredUnaryEffect::RemoveDcOffset)
+            .expect("DC lowerings").len(), 2);
+    }
+
+    #[test]
+    fn stereo_fold_precedes_certified_true_peak_observation() {
+        let mut request = pcm_request(SampleGainPolicy::TruePeakGuard {
+            target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            scope: TruePeakScope::Track,
+            scan: TruePeakScanTier::Fast,
+        });
+        request.source.channels = Some(6);
+        let effects = [EffectIntent {
+            id: EffectInstanceId(1),
+            effect: RegisteredUnaryEffect::StereoFold,
+            after: Vec::new(),
+            placement: EffectPlacement::AfterPcmResample,
+        }];
+        let Ok(PlanningOutcome::Ready(plan)) = plan_typed_with_effects(&request, &effects) else {
+            panic!("stereo fold must admit a certified post-fold true-peak guard")
+        };
+        let folded = plan.nodes.iter().position(|node| matches!(node,
+            TypedPlanNode::ApplyEffect { instance, .. }
+                if matches!(instance.effect, RegisteredUnaryEffect::StereoFold)
+        )).expect("typed stereo fold node");
+        let observed = plan.nodes.iter().position(|node| matches!(node,
+            TypedPlanNode::Observe(observation)
+                if matches!(observation.kind, ObservationKind::CertifiedTruePeak { .. })
+        )).expect("certified true-peak observation");
+        assert!(folded < observed);
     }
 }

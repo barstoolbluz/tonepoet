@@ -214,7 +214,12 @@ impl DvdaChannelLayout {
             8 | 13 => Some("4.0"),
             9 | 14 | 19 => Some("5.0"),
             10 | 15 => Some("3.1"),
-            11 | 16 | 18 => Some("4.1"),
+            11 | 16 => Some("4.1"),
+            // Assignment 18 is L,R,Ls,Rs,LFE (no center, no back-center).
+            // Its reordered WAV order is FL,FR,LFE,BL,BR: mask 0x3b.
+            // FFmpeg's "4.1" is FL,FR,FC,LFE,BC (0x10f) and would
+            // silently route these samples to the wrong speakers.
+            18 => Some("0x3b"),
             12 | 17 | 20 => Some("5.1"),
             _ => None,
         }
@@ -275,11 +280,20 @@ pub(super) fn source_group_order_label(group1: Option<&str>, group2: Option<&str
 
 #[must_use]
 pub(super) fn normalized_ffmpeg_channel_layout(layout: &str) -> String {
-    layout
+    let normalized = layout
         .trim()
         .to_ascii_lowercase()
         .replace(' ', "")
-        .replace("6.0(side)", "6.0")
+        .replace("6.0(side)", "6.0");
+    // FFprobe renders this nonstandard but valid explicit mask by speaker
+    // names, not by the hexadecimal expression passed to FFmpeg. The WAV
+    // validator runs on both newly materialized files and cache hits; keep
+    // the comparison strict, including against legacy mislabelled "4.1".
+    if normalized == "5channels(fl+fr+lfe+bl+br)" {
+        "0x3b".to_string()
+    } else {
+        normalized
+    }
 }
 
 #[cfg(test)]
@@ -304,6 +318,33 @@ mod tests {
         assert!(layout.compatible_ffmpeg_layouts().is_empty());
         assert_eq!(layout.ffmpeg_input_layout_for_policy(DvdaChannelOrderPolicy::WaveExtensible), Some("5.1"));
         assert_eq!(layout.source_to_output_indices(DvdaChannelOrderPolicy::WaveExtensible), vec![0, 1, 4, 5, 2, 3]);
+    }
+
+    #[test]
+    fn assignment_18_reorders_lfe_between_front_and_rears_with_explicit_mask() {
+        let layout = layout_for_assignment_code(18).unwrap();
+        assert_eq!(layout.order_label(), "L,R,Ls,Rs,LFE");
+        assert_eq!(layout.wave_order_label(), "L,R,LFE,Ls,Rs");
+        assert_eq!(
+            layout.source_to_output_indices(DvdaChannelOrderPolicy::WaveExtensible),
+            vec![0, 1, 4, 2, 3],
+        );
+        assert_eq!(
+            layout.ffmpeg_input_layout_for_policy(DvdaChannelOrderPolicy::WaveExtensible),
+            Some("0x3b"),
+        );
+        assert_eq!(
+            layout.ffmpeg_input_layout_for_policy(DvdaChannelOrderPolicy::PreserveDvdAudio),
+            None,
+        );
+        assert_eq!(normalized_ffmpeg_channel_layout("0x3b"), "0x3b");
+        assert_eq!(
+            normalized_ffmpeg_channel_layout("5 channels (FL+FR+LFE+BL+BR)"),
+            "0x3b",
+        );
+        // Neither the buggy layout nor a similar 5-channel role set is valid.
+        assert_ne!(normalized_ffmpeg_channel_layout("4.1"), "0x3b");
+        assert_ne!(normalized_ffmpeg_channel_layout("5.0"), "0x3b");
     }
 
     #[test]

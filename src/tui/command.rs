@@ -10104,12 +10104,15 @@ fn set_request_cd_deemphasis(
     request: &mut crate::convert::pipeline::PipelineRequest,
     enabled: bool,
 ) {
-    request.registered_effects.retain(|effect| {
-        !matches!(
-            effect.effect,
+    let prior_ids: Vec<_> = request.registered_effects.iter()
+        .filter(|effect| matches!(
+            &effect.effect,
             tonepoet_pipeline::RegisteredUnaryEffect::CdDeemphasis
-        )
-    });
+        )).map(|effect| effect.id).collect();
+    request.registered_effects.retain(|effect| !prior_ids.contains(&effect.id));
+    for intent in &mut request.registered_effects {
+        intent.after.retain(|id| !prior_ids.contains(id));
+    }
     if !enabled {
         return;
     }
@@ -10137,6 +10140,38 @@ fn set_request_cd_deemphasis(
         after,
         placement: tonepoet_pipeline::EffectPlacement::SourceRate,
     });
+}
+
+/// Replace the Convert-owned output DSP intents atomically. Repeated commits
+/// cannot duplicate an effect or leave dangling ordering edges from a stale
+/// request. A fold changes channel facts; the DC high-pass follows the fold,
+/// and both precede the already typed true-peak observer and quantizer.
+fn set_request_output_processing(
+    request: &mut crate::convert::pipeline::PipelineRequest,
+    stereo_fold: bool,
+    remove_dc_offset: bool,
+) {
+    use tonepoet_pipeline::{EffectInstanceId, EffectIntent, EffectPlacement, RegisteredUnaryEffect};
+    let obsolete: Vec<_> = request.registered_effects.iter()
+        .filter(|intent| matches!(&intent.effect,
+            RegisteredUnaryEffect::StereoFold | RegisteredUnaryEffect::RemoveDcOffset))
+        .map(|intent| intent.id).collect();
+    request.registered_effects.retain(|intent| !obsolete.contains(&intent.id));
+    for intent in &mut request.registered_effects {
+        intent.after.retain(|id| !obsolete.contains(id));
+    }
+    for effect in [
+        stereo_fold.then_some(RegisteredUnaryEffect::StereoFold),
+        remove_dc_offset.then_some(RegisteredUnaryEffect::RemoveDcOffset),
+    ].into_iter().flatten() {
+        let id = EffectInstanceId(request.registered_effects.iter().map(|intent| intent.id.0)
+            .max().unwrap_or(0).saturating_add(1));
+        let after = request.registered_effects.iter().map(|intent| intent.id).collect();
+        request.registered_effects.push(EffectIntent {
+            id, effect, after,
+            placement: EffectPlacement::AfterPcmResample,
+        });
+    }
 }
 
 /// Install a guarded source-bitstream HDCD decode only for a member whose
@@ -10294,6 +10329,17 @@ fn execute_commit_with_source_options_transform(
     }
     let hdcd_path_states = app.convert.source.hdcd_scan_results.clone();
     let hdcd_decode_enabled = app.convert.format.hdcd_decode_enabled;
+    let output_stereo_fold = !app.convert.format.is_dsd_selected()
+        && *app.convert.format.output_channel_layout.selected_value()
+            == super::app::OutputChannelLayoutChoice::Stereo;
+    let output_remove_dc_offset = !app.convert.format.is_dsd_selected()
+        && app.convert.format.remove_dc_offset;
+    if (output_stereo_fold || output_remove_dc_offset)
+        && app.convert.format.dsd_reference_path_selected()
+    {
+        app.set_status("channel folding and DC removal require the Custom DSD pathway");
+        return;
+    }
     // HDCD/true-peak composition is admitted by the typed plan and the
     // pre-observation execution contract, not by a blanket UI refusal.
     // Source scan identity, per-member selection and other commit gates remain.
@@ -10421,6 +10467,9 @@ fn execute_commit_with_source_options_transform(
     if let Some(transform) = source_options_transform.take() {
         commit_source = transform(commit_source);
     }
+    // The output-channel intent now owns downmixing on every source family;
+    // DVD-Auto is not a second hidden matrix in the DVD-A reader.
+    commit_source.dvda_downmix_policy = DvdaDownmixPolicy::None;
 
     let rg_enabled = options.calculate_replaygain;
     let companion_policy = companion_copy_policy_from_conversion_options(&options);
@@ -10573,6 +10622,7 @@ fn execute_commit_with_source_options_transform(
                 existing_req.deemphasis_evidence_origin = deemphasis_evidence_origin;
                 set_request_hdcd_decode(existing_req, hdcd_binding.clone());
                 set_request_cd_deemphasis(existing_req, apply_cd_deemphasis);
+                set_request_output_processing(existing_req, output_stereo_fold, output_remove_dc_offset);
             } else {
                 let output_root = options.output_dir.clone()
                     .map(|p| crate::convert::pipeline::unified_request::expand_tilde(&p))
@@ -10652,6 +10702,7 @@ fn execute_commit_with_source_options_transform(
                 if let Some(request) = item.pipeline_request.as_mut() {
                     set_request_hdcd_decode(request, hdcd_binding);
                     set_request_cd_deemphasis(request, apply_cd_deemphasis);
+                    set_request_output_processing(request, output_stereo_fold, output_remove_dc_offset);
                 }
             }
         },

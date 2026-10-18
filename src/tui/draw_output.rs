@@ -143,6 +143,24 @@ pub fn draw_format_pane(
                             theme,
                         ));
                     }
+                    FormatField::OutputChannelLayout => lines.push(pill_row(
+                        border_color,
+                        w,
+                        "channels   ",
+                        "",
+                        &render_pill_spans(&format_state.output_channel_layout, row_focused, theme),
+                        row_focused,
+                        theme,
+                    )),
+                    FormatField::RemoveDcOffset => lines.push(pill_row(
+                        border_color,
+                        w,
+                        "DC removal ",
+                        "2 Hz HPF",
+                        &deemphasis_pill_spans(format_state.remove_dc_offset, row_focused, theme),
+                        row_focused,
+                        theme,
+                    )),
                     FormatField::Deemphasis => {
                         let suffix = deemphasis_status_suffix(format_state);
                         lines.push(pill_row(
