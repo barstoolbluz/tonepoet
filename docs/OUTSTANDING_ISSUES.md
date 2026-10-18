@@ -362,6 +362,20 @@ the exact conversion) to name the precise tool + args.
 
 ---
 
+**✅ RESOLVED 2026-10-18.** Both halves. The classification is now level-relative:
+`dc_bias_is_significant` takes the RMS alongside the DC reading, so a verdict no
+longer changes merely because the content got louder — which was the whole
+complaint, since the DC-to-signal ratio was identical across the quiet transfer,
+the gained transfer and the redbook CD. And a DC offset can now be removed during
+conversion: `remove_dc_offset` is a Convert setting, implemented as a 2 Hz
+high-pass rather than a fixed `dcshift` gain, so an unknown offset is removed
+without asserting a magnitude.
+
+Gate 7545 / 0 on the requalified tree; `validation/channel_dc_smoke.py` is 13/13
+and was run here, showing high-pass suppressing DC while preserving a 440 Hz tone
+at identical RMS on both the sox and FFmpeg backends. Not yet confirmed by hand
+on the Mingus SACD the issue was filed from.
+
 ## 6. Cross-process DB init lock can time out during a schema migration under heavy concurrent load (self-recovering, no corruption)
 
 > **Verified STILL OPEN 2026-08-25.** Acquisition is still poll-based `fs2::FileExt::try_lock_exclusive` (`src/db.rs:714`, and a second site at `:981`), not a blocking `lock_exclusive`. **Anchor correction:** the timeout/message now live at `src/db.rs:725` under `DB_OPEN_INIT_LOCK_WAIT_LIMIT` (not `:322`-`326`), and the wording is `"timed out after {} ms waiting for {mode} database initialization lock <path>"`.
