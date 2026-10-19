@@ -58,13 +58,16 @@ pub struct ResultRecord {
     pub frames: u64,
     pub sample_rate_hz: u32,
     pub channels: Vec<ChannelResult>,
+    /// Whether the physical subtraction wrote output. Retained as receipt
+    /// provenance; no projection reads it yet.
+    #[allow(dead_code)]
     pub output_written: bool,
     /// SHA-256 of the exact raw interleaved Float64 bytes observed/processed.
     pub input_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone)]
-pub struct NativeDcReceipt {
+pub(crate) struct NativeDcReceipt {
     pub input: PathBuf,
     pub output: PathBuf,
     pub policy_version: u32,
@@ -227,6 +230,7 @@ pub struct ResolvedCorrection {
 }
 
 impl ResolvedCorrection {
+    #[cfg(test)]
     pub fn changed(&self) -> bool {
         self.records.iter().any(|record| record.subtraction != 0.0)
     }
@@ -380,6 +384,7 @@ pub fn apply_resolved(
 /// Compatibility entry point for focused numeric tests. Production planning
 /// calls resolve() and apply_resolved() separately, preserving the typed
 /// observation -> decision -> physical operation dependency.
+#[cfg(test)]
 pub fn run(
     input: &Path,
     output: &Path,
@@ -391,6 +396,7 @@ pub fn run(
     run_scoped(input, output, rate, channels, mode, true, cancel)
 }
 
+#[cfg(test)]
 pub fn run_scoped(
     input: &Path,
     output: &Path,

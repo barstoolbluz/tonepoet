@@ -392,7 +392,10 @@ pub enum ObservationKind {
     /// Independent terminal decode/verification.
     TerminalVerification,
     /// Per-channel Float64 DC baseline observation (policy version is part of identity).
-    DcBaseline { policy_version: u32 },
+    DcBaseline {
+        /// DC policy version; part of this observation's identity.
+        policy_version: u32,
+    },
 }
 
 
@@ -541,7 +544,10 @@ pub enum DecisionKind {
     },
     /// Decide whether a constant per-channel DC subtraction is supported by
     /// this exact input signal. A skip remains an explicit resolved decision.
-    DcCorrection { policy_version: u32 },
+    DcCorrection {
+        /// DC policy version; part of this decision's identity.
+        policy_version: u32,
+    },
     /// Native ReplayGain projection/writer decision.
     ReplayGainProjection {
         /// Resolved projection policy. Clipping prevention affects projection,
@@ -664,7 +670,11 @@ pub enum RegisteredUnaryEffect {
     DcShiftAuto,
     /// Remove one signed normalized PCM offset (nanounits) from every channel.
     /// The operand describes the value to REMOVE, not a backend addition.
-    DcShiftManual { offset_nanounits: i64 },
+    DcShiftManual {
+        /// Signed offset to remove, in nanounits of normalized full scale;
+        /// 1_000_000_000 is 1.0. Admitted range is -1.0 to 1.0 inclusive.
+        offset_nanounits: i64,
+    },
     /// Backend-neutral Red Book CD de-emphasis intent. Physical planning may
     /// realize this with a qualified SoX-ng or FFmpeg candidate.
     CdDeemphasis,
@@ -739,7 +749,13 @@ pub enum EffectArgumentMapping {
     FfmpegAudioFilter(String),
     /// In-process Float64 subtraction. `None` declares an unresolved automatic
     /// observation dependency; `Some` is explicit, typed, fixed user input.
-    NativeDcShift { offset_nanounits: Option<i64>, policy_version: u32 },
+    NativeDcShift {
+        /// `None` is an unresolved automatic observation dependency; `Some` is
+        /// fixed user input, in nanounits of normalized full scale.
+        offset_nanounits: Option<i64>,
+        /// DC policy version carried into the physical operation.
+        policy_version: u32,
+    },
 }
 
 /// Registered lowering and contract for an effect instance.
