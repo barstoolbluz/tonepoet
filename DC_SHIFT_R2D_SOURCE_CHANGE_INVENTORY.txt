@@ -1,0 +1,25 @@
+TonePoet DC Shift R2D source inventory — 2026-10-18
+BASE R2C archive SHA-256: 3cb75b870a5dce6f149f7cab3bf85e367df300a2eae21d49408c90307746ce70
+
+MODIFIED ORIGINAL SOURCE FILES (exactly 2 compared against R2C SHA256SUMS):
+  tonepoet-pipeline/src/semantic_plan.rs
+    Initial certified terminal candidate admission binds verified-layout
+    FFmpeg direct capability for multichannel Auto/Manual DC; three Rust
+    regression tests for Auto/Manual 3.0/quad, negatives, unchanged controls.
+  src/convert/pipeline/plan_bridge.rs
+    Rust test only, checks initial charged FFmpeg terminal, final retained
+    FFmpeg and input mask/argv for 3.0/quad Auto/Manual.
+
+NEW R2D DELIVERABLE FILES:
+  DC_SHIFT_R2D_ENGINEERING_HANDOFF.md
+  DC_SHIFT_R2D_RESUME_CHECKPOINT.md
+  DC_SHIFT_R2D_SOURCE_CHANGE_INVENTORY.txt
+  DC_SHIFT_R2D_SHA256SUMS.txt (generated last; not self-listed)
+  validation/dc_shift_r2d/ffmpeg_flac_multichannel_terminal.py
+  validation/dc_shift_r2d/EXECUTED_VALIDATION.log
+
+All other R2C source hashes remain equal to the R2C file manifest.
+The R2/R2C manifests included in the archive remain historical, not current.
+
+LIMITATION: No Rust/Nix toolchain; new Rust tests and cargo gates not run.
+See DC_SHIFT_R2D_ENGINEERING_HANDOFF.md for mandatory build-host checks.

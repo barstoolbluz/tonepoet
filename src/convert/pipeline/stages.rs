@@ -21,8 +21,9 @@ use fs2::FileExt;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
+use super::dc_shift::{self, NativeDcReceipt};
 use super::execution_evidence::{
-    append_prior_attempt_bounded, completed_registered_effects_from_plan,
+    append_prior_attempt_bounded, completed_registered_effects_with_dc,
     discarded_attempt_evidence_from_invocations, record_native_scalar_materialization,
     render_discarded_attempt_processing, render_operation_with_context, render_other_track_artifact_work,
     render_track_processing, render_track_verifications, summarize_prior_attempt, DecisionAuthority,
@@ -4174,6 +4175,7 @@ async fn prepare_final_execution_input(
 
     let mut planner_track = track.clone();
     planner_track.source_ref = TrackSourceRef::RegisteredEffectCarrier {
+        channel_layout: None,
         path: terminal_path.clone(),
         source_path: source_path.clone(),
         sample_rate_hz: replay.target_rate_hz,
@@ -14408,6 +14410,7 @@ FILE "album.flac" WAVE
                 std::fs::write(&raw_carrier, b"metadata-branch-only raw carrier")
                     .expect("album-scope DFF raw carrier fixture");
                 album_source.tracks[0].source_ref = TrackSourceRef::DsdTruePeakCarrier {
+                    channel_layout: None,
                     path: raw_carrier,
                     source_path: carrier.clone(),
                     sample_rate_hz: album_source.tracks[0]
@@ -37845,6 +37848,7 @@ mod protected_ssrc_runtime_tests {
             },
             outcome: TrackOutcome::Ok,
             source_ref: TrackSourceRef::PcmTruePeakCarrier {
+                channel_layout: None,
                 path: PathBuf::from("carrier.f64le"),
                 source_path: PathBuf::from("source.wav"),
                 sample_rate_hz: 44_100,
@@ -38582,6 +38586,8 @@ async fn prepare_pcm_true_peak_carrier_for_track(
         &intent.effect,
         tonepoet_pipeline::RegisteredUnaryEffect::StereoFold
             | tonepoet_pipeline::RegisteredUnaryEffect::RemoveDcOffset
+            | tonepoet_pipeline::RegisteredUnaryEffect::DcShiftAuto
+            | tonepoet_pipeline::RegisteredUnaryEffect::DcShiftManual { .. }
     ));
     if output_effects_active && ssrc_terminal_binding.is_some() {
         return Err(format!(
@@ -38594,6 +38600,7 @@ async fn prepare_pcm_true_peak_carrier_for_track(
     let mut carrier_path = raw_carrier_path.clone();
     let _ = fs::remove_file(&raw_carrier_path);
     let mut retained_ssrc_ingress: Option<RetainedSsrcTruePeakIngress> = None;
+    let mut dc_preobservation_layout: Option<String> = None;
     if hdcd_active || output_effects_active {
         // Qualify the whole plan before processing. The registered-effect
         // executor consumes the selected certified pre-observation spine,
@@ -38618,6 +38625,7 @@ async fn prepare_pcm_true_peak_carrier_for_track(
         )
         .await?;
         let TrackSourceRef::RegisteredEffectCarrier {
+            channel_layout: effected_layout,
             path: effect_path,
             sample_rate_hz: effected_rate,
             channels: effected_channels,
@@ -38632,6 +38640,7 @@ async fn prepare_pcm_true_peak_carrier_for_track(
         {
             return Err("registered-effect pre-observation carrier disagrees with the certified typed rate, channel geometry or resampler count".into());
         }
+        dc_preobservation_layout = effected_layout;
         match representation {
             RegisteredEffectCarrierRepresentation::RawFloat64 => {
                 carrier_path = effect_path;
@@ -38775,6 +38784,7 @@ async fn prepare_pcm_true_peak_carrier_for_track(
         realize_certified_post_resample_effects(
             &execution,
             None,
+            !matches!(&track.source_ref, TrackSourceRef::CueStreamSegment { .. } | TrackSourceRef::CueSegmentCarrier { .. }),
             &mut carrier_path,
             carrier_dir,
             &track_stem,
@@ -38905,6 +38915,7 @@ async fn prepare_pcm_true_peak_carrier_for_track(
     );
     Ok(PreparedPcmTruePeakCarrier {
         source_ref: TrackSourceRef::PcmTruePeakCarrier {
+            channel_layout: dc_preobservation_layout,
             path: carrier_path,
             source_path: original_source_path,
             sample_rate_hz: target_rate_hz,
@@ -40160,6 +40171,11 @@ async fn prepare_registered_effect_carrier_for_track(
 
     let original_source_path = track_source_identity_path(&track).to_path_buf();
     let source_ref = track.source_ref.clone();
+    // A single CUE image is a continuous programme. This per-track executor
+    // lacks an album-wide observed carrier; never create discontinuities by
+    // subtracting a different automatic mean at each artificial cut.
+    let allow_auto_subtraction = !matches!(&source_ref,
+        TrackSourceRef::CueStreamSegment { .. } | TrackSourceRef::CueSegmentCarrier { .. });
     // A scanned CUE member must go directly from the original 16-bit image
     // into FFmpeg HDCD. Materializing the usual S32 CUE fallback first both
     // wastes an additional decode and loses the control-stream input contract.
@@ -40275,9 +40291,18 @@ async fn prepare_registered_effect_carrier_for_track(
             track.id.source_ordinal, execution.channels, source_channels,
         ));
     }
-    let stereo_fold_layout = if track_effects.iter().any(|intent| matches!(
+    let dc_shift_requested = track_effects.iter().any(|intent| matches!(
+        &intent.effect,
+        tonepoet_pipeline::RegisteredUnaryEffect::DcShiftAuto
+            | tonepoet_pipeline::RegisteredUnaryEffect::DcShiftManual { .. }
+    ));
+    let stereo_fold_requested = track_effects.iter().any(|intent| matches!(
         &intent.effect, tonepoet_pipeline::RegisteredUnaryEffect::StereoFold
-    )) {
+    ));
+    // DC subtraction retains the original physical speaker roles even though
+    // its native Float64 staging file has no container header. Use the same
+    // source-layout admission authority as the existing stereo fold.
+    let stereo_fold_layout = if stereo_fold_requested || dc_shift_requested {
         // Mono/stereo have unambiguous canonical speaker roles. For every
         // multichannel fold, verify the source's speaker assignment *before*
         // the no-rate-change Float64 WAV or raw carrier can erase it.
@@ -40339,6 +40364,7 @@ async fn prepare_registered_effect_carrier_for_track(
         };
         segment.lowerings.remove(0);
         segment.effect_output_channels.remove(0);
+        segment.dc_dependencies.remove(0);
         Some(filter)
     } else {
         None
@@ -40601,6 +40627,7 @@ async fn prepare_registered_effect_carrier_for_track(
 
     let mut representation = RegisteredEffectCarrierRepresentation::RawFloat64;
     let mut effect_invocation_indices = Vec::with_capacity(track_effects.len());
+    let mut dc_receipts = Vec::<NativeDcReceipt>::new();
     if let Some(index) = hdcd_invocation_index {
         effect_invocation_indices.push(index);
     }
@@ -40616,12 +40643,14 @@ async fn prepare_registered_effect_carrier_for_track(
             }
             realize_registered_effect_chain_recorded(
                 &pre.lowerings,
+                &pre.dc_dependencies,
                 &pre.effect_output_channels,
                 pre.sample_rate_hz,
                 pre.input_channels,
                 pre.channels,
                 stereo_fold_layout.as_deref(),
                 first_input_is_raw_f64le,
+                allow_auto_subtraction,
                 RegisteredEffectOutputCarrier::WavFloat64,
                 &mut carrier_path,
                 &carrier_dir,
@@ -40632,6 +40661,7 @@ async fn prepare_registered_effect_carrier_for_track(
                 tool_concurrency_limits.as_ref(),
                 preparation_commands,
                 &mut effect_invocation_indices,
+                &mut dc_receipts,
             )
             .await
             .map_err(|error| {
@@ -40693,6 +40723,7 @@ async fn prepare_registered_effect_carrier_for_track(
             }
             realize_registered_effect_chain_recorded(
                 &post.lowerings,
+                &post.dc_dependencies,
                 &post.effect_output_channels,
                 post.sample_rate_hz,
                 post.input_channels,
@@ -40701,6 +40732,7 @@ async fn prepare_registered_effect_carrier_for_track(
                     pre.lowerings.iter().any(is_stereo_fold_lowering)
                 ) { Some("0x3") } else { stereo_fold_layout.as_deref() },
                 false,
+                allow_auto_subtraction,
                 RegisteredEffectOutputCarrier::RawFloat64,
                 &mut carrier_path,
                 &carrier_dir,
@@ -40711,6 +40743,7 @@ async fn prepare_registered_effect_carrier_for_track(
                 tool_concurrency_limits.as_ref(),
                 preparation_commands,
                 &mut effect_invocation_indices,
+                &mut dc_receipts,
             )
             .await
             .map_err(|error| {
@@ -40737,12 +40770,14 @@ async fn prepare_registered_effect_carrier_for_track(
         } else {
         realize_registered_effect_chain_recorded(
             &post.lowerings,
+            &post.dc_dependencies,
             &post.effect_output_channels,
             post.sample_rate_hz,
             post.input_channels,
             post.channels,
             stereo_fold_layout.as_deref(),
             first_input_is_raw_f64le,
+                allow_auto_subtraction,
             RegisteredEffectOutputCarrier::RawFloat64,
             &mut carrier_path,
             &carrier_dir,
@@ -40753,6 +40788,7 @@ async fn prepare_registered_effect_carrier_for_track(
             tool_concurrency_limits.as_ref(),
             preparation_commands,
             &mut effect_invocation_indices,
+            &mut dc_receipts,
         )
         .await
         .map_err(|error| {
@@ -40793,11 +40829,36 @@ async fn prepare_registered_effect_carrier_for_track(
         }
     }
 
-    let mut semantic_effect_evidence = completed_registered_effects_from_plan(
+    // Native subtraction intentionally permits temporary Float64 overloads.
+    // Without a selected peak/gain decision, however, allowing an overloaded
+    // corrected carrier to reach an integer or lossy terminal would silently
+    // narrow/clip it. A Float32/64 PCM terminal can preserve the value; all
+    // other unprotected terminals must refuse instead of adding a limiter.
+    let floating_terminal = matches!(req.settings.target_format,
+        tonepoet_pipeline::AudioFormat::Wav
+            | tonepoet_pipeline::AudioFormat::Aiff
+            | tonepoet_pipeline::AudioFormat::WavPack)
+        && !(req.settings.target_format == tonepoet_pipeline::AudioFormat::WavPack
+            && req.settings.wavpack.hybrid)
+        && resolved_target_pcm_depth(&track, &req.settings)
+            .is_some_and(tonepoet_pipeline::PcmBitDepth::is_float);
+    if matches!(policy, SampleGainPolicy::Off) && !floating_terminal
+        && dc_receipts.iter().any(|receipt| receipt.result.changed()
+            && receipt.result.channels.iter().any(|channel|
+                channel.output_peak.is_some_and(|peak| peak > 1.0 + 1e-12)))
+    {
+        return Err(format!(
+            "track {} DC subtraction would exceed integer/lossy terminal full scale without user-selected gain or true-peak protection; refusing to clip",
+            track.id.source_ordinal,
+        ));
+    }
+
+    let mut semantic_effect_evidence = completed_registered_effects_with_dc(
         &plan_request,
         &track_effects,
         &effect_invocation_indices,
         resampler_invocation_index,
+        &dc_receipts,
     )
     .map_err(|error| format!("could not project completed registered-effect evidence: {error}"))?;
     if hdcd_invocation_index.is_some() {
@@ -40810,6 +40871,12 @@ async fn prepare_registered_effect_carrier_for_track(
     preparation_evidence.append(semantic_effect_evidence, 0);
 
     track.source_ref = TrackSourceRef::RegisteredEffectCarrier {
+        channel_layout: if dc_shift_requested {
+            Some(if stereo_fold_requested { "0x3".to_string() } else {
+                stereo_fold_layout.clone().ok_or_else(||
+                    "native DC output lost its verified speaker layout".to_string())?
+            })
+        } else { None },
         path: carrier_path,
         source_path: original_source_path,
         sample_rate_hz: execution.sample_rate_hz,
@@ -41285,6 +41352,42 @@ fn is_stereo_fold_lowering(lowering: &tonepoet_pipeline::EffectLowering) -> bool
             if filter == tonepoet_pipeline::STEREO_FOLD_FFMPEG_FILTER)
 }
 
+/// Pure Float64 container transportation for a native operation. An `anull`
+/// copy is explicitly not the DC effect, and its subprocess receipt is never
+/// misrepresented as the effect invocation.
+async fn native_dc_container_transport(
+    native: &tonepoet_pipeline::EffectLowering,
+    input: &Path,
+    input_is_raw: bool,
+    output: &Path,
+    output_carrier: RegisteredEffectOutputCarrier,
+    sample_rate_hz: u32,
+    channels: u16,
+    channel_layout: Option<&str>,
+    expected_duration: Option<Duration>,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    limits: Option<&Arc<ToolConcurrencyLimits>>,
+    commands: &mut Vec<CommandRecord>,
+    record: bool,
+) -> Result<Duration, String> {
+    let transport = tonepoet_pipeline::EffectLowering {
+        tool: tonepoet_pipeline::ToolIdentifier::Ffmpeg,
+        arguments: tonepoet_pipeline::EffectArgumentMapping::FfmpegAudioFilter("anull".into()),
+        contract: native.contract.clone(),
+    };
+    let mut cmd = registered_effect_f64le_command(
+        &transport, input, input_is_raw, output, output_carrier,
+        sample_rate_hz, channels, channel_layout, expected_duration,
+    )?;
+    cmd.description = "Native DC effect: Float64 container transportation (no DSP)".into();
+    if record {
+        run_recorded_planned_command(&cmd, runner, cancel, limits, commands).await
+    } else {
+        run_dsd_true_peak_planned_command(&cmd, runner, cancel, limits).await
+    }
+}
+
 fn registered_effect_f64le_command(
     lowering: &tonepoet_pipeline::EffectLowering,
     input: &Path,
@@ -41331,20 +41434,20 @@ fn registered_effect_f64le_command(
                     "-ac".to_string(), channels.to_string(),
                 ]);
             }
-            if is_stereo_fold_lowering(lowering) {
-                let layout = stereo_fold_input_layout.ok_or_else(|| {
-                    "stereo fold has no verified source speaker layout".to_string()
-                })?;
+            if is_stereo_fold_lowering(lowering) && stereo_fold_input_layout.is_none() {
+                return Err("stereo fold has no verified source speaker layout".to_string());
+            }
+            if let Some(layout) = stereo_fold_input_layout {
                 let mask = fold_layout_mask(layout).ok_or_else(|| {
-                    "stereo fold received an invalid source speaker layout".to_string()
+                    "registered effect received an invalid source speaker layout".to_string()
                 })?;
                 if !valid_fold_layout_mask(mask, channels) {
                     return Err(format!(
-                        "stereo fold speaker layout {layout} does not match {channels} input channels",
+                        "registered effect speaker layout {layout} does not match {channels} input channels",
                     ));
                 }
-                // Per-input option. Overrides the guessed mask on *both*
-                // headerless Float64 and unlabelled SoX Float64 WAV carriers.
+                // Per-input option: raw Float64 carriers contain only a channel
+                // count and may otherwise cause FFmpeg to relabel physical speakers.
                 args.extend(["-channel_layout".to_string(), layout.to_string()]);
             }
             args.extend([
@@ -41423,6 +41526,7 @@ mod r18_deemphasis_lowering_tests {
             plan_scope: tonepoet_pipeline::PlanScope::track("r18-stage-bridge"),
             intermediate_dir: Some(PathBuf::from("work")),
             container_ffmpeg_flags: Vec::new(),
+            raw_input_channel_layout: None,
             resolved_output_target: None,
             reference_programme_scope: Default::default(),
             planned_riff_non_audio_upper_bound_bytes: None,
@@ -41934,12 +42038,14 @@ fn fusible_ordinary_sox_highpass_lowpass_pair(
 
 async fn realize_registered_effect_chain(
     lowerings: &[tonepoet_pipeline::EffectLowering],
+    dc_dependencies: &[Option<super::plan_bridge::DcEffectDependency>],
     effect_output_channels: &[u16],
     sample_rate_hz: u32,
     input_channels: u16,
     channels: u16,
     stereo_fold_input_layout: Option<&str>,
     first_input_is_raw_f64le: bool,
+    allow_auto_subtraction: bool,
     final_output_carrier: RegisteredEffectOutputCarrier,
     carrier_path: &mut PathBuf,
     carrier_dir: &Path,
@@ -41951,14 +42057,17 @@ async fn realize_registered_effect_chain(
 ) -> Result<Duration, String> {
     let mut ignored_commands = Vec::new();
     let mut ignored_effect_invocation_indices = Vec::new();
+    let mut ignored_dc_receipts = Vec::new();
     realize_registered_effect_chain_impl(
         lowerings,
+        dc_dependencies,
         effect_output_channels,
         sample_rate_hz,
         input_channels,
         channels,
         stereo_fold_input_layout,
         first_input_is_raw_f64le,
+        allow_auto_subtraction,
         final_output_carrier,
         carrier_path,
         carrier_dir,
@@ -41969,6 +42078,7 @@ async fn realize_registered_effect_chain(
         tool_concurrency_limits,
         &mut ignored_commands,
         &mut ignored_effect_invocation_indices,
+        &mut ignored_dc_receipts,
         false,
         false,
     )
@@ -41977,12 +42087,14 @@ async fn realize_registered_effect_chain(
 
 async fn realize_registered_effect_chain_recorded(
     lowerings: &[tonepoet_pipeline::EffectLowering],
+    dc_dependencies: &[Option<super::plan_bridge::DcEffectDependency>],
     effect_output_channels: &[u16],
     sample_rate_hz: u32,
     input_channels: u16,
     channels: u16,
     stereo_fold_input_layout: Option<&str>,
     first_input_is_raw_f64le: bool,
+    allow_auto_subtraction: bool,
     final_output_carrier: RegisteredEffectOutputCarrier,
     carrier_path: &mut PathBuf,
     carrier_dir: &Path,
@@ -41993,15 +42105,18 @@ async fn realize_registered_effect_chain_recorded(
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
     recorded_commands: &mut Vec<CommandRecord>,
     effect_invocation_indices: &mut Vec<usize>,
+    native_dc_receipts: &mut Vec<NativeDcReceipt>,
 ) -> Result<Duration, String> {
     realize_registered_effect_chain_impl(
         lowerings,
+        dc_dependencies,
         effect_output_channels,
         sample_rate_hz,
         input_channels,
         channels,
         stereo_fold_input_layout,
         first_input_is_raw_f64le,
+        allow_auto_subtraction,
         final_output_carrier,
         carrier_path,
         carrier_dir,
@@ -42012,6 +42127,7 @@ async fn realize_registered_effect_chain_recorded(
         tool_concurrency_limits,
         recorded_commands,
         effect_invocation_indices,
+        native_dc_receipts,
         true,
         false,
     )
@@ -42023,12 +42139,14 @@ async fn realize_registered_effect_chain_recorded(
 // profile establishes multi-effect process/I/O segmentation as a material cost.
 async fn realize_registered_effect_chain_impl(
     lowerings: &[tonepoet_pipeline::EffectLowering],
+    dc_dependencies: &[Option<super::plan_bridge::DcEffectDependency>],
     effect_output_channels: &[u16],
     sample_rate_hz: u32,
     input_channels: u16,
     channels: u16,
     stereo_fold_input_layout: Option<&str>,
     first_input_is_raw_f64le: bool,
+    allow_auto_subtraction: bool,
     final_output_carrier: RegisteredEffectOutputCarrier,
     carrier_path: &mut PathBuf,
     carrier_dir: &Path,
@@ -42039,11 +42157,12 @@ async fn realize_registered_effect_chain_impl(
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
     recorded_commands: &mut Vec<CommandRecord>,
     effect_invocation_indices: &mut Vec<usize>,
+    native_dc_receipts: &mut Vec<NativeDcReceipt>,
     record_commands: bool,
     allow_ordinary_sox_pair_fusion: bool,
 ) -> Result<Duration, String> {
-    if lowerings.len() != effect_output_channels.len() {
-        return Err("registered effect geometry length does not match selected lowerings".to_string());
+    if lowerings.len() != effect_output_channels.len() || lowerings.len() != dc_dependencies.len() {
+        return Err("registered effect geometry/typed dependency count disagrees with selected lowerings".to_string());
     }
     if lowerings.is_empty() {
         if input_channels != channels {
@@ -42211,44 +42330,115 @@ async fn realize_registered_effect_chain_impl(
             index + 1,
         ));
         let _ = fs::remove_file(&next);
-        let planned = registered_effect_f64le_command(
-            lowering,
-            &current,
-            first_input_is_raw_f64le || index > 0,
-            &next,
-            output_carrier,
-            sample_rate_hz,
-            current_channels,
-            current_layout.as_deref(),
-            expected_duration,
-        )?;
-        let invocation_index = recorded_commands.len();
-        let effect_result = if record_commands {
-            run_recorded_planned_command(
-                &planned,
-                runner,
-                cancel,
-                tool_concurrency_limits,
-                recorded_commands,
-            )
-            .await
+        let effect_elapsed = if let tonepoet_pipeline::EffectArgumentMapping::NativeDcShift {
+            offset_nanounits, policy_version,
+        } = &lowering.arguments {
+            if *policy_version != dc_shift::POLICY_VERSION || emitted_channels != current_channels {
+                return Err("native DC lowering has unsupported policy or changes channel geometry".into());
+            }
+            if lowering.tool != tonepoet_pipeline::ToolIdentifier::Custom(
+                "tonepoet-native-f64-dc".to_string()) {
+                return Err("native DC typed lowering has incompatible tool identity".into());
+            }
+            let started = Instant::now();
+            // The base PCM carrier is a Float64 WAV. Keep container operations
+            // distinct from the native effect; no int32 or S32P DSP is allowed.
+            let input_is_raw = first_input_is_raw_f64le || index > 0;
+            let native_input = if input_is_raw { current.clone() } else {
+                let ingress = carrier_dir.join(format!(
+                    "track-{track_stem}.effect-{:03}.dc-ingress.f64le", index + 1,
+                ));
+                let _ = fs::remove_file(&ingress);
+                native_dc_container_transport(
+                    lowering, &current, false, &ingress,
+                    RegisteredEffectOutputCarrier::RawFloat64,
+                    sample_rate_hz, current_channels, current_layout.as_deref(), expected_duration,
+                    runner, cancel, tool_concurrency_limits, recorded_commands, record_commands,
+                ).await?;
+                ingress
+            };
+            let native_output = if matches!(output_carrier, RegisteredEffectOutputCarrier::RawFloat64) {
+                next.clone()
+            } else {
+                carrier_dir.join(format!(
+                    "track-{track_stem}.effect-{:03}.dc-result.f64le", index + 1,
+                ))
+            };
+            let _ = fs::remove_file(&native_output);
+            let binding = dc_dependencies[index].clone();
+            match (offset_nanounits, &binding) {
+                (None, Some(dependency)) if dependency.policy_version == *policy_version => {},
+                (Some(_), None) => {},
+                _ => return Err("native DC realization lost its typed observation/decision dependency".into()),
+            }
+            let mode = if let Some(offset) = offset_nanounits {
+                dc_shift::Mode::Manual { offset_nanounits: *offset }
+            } else { dc_shift::Mode::Auto };
+            // Decision phase: observation completes and produces immutable per-channel
+            // subtraction parameters. A physical writer cannot infer its own values.
+            let input_for_decision = native_input.clone();
+            let dc_cancel = cancel.clone();
+            let resolved = tokio::task::spawn_blocking(move ||
+                dc_shift::resolve(&input_for_decision, sample_rate_hz, current_channels,
+                    mode, allow_auto_subtraction, &dc_cancel)
+            ).await.map_err(|error| format!("DC observation/decision worker failed: {error}"))?
+             .map_err(|error| format!("native DC observation/decision {} failed: {error}", index + 1))?;
+            // Application phase: consumes exactly that resolved decision; no
+            // second policy evaluation, hidden zero shift, or automatic fallback.
+            let input_for_worker = native_input.clone();
+            let output_for_worker = native_output.clone();
+            let dc_cancel = cancel.clone();
+            let realized = tokio::task::spawn_blocking(move ||
+                dc_shift::apply_resolved(&input_for_worker, &output_for_worker, resolved, &dc_cancel)
+            ).await.map_err(|error| format!("native DC application worker failed: {error}"))?
+             .map_err(|error| format!("native DC application {} failed: {error}", index + 1))?;
+            if matches!(output_carrier, RegisteredEffectOutputCarrier::WavFloat64) {
+                native_dc_container_transport(
+                    lowering, &native_output, true, &next,
+                    RegisteredEffectOutputCarrier::WavFloat64,
+                    sample_rate_hz, current_channels, current_layout.as_deref(), expected_duration,
+                    runner, cancel, tool_concurrency_limits, recorded_commands, record_commands,
+                ).await?;
+                fs::remove_file(&native_output).map_err(|e| format!(
+                    "could not retire raw DC correction carrier {}: {e}", native_output.display()))?;
+            }
+            if native_input != current {
+                fs::remove_file(&native_input).map_err(|e| format!(
+                    "could not retire DC correction ingress {}: {e}", native_input.display()))?;
+            }
+            native_dc_receipts.push(NativeDcReceipt {
+                input: native_input.clone(), output: next.clone(),
+                policy_version: *policy_version, typed_dependency: binding,
+                result: realized,
+            });
+            started.elapsed()
         } else {
-            run_dsd_true_peak_planned_command(
-                &planned,
-                runner,
-                cancel,
-                tool_concurrency_limits,
-            )
-            .await
-        };
-        let effect_elapsed = effect_result
-            .map_err(|error| {
+            let planned = registered_effect_f64le_command(
+                lowering,
+                &current,
+                first_input_is_raw_f64le || index > 0,
+                &next,
+                output_carrier,
+                sample_rate_hz,
+                current_channels,
+                current_layout.as_deref(),
+                expected_duration,
+            )?;
+            let invocation_index = recorded_commands.len();
+            let effect_result = if record_commands {
+                run_recorded_planned_command(
+                    &planned, runner, cancel, tool_concurrency_limits, recorded_commands,
+                ).await
+            } else {
+                run_dsd_true_peak_planned_command(&planned, runner, cancel, tool_concurrency_limits).await
+            };
+            let effect_elapsed = effect_result.map_err(|error| {
                 let _ = fs::remove_file(&next);
                 format!("registered effect {} failed: {error}", index + 1)
             })?;
-        if record_commands {
-            effect_invocation_indices.push(invocation_index);
-        }
+            if record_commands { effect_invocation_indices.push(invocation_index); }
+            effect_elapsed
+        };
         let len = fs::metadata(&next)
             .map_err(|error| format!("could not stat registered effect output {}: {error}", next.display()))?
             .len();
@@ -42349,6 +42539,7 @@ async fn realize_registered_effect_chain_impl(
 async fn realize_certified_post_resample_effects(
     execution: &CertifiedTruePeakExecutionContract,
     stereo_fold_input_layout: Option<&str>,
+    allow_auto_subtraction: bool,
     carrier_path: &mut PathBuf,
     carrier_dir: &Path,
     track_stem: &str,
@@ -42356,7 +42547,7 @@ async fn realize_certified_post_resample_effects(
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
-    receipts: Option<(&mut Vec<CommandRecord>, &mut Vec<usize>)>,
+    receipts: Option<(&mut Vec<CommandRecord>, &mut Vec<usize>, &mut Vec<NativeDcReceipt>)>,
 ) -> Result<Duration, String> {
     let Some(post) = execution.post_resample.as_ref() else {
         return Ok(Duration::ZERO);
@@ -42368,14 +42559,16 @@ async fn realize_certified_post_resample_effects(
         );
     }
     match receipts {
-        Some((commands, indices)) => realize_registered_effect_chain_recorded(
+        Some((commands, indices, native_receipts)) => realize_registered_effect_chain_recorded(
             &post.lowerings,
+            &post.dc_dependencies,
             &post.effect_output_channels,
             post.sample_rate_hz,
             post.input_channels,
             post.channels,
             stereo_fold_input_layout,
             true,
+            allow_auto_subtraction,
             RegisteredEffectOutputCarrier::RawFloat64,
             carrier_path,
             carrier_dir,
@@ -42386,15 +42579,18 @@ async fn realize_certified_post_resample_effects(
             tool_concurrency_limits,
             commands,
             indices,
+            native_receipts,
         ).await,
         None => realize_registered_effect_chain(
             &post.lowerings,
+            &post.dc_dependencies,
             &post.effect_output_channels,
             post.sample_rate_hz,
             post.input_channels,
             post.channels,
             stereo_fold_input_layout,
             true,
+            allow_auto_subtraction,
             RegisteredEffectOutputCarrier::RawFloat64,
             carrier_path,
             carrier_dir,
@@ -42536,9 +42732,12 @@ async fn prepare_dsd_true_peak_carrier_for_track(
         })?;
     // The DSD certified observation is a separate source-to-Float64 ingress.
     // Bind its original speaker roles before reconstruction also erases them.
-    let stereo_fold_layout = if req.registered_effects.iter().any(|intent|
-        matches!(&intent.effect, tonepoet_pipeline::RegisteredUnaryEffect::StereoFold))
-        && channels > 2
+    let dc_shift_requested = req.registered_effects.iter().any(|intent|
+        matches!(&intent.effect, tonepoet_pipeline::RegisteredUnaryEffect::DcShiftAuto
+            | tonepoet_pipeline::RegisteredUnaryEffect::DcShiftManual { .. }));
+    let stereo_fold_requested = req.registered_effects.iter().any(|intent|
+        matches!(&intent.effect, tonepoet_pipeline::RegisteredUnaryEffect::StereoFold));
+    let stereo_fold_layout = if (stereo_fold_requested || dc_shift_requested) && channels > 2
     {
         let probe = probe_realized_segment_with_tool_limits(
             &realized.path, runner, cancel, tool_concurrency_limits.as_ref(),
@@ -42550,9 +42749,7 @@ async fn prepare_dsd_true_peak_carrier_for_track(
             .map_err(|error| format!(
                 "DSD track {} cannot safely fold channels: {error}", track.id.source_ordinal,
             ))?)
-    } else if req.registered_effects.iter().any(|intent|
-        matches!(&intent.effect, tonepoet_pipeline::RegisteredUnaryEffect::StereoFold))
-    {
+    } else if stereo_fold_requested || dc_shift_requested {
         Some(if channels == 1 { "0x4" } else { "0x3" }.to_string())
     } else {
         None
@@ -42761,9 +42958,11 @@ async fn prepare_dsd_true_peak_carrier_for_track(
     };
     let mut effect_prelude = CertifiedEffectPrelude::default();
     let mut effect_invocation_indices = Vec::new();
+    let mut dc_receipts = Vec::<NativeDcReceipt>::new();
     let effect_elapsed = realize_certified_post_resample_effects(
         &execution,
         stereo_fold_layout.as_deref(),
+        !matches!(&track.source_ref, TrackSourceRef::CueStreamSegment { .. } | TrackSourceRef::CueSegmentCarrier { .. }),
         &mut carrier_path,
         carrier_dir,
         &track_stem,
@@ -42771,7 +42970,7 @@ async fn prepare_dsd_true_peak_carrier_for_track(
         runner,
         cancel,
         tool_concurrency_limits.as_ref(),
-        Some((&mut effect_prelude.commands, &mut effect_invocation_indices)),
+        Some((&mut effect_prelude.commands, &mut effect_invocation_indices, &mut dc_receipts)),
     )
     .await
     .map_err(|error| {
@@ -42781,12 +42980,13 @@ async fn prepare_dsd_true_peak_carrier_for_track(
             track.id.source_ordinal,
         )
     })?;
-    if !effect_invocation_indices.is_empty() {
-        let effect_evidence = completed_registered_effects_from_plan(
+    if !effect_invocation_indices.is_empty() || !dc_receipts.is_empty() {
+        let effect_evidence = completed_registered_effects_with_dc(
             &typed_request,
             &req.registered_effects,
             &effect_invocation_indices,
             None,
+            &dc_receipts,
         ).map_err(|error| format!(
             "DSD certified effects executed but semantic evidence projection failed: {error}"
         ))?;
@@ -42916,6 +43116,12 @@ async fn prepare_dsd_true_peak_carrier_for_track(
     let track_id = track.id.clone();
     Ok(PreparedDsdTruePeakCarrier {
         source_ref: TrackSourceRef::DsdTruePeakCarrier {
+            channel_layout: if dc_shift_requested {
+                Some(if stereo_fold_requested { "0x3".to_string() } else {
+                    stereo_fold_layout.clone().ok_or_else(||
+                        "DSD native DC output lost its verified speaker layout".to_string())?
+                })
+            } else { None },
             path: carrier_path,
             source_path: original_source_path,
             sample_rate_hz: target_rate_hz,
@@ -65749,6 +65955,7 @@ mod conversion_log_tests {
         source.tracks.truncate(1);
         let prepared = &mut source.tracks[0];
         prepared.source_ref = TrackSourceRef::RegisteredEffectCarrier {
+            channel_layout: None,
             path: carrier_path,
             source_path: source_path.clone(),
             sample_rate_hz: 44_100,
@@ -71081,6 +71288,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             .expect("retained album-gain carrier");
         let single_file_track_id = fixture.album.source.tracks[0].id.clone();
         fixture.album.source.tracks[0].source_ref = TrackSourceRef::DsdTruePeakCarrier {
+            channel_layout: None,
             path: retained_carrier,
             source_path: a_source.clone(),
             sample_rate_hz: 176_400,
@@ -71633,6 +71841,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         fixture.album.req.container = iso.clone();
         fixture.album.source.container = iso.clone();
         fixture.album.source.tracks[0].source_ref = TrackSourceRef::DsdTruePeakCarrier {
+            channel_layout: None,
             path: carrier,
             source_path: iso.clone(),
             sample_rate_hz: 176_400,
@@ -72055,6 +72264,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         std::fs::write(&carrier, b"raw f64 carrier").expect("carrier fixture");
         fixture.album.source.container = original_dsd.clone();
         fixture.album.source.tracks[0].source_ref = TrackSourceRef::DsdTruePeakCarrier {
+            channel_layout: None,
             path: carrier.clone(),
             source_path: original_dsd.clone(),
             sample_rate_hz: 176_400,
@@ -72270,6 +72480,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
         std::fs::write(&carrier, b"carrier provenance only").expect("carrier fixture");
         fixture.album.source.container = original_dsd.clone();
         fixture.album.source.tracks[0].source_ref = TrackSourceRef::DsdTruePeakCarrier {
+            channel_layout: None,
             path: carrier,
             source_path: original_dsd.clone(),
             sample_rate_hz: 176_400,
@@ -74143,6 +74354,7 @@ mod chunk_2_1_3_postprocessing_gate_and_phase_tests {
             plan_scope: tonepoet_pipeline::PlanScope::track("issue-65-reference"),
             intermediate_dir: Some(f._temp.path().join("reference-work")),
             container_ffmpeg_flags: Vec::new(),
+            raw_input_channel_layout: None,
             resolved_output_target: Some(ResolvedOutputTarget::FlacNative),
             reference_programme_scope: ReferenceProgrammeScope::Singleton,
             planned_riff_non_audio_upper_bound_bytes: Some(0),

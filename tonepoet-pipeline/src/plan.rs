@@ -122,6 +122,11 @@ pub struct PlanRequest {
     /// Inserted before the output path in the ffmpeg command. Empty for most containers.
     #[cfg_attr(feature = "serde", serde(default))]
     pub container_ffmpeg_flags: Vec<String>,
+    /// Speaker layout of an internal raw Float64 carrier. For multichannel DC
+    /// paths the caller binds this from source roles before raw I/O erases them.
+    /// Input-only; never part of user-selected output/container flags.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub raw_input_channel_layout: Option<String>,
     /// Exact format/container product identity resolved by the trusted catalog.
     #[cfg_attr(feature = "serde", serde(default))]
     pub resolved_output_target: Option<ResolvedOutputTarget>,
@@ -3613,6 +3618,7 @@ mod phase2_gain_and_reference_planning_tests {
             plan_scope: crate::plan::PlanScope::submitted_batch("test-submission", "test-track", Some(1)),
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
+            raw_input_channel_layout: None,
             resolved_output_target: None,
             reference_programme_scope: Default::default(),
             planned_riff_non_audio_upper_bound_bytes: None,
@@ -3722,6 +3728,7 @@ mod ordinary_lossy_rate_resolution_tests {
             plan_scope: crate::plan::PlanScope::track("test-track"),
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
+            raw_input_channel_layout: None,
         }
     }
 
@@ -3754,6 +3761,7 @@ mod ordinary_lossy_rate_resolution_tests {
             plan_scope: crate::plan::PlanScope::track("test-track"),
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
+            raw_input_channel_layout: None,
         }
     }
 
@@ -4074,6 +4082,7 @@ mod metadata_pruning_tests {
             plan_scope: crate::plan::PlanScope::track("test-track"),
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
+            raw_input_channel_layout: None,
         }
     }
 
@@ -4269,6 +4278,7 @@ mod phase2_retained_gain_carrier_planning_tests {
             plan_scope: crate::plan::PlanScope::track("test-track"),
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
+            raw_input_channel_layout: None,
         }
     }
 
@@ -4628,6 +4638,7 @@ mod stage_a_lowering_selection_diagnostics {
             plan_scope: PlanScope::track(format!("stage-a-{route}")),
             intermediate_dir: Some(PathBuf::from(format!("{route}-work")),),
             container_ffmpeg_flags: Vec::new(),
+            raw_input_channel_layout: None,
             resolved_output_target: None,
             reference_programme_scope: Default::default(),
             planned_riff_non_audio_upper_bound_bytes: None,
@@ -5086,6 +5097,7 @@ mod source_float_source_depth_policy_tests {
             plan_scope: PlanScope::track("source-float-source-depth"),
             intermediate_dir: Some(PathBuf::from("work")),
             container_ffmpeg_flags: Vec::new(),
+            raw_input_channel_layout: None,
             resolved_output_target: None,
             reference_programme_scope: Default::default(),
             planned_riff_non_audio_upper_bound_bytes: None,

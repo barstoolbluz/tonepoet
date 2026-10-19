@@ -1707,6 +1707,21 @@ fn ffmpeg_base_input_args(
             "-ac".into(),
             channels.to_string(),
         ]);
+        if let Some(layout) = context.request.raw_input_channel_layout.as_deref() {
+            let mask = layout.strip_prefix("0x")
+                .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+                .filter(|mask| *mask != 0 && mask.count_ones() == u32::from(channels))
+                .ok_or_else(|| PlanningError::invalid_source(
+                    "channel_layout", "bound raw Float64 speaker mask does not match input geometry"
+                ))?;
+            if mask > 0x7ff || channels > 8 {
+                return Err(PlanningError::invalid_source(
+                    "channel_layout", "bound speaker mask contains unsupported physical roles"
+                ));
+            }
+            // Input-side override; never place this after -i or infer from -ac.
+            args.extend(["-channel_layout".into(), layout.to_string()]);
+        }
     }
     args.extend([
         "-i".into(),
@@ -2732,6 +2747,7 @@ mod tests {
             plan_scope: crate::plan::PlanScope::track("test-track"),
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
+            raw_input_channel_layout: None,
         };
         let context = request.context();
         let step = PlanStep::new(
@@ -2801,6 +2817,7 @@ mod tests {
             plan_scope: crate::plan::PlanScope::track("test-track"),
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
+            raw_input_channel_layout: None,
         }
     }
 
@@ -3329,6 +3346,43 @@ mod tests {
                 .filter(|pair| pair[0] == "gain" && pair[1] == "2.125000000")
                 .count();
             assert_eq!(count, expected_count, "{:?}", command.args);
+        }
+    }
+
+    #[test]
+    fn internal_float64_correction_preserves_verified_multichannel_speaker_roles() {
+        // Regression: a headerless three-channel stream must not be rebranded
+        // as 2.1, and quadraphonic rear samples must not become 4.0 speakers.
+        for (channels, mask) in [(3, "0x7"), (4, "0x33"), (5, "0x3b")] {
+            let mut request = album_gain_pcm_request(AudioFormat::Flac);
+            request.source.channels = Some(channels);
+            request.raw_input_channel_layout = Some(mask.to_string());
+            let step = album_gain_encode_step(AudioFormat::Flac, false);
+            let command = build_ffmpeg_encode_pcm(
+                &request.context(), &step, &AudioFormat::Flac,
+                None, PcmBitDepth::Int24, false,
+            ).expect("FFmpeg must accept the verified raw input layout");
+            let layout_position = command.args.iter().position(|arg| arg == "-channel_layout")
+                .expect("speaker mask must be explicitly bound on raw input");
+            let input_position = command.args.iter().position(|arg| arg == "-i")
+                .expect("FFmpeg raw carrier input");
+            assert!(layout_position < input_position, "-channel_layout is input-scoped");
+            assert_eq!(command.args[layout_position + 1], mask);
+            assert_arg(&command.args, "-ac", &channels.to_string());
+        }
+    }
+
+    #[test]
+    fn invalid_raw_float64_speaker_masks_are_not_guessed() {
+        let mut request = album_gain_pcm_request(AudioFormat::Flac);
+        request.source.channels = Some(3);
+        let step = album_gain_encode_step(AudioFormat::Flac, false);
+        for layout in ["0x3", "0x0", "0xffff", "quad"] {
+            request.raw_input_channel_layout = Some(layout.to_string());
+            assert!(build_ffmpeg_encode_pcm(
+                &request.context(), &step, &AudioFormat::Flac,
+                None, PcmBitDepth::Int24, false,
+            ).is_err(), "invalid/unverified raw speaker geometry: {layout}");
         }
     }
 
@@ -4327,6 +4381,7 @@ mod tests {
             plan_scope: crate::plan::PlanScope::track("test-track"),
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
+            raw_input_channel_layout: None,
         };
         let step = |apply_processing: bool| {
             PlanStep::new(
@@ -4424,6 +4479,7 @@ mod tests {
             plan_scope: crate::plan::PlanScope::track("test-track"),
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
+            raw_input_channel_layout: None,
         };
         assert!(
             FfmpegPlugin
@@ -4561,6 +4617,7 @@ mod tests {
             plan_scope: crate::plan::PlanScope::track("test-track"),
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
+            raw_input_channel_layout: None,
         };
         let step = PlanStep::new(
             0,
@@ -4612,6 +4669,7 @@ mod tests {
             plan_scope: crate::plan::PlanScope::track("test-track"),
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
+            raw_input_channel_layout: None,
         };
         let step = PlanStep::new(
             0,
@@ -4667,6 +4725,7 @@ mod tests {
             plan_scope: crate::plan::PlanScope::track("test-track"),
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
+            raw_input_channel_layout: None,
         };
         let aac_step = PlanStep::new(
             0,
@@ -4696,6 +4755,7 @@ mod tests {
             plan_scope: crate::plan::PlanScope::track("test-track"),
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
+            raw_input_channel_layout: None,
         };
         let alac_step = PlanStep::new(
             0,
@@ -4746,6 +4806,7 @@ mod tests {
             plan_scope: crate::plan::PlanScope::track("test-track"),
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
+            raw_input_channel_layout: None,
         };
         let context = request.context();
         let step = PlanStep::new(
@@ -4864,6 +4925,7 @@ mod tests {
             plan_scope: crate::plan::PlanScope::track("test-track"),
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
+            raw_input_channel_layout: None,
         };
         let context = request.context();
         let step = PlanStep::new(
@@ -4936,6 +4998,7 @@ mod tests {
             plan_scope: crate::plan::PlanScope::track("test-track"),
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
+            raw_input_channel_layout: None,
         };
         let context = request.context();
         let step = PlanStep::new(
@@ -5007,6 +5070,7 @@ mod tests {
             plan_scope: crate::plan::PlanScope::track("test-track"),
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
+            raw_input_channel_layout: None,
         };
         let context = request.context();
         let step = PlanStep::new(
@@ -5100,6 +5164,7 @@ mod tests {
             plan_scope: crate::plan::PlanScope::track("test-track"),
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
+            raw_input_channel_layout: None,
         };
         let context = request.context();
         let step = PlanStep::new(
@@ -5169,6 +5234,7 @@ mod tests {
             plan_scope: crate::plan::PlanScope::track("test-track"),
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
+            raw_input_channel_layout: None,
         };
         let context = request.context();
         let step = PlanStep::new(
@@ -5318,6 +5384,7 @@ mod tests {
             plan_scope: crate::plan::PlanScope::track("test-track"),
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
+            raw_input_channel_layout: None,
             resolved_output_target: None,
             reference_programme_scope: Default::default(),
             planned_riff_non_audio_upper_bound_bytes: None,

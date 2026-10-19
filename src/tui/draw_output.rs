@@ -152,14 +152,39 @@ pub fn draw_format_pane(
                         row_focused,
                         theme,
                     )),
-                    FormatField::RemoveDcOffset => lines.push(pill_row(
-                        border_color,
-                        w,
-                        "DC removal ",
-                        "2 Hz HPF",
-                        &deemphasis_pill_spans(format_state.remove_dc_offset, row_focused, theme),
-                        row_focused,
-                        theme,
+                    FormatField::RemoveDcOffset => {
+                        let labels = dc_correction_labels(w);
+                        let selected = *format_state.dc_correction.selected_value();
+                        let mut spans = Vec::new();
+                        for (index, label) in labels.into_iter().enumerate() {
+                            if index != 0 { spans.push(Span::raw("  ")); }
+                            let active = match index {
+                                0 => selected == super::app::DcCorrectionMode::Off,
+                                1 => selected == super::app::DcCorrectionMode::AutoShift,
+                                2 => selected == super::app::DcCorrectionMode::HighPass,
+                                _ => selected == super::app::DcCorrectionMode::Manual,
+                            };
+                            let style = if active {
+                                Style::default().fg(theme.pill_active_fg).bg(theme.pill_active_bg)
+                                    .add_modifier(Modifier::BOLD)
+                            } else if row_focused { Style::default().fg(theme.text_muted) }
+                              else { Style::default().fg(theme.text_dim) };
+                            spans.push(Span::styled(label, style));
+                        }
+                        lines.push(pill_row(border_color, w, "DC offset  ", "ⓘ",
+                            &spans, row_focused, theme));
+                    }
+                    FormatField::DcManualValue => lines.push(pill_row(
+                        border_color, w, "DC amount  ",
+                        "normalized PCM; positive means subtract",
+                        &[Span::styled(
+                            format!(" {} ", format_state.true_peak_target_editing
+                                .filter(|field| *field == FormatField::DcManualValue)
+                                .map(|_| format_state.true_peak_target_input.text.as_str())
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| super::app::dc_offset_label(format_state.dc_manual_nanounits))),
+                            if row_focused { theme.bright() } else { theme.muted() })],
+                        row_focused, theme,
                     )),
                     FormatField::Deemphasis => {
                         let suffix = deemphasis_status_suffix(format_state);
@@ -182,8 +207,8 @@ pub fn draw_format_pane(
                         ));
                     }
                     FormatField::PcmTruePeak => lines.push(pill_row(
-                        border_color, w, "PCM gain   ", "",
-                        &render_pill_spans(&format_state.pcm_gain_mode, row_focused, theme),
+                        border_color, w, "PCM gain   ", "ⓘ",
+                        &pcm_gain_pill_spans(format_state, w, row_focused, theme),
                         row_focused, theme,
                     )),
                     FormatField::PcmGainDb => lines.push(dsd_db_value_row(
@@ -490,6 +515,16 @@ fn deemphasis_status_suffix(format_state: &FormatState) -> &'static str {
         (false, ConvertDeemphasisEvidence::CatalogExact) => {
             "ⓘ this pressing is known pre-emphasised: turn on to correct it."
         }
+    }
+}
+
+pub(super) fn dc_correction_labels(width: usize) -> [&'static str; 4] {
+    if width >= 66 {
+        [" off ", " auto shift ", " high-pass ", " manual "]
+    } else if width >= 52 {
+        [" off ", " auto ", " HPF ", " manual "]
+    } else {
+        [" O ", " A ", " H ", " M "]
     }
 }
 
@@ -816,6 +851,38 @@ fn dim_pill_spans<'a>(spans: &[Span<'a>],
         .iter()
         .map(|span| Span::styled(span.content.clone(), Style::default().fg(theme.text_dim)))
         .collect()
+}
+
+/// PCM gain uses the normal suffix information control, after the last pill.
+/// At narrow terminal widths the labels contract in stages, like the DC row.
+/// The renderer and hitbox registration share these exact labels; the full
+/// mode names remain available through the information control and keyboard.
+/// Four pills + three two-cell gaps + two-cell information delimiter +
+/// two-cell information glyph/guard must fit before the right border.
+pub(super) fn pcm_gain_pill_labels(width: usize) -> [&'static str; 4] {
+    if width >= 84 {
+        ["off", "true-peak guard", "true-peak normalize", "fixed gain"]
+    } else if width >= 64 {
+        ["off", "guard", "normalize", "fixed gain"]
+    } else if width >= 52 {
+        ["off", "guard", "norm", "fix"]
+    } else {
+        ["off", "G", "N", "F"]
+    }
+}
+
+fn pcm_gain_pill_spans(
+    format_state: &FormatState,
+    width: usize,
+    focused: bool,
+    theme: super::theme::Theme,
+) -> Vec<Span<'static>> {
+    let mut spans = render_pill_spans(&format_state.pcm_gain_mode, focused, theme);
+    for (index, label) in pcm_gain_pill_labels(width).iter().enumerate() {
+        // Keep the common pill painter's selection, enabled and focus styles.
+        spans[index * 2].content = format!(" {label} ").into();
+    }
+    spans
 }
 
 fn pill_row<'a>(
@@ -1165,6 +1232,47 @@ mod r32_true_peak_help_renderer_tests {
             assert_eq!(text.contains("lossy encoder input capped"), lossy_capped && !editing);
             if editing {
                 assert!(text.contains("Enter: apply"));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod pcm_gain_info_glyph_tests {
+    use super::*;
+
+    #[test]
+    fn pcm_gain_info_follows_all_four_pills_with_foreground_only_unicode_guard() {
+        use crate::config::TonepoetConfig;
+        let app = super::super::app::AppState::new_for_test(TonepoetConfig::default());
+        for palette in super::super::theme::palettes() {
+            let theme = super::super::theme::theme_by_slug(palette.slug)
+                .expect("shipped theme");
+            for width in [42, 44, 51, 52, 63, 64, 80, 83, 84, 120] {
+                for focused in [false, true] {
+                    let pills = pcm_gain_pill_spans(&app.convert.format, width, focused, theme);
+                    let plain = pill_row(theme.green, width, "PCM gain   ", "",
+                        &pills, focused, theme);
+                    let with_info = pill_row(theme.green, width, "PCM gain   ", "ⓘ",
+                        &pills, focused, theme);
+                    let index = with_info.spans.iter().position(|span|
+                        span.content.as_ref() == "ⓘ ").expect("glyph and guard cell");
+                    let info = &with_info.spans[index];
+                    let expected_fg = if theme.dark { theme.info } else { theme.value };
+                    assert_eq!(info.style.fg, Some(expected_fg));
+                    assert_eq!(info.style.bg, None, "no filled icon background");
+                    assert!(info.style.add_modifier.contains(Modifier::BOLD));
+                    assert!(super::super::theme::contrast_ratio(expected_fg, theme.panel_bg) >= 4.5);
+                    assert_eq!(with_info.spans[1].content, plain.spans[1].content,
+                        "the original label span must be left untouched");
+                    // Pill styles and positions are identical with and without help.
+                    assert_eq!(with_info.spans[..1 + pills.len() + 1],
+                        plain.spans[..1 + pills.len() + 1]);
+                    assert_eq!(index, 2 + pills.len() + 1,
+                        "information follows the final pill and separator");
+                    assert_eq!(Line::from(with_info.spans.clone()).width(), width,
+                        "responsive labels keep the suffix inside the pane");
+                }
             }
         }
     }

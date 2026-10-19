@@ -1,0 +1,29 @@
+Baseline archive SHA-256: ba4e5c6d7b73fd387886e9cde818fc630c019e89f778041952e7b8c2006120a0
+Integrity manifest is relative to tonepoet/; itself not listed.
+
+MODIFIED EXISTING (12):
+src/convert/pipeline/execution_evidence.rs
+src/convert/pipeline/mod.rs
+src/convert/pipeline/stages.rs
+src/tui/app.rs
+src/tui/button_map.rs
+src/tui/command.rs
+src/tui/convert_screen.rs
+src/tui/draw_output.rs
+src/tui/keybindings.rs
+src/tui/presets.rs
+tonepoet-pipeline/src/fingerprint.rs
+tonepoet-pipeline/src/semantic_plan.rs
+
+ADDED (8):
+DC_SHIFT_R2_CHECKPOINT.md
+DC_SHIFT_R2_ENGINEERING_HANDOFF.md
+DC_SHIFT_R2_IMPLEMENTATION_BRIEF.md
+DC_SHIFT_R2_SHA256SUMS.txt
+DC_SHIFT_R2_SOURCE_CHANGE_INVENTORY.txt
+DC_SHIFT_R2_TRANSPORT_DIAGNOSTIC.txt
+src/convert/pipeline/dc_shift.rs
+tools/dc_shift_transport_probe.py
+
+REMOVED (0):
+

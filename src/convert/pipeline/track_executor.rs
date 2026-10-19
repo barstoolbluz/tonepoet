@@ -12531,6 +12531,7 @@ mod tests {
             ),
         );
         let mut track = metadata_test_track(TrackSourceRef::PcmTruePeakCarrier {
+            channel_layout: None,
             path: root.join("carrier.f64le"),
             source_path: root.join("source.wv"),
             sample_rate_hz: carrier_rate_hz,
@@ -13352,6 +13353,7 @@ mod tests {
             plan_scope: tonepoet_pipeline::PlanScope::track("test-track"),
             intermediate_dir: Some(PathBuf::from("work")),
             container_ffmpeg_flags: Vec::new(),
+            raw_input_channel_layout: None,
             resolved_output_target: Some(target),
             reference_programme_scope: tonepoet_pipeline::ReferenceProgrammeScope::Singleton,
             // RIFF-family targets require the planner size-bound preflight;
@@ -14371,6 +14373,7 @@ mod tests {
             )
         };
         let mut track = metadata_test_track(TrackSourceRef::PcmTruePeakCarrier {
+            channel_layout: None,
             path: root.join("carrier.f64le"),
             source_path: root.join("source.wav"),
             sample_rate_hz: 48_000,
@@ -14434,6 +14437,7 @@ mod tests {
             plan_scope: tonepoet_pipeline::PlanScope::track("terminal-binding-test"),
             intermediate_dir: Some(root.join("work")),
             container_ffmpeg_flags: Vec::new(),
+            raw_input_channel_layout: None,
             resolved_output_target: None,
             reference_programme_scope: tonepoet_pipeline::ReferenceProgrammeScope::Singleton,
             planned_riff_non_audio_upper_bound_bytes: None,
@@ -15895,6 +15899,7 @@ mod tests {
             plan_scope: tonepoet_pipeline::PlanScope::track("test-track"),
             intermediate_dir: Some(work_dir.to_path_buf()),
             container_ffmpeg_flags: Vec::new(),
+            raw_input_channel_layout: None,
             resolved_output_target: Some(tonepoet_pipeline::ResolvedOutputTarget::WavW64),
             reference_programme_scope: tonepoet_pipeline::ReferenceProgrammeScope::Singleton,
             planned_riff_non_audio_upper_bound_bytes: Some(0),

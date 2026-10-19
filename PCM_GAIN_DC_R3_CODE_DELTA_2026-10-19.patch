@@ -1,0 +1,300 @@
+--- a/tonepoet-pipeline/src/semantic_plan.rs
++++ b/tonepoet-pipeline/src/semantic_plan.rs
+@@ -7163,23 +7163,46 @@
+         request.source.channels = Some(3);
+         request.settings.dither_type = DitherType::None;
+         request.settings.dither_explicit = true;
++        let folded_dc = explicit_effect_sequence([
++            RegisteredUnaryEffect::StereoFold,
++            RegisteredUnaryEffect::DcShiftManual { offset_nanounits: 3_000_000 },
++        ]);
+         for effects in [
+             Vec::new(),
+             explicit_effect_sequence([RegisteredUnaryEffect::RemoveDcOffset]),
+-            explicit_effect_sequence([
+-                RegisteredUnaryEffect::StereoFold,
+-                RegisteredUnaryEffect::DcShiftManual { offset_nanounits: 3_000_000 },
+-            ]),
++            folded_dc.clone(),
+         ] {
+             let PlanningOutcome::Ready(plan) =
+                 plan_typed_with_effects(&request, &effects).expect("bounded planning")
+-            else { panic!("previously admitted route must stay admitted") };
++            else { panic!("legacy or post-fold stereo route must stay admitted") };
+             let (selected, _) = selected_pcm_terminal(&plan);
+-            assert_eq!(selected.tool, Some(ToolIdentifier::Sox));
+-            assert!(!selected.contract.runtime_obligations.contains(
+-                MULTICHANNEL_DC_RAW_LAYOUT_CONTRACT
+-            ));
+-        }
++            assert!(selected.contract.terminal_proof.is_some(),
++                "true-peak ceiling must remain bound to the selected terminal");
++            // The raw-layout obligation is not applicable to *any* candidate
++            // in these paths. Auto may legitimately select either admitted
++            // terminal; its normal preference is not this constraint's API.
++            for node in &plan.nodes {
++                if let TypedPlanNode::Operation {
++                    operation: PlanOperation::EncodePcm { .. }, candidates, ..
++                } = node {
++                    assert!(candidates.iter().all(|candidate|
++                        !candidate.contract.runtime_obligations.contains(
++                            MULTICHANNEL_DC_RAW_LAYOUT_CONTRACT)),
++                        "unrelated terminals must not acquire a multichannel DC obligation");
++                }
++            }
++        }
++        // A deliberate SoX preference remains admissible after folding.
++        // This catches a leaked FFmpeg-only requirement without assuming
++        // that Auto selected SoX in the original registry.
++        request.settings.preferred_tool = PreferredTool::Sox;
++        let PlanningOutcome::Ready(plan) =
++            plan_typed_with_effects(&request, &folded_dc).expect("bounded planning")
++        else { panic!("post-fold stereo must not be forced through FFmpeg") };
++        let (terminal, _) = selected_pcm_terminal(&plan);
++        assert_eq!(terminal.tool, Some(ToolIdentifier::Sox));
++        assert!(!terminal.contract.runtime_obligations.contains(
++            MULTICHANNEL_DC_RAW_LAYOUT_CONTRACT));
+     }
+ 
+     #[test]
+--- a/src/tui/convert_screen.rs
++++ b/src/tui/convert_screen.rs
+@@ -348,13 +348,22 @@
+             }
+             FormatField::ReplayGain => register_pill_row(buttons, &state.replaygain, y, label_col, TuiButton::ReplayGainPill),
+             FormatField::PcmTruePeak => {
+-                register_pill_row(buttons, &state.pcm_gain_mode, y, label_col,
+-                    TuiButton::PcmTruePeakPill);
+-                if area.width >= 30 && area.height >= 6 {
+-                    // The literal U+24D8 plus its same-style guard cell occupy
+-                    // two otherwise unused label cells. No pill is displaced.
++                let labels = super::draw_output::pcm_gain_pill_labels(area.width as usize);
++                let pane_right = area.x.saturating_add(area.width).saturating_sub(1);
++                let mut x = label_col;
++                for (index, label) in labels.iter().enumerate() {
++                    let len = label.len() as u16 + 2; // pill padding
++                    if x.saturating_add(len) <= pane_right {
++                        buttons.record_button(TuiButton::PcmTruePeakPill(index),
++                            Rect::new(x, y, len, 1));
++                    }
++                    x = x.saturating_add(len + 2); // two-cell gap after each pill
++                }
++                // The common pill_row suffix places U+24D8 two cells after
++                // the last pill; its guard cell is part of the same hitbox.
++                if x.saturating_add(2) <= pane_right {
+                     buttons.record_button(TuiButton::PcmGainInfo,
+-                        Rect::new(area.x + 13, y, 2, 1));
++                        Rect::new(x, y, 2, 1));
+                 }
+             }
+             FormatField::PcmGainDb => buttons.record_button(
+@@ -971,9 +980,43 @@
+                         .map(|y| row_text(&notice_terminal, y, width)).collect();
+                     assert!(displayed.contains("DC offset correction"));
+                     assert!(displayed.contains("Recommended unless"));
+-                    assert!(crate::tui::draw_overlays::notice_message_max_scroll(
++                    let tall_max_scroll = crate::tui::draw_overlays::notice_message_max_scroll(
+                         ratatui::layout::Rect::new(0, 0, width, height),
+-                        crate::tui::keybindings::DC_CORRECTION_INFO_MESSAGE) > 0);
++                        crate::tui::keybindings::DC_CORRECTION_INFO_MESSAGE);
++                    if tall_max_scroll == 0 {
++                        assert!(displayed.contains("This setting does not fix hum"),
++                            "a notice that fits must show its ending without scrolling");
++                    } else {
++                        // If help copy grows, it is still valid for this tall
++                        // terminal to scroll; the last paragraph must remain reachable.
++                        if let ActiveOverlay::Notice { scroll, .. } = &mut app.active_overlay {
++                            *scroll = tall_max_scroll;
++                        }
++                        notice_terminal.draw(|frame|
++                            crate::tui::draw::draw_ui(frame, &mut app)).unwrap();
++                        let final_page: String = (0..height)
++                            .map(|y| row_text(&notice_terminal, y, width)).collect();
++                        assert!(final_page.contains("This setting does not fix hum"));
++                    }
++                    // Scrolling is required only when the same content exceeds
++                    // the visible body height. Exercise the actual overlay at
++                    // a short terminal size, including its final paragraph.
++                    let short_height = 24;
++                    let max_scroll = crate::tui::draw_overlays::notice_message_max_scroll(
++                        ratatui::layout::Rect::new(0, 0, width, short_height),
++                        crate::tui::keybindings::DC_CORRECTION_INFO_MESSAGE);
++                    assert!(max_scroll > 0, "short terminals must scroll");
++                    if let ActiveOverlay::Notice { scroll, .. } = &mut app.active_overlay {
++                        *scroll = max_scroll;
++                    }
++                    let mut short_terminal = Terminal::new(
++                        TestBackend::new(width, short_height)).unwrap();
++                    short_terminal.draw(|frame|
++                        crate::tui::draw::draw_ui(frame, &mut app)).unwrap();
++                    let final_page: String = (0..short_height)
++                        .map(|y| row_text(&short_terminal, y, width)).collect();
++                    assert!(final_page.contains("This setting does not fix hum"),
++                        "scrolling to the bottom must expose the last paragraph");
+                 }
+             }
+         }
+@@ -1529,7 +1572,7 @@
+ 
+     #[test]
+     fn pcm_gain_info_is_visible_clickable_and_does_not_overlap_pills_at_narrow_widths() {
+-        for width in [44u16, 64, 80, 100, 120] {
++        for width in [44u16, 51, 52, 63, 64, 80, 83, 84, 100, 120] {
+             for mode in [PcmGainMode::Off, PcmGainMode::TruePeakGuard,
+                 PcmGainMode::TruePeakNormalize, PcmGainMode::FixedGain] {
+                 let height = 50;
+@@ -1546,7 +1589,7 @@
+                 let info_rect = app.button_map.find_button_rect(&TuiButton::PcmGainInfo)
+                     .expect("visible PCM gain information hitbox");
+                 assert_eq!((info_rect.x, info_rect.y, info_rect.width), (glyph_x, row, 2));
+-                assert_eq!(glyph_x, 13, "the icon uses spare label space, without moving pills");
++                assert!(glyph_x > 17, "the information control belongs after the pills");
+                 for x in glyph_x..glyph_x + 2 {
+                     assert_eq!(app.button_map.find_button_at(x, row), Some(TuiButton::PcmGainInfo));
+                 }
+@@ -1554,11 +1597,14 @@
+                     let pill = TuiButton::PcmTruePeakPill(index);
+                     let rect = app.button_map.find_button_rect(&pill).expect("original gain pill");
+                     assert_eq!(rect.y, row);
+-                    assert!(rect.x >= glyph_x + 2, "glyph may not overlap a gain pill");
+-                    if rect.x < width - 1 {
+-                        assert_eq!(app.button_map.find_button_at(rect.x, row), Some(pill));
+-                    }
++                    assert!(rect.x + rect.width + 2 <= glyph_x,
++                        "all four selectable pills must precede the information control");
++                    assert_eq!(app.button_map.find_button_at(rect.x, row), Some(pill));
+                 }
++                let last_pill = app.button_map.find_button_rect(
++                    &TuiButton::PcmTruePeakPill(3)).unwrap();
++                assert_eq!(glyph_x, last_pill.x + last_pill.width + 2,
++                    "the suffix follows the final pill by the common two-cell gap");
+                 let prior_gain = *app.convert.format.pcm_gain_mode.selected_value();
+                 let prior_db = app.convert.format.pcm_fixed_gain_db;
+                 let prior_ceiling = app.convert.format.pcm_true_peak_target_dbtp;
+--- a/src/tui/draw_output.rs
++++ b/src/tui/draw_output.rs
+@@ -206,9 +206,9 @@
+                             row_focused, theme,
+                         ));
+                     }
+-                    FormatField::PcmTruePeak => lines.push(pcm_gain_info_row(
+-                        border_color, w,
+-                        &render_pill_spans(&format_state.pcm_gain_mode, row_focused, theme),
++                    FormatField::PcmTruePeak => lines.push(pill_row(
++                        border_color, w, "PCM gain   ", "ⓘ",
++                        &pcm_gain_pill_spans(format_state, w, row_focused, theme),
+                         row_focused, theme,
+                     )),
+                     FormatField::PcmGainDb => lines.push(dsd_db_value_row(
+@@ -853,28 +853,36 @@
+         .collect()
+ }
+ 
+-/// The four PCM gain pills occupy the full row on narrow terminals. Put help
+-/// in the unused two cells of the label area, keeping every pill's original
+-/// position and clickable width. Both the glyph and its guard cell use the
+-/// established foreground-only information style.
+-fn pcm_gain_info_row<'a>(
+-    border_color: ratatui::style::Color,
++/// PCM gain uses the normal suffix information control, after the last pill.
++/// At narrow terminal widths the labels contract in stages, like the DC row.
++/// The renderer and hitbox registration share these exact labels; the full
++/// mode names remain available through the information control and keyboard.
++/// Four pills + three two-cell gaps + two-cell information delimiter +
++/// two-cell information glyph/guard must fit before the right border.
++pub(super) fn pcm_gain_pill_labels(width: usize) -> [&'static str; 4] {
++    if width >= 84 {
++        ["off", "true-peak guard", "true-peak normalize", "fixed gain"]
++    } else if width >= 64 {
++        ["off", "guard", "normalize", "fixed gain"]
++    } else if width >= 52 {
++        ["off", "guard", "norm", "fix"]
++    } else {
++        ["off", "G", "N", "F"]
++    }
++}
++
++fn pcm_gain_pill_spans(
++    format_state: &FormatState,
+     width: usize,
+-    pills: &[Span<'a>],
+     focused: bool,
+     theme: super::theme::Theme,
+-) -> Line<'a> {
+-    let mut row = pill_row(border_color, width, "PCM gain   ", "", pills, focused, theme);
+-    let label_style = if focused { theme.bright() } else { theme.muted() };
+-    let info_fg = if theme.dark { theme.info } else { theme.value };
+-    // Replace the existing 16-cell label span with 12 + 2 + 2 cells.
+-    // The first pill still starts at x=17 (including the left border).
+-    row.spans.splice(1..2, [
+-        Span::styled("   PCM gain ", label_style),
+-        Span::styled("ⓘ ", Style::default().fg(info_fg).add_modifier(Modifier::BOLD)),
+-        Span::styled("  ", label_style),
+-    ]);
+-    row
++) -> Vec<Span<'static>> {
++    let mut spans = render_pill_spans(&format_state.pcm_gain_mode, focused, theme);
++    for (index, label) in pcm_gain_pill_labels(width).iter().enumerate() {
++        // Keep the common pill painter's selection, enabled and focus styles.
++        spans[index * 2].content = format!(" {label} ").into();
++    }
++    spans
+ }
+ 
+ fn pill_row<'a>(
+@@ -1234,27 +1242,37 @@
+     use super::*;
+ 
+     #[test]
+-    fn pcm_gain_info_uses_foreground_only_contrasting_unicode_guard() {
++    fn pcm_gain_info_follows_all_four_pills_with_foreground_only_unicode_guard() {
++        use crate::config::TonepoetConfig;
++        let app = super::super::app::AppState::new_for_test(TonepoetConfig::default());
+         for palette in super::super::theme::palettes() {
+             let theme = super::super::theme::theme_by_slug(palette.slug)
+                 .expect("shipped theme");
+-            for focused in [false, true] {
+-                let plain = pill_row(theme.green, 80, "PCM gain   ", "",
+-                    &[Span::raw(" off ")], focused, theme);
+-                let with_info = pcm_gain_info_row(theme.green, 80,
+-                    &[Span::raw(" off ")], focused, theme);
+-                let info = with_info.spans.iter().find(|span|
+-                    span.content.as_ref() == "ⓘ ").expect("glyph and guard cell");
+-                let expected_fg = if theme.dark { theme.info } else { theme.value };
+-                assert_eq!(info.style.fg, Some(expected_fg));
+-                assert_eq!(info.style.bg, None, "no filled icon background");
+-                assert!(info.style.add_modifier.contains(Modifier::BOLD));
+-                assert!(super::super::theme::contrast_ratio(expected_fg, theme.panel_bg) >= 4.5);
+-                assert_eq!(Line::from(plain.spans.clone()).width(),
+-                    Line::from(with_info.spans.clone()).width(),
+-                    "information affordance must not change any pill positions");
+-                assert_eq!(with_info.spans[1..4].iter().map(Span::width).sum::<usize>(),
+-                    plain.spans[1].width());
++            for width in [42, 44, 51, 52, 63, 64, 80, 83, 84, 120] {
++                for focused in [false, true] {
++                    let pills = pcm_gain_pill_spans(&app.convert.format, width, focused, theme);
++                    let plain = pill_row(theme.green, width, "PCM gain   ", "",
++                        &pills, focused, theme);
++                    let with_info = pill_row(theme.green, width, "PCM gain   ", "ⓘ",
++                        &pills, focused, theme);
++                    let index = with_info.spans.iter().position(|span|
++                        span.content.as_ref() == "ⓘ ").expect("glyph and guard cell");
++                    let info = &with_info.spans[index];
++                    let expected_fg = if theme.dark { theme.info } else { theme.value };
++                    assert_eq!(info.style.fg, Some(expected_fg));
++                    assert_eq!(info.style.bg, None, "no filled icon background");
++                    assert!(info.style.add_modifier.contains(Modifier::BOLD));
++                    assert!(super::super::theme::contrast_ratio(expected_fg, theme.panel_bg) >= 4.5);
++                    assert_eq!(with_info.spans[1].content, plain.spans[1].content,
++                        "the original label span must be left untouched");
++                    // Pill styles and positions are identical with and without help.
++                    assert_eq!(with_info.spans[..1 + pills.len() + 1],
++                        plain.spans[..1 + pills.len() + 1]);
++                    assert_eq!(index, 2 + pills.len() + 1,
++                        "information follows the final pill and separator");
++                    assert_eq!(Line::from(with_info.spans.clone()).width(), width,
++                        "responsive labels keep the suffix inside the pane");
++                }
+             }
+         }
+     }

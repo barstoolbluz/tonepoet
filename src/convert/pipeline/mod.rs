@@ -13,6 +13,7 @@
 #![deny(unsafe_code)]
 
 pub(crate) mod dvda_channel_layout;
+pub(crate) mod dc_shift;
 pub(crate) mod dvda_demux;
 pub(crate) mod dvda_lpcm;
 pub(crate) mod dvda_mlp;

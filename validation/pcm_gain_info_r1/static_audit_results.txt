@@ -1,0 +1,16 @@
+PASS Four modes in correct order as plain-text standalone headings
+PASS Four distinct guidance paragraphs
+PASS Copy retains guard attenuation, normalization, gain signs, clipping
+PASS Copy reflects actual conditional auto defaults and lossy ceiling
+PASS Copy does not embed unsupported Markdown
+PASS One glyph plus same-foreground guard cell, high-contrast and no background
+PASS PCM gain pills unchanged; label-only replacement of equal width
+PASS Hitbox is two cells in previously empty label padding
+PASS PcmTruePeak drawing uses new icon while retaining original pills
+PASS Mouse/keyboard open exactly existing Notice and do not alter policy
+PASS Both existing focus and dismissal mechanics reused
+PASS Button classification exhaustive match includes info target
+PASS New actual ratatui tests cover render/hitboxes/keyboard/scroll/no settings mutation
+PASS Existing PCM gain policy untouched and true-peak guard behavior understood
+PASS Two-cell glyph always visible at all supported pane widths
+AUDIT: 15/15 PASS (source/geometry only; no Rust execution)

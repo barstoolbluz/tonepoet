@@ -306,8 +306,27 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
                 buttons, &state.output_channel_layout, y, label_col, TuiButton::ChannelLayoutPill,
             ),
             FormatField::RemoveDcOffset => {
-                buttons.record_button(TuiButton::RemoveDcPill(0), Rect::new(label_col, y, 5, 1));
-                buttons.record_button(TuiButton::RemoveDcPill(1), Rect::new(label_col + 7, y, 4, 1));
+                let labels = super::draw_output::dc_correction_labels(area.width as usize);
+                let mut x = label_col;
+                let pane_right = area.x.saturating_add(area.width).saturating_sub(1);
+                for (index, label) in labels.iter().enumerate() {
+                    let len = label.len() as u16;
+                    if x.saturating_add(len) <= pane_right {
+                        buttons.record_button(TuiButton::RemoveDcPill(index), Rect::new(x, y, len, 1));
+                    }
+                    x = x.saturating_add(len + 2);
+                }
+                // pill_row adds two cells before U+24D8; include glyph and
+                // same-foreground guard cell in a two-cell target.
+                if x.saturating_add(2) <= pane_right {
+                    buttons.record_button(TuiButton::DcInfo, Rect::new(x, y, 2, 1));
+                }
+            }
+            FormatField::DcManualValue => {
+                if label_col < area.x.saturating_add(area.width).saturating_sub(1) {
+                    buttons.record_button(TuiButton::DcManualValueField,
+                        Rect::new(label_col, y, area.x + area.width - label_col - 1, 1));
+                }
             }
             FormatField::Deemphasis => {
                 buttons.record_button(TuiButton::DeemphasisPill(0), Rect::new(label_col, y, 5, 1));
@@ -328,13 +347,25 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
                 buttons.record_button(TuiButton::HdcdInfo, Rect::new(label_col + 13, y, 2, 1));
             }
             FormatField::ReplayGain => register_pill_row(buttons, &state.replaygain, y, label_col, TuiButton::ReplayGainPill),
-            FormatField::PcmTruePeak => register_pill_row(
-                buttons,
-                &state.pcm_gain_mode,
-                y,
-                label_col,
-                TuiButton::PcmTruePeakPill,
-            ),
+            FormatField::PcmTruePeak => {
+                let labels = super::draw_output::pcm_gain_pill_labels(area.width as usize);
+                let pane_right = area.x.saturating_add(area.width).saturating_sub(1);
+                let mut x = label_col;
+                for (index, label) in labels.iter().enumerate() {
+                    let len = label.len() as u16 + 2; // pill padding
+                    if x.saturating_add(len) <= pane_right {
+                        buttons.record_button(TuiButton::PcmTruePeakPill(index),
+                            Rect::new(x, y, len, 1));
+                    }
+                    x = x.saturating_add(len + 2); // two-cell gap after each pill
+                }
+                // The common pill_row suffix places U+24D8 two cells after
+                // the last pill; its guard cell is part of the same hitbox.
+                if x.saturating_add(2) <= pane_right {
+                    buttons.record_button(TuiButton::PcmGainInfo,
+                        Rect::new(x, y, 2, 1));
+                }
+            }
             FormatField::PcmGainDb => buttons.record_button(
                 TuiButton::PcmGainDbField,
                 ratatui::layout::Rect::new(area.x, y, area.width, 1),
@@ -908,6 +939,109 @@ mod format_render_registration_tests {
     }
 
     #[test]
+    fn dc_info_hitbox_four_pills_and_readable_notice_at_terminal_widths() {
+        use crate::tui::app::DcCorrectionMode;
+        for width in [44u16, 52, 66, 96, 120] {
+            for mode in [DcCorrectionMode::Off, DcCorrectionMode::AutoShift,
+                DcCorrectionMode::HighPass, DcCorrectionMode::Manual] {
+                let height = 50;
+                let mut app = AppState::new_for_test(TonepoetConfig::default());
+                assert!(app.convert.format.dc_correction.select_value(&mode));
+                let terminal = render_deemphasis_info_case(&mut app, width, height);
+                let row = rendered_row(&terminal, width, height, "DC offset");
+                let glyph_x = rendered_symbol_x(&terminal, width, row, "ⓘ");
+                let rect = app.button_map.find_button_rect(&TuiButton::DcInfo)
+                    .expect("DC info must be a real hitbox");
+                assert_eq!((rect.x, rect.y, rect.width), (glyph_x, row, 2));
+                assert_eq!(app.button_map.find_button_at(glyph_x, row), Some(TuiButton::DcInfo));
+                assert_eq!(app.button_map.find_button_at(glyph_x + 1, row), Some(TuiButton::DcInfo));
+                for pill in 0..4 {
+                    let control = TuiButton::RemoveDcPill(pill);
+                    let rect = app.button_map.find_button_rect(&control)
+                        .expect("each visible DC pill has an independent hitbox");
+                    assert_eq!(rect.y, row);
+                    assert!(rect.x + rect.width <= glyph_x);
+                    assert_eq!(app.button_map.find_button_at(rect.x, row), Some(control));
+                }
+                let (tx, _rx) = tokio::sync::mpsc::channel(1);
+                crate::tui::keybindings::handle_mouse(&mut app, MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: glyph_x, row, modifiers: KeyModifiers::NONE,
+                }, &tx);
+                assert!(matches!(app.active_overlay,
+                    ActiveOverlay::Notice { ref title, ref message, scroll: 0 }
+                        if title == "DC offset correction"
+                        && message == crate::tui::keybindings::DC_CORRECTION_INFO_MESSAGE));
+                if width == 96 && mode == DcCorrectionMode::Off {
+                    let mut notice_terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                    notice_terminal.draw(|frame|
+                        crate::tui::draw::draw_ui(frame, &mut app)).unwrap();
+                    let displayed: String = (0..height)
+                        .map(|y| row_text(&notice_terminal, y, width)).collect();
+                    assert!(displayed.contains("DC offset correction"));
+                    assert!(displayed.contains("Recommended unless"));
+                    let tall_max_scroll = crate::tui::draw_overlays::notice_message_max_scroll(
+                        ratatui::layout::Rect::new(0, 0, width, height),
+                        crate::tui::keybindings::DC_CORRECTION_INFO_MESSAGE);
+                    if tall_max_scroll == 0 {
+                        assert!(displayed.contains("This setting does not fix hum"),
+                            "a notice that fits must show its ending without scrolling");
+                    } else {
+                        // If help copy grows, it is still valid for this tall
+                        // terminal to scroll; the last paragraph must remain reachable.
+                        if let ActiveOverlay::Notice { scroll, .. } = &mut app.active_overlay {
+                            *scroll = tall_max_scroll;
+                        }
+                        notice_terminal.draw(|frame|
+                            crate::tui::draw::draw_ui(frame, &mut app)).unwrap();
+                        let final_page: String = (0..height)
+                            .map(|y| row_text(&notice_terminal, y, width)).collect();
+                        assert!(final_page.contains("This setting does not fix hum"));
+                    }
+                    // Scrolling is required only when the same content exceeds
+                    // the visible body height. Exercise the actual overlay at
+                    // a short terminal size, including its final paragraph.
+                    let short_height = 24;
+                    let max_scroll = crate::tui::draw_overlays::notice_message_max_scroll(
+                        ratatui::layout::Rect::new(0, 0, width, short_height),
+                        crate::tui::keybindings::DC_CORRECTION_INFO_MESSAGE);
+                    assert!(max_scroll > 0, "short terminals must scroll");
+                    if let ActiveOverlay::Notice { scroll, .. } = &mut app.active_overlay {
+                        *scroll = max_scroll;
+                    }
+                    let mut short_terminal = Terminal::new(
+                        TestBackend::new(width, short_height)).unwrap();
+                    short_terminal.draw(|frame|
+                        crate::tui::draw::draw_ui(frame, &mut app)).unwrap();
+                    let final_page: String = (0..short_height)
+                        .map(|y| row_text(&short_terminal, y, width)).collect();
+                    assert!(final_page.contains("This setting does not fix hum"),
+                        "scrolling to the bottom must expose the last paragraph");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dc_manual_edit_row_only_appears_in_manual_mode() {
+        use crate::tui::app::DcCorrectionMode;
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let _ = render_deemphasis_info_case(&mut app, 100, 50);
+        assert!(app.button_map.find_button_rect(&TuiButton::DcManualValueField).is_none());
+        assert!(app.convert.format.dc_correction.select_value(&DcCorrectionMode::Manual));
+        let terminal = render_deemphasis_info_case(&mut app, 100, 50);
+        let row = rendered_row(&terminal, 100, 50, "DC amount");
+        let rect = app.button_map.find_button_rect(&TuiButton::DcManualValueField).unwrap();
+        assert_eq!(rect.y, row);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        crate::tui::keybindings::handle_mouse(&mut app, MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x, row, modifiers: KeyModifiers::NONE,
+        }, &tx);
+        assert_eq!(app.convert.format.true_peak_target_editing, Some(FormatField::DcManualValue));
+    }
+
+    #[test]
     fn catalog_deemphasis_info_hitbox_tracks_rendered_icon_and_opens_notice() {
         const WIDTH: u16 = 120;
         const HEIGHT: u16 = 48;
@@ -1406,5 +1540,146 @@ mod format_render_registration_tests {
             .map(|y| row_text(&terminal, y, WIDTH))
             .collect();
         assert!(!all_text.contains("TP target"));
+    }
+}
+
+#[cfg(test)]
+mod pcm_gain_info_regressions {
+    use super::*;
+    use crate::config::TonepoetConfig;
+    use crate::tui::app::{ActiveOverlay, AppScreen, PcmGainMode};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn render(app: &mut AppState, width: u16, height: u16) -> Terminal<TestBackend> {
+        let theme = crate::tui::theme::theme_by_slug(
+            crate::tui::theme::default_theme_slug(),
+        ).expect("default theme");
+        app.current_screen = AppScreen::Convert;
+        app.convert.focus = ConvertFocus::Format;
+        app.convert.layout = ConvertLayout::Maximized(ConvertFocus::Format);
+        app.button_map.clear();
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal.draw(|frame| draw_convert_screen(frame, frame.size(), app, theme))
+            .expect("draw maximized Format pane");
+        terminal
+    }
+
+    fn rendered_text(terminal: &Terminal<TestBackend>, width: u16, y: u16) -> String {
+        (0..width).map(|x| terminal.backend().buffer().get(x, y).symbol().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn pcm_gain_info_is_visible_clickable_and_does_not_overlap_pills_at_narrow_widths() {
+        for width in [44u16, 51, 52, 63, 64, 80, 83, 84, 100, 120] {
+            for mode in [PcmGainMode::Off, PcmGainMode::TruePeakGuard,
+                PcmGainMode::TruePeakNormalize, PcmGainMode::FixedGain] {
+                let height = 50;
+                let mut app = AppState::new_for_test(TonepoetConfig::default());
+                assert!(app.convert.format.pcm_gain_mode.select_value(&mode));
+                app.convert.format.field_focus = FormatField::PcmTruePeak;
+                let terminal = render(&mut app, width, height);
+                let row = (0..height).find(|&y|
+                    rendered_text(&terminal, width, y).contains("PCM gain"))
+                    .expect("PCM gain row visible in maximized Format pane");
+                let glyph_x = (0..width).find(|&x|
+                    terminal.backend().buffer().get(x, row).symbol() == "ⓘ")
+                    .expect("literal U+24D8 drawn even when pills extend beyond pane");
+                let info_rect = app.button_map.find_button_rect(&TuiButton::PcmGainInfo)
+                    .expect("visible PCM gain information hitbox");
+                assert_eq!((info_rect.x, info_rect.y, info_rect.width), (glyph_x, row, 2));
+                assert!(glyph_x > 17, "the information control belongs after the pills");
+                for x in glyph_x..glyph_x + 2 {
+                    assert_eq!(app.button_map.find_button_at(x, row), Some(TuiButton::PcmGainInfo));
+                }
+                for index in 0..4 {
+                    let pill = TuiButton::PcmTruePeakPill(index);
+                    let rect = app.button_map.find_button_rect(&pill).expect("original gain pill");
+                    assert_eq!(rect.y, row);
+                    assert!(rect.x + rect.width + 2 <= glyph_x,
+                        "all four selectable pills must precede the information control");
+                    assert_eq!(app.button_map.find_button_at(rect.x, row), Some(pill));
+                }
+                let last_pill = app.button_map.find_button_rect(
+                    &TuiButton::PcmTruePeakPill(3)).unwrap();
+                assert_eq!(glyph_x, last_pill.x + last_pill.width + 2,
+                    "the suffix follows the final pill by the common two-cell gap");
+                let prior_gain = *app.convert.format.pcm_gain_mode.selected_value();
+                let prior_db = app.convert.format.pcm_fixed_gain_db;
+                let prior_ceiling = app.convert.format.pcm_true_peak_target_dbtp;
+                let prior_override = app.convert.format.pcm_gain_overridden;
+                let (tx, _rx) = tokio::sync::mpsc::channel(8);
+                crate::tui::keybindings::handle_mouse(&mut app, MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left), column: glyph_x + 1,
+                    row, modifiers: KeyModifiers::NONE,
+                }, &tx);
+                assert!(matches!(&app.active_overlay, ActiveOverlay::Notice { title, message, scroll }
+                    if title == "PCM gain"
+                    && message == crate::tui::keybindings::PCM_GAIN_INFO_MESSAGE
+                    && *scroll == 0));
+                assert_eq!(*app.convert.format.pcm_gain_mode.selected_value(), prior_gain);
+                assert_eq!(app.convert.format.pcm_fixed_gain_db, prior_db);
+                assert_eq!(app.convert.format.pcm_true_peak_target_dbtp, prior_ceiling);
+                assert_eq!(app.convert.format.pcm_gain_overridden, prior_override);
+                crate::tui::keybindings::handle_key(&mut app,
+                    KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+                assert!(matches!(app.active_overlay, ActiveOverlay::None));
+                assert_eq!(app.convert.format.field_focus, FormatField::PcmTruePeak);
+                crate::tui::keybindings::handle_key(&mut app,
+                    KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE), &tx);
+                assert!(matches!(app.active_overlay, ActiveOverlay::Notice { .. }),
+                    "focused PCM gain row also opens help by keyboard");
+                crate::tui::keybindings::handle_key(&mut app,
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+                assert!(matches!(app.active_overlay, ActiveOverlay::None));
+                assert_eq!(*app.convert.format.pcm_gain_mode.selected_value(), prior_gain);
+            }
+        }
+    }
+
+    #[test]
+    fn pcm_gain_notice_is_readable_and_scrolls_to_fixed_gain_without_markdown() {
+        const WIDTH: u16 = 80;
+        const HEIGHT: u16 = 24;
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.convert.format.field_focus = FormatField::PcmTruePeak;
+        // Render the larger Format screen first, then use the actual Notice overlay renderer.
+        let _ = render(&mut app, WIDTH, 50);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        crate::tui::keybindings::handle_key(&mut app,
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE), &tx);
+        let message = crate::tui::keybindings::PCM_GAIN_INFO_MESSAGE;
+        let headings = ["Off\n", "True-peak guard\n", "True-peak normalize\n", "Fixed gain\n"];
+        let positions = headings.map(|heading| message.find(heading).expect("help heading"));
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "all four headings must appear in the correct order");
+        assert_eq!(message.matches("Choose this when").count(), 4);
+        assert!(!message.contains("**"), "Notice uses plain-text headings, not Markdown");
+        let max_scroll = crate::tui::draw_overlays::notice_message_max_scroll(
+            Rect::new(0, 0, WIDTH, HEIGHT), message);
+        assert!(max_scroll > 0, "the long help must scroll on a standard terminal");
+        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
+        terminal.draw(|frame| crate::tui::draw::draw_ui(frame, &mut app)).unwrap();
+        let first_page = (0..HEIGHT)
+            .map(|y| rendered_text(&terminal, WIDTH, y)).collect::<String>();
+        assert!(first_page.contains("PCM gain"));
+        assert!(first_page.contains("Controls whether"));
+        // Scroll to the end through the same persistent Notice state consumed by the renderer.
+        if let ActiveOverlay::Notice { scroll, .. } = &mut app.active_overlay {
+            *scroll = max_scroll;
+        } else {
+            panic!("information popup must still be open");
+        }
+        terminal.draw(|frame| crate::tui::draw::draw_ui(frame, &mut app)).unwrap();
+        let last_page = (0..HEIGHT)
+            .map(|y| rendered_text(&terminal, WIDTH, y)).collect::<String>();
+        assert!(last_page.contains("Fixed gain"));
+        assert!(last_page.contains("clipping"));
+        assert!(app.button_map.find_button_rect(&TuiButton::OverlayCancel).is_some());
+        crate::tui::keybindings::handle_key(&mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+        assert_eq!(app.convert.format.field_focus, FormatField::PcmTruePeak);
     }
 }

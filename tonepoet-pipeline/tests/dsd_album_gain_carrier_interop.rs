@@ -233,6 +233,7 @@ fn sox_written_album_carrier_survives_production_ffmpeg_consumer_at_known_level(
         plan_scope: PlanScope::submitted_batch("interop-submission", "interop-track", Some(2)),
         intermediate_dir: Some(root.0.clone()),
         container_ffmpeg_flags: Vec::new(),
+        raw_input_channel_layout: None,
     };
 
     let plan = plan_conversion(&request).expect("production album-carrier consumer plan");

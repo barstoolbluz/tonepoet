@@ -46,6 +46,7 @@ fn request(settings: PipelineSettings) -> PlanRequest {
         plan_scope: PlanScope::track("test-track"),
         intermediate_dir: Some(PathBuf::from("work")),
         container_ffmpeg_flags: Vec::new(),
+        raw_input_channel_layout: None,
     }
 }
 
@@ -360,6 +361,7 @@ fn default_dsd_to_pcm_matches_explicit_strict_general_plan() {
         plan_scope: PlanScope::track("test-track"),
         intermediate_dir: Some(PathBuf::from("work")),
         container_ffmpeg_flags: Vec::new(),
+        raw_input_channel_layout: None,
     };
     let plan = plan_conversion(&req).unwrap();
     assert!(plan.reference.is_none());
@@ -409,6 +411,7 @@ fn dsd_to_pcm_source_depth_uses_documented_target_default() {
         plan_scope: PlanScope::track("test-track"),
         intermediate_dir: Some(PathBuf::from("work")),
         container_ffmpeg_flags: Vec::new(),
+        raw_input_channel_layout: None,
     };
 
     let topology = plan_topology(&req).expect("DSD Source depth resolves to target default");
@@ -456,6 +459,7 @@ fn lossy_source_depth_uses_documented_target_default() {
         plan_scope: PlanScope::track("test-track"),
         intermediate_dir: Some(PathBuf::from("work")),
         container_ffmpeg_flags: Vec::new(),
+        raw_input_channel_layout: None,
     };
 
     let topology = plan_topology(&req).expect("lossy Source depth resolves to target default");
@@ -505,6 +509,7 @@ fn lossy_source_default_ignores_decoded_integer_carrier_width() {
         plan_scope: PlanScope::track("test-track"),
         intermediate_dir: Some(PathBuf::from("work")),
         container_ffmpeg_flags: Vec::new(),
+        raw_input_channel_layout: None,
     };
 
     let topology = plan_topology(&req).expect("lossy carrier resolves to target default");
@@ -562,6 +567,7 @@ fn lossy_same_format_never_passes_through_without_proven_encoder_settings() {
         plan_scope: PlanScope::track("test-track"),
         intermediate_dir: Some(PathBuf::from("work")),
         container_ffmpeg_flags: Vec::new(),
+        raw_input_channel_layout: None,
     };
     let plan = plan_conversion(&req).unwrap();
     assert!(matches!(plan.action, PlanAction::Execute { .. }));
@@ -804,6 +810,7 @@ fn dsd_lowpass_paths_all_use_sox_ultra_rate_flag() {
         plan_scope: PlanScope::track("test-track"),
         intermediate_dir: Some(PathBuf::from("work")),
         container_ffmpeg_flags: Vec::new(),
+        raw_input_channel_layout: None,
     };
 
     let mut ultra = req_auto.clone();
@@ -1105,6 +1112,7 @@ fn dsd_request_for(format: AudioFormat, depth: PcmBitDepth, extension: &str) -> 
         plan_scope: PlanScope::track("test-track"),
         intermediate_dir: Some(PathBuf::from("work")),
         container_ffmpeg_flags: Vec::new(),
+        raw_input_channel_layout: None,
     }
 }
 
@@ -1140,6 +1148,7 @@ fn source_resolved_int32_alac_is_rejected_through_public_planner() {
         plan_scope: PlanScope::track("test-track"),
         intermediate_dir: Some(PathBuf::from("work")),
         container_ffmpeg_flags: Vec::new(),
+        raw_input_channel_layout: None,
     };
     let err = plan_conversion(&req).expect_err("ALAC Source over Int32 must fail closed");
     match err {

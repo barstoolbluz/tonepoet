@@ -10149,21 +10149,28 @@ fn set_request_cd_deemphasis(
 fn set_request_output_processing(
     request: &mut crate::convert::pipeline::PipelineRequest,
     stereo_fold: bool,
-    remove_dc_offset: bool,
+    dc_correction: crate::tui::app::DcCorrectionMode,
+    dc_manual_nanounits: i64,
 ) {
     use tonepoet_pipeline::{EffectInstanceId, EffectIntent, EffectPlacement, RegisteredUnaryEffect};
     let obsolete: Vec<_> = request.registered_effects.iter()
         .filter(|intent| matches!(&intent.effect,
-            RegisteredUnaryEffect::StereoFold | RegisteredUnaryEffect::RemoveDcOffset))
+            RegisteredUnaryEffect::StereoFold | RegisteredUnaryEffect::RemoveDcOffset
+            | RegisteredUnaryEffect::DcShiftAuto | RegisteredUnaryEffect::DcShiftManual { .. }))
         .map(|intent| intent.id).collect();
     request.registered_effects.retain(|intent| !obsolete.contains(&intent.id));
     for intent in &mut request.registered_effects {
         intent.after.retain(|id| !obsolete.contains(id));
     }
-    for effect in [
-        stereo_fold.then_some(RegisteredUnaryEffect::StereoFold),
-        remove_dc_offset.then_some(RegisteredUnaryEffect::RemoveDcOffset),
-    ].into_iter().flatten() {
+    let dc_effect = match dc_correction {
+        crate::tui::app::DcCorrectionMode::Off => None,
+        crate::tui::app::DcCorrectionMode::HighPass => Some(RegisteredUnaryEffect::RemoveDcOffset),
+        crate::tui::app::DcCorrectionMode::AutoShift => Some(RegisteredUnaryEffect::DcShiftAuto),
+        crate::tui::app::DcCorrectionMode::Manual => Some(
+            RegisteredUnaryEffect::DcShiftManual { offset_nanounits: dc_manual_nanounits }),
+    };
+    for effect in [stereo_fold.then_some(RegisteredUnaryEffect::StereoFold), dc_effect]
+        .into_iter().flatten() {
         let id = EffectInstanceId(request.registered_effects.iter().map(|intent| intent.id.0)
             .max().unwrap_or(0).saturating_add(1));
         let after = request.registered_effects.iter().map(|intent| intent.id).collect();
@@ -10332,9 +10339,11 @@ fn execute_commit_with_source_options_transform(
     let output_stereo_fold = !app.convert.format.is_dsd_selected()
         && *app.convert.format.output_channel_layout.selected_value()
             == super::app::OutputChannelLayoutChoice::Stereo;
-    let output_remove_dc_offset = !app.convert.format.is_dsd_selected()
-        && app.convert.format.remove_dc_offset;
-    if (output_stereo_fold || output_remove_dc_offset)
+    let output_dc_correction = if app.convert.format.is_dsd_selected() {
+        crate::tui::app::DcCorrectionMode::Off
+    } else { *app.convert.format.dc_correction.selected_value() };
+    let output_dc_manual_nanounits = app.convert.format.dc_manual_nanounits;
+    if (output_stereo_fold || output_dc_correction != crate::tui::app::DcCorrectionMode::Off)
         && app.convert.format.dsd_reference_path_selected()
     {
         app.set_status("channel folding and DC removal require the Custom DSD pathway");
@@ -10622,7 +10631,7 @@ fn execute_commit_with_source_options_transform(
                 existing_req.deemphasis_evidence_origin = deemphasis_evidence_origin;
                 set_request_hdcd_decode(existing_req, hdcd_binding.clone());
                 set_request_cd_deemphasis(existing_req, apply_cd_deemphasis);
-                set_request_output_processing(existing_req, output_stereo_fold, output_remove_dc_offset);
+                set_request_output_processing(existing_req, output_stereo_fold, output_dc_correction, output_dc_manual_nanounits);
             } else {
                 let output_root = options.output_dir.clone()
                     .map(|p| crate::convert::pipeline::unified_request::expand_tilde(&p))
@@ -10702,7 +10711,7 @@ fn execute_commit_with_source_options_transform(
                 if let Some(request) = item.pipeline_request.as_mut() {
                     set_request_hdcd_decode(request, hdcd_binding);
                     set_request_cd_deemphasis(request, apply_cd_deemphasis);
-                    set_request_output_processing(request, output_stereo_fold, output_remove_dc_offset);
+                    set_request_output_processing(request, output_stereo_fold, output_dc_correction, output_dc_manual_nanounits);
                 }
             }
         },

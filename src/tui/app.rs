@@ -4933,6 +4933,37 @@ pub enum OutputChannelLayoutChoice {
     Stereo,
 }
 
+/// Explicit DC-correction intent. CD de-emphasis is unrelated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DcCorrectionMode { Off, AutoShift, HighPass, Manual }
+
+/// PCM DC subtraction is expressed as signed billionths of full scale. The
+/// backend removes this value; positive means subtract a positive amount.
+/// Validated, signed normalized amplitude in 1e-9 units (positive means subtract).
+pub fn parse_dc_offset_nanounits(input: &str) -> Result<i64, String> {
+    let input = input.trim();
+    if input.is_empty() { return Err("enter a normalized amplitude between -1 and +1".into()); }
+    let value = input.parse::<f64>().map_err(|_| "enter a numeric amplitude".to_string())?;
+    if !value.is_finite() || !(-1.0..=1.0).contains(&value) {
+        return Err("offset must be finite and between -1 and +1".into());
+    }
+    let scaled = value * 1_000_000_000.0;
+    let rounded = scaled.round();
+    if (scaled - rounded).abs() > 0.000_001 {
+        return Err("use at most nine decimal places".into());
+    }
+    Ok(rounded as i64)
+}
+
+pub fn dc_offset_label(value: i64) -> String {
+    let sign = if value < 0 { "-" } else { "+" };
+    let magnitude = value.unsigned_abs();
+    let frac = format!("{:09}", magnitude % 1_000_000_000);
+    let frac = frac.trim_end_matches('0');
+    if frac.is_empty() { format!("{sign}{}", magnitude / 1_000_000_000) }
+    else { format!("{sign}{}.{frac}", magnitude / 1_000_000_000) }
+}
+
 /// Which row in the format pane is focused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FormatField {
@@ -4946,6 +4977,8 @@ pub enum FormatField {
     OutputChannelLayout,
     /// Advanced DC-bias suppression with an explicit 2 Hz high-pass.
     RemoveDcOffset,
+    /// Fixed normalized offset to subtract in Manual DC mode.
+    DcManualValue,
     /// CD source-rate de-emphasis correction.
     Deemphasis,
     /// Source-control-bit HDCD decoding, separately gated from EQ.
@@ -5205,7 +5238,9 @@ pub struct FormatState {
     pub dither: PillState<DitherType>,
     pub replaygain: PillState<ReplayGainChoice>,
     pub output_channel_layout: PillState<OutputChannelLayoutChoice>,
-    pub remove_dc_offset: bool,
+    pub dc_correction: PillState<DcCorrectionMode>,
+    /// Offset to subtract in Manual mode, signed normalized PCM nanounits.
+    pub dc_manual_nanounits: i64,
     pub pcm_gain_mode: PillState<PcmGainMode>,
     pub pcm_true_peak_scope: PillState<TruePeakScope>,
     pub pcm_true_peak_scan_mode: PillState<TruePeakScanTier>,
@@ -5602,7 +5637,13 @@ impl FormatState {
             dither,
             replaygain,
             output_channel_layout,
-            remove_dc_offset: false,
+            dc_correction: PillState::new(vec![
+                (DcCorrectionMode::Off, "off"),
+                (DcCorrectionMode::AutoShift, "auto shift"),
+                (DcCorrectionMode::HighPass, "high-pass"),
+                (DcCorrectionMode::Manual, "manual"),
+            ]),
+            dc_manual_nanounits: 0,
             pcm_gain_mode,
             pcm_true_peak_scope,
             pcm_true_peak_scan_mode,
@@ -5995,6 +6036,9 @@ impl FormatState {
             rows.push(FormatPaneRow::Spacer);
             rows.push(FormatPaneRow::Field(FormatField::OutputChannelLayout));
             rows.push(FormatPaneRow::Field(FormatField::RemoveDcOffset));
+            if *self.dc_correction.selected_value() == DcCorrectionMode::Manual {
+                rows.push(FormatPaneRow::Field(FormatField::DcManualValue));
+            }
         }
         if maximized
             && self.deemphasis_eligible
@@ -6387,9 +6431,10 @@ impl FormatState {
             return;
         }
         if self.field_focus == FormatField::RemoveDcOffset {
-            self.remove_dc_offset = !self.remove_dc_offset;
+            self.dc_correction.select_next();
             return;
         }
+        if self.field_focus == FormatField::DcManualValue { return; }
         if self.field_focus == FormatField::Deemphasis {
             self.record_manual_deemphasis_choice(!self.deemphasis_enabled);
             self.apply_auto_dither(source_bits);
@@ -6432,9 +6477,10 @@ impl FormatState {
             return;
         }
         if self.field_focus == FormatField::RemoveDcOffset {
-            self.remove_dc_offset = !self.remove_dc_offset;
+            self.dc_correction.select_prev();
             return;
         }
+        if self.field_focus == FormatField::DcManualValue { return; }
         if self.field_focus == FormatField::Deemphasis {
             self.record_manual_deemphasis_choice(!self.deemphasis_enabled);
             self.apply_auto_dither(source_bits);
@@ -6502,9 +6548,8 @@ impl FormatState {
             FormatField::OutputChannelLayout => {
                 select_enabled_index(&mut self.output_channel_layout, index)
             }
-            FormatField::RemoveDcOffset => {
-                if index > 1 { false } else { self.remove_dc_offset = index == 1; true }
-            },
+            FormatField::RemoveDcOffset => select_enabled_index(&mut self.dc_correction, index),
+            FormatField::DcManualValue => false,
             FormatField::HdcdDecode => {
                 if !self.hdcd_is_actionable() || index > 1 {
                     false
@@ -7750,6 +7795,7 @@ impl FormatState {
         clamp_pill(&mut self.pcm_true_peak_scan_mode);
         self.pcm_true_peak_target_dbtp = clamp_pcm_true_peak_target(self.pcm_true_peak_target_dbtp);
         self.pcm_fixed_gain_db = clamp_dsd_to_pcm_gain_db(self.pcm_fixed_gain_db);
+        clamp_pill(&mut self.dc_correction);
         clamp_pill(&mut self.noise_shaper);
         clamp_pill(&mut self.modulator_order);
         clamp_pill(&mut self.conversion_preset);
@@ -7777,7 +7823,7 @@ impl FormatState {
             FormatField::BitDepth => FocusedPill::BitDepth(&mut self.bit_depth),
             FormatField::Resampler => FocusedPill::Resampler(&mut self.resampler),
             FormatField::Dither => FocusedPill::Dither(&mut self.dither),
-            FormatField::OutputChannelLayout | FormatField::RemoveDcOffset => {
+            FormatField::OutputChannelLayout | FormatField::RemoveDcOffset | FormatField::DcManualValue => {
                 unreachable!("channel/DC controls use dedicated selectors")
             },
             FormatField::Deemphasis => unreachable!("de-emphasis uses its dedicated boolean selector"),
@@ -25498,7 +25544,7 @@ mod hdcd_format_policy_tests {
 
 #[cfg(test)]
 mod channel_and_dc_format_controls_tests {
-    use super::{FormatField, FormatPaneRow, FormatState, OutputChannelLayoutChoice};
+    use super::{DcCorrectionMode, FormatField, FormatPaneRow, FormatState, OutputChannelLayoutChoice};
 
     #[test]
     fn advanced_rows_are_below_fold_and_keyboard_mouse_agree() {
@@ -25509,17 +25555,40 @@ mod channel_and_dc_format_controls_tests {
             assert!(!format.pane_rows(false).contains(&FormatPaneRow::Field(field)));
         }
         assert_eq!(*format.output_channel_layout.selected_value(), OutputChannelLayoutChoice::Source);
-        assert!(!format.remove_dc_offset);
+        assert_eq!(*format.dc_correction.selected_value(), DcCorrectionMode::Off);
         assert!(format.select_row_index(FormatField::OutputChannelLayout, 1, None, None));
         assert_eq!(*format.output_channel_layout.selected_value(), OutputChannelLayoutChoice::Stereo);
         format.field_focus = FormatField::OutputChannelLayout;
         format.select_focused_next(None, None);
         assert_eq!(*format.output_channel_layout.selected_value(), OutputChannelLayoutChoice::Source);
         assert!(format.select_row_index(FormatField::RemoveDcOffset, 1, None, None));
-        assert!(format.remove_dc_offset);
+        assert_eq!(*format.dc_correction.selected_value(), DcCorrectionMode::AutoShift);
         format.field_focus = FormatField::RemoveDcOffset;
         format.select_focused_prev(None, None);
-        assert!(!format.remove_dc_offset);
-        assert!(!format.select_row_index(FormatField::RemoveDcOffset, 2, None, None));
+        assert_eq!(*format.dc_correction.selected_value(), DcCorrectionMode::Off);
+        assert!(format.select_row_index(FormatField::RemoveDcOffset, 2, None, None));
+        assert_eq!(*format.dc_correction.selected_value(), DcCorrectionMode::HighPass);
+        assert!(format.select_row_index(FormatField::RemoveDcOffset, 3, None, None));
+        assert_eq!(*format.dc_correction.selected_value(), DcCorrectionMode::Manual);
+        assert!(!format.select_row_index(FormatField::RemoveDcOffset, 4, None, None));
+    }
+}
+
+#[cfg(test)]
+mod dc_r2_manual_normalized_ui_tests {
+    use super::{dc_offset_label, parse_dc_offset_nanounits};
+
+    #[test]
+    fn signed_manual_values_round_trip_without_backend_sign_reversal() {
+        for (text, nanounits) in [("+0.003", 3_000_000),
+            ("-0.125", -125_000_000), ("0", 0), ("+1", 1_000_000_000)] {
+            let parsed = parse_dc_offset_nanounits(text).unwrap();
+            assert_eq!(parsed, nanounits);
+            assert_eq!(parse_dc_offset_nanounits(&dc_offset_label(parsed)).unwrap(), parsed);
+        }
+        for invalid in ["", "abc", "NaN", "Infinity", "1.000000001",
+            "0.0000000001", "1e309", "-1.1"] {
+            assert!(parse_dc_offset_nanounits(invalid).is_err(), "unexpectedly accepted {invalid}");
+        }
     }
 }

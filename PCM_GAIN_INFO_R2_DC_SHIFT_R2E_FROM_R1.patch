@@ -1,0 +1,476 @@
+--- a/tonepoet-pipeline/src/semantic_plan.rs
++++ b/tonepoet-pipeline/src/semantic_plan.rs
+@@ -2072,13 +2072,28 @@
+                 "effect.{}.float64_carrier",
+                 instance.id.0
+             )),
+-            processing_domain: Fact::Known(ProcessingDomain::PcmFloating),
+-            // A Float64 carrier does not by itself establish a protected value
+-            // or overload-preservation proof for the effect arithmetic.
+-            value_domain: ValueDomain::Pending(format!(
+-                "effect.{}.output_value_domain",
+-                instance.id.0
+-            )),
++            // Only the native DC writer has an explicit Float64 arithmetic
++            // contract. Other effects cannot inherit a protected numeric
++            // domain merely because their carrier stores Float64 samples.
++            processing_domain: Fact::Known(if matches!(
++                &instance.effect,
++                RegisteredUnaryEffect::DcShiftAuto | RegisteredUnaryEffect::DcShiftManual { .. }
++            ) {
++                ProcessingDomain::Binary64
++            } else {
++                ProcessingDomain::PcmFloating
++            }),
++            value_domain: if matches!(
++                &instance.effect,
++                RegisteredUnaryEffect::DcShiftAuto | RegisteredUnaryEffect::DcShiftManual { .. }
++            ) {
++                ValueDomain::FiniteFloating
++            } else {
++                ValueDomain::Pending(format!(
++                    "effect.{}.output_value_domain",
++                    instance.id.0
++                ))
++            },
+             level_basis: input_state.level_basis,
+             claims: BTreeSet::new(),
+             obligations: input_state.obligations,
+@@ -3964,28 +3979,46 @@
+                 None,
+             );
+             // An active multichannel DC shift feeds the certified terminal
+-            // through a raw Float64 carrier. SoX cannot bind the source's
+-            // verified speaker roles at that raw ingress. This constraint must
+-            // participate in the *initial* terminal selection and its proof:
+-            // replacing a charged SoX candidate at final lowering is invalid.
+-            // StereoFold has already changed the typed channel count to two.
++            // through a raw Float64 carrier, including Custom DSD-to-PCM
++            // certified prepasses. SoX cannot bind the original verified
++            // speaker roles at that raw ingress. Select and charge a capable
++            // terminal *before* the raw carrier exists; never replace the
++            // frozen terminal at final lowering. StereoFold has already
++            // reduced the typed channel count to two; Reference is sealed.
+             let needs_multichannel_dc_raw_layout = intent.gain_policy.is_true_peak()
+-                && !request.source.is_dsd()
++                && !intent.reference_delivery
+                 && matches!(&input_state.channels, Fact::Known(channels) if *channels > 2)
+                 && ordered_effects.iter().any(|effect| matches!(
+                     &effect.effect,
+                     RegisteredUnaryEffect::DcShiftAuto
+                         | RegisteredUnaryEffect::DcShiftManual { .. }
+                 ));
++            // SSRC is a rate-changing *resampler*, not a raw-Float64 PCM
++            // encoder. An explicit SSRC preference is compatible only when
++            // the already-admitted, independent resampler is actually SSRC;
++            // the terminal below must still satisfy the FFmpeg-only layout
++            // contract. No rate change or unqualified SSRC cell is excused.
++            let selected_ssrc_resampler = needs_multichannel_dc_raw_layout
++                && request.settings.preferred_tool == PreferredTool::Ssrc
++                && nodes.iter().any(|node| matches!(node,
++                    TypedPlanNode::Operation {
++                        operation: PlanOperation::ResamplePcm { .. },
++                        candidates,
++                        selected_candidate,
++                        ..
++                    } if candidates.get(*selected_candidate)
++                        .is_some_and(|candidate| candidate.tool == Some(ToolIdentifier::Ssrc))
++                ));
+             if needs_multichannel_dc_raw_layout
+                 && !matches!(
+                     &request.settings.preferred_tool,
+                     PreferredTool::Auto | PreferredTool::Ffmpeg
+                 )
++                && !selected_ssrc_resampler
+             {
+                 return Ok(PlanningOutcome::Refused(PlanRefusal {
+                     code: "multichannel_dc_terminal_preference".to_owned(),
+-                    reason: "certified multichannel DC subtraction requires a verified-layout FFmpeg raw terminal; the explicit backend preference is incompatible".to_owned(),
++                    reason: "certified multichannel DC subtraction requires a verified-layout FFmpeg raw terminal; the explicit backend preference does not identify a separately admitted SSRC resampler".to_owned(),
+                 }));
+             }
+             for candidate in &mut candidates {
+@@ -5914,6 +5947,20 @@
+             contract: plain,
+         }],
+         RegisteredUnaryEffect::DcShiftAuto | RegisteredUnaryEffect::DcShiftManual { .. } => {
++            // The native implementation traverses interleaved Float64 and
++            // writes `sample - resolved_offset` in Float64. It refuses
++            // nonfinite results; it neither clamps above-full-scale samples
++            // nor quantizes/dithers. This is the actual overload-preserving
++            // contract needed when protected SSRC feeds post-resample DC.
++            let mut native_contract = plain.clone();
++            native_contract.representation.accepted_processing_domains = all_pcm_processing_domains();
++            native_contract.representation.accepted_value_domains = all_pcm_value_domains();
++            native_contract.representation.emitted_processing_domain = Some(ProcessingDomain::Binary64);
++            native_contract.representation.emitted_precision = Some(StoragePrecision::Pcm(PcmBitDepth::Float64));
++            native_contract.representation.emitted_value_domain = Some(ValueDomain::FiniteFloating);
++            native_contract.runtime_obligations.insert(
++                "preserve_floating_overload_before_true_peak".to_owned(),
++            );
+             let offset_nanounits = match effect {
+                 RegisteredUnaryEffect::DcShiftManual { offset_nanounits } => {
+                     if !(-1_000_000_000..=1_000_000_000).contains(offset_nanounits) {
+@@ -5929,7 +5976,7 @@
+             vec![EffectLowering {
+                 tool: ToolIdentifier::Custom("tonepoet-native-f64-dc".to_owned()),
+                 arguments: EffectArgumentMapping::NativeDcShift { offset_nanounits, policy_version: 1 },
+-                contract: plain,
++                contract: native_contract,
+             }]
+         }
+         RegisteredUnaryEffect::RemoveDcOffset => vec![
+@@ -7133,6 +7180,245 @@
+                 MULTICHANNEL_DC_RAW_LAYOUT_CONTRACT
+             ));
+         }
++    }
++
++    #[test]
++    fn custom_dsd_multichannel_dc_true_peak_charges_layout_preserving_terminal_for_both_scopes() {
++        for scope in [TruePeakScope::Track, TruePeakScope::Album] {
++            for effect in [
++                RegisteredUnaryEffect::DcShiftManual { offset_nanounits: 3_000_000 },
++                RegisteredUnaryEffect::DcShiftAuto,
++            ] {
++                let mut request = dsd_request(SampleGainPolicy::TruePeakGuard {
++                    target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
++                    scope,
++                    scan: TruePeakScanTier::Standard,
++                });
++                request.source.channels = Some(6);
++                request.settings.preferred_tool = PreferredTool::Auto;
++                request.settings.dither_type = DitherType::None;
++                request.settings.dither_explicit = true;
++                // Custom DSD starts with an original DSD source. Its final
++                // certified carrier is produced later as raw interleaved F64.
++                assert!(request.source.is_dsd());
++                assert!(!normalize_intent(&request).unwrap().reference_delivery);
++                assert_eq!(request.raw_input_channel_layout, None);
++                let effects = explicit_effect_sequence([effect]);
++                let PlanningOutcome::Ready(plan) =
++                    plan_typed_with_effects(&request, &effects).expect("bounded DSD planning")
++                else {
++                    panic!("Custom DSD split true-peak DC must admit its FFmpeg raw terminal")
++                };
++                let (terminal, _) = selected_pcm_terminal(&plan);
++                assert_eq!(terminal.tool, Some(ToolIdentifier::Ffmpeg));
++                assert!(terminal.contract.terminal_proof.is_some());
++                assert!(terminal.contract.runtime_obligations.contains(
++                    MULTICHANNEL_DC_RAW_LAYOUT_CONTRACT
++                ));
++                assert!(matches!(
++                    terminal.contract.terminal_realization.as_ref(),
++                    Some(SelectedTerminalRealization::Pcm(realization))
++                        if realization.kind == PcmTerminalRealizationKind::FfmpegDirect
++                ));
++            }
++        }
++    }
++
++    #[test]
++    fn custom_dsd_multichannel_dc_refuses_unqualified_terminal_before_certification() {
++        let mut request = dsd_request(SampleGainPolicy::TruePeakGuard {
++            target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
++            scope: TruePeakScope::Track,
++            scan: TruePeakScanTier::Standard,
++        });
++        request.source.channels = Some(6);
++        request.settings.dither_type = DitherType::None;
++        request.settings.dither_explicit = true;
++        let effects = explicit_effect_sequence([
++            RegisteredUnaryEffect::DcShiftManual { offset_nanounits: 3_000_000 },
++        ]);
++        request.settings.preferred_tool = PreferredTool::Sox;
++        let PlanningOutcome::Refused(refusal) =
++            plan_typed_with_effects(&request, &effects).expect("bounded planning")
++        else {
++            panic!("explicit SoX cannot bind verified speaker roles to the raw terminal")
++        };
++        assert_eq!(refusal.code, "multichannel_dc_terminal_preference");
++
++        request.settings.preferred_tool = PreferredTool::Auto;
++        let policy = CandidateSearchPolicy {
++            strip_terminal_proof_for_tool: Some(ToolIdentifier::Ffmpeg),
++            ..CandidateSearchPolicy::default()
++        };
++        let PlanningOutcome::Refused(refusal) =
++            plan_typed_with_effects_and_policy(&request, &effects, &policy)
++                .expect("bounded planning")
++        else {
++            panic!("unproved FFmpeg cannot be replaced by a SoX terminal")
++        };
++        assert_eq!(refusal.code, "no_admitted_candidate");
++    }
++
++    #[test]
++    fn native_float64_dc_effect_explicitly_preserves_finite_overload_for_protected_ssrc() {
++        for effect in [
++            RegisteredUnaryEffect::DcShiftAuto,
++            RegisteredUnaryEffect::DcShiftManual { offset_nanounits: 3_000_000 },
++        ] {
++            let candidates = registered_effect_candidates(&effect).unwrap();
++            assert_eq!(candidates.len(), 1);
++            let native = &candidates[0];
++            assert_eq!(native.tool, ToolIdentifier::Custom("tonepoet-native-f64-dc".to_owned()));
++            assert!(effect_contract_preserves_protected_true_peak_input(&native.contract));
++            assert_eq!(native.contract.representation.emitted_precision,
++                Some(StoragePrecision::Pcm(PcmBitDepth::Float64)));
++            // No claim is granted to any FFmpeg/SoX filter or unrelated effect.
++        }
++        assert!(!effect_contract_preserves_protected_true_peak_input(
++            &registered_effect_candidates(&RegisteredUnaryEffect::RemoveDcOffset)
++                .unwrap()[0].contract
++        ));
++    }
++
++    #[test]
++    fn forced_qualified_ssrc_resampler_with_multichannel_dc_charges_ffmpeg_terminal() {
++        use crate::ssrc_binary64::{
++            Binary64ResampleEvidenceScope, Binary64ResamplePreservationEvidence,
++            Binary64RuntimeAttestation, TONEPOET_BINARY64_OVERLOAD_PRESERVING_RESAMPLE_V1,
++        };
++        let scope = Binary64ResampleEvidenceScope {
++            profile: SsrcProfile::High,
++            source_rate_hz: 96_000,
++            target_rate_hz: 44_100,
++            attenuation_db: Some("0.0".to_owned()),
++            min_phase: false,
++            architecture: std::env::consts::ARCH.to_owned(),
++            input_container: "wav".to_owned(),
++            input_sample_format: "pcm_f64le".to_owned(),
++            output_container: "w64".to_owned(),
++            output_sample_format: "pcm_f64le".to_owned(),
++        };
++        let established = Binary64ResamplePreservationEvidence::Established {
++            authority_id: TONEPOET_BINARY64_OVERLOAD_PRESERVING_RESAMPLE_V1.to_owned(),
++            evidence_id: "test:ssrc-dc-layout".to_owned(),
++            qualification_report_sha256: "test-report-sha256".to_owned(),
++            runtime_attestation: Binary64RuntimeAttestation {
++                expected_executable_sha256: "test-executable-sha256".to_owned(),
++                architecture: scope.architecture.clone(),
++                source_revision: crate::ssrc_binary64::PINNED_SSRC_SOURCE_REV.to_owned(),
++                build_identity: "test-build-identity".to_owned(),
++            },
++            scope: scope.clone(),
++        };
++        let policy = CandidateSearchPolicy {
++            ssrc_binary64_evidence_override: Some(TestBinary64SsrcEvidenceOverride {
++                scope,
++                evidence: established,
++            }),
++            ..CandidateSearchPolicy::default()
++        };
++        let guard = SampleGainPolicy::TruePeakGuard {
++            target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
++            scope: TruePeakScope::Track,
++            scan: TruePeakScanTier::Standard,
++        };
++        for channels in [3, 4] {
++            for effect in [
++                RegisteredUnaryEffect::DcShiftManual { offset_nanounits: 3_000_000 },
++                RegisteredUnaryEffect::DcShiftAuto,
++            ] {
++                let mut request = pcm_request(guard);
++                request.source.format = AudioFormat::Flac;
++                request.source.codec = AudioCodec::Flac;
++                request.source.sample_rate_hz = Some(96_000);
++                request.source.channels = Some(channels);
++                request.source.frame_extent = Some(
++                    crate::source::SourceFrameExtent::Exact(96_000 * 60),
++                );
++                request.settings.target_sample_rate = RateTarget::PcmHz(44_100);
++                request.settings.preferred_tool = PreferredTool::Ssrc;
++                request.settings.ssrc.force = true;
++                request.settings.ssrc.profile = Some(SsrcProfile::High);
++                request.settings.dither_type = DitherType::None;
++                request.settings.dither_explicit = true;
++                let effects = explicit_effect_sequence([effect]);
++                let PlanningOutcome::Ready(plan) = plan_typed_with_effects_and_policy(
++                    &request, &effects, &policy,
++                ).expect("bounded planning") else {
++                    panic!("commissioned strong-Binary64 SSRC must remain the independent resampler")
++                };
++                assert!(plan.nodes.iter().any(|node| matches!(node,
++                    TypedPlanNode::Operation {
++                        operation: PlanOperation::ResamplePcm { .. },
++                        candidates, selected_candidate, ..
++                    } if candidates[*selected_candidate].tool == Some(ToolIdentifier::Ssrc)
++                )));
++                let (terminal, _) = selected_pcm_terminal(&plan);
++                assert_eq!(terminal.tool, Some(ToolIdentifier::Ffmpeg));
++                assert!(terminal.contract.terminal_proof.is_some());
++                assert!(terminal.contract.runtime_obligations.contains(
++                    MULTICHANNEL_DC_RAW_LAYOUT_CONTRACT
++                ));
++                assert!(plan.nodes.iter().any(|node| matches!(node,
++                    TypedPlanNode::ApplyEffect { output, instance, .. }
++                        if matches!(&instance.effect, RegisteredUnaryEffect::DcShiftAuto
++                            | RegisteredUnaryEffect::DcShiftManual { .. })
++                        && plan.audio_states.iter().any(|state|
++                            state.id == *output
++                            && state.processing_domain == Fact::Known(ProcessingDomain::Binary64)
++                            && state.value_domain == ValueDomain::FiniteFloating)
++                )));
++                if channels == 3 {
++                    let unproved_terminal = CandidateSearchPolicy {
++                        strip_terminal_proof_for_tool: Some(ToolIdentifier::Ffmpeg),
++                        ..policy.clone()
++                    };
++                    let PlanningOutcome::Refused(refusal) =
++                        plan_typed_with_effects_and_policy(&request, &effects, &unproved_terminal)
++                            .expect("bounded planning")
++                    else {
++                        panic!("SSRC must not legitimize an unproved FFmpeg terminal")
++                    };
++                    assert_eq!(refusal.code, "no_admitted_candidate");
++                }
++            }
++        }
++
++        // A selected SSRC preference without any actual resampling cannot
++        // masquerade as an independently selected resampler at the terminal.
++        let mut no_resample = pcm_request(guard);
++        no_resample.source.channels = Some(3);
++        no_resample.settings.preferred_tool = PreferredTool::Ssrc;
++        let effects = explicit_effect_sequence([
++            RegisteredUnaryEffect::DcShiftManual { offset_nanounits: 3_000_000 },
++        ]);
++        let PlanningOutcome::Refused(refusal) =
++            plan_typed_with_effects(&no_resample, &effects).expect("bounded planning")
++        else {
++            panic!("no-rate-change SSRC preference cannot select the required raw terminal")
++        };
++        assert_eq!(refusal.code, "multichannel_dc_terminal_preference");
++
++        // An uncommissioned SSRC profile must still be refused by its strong
++        // resampler proof, never waved through by the FFmpeg terminal check.
++        let mut unproved = pcm_request(guard);
++        unproved.source.channels = Some(3);
++        unproved.source.sample_rate_hz = Some(96_000);
++        unproved.source.frame_extent = Some(crate::source::SourceFrameExtent::Exact(96_000 * 60));
++        unproved.settings.target_sample_rate = RateTarget::PcmHz(44_100);
++        unproved.settings.preferred_tool = PreferredTool::Ssrc;
++        unproved.settings.ssrc.force = true;
++        unproved.settings.ssrc.profile = Some(SsrcProfile::Standard);
++        unproved.settings.dither_type = DitherType::None;
++        unproved.settings.dither_explicit = true;
++        let PlanningOutcome::Refused(refusal) =
++            plan_typed_with_effects_and_policy(&unproved, &effects, &policy)
++                .expect("bounded planning")
++        else {
++            panic!("a noncommissioned SSRC profile cannot borrow High-profile evidence")
++        };
++        assert!(refusal.code.starts_with("binary64_resample_preservation"),
++            "resampler proof refusal must remain the authority: {}", refusal.code);
+     }
+ 
+     #[test]
+--- a/src/convert/pipeline/plan_bridge.rs
++++ b/src/convert/pipeline/plan_bridge.rs
+@@ -6827,6 +6827,105 @@
+     }
+ 
+     #[test]
++    fn custom_dsd_multichannel_dc_charged_terminal_binds_verified_raw_speaker_mask() {
++        // Phase-3 produces this carrier only after reconstructing DSD and
++        // applying the typed native DC effect. Its speaker mask comes from
++        // the source-specific verified layout, not the channel count.
++        for effect in [
++            RegisteredUnaryEffect::DcShiftManual { offset_nanounits: 3_000_000 },
++            RegisteredUnaryEffect::DcShiftAuto,
++        ] {
++            let temp = TempDir::new().expect("temp dir");
++            let source_path = temp.path().join("source.dsf");
++            std::fs::write(&source_path, b"fixture source").expect("source placeholder");
++            let raw_carrier = temp.path().join("dsd.dc.true-peak.f64le");
++            std::fs::write(&raw_carrier, vec![0_u8; 6 * 8 * 16])
++                .expect("raw six-channel Float64 carrier");
++            let output = temp.path().join("output.flac");
++            let mut req = request(temp.path());
++            req.stages.metadata = StageRequirement::Disabled;
++            req.settings.target_format = PlannerFormat::Flac;
++            req.settings.target_sample_rate = tonepoet_pipeline::RateTarget::PcmHz(176_400);
++            req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(PcmBitDepth::Int24);
++            req.settings.preferred_tool = PreferredTool::Auto;
++            req.settings.dither_type = tonepoet_pipeline::DitherType::None;
++            req.settings.dither_explicit = true;
++            req.settings.metadata.transfer_tags = false;
++            req.settings.metadata.preserve_artwork = false;
++            req.settings.metadata.store_source_audio_md5 = false;
++            req.settings.dsd.set_gain_policy(tonepoet_pipeline::SampleGainPolicy::TruePeakGuard {
++                target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
++                scope: tonepoet_pipeline::TruePeakScope::Track,
++                scan: tonepoet_pipeline::TruePeakScanTier::Standard,
++            });
++            req.registered_effects = tonepoet_pipeline::explicit_effect_sequence([effect]);
++            let initial = PlanRequest {
++                input_path: source_path.clone(),
++                output_path: output.clone(),
++                source: tonepoet_pipeline::SourceInfo {
++                    format: PlannerFormat::Dsf,
++                    codec: tonepoet_pipeline::AudioCodec::Dsd,
++                    sample_rate_hz: Some(5_644_800),
++                    bit_depth: None,
++                    true_source_depth: None,
++                    source_representation: tonepoet_pipeline::SourceRepresentationKind::Dsd,
++                    sample_kind: Some(tonepoet_pipeline::SampleKind::Dsd),
++                    channels: Some(6),
++                    duration: Some(std::time::Duration::from_secs(60)),
++                    frame_extent: None,
++                    dsd_source_kind: None,
++                    audio_md5: None,
++                },
++                settings: req.settings.clone(),
++                plan_scope: tonepoet_pipeline::PlanScope::track("dsd-multichannel-dc"),
++                intermediate_dir: Some(temp.path().join("initial-plan")),
++                container_ffmpeg_flags: Vec::new(),
++                raw_input_channel_layout: None,
++                resolved_output_target: None,
++                reference_programme_scope: tonepoet_pipeline::ReferenceProgrammeScope::Singleton,
++                planned_riff_non_audio_upper_bound_bytes: None,
++            };
++            let execution = certified_true_peak_execution_contract_with_effects(
++                &initial, &req.registered_effects,
++            ).expect("initial DSD admission must charge its layout-capable terminal");
++            assert_eq!(execution.charged_terminal.tool, tonepoet_pipeline::ToolIdentifier::Ffmpeg);
++            let mut prepared = track(TrackSourceRef::DsdTruePeakCarrier {
++                channel_layout: Some("0x3f".to_owned()),
++                path: raw_carrier.clone(),
++                source_path,
++                sample_rate_hz: 176_400,
++                channels: 6,
++                duration: None,
++                gain_db: Some(tonepoet_pipeline::DbNano::ZERO),
++                point_dbtp: Some("-2.000000000".parse().expect("true peak")),
++                effective_target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
++                lossy_target_capped: false,
++                terminal_candidate: Some(execution.charged_terminal.clone()),
++            });
++            prepared.sample_rate = Some(5_644_800);
++            prepared.source_audio = SourceAudioDescriptor::from_scalar(
++                Some(5_644_800), None, Some(SourceAudioCoding::Dsd),
++            );
++            let final_request = plan_request_for_track(
++                &req, &prepared, &raw_carrier, &output,
++                temp.path().join("final-plan"),
++            ).expect("charged DSD terminal must survive final raw-carrier binding");
++            assert_eq!(final_request.settings.preferred_tool, PreferredTool::Ffmpeg);
++            assert_eq!(final_request.raw_input_channel_layout.as_deref(), Some("0x3f"));
++            let tools = planned_command_tools(&final_request);
++            assert_eq!(tools.last(), Some(&execution.charged_terminal.tool));
++            let args = planned_command_args(&final_request);
++            let terminal_args = args.last().expect("terminal argv");
++            let mask_index = terminal_args.windows(2).position(|arg|
++                arg[0] == "-channel_layout" && arg[1] == "0x3f"
++            ).expect("verified roles bind to raw input");
++            let input_index = terminal_args.iter().position(|arg| arg == "-i")
++                .expect("raw input option");
++            assert!(mask_index < input_index);
++        }
++    }
++
++    #[test]
+     fn certified_multichannel_dc_auto_terminal_freezes_ffmpeg_before_raw_layout_binding() {
+         for (channels, mask) in [(3_u16, "0x7"), (4_u16, "0x33")] {
+             for effect in [
