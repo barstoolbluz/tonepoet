@@ -50,9 +50,10 @@ the label and the first pill:
 PCM gain ⓘ   off   true-peak-guard   true-peak-normalize   fixed-gain
 ```
 
-De-emphasis and HDCD register their glyph past their pills, and DC passes it
-as the row suffix, which renders after the pills. True peak computes its own
-offset and we did not establish where that lands.
+Every other information control puts it after the pills. De-emphasis and HDCD
+register past theirs; DC passes it as the row suffix, which renders after the
+pills; and true peak computes an offset two cells past its last pill. PCM gain
+is the only one that does not.
 
 The splice also engineers pill geometry back into place, which the comment
 acknowledges.
