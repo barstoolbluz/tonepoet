@@ -8,9 +8,10 @@ moved. Requalification is held until the other two are fixed, since the tree
 changes again.
 
 Both findings from the independent review read right to us, though we did not
-verify the planner reasoning ourselves. The prerequisite you found yourselves — the native DC effect declared as an unspecified transform,
-so the strong Binary64 SSRC gate rejected it — was the correct thing to
-correct in the contract rather than in the worker.
+verify the planner reasoning ourselves. The prerequisite you found yourselves
+— the native DC effect declared as an unspecified transform, so the strong
+Binary64 SSRC gate rejected it — was the correct thing to correct in the
+contract rather than in the worker.
 
 ## 1. The new constraint leaks into a path it should not touch
 
@@ -25,9 +26,11 @@ route keeps selecting Sox and does not acquire the multichannel raw-layout
 contract. It now selects FFmpeg. Your own guard against the new constraint
 reaching unrelated paths is reporting that it reaches them.
 
-**What we want:** the stereo and legacy routes select what they selected
-before, and the multichannel raw-layout obligation attaches only where
-multichannel native DC genuinely requires it.
+**What we want:** the stereo and legacy routes are not perturbed by the
+multichannel constraint, and the raw-layout obligation attaches only where
+multichannel native DC genuinely requires it. The test is new, so we have no
+measurement of what those routes selected before it existed — whether Sox is
+the correct expectation is yours to confirm.
 
 ## 2. The DC notice does not scroll where the test requires it
 
