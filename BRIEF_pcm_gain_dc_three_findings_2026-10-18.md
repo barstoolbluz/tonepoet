@@ -7,8 +7,8 @@ One failure is the expected source-lock freshness; all eight locked files
 moved. Requalification is held until the other two are fixed, since the tree
 changes again.
 
-Both findings from the independent review look right, and the prerequisite you
-found yourselves — the native DC effect declared as an unspecified transform,
+Both findings from the independent review read right to us, though we did not
+verify the planner reasoning ourselves. The prerequisite you found yourselves — the native DC effect declared as an unspecified transform,
 so the strong Binary64 SSRC gate rejected it — was the correct thing to
 correct in the contract rather than in the worker.
 
@@ -47,12 +47,12 @@ The PCM gain row splices the glyph into the label span, so it renders between
 the label and the first pill:
 
 ```
-PCM gain ⓘ   off   guard   normalize
+PCM gain ⓘ   off   true-peak-guard   true-peak-normalize   fixed-gain
 ```
 
-Every other information control puts it after the pills, at the end of the
-row — de-emphasis and HDCD register past their two pills, DC passes it as the
-row suffix, and true peak was moved to the end for this reason two rounds ago.
+De-emphasis and HDCD register their glyph past their pills, and DC passes it
+as the row suffix, which renders after the pills. True peak computes its own
+offset and we did not establish where that lands.
 
 The splice also engineers pill geometry back into place, which the comment
 acknowledges.
