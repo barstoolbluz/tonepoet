@@ -1,0 +1,327 @@
+--- a/src/tui/button_map.rs
++++ b/src/tui/button_map.rs
+@@ -57,6 +57,8 @@
+     HdcdInfo,
+     /// Shared true-peak explanation on PCM and DSD target rows.
+     TruePeakInfo,
++    /// Explanation of the four PCM gain choices, independent of the true-peak target help.
++    PcmGainInfo,
+     ReplayGainPill(usize),
+     PcmTruePeakPill(usize),
+     TruePeakScopePill(usize),
+@@ -621,6 +623,7 @@
+             | Self::HdcdPill(_)
+             | Self::HdcdInfo
+             | Self::TruePeakInfo
++            | Self::PcmGainInfo
+             | Self::ReplayGainPill(_)
+             | Self::PcmTruePeakPill(_)
+             | Self::TruePeakScopePill(_)
+--- a/src/tui/draw_output.rs
++++ b/src/tui/draw_output.rs
+@@ -206,8 +206,8 @@
+                             row_focused, theme,
+                         ));
+                     }
+-                    FormatField::PcmTruePeak => lines.push(pill_row(
+-                        border_color, w, "PCM gain   ", "",
++                    FormatField::PcmTruePeak => lines.push(pcm_gain_info_row(
++                        border_color, w,
+                         &render_pill_spans(&format_state.pcm_gain_mode, row_focused, theme),
+                         row_focused, theme,
+                     )),
+@@ -853,6 +853,30 @@
+         .collect()
+ }
+ 
++/// The four PCM gain pills occupy the full row on narrow terminals. Put help
++/// in the unused two cells of the label area, keeping every pill's original
++/// position and clickable width. Both the glyph and its guard cell use the
++/// established foreground-only information style.
++fn pcm_gain_info_row<'a>(
++    border_color: ratatui::style::Color,
++    width: usize,
++    pills: &[Span<'a>],
++    focused: bool,
++    theme: super::theme::Theme,
++) -> Line<'a> {
++    let mut row = pill_row(border_color, width, "PCM gain   ", "", pills, focused, theme);
++    let label_style = if focused { theme.bright() } else { theme.muted() };
++    let info_fg = if theme.dark { theme.info } else { theme.value };
++    // Replace the existing 16-cell label span with 12 + 2 + 2 cells.
++    // The first pill still starts at x=17 (including the left border).
++    row.spans.splice(1..2, [
++        Span::styled("   PCM gain ", label_style),
++        Span::styled("ⓘ ", Style::default().fg(info_fg).add_modifier(Modifier::BOLD)),
++        Span::styled("  ", label_style),
++    ]);
++    row
++}
++
+ fn pill_row<'a>(
+     border_color: ratatui::style::Color,
+     width: usize,
+@@ -1203,4 +1227,35 @@
+             }
+         }
+     }
++}
++
++#[cfg(test)]
++mod pcm_gain_info_glyph_tests {
++    use super::*;
++
++    #[test]
++    fn pcm_gain_info_uses_foreground_only_contrasting_unicode_guard() {
++        for palette in super::super::theme::palettes() {
++            let theme = super::super::theme::theme_by_slug(palette.slug)
++                .expect("shipped theme");
++            for focused in [false, true] {
++                let plain = pill_row(theme.green, 80, "PCM gain   ", "",
++                    &[Span::raw(" off ")], focused, theme);
++                let with_info = pcm_gain_info_row(theme.green, 80,
++                    &[Span::raw(" off ")], focused, theme);
++                let info = with_info.spans.iter().find(|span|
++                    span.content.as_ref() == "ⓘ ").expect("glyph and guard cell");
++                let expected_fg = if theme.dark { theme.info } else { theme.value };
++                assert_eq!(info.style.fg, Some(expected_fg));
++                assert_eq!(info.style.bg, None, "no filled icon background");
++                assert!(info.style.add_modifier.contains(Modifier::BOLD));
++                assert!(super::super::theme::contrast_ratio(expected_fg, theme.panel_bg) >= 4.5);
++                assert_eq!(Line::from(plain.spans.clone()).width(),
++                    Line::from(with_info.spans.clone()).width(),
++                    "information affordance must not change any pill positions");
++                assert_eq!(with_info.spans[1..4].iter().map(Span::width).sum::<usize>(),
++                    plain.spans[1].width());
++            }
++        }
++    }
+ }
+--- a/src/tui/convert_screen.rs
++++ b/src/tui/convert_screen.rs
+@@ -347,13 +347,16 @@
+                 buttons.record_button(TuiButton::HdcdInfo, Rect::new(label_col + 13, y, 2, 1));
+             }
+             FormatField::ReplayGain => register_pill_row(buttons, &state.replaygain, y, label_col, TuiButton::ReplayGainPill),
+-            FormatField::PcmTruePeak => register_pill_row(
+-                buttons,
+-                &state.pcm_gain_mode,
+-                y,
+-                label_col,
+-                TuiButton::PcmTruePeakPill,
+-            ),
++            FormatField::PcmTruePeak => {
++                register_pill_row(buttons, &state.pcm_gain_mode, y, label_col,
++                    TuiButton::PcmTruePeakPill);
++                if area.width >= 30 && area.height >= 6 {
++                    // The literal U+24D8 plus its same-style guard cell occupy
++                    // two otherwise unused label cells. No pill is displaced.
++                    buttons.record_button(TuiButton::PcmGainInfo,
++                        Rect::new(area.x + 13, y, 2, 1));
++                }
++            }
+             FormatField::PcmGainDb => buttons.record_button(
+                 TuiButton::PcmGainDbField,
+                 ratatui::layout::Rect::new(area.x, y, area.width, 1),
+@@ -1496,3 +1499,141 @@
+         assert!(!all_text.contains("TP target"));
+     }
+ }
++
++#[cfg(test)]
++mod pcm_gain_info_regressions {
++    use super::*;
++    use crate::config::TonepoetConfig;
++    use crate::tui::app::{ActiveOverlay, AppScreen, PcmGainMode};
++    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
++    use ratatui::{backend::TestBackend, Terminal};
++
++    fn render(app: &mut AppState, width: u16, height: u16) -> Terminal<TestBackend> {
++        let theme = crate::tui::theme::theme_by_slug(
++            crate::tui::theme::default_theme_slug(),
++        ).expect("default theme");
++        app.current_screen = AppScreen::Convert;
++        app.convert.focus = ConvertFocus::Format;
++        app.convert.layout = ConvertLayout::Maximized(ConvertFocus::Format);
++        app.button_map.clear();
++        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
++        terminal.draw(|frame| draw_convert_screen(frame, frame.size(), app, theme))
++            .expect("draw maximized Format pane");
++        terminal
++    }
++
++    fn rendered_text(terminal: &Terminal<TestBackend>, width: u16, y: u16) -> String {
++        (0..width).map(|x| terminal.backend().buffer().get(x, y).symbol().to_string())
++            .collect()
++    }
++
++    #[test]
++    fn pcm_gain_info_is_visible_clickable_and_does_not_overlap_pills_at_narrow_widths() {
++        for width in [44u16, 64, 80, 100, 120] {
++            for mode in [PcmGainMode::Off, PcmGainMode::TruePeakGuard,
++                PcmGainMode::TruePeakNormalize, PcmGainMode::FixedGain] {
++                let height = 50;
++                let mut app = AppState::new_for_test(TonepoetConfig::default());
++                assert!(app.convert.format.pcm_gain_mode.select_value(&mode));
++                app.convert.format.field_focus = FormatField::PcmTruePeak;
++                let terminal = render(&mut app, width, height);
++                let row = (0..height).find(|&y|
++                    rendered_text(&terminal, width, y).contains("PCM gain"))
++                    .expect("PCM gain row visible in maximized Format pane");
++                let glyph_x = (0..width).find(|&x|
++                    terminal.backend().buffer().get(x, row).symbol() == "ⓘ")
++                    .expect("literal U+24D8 drawn even when pills extend beyond pane");
++                let info_rect = app.button_map.find_button_rect(&TuiButton::PcmGainInfo)
++                    .expect("visible PCM gain information hitbox");
++                assert_eq!((info_rect.x, info_rect.y, info_rect.width), (glyph_x, row, 2));
++                assert_eq!(glyph_x, 13, "the icon uses spare label space, without moving pills");
++                for x in glyph_x..glyph_x + 2 {
++                    assert_eq!(app.button_map.find_button_at(x, row), Some(TuiButton::PcmGainInfo));
++                }
++                for index in 0..4 {
++                    let pill = TuiButton::PcmTruePeakPill(index);
++                    let rect = app.button_map.find_button_rect(&pill).expect("original gain pill");
++                    assert_eq!(rect.y, row);
++                    assert!(rect.x >= glyph_x + 2, "glyph may not overlap a gain pill");
++                    if rect.x < width - 1 {
++                        assert_eq!(app.button_map.find_button_at(rect.x, row), Some(pill));
++                    }
++                }
++                let prior_gain = *app.convert.format.pcm_gain_mode.selected_value();
++                let prior_db = app.convert.format.pcm_fixed_gain_db;
++                let prior_ceiling = app.convert.format.pcm_true_peak_target_dbtp;
++                let prior_override = app.convert.format.pcm_gain_overridden;
++                let (tx, _rx) = tokio::sync::mpsc::channel(8);
++                crate::tui::keybindings::handle_mouse(&mut app, MouseEvent {
++                    kind: MouseEventKind::Down(MouseButton::Left), column: glyph_x + 1,
++                    row, modifiers: KeyModifiers::NONE,
++                }, &tx);
++                assert!(matches!(&app.active_overlay, ActiveOverlay::Notice { title, message, scroll }
++                    if title == "PCM gain"
++                    && message == crate::tui::keybindings::PCM_GAIN_INFO_MESSAGE
++                    && *scroll == 0));
++                assert_eq!(*app.convert.format.pcm_gain_mode.selected_value(), prior_gain);
++                assert_eq!(app.convert.format.pcm_fixed_gain_db, prior_db);
++                assert_eq!(app.convert.format.pcm_true_peak_target_dbtp, prior_ceiling);
++                assert_eq!(app.convert.format.pcm_gain_overridden, prior_override);
++                crate::tui::keybindings::handle_key(&mut app,
++                    KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
++                assert!(matches!(app.active_overlay, ActiveOverlay::None));
++                assert_eq!(app.convert.format.field_focus, FormatField::PcmTruePeak);
++                crate::tui::keybindings::handle_key(&mut app,
++                    KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE), &tx);
++                assert!(matches!(app.active_overlay, ActiveOverlay::Notice { .. }),
++                    "focused PCM gain row also opens help by keyboard");
++                crate::tui::keybindings::handle_key(&mut app,
++                    KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
++                assert!(matches!(app.active_overlay, ActiveOverlay::None));
++                assert_eq!(*app.convert.format.pcm_gain_mode.selected_value(), prior_gain);
++            }
++        }
++    }
++
++    #[test]
++    fn pcm_gain_notice_is_readable_and_scrolls_to_fixed_gain_without_markdown() {
++        const WIDTH: u16 = 80;
++        const HEIGHT: u16 = 24;
++        let mut app = AppState::new_for_test(TonepoetConfig::default());
++        app.convert.format.field_focus = FormatField::PcmTruePeak;
++        // Render the larger Format screen first, then use the actual Notice overlay renderer.
++        let _ = render(&mut app, WIDTH, 50);
++        let (tx, _rx) = tokio::sync::mpsc::channel(8);
++        crate::tui::keybindings::handle_key(&mut app,
++            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE), &tx);
++        let message = crate::tui::keybindings::PCM_GAIN_INFO_MESSAGE;
++        let headings = ["Off\n", "True-peak guard\n", "True-peak normalize\n", "Fixed gain\n"];
++        let positions = headings.map(|heading| message.find(heading).expect("help heading"));
++        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]),
++            "all four headings must appear in the correct order");
++        assert_eq!(message.matches("Choose this when").count(), 4);
++        assert!(!message.contains("**"), "Notice uses plain-text headings, not Markdown");
++        let max_scroll = crate::tui::draw_overlays::notice_message_max_scroll(
++            Rect::new(0, 0, WIDTH, HEIGHT), message);
++        assert!(max_scroll > 0, "the long help must scroll on a standard terminal");
++        let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();
++        terminal.draw(|frame| crate::tui::draw::draw_ui(frame, &mut app)).unwrap();
++        let first_page = (0..HEIGHT)
++            .map(|y| rendered_text(&terminal, WIDTH, y)).collect::<String>();
++        assert!(first_page.contains("PCM gain"));
++        assert!(first_page.contains("Controls whether"));
++        // Scroll to the end through the same persistent Notice state consumed by the renderer.
++        if let ActiveOverlay::Notice { scroll, .. } = &mut app.active_overlay {
++            *scroll = max_scroll;
++        } else {
++            panic!("information popup must still be open");
++        }
++        terminal.draw(|frame| crate::tui::draw::draw_ui(frame, &mut app)).unwrap();
++        let last_page = (0..HEIGHT)
++            .map(|y| rendered_text(&terminal, WIDTH, y)).collect::<String>();
++        assert!(last_page.contains("Fixed gain"));
++        assert!(last_page.contains("clipping"));
++        assert!(app.button_map.find_button_rect(&TuiButton::OverlayCancel).is_some());
++        crate::tui::keybindings::handle_key(&mut app,
++            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
++        assert!(matches!(app.active_overlay, ActiveOverlay::None));
++        assert_eq!(app.convert.format.field_focus, FormatField::PcmTruePeak);
++    }
++}
+--- a/src/tui/keybindings.rs
++++ b/src/tui/keybindings.rs
+@@ -29,6 +29,25 @@
+ 
+ This setting does not fix hum, clipping, or CD pre-emphasis."#;
+ 
++/// Plain-text Notice: standalone section headings and paragraph breaks are
++/// deliberate. The existing Notice does not parse Markdown.
++pub(crate) const PCM_GAIN_INFO_MESSAGE: &str = concat!(
++    "Controls whether TonePoet changes the audio's volume level during conversion.\n\n",
++    "Off\n",
++    "Leaves the audio's level unchanged by this setting. Other processing you've selected may still affect it.\n\n",
++    "Choose this when you want to preserve the original level and don't need a gain adjustment.\n\n",
++    "True-peak guard\n",
++    "Checks whether the audio's highest peaks would exceed your selected ceiling. If necessary, turns the entire recording down just enough to stay within that limit. It never turns quieter audio up.\n\n",
++    "Choose this when you want protection against excessive peaks without otherwise changing the recording's level. Note: TonePoet normally selects True-peak guard automatically when converting from floating-point to integer PCM (e.g., 32-bit float to 24-bit integer) or from lossless to lossy (e.g., FLAC to AAC), when it knows the source and output formats. Your explicit choice or preset takes priority, and the automatic default does not apply to HDCD decoding for lossy output.\n\n",
++    "True-peak normalize\n",
++    "Measures the audio's highest peaks, then turns the entire recording up or down so its maximum true peak approaches your specified ceiling without exceeding it.\n\n",
++    "Choose this when you want recordings to reach a consistent peak level. It does not make different recordings sound equally loud.\n\n",
++    "For lossy output, TonePoet caps a higher selected ceiling at -0.10 dBTP before encoding; lossy encoding can change the resulting peaks.\n\n",
++    "Fixed gain\n",
++    "Raises or lowers the entire recording by the exact amount you specify, in decibels (dB). Positive values increase the level; negative values decrease it.\n\n",
++    "Choose this when you already know how much adjustment you want. Increasing gain can cause clipping if the resulting peaks are too high. Unlike with True-peak, TonePoet does not automatically prevent clipping with this mode."
++);
++
+ pub(crate) const DEEMPHASIS_INFO_MESSAGE: &str = concat!(
+     "This disc was mastered with pre-emphasis: the treble was boosted on the CD, and the player is meant to cut it back on playback.\n\n",
+     "On — tonepoet removes the boost now, so the file plays correctly anywhere. This is a filter, not a tag change: the audio is altered, and the output will not be bit-identical to the source even when both sides are lossless at 16-bit/44.1 kHz.\n\n",
+@@ -922,6 +941,16 @@
+                 message: DC_CORRECTION_INFO_MESSAGE.to_string(), scroll: 0,
+             };
+         }
++        (KeyCode::Char('i'), KeyModifiers::NONE)
++            if app.convert.focus == ConvertFocus::Format
++                && !app.convert.is_collapsed(ConvertFocus::Format)
++                && app.convert.format.field_focus == FormatField::PcmTruePeak =>
++        {
++            app.active_overlay = ActiveOverlay::Notice {
++                title: "PCM gain".to_string(),
++                message: PCM_GAIN_INFO_MESSAGE.to_string(), scroll: 0,
++            };
++        }
+ 
+         // Format pane navigation.
+         (KeyCode::Enter | KeyCode::Char('e'), KeyModifiers::NONE)
+@@ -72474,6 +72503,14 @@
+                     scroll: 0,
+                 };
+             }
++            TuiButton::PcmGainInfo => {
++                app.convert.focus = ConvertFocus::Format;
++                app.active_overlay = ActiveOverlay::Notice {
++                    title: "PCM gain".to_string(),
++                    message: PCM_GAIN_INFO_MESSAGE.to_string(),
++                    scroll: 0,
++                };
++            }
+             TuiButton::FormatSettingsButton => {
+                 app.convert.focus = ConvertFocus::Format;
+                 let fmt = &app.convert.format;

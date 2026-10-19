@@ -47,6 +47,12 @@ pub struct TuiPreset {
     pub output_channel_layout: Option<String>, // source | stereo
     #[serde(default)]
     pub remove_dc_offset: bool,
+    /// Explicit R2 mode; None means the legacy 2 Hz high-pass boolean controls it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dc_correction_mode: Option<String>,
+    /// Signed normalized PCM amplitude, expressed in billionths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dc_manual_nanounits: Option<i64>,
     #[serde(default = "default_resampler")]
     pub resampler: String, // "sox", "ssrc", "soxr"
     /// Explicit user de-emphasis override. None means follow source/target automatic policy.
@@ -233,6 +239,8 @@ impl PresetWireLegacy {
             deemphasis: None,
             output_channel_layout: None,
             remove_dc_offset: false,
+            dc_correction_mode: None,
+            dc_manual_nanounits: None,
             hdcd_decode: None,
             hdcd_auto_depth: None,
             hdcd_auto_dither: None,
@@ -448,7 +456,14 @@ impl TuiPreset {
                 crate::tui::app::OutputChannelLayoutChoice::Source => "source",
                 crate::tui::app::OutputChannelLayoutChoice::Stereo => "stereo",
             }.to_string()),
-            remove_dc_offset: format.remove_dc_offset,
+            remove_dc_offset: *format.dc_correction.selected_value() == crate::tui::app::DcCorrectionMode::HighPass,
+            dc_correction_mode: Some(match format.dc_correction.selected_value() {
+                crate::tui::app::DcCorrectionMode::Off => "off",
+                crate::tui::app::DcCorrectionMode::AutoShift => "auto_shift",
+                crate::tui::app::DcCorrectionMode::HighPass => "high_pass",
+                crate::tui::app::DcCorrectionMode::Manual => "manual",
+            }.to_owned()),
+            dc_manual_nanounits: Some(format.dc_manual_nanounits),
             deemphasis: format.deemphasis_overridden.then_some(format.deemphasis_enabled),
             hdcd_decode: format.hdcd_decode_overridden.then_some(format.hdcd_decode_enabled),
             hdcd_auto_depth: format.hdcd_promoted_from_depth.map(|_| true),
@@ -935,7 +950,23 @@ impl TuiPreset {
             };
             report.record("output_channel_layout", channel_choice.is_some_and(|value|
                 format_state.output_channel_layout.select_value(&value)));
-            format_state.remove_dc_offset = self.remove_dc_offset;
+            let mode = match self.dc_correction_mode.as_deref() {
+                None => Some(if self.remove_dc_offset {
+                    crate::tui::app::DcCorrectionMode::HighPass
+                } else { crate::tui::app::DcCorrectionMode::Off }),
+                Some("off") => Some(crate::tui::app::DcCorrectionMode::Off),
+                Some("auto_shift") => Some(crate::tui::app::DcCorrectionMode::AutoShift),
+                Some("high_pass") => Some(crate::tui::app::DcCorrectionMode::HighPass),
+                Some("manual") => Some(crate::tui::app::DcCorrectionMode::Manual),
+                Some(_) => None,
+            };
+            report.record("dc_correction_mode", mode.is_some_and(|value|
+                format_state.dc_correction.select_value(&value)));
+            if let Some(value) = self.dc_manual_nanounits {
+                let accepted = (-1_000_000_000..=1_000_000_000).contains(&value);
+                if accepted { format_state.dc_manual_nanounits = value; }
+                report.record("dc_manual_nanounits", accepted);
+            }
             report.record("remove_dc_offset", true);
             match self.hdcd_decode {
                 Some(enabled) => {
@@ -1880,7 +1911,7 @@ mod companion_preset_tests {
         assert!(format.output_channel_layout.select_value(
             &crate::tui::app::OutputChannelLayoutChoice::Stereo,
         ));
-        format.remove_dc_offset = true;
+        assert!(format.dc_correction.select_value(&crate::tui::app::DcCorrectionMode::HighPass));
         let preset = TuiPreset::from_pill_state(
             "stereo-dc",
             &format,
@@ -1891,12 +1922,44 @@ mod companion_preset_tests {
         let saved: TuiPreset = serde_json::from_str(&encoded).expect("deserialize preset");
         assert_eq!(saved.output_channel_layout.as_deref(), Some("stereo"));
         assert!(saved.remove_dc_offset);
+        assert_eq!(saved.dc_correction_mode.as_deref(), Some("high_pass"));
         let mut old: serde_json::Value = serde_json::from_str(&encoded).unwrap();
         old.as_object_mut().unwrap().remove("output_channel_layout");
         old.as_object_mut().unwrap().remove("remove_dc_offset");
+        old.as_object_mut().unwrap().remove("dc_correction_mode");
+        old.as_object_mut().unwrap().remove("dc_manual_nanounits");
         let old: TuiPreset = serde_json::from_value(old).expect("legacy preset remains valid");
         assert!(old.output_channel_layout.is_none());
         assert!(!old.remove_dc_offset);
+    }
+
+    #[test]
+    fn legacy_on_means_highpass_and_new_modes_and_manual_values_round_trip() {
+        use crate::tui::app::DcCorrectionMode;
+        let default = current_test_preset("legacy-dc");
+        let mut old: serde_json::Value = serde_json::to_value(&default).unwrap();
+        old.as_object_mut().unwrap().remove("dc_correction_mode");
+        old.as_object_mut().unwrap().remove("dc_manual_nanounits");
+        old["remove_dc_offset"] = serde_json::Value::Bool(true);
+        let old: TuiPreset = serde_json::from_value(old).unwrap();
+        let mut format = FormatState::new();
+        old.apply_to_pills(&mut format, &mut OutputOptionsState::new(), &mut MetadataState::default());
+        assert_eq!(*format.dc_correction.selected_value(), DcCorrectionMode::HighPass);
+
+        for mode in [DcCorrectionMode::AutoShift, DcCorrectionMode::Manual] {
+            let mut initial = FormatState::new();
+            assert!(initial.dc_correction.select_value(&mode));
+            initial.dc_manual_nanounits = -3_000_000;
+            let encoded = serde_json::to_string(&TuiPreset::from_pill_state(
+                "new-dc", &initial, &OutputOptionsState::new(), &MetadataState::default()
+            )).unwrap();
+            let parsed: TuiPreset = serde_json::from_str(&encoded).unwrap();
+            let mut restored = FormatState::new();
+            parsed.apply_to_pills(&mut restored, &mut OutputOptionsState::new(),
+                &mut MetadataState::default());
+            assert_eq!(*restored.dc_correction.selected_value(), mode);
+            assert_eq!(restored.dc_manual_nanounits, -3_000_000);
+        }
     }
 
     fn eligible_preemphasized_16441_state() -> FormatState {

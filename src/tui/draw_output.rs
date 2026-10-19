@@ -152,14 +152,39 @@ pub fn draw_format_pane(
                         row_focused,
                         theme,
                     )),
-                    FormatField::RemoveDcOffset => lines.push(pill_row(
-                        border_color,
-                        w,
-                        "DC removal ",
-                        "2 Hz HPF",
-                        &deemphasis_pill_spans(format_state.remove_dc_offset, row_focused, theme),
-                        row_focused,
-                        theme,
+                    FormatField::RemoveDcOffset => {
+                        let labels = dc_correction_labels(w);
+                        let selected = *format_state.dc_correction.selected_value();
+                        let mut spans = Vec::new();
+                        for (index, label) in labels.into_iter().enumerate() {
+                            if index != 0 { spans.push(Span::raw("  ")); }
+                            let active = match index {
+                                0 => selected == super::app::DcCorrectionMode::Off,
+                                1 => selected == super::app::DcCorrectionMode::AutoShift,
+                                2 => selected == super::app::DcCorrectionMode::HighPass,
+                                _ => selected == super::app::DcCorrectionMode::Manual,
+                            };
+                            let style = if active {
+                                Style::default().fg(theme.pill_active_fg).bg(theme.pill_active_bg)
+                                    .add_modifier(Modifier::BOLD)
+                            } else if row_focused { Style::default().fg(theme.text_muted) }
+                              else { Style::default().fg(theme.text_dim) };
+                            spans.push(Span::styled(label, style));
+                        }
+                        lines.push(pill_row(border_color, w, "DC offset  ", "ⓘ",
+                            &spans, row_focused, theme));
+                    }
+                    FormatField::DcManualValue => lines.push(pill_row(
+                        border_color, w, "DC amount  ",
+                        "normalized PCM; positive means subtract",
+                        &[Span::styled(
+                            format!(" {} ", format_state.true_peak_target_editing
+                                .filter(|field| *field == FormatField::DcManualValue)
+                                .map(|_| format_state.true_peak_target_input.text.as_str())
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| super::app::dc_offset_label(format_state.dc_manual_nanounits))),
+                            if row_focused { theme.bright() } else { theme.muted() })],
+                        row_focused, theme,
                     )),
                     FormatField::Deemphasis => {
                         let suffix = deemphasis_status_suffix(format_state);
@@ -181,8 +206,8 @@ pub fn draw_format_pane(
                             row_focused, theme,
                         ));
                     }
-                    FormatField::PcmTruePeak => lines.push(pill_row(
-                        border_color, w, "PCM gain   ", "",
+                    FormatField::PcmTruePeak => lines.push(pcm_gain_info_row(
+                        border_color, w,
                         &render_pill_spans(&format_state.pcm_gain_mode, row_focused, theme),
                         row_focused, theme,
                     )),
@@ -490,6 +515,16 @@ fn deemphasis_status_suffix(format_state: &FormatState) -> &'static str {
         (false, ConvertDeemphasisEvidence::CatalogExact) => {
             "ⓘ this pressing is known pre-emphasised: turn on to correct it."
         }
+    }
+}
+
+pub(super) fn dc_correction_labels(width: usize) -> [&'static str; 4] {
+    if width >= 66 {
+        [" off ", " auto shift ", " high-pass ", " manual "]
+    } else if width >= 52 {
+        [" off ", " auto ", " HPF ", " manual "]
+    } else {
+        [" O ", " A ", " H ", " M "]
     }
 }
 
@@ -816,6 +851,30 @@ fn dim_pill_spans<'a>(spans: &[Span<'a>],
         .iter()
         .map(|span| Span::styled(span.content.clone(), Style::default().fg(theme.text_dim)))
         .collect()
+}
+
+/// The four PCM gain pills occupy the full row on narrow terminals. Put help
+/// in the unused two cells of the label area, keeping every pill's original
+/// position and clickable width. Both the glyph and its guard cell use the
+/// established foreground-only information style.
+fn pcm_gain_info_row<'a>(
+    border_color: ratatui::style::Color,
+    width: usize,
+    pills: &[Span<'a>],
+    focused: bool,
+    theme: super::theme::Theme,
+) -> Line<'a> {
+    let mut row = pill_row(border_color, width, "PCM gain   ", "", pills, focused, theme);
+    let label_style = if focused { theme.bright() } else { theme.muted() };
+    let info_fg = if theme.dark { theme.info } else { theme.value };
+    // Replace the existing 16-cell label span with 12 + 2 + 2 cells.
+    // The first pill still starts at x=17 (including the left border).
+    row.spans.splice(1..2, [
+        Span::styled("   PCM gain ", label_style),
+        Span::styled("ⓘ ", Style::default().fg(info_fg).add_modifier(Modifier::BOLD)),
+        Span::styled("  ", label_style),
+    ]);
+    row
 }
 
 fn pill_row<'a>(
@@ -1165,6 +1224,37 @@ mod r32_true_peak_help_renderer_tests {
             assert_eq!(text.contains("lossy encoder input capped"), lossy_capped && !editing);
             if editing {
                 assert!(text.contains("Enter: apply"));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod pcm_gain_info_glyph_tests {
+    use super::*;
+
+    #[test]
+    fn pcm_gain_info_uses_foreground_only_contrasting_unicode_guard() {
+        for palette in super::super::theme::palettes() {
+            let theme = super::super::theme::theme_by_slug(palette.slug)
+                .expect("shipped theme");
+            for focused in [false, true] {
+                let plain = pill_row(theme.green, 80, "PCM gain   ", "",
+                    &[Span::raw(" off ")], focused, theme);
+                let with_info = pcm_gain_info_row(theme.green, 80,
+                    &[Span::raw(" off ")], focused, theme);
+                let info = with_info.spans.iter().find(|span|
+                    span.content.as_ref() == "ⓘ ").expect("glyph and guard cell");
+                let expected_fg = if theme.dark { theme.info } else { theme.value };
+                assert_eq!(info.style.fg, Some(expected_fg));
+                assert_eq!(info.style.bg, None, "no filled icon background");
+                assert!(info.style.add_modifier.contains(Modifier::BOLD));
+                assert!(super::super::theme::contrast_ratio(expected_fg, theme.panel_bg) >= 4.5);
+                assert_eq!(Line::from(plain.spans.clone()).width(),
+                    Line::from(with_info.spans.clone()).width(),
+                    "information affordance must not change any pill positions");
+                assert_eq!(with_info.spans[1..4].iter().map(Span::width).sum::<usize>(),
+                    plain.spans[1].width());
             }
         }
     }

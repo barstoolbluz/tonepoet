@@ -49,12 +49,16 @@ pub enum TuiButton {
     DitherPill(usize),
     ChannelLayoutPill(usize),
     RemoveDcPill(usize),
+    DcInfo,
+    DcManualValueField,
     DeemphasisPill(usize),
     DeemphasisInfo,
     HdcdPill(usize),
     HdcdInfo,
     /// Shared true-peak explanation on PCM and DSD target rows.
     TruePeakInfo,
+    /// Explanation of the four PCM gain choices, independent of the true-peak target help.
+    PcmGainInfo,
     ReplayGainPill(usize),
     PcmTruePeakPill(usize),
     TruePeakScopePill(usize),
@@ -612,11 +616,14 @@ impl TuiButton {
             | Self::DitherPill(_)
             | Self::ChannelLayoutPill(_)
             | Self::RemoveDcPill(_)
+            | Self::DcInfo
+            | Self::DcManualValueField
             | Self::DeemphasisPill(_)
             | Self::DeemphasisInfo
             | Self::HdcdPill(_)
             | Self::HdcdInfo
             | Self::TruePeakInfo
+            | Self::PcmGainInfo
             | Self::ReplayGainPill(_)
             | Self::PcmTruePeakPill(_)
             | Self::TruePeakScopePill(_)

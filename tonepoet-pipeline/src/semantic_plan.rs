@@ -323,6 +323,8 @@ pub enum ObservationClass {
     SourceAudioDigest,
     /// Independent post-terminal acceptance/verification observation.
     TerminalVerification,
+    /// Complete-reader per-channel DC baseline observation, not a defect diagnosis.
+    DcBaseline,
 }
 
 /// Selected physical read/measurement contract for an observation.
@@ -389,6 +391,8 @@ pub enum ObservationKind {
     SourceAudioMd5,
     /// Independent terminal decode/verification.
     TerminalVerification,
+    /// Per-channel Float64 DC baseline observation (policy version is part of identity).
+    DcBaseline { policy_version: u32 },
 }
 
 
@@ -420,6 +424,7 @@ impl ObservationKind {
             Self::ReplayGain { .. } => ObservationClass::Loudness,
             Self::SourceAudioMd5 => ObservationClass::SourceAudioDigest,
             Self::TerminalVerification => ObservationClass::TerminalVerification,
+            Self::DcBaseline { .. } => ObservationClass::DcBaseline,
         }
     }
 }
@@ -534,6 +539,9 @@ pub enum DecisionKind {
         /// Fully resolved qualified Reference policy; exact modes remain exact.
         policy: ResolvedGainPolicy,
     },
+    /// Decide whether a constant per-channel DC subtraction is supported by
+    /// this exact input signal. A skip remains an explicit resolved decision.
+    DcCorrection { policy_version: u32 },
     /// Native ReplayGain projection/writer decision.
     ReplayGainProjection {
         /// Resolved projection policy. Clipping prevention affects projection,
@@ -651,6 +659,12 @@ pub enum RegisteredUnaryEffect {
     /// Remove unknown DC bias with a 2-Hz high-pass, not a fixed dcshift gain.
     /// This necessarily also filters content very close to 0 Hz.
     RemoveDcOffset,
+    /// Observe the exact Float64 PCM correction input, decide conservatively,
+    /// and subtract independently per channel if the observation supports it.
+    DcShiftAuto,
+    /// Remove one signed normalized PCM offset (nanounits) from every channel.
+    /// The operand describes the value to REMOVE, not a backend addition.
+    DcShiftManual { offset_nanounits: i64 },
     /// Backend-neutral Red Book CD de-emphasis intent. Physical planning may
     /// realize this with a qualified SoX-ng or FFmpeg candidate.
     CdDeemphasis,
@@ -723,6 +737,9 @@ pub enum EffectArgumentMapping {
     SoxEffect(Vec<String>),
     /// One FFmpeg audio-filter expression to compose into the selected filtergraph.
     FfmpegAudioFilter(String),
+    /// In-process Float64 subtraction. `None` declares an unresolved automatic
+    /// observation dependency; `Some` is explicit, typed, fixed user input.
+    NativeDcShift { offset_nanounits: Option<i64>, policy_version: u32 },
 }
 
 /// Registered lowering and contract for an effect instance.
@@ -1365,6 +1382,8 @@ pub enum TypedPlanNode {
         selected_candidate: usize,
         /// Exact selected lowering retained for the existing Phase-3 bridge.
         lowering: EffectLowering,
+        /// A measured DC effect cannot run until this decision is resolved.
+        dc_decision: Option<DecisionId>,
     },
     /// Explicit DSD reconstruction export-level boundary.
     ExportDsdLevel {
@@ -1722,6 +1741,11 @@ pub enum CandidateSelectionError {
     Resource(PlanningResourceLimit),
 }
 
+// Only the direct FFmpeg raw-Float64 terminal can bind verified speaker roles
+// from a multichannel DC carrier before the input is decoded. Keep this as a
+// candidate capability, not a late replacement of the charged terminal.
+const MULTICHANNEL_DC_RAW_LAYOUT_CONTRACT: &str = "verified_multichannel_dc_raw_input_layout";
+
 const DEFAULT_CANDIDATE_ALTERNATIVE_LIMIT: usize = 8;
 
 #[derive(Debug, Clone)]
@@ -2048,13 +2072,28 @@ fn prepare_registered_effect_segment(
                 "effect.{}.float64_carrier",
                 instance.id.0
             )),
-            processing_domain: Fact::Known(ProcessingDomain::PcmFloating),
-            // A Float64 carrier does not by itself establish a protected value
-            // or overload-preservation proof for the effect arithmetic.
-            value_domain: ValueDomain::Pending(format!(
-                "effect.{}.output_value_domain",
-                instance.id.0
-            )),
+            // Only the native DC writer has an explicit Float64 arithmetic
+            // contract. Other effects cannot inherit a protected numeric
+            // domain merely because their carrier stores Float64 samples.
+            processing_domain: Fact::Known(if matches!(
+                &instance.effect,
+                RegisteredUnaryEffect::DcShiftAuto | RegisteredUnaryEffect::DcShiftManual { .. }
+            ) {
+                ProcessingDomain::Binary64
+            } else {
+                ProcessingDomain::PcmFloating
+            }),
+            value_domain: if matches!(
+                &instance.effect,
+                RegisteredUnaryEffect::DcShiftAuto | RegisteredUnaryEffect::DcShiftManual { .. }
+            ) {
+                ValueDomain::FiniteFloating
+            } else {
+                ValueDomain::Pending(format!(
+                    "effect.{}.output_value_domain",
+                    instance.id.0
+                ))
+            },
             level_basis: input_state.level_basis,
             claims: BTreeSet::new(),
             obligations: input_state.obligations,
@@ -2181,6 +2220,46 @@ fn commit_registered_effect_segment(
     require_protected_true_peak: bool,
 ) -> Result<(), PlanRefusal> {
     for prepared in prepared {
+        // A measured shift has a typed observation on the *input* boundary
+        // immediately preceding its physical effect. The decision is explicit
+        // and owned by the same participant, never an invisible zero-parameter
+        // effect later mutated in an executor.
+        let dc_decision = if matches!(&prepared.instance.effect, RegisteredUnaryEffect::DcShiftAuto) {
+            let local_id = prepared.instance.id.0.checked_add(1_000_000).ok_or_else(|| PlanRefusal {
+                code: "dc_observation_id_exhausted".to_owned(),
+                reason: "DC effect identity exceeded the reserved typed observation range".to_owned(),
+            })?;
+            let observation = ObservationId(local_id);
+            let decision = DecisionId(local_id);
+            let scope = track_scope_id(request);
+            nodes.push(TypedPlanNode::Observe(Observation {
+                id: observation,
+                scope: scope.clone(),
+                participant: request.plan_scope.participant_id().clone(),
+                subject: prepared.input,
+                artifact_subject: None,
+                kind: ObservationKind::DcBaseline { policy_version: 1 },
+                complete_reader_required: true,
+                read_contract: ObservationReadContract {
+                    authority: "tonepoet-native-f64-dc/v1".to_owned(),
+                    accepted_processing_domains: BTreeSet::from([ProcessingDomain::Binary64]),
+                    accepted_value_domains: BTreeSet::from([ValueDomain::FiniteFloating]),
+                    complete_reader: true,
+                    connected_executor: true,
+                },
+            }));
+            nodes.push(TypedPlanNode::Decide(Decision {
+                id: decision,
+                kind: DecisionKind::DcCorrection { policy_version: 1 },
+                observations: vec![ScopedObservationId {
+                    scope,
+                    participant: request.plan_scope.participant_id().clone(),
+                    observation,
+                    purpose: ObservationClass::DcBaseline,
+                }],
+            }));
+            Some(decision)
+        } else { None };
         let selected_candidate = selected_registered_effect_candidate(
             request,
             &prepared.instance.effect,
@@ -2197,6 +2276,7 @@ fn commit_registered_effect_segment(
             candidates: prepared.candidates,
             selected_candidate,
             lowering,
+            dc_decision,
         });
     }
     Ok(())
@@ -3898,6 +3978,49 @@ fn plan_typed_with_effects_and_policy(
                 contract_for_operation(&operation),
                 None,
             );
+            // An active multichannel DC shift feeds the certified terminal
+            // through a raw Float64 carrier, including Custom DSD-to-PCM
+            // certified prepasses. SoX cannot bind the original verified
+            // speaker roles at that raw ingress. Select and charge a capable
+            // terminal *before* the raw carrier exists; never replace the
+            // frozen terminal at final lowering. StereoFold has already
+            // reduced the typed channel count to two; Reference is sealed.
+            let needs_multichannel_dc_raw_layout = intent.gain_policy.is_true_peak()
+                && !intent.reference_delivery
+                && matches!(&input_state.channels, Fact::Known(channels) if *channels > 2)
+                && ordered_effects.iter().any(|effect| matches!(
+                    &effect.effect,
+                    RegisteredUnaryEffect::DcShiftAuto
+                        | RegisteredUnaryEffect::DcShiftManual { .. }
+                ));
+            // SSRC is a rate-changing *resampler*, not a raw-Float64 PCM
+            // encoder. An explicit SSRC preference is compatible only when
+            // the already-admitted, independent resampler is actually SSRC;
+            // the terminal below must still satisfy the FFmpeg-only layout
+            // contract. No rate change or unqualified SSRC cell is excused.
+            let selected_ssrc_resampler = needs_multichannel_dc_raw_layout
+                && request.settings.preferred_tool == PreferredTool::Ssrc
+                && nodes.iter().any(|node| matches!(node,
+                    TypedPlanNode::Operation {
+                        operation: PlanOperation::ResamplePcm { .. },
+                        candidates,
+                        selected_candidate,
+                        ..
+                    } if candidates.get(*selected_candidate)
+                        .is_some_and(|candidate| candidate.tool == Some(ToolIdentifier::Ssrc))
+                ));
+            if needs_multichannel_dc_raw_layout
+                && !matches!(
+                    &request.settings.preferred_tool,
+                    PreferredTool::Auto | PreferredTool::Ffmpeg
+                )
+                && !selected_ssrc_resampler
+            {
+                return Ok(PlanningOutcome::Refused(PlanRefusal {
+                    code: "multichannel_dc_terminal_preference".to_owned(),
+                    reason: "certified multichannel DC subtraction requires a verified-layout FFmpeg raw terminal; the explicit backend preference does not identify a separately admitted SSRC resampler".to_owned(),
+                }));
+            }
             for candidate in &mut candidates {
                 candidate.contract = terminal_contract_for_candidate(
                     request,
@@ -3907,6 +4030,22 @@ fn plan_typed_with_effects_and_policy(
                     &input_state,
                     candidate.tool.as_ref(),
                 );
+                if needs_multichannel_dc_raw_layout
+                    && candidate.tool.as_ref() == Some(&ToolIdentifier::Ffmpeg)
+                    && (matches!(
+                        candidate.contract.terminal_realization.as_ref(),
+                        Some(SelectedTerminalRealization::Pcm(realization))
+                            if realization.kind == PcmTerminalRealizationKind::FfmpegDirect
+                                && !realization.wavpack_hybrid
+                    ) || matches!(
+                        candidate.contract.terminal_realization.as_ref(),
+                        Some(SelectedTerminalRealization::LossyFfmpegEncoderInput { .. })
+                    ))
+                {
+                    candidate.contract.runtime_obligations.insert(
+                        MULTICHANNEL_DC_RAW_LAYOUT_CONTRACT.to_owned(),
+                    );
+                }
                 if let Some(obligation) = selected_reader_obligation.as_ref() {
                     candidate.contract.runtime_obligations.insert(obligation.clone());
                 }
@@ -3927,6 +4066,11 @@ fn plan_typed_with_effects_and_policy(
             );
             requirements.terminal_realization_required =
                 matches!(operation, PlanOperation::EncodePcm { .. });
+            if needs_multichannel_dc_raw_layout {
+                requirements.required_runtime_obligations.insert(
+                    MULTICHANNEL_DC_RAW_LAYOUT_CONTRACT.to_owned(),
+                );
+            }
             if let Some(obligation) = selected_reader_obligation {
                 requirements.required_runtime_obligations.insert(obligation);
             }
@@ -5802,6 +5946,39 @@ pub fn registered_effect_candidates(
             ),
             contract: plain,
         }],
+        RegisteredUnaryEffect::DcShiftAuto | RegisteredUnaryEffect::DcShiftManual { .. } => {
+            // The native implementation traverses interleaved Float64 and
+            // writes `sample - resolved_offset` in Float64. It refuses
+            // nonfinite results; it neither clamps above-full-scale samples
+            // nor quantizes/dithers. This is the actual overload-preserving
+            // contract needed when protected SSRC feeds post-resample DC.
+            let mut native_contract = plain.clone();
+            native_contract.representation.accepted_processing_domains = all_pcm_processing_domains();
+            native_contract.representation.accepted_value_domains = all_pcm_value_domains();
+            native_contract.representation.emitted_processing_domain = Some(ProcessingDomain::Binary64);
+            native_contract.representation.emitted_precision = Some(StoragePrecision::Pcm(PcmBitDepth::Float64));
+            native_contract.representation.emitted_value_domain = Some(ValueDomain::FiniteFloating);
+            native_contract.runtime_obligations.insert(
+                "preserve_floating_overload_before_true_peak".to_owned(),
+            );
+            let offset_nanounits = match effect {
+                RegisteredUnaryEffect::DcShiftManual { offset_nanounits } => {
+                    if !(-1_000_000_000..=1_000_000_000).contains(offset_nanounits) {
+                        return Err(PlanRefusal {
+                            code: "dc_manual_offset_invalid".to_owned(),
+                            reason: "manual DC offset must be between -1 and +1 normalized PCM".to_owned(),
+                        });
+                    }
+                    Some(*offset_nanounits)
+                }
+                _ => None,
+            };
+            vec![EffectLowering {
+                tool: ToolIdentifier::Custom("tonepoet-native-f64-dc".to_owned()),
+                arguments: EffectArgumentMapping::NativeDcShift { offset_nanounits, policy_version: 1 },
+                contract: native_contract,
+            }]
+        }
         RegisteredUnaryEffect::RemoveDcOffset => vec![
             EffectLowering {
                 tool: ToolIdentifier::Sox,
@@ -6769,6 +6946,7 @@ mod tests {
             plan_scope: crate::plan::PlanScope::submitted_batch("test-submission", "test-track", Some(1)),
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
+            raw_input_channel_layout: None,
             resolved_output_target: None,
             reference_programme_scope: Default::default(),
             planned_riff_non_audio_upper_bound_bytes: None,
@@ -6803,6 +6981,7 @@ mod tests {
             plan_scope: PlanScope::track("pcm-track"),
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
+            raw_input_channel_layout: None,
             resolved_output_target: None,
             reference_programme_scope: Default::default(),
             planned_riff_non_audio_upper_bound_bytes: None,
@@ -6893,6 +7072,353 @@ mod tests {
                 _ => None,
             })
             .expect("plan must select a PCM terminal")
+    }
+
+    #[test]
+    fn multichannel_dc_true_peak_binds_layout_capable_terminal_before_proof_is_charged() {
+        let guard = SampleGainPolicy::TruePeakGuard {
+            target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            scope: TruePeakScope::Track,
+            scan: TruePeakScanTier::Standard,
+        };
+        for channels in [3, 4] {
+            for effect in [
+                RegisteredUnaryEffect::DcShiftManual { offset_nanounits: 3_000_000 },
+                RegisteredUnaryEffect::DcShiftAuto,
+            ] {
+                let mut request = pcm_request(guard);
+                request.source.format = AudioFormat::Flac;
+                request.source.codec = AudioCodec::Flac;
+                request.source.channels = Some(channels);
+                request.settings.preferred_tool = PreferredTool::Auto;
+                request.settings.dither_type = DitherType::None;
+                request.settings.dither_explicit = true;
+                // The final raw Float64 carrier and its channel mask do not
+                // exist yet: the candidate must be admitted from source
+                // geometry plus the registered effect's typed output state.
+                assert_eq!(request.raw_input_channel_layout, None);
+                let effects = explicit_effect_sequence([effect.clone()]);
+                let PlanningOutcome::Ready(plan) =
+                    plan_typed_with_effects(&request, &effects).expect("bounded planning")
+                else {
+                    panic!("multichannel true-peak DC must admit a qualified FFmpeg terminal")
+                };
+                let (selected, _) = selected_pcm_terminal(&plan);
+                assert_eq!(selected.tool, Some(ToolIdentifier::Ffmpeg));
+                assert!(selected.contract.terminal_proof.is_some(), "proof must bind chosen terminal");
+                assert!(selected.contract.runtime_obligations.contains(
+                    MULTICHANNEL_DC_RAW_LAYOUT_CONTRACT
+                ));
+                assert!(matches!(
+                    selected.contract.terminal_realization.as_ref(),
+                    Some(SelectedTerminalRealization::Pcm(realization))
+                        if realization.kind == PcmTerminalRealizationKind::FfmpegDirect
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn multichannel_dc_true_peak_refuses_incompatible_or_unproved_terminals_at_admission() {
+        let mut request = pcm_request(SampleGainPolicy::TruePeakGuard {
+            target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            scope: TruePeakScope::Track,
+            scan: TruePeakScanTier::Standard,
+        });
+        request.source.channels = Some(3);
+        request.settings.dither_type = DitherType::None;
+        request.settings.dither_explicit = true;
+        let effects = explicit_effect_sequence([
+            RegisteredUnaryEffect::DcShiftManual { offset_nanounits: 3_000_000 },
+        ]);
+        request.settings.preferred_tool = PreferredTool::Sox;
+        let PlanningOutcome::Refused(refusal) =
+            plan_typed_with_effects(&request, &effects).expect("bounded planning")
+        else {
+            panic!("explicit SoX must refuse before the certified carrier exists")
+        };
+        assert_eq!(refusal.code, "multichannel_dc_terminal_preference");
+
+        request.settings.preferred_tool = PreferredTool::Auto;
+        let policy = CandidateSearchPolicy {
+            strip_terminal_proof_for_tool: Some(ToolIdentifier::Ffmpeg),
+            ..CandidateSearchPolicy::default()
+        };
+        let PlanningOutcome::Refused(refusal) =
+            plan_typed_with_effects_and_policy(&request, &effects, &policy)
+                .expect("bounded planning")
+        else {
+            panic!("SoX cannot replace a missing qualified layout-preserving terminal")
+        };
+        assert_eq!(refusal.code, "no_admitted_candidate");
+    }
+
+    #[test]
+    fn multichannel_dc_constraint_does_not_perturb_stereo_fold_or_legacy_paths() {
+        let mut request = pcm_request(SampleGainPolicy::TruePeakGuard {
+            target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            scope: TruePeakScope::Track,
+            scan: TruePeakScanTier::Standard,
+        });
+        request.source.channels = Some(3);
+        request.settings.dither_type = DitherType::None;
+        request.settings.dither_explicit = true;
+        for effects in [
+            Vec::new(),
+            explicit_effect_sequence([RegisteredUnaryEffect::RemoveDcOffset]),
+            explicit_effect_sequence([
+                RegisteredUnaryEffect::StereoFold,
+                RegisteredUnaryEffect::DcShiftManual { offset_nanounits: 3_000_000 },
+            ]),
+        ] {
+            let PlanningOutcome::Ready(plan) =
+                plan_typed_with_effects(&request, &effects).expect("bounded planning")
+            else { panic!("previously admitted route must stay admitted") };
+            let (selected, _) = selected_pcm_terminal(&plan);
+            assert_eq!(selected.tool, Some(ToolIdentifier::Sox));
+            assert!(!selected.contract.runtime_obligations.contains(
+                MULTICHANNEL_DC_RAW_LAYOUT_CONTRACT
+            ));
+        }
+    }
+
+    #[test]
+    fn custom_dsd_multichannel_dc_true_peak_charges_layout_preserving_terminal_for_both_scopes() {
+        for scope in [TruePeakScope::Track, TruePeakScope::Album] {
+            for effect in [
+                RegisteredUnaryEffect::DcShiftManual { offset_nanounits: 3_000_000 },
+                RegisteredUnaryEffect::DcShiftAuto,
+            ] {
+                let mut request = dsd_request(SampleGainPolicy::TruePeakGuard {
+                    target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+                    scope,
+                    scan: TruePeakScanTier::Standard,
+                });
+                request.source.channels = Some(6);
+                request.settings.preferred_tool = PreferredTool::Auto;
+                request.settings.dither_type = DitherType::None;
+                request.settings.dither_explicit = true;
+                // Custom DSD starts with an original DSD source. Its final
+                // certified carrier is produced later as raw interleaved F64.
+                assert!(request.source.is_dsd());
+                assert!(!normalize_intent(&request).unwrap().reference_delivery);
+                assert_eq!(request.raw_input_channel_layout, None);
+                let effects = explicit_effect_sequence([effect]);
+                let PlanningOutcome::Ready(plan) =
+                    plan_typed_with_effects(&request, &effects).expect("bounded DSD planning")
+                else {
+                    panic!("Custom DSD split true-peak DC must admit its FFmpeg raw terminal")
+                };
+                let (terminal, _) = selected_pcm_terminal(&plan);
+                assert_eq!(terminal.tool, Some(ToolIdentifier::Ffmpeg));
+                assert!(terminal.contract.terminal_proof.is_some());
+                assert!(terminal.contract.runtime_obligations.contains(
+                    MULTICHANNEL_DC_RAW_LAYOUT_CONTRACT
+                ));
+                assert!(matches!(
+                    terminal.contract.terminal_realization.as_ref(),
+                    Some(SelectedTerminalRealization::Pcm(realization))
+                        if realization.kind == PcmTerminalRealizationKind::FfmpegDirect
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn custom_dsd_multichannel_dc_refuses_unqualified_terminal_before_certification() {
+        let mut request = dsd_request(SampleGainPolicy::TruePeakGuard {
+            target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            scope: TruePeakScope::Track,
+            scan: TruePeakScanTier::Standard,
+        });
+        request.source.channels = Some(6);
+        request.settings.dither_type = DitherType::None;
+        request.settings.dither_explicit = true;
+        let effects = explicit_effect_sequence([
+            RegisteredUnaryEffect::DcShiftManual { offset_nanounits: 3_000_000 },
+        ]);
+        request.settings.preferred_tool = PreferredTool::Sox;
+        let PlanningOutcome::Refused(refusal) =
+            plan_typed_with_effects(&request, &effects).expect("bounded planning")
+        else {
+            panic!("explicit SoX cannot bind verified speaker roles to the raw terminal")
+        };
+        assert_eq!(refusal.code, "multichannel_dc_terminal_preference");
+
+        request.settings.preferred_tool = PreferredTool::Auto;
+        let policy = CandidateSearchPolicy {
+            strip_terminal_proof_for_tool: Some(ToolIdentifier::Ffmpeg),
+            ..CandidateSearchPolicy::default()
+        };
+        let PlanningOutcome::Refused(refusal) =
+            plan_typed_with_effects_and_policy(&request, &effects, &policy)
+                .expect("bounded planning")
+        else {
+            panic!("unproved FFmpeg cannot be replaced by a SoX terminal")
+        };
+        assert_eq!(refusal.code, "no_admitted_candidate");
+    }
+
+    #[test]
+    fn native_float64_dc_effect_explicitly_preserves_finite_overload_for_protected_ssrc() {
+        for effect in [
+            RegisteredUnaryEffect::DcShiftAuto,
+            RegisteredUnaryEffect::DcShiftManual { offset_nanounits: 3_000_000 },
+        ] {
+            let candidates = registered_effect_candidates(&effect).unwrap();
+            assert_eq!(candidates.len(), 1);
+            let native = &candidates[0];
+            assert_eq!(native.tool, ToolIdentifier::Custom("tonepoet-native-f64-dc".to_owned()));
+            assert!(effect_contract_preserves_protected_true_peak_input(&native.contract));
+            assert_eq!(native.contract.representation.emitted_precision,
+                Some(StoragePrecision::Pcm(PcmBitDepth::Float64)));
+            // No claim is granted to any FFmpeg/SoX filter or unrelated effect.
+        }
+        assert!(!effect_contract_preserves_protected_true_peak_input(
+            &registered_effect_candidates(&RegisteredUnaryEffect::RemoveDcOffset)
+                .unwrap()[0].contract
+        ));
+    }
+
+    #[test]
+    fn forced_qualified_ssrc_resampler_with_multichannel_dc_charges_ffmpeg_terminal() {
+        use crate::ssrc_binary64::{
+            Binary64ResampleEvidenceScope, Binary64ResamplePreservationEvidence,
+            Binary64RuntimeAttestation, TONEPOET_BINARY64_OVERLOAD_PRESERVING_RESAMPLE_V1,
+        };
+        let scope = Binary64ResampleEvidenceScope {
+            profile: SsrcProfile::High,
+            source_rate_hz: 96_000,
+            target_rate_hz: 44_100,
+            attenuation_db: Some("0.0".to_owned()),
+            min_phase: false,
+            architecture: std::env::consts::ARCH.to_owned(),
+            input_container: "wav".to_owned(),
+            input_sample_format: "pcm_f64le".to_owned(),
+            output_container: "w64".to_owned(),
+            output_sample_format: "pcm_f64le".to_owned(),
+        };
+        let established = Binary64ResamplePreservationEvidence::Established {
+            authority_id: TONEPOET_BINARY64_OVERLOAD_PRESERVING_RESAMPLE_V1.to_owned(),
+            evidence_id: "test:ssrc-dc-layout".to_owned(),
+            qualification_report_sha256: "test-report-sha256".to_owned(),
+            runtime_attestation: Binary64RuntimeAttestation {
+                expected_executable_sha256: "test-executable-sha256".to_owned(),
+                architecture: scope.architecture.clone(),
+                source_revision: crate::ssrc_binary64::PINNED_SSRC_SOURCE_REV.to_owned(),
+                build_identity: "test-build-identity".to_owned(),
+            },
+            scope: scope.clone(),
+        };
+        let policy = CandidateSearchPolicy {
+            ssrc_binary64_evidence_override: Some(TestBinary64SsrcEvidenceOverride {
+                scope,
+                evidence: established,
+            }),
+            ..CandidateSearchPolicy::default()
+        };
+        let guard = SampleGainPolicy::TruePeakGuard {
+            target_dbtp: PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+            scope: TruePeakScope::Track,
+            scan: TruePeakScanTier::Standard,
+        };
+        for channels in [3, 4] {
+            for effect in [
+                RegisteredUnaryEffect::DcShiftManual { offset_nanounits: 3_000_000 },
+                RegisteredUnaryEffect::DcShiftAuto,
+            ] {
+                let mut request = pcm_request(guard);
+                request.source.format = AudioFormat::Flac;
+                request.source.codec = AudioCodec::Flac;
+                request.source.sample_rate_hz = Some(96_000);
+                request.source.channels = Some(channels);
+                request.source.frame_extent = Some(
+                    crate::source::SourceFrameExtent::Exact(96_000 * 60),
+                );
+                request.settings.target_sample_rate = RateTarget::PcmHz(44_100);
+                request.settings.preferred_tool = PreferredTool::Ssrc;
+                request.settings.ssrc.force = true;
+                request.settings.ssrc.profile = Some(SsrcProfile::High);
+                request.settings.dither_type = DitherType::None;
+                request.settings.dither_explicit = true;
+                let effects = explicit_effect_sequence([effect]);
+                let PlanningOutcome::Ready(plan) = plan_typed_with_effects_and_policy(
+                    &request, &effects, &policy,
+                ).expect("bounded planning") else {
+                    panic!("commissioned strong-Binary64 SSRC must remain the independent resampler")
+                };
+                assert!(plan.nodes.iter().any(|node| matches!(node,
+                    TypedPlanNode::Operation {
+                        operation: PlanOperation::ResamplePcm { .. },
+                        candidates, selected_candidate, ..
+                    } if candidates[*selected_candidate].tool == Some(ToolIdentifier::Ssrc)
+                )));
+                let (terminal, _) = selected_pcm_terminal(&plan);
+                assert_eq!(terminal.tool, Some(ToolIdentifier::Ffmpeg));
+                assert!(terminal.contract.terminal_proof.is_some());
+                assert!(terminal.contract.runtime_obligations.contains(
+                    MULTICHANNEL_DC_RAW_LAYOUT_CONTRACT
+                ));
+                assert!(plan.nodes.iter().any(|node| matches!(node,
+                    TypedPlanNode::ApplyEffect { output, instance, .. }
+                        if matches!(&instance.effect, RegisteredUnaryEffect::DcShiftAuto
+                            | RegisteredUnaryEffect::DcShiftManual { .. })
+                        && plan.audio_states.iter().any(|state|
+                            state.id == *output
+                            && state.processing_domain == Fact::Known(ProcessingDomain::Binary64)
+                            && state.value_domain == ValueDomain::FiniteFloating)
+                )));
+                if channels == 3 {
+                    let unproved_terminal = CandidateSearchPolicy {
+                        strip_terminal_proof_for_tool: Some(ToolIdentifier::Ffmpeg),
+                        ..policy.clone()
+                    };
+                    let PlanningOutcome::Refused(refusal) =
+                        plan_typed_with_effects_and_policy(&request, &effects, &unproved_terminal)
+                            .expect("bounded planning")
+                    else {
+                        panic!("SSRC must not legitimize an unproved FFmpeg terminal")
+                    };
+                    assert_eq!(refusal.code, "no_admitted_candidate");
+                }
+            }
+        }
+
+        // A selected SSRC preference without any actual resampling cannot
+        // masquerade as an independently selected resampler at the terminal.
+        let mut no_resample = pcm_request(guard);
+        no_resample.source.channels = Some(3);
+        no_resample.settings.preferred_tool = PreferredTool::Ssrc;
+        let effects = explicit_effect_sequence([
+            RegisteredUnaryEffect::DcShiftManual { offset_nanounits: 3_000_000 },
+        ]);
+        let PlanningOutcome::Refused(refusal) =
+            plan_typed_with_effects(&no_resample, &effects).expect("bounded planning")
+        else {
+            panic!("no-rate-change SSRC preference cannot select the required raw terminal")
+        };
+        assert_eq!(refusal.code, "multichannel_dc_terminal_preference");
+
+        // An uncommissioned SSRC profile must still be refused by its strong
+        // resampler proof, never waved through by the FFmpeg terminal check.
+        let mut unproved = pcm_request(guard);
+        unproved.source.channels = Some(3);
+        unproved.source.sample_rate_hz = Some(96_000);
+        unproved.source.frame_extent = Some(crate::source::SourceFrameExtent::Exact(96_000 * 60));
+        unproved.settings.target_sample_rate = RateTarget::PcmHz(44_100);
+        unproved.settings.preferred_tool = PreferredTool::Ssrc;
+        unproved.settings.ssrc.force = true;
+        unproved.settings.ssrc.profile = Some(SsrcProfile::Standard);
+        unproved.settings.dither_type = DitherType::None;
+        unproved.settings.dither_explicit = true;
+        let PlanningOutcome::Refused(refusal) =
+            plan_typed_with_effects_and_policy(&unproved, &effects, &policy)
+                .expect("bounded planning")
+        else {
+            panic!("a noncommissioned SSRC profile cannot borrow High-profile evidence")
+        };
+        assert!(refusal.code.starts_with("binary64_resample_preservation"),
+            "resampler proof refusal must remain the authority: {}", refusal.code);
     }
 
     #[test]
@@ -11452,4 +11978,73 @@ mod tests {
         )).expect("certified true-peak observation");
         assert!(folded < observed);
     }
+    #[test]
+    fn dc_auto_is_a_typed_signal_bound_observation_decision_and_effect() {
+        let request = pcm_request(SampleGainPolicy::Off);
+        let effects = [EffectIntent {
+            id: EffectInstanceId(85),
+            effect: RegisteredUnaryEffect::DcShiftAuto,
+            after: Vec::new(),
+            placement: EffectPlacement::AfterPcmResample,
+        }];
+        let Ok(PlanningOutcome::Ready(plan)) = plan_typed_with_effects(&request, &effects) else {
+            panic!("automatic DC must be admitted as an effect-aware typed plan")
+        };
+        let (mut observe_at, mut decide_at, mut effect_at) = (None, None, None);
+        let mut observed_input = None;
+        for (pos, node) in plan.nodes.iter().enumerate() {
+            match node {
+                TypedPlanNode::Observe(ob) if matches!(ob.kind, ObservationKind::DcBaseline { .. }) => {
+                    observe_at = Some(pos);
+                    observed_input = Some(ob.subject);
+                    assert!(ob.complete_reader_required);
+                    assert_eq!(ob.read_contract.authority, "tonepoet-native-f64-dc/v1");
+                    assert!(ob.read_contract.accepted_processing_domains.contains(&ProcessingDomain::Binary64));
+                }
+                TypedPlanNode::Decide(dec) if matches!(dec.kind, DecisionKind::DcCorrection { .. }) => {
+                    decide_at = Some(pos);
+                    assert_eq!(dec.observations.len(), 1);
+                    assert_eq!(dec.observations[0].purpose, ObservationClass::DcBaseline);
+                }
+                TypedPlanNode::ApplyEffect { input, instance, lowering, dc_decision, .. }
+                    if matches!(&instance.effect, RegisteredUnaryEffect::DcShiftAuto) => {
+                    effect_at = Some(pos);
+                    assert_eq!(Some(*input), observed_input);
+                    assert_eq!(*dc_decision, Some(DecisionId(1_000_085)));
+                    assert!(matches!(&lowering.arguments,
+                        EffectArgumentMapping::NativeDcShift { offset_nanounits: None, policy_version: 1 }));
+                }
+                _ => {}
+            }
+        }
+        assert!(observe_at.unwrap() < decide_at.unwrap());
+        assert!(decide_at.unwrap() < effect_at.unwrap());
+    }
+
+    #[test]
+    fn manual_dc_has_fixed_value_without_observation_and_preserves_legacy_highpass() {
+        let request = pcm_request(SampleGainPolicy::Off);
+        for (effect, expected_native, expected_observations) in [
+            (RegisteredUnaryEffect::DcShiftManual { offset_nanounits: 3_000_000 }, true, 0),
+            (RegisteredUnaryEffect::RemoveDcOffset, false, 0),
+        ] {
+            let effects = [EffectIntent { id: EffectInstanceId(51), effect,
+                after: Vec::new(), placement: EffectPlacement::AfterPcmResample }];
+            let Ok(PlanningOutcome::Ready(plan)) = plan_typed_with_effects(&request, &effects) else {
+                panic!("manual and legacy high-pass must remain plannable")
+            };
+            let observed = plan.nodes.iter().filter(|node| matches!(node,
+                TypedPlanNode::Observe(ob) if matches!(ob.kind, ObservationKind::DcBaseline { .. })
+            )).count();
+            assert_eq!(observed, expected_observations);
+            let lowering = plan.nodes.iter().find_map(|node| match node {
+                TypedPlanNode::ApplyEffect { lowering, .. } => Some(lowering),
+                _ => None,
+            }).unwrap();
+            assert_eq!(matches!(&lowering.arguments,
+                EffectArgumentMapping::NativeDcShift { offset_nanounits: Some(3_000_000), policy_version: 1 }),
+                expected_native);
+        }
+    }
+
 }

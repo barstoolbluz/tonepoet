@@ -35,6 +35,7 @@ fn pcm_request() -> PlanRequest {
         plan_scope: PlanScope::track("parameter-test"),
         intermediate_dir: Some(PathBuf::from("work")),
         container_ffmpeg_flags: Vec::new(),
+        raw_input_channel_layout: None,
         resolved_output_target: None,
         reference_programme_scope: Default::default(),
         planned_riff_non_audio_upper_bound_bytes: None,

@@ -17,6 +17,7 @@ use tonepoet_pipeline::{
 };
 
 use super::tool::{CommandRecord, ProcessExit, RetainedPcmScalarPump};
+use super::dc_shift::{NativeDcReceipt, Mode as DcMode};
 
 pub const PORTABLE_EXECUTION_SCHEMA: &str = "tonepoet.execution/v1";
 
@@ -1326,6 +1327,21 @@ pub fn completed_registered_effects_from_plan(
     effect_invocation_indices: &[usize],
     resampler_invocation_index: Option<usize>,
 ) -> Result<TrackExecutionEvidence, String> {
+    completed_registered_effects_with_dc(request, effects, effect_invocation_indices,
+        resampler_invocation_index, &[])
+}
+
+/// The typed plan has observation and decision nodes for Auto DC. Their
+/// physical receipts are resolved at the exact registered-effect boundary.
+/// Native effects consume a native receipt; they must never consume a fake
+/// process invocation or claim that analysis alone executed subtraction.
+pub fn completed_registered_effects_with_dc(
+    request: &PlanRequest,
+    effects: &[EffectIntent],
+    effect_invocation_indices: &[usize],
+    resampler_invocation_index: Option<usize>,
+    dc_receipts: &[NativeDcReceipt],
+) -> Result<TrackExecutionEvidence, String> {
     let typed = match tonepoet_pipeline::plan_typed_with_effects(request, effects)
         .map_err(|error| error.to_string())?
     {
@@ -1339,11 +1355,149 @@ pub fn completed_registered_effects_from_plan(
     };
     let mut evidence = TrackExecutionEvidence::default();
     let mut effect_bindings = effect_invocation_indices.iter().copied();
+    let mut native_bindings = dc_receipts.iter();
     let mut projected_effects = 0_usize;
     let mut projected_resamplers = 0_usize;
     for (node_index, node) in typed.nodes.iter().enumerate() {
         match node {
-            TypedPlanNode::ApplyEffect { input, output, instance, lowering, .. } => {
+            TypedPlanNode::ApplyEffect { input, output, instance, lowering, dc_decision, .. } => {
+                if matches!(&instance.effect,
+                    RegisteredUnaryEffect::DcShiftAuto | RegisteredUnaryEffect::DcShiftManual { .. })
+                {
+                    let native = native_bindings.next().ok_or_else(|| format!(
+                        "DC effect {} lacks a completed native execution receipt", instance.id.0,
+                    ))?;
+                    if native.policy_version != super::dc_shift::POLICY_VERSION
+                        || !matches!(
+                            (&instance.effect, native.result.mode),
+                            (RegisteredUnaryEffect::DcShiftAuto, DcMode::Auto)
+                                | (RegisteredUnaryEffect::DcShiftManual { .. }, DcMode::Manual { .. })
+                        )
+                    {
+                        return Err("native DC receipt does not match typed effect mode and policy".into());
+                    }
+                    if let (RegisteredUnaryEffect::DcShiftManual { offset_nanounits },
+                        DcMode::Manual { offset_nanounits: realized }) =
+                        (&instance.effect, native.result.mode)
+                    {
+                        if *offset_nanounits != realized {
+                            return Err("manual native DC value differs from typed effect".into());
+                        }
+                    }
+                    let changed = native.result.changed();
+                    let auto = native.result.mode == DcMode::Auto;
+                    let kind = if auto {
+                        if changed { "dc_offset_subtracted" } else { "dc_analyzed_no_change" }
+                    } else if changed { "dc_manual_subtraction" } else { "dc_manual_zero" };
+                    let name = if auto {
+                        if changed { "DC offset subtracted (measured)" }
+                        else { "DC offset analyzed; no change" }
+                    } else if changed { "Manual DC offset subtracted" }
+                    else { "Manual DC offset zero; no change" };
+                    let mut operation = OperationRecord::completed(
+                        format!("effect-{}", instance.id.0), kind, name,
+                        ExecutionBackend::native("TonePoet interleaved Float64 DC correction v1"),
+                    );
+                    operation.inputs.extend([
+                        EvidenceArtifactRef::signal(input.0),
+                        EvidenceArtifactRef::path("dc-correction-input", &native.input),
+                    ]);
+                    operation.outputs.extend([
+                        EvidenceArtifactRef::signal(output.0),
+                        EvidenceArtifactRef::path("dc-correction-carrier", &native.output),
+                    ]);
+                    operation.parameters.extend([
+                        OperationParameter::new("Policy", EvidenceValue::Unsigned(native.policy_version as u64)),
+                        OperationParameter::new("Scope", EvidenceValue::Text("track logical correction input".to_string())),
+                        OperationParameter::new("Sample representation", EvidenceValue::Text("interleaved little-endian Float64".into())),
+                        OperationParameter::new("Frames", EvidenceValue::Unsigned(native.result.frames)),
+                        OperationParameter::new("Sample rate", EvidenceValue::SampleRateHz(native.result.sample_rate_hz)),
+                        OperationParameter::new("Input SHA-256", EvidenceValue::Text(native.result.input_sha256.clone().unwrap_or_else(|| "not read (zero no-op)".into()))),
+                        OperationParameter::new("Sign convention", EvidenceValue::Text("output sample = input sample - offset".into())),
+                    ]);
+                    for (channel, result) in native.result.channels.iter().enumerate() {
+                        operation.parameters.push(OperationParameter::new(
+                            format!("Channel {} subtract", channel + 1), EvidenceValue::Decimal(result.subtraction),
+                        ));
+                        operation.parameters.push(OperationParameter::new(
+                            format!("Channel {} decision", channel + 1),
+                            EvidenceValue::Text(result.disposition.label().to_string()),
+                        ));
+                        if let Some(observed) = result.observed_mean {
+                            operation.parameters.push(OperationParameter::new(
+                                format!("Channel {} observed mean", channel + 1),
+                                EvidenceValue::Decimal(observed),
+                            ));
+                        }
+                        if let Some(after) = result.output_mean {
+                            operation.parameters.push(OperationParameter::new(
+                                format!("Channel {} output mean (same traversal)", channel + 1),
+                                EvidenceValue::Decimal(after),
+                            ));
+                        }
+                    }
+                    if let Some(decision) = dc_decision {
+                        // The effect's typed dependency must actually exist in
+                        // the plan and bind this exact input signal, never a
+                        // Browse or pre-gain observation.
+                        let binding = native.typed_dependency.as_ref().ok_or_else(||
+                            "native DC receipt lacks its execution-time typed binding".to_string())?;
+                        if !auto || binding.decision != *decision || binding.input != *input ||
+                            binding.policy_version != native.policy_version {
+                            return Err("DC execution decision/input/policy differs from its typed binding".into());
+                        }
+                        let observation = typed.nodes.iter().find_map(|node| match node {
+                            TypedPlanNode::Observe(obs) if obs.id == binding.observation.observation => Some(obs),
+                            _ => None,
+                        }).ok_or_else(|| "DC receipt lacks its declared observation".to_string())?;
+                        let decision_node = typed.nodes.iter().find_map(|node| match node {
+                            TypedPlanNode::Decide(d) if d.id == binding.decision => Some(d),
+                            _ => None,
+                        }).ok_or_else(|| "DC receipt lacks its declared decision".to_string())?;
+                        if observation.subject != *input ||
+                            !tonepoet_pipeline::observation_satisfies_dependency(observation, &binding.observation) ||
+                            decision_node.observations.len() != 1 ||
+                            decision_node.observations[0] != binding.observation ||
+                            !matches!(&decision_node.kind,
+                                DecisionKind::DcCorrection { policy_version } if *policy_version == native.policy_version) {
+                            return Err("DC execution receipt did not satisfy its typed dependency".into());
+                        }
+                        let observation_key = format!("dc-observation-{}", observation.id.0);
+                        let decision_key = format!("dc-decision-{}", binding.decision.0);
+                        evidence.observations.push(ObservationRecord {
+                            id: observation_key.clone(),
+                            kind: "per_channel_dc_baseline".into(),
+                            name: "Observed channel means, AC-RMS and temporal stability".into(),
+                            value: Some(EvidenceValue::Text(native.result.channels.iter().enumerate()
+                                .map(|(ch, r)| format!(
+                                    "channel {} mean={:?} ac_rms={:?} peak={:?} max_window_delta={:?}",
+                                    ch + 1, r.observed_mean, r.ac_rms, r.input_peak,
+                                    r.maximum_window_deviation,
+                                )).collect::<Vec<_>>().join("; "))),
+                            source: format!("Float64 carrier {} sha256:{} ({} frames, {} Hz)",
+                                native.input.display(), native.result.input_sha256.as_deref().unwrap_or("not recorded"),
+                                native.result.frames, native.result.sample_rate_hz),
+                        });
+                        evidence.decisions.push(DecisionRecord {
+                            id: decision_key.clone(),
+                            kind: "automatic_dc_correction".into(),
+                            summary: native.result.channels.iter().enumerate().map(|(ch, r)|
+                                format!("channel {}: {}", ch + 1, r.disposition.label()))
+                                .collect::<Vec<_>>().join("; "),
+                            authority: DecisionAuthority::AutomaticPolicy,
+                            parameters: vec![OperationParameter::new("Policy revision",
+                                EvidenceValue::Unsigned(native.policy_version as u64))],
+                            observation_ids: vec![observation_key.clone()],
+                        });
+                        operation.observation_ids.push(observation_key);
+                        operation.decision_ids.push(decision_key);
+                    } else if auto || native.typed_dependency.is_some() {
+                        return Err("DC receipt has an unexpected or missing typed decision dependency".into());
+                    }
+                    evidence.operations.push(operation);
+                    projected_effects += 1;
+                    continue;
+                }
                 let invocation_index = effect_bindings.next().ok_or_else(|| {
                     format!(
                         "registered-effect execution completed effect {} without a physical invocation receipt",
@@ -1400,10 +1554,12 @@ pub fn completed_registered_effects_from_plan(
             _ => {}
         }
     }
-    if effect_bindings.next().is_some() || projected_effects != effect_invocation_indices.len() {
+    if effect_bindings.next().is_some() || native_bindings.next().is_some()
+        || projected_effects != effect_invocation_indices.len() + dc_receipts.len()
+    {
         return Err(format!(
-            "registered-effect execution supplied {} effect invocation receipt(s) for {} projected effect(s)",
-            effect_invocation_indices.len(), projected_effects,
+            "registered-effect execution supplied {} process and {} native receipt(s) for {} projected effect(s)",
+            effect_invocation_indices.len(), dc_receipts.len(), projected_effects,
         ));
     }
     match (projected_resamplers, resampler_invocation_index) {
@@ -1635,6 +1791,15 @@ pub fn completed_effect_operation(
         RegisteredUnaryEffect::RemoveDcOffset => (
             "dc_offset_removal", "DC offset removal (2 Hz high-pass)",
             vec![OperationParameter::new("Cutoff", EvidenceValue::SampleRateHz(2))],
+        ),
+        RegisteredUnaryEffect::DcShiftAuto => (
+            "dc_offset_subtracted", "Automatic DC offset subtraction",
+            Vec::new(),
+        ),
+        RegisteredUnaryEffect::DcShiftManual { offset_nanounits } => (
+            "dc_manual_subtraction", "Manual DC offset subtraction",
+            vec![OperationParameter::new("Offset to subtract",
+                EvidenceValue::Decimal(*offset_nanounits as f64 / 1e9))],
         ),
         RegisteredUnaryEffect::CdDeemphasis => (
             "cd_deemphasis",
@@ -2170,6 +2335,7 @@ fn decision_kind_name(kind: &DecisionKind) -> &'static str {
         DecisionKind::TruePeakGain { .. } => "true_peak_gain",
         DecisionKind::ReferenceGain { .. } => "reference_gain",
         DecisionKind::ReplayGainProjection { .. } => "replay_gain",
+        DecisionKind::DcCorrection { .. } => "dc_correction",
     }
 }
 
@@ -2178,6 +2344,7 @@ fn decision_summary(kind: &DecisionKind) -> String {
         DecisionKind::TruePeakGain { .. } => "Resolved true-peak gain policy".to_string(),
         DecisionKind::ReferenceGain { .. } => "Resolved qualified Reference gain policy".to_string(),
         DecisionKind::ReplayGainProjection { .. } => "Resolved ReplayGain projection".to_string(),
+        DecisionKind::DcCorrection { .. } => "Resolved per-channel DC observation and correction policy".to_string(),
     }
 }
 
@@ -2666,6 +2833,7 @@ mod tests {
             plan_scope: tonepoet_pipeline::PlanScope::track("execution-evidence-test"),
             intermediate_dir: None,
             container_ffmpeg_flags: Vec::new(),
+            raw_input_channel_layout: None,
             resolved_output_target: None,
             reference_programme_scope: Default::default(),
             planned_riff_non_audio_upper_bound_bytes: None,
@@ -2804,6 +2972,7 @@ mod tests {
             plan_scope: tonepoet_pipeline::PlanScope::track("execution-evidence-terminal-test"),
             intermediate_dir: Some(PathBuf::from("work")),
             container_ffmpeg_flags: Vec::new(),
+            raw_input_channel_layout: None,
             resolved_output_target: None,
             reference_programme_scope: Default::default(),
             planned_riff_non_audio_upper_bound_bytes: None,

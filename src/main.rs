@@ -1084,6 +1084,7 @@ mod bit_depth_cli_tests {
             plan_scope: tonepoet_pipeline::PlanScope::track("test-track"),
             intermediate_dir: Some(PathBuf::from("work")),
             container_ffmpeg_flags: Vec::new(),
+            raw_input_channel_layout: None,
         };
         let topology = tonepoet_pipeline::plan_topology(&request)
             .expect("no-depth CLI DSD conversion must plan");

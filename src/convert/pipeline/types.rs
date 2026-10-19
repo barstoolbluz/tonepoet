@@ -1278,6 +1278,9 @@ pub enum TrackSourceRef {
         source_path: PathBuf,
         sample_rate_hz: u32,
         channels: u16,
+        /// Verified interleaved speaker order for a DC-processed raw PCM carrier.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        channel_layout: Option<String>,
         duration: Option<std::time::Duration>,
         gain_db: Option<tonepoet_pipeline::DbNano>,
         point_dbtp: Option<tonepoet_pipeline::DbNano>,
@@ -1339,6 +1342,9 @@ pub enum TrackSourceRef {
         source_path: PathBuf,
         sample_rate_hz: u32,
         channels: u16,
+        /// Verified interleaved speaker order for a DC-processed raw PCM carrier.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        channel_layout: Option<String>,
         duration: Option<std::time::Duration>,
         gain_db: Option<tonepoet_pipeline::DbNano>,
         point_dbtp: Option<tonepoet_pipeline::DbNano>,
@@ -1379,6 +1385,9 @@ pub enum TrackSourceRef {
         source_path: PathBuf,
         sample_rate_hz: u32,
         channels: u16,
+        /// Physical speaker-mask identity checked before Float64 intermediate creation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        channel_layout: Option<String>,
         duration: Option<std::time::Duration>,
         source_was_dsd: bool,
         /// True when the Phase-3 common realizer already executed the typed

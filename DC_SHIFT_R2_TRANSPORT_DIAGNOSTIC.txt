@@ -1,0 +1,3 @@
+FFmpeg 7.1.5 host (NOT pinned version) transport raw-to-WAV-to-raw
+frames=480000 channels=2 raw_bytes=7680000 bit_identical=True max=1.2029999999999998
+secs_f64_to_wav=0.0973 secs_wav_to_f64=0.0843

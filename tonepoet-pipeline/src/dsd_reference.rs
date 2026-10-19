@@ -5233,6 +5233,7 @@ mod tests {
             plan_scope: crate::plan::PlanScope::track("test-track"),
             intermediate_dir: Some(PathBuf::from("work")),
             container_ffmpeg_flags: Vec::new(),
+            raw_input_channel_layout: None,
             resolved_output_target: Some(target),
             reference_programme_scope: ReferenceProgrammeScope::Singleton,
             planned_riff_non_audio_upper_bound_bytes: (target == ResolvedOutputTarget::WavRiff)

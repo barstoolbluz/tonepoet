@@ -17,6 +17,37 @@ use super::draw_browse::{
 use super::message::AppMessage;
 use crate::convert::{AudioFormat, ConversionOptions, ConversionStatus};
 
+pub(crate) const DC_CORRECTION_INFO_MESSAGE: &str = r#"DC offset means a recording's audio waveform sits slightly above or below its normal centre line. It can occur when audio is recorded or digitized. A tiny offset is usually harmless, and removing it does not automatically improve the sound.
+
+Off — Recommended unless you have a reason to correct an offset. Leaves the audio unchanged.
+
+Auto shift — TonePoet measures the audio during conversion. When the result supports correcting a reasonably steady offset, it subtracts that amount without filtering the deep bass. If the offset is negligible or the measurement is uncertain, it leaves the audio unchanged and explains why. Measurements cannot always distinguish an unwanted offset from real low-frequency sound.
+
+High-pass (2 Hz) — Uses a very-low-frequency filter to remove DC and reduce slow changes in the baseline. Consider this if the offset drifts instead of staying steady. Unlike a fixed subtraction, a filter also changes some extremely low-frequency sound and can produce a short settling transient.
+
+Manual — Subtracts the value you enter. Choose this if you have a trustworthy measurement and know what you want removed. For example, entering +0.003 subtracts 0.003 from each sample in the affected channel(s).
+
+This setting does not fix hum, clipping, or CD pre-emphasis."#;
+
+/// Plain-text Notice: standalone section headings and paragraph breaks are
+/// deliberate. The existing Notice does not parse Markdown.
+pub(crate) const PCM_GAIN_INFO_MESSAGE: &str = concat!(
+    "Controls whether TonePoet changes the audio's volume level during conversion.\n\n",
+    "Off\n",
+    "Leaves the audio's level unchanged by this setting. Other processing you've selected may still affect it.\n\n",
+    "Choose this when you want to preserve the original level and don't need a gain adjustment.\n\n",
+    "True-peak guard\n",
+    "Checks whether the audio's highest peaks would exceed your selected ceiling. If necessary, turns the entire recording down just enough to stay within that limit. It never turns quieter audio up.\n\n",
+    "Choose this when you want protection against excessive peaks without otherwise changing the recording's level. Note: TonePoet normally selects True-peak guard automatically when converting from floating-point to integer PCM (e.g., 32-bit float to 24-bit integer) or from lossless to lossy (e.g., FLAC to AAC), when it knows the source and output formats. Your explicit choice or preset takes priority, and the automatic default does not apply to HDCD decoding for lossy output.\n\n",
+    "True-peak normalize\n",
+    "Measures the audio's highest peaks, then turns the entire recording up or down so its maximum true peak approaches your specified ceiling without exceeding it.\n\n",
+    "Choose this when you want recordings to reach a consistent peak level. It does not make different recordings sound equally loud.\n\n",
+    "For lossy output, TonePoet caps a higher selected ceiling at -0.10 dBTP before encoding; lossy encoding can change the resulting peaks.\n\n",
+    "Fixed gain\n",
+    "Raises or lowers the entire recording by the exact amount you specify, in decibels (dB). Positive values increase the level; negative values decrease it.\n\n",
+    "Choose this when you already know how much adjustment you want. Increasing gain can cause clipping if the resulting peaks are too high. Unlike with True-peak, TonePoet does not automatically prevent clipping with this mode."
+);
+
 pub(crate) const DEEMPHASIS_INFO_MESSAGE: &str = concat!(
     "This disc was mastered with pre-emphasis: the treble was boosted on the CD, and the player is meant to cut it back on playback.\n\n",
     "On — tonepoet removes the boost now, so the file plays correctly anywhere. This is a filter, not a tag change: the audio is altered, and the output will not be bit-identical to the source even when both sides are lossless at 16-bit/44.1 kHz.\n\n",
@@ -900,6 +931,27 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             cycle_stream_pill(app, true);
         }
 
+        (KeyCode::Char('i'), KeyModifiers::NONE)
+            if app.convert.focus == ConvertFocus::Format
+                && !app.convert.is_collapsed(ConvertFocus::Format)
+                && app.convert.format.field_focus == FormatField::RemoveDcOffset =>
+        {
+            app.active_overlay = ActiveOverlay::Notice {
+                title: "DC offset correction".to_string(),
+                message: DC_CORRECTION_INFO_MESSAGE.to_string(), scroll: 0,
+            };
+        }
+        (KeyCode::Char('i'), KeyModifiers::NONE)
+            if app.convert.focus == ConvertFocus::Format
+                && !app.convert.is_collapsed(ConvertFocus::Format)
+                && app.convert.format.field_focus == FormatField::PcmTruePeak =>
+        {
+            app.active_overlay = ActiveOverlay::Notice {
+                title: "PCM gain".to_string(),
+                message: PCM_GAIN_INFO_MESSAGE.to_string(), scroll: 0,
+            };
+        }
+
         // Format pane navigation.
         (KeyCode::Enter | KeyCode::Char('e'), KeyModifiers::NONE)
             if app.convert.focus == ConvertFocus::Format
@@ -907,6 +959,7 @@ fn handle_convert_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 && matches!(
                     app.convert.format.field_focus,
                     FormatField::PcmTruePeakTarget | FormatField::DsdTruePeakTarget
+                    | FormatField::DcManualValue
                 ) =>
         {
             begin_format_true_peak_inline_edit(app, app.convert.format.field_focus);
@@ -1248,6 +1301,7 @@ fn active_inline_edit_matches_button(app: &AppState, button: Option<&TuiButton>)
         TuiButton::DsdTruePeakTargetField | TuiButton::DsdTruePeakCustomPill => {
             Some(FormatField::DsdTruePeakTarget)
         }
+        TuiButton::DcManualValueField => Some(FormatField::DcManualValue),
         _ => None,
     };
     if target_editor_button.is_some()
@@ -3779,7 +3833,8 @@ fn convert_format_field_value(app: &AppState, field: FormatField) -> String {
         FormatField::Resampler => format.resampler.selected_label().to_string(),
         FormatField::Dither => format.dither.selected_label().to_string(),
         FormatField::OutputChannelLayout => format.output_channel_layout.selected_label().to_string(),
-        FormatField::RemoveDcOffset => if format.remove_dc_offset { "on" } else { "off" }.to_string(),
+        FormatField::RemoveDcOffset => format.dc_correction.selected_label().to_string(),
+        FormatField::DcManualValue => crate::tui::app::dc_offset_label(format.dc_manual_nanounits),
         FormatField::Deemphasis => if format.deemphasis_enabled { "on" } else { "off" }.to_string(),
         FormatField::HdcdDecode => if format.hdcd_decode_enabled { "on" } else { "off" }.to_string(),
         FormatField::ReplayGain => format.replaygain.selected_label().to_string(),
@@ -4858,6 +4913,14 @@ fn begin_format_true_peak_inline_edit(app: &mut AppState, field: FormatField) {
     let current = match field {
         FormatField::PcmTruePeakTarget => app.convert.format.pcm_true_peak_target_dbtp,
         FormatField::DsdTruePeakTarget => app.convert.format.dsd_true_peak_target_dbtp,
+        FormatField::DcManualValue => {
+            app.convert.focus = ConvertFocus::Format;
+            app.convert.format.field_focus = field;
+            app.convert.format.true_peak_target_input = super::text_input::TextInputState::new_selected(
+                super::app::dc_offset_label(app.convert.format.dc_manual_nanounits));
+            app.convert.format.true_peak_target_editing = Some(field);
+            return;
+        }
         _ => return,
     };
     app.convert.focus = ConvertFocus::Format;
@@ -4876,6 +4939,23 @@ fn commit_format_true_peak_inline_edit(app: &mut AppState, discard_invalid: bool
         return true;
     };
     let raw = app.convert.format.true_peak_target_input.text.clone();
+    if field == FormatField::DcManualValue {
+        match super::app::parse_dc_offset_nanounits(&raw) {
+            Ok(offset) => {
+                app.convert.format.dc_manual_nanounits = offset;
+                app.convert.format.true_peak_target_editing = None;
+                app.preset.mark_modified();
+                app.set_status(format!("manual DC: subtract {} (normalized PCM)",
+                    super::app::dc_offset_label(offset)));
+                return true;
+            }
+            Err(error) => {
+                if discard_invalid { app.convert.format.true_peak_target_editing = None; }
+                app.set_status(format!("manual DC: {error}; edit or press Esc to cancel"));
+                return false;
+            }
+        }
+    }
     let label = match field {
         FormatField::PcmTruePeakTarget => "pcm-true-peak-target",
         FormatField::DsdTruePeakTarget => "dsd-true-peak-target",
@@ -72347,6 +72427,9 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             }
 
             // ── Convert screen: format pane pills ──
+            TuiButton::DcManualValueField => {
+                begin_format_true_peak_inline_edit(app, FormatField::DcManualValue);
+            }
             TuiButton::PcmTruePeakCustomPill => {
                 begin_format_true_peak_inline_edit(app, FormatField::PcmTruePeakTarget);
             }
@@ -72388,6 +72471,13 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     app.preset.mark_modified();
                 }
             }
+            TuiButton::DcInfo => {
+                app.convert.focus = ConvertFocus::Format;
+                app.active_overlay = ActiveOverlay::Notice {
+                    title: "DC offset correction".to_owned(),
+                    message: DC_CORRECTION_INFO_MESSAGE.to_owned(), scroll: 0,
+                };
+            }
             TuiButton::HdcdInfo => {
                 use super::app::ActiveOverlay;
                 app.convert.focus = ConvertFocus::Format;
@@ -72410,6 +72500,14 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 app.active_overlay = ActiveOverlay::Notice {
                     title: "True peak".to_string(),
                     message: TRUE_PEAK_INFO_MESSAGE.to_string(),
+                    scroll: 0,
+                };
+            }
+            TuiButton::PcmGainInfo => {
+                app.convert.focus = ConvertFocus::Format;
+                app.active_overlay = ActiveOverlay::Notice {
+                    title: "PCM gain".to_string(),
+                    message: PCM_GAIN_INFO_MESSAGE.to_string(),
                     scroll: 0,
                 };
             }

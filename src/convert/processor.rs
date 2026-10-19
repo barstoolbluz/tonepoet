@@ -7025,6 +7025,7 @@ mod tests {
                     track_number,
                 },
                 TrackSourceRef::DsdTruePeakCarrier {
+                    channel_layout: None,
                     path: PathBuf::from(format!("/staging/{ordinal}-{track_number}.f64le")),
                     source_path: PathBuf::from(source),
                     sample_rate_hz: 176_400,
@@ -7202,6 +7203,7 @@ mod tests {
         });
         let source_ref = if is_dsd {
             TrackSourceRef::DsdTruePeakCarrier {
+                channel_layout: None,
                 path: carrier_path,
                 source_path: source_path.clone(),
                 sample_rate_hz: 48_000,
@@ -7218,6 +7220,7 @@ mod tests {
             }
         } else {
             TrackSourceRef::PcmTruePeakCarrier {
+                channel_layout: None,
                 path: carrier_path,
                 source_path: source_path.clone(),
                 sample_rate_hz: 48_000,
@@ -9369,6 +9372,7 @@ FILE "track.flac" WAVE
             tracks: vec![PreparedTrack {
                 id: track_id.clone(),
                 source_ref: TrackSourceRef::DsdTruePeakCarrier {
+                    channel_layout: None,
                     path: carrier_path.clone(),
                     source_path: source_a.clone(),
                     sample_rate_hz: 176_400,
@@ -9457,6 +9461,7 @@ FILE "track.flac" WAVE
                     failed_staged_path.display()
                 )),
                 source_ref: TrackSourceRef::DsdTruePeakCarrier {
+                    channel_layout: None,
                     path: carrier_path,
                     source_path: source_a.clone(),
                     sample_rate_hz: 176_400,
@@ -9695,6 +9700,7 @@ FILE "track.flac" WAVE
             tracks: vec![PreparedTrack {
                 id: track_id.clone(),
                 source_ref: TrackSourceRef::DsdTruePeakCarrier {
+                    channel_layout: None,
                     path: carrier_path.clone(),
                     source_path: source_a.clone(),
                     sample_rate_hz: 176_400,
@@ -9777,6 +9783,7 @@ FILE "track.flac" WAVE
                 track_id: track_id.clone(),
                 outcome: TrackOutcome::Ok,
                 source_ref: TrackSourceRef::DsdTruePeakCarrier {
+                    channel_layout: None,
                     path: carrier_path,
                     source_path: source_a.clone(),
                     sample_rate_hz: 176_400,

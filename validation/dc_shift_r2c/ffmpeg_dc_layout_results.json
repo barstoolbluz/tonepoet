@@ -1,0 +1,29 @@
+[
+  {
+    "input_layout": "3.0",
+    "mask": "0x7",
+    "output": {
+      "channels": 3,
+      "channel_layout": "3.0"
+    },
+    "sample_bitwise_equal": true
+  },
+  {
+    "input_layout": "quad",
+    "mask": "0x33",
+    "output": {
+      "channels": 4,
+      "channel_layout": "quad"
+    },
+    "sample_bitwise_equal": true
+  },
+  {
+    "input_layout": "5.1_no_center_alt",
+    "mask": "0x3b",
+    "output": {
+      "channels": 5,
+      "channel_layout": "5 channels (FL+FR+LFE+BL+BR)"
+    },
+    "sample_bitwise_equal": true
+  }
+]

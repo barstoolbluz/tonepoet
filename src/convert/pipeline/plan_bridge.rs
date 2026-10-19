@@ -843,6 +843,63 @@ fn plan_request_for_track_impl(
         None => tonepoet_pipeline::PlanScope::track(request.item_id.clone()),
     };
 
+    let raw_input_channel_layout = match &track.source_ref {
+        TrackSourceRef::RegisteredEffectCarrier {
+            channel_layout,
+            representation: RegisteredEffectCarrierRepresentation::RawFloat64,
+            ..
+        }
+        | TrackSourceRef::PcmTruePeakCarrier { channel_layout, .. }
+        | TrackSourceRef::DsdTruePeakCarrier { channel_layout, .. } => channel_layout.clone(),
+        // WAV/Wave64 have their own layout metadata. A mask intended for
+        // raw input must never be passed as if those files were headerless.
+        _ => None,
+    };
+    if let Some(mask_text) = raw_input_channel_layout.as_deref() {
+        let mask = mask_text.strip_prefix("0x")
+            .and_then(|value| u32::from_str_radix(value, 16).ok())
+            .filter(|mask| *mask != 0 && mask.count_ones() == source.channels.unwrap_or(0) as u32)
+            .ok_or_else(|| ConvertError::Backend(
+                "retained DC carrier has invalid speaker-mask/channel binding".into()
+            ))?;
+        if mask > 0x7ff || source.channels.unwrap_or(0) > 8 {
+            return Err(ConvertError::Backend(
+                "retained DC carrier speaker mask is outside supported verified roles".into()
+            ));
+        }
+        // SoX and hybrid raw entry points cannot attach a verified speaker
+        // mask to the final encoded stream. Use the FFmpeg raw ingress for
+        // Auto-selected multichannel DC routes; refuse explicit incompatible
+        // backend selection rather than relabel speakers.
+        if source.channels.unwrap_or(0) > 2 {
+            if settings.preferred_tool == PreferredTool::Auto {
+                settings.preferred_tool = PreferredTool::Ffmpeg;
+            } else if settings.preferred_tool != PreferredTool::Ffmpeg {
+                return Err(ConvertError::Backend(
+                    "multichannel DC correction requires FFmpeg terminal encoding to preserve verified speaker roles".into()
+                ));
+            }
+            if settings.target_format == PlannerFormat::WavPack && settings.wavpack.hybrid {
+                return Err(ConvertError::Backend(
+                    "multichannel DC correction cannot bind speaker roles to WavPack hybrid encoding".into()
+                ));
+            }
+        }
+    } else if source.channels.unwrap_or(0) > 2
+        && request.registered_effects.iter().any(|intent| matches!(
+            &intent.effect,
+            tonepoet_pipeline::RegisteredUnaryEffect::DcShiftAuto
+                | tonepoet_pipeline::RegisteredUnaryEffect::DcShiftManual { .. }
+        )) && matches!(&track.source_ref,
+            TrackSourceRef::RegisteredEffectCarrier { .. }
+                | TrackSourceRef::DsdTruePeakCarrier { .. }
+                | TrackSourceRef::PcmTruePeakCarrier { .. }
+        ) {
+        return Err(ConvertError::Backend(
+            "multichannel DC carrier reached final encoding without verified source speaker roles".into()
+        ));
+    }
+
     // settings-sentinel-allow: `settings` is `request.settings.clone()` (bound
     // at the top of this function) plus the documented per-track realization
     // adjustments above; no defaults are synthesized outside the typed request.
@@ -857,6 +914,7 @@ fn plan_request_for_track_impl(
         settings,
         intermediate_dir: Some(intermediate_dir),
         container_ffmpeg_flags: request.container_ffmpeg_flags.clone(),
+        raw_input_channel_layout,
     })
 }
 
@@ -1199,6 +1257,16 @@ fn disable_planner_source_audio_md5(settings: &mut PipelineSettings) {
 /// disables the per-track planner flag to avoid a late planner validation error.
 /// This helper keeps that downgrade explicit and testable rather than silent.
 
+/// A concrete observation/decision dependency from the frozen typed plan.
+/// The executor must resolve this dependency before it can write DC samples.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DcEffectDependency {
+    pub input: tonepoet_pipeline::SignalId,
+    pub observation: tonepoet_pipeline::ScopedObservationId,
+    pub decision: tonepoet_pipeline::DecisionId,
+    pub policy_version: u32,
+}
+
 /// One ordered registered-effect segment on one side of the PCM resampler barrier.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RegisteredEffectSegment {
@@ -1213,6 +1281,8 @@ pub(crate) struct RegisteredEffectSegment {
     /// Output interleave width for each ordered lowering, taken directly
     /// from the authoritative typed graph (never parsed from filter text).
     pub effect_output_channels: Vec<u16>,
+    /// Per-lowering typed DC observation/decision binding (None for other effects).
+    pub dc_dependencies: Vec<Option<DcEffectDependency>>,
 }
 
 /// Frozen selected PCM resampler between optional registered-effect segments.
@@ -1246,7 +1316,7 @@ pub(crate) struct RegisteredEffectExecutionContract {
 
 fn registered_effect_segment_from_nodes(
     typed: &tonepoet_pipeline::TypedConversionPlan,
-    nodes: &[(tonepoet_pipeline::SignalId, tonepoet_pipeline::SignalId, tonepoet_pipeline::EffectLowering)],
+    nodes: &[(tonepoet_pipeline::SignalId, tonepoet_pipeline::SignalId, tonepoet_pipeline::EffectLowering, Option<DcEffectDependency>)],
 ) -> Result<Option<RegisteredEffectSegment>, ConvertError> {
     if nodes.is_empty() {
         return Ok(None);
@@ -1308,9 +1378,10 @@ fn registered_effect_segment_from_nodes(
         level_basis: output_state.level_basis,
         lowerings: nodes
             .iter()
-            .map(|(_, _, lowering)| lowering.clone())
+            .map(|(_, _, lowering, _)| lowering.clone())
             .collect(),
-        effect_output_channels: nodes.iter().map(|(_, node_output, _)| {
+        dc_dependencies: nodes.iter().map(|(_, _, _, dependency)| dependency.clone()).collect(),
+        effect_output_channels: nodes.iter().map(|(_, node_output, _, _)| {
             let state = typed.audio_states.iter().find(|state| state.id == *node_output)
                 .ok_or_else(|| ConvertError::Backend(format!(
                     "typed effect output {:?} lacks audio state", node_output,
@@ -1384,13 +1455,59 @@ fn segmented_registered_effect_execution_from_typed(
             input,
             output,
             lowering,
+            dc_decision,
             ..
         } = node
         {
+            let dependency = match (&lowering.arguments, dc_decision) {
+                (tonepoet_pipeline::EffectArgumentMapping::NativeDcShift {
+                    offset_nanounits: None, policy_version,
+                }, Some(decision_id)) => {
+                    let decision = nodes.iter().find_map(|node| match node {
+                        tonepoet_pipeline::TypedPlanNode::Decide(decision) if decision.id == *decision_id => Some(decision),
+                        _ => None,
+                    }).ok_or_else(|| ConvertError::Backend(format!(
+                        "typed DC effect {:?} has no matching decision", decision_id
+                    )))?;
+                    if !matches!(&decision.kind,
+                        tonepoet_pipeline::DecisionKind::DcCorrection { policy_version: version } if *version == *policy_version)
+                        || decision.observations.len() != 1
+                    {
+                        return Err(ConvertError::Backend("typed DC decision policy/dependency mismatch".into()));
+                    }
+                    let scoped = &decision.observations[0];
+                    let observation = nodes.iter().find_map(|node| match node {
+                        tonepoet_pipeline::TypedPlanNode::Observe(observation)
+                            if observation.id == scoped.observation => Some(observation),
+                        _ => None,
+                    }).ok_or_else(|| ConvertError::Backend("typed DC observation is absent".into()))?;
+                    if observation.subject != *input
+                        || !observation.complete_reader_required
+                        || !observation.read_contract.complete_reader
+                        || !observation.read_contract.connected_executor
+                        || !matches!(&observation.kind,
+                            tonepoet_pipeline::ObservationKind::DcBaseline { policy_version: version } if *version == *policy_version)
+                        || !tonepoet_pipeline::observation_satisfies_dependency(observation, scoped)
+                    {
+                        return Err(ConvertError::Backend("typed DC input/observation binding is invalid".into()));
+                    }
+                    Some(DcEffectDependency {
+                        input: *input, observation: scoped.clone(),
+                        decision: *decision_id, policy_version: *policy_version,
+                    })
+                }
+                (tonepoet_pipeline::EffectArgumentMapping::NativeDcShift { offset_nanounits: Some(_), .. }, None) => None,
+                (tonepoet_pipeline::EffectArgumentMapping::NativeDcShift { .. }, _) => {
+                    return Err(ConvertError::Backend("native DC lowering has incorrect typed decision binding".into()));
+                }
+                (_, Some(_)) => return Err(ConvertError::Backend(
+                    "non-DC lowering unexpectedly owns a DC decision".into())),
+                (_, None) => None,
+            };
             if resampler_index.is_some_and(|barrier| index < barrier) {
-                pre_nodes.push((*input, *output, lowering.clone()));
+                pre_nodes.push((*input, *output, lowering.clone(), dependency));
             } else {
-                post_nodes.push((*input, *output, lowering.clone()));
+                post_nodes.push((*input, *output, lowering.clone(), dependency));
             }
         }
     }
@@ -3889,12 +4006,66 @@ mod tests {
         (req, source_path, output, selected)
     }
 
+    #[test]
+    fn automatic_dc_executor_receives_scoped_observation_and_decision_before_audio() {
+        let temp = TempDir::new().expect("temporary plan workspace");
+        let mut settings = PipelineSettings::default();
+        settings.target_format = PlannerFormat::Flac;
+        settings.target_sample_rate = tonepoet_pipeline::RateTarget::PcmHz(48_000);
+        settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(PcmBitDepth::Int24);
+        let request = PlanRequest {
+            input_path: temp.path().join("source.wav"),
+            output_path: temp.path().join("output.flac"),
+            source: pcm_source_info(
+                PlannerFormat::Wav, tonepoet_pipeline::AudioCodec::PcmSigned,
+                48_000, PcmBitDepth::Int24,
+            ),
+            settings,
+            plan_scope: tonepoet_pipeline::PlanScope::track("dc-r2c-observation"),
+            intermediate_dir: Some(temp.path().join("work")),
+            container_ffmpeg_flags: Vec::new(),
+            raw_input_channel_layout: None,
+            resolved_output_target: None,
+            reference_programme_scope: Default::default(),
+            planned_riff_non_audio_upper_bound_bytes: None,
+        };
+        let effect = EffectIntent {
+            id: EffectInstanceId(85),
+            effect: RegisteredUnaryEffect::DcShiftAuto,
+            after: Vec::new(),
+            placement: EffectPlacement::AfterPcmResample,
+        };
+        let execution = super::registered_effect_execution_contract(
+            &request, std::slice::from_ref(&effect),
+        ).expect("automatic DC plan must export its decision dependency");
+        let segment = execution.post_resample.expect("DC effect segment");
+        assert_eq!(segment.lowerings.len(), 1);
+        assert_eq!(segment.dc_dependencies.len(), 1);
+        let binding = segment.dc_dependencies[0].as_ref()
+            .expect("Auto must bind typed observation and decision before execution");
+        assert_eq!(binding.input, segment.input);
+        assert_eq!(binding.policy_version, 1);
+        assert_eq!(binding.observation.purpose, tonepoet_pipeline::ObservationClass::DcBaseline);
+        assert_eq!(binding.decision, tonepoet_pipeline::DecisionId(1_000_085));
+
+        let manual = EffectIntent {
+            effect: RegisteredUnaryEffect::DcShiftManual { offset_nanounits: 3_000_000 },
+            ..effect
+        };
+        let manual_execution = super::registered_effect_execution_contract(
+            &request, &[manual],
+        ).expect("manual DC retains a fixed parameter rather than an observation");
+        let manual_segment = manual_execution.post_resample.expect("manual DC segment");
+        assert_eq!(manual_segment.dc_dependencies, vec![None]);
+    }
+
     fn registered_terminal_carrier_ref(
         carrier: PathBuf,
         source_path: PathBuf,
         terminal_candidate: SelectedPhysicalCandidateBinding,
     ) -> TrackSourceRef {
         TrackSourceRef::RegisteredEffectCarrier {
+            channel_layout: None,
             path: carrier,
             source_path,
             sample_rate_hz: 88_200,
@@ -4600,6 +4771,7 @@ mod tests {
         representation: RegisteredEffectCarrierRepresentation,
     ) -> PreparedTrack {
         let mut prepared = track(TrackSourceRef::RegisteredEffectCarrier {
+            channel_layout: None,
             path: carrier,
             source_path,
             sample_rate_hz: 44_100,
@@ -6029,6 +6201,7 @@ mod tests {
             2,
         );
         let mut prepared_track = track(TrackSourceRef::DsdTruePeakCarrier {
+            channel_layout: None,
             path: carrier.clone(),
             source_path: original_dsd.clone(),
             sample_rate_hz: 176_400,
@@ -6170,6 +6343,7 @@ mod tests {
 
         let selected_terminal = selected_terminal(tonepoet_pipeline::ToolIdentifier::Ffmpeg);
         let mut prepared_track = track(TrackSourceRef::PcmTruePeakCarrier {
+            channel_layout: None,
             path: carrier.clone(),
             source_path: original_pcm,
             sample_rate_hz: 44_100,
@@ -6284,6 +6458,7 @@ mod tests {
             .bind_runtime_album_gain("-0.375000000".parse().expect("album gain"));
 
         let prepared_track = track(TrackSourceRef::PcmTruePeakCarrier {
+            channel_layout: None,
             path: carrier.clone(),
             source_path: original_pcm,
             sample_rate_hz: 96_000,
@@ -6378,6 +6553,7 @@ mod tests {
     fn pcm_true_peak_carrier_preserves_original_pcm_depth_separately_from_float64_carrier() {
         let carrier = PathBuf::from("track.true-peak.f64le");
         let mut prepared = track(TrackSourceRef::PcmTruePeakCarrier {
+            channel_layout: None,
             path: carrier.clone(),
             source_path: PathBuf::from("source.wav"),
             sample_rate_hz: 192_000,
@@ -6441,6 +6617,7 @@ mod tests {
                 tonepoet_pipeline::SampleGainPolicy::pcm_guard_default();
 
             let mut prepared = track(TrackSourceRef::PcmTruePeakCarrier {
+                channel_layout: None,
                 path: carrier.clone(),
                 source_path: original.clone(),
                 sample_rate_hz: 192_000,
@@ -6525,6 +6702,7 @@ mod tests {
             plan_scope: tonepoet_pipeline::PlanScope::track("pcm-rate-change"),
             intermediate_dir: Some(temp.path().join("work")),
             container_ffmpeg_flags: Vec::new(),
+            raw_input_channel_layout: None,
             resolved_output_target: None,
             reference_programme_scope: tonepoet_pipeline::ReferenceProgrammeScope::Singleton,
             planned_riff_non_audio_upper_bound_bytes: None,
@@ -6590,6 +6768,7 @@ mod tests {
             plan_scope: tonepoet_pipeline::PlanScope::track("pcm-protected-effects"),
             intermediate_dir: Some(temp.path().join("work")),
             container_ffmpeg_flags: Vec::new(),
+            raw_input_channel_layout: None,
             resolved_output_target: None,
             reference_programme_scope: tonepoet_pipeline::ReferenceProgrammeScope::Singleton,
             planned_riff_non_audio_upper_bound_bytes: None,
@@ -6648,6 +6827,196 @@ mod tests {
     }
 
     #[test]
+    fn custom_dsd_multichannel_dc_charged_terminal_binds_verified_raw_speaker_mask() {
+        // Phase-3 produces this carrier only after reconstructing DSD and
+        // applying the typed native DC effect. Its speaker mask comes from
+        // the source-specific verified layout, not the channel count.
+        for effect in [
+            RegisteredUnaryEffect::DcShiftManual { offset_nanounits: 3_000_000 },
+            RegisteredUnaryEffect::DcShiftAuto,
+        ] {
+            let temp = TempDir::new().expect("temp dir");
+            let source_path = temp.path().join("source.dsf");
+            std::fs::write(&source_path, b"fixture source").expect("source placeholder");
+            let raw_carrier = temp.path().join("dsd.dc.true-peak.f64le");
+            std::fs::write(&raw_carrier, vec![0_u8; 6 * 8 * 16])
+                .expect("raw six-channel Float64 carrier");
+            let output = temp.path().join("output.flac");
+            let mut req = request(temp.path());
+            req.stages.metadata = StageRequirement::Disabled;
+            req.settings.target_format = PlannerFormat::Flac;
+            req.settings.target_sample_rate = tonepoet_pipeline::RateTarget::PcmHz(176_400);
+            req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(PcmBitDepth::Int24);
+            req.settings.preferred_tool = PreferredTool::Auto;
+            req.settings.dither_type = tonepoet_pipeline::DitherType::None;
+            req.settings.dither_explicit = true;
+            req.settings.metadata.transfer_tags = false;
+            req.settings.metadata.preserve_artwork = false;
+            req.settings.metadata.store_source_audio_md5 = false;
+            req.settings.dsd.set_gain_policy(tonepoet_pipeline::SampleGainPolicy::TruePeakGuard {
+                target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+                scope: tonepoet_pipeline::TruePeakScope::Track,
+                scan: tonepoet_pipeline::TruePeakScanTier::Standard,
+            });
+            req.registered_effects = tonepoet_pipeline::explicit_effect_sequence([effect]);
+            let initial = PlanRequest {
+                input_path: source_path.clone(),
+                output_path: output.clone(),
+                source: tonepoet_pipeline::SourceInfo {
+                    format: PlannerFormat::Dsf,
+                    codec: tonepoet_pipeline::AudioCodec::Dsd,
+                    sample_rate_hz: Some(5_644_800),
+                    bit_depth: None,
+                    true_source_depth: None,
+                    source_representation: tonepoet_pipeline::SourceRepresentationKind::Dsd,
+                    sample_kind: Some(tonepoet_pipeline::SampleKind::Dsd),
+                    channels: Some(6),
+                    duration: Some(std::time::Duration::from_secs(60)),
+                    frame_extent: None,
+                    dsd_source_kind: None,
+                    audio_md5: None,
+                },
+                settings: req.settings.clone(),
+                plan_scope: tonepoet_pipeline::PlanScope::track("dsd-multichannel-dc"),
+                intermediate_dir: Some(temp.path().join("initial-plan")),
+                container_ffmpeg_flags: Vec::new(),
+                raw_input_channel_layout: None,
+                resolved_output_target: None,
+                reference_programme_scope: tonepoet_pipeline::ReferenceProgrammeScope::Singleton,
+                planned_riff_non_audio_upper_bound_bytes: None,
+            };
+            let execution = certified_true_peak_execution_contract_with_effects(
+                &initial, &req.registered_effects,
+            ).expect("initial DSD admission must charge its layout-capable terminal");
+            assert_eq!(execution.charged_terminal.tool, tonepoet_pipeline::ToolIdentifier::Ffmpeg);
+            let mut prepared = track(TrackSourceRef::DsdTruePeakCarrier {
+                channel_layout: Some("0x3f".to_owned()),
+                path: raw_carrier.clone(),
+                source_path,
+                sample_rate_hz: 176_400,
+                channels: 6,
+                duration: None,
+                gain_db: Some(tonepoet_pipeline::DbNano::ZERO),
+                point_dbtp: Some("-2.000000000".parse().expect("true peak")),
+                effective_target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+                lossy_target_capped: false,
+                terminal_candidate: Some(execution.charged_terminal.clone()),
+            });
+            prepared.sample_rate = Some(5_644_800);
+            prepared.source_audio = SourceAudioDescriptor::from_scalar(
+                Some(5_644_800), None, Some(SourceAudioCoding::Dsd),
+            );
+            let final_request = plan_request_for_track(
+                &req, &prepared, &raw_carrier, &output,
+                temp.path().join("final-plan"),
+            ).expect("charged DSD terminal must survive final raw-carrier binding");
+            assert_eq!(final_request.settings.preferred_tool, PreferredTool::Ffmpeg);
+            assert_eq!(final_request.raw_input_channel_layout.as_deref(), Some("0x3f"));
+            let tools = planned_command_tools(&final_request);
+            assert_eq!(tools.last(), Some(&execution.charged_terminal.tool));
+            let args = planned_command_args(&final_request);
+            let terminal_args = args.last().expect("terminal argv");
+            let mask_index = terminal_args.windows(2).position(|arg|
+                arg[0] == "-channel_layout" && arg[1] == "0x3f"
+            ).expect("verified roles bind to raw input");
+            let input_index = terminal_args.iter().position(|arg| arg == "-i")
+                .expect("raw input option");
+            assert!(mask_index < input_index);
+        }
+    }
+
+    #[test]
+    fn certified_multichannel_dc_auto_terminal_freezes_ffmpeg_before_raw_layout_binding() {
+        for (channels, mask) in [(3_u16, "0x7"), (4_u16, "0x33")] {
+            for effect in [
+                RegisteredUnaryEffect::DcShiftManual { offset_nanounits: 3_000_000 },
+                RegisteredUnaryEffect::DcShiftAuto,
+            ] {
+                let temp = TempDir::new().expect("temp dir");
+                let original = temp.path().join("input.flac");
+                write_minimal_flac_with_md5(&original);
+                let carrier = temp.path().join("dc-truepeak.f64le");
+                std::fs::write(&carrier, vec![0_u8; usize::from(channels) * 8 * 16])
+                    .expect("raw PCM carrier");
+                let output = temp.path().join("output.flac");
+                let mut req = request(temp.path());
+                req.stages.metadata = StageRequirement::Disabled;
+                req.settings.target_format = PlannerFormat::Flac;
+                req.settings.target_sample_rate = tonepoet_pipeline::RateTarget::PcmHz(48_000);
+                req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Pcm(PcmBitDepth::Int24);
+                req.settings.preferred_tool = PreferredTool::Auto;
+                req.settings.dither_type = tonepoet_pipeline::DitherType::None;
+                req.settings.dither_explicit = true;
+                req.settings.metadata.transfer_tags = false;
+                req.settings.metadata.preserve_artwork = false;
+                req.settings.metadata.store_source_audio_md5 = false;
+                req.settings.pcm_true_peak.policy = tonepoet_pipeline::SampleGainPolicy::TruePeakGuard {
+                    target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+                    scope: tonepoet_pipeline::TruePeakScope::Track,
+                    scan: tonepoet_pipeline::TruePeakScanTier::Standard,
+                };
+                req.registered_effects = tonepoet_pipeline::explicit_effect_sequence([effect]);
+
+                let mut initial_track = track(TrackSourceRef::StagedFile(original.clone()));
+                initial_track.sample_rate = Some(48_000);
+                initial_track.bit_depth = Some(24);
+                initial_track.source_audio = SourceAudioDescriptor::from_scalar(
+                    Some(48_000), Some(24), Some(SourceAudioCoding::Pcm),
+                );
+                let mut source = pcm_source_info(
+                    PlannerFormat::Flac, tonepoet_pipeline::AudioCodec::Flac,
+                    48_000, PcmBitDepth::Int24,
+                );
+                source.channels = Some(channels);
+                let initial = super::plan_request_for_track_with_resolved_source(
+                    &req, &initial_track, &original, &output,
+                    temp.path().join("initial"), source,
+                ).expect("initial source-aware typed request");
+                assert!(initial.raw_input_channel_layout.is_none());
+                let execution = certified_true_peak_execution_contract_with_effects(
+                    &initial, &req.registered_effects,
+                ).expect("layout-capable terminal is admitted before its proof is frozen");
+                assert_eq!(execution.charged_terminal.tool, tonepoet_pipeline::ToolIdentifier::Ffmpeg);
+
+                let mut effected_track = track(TrackSourceRef::PcmTruePeakCarrier {
+                    channel_layout: Some(mask.to_owned()),
+                    path: carrier.clone(),
+                    source_path: original,
+                    sample_rate_hz: 48_000,
+                    channels,
+                    duration: None,
+                    gain_db: Some(tonepoet_pipeline::DbNano::ZERO),
+                    point_dbtp: Some("-2.000000000".parse().expect("point")),
+                    effective_target_dbtp: tonepoet_pipeline::PCM_TRUE_PEAK_DEFAULT_TARGET_DBTP,
+                    lossy_target_capped: false,
+                    strong_ssrc_resampler: None,
+                    terminal_candidate: Some(execution.charged_terminal.clone()),
+                    ssrc_true_peak_replay: None,
+                });
+                effected_track.sample_rate = Some(48_000);
+                effected_track.bit_depth = Some(64);
+                effected_track.source_audio = SourceAudioDescriptor::from_scalar(
+                    Some(48_000), Some(64), Some(SourceAudioCoding::Pcm),
+                );
+                let final_request = plan_request_for_track(
+                    &req, &effected_track, &carrier, &output,
+                    temp.path().join("final"),
+                ).expect("the approved terminal survives raw-carrier binding");
+                assert_eq!(final_request.settings.preferred_tool, PreferredTool::Ffmpeg);
+                assert_eq!(final_request.raw_input_channel_layout.as_deref(), Some(mask));
+                let tools = planned_command_tools(&final_request);
+                assert_eq!(tools.last(), Some(&execution.charged_terminal.tool));
+                let args = planned_command_args(&final_request);
+                let terminal = args.last().expect("terminal FFmpeg argv");
+                let layout_at = terminal.windows(2).position(|pair| pair[0] == "-channel_layout" && pair[1] == mask)
+                    .expect("verified mask is bound to the FFmpeg raw input");
+                let input_at = terminal.iter().position(|arg| arg == "-i").expect("input option");
+                assert!(layout_at < input_at, "speaker roles must be bound before input decoding");
+            }
+        }
+    }
+
+    #[test]
     fn certified_pcm_lossless_sox_terminal_stays_bound_to_typed_selected_sox() {
         let temp = TempDir::new().expect("temp dir");
         let carrier = temp.path().join("pcm.true-peak.f64le");
@@ -6688,6 +7057,7 @@ mod tests {
             plan_scope: tonepoet_pipeline::PlanScope::track("pcm-lossless-sox"),
             intermediate_dir: Some(temp.path().join("typed-work")),
             container_ffmpeg_flags: Vec::new(),
+            raw_input_channel_layout: None,
             resolved_output_target: None,
             reference_programme_scope: tonepoet_pipeline::ReferenceProgrammeScope::Singleton,
             planned_riff_non_audio_upper_bound_bytes: None,
@@ -6701,6 +7071,7 @@ mod tests {
         );
 
         let mut prepared = track(TrackSourceRef::PcmTruePeakCarrier {
+            channel_layout: None,
             path: carrier.clone(),
             source_path: original,
             sample_rate_hz: 48_000,
@@ -6781,6 +7152,7 @@ mod tests {
                 plan_scope: tonepoet_pipeline::PlanScope::track(format!("pcm-{extension}")),
                 intermediate_dir: Some(temp.path().join("typed-work")),
                 container_ffmpeg_flags: Vec::new(),
+                raw_input_channel_layout: None,
                 resolved_output_target: None,
                 reference_programme_scope: tonepoet_pipeline::ReferenceProgrammeScope::Singleton,
                 planned_riff_non_audio_upper_bound_bytes: None,
@@ -6793,6 +7165,7 @@ mod tests {
             );
 
             let mut prepared = track(TrackSourceRef::PcmTruePeakCarrier {
+                channel_layout: None,
                 path: carrier.clone(),
                 source_path: original,
                 sample_rate_hz: 48_000,
@@ -6840,6 +7213,7 @@ mod tests {
         let source = temp.path().join("source.flac");
         std::fs::write(&source, b"source").expect("source placeholder");
         let prepared = track(TrackSourceRef::RegisteredEffectCarrier {
+            channel_layout: None,
             path: carrier.clone(),
             source_path: source,
             sample_rate_hz: 88_200,
@@ -6919,6 +7293,7 @@ mod tests {
             let source = temp.path().join(format!("source-{label}.flac"));
             std::fs::write(&source, b"source").expect("source placeholder");
             let prepared = track(TrackSourceRef::RegisteredEffectCarrier {
+                channel_layout: None,
                 path: carrier.clone(),
                 source_path: source,
                 sample_rate_hz: 88_200,
@@ -6969,6 +7344,7 @@ mod tests {
         let source = temp.path().join("source.flac");
         std::fs::write(&source, b"source").expect("source placeholder");
         let prepared = track(TrackSourceRef::RegisteredEffectCarrier {
+            channel_layout: None,
             path: carrier.clone(),
             source_path: source,
             sample_rate_hz: 88_200,
@@ -7041,6 +7417,7 @@ mod tests {
             plan_scope: tonepoet_pipeline::PlanScope::track("dsd-opus"),
             intermediate_dir: Some(temp.path().join("typed-work")),
             container_ffmpeg_flags: Vec::new(),
+            raw_input_channel_layout: None,
             resolved_output_target: None,
             reference_programme_scope: tonepoet_pipeline::ReferenceProgrammeScope::Singleton,
             planned_riff_non_audio_upper_bound_bytes: None,
@@ -7053,6 +7430,7 @@ mod tests {
         );
 
         let mut prepared = track(TrackSourceRef::DsdTruePeakCarrier {
+            channel_layout: None,
             path: carrier.clone(),
             source_path: original,
             sample_rate_hz: 48_000,
@@ -7109,6 +7487,7 @@ mod tests {
         req.settings.pcm_true_peak.policy = tonepoet_pipeline::SampleGainPolicy::pcm_guard_default();
 
         let mut prepared_track = track(TrackSourceRef::PcmTruePeakCarrier {
+            channel_layout: None,
             path: carrier.clone(),
             source_path: original_pcm,
             sample_rate_hz: 96_000,
@@ -7629,6 +8008,7 @@ mod tests {
             plan_scope: tonepoet_pipeline::PlanScope::track("test-track"),
             intermediate_dir: Some(temp.path().join("work")),
             container_ffmpeg_flags: Vec::new(),
+            raw_input_channel_layout: None,
         };
 
         let obligations = planner_metadata_obligations_for_track(&req, &track, &planned);

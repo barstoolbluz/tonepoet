@@ -252,6 +252,12 @@ pub fn common_semantic_plan_fingerprint_v1(
         "source_probe",
         &reference_source_probe_digest_v1(&request.source).to_hex(),
     );
+    // Speaker roles on headerless Float64 carriers affect the physical
+    // decoding/encoding recipe. Bind them to the common-plan identity when
+    // present without changing pre-existing non-DC fingerprints.
+    if let Some(layout) = request.raw_input_channel_layout.as_deref() {
+        writer.field_string("source.verified_raw_channel_layout", layout.to_string());
+    }
     writer.field_static("intent.target_format", &audio_format(&plan.intent.target_format));
     writer.field_string("intent.target_rate", rate_target(plan.intent.target_rate));
     writer.field_string("intent.target_depth", bit_depth_target(plan.intent.target_depth));
@@ -692,6 +698,10 @@ fn push_semantic_node(writer: &mut FingerprintWriter, index: usize, node: &Typed
                 ObservationKind::TerminalVerification => {
                     writer.field_static(&format!("{prefix}.metric"), "terminal_verification");
                 }
+                ObservationKind::DcBaseline { policy_version } => {
+                    writer.field_static(&format!("{prefix}.metric"), "dc_baseline");
+                    writer.field_string(&format!("{prefix}.policy_version"), policy_version.to_string());
+                }
             }
         }
         TypedPlanNode::Decide(decision) => {
@@ -788,6 +798,10 @@ fn push_semantic_node(writer: &mut FingerprintWriter, index: usize, node: &Typed
                         canonical_gain_policy(*policy),
                     );
                 }
+                DecisionKind::DcCorrection { policy_version } => {
+                    writer.field_static(&format!("{prefix}.decision"), "dc_correction");
+                    writer.field_string(&format!("{prefix}.policy_version"), policy_version.to_string());
+                }
                 DecisionKind::ReplayGainProjection { policy, group } => {
                     writer.field_static(&format!("{prefix}.decision"), "replaygain_projection");
                     writer.field_static(&format!("{prefix}.mode"), replay_gain_mode(policy.mode));
@@ -826,12 +840,16 @@ fn push_semantic_node(writer: &mut FingerprintWriter, index: usize, node: &Typed
             output,
             instance,
             lowering,
+            dc_decision,
             ..
         } => {
             writer.field_static(&format!("{prefix}.kind"), "apply_effect");
             writer.field_string(&format!("{prefix}.input"), input.0.to_string());
             writer.field_string(&format!("{prefix}.output"), output.0.to_string());
             writer.field_string(&format!("{prefix}.instance"), instance.id.0.to_string());
+            if let Some(decision) = dc_decision {
+                writer.field_string(&format!("{prefix}.dc_decision"), decision.0.to_string());
+            }
             push_registered_effect(writer, &format!("{prefix}.effect"), &instance.effect);
             if instance.placement == EffectPlacement::SourceRate {
                 writer.field_static(&format!("{prefix}.placement"), "source_rate");
@@ -849,6 +867,12 @@ fn push_semantic_node(writer: &mut FingerprintWriter, index: usize, node: &Typed
                 EffectArgumentMapping::FfmpegAudioFilter(filter) => {
                     writer.field_static(&format!("{prefix}.argument_kind"), "ffmpeg_filter");
                     writer.field_string(&format!("{prefix}.filter"), filter.clone());
+                }
+                EffectArgumentMapping::NativeDcShift { offset_nanounits, policy_version } => {
+                    writer.field_static(&format!("{prefix}.argument_kind"), "native_f64_dc");
+                    writer.field_string(&format!("{prefix}.policy_version"), policy_version.to_string());
+                    writer.field_string(&format!("{prefix}.offset_nanounits"),
+                        offset_nanounits.map_or_else(|| "unresolved".to_owned(), |v| v.to_string()));
                 }
             }
         }
@@ -2016,6 +2040,7 @@ fn observation_class(value: ObservationClass) -> &'static str {
         ObservationClass::ProgrammeGeometry => "programme_geometry",
         ObservationClass::SourceAudioDigest => "source_audio_digest",
         ObservationClass::TerminalVerification => "terminal_verification",
+        ObservationClass::DcBaseline => "dc_baseline",
     }
 }
 
@@ -2053,6 +2078,14 @@ fn push_registered_effect(
         RegisteredUnaryEffect::RemoveDcOffset => {
             writer.field_static(&format!("{prefix}.kind"), "remove_dc_offset");
             writer.field_static(&format!("{prefix}.filter"), "highpass_2hz_v1");
+        }
+        RegisteredUnaryEffect::DcShiftAuto => {
+            writer.field_static(&format!("{prefix}.kind"), "dc_shift_auto");
+            writer.field_static(&format!("{prefix}.policy"), "conservative_v1");
+        }
+        RegisteredUnaryEffect::DcShiftManual { offset_nanounits } => {
+            writer.field_static(&format!("{prefix}.kind"), "dc_shift_manual");
+            writer.field_string(&format!("{prefix}.offset_nanounits"), offset_nanounits.to_string());
         }
         RegisteredUnaryEffect::CdDeemphasis => {
             writer.field_static(&format!("{prefix}.kind"), "cd_deemphasis");
