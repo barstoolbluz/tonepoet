@@ -206,9 +206,9 @@ pub fn draw_format_pane(
                             row_focused, theme,
                         ));
                     }
-                    FormatField::PcmTruePeak => lines.push(pcm_gain_info_row(
-                        border_color, w,
-                        &render_pill_spans(&format_state.pcm_gain_mode, row_focused, theme),
+                    FormatField::PcmTruePeak => lines.push(pill_row(
+                        border_color, w, "PCM gain   ", "ⓘ",
+                        &pcm_gain_pill_spans(format_state, w, row_focused, theme),
                         row_focused, theme,
                     )),
                     FormatField::PcmGainDb => lines.push(dsd_db_value_row(
@@ -853,28 +853,36 @@ fn dim_pill_spans<'a>(spans: &[Span<'a>],
         .collect()
 }
 
-/// The four PCM gain pills occupy the full row on narrow terminals. Put help
-/// in the unused two cells of the label area, keeping every pill's original
-/// position and clickable width. Both the glyph and its guard cell use the
-/// established foreground-only information style.
-fn pcm_gain_info_row<'a>(
-    border_color: ratatui::style::Color,
+/// PCM gain uses the normal suffix information control, after the last pill.
+/// At narrow terminal widths the labels contract in stages, like the DC row.
+/// The renderer and hitbox registration share these exact labels; the full
+/// mode names remain available through the information control and keyboard.
+/// Four pills + three two-cell gaps + two-cell information delimiter +
+/// two-cell information glyph/guard must fit before the right border.
+pub(super) fn pcm_gain_pill_labels(width: usize) -> [&'static str; 4] {
+    if width >= 84 {
+        ["off", "true-peak guard", "true-peak normalize", "fixed gain"]
+    } else if width >= 64 {
+        ["off", "guard", "normalize", "fixed gain"]
+    } else if width >= 52 {
+        ["off", "guard", "norm", "fix"]
+    } else {
+        ["off", "G", "N", "F"]
+    }
+}
+
+fn pcm_gain_pill_spans(
+    format_state: &FormatState,
     width: usize,
-    pills: &[Span<'a>],
     focused: bool,
     theme: super::theme::Theme,
-) -> Line<'a> {
-    let mut row = pill_row(border_color, width, "PCM gain   ", "", pills, focused, theme);
-    let label_style = if focused { theme.bright() } else { theme.muted() };
-    let info_fg = if theme.dark { theme.info } else { theme.value };
-    // Replace the existing 16-cell label span with 12 + 2 + 2 cells.
-    // The first pill still starts at x=17 (including the left border).
-    row.spans.splice(1..2, [
-        Span::styled("   PCM gain ", label_style),
-        Span::styled("ⓘ ", Style::default().fg(info_fg).add_modifier(Modifier::BOLD)),
-        Span::styled("  ", label_style),
-    ]);
-    row
+) -> Vec<Span<'static>> {
+    let mut spans = render_pill_spans(&format_state.pcm_gain_mode, focused, theme);
+    for (index, label) in pcm_gain_pill_labels(width).iter().enumerate() {
+        // Keep the common pill painter's selection, enabled and focus styles.
+        spans[index * 2].content = format!(" {label} ").into();
+    }
+    spans
 }
 
 fn pill_row<'a>(
@@ -1234,27 +1242,37 @@ mod pcm_gain_info_glyph_tests {
     use super::*;
 
     #[test]
-    fn pcm_gain_info_uses_foreground_only_contrasting_unicode_guard() {
+    fn pcm_gain_info_follows_all_four_pills_with_foreground_only_unicode_guard() {
+        use crate::config::TonepoetConfig;
+        let app = super::super::app::AppState::new_for_test(TonepoetConfig::default());
         for palette in super::super::theme::palettes() {
             let theme = super::super::theme::theme_by_slug(palette.slug)
                 .expect("shipped theme");
-            for focused in [false, true] {
-                let plain = pill_row(theme.green, 80, "PCM gain   ", "",
-                    &[Span::raw(" off ")], focused, theme);
-                let with_info = pcm_gain_info_row(theme.green, 80,
-                    &[Span::raw(" off ")], focused, theme);
-                let info = with_info.spans.iter().find(|span|
-                    span.content.as_ref() == "ⓘ ").expect("glyph and guard cell");
-                let expected_fg = if theme.dark { theme.info } else { theme.value };
-                assert_eq!(info.style.fg, Some(expected_fg));
-                assert_eq!(info.style.bg, None, "no filled icon background");
-                assert!(info.style.add_modifier.contains(Modifier::BOLD));
-                assert!(super::super::theme::contrast_ratio(expected_fg, theme.panel_bg) >= 4.5);
-                assert_eq!(Line::from(plain.spans.clone()).width(),
-                    Line::from(with_info.spans.clone()).width(),
-                    "information affordance must not change any pill positions");
-                assert_eq!(with_info.spans[1..4].iter().map(Span::width).sum::<usize>(),
-                    plain.spans[1].width());
+            for width in [42, 44, 51, 52, 63, 64, 80, 83, 84, 120] {
+                for focused in [false, true] {
+                    let pills = pcm_gain_pill_spans(&app.convert.format, width, focused, theme);
+                    let plain = pill_row(theme.green, width, "PCM gain   ", "",
+                        &pills, focused, theme);
+                    let with_info = pill_row(theme.green, width, "PCM gain   ", "ⓘ",
+                        &pills, focused, theme);
+                    let index = with_info.spans.iter().position(|span|
+                        span.content.as_ref() == "ⓘ ").expect("glyph and guard cell");
+                    let info = &with_info.spans[index];
+                    let expected_fg = if theme.dark { theme.info } else { theme.value };
+                    assert_eq!(info.style.fg, Some(expected_fg));
+                    assert_eq!(info.style.bg, None, "no filled icon background");
+                    assert!(info.style.add_modifier.contains(Modifier::BOLD));
+                    assert!(super::super::theme::contrast_ratio(expected_fg, theme.panel_bg) >= 4.5);
+                    assert_eq!(with_info.spans[1].content, plain.spans[1].content,
+                        "the original label span must be left untouched");
+                    // Pill styles and positions are identical with and without help.
+                    assert_eq!(with_info.spans[..1 + pills.len() + 1],
+                        plain.spans[..1 + pills.len() + 1]);
+                    assert_eq!(index, 2 + pills.len() + 1,
+                        "information follows the final pill and separator");
+                    assert_eq!(Line::from(with_info.spans.clone()).width(), width,
+                        "responsive labels keep the suffix inside the pane");
+                }
             }
         }
     }

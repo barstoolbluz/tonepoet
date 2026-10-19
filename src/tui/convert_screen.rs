@@ -348,13 +348,22 @@ fn register_format_buttons(app: &mut AppState, area: Rect) {
             }
             FormatField::ReplayGain => register_pill_row(buttons, &state.replaygain, y, label_col, TuiButton::ReplayGainPill),
             FormatField::PcmTruePeak => {
-                register_pill_row(buttons, &state.pcm_gain_mode, y, label_col,
-                    TuiButton::PcmTruePeakPill);
-                if area.width >= 30 && area.height >= 6 {
-                    // The literal U+24D8 plus its same-style guard cell occupy
-                    // two otherwise unused label cells. No pill is displaced.
+                let labels = super::draw_output::pcm_gain_pill_labels(area.width as usize);
+                let pane_right = area.x.saturating_add(area.width).saturating_sub(1);
+                let mut x = label_col;
+                for (index, label) in labels.iter().enumerate() {
+                    let len = label.len() as u16 + 2; // pill padding
+                    if x.saturating_add(len) <= pane_right {
+                        buttons.record_button(TuiButton::PcmTruePeakPill(index),
+                            Rect::new(x, y, len, 1));
+                    }
+                    x = x.saturating_add(len + 2); // two-cell gap after each pill
+                }
+                // The common pill_row suffix places U+24D8 two cells after
+                // the last pill; its guard cell is part of the same hitbox.
+                if x.saturating_add(2) <= pane_right {
                     buttons.record_button(TuiButton::PcmGainInfo,
-                        Rect::new(area.x + 13, y, 2, 1));
+                        Rect::new(x, y, 2, 1));
                 }
             }
             FormatField::PcmGainDb => buttons.record_button(
@@ -971,9 +980,43 @@ mod format_render_registration_tests {
                         .map(|y| row_text(&notice_terminal, y, width)).collect();
                     assert!(displayed.contains("DC offset correction"));
                     assert!(displayed.contains("Recommended unless"));
-                    assert!(crate::tui::draw_overlays::notice_message_max_scroll(
+                    let tall_max_scroll = crate::tui::draw_overlays::notice_message_max_scroll(
                         ratatui::layout::Rect::new(0, 0, width, height),
-                        crate::tui::keybindings::DC_CORRECTION_INFO_MESSAGE) > 0);
+                        crate::tui::keybindings::DC_CORRECTION_INFO_MESSAGE);
+                    if tall_max_scroll == 0 {
+                        assert!(displayed.contains("This setting does not fix hum"),
+                            "a notice that fits must show its ending without scrolling");
+                    } else {
+                        // If help copy grows, it is still valid for this tall
+                        // terminal to scroll; the last paragraph must remain reachable.
+                        if let ActiveOverlay::Notice { scroll, .. } = &mut app.active_overlay {
+                            *scroll = tall_max_scroll;
+                        }
+                        notice_terminal.draw(|frame|
+                            crate::tui::draw::draw_ui(frame, &mut app)).unwrap();
+                        let final_page: String = (0..height)
+                            .map(|y| row_text(&notice_terminal, y, width)).collect();
+                        assert!(final_page.contains("This setting does not fix hum"));
+                    }
+                    // Scrolling is required only when the same content exceeds
+                    // the visible body height. Exercise the actual overlay at
+                    // a short terminal size, including its final paragraph.
+                    let short_height = 24;
+                    let max_scroll = crate::tui::draw_overlays::notice_message_max_scroll(
+                        ratatui::layout::Rect::new(0, 0, width, short_height),
+                        crate::tui::keybindings::DC_CORRECTION_INFO_MESSAGE);
+                    assert!(max_scroll > 0, "short terminals must scroll");
+                    if let ActiveOverlay::Notice { scroll, .. } = &mut app.active_overlay {
+                        *scroll = max_scroll;
+                    }
+                    let mut short_terminal = Terminal::new(
+                        TestBackend::new(width, short_height)).unwrap();
+                    short_terminal.draw(|frame|
+                        crate::tui::draw::draw_ui(frame, &mut app)).unwrap();
+                    let final_page: String = (0..short_height)
+                        .map(|y| row_text(&short_terminal, y, width)).collect();
+                    assert!(final_page.contains("This setting does not fix hum"),
+                        "scrolling to the bottom must expose the last paragraph");
                 }
             }
         }
@@ -1529,7 +1572,7 @@ mod pcm_gain_info_regressions {
 
     #[test]
     fn pcm_gain_info_is_visible_clickable_and_does_not_overlap_pills_at_narrow_widths() {
-        for width in [44u16, 64, 80, 100, 120] {
+        for width in [44u16, 51, 52, 63, 64, 80, 83, 84, 100, 120] {
             for mode in [PcmGainMode::Off, PcmGainMode::TruePeakGuard,
                 PcmGainMode::TruePeakNormalize, PcmGainMode::FixedGain] {
                 let height = 50;
@@ -1546,7 +1589,7 @@ mod pcm_gain_info_regressions {
                 let info_rect = app.button_map.find_button_rect(&TuiButton::PcmGainInfo)
                     .expect("visible PCM gain information hitbox");
                 assert_eq!((info_rect.x, info_rect.y, info_rect.width), (glyph_x, row, 2));
-                assert_eq!(glyph_x, 13, "the icon uses spare label space, without moving pills");
+                assert!(glyph_x > 17, "the information control belongs after the pills");
                 for x in glyph_x..glyph_x + 2 {
                     assert_eq!(app.button_map.find_button_at(x, row), Some(TuiButton::PcmGainInfo));
                 }
@@ -1554,11 +1597,14 @@ mod pcm_gain_info_regressions {
                     let pill = TuiButton::PcmTruePeakPill(index);
                     let rect = app.button_map.find_button_rect(&pill).expect("original gain pill");
                     assert_eq!(rect.y, row);
-                    assert!(rect.x >= glyph_x + 2, "glyph may not overlap a gain pill");
-                    if rect.x < width - 1 {
-                        assert_eq!(app.button_map.find_button_at(rect.x, row), Some(pill));
-                    }
+                    assert!(rect.x + rect.width + 2 <= glyph_x,
+                        "all four selectable pills must precede the information control");
+                    assert_eq!(app.button_map.find_button_at(rect.x, row), Some(pill));
                 }
+                let last_pill = app.button_map.find_button_rect(
+                    &TuiButton::PcmTruePeakPill(3)).unwrap();
+                assert_eq!(glyph_x, last_pill.x + last_pill.width + 2,
+                    "the suffix follows the final pill by the common two-cell gap");
                 let prior_gain = *app.convert.format.pcm_gain_mode.selected_value();
                 let prior_db = app.convert.format.pcm_fixed_gain_db;
                 let prior_ceiling = app.convert.format.pcm_true_peak_target_dbtp;

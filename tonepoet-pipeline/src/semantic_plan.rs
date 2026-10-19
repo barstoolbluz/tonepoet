@@ -7163,23 +7163,46 @@ mod tests {
         request.source.channels = Some(3);
         request.settings.dither_type = DitherType::None;
         request.settings.dither_explicit = true;
+        let folded_dc = explicit_effect_sequence([
+            RegisteredUnaryEffect::StereoFold,
+            RegisteredUnaryEffect::DcShiftManual { offset_nanounits: 3_000_000 },
+        ]);
         for effects in [
             Vec::new(),
             explicit_effect_sequence([RegisteredUnaryEffect::RemoveDcOffset]),
-            explicit_effect_sequence([
-                RegisteredUnaryEffect::StereoFold,
-                RegisteredUnaryEffect::DcShiftManual { offset_nanounits: 3_000_000 },
-            ]),
+            folded_dc.clone(),
         ] {
             let PlanningOutcome::Ready(plan) =
                 plan_typed_with_effects(&request, &effects).expect("bounded planning")
-            else { panic!("previously admitted route must stay admitted") };
+            else { panic!("legacy or post-fold stereo route must stay admitted") };
             let (selected, _) = selected_pcm_terminal(&plan);
-            assert_eq!(selected.tool, Some(ToolIdentifier::Sox));
-            assert!(!selected.contract.runtime_obligations.contains(
-                MULTICHANNEL_DC_RAW_LAYOUT_CONTRACT
-            ));
+            assert!(selected.contract.terminal_proof.is_some(),
+                "true-peak ceiling must remain bound to the selected terminal");
+            // The raw-layout obligation is not applicable to *any* candidate
+            // in these paths. Auto may legitimately select either admitted
+            // terminal; its normal preference is not this constraint's API.
+            for node in &plan.nodes {
+                if let TypedPlanNode::Operation {
+                    operation: PlanOperation::EncodePcm { .. }, candidates, ..
+                } = node {
+                    assert!(candidates.iter().all(|candidate|
+                        !candidate.contract.runtime_obligations.contains(
+                            MULTICHANNEL_DC_RAW_LAYOUT_CONTRACT)),
+                        "unrelated terminals must not acquire a multichannel DC obligation");
+                }
+            }
         }
+        // A deliberate SoX preference remains admissible after folding.
+        // This catches a leaked FFmpeg-only requirement without assuming
+        // that Auto selected SoX in the original registry.
+        request.settings.preferred_tool = PreferredTool::Sox;
+        let PlanningOutcome::Ready(plan) =
+            plan_typed_with_effects(&request, &folded_dc).expect("bounded planning")
+        else { panic!("post-fold stereo must not be forced through FFmpeg") };
+        let (terminal, _) = selected_pcm_terminal(&plan);
+        assert_eq!(terminal.tool, Some(ToolIdentifier::Sox));
+        assert!(!terminal.contract.runtime_obligations.contains(
+            MULTICHANNEL_DC_RAW_LAYOUT_CONTRACT));
     }
 
     #[test]
