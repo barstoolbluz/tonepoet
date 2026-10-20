@@ -1335,7 +1335,7 @@ pub fn completed_registered_effects_from_plan(
 /// physical receipts are resolved at the exact registered-effect boundary.
 /// Native effects consume a native receipt; they must never consume a fake
 /// process invocation or claim that analysis alone executed subtraction.
-pub fn completed_registered_effects_with_dc(
+pub(crate) fn completed_registered_effects_with_dc(
     request: &PlanRequest,
     effects: &[EffectIntent],
     effect_invocation_indices: &[usize],
