@@ -1,0 +1,17 @@
+{
+  "as_of": "2026-10-22",
+  "archive": "TonePoet_SNAPSHOT_98aae2b_2026-10-22.tar.gz",
+  "archive_sha256": "0740a9c8cbd8e59648981207daf62e6373f4b544ad3a40c7872b3890c9d76d26",
+  "identity_origin": "user-supplied TonePoet_SOURCE_IDENTITY_2026-10-22.md",
+  "reported_commit": "98aae2b",
+  "reported_branch": "main",
+  "reported_git_clean": true,
+  "reported_test_result": "7575 passed, no failures/warnings at this preexisting commit, reported by source-identity letter, NOT RERUN",
+  "independent_git_verification": "NOT POSSIBLE: source is git archive without .git",
+  "rust_build_performed": false,
+  "production_code_changes": false,
+  "cue_benchmark_performed": false,
+  "planning_packet_count": 6,
+  "planning_release": "R2_CORRECTIVE",
+  "next_accepted_source": "NOT YET GENERATED; IP-01 must generate after implementation and host qualification"
+}

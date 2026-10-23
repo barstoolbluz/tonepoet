@@ -1,0 +1,6 @@
+PASS snapshot identity: 0740a9c8cbd8e59648981207daf62e6373f4b544ad3a40c7872b3890c9d76d26
+PASS original files intact except these 3 Rust modules: ['src/convert/pipeline/baseline.rs', 'src/convert/pipeline/stages.rs', 'src/convert/processor.rs']
+PASS amended planning authority byte-identical including IP-06 decision
+PASS IP-01 R2 corrective source anchors (D-01..D-06)
+PASS instrumentation anchors, prelaunch route reason inventory and native observer reuse
+QUALIFICATION NOT RUN: cargo fmt, cargo tests, native runtime/benchmarks

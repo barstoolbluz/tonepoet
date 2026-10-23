@@ -1,0 +1,536 @@
+--- a/src/convert/pipeline/baseline.rs
++++ b/src/convert/pipeline/baseline.rs
+@@ -4,6 +4,7 @@
+ //! names an output file.  It owns no execution decisions and must never turn an
+ //! instrumentation failure into a conversion failure.
+ 
++use std::cell::RefCell;
+ use std::collections::HashMap;
+ use std::fs::{File, OpenOptions};
+ use std::io::Write;
+@@ -57,6 +58,37 @@
+ // process-local; never compare its values between separate runs.
+ static CUE_CLOCK: OnceLock<Instant> = OnceLock::new();
+ static CUE_ID_SALT: OnceLock<[u8; 16]> = OnceLock::new();
++
++// This context exists ONLY on the native post-output worker thread. It binds
++// its preexisting replaygain_measure scope to the corresponding CUE run,
++// instead of guessing from the number of events in a possibly mixed trace.
++thread_local! {
++    static CUE_NATIVE_REPLAYGAIN_RUN: RefCell<Option<String>> = const { RefCell::new(None) };
++}
++
++struct CueNativeReplayGainGuard(Option<String>);
++
++impl Drop for CueNativeReplayGainGuard {
++    fn drop(&mut self) {
++        CUE_NATIVE_REPLAYGAIN_RUN.with(|slot| {
++            *slot.borrow_mut() = self.0.take();
++        });
++    }
++}
++
++pub(crate) fn with_cue_native_replaygain_correlation<T>(
++    job_id: &str,
++    operation: impl FnOnce() -> T,
++) -> T {
++    if !enabled() {
++        return operation();
++    }
++    let previous = CUE_NATIVE_REPLAYGAIN_RUN.with(|slot| {
++        slot.borrow_mut().replace(cue_run_id(job_id))
++    });
++    let _guard = CueNativeReplayGainGuard(previous);
++    operation()
++}
+ 
+ fn cue_run_id(job_id: &str) -> String {
+     let salt = CUE_ID_SALT.get_or_init(|| *uuid::Uuid::new_v4().as_bytes());
+@@ -167,6 +199,93 @@
+         // event name only on the actually enabled sink path.
+     }
+ 
++    // Child runs are fresh test-harness processes: a OnceLock sink can only
++    // be tested honestly by choosing the env var before the first emit.
++    #[test]
++    fn cue_ip01_actual_sink_subprocess_child() {
++        let Ok(mode) = std::env::var("TONEPOET_IP01_SINK_CHILD") else {
++            return; // ordinary full-workspace test execution
++        };
++        assert_eq!(enabled(), mode == "enabled");
++        let jobs = ["/private/album-one.flac", "/private/album-two.flac"];
++        std::thread::scope(|scope| {
++            for (index, job) in jobs.iter().enumerate() {
++                scope.spawn(move || {
++                    cue_emit(job, "route_selected", json!({
++                        "group": format!("cue-stream:{index:04}-{index:04}"),
++                        "route": "s1",
++                        "track_ordinal": index,
++                    }));
++                    cue_emit(job, "work_finished", json!({
++                        "group": format!("cue-stream:{index:04}-{index:04}"),
++                        "elapsed_ms": 0.5,
++                    }));
++                    if index == 0 {
++                        with_cue_native_replaygain_correlation(job, || {
++                            emit("replaygain_measure_started", json!({"mode": "Both"}));
++                            emit("replaygain_measure_finished", json!({"elapsed_ms": 0.4}));
++                        });
++                    }
++                });
++            }
++        });
++    }
++
++    #[test]
++    fn cue_ip01_real_enabled_disabled_sink_and_concurrent_identity() {
++        let exe = std::env::current_exe().expect("test harness path");
++        for mode in ["disabled", "enabled"] {
++            let temp = tempfile::tempdir().expect("isolated trace dir");
++            let trace = temp.path().join("diagnostics.jsonl");
++            let original = temp.path().join("original-conversion.log");
++            std::fs::write(&original, b"existing log unaffected\n").unwrap();
++            let mut child = std::process::Command::new(&exe);
++            child.arg("cue_ip01_actual_sink_subprocess_child")
++                .arg("--nocapture")
++                .env("TONEPOET_IP01_SINK_CHILD", mode)
++                .env_remove(BASELINE_ENV);
++            if mode == "enabled" {
++                child.env(BASELINE_ENV, &trace);
++            }
++            let output = child.output().expect("child test launched");
++            assert!(output.status.success(), "child test failed: {} / {}",
++                String::from_utf8_lossy(&output.stdout),
++                String::from_utf8_lossy(&output.stderr));
++            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"),
++                "the child filter must execute exactly one test");
++            assert_eq!(std::fs::read(&original).unwrap(), b"existing log unaffected\n");
++            if mode == "disabled" {
++                assert!(!trace.exists(), "disabled diagnostics must not create a file");
++                continue;
++            }
++            let raw = std::fs::read_to_string(&trace).expect("real JSONL file exists");
++            assert!(!raw.contains("/private/"), "CUE records leak private job IDs");
++            let records = raw.lines()
++                .map(|line| serde_json::from_str::<Value>(line).unwrap())
++                .collect::<Vec<_>>();
++            assert_eq!(records.len(), 6, "atomic concurrent JSONL plus one native scope");
++            let cue = records.iter().filter(|value| value["event"] == "cue_ip01")
++                .collect::<Vec<_>>();
++            assert_eq!(cue.len(), 4);
++            let ids = cue.iter().map(|record| record["cue_run_id"].as_str().unwrap())
++                .collect::<std::collections::HashSet<_>>();
++            assert_eq!(ids.len(), 2, "two jobs must have distinct salted run IDs");
++            for record in &cue {
++                assert!(record["cue_monotonic_us"].as_u64().is_some());
++            }
++            let native = records.iter().find(|record|
++                record["event"] == "replaygain_measure_finished").unwrap();
++            let native_start = records.iter().find(|record|
++                record["event"] == "replaygain_measure_started").unwrap();
++            assert_eq!(native["cue_run_id"], native_start["cue_run_id"]);
++            let matching = cue.iter().filter(|record|
++                record["cue_phase"] == "route_selected"
++                    && record["cue_run_id"] == native["cue_run_id"])
++                .count();
++            assert_eq!(matching, 1);
++        }
++    }
++
+     #[test]
+     fn cue_ip01_overlapping_intervals_are_not_summed() {
+         // A decoder can overlap encoders; the observable transport wall clock
+@@ -210,6 +329,13 @@
+     };
+     object.insert("event".to_string(), Value::String(event.to_string()));
+     object.insert("unix_ms".to_string(), json!(unix_millis()));
++    if matches!(event, "replaygain_measure_started" | "replaygain_measure_finished") {
++        // This key is added only by the CUE worker's explicit thread-local
++        // scope, not from a legacy item_id or event-count heuristic.
++        if let Some(run) = CUE_NATIVE_REPLAYGAIN_RUN.with(|slot| slot.borrow().clone()) {
++            object.insert("cue_run_id".to_string(), json!(run));
++        }
++    }
+     // CUE IP-01 identifies runs only by their salted correlation key;
+     // the existing baseline records retain their established item_id policy.
+     if event != "cue_ip01" {
+--- a/src/convert/pipeline/stages.rs
++++ b/src/convert/pipeline/stages.rs
+@@ -15789,15 +15789,21 @@
+         && source.is_some_and(|prepared| prepared.tracks.iter().any(|track| {
+             matches!(&track.source_ref, TrackSourceRef::CueStreamSegment { .. })
+         }))).then(Instant::now);
++    let cue_native_rg_job = cue_post_output_started.map(|_| req.job_id.clone());
+     let native_join = tokio::task::spawn_blocking(move || {
+         crate::concurrency::with_scoped_mutation_claims(&inherited_mutation_claims, || {
+-            crate::convert::replaygain::measure_and_write_paths(
++            let measure = || crate::convert::replaygain::measure_and_write_paths(
+                 &native_paths,
+                 &native_members,
+                 mode,
+                 prevent_clipping,
+                 false,
+-            )
++            );
++            if let Some(job_id) = cue_native_rg_job.as_deref() {
++                super::baseline::with_cue_native_replaygain_correlation(job_id, measure)
++            } else {
++                measure()
++            }
+         })
+     })
+     .await;
+@@ -44830,6 +44836,9 @@
+     let mut observer_handles = Vec::with_capacity(rg_observers.len());
+     let observer_diagnostics_job = super::baseline::enabled().then(|| req.job_id.clone());
+     for (ordinal, observer) in rg_observers.into_iter().enumerate() {
++        // The authored ordinal is stable across non-contiguous selections;
++        // the observer's local FIFO index is not a track identity.
++        let source_ordinal = tracks[ordinal].track.id.source_ordinal;
+         let observer_cancel = analysis_cancel.clone();
+         let observer_diagnostics_job = observer_diagnostics_job.clone();
+         observer_handles.push(tokio::task::spawn_blocking(move || {
+@@ -44849,6 +44858,7 @@
+             if let (Some(started), Some(job_id)) = (observer_started, observer_diagnostics_job) {
+                 super::baseline::cue_emit(&job_id, "source_pass_track_observer_settled", serde_json::json!({
+                     "group_track_index": ordinal,
++                    "track_ordinal": source_ordinal,
+                     "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+                     "success": observation.is_ok(),
+                     "scope": "fifo_read_wait_and_native_source_pass_observation_inclusive_not_additive",
+@@ -44950,6 +44960,15 @@
+     let failure_cause = first_failure_cause.load(Ordering::Acquire);
+ 
+     if failure_cause == CUE_CAUSE_OBSERVER && !direct && !cancel.is_cancelled() {
++        if super::baseline::enabled() {
++            // One recovery *episode* for the album, not one event per group:
++            // some original groups may never have reached routing before the
++            // observer cancelled conversion, while the rerun visits them all.
++            super::baseline::cue_emit(&req.job_id, "source_pass_observer_recovery_retry", serde_json::json!({
++                "reason": "source_pass_observer_causal_failure",
++                "next_attempt": "non_mirrored_s1",
++            }));
++        }
+         // The optional observer was the causal failure and disrupted the
+         // mirrored attempt. Settle that attempt first, then perform exactly one
+         // non-mirrored conversion rerun. The ordinary required final-output
+@@ -45273,8 +45292,16 @@
+     }
+ }
+ 
+-/// One CUE IP-01 route decision per physical decoder group. No filenames,
+-/// metadata or tool argv appear in these opt-in diagnostic fields.
++/// Private-safe physical group identity, shared with the scheduler's existing
++/// CUE queue identifier. Identical on a recovered non-mirrored S1 attempt.
++fn cue_ip01_group_id(tracks: &[ScheduledCueStreamTrack]) -> String {
++    let first = tracks.first().expect("CUE group is non-empty").track.id.source_ordinal;
++    let last = tracks.last().expect("CUE group is non-empty").track.id.source_ordinal;
++    format!("cue-stream:{first:04}-{last:04}")
++}
++
++/// One route decision per *attempt* of a physical decoder group, not proof of
++/// a distinct group. Observer recovery is explicitly marked separately.
+ fn cue_ip01_route(
+     req: &PipelineRequest,
+     tracks: &[ScheduledCueStreamTrack],
+@@ -45290,6 +45317,7 @@
+         serde_json::json!({
+             "route": route,
+             "route_reason": reason,
++            "group": cue_ip01_group_id(tracks),
+             "track_ordinals": tracks.iter().map(|input| input.track.id.source_ordinal).collect::<Vec<_>>(),
+         }),
+     );
+@@ -45303,6 +45331,21 @@
+         tonepoet_pipeline::ReplayGainMode::Track => "Track",
+         tonepoet_pipeline::ReplayGainMode::Album => "Album",
+         tonepoet_pipeline::ReplayGainMode::Both => "Both",
++    }
++}
++
++// Selection and observer success are not tag-write success. Skipped metadata
++// normalization may succeed without applying a fresh ReplayGain tag pair.
++fn cue_ip01_replaygain_tag_action(
++    result: &Result<StageRecord, ReplayGainError>,
++) -> &'static str {
++    match result {
++        Ok(record) => match &record.outcome {
++            StageOutcome::Ok | StageOutcome::OkWithDetail(_) => "applied",
++            StageOutcome::Skipped | StageOutcome::SkippedWithReason(_) => "skipped",
++            _ => "not_applied",
++        },
++        Err(_) => "failed",
+     }
+ }
+ 
+@@ -45619,6 +45662,7 @@
+             &req.job_id,
+             "s1_transport_settled",
+             serde_json::json!({
++                "group": cue_ip01_group_id(&tracks),
+                 "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+                 "outcome": match &execution {
+                     Ok(_) => "ok",
+@@ -46876,16 +46920,18 @@
+                 scan,
+             )
+         });
+-        if super::baseline::enabled() && source_value.tracks.iter().any(|track| {
++        let cue_rg_diagnostics = super::baseline::enabled() && source_value.tracks.iter().any(|track| {
+             matches!(&track.source_ref, TrackSourceRef::CueStreamSegment { .. })
+-        }) {
+-            let path = if batch_scan_record.is_some() { "batch_scan" }
+-                else if source_scan_record.is_some() { "source_pass" }
+-                else { "post_output_candidate" };
++        });
++        let rg_selected_path = if batch_scan_record.is_some() { "batch_scan" }
++            else if source_scan_record.is_some() { "source_pass" }
++            else { "post_output_candidate" };
++        if cue_rg_diagnostics {
+             super::baseline::cue_emit(&req.job_id, "replaygain_application_path", serde_json::json!({
+                 "requested": cue_ip01_rg_policy(&req),
+-                "path": path,
++                "path": rg_selected_path,
+                 "post_output_candidate_is_not_proof_of_scan": true,
++                "selection_is_not_proof_of_success": true,
+             }));
+         }
+         let replaygain_result = match batch_scan_record.or(source_scan_record) {
+@@ -46905,6 +46951,14 @@
+             ))
+             .await,
+         };
++        if cue_rg_diagnostics {
++            super::baseline::cue_emit(&req.job_id, "replaygain_application_settled", serde_json::json!({
++                "requested": cue_ip01_rg_policy(&req),
++                "path": rg_selected_path,
++                "tag_action": cue_ip01_replaygain_tag_action(&replaygain_result),
++                "succeeded": replaygain_result.is_ok(),
++            }));
++        }
+         match replaygain_result {
+             Ok(record) => {
+                 emit_stage_finished(reporter, &item_id, record.clone()).await;
+@@ -69708,6 +69762,137 @@
+         assert!(!cue_source_replaygain_eligible(&source, &req));
+         req.settings.replay_gain.mode = Some(tonepoet_pipeline::ReplayGainMode::Track);
+         assert_eq!(cue_ip01_rg_policy(&req), "Track");
++    }
++
++    #[test]
++    fn cue_ip01_eligible_cue_source_and_off_or_lossy_controls() {
++        let temp = tempfile::tempdir().unwrap();
++        let (scheduled, _) = cue_stream_three_track_group(temp.path(), 16);
++        let mut source = prepared_source(temp.path(), &[track_id(0), track_id(1), track_id(2)]);
++        source.kind = SourceKind::CueImage;
++        source.tracks = scheduled.into_iter().map(|input| input.track).collect();
++        let mut req = request(
++            temp.path(),
++            FailurePolicy::FailAlbumOnAnyTrackFailure,
++            stage_policy(false, true, false),
++            OverwritePolicy::FailIfExists,
++        );
++        req.settings.target_format = tonepoet_pipeline::AudioFormat::Flac;
++        req.settings.target_bit_depth = tonepoet_pipeline::BitDepthTarget::Source;
++        req.settings.target_sample_rate = tonepoet_pipeline::RateTarget::Source;
++        req.settings.replay_gain.mode = Some(tonepoet_pipeline::ReplayGainMode::Both);
++        assert_eq!(cue_ip01_rg_policy(&req), "Both");
++        assert!(cue_source_replaygain_eligible(&source, &req),
++            "signal-equivalent PCM CUE must be source-pass eligible");
++        req.stages.replaygain = StageRequirement::Disabled;
++        assert_eq!(cue_ip01_rg_policy(&req), "Off");
++        assert!(!cue_source_replaygain_eligible(&source, &req));
++        req.stages.replaygain = StageRequirement::Enabled;
++        req.settings.target_format = tonepoet_pipeline::AudioFormat::Mp3;
++        assert!(!cue_source_replaygain_eligible(&source, &req),
++            "lossy output must not trust the source-pass result");
++    }
++
++    #[test]
++    fn cue_ip01_source_tag_application_outcome_requires_settled_writer() {
++        // Drive an actual failing ReplayGain apply_source_scan validation,
++        // rather than treating a retained scan / selected route as success.
++        let manifest = crate::convert::replaygain::ReplayGainManifestBinding::new(
++            vec!["different-member".to_string()]
++        ).unwrap();
++        let retained = crate::convert::replaygain::ReplayGainSourceScan {
++            manifest: manifest.clone(),
++            album_manifest: manifest,
++            demand: crate::convert::replaygain::MetricDemand::IntegratedOnly,
++            tracks: Vec::new(),
++            album: None,
++        };
++        let applied = crate::convert::replaygain::apply_source_scan(
++            &[PathBuf::from("/nonexistent-ip01-output.flac")],
++            &["expected-member".to_string()],
++            tonepoet_pipeline::ReplayGainMode::Track,
++            false,
++            &retained,
++        )
++        .map_err(ReplayGainError::Io)
++        .map(|_| StageRecord {
++            stage: PipelineStage::ReplayGain,
++            outcome: StageOutcome::Ok,
++            dsd_dst_stats: None,
++        });
++        assert!(applied.is_err(), "real native binding refusal must propagate");
++        assert_eq!(cue_ip01_replaygain_tag_action(&applied), "failed");
++        // Exercise the real metadata-normalization writer's failure return,
++        // not only a hand-constructed error: a missing staged artifact cannot
++        // be treated as a completed ReplayGain application.
++        let temp = tempfile::tempdir().unwrap();
++        let write = crate::convert::replaygain::normalize_track_skip_metadata(
++            &[temp.path().join("missing-output.flac")],
++        )
++        .map_err(ReplayGainError::Io)
++        .map(|_| StageRecord {
++            stage: PipelineStage::ReplayGain,
++            outcome: StageOutcome::Ok,
++            dsd_dst_stats: None,
++        });
++        assert!(write.is_err());
++        assert_eq!(cue_ip01_replaygain_tag_action(&write), "failed");
++        let skipped: Result<StageRecord, ReplayGainError> = Ok(StageRecord {
++            stage: PipelineStage::ReplayGain,
++            outcome: StageOutcome::SkippedWithReason("already complete".to_string()),
++            dsd_dst_stats: None,
++        });
++        assert_eq!(cue_ip01_replaygain_tag_action(&skipped), "skipped");
++        let ok = Ok(StageRecord {
++            stage: PipelineStage::ReplayGain,
++            outcome: StageOutcome::Ok,
++            dsd_dst_stats: None,
++        });
++        assert_eq!(cue_ip01_replaygain_tag_action(&ok), "applied");
++    }
++
++    #[test]
++    fn cue_ip01_noncontiguous_authored_ordinals_have_stable_group_identity() {
++        let temp = tempfile::tempdir().unwrap();
++        let (mut group, _) = cue_stream_three_track_group(temp.path(), 16);
++        for (input, ordinal) in group.iter_mut().zip([2_u32, 5, 9]) {
++            input.track.id.source_ordinal = ordinal;
++        }
++        assert_eq!(cue_ip01_group_id(&group), "cue-stream:0002-0009");
++        let indices = group.iter().enumerate().map(|(index, input)|
++            (index, input.track.id.source_ordinal)).collect::<Vec<_>>();
++        assert_eq!(indices, vec![(0, 2), (1, 5), (2, 9)]);
++    }
++
++    #[test]
++    fn cue_ip01_real_s1_and_fallback_diagnostic_routes_on_isolated_sink() {
++        let exe = std::env::current_exe().expect("unit test harness");
++        for (filter, route) in [
++            ("cue_stream_runtime_failure_is_not_retried_through_carrier_materialization", "s1"),
++            ("cue_stream_prelaunch_admission_rejection_keeps_established_fallback", "fallback"),
++        ] {
++            let temp = tempfile::tempdir().unwrap();
++            let trace = temp.path().join("cue-test.jsonl");
++            let output = std::process::Command::new(&exe)
++                .arg(filter).arg("--nocapture")
++                .env("TONEPOET_PIPELINE_BASELINE_JSONL", &trace)
++                .output().expect("subprocess CUE fixture");
++            assert!(output.status.success(), "CUE fixture failed: {} / {}",
++                String::from_utf8_lossy(&output.stdout),
++                String::from_utf8_lossy(&output.stderr));
++            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"),
++                "expected exactly one runnable fixture: {filter}");
++            let raw = std::fs::read_to_string(&trace).expect("real route trace exists");
++            let selected = raw.lines()
++                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
++                .filter(|event| event["event"] == "cue_ip01"
++                    && event["cue_phase"] == "route_selected")
++                .collect::<Vec<_>>();
++            assert!(selected.iter().any(|event| event["route"] == route
++                && event["route_reason"].as_str().is_some_and(|reason|
++                    !reason.is_empty() && (route != "s1" || reason == "direct_stream_admitted"))),
++                "actual {route} decision and reason not present for fixture {filter}");
++        }
+     }
+ 
+     pub(super) fn stage_policy(metadata: bool, replaygain: bool, features: bool) -> StagePolicy {
+--- a/src/convert/processor.rs
++++ b/src/convert/processor.rs
+@@ -2660,6 +2660,15 @@
+                 true
+             }
+             Err(TrySubmitError::QueueBusy(unit)) => {
++                if unit.unit_id.starts_with("cue-stream:")
++                    && crate::convert::pipeline::baseline::enabled()
++                {
++                    crate::convert::pipeline::baseline::cue_emit(
++                        &unit.job_id,
++                        "queue_deferred",
++                        serde_json::json!({"group": unit.unit_id.as_str(), "reason": "queue_busy"}),
++                    );
++                }
+                 if !counted {
+                     pool.metrics().record_jobs_queued(1);
+                 }
+@@ -2668,6 +2677,15 @@
+                 false
+             }
+             Err(TrySubmitError::QueueFull { unit, .. }) => {
++                if unit.unit_id.starts_with("cue-stream:")
++                    && crate::convert::pipeline::baseline::enabled()
++                {
++                    crate::convert::pipeline::baseline::cue_emit(
++                        &unit.job_id,
++                        "queue_deferred",
++                        serde_json::json!({"group": unit.unit_id.as_str(), "reason": "queue_full"}),
++                    );
++                }
+                 if !counted {
+                     pool.metrics().record_jobs_queued(1);
+                 }
+@@ -12595,6 +12613,50 @@
+     }
+ 
+     #[test]
++    fn cue_ip01_real_queue_deferral_child() {
++        if std::env::var("TONEPOET_IP01_QUEUE_CHILD").as_deref() != Ok("enabled") {
++            return;
++        }
++        let pool = SharedWorkerPool::<QueueWorkOutput>::new_with_limits(
++            Some(1), CancellationToken::new(), PoolLimits { ready_capacity: Some(1) },
++        );
++        pool.try_submit(synthetic_queue_work_unit("resident", "resident".to_string()))
++            .expect("resident saturates queue");
++        let mut pump = SubmissionPump::new(Vec::new());
++        assert!(!pump.try_submit_unit(
++            &pool, synthetic_queue_work_unit("cue-child", "cue-stream:0002-0009".to_string()), false,
++        ));
++        assert_eq!(pump.pending_work_units(), 1);
++        // A worker was never started. No queue admission can be reported.
++    }
++
++    #[test]
++    fn cue_ip01_real_queue_deferred_event_before_admission() {
++        let temp = tempfile::tempdir().unwrap();
++        let trace = temp.path().join("queue-events.jsonl");
++        let output = std::process::Command::new(std::env::current_exe().unwrap())
++            .arg("cue_ip01_real_queue_deferral_child").arg("--nocapture")
++            .env("TONEPOET_IP01_QUEUE_CHILD", "enabled")
++            .env("TONEPOET_PIPELINE_BASELINE_JSONL", &trace)
++            .output().expect("isolated scheduler child");
++        assert!(output.status.success(), "child test failure: {} / {}",
++            String::from_utf8_lossy(&output.stdout),
++            String::from_utf8_lossy(&output.stderr));
++        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"),
++            "scheduler child fixture must run once");
++        let trace = std::fs::read_to_string(trace).expect("actual opt-in sink file");
++        let records = trace.lines()
++            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
++            .filter(|record| record["event"] == "cue_ip01")
++            .collect::<Vec<_>>();
++        assert!(records.iter().any(|record|
++            record["cue_phase"] == "queue_deferred"
++                && record["reason"] == "queue_full"
++                && record["group"] == "cue-stream:0002-0009"));
++        assert!(!records.iter().any(|record| record["cue_phase"] == "queue_admitted"));
++    }
++
++    #[test]
+     fn submission_pump_large_album_fanout_generates_only_one_deferred_unit_when_pool_is_full() {
+         let pool = SharedWorkerPool::<QueueWorkOutput>::new_with_limits(
+             Some(1),

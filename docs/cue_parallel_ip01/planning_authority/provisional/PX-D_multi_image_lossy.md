@@ -1,0 +1,7 @@
+# PX-D — parallel independent images and lossy image CUE (PROVISIONAL)
+
+**Multi-image:** `src/convert/pipeline/stages.rs:44413-44943` currently handles physical decoder groups sequentially within one scheduled logical album. A bounded scheduler might overlap independent physical FILE groups using the already-global resource admission; retain the album barrier, authored order, track/FILE provenance, merge/synthetic CUE metadata and same failure-policy semantics. First test whether current queue scheduling of truly separate jobs already captures most benefit; do not insert a second generic scheduler for marginal gain.
+
+**Lossy images:** `src/convert/pipeline/materializer_cue.rs:604-690` deliberately uses staged WAV and a decoded-length-aware tail for inexact MP3/AAC/Vorbis/Opus. A parallel seek worker requires an independently justified per-codec decoder priming/edit-list/gapless contract; compressed packet timestamps and floating duration are not safe sample boundaries. Compare **decoded signal identity under a pinned decoder** and accepted latency/padding handling, not compressed file bitstream identity.
+
+**Promotion:** only after a per-physical-FILE or per-lossy-codec fixture matrix, native tool version pin, deterministic cancellation/publishing tests and convincing full-wall timing benefit. Special SACD/DVD-A/DVD-V/Blu-ray streams remain their separate source families, not interchangeable CUE index adapters.
