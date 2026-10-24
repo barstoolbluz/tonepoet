@@ -44581,6 +44581,7 @@ fn cue_stream_replaygain_mirrors(
                 ToolStreamMirror {
                     path: absolute,
                     prefix: header,
+                    rg_profile: None,
                 },
             );
         }
@@ -44835,6 +44836,12 @@ pub async fn encode_cue_stream_album_for_scheduler_with_tool_limits_and_version_
     // EOF after the payload; no external process owns this observation.
     let mut observer_handles = Vec::with_capacity(rg_observers.len());
     let observer_diagnostics_job = super::baseline::enabled().then(|| req.job_id.clone());
+    if super::rg_profile::enabled() {
+        let expected_ordinals = tracks.iter()
+            .map(|track| track.track.id.source_ordinal)
+            .collect::<Vec<_>>();
+        super::rg_profile::emit_manifest(&req.job_id, &expected_ordinals);
+    }
     for (ordinal, observer) in rg_observers.into_iter().enumerate() {
         // The authored ordinal is stable across non-contiguous selections;
         // the observer's local FIFO index is not a track identity.
@@ -44843,6 +44850,8 @@ pub async fn encode_cue_stream_album_for_scheduler_with_tool_limits_and_version_
         let observer_diagnostics_job = observer_diagnostics_job.clone();
         observer_handles.push(tokio::task::spawn_blocking(move || {
             let observer_started = observer_diagnostics_job.as_ref().map(|_| Instant::now());
+            let mut rg_profile = super::rg_profile::enabled()
+                .then(super::rg_profile::ObserverMetrics::default);
             let observation = crate::convert::replaygain::observe_cue_mirror(
                 &observer.path,
                 observer.member_id,
@@ -44854,7 +44863,11 @@ pub async fn encode_cue_stream_album_for_scheduler_with_tool_limits_and_version_
                 demand,
                 observer_storage_limit,
                 &observer_cancel,
+                rg_profile.as_mut(),
             );
+            if let (Some(stats), Some(job_id)) = (rg_profile.as_ref(), observer_diagnostics_job.as_deref()) {
+                super::rg_profile::emit_observer(job_id, source_ordinal, observation.is_ok(), stats);
+            }
             if let (Some(started), Some(job_id)) = (observer_started, observer_diagnostics_job) {
                 super::baseline::cue_emit(&job_id, "source_pass_track_observer_settled", serde_json::json!({
                     "group_track_index": ordinal,
@@ -45614,7 +45627,17 @@ async fn encode_cue_stream_group_with_runner(
             start_byte,
             byte_len,
             consumer,
-            mirror: mirrors.and_then(|values| values.get(&input.index).cloned()),
+            mirror: mirrors.and_then(|values| values.get(&input.index).cloned()).map(|mut mirror| {
+                // Attach diagnostics only to the actual mirrored S1 transfer;
+                // correlation is an ephemeral key and never affects commands.
+                if super::rg_profile::enabled() {
+                    mirror.rg_profile = Some(super::rg_profile::CueProfileKey {
+                        job_id: req.job_id.clone(),
+                        track_ordinal: input.track.id.source_ordinal,
+                    });
+                }
+                mirror
+            }),
             stop_producer_after: false,
         });
     }

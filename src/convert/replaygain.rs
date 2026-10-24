@@ -327,28 +327,59 @@ impl NativeReplayGainObserver {
     }
 
     pub(crate) fn push_interleaved(&mut self, samples: &[f64]) -> io::Result<()> {
-        // Both observers advance from the same real frame slice. If either
-        // fails, the whole grouped observation is terminal; callers must not
-        // splice a retry of only one observer into the other result.
-        self.loudness
-            .push_interleaved(samples)
+        self.push_interleaved_profiled(samples, None)
+    }
+
+    fn push_interleaved_profiled(
+        &mut self,
+        samples: &[f64],
+        mut profile: Option<&mut crate::convert::pipeline::rg_profile::ObserverMetrics>,
+    ) -> io::Result<()> {
+        use crate::convert::pipeline::rg_profile::ObserverStage;
+        // The same meter methods and order are used with diagnostics on/off.
+        // A failure terminates the entire grouped observation, as before.
+        let t = profile.as_ref().map(|_| std::time::Instant::now());
+        let loudness_result = self.loudness.push_interleaved(samples);
+        if let (Some(stats), Some(started)) = (profile.as_deref_mut(), t) {
+            stats.add(ObserverStage::LoudnessPush, started.elapsed());
+        }
+        loudness_result
             .map_err(|error| invalid(format!("native loudness observation failed: {error}")))?;
-        self.reporting_peak
-            .push_interleaved(samples)
+        let t = profile.as_ref().map(|_| std::time::Instant::now());
+        let peak_result = self.reporting_peak.push_interleaved(samples);
+        if let (Some(stats), Some(started)) = (profile.as_deref_mut(), t) {
+            stats.add(ObserverStage::PeakPush, started.elapsed());
+        }
+        peak_result
             .map_err(|error| invalid(format!("reporting peak observation failed: {error}")))?;
         Ok(())
     }
 
     fn finish(self, completion_evidence: String) -> io::Result<OwnedTrackObservation> {
+        self.finish_profiled(completion_evidence, None)
+    }
+
+    fn finish_profiled(
+        self,
+        completion_evidence: String,
+        mut profile: Option<&mut crate::convert::pipeline::rg_profile::ObserverMetrics>,
+    ) -> io::Result<OwnedTrackObservation> {
+        use crate::convert::pipeline::rg_profile::ObserverStage;
         let expected_subject = self.subject.clone();
         let expected_demand = self.demand;
-        let measurement = self
-            .loudness
-            .finalize()
+        let t = profile.as_ref().map(|_| std::time::Instant::now());
+        let measurement_result = self.loudness.finalize();
+        if let (Some(stats), Some(started)) = (profile.as_deref_mut(), t) {
+            stats.add(ObserverStage::LoudnessFinalize, started.elapsed());
+        }
+        let measurement = measurement_result
             .map_err(|error| invalid(format!("native loudness finalization failed: {error}")))?;
-        let reporting_peak = self
-            .reporting_peak
-            .finalize()
+        let t = profile.as_ref().map(|_| std::time::Instant::now());
+        let peak_result = self.reporting_peak.finalize();
+        if let (Some(stats), Some(started)) = (profile.as_deref_mut(), t) {
+            stats.add(ObserverStage::PeakFinalize, started.elapsed());
+        }
+        let reporting_peak = peak_result
             .map_err(|error| invalid(format!("reporting peak finalization failed: {error}")))?;
         validate_completed_measurement(
             &expected_subject,
@@ -1115,7 +1146,9 @@ pub(crate) fn observe_cue_mirror(
     demand: MetricDemand,
     storage_limit_bytes: usize,
     cancel: &CancellationToken,
+    mut profile: Option<&mut crate::convert::pipeline::rg_profile::ObserverMetrics>,
 ) -> io::Result<OwnedTrackObservation> {
+    use crate::convert::pipeline::rg_profile::ObserverStage;
     let roles = match channels {
         1 => vec![ChannelRole::Mono],
         2 => vec![ChannelRole::Left, ChannelRole::Right],
@@ -1129,10 +1162,20 @@ pub(crate) fn observe_cue_mirror(
         roles,
     };
     let mut observer = NativeReplayGainObserver::new_with_storage_limit(subject, demand, storage_limit_bytes)?;
-    let mut reader = open_fifo_reader_nonblocking(path)?;
+    let t = profile.as_ref().map(|_| std::time::Instant::now());
+    let opened = open_fifo_reader_nonblocking(path);
+    if let (Some(stats), Some(started)) = (profile.as_deref_mut(), t) {
+        stats.add(ObserverStage::FifoOpen, started.elapsed());
+    }
+    let mut reader = opened?;
     let mut saw_data = false;
     let mut header = vec![0_u8; expected_header.len()];
-    read_fifo_exact(&mut reader, &mut header, cancel, &mut saw_data)?;
+    let t = profile.as_ref().map(|_| std::time::Instant::now());
+    let header_result = read_fifo_exact(&mut reader, &mut header, cancel, &mut saw_data, profile.as_deref_mut());
+    if let (Some(stats), Some(started)) = (profile.as_deref_mut(), t) {
+        stats.add(ObserverStage::HeaderRead, started.elapsed());
+    }
+    header_result?;
     if header != expected_header {
         return Err(invalid("CUE source-pass mirror header does not match planned geometry"));
     }
@@ -1152,31 +1195,57 @@ pub(crate) fn observe_cue_mirror(
     while remaining > 0 {
         let wanted = remaining.min(chunk_frames * frame_bytes) as usize;
         raw.resize(wanted, 0);
-        read_fifo_exact(&mut reader, &mut raw, cancel, &mut saw_data)?;
-        let interleaved = decode_pcm_bytes(&raw, encoding)?;
+        let t = profile.as_ref().map(|_| std::time::Instant::now());
+        let read_result = read_fifo_exact(&mut reader, &mut raw, cancel, &mut saw_data, profile.as_deref_mut());
+        if let (Some(stats), Some(started)) = (profile.as_deref_mut(), t) {
+            stats.add(ObserverStage::PcmRead, started.elapsed());
+        }
+        read_result?;
+        let t = profile.as_ref().map(|_| std::time::Instant::now());
+        let decoded = decode_pcm_bytes(&raw, encoding);
+        if let (Some(stats), Some(started)) = (profile.as_deref_mut(), t) {
+            stats.add(ObserverStage::PcmDecode, started.elapsed());
+        }
+        let interleaved = decoded?;
         if interleaved.len() % usize::from(channels) != 0 {
             return Err(invalid("CUE mirror ended on a partial PCM frame"));
         }
-        observer.push_interleaved(&interleaved)?;
+        observer.push_interleaved_profiled(&interleaved, profile.as_deref_mut())?;
+        if let Some(stats) = profile.as_deref_mut() {
+            stats.blocks = stats.blocks.saturating_add(1);
+            stats.pcm_bytes = stats.pcm_bytes.saturating_add(wanted as u64);
+        }
         remaining -= wanted as u64;
     }
     let mut surplus = [0_u8; 1];
-    loop {
-        if cancel.is_cancelled() {
-            return Err(io::Error::new(io::ErrorKind::Interrupted, "CUE source-pass observation cancelled"));
-        }
-        match reader.read(&mut surplus) {
-            Ok(0) => break,
-            Ok(_) => return Err(invalid("CUE mirror contains unexpected PCM after declared payload")),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(5));
+    let eof_start = profile.as_ref().map(|_| std::time::Instant::now());
+    let eof_result = (|| -> io::Result<()> {
+        loop {
+            if cancel.is_cancelled() {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "CUE source-pass observation cancelled"));
             }
-            Err(error) => return Err(error),
+            match reader.read(&mut surplus) {
+                Ok(0) => return Ok(()),
+                Ok(_) => return Err(invalid("CUE mirror contains unexpected PCM after declared payload")),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    let t = profile.as_ref().map(|_| std::time::Instant::now());
+                    std::thread::sleep(Duration::from_millis(5));
+                    if let (Some(stats), Some(started)) = (profile.as_deref_mut(), t) {
+                        stats.would_block_poll_count = stats.would_block_poll_count.saturating_add(1);
+                        stats.add(ObserverStage::PollSleep, started.elapsed());
+                    }
+                }
+                Err(error) => return Err(error),
+            }
         }
+    })();
+    if let (Some(stats), Some(started)) = (profile.as_deref_mut(), eof_start) {
+        stats.add(ObserverStage::EofWait, started.elapsed());
     }
-    let result = observer.finish(format!(
+    eof_result?;
+    let result = observer.finish_profiled(format!(
         "exact CUE FIFO header/payload/EOF; {payload_bytes} payload bytes"
-    ))?;
+    ), profile.as_deref_mut())?;
     if result.summary.real_frames != frames {
         return Err(invalid("CUE mirror frame count does not match declared programme extent"));
     }
@@ -1203,7 +1272,9 @@ fn read_fifo_exact(
     output: &mut [u8],
     cancel: &CancellationToken,
     saw_data: &mut bool,
+    mut profile: Option<&mut crate::convert::pipeline::rg_profile::ObserverMetrics>,
 ) -> io::Result<()> {
+    use crate::convert::pipeline::rg_profile::ObserverStage;
     let mut offset = 0usize;
     while offset < output.len() {
         if cancel.is_cancelled() {
@@ -1216,7 +1287,12 @@ fn read_fifo_exact(
             Ok(0) if !*saw_data => {
                 // Nonblocking FIFO readers report EOF until the writer first
                 // connects. This is setup wait, not programme EOF.
+                let t = profile.as_ref().map(|_| std::time::Instant::now());
                 std::thread::sleep(Duration::from_millis(5));
+                if let (Some(stats), Some(started)) = (profile.as_deref_mut(), t) {
+                    stats.no_writer_poll_count = stats.no_writer_poll_count.saturating_add(1);
+                    stats.add(ObserverStage::PollSleep, started.elapsed());
+                }
             }
             Ok(0) => {
                 return Err(io::Error::new(
@@ -1229,7 +1305,12 @@ fn read_fifo_exact(
                 offset += read;
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                let t = profile.as_ref().map(|_| std::time::Instant::now());
                 std::thread::sleep(Duration::from_millis(5));
+                if let (Some(stats), Some(started)) = (profile.as_deref_mut(), t) {
+                    stats.would_block_poll_count = stats.would_block_poll_count.saturating_add(1);
+                    stats.add(ObserverStage::PollSleep, started.elapsed());
+                }
             }
             Err(error) => return Err(error),
         }
@@ -2239,6 +2320,35 @@ mod tests {
         ];
         let rendered = reasons.iter().map(ToString::to_string).collect::<BTreeSet<_>>();
         assert_eq!(rendered.len(), reasons.len());
+    }
+
+    #[test]
+    fn profiled_cue_meter_matches_unprofiled_samples_and_result_bits() {
+        // Same production meters, input order, and exact f64 samples. The
+        // profile is not allowed to affect accepted frames or arithmetic.
+        let subject = ProgrammeSubject {
+            participant: "profiling-equivalence".into(),
+            identity: "cue-source-pass:profiling-equivalence".into(),
+            reader: ReaderAuthority::CueExactPcmMirror,
+            sample_rate_hz: 44_100,
+            roles: vec![ChannelRole::Left, ChannelRole::Right],
+        };
+        let mut ordinary = NativeReplayGainObserver::new(subject.clone(), MetricDemand::IntegratedOnly).unwrap();
+        let mut profiled = NativeReplayGainObserver::new(subject, MetricDemand::IntegratedOnly).unwrap();
+        let mut stats = crate::convert::pipeline::rg_profile::ObserverMetrics::default();
+        let audio: Vec<f64> = (0..(44_100 * 2))
+            .map(|index| 0.4 * (index as f64 * 0.007).sin())
+            .collect();
+        for chunk in audio.chunks(1024) {
+            ordinary.push_interleaved(chunk).unwrap();
+            profiled.push_interleaved_profiled(chunk, Some(&mut stats)).unwrap();
+        }
+        let a = ordinary.finish("exact sample fixture".into()).unwrap();
+        let b = profiled.finish_profiled("exact sample fixture".into(), Some(&mut stats)).unwrap();
+        assert_eq!(a.summary, b.summary, "instrumentation must not change mathematical results");
+        assert_eq!(a.reporting_peak_linear.to_bits(), b.reporting_peak_linear.to_bits());
+        assert!(stats.loudness_push_ns > 0);
+        assert!(stats.peak_push_ns > 0);
     }
 
     #[test]
