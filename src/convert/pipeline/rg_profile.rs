@@ -135,9 +135,16 @@ pub(crate) struct ObserverMetrics {
     pub eof_wait_ns: u64,
     pub blocks: u64,
     pub pcm_bytes: u64,
+    // would_block_poll_count counts EAGAIN reads, not poll(2) invocations.
+    // poll_sleep_ns now covers only no-writer setup backoff on Unix; earlier
+    // snapshots included sleeps on EAGAIN too. Use the new readiness fields
+    // to compare wait behavior instead of comparing poll_sleep_ns directly.
     pub no_writer_poll_count: u64,
     pub would_block_poll_count: u64,
     pub poll_sleep_ns: u64,
+    pub readiness_wait_count: u64,
+    pub readiness_timeout_count: u64,
+    pub readiness_wait_ns: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -152,6 +159,7 @@ pub(crate) enum ObserverStage {
     PeakFinalize,
     EofWait,
     PollSleep,
+    ReadinessWait,
 }
 
 impl ObserverMetrics {
@@ -167,6 +175,7 @@ impl ObserverMetrics {
             ObserverStage::PeakFinalize => &mut self.peak_finalize_ns,
             ObserverStage::EofWait => &mut self.eof_wait_ns,
             ObserverStage::PollSleep => &mut self.poll_sleep_ns,
+            ObserverStage::ReadinessWait => &mut self.readiness_wait_ns,
         };
         *bucket = bucket.saturating_add(nanos(elapsed));
     }
@@ -191,6 +200,10 @@ pub(crate) fn emit_observer(job_id: &str, track_ordinal: u32, success: bool, m: 
         "no_writer_poll_count": m.no_writer_poll_count,
         "would_block_poll_count": m.would_block_poll_count,
         "poll_sleep_call_ns": m.poll_sleep_ns,
+        "readiness_wait_count": m.readiness_wait_count,
+        "readiness_timeout_count": m.readiness_timeout_count,
+        "readiness_wait_call_ns": m.readiness_wait_ns,
+        "fifo_wait_strategy": if cfg!(unix) { "poll_50ms_plus_no_writer_backoff" } else { "legacy_non_unix" },
         "warning": "call_wall_includes_sched; overlapping_transport_not_additive",
     }));
 }

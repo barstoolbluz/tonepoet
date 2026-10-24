@@ -97,6 +97,18 @@ def summary_by_run(rows):
             else:
                 for key in OBSERVER_TIME_KEYS + ("pcm_bytes", "blocks"):
                     require_nonnegative_int(row, key)
+                # Historical v1 rows had no readiness counters. Corrected
+                # producers advertise their wait strategy and must supply all
+                # counters so missing new evidence cannot silently pass.
+                if row.get("fifo_wait_strategy") == "poll_50ms_plus_no_writer_backoff":
+                    for key in ("readiness_wait_call_ns", "readiness_wait_count",
+                                "readiness_timeout_count", "no_writer_poll_count",
+                                "would_block_poll_count", "poll_sleep_call_ns"):
+                        require_nonnegative_int(row, key)
+                    if row["readiness_timeout_count"] > row["readiness_wait_count"]:
+                        raise ValueError("FIFO readiness timeouts exceed poll calls")
+                elif "fifo_wait_strategy" in row and row["fifo_wait_strategy"] != "legacy_non_unix":
+                    raise ValueError("unrecognized FIFO wait strategy")
                 runs[run]["observer"].append(row)
         elif phase == "source_pass_replaygain_result":
             runs[run]["policy"].append(row)
@@ -268,7 +280,25 @@ def make_report(run_dirs, benchmarks=None):
                         f"{as_s(o['reporting_peak_push_call_ns'] + o['reporting_peak_finalize_call_ns'])} |"
                     )
                 details.append("")
-                details.append("These track-level call-wall totals include scheduler delays; observer FIFO read includes intentional 5-ms polls. The last two columns are distinct meter calls on the same PCM, not exclusive CPU costs. A long mirror-write call is consistent with backpressure but is not definitive evidence of kernel blocking.")
+                strategies = {o.get("fifo_wait_strategy") for _, _, o in pairs}
+                if strategies == {"poll_50ms_plus_no_writer_backoff"}:
+                    waits = sum(o["readiness_wait_count"] for _, _, o in pairs)
+                    timeouts = sum(o["readiness_timeout_count"] for _, _, o in pairs)
+                    eagain = sum(o["would_block_poll_count"] for _, _, o in pairs)
+                    readiness_ns = sum(o["readiness_wait_call_ns"] for _, _, o in pairs)
+                    setup_ns = sum(o["poll_sleep_call_ns"] for _, _, o in pairs)
+                    details.append(
+                        f"FIFO readiness: {eagain} EAGAIN reads, {waits} poll(2) calls "
+                        f"({timeouts} timeouts), {as_s(readiness_ns)} cumulative poll wall seconds, "
+                        f"{as_s(setup_ns)} cumulative pre-writer backoff seconds. "
+                        "These per-observer durations overlap; they are not album elapsed time."
+                    )
+                    details.append("EAGAIN now waits on descriptor readiness. Only the initial no-writer setup retains a 5-ms sleep.")
+                elif strategies == {None}:
+                    details.append("Legacy FIFO observer used 5-ms sleeps after EAGAIN and before the first writer connected.")
+                else:
+                    details.append("Mixed/other FIFO wait strategies: compare only homogeneous runs, not legacy and corrected sleep counters.")
+                details.append("These track-level call-wall totals include scheduler delays. Loudness and reporting peak are distinct meter calls, not exclusive CPU costs. A long mirror-write call is consistent with backpressure but is not definitive evidence of kernel blocking.")
                 details.append("")
         if host.get("returncode") != 0:
             details.append("**Host execution failed or was interrupted; exclude this trial from performance acceptance.**")

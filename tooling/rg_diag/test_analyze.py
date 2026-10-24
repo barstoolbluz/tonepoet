@@ -64,6 +64,24 @@ class AnalyzeTests(unittest.TestCase):
         self.assertEqual(list(result), [RUN_ID])
         return analyze.classify_run(result[RUN_ID])
 
+    def test_corrected_fifo_readiness_is_validated_and_reported(self):
+        fixed = observer()
+        fixed.update(fifo_wait_strategy="poll_50ms_plus_no_writer_backoff",
+                     readiness_wait_call_ns=10_000_000, readiness_wait_count=4,
+                     readiness_timeout_count=2, no_writer_poll_count=1,
+                     would_block_poll_count=2, poll_sleep_call_ns=5_000_000)
+        status, warnings, pairs = self.classify([transport(), fixed, policy()])
+        self.assertEqual((status, warnings), ("PASS", []))
+        self.assertEqual(len(pairs), 1)
+        invalid = fixed.copy()
+        invalid["readiness_timeout_count"] = 5
+        with self.assertRaisesRegex(ValueError, "timeouts exceed"):
+            analyze.summary_by_run([manifest(), transport(), invalid, policy()])
+        missing = fixed.copy()
+        del missing["readiness_wait_call_ns"]
+        with self.assertRaises(ValueError):
+            analyze.summary_by_run([manifest(), transport(), missing, policy()])
+
     def test_complete_equal_bytes_pass(self):
         status, warnings, pairs = self.classify([transport(), observer(), policy()])
         self.assertEqual(status, "PASS")

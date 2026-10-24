@@ -1,0 +1,27 @@
+checking file src/convert/replaygain.rs
+checking file src/convert/pipeline/rg_profile.rs
+checking file tooling/rg_diag/analyze.py
+checking file tooling/rg_diag/test_analyze.py
+patching file src/convert/replaygain.rs
+patching file src/convert/pipeline/rg_profile.rs
+patching file tooling/rg_diag/analyze.py
+patching file tooling/rg_diag/test_analyze.py
+PASS patched source byte identity: src/convert/replaygain.rs 0f601740776a1667ba58fa8589781077c94f212036f3ce4bb72695ba557acdf4
+PASS patched source byte identity: src/convert/pipeline/rg_profile.rs ea5b1ee6c2aa2429287abddc7b353874fa9831f2e7fcc0acaacdc55a18bfd316
+PASS patched source byte identity: tooling/rg_diag/analyze.py 2552706f72e077602594988f94f9ac5df2e6842428669bddcb7695b9ebe2f31b
+PASS patched source byte identity: tooling/rg_diag/test_analyze.py 5729c7ff7db6f2a3f8aa5c289c8e2332c9a7c58ba1a5222c378c24667379efb1
+PASS all four patched paths byte-identical to delivered source
+patching file src/convert/replaygain.rs
+Reversed (or previously applied) patch detected!  Skipping patch.
+6 out of 6 hunks ignored -- saving rejects to file src/convert/replaygain.rs.rej
+patching file src/convert/pipeline/rg_profile.rs
+Reversed (or previously applied) patch detected!  Skipping patch.
+4 out of 4 hunks ignored -- saving rejects to file src/convert/pipeline/rg_profile.rs.rej
+patching file tooling/rg_diag/analyze.py
+Reversed (or previously applied) patch detected!  Skipping patch.
+2 out of 2 hunks ignored -- saving rejects to file tooling/rg_diag/analyze.py.rej
+patching file tooling/rg_diag/test_analyze.py
+Reversed (or previously applied) patch detected!  Skipping patch.
+1 out of 1 hunk ignored -- saving rejects to file tooling/rg_diag/test_analyze.py.rej
+PASS repeated application rejected by --forward
+PASS no mutation from rejected second application
