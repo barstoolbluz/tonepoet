@@ -1,0 +1,233 @@
+{
+  "cases": 25,
+  "ffmpeg_version": "ffmpeg version 7.1.5-0+deb13u1 Copyright (c) 2000-2026 the FFmpeg developers",
+  "results": [
+    {
+      "bits": 16,
+      "bytes": 2352,
+      "channels": 1,
+      "end_sample": 588,
+      "first_sample": 0,
+      "rate": 44100,
+      "sha256": "d9d633ecdbdb79c1739325c1af1c603b1f40dbd0864b1e702029d58eddf08bc5"
+    },
+    {
+      "bits": 16,
+      "bytes": 2052,
+      "channels": 1,
+      "end_sample": 1101,
+      "first_sample": 588,
+      "rate": 44100,
+      "sha256": "50f3e8484b5dd644bda13f13c84dffc7e581018644776818c238c71c5112604d"
+    },
+    {
+      "bits": 16,
+      "bytes": 168,
+      "channels": 1,
+      "end_sample": 44119,
+      "first_sample": 44077,
+      "rate": 44100,
+      "sha256": "3df3650b12925fa49208e461fb9b809170ad6990b26121675666912f126c568f"
+    },
+    {
+      "bits": 16,
+      "bytes": 176424,
+      "channels": 1,
+      "end_sample": 88207,
+      "first_sample": 44101,
+      "rate": 44100,
+      "sha256": "a685d1618bf18742d74bd68b83fdf802275ae37760f1f96bfe25c6a7381ae999"
+    },
+    {
+      "bits": 16,
+      "bytes": 176904,
+      "channels": 1,
+      "end_sample": 132437,
+      "first_sample": 88211,
+      "rate": 44100,
+      "sha256": "964c516161630c910663f873d473b5cbda33c61f4e326c9d78780eeb5186a937"
+    },
+    {
+      "bits": 16,
+      "bytes": 4704,
+      "channels": 2,
+      "end_sample": 588,
+      "first_sample": 0,
+      "rate": 44100,
+      "sha256": "c188a9a539dedd2c0108c83e9af6f8728e7258f0cdb136dff5da3f0276428dc6"
+    },
+    {
+      "bits": 16,
+      "bytes": 4104,
+      "channels": 2,
+      "end_sample": 1101,
+      "first_sample": 588,
+      "rate": 44100,
+      "sha256": "1c6c9696657bb917fd37535b70c66a64d78126b0e503e2ce79e7b2cb6774ee67"
+    },
+    {
+      "bits": 16,
+      "bytes": 336,
+      "channels": 2,
+      "end_sample": 44119,
+      "first_sample": 44077,
+      "rate": 44100,
+      "sha256": "03b9bf8a4f34399f212c2838f01c700faa32c5748accb151a3d9a3bc7c43d989"
+    },
+    {
+      "bits": 16,
+      "bytes": 352848,
+      "channels": 2,
+      "end_sample": 88207,
+      "first_sample": 44101,
+      "rate": 44100,
+      "sha256": "ef6a7ebfeaa7c364a4505eb185f37a51a5190c89e78e6318c22914f8402f1f7f"
+    },
+    {
+      "bits": 16,
+      "bytes": 353808,
+      "channels": 2,
+      "end_sample": 132437,
+      "first_sample": 88211,
+      "rate": 44100,
+      "sha256": "ed5ddfd99137bf5374dc7d29805dbc535b27a351b070b8429db6994de76da66d"
+    },
+    {
+      "bits": 24,
+      "bytes": 4704,
+      "channels": 2,
+      "end_sample": 588,
+      "first_sample": 0,
+      "rate": 44100,
+      "sha256": "b59df922f8e9b2207d27251016c0c61749765f33655d20d312e37389511c6583"
+    },
+    {
+      "bits": 24,
+      "bytes": 4104,
+      "channels": 2,
+      "end_sample": 1101,
+      "first_sample": 588,
+      "rate": 44100,
+      "sha256": "286e8486ede4cc265f6059577ce30c1e084829f925f43c74d706f35e977ac3ad"
+    },
+    {
+      "bits": 24,
+      "bytes": 336,
+      "channels": 2,
+      "end_sample": 44119,
+      "first_sample": 44077,
+      "rate": 44100,
+      "sha256": "1b1a336913579bebb3b491d2d9da0560852f6d8f8aa34811a83adaf8cccbb5d3"
+    },
+    {
+      "bits": 24,
+      "bytes": 352848,
+      "channels": 2,
+      "end_sample": 88207,
+      "first_sample": 44101,
+      "rate": 44100,
+      "sha256": "b208f5c98540ce53b1a4df802770aae0c780e8db4a44368caf3f2ad85de1b69c"
+    },
+    {
+      "bits": 24,
+      "bytes": 353808,
+      "channels": 2,
+      "end_sample": 132437,
+      "first_sample": 88211,
+      "rate": 44100,
+      "sha256": "7669c31f0f355b756c48b93e629b24dedca12e7ff48e57efe688e86aa8689c35"
+    },
+    {
+      "bits": 16,
+      "bytes": 4704,
+      "channels": 2,
+      "end_sample": 588,
+      "first_sample": 0,
+      "rate": 48000,
+      "sha256": "639d7e91875b01c6d9f6ea866a8eec379988236c591d16e840d58fc527e835de"
+    },
+    {
+      "bits": 16,
+      "bytes": 4104,
+      "channels": 2,
+      "end_sample": 1101,
+      "first_sample": 588,
+      "rate": 48000,
+      "sha256": "e535964a2ebd6757908f8629af6791bc4bdc135d942be7f4195f23eb4a524db7"
+    },
+    {
+      "bits": 16,
+      "bytes": 336,
+      "channels": 2,
+      "end_sample": 48019,
+      "first_sample": 47977,
+      "rate": 48000,
+      "sha256": "a8dddd95f3d1b606739f16fccc7673a5657e167edf018e158d99ca7477ae7214"
+    },
+    {
+      "bits": 16,
+      "bytes": 384048,
+      "channels": 2,
+      "end_sample": 96007,
+      "first_sample": 48001,
+      "rate": 48000,
+      "sha256": "5612030616dc3507c5593cec2e56ec30e413b77fa9aeb6eb45ffc3e17c1fe704"
+    },
+    {
+      "bits": 16,
+      "bytes": 385008,
+      "channels": 2,
+      "end_sample": 144137,
+      "first_sample": 96011,
+      "rate": 48000,
+      "sha256": "cf1e72e9d781802a601972a3d8d18b0b9855d330e932f6229312d6b4faeee4a7"
+    },
+    {
+      "bits": 24,
+      "bytes": 2352,
+      "channels": 1,
+      "end_sample": 588,
+      "first_sample": 0,
+      "rate": 96000,
+      "sha256": "67ef8e5dc1ff8d3f9c8cfcc0d899db1ea2c9b0af37cd34fc4a86b5fa8d538b9b"
+    },
+    {
+      "bits": 24,
+      "bytes": 2052,
+      "channels": 1,
+      "end_sample": 1101,
+      "first_sample": 588,
+      "rate": 96000,
+      "sha256": "af33ae46486922509f8e037aec3b60b60fbbda9e513fc9e5e753f8971cd2d80f"
+    },
+    {
+      "bits": 24,
+      "bytes": 168,
+      "channels": 1,
+      "end_sample": 96019,
+      "first_sample": 95977,
+      "rate": 96000,
+      "sha256": "546982d803b670f9f4a69bd457636aa34f208cee6ef303255d1a1469c1172398"
+    },
+    {
+      "bits": 24,
+      "bytes": 384024,
+      "channels": 1,
+      "end_sample": 192007,
+      "first_sample": 96001,
+      "rate": 96000,
+      "sha256": "64b47e32f41fd2d06cb969927ac3835dd2eae20240bab59035ee5063d49b3582"
+    },
+    {
+      "bits": 24,
+      "bytes": 384504,
+      "channels": 1,
+      "end_sample": 288137,
+      "first_sample": 192011,
+      "rate": 96000,
+      "sha256": "496d2c6384f77db61da283721c855f46024ed3f1e4b03a674f08f04f5b51ff32"
+    }
+  ],
+  "scope": "standalone_ffmpeg_ip02_command_only_NOT_rust_IP07",
+  "status": "PASS"
+}

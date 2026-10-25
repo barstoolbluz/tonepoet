@@ -98,7 +98,7 @@ pub(crate) struct NativeObservationSummary {
 }
 
 #[derive(Debug)]
-pub(crate) struct OwnedTrackObservation {
+pub struct OwnedTrackObservation {
     summary: NativeObservationSummary,
     measurement: LoudnessMeasurement,
     reporting_peak_linear: f64,
@@ -1132,6 +1132,91 @@ pub(crate) fn preflight_cue_observer(
     Ok(())
 }
 
+/// One qualified native source-range meter. The owned result is valid only
+/// after the process supervisor has ALSO proved a clean decoder exit. The
+/// caller binds it to the immutable IP-02 range, album identity and source
+/// generation; this reader neither owns a child nor writes ReplayGain tags.
+#[derive(Debug, Clone)]
+pub struct CueSourceRangeObservationSpec {
+    pub member_id: String,
+    pub sample_rate_hz: u32,
+    pub channels: u16,
+    pub frames: u64,
+    pub(crate) demand: MetricDemand,
+    pub(crate) storage_limit_bytes: usize,
+}
+
+/// Raw s32le pipe, not a WAV FIFO: use the exact native S1 normalization and
+/// 16,384-frame push boundaries. A connected anonymous pipe has ordinary
+/// blocking read/EOF semantics; there is no no-writer FIFO polling loop.
+/// The supervisor owns the writer and closes it on success, failure and
+/// cancellation. No statistic may be admitted before EOF *and* child success.
+pub(crate) fn observe_cue_source_range_pcm<R: Read>(
+    mut reader: R,
+    spec: &CueSourceRangeObservationSpec,
+    mut extent: crate::convert::pipeline::cue_flac_range::ExactPcmExtent,
+    cancel: &CancellationToken,
+) -> io::Result<OwnedTrackObservation> {
+    let roles = match spec.channels {
+        1 => vec![ChannelRole::Mono],
+        2 => vec![ChannelRole::Left, ChannelRole::Right],
+        _ => return Err(invalid("source-range meter admits only mono/stereo")),
+    };
+    let frame_bytes = u64::from(spec.channels)
+        .checked_mul(4)
+        .ok_or_else(|| invalid("source-range PCM frame-size overflow"))?;
+    let required_bytes = spec.frames
+        .checked_mul(frame_bytes)
+        .ok_or_else(|| invalid("source-range PCM byte extent overflow"))?;
+    if spec.frames == 0 || required_bytes != extent.expected_bytes() {
+        return Err(invalid("source-range meter frame geometry and qualified extent disagree"));
+    }
+    let subject = ProgrammeSubject {
+        participant: spec.member_id.clone(),
+        identity: format!("cue-source-pass:{}", spec.member_id),
+        reader: ReaderAuthority::CueExactPcmMirror,
+        sample_rate_hz: spec.sample_rate_hz,
+        roles,
+    };
+    let mut meter = NativeReplayGainObserver::new_with_storage_limit(
+        subject, spec.demand, spec.storage_limit_bytes,
+    )?;
+    let chunk_bytes = usize::try_from(16_384_u64 * frame_bytes)
+        .map_err(|_| invalid("source-range chunk does not fit in usize"))?;
+    let mut raw = vec![0u8; chunk_bytes];
+    let mut remaining = required_bytes;
+    while remaining > 0 {
+        if cancel.is_cancelled() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "source-range meter cancelled"));
+        }
+        let wanted = usize::try_from(remaining.min(chunk_bytes as u64))
+            .map_err(|_| invalid("source-range read extent overflow"))?;
+        reader.read_exact(&mut raw[..wanted])?;
+        extent.observe_bytes(wanted).map_err(|error| invalid(error.to_string()))?;
+        let samples = decode_pcm_bytes(&raw[..wanted], PcmMirrorEncoding::S32Le)?;
+        if samples.len() % usize::from(spec.channels) != 0 {
+            return Err(invalid("source-range meter received an incomplete PCM frame"));
+        }
+        meter.push_interleaved(&samples)?;
+        remaining -= wanted as u64;
+    }
+    if cancel.is_cancelled() {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "source-range meter cancelled"));
+    }
+    let mut surplus = [0u8; 1];
+    if reader.read(&mut surplus)? != 0 {
+        return Err(invalid("source-range producer emitted surplus PCM after exact extent"));
+    }
+    extent.finish().map_err(|error| invalid(error.to_string()))?;
+    let result = meter.finish(format!(
+        "supervised source-range s32le pipe: {required_bytes} bytes, exact EOF; decoder exit checked by runner"
+    ))?;
+    if result.summary.real_frames != spec.frames {
+        return Err(invalid("source-range native observer frame count differs from qualified source"));
+    }
+    Ok(result)
+}
+
 /// Exact CUE source-pass reader. It validates the exact header, exact payload,
 /// frame alignment, and EOF *after* the declared payload, so a later surplus
 /// FIFO write cannot be mistaken for a complete observation.
@@ -2054,6 +2139,89 @@ fn invalid(message: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cue_ip07_synthetic_pcm(frames: usize) -> Vec<u8> {
+        let mut data = Vec::with_capacity(frames * 8);
+        for i in 0..frames {
+            let value = (((i % 137) as i64 - 68) * 24_000_000) as i32;
+            data.extend_from_slice(&value.to_le_bytes());
+            data.extend_from_slice(&(-value).to_le_bytes());
+        }
+        data
+    }
+
+    fn cue_ip07_spec(frames: u64) -> CueSourceRangeObservationSpec {
+        CueSourceRangeObservationSpec {
+            member_id: "source:1:disc:-:track:1".to_string(),
+            sample_rate_hz: 44_100,
+            channels: 2,
+            frames,
+            demand: MetricDemand::IntegratedOnly,
+            storage_limit_bytes: 8 * 1024 * 1024,
+        }
+    }
+
+    #[test]
+    fn cue_ip07_exact_s32le_native_sample_and_peak_identity() {
+        let frames = 44_100;
+        let raw = cue_ip07_synthetic_pcm(frames);
+        let spec = cue_ip07_spec(frames as u64);
+        let scan = observe_cue_source_range_pcm(
+            io::Cursor::new(&raw), &spec,
+            crate::convert::pipeline::cue_flac_range::ExactPcmExtent::for_expected_bytes(raw.len() as u64),
+            &CancellationToken::new(),
+        ).expect("exact supervised-pipe-equivalent raw PCM");
+        let subject = ProgrammeSubject {
+            participant: spec.member_id.clone(),
+            identity: format!("cue-source-pass:{}", spec.member_id),
+            reader: ReaderAuthority::CueExactPcmMirror,
+            sample_rate_hz: 44_100,
+            roles: vec![ChannelRole::Left, ChannelRole::Right],
+        };
+        let mut reference = NativeReplayGainObserver::new_with_storage_limit(
+            subject, spec.demand, spec.storage_limit_bytes,
+        ).unwrap();
+        for chunk in raw.chunks(16_384 * 8) {
+            let samples = decode_pcm_bytes(chunk, PcmMirrorEncoding::S32Le).unwrap();
+            reference.push_interleaved(&samples).unwrap();
+        }
+        let reference = reference.finish("same native S1 PCM chunks".to_string()).unwrap();
+        assert_eq!(scan.summary.real_frames, 44_100);
+        assert_eq!(scan.summary.subject, reference.summary.subject);
+        assert_eq!(scan.summary.loudness, reference.summary.loudness);
+        assert_eq!(scan.summary.reporting_peak, reference.summary.reporting_peak);
+        assert_eq!(scan.measurement.statistics.integrated_observations(),
+            reference.measurement.statistics.integrated_observations());
+        assert_eq!(scan.measurement.statistics.lra_observations(),
+            reference.measurement.statistics.lra_observations());
+    }
+
+    #[test]
+    fn cue_ip07_reader_refuses_missing_extra_and_wrong_extent() {
+        let raw = cue_ip07_synthetic_pcm(100);
+        let spec = cue_ip07_spec(100);
+        let extent = || crate::convert::pipeline::cue_flac_range::ExactPcmExtent::for_expected_bytes(raw.len() as u64);
+        for data in [&raw[..raw.len() - 1], &raw[..raw.len() - 8]] {
+            assert!(observe_cue_source_range_pcm(
+                io::Cursor::new(data), &spec, extent(), &CancellationToken::new(),
+            ).is_err(), "early EOF cannot create a mathematically unavailable observation");
+        }
+        let mut surplus = raw.clone();
+        surplus.push(0);
+        assert!(observe_cue_source_range_pcm(
+            io::Cursor::new(surplus), &spec, extent(), &CancellationToken::new(),
+        ).is_err(), "full expected prefix with surplus is an operational failure");
+        assert!(observe_cue_source_range_pcm(
+            io::Cursor::new(&raw), &spec,
+            crate::convert::pipeline::cue_flac_range::ExactPcmExtent::for_expected_bytes((raw.len() + 4) as u64),
+            &CancellationToken::new(),
+        ).is_err(), "caller may not substitute an unsupported extent");
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert_eq!(observe_cue_source_range_pcm(
+            io::Cursor::new(&raw), &spec, extent(), &cancelled,
+        ).unwrap_err().kind(), io::ErrorKind::Interrupted);
+    }
 
     #[test]
     fn id3_wrapped_flac_observes_declared_extent_and_succeeds() {

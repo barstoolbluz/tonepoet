@@ -11919,6 +11919,37 @@ pub(crate) async fn run_tool_command_with_concurrency(
     runner.run(cmd, cancel).await
 }
 
+/// IP-07's independent source meter charges one global FFmpeg-family
+/// permit through BOTH the supervised decoder and the native pipe reader.
+/// It never owns an S3 worker slot or waits for a second resource while
+/// holding this permit. No non-real runner can silently substitute `run()`.
+pub(crate) async fn run_cue_source_meter_with_concurrency(
+    mut decoder: ToolCommand,
+    spec: crate::convert::replaygain::CueSourceRangeObservationSpec,
+    extent: super::cue_flac_range::ExactPcmExtent,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    limits: &Arc<ToolConcurrencyLimits>,
+) -> Result<super::tool::ToolCueSourceObservationOutput, ToolRunnerError> {
+    if decoder.binary != ToolBinary::Ffmpeg {
+        return Err(ToolRunnerError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput, "source meter decoder must be FFmpeg",
+        )));
+    }
+    let queued = Instant::now();
+    let _ffmpeg_permit = acquire_tool_permit(&mut decoder, Some(limits), cancel)
+        .await
+        .map_err(|error| tool_permit_error_to_runner_error(error, &decoder))?;
+    let queue_wait = queued.elapsed();
+    let active = Instant::now();
+    let mut result = runner.run_cue_source_range_observation(
+        decoder, spec, extent, cancel,
+    ).await?;
+    result.queue_wait = queue_wait;
+    result.active_wall = active.elapsed();
+    Ok(result)
+}
+
 pub(crate) async fn run_bound_tool_command_with_concurrency(
     mut cmd: ToolCommand,
     executable: &BoundToolExecutable,

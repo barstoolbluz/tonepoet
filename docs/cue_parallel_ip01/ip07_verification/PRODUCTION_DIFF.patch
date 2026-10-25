@@ -1,0 +1,933 @@
+--- a/src/convert/pipeline/cue_flac_range.rs
++++ b/src/convert/pipeline/cue_flac_range.rs
+@@ -122,6 +122,10 @@
+     /// `CueFlacRangeDecoder` instead of fabricating its expected extent.
+     pub(crate) fn for_expected_bytes(expected: u64) -> Self {
+         Self { expected, observed: 0 }
++    }
++
++    pub fn expected_bytes(&self) -> u64 {
++        self.expected
+     }
+ 
+     pub fn observe_bytes(&mut self, amount: usize) -> Result<(), CueFlacRangeError> {
+--- a/src/convert/pipeline/stages.rs
++++ b/src/convert/pipeline/stages.rs
+@@ -92,6 +92,7 @@
+     retained_pcm_scalar_stream_plan_admitted,
+     run_segmented_tool_pipeline_with_concurrency, SegmentedPipelineExecutionError,
+     run_cue_s3_pipeline_if_admitted, run_cue_s3_pipeline_after_pilot_admission,
++    run_cue_source_meter_with_concurrency,
+     CueS3PipelineAttempt,
+     materialize_reference_source_for_album_gain,
+     reference_bound_metadata_executable,
+@@ -44682,6 +44683,314 @@
+     Ok(prepared)
+ }
+ 
++// IP-07's optional meter owns no conversion streams, work products or
++// metadata state. Snapshot the physical generation at admission and verify it
++// before/after each separate decode AND after all conversion children settle.
++// Changes invalidate observations, not successful staged conversion results.
++#[derive(Debug, Clone, PartialEq, Eq)]
++struct CueS3SourceGeneration {
++    path: PathBuf,
++    length: u64,
++    modified: SystemTime,
++    #[cfg(unix)]
++    device: u64,
++    #[cfg(unix)]
++    inode: u64,
++    #[cfg(unix)]
++    ctime: i64,
++    #[cfg(unix)]
++    ctime_nsec: i64,
++}
++
++impl CueS3SourceGeneration {
++    fn capture(path: &Path) -> io::Result<Self> {
++        #[cfg(unix)]
++        use std::os::unix::fs::MetadataExt;
++        let canonical = fs::canonicalize(path)?;
++        let metadata = fs::metadata(&canonical)?;
++        if !metadata.is_file() {
++            return Err(io::Error::new(io::ErrorKind::InvalidData,
++                "source-range physical FLAC ceased being a regular file"));
++        }
++        Ok(Self {
++            path: canonical,
++            length: metadata.len(),
++            modified: metadata.modified()?,
++            #[cfg(unix)]
++            device: metadata.dev(),
++            #[cfg(unix)]
++            inode: metadata.ino(),
++            #[cfg(unix)]
++            ctime: metadata.ctime(),
++            #[cfg(unix)]
++            ctime_nsec: metadata.ctime_nsec(),
++        })
++    }
++
++    fn verify(&self) -> io::Result<()> {
++        if &Self::capture(&self.path)? != self {
++            return Err(io::Error::new(io::ErrorKind::InvalidData,
++                "source-range FLAC physical generation changed after admission"));
++        }
++        Ok(())
++    }
++}
++
++struct CueS3SourceMeterWork {
++    index: usize,
++    track_id: TrackId,
++    member_id: String,
++    range: (u64, u64),
++    decoder: CueFlacRangeDecoder,
++    spec: crate::convert::replaygain::CueSourceRangeObservationSpec,
++}
++
++struct CueS3SourceMeterPlan {
++    generation: CueS3SourceGeneration,
++    works: Vec<CueS3SourceMeterWork>,
++    manifest: crate::convert::replaygain::ReplayGainManifestBinding,
++    demand: crate::convert::replaygain::MetricDemand,
++    needs_album: bool,
++    active_cap: usize,
++}
++
++/// This additional optimization must not broaden IP-05 admission or alter
++/// S1 source-pass eligibility. Missing headroom uses S3's old output pass
++/// rather than burning a native child permit on a non-overlapping reader.
++fn cue_s3_source_meter_plan(
++    prepared: &[CueS3PrivatePrepared],
++    source: &PreparedSource,
++    req: &PipelineRequest,
++    limits: &Arc<ToolConcurrencyLimits>,
++    runner: &dyn ToolRunner,
++) -> Result<CueS3SourceMeterPlan, String> {
++    if !cue_source_replaygain_eligible(source, req) {
++        return Err("source_pass_policy_ineligible".to_string());
++    }
++    if !runner.supports_cue_source_range_observation() {
++        return Err("tool_runner_has_no_supervised_native_stream_handoff".to_string());
++    }
++    let available = limits.ffmpeg_max_concurrent().saturating_sub(2);
++    if available == 0 {
++        return Err("no_ffmpeg_meter_headroom_beyond_one_s3_worker".to_string());
++    }
++    let storage_limit = crate::convert::replaygain::cue_observer_storage_limit(prepared.len())
++        .map_err(|error| format!("native_meter_storage: {error}"))?;
++    let demand = crate::convert::replaygain::MetricDemand::IntegratedOnly;
++    let mode = req.settings.replay_gain.mode.unwrap_or(tonepoet_pipeline::ReplayGainMode::Both);
++    let needs_album = matches!(mode,
++        tonepoet_pipeline::ReplayGainMode::Both | tonepoet_pipeline::ReplayGainMode::Album);
++    let mut works = Vec::with_capacity(prepared.len());
++    let mut members = Vec::with_capacity(prepared.len());
++    let mut last_end = None;
++    let mut physical = None;
++    for member in prepared {
++        let TrackSourceRef::CueStreamSegment {
++            source_image, decode_path, channels, carrier, image_samples,
++            start_sample, samples, ..
++        } = &member.input.track.source_ref else {
++            return Err("non_exact_source_segment".to_string());
++        };
++        if *carrier != CueSegmentCarrier::PcmS32LeWav || source_image != decode_path {
++            return Err("source_and_meter_pcm_carrier_differ".to_string());
++        }
++        let range = member.decoder.sample_bounds();
++        if range.0 != *start_sample
++            || range.1 != start_sample.checked_add(*samples).unwrap_or(0)
++            || last_end.is_some_and(|end| end != range.0)
++            || range.0 >= range.1 || range.1 > *image_samples
++        {
++            return Err("cue_authored_range_gap_overlap_or_mismatch".to_string());
++        }
++        last_end = Some(range.1);
++        if let Some((path, image_size)) = &physical {
++            if path.as_path() != member.decoder.source_path() || image_size != image_samples {
++                return Err("source_meter_physical_file_or_size_drift".to_string());
++            }
++        } else {
++            physical = Some((member.decoder.source_path().to_path_buf(), *image_samples));
++        }
++        if member.input.track.expected_samples != Some(*samples)
++            || member.input.track.source_audio.coding != Some(SourceAudioCoding::Pcm)
++            || member.input.track.source_audio.bit_depth != member.input.track.bit_depth
++        {
++            return Err("source_meter_typed_pcm_facts_mismatch".to_string());
++        }
++        let sample_rate = member.input.track.scalar_sample_rate()
++            .ok_or("source_meter_missing_typed_rate")?;
++        crate::convert::replaygain::preflight_cue_observer(
++            sample_rate, *channels, demand, storage_limit,
++        ).map_err(|error| format!("native_meter_preflight: {error}"))?;
++        let member_id = replaygain_member_id(&member.input.track.id);
++        members.push(member_id.clone());
++        works.push(CueS3SourceMeterWork {
++            index: member.input.index,
++            track_id: member.input.track.id.clone(),
++            member_id: member_id.clone(),
++            range,
++            decoder: member.decoder.clone(),
++            spec: crate::convert::replaygain::CueSourceRangeObservationSpec {
++                member_id, sample_rate_hz: sample_rate, channels: *channels,
++                frames: *samples, demand, storage_limit_bytes: storage_limit,
++            },
++        });
++    }
++    let (path, _) = physical.ok_or("source_meter_empty_album")?;
++    let generation = CueS3SourceGeneration::capture(&path)
++        .map_err(|error| format!("source_generation_admission: {error}"))?;
++    let manifest = crate::convert::replaygain::ReplayGainManifestBinding::new(members)
++        .map_err(|error| format!("source_meter_manifest: {error}"))?;
++    Ok(CueS3SourceMeterPlan {
++        generation, works, manifest, demand, needs_album,
++        active_cap: available.min(2),
++    })
++}
++
++/// Native child is supervised by ToolRunner with one shared FFmpeg permit.
++/// A reader failure never interrupts an otherwise successful S3 conversion;
++/// its returned statistics are discarded for the entire album on failure.
++async fn run_one_cue_s3_source_meter(
++    work: CueS3SourceMeterWork,
++    generation: &CueS3SourceGeneration,
++    job_id: &str,
++    runner: &dyn ToolRunner,
++    limits: &Arc<ToolConcurrencyLimits>,
++    cancel: &CancellationToken,
++) -> Result<(usize, crate::convert::replaygain::OwnedTrackObservation), String> {
++    generation.verify().map_err(|error| error.to_string())?;
++    let started = Instant::now();
++    let decoder_command = work.decoder.command();
++    let decoder_args = decoder_command.sanitized_args();
++    let output = run_cue_source_meter_with_concurrency(
++        decoder_command, work.spec, work.decoder.extent_verifier(),
++        runner, cancel, limits,
++    ).await;
++    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
++    let mut queue_wait_ms = None;
++    let mut active_wall_ms = None;
++    let mut completed_command = None;
++    let result = output.map_err(|error| format!(
++        "source-range FFmpeg/native meter for ordinal {} range [{}, {}): {error}",
++        work.track_id.source_ordinal, work.range.0, work.range.1,
++    )).and_then(|output| {
++        queue_wait_ms = Some(output.queue_wait.as_secs_f64() * 1000.0);
++        active_wall_ms = Some(output.active_wall.as_secs_f64() * 1000.0);
++        completed_command = Some(output.decoder.command.clone());
++        generation.verify().map_err(|error| error.to_string())?;
++        if output.decoder.command.exit.is_none() {
++            return Err("source-range tool supervisor did not retain a completed command".to_string());
++        }
++        Ok((work.index, output.observation))
++    });
++    if result.is_ok() {
++        log::info!("CUE S3 source-range native meter completed for job {job_id}, source ordinal {}, range [{}, {})", work.track_id.source_ordinal, work.range.0, work.range.1);
++    } else {
++        log::warn!("CUE S3 source-range native meter failed for job {job_id}, source ordinal {}, range [{}, {}): {}; discarding album source scan", work.track_id.source_ordinal, work.range.0, work.range.1, result.as_ref().unwrap_err());
++    }
++    if super::baseline::enabled() {
++        super::baseline::cue_emit(job_id, "s3_source_meter_track_settled", serde_json::json!({
++            "track_ordinal": work.track_id.source_ordinal,
++            "replaygain_member_id": work.member_id,
++            "start_sample": work.range.0,
++            "end_sample": work.range.1,
++            "elapsed_inclusive_queue_and_native_ms": elapsed_ms,
++            "ffmpeg_permit_wait_ms": queue_wait_ms,
++            "native_meter_active_wall_ms": active_wall_ms,
++            "decoder_sanitized_args": decoder_args,
++            "decoder_completed_command": completed_command,
++            "ok": result.is_ok(),
++            "failure": result.as_ref().err(),
++        }));
++    }
++    result
++}
++
++async fn run_cue_s3_source_meter_album(
++    plan: CueS3SourceMeterPlan,
++    job_id: &str,
++    runner: &dyn ToolRunner,
++    limits: &Arc<ToolConcurrencyLimits>,
++    cancel: &CancellationToken,
++) -> Result<Vec<crate::convert::replaygain::OwnedTrackObservation>, String> {
++    let mut pending = VecDeque::from(plan.works);
++    let mut done = (0..pending.len()).map(|_| None).collect::<Vec<_>>();
++    let mut first_error = None;
++    let scope = cancel.child_token();
++    let mut first = pending.pop_front().map(|work| Box::pin(
++        run_one_cue_s3_source_meter(work, &plan.generation, job_id, runner, limits, &scope)
++    ));
++    let mut second = if plan.active_cap > 1 {
++        pending.pop_front().map(|work| Box::pin(
++            run_one_cue_s3_source_meter(work, &plan.generation, job_id, runner, limits, &scope)
++        ))
++    } else { None };
++    // Sliding fixed-size window, not one spawn or one memory allotment per
++    // album member. On first fault cancel peers and await their supervisors.
++    while first.is_some() || second.is_some() {
++        let (slot, observation) = match (&mut first, &mut second) {
++            (Some(a), Some(b)) => tokio::select! {
++                result = a => (0, result),
++                result = b => (1, result),
++            },
++            (Some(a), None) => (0, a.await),
++            (None, Some(b)) => (1, b.await),
++            (None, None) => unreachable!("source meter has live task"),
++        };
++        match observation {
++            Ok((index, result)) if index < done.len() && done[index].is_none() => {
++                done[index] = Some(result);
++            }
++            Ok((index, _)) => {
++                first_error.get_or_insert_with(|| format!(
++                    "source meter returned duplicate or foreign member index {index}"
++                ));
++                scope.cancel();
++            }
++            Err(error) => {
++                first_error.get_or_insert(error);
++                scope.cancel();
++            }
++        }
++        let next = if first_error.is_none() {
++            pending.pop_front().map(|work| Box::pin(
++                run_one_cue_s3_source_meter(work, &plan.generation, job_id, runner, limits, &scope)
++            ))
++        } else { None };
++        if slot == 0 { first = next; } else { second = next; }
++    }
++    if cancel.is_cancelled() {
++        return Err("source meter cancelled by conversion owner or user".to_string());
++    }
++    if let Some(error) = first_error { return Err(error); }
++    plan.generation.verify().map_err(|error| error.to_string())?;
++    done.into_iter().enumerate().map(|(index, item)| {
++        item.ok_or_else(|| format!("missing source-range observation at authored index {index}"))
++    }).collect()
++}
++
++/// A retained original-album source scan may never tag an arbitrary partial
++/// cohort, a realized fallback output, or an artifact whose authored identity
++/// has drifted since the S3 admission boundary.
++fn cue_s3_source_meter_outputs_match(
++    outputs: &[ScheduledTrackOutput],
++    prepared: &[ScheduledCueStreamTrack],
++    staged_paths: &[PathBuf],
++) -> bool {
++    outputs.len() == prepared.len() && staged_paths.len() == prepared.len()
++        && outputs.iter().zip(prepared).zip(staged_paths).all(|((out, expected), staged)| {
++        out.ok && out.index == expected.index
++            && out.record.track_id == expected.track.id
++            && out.record.source_ref == expected.track.source_ref
++            && out.record.realized_input.is_none()
++            && out.artifact.as_ref().is_some_and(|artifact| {
++                artifact.track_id == expected.track.id
++                    && artifact.final_path == expected.final_path
++                    && &artifact.staged_path == staged
++                    && artifact.staged_path.is_file()
++            })
++    })
++}
++
+ async fn try_encode_cue_s3_pilot(
+     requested: bool,
+     tracks: &[ScheduledCueStreamTrack],
+@@ -44712,34 +45021,123 @@
+         }
+     };
+     let limits = limits.expect("admitted S3 requires shared tool limits");
++    let meter_plan = cue_s3_source_meter_plan(&prepared, source, req, limits, runner);
++    let source_meter_candidate = meter_plan.is_ok();
++    if let Err(reason) = &meter_plan {
++        log::info!("CUE S3 job {} source-range meter not admitted ({reason}); existing ReplayGain policy remains available", req.job_id);
++    }
++    let authored_tracks = prepared.iter().map(|item| item.input.clone()).collect::<Vec<_>>();
++    let authored_stage_paths = prepared.iter().map(|item| item.staged_path.clone()).collect::<Vec<_>>();
+     cue_ip01_route(req, tracks, "s3", "exact_flac_pilot_opt_in");
+-    log::info!("CUE S3 pilot admitted for job {} ({} tracks); ReplayGain measured after output",
+-        req.job_id, tracks.len());
++    log::info!("CUE S3 pilot admitted for job {} ({} tracks); source-range ReplayGain candidate: {}",
++        req.job_id, tracks.len(), source_meter_candidate);
+     if super::baseline::enabled() {
+-        // Retain the same per-album ReplayGain policy event as S1. Selection
+-        // is not a claim that tags have already been written or verified.
+         super::baseline::cue_emit(&req.job_id, "replaygain_policy", serde_json::json!({
+             "requested": cue_ip01_rg_policy(req),
+-            "source_pass_candidate": false,
++            "source_pass_candidate": source_meter_candidate,
+             "source_pass_observed": false,
+-            "note": "s3_uses_native_post_output_replaygain",
++            "note": "s3_source_range_candidate_or_existing_native_post_output",
+         }));
+         super::baseline::cue_emit(&req.job_id, "s3_pilot_decision", serde_json::json!({
+             "selected": true,
+             "track_ordinals": tracks.iter().map(|item| item.track.id.source_ordinal).collect::<Vec<_>>(),
+             "source_pass_replaygain": false,
+-            "post_output_replaygain": req.stages.replaygain == StageRequirement::Enabled,
++            "source_range_candidate": source_meter_candidate,
++            "post_output_replaygain_if_unavailable": req.stages.replaygain == StageRequirement::Enabled,
+         }));
+     }
+-    let outputs = run_prepared_qualified_flac_ranges(
+-        prepared, req, runner, cancel, limits, true,
+-    ).await;
+-    Some(ScheduledCueStreamBatch {
+-        outputs,
+-        // The existing album post-processing barrier owns native ReplayGain
+-        // for all successfully encoded staged files, including Both/IfMissing.
+-        source_replaygain: None,
+-    })
++    // S3 conversion remains exactly IP-05's original worker and command
++    // sequence. Meter failure is optional and cannot cancel/restart workers;
++    // a conversion failure cancels/reaps any independent meter children.
++    let (outputs, source_replaygain) = match meter_plan {
++        Ok(plan) => {
++            if super::baseline::enabled() {
++                // The pilot is never admitted outside Unix, but even the
++                // unsupported-platform build must compile the diagnostics.
++                #[cfg(unix)]
++                let unix_generation = serde_json::json!({
++                    "device": plan.generation.device,
++                    "inode": plan.generation.inode,
++                    "ctime_seconds": plan.generation.ctime,
++                    "ctime_nanoseconds": plan.generation.ctime_nsec,
++                });
++                #[cfg(not(unix))]
++                let unix_generation = serde_json::Value::Null;
++                super::baseline::cue_emit(&req.job_id, "s3_source_meter_generation_admitted", serde_json::json!({
++                    "canonical_path": plan.generation.path,
++                    "source_length_bytes": plan.generation.length,
++                    "source_modified": format!("{:?}", plan.generation.modified),
++                    "unix_generation": unix_generation,
++                    "authored_members": plan.manifest.ordered_members,
++                    "active_meter_cap": plan.active_cap,
++                }));
++            }
++            let source_generation = plan.generation.clone();
++            let manifest = plan.manifest.clone();
++            let demand = plan.demand;
++            let needs_album = plan.needs_album;
++            let meter_cancel = cancel.child_token();
++            let meter_started = Instant::now();
++            let observation = run_cue_s3_source_meter_album(
++                plan, &req.job_id, runner, limits, &meter_cancel,
++            );
++            let conversion = async {
++                let outputs = run_prepared_qualified_flac_ranges(
++                    prepared, req, runner, cancel, limits, true,
++                ).await;
++                if !cue_s3_source_meter_outputs_match(&outputs, &authored_tracks, &authored_stage_paths) {
++                    meter_cancel.cancel();
++                }
++                outputs
++            };
++            let (observations, outputs) = tokio::join!(observation, conversion);
++            let source_replaygain = if cancel.is_cancelled()
++                || !cue_s3_source_meter_outputs_match(&outputs, &authored_tracks, &authored_stage_paths)
++            {
++                log::info!("CUE S3 job {} cannot retain full-album source observations after partial/fallback/cancelled conversion", req.job_id);
++                None
++            } else {
++                observations.and_then(|observations| {
++                    source_generation.verify().map_err(|error| error.to_string())?;
++                    crate::convert::replaygain::reduce_cue_observations(
++                        manifest, demand, observations, needs_album,
++                    ).map_err(|error| error.to_string())
++                }).map_err(|reason| {
++                    log::warn!("CUE S3 job {} discarded optional source-range ReplayGain: {reason}; retaining native post-output ReplayGain", req.job_id);
++                    reason
++                }).ok()
++            };
++            if super::baseline::enabled() {
++                super::baseline::cue_emit(&req.job_id, "s3_source_meter_album_settled", serde_json::json!({
++                    "candidate": true,
++                    "source_pass_observed": source_replaygain.is_some(),
++                    "post_output_path_required_when_enabled": source_replaygain.is_none(),
++                    "overlapped_group_and_meter_wall_ms": meter_started.elapsed().as_secs_f64() * 1000.0,
++                    "album_local_meter_cap": limits.ffmpeg_max_concurrent().saturating_sub(2).min(2),
++                    "note": "wall is inclusive, not an additive native meter duration",
++                }));
++            }
++            (outputs, source_replaygain)
++        }
++        Err(reason) => {
++            if super::baseline::enabled() {
++                super::baseline::cue_emit(&req.job_id, "s3_source_meter_unavailable", serde_json::json!({
++                    "reason": reason, "post_output_path_required": true,
++                }));
++            }
++            (run_prepared_qualified_flac_ranges(
++                prepared, req, runner, cancel, limits, true,
++            ).await, None)
++        }
++    };
++    if super::baseline::enabled() {
++        super::baseline::cue_emit(&req.job_id, "source_pass_replaygain_result", serde_json::json!({
++            "source_pass_observed": source_replaygain.is_some(),
++            "post_output_path_required_when_enabled": source_replaygain.is_none(),
++            "requested": cue_ip01_rg_policy(req),
++        }));
++    }
++    Some(ScheduledCueStreamBatch { outputs, source_replaygain })
+ }
+ 
+ pub async fn encode_cue_stream_album_for_scheduler_with_tool_limits_and_version_cache(
+@@ -82784,8 +83182,8 @@
+             true, &tracks, &source, &req, &root.join("s3-work"),
+             Some(&limits), &runner, &cancel,
+         ).await.expect("selected complete FLAC pilot");
+-        assert!(s3.source_replaygain.is_none(),
+-            "S3 must always defer native gain to the album output barrier");
++        assert_eq!(s3.source_replaygain.is_some(), mode.is_some(),
++            "IP-07 keeps RG Off free of meter children and binds eligible RG to the source scan");
+         assert_eq!(s3.outputs.len(), members);
+         let s1 = encode_cue_stream_group_with_runner(
+             tracks.clone(), req.clone(), root.join("s1-stage"), "s1-reference".to_string(),
+@@ -82837,12 +83235,18 @@
+                     o.artifact.clone().expect("S1 stage")).collect()),
+                 sidecars: Vec::new(),
+             };
+-            for artifacts in [&s3_artifacts, &s1_artifacts] {
+-                let result = apply_replaygain_with_source_and_tool_limits(
+-                    artifacts, Some(&source), &req, &runner, &cancel, Some(limits.clone()),
+-                ).await.expect("actual native output ReplayGain stage");
+-                assert!(matches!(result.outcome, StageOutcome::Ok | StageOutcome::OkWithDetail(_)));
+-            }
++            let source_result = apply_cue_source_replaygain_if_eligible(
++                &s3_artifacts, Some(&source), &req,
++                s3.source_replaygain.as_ref().expect("IP-07 retained complete scan"),
++            ).expect("IP-07 signal-equivalent source stage selected")
++                .expect("native source scan writes through existing metadata stage");
++            assert!(matches!(source_result.outcome,
++                StageOutcome::Ok | StageOutcome::OkWithDetail(_)));
++            let output_result = apply_replaygain_with_source_and_tool_limits(
++                &s1_artifacts, Some(&source), &req, &runner, &cancel, Some(limits.clone()),
++            ).await.expect("S1 native post-output comparison measurement");
++            assert!(matches!(output_result.outcome,
++                StageOutcome::Ok | StageOutcome::OkWithDetail(_)));
+             for (pilot, reference) in s3.outputs.iter().zip(s1.iter()) {
+                 for tag in ["REPLAYGAIN_TRACK_GAIN", "REPLAYGAIN_TRACK_PEAK",
+                             "REPLAYGAIN_ALBUM_GAIN", "REPLAYGAIN_ALBUM_PEAK"] {
+@@ -82855,7 +83259,7 @@
+                     };
+                     let left = read(&pilot.artifact.as_ref().unwrap().staged_path);
+                     let right = read(&reference.artifact.as_ref().unwrap().staged_path);
+-                    assert_eq!(left, right, "{tag}: S3 versus S1 post-output at {mode:?}");
++                    assert_eq!(left, right, "{tag}: IP-07 source-range versus native S1 output at {mode:?}");
+                 }
+             }
+         }
+@@ -82863,6 +83267,29 @@
+             "neither worker may create the publication destination or control sidecars");
+         assert_eq!(limits.ffmpeg_available_permits_for_test(), 4,
+             "all supervised S3/S1 native permits must be returned");
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn cue_ip07_source_generation_replacement_is_detected() {
++        let temp = tempfile::tempdir().unwrap();
++        let source = temp.path().join("physical.flac");
++        fs::write(&source, b"this is a fixture generation").unwrap();
++        let generation = CueS3SourceGeneration::capture(&source).unwrap();
++        generation.verify().unwrap();
++        let replacement = temp.path().join("replacement.flac");
++        fs::write(&replacement, b"this is a fixture generation").unwrap();
++        fs::rename(&replacement, &source).unwrap();
++        assert!(generation.verify().is_err(),
++            "even a same-size replacement with an old timestamp is a different inode");
++    }
++
++    #[cfg(unix)]
++    #[tokio::test]
++    async fn cue_ip07_real_three_track_source_range_both_native_tag_parity() {
++        cue_ip05_real_worker_parity_case(
++            16, 3, Some(tonepoet_pipeline::ReplayGainMode::Both),
++        ).await;
+     }
+ 
+     #[cfg(unix)]
+--- a/src/convert/pipeline/tool.rs
++++ b/src/convert/pipeline/tool.rs
+@@ -500,6 +500,17 @@
+ /// Maximum stdout/stderr tail any runner retains.
+ pub const TOOL_OUTPUT_TAIL_BYTES: usize = 64 * 1024;
+ 
++/// A native owned observation and its actual supervised source-decoder
++/// invocation. The observation is not admissible until BOTH have succeeded.
++pub struct ToolCueSourceObservationOutput {
++    pub observation: crate::convert::replaygain::OwnedTrackObservation,
++    pub decoder: ToolOutput,
++    /// Includes only admission wait, not the source decode or native meter.
++    pub queue_wait: Duration,
++    /// Permit-held supervised decode and native observation wall duration.
++    pub active_wall: Duration,
++}
++
+ #[async_trait]
+ pub trait ToolRunner: Send + Sync {
+     async fn run(
+@@ -554,6 +565,23 @@
+             error: ToolRunnerError::UnsupportedPipeline,
+             other_commands: Vec::new(),
+         })
++    }
++
++    /// IP-07: one supervised FFmpeg stdout pipe into the production native
++    /// ReplayGain reader. The default is an explicit refusal: `run()` captures
++    /// only a bounded diagnostic tail and cannot satisfy this PCM contract.
++    fn supports_cue_source_range_observation(&self) -> bool {
++        false
++    }
++
++    async fn run_cue_source_range_observation(
++        &self,
++        _decoder: ToolCommand,
++        _spec: crate::convert::replaygain::CueSourceRangeObservationSpec,
++        _extent: super::cue_flac_range::ExactPcmExtent,
++        _cancel: &CancellationToken,
++    ) -> Result<ToolCueSourceObservationOutput, ToolRunnerError> {
++        Err(ToolRunnerError::UnsupportedPipeline)
+     }
+ 
+     /// Return whether this runner implements the narrow retained-f64le scalar
+@@ -2094,6 +2122,102 @@
+         )
+         .map_err(ToolRunnerError::Io)?;
+         self.run_with_binary_path(cmd, binary_path, cancel).await
++    }
++
++    fn supports_cue_source_range_observation(&self) -> bool {
++        cfg!(unix)
++    }
++
++    async fn run_cue_source_range_observation(
++        &self,
++        decoder: ToolCommand,
++        spec: crate::convert::replaygain::CueSourceRangeObservationSpec,
++        extent: super::cue_flac_range::ExactPcmExtent,
++        cancel: &CancellationToken,
++    ) -> Result<ToolCueSourceObservationOutput, ToolRunnerError> {
++        #[cfg(unix)]
++        {
++            if decoder.binary != ToolBinary::Ffmpeg {
++                return Err(ToolRunnerError::Io(std::io::Error::new(
++                    std::io::ErrorKind::InvalidInput,
++                    "source-range observation requires the IP-02 FFmpeg command",
++                )));
++            }
++            // The same configured tool path, sanitized execution, timeout,
++            // execution-item supervisor and child reaper as ordinary S3.
++            if decoder.environment_policy == CommandEnvironmentPolicy::InheritAndSet {
++                let _ = self.tool_version(decoder.binary);
++            }
++            let path = resolve_command_launch_path(
++                self.resolve_binary(decoder.binary), decoder.environment_policy,
++            ).map_err(ToolRunnerError::Io)?;
++            let (read, write) = create_cloexec_pipe().map_err(ToolRunnerError::Io)?;
++            let scope_cancel = cancel.child_token();
++            let observer_cancel = scope_cancel.clone();
++            let mut observer_task = tokio::task::spawn_blocking(move || {
++                crate::convert::replaygain::observe_cue_source_range_pcm(
++                    read, &spec, extent, &observer_cancel,
++                )
++            });
++            let decoder_future = self.run_supervised_with_stdio(
++                decoder, path, &scope_cancel, None, Some(Arc::new(write)), None,
++            );
++            tokio::pin!(decoder_future);
++            let mut decoder_result = None;
++            let mut observer_result = None;
++            // Neither peer may be abandoned. An early reader failure shuts
++            // down its producer immediately instead of waiting for a six-hour
++            // native command timeout or leaving an orphaned pipe writer.
++            while decoder_result.is_none() || observer_result.is_none() {
++                tokio::select! {
++                    result = &mut decoder_future, if decoder_result.is_none() => {
++                        if result.is_err() { scope_cancel.cancel(); }
++                        decoder_result = Some(result);
++                    }
++                    result = &mut observer_task, if observer_result.is_none() => {
++                        if !matches!(&result, Ok(Ok(_))) { scope_cancel.cancel(); }
++                        observer_result = Some(result);
++                    }
++                }
++            }
++            let decoder_result = decoder_result.expect("source decoder settled");
++            let observer_result = observer_result.expect("native observer settled")
++                .map_err(|error| ToolRunnerError::Io(std::io::Error::other(
++                    format!("source-range observer task failed: {error}"),
++                )))?;
++            // A nonzero exit (CRC/timeout/early EOF) always invalidates a
++            // mathematically complete prefix. Conversely a reader failure
++            // outranks the cancellation it caused in the decoder supervisor.
++            match (decoder_result, observer_result) {
++                (Ok(decoder), Ok(observation)) => {
++                    if cancel.is_cancelled() {
++                        Err(ToolRunnerError::Io(std::io::Error::new(
++                            std::io::ErrorKind::Interrupted, "source-range observation cancelled",
++                        )))
++                    } else {
++                        Ok(ToolCueSourceObservationOutput {
++                            observation, decoder,
++                            queue_wait: Duration::ZERO,
++                            active_wall: Duration::ZERO,
++                        })
++                    }
++                }
++                (Err(error), Ok(_)) => Err(error),
++                (Ok(_), Err(error)) => Err(ToolRunnerError::Io(error)),
++                (Err(error), Err(reader_error)) => {
++                    if cancel.is_cancelled() || !matches!(&error, ToolRunnerError::Cancelled { .. }) {
++                        Err(error)
++                    } else {
++                        Err(ToolRunnerError::Io(reader_error))
++                    }
++                }
++            }
++        }
++        #[cfg(not(unix))]
++        {
++            let _ = (decoder, spec, extent, cancel);
++            Err(ToolRunnerError::UnsupportedPipeline)
++        }
+     }
+ 
+     async fn run_bound(
+--- a/src/convert/pipeline/track_executor.rs
++++ b/src/convert/pipeline/track_executor.rs
+@@ -11919,6 +11919,37 @@
+     runner.run(cmd, cancel).await
+ }
+ 
++/// IP-07's independent source meter charges one global FFmpeg-family
++/// permit through BOTH the supervised decoder and the native pipe reader.
++/// It never owns an S3 worker slot or waits for a second resource while
++/// holding this permit. No non-real runner can silently substitute `run()`.
++pub(crate) async fn run_cue_source_meter_with_concurrency(
++    mut decoder: ToolCommand,
++    spec: crate::convert::replaygain::CueSourceRangeObservationSpec,
++    extent: super::cue_flac_range::ExactPcmExtent,
++    runner: &dyn ToolRunner,
++    cancel: &CancellationToken,
++    limits: &Arc<ToolConcurrencyLimits>,
++) -> Result<super::tool::ToolCueSourceObservationOutput, ToolRunnerError> {
++    if decoder.binary != ToolBinary::Ffmpeg {
++        return Err(ToolRunnerError::Io(io::Error::new(
++            io::ErrorKind::InvalidInput, "source meter decoder must be FFmpeg",
++        )));
++    }
++    let queued = Instant::now();
++    let _ffmpeg_permit = acquire_tool_permit(&mut decoder, Some(limits), cancel)
++        .await
++        .map_err(|error| tool_permit_error_to_runner_error(error, &decoder))?;
++    let queue_wait = queued.elapsed();
++    let active = Instant::now();
++    let mut result = runner.run_cue_source_range_observation(
++        decoder, spec, extent, cancel,
++    ).await?;
++    result.queue_wait = queue_wait;
++    result.active_wall = active.elapsed();
++    Ok(result)
++}
++
+ pub(crate) async fn run_bound_tool_command_with_concurrency(
+     mut cmd: ToolCommand,
+     executable: &BoundToolExecutable,
+--- a/src/convert/replaygain.rs
++++ b/src/convert/replaygain.rs
+@@ -98,7 +98,7 @@
+ }
+ 
+ #[derive(Debug)]
+-pub(crate) struct OwnedTrackObservation {
++pub struct OwnedTrackObservation {
+     summary: NativeObservationSummary,
+     measurement: LoudnessMeasurement,
+     reporting_peak_linear: f64,
+@@ -1132,6 +1132,91 @@
+     Ok(())
+ }
+ 
++/// One qualified native source-range meter. The owned result is valid only
++/// after the process supervisor has ALSO proved a clean decoder exit. The
++/// caller binds it to the immutable IP-02 range, album identity and source
++/// generation; this reader neither owns a child nor writes ReplayGain tags.
++#[derive(Debug, Clone)]
++pub struct CueSourceRangeObservationSpec {
++    pub member_id: String,
++    pub sample_rate_hz: u32,
++    pub channels: u16,
++    pub frames: u64,
++    pub(crate) demand: MetricDemand,
++    pub(crate) storage_limit_bytes: usize,
++}
++
++/// Raw s32le pipe, not a WAV FIFO: use the exact native S1 normalization and
++/// 16,384-frame push boundaries. A connected anonymous pipe has ordinary
++/// blocking read/EOF semantics; there is no no-writer FIFO polling loop.
++/// The supervisor owns the writer and closes it on success, failure and
++/// cancellation. No statistic may be admitted before EOF *and* child success.
++pub(crate) fn observe_cue_source_range_pcm<R: Read>(
++    mut reader: R,
++    spec: &CueSourceRangeObservationSpec,
++    mut extent: crate::convert::pipeline::cue_flac_range::ExactPcmExtent,
++    cancel: &CancellationToken,
++) -> io::Result<OwnedTrackObservation> {
++    let roles = match spec.channels {
++        1 => vec![ChannelRole::Mono],
++        2 => vec![ChannelRole::Left, ChannelRole::Right],
++        _ => return Err(invalid("source-range meter admits only mono/stereo")),
++    };
++    let frame_bytes = u64::from(spec.channels)
++        .checked_mul(4)
++        .ok_or_else(|| invalid("source-range PCM frame-size overflow"))?;
++    let required_bytes = spec.frames
++        .checked_mul(frame_bytes)
++        .ok_or_else(|| invalid("source-range PCM byte extent overflow"))?;
++    if spec.frames == 0 || required_bytes != extent.expected_bytes() {
++        return Err(invalid("source-range meter frame geometry and qualified extent disagree"));
++    }
++    let subject = ProgrammeSubject {
++        participant: spec.member_id.clone(),
++        identity: format!("cue-source-pass:{}", spec.member_id),
++        reader: ReaderAuthority::CueExactPcmMirror,
++        sample_rate_hz: spec.sample_rate_hz,
++        roles,
++    };
++    let mut meter = NativeReplayGainObserver::new_with_storage_limit(
++        subject, spec.demand, spec.storage_limit_bytes,
++    )?;
++    let chunk_bytes = usize::try_from(16_384_u64 * frame_bytes)
++        .map_err(|_| invalid("source-range chunk does not fit in usize"))?;
++    let mut raw = vec![0u8; chunk_bytes];
++    let mut remaining = required_bytes;
++    while remaining > 0 {
++        if cancel.is_cancelled() {
++            return Err(io::Error::new(io::ErrorKind::Interrupted, "source-range meter cancelled"));
++        }
++        let wanted = usize::try_from(remaining.min(chunk_bytes as u64))
++            .map_err(|_| invalid("source-range read extent overflow"))?;
++        reader.read_exact(&mut raw[..wanted])?;
++        extent.observe_bytes(wanted).map_err(|error| invalid(error.to_string()))?;
++        let samples = decode_pcm_bytes(&raw[..wanted], PcmMirrorEncoding::S32Le)?;
++        if samples.len() % usize::from(spec.channels) != 0 {
++            return Err(invalid("source-range meter received an incomplete PCM frame"));
++        }
++        meter.push_interleaved(&samples)?;
++        remaining -= wanted as u64;
++    }
++    if cancel.is_cancelled() {
++        return Err(io::Error::new(io::ErrorKind::Interrupted, "source-range meter cancelled"));
++    }
++    let mut surplus = [0u8; 1];
++    if reader.read(&mut surplus)? != 0 {
++        return Err(invalid("source-range producer emitted surplus PCM after exact extent"));
++    }
++    extent.finish().map_err(|error| invalid(error.to_string()))?;
++    let result = meter.finish(format!(
++        "supervised source-range s32le pipe: {required_bytes} bytes, exact EOF; decoder exit checked by runner"
++    ))?;
++    if result.summary.real_frames != spec.frames {
++        return Err(invalid("source-range native observer frame count differs from qualified source"));
++    }
++    Ok(result)
++}
++
+ /// Exact CUE source-pass reader. It validates the exact header, exact payload,
+ /// frame alignment, and EOF *after* the declared payload, so a later surplus
+ /// FIFO write cannot be mistaken for a complete observation.
+@@ -2054,6 +2139,89 @@
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++
++    fn cue_ip07_synthetic_pcm(frames: usize) -> Vec<u8> {
++        let mut data = Vec::with_capacity(frames * 8);
++        for i in 0..frames {
++            let value = (((i % 137) as i64 - 68) * 24_000_000) as i32;
++            data.extend_from_slice(&value.to_le_bytes());
++            data.extend_from_slice(&(-value).to_le_bytes());
++        }
++        data
++    }
++
++    fn cue_ip07_spec(frames: u64) -> CueSourceRangeObservationSpec {
++        CueSourceRangeObservationSpec {
++            member_id: "source:1:disc:-:track:1".to_string(),
++            sample_rate_hz: 44_100,
++            channels: 2,
++            frames,
++            demand: MetricDemand::IntegratedOnly,
++            storage_limit_bytes: 8 * 1024 * 1024,
++        }
++    }
++
++    #[test]
++    fn cue_ip07_exact_s32le_native_sample_and_peak_identity() {
++        let frames = 44_100;
++        let raw = cue_ip07_synthetic_pcm(frames);
++        let spec = cue_ip07_spec(frames as u64);
++        let scan = observe_cue_source_range_pcm(
++            io::Cursor::new(&raw), &spec,
++            crate::convert::pipeline::cue_flac_range::ExactPcmExtent::for_expected_bytes(raw.len() as u64),
++            &CancellationToken::new(),
++        ).expect("exact supervised-pipe-equivalent raw PCM");
++        let subject = ProgrammeSubject {
++            participant: spec.member_id.clone(),
++            identity: format!("cue-source-pass:{}", spec.member_id),
++            reader: ReaderAuthority::CueExactPcmMirror,
++            sample_rate_hz: 44_100,
++            roles: vec![ChannelRole::Left, ChannelRole::Right],
++        };
++        let mut reference = NativeReplayGainObserver::new_with_storage_limit(
++            subject, spec.demand, spec.storage_limit_bytes,
++        ).unwrap();
++        for chunk in raw.chunks(16_384 * 8) {
++            let samples = decode_pcm_bytes(chunk, PcmMirrorEncoding::S32Le).unwrap();
++            reference.push_interleaved(&samples).unwrap();
++        }
++        let reference = reference.finish("same native S1 PCM chunks".to_string()).unwrap();
++        assert_eq!(scan.summary.real_frames, 44_100);
++        assert_eq!(scan.summary.subject, reference.summary.subject);
++        assert_eq!(scan.summary.loudness, reference.summary.loudness);
++        assert_eq!(scan.summary.reporting_peak, reference.summary.reporting_peak);
++        assert_eq!(scan.measurement.statistics.integrated_observations(),
++            reference.measurement.statistics.integrated_observations());
++        assert_eq!(scan.measurement.statistics.lra_observations(),
++            reference.measurement.statistics.lra_observations());
++    }
++
++    #[test]
++    fn cue_ip07_reader_refuses_missing_extra_and_wrong_extent() {
++        let raw = cue_ip07_synthetic_pcm(100);
++        let spec = cue_ip07_spec(100);
++        let extent = || crate::convert::pipeline::cue_flac_range::ExactPcmExtent::for_expected_bytes(raw.len() as u64);
++        for data in [&raw[..raw.len() - 1], &raw[..raw.len() - 8]] {
++            assert!(observe_cue_source_range_pcm(
++                io::Cursor::new(data), &spec, extent(), &CancellationToken::new(),
++            ).is_err(), "early EOF cannot create a mathematically unavailable observation");
++        }
++        let mut surplus = raw.clone();
++        surplus.push(0);
++        assert!(observe_cue_source_range_pcm(
++            io::Cursor::new(surplus), &spec, extent(), &CancellationToken::new(),
++        ).is_err(), "full expected prefix with surplus is an operational failure");
++        assert!(observe_cue_source_range_pcm(
++            io::Cursor::new(&raw), &spec,
++            crate::convert::pipeline::cue_flac_range::ExactPcmExtent::for_expected_bytes((raw.len() + 4) as u64),
++            &CancellationToken::new(),
++        ).is_err(), "caller may not substitute an unsupported extent");
++        let cancelled = CancellationToken::new();
++        cancelled.cancel();
++        assert_eq!(observe_cue_source_range_pcm(
++            io::Cursor::new(&raw), &spec, extent(), &cancelled,
++        ).unwrap_err().kind(), io::ErrorKind::Interrupted);
++    }
+ 
+     #[test]
+     fn id3_wrapped_flac_observes_declared_extent_and_succeeds() {

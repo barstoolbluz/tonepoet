@@ -124,6 +124,10 @@ impl ExactPcmExtent {
         Self { expected, observed: 0 }
     }
 
+    pub fn expected_bytes(&self) -> u64 {
+        self.expected
+    }
+
     pub fn observe_bytes(&mut self, amount: usize) -> Result<(), CueFlacRangeError> {
         let next = self
             .observed

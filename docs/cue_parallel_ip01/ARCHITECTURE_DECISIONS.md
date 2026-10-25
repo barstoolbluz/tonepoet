@@ -1,3 +1,14 @@
+# CURRENT IP-07 design decisions — 2026-10-25
+
+1. **Optimize only after IP-05's identity-PCM S3 decision.** Retain exact S3 admission and opt-in. Additional eligibility is the existing `cue_source_replaygain_eligible`/Trust policy plus exact qualified per-track source facts, a stable physical FLAC generation, contiguous authored ranges and FFmpeg capacity. A declined optimization is not a declined conversion.
+2. **Reuse the supervised ToolRunner, not a new transport framework.** One existing FFmpeg exact-range command writes raw s32le to a private CLOEXEC anonymous pipe and is reaped under the existing process supervisor. A single private trait method gives compatible real runners an explicit bounded stdout stream; default tool runners refuse. No decoded-stream interception, WAV header, FIFO, files, general scheduler or metadata writer.
+3. **One independent global FFmpeg permit per source reader.** Hold it across decoder *and* native observer settlement, with only one permit awaited and no partial resource reservation; bound album-local active meter tasks to at most two and FFmpeg capacity minus two. This does not retroactively fix preexisting S1 child accounting.
+4. **Proof before statistics, statistics before album projection.** Native signed32 samples, original 16,384-frame push chunk boundary, NativeEbu2023 and peak meter are unchanged. Require exact expected bytes, EOF, correct frames, clean decoder exit and unchanged source generation. Order independent per-track owned sufficient statistics by admitted manifest before existing `reduce_cue_observations`; do not merge LUFS or tag scalars. Split the existing 256-MiB live-meter statistics allowance across authored tracks; the album reducer has its own 256 MiB.
+5. **Conversion owns output; source scan is disposable.** Source failure -> discard scan, retain staged outputs, existing native post-output meter. Conversion/partial failure -> cancel/reap optional meters and never attach full original album statistics. Writer/binding failure after selected source scan -> original fatal stage, never scan again. Existing publication and S1 code untouched.
+6. **Engineering/qualification separation.** 25 independently validated FFmpeg PCM ranges do not verify ToolRunner, native ReplayGain or publication in Rust. All host runtime and numeric gates remain NOT RUN, output stays default-OFF and IP-06 cannot begin until exact host-accepted IP-07 archive identity exists. Packet sequencing amendment supersedes historical IP-06 dependency order, not its performance and correctness thresholds.
+
+---
+
 # CURRENT IP-05 corrective architecture — 2026-10-25
 
 **D-01:** The selection-filtered prepared/scheduled track counts must also

@@ -500,6 +500,17 @@ fn consumer_failure_makes_producer_sigpipe_secondary(
 /// Maximum stdout/stderr tail any runner retains.
 pub const TOOL_OUTPUT_TAIL_BYTES: usize = 64 * 1024;
 
+/// A native owned observation and its actual supervised source-decoder
+/// invocation. The observation is not admissible until BOTH have succeeded.
+pub struct ToolCueSourceObservationOutput {
+    pub observation: crate::convert::replaygain::OwnedTrackObservation,
+    pub decoder: ToolOutput,
+    /// Includes only admission wait, not the source decode or native meter.
+    pub queue_wait: Duration,
+    /// Permit-held supervised decode and native observation wall duration.
+    pub active_wall: Duration,
+}
+
 #[async_trait]
 pub trait ToolRunner: Send + Sync {
     async fn run(
@@ -554,6 +565,23 @@ pub trait ToolRunner: Send + Sync {
             error: ToolRunnerError::UnsupportedPipeline,
             other_commands: Vec::new(),
         })
+    }
+
+    /// IP-07: one supervised FFmpeg stdout pipe into the production native
+    /// ReplayGain reader. The default is an explicit refusal: `run()` captures
+    /// only a bounded diagnostic tail and cannot satisfy this PCM contract.
+    fn supports_cue_source_range_observation(&self) -> bool {
+        false
+    }
+
+    async fn run_cue_source_range_observation(
+        &self,
+        _decoder: ToolCommand,
+        _spec: crate::convert::replaygain::CueSourceRangeObservationSpec,
+        _extent: super::cue_flac_range::ExactPcmExtent,
+        _cancel: &CancellationToken,
+    ) -> Result<ToolCueSourceObservationOutput, ToolRunnerError> {
+        Err(ToolRunnerError::UnsupportedPipeline)
     }
 
     /// Return whether this runner implements the narrow retained-f64le scalar
@@ -2094,6 +2122,102 @@ impl ToolRunner for RealToolRunner {
         )
         .map_err(ToolRunnerError::Io)?;
         self.run_with_binary_path(cmd, binary_path, cancel).await
+    }
+
+    fn supports_cue_source_range_observation(&self) -> bool {
+        cfg!(unix)
+    }
+
+    async fn run_cue_source_range_observation(
+        &self,
+        decoder: ToolCommand,
+        spec: crate::convert::replaygain::CueSourceRangeObservationSpec,
+        extent: super::cue_flac_range::ExactPcmExtent,
+        cancel: &CancellationToken,
+    ) -> Result<ToolCueSourceObservationOutput, ToolRunnerError> {
+        #[cfg(unix)]
+        {
+            if decoder.binary != ToolBinary::Ffmpeg {
+                return Err(ToolRunnerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "source-range observation requires the IP-02 FFmpeg command",
+                )));
+            }
+            // The same configured tool path, sanitized execution, timeout,
+            // execution-item supervisor and child reaper as ordinary S3.
+            if decoder.environment_policy == CommandEnvironmentPolicy::InheritAndSet {
+                let _ = self.tool_version(decoder.binary);
+            }
+            let path = resolve_command_launch_path(
+                self.resolve_binary(decoder.binary), decoder.environment_policy,
+            ).map_err(ToolRunnerError::Io)?;
+            let (read, write) = create_cloexec_pipe().map_err(ToolRunnerError::Io)?;
+            let scope_cancel = cancel.child_token();
+            let observer_cancel = scope_cancel.clone();
+            let mut observer_task = tokio::task::spawn_blocking(move || {
+                crate::convert::replaygain::observe_cue_source_range_pcm(
+                    read, &spec, extent, &observer_cancel,
+                )
+            });
+            let decoder_future = self.run_supervised_with_stdio(
+                decoder, path, &scope_cancel, None, Some(Arc::new(write)), None,
+            );
+            tokio::pin!(decoder_future);
+            let mut decoder_result = None;
+            let mut observer_result = None;
+            // Neither peer may be abandoned. An early reader failure shuts
+            // down its producer immediately instead of waiting for a six-hour
+            // native command timeout or leaving an orphaned pipe writer.
+            while decoder_result.is_none() || observer_result.is_none() {
+                tokio::select! {
+                    result = &mut decoder_future, if decoder_result.is_none() => {
+                        if result.is_err() { scope_cancel.cancel(); }
+                        decoder_result = Some(result);
+                    }
+                    result = &mut observer_task, if observer_result.is_none() => {
+                        if !matches!(&result, Ok(Ok(_))) { scope_cancel.cancel(); }
+                        observer_result = Some(result);
+                    }
+                }
+            }
+            let decoder_result = decoder_result.expect("source decoder settled");
+            let observer_result = observer_result.expect("native observer settled")
+                .map_err(|error| ToolRunnerError::Io(std::io::Error::other(
+                    format!("source-range observer task failed: {error}"),
+                )))?;
+            // A nonzero exit (CRC/timeout/early EOF) always invalidates a
+            // mathematically complete prefix. Conversely a reader failure
+            // outranks the cancellation it caused in the decoder supervisor.
+            match (decoder_result, observer_result) {
+                (Ok(decoder), Ok(observation)) => {
+                    if cancel.is_cancelled() {
+                        Err(ToolRunnerError::Io(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted, "source-range observation cancelled",
+                        )))
+                    } else {
+                        Ok(ToolCueSourceObservationOutput {
+                            observation, decoder,
+                            queue_wait: Duration::ZERO,
+                            active_wall: Duration::ZERO,
+                        })
+                    }
+                }
+                (Err(error), Ok(_)) => Err(error),
+                (Ok(_), Err(error)) => Err(ToolRunnerError::Io(error)),
+                (Err(error), Err(reader_error)) => {
+                    if cancel.is_cancelled() || !matches!(&error, ToolRunnerError::Cancelled { .. }) {
+                        Err(error)
+                    } else {
+                        Err(ToolRunnerError::Io(reader_error))
+                    }
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (decoder, spec, extent, cancel);
+            Err(ToolRunnerError::UnsupportedPipeline)
+        }
     }
 
     async fn run_bound(

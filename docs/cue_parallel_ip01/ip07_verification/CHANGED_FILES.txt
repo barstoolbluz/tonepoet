@@ -1,0 +1,32 @@
+IP-07 changed-file inventory relative to SHA-verified accepted IP-05
+SOURCE INPUT SHA-256: af66b5c2a40904d4db6fec3fd4185914b4aadd32c74cf6fd6ff15568bf2cbd20
+PRODUCTION MODULES (5):
+  src/convert/pipeline/cue_flac_range.rs
+  src/convert/pipeline/stages.rs
+  src/convert/pipeline/tool.rs
+  src/convert/pipeline/track_executor.rs
+  src/convert/replaygain.rs
+CURRENT EXISTING DOCS UPDATED (4):
+  docs/cue_parallel_ip01/ARCHITECTURE_DECISIONS.md
+  docs/cue_parallel_ip01/CONFORMANCE_MATRIX.md
+  docs/cue_parallel_ip01/IMPLEMENTATION_STATUS.md
+  docs/cue_parallel_ip01/NEXT_SESSION_HANDOFF.md
+ADDED EVIDENCE DOCUMENTS / SCRIPTS:
+  docs/cue_parallel_ip01/ip07_verification/CHANGED_FILES.txt
+  docs/cue_parallel_ip01/ip07_verification/CONFORMANCE_MATRIX.md
+  docs/cue_parallel_ip01/ip07_verification/EXCLUDED_BYTECODE_CACHE.txt
+  docs/cue_parallel_ip01/ip07_verification/HOST_QUALIFICATION.md
+  docs/cue_parallel_ip01/ip07_verification/IP-06_SEQUENCING_AMENDMENT.md
+  docs/cue_parallel_ip01/ip07_verification/IP-07_ORIGINAL_PACKET.md
+  docs/cue_parallel_ip01/ip07_verification/IP07_SHA256SUMS
+  docs/cue_parallel_ip01/ip07_verification/NATIVE_FFMPEG_RANGE_RESULTS.json
+  docs/cue_parallel_ip01/ip07_verification/PRODUCTION_DIFF.patch
+  docs/cue_parallel_ip01/ip07_verification/README.md
+  docs/cue_parallel_ip01/ip07_verification/SOURCE_INVENTORY.json
+  docs/cue_parallel_ip01/ip07_verification/STATIC_GATE_OUTPUT.txt
+  docs/cue_parallel_ip01/ip07_verification/VERIFICATION_RESULTS.md
+  docs/cue_parallel_ip01/ip07_verification/verify_ip07_static.py
+  docs/cue_parallel_ip01/ip07_verification/verify_native_ffmpeg_ranges.py
+EXCLUDED INERT BYTECODE FROM OUTPUT:
+  tonepoet-pipeline/qualification/ssrc_binary64/__pycache__/qualify_ssrc_binary64.cpython-313.pyc
+  tonepoet-pipeline/qualification/ssrc_binary64/__pycache__/test_qualify_ssrc_binary64.cpython-313.pyc
