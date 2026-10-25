@@ -1,3 +1,16 @@
+# IP-03 addendum — shared two-child permits
+
+1. **Existing tool semaphores remain authoritative.** Add only a globally shared `cue_s3_in_flight` semaphore to `ToolConcurrencyLimits`; every S3 worker counts two actual children with `try_acquire_many_owned` (FFmpeg/FFmpeg) or one token from each family (FFmpeg/SoX). No generic RAM/FD/I/O scheduler and no changes to the ordinary S1 or single-tool limiter.
+2. **Admission is immediate, complete, and all-or-nothing.** Reserve the S3 slot, then SoX (if needed), then FFmpeg; no `.await` occurs while a partial set is held. Tokio RAII drops a partially acquired set on failure/cancellation/panic. `Closed` and invalid types are errors, not ordinary capacity deferrals.
+3. **One execution lifetime for both children.** Keep the guard through `runner.run_pipeline` (the existing supervised Unix pipe). The API returns `Declined` only before spawn, versus `Executed(Result)` after attempting the real pipeline. A failed decode/encode cannot silently retry as S1. No `run_tool_command_with_concurrency` / reference-permit double charge.
+4. **Bound S3 independently across albums, but do not misstate old S1.** Hard cap `N <= 2`, further bounded by FFmpeg/2, with a single OS pipe and a fixed number of 64 KiB tool tails for each worker. New S3 contributes at most two new native children per admitted worker. Historical S1 segmented FFmpeg/FFmpeg consumes only one family token: the test identifies this known undercount, so no assertion of an absolute cap across *all* existing operations is made.
+5. **No source execution or user activation in IP-03.** Typed FLAC range-to-planner worker and exact stream extent integration are IP-04; album ownership, ReplayGain, metadata and publication are IP-05. S3 is unreachable from ordinary conversion routes until those gates complete. Preserve the amended IP-06 ReplayGain-Off/Both measurement gate.
+6. **Qualification split:** Authoring host lacks Rust; all new Rust tests remain NOT RUN. The executed native FFmpeg fixture is independent resource/PCM evidence, not a substitute. Actual host FD/RSS/child-reaping, effective family cap under shared S1 activity, and full regressions are mandatory before acceptance.
+
+---
+
+## Preserved IP-01 historical decisions
+
 # CUE IP-01 — architecture decisions and retained plan authority
 
 The original amended planning decisions remain authoritative in the byte-for-byte `planning_authority/` directory. Additive IP-01 decisions:

@@ -1,0 +1,145 @@
+{
+  "added": {
+    "docs/cue_parallel_ip01/ip03_verification/CORRECTIVE_D01_VERIFICATION.md": {
+      "mode": "0o644",
+      "sha256": "63d231b0da3dfbec47fa4725f3ca9f2a8504f100ac548880e7f50ec5c541b825",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip03_verification/LEGACY_IP01_PYTHON_TEST_OUTPUT.txt": {
+      "mode": "0o644",
+      "sha256": "5fec00d4810f28bff3b4c587f29bf06cf4da53c672b340055f510c993905517a",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip03_verification/PATCH_CHECK.txt": {
+      "mode": "0o644",
+      "sha256": "58f0be17ccd8df5be7989df5402c28324b998c12d916b6ff336a933283ee481e",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip03_verification/PLANNING_AUTHORITY_SHA256_CHECK.txt": {
+      "mode": "0o644",
+      "sha256": "7ef20452bbfc7f5501590a43f02c0260d54cfb2c623ed276489b037adf49f03e",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip03_verification/PRODUCTION_DIFF.patch": {
+      "mode": "0o644",
+      "sha256": "2425b6a8c53f773bd858e961f3cde3846b2363764d0a09a9dee680d9969ac5cf",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip03_verification/README.md": {
+      "mode": "0o644",
+      "sha256": "c78c5ba6d9a13b4282e065c7c4b78795826ccdfcf096188c107b3fb47e3d0496",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip03_verification/SESSION_CHECKPOINT.md": {
+      "mode": "0o644",
+      "sha256": "dfe1e99b47635181f510b77b816a1384ccaa804637e6113e61e010ee41ff14bd",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip03_verification/STATIC_AUDIT.md": {
+      "mode": "0o644",
+      "sha256": "dcbee9eed0fb9aba6b850a7d90d0bc93e12e207203915accd70f10cd7a3a8858",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip03_verification/make_manifest.py": {
+      "mode": "0o644",
+      "sha256": "545ff1661470a0ec017df58b1584e66ab7b287c9a450d0eff64df717b0f65651",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip03_verification/native_pair_envelope_probe.py": {
+      "mode": "0o644",
+      "sha256": "0de769c0b23efe3a8c24cf8fd0464c36717bd327e192812789a77cde448044e7",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip03_verification/native_pair_probe_results.json": {
+      "mode": "0o644",
+      "sha256": "3921b5d2e9df01cd4059c12ce2e3c29739084720f4316d45ccbee4c129f5da7a",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip03_verification/test_verify_static_ip03.py": {
+      "mode": "0o644",
+      "sha256": "9ef90eaa6dbca3febd12bf46b0bd4fad63e75405a9264dfe7bb24bb9a27fd627",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip03_verification/verify_static_ip03.py": {
+      "mode": "0o644",
+      "sha256": "bb4dc83d3e64b6a3d0fa68992e49aef04850f3d1763a32c75bacf422cd10905d",
+      "type": "file"
+    }
+  },
+  "changed": {
+    "docs/cue_parallel_ip01/ARCHITECTURE_DECISIONS.md": {
+      "new": {
+        "mode": "0o664",
+        "sha256": "af88fc5abdf6bfe196fdc9c1b6d24ad13b9bd3c177e66eccaa150361d55362b7",
+        "type": "file"
+      },
+      "old": {
+        "mode": "0o664",
+        "sha256": "14df96ebf46d9f56f50b11a293831819600e00d357ee3871cd6b35aabd1d398e",
+        "type": "file"
+      }
+    },
+    "docs/cue_parallel_ip01/CONFORMANCE_MATRIX.md": {
+      "new": {
+        "mode": "0o664",
+        "sha256": "ae0c256647b9b393eb4f88736ca6c3c82cd6539b7f5df7baff7f3626ac0fbf19",
+        "type": "file"
+      },
+      "old": {
+        "mode": "0o664",
+        "sha256": "3328d65d8fdc7c91a4c1918544d282f778e33d63b808bdb672962175a33ff0bc",
+        "type": "file"
+      }
+    },
+    "docs/cue_parallel_ip01/IMPLEMENTATION_STATUS.md": {
+      "new": {
+        "mode": "0o664",
+        "sha256": "e81a9e178288e958f25eaee96a029f4cd88c4bb9f067eed7719c3c2e6c1aa373",
+        "type": "file"
+      },
+      "old": {
+        "mode": "0o664",
+        "sha256": "80cf9ae9ab85a2497e6909a8c70400b27c425a5c0ebc8a414ce01dd8f545204a",
+        "type": "file"
+      }
+    },
+    "docs/cue_parallel_ip01/NEXT_SESSION_HANDOFF.md": {
+      "new": {
+        "mode": "0o664",
+        "sha256": "3f69db22954f59b23d0ab2605d8542521ebca74a957229b1443ce0c6e991da08",
+        "type": "file"
+      },
+      "old": {
+        "mode": "0o664",
+        "sha256": "ef602cb32d70a98683314a2e10f2426e366a3f6b9a0179059c07053840b28474",
+        "type": "file"
+      }
+    },
+    "docs/cue_parallel_ip01/VERIFICATION_RESULTS.md": {
+      "new": {
+        "mode": "0o664",
+        "sha256": "5b450eee8381ac577c82b7a535f51060959e9239970e4cb32cddee1ce3bb00c5",
+        "type": "file"
+      },
+      "old": {
+        "mode": "0o664",
+        "sha256": "e70f103159998b1af0fddfd9cb57f8c02d715cc57b18548255289e7bbb2b88b7",
+        "type": "file"
+      }
+    },
+    "src/convert/pipeline/track_executor.rs": {
+      "new": {
+        "mode": "0o664",
+        "sha256": "5363bc18f191bb75677568dcffdf3900fdc963d46e29b8a9696b9defb713ee1e",
+        "type": "file"
+      },
+      "old": {
+        "mode": "0o664",
+        "sha256": "985d75357b9b80f26f7cff58af4c79b0d44771cb266195e50a7643b576300523",
+        "type": "file"
+      }
+    }
+  },
+  "removed": {},
+  "unchanged_count": 1214
+}
