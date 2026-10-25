@@ -1,3 +1,9 @@
+# CURRENT IP-07 conformance checkpoint — 2026-10-25
+
+Implementation covers an optional concurrent source-range native ReplayGain path after IP-05 S3 admission, separate supervised FFmpeg permits, exact EOF/decoder-exit and source-generation evidence, bounded two-meter window/256-MiB shared statistics, unchanged manifest-ordered album reduction, source-observer failure-to-postoutput fallback, fatal original metadata failure and unchanged S1, pilot gate and publisher. **Source scope static PASS and 25 standalone FFmpeg PCM range checks PASS; all Rust, tag, native app, failure injection, publication, resource and performance qualification NOT RUN.** Status: `implemented-unqualified`, no host acceptance, S3 default-OFF, IP-06 not executable. The detailed criterion-by-criterion table is `ip07_verification/CONFORMANCE_MATRIX.md` and the mandatory host recipe is `ip07_verification/HOST_QUALIFICATION.md`; the copied `ip07_verification/IP-06_SEQUENCING_AMENDMENT.md` controls next-packet order. Input: accepted IP-05 SHA-256 `af66b5c2a40904d4db6fec3fd4185914b4aadd32c74cf6fd6ff15568bf2cbd20` (reported host acceptance, exact bytes verified, no Git metadata).
+
+---
+
 # CURRENT IP-05 corrective conformance — 2026-10-25
 
 D-01 incomplete selected CUE albums: authored-count guard and a named

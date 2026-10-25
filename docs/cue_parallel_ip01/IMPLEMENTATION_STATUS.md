@@ -1,3 +1,9 @@
+# CURRENT IP-07 implementation status — 2026-10-25
+
+**`implemented-unqualified`, not host-accepted; S3 DEFAULT OFF. IP-06 remains blocked.** User-supplied accepted IP-05 tree `TonePoet_SNAPSHOT_46696d1_2026-10-25.tar.gz` independently hashed to `af66b5c2a40904d4db6fec3fd4185914b4aadd32c74cf6fd6ff15568bf2cbd20`; Git status/merge cannot be independently verified because source has no `.git`. All five changed production modules are confined to native source observation, ToolRunner streaming, weighted admission, exact extent and S3 album handoff; previous S1 and metadata/publisher code remains unchanged. Scope verifier PASS and standalone FFmpeg range fixture 25/25 PASS, but **Rust fmt/build, all Rust tests, real ReplayGain tag parity, child lifecycle, full destination and IP-06 performance NOT RUN**. Exact output identity is in external delivery receipt. See `ip07_verification/` for evidence, host commands, known qualification gaps and authoritative copied IP-06 amendment. Retain original post-output S3 and S1 rollback paths. If any gate fails, correct IP-07 before IP-06; no automatic S3 promotion is authorized.
+
+---
+
 # CURRENT IP-05 corrective status — 2026-10-25
 
 **D-01/D-02 corrected, not host-qualified.** IP-05 S3 now rejects a user

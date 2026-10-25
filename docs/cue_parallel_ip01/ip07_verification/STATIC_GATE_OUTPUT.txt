@@ -1,0 +1,3 @@
+PASS: unchanged baseline files preserved, exactly 5 expected Rust production modules modified
+PASS: source-verified default-OFF, separate observer, legacy fallback, existing reducer, supervisor and s32le invariants
+NOT RUN: Rust compiler, tests, process lifetimes, actual native ReplayGain album and publisher

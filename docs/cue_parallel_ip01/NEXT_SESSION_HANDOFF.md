@@ -1,3 +1,15 @@
+# CURRENT IP-07 implementation handoff — October 25, 2026
+
+**IMPLEMENTED-UNQUALIFIED; NOT HOST ACCEPTED. S3 DEFAULT OFF. IP-06 BLOCKED.** This candidate starts from the exact host-accepted user-supplied IP-05 source archive `TonePoet_SNAPSHOT_46696d1_2026-10-25.tar.gz`, independently verified SHA-256 `af66b5c2a40904d4db6fec3fd4185914b4aadd32c74cf6fd6ff15568bf2cbd20`. The input tar contains no `.git`. Do **not** use the superseded IP-05 archive identities in historical sections below as current implementation inputs. The IP-07 archive's **external** SHA and full filename are provided in the separate delivery receipt.
+
+Read first: `ip07_verification/README.md` -> `ip07_verification/VERIFICATION_RESULTS.md` -> `ip07_verification/HOST_QUALIFICATION.md` -> `ip07_verification/CONFORMANCE_MATRIX.md` -> `ip07_verification/SOURCE_INVENTORY.json` and `PRODUCTION_DIFF.patch`. Then inspect the five changed Rust modules and `ip07_verification/IP-06_SEQUENCING_AMENDMENT.md`.
+
+**Implemented:** IP-07 separately and optionally meters each exact source FLAC CUE range concurrently with original S3 workers. It uses the qualified IP-02 decoder command, a private CLOEXEC anonymous pipe into the existing signed32 native ReplayGain observer, the existing supervised `ToolRunner`, one separately charged FFmpeg token per meter, a maximum of two album-local meters with shared 256-MiB statistics storage, strict physical-source generation/complete-cohort checks, and the existing manifest-ordered native album reducer and metadata/publication stage. On any source-meter error it discards the entire optional scan, leaves successful conversion outputs untouched and preserves native post-output measurement; failures in metadata application remain fatal. No S1, planner, publisher, UI, or default routing edits.
+
+**Verification distinction:** Exact accepted input and source-scope static gate PASS; 25 independent FFmpeg exact-range byte comparisons PASS. No Rust compiler/formatter is available: **cargo fmt, all Rust tests (including named `cue_ip07`), native app-level RG/tag/album, cancellation/FD/RSS, real publication and full workspace gates NOT RUN.** Do not treat the standalone range fixture as a successful new Rust source meter. Host **must** test the candidate and accept its exact SHA before attempting IP-06. Preserve the unchanged accepted IP-05 tar in the user-attached packet as rollback and use the **appended IP-06 sequencing amendment** (IP-05 -> IP-07 -> IP-06), not the superseded pre-IP-07 original IP-06 order. If any host gate fails, issue a narrow IP-07 corrective archive; keep S3 OFF.
+
+---
+
 # CURRENT IP-05 corrective handoff — 2026-10-25
 
 **Correction D-01/D-02:** Added the full authored CUE count to the group-level
