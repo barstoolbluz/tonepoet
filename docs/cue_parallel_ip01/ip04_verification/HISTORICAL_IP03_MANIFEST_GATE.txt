@@ -1,0 +1,16 @@
+EXPECTED FAIL on newer IP-04 source (historical IP-03 SHA/source manifest):
+Traceback (most recent call last):
+  File "/mnt/data/ip04_work/tonepoet/docs/cue_parallel_ip01/ip03_verification/verify_static_ip03.py", line 148, in <module>
+    main()
+    ~~~~^^
+  File "/mnt/data/ip04_work/tonepoet/docs/cue_parallel_ip01/ip03_verification/verify_static_ip03.py", line 75, in main
+    assert_source_entries(manifest['entries'], entries)
+    ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/data/ip04_work/tonepoet/docs/cue_parallel_ip01/ip03_verification/verify_static_ip03.py", line 57, in assert_source_entries
+    expect(comparable_entry(expected) == comparable_entry(actual),
+    ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+           f'source manifest identity differs: {path}')
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/data/ip04_work/tonepoet/docs/cue_parallel_ip01/ip03_verification/verify_static_ip03.py", line 32, in expect
+    raise AssertionError(message)
+AssertionError: source manifest identity differs: src/convert/pipeline/cue_flac_range.rs

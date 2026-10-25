@@ -1,0 +1,11 @@
+test_added_executable_grants_fail (__main__.VerificationIdentityTests.test_added_executable_grants_fail) ... ok
+test_changing_bytes_or_owner_executable_bit_fails (__main__.VerificationIdentityTests.test_changing_bytes_or_owner_executable_bit_fails) ... ok
+test_diff_normalization_preserves_content_and_execute_changes (__main__.VerificationIdentityTests.test_diff_normalization_preserves_content_and_execute_changes) ... ok
+test_inventory_changes_fail (__main__.VerificationIdentityTests.test_inventory_changes_fail) ... ok
+test_symlink_target_and_file_type_are_checked (__main__.VerificationIdentityTests.test_symlink_target_and_file_type_are_checked) ... ok
+test_umask_022_and_077_preserve_file_identity (__main__.VerificationIdentityTests.test_umask_022_and_077_preserve_file_identity) ... ok
+
+----------------------------------------------------------------------
+Ran 6 tests in 0.000s
+
+OK

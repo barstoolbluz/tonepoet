@@ -1,3 +1,9 @@
+# IP-04 verification checkpoint — 2026-10-24
+
+Exact input SHA-256 confirmed; IP-03 static-unit helper 6/6 PASS; independent 16-/24-bit FFmpeg range probe 42/42 exact PCM PASS, bounded 4 native child high-water (Python, not Rust); no Rust compiler and therefore **NO RUST FORMAT, BUILD OR TEST RESULTS**. Old IP-03 source-manifest verifier is expected to fail on this new tree and is not the IP-04 gate. `ip04_verification/VERIFICATION_RESULTS.md` documents command-by-command results and mandatory owner-host gates. **State implemented-unqualified; S1 remains live.**
+
+---
+
 # IP-03 verification current state — 2026-10-24
 
 **Status:** `implemented-unqualified`; NO Rust compile/fmt/host supervised process qualification. Source identity `d8c25d3` supplied and input SHA matched. Full archive checksum and manifest are in `ip03_verification` and the separately distributed external delivery receipt.

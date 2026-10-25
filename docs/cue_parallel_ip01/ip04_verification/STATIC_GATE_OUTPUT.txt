@@ -1,0 +1,5 @@
+PASS IP04 static identity: 1260 entries, 1260 files
+PASS IP04 source scope: 4 Rust modules, 9 named tests present (NOT RUN)
+PASS IP04 native independent evidence: 6 quick, 42 full and 3 gap PCM range checks
+PASS source-diff receipt; host Rust compile/tests remain NOT RUN
+Static checks are NOT Rust test qualification; the final archive SHA-256 is in its external delivery receipt.

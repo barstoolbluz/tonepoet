@@ -1,3 +1,16 @@
+# Current corrective IP-04 status — October 25, 2026
+
+**`implemented-unqualified` / S3 OFF / NOT ACCEPTED.** The prior IP-04 candidate `662379ddebf6` received a three-defect audit. Corrected D-01 test type mismatch, D-02 causal verified-pipe/peer-record attribution, and added the D-03 async attributed private coordinator regression. Production differences from prior candidate are confined to `tool.rs` and tests/type assertion in `stages.rs`; accepted IP-03 input and the normal S1 route remain unchanged. Offline native three-gap PCM probe passed, but all Rust compilation and runtime gates remain **NOT RUN**. See `ip04_verification/CORRECTIVE_D01_D03_2026-10-25.md` and the new external archive delivery receipt for actual candidate SHA. Host approval remains mandatory before IP-05.
+---
+
+# Current cumulative checkpoint — IP-04 (October 24, 2026)
+
+**`implemented-unqualified` / NOT ACCEPTED.** The user-supplied accepted IP-03 input is `TonePoet_SNAPSHOT_c1103be_2026-10-24.tar.gz`, SHA-256 `fc3ea07b6a8ffac0b21f366b50e01693ee6b0b626a89749f551f964bcda815d7`, reported commit `c1103be`. The earlier IP-03 in-archive checkpoint below predates the later host acceptance letter and is retained as historical evidence.
+
+IP-04 implements an inert, private, all-member-preflight FLAC range worker. It reuses the accepted IP-02 exact FLAC ranged source and the IP-03 weighted admission guard, adding the exact producer stdout verifier on a **supervised 64-KiB buffered pipe** before the decoder's PCM reaches the encoder. Existing planner, metadata, staged finalizer, per-track records, S1 route and publisher are unchanged in behavior. No user routing activation, retry or ReplayGain/tag work is attempted. All 42 independently simulated native range PCM comparisons passed (12 x16-bit and 30 x24-bit), but **cargo/rustc/rustfmt are unavailable**, so all Rust tests and full compatibility remain **NOT RUN**. See `ip04_verification/` for audited source diff/manifest, direct native data and host acceptance gates. Next: host qualification of IP-04; IP-05 only after owner acceptance.
+
+---
+
 # Current checkpoint — IP-03 (October 24, 2026)
 
 **State: `implemented-unqualified` — NOT ACCEPTED, S3 remains OFF.** This section is the current cumulative status. The original IP-01 R2 corrective ledger is preserved below as historical evidence, not as the current next-packet instruction.

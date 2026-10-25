@@ -11747,6 +11747,7 @@ pub(crate) async fn run_cue_s3_pipeline_if_admitted(
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     limits: &Arc<ToolConcurrencyLimits>,
+    exact_pcm_extent: Option<super::cue_flac_range::ExactPcmExtent>,
 ) -> Result<CueS3PipelineAttempt, ConvertError> {
     let Some(_permits) =
         try_acquire_cue_s3_pipeline_permits(&producer, &mut consumer, limits, cancel)?
@@ -11755,9 +11756,15 @@ pub(crate) async fn run_cue_s3_pipeline_if_admitted(
     };
     // No second acquisition through run_tool_command_with_concurrency or the
     // Reference pipeline helper. Both actual children are charged above.
-    Ok(CueS3PipelineAttempt::Executed(
-        runner.run_pipeline(producer, consumer, cancel).await,
-    ))
+    // The private IP-04 caller supplies the independent IP-02 extent; other
+    // IP-03 admission probes preserve their original unchecked test route.
+    let result = match exact_pcm_extent {
+        Some(extent) => runner.run_pipeline_with_exact_pcm_extent(
+            producer, consumer, extent, cancel,
+        ).await,
+        None => runner.run_pipeline(producer, consumer, cancel).await,
+    };
+    Ok(CueS3PipelineAttempt::Executed(result))
 }
 
 async fn acquire_reference_pipeline_permits(
@@ -15328,6 +15335,7 @@ mod tests {
             runner.as_ref(),
             &cancel,
             &limits,
+            None,
         )
         .await
         .expect("no-capacity admission is a normal refusal");
@@ -15346,6 +15354,7 @@ mod tests {
                 worker_runner.as_ref(),
                 &CancellationToken::new(),
                 &worker_limits,
+                None,
             )
             .await
         });
@@ -15387,6 +15396,7 @@ mod tests {
             runner.as_ref(),
             &cancel,
             &limits,
+            None,
         )
         .await
         .expect("one FFmpeg permit is insufficient for two children");
@@ -15403,6 +15413,7 @@ mod tests {
                 worker_runner.as_ref(),
                 &CancellationToken::new(),
                 &worker_limits,
+                None,
             )
             .await
         });
@@ -15439,6 +15450,7 @@ mod tests {
             runner.as_ref(),
             &cancel,
             &limits,
+            None,
         )
         .await
         .expect("partial admission is an ordinary refusal");
@@ -15455,6 +15467,7 @@ mod tests {
             runner.as_ref(),
             &cancel,
             &limits,
+            None,
         )
         .await
         .expect("SoX contention declines");
@@ -15486,6 +15499,7 @@ mod tests {
                 runner.as_ref(),
                 &cancel,
                 &limits,
+                None,
             )
             .await,
             Err(ConvertError::Realize(message)) if message == "cancelled"
@@ -15514,6 +15528,7 @@ mod tests {
                     worker_runner.as_ref(),
                     &CancellationToken::new(),
                     &worker_limits,
+                    None,
                 )
                 .await
             }));
@@ -15534,6 +15549,7 @@ mod tests {
             runner.as_ref(),
             &cancel,
             &limits,
+            None,
         )
         .await
         .expect("cap exhaustion is not a conversion error");
@@ -15595,6 +15611,7 @@ mod tests {
                     worker_runner.as_ref(),
                     &worker_cancel,
                     &worker_limits,
+                    None,
                 )
                 .await
             });
@@ -15673,6 +15690,7 @@ mod tests {
                 runner.as_ref(),
                 &cancel,
                 &limits,
+                None,
             )
             .await,
             Err(ConvertError::Backend(_))
@@ -15685,6 +15703,7 @@ mod tests {
                 runner.as_ref(),
                 &cancel,
                 &limits,
+                None,
             )
             .await,
             Err(ConvertError::Backend(_))
@@ -15714,6 +15733,7 @@ mod tests {
             Duration::from_secs(20),
             run_cue_s3_pipeline_if_admitted(
                 producer, consumer, &runner, &CancellationToken::new(), &limits,
+                None,
             ),
         )
         .await
@@ -15750,6 +15770,7 @@ mod tests {
             Duration::from_secs(20),
             run_cue_s3_pipeline_if_admitted(
                 producer, consumer, &runner, &CancellationToken::new(), &limits,
+                None,
             ),
         )
         .await
@@ -15794,6 +15815,7 @@ mod tests {
         let worker = tokio::spawn(async move {
             run_cue_s3_pipeline_if_admitted(
                 producer, consumer, worker_runner.as_ref(), &worker_cancel, &worker_limits,
+                None,
             )
             .await
         });

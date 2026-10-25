@@ -1,0 +1,1460 @@
+--- a/src/convert/pipeline/cue_flac_range.rs
++++ b/src/convert/pipeline/cue_flac_range.rs
+@@ -117,6 +117,13 @@
+ }
+ 
+ impl ExactPcmExtent {
++    /// Explicitly constructed for tests and the typed verified-pipe runner.
++    /// The production caller obtains this from a prepared, source-qualified
++    /// `CueFlacRangeDecoder` instead of fabricating its expected extent.
++    pub(crate) fn for_expected_bytes(expected: u64) -> Self {
++        Self { expected, observed: 0 }
++    }
++
+     pub fn observe_bytes(&mut self, amount: usize) -> Result<(), CueFlacRangeError> {
+         let next = self
+             .observed
+@@ -236,10 +243,7 @@
+     }
+ 
+     pub fn extent_verifier(&self) -> ExactPcmExtent {
+-        ExactPcmExtent {
+-            expected: self.expected_bytes,
+-            observed: 0,
+-        }
++        ExactPcmExtent::for_expected_bytes(self.expected_bytes)
+     }
+ 
+     /// Check FLAC frame CRC: `explode` alone does NOT enable CRC verification.
+--- a/src/convert/pipeline/tool.rs
++++ b/src/convert/pipeline/tool.rs
+@@ -530,6 +530,24 @@
+         &self,
+         _producer: ToolCommand,
+         _consumer: ToolCommand,
++        _cancel: &CancellationToken,
++    ) -> Result<ToolPipelineOutput, ToolPipelineError> {
++        Err(ToolPipelineError {
++            error: ToolRunnerError::UnsupportedPipeline,
++            other_commands: Vec::new(),
++        })
++    }
++
++    /// IP-04 private S3 transport: the same two supervised children as
++    /// `run_pipeline`, but transfer every producer byte through IP-02's
++    /// independent exact-extent verifier before writing to the consumer.
++    /// A runner without this capability must fail closed, never fall back
++    /// to an unverified pipe or claim that a successful exit proves length.
++    async fn run_pipeline_with_exact_pcm_extent(
++        &self,
++        _producer: ToolCommand,
++        _consumer: ToolCommand,
++        _extent: super::cue_flac_range::ExactPcmExtent,
+         _cancel: &CancellationToken,
+     ) -> Result<ToolPipelineOutput, ToolPipelineError> {
+         Err(ToolPipelineError {
+@@ -1572,6 +1590,38 @@
+         | ToolRunnerError::Termination { command, .. }
+         | ToolRunnerError::NonZeroExit { command, .. } => Some(command.clone()),
+         ToolRunnerError::UnsupportedPipeline | ToolRunnerError::Io(_) => None,
++    }
++}
++
++// A supervisor may return Io without a command record. Select the other
++// child's record by its role, never by position in a filtered record vector.
++#[cfg(unix)]
++fn verified_pipe_record(result: &Result<ToolOutput, ToolRunnerError>) -> Option<CommandRecord> {
++    match result {
++        Ok(output) => Some(output.command.clone()),
++        Err(error) => command_record_from_runner_error(error),
++    }
++}
++
++#[cfg(unix)]
++#[derive(Clone, Copy)]
++enum VerifiedPipeFault {
++    Producer,
++    Consumer,
++    Transfer,
++}
++
++#[cfg(unix)]
++fn verified_pipe_other_commands(
++    fault: VerifiedPipeFault,
++    producer: &Result<ToolOutput, ToolRunnerError>,
++    consumer: &Result<ToolOutput, ToolRunnerError>,
++) -> Vec<CommandRecord> {
++    match fault {
++        VerifiedPipeFault::Producer => verified_pipe_record(consumer).into_iter().collect(),
++        VerifiedPipeFault::Consumer => verified_pipe_record(producer).into_iter().collect(),
++        VerifiedPipeFault::Transfer => [verified_pipe_record(producer), verified_pipe_record(consumer)]
++            .into_iter().flatten().collect(),
+     }
+ }
+ 
+@@ -2417,6 +2467,214 @@
+         }
+     }
+ 
++    async fn run_pipeline_with_exact_pcm_extent(
++        &self,
++        producer: ToolCommand,
++        consumer: ToolCommand,
++        mut extent: super::cue_flac_range::ExactPcmExtent,
++        cancel: &CancellationToken,
++    ) -> Result<ToolPipelineOutput, ToolPipelineError> {
++        // Keep the established (unverified) run_pipeline entirely untouched.
++        // This extra supervised transport is private to S3, and has only two
++        // bounded OS pipes and one fixed-size transfer buffer per worker.
++        #[cfg(unix)]
++        {
++            if producer.environment_policy == CommandEnvironmentPolicy::InheritAndSet {
++                let _ = self.tool_version(producer.binary);
++            }
++            if consumer.environment_policy == CommandEnvironmentPolicy::InheritAndSet {
++                let _ = self.tool_version(consumer.binary);
++            }
++            let producer_path = resolve_command_launch_path(
++                self.resolve_binary(producer.binary), producer.environment_policy,
++            ).map_err(|error| ToolPipelineError {
++                error: ToolRunnerError::Io(error), other_commands: Vec::new(),
++            })?;
++            let consumer_path = resolve_command_launch_path(
++                self.resolve_binary(consumer.binary), consumer.environment_policy,
++            ).map_err(|error| ToolPipelineError {
++                error: ToolRunnerError::Io(error), other_commands: Vec::new(),
++            })?;
++            let (producer_read, producer_write) = create_cloexec_pipe().map_err(|error| {
++                ToolPipelineError { error: ToolRunnerError::Io(error), other_commands: Vec::new() }
++            })?;
++            let (consumer_read, consumer_write) = create_cloexec_pipe().map_err(|error| {
++                ToolPipelineError { error: ToolRunnerError::Io(error), other_commands: Vec::new() }
++            })?;
++            // The subprocess supervisors hold their execution capability,
++            // process group and descriptor ownership just as in run_pipeline.
++            // On *any* transfer or child failure, cancel and await BOTH peers.
++            let pipeline_cancel = CancellationToken::new();
++            let producer_future = self.run_supervised_with_stdio(
++                producer, producer_path, &pipeline_cancel,
++                None, Some(Arc::new(producer_write)), None,
++            );
++            let consumer_future = self.run_supervised_with_stdio(
++                consumer, consumer_path, &pipeline_cancel,
++                Some(Arc::new(consumer_read)), None, None,
++            );
++            let transfer_future = async {
++                let mut reader = tokio::fs::File::from_std(producer_read);
++                let mut writer = tokio::fs::File::from_std(consumer_write);
++                let mut bytes = [0_u8; 64 * 1024];
++                loop {
++                    let count = tokio::select! {
++                        _ = pipeline_cancel.cancelled() => {
++                            return Err(std::io::Error::new(
++                                std::io::ErrorKind::Interrupted, "S3 verified PCM transfer cancelled",
++                            ));
++                        }
++                        result = reader.read(&mut bytes) => result?,
++                    };
++                    if count == 0 { break; }
++                    // Fail surplus BEFORE forwarding it. On EOF fail a short
++                    // stream, even if both tools otherwise report exit code 0.
++                    extent.observe_bytes(count).map_err(|error| {
++                        std::io::Error::new(std::io::ErrorKind::InvalidData, error)
++                    })?;
++                    tokio::select! {
++                        _ = pipeline_cancel.cancelled() => {
++                            return Err(std::io::Error::new(
++                                std::io::ErrorKind::Interrupted, "S3 verified PCM transfer cancelled",
++                            ));
++                        }
++                        result = writer.write_all(&bytes[..count]) => result?,
++                    }
++                }
++                extent.finish().map_err(|error| {
++                    std::io::Error::new(std::io::ErrorKind::UnexpectedEof, error)
++                })?;
++                // EOF is observable by the consumer only after the last
++                // verified byte and this writer have both been released.
++                drop(writer);
++                Ok::<(), std::io::Error>(())
++            };
++            tokio::pin!(producer_future);
++            tokio::pin!(consumer_future);
++            tokio::pin!(transfer_future);
++            let mut producer_result = None;
++            let mut consumer_result = None;
++            let mut transfer_result = None;
++            let mut first_fault = None;
++            let mut externally_cancelled = false;
++            while producer_result.is_none() || consumer_result.is_none() || transfer_result.is_none() {
++                tokio::select! {
++                    biased;
++                    _ = cancel.cancelled(), if !externally_cancelled => {
++                        externally_cancelled = true;
++                        pipeline_cancel.cancel();
++                    }
++                    result = &mut transfer_future, if transfer_result.is_none() => {
++                        if let Err(error) = &result {
++                            if error.kind() == std::io::ErrorKind::BrokenPipe
++                                && consumer_result.is_none()
++                            {
++                                // The consumer has closed stdin. Its supervisor
++                                // may still be draining stderr and reporting its
++                                // causal exit. Give that *existing* supervisor a
++                                // bounded opportunity to finish before cancelling
++                                // both children; do not delay short/surplus errors.
++                                let settled = tokio::select! {
++                                    _ = cancel.cancelled() => {
++                                        externally_cancelled = true;
++                                        None
++                                    }
++                                    result = tokio::time::timeout(
++                                        Duration::from_millis(750), &mut consumer_future,
++                                    ) => result.ok(),
++                                };
++                                if let Some(result) = settled {
++                                    if matches!(result, Err(
++                                        ToolRunnerError::NonZeroExit { .. }
++                                        | ToolRunnerError::Spawn { .. }
++                                        | ToolRunnerError::Timeout { .. }
++                                        | ToolRunnerError::Termination { .. }
++                                    )) {
++                                        first_fault.get_or_insert(VerifiedPipeFault::Consumer);
++                                    }
++                                    consumer_result = Some(result);
++                                }
++                            }
++                            first_fault.get_or_insert(VerifiedPipeFault::Transfer);
++                            pipeline_cancel.cancel();
++                        }
++                        transfer_result = Some(result);
++                    }
++                    result = &mut consumer_future, if consumer_result.is_none() => {
++                        if result.is_err() {
++                            first_fault.get_or_insert(VerifiedPipeFault::Consumer);
++                            pipeline_cancel.cancel();
++                        }
++                        consumer_result = Some(result);
++                    }
++                    result = &mut producer_future, if producer_result.is_none() => {
++                        if result.is_err() {
++                            first_fault.get_or_insert(VerifiedPipeFault::Producer);
++                            pipeline_cancel.cancel();
++                        }
++                        producer_result = Some(result);
++                    }
++                }
++            }
++            let producer_result = producer_result.expect("supervised producer settled");
++            let consumer_result = consumer_result.expect("supervised consumer settled");
++            let transfer_result = transfer_result.expect("verified transfer settled");
++
++            // Exact extent violations always outrank the cancellations they
++            // induce. An independently observed consumer nonzero exit, however,
++            // is the cause of a downstream BrokenPipe (not a verifier failure).
++            if externally_cancelled {
++                let records = verified_pipe_other_commands(
++                    VerifiedPipeFault::Transfer, &producer_result, &consumer_result,
++                );
++                let error = producer_result.err()
++                    .or_else(|| consumer_result.err())
++                    .unwrap_or_else(|| ToolRunnerError::Io(std::io::Error::new(
++                        std::io::ErrorKind::Interrupted, "S3 pipeline cancelled",
++                    )));
++                return Err(ToolPipelineError { error, other_commands: records });
++            }
++            let Some(mut primary) = first_fault else {
++                return match (producer_result, consumer_result, transfer_result) {
++                    (Ok(producer), Ok(consumer), Ok(())) => {
++                        Ok(ToolPipelineOutput { producer, consumer })
++                    }
++                    _ => unreachable!("S3 completed with no first fault"),
++                };
++            };
++            if matches!(primary, VerifiedPipeFault::Transfer)
++                && matches!(&transfer_result, Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe)
++                && matches!(&consumer_result, Err(
++                    ToolRunnerError::NonZeroExit { .. }
++                    | ToolRunnerError::Spawn { .. }
++                    | ToolRunnerError::Timeout { .. }
++                    | ToolRunnerError::Termination { .. }
++                ))
++            {
++                primary = VerifiedPipeFault::Consumer;
++            }
++            let other_commands = verified_pipe_other_commands(
++                primary, &producer_result, &consumer_result,
++            );
++            let error = match primary {
++                VerifiedPipeFault::Transfer => {
++                    ToolRunnerError::Io(transfer_result.expect_err("transfer failed"))
++                }
++                VerifiedPipeFault::Producer => producer_result.err().expect("producer failed"),
++                VerifiedPipeFault::Consumer => consumer_result.err().expect("consumer failed"),
++            };
++            Err(ToolPipelineError { error, other_commands })
++        }
++        #[cfg(not(unix))]
++        {
++            let _ = (producer, consumer, extent, cancel);
++            Err(ToolPipelineError {
++                error: ToolRunnerError::UnsupportedPipeline,
++                other_commands: Vec::new(),
++            })
++        }
++    }
++
+     async fn run_segmented_pipeline(
+         &self,
+         producer: ToolCommand,
+@@ -5094,4 +5352,192 @@
+             "version probe should avoid pipe backpressure and complete promptly, took {elapsed:?}"
+         );
+     }
+-}
++
++    #[cfg(unix)]
++    fn cue_ip04_test_commands(
++        producer_script: PathBuf,
++        consumer_script: PathBuf,
++        consumer_args: Vec<String>,
++    ) -> (RealToolRunner, ToolCommand, ToolCommand) {
++        let mut paths = HashMap::new();
++        paths.insert(ToolBinary::Ffmpeg.canonical_name().to_string(), producer_script);
++        paths.insert(ToolBinary::Sox.canonical_name().to_string(), consumer_script);
++        (
++            RealToolRunner::new(paths),
++            closed_command(ToolBinary::Ffmpeg, vec![], Duration::from_secs(5)),
++            closed_command(ToolBinary::Sox, consumer_args, Duration::from_secs(5)),
++        )
++    }
++
++    #[cfg(unix)]
++    #[tokio::test]
++    async fn cue_ip04_supervised_exact_pipe_rejects_short_and_surplus_and_proves_success() {
++        let consumer = write_executable_test_script(
++            "cue-ip04-verified-consumer",
++            "#!/bin/sh\nexec /bin/cat > \"$1\"\n",
++        );
++        for (case, body, expected, success) in [
++            ("exact", "#!/bin/sh\nprintf 'abcdefgh'\n", 8_u64, true),
++            ("short", "#!/bin/sh\nprintf 'abcdefg'\n", 8, false),
++            ("surplus", "#!/bin/sh\nprintf 'abcdefghi'\n", 8, false),
++            ("zero", "#!/bin/sh\nprintf 'abcdefgh'\n", 0, false),
++        ] {
++            let temp = tempfile::tempdir().unwrap();
++            let out = temp.path().join("private-output.bin");
++            let producer = write_executable_test_script(
++                &format!("cue-ip04-producer-{case}"), body,
++            );
++            let (runner, producer_cmd, consumer_cmd) = cue_ip04_test_commands(
++                producer, consumer.clone(), vec![out.display().to_string()],
++            );
++            let result = tokio::time::timeout(
++                Duration::from_secs(4),
++                runner.run_pipeline_with_exact_pcm_extent(
++                    producer_cmd, consumer_cmd,
++                    super::super::cue_flac_range::ExactPcmExtent::for_expected_bytes(expected),
++                    &CancellationToken::new(),
++                ),
++            ).await.expect("verified pipe settled without deadlock");
++            if success {
++                let output = result.expect("exact transfer must succeed");
++                assert_eq!(output.producer.exit, ProcessExit::Code(0));
++                assert_eq!(output.consumer.exit, ProcessExit::Code(0));
++                assert_eq!(std::fs::read(&out).unwrap(), b"abcdefgh");
++            } else {
++                let error = result.expect_err("count mismatch must fail pipeline");
++                assert!(matches!(error.error, ToolRunnerError::Io(_)
++                    | ToolRunnerError::Cancelled { .. }
++                    | ToolRunnerError::Termination { .. }), "{error:?}");
++                assert!(!error.other_commands.is_empty(), "real child records survive failure");
++            }
++        }
++    }
++
++    #[cfg(unix)]
++    #[tokio::test]
++    async fn cue_ip04_supervised_exact_pipe_reaps_both_on_consumer_error_and_cancel() {
++        let producer = write_executable_test_script(
++            "cue-ip04-endless-producer", "#!/bin/sh\nexec /bin/dd if=/dev/zero bs=65536 2>/dev/null\n",
++        );
++        let consumer = write_executable_test_script(
++            "cue-ip04-early-consumer",
++            "#!/bin/sh\nprintf 'cue-ip04-encoder-refused\n' >&2\nexit 7\n",
++        );
++        let (runner, source, sink) = cue_ip04_test_commands(
++            producer.clone(), consumer, vec![],
++        );
++        let error = tokio::time::timeout(Duration::from_secs(4),
++            runner.run_pipeline_with_exact_pcm_extent(
++                source, sink,
++                super::super::cue_flac_range::ExactPcmExtent::for_expected_bytes(500_000),
++                &CancellationToken::new(),
++            ),
++        ).await.expect("early encoder exit cannot deadlock").expect_err("early failure");
++        match error.error {
++            ToolRunnerError::NonZeroExit {
++                exit: ProcessExit::Code(7), stderr_tail, command,
++            } => {
++                assert!(stderr_tail.contains("cue-ip04-encoder-refused"));
++                assert!(command.stderr_tail.contains("cue-ip04-encoder-refused"));
++                assert_eq!(command.binary, ToolBinary::Sox);
++            }
++            other => panic!("encoder exit code 7 must remain causal: {other:?}"),
++        }
++        assert!(error.other_commands.iter().any(|record|
++            record.binary == ToolBinary::Ffmpeg), "producer record retained");
++
++        let consumer = write_executable_test_script(
++            "cue-ip04-slow-consumer", "#!/bin/sh\nexec /bin/cat >/dev/null\n",
++        );
++        let (runner, source, sink) = cue_ip04_test_commands(producer, consumer, vec![]);
++        let cancel = CancellationToken::new();
++        let cancelling = cancel.clone();
++        let future = runner.run_pipeline_with_exact_pcm_extent(
++            source, sink,
++            super::super::cue_flac_range::ExactPcmExtent::for_expected_bytes(u64::MAX),
++            &cancel,
++        );
++        let trigger = async move {
++            tokio::time::sleep(Duration::from_millis(80)).await;
++            cancelling.cancel();
++        };
++        let (result, ()) = tokio::time::timeout(
++            Duration::from_secs(4), async { tokio::join!(future, trigger) },
++        ).await.expect("cancellation reaps the supervised pipeline");
++        assert!(result.is_err(), "cancelled transfer cannot produce an artifact");
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn cue_ip04_supervised_exact_pipe_retains_peer_when_primary_has_no_command() {
++        let producer = Err(ToolRunnerError::Io(std::io::Error::other(
++            "producer failed before recording a command",
++        )));
++        let consumer_cmd = closed_command(ToolBinary::Sox, vec![], Duration::from_secs(5));
++        let consumer_record = RealToolRunner::build_record(
++            &consumer_cmd, Some(ProcessExit::Code(0)), "sink-ok", "sink-stderr",
++            Duration::from_millis(12),
++        );
++        let consumer = Ok(ToolOutput {
++            exit: ProcessExit::Code(0),
++            stdout_tail: "sink-ok".to_string(),
++            stderr_tail: "sink-stderr".to_string(),
++            elapsed: Duration::from_millis(12),
++            command: consumer_record.clone(),
++        });
++        let peers = verified_pipe_other_commands(
++            VerifiedPipeFault::Producer, &producer, &consumer,
++        );
++        assert_eq!(peers.len(), 1);
++        assert_eq!(peers[0].binary, ToolBinary::Sox);
++        assert_eq!(peers[0].stdout_tail, "sink-ok");
++        assert_eq!(peers[0].stderr_tail, "sink-stderr");
++        assert_eq!(peers[0].sanitized_args, consumer_record.sanitized_args);
++
++        let reverse = verified_pipe_other_commands(
++            VerifiedPipeFault::Consumer, &consumer, &producer,
++        );
++        assert_eq!(reverse.len(), 1, "reverse role must retain its healthy peer");
++        assert_eq!(reverse[0].binary, ToolBinary::Sox);
++    }
++
++    #[cfg(unix)]
++    #[tokio::test]
++    async fn cue_ip04_supervised_exact_pipe_preserves_tool_failures_and_stderr_load() {
++        let producer = write_executable_test_script(
++            "cue-ip04-nonzero-producer",
++            "#!/bin/sh\nprintf 'abcdefgh'\nexit 9\n",
++        );
++        let consumer = write_executable_test_script(
++            "cue-ip04-sink", "#!/bin/sh\nexec /bin/cat >/dev/null\n",
++        );
++        let (runner, source, sink) = cue_ip04_test_commands(
++            producer, consumer.clone(), vec![],
++        );
++        let result = runner.run_pipeline_with_exact_pcm_extent(
++            source, sink,
++            super::super::cue_flac_range::ExactPcmExtent::for_expected_bytes(8),
++            &CancellationToken::new(),
++        ).await.expect_err("full byte extent with nonzero decoder still fails");
++        assert!(matches!(result.error, ToolRunnerError::NonZeroExit { .. }));
++        assert!(!result.other_commands.is_empty());
++
++        let producer = write_executable_test_script(
++            "cue-ip04-stderr-producer",
++            "#!/bin/sh\n/bin/dd if=/dev/zero bs=1024 count=256 2>/dev/null >&2\nprintf 'abcdefgh'\n",
++        );
++        let (runner, source, sink) = cue_ip04_test_commands(
++            producer, consumer, vec![],
++        );
++        let output = tokio::time::timeout(Duration::from_secs(4),
++            runner.run_pipeline_with_exact_pcm_extent(
++                source, sink,
++                super::super::cue_flac_range::ExactPcmExtent::for_expected_bytes(8),
++                &CancellationToken::new(),
++            ),
++        ).await.expect("stderr load cannot deadlock").expect("exact PCM despite stderr load");
++        assert_eq!(output.producer.exit, ProcessExit::Code(0));
++        assert!(output.producer.stderr_tail.len() <= TOOL_OUTPUT_TAIL_BYTES);
++    }
++
++}
+--- a/src/convert/pipeline/track_executor.rs
++++ b/src/convert/pipeline/track_executor.rs
+@@ -11747,6 +11747,7 @@
+     runner: &dyn ToolRunner,
+     cancel: &CancellationToken,
+     limits: &Arc<ToolConcurrencyLimits>,
++    exact_pcm_extent: Option<super::cue_flac_range::ExactPcmExtent>,
+ ) -> Result<CueS3PipelineAttempt, ConvertError> {
+     let Some(_permits) =
+         try_acquire_cue_s3_pipeline_permits(&producer, &mut consumer, limits, cancel)?
+@@ -11755,9 +11756,15 @@
+     };
+     // No second acquisition through run_tool_command_with_concurrency or the
+     // Reference pipeline helper. Both actual children are charged above.
+-    Ok(CueS3PipelineAttempt::Executed(
+-        runner.run_pipeline(producer, consumer, cancel).await,
+-    ))
++    // The private IP-04 caller supplies the independent IP-02 extent; other
++    // IP-03 admission probes preserve their original unchecked test route.
++    let result = match exact_pcm_extent {
++        Some(extent) => runner.run_pipeline_with_exact_pcm_extent(
++            producer, consumer, extent, cancel,
++        ).await,
++        None => runner.run_pipeline(producer, consumer, cancel).await,
++    };
++    Ok(CueS3PipelineAttempt::Executed(result))
+ }
+ 
+ async fn acquire_reference_pipeline_permits(
+@@ -15328,6 +15335,7 @@
+             runner.as_ref(),
+             &cancel,
+             &limits,
++            None,
+         )
+         .await
+         .expect("no-capacity admission is a normal refusal");
+@@ -15346,6 +15354,7 @@
+                 worker_runner.as_ref(),
+                 &CancellationToken::new(),
+                 &worker_limits,
++                None,
+             )
+             .await
+         });
+@@ -15387,6 +15396,7 @@
+             runner.as_ref(),
+             &cancel,
+             &limits,
++            None,
+         )
+         .await
+         .expect("one FFmpeg permit is insufficient for two children");
+@@ -15403,6 +15413,7 @@
+                 worker_runner.as_ref(),
+                 &CancellationToken::new(),
+                 &worker_limits,
++                None,
+             )
+             .await
+         });
+@@ -15439,6 +15450,7 @@
+             runner.as_ref(),
+             &cancel,
+             &limits,
++            None,
+         )
+         .await
+         .expect("partial admission is an ordinary refusal");
+@@ -15455,6 +15467,7 @@
+             runner.as_ref(),
+             &cancel,
+             &limits,
++            None,
+         )
+         .await
+         .expect("SoX contention declines");
+@@ -15486,6 +15499,7 @@
+                 runner.as_ref(),
+                 &cancel,
+                 &limits,
++                None,
+             )
+             .await,
+             Err(ConvertError::Realize(message)) if message == "cancelled"
+@@ -15514,6 +15528,7 @@
+                     worker_runner.as_ref(),
+                     &CancellationToken::new(),
+                     &worker_limits,
++                    None,
+                 )
+                 .await
+             }));
+@@ -15534,6 +15549,7 @@
+             runner.as_ref(),
+             &cancel,
+             &limits,
++            None,
+         )
+         .await
+         .expect("cap exhaustion is not a conversion error");
+@@ -15595,6 +15611,7 @@
+                     worker_runner.as_ref(),
+                     &worker_cancel,
+                     &worker_limits,
++                    None,
+                 )
+                 .await
+             });
+@@ -15673,6 +15690,7 @@
+                 runner.as_ref(),
+                 &cancel,
+                 &limits,
++                None,
+             )
+             .await,
+             Err(ConvertError::Backend(_))
+@@ -15685,6 +15703,7 @@
+                 runner.as_ref(),
+                 &cancel,
+                 &limits,
++                None,
+             )
+             .await,
+             Err(ConvertError::Backend(_))
+@@ -15714,6 +15733,7 @@
+             Duration::from_secs(20),
+             run_cue_s3_pipeline_if_admitted(
+                 producer, consumer, &runner, &CancellationToken::new(), &limits,
++                None,
+             ),
+         )
+         .await
+@@ -15750,6 +15770,7 @@
+             Duration::from_secs(20),
+             run_cue_s3_pipeline_if_admitted(
+                 producer, consumer, &runner, &CancellationToken::new(), &limits,
++                None,
+             ),
+         )
+         .await
+@@ -15794,6 +15815,7 @@
+         let worker = tokio::spawn(async move {
+             run_cue_s3_pipeline_if_admitted(
+                 producer, consumer, worker_runner.as_ref(), &worker_cancel, &worker_limits,
++                None,
+             )
+             .await
+         });
+--- a/src/convert/pipeline/stages.rs
++++ b/src/convert/pipeline/stages.rs
+@@ -8,7 +8,7 @@
+ //! `map_album_outcome` are real implementations in PR 1 — they are
+ //! pure logic and are exercised by PR 1's exit-condition tests.
+ 
+-use std::collections::{BTreeMap, BTreeSet, HashMap};
++use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+ use std::path::{Component, Path, PathBuf};
+ use std::sync::{Arc, Mutex, OnceLock};
+ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+@@ -66,6 +66,7 @@
+ #[cfg(all(test, target_os = "linux"))]
+ use super::actions::{ScriptInvocation, ScriptOutcome};
+ use super::materializer_archive::ArchiveMaterializer;
++use super::cue_flac_range::{CueFlacRangeDecoder, CueFlacRangeRequest};
+ use super::materializer_cue::{
+     cue_streaming_scratch_facts, is_cue_image_candidate, CueImageMaterializer,
+     CueStreamingScratchFacts,
+@@ -90,6 +91,7 @@
+     finalize_cue_stream_direct_track_plan, prepare_cue_stream_direct_track_plan,
+     retained_pcm_scalar_stream_plan_admitted,
+     run_segmented_tool_pipeline_with_concurrency, SegmentedPipelineExecutionError,
++    run_cue_s3_pipeline_if_admitted, CueS3PipelineAttempt,
+     materialize_reference_source_for_album_gain,
+     reference_bound_metadata_executable,
+     reference_metadata_toolchains_match, run_bound_tool_command_with_concurrency,
+@@ -45128,12 +45130,16 @@
+     runner: &dyn ToolRunner,
+     cancel: &CancellationToken,
+     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
++    // Only S3 calls with Some; its supervised transport already certified
++    // exact producer EOF/extent, independently of FFmpeg's exit status.
++    qualified_range: Option<(u64, u64, u64)>,
+ ) -> ScheduledTrackOutput {
+     let metadata_satisfaction = plan.metadata_satisfaction;
+     let consumer_elapsed = consumer_output.elapsed;
+     let mut consumer_record = consumer_output.command;
+     consumer_record.description = Some(format!(
+-        "Direct encode from shared CUE PCM stream for track {}",
++        "Direct encode from {} CUE PCM stream for track {}",
++        if qualified_range.is_some() { "independent exact-range" } else { "shared" },
+         input.track.id.source_ordinal
+     ));
+ 
+@@ -45142,15 +45148,35 @@
+     // the successful invocation or masquerade it as never attempted.
+     let mut completed_evidence = TrackExecutionEvidence::default();
+     let mut decode = OperationRecord::completed(
+-        "shared-cue-decode",
+-        "shared_cue_decode",
+-        "Decode shared CUE image",
++        if qualified_range.is_some() { "s3-cue-range-decode" } else { "shared-cue-decode" },
++        if qualified_range.is_some() { "independent_cue_flac_range_decode" } else { "shared_cue_decode" },
++        if qualified_range.is_some() { "Decode sample-qualified CUE FLAC range" } else { "Decode shared CUE image" },
+         super::execution_evidence::ExecutionBackend::external(producer_record.binary.default_name()),
+     );
+     decode.inputs.push(super::execution_evidence::EvidenceArtifactRef::path(
+-        "shared-source-image",
++        if qualified_range.is_some() { "physical-flac-source-image" } else { "shared-source-image" },
+         source_decode_path,
+     ));
++    if let Some((start, end, bytes)) = qualified_range {
++        decode.parameters.push(OperationParameter::new(
++            "Start sample (inclusive)", EvidenceValue::Unsigned(start),
++        ));
++        decode.parameters.push(OperationParameter::new(
++            "End sample (exclusive)", EvidenceValue::Unsigned(end),
++        ));
++        decode.parameters.push(OperationParameter::new(
++            "Exact producer PCM bytes", EvidenceValue::Unsigned(bytes),
++        ));
++        completed_evidence.verifications.push(VerificationRecord {
++            id: "s3-exact-producer-extent".to_string(),
++            kind: "exact_pcm_extent".to_string(),
++            statement: format!(
++                "Supervised independent range producer yielded exactly {bytes} PCM bytes",
++            ),
++            status: VerificationStatus::Passed,
++            invocation_indices: vec![0],
++        });
++    }
+     decode.invocation_indices.push(0);
+     completed_evidence.operations.push(decode);
+     let mut consumer_evidence = super::execution_evidence::completed_plan_evidence_or_fallback(
+@@ -45219,7 +45245,11 @@
+                 domain: SizeDomain::WorkingArtifact,
+                 bytes,
+                 path: None,
+-                note: Some("selected shared-CUE decoded PCM extent; not original stored bytes".to_string()),
++                note: Some(if qualified_range.is_some() {
++                    "independently verified CUE FLAC range decoded PCM extent; not original stored bytes".to_string()
++                } else {
++                    "selected shared-CUE decoded PCM extent; not original stored bytes".to_string()
++                }),
+             });
+         }
+         if let Some(bytes) = bytes_out {
+@@ -45303,6 +45333,299 @@
+             }
+         }
+     }
++}
++
++// IP-04: private FLAC-only per-track executor. No user-facing dispatch or
++// album publisher references this function. IP-05 owns admission and policy.
++// The preflight is group-atomic; after spawn, each track returns a separate
++// staged attempt and is NEVER silently re-executed on S1.
++struct CueS3PrivatePrepared {
++    input: ScheduledCueStreamTrack,
++    staged_path: PathBuf,
++    plan: CueStreamDirectTrackPlan,
++    decoder: CueFlacRangeDecoder,
++    consumer: ToolCommand,
++}
++
++// Unlike Path::exists, symlink_metadata catches a dangling symlink occupying
++// a supposedly unused private work/staging name. I/O failures fail closed.
++fn cue_s3_path_is_occupied(path: &Path) -> io::Result<bool> {
++    match fs::symlink_metadata(path) {
++        Ok(_) => Ok(true),
++        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
++        Err(error) => Err(error),
++    }
++}
++
++fn prepare_qualified_flac_ranges_for_group(
++    tracks: &[ScheduledCueStreamTrack],
++    req: &PipelineRequest,
++    convert_root: &Path,
++) -> Result<Vec<CueS3PrivatePrepared>, ConvertError> {
++    if req.settings.target_format != tonepoet_pipeline::AudioFormat::Flac {
++        return Err(ConvertError::Backend("private S3 pilot requires FLAC output".to_string()));
++    }
++    let mut planned: Vec<CueS3PrivatePrepared> = Vec::with_capacity(tracks.len());
++    let mut seen_indices = BTreeSet::new();
++    let mut seen_paths = BTreeSet::new();
++    let mut seen_ordinals = BTreeSet::new();
++    let mut physical_source: Option<(PathBuf, PathBuf, u16, CueSegmentCarrier, u64)> = None;
++    for input in tracks {
++        // Do not create or reset another track's work directory if a CUE
++        // identity, target path or stage path is already duplicated.
++        let member = (|| -> Result<CueS3PrivatePrepared, ConvertError> {
++            let TrackSourceRef::CueStreamSegment {
++                fallback_path, source_image, decode_path, carrier, channels,
++                image_samples, start_sample, samples,
++            } = &input.track.source_ref else {
++                return Err(ConvertError::Backend("S3 requires typed CUE segments".to_string()));
++            };
++            if *samples == 0 || start_sample.checked_add(*samples)
++                .filter(|end| *end <= *image_samples).is_none()
++            {
++                return Err(ConvertError::Backend("S3 invalid track sample extent".to_string()));
++            }
++            let source_identity = (
++                source_image.clone(), decode_path.clone(), *channels, *carrier, *image_samples,
++            );
++            if physical_source.as_ref().is_some_and(|source| source != &source_identity) {
++                return Err(ConvertError::Backend("S3 group crosses a physical FILE or carrier".to_string()));
++            }
++            physical_source.get_or_insert(source_identity);
++            if !seen_indices.insert(input.index)
++                || !seen_ordinals.insert(input.track.id.source_ordinal)
++                || !seen_paths.insert(input.final_path.clone())
++            {
++                return Err(ConvertError::Backend("S3 duplicate group member identity or final path".to_string()));
++            }
++            let sample_rate = input.track.scalar_sample_rate()
++                .ok_or_else(|| ConvertError::Backend("S3 missing source sample rate".to_string()))?;
++            let source_bits = input.track.bit_depth
++                .and_then(|depth| u16::try_from(depth).ok())
++                .ok_or_else(|| ConvertError::Backend("S3 missing integer source depth".to_string()))?;
++            if input.track.source_audio.bit_depth != Some(u32::from(source_bits))
++                || input.track.source_audio.coding != Some(SourceAudioCoding::Pcm)
++                || input.track.expected_samples != Some(*samples)
++            {
++                return Err(ConvertError::Backend("S3 planner/source sample or depth facts drift".to_string()));
++            }
++            let range_request = CueFlacRangeRequest::from_segment(
++                &input.track.source_ref, sample_rate, source_bits,
++            ).map_err(|error| ConvertError::Backend(format!("S3 FLAC range request: {error}")))?;
++            let decoder = CueFlacRangeDecoder::prepare(&range_request)
++                .map_err(|error| ConvertError::Backend(format!("S3 independent FLAC range: {error}")))?;
++            let staged_path = staged_audio_path(
++                convert_root, &input.final_path, &input.track.id, &req.settings.target_format,
++            );
++            if !seen_paths.insert(staged_path.clone()) || cue_s3_path_is_occupied(&staged_path)? {
++                return Err(ConvertError::Backend("S3 staged destination is not unused and unique".to_string()));
++            }
++            if let Some(parent) = staged_path.parent() {
++                fs::create_dir_all(parent)?;
++            }
++            let plan = prepare_cue_stream_direct_track_plan(
++                req, &input.track, fallback_path, &staged_path, convert_root,
++            )?.ok_or_else(|| ConvertError::Backend(
++                "S3 member has no planner-approved source-rate direct encode".to_string(),
++            ))?;
++            let consumer = (|| -> Result<ToolCommand, ConvertError> {
++                let consumer = cue_stream_consumer_command(
++                    &plan, sample_rate, *channels, *carrier,
++                )?;
++                if !matches!(consumer.binary, ToolBinary::Ffmpeg | ToolBinary::Sox) {
++                    return Err(ConvertError::Backend("S3 encoder family not supported".to_string()));
++                }
++                let work_path = plan.work_output()?;
++                if let Some(parent) = work_path.parent() {
++                    fs::create_dir_all(parent)?;
++                }
++                // No existing partial may be mistaken for this fresh attempt.
++                if cue_s3_path_is_occupied(&work_path)? {
++                    return Err(ConvertError::Backend("S3 private work output already exists".to_string()));
++                }
++                Ok(consumer)
++            })();
++            let consumer = match consumer {
++                Ok(consumer) => consumer,
++                Err(error) => {
++                    cleanup_cue_stream_direct_track_plan(&plan);
++                    return Err(error);
++                }
++            };
++            Ok(CueS3PrivatePrepared {
++                input: input.clone(), staged_path, plan, decoder, consumer,
++            })
++        })();
++        match member {
++            Ok(member) => planned.push(member),
++            Err(error) => {
++                for prepared in &planned {
++                    cleanup_cue_stream_direct_track_plan(&prepared.plan);
++                }
++                return Err(error);
++            }
++        }
++    }
++    Ok(planned)
++}
++
++fn cue_s3_failed_member(
++    prepared: &CueS3PrivatePrepared,
++    commands: Vec<CommandRecord>,
++    message: String,
++) -> ScheduledTrackOutput {
++    ScheduledTrackOutput {
++        index: prepared.input.index,
++        record: failed_track_record(
++            &prepared.input.track,
++            None,
++            Some(prepared.staged_path.clone()),
++            commands,
++            message,
++        ),
++        artifact: None,
++        ok: false,
++        metadata_satisfaction: PlannedMetadataSatisfaction::none(),
++    }
++}
++
++async fn run_qualified_flac_range_member(
++    prepared: CueS3PrivatePrepared,
++    req: &PipelineRequest,
++    runner: &dyn ToolRunner,
++    cancel: &CancellationToken,
++    limits: &Arc<ToolConcurrencyLimits>,
++) -> ScheduledTrackOutput {
++    let range = prepared.decoder.sample_bounds();
++    let expected_bytes = prepared.decoder.expected_pcm_bytes();
++    let attempted = run_cue_s3_pipeline_if_admitted(
++        prepared.decoder.command(), prepared.consumer.clone(), runner, cancel,
++        limits, Some(prepared.decoder.extent_verifier()),
++    ).await;
++    let output = match attempted {
++        Ok(CueS3PipelineAttempt::Executed(Ok(pipeline))) => {
++            let mut producer = pipeline.producer.command;
++            producer.description = Some(format!(
++                "Independent FLAC CUE range [{}, {}) for track {}",
++                range.0, range.1, prepared.input.track.id.source_ordinal,
++            ));
++            finalize_cue_stream_consumer_output(
++                prepared.input.clone(), prepared.staged_path.clone(), prepared.plan,
++                pipeline.consumer, &producer, prepared.decoder.source_path(),
++                req, runner, cancel, Some(limits),
++                Some((range.0, range.1, expected_bytes)),
++            ).await
++        }
++        other => {
++            let (commands, message) = match other {
++                Ok(CueS3PipelineAttempt::Declined) => (
++                    Vec::new(), "S3 declined before launch: shared child permits unavailable".to_string(),
++                ),
++                Ok(CueS3PipelineAttempt::Executed(Err(error))) => {
++                    let mut commands = error.other_commands;
++                    if let Some(record) = command_from_tool_error(&error.error) {
++                        if !commands.iter().any(|item| item.binary == record.binary
++                            && item.sanitized_args == record.sanitized_args
++                            && item.cwd == record.cwd)
++                        {
++                            commands.push(record);
++                        }
++                    }
++                    // True attribution survives two FFmpeg children and is
++                    // sorted by command identity, not tool family name.
++                    let producer_args = prepared.decoder.command().sanitized_args();
++                    commands.sort_by_key(|record| {
++                        if record.sanitized_args == producer_args { 0 } else { 1 }
++                    });
++                    (commands, format!("S3 independently supervised range failed: {}", error.error))
++                }
++                Err(error) => (Vec::new(), format!("S3 admission error: {error}")),
++                Ok(CueS3PipelineAttempt::Executed(Ok(_))) => unreachable!(),
++            };
++            let result = cue_s3_failed_member(&prepared, commands, message);
++            cleanup_cue_stream_direct_track_plan(&prepared.plan);
++            result
++        }
++    };
++    // No failed private stage may survive for later accidental publication.
++    // The existing plan cleanup handles its work output, and validation may
++    // have already moved that output to the staged artifact.
++    if !output.ok {
++        if let Err(error) = fs::remove_file(&prepared.staged_path) {
++            if error.kind() != io::ErrorKind::NotFound {
++                log::error!(
++                    "S3 failed stage cleanup for {}: {error}",
++                    prepared.staged_path.display(),
++                );
++            }
++        }
++    }
++    output
++}
++
++/// IP-04 private proof entry point; NEVER invoked by ordinary CUE routing.
++/// Preflight is all-or-nothing, execution is independent per track. Two work
++/// futures at most are polled concurrently, even for 200 members. The shared
++/// IP-03 limits arbitrate across simultaneous private albums; no spin, wait
++/// queue, second permit acquisition, or automatic S1 retry is introduced.
++#[allow(dead_code)]
++async fn run_qualified_flac_ranges_for_group(
++    tracks: Vec<ScheduledCueStreamTrack>,
++    req: &PipelineRequest,
++    convert_root: &Path,
++    runner: &dyn ToolRunner,
++    cancel: &CancellationToken,
++    limits: &Arc<ToolConcurrencyLimits>,
++) -> Result<Vec<ScheduledTrackOutput>, ConvertError> {
++    if cancel.is_cancelled() {
++        return Err(ConvertError::Realize("cancelled".to_string()));
++    }
++    let mut prepared = VecDeque::from(prepare_qualified_flac_ranges_for_group(
++        &tracks, req, convert_root,
++    )?);
++    let mut outputs = Vec::with_capacity(prepared.len());
++    let bound = limits.cue_s3_max_in_flight().min(2);
++    // A sliding two-worker window: refill a slot immediately after its
++    // worker settles. `join!` per pair would impose a slow-worker barrier,
++    // wasting capacity on albums with uneven track lengths.
++    let mut first = prepared.pop_front().map(|job| Box::pin(
++        run_qualified_flac_range_member(job, req, runner, cancel, limits),
++    ));
++    let mut second = if bound > 1 {
++        prepared.pop_front().map(|job| Box::pin(
++            run_qualified_flac_range_member(job, req, runner, cancel, limits),
++        ))
++    } else {
++        None
++    };
++    while first.is_some() || second.is_some() {
++        let (slot, result) = match (&mut first, &mut second) {
++            (Some(a), Some(b)) => tokio::select! {
++                result = a => (0, result),
++                result = b => (1, result),
++            },
++            (Some(a), None) => (0, a.await),
++            (None, Some(b)) => (1, b.await),
++            (None, None) => unreachable!("S3 loop has a live worker"),
++        };
++        outputs.push(result);
++        let next = prepared.pop_front().map(|job| Box::pin(
++            run_qualified_flac_range_member(job, req, runner, cancel, limits),
++        ));
++        if slot == 0 {
++            first = next;
++        } else {
++            second = next;
++        }
++    }
++    order_qualified_cue_results(&mut outputs);
++    Ok(outputs)
++}
++
++/// A stable reporting/publication input order is independent of which native
++/// worker happens to finish first. This operates on completed records only.
++fn order_qualified_cue_results(outputs: &mut [ScheduledTrackOutput]) {
++    outputs.sort_by_key(|output| output.index);
+ }
+ 
+ /// Private-safe physical group identity, shared with the scheduler's existing
+@@ -45773,6 +46096,7 @@
+                                     runner,
+                                     &cancel,
+                                     tool_concurrency_limits.as_ref(),
++                                    None,
+                                 ))
+                                 .await,
+                             );
+@@ -45895,6 +46219,7 @@
+                 runner,
+                 &cancel,
+                 tool_concurrency_limits.as_ref(),
++                None,
+             ))
+             .await,
+         );
+@@ -81668,6 +81993,393 @@
+         assert!(matches!(output.record.outcome, TrackOutcome::Err(_)));
+         assert_eq!(output.index, 0);
+     }
++
++    /// Execute the real supervised two-child S3 private worker against an
++    /// independently decoded, full-image PCM reference. The image is created
++    /// outside the repository and no user-facing CUE dispatch is used.
++    #[cfg(unix)]
++    async fn cue_ip04_real_flac_case(source_bits: u32, members: usize) {
++        let temp = tempfile::tempdir().expect("S3 private fixture directory");
++        let source_path = temp.path().join("album.flac");
++        let sample_rate = 44_100_u32;
++        let samples_per_track = if members == 3 { 44_100_u64 } else { 4_410_u64 };
++        let image_samples = samples_per_track * members as u64;
++        let mut command = std::process::Command::new("ffmpeg");
++        command.args([
++            "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
++            "-f", "lavfi", "-i",
++        ]).arg(format!(
++            "sine=frequency=440:sample_rate={sample_rate}:duration={}",
++            image_samples as f64 / f64::from(sample_rate),
++        )).args(["-ac", "2", "-c:a", "flac"]);
++        if source_bits == 24 {
++            command.args(["-sample_fmt", "s32", "-bits_per_raw_sample", "24"]);
++        } else {
++            command.args(["-sample_fmt", "s16"]);
++        }
++        let generation = command.arg(&source_path).output().expect("native FLAC encoder available");
++        assert!(generation.status.success(), "fixture FLAC failed: {}",
++            String::from_utf8_lossy(&generation.stderr));
++        let streaminfo = super::super::materializer_cue::cue_exact_flac_streaminfo(&source_path)
++            .expect("generated FLAC has exact STREAMINFO");
++        assert_eq!(streaminfo, (sample_rate, 2, u16::try_from(source_bits).unwrap(), image_samples));
++
++        let mut request = request(
++            temp.path(), FailurePolicy::FailAlbumOnAnyTrackFailure,
++            stage_policy(false, false, false), OverwritePolicy::FailIfExists,
++        );
++        request.settings.target_format = tonepoet_pipeline::AudioFormat::Flac;
++        request.settings.preferred_tool = tonepoet_pipeline::PreferredTool::Ffmpeg;
++        let tracks = (0..members).map(|index| {
++            let mut track = prepared_source(temp.path(), &[track_id(index as u32)])
++                .tracks.remove(0);
++            let start_sample = index as u64 * samples_per_track;
++            track.bit_depth = Some(source_bits);
++            track.source_audio = SourceAudioDescriptor::from_scalar(
++                Some(sample_rate), Some(source_bits), Some(SourceAudioCoding::Pcm),
++            );
++            track.expected_samples = Some(samples_per_track);
++            track.source_ref = TrackSourceRef::CueStreamSegment {
++                fallback_path: temp.path().join(format!("fallback-{index}.wav")),
++                source_image: source_path.clone(),
++                decode_path: source_path.clone(),
++                start_sample,
++                samples: samples_per_track,
++                image_samples,
++                carrier: CueSegmentCarrier::PcmS32LeWav,
++                channels: 2,
++            };
++            ScheduledCueStreamTrack {
++                index,
++                track,
++                final_path: temp.path().join(format!("visible-{index}.flac")),
++            }
++        }).collect::<Vec<_>>();
++        let limits = Arc::new(ToolConcurrencyLimits::new(2, 4, 1, 4));
++        let runner = RealToolRunner::new(HashMap::new());
++        let outputs = run_qualified_flac_ranges_for_group(
++            tracks.clone(), &request, &temp.path().join("private-work"),
++            &runner, &CancellationToken::new(), &limits,
++        ).await.expect("whole-group S3 preflight");
++        assert_eq!(outputs.len(), members);
++        assert_eq!(outputs.iter().map(|item| item.index).collect::<Vec<_>>(),
++            (0..members).collect::<Vec<_>>(), "original member ordering");
++        let reference = std::process::Command::new("ffmpeg")
++            .args(["-v", "error", "-nostdin", "-i"])
++            .arg(&source_path)
++            .args(["-f", "s32le", "-c:a", "pcm_s32le", "pipe:1"])
++            .output().expect("independently decode entire source");
++        assert!(reference.status.success());
++        let frame_bytes = 2 * 4_usize;
++        assert_eq!(reference.stdout.len() as u64, image_samples * frame_bytes as u64);
++        let mut staged_paths = BTreeSet::new();
++        for (position, output) in outputs.iter().enumerate() {
++            assert!(output.ok, "S3 track {position} failure: {:?}", output.record);
++            assert!(output.record.commands.len() == 2);
++            assert_eq!(output.record.source_ref, tracks[position].track.source_ref);
++            let artifact = output.artifact.as_ref().expect("private stage artifact");
++            assert!(staged_paths.insert(artifact.staged_path.clone()), "private stages distinct");
++            assert!(!artifact.final_path.exists(), "no visible publication in IP-04");
++            assert_eq!(artifact.samples, Some(samples_per_track));
++            assert!(output.record.execution_evidence.verifications.iter().any(|entry|
++                entry.kind == "exact_pcm_extent" && entry.status == VerificationStatus::Passed));
++            let decoded = std::process::Command::new("ffmpeg")
++                .args(["-v", "error", "-nostdin", "-i"])
++                .arg(&artifact.staged_path)
++                .args(["-f", "s32le", "-c:a", "pcm_s32le", "pipe:1"])
++                .output().expect("decode private artifact");
++            assert!(decoded.status.success());
++            let first = position * samples_per_track as usize * frame_bytes;
++            let last = first + samples_per_track as usize * frame_bytes;
++            assert_eq!(&decoded.stdout, &reference.stdout[first..last],
++                "every decoded PCM frame must equal independent full-image slice");
++        }
++        assert_eq!(limits.ffmpeg_available_permits_for_test(), 4);
++    }
++
++    #[cfg(unix)]
++    #[tokio::test]
++    async fn cue_ip04_private_real_three_tracks_16_and_24_exact_pcm() {
++        cue_ip04_real_flac_case(16, 3).await;
++        cue_ip04_real_flac_case(24, 3).await;
++    }
++
++    #[cfg(unix)]
++    #[tokio::test]
++    #[ignore = "native FFmpeg 12/30-track load qualification; run explicitly on build host"]
++    async fn cue_ip04_private_real_twelve_and_thirty_tracks_bounded() {
++        cue_ip04_real_flac_case(16, 12).await;
++        cue_ip04_real_flac_case(24, 30).await;
++    }
++
++    #[test]
++    fn cue_ip04_private_reorders_three_two_one_completion_by_source_identity() {
++        let temp = tempfile::tempdir().unwrap();
++        let (tracks, _) = cue_stream_three_track_group(temp.path(), 16);
++        // Deliberately simulate completion in ordinal order 3, 1, 2.
++        let mut outputs = [2_usize, 0, 1].into_iter().map(|index| {
++            ScheduledTrackOutput {
++                index,
++                record: failed_track_record(
++                    &tracks[index].track, None, None, vec![],
++                    format!("synthetic completed member {}", index + 1),
++                ),
++                artifact: None,
++                ok: false,
++                metadata_satisfaction: PlannedMetadataSatisfaction::none(),
++            }
++        }).collect::<Vec<_>>();
++        order_qualified_cue_results(&mut outputs);
++        assert_eq!(outputs.iter().map(|member| member.index).collect::<Vec<_>>(),
++            vec![0, 1, 2]);
++        for (index, member) in outputs.iter().enumerate() {
++            assert_eq!(member.record.source_ref, tracks[index].track.source_ref);
++        }
++    }
++
++    // IP-04 D-03: exercise the *actual private coordinator* with a runner
++    // whose completion notifications are held in a deterministic order. The
++    // runner delegates native PCM verification and encoding to RealToolRunner;
++    // only completion timing and attributable stdout/stderr test markers are
++    // controlled here. It does not model a new production scheduler.
++    #[cfg(unix)]
++    struct CueIp04OrderedCompletionRunner {
++        native: RealToolRunner,
++        work_path_owner: HashMap<String, usize>,
++        finish_gates: [Arc<tokio::sync::Semaphore>; 3],
++        completed: tokio::sync::mpsc::UnboundedSender<usize>,
++    }
++
++    #[cfg(unix)]
++    #[async_trait]
++    impl ToolRunner for CueIp04OrderedCompletionRunner {
++        async fn run(
++            &self,
++            command: ToolCommand,
++            cancel: &CancellationToken,
++        ) -> Result<ToolOutput, ToolRunnerError> {
++            // Keep real ffprobe post-encode sample/depth validation.
++            self.native.run(command, cancel).await
++        }
++
++        async fn run_pipeline_with_exact_pcm_extent(
++            &self,
++            producer: ToolCommand,
++            consumer: ToolCommand,
++            extent: super::super::cue_flac_range::ExactPcmExtent,
++            cancel: &CancellationToken,
++        ) -> Result<super::super::tool::ToolPipelineOutput, super::super::tool::ToolPipelineError> {
++            let work_path = consumer.args.last().expect("planned private work output");
++            let index = *self.work_path_owner.get(work_path)
++                .expect("fake runner only executes preflighted work paths");
++            let mut output = self.native.run_pipeline_with_exact_pcm_extent(
++                producer, consumer, extent, cancel,
++            ).await?;
++            // Hold each *completed* verified native pair before returning to
++            // the coordinator. With two worker slots, launch order 1,3,2
++            // permits completion 3,1,2 without ever admitting three at once.
++            let gate = self.finish_gates[index].acquire().await
++                .expect("test completion gate remains open");
++            gate.forget();
++            let producer_mark = format!("S3-producer-track-{}", index + 1);
++            let consumer_mark = format!("S3-consumer-track-{}", index + 1);
++            output.producer.stdout_tail = format!("{producer_mark}-stdout");
++            output.producer.stderr_tail = format!("{producer_mark}-stderr");
++            output.producer.command.stdout_tail = output.producer.stdout_tail.clone();
++            output.producer.command.stderr_tail = output.producer.stderr_tail.clone();
++            output.consumer.stdout_tail = format!("{consumer_mark}-stdout");
++            output.consumer.stderr_tail = format!("{consumer_mark}-stderr");
++            output.consumer.command.stdout_tail = output.consumer.stdout_tail.clone();
++            output.consumer.command.stderr_tail = output.consumer.stderr_tail.clone();
++            self.completed.send(index).expect("test completion receiver still active");
++            Ok(output)
++        }
++    }
++
++    #[cfg(unix)]
++    #[tokio::test]
++    async fn cue_ip04_private_fake_runner_three_one_two_preserves_attribution_and_gaps() {
++        let temp = tempfile::tempdir().expect("private CUE fake-runner fixture");
++        let source_path = temp.path().join("album.flac");
++        // The existing helper creates a placeholder at this path. Build the
++        // real fixture *after* it so preflight sees a genuine exact FLAC.
++        let (mut tracks, _) = cue_stream_three_track_group(temp.path(), 16);
++        let sample_rate = 44_100_u32;
++        let image_samples = 40_013_u64;
++        let ranges = [(31_u64, 17_111_u64), (17_139, 35_137), (35_191, image_samples)];
++        // First unselected prefix, middle omitted intervals, a range crossing
++        // FLAC-frame boundaries, and a final partial frame. No PCM is cached
++        // by the production worker; this is test-only reference material.
++        assert!(ranges[0].0 > 0 && ranges[0].1 < ranges[1].0);
++        assert!(ranges[1].1 < ranges[2].0 && ranges[2].1 == image_samples);
++        let generated = std::process::Command::new("ffmpeg")
++            .args(["-hide_banner", "-nostdin", "-loglevel", "error", "-y",
++                "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100",
++                "-af", "atrim=end_sample=40013", "-ac", "2",
++                "-c:a", "flac", "-sample_fmt", "s16"])
++            .arg(&source_path)
++            .output().expect("native FLAC fixture encoder");
++        assert!(generated.status.success(), "FLAC fixture creation: {}",
++            String::from_utf8_lossy(&generated.stderr));
++        assert_eq!(
++            super::super::materializer_cue::cue_exact_flac_streaminfo(&source_path),
++            Some((sample_rate, 2, 16, image_samples)),
++            "fixture must have the exact final partial frame",
++        );
++
++        for (input, &(start_sample, end_sample)) in tracks.iter_mut().zip(&ranges) {
++            let samples = end_sample - start_sample;
++            input.track.expected_samples = Some(samples);
++            input.track.source_ref = TrackSourceRef::CueStreamSegment {
++                fallback_path: temp.path().join(format!("unused-{}.wav", input.index)),
++                source_image: source_path.clone(),
++                decode_path: source_path.clone(),
++                start_sample,
++                samples,
++                image_samples,
++                carrier: CueSegmentCarrier::PcmS32LeWav,
++                channels: 2,
++            };
++        }
++        let sources = tracks.clone();
++        // Launch 1 and 3 together, deliberately finish 3 first, then
++        // refill that slot with 2. This obtains completion 3,1,2 while
++        // exercising a genuinely out-of-launch-order first completion.
++        let launch_order = vec![tracks.remove(0), tracks.remove(1), tracks.remove(0)];
++        let mut req = request(
++            temp.path(), FailurePolicy::FailAlbumOnAnyTrackFailure,
++            stage_policy(false, false, false), OverwritePolicy::FailIfExists,
++        );
++        req.settings.target_format = tonepoet_pipeline::AudioFormat::Flac;
++        req.settings.preferred_tool = tonepoet_pipeline::PreferredTool::Ffmpeg;
++        let work_root = temp.path().join("private-work");
++        let planned = prepare_qualified_flac_ranges_for_group(
++            &launch_order, &req, &work_root,
++        ).expect("every independent source range preflighted");
++        let mut work_path_owner = HashMap::new();
++        let mut expected = BTreeMap::new();
++        for job in &planned {
++            assert!(work_path_owner.insert(
++                job.consumer.args.last().expect("work output arg").clone(),
++                job.input.index,
++            ).is_none(), "each work output has a unique owner");
++            expected.insert(job.input.index, (
++                job.staged_path.clone(), job.decoder.command().sanitized_args(),
++                job.consumer.sanitized_args(),
++            ));
++        }
++        let finish_gates: [Arc<tokio::sync::Semaphore>; 3] =
++            std::array::from_fn(|_| Arc::new(tokio::sync::Semaphore::new(0)));
++        let driver_gates = finish_gates.clone();
++        let (completed_tx, mut completed_rx) = tokio::sync::mpsc::unbounded_channel();
++        let runner = CueIp04OrderedCompletionRunner {
++            native: RealToolRunner::new(HashMap::new()),
++            work_path_owner,
++            finish_gates,
++            completed: completed_tx,
++        };
++        let limits = Arc::new(ToolConcurrencyLimits::new(2, 4, 1, 4));
++        let cancel = CancellationToken::new();
++        let execute = run_qualified_flac_ranges_for_group(
++            launch_order, &req, &work_root, &runner, &cancel, &limits,
++        );
++        let release = async {
++            for index in [2_usize, 0, 1] {
++                driver_gates[index].add_permits(1);
++                assert_eq!(completed_rx.recv().await, Some(index),
++                    "exact fake-runner completion order must be 3,1,2");
++            }
++        };
++        let (outputs, ()) = tokio::time::timeout(Duration::from_secs(45), async {
++            tokio::join!(execute, release)
++        }).await.expect("bounded private coordinator and controlled fake complete");
++        let outputs = outputs.expect("private group preflight and execution");
++        assert_eq!(outputs.len(), 3);
++        assert_eq!(outputs.iter().map(|output| output.index).collect::<Vec<_>>(),
++            vec![0, 1, 2], "results must be source-ordered, not completion-ordered");
++
++        // Keep the assertion reusable for a deliberate negative test below:
++        // it detects either a swapped command record or a swapped stage path.
++        let attributed = |index: usize, record: &TrackRecord, artifact: &TrackArtifact| {
++            let (stage, producer_args, consumer_args) = &expected[&index];
++            record.track_id == sources[index].track.id
++                && record.source_ref == sources[index].track.source_ref
++                && artifact.track_id == sources[index].track.id
++                && artifact.staged_path == *stage
++                && artifact.final_path == sources[index].final_path
++                && record.commands.len() == 2
++                && record.commands[0].sanitized_args == *producer_args
++                && record.commands[1].sanitized_args == *consumer_args
++                && record.commands[0].stdout_tail == format!("S3-producer-track-{}-stdout", index + 1)
++                && record.commands[0].stderr_tail == format!("S3-producer-track-{}-stderr", index + 1)
++                && record.commands[1].stdout_tail == format!("S3-consumer-track-{}-stdout", index + 1)
++                && record.commands[1].stderr_tail == format!("S3-consumer-track-{}-stderr", index + 1)
++        };
++        let mut distinct_stages = BTreeSet::new();
++        let reference = std::process::Command::new("ffmpeg")
++            .args(["-hide_banner", "-nostdin", "-loglevel", "error", "-i"])
++            .arg(&source_path)
++            .args(["-f", "s32le", "-c:a", "pcm_s32le", "pipe:1"])
++            .output().expect("full-image reference PCM");
++        assert!(reference.status.success(), "reference decode failed");
++        assert_eq!(reference.stdout.len() as u64, image_samples * 8);
++        for (index, output) in outputs.iter().enumerate() {
++            assert!(output.ok, "private fake-runner worker {}: {:?}", index + 1, output.record);
++            let artifact = output.artifact.as_ref().expect("private staged artifact");
++            assert!(attributed(index, &output.record, artifact),
++                "worker {index} lost source, command, or stage identity");
++            assert!(distinct_stages.insert(artifact.staged_path.clone()));
++            assert!(!artifact.final_path.exists(), "private worker must not publish");
++            assert_eq!(artifact.samples, Some(ranges[index].1 - ranges[index].0));
++            let decoded = std::process::Command::new("ffmpeg")
++                .args(["-hide_banner", "-nostdin", "-loglevel", "error", "-i"])
++                .arg(&artifact.staged_path)
++                .args(["-f", "s32le", "-c:a", "pcm_s32le", "pipe:1"])
++                .output().expect("private artifact PCM decode");
++            assert!(decoded.status.success(), "private artifact decode failed: {}",
++                String::from_utf8_lossy(&decoded.stderr));
++            let start = usize::try_from(ranges[index].0 * 8).unwrap();
++            let end = usize::try_from(ranges[index].1 * 8).unwrap();
++            assert_eq!(decoded.stdout, reference.stdout[start..end],
++                "PCM mismatch in selected range including middle/final frames");
++        }
++        // Negative probe: both isolated attribution swaps MUST be detected by
++        // the same assertion used on the real coordinator results.
++        let first = outputs[0].artifact.as_ref().unwrap();
++        let second = outputs[1].artifact.as_ref().unwrap();
++        let mut swapped_record = outputs[0].record.clone();
++        swapped_record.commands[0] = outputs[1].record.commands[0].clone();
++        assert!(!attributed(0, &swapped_record, first),
++            "cross-worker decoder record swap escaped detection");
++        let mut swapped_artifact = first.clone();
++        swapped_artifact.staged_path = second.staged_path.clone();
++        assert!(!attributed(0, &outputs[0].record, &swapped_artifact),
++            "cross-worker staged path swap escaped detection");
++        assert_eq!(limits.ffmpeg_available_permits_for_test(), 4,
++            "private workers return shared IP-03 permits");
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn cue_ip04_private_preflight_refuses_unqualified_source_without_spawning() {
++        let temp = tempfile::tempdir().unwrap();
++        let (tracks, _) = cue_stream_three_track_group(temp.path(), 16);
++        // The existing helper writes a source placeholder rather than FLAC.
++        // No member may run or obtain a token while preflight is incomplete.
++        let mut req = request(
++            temp.path(), FailurePolicy::FailAlbumOnAnyTrackFailure,
++            stage_policy(false, false, false), OverwritePolicy::FailIfExists,
++        );
++        req.settings.target_format = tonepoet_pipeline::AudioFormat::Flac;
++        req.settings.preferred_tool = tonepoet_pipeline::PreferredTool::Ffmpeg;
++        let limits = ToolConcurrencyLimits::new(2, 4, 1, 4);
++        assert!(prepare_qualified_flac_ranges_for_group(
++            &tracks, &req, &temp.path().join("private-work"),
++        ).is_err());
++        assert_eq!(limits.ffmpeg_available_permits_for_test(), 4);
++        assert!(tracks.iter().all(|item| !item.final_path.exists()));
++    }
++
+ }
+ // CHUNK_2_1_3_FAILURE_CANCELLATION_TESTS_END
+ 

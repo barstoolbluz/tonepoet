@@ -22,7 +22,7 @@ use super::tool::{ToolBinary, ToolCommand};
 use super::types::{CueSegmentCarrier, TrackSourceRef};
 
 #[derive(Debug, Error)]
-pub(crate) enum CueFlacRangeError {
+pub enum CueFlacRangeError {
     #[error("source is not an exact CUE stream segment")]
     NotCueStreamSegment,
     #[error("FLAC range requires the existing signed s32le carrier and qualified PCM facts")]
@@ -111,12 +111,19 @@ pub(crate) struct CueFlacRangeDecoder {
 /// Count an arbitrarily chunked stream without retaining any PCM. `finish`
 /// rejects early EOF, while `observe_bytes` rejects surplus before forwarding.
 #[derive(Debug, Clone)]
-pub(crate) struct ExactPcmExtent {
+pub struct ExactPcmExtent {
     expected: u64,
     observed: u128,
 }
 
 impl ExactPcmExtent {
+    /// Explicitly constructed for tests and the typed verified-pipe runner.
+    /// The production caller obtains this from a prepared, source-qualified
+    /// `CueFlacRangeDecoder` instead of fabricating its expected extent.
+    pub(crate) fn for_expected_bytes(expected: u64) -> Self {
+        Self { expected, observed: 0 }
+    }
+
     pub fn observe_bytes(&mut self, amount: usize) -> Result<(), CueFlacRangeError> {
         let next = self
             .observed
@@ -236,10 +243,7 @@ impl CueFlacRangeDecoder {
     }
 
     pub fn extent_verifier(&self) -> ExactPcmExtent {
-        ExactPcmExtent {
-            expected: self.expected_bytes,
-            observed: 0,
-        }
+        ExactPcmExtent::for_expected_bytes(self.expected_bytes)
     }
 
     /// Check FLAC frame CRC: `explode` alone does NOT enable CRC verification.

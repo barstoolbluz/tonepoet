@@ -1,3 +1,9 @@
+# IP-04 delta — CURRENT (2026-10-24)
+
+Four production source files are touched: `src/convert/pipeline/cue_flac_range.rs` (test/typed extent constructor), `src/convert/pipeline/tool.rs` (optional exact supervised pipeline + tests), `src/convert/pipeline/track_executor.rs` (single-pass IP-03 typed verifier plumbing + existing test call updates), `src/convert/pipeline/stages.rs` (private all-member FLAC preflight/worker and staged evidence + tests). Also appended `ip04_verification/` evidence and prepended the latest cumulative checkpoint to six root docs. See `ip04_verification/PRODUCTION_DIFF.patch` and `ip04_verification/SOURCE_DIFF.json`. No other production file was changed and S1 dispatcher is untouched.
+
+---
+
 # IP-01 R2 corrective changed-file summary
 
 Original source SHA-256: `0740a9c8cbd8e59648981207daf62e6373f4b544ad3a40c7872b3890c9d76d26`.

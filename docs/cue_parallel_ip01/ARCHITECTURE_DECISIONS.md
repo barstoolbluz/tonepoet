@@ -1,3 +1,9 @@
+# IP-04 architecture decision checkpoint — 2026-10-24
+
+New private CUE S3 execution uses IP-02 range qualification, IP-03 weighted RAII permits, an opt-in checked `ToolRunner` pipe, and the existing direct-plan/finalization and staged result. No separate scheduler/encoder/metadata/publisher and no general process-management rewrite. The upstream unchecked two-child `run_pipeline` and S1 semantics are unchanged. Private S3 result ordering is detached from native worker completion order. For full reasoning see `ip04_verification/ARCHITECTURE_DECISIONS.md`.
+
+---
+
 # IP-03 addendum — shared two-child permits
 
 1. **Existing tool semaphores remain authoritative.** Add only a globally shared `cue_s3_in_flight` semaphore to `ToolConcurrencyLimits`; every S3 worker counts two actual children with `try_acquire_many_owned` (FFmpeg/FFmpeg) or one token from each family (FFmpeg/SoX). No generic RAM/FD/I/O scheduler and no changes to the ordinary S1 or single-tool limiter.
