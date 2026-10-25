@@ -1,0 +1,243 @@
+{
+  "added": {
+    "docs/cue_parallel_ip01/ip04_verification/ARCHITECTURE_DECISIONS.md": {
+      "mode": "0o644",
+      "sha256": "7a8e10b7908d88551ea7acb80f3b4ba9c05ccdccd42f0d7cc8a10b7d13a5d47a",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip04_verification/AUTHOR_ENVIRONMENT.txt": {
+      "mode": "0o644",
+      "sha256": "cb13f0cb38b11358f3de6959948f097074d94b72535bf3fe64d32535cfe9b6c8",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip04_verification/CONFORMANCE_MATRIX.md": {
+      "mode": "0o644",
+      "sha256": "10d962d9a34467990fc7d5238bbec62b84379249a4271d07b181412234f58a88",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip04_verification/CORRECTIVE_D01_D03_2026-10-25.md": {
+      "mode": "0o644",
+      "sha256": "ee85c08039df9396d56ccd2c837c38ae0aabc579e23b435664c7767390153721",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip04_verification/CORRECTIVE_DIFF.patch": {
+      "mode": "0o644",
+      "sha256": "5f78e72cf50985534ec730a0226c6b28252a1280c794fad8f8c33a250068974d",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip04_verification/HISTORICAL_IP03_MANIFEST_GATE.txt": {
+      "mode": "0o644",
+      "sha256": "0d6095eff288d74713c248a18d130d88888c3f3fa921f1813bb00e783922098b",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip04_verification/INPUT_SHA256.txt": {
+      "mode": "0o644",
+      "sha256": "24b0379aa7bf1cb3536e4a2d6af9d6f2ea0b054502e7ed6bd46d8c675850cf0e",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip04_verification/IP03_IDENTITY_TESTS.txt": {
+      "mode": "0o644",
+      "sha256": "a92305a554a168c6f068b0c60cc51dc16e708a38ad322c7ed40a9406fe3d963e",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip04_verification/NEXT_SESSION_HANDOFF.md": {
+      "mode": "0o644",
+      "sha256": "b50750f4a25b16e00e9b606652d6f71d508adc2bd3f1edec3b61a9c5b6be0215",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip04_verification/PACKAGE_CHECK.txt": {
+      "mode": "0o644",
+      "sha256": "43739ecc147e4488a87e97dfcf7c243ccf769dd845d6f8793f6654167a535c9f",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip04_verification/PRODUCTION_DIFF.patch": {
+      "mode": "0o644",
+      "sha256": "283fd712626d5f1e363a3b452ce4ffaa1bc12fd66eddf97e0989f20d065617cf",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip04_verification/PRODUCTION_PATCH_CHECK.txt": {
+      "mode": "0o644",
+      "sha256": "f12d1388a67e7e9d202c8276a02591244f279d5c6233d7a8106d9554549099a9",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip04_verification/README.md": {
+      "mode": "0o644",
+      "sha256": "29ddd071895c489283374402e5ae1ef84234aae3f739648aa96875e106077dda",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip04_verification/STATIC_AUDIT.md": {
+      "mode": "0o644",
+      "sha256": "c2209c15178fb2710f3e1f7fa572f32d0b13b37f6ce8f0b9b0c1a9d92a0a6c7b",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip04_verification/STATIC_GATE_OUTPUT.txt": {
+      "mode": "0o644",
+      "sha256": "bb747f59a5815ee7abf091b117aed4f1d9529a68e94eba0a7c7b68e6473eff46",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip04_verification/VERIFICATION_RESULTS.md": {
+      "mode": "0o644",
+      "sha256": "b92558244375dc280c923b6670fe5b6c24b5f2ed373f3e73eba691a832171856",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip04_verification/make_manifest.py": {
+      "mode": "0o644",
+      "sha256": "341390519a83a1d5c21e6a4dbcfed13d0dfe27f1f586ff024442b6bc32d7cdf1",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip04_verification/native_flac_pairs.py": {
+      "mode": "0o644",
+      "sha256": "006521accdef8c936f3d39e040e0ffbd81c93eeeb3b769c97ef6fa381e5fb050",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip04_verification/native_full_results.json": {
+      "mode": "0o644",
+      "sha256": "a76f47c298b2b2e30e1e2cbc257136a0cc56f02fe60c70d0f6c56e1eedbb2d1a",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip04_verification/native_gap_reference_probe.py": {
+      "mode": "0o644",
+      "sha256": "8d91cb2488d0a6241b6b4efa20f0cec9b753a97e0236f2fc76e1a08c458dc755",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip04_verification/native_gap_reference_results.json": {
+      "mode": "0o644",
+      "sha256": "c756dbf9820769ae7d2b6e79c1dc5ffc81dc2f1b4edb446e13b3201702347cb1",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip04_verification/native_quick_results.json": {
+      "mode": "0o644",
+      "sha256": "0450a959641e0fae0e79cd49b33783c6e5dd4121c4588f4e0c6951355ef40686",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip04_verification/verify_static_ip04.py": {
+      "mode": "0o644",
+      "sha256": "4d5e837c1561bd8897f2c2678322ef34572c90e4c6777ab042c5eb89ed963b8d",
+      "type": "file"
+    }
+  },
+  "changed": {
+    "docs/cue_parallel_ip01/ARCHITECTURE_DECISIONS.md": {
+      "new": {
+        "mode": "0o664",
+        "sha256": "d06534b9f5aafe9a04d767d8a52d7d4fa0c859df0afaee4131635a8f7b0e60b9",
+        "type": "file"
+      },
+      "old": {
+        "mode": "0o664",
+        "sha256": "af88fc5abdf6bfe196fdc9c1b6d24ad13b9bd3c177e66eccaa150361d55362b7",
+        "type": "file"
+      }
+    },
+    "docs/cue_parallel_ip01/CHANGED_FILE_SUMMARY.md": {
+      "new": {
+        "mode": "0o664",
+        "sha256": "17d5af5eb07008115dcc3171e25da27bc312eb08571277770955fa585a3d9a67",
+        "type": "file"
+      },
+      "old": {
+        "mode": "0o664",
+        "sha256": "8f9caaeb92e48b8fe894473f3bad7e84c21db0d70493e49416990d2adfaa0736",
+        "type": "file"
+      }
+    },
+    "docs/cue_parallel_ip01/CONFORMANCE_MATRIX.md": {
+      "new": {
+        "mode": "0o664",
+        "sha256": "120f122ae5651fe659305a419b3220378662807e13ec0466903f5a40ecd10b4b",
+        "type": "file"
+      },
+      "old": {
+        "mode": "0o664",
+        "sha256": "ae0c256647b9b393eb4f88736ca6c3c82cd6539b7f5df7baff7f3626ac0fbf19",
+        "type": "file"
+      }
+    },
+    "docs/cue_parallel_ip01/IMPLEMENTATION_STATUS.md": {
+      "new": {
+        "mode": "0o664",
+        "sha256": "d73ef81501ce38fd3df2fd5516326e704cfbc3bcd3523c304e54b71d3ff6f047",
+        "type": "file"
+      },
+      "old": {
+        "mode": "0o664",
+        "sha256": "e81a9e178288e958f25eaee96a029f4cd88c4bb9f067eed7719c3c2e6c1aa373",
+        "type": "file"
+      }
+    },
+    "docs/cue_parallel_ip01/NEXT_SESSION_HANDOFF.md": {
+      "new": {
+        "mode": "0o664",
+        "sha256": "f7eb28177a88cb4c894fdabf9beea2d9648cc5aadc88e4ac69f520eaba83ce3c",
+        "type": "file"
+      },
+      "old": {
+        "mode": "0o664",
+        "sha256": "3f69db22954f59b23d0ab2605d8542521ebca74a957229b1443ce0c6e991da08",
+        "type": "file"
+      }
+    },
+    "docs/cue_parallel_ip01/VERIFICATION_RESULTS.md": {
+      "new": {
+        "mode": "0o664",
+        "sha256": "3b2f9f5cb9b1732bc3b7badd7ec6d4b71bda1ea72782ffbd37892c9831706c10",
+        "type": "file"
+      },
+      "old": {
+        "mode": "0o664",
+        "sha256": "5b450eee8381ac577c82b7a535f51060959e9239970e4cb32cddee1ce3bb00c5",
+        "type": "file"
+      }
+    },
+    "src/convert/pipeline/cue_flac_range.rs": {
+      "new": {
+        "mode": "0o664",
+        "sha256": "05dfa86727736d97b0389e0b422c0aaa94db0dc0db700b367105df94eca9ca69",
+        "type": "file"
+      },
+      "old": {
+        "mode": "0o664",
+        "sha256": "e470d5deb8070ce3c91686b5040e7163083f71ef8705c44a50b9e7d9921c22a9",
+        "type": "file"
+      }
+    },
+    "src/convert/pipeline/stages.rs": {
+      "new": {
+        "mode": "0o664",
+        "sha256": "a8f40810b412cee882e51dc4a4990be4469e1c4f85e7346468f77c40de885fef",
+        "type": "file"
+      },
+      "old": {
+        "mode": "0o664",
+        "sha256": "f34f10fc4865505754bb73be49f0e6a2eda79abeb94e4e3759285dba2b1a7727",
+        "type": "file"
+      }
+    },
+    "src/convert/pipeline/tool.rs": {
+      "new": {
+        "mode": "0o664",
+        "sha256": "9ab2f1211dabf37c38f19747ca713631b65d08b598bda9c025f9afac36aecd3d",
+        "type": "file"
+      },
+      "old": {
+        "mode": "0o664",
+        "sha256": "e62c7c5bd1c729f326a17c052ab27a5b4b3d338322f9bd456aefa67567244ec9",
+        "type": "file"
+      }
+    },
+    "src/convert/pipeline/track_executor.rs": {
+      "new": {
+        "mode": "0o664",
+        "sha256": "4c9aa6457b7e97aa4d6067f7452270c5260b54f83a90c65a04ee8141fa787e7a",
+        "type": "file"
+      },
+      "old": {
+        "mode": "0o664",
+        "sha256": "275fadda5af52e6f7e0622a8547a608de876f320ede7f1a6921d798b3ed34366",
+        "type": "file"
+      }
+    }
+  },
+  "removed": {},
+  "unchanged_count": 1226
+}

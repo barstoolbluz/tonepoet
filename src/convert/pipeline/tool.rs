@@ -538,6 +538,24 @@ pub trait ToolRunner: Send + Sync {
         })
     }
 
+    /// IP-04 private S3 transport: the same two supervised children as
+    /// `run_pipeline`, but transfer every producer byte through IP-02's
+    /// independent exact-extent verifier before writing to the consumer.
+    /// A runner without this capability must fail closed, never fall back
+    /// to an unverified pipe or claim that a successful exit proves length.
+    async fn run_pipeline_with_exact_pcm_extent(
+        &self,
+        _producer: ToolCommand,
+        _consumer: ToolCommand,
+        _extent: super::cue_flac_range::ExactPcmExtent,
+        _cancel: &CancellationToken,
+    ) -> Result<ToolPipelineOutput, ToolPipelineError> {
+        Err(ToolPipelineError {
+            error: ToolRunnerError::UnsupportedPipeline,
+            other_commands: Vec::new(),
+        })
+    }
+
     /// Return whether this runner implements the narrow retained-f64le scalar
     /// pump. Test/fake runners default to false so existing fixtures retain the
     /// materialized baseline unless they explicitly model the transport.
@@ -1575,6 +1593,38 @@ fn command_record_from_runner_error(error: &ToolRunnerError) -> Option<CommandRe
     }
 }
 
+// A supervisor may return Io without a command record. Select the other
+// child's record by its role, never by position in a filtered record vector.
+#[cfg(unix)]
+fn verified_pipe_record(result: &Result<ToolOutput, ToolRunnerError>) -> Option<CommandRecord> {
+    match result {
+        Ok(output) => Some(output.command.clone()),
+        Err(error) => command_record_from_runner_error(error),
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum VerifiedPipeFault {
+    Producer,
+    Consumer,
+    Transfer,
+}
+
+#[cfg(unix)]
+fn verified_pipe_other_commands(
+    fault: VerifiedPipeFault,
+    producer: &Result<ToolOutput, ToolRunnerError>,
+    consumer: &Result<ToolOutput, ToolRunnerError>,
+) -> Vec<CommandRecord> {
+    match fault {
+        VerifiedPipeFault::Producer => verified_pipe_record(consumer).into_iter().collect(),
+        VerifiedPipeFault::Consumer => verified_pipe_record(producer).into_iter().collect(),
+        VerifiedPipeFault::Transfer => [verified_pipe_record(producer), verified_pipe_record(consumer)]
+            .into_iter().flatten().collect(),
+    }
+}
+
 #[cfg(unix)]
 fn remap_segmented_stall_error(
     mut error: ToolSegmentedPipelineError,
@@ -2412,6 +2462,214 @@ impl ToolRunner for RealToolRunner {
                     std::io::ErrorKind::Unsupported,
                     "supervised external pipelines require Unix descriptor handoff",
                 )),
+                other_commands: Vec::new(),
+            })
+        }
+    }
+
+    async fn run_pipeline_with_exact_pcm_extent(
+        &self,
+        producer: ToolCommand,
+        consumer: ToolCommand,
+        mut extent: super::cue_flac_range::ExactPcmExtent,
+        cancel: &CancellationToken,
+    ) -> Result<ToolPipelineOutput, ToolPipelineError> {
+        // Keep the established (unverified) run_pipeline entirely untouched.
+        // This extra supervised transport is private to S3, and has only two
+        // bounded OS pipes and one fixed-size transfer buffer per worker.
+        #[cfg(unix)]
+        {
+            if producer.environment_policy == CommandEnvironmentPolicy::InheritAndSet {
+                let _ = self.tool_version(producer.binary);
+            }
+            if consumer.environment_policy == CommandEnvironmentPolicy::InheritAndSet {
+                let _ = self.tool_version(consumer.binary);
+            }
+            let producer_path = resolve_command_launch_path(
+                self.resolve_binary(producer.binary), producer.environment_policy,
+            ).map_err(|error| ToolPipelineError {
+                error: ToolRunnerError::Io(error), other_commands: Vec::new(),
+            })?;
+            let consumer_path = resolve_command_launch_path(
+                self.resolve_binary(consumer.binary), consumer.environment_policy,
+            ).map_err(|error| ToolPipelineError {
+                error: ToolRunnerError::Io(error), other_commands: Vec::new(),
+            })?;
+            let (producer_read, producer_write) = create_cloexec_pipe().map_err(|error| {
+                ToolPipelineError { error: ToolRunnerError::Io(error), other_commands: Vec::new() }
+            })?;
+            let (consumer_read, consumer_write) = create_cloexec_pipe().map_err(|error| {
+                ToolPipelineError { error: ToolRunnerError::Io(error), other_commands: Vec::new() }
+            })?;
+            // The subprocess supervisors hold their execution capability,
+            // process group and descriptor ownership just as in run_pipeline.
+            // On *any* transfer or child failure, cancel and await BOTH peers.
+            let pipeline_cancel = CancellationToken::new();
+            let producer_future = self.run_supervised_with_stdio(
+                producer, producer_path, &pipeline_cancel,
+                None, Some(Arc::new(producer_write)), None,
+            );
+            let consumer_future = self.run_supervised_with_stdio(
+                consumer, consumer_path, &pipeline_cancel,
+                Some(Arc::new(consumer_read)), None, None,
+            );
+            let transfer_future = async {
+                let mut reader = tokio::fs::File::from_std(producer_read);
+                let mut writer = tokio::fs::File::from_std(consumer_write);
+                let mut bytes = [0_u8; 64 * 1024];
+                loop {
+                    let count = tokio::select! {
+                        _ = pipeline_cancel.cancelled() => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::Interrupted, "S3 verified PCM transfer cancelled",
+                            ));
+                        }
+                        result = reader.read(&mut bytes) => result?,
+                    };
+                    if count == 0 { break; }
+                    // Fail surplus BEFORE forwarding it. On EOF fail a short
+                    // stream, even if both tools otherwise report exit code 0.
+                    extent.observe_bytes(count).map_err(|error| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                    })?;
+                    tokio::select! {
+                        _ = pipeline_cancel.cancelled() => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::Interrupted, "S3 verified PCM transfer cancelled",
+                            ));
+                        }
+                        result = writer.write_all(&bytes[..count]) => result?,
+                    }
+                }
+                extent.finish().map_err(|error| {
+                    std::io::Error::new(std::io::ErrorKind::UnexpectedEof, error)
+                })?;
+                // EOF is observable by the consumer only after the last
+                // verified byte and this writer have both been released.
+                drop(writer);
+                Ok::<(), std::io::Error>(())
+            };
+            tokio::pin!(producer_future);
+            tokio::pin!(consumer_future);
+            tokio::pin!(transfer_future);
+            let mut producer_result = None;
+            let mut consumer_result = None;
+            let mut transfer_result = None;
+            let mut first_fault = None;
+            let mut externally_cancelled = false;
+            while producer_result.is_none() || consumer_result.is_none() || transfer_result.is_none() {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled(), if !externally_cancelled => {
+                        externally_cancelled = true;
+                        pipeline_cancel.cancel();
+                    }
+                    result = &mut transfer_future, if transfer_result.is_none() => {
+                        if let Err(error) = &result {
+                            if error.kind() == std::io::ErrorKind::BrokenPipe
+                                && consumer_result.is_none()
+                            {
+                                // The consumer has closed stdin. Its supervisor
+                                // may still be draining stderr and reporting its
+                                // causal exit. Give that *existing* supervisor a
+                                // bounded opportunity to finish before cancelling
+                                // both children; do not delay short/surplus errors.
+                                let settled = tokio::select! {
+                                    _ = cancel.cancelled() => {
+                                        externally_cancelled = true;
+                                        None
+                                    }
+                                    result = tokio::time::timeout(
+                                        Duration::from_millis(750), &mut consumer_future,
+                                    ) => result.ok(),
+                                };
+                                if let Some(result) = settled {
+                                    if matches!(result, Err(
+                                        ToolRunnerError::NonZeroExit { .. }
+                                        | ToolRunnerError::Spawn { .. }
+                                        | ToolRunnerError::Timeout { .. }
+                                        | ToolRunnerError::Termination { .. }
+                                    )) {
+                                        first_fault.get_or_insert(VerifiedPipeFault::Consumer);
+                                    }
+                                    consumer_result = Some(result);
+                                }
+                            }
+                            first_fault.get_or_insert(VerifiedPipeFault::Transfer);
+                            pipeline_cancel.cancel();
+                        }
+                        transfer_result = Some(result);
+                    }
+                    result = &mut consumer_future, if consumer_result.is_none() => {
+                        if result.is_err() {
+                            first_fault.get_or_insert(VerifiedPipeFault::Consumer);
+                            pipeline_cancel.cancel();
+                        }
+                        consumer_result = Some(result);
+                    }
+                    result = &mut producer_future, if producer_result.is_none() => {
+                        if result.is_err() {
+                            first_fault.get_or_insert(VerifiedPipeFault::Producer);
+                            pipeline_cancel.cancel();
+                        }
+                        producer_result = Some(result);
+                    }
+                }
+            }
+            let producer_result = producer_result.expect("supervised producer settled");
+            let consumer_result = consumer_result.expect("supervised consumer settled");
+            let transfer_result = transfer_result.expect("verified transfer settled");
+
+            // Exact extent violations always outrank the cancellations they
+            // induce. An independently observed consumer nonzero exit, however,
+            // is the cause of a downstream BrokenPipe (not a verifier failure).
+            if externally_cancelled {
+                let records = verified_pipe_other_commands(
+                    VerifiedPipeFault::Transfer, &producer_result, &consumer_result,
+                );
+                let error = producer_result.err()
+                    .or_else(|| consumer_result.err())
+                    .unwrap_or_else(|| ToolRunnerError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted, "S3 pipeline cancelled",
+                    )));
+                return Err(ToolPipelineError { error, other_commands: records });
+            }
+            let Some(mut primary) = first_fault else {
+                return match (producer_result, consumer_result, transfer_result) {
+                    (Ok(producer), Ok(consumer), Ok(())) => {
+                        Ok(ToolPipelineOutput { producer, consumer })
+                    }
+                    _ => unreachable!("S3 completed with no first fault"),
+                };
+            };
+            if matches!(primary, VerifiedPipeFault::Transfer)
+                && matches!(&transfer_result, Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe)
+                && matches!(&consumer_result, Err(
+                    ToolRunnerError::NonZeroExit { .. }
+                    | ToolRunnerError::Spawn { .. }
+                    | ToolRunnerError::Timeout { .. }
+                    | ToolRunnerError::Termination { .. }
+                ))
+            {
+                primary = VerifiedPipeFault::Consumer;
+            }
+            let other_commands = verified_pipe_other_commands(
+                primary, &producer_result, &consumer_result,
+            );
+            let error = match primary {
+                VerifiedPipeFault::Transfer => {
+                    ToolRunnerError::Io(transfer_result.expect_err("transfer failed"))
+                }
+                VerifiedPipeFault::Producer => producer_result.err().expect("producer failed"),
+                VerifiedPipeFault::Consumer => consumer_result.err().expect("consumer failed"),
+            };
+            Err(ToolPipelineError { error, other_commands })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (producer, consumer, extent, cancel);
+            Err(ToolPipelineError {
+                error: ToolRunnerError::UnsupportedPipeline,
                 other_commands: Vec::new(),
             })
         }
@@ -5094,4 +5352,192 @@ exit 0
             "version probe should avoid pipe backpressure and complete promptly, took {elapsed:?}"
         );
     }
+
+    #[cfg(unix)]
+    fn cue_ip04_test_commands(
+        producer_script: PathBuf,
+        consumer_script: PathBuf,
+        consumer_args: Vec<String>,
+    ) -> (RealToolRunner, ToolCommand, ToolCommand) {
+        let mut paths = HashMap::new();
+        paths.insert(ToolBinary::Ffmpeg.canonical_name().to_string(), producer_script);
+        paths.insert(ToolBinary::Sox.canonical_name().to_string(), consumer_script);
+        (
+            RealToolRunner::new(paths),
+            closed_command(ToolBinary::Ffmpeg, vec![], Duration::from_secs(5)),
+            closed_command(ToolBinary::Sox, consumer_args, Duration::from_secs(5)),
+        )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cue_ip04_supervised_exact_pipe_rejects_short_and_surplus_and_proves_success() {
+        let consumer = write_executable_test_script(
+            "cue-ip04-verified-consumer",
+            "#!/bin/sh\nexec /bin/cat > \"$1\"\n",
+        );
+        for (case, body, expected, success) in [
+            ("exact", "#!/bin/sh\nprintf 'abcdefgh'\n", 8_u64, true),
+            ("short", "#!/bin/sh\nprintf 'abcdefg'\n", 8, false),
+            ("surplus", "#!/bin/sh\nprintf 'abcdefghi'\n", 8, false),
+            ("zero", "#!/bin/sh\nprintf 'abcdefgh'\n", 0, false),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let out = temp.path().join("private-output.bin");
+            let producer = write_executable_test_script(
+                &format!("cue-ip04-producer-{case}"), body,
+            );
+            let (runner, producer_cmd, consumer_cmd) = cue_ip04_test_commands(
+                producer, consumer.clone(), vec![out.display().to_string()],
+            );
+            let result = tokio::time::timeout(
+                Duration::from_secs(4),
+                runner.run_pipeline_with_exact_pcm_extent(
+                    producer_cmd, consumer_cmd,
+                    super::super::cue_flac_range::ExactPcmExtent::for_expected_bytes(expected),
+                    &CancellationToken::new(),
+                ),
+            ).await.expect("verified pipe settled without deadlock");
+            if success {
+                let output = result.expect("exact transfer must succeed");
+                assert_eq!(output.producer.exit, ProcessExit::Code(0));
+                assert_eq!(output.consumer.exit, ProcessExit::Code(0));
+                assert_eq!(std::fs::read(&out).unwrap(), b"abcdefgh");
+            } else {
+                let error = result.expect_err("count mismatch must fail pipeline");
+                assert!(matches!(error.error, ToolRunnerError::Io(_)
+                    | ToolRunnerError::Cancelled { .. }
+                    | ToolRunnerError::Termination { .. }), "{error:?}");
+                assert!(!error.other_commands.is_empty(), "real child records survive failure");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cue_ip04_supervised_exact_pipe_reaps_both_on_consumer_error_and_cancel() {
+        let producer = write_executable_test_script(
+            "cue-ip04-endless-producer", "#!/bin/sh\nexec /bin/dd if=/dev/zero bs=65536 2>/dev/null\n",
+        );
+        let consumer = write_executable_test_script(
+            "cue-ip04-early-consumer",
+            "#!/bin/sh\nprintf 'cue-ip04-encoder-refused\n' >&2\nexit 7\n",
+        );
+        let (runner, source, sink) = cue_ip04_test_commands(
+            producer.clone(), consumer, vec![],
+        );
+        let error = tokio::time::timeout(Duration::from_secs(4),
+            runner.run_pipeline_with_exact_pcm_extent(
+                source, sink,
+                super::super::cue_flac_range::ExactPcmExtent::for_expected_bytes(500_000),
+                &CancellationToken::new(),
+            ),
+        ).await.expect("early encoder exit cannot deadlock").expect_err("early failure");
+        match error.error {
+            ToolRunnerError::NonZeroExit {
+                exit: ProcessExit::Code(7), stderr_tail, command,
+            } => {
+                assert!(stderr_tail.contains("cue-ip04-encoder-refused"));
+                assert!(command.stderr_tail.contains("cue-ip04-encoder-refused"));
+                assert_eq!(command.binary, ToolBinary::Sox);
+            }
+            other => panic!("encoder exit code 7 must remain causal: {other:?}"),
+        }
+        assert!(error.other_commands.iter().any(|record|
+            record.binary == ToolBinary::Ffmpeg), "producer record retained");
+
+        let consumer = write_executable_test_script(
+            "cue-ip04-slow-consumer", "#!/bin/sh\nexec /bin/cat >/dev/null\n",
+        );
+        let (runner, source, sink) = cue_ip04_test_commands(producer, consumer, vec![]);
+        let cancel = CancellationToken::new();
+        let cancelling = cancel.clone();
+        let future = runner.run_pipeline_with_exact_pcm_extent(
+            source, sink,
+            super::super::cue_flac_range::ExactPcmExtent::for_expected_bytes(u64::MAX),
+            &cancel,
+        );
+        let trigger = async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            cancelling.cancel();
+        };
+        let (result, ()) = tokio::time::timeout(
+            Duration::from_secs(4), async { tokio::join!(future, trigger) },
+        ).await.expect("cancellation reaps the supervised pipeline");
+        assert!(result.is_err(), "cancelled transfer cannot produce an artifact");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cue_ip04_supervised_exact_pipe_retains_peer_when_primary_has_no_command() {
+        let producer = Err(ToolRunnerError::Io(std::io::Error::other(
+            "producer failed before recording a command",
+        )));
+        let consumer_cmd = closed_command(ToolBinary::Sox, vec![], Duration::from_secs(5));
+        let consumer_record = RealToolRunner::build_record(
+            &consumer_cmd, Some(ProcessExit::Code(0)), "sink-ok", "sink-stderr",
+            Duration::from_millis(12),
+        );
+        let consumer = Ok(ToolOutput {
+            exit: ProcessExit::Code(0),
+            stdout_tail: "sink-ok".to_string(),
+            stderr_tail: "sink-stderr".to_string(),
+            elapsed: Duration::from_millis(12),
+            command: consumer_record.clone(),
+        });
+        let peers = verified_pipe_other_commands(
+            VerifiedPipeFault::Producer, &producer, &consumer,
+        );
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].binary, ToolBinary::Sox);
+        assert_eq!(peers[0].stdout_tail, "sink-ok");
+        assert_eq!(peers[0].stderr_tail, "sink-stderr");
+        assert_eq!(peers[0].sanitized_args, consumer_record.sanitized_args);
+
+        let reverse = verified_pipe_other_commands(
+            VerifiedPipeFault::Consumer, &consumer, &producer,
+        );
+        assert_eq!(reverse.len(), 1, "reverse role must retain its healthy peer");
+        assert_eq!(reverse[0].binary, ToolBinary::Sox);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cue_ip04_supervised_exact_pipe_preserves_tool_failures_and_stderr_load() {
+        let producer = write_executable_test_script(
+            "cue-ip04-nonzero-producer",
+            "#!/bin/sh\nprintf 'abcdefgh'\nexit 9\n",
+        );
+        let consumer = write_executable_test_script(
+            "cue-ip04-sink", "#!/bin/sh\nexec /bin/cat >/dev/null\n",
+        );
+        let (runner, source, sink) = cue_ip04_test_commands(
+            producer, consumer.clone(), vec![],
+        );
+        let result = runner.run_pipeline_with_exact_pcm_extent(
+            source, sink,
+            super::super::cue_flac_range::ExactPcmExtent::for_expected_bytes(8),
+            &CancellationToken::new(),
+        ).await.expect_err("full byte extent with nonzero decoder still fails");
+        assert!(matches!(result.error, ToolRunnerError::NonZeroExit { .. }));
+        assert!(!result.other_commands.is_empty());
+
+        let producer = write_executable_test_script(
+            "cue-ip04-stderr-producer",
+            "#!/bin/sh\n/bin/dd if=/dev/zero bs=1024 count=256 2>/dev/null >&2\nprintf 'abcdefgh'\n",
+        );
+        let (runner, source, sink) = cue_ip04_test_commands(
+            producer, consumer, vec![],
+        );
+        let output = tokio::time::timeout(Duration::from_secs(4),
+            runner.run_pipeline_with_exact_pcm_extent(
+                source, sink,
+                super::super::cue_flac_range::ExactPcmExtent::for_expected_bytes(8),
+                &CancellationToken::new(),
+            ),
+        ).await.expect("stderr load cannot deadlock").expect("exact PCM despite stderr load");
+        assert_eq!(output.producer.exit, ProcessExit::Code(0));
+        assert!(output.producer.stderr_tail.len() <= TOOL_OUTPUT_TAIL_BYTES);
+    }
+
 }

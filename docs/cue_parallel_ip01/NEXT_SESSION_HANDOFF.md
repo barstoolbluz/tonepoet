@@ -1,3 +1,14 @@
+# Current IP-04 corrective handoff — October 25, 2026
+
+**Status: `implemented-unqualified` — S3 OFF — NOT ACCEPTED.** D-01/D-02/D-03 are corrected in the candidate source; unexecuted Rust tests remain unqualified. Preserve the accepted IP-03 source `TonePoet_SNAPSHOT_c1103be_2026-10-24.tar.gz` (`fc3ea07b6a8ffac0b21f366b50e01693ee6b0b626a89749f551f964bcda815d7`) and the pre-correction IP-04 candidate (`662379ddebf6...`) as rollback/review inputs. Read `ip04_verification/CORRECTIVE_D01_D03_2026-10-25.md`, `ip04_verification/NEXT_SESSION_HANDOFF.md`, and host gate commands. New archive identity is in the **external** delivery receipt; no `.git` in the archive. No normal dispatcher may call the private worker.
+---
+
+# IP-04 handoff — CURRENT (October 24, 2026)
+
+**`implemented-unqualified` — S3 OFF — NOT ACCEPTED.** Exact input `TonePoet_SNAPSHOT_c1103be_2026-10-24.tar.gz` SHA-256 `fc3ea07b6a8ffac0b21f366b50e01693ee6b0b626a89749f551f964bcda815d7` is host-accepted IP-03 by supplied identity letter; earlier in-archive IP-03 candidate notes are historical. Current candidate output's true full SHA-256 and file name are in the **external** `TonePoet_CUE_IP04_DELIVERY_RECEIPT_<sha12>.md`. Read `ip04_verification/NEXT_SESSION_HANDOFF.md` and `ip04_verification/VERIFICATION_RESULTS.md` first. 42/42 independent native reference PCM slices passed, but **Rust build/tests NOT RUN** because no toolchain. Qualify IP-04 on a Rust host before doing IP-05; keep accepted input as rollback and preserve S1 selection unchanged.
+
+---
+
 # IP-03 durable handoff — current (2026-10-24)
 
 **Status: `implemented-unqualified` / NOT ACCEPTED. IP-04 is blocked until owner/host acceptance.** This current handoff supersedes the preserved IP-01 historical handoff below.

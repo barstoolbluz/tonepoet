@@ -1,3 +1,9 @@
+# IP-04 conformance checkpoint — 2026-10-24
+
+Private worker, exact boundary verifier, IP-03 weighted token custody and S1 isolation are source-implemented. Native independently checked 42/42 FLAC range PCM outputs. **Rust host gate NOT RUN / not accepted.** The authoritative IP-04 matrix is `ip04_verification/CONFORMANCE_MATRIX.md`; below is preserved IP-03/IP-01 history.
+
+---
+
 # IP-03 current conformance (October 24, 2026)
 
 | Requirement | Implementation/evidence | Status |

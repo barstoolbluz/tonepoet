@@ -1,0 +1,5 @@
+IP-04 D01-D03 corrective / accepted IP-03 source (2026-10-25)
+PASS `patch --dry-run -p1` on fresh extracted `TonePoet_SNAPSHOT_c1103be_2026-10-24.tar.gz`.
+Exactly four Rust production files checked: cue_flac_range.rs, tool.rs, track_executor.rs, stages.rs.
+See `PRODUCTION_DIFF.patch` for the cumulative source patch and `CORRECTIVE_DIFF.patch` for the two-file delta from prior unqualified IP-04 candidate.
+The input archive SHA-256 was independently verified before changes.

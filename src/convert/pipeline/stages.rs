@@ -8,7 +8,7 @@
 //! `map_album_outcome` are real implementations in PR 1 — they are
 //! pure logic and are exercised by PR 1's exit-condition tests.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -66,6 +66,7 @@ use super::actions::{
 #[cfg(all(test, target_os = "linux"))]
 use super::actions::{ScriptInvocation, ScriptOutcome};
 use super::materializer_archive::ArchiveMaterializer;
+use super::cue_flac_range::{CueFlacRangeDecoder, CueFlacRangeRequest};
 use super::materializer_cue::{
     cue_streaming_scratch_facts, is_cue_image_candidate, CueImageMaterializer,
     CueStreamingScratchFacts,
@@ -90,6 +91,7 @@ use super::track_executor::{
     finalize_cue_stream_direct_track_plan, prepare_cue_stream_direct_track_plan,
     retained_pcm_scalar_stream_plan_admitted,
     run_segmented_tool_pipeline_with_concurrency, SegmentedPipelineExecutionError,
+    run_cue_s3_pipeline_if_admitted, CueS3PipelineAttempt,
     materialize_reference_source_for_album_gain,
     reference_bound_metadata_executable,
     reference_metadata_toolchains_match, run_bound_tool_command_with_concurrency,
@@ -45128,12 +45130,16 @@ async fn finalize_cue_stream_consumer_output(
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
+    // Only S3 calls with Some; its supervised transport already certified
+    // exact producer EOF/extent, independently of FFmpeg's exit status.
+    qualified_range: Option<(u64, u64, u64)>,
 ) -> ScheduledTrackOutput {
     let metadata_satisfaction = plan.metadata_satisfaction;
     let consumer_elapsed = consumer_output.elapsed;
     let mut consumer_record = consumer_output.command;
     consumer_record.description = Some(format!(
-        "Direct encode from shared CUE PCM stream for track {}",
+        "Direct encode from {} CUE PCM stream for track {}",
+        if qualified_range.is_some() { "independent exact-range" } else { "shared" },
         input.track.id.source_ordinal
     ));
 
@@ -45142,15 +45148,35 @@ async fn finalize_cue_stream_consumer_output(
     // the successful invocation or masquerade it as never attempted.
     let mut completed_evidence = TrackExecutionEvidence::default();
     let mut decode = OperationRecord::completed(
-        "shared-cue-decode",
-        "shared_cue_decode",
-        "Decode shared CUE image",
+        if qualified_range.is_some() { "s3-cue-range-decode" } else { "shared-cue-decode" },
+        if qualified_range.is_some() { "independent_cue_flac_range_decode" } else { "shared_cue_decode" },
+        if qualified_range.is_some() { "Decode sample-qualified CUE FLAC range" } else { "Decode shared CUE image" },
         super::execution_evidence::ExecutionBackend::external(producer_record.binary.default_name()),
     );
     decode.inputs.push(super::execution_evidence::EvidenceArtifactRef::path(
-        "shared-source-image",
+        if qualified_range.is_some() { "physical-flac-source-image" } else { "shared-source-image" },
         source_decode_path,
     ));
+    if let Some((start, end, bytes)) = qualified_range {
+        decode.parameters.push(OperationParameter::new(
+            "Start sample (inclusive)", EvidenceValue::Unsigned(start),
+        ));
+        decode.parameters.push(OperationParameter::new(
+            "End sample (exclusive)", EvidenceValue::Unsigned(end),
+        ));
+        decode.parameters.push(OperationParameter::new(
+            "Exact producer PCM bytes", EvidenceValue::Unsigned(bytes),
+        ));
+        completed_evidence.verifications.push(VerificationRecord {
+            id: "s3-exact-producer-extent".to_string(),
+            kind: "exact_pcm_extent".to_string(),
+            statement: format!(
+                "Supervised independent range producer yielded exactly {bytes} PCM bytes",
+            ),
+            status: VerificationStatus::Passed,
+            invocation_indices: vec![0],
+        });
+    }
     decode.invocation_indices.push(0);
     completed_evidence.operations.push(decode);
     let mut consumer_evidence = super::execution_evidence::completed_plan_evidence_or_fallback(
@@ -45219,7 +45245,11 @@ async fn finalize_cue_stream_consumer_output(
                 domain: SizeDomain::WorkingArtifact,
                 bytes,
                 path: None,
-                note: Some("selected shared-CUE decoded PCM extent; not original stored bytes".to_string()),
+                note: Some(if qualified_range.is_some() {
+                    "independently verified CUE FLAC range decoded PCM extent; not original stored bytes".to_string()
+                } else {
+                    "selected shared-CUE decoded PCM extent; not original stored bytes".to_string()
+                }),
             });
         }
         if let Some(bytes) = bytes_out {
@@ -45303,6 +45333,299 @@ async fn finalize_cue_stream_consumer_output(
             }
         }
     }
+}
+
+// IP-04: private FLAC-only per-track executor. No user-facing dispatch or
+// album publisher references this function. IP-05 owns admission and policy.
+// The preflight is group-atomic; after spawn, each track returns a separate
+// staged attempt and is NEVER silently re-executed on S1.
+struct CueS3PrivatePrepared {
+    input: ScheduledCueStreamTrack,
+    staged_path: PathBuf,
+    plan: CueStreamDirectTrackPlan,
+    decoder: CueFlacRangeDecoder,
+    consumer: ToolCommand,
+}
+
+// Unlike Path::exists, symlink_metadata catches a dangling symlink occupying
+// a supposedly unused private work/staging name. I/O failures fail closed.
+fn cue_s3_path_is_occupied(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn prepare_qualified_flac_ranges_for_group(
+    tracks: &[ScheduledCueStreamTrack],
+    req: &PipelineRequest,
+    convert_root: &Path,
+) -> Result<Vec<CueS3PrivatePrepared>, ConvertError> {
+    if req.settings.target_format != tonepoet_pipeline::AudioFormat::Flac {
+        return Err(ConvertError::Backend("private S3 pilot requires FLAC output".to_string()));
+    }
+    let mut planned: Vec<CueS3PrivatePrepared> = Vec::with_capacity(tracks.len());
+    let mut seen_indices = BTreeSet::new();
+    let mut seen_paths = BTreeSet::new();
+    let mut seen_ordinals = BTreeSet::new();
+    let mut physical_source: Option<(PathBuf, PathBuf, u16, CueSegmentCarrier, u64)> = None;
+    for input in tracks {
+        // Do not create or reset another track's work directory if a CUE
+        // identity, target path or stage path is already duplicated.
+        let member = (|| -> Result<CueS3PrivatePrepared, ConvertError> {
+            let TrackSourceRef::CueStreamSegment {
+                fallback_path, source_image, decode_path, carrier, channels,
+                image_samples, start_sample, samples,
+            } = &input.track.source_ref else {
+                return Err(ConvertError::Backend("S3 requires typed CUE segments".to_string()));
+            };
+            if *samples == 0 || start_sample.checked_add(*samples)
+                .filter(|end| *end <= *image_samples).is_none()
+            {
+                return Err(ConvertError::Backend("S3 invalid track sample extent".to_string()));
+            }
+            let source_identity = (
+                source_image.clone(), decode_path.clone(), *channels, *carrier, *image_samples,
+            );
+            if physical_source.as_ref().is_some_and(|source| source != &source_identity) {
+                return Err(ConvertError::Backend("S3 group crosses a physical FILE or carrier".to_string()));
+            }
+            physical_source.get_or_insert(source_identity);
+            if !seen_indices.insert(input.index)
+                || !seen_ordinals.insert(input.track.id.source_ordinal)
+                || !seen_paths.insert(input.final_path.clone())
+            {
+                return Err(ConvertError::Backend("S3 duplicate group member identity or final path".to_string()));
+            }
+            let sample_rate = input.track.scalar_sample_rate()
+                .ok_or_else(|| ConvertError::Backend("S3 missing source sample rate".to_string()))?;
+            let source_bits = input.track.bit_depth
+                .and_then(|depth| u16::try_from(depth).ok())
+                .ok_or_else(|| ConvertError::Backend("S3 missing integer source depth".to_string()))?;
+            if input.track.source_audio.bit_depth != Some(u32::from(source_bits))
+                || input.track.source_audio.coding != Some(SourceAudioCoding::Pcm)
+                || input.track.expected_samples != Some(*samples)
+            {
+                return Err(ConvertError::Backend("S3 planner/source sample or depth facts drift".to_string()));
+            }
+            let range_request = CueFlacRangeRequest::from_segment(
+                &input.track.source_ref, sample_rate, source_bits,
+            ).map_err(|error| ConvertError::Backend(format!("S3 FLAC range request: {error}")))?;
+            let decoder = CueFlacRangeDecoder::prepare(&range_request)
+                .map_err(|error| ConvertError::Backend(format!("S3 independent FLAC range: {error}")))?;
+            let staged_path = staged_audio_path(
+                convert_root, &input.final_path, &input.track.id, &req.settings.target_format,
+            );
+            if !seen_paths.insert(staged_path.clone()) || cue_s3_path_is_occupied(&staged_path)? {
+                return Err(ConvertError::Backend("S3 staged destination is not unused and unique".to_string()));
+            }
+            if let Some(parent) = staged_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let plan = prepare_cue_stream_direct_track_plan(
+                req, &input.track, fallback_path, &staged_path, convert_root,
+            )?.ok_or_else(|| ConvertError::Backend(
+                "S3 member has no planner-approved source-rate direct encode".to_string(),
+            ))?;
+            let consumer = (|| -> Result<ToolCommand, ConvertError> {
+                let consumer = cue_stream_consumer_command(
+                    &plan, sample_rate, *channels, *carrier,
+                )?;
+                if !matches!(consumer.binary, ToolBinary::Ffmpeg | ToolBinary::Sox) {
+                    return Err(ConvertError::Backend("S3 encoder family not supported".to_string()));
+                }
+                let work_path = plan.work_output()?;
+                if let Some(parent) = work_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                // No existing partial may be mistaken for this fresh attempt.
+                if cue_s3_path_is_occupied(&work_path)? {
+                    return Err(ConvertError::Backend("S3 private work output already exists".to_string()));
+                }
+                Ok(consumer)
+            })();
+            let consumer = match consumer {
+                Ok(consumer) => consumer,
+                Err(error) => {
+                    cleanup_cue_stream_direct_track_plan(&plan);
+                    return Err(error);
+                }
+            };
+            Ok(CueS3PrivatePrepared {
+                input: input.clone(), staged_path, plan, decoder, consumer,
+            })
+        })();
+        match member {
+            Ok(member) => planned.push(member),
+            Err(error) => {
+                for prepared in &planned {
+                    cleanup_cue_stream_direct_track_plan(&prepared.plan);
+                }
+                return Err(error);
+            }
+        }
+    }
+    Ok(planned)
+}
+
+fn cue_s3_failed_member(
+    prepared: &CueS3PrivatePrepared,
+    commands: Vec<CommandRecord>,
+    message: String,
+) -> ScheduledTrackOutput {
+    ScheduledTrackOutput {
+        index: prepared.input.index,
+        record: failed_track_record(
+            &prepared.input.track,
+            None,
+            Some(prepared.staged_path.clone()),
+            commands,
+            message,
+        ),
+        artifact: None,
+        ok: false,
+        metadata_satisfaction: PlannedMetadataSatisfaction::none(),
+    }
+}
+
+async fn run_qualified_flac_range_member(
+    prepared: CueS3PrivatePrepared,
+    req: &PipelineRequest,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    limits: &Arc<ToolConcurrencyLimits>,
+) -> ScheduledTrackOutput {
+    let range = prepared.decoder.sample_bounds();
+    let expected_bytes = prepared.decoder.expected_pcm_bytes();
+    let attempted = run_cue_s3_pipeline_if_admitted(
+        prepared.decoder.command(), prepared.consumer.clone(), runner, cancel,
+        limits, Some(prepared.decoder.extent_verifier()),
+    ).await;
+    let output = match attempted {
+        Ok(CueS3PipelineAttempt::Executed(Ok(pipeline))) => {
+            let mut producer = pipeline.producer.command;
+            producer.description = Some(format!(
+                "Independent FLAC CUE range [{}, {}) for track {}",
+                range.0, range.1, prepared.input.track.id.source_ordinal,
+            ));
+            finalize_cue_stream_consumer_output(
+                prepared.input.clone(), prepared.staged_path.clone(), prepared.plan,
+                pipeline.consumer, &producer, prepared.decoder.source_path(),
+                req, runner, cancel, Some(limits),
+                Some((range.0, range.1, expected_bytes)),
+            ).await
+        }
+        other => {
+            let (commands, message) = match other {
+                Ok(CueS3PipelineAttempt::Declined) => (
+                    Vec::new(), "S3 declined before launch: shared child permits unavailable".to_string(),
+                ),
+                Ok(CueS3PipelineAttempt::Executed(Err(error))) => {
+                    let mut commands = error.other_commands;
+                    if let Some(record) = command_from_tool_error(&error.error) {
+                        if !commands.iter().any(|item| item.binary == record.binary
+                            && item.sanitized_args == record.sanitized_args
+                            && item.cwd == record.cwd)
+                        {
+                            commands.push(record);
+                        }
+                    }
+                    // True attribution survives two FFmpeg children and is
+                    // sorted by command identity, not tool family name.
+                    let producer_args = prepared.decoder.command().sanitized_args();
+                    commands.sort_by_key(|record| {
+                        if record.sanitized_args == producer_args { 0 } else { 1 }
+                    });
+                    (commands, format!("S3 independently supervised range failed: {}", error.error))
+                }
+                Err(error) => (Vec::new(), format!("S3 admission error: {error}")),
+                Ok(CueS3PipelineAttempt::Executed(Ok(_))) => unreachable!(),
+            };
+            let result = cue_s3_failed_member(&prepared, commands, message);
+            cleanup_cue_stream_direct_track_plan(&prepared.plan);
+            result
+        }
+    };
+    // No failed private stage may survive for later accidental publication.
+    // The existing plan cleanup handles its work output, and validation may
+    // have already moved that output to the staged artifact.
+    if !output.ok {
+        if let Err(error) = fs::remove_file(&prepared.staged_path) {
+            if error.kind() != io::ErrorKind::NotFound {
+                log::error!(
+                    "S3 failed stage cleanup for {}: {error}",
+                    prepared.staged_path.display(),
+                );
+            }
+        }
+    }
+    output
+}
+
+/// IP-04 private proof entry point; NEVER invoked by ordinary CUE routing.
+/// Preflight is all-or-nothing, execution is independent per track. Two work
+/// futures at most are polled concurrently, even for 200 members. The shared
+/// IP-03 limits arbitrate across simultaneous private albums; no spin, wait
+/// queue, second permit acquisition, or automatic S1 retry is introduced.
+#[allow(dead_code)]
+async fn run_qualified_flac_ranges_for_group(
+    tracks: Vec<ScheduledCueStreamTrack>,
+    req: &PipelineRequest,
+    convert_root: &Path,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    limits: &Arc<ToolConcurrencyLimits>,
+) -> Result<Vec<ScheduledTrackOutput>, ConvertError> {
+    if cancel.is_cancelled() {
+        return Err(ConvertError::Realize("cancelled".to_string()));
+    }
+    let mut prepared = VecDeque::from(prepare_qualified_flac_ranges_for_group(
+        &tracks, req, convert_root,
+    )?);
+    let mut outputs = Vec::with_capacity(prepared.len());
+    let bound = limits.cue_s3_max_in_flight().min(2);
+    // A sliding two-worker window: refill a slot immediately after its
+    // worker settles. `join!` per pair would impose a slow-worker barrier,
+    // wasting capacity on albums with uneven track lengths.
+    let mut first = prepared.pop_front().map(|job| Box::pin(
+        run_qualified_flac_range_member(job, req, runner, cancel, limits),
+    ));
+    let mut second = if bound > 1 {
+        prepared.pop_front().map(|job| Box::pin(
+            run_qualified_flac_range_member(job, req, runner, cancel, limits),
+        ))
+    } else {
+        None
+    };
+    while first.is_some() || second.is_some() {
+        let (slot, result) = match (&mut first, &mut second) {
+            (Some(a), Some(b)) => tokio::select! {
+                result = a => (0, result),
+                result = b => (1, result),
+            },
+            (Some(a), None) => (0, a.await),
+            (None, Some(b)) => (1, b.await),
+            (None, None) => unreachable!("S3 loop has a live worker"),
+        };
+        outputs.push(result);
+        let next = prepared.pop_front().map(|job| Box::pin(
+            run_qualified_flac_range_member(job, req, runner, cancel, limits),
+        ));
+        if slot == 0 {
+            first = next;
+        } else {
+            second = next;
+        }
+    }
+    order_qualified_cue_results(&mut outputs);
+    Ok(outputs)
+}
+
+/// A stable reporting/publication input order is independent of which native
+/// worker happens to finish first. This operates on completed records only.
+fn order_qualified_cue_results(outputs: &mut [ScheduledTrackOutput]) {
+    outputs.sort_by_key(|output| output.index);
 }
 
 /// Private-safe physical group identity, shared with the scheduler's existing
@@ -45773,6 +46096,7 @@ async fn encode_cue_stream_group_with_runner(
                                     runner,
                                     &cancel,
                                     tool_concurrency_limits.as_ref(),
+                                    None,
                                 ))
                                 .await,
                             );
@@ -45895,6 +46219,7 @@ async fn encode_cue_stream_group_with_runner(
                 runner,
                 &cancel,
                 tool_concurrency_limits.as_ref(),
+                None,
             ))
             .await,
         );
@@ -81668,6 +81993,393 @@ retry log
         assert!(matches!(output.record.outcome, TrackOutcome::Err(_)));
         assert_eq!(output.index, 0);
     }
+
+    /// Execute the real supervised two-child S3 private worker against an
+    /// independently decoded, full-image PCM reference. The image is created
+    /// outside the repository and no user-facing CUE dispatch is used.
+    #[cfg(unix)]
+    async fn cue_ip04_real_flac_case(source_bits: u32, members: usize) {
+        let temp = tempfile::tempdir().expect("S3 private fixture directory");
+        let source_path = temp.path().join("album.flac");
+        let sample_rate = 44_100_u32;
+        let samples_per_track = if members == 3 { 44_100_u64 } else { 4_410_u64 };
+        let image_samples = samples_per_track * members as u64;
+        let mut command = std::process::Command::new("ffmpeg");
+        command.args([
+            "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i",
+        ]).arg(format!(
+            "sine=frequency=440:sample_rate={sample_rate}:duration={}",
+            image_samples as f64 / f64::from(sample_rate),
+        )).args(["-ac", "2", "-c:a", "flac"]);
+        if source_bits == 24 {
+            command.args(["-sample_fmt", "s32", "-bits_per_raw_sample", "24"]);
+        } else {
+            command.args(["-sample_fmt", "s16"]);
+        }
+        let generation = command.arg(&source_path).output().expect("native FLAC encoder available");
+        assert!(generation.status.success(), "fixture FLAC failed: {}",
+            String::from_utf8_lossy(&generation.stderr));
+        let streaminfo = super::super::materializer_cue::cue_exact_flac_streaminfo(&source_path)
+            .expect("generated FLAC has exact STREAMINFO");
+        assert_eq!(streaminfo, (sample_rate, 2, u16::try_from(source_bits).unwrap(), image_samples));
+
+        let mut request = request(
+            temp.path(), FailurePolicy::FailAlbumOnAnyTrackFailure,
+            stage_policy(false, false, false), OverwritePolicy::FailIfExists,
+        );
+        request.settings.target_format = tonepoet_pipeline::AudioFormat::Flac;
+        request.settings.preferred_tool = tonepoet_pipeline::PreferredTool::Ffmpeg;
+        let tracks = (0..members).map(|index| {
+            let mut track = prepared_source(temp.path(), &[track_id(index as u32)])
+                .tracks.remove(0);
+            let start_sample = index as u64 * samples_per_track;
+            track.bit_depth = Some(source_bits);
+            track.source_audio = SourceAudioDescriptor::from_scalar(
+                Some(sample_rate), Some(source_bits), Some(SourceAudioCoding::Pcm),
+            );
+            track.expected_samples = Some(samples_per_track);
+            track.source_ref = TrackSourceRef::CueStreamSegment {
+                fallback_path: temp.path().join(format!("fallback-{index}.wav")),
+                source_image: source_path.clone(),
+                decode_path: source_path.clone(),
+                start_sample,
+                samples: samples_per_track,
+                image_samples,
+                carrier: CueSegmentCarrier::PcmS32LeWav,
+                channels: 2,
+            };
+            ScheduledCueStreamTrack {
+                index,
+                track,
+                final_path: temp.path().join(format!("visible-{index}.flac")),
+            }
+        }).collect::<Vec<_>>();
+        let limits = Arc::new(ToolConcurrencyLimits::new(2, 4, 1, 4));
+        let runner = RealToolRunner::new(HashMap::new());
+        let outputs = run_qualified_flac_ranges_for_group(
+            tracks.clone(), &request, &temp.path().join("private-work"),
+            &runner, &CancellationToken::new(), &limits,
+        ).await.expect("whole-group S3 preflight");
+        assert_eq!(outputs.len(), members);
+        assert_eq!(outputs.iter().map(|item| item.index).collect::<Vec<_>>(),
+            (0..members).collect::<Vec<_>>(), "original member ordering");
+        let reference = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-nostdin", "-i"])
+            .arg(&source_path)
+            .args(["-f", "s32le", "-c:a", "pcm_s32le", "pipe:1"])
+            .output().expect("independently decode entire source");
+        assert!(reference.status.success());
+        let frame_bytes = 2 * 4_usize;
+        assert_eq!(reference.stdout.len() as u64, image_samples * frame_bytes as u64);
+        let mut staged_paths = BTreeSet::new();
+        for (position, output) in outputs.iter().enumerate() {
+            assert!(output.ok, "S3 track {position} failure: {:?}", output.record);
+            assert!(output.record.commands.len() == 2);
+            assert_eq!(output.record.source_ref, tracks[position].track.source_ref);
+            let artifact = output.artifact.as_ref().expect("private stage artifact");
+            assert!(staged_paths.insert(artifact.staged_path.clone()), "private stages distinct");
+            assert!(!artifact.final_path.exists(), "no visible publication in IP-04");
+            assert_eq!(artifact.samples, Some(samples_per_track));
+            assert!(output.record.execution_evidence.verifications.iter().any(|entry|
+                entry.kind == "exact_pcm_extent" && entry.status == VerificationStatus::Passed));
+            let decoded = std::process::Command::new("ffmpeg")
+                .args(["-v", "error", "-nostdin", "-i"])
+                .arg(&artifact.staged_path)
+                .args(["-f", "s32le", "-c:a", "pcm_s32le", "pipe:1"])
+                .output().expect("decode private artifact");
+            assert!(decoded.status.success());
+            let first = position * samples_per_track as usize * frame_bytes;
+            let last = first + samples_per_track as usize * frame_bytes;
+            assert_eq!(&decoded.stdout, &reference.stdout[first..last],
+                "every decoded PCM frame must equal independent full-image slice");
+        }
+        assert_eq!(limits.ffmpeg_available_permits_for_test(), 4);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cue_ip04_private_real_three_tracks_16_and_24_exact_pcm() {
+        cue_ip04_real_flac_case(16, 3).await;
+        cue_ip04_real_flac_case(24, 3).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "native FFmpeg 12/30-track load qualification; run explicitly on build host"]
+    async fn cue_ip04_private_real_twelve_and_thirty_tracks_bounded() {
+        cue_ip04_real_flac_case(16, 12).await;
+        cue_ip04_real_flac_case(24, 30).await;
+    }
+
+    #[test]
+    fn cue_ip04_private_reorders_three_two_one_completion_by_source_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let (tracks, _) = cue_stream_three_track_group(temp.path(), 16);
+        // Deliberately simulate completion in ordinal order 3, 1, 2.
+        let mut outputs = [2_usize, 0, 1].into_iter().map(|index| {
+            ScheduledTrackOutput {
+                index,
+                record: failed_track_record(
+                    &tracks[index].track, None, None, vec![],
+                    format!("synthetic completed member {}", index + 1),
+                ),
+                artifact: None,
+                ok: false,
+                metadata_satisfaction: PlannedMetadataSatisfaction::none(),
+            }
+        }).collect::<Vec<_>>();
+        order_qualified_cue_results(&mut outputs);
+        assert_eq!(outputs.iter().map(|member| member.index).collect::<Vec<_>>(),
+            vec![0, 1, 2]);
+        for (index, member) in outputs.iter().enumerate() {
+            assert_eq!(member.record.source_ref, tracks[index].track.source_ref);
+        }
+    }
+
+    // IP-04 D-03: exercise the *actual private coordinator* with a runner
+    // whose completion notifications are held in a deterministic order. The
+    // runner delegates native PCM verification and encoding to RealToolRunner;
+    // only completion timing and attributable stdout/stderr test markers are
+    // controlled here. It does not model a new production scheduler.
+    #[cfg(unix)]
+    struct CueIp04OrderedCompletionRunner {
+        native: RealToolRunner,
+        work_path_owner: HashMap<String, usize>,
+        finish_gates: [Arc<tokio::sync::Semaphore>; 3],
+        completed: tokio::sync::mpsc::UnboundedSender<usize>,
+    }
+
+    #[cfg(unix)]
+    #[async_trait]
+    impl ToolRunner for CueIp04OrderedCompletionRunner {
+        async fn run(
+            &self,
+            command: ToolCommand,
+            cancel: &CancellationToken,
+        ) -> Result<ToolOutput, ToolRunnerError> {
+            // Keep real ffprobe post-encode sample/depth validation.
+            self.native.run(command, cancel).await
+        }
+
+        async fn run_pipeline_with_exact_pcm_extent(
+            &self,
+            producer: ToolCommand,
+            consumer: ToolCommand,
+            extent: super::super::cue_flac_range::ExactPcmExtent,
+            cancel: &CancellationToken,
+        ) -> Result<super::super::tool::ToolPipelineOutput, super::super::tool::ToolPipelineError> {
+            let work_path = consumer.args.last().expect("planned private work output");
+            let index = *self.work_path_owner.get(work_path)
+                .expect("fake runner only executes preflighted work paths");
+            let mut output = self.native.run_pipeline_with_exact_pcm_extent(
+                producer, consumer, extent, cancel,
+            ).await?;
+            // Hold each *completed* verified native pair before returning to
+            // the coordinator. With two worker slots, launch order 1,3,2
+            // permits completion 3,1,2 without ever admitting three at once.
+            let gate = self.finish_gates[index].acquire().await
+                .expect("test completion gate remains open");
+            gate.forget();
+            let producer_mark = format!("S3-producer-track-{}", index + 1);
+            let consumer_mark = format!("S3-consumer-track-{}", index + 1);
+            output.producer.stdout_tail = format!("{producer_mark}-stdout");
+            output.producer.stderr_tail = format!("{producer_mark}-stderr");
+            output.producer.command.stdout_tail = output.producer.stdout_tail.clone();
+            output.producer.command.stderr_tail = output.producer.stderr_tail.clone();
+            output.consumer.stdout_tail = format!("{consumer_mark}-stdout");
+            output.consumer.stderr_tail = format!("{consumer_mark}-stderr");
+            output.consumer.command.stdout_tail = output.consumer.stdout_tail.clone();
+            output.consumer.command.stderr_tail = output.consumer.stderr_tail.clone();
+            self.completed.send(index).expect("test completion receiver still active");
+            Ok(output)
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cue_ip04_private_fake_runner_three_one_two_preserves_attribution_and_gaps() {
+        let temp = tempfile::tempdir().expect("private CUE fake-runner fixture");
+        let source_path = temp.path().join("album.flac");
+        // The existing helper creates a placeholder at this path. Build the
+        // real fixture *after* it so preflight sees a genuine exact FLAC.
+        let (mut tracks, _) = cue_stream_three_track_group(temp.path(), 16);
+        let sample_rate = 44_100_u32;
+        let image_samples = 40_013_u64;
+        let ranges = [(31_u64, 17_111_u64), (17_139, 35_137), (35_191, image_samples)];
+        // First unselected prefix, middle omitted intervals, a range crossing
+        // FLAC-frame boundaries, and a final partial frame. No PCM is cached
+        // by the production worker; this is test-only reference material.
+        assert!(ranges[0].0 > 0 && ranges[0].1 < ranges[1].0);
+        assert!(ranges[1].1 < ranges[2].0 && ranges[2].1 == image_samples);
+        let generated = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-nostdin", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100",
+                "-af", "atrim=end_sample=40013", "-ac", "2",
+                "-c:a", "flac", "-sample_fmt", "s16"])
+            .arg(&source_path)
+            .output().expect("native FLAC fixture encoder");
+        assert!(generated.status.success(), "FLAC fixture creation: {}",
+            String::from_utf8_lossy(&generated.stderr));
+        assert_eq!(
+            super::super::materializer_cue::cue_exact_flac_streaminfo(&source_path),
+            Some((sample_rate, 2, 16, image_samples)),
+            "fixture must have the exact final partial frame",
+        );
+
+        for (input, &(start_sample, end_sample)) in tracks.iter_mut().zip(&ranges) {
+            let samples = end_sample - start_sample;
+            input.track.expected_samples = Some(samples);
+            input.track.source_ref = TrackSourceRef::CueStreamSegment {
+                fallback_path: temp.path().join(format!("unused-{}.wav", input.index)),
+                source_image: source_path.clone(),
+                decode_path: source_path.clone(),
+                start_sample,
+                samples,
+                image_samples,
+                carrier: CueSegmentCarrier::PcmS32LeWav,
+                channels: 2,
+            };
+        }
+        let sources = tracks.clone();
+        // Launch 1 and 3 together, deliberately finish 3 first, then
+        // refill that slot with 2. This obtains completion 3,1,2 while
+        // exercising a genuinely out-of-launch-order first completion.
+        let launch_order = vec![tracks.remove(0), tracks.remove(1), tracks.remove(0)];
+        let mut req = request(
+            temp.path(), FailurePolicy::FailAlbumOnAnyTrackFailure,
+            stage_policy(false, false, false), OverwritePolicy::FailIfExists,
+        );
+        req.settings.target_format = tonepoet_pipeline::AudioFormat::Flac;
+        req.settings.preferred_tool = tonepoet_pipeline::PreferredTool::Ffmpeg;
+        let work_root = temp.path().join("private-work");
+        let planned = prepare_qualified_flac_ranges_for_group(
+            &launch_order, &req, &work_root,
+        ).expect("every independent source range preflighted");
+        let mut work_path_owner = HashMap::new();
+        let mut expected = BTreeMap::new();
+        for job in &planned {
+            assert!(work_path_owner.insert(
+                job.consumer.args.last().expect("work output arg").clone(),
+                job.input.index,
+            ).is_none(), "each work output has a unique owner");
+            expected.insert(job.input.index, (
+                job.staged_path.clone(), job.decoder.command().sanitized_args(),
+                job.consumer.sanitized_args(),
+            ));
+        }
+        let finish_gates: [Arc<tokio::sync::Semaphore>; 3] =
+            std::array::from_fn(|_| Arc::new(tokio::sync::Semaphore::new(0)));
+        let driver_gates = finish_gates.clone();
+        let (completed_tx, mut completed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let runner = CueIp04OrderedCompletionRunner {
+            native: RealToolRunner::new(HashMap::new()),
+            work_path_owner,
+            finish_gates,
+            completed: completed_tx,
+        };
+        let limits = Arc::new(ToolConcurrencyLimits::new(2, 4, 1, 4));
+        let cancel = CancellationToken::new();
+        let execute = run_qualified_flac_ranges_for_group(
+            launch_order, &req, &work_root, &runner, &cancel, &limits,
+        );
+        let release = async {
+            for index in [2_usize, 0, 1] {
+                driver_gates[index].add_permits(1);
+                assert_eq!(completed_rx.recv().await, Some(index),
+                    "exact fake-runner completion order must be 3,1,2");
+            }
+        };
+        let (outputs, ()) = tokio::time::timeout(Duration::from_secs(45), async {
+            tokio::join!(execute, release)
+        }).await.expect("bounded private coordinator and controlled fake complete");
+        let outputs = outputs.expect("private group preflight and execution");
+        assert_eq!(outputs.len(), 3);
+        assert_eq!(outputs.iter().map(|output| output.index).collect::<Vec<_>>(),
+            vec![0, 1, 2], "results must be source-ordered, not completion-ordered");
+
+        // Keep the assertion reusable for a deliberate negative test below:
+        // it detects either a swapped command record or a swapped stage path.
+        let attributed = |index: usize, record: &TrackRecord, artifact: &TrackArtifact| {
+            let (stage, producer_args, consumer_args) = &expected[&index];
+            record.track_id == sources[index].track.id
+                && record.source_ref == sources[index].track.source_ref
+                && artifact.track_id == sources[index].track.id
+                && artifact.staged_path == *stage
+                && artifact.final_path == sources[index].final_path
+                && record.commands.len() == 2
+                && record.commands[0].sanitized_args == *producer_args
+                && record.commands[1].sanitized_args == *consumer_args
+                && record.commands[0].stdout_tail == format!("S3-producer-track-{}-stdout", index + 1)
+                && record.commands[0].stderr_tail == format!("S3-producer-track-{}-stderr", index + 1)
+                && record.commands[1].stdout_tail == format!("S3-consumer-track-{}-stdout", index + 1)
+                && record.commands[1].stderr_tail == format!("S3-consumer-track-{}-stderr", index + 1)
+        };
+        let mut distinct_stages = BTreeSet::new();
+        let reference = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-nostdin", "-loglevel", "error", "-i"])
+            .arg(&source_path)
+            .args(["-f", "s32le", "-c:a", "pcm_s32le", "pipe:1"])
+            .output().expect("full-image reference PCM");
+        assert!(reference.status.success(), "reference decode failed");
+        assert_eq!(reference.stdout.len() as u64, image_samples * 8);
+        for (index, output) in outputs.iter().enumerate() {
+            assert!(output.ok, "private fake-runner worker {}: {:?}", index + 1, output.record);
+            let artifact = output.artifact.as_ref().expect("private staged artifact");
+            assert!(attributed(index, &output.record, artifact),
+                "worker {index} lost source, command, or stage identity");
+            assert!(distinct_stages.insert(artifact.staged_path.clone()));
+            assert!(!artifact.final_path.exists(), "private worker must not publish");
+            assert_eq!(artifact.samples, Some(ranges[index].1 - ranges[index].0));
+            let decoded = std::process::Command::new("ffmpeg")
+                .args(["-hide_banner", "-nostdin", "-loglevel", "error", "-i"])
+                .arg(&artifact.staged_path)
+                .args(["-f", "s32le", "-c:a", "pcm_s32le", "pipe:1"])
+                .output().expect("private artifact PCM decode");
+            assert!(decoded.status.success(), "private artifact decode failed: {}",
+                String::from_utf8_lossy(&decoded.stderr));
+            let start = usize::try_from(ranges[index].0 * 8).unwrap();
+            let end = usize::try_from(ranges[index].1 * 8).unwrap();
+            assert_eq!(decoded.stdout, reference.stdout[start..end],
+                "PCM mismatch in selected range including middle/final frames");
+        }
+        // Negative probe: both isolated attribution swaps MUST be detected by
+        // the same assertion used on the real coordinator results.
+        let first = outputs[0].artifact.as_ref().unwrap();
+        let second = outputs[1].artifact.as_ref().unwrap();
+        let mut swapped_record = outputs[0].record.clone();
+        swapped_record.commands[0] = outputs[1].record.commands[0].clone();
+        assert!(!attributed(0, &swapped_record, first),
+            "cross-worker decoder record swap escaped detection");
+        let mut swapped_artifact = first.clone();
+        swapped_artifact.staged_path = second.staged_path.clone();
+        assert!(!attributed(0, &outputs[0].record, &swapped_artifact),
+            "cross-worker staged path swap escaped detection");
+        assert_eq!(limits.ffmpeg_available_permits_for_test(), 4,
+            "private workers return shared IP-03 permits");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cue_ip04_private_preflight_refuses_unqualified_source_without_spawning() {
+        let temp = tempfile::tempdir().unwrap();
+        let (tracks, _) = cue_stream_three_track_group(temp.path(), 16);
+        // The existing helper writes a source placeholder rather than FLAC.
+        // No member may run or obtain a token while preflight is incomplete.
+        let mut req = request(
+            temp.path(), FailurePolicy::FailAlbumOnAnyTrackFailure,
+            stage_policy(false, false, false), OverwritePolicy::FailIfExists,
+        );
+        req.settings.target_format = tonepoet_pipeline::AudioFormat::Flac;
+        req.settings.preferred_tool = tonepoet_pipeline::PreferredTool::Ffmpeg;
+        let limits = ToolConcurrencyLimits::new(2, 4, 1, 4);
+        assert!(prepare_qualified_flac_ranges_for_group(
+            &tracks, &req, &temp.path().join("private-work"),
+        ).is_err());
+        assert_eq!(limits.ffmpeg_available_permits_for_test(), 4);
+        assert!(tracks.iter().all(|item| !item.final_path.exists()));
+    }
+
 }
 // CHUNK_2_1_3_FAILURE_CANCELLATION_TESTS_END
 

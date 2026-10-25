@@ -1,0 +1,14 @@
+# Final archive seal verification recipe (the actual outcome is in the external delivery receipt)
+
+Check archive SHA-256 from its separately delivered receipt. Extract as an
+unprivileged user, with either umask 022 or 077. From extracted source root:
+
+  python3 -B docs/cue_parallel_ip01/ip04_verification/verify_static_ip04.py
+  sha256sum -c docs/cue_parallel_ip01/ip04_verification/SHA256SUMS
+
+With the accepted IP-03 input extracted separately, also run:
+
+  python3 -B docs/cue_parallel_ip01/ip04_verification/verify_static_ip04.py --baseline /path/to/ip03/tonepoet
+
+The external delivery receipt records whether these commands actually ran
+on an independent fresh extract; do not infer PASS from this recipe alone.
