@@ -327,28 +327,59 @@ impl NativeReplayGainObserver {
     }
 
     pub(crate) fn push_interleaved(&mut self, samples: &[f64]) -> io::Result<()> {
-        // Both observers advance from the same real frame slice. If either
-        // fails, the whole grouped observation is terminal; callers must not
-        // splice a retry of only one observer into the other result.
-        self.loudness
-            .push_interleaved(samples)
+        self.push_interleaved_profiled(samples, None)
+    }
+
+    fn push_interleaved_profiled(
+        &mut self,
+        samples: &[f64],
+        mut profile: Option<&mut crate::convert::pipeline::rg_profile::ObserverMetrics>,
+    ) -> io::Result<()> {
+        use crate::convert::pipeline::rg_profile::ObserverStage;
+        // The same meter methods and order are used with diagnostics on/off.
+        // A failure terminates the entire grouped observation, as before.
+        let t = profile.as_ref().map(|_| std::time::Instant::now());
+        let loudness_result = self.loudness.push_interleaved(samples);
+        if let (Some(stats), Some(started)) = (profile.as_deref_mut(), t) {
+            stats.add(ObserverStage::LoudnessPush, started.elapsed());
+        }
+        loudness_result
             .map_err(|error| invalid(format!("native loudness observation failed: {error}")))?;
-        self.reporting_peak
-            .push_interleaved(samples)
+        let t = profile.as_ref().map(|_| std::time::Instant::now());
+        let peak_result = self.reporting_peak.push_interleaved(samples);
+        if let (Some(stats), Some(started)) = (profile.as_deref_mut(), t) {
+            stats.add(ObserverStage::PeakPush, started.elapsed());
+        }
+        peak_result
             .map_err(|error| invalid(format!("reporting peak observation failed: {error}")))?;
         Ok(())
     }
 
     fn finish(self, completion_evidence: String) -> io::Result<OwnedTrackObservation> {
+        self.finish_profiled(completion_evidence, None)
+    }
+
+    fn finish_profiled(
+        self,
+        completion_evidence: String,
+        mut profile: Option<&mut crate::convert::pipeline::rg_profile::ObserverMetrics>,
+    ) -> io::Result<OwnedTrackObservation> {
+        use crate::convert::pipeline::rg_profile::ObserverStage;
         let expected_subject = self.subject.clone();
         let expected_demand = self.demand;
-        let measurement = self
-            .loudness
-            .finalize()
+        let t = profile.as_ref().map(|_| std::time::Instant::now());
+        let measurement_result = self.loudness.finalize();
+        if let (Some(stats), Some(started)) = (profile.as_deref_mut(), t) {
+            stats.add(ObserverStage::LoudnessFinalize, started.elapsed());
+        }
+        let measurement = measurement_result
             .map_err(|error| invalid(format!("native loudness finalization failed: {error}")))?;
-        let reporting_peak = self
-            .reporting_peak
-            .finalize()
+        let t = profile.as_ref().map(|_| std::time::Instant::now());
+        let peak_result = self.reporting_peak.finalize();
+        if let (Some(stats), Some(started)) = (profile.as_deref_mut(), t) {
+            stats.add(ObserverStage::PeakFinalize, started.elapsed());
+        }
+        let reporting_peak = peak_result
             .map_err(|error| invalid(format!("reporting peak finalization failed: {error}")))?;
         validate_completed_measurement(
             &expected_subject,
@@ -1115,7 +1146,9 @@ pub(crate) fn observe_cue_mirror(
     demand: MetricDemand,
     storage_limit_bytes: usize,
     cancel: &CancellationToken,
+    mut profile: Option<&mut crate::convert::pipeline::rg_profile::ObserverMetrics>,
 ) -> io::Result<OwnedTrackObservation> {
+    use crate::convert::pipeline::rg_profile::ObserverStage;
     let roles = match channels {
         1 => vec![ChannelRole::Mono],
         2 => vec![ChannelRole::Left, ChannelRole::Right],
@@ -1129,10 +1162,20 @@ pub(crate) fn observe_cue_mirror(
         roles,
     };
     let mut observer = NativeReplayGainObserver::new_with_storage_limit(subject, demand, storage_limit_bytes)?;
-    let mut reader = open_fifo_reader_nonblocking(path)?;
+    let t = profile.as_ref().map(|_| std::time::Instant::now());
+    let opened = open_fifo_reader_nonblocking(path);
+    if let (Some(stats), Some(started)) = (profile.as_deref_mut(), t) {
+        stats.add(ObserverStage::FifoOpen, started.elapsed());
+    }
+    let mut reader = opened?;
     let mut saw_data = false;
     let mut header = vec![0_u8; expected_header.len()];
-    read_fifo_exact(&mut reader, &mut header, cancel, &mut saw_data)?;
+    let t = profile.as_ref().map(|_| std::time::Instant::now());
+    let header_result = read_fifo_exact(&mut reader, &mut header, cancel, &mut saw_data, profile.as_deref_mut());
+    if let (Some(stats), Some(started)) = (profile.as_deref_mut(), t) {
+        stats.add(ObserverStage::HeaderRead, started.elapsed());
+    }
+    header_result?;
     if header != expected_header {
         return Err(invalid("CUE source-pass mirror header does not match planned geometry"));
     }
@@ -1152,31 +1195,56 @@ pub(crate) fn observe_cue_mirror(
     while remaining > 0 {
         let wanted = remaining.min(chunk_frames * frame_bytes) as usize;
         raw.resize(wanted, 0);
-        read_fifo_exact(&mut reader, &mut raw, cancel, &mut saw_data)?;
-        let interleaved = decode_pcm_bytes(&raw, encoding)?;
+        let t = profile.as_ref().map(|_| std::time::Instant::now());
+        let read_result = read_fifo_exact(&mut reader, &mut raw, cancel, &mut saw_data, profile.as_deref_mut());
+        if let (Some(stats), Some(started)) = (profile.as_deref_mut(), t) {
+            stats.add(ObserverStage::PcmRead, started.elapsed());
+        }
+        read_result?;
+        let t = profile.as_ref().map(|_| std::time::Instant::now());
+        let decoded = decode_pcm_bytes(&raw, encoding);
+        if let (Some(stats), Some(started)) = (profile.as_deref_mut(), t) {
+            stats.add(ObserverStage::PcmDecode, started.elapsed());
+        }
+        let interleaved = decoded?;
         if interleaved.len() % usize::from(channels) != 0 {
             return Err(invalid("CUE mirror ended on a partial PCM frame"));
         }
-        observer.push_interleaved(&interleaved)?;
+        observer.push_interleaved_profiled(&interleaved, profile.as_deref_mut())?;
+        if let Some(stats) = profile.as_deref_mut() {
+            stats.blocks = stats.blocks.saturating_add(1);
+            stats.pcm_bytes = stats.pcm_bytes.saturating_add(wanted as u64);
+        }
         remaining -= wanted as u64;
     }
     let mut surplus = [0_u8; 1];
-    loop {
-        if cancel.is_cancelled() {
-            return Err(io::Error::new(io::ErrorKind::Interrupted, "CUE source-pass observation cancelled"));
-        }
-        match reader.read(&mut surplus) {
-            Ok(0) => break,
-            Ok(_) => return Err(invalid("CUE mirror contains unexpected PCM after declared payload")),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(5));
+    let eof_start = profile.as_ref().map(|_| std::time::Instant::now());
+    let eof_result = (|| -> io::Result<()> {
+        loop {
+            if cancel.is_cancelled() {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "CUE source-pass observation cancelled"));
             }
-            Err(error) => return Err(error),
+            match reader.read(&mut surplus) {
+                Ok(0) => return Ok(()),
+                Ok(_) => return Err(invalid("CUE mirror contains unexpected PCM after declared payload")),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if let Some(stats) = profile.as_deref_mut() {
+                        stats.would_block_poll_count = stats.would_block_poll_count.saturating_add(1);
+                    }
+                    wait_fifo_readable(&reader, cancel, profile.as_deref_mut())?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
         }
+    })();
+    if let (Some(stats), Some(started)) = (profile.as_deref_mut(), eof_start) {
+        stats.add(ObserverStage::EofWait, started.elapsed());
     }
-    let result = observer.finish(format!(
+    eof_result?;
+    let result = observer.finish_profiled(format!(
         "exact CUE FIFO header/payload/EOF; {payload_bytes} payload bytes"
-    ))?;
+    ), profile.as_deref_mut())?;
     if result.summary.real_frames != frames {
         return Err(invalid("CUE mirror frame count does not match declared programme extent"));
     }
@@ -1198,13 +1266,100 @@ fn open_fifo_reader_nonblocking(path: &Path) -> io::Result<File> {
     File::open(path)
 }
 
+// A connected-but-empty FIFO returns EAGAIN; the producer's next write or
+// close must wake the observer promptly. Do not use poll for the *initial*
+// no-writer state: a FIFO after writer closure can continuously report POLLHUP,
+// and polling it would spin. That state retains the bounded setup backoff.
+#[cfg(unix)]
+fn wait_fifo_readable(
+    reader: &File,
+    cancel: &CancellationToken,
+    profile: Option<&mut crate::convert::pipeline::rg_profile::ObserverMetrics>,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    wait_fifo_fd_readable(reader.as_raw_fd(), cancel, profile)
+}
+
+#[cfg(unix)]
+fn wait_fifo_fd_readable(
+    fd: std::os::fd::RawFd,
+    cancel: &CancellationToken,
+    mut profile: Option<&mut crate::convert::pipeline::rg_profile::ObserverMetrics>,
+) -> io::Result<()> {
+    use crate::convert::pipeline::rg_profile::ObserverStage;
+    let mut ready_fd = libc::pollfd {
+        fd,
+        events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+        revents: 0,
+    };
+    loop {
+        if cancel.is_cancelled() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "CUE source-pass observation cancelled"));
+        }
+        ready_fd.revents = 0;
+        let t = profile.as_ref().map(|_| std::time::Instant::now());
+        // Same bounded descriptor-readiness pattern as script_supervisor.
+        // Periodic cancellation checks also cover a writer that never resumes.
+        let ready = unsafe { libc::poll(&mut ready_fd, 1, 50) };
+        if let (Some(stats), Some(started)) = (profile.as_deref_mut(), t) {
+            stats.readiness_wait_count = stats.readiness_wait_count.saturating_add(1);
+            stats.add(ObserverStage::ReadinessWait, started.elapsed());
+            if ready == 0 {
+                stats.readiness_timeout_count = stats.readiness_timeout_count.saturating_add(1);
+            }
+        }
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if ready == 0 {
+            continue;
+        }
+        // POLLHUP is not an error: the FIFO can still contain unread PCM.
+        // Retry read first, and let its EOF/expected-length checks decide.
+        if ready_fd.revents & libc::POLLNVAL != 0 {
+            return Err(io::Error::from_raw_os_error(libc::EBADF));
+        }
+        if ready_fd.revents & libc::POLLERR != 0 {
+            return Err(io::Error::from_raw_os_error(libc::EIO));
+        }
+        return Ok(());
+    }
+}
+
+// The source-pass mirror is Unix-only. Retain the legacy cross-platform
+// fallback rather than changing unrelated builds or transport paths.
+#[cfg(not(unix))]
+fn wait_fifo_readable(
+    _reader: &File,
+    _cancel: &CancellationToken,
+    mut profile: Option<&mut crate::convert::pipeline::rg_profile::ObserverMetrics>,
+) -> io::Result<()> {
+    use crate::convert::pipeline::rg_profile::ObserverStage;
+    let t = profile.as_ref().map(|_| std::time::Instant::now());
+    std::thread::sleep(Duration::from_millis(5));
+    if let (Some(stats), Some(started)) = (profile.as_deref_mut(), t) {
+        stats.add(ObserverStage::PollSleep, started.elapsed());
+    }
+    Ok(())
+}
+
 fn read_fifo_exact(
     reader: &mut File,
     output: &mut [u8],
     cancel: &CancellationToken,
     saw_data: &mut bool,
+    mut profile: Option<&mut crate::convert::pipeline::rg_profile::ObserverMetrics>,
 ) -> io::Result<()> {
+    use crate::convert::pipeline::rg_profile::ObserverStage;
     let mut offset = 0usize;
+    // EAGAIN on a nonblocking FIFO proves a writer was connected even if
+    // no payload has arrived yet. A later EOF must be reported as truncation,
+    // not mistaken for a writer that has never connected.
+    let mut saw_connected_writer = *saw_data;
     while offset < output.len() {
         if cancel.is_cancelled() {
             return Err(io::Error::new(
@@ -1213,10 +1368,15 @@ fn read_fifo_exact(
             ));
         }
         match reader.read(&mut output[offset..]) {
-            Ok(0) if !*saw_data => {
+            Ok(0) if !*saw_data && !saw_connected_writer => {
                 // Nonblocking FIFO readers report EOF until the writer first
                 // connects. This is setup wait, not programme EOF.
+                let t = profile.as_ref().map(|_| std::time::Instant::now());
                 std::thread::sleep(Duration::from_millis(5));
+                if let (Some(stats), Some(started)) = (profile.as_deref_mut(), t) {
+                    stats.no_writer_poll_count = stats.no_writer_poll_count.saturating_add(1);
+                    stats.add(ObserverStage::PollSleep, started.elapsed());
+                }
             }
             Ok(0) => {
                 return Err(io::Error::new(
@@ -1229,8 +1389,13 @@ fn read_fifo_exact(
                 offset += read;
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(5));
+                saw_connected_writer = true;
+                if let Some(stats) = profile.as_deref_mut() {
+                    stats.would_block_poll_count = stats.would_block_poll_count.saturating_add(1);
+                }
+                wait_fifo_readable(reader, cancel, profile.as_deref_mut())?;
             }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
         }
     }
@@ -2242,8 +2407,225 @@ mod tests {
     }
 
     #[test]
+    fn profiled_cue_meter_matches_unprofiled_samples_and_result_bits() {
+        // Same production meters, input order, and exact f64 samples. The
+        // profile is not allowed to affect accepted frames or arithmetic.
+        let subject = ProgrammeSubject {
+            participant: "profiling-equivalence".into(),
+            identity: "cue-source-pass:profiling-equivalence".into(),
+            reader: ReaderAuthority::CueExactPcmMirror,
+            sample_rate_hz: 44_100,
+            roles: vec![ChannelRole::Left, ChannelRole::Right],
+        };
+        let mut ordinary = NativeReplayGainObserver::new(subject.clone(), MetricDemand::IntegratedOnly).unwrap();
+        let mut profiled = NativeReplayGainObserver::new(subject, MetricDemand::IntegratedOnly).unwrap();
+        let mut stats = crate::convert::pipeline::rg_profile::ObserverMetrics::default();
+        let audio: Vec<f64> = (0..(44_100 * 2))
+            .map(|index| 0.4 * (index as f64 * 0.007).sin())
+            .collect();
+        for chunk in audio.chunks(1024) {
+            ordinary.push_interleaved(chunk).unwrap();
+            profiled.push_interleaved_profiled(chunk, Some(&mut stats)).unwrap();
+        }
+        let a = ordinary.finish("exact sample fixture".into()).unwrap();
+        let b = profiled.finish_profiled("exact sample fixture".into(), Some(&mut stats)).unwrap();
+        assert_eq!(a.summary, b.summary, "instrumentation must not change mathematical results");
+        assert_eq!(a.reporting_peak_linear.to_bits(), b.reporting_peak_linear.to_bits());
+        assert!(stats.loudness_push_ns > 0);
+        assert!(stats.peak_push_ns > 0);
+    }
+
+    #[test]
     fn cue_pcm_decoder_rejects_partial_sample_and_nonfinite_float() {
         assert!(decode_pcm_bytes(&[0, 1, 2], PcmMirrorEncoding::S32Le).is_err());
         assert!(decode_pcm_bytes(&f32::NAN.to_le_bytes(), PcmMirrorEncoding::F32Le).is_err());
+    }
+
+    #[cfg(unix)]
+    mod fifo_readiness_tests {
+        use super::*;
+        use std::io::Write;
+        use std::sync::mpsc;
+        use std::thread;
+
+        fn fifo() -> (tempfile::TempDir, PathBuf) {
+            use rustix::fs::{mknodat, FileType, Mode, CWD};
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("mirror.fifo");
+            mknodat(CWD, path.as_path(), FileType::Fifo, Mode::RUSR | Mode::WUSR, 0).unwrap();
+            (temp, path)
+        }
+
+        #[test]
+        fn no_writer_is_a_bounded_cancelable_setup_wait() {
+            let (_dir, path) = fifo();
+            let token = CancellationToken::new();
+            let reader_cancel = token.clone();
+            let (opened, ready) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                let mut file = open_fifo_reader_nonblocking(&path).unwrap();
+                opened.send(()).unwrap();
+                let mut bytes = [0_u8; 8];
+                let mut saw_data = false;
+                let mut stats = crate::convert::pipeline::rg_profile::ObserverMetrics::default();
+                let result = read_fifo_exact(&mut file, &mut bytes, &reader_cancel, &mut saw_data, Some(&mut stats));
+                (result, stats)
+            });
+            ready.recv_timeout(Duration::from_secs(2)).unwrap();
+            // Allow the setup backoff to execute; no writer will ever connect.
+            thread::sleep(Duration::from_millis(80));
+            token.cancel();
+            let (result, stats) = worker.join().unwrap();
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+            assert!(stats.no_writer_poll_count > 0);
+            assert!(stats.no_writer_poll_count < 100, "no-writer state must not spin");
+            assert_eq!(stats.readiness_wait_count, 0, "never poll a disconnected FIFO");
+        }
+
+        #[test]
+        fn connected_empty_writer_waits_for_readiness_without_spin_or_sleep() {
+            let (_dir, path) = fifo();
+            let mut reader = open_fifo_reader_nonblocking(&path).unwrap();
+            let mut writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            let mut probe = [0_u8; 1];
+            assert_eq!(reader.read(&mut probe).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+            let (tx, rx) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                let mut stats = crate::convert::pipeline::rg_profile::ObserverMetrics::default();
+                let result = wait_fifo_readable(&reader, &CancellationToken::new(), Some(&mut stats))
+                    .and_then(|()| reader.read(&mut probe));
+                tx.send((result, probe, stats)).unwrap();
+            });
+            assert!(matches!(rx.recv_timeout(Duration::from_millis(130)), Err(mpsc::RecvTimeoutError::Timeout)),
+                "an attached but idle writer cannot make the FIFO readable");
+            writer.write_all(b"A").unwrap();
+            let (result, byte, stats) = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            worker.join().unwrap();
+            assert_eq!(result.unwrap(), 1);
+            assert_eq!(byte[0], b'A');
+            assert!(stats.readiness_wait_count >= 1);
+            assert!(stats.readiness_timeout_count <= stats.readiness_wait_count);
+            assert!(stats.readiness_wait_count < 128, "idle writer caused a poll spin");
+            assert_eq!(stats.poll_sleep_ns, 0, "active transfer must not sleep on EAGAIN");
+        }
+
+        #[test]
+        fn exact_irregular_transfer_and_truncated_payload_preserve_byte_accounting() {
+            let (_dir, path) = fifo();
+            let reader = open_fifo_reader_nonblocking(&path).unwrap();
+            let mut writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            let expected: Vec<u8> = (0..200_003).map(|index| (index % 251) as u8).collect();
+            let (start_tx, start_rx) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                let mut reader = reader;
+                let mut output = vec![0_u8; 200_003];
+                let mut saw_data = false;
+                let mut stats = crate::convert::pipeline::rg_profile::ObserverMetrics::default();
+                start_tx.send(()).unwrap();
+                let result = read_fifo_exact(&mut reader, &mut output, &CancellationToken::new(), &mut saw_data, Some(&mut stats));
+                (result, output, stats)
+            });
+            start_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            // A real producer may pause between any two reads. Keep the writer
+            // attached during the pause, then deliver uneven and short writes.
+            writer.write_all(&expected[..13]).unwrap();
+            thread::sleep(Duration::from_millis(80));
+            for chunk in expected[13..].chunks(2333) {
+                writer.write_all(chunk).unwrap();
+            }
+            drop(writer);
+            let (result, actual, stats) = worker.join().unwrap();
+            result.unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(stats.no_writer_poll_count, 0);
+            assert_eq!(stats.poll_sleep_ns, 0);
+            assert!(stats.readiness_wait_count > 0);
+
+            // Early close must not silently accept a partial buffer, even if
+            // POLLIN and POLLHUP are simultaneously reported by the kernel.
+            let (_dir, path) = fifo();
+            let mut reader = open_fifo_reader_nonblocking(&path).unwrap();
+            let mut writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            writer.write_all(&[1, 2, 3]).unwrap();
+            drop(writer);
+            let mut bytes = [0_u8; 5];
+            let mut saw_data = false;
+            let err = read_fifo_exact(&mut reader, &mut bytes, &CancellationToken::new(), &mut saw_data, None).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+            assert_eq!(&bytes[..3], &[1, 2, 3]);
+        }
+
+        #[test]
+        fn cancel_during_connected_idle_transfer_and_invalid_descriptor() {
+            let (_dir, path) = fifo();
+            let mut reader = open_fifo_reader_nonblocking(&path).unwrap();
+            let mut writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            writer.write_all(&[0xA5; 13]).unwrap();
+            let cancel = CancellationToken::new();
+            let reader_cancel = cancel.clone();
+            let worker = thread::spawn(move || {
+                let mut output = [0_u8; 4096];
+                let mut saw_data = false;
+                let mut stats = crate::convert::pipeline::rg_profile::ObserverMetrics::default();
+                let result = read_fifo_exact(&mut reader, &mut output, &reader_cancel, &mut saw_data, Some(&mut stats));
+                (result, stats)
+            });
+            thread::sleep(Duration::from_millis(115));
+            cancel.cancel();
+            let (result, stats) = worker.join().unwrap();
+            drop(writer);
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+            assert_eq!(stats.poll_sleep_ns, 0);
+            assert!(stats.readiness_wait_count >= 1);
+            assert!(stats.readiness_wait_count < 128, "cancellable poll loop must not spin");
+
+            let err = wait_fifo_fd_readable(i32::MAX, &CancellationToken::new(), None).unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(libc::EBADF));
+        }
+
+        fn observe_one(extra_byte: bool, short_writes: bool) -> (io::Result<OwnedTrackObservation>, crate::convert::pipeline::rg_profile::ObserverMetrics) {
+            let (_dir, path) = fifo();
+            let header = b"CUE-MIRROR-TEST";
+            let samples: Vec<u8> = (0..44_100_i32)
+                .map(|frame| ((frame as f64 * 0.019).sin() * 0.4) as f32)
+                .flat_map(f32::to_le_bytes)
+                .collect();
+            let writer_path = path.clone();
+            let worker = thread::spawn(move || {
+                let mut writer = std::fs::OpenOptions::new().write(true).open(writer_path).unwrap();
+                writer.write_all(header).unwrap();
+                if short_writes {
+                    for part in samples.chunks(173) { writer.write_all(part).unwrap(); }
+                } else {
+                    writer.write_all(&samples).unwrap();
+                }
+                if extra_byte { writer.write_all(b"X").unwrap(); }
+            });
+            let mut stats = crate::convert::pipeline::rg_profile::ObserverMetrics::default();
+            let result = observe_cue_mirror(
+                &path, "test-member".into(), header, 44_100, 1, 44_100,
+                PcmMirrorEncoding::F32Le, MetricDemand::IntegratedOnly,
+                METER_STORAGE_ALLOWANCE_BYTES, &CancellationToken::new(), Some(&mut stats),
+            );
+            worker.join().unwrap();
+            (result, stats)
+        }
+
+        #[test]
+        fn exact_fifo_eof_accepts_buffered_hangup_and_rejects_surplus() {
+            // The same float PCM must reach identical native meters whether
+            // transferred in many short writes or in large kernel-buffer writes.
+            let (a, first) = observe_one(false, false);
+            let (b, second) = observe_one(false, true);
+            let a = a.unwrap();
+            let b = b.unwrap();
+            assert_eq!(a.summary, b.summary);
+            assert_eq!(a.reporting_peak_linear.to_bits(), b.reporting_peak_linear.to_bits());
+            assert_eq!(a.summary.real_frames, 44_100);
+            assert_eq!(first.pcm_bytes, 44_100 * 4);
+            assert_eq!(second.pcm_bytes, first.pcm_bytes);
+            let (surplus, _) = observe_one(true, false);
+            assert_eq!(surplus.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        }
     }
 }

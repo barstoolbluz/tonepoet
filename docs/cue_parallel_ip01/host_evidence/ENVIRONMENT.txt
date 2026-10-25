@@ -1,0 +1,17 @@
+# IP-01 S1 baseline environment, recorded 2026-10-23T02:06:31Z
+host_kernel=6.12.85+deb13-amd64
+cpu=AMD Ryzen Threadripper 7970X 32-Cores
+cores=63
+ram_kb=131363804
+album_dir=/home/daedalus/dev/ip01_bench/source (staged from sshfs ~/torrents to local NVMe ext4)
+flac_sha256=3e69fd1efb09d3688da77117c67037f704843850a0be1d95d8c25c854164e6c8
+cue_sha256=47350da6b2f7b9f988dc3153d9e7270c714c7451f7f91e75c0926a671b87241e
+source_fs=fuse
+output_fs=tmpfs
+git_commit=c611ea9574aa6e96532151fcfc4fda1eddec2ab8
+source_archive_sha256=687fcd9717f063dafa1f05258262909b220ddfa6a3bae7629c624ed5b0afeca2
+binary_sha256=325d26a38b5fc8188b24e6d7c1240af7aff8f7f14667e41fcd43806de4b1c5a9
+ffmpeg version 7.1.3 Copyright (c) 2000-2025 the FFmpeg developers
+ffprobe version 7.1.3 Copyright (c) 2007-2025 the FFmpeg developers
+flac 1.5.0
+sox:      SoX_ng v14.8.0.1

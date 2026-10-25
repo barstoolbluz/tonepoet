@@ -28,6 +28,7 @@ pub(crate) mod bluray_realize;
 pub(crate) mod coordination_name;
 pub mod actions;
 pub(crate) mod baseline;
+pub(crate) mod rg_profile;
 pub(crate) mod chapter_write;
 pub mod errors;
 pub mod execution_evidence;

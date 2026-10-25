@@ -279,6 +279,8 @@ pub struct ToolPipelineError {
 pub struct ToolStreamMirror {
     pub path: PathBuf,
     pub prefix: Vec<u8>,
+    /// Commissioning-only correlation; not part of command or audio identity.
+    pub(crate) rg_profile: Option<super::rg_profile::CueProfileKey>,
 }
 
 #[derive(Debug, Clone)]
@@ -1478,6 +1480,9 @@ async fn transfer_exact_stream_bytes_mirrored(
     mut remaining: u64,
     watchdog: &SegmentedStreamIdleWatchdog<'_>,
 ) -> std::io::Result<()> {
+    // Shipping path: unchanged byte-transfer and watchdog operation graph.
+    // When diagnostics are off this loop has no clocks, counters or branches
+    // for instrumentation.
     let mut buffer = [0_u8; 64 * 1024];
     while remaining > 0 {
         let wanted = usize::try_from(remaining.min(buffer.len() as u64))
@@ -1499,6 +1504,47 @@ async fn transfer_exact_stream_bytes_mirrored(
                 .wait_for_progress(output.write_all(&buffer[..read]))
                 .await?;
         }
+        remaining -= read as u64;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn transfer_exact_stream_bytes_mirrored_profiled(
+    reader: &mut tokio::fs::File,
+    writer: &mut tokio::fs::File,
+    mut mirror: Option<&mut tokio::fs::File>,
+    mut remaining: u64,
+    watchdog: &SegmentedStreamIdleWatchdog<'_>,
+    stats: &mut super::rg_profile::TransferMetrics,
+) -> std::io::Result<()> {
+    use super::rg_profile::TransferStage;
+    let mut buffer = [0_u8; 64 * 1024];
+    while remaining > 0 {
+        let wanted = usize::try_from(remaining.min(buffer.len() as u64))
+            .expect("bounded transfer chunk fits usize");
+        let t = StdInstant::now();
+        let read_result = watchdog.wait_for_progress(reader.read(&mut buffer[..wanted])).await;
+        stats.add(TransferStage::DecoderRead, t.elapsed());
+        let read = read_result?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("producer ended with {remaining} requested stream bytes remaining"),
+            ));
+        }
+        let t = StdInstant::now();
+        let written = watchdog.wait_for_progress(writer.write_all(&buffer[..read])).await;
+        stats.add(TransferStage::EncoderWrite, t.elapsed());
+        written?;
+        if let Some(output) = mirror.as_deref_mut() {
+            let t = StdInstant::now();
+            let written = watchdog.wait_for_progress(output.write_all(&buffer[..read])).await;
+            stats.add(TransferStage::MirrorWrite, t.elapsed());
+            written?;
+        }
+        stats.chunks = stats.chunks.saturating_add(1);
+        stats.bytes = stats.bytes.saturating_add(read as u64);
         remaining -= read as u64;
     }
     Ok(())
@@ -2558,34 +2604,62 @@ impl ToolRunner for RealToolRunner {
                             None,
                         ));
                         let transfer_future = Box::pin(async {
+                            use super::rg_profile::TransferStage;
+                            // The guard emits on every exit, including cancelled futures,
+                            // failed FIFO open, short input, and watchdog timeout.
+                            let mut profile_guard = mirror.as_ref()
+                                .and_then(|mirror| mirror.rg_profile.clone())
+                                .map(super::rg_profile::TransferGuard::new);
                             let mut mirror_writer = if let Some(mirror) = mirror {
-                                let mut output = open_stream_mirror_writer(
-                                    &mirror.path,
-                                    &stream_cancel,
-                                )
-                                .await?;
+                                let t = profile_guard.as_ref().map(|_| StdInstant::now());
+                                let opened = open_stream_mirror_writer(&mirror.path, &stream_cancel).await;
+                                if let (Some(guard), Some(started)) = (profile_guard.as_mut(), t) {
+                                    guard.metrics.add(TransferStage::FifoOpen, started.elapsed());
+                                }
+                                let mut output = opened?;
                                 if !mirror.prefix.is_empty() {
-                                    tokio::select! {
+                                    let t = profile_guard.as_ref().map(|_| StdInstant::now());
+                                    let written = tokio::select! {
                                         _ = stream_cancel.cancelled() => {
-                                            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "segmented pipeline cancelled"));
+                                            Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "segmented pipeline cancelled"))
                                         }
-                                        write = output.write_all(&mirror.prefix) => write?,
+                                        write = output.write_all(&mirror.prefix) => write,
+                                    };
+                                    if let (Some(guard), Some(started)) = (profile_guard.as_mut(), t) {
+                                        guard.metrics.add(TransferStage::HeaderWrite, started.elapsed());
                                     }
+                                    written?;
                                 }
                                 Some(output)
                             } else {
                                 None
                             };
-                            let result = transfer_exact_stream_bytes_mirrored(
-                                &mut producer_reader,
-                                &mut consumer_writer,
-                                mirror_writer.as_mut(),
-                                segment.byte_len,
-                                &watchdog,
-                            )
-                            .await;
+                            let result = if let Some(guard) = profile_guard.as_mut() {
+                                transfer_exact_stream_bytes_mirrored_profiled(
+                                    &mut producer_reader,
+                                    &mut consumer_writer,
+                                    mirror_writer.as_mut(),
+                                    segment.byte_len,
+                                    &watchdog,
+                                    &mut guard.metrics,
+                                ).await
+                            } else {
+                                transfer_exact_stream_bytes_mirrored(
+                                    &mut producer_reader,
+                                    &mut consumer_writer,
+                                    mirror_writer.as_mut(),
+                                    segment.byte_len,
+                                    &watchdog,
+                                ).await
+                            };
+                            if result.is_ok() {
+                                if let Some(guard) = profile_guard.as_mut() {
+                                    guard.mark_complete();
+                                }
+                            }
                             drop(mirror_writer);
                             drop(consumer_writer);
+                            drop(profile_guard);
                             if result.is_ok() && stop_producer_after {
                                 // Stop read-ahead as soon as the exact final requested
                                 // byte has left the decoder pipe. The encoder remains

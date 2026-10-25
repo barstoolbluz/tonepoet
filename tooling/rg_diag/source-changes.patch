@@ -1,0 +1,474 @@
+--- a/src/convert/pipeline/mod.rs
++++ b/src/convert/pipeline/mod.rs
+@@ -28,6 +28,7 @@
+ pub(crate) mod coordination_name;
+ pub mod actions;
+ pub(crate) mod baseline;
++pub(crate) mod rg_profile;
+ pub(crate) mod chapter_write;
+ pub mod errors;
+ pub mod execution_evidence;
+--- a/src/convert/pipeline/tool.rs
++++ b/src/convert/pipeline/tool.rs
+@@ -279,6 +279,8 @@
+ pub struct ToolStreamMirror {
+     pub path: PathBuf,
+     pub prefix: Vec<u8>,
++    /// Commissioning-only correlation; not part of command or audio identity.
++    pub(crate) rg_profile: Option<super::rg_profile::CueProfileKey>,
+ }
+ 
+ #[derive(Debug, Clone)]
+@@ -1478,6 +1480,9 @@
+     mut remaining: u64,
+     watchdog: &SegmentedStreamIdleWatchdog<'_>,
+ ) -> std::io::Result<()> {
++    // Shipping path: unchanged byte-transfer and watchdog operation graph.
++    // When diagnostics are off this loop has no clocks, counters or branches
++    // for instrumentation.
+     let mut buffer = [0_u8; 64 * 1024];
+     while remaining > 0 {
+         let wanted = usize::try_from(remaining.min(buffer.len() as u64))
+@@ -1505,6 +1510,47 @@
+ }
+ 
+ #[cfg(unix)]
++async fn transfer_exact_stream_bytes_mirrored_profiled(
++    reader: &mut tokio::fs::File,
++    writer: &mut tokio::fs::File,
++    mut mirror: Option<&mut tokio::fs::File>,
++    mut remaining: u64,
++    watchdog: &SegmentedStreamIdleWatchdog<'_>,
++    stats: &mut super::rg_profile::TransferMetrics,
++) -> std::io::Result<()> {
++    use super::rg_profile::TransferStage;
++    let mut buffer = [0_u8; 64 * 1024];
++    while remaining > 0 {
++        let wanted = usize::try_from(remaining.min(buffer.len() as u64))
++            .expect("bounded transfer chunk fits usize");
++        let t = StdInstant::now();
++        let read_result = watchdog.wait_for_progress(reader.read(&mut buffer[..wanted])).await;
++        stats.add(TransferStage::DecoderRead, t.elapsed());
++        let read = read_result?;
++        if read == 0 {
++            return Err(std::io::Error::new(
++                std::io::ErrorKind::UnexpectedEof,
++                format!("producer ended with {remaining} requested stream bytes remaining"),
++            ));
++        }
++        let t = StdInstant::now();
++        let written = watchdog.wait_for_progress(writer.write_all(&buffer[..read])).await;
++        stats.add(TransferStage::EncoderWrite, t.elapsed());
++        written?;
++        if let Some(output) = mirror.as_deref_mut() {
++            let t = StdInstant::now();
++            let written = watchdog.wait_for_progress(output.write_all(&buffer[..read])).await;
++            stats.add(TransferStage::MirrorWrite, t.elapsed());
++            written?;
++        }
++        stats.chunks = stats.chunks.saturating_add(1);
++        stats.bytes = stats.bytes.saturating_add(read as u64);
++        remaining -= read as u64;
++    }
++    Ok(())
++}
++
++#[cfg(unix)]
+ async fn drain_stream_to_eof(
+     reader: &mut tokio::fs::File,
+     watchdog: &SegmentedStreamIdleWatchdog<'_>,
+@@ -2558,34 +2604,62 @@
+                             None,
+                         ));
+                         let transfer_future = Box::pin(async {
++                            use super::rg_profile::TransferStage;
++                            // The guard emits on every exit, including cancelled futures,
++                            // failed FIFO open, short input, and watchdog timeout.
++                            let mut profile_guard = mirror.as_ref()
++                                .and_then(|mirror| mirror.rg_profile.clone())
++                                .map(super::rg_profile::TransferGuard::new);
+                             let mut mirror_writer = if let Some(mirror) = mirror {
+-                                let mut output = open_stream_mirror_writer(
+-                                    &mirror.path,
+-                                    &stream_cancel,
+-                                )
+-                                .await?;
++                                let t = profile_guard.as_ref().map(|_| StdInstant::now());
++                                let opened = open_stream_mirror_writer(&mirror.path, &stream_cancel).await;
++                                if let (Some(guard), Some(started)) = (profile_guard.as_mut(), t) {
++                                    guard.metrics.add(TransferStage::FifoOpen, started.elapsed());
++                                }
++                                let mut output = opened?;
+                                 if !mirror.prefix.is_empty() {
+-                                    tokio::select! {
++                                    let t = profile_guard.as_ref().map(|_| StdInstant::now());
++                                    let written = tokio::select! {
+                                         _ = stream_cancel.cancelled() => {
+-                                            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "segmented pipeline cancelled"));
++                                            Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "segmented pipeline cancelled"))
+                                         }
+-                                        write = output.write_all(&mirror.prefix) => write?,
++                                        write = output.write_all(&mirror.prefix) => write,
++                                    };
++                                    if let (Some(guard), Some(started)) = (profile_guard.as_mut(), t) {
++                                        guard.metrics.add(TransferStage::HeaderWrite, started.elapsed());
+                                     }
++                                    written?;
+                                 }
+                                 Some(output)
+                             } else {
+                                 None
+                             };
+-                            let result = transfer_exact_stream_bytes_mirrored(
+-                                &mut producer_reader,
+-                                &mut consumer_writer,
+-                                mirror_writer.as_mut(),
+-                                segment.byte_len,
+-                                &watchdog,
+-                            )
+-                            .await;
++                            let result = if let Some(guard) = profile_guard.as_mut() {
++                                transfer_exact_stream_bytes_mirrored_profiled(
++                                    &mut producer_reader,
++                                    &mut consumer_writer,
++                                    mirror_writer.as_mut(),
++                                    segment.byte_len,
++                                    &watchdog,
++                                    &mut guard.metrics,
++                                ).await
++                            } else {
++                                transfer_exact_stream_bytes_mirrored(
++                                    &mut producer_reader,
++                                    &mut consumer_writer,
++                                    mirror_writer.as_mut(),
++                                    segment.byte_len,
++                                    &watchdog,
++                                ).await
++                            };
++                            if result.is_ok() {
++                                if let Some(guard) = profile_guard.as_mut() {
++                                    guard.mark_complete();
++                                }
++                            }
+                             drop(mirror_writer);
+                             drop(consumer_writer);
++                            drop(profile_guard);
+                             if result.is_ok() && stop_producer_after {
+                                 // Stop read-ahead as soon as the exact final requested
+                                 // byte has left the decoder pipe. The encoder remains
+--- a/src/convert/pipeline/stages.rs
++++ b/src/convert/pipeline/stages.rs
+@@ -44581,6 +44581,7 @@
+                 ToolStreamMirror {
+                     path: absolute,
+                     prefix: header,
++                    rg_profile: None,
+                 },
+             );
+         }
+@@ -44835,6 +44836,12 @@
+     // EOF after the payload; no external process owns this observation.
+     let mut observer_handles = Vec::with_capacity(rg_observers.len());
+     let observer_diagnostics_job = super::baseline::enabled().then(|| req.job_id.clone());
++    if super::rg_profile::enabled() {
++        let expected_ordinals = tracks.iter()
++            .map(|track| track.track.id.source_ordinal)
++            .collect::<Vec<_>>();
++        super::rg_profile::emit_manifest(&req.job_id, &expected_ordinals);
++    }
+     for (ordinal, observer) in rg_observers.into_iter().enumerate() {
+         // The authored ordinal is stable across non-contiguous selections;
+         // the observer's local FIFO index is not a track identity.
+@@ -44843,6 +44850,8 @@
+         let observer_diagnostics_job = observer_diagnostics_job.clone();
+         observer_handles.push(tokio::task::spawn_blocking(move || {
+             let observer_started = observer_diagnostics_job.as_ref().map(|_| Instant::now());
++            let mut rg_profile = super::rg_profile::enabled()
++                .then(super::rg_profile::ObserverMetrics::default);
+             let observation = crate::convert::replaygain::observe_cue_mirror(
+                 &observer.path,
+                 observer.member_id,
+@@ -44854,7 +44863,11 @@
+                 demand,
+                 observer_storage_limit,
+                 &observer_cancel,
++                rg_profile.as_mut(),
+             );
++            if let (Some(stats), Some(job_id)) = (rg_profile.as_ref(), observer_diagnostics_job.as_deref()) {
++                super::rg_profile::emit_observer(job_id, source_ordinal, observation.is_ok(), stats);
++            }
+             if let (Some(started), Some(job_id)) = (observer_started, observer_diagnostics_job) {
+                 super::baseline::cue_emit(&job_id, "source_pass_track_observer_settled", serde_json::json!({
+                     "group_track_index": ordinal,
+@@ -45614,7 +45627,17 @@
+             start_byte,
+             byte_len,
+             consumer,
+-            mirror: mirrors.and_then(|values| values.get(&input.index).cloned()),
++            mirror: mirrors.and_then(|values| values.get(&input.index).cloned()).map(|mut mirror| {
++                // Attach diagnostics only to the actual mirrored S1 transfer;
++                // correlation is an ephemeral key and never affects commands.
++                if super::rg_profile::enabled() {
++                    mirror.rg_profile = Some(super::rg_profile::CueProfileKey {
++                        job_id: req.job_id.clone(),
++                        track_ordinal: input.track.id.source_ordinal,
++                    });
++                }
++                mirror
++            }),
+             stop_producer_after: false,
+         });
+     }
+--- a/src/convert/replaygain.rs
++++ b/src/convert/replaygain.rs
+@@ -327,28 +327,59 @@
+     }
+ 
+     pub(crate) fn push_interleaved(&mut self, samples: &[f64]) -> io::Result<()> {
+-        // Both observers advance from the same real frame slice. If either
+-        // fails, the whole grouped observation is terminal; callers must not
+-        // splice a retry of only one observer into the other result.
+-        self.loudness
+-            .push_interleaved(samples)
++        self.push_interleaved_profiled(samples, None)
++    }
++
++    fn push_interleaved_profiled(
++        &mut self,
++        samples: &[f64],
++        mut profile: Option<&mut crate::convert::pipeline::rg_profile::ObserverMetrics>,
++    ) -> io::Result<()> {
++        use crate::convert::pipeline::rg_profile::ObserverStage;
++        // The same meter methods and order are used with diagnostics on/off.
++        // A failure terminates the entire grouped observation, as before.
++        let t = profile.as_ref().map(|_| std::time::Instant::now());
++        let loudness_result = self.loudness.push_interleaved(samples);
++        if let (Some(stats), Some(started)) = (profile.as_deref_mut(), t) {
++            stats.add(ObserverStage::LoudnessPush, started.elapsed());
++        }
++        loudness_result
+             .map_err(|error| invalid(format!("native loudness observation failed: {error}")))?;
+-        self.reporting_peak
+-            .push_interleaved(samples)
++        let t = profile.as_ref().map(|_| std::time::Instant::now());
++        let peak_result = self.reporting_peak.push_interleaved(samples);
++        if let (Some(stats), Some(started)) = (profile.as_deref_mut(), t) {
++            stats.add(ObserverStage::PeakPush, started.elapsed());
++        }
++        peak_result
+             .map_err(|error| invalid(format!("reporting peak observation failed: {error}")))?;
+         Ok(())
+     }
+ 
+     fn finish(self, completion_evidence: String) -> io::Result<OwnedTrackObservation> {
++        self.finish_profiled(completion_evidence, None)
++    }
++
++    fn finish_profiled(
++        self,
++        completion_evidence: String,
++        mut profile: Option<&mut crate::convert::pipeline::rg_profile::ObserverMetrics>,
++    ) -> io::Result<OwnedTrackObservation> {
++        use crate::convert::pipeline::rg_profile::ObserverStage;
+         let expected_subject = self.subject.clone();
+         let expected_demand = self.demand;
+-        let measurement = self
+-            .loudness
+-            .finalize()
++        let t = profile.as_ref().map(|_| std::time::Instant::now());
++        let measurement_result = self.loudness.finalize();
++        if let (Some(stats), Some(started)) = (profile.as_deref_mut(), t) {
++            stats.add(ObserverStage::LoudnessFinalize, started.elapsed());
++        }
++        let measurement = measurement_result
+             .map_err(|error| invalid(format!("native loudness finalization failed: {error}")))?;
+-        let reporting_peak = self
+-            .reporting_peak
+-            .finalize()
++        let t = profile.as_ref().map(|_| std::time::Instant::now());
++        let peak_result = self.reporting_peak.finalize();
++        if let (Some(stats), Some(started)) = (profile.as_deref_mut(), t) {
++            stats.add(ObserverStage::PeakFinalize, started.elapsed());
++        }
++        let reporting_peak = peak_result
+             .map_err(|error| invalid(format!("reporting peak finalization failed: {error}")))?;
+         validate_completed_measurement(
+             &expected_subject,
+@@ -1115,7 +1146,9 @@
+     demand: MetricDemand,
+     storage_limit_bytes: usize,
+     cancel: &CancellationToken,
++    mut profile: Option<&mut crate::convert::pipeline::rg_profile::ObserverMetrics>,
+ ) -> io::Result<OwnedTrackObservation> {
++    use crate::convert::pipeline::rg_profile::ObserverStage;
+     let roles = match channels {
+         1 => vec![ChannelRole::Mono],
+         2 => vec![ChannelRole::Left, ChannelRole::Right],
+@@ -1129,10 +1162,20 @@
+         roles,
+     };
+     let mut observer = NativeReplayGainObserver::new_with_storage_limit(subject, demand, storage_limit_bytes)?;
+-    let mut reader = open_fifo_reader_nonblocking(path)?;
++    let t = profile.as_ref().map(|_| std::time::Instant::now());
++    let opened = open_fifo_reader_nonblocking(path);
++    if let (Some(stats), Some(started)) = (profile.as_deref_mut(), t) {
++        stats.add(ObserverStage::FifoOpen, started.elapsed());
++    }
++    let mut reader = opened?;
+     let mut saw_data = false;
+     let mut header = vec![0_u8; expected_header.len()];
+-    read_fifo_exact(&mut reader, &mut header, cancel, &mut saw_data)?;
++    let t = profile.as_ref().map(|_| std::time::Instant::now());
++    let header_result = read_fifo_exact(&mut reader, &mut header, cancel, &mut saw_data, profile.as_deref_mut());
++    if let (Some(stats), Some(started)) = (profile.as_deref_mut(), t) {
++        stats.add(ObserverStage::HeaderRead, started.elapsed());
++    }
++    header_result?;
+     if header != expected_header {
+         return Err(invalid("CUE source-pass mirror header does not match planned geometry"));
+     }
+@@ -1152,31 +1195,57 @@
+     while remaining > 0 {
+         let wanted = remaining.min(chunk_frames * frame_bytes) as usize;
+         raw.resize(wanted, 0);
+-        read_fifo_exact(&mut reader, &mut raw, cancel, &mut saw_data)?;
+-        let interleaved = decode_pcm_bytes(&raw, encoding)?;
++        let t = profile.as_ref().map(|_| std::time::Instant::now());
++        let read_result = read_fifo_exact(&mut reader, &mut raw, cancel, &mut saw_data, profile.as_deref_mut());
++        if let (Some(stats), Some(started)) = (profile.as_deref_mut(), t) {
++            stats.add(ObserverStage::PcmRead, started.elapsed());
++        }
++        read_result?;
++        let t = profile.as_ref().map(|_| std::time::Instant::now());
++        let decoded = decode_pcm_bytes(&raw, encoding);
++        if let (Some(stats), Some(started)) = (profile.as_deref_mut(), t) {
++            stats.add(ObserverStage::PcmDecode, started.elapsed());
++        }
++        let interleaved = decoded?;
+         if interleaved.len() % usize::from(channels) != 0 {
+             return Err(invalid("CUE mirror ended on a partial PCM frame"));
+         }
+-        observer.push_interleaved(&interleaved)?;
++        observer.push_interleaved_profiled(&interleaved, profile.as_deref_mut())?;
++        if let Some(stats) = profile.as_deref_mut() {
++            stats.blocks = stats.blocks.saturating_add(1);
++            stats.pcm_bytes = stats.pcm_bytes.saturating_add(wanted as u64);
++        }
+         remaining -= wanted as u64;
+     }
+     let mut surplus = [0_u8; 1];
+-    loop {
+-        if cancel.is_cancelled() {
+-            return Err(io::Error::new(io::ErrorKind::Interrupted, "CUE source-pass observation cancelled"));
+-        }
+-        match reader.read(&mut surplus) {
+-            Ok(0) => break,
+-            Ok(_) => return Err(invalid("CUE mirror contains unexpected PCM after declared payload")),
+-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+-                std::thread::sleep(Duration::from_millis(5));
++    let eof_start = profile.as_ref().map(|_| std::time::Instant::now());
++    let eof_result = (|| -> io::Result<()> {
++        loop {
++            if cancel.is_cancelled() {
++                return Err(io::Error::new(io::ErrorKind::Interrupted, "CUE source-pass observation cancelled"));
++            }
++            match reader.read(&mut surplus) {
++                Ok(0) => return Ok(()),
++                Ok(_) => return Err(invalid("CUE mirror contains unexpected PCM after declared payload")),
++                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
++                    let t = profile.as_ref().map(|_| std::time::Instant::now());
++                    std::thread::sleep(Duration::from_millis(5));
++                    if let (Some(stats), Some(started)) = (profile.as_deref_mut(), t) {
++                        stats.would_block_poll_count = stats.would_block_poll_count.saturating_add(1);
++                        stats.add(ObserverStage::PollSleep, started.elapsed());
++                    }
++                }
++                Err(error) => return Err(error),
+             }
+-            Err(error) => return Err(error),
+         }
++    })();
++    if let (Some(stats), Some(started)) = (profile.as_deref_mut(), eof_start) {
++        stats.add(ObserverStage::EofWait, started.elapsed());
+     }
+-    let result = observer.finish(format!(
++    eof_result?;
++    let result = observer.finish_profiled(format!(
+         "exact CUE FIFO header/payload/EOF; {payload_bytes} payload bytes"
+-    ))?;
++    ), profile.as_deref_mut())?;
+     if result.summary.real_frames != frames {
+         return Err(invalid("CUE mirror frame count does not match declared programme extent"));
+     }
+@@ -1203,7 +1272,9 @@
+     output: &mut [u8],
+     cancel: &CancellationToken,
+     saw_data: &mut bool,
++    mut profile: Option<&mut crate::convert::pipeline::rg_profile::ObserverMetrics>,
+ ) -> io::Result<()> {
++    use crate::convert::pipeline::rg_profile::ObserverStage;
+     let mut offset = 0usize;
+     while offset < output.len() {
+         if cancel.is_cancelled() {
+@@ -1216,7 +1287,12 @@
+             Ok(0) if !*saw_data => {
+                 // Nonblocking FIFO readers report EOF until the writer first
+                 // connects. This is setup wait, not programme EOF.
++                let t = profile.as_ref().map(|_| std::time::Instant::now());
+                 std::thread::sleep(Duration::from_millis(5));
++                if let (Some(stats), Some(started)) = (profile.as_deref_mut(), t) {
++                    stats.no_writer_poll_count = stats.no_writer_poll_count.saturating_add(1);
++                    stats.add(ObserverStage::PollSleep, started.elapsed());
++                }
+             }
+             Ok(0) => {
+                 return Err(io::Error::new(
+@@ -1229,7 +1305,12 @@
+                 offset += read;
+             }
+             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
++                let t = profile.as_ref().map(|_| std::time::Instant::now());
+                 std::thread::sleep(Duration::from_millis(5));
++                if let (Some(stats), Some(started)) = (profile.as_deref_mut(), t) {
++                    stats.would_block_poll_count = stats.would_block_poll_count.saturating_add(1);
++                    stats.add(ObserverStage::PollSleep, started.elapsed());
++                }
+             }
+             Err(error) => return Err(error),
+         }
+@@ -2242,6 +2323,35 @@
+     }
+ 
+     #[test]
++    fn profiled_cue_meter_matches_unprofiled_samples_and_result_bits() {
++        // Same production meters, input order, and exact f64 samples. The
++        // profile is not allowed to affect accepted frames or arithmetic.
++        let subject = ProgrammeSubject {
++            participant: "profiling-equivalence".into(),
++            identity: "cue-source-pass:profiling-equivalence".into(),
++            reader: ReaderAuthority::CueExactPcmMirror,
++            sample_rate_hz: 44_100,
++            roles: vec![ChannelRole::Left, ChannelRole::Right],
++        };
++        let mut ordinary = NativeReplayGainObserver::new(subject.clone(), MetricDemand::IntegratedOnly).unwrap();
++        let mut profiled = NativeReplayGainObserver::new(subject, MetricDemand::IntegratedOnly).unwrap();
++        let mut stats = crate::convert::pipeline::rg_profile::ObserverMetrics::default();
++        let audio: Vec<f64> = (0..(44_100 * 2))
++            .map(|index| 0.4 * (index as f64 * 0.007).sin())
++            .collect();
++        for chunk in audio.chunks(1024) {
++            ordinary.push_interleaved(chunk).unwrap();
++            profiled.push_interleaved_profiled(chunk, Some(&mut stats)).unwrap();
++        }
++        let a = ordinary.finish("exact sample fixture".into()).unwrap();
++        let b = profiled.finish_profiled("exact sample fixture".into(), Some(&mut stats)).unwrap();
++        assert_eq!(a.summary, b.summary, "instrumentation must not change mathematical results");
++        assert_eq!(a.reporting_peak_linear.to_bits(), b.reporting_peak_linear.to_bits());
++        assert!(stats.loudness_push_ns > 0);
++        assert!(stats.peak_push_ns > 0);
++    }
++
++    #[test]
+     fn cue_pcm_decoder_rejects_partial_sample_and_nonfinite_float() {
+         assert!(decode_pcm_bytes(&[0, 1, 2], PcmMirrorEncoding::S32Le).is_err());
+         assert!(decode_pcm_bytes(&f32::NAN.to_le_bytes(), PcmMirrorEncoding::F32Le).is_err());

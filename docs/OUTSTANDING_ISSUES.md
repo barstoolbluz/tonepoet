@@ -5221,3 +5221,77 @@ What remains is the field check on the original album, and on any other
 configuration the user cares about. The declared outcome — the configured
 order as the single authority — is implemented but has not been exercised by
 hand.
+
+## 77. An idle TUI burns about 2% of a core, continuously
+
+Noticed incidentally while sampling process CPU during the CUE ReplayGain
+investigation, not sought out, and not investigated beyond the measurement
+below.
+
+A `tonepoet tui` left open and untouched consumes roughly 2% of one core
+indefinitely. Measured twice on 2026-10-24 against a session that had been
+running 2.2 days: 0.20 s of CPU over a 10 s window and 0.41 s over a 20 s
+window, both 2.0%. Its lifetime total at that point was one hour of CPU, which
+is consistent with that rate sustained since launch. It works out to about half
+a CPU-hour per day for a window nobody is looking at.
+
+The outcome wanted is that an idle TUI costs approximately nothing. A terminal
+UI with no animation, no transfer in flight and no user input should be parked
+waiting on an input event, not waking on a timer to redraw or poll.
+
+Two reasons this is worth a look beyond tidiness. It is the kind of thing that
+shows up as fan noise or battery drain on a laptop and gets blamed on the
+application generally. And a periodic wake-up in the event loop is the same
+shape of defect as the one the CUE ReplayGain work just found — a fixed-interval
+poll standing in for readiness-driven waiting — so it is worth confirming the
+pattern is not repeated elsewhere.
+
+No cause is proposed here. I did not attach a profiler, because the only
+instance available was the user's live session and interrupting it to look was
+not worth it. Reproducing it should be as simple as launching the TUI, leaving
+it alone, and reading `utime` plus `stime` from `/proc` twice a minute apart.
+
+## 78. Converting twelve tracks spawns fifty-two tool processes, and a third of the time goes to them
+
+Measured on 2026-10-24 while decomposing an 18-second CUE conversion, after the
+ReplayGain FIFO readiness correction landed. One single-image FLAC+CUE album,
+twelve tracks, 45 minutes, decoded to FLAC at source rate and depth.
+
+The run spawns 52 external tool processes: 2 ffmpeg, 12 sox, **14 ffprobe** and
+**24 metaflac**. The probe and tag calls alone account for about 5.5 seconds of
+an 18-second conversion, against roughly 1 second of actual decoding.
+
+| Tool | Calls | Summed | Mean each |
+| --- | --- | --- | --- |
+| ffprobe | 14 | 2.89 s | 207 ms |
+| metaflac | 24 | 2.64 s | 110 ms |
+
+The two have different causes, and only the first is established.
+
+**ffprobe is pure process startup.** `ffprobe -version`, which opens no file at
+all, costs 109 ms on this host — the same as probing a real one. The work is
+free and the spawn is not. Fourteen of them is at least 1.5 seconds of doing
+nothing, and the in-run mean is higher still, presumably under contention.
+
+**metaflac is not startup.** It reads tags from an output file in 3 ms
+standalone, against 110 ms inside the run. I believe the in-run calls are tag
+*writes*, which rewrite the file, but I have not confirmed that and the cause
+should be established before anything is changed.
+
+The outcome wanted is that per-track housekeeping is not a third of the
+conversion. Two tags written per output file should not cost as much as
+decoding the entire album.
+
+Worth noting what this is not. It is independent of the parallel-CUE work,
+which targets the sequential encoding in the same run, and it would survive
+that change unaltered. The two are additive, not alternatives.
+
+No remedy is proposed here, and the obvious ones each need their own
+justification: probing in process rather than spawning ffprobe, batching the
+tag writes per file, folding the probe into work already being done, or
+establishing that some of these calls are redundant. Which of those applies
+depends on what the calls are actually for, which I have not traced.
+
+Reproduction is the ordinary conversion above with
+`TONEPOET_PIPELINE_BASELINE_JSONL` set, counting `tool_run_finished` records by
+tool in the resulting trace.

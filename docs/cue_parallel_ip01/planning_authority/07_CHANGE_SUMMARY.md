@@ -1,0 +1,15 @@
+# R1 → R2 corrective planning delta (2026-10-22)
+
+**No TonePoet production source changes.** The source archive, git state claim and six committed packet IDs remain identical. The new archive contains planning material, executable checks and the independent audit only. Use R2 instead of R1 for future implementation prompts.
+
+| Change | Why | Minimal implementation impact |
+|---|---|---|
+| **D1 / platform:** S3 admission must check the *actual* native supervised two-process runner, not only FFmpeg range seeking; baseline runner is Unix-only. | Avoid predictable unsupported-runner failure after opting into S3 on a non-Unix desktop. | One admission guard + focused negative/positive tests; **no Windows runner rewrite**. |
+| **D2 / proportionality:** IP-03 now builds only the S3 two-child permit adapter using existing shared `ToolConcurrencyLimits` and a small global live-worker cap. | Previously mandated broad RAM/FD/I/O reservation infrastructure is not necessary to bound this fixed streaming shape and threatens unrelated routes. | Narrow change near current `track_executor` tool-family semaphores and new worker; no new general scheduler. |
+| **D3 / measurement:** trial pairing requires `configuration_sha256` matching across routes. | Prevent a false 1.25x candidate when S1 and S3 were run with different encoding settings or binaries. | One CSV column and simple cohort-key check in existing Python helper. |
+| **Proportionality:** IP-01 reuses `ConversionRunTiming` and scheduler counters before adding any opt-in CUE observation. | No duplicate versioned telemetry infrastructure unless a real missing phase is identified. | Less work on the fast path, smaller change surface. |
+| **Representativeness:** IP-06 performance gate includes one existing, legitimate real/compressible music album in addition to deterministic synthetic noise. | Synthetic noise can have atypical FLAC CPU cost; do not auto-enable based only on that cohort. | One additional comparison cohort, no new permanent format tests or fixture library. |
+
+**File touchpoints:** `00_START_HERE.md`, `01_SOURCE_AUDIT.md`, `02_ARCHITECTURE_DECISION.md`, `03_IMPLEMENTATION_PLAN.md`, `04_FORMAT_CAPABILITY_MATRIX.md`, `05_CONFORMANCE_AND_PERFORMANCE.md`, `06_INDEPENDENT_ADVERSARIAL_AUDIT.md` (new), `07_CHANGE_SUMMARY.md` (new), `SOURCE_MANIFEST.json`, `IMPLEMENTATION_STATUS.md`, `ARCHITECTURE_DECISIONS.md`, `VERIFICATION_RESULTS.md`, `NEXT_SESSION_HANDOFF.md`, packets IP-01 through IP-06, `tools/evaluate_trials.py`, `tools/package_bundle.py`, and `tools/verify_bundle.py`. Unmentioned provisional outlines, source-fixture generation and original audio code are unchanged. `manifest.json` and `SHA256SUMS` regenerated, never copied as authority.
+
+**First next action:** Open `00_START_HERE.md`, run `packets/IP-01_observe_baseline.md` against the verified original source archive with SHA-256 `0740a9c8cbd8e59648981207daf62e6373f4b544ad3a40c7872b3890c9d76d26`, and preserve exact source-hash/test evidence in the cumulative handoff. Do not switch any production audio route from this planning bundle alone.

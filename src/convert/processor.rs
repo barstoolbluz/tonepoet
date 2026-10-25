@@ -17,6 +17,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
@@ -2626,6 +2627,20 @@ impl SubmissionPump {
         unit: WorkUnit<QueueWorkOutput>,
         counted: bool,
     ) -> bool {
+        // Queue admission is measured at the attempt boundary, *before* a
+        // fast worker can start. Rejected/busy submissions emit no admission.
+        // Work creation and UI acceptance are earlier, uninstrumented events.
+        let cue_admission = if unit.unit_id.starts_with("cue-stream:")
+            && crate::convert::pipeline::baseline::enabled()
+        {
+            Some((
+                unit.job_id.clone(),
+                unit.unit_id.clone(),
+                crate::convert::pipeline::baseline::cue_timestamp_us(),
+            ))
+        } else {
+            None
+        };
         let submitted = if counted {
             pool.try_submit_counted(unit)
         } else {
@@ -2633,8 +2648,27 @@ impl SubmissionPump {
         };
 
         match submitted {
-            Ok(()) => true,
+            Ok(()) => {
+                if let Some((job_id, unit_id, at_us)) = cue_admission {
+                    crate::convert::pipeline::baseline::cue_emit_at(
+                        &job_id,
+                        "queue_admitted",
+                        at_us,
+                        serde_json::json!({"group": unit_id, "boundary": "before_successful_submit"}),
+                    );
+                }
+                true
+            }
             Err(TrySubmitError::QueueBusy(unit)) => {
+                if unit.unit_id.starts_with("cue-stream:")
+                    && crate::convert::pipeline::baseline::enabled()
+                {
+                    crate::convert::pipeline::baseline::cue_emit(
+                        &unit.job_id,
+                        "queue_deferred",
+                        serde_json::json!({"group": unit.unit_id.as_str(), "reason": "queue_busy"}),
+                    );
+                }
                 if !counted {
                     pool.metrics().record_jobs_queued(1);
                 }
@@ -2643,6 +2677,15 @@ impl SubmissionPump {
                 false
             }
             Err(TrySubmitError::QueueFull { unit, .. }) => {
+                if unit.unit_id.starts_with("cue-stream:")
+                    && crate::convert::pipeline::baseline::enabled()
+                {
+                    crate::convert::pipeline::baseline::cue_emit(
+                        &unit.job_id,
+                        "queue_deferred",
+                        serde_json::json!({"group": unit.unit_id.as_str(), "reason": "queue_full"}),
+                    );
+                }
                 if !counted {
                     pool.metrics().record_jobs_queued(1);
                 }
@@ -5494,14 +5537,25 @@ fn build_cue_stream_group_work(
         .last()
         .map(|input| input.track.id.source_ordinal)
         .unwrap_or(first_id.source_ordinal);
+    let group_id = format!(
+        "cue-stream:{:04}-{:04}",
+        first_id.source_ordinal, last_ordinal
+    );
+    let measured_ordinals = crate::convert::pipeline::baseline::enabled()
+        .then(|| tracks.iter().map(|input| input.track.id.source_ordinal).collect::<Vec<_>>());
     WorkUnit {
         job_id: job_id.clone(),
-        unit_id: format!(
-            "cue-stream:{:04}-{:04}",
-            first_id.source_ordinal, last_ordinal
-        ),
+        unit_id: group_id.clone(),
         kind: WorkKind::CueSplitTrack { track_id: first_id },
         task: boxed_work(move |_worker_cancel| async move {
+            let worker_started = measured_ordinals.as_ref().map(|_| Instant::now());
+            if let Some(ordinals) = measured_ordinals.as_ref() {
+                crate::convert::pipeline::baseline::cue_emit(
+                    &job_id,
+                    "work_started",
+                    serde_json::json!({"group": group_id, "track_ordinals": ordinals}),
+                );
+            }
             let reporter = BroadcastReporter::new(progress_tx, lifecycle_tx, item_id, None);
             let _guard = reporter.track_lifecycle_guard();
             let batch = encode_cue_stream_album_for_scheduler_with_tool_limits_and_version_cache(
@@ -5518,6 +5572,22 @@ fn build_cue_stream_group_work(
                 job_cancel,
             )
             .await;
+            if let Some(started) = worker_started {
+                crate::convert::pipeline::baseline::cue_emit(
+                    &job_id,
+                    "work_finished",
+                    serde_json::json!({
+                        "group": group_id,
+                        "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0,
+                        "encoded_track_count": batch.outputs.len(),
+                        "succeeded": batch.outputs.iter().filter(|output| output.ok).count(),
+                        "failed": batch.outputs.iter().filter(|output| !output.ok).count(),
+                        "source_replaygain_observed": batch.source_replaygain.is_some(),
+                        "track_ordinals": measured_ordinals,
+                        "scope": "group_worker_inclusive_not_additive_with_child_lifetimes",
+                    }),
+                );
+            }
             Ok(QueueWorkOutput::EncodedBatch {
                 job_id,
                 outputs: batch.outputs,
@@ -12540,6 +12610,50 @@ FILE "disc2.flac" WAVE
             source_audio: SourceAudioDescriptor::default(),
             warnings: Vec::new(),
         }
+    }
+
+    #[test]
+    fn cue_ip01_real_queue_deferral_child() {
+        if std::env::var("TONEPOET_IP01_QUEUE_CHILD").as_deref() != Ok("enabled") {
+            return;
+        }
+        let pool = SharedWorkerPool::<QueueWorkOutput>::new_with_limits(
+            Some(1), CancellationToken::new(), PoolLimits { ready_capacity: Some(1) },
+        );
+        pool.try_submit(synthetic_queue_work_unit("resident", "resident".to_string()))
+            .expect("resident saturates queue");
+        let mut pump = SubmissionPump::new(Vec::new());
+        assert!(!pump.try_submit_unit(
+            &pool, synthetic_queue_work_unit("cue-child", "cue-stream:0002-0009".to_string()), false,
+        ));
+        assert_eq!(pump.pending_work_units(), 1);
+        // A worker was never started. No queue admission can be reported.
+    }
+
+    #[test]
+    fn cue_ip01_real_queue_deferred_event_before_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let trace = temp.path().join("queue-events.jsonl");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("cue_ip01_real_queue_deferral_child").arg("--nocapture")
+            .env("TONEPOET_IP01_QUEUE_CHILD", "enabled")
+            .env("TONEPOET_PIPELINE_BASELINE_JSONL", &trace)
+            .output().expect("isolated scheduler child");
+        assert!(output.status.success(), "child test failure: {} / {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "scheduler child fixture must run once");
+        let trace = std::fs::read_to_string(trace).expect("actual opt-in sink file");
+        let records = trace.lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|record| record["event"] == "cue_ip01")
+            .collect::<Vec<_>>();
+        assert!(records.iter().any(|record|
+            record["cue_phase"] == "queue_deferred"
+                && record["reason"] == "queue_full"
+                && record["group"] == "cue-stream:0002-0009"));
+        assert!(!records.iter().any(|record| record["cue_phase"] == "queue_admitted"));
     }
 
     #[test]

@@ -1,0 +1,184 @@
+{
+  "date": "2026-10-22",
+  "files": {
+    "00_START_HERE.md": {
+      "sha256": "c352f646cd33eadaa916632c2f1210d65d0214c9096f99b83508d86f520cef12",
+      "size": 6112
+    },
+    "01_SOURCE_AUDIT.md": {
+      "sha256": "53654d96b31ee43244bd0b502a88c351654e248f56f314784d741a76b35a5fbd",
+      "size": 14480
+    },
+    "02_ARCHITECTURE_DECISION.md": {
+      "sha256": "646f6103f3356d3f44231df68e23dbeba952308819ae505b715cef5cefea5cec",
+      "size": 12812
+    },
+    "03_IMPLEMENTATION_PLAN.md": {
+      "sha256": "ab1299448fb255e51824017dd1f41e6644b1cb9136466a825badc8cb8af4538e",
+      "size": 8418
+    },
+    "04_FORMAT_CAPABILITY_MATRIX.md": {
+      "sha256": "6156421275ef673c142deb0bc0251c998841bb651e12590a3cf58f97804cf5d8",
+      "size": 9912
+    },
+    "05_CONFORMANCE_AND_PERFORMANCE.md": {
+      "sha256": "a485915256f6b6209b1999397a3a54590c9164d3d434bf148074d80b1b9ec4fe",
+      "size": 13508
+    },
+    "06_INDEPENDENT_ADVERSARIAL_AUDIT.md": {
+      "sha256": "3fec50397bc6e23e3af4edca7970cf6a14b3e807491e426d5cb3447eecb40b91",
+      "size": 23065
+    },
+    "07_CHANGE_SUMMARY.md": {
+      "sha256": "f27d281df00c1590f0039f86515bcc370fdf19ef4467e56f7c54c25e85228464",
+      "size": 3099
+    },
+    "08_HOST_GATE_AMENDMENT.md": {
+      "sha256": "43d30a5cae8178de110dbe33bb6f8c1c34133d29332b7bf58dc241049c8dbf3b",
+      "size": 3703
+    },
+    "ARCHITECTURE_DECISIONS.md": {
+      "sha256": "eb5326d6d40e77ec08a8d39c530dbe4da0c7823de50834e609bebf47bf27087f",
+      "size": 4277
+    },
+    "CONFORMANCE_MATRIX.md": {
+      "sha256": "2d9ced5e5063e78347edb3f104267fa87f19888205a5ecbd7d17883e343d6658",
+      "size": 2713
+    },
+    "IMPLEMENTATION_STATUS.md": {
+      "sha256": "c8f96129a951f10719700e42a7d733f97c2dc9286428a8717d2285950101fba2",
+      "size": 2684
+    },
+    "NEXT_SESSION_HANDOFF.md": {
+      "sha256": "e838eece80df1795ebed0597aba3ba89294d8e821b389ba5eabcf8c3611b1829",
+      "size": 2789
+    },
+    "SOURCE_MANIFEST.json": {
+      "sha256": "0ed6fc721c69e2ce3a490d578abbe0039967f958238ccc01fc3f973a43a8db0a",
+      "size": 853
+    },
+    "VERIFICATION_RESULTS.md": {
+      "sha256": "eb199bc7f7c3ff4dbd6fb4e0dba2ec1bd147385283a16a599c59f0114d9b5a3d",
+      "size": 5199
+    },
+    "packets/IP-01_observe_baseline.md": {
+      "sha256": "67980c28abaf9b0fcc67202e1c8bd8c6b4241d2e4b83f03f633310bdf41b1556",
+      "size": 8975
+    },
+    "packets/IP-02_qualify_flac_ranges.md": {
+      "sha256": "a02547d996e98dd8cce470a76674a648dd5d23c546108602730eeedf67a7d45f",
+      "size": 9582
+    },
+    "packets/IP-03_global_resource_admission.md": {
+      "sha256": "83d0c50ce9cb0c894234e7a87319ac573740350d0dabe415777ebe21d78c166a",
+      "size": 9989
+    },
+    "packets/IP-04_parallel_worker_private.md": {
+      "sha256": "a93fb4b9f38ce5356a08b20563c3f291297b58f352f18bfea625bfd76727dd70",
+      "size": 9668
+    },
+    "packets/IP-05_integrate_pilot.md": {
+      "sha256": "7603ca7007f1df8f76440651f55166b5f534fcf229304017a2909914d1548cfc",
+      "size": 10625
+    },
+    "packets/IP-06_qualify_and_promote.md": {
+      "sha256": "e1c82c335c056f5f3d90f93ffb4057146d4e83e087da4455a096cccbc3a891a9",
+      "size": 11957
+    },
+    "provisional/INDEX.md": {
+      "sha256": "6720e1e33032fb3ae4f06e2b0b63753090713b4b1b9a0950d267c1b4f4ec18a2",
+      "size": 2111
+    },
+    "provisional/PX-A_additional_inputs.md": {
+      "sha256": "d79d9d2c2be8db62591b7af91af78dce487aa153b7989eb4a00774dd2aab5aec",
+      "size": 1601
+    },
+    "provisional/PX-B_more_outputs.md": {
+      "sha256": "4c9d714c91fb22101f1ab62750e0976abf3aa0af5194f385e7846d40135162d4",
+      "size": 1190
+    },
+    "provisional/PX-C_stateful_and_fallback.md": {
+      "sha256": "276f81be9262db55c1102fb706c7ce1b53b6cba89efad075884f8d95e5a9d0ad",
+      "size": 2019
+    },
+    "provisional/PX-D_multi_image_lossy.md": {
+      "sha256": "956754f3f0060db9f62ae0d5517f4b71765ab44dcaf5f4d77ed526989c741029",
+      "size": 1436
+    },
+    "tools/evaluate_trials.py": {
+      "sha256": "6526c0c8798c08cac9f3f747a6cfb0bbca8a06c6cb05508a6e7dfdce776b206a",
+      "size": 3564
+    },
+    "tools/generate_cue_fixture.py": {
+      "sha256": "dcc15b7526649a2d18013c6708b9c0ea117551f567f0be5e22b784c50d22ab3f",
+      "size": 4765
+    },
+    "tools/package_bundle.py": {
+      "sha256": "986aac37c44fc7f8572184d0212e08dbbd07179c349d7dd2c4183b68bb4e5697",
+      "size": 4927
+    },
+    "tools/verify_bundle.py": {
+      "sha256": "5e0d8b5d259f72d24de6e70cd6e84cc27923c700ea2cfc7a9ac2bf7d12fd07d3",
+      "size": 4940
+    },
+    "tools/verify_source_refs.py": {
+      "sha256": "1271c9c15d9b98c889f03a8dad885c0bc747f892ca559453f1767dae4f09484b",
+      "size": 4238
+    }
+  },
+  "packets": [
+    {
+      "depends_on": [],
+      "id": "IP-01",
+      "initial_state": "planned",
+      "prompt": "packets/IP-01_observe_baseline.md"
+    },
+    {
+      "depends_on": [
+        "IP-01"
+      ],
+      "id": "IP-02",
+      "initial_state": "planned",
+      "prompt": "packets/IP-02_qualify_flac_ranges.md"
+    },
+    {
+      "depends_on": [
+        "IP-02"
+      ],
+      "id": "IP-03",
+      "initial_state": "planned",
+      "prompt": "packets/IP-03_global_resource_admission.md"
+    },
+    {
+      "depends_on": [
+        "IP-03"
+      ],
+      "id": "IP-04",
+      "initial_state": "planned",
+      "prompt": "packets/IP-04_parallel_worker_private.md"
+    },
+    {
+      "depends_on": [
+        "IP-04"
+      ],
+      "id": "IP-05",
+      "initial_state": "planned",
+      "prompt": "packets/IP-05_integrate_pilot.md"
+    },
+    {
+      "depends_on": [
+        "IP-05"
+      ],
+      "id": "IP-06",
+      "initial_state": "planned",
+      "prompt": "packets/IP-06_qualify_and_promote.md"
+    }
+  ],
+  "planning_release": "R2_CORRECTIVE",
+  "production_modified": false,
+  "schema": "tonepoet-cue-planning-inventory-v1",
+  "source_archive": "TonePoet_SNAPSHOT_98aae2b_2026-10-22.tar.gz",
+  "source_archive_sha256": "0740a9c8cbd8e59648981207daf62e6373f4b544ad3a40c7872b3890c9d76d26",
+  "source_commit_reported": "98aae2b",
+  "source_present_in_this_bundle": false
+}
