@@ -104,6 +104,18 @@ fn cue_preflight_flac_probe(path: &Path) -> Option<AudioProbe> {
     })
 }
 
+// IP-02: share the existing STREAMINFO authority with the inert FLAC range
+// adapter. This is deliberately *not* a general FLAC decoder/probe API.
+pub(super) fn cue_exact_flac_streaminfo(path: &Path) -> Option<(u32, u16, u16, u64)> {
+    let facts = cue_preflight_flac_probe(path)?;
+    Some((
+        facts.sample_rate,
+        facts.channels?,
+        u16::try_from(facts.bit_depth?).ok()?,
+        facts.total_samples,
+    ))
+}
+
 #[derive(Debug, Clone, Copy)]
 struct CuePreflightWavFormat {
     channels: u16,

@@ -22,3 +22,16 @@
 | End-to-end net wall-time with UI RG Both | **Unmeasured** in this source inspection | **NOT RUN** | IP-06 hard gate |
 
 For expanded format inventory and the source-grounded **current routing facts** see [04_FORMAT_CAPABILITY_MATRIX.md](04_FORMAT_CAPABILITY_MATRIX.md). Do not turn this ledger's source-code observations into PASS claims.
+
+
+## IP-02 evidence update, 2026-10-24 (decoder feasibility, NOT production certification)
+
+| Scope | Status here | Evidence | Production admission |
+|---|---|---|---|
+| Standalone exact 16/24-bit FLAC ranged PCM vs S1 baseline for 44.1/48/96k mono/stereo, SEEKTABLE/no SEEKTABLE | **NATIVE TEST PASS** (selected installed executable/version only) | `docs/cue_parallel_ip01/ip02_verification/native_host_results_*.json`; full SHA-256 fixture and reference evidence | **S3 disabled** |
+| Independent byte-count verifier including early EOF, surplus and overflow refusal | **STATIC SOURCE IMPLEMENTED**; Rust unit tests **NOT RUN** | `cue_flac_range.rs`, named `cue_ip02_*` tests | Requires Cargo compilation/test and wiring to supervised pipe in later packet |
+| Corrupt FLAC frame CRC and truncated read failure | **NATIVE TEST PASS** with `crccheck+explode`; `explode` alone **FAILED** exploratory adversarial probe | Native evidence/error records | Fail closed; keep CRC requirement |
+| Long/no-seektable late-offset seek scaling, slow consumer, cancellation/reap | **NATIVE TEST PASS** in limited synthetic host cell; not a portable performance guarantee | Native timing/cancel results | Build-host retest required; no S3 worker yet |
+| Real TonePoet S3 worker, resource concurrency, ReplayGain Both, logs/publication parity | **NOT RUN / NOT IMPLEMENTED** | IP-03 through IP-06 | **S3 disabled** |
+
+This table appends evidence without overwriting the historical planning-state table. No transfer of a PASS claim between source hashes, executable versions or machines is authorized.

@@ -1,0 +1,165 @@
+{
+  "added": {
+    "docs/cue_parallel_ip01/ip02_verification/ADVERSARIAL_CRC_PROBE.md": {
+      "mode": "0o644",
+      "sha256": "d2585f7d7c82e69402bec480a67ce13fe48da20ded177793bd3d1a590023b959",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip02_verification/README.md": {
+      "mode": "0o644",
+      "sha256": "224d968b5c5c292013282dff627d079c6be79dbeba6b4adfbdf143cf2fc318ec",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip02_verification/SESSION_CHECKPOINT.md": {
+      "mode": "0o644",
+      "sha256": "36d4e91123c136f4558d29f13ac2352dad3db213240e8a239b4f40908d7466d9",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip02_verification/native_full_console.log": {
+      "mode": "0o644",
+      "sha256": "1d14642ceb8519fbd1b237b5ea75955defa40c7372a971c39c15b2b3a16db858",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip02_verification/native_host_results_full.json": {
+      "mode": "0o644",
+      "sha256": "8036a2ddf39efafff99f281cb5a19d7c80ed6401fda1f750c02fbb56321fb646",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip02_verification/native_host_results_quick.json": {
+      "mode": "0o644",
+      "sha256": "30142245edccaca616f8f8316dcef3bff7db3c3282b2d284319f99589aabe663",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip02_verification/native_qualify_ranges.py": {
+      "mode": "0o644",
+      "sha256": "2a98e672d779115fab85392af27fa9863a8fe42874df86bd6f42bcbe4566e714",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip02_verification/native_quick_console.log": {
+      "mode": "0o644",
+      "sha256": "d2e232431e0b7a47b554e6cdcb3060893554608956edc867229e021c02f00a04",
+      "type": "file"
+    },
+    "src/convert/pipeline/cue_flac_range.rs": {
+      "mode": "0o644",
+      "sha256": "e470d5deb8070ce3c91686b5040e7163083f71ef8705c44a50b9e7d9921c22a9",
+      "type": "file"
+    }
+  },
+  "changed": {
+    "docs/cue_parallel_ip01/planning_authority/ARCHITECTURE_DECISIONS.md": {
+      "new": {
+        "mode": "0o664",
+        "sha256": "02326528995a71382d29b653a5983e4e58dcbd418052156462ef99a4e4e04472",
+        "type": "file"
+      },
+      "old": {
+        "mode": "0o664",
+        "sha256": "eb5326d6d40e77ec08a8d39c530dbe4da0c7823de50834e609bebf47bf27087f",
+        "type": "file"
+      }
+    },
+    "docs/cue_parallel_ip01/planning_authority/CONFORMANCE_MATRIX.md": {
+      "new": {
+        "mode": "0o664",
+        "sha256": "85c8d1ccaeda282c9ee7c8d4f852ceafac7a7e80a1f8fd1e86b54af82e59cebb",
+        "type": "file"
+      },
+      "old": {
+        "mode": "0o664",
+        "sha256": "2d9ced5e5063e78347edb3f104267fa87f19888205a5ecbd7d17883e343d6658",
+        "type": "file"
+      }
+    },
+    "docs/cue_parallel_ip01/planning_authority/IMPLEMENTATION_STATUS.md": {
+      "new": {
+        "mode": "0o664",
+        "sha256": "df2ff6bb3dd978ba66e9fb87c8ceca9d45ad6c4d4ad531b72e8e94d928aff3d0",
+        "type": "file"
+      },
+      "old": {
+        "mode": "0o664",
+        "sha256": "c8f96129a951f10719700e42a7d733f97c2dc9286428a8717d2285950101fba2",
+        "type": "file"
+      }
+    },
+    "docs/cue_parallel_ip01/planning_authority/NEXT_SESSION_HANDOFF.md": {
+      "new": {
+        "mode": "0o664",
+        "sha256": "b4dc2e8d917355495be73a9d1afcb71557471a12a8606bfac31ca7b7604aa994",
+        "type": "file"
+      },
+      "old": {
+        "mode": "0o664",
+        "sha256": "e838eece80df1795ebed0597aba3ba89294d8e821b389ba5eabcf8c3611b1829",
+        "type": "file"
+      }
+    },
+    "docs/cue_parallel_ip01/planning_authority/SHA256SUMS": {
+      "new": {
+        "mode": "0o644",
+        "sha256": "022000c98cc4246148192f1b1ce78d6f64cea0eabf16a38d322b347eb64a559f",
+        "type": "file"
+      },
+      "old": {
+        "mode": "0o664",
+        "sha256": "d0adf05b2f145a7b8d4788eda4832524de3368c5a113627545ef2d66bc8307ec",
+        "type": "file"
+      }
+    },
+    "docs/cue_parallel_ip01/planning_authority/VERIFICATION_RESULTS.md": {
+      "new": {
+        "mode": "0o664",
+        "sha256": "78565c3f761c91c3673f53b1b0d02354120e66c79aea2c89dbff295b0f4bbba3",
+        "type": "file"
+      },
+      "old": {
+        "mode": "0o664",
+        "sha256": "eb199bc7f7c3ff4dbd6fb4e0dba2ec1bd147385283a16a599c59f0114d9b5a3d",
+        "type": "file"
+      }
+    },
+    "docs/cue_parallel_ip01/planning_authority/manifest.json": {
+      "new": {
+        "mode": "0o644",
+        "sha256": "e78181d868d6db3f4786247ef60637c1b938de5021d7ef94fe6670d08b65067f",
+        "type": "file"
+      },
+      "old": {
+        "mode": "0o664",
+        "sha256": "0533820409ea0b20bf7f489e0aafc03bd5c0b2f621ad0392e296404485428618",
+        "type": "file"
+      }
+    },
+    "src/convert/pipeline/materializer_cue.rs": {
+      "new": {
+        "mode": "0o664",
+        "sha256": "6962b03cfdba452d857d3ce13422159d0183ca6b9a795213cb6493a7e0b378de",
+        "type": "file"
+      },
+      "old": {
+        "mode": "0o664",
+        "sha256": "8973f4aa5076b25451261b1b19cb4e6dbd425f5368fb989a18140e9f7ef05dc3",
+        "type": "file"
+      }
+    },
+    "src/convert/pipeline/mod.rs": {
+      "new": {
+        "mode": "0o664",
+        "sha256": "393e63575bc4f28273cc13f6cf9ea7c5be38734ad79ff5351545d8f933770789",
+        "type": "file"
+      },
+      "old": {
+        "mode": "0o664",
+        "sha256": "aa9c63ebb614abf66864c0b4d7bca7722383a63a88254e61951ef8ca9165d877",
+        "type": "file"
+      }
+    }
+  },
+  "new_entry_count_at_comparison": 1215,
+  "notes": "Generated before embedding the source manifest and final verification script. No .git is available.",
+  "old_entry_count": 1206,
+  "removed": {},
+  "source_archive": "TonePoet_SNAPSHOT_847fc5e_2026-10-24.tar.gz",
+  "source_archive_sha256": "880c5e2693ee09ef56723c0ac7b72cbd6080340c08671f0f36e9288b9a994112"
+}

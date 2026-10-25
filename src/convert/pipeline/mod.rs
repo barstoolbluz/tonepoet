@@ -27,6 +27,9 @@ pub(crate) mod bluray_wav_validate;
 pub(crate) mod bluray_realize;
 pub(crate) mod coordination_name;
 pub mod actions;
+// IP-02 feasibility probe only. No production decoder/worker admission uses it.
+#[allow(dead_code)]
+pub(crate) mod cue_flac_range;
 pub(crate) mod baseline;
 pub(crate) mod rg_profile;
 pub(crate) mod chapter_write;
