@@ -1,3 +1,28 @@
+# CURRENT IP-05 corrective handoff — 2026-10-25
+
+**Correction D-01/D-02:** Added the full authored CUE count to the group-level
+S3 prelaunch gate and a named 12-authored/2-selected regression; removed two
+inherited Python bytecode caches from the delivered full source. The previous
+IP-05 archive `4467bd785bbb...` is **superseded**. Read
+`ip05_verification/CORRECTIVE_D01_D02_2026-10-25.md` and use the **new**
+external delivery receipt for this exact source/archive identity. The rest of
+IP-05 remains unchanged, `implemented-unqualified`, S3 default-OFF, host
+Rust and real album qualification **NOT RUN**. IP-06 stays blocked.
+
+---
+# Original IP-05 implementation handoff — 2026-10-25 (historical after corrective)
+
+**State: `implemented-unqualified`; S3 DEFAULT OFF; NOT ACCEPTED.** Input is owner-accepted IP-04 `TonePoet_SNAPSHOT_9c06f0f_2026-10-25.tar.gz`, SHA-256 `de88377467699875b265231893623b49ee1cfd6a68c20b284a6bf361444defa0`. The supplied owner identity note verifies IP-04 host compilation/qualification; older in-archive IP-04 candidate "not accepted" headings are historical and should not be treated as current. This source is a Git archive without `.git`; owner-reported commit `9c06f0f` is not independently verifiable here.
+
+**Read first:** `ip05_verification/README.md` → `ip05_verification/HOST_GATE.md` → `ip05_verification/VERIFICATION_RESULTS.md` → `ip05_verification/CONFORMANCE_MATRIX.md` → `ip05_verification/ARCHITECTURE_DECISIONS.md` → `ip05_verification/SOURCE_MANIFEST.json` and `SOURCE_DIFF.json` → `planning_authority/packets/IP-05_integrate_pilot.md`, then code.
+
+**Implementation:** ONLY `src/convert/pipeline/stages.rs` and `track_executor.rs` differ among input production modules. One hidden, process-scoped `TONEPOET_CUE_S3_PILOT=1` exact opt-in routes a complete, eligible physical FLAC+CUE album through IP-04 independent sample-qualified workers, IP-03 shared native concurrency budget and ordinary album post-processing/publisher. Default or rejected request uses S1 exactly. Selected pilot uses ordinary native *post-output* ReplayGain, never the incompatible S1 source-pass FIFO. Full group preflight occurs before first child. No child failure is retried under S1. Nothing new is written into visible destination, which must contain only requested output audio and enabled log, CUE and artwork. This is **not a claim** of actual destination parity: host must check the output set.
+
+**Verified here:** native FLAC exact decoded PCM probes PASS (16/24 bits, 3/12/30 tracks, gapped range); destination-auditor unit self-test PASS; source static inventory PASS after build; Rust compile/format/tests and actual TonePoet end-to-end conversion **NOT RUN** (toolchain absent). The input owner separately reported 7618 pass/2 non-IP-05 failures; do not attribute these or claim this IP-05 test suite passed. Evidence under `ip05_verification/`.
+
+**Exact generated output identity / next input:** the deliverable's **external** SHA-bound `TonePoet_CUE_IP05_DELIVERY_RECEIPT_<SHA12>.md` records the complete new archive's literal filename and full SHA-256. An archive cannot embed its own checksum. After all `HOST_GATE.md` gates pass and owner accepts IP-05, **and only then**, IP-06 consumes that **exact verified IP-05 archive**. Until then preserve the accepted IP-04 tarball as rollback and leave the pilot flag unset. Source control commit/merge is for the host; this candidate has no `.git`.
+
+---
 # Current IP-04 corrective handoff — October 25, 2026
 
 **Status: `implemented-unqualified` — S3 OFF — NOT ACCEPTED.** D-01/D-02/D-03 are corrected in the candidate source; unexecuted Rust tests remain unqualified. Preserve the accepted IP-03 source `TonePoet_SNAPSHOT_c1103be_2026-10-24.tar.gz` (`fc3ea07b6a8ffac0b21f366b50e01693ee6b0b626a89749f551f964bcda815d7`) and the pre-correction IP-04 candidate (`662379ddebf6...`) as rollback/review inputs. Read `ip04_verification/CORRECTIVE_D01_D03_2026-10-25.md`, `ip04_verification/NEXT_SESSION_HANDOFF.md`, and host gate commands. New archive identity is in the **external** delivery receipt; no `.git` in the archive. No normal dispatcher may call the private worker.

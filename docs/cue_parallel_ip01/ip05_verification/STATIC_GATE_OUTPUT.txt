@@ -1,0 +1,6 @@
+PASS: IP05 source manifest 1276 entries / 1277 SHA256 checks
+PASS: 2 scoped Rust modules; prelaunch authored CUE count gate, default-OFF switch, true PCM gain exclusion
+PASS: no Python bytecode caches in delivered source inventory
+PASS: native verified pipe/weighted shared permits, downstream RG/publisher wiring, 5 named tests present
+PASS: independent native full reference fixture recorded (not a Rust runner result)
+NOT RUN: rustc, cargo fmt/test, actual TonePoet album/post-output/visible publication

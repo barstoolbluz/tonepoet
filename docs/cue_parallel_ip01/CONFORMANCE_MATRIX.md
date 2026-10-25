@@ -1,3 +1,17 @@
+# CURRENT IP-05 corrective conformance — 2026-10-25
+
+D-01 incomplete selected CUE albums: authored-count guard and a named
+12-authored/2-selected Rust regression added (**NOT RUN**, no Rust toolchain).
+D-02 packaging: inherited `.pyc`/`__pycache__` excluded and checked in
+source static verifier. Host run for actual S1 fallback and full album
+qualification remains mandatory. Details: `ip05_verification/CONFORMANCE_MATRIX.md`.
+
+---
+# Original IP-05 conformance — 2026-10-25 (retained)
+
+Static implementation covers explicit default-OFF gate, all-member prelaunch admission, non-Unix decline, original fallback, exact ranged children, native post-output ReplayGain, existing metadata/publisher and cancellation-aware weighted native permits. Independent native PCM probes PASS for 16/24 bit, 3/12/30 tracks and gapped range; destination checker self-test PASS. Rust integration, actual RG/tags/artwork/parity, failure injection, publication and cross-device gates **NOT RUN** (no Rust toolchain). The authoritative granular matrix is `ip05_verification/CONFORMANCE_MATRIX.md`.
+
+---
 # IP-04 conformance checkpoint — 2026-10-24
 
 Private worker, exact boundary verifier, IP-03 weighted token custody and S1 isolation are source-implemented. Native independently checked 42/42 FLAC range PCM outputs. **Rust host gate NOT RUN / not accepted.** The authoritative IP-04 matrix is `ip04_verification/CONFORMANCE_MATRIX.md`; below is preserved IP-03/IP-01 history.

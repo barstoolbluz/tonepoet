@@ -1,0 +1,36 @@
+{
+  "bit_depth": 16,
+  "full_image_pcm_sha256": "d2e2a85cb6d2213fb9d16af0d387087a9c9bb0f3cdacaded91479aa5355d3de9",
+  "gaps": [
+    31,
+    28,
+    54
+  ],
+  "outcome": "PASS",
+  "ranges": [
+    {
+      "bytes": 136640,
+      "end": 17111,
+      "ordinal": 1,
+      "sha256": "ebf959654d67f25a0bb3ab02bc5e6819ab13dd94d7e9315134763a20983b55ff",
+      "start": 31
+    },
+    {
+      "bytes": 143984,
+      "end": 35137,
+      "ordinal": 2,
+      "sha256": "39bcec9046c81e2afcc36157af89aef02640b6e9f86a609c5697a8cd90e58e5e",
+      "start": 17139
+    },
+    {
+      "bytes": 38576,
+      "end": 40013,
+      "ordinal": 3,
+      "sha256": "1043240cb1f4ff3557b89158180ccd05be557cb103104b5c2f08880c9b6b2b5f",
+      "start": 35191
+    }
+  ],
+  "sample_count": 40013,
+  "scope": "independent native test only; Rust test NOT RUN",
+  "source_flac_sha256": "44f3759e7ee4f7a890aa2b6fb01779dd76ef66ef20dd472cbd446e5d2fb2a5ae"
+}

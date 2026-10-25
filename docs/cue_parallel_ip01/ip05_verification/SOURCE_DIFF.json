@@ -1,0 +1,183 @@
+{
+  "added": {
+    "docs/cue_parallel_ip01/ip05_verification/ARCHITECTURE_DECISIONS.md": {
+      "mode": "0o644",
+      "sha256": "7d8b6abbdb70fa30d2a21892f26b2f841156a4a6c9ef73a108aa77d9c28f3f83",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip05_verification/CONFORMANCE_MATRIX.md": {
+      "mode": "0o644",
+      "sha256": "1903aa979a7c4e48d06b61be7dddaaf445e3123a74ea967aecfd21ff3001a960",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip05_verification/CORRECTIVE_D01_D02_2026-10-25.md": {
+      "mode": "0o644",
+      "sha256": "824ae9fb1e115c6f97f77e9db74328e62e8fcc68752ccef9cca03f1ce9abee47",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip05_verification/HOST_GATE.md": {
+      "mode": "0o644",
+      "sha256": "f4a3710e500b68d1c8185fc8bbde58a9b95722c8ae24b94ee41a78fcde431df4",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip05_verification/README.md": {
+      "mode": "0o644",
+      "sha256": "1766f1c867622640dc2c636ff80b3f694ccbc62b82641913522c403b99c51f2a",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip05_verification/STATIC_AUDIT.md": {
+      "mode": "0o644",
+      "sha256": "a49e66dcdd3fb2337ef2384ba637c2e88cf86a9bb77f9a18c7eb0f2ddcfb208f",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip05_verification/STATIC_GATE_OUTPUT.txt": {
+      "mode": "0o644",
+      "sha256": "4ebf4094d7d1473f1e3690adf042984126d884ea88926f3d62985f2f47ddd3a7",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip05_verification/VERIFICATION_RESULTS.md": {
+      "mode": "0o644",
+      "sha256": "9d53b4645cb450ee6f2303ee117534dbfccd12126bff56cc86ca0ac5fdb0902c",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip05_verification/build_manifest_ip05.py": {
+      "mode": "0o755",
+      "sha256": "3e0a50878ef9255af9eea63d0cd3430991baf0dc0c71b470f221023eeaf9cdbb",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip05_verification/corrective_native_gap_rerun.json": {
+      "mode": "0o644",
+      "sha256": "c756dbf9820769ae7d2b6e79c1dc5ffc81dc2f1b4edb446e13b3201702347cb1",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip05_verification/corrective_native_quick_rerun.json": {
+      "mode": "0o644",
+      "sha256": "ad858e833605dcb4d340e16c305feba01575db70369e7392261f89a0f051c36d",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip05_verification/native_full_results.json": {
+      "mode": "0o644",
+      "sha256": "6850997a88ac9d4a45033da735a53b0a0889d2ce3437c284eed3a0e91a619791",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip05_verification/native_gap_reference_results.json": {
+      "mode": "0o644",
+      "sha256": "c756dbf9820769ae7d2b6e79c1dc5ffc81dc2f1b4edb446e13b3201702347cb1",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip05_verification/native_quick_results.json": {
+      "mode": "0o644",
+      "sha256": "00ed59110372eefc959d30b8d023283637561d9e3d1a9e62babbb6bd33e411cf",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip05_verification/verify_destination_files.py": {
+      "mode": "0o755",
+      "sha256": "9a25f17ddb9c1516245568a84f835487abd8f4354a9c7e3caf474046a155fe96",
+      "type": "file"
+    },
+    "docs/cue_parallel_ip01/ip05_verification/verify_static_ip05.py": {
+      "mode": "0o755",
+      "sha256": "9722cf92f41a409e4b8219e12d5a39fc0c5b78e5413c38baf48a1aa65b3c7384",
+      "type": "file"
+    }
+  },
+  "changed": {
+    "docs/cue_parallel_ip01/ARCHITECTURE_DECISIONS.md": {
+      "new": {
+        "mode": "0o664",
+        "sha256": "30887ed005cd9e9ff10db57043396ec9b962371abe4153b95c2e9e9ce8167355",
+        "type": "file"
+      },
+      "old": {
+        "mode": "0o664",
+        "sha256": "d06534b9f5aafe9a04d767d8a52d7d4fa0c859df0afaee4131635a8f7b0e60b9",
+        "type": "file"
+      }
+    },
+    "docs/cue_parallel_ip01/CONFORMANCE_MATRIX.md": {
+      "new": {
+        "mode": "0o664",
+        "sha256": "8ec4fce64bace68c4afb25d80fc67d2674943caeab668df6874d5f53f031afb9",
+        "type": "file"
+      },
+      "old": {
+        "mode": "0o664",
+        "sha256": "120f122ae5651fe659305a419b3220378662807e13ec0466903f5a40ecd10b4b",
+        "type": "file"
+      }
+    },
+    "docs/cue_parallel_ip01/IMPLEMENTATION_STATUS.md": {
+      "new": {
+        "mode": "0o664",
+        "sha256": "ac06da187605eb8ce8fc63e323aa0b78121dc8677259296209045112e2c9e4b6",
+        "type": "file"
+      },
+      "old": {
+        "mode": "0o664",
+        "sha256": "d73ef81501ce38fd3df2fd5516326e704cfbc3bcd3523c304e54b71d3ff6f047",
+        "type": "file"
+      }
+    },
+    "docs/cue_parallel_ip01/NEXT_SESSION_HANDOFF.md": {
+      "new": {
+        "mode": "0o664",
+        "sha256": "4031718fa962e76e756068b39623ca248ec6fb710e56a6aea1e81a39dd33f8d2",
+        "type": "file"
+      },
+      "old": {
+        "mode": "0o664",
+        "sha256": "f7eb28177a88cb4c894fdabf9beea2d9648cc5aadc88e4ac69f520eaba83ce3c",
+        "type": "file"
+      }
+    },
+    "docs/cue_parallel_ip01/VERIFICATION_RESULTS.md": {
+      "new": {
+        "mode": "0o664",
+        "sha256": "f315e6bbbb6313cc2f7b2d2658fc7322a01f6b646f241d2212f75e3a19d0a243",
+        "type": "file"
+      },
+      "old": {
+        "mode": "0o664",
+        "sha256": "3b2f9f5cb9b1732bc3b7badd7ec6d4b71bda1ea72782ffbd37892c9831706c10",
+        "type": "file"
+      }
+    },
+    "src/convert/pipeline/stages.rs": {
+      "new": {
+        "mode": "0o664",
+        "sha256": "a8190883546fbaf2a40a1490eacb2d51fd853db7ca543cdbb5d1d3fade0d1e3d",
+        "type": "file"
+      },
+      "old": {
+        "mode": "0o664",
+        "sha256": "a8f40810b412cee882e51dc4a4990be4469e1c4f85e7346468f77c40de885fef",
+        "type": "file"
+      }
+    },
+    "src/convert/pipeline/track_executor.rs": {
+      "new": {
+        "mode": "0o664",
+        "sha256": "602c3f63730b269cbb2fceeea5faa68ae0d14b92048e3a2e691943d88b91e55f",
+        "type": "file"
+      },
+      "old": {
+        "mode": "0o664",
+        "sha256": "4c9aa6457b7e97aa4d6067f7452270c5260b54f83a90c65a04ee8141fa787e7a",
+        "type": "file"
+      }
+    }
+  },
+  "removed": {
+    "tonepoet-pipeline/qualification/ssrc_binary64/__pycache__/qualify_ssrc_binary64.cpython-313.pyc": {
+      "mode": "0o664",
+      "sha256": "7722056946191eba22b40da38e69ec637531c59e6d63eb8e6a8d1baff71e92ad",
+      "type": "file"
+    },
+    "tonepoet-pipeline/qualification/ssrc_binary64/__pycache__/test_qualify_ssrc_binary64.cpython-313.pyc": {
+      "mode": "0o664",
+      "sha256": "90eaf3f00cf81d708965b3b2ef44bf841a37143d3bd281b1c1e94330bee4de55",
+      "type": "file"
+    }
+  },
+  "unchanged_count": 1251
+}

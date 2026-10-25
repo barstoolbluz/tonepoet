@@ -11767,6 +11767,72 @@ pub(crate) async fn run_cue_s3_pipeline_if_admitted(
     Ok(CueS3PipelineAttempt::Executed(result))
 }
 
+/// IP-05 activated-pilot path. IP-03's nonblocking entry point remains
+/// unchanged for probes and opt-out callers. Once a complete album is
+/// admitted, temporary competition for a shared native permit must not turn
+/// an otherwise valid track into an arbitrary conversion failure. Wait using
+/// the SAME shared semaphores in the existing SoX -> FFmpeg family order,
+/// without polling or holding a partial family reservation in the fast path.
+/// The guard spans both supervised children and releases on cancellation.
+pub(crate) async fn run_cue_s3_pipeline_after_pilot_admission(
+    producer: ToolCommand,
+    mut consumer: ToolCommand,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    limits: &Arc<ToolConcurrencyLimits>,
+    extent: super::cue_flac_range::ExactPcmExtent,
+) -> Result<CueS3PipelineAttempt, ConvertError> {
+    if producer.binary != ToolBinary::Ffmpeg
+        || !matches!(consumer.binary, ToolBinary::Ffmpeg | ToolBinary::Sox)
+    {
+        return Err(ConvertError::Backend("invalid S3 pilot decoder/encoder pair".to_string()));
+    }
+    let ffmpeg_cost = if consumer.binary == ToolBinary::Ffmpeg { 2 } else { 1 };
+    if !cfg!(unix) || limits.ffmpeg_max_concurrent() < ffmpeg_cost as usize {
+        return Ok(CueS3PipelineAttempt::Declined);
+    }
+    // The common case retains the IP-03 immediate/atomic acquisition, and
+    // never pays a waiting or background-task cost when tokens are free.
+    let fast = run_cue_s3_pipeline_if_admitted(
+        producer.clone(), consumer.clone(), runner, cancel, limits,
+        Some(extent.clone()),
+    ).await?;
+    if !matches!(fast, CueS3PipelineAttempt::Declined) {
+        return Ok(fast);
+    }
+    // A previously launched S3 worker must never fall back to S1 merely
+    // because another album holds the family permit temporarily. No second
+    // scheduler is introduced: these are the IP-03 global semaphores.
+    let in_flight = acquire_owned_permit(limits.cue_s3_in_flight.clone(), cancel).await?;
+    let sox = if consumer.binary == ToolBinary::Sox {
+        Some(acquire_owned_permit(limits.sox.clone(), cancel).await?)
+    } else {
+        None
+    };
+    let ffmpeg = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(ConvertError::Realize("cancelled".to_string())),
+        acquired = limits.ffmpeg.clone().acquire_many_owned(ffmpeg_cost) => {
+            acquired.map_err(|_| ConvertError::Backend(
+                "S3 FFmpeg family semaphore closed".to_string()
+            ))
+        },
+    }?;
+    let _permits = (in_flight, sox, ffmpeg);
+    if cancel.is_cancelled() {
+        return Err(ConvertError::Realize("cancelled".to_string()));
+    }
+    if consumer.binary == ToolBinary::Sox
+        && consumer.environment_policy
+            == tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet
+    {
+        set_sox_omp_threads(&mut consumer, limits.sox_omp_threads());
+    }
+    Ok(CueS3PipelineAttempt::Executed(
+        runner.run_pipeline_with_exact_pcm_extent(producer, consumer, extent, cancel).await,
+    ))
+}
+
 async fn acquire_reference_pipeline_permits(
     binaries: impl IntoIterator<Item = ToolBinary>,
     limits: Option<&Arc<ToolConcurrencyLimits>>,
@@ -15850,6 +15916,84 @@ mod tests {
             let proc_path = PathBuf::from(format!("/proc/{pid}"));
             assert!(!proc_path.exists(), "supervised child {pid} survived permit release");
         }
+    }
+
+    /// IP-05: once an album has been admitted, transient shared-family
+    /// contention must WAIT, not decline and lose the already-selected track.
+    /// Uses the real supervised/exact-length native pipe, not a fake runner.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cue_ip05_pilot_waits_for_shared_permit_and_reaps_on_cancel() {
+        let mut paths = HashMap::new();
+        paths.insert("ffmpeg".to_string(), PathBuf::from("/bin/sh"));
+        paths.insert("sox".to_string(), PathBuf::from("/bin/sh"));
+        let runner = Arc::new(super::super::tool::RealToolRunner::new(paths));
+        let limits = Arc::new(ToolConcurrencyLimits::new(1, 1, 1, 1));
+        let producer = || {
+            let mut cmd = test_tool_command(ToolBinary::Ffmpeg);
+            cmd.args = vec!["-c".to_string(), "printf 01234567".to_string()];
+            cmd
+        };
+        let consumer = || {
+            let mut cmd = test_tool_command(ToolBinary::Sox);
+            cmd.args = vec!["-c".to_string(), "cat >/dev/null".to_string()];
+            cmd
+        };
+        let external = limits.hold_ffmpeg_permit_for_test().await;
+        let cancel = CancellationToken::new();
+        let waiting = {
+            let limits = limits.clone();
+            let runner = runner.clone();
+            let cancel = cancel.clone();
+            let producer = producer();
+            let consumer = consumer();
+            tokio::spawn(async move {
+                run_cue_s3_pipeline_after_pilot_admission(
+                    producer, consumer, runner.as_ref(), &cancel, &limits,
+                    super::super::cue_flac_range::ExactPcmExtent::for_expected_bytes(8),
+                ).await
+            })
+        };
+        tokio::pin!(waiting);
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut waiting)
+            .await.is_err(), "temporary contention must not reject an admitted worker");
+        drop(external);
+        let result = tokio::time::timeout(Duration::from_secs(10), &mut waiting)
+            .await.expect("native S3 must finish after the shared permit is returned")
+            .expect("worker join").expect("post-admission execution");
+        assert!(matches!(result, CueS3PipelineAttempt::Executed(Ok(_))),
+            "real native exact pipe must execute after contention");
+        assert_eq!(limits.ffmpeg.available_permits(), 1);
+        assert_eq!(limits.sox.available_permits(), 1);
+        assert_eq!(limits.cue_s3_in_flight.available_permits(), 1);
+
+        // Cancellation while waiting must not launch any worker, and must
+        // release the S3 and SoX permits it may already have reserved.
+        let external = limits.hold_ffmpeg_permit_for_test().await;
+        let cancel = CancellationToken::new();
+        let waiting = {
+            let limits = limits.clone();
+            let runner = runner.clone();
+            let cancel = cancel.clone();
+            let producer = producer();
+            let consumer = consumer();
+            tokio::spawn(async move {
+                run_cue_s3_pipeline_after_pilot_admission(
+                    producer, consumer, runner.as_ref(), &cancel, &limits,
+                    super::super::cue_flac_range::ExactPcmExtent::for_expected_bytes(8),
+                ).await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        cancel.cancel();
+        let outcome = tokio::time::timeout(Duration::from_secs(3), waiting)
+            .await.expect("cancel must wake the queue immediately")
+            .expect("cancelled worker must join");
+        assert!(outcome.is_err(), "queued cancel cannot be reported as success");
+        drop(external);
+        assert_eq!(limits.ffmpeg.available_permits(), 1);
+        assert_eq!(limits.sox.available_permits(), 1);
+        assert_eq!(limits.cue_s3_in_flight.available_permits(), 1);
     }
 
     #[tokio::test]

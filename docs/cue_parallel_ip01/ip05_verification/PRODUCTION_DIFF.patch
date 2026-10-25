@@ -1,0 +1,797 @@
+--- a/src/convert/pipeline/stages.rs
++++ b/src/convert/pipeline/stages.rs
+@@ -89,11 +89,12 @@
+     cleanup_cue_stream_direct_track_plan, execute_planned_track_conversion,
+     execute_planned_track_conversion_with_scalar_pump,
+     finalize_cue_stream_direct_track_plan, prepare_cue_stream_direct_track_plan,
+     retained_pcm_scalar_stream_plan_admitted,
+     run_segmented_tool_pipeline_with_concurrency, SegmentedPipelineExecutionError,
+-    run_cue_s3_pipeline_if_admitted, CueS3PipelineAttempt,
++    run_cue_s3_pipeline_if_admitted, run_cue_s3_pipeline_after_pilot_admission,
++    CueS3PipelineAttempt,
+     materialize_reference_source_for_album_gain,
+     reference_bound_metadata_executable,
+     reference_metadata_toolchains_match, run_bound_tool_command_with_concurrency,
+     run_tool_command_with_concurrency,
+     verify_reference_metadata_toolchain_before_mutation, verify_reference_output_after_metadata,
+@@ -44600,10 +44601,149 @@
+             Err(error)
+         }
+     }
+ }
+ 
++/// Hidden, process-scoped IP-05 development opt-in. It defaults OFF; only
++/// the exact value `1` selects the pilot, and no request, output directory or
++/// manifest is mutated to persist the gate. Do not promote it in IP-05.
++fn cue_s3_pilot_requested() -> bool {
++    std::env::var("TONEPOET_CUE_S3_PILOT").as_deref() == Ok("1")
++}
++
++/// All eligibility facts must hold for the complete materialized CUE album,
++/// not only the first worker. A rejection leaves the existing S1/source-pass
++/// RG and file-backed fallback paths untouched. Read-only predicates precede
++/// the actual IP-04 typed, source/probe/planner preflight.
++fn cue_s3_pilot_preflight(
++    requested: bool,
++    source: &PreparedSource,
++    tracks: &[ScheduledCueStreamTrack],
++    req: &PipelineRequest,
++    convert_root: &Path,
++    limits: Option<&Arc<ToolConcurrencyLimits>>,
++) -> Result<Vec<CueS3PrivatePrepared>, String> {
++    if !requested {
++        return Err("pilot_disabled".to_string());
++    }
++    if !cfg!(unix) {
++        return Err("two_process_runner_unsupported_on_platform".to_string());
++    }
++    let limits = limits.ok_or("shared_tool_limits_unavailable")?;
++    if source.kind != SourceKind::CueImage
++        || req.merge
++        || source.tracks.len() < 2
++        || source.tracks.len() != tracks.len()
++        // The materializer filters `source.tracks` to the user selection,
++        // but retains the full authored CUE count in album metadata.
++        || source.tracks.len() != source.album_metadata.total_tracks as usize
++    {
++        return Err("not_one_complete_multi_track_cue_album".to_string());
++    }
++    if req.settings.target_format != tonepoet_pipeline::AudioFormat::Flac
++        || req.settings.target_sample_rate != RateTarget::Source
++        || req.settings.target_bit_depth != BitDepthTarget::Source
++        || !req.registered_effects.is_empty()
++        || req.settings.dither_type != tonepoet_pipeline::DitherType::None
++        || req.settings.pcm_true_peak.is_active()
++    {
++        return Err("non_identity_pcm_or_registered_processing".to_string());
++    }
++    // Require the scheduler's exact authored sequence and one physical FILE.
++    // No partial group activation or cross-FILE ReplayGain membership change.
++    if !tracks.iter().enumerate().all(|(index, item)| {
++        item.index == index && item.track.id == source.tracks[index].id
++            && item.track.source_ref == source.tracks[index].source_ref
++    }) || cue_stream_groups(tracks).len() != 1 {
++        return Err("non_contiguous_or_multiple_physical_files".to_string());
++    }
++    let TrackSourceRef::CueStreamSegment { source_image, decode_path, .. } =
++        &tracks[0].track.source_ref else {
++        return Err("non_exact_cue_stream_source".to_string());
++    };
++    if source_image != decode_path {
++        return Err("physical_flac_decode_authority_differs_from_image".to_string());
++    }
++    // This is one all-member preflight, before ANY native child starts. It
++    // independently rechecks FLAC STREAMINFO and the exact sample extents,
++    // planner shape and every distinct staged/work path.
++    let prepared = prepare_qualified_flac_ranges_for_group(tracks, req, convert_root)
++        .map_err(|error| format!("typed_flac_or_planner_preflight_failed: {error}"))?;
++    // Static native capacity, not ephemeral availability; competing albums
++    // await permits only after the entire group has passed this gate.
++    if prepared.iter().any(|member| {
++        member.consumer.binary == ToolBinary::Ffmpeg
++            && limits.ffmpeg_max_concurrent() < 2
++    }) {
++        for member in &prepared {
++            cleanup_cue_stream_direct_track_plan(&member.plan);
++        }
++        return Err("encoder_pair_exceeds_native_child_capacity".to_string());
++    }
++    Ok(prepared)
++}
++
++async fn try_encode_cue_s3_pilot(
++    requested: bool,
++    tracks: &[ScheduledCueStreamTrack],
++    source: &PreparedSource,
++    req: &PipelineRequest,
++    convert_root: &Path,
++    limits: Option<&Arc<ToolConcurrencyLimits>>,
++    runner: &dyn ToolRunner,
++    cancel: &CancellationToken,
++) -> Option<ScheduledCueStreamBatch> {
++    if !requested {
++        return None;
++    }
++    let prepared = match cue_s3_pilot_preflight(
++        requested, source, tracks, req, convert_root, limits,
++    ) {
++        Ok(prepared) => prepared,
++        Err(reason) => {
++            // Auditable opt-in rejection, not an attempted/failed conversion.
++            log::info!("CUE S3 pilot not selected for job {}: {reason}", req.job_id);
++            if super::baseline::enabled() {
++                super::baseline::cue_emit(&req.job_id, "s3_pilot_decision", serde_json::json!({
++                    "selected": false, "reason": reason,
++                    "fallback": "existing_s1_or_carrier_route",
++                }));
++            }
++            return None;
++        }
++    };
++    let limits = limits.expect("admitted S3 requires shared tool limits");
++    cue_ip01_route(req, tracks, "s3", "exact_flac_pilot_opt_in");
++    log::info!("CUE S3 pilot admitted for job {} ({} tracks); ReplayGain measured after output",
++        req.job_id, tracks.len());
++    if super::baseline::enabled() {
++        // Retain the same per-album ReplayGain policy event as S1. Selection
++        // is not a claim that tags have already been written or verified.
++        super::baseline::cue_emit(&req.job_id, "replaygain_policy", serde_json::json!({
++            "requested": cue_ip01_rg_policy(req),
++            "source_pass_candidate": false,
++            "source_pass_observed": false,
++            "note": "s3_uses_native_post_output_replaygain",
++        }));
++        super::baseline::cue_emit(&req.job_id, "s3_pilot_decision", serde_json::json!({
++            "selected": true,
++            "track_ordinals": tracks.iter().map(|item| item.track.id.source_ordinal).collect::<Vec<_>>(),
++            "source_pass_replaygain": false,
++            "post_output_replaygain": req.stages.replaygain == StageRequirement::Enabled,
++        }));
++    }
++    let outputs = run_prepared_qualified_flac_ranges(
++        prepared, req, runner, cancel, limits, true,
++    ).await;
++    Some(ScheduledCueStreamBatch {
++        outputs,
++        // The existing album post-processing barrier owns native ReplayGain
++        // for all successfully encoded staged files, including Both/IfMissing.
++        source_replaygain: None,
++    })
++}
++
+ pub async fn encode_cue_stream_album_for_scheduler_with_tool_limits_and_version_cache(
+     tracks: Vec<ScheduledCueStreamTrack>,
+     source: PreparedSource,
+     req: PipelineRequest,
+     staging_root: PathBuf,
+@@ -44618,10 +44758,19 @@
+     let runner = real_tool_runner_with_optional_version_cache(
+         tool_paths.clone(),
+         version_cache,
+         &req,
+     );
++    // IP-05: select only AFTER complete CUE materialization and planner/
++    // source preflight. The common album post-processing and publisher are
++    // unchanged; rejected albums enter the exact existing S1 path below.
++    if let Some(batch) = try_encode_cue_s3_pilot(
++        cue_s3_pilot_requested(), &tracks, &source, &req, &convert_root,
++        tool_concurrency_limits.as_ref(), &runner, &cancel,
++    ).await {
++        return batch;
++    }
+     let groups = cue_stream_groups(&tracks);
+     let source_rg = cue_source_replaygain_eligible(&source, &req)
+         && cue_stream_album_direct_preflight(&tracks, &req, &convert_root);
+     if super::baseline::enabled() {
+         super::baseline::cue_emit(&req.job_id, "replaygain_policy", serde_json::json!({
+@@ -45493,17 +45642,28 @@
+     prepared: CueS3PrivatePrepared,
+     req: &PipelineRequest,
+     runner: &dyn ToolRunner,
+     cancel: &CancellationToken,
+     limits: &Arc<ToolConcurrencyLimits>,
++    wait_for_shared_permits: bool,
+ ) -> ScheduledTrackOutput {
+     let range = prepared.decoder.sample_bounds();
+     let expected_bytes = prepared.decoder.expected_pcm_bytes();
+-    let attempted = run_cue_s3_pipeline_if_admitted(
+-        prepared.decoder.command(), prepared.consumer.clone(), runner, cancel,
+-        limits, Some(prepared.decoder.extent_verifier()),
+-    ).await;
++    // The inactive IP-04 probe preserves its immediate-decline semantics.
++    // Once IP-05 has selected an entire album, native contention waits rather
++    // than spuriously failing a member halfway through a started album.
++    let attempted = if wait_for_shared_permits {
++        run_cue_s3_pipeline_after_pilot_admission(
++            prepared.decoder.command(), prepared.consumer.clone(), runner, cancel,
++            limits, prepared.decoder.extent_verifier(),
++        ).await
++    } else {
++        run_cue_s3_pipeline_if_admitted(
++            prepared.decoder.command(), prepared.consumer.clone(), runner, cancel,
++            limits, Some(prepared.decoder.extent_verifier()),
++        ).await
++    };
+     let output = match attempted {
+         Ok(CueS3PipelineAttempt::Executed(Ok(pipeline))) => {
+             let mut producer = pipeline.producer.command;
+             producer.description = Some(format!(
+                 "Independent FLAC CUE range [{}, {}) for track {}",
+@@ -45578,24 +45738,40 @@
+     limits: &Arc<ToolConcurrencyLimits>,
+ ) -> Result<Vec<ScheduledTrackOutput>, ConvertError> {
+     if cancel.is_cancelled() {
+         return Err(ConvertError::Realize("cancelled".to_string()));
+     }
+-    let mut prepared = VecDeque::from(prepare_qualified_flac_ranges_for_group(
+-        &tracks, req, convert_root,
+-    )?);
++    let prepared = prepare_qualified_flac_ranges_for_group(&tracks, req, convert_root)?;
++    Ok(run_prepared_qualified_flac_ranges(
++        prepared, req, runner, cancel, limits, false,
++    ).await)
++}
++
++/// IP-05 consumes the same once-only all-member preflight plan, without
++/// rebuilding/resetting scratch between admission and execution. It is this
++/// entry point (rather than the IP-04 proof wrapper) that waits for contended
++/// native permits after selecting the full album.
++async fn run_prepared_qualified_flac_ranges(
++    prepared: Vec<CueS3PrivatePrepared>,
++    req: &PipelineRequest,
++    runner: &dyn ToolRunner,
++    cancel: &CancellationToken,
++    limits: &Arc<ToolConcurrencyLimits>,
++    wait_for_shared_permits: bool,
++) -> Vec<ScheduledTrackOutput> {
++    let mut prepared = VecDeque::from(prepared);
+     let mut outputs = Vec::with_capacity(prepared.len());
+     let bound = limits.cue_s3_max_in_flight().min(2);
+     // A sliding two-worker window: refill a slot immediately after its
+     // worker settles. `join!` per pair would impose a slow-worker barrier,
+     // wasting capacity on albums with uneven track lengths.
+     let mut first = prepared.pop_front().map(|job| Box::pin(
+-        run_qualified_flac_range_member(job, req, runner, cancel, limits),
++        run_qualified_flac_range_member(job, req, runner, cancel, limits, wait_for_shared_permits),
+     ));
+     let mut second = if bound > 1 {
+         prepared.pop_front().map(|job| Box::pin(
+-            run_qualified_flac_range_member(job, req, runner, cancel, limits),
++            run_qualified_flac_range_member(job, req, runner, cancel, limits, wait_for_shared_permits),
+         ))
+     } else {
+         None
+     };
+     while first.is_some() || second.is_some() {
+@@ -45608,20 +45784,20 @@
+             (None, Some(b)) => (1, b.await),
+             (None, None) => unreachable!("S3 loop has a live worker"),
+         };
+         outputs.push(result);
+         let next = prepared.pop_front().map(|job| Box::pin(
+-            run_qualified_flac_range_member(job, req, runner, cancel, limits),
++            run_qualified_flac_range_member(job, req, runner, cancel, limits, wait_for_shared_permits),
+         ));
+         if slot == 0 {
+             first = next;
+         } else {
+             second = next;
+         }
+     }
+     order_qualified_cue_results(&mut outputs);
+-    Ok(outputs)
++    outputs
+ }
+ 
+ /// A stable reporting/publication input order is independent of which native
+ /// worker happens to finish first. This operates on completed records only.
+ fn order_qualified_cue_results(outputs: &mut [ScheduledTrackOutput]) {
+@@ -82378,10 +82554,340 @@
+         ).is_err());
+         assert_eq!(limits.ffmpeg_available_permits_for_test(), 4);
+         assert!(tracks.iter().all(|item| !item.final_path.exists()));
+     }
+ 
++    // IP-05's selector is deliberately injected with a Boolean in these tests;
++    // there is no process-global environment mutation or test-order dependency.
++    fn cue_ip05_test_album(
++        root: &Path,
++        tracks: &[ScheduledCueStreamTrack],
++    ) -> PreparedSource {
++        let ids = tracks.iter().map(|item| item.track.id.clone()).collect::<Vec<_>>();
++        let mut source = prepared_source(root, &ids);
++        source.kind = SourceKind::CueImage;
++        source.tracks = tracks.iter().map(|item| item.track.clone()).collect();
++        source
++    }
++
++    fn cue_ip05_test_request(root: &Path, replaygain: bool) -> PipelineRequest {
++        let mut req = request(
++            root, FailurePolicy::FailAlbumOnAnyTrackFailure,
++            stage_policy(false, replaygain, false), OverwritePolicy::FailIfExists,
++        );
++        req.settings.target_format = tonepoet_pipeline::AudioFormat::Flac;
++        req.settings.target_sample_rate = RateTarget::Source;
++        req.settings.target_bit_depth = BitDepthTarget::Source;
++        req.settings.preferred_tool = tonepoet_pipeline::PreferredTool::Ffmpeg;
++        req
++    }
++
++    #[test]
++    fn cue_ip05_pilot_opt_out_and_nonidentity_rejections_are_whole_album() {
++        let temp = tempfile::tempdir().unwrap();
++        let (tracks, _) = cue_stream_three_track_group(temp.path(), 16);
++        let source = cue_ip05_test_album(temp.path(), &tracks);
++        let req = cue_ip05_test_request(temp.path(), true);
++        let root = temp.path().join("private-work");
++        let limits = Arc::new(ToolConcurrencyLimits::new(2, 4, 1, 4));
++        let admit = |enabled: bool, source: &PreparedSource,
++                     group: &[ScheduledCueStreamTrack], req: &PipelineRequest| {
++            cue_s3_pilot_preflight(enabled, source, group, req, &root, Some(&limits))
++                .err().expect("unqualified request must decline")
++        };
++        assert_eq!(admit(false, &source, &tracks, &req), "pilot_disabled");
++        let mut wrong_kind = source.clone();
++        wrong_kind.kind = SourceKind::SingleFile;
++        assert_eq!(admit(true, &wrong_kind, &tracks, &req),
++            "not_one_complete_multi_track_cue_album");
++        let mut merged = req.clone();
++        merged.merge = true;
++        assert_eq!(admit(true, &source, &tracks, &merged),
++            "not_one_complete_multi_track_cue_album");
++        let mut rate = req.clone();
++        rate.settings.target_sample_rate = RateTarget::PcmHz(48_000);
++        assert_eq!(admit(true, &source, &tracks, &rate),
++            "non_identity_pcm_or_registered_processing");
++        let mut depth = req.clone();
++        depth.settings.target_bit_depth = BitDepthTarget::Pcm(PcmBitDepth::Int16);
++        assert_eq!(admit(true, &source, &tracks, &depth),
++            "non_identity_pcm_or_registered_processing");
++        let mut lossy = req.clone();
++        lossy.settings.target_format = tonepoet_pipeline::AudioFormat::Mp3;
++        assert_eq!(admit(true, &source, &tracks, &lossy),
++            "non_identity_pcm_or_registered_processing");
++        let mut fixed_gain = req.clone();
++        fixed_gain.settings.pcm_true_peak.policy =
++            tonepoet_pipeline::SampleGainPolicy::FixedGain {
++                gain_db: "1.000000000".parse().unwrap(),
++            };
++        assert_eq!(admit(true, &source, &tracks, &fixed_gain),
++            "non_identity_pcm_or_registered_processing");
++        let mut dither = req.clone();
++        dither.settings.dither_type = tonepoet_pipeline::DitherType::Tpdf;
++        assert_eq!(admit(true, &source, &tracks, &dither),
++            "non_identity_pcm_or_registered_processing");
++        let mut selected_only = tracks.clone();
++        selected_only.pop();
++        assert_eq!(admit(true, &source, &selected_only, &req),
++            "not_one_complete_multi_track_cue_album");
++        let mut gap = tracks.clone();
++        gap[1].index += 1;
++        assert_eq!(admit(true, &source, &gap, &req),
++            "non_contiguous_or_multiple_physical_files");
++        let mut other_file = tracks.clone();
++        if let TrackSourceRef::CueStreamSegment { source_image, .. } =
++            &mut other_file[1].track.source_ref {
++            *source_image = temp.path().join("other.flac");
++        }
++        let other_source = cue_ip05_test_album(temp.path(), &other_file);
++        assert_eq!(admit(true, &other_source, &other_file, &req),
++            "non_contiguous_or_multiple_physical_files");
++        assert!(admit(true, &source, &tracks, &req).starts_with(
++            "typed_flac_or_planner_preflight_failed"),
++            "a placeholder cannot reach execution or reserve a live child");
++        assert_eq!(limits.ffmpeg_available_permits_for_test(), 4);
++        assert!(tracks.iter().all(|item| !item.final_path.exists()));
++    }
++
++    #[tokio::test]
++    async fn cue_ip05_pilot_incomplete_materialized_album_falls_back_before_spawn() {
++        let temp = tempfile::tempdir().unwrap();
++        let (mut selected, _) = cue_stream_three_track_group(temp.path(), 16);
++        selected.truncate(2);
++        // Model the real materializer after a Range/Set selection of tracks
++        // 1-2 from a twelve-track CUE. Both the prepared and scheduled lists
++        // now contain just the selection; the authored total still says 12.
++        for (index, item) in selected.iter_mut().enumerate() {
++            item.track.id.source_ordinal = index as u32 + 1;
++            if let TrackSourceRef::CueStreamSegment { image_samples, .. } =
++                &mut item.track.source_ref
++            {
++                *image_samples = 12 * 44_100;
++            }
++        }
++        let mut source = cue_ip05_test_album(temp.path(), &selected);
++        source.album_metadata.total_tracks = 12;
++        assert_eq!(source.tracks.len(), 2);
++        assert_eq!(
++            source
++                .tracks
++                .iter()
++                .map(|item| item.id.source_ordinal)
++                .collect::<Vec<_>>(),
++            vec![1, 2]
++        );
++        let req = cue_ip05_test_request(temp.path(), true);
++        let root = temp.path().join("private-work");
++        let limits = Arc::new(ToolConcurrencyLimits::new(2, 4, 1, 4));
++        assert_eq!(
++            cue_s3_pilot_preflight(true, &source, &selected, &req, &root, Some(&limits))
++                .err()
++                .expect("shortened album must decline"),
++            "not_one_complete_multi_track_cue_album"
++        );
++        let runner = RealToolRunner::new(HashMap::new());
++        assert!(
++            try_encode_cue_s3_pilot(
++                true,
++                &selected,
++                &source,
++                &req,
++                &root,
++                Some(&limits),
++                &runner,
++                &CancellationToken::new(),
++            )
++            .await
++            .is_none(),
++            "incomplete selection must return control to S1"
++        );
++        assert_eq!(limits.ffmpeg_available_permits_for_test(), 4);
++        assert!(selected.iter().all(|item| !item.final_path.exists()));
++
++        // A fully selected authored album is not excluded just because the
++        // caller originally expressed that selection as a Range or Set.
++        // This placeholder is otherwise unqualified FLAC, so the typed source
++        // proof (not the album-count gate) must reject it next.
++        source.album_metadata.total_tracks = 2;
++        let reason = cue_s3_pilot_preflight(true, &source, &selected, &req, &root, Some(&limits))
++            .err()
++            .expect("non-FLAC placeholder must decline");
++        assert!(
++            reason.starts_with("typed_flac_or_planner_preflight_failed"),
++            "full selection must reach the existing typed proof: {reason}"
++        );
++    }
++
++    /// End-to-end at the real album *worker* boundary (not an independent
++    /// simulation): S3 admission, supervised native children, exact PCM,
++    /// retained records, and the normal output-scanned ReplayGain stage.
++    /// The later publisher remains the same album-level owner for both routes.
++    #[cfg(unix)]
++    async fn cue_ip05_real_worker_parity_case(
++        bits: u32,
++        members: usize,
++        mode: Option<tonepoet_pipeline::ReplayGainMode>,
++    ) {
++        let temp = tempfile::tempdir().expect("native CUE pilot fixture");
++        let root = temp.path();
++        let image = root.join("physical-image.flac");
++        let samples_per_track = 44_100_u64;
++        let total = samples_per_track * members as u64;
++        let mut create = std::process::Command::new("ffmpeg");
++        create.args(["-hide_banner", "-nostdin", "-loglevel", "error", "-y",
++            "-f", "lavfi", "-i"])
++            .arg(format!("sine=frequency=440:sample_rate=44100:duration={}",
++                total as f64 / 44_100.0))
++            .args(["-ac", "2", "-c:a", "flac"]);
++        if bits == 24 {
++            create.args(["-sample_fmt", "s32", "-bits_per_raw_sample", "24"]);
++        } else {
++            create.args(["-sample_fmt", "s16"]);
++        }
++        let generated = create.arg(&image).output().expect("ffmpeg fixture");
++        assert!(generated.status.success(), "native FLAC generation: {}",
++            String::from_utf8_lossy(&generated.stderr));
++        assert_eq!(super::super::materializer_cue::cue_exact_flac_streaminfo(&image),
++            Some((44_100, 2, u16::try_from(bits).unwrap(), total)));
++        let mut tracks = Vec::new();
++        for index in 0..members {
++            let mut track = prepared_source(root, &[track_id(index as u32)])
++                .tracks.remove(0);
++            track.bit_depth = Some(bits);
++            track.sample_rate = Some(44_100);
++            track.expected_samples = Some(samples_per_track);
++            track.source_audio = SourceAudioDescriptor::from_scalar(
++                Some(44_100), Some(bits), Some(SourceAudioCoding::Pcm),
++            );
++            track.source_ref = TrackSourceRef::CueStreamSegment {
++                fallback_path: root.join(format!("fallback-{index}.wav")),
++                source_image: image.clone(),
++                decode_path: image.clone(),
++                start_sample: index as u64 * samples_per_track,
++                samples: samples_per_track,
++                image_samples: total,
++                carrier: CueSegmentCarrier::PcmS32LeWav,
++                channels: 2,
++            };
++            tracks.push(ScheduledCueStreamTrack {
++                index, track,
++                final_path: root.join(format!("VISIBLE/{:02}.flac", index + 1)),
++            });
++        }
++        let source = cue_ip05_test_album(root, &tracks);
++        let mut req = cue_ip05_test_request(root, mode.is_some());
++        req.settings.replay_gain.mode = mode;
++        let runner = RealToolRunner::new(HashMap::new());
++        let limits = Arc::new(ToolConcurrencyLimits::new(2, 4, 1, 2));
++        let cancel = CancellationToken::new();
++        let s3 = try_encode_cue_s3_pilot(
++            true, &tracks, &source, &req, &root.join("s3-work"),
++            Some(&limits), &runner, &cancel,
++        ).await.expect("selected complete FLAC pilot");
++        assert!(s3.source_replaygain.is_none(),
++            "S3 must always defer native gain to the album output barrier");
++        assert_eq!(s3.outputs.len(), members);
++        let s1 = encode_cue_stream_group_with_runner(
++            tracks.clone(), req.clone(), root.join("s1-stage"), "s1-reference".to_string(),
++            root.join("s1-work"), HashMap::new(), Some(limits.clone()),
++            &runner, None, cancel.clone(), None,
++        ).await;
++        assert_eq!(s1.len(), members);
++        let full_pcm = std::process::Command::new("ffmpeg")
++            .args(["-hide_banner", "-nostdin", "-loglevel", "error", "-i"])
++            .arg(&image).args(["-f", "s32le", "-c:a", "pcm_s32le", "pipe:1"])
++            .output().expect("reference PCM");
++        assert!(full_pcm.status.success());
++        assert_eq!(full_pcm.stdout.len() as u64, total * 8);
++        for (index, (pilot, reference)) in s3.outputs.iter().zip(s1.iter()).enumerate() {
++            assert!(pilot.ok && reference.ok,
++                "S3/S1 worker failure at {index}: {:?} / {:?}", pilot.record, reference.record);
++            assert_eq!(pilot.index, index);
++            assert_eq!(pilot.record.track_id, tracks[index].track.id);
++            assert_eq!(pilot.record.source_ref, tracks[index].track.source_ref);
++            assert_eq!(pilot.record.commands.len(), 2, "each native child has its own record");
++            assert!(pilot.record.execution_evidence.verifications.iter()
++                .any(|v| v.id == "s3-exact-producer-extent"
++                    && v.status == VerificationStatus::Passed));
++            let artifact = pilot.artifact.as_ref().expect("pilot stage");
++            assert_eq!(artifact.final_path, tracks[index].final_path);
++            assert_eq!(artifact.samples, Some(samples_per_track));
++            assert!(!artifact.final_path.exists(), "worker must never publish directly");
++            for output in [pilot, reference] {
++                let path = &output.artifact.as_ref().unwrap().staged_path;
++                let decoded = std::process::Command::new("ffmpeg")
++                    .args(["-hide_banner", "-nostdin", "-loglevel", "error", "-i"])
++                    .arg(path).args(["-f", "s32le", "-c:a", "pcm_s32le", "pipe:1"])
++                    .output().expect("encoded PCM");
++                assert!(decoded.status.success(), "decode failed: {}",
++                    String::from_utf8_lossy(&decoded.stderr));
++                let start = index * samples_per_track as usize * 8;
++                assert_eq!(&decoded.stdout, &full_pcm.stdout[start..start + samples_per_track as usize * 8],
++                    "every original source PCM sample must survive S3 AND S1");
++            }
++        }
++        if let Some(mode) = mode {
++            let s3_artifacts = ArtifactSet {
++                audio: AudioArtifacts::Tracks(s3.outputs.iter().map(|o|
++                    o.artifact.clone().expect("S3 stage")).collect()),
++                sidecars: Vec::new(),
++            };
++            let s1_artifacts = ArtifactSet {
++                audio: AudioArtifacts::Tracks(s1.iter().map(|o|
++                    o.artifact.clone().expect("S1 stage")).collect()),
++                sidecars: Vec::new(),
++            };
++            for artifacts in [&s3_artifacts, &s1_artifacts] {
++                let result = apply_replaygain_with_source_and_tool_limits(
++                    artifacts, Some(&source), &req, &runner, &cancel, Some(limits.clone()),
++                ).await.expect("actual native output ReplayGain stage");
++                assert!(matches!(result.outcome, StageOutcome::Ok | StageOutcome::OkWithDetail(_)));
++            }
++            for (pilot, reference) in s3.outputs.iter().zip(s1.iter()) {
++                for tag in ["REPLAYGAIN_TRACK_GAIN", "REPLAYGAIN_TRACK_PEAK",
++                            "REPLAYGAIN_ALBUM_GAIN", "REPLAYGAIN_ALBUM_PEAK"] {
++                    let read = |path: &Path| {
++                        let output = std::process::Command::new("metaflac")
++                            .arg(format!("--show-tag={tag}"))
++                            .arg(path).output().expect("metaflac tag read");
++                        assert!(output.status.success());
++                        output.stdout
++                    };
++                    let left = read(&pilot.artifact.as_ref().unwrap().staged_path);
++                    let right = read(&reference.artifact.as_ref().unwrap().staged_path);
++                    assert_eq!(left, right, "{tag}: S3 versus S1 post-output at {mode:?}");
++                }
++            }
++        }
++        assert!(!root.join("VISIBLE").exists(),
++            "neither worker may create the publication destination or control sidecars");
++        assert_eq!(limits.ffmpeg_available_permits_for_test(), 4,
++            "all supervised S3/S1 native permits must be returned");
++    }
++
++    #[cfg(unix)]
++    #[tokio::test]
++    async fn cue_ip05_pilot_selected_real_three_tracks_16_24_off_and_both() {
++        cue_ip05_real_worker_parity_case(16, 3, None).await;
++        cue_ip05_real_worker_parity_case(24, 3, Some(tonepoet_pipeline::ReplayGainMode::Both)).await;
++    }
++
++    #[cfg(unix)]
++    #[tokio::test]
++    #[ignore = "native S3/S1 12-member album plus RG modes; run explicitly on build host"]
++    async fn cue_ip05_pilot_native_twelve_track_rg_mode_matrix() {
++        for bits in [16_u32, 24_u32] {
++            for mode in [
++                tonepoet_pipeline::ReplayGainMode::Track,
++                tonepoet_pipeline::ReplayGainMode::Album,
++                tonepoet_pipeline::ReplayGainMode::Both,
++            ] {
++                cue_ip05_real_worker_parity_case(bits, 12, Some(mode)).await;
++            }
++        }
++    }
+ }
+ // CHUNK_2_1_3_FAILURE_CANCELLATION_TESTS_END
+ 
+ #[cfg(test)]
+ mod validate_encoded_output_tests {
+--- a/src/convert/pipeline/track_executor.rs
++++ b/src/convert/pipeline/track_executor.rs
+@@ -11765,10 +11765,76 @@
+         None => runner.run_pipeline(producer, consumer, cancel).await,
+     };
+     Ok(CueS3PipelineAttempt::Executed(result))
+ }
+ 
++/// IP-05 activated-pilot path. IP-03's nonblocking entry point remains
++/// unchanged for probes and opt-out callers. Once a complete album is
++/// admitted, temporary competition for a shared native permit must not turn
++/// an otherwise valid track into an arbitrary conversion failure. Wait using
++/// the SAME shared semaphores in the existing SoX -> FFmpeg family order,
++/// without polling or holding a partial family reservation in the fast path.
++/// The guard spans both supervised children and releases on cancellation.
++pub(crate) async fn run_cue_s3_pipeline_after_pilot_admission(
++    producer: ToolCommand,
++    mut consumer: ToolCommand,
++    runner: &dyn ToolRunner,
++    cancel: &CancellationToken,
++    limits: &Arc<ToolConcurrencyLimits>,
++    extent: super::cue_flac_range::ExactPcmExtent,
++) -> Result<CueS3PipelineAttempt, ConvertError> {
++    if producer.binary != ToolBinary::Ffmpeg
++        || !matches!(consumer.binary, ToolBinary::Ffmpeg | ToolBinary::Sox)
++    {
++        return Err(ConvertError::Backend("invalid S3 pilot decoder/encoder pair".to_string()));
++    }
++    let ffmpeg_cost = if consumer.binary == ToolBinary::Ffmpeg { 2 } else { 1 };
++    if !cfg!(unix) || limits.ffmpeg_max_concurrent() < ffmpeg_cost as usize {
++        return Ok(CueS3PipelineAttempt::Declined);
++    }
++    // The common case retains the IP-03 immediate/atomic acquisition, and
++    // never pays a waiting or background-task cost when tokens are free.
++    let fast = run_cue_s3_pipeline_if_admitted(
++        producer.clone(), consumer.clone(), runner, cancel, limits,
++        Some(extent.clone()),
++    ).await?;
++    if !matches!(fast, CueS3PipelineAttempt::Declined) {
++        return Ok(fast);
++    }
++    // A previously launched S3 worker must never fall back to S1 merely
++    // because another album holds the family permit temporarily. No second
++    // scheduler is introduced: these are the IP-03 global semaphores.
++    let in_flight = acquire_owned_permit(limits.cue_s3_in_flight.clone(), cancel).await?;
++    let sox = if consumer.binary == ToolBinary::Sox {
++        Some(acquire_owned_permit(limits.sox.clone(), cancel).await?)
++    } else {
++        None
++    };
++    let ffmpeg = tokio::select! {
++        biased;
++        _ = cancel.cancelled() => Err(ConvertError::Realize("cancelled".to_string())),
++        acquired = limits.ffmpeg.clone().acquire_many_owned(ffmpeg_cost) => {
++            acquired.map_err(|_| ConvertError::Backend(
++                "S3 FFmpeg family semaphore closed".to_string()
++            ))
++        },
++    }?;
++    let _permits = (in_flight, sox, ffmpeg);
++    if cancel.is_cancelled() {
++        return Err(ConvertError::Realize("cancelled".to_string()));
++    }
++    if consumer.binary == ToolBinary::Sox
++        && consumer.environment_policy
++            == tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet
++    {
++        set_sox_omp_threads(&mut consumer, limits.sox_omp_threads());
++    }
++    Ok(CueS3PipelineAttempt::Executed(
++        runner.run_pipeline_with_exact_pcm_extent(producer, consumer, extent, cancel).await,
++    ))
++}
++
+ async fn acquire_reference_pipeline_permits(
+     binaries: impl IntoIterator<Item = ToolBinary>,
+     limits: Option<&Arc<ToolConcurrencyLimits>>,
+     cancel: &CancellationToken,
+ ) -> Result<Option<ReferencePipelinePermitSet>, ConvertError> {
+@@ -15850,10 +15916,88 @@
+             let proc_path = PathBuf::from(format!("/proc/{pid}"));
+             assert!(!proc_path.exists(), "supervised child {pid} survived permit release");
+         }
+     }
+ 
++    /// IP-05: once an album has been admitted, transient shared-family
++    /// contention must WAIT, not decline and lose the already-selected track.
++    /// Uses the real supervised/exact-length native pipe, not a fake runner.
++    #[cfg(unix)]
++    #[tokio::test]
++    async fn cue_ip05_pilot_waits_for_shared_permit_and_reaps_on_cancel() {
++        let mut paths = HashMap::new();
++        paths.insert("ffmpeg".to_string(), PathBuf::from("/bin/sh"));
++        paths.insert("sox".to_string(), PathBuf::from("/bin/sh"));
++        let runner = Arc::new(RealToolRunner::new(paths));
++        let limits = Arc::new(ToolConcurrencyLimits::new(1, 1, 1, 1));
++        let producer = || {
++            let mut cmd = test_tool_command(ToolBinary::Ffmpeg);
++            cmd.args = vec!["-c".to_string(), "printf 01234567".to_string()];
++            cmd
++        };
++        let consumer = || {
++            let mut cmd = test_tool_command(ToolBinary::Sox);
++            cmd.args = vec!["-c".to_string(), "cat >/dev/null".to_string()];
++            cmd
++        };
++        let external = limits.hold_ffmpeg_permit_for_test().await;
++        let cancel = CancellationToken::new();
++        let waiting = {
++            let limits = limits.clone();
++            let runner = runner.clone();
++            let cancel = cancel.clone();
++            let producer = producer();
++            let consumer = consumer();
++            tokio::spawn(async move {
++                run_cue_s3_pipeline_after_pilot_admission(
++                    producer, consumer, runner.as_ref(), &cancel, &limits,
++                    super::super::cue_flac_range::ExactPcmExtent::for_expected_bytes(8),
++                ).await
++            })
++        };
++        tokio::pin!(waiting);
++        assert!(tokio::time::timeout(Duration::from_millis(100), &mut waiting)
++            .await.is_err(), "temporary contention must not reject an admitted worker");
++        drop(external);
++        let result = tokio::time::timeout(Duration::from_secs(10), &mut waiting)
++            .await.expect("native S3 must finish after the shared permit is returned")
++            .expect("worker join").expect("post-admission execution");
++        assert!(matches!(result, CueS3PipelineAttempt::Executed(Ok(_))),
++            "real native exact pipe must execute after contention");
++        assert_eq!(limits.ffmpeg.available_permits(), 1);
++        assert_eq!(limits.sox.available_permits(), 1);
++        assert_eq!(limits.cue_s3_in_flight.available_permits(), 1);
++
++        // Cancellation while waiting must not launch any worker, and must
++        // release the S3 and SoX permits it may already have reserved.
++        let external = limits.hold_ffmpeg_permit_for_test().await;
++        let cancel = CancellationToken::new();
++        let waiting = {
++            let limits = limits.clone();
++            let runner = runner.clone();
++            let cancel = cancel.clone();
++            let producer = producer();
++            let consumer = consumer();
++            tokio::spawn(async move {
++                run_cue_s3_pipeline_after_pilot_admission(
++                    producer, consumer, runner.as_ref(), &cancel, &limits,
++                    super::super::cue_flac_range::ExactPcmExtent::for_expected_bytes(8),
++                ).await
++            })
++        };
++        tokio::time::sleep(Duration::from_millis(30)).await;
++        cancel.cancel();
++        let outcome = tokio::time::timeout(Duration::from_secs(3), waiting)
++            .await.expect("cancel must wake the queue immediately")
++            .expect("cancelled worker must join");
++        assert!(outcome.is_err(), "queued cancel cannot be reported as success");
++        drop(external);
++        assert_eq!(limits.ffmpeg.available_permits(), 1);
++        assert_eq!(limits.sox.available_permits(), 1);
++        assert_eq!(limits.cue_s3_in_flight.available_permits(), 1);
++    }
++
+     #[tokio::test]
+     async fn sox_permit_caps_concurrent_sox_and_sets_omp_threads() {
+         let limits = Arc::new(ToolConcurrencyLimits::new(1, 4, 4, 6));
+         let cancel = CancellationToken::new();
+         let mut first = test_tool_command(ToolBinary::Sox);

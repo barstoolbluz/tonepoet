@@ -1,0 +1,82 @@
+{
+  "cases": [
+    {
+      "all_pcm_matched": true,
+      "bit_depth": 16,
+      "elapsed_s": 0.276,
+      "image_samples": 132300,
+      "max_native_children": 4,
+      "max_parent_fds": 16,
+      "ranges": [
+        {
+          "artifact_sha256": "ba9a9cb3488f75ac44d13f0a318df6d8db655277abac708c2a059eaf801794cc",
+          "decoded_bytes": 352800,
+          "end": 44100,
+          "index": 0,
+          "pcm_sha256": "d5eb80eadd17ebfb63e8b55b61103946219925ad3d248b5ac1accb5ffe8c5e8b",
+          "start": 0
+        },
+        {
+          "artifact_sha256": "32c0b7c2a795ddb17031f88359eacf40cdfadeb0ae75fb1c641d29d0ba832f13",
+          "decoded_bytes": 352800,
+          "end": 88200,
+          "index": 1,
+          "pcm_sha256": "a163ac1ecfc6615027818f154b20d26b075fc7eac64e5583dc4d6648f308c5f6",
+          "start": 44100
+        },
+        {
+          "artifact_sha256": "85d9024dcfba5d547269fb772b9900eb868114de5c9fbe4c7f6c66fcf89dfad8",
+          "decoded_bytes": 352800,
+          "end": 132300,
+          "index": 2,
+          "pcm_sha256": "c8183db680d2432f602a3942b18eff6f1b21efc7c3538b2f9862ee0e1f522c10",
+          "start": 88200
+        }
+      ],
+      "sample_rate": 44100,
+      "source_full_pcm_sha256": "490a0a04e860498e28636a24ea21739662f95c6c3f1cd91eeb28a2c360df64bc",
+      "source_sha256": "8c309f8d25f26edca0fbad917bc444f98cb513d05881bfb16c163f2b21e11fb3",
+      "tracks": 3
+    },
+    {
+      "all_pcm_matched": true,
+      "bit_depth": 24,
+      "elapsed_s": 0.297,
+      "image_samples": 132300,
+      "max_native_children": 4,
+      "max_parent_fds": 16,
+      "ranges": [
+        {
+          "artifact_sha256": "d90128f88b5b7940e80d66123c56de93f67657e48ad7e5ce2554017391653aee",
+          "decoded_bytes": 352800,
+          "end": 44100,
+          "index": 0,
+          "pcm_sha256": "88283506a525ca7f508c75952dc0fd42d69eb5c209a955f19acab92f92112b63",
+          "start": 0
+        },
+        {
+          "artifact_sha256": "663a45d16e8ab13b993324b1b4e6481ea7dbd5f9f669193e45234de4c0b87873",
+          "decoded_bytes": 352800,
+          "end": 88200,
+          "index": 1,
+          "pcm_sha256": "a760ed2d96a44e83e5922f8093d9aedb96e4be0d4459735a64bc84c0ff92f5d9",
+          "start": 44100
+        },
+        {
+          "artifact_sha256": "53c8f45be8811e95c366b6bb85f4fa27c417048f1048bd6542cc459819731eeb",
+          "decoded_bytes": 352800,
+          "end": 132300,
+          "index": 2,
+          "pcm_sha256": "42bae7872f0cffa85f7df15611f33dce8dc66772836fadee852de9ec3280d6a9",
+          "start": 88200
+        }
+      ],
+      "sample_rate": 44100,
+      "source_full_pcm_sha256": "56918ef58821d43ac869e9ddcd7a30925dc0198b1adbb740815b810c5ff9d6d3",
+      "source_sha256": "b88d095f41e58b250a784970b966b0158cd4e1702a0153985cf2cbbbc2de275a",
+      "tracks": 3
+    }
+  ],
+  "outcome": "PASS",
+  "scope": "independent native FFmpeg feasibility only; not Rust ToolRunner"
+}
