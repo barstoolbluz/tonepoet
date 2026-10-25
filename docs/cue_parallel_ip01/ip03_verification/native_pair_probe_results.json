@@ -1,0 +1,173 @@
+{
+  "scope": "INDEPENDENT FFmpeg pipe resource envelope; NOT Rust S3 supervisor/admission",
+  "outcome": "PASS",
+  "ffmpeg_path": "/usr/bin/ffmpeg",
+  "ffmpeg_executable_sha256": "e8a8d46f5225f3062cec7c07fb145d58ae73c603cb740dcd5bad34bfb54e455a",
+  "ffmpeg_version": "ffmpeg version 7.1.5-0+deb13u1 Copyright (c) 2000-2026 the FFmpeg developers",
+  "fixture": {
+    "samples": 352800,
+    "channels": 2,
+    "rate": 44100,
+    "source_pcm_sha256": "f854f2f7dde1b12af5ca6a126bbd1a53b5abc3821e01a1a18baa337ff0a03d80",
+    "source_flac_sha256": "42ab1a190febe8ad758494f5ae096f037e9bc44cbc639f8a9193eb532a3335cb",
+    "whole_decoded_s32le_sha256": "48c46bfc09be92ad977e035e09587e2f17a08fe52f0c2f2099aa53a4c50a3e5b",
+    "source_flac_bytes": 1041618
+  },
+  "results": [
+    {
+      "parallel_pairs": 1,
+      "range_results": [
+        {
+          "ordinal": 0,
+          "start": 0,
+          "end": 588,
+          "pcm_sha256": "32ac06dfdc365dd9ec48e9d4f08c71a57689437bd2a66adf534c73c27d2d5817",
+          "decoded_pcm_bytes": 4704,
+          "flac_sha256": "1724660b0e809d900e5ed4d5bd9ee34e8a8cf625826e96a8fc6b4be85f79889c"
+        },
+        {
+          "ordinal": 1,
+          "start": 1,
+          "end": 590,
+          "pcm_sha256": "d7aa3013b687b108899f751d4819728e2e5bce2bde49213442bc4bcde89dd2fe",
+          "decoded_pcm_bytes": 4712,
+          "flac_sha256": "04c048eec21a896b302584af0cdd754b808024b5258a8ff0af7bedce4b7e7e7d"
+        },
+        {
+          "ordinal": 2,
+          "start": 587,
+          "end": 1177,
+          "pcm_sha256": "5d62899ed846cc6bc5c73feda23d8c1d8a26403d2f40a904c3f2b11af985759c",
+          "decoded_pcm_bytes": 4720,
+          "flac_sha256": "dad499dfc510ef6e9d5e1d3d03f9621a06a61a7cf1a65cdee1aeed5e4ac57009"
+        },
+        {
+          "ordinal": 3,
+          "start": 588,
+          "end": 1176,
+          "pcm_sha256": "727f6c32374ebd88fd32432fe9ea65422bca68f0661b53cdd04cfd1fd7d0a52d",
+          "decoded_pcm_bytes": 4704,
+          "flac_sha256": "ecec6491c87b602a0eaff9d84c5328cfbf63a2a5b3e6aafac1671a9d1ea739c0"
+        }
+      ],
+      "resource_maxima": {
+        "total_native_children": 2,
+        "sampled_rss_kib_parent_plus_children": 168840,
+        "sampled_fd_parent_plus_children": 15,
+        "sampled_ffmpeg_rss_kib": 39096,
+        "sampled_ffmpeg_fd_count": 5,
+        "kernel_pipe_bytes": 65536
+      }
+    },
+    {
+      "parallel_pairs": 2,
+      "range_results": [
+        {
+          "ordinal": 0,
+          "start": 0,
+          "end": 588,
+          "pcm_sha256": "32ac06dfdc365dd9ec48e9d4f08c71a57689437bd2a66adf534c73c27d2d5817",
+          "decoded_pcm_bytes": 4704,
+          "flac_sha256": "1724660b0e809d900e5ed4d5bd9ee34e8a8cf625826e96a8fc6b4be85f79889c"
+        },
+        {
+          "ordinal": 1,
+          "start": 1,
+          "end": 590,
+          "pcm_sha256": "d7aa3013b687b108899f751d4819728e2e5bce2bde49213442bc4bcde89dd2fe",
+          "decoded_pcm_bytes": 4712,
+          "flac_sha256": "04c048eec21a896b302584af0cdd754b808024b5258a8ff0af7bedce4b7e7e7d"
+        },
+        {
+          "ordinal": 2,
+          "start": 587,
+          "end": 1177,
+          "pcm_sha256": "5d62899ed846cc6bc5c73feda23d8c1d8a26403d2f40a904c3f2b11af985759c",
+          "decoded_pcm_bytes": 4720,
+          "flac_sha256": "dad499dfc510ef6e9d5e1d3d03f9621a06a61a7cf1a65cdee1aeed5e4ac57009"
+        },
+        {
+          "ordinal": 3,
+          "start": 588,
+          "end": 1176,
+          "pcm_sha256": "727f6c32374ebd88fd32432fe9ea65422bca68f0661b53cdd04cfd1fd7d0a52d",
+          "decoded_pcm_bytes": 4704,
+          "flac_sha256": "ecec6491c87b602a0eaff9d84c5328cfbf63a2a5b3e6aafac1671a9d1ea739c0"
+        },
+        {
+          "ordinal": 4,
+          "start": 589,
+          "end": 1178,
+          "pcm_sha256": "006cccff4dfb50ee3480217da98b0bf03b23a010f31d2d7519cabf43fc188063",
+          "decoded_pcm_bytes": 4712,
+          "flac_sha256": "c677e9112fbc1d5a47a95f0a675058f01d4a3e93cd93bf6ed023e58f0695a9f0"
+        },
+        {
+          "ordinal": 5,
+          "start": 44099,
+          "end": 44689,
+          "pcm_sha256": "f0f860fcce2ee30ba89793cb260fcbf5e265438edbef454bd4652eb50004e47b",
+          "decoded_pcm_bytes": 4720,
+          "flac_sha256": "049e1dd07da79a2647a55e5f89aae08f87894de8cd4777e886cf892dd3aa765a"
+        },
+        {
+          "ordinal": 6,
+          "start": 44100,
+          "end": 44688,
+          "pcm_sha256": "6d47cd5ee0e6c3b957962544d8e28e9ec585e3973398eab67c453a0fb46af9e8",
+          "decoded_pcm_bytes": 4704,
+          "flac_sha256": "ead144a919379285c6238c5fb782acd5a79545197a423f0b65e1749f175fb265"
+        },
+        {
+          "ordinal": 7,
+          "start": 44101,
+          "end": 44690,
+          "pcm_sha256": "5a45763bf1531d1aa8fdd3771753846189684a5451c3635c4afffb5efe5e5016",
+          "decoded_pcm_bytes": 4712,
+          "flac_sha256": "fe5c1aade004414177bc0191f24fe2b224aad0db50063fb61ef1b4e452755051"
+        },
+        {
+          "ordinal": 8,
+          "start": 88787,
+          "end": 89377,
+          "pcm_sha256": "7c6e0934d46d19df260d997e949be0d56cbc53312f5fc57c7c0322c970bf7bb0",
+          "decoded_pcm_bytes": 4720,
+          "flac_sha256": "13ef9c155f6e0dab9ad8f5065d66952cd36dd8975dc2c4d7147042f99b71fe45"
+        },
+        {
+          "ordinal": 9,
+          "start": 132889,
+          "end": 133477,
+          "pcm_sha256": "dd9500529ad1c9c40429ffdcc7a90242d02ab0fc6b188760f1d2ad9dc530e019",
+          "decoded_pcm_bytes": 4704,
+          "flac_sha256": "a3fce6a618597b6bd62db956c2b0f30865c8e16ad35a665bf36c666b08e9ed9f"
+        },
+        {
+          "ordinal": 10,
+          "start": 220511,
+          "end": 221100,
+          "pcm_sha256": "e7a8f6bdb4ed4919ccff63a87fc9edc8d21f9098b9cd4c4349e849c2c1b1e97a",
+          "decoded_pcm_bytes": 4712,
+          "flac_sha256": "2814d7f9ae66a23806d91630a1d3b123520239269eb2ce8b7837430d30100cff"
+        },
+        {
+          "ordinal": 11,
+          "start": 352211,
+          "end": 352800,
+          "pcm_sha256": "4232e557452ba3c14601e8b5b186374e436178d755c02027bc223c6d6864c2b4",
+          "decoded_pcm_bytes": 4712,
+          "flac_sha256": "fe0dff80b3351fb67533a323f9aa40f17a4e34741eeb0554475c755f08580544"
+        }
+      ],
+      "resource_maxima": {
+        "total_native_children": 4,
+        "sampled_rss_kib_parent_plus_children": 232944,
+        "sampled_fd_parent_plus_children": 26,
+        "sampled_ffmpeg_rss_kib": 39236,
+        "sampled_ffmpeg_fd_count": 5,
+        "kernel_pipe_bytes": 65536
+      }
+    }
+  ],
+  "elapsed_seconds": 1.77
+}

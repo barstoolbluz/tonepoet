@@ -57,7 +57,8 @@ use super::progress::{
 use super::tool::{
     parse_tool_version_output, BoundToolExecutable, CommandRecord, EnvVar, ProcessExit,
     RetainedPcmScalarPump, ToolBinary, ToolCommand, ToolOutput, ToolRunner,
-    ToolSegmentedPipelineError, ToolSegmentedPipelineOutput, ToolStreamSegment,
+    ToolPipelineError, ToolPipelineOutput, ToolSegmentedPipelineError,
+    ToolSegmentedPipelineOutput, ToolStreamSegment,
 };
 use super::types::{PlannedMetadataSatisfaction, PipelineRequest, PreparedTrack, TrackSourceRef};
 
@@ -710,9 +711,13 @@ pub struct ToolConcurrencyLimits {
     sox: Arc<Semaphore>,
     ffmpeg: Arc<Semaphore>,
     ssrc: Arc<Semaphore>,
+    // IP-03: shared by every S3 work unit holding this ToolConcurrencyLimits.
+    // Never constructed per album; S1 and ordinary commands remain unchanged.
+    cue_s3_in_flight: Arc<Semaphore>,
     sox_max_concurrent: usize,
     ffmpeg_max_concurrent: usize,
     ssrc_max_concurrent: usize,
+    cue_s3_max_in_flight: usize,
     sox_omp_threads: u32,
 }
 
@@ -727,13 +732,20 @@ impl ToolConcurrencyLimits {
         let ffmpeg_max_concurrent = ffmpeg_max_concurrent.max(1);
         let ssrc_max_concurrent = ssrc_max_concurrent.max(1);
         let sox_omp_threads = sox_omp_threads.max(1);
+        // Even on a large host, at most two simultaneous two-child S3 streams.
+        // The FFmpeg family remains the ultimate live-child gate, with an
+        // FFmpeg/FFmpeg worker charging two permits. A one-permit host may still
+        // run one FFmpeg/SoX S3 stream but not an FFmpeg/FFmpeg S3 stream.
+        let cue_s3_max_in_flight = (ffmpeg_max_concurrent / 2).clamp(1, 2);
         Self {
             sox: Arc::new(Semaphore::new(sox_max_concurrent)),
             ffmpeg: Arc::new(Semaphore::new(ffmpeg_max_concurrent)),
             ssrc: Arc::new(Semaphore::new(ssrc_max_concurrent)),
+            cue_s3_in_flight: Arc::new(Semaphore::new(cue_s3_max_in_flight)),
             sox_max_concurrent,
             ffmpeg_max_concurrent,
             ssrc_max_concurrent,
+            cue_s3_max_in_flight,
             sox_omp_threads,
         }
     }
@@ -781,6 +793,12 @@ impl ToolConcurrencyLimits {
         self.sox_max_concurrent
             .max(self.ffmpeg_max_concurrent)
             .max(self.ssrc_max_concurrent)
+    }
+
+    /// Maximum *S3 pipelines*, not a new general tool or job limit.
+    #[allow(dead_code)] // IP-03 is private until IP-04/IP-05.
+    pub(crate) fn cue_s3_max_in_flight(&self) -> usize {
+        self.cue_s3_max_in_flight
     }
 
     #[cfg(test)]
@@ -11622,6 +11640,126 @@ pub(crate) async fn run_segmented_tool_pipeline_with_concurrency(
         .map_err(SegmentedPipelineExecutionError::Tool)
 }
 
+// IP-03 private adapter: the parallel CUE route is not wired to a caller until
+// IP-04/IP-05. The only observable production change is an idle shared semaphore
+// on ToolConcurrencyLimits. In particular, the legacy segmented path above is
+// intentionally untouched and continues to charge one permit per *family*.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) enum CueS3PipelineAttempt {
+    /// Optimization refused without launching either process; caller may use S1.
+    Declined,
+    /// Both tool children were attempted. An execution failure is *not* a
+    /// fallback signal: the caller must apply its ordinary failure policy.
+    Executed(Result<ToolPipelineOutput, ToolPipelineError>),
+}
+
+/// The sole owner of the in-flight slot and both live-child family permits.
+/// Held across ToolRunner::run_pipeline, which completes only after both
+/// supervised children have exited/reaped on normal failure/cancellation.
+#[must_use = "dropping S3 admission releases its live-child permits"]
+#[derive(Debug)]
+struct CueS3PipelinePermits {
+    _in_flight: OwnedSemaphorePermit,
+    _families: Vec<OwnedSemaphorePermit>,
+}
+
+/// A failed nonblocking reservation never retains a partial family permit.
+/// `NoPermits` means a feature-off S1 fallback, not a conversion error;
+/// `Closed` is an internal scheduling failure and must never be concealed.
+fn try_acquire_s3_owned(
+    semaphore: Arc<Semaphore>,
+    count: u32,
+) -> Result<Option<OwnedSemaphorePermit>, ConvertError> {
+    match semaphore.try_acquire_many_owned(count) {
+        Ok(permit) => Ok(Some(permit)),
+        Err(tokio::sync::TryAcquireError::NoPermits) => Ok(None),
+        Err(tokio::sync::TryAcquireError::Closed) => Err(ConvertError::Backend(
+            "S3 shared tool concurrency semaphore closed".to_string(),
+        )),
+    }
+}
+
+/// All-or-nothing immediate admission. No await is allowed while any partial
+/// reservation is owned: neither two FFmpeg permits nor FFmpeg+SoX can
+/// self-deadlock against their own incomplete acquisition. Order is SoX,
+/// FFmpeg, matching the existing distinct-family acquisition rank.
+fn try_acquire_cue_s3_pipeline_permits(
+    producer: &ToolCommand,
+    consumer: &mut ToolCommand,
+    limits: &Arc<ToolConcurrencyLimits>,
+    cancel: &CancellationToken,
+) -> Result<Option<CueS3PipelinePermits>, ConvertError> {
+    if cancel.is_cancelled() {
+        return Err(ConvertError::Realize("cancelled".to_string()));
+    }
+    if producer.binary != ToolBinary::Ffmpeg
+        || !matches!(consumer.binary, ToolBinary::Ffmpeg | ToolBinary::Sox)
+    {
+        return Err(ConvertError::Backend(
+            "S3 permits require one FFmpeg decoder and one FFmpeg/SoX encoder".to_string(),
+        ));
+    }
+    // ToolRunner::run_pipeline deliberately refuses non-Unix execution.
+    if !cfg!(unix) {
+        return Ok(None);
+    }
+
+    let Some(in_flight) = try_acquire_s3_owned(limits.cue_s3_in_flight.clone(), 1)? else {
+        return Ok(None);
+    };
+    let mut families = Vec::with_capacity(2);
+    if consumer.binary == ToolBinary::Sox {
+        let Some(sox) = try_acquire_s3_owned(limits.sox.clone(), 1)? else {
+            return Ok(None);
+        };
+        families.push(sox);
+    }
+    let ffmpeg_cost = if consumer.binary == ToolBinary::Ffmpeg { 2 } else { 1 };
+    let Some(ffmpeg) = try_acquire_s3_owned(limits.ffmpeg.clone(), ffmpeg_cost)? else {
+        return Ok(None);
+    };
+    families.push(ffmpeg);
+    if cancel.is_cancelled() {
+        return Err(ConvertError::Realize("cancelled".to_string()));
+    }
+    if consumer.binary == ToolBinary::Sox
+        && consumer.environment_policy
+            == tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet
+    {
+        set_sox_omp_threads(consumer, limits.sox_omp_threads());
+    }
+    Ok(Some(CueS3PipelinePermits {
+        _in_flight: in_flight,
+        _families: families,
+    }))
+}
+
+/// Feature-disabled IP-03 entry point for the future private S3 worker.
+/// The guard is held *through* the real supervised two-child transport and
+/// cannot be bypassed by mistakenly calling a one-child permit wrapper.
+/// Admission decline alone authorizes a pre-spawn fallback; failure inside
+/// the runner is a completed/failed attempt and must not be retried as S1.
+#[allow(dead_code)]
+pub(crate) async fn run_cue_s3_pipeline_if_admitted(
+    producer: ToolCommand,
+    mut consumer: ToolCommand,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    limits: &Arc<ToolConcurrencyLimits>,
+) -> Result<CueS3PipelineAttempt, ConvertError> {
+    let Some(_permits) =
+        try_acquire_cue_s3_pipeline_permits(&producer, &mut consumer, limits, cancel)?
+    else {
+        return Ok(CueS3PipelineAttempt::Declined);
+    };
+    // No second acquisition through run_tool_command_with_concurrency or the
+    // Reference pipeline helper. Both actual children are charged above.
+    Ok(CueS3PipelineAttempt::Executed(
+        runner.run_pipeline(producer, consumer, cancel).await,
+    ))
+}
+
 async fn acquire_reference_pipeline_permits(
     binaries: impl IntoIterator<Item = ToolBinary>,
     limits: Option<&Arc<ToolConcurrencyLimits>>,
@@ -15084,6 +15222,612 @@ mod tests {
         assert_eq!(tiny.ffmpeg_max_concurrent(), 1);
         assert_eq!(tiny.ssrc_max_concurrent(), 1);
         assert_eq!(tiny.sox_omp_threads(), 1);
+    }
+
+    // IP-03 tests exercise the *private* adapter directly. No production
+    // route references run_cue_s3_pipeline_if_admitted until IP-04/IP-05.
+    struct CueIp03GateRunner {
+        started: tokio::sync::mpsc::UnboundedSender<(ToolCommand, ToolCommand)>,
+        release: Arc<Semaphore>,
+        fail: bool,
+        panic_on_release: bool,
+    }
+
+    #[async_trait]
+    impl ToolRunner for CueIp03GateRunner {
+        async fn run(
+            &self,
+            _cmd: ToolCommand,
+            _cancel: &CancellationToken,
+        ) -> Result<ToolOutput, ToolRunnerError> {
+            panic!("IP-03 pair must call run_pipeline, never run");
+        }
+
+        async fn run_pipeline(
+            &self,
+            producer: ToolCommand,
+            consumer: ToolCommand,
+            cancel: &CancellationToken,
+        ) -> Result<ToolPipelineOutput, ToolPipelineError> {
+            self.started
+                .send((producer.clone(), consumer.clone()))
+                .expect("IP-03 gate receiver is alive");
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    return Err(ToolPipelineError {
+                        error: ToolRunnerError::Cancelled {
+                            command: command_record_for_unstarted_command(&producer),
+                        },
+                        other_commands: Vec::new(),
+                    });
+                }
+                permit = self.release.acquire() => {
+                    permit.expect("IP-03 test release semaphore remains open").forget();
+                }
+            }
+            if self.panic_on_release {
+                panic!("injected IP-03 runner panic");
+            }
+            if self.fail {
+                return Err(ToolPipelineError {
+                    error: ToolRunnerError::UnsupportedPipeline,
+                    other_commands: Vec::new(),
+                });
+            }
+            let output = |command: ToolCommand| {
+                let mut record = command_record_for_unstarted_command(&command);
+                record.exit = Some(ProcessExit::Code(0));
+                ToolOutput {
+                    exit: ProcessExit::Code(0),
+                    stdout_tail: String::new(),
+                    stderr_tail: String::new(),
+                    elapsed: Duration::ZERO,
+                    command: record,
+                }
+            };
+            Ok(ToolPipelineOutput {
+                producer: output(producer),
+                consumer: output(consumer),
+            })
+        }
+    }
+
+    fn cue_ip03_gate_runner(
+        fail: bool,
+        panic_on_release: bool,
+    ) -> (
+        Arc<CueIp03GateRunner>,
+        tokio::sync::mpsc::UnboundedReceiver<(ToolCommand, ToolCommand)>,
+        Arc<Semaphore>,
+    ) {
+        let (started, rx) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(Semaphore::new(0));
+        (
+            Arc::new(CueIp03GateRunner {
+                started,
+                release: release.clone(),
+                fail,
+                panic_on_release,
+            }),
+            rx,
+            release,
+        )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cue_ip03_ffmpeg_pair_costs_two_and_refuses_before_spawn() {
+        let limits = Arc::new(ToolConcurrencyLimits::new(2, 2, 1, 4));
+        let cancel = CancellationToken::new();
+        let external = limits.hold_ffmpeg_permit_for_test().await;
+        let (runner, mut started, release) = cue_ip03_gate_runner(false, false);
+        let attempt = run_cue_s3_pipeline_if_admitted(
+            test_tool_command(ToolBinary::Ffmpeg),
+            test_tool_command(ToolBinary::Ffmpeg),
+            runner.as_ref(),
+            &cancel,
+            &limits,
+        )
+        .await
+        .expect("no-capacity admission is a normal refusal");
+        assert!(matches!(attempt, CueS3PipelineAttempt::Declined));
+        assert!(started.try_recv().is_err(), "refusal cannot spawn either child");
+        assert_eq!(limits.ffmpeg.available_permits(), 1);
+        assert_eq!(limits.cue_s3_in_flight.available_permits(), 1);
+        drop(external);
+
+        let worker_limits = limits.clone();
+        let worker_runner = runner.clone();
+        let worker = tokio::spawn(async move {
+            run_cue_s3_pipeline_if_admitted(
+                test_tool_command(ToolBinary::Ffmpeg),
+                test_tool_command(ToolBinary::Ffmpeg),
+                worker_runner.as_ref(),
+                &CancellationToken::new(),
+                &worker_limits,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), started.recv())
+            .await
+            .expect("pair reached the runner")
+            .expect("pair is recorded");
+        assert_eq!(limits.ffmpeg.available_permits(), 0);
+        assert_eq!(limits.cue_s3_in_flight.available_permits(), 0);
+        // Ordinary tools cannot obtain a token owned by an active S3 child.
+        let mut ffprobe = test_tool_command(ToolBinary::Ffprobe);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                acquire_tool_permit(&mut ffprobe, Some(&limits), &cancel)
+            )
+            .await
+            .is_err()
+        );
+        release.add_permits(1);
+        assert!(matches!(
+            worker.await.expect("S3 worker joined").expect("S3 admitted"),
+            CueS3PipelineAttempt::Executed(Ok(_))
+        ));
+        assert_eq!(limits.ffmpeg.available_permits(), 2);
+        assert_eq!(limits.cue_s3_in_flight.available_permits(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cue_ip03_one_ffmpeg_host_rejects_pair_but_admits_sox() {
+        let limits = Arc::new(ToolConcurrencyLimits::new(1, 1, 1, 7));
+        let cancel = CancellationToken::new();
+        let (runner, mut started, release) = cue_ip03_gate_runner(false, false);
+        assert_eq!(limits.cue_s3_max_in_flight(), 1);
+        let denied = run_cue_s3_pipeline_if_admitted(
+            test_tool_command(ToolBinary::Ffmpeg),
+            test_tool_command(ToolBinary::Ffmpeg),
+            runner.as_ref(),
+            &cancel,
+            &limits,
+        )
+        .await
+        .expect("one FFmpeg permit is insufficient for two children");
+        assert!(matches!(denied, CueS3PipelineAttempt::Declined));
+        assert!(started.try_recv().is_err());
+        assert_eq!(limits.ffmpeg.available_permits(), 1);
+
+        let worker_limits = limits.clone();
+        let worker_runner = runner.clone();
+        let worker = tokio::spawn(async move {
+            run_cue_s3_pipeline_if_admitted(
+                test_tool_command(ToolBinary::Ffmpeg),
+                test_tool_command(ToolBinary::Sox),
+                worker_runner.as_ref(),
+                &CancellationToken::new(),
+                &worker_limits,
+            )
+            .await
+        });
+        let (decoder, encoder) = tokio::time::timeout(Duration::from_secs(2), started.recv())
+            .await
+            .expect("cross-family pair reached runner")
+            .expect("pair recorded");
+        assert_eq!(decoder.binary, ToolBinary::Ffmpeg);
+        assert_eq!(encoder.binary, ToolBinary::Sox);
+        assert_eq!(env_value(&encoder, "OMP_NUM_THREADS"), Some("7"));
+        assert_eq!(limits.ffmpeg.available_permits(), 0);
+        assert_eq!(limits.sox.available_permits(), 0);
+        release.add_permits(1);
+        assert!(matches!(
+            worker.await.expect("S3 worker joined").expect("S3 admitted"),
+            CueS3PipelineAttempt::Executed(Ok(_))
+        ));
+        assert_eq!(limits.ffmpeg.available_permits(), 1);
+        assert_eq!(limits.sox.available_permits(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cue_ip03_partial_acquisition_never_holds_or_leaks_a_family() {
+        let limits = Arc::new(ToolConcurrencyLimits::new(1, 1, 1, 4));
+        let cancel = CancellationToken::new();
+        let (runner, mut started, _) = cue_ip03_gate_runner(false, false);
+        let external_ffmpeg = limits.hold_ffmpeg_permit_for_test().await;
+        // The SoX permit is obtained first, then the FFmpeg attempt fails.
+        // Both the SoX permit and S3 slot must be released immediately.
+        let denied = run_cue_s3_pipeline_if_admitted(
+            test_tool_command(ToolBinary::Ffmpeg),
+            test_tool_command(ToolBinary::Sox),
+            runner.as_ref(),
+            &cancel,
+            &limits,
+        )
+        .await
+        .expect("partial admission is an ordinary refusal");
+        assert!(matches!(denied, CueS3PipelineAttempt::Declined));
+        assert_eq!(limits.sox.available_permits(), 1);
+        assert_eq!(limits.cue_s3_in_flight.available_permits(), 1);
+        assert!(started.try_recv().is_err());
+        drop(external_ffmpeg);
+
+        let external_sox = limits.sox.clone().acquire_owned().await.expect("hold SoX");
+        let denied = run_cue_s3_pipeline_if_admitted(
+            test_tool_command(ToolBinary::Ffmpeg),
+            test_tool_command(ToolBinary::Sox),
+            runner.as_ref(),
+            &cancel,
+            &limits,
+        )
+        .await
+        .expect("SoX contention declines");
+        assert!(matches!(denied, CueS3PipelineAttempt::Declined));
+        assert_eq!(limits.ffmpeg.available_permits(), 1);
+        assert_eq!(limits.cue_s3_in_flight.available_permits(), 1);
+        drop(external_sox);
+
+        // Exact reference/frozen environments are not rewritten to inject OMP.
+        let mut closed_consumer = test_tool_command(ToolBinary::Sox);
+        closed_consumer.environment_policy =
+            tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet;
+        let guard = try_acquire_cue_s3_pipeline_permits(
+            &test_tool_command(ToolBinary::Ffmpeg),
+            &mut closed_consumer,
+            &limits,
+            &cancel,
+        )
+        .expect("frozen-environment pair admits")
+        .expect("pair guard");
+        assert_eq!(env_value(&closed_consumer, "OMP_NUM_THREADS"), None);
+        drop(guard);
+
+        cancel.cancel();
+        assert!(matches!(
+            run_cue_s3_pipeline_if_admitted(
+                test_tool_command(ToolBinary::Ffmpeg),
+                test_tool_command(ToolBinary::Sox),
+                runner.as_ref(),
+                &cancel,
+                &limits,
+            )
+            .await,
+            Err(ConvertError::Realize(message)) if message == "cancelled"
+        ));
+        assert!(started.try_recv().is_err());
+        assert_eq!(limits.sox.available_permits(), 1);
+        assert_eq!(limits.ffmpeg.available_permits(), 1);
+        assert_eq!(limits.cue_s3_in_flight.available_permits(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cue_ip03_two_albums_share_cap_and_do_not_starve_ordinary_tools() {
+        let limits = Arc::new(ToolConcurrencyLimits::new(2, 6, 1, 4));
+        let cancel = CancellationToken::new();
+        let (runner, mut started, release) = cue_ip03_gate_runner(false, false);
+        assert_eq!(limits.cue_s3_max_in_flight(), 2);
+        let mut workers = Vec::new();
+        for _album in ["album-a", "album-b"] {
+            let worker_limits = limits.clone();
+            let worker_runner = runner.clone();
+            workers.push(tokio::spawn(async move {
+                run_cue_s3_pipeline_if_admitted(
+                    test_tool_command(ToolBinary::Ffmpeg),
+                    test_tool_command(ToolBinary::Ffmpeg),
+                    worker_runner.as_ref(),
+                    &CancellationToken::new(),
+                    &worker_limits,
+                )
+                .await
+            }));
+        }
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(2), started.recv())
+                .await
+                .expect("each album started an S3 pair")
+                .expect("pair recorded");
+        }
+        assert_eq!(limits.cue_s3_in_flight.available_permits(), 0);
+        assert_eq!(limits.ffmpeg.available_permits(), 2);
+        // A third independent album is declined even though FFmpeg has spare
+        // capacity, because the global S3 stream cap has been reached.
+        let third = run_cue_s3_pipeline_if_admitted(
+            test_tool_command(ToolBinary::Ffmpeg),
+            test_tool_command(ToolBinary::Ffmpeg),
+            runner.as_ref(),
+            &cancel,
+            &limits,
+        )
+        .await
+        .expect("cap exhaustion is not a conversion error");
+        assert!(matches!(third, CueS3PipelineAttempt::Declined));
+
+        // Existing FFprobe/FFmpeg work uses the *same* family semaphore.
+        let probe_result = run_tool_command_with_concurrency(
+            test_tool_command(ToolBinary::Ffprobe),
+            &StubToolRunner::new(),
+            &cancel,
+            Some(&limits),
+        )
+        .await
+        .expect("ordinary FFprobe still proceeds under S3 load");
+        assert_eq!(probe_result.exit, ProcessExit::Code(0));
+        assert_eq!(limits.ffmpeg.available_permits(), 2);
+
+        // Existing S1 segmented streaming takes ONE token for distinct FFmpeg
+        // families (even with two actual children). Model that historical fact
+        // rather than falsely claiming strict system-wide native-child bounds.
+        let legacy = acquire_reference_pipeline_permits(
+            [ToolBinary::Ffmpeg, ToolBinary::Ffmpeg],
+            Some(&limits),
+            &cancel,
+        )
+        .await
+        .expect("legacy S1 permit acquisition succeeds")
+        .expect("legacy S1 owns one permit set");
+        assert_eq!(limits.ffmpeg.available_permits(), 1);
+        drop(legacy);
+
+        release.add_permits(2);
+        for worker in workers {
+            assert!(matches!(
+                worker.await.expect("album worker joined").expect("S3 admitted"),
+                CueS3PipelineAttempt::Executed(Ok(_))
+            ));
+        }
+        assert_eq!(limits.ffmpeg.available_permits(), 6);
+        assert_eq!(limits.cue_s3_in_flight.available_permits(), 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cue_ip03_failure_cancel_and_panic_release_all_permits() {
+        for (fail, panic_on_release, cancel_during_run) in
+            [(true, false, false), (false, false, true), (false, true, false)]
+        {
+            let limits = Arc::new(ToolConcurrencyLimits::new(1, 2, 1, 4));
+            let cancel = CancellationToken::new();
+            let (runner, mut started, release) = cue_ip03_gate_runner(fail, panic_on_release);
+            let worker_limits = limits.clone();
+            let worker_runner = runner.clone();
+            let worker_cancel = cancel.clone();
+            let worker = tokio::spawn(async move {
+                run_cue_s3_pipeline_if_admitted(
+                    test_tool_command(ToolBinary::Ffmpeg),
+                    test_tool_command(ToolBinary::Ffmpeg),
+                    worker_runner.as_ref(),
+                    &worker_cancel,
+                    &worker_limits,
+                )
+                .await
+            });
+            tokio::time::timeout(Duration::from_secs(2), started.recv())
+                .await
+                .expect("S3 runner entered")
+                .expect("pair recorded");
+            assert_eq!(limits.ffmpeg.available_permits(), 0);
+            assert_eq!(limits.cue_s3_in_flight.available_permits(), 0);
+            if cancel_during_run {
+                cancel.cancel();
+            } else {
+                release.add_permits(1);
+            }
+            let joined = worker.await;
+            if panic_on_release {
+                assert!(joined.expect_err("panic must propagate").is_panic());
+            } else {
+                let attempt = joined.expect("worker joins").expect("admission succeeds");
+                match attempt {
+                    CueS3PipelineAttempt::Executed(Err(error)) if cancel_during_run => {
+                        assert!(matches!(error.error, ToolRunnerError::Cancelled { .. }));
+                    }
+                    CueS3PipelineAttempt::Executed(Err(error)) if fail => {
+                        assert!(matches!(error.error, ToolRunnerError::UnsupportedPipeline));
+                    }
+                    other => panic!("failure after spawn cannot become S1 fallback: {other:?}"),
+                }
+            }
+            assert_eq!(limits.ffmpeg.available_permits(), 2);
+            assert_eq!(limits.cue_s3_in_flight.available_permits(), 1);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cue_ip03_200_track_album_has_constant_inflight_and_no_leaks() {
+        let limits = Arc::new(ToolConcurrencyLimits::new(1, 2, 1, 4));
+        let cancel = CancellationToken::new();
+        assert_eq!(limits.cue_s3_max_in_flight(), 1);
+        for ordinal in 0..200 {
+            let mut encoder = test_tool_command(ToolBinary::Ffmpeg);
+            let guard = try_acquire_cue_s3_pipeline_permits(
+                &test_tool_command(ToolBinary::Ffmpeg),
+                &mut encoder,
+                &limits,
+                &cancel,
+            )
+            .unwrap_or_else(|error| panic!("track {ordinal} admission failed: {error}"))
+            .expect("one admitted worker");
+            assert_eq!(limits.ffmpeg.available_permits(), 0);
+            let declined = try_acquire_cue_s3_pipeline_permits(
+                &test_tool_command(ToolBinary::Ffmpeg),
+                &mut encoder,
+                &limits,
+                &cancel,
+            )
+            .expect("second admission only declines");
+            assert!(declined.is_none());
+            drop(guard);
+            assert_eq!(limits.ffmpeg.available_permits(), 2);
+            assert_eq!(limits.cue_s3_in_flight.available_permits(), 1);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cue_ip03_invalid_family_and_closed_semaphore_fail_closed() {
+        let limits = Arc::new(ToolConcurrencyLimits::new(1, 2, 1, 4));
+        let cancel = CancellationToken::new();
+        let (runner, mut started, _) = cue_ip03_gate_runner(false, false);
+        assert!(matches!(
+            run_cue_s3_pipeline_if_admitted(
+                test_tool_command(ToolBinary::Sox),
+                test_tool_command(ToolBinary::Ffmpeg),
+                runner.as_ref(),
+                &cancel,
+                &limits,
+            )
+            .await,
+            Err(ConvertError::Backend(_))
+        ));
+        limits.ffmpeg.close();
+        assert!(matches!(
+            run_cue_s3_pipeline_if_admitted(
+                test_tool_command(ToolBinary::Ffmpeg),
+                test_tool_command(ToolBinary::Ffmpeg),
+                runner.as_ref(),
+                &cancel,
+                &limits,
+            )
+            .await,
+            Err(ConvertError::Backend(_))
+        ));
+        assert!(started.try_recv().is_err());
+        assert_eq!(limits.cue_s3_in_flight.available_permits(), 1);
+    }
+
+    // This is a real ToolRunner::run_pipeline path through the existing Unix
+    // script supervisor, not a mock of the process lifecycle. /bin/sh is used
+    // as the family-mapped test executable to avoid codec-dependent fixtures.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cue_ip03_supervised_early_encoder_exit_releases_pair() {
+        let mut tool_paths = HashMap::new();
+        tool_paths.insert(ToolBinary::Ffmpeg.canonical_name().to_string(), PathBuf::from("/bin/sh"));
+        tool_paths.insert(ToolBinary::Sox.canonical_name().to_string(), PathBuf::from("/bin/sh"));
+        let runner = super::super::tool::RealToolRunner::new(tool_paths);
+        let limits = Arc::new(ToolConcurrencyLimits::new(1, 1, 1, 4));
+        let mut producer = test_tool_command(ToolBinary::Ffmpeg);
+        producer.args = vec!["-c".into(), "exec /bin/cat /dev/zero".into()];
+        producer.timeout = Duration::from_secs(12);
+        let mut consumer = test_tool_command(ToolBinary::Sox);
+        consumer.args = vec!["-c".into(), "exit 23".into()];
+        consumer.timeout = Duration::from_secs(12);
+        let attempt = tokio::time::timeout(
+            Duration::from_secs(20),
+            run_cue_s3_pipeline_if_admitted(
+                producer, consumer, &runner, &CancellationToken::new(), &limits,
+            ),
+        )
+        .await
+        .expect("supervised pair must terminate after early encoder exit")
+        .expect("admission itself succeeds");
+        assert!(matches!(attempt, CueS3PipelineAttempt::Executed(Err(_))));
+        assert_eq!(limits.ffmpeg.available_permits(), 1);
+        assert_eq!(limits.sox.available_permits(), 1);
+        assert_eq!(limits.cue_s3_in_flight.available_permits(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cue_ip03_supervised_slow_consumer_remains_a_bounded_pipe() {
+        let mut tool_paths = HashMap::new();
+        tool_paths.insert(ToolBinary::Ffmpeg.canonical_name().to_string(), PathBuf::from("/bin/sh"));
+        let runner = super::super::tool::RealToolRunner::new(tool_paths);
+        let limits = Arc::new(ToolConcurrencyLimits::new(1, 2, 1, 4));
+        let mut producer = test_tool_command(ToolBinary::Ffmpeg);
+        producer.environment_policy = tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet;
+        producer.args = vec![
+            "-c".into(),
+            "exec /bin/head -c 1048576 /dev/zero".into(),
+        ];
+        producer.timeout = Duration::from_secs(12);
+        let mut consumer = test_tool_command(ToolBinary::Ffmpeg);
+        consumer.environment_policy = tonepoet_pipeline::CommandEnvironmentPolicy::ClearAndSet;
+        consumer.args = vec![
+            "-c".into(),
+            "sleep 0.2; exec /bin/cat >/dev/null".into(),
+        ];
+        consumer.timeout = Duration::from_secs(12);
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            run_cue_s3_pipeline_if_admitted(
+                producer, consumer, &runner, &CancellationToken::new(), &limits,
+            ),
+        )
+        .await
+        .expect("slow bounded-pipe pair terminated")
+        .expect("pair admitted");
+        assert!(matches!(result, CueS3PipelineAttempt::Executed(Ok(_))));
+        assert_eq!(limits.ffmpeg.available_permits(), 2);
+        assert_eq!(limits.cue_s3_in_flight.available_permits(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cue_ip03_supervised_cancel_holds_pair_until_reaped() {
+        let temp = TempDir::new().expect("IP-03 pid files");
+        let producer_pid = temp.path().join("producer.pid");
+        let consumer_pid = temp.path().join("consumer.pid");
+        let mut tool_paths = HashMap::new();
+        tool_paths.insert(ToolBinary::Ffmpeg.canonical_name().to_string(), PathBuf::from("/bin/sh"));
+        tool_paths.insert(ToolBinary::Sox.canonical_name().to_string(), PathBuf::from("/bin/sh"));
+        let runner = Arc::new(super::super::tool::RealToolRunner::new(tool_paths));
+        let limits = Arc::new(ToolConcurrencyLimits::new(1, 1, 1, 4));
+        let cancel = CancellationToken::new();
+        let mut producer = test_tool_command(ToolBinary::Ffmpeg);
+        producer.args = vec![
+            "-c".into(),
+            "printf '%s\\n' \"$$\" > \"$1\"; exec /bin/sleep 30".into(),
+            "sh".into(),
+            producer_pid.display().to_string(),
+        ];
+        producer.timeout = Duration::from_secs(25);
+        let mut consumer = test_tool_command(ToolBinary::Sox);
+        consumer.args = vec![
+            "-c".into(),
+            "printf '%s\\n' \"$$\" > \"$1\"; exec /bin/sleep 30".into(),
+            "sh".into(),
+            consumer_pid.display().to_string(),
+        ];
+        consumer.timeout = Duration::from_secs(25);
+        let worker_runner = runner.clone();
+        let worker_limits = limits.clone();
+        let worker_cancel = cancel.clone();
+        let worker = tokio::spawn(async move {
+            run_cue_s3_pipeline_if_admitted(
+                producer, consumer, worker_runner.as_ref(), &worker_cancel, &worker_limits,
+            )
+            .await
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+        while (!producer_pid.exists() || !consumer_pid.exists())
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let ready = producer_pid.exists() && consumer_pid.exists();
+        if ready {
+            assert_eq!(limits.ffmpeg.available_permits(), 0);
+            assert_eq!(limits.sox.available_permits(), 0);
+            assert_eq!(limits.cue_s3_in_flight.available_permits(), 0);
+        }
+        cancel.cancel(); // Also releases stalled test children when readiness fails.
+        let result = tokio::time::timeout(Duration::from_secs(15), worker)
+            .await
+            .expect("supervised cancellation finishes with both children reaped")
+            .expect("worker joins")
+            .expect("admission succeeded");
+        assert!(ready, "both native child pid files must exist before cancellation");
+        assert!(matches!(result, CueS3PipelineAttempt::Executed(Err(_))));
+        assert_eq!(limits.ffmpeg.available_permits(), 1);
+        assert_eq!(limits.sox.available_permits(), 1);
+        assert_eq!(limits.cue_s3_in_flight.available_permits(), 1);
+        #[cfg(target_os = "linux")]
+        for path in [&producer_pid, &consumer_pid] {
+            let pid: u32 = std::fs::read_to_string(path)
+                .expect("native child pid file")
+                .trim().parse().expect("native child pid");
+            let proc_path = PathBuf::from(format!("/proc/{pid}"));
+            assert!(!proc_path.exists(), "supervised child {pid} survived permit release");
+        }
     }
 
     #[tokio::test]

@@ -1,3 +1,23 @@
+# IP-03 durable handoff — current (2026-10-24)
+
+**Status: `implemented-unqualified` / NOT ACCEPTED. IP-04 is blocked until owner/host acceptance.** This current handoff supersedes the preserved IP-01 historical handoff below.
+
+**Input:** `TonePoet_SNAPSHOT_d8c25d3_2026-10-24.tar.gz`, SHA-256 `fa51a09ad0c71fe17564053c8fd309f38bb5592730bb80fbac29dcc9e519fd95`. Origin letter reports `main` commit `d8c25d3`, clean and pushed; the archive has no `.git` to independently prove those Git assertions. Host input notes 24/24 FLAC seek cells, 840/840 ranges, FFmpeg 7.1.3. Its 7601/7602 Rust gate contains one known Reference qualification lock drift failure.
+
+**Read order:** this file → `ip03_verification/README.md` → current `IMPLEMENTATION_STATUS.md` → current `ARCHITECTURE_DECISIONS.md` → current `CONFORMANCE_MATRIX.md` → current `VERIFICATION_RESULTS.md` → `ip03_verification/STATIC_AUDIT.md` → `planning_authority/packets/IP-03_global_resource_admission.md` → `planning_authority/packets/IP-04_parallel_worker_private.md`. Previous IP-01/IP-02 evidence and amended plan preserved without modification.
+
+**Change:** only `src/convert/pipeline/track_executor.rs` differs from input among original production modules. Adds inert global S3 in-flight cap to already global `ToolConcurrencyLimits`, a nonblocking pair reservation and an opt-in/private `run_cue_s3_pipeline_if_admitted`. Unit/probe tests assert FFmpeg/FFmpeg two permits, FFmpeg/SoX one each, partial declines, one-token host, ordinary FFprobe coexistence, two albums sharing the cap, 200 attempts, release on cancellation/panic/error, closed family, real supervised early-exit/slow-pipe/cancel. No production S3 call site exists; old S1 reference is untouched.
+
+**Qualification:** Native FFmpeg pair resource envelope and exact 16 ranged reconstructed PCM comparisons PASS in the independent Python harness. `cargo`/`rustc`/`rustfmt` unavailable, so ten authored Rust tests, real supervisor execution, native child reaping, broad regression and full application resource measurements are NOT RUN. Legacy S1 segmented FFmpeg/FFmpeg remains one token; do not assert an absolute total-native-FFmpeg cap when legacy paths overlap. The current input's known reference lock-source drift is separate and must be recorded in the full suite. Critical IP-04 future prerequisite: integrate the IP-02 independent exact-byte extent contract into the real supervised pipe before allowing any private output to count as verified. A successful FFmpeg exit alone is not proof of full sample extent.
+
+**Archive identity / next packet input:** the archive's **actual** name and SHA-256 are written to the separate `TonePoet_CUE_IP03_DELIVERY_RECEIPT_<SHA12>.md` accompanying the tar, because embedding an archive's own digest would change the digest. The receipt is the binding identity for **the one exact next IP-04 input**. Do not infer the file name from this source tree or begin IP-04 until the host has signed off IP-03 with that exact hash. If a gate fails, produce a small corrective IP-03 successor and new receipt instead.
+
+**Rollback:** exact retained accepted input bytes are the external archive named above; no feature flags or user paths need switching, because the new S3 branch is not called. All modifications are additive to global limits while inactive; restore the input `track_executor.rs` to remove them.
+
+---
+
+## Preserved IP-01 historical handoff
+
 # TonePoet CUE IP-01 R2 corrective — durable handoff
 
 **Status:** `implemented-unqualified` / **NOT ACCEPTED**. Do **not** start IP-02 from an unaccepted packet.

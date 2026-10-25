@@ -1,0 +1,9 @@
+IP-03 independent production patch application
+Date: 2026-10-24
+Input: TonePoet_SNAPSHOT_d8c25d3_2026-10-24.tar.gz SHA-256 fa51a09ad0c71fe17564053c8fd309f38bb5592730bb80fbac29dcc9e519fd95
+Operation: patch --dry-run --batch --forward -p1 applied against fresh extracted baseline: PASS (six hunks)
+Operation: patch --batch --forward -p1 applied to independent scratch clone: PASS (six hunks)
+Output: patched scratch `src/convert/pipeline/track_executor.rs` SHA-256 5363bc18f191bb75677568dcffdf3900fdc963d46e29b8a9696b9defb713ee1e
+Output: authored `src/convert/pipeline/track_executor.rs` SHA-256 5363bc18f191bb75677568dcffdf3900fdc963d46e29b8a9696b9defb713ee1e
+Second forward patch: exit 1, reversed/already-applied patch rejected (six hunks ignored): PASS idempotency safety.
+This is an independent file-patch verification, not Rust compilation.

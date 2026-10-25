@@ -1,3 +1,24 @@
+# IP-03 current conformance (October 24, 2026)
+
+| Requirement | Implementation/evidence | Status |
+| --- | --- | --- |
+| Exact accepted input archive | Verified SHA-256 `fa51a09ad0c71fe17564053c8fd309f38bb5592730bb80fbac29dcc9e519fd95`; git-less origin letter `d8c25d3` | PASS provenance of supplied bytes; Git cleanliness cannot be re-proven here |
+| Shared FFmpeg/FFmpeg = 2, FFmpeg/SoX = 1+1 | `try_acquire_cue_s3_pipeline_permits`, named `cue_ip03_...` tests | Static PASS; Rust NOT RUN |
+| Atomic decline/no self-deadlock/pre-spawn fallback | `try_acquire_many_owned`, partial-guard drop, `Declined` only prelaunch | Static PASS; Rust NOT RUN |
+| Live-child permit lifetime across both children | `run_cue_s3_pipeline_if_admitted` holds guard over `ToolRunner::run_pipeline` | Static PASS; real supervisor test NOT RUN |
+| Cancellation, tool failure, panic, early exit, slow pipe | Named `cue_ip03_failure_...`, `cue_ip03_supervised_...` tests | Authored; Rust NOT RUN |
+| Shared global S3 cap and coexistence | `ToolConcurrencyLimits::cue_s3_in_flight` shared by `Arc`; two-album test includes ordinary FFprobe and historical S1 permit accounting | Static PASS; Rust NOT RUN |
+| 200-track album does not accumulate permits | `cue_ip03_200_track_album_has_constant_inflight_and_no_leaks` | Authored; Rust NOT RUN; 200 native tracked album NOT RUN |
+| Native independent FFmpeg two-process resource envelope | `ip03_verification/native_pair_envelope_probe.py`, `native_pair_probe_results.json`; 16 ranged cases byte-identical; two-pair max 4 children, 26 sampled parent+child FDs, 64 KiB kernel pipe | PASS **for independent subprocess fixture only** |
+| No change to S1, planner, ReplayGain, publisher, IP-02 adapter | Baseline-vs-result file hashes (`SOURCE_DIFF.json`) | Static PASS; regression runtime NOT RUN |
+| No strict all-native-child limit falsely claimed for S1 | Explicit one-family S1 permit coexistence test and caveat | Requirement met by honest disclosure; host process-limit review still needed |
+| Rust fmt/compile/CUE & full workspace tests | Exact commands in current `VERIFICATION_RESULTS.md` | NOT RUN; required before IP-03 acceptance |
+| S3 user admission | No production caller; S3 still disabled | PASS scope |
+
+---
+
+## Preserved IP-01 historical conformance
+
 # IP-01 R2 corrective conformance map (not a Rust qualification)
 
 | Requirement / audit issue | Corrected evidence | Executed status | Outstanding host gate |

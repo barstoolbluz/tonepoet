@@ -1,3 +1,21 @@
+# Current checkpoint — IP-03 (October 24, 2026)
+
+**State: `implemented-unqualified` — NOT ACCEPTED, S3 remains OFF.** This section is the current cumulative status. The original IP-01 R2 corrective ledger is preserved below as historical evidence, not as the current next-packet instruction.
+
+**Accepted input source:** `TonePoet_SNAPSHOT_d8c25d3_2026-10-24.tar.gz`, SHA-256 `fa51a09ad0c71fe17564053c8fd309f38bb5592730bb80fbac29dcc9e519fd95`, `git archive` reported commit `d8c25d3` with no `.git`. Supplied `TonePoet_SOURCE_IDENTITY_IP03_2026-10-24.md` explicitly identifies it as the accepted IP-02 tree, with 24 native cells/840 ranges passing on FFmpeg 7.1.3; supplied host Rust gate was **7601 PASS, 1 known Reference qualification failure**, not a clean full-suite PASS. No fabricated Git commit/status.
+
+**Scope:** One pre-spawn all-or-nothing nonblocking two-child S3 adapter within `src/convert/pipeline/track_executor.rs`; global shared S3 in-flight semaphore added to existing `ToolConcurrencyLimits`. Family cost is FFmpeg=2 for FFmpeg/FFmpeg; FFmpeg=1 and SoX=1 for FFmpeg/SoX. Max S3 workers = `min(2, max(1, ffmpeg_family_capacity / 2))`, shared by all holders of the same limits. Failed acquire releases all earlier tokens; closed semaphore/cancellation/invalid family is an error. A genuine runner execution failure is `Executed(Err(_))`, never a pre-spawn `Declined` fallback. The existing `ToolRunner::run_pipeline` is invoked directly under RAII; no second permit acquisition. S1 and unrelated command scheduling are untouched.
+
+**Evidence:** `ip03_verification/` (static delta auditor, current source manifest, original-vs-output diff, native FFmpeg pair resource probe with SHA-256 audio hashes). Authoring environment has FFmpeg but **no Cargo, rustc or rustfmt**. The independent native probe passed 16 PCM-exact ranges at one/two concurrent FFmpeg pairs; it cannot qualify the Rust transport/supervision. The Rust unit, failure/cancel/panic and real supervised-process tests are *authored but NOT RUN*. Host acceptance requires `cargo fmt` + named `cue_ip03` + full CUE/full workspace tests, real child FD/RSS and cancellation/reaping, and at least the preexisting known Reference qualification drift tracked separately.
+
+**Compatibility:** No S3 scheduler/worker caller is wired in; no ordinary conversions can select this new path. `cue_flac_range.rs`, ReplayGain, source/metadata authority, planner, publisher, and existing S1 remain byte-identical to the input. A legacy S1 segmented pipeline still holds one FFmpeg family token for its two live FFmpeg children; the IP-03 admission test explicitly exposes that historical accounting rather than claiming strict limits for all native children. Do not change S1 without independent resource evidence and a measured throughput review.
+
+**Next packet:** IP-04 only **after the owner/build host accepts the exact IP-03 archive**. Use the exact delivered archive name and SHA from the external IP-03 `DELIVERY_RECEIPT_*.md` (the digest of an archive cannot be embedded in the archive itself without invalidating that digest). If a gate fails, correct IP-03 narrowly and repackage first.
+
+---
+
+## Preserved IP-01 historical ledger
+
 # TonePoet Parallel CUE — cumulative implementation status after IP-01
 
 **Recorded:** 2026-10-22 (America/New_York). **Planning authority:** full byte-identical R2 corrective **host-gate-amended** bundle in `planning_authority/`. This file supersedes the preserved plan's *historical* pre-implementation `IMPLEMENTATION_STATUS.md`; the historical plan is not edited in place.
