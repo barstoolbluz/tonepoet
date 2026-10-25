@@ -1,3 +1,17 @@
+# CURRENT IP-05 corrective architecture — 2026-10-25
+
+**D-01:** The selection-filtered prepared/scheduled track counts must also
+equal the unfiltered authored CUE `album_metadata.total_tracks`; this check
+precedes the existing typed planner. It does not depend on whether a full
+selection was specified as All, Range or Set. **D-02** affects packaging only:
+compiled Python bytecode caches are omitted. No new subsystem or publisher.
+
+---
+# Original IP-05 architecture — 2026-10-25 (retained)
+
+Narrow reversible hidden `TONEPOET_CUE_S3_PILOT=1` at the existing CUE album encode-work boundary. Complete physical FLAC+CUE, exact sample/image facts, typed planner, unchanged-rate/depth FLAC, source metadata and native child budget all preflight before spawn; rejected albums use old S1. Real selected workers reuse IP-04 exact-range verified-pipe and IP-03 shared semaphores with cancellation-aware wait on transient contention. Existing processor, metadata, native post-output RG and album publisher remain the owners. S1 source-pass FIFO cannot be attached to parallel readers, therefore selected S3 uses post-output ReplayGain, respecting user settings. Fixed PCM gain is explicitly ineligible even when not true-peak. Destination contains only requested files. No new scheduler or output control files. Host qualification pending; details in `ip05_verification/ARCHITECTURE_DECISIONS.md`.
+
+---
 # IP-04 architecture decision checkpoint — 2026-10-24
 
 New private CUE S3 execution uses IP-02 range qualification, IP-03 weighted RAII permits, an opt-in checked `ToolRunner` pipe, and the existing direct-plan/finalization and staged result. No separate scheduler/encoder/metadata/publisher and no general process-management rewrite. The upstream unchecked two-child `run_pipeline` and S1 semantics are unchanged. Private S3 result ordering is detached from native worker completion order. For full reasoning see `ip04_verification/ARCHITECTURE_DECISIONS.md`.

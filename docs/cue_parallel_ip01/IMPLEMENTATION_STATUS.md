@@ -1,3 +1,21 @@
+# CURRENT IP-05 corrective status — 2026-10-25
+
+**D-01/D-02 corrected, not host-qualified.** IP-05 S3 now rejects a user
+selection shorter than the authored CUE track count even when both materialized
+and scheduled arrays contain the identical selected subset. The corrective
+regression and absence of Python bytecode caches are documented under
+`ip05_verification/CORRECTIVE_D01_D02_2026-10-25.md`. Prior IP-05 archive
+`4467bd785bbb...` is superseded. Status remains **`implemented-unqualified`**;
+Rust compilation, suite and real album destination tests have **NOT RUN**.
+S3 default-OFF. Do not proceed to IP-06 before host acceptance of the exact
+corrected SHA-bound archive.
+
+---
+# Original IP-05 status — 2026-10-25 (historical after corrective)
+
+**`implemented-unqualified`, S3 default-OFF, host acceptance PENDING.** The supplied owner identity note says accepted input IP-04 is clean `9c06f0f`, SHA-256 `de88377467699875b265231893623b49ee1cfd6a68c20b284a6bf361444defa0`. The candidate keeps all accepted prior code intact except focused additive changes in `stages.rs` and `track_executor.rs`. Hidden S3 opt-in and all-member source/planner admission now connect IP-04 workers to existing album post-output ReplayGain and publication. Real native S3 full application not run: no Rust toolchain. Read `ip05_verification/` for evidence and exact host commands. Historic IP-04 not-accepted status below is from earlier candidates and was superseded by the current host input identity.
+
+---
 # Current corrective IP-04 status — October 25, 2026
 
 **`implemented-unqualified` / S3 OFF / NOT ACCEPTED.** The prior IP-04 candidate `662379ddebf6` received a three-defect audit. Corrected D-01 test type mismatch, D-02 causal verified-pipe/peer-record attribution, and added the D-03 async attributed private coordinator regression. Production differences from prior candidate are confined to `tool.rs` and tests/type assertion in `stages.rs`; accepted IP-03 input and the normal S1 route remain unchanged. Offline native three-gap PCM probe passed, but all Rust compilation and runtime gates remain **NOT RUN**. See `ip04_verification/CORRECTIVE_D01_D03_2026-10-25.md` and the new external archive delivery receipt for actual candidate SHA. Host approval remains mandatory before IP-05.

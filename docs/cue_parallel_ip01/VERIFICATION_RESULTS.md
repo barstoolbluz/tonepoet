@@ -1,3 +1,19 @@
+# CURRENT IP-05 corrective verification — 2026-10-25
+
+The prior IP-05 full-source archive `4467bd785bbb...` is superseded by the
+new corrective candidate. The corrected source gate validates the complete
+authored track count and absence of packaged Python caches. New Rust test
+`cue_ip05_pilot_incomplete_materialized_album_falls_back_before_spawn`
+remains **NOT RUN** until host qualification. Full command evidence is in
+`ip05_verification/CORRECTIVE_D01_D02_2026-10-25.md`; exact new tar SHA-256
+is supplied in a separate external delivery receipt.
+
+---
+# Original IP-05 verification — 2026-10-25 (retained)
+
+Verified SHA of accepted input: `de88377467699875b265231893623b49ee1cfd6a68c20b284a6bf361444defa0`. Native-independent FLAC reference probes PASS (48 total: 6 quick + 42 full) and 3 gapped-range probes PASS; destination exact-set self-test PASS. Complete source static validator PASS when package verified. Rust commands `cargo fmt`, filtered/full suites, named real-worker integration and actual UI publication tests **NOT RUN** because `cargo`, `rustc`, `rustfmt` absent. `ip05_verification/VERIFICATION_RESULTS.md` has executable commands, evidence JSON checksums, and granular qualifications. Do not infer native probe success equals IP-05 runtime success.
+
+---
 # IP-04 verification checkpoint — 2026-10-24
 
 Exact input SHA-256 confirmed; IP-03 static-unit helper 6/6 PASS; independent 16-/24-bit FFmpeg range probe 42/42 exact PCM PASS, bounded 4 native child high-water (Python, not Rust); no Rust compiler and therefore **NO RUST FORMAT, BUILD OR TEST RESULTS**. Old IP-03 source-manifest verifier is expected to fail on this new tree and is not the IP-04 gate. `ip04_verification/VERIFICATION_RESULTS.md` documents command-by-command results and mandatory owner-host gates. **State implemented-unqualified; S1 remains live.**
