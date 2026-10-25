@@ -38,3 +38,14 @@ demonstrated end-to-end improvement with ReplayGain `Both`.
 
 See `08_HOST_GATE_AMENDMENT.md`. No source code has changed and no packet IDs, scopes or
 dependencies were altered.
+
+
+## ADR-CUE-PAR-002 — IP-02 isolated FLAC sample seeks (2026-10-24)
+
+**Status: provisionally feasible on one measured FFmpeg 7.1.5 / FLAC 1.5.0 Linux native cell; not accepted for S3 admission.** Source-tree digest `f97081a14dece5c1d1553cfbaf3bd60ecc02876b85fb98ba7346f7e8b0419308`; cumulative output archive `TonePoet_CUE_IP02_FULL_SOURCE_f97081a14dec.tar.gz`. Exact binary identities and source/fixture SHA-256s are recorded in `docs/cue_parallel_ip01/ip02_verification/native_host_results_*.json`.
+
+The inert command adapter adopts input `-ss` at integer source-rate seconds followed by `atrim` using exact integer sample offsets and an independent `u128`-checked PCM byte-extent contract. It outputs the same `s32le` carrier as S1. It reuses CUE materializer STREAMINFO, rejects mismatched source facts and unqualified formats before spawn, and does not change any route.
+
+**Adversarial corrective finding:** `-err_detect explode` alone did not detect a deliberately CRC-corrupted FLAC frame: FFmpeg emitted a full-sized but byte-wrong PCM stream with exit code zero. `-err_detect crccheck+explode` was required to reject it. With the corrected command, the native suite checks valid audio, truncated frames, CRC damage, and low-memory stream consumption. Do not drop CRC checking in subsequent packets. A FLAC STREAMINFO whole-stream MD5 is not an independently available per-range certificate.
+
+**Reversal gates:** any byte disagreement with S1, frame CRC escape, premature EOF, inaccurate sample count, tool/version drift, O(start) work on long/no-seektable sources, or missing child lifecycle supervision keeps S3 disabled. The S1 transport stays the reference/rollback. Only the receiving build host can promote IP-02 after its Rust and native gates pass on the exact delivered archive. Non-Unix S3 remains denied independently of successful standalone FFmpeg seeks.
