@@ -1,0 +1,1 @@
+INVALID TRIAL EVIDENCE: expected CSV headers: ('pair_id', 'host', 'storage', 'cache_state', 'tracks', 'replaygain', 'route', 'wall_seconds', 'source_sha256', 'fixture_sha256', 'configuration_sha256')

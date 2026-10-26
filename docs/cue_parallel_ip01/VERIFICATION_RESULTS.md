@@ -1,3 +1,32 @@
+# CURRENT IP-06 default-on verification — 2026-10-26
+
+**Disposition:** Owner-approved default-on selector **IMPLEMENTED**; engineering performance-cohort exception explicitly accepted. Native Rust build and full TonePoet conversion qualification **NOT RUN** here (no Cargo/rustc/rustfmt). The original IP-06 host data are internally recalculated but do not constitute authenticated cross-host/correctness acceptance. Existing evaluator H-01 tests and historic FFmpeg-only observations remain separate. The new source scope is measured against reviewed default-OFF archive SHA-256 `9722a3e9551fa2f2e257a3d690ef9c6e19945072c61375d01fb95875d736d921`, not against an imagined Git commit. `ip06_verification/DECISION_RECORD.md` records the owner exception, `CHECKPOINT.md` the native host gate, and the external delivery receipt current executed test results/manifest hash.
+
+**Previous independent 2026-10-25 recommendation is preserved below as historical review and was not disproved.** Its missing evidence gates remain missing; the product owner chose to accept the performance uncertainty.
+
+---
+
+# HISTORICAL 2026-10-25 IP-06 promotion review verification (reviewed default-off state)
+
+**Overall gate: FAIL for proposed default-ON. Rollback applied and statically reviewed; native product qualification NOT RUN here.** Independently verified input SHA-256: `1f1fcf261ac35aa585580489a64989541a71916af58f88bc592f0a91aa196d2e`. Git commit/branch history unavailable in user snapshot.
+
+Commands and results (run in extracted root; logs under `ip06_verification/`):
+
+- `git apply --reverse --check S3_PROMOTION.patch` against original snapshot: **PASS**; `git apply --reverse S3_PROMOTION.patch`: **PASS**. Exact original explicit opt-in restored.
+- `python3 -B ip06_verification/audit_release_scope.py INPUT_TAR . --json ip06_verification/SOURCE_SCOPE_AUDIT.json` (under `docs/cue_parallel_ip01/` paths): **PASS**; only approved files changed or added. Input tar cannot verify commit ancestry.
+- `python3 -B docs/cue_parallel_ip01/ip06_verification/audit_submitted_measurements.py`: **PASS**, 140 self-consistent reported rows/70 matched pairs, output `SUBMITTED_CSV_RECALCULATION.json`. No run configuration/identity/provenance proof.
+- `python3 -B -m unittest discover -v -s docs/cue_parallel_ip01/ip06_verification -p 'test_*.py'`: **PASS**, 11 tests. Explicit cross-RG digest reuse and within-pair mismatches are refused. Historical checksummed planning evaluator retained unchanged.
+- `python3 -B docs/cue_parallel_ip01/ip06_verification/evaluate_trials.py docs/cue_parallel_ip01/ip06_host_measurement/RESULTS.csv`: **REJECTS INPUT AS REQUIRED** (missing route/config/source identity headers); this is a failed *qualification*, not a failing test.
+- `python3 -B docs/cue_parallel_ip01/tools/test_trace_summary.py`: **PASS**, 15 tests (`TRACE_SUMMARY_TEST_OUTPUT.txt`). This does not run the Rust pipeline.
+- `python3 -B docs/cue_parallel_ip01/ip05_verification/verify_destination_files.py --self-test`: **PASS**, path-set verifier self-test. This does not examine the reported 140 destinations.
+- `python3 -B docs/cue_parallel_ip01/ip07_verification/verify_native_ffmpeg_ranges.py --json docs/cue_parallel_ip01/ip06_verification/NATIVE_FFMPEG_RANGE_SMOKE.json`: **PASS**, 25 standalone CRC/exact-range PCM slices with local FFmpeg **7.1.5**, not the reported **7.1.3** host or TonePoet worker. See output log.
+- `cargo fmt --all -- --check`, `cargo test --workspace --exclude tonepoet-true-peak cue_stream -- --nocapture`, `cargo test --workspace --exclude tonepoet-true-peak cue -- --nocapture`, `cargo test --workspace --no-fail-fast --exclude tonepoet-true-peak`: **NOT RUN**: Cargo, rustc and rustfmt are not installed in this environment.
+- Real UI/API runtime, native ReplayGain tags/output, live child reaping, concurrent resource high-water, injection of required faults, and complete action-to-visible timing: **NOT RUN** (fixtures and binary unavailable).
+
+Input claims of 7,627 passing Rust tests / one unrelated Reference drift, equality of decoded MD5/tag/file sets, and selected IP-07 source meter remain **HOST-REPORTED**, not verified by the sandbox gates. Formal adjudication and remaining requirements: `ip06_verification/DECISION_RECORD.md`.
+
+---
+
 # CURRENT IP-05 corrective verification — 2026-10-25
 
 The prior IP-05 full-source archive `4467bd785bbb...` is superseded by the

@@ -1,3 +1,29 @@
+# CURRENT IP-06 S3 default-on status — owner decision 2026-10-26
+
+- **Policy selector:** IMPLEMENTED as default-on with trimmed `TONEPOET_CUE_S3_PILOT=0` opting out. Complete-album semantic/resource preflight is unchanged; disabled or ineligible inputs use S1 before any S3 spawn. New Rust assertions added; native compilation/tests **NOT RUN** in this environment.
+- **Product disposition:** ACCEPTED by explicit owner direction. The requirement for narrow, measured CPU/storage default-admission cohorts is an **acknowledged exception**, not a PASS of that original gate.
+- **Host speed data:** 140 reported timing rows, internally verified and recalculated in the previous independent audit. Source/configuration-bound qualification and varied host/attached-HDD measurements remain **NOT PROVEN**. No unobserved cohort is characterized as measured.
+- **Full correctness, resource and fault gates:** No new native evidence since the independent review. Reported host PCM/tag/file parity and two adverse cases remain **HOST-REPORTED**; Rust full runtime and extended failure/peak budgets **NOT RUN** here.
+- **Offline checks:** See new external receipt for the currently executed Python regression, selector source-scope and package-roundtrip checks; retained 25 FFmpeg-only PCM range probes do not constitute Rust qualification.
+
+**Owner-approved default policy; native host release qualification outstanding.** Current record: `ip06_verification/DECISION_RECORD.md`. Everything below is dated historical evidence.
+
+---
+
+# HISTORICAL 2026-10-25 IP-06 evidence/conformance status (reviewed default-off state)
+
+- **Selector rollback:** PASS by clean inverse-patch application and source-scope audit; compile/runtime assertion **NOT RUN**. The exact `"1"` opt-in is restored; all other Rust source files remain identical to the supplied archive.
+- **Supplied primary timing table:** PASS **for internal CSV arithmetic only** (140 entries; 70 paired comparisons; seven workload types, two ReplayGain modes, five repetitions each). Source-bound full-app performance, route-excluded config hashes and admission-to-publication timing **NOT PROVEN**.
+- **Actual S1/S3 ReplayGain instrumentation:** 12-track RG Both source meter selected and no post-output worker **reported** in accompanying summary; no per-run trace JSONL or measured fallback attribution supplied. **NOT INDEPENDENTLY VERIFIED** for the matrix.
+- **Decoded PCM, ReplayGain, metadata, artwork, destination file parity:** **HOST-REPORTED** for basic cases. Audio/tag inventories and fixture identities were not supplied for independent comparison; artwork on/off matrix and additional IP-06 variants are not shown. **NOT INDEPENDENTLY VERIFIED**.
+- **Directly attached HDD / constrained host / platform / tool-version:** **NOT RUN**. Four cold-first SSHFS spinning-disk albums were reported, but no direct HDD-under-pressure cell or matched small-host qualification. These unobserved cohorts cannot be globally auto-admitted.
+- **Failure, cancellation and resource high-water:** SIGINT and corrupt frame are **HOST-REPORTED** only. Disk full, early encoder exit, blocked pipe, concurrent albums, scan/tag/publish faults, peak RSS/FD/temp/children/bandwidth: **NOT INDEPENDENTLY VERIFIED**.
+- **Current sandbox offline tests:** 11 H-01 evaluator tests, 15 existing trace tests, exact destination self-test and 25 standalone FFmpeg PCM range checks **PASS**. Rust compilation, TUI/runtime execution and true end-to-end publication **NOT RUN** (no Cargo/rustc/rustfmt).
+
+For provenance, exact fields and statuses see `ip06_verification/DECISION_RECORD.md` and `VERIFICATION_RESULTS.md`. The preceding IP-07 and historical matrices below remain unchanged.
+
+---
+
 # CURRENT IP-07 conformance checkpoint — 2026-10-25
 
 Implementation covers an optional concurrent source-range native ReplayGain path after IP-05 S3 admission, separate supervised FFmpeg permits, exact EOF/decoder-exit and source-generation evidence, bounded two-meter window/256-MiB shared statistics, unchanged manifest-ordered album reduction, source-observer failure-to-postoutput fallback, fatal original metadata failure and unchanged S1, pilot gate and publisher. **Source scope static PASS and 25 standalone FFmpeg PCM range checks PASS; all Rust, tag, native app, failure injection, publication, resource and performance qualification NOT RUN.** Status: `implemented-unqualified`, no host acceptance, S3 default-OFF, IP-06 not executable. The detailed criterion-by-criterion table is `ip07_verification/CONFORMANCE_MATRIX.md` and the mandatory host recipe is `ip07_verification/HOST_QUALIFICATION.md`; the copied `ip07_verification/IP-06_SEQUENCING_AMENDMENT.md` controls next-packet order. Input: accepted IP-05 SHA-256 `af66b5c2a40904d4db6fec3fd4185914b4aadd32c74cf6fd6ff15568bf2cbd20` (reported host acceptance, exact bytes verified, no Git metadata).

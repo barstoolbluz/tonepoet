@@ -1,0 +1,1 @@
+PASS: exact destination-set self-test (allowed, hidden, extra file, extra directory, missing, traversal)
