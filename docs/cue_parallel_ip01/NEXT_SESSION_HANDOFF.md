@@ -1,3 +1,21 @@
+# CURRENT IP-06 default-on handoff — 2026-10-26
+
+**Product verdict: TURN S3 ON BY DEFAULT.** The owner explicitly overrode the earlier recommendation to withhold global auto-selection on unmeasured CPU/storage cohorts. The selector now requests S3 by default for every complete album passing the unchanged S3 functional/native-capacity preflight; `TONEPOET_CUE_S3_PILOT=0` selects the unchanged S1 path. This is a conscious performance-qualification exception; do not replace it with a "all gates passed" statement. The original reviewer report is preserved at `ip06_verification/INDEPENDENT_REVIEW_2026-10-25.md`.
+
+**Handoff:** Verify the *new* full-source archive name and SHA-256 in the external `DELIVERY_RECEIPT_IP06_DEFAULT_ON_2026-10-26.md`; then `sha256sum -c SHA256SUMS`. Read `ip06_verification/DECISION_RECORD.md` and `CHECKPOINT.md`. The package has no `.git`; only `src/convert/pipeline/stages.rs` is changed among production modules against reviewed default-OFF input. Validate `cargo fmt --all -- --check`, named CUE/S3 tests, full workspace tests and native default-on/`0`/ineligible route selection. Confirm RG Off/Both PCM/tag/output parity and SIGINT/corrupt-source child cleanup/publication before merging/deploying. The earlier S1-default archive and explicit `0` override provide rollback. **Native verification has not occurred in the packaging sandbox.**
+
+---
+
+# HISTORICAL 2026-10-25 IP-06 rollback and qualification handoff (reviewed default-off state)
+
+**Disposition:** The global S3 default-ON candidate is **REJECTED**. Reverted source defaults to the old S1 path and retains the exact `TONEPOET_CUE_S3_PILOT=1` opt-in. The IP-07 worker/observer implementation was not changed. No promotion is authorized by the supplied one-host evidence. New source artifact: `TonePoet_CUE_IP06_FULL_SOURCE_3d561894f1a4.tar.gz` (hash12 is the SHA-256 of the documented non-ledger source-tree file inventory, **not** the archive digest). Its actual archive SHA-256 and final manifest are in the separately delivered `DELIVERY_RECEIPT_IP06_2026-10-25.md` and the root `SHA256SUMS`. Do not treat the user-supplied default-on snapshot or `S3_PROMOTION.patch` as the accepted input for the next packet.
+
+**Next session:** Verify the exact archive SHA from the external receipt; extract and run `sha256sum -c SHA256SUMS`; read `ip06_verification/DECISION_RECORD.md`, `ip06_verification/CHECKPOINT.md`, the IP-06 packet and the IP-07 sequencing amendment. On a native host, rerun Cargo fmt, named CUE and workspace regressions, test the default-off selector and explicit pilot, and confirm SIGINT/fault/metadata/publication behavior. Separately, collect cryptographically bound complete-run timing, audio/tag/file manifests, resource/child high water, cold storage and smaller-host cells. Only propose a new limited auto-selector after those gates pass. Avoid new policy heuristics until host evidence supports them. The historical evaluator in `planning_authority/tools/` is superseded for H-01 by `ip06_verification/evaluate_trials.py`.
+
+**Source provenance:** Input tar SHA `1f1fcf261ac35aa585580489a64989541a71916af58f88bc592f0a91aa196d2e`. Claimed git commits/branch unverified because the archive has no `.git`. The five older IP-07 Rust modules, all planning authority contents and historical validation receipts remain untouched. Details in `ip06_verification/CHANGED_FILES.md` and the file-level scope report.
+
+---
+
 # CURRENT IP-07 implementation handoff — October 25, 2026
 
 **IMPLEMENTED-UNQUALIFIED; NOT HOST ACCEPTED. S3 DEFAULT OFF. IP-06 BLOCKED.** This candidate starts from the exact host-accepted user-supplied IP-05 source archive `TonePoet_SNAPSHOT_46696d1_2026-10-25.tar.gz`, independently verified SHA-256 `af66b5c2a40904d4db6fec3fd4185914b4aadd32c74cf6fd6ff15568bf2cbd20`. The input tar contains no `.git`. Do **not** use the superseded IP-05 archive identities in historical sections below as current implementation inputs. The IP-07 archive's **external** SHA and full filename are provided in the separate delivery receipt.

@@ -1,0 +1,16 @@
+test_empty_csv_not_accepted (test_evaluate_trials.EvaluatorTests.test_empty_csv_not_accepted) ... ok
+test_incomplete_pair_does_not_promote (test_evaluate_trials.EvaluatorTests.test_incomplete_pair_does_not_promote) ... ok
+test_missing_required_header (test_evaluate_trials.EvaluatorTests.test_missing_required_header) ... ok
+test_reject_cross_mode_reused_digest (test_evaluate_trials.EvaluatorTests.test_reject_cross_mode_reused_digest) ... ok
+test_reject_duplicate_route (test_evaluate_trials.EvaluatorTests.test_reject_duplicate_route) ... ok
+test_reject_missing_hash (test_evaluate_trials.EvaluatorTests.test_reject_missing_hash) ... ok
+test_reject_nan_and_zero_wall (test_evaluate_trials.EvaluatorTests.test_reject_nan_and_zero_wall) ... ok
+test_reject_pair_digest_disagreement (test_evaluate_trials.EvaluatorTests.test_reject_pair_digest_disagreement) ... ok
+test_reject_unrecognized_mode (test_evaluate_trials.EvaluatorTests.test_reject_unrecognized_mode) ... ok
+test_slow_route_not_candidate (test_evaluate_trials.EvaluatorTests.test_slow_route_not_candidate) ... ok
+test_valid_distinct_modes_and_matching_pairs (test_evaluate_trials.EvaluatorTests.test_valid_distinct_modes_and_matching_pairs) ... ok
+
+----------------------------------------------------------------------
+Ran 11 tests in 0.028s
+
+OK

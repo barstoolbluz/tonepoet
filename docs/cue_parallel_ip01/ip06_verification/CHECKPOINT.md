@@ -1,0 +1,13 @@
+# Durable checkpoint — IP-06 owner-selected S3 default ON (2026-10-26)
+
+**Current decision:** The owner explicitly approved requesting S3 by default on 2026-10-26, despite the 2026-10-25 independent recommendation against global automatic promotion. This supersedes the previous review disposition. Read `DECISION_RECORD.md` for the exception and qualifications; the exact independent review is preserved in `INDEPENDENT_REVIEW_2026-10-25.md`.
+
+**Starting artifact:** `TonePoet_CUE_IP06_FULL_SOURCE_3d561894f1a4.tar.gz`, SHA-256 `9722a3e9551fa2f2e257a3d690ef9c6e19945072c61375d01fb95875d736d921`; this was the reviewed default-OFF rollback. Earlier original user snapshot SHA-256 `1f1fcf261ac35aa585580489a64989541a71916af58f88bc592f0a91aa196d2e` and patch `S3_PROMOTION.patch` remain the historical comparison. No `.git` is in either archive.
+
+**Code state:** One production module (`src/convert/pipeline/stages.rs`) requests S3 by default, with `TONEPOET_CUE_S3_PILOT=0` opting out; existing complete-album preflight routes ineligible requests to S1. No other Rust module is modified relative to the prior review archive. The added selector assertions avoid mutating environment variables in a contended test suite. The original review's H-01 corrected evaluator, its tests and timing evidence remain unchanged.
+
+**Proof boundaries:** Owner accepts **performance-cohort uncertainty** on unmeasured hardware/storage. Historical 140-row CSV was internally recalculated; no route-bound verified native performance proof has been added. Rust toolchain, native app conversions and complete fault/resource matrix are unavailable here. Do not portray product risk acceptance as engineering PASS.
+
+**Resumption:** Verify the **new** full-source archive hash against `DELIVERY_RECEIPT_IP06_DEFAULT_ON_2026-10-26.md` distributed outside the tarball. Extract, run `sha256sum -c SHA256SUMS`, read this record, `DECISION_RECORD.md`, current cumulative ledgers and `PRODUCTION_ENABLE_DEFAULT_ON.patch`. On a native host run Cargo formatting, targeted and full tests, including default-on/explicit opt-out/fallback, RG parity, SIGINT/corruption, publication and orphan checks. If any correctness gate fails, do not release until corrected; S1 can be selected with `TONEPOET_CUE_S3_PILOT=0`. Preserve the previous default-OFF source archive as the rollback baseline.
+
+**Output identity:** Exact new archive filename, SHA-256 and package-scope audit are in the external delivery receipt; do not infer the new archive's digest from its source-inventory name. The prior review checkpoint remains intact in `REVIEW_ROLLBACK_CHECKPOINT_2026-10-25.md`.

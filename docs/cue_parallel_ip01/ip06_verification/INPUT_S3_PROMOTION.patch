@@ -1,0 +1,51 @@
+diff --git a/src/convert/pipeline/stages.rs b/src/convert/pipeline/stages.rs
+index a6a3fb9..7c8c8cf 100644
+--- a/src/convert/pipeline/stages.rs
++++ b/src/convert/pipeline/stages.rs
+@@ -44604,11 +44604,24 @@ fn cue_stream_replaygain_mirrors(
+     }
+ }
+ 
+-/// Hidden, process-scoped IP-05 development opt-in. It defaults OFF; only
+-/// the exact value `1` selects the pilot, and no request, output directory or
+-/// manifest is mutated to persist the gate. Do not promote it in IP-05.
++/// Process-scoped route selection for the qualified S3 CUE pilot. It defaults
++/// ON; the exact trimmed value `0` opts out and restores the sequential S1
++/// transport for every album in that process. No request, output directory or
++/// manifest is mutated to persist the gate.
++///
++/// Promotion is safe because the gate decides nothing on its own. Every
++/// eligibility fact is still decided by `cue_s3_pilot_preflight`, which
++/// refuses single-track albums, non-identity PCM, multi-file groups,
++/// platforms without the supervised two-process runner, and hosts that cannot
++/// seat two live children. A refused album silently keeps S1.
+ fn cue_s3_pilot_requested() -> bool {
+-    std::env::var("TONEPOET_CUE_S3_PILOT").as_deref() == Ok("1")
++    cue_s3_pilot_enabled_for(std::env::var("TONEPOET_CUE_S3_PILOT").ok().as_deref())
++}
++
++/// Split out so the opt-out spelling is testable without mutating the
++/// process environment, which the shared test harness cannot do safely.
++fn cue_s3_pilot_enabled_for(value: Option<&str>) -> bool {
++    value.map(str::trim) != Some("0")
+ }
+ 
+ /// All eligibility facts must hold for the complete materialized CUE album,
+@@ -82993,6 +83006,17 @@ retry log
+                 .err().expect("unqualified request must decline")
+         };
+         assert_eq!(admit(false, &source, &tracks, &req), "pilot_disabled");
++
++        // IP-06 promotion: the gate now defaults on, and only the exact
++        // trimmed value `0` opts out. The preflight above still owns every
++        // other refusal, so an unset variable does not admit an ineligible
++        // album.
++        assert!(cue_s3_pilot_enabled_for(None));
++        assert!(cue_s3_pilot_enabled_for(Some("1")));
++        assert!(cue_s3_pilot_enabled_for(Some("")));
++        assert!(cue_s3_pilot_enabled_for(Some("anything")));
++        assert!(!cue_s3_pilot_enabled_for(Some("0")));
++        assert!(!cue_s3_pilot_enabled_for(Some(" 0 ")));
+         let mut wrong_kind = source.clone();
+         wrong_kind.kind = SourceKind::SingleFile;
+         assert_eq!(admit(true, &wrong_kind, &tracks, &req),

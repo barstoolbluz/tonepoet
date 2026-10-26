@@ -1,3 +1,15 @@
+# CURRENT IP-06 owner decision — 2026-10-26
+
+**S3 DEFAULT ON for eligible complete FLAC+CUE albums; APPROVED by product owner as a performance-risk exception.** The source requests S3 when `TONEPOET_CUE_S3_PILOT` is unset or any value other than trimmed `0`; the existing all-album preflight still refuses ineligible conversions before spawning S3 children. `TONEPOET_CUE_S3_PILOT=0` restores S1 immediately. Only `src/convert/pipeline/stages.rs` changes among production modules relative to the independently reviewed default-OFF archive. This decision supersedes the 2026-10-25 *policy rejection*; historical findings remain valid. It does **not** mean IP-06's original performance/correctness acceptance matrix passed or that the new artifact was compiled in this sandbox. Native release qualification must still be performed on the build host. Read `ip06_verification/DECISION_RECORD.md`, `CHECKPOINT.md`, and the external delivery receipt.
+
+---
+
+# HISTORICAL 2026-10-25 IP-06 promotion review (reviewed default-off state)
+
+**Decision: REVERT global default-ON; keep IP-05/IP-07 S3 opt-in. Status: default-admission NOT ACCEPTED; rollback implemented but native host qualification NOT RUN here.** The user-supplied archive (verified SHA-256 `1f1fcf261ac35aa585580489a64989541a71916af58f88bc592f0a91aa196d2e`) made S3 the default for every functionally eligible exact-FLAC CUE album. This exceeds the packet's evidence-bounded policy and hardware/storage requirements. The patch was reversed exactly; only `TONEPOET_CUE_S3_PILOT=1` can request S3. See `ip06_verification/DECISION_RECORD.md` for the adjudication, `ip06_verification/CHECKPOINT.md` for interruption recovery, and the accompanying external delivery receipt for this new artifact's SHA. The original IP-07 checkpoint and older statuses below are historical; they do not supersede this decision.
+
+---
+
 # CURRENT IP-07 implementation status — 2026-10-25
 
 **`implemented-unqualified`, not host-accepted; S3 DEFAULT OFF. IP-06 remains blocked.** User-supplied accepted IP-05 tree `TonePoet_SNAPSHOT_46696d1_2026-10-25.tar.gz` independently hashed to `af66b5c2a40904d4db6fec3fd4185914b4aadd32c74cf6fd6ff15568bf2cbd20`; Git status/merge cannot be independently verified because source has no `.git`. All five changed production modules are confined to native source observation, ToolRunner streaming, weighted admission, exact extent and S3 album handoff; previous S1 and metadata/publisher code remains unchanged. Scope verifier PASS and standalone FFmpeg range fixture 25/25 PASS, but **Rust fmt/build, all Rust tests, real ReplayGain tag parity, child lifecycle, full destination and IP-06 performance NOT RUN**. Exact output identity is in external delivery receipt. See `ip07_verification/` for evidence, host commands, known qualification gaps and authoritative copied IP-06 amendment. Retain original post-output S3 and S1 rollback paths. If any gate fails, correct IP-07 before IP-06; no automatic S3 promotion is authorized.

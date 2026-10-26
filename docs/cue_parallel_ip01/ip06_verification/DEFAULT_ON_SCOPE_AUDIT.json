@@ -1,0 +1,33 @@
+{
+  "status": "PASS",
+  "input_archive_sha256": "9722a3e9551fa2f2e257a3d690ef9c6e19945072c61375d01fb95875d736d921",
+  "changed": [
+    "SHA256SUMS",
+    "docs/cue_parallel_ip01/ARCHITECTURE_DECISIONS.md",
+    "docs/cue_parallel_ip01/CHANGED_FILE_SUMMARY.md",
+    "docs/cue_parallel_ip01/CONFORMANCE_MATRIX.md",
+    "docs/cue_parallel_ip01/IMPLEMENTATION_STATUS.md",
+    "docs/cue_parallel_ip01/NEXT_SESSION_HANDOFF.md",
+    "docs/cue_parallel_ip01/VERIFICATION_RESULTS.md",
+    "docs/cue_parallel_ip01/ip06_verification/CHANGED_FILES.md",
+    "docs/cue_parallel_ip01/ip06_verification/CHECKPOINT.md",
+    "docs/cue_parallel_ip01/ip06_verification/DECISION_RECORD.md",
+    "docs/cue_parallel_ip01/ip06_verification/README.md",
+    "docs/cue_parallel_ip01/ip06_verification/SOURCE_MANIFEST.json",
+    "docs/cue_parallel_ip01/ip06_verification/package_cumulative.py",
+    "src/convert/pipeline/stages.rs"
+  ],
+  "added": [
+    "docs/cue_parallel_ip01/ip06_verification/DEFAULT_ON_SCOPE_AUDIT.json",
+    "docs/cue_parallel_ip01/ip06_verification/INDEPENDENT_REVIEW_2026-10-25.md",
+    "docs/cue_parallel_ip01/ip06_verification/PRODUCTION_DISABLE_DEFAULT_ON.patch",
+    "docs/cue_parallel_ip01/ip06_verification/PRODUCTION_ENABLE_DEFAULT_ON.patch",
+    "docs/cue_parallel_ip01/ip06_verification/REVIEW_ROLLBACK_CHECKPOINT_2026-10-25.md",
+    "docs/cue_parallel_ip01/ip06_verification/audit_default_on_delta.py"
+  ],
+  "removed": [],
+  "unchanged": 1314,
+  "other_production_changes": [],
+  "errors": [],
+  "git_history_verified": false
+}

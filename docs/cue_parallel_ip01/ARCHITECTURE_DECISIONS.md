@@ -1,3 +1,24 @@
+# CURRENT IP-06 owner-selected default-on routing — 2026-10-26
+
+1. **ENABLE S3 by default** for functionally eligible complete FLAC+CUE album conversions, using the unchanged `cue_s3_pilot_preflight` and exact `TONEPOET_CUE_S3_PILOT=0` process opt-out. Rejected preflight requests remain S1; a failed running S3 job must not be retried as S1.
+2. **Record the policy exception, not a fabricated engineering PASS.** The product owner explicitly accepts the risk of variable performance/resources on unmeasured machines and storage. IP-06's previous evidence-bounded admission requirement is not satisfied by the existing host matrix. Preserve the original 2026-10-25 independent rejection in `ip06_verification/INDEPENDENT_REVIEW_2026-10-25.md`; it has been superseded as *policy advice*, not disproved.
+3. **No algorithm or publisher change.** The selector and unit assertions in `stages.rs` are the only production delta against the reviewed default-OFF source. Preserve the IP-06 H-01 evaluator correction and the historical plan unchanged. Native compilation, conversion correctness, cancellation and publication remain unverified here; host release checks still apply.
+
+Authoritative current decision: `ip06_verification/DECISION_RECORD.md`. New artifact identity: external default-on delivery receipt.
+
+---
+
+# HISTORICAL 2026-10-25 IP-06 admission decision (reviewed default-off state)
+
+1. **Reject global auto-admission.** Existing `cue_s3_pilot_preflight` is a semantic/resource-capacity gate, not an evidence-qualified CPU, platform, tool-version or storage selection policy. Functional eligibility alone does not satisfy IP-06's constrained promotion requirement. Do not guess hardware thresholds from the single-host matrix.
+2. **Restore the exact S1 default.** Require `TONEPOET_CUE_S3_PILOT=1` to request S3. Retain S1 and the IP-07 source-range ReplayGain optimization unmodified; preserve all reported speedups for future hardware-bounded qualification.
+3. **Make pairing invalidities fatal.** Historical evaluator H-01 is corrected in `ip06_verification/evaluate_trials.py`, without modifying the checksummed planning authority. The ReplayGain mode must be part of canonical configuration identity; S1/S3 half-pairs must have matching hashes. Numeric evaluation never substitutes for publication/correctness gate evidence.
+4. **Separate review from native qualification.** The owner/build host must independently accept the restored production selector and later qualify any proposed auto-admission policy with per-run source/configuration hashes, S1/S3 publication parity, failure injection, actual child/resource high water and appropriate hardware/storage cells.
+
+Full argument and evidence boundaries: `ip06_verification/DECISION_RECORD.md`.
+
+---
+
 # CURRENT IP-07 design decisions — 2026-10-25
 
 1. **Optimize only after IP-05's identity-PCM S3 decision.** Retain exact S3 admission and opt-in. Additional eligibility is the existing `cue_source_replaygain_eligible`/Trust policy plus exact qualified per-track source facts, a stable physical FLAC generation, contiguous authored ranges and FFmpeg capacity. A declined optimization is not a declined conversion.

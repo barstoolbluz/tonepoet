@@ -1,3 +1,9 @@
+# CURRENT IP-06 owner-approved S3 default-on delta — 2026-10-26
+
+Relative to reviewed S1-default archive `TonePoet_CUE_IP06_FULL_SOURCE_3d561894f1a4.tar.gz` (SHA-256 `9722a3e9551fa2f2e257a3d690ef9c6e19945072c61375d01fb95875d736d921`), the only production file changed is `src/convert/pipeline/stages.rs` (selector, env parsing helper, assertions and comments). The 2026-10-25 independent rejection and rollback remain as historical records; current decision, checkpoint, manifest, release script, patch and refreshed top-of-ledger sections are IP-06 documentation/tooling. All other Rust production code is unchanged. `ip06_verification/CHANGED_FILES.md` and external delivery receipt record full change inventory. Native build/tests remain outstanding.
+
+---
+
 # IP-04 delta — CURRENT (2026-10-24)
 
 Four production source files are touched: `src/convert/pipeline/cue_flac_range.rs` (test/typed extent constructor), `src/convert/pipeline/tool.rs` (optional exact supervised pipeline + tests), `src/convert/pipeline/track_executor.rs` (single-pass IP-03 typed verifier plumbing + existing test call updates), `src/convert/pipeline/stages.rs` (private all-member FLAC preflight/worker and staged evidence + tests). Also appended `ip04_verification/` evidence and prepended the latest cumulative checkpoint to six root docs. See `ip04_verification/PRODUCTION_DIFF.patch` and `ip04_verification/SOURCE_DIFF.json`. No other production file was changed and S1 dispatcher is untouched.

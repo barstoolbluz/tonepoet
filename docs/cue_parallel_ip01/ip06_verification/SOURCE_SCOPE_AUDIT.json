@@ -1,0 +1,47 @@
+{
+  "added": [
+    "docs/cue_parallel_ip01/ip06_verification/AUDIT_RECALCULATION_OUTPUT.txt",
+    "docs/cue_parallel_ip01/ip06_verification/CHANGED_FILES.md",
+    "docs/cue_parallel_ip01/ip06_verification/CHECKPOINT.md",
+    "docs/cue_parallel_ip01/ip06_verification/DECISION_RECORD.md",
+    "docs/cue_parallel_ip01/ip06_verification/DESTINATION_SELFTEST_OUTPUT.txt",
+    "docs/cue_parallel_ip01/ip06_verification/EXCLUDED_INPUT_BYTECODE.md",
+    "docs/cue_parallel_ip01/ip06_verification/EXCLUDED_INPUT_BYTECODE_SHA256.txt",
+    "docs/cue_parallel_ip01/ip06_verification/INPUT_REVIEW_REQUEST.md",
+    "docs/cue_parallel_ip01/ip06_verification/INPUT_S3_PROMOTION.patch",
+    "docs/cue_parallel_ip01/ip06_verification/IP06_EVALUATOR_TEST_OUTPUT.txt",
+    "docs/cue_parallel_ip01/ip06_verification/NATIVE_FFMPEG_RANGE_OUTPUT.txt",
+    "docs/cue_parallel_ip01/ip06_verification/NATIVE_FFMPEG_RANGE_SMOKE.json",
+    "docs/cue_parallel_ip01/ip06_verification/PRE_IP06_ROOT_SHA256SUMS.txt",
+    "docs/cue_parallel_ip01/ip06_verification/PRODUCTION_ROLLBACK.patch",
+    "docs/cue_parallel_ip01/ip06_verification/README.md",
+    "docs/cue_parallel_ip01/ip06_verification/SOURCE_MANIFEST.json",
+    "docs/cue_parallel_ip01/ip06_verification/SOURCE_SCOPE_AUDIT.json",
+    "docs/cue_parallel_ip01/ip06_verification/SOURCE_SCOPE_AUDIT_OUTPUT.txt",
+    "docs/cue_parallel_ip01/ip06_verification/SUBMITTED_CSV_RECALCULATION.json",
+    "docs/cue_parallel_ip01/ip06_verification/TRACE_SUMMARY_TEST_OUTPUT.txt",
+    "docs/cue_parallel_ip01/ip06_verification/audit_release_scope.py",
+    "docs/cue_parallel_ip01/ip06_verification/audit_submitted_measurements.py",
+    "docs/cue_parallel_ip01/ip06_verification/evaluate_trials.py",
+    "docs/cue_parallel_ip01/ip06_verification/evaluator_original_csv_output.txt",
+    "docs/cue_parallel_ip01/ip06_verification/package_cumulative.py",
+    "docs/cue_parallel_ip01/ip06_verification/test_evaluate_trials.py"
+  ],
+  "changed": [
+    "docs/cue_parallel_ip01/ARCHITECTURE_DECISIONS.md",
+    "docs/cue_parallel_ip01/CONFORMANCE_MATRIX.md",
+    "docs/cue_parallel_ip01/IMPLEMENTATION_STATUS.md",
+    "docs/cue_parallel_ip01/NEXT_SESSION_HANDOFF.md",
+    "docs/cue_parallel_ip01/VERIFICATION_RESULTS.md",
+    "src/convert/pipeline/stages.rs"
+  ],
+  "git_provenance": "not present in input tarball",
+  "output_file_entries": 1328,
+  "removed": [
+    "tonepoet-pipeline/qualification/ssrc_binary64/__pycache__/qualify_ssrc_binary64.cpython-313.pyc",
+    "tonepoet-pipeline/qualification/ssrc_binary64/__pycache__/test_qualify_ssrc_binary64.cpython-313.pyc"
+  ],
+  "source_archive_sha256": "1f1fcf261ac35aa585580489a64989541a71916af58f88bc592f0a91aa196d2e",
+  "source_file_entries": 1304,
+  "status": "PASS"
+}

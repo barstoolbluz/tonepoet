@@ -1,0 +1,193 @@
+{
+  "cohorts": 14,
+  "columns": [
+    "cell",
+    "rep",
+    "route",
+    "rg",
+    "wall_s",
+    "rc",
+    "tracks"
+  ],
+  "reported_exit_codes": {
+    "0": 140
+  },
+  "rows": 140,
+  "runs_per_cohort": 10,
+  "source": "ip06_host_measurement/RESULTS.csv (user-supplied, not host-attested)",
+  "timing_claims_independently_recalculated": [
+    {
+      "cell": "real-billie",
+      "max_paired_ratio": 1.7023434767401189,
+      "median_of_paired_ratios": 1.6861595027575942,
+      "min_paired_ratio": 1.680200414651002,
+      "n_pairs": 5,
+      "ratio_of_route_medians": 1.6952845811906212,
+      "replaygain_mode": "both",
+      "s1_median_seconds": 19.45,
+      "s3_median_seconds": 11.473
+    },
+    {
+      "cell": "real-billie",
+      "max_paired_ratio": 1.4108374384236455,
+      "median_of_paired_ratios": 1.3856899794036,
+      "min_paired_ratio": 1.3760991909954272,
+      "n_pairs": 5,
+      "ratio_of_route_medians": 1.3922024501475454,
+      "replaygain_mode": "off",
+      "s1_median_seconds": 15.569,
+      "s3_median_seconds": 11.183
+    },
+    {
+      "cell": "t1-16-44",
+      "max_paired_ratio": 0.9978603268945023,
+      "median_of_paired_ratios": 0.9818560380725758,
+      "min_paired_ratio": 0.9789379474940333,
+      "n_pairs": 5,
+      "ratio_of_route_medians": 0.9837286923352009,
+      "replaygain_mode": "both",
+      "s1_median_seconds": 16.505,
+      "s3_median_seconds": 16.778
+    },
+    {
+      "cell": "t1-16-44",
+      "max_paired_ratio": 1.0223841199450956,
+      "median_of_paired_ratios": 1.0064205457463884,
+      "min_paired_ratio": 0.9950098762865163,
+      "n_pairs": 5,
+      "ratio_of_route_medians": 1.0060419758320966,
+      "replaygain_mode": "off",
+      "s1_median_seconds": 9.491,
+      "s3_median_seconds": 9.434
+    },
+    {
+      "cell": "t12-16-44",
+      "max_paired_ratio": 1.796133156622749,
+      "median_of_paired_ratios": 1.7700224406097653,
+      "min_paired_ratio": 1.7664614665315983,
+      "n_pairs": 5,
+      "ratio_of_route_medians": 1.7824359074261669,
+      "replaygain_mode": "both",
+      "s1_median_seconds": 22.874,
+      "s3_median_seconds": 12.833
+    },
+    {
+      "cell": "t12-16-44",
+      "max_paired_ratio": 1.4810282678808575,
+      "median_of_paired_ratios": 1.4496369391174826,
+      "min_paired_ratio": 1.4217270194986071,
+      "n_pairs": 5,
+      "ratio_of_route_medians": 1.4444237572146712,
+      "replaygain_mode": "off",
+      "s1_median_seconds": 15.516,
+      "s3_median_seconds": 10.742
+    },
+    {
+      "cell": "t12-24-44",
+      "max_paired_ratio": 1.7268250909869407,
+      "median_of_paired_ratios": 1.7074702273547455,
+      "min_paired_ratio": 1.688573245707017,
+      "n_pairs": 5,
+      "ratio_of_route_medians": 1.7052023121387283,
+      "replaygain_mode": "both",
+      "s1_median_seconds": 23.895,
+      "s3_median_seconds": 14.013
+    },
+    {
+      "cell": "t12-24-44",
+      "max_paired_ratio": 1.4666402221340735,
+      "median_of_paired_ratios": 1.4531811786775048,
+      "min_paired_ratio": 1.4194383134180684,
+      "n_pairs": 5,
+      "ratio_of_route_medians": 1.4512128110526727,
+      "replaygain_mode": "off",
+      "s1_median_seconds": 18.487,
+      "s3_median_seconds": 12.739
+    },
+    {
+      "cell": "t12-24-96",
+      "max_paired_ratio": 1.8159451264973407,
+      "median_of_paired_ratios": 1.7867668875482146,
+      "min_paired_ratio": 1.7404331779331779,
+      "n_pairs": 5,
+      "ratio_of_route_medians": 1.7867668875482146,
+      "replaygain_mode": "both",
+      "s1_median_seconds": 36.132,
+      "s3_median_seconds": 20.222
+    },
+    {
+      "cell": "t12-24-96",
+      "max_paired_ratio": 1.5926118356107444,
+      "median_of_paired_ratios": 1.5828195430288587,
+      "min_paired_ratio": 1.5754025598678776,
+      "n_pairs": 5,
+      "ratio_of_route_medians": 1.5783219673486257,
+      "replaygain_mode": "off",
+      "s1_median_seconds": 30.55,
+      "s3_median_seconds": 19.356
+    },
+    {
+      "cell": "t3-16-44",
+      "max_paired_ratio": 1.4670387446412685,
+      "median_of_paired_ratios": 1.4429032258064516,
+      "min_paired_ratio": 1.4193290734824282,
+      "n_pairs": 5,
+      "ratio_of_route_medians": 1.4457258064516127,
+      "replaygain_mode": "both",
+      "s1_median_seconds": 17.927,
+      "s3_median_seconds": 12.4
+    },
+    {
+      "cell": "t3-16-44",
+      "max_paired_ratio": 1.3184158901422265,
+      "median_of_paired_ratios": 1.3060682832669805,
+      "min_paired_ratio": 1.3013832782470314,
+      "n_pairs": 5,
+      "ratio_of_route_medians": 1.3108884272271784,
+      "replaygain_mode": "off",
+      "s1_median_seconds": 10.727,
+      "s3_median_seconds": 8.183
+    },
+    {
+      "cell": "t30-16-44",
+      "max_paired_ratio": 1.708120912508368,
+      "median_of_paired_ratios": 1.7050378222611022,
+      "min_paired_ratio": 1.669081632653061,
+      "n_pairs": 5,
+      "ratio_of_route_medians": 1.704423868312757,
+      "replaygain_mode": "both",
+      "s1_median_seconds": 33.134,
+      "s3_median_seconds": 19.44
+    },
+    {
+      "cell": "t30-16-44",
+      "max_paired_ratio": 1.3337519623233909,
+      "median_of_paired_ratios": 1.3283372365339579,
+      "min_paired_ratio": 1.3136757008861482,
+      "n_pairs": 5,
+      "ratio_of_route_medians": 1.328414442700157,
+      "replaygain_mode": "off",
+      "s1_median_seconds": 25.386,
+      "s3_median_seconds": 19.11
+    }
+  ],
+  "unavailable_fields": [
+    "source_sha256",
+    "cue_sha256",
+    "fixture_sha256",
+    "configuration_sha256",
+    "tool_versions_per_run",
+    "build_sha256",
+    "admission_to_visible_publication",
+    "actual_route",
+    "audio_hashes",
+    "tag_sets",
+    "destination_file_sets",
+    "peak_RSS",
+    "peak_FD",
+    "peak_temp",
+    "simultaneous_children",
+    "source_meter_intervals",
+    "cache_cohort"
+  ]
+}

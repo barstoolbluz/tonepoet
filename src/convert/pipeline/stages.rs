@@ -44604,11 +44604,22 @@ fn cue_stream_replaygain_mirrors(
     }
 }
 
-/// Hidden, process-scoped IP-05 development opt-in. It defaults OFF; only
-/// the exact value `1` selects the pilot, and no request, output directory or
-/// manifest is mutated to persist the gate. Do not promote it in IP-05.
+/// Process-scoped default-on request for the S3 CUE route. The exact trimmed
+/// value `0` selects S1 instead. No request, output directory or manifest
+/// is mutated to persist this choice.
+///
+/// The complete-album preflight retains authority over functional eligibility
+/// and native child capacity. A declined album uses S1 before any S3 child is
+/// started. Default-on is a product decision, not a claim that every hardware
+/// or storage class has been performance-qualified.
 fn cue_s3_pilot_requested() -> bool {
-    std::env::var("TONEPOET_CUE_S3_PILOT").as_deref() == Ok("1")
+    cue_s3_pilot_enabled_for(std::env::var("TONEPOET_CUE_S3_PILOT").ok().as_deref())
+}
+
+/// Split out so the opt-out spelling is testable without mutating the
+/// process environment, which the shared test harness cannot do safely.
+fn cue_s3_pilot_enabled_for(value: Option<&str>) -> bool {
+    value.map(str::trim) != Some("0")
 }
 
 /// All eligibility facts must hold for the complete materialized CUE album,
@@ -82993,6 +83004,15 @@ retry log
                 .err().expect("unqualified request must decline")
         };
         assert_eq!(admit(false, &source, &tracks, &req), "pilot_disabled");
+
+        // The product default requests S3 unless the process opts out with
+        // trimmed `0`; the complete-album preflight can still decline.
+        assert!(cue_s3_pilot_enabled_for(None));
+        assert!(cue_s3_pilot_enabled_for(Some("1")));
+        assert!(cue_s3_pilot_enabled_for(Some("")));
+        assert!(cue_s3_pilot_enabled_for(Some("anything")));
+        assert!(!cue_s3_pilot_enabled_for(Some("0")));
+        assert!(!cue_s3_pilot_enabled_for(Some(" 0 ")));
         let mut wrong_kind = source.clone();
         wrong_kind.kind = SourceKind::SingleFile;
         assert_eq!(admit(true, &wrong_kind, &tracks, &req),
