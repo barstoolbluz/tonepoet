@@ -5302,6 +5302,10 @@ tool in the resulting trace.
 
 ### Update 2026-10-27: the cost is in the supervisor, not the tools
 
+*Qualified by the second update below: on this host the cgroup path fails on
+every call and every tool runs under the subreaper fallback, so the migration
+cost described here is paid by an attempt that cannot succeed.*
+
 Same album, `main` at `e399d9e`, measured both untraced and under strace. The
 strace timings turned out to be badly distorted, so every figure below is from
 untraced runs unless it says otherwise.
@@ -5384,3 +5388,62 @@ where migrations cluster, pays less for them. Why the convert path calls
 No remedy is proposed. Harness, traces and per-run results are on the
 measuring host under `~/dev/issue78/`, not committed: `run.sh`, the `shim/`
 directory, `breakdown.py` and `cpu_sampler.py`.
+
+### Update 2026-10-27, later: cgroup containment never arms on this host
+
+Found while checking a candidate fix for this issue and #77 (branch
+`issue77-78-delivery`, not merged). Everything below holds for the unmodified
+tree (`6ad6bb1`) as well as the candidate, and I have not diagnosed it.
+
+**Every cgroup launch fails, and the supervisor falls back.** Traced through an
+S1 conversion, each supervised call creates its leaf cgroup and places the
+launcher in it. The launcher then calls `unshare(CLONE_NEWCGROUP)`, which
+returns EPERM, and exits with status 70. The supervisor then runs the tool
+under the dedicated child subreaper instead. That held for every attempt traced,
+about 50 per run, in both trees. No `unshare` call of any other kind appears in
+the trace.
+
+The supervisor reports the fallback in the outcome's containment warning:
+
+```
+delegated cgroup v2 was unavailable (delegated cgroup launcher setup failed
+before script release: script supervisor I/O error: failed to fill whole
+buffer); used a dedicated child subreaper with PID-start-validated /proc
+tracking. This fallback cannot contain processes launched indirectly through
+an external service manager, ...
+```
+
+For what it may be worth: `unshare(2)` documents that `CLONE_NEWCGROUP` requires
+`CAP_SYS_ADMIN` in the caller's user namespace. TonePoet runs here as an
+unprivileged user from a tmux scope under `user@1000.service`. The host runs
+Linux 6.12.85, with cgroup2 mounted with `nsdelegate`. Whether the cgroup path
+has ever armed on this host is unknown.
+
+**What that changes above.**
+
+- The `cgroup.procs` migration measured in the first update is real, but it is
+  spent on an attempt that then fails. Every call pays for that attempt and then
+  for the fallback launch.
+- The 10 ms process-table walk measured there is the fallback's supervision
+  loop.
+- Containment on this host is process-tree observation, not kernel enforcement,
+  for every supervised tool.
+- The test suite runs into the same thing. A probe built on the fixture in
+  `tests/conversion_action_runscript_containment.rs` got this warning under
+  `ContainmentPreference::Auto`. The gate's containment tests use that fixture,
+  so on this host they exercise the fallback, not the cgroup path.
+  `required_cgroup_either_arms_without_control_fd_leak_or_fails_before_user_code`
+  passes either way.
+
+**The helper CPU figures above probably undercount.** Measured instead with
+`getrusage(RUSAGE_CHILDREN)` around the whole conversion, which counts every
+reaped descendant, an S1 run used 72.0 s of CPU (user 37.6–37.8 s, system
+34.2–34.4 s, two runs). The 20 ms sampler accounted for about 35 s across the
+same tree in an earlier run. The two are not strictly comparable: the
+getrusage runs overlapped an unrelated multiprocessing workload that held the
+host's load average at 30–40, and the sampler run did not. Treat the absolute
+figure as indicative. The candidate fix, run interleaved under the same load,
+used 42.0–42.1 s.
+
+Traces are `runs/b-sys2` (unmodified) and `runs/d-sys2` (candidate) under
+`~/dev/issue78/`.
