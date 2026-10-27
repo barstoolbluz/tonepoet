@@ -9,11 +9,13 @@
 //! ownership to a process which has no unrelated children.
 //!
 //! Linux prefers a delegated cgroup-v2 leaf and also makes the dedicated
-//! helper a child subreaper.  A minimal hidden launcher joins the retained
-//! cgroup descriptor before it receives the authenticated invocation, so the
-//! target script cannot execute or fork outside the armed containment boundary.
-//! If cgroup delegation is unavailable, the subreaper tracks the complete
-//! `/proc` descendant graph with PID start-time validation.  On macOS the helper
+//! helper a child subreaper. The gated launcher enters the leaf atomically at
+//! clone3 when supported, otherwise it migrates before script release. A
+//! private cgroup namespace prevents the script from leaving its leaf.
+//! Kernel cgroup occupancy provides the normal completion condition. Without
+//! delegation, the subreaper discovers descendants at exit/termination, using
+//! task-local procfs enumeration when available and PID-start-validated global
+//! procfs snapshots otherwise. On macOS the helper
 //! arms EVFILT_PROC/NOTE_FORK before releasing an exec gate and combines those
 //! notifications with libproc child enumeration and process start identities.
 
@@ -1849,6 +1851,17 @@ pub fn run_internal_launcher(
     cgroup_fd: Option<RawFd>,
     script_fd: RawFd,
 ) -> Result<(), ScriptSupervisorError> {
+    run_internal_launcher_with_placement(launch_fd, cgroup_fd, script_fd, false)
+}
+
+// clone3(CLONE_INTO_CGROUP) places the child in the retained leaf at creation.
+// The ordinary fork path still joins before reporting LAUNCHER_READY.
+fn run_internal_launcher_with_placement(
+    launch_fd: RawFd,
+    cgroup_fd: Option<RawFd>,
+    script_fd: RawFd,
+    already_in_cgroup: bool,
+) -> Result<(), ScriptSupervisorError> {
     if launch_fd < 0 || script_fd < 0 {
         return Err(ScriptSupervisorError::Protocol(
             "invalid script-launch channel descriptor".to_string(),
@@ -1856,7 +1869,7 @@ pub fn run_internal_launcher(
     }
     #[cfg(target_os = "linux")]
     if let Some(cgroup_fd) = cgroup_fd {
-        linux::join_cgroup(cgroup_fd)?;
+        linux::join_cgroup(cgroup_fd, already_in_cgroup)?;
         // The directory capability is needed only to place this trusted
         // launcher into the already-created leaf.  Restore close-on-exec
         // before receiving the invocation so untrusted user code never
@@ -1884,7 +1897,7 @@ pub fn run_internal_launcher(
     clear_close_on_exec(script_file.as_raw_fd())?;
     // The supervisor does not release any invocation bytes until this process
     // has completed all platform containment setup.  In particular, Linux
-    // sends this only after cgroup.procs accepted the launcher's PID.
+    // sends this only after kernel placement and namespace isolation succeed.
     channel.write_all(&[LAUNCHER_READY])?;
     let mut length_bytes = [0_u8; 4];
     channel.read_exact(&mut length_bytes)?;
@@ -2757,12 +2770,23 @@ fn spawn_launcher(
     let (release, launch_child) = UnixStream::pair()?;
     // Every caller runs inside the dedicated single-threaded containment
     // helper (or a single-threaded backend worker forked by the persistent
-    // execution supervisor). Forking the tiny exec gate here avoids re-execing
+    // execution supervisor). Creating the tiny exec gate here avoids re-execing
     // the full Tonepoet binary for every external command while preserving the
     // same pre-release cgroup/session/process-group setup and retained-FD exec.
     // Unrelated inherited supervisor descriptors stay CLOEXEC, so the final
     // external exec sees the same descriptor boundary as the former re-exec gate.
-    let pid = unsafe { libc::fork() };
+    #[cfg(target_os = "linux")]
+    let (pid, already_in_cgroup) = match cgroup_fd {
+        Some(fd) => match linux::clone_into_cgroup(fd) {
+            Ok(pid) => (pid, true),
+            // A blocked or unsupported clone3 must not weaken containment:
+            // the fork launcher will still join the leaf before release.
+            Err(_) => (unsafe { libc::fork() }, false),
+        },
+        None => (unsafe { libc::fork() }, false),
+    };
+    #[cfg(not(target_os = "linux"))]
+    let (pid, already_in_cgroup) = (unsafe { libc::fork() }, false);
     if pid < 0 {
         return Err(io::Error::last_os_error().into());
     }
@@ -2789,7 +2813,12 @@ fn spawn_launcher(
             Ok(())
         });
         if setup.is_ok() {
-            let _ = run_internal_launcher(launch_fd, cgroup_fd, script_fd);
+            let _ = run_internal_launcher_with_placement(
+                launch_fd,
+                cgroup_fd,
+                script_fd,
+                already_in_cgroup,
+            );
         }
         unsafe { libc::_exit(70) };
     }
@@ -2881,6 +2910,26 @@ mod linux {
 
     const PR_SET_PDEATHSIG: libc::c_int = 1;
     const PR_SET_CHILD_SUBREAPER: libc::c_int = 36;
+
+    // Linux 5.7+ creates the gated launcher directly in its delegated leaf.
+    // This avoids a costly post-fork cgroup.procs migration. The zeroed clone3
+    // tail is part of the kernel ABI; do not use CLONE_VM or CLONE_THREAD here.
+    const CLONE_INTO_CGROUP: u64 = 1_u64 << 33;
+
+    pub(super) fn clone_into_cgroup(cgroup_fd: RawFd) -> io::Result<libc::pid_t> {
+        let mut args = [0_u64; 11];
+        args[0] = CLONE_INTO_CGROUP;
+        args[4] = libc::SIGCHLD as u64;
+        args[10] = cgroup_fd as u64;
+        let pid = unsafe {
+            libc::syscall(libc::SYS_clone3, args.as_ptr(), std::mem::size_of_val(&args))
+        };
+        if pid < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(pid as libc::pid_t)
+        }
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
     pub(super) struct ProcessIdentity {
@@ -3068,7 +3117,10 @@ mod linux {
         }
     }
 
-    pub(super) fn join_cgroup(cgroup_fd: RawFd) -> Result<(), ScriptSupervisorError> {
+    pub(super) fn join_cgroup(
+        cgroup_fd: RawFd,
+        already_in_cgroup: bool,
+    ) -> Result<(), ScriptSupervisorError> {
         if cgroup_fd < 0 {
             return Err(ScriptSupervisorError::Protocol(
                 "invalid inherited cgroup descriptor".to_string(),
@@ -3078,8 +3130,10 @@ mod linux {
         // descriptor. Borrow it here so the caller can restore FD_CLOEXEC
         // immediately after joining, preventing the target script from
         // inheriting cgroup control authority.
-        let pid = format!("{}\n", std::process::id());
-        write_control(cgroup_fd, "cgroup.procs", pid.as_bytes())?;
+        if !already_in_cgroup {
+            let pid = format!("{}\n", std::process::id());
+            write_control(cgroup_fd, "cgroup.procs", pid.as_bytes())?;
+        }
         // A child cgroup alone is not an inescapable boundary for a process
         // running as the same delegated user: it may be able to write an
         // ancestor cgroup.procs. Root a new cgroup namespace at the retained
@@ -3280,7 +3334,6 @@ mod linux {
                 return Err(supervision_error_with_cleanup(error.into(), cleanup));
             }
         };
-        let mut tracked = BTreeSet::from([root]);
         let mut launch_channel = launch_channel;
         if let Err(readiness_error) = wait_launcher_ready(&mut launch_channel) {
             let mut cleanup = emergency_kill_child_group(&mut child);
@@ -3324,10 +3377,7 @@ mod linux {
                 event_fd,
                 TerminationReason::ParentDisconnected,
                 &leaf,
-                root.pid,
-                supervisor_pid,
                 &mut child,
-                &mut tracked,
                 &mut raw_wait_status,
             )?;
             let raw_wait_status = complete_leader_wait(event_fd, &mut child, raw_wait_status)?;
@@ -3358,10 +3408,7 @@ mod linux {
                 event_fd,
                 reason,
                 &leaf,
-                root.pid,
-                supervisor_pid,
                 &mut child,
-                &mut tracked,
                 &mut raw_wait_status,
             )?;
             let raw_wait_status = complete_leader_wait(event_fd, &mut child, raw_wait_status)?;
@@ -3395,14 +3442,12 @@ mod linux {
         let mut leader_exited_at: Option<Instant> = None;
         loop {
             observe_leader_exit(event_fd, &mut child, &mut raw_wait_status)?;
-            refresh_linux_tree(
-                root.pid,
-                supervisor_pid,
-                raw_wait_status.is_some(),
-                &mut tracked,
-            )?;
+            // The cgroup namespace was rooted at this leaf before exec.
+            // Its kernel-maintained populated bit accounts for all descendants,
+            // including double-forks and changed process groups. /proc tree
+            // enumeration here would add host-wide work to every 10 ms tick.
             let populated = leaf.populated()?;
-            if raw_wait_status.is_some() && !populated && tracked.is_empty() {
+            if raw_wait_status.is_some() && !populated {
                 emit_containment_empty(event_fd, ContainmentConfidence::KernelEnforced)?;
                 break;
             }
@@ -3414,10 +3459,7 @@ mod linux {
                         event_fd,
                         TerminationReason::LeaderExitedWithDescendants,
                         &leaf,
-                        root.pid,
-                        supervisor_pid,
                         &mut child,
-                        &mut tracked,
                         &mut raw_wait_status,
                     )?);
                     break;
@@ -3434,10 +3476,7 @@ mod linux {
                     event_fd,
                     reason,
                     &leaf,
-                    root.pid,
-                    supervisor_pid,
                     &mut child,
-                    &mut tracked,
                     &mut raw_wait_status,
                 )?);
                 break;
@@ -3448,10 +3487,7 @@ mod linux {
                     event_fd,
                     TerminationReason::Timeout,
                     &leaf,
-                    root.pid,
-                    supervisor_pid,
                     &mut child,
-                    &mut tracked,
                     &mut raw_wait_status,
                 )?);
                 break;
@@ -3499,12 +3535,18 @@ mod linux {
         event_fd: RawFd,
         reason: TerminationReason,
         leaf: &CgroupLeaf,
-        root_pgid: i32,
-        supervisor_pid: i32,
         child: &mut LauncherChild,
-        tracked: &mut BTreeSet<ProcessIdentity>,
         raw_wait_status: &mut Option<i32>,
     ) -> Result<TerminationSummary, ScriptSupervisorError> {
+        // Keep descendant identities for the exceptional termination path.
+        // cgroup.kill is recursive on modern kernels, but older/delegated
+        // kernels may fall back to signalling cgroup.procs. Descendant PIDFD
+        // signalling also reaches members in nested child cgroups, as before.
+        // There is no need to scan this tree while a tool is running normally.
+        let mut tracked = BTreeSet::new();
+        let root_pgid = child.id() as i32;
+        let supervisor_pid = std::process::id() as i32;
+        refresh_linux_tree(root_pgid, supervisor_pid, raw_wait_status.is_some(), &mut tracked)?;
         let graceful_deadline_unix_millis = graceful_deadline_unix_millis();
         emit_lifecycle_best_effort(
             event_fd,
@@ -3516,11 +3558,11 @@ mod linux {
         );
         signal_process_group(child.id(), libc::SIGTERM);
         leaf.signal_members(libc::SIGTERM)?;
-        signal_identities(tracked, libc::SIGTERM)?;
+        signal_identities(&tracked, libc::SIGTERM)?;
         let term_deadline = Instant::now() + TERM_GRACE;
         while Instant::now() < term_deadline {
             observe_leader_exit(event_fd, child, raw_wait_status)?;
-            refresh_linux_tree(root_pgid, supervisor_pid, raw_wait_status.is_some(), tracked)?;
+            refresh_linux_tree(root_pgid, supervisor_pid, raw_wait_status.is_some(), &mut tracked)?;
             if !leaf.populated()? && tracked.is_empty() {
                 reap_waitable_children_recording_leader(event_fd, child, raw_wait_status);
                 emit_containment_empty(event_fd, ContainmentConfidence::KernelEnforced)?;
@@ -3531,7 +3573,7 @@ mod linux {
                 });
             }
             leaf.signal_members(libc::SIGTERM)?;
-            signal_identities(tracked, libc::SIGTERM)?;
+            signal_identities(&tracked, libc::SIGTERM)?;
             thread::sleep(CONTROL_POLL_INTERVAL);
         }
 
@@ -3544,11 +3586,11 @@ mod linux {
         );
         leaf.kill_all()?;
         signal_process_group(child.id(), libc::SIGKILL);
-        signal_identities(tracked, libc::SIGKILL)?;
+        signal_identities(&tracked, libc::SIGKILL)?;
         let kill_deadline = Instant::now() + KILL_GRACE;
         while Instant::now() < kill_deadline {
             observe_leader_exit(event_fd, child, raw_wait_status)?;
-            refresh_linux_tree(root_pgid, supervisor_pid, raw_wait_status.is_some(), tracked)?;
+            refresh_linux_tree(root_pgid, supervisor_pid, raw_wait_status.is_some(), &mut tracked)?;
             if !leaf.populated()? && tracked.is_empty() {
                 reap_waitable_children_recording_leader(event_fd, child, raw_wait_status);
                 emit_containment_empty(event_fd, ContainmentConfidence::KernelEnforced)?;
@@ -3559,7 +3601,7 @@ mod linux {
                 });
             }
             let _ = leaf.kill_all();
-            signal_identities(tracked, libc::SIGKILL)?;
+            signal_identities(&tracked, libc::SIGKILL)?;
             thread::sleep(CONTROL_POLL_INTERVAL);
         }
         Err(ScriptSupervisorError::Internal(
@@ -3709,15 +3751,18 @@ mod linux {
         let mut leader_exited_at: Option<Instant> = None;
         loop {
             observe_leader_exit(event_fd, &mut child, &mut raw_wait_status)?;
-            refresh_linux_tree(
-                root.pid,
-                supervisor_pid,
-                raw_wait_status.is_some(),
-                &mut tracked,
-            )?;
-            if raw_wait_status.is_some() && tracked.is_empty() {
-                emit_containment_empty(event_fd, ContainmentConfidence::ProcessTreeObserved)?;
-                break;
+            // Before the leader exits, the dedicated subreaper owns its
+            // descendant lineage. At leader exit, remaining descendants are
+            // reparented to it by the kernel. Discovery is needed at that
+            // boundary and during termination, not ten times a second for
+            // every second of normal tool execution. This matters on kernels
+            // without /proc/<tid>/children, which require the global fallback.
+            if raw_wait_status.is_some() {
+                refresh_linux_tree(root.pid, supervisor_pid, true, &mut tracked)?;
+                if tracked.is_empty() {
+                    emit_containment_empty(event_fd, ContainmentConfidence::ProcessTreeObserved)?;
+                    break;
+                }
             }
             if raw_wait_status.is_some() {
                 let exited_at = leader_exited_at.get_or_insert_with(Instant::now);
@@ -3858,7 +3903,14 @@ mod linux {
         root_reaped: bool,
         tracked: &mut BTreeSet<ProcessIdentity>,
     ) -> io::Result<()> {
-        let snapshot = process_snapshot()?;
+        // The helper is a single-purpose child subreaper. All descendants
+        // either remain beneath one of its children or are adopted by it.
+        // Enumerating task/*/children is independent of unrelated host PIDs.
+        // Retain the whole-/proc implementation for procfs without children.
+        let snapshot = match descendant_snapshot(supervisor_pid) {
+            Ok(snapshot) => snapshot,
+            Err(_) => process_snapshot()?,
+        };
         let by_pid: BTreeMap<i32, ProcessInfo> =
             snapshot.into_iter().map(|info| (info.identity.pid, info)).collect();
         tracked.retain(|identity| {
@@ -3925,6 +3977,73 @@ mod linux {
                         Some(libc::ENOENT) | Some(libc::ESRCH) | Some(libc::EACCES)
                     ) => {}
                 Err(error) => return Err(error),
+            }
+        }
+        Ok(result)
+    }
+
+    pub(super) fn descendant_snapshot(supervisor_pid: i32) -> io::Result<Vec<ProcessInfo>> {
+        let mut visited = BTreeSet::new();
+        let mut pending = VecDeque::from([supervisor_pid]);
+        let mut result = Vec::new();
+        while let Some(parent) = pending.pop_front() {
+            let tasks = match fs::read_dir(format!("/proc/{parent}/task")) {
+                Ok(tasks) => tasks,
+                Err(error)
+                    if matches!(error.raw_os_error(), Some(libc::ENOENT) | Some(libc::ESRCH)) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            for task in tasks {
+                let task = task?;
+                let name = task.file_name();
+                let Some(tid) = name.to_str().and_then(|text| text.parse::<i32>().ok()) else {
+                    continue;
+                };
+                let children = match fs::read_to_string(format!(
+                    "/proc/{parent}/task/{tid}/children"
+                )) {
+                    Ok(text) => text,
+                    Err(error)
+                        if matches!(error.raw_os_error(), Some(libc::ENOENT) | Some(libc::ESRCH)) =>
+                    {
+                        // Some Linux builds omit CONFIG_PROC_CHILDREN. A
+                        // missing children file on a still-live task means
+                        // "interface unavailable", not "no descendants".
+                        // Revert to the global PID/start-time snapshot rather
+                        // than falsely reporting containment empty.
+                        if fs::metadata(format!("/proc/{parent}/task/{tid}")).is_ok() {
+                            return Err(error);
+                        }
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                for value in children.split_whitespace() {
+                    let pid = value.parse::<i32>().map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "malformed procfs children PID")
+                    })?;
+                    if !visited.insert(pid) {
+                        continue;
+                    }
+                    match process_info(pid) {
+                        Ok(Some(info)) => {
+                            if info.state != b'Z' {
+                                pending.push_back(pid);
+                            }
+                            result.push(info);
+                        }
+                        Ok(None) => {}
+                        Err(error)
+                            if matches!(
+                                error.raw_os_error(),
+                                Some(libc::ENOENT) | Some(libc::ESRCH) | Some(libc::EACCES)
+                            ) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
             }
         }
         Ok(result)
@@ -5411,6 +5530,57 @@ mod tests {
         assert_eq!(parsed.parent, 41);
         assert_eq!(parsed.group, 77);
         assert_eq!(parsed.state, b'S');
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_descendant_snapshot_finds_grandchildren_without_host_scan() {
+        let self_pid = std::process::id();
+        let children_file = format!("/proc/{self_pid}/task/{self_pid}/children");
+        if !Path::new(&children_file).exists() {
+            assert!(
+                linux::descendant_snapshot(self_pid as i32).is_err(),
+                "missing procfs children must activate the full-table fallback"
+            );
+            return;
+        }
+        // A long-lived grandchild is not necessarily in the leader's original
+        // process group. The descendant path must follow task/children rather
+        // than relying on the process-group identity alone.
+        let mut shell = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 3 & wait")
+            .stdin(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("spawn descendant fixture");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut found = false;
+        while Instant::now() < deadline {
+            let snapshot = linux::descendant_snapshot(std::process::id() as i32)
+                .expect("read procfs task children");
+            found = snapshot.iter().any(|entry| {
+                entry.parent == shell.id() as i32 && entry.state != b'Z'
+            });
+            if found {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        // The fixture owns its process group, so cleanup includes the sleep
+        // grandchild even when an assertion fails to find it.
+        unsafe { libc::kill(-(shell.id() as i32), libc::SIGKILL) };
+        let _ = shell.wait();
+        assert!(found, "subprocess grandchild must be discoverable via procfs children");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_clone3_requires_a_valid_leaf_descriptor() {
+        // This is intentionally a negative test: a successful clone would
+        // spawn a second copy of the test harness. The kernel must reject an
+        // invalid leaf, or the syscall may be disabled by sandbox policy.
+        assert!(linux::clone_into_cgroup(-1).is_err());
     }
 
     #[test]
