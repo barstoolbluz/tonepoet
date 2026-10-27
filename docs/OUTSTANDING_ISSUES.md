@@ -5266,6 +5266,10 @@ an 18-second conversion, against roughly 1 second of actual decoding.
 | ffprobe | 14 | 2.89 s | 207 ms |
 | metaflac | 24 | 2.64 s | 110 ms |
 
+*Partly superseded by the 2026-10-27 update below: most of the per-call cost
+is TonePoet's own tool supervision, not ffprobe or metaflac, and the metaflac
+writes are not expensive.*
+
 The two have different causes, and only the first is established.
 
 **ffprobe is pure process startup.** `ffprobe -version`, which opens no file at
@@ -5295,3 +5299,88 @@ depends on what the calls are actually for, which I have not traced.
 Reproduction is the ordinary conversion above with
 `TONEPOET_PIPELINE_BASELINE_JSONL` set, counting `tool_run_finished` records by
 tool in the resulting trace.
+
+### Update 2026-10-27: the cost is in the supervisor, not the tools
+
+Same album, `main` at `e399d9e`, measured both untraced and under strace. The
+strace timings turned out to be badly distorted, so every figure below is from
+untraced runs unless it says otherwise.
+
+**What the calls are.** The counts are identical under S1 and the default S3
+route, and every one of these calls runs alone (`active_at_start` is 1).
+
+| Calls | Command | Stage |
+| --- | --- | --- |
+| 2 | `ffprobe` on the source image: audio stream, then attached art | materialize |
+| 12 | `ffprobe` on each staged output: rate, channels, duration, format | after encode |
+| 12 | `metaflac --export-tags-to=-` | metadata |
+| 12 | `metaflac` with 28 `--remove-tag` and 15 `--set-tag` in one rewrite | metadata |
+
+An `ffprobe --version` check also runs, but outside the tool runner, so it is
+not among the 14. Publication additionally spawns 24 `getfacl` processes (a
+`--version` and a `--access` per track, from `src/tui/probe.rs`). They are fast,
+but the built-in trace does not count them.
+
+**Where a call's time goes.** A timing shim placed ahead on `PATH` recorded each
+tool's real start and exit, which were joined to the runner's
+`tool_run_finished` records. The shim itself adds about 2.4 ms.
+
+| Tool | Runner elapsed | Before exec | Process | After exit |
+| --- | --- | --- | --- | --- |
+| metaflac | 99–110 ms | 50–59 ms | 14 ms | 40–44 ms |
+| ffprobe | 191–193 ms | 59–60 ms | 94 ms | 39 ms |
+
+That puts roughly 100 ms of overhead on every call, about 3.5–3.8 s per S1
+run across the 38 calls. ffprobe's own ~94 ms is real startup cost. metaflac's
+work is small: standalone, both the read and the rewrite take 3–4 ms.
+
+**Two mechanisms are established**, both in `src/convert/script_supervisor.rs`:
+
+- *A cgroup migration before each exec.* `CgroupLeaf::create` makes a leaf
+  cgroup per call, and `join_cgroup` writes the launcher's PID to its
+  `cgroup.procs`. Reproduced in isolation on this host: with migrations spaced
+  100–250 ms apart, as TonePoet's are, each write takes a median of 21–27 ms
+  (range 17–49). Back to back it takes 0.08 ms. My reading is that a spaced
+  migration has to wait for a fresh RCU grace period. This accounts for about
+  half of the before-exec time. The rest is unattributed and does not depend on
+  how many processes the host is running.
+- *A full process-table walk every 10 ms for the whole life of every tool.*
+  The supervision loop calls `refresh_linux_tree`, which calls
+  `process_snapshot`, which reads `/proc/<pid>/stat` for every process on the
+  host, then sleeps `CONTROL_POLL_INTERVAL` (10 ms). With 3,000 idle processes
+  added to the host (943 → 3,946), after-exit time rose from ~40 ms to 91–110 ms
+  while before-exec time and tool runtimes did not move, and the whole
+  conversion went from 17.0 s to 19.5 s.
+
+**The walk also costs a lot of CPU.** Sampling every TonePoet process in the
+conversion's process tree:
+
+| Run | Host processes | Helper CPU | Audio tool CPU | Per supervised tool |
+| --- | --- | --- | --- | --- |
+| S1 | 943 | 11.0 s | 11.9 s | 41% of a core |
+| S3 | 943 | 13.9 s | 19.6 s | 41% of a core |
+| S1 | 3,946 | 20.8 s | 12.6 s | 70% of a core |
+
+"Helper" means the forked supervisor and launcher processes, about two per
+call. "Per supervised tool" is helper CPU divided by the summed runner time of
+all tool calls. A loop of one walk plus a 10 ms sleep fits all three runs with
+an implied walk of about 7 ms, or 6–7 µs per host process. So supervising a
+tool costs something like half a core however long that tool runs, including
+the long sox and ffmpeg encodes. These figures come from sampling every 20 ms
+and probably undercount slightly.
+
+**What changes from the original entry.** ffprobe is about half startup and
+half supervision. metaflac is mostly supervision, not file rewriting. The cost
+grows with the number of processes on the host and is not specific to these two
+tools: every supervised call pays it, and only short calls make it visible as
+wall time. This is the same pattern as the ReplayGain FIFO poll and possibly
+#77, a fixed-interval poll doing work that could wait on an event, though for
+#77 that is unconfirmed.
+
+**Still open.** The unattributed half of the before-exec time. Whether S3,
+where migrations cluster, pays less for them. Why the convert path calls
+`getfacl` through `tui::probe`.
+
+No remedy is proposed. Harness, traces and per-run results are on the
+measuring host under `~/dev/issue78/`, not committed: `run.sh`, the `shim/`
+directory, `breakdown.py` and `cpu_sampler.py`.
