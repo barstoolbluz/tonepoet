@@ -5391,6 +5391,9 @@ directory, `breakdown.py` and `cpu_sampler.py`.
 
 ### Update 2026-10-27, later: cgroup containment never arms on this host
 
+*Its 72.0 s whole-tree CPU figure is corrected in the third update below: on a
+quiet host the input tree used about 35 s.*
+
 Found while checking a candidate fix for this issue and #77 (branch
 `issue77-78-delivery`, not merged). Everything below holds for the unmodified
 tree (`6ad6bb1`) as well as the candidate, and I have not diagnosed it.
@@ -5447,6 +5450,78 @@ used 42.0–42.1 s.
 
 Traces are `runs/b-sys2` (unmodified) and `runs/d-sys2` (candidate) under
 `~/dev/issue78/`.
+
+### Update 2026-10-28: both candidates re-measured on a quiet host
+
+Three builds of the same album, interleaved run by run, on a quiet host (load
+average 2–6, about 930 processes): the input tree (`6ad6bb1`), the first
+candidate (`cbc976f`, branch `issue77-78-delivery`) and a follow-up candidate
+(`90ee62c`, measured at `d950d63` on branch `issue77-78-followup`). None is
+merged.
+
+The follow-up changes only the supervisor:
+
+- Before attempting cgroup containment, it checks for `CAP_SYS_ADMIN`,
+  `CAP_SETPCAP` and `nsdelegate`. Without them it goes straight to the
+  subreaper, as it always does on this host.
+- The parent's fixed 10 ms sleep becomes a wait that wakes on lifecycle events.
+- When the cgroup path does arm, the launcher drops `CAP_SYS_ADMIN` and sets
+  `no_new_privs`. That cannot be exercised here.
+
+| Measure | Input | First candidate | Follow-up |
+| --- | --- | --- | --- |
+| S1 wall time, 3 runs | 16.5 / 16.5 / 16.5 s | 14.7 / 14.3 / 14.6 s | 13.2 / 13.0 / 13.3 s |
+| S3 wall time, 2 runs | 10.0 / 10.0 s | 8.5 / 8.6 s | 7.4 / 7.5 s |
+| ffprobe per call, before exec / after exit | 50–70 / 36–38 ms | 19–20 / 36–38 ms | 13–14 / 15–18 ms |
+| metaflac per call, before exec / after exit | 49–58 / 39 ms | 18 / 38–39 ms | 11 / 11–13 ms |
+| ffprobe + metaflac supervision overhead per S1 run | 3.4–3.7 s | 2.0–2.1 s | 0.9–1.0 s |
+| S1 with ~6,940 host processes | 21.5 / 22.2 s | 14.5 / 14.7 s | 13.1 / 12.9 s |
+| After exit with ~6,940 host processes | 100–108 ms ffprobe, 171 ms metaflac | 37–40 ms | 12–16 ms |
+| Whole-tree CPU per S1 run (`getrusage`) | 34.7 / 35.2 s, system 11.1 / 11.2 s | 24.8 / 25.5 s, system 3.4 / 3.8 s | 24.7 / 24.8 s, system 3.4 / 3.6 s |
+
+Per-call figures are medians per run, from the same shim and runner trace as the
+first update. Tool runtimes were unchanged across the three builds: ffprobe
+about 94 ms, metaflac about 14 ms.
+
+- **Where the follow-up's gain shows.** It is mostly after exit, where the time
+  fell by about two thirds. Before exec fell by a further 6–8 ms.
+- **What is left.** Supervision still adds about 25–30 ms per call. A metaflac
+  call takes about 34 ms against about 14 ms for the tool.
+- **Host process count.** With ~6,940 host processes the follow-up was
+  unaffected.
+- **CPU.** Whole-tree CPU is the same for both candidates. The follow-up's gain
+  is wall time.
+- **S3.** The breakdown script cannot attribute concurrent calls, so S3 has wall
+  times only.
+
+**A correction to the second update.** Its 72.0 s whole-tree CPU figure was
+inflated by the concurrent workload it mentions. On this quiet host the input
+tree used 34.7–35.2 s per S1 run.
+
+**Output.** S1 and S3 from the follow-up match both other builds: the same 13
+files, the same audio MD5 and tags on all 12 FLACs, and byte-identical CUE.
+
+**Containment.** I ran the four probe fixtures from the second update on the
+follow-up: a TERM-ignoring `setsid` leftover, a self-finishing child, and a
+double fork under timeout and under cancellation.
+
+- **`Auto` and forced fallback.** Outcomes, event order and elapsed times match
+  the first candidate's, and no process survived.
+- **The `Auto` warning** now reads "delegated cgroup v2 was unavailable
+  (CLONE_NEWCGROUP requires CAP_SYS_ADMIN, which is not effective in this
+  process)".
+- **`RequireLinuxCgroupV2`** refuses in about 0.11 s and never runs the script.
+  The count of cgroup directories under `user@1000.service` was 40 before and
+  after.
+
+**Still open.** The cgroup path has never run on this host, in any of the three
+builds. For what it may be worth, `unshare -C` fails with EPERM here, while
+`unshare -U -C` (a new user namespace together with a new cgroup namespace)
+succeeds unprivileged. I have not looked at whether that route gives an
+equivalent containment boundary.
+
+Run data is in `runs/f-*` under `~/dev/issue78/`, and the driver is
+`followup.sh`.
 
 ## 79. The TUI event loop still wakes ten times a second when idle
 
