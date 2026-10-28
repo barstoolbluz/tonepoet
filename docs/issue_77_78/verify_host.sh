@@ -21,5 +21,6 @@ cargo test --locked -p tonepoet --lib tui::event_loop::idle_redraw_tests -- --no
 cargo test --locked -p tonepoet --lib linux_descendant_snapshot -- --nocapture
 cargo test --locked -p tonepoet --lib linux_clone3_requires_a_valid_leaf_descriptor -- --nocapture
 cargo test --locked -p tonepoet --lib convert::script_supervisor::tests -- --nocapture
+cargo test --locked -p tonepoet --test conversion_action_runscript_containment -- --nocapture
 
 printf 'Focused unit tests passed. Host end-to-end and timing gates remain separate.\n'
