@@ -5447,3 +5447,46 @@ used 42.0–42.1 s.
 
 Traces are `runs/b-sys2` (unmodified) and `runs/d-sys2` (candidate) under
 `~/dev/issue78/`.
+
+## 79. The TUI event loop still wakes ten times a second when idle
+
+Filed 2026-10-28 as a possible later redesign, not a defect. It follows #77,
+whose fix on `issue77-78-followup` (not yet merged) skips the redraw when
+nothing visible has changed.
+
+**What remains.** Measured 2026-10-28 on `d950d63`, idle on Browse at 248×75
+with empty XDG directories:
+
+- 0.05% of one core, flat across the first 45 minutes of a 24-hour soak. That
+  is about 43 s of CPU a day.
+- 0.04–0.07% with 0, 32 and 64 stress-ng CPU workers on the 64-thread host. The
+  build before the fix rose from 1.1% to 1.7% under the same load.
+- Over 20 s the main thread woke 203 times. The other 64 threads did not wake.
+- At 400×110 it was 0.37–0.39% over 120 s.
+
+The wakes come from the event loop's 100 ms `event::poll` timeout. Each runs the
+loop's bookkeeping (`refresh_items`, the debounce and status-expiry checks,
+`ensure_convert_hdcd_scan`, the async-message drain) and draws only if something
+visible changed. A full redraw also runs every `IDLE_REDRAW_INTERVAL` (5 s), as
+a catch-all for changes the change detection does not track.
+
+**Not a responsiveness problem.** A keypress ends the poll wait at once.
+Keypress-to-screen measured 6–9 ms both before the fix, when the TUI redrew
+continuously, and after it. The timers bound how stale background state can be
+on screen, not how quickly input is answered.
+
+**Why it still polls, as far as I can tell.** Two sources cannot end the
+terminal wait: async results arriving on the message channel, and queue progress
+that `refresh_items` reads from shared state the conversion workers update
+without sending anything. The second looks like the larger obstacle. While
+progress is read rather than announced, something has to keep checking.
+
+**What we would want, if revisited.** An idle TUI that sleeps until a real event
+or its next deadline, with no fixed-interval wake, while background progress,
+async results, resize and timed maintenance still appear as promptly as they do
+now. Whether that justifies redesigning the event loop and how workers report
+progress is open. At the measured cost it matters mainly where wakeups are
+expensive in themselves, such as on battery.
+
+My reading of the event loop covers only the poll and the redraw decision. The
+account of why it polls is inference and may be incomplete.
