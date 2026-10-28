@@ -9,11 +9,13 @@
 //! ownership to a process which has no unrelated children.
 //!
 //! Linux prefers a delegated cgroup-v2 leaf and also makes the dedicated
-//! helper a child subreaper.  A minimal hidden launcher joins the retained
-//! cgroup descriptor before it receives the authenticated invocation, so the
-//! target script cannot execute or fork outside the armed containment boundary.
-//! If cgroup delegation is unavailable, the subreaper tracks the complete
-//! `/proc` descendant graph with PID start-time validation.  On macOS the helper
+//! helper a child subreaper. The gated launcher enters the leaf atomically at
+//! clone3 when supported, otherwise it migrates before script release. A
+//! private cgroup namespace prevents the script from leaving its leaf.
+//! Kernel cgroup occupancy provides the normal completion condition. Without
+//! delegation, the subreaper discovers descendants at exit/termination, using
+//! task-local procfs enumeration when available and PID-start-validated global
+//! procfs snapshots otherwise. On macOS the helper
 //! arms EVFILT_PROC/NOTE_FORK before releasing an exec gate and combines those
 //! notifications with libproc child enumeration and process start identities.
 
@@ -682,6 +684,7 @@ where
     let mut control_sent = false;
     let mut event_reader = EventFrameReader::default();
     let mut observed_descriptor: Option<ContainmentDescriptor> = None;
+    let mut event_pollable = true;
     let helper_status = loop {
         for event in event_reader.read_available(&mut event_parent)? {
             if event.schema_version() != LIFECYCLE_EVENT_SCHEMA {
@@ -753,7 +756,7 @@ where
             send_control(&mut control_parent, CONTROL_TIMEOUT)?;
             control_sent = true;
         }
-        thread::sleep(Duration::from_millis(10));
+        wait_for_lifecycle_activity(&event_parent, &mut event_pollable)?;
     };
     drop(control_parent);
 
@@ -1325,6 +1328,7 @@ where
     let mut control_sent = false;
     let mut event_reader = EventFrameReader::default();
     let mut observed_descriptor: Option<ContainmentDescriptor> = None;
+    let mut event_pollable = true;
     loop {
         for event in event_reader.read_available(&mut event_parent)? {
             if event.schema_version() != LIFECYCLE_EVENT_SCHEMA {
@@ -1386,7 +1390,7 @@ where
                 "item supervisor backend did not publish a terminal containment result within the bounded recovery window".to_string(),
             ));
         }
-        thread::sleep(Duration::from_millis(10));
+        wait_for_lifecycle_activity(&event_parent, &mut event_pollable)?;
     }
     drop(control_parent);
 
@@ -1849,6 +1853,17 @@ pub fn run_internal_launcher(
     cgroup_fd: Option<RawFd>,
     script_fd: RawFd,
 ) -> Result<(), ScriptSupervisorError> {
+    run_internal_launcher_with_placement(launch_fd, cgroup_fd, script_fd, false)
+}
+
+// clone3(CLONE_INTO_CGROUP) places the child in the retained leaf at creation.
+// The ordinary fork path still joins before reporting LAUNCHER_READY.
+fn run_internal_launcher_with_placement(
+    launch_fd: RawFd,
+    cgroup_fd: Option<RawFd>,
+    script_fd: RawFd,
+    already_in_cgroup: bool,
+) -> Result<(), ScriptSupervisorError> {
     if launch_fd < 0 || script_fd < 0 {
         return Err(ScriptSupervisorError::Protocol(
             "invalid script-launch channel descriptor".to_string(),
@@ -1856,7 +1871,7 @@ pub fn run_internal_launcher(
     }
     #[cfg(target_os = "linux")]
     if let Some(cgroup_fd) = cgroup_fd {
-        linux::join_cgroup(cgroup_fd)?;
+        linux::join_cgroup(cgroup_fd, already_in_cgroup)?;
         // The directory capability is needed only to place this trusted
         // launcher into the already-created leaf.  Restore close-on-exec
         // before receiving the invocation so untrusted user code never
@@ -1884,7 +1899,7 @@ pub fn run_internal_launcher(
     clear_close_on_exec(script_file.as_raw_fd())?;
     // The supervisor does not release any invocation bytes until this process
     // has completed all platform containment setup.  In particular, Linux
-    // sends this only after cgroup.procs accepted the launcher's PID.
+    // sends this only after kernel placement and namespace isolation succeed.
     channel.write_all(&[LAUNCHER_READY])?;
     let mut length_bytes = [0_u8; 4];
     channel.read_exact(&mut length_bytes)?;
@@ -2309,6 +2324,48 @@ fn emit_lifecycle_event(
         }
         return Err(error.into());
     }
+}
+
+/// Wake immediately for a lifecycle event instead of delaying each ACK by an
+/// unconditional 10 ms. Keep the same bound on cancellation/timeout checks.
+/// A closed event channel must be polled no more: POLLHUP is permanently ready.
+fn wait_for_lifecycle_activity(
+    channel: &UnixStream,
+    event_pollable: &mut bool,
+) -> io::Result<()> {
+    if !*event_pollable {
+        thread::sleep(CONTROL_POLL_INTERVAL);
+        return Ok(());
+    }
+    let mut pollfd = libc::pollfd {
+        fd: channel.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let timeout_ms = i32::try_from(CONTROL_POLL_INTERVAL.as_millis())
+        .expect("control poll interval must fit in poll timeout");
+    let ready = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+    if ready < 0 {
+        let error = io::Error::last_os_error();
+        // An interrupted poll must recheck cancellation and the deadline.
+        return if error.kind() == io::ErrorKind::Interrupted {
+            Ok(())
+        } else {
+            Err(error)
+        };
+    }
+    if ready > 0 {
+        if pollfd.revents & libc::POLLNVAL != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "lifecycle channel descriptor became invalid",
+            ));
+        }
+        if pollfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+            *event_pollable = false;
+        }
+    }
+    Ok(())
 }
 
 fn lifecycle_channel_disconnected(error: &io::Error) -> bool {
@@ -2757,12 +2814,23 @@ fn spawn_launcher(
     let (release, launch_child) = UnixStream::pair()?;
     // Every caller runs inside the dedicated single-threaded containment
     // helper (or a single-threaded backend worker forked by the persistent
-    // execution supervisor). Forking the tiny exec gate here avoids re-execing
+    // execution supervisor). Creating the tiny exec gate here avoids re-execing
     // the full Tonepoet binary for every external command while preserving the
     // same pre-release cgroup/session/process-group setup and retained-FD exec.
     // Unrelated inherited supervisor descriptors stay CLOEXEC, so the final
     // external exec sees the same descriptor boundary as the former re-exec gate.
-    let pid = unsafe { libc::fork() };
+    #[cfg(target_os = "linux")]
+    let (pid, already_in_cgroup) = match cgroup_fd {
+        Some(fd) => match linux::clone_into_cgroup(fd) {
+            Ok(pid) => (pid, true),
+            // A blocked or unsupported clone3 must not weaken containment:
+            // the fork launcher will still join the leaf before release.
+            Err(_) => (unsafe { libc::fork() }, false),
+        },
+        None => (unsafe { libc::fork() }, false),
+    };
+    #[cfg(not(target_os = "linux"))]
+    let (pid, already_in_cgroup) = (unsafe { libc::fork() }, false);
     if pid < 0 {
         return Err(io::Error::last_os_error().into());
     }
@@ -2789,7 +2857,12 @@ fn spawn_launcher(
             Ok(())
         });
         if setup.is_ok() {
-            let _ = run_internal_launcher(launch_fd, cgroup_fd, script_fd);
+            let _ = run_internal_launcher_with_placement(
+                launch_fd,
+                cgroup_fd,
+                script_fd,
+                already_in_cgroup,
+            );
         }
         unsafe { libc::_exit(70) };
     }
@@ -2881,6 +2954,163 @@ mod linux {
 
     const PR_SET_PDEATHSIG: libc::c_int = 1;
     const PR_SET_CHILD_SUBREAPER: libc::c_int = 36;
+
+    // Linux 5.7+ creates the gated launcher directly in its delegated leaf.
+    // This avoids a costly post-fork cgroup.procs migration. The zeroed clone3
+    // tail is part of the kernel ABI; do not use CLONE_VM or CLONE_THREAD here.
+    const CLONE_INTO_CGROUP: u64 = 1_u64 << 33;
+
+    pub(super) fn clone_into_cgroup(cgroup_fd: RawFd) -> io::Result<libc::pid_t> {
+        let mut args = [0_u64; 11];
+        args[0] = CLONE_INTO_CGROUP;
+        args[4] = libc::SIGCHLD as u64;
+        args[10] = cgroup_fd as u64;
+        let pid = unsafe {
+            libc::syscall(libc::SYS_clone3, args.as_ptr(), std::mem::size_of_val(&args))
+        };
+        if pid < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(pid as libc::pid_t)
+        }
+    }
+
+    // CLONE_NEWCGROUP requires CAP_SYS_ADMIN in the calling user namespace.
+    // Moving into a delegated cgroup cannot confer that capability. A missing
+    // bit is definitive; a present bit is NOT proof that unshare will succeed.
+    const CAP_SYS_ADMIN: libc::c_int = 21;
+    const CAP_SYS_ADMIN_BIT: u64 = 1_u64 << 21;
+    const CAP_SETPCAP_BIT: u64 = 1_u64 << 8;
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+    #[repr(C)]
+    struct CapabilityHeader {
+        version: u32,
+        pid: i32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct CapabilityWord {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+
+    // nsdelegate constrains cgroup migration, but a target inheriting
+    // CAP_SYS_ADMIN can setns() into a more powerful cgroup namespace and
+    // bypass that boundary. Drop all ways to reacquire that specific
+    // capability before any untrusted script bytes cross the exec gate.
+    // Failure is a setup error: the caller never releases the script.
+    fn drop_cgroup_namespace_escape_capability() -> io::Result<()> {
+        // The bounding set limits even root-UID execve. This operation must
+        // precede capset while CAP_SETPCAP is still effective.
+        if unsafe { libc::prctl(libc::PR_CAPBSET_DROP, CAP_SYS_ADMIN, 0, 0, 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut header = CapabilityHeader {
+            version: LINUX_CAPABILITY_VERSION_3,
+            pid: 0,
+        };
+        let mut data = [CapabilityWord::default(); 2];
+        if unsafe { libc::syscall(libc::SYS_capget, &mut header, data.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mask = !(CAP_SYS_ADMIN_BIT as u32);
+        data[0].effective &= mask;
+        data[0].permitted &= mask;
+        data[0].inheritable &= mask;
+        if unsafe { libc::syscall(libc::SYS_capset, &header, data.as_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // Read back the security-sensitive state rather than assuming that
+        // successful syscalls imply the intended restriction.
+        if unsafe { libc::syscall(libc::SYS_capget, &mut header, data.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let cap_present = data[0].effective | data[0].permitted | data[0].inheritable;
+        let bounding = unsafe { libc::prctl(libc::PR_CAPBSET_READ, CAP_SYS_ADMIN, 0, 0, 0) };
+        let no_new_privs = unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) };
+        if cap_present & (CAP_SYS_ADMIN_BIT as u32) != 0
+            || bounding != 0
+            || no_new_privs != 1
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "cgroup namespace escape capability could not be revoked",
+            ));
+        }
+        Ok(())
+    }
+
+    fn effective_capabilities(status: &str) -> Option<u64> {
+        status.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            (key == "CapEff")
+                .then(|| u64::from_str_radix(value.trim(), 16).ok())
+                .flatten()
+        })
+    }
+
+    pub(super) fn require_cgroup_namespace_capabilities(status: &str) -> Result<(), String> {
+        let capabilities = effective_capabilities(status)
+            .ok_or_else(|| "cannot determine effective Linux capabilities".to_string())?;
+        if capabilities & CAP_SYS_ADMIN_BIT == 0 {
+            return Err(
+                "CLONE_NEWCGROUP requires CAP_SYS_ADMIN, which is not effective in this process"
+                    .to_string(),
+            );
+        }
+        if capabilities & CAP_SETPCAP_BIT == 0 {
+            return Err(
+                "cgroup namespace containment requires CAP_SETPCAP to revoke escape authority"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    // A cgroup namespace is not an immutable containment boundary unless
+    // cgroup-v2's nsdelegate rules prevent moves outside the namespace root.
+    // Qualify the same first cgroup2 mount selected by current_cgroup_directory,
+    // which may not be mounted at /sys/fs/cgroup. A different, nsdelegated
+    // cgroup2 mount cannot establish this one's containment properties.
+    pub(super) fn is_nsdelegated_cgroup_mount(mountinfo: &str) -> bool {
+        for line in mountinfo.lines() {
+            let Some((mount, filesystem)) = line.split_once(" - ") else {
+                continue;
+            };
+            let mut fs_fields = filesystem.split_whitespace();
+            if fs_fields.next() != Some("cgroup2") {
+                continue;
+            }
+            let _source = fs_fields.next();
+            let super_options = fs_fields.next().unwrap_or("");
+            let mount_options = mount.split_whitespace().nth(5).unwrap_or("");
+            return [mount_options, super_options].iter().any(|options| {
+                options.split(',').any(|option| option == "nsdelegate")
+            });
+        }
+        false
+    }
+
+    fn kernel_cgroup_prerequisites() -> Result<(), String> {
+        let status = fs::read_to_string("/proc/self/status")
+            .map_err(|error| format!("cannot read effective Linux capabilities: {error}"))?;
+        require_cgroup_namespace_capabilities(&status)?;
+        let mountinfo = fs::read_to_string("/proc/self/mountinfo")
+            .map_err(|error| format!("cannot verify the cgroup-v2 delegation mount: {error}"))?;
+        if !is_nsdelegated_cgroup_mount(&mountinfo) {
+            return Err(
+                "the selected cgroup-v2 mount lacks verified nsdelegate enforcement"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
     pub(super) struct ProcessIdentity {
@@ -3068,7 +3298,10 @@ mod linux {
         }
     }
 
-    pub(super) fn join_cgroup(cgroup_fd: RawFd) -> Result<(), ScriptSupervisorError> {
+    pub(super) fn join_cgroup(
+        cgroup_fd: RawFd,
+        already_in_cgroup: bool,
+    ) -> Result<(), ScriptSupervisorError> {
         if cgroup_fd < 0 {
             return Err(ScriptSupervisorError::Protocol(
                 "invalid inherited cgroup descriptor".to_string(),
@@ -3078,14 +3311,14 @@ mod linux {
         // descriptor. Borrow it here so the caller can restore FD_CLOEXEC
         // immediately after joining, preventing the target script from
         // inheriting cgroup control authority.
-        let pid = format!("{}\n", std::process::id());
-        write_control(cgroup_fd, "cgroup.procs", pid.as_bytes())?;
-        // A child cgroup alone is not an inescapable boundary for a process
-        // running as the same delegated user: it may be able to write an
-        // ancestor cgroup.procs. Root a new cgroup namespace at the retained
-        // leaf before acknowledging readiness. If the kernel/user namespace
-        // policy disallows this, the supervisor kills this launcher and uses
-        // the explicitly weaker subreaper backend instead.
+        if !already_in_cgroup {
+            let pid = format!("{}\n", std::process::id());
+            write_control(cgroup_fd, "cgroup.procs", pid.as_bytes())?;
+        }
+        // Direct placement does not prevent migration to an ancestor. With
+        // nsdelegate verified and the caller's capability checked, root a
+        // cgroup namespace at the retained leaf before acknowledging readiness.
+        // A denied unshare leaves user code behind the exec gate.
         let namespace = unsafe { libc::unshare(libc::CLONE_NEWCGROUP) };
         if namespace != 0 {
             return Err(ScriptSupervisorError::Internal(format!(
@@ -3093,6 +3326,11 @@ mod linux {
                 io::Error::last_os_error()
             )));
         }
+        drop_cgroup_namespace_escape_capability().map_err(|error| {
+            ScriptSupervisorError::Internal(format!(
+                "cannot revoke cgroup namespace escape authority before script release: {error}"
+            ))
+        })?;
         Ok(())
     }
 
@@ -3212,7 +3450,12 @@ mod linux {
                 Some("supervisor fallback was explicitly selected".to_string()),
             ),
             ContainmentPreference::Auto | ContainmentPreference::RequireLinuxCgroupV2 => {
-                match CgroupLeaf::create(&spec.token) {
+                // Direct cgroup placement does not grant CLONE_NEWCGROUP's
+                // CAP_SYS_ADMIN prerequisite. If it cannot possibly arm,
+                // avoid the create/clone/fail/cleanup cost altogether.
+                let leaf = kernel_cgroup_prerequisites()
+                    .and_then(|()| CgroupLeaf::create(&spec.token));
+                match leaf {
                     Ok(leaf) => run_cgroup(
                         spec,
                         control_fd,
@@ -3280,7 +3523,6 @@ mod linux {
                 return Err(supervision_error_with_cleanup(error.into(), cleanup));
             }
         };
-        let mut tracked = BTreeSet::from([root]);
         let mut launch_channel = launch_channel;
         if let Err(readiness_error) = wait_launcher_ready(&mut launch_channel) {
             let mut cleanup = emergency_kill_child_group(&mut child);
@@ -3324,10 +3566,7 @@ mod linux {
                 event_fd,
                 TerminationReason::ParentDisconnected,
                 &leaf,
-                root.pid,
-                supervisor_pid,
                 &mut child,
-                &mut tracked,
                 &mut raw_wait_status,
             )?;
             let raw_wait_status = complete_leader_wait(event_fd, &mut child, raw_wait_status)?;
@@ -3358,10 +3597,7 @@ mod linux {
                 event_fd,
                 reason,
                 &leaf,
-                root.pid,
-                supervisor_pid,
                 &mut child,
-                &mut tracked,
                 &mut raw_wait_status,
             )?;
             let raw_wait_status = complete_leader_wait(event_fd, &mut child, raw_wait_status)?;
@@ -3395,14 +3631,12 @@ mod linux {
         let mut leader_exited_at: Option<Instant> = None;
         loop {
             observe_leader_exit(event_fd, &mut child, &mut raw_wait_status)?;
-            refresh_linux_tree(
-                root.pid,
-                supervisor_pid,
-                raw_wait_status.is_some(),
-                &mut tracked,
-            )?;
+            // The cgroup namespace was rooted at this leaf before exec.
+            // Its kernel-maintained populated bit accounts for all descendants,
+            // including double-forks and changed process groups. /proc tree
+            // enumeration here would add host-wide work to every 10 ms tick.
             let populated = leaf.populated()?;
-            if raw_wait_status.is_some() && !populated && tracked.is_empty() {
+            if raw_wait_status.is_some() && !populated {
                 emit_containment_empty(event_fd, ContainmentConfidence::KernelEnforced)?;
                 break;
             }
@@ -3414,10 +3648,7 @@ mod linux {
                         event_fd,
                         TerminationReason::LeaderExitedWithDescendants,
                         &leaf,
-                        root.pid,
-                        supervisor_pid,
                         &mut child,
-                        &mut tracked,
                         &mut raw_wait_status,
                     )?);
                     break;
@@ -3434,10 +3665,7 @@ mod linux {
                     event_fd,
                     reason,
                     &leaf,
-                    root.pid,
-                    supervisor_pid,
                     &mut child,
-                    &mut tracked,
                     &mut raw_wait_status,
                 )?);
                 break;
@@ -3448,10 +3676,7 @@ mod linux {
                     event_fd,
                     TerminationReason::Timeout,
                     &leaf,
-                    root.pid,
-                    supervisor_pid,
                     &mut child,
-                    &mut tracked,
                     &mut raw_wait_status,
                 )?);
                 break;
@@ -3499,12 +3724,18 @@ mod linux {
         event_fd: RawFd,
         reason: TerminationReason,
         leaf: &CgroupLeaf,
-        root_pgid: i32,
-        supervisor_pid: i32,
         child: &mut LauncherChild,
-        tracked: &mut BTreeSet<ProcessIdentity>,
         raw_wait_status: &mut Option<i32>,
     ) -> Result<TerminationSummary, ScriptSupervisorError> {
+        // Keep descendant identities for the exceptional termination path.
+        // cgroup.kill is recursive on modern kernels, but older/delegated
+        // kernels may fall back to signalling cgroup.procs. Descendant PIDFD
+        // signalling also reaches members in nested child cgroups, as before.
+        // There is no need to scan this tree while a tool is running normally.
+        let mut tracked = BTreeSet::new();
+        let root_pgid = child.id() as i32;
+        let supervisor_pid = std::process::id() as i32;
+        refresh_linux_tree(root_pgid, supervisor_pid, raw_wait_status.is_some(), &mut tracked)?;
         let graceful_deadline_unix_millis = graceful_deadline_unix_millis();
         emit_lifecycle_best_effort(
             event_fd,
@@ -3516,11 +3747,11 @@ mod linux {
         );
         signal_process_group(child.id(), libc::SIGTERM);
         leaf.signal_members(libc::SIGTERM)?;
-        signal_identities(tracked, libc::SIGTERM)?;
+        signal_identities(&tracked, libc::SIGTERM)?;
         let term_deadline = Instant::now() + TERM_GRACE;
         while Instant::now() < term_deadline {
             observe_leader_exit(event_fd, child, raw_wait_status)?;
-            refresh_linux_tree(root_pgid, supervisor_pid, raw_wait_status.is_some(), tracked)?;
+            refresh_linux_tree(root_pgid, supervisor_pid, raw_wait_status.is_some(), &mut tracked)?;
             if !leaf.populated()? && tracked.is_empty() {
                 reap_waitable_children_recording_leader(event_fd, child, raw_wait_status);
                 emit_containment_empty(event_fd, ContainmentConfidence::KernelEnforced)?;
@@ -3531,7 +3762,7 @@ mod linux {
                 });
             }
             leaf.signal_members(libc::SIGTERM)?;
-            signal_identities(tracked, libc::SIGTERM)?;
+            signal_identities(&tracked, libc::SIGTERM)?;
             thread::sleep(CONTROL_POLL_INTERVAL);
         }
 
@@ -3544,11 +3775,11 @@ mod linux {
         );
         leaf.kill_all()?;
         signal_process_group(child.id(), libc::SIGKILL);
-        signal_identities(tracked, libc::SIGKILL)?;
+        signal_identities(&tracked, libc::SIGKILL)?;
         let kill_deadline = Instant::now() + KILL_GRACE;
         while Instant::now() < kill_deadline {
             observe_leader_exit(event_fd, child, raw_wait_status)?;
-            refresh_linux_tree(root_pgid, supervisor_pid, raw_wait_status.is_some(), tracked)?;
+            refresh_linux_tree(root_pgid, supervisor_pid, raw_wait_status.is_some(), &mut tracked)?;
             if !leaf.populated()? && tracked.is_empty() {
                 reap_waitable_children_recording_leader(event_fd, child, raw_wait_status);
                 emit_containment_empty(event_fd, ContainmentConfidence::KernelEnforced)?;
@@ -3559,7 +3790,7 @@ mod linux {
                 });
             }
             let _ = leaf.kill_all();
-            signal_identities(tracked, libc::SIGKILL)?;
+            signal_identities(&tracked, libc::SIGKILL)?;
             thread::sleep(CONTROL_POLL_INTERVAL);
         }
         Err(ScriptSupervisorError::Internal(
@@ -3709,15 +3940,18 @@ mod linux {
         let mut leader_exited_at: Option<Instant> = None;
         loop {
             observe_leader_exit(event_fd, &mut child, &mut raw_wait_status)?;
-            refresh_linux_tree(
-                root.pid,
-                supervisor_pid,
-                raw_wait_status.is_some(),
-                &mut tracked,
-            )?;
-            if raw_wait_status.is_some() && tracked.is_empty() {
-                emit_containment_empty(event_fd, ContainmentConfidence::ProcessTreeObserved)?;
-                break;
+            // Before the leader exits, the dedicated subreaper owns its
+            // descendant lineage. At leader exit, remaining descendants are
+            // reparented to it by the kernel. Discovery is needed at that
+            // boundary and during termination, not ten times a second for
+            // every second of normal tool execution. This matters on kernels
+            // without /proc/<tid>/children, which require the global fallback.
+            if raw_wait_status.is_some() {
+                refresh_linux_tree(root.pid, supervisor_pid, true, &mut tracked)?;
+                if tracked.is_empty() {
+                    emit_containment_empty(event_fd, ContainmentConfidence::ProcessTreeObserved)?;
+                    break;
+                }
             }
             if raw_wait_status.is_some() {
                 let exited_at = leader_exited_at.get_or_insert_with(Instant::now);
@@ -3858,7 +4092,14 @@ mod linux {
         root_reaped: bool,
         tracked: &mut BTreeSet<ProcessIdentity>,
     ) -> io::Result<()> {
-        let snapshot = process_snapshot()?;
+        // The helper is a single-purpose child subreaper. All descendants
+        // either remain beneath one of its children or are adopted by it.
+        // Enumerating task/*/children is independent of unrelated host PIDs.
+        // Retain the whole-/proc implementation for procfs without children.
+        let snapshot = match descendant_snapshot(supervisor_pid) {
+            Ok(snapshot) => snapshot,
+            Err(_) => process_snapshot()?,
+        };
         let by_pid: BTreeMap<i32, ProcessInfo> =
             snapshot.into_iter().map(|info| (info.identity.pid, info)).collect();
         tracked.retain(|identity| {
@@ -3925,6 +4166,73 @@ mod linux {
                         Some(libc::ENOENT) | Some(libc::ESRCH) | Some(libc::EACCES)
                     ) => {}
                 Err(error) => return Err(error),
+            }
+        }
+        Ok(result)
+    }
+
+    pub(super) fn descendant_snapshot(supervisor_pid: i32) -> io::Result<Vec<ProcessInfo>> {
+        let mut visited = BTreeSet::new();
+        let mut pending = VecDeque::from([supervisor_pid]);
+        let mut result = Vec::new();
+        while let Some(parent) = pending.pop_front() {
+            let tasks = match fs::read_dir(format!("/proc/{parent}/task")) {
+                Ok(tasks) => tasks,
+                Err(error)
+                    if matches!(error.raw_os_error(), Some(libc::ENOENT) | Some(libc::ESRCH)) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            for task in tasks {
+                let task = task?;
+                let name = task.file_name();
+                let Some(tid) = name.to_str().and_then(|text| text.parse::<i32>().ok()) else {
+                    continue;
+                };
+                let children = match fs::read_to_string(format!(
+                    "/proc/{parent}/task/{tid}/children"
+                )) {
+                    Ok(text) => text,
+                    Err(error)
+                        if matches!(error.raw_os_error(), Some(libc::ENOENT) | Some(libc::ESRCH)) =>
+                    {
+                        // Some Linux builds omit CONFIG_PROC_CHILDREN. A
+                        // missing children file on a still-live task means
+                        // "interface unavailable", not "no descendants".
+                        // Revert to the global PID/start-time snapshot rather
+                        // than falsely reporting containment empty.
+                        if fs::metadata(format!("/proc/{parent}/task/{tid}")).is_ok() {
+                            return Err(error);
+                        }
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                for value in children.split_whitespace() {
+                    let pid = value.parse::<i32>().map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "malformed procfs children PID")
+                    })?;
+                    if !visited.insert(pid) {
+                        continue;
+                    }
+                    match process_info(pid) {
+                        Ok(Some(info)) => {
+                            if info.state != b'Z' {
+                                pending.push_back(pid);
+                            }
+                            result.push(info);
+                        }
+                        Ok(None) => {}
+                        Err(error)
+                            if matches!(
+                                error.raw_os_error(),
+                                Some(libc::ENOENT) | Some(libc::ESRCH) | Some(libc::EACCES)
+                            ) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
             }
         }
         Ok(result)
@@ -5411,6 +5719,101 @@ mod tests {
         assert_eq!(parsed.parent, 41);
         assert_eq!(parsed.group, 77);
         assert_eq!(parsed.state, b'S');
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_descendant_snapshot_finds_grandchildren_without_host_scan() {
+        let self_pid = std::process::id();
+        let children_file = format!("/proc/{self_pid}/task/{self_pid}/children");
+        if !Path::new(&children_file).exists() {
+            assert!(
+                linux::descendant_snapshot(self_pid as i32).is_err(),
+                "missing procfs children must activate the full-table fallback"
+            );
+            return;
+        }
+        // A long-lived grandchild is not necessarily in the leader's original
+        // process group. The descendant path must follow task/children rather
+        // than relying on the process-group identity alone.
+        let mut shell = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 3 & wait")
+            .stdin(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("spawn descendant fixture");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut found = false;
+        while Instant::now() < deadline {
+            let snapshot = linux::descendant_snapshot(std::process::id() as i32)
+                .expect("read procfs task children");
+            found = snapshot.iter().any(|entry| {
+                entry.parent == shell.id() as i32 && entry.state != b'Z'
+            });
+            if found {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        // The fixture owns its process group, so cleanup includes the sleep
+        // grandchild even when an assertion fails to find it.
+        unsafe { libc::kill(-(shell.id() as i32), libc::SIGKILL) };
+        let _ = shell.wait();
+        assert!(found, "subprocess grandchild must be discoverable via procfs children");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_cgroup_prerequisites_reject_missing_capability_and_nsdelegate() {
+        assert!(linux::require_cgroup_namespace_capabilities(
+            "CapEff:\t0000000000000000\n"
+        ).unwrap_err().contains("CAP_SYS_ADMIN"));
+        assert!(linux::require_cgroup_namespace_capabilities(
+            "CapEff:\t0000000000200000\n"
+        ).unwrap_err().contains("CAP_SETPCAP"));
+        assert!(linux::require_cgroup_namespace_capabilities(
+            "Name:\tthing\nCapEff:\t0000000000200100\n"
+        ).is_ok());
+        assert!(linux::require_cgroup_namespace_capabilities(
+            "CapEff:\tbroken\n"
+        ).is_err());
+        assert!(linux::require_cgroup_namespace_capabilities(
+            "CapPrm:\t0000000000200100\n"
+        ).is_err());
+        let delegated = "19 22 0:22 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime - cgroup2 cgroup rw,nsdelegate,memory_recursiveprot\n";
+        assert!(linux::is_nsdelegated_cgroup_mount(delegated));
+        assert!(!linux::is_nsdelegated_cgroup_mount(&delegated.replace("nsdelegate,", "")));
+        assert!(linux::is_nsdelegated_cgroup_mount("19 22 0:22 / /cgroup2 rw - cgroup2 cgroup rw,nsdelegate\n"));
+        // The first cgroup2 mount is the one current_cgroup_directory uses.
+        assert!(!linux::is_nsdelegated_cgroup_mount(&format!(
+            "19 22 0:22 / /cgroup2 rw - cgroup2 cgroup rw\n{delegated}"
+        )));
+    }
+
+    #[test]
+    fn lifecycle_poll_wakes_for_data_and_disables_hangup_spin() {
+        let (mut channel, mut peer) = UnixStream::pair().expect("socket pair");
+        let mut pollable = true;
+        peer.write_all(b"R").expect("queued lifecycle byte");
+        wait_for_lifecycle_activity(&channel, &mut pollable).expect("poll readable event");
+        assert!(pollable, "a readable peer is still active");
+        let mut byte = [0_u8; 1];
+        channel.read_exact(&mut byte).expect("drain lifecycle byte");
+        assert_eq!(byte[0], b'R');
+        drop(peer);
+        wait_for_lifecycle_activity(&channel, &mut pollable).expect("poll hung-up event");
+        assert!(!pollable, "a hung-up socket must not be polled in a tight loop");
+        wait_for_lifecycle_activity(&channel, &mut pollable).expect("bounded wait after hangup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_clone3_requires_a_valid_leaf_descriptor() {
+        // This is intentionally a negative test: a successful clone would
+        // spawn a second copy of the test harness. The kernel must reject an
+        // invalid leaf, or the syscall may be disabled by sandbox policy.
+        assert!(linux::clone_into_cgroup(-1).is_err());
     }
 
     #[test]

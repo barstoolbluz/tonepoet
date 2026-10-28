@@ -1,0 +1,725 @@
+--- a/src/convert/script_supervisor.rs
++++ b/src/convert/script_supervisor.rs
+@@ -9,11 +9,13 @@
+ //! ownership to a process which has no unrelated children.
+ //!
+ //! Linux prefers a delegated cgroup-v2 leaf and also makes the dedicated
+-//! helper a child subreaper.  A minimal hidden launcher joins the retained
+-//! cgroup descriptor before it receives the authenticated invocation, so the
+-//! target script cannot execute or fork outside the armed containment boundary.
+-//! If cgroup delegation is unavailable, the subreaper tracks the complete
+-//! `/proc` descendant graph with PID start-time validation.  On macOS the helper
++//! helper a child subreaper. The gated launcher enters the leaf atomically at
++//! clone3 when supported, otherwise it migrates before script release. A
++//! private cgroup namespace prevents the script from leaving its leaf.
++//! Kernel cgroup occupancy provides the normal completion condition. Without
++//! delegation, the subreaper discovers descendants at exit/termination, using
++//! task-local procfs enumeration when available and PID-start-validated global
++//! procfs snapshots otherwise. On macOS the helper
+ //! arms EVFILT_PROC/NOTE_FORK before releasing an exec gate and combines those
+ //! notifications with libproc child enumeration and process start identities.
+ 
+@@ -1849,6 +1851,17 @@
+     cgroup_fd: Option<RawFd>,
+     script_fd: RawFd,
+ ) -> Result<(), ScriptSupervisorError> {
++    run_internal_launcher_with_placement(launch_fd, cgroup_fd, script_fd, false)
++}
++
++// clone3(CLONE_INTO_CGROUP) places the child in the retained leaf at creation.
++// The ordinary fork path still joins before reporting LAUNCHER_READY.
++fn run_internal_launcher_with_placement(
++    launch_fd: RawFd,
++    cgroup_fd: Option<RawFd>,
++    script_fd: RawFd,
++    already_in_cgroup: bool,
++) -> Result<(), ScriptSupervisorError> {
+     if launch_fd < 0 || script_fd < 0 {
+         return Err(ScriptSupervisorError::Protocol(
+             "invalid script-launch channel descriptor".to_string(),
+@@ -1856,7 +1869,7 @@
+     }
+     #[cfg(target_os = "linux")]
+     if let Some(cgroup_fd) = cgroup_fd {
+-        linux::join_cgroup(cgroup_fd)?;
++        linux::join_cgroup(cgroup_fd, already_in_cgroup)?;
+         // The directory capability is needed only to place this trusted
+         // launcher into the already-created leaf.  Restore close-on-exec
+         // before receiving the invocation so untrusted user code never
+@@ -1884,7 +1897,7 @@
+     clear_close_on_exec(script_file.as_raw_fd())?;
+     // The supervisor does not release any invocation bytes until this process
+     // has completed all platform containment setup.  In particular, Linux
+-    // sends this only after cgroup.procs accepted the launcher's PID.
++    // sends this only after kernel placement and namespace isolation succeed.
+     channel.write_all(&[LAUNCHER_READY])?;
+     let mut length_bytes = [0_u8; 4];
+     channel.read_exact(&mut length_bytes)?;
+@@ -2757,12 +2770,23 @@
+     let (release, launch_child) = UnixStream::pair()?;
+     // Every caller runs inside the dedicated single-threaded containment
+     // helper (or a single-threaded backend worker forked by the persistent
+-    // execution supervisor). Forking the tiny exec gate here avoids re-execing
++    // execution supervisor). Creating the tiny exec gate here avoids re-execing
+     // the full Tonepoet binary for every external command while preserving the
+     // same pre-release cgroup/session/process-group setup and retained-FD exec.
+     // Unrelated inherited supervisor descriptors stay CLOEXEC, so the final
+     // external exec sees the same descriptor boundary as the former re-exec gate.
+-    let pid = unsafe { libc::fork() };
++    #[cfg(target_os = "linux")]
++    let (pid, already_in_cgroup) = match cgroup_fd {
++        Some(fd) => match linux::clone_into_cgroup(fd) {
++            Ok(pid) => (pid, true),
++            // A blocked or unsupported clone3 must not weaken containment:
++            // the fork launcher will still join the leaf before release.
++            Err(_) => (unsafe { libc::fork() }, false),
++        },
++        None => (unsafe { libc::fork() }, false),
++    };
++    #[cfg(not(target_os = "linux"))]
++    let (pid, already_in_cgroup) = (unsafe { libc::fork() }, false);
+     if pid < 0 {
+         return Err(io::Error::last_os_error().into());
+     }
+@@ -2789,7 +2813,12 @@
+             Ok(())
+         });
+         if setup.is_ok() {
+-            let _ = run_internal_launcher(launch_fd, cgroup_fd, script_fd);
++            let _ = run_internal_launcher_with_placement(
++                launch_fd,
++                cgroup_fd,
++                script_fd,
++                already_in_cgroup,
++            );
+         }
+         unsafe { libc::_exit(70) };
+     }
+@@ -2882,6 +2911,26 @@
+     const PR_SET_PDEATHSIG: libc::c_int = 1;
+     const PR_SET_CHILD_SUBREAPER: libc::c_int = 36;
+ 
++    // Linux 5.7+ creates the gated launcher directly in its delegated leaf.
++    // This avoids a costly post-fork cgroup.procs migration. The zeroed clone3
++    // tail is part of the kernel ABI; do not use CLONE_VM or CLONE_THREAD here.
++    const CLONE_INTO_CGROUP: u64 = 1_u64 << 33;
++
++    pub(super) fn clone_into_cgroup(cgroup_fd: RawFd) -> io::Result<libc::pid_t> {
++        let mut args = [0_u64; 11];
++        args[0] = CLONE_INTO_CGROUP;
++        args[4] = libc::SIGCHLD as u64;
++        args[10] = cgroup_fd as u64;
++        let pid = unsafe {
++            libc::syscall(libc::SYS_clone3, args.as_ptr(), std::mem::size_of_val(&args))
++        };
++        if pid < 0 {
++            Err(io::Error::last_os_error())
++        } else {
++            Ok(pid as libc::pid_t)
++        }
++    }
++
+     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+     pub(super) struct ProcessIdentity {
+         pub(super) pid: i32,
+@@ -3068,7 +3117,10 @@
+         }
+     }
+ 
+-    pub(super) fn join_cgroup(cgroup_fd: RawFd) -> Result<(), ScriptSupervisorError> {
++    pub(super) fn join_cgroup(
++        cgroup_fd: RawFd,
++        already_in_cgroup: bool,
++    ) -> Result<(), ScriptSupervisorError> {
+         if cgroup_fd < 0 {
+             return Err(ScriptSupervisorError::Protocol(
+                 "invalid inherited cgroup descriptor".to_string(),
+@@ -3078,8 +3130,10 @@
+         // descriptor. Borrow it here so the caller can restore FD_CLOEXEC
+         // immediately after joining, preventing the target script from
+         // inheriting cgroup control authority.
+-        let pid = format!("{}\n", std::process::id());
+-        write_control(cgroup_fd, "cgroup.procs", pid.as_bytes())?;
++        if !already_in_cgroup {
++            let pid = format!("{}\n", std::process::id());
++            write_control(cgroup_fd, "cgroup.procs", pid.as_bytes())?;
++        }
+         // A child cgroup alone is not an inescapable boundary for a process
+         // running as the same delegated user: it may be able to write an
+         // ancestor cgroup.procs. Root a new cgroup namespace at the retained
+@@ -3280,7 +3334,6 @@
+                 return Err(supervision_error_with_cleanup(error.into(), cleanup));
+             }
+         };
+-        let mut tracked = BTreeSet::from([root]);
+         let mut launch_channel = launch_channel;
+         if let Err(readiness_error) = wait_launcher_ready(&mut launch_channel) {
+             let mut cleanup = emergency_kill_child_group(&mut child);
+@@ -3324,10 +3377,7 @@
+                 event_fd,
+                 TerminationReason::ParentDisconnected,
+                 &leaf,
+-                root.pid,
+-                supervisor_pid,
+                 &mut child,
+-                &mut tracked,
+                 &mut raw_wait_status,
+             )?;
+             let raw_wait_status = complete_leader_wait(event_fd, &mut child, raw_wait_status)?;
+@@ -3358,10 +3408,7 @@
+                 event_fd,
+                 reason,
+                 &leaf,
+-                root.pid,
+-                supervisor_pid,
+                 &mut child,
+-                &mut tracked,
+                 &mut raw_wait_status,
+             )?;
+             let raw_wait_status = complete_leader_wait(event_fd, &mut child, raw_wait_status)?;
+@@ -3395,14 +3442,12 @@
+         let mut leader_exited_at: Option<Instant> = None;
+         loop {
+             observe_leader_exit(event_fd, &mut child, &mut raw_wait_status)?;
+-            refresh_linux_tree(
+-                root.pid,
+-                supervisor_pid,
+-                raw_wait_status.is_some(),
+-                &mut tracked,
+-            )?;
++            // The cgroup namespace was rooted at this leaf before exec.
++            // Its kernel-maintained populated bit accounts for all descendants,
++            // including double-forks and changed process groups. /proc tree
++            // enumeration here would add host-wide work to every 10 ms tick.
+             let populated = leaf.populated()?;
+-            if raw_wait_status.is_some() && !populated && tracked.is_empty() {
++            if raw_wait_status.is_some() && !populated {
+                 emit_containment_empty(event_fd, ContainmentConfidence::KernelEnforced)?;
+                 break;
+             }
+@@ -3414,10 +3459,7 @@
+                         event_fd,
+                         TerminationReason::LeaderExitedWithDescendants,
+                         &leaf,
+-                        root.pid,
+-                        supervisor_pid,
+                         &mut child,
+-                        &mut tracked,
+                         &mut raw_wait_status,
+                     )?);
+                     break;
+@@ -3434,10 +3476,7 @@
+                     event_fd,
+                     reason,
+                     &leaf,
+-                    root.pid,
+-                    supervisor_pid,
+                     &mut child,
+-                    &mut tracked,
+                     &mut raw_wait_status,
+                 )?);
+                 break;
+@@ -3448,10 +3487,7 @@
+                     event_fd,
+                     TerminationReason::Timeout,
+                     &leaf,
+-                    root.pid,
+-                    supervisor_pid,
+                     &mut child,
+-                    &mut tracked,
+                     &mut raw_wait_status,
+                 )?);
+                 break;
+@@ -3499,12 +3535,18 @@
+         event_fd: RawFd,
+         reason: TerminationReason,
+         leaf: &CgroupLeaf,
+-        root_pgid: i32,
+-        supervisor_pid: i32,
+         child: &mut LauncherChild,
+-        tracked: &mut BTreeSet<ProcessIdentity>,
+         raw_wait_status: &mut Option<i32>,
+     ) -> Result<TerminationSummary, ScriptSupervisorError> {
++        // Keep descendant identities for the exceptional termination path.
++        // cgroup.kill is recursive on modern kernels, but older/delegated
++        // kernels may fall back to signalling cgroup.procs. Descendant PIDFD
++        // signalling also reaches members in nested child cgroups, as before.
++        // There is no need to scan this tree while a tool is running normally.
++        let mut tracked = BTreeSet::new();
++        let root_pgid = child.id() as i32;
++        let supervisor_pid = std::process::id() as i32;
++        refresh_linux_tree(root_pgid, supervisor_pid, raw_wait_status.is_some(), &mut tracked)?;
+         let graceful_deadline_unix_millis = graceful_deadline_unix_millis();
+         emit_lifecycle_best_effort(
+             event_fd,
+@@ -3516,11 +3558,11 @@
+         );
+         signal_process_group(child.id(), libc::SIGTERM);
+         leaf.signal_members(libc::SIGTERM)?;
+-        signal_identities(tracked, libc::SIGTERM)?;
++        signal_identities(&tracked, libc::SIGTERM)?;
+         let term_deadline = Instant::now() + TERM_GRACE;
+         while Instant::now() < term_deadline {
+             observe_leader_exit(event_fd, child, raw_wait_status)?;
+-            refresh_linux_tree(root_pgid, supervisor_pid, raw_wait_status.is_some(), tracked)?;
++            refresh_linux_tree(root_pgid, supervisor_pid, raw_wait_status.is_some(), &mut tracked)?;
+             if !leaf.populated()? && tracked.is_empty() {
+                 reap_waitable_children_recording_leader(event_fd, child, raw_wait_status);
+                 emit_containment_empty(event_fd, ContainmentConfidence::KernelEnforced)?;
+@@ -3531,7 +3573,7 @@
+                 });
+             }
+             leaf.signal_members(libc::SIGTERM)?;
+-            signal_identities(tracked, libc::SIGTERM)?;
++            signal_identities(&tracked, libc::SIGTERM)?;
+             thread::sleep(CONTROL_POLL_INTERVAL);
+         }
+ 
+@@ -3544,11 +3586,11 @@
+         );
+         leaf.kill_all()?;
+         signal_process_group(child.id(), libc::SIGKILL);
+-        signal_identities(tracked, libc::SIGKILL)?;
++        signal_identities(&tracked, libc::SIGKILL)?;
+         let kill_deadline = Instant::now() + KILL_GRACE;
+         while Instant::now() < kill_deadline {
+             observe_leader_exit(event_fd, child, raw_wait_status)?;
+-            refresh_linux_tree(root_pgid, supervisor_pid, raw_wait_status.is_some(), tracked)?;
++            refresh_linux_tree(root_pgid, supervisor_pid, raw_wait_status.is_some(), &mut tracked)?;
+             if !leaf.populated()? && tracked.is_empty() {
+                 reap_waitable_children_recording_leader(event_fd, child, raw_wait_status);
+                 emit_containment_empty(event_fd, ContainmentConfidence::KernelEnforced)?;
+@@ -3559,7 +3601,7 @@
+                 });
+             }
+             let _ = leaf.kill_all();
+-            signal_identities(tracked, libc::SIGKILL)?;
++            signal_identities(&tracked, libc::SIGKILL)?;
+             thread::sleep(CONTROL_POLL_INTERVAL);
+         }
+         Err(ScriptSupervisorError::Internal(
+@@ -3709,15 +3751,18 @@
+         let mut leader_exited_at: Option<Instant> = None;
+         loop {
+             observe_leader_exit(event_fd, &mut child, &mut raw_wait_status)?;
+-            refresh_linux_tree(
+-                root.pid,
+-                supervisor_pid,
+-                raw_wait_status.is_some(),
+-                &mut tracked,
+-            )?;
+-            if raw_wait_status.is_some() && tracked.is_empty() {
+-                emit_containment_empty(event_fd, ContainmentConfidence::ProcessTreeObserved)?;
+-                break;
++            // Before the leader exits, the dedicated subreaper owns its
++            // descendant lineage. At leader exit, remaining descendants are
++            // reparented to it by the kernel. Discovery is needed at that
++            // boundary and during termination, not ten times a second for
++            // every second of normal tool execution. This matters on kernels
++            // without /proc/<tid>/children, which require the global fallback.
++            if raw_wait_status.is_some() {
++                refresh_linux_tree(root.pid, supervisor_pid, true, &mut tracked)?;
++                if tracked.is_empty() {
++                    emit_containment_empty(event_fd, ContainmentConfidence::ProcessTreeObserved)?;
++                    break;
++                }
+             }
+             if raw_wait_status.is_some() {
+                 let exited_at = leader_exited_at.get_or_insert_with(Instant::now);
+@@ -3858,7 +3903,14 @@
+         root_reaped: bool,
+         tracked: &mut BTreeSet<ProcessIdentity>,
+     ) -> io::Result<()> {
+-        let snapshot = process_snapshot()?;
++        // The helper is a single-purpose child subreaper. All descendants
++        // either remain beneath one of its children or are adopted by it.
++        // Enumerating task/*/children is independent of unrelated host PIDs.
++        // Retain the whole-/proc implementation for procfs without children.
++        let snapshot = match descendant_snapshot(supervisor_pid) {
++            Ok(snapshot) => snapshot,
++            Err(_) => process_snapshot()?,
++        };
+         let by_pid: BTreeMap<i32, ProcessInfo> =
+             snapshot.into_iter().map(|info| (info.identity.pid, info)).collect();
+         tracked.retain(|identity| {
+@@ -3930,6 +3982,73 @@
+         Ok(result)
+     }
+ 
++    pub(super) fn descendant_snapshot(supervisor_pid: i32) -> io::Result<Vec<ProcessInfo>> {
++        let mut visited = BTreeSet::new();
++        let mut pending = VecDeque::from([supervisor_pid]);
++        let mut result = Vec::new();
++        while let Some(parent) = pending.pop_front() {
++            let tasks = match fs::read_dir(format!("/proc/{parent}/task")) {
++                Ok(tasks) => tasks,
++                Err(error)
++                    if matches!(error.raw_os_error(), Some(libc::ENOENT) | Some(libc::ESRCH)) =>
++                {
++                    continue;
++                }
++                Err(error) => return Err(error),
++            };
++            for task in tasks {
++                let task = task?;
++                let name = task.file_name();
++                let Some(tid) = name.to_str().and_then(|text| text.parse::<i32>().ok()) else {
++                    continue;
++                };
++                let children = match fs::read_to_string(format!(
++                    "/proc/{parent}/task/{tid}/children"
++                )) {
++                    Ok(text) => text,
++                    Err(error)
++                        if matches!(error.raw_os_error(), Some(libc::ENOENT) | Some(libc::ESRCH)) =>
++                    {
++                        // Some Linux builds omit CONFIG_PROC_CHILDREN. A
++                        // missing children file on a still-live task means
++                        // "interface unavailable", not "no descendants".
++                        // Revert to the global PID/start-time snapshot rather
++                        // than falsely reporting containment empty.
++                        if fs::metadata(format!("/proc/{parent}/task/{tid}")).is_ok() {
++                            return Err(error);
++                        }
++                        continue;
++                    }
++                    Err(error) => return Err(error),
++                };
++                for value in children.split_whitespace() {
++                    let pid = value.parse::<i32>().map_err(|_| {
++                        io::Error::new(io::ErrorKind::InvalidData, "malformed procfs children PID")
++                    })?;
++                    if !visited.insert(pid) {
++                        continue;
++                    }
++                    match process_info(pid) {
++                        Ok(Some(info)) => {
++                            if info.state != b'Z' {
++                                pending.push_back(pid);
++                            }
++                            result.push(info);
++                        }
++                        Ok(None) => {}
++                        Err(error)
++                            if matches!(
++                                error.raw_os_error(),
++                                Some(libc::ENOENT) | Some(libc::ESRCH) | Some(libc::EACCES)
++                            ) => {}
++                        Err(error) => return Err(error),
++                    }
++                }
++            }
++        }
++        Ok(result)
++    }
++
+     pub(super) fn process_identity(pid: i32) -> io::Result<Option<ProcessIdentity>> {
+         Ok(process_info(pid)?.map(|info| info.identity))
+     }
+@@ -5413,6 +5532,56 @@
+         assert_eq!(parsed.state, b'S');
+     }
+ 
++    #[cfg(target_os = "linux")]
++    #[test]
++    fn linux_descendant_snapshot_finds_grandchildren_without_host_scan() {
++        let self_pid = std::process::id();
++        let children_file = format!("/proc/{self_pid}/task/{self_pid}/children");
++        if !Path::new(&children_file).exists() {
++            assert!(
++                linux::descendant_snapshot(self_pid as i32).is_err(),
++                "missing procfs children must activate the full-table fallback"
++            );
++            return;
++        }
++        // A long-lived grandchild is not necessarily in the leader's original
++        // process group. The descendant path must follow task/children rather
++        // than relying on the process-group identity alone.
++        let mut shell = Command::new("/bin/sh")
++            .arg("-c")
++            .arg("sleep 3 & wait")
++            .process_group(0)
++            .spawn()
++            .expect("spawn descendant fixture");
++        let deadline = Instant::now() + Duration::from_secs(2);
++        let mut found = false;
++        while Instant::now() < deadline {
++            let snapshot = linux::descendant_snapshot(std::process::id() as i32)
++                .expect("read procfs task children");
++            found = snapshot.iter().any(|entry| {
++                entry.parent == shell.id() as i32 && entry.state != b'Z'
++            });
++            if found {
++                break;
++            }
++            thread::sleep(Duration::from_millis(10));
++        }
++        // The fixture owns its process group, so cleanup includes the sleep
++        // grandchild even when an assertion fails to find it.
++        unsafe { libc::kill(-(shell.id() as i32), libc::SIGKILL) };
++        let _ = shell.wait();
++        assert!(found, "subprocess grandchild must be discoverable via procfs children");
++    }
++
++    #[cfg(target_os = "linux")]
++    #[test]
++    fn linux_clone3_requires_a_valid_leaf_descriptor() {
++        // This is intentionally a negative test: a successful clone would
++        // spawn a second copy of the test harness. The kernel must reject an
++        // invalid leaf, or the syscall may be disabled by sandbox policy.
++        assert!(linux::clone_into_cgroup(-1).is_err());
++    }
++
+     #[test]
+     fn stable_process_identity_rejects_pid_reuse_evidence() {
+         let mut identity = supervisor_identity().expect("current process identity");
+--- a/src/tui/app.rs
++++ b/src/tui/app.rs
+@@ -17719,7 +17719,7 @@
+     /// image decode or protocol creation work. For Kitty/Ghostty, a separate
+     /// rate-limited retransmit generation can also rebuild protocol state from
+     /// cached decoded pixels after mouse-driven graphics-layer damage.
+-    pub fn prepare_image_preview_protocols(&mut self) {
++    pub fn prepare_image_preview_protocols(&mut self) -> bool {
+         // This must run before any preview path can wrap decoded pixels in a
+         // terminal protocol. In tmux/byobu it downgrades any cached Kitty picker
+         // state to Halfblocks and invalidates old protocol caches first.
+@@ -17759,7 +17759,7 @@
+         // No force_redraw — the next normal render cycle picks up the new
+         // protocol. force_redraw triggers terminal.clear() which causes a
+         // visible full-screen flash.
+-        let _ = changed;
++        changed
+     }
+ 
+     /// Establish the crash-safe durable boundary for a new conversion run.
+@@ -18061,11 +18061,40 @@
+         }
+     }
+ 
+-    /// Refresh the items snapshot from the manager
+-    pub fn refresh_items(&mut self) {
++    fn visible_queue_item_changed(old: &ConversionItem, new: &ConversionItem) -> bool {
++        old.id != new.id
++            || old.status != new.status
++            || old.selected != new.selected
++            || old.input_path != new.input_path
++            || old.output_path != new.output_path
++            || old.tracks_collapsed != new.tracks_collapsed
++            || old.closed_track_epochs != new.closed_track_epochs
++            || old.active_tracks.len() != new.active_tracks.len()
++            || old.active_tracks.iter().any(|(index, progress)| {
++                let Some(next) = new.active_tracks.get(index) else {
++                    return true;
++                };
++                progress.track_label != next.track_label
++                    || progress.step_description != next.step_description
++                    || progress.progress_fraction != next.progress_fraction
++                    || progress.epoch != next.epoch
++            })
++    }
++
++    /// Refresh the items snapshot from the manager. A changed snapshot is a
++    /// redraw signal even when no async TUI message was sent.
++    pub fn refresh_items(&mut self) -> bool {
+         if let Some(items) = self.manager.try_get_items_clone() {
++            let changed = self.items_snapshot.len() != items.len()
++                || self
++                    .items_snapshot
++                    .iter()
++                    .zip(&items)
++                    .any(|(old, new)| Self::visible_queue_item_changed(old, new));
+             self.items_snapshot = items;
++            return changed;
+         }
++        false
+     }
+ 
+     /// Ensure selected_index stays within bounds
+@@ -18383,6 +18412,28 @@
+     use crate::convert::{AudioFormat, ConversionOptions, FileFormat};
+     use std::path::PathBuf;
+ 
++    #[test]
++    fn redraw_detection_includes_individual_track_progress() {
++        use crate::convert::queue::TrackProgress;
++
++        let original = ConversionItem::default();
++        let mut changed = original.clone();
++        assert!(!AppState::visible_queue_item_changed(&original, &changed));
++        changed.active_tracks.insert(
++            1,
++            TrackProgress {
++                track_label: "track 1".to_string(),
++                step_description: "encoding".to_string(),
++                progress_fraction: 0.25,
++                epoch: 1,
++            },
++        );
++        assert!(AppState::visible_queue_item_changed(&original, &changed));
++        let previous = changed.clone();
++        changed.active_tracks.get_mut(&1).unwrap().progress_fraction = 0.5;
++        assert!(AppState::visible_queue_item_changed(&previous, &changed));
++    }
++
+     #[tokio::test]
+     async fn refresh_items_retains_last_good_snapshot_when_queue_is_write_locked() {
+         let mut app = AppState::new_for_test(TonepoetConfig::default());
+--- a/src/tui/event_loop.rs
++++ b/src/tui/event_loop.rs
+@@ -24,6 +24,40 @@
+ /// unbounded reducer batch.
+ const MAX_ASYNC_MESSAGES_PER_FRAME: usize = 32;
+ const DEAD_QUEUE_RECOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(5);
++// Timed app maintenance (status expiry, queue recovery, browse debounce) must
++// still run when no input arrives. Rendering a full terminal buffer on every
++// such timeout is unnecessary; a slow heartbeat covers changes that have no
++// explicit message or state-change signal.
++const IDLE_REDRAW_INTERVAL: Duration = Duration::from_secs(5);
++
++fn should_draw_frame(
++    requested: bool,
++    visible_state_changed: bool,
++    force_redraw: bool,
++    since_last_draw: Duration,
++) -> bool {
++    requested || visible_state_changed || force_redraw || since_last_draw >= IDLE_REDRAW_INTERVAL
++}
++
++#[cfg(test)]
++mod idle_redraw_tests {
++    use super::*;
++
++    #[test]
++    fn inactive_timeout_skips_draw_but_events_and_progress_draw_immediately() {
++        assert!(!should_draw_frame(false, false, false, Duration::from_millis(100)));
++        assert!(should_draw_frame(true, false, false, Duration::ZERO));
++        assert!(should_draw_frame(false, true, false, Duration::ZERO));
++        assert!(should_draw_frame(false, false, true, Duration::ZERO));
++        assert!(!should_draw_frame(
++            false,
++            false,
++            false,
++            IDLE_REDRAW_INTERVAL - Duration::from_millis(1)
++        ));
++        assert!(should_draw_frame(false, false, false, IDLE_REDRAW_INTERVAL));
++    }
++}
+ 
+ fn merge_recovered_queue_items(
+     app: &mut AppState,
+@@ -94,6 +128,8 @@
+     let mut deferred_browse_visible_messages: VecDeque<AppMessage> = VecDeque::new();
+     let mut pending_recovered_queue_items = VecDeque::new();
+     let mut last_dead_queue_recovery_attempt = Instant::now();
++    let mut redraw_requested = true;
++    let mut last_draw = Instant::now();
+ 
+     loop {
+         // Check whether terminal input is already queued before firing any
+@@ -119,6 +155,7 @@
+         let recovered_count =
+             merge_recovered_queue_items(app, &mut pending_recovered_queue_items);
+         if recovered_count > 0 {
++            redraw_requested = true;
+             app.save_queue();
+             app.set_status(format!(
+                 "Recovered {recovered_count} queue item{} from an ended session; interrupted conversions are available in Queue for Retry or removal",
+@@ -129,8 +166,11 @@
+         // 1. Refresh items from the manager. Startup journal recoveries and
+         // any queue left waiting behind a transient modal claim the serial
+         // execution slot as soon as presentation state permits.
++        let previous_status = app.status_message.as_ref().map(|(message, _)| message.clone());
++        let previous_screen = app.current_screen;
++        let previous_overlay = std::mem::discriminant(&app.active_overlay);
+         super::keybindings::maybe_start_next_file_transfer(app, &tx);
+-        app.refresh_items();
++        let items_changed = app.refresh_items();
+         app.clamp_selection();
+         app.clear_expired_status();
+         check_pending_browse_rename(app);
+@@ -184,24 +224,43 @@
+         // lets that draw retransmit immediately instead of showing one stale or
+         // missing frame. The post-draw prepare remains for first-time geometry
+         // discovery and resize/layout changes recorded during this draw.
+-        app.prepare_image_preview_protocols();
++        let image_changed = app.prepare_image_preview_protocols();
+         // `force_redraw` means the terminal diff buffer is suspected to be
+         // invalid and a full clear is required before drawing. Ordinary async
+         // reducer progress must not set it: the loop below uses a zero-timeout
+         // tick for prompt non-clearing redraws instead.
+-        if app.force_redraw {
+-            terminal.clear()?;
+-            app.force_redraw = false;
+-        }
+-        terminal.draw(|f| draw_ui(f, app))?;
+-        app.prepare_image_preview_protocols();
++        let status_changed = previous_status.as_deref()
++            != app.status_message.as_ref().map(|(message, _)| message.as_str());
++        if should_draw_frame(
++            redraw_requested,
++            items_changed
++                || status_changed
++                || image_changed
++                || app.current_screen != previous_screen
++                || std::mem::discriminant(&app.active_overlay) != previous_overlay,
++            app.force_redraw,
++            last_draw.elapsed(),
++        ) {
++            if app.force_redraw {
++                terminal.clear()?;
++                app.force_redraw = false;
++            }
++            terminal.draw(|f| draw_ui(f, app))?;
++            last_draw = Instant::now();
++            redraw_requested = false;
++        }
++        // Geometry discovered by this draw may complete a preview protocol.
++        // Mark the next iteration dirty without forcing a terminal clear.
++        redraw_requested |= app.prepare_image_preview_protocols();
+ 
+         // 3. Check quit
+         if app.should_quit {
+             if defer_quit_for_browse_archive_metadata(app, &tx) {
++                redraw_requested = true;
+                 continue;
+             }
+             if defer_quit_for_queued_file_transfers(app) {
++                redraw_requested = true;
+                 continue;
+             }
+             app.cancel_all_archive_listings();
+@@ -215,6 +274,7 @@
+                 app.should_quit = false;
+                 app.quit_after_browse_archive_repackage = true;
+                 app.set_status("quit deferred: waiting for archive save to finish".to_string());
++                redraw_requested = true;
+                 continue;
+             }
+             // Save queue before exiting
+@@ -230,6 +290,9 @@
+         // merges, folder classifications, or probe completions stutter scrolling.
+         let defer_visible_browse_work =
+             browse_visible_work_should_wait(app, input_waiting_at_frame_start);
++        let browse_work_can_change_view = !defer_visible_browse_work
++            && (app.browse.has_browse_deferred_work()
++                || app.browse.has_probe_cache_warm_backlog());
+         let (drained, reducer_work_ready_remains) = drain_async_messages_for_frame(
+             app,
+             &mut rx,
+@@ -239,6 +302,7 @@
+         );
+         let immediate_nonclearing_tick_needed =
+             needs_immediate_nonclearing_tick(drained, reducer_work_ready_remains);
++        redraw_requested |= immediate_nonclearing_tick_needed || browse_work_can_change_view;
+ 
+         // 5. Poll for crossterm events. Async messages and bounded reducer
+         // slices mutate app state after this frame's draw. Use a zero timeout
+@@ -251,6 +315,7 @@
+             Duration::from_millis(100)
+         };
+         if event::poll(poll_timeout)? {
++            redraw_requested = true;
+             match event::read()? {
+                 Event::Key(key) => handle_key(app, key, &tx),
+                 Event::Mouse(mouse) => handle_mouse(app, mouse, &tx),

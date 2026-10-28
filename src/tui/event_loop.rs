@@ -24,6 +24,40 @@ use super::text_input::TextInputState;
 /// unbounded reducer batch.
 const MAX_ASYNC_MESSAGES_PER_FRAME: usize = 32;
 const DEAD_QUEUE_RECOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+// Timed app maintenance (status expiry, queue recovery, browse debounce) must
+// still run when no input arrives. Rendering a full terminal buffer on every
+// such timeout is unnecessary; a slow heartbeat covers changes that have no
+// explicit message or state-change signal.
+const IDLE_REDRAW_INTERVAL: Duration = Duration::from_secs(5);
+
+fn should_draw_frame(
+    requested: bool,
+    visible_state_changed: bool,
+    force_redraw: bool,
+    since_last_draw: Duration,
+) -> bool {
+    requested || visible_state_changed || force_redraw || since_last_draw >= IDLE_REDRAW_INTERVAL
+}
+
+#[cfg(test)]
+mod idle_redraw_tests {
+    use super::*;
+
+    #[test]
+    fn inactive_timeout_skips_draw_but_events_and_progress_draw_immediately() {
+        assert!(!should_draw_frame(false, false, false, Duration::from_millis(100)));
+        assert!(should_draw_frame(true, false, false, Duration::ZERO));
+        assert!(should_draw_frame(false, true, false, Duration::ZERO));
+        assert!(should_draw_frame(false, false, true, Duration::ZERO));
+        assert!(!should_draw_frame(
+            false,
+            false,
+            false,
+            IDLE_REDRAW_INTERVAL - Duration::from_millis(1)
+        ));
+        assert!(should_draw_frame(false, false, false, IDLE_REDRAW_INTERVAL));
+    }
+}
 
 fn merge_recovered_queue_items(
     app: &mut AppState,
@@ -94,6 +128,8 @@ pub async fn run_app(
     let mut deferred_browse_visible_messages: VecDeque<AppMessage> = VecDeque::new();
     let mut pending_recovered_queue_items = VecDeque::new();
     let mut last_dead_queue_recovery_attempt = Instant::now();
+    let mut redraw_requested = true;
+    let mut last_draw = Instant::now();
 
     loop {
         // Check whether terminal input is already queued before firing any
@@ -119,6 +155,7 @@ pub async fn run_app(
         let recovered_count =
             merge_recovered_queue_items(app, &mut pending_recovered_queue_items);
         if recovered_count > 0 {
+            redraw_requested = true;
             app.save_queue();
             app.set_status(format!(
                 "Recovered {recovered_count} queue item{} from an ended session; interrupted conversions are available in Queue for Retry or removal",
@@ -129,8 +166,11 @@ pub async fn run_app(
         // 1. Refresh items from the manager. Startup journal recoveries and
         // any queue left waiting behind a transient modal claim the serial
         // execution slot as soon as presentation state permits.
+        let previous_status = app.status_message.as_ref().map(|(message, _)| message.clone());
+        let previous_screen = app.current_screen;
+        let previous_overlay = std::mem::discriminant(&app.active_overlay);
         super::keybindings::maybe_start_next_file_transfer(app, &tx);
-        app.refresh_items();
+        let items_changed = app.refresh_items();
         app.clamp_selection();
         app.clear_expired_status();
         check_pending_browse_rename(app);
@@ -184,24 +224,43 @@ pub async fn run_app(
         // lets that draw retransmit immediately instead of showing one stale or
         // missing frame. The post-draw prepare remains for first-time geometry
         // discovery and resize/layout changes recorded during this draw.
-        app.prepare_image_preview_protocols();
+        let image_changed = app.prepare_image_preview_protocols();
         // `force_redraw` means the terminal diff buffer is suspected to be
         // invalid and a full clear is required before drawing. Ordinary async
         // reducer progress must not set it: the loop below uses a zero-timeout
         // tick for prompt non-clearing redraws instead.
-        if app.force_redraw {
-            terminal.clear()?;
-            app.force_redraw = false;
+        let status_changed = previous_status.as_deref()
+            != app.status_message.as_ref().map(|(message, _)| message.as_str());
+        if should_draw_frame(
+            redraw_requested,
+            items_changed
+                || status_changed
+                || image_changed
+                || app.current_screen != previous_screen
+                || std::mem::discriminant(&app.active_overlay) != previous_overlay,
+            app.force_redraw,
+            last_draw.elapsed(),
+        ) {
+            if app.force_redraw {
+                terminal.clear()?;
+                app.force_redraw = false;
+            }
+            terminal.draw(|f| draw_ui(f, app))?;
+            last_draw = Instant::now();
+            redraw_requested = false;
         }
-        terminal.draw(|f| draw_ui(f, app))?;
-        app.prepare_image_preview_protocols();
+        // Geometry discovered by this draw may complete a preview protocol.
+        // Mark the next iteration dirty without forcing a terminal clear.
+        redraw_requested |= app.prepare_image_preview_protocols();
 
         // 3. Check quit
         if app.should_quit {
             if defer_quit_for_browse_archive_metadata(app, &tx) {
+                redraw_requested = true;
                 continue;
             }
             if defer_quit_for_queued_file_transfers(app) {
+                redraw_requested = true;
                 continue;
             }
             app.cancel_all_archive_listings();
@@ -215,6 +274,7 @@ pub async fn run_app(
                 app.should_quit = false;
                 app.quit_after_browse_archive_repackage = true;
                 app.set_status("quit deferred: waiting for archive save to finish".to_string());
+                redraw_requested = true;
                 continue;
             }
             // Save queue before exiting
@@ -230,6 +290,9 @@ pub async fn run_app(
         // merges, folder classifications, or probe completions stutter scrolling.
         let defer_visible_browse_work =
             browse_visible_work_should_wait(app, input_waiting_at_frame_start);
+        let browse_work_can_change_view = !defer_visible_browse_work
+            && (app.browse.has_browse_deferred_work()
+                || app.browse.has_probe_cache_warm_backlog());
         let (drained, reducer_work_ready_remains) = drain_async_messages_for_frame(
             app,
             &mut rx,
@@ -239,6 +302,7 @@ pub async fn run_app(
         );
         let immediate_nonclearing_tick_needed =
             needs_immediate_nonclearing_tick(drained, reducer_work_ready_remains);
+        redraw_requested |= immediate_nonclearing_tick_needed || browse_work_can_change_view;
 
         // 5. Poll for crossterm events. Async messages and bounded reducer
         // slices mutate app state after this frame's draw. Use a zero timeout
@@ -251,6 +315,7 @@ pub async fn run_app(
             Duration::from_millis(100)
         };
         if event::poll(poll_timeout)? {
+            redraw_requested = true;
             match event::read()? {
                 Event::Key(key) => handle_key(app, key, &tx),
                 Event::Mouse(mouse) => handle_mouse(app, mouse, &tx),

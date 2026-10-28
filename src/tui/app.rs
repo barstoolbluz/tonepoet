@@ -17719,7 +17719,7 @@ impl AppState {
     /// image decode or protocol creation work. For Kitty/Ghostty, a separate
     /// rate-limited retransmit generation can also rebuild protocol state from
     /// cached decoded pixels after mouse-driven graphics-layer damage.
-    pub fn prepare_image_preview_protocols(&mut self) {
+    pub fn prepare_image_preview_protocols(&mut self) -> bool {
         // This must run before any preview path can wrap decoded pixels in a
         // terminal protocol. In tmux/byobu it downgrades any cached Kitty picker
         // state to Halfblocks and invalidates old protocol caches first.
@@ -17759,7 +17759,7 @@ impl AppState {
         // No force_redraw — the next normal render cycle picks up the new
         // protocol. force_redraw triggers terminal.clear() which causes a
         // visible full-screen flash.
-        let _ = changed;
+        changed
     }
 
     /// Establish the crash-safe durable boundary for a new conversion run.
@@ -18061,11 +18061,40 @@ impl AppState {
         }
     }
 
-    /// Refresh the items snapshot from the manager
-    pub fn refresh_items(&mut self) {
+    fn visible_queue_item_changed(old: &ConversionItem, new: &ConversionItem) -> bool {
+        old.id != new.id
+            || old.status != new.status
+            || old.selected != new.selected
+            || old.input_path != new.input_path
+            || old.output_path != new.output_path
+            || old.tracks_collapsed != new.tracks_collapsed
+            || old.closed_track_epochs != new.closed_track_epochs
+            || old.active_tracks.len() != new.active_tracks.len()
+            || old.active_tracks.iter().any(|(index, progress)| {
+                let Some(next) = new.active_tracks.get(index) else {
+                    return true;
+                };
+                progress.track_label != next.track_label
+                    || progress.step_description != next.step_description
+                    || progress.progress_fraction != next.progress_fraction
+                    || progress.epoch != next.epoch
+            })
+    }
+
+    /// Refresh the items snapshot from the manager. A changed snapshot is a
+    /// redraw signal even when no async TUI message was sent.
+    pub fn refresh_items(&mut self) -> bool {
         if let Some(items) = self.manager.try_get_items_clone() {
+            let changed = self.items_snapshot.len() != items.len()
+                || self
+                    .items_snapshot
+                    .iter()
+                    .zip(&items)
+                    .any(|(old, new)| Self::visible_queue_item_changed(old, new));
             self.items_snapshot = items;
+            return changed;
         }
+        false
     }
 
     /// Ensure selected_index stays within bounds
@@ -18382,6 +18411,28 @@ mod queue_snapshot_contention_tests {
     use crate::config::TonepoetConfig;
     use crate::convert::{AudioFormat, ConversionOptions, FileFormat};
     use std::path::PathBuf;
+
+    #[test]
+    fn redraw_detection_includes_individual_track_progress() {
+        use crate::convert::queue::TrackProgress;
+
+        let original = ConversionItem::default();
+        let mut changed = original.clone();
+        assert!(!AppState::visible_queue_item_changed(&original, &changed));
+        changed.active_tracks.insert(
+            1,
+            TrackProgress {
+                track_label: "track 1".to_string(),
+                step_description: "encoding".to_string(),
+                progress_fraction: 0.25,
+                epoch: 1,
+            },
+        );
+        assert!(AppState::visible_queue_item_changed(&original, &changed));
+        let previous = changed.clone();
+        changed.active_tracks.get_mut(&1).unwrap().progress_fraction = 0.5;
+        assert!(AppState::visible_queue_item_changed(&previous, &changed));
+    }
 
     #[tokio::test]
     async fn refresh_items_retains_last_good_snapshot_when_queue_is_write_locked() {

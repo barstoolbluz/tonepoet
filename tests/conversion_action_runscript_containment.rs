@@ -363,6 +363,30 @@ fn forced_supervisor_fallback_is_explicit_and_operational() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn auto_falls_back_when_sys_admin_is_missing() {
+    let status = fs::read_to_string("/proc/self/status").expect("Linux capability status");
+    let Some(cap_eff) = status.lines().find_map(|line| {
+        line.strip_prefix("CapEff:")
+            .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
+    }) else {
+        panic!("could not parse effective Linux capabilities");
+    };
+    if cap_eff & (1 << 21) != 0 {
+        eprintln!("CAP_SYS_ADMIN is available; unprivileged fallback fixture skipped");
+        return;
+    }
+    let fixture = Fixture::new("printf fallback-ran");
+    let cancelled = AtomicBool::new(false);
+    let command = fixture.command(Vec::new(), Duration::from_secs(5));
+    let (outcome, _) = run_collect(&command, &cancelled).expect("automatic subreaper fallback");
+    assert_eq!(outcome.descriptor.backend, ContainmentBackend::LinuxSubreaper);
+    assert_eq!(outcome.stdout_tail, b"fallback-ran");
+    assert!(outcome.containment_empty);
+    assert!(outcome.descriptor.warning.as_deref().unwrap_or("").contains("CAP_SYS_ADMIN"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn required_cgroup_either_arms_without_control_fd_leak_or_fails_before_user_code() {
     let fixture = Fixture::new(
         r#"
@@ -372,11 +396,20 @@ for descriptor in /proc/self/fd/*; do
         *cgroup*) exit 88 ;;
     esac
 done
+# The launcher must drop authority that would let a privileged script
+# setns() back into its supervisor's namespace and escape the cgroup leaf.
+grep -E '^(CapEff|CapPrm|CapBnd|NoNewPrivs):' /proc/self/status
 printf ran > cgroup-ran
 "#,
     );
     let marker = fixture._temp.path().join("cgroup-ran");
     let cancelled = AtomicBool::new(false);
+    // The ordinary cross-host gate permits a documented pre-release denial.
+    // On a specially prepared host, require proof of the actual cgroup path.
+    let qualify_real_cgroup = std::env::var("TONEPOET_TEST_REQUIRE_CGROUP")
+        .ok()
+        .as_deref()
+        == Some("1");
     let mut command = fixture.command(Vec::new(), Duration::from_secs(5));
     command.containment_preference = ContainmentPreference::RequireLinuxCgroupV2;
     match run_collect(&command, &cancelled) {
@@ -384,8 +417,27 @@ printf ran > cgroup-ran
             assert_eq!(outcome.descriptor.backend, ContainmentBackend::LinuxCgroupV2);
             assert!(outcome.containment_empty);
             assert!(marker.exists());
+            let status = std::str::from_utf8(&outcome.stdout_tail)
+                .expect("cgroup script reported Linux capability status");
+            for field in ["CapEff", "CapPrm", "CapBnd"] {
+                let value = status
+                    .lines()
+                    .find_map(|line| line.strip_prefix(&format!("{field}:")))
+                    .expect("cgroup script omitted a capability field");
+                let bits = u64::from_str_radix(value.trim(), 16)
+                    .expect("cgroup script reported malformed capabilities");
+                assert_eq!(bits & (1 << 21), 0, "{field} retained CAP_SYS_ADMIN");
+            }
+            assert!(status.lines().any(|line| {
+                line.strip_prefix("NoNewPrivs:")
+                    .is_some_and(|value| value.trim() == "1")
+            }), "cgroup script must inherit no_new_privs");
         }
         Err(error) => {
+            assert!(
+                !qualify_real_cgroup,
+                "explicit positive cgroup qualification requires an armed backend: {error}"
+            );
             assert!(error.to_string().contains("cgroup"));
             assert!(!marker.exists());
         }
