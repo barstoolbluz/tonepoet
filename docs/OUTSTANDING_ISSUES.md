@@ -5266,6 +5266,10 @@ an 18-second conversion, against roughly 1 second of actual decoding.
 | ffprobe | 14 | 2.89 s | 207 ms |
 | metaflac | 24 | 2.64 s | 110 ms |
 
+*Partly superseded by the 2026-10-27 update below: most of the per-call cost
+is TonePoet's own tool supervision, not ffprobe or metaflac, and the metaflac
+writes are not expensive.*
+
 The two have different causes, and only the first is established.
 
 **ffprobe is pure process startup.** `ffprobe -version`, which opens no file at
@@ -5295,3 +5299,269 @@ depends on what the calls are actually for, which I have not traced.
 Reproduction is the ordinary conversion above with
 `TONEPOET_PIPELINE_BASELINE_JSONL` set, counting `tool_run_finished` records by
 tool in the resulting trace.
+
+### Update 2026-10-27: the cost is in the supervisor, not the tools
+
+*Qualified by the second update below: on this host the cgroup path fails on
+every call and every tool runs under the subreaper fallback, so the migration
+cost described here is paid by an attempt that cannot succeed.*
+
+Same album, `main` at `e399d9e`, measured both untraced and under strace. The
+strace timings turned out to be badly distorted, so every figure below is from
+untraced runs unless it says otherwise.
+
+**What the calls are.** The counts are identical under S1 and the default S3
+route, and every one of these calls runs alone (`active_at_start` is 1).
+
+| Calls | Command | Stage |
+| --- | --- | --- |
+| 2 | `ffprobe` on the source image: audio stream, then attached art | materialize |
+| 12 | `ffprobe` on each staged output: rate, channels, duration, format | after encode |
+| 12 | `metaflac --export-tags-to=-` | metadata |
+| 12 | `metaflac` with 28 `--remove-tag` and 15 `--set-tag` in one rewrite | metadata |
+
+An `ffprobe --version` check also runs, but outside the tool runner, so it is
+not among the 14. Publication additionally spawns 24 `getfacl` processes (a
+`--version` and a `--access` per track, from `src/tui/probe.rs`). They are fast,
+but the built-in trace does not count them.
+
+**Where a call's time goes.** A timing shim placed ahead on `PATH` recorded each
+tool's real start and exit, which were joined to the runner's
+`tool_run_finished` records. The shim itself adds about 2.4 ms.
+
+| Tool | Runner elapsed | Before exec | Process | After exit |
+| --- | --- | --- | --- | --- |
+| metaflac | 99–110 ms | 50–59 ms | 14 ms | 40–44 ms |
+| ffprobe | 191–193 ms | 59–60 ms | 94 ms | 39 ms |
+
+That puts roughly 100 ms of overhead on every call, about 3.5–3.8 s per S1
+run across the 38 calls. ffprobe's own ~94 ms is real startup cost. metaflac's
+work is small: standalone, both the read and the rewrite take 3–4 ms.
+
+**Two mechanisms are established**, both in `src/convert/script_supervisor.rs`:
+
+- *A cgroup migration before each exec.* `CgroupLeaf::create` makes a leaf
+  cgroup per call, and `join_cgroup` writes the launcher's PID to its
+  `cgroup.procs`. Reproduced in isolation on this host: with migrations spaced
+  100–250 ms apart, as TonePoet's are, each write takes a median of 21–27 ms
+  (range 17–49). Back to back it takes 0.08 ms. My reading is that a spaced
+  migration has to wait for a fresh RCU grace period. This accounts for about
+  half of the before-exec time. The rest is unattributed and does not depend on
+  how many processes the host is running.
+- *A full process-table walk every 10 ms for the whole life of every tool.*
+  The supervision loop calls `refresh_linux_tree`, which calls
+  `process_snapshot`, which reads `/proc/<pid>/stat` for every process on the
+  host, then sleeps `CONTROL_POLL_INTERVAL` (10 ms). With 3,000 idle processes
+  added to the host (943 → 3,946), after-exit time rose from ~40 ms to 91–110 ms
+  while before-exec time and tool runtimes did not move, and the whole
+  conversion went from 17.0 s to 19.5 s.
+
+**The walk also costs a lot of CPU.** Sampling every TonePoet process in the
+conversion's process tree:
+
+| Run | Host processes | Helper CPU | Audio tool CPU | Per supervised tool |
+| --- | --- | --- | --- | --- |
+| S1 | 943 | 11.0 s | 11.9 s | 41% of a core |
+| S3 | 943 | 13.9 s | 19.6 s | 41% of a core |
+| S1 | 3,946 | 20.8 s | 12.6 s | 70% of a core |
+
+"Helper" means the forked supervisor and launcher processes, about two per
+call. "Per supervised tool" is helper CPU divided by the summed runner time of
+all tool calls. A loop of one walk plus a 10 ms sleep fits all three runs with
+an implied walk of about 7 ms, or 6–7 µs per host process. So supervising a
+tool costs something like half a core however long that tool runs, including
+the long sox and ffmpeg encodes. These figures come from sampling every 20 ms
+and probably undercount slightly.
+
+**What changes from the original entry.** ffprobe is about half startup and
+half supervision. metaflac is mostly supervision, not file rewriting. The cost
+grows with the number of processes on the host and is not specific to these two
+tools: every supervised call pays it, and only short calls make it visible as
+wall time. This is the same pattern as the ReplayGain FIFO poll and possibly
+#77, a fixed-interval poll doing work that could wait on an event, though for
+#77 that is unconfirmed.
+
+**Still open.** The unattributed half of the before-exec time. Whether S3,
+where migrations cluster, pays less for them. Why the convert path calls
+`getfacl` through `tui::probe`.
+
+No remedy is proposed. Harness, traces and per-run results are on the
+measuring host under `~/dev/issue78/`, not committed: `run.sh`, the `shim/`
+directory, `breakdown.py` and `cpu_sampler.py`.
+
+### Update 2026-10-27, later: cgroup containment never arms on this host
+
+*Its 72.0 s whole-tree CPU figure is corrected in the third update below: on a
+quiet host the input tree used about 35 s.*
+
+Found while checking a candidate fix for this issue and #77 (branch
+`issue77-78-delivery`, not merged). Everything below holds for the unmodified
+tree (`6ad6bb1`) as well as the candidate, and I have not diagnosed it.
+
+**Every cgroup launch fails, and the supervisor falls back.** Traced through an
+S1 conversion, each supervised call creates its leaf cgroup and places the
+launcher in it. The launcher then calls `unshare(CLONE_NEWCGROUP)`, which
+returns EPERM, and exits with status 70. The supervisor then runs the tool
+under the dedicated child subreaper instead. That held for every attempt traced,
+about 50 per run, in both trees. No `unshare` call of any other kind appears in
+the trace.
+
+The supervisor reports the fallback in the outcome's containment warning:
+
+```
+delegated cgroup v2 was unavailable (delegated cgroup launcher setup failed
+before script release: script supervisor I/O error: failed to fill whole
+buffer); used a dedicated child subreaper with PID-start-validated /proc
+tracking. This fallback cannot contain processes launched indirectly through
+an external service manager, ...
+```
+
+For what it may be worth: `unshare(2)` documents that `CLONE_NEWCGROUP` requires
+`CAP_SYS_ADMIN` in the caller's user namespace. TonePoet runs here as an
+unprivileged user from a tmux scope under `user@1000.service`. The host runs
+Linux 6.12.85, with cgroup2 mounted with `nsdelegate`. Whether the cgroup path
+has ever armed on this host is unknown.
+
+**What that changes above.**
+
+- The `cgroup.procs` migration measured in the first update is real, but it is
+  spent on an attempt that then fails. Every call pays for that attempt and then
+  for the fallback launch.
+- The 10 ms process-table walk measured there is the fallback's supervision
+  loop.
+- Containment on this host is process-tree observation, not kernel enforcement,
+  for every supervised tool.
+- The test suite runs into the same thing. A probe built on the fixture in
+  `tests/conversion_action_runscript_containment.rs` got this warning under
+  `ContainmentPreference::Auto`. The gate's containment tests use that fixture,
+  so on this host they exercise the fallback, not the cgroup path.
+  `required_cgroup_either_arms_without_control_fd_leak_or_fails_before_user_code`
+  passes either way.
+
+**The helper CPU figures above probably undercount.** Measured instead with
+`getrusage(RUSAGE_CHILDREN)` around the whole conversion, which counts every
+reaped descendant, an S1 run used 72.0 s of CPU (user 37.6–37.8 s, system
+34.2–34.4 s, two runs). The 20 ms sampler accounted for about 35 s across the
+same tree in an earlier run. The two are not strictly comparable: the
+getrusage runs overlapped an unrelated multiprocessing workload that held the
+host's load average at 30–40, and the sampler run did not. Treat the absolute
+figure as indicative. The candidate fix, run interleaved under the same load,
+used 42.0–42.1 s.
+
+Traces are `runs/b-sys2` (unmodified) and `runs/d-sys2` (candidate) under
+`~/dev/issue78/`.
+
+### Update 2026-10-28: both candidates re-measured on a quiet host
+
+Three builds of the same album, interleaved run by run, on a quiet host (load
+average 2–6, about 930 processes): the input tree (`6ad6bb1`), the first
+candidate (`cbc976f`, branch `issue77-78-delivery`) and a follow-up candidate
+(`90ee62c`, measured at `d950d63` on branch `issue77-78-followup`). None is
+merged.
+
+The follow-up changes only the supervisor:
+
+- Before attempting cgroup containment, it checks for `CAP_SYS_ADMIN`,
+  `CAP_SETPCAP` and `nsdelegate`. Without them it goes straight to the
+  subreaper, as it always does on this host.
+- The parent's fixed 10 ms sleep becomes a wait that wakes on lifecycle events.
+- When the cgroup path does arm, the launcher drops `CAP_SYS_ADMIN` and sets
+  `no_new_privs`. That cannot be exercised here.
+
+| Measure | Input | First candidate | Follow-up |
+| --- | --- | --- | --- |
+| S1 wall time, 3 runs | 16.5 / 16.5 / 16.5 s | 14.7 / 14.3 / 14.6 s | 13.2 / 13.0 / 13.3 s |
+| S3 wall time, 2 runs | 10.0 / 10.0 s | 8.5 / 8.6 s | 7.4 / 7.5 s |
+| ffprobe per call, before exec / after exit | 50–70 / 36–38 ms | 19–20 / 36–38 ms | 13–14 / 15–18 ms |
+| metaflac per call, before exec / after exit | 49–58 / 39 ms | 18 / 38–39 ms | 11 / 11–13 ms |
+| ffprobe + metaflac supervision overhead per S1 run | 3.4–3.7 s | 2.0–2.1 s | 0.9–1.0 s |
+| S1 with ~6,940 host processes | 21.5 / 22.2 s | 14.5 / 14.7 s | 13.1 / 12.9 s |
+| After exit with ~6,940 host processes | 100–108 ms ffprobe, 171 ms metaflac | 37–40 ms | 12–16 ms |
+| Whole-tree CPU per S1 run (`getrusage`) | 34.7 / 35.2 s, system 11.1 / 11.2 s | 24.8 / 25.5 s, system 3.4 / 3.8 s | 24.7 / 24.8 s, system 3.4 / 3.6 s |
+
+Per-call figures are medians per run, from the same shim and runner trace as the
+first update. Tool runtimes were unchanged across the three builds: ffprobe
+about 94 ms, metaflac about 14 ms.
+
+- **Where the follow-up's gain shows.** It is mostly after exit, where the time
+  fell by about two thirds. Before exec fell by a further 6–8 ms.
+- **What is left.** Supervision still adds about 25–30 ms per call. A metaflac
+  call takes about 34 ms against about 14 ms for the tool.
+- **Host process count.** With ~6,940 host processes the follow-up was
+  unaffected.
+- **CPU.** Whole-tree CPU is the same for both candidates. The follow-up's gain
+  is wall time.
+- **S3.** The breakdown script cannot attribute concurrent calls, so S3 has wall
+  times only.
+
+**A correction to the second update.** Its 72.0 s whole-tree CPU figure was
+inflated by the concurrent workload it mentions. On this quiet host the input
+tree used 34.7–35.2 s per S1 run.
+
+**Output.** S1 and S3 from the follow-up match both other builds: the same 13
+files, the same audio MD5 and tags on all 12 FLACs, and byte-identical CUE.
+
+**Containment.** I ran the four probe fixtures from the second update on the
+follow-up: a TERM-ignoring `setsid` leftover, a self-finishing child, and a
+double fork under timeout and under cancellation.
+
+- **`Auto` and forced fallback.** Outcomes, event order and elapsed times match
+  the first candidate's, and no process survived.
+- **The `Auto` warning** now reads "delegated cgroup v2 was unavailable
+  (CLONE_NEWCGROUP requires CAP_SYS_ADMIN, which is not effective in this
+  process)".
+- **`RequireLinuxCgroupV2`** refuses in about 0.11 s and never runs the script.
+  The count of cgroup directories under `user@1000.service` was 40 before and
+  after.
+
+**Still open.** The cgroup path has never run on this host, in any of the three
+builds. For what it may be worth, `unshare -C` fails with EPERM here, while
+`unshare -U -C` (a new user namespace together with a new cgroup namespace)
+succeeds unprivileged. I have not looked at whether that route gives an
+equivalent containment boundary.
+
+Run data is in `runs/f-*` under `~/dev/issue78/`, and the driver is
+`followup.sh`.
+
+## 79. The TUI event loop still wakes ten times a second when idle
+
+Filed 2026-10-28 as a possible later redesign, not a defect. It follows #77,
+whose fix on `issue77-78-followup` (not yet merged) skips the redraw when
+nothing visible has changed.
+
+**What remains.** Measured 2026-10-28 on `d950d63`, idle on Browse at 248×75
+with empty XDG directories:
+
+- 0.05% of one core, flat across the first 45 minutes of a 24-hour soak. That
+  is about 43 s of CPU a day.
+- 0.04–0.07% with 0, 32 and 64 stress-ng CPU workers on the 64-thread host. The
+  build before the fix rose from 1.1% to 1.7% under the same load.
+- Over 20 s the main thread woke 203 times. The other 64 threads did not wake.
+- At 400×110 it was 0.37–0.39% over 120 s.
+
+The wakes come from the event loop's 100 ms `event::poll` timeout. Each runs the
+loop's bookkeeping (`refresh_items`, the debounce and status-expiry checks,
+`ensure_convert_hdcd_scan`, the async-message drain) and draws only if something
+visible changed. A full redraw also runs every `IDLE_REDRAW_INTERVAL` (5 s), as
+a catch-all for changes the change detection does not track.
+
+**Not a responsiveness problem.** A keypress ends the poll wait at once.
+Keypress-to-screen measured 6–9 ms both before the fix, when the TUI redrew
+continuously, and after it. The timers bound how stale background state can be
+on screen, not how quickly input is answered.
+
+**Why it still polls, as far as I can tell.** Two sources cannot end the
+terminal wait: async results arriving on the message channel, and queue progress
+that `refresh_items` reads from shared state the conversion workers update
+without sending anything. The second looks like the larger obstacle. While
+progress is read rather than announced, something has to keep checking.
+
+**What we would want, if revisited.** An idle TUI that sleeps until a real event
+or its next deadline, with no fixed-interval wake, while background progress,
+async results, resize and timed maintenance still appear as promptly as they do
+now. Whether that justifies redesigning the event loop and how workers report
+progress is open. At the measured cost it matters mainly where wakeups are
+expensive in themselves, such as on battery.
+
+My reading of the event loop covers only the poll and the redraw decision. The
+account of why it polls is inference and may be incomplete.
