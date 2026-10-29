@@ -21704,12 +21704,21 @@ mod disc_directory_navigation_tests {
 
         state.probe_current_with_db(&tx, None);
 
-        assert_eq!(state.probe_debounce.as_ref().map(|d| d.path.as_path()), Some(album.as_path()));
+        assert!(
+            state.probe_debounce.is_none(),
+            "cached album classification must not arm a debounce with no remaining work"
+        );
         assert!(!state.dir_stats_pending.contains(&album));
 
-        state.probe_debounce.as_mut().expect("debounce").deadline = Instant::now() - Duration::from_millis(1);
+        // A debounce armed before the classification was cached can still
+        // expire later. It must not resurrect retired recursive stats.
+        state.probe_debounce = Some(BrowseProbeDebounce {
+            path: album.clone(),
+            deadline: Instant::now() - Duration::from_millis(1),
+        });
         state.check_probe_debounce(&tx);
 
+        assert!(state.probe_debounce.is_none());
         assert!(!state.dir_stats_pending.contains(&album),
             "legacy bounded recursion must remain retired after album classification");
         assert!(state.dir_stats_queue.is_empty(), "must not queue a legacy scan");

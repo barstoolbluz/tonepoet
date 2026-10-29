@@ -20517,8 +20517,11 @@ mod app_startup_options_tests {
         // queue authority exactly enough to exercise the real v23 -> v24
         // activation boundary rather than relying on a version-only stub.
         drop(crate::db::Database::open_path(&db_path).expect("initialize current database"));
-        {
+        let current_schema_version = {
             let conn = rusqlite::Connection::open(&db_path).expect("open database for v23 fixture");
+            let version: u32 = conn
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .expect("read freshly initialized current schema version");
             conn.execute_batch(
                 "PRAGMA foreign_keys = OFF;
                  DROP VIEW conversion_queue;
@@ -20531,7 +20534,8 @@ mod app_startup_options_tests {
                  PRAGMA user_version = 23;",
             )
             .expect("reconstruct complete v23 fixture");
-        }
+            version
+        };
         let options = AppStartupOptions::default().with_database_path(&db_path);
         let app = AppState::try_new_with_startup_options(TonepoetConfig::default(), options)
             .expect("quiescent v23 startup should activate v24 without external confirmation");
@@ -20541,7 +20545,7 @@ mod app_startup_options_tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("read activated schema version");
         assert_eq!(
-            version, 28,
+            version, current_schema_version,
             "quiescent startup must durably advance through the current schema"
         );
         let protocol_version: u32 = conn
