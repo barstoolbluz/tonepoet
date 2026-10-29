@@ -4917,7 +4917,7 @@ mod folder_classification_info_pane_tests {
 
         assert!(rendered.contains("Folders       3"));
         assert!(rendered.contains("Files         8"));
-        assert!(rendered.contains("Contents size  13.13 GiB"));
+        assert!(rendered.contains("Contents size 13.13 GiB"));
         assert!(rendered.contains("Audio files   3"));
         assert!(!rendered.contains("collection · 24 albums"));
         assert!(!rendered.contains("kind    collection"));
@@ -4983,7 +4983,7 @@ mod folder_classification_info_pane_tests {
 
         assert!(rendered.contains("Folders       2"));
         assert!(rendered.contains("Files         8"));
-        assert!(rendered.contains("Contents size  41.91 GiB"));
+        assert!(rendered.contains("Contents size 41.91 GiB"));
         assert!(rendered.contains("Audio files   3"));
         assert!(rendered.contains("Updated"));
         assert!(!rendered.contains("collection · many albums"));
@@ -5720,7 +5720,7 @@ mod directory_info_presentation_tests {
         assert!(text.contains("Folders       1"));
         assert!(text.contains("Files         2"));
         assert!(text.contains("Audio files   1"));
-        assert!(text.contains("Contents size  4 B"));
+        assert!(text.contains("Contents size 4 B"));
         assert!(text.contains("Updated"));
     }
 
@@ -5744,7 +5744,7 @@ mod directory_info_presentation_tests {
             });
         let text = render(&entry, &browse);
         assert!(text.contains("Folders       3"));
-        assert!(text.contains("Contents size  2.00 TiB (partial)"));
+        assert!(text.contains("Contents size 2.00 TiB (partial)"));
         assert!(!text.contains("Folders       100"));
         assert!(text.contains("Disk free     unavailable"));
     }
