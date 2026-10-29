@@ -21682,7 +21682,7 @@ mod disc_directory_navigation_tests {
     }
 
     #[tokio::test]
-    async fn cached_album_classification_allows_recursive_stats_after_debounce() {
+    async fn cached_album_classification_does_not_relaunch_retired_stats_after_debounce() {
         let temp = tempfile::tempdir().expect("tempdir");
         let album = temp.path().join("Cached Album");
         std::fs::create_dir_all(&album).expect("album fixture");
@@ -21712,10 +21712,13 @@ mod disc_directory_navigation_tests {
 
         assert!(!state.dir_stats_pending.contains(&album),
             "legacy bounded recursion must remain retired after album classification");
+        assert!(state.dir_stats_queue.is_empty(), "must not queue a legacy scan");
+        assert_eq!(state.active_dir_stats_request_id(&album), None,
+            "must not launch an active legacy scan");
     }
 
     #[tokio::test]
-    async fn cached_collection_classification_allows_bounded_recursive_stats_after_debounce() {
+    async fn cached_collection_classification_does_not_relaunch_retired_stats_after_debounce() {
         let temp = tempfile::tempdir().expect("tempdir");
         let artist = temp.path().join("Artist");
         std::fs::create_dir_all(&artist).expect("artist fixture");
@@ -21750,6 +21753,9 @@ mod disc_directory_navigation_tests {
 
         assert!(!state.dir_stats_pending.contains(&artist),
             "collection classification cannot relaunch legacy bounded recursion");
+        assert!(state.dir_stats_queue.is_empty(), "must not queue a legacy scan");
+        assert_eq!(state.active_dir_stats_request_id(&artist), None,
+            "must not launch an active legacy scan");
     }
 
     #[test]

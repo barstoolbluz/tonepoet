@@ -74,17 +74,29 @@ fn put_complete_in_transaction(tx: &Transaction<'_>, write: &SubtreeWrite, now: 
             params![key, POLICY_VERSION, AUDIO_POLICY_VERSION], |r| r.get(0)
         ).optional().map_err(|e| e.to_string())?;
         if prior.is_some_and(|generation| generation > value.generation) { return Ok(false); }
-        tx.execute("INSERT INTO directory_accounting_state_v29(path_key,policy_version,audio_policy_version,invalidation_epoch,dirty,last_access_utc_us)\
-            VALUES(?1,?2,?3,?4,0,?5) ON CONFLICT(path_key,policy_version,audio_policy_version) DO UPDATE SET dirty=0,last_access_utc_us=excluded.last_access_utc_us",
+        tx.execute(r#"INSERT INTO directory_accounting_state_v29(
+                path_key,policy_version,audio_policy_version,invalidation_epoch,dirty,last_access_utc_us)
+            VALUES(?1,?2,?3,?4,0,?5)
+            ON CONFLICT(path_key,policy_version,audio_policy_version) DO UPDATE SET
+                dirty=0,last_access_utc_us=excluded.last_access_utc_us"#,
             params![key, POLICY_VERSION, AUDIO_POLICY_VERSION, expected_epoch, now]).map_err(|e| e.to_string())?;
-        tx.execute("INSERT INTO directory_accounting_totals_v29(path_key,policy_version,audio_policy_version,files,descendant_folders,audio_files,logical_bytes,audio_logical_bytes,excluded_symlinks,other_entries,coverage_code,outcome_code,consistency_code,scan_started_utc_us,scan_finished_utc_us,run_generation,committed_epoch,created_utc_us,modified_utc_us,encoding_version,last_access_utc_us)\
-           VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,1,1,?11,?12,?13,?14,?15,?16,?17,1,?18)\
-           ON CONFLICT(path_key,policy_version,audio_policy_version) DO UPDATE SET\
-             files=excluded.files,descendant_folders=excluded.descendant_folders,audio_files=excluded.audio_files,logical_bytes=excluded.logical_bytes,\
-             audio_logical_bytes=excluded.audio_logical_bytes,excluded_symlinks=excluded.excluded_symlinks,other_entries=excluded.other_entries,\
-             consistency_code=excluded.consistency_code,scan_started_utc_us=excluded.scan_started_utc_us,scan_finished_utc_us=excluded.scan_finished_utc_us,\
-             run_generation=excluded.run_generation,committed_epoch=excluded.committed_epoch,created_utc_us=excluded.created_utc_us,\
-             modified_utc_us=excluded.modified_utc_us,last_access_utc_us=excluded.last_access_utc_us",
+        tx.execute(r#"INSERT INTO directory_accounting_totals_v29(
+                path_key,policy_version,audio_policy_version,files,descendant_folders,audio_files,
+                logical_bytes,audio_logical_bytes,excluded_symlinks,other_entries,coverage_code,
+                outcome_code,consistency_code,scan_started_utc_us,scan_finished_utc_us,
+                run_generation,committed_epoch,created_utc_us,modified_utc_us,encoding_version,last_access_utc_us)
+            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,1,1,?11,?12,?13,?14,?15,?16,?17,1,?18)
+            ON CONFLICT(path_key,policy_version,audio_policy_version) DO UPDATE SET
+                files=excluded.files,descendant_folders=excluded.descendant_folders,
+                audio_files=excluded.audio_files,logical_bytes=excluded.logical_bytes,
+                audio_logical_bytes=excluded.audio_logical_bytes,
+                excluded_symlinks=excluded.excluded_symlinks,other_entries=excluded.other_entries,
+                consistency_code=excluded.consistency_code,
+                scan_started_utc_us=excluded.scan_started_utc_us,
+                scan_finished_utc_us=excluded.scan_finished_utc_us,
+                run_generation=excluded.run_generation,committed_epoch=excluded.committed_epoch,
+                created_utc_us=excluded.created_utc_us,modified_utc_us=excluded.modified_utc_us,
+                last_access_utc_us=excluded.last_access_utc_us"#,
            params![key, POLICY_VERSION, AUDIO_POLICY_VERSION, value.counts.files.to_string(), value.counts.folders.to_string(),
              value.counts.audio.to_string(), value.counts.bytes.to_string(), value.counts.audio_bytes.to_string(),
              value.counts.excluded_links.to_string(), value.counts.other.to_string(),
@@ -220,12 +232,17 @@ impl Repository {
     }
     pub fn lookup(&mut self, path: &Path) -> Result<Option<CachedMeasurement>, String> {
         let values = self.conn.query_row(
-            "SELECT t.files,t.descendant_folders,t.audio_files,t.logical_bytes,t.audio_logical_bytes,t.excluded_symlinks,t.other_entries,\
-                    t.scan_started_utc_us,t.scan_finished_utc_us,t.run_generation,t.consistency_code,s.dirty,s.invalidation_epoch,t.committed_epoch,\
-                    t.created_utc_us,t.modified_utc_us,t.last_access_utc_us\
-             FROM directory_accounting_totals_v29 t LEFT JOIN directory_accounting_state_v29 s\
-             ON s.path_key=t.path_key AND s.policy_version=t.policy_version AND s.audio_policy_version=t.audio_policy_version\
-             WHERE t.path_key=?1 AND t.policy_version=?2 AND t.audio_policy_version=?3 AND t.coverage_code=1 AND t.outcome_code=1 AND t.encoding_version=1",
+            r#"SELECT t.files,t.descendant_folders,t.audio_files,t.logical_bytes,
+                      t.audio_logical_bytes,t.excluded_symlinks,t.other_entries,
+                      t.scan_started_utc_us,t.scan_finished_utc_us,t.run_generation,
+                      t.consistency_code,s.dirty,s.invalidation_epoch,t.committed_epoch,
+                      t.created_utc_us,t.modified_utc_us,t.last_access_utc_us
+               FROM directory_accounting_totals_v29 t
+               LEFT JOIN directory_accounting_state_v29 s
+                 ON s.path_key=t.path_key AND s.policy_version=t.policy_version
+                AND s.audio_policy_version=t.audio_policy_version
+              WHERE t.path_key=?1 AND t.policy_version=?2 AND t.audio_policy_version=?3
+                AND t.coverage_code=1 AND t.outcome_code=1 AND t.encoding_version=1"#,
             params![path_key(path), POLICY_VERSION, AUDIO_POLICY_VERSION], |r| {
                 Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,i64>(7)?,r.get::<_,i64>(8)?,r.get::<_,i64>(9)?,r.get::<_,i64>(10)?,r.get::<_,Option<i64>>(11)?,r.get::<_,Option<i64>>(12)?,r.get::<_,i64>(13)?,r.get::<_,Option<i64>>(14)?,r.get::<_,Option<i64>>(15)?,r.get::<_,i64>(16)?))
             }
