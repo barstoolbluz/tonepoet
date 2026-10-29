@@ -321,7 +321,7 @@ fn hint_groups_for(
                 h("↑↓", "navigate", theme.blue, 0),
                 h("enter", "open", theme.green, 0),
                 h("space", "select", theme.blue, 0),
-                h("Ctrl+P", "paste", theme.cyan, 1),
+                h("^P", "properties", theme.cyan, 1),
             ];
             if browse_tab_count > 1 {
                 hints.extend([

@@ -54,7 +54,7 @@ fn help_content(screen: AppScreen) -> Vec<HelpSection> {
                 title: "Selection",
                 entries: vec![
                     ("Space", "Toggle select (moves cursor down)"),
-                    ("Ctrl+V", "Visual range select (move cursor to extend)"),
+                    ("Ctrl+V", "Paste from clipboard (when supported)"),
                     ("Esc", "Exit type-ahead / visual mode / clear selection"),
                     ("Ctrl+E", "Edit metadata for selected file(s)"),
                     (":D / :detail", "Per-file detail view (in metadata editor)"),
@@ -85,6 +85,9 @@ fn help_content(screen: AppScreen) -> Vec<HelpSection> {
                 title: "File Operations",
                 entries: vec![
                     (":context", "Context menu (right-click)"),
+                    ("Ctrl+P", "Folder Properties (filesystem directories)"),
+                    ("Ctrl+Shift+P", "Paste filesystem clipboard"),
+                    ("Alt+P", "Metadata editor (existing mapping)"),
                     (":rename <name>", "Rename selected entry"),
                     (":rename-all", "Bulk rename wizard"),
                     (":cp <dest>", "Copy selected to destination"),

@@ -432,6 +432,7 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: 
                 f,
                 info_area,
                 &app.browse,
+                &app.directory_accounting,
                 inline_edit.as_ref(),
                 app.browse_info_focus,
                 &mut app.button_map,
@@ -3100,6 +3101,7 @@ fn draw_browse_info(
     f: &mut Frame,
     area: Rect,
     browse: &BrowseState,
+    accounting: &crate::directory_accounting::AccountingService,
     inline_edit: Option<&BrowseInlineEditState>,
     info_focus: Option<BrowseInfoFocus>,
     buttons: &mut ButtonRenderMap,
@@ -3144,6 +3146,7 @@ fn draw_browse_info(
         entry_info_lines(
             entry,
             browse,
+            accounting,
             content_width,
             analyze_hovered,
             edit_tags_hovered,
@@ -3281,40 +3284,52 @@ fn directory_size_str(bytes: u64) -> String {
 fn push_directory_stats_lines(
     lines: &mut Vec<Vec<Span<'static>>>,
     browse: &BrowseState,
+    accounting: &crate::directory_accounting::AccountingService,
     entry_path: &Path,
     entry_date_label: &str,
     theme: super::theme::Theme,
 ) {
-    let pending = browse.dir_stats_pending.contains(entry_path);
-    let counts = browse.current_directory_immediate_counts();
-    let waiting_for_listing = browse.selected_entry()
-        .is_some_and(|entry| matches!(entry.kind, EntryKind::ParentDir))
-        && browse.scan_pending.is_some();
-    let unavailable_count = if waiting_for_listing {
-        "scanning..."
-    } else if pending {
-        "calculating..."
-    } else {
-        "unavailable"
-    };
-    push_directory_metric_line(lines, "Folders", counts.map(|n| n.folders.to_string())
-        .unwrap_or_else(|| unavailable_count.to_string()), theme);
-    push_directory_metric_line(lines, "Files", counts.map(|n| n.files.to_string())
-        .unwrap_or_else(|| unavailable_count.to_string()), theme);
-    push_directory_metric_line(lines, "Audio files", counts.map(|n| n.audio_files.to_string())
-        .unwrap_or_else(|| unavailable_count.to_string()), theme);
-
-    let size = match browse.current_dir_stats() {
-        Some(stats) if stats.complete => directory_size_str(stats.total_size),
-        Some(stats) if stats.total_size > 0 => {
-            format!("{} (partial)", directory_size_str(stats.total_size))
+    use crate::directory_accounting::{Freshness, format_bytes, format_exact};
+    let view = accounting.view(entry_path);
+    let local = view.and_then(|v| v.local);
+    // A completed Browse listing has exact immediate counts even when
+    // recursive accounting is disabled. Never use the listing for a selected
+    // child folder whose contents have not actually been enumerated.
+    let listing = (entry_path == browse.current_dir.as_path())
+        .then(|| browse.current_directory_listing_counts()).flatten();
+    for (label, value) in [
+        ("folders (direct)", local.map(|c| c.folders).or_else(|| listing.map(|c| c.folders as u128))),
+        ("files (direct)", local.map(|c| c.files).or_else(|| listing.map(|c| c.files as u128))),
+        ("audio (direct)", local.map(|c| c.audio).or_else(|| listing.map(|c| c.audio_files as u128))),
+    ] {
+        let text = value.map(format_exact).unwrap_or_else(|| {
+            if view.is_some_and(|v| v.running) { "calculating...".into() }
+            else { "not calculated".into() }
+        });
+        push_directory_metric_line(lines, label, text, theme);
+    }
+    let (size_label, size) = match view.and_then(|v| v.cached.as_ref()) {
+        Some(cached) => {
+            let label = if cached.freshness == Freshness::KnownInvalid {
+                "historical size (recursive)"
+            } else { "contents size (recursive)" };
+            (label, format_bytes(cached.measurement.counts.bytes))
         }
-        Some(_) => "not calculated".to_string(),
-        None if pending => "calculating...".to_string(),
-        None => "not calculated".to_string(),
+        None if view.is_some_and(|v| v.running) => ("contents size (recursive)", "calculating...".into()),
+        None if view.is_some_and(|v| v.error.is_some() || matches!(&v.last_end, Some(crate::directory_accounting::ScanEnd::Failed { .. } | crate::directory_accounting::ScanEnd::Changed { .. }))) => ("contents size (recursive)", "unavailable".into()),
+        None => ("contents size (recursive)", "not calculated".into()),
     };
-    push_directory_metric_line(lines, "Contents size", size, theme);
-
+    push_directory_metric_line(lines, size_label, size, theme);
+    if let Some(cached) = view.and_then(|v| v.cached.as_ref()) {
+        let status = match cached.freshness {
+            Freshness::AsObserved => "measured (as observed; not a snapshot)",
+            Freshness::Unverified => "cached (freshness unverified)",
+            Freshness::KnownInvalid => "known invalid; showing historical size",
+        };
+        push_directory_metric_line(lines, "measurement", status, theme);
+        let dt: chrono::DateTime<chrono::Local> = cached.measurement.finished.into();
+        push_directory_metric_line(lines, "measured at", dt.format("%Y-%m-%d %H:%M").to_string(), theme);
+    }
     let space = browse.current_filesystem_space()
         .map(|(available, total)| format!(
             "{} / {}", directory_size_str(available), directory_size_str(total)
@@ -3324,9 +3339,9 @@ fn push_directory_stats_lines(
         } else {
             "unavailable".to_string()
         });
-    push_directory_metric_line(lines, "Disk free", space, theme);
+    push_directory_metric_line(lines, "disk free", space, theme);
     if !entry_date_label.is_empty() {
-        push_directory_metric_line(lines, "Updated", entry_date_label.to_string(), theme);
+        push_directory_metric_line(lines, "updated", entry_date_label.to_string(), theme);
     }
 }
 
@@ -3391,12 +3406,6 @@ fn push_folder_audio_detail_lines(
             "duration: {}",
             crate::tui::disc_browser::duration_display(rollup.total_duration_secs)
         ));
-    }
-    if let Some(stats) = browse.current_dir_stats() {
-        if stats.total_size > 0 {
-            let suffix = if stats.complete { "" } else { " (partial)" };
-            tail.push(format!("size: {}{suffix}", directory_size_str(stats.total_size)));
-        }
     }
     if rollup.probed_count > 0 && rollup.probed_count < audio.track_count {
         tail.push(format!(
@@ -3519,6 +3528,7 @@ fn push_folder_classification_lines(
     lines: &mut Vec<Vec<Span<'static>>>,
     classification: &FolderContentClassification,
     browse: &BrowseState,
+    accounting: &crate::directory_accounting::AccountingService,
     entry_path: &Path,
     entry_size: u64,
     entry_date_label: &str,
@@ -3623,9 +3633,10 @@ fn push_folder_classification_lines(
         }
         FolderClassificationKind::Collection | FolderClassificationKind::Unknown => {
             push_key_value_line(lines, "kind", "directory", theme.muted(), theme.text_style());
-            push_directory_stats_lines(lines, browse, entry_path, entry_date_label, theme);
         }
     }
+    // Every physical folder class uses the same scope-aware accounting display.
+    push_directory_stats_lines(lines, browse, accounting, entry_path, entry_date_label, theme);
 }
 
 /// Build content lines for the info pane based on the entry kind.
@@ -3635,6 +3646,7 @@ fn push_folder_classification_lines(
 fn entry_info_lines(
     entry: &BrowseEntry,
     browse: &BrowseState,
+    accounting: &crate::directory_accounting::AccountingService,
     content_width: usize,
     analyze_hovered: bool,
     edit_tags_hovered: bool,
@@ -3737,7 +3749,7 @@ fn entry_info_lines(
                 lines.push(vec![Span::styled("   parent directory", theme.muted())]);
             } else {
                 push_key_value_line(&mut lines, "kind", "directory", theme.muted(), theme.text_style());
-                push_directory_stats_lines(&mut lines, browse, &browse.current_dir, &entry_date_label, theme);
+                push_directory_stats_lines(&mut lines, browse, accounting, &browse.current_dir, &entry_date_label, theme);
             }
         }
         EntryKind::Directory if browse.is_in_archive() => {
@@ -3753,6 +3765,7 @@ fn entry_info_lines(
                     &mut lines,
                     classification.as_ref(),
                     browse,
+                    accounting,
                     &entry.path,
                     entry.size,
                     &entry_date_label,
@@ -3772,7 +3785,7 @@ fn entry_info_lines(
                         Span::styled("classifying...", Style::default().fg(theme.text_dim)),
                     ]);
                 }
-                push_directory_stats_lines(&mut lines, browse, &entry.path, &entry_date_label, theme);
+                push_directory_stats_lines(&mut lines, browse, accounting, &entry.path, &entry_date_label, theme);
             }
         }
         EntryKind::AudioFile(fmt) => {
@@ -4255,6 +4268,9 @@ fn entry_info_lines(
                 &mut audio_streams_pill_row,
                 theme,
             );
+            if entry.is_child_dir() && !browse.is_in_archive() {
+                push_directory_stats_lines(&mut lines, browse, accounting, &entry.path, &entry_date_label, theme);
+            }
         }
         EntryKind::Archive => {
             lines.push(vec![
@@ -4712,6 +4728,7 @@ mod folder_classification_info_pane_tests {
         let info = entry_info_lines(
             &entry,
             &browse,
+            &crate::directory_accounting::AccountingService::new(None),
             96,
             false,
             false,
@@ -4905,6 +4922,7 @@ mod folder_classification_info_pane_tests {
         let info = entry_info_lines(
             &entry,
             &browse,
+            &crate::directory_accounting::AccountingService::new(None),
             96,
             false,
             false,
@@ -4915,10 +4933,11 @@ mod folder_classification_info_pane_tests {
         );
         let rendered = flatten(&info);
 
-        assert!(rendered.contains("Folders       3"));
-        assert!(rendered.contains("Files         8"));
-        assert!(rendered.contains("Contents size 13.13 GiB"));
-        assert!(rendered.contains("Audio files   3"));
+        assert!(rendered.contains("folders (direct)"));
+        assert!(rendered.contains("files (direct)"));
+        assert!(rendered.contains("contents size (recursive)"));
+        assert!(!rendered.contains("13.13 GiB"));
+        assert!(rendered.contains("audio (direct)"));
         assert!(!rendered.contains("collection · 24 albums"));
         assert!(!rendered.contains("kind    collection"));
     }
@@ -4971,6 +4990,7 @@ mod folder_classification_info_pane_tests {
         let info = entry_info_lines(
             &entry,
             &browse,
+            &crate::directory_accounting::AccountingService::new(None),
             96,
             false,
             false,
@@ -4981,11 +5001,12 @@ mod folder_classification_info_pane_tests {
         );
         let rendered = flatten(&info);
 
-        assert!(rendered.contains("Folders       2"));
-        assert!(rendered.contains("Files         8"));
-        assert!(rendered.contains("Contents size 41.91 GiB"));
-        assert!(rendered.contains("Audio files   3"));
-        assert!(rendered.contains("Updated"));
+        assert!(rendered.contains("folders (direct)"));
+        assert!(rendered.contains("files (direct)"));
+        assert!(rendered.contains("contents size (recursive)"));
+        assert!(!rendered.contains("41.91 GiB"));
+        assert!(rendered.contains("audio (direct)"));
+        assert!(rendered.contains("updated"));
         assert!(!rendered.contains("collection · many albums"));
         assert!(!rendered.contains("kind    collection"));
     }
@@ -5091,6 +5112,7 @@ mod folder_classification_info_pane_tests {
         let info = entry_info_lines(
             &entry,
             &browse,
+            &crate::directory_accounting::AccountingService::new(None),
             96,
             false,
             false,
@@ -5192,6 +5214,7 @@ mod folder_classification_info_pane_tests {
             let info = entry_info_lines(
                 &entry,
                 &browse,
+                &crate::directory_accounting::AccountingService::new(None),
                 96,
                 false,
                 false,
@@ -5249,6 +5272,7 @@ mod folder_classification_info_pane_tests {
         let info = entry_info_lines(
             &entry,
             &browse,
+            &crate::directory_accounting::AccountingService::new(None),
             96,
             false,
             false,
@@ -5301,6 +5325,7 @@ mod folder_classification_info_pane_tests {
         let info = entry_info_lines(
             &entry,
             &browse,
+            &crate::directory_accounting::AccountingService::new(None),
             96,
             false,
             false,
@@ -5347,6 +5372,7 @@ mod folder_classification_info_pane_tests {
         let info = entry_info_lines(
             &entry,
             &browse,
+            &crate::directory_accounting::AccountingService::new(None),
             96,
             false,
             false,
@@ -5439,6 +5465,7 @@ mod folder_classification_info_pane_tests {
         let info = entry_info_lines(
             &entry,
             &browse,
+            &crate::directory_accounting::AccountingService::new(None),
             96,
             false,
             false,
@@ -5677,7 +5704,7 @@ mod directory_info_presentation_tests {
 
     fn render(entry: &BrowseEntry, browse: &BrowseState) -> String {
         let theme = crate::tui::theme::theme_by_slug_or_default(crate::tui::theme::default_theme_slug());
-        let info = entry_info_lines(entry, browse, 100, false, false, false, None, None, theme);
+        let info = entry_info_lines(entry, browse, &crate::directory_accounting::AccountingService::new(None), 100, false, false, false, None, None, theme);
         info.lines.iter().map(|spans| spans.iter().map(|span| span.content.as_ref()).collect::<String>())
             .collect::<Vec<_>>().join("\n")
     }
@@ -5717,15 +5744,16 @@ mod directory_info_presentation_tests {
         let text = render(&parent_entry, &browse);
         assert!(text.contains("Rock"));
         assert!(!text.contains("parent directory"));
-        assert!(text.contains("Folders       1"));
-        assert!(text.contains("Files         2"));
-        assert!(text.contains("Audio files   1"));
-        assert!(text.contains("Contents size 4 B"));
-        assert!(text.contains("Updated"));
+        assert!(text.contains("folders (direct)"));
+        assert!(text.contains("files (direct)"));
+        assert!(text.contains("audio (direct)"));
+        assert!(text.contains("contents size (recursive)"));
+        assert!(!text.contains("contents size (recursive)4 B"));
+        assert!(text.contains("updated"));
     }
 
     #[test]
-    fn incomplete_collection_size_is_explicitly_partial_and_binary() {
+    fn incomplete_collection_size_is_never_published_as_total() {
         let entry = BrowseEntry::new(
             Path::new("/music/collection").to_path_buf(), "collection".into(), EntryKind::Directory, 0, None
         );
@@ -5743,10 +5771,13 @@ mod directory_info_presentation_tests {
                 ..Default::default()
             });
         let text = render(&entry, &browse);
-        assert!(text.contains("Folders       3"));
-        assert!(text.contains("Contents size 2.00 TiB (partial)"));
-        assert!(!text.contains("Folders       100"));
-        assert!(text.contains("Disk free     unavailable"));
+        assert!(text.contains("folders (direct)"));
+        assert!(text.contains("contents size (recursive)"));
+        assert!(text.contains("not calculated"));
+        assert!(!text.contains("2.00 TiB"));
+        assert!(!text.contains("(partial)"));
+        assert!(!text.contains("folders (direct) 100"));
+        assert!(text.contains("disk free"));
     }
 
     #[test]

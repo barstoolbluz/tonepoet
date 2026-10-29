@@ -4060,6 +4060,7 @@ fn is_host_clipboard_paste_chord(key: &KeyEvent) -> bool {
         }
         KeyCode::Char(c) if c.eq_ignore_ascii_case(&'p') => {
             key.modifiers == KeyModifiers::CONTROL
+                || key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
         }
         _ => false,
     }
@@ -8489,6 +8490,10 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
     // In particular, `/` and `.` must not become tree-prefix characters merely
     // because Explore currently owns keyboard navigation.
     match (key.code, key.modifiers) {
+        (KeyCode::Char('p' | 'P'), KeyModifiers::CONTROL) => {
+            super::directory_properties::open_selected(app, tx);
+            return;
+        }
         (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
             request_new_browse_tab(app, tx);
             return;
@@ -9074,10 +9079,15 @@ fn handle_browse_search_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender
         return;
     }
 
-    // Search owns Browse dispatch while its panel is active. Its non-text
-    // control focuses must delegate both paste chords to the file
-    // clipboard arm. Only the input focus owns in-app text paste; every other
-    // search focus delegates Ctrl+V/Ctrl+P to filesystem paste.
+    // Search text input retains its editing shortcuts; other search focuses
+    // expose the same filesystem Folder Properties shortcut as Browse.
+    if app.browse.search.focus != SearchFocus::Input
+        && matches!(key.code, KeyCode::Char('p' | 'P'))
+        && key.modifiers == KeyModifiers::CONTROL
+    {
+        super::directory_properties::open_selected(app, tx);
+        return;
+    }
     if is_host_clipboard_paste_chord(&key)
         && app.browse.search.focus != SearchFocus::Input
     {
@@ -10679,6 +10689,9 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
 
     let overlay = app.active_overlay.clone();
     match overlay {
+        ActiveOverlay::FolderProperties(state) => {
+            super::directory_properties::handle_key(app, *state, key, tx);
+        }
         ActiveOverlay::DiscBrowser(_) => {
             super::disc_browser_actions::handle_disc_browser_key(app, key);
         }
@@ -34723,6 +34736,7 @@ pub(super) fn start_embedded_cuesheet_extract(
     let tx = tx.clone();
     app.set_status(format!("Extract embedded CUE sheet: writing {cue_filename}..."));
     tokio::spawn(async move {
+        let written_path = cue_path.clone();
         let result = tokio::task::spawn_blocking(move || {
             write_extracted_cuesheet_sidecar(&cue_path, &cue_text)
         })
@@ -34736,6 +34750,7 @@ pub(super) fn start_embedded_cuesheet_extract(
             .send(AppMessage::CueWriteComplete {
                 result,
                 refresh_browse,
+                written_path,
             })
             .await;
     });
@@ -110274,11 +110289,43 @@ mod file_picker_browse_parity_regression_tests {
         assert_eq!(clipboard.paths(), std::slice::from_ref(&file));
     }
 
+    #[test]
+    fn ctrl_p_opens_folder_properties_but_ctrl_p_on_regular_files_does_not() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = root.path().join("albums");
+        std::fs::create_dir(&folder).unwrap();
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = root.path().to_path_buf();
+        app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
+            folder.clone(), "albums".into(), crate::convert::classify::EntryKind::Directory,
+            0, None,
+        )];
+        app.browse.set_navigation_pane(crate::tui::browse::BrowseNavigationPane::Files);
+        let (tx, _rx) = mpsc::channel(8);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL), &tx);
+        match &app.active_overlay {
+            ActiveOverlay::FolderProperties(properties) => assert_eq!(properties.path, folder),
+            other => panic!("Ctrl+P must open filesystem properties: {other:?}"),
+        }
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+
+        let file = root.path().join("notes.txt");
+        std::fs::write(&file, b"note").unwrap();
+        app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
+            file, "notes.txt".into(), crate::convert::classify::EntryKind::OtherFile,
+            4, None,
+        )];
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL), &tx);
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+    }
+
     #[tokio::test]
     async fn files_ctrl_x_then_all_paste_chords_request_fresh_host_clipboard() {
         for (paste_chord, modifiers, label) in [
             ('v', KeyModifiers::CONTROL, "Ctrl+V"),
-            ('p', KeyModifiers::CONTROL, "Ctrl+P"),
+            ('p', KeyModifiers::CONTROL | KeyModifiers::SHIFT, "Ctrl+Shift+P"),
             (
                 'v',
                 KeyModifiers::CONTROL | KeyModifiers::SHIFT,

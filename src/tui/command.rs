@@ -6037,6 +6037,7 @@ OSC 52 fallback is capped at 64 KiB; install a native clipboard helper for large
 
                 let refresh_browse = app.current_screen == AppScreen::Browse;
                 let tx = tx.clone();
+                let destination_dir = output_dir.clone();
                 app.set_status("CUE generation: probing selected files…".to_string());
                 tokio::spawn(async move {
                     let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
@@ -6089,6 +6090,7 @@ OSC 52 fallback is capped at 64 KiB; install a native clipboard helper for large
                         .send(AppMessage::CueWriteComplete {
                             result,
                             refresh_browse,
+                            written_path: destination_dir,
                         })
                         .await;
                 });

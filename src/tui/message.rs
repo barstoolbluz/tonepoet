@@ -203,6 +203,8 @@ pub enum HostClipboardPasteTarget {
 /// Messages sent to the TUI event loop via mpsc channel
 #[derive(Debug)]
 pub enum AppMessage {
+    /// Dedicated nonblocking directory accounting worker update.
+    DirectoryAccounting(crate::directory_accounting::AccountingEvent),
     /// Completion of an explicit terminal-clipboard read.
     HostClipboardReadComplete {
         generation: u64,
@@ -973,6 +975,7 @@ pub enum AppMessage {
     CueWriteComplete {
         result: Result<String, String>,
         refresh_browse: bool,
+        written_path: std::path::PathBuf,
     },
     /// Result of async CUE preview construction. Used by MB-enriched CUE
     /// generation so probe/tag reads do not block message handling.

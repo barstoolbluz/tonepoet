@@ -588,6 +588,9 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState, theme: super::theme::Them
     let overlay = app.active_overlay.clone();
     match overlay {
         ActiveOverlay::None => {}
+        ActiveOverlay::FolderProperties(ref state) => {
+            super::draw_directory_properties::draw(f, state, &app.directory_accounting, theme);
+        }
         ActiveOverlay::ThemeBuilder(_) => {}
         ActiveOverlay::Confirmation {
             ref message,

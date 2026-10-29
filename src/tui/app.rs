@@ -8873,6 +8873,8 @@ pub enum WizardTarget {
 #[derive(Debug, Clone)]
 pub enum ActiveOverlay {
     None,
+    /// Read-only filesystem folder properties; metadata editor remains separate.
+    FolderProperties(Box<crate::tui::directory_properties::FolderPropertiesState>),
     /// Three-view theme builder overlay.
     ThemeBuilder(Box<crate::tui::theme_builder::ThemeBuilderState>),
     Confirmation {
@@ -15763,6 +15765,8 @@ pub struct AppState {
 
     // Overlays
     pub active_overlay: ActiveOverlay,
+    /// Shared directory-statistics service across Browse tabs.
+    pub directory_accounting: crate::directory_accounting::AccountingService,
 
     /// Overlay temporarily replaced by a text-editor context menu. Unlike the
     /// older feature-specific parking slots, this owns the complete overlay so
@@ -16844,6 +16848,11 @@ impl AppState {
         // Import TOML presets into DB on first run.
         crate::tui::presets::import_presets_to_db(&db);
         let mut browse = crate::tui::browse::BrowseState::new_with_config(&config.browsing);
+        // Disable the legacy depth/time-bounded recursive subtotal worker in
+        // production. The separate complete-only service owns all new totals.
+        browse.set_directory_stats_cold_work_policy(
+            crate::tui::browse::BrowseDirectoryStatsColdWorkPolicy::CachedOnly,
+        );
         let mut file_transfers = FileTransferQueueState::default();
         let mut recovery_surface_records = Vec::new();
         if startup_options.recover_pending_file_operations {
@@ -16935,6 +16944,9 @@ impl AppState {
             crate::config::FileOperationStatusVerbosity::Verbose
         );
 
+        let directory_accounting = crate::directory_accounting::AccountingService::new(
+            db.accounting_database_path(),
+        );
         Self {
             config,
             theme,
@@ -16980,6 +16992,7 @@ impl AppState {
             wizard_mouse_areas: None,
             wizard_target: WizardTarget::ConfigureAll,
             active_overlay,
+            directory_accounting,
             pending_editor_context_overlay: None,
             editor_context_target: None,
             host_clipboard_paste_generation: 0,

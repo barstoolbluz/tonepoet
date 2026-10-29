@@ -8,7 +8,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
 /// Schema version — bump when adding migrations.
-const CURRENT_VERSION: u32 = 28;
+const CURRENT_VERSION: u32 = 30;
 
 const LEGACY_IMPORT_STATE_ROW_ID: i64 = 1;
 pub(crate) const RECENT_FILES_RETENTION_LIMIT: usize = 50;
@@ -700,6 +700,15 @@ impl Database {
         }
     }
 
+    /// Returns the path used for a separate accounting worker connection.
+    /// In-memory databases deliberately disable cross-session persistence.
+    pub fn accounting_database_path(&self) -> Option<PathBuf> {
+        self.conn.query_row(
+            "SELECT file FROM pragma_database_list WHERE name='main'", [],
+            |row| row.get::<_, String>(0),
+        ).ok().filter(|p| !p.is_empty()).map(PathBuf::from)
+    }
+
     /// Open (or create) the production database, run migrations, and enable the
     /// same durability/performance pragmas used by ordinary application starts.
     pub fn open() -> Result<Self, String> {
@@ -1071,6 +1080,14 @@ impl Database {
 
         if version < 28 {
             self.run_migration_step(28, Self::migrate_v28)?;
+            version = 28;
+        }
+        if version < 29 {
+            self.run_migration_step(29, Self::migrate_v29)?;
+            version = 29;
+        }
+        if version < 30 {
+            self.run_migration_step(30, Self::migrate_v30)?;
         }
 
         Ok(())
@@ -1776,6 +1793,103 @@ impl Database {
             }
         }
         Ok(())
+    }
+
+    /// v29: independent, complete-only directory accounting. Legacy v21
+    /// directory_summary_cache is retained for shallow album classification;
+    /// its recursive payload never enters these tables.
+    fn migrate_v29(conn: &Connection) -> Result<(), String> {
+        conn.execute_batch(r#"
+            CREATE TABLE IF NOT EXISTS directory_accounting_generation_v29 (
+                singleton_id INTEGER PRIMARY KEY CHECK(singleton_id=1),
+                next_generation INTEGER NOT NULL CHECK(next_generation > 0)
+            );
+            INSERT OR IGNORE INTO directory_accounting_generation_v29(singleton_id,next_generation)
+                VALUES(1,1);
+            CREATE TABLE IF NOT EXISTS directory_accounting_state_v29 (
+                path_key BLOB NOT NULL,
+                policy_version INTEGER NOT NULL,
+                audio_policy_version INTEGER NOT NULL,
+                invalidation_epoch INTEGER NOT NULL DEFAULT 0 CHECK(invalidation_epoch >= 0),
+                dirty INTEGER NOT NULL DEFAULT 1 CHECK(dirty IN (0,1)),
+                dirty_at_utc_us INTEGER,
+                active_edge_generation TEXT,
+                last_access_utc_us INTEGER NOT NULL,
+                PRIMARY KEY(path_key,policy_version,audio_policy_version)
+            );
+            CREATE TABLE IF NOT EXISTS directory_accounting_local_v29 (
+                path_key BLOB NOT NULL,
+                policy_version INTEGER NOT NULL,
+                audio_policy_version INTEGER NOT NULL,
+                direct_files TEXT NOT NULL,
+                direct_folders TEXT NOT NULL,
+                direct_audio TEXT NOT NULL,
+                direct_logical_bytes TEXT NOT NULL,
+                excluded_symlinks TEXT NOT NULL,
+                observed_at_utc_us INTEGER NOT NULL,
+                run_generation INTEGER NOT NULL CHECK(run_generation > 0),
+                edge_generation TEXT NOT NULL,
+                encoding_version INTEGER NOT NULL,
+                PRIMARY KEY(path_key,policy_version,audio_policy_version)
+            );
+            CREATE TABLE IF NOT EXISTS directory_accounting_edges_v29 (
+                parent_key BLOB NOT NULL,
+                child_key BLOB NOT NULL,
+                policy_version INTEGER NOT NULL,
+                audio_policy_version INTEGER NOT NULL,
+                edge_generation TEXT NOT NULL,
+                PRIMARY KEY(parent_key,policy_version,audio_policy_version,edge_generation,child_key)
+            );
+            CREATE INDEX IF NOT EXISTS directory_accounting_edges_child_v29
+                ON directory_accounting_edges_v29(child_key,policy_version,audio_policy_version);
+            CREATE TABLE IF NOT EXISTS directory_accounting_totals_v29 (
+                path_key BLOB NOT NULL,
+                policy_version INTEGER NOT NULL,
+                audio_policy_version INTEGER NOT NULL,
+                files TEXT NOT NULL,
+                descendant_folders TEXT NOT NULL,
+                audio_files TEXT NOT NULL,
+                logical_bytes TEXT NOT NULL,
+                audio_logical_bytes TEXT NOT NULL,
+                excluded_symlinks TEXT NOT NULL,
+                other_entries TEXT NOT NULL,
+                coverage_code INTEGER NOT NULL DEFAULT 1 CHECK(coverage_code=1),
+                outcome_code INTEGER NOT NULL DEFAULT 1 CHECK(outcome_code=1),
+                consistency_code INTEGER NOT NULL,
+                scan_started_utc_us INTEGER NOT NULL,
+                scan_finished_utc_us INTEGER NOT NULL,
+                run_generation INTEGER NOT NULL CHECK(run_generation>0),
+                committed_epoch INTEGER NOT NULL,
+                created_utc_us INTEGER,
+                modified_utc_us INTEGER,
+                encoding_version INTEGER NOT NULL,
+                last_access_utc_us INTEGER NOT NULL,
+                PRIMARY KEY(path_key,policy_version,audio_policy_version),
+                CHECK(scan_finished_utc_us >= scan_started_utc_us)
+            );
+            CREATE INDEX IF NOT EXISTS directory_accounting_totals_lru_v29
+                ON directory_accounting_totals_v29(last_access_utc_us);
+        "#).map_err(|e| format!("v29 directory accounting migration failed: {e}"))
+    }
+
+    /// v30: mutation-sequence fence, independently verified local summaries,
+    /// and an exact child-edge set for qualified bottom-up reuse. All ALTERs
+    /// and user_version advance in the same migration transaction.
+    fn migrate_v30(conn: &Connection) -> Result<(), String> {
+        conn.execute_batch(r#"
+            ALTER TABLE directory_accounting_generation_v29
+                ADD COLUMN mutation_sequence INTEGER NOT NULL DEFAULT 0 CHECK(mutation_sequence>=0);
+            ALTER TABLE directory_accounting_local_v29
+                ADD COLUMN direct_audio_logical_bytes TEXT NOT NULL DEFAULT '0';
+            ALTER TABLE directory_accounting_local_v29
+                ADD COLUMN direct_other_entries TEXT NOT NULL DEFAULT '0';
+            ALTER TABLE directory_accounting_local_v29
+                ADD COLUMN entry_digest BLOB;
+            ALTER TABLE directory_accounting_local_v29
+                ADD COLUMN root_identity BLOB;
+            CREATE INDEX IF NOT EXISTS directory_accounting_edges_generation_v30
+                ON directory_accounting_edges_v29(parent_key,policy_version,audio_policy_version,edge_generation);
+        "#).map_err(|e| format!("v30 directory accounting migration failed: {e}"))
     }
 
     /// v16: AccurateRip result cache.
@@ -6355,17 +6469,12 @@ fn directory_summary_scope_code(scope: crate::tui::browse::DirectorySummaryScope
 fn directory_summary_strongest_scope_code(
     entry: &crate::tui::browse::DirectorySummaryCacheEntry,
 ) -> &'static str {
-    let mut strongest = entry.facts.classification_scope;
-    if let Some(stats_scope) = entry.facts.stats_scope {
-        if strongest
-            .map(|scope| directory_summary_scope_rank(stats_scope) > directory_summary_scope_rank(scope))
-            .unwrap_or(true)
-        {
-            strongest = Some(stats_scope);
-        }
-    }
+    // Never advertise recursive work from the legacy v21 classification cache.
+    // v30 is the sole authority for completed directory accounting.
     directory_summary_scope_code(
-        strongest.unwrap_or(crate::tui::browse::DirectorySummaryScope::Immediate),
+        entry.facts.classification_scope.unwrap_or(
+            crate::tui::browse::DirectorySummaryScope::Immediate,
+        ),
     )
 }
 
@@ -10192,9 +10301,9 @@ mod tests {
         assert_eq!(cached.facts.classification_scope, Some(DirectorySummaryScope::Immediate));
         assert_eq!(
             cached.facts.stats_scope,
-            Some(DirectorySummaryScope::RecursiveBestEffort),
+            None,
         );
-        assert_eq!(cached.facts.stats.as_ref().map(|stats| stats.audio_count), Some(2));
+        assert!(cached.facts.stats.is_none(), "legacy bounded recursive counts must not survive persistence");
 
         let changed_size = ProbeCacheIdentity { size: identity.size + 1, ..identity };
         assert!(db.get_cached_directory_summary(&path, changed_size).is_none());

@@ -157,6 +157,8 @@ pub enum ContextAction {
     EditMetadata(crate::tui::probe::MetadataField),
     /// Open the full metadata editor overlay.
     EditMetadataFull,
+    /// Open a true filesystem folder properties modal (not the metadata editor).
+    OpenFilesystemProperties(PathBuf),
     /// Copy the selected file(s) to a destination (opens directory picker).
     CopyTo,
     /// Move the selected file(s) to a destination (opens directory picker).
@@ -617,11 +619,14 @@ fn build_select_submenu(include_current_item: bool) -> ContextMenuEntry {
     }
 }
 
-fn push_properties_footer(items: &mut Vec<ContextMenuEntry>) {
+fn push_properties_footer(items: &mut Vec<ContextMenuEntry>, directory: Option<PathBuf>) {
     if !matches!(items.last(), Some(ContextMenuEntry::Separator)) {
         items.push(separator());
     }
-    items.push(item("Properties", ContextAction::EditMetadataFull));
+    match directory {
+        Some(path) => items.push(item("Properties", ContextAction::OpenFilesystemProperties(path))),
+        None => items.push(item("Edit metadata", ContextAction::EditMetadataFull)),
+    }
 }
 
 
@@ -648,7 +653,7 @@ fn archive_file_ops_submenu(entry: &BrowseEntry) -> Option<ContextMenuEntry> {
 
 fn build_archive_browse_entry_menu(entry: &BrowseEntry) -> Vec<ContextMenuEntry> {
     let mut items = Vec::new();
-    let include_properties = matches!(&entry.kind, EntryKind::AudioFile(_) | EntryKind::Directory);
+    let include_properties = matches!(&entry.kind, EntryKind::AudioFile(_));
 
     match &entry.kind {
         EntryKind::AudioFile(_) => {
@@ -686,7 +691,7 @@ fn build_archive_browse_entry_menu(entry: &BrowseEntry) -> Vec<ContextMenuEntry>
     }
 
     if include_properties {
-        push_properties_footer(&mut items);
+        push_properties_footer(&mut items, None);
     }
     items
 }
@@ -1591,7 +1596,7 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
         );
     }
     if include_properties {
-        push_properties_footer(&mut items);
+        push_properties_footer(&mut items, if entry.is_child_dir() { Some(entry.path.clone()) } else { None });
     }
 
     items
@@ -1784,7 +1789,8 @@ pub fn build_browse_tree_menu(app: &AppState, index: usize) -> Vec<ContextMenuEn
         item_enabled("Rename", ContextAction::TreeRename(path.clone()), mutable),
         item_enabled("Delete permanently", ContextAction::TreeDelete(path.clone()), mutable),
         separator(),
-        item("Copy path", ContextAction::CopyPath(path)),
+        item("Copy path", ContextAction::CopyPath(path.clone())),
+        item("Properties", ContextAction::OpenFilesystemProperties(path)),
     ]
 }
 
@@ -3469,6 +3475,9 @@ pub fn execute_context_action(
         }
         ContextAction::EditMetadata(field) => {
             super::command::execute_edit_metadata_pub(app, field);
+        }
+        ContextAction::OpenFilesystemProperties(path) => {
+            super::directory_properties::open_for_path(app, path, tx);
         }
         ContextAction::EditMetadataFull => {
             let guard_paths = super::command::collect_selection_for_file_ops(app);
@@ -7759,7 +7768,8 @@ mod tests {
         ));
         let labels = menu_labels_recursive(&build_archive_browse_entry_menu(&entry));
 
-        assert!(labels.iter().any(|label| label == "Properties"));
+        assert!(labels.iter().any(|label| label == "Edit metadata"));
+        assert!(!labels.iter().any(|label| label == "Properties"));
         assert!(labels.iter().any(|label| label == "Rename"));
         for forbidden in [
             "Bulk Rename",
@@ -7784,7 +7794,7 @@ mod tests {
         let labels = menu_labels_recursive(&build_archive_browse_entry_menu(&entry));
 
         assert!(labels.iter().any(|label| label == "Open"));
-        assert!(labels.iter().any(|label| label == "Properties"));
+        assert!(!labels.iter().any(|label| label == "Properties"));
         assert!(labels.iter().any(|label| label == "File operations"));
         assert!(labels.iter().any(|label| label == "Rename"));
         for forbidden in [
@@ -8231,7 +8241,7 @@ mod tests {
 
             let labels = menu_labels_recursive(&build_browse_entry_menu(&app));
             assert!(labels.iter().any(|label| label == "Convert"), "{name}");
-            assert!(labels.iter().any(|label| label == "Properties"), "{name}");
+            assert!(labels.iter().any(|label| label == "Edit metadata"), "{name}");
             assert!(
                 !labels.iter().any(|label| label == "Tags & Tagging"),
                 "{name} must not gain the out-of-scope tagging submenu"
@@ -8291,7 +8301,7 @@ mod tests {
                     label,
                     action: ContextAction::EditMetadataFull,
                     ..
-                })) if label == "Properties"
+                })) if label == "Edit metadata"
             ));
             assert!(matches!(
                 menu.get(menu.len().saturating_sub(2)),
@@ -8323,7 +8333,7 @@ mod tests {
             menu.last(),
             Some(ContextMenuEntry::Item(ContextMenuItem {
                 label,
-                action: ContextAction::EditMetadataFull,
+                action: ContextAction::OpenFilesystemProperties(_),
                 ..
             })) if label == "Properties"
         ));
