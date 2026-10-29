@@ -1,0 +1,37 @@
+TonePoet Browse Info pane directory-summary corrective R3
+Static verification record, 2026-10-28 America/New_York
+
+Input R2 archive SHA-256 (sha256sum):
+  41cf9da94c228ae7064f3a9f30ec2ceca2372614d23d3cd6afa9ed5d67e0c8ec PASS
+Input R2 archive extraction: PASS
+Full R2-versus-R3 file-hash comparison: PASS
+  R2 original regular files: 1354
+  R2 original symlinks: 1 (unchanged)
+  Missing original files: 0
+  Modified original files: only tonepoet/src/tui/browse.rs
+  Added R3 files: the R3 patch, handoff, resume checkpoint, this verification record
+
+Commands:
+  patch --dry-run -s -p1 < docs/browse_directory_info/CORRECTIVE_R3_FROM_R2.patch
+  Result: PASS, against R2 source tree
+  git diff --no-index --check R2/src/tui/browse.rs R3/src/tui/browse.rs
+  Result: PASS, no whitespace errors
+  sha256sum src/tui/browse.rs
+  Result: 15ce8c21b42a6dee3f2f0ca9b197a5dd27634156ef3a6cb05f240cd9936c4879
+  sha256sum docs/browse_directory_info/CORRECTIVE_R3_FROM_R2.patch
+  Result: 2b1316ab5fbce4385f747b929ff6d7226bae8e1c284808ecb904b1b123fb521d
+
+Production change scope: src/tui/browse.rs only. Cargo.toml unchanged.
+Unit tests added (SOURCE PRESENT, NOT EXECUTED):
+  recursive_stats_readdir_failure_at_first_level_cannot_cache_exact_counts
+  recursive_stats_descendant_readdir_failure_preserves_complete_first_level
+Previously present depth-cutoff control:
+  bounded_walk_records_direct_counts_even_when_descendants_are_skipped
+
+Rust 1.93 toolchain: UNAVAILABLE (cargo/rustc/rustfmt not on PATH)
+cargo fmt --all --check: NOT RUN
+cargo check -p tonepoet: NOT RUN
+cargo test focused: NOT RUN
+Interactive TUI, filesystem mounts, CPU measurements: NOT RUN
+
+See CORRECTIVE_R3_HANDOFF_2026-10-28.md for the host qualification commands.

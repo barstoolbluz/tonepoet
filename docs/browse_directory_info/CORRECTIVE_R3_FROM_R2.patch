@@ -1,0 +1,156 @@
+--- a/src/tui/browse.rs
++++ b/src/tui/browse.rs
+@@ -13578,6 +13578,20 @@
+     cancel: &AtomicBool,
+     budget: DirStatsWalkBudget,
+ ) -> Option<DirStats> {
++    compute_dir_stats_with_budget_reading(path, cancel, budget, fs::read_dir)
++}
++
++/// Share the bounded production walk with deterministic readdir fault-injection
++/// tests; filesystem timing cannot reliably reproduce those failures.
++fn compute_dir_stats_with_budget_reading<I>(
++    path: &Path,
++    cancel: &AtomicBool,
++    budget: DirStatsWalkBudget,
++    mut read_dir: impl FnMut(&Path) -> std::io::Result<I>,
++) -> Option<DirStats>
++where
++    I: Iterator<Item = std::io::Result<fs::DirEntry>>,
++{
+     if cancel.load(Ordering::Relaxed) {
+         return None;
+     }
+@@ -13600,7 +13614,7 @@
+             continue;
+         }
+ 
+-        let read = match fs::read_dir(&dir) {
++        let read = match read_dir(&dir) {
+             Ok(read) => read,
+             Err(_) => {
+                 stats.complete = false;
+@@ -13608,6 +13622,9 @@
+             }
+         };
+         let mut direct = DirectoryImmediateCounts::default();
++        // Only failures in the first level invalidate direct-child counts.
++        // An unreadable or truncated descendant still permits exact direct counts.
++        let mut immediate_complete = true;
+         for entry in read {
+             if cancel.load(Ordering::Relaxed) {
+                 return None;
+@@ -13621,11 +13638,19 @@
+             entries_seen += 1;
+             let entry = match entry {
+                 Ok(entry) => entry,
+-                Err(_) => { stats.complete = false; continue; }
++                Err(_) => {
++                    stats.complete = false;
++                    if depth == 0 { immediate_complete = false; }
++                    continue;
++                }
+             };
+             let file_type = match entry.file_type() {
+                 Ok(file_type) => file_type,
+-                Err(_) => { stats.complete = false; continue; }
++                Err(_) => {
++                    stats.complete = false;
++                    if depth == 0 { immediate_complete = false; }
++                    continue;
++                }
+             };
+             if file_type.is_symlink() {
+                 // Browse includes navigable symlinks in its immediate listing;
+@@ -13674,8 +13699,9 @@
+                 direct.files += 1;
+             }
+         }
+-        if depth == 0 {
+-            // Only a completed first-directory enumeration is authoritative.
++        if depth == 0 && immediate_complete {
++            // Descendant incompleteness must not invalidate fully enumerated
++            // immediate children, but a skipped root entry must.
+             stats.immediate = Some(direct);
+         }
+     }
+@@ -22667,6 +22693,79 @@
+     }
+ 
+     #[test]
++    fn recursive_stats_readdir_failure_at_first_level_cannot_cache_exact_counts() {
++        let temp = tempfile::tempdir().expect("tempdir");
++        let collection = temp.path().join("Collection");
++        std::fs::create_dir_all(collection.join("Album")).expect("album");
++        std::fs::write(collection.join("track.flac"), b"audio").expect("audio");
++
++        // Inject an error after valid entries. Even an otherwise plausible
++        // subtotal cannot be declared an exact first-level count.
++        let stats = compute_dir_stats_with_budget_reading(
++            &collection,
++            &AtomicBool::new(false),
++            DirStatsWalkBudget { max_depth: 4, max_files: 100, max_entries: 100, max_millis: 1000 },
++            |dir| {
++                let injected: Option<std::io::Result<fs::DirEntry>> =
++                    (dir == collection.as_path()).then(|| {
++                        Err(std::io::Error::other("injected first-level readdir failure"))
++                    });
++                Ok(fs::read_dir(dir)?.chain(injected))
++            },
++        ).expect("partial stats");
++        assert!(!stats.complete);
++        assert_eq!(stats.immediate, None, "failed root enumeration is not authoritative");
++
++        let meta = fs::metadata(&collection).expect("collection metadata");
++        let entry = BrowseEntry::new(
++            collection.clone(), "Collection".into(), EntryKind::Directory,
++            meta.len(), meta.modified().ok(),
++        );
++        let identity = ProbeCacheIdentity::from_entry(&entry);
++        let mut browse = BrowseState::new();
++        browse.entries = vec![entry];
++        browse.selected_index = 0;
++        browse.insert_dir_stats_for_identity(collection.clone(), identity, stats);
++        assert!(browse.current_dir_stats().is_some(), "the partial result remains cacheable");
++        assert_eq!(browse.current_directory_immediate_counts(), None,
++            "neither the Info pane nor the cached summary may expose exact counts");
++        let saved = browse.directory_summary_cache.get(&collection)
++            .expect("cached summary").to_persistent_line(&collection);
++        let (_, restored) = DirectorySummaryCacheEntry::from_persistent_line(&saved)
++            .expect("v4 summary round-trip");
++        assert!(restored.facts.stats.as_ref().is_some_and(|stats| stats.immediate.is_none()),
++            "persistence must not turn partial enumeration into authoritative counts");
++    }
++
++    #[test]
++    fn recursive_stats_descendant_readdir_failure_preserves_complete_first_level() {
++        let temp = tempfile::tempdir().expect("tempdir");
++        let collection = temp.path().join("Collection");
++        let album = collection.join("Album");
++        std::fs::create_dir_all(&album).expect("album");
++        std::fs::write(collection.join("cover.jpg"), b"cover").expect("cover");
++        std::fs::write(collection.join("track.flac"), b"audio").expect("audio");
++        std::fs::write(album.join("nested.flac"), b"nested").expect("nested");
++
++        let stats = compute_dir_stats_with_budget_reading(
++            &collection,
++            &AtomicBool::new(false),
++            DirStatsWalkBudget { max_depth: 4, max_files: 100, max_entries: 100, max_millis: 1000 },
++            |dir| {
++                let injected: Option<std::io::Result<fs::DirEntry>> =
++                    (dir == album.as_path()).then(|| {
++                        Err(std::io::Error::other("injected descendant readdir failure"))
++                    });
++                Ok(fs::read_dir(dir)?.chain(injected))
++            },
++        ).expect("partial stats");
++        assert!(!stats.complete, "descendant traversal is incomplete");
++        assert_eq!(stats.immediate, Some(DirectoryImmediateCounts {
++            folders: 1, files: 2, audio_files: 1,
++        }), "a descendant failure cannot invalidate successfully counted immediate children");
++    }
++
++    #[test]
+     fn parent_row_summarizes_current_directory_from_unfiltered_completed_listing() {
+         let temp = tempfile::tempdir().expect("tempdir");
+         let current = temp.path().join("Music");

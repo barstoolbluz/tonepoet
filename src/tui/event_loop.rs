@@ -399,6 +399,7 @@ fn message_mutates_browse_visible_state(msg: &AppMessage) -> bool {
         | AppMessage::AudioProbeComplete { .. }
         | AppMessage::DiscProbeComplete { .. }
         | AppMessage::DirStatsComplete { .. }
+        | AppMessage::BrowseFilesystemSpaceComplete { .. }
         | AppMessage::FolderClassifyComplete { .. }
         | AppMessage::DirScanBatch { .. }
         | AppMessage::DirScanComplete { .. }
@@ -8264,8 +8265,17 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 }
             }
         }
-        AppMessage::DirStatsComplete { path, identity, stats, cancelled } => {
-            let was_pending = app.browse.complete_dir_stats(&path, tx);
+        AppMessage::BrowseFilesystemSpaceComplete {
+            tab_id, generation, request_id, path, space,
+        } => {
+            if let Some(browse) = app.browse.tab_mut(tab_id) {
+                if browse.complete_filesystem_space(&path, generation, request_id, space) {
+                    browse.deferred_work.info_pane_changed = true;
+                }
+            }
+        }
+        AppMessage::DirStatsComplete { path, identity, request_id, stats, cancelled } => {
+            let was_pending = app.browse.complete_dir_stats(&path, request_id, tx);
             if !was_pending {
                 return;
             }
@@ -8282,7 +8292,9 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                     log::debug!("dropping stale directory-stats completion after identity change: {}", path.display());
                     app.browse.remove_dir_stats_cache_entry(&path);
                     app.browse.invalidate_directory_summary_persistent_cache_best_effort(&path, &app.db);
-                    if app.browse.current_entry_is_still_statable(&path) {
+                    if app.browse.is_current_directory_stats_target_path(&path)
+                        && std::fs::metadata(&path).is_ok()
+                    {
                         app.browse.probe_current_with_db(tx, Some(&app.db));
                     }
                 }
@@ -21610,28 +21622,33 @@ mod async_message_drain_tests {
 
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = path.clone();
         app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
-            path.clone(),
-            "album".to_string(),
-            EntryKind::Directory,
+            temp.path().to_path_buf(),
+            "..".to_string(),
+            EntryKind::ParentDir,
             0,
             None,
         )];
         app.browse.selected_index = 0;
-        app.browse.dir_stats_pending.insert(path.clone());
-
-        let (tx, _rx) = mpsc::channel(4);
+        let (tx, _rx) = mpsc::channel(8);
+        app.browse.probe_current(&tx);
+        app.browse.probe_debounce.as_mut().expect("focus debounce").deadline = std::time::Instant::now();
+        app.browse.check_probe_debounce(&tx);
+        let request_id = app.browse.active_dir_stats_request_id(&path).expect("active stats request");
         handle_message(
             &mut app,
             AppMessage::DirStatsComplete {
                 path: path.clone(),
                 identity: stale_identity,
+                request_id,
                 stats: crate::tui::browse::DirStats {
                     folder_count: 0,
                     file_count: 99,
                     audio_count: 99,
                     audio_size: 0,
                     total_size: 99,
+                    ..Default::default()
                 },
                 cancelled: false,
             },
@@ -21642,13 +21659,13 @@ mod async_message_drain_tests {
         assert!(!app.browse.dir_stats_pending.contains(&path));
         assert_eq!(
             app.browse.probe_debounce.as_ref().map(|pending| pending.path.as_path()),
-            Some(path.as_path()),
+            Some(temp.path()),
             "a stale stats result should re-enter the settled-focus policy path instead of immediately relaunching recursive stats"
         );
     }
 
-    #[test]
-    fn missing_dir_stats_completion_stops_without_retry() {
+    #[tokio::test]
+    async fn missing_dir_stats_completion_stops_without_retry() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("gone");
         std::fs::create_dir(&path).expect("mkdir");
@@ -21658,29 +21675,47 @@ mod async_message_drain_tests {
 
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = path.clone();
         app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
-            path.clone(),
-            "gone".to_string(),
-            EntryKind::Directory,
-            identity.size,
-            identity.modified,
+            temp.path().to_path_buf(),
+            "..".to_string(),
+            EntryKind::ParentDir,
+            0,
+            None,
         )];
         app.browse.selected_index = 0;
-        app.browse.dir_stats_pending.insert(path.clone());
+        let (tx, mut rx) = mpsc::channel(8);
+        app.browse.probe_current(&tx);
+        app.browse.probe_debounce.as_mut().expect("focus debounce").deadline = std::time::Instant::now();
+        app.browse.check_probe_debounce(&tx);
+        let request_id = app.browse.active_dir_stats_request_id(&path).expect("active stats request");
+        // The launched worker must have closed its directory before rmdir,
+        // including on hosts that prevent deleting open directories.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await {
+                    Some(AppMessage::DirStatsComplete { request_id: finished, .. })
+                        if finished == request_id => break,
+                    Some(_) => {},
+                    None => panic!("stats worker channel closed"),
+                }
+            }
+        }).await.expect("stats worker completed");
         std::fs::remove_dir(&path).expect("remove dir");
 
-        let (tx, _rx) = mpsc::channel(4);
         handle_message(
             &mut app,
             AppMessage::DirStatsComplete {
                 path: path.clone(),
                 identity,
+                request_id,
                 stats: crate::tui::browse::DirStats {
                     folder_count: 0,
                     file_count: 1,
                     audio_count: 1,
                     audio_size: 0,
                     total_size: 1,
+                    ..Default::default()
                 },
                 cancelled: false,
             },
@@ -21689,6 +21724,71 @@ mod async_message_drain_tests {
 
         assert!(!app.browse.dir_stats_pending.contains(&path));
         assert!(app.browse.current_dir_stats().is_none());
+    }
+
+    #[tokio::test]
+    async fn late_stats_completion_cannot_displace_newer_request_for_same_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("music");
+        std::fs::create_dir(&path).expect("music fixture");
+        let identity = crate::tui::browse::ProbeCacheIdentity::from_metadata(
+            &std::fs::metadata(&path).expect("directory metadata"),
+        );
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = path.clone();
+        app.browse.entries = vec![
+            crate::tui::browse::BrowseEntry::new(
+                temp.path().to_path_buf(), "..".into(), EntryKind::ParentDir, 0, None,
+            ),
+            crate::tui::browse::BrowseEntry::new(
+                path.join("unrelated.txt"), "unrelated.txt".into(), EntryKind::OtherFile, 0, None,
+            ),
+        ];
+        let (tx, _rx) = mpsc::channel(8);
+
+        app.browse.probe_current(&tx);
+        app.browse.probe_debounce.as_mut().expect("A debounce").deadline = std::time::Instant::now();
+        app.browse.check_probe_debounce(&tx);
+        let request_a = app.browse.active_dir_stats_request_id(&path).expect("A active");
+
+        app.browse.selected_index = 1;
+        app.browse.probe_current(&tx); // Cancel A without processing its completion.
+        assert!(app.browse.active_dir_stats_request_id(&path).is_none());
+
+        app.browse.selected_index = 0;
+        app.browse.probe_current(&tx);
+        app.browse.probe_debounce.as_mut().expect("B debounce").deadline = std::time::Instant::now();
+        app.browse.check_probe_debounce(&tx);
+        let request_b = app.browse.active_dir_stats_request_id(&path).expect("B active");
+        assert_ne!(request_a, request_b);
+
+        // Both a cancelled A and a previously completed (but delayed) A must
+        // leave B untouched, even though path, identity and generation match.
+        for cancelled in [true, false] {
+            handle_message(&mut app, AppMessage::DirStatsComplete {
+                path: path.clone(), identity, request_id: request_a,
+                stats: crate::tui::browse::DirStats {
+                    total_size: 111, complete: true, ..Default::default()
+                },
+                cancelled,
+            }, &tx);
+            assert_eq!(app.browse.active_dir_stats_request_id(&path), Some(request_b));
+            assert!(app.browse.dir_stats_pending.contains(&path));
+            assert!(app.browse.current_dir_stats().is_none(), "stale A must not publish");
+        }
+
+        handle_message(&mut app, AppMessage::DirStatsComplete {
+            path: path.clone(), identity, request_id: request_b,
+            stats: crate::tui::browse::DirStats {
+                total_size: 222, complete: true, ..Default::default()
+            },
+            cancelled: false,
+        }, &tx);
+        assert!(app.browse.active_dir_stats_request_id(&path).is_none());
+        assert!(!app.browse.dir_stats_pending.contains(&path));
+        assert_eq!(app.browse.current_dir_stats().map(|stats| stats.total_size), Some(222));
     }
 
     #[test]

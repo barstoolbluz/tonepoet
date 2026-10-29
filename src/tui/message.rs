@@ -582,14 +582,24 @@ pub enum AppMessage {
     },
     /// Result of an asynchronous directory-stats computation launched by
     /// `BrowseState::probe_current` for a directory entry. The completion
-    /// carries the directory identity captured at dispatch so stale walkers
-    /// cannot publish stats after the selected directory has changed or
-    /// disappeared.
+    /// carries the directory identity and unique request id captured at
+    /// dispatch. The id prevents a cancelled walk from consuming a newer
+    /// request for the same directory and filesystem identity.
     DirStatsComplete {
         path: std::path::PathBuf,
         identity: crate::tui::browse::ProbeCacheIdentity,
+        request_id: u64,
         stats: crate::tui::browse::DirStats,
         cancelled: bool,
+    },
+    /// One settled-focus filesystem-capacity lookup for the selected directory.
+    /// Ownership and generation are rechecked before updating its Info pane.
+    BrowseFilesystemSpaceComplete {
+        tab_id: crate::tui::browse::BrowseTabId,
+        generation: u64,
+        request_id: u64,
+        path: std::path::PathBuf,
+        space: Option<(u64, u64)>,
     },
     /// Result of a bounded folder-content classification launched after the
     /// Browse cursor debounce. Ordinary classification performs only bounded
