@@ -79,7 +79,7 @@ pub fn handle_key(app: &mut AppState, state: FolderPropertiesState, key: KeyEven
             app.active_overlay = ActiveOverlay::FolderProperties(Box::new(state));
         }
         (KeyCode::Char('c' | 'C'), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
-            app.directory_accounting.detach_explicit(&state.path, state.request_id);
+            app.directory_accounting.cancel_scan(&state.path);
             state.cancelled = true;
             app.active_overlay = ActiveOverlay::FolderProperties(Box::new(state));
         }

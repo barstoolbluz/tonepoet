@@ -4685,10 +4685,9 @@ fn browse_archive_inline_metadata_status(app: &mut AppState) {
     app.set_status("archive metadata: use Tags & Tagging to stage changes and repackage the archive");
 }
 
-/// The Info Refresh target is the directory actually shown in the Info pane,
-/// not an unrelated Explore-tree selection. Re-check it on activation so a
-/// stale mouse hit map cannot operate on a different path.
-fn browse_info_refresh_target(app: &AppState) -> Option<std::path::PathBuf> {
+/// Resolve the physical directory actually displayed in Browse Info, not a
+/// stale tree selection. Both mouse and keyboard actions recheck this target.
+fn browse_info_directory_target(app: &AppState) -> Option<std::path::PathBuf> {
     if app.browse.search.active || !app.browse.info_focus_available()
         || app.browse.is_in_archive() { return None; }
     let entry = app.browse.selected_entry()?;
@@ -4698,13 +4697,34 @@ fn browse_info_refresh_target(app: &AppState) -> Option<std::path::PathBuf> {
     } else if entry.is_child_dir() {
         entry.path.clone()
     } else { return None; };
-    (path.is_absolute() && app.directory_accounting.refresh_available(&path)).then_some(path)
+    path.is_absolute().then_some(path)
+}
+
+fn browse_info_refresh_target(app: &AppState) -> Option<std::path::PathBuf> {
+    browse_info_directory_target(app)
+        .filter(|path| app.directory_accounting.refresh_available(path))
+}
+
+fn browse_info_cancel_target(app: &AppState) -> Option<std::path::PathBuf> {
+    browse_info_directory_target(app)
+        .filter(|path| app.directory_accounting.cancel_available(path))
+}
+
+fn browse_info_action_available(app: &AppState) -> bool {
+    browse_info_cancel_target(app).is_some() || browse_info_refresh_target(app).is_some()
 }
 
 fn activate_browse_info_refresh(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
-    let target = browse_info_refresh_target(app);
+    // A running or queued request takes precedence: the same focusable
+    // control switches to Cancel without creating a second walker.
+    let cancel = browse_info_cancel_target(app);
+    let refresh = if cancel.is_none() { browse_info_refresh_target(app) } else { None };
     clear_browse_info_focus(app);
-    if let Some(path) = target {
+    if let Some(path) = cancel {
+        if app.directory_accounting.cancel_scan(&path) {
+            app.set_status("Cancelling folder scan");
+        }
+    } else if let Some(path) = refresh {
         if app.directory_accounting.request_refresh(path, tx) {
             app.set_status("Calculating folder size");
         } else {
@@ -4726,7 +4746,7 @@ fn repair_browse_focus_visibility(app: &mut AppState) {
     app.browse.repair_navigation_pane_visibility();
     let info_available = match app.browse_info_focus {
         Some(BrowseInfoFocus::Metadata(_)) => browse_metadata_focus_available(app),
-        Some(BrowseInfoFocus::Refresh) => browse_info_refresh_target(app).is_some(),
+        Some(BrowseInfoFocus::Refresh) => browse_info_action_available(app),
         None => true,
     };
     if !info_available {
@@ -8045,7 +8065,7 @@ fn cycle_browse_pane_focus(app: &mut AppState, forward: bool) {
     repair_browse_focus_visibility(app);
     let tree_available = app.browse.explore_focus_available();
     let metadata_available = browse_metadata_focus_available(app);
-    let refresh_available = browse_info_refresh_target(app).is_some();
+    let refresh_available = browse_info_action_available(app);
     let info_available = metadata_available || refresh_available;
 
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -8091,7 +8111,11 @@ fn cycle_browse_pane_focus(app: &mut AppState, forward: bool) {
             // priority; audio files retain their existing metadata focus.
             if refresh_available {
                 app.browse_info_focus = Some(BrowseInfoFocus::Refresh);
-                app.set_status("Browse Info Refresh focus — Enter to calculate, Esc returns to Files");
+                if browse_info_cancel_target(app).is_some() {
+                    app.set_status("Browse Info Cancel focus — Enter to stop scan, Esc returns to Files");
+                } else {
+                    app.set_status("Browse Info Refresh focus — Enter to calculate, Esc returns to Files");
+                }
             } else if metadata_available { cycle_browse_metadata_focus(app, forward); }
         },
     }
@@ -110115,6 +110139,36 @@ mod file_picker_browse_parity_regression_tests {
             crate::tui::browse::BrowseNavigationPane::Tree,
             "Tab must still return keyboard ownership to visible Explore",
         );
+    }
+
+    #[test]
+    fn browse_info_keyboard_cancel_stops_the_same_refresh_mouse_controls() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("Collection");
+        std::fs::create_dir(&path).expect("folder");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
+            path.clone(), "Collection".into(),
+            crate::convert::classify::EntryKind::Directory, 0, None,
+        )];
+        app.browse.selected_index = 0;
+        app.browse.info_enabled = true;
+        app.browse.info_collapsed = false;
+        let (tx, _rx) = mpsc::channel(32);
+        assert_eq!(browse_info_refresh_target(&app), Some(path.clone()));
+        // Mouse and keyboard use this identical activation path.
+        activate_browse_info_refresh(&mut app, &tx);
+        assert!(app.directory_accounting.cancel_available(&path));
+        assert_eq!(browse_info_cancel_target(&app), Some(path.clone()));
+        app.browse_info_focus = Some(BrowseInfoFocus::Refresh);
+        assert!(handle_browse_info_navigation_key(&mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx));
+        assert!(!app.directory_accounting.cancel_available(&path));
+        assert!(app.browse_info_focus.is_none());
+        assert!(app.status_message.as_ref().is_some_and(|(text, _)|
+            text.contains("Cancelling folder scan")));
     }
 
     #[test]

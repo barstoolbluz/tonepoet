@@ -39,6 +39,7 @@ impl Counts {
 #[derive(Debug, Clone, Default)]
 pub struct ScanProgress {
     pub files_examined: u128,
+    pub audio_examined: u128,
     pub folders_examined: u128,
     pub folders_discovered: u128,
     pub bytes_examined: u128,
@@ -76,6 +77,8 @@ pub struct CachedMeasurement {
 pub enum ScanEnd {
     Complete { value: CompleteMeasurement, saved: bool, persistence_error: Option<String> },
     Cancelled(ScanProgress),
+    /// A network/unknown mount failed its read-only metadata-latency gate.
+    Deferred(ScanProgress),
     Failed { reason: String, progress: ScanProgress },
     Changed { reason: String, progress: ScanProgress },
 }

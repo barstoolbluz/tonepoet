@@ -41,7 +41,7 @@ pub fn draw(f: &mut Frame, state: &FolderPropertiesState, service: &AccountingSe
     rows.push("Type: Directory (links not followed)".into());
     if let Some(view) = view {
         if state.cancelled {
-            rows.push("Status: Request cancelled (shared background work may continue)".into());
+            rows.push("Status: Scan cancellation requested".into());
         }
         if running {
             rows.push("Status: Calculating...".into());
@@ -79,6 +79,7 @@ pub fn draw(f: &mut Frame, state: &FolderPropertiesState, service: &AccountingSe
             match end {
                 ScanEnd::Complete { saved: false, persistence_error, .. } => rows.push(format!("Persistence: not saved ({})", persistence_error.as_deref().unwrap_or("unavailable"))),
                 ScanEnd::Cancelled(p) => rows.push(format!("Status: Cancelled after {} files", format_exact(p.files_examined))),
+                ScanEnd::Deferred(_) => rows.push("Status: Background scan deferred by metadata latency".into()),
                 ScanEnd::Failed { reason, .. } => rows.push(format!("Status: Failed: {reason}")),
                 ScanEnd::Changed { reason, .. } => rows.push(format!("Status: Changed during scan: {reason}")),
                 _ => {},

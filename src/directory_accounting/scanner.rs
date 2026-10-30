@@ -10,7 +10,7 @@ use tempfile::NamedTempFile;
 use sha2::{Digest, Sha256};
 use super::model::{is_audio_name, CompleteMeasurement, Counts, Observation, ScanEnd, ScanProgress};
 use super::repository::{path_key, Repository, SubtreeWrite};
-use super::volume::{Inventory, Volume, VolumeBudgets, VolumeClass};
+use super::volume::{Inventory, NetworkProbeGate, Volume, VolumeBudgets, VolumeClass};
 
 const MEMORY_CHILDREN_LIMIT: usize = 2048;
 const BACKGROUND_SCRATCH_QUOTA: u64 = 64 * 1024 * 1024;
@@ -218,16 +218,20 @@ struct Frame {
     observation: Observation,
 }
 
-/// One cooperative governor per worker, charging shared per-volume buckets.
-/// Every blocking metadata step consumes a token; sleepers never hold locks.
+/// One cooperative governor per worker. Background metadata steps draw from
+/// shared per-volume buckets; foreground steps only check cancellation and
+/// periodically yield. Sleepers never hold locks.
 pub struct RateGovernor {
     cancel: Arc<AtomicBool>,
     pub(super) priority: Arc<AtomicU8>,
     background_pause: Arc<AtomicBool>,
     background_busy: Arc<AtomicBool>,
     budgets: Arc<VolumeBudgets>,
+    network_gate: Arc<NetworkProbeGate>,
     inventory: Inventory,
     current_volume: Volume,
+    current_directory: Option<PathBuf>,
+    last_network_probe: Instant,
     scratch: ScratchBudget,
     operations: u64,
     #[cfg(test)] unlimited_fixture: bool,
@@ -235,28 +239,42 @@ pub struct RateGovernor {
 impl RateGovernor {
     #[cfg(test)]
     pub fn new(cancel: Arc<AtomicBool>, priority: Arc<AtomicU8>, pause: Arc<AtomicBool>, busy: Arc<AtomicBool>, _slow: bool) -> Self {
-        let mut value = Self::with_budgets(cancel, priority, pause, busy, Arc::new(VolumeBudgets::default()), Inventory::inspect());
+        let mut value = Self::with_budgets(cancel, priority, pause, busy, Arc::new(VolumeBudgets::default()), Arc::new(NetworkProbeGate::default()), Inventory::inspect());
         value.unlimited_fixture = true;
         value
     }
-    pub fn with_budgets(cancel: Arc<AtomicBool>, priority: Arc<AtomicU8>, pause: Arc<AtomicBool>, busy: Arc<AtomicBool>, budgets: Arc<VolumeBudgets>, inventory: Inventory) -> Self {
+    pub fn with_budgets(cancel: Arc<AtomicBool>, priority: Arc<AtomicU8>, pause: Arc<AtomicBool>, busy: Arc<AtomicBool>, budgets: Arc<VolumeBudgets>, network_gate: Arc<NetworkProbeGate>, inventory: Inventory) -> Self {
         Self {
             scratch: ScratchBudget { used: Arc::new(AtomicU64::new(0)), priority: priority.clone() },
             cancel, priority, background_pause: pause, background_busy: busy,
-            budgets, inventory, current_volume: Volume { key: "unclassified".into(), class: VolumeClass::NetworkOrUnknown },
-            operations: 0,
+            budgets, network_gate, inventory,
+            current_volume: Volume { key: "unclassified".into(), class: VolumeClass::NetworkOrUnknown },
+            current_directory: None, last_network_probe: Instant::now(), operations: 0,
             #[cfg(test)] unlimited_fixture: false,
         }
     }
     pub fn enter_directory(&mut self, path: &Path) -> Result<(), ScanExit> {
         self.current_volume = self.inventory.for_path(path);
+        self.current_directory = Some(path.to_path_buf());
+        #[cfg(test)]
+        if self.unlimited_fixture { return Ok(()); }
         if self.priority.load(Ordering::Acquire) < 2
-            && self.current_volume.class == VolumeClass::NetworkOrUnknown
-            && std::env::var_os("TONEPOET_ACCOUNTING_ALLOW_UNKNOWN_VOLUMES").as_deref()
-                != Some(std::ffi::OsStr::new("1")) {
-            return Err(ScanExit::Failed(format!("background accounting deferred on unsupported volume: {}", path.display())));
+            && self.current_volume.class == VolumeClass::NetworkOrUnknown {
+            self.check_network_background(path)?;
         }
         Ok(())
+    }
+    fn check_network_background(&mut self, path: &Path) -> Result<(), ScanExit> {
+        let permitted = self.network_gate.permit(&self.current_volume, path, &self.cancel);
+        self.last_network_probe = Instant::now();
+        match permitted {
+            Some(true) => Ok(()),
+            // A Folder Properties request can promote this worker while the
+            // probe is doing synchronous metadata I/O.
+            Some(false) if self.priority.load(Ordering::Acquire) >= 2 => Ok(()),
+            Some(false) => Err(ScanExit::Deferred),
+            None => Err(ScanExit::Cancelled),
+        }
     }
     pub fn tick(&mut self, cost: f64) -> Result<(), ScanExit> {
         loop {
@@ -268,7 +286,26 @@ impl RateGovernor {
                 std::thread::sleep(Duration::from_millis(15));
                 continue;
             }
-            let delay = self.budgets.charge(&self.current_volume, foreground, cost);
+            // Foreground scans are user-requested. Never debit the shared
+            // background bucket or sleep for token replenishment; retained
+            // cancellation checks and cooperative yields still apply.
+            if foreground {
+                self.operations = self.operations.wrapping_add(1);
+                if self.operations % 128 == 0 { std::thread::yield_now(); }
+                return Ok(());
+            }
+            // Reprobe during a very wide directory too: otherwise a single
+            // read_dir that takes hours could retain an obsolete fast-link
+            // admission indefinitely without entering another directory.
+            if self.current_volume.class == VolumeClass::NetworkOrUnknown
+                && self.last_network_probe.elapsed() >= Duration::from_secs(60) {
+                if let Some(path) = self.current_directory.clone() {
+                    self.check_network_background(&path)?;
+                }
+            }
+            // Priority can change while an sshfs metadata probe blocks.
+            if self.priority.load(Ordering::Acquire) >= 2 { continue; }
+            let delay = self.budgets.charge(&self.current_volume, false, cost);
             if delay.is_zero() {
                 self.operations = self.operations.wrapping_add(1);
                 if self.operations % 128 == 0 { std::thread::yield_now(); }
@@ -280,7 +317,7 @@ impl RateGovernor {
 }
 
 #[derive(Debug)]
-pub enum ScanExit { Cancelled, Failed(String), Changed(String) }
+pub enum ScanExit { Cancelled, Deferred, Failed(String), Changed(String) }
 impl From<String> for ScanExit { fn from(value: String) -> Self { Self::Failed(value) } }
 
 fn io_error(path: &Path, what: &str, error: impl std::fmt::Display) -> ScanExit {
@@ -317,6 +354,9 @@ fn inspect_directory(path: &Path, governor: &mut RateGovernor, progress: &mut Sc
             let audio = is_audio_name(&entry_path);
             counts.add_file(meta.len(), audio).map_err(|e| ScanExit::Failed(e.into()))?;
             progress.files_examined = progress.files_examined.checked_add(1).ok_or_else(|| ScanExit::Failed("file count overflow".into()))?;
+            if audio {
+                progress.audio_examined = progress.audio_examined.checked_add(1).ok_or_else(|| ScanExit::Failed("audio count overflow".into()))?;
+            }
             progress.bytes_examined = progress.bytes_examined.checked_add(meta.len() as u128).ok_or_else(|| ScanExit::Failed("byte count overflow".into()))?;
         } else if meta.is_dir() {
             children.push(entry_path).map_err(ScanExit::Failed)?;
@@ -427,6 +467,7 @@ where F: FnMut(ScanProgress), L: FnMut(Counts) {
             if let Err(exit) = governor.enter_directory(&path) {
                 return match exit {
                     ScanExit::Cancelled => ScanEnd::Cancelled(progress),
+                    ScanExit::Deferred => ScanEnd::Deferred(progress),
                     ScanExit::Failed(reason) => ScanEnd::Failed { reason, progress },
                     ScanExit::Changed(reason) => ScanEnd::Changed { reason, progress },
                 };
@@ -435,6 +476,7 @@ where F: FnMut(ScanProgress), L: FnMut(Counts) {
             let (counts, children, before, created, modified, observation, digest, root_identity) = match inspected {
                 Ok(value) => value,
                 Err(ScanExit::Cancelled) => return ScanEnd::Cancelled(progress),
+                Err(ScanExit::Deferred) => return ScanEnd::Deferred(progress),
                 Err(ScanExit::Failed(reason)) => return ScanEnd::Failed { reason, progress },
                 Err(ScanExit::Changed(reason)) => return ScanEnd::Changed { reason, progress },
             };
@@ -465,7 +507,12 @@ where F: FnMut(ScanProgress), L: FnMut(Counts) {
         let complete_frame = stack.pop().expect("checked nonempty");
         #[cfg(unix)] { active_ids.remove(&(complete_frame.before.dev, complete_frame.before.ino)); }
         if let Err(exit) = governor.tick(1.0) {
-            if matches!(exit, ScanExit::Cancelled) { return ScanEnd::Cancelled(progress); }
+            return match exit {
+                ScanExit::Cancelled => ScanEnd::Cancelled(progress),
+                ScanExit::Deferred => ScanEnd::Deferred(progress),
+                ScanExit::Failed(reason) => ScanEnd::Failed { reason, progress },
+                ScanExit::Changed(reason) => ScanEnd::Changed { reason, progress },
+            };
         }
         let final_meta = match fs::symlink_metadata(&complete_frame.path) {
             Ok(m) => m,
@@ -515,6 +562,13 @@ where F: FnMut(ScanProgress), L: FnMut(Counts) {
         let edge_batch_size: usize = pending_writes.iter()
             .map(|write| write.children.as_ref().map_or(0, Vec::len)).sum();
         if pending_writes.len() == 32 || edge_batch_size >= 512 || stack.is_empty() {
+            // A completed subtree can be staged while Cancel is requested.
+            // Recheck immediately before committing the next bounded batch.
+            // Earlier *complete child* batches may already exist; an
+            // interrupted root is never published as a complete aggregate.
+            if governor.cancel.load(Ordering::Acquire) {
+                return ScanEnd::Cancelled(progress);
+            }
             if let Some(repository) = repo.as_mut() {
                 match repository.put_batch_at_sequence(&pending_writes, expected_sequence) {
                     Ok(results) if results.iter().all(|&saved| saved) => {},
