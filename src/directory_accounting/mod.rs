@@ -35,10 +35,19 @@ struct Job {
     priority: Arc<AtomicU8>,
     explicit: bool,
     background_interest: bool,
+    /// A Browse Info Refresh independently owns the foreground scan even
+    /// while a Folder Properties dialog attaches and later detaches.
+    refresh_interest: bool,
     subscribers: HashSet<u64>,
     invalidation_generation: u64,
 }
-struct Pending { id: u64, path: PathBuf, explicit: bool, force: bool, subscriber: Option<u64> }
+struct Pending { id: u64, path: PathBuf, explicit: bool, force: bool, subscriber: Option<u64>, refresh_interest: bool }
+struct PreviewJob {
+    id: u64,
+    path: PathBuf,
+    cancel: Arc<AtomicBool>,
+    invalidation_generation: u64,
+}
 
 /// One UI-owned registry. It has *at most* one active explicit and one active
 /// background worker. A promoted background worker is never duplicated.
@@ -51,6 +60,8 @@ pub struct AccountingService {
     browse_dwell: Option<(PathBuf, Instant)>,
     highlight_dwell: Option<(PathBuf, Instant)>,
     background_tried: HashMap<PathBuf, Instant>,
+    preview_active: Option<PreviewJob>,
+    preview_tried: HashMap<PathBuf, Instant>,
     explicit_pause: Arc<AtomicBool>,
     background_busy: Arc<AtomicBool>,
     volume_budgets: Arc<VolumeBudgets>,
@@ -96,6 +107,7 @@ impl AccountingService {
         Self { db_path, active: HashMap::new(), queued: VecDeque::new(), next_id: 0,
             views: HashMap::new(), browse_dwell: None, highlight_dwell: None,
             background_tried: HashMap::new(),
+            preview_active: None, preview_tried: HashMap::new(),
             explicit_pause: Arc::new(AtomicBool::new(false)),
             background_busy: Arc::new(AtomicBool::new(false)),
             volume_budgets: Arc::new(VolumeBudgets::default()),
@@ -112,20 +124,83 @@ impl AccountingService {
         self.next_id = self.next_id.checked_add(1).unwrap_or(1);
         self.next_id
     }
+    /// Keep the UI projection bounded even when only direct-count previews
+    /// complete (for example on an unknown/sshfs volume). Pin both active
+    /// work and the two visible Browse roots during opportunistic eviction.
+    fn prune_views(&mut self) {
+        if self.views.len() <= 1024 { return; }
+        let pinned = self.active.keys()
+            .chain(self.queued.iter().map(|pending| &pending.path))
+            .chain(self.preview_active.iter().map(|job| &job.path))
+            .chain(self.browse_dwell.iter().map(|(path, _)| path))
+            .chain(self.highlight_dwell.iter().map(|(path, _)| path))
+            .cloned().collect::<HashSet<_>>();
+        let mut excess = self.views.len() - 1024;
+        let obsolete = self.views.keys().filter(|path| !pinned.contains(*path))
+            .take(excess).cloned().collect::<Vec<_>>();
+        for path in obsolete {
+            self.views.remove(&path);
+            excess -= 1;
+            if excess == 0 { break; }
+        }
+    }
     /// Return an *independent subscriber token*. A scan id is never used as
     /// authority to cancel another consumer's work.
     pub fn request_explicit(&mut self, path: PathBuf, force: bool, tx: &Sender<AppMessage>) -> u64 {
         let subscriber = self.next_id();
+        self.request_explicit_scan(path, force, Some(subscriber), tx);
+        subscriber
+    }
+
+    /// The Browse Info Refresh pill requests the same exhaustive foreground
+    /// walker as Folder Properties, without allocating a modal subscription.
+    /// A known-valid cached total is never silently replaced by a UI refresh.
+    pub fn request_refresh(&mut self, path: PathBuf, tx: &Sender<AppMessage>) -> bool {
+        if !path.is_absolute() || !self.refresh_available(&path) { return false; }
+        self.request_explicit_scan(path.clone(), true, None, tx);
+        // launch() reports thread-spawn failures in the view, with running
+        // cleared. Do not tell the caller a Refresh started when it did not.
+        self.views.get(&path).is_some_and(|view| view.running)
+    }
+
+    pub fn scan_pending(&self, path: &Path) -> bool {
+        self.queued.iter().any(|pending| pending.path == path && pending.explicit)
+    }
+
+    pub fn refresh_available(&self, path: &Path) -> bool {
+        // A queued background attempt is not an obstacle: the user-triggered
+        // Refresh supersedes it and owns foreground priority.
+        if self.scan_pending(path) { return false; }
+        if self.views.get(path).is_some_and(|view| view.running) { return false; }
+        self.views.get(path)
+            .and_then(|view| view.cached.as_ref())
+            .is_none_or(|cached| cached.freshness == Freshness::KnownInvalid)
+    }
+
+    fn request_explicit_scan(&mut self, path: PathBuf, force: bool,
+        subscriber: Option<u64>, tx: &Sender<AppMessage>) {
+        if let Some(job) = &self.preview_active {
+            if job.path == path { job.cancel.store(true, Ordering::Release); }
+        }
         let another_explicit = self.active.iter().any(|(other_path, job)|
             other_path != &path && job.explicit);
+        // A forced Folder Properties request must not replace and thereby
+        // lose an in-progress Info Refresh owned by the Browse pane.
+        let refresh_interest = subscriber.is_none()
+            || self.active.get(&path).is_some_and(|job| job.refresh_interest)
+            || self.queued.iter().any(|pending|
+                pending.path == path && pending.refresh_interest);
         if let Some(job) = self.active.get_mut(&path) {
             if !force && !another_explicit && !job.cancel.load(Ordering::Acquire) {
-                job.subscribers.insert(subscriber);
+                if let Some(subscriber) = subscriber {
+                    job.subscribers.insert(subscriber);
+                    self.views.entry(path).or_default().subscription = Some(subscriber);
+                }
                 job.explicit = true;
+                job.refresh_interest |= subscriber.is_none();
                 job.priority.store(2, Ordering::Release);
-                self.views.entry(path).or_default().subscription = Some(subscriber);
                 self.refresh_pause();
-                return subscriber;
+                return;
             }
             // Force replaces the previous generation. A second explicit scan
             // must queue until the worker acknowledges cancellation; never
@@ -134,21 +209,35 @@ impl AccountingService {
         }
         self.queued.retain(|p| p.path != path);
         let scan_id = self.next_id();
-        self.views.entry(path.clone()).or_default().subscription = Some(subscriber);
+        let view = self.views.entry(path.clone()).or_default();
+        if let Some(subscriber) = subscriber { view.subscription = Some(subscriber); }
+        // Only a modal-less Info Refresh needs a queued-running indicator.
+        // Modal subscriptions retain their existing queued/cancel semantics.
+        if subscriber.is_none() { view.running = true; }
         if self.active.contains_key(&path) || self.active.values().any(|job| job.explicit) {
-            self.queued.push_front(Pending { id: scan_id, path, explicit: true, force, subscriber: Some(subscriber) });
+            self.queued.push_front(Pending { id: scan_id, path, explicit: true, force, subscriber, refresh_interest });
         } else {
-            self.launch(path, true, force, scan_id, Some(subscriber), tx);
+            self.launch(path, true, force, scan_id, subscriber, refresh_interest, tx);
         }
-        subscriber
     }
     /// Detach only this modal. Background-originated work survives a close or
     /// cancel, even if its priority had been promoted for Folder Properties.
     pub fn detach_explicit(&mut self, path: &Path, subscriber: u64) {
+        // A queued forced Properties replacement can also carry the Browse
+        // Refresh interest. Closing the modal detaches its subscription but
+        // must not discard the queued independent refresh.
+        for pending in &mut self.queued {
+            if pending.path == path && pending.subscriber == Some(subscriber)
+                && pending.refresh_interest
+            { pending.subscriber = None; }
+        }
         self.queued.retain(|p| !(p.path == path && p.subscriber == Some(subscriber)));
         if let Some(job) = self.active.get_mut(path) {
             if job.subscribers.remove(&subscriber) && job.subscribers.is_empty() {
-                if job.background_interest {
+                if job.refresh_interest {
+                    // This dialog does not own the Browse-initiated work.
+                    // Keep foreground priority and do not cancel the scan.
+                } else if job.background_interest {
                     job.explicit = false;
                     job.priority.store(1, Ordering::Release);
                 } else {
@@ -170,6 +259,42 @@ impl AccountingService {
             _ => { *dwell = Some((path, Instant::now())); None }
         }
     }
+    /// One cancellable, nonrecursive filesystem read is permitted at a time.
+    /// This is deliberately independent of the volume policy for background
+    /// recursive accounting: on sshfs, a settled highlight still gets counts.
+    fn consider_preview(&mut self, highlighted: Option<&Path>, settled: Option<PathBuf>, tx: &Sender<AppMessage>) {
+        if let Some(job) = &self.preview_active {
+            if highlighted != Some(job.path.as_path()) {
+                job.cancel.store(true, Ordering::Release);
+            }
+        }
+        let Some(path) = settled else { return; };
+        if !path.is_absolute() || self.preview_active.is_some()
+            || self.views.get(&path).is_some_and(|v| v.local.is_some())
+            || self.active.contains_key(&path)
+            || self.queued.iter().any(|pending| pending.path == path)
+            || self.preview_tried.get(&path).is_some_and(|when| when.elapsed() < Duration::from_secs(30))
+        { return; }
+        self.preview_tried.insert(path.clone(), Instant::now());
+        let id = self.next_id();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let token = cancel.clone();
+        let worker_path = path.clone();
+        let sender = tx.clone();
+        let generation = self.invalidation_generation;
+        match std::thread::Builder::new().name("tonepoet-directory-preview".into()).spawn(move || {
+            let result = scanner::preview_local_counts(&worker_path, &token);
+            let _ = sender.blocking_send(AppMessage::DirectoryAccounting(Event::LocalPreview {
+                id, path: worker_path, result,
+            }));
+        }) {
+            Ok(_) => self.preview_active = Some(PreviewJob {
+                id, path, cancel, invalidation_generation: generation,
+            }),
+            Err(error) => log::warn!("directory preview thread unavailable: {error}"),
+        }
+    }
+
     pub fn consider_background(&mut self, current: Option<PathBuf>, highlighted: Option<PathBuf>, tx: &Sender<AppMessage>) {
         // Navigation changes immediately discard not-yet-started roots. An
         // active unrelated walk is cancelled at the next metadata I/O token.
@@ -180,10 +305,21 @@ impl AccountingService {
             if !job.explicit && !relevant(&job.path) { job.cancel.store(true, Ordering::Release); }
         }
         let settled_current = Self::settled(&mut self.browse_dwell, current, Duration::from_millis(750));
-        let settled_highlight = Self::settled(&mut self.highlight_dwell, highlighted, Duration::from_millis(1500));
+        let settled_highlight = Self::settled(&mut self.highlight_dwell, highlighted.clone(), Duration::from_millis(1500));
+        self.consider_preview(highlighted.as_deref(), settled_highlight.clone(), tx);
         // Prefer current Browse folder, then a cursor-stable highlighted folder.
         for candidate in [settled_current, settled_highlight].into_iter().flatten() {
             if candidate.is_absolute() { self.queue_background_if_needed(candidate, tx); }
+        }
+        if self.preview_tried.len() > 1024 {
+            self.preview_tried.retain(|_, when| when.elapsed() < Duration::from_secs(30));
+            if self.preview_tried.len() > 1024 {
+                let mut attempts = self.preview_tried.iter().map(|(path, when)| (path.clone(), *when)).collect::<Vec<_>>();
+                attempts.sort_unstable_by_key(|(_, when)| *when);
+                for (path, _) in attempts.into_iter().take(self.preview_tried.len() - 1024) {
+                    self.preview_tried.remove(&path);
+                }
+            }
         }
         if self.background_tried.len() > 4096 {
             self.background_tried.retain(|_, time| time.elapsed() < Duration::from_secs(86400));
@@ -207,18 +343,19 @@ impl AccountingService {
         if self.queued.len() >= 64 { return; }
         self.background_tried.insert(path.clone(), Instant::now());
         if self.active.values().any(|j| !j.explicit) || self.active.values().any(|j| j.explicit) {
-            self.queued.push_back(Pending { id: 0, path, explicit: false, force: false, subscriber: None });
+            self.queued.push_back(Pending { id: 0, path, explicit: false, force: false, subscriber: None, refresh_interest: false });
         } else {
             let id = self.next_id();
-            self.launch(path, false, false, id, None, tx);
+            self.launch(path, false, false, id, None, false, tx);
         }
     }
-    fn launch(&mut self, path: PathBuf, explicit: bool, force: bool, id: u64, subscriber: Option<u64>, tx: &Sender<AppMessage>) {
+    fn launch(&mut self, path: PathBuf, explicit: bool, force: bool, id: u64,
+        subscriber: Option<u64>, refresh_interest: bool, tx: &Sender<AppMessage>) {
         let cancel = Arc::new(AtomicBool::new(false));
         let priority = Arc::new(AtomicU8::new(if explicit { 2 } else { 1 }));
         self.active.insert(path.clone(), Job {
             id, path: path.clone(), cancel: cancel.clone(), priority: priority.clone(),
-            explicit, background_interest: !explicit,
+            explicit, background_interest: !explicit, refresh_interest,
             subscribers: subscriber.into_iter().collect(),
             invalidation_generation: self.invalidation_generation,
         });
@@ -355,7 +492,27 @@ impl AccountingService {
         }
     }
     pub fn accept_event(&mut self, event: &Event, tx: &Sender<AppMessage>) -> bool {
+        if let Event::LocalPreview { id, path, result } = event {
+            let Some(job) = self.preview_active.as_ref() else { return false; };
+            if job.id != *id || job.path != *path { return false; }
+            let valid = !job.cancel.load(Ordering::Acquire)
+                && job.invalidation_generation == self.invalidation_generation
+                && !self.active.get(path).is_some_and(|job| job.explicit)
+                && !self.queued.iter().any(|pending| pending.path == *path && pending.explicit);
+            if valid {
+                if let Ok(Some(counts)) = result {
+                    let view = self.views.entry(path.clone()).or_default();
+                    if view.local.is_none() { view.local = Some(*counts); }
+                }
+            } else {
+                self.preview_tried.remove(path);
+            }
+            self.preview_active = None;
+            self.prune_views();
+            return valid && matches!(result, Ok(Some(_)));
+        }
         let (id, path) = match event {
+            Event::LocalPreview { .. } => unreachable!("handled above"),
             Event::Cached { id, path, .. } | Event::Local { id, path, .. } |
             Event::Progress { id, path, .. } | Event::Finished { id, path, .. } |
             Event::Ready { id, path } => (*id, path),
@@ -372,14 +529,18 @@ impl AccountingService {
             Event::Cached { value, error, .. } => {
                 if let Some(value) = value {
                     let mut value = value.clone();
-                    // A DB lookup may finish after an application mutation;
-                    // never let that response revive invalidated measurements.
-                    if !unchanged_since_launch { value.freshness = Freshness::KnownInvalid; }
+                    // A late cache read must not clear either a local mutation
+                    // fence or a previously known invalidity. Only a successful
+                    // exhaustive scan can replace an invalid historical total.
+                    if !unchanged_since_launch || view.cached.as_ref()
+                        .is_some_and(|prior| prior.freshness == Freshness::KnownInvalid)
+                    { value.freshness = Freshness::KnownInvalid; }
                     view.cached = Some(value);
                 }
                 if error.is_some() && value.is_none() { view.cached = None; }
                 if let Some(error) = error { view.error = Some(error.clone()); }
             }
+            Event::LocalPreview { .. } => unreachable!("handled above"),
             Event::Local { counts, .. } => {
                 if unchanged_since_launch { view.local = Some(*counts); }
             },
@@ -429,24 +590,22 @@ impl AccountingService {
             if let Some(index) = index {
                 if let Some(pending) = self.queued.remove(index) {
                     let id = if pending.id == 0 { self.next_id() } else { pending.id };
-                    self.launch(pending.path, pending.explicit, pending.force, id, pending.subscriber, tx);
+                    self.launch(pending.path, pending.explicit, pending.force, id,
+                        pending.subscriber, pending.refresh_interest, tx);
                 }
             }
         }
-        if self.views.len() > 1024 {
-            let pinned = self.active.keys().chain(self.queued.iter().map(|p| &p.path))
-                .cloned().collect::<std::collections::HashSet<_>>();
-            let overflow = self.views.len() - 1024;
-            let to_remove = self.views.keys().filter(|path| !pinned.contains(*path))
-                .take(overflow).cloned().collect::<Vec<_>>();
-            for obsolete in to_remove { self.views.remove(&obsolete); }
-        }
+        self.prune_views();
         true
     }
     pub fn invalidate(&mut self, paths: Vec<PathBuf>) {
         self.invalidation_generation = self.invalidation_generation.checked_add(1).unwrap_or(1);
         for path in &paths {
             for ancestor in path.ancestors() {
+                self.preview_tried.remove(ancestor);
+                if let Some(job) = &self.preview_active {
+                    if job.path == ancestor { job.cancel.store(true, Ordering::Release); }
+                }
                 self.background_tried.remove(ancestor);
                 if let Some(view) = self.views.get_mut(ancestor) {
                     view.local = None;
@@ -478,6 +637,7 @@ impl AccountingService {
 impl Drop for AccountingService {
     fn drop(&mut self) {
         for job in self.active.values() { job.cancel.store(true, Ordering::Release); }
+        if let Some(job) = &self.preview_active { job.cancel.store(true, Ordering::Release); }
     }
 }
 
@@ -492,9 +652,227 @@ mod service_tests {
         Job {
             id, path: path.to_path_buf(), cancel: Arc::new(AtomicBool::new(false)),
             priority: Arc::new(AtomicU8::new(if explicit { 2 } else { 1 })),
-            explicit, background_interest: !explicit,
+            explicit, background_interest: !explicit, refresh_interest: false,
             subscribers: HashSet::new(), invalidation_generation: generation,
         }
+    }
+
+    #[test]
+    fn preview_event_is_isolated_and_fail_closed() {
+        let mut service = AccountingService::new(None);
+        let path = PathBuf::from("/music/album");
+        let other = PathBuf::from("/music/other");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        service.preview_active = Some(PreviewJob {
+            id: 20, path: path.clone(), cancel: cancel.clone(), invalidation_generation: 0,
+        });
+        let counts = Counts { folders: 1, files: 7, audio: 6, ..Counts::default() };
+        assert!(!service.accept_event(&Event::LocalPreview {
+            id: 19, path: path.clone(), result: Ok(Some(counts)),
+        }, &tx));
+        assert!(!service.accept_event(&Event::LocalPreview {
+            id: 20, path: other, result: Ok(Some(counts)),
+        }, &tx));
+        assert!(service.views.is_empty());
+        assert!(service.accept_event(&Event::LocalPreview {
+            id: 20, path: path.clone(), result: Ok(Some(counts)),
+        }, &tx));
+        assert_eq!(service.view(&path).unwrap().local.unwrap().files, 7);
+        assert!(service.preview_active.is_none());
+        service.preview_active = Some(PreviewJob {
+            id: 21, path: path.clone(), cancel, invalidation_generation: 0,
+        });
+        service.invalidate(vec![path.clone()]);
+        assert!(!service.accept_event(&Event::LocalPreview {
+            id: 21, path: path.clone(), result: Ok(Some(counts)),
+        }, &tx));
+        assert!(service.view(&path).unwrap().local.is_none());
+    }
+
+    #[tokio::test]
+    async fn settled_highlight_starts_only_one_one_level_preview() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("highlight");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("track.flac"), b"123").unwrap();
+        let mut service = AccountingService::new(None);
+        // Prevent the independent recursive background queue from joining
+        // this fixture. The preview must be a separate worker.
+        service.background_tried.insert(root.clone(), Instant::now());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        service.consider_background(None, Some(root.clone()), &tx);
+        assert!(service.preview_active.is_none(), "cursor has not settled");
+        service.highlight_dwell = Some((root.clone(), Instant::now() - Duration::from_secs(2)));
+        service.consider_background(None, Some(root.clone()), &tx);
+        assert!(service.preview_active.is_some());
+        service.consider_background(None, Some(root.clone()), &tx);
+        assert!(service.preview_active.is_some(), "must not spawn another reader");
+        let message = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await.expect("worker returned").expect("preview event");
+        let AppMessage::DirectoryAccounting(event) = message else { panic!("unexpected event") };
+        assert!(matches!(event, Event::LocalPreview { .. }));
+        assert!(service.accept_event(&event, &tx));
+        assert_eq!(service.view(&root).unwrap().local.unwrap().audio, 1);
+        assert!(service.preview_active.is_none());
+    }
+
+    #[tokio::test]
+    async fn refresh_runs_exhaustive_foreground_scan_without_modal_subscription() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(root.join("subfolder")).unwrap();
+        std::fs::write(root.join("subfolder").join("song.flac"), b"ABCD").unwrap();
+        let mut service = AccountingService::new(None);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        assert!(service.refresh_available(&root));
+        assert!(service.request_refresh(root.clone(), &tx));
+        assert!(service.view(&root).unwrap().running);
+        assert!(service.view(&root).unwrap().subscription.is_none());
+        assert!(service.active.get(&root).unwrap().explicit);
+        assert!(!service.request_refresh(root.clone(), &tx));
+        let mut completed = false;
+        while let Some(message) = tokio::time::timeout(Duration::from_secs(15), rx.recv()).await.unwrap() {
+            let AppMessage::DirectoryAccounting(event) = message else { panic!("unexpected event"); };
+            let finished = matches!(event, Event::Finished { .. });
+            service.accept_event(&event, &tx);
+            if finished { completed = true; break; }
+        }
+        assert!(completed);
+        let view = service.view(&root).unwrap();
+        assert!(!view.running);
+        assert!(view.subscription.is_none());
+        assert_eq!(view.cached.as_ref().unwrap().measurement.counts.bytes, 4);
+        assert_eq!(view.cached.as_ref().unwrap().measurement.counts.folders, 1);
+        assert!(!service.refresh_available(&root));
+    }
+
+    #[test]
+    fn manual_refresh_supersedes_queued_background_attempt() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("catalogue");
+        std::fs::create_dir(&path).unwrap();
+        let mut service = AccountingService::new(None);
+        service.queued.push_back(Pending {
+            id: 0, path: path.clone(), explicit: false, force: false,
+            subscriber: None, refresh_interest: false,
+        });
+        assert!(service.refresh_available(&path));
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        assert!(service.request_refresh(path.clone(), &tx));
+        assert!(!service.queued.iter().any(|pending| pending.path == path));
+        let active = service.active.get(&path).unwrap();
+        assert!(active.explicit);
+        assert!(active.refresh_interest);
+        assert!(!service.refresh_available(&path));
+    }
+
+    #[test]
+    fn explicit_queue_is_reported_to_info_as_pending() {
+        let mut service = AccountingService::new(None);
+        let path = PathBuf::from("/music/queued");
+        service.queued.push_back(Pending {
+            id: 42, path: path.clone(), explicit: true, force: true,
+            subscriber: Some(43), refresh_interest: false,
+        });
+        assert!(service.scan_pending(&path));
+        assert!(!service.refresh_available(&path));
+    }
+
+    #[test]
+    fn focus_change_cancels_a_previously_started_preview() {
+        let mut service = AccountingService::new(None);
+        let old = PathBuf::from("/music/old");
+        let new = PathBuf::from("/music/new");
+        let cancel = Arc::new(AtomicBool::new(false));
+        service.preview_active = Some(PreviewJob {
+            id: 32, path: old.clone(), cancel: cancel.clone(), invalidation_generation: 0,
+        });
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        service.consider_background(None, Some(new), &tx);
+        assert!(cancel.load(Ordering::Acquire), "moving focus fences the old reader");
+        assert!(!service.accept_event(&Event::LocalPreview {
+            id: 32, path: old.clone(),
+            result: Ok(Some(Counts { files: 3, ..Counts::default() })),
+        }, &tx));
+        assert!(service.view(&old).is_none(), "cancelled count cannot update UI");
+    }
+
+    #[test]
+    fn browse_refresh_survives_properties_subscriber_detach() {
+        let mut service = AccountingService::new(None);
+        let path = PathBuf::from("/music/still-scanning");
+        let mut refresh = job(&path, 33, true, 0);
+        refresh.refresh_interest = true;
+        service.active.insert(path.clone(), refresh);
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let modal = service.request_explicit(path.clone(), false, &tx);
+        assert!(service.active.get(&path).unwrap().subscribers.contains(&modal));
+        service.detach_explicit(&path, modal);
+        let remaining = service.active.get(&path).unwrap();
+        assert!(remaining.refresh_interest);
+        assert!(remaining.explicit);
+        assert_eq!(remaining.priority.load(Ordering::Acquire), 2);
+        assert!(!remaining.cancel.load(Ordering::Acquire));
+        assert!(remaining.subscribers.is_empty());
+    }
+
+    #[test]
+    fn queued_replacement_preserves_browse_refresh_when_modal_closes() {
+        let mut service = AccountingService::new(None);
+        let path = PathBuf::from("/music/queued-refresh");
+        let mut refresh = job(&path, 34, true, 0);
+        refresh.refresh_interest = true;
+        let cancel = refresh.cancel.clone();
+        service.active.insert(path.clone(), refresh);
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let modal = service.request_explicit(path.clone(), true, &tx);
+        assert!(cancel.load(Ordering::Acquire));
+        assert_eq!(service.queued.len(), 1);
+        assert_eq!(service.queued.front().unwrap().subscriber, Some(modal));
+        assert!(service.queued.front().unwrap().refresh_interest);
+        service.detach_explicit(&path, modal);
+        let pending = service.queued.front().expect("independent refresh remains queued");
+        assert_eq!(pending.path, path);
+        assert_eq!(pending.subscriber, None);
+        assert!(pending.refresh_interest);
+    }
+
+    #[test]
+    fn failed_refresh_does_not_revive_known_invalid_saved_size() {
+        let mut service = AccountingService::new(None);
+        let path = PathBuf::from("/music/invalidated");
+        service.active.insert(path.clone(), job(&path, 35, true, 0));
+        let now = SystemTime::now();
+        let measurement = CompleteMeasurement {
+            path: path.clone(), counts: Counts { bytes: 99_999, ..Counts::default() },
+            started: now, finished: now, created: None, modified: None,
+            generation: 1, observation: Observation::AsObserved,
+        };
+        service.views.entry(path.clone()).or_default().cached = Some(CachedMeasurement {
+            measurement: measurement.clone(), freshness: Freshness::KnownInvalid,
+        });
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        assert!(service.accept_event(&Event::Cached {
+            id: 35, path: path.clone(),
+            value: Some(CachedMeasurement {
+                measurement, freshness: Freshness::AsObserved,
+            }),
+            error: None,
+        }, &tx));
+        assert_eq!(service.view(&path).unwrap().cached.as_ref().unwrap().freshness,
+            Freshness::KnownInvalid);
+        assert!(service.accept_event(&Event::Finished {
+            id: 35, path: path.clone(),
+            end: ScanEnd::Failed {
+                reason: "directory unavailable".to_string(),
+                progress: ScanProgress::default(),
+            },
+        }, &tx));
+        assert_eq!(service.view(&path).unwrap().cached.as_ref().unwrap().freshness,
+            Freshness::KnownInvalid);
+        assert!(service.refresh_available(&path));
     }
 
     #[test]

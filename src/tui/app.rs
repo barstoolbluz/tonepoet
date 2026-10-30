@@ -14661,6 +14661,8 @@ pub type BrowseTextMouseTarget = EditorTextTarget;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BrowseInfoFocus {
     Metadata(crate::tui::probe::MetadataField),
+    /// The Total size Refresh pill for a physical directory selection.
+    Refresh,
 }
 
 /// Which field a TextEdit overlay is editing

@@ -84,6 +84,8 @@ pub enum ScanEnd {
 pub enum AccountingEvent {
     Cached { id: u64, path: PathBuf, value: Option<CachedMeasurement>, error: Option<String> },
     Local { id: u64, path: PathBuf, counts: Counts },
+    /// Ephemeral one-level Browse read, never a persisted subtree measurement.
+    LocalPreview { id: u64, path: PathBuf, result: Result<Option<Counts>, String> },
     Progress { id: u64, path: PathBuf, progress: ScanProgress },
     Finished { id: u64, path: PathBuf, end: ScanEnd },
     Ready { id: u64, path: PathBuf },

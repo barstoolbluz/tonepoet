@@ -183,7 +183,7 @@ pub async fn run_app(
                 app.analysis_pending > 0 || app.processing_active
             );
             if app.current_screen == AppScreen::Browse && !app.browse.is_in_archive() {
-                let highlighted = if app.browse.selected_entry().is_some_and(|entry| entry.is_child_dir()) {
+                let highlighted = if app.browse.selected_entry().is_some_and(|entry| entry.is_child_dir() && !entry.is_symlink) {
                     app.browse.selected_entry().map(|entry| entry.path.clone())
                 } else { None };
                 app.directory_accounting.consider_background(Some(app.browse.current_dir.clone()), highlighted, &tx);

@@ -1416,7 +1416,7 @@ fn browse_metadata_fields() -> [crate::tui::probe::MetadataField; 5] {
 fn browse_metadata_focus_field(app: &AppState) -> Option<crate::tui::probe::MetadataField> {
     match app.browse_info_focus {
         Some(BrowseInfoFocus::Metadata(field)) => Some(field),
-        None => None,
+        Some(BrowseInfoFocus::Refresh) | None => None,
     }
 }
 
@@ -4685,6 +4685,34 @@ fn browse_archive_inline_metadata_status(app: &mut AppState) {
     app.set_status("archive metadata: use Tags & Tagging to stage changes and repackage the archive");
 }
 
+/// The Info Refresh target is the directory actually shown in the Info pane,
+/// not an unrelated Explore-tree selection. Re-check it on activation so a
+/// stale mouse hit map cannot operate on a different path.
+fn browse_info_refresh_target(app: &AppState) -> Option<std::path::PathBuf> {
+    if app.browse.search.active || !app.browse.info_focus_available()
+        || app.browse.is_in_archive() { return None; }
+    let entry = app.browse.selected_entry()?;
+    if entry.is_symlink { return None; }
+    let path = if matches!(entry.kind, crate::convert::classify::EntryKind::ParentDir) {
+        app.browse.current_dir.clone()
+    } else if entry.is_child_dir() {
+        entry.path.clone()
+    } else { return None; };
+    (path.is_absolute() && app.directory_accounting.refresh_available(&path)).then_some(path)
+}
+
+fn activate_browse_info_refresh(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
+    let target = browse_info_refresh_target(app);
+    clear_browse_info_focus(app);
+    if let Some(path) = target {
+        if app.directory_accounting.request_refresh(path, tx) {
+            app.set_status("Calculating folder size");
+        } else {
+            app.set_status("Could not start folder size scan");
+        }
+    }
+}
+
 fn browse_metadata_focus_available(app: &AppState) -> bool {
     !app.browse.search.active
         && app.browse.info_focus_available()
@@ -4696,7 +4724,12 @@ fn browse_metadata_focus_available(app: &AppState) -> bool {
 /// layout does not render. Files is the always-visible recovery target.
 fn repair_browse_focus_visibility(app: &mut AppState) {
     app.browse.repair_navigation_pane_visibility();
-    if app.browse_info_focus.is_some() && !browse_metadata_focus_available(app) {
+    let info_available = match app.browse_info_focus {
+        Some(BrowseInfoFocus::Metadata(_)) => browse_metadata_focus_available(app),
+        Some(BrowseInfoFocus::Refresh) => browse_info_refresh_target(app).is_some(),
+        None => true,
+    };
+    if !info_available {
         clear_browse_info_focus(app);
         app.browse
             .set_navigation_pane(super::browse::BrowseNavigationPane::Files);
@@ -8011,7 +8044,9 @@ fn cycle_browse_pane_focus(app: &mut AppState, forward: bool) {
 
     repair_browse_focus_visibility(app);
     let tree_available = app.browse.explore_focus_available();
-    let info_available = browse_metadata_focus_available(app);
+    let metadata_available = browse_metadata_focus_available(app);
+    let refresh_available = browse_info_refresh_target(app).is_some();
+    let info_available = metadata_available || refresh_available;
 
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum FocusOwner {
@@ -8050,7 +8085,15 @@ fn cycle_browse_pane_focus(app: &mut AppState, forward: bool) {
     match owners[next_idx] {
         FocusOwner::Files => focus_browse_navigation_pane(app, Files),
         FocusOwner::Tree => focus_browse_navigation_pane(app, Tree),
-        FocusOwner::Info => cycle_browse_metadata_focus(app, forward),
+        FocusOwner::Info => {
+            // Disc-directory probes also populate metadata, but those rows
+            // have no editable metadata focus. Give the visible Refresh pill
+            // priority; audio files retain their existing metadata focus.
+            if refresh_available {
+                app.browse_info_focus = Some(BrowseInfoFocus::Refresh);
+                app.set_status("Browse Info Refresh focus — Enter to calculate, Esc returns to Files");
+            } else if metadata_available { cycle_browse_metadata_focus(app, forward); }
+        },
     }
 }
 
@@ -8059,10 +8102,20 @@ fn cycle_browse_pane_focus(app: &mut AppState, forward: bool) {
 /// commands are handled before this function, and every remaining key is
 /// consumed here so file-list navigation, selection, and destructive actions
 /// can never execute through an inactive pane.
-fn handle_browse_info_navigation_key(app: &mut AppState, key: KeyEvent) -> bool {
-    let Some(field) = browse_metadata_focus_field(app) else {
-        return false;
-    };
+fn handle_browse_info_navigation_key(app: &mut AppState, key: KeyEvent,
+    tx: &mpsc::Sender<AppMessage>) -> bool {
+    let Some(focus) = app.browse_info_focus else { return false; };
+    if focus == BrowseInfoFocus::Refresh {
+        match (key.code, key.modifiers) {
+            (KeyCode::Enter | KeyCode::Char(' '), KeyModifiers::NONE) =>
+                activate_browse_info_refresh(app, tx),
+            (KeyCode::Left, KeyModifiers::NONE) | (KeyCode::Esc, _) =>
+                focus_browse_navigation_pane(app, super::browse::BrowseNavigationPane::Files),
+            _ => {}, // Contain all other keys; no file-list fallthrough.
+        }
+        return true;
+    }
+    let BrowseInfoFocus::Metadata(field) = focus else { unreachable!("handled Refresh above"); };
 
     match (key.code, key.modifiers) {
         (KeyCode::Up, KeyModifiers::NONE) => {
@@ -8650,7 +8703,7 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
         // The Info dispatcher consumes every non-global key. Never permit an
         // unrecognized metadata key to fall through into file-list selection,
         // destructive actions, cursor movement, or future file-only bindings.
-        let consumed = handle_browse_info_navigation_key(app, key);
+        let consumed = handle_browse_info_navigation_key(app, key, tx);
         debug_assert!(consumed, "active Browse Info pane must consume every local key");
         return;
     }
@@ -73037,6 +73090,9 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     begin_browse_metadata_inline_edit(app, field, None);
                 }
             }
+            TuiButton::BrowseInfoRefresh => {
+                activate_browse_info_refresh(app, tx);
+            }
             TuiButton::BrowseInfoAnalyze => {
                 clear_browse_info_focus(app);
                 let cmd = super::command::Command::Analyze { force: false };
@@ -109449,6 +109505,138 @@ mod file_picker_browse_parity_regression_tests {
         );
         assert_eq!(app.browse.selected_index, 1);
         assert_eq!(app.browse.tree_cursor, tree_cursor);
+    }
+
+    #[test]
+    fn directory_refresh_is_reachable_by_tab_and_enter_without_leaking_file_commands() {
+        let temp = tempfile::tempdir().unwrap();
+        let child = temp.path().join("Folder");
+        std::fs::create_dir(&child).unwrap();
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
+            child.clone(), "Folder".into(), crate::convert::classify::EntryKind::Directory, 0, None,
+        )];
+        app.browse.selected_index = 0;
+        app.browse.explore_enabled = false;
+        app.browse.info_enabled = true;
+        app.browse.info_collapsed = false;
+        app.browse.set_navigation_pane(crate::tui::browse::BrowseNavigationPane::Files);
+        let (tx, _rx) = mpsc::channel(16);
+        cycle_browse_pane_focus(&mut app, true);
+        assert_eq!(app.browse_info_focus, Some(BrowseInfoFocus::Refresh));
+        let selection_before = app.browse.selected_index;
+        handle_browse_key(&mut app, KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE), &tx);
+        assert_eq!(app.browse.selected_index, selection_before);
+        assert_eq!(app.browse_info_focus, Some(BrowseInfoFocus::Refresh));
+        handle_browse_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        assert_eq!(app.browse_info_focus, None);
+        let view = app.directory_accounting.view(&child).expect("Refresh started");
+        assert!(view.running);
+        assert!(view.subscription.is_none());
+        assert!(!app.directory_accounting.refresh_available(&child));
+    }
+
+    #[test]
+    fn probed_disc_directories_focus_refresh_before_metadata() {
+        for kind in [
+            crate::convert::classify::EntryKind::DvdAudioDir,
+            crate::convert::classify::EntryKind::DvdVideoDir,
+            crate::convert::classify::EntryKind::BlurayDir,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let dir = temp.path().join("disc");
+            std::fs::create_dir(&dir).unwrap();
+            let mut app = AppState::new_for_test(TonepoetConfig::default());
+            app.current_screen = AppScreen::Browse;
+            app.browse.current_dir = temp.path().to_path_buf();
+            app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
+                dir.clone(), "disc".into(), kind, 0, None,
+            )];
+            app.browse.selected_index = 0;
+            app.browse.explore_enabled = false;
+            app.browse.info_enabled = true;
+            app.browse.info_collapsed = false;
+            app.browse.set_navigation_pane(crate::tui::browse::BrowseNavigationPane::Files);
+            install_test_cached_info(&mut app, dir.clone());
+            assert!(browse_metadata_focus_available(&app), "disc has cached probe");
+            assert_eq!(browse_info_refresh_target(&app), Some(dir.clone()));
+
+            let (tx, _rx) = mpsc::channel(16);
+            handle_browse_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &tx);
+            assert_eq!(app.browse_info_focus, Some(BrowseInfoFocus::Refresh));
+            let selected_before = app.browse.selected_index;
+            handle_browse_key(&mut app, KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE), &tx);
+            assert_eq!(app.browse.selected_index, selected_before);
+            assert_eq!(app.browse_info_focus, Some(BrowseInfoFocus::Refresh));
+            handle_browse_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+            assert_eq!(app.browse_info_focus, None);
+            assert!(app.directory_accounting.view(&dir).is_some_and(|view| view.running));
+        }
+    }
+
+    #[test]
+    fn ordinary_probed_audio_files_retain_metadata_focus() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("track.flac");
+        std::fs::write(&path, b"audio").unwrap();
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![browse_audio_entry(path.clone())];
+        app.browse.selected_index = 0;
+        app.browse.explore_enabled = false;
+        app.browse.info_enabled = true;
+        app.browse.info_collapsed = false;
+        install_test_cached_info(&mut app, path);
+        assert!(browse_metadata_focus_available(&app));
+        assert!(browse_info_refresh_target(&app).is_none());
+
+        let (tx, _rx) = mpsc::channel(16);
+        handle_browse_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &tx);
+        assert!(matches!(app.browse_info_focus, Some(BrowseInfoFocus::Metadata(_))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_directory_does_not_offer_keyboard_refresh() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("real");
+        std::fs::create_dir(&target).unwrap();
+        let link = temp.path().join("linked");
+        std::os::unix::fs::symlink(target, &link).unwrap();
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![crate::tui::browse::BrowseEntry::new_with_symlink(
+            link, "linked".into(), crate::convert::classify::EntryKind::Directory,
+            0, None, true, false,
+        )];
+        app.browse.selected_index = 0;
+        app.browse.explore_enabled = false;
+        app.browse.info_enabled = true;
+        app.browse.info_collapsed = false;
+        assert!(browse_info_refresh_target(&app).is_none());
+        let (tx, _rx) = mpsc::channel(4);
+        handle_browse_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &tx);
+        assert_ne!(app.browse_info_focus, Some(BrowseInfoFocus::Refresh));
+    }
+
+    #[test]
+    fn directory_refresh_focus_exits_when_info_is_collapsed() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
+            PathBuf::from("/music/folder"), "folder".into(), crate::convert::classify::EntryKind::Directory, 0, None,
+        )];
+        app.browse.selected_index = 0;
+        app.browse.info_enabled = true;
+        app.browse.info_collapsed = false;
+        app.browse_info_focus = Some(BrowseInfoFocus::Refresh);
+        app.browse.info_collapsed = true;
+        repair_browse_focus_visibility(&mut app);
+        assert!(app.browse_info_focus.is_none());
     }
 
     #[test]

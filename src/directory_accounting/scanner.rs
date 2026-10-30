@@ -338,6 +338,49 @@ fn inspect_directory(path: &Path, governor: &mut RateGovernor, progress: &mut Sc
     Ok((counts, children, before, created, modified, observation, digest, root_identity))
 }
 
+/// Count exactly one directory level for a settled Browse highlight. Unlike
+/// `scan`, this never descends, writes SQL, or publishes a recursive total.
+/// Errors and cancellations produce no counts, not partial numbers. It uses
+/// the same no-follow and audio-extension policy as the full walker.
+pub(super) fn preview_local_counts(path: &Path, cancel: &AtomicBool) -> Result<Option<Counts>, String> {
+    if cancel.load(Ordering::Acquire) { return Ok(None); }
+    let before_meta = fs::symlink_metadata(path)
+        .map_err(|e| format!("{}: read directory attributes: {e}", path.display()))?;
+    if !before_meta.is_dir() || is_excluded(&before_meta) {
+        return Err(format!("{} is not a real directory", path.display()));
+    }
+    let before = fingerprint(&before_meta);
+    let entries = fs::read_dir(path)
+        .map_err(|e| format!("{}: list directory: {e}", path.display()))?;
+    let mut counts = Counts::default();
+    for entry in entries {
+        if cancel.load(Ordering::Acquire) { return Ok(None); }
+        let entry = entry.map_err(|e| format!("{}: enumerate entry: {e}", path.display()))?;
+        let child = entry.path();
+        let metadata = fs::symlink_metadata(&child)
+            .map_err(|e| format!("{}: read entry: {e}", child.display()))?;
+        if is_excluded(&metadata) {
+            counts.excluded_links = counts.excluded_links.checked_add(1)
+                .ok_or("link count overflow")?;
+        } else if metadata.is_file() {
+            counts.add_file(metadata.len(), is_audio_name(&child))?;
+        } else if metadata.is_dir() {
+            counts.folders = counts.folders.checked_add(1)
+                .ok_or("folder count overflow")?;
+        } else {
+            counts.other = counts.other.checked_add(1)
+                .ok_or("entry count overflow")?;
+        }
+    }
+    if cancel.load(Ordering::Acquire) { return Ok(None); }
+    let after_meta = fs::symlink_metadata(path)
+        .map_err(|e| format!("{}: recheck directory: {e}", path.display()))?;
+    if !after_meta.is_dir() || is_excluded(&after_meta) || fingerprint(&after_meta) != before {
+        return Err(format!("{} changed during enumeration", path.display()));
+    }
+    Ok(Some(counts))
+}
+
 /// Full traversal is deliberately unbounded by depth, total bytes, file count,
 /// or wall clock. Rate limits affect speed only, never completion truth.
 pub fn scan<F, L>(root: &Path, generation: i64, repo: &mut Option<Repository>, governor: &mut RateGovernor,
@@ -664,6 +707,50 @@ mod tests {
         match execute(dir.path(), false) {
             ScanEnd::Complete { value, .. } => assert_eq!(value.counts.folders, 2055),
             other => panic!("unexpected result: {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod local_preview_tests {
+    use super::*;
+
+    #[test]
+    fn one_level_counts_do_not_descend_or_publish_link_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("music");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join("album")).unwrap();
+        fs::write(root.join("album").join("nested.flac"), b"nested").unwrap();
+        fs::write(root.join("song.FLAC"), b"audio").unwrap();
+        fs::write(root.join("cover.jpg"), b"cover").unwrap();
+        #[cfg(unix)] {
+            std::os::unix::fs::symlink(root.join("album"), root.join("shortcut")).unwrap();
+            std::os::unix::fs::symlink(root.join("song.FLAC"), root.join("linked.flac")).unwrap();
+        }
+        let cancel = AtomicBool::new(false);
+        let counts = preview_local_counts(&root, &cancel).unwrap().unwrap();
+        assert_eq!(counts.folders, 1);
+        assert_eq!(counts.files, 2);
+        assert_eq!(counts.audio, 1);
+        assert_eq!(counts.bytes, 10);
+        #[cfg(unix)] assert_eq!(counts.excluded_links, 2);
+        assert_eq!(counts.audio_bytes, 5);
+        assert_eq!(counts.other, 0);
+    }
+
+    #[test]
+    fn cancelled_or_non_directory_preview_has_no_counts() {
+        let temp = tempfile::tempdir().unwrap();
+        let cancel = AtomicBool::new(true);
+        assert!(preview_local_counts(temp.path(), &cancel).unwrap().is_none());
+        let file = temp.path().join("file.flac");
+        fs::write(&file, b"audio").unwrap();
+        assert!(preview_local_counts(&file, &AtomicBool::new(false)).is_err());
+        #[cfg(unix)] {
+            let link = temp.path().join("symlink");
+            std::os::unix::fs::symlink(temp.path(), &link).unwrap();
+            assert!(preview_local_counts(&link, &AtomicBool::new(false)).is_err());
         }
     }
 }
