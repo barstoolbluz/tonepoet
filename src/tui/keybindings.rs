@@ -6850,6 +6850,7 @@ mod inline_edit_behavior_tests {
                     title: Some("Old".to_string()),
                     ..Default::default()
                 },
+                transport: None,
             })),
         );
 
@@ -6928,6 +6929,7 @@ mod inline_edit_behavior_tests {
                     title: Some("Original".to_string()),
                     ..Default::default()
                 },
+                transport: None,
             })),
         );
 
@@ -7033,6 +7035,7 @@ mod inline_edit_behavior_tests {
                     title: Some("Original".to_string()),
                     ..Default::default()
                 },
+                transport: None,
             })),
         );
 
@@ -7148,6 +7151,7 @@ mod inline_edit_behavior_tests {
                     artist: Some(artist.to_string()),
                     ..Default::default()
                 },
+                transport: None,
             })
         };
         app.browse.insert_probe_for_identity(
@@ -41998,6 +42002,18 @@ pub fn open_metadata_editor_with_tx(app: &mut AppState, tx: &mpsc::Sender<AppMes
     );
 }
 
+/// Properties carries a single, exact filesystem target. Use the same editor
+/// backend and admission policy as Browse Alt+P, but never substitute an
+/// unrelated marked selection or a tree-pane file cursor for that target.
+pub(super) fn open_metadata_editor_for_properties(
+    app: &mut AppState, path: PathBuf, tx: &mpsc::Sender<AppMessage>,
+) {
+    open_metadata_editor_impl_for_selection(
+        app, Some(tx), super::cue_parser::DEFAULT_FRONTEND_CUE_POLICY,
+        app.cue_selection_overrides.clone(), vec![path],
+    );
+}
+
 #[cfg(test)]
 pub(crate) fn explicit_native_multi_file_embedded_title_for_test(
     paths: &[std::path::PathBuf],
@@ -71509,10 +71525,15 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
         .host_clipboard_interaction_generation
         .checked_add(1)
         .unwrap_or(1);
+    // Properties owns every pointer event ahead of any parked text editor or
+    // underlying Browse widget. Hitboxes come from the current painted frame.
+    if matches!(app.active_overlay, ActiveOverlay::FolderProperties(_)) {
+        super::directory_properties::handle_mouse(app, mouse, tx);
+        return;
+    }
     if handle_editor_text_mouse(app, mouse) {
         return;
     }
-
     // Metadata editor mouse: intercept all events when the editor is open.
     if matches!(app.active_overlay, ActiveOverlay::MetadataEditor(_)) {
         // Mouse movement can damage terminal graphics layers without changing
@@ -73317,7 +73338,11 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::MetadataChapterSave
             | TuiButton::MetadataReplayGainScanTrack
             | TuiButton::MetadataReplayGainScanAlbum
-            | TuiButton::MetadataEntryView(_) => {}
+            | TuiButton::MetadataEntryView(_)
+            | TuiButton::PropertiesEditMetadata
+            | TuiButton::PropertiesRecalculate
+            | TuiButton::PropertiesCancel
+            | TuiButton::PropertiesOk => {}
 
             // ── Template builder: open pills ──
             TuiButton::TemplateBuildFolderButton => {
@@ -109302,6 +109327,7 @@ mod file_picker_browse_parity_regression_tests {
                     file_size: 0,
                 },
                 metadata: crate::tui::probe::SourceMetadata::default(),
+                transport: None,
             })),
         );
     }
@@ -110467,6 +110493,7 @@ mod file_picker_browse_parity_regression_tests {
                     album: Some("Even in the Quietest Moments...".to_string()),
                     ..crate::tui::probe::SourceMetadata::default()
                 },
+                transport: None,
             })),
         );
         app.browse.info_enabled = true;
@@ -110532,7 +110559,7 @@ mod file_picker_browse_parity_regression_tests {
     }
 
     #[test]
-    fn ctrl_p_opens_folder_properties_but_ctrl_p_on_regular_files_does_not() {
+    fn ctrl_p_opens_properties_for_folders_and_files() {
         let root = tempfile::tempdir().unwrap();
         let folder = root.path().join("albums");
         std::fs::create_dir(&folder).unwrap();
@@ -110556,11 +110583,18 @@ mod file_picker_browse_parity_regression_tests {
         let file = root.path().join("notes.txt");
         std::fs::write(&file, b"note").unwrap();
         app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
-            file, "notes.txt".into(), crate::convert::classify::EntryKind::OtherFile,
+            file.clone(), "notes.txt".into(), crate::convert::classify::EntryKind::OtherFile,
             4, None,
         )];
         handle_key(&mut app, KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL), &tx);
-        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+        match &app.active_overlay {
+            ActiveOverlay::FolderProperties(properties) => {
+                assert_eq!(properties.path, file);
+                assert!(matches!(properties.subject, super::super::directory_properties::PropertiesSubject::File { size: 4, .. }));
+                assert!(properties.request_id.is_none(), "files must not start recursive scans");
+            }
+            other => panic!("Ctrl+P must show file Properties: {other:?}"),
+        }
     }
 
     #[tokio::test]

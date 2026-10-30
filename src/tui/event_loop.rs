@@ -8135,7 +8135,15 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                         // which carries generation and baseline guards. Keeping
                         // this reducer browse-only prevents late navigation probes
                         // from resetting Convert metadata or output settings.
-                        let metadata = std::fs::metadata(&path).ok();
+                        // VOB/M2TS inventories have no audio-only database
+                        // representation or HDCD analysis. The focus identity
+                        // was already checked above, so do not stat the source
+                        // again or issue unrelated SQLite reads.
+                        let metadata = if info.transport.is_some() {
+                            None
+                        } else {
+                            std::fs::metadata(&path).ok()
+                        };
                         if let Some(meta) = metadata.as_ref() {
                             let mtime = meta
                                 .modified()
@@ -8174,6 +8182,9 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                         );
                         app.browse.mark_probe_cache_update_pending(false);
 
+                        // Transport inventories have no representation in the
+                        // persistent single-audio-stream cache schema. Do not
+                        // write a partial row that will mask the real preview.
                         if let Some(meta) = metadata.as_ref() {
                             let mtime = meta
                                 .modified()
@@ -21306,6 +21317,7 @@ mod async_message_drain_tests {
                 title: Some(title.to_string()),
                 ..Default::default()
             },
+            transport: None,
         }
     }
 

@@ -345,6 +345,12 @@ pub enum TuiButton {
     BrowseOptionsFilterChoice(usize),
     BrowseOptionsArchiveChoice(usize),
 
+    // Properties modal actions, recorded from the painted pill rectangles.
+    PropertiesEditMetadata,
+    PropertiesRecalculate,
+    PropertiesCancel,
+    PropertiesOk,
+
     // Browse info pane: clickable metadata field (click → edit tag).
     BrowseInfoMeta(crate::tui::probe::MetadataField),
     // Browse info pane: foreground recursive accounting on demand.
@@ -609,7 +615,11 @@ impl TuiButton {
             | Self::FormatSettingsSoxChebyshev(_)
             | Self::FormatSettingsSoxAliasing(_)
             | Self::FormatSettingsSoxSincPhase(_)
-            | Self::FormatSettingsSoxrChebyshev(_) => None,
+            | Self::FormatSettingsSoxrChebyshev(_)
+            | Self::PropertiesEditMetadata
+            | Self::PropertiesRecalculate
+            | Self::PropertiesCancel
+            | Self::PropertiesOk => None,
             Self::Pane(_)
             | Self::FormatPill(_)
             | Self::RatePill(_)

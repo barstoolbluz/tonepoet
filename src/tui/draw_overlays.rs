@@ -589,7 +589,7 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState, theme: super::theme::Them
     match overlay {
         ActiveOverlay::None => {}
         ActiveOverlay::FolderProperties(ref state) => {
-            super::draw_directory_properties::draw(f, state, &app.directory_accounting, theme);
+            super::draw_directory_properties::draw(f, state, &app.directory_accounting, &mut app.button_map, theme);
         }
         ActiveOverlay::ThemeBuilder(_) => {}
         ActiveOverlay::Confirmation {

@@ -157,7 +157,7 @@ pub enum ContextAction {
     EditMetadata(crate::tui::probe::MetadataField),
     /// Open the full metadata editor overlay.
     EditMetadataFull,
-    /// Open a true filesystem folder properties modal (not the metadata editor).
+    /// Open filesystem Properties for an exact Browse path (not the metadata editor).
     OpenFilesystemProperties(PathBuf),
     /// Copy the selected file(s) to a destination (opens directory picker).
     CopyTo,
@@ -619,14 +619,11 @@ fn build_select_submenu(include_current_item: bool) -> ContextMenuEntry {
     }
 }
 
-fn push_properties_footer(items: &mut Vec<ContextMenuEntry>, directory: Option<PathBuf>) {
+fn push_properties_footer(items: &mut Vec<ContextMenuEntry>, path: PathBuf) {
     if !matches!(items.last(), Some(ContextMenuEntry::Separator)) {
         items.push(separator());
     }
-    match directory {
-        Some(path) => items.push(item("Properties", ContextAction::OpenFilesystemProperties(path))),
-        None => items.push(item("Edit metadata", ContextAction::EditMetadataFull)),
-    }
+    items.push(item("Properties", ContextAction::OpenFilesystemProperties(path)));
 }
 
 
@@ -691,7 +688,9 @@ fn build_archive_browse_entry_menu(entry: &BrowseEntry) -> Vec<ContextMenuEntry>
     }
 
     if include_properties {
-        push_properties_footer(&mut items, None);
+        if !matches!(items.last(), Some(ContextMenuEntry::Separator)) { items.push(separator()); }
+        // Archive paths are synthetic and have no filesystem Properties.
+        items.push(item("Edit metadata", ContextAction::EditMetadataFull));
     }
     items
 }
@@ -1338,24 +1337,9 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
 
     let mut items = Vec::new();
     let effective_kind = effective_browse_context_entry_kind(&entry.kind, &entry.path);
-    let include_properties = matches!(
-        &effective_kind,
-        EntryKind::AudioFile(_)
-            | EntryKind::Archive
-            | EntryKind::SacdIso
-            | EntryKind::DvdAudioIso
-            | EntryKind::DvdAudioDir
-            | EntryKind::DvdVideoIso
-            | EntryKind::DvdVideoDir
-            | EntryKind::BlurayIso
-            | EntryKind::BlurayDir
-            | EntryKind::Directory
-    ) || matches!(&effective_kind, EntryKind::OtherFile)
-        && (crate::convert::classify::is_cue_sheet_path(&entry.path)
-            || matches!(
-                crate::convert::source_admission::direct_source_kind(&entry.path),
-                Some(crate::convert::source_admission::DirectSourceKind::Audio)
-            ));
+    // Properties applies to any real filesystem entry, including generic files.
+    // Keep archive-internal (synthetic) paths on their existing metadata menu.
+    let include_properties = !matches!(&effective_kind, EntryKind::ParentDir);
     let selected_path_is_marked = app
         .browse
         .multi_selected
@@ -1596,7 +1580,7 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
         );
     }
     if include_properties {
-        push_properties_footer(&mut items, if entry.is_child_dir() { Some(entry.path.clone()) } else { None });
+        push_properties_footer(&mut items, entry.path.clone());
     }
 
     items
@@ -7008,6 +6992,7 @@ mod tests {
         std::sync::Arc::new(super::super::browse::CachedInfo {
             source: crate::tui::probe::probe_audio(path).expect("probe audio fixture"),
             metadata: crate::tui::probe::read_metadata(path).expect("read metadata fixture"),
+            transport: None,
         })
     }
 
@@ -8241,7 +8226,7 @@ mod tests {
 
             let labels = menu_labels_recursive(&build_browse_entry_menu(&app));
             assert!(labels.iter().any(|label| label == "Convert"), "{name}");
-            assert!(labels.iter().any(|label| label == "Edit metadata"), "{name}");
+            assert!(labels.iter().any(|label| label == "Properties"), "{name}");
             assert!(
                 !labels.iter().any(|label| label == "Tags & Tagging"),
                 "{name} must not gain the out-of-scope tagging submenu"
@@ -8262,7 +8247,37 @@ mod tests {
         )];
         let labels = menu_labels_recursive(&build_browse_entry_menu(&app));
         assert!(!labels.iter().any(|label| label == "Convert"));
-        assert!(!labels.iter().any(|label| label == "Properties"));
+        assert!(labels.iter().any(|label| label == "Properties"));
+    }
+
+    #[test]
+    fn filesystem_properties_context_action_opens_dialog_not_metadata_editor() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let target = temp.path().join("track.flac");
+        std::fs::write(&target, b"fixture").expect("file fixture");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![BrowseEntry::new(
+            target.clone(), "track.flac".into(),
+            EntryKind::AudioFile(crate::convert::formats::AudioFormat::Flac), 7, None,
+        )];
+        let menu = build_browse_entry_menu(&app);
+        let action = match menu.last() {
+            Some(ContextMenuEntry::Item(ContextMenuItem {
+                label, action: ContextAction::OpenFilesystemProperties(path), ..
+            })) if label == "Properties" && path == &target => ContextAction::OpenFilesystemProperties(path.clone()),
+            other => panic!("Properties must target this file: {other:?}"),
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        execute_context_action(&mut app, action, &tx, false);
+        match &app.active_overlay {
+            ActiveOverlay::FolderProperties(state) => {
+                assert_eq!(state.path, target);
+                assert!(state.request_id.is_none());
+            }
+            other => panic!("context Properties opened wrong overlay: {other:?}"),
+        }
     }
 
     #[test]
@@ -8299,9 +8314,9 @@ mod tests {
                 menu.last(),
                 Some(ContextMenuEntry::Item(ContextMenuItem {
                     label,
-                    action: ContextAction::EditMetadataFull,
+                    action: ContextAction::OpenFilesystemProperties(_),
                     ..
-                })) if label == "Edit metadata"
+                })) if label == "Properties"
             ));
             assert!(matches!(
                 menu.get(menu.len().saturating_sub(2)),
