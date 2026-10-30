@@ -8,7 +8,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
 /// Schema version — bump when adding migrations.
-const CURRENT_VERSION: u32 = 28;
+const CURRENT_VERSION: u32 = 30;
 
 const LEGACY_IMPORT_STATE_ROW_ID: i64 = 1;
 pub(crate) const RECENT_FILES_RETENTION_LIMIT: usize = 50;
@@ -700,6 +700,15 @@ impl Database {
         }
     }
 
+    /// Returns the path used for a separate accounting worker connection.
+    /// In-memory databases deliberately disable cross-session persistence.
+    pub fn accounting_database_path(&self) -> Option<PathBuf> {
+        self.conn.query_row(
+            "SELECT file FROM pragma_database_list WHERE name='main'", [],
+            |row| row.get::<_, String>(0),
+        ).ok().filter(|p| !p.is_empty()).map(PathBuf::from)
+    }
+
     /// Open (or create) the production database, run migrations, and enable the
     /// same durability/performance pragmas used by ordinary application starts.
     pub fn open() -> Result<Self, String> {
@@ -1071,6 +1080,14 @@ impl Database {
 
         if version < 28 {
             self.run_migration_step(28, Self::migrate_v28)?;
+            version = 28;
+        }
+        if version < 29 {
+            self.run_migration_step(29, Self::migrate_v29)?;
+            version = 29;
+        }
+        if version < 30 {
+            self.run_migration_step(30, Self::migrate_v30)?;
         }
 
         Ok(())
@@ -1776,6 +1793,125 @@ impl Database {
             }
         }
         Ok(())
+    }
+
+    /// v29: independent, complete-only directory accounting. Legacy v21
+    /// directory_summary_cache is retained for shallow album classification;
+    /// its recursive payload never enters these tables.
+    fn migrate_v29(conn: &Connection) -> Result<(), String> {
+        conn.execute_batch(r#"
+            CREATE TABLE IF NOT EXISTS directory_accounting_generation_v29 (
+                singleton_id INTEGER PRIMARY KEY CHECK(singleton_id=1),
+                next_generation INTEGER NOT NULL CHECK(next_generation > 0)
+            );
+            INSERT OR IGNORE INTO directory_accounting_generation_v29(singleton_id,next_generation)
+                VALUES(1,1);
+            CREATE TABLE IF NOT EXISTS directory_accounting_state_v29 (
+                path_key BLOB NOT NULL,
+                policy_version INTEGER NOT NULL,
+                audio_policy_version INTEGER NOT NULL,
+                invalidation_epoch INTEGER NOT NULL DEFAULT 0 CHECK(invalidation_epoch >= 0),
+                dirty INTEGER NOT NULL DEFAULT 1 CHECK(dirty IN (0,1)),
+                dirty_at_utc_us INTEGER,
+                active_edge_generation TEXT,
+                last_access_utc_us INTEGER NOT NULL,
+                PRIMARY KEY(path_key,policy_version,audio_policy_version)
+            );
+            CREATE TABLE IF NOT EXISTS directory_accounting_local_v29 (
+                path_key BLOB NOT NULL,
+                policy_version INTEGER NOT NULL,
+                audio_policy_version INTEGER NOT NULL,
+                direct_files TEXT NOT NULL,
+                direct_folders TEXT NOT NULL,
+                direct_audio TEXT NOT NULL,
+                direct_logical_bytes TEXT NOT NULL,
+                excluded_symlinks TEXT NOT NULL,
+                observed_at_utc_us INTEGER NOT NULL,
+                run_generation INTEGER NOT NULL CHECK(run_generation > 0),
+                edge_generation TEXT NOT NULL,
+                encoding_version INTEGER NOT NULL,
+                PRIMARY KEY(path_key,policy_version,audio_policy_version)
+            );
+            CREATE TABLE IF NOT EXISTS directory_accounting_edges_v29 (
+                parent_key BLOB NOT NULL,
+                child_key BLOB NOT NULL,
+                policy_version INTEGER NOT NULL,
+                audio_policy_version INTEGER NOT NULL,
+                edge_generation TEXT NOT NULL,
+                PRIMARY KEY(parent_key,policy_version,audio_policy_version,edge_generation,child_key)
+            );
+            CREATE INDEX IF NOT EXISTS directory_accounting_edges_child_v29
+                ON directory_accounting_edges_v29(child_key,policy_version,audio_policy_version);
+            CREATE TABLE IF NOT EXISTS directory_accounting_totals_v29 (
+                path_key BLOB NOT NULL,
+                policy_version INTEGER NOT NULL,
+                audio_policy_version INTEGER NOT NULL,
+                files TEXT NOT NULL,
+                descendant_folders TEXT NOT NULL,
+                audio_files TEXT NOT NULL,
+                logical_bytes TEXT NOT NULL,
+                audio_logical_bytes TEXT NOT NULL,
+                excluded_symlinks TEXT NOT NULL,
+                other_entries TEXT NOT NULL,
+                coverage_code INTEGER NOT NULL DEFAULT 1 CHECK(coverage_code=1),
+                outcome_code INTEGER NOT NULL DEFAULT 1 CHECK(outcome_code=1),
+                consistency_code INTEGER NOT NULL,
+                scan_started_utc_us INTEGER NOT NULL,
+                scan_finished_utc_us INTEGER NOT NULL,
+                run_generation INTEGER NOT NULL CHECK(run_generation>0),
+                committed_epoch INTEGER NOT NULL,
+                created_utc_us INTEGER,
+                modified_utc_us INTEGER,
+                encoding_version INTEGER NOT NULL,
+                last_access_utc_us INTEGER NOT NULL,
+                PRIMARY KEY(path_key,policy_version,audio_policy_version),
+                CHECK(scan_finished_utc_us >= scan_started_utc_us)
+            );
+            CREATE INDEX IF NOT EXISTS directory_accounting_totals_lru_v29
+                ON directory_accounting_totals_v29(last_access_utc_us);
+        "#).map_err(|e| format!("v29 directory accounting migration failed: {e}"))
+    }
+
+    /// v30: mutation-sequence fence, independently verified local summaries,
+    /// and an exact child-edge set for qualified bottom-up reuse. All ALTERs
+    /// and user_version advance in the same migration transaction.
+    fn migrate_v30(conn: &Connection) -> Result<(), String> {
+        // A partially applied historical migration can already contain any
+        // subset of these columns. Validate existing declarations rather than
+        // skipping a conflicting column or failing with duplicate-column DDL.
+        // run_migration_step owns the transaction and user_version update.
+        for (table, column, ty, not_null, default, ddl) in [
+            (
+                "directory_accounting_generation_v29", "mutation_sequence", "INTEGER", true, Some("0"),
+                "ALTER TABLE directory_accounting_generation_v29 ADD COLUMN mutation_sequence INTEGER NOT NULL DEFAULT 0 CHECK(mutation_sequence>=0)",
+            ),
+            (
+                "directory_accounting_local_v29", "direct_audio_logical_bytes", "TEXT", true, Some("'0'"),
+                "ALTER TABLE directory_accounting_local_v29 ADD COLUMN direct_audio_logical_bytes TEXT NOT NULL DEFAULT '0'",
+            ),
+            (
+                "directory_accounting_local_v29", "direct_other_entries", "TEXT", true, Some("'0'"),
+                "ALTER TABLE directory_accounting_local_v29 ADD COLUMN direct_other_entries TEXT NOT NULL DEFAULT '0'",
+            ),
+            (
+                "directory_accounting_local_v29", "entry_digest", "BLOB", false, None,
+                "ALTER TABLE directory_accounting_local_v29 ADD COLUMN entry_digest BLOB",
+            ),
+            (
+                "directory_accounting_local_v29", "root_identity", "BLOB", false, None,
+                "ALTER TABLE directory_accounting_local_v29 ADD COLUMN root_identity BLOB",
+            ),
+        ] {
+            if !Self::legacy_add_column_present(conn, "v30", table, column, ty, not_null, default)? {
+                conn.execute_batch(ddl).map_err(|e| {
+                    format!("v30 directory accounting migration add {table}.{column}: {e}")
+                })?;
+            }
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS directory_accounting_edges_generation_v30
+             ON directory_accounting_edges_v29(parent_key,policy_version,audio_policy_version,edge_generation);",
+        ).map_err(|e| format!("v30 directory accounting migration index failed: {e}"))
     }
 
     /// v16: AccurateRip result cache.
@@ -6355,17 +6491,12 @@ fn directory_summary_scope_code(scope: crate::tui::browse::DirectorySummaryScope
 fn directory_summary_strongest_scope_code(
     entry: &crate::tui::browse::DirectorySummaryCacheEntry,
 ) -> &'static str {
-    let mut strongest = entry.facts.classification_scope;
-    if let Some(stats_scope) = entry.facts.stats_scope {
-        if strongest
-            .map(|scope| directory_summary_scope_rank(stats_scope) > directory_summary_scope_rank(scope))
-            .unwrap_or(true)
-        {
-            strongest = Some(stats_scope);
-        }
-    }
+    // Never advertise recursive work from the legacy v21 classification cache.
+    // v30 is the sole authority for completed directory accounting.
     directory_summary_scope_code(
-        strongest.unwrap_or(crate::tui::browse::DirectorySummaryScope::Immediate),
+        entry.facts.classification_scope.unwrap_or(
+            crate::tui::browse::DirectorySummaryScope::Immediate,
+        ),
     )
 }
 
@@ -10175,6 +10306,7 @@ mod tests {
                     audio_count: 2,
                     audio_size: 12345,
                     total_size: 12345,
+                    ..Default::default()
                 })),
                 stats_scope: Some(DirectorySummaryScope::RecursiveBestEffort),
             },
@@ -10191,9 +10323,9 @@ mod tests {
         assert_eq!(cached.facts.classification_scope, Some(DirectorySummaryScope::Immediate));
         assert_eq!(
             cached.facts.stats_scope,
-            Some(DirectorySummaryScope::RecursiveBestEffort),
+            None,
         );
-        assert_eq!(cached.facts.stats.as_ref().map(|stats| stats.audio_count), Some(2));
+        assert!(cached.facts.stats.is_none(), "legacy bounded recursive counts must not survive persistence");
 
         let changed_size = ProbeCacheIdentity { size: identity.size + 1, ..identity };
         assert!(db.get_cached_directory_summary(&path, changed_size).is_none());
@@ -10890,5 +11022,123 @@ mod r19_hdcd_v28_migration_tests {
             [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         ).unwrap();
         assert_eq!(record, ("prior".to_owned(), 40, None));
+    }
+}
+
+#[cfg(test)]
+mod directory_accounting_v30_migration_tests {
+    use super::*;
+
+    #[test]
+    fn v28_file_backed_upgrade_to_v30_preserves_data_and_reopens() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("v28-to-v30.db");
+        {
+            let conn = Connection::open(&path).expect("create v28 fixture");
+            conn.execute_batch(
+                "CREATE TABLE upgrade_sentinel(value TEXT NOT NULL);
+                 INSERT INTO upgrade_sentinel(value) VALUES('keep-me');
+                 PRAGMA user_version = 28;",
+            ).expect("seed v28 fixture");
+        }
+        {
+            let db = Database::open_path(&path).expect("upgrade v28 to v30");
+            let version: u32 = db.conn
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .expect("read upgraded version");
+            assert_eq!(version, CURRENT_VERSION);
+            let value: String = db.conn.query_row(
+                "SELECT value FROM upgrade_sentinel", [], |row| row.get(0),
+            ).expect("read pre-upgrade row");
+            assert_eq!(value, "keep-me");
+            Database::migrate_v30(&db.conn).expect("explicit replay is safe");
+        }
+        let reopened = Database::open_path(&path).expect("reopen upgraded database");
+        let version: u32 = reopened.conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read reopened version");
+        assert_eq!(version, CURRENT_VERSION);
+        let sequence: i64 = reopened.conn.query_row(
+            "SELECT mutation_sequence FROM directory_accounting_generation_v29 WHERE singleton_id=1",
+            [], |row| row.get(0),
+        ).expect("v30 mutation fence is readable");
+        assert_eq!(sequence, 0);
+    }
+
+    #[test]
+    fn v30_replays_partial_schema_without_resetting_existing_values() {
+        let conn = Connection::open_in_memory().expect("fixture connection");
+        Database::migrate_v29(&conn).expect("create v29 schema");
+        conn.execute_batch(
+            "UPDATE directory_accounting_generation_v29 SET next_generation=42;
+             ALTER TABLE directory_accounting_generation_v29
+                 ADD COLUMN mutation_sequence INTEGER NOT NULL DEFAULT 0 CHECK(mutation_sequence>=0);
+             UPDATE directory_accounting_generation_v29 SET mutation_sequence=7;
+             ALTER TABLE directory_accounting_local_v29 ADD COLUMN entry_digest BLOB;",
+        ).expect("seed partly applied v30 DDL and data");
+
+        Database::migrate_v30(&conn).expect("complete partial v30");
+        Database::migrate_v30(&conn).expect("replay full v30");
+        for (table, expected) in [
+            ("directory_accounting_generation_v29", &["mutation_sequence"][..]),
+            ("directory_accounting_local_v29", &[
+                "direct_audio_logical_bytes", "direct_other_entries", "entry_digest", "root_identity",
+            ][..]),
+        ] {
+            let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))
+                .expect("inspect columns");
+            let names: Vec<String> = statement.query_map([], |row| row.get(1))
+                .expect("list columns")
+                .map(|row| row.expect("decode column"))
+                .collect();
+            for column in expected {
+                assert_eq!(names.iter().filter(|name| name.as_str() == *column).count(), 1,
+                    "{table}.{column} must be present exactly once");
+            }
+        }
+        let counters: (i64, i64) = conn.query_row(
+            "SELECT next_generation,mutation_sequence FROM directory_accounting_generation_v29 WHERE singleton_id=1",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).expect("read preserved counters");
+        assert_eq!(counters, (42, 7), "replay must never reset fence state");
+        let index_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type='index' AND name='directory_accounting_edges_generation_v30'",
+            [], |row| row.get(0),
+        ).expect("read index");
+        assert_eq!(index_count, 1);
+    }
+
+    #[test]
+    fn incompatible_partial_v30_schema_fails_without_committing_earlier_columns() {
+        let mut conn = Connection::open_in_memory().expect("fixture connection");
+        Database::migrate_v29(&conn).expect("create v29 schema");
+        conn.execute_batch(
+            "ALTER TABLE directory_accounting_local_v29 ADD COLUMN direct_other_entries BLOB;
+             PRAGMA user_version = 29;",
+        ).expect("seed incompatible partial column");
+        {
+            let transaction = conn.transaction().expect("begin migration transaction");
+            let error = Database::migrate_v30(&transaction)
+                .expect_err("incompatible existing column must be rejected");
+            assert!(error.contains(
+                "v30 migration found incompatible existing column directory_accounting_local_v29.direct_other_entries"
+            ), "unexpected error: {error}");
+            // A failed migration must abort the entire schema mutation, not
+            // leave behind the successful ALTERs that preceded the conflict.
+            transaction.rollback().expect("roll back failed migration");
+        }
+        let version: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read version after rollback");
+        assert_eq!(version, 29);
+        for (table, column) in [
+            ("directory_accounting_generation_v29", "mutation_sequence"),
+            ("directory_accounting_local_v29", "direct_audio_logical_bytes"),
+        ] {
+            assert!(!Database::legacy_add_column_present(
+                &conn, "v30", table, column,
+                if column == "mutation_sequence" { "INTEGER" } else { "TEXT" },
+                true, if column == "mutation_sequence" { Some("0") } else { Some("'0'") },
+            ).expect("inspect rolled-back column"), "{table}.{column} must roll back");
+        }
     }
 }

@@ -179,6 +179,17 @@ pub async fn run_app(
         let _ = super::app::ensure_convert_hdcd_scan(app, &tx);
         if !input_waiting_at_frame_start {
             check_browse_probe_debounce(app, &tx);
+            app.directory_accounting.set_interactive_busy(
+                app.analysis_pending > 0 || app.processing_active
+            );
+            if app.current_screen == AppScreen::Browse && !app.browse.is_in_archive() {
+                let highlighted = if app.browse.selected_entry().is_some_and(|entry| entry.is_child_dir() && !entry.is_symlink) {
+                    app.browse.selected_entry().map(|entry| entry.path.clone())
+                } else { None };
+                app.directory_accounting.consider_background(Some(app.browse.current_dir.clone()), highlighted, &tx);
+            } else {
+                app.directory_accounting.consider_background(None, None, &tx);
+            }
         }
         check_search_debounce(app, &tx);
         // Close browse-only overlays if the user has left the browse screen.
@@ -395,10 +406,12 @@ fn drain_async_messages_for_frame(
 
 fn message_mutates_browse_visible_state(msg: &AppMessage) -> bool {
     match msg {
-        AppMessage::ProbeCacheWarmComplete { .. }
+        AppMessage::DirectoryAccounting(_)
+        | AppMessage::ProbeCacheWarmComplete { .. }
         | AppMessage::AudioProbeComplete { .. }
         | AppMessage::DiscProbeComplete { .. }
         | AppMessage::DirStatsComplete { .. }
+        | AppMessage::BrowseFilesystemSpaceComplete { .. }
         | AppMessage::FolderClassifyComplete { .. }
         | AppMessage::DirScanBatch { .. }
         | AppMessage::DirScanComplete { .. }
@@ -7023,6 +7036,11 @@ mod analysis_batch_status_tests {
 
 pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMessage>) {
     match msg {
+        AppMessage::DirectoryAccounting(event) => {
+            // Request ids prevent late results from previous tabs/selections
+            // from overwriting a newer view, while all tabs share the cache.
+            let _ = app.directory_accounting.accept_event(&event, tx);
+        }
         AppMessage::HostClipboardReadComplete {
             generation,
             target,
@@ -8264,34 +8282,18 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 }
             }
         }
-        AppMessage::DirStatsComplete { path, identity, stats, cancelled } => {
-            let was_pending = app.browse.complete_dir_stats(&path, tx);
-            if !was_pending {
-                return;
-            }
-            if cancelled {
-                log::debug!("dropping cancelled directory-stats completion: {}", path.display());
-                return;
-            }
-            match app.browse.classify_filesystem_async_completion(&path, identity) {
-                crate::tui::browse::FilesystemAsyncCompletion::Accept => {
-                    app.browse.insert_dir_stats_for_identity(path.clone(), identity, stats);
-                    app.browse.store_directory_summary_for_identity_best_effort(&path, identity, &app.db);
-                }
-                crate::tui::browse::FilesystemAsyncCompletion::Changed => {
-                    log::debug!("dropping stale directory-stats completion after identity change: {}", path.display());
-                    app.browse.remove_dir_stats_cache_entry(&path);
-                    app.browse.invalidate_directory_summary_persistent_cache_best_effort(&path, &app.db);
-                    if app.browse.current_entry_is_still_statable(&path) {
-                        app.browse.probe_current_with_db(tx, Some(&app.db));
-                    }
-                }
-                crate::tui::browse::FilesystemAsyncCompletion::MissingOrUnstatable => {
-                    log::debug!("dropping directory-stats completion for missing/unstatable path: {}", path.display());
-                    app.browse.remove_dir_stats_cache_entry(&path);
-                    app.browse.invalidate_directory_summary_persistent_cache_best_effort(&path, &app.db);
+        AppMessage::BrowseFilesystemSpaceComplete {
+            tab_id, generation, request_id, path, space,
+        } => {
+            if let Some(browse) = app.browse.tab_mut(tab_id) {
+                if browse.complete_filesystem_space(&path, generation, request_id, space) {
+                    browse.deferred_work.info_pane_changed = true;
                 }
             }
+        }
+        AppMessage::DirStatsComplete { .. } => {
+            // Obsolete bounded scanner completions, including messages already
+            // queued before an upgrade, have no write or UI authority.
         }
         AppMessage::FolderClassifyComplete {
             request_id,
@@ -8935,6 +8937,9 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                     );
             match result {
                 Ok(report) => {
+                    if archive_staging_owner.is_none() {
+                        app.directory_accounting.invalidate(vec![path.clone()]);
+                    }
                     app.browse.remove_probe_cache_entry(&path);
                     app.browse.probe_pending.remove(&path);
                     app.browse.invalidate_search_tag_cache_for_metadata_path(&path);
@@ -9377,6 +9382,11 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             report,
             retry_plan,
         } => {
+            let changed = report.roots.iter()
+                .filter(|root| root.disposition.is_completed())
+                .flat_map(|root| [root.source.clone(), root.destination.clone()])
+                .collect::<Vec<_>>();
+            if !changed.is_empty() { app.directory_accounting.invalidate(changed); }
             reduce_file_task_complete(app, session_id, report, retry_plan, tx);
             // Control-plane only: scans journal files beside the config, never
             // source/destination mounts. This keeps the footer indicator in
@@ -9397,6 +9407,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             base_dir,
             result,
         } => {
+            if result.is_ok() { app.directory_accounting.invalidate(vec![base_dir.clone()]); }
             super::keybindings::complete_rename_plan(
                 app,
                 description,
@@ -9411,6 +9422,11 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             undo,
             result,
         } => {
+            let changed = result.completed.iter()
+                .filter_map(|item| entry.mappings.get(item.index))
+                .flat_map(|mapping| [mapping.source.clone(), mapping.destination.clone()])
+                .collect::<Vec<_>>();
+            if !changed.is_empty() { app.directory_accounting.invalidate(changed); }
             super::keybindings::complete_file_operation_replay(
                 app,
                 session_id,
@@ -10503,9 +10519,11 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 }
             }
         }
-        AppMessage::CueWriteComplete { result, refresh_browse } => {
+        AppMessage::CueWriteComplete { result, refresh_browse, written_path } => {
             match result {
                 Ok(message) => {
+                    // Some CUE writes alter a sidecar's logical byte count.
+                    app.directory_accounting.invalidate(vec![written_path]);
                     app.set_status(message);
                     if refresh_browse && app.current_screen == AppScreen::Browse {
                         app.browse.refresh_with_search(Some(tx));
@@ -21603,92 +21621,62 @@ mod async_message_drain_tests {
 
     #[tokio::test]
     async fn stale_dir_stats_completion_rechecks_only_when_current_and_statable() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let path = temp.path().join("album");
-        std::fs::create_dir(&path).expect("mkdir");
-        let stale_identity = crate::tui::browse::ProbeCacheIdentity { modified: None, size: 0 };
-
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
-        app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
-            path.clone(),
-            "album".to_string(),
-            EntryKind::Directory,
-            0,
-            None,
-        )];
-        app.browse.selected_index = 0;
-        app.browse.dir_stats_pending.insert(path.clone());
-
+        let path = std::path::PathBuf::from("/tmp/retired-directory-accounting-0");
         let (tx, _rx) = mpsc::channel(4);
-        handle_message(
-            &mut app,
-            AppMessage::DirStatsComplete {
-                path: path.clone(),
-                identity: stale_identity,
-                stats: crate::tui::browse::DirStats {
-                    folder_count: 0,
-                    file_count: 99,
-                    audio_count: 99,
-                    audio_size: 0,
-                    total_size: 99,
-                },
-                cancelled: false,
+        handle_message(&mut app, AppMessage::DirStatsComplete {
+            path: path.clone(),
+            identity: crate::tui::browse::ProbeCacheIdentity { modified: None, size: 0 },
+            request_id: 42,
+            stats: crate::tui::browse::DirStats {
+                total_size: 420 * 1024, complete: true, ..Default::default()
             },
-            &tx,
-        );
-
+            cancelled: false,
+        }, &tx);
         assert!(app.browse.current_dir_stats().is_none());
-        assert!(!app.browse.dir_stats_pending.contains(&path));
-        assert_eq!(
-            app.browse.probe_debounce.as_ref().map(|pending| pending.path.as_path()),
-            Some(path.as_path()),
-            "a stale stats result should re-enter the settled-focus policy path instead of immediately relaunching recursive stats"
-        );
+        assert!(app.browse.dir_stats_pending.is_empty());
+        assert!(app.browse.directory_summary_cache_entry_for_test(&path).is_none());
     }
 
-    #[test]
-    fn missing_dir_stats_completion_stops_without_retry() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let path = temp.path().join("gone");
-        std::fs::create_dir(&path).expect("mkdir");
-        let identity = crate::tui::browse::ProbeCacheIdentity::from_metadata(
-            &std::fs::metadata(&path).expect("metadata"),
-        );
-
+    #[tokio::test]
+    async fn missing_dir_stats_completion_stops_without_retry() {
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
-        app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
-            path.clone(),
-            "gone".to_string(),
-            EntryKind::Directory,
-            identity.size,
-            identity.modified,
-        )];
-        app.browse.selected_index = 0;
-        app.browse.dir_stats_pending.insert(path.clone());
-        std::fs::remove_dir(&path).expect("remove dir");
-
+        let path = std::path::PathBuf::from("/tmp/retired-directory-accounting-1");
         let (tx, _rx) = mpsc::channel(4);
-        handle_message(
-            &mut app,
-            AppMessage::DirStatsComplete {
-                path: path.clone(),
-                identity,
-                stats: crate::tui::browse::DirStats {
-                    folder_count: 0,
-                    file_count: 1,
-                    audio_count: 1,
-                    audio_size: 0,
-                    total_size: 1,
-                },
-                cancelled: false,
+        handle_message(&mut app, AppMessage::DirStatsComplete {
+            path: path.clone(),
+            identity: crate::tui::browse::ProbeCacheIdentity { modified: None, size: 0 },
+            request_id: 42,
+            stats: crate::tui::browse::DirStats {
+                total_size: 420 * 1024, complete: true, ..Default::default()
             },
-            &tx,
-        );
-
-        assert!(!app.browse.dir_stats_pending.contains(&path));
+            cancelled: false,
+        }, &tx);
         assert!(app.browse.current_dir_stats().is_none());
+        assert!(app.browse.dir_stats_pending.is_empty());
+        assert!(app.browse.directory_summary_cache_entry_for_test(&path).is_none());
+    }
+
+    #[tokio::test]
+    async fn late_stats_completion_cannot_displace_newer_request_for_same_directory() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        let path = std::path::PathBuf::from("/tmp/retired-directory-accounting-2");
+        let (tx, _rx) = mpsc::channel(4);
+        handle_message(&mut app, AppMessage::DirStatsComplete {
+            path: path.clone(),
+            identity: crate::tui::browse::ProbeCacheIdentity { modified: None, size: 0 },
+            request_id: 42,
+            stats: crate::tui::browse::DirStats {
+                total_size: 420 * 1024, complete: true, ..Default::default()
+            },
+            cancelled: false,
+        }, &tx);
+        assert!(app.browse.current_dir_stats().is_none());
+        assert!(app.browse.dir_stats_pending.is_empty());
+        assert!(app.browse.directory_summary_cache_entry_for_test(&path).is_none());
     }
 
     #[test]

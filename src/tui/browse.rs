@@ -359,6 +359,7 @@ struct DirStatsRequest {
 
 #[derive(Debug, Clone)]
 struct DirStatsActiveJob {
+    request_id: u64,
     identity: ProbeCacheIdentity,
     scan_generation: u64,
     cursor_focused: bool,
@@ -480,6 +481,15 @@ pub enum FilesystemAsyncCompletion {
     MissingOrUnstatable,
 }
 
+/// Counts of the immediate children of one directory, distinct from the
+/// recursive counts retained for older Browse summary consumers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DirectoryImmediateCounts {
+    pub folders: usize,
+    pub files: usize,
+    pub audio_files: usize,
+}
+
 /// Cached statistics for a directory
 #[derive(Debug, Clone, Default)]
 pub struct DirStats {
@@ -493,6 +503,12 @@ pub struct DirStats {
     /// Total bytes attributable to audio files in this directory walk.
     pub audio_size: u64,
     pub total_size: u64,
+    /// Present only after every immediate child has been enumerated.
+    pub immediate: Option<DirectoryImmediateCounts>,
+    /// True only when every descendant was visited without a depth, time,
+    /// count, permission, or unsupported-symlink omission. Older cache records
+    /// must never be interpreted as complete.
+    pub complete: bool,
 }
 
 /// Identity-validated recursive directory-stats cache value. Directory stats
@@ -669,7 +685,7 @@ impl Default for DirectorySummaryPersistentCacheMode {
     }
 }
 
-const DIRECTORY_SUMMARY_PERSISTENCE_VERSION: u32 = 3;
+const DIRECTORY_SUMMARY_PERSISTENCE_VERSION: u32 = 4;
 
 fn directory_summary_encode_bytes(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len());
@@ -928,22 +944,11 @@ impl DirectorySummaryCacheEntry {
             fields.extend(["-", "-", "0", "-", "-", "-", "0", "0", "0", "-"].into_iter().map(|value| value.to_string()));
         }
 
-        if let Some(stats) = self.facts.stats.as_ref() {
-            let scope = self
-                .facts
-                .stats_scope
-                .unwrap_or(DirectorySummaryScope::RecursiveBestEffort);
-            fields.extend([
-                directory_summary_scope_code(scope).to_string(),
-                stats.folder_count.to_string(),
-                stats.file_count.to_string(),
-                stats.audio_count.to_string(),
-                stats.audio_size.to_string(),
-                stats.total_size.to_string(),
-            ]);
-        } else {
-            fields.extend(["-", "0", "0", "0", "0", "0"].into_iter().map(|value| value.to_string()));
-        }
+        // v21 is retained *only* for identity-scoped folder classification.
+        // Do not write bounded recursive facts, even when a legacy caller
+        // supplies `DirStats { complete: true }`.
+        fields.extend(["-", "0", "0", "0", "0", "0", "-", "-", "-", "-"]
+            .into_iter().map(str::to_string));
 
         fields.join("\t")
     }
@@ -957,7 +962,8 @@ impl DirectorySummaryCacheEntry {
         let expected_len = match version {
             1 => 19,
             2 => 20,
-            DIRECTORY_SUMMARY_PERSISTENCE_VERSION => 21,
+            3 => 21,
+            DIRECTORY_SUMMARY_PERSISTENCE_VERSION => 25,
             _ => return None,
         };
         if fields.len() != expected_len {
@@ -993,24 +999,10 @@ impl DirectorySummaryCacheEntry {
             entry.facts.classification = Some(Arc::new(classification));
         }
 
-        if fields[15] != "-" {
-            if version < 3 {
-                // v1/v2 rows predate folder_count. A missing folder count is
-                // unknown, not zero; keep any restored classification facts,
-                // but refuse to render incomplete old stats. A settled v3 stats
-                // pass can repopulate the cache with truthful folder totals.
-                return Some((path, entry));
-            }
-
-            entry.facts.stats_scope = Some(directory_summary_scope_from_code(fields[15])?);
-            entry.facts.stats = Some(Arc::new(DirStats {
-                folder_count: fields[16].parse().ok()?,
-                file_count: fields[17].parse().ok()?,
-                audio_count: fields[18].parse().ok()?,
-                audio_size: fields[19].parse().ok()?,
-                total_size: fields[20].parse().ok()?,
-            }));
-        }
+        // Discard all legacy v21 recursive records on read. Root metadata
+        // identity is not a recursive freshness proof; the v29+ accounting
+        // repository is the sole authority for complete historical totals.
+        // Classification above may still be restored.
 
         Some((path, entry))
     }
@@ -1888,6 +1880,16 @@ impl SearchState {
     }
 }
 
+/// No-follow accounting excludes Windows junctions and other reparse
+/// points even when std::fs metadata otherwise classifies their target.
+#[cfg(windows)]
+fn windows_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.file_attributes() & 0x400 != 0
+}
+#[cfg(not(windows))]
+fn windows_reparse_point(_metadata: &fs::Metadata) -> bool { false }
+
 /// A single entry in the browse listing
 #[derive(Debug, Clone)]
 pub struct BrowseEntry {
@@ -1903,6 +1905,9 @@ pub struct BrowseEntry {
     /// True if the entry is a broken symlink (target doesn't exist). Only
     /// meaningful when `is_symlink` is true.
     pub is_broken_symlink: bool,
+    /// Real regular file, not a symlink, reparse point, socket, or device.
+    /// Only the completed listing uses this to supply policy-v1 direct facts.
+    pub is_regular_file: bool,
 }
 
 impl BrowseEntry {
@@ -1915,6 +1920,8 @@ impl BrowseEntry {
         modified: Option<SystemTime>,
     ) -> Self {
         let name_lower = name.to_lowercase();
+        let is_regular_file = !matches!(&kind, EntryKind::Directory | EntryKind::ParentDir
+            | EntryKind::DvdAudioDir | EntryKind::DvdVideoDir | EntryKind::BlurayDir);
         Self {
             path,
             name,
@@ -1924,6 +1931,7 @@ impl BrowseEntry {
             modified,
             is_symlink: false,
             is_broken_symlink: false,
+            is_regular_file,
         }
     }
 
@@ -1938,6 +1946,9 @@ impl BrowseEntry {
         is_broken_symlink: bool,
     ) -> Self {
         let name_lower = name.to_lowercase();
+        let is_regular_file = !is_symlink && !matches!(&kind,
+            EntryKind::Directory | EntryKind::ParentDir | EntryKind::DvdAudioDir
+                | EntryKind::DvdVideoDir | EntryKind::BlurayDir);
         Self {
             path,
             name,
@@ -1947,6 +1958,7 @@ impl BrowseEntry {
             modified,
             is_symlink,
             is_broken_symlink,
+            is_regular_file,
         }
     }
 
@@ -2627,6 +2639,8 @@ pub struct BrowseState {
     pub(super) all_dirs: Vec<BrowseEntry>,
     /// All file entries from current_dir, unfiltered (including hidden).
     pub(super) all_files: Vec<BrowseEntry>,
+    /// Populated when the authoritative listing completes, not recomputed on each paint.
+    current_dir_audio_count: usize,
 
     /// Exact path → identity index for entries owned by the current directory
     /// scan. SQLite warm-cache rows are emitted from these scan-owned paths,
@@ -2813,9 +2827,23 @@ pub struct BrowseState {
     /// directories when the cursor moves rapidly over folders.
     dir_stats_active: HashMap<PathBuf, DirStatsActiveJob>,
 
+    /// Monotonic identity for launched stats walks. Never reset on navigation:
+    /// a cancelled walk may send its completion after a replacement starts.
+    dir_stats_next_request_id: u64,
+
     /// Recursive directory stats requests waiting for an in-flight slot.
     /// Current-selection requests are kept ahead of stale cursor positions.
     dir_stats_queue: VecDeque<DirStatsRequest>,
+
+    /// The displayed directory's identity is captured on settled `..` focus,
+    /// never by statting the parent-navigation row during a repaint.
+    current_dir_identity: Option<(PathBuf, ProbeCacheIdentity)>,
+
+    /// One last settled directory's statvfs result (including failures). The
+    /// lookup runs on the existing Tokio blocking pool, not the render path.
+    filesystem_space_cache: Option<(PathBuf, Option<(u64, u64)>)>,
+    filesystem_space_pending: Option<(PathBuf, u64, u64)>, // path, scan generation, request id
+    filesystem_space_request_id: u64,
 
     /// Folder-summary rollup cache with explicit validation scope. This is the
     /// fast info-pane path for performance mode: cursor movement can read this
@@ -2920,6 +2948,8 @@ pub struct BrowseState {
     /// Handle to the in-flight async directory scan. `Some` while a background
     /// scan is running. Used for cancellation and loading/progress indication.
     pub scan_pending: Option<ScanHandle>,
+    /// A terminally successful enumeration, never a streamed partial listing.
+    pub listing_complete: bool,
 
     /// Number of filesystem entries discovered by the active streaming scan.
     /// This is reset at scan start and terminal completion.
@@ -3815,6 +3845,7 @@ impl BrowseState {
             parent_entry: None,
             all_dirs: Vec::new(),
             all_files: Vec::new(),
+            current_dir_audio_count: 0,
             probe_cache_scan_identity_index: HashMap::new(),
             entries: Vec::new(),
             selected_index: 0,
@@ -3866,7 +3897,12 @@ impl BrowseState {
             dir_stats_cache: HashMap::new(),
             dir_stats_pending: std::collections::HashSet::new(),
             dir_stats_active: HashMap::new(),
+            dir_stats_next_request_id: 0,
             dir_stats_queue: VecDeque::new(),
+            current_dir_identity: None,
+            filesystem_space_cache: None,
+            filesystem_space_pending: None,
+            filesystem_space_request_id: 0,
             directory_summary_cache: HashMap::new(),
             directory_summary_db_miss_cache: HashMap::new(),
             directory_summary_persistent_cache_mode: DirectorySummaryPersistentCacheMode::default(),
@@ -3894,6 +3930,7 @@ impl BrowseState {
             error: None,
             archive: None,
             scan_pending: None,
+            listing_complete: false,
             scan_discovered_count: 0,
             scan_generation: 0,
             cursor_restore_target: None,
@@ -3976,6 +4013,7 @@ impl BrowseState {
         std::mem::swap(&mut self.dir_stats_cache, &mut other.dir_stats_cache);
         std::mem::swap(&mut self.dir_stats_pending, &mut other.dir_stats_pending);
         std::mem::swap(&mut self.dir_stats_active, &mut other.dir_stats_active);
+        std::mem::swap(&mut self.dir_stats_next_request_id, &mut other.dir_stats_next_request_id);
         std::mem::swap(&mut self.dir_stats_queue, &mut other.dir_stats_queue);
         std::mem::swap(&mut self.directory_summary_cache, &mut other.directory_summary_cache);
         std::mem::swap(&mut self.directory_summary_db_miss_cache, &mut other.directory_summary_db_miss_cache);
@@ -4198,11 +4236,13 @@ impl BrowseState {
         // clone of a still-live source tab. Dropping the cloned handle severs
         // ownership; the new tab launches fresh work under its own tab id.
         state.scan_pending = None;
+        state.listing_complete = false;
         state.scan_discovered_count = 0;
         state.tree_scan_pending = None;
         state.search.cancel = None;
         state.search.searching = false;
         state.probe_cache_warm_pending.clear();
+        state.filesystem_space_pending = None;
         state.pending_inline_rename_after_scan = None;
     }
 
@@ -5241,6 +5281,8 @@ impl BrowseState {
         });
         self.all_dirs.clear();
         self.all_files.clear();
+        self.listing_complete = false;
+        self.current_dir_audio_count = 0;
         self.probe_cache_scan_identity_index.clear();
         if let Some(parent) = &self.parent_entry {
             self.probe_cache_scan_identity_index
@@ -5256,6 +5298,9 @@ impl BrowseState {
         self.clear_browse_cold_probe_queue();
         self.clear_dir_stats_work_queue();
         self.clear_folder_classification_work_queue();
+        self.current_dir_identity = None;
+        self.filesystem_space_cache = None;
+        self.filesystem_space_pending = None;
 
         let tx = match &self.scan_tx {
             Some(tx) => tx.clone(),
@@ -5306,7 +5351,9 @@ impl BrowseState {
         self.reconcile_current_tree_from_dirs(&dirs, true);
         self.parent_entry = parent_entry;
         self.all_dirs = dirs;
+        self.current_dir_audio_count = files.iter().filter(|entry| entry.is_audio()).count();
         self.all_files = files;
+        self.listing_complete = true;
         self.rebuild_probe_cache_scan_identity_index();
     }
 
@@ -5906,6 +5953,7 @@ impl BrowseState {
         self.parent_entry = None;
         self.all_dirs.clear();
         self.all_files.clear();
+        self.current_dir_audio_count = 0;
         self.probe_cache_scan_identity_index.clear();
         self.error = None;
 
@@ -5932,7 +5980,8 @@ impl BrowseState {
                         Ok(m) => m,
                         Err(_) => continue,
                     };
-                    let is_symlink = symlink_meta.file_type().is_symlink();
+                    let is_symlink = symlink_meta.file_type().is_symlink()
+                        || windows_reparse_point(&symlink_meta);
 
                     // For non-symlinks: use symlink_meta directly (it's the file).
                     // For symlinks: try to follow with metadata() to determine kind
@@ -5989,6 +6038,7 @@ impl BrowseState {
             }
         }
 
+        self.current_dir_audio_count = self.all_files.iter().filter(|entry| entry.is_audio()).count();
         self.rebuild_probe_cache_scan_identity_index();
     }
 
@@ -9370,6 +9420,21 @@ impl BrowseState {
             return;
         }
 
+        if matches!(entry.kind, EntryKind::ParentDir) {
+            let path = self.current_dir.clone();
+            let space_missing = !self.filesystem_space_known_for(&path)
+                && !self.filesystem_space_pending_for(&path);
+            let stats_needed = self.recursive_dir_stats_allowed_for_focus()
+                && !self.dir_stats_pending.contains(&path)
+                && self.current_dir_stats().is_none();
+            if space_missing || stats_needed || self.current_dir_identity.is_none() {
+                self.arm_probe_debounce(entry.path);
+            } else {
+                self.probe_debounce = None;
+            }
+            return;
+        }
+
         let scanned_identity = ProbeCacheIdentity::from_entry(&entry);
         entry = self.lazy_promote_native_disc_source_for_focus(&entry, scanned_identity, false, false);
 
@@ -9455,8 +9520,15 @@ impl BrowseState {
                     .is_some_and(|classification| classification.kind == FolderClassificationKind::Disc);
             let persistent_summary_lookup_needed = db.is_some()
                 && self.directory_summary_database_lookup_may_be_useful(&path, identity);
+            let space_needed = cold_directory_work_allowed
+                && classification.as_deref().is_none_or(|summary| {
+                    matches!(summary.kind, FolderClassificationKind::Collection | FolderClassificationKind::Unknown)
+                })
+                && !self.filesystem_space_known_for(&path)
+                && !self.filesystem_space_pending_for(&path);
 
-            if stats_needed
+            if space_needed
+                || stats_needed
                 || classification_needed
                 || cached_disc_probe_may_be_needed
                 || persistent_summary_lookup_needed
@@ -9675,11 +9747,24 @@ impl BrowseState {
     }
 
 
+    /// For `..`, the information target is the displayed directory, *not*
+    /// the path that the row would navigate to. This also owns stats jobs.
+    fn selected_stats_directory_path(&self) -> Option<&Path> {
+        let entry = self.entries.get(self.selected_index)?;
+        match &entry.kind {
+            EntryKind::ParentDir if self.archive.is_none() => Some(&self.current_dir),
+            _ if entry.is_child_dir() => Some(&entry.path),
+            _ => None,
+        }
+    }
+
+    pub fn is_current_directory_stats_target_path(&self, path: &Path) -> bool {
+        self.selected_stats_directory_path()
+            .is_some_and(|selected| same_scanned_path(selected, path))
+    }
+
     fn current_directory_entry_path(&self) -> Option<PathBuf> {
-        self.entries
-            .get(self.selected_index)
-            .filter(|entry| entry.is_child_dir())
-            .map(|entry| entry.path.clone())
+        self.selected_stats_directory_path().map(Path::to_path_buf)
     }
 
     fn discard_stale_queued_dir_stats(&mut self) {
@@ -9779,24 +9864,114 @@ impl BrowseState {
         }
     }
 
-    fn start_dir_stats_now(
+    fn filesystem_space_known_for(&self, path: &Path) -> bool {
+        self.filesystem_space_cache.as_ref()
+            .is_some_and(|(cached, _)| same_scanned_path(cached, path))
+    }
+
+    fn filesystem_space_pending_for(&self, path: &Path) -> bool {
+        self.filesystem_space_pending.as_ref()
+            .is_some_and(|(pending, generation, _)| {
+                *generation == self.scan_generation && same_scanned_path(pending, path)
+            })
+    }
+
+    /// A single settled-focus statvfs lookup. This is neither a directory walk
+    /// nor a recurring poll, and its failed result is cached until focus moves
+    /// or Browse refreshes.
+    fn schedule_filesystem_space_if_needed(
         &mut self,
-        path: PathBuf,
-        identity: ProbeCacheIdentity,
+        path: &Path,
         tx: &tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
     ) {
-        let cancel = Arc::new(AtomicBool::new(false));
-        self.dir_stats_pending.insert(path.clone());
-        self.dir_stats_active.insert(
-            path.clone(),
-            DirStatsActiveJob {
-                identity,
-                scan_generation: self.scan_generation,
-                cursor_focused: true,
-                cancel: cancel.clone(),
-            },
-        );
-        spawn_dir_stats(path, identity, cancel, tx.clone());
+        if self.archive.is_some() || self.filesystem_space_known_for(path)
+            || self.filesystem_space_pending_for(path)
+        {
+            return;
+        }
+        self.filesystem_space_request_id = self.filesystem_space_request_id.wrapping_add(1);
+        let request_id = self.filesystem_space_request_id;
+        let generation = self.scan_generation;
+        let tab_id = self.tab_id;
+        let path = path.to_path_buf();
+        self.filesystem_space_pending = Some((path.clone(), generation, request_id));
+        let tx = tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let space = fs2::available_space(&path).ok()
+                .zip(fs2::total_space(&path).ok());
+            let _ = tx.blocking_send(crate::tui::message::AppMessage::BrowseFilesystemSpaceComplete {
+                tab_id, generation, request_id, path, space,
+            });
+        });
+    }
+
+    pub fn complete_filesystem_space(
+        &mut self,
+        path: &Path,
+        generation: u64,
+        request_id: u64,
+        space: Option<(u64, u64)>,
+    ) -> bool {
+        if !self.filesystem_space_pending.as_ref().is_some_and(|(pending, pending_generation, pending_id)| {
+            *pending_generation == generation && *pending_id == request_id
+                && same_scanned_path(pending, path)
+        }) {
+            return false;
+        }
+        self.filesystem_space_pending = None;
+        if generation != self.scan_generation || !self.is_current_directory_stats_target_path(path)
+            || self.archive.is_some()
+        {
+            return false;
+        }
+        self.filesystem_space_cache = Some((path.to_path_buf(), space));
+        true
+    }
+
+    /// Only the current selection's settled filesystem has a capacity value;
+    /// failed statvfs calls return `None` rather than a misleading zero.
+    pub fn current_filesystem_space(&self) -> Option<(u64, u64)> {
+        let path = self.selected_stats_directory_path()?;
+        let (cached, space) = self.filesystem_space_cache.as_ref()?;
+        same_scanned_path(path, cached).then_some(*space).flatten()
+    }
+
+    pub fn current_filesystem_space_pending(&self) -> bool {
+        self.selected_stats_directory_path()
+            .is_some_and(|path| self.filesystem_space_pending_for(path))
+    }
+
+    /// The parent row reports `current_dir`, including its actual mtime.
+    pub fn current_directory_modified(&self) -> Option<SystemTime> {
+        let (path, identity) = self.current_dir_identity.as_ref()?;
+        (self.archive.is_none() && same_scanned_path(path, &self.current_dir))
+            .then_some(identity.modified).flatten()
+    }
+
+    /// Immediate counts from the unfiltered scan, never streamed partial rows.
+    pub fn current_directory_listing_counts(&self) -> Option<DirectoryImmediateCounts> {
+        if self.archive.is_some() || self.scan_pending.is_some()
+            || self.error.is_some() || !self.listing_complete {
+            return None;
+        }
+        // The listing is complete and unfiltered, but Browse may classify
+        // symlinks by their target. Exclude such entries to match the
+        // accounting service's *no-follow* immediate-count policy.
+        Some(DirectoryImmediateCounts {
+            folders: self.all_dirs.iter().filter(|e| !e.is_symlink).count(),
+            files: self.all_files.iter().filter(|e| e.is_regular_file).count(),
+            audio_files: self.all_files.iter().filter(|e| e.is_regular_file && e.is_audio()).count(),
+        })
+    }
+
+    // Legacy bounded recursive scanning is retired. The shared accounting
+    // service is the sole producer of recursive filesystem measurements.
+    // Keep old cache types for shallow classification compatibility only.
+    fn start_dir_stats_now(
+        &mut self, _path: PathBuf, _identity: ProbeCacheIdentity,
+        _tx: &tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
+    ) {
+        // Deliberately no-op; no legacy jobs or completions may be created.
     }
 
     fn uncached_directory_summary_work_allowed_for_focus(&self) -> bool {
@@ -9813,8 +9988,9 @@ impl BrowseState {
     }
 
     fn recursive_dir_stats_allowed_for_focus(&self) -> bool {
-        self.uncached_directory_summary_work_allowed_for_focus()
-            && self.directory_stats_cold_work_policy.allows_hover_stats()
+        // Legacy best-effort recursion can never be scheduled, regardless of
+        // user preferences or old persisted cache entries.
+        false
     }
 
     pub fn set_directory_stats_cold_work_policy(
@@ -9942,14 +10118,33 @@ impl BrowseState {
     pub fn complete_dir_stats(
         &mut self,
         path: &Path,
+        request_id: u64,
         tx: &tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
     ) -> bool {
-        let was_pending = self.dir_stats_pending.remove(path);
+        // Path and filesystem identity cannot distinguish two requests for the
+        // same directory. A late cancelled completion must not consume or
+        // cancel its replacement, even when both share one scan generation.
+        if !self.dir_stats_active.get(path).is_some_and(|job| job.request_id == request_id)
+            || !self.dir_stats_pending.contains(path)
+        {
+            return false;
+        }
+        self.dir_stats_pending.remove(path);
         if let Some(job) = self.dir_stats_active.remove(path) {
             job.cancel.store(true, Ordering::Relaxed);
         }
         self.launch_ready_dir_stats(tx);
-        was_pending
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn directory_summary_cache_entry_for_test(&self, path: &Path) -> Option<&DirectorySummaryCacheEntry> {
+        self.directory_summary_cache.get(path)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_dir_stats_request_id(&self, path: &Path) -> Option<u64> {
+        self.dir_stats_active.get(path).map(|job| job.request_id)
     }
 
     fn launch_ready_dir_stats(
@@ -9966,7 +10161,7 @@ impl BrowseState {
                 self.dir_stats_pending.remove(&request.path);
                 continue;
             }
-            if request.cursor_focused && !self.is_current_entry_path(&request.path) {
+            if request.cursor_focused && !self.is_current_directory_stats_target_path(&request.path) {
                 self.dir_stats_pending.remove(&request.path);
                 continue;
             }
@@ -9987,7 +10182,7 @@ impl BrowseState {
             if current_identity != request.identity {
                 self.dir_stats_pending.remove(&request.path);
                 self.remove_dir_stats_cache_entry(&request.path);
-                if request.cursor_focused && self.is_current_entry_path(&request.path) {
+                if request.cursor_focused && self.is_current_directory_stats_target_path(&request.path) {
                     self.schedule_cursor_focused_dir_stats(request.path, current_identity, tx);
                 }
                 continue;
@@ -10394,6 +10589,39 @@ impl BrowseState {
             return;
         }
 
+        if matches!(entry.kind, EntryKind::ParentDir) {
+            // The parent row is lexical; its recorded path and identity are
+            // deliberately never used as the summary target.
+            let path = self.current_dir.clone();
+            let Some(identity) = std::fs::metadata(&path)
+                .ok()
+                .map(|metadata| ProbeCacheIdentity::from_metadata(&metadata))
+            else {
+                self.current_dir_identity = None;
+                return;
+            };
+            self.current_dir_identity = Some((path.clone(), identity));
+            if let Some(db) = db {
+                // Database lookup already uses identity-scoped Browse summaries.
+                // Adapt the displayed directory to its child-entry API without
+                // substituting the `..` navigation path.
+                let current = BrowseEntry::new(
+                    path.clone(), String::new(), EntryKind::Directory,
+                    identity.size, identity.modified,
+                );
+                self.load_directory_summary_from_database_for_entry(&current, identity, db);
+            }
+            self.schedule_filesystem_space_if_needed(&path, tx);
+            if self.scan_pending.is_none()
+                && self.recursive_dir_stats_allowed_for_focus()
+                && !self.has_valid_dir_stats_for_identity(&path, identity)
+                && !self.dir_stats_pending.contains(&path)
+            {
+                self.schedule_cursor_focused_dir_stats(path, identity, tx);
+            }
+            return;
+        }
+
         let Some(identity) = Self::current_filesystem_probe_identity(&entry) else {
             self.remove_probe_cache_entry(&pending.path);
             self.remove_folder_classification_cache_entry(&pending.path);
@@ -10419,6 +10647,14 @@ impl BrowseState {
         if entry.is_child_dir() {
             if let Some(db) = db {
                 self.load_directory_summary_from_database_for_entry(&entry, identity, db);
+            }
+            if self.uncached_directory_summary_work_allowed_for_focus()
+                && self.valid_folder_classification_for_entry(&entry)
+                    .is_none_or(|summary| {
+                        matches!(summary.kind, FolderClassificationKind::Collection | FolderClassificationKind::Unknown)
+                    })
+            {
+                self.schedule_filesystem_space_if_needed(&entry.path, tx);
             }
         }
 
@@ -10921,15 +11157,6 @@ impl BrowseState {
                 },
             );
         }
-        if let Some(stats) = entry.facts.stats.as_ref() {
-            self.dir_stats_cache.insert(
-                path.clone(),
-                DirStatsCacheEntry {
-                    identity: entry.identity,
-                    stats: stats.clone(),
-                },
-            );
-        }
         self.directory_summary_db_miss_cache.remove(&path);
         self.directory_summary_cache.insert(path, entry);
     }
@@ -11182,10 +11409,29 @@ impl BrowseState {
         self.valid_probe_arc_for_entry(entry)
     }
 
-    /// Get cached directory stats for the current selection (if it's a directory)
+    /// Get cached stats for the selected child or for the *displayed* directory
+    /// when the selection is `..`. Never consult the parent-navigation path.
     pub fn current_dir_stats(&self) -> Option<&Arc<DirStats>> {
         let entry = self.entries.get(self.selected_index)?;
+        if matches!(entry.kind, EntryKind::ParentDir) && self.archive.is_none() {
+            let (path, identity) = self.current_dir_identity.as_ref()?;
+            if !same_scanned_path(path, &self.current_dir) { return None; }
+            return self.dir_stats_cache.get(path)
+                .filter(|cached| cached.is_valid_for(*identity))
+                .map(|cached| &cached.stats);
+        }
         self.valid_dir_stats_for_entry(entry)
+    }
+
+    pub fn current_directory_immediate_counts(&self) -> Option<DirectoryImmediateCounts> {
+        let entry = self.entries.get(self.selected_index)?;
+        if matches!(entry.kind, EntryKind::ParentDir) && self.archive.is_none() {
+            self.current_directory_listing_counts()
+        } else if entry.is_child_dir() {
+            self.valid_dir_stats_for_entry(entry).and_then(|stats| stats.immediate)
+        } else {
+            None
+        }
     }
 
     pub fn valid_dir_stats_for_entry(&self, entry: &BrowseEntry) -> Option<&Arc<DirStats>> {
@@ -11214,9 +11460,8 @@ impl BrowseState {
         let entry = DirStatsCacheEntry::new(identity, stats);
         let stats = entry.stats.clone();
         self.dir_stats_cache.insert(path.clone(), entry);
-        self.directory_summary_entry_mut_for_identity(path, identity)
-            .set_stats(stats);
-        self.persist_directory_summary_cache_best_effort();
+        // Not promoted into the classification-only v21 cache.
+        let _ = (path, identity, stats);
     }
 
     pub fn remove_dir_stats_cache_entry(&mut self, path: &Path) {
@@ -11560,9 +11805,11 @@ pub fn spawn_cue_proxy_audio_probe(
 /// runs on `spawn_blocking` so it doesn't tie up an async worker thread —
 /// the original sync version was the source of the Phase 4d UI freeze on
 /// large directories like ~/Downloads.
+#[cfg(test)]
 pub fn spawn_dir_stats(
     path: PathBuf,
     identity: ProbeCacheIdentity,
+    request_id: u64,
     cancel: Arc<AtomicBool>,
     tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
 ) {
@@ -11584,6 +11831,7 @@ pub fn spawn_dir_stats(
             .send(crate::tui::message::AppMessage::DirStatsComplete {
                 path,
                 identity,
+                request_id,
                 stats,
                 cancelled,
             })
@@ -12032,6 +12280,28 @@ fn scan_directory_blocking(
     Vec<BrowseEntry>,
     BrowseClassificationCacheUpdates,
 ), String> {
+    let read = fs::read_dir(dir).map_err(|e| format!("Cannot read directory: {}", e))?;
+
+    scan_directory_entries_blocking(dir, cancel, batch_sink, read)
+}
+
+/// Share the production scan loop with fault-injection tests. In particular,
+/// an individual readdir failure must not become a successful partial listing.
+fn scan_directory_entries_blocking(
+    dir: &Path,
+    cancel: &std::sync::atomic::AtomicBool,
+    batch_sink: Option<(
+        BrowseTabId,
+        u64,
+        &tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
+    )>,
+    read: impl Iterator<Item = std::io::Result<fs::DirEntry>>,
+) -> Result<(
+    Option<BrowseEntry>,
+    Vec<BrowseEntry>,
+    Vec<BrowseEntry>,
+    BrowseClassificationCacheUpdates,
+), String> {
     use std::sync::atomic::Ordering;
 
     let parent_entry = dir.parent().map(|parent| {
@@ -12043,8 +12313,6 @@ fn scan_directory_blocking(
             None,
         )
     });
-
-    let read = fs::read_dir(dir).map_err(|e| format!("Cannot read directory: {}", e))?;
 
     let mut dirs = Vec::new();
     let mut files = Vec::new();
@@ -12081,19 +12349,22 @@ fn scan_directory_blocking(
         .map_err(|_| "directory scan receiver closed".to_string())
     };
 
-    for (i, entry) in read.flatten().enumerate() {
+    for (i, entry) in read.enumerate() {
         if i % DIR_SCAN_CANCEL_CHECK_INTERVAL == 0 && cancel.load(Ordering::Relaxed) {
             return Err("cancelled".into());
         }
+
+        let entry = entry.map_err(|e| format!("Cannot enumerate {}: {}", dir.display(), e))?;
 
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
 
         let symlink_meta = match fs::symlink_metadata(&path) {
             Ok(m) => m,
-            Err(_) => continue,
+            Err(e) => return Err(format!("Cannot read entry metadata for {}: {}", path.display(), e)),
         };
-        let is_symlink = symlink_meta.file_type().is_symlink();
+        let is_symlink = symlink_meta.file_type().is_symlink()
+            || windows_reparse_point(&symlink_meta);
 
         let (metadata, is_broken_symlink) = if is_symlink {
             match fs::metadata(&path) {
@@ -12116,7 +12387,7 @@ fn scan_directory_blocking(
             classify_file(&path)
         };
 
-        let browse_entry = BrowseEntry::new_with_symlink(
+        let mut browse_entry = BrowseEntry::new_with_symlink(
             path,
             name,
             kind.clone(),
@@ -12125,6 +12396,7 @@ fn scan_directory_blocking(
             is_symlink,
             is_broken_symlink,
         );
+        browse_entry.is_regular_file = !is_symlink && symlink_meta.is_file();
 
         // Keep directory scans cheap and predictable: do not open ISO images
         // or disc-directory structures for every row. Supported native disc
@@ -13251,6 +13523,7 @@ fn is_disc_like_folder_name(name: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg(test)]
 struct DirStatsWalkBudget {
     max_depth: u32,
     max_files: usize,
@@ -13258,6 +13531,7 @@ struct DirStatsWalkBudget {
     max_millis: u64,
 }
 
+#[cfg(test)]
 impl Default for DirStatsWalkBudget {
     fn default() -> Self {
         Self {
@@ -13269,73 +13543,148 @@ impl Default for DirStatsWalkBudget {
     }
 }
 
+#[cfg(test)]
 fn compute_dir_stats(path: &Path, cancel: &AtomicBool) -> Option<DirStats> {
     compute_dir_stats_with_budget(path, cancel, DirStatsWalkBudget::default())
 }
 
+#[cfg(test)]
 fn compute_dir_stats_with_budget(
     path: &Path,
     cancel: &AtomicBool,
     budget: DirStatsWalkBudget,
 ) -> Option<DirStats> {
+    compute_dir_stats_with_budget_reading(path, cancel, budget, |dir| fs::read_dir(dir))
+}
+
+/// Share the bounded production walk with deterministic readdir fault-injection
+/// tests; filesystem timing cannot reliably reproduce those failures.
+#[cfg(test)]
+fn compute_dir_stats_with_budget_reading<I>(
+    path: &Path,
+    cancel: &AtomicBool,
+    budget: DirStatsWalkBudget,
+    mut read_dir: impl FnMut(&Path) -> std::io::Result<I>,
+) -> Option<DirStats>
+where
+    I: Iterator<Item = std::io::Result<fs::DirEntry>>,
+{
     if cancel.load(Ordering::Relaxed) {
         return None;
     }
 
     let deadline = Instant::now() + Duration::from_millis(budget.max_millis);
-    let mut stats = DirStats::default();
+    let mut stats = DirStats { complete: true, ..DirStats::default() };
     let mut entries_seen = 0usize;
     let mut queue = VecDeque::from([(path.to_path_buf(), 0u32)]);
 
     while let Some((dir, depth)) = queue.pop_front() {
-        if cancel.load(Ordering::Relaxed) || Instant::now() >= deadline {
+        if cancel.load(Ordering::Relaxed) {
             return None;
         }
+        if Instant::now() >= deadline {
+            stats.complete = false;
+            return Some(stats);
+        }
         if depth >= budget.max_depth {
+            stats.complete = false;
             continue;
         }
 
-        let read = match fs::read_dir(&dir) {
+        let read = match read_dir(&dir) {
             Ok(read) => read,
-            Err(_) => continue,
+            Err(_) => {
+                stats.complete = false;
+                continue;
+            }
         };
-
-        for entry in read.flatten() {
-            if cancel.load(Ordering::Relaxed) || Instant::now() >= deadline {
+        let mut direct = DirectoryImmediateCounts::default();
+        // Only failures in the first level invalidate direct-child counts.
+        // An unreadable or truncated descendant still permits exact direct counts.
+        let mut immediate_complete = true;
+        for entry in read {
+            if cancel.load(Ordering::Relaxed) {
                 return None;
             }
-            entries_seen = entries_seen.saturating_add(1);
-            if entries_seen > budget.max_entries || stats.file_count >= budget.max_files {
-                return None;
+            if Instant::now() >= deadline || entries_seen >= budget.max_entries
+                || stats.file_count >= budget.max_files
+            {
+                stats.complete = false;
+                return Some(stats);
             }
-
+            entries_seen += 1;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    stats.complete = false;
+                    if depth == 0 { immediate_complete = false; }
+                    continue;
+                }
+            };
             let file_type = match entry.file_type() {
                 Ok(file_type) => file_type,
-                Err(_) => continue,
+                Err(_) => {
+                    stats.complete = false;
+                    if depth == 0 { immediate_complete = false; }
+                    continue;
+                }
             };
             if file_type.is_symlink() {
+                // Browse includes navigable symlinks in its immediate listing;
+                // count them there but do not follow links recursively (cycles
+                // and out-of-tree targets are possible).
+                if depth == 0 {
+                    match entry.metadata() {
+                        Ok(meta) if meta.is_dir() => direct.folders += 1,
+                        Ok(meta) => {
+                            direct.files += 1;
+                            if meta.is_file() && matches!(classify_file(&entry.path()), EntryKind::AudioFile(_)) {
+                                direct.audio_files += 1;
+                            }
+                        }
+                        Err(_) => direct.files += 1, // broken symlink in the Browse listing
+                    }
+                }
+                stats.complete = false;
                 continue;
             }
             if file_type.is_file() {
-                if let Ok(meta) = entry.metadata() {
-                    stats.file_count = stats.file_count.saturating_add(1);
-                    let file_len = meta.len();
-                    stats.total_size = stats.total_size.saturating_add(file_len);
+                if depth == 0 {
+                    direct.files += 1;
                     if matches!(classify_file(&entry.path()), EntryKind::AudioFile(_)) {
-                        stats.audio_count = stats.audio_count.saturating_add(1);
-                        stats.audio_size = stats.audio_size.saturating_add(file_len);
+                        direct.audio_files += 1;
                     }
                 }
+                match entry.metadata() {
+                    Ok(meta) => {
+                        stats.file_count = stats.file_count.saturating_add(1);
+                        let file_len = meta.len();
+                        stats.total_size = stats.total_size.saturating_add(file_len);
+                        if matches!(classify_file(&entry.path()), EntryKind::AudioFile(_)) {
+                            stats.audio_count = stats.audio_count.saturating_add(1);
+                            stats.audio_size = stats.audio_size.saturating_add(file_len);
+                        }
+                    }
+                    Err(_) => stats.complete = false,
+                }
             } else if file_type.is_dir() {
+                if depth == 0 { direct.folders += 1; }
                 stats.folder_count = stats.folder_count.saturating_add(1);
                 queue.push_back((entry.path(), depth + 1));
+            } else if depth == 0 {
+                // Special filesystem entries are still shown under `all_files`.
+                direct.files += 1;
             }
+        }
+        if depth == 0 && immediate_complete {
+            // Descendant incompleteness must not invalidate fully enumerated
+            // immediate children, but a skipped root entry must.
+            stats.immediate = Some(direct);
         }
     }
 
     Some(stats)
 }
-
 
 impl Default for BrowseState {
     fn default() -> Self {
@@ -15769,6 +16118,7 @@ mod tests {
                 audio_count: 9,
                 audio_size: 0,
                 total_size: 999,
+                ..Default::default()
             },
         );
 
@@ -15786,6 +16136,7 @@ mod tests {
                 audio_count: 2,
                 audio_size: 0,
                 total_size: 200,
+                ..Default::default()
             },
         );
         let stats = state.current_dir_stats().expect("fresh stats");
@@ -18041,7 +18392,7 @@ mod tests {
     }
 
     #[test]
-    fn compute_dir_stats_returns_none_when_entry_budget_is_exhausted() {
+    fn compute_dir_stats_returns_incomplete_once_when_entry_budget_is_exhausted() {
         let td = tempfile::tempdir().expect("tempdir");
         for idx in 0..5usize {
             std::fs::write(td.path().join(format!("file-{idx}.txt")), b"x").expect("file");
@@ -18053,10 +18404,10 @@ mod tests {
             max_entries: 2,
             max_millis: 1_000,
         };
-        assert!(
-            compute_dir_stats_with_budget(td.path(), &cancel, budget).is_none(),
-            "stats walks should stop at the hard entry budget instead of traversing everything"
-        );
+        let stats = compute_dir_stats_with_budget(td.path(), &cancel, budget).expect("bounded result");
+        assert!(!stats.complete);
+        assert!(stats.immediate.is_none(), "a truncated first pass cannot establish direct counts");
+        assert!(stats.file_count <= 2);
     }
 
     #[test]
@@ -18075,6 +18426,10 @@ mod tests {
 
         let stats = compute_dir_stats_with_budget(td.path(), &cancel, budget).expect("stats");
 
+        assert!(stats.complete);
+        assert_eq!(stats.immediate, Some(DirectoryImmediateCounts {
+            folders: 1, files: 1, audio_files: 0,
+        }));
         assert_eq!(stats.folder_count, 1);
         assert_eq!(stats.file_count, 2);
         assert_eq!(stats.audio_count, 1);
@@ -19768,59 +20123,14 @@ mod browse_perf_followup_v10_tests {
     #[test]
     fn recursive_dir_stats_queue_is_bounded_and_current_selection_first() {
         let mut state = BrowseState::new();
-        // An isolated directory: using a shared location like env::temp_dir()
-        // makes the captured identity race with unrelated tests mutating it.
-        let active_dir = tempfile::tempdir().expect("isolated active dir");
-        let active = active_dir.path().to_path_buf();
-        let active_identity = std::fs::metadata(&active)
-            .ok()
-            .map(|metadata| ProbeCacheIdentity::from_metadata(&metadata))
-            .unwrap_or(ProbeCacheIdentity { modified: None, size: 0 });
-        state.dir_stats_active.insert(
-            active.clone(),
-            DirStatsActiveJob {
-                identity: active_identity,
-                scan_generation: state.scan_generation,
-                cursor_focused: false,
-                cancel: Arc::new(AtomicBool::new(false)),
-            },
-        );
-        state.dir_stats_pending.insert(active);
-
-        let first = BrowseEntry::new(
-            PathBuf::from("/tmp/first-dir"),
-            "first-dir".to_string(),
-            EntryKind::Directory,
-            0,
-            None,
-        );
-        let second = BrowseEntry::new(
-            PathBuf::from("/tmp/second-dir"),
-            "second-dir".to_string(),
-            EntryKind::Directory,
-            0,
-            None,
-        );
-        state.entries = vec![first.clone(), second.clone()];
         let (tx, _rx) = tokio::sync::mpsc::channel(4);
-
-        state.selected_index = 0;
-        state.schedule_cursor_focused_dir_stats(
-            first.path.clone(),
-            ProbeCacheIdentity::from_entry(&first),
-            &tx,
-        );
-        state.selected_index = 1;
-        state.schedule_cursor_focused_dir_stats(
-            second.path.clone(),
-            ProbeCacheIdentity::from_entry(&second),
-            &tx,
-        );
-
-        assert_eq!(state.dir_stats_queue.len(), 1);
-        assert!(same_path(&state.dir_stats_queue[0].path, &second.path));
-        assert!(!state.dir_stats_pending.contains(&first.path));
-        assert!(state.dir_stats_pending.contains(&second.path));
+        let dir = PathBuf::from("/tmp/legacy-stats-disabled");
+        let identity = ProbeCacheIdentity { modified: None, size: 0 };
+        // Even a direct attempt to start the old worker is inert.
+        state.start_dir_stats_now(dir, identity, &tx);
+        assert!(state.dir_stats_active.is_empty());
+        assert!(state.dir_stats_pending.is_empty());
+        assert!(!state.recursive_dir_stats_allowed_for_focus());
     }
 
     #[test]
@@ -19839,6 +20149,7 @@ mod browse_perf_followup_v10_tests {
         state.dir_stats_active.insert(
             active,
             DirStatsActiveJob {
+                request_id: 0,
                 identity: ProbeCacheIdentity { modified: None, size: 0 },
                 scan_generation: state.scan_generation,
                 cursor_focused: false,
@@ -19860,36 +20171,19 @@ mod browse_perf_followup_v10_tests {
         let mut state = BrowseState::new();
         let stale_path = PathBuf::from("/tmp/stale-active-dir");
         let stale_cancel = Arc::new(AtomicBool::new(false));
-        state.dir_stats_active.insert(
-            stale_path.clone(),
-            DirStatsActiveJob {
-                identity: ProbeCacheIdentity { modified: None, size: 0 },
-                scan_generation: state.scan_generation + 1,
-                cursor_focused: true,
-                cancel: stale_cancel.clone(),
-            },
-        );
+        state.dir_stats_active.insert(stale_path.clone(), DirStatsActiveJob {
+            request_id: 9, identity: ProbeCacheIdentity { modified: None, size: 0 },
+            scan_generation: state.scan_generation + 1,
+            cursor_focused: true, cancel: stale_cancel.clone(),
+        });
         state.dir_stats_pending.insert(stale_path.clone());
-
-        let current = BrowseEntry::new(
-            std::env::temp_dir(),
-            "current-dir".to_string(),
-            EntryKind::Directory,
-            0,
-            None,
-        );
-        let current_identity = std::fs::metadata(&current.path)
-            .ok()
-            .map(|metadata| ProbeCacheIdentity::from_metadata(&metadata))
-            .unwrap_or(ProbeCacheIdentity { modified: None, size: 0 });
-        state.entries = vec![current.clone()];
+        let new = std::env::temp_dir();
         let (tx, _rx) = tokio::sync::mpsc::channel(4);
-
-        state.schedule_cursor_focused_dir_stats(current.path.clone(), current_identity, &tx);
-
+        state.schedule_cursor_focused_dir_stats(new.clone(), ProbeCacheIdentity { modified: None, size: 0 }, &tx);
         assert!(stale_cancel.load(Ordering::Relaxed));
         assert!(!state.dir_stats_pending.contains(&stale_path));
-        assert!(state.dir_stats_active.keys().any(|path| same_path(path, &current.path)));
+        assert!(!state.dir_stats_active.contains_key(&new),
+            "retired legacy workers may not be relaunched");
     }
 
 
@@ -19917,6 +20211,7 @@ mod browse_perf_followup_v10_tests {
                 audio_count: 1,
                 audio_size: 0,
                 total_size: 123,
+                ..Default::default()
             },
         );
         writer.flush_directory_summary_persistent_cache().expect("flush cache");
@@ -19942,8 +20237,8 @@ mod browse_perf_followup_v10_tests {
         );
         let facts = reader.current_directory_summary().expect("restored facts");
         assert_eq!(facts.classification_scope, Some(DirectorySummaryScope::Immediate));
-        assert_eq!(facts.stats_scope, Some(DirectorySummaryScope::RecursiveBestEffort));
-        assert_eq!(facts.stats.as_ref().map(|stats| stats.audio_count), Some(1));
+        assert_eq!(facts.stats_scope, None);
+        assert!(facts.stats.is_none(), "legacy directory stats cannot be restored or persisted");
     }
 
     #[test]
@@ -19973,6 +20268,7 @@ mod browse_perf_followup_v10_tests {
             audio_count: 247,
             audio_size: 12_400_000_000,
             total_size: 14_100_000_000,
+            ..Default::default()
         }));
 
         let mut fields: Vec<String> = entry
@@ -19980,6 +20276,7 @@ mod browse_perf_followup_v10_tests {
             .split('\t')
             .map(ToString::to_string)
             .collect();
+        fields.truncate(21); // keep the v3 prefix before dropping folder_count
         fields[1] = "2".to_string();
         fields.remove(16); // v2 did not record folder_count.
         let legacy_v2_line = fields.join("\t");
@@ -20000,32 +20297,45 @@ mod browse_perf_followup_v10_tests {
     }
 
     #[test]
-    fn v3_directory_summary_cache_round_trips_folder_count() {
-        let path = PathBuf::from("/music/v3-artist");
+    fn v4_directory_summary_cache_quarantines_recursive_counts_even_when_marked_complete() {
+        let path = PathBuf::from("/music/v4-artist");
         let identity = ProbeCacheIdentity { modified: None, size: 42 };
         let mut entry = DirectorySummaryCacheEntry::new(identity);
         entry.facts.stats_scope = Some(DirectorySummaryScope::RecursiveBestEffort);
         entry.facts.stats = Some(Arc::new(DirStats {
-            folder_count: 24,
-            file_count: 312,
-            audio_count: 247,
-            audio_size: 12_400_000_000,
-            total_size: 14_100_000_000,
+            folder_count: 24, file_count: 312, audio_count: 247,
+            audio_size: 12_400_000_000, total_size: 14_100_000_000,
+            complete: true,
+            immediate: Some(DirectoryImmediateCounts { folders: 3, files: 8, audio_files: 2 }),
         }));
-
         let (restored_path, restored) = DirectorySummaryCacheEntry::from_persistent_line(
             &entry.to_persistent_line(&path),
-        )
-        .expect("v3 row should restore stats");
-        let stats = restored.facts.stats.as_ref().expect("v3 stats");
-
+        ).expect("v4 classification row remains parseable");
         assert_eq!(restored_path, path);
-        assert_eq!(restored.facts.stats_scope, Some(DirectorySummaryScope::RecursiveBestEffort));
-        assert_eq!(stats.folder_count, 24);
-        assert_eq!(stats.file_count, 312);
-        assert_eq!(stats.audio_count, 247);
-        assert_eq!(stats.audio_size, 12_400_000_000);
-        assert_eq!(stats.total_size, 14_100_000_000);
+        assert!(restored.facts.stats.is_none());
+        assert_eq!(restored.facts.stats_scope, None);
+    }
+
+    #[test]
+    fn v3_directory_summary_cache_reloads_classification_without_unproven_size() {
+        let path = PathBuf::from("/music/v3-legacy");
+        let identity = ProbeCacheIdentity { modified: None, size: 42 };
+        let mut cached = DirectorySummaryCacheEntry::new(identity);
+        cached.facts.stats_scope = Some(DirectorySummaryScope::RecursiveBestEffort);
+        cached.facts.stats = Some(Arc::new(DirStats {
+            total_size: 500,
+            complete: true,
+            ..Default::default()
+        }));
+        let line = cached.to_persistent_line(&path);
+        let mut columns: Vec<String> = line.split('\t').map(str::to_string).collect();
+        columns[1] = "3".to_string();
+        columns.truncate(21);
+        let (restored_path, restored) = DirectorySummaryCacheEntry::from_persistent_line(
+            &columns.join("\t")
+        ).expect("legacy v3 is readable");
+        assert_eq!(restored_path, path);
+        assert!(restored.facts.stats.is_none(), "legacy depth/coverage was unknown");
     }
 
     #[tokio::test]
@@ -20051,6 +20361,7 @@ mod browse_perf_followup_v10_tests {
                 audio_count: 1,
                 audio_size: 0,
                 total_size: 123,
+                ..Default::default()
             },
         );
         writer.store_directory_summary_for_identity_best_effort(&album, identity, &db);
@@ -20083,8 +20394,8 @@ mod browse_perf_followup_v10_tests {
         );
         let facts = reader.current_directory_summary().expect("restored db-backed facts");
         assert_eq!(facts.classification_scope, Some(DirectorySummaryScope::Immediate));
-        assert_eq!(facts.stats_scope, Some(DirectorySummaryScope::RecursiveBestEffort));
-        assert_eq!(facts.stats.as_ref().map(|stats| stats.audio_count), Some(1));
+        assert_eq!(facts.stats_scope, None);
+        assert!(facts.stats.is_none(), "legacy directory stats cannot be restored or persisted");
         assert!(!reader.folder_classification_pending_for(&album));
         assert!(!reader.dir_stats_pending.contains(&album));
     }
@@ -20129,6 +20440,7 @@ mod browse_perf_followup_v10_tests {
         state.dir_stats_active.insert(
             stale_dir.clone(),
             DirStatsActiveJob {
+                request_id: 0,
                 identity: ProbeCacheIdentity { modified: None, size: 0 },
                 scan_generation: state.scan_generation,
                 cursor_focused: true,
@@ -20293,6 +20605,7 @@ mod browse_perf_followup_v10_tests {
         state.dir_stats_active.insert(
             active_path.clone(),
             DirStatsActiveJob {
+                request_id: 0,
                 identity: ProbeCacheIdentity { modified: None, size: 0 },
                 scan_generation: state.scan_generation,
                 cursor_focused: true,
@@ -20780,6 +21093,7 @@ mod disc_directory_navigation_tests {
                     audio_count: 2,
                     audio_size: 0,
                     total_size: 4096,
+                    ..Default::default()
                 },
             );
 
@@ -20802,6 +21116,7 @@ mod disc_directory_navigation_tests {
                 audio_count: 0,
                 audio_size: 0,
                 total_size: 1,
+                ..Default::default()
             },
         );
         assert!(state.valid_dir_stats_for_entry(&parent).is_none());
@@ -21367,7 +21682,7 @@ mod disc_directory_navigation_tests {
     }
 
     #[tokio::test]
-    async fn cached_album_classification_allows_recursive_stats_after_debounce() {
+    async fn cached_album_classification_does_not_relaunch_retired_stats_after_debounce() {
         let temp = tempfile::tempdir().expect("tempdir");
         let album = temp.path().join("Cached Album");
         std::fs::create_dir_all(&album).expect("album fixture");
@@ -21389,20 +21704,30 @@ mod disc_directory_navigation_tests {
 
         state.probe_current_with_db(&tx, None);
 
-        assert_eq!(state.probe_debounce.as_ref().map(|d| d.path.as_path()), Some(album.as_path()));
+        assert!(
+            state.probe_debounce.is_none(),
+            "cached album classification must not arm a debounce with no remaining work"
+        );
         assert!(!state.dir_stats_pending.contains(&album));
 
-        state.probe_debounce.as_mut().expect("debounce").deadline = Instant::now() - Duration::from_millis(1);
+        // A debounce armed before the classification was cached can still
+        // expire later. It must not resurrect retired recursive stats.
+        state.probe_debounce = Some(BrowseProbeDebounce {
+            path: album.clone(),
+            deadline: Instant::now() - Duration::from_millis(1),
+        });
         state.check_probe_debounce(&tx);
 
-        assert!(
-            state.dir_stats_pending.contains(&album),
-            "recursive stats should be allowed after a valid cached/shallow Album classification"
-        );
+        assert!(state.probe_debounce.is_none());
+        assert!(!state.dir_stats_pending.contains(&album),
+            "legacy bounded recursion must remain retired after album classification");
+        assert!(state.dir_stats_queue.is_empty(), "must not queue a legacy scan");
+        assert_eq!(state.active_dir_stats_request_id(&album), None,
+            "must not launch an active legacy scan");
     }
 
     #[tokio::test]
-    async fn cached_collection_classification_allows_bounded_recursive_stats_after_debounce() {
+    async fn cached_collection_classification_does_not_relaunch_retired_stats_after_debounce() {
         let temp = tempfile::tempdir().expect("tempdir");
         let artist = temp.path().join("Artist");
         std::fs::create_dir_all(&artist).expect("artist fixture");
@@ -21435,10 +21760,11 @@ mod disc_directory_navigation_tests {
         state.probe_debounce.as_mut().expect("debounce").deadline = Instant::now() - Duration::from_millis(1);
         state.check_probe_debounce(&tx);
 
-        assert!(
-            state.dir_stats_pending.contains(&artist),
-            "Collection folders use bounded recursive stats as the primary info-pane summary"
-        );
+        assert!(!state.dir_stats_pending.contains(&artist),
+            "collection classification cannot relaunch legacy bounded recursion");
+        assert!(state.dir_stats_queue.is_empty(), "must not queue a legacy scan");
+        assert_eq!(state.active_dir_stats_request_id(&artist), None,
+            "must not launch an active legacy scan");
     }
 
     #[test]
@@ -21478,6 +21804,7 @@ mod disc_directory_navigation_tests {
                 audio_count: 1,
                 audio_size: 0,
                 total_size: 128,
+                ..Default::default()
             },
         );
 
@@ -21485,8 +21812,8 @@ mod disc_directory_navigation_tests {
             .valid_directory_summary_for_entry(&entry)
             .expect("combined summary facts");
         assert_eq!(facts.classification_scope, Some(DirectorySummaryScope::Immediate));
-        assert_eq!(facts.stats_scope, Some(DirectorySummaryScope::RecursiveBestEffort));
-        assert_eq!(facts.stats.as_ref().map(|stats| stats.audio_count), Some(1));
+        assert_eq!(facts.stats_scope, None);
+        assert!(facts.stats.is_none(), "legacy directory stats cannot be restored or persisted");
     }
 
     #[tokio::test]
@@ -21676,10 +22003,8 @@ mod disc_directory_navigation_tests {
             state.disc_probe_pending.contains(&disc),
             "a settled native Blu-ray directory must launch the disc-summary probe"
         );
-        assert!(
-            state.dir_stats_pending.contains(&disc),
-            "a settled native disc directory should also launch directory stats for size/count display"
-        );
+        assert!(!state.dir_stats_pending.contains(&disc),
+            "native-disc probes remain independent of retired recursive statistics");
     }
 
     #[tokio::test]
@@ -22210,5 +22535,312 @@ mod tabbed_browsing_tests {
             Some(source_staging),
         );
         assert!(browse.active_archive_staging().is_some_and(|session| session.dirty));
+    }
+}
+
+
+#[cfg(test)]
+mod browse_directory_info_tests {
+    use super::*;
+
+    fn parent_selection(browse: &mut BrowseState, current: &Path) {
+        browse.current_dir = current.to_path_buf();
+        let parent = current.parent().expect("fixture has parent");
+        let parent_entry = BrowseEntry::new(
+            parent.to_path_buf(), "..".into(), EntryKind::ParentDir, 0, None,
+        );
+        browse.parent_entry = Some(parent_entry.clone());
+        browse.entries = vec![parent_entry];
+        browse.selected_index = 0;
+    }
+
+    #[test]
+    fn failed_directory_enumeration_cannot_publish_authoritative_immediate_counts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let current = temp.path().join("Music");
+        std::fs::create_dir(&current).expect("directory");
+        std::fs::write(current.join("one.flac"), b"audio").expect("file");
+
+        // The first entry is readable but a later readdir yields an error.
+        // `flatten()` would drop that error and return an apparently complete
+        // listing. The production scanner must instead fail terminally.
+        let read = std::fs::read_dir(&current).expect("read dir").chain(std::iter::once(
+            Err(std::io::Error::other("injected readdir error")),
+        ));
+        let error = scan_directory_entries_blocking(
+            &current, &AtomicBool::new(false), None, read,
+        ).expect_err("partial enumeration must fail");
+        assert!(error.contains("injected readdir error"));
+
+        let mut browse = BrowseState::new();
+        parent_selection(&mut browse, &current);
+        browse.all_files.push(BrowseEntry::new(
+            current.join("one.flac"), "one.flac".into(),
+            EntryKind::OtherFile, 5, None,
+        ));
+        browse.error = Some(error); // Same terminal-error state as the reducer.
+        assert!(browse.current_directory_immediate_counts().is_none());
+    }
+
+    #[test]
+    fn failed_entry_metadata_cannot_finish_directory_scan_successfully() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = temp.path().join("removed.flac");
+        std::fs::write(&file, b"audio").expect("file");
+
+        // Return a real DirEntry, but remove its file before lstat. This
+        // deterministically exercises the second previously silent skip.
+        let read = std::fs::read_dir(temp.path()).expect("read dir").map(|entry| {
+            let entry = entry?;
+            std::fs::remove_file(entry.path())?;
+            Ok(entry)
+        });
+        let error = scan_directory_entries_blocking(
+            temp.path(), &AtomicBool::new(false), None, read,
+        ).expect_err("missing metadata must fail");
+        assert!(error.contains("Cannot read entry metadata"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_listing_direct_counts_exclude_directory_symlinks_and_links_to_audio() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("RealAlbum");
+        std::fs::create_dir(&dir).unwrap();
+        let track = root.path().join("track.flac");
+        std::fs::write(&track, b"song").unwrap();
+        std::os::unix::fs::symlink(&dir, root.path().join("linked_dir")).unwrap();
+        std::os::unix::fs::symlink(&track, root.path().join("linked_track.flac")).unwrap();
+        std::os::unix::fs::symlink("missing.flac", root.path().join("broken.flac")).unwrap();
+        let mut browse = BrowseState::new();
+        browse.current_dir = root.path().to_path_buf();
+        assert_eq!(browse.current_directory_listing_counts(), None,
+            "an uninitialized listing is never complete even if it has zero entries");
+        let (parent, dirs, files, _) = scan_directory_blocking(
+            root.path(), &AtomicBool::new(false), None).unwrap();
+        assert!(dirs.iter().any(|entry| entry.is_symlink),
+            "Browse still displays navigable symlinks under its own UI policy");
+        browse.publish_scanned_entries(parent, dirs, files);
+        assert_eq!(browse.current_directory_listing_counts(), Some(DirectoryImmediateCounts {
+            folders: 1, files: 1, audio_files: 1,
+        }));
+    }
+
+    #[test]
+    fn recursive_stats_readdir_failure_at_first_level_cannot_cache_exact_counts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let collection = temp.path().join("Collection");
+        std::fs::create_dir_all(collection.join("Album")).expect("album");
+        std::fs::write(collection.join("track.flac"), b"audio").expect("audio");
+
+        // Inject an error after valid entries. Even an otherwise plausible
+        // subtotal cannot be declared an exact first-level count.
+        let stats = compute_dir_stats_with_budget_reading(
+            &collection,
+            &AtomicBool::new(false),
+            DirStatsWalkBudget { max_depth: 4, max_files: 100, max_entries: 100, max_millis: 1000 },
+            |dir| {
+                let injected: Option<std::io::Result<fs::DirEntry>> =
+                    (dir == collection.as_path()).then(|| {
+                        Err(std::io::Error::other("injected first-level readdir failure"))
+                    });
+                Ok(fs::read_dir(dir)?.chain(injected))
+            },
+        ).expect("partial stats");
+        assert!(!stats.complete);
+        assert_eq!(stats.immediate, None, "failed root enumeration is not authoritative");
+
+        let meta = fs::metadata(&collection).expect("collection metadata");
+        let entry = BrowseEntry::new(
+            collection.clone(), "Collection".into(), EntryKind::Directory,
+            meta.len(), meta.modified().ok(),
+        );
+        let identity = ProbeCacheIdentity::from_entry(&entry);
+        let mut browse = BrowseState::new();
+        browse.entries = vec![entry];
+        browse.selected_index = 0;
+        browse.insert_dir_stats_for_identity(collection.clone(), identity, stats);
+        assert!(browse.current_dir_stats().is_some(), "the partial result remains cacheable");
+        assert_eq!(browse.current_directory_immediate_counts(), None,
+            "neither the Info pane nor the cached summary may expose exact counts");
+        assert!(browse.directory_summary_cache.get(&collection).is_none(),
+            "partial legacy recursive counts must never enter the persistent summary cache");
+    }
+
+    #[test]
+    fn recursive_stats_descendant_readdir_failure_preserves_complete_first_level() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let collection = temp.path().join("Collection");
+        let album = collection.join("Album");
+        std::fs::create_dir_all(&album).expect("album");
+        std::fs::write(collection.join("cover.jpg"), b"cover").expect("cover");
+        std::fs::write(collection.join("track.flac"), b"audio").expect("audio");
+        std::fs::write(album.join("nested.flac"), b"nested").expect("nested");
+
+        let stats = compute_dir_stats_with_budget_reading(
+            &collection,
+            &AtomicBool::new(false),
+            DirStatsWalkBudget { max_depth: 4, max_files: 100, max_entries: 100, max_millis: 1000 },
+            |dir| {
+                let injected: Option<std::io::Result<fs::DirEntry>> =
+                    (dir == album.as_path()).then(|| {
+                        Err(std::io::Error::other("injected descendant readdir failure"))
+                    });
+                Ok(fs::read_dir(dir)?.chain(injected))
+            },
+        ).expect("partial stats");
+        assert!(!stats.complete, "descendant traversal is incomplete");
+        assert_eq!(stats.immediate, Some(DirectoryImmediateCounts {
+            folders: 1, files: 2, audio_files: 1,
+        }), "a descendant failure cannot invalidate successfully counted immediate children");
+    }
+
+    #[test]
+    fn parent_row_summarizes_current_directory_from_unfiltered_completed_listing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let current = temp.path().join("Music");
+        std::fs::create_dir(&current).expect("music");
+        let mut browse = BrowseState::new();
+        parent_selection(&mut browse, &current);
+        let dirs = ["Beatles", "Yes", "Pink Floyd"].iter()
+            .map(|name| BrowseEntry::new(current.join(name), (*name).to_string(), EntryKind::Directory, 0, None))
+            .collect();
+        let files = vec![
+            BrowseEntry::new(current.join("one.flac"), "one.flac".into(), classify_file(&current.join("one.flac")), 3, None),
+            BrowseEntry::new(current.join("cover.jpg"), "cover.jpg".into(), EntryKind::OtherFile, 2, None),
+        ];
+        // Terminal publication computes the audio count once, rather than on repaint.
+        let parent = browse.parent_entry.clone();
+        browse.publish_scanned_entries(parent, dirs, files);
+        // `entries` is deliberately only the `..` row, as with a filtered view.
+        assert_eq!(browse.current_directory_immediate_counts(), Some(DirectoryImmediateCounts {
+            folders: 3, files: 2, audio_files: 1,
+        }));
+
+        let identity = ProbeCacheIdentity::from_metadata(&std::fs::metadata(&current).expect("identity"));
+        browse.current_dir_identity = Some((current.clone(), identity));
+        browse.insert_dir_stats_for_identity(current.clone(), identity, DirStats {
+            total_size: 2_000, complete: true, ..Default::default()
+        });
+        let parent = current.parent().expect("parent");
+        let parent_identity = ProbeCacheIdentity::from_metadata(&std::fs::metadata(parent).expect("parent identity"));
+        browse.insert_dir_stats_for_identity(parent.to_path_buf(), parent_identity, DirStats {
+            total_size: 9_999_999, complete: true, ..Default::default()
+        });
+        assert_eq!(browse.current_dir_stats().expect("current dir stats").total_size, 2_000);
+        assert!(browse.is_current_directory_stats_target_path(&current));
+        assert!(!browse.is_current_directory_stats_target_path(parent));
+    }
+
+    #[test]
+    fn partial_streamed_listing_never_exposes_final_immediate_counts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let current = temp.path().join("Music");
+        std::fs::create_dir(&current).expect("music");
+        let mut browse = BrowseState::new();
+        parent_selection(&mut browse, &current);
+        browse.all_files.push(BrowseEntry::new(current.join("one.flac"), "one.flac".into(),
+            classify_file(&current.join("one.flac")), 3, None));
+        let (scan_handle, _) = ScanHandle::new(browse.scan_generation);
+        browse.scan_pending = Some(scan_handle);
+        assert!(browse.current_directory_immediate_counts().is_none());
+        browse.scan_pending = None;
+        browse.error = Some("scan failed".into());
+        assert!(browse.current_directory_immediate_counts().is_none());
+    }
+
+    #[tokio::test]
+    async fn parent_focus_queues_bounded_stats_for_current_not_ancestor() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let current = temp.path().join("Music");
+        std::fs::create_dir(&current).expect("music");
+        std::fs::write(current.join("track.flac"), b"track").expect("file");
+        let mut browse = BrowseState::new();
+        parent_selection(&mut browse, &current);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        browse.probe_current(&tx);
+        browse.probe_debounce.as_mut().expect("debounce").deadline = Instant::now();
+        browse.check_probe_debounce(&tx);
+        assert_eq!(browse.current_directory_modified(), std::fs::metadata(&current).ok().and_then(|m| m.modified().ok()));
+        assert!(!browse.dir_stats_pending.contains(&current));
+        assert!(!browse.dir_stats_pending.contains(temp.path()));
+        browse.clear_dir_stats_work_queue();
+    }
+
+    #[tokio::test]
+    async fn filesystem_space_lookup_uses_selected_mount_and_rejects_stale_focus() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        std::fs::create_dir(&first).expect("first");
+        std::fs::create_dir(&second).expect("second");
+        let mut browse = BrowseState::new();
+        let first_meta = std::fs::metadata(&first).expect("first meta");
+        let second_meta = std::fs::metadata(&second).expect("second meta");
+        browse.entries = vec![
+            BrowseEntry::new(first.clone(), "first".into(), EntryKind::Directory, first_meta.len(), first_meta.modified().ok()),
+            BrowseEntry::new(second.clone(), "second".into(), EntryKind::Directory, second_meta.len(), second_meta.modified().ok()),
+        ];
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        browse.probe_current(&tx);
+        browse.probe_debounce.as_mut().expect("first debounce").deadline = Instant::now();
+        browse.check_probe_debounce(&tx);
+        let (path, generation, request_id) = browse.filesystem_space_pending.clone().expect("space pending");
+        assert_eq!(path, first);
+        browse.selected_index = 1;
+        browse.probe_current(&tx);
+        assert!(!browse.complete_filesystem_space(&first, generation, request_id, Some((1, 2))),
+            "selection changed before the result arrived");
+        assert!(browse.current_filesystem_space().is_none());
+        browse.probe_debounce.as_mut().expect("second debounce").deadline = Instant::now();
+        browse.check_probe_debounce(&tx);
+        assert_eq!(browse.filesystem_space_pending.as_ref().map(|v| &v.0), Some(&second));
+        let mut accepted = false;
+        for _ in 0..4 {
+            let message = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+                .await.expect("worker timed out").expect("worker message");
+            if let crate::tui::message::AppMessage::BrowseFilesystemSpaceComplete {
+                path, generation, request_id, space, ..
+            } = message {
+                if browse.complete_filesystem_space(&path, generation, request_id, space) {
+                    accepted = true;
+                    assert_eq!(path, second);
+                    assert_eq!(browse.current_filesystem_space().map(|v| v.1), fs2::total_space(&second).ok());
+                    break;
+                }
+            }
+        }
+        assert!(accepted, "accepted only the selected path's capacity");
+    }
+
+    #[test]
+    fn bounded_walk_records_direct_counts_even_when_descendants_are_skipped() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let mut dir = root.to_path_buf();
+        for depth in 0..5 {
+            dir = dir.join(format!("level-{depth}"));
+            std::fs::create_dir(&dir).expect("subdir");
+        }
+        std::fs::write(dir.join("deep.flac"), b"not included").expect("deep file");
+        std::fs::write(root.join("readme.txt"), b"included").expect("root file");
+        let stats = compute_dir_stats_with_budget(root, &AtomicBool::new(false),
+            DirStatsWalkBudget { max_depth: 4, max_files: 100, max_entries: 100, max_millis: 1000 })
+            .expect("bounded stats");
+        assert_eq!(stats.immediate, Some(DirectoryImmediateCounts {
+            folders: 1, files: 1, audio_files: 0,
+        }));
+        assert!(!stats.complete);
+        assert_eq!(stats.total_size, b"included".len() as u64);
+    }
+
+    #[test]
+    fn filesystem_root_has_no_synthetic_parent_row() {
+        let root = Path::new("/");
+        // The lexical parent-row constructor does not create `..` at root.
+        assert!(root.parent().is_none());
+        let mut browse = BrowseState::new();
+        browse.current_dir = root.to_path_buf();
+        assert!(browse.current_dir.parent().is_none());
     }
 }

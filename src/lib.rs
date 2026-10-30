@@ -3,6 +3,7 @@ pub mod config;
 pub mod convert;
 pub mod ctdb_rs;
 pub mod db;
+pub mod directory_accounting;
 pub mod disc;
 pub mod dsf_tags;
 pub(crate) mod fs_limits;

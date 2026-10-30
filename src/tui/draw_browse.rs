@@ -432,6 +432,7 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: 
                 f,
                 info_area,
                 &app.browse,
+                &app.directory_accounting,
                 inline_edit.as_ref(),
                 app.browse_info_focus,
                 &mut app.button_map,
@@ -3080,12 +3081,15 @@ fn pad_or_truncate(s: &str, width: usize, right_align: bool) -> String {
 /// Content returned by `entry_info_lines`: the visual lines plus a
 /// mapping of which metadata fields appear at which line indices (for
 /// registering click targets).
+#[derive(Clone)]
 struct InfoContent {
     lines: Vec<Vec<Span<'static>>>,
     /// (field, line_index) for each clickable metadata row. Fields
     /// that are absent but have a "(click to add)" placeholder also
     /// appear here.
     meta_field_rows: Vec<(MetadataField, usize)>,
+    /// Line index of the separate directory Refresh/Cancel block (if present).
+    refresh_pill_row: Option<usize>,
     /// Line index of the analyze pill (if present).
     analyze_pill_row: Option<usize>,
     /// Line index of the edit tags pill (if present).
@@ -3096,10 +3100,169 @@ struct InfoContent {
     inline_cursor: Option<(usize, u16)>,
 }
 
+/// Find a directory summary row by its first (label) span. A wrapped metric
+/// occupies two physical rows: its label followed by an indented value row.
+fn directory_info_metric_block(
+    info: &InfoContent,
+    label: &str,
+) -> Option<(usize, Vec<Vec<Span<'static>>>)> {
+    let start = info.lines.iter().position(|row| row.first()
+        .is_some_and(|span| span.content.trim() == label))?;
+    let mut end = start + 1;
+    if info.lines.get(end).is_some_and(|row| row.len() > 1
+        && row.first().is_some_and(|span| span.content == "   ")) {
+        end += 1;
+    }
+    Some((start, info.lines[start..end].to_vec()))
+}
+
+/// In a compact pane, a wrapped count may fit on the label row if we drop
+/// the alignment padding. Preserve the entire value (and its span styles):
+/// only the fallback below may abbreviate a value on extremely small panes.
+fn tighten_directory_metric_value(
+    rows: &[Vec<Span<'static>>],
+    content_width: usize,
+) -> Option<Vec<Span<'static>>> {
+    let label = rows.first()?.first()?;
+    let value = rows.get(1)?.get(1..)?;
+    let compact_label = format!("{} ", label.content.trim_end());
+    let width = super::display_width::width(&compact_label)
+        + value.iter().map(|span| super::display_width::width(span.content.as_ref())).sum::<usize>();
+    if width > content_width { return None; }
+    let mut line = vec![Span::styled(compact_label, label.style)];
+    line.extend(value.iter().cloned());
+    Some(line)
+}
+
+/// If the viewport genuinely cannot fit the required rows, abbreviate only
+/// enough wrapped values to keep each label and the active action visible.
+fn compact_directory_metric_value(
+    rows: &[Vec<Span<'static>>],
+    content_width: usize,
+) -> Vec<Span<'static>> {
+    let label = &rows[0][0];
+    let compact_label = format!("{} ", label.content.trim_end());
+    let mut line = vec![Span::styled(compact_label.clone(), label.style)];
+    let mut remaining = content_width.saturating_sub(super::display_width::width(&compact_label));
+    for span in rows[1].iter().skip(1) {
+        if remaining == 0 { break; }
+        let value = truncate_to(span.content.as_ref(), remaining);
+        remaining = remaining.saturating_sub(super::display_width::width(&value));
+        line.push(Span::styled(value, span.style));
+    }
+    line
+}
+
+/// Short Browse panes prioritize the four counted rows and the active action.
+/// Retain optional summary values and then as many classification details as
+/// fit. The full-height Info pane never calls this function.
+fn compact_directory_info(
+    mut info: InfoContent,
+    content_height: usize,
+    content_width: usize,
+) -> InfoContent {
+    let mut mandatory = ["Folders", "Files", "Audio files", "Total size"]
+        .into_iter().filter_map(|label| directory_info_metric_block(&info, label))
+        .collect::<Vec<_>>();
+    if mandatory.len() != 4 { return info; }
+    let action = info.refresh_pill_row;
+    let action_rows = if action.is_some() { 1 } else { 0 };
+    let mut required = mandatory.iter().map(|(_, rows)| rows.len()).sum::<usize>()
+        + action_rows;
+    // Before clipping any count, reclaim unused label-column padding in just
+    // the wrapped rows. At 66x24 this fits complete "unknown" values for
+    // Folders/Files without stealing the lines needed by the other counts.
+    for (_, rows) in &mut mandatory {
+        if required <= content_height { break; }
+        if rows.len() > 1 {
+            if let Some(tight) = tighten_directory_metric_value(rows, content_width) {
+                *rows = vec![tight];
+                required -= 1;
+            }
+        }
+    }
+    // Truly tiny viewports may still need shortened numbers; this fallback
+    // never runs for the 66x24 all-unknown case.
+    for (_, rows) in &mut mandatory {
+        if required <= content_height { break; }
+        if rows.len() > 1 {
+            *rows = vec![compact_directory_metric_value(rows, content_width)];
+            required -= 1;
+        }
+    }
+    let mut remaining = content_height.saturating_sub(required);
+    let show_blank = action.is_some() && remaining > 0;
+    if show_blank { remaining -= 1; }
+    let mut selected = mandatory;
+    // Optional metric blocks retain their original physical wrapping and order.
+    for label in ["Disk free", "Updated", "Kind"] {
+        if let Some(block) = directory_info_metric_block(&info, label) {
+            if block.1.len() <= remaining {
+                remaining -= block.1.len();
+                selected.push(block);
+            }
+        }
+    }
+    if let (Some(start), Some(end)) = (
+        info.lines.iter().position(|row| row.first()
+            .is_some_and(|span| span.content.trim() == "Name")),
+        info.lines.iter().position(|row| row.first()
+            .is_some_and(|span| span.content.trim() == "Kind")),
+    ) {
+        if start < end && end - start <= remaining {
+            remaining -= end - start;
+            selected.push((start, info.lines[start..end].to_vec()));
+        }
+    }
+    if let Some(row) = action {
+        if show_blank { selected.push((row - 1, vec![Vec::new()])); }
+        selected.push((row, vec![info.lines[row].clone()]));
+    }
+    // Album and disc information follows the directory summary. C4C1
+    // inadvertently dropped it, even with spare rows in the compact pane.
+    // Keep the original order, including controls, without displacing counts.
+    let supplemental_start = action.map(|row| row + 1).or_else(|| {
+        ["Updated", "Disk free", "Total size"].into_iter()
+            .find_map(|label| directory_info_metric_block(&info, label)
+                .map(|(start, rows)| start + rows.len()))
+    }).unwrap_or(info.lines.len());
+    for (row, spans) in info.lines.iter().enumerate().skip(supplemental_start) {
+        if remaining == 0 { break; }
+        selected.push((row, vec![spans.clone()]));
+        remaining -= 1;
+    }
+
+    selected.sort_by_key(|(start, _)| *start);
+    let mut compact = Vec::new();
+    let mut row_mapping = Vec::new();
+    for (start, rows) in selected {
+        for (offset, line) in rows.into_iter().enumerate() {
+            row_mapping.push((start + offset, compact.len()));
+            compact.push(line);
+        }
+    }
+    let remap = |original: Option<usize>| -> Option<usize> {
+        original.and_then(|row| row_mapping.iter()
+            .find(|(old, _)| *old == row).map(|(_, new)| *new))
+    };
+    info.refresh_pill_row = remap(info.refresh_pill_row);
+    info.analyze_pill_row = remap(info.analyze_pill_row);
+    info.edit_tags_pill_row = remap(info.edit_tags_pill_row);
+    info.audio_streams_pill_row = remap(info.audio_streams_pill_row);
+    info.meta_field_rows = info.meta_field_rows.into_iter()
+        .filter_map(|(field, row)| remap(Some(row)).map(|new| (field, new)))
+        .collect();
+    info.inline_cursor = info.inline_cursor.and_then(|(row, col)|
+        remap(Some(row)).map(|new| (new, col)));
+    info.lines = compact;
+    info
+}
+
 fn draw_browse_info(
     f: &mut Frame,
     area: Rect,
     browse: &BrowseState,
+    accounting: &crate::directory_accounting::AccountingService,
     inline_edit: Option<&BrowseInlineEditState>,
     info_focus: Option<BrowseInfoFocus>,
     buttons: &mut ButtonRenderMap,
@@ -3140,14 +3303,17 @@ fn draw_browse_info(
     let analyze_hovered = hover == Some(super::button_map::TuiButton::BrowseInfoAnalyze);
     let edit_tags_hovered = hover == Some(super::button_map::TuiButton::BrowseInfoEditTags);
     let audio_streams_hovered = hover == Some(super::button_map::TuiButton::BrowseInfoAudioStreams);
+    let refresh_hovered = hover == Some(super::button_map::TuiButton::BrowseInfoRefresh);
     let info = if let Some(entry) = browse.selected_entry() {
         entry_info_lines(
             entry,
             browse,
+            accounting,
             content_width,
             analyze_hovered,
             edit_tags_hovered,
             audio_streams_hovered,
+            refresh_hovered,
             inline_edit,
             info_focus,
             theme)
@@ -3155,6 +3321,7 @@ fn draw_browse_info(
         InfoContent {
             lines: vec![vec![Span::styled("   (no selection)", theme.muted())]],
             meta_field_rows: Vec::new(),
+            refresh_pill_row: None,
             analyze_pill_row: None,
             edit_tags_pill_row: None,
             audio_streams_pill_row: None,
@@ -3162,13 +3329,25 @@ fn draw_browse_info(
         }
     };
 
+    // The full Info pane retains the reference's order and spacing. On a
+    // compact Browse screen, optional wrapping must never scroll away one of
+    // the four required accounting rows or the active Refresh/Cancel control.
+    let physical_folder = browse.selected_entry().is_some_and(|entry|
+        !browse.is_in_archive() &&
+            (matches!(entry.kind, EntryKind::ParentDir) || entry.is_child_dir())
+            && !entry.is_symlink);
+    let info = if physical_folder && info.lines.len() > content_height {
+        compact_directory_info(info, content_height, content_width)
+    } else { info };
+    let start_row = 0;
+
     // Render content lines with border
-    for line_spans in info.lines.iter().take(content_height) {
+    for line_spans in info.lines.iter().skip(start_row).take(content_height) {
         lines.push(bordered_line(border_color, w, line_spans.clone(), theme));
     }
 
     // Fill remaining
-    let rendered = info.lines.len().min(content_height);
+    let rendered = info.lines.len().saturating_sub(start_row).min(content_height);
     for _ in rendered..content_height {
         lines.push(bordered_line(border_color, w, vec![], theme));
     }
@@ -3179,8 +3358,8 @@ fn draw_browse_info(
     f.render_widget(paragraph, area);
 
     if let Some((line_idx, col)) = info.inline_cursor {
-        if line_idx < content_height {
-            f.set_cursor(area.x + 1 + col, area.y + 1 + line_idx as u16);
+        if line_idx >= start_row && line_idx - start_row < content_height {
+            f.set_cursor(area.x + 1 + col, area.y + 1 + (line_idx - start_row) as u16);
         }
     }
 
@@ -3188,12 +3367,12 @@ fn draw_browse_info(
     // lines that fit within the visible content area.
     let info_y_start = area.y + 1; // below top border
     for (field, line_idx) in &info.meta_field_rows {
-        if *line_idx < content_height {
+        if *line_idx >= start_row && *line_idx - start_row < content_height {
             buttons.record_button(
                 TuiButton::BrowseInfoMeta(*field),
                 Rect::new(
                     area.x + 1,
-                    info_y_start + *line_idx as u16,
+                    info_y_start + (*line_idx - start_row) as u16,
                     (w - 2) as u16,
                     1,
                 ),
@@ -3201,28 +3380,44 @@ fn draw_browse_info(
         }
     }
 
+    // The Refresh/Cancel block is below the summary. Only register its
+    // actual painted row, including when the compact viewport is offset.
+    if let Some(row) = info.refresh_pill_row {
+        if row >= start_row && row - start_row < content_height {
+            buttons.record_button(
+                TuiButton::BrowseInfoRefresh,
+                Rect::new(
+                    area.x + 4,
+                    info_y_start + (row - start_row) as u16,
+                    (if info.lines[row].iter().any(|span| span.content == " Cancel ") { 8 } else { 9 })
+                        .min(w.saturating_sub(5)) as u16,
+                    1,
+                ),
+            );
+        }
+    }
     // Register pill buttons if they fit.
     if let Some(row) = info.analyze_pill_row {
-        if row < content_height {
+        if row >= start_row && row - start_row < content_height {
             buttons.record_button(
                 TuiButton::BrowseInfoAnalyze,
-                Rect::new(area.x + 1, info_y_start + row as u16, (w - 2) as u16, 1),
+                Rect::new(area.x + 1, info_y_start + (row - start_row) as u16, (w - 2) as u16, 1),
             );
         }
     }
     if let Some(row) = info.edit_tags_pill_row {
-        if row < content_height {
+        if row >= start_row && row - start_row < content_height {
             buttons.record_button(
                 TuiButton::BrowseInfoEditTags,
-                Rect::new(area.x + 1, info_y_start + row as u16, (w - 2) as u16, 1),
+                Rect::new(area.x + 1, info_y_start + (row - start_row) as u16, (w - 2) as u16, 1),
             );
         }
     }
     if let Some(row) = info.audio_streams_pill_row {
-        if row < content_height {
+        if row >= start_row && row - start_row < content_height {
             buttons.record_button(
                 TuiButton::BrowseInfoAudioStreams,
-                Rect::new(area.x + 1, info_y_start + row as u16, (w - 2) as u16, 1),
+                Rect::new(area.x + 1, info_y_start + (row - start_row) as u16, (w - 2) as u16, 1),
             );
         }
     }
@@ -3249,74 +3444,198 @@ fn push_key_value_line(
     ]);
 }
 
+/// One label column for the four counted rows, Disk free and Updated.
+/// Kind intentionally keeps its older, narrower label column.
 fn push_directory_metric_line(
     lines: &mut Vec<Vec<Span<'static>>>,
     key: &'static str,
-    value: impl Into<String>,
+    value: Vec<Span<'static>>,
+    label_width: usize,
     theme: super::theme::Theme,
 ) {
-    lines.push(vec![
-        Span::styled(format!("   {key:<12}"), theme.muted()),
-        Span::styled(value.into(), theme.text_style()),
-    ]);
+    let mut row = vec![Span::styled(format!("   {key:label_width$}"), theme.muted())];
+    row.extend(value);
+    lines.push(row);
 }
 
-fn directory_count_label(count: usize, singular: &str, plural: &str) -> String {
-    format!("{} {}", count, if count == 1 { singular } else { plural })
-}
-
-fn append_size_label(mut label: String, size: u64) -> String {
-    if size > 0 {
-        label.push_str(&format!(" ({})", size_str(size)));
+/// Binary units for directory contents and filesystem capacity. The general
+/// file-list formatter is unchanged for compatibility with existing columns.
+fn directory_size_str(bytes: u64) -> String {
+    let bytes_f = bytes as f64;
+    if bytes >= 1 << 40 {
+        format!("{:.2} TiB", bytes_f / (1u64 << 40) as f64)
+    } else if bytes >= 1 << 30 {
+        format!("{:.2} GiB", bytes_f / (1u64 << 30) as f64)
+    } else if bytes >= 1 << 20 {
+        format!("{:.1} MiB", bytes_f / (1u64 << 20) as f64)
+    } else if bytes >= 1 << 10 {
+        format!("{:.1} KiB", bytes_f / (1u64 << 10) as f64)
+    } else {
+        format!("{bytes} B")
     }
-    label
 }
 
+enum DirectoryMetricValue {
+    Known(String),
+    Unknown,
+    Scanning(String),
+    Disk(u64, u64),
+}
+
+fn directory_spinner() -> &'static str {
+    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let tick = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default().as_millis() / 125;
+    FRAMES[tick as usize % FRAMES.len()]
+}
+
+/// The action is a separate block below the summary, never a value for
+/// Total size. The four counted rows exist even without measurements.
 fn push_directory_stats_lines(
     lines: &mut Vec<Vec<Span<'static>>>,
     browse: &BrowseState,
+    accounting: &crate::directory_accounting::AccountingService,
     entry_path: &Path,
     entry_date_label: &str,
+    content_width: usize,
+    refresh_hovered: bool,
+    refresh_focused: bool,
     theme: super::theme::Theme,
-) -> bool {
-    if let Some(stats) = browse.current_dir_stats() {
-        push_directory_metric_line(
-            lines,
-            "folders",
-            directory_count_label(stats.folder_count, "folder", "folders"),
-            theme,
-        );
-        push_directory_metric_line(
-            lines,
-            "files",
-            append_size_label(
-                directory_count_label(stats.file_count, "file", "files"),
-                stats.total_size,
-            ),
-            theme,
-        );
-        push_directory_metric_line(
-            lines,
-            "audio files",
-            append_size_label(
-                directory_count_label(stats.audio_count, "audio file", "audio files"),
-                stats.audio_size,
-            ),
-            theme,
-        );
-        if !entry_date_label.is_empty() {
-            push_directory_metric_line(lines, "updated", entry_date_label.to_string(), theme);
-        }
-        true
-    } else if browse.dir_stats_pending.contains(entry_path) {
-        lines.push(vec![
-            Span::styled("   files       ", theme.muted()),
-            Span::styled("computing...", Style::default().fg(theme.text_dim)),
-        ]);
-        true
+) -> Option<usize> {
+    use crate::directory_accounting::{Freshness, format_bytes, format_exact};
+    let view = accounting.view(entry_path);
+    let running = view.is_some_and(|v| v.running) || accounting.scan_pending(entry_path);
+    let progress = view.and_then(|v| v.progress.as_ref());
+    let cached = view.and_then(|v| v.cached.as_ref())
+        .filter(|v| v.freshness != Freshness::KnownInvalid);
+    let local = view.and_then(|v| v.local);
+    // Folders is the *immediate* child-directory count shown in the image.
+    // Files and Audio files are recursive totals: a one-level preview does
+    // not establish their values (nor the Total size). Their values are
+    // unknown until a complete measurement is available, or provisional
+    // while the exhaustive walker runs. Do not mix these scopes.
+    let listing = (entry_path == browse.current_dir.as_path())
+        .then(|| browse.current_directory_listing_counts()).flatten();
+    let direct_folders = local.map(|counts| counts.folders)
+        .or_else(|| listing.as_ref().map(|counts| counts.folders as u128));
+    let completed = cached.map(|v| v.measurement.counts);
+
+    let mut metrics: Vec<(&'static str, DirectoryMetricValue)> = Vec::new();
+    let folders = if let Some(count) = direct_folders {
+        DirectoryMetricValue::Known(format_exact(count))
+    } else if running {
+        DirectoryMetricValue::Scanning(format_exact(progress.map_or(0, |p| p.folders_discovered)))
     } else {
-        false
+        DirectoryMetricValue::Unknown
+    };
+    metrics.push(("Folders", folders));
+    for (label, completed_value, scanned_value) in [
+        ("Files", completed.map(|counts| counts.files), progress.map(|p| p.files_examined)),
+        ("Audio files", completed.map(|counts| counts.audio), progress.map(|p| p.audio_examined)),
+    ] {
+        let value = if running && completed_value.is_none() {
+            DirectoryMetricValue::Scanning(format_exact(scanned_value.unwrap_or(0)))
+        } else if let Some(value) = completed_value {
+            DirectoryMetricValue::Known(format_exact(value))
+        } else {
+            DirectoryMetricValue::Unknown
+        };
+        metrics.push((label, value));
     }
+    let total = if running && cached.is_none() {
+        DirectoryMetricValue::Scanning(format!("{}…",
+            format_bytes(progress.map_or(0, |p| p.bytes_examined))))
+    } else if let Some(cached) = cached {
+        DirectoryMetricValue::Known(format_bytes(cached.measurement.counts.bytes))
+    } else {
+        DirectoryMetricValue::Unknown
+    };
+    metrics.push(("Total size", total));
+    if let Some((available, total)) = browse.current_filesystem_space() {
+        metrics.push(("Disk free", DirectoryMetricValue::Disk(available, total)));
+    }
+    if !entry_date_label.is_empty() {
+        metrics.push(("Updated", DirectoryMetricValue::Known(entry_date_label.into())));
+    }
+    let has_unknown = metrics.iter().any(|(label, value)|
+        matches!(*label, "Files" | "Audio files" | "Total size")
+            && matches!(value, DirectoryMetricValue::Unknown));
+
+    let max_label = metrics.iter().map(|(label, _)| label.len()).max().unwrap_or(0);
+    // On a narrow terminal one inter-column space fits 'unknown' without
+    // orphaning its value. Keep the image's two spaces at normal widths.
+    let gap = if content_width >= 3 + max_label + 2 + 10 { 2 } else { 1 };
+    let label_width = max_label + gap;
+    let available = content_width.saturating_sub(3 + label_width);
+    for (label, value) in metrics {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        match value {
+            DirectoryMetricValue::Known(value) => {
+                spans.push(Span::styled(value, Style::default().fg(theme.cyan)));
+            }
+            DirectoryMetricValue::Unknown => {
+                spans.push(Span::styled("unknown", Style::default().fg(theme.text_dim)));
+            }
+            DirectoryMetricValue::Scanning(value) => {
+                spans.push(Span::styled(format!("{} ", directory_spinner()),
+                    Style::default().fg(theme.purple)));
+                spans.push(Span::styled(value, Style::default().fg(theme.cyan)));
+            }
+            DirectoryMetricValue::Disk(free, capacity) => {
+                let size = if content_width < 35 {
+                    format!("{}/{}", directory_size_str(free), directory_size_str(capacity))
+                        .replace(" TiB", "T").replace(" GiB", "G")
+                        .replace(" MiB", "M").replace(" KiB", "K").replace(" B", "B")
+                } else {
+                    format!("{} / {}", directory_size_str(free), directory_size_str(capacity))
+                };
+                // Used portion is solid blue; free portion is shaded. Unlike
+                // a percent-only indicator, the fraction is calculated from
+                // the same available/total units printed beside the bar.
+                let slots = if content_width < 35 { 5usize } else { 12usize };
+                let used = if capacity == 0 { 0 } else {
+                    (((capacity.saturating_sub(free.min(capacity))) as u128 * slots as u128)
+                        / capacity as u128) as usize
+                };
+                spans.push(Span::styled("█".repeat(used), Style::default().fg(theme.cyan)));
+                spans.push(Span::styled("░".repeat(slots - used), Style::default().fg(theme.text_dim)));
+                spans.push(Span::raw(if content_width < 35 { " " } else { "  " }));
+                spans.push(Span::styled(size, Style::default().fg(theme.cyan)));
+            }
+        }
+        let value_width = spans.iter().map(|span| super::display_width::width(span.content.as_ref())).sum::<usize>();
+        if value_width <= available {
+            push_directory_metric_line(lines, label, spans, label_width, theme);
+        } else {
+            // Do not silently truncate 'unknown', a running size, or the
+            // volume capacity. Narrow panes wrap the *value* as a unit.
+            push_directory_metric_line(lines, label, vec![], label_width, theme);
+            let max_width = content_width.saturating_sub(3);
+            let mut row = vec![Span::raw("   ")];
+            let mut remaining = max_width;
+            for span in spans {
+                let text = truncate_to(span.content.as_ref(), remaining);
+                remaining = remaining.saturating_sub(super::display_width::width(&text));
+                row.push(Span::styled(text, span.style));
+                if remaining == 0 { break; }
+            }
+            lines.push(row);
+        }
+    }
+    if !running && !has_unknown { return None; }
+    // One blank line below Updated (or Total size when optional rows are
+    // absent). The control always aligns with the labels, not the value column.
+    lines.push(Vec::new());
+    let row = lines.len();
+    let caption = if running { " Cancel " } else { " Refresh " };
+    let _ = (refresh_hovered, refresh_focused); // Keep the purple block in both states.
+    lines.push(vec![
+        Span::raw("   "),
+        Span::styled(caption, Style::default().fg(theme.bg).bg(theme.purple)
+            .add_modifier(Modifier::BOLD)),
+    ]);
+    Some(row)
 }
 
 fn folder_audio_headline(
@@ -3380,11 +3699,6 @@ fn push_folder_audio_detail_lines(
             "duration: {}",
             crate::tui::disc_browser::duration_display(rollup.total_duration_secs)
         ));
-    }
-    if let Some(stats) = browse.current_dir_stats() {
-        if stats.total_size > 0 {
-            tail.push(format!("size: {}", size_str(stats.total_size)));
-        }
     }
     if rollup.probed_count > 0 && rollup.probed_count < audio.track_count {
         tail.push(format!(
@@ -3507,23 +3821,57 @@ fn push_folder_classification_lines(
     lines: &mut Vec<Vec<Span<'static>>>,
     classification: &FolderContentClassification,
     browse: &BrowseState,
+    accounting: &crate::directory_accounting::AccountingService,
     entry_path: &Path,
     entry_size: u64,
     entry_date_label: &str,
     content_width: usize,
     audio_streams_hovered: bool,
     audio_streams_pill_row: &mut Option<usize>,
+    refresh_hovered: bool,
+    refresh_focused: bool,
+    refresh_pill_row: &mut Option<usize>,
+    is_symlink: bool,
     theme: super::theme::Theme,
 ) {
+    // Keep the essential accounting rows immediately after Kind. Album and
+    // disc-probe details can be arbitrarily long and belong below them.
+    match classification.kind {
+        FolderClassificationKind::Album => push_key_value_line(
+            lines, "Kind", "album folder", theme.muted(), theme.bold(theme.blue),
+        ),
+        FolderClassificationKind::Disc => {
+            let marker = classification
+                .disc_marker
+                .map(|marker| marker.label())
+                .or_else(|| {
+                    classification.units.first()
+                        .and_then(|unit| unit.disc_marker.map(|marker| marker.label()))
+                })
+                .unwrap_or("disc");
+            push_key_value_line(
+                lines, "Kind", format!("{marker} disc folder"),
+                theme.muted(), theme.bold(theme.purple),
+            );
+        }
+        FolderClassificationKind::MultiDisc => push_key_value_line(
+            lines, "Kind", "multi-disc album", theme.muted(), theme.bold(theme.blue),
+        ),
+        FolderClassificationKind::Collection | FolderClassificationKind::Unknown =>
+            push_key_value_line(lines, "Kind", "directory", theme.muted(), theme.text_style()),
+    }
+    // A symlink can be classified as a directory because Browse follows its
+    // target for navigation. The accounting scanner deliberately does not
+    // follow symlink roots, so no directory-accounting action belongs here.
+    if !is_symlink {
+        *refresh_pill_row = push_directory_stats_lines(
+            lines, browse, accounting, entry_path, entry_date_label, content_width,
+            refresh_hovered, refresh_focused, theme,
+        );
+    }
+
     match classification.kind {
         FolderClassificationKind::Album => {
-            push_key_value_line(
-                lines,
-                "kind",
-                "album folder",
-                theme.muted(),
-                theme.bold(theme.blue),
-            );
             lines.push(vec![
                 Span::raw("   "),
                 Span::styled(
@@ -3537,48 +3885,14 @@ fn push_folder_classification_lines(
             push_folder_audio_detail_lines(lines, &classification.audio, browse, content_width, theme);
         }
         FolderClassificationKind::Disc => {
-            let marker = classification
-                .disc_marker
-                .map(|marker| marker.label())
-                .or_else(|| {
-                    classification
-                        .units
-                        .first()
-                        .and_then(|unit| unit.disc_marker.map(|marker| marker.label()))
-                })
-                .unwrap_or("disc");
-            push_key_value_line(
-                lines,
-                "kind",
-                format!("{marker} disc folder"),
-                theme.muted(),
-                theme.bold(theme.purple),
-            );
             let source_path = classification.disc_probe_source_path(entry_path);
             push_disc_probe_summary_lines(
-                lines,
-                browse,
-                source_path,
-                entry_size,
-                content_width,
-                audio_streams_hovered,
-                audio_streams_pill_row,
-                theme,
+                lines, browse, source_path, entry_size, content_width,
+                audio_streams_hovered, audio_streams_pill_row, theme,
             );
         }
         FolderClassificationKind::MultiDisc => {
-            push_key_value_line(
-                lines,
-                "kind",
-                "multi-disc album",
-                theme.muted(),
-                theme.bold(theme.blue),
-            );
-            let disc_word = if classification.unit_count == 1 {
-                "disc"
-            } else {
-                "discs"
-            };
+            let disc_word = if classification.unit_count == 1 { "disc" } else { "discs" };
             let mut headline = format!("{} {disc_word}", classification.unit_count);
             if classification.audio.track_count > 0 {
                 headline.push_str(" · ");
@@ -3595,8 +3909,7 @@ fn push_folder_classification_lines(
             if classification.audio.track_count > 0 && classification.units.len() <= 6 {
                 for unit in &classification.units {
                     let unit_line = format!(
-                        "{}: {}",
-                        unit.name,
+                        "{}: {}", unit.name,
                         folder_audio_headline(&unit.audio, browse, false)
                     );
                     lines.push(vec![
@@ -3609,21 +3922,7 @@ fn push_folder_classification_lines(
                 }
             }
         }
-        FolderClassificationKind::Collection => {
-            if !push_directory_stats_lines(lines, browse, entry_path, entry_date_label, theme) {
-                // Collections are an internal classification signal used to
-                // choose follow-up work. Do not make "collection · many albums"
-                // the primary user-facing summary for ordinary artist/tree
-                // folders; without stats, fall back to the old neutral
-                // directory label until stats are available.
-                push_key_value_line(lines, "kind", "directory", theme.muted(), theme.text_style());
-            }
-        }
-        FolderClassificationKind::Unknown => {
-            if !push_directory_stats_lines(lines, browse, entry_path, entry_date_label, theme) {
-                push_key_value_line(lines, "kind", "directory", theme.muted(), theme.text_style());
-            }
-        }
+        FolderClassificationKind::Collection | FolderClassificationKind::Unknown => {}
     }
 }
 
@@ -3634,10 +3933,12 @@ fn push_folder_classification_lines(
 fn entry_info_lines(
     entry: &BrowseEntry,
     browse: &BrowseState,
+    accounting: &crate::directory_accounting::AccountingService,
     content_width: usize,
     analyze_hovered: bool,
     edit_tags_hovered: bool,
     audio_streams_hovered: bool,
+    refresh_hovered: bool,
     inline_edit: Option<&BrowseInlineEditState>,
     info_focus: Option<BrowseInfoFocus>,
     theme: super::theme::Theme,
@@ -3656,6 +3957,8 @@ fn entry_info_lines(
     // pill rendering.
     let mut sacd_edit_tags_row: Option<usize> = None;
     let mut audio_streams_pill_row: Option<usize> = None;
+    let mut refresh_pill_row: Option<usize> = None;
+    let refresh_focused = info_focus == Some(BrowseInfoFocus::Refresh);
 
     let inline_metadata_input = |field: MetadataField| -> Option<&TextInputState> {
         if archive_metadata_inline_disabled {
@@ -3699,22 +4002,75 @@ fn entry_info_lines(
         }
     };
 
-    let entry_date_label = entry.date_label();
+    let entry_date_label = if matches!(entry.kind, EntryKind::ParentDir) && !browse.is_in_archive() {
+        browse.current_directory_modified()
+            .map(|modified| {
+                let dt: chrono::DateTime<chrono::Local> = modified.into();
+                dt.format("%Y-%m-%d").to_string()
+            })
+            .unwrap_or_default()
+    } else {
+        entry.date_label()
+    };
 
-    // Blank
-    lines.push(vec![]);
-
-    // Name section
-    lines.push(vec![Span::styled("   name", theme.muted())]);
-    lines.push(vec![
-        Span::raw("   "),
-        Span::styled(truncate_to(&entry.name, max_value_chars), theme.bright()),
-    ]);
-    lines.push(vec![]);
+    // Directory Name starts at the top of a full-height Info pane. A compact
+    // viewport keeps the accounting action visible when only eight rows fit.
+    let physical_directory = !browse.is_in_archive() &&
+        (matches!(entry.kind, EntryKind::ParentDir) || entry.is_child_dir());
+    if !physical_directory {
+        lines.push(vec![]);
+    }
+    lines.push(vec![Span::styled(if physical_directory { "   Name" } else { "   name" }, theme.muted())]);
+    let display_name = if matches!(entry.kind, EntryKind::ParentDir) && !browse.is_in_archive() {
+        browse.current_dir.file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| browse.current_dir.display().to_string())
+    } else {
+        entry.name.clone()
+    };
+    if physical_directory {
+        // Match the reference's multiline physical-directory name without
+        // truncating its last word at ordinary Info-pane widths.
+        let mut row = String::new();
+        for word in display_name.split_whitespace() {
+            let joined = if row.is_empty() { word.to_string() }
+                else { format!("{row} {word}") };
+            if !row.is_empty() && super::display_width::width(&joined) > max_value_chars {
+                lines.push(vec![Span::raw("   "), Span::styled(row, theme.bright())]);
+                row = word.to_string();
+            } else { row = joined; }
+        }
+        if row.is_empty() { row = display_name; }
+        lines.push(vec![Span::raw("   "),
+            Span::styled(truncate_to(&row, max_value_chars), theme.bright())]);
+    } else {
+        lines.push(vec![Span::raw("   "),
+            Span::styled(truncate_to(&display_name, max_value_chars), theme.bright())]);
+    }
+    if !physical_directory {
+        lines.push(vec![]);
+    }
 
     match &entry.kind {
         EntryKind::ParentDir => {
-            lines.push(vec![Span::styled("   parent directory", theme.muted())]);
+            if browse.is_in_archive() {
+                lines.push(vec![Span::styled("   parent directory", theme.muted())]);
+            } else {
+                push_key_value_line(&mut lines, "Kind", "directory", theme.muted(), theme.text_style());
+                refresh_pill_row = push_directory_stats_lines(
+                    &mut lines, browse, accounting, &browse.current_dir, &entry_date_label,
+                    content_width, refresh_hovered, refresh_focused, theme,
+                );
+            }
+        }
+        EntryKind::Directory if browse.is_in_archive() => {
+            // Archive-member paths are logical, not filesystem directories.
+            lines.push(vec![
+                Span::styled("   kind    ", theme.muted()),
+                Span::styled("directory", theme.text_style()),
+            ]);
         }
         EntryKind::Directory => {
             if let Some(classification) = browse.current_folder_classification() {
@@ -3722,28 +4078,36 @@ fn entry_info_lines(
                     &mut lines,
                     classification.as_ref(),
                     browse,
+                    accounting,
                     &entry.path,
                     entry.size,
                     &entry_date_label,
                     content_width,
                     audio_streams_hovered,
                     &mut audio_streams_pill_row,
+                    refresh_hovered,
+                    refresh_focused,
+                    &mut refresh_pill_row,
+                    entry.is_symlink,
                     theme,
                 );
             } else {
                 lines.push(vec![
-                    Span::styled("   kind    ", theme.muted()),
+                    Span::styled("   Kind    ", theme.muted()),
                     Span::styled("directory", theme.text_style()),
                 ]);
+                if !entry.is_symlink {
+                    refresh_pill_row = push_directory_stats_lines(
+                        &mut lines, browse, accounting, &entry.path, &entry_date_label,
+                        content_width, refresh_hovered, refresh_focused, theme,
+                    );
+                }
                 if browse.folder_classification_pending_for(&entry.path) {
                     lines.push(vec![
-                        Span::styled("   content ", theme.muted()),
+                        Span::styled("   Content ", theme.muted()),
                         Span::styled("classifying...", Style::default().fg(theme.text_dim)),
                     ]);
                 }
-                // Show directory stats if cached, or "computing..." if a stats
-                // task is currently in flight for this directory.
-                push_directory_stats_lines(&mut lines, browse, &entry.path, &entry_date_label, theme);
             }
         }
         EntryKind::AudioFile(fmt) => {
@@ -4160,6 +4524,7 @@ fn entry_info_lines(
                 return InfoContent {
                     lines,
                     meta_field_rows,
+                    refresh_pill_row: None,
                     analyze_pill_row: Some(analyze_row_unprobed),
                     edit_tags_pill_row: Some(et_row),
                     audio_streams_pill_row,
@@ -4191,6 +4556,7 @@ fn entry_info_lines(
             return InfoContent {
                 lines,
                 meta_field_rows,
+                refresh_pill_row: None,
                 analyze_pill_row: Some(analyze_row),
                 edit_tags_pill_row: Some(edit_tags_row),
                 audio_streams_pill_row,
@@ -4213,9 +4579,20 @@ fn entry_info_lines(
                 _ => unreachable!("disc info arm only handles disc entries"),
             };
             lines.push(vec![
-                Span::styled("   kind    ", theme.muted()),
+                Span::styled(
+                    if entry.is_child_dir() && !browse.is_in_archive() {
+                        "   Kind    "
+                    } else { "   kind    " },
+                    theme.muted(),
+                ),
                 Span::styled(disc_kind, theme.bold(theme.purple)),
             ]);
+            if entry.is_child_dir() && !browse.is_in_archive() && !entry.is_symlink {
+                refresh_pill_row = push_directory_stats_lines(
+                    &mut lines, browse, accounting, &entry.path, &entry_date_label,
+                    content_width, refresh_hovered, refresh_focused, theme,
+                );
+            }
             push_disc_probe_summary_lines(
                 &mut lines,
                 browse,
@@ -4392,6 +4769,7 @@ fn entry_info_lines(
     InfoContent {
         lines,
         meta_field_rows,
+        refresh_pill_row,
         analyze_pill_row: None,
         edit_tags_pill_row: sacd_edit_tags_row,
         audio_streams_pill_row,
@@ -4683,7 +5061,9 @@ mod folder_classification_info_pane_tests {
         let info = entry_info_lines(
             &entry,
             &browse,
+            &crate::directory_accounting::AccountingService::new(None),
             96,
+            false,
             false,
             false,
             false,
@@ -4823,7 +5203,7 @@ mod folder_classification_info_pane_tests {
 
         let (rendered, _) = render_classification(entry, classification);
 
-        assert!(rendered.contains("kind    directory"));
+        assert!(rendered.contains("Kind    directory"));
         assert!(!rendered.contains("collection · 24 albums"));
         assert!(!rendered.contains("probing..."));
         assert!(!rendered.contains("streams:"));
@@ -4863,17 +5243,22 @@ mod folder_classification_info_pane_tests {
             identity,
             crate::tui::browse::DirStats {
                 folder_count: 24,
+                immediate: Some(crate::tui::browse::DirectoryImmediateCounts { folders: 3, files: 8, audio_files: 3 }),
+                complete: true,
                 file_count: 312,
                 audio_count: 247,
                 audio_size: 12_400_000_000,
                 total_size: 14_100_000_000,
+                ..Default::default()
             },
         );
 
         let info = entry_info_lines(
             &entry,
             &browse,
+            &crate::directory_accounting::AccountingService::new(None),
             96,
+            false,
             false,
             false,
             false,
@@ -4883,11 +5268,15 @@ mod folder_classification_info_pane_tests {
         );
         let rendered = flatten(&info);
 
-        assert!(rendered.contains("folders     24 folders"));
-        assert!(rendered.contains("files       312 files (13.1 GB)"));
-        assert!(rendered.contains("audio files 247 audio files (11.5 GB)"));
+        assert!(rendered.contains("Folders"));
+        assert!(rendered.contains("Files"));
+        assert!(rendered.contains("Audio files"));
+        assert!(rendered.contains("Total size"));
+        assert!(rendered.contains("Refresh"));
+        assert!(rendered.contains("unknown"));
+        assert!(!rendered.contains("13.13 GiB"));
         assert!(!rendered.contains("collection · 24 albums"));
-        assert!(!rendered.contains("kind    collection"));
+        assert!(!rendered.contains("Kind    collection"));
     }
 
     #[test]
@@ -4925,17 +5314,22 @@ mod folder_classification_info_pane_tests {
             identity,
             crate::tui::browse::DirStats {
                 folder_count: 18,
+                immediate: Some(crate::tui::browse::DirectoryImmediateCounts { folders: 2, files: 8, audio_files: 3 }),
+                complete: true,
                 file_count: 247,
                 audio_count: 192,
                 audio_size: 42_000_000_000,
                 total_size: 45_000_000_000,
+                ..Default::default()
             },
         );
 
         let info = entry_info_lines(
             &entry,
             &browse,
+            &crate::directory_accounting::AccountingService::new(None),
             96,
+            false,
             false,
             false,
             false,
@@ -4945,12 +5339,16 @@ mod folder_classification_info_pane_tests {
         );
         let rendered = flatten(&info);
 
-        assert!(rendered.contains("folders     18 folders"));
-        assert!(rendered.contains("files       247 files (41.9 GB)"));
-        assert!(rendered.contains("audio files 192 audio files (39.1 GB)"));
-        assert!(rendered.contains("updated"));
+        assert!(rendered.contains("Folders"));
+        assert!(rendered.contains("Files"));
+        assert!(rendered.contains("Audio files"));
+        assert!(rendered.contains("Total size"));
+        assert!(rendered.contains("Refresh"));
+        assert!(rendered.contains("unknown"));
+        assert!(!rendered.contains("41.91 GiB"));
+        assert!(rendered.contains("Updated"));
         assert!(!rendered.contains("collection · many albums"));
-        assert!(!rendered.contains("kind    collection"));
+        assert!(!rendered.contains("Kind    collection"));
     }
 
 
@@ -5054,7 +5452,9 @@ mod folder_classification_info_pane_tests {
         let info = entry_info_lines(
             &entry,
             &browse,
+            &crate::directory_accounting::AccountingService::new(None),
             96,
+            false,
             false,
             false,
             false,
@@ -5155,11 +5555,13 @@ mod folder_classification_info_pane_tests {
             let info = entry_info_lines(
                 &entry,
                 &browse,
+                &crate::directory_accounting::AccountingService::new(None),
                 96,
                 false,
                 false,
                 false,
-                None,
+                false,
+            None,
                 None,
                 theme(),
             );
@@ -5212,7 +5614,9 @@ mod folder_classification_info_pane_tests {
         let info = entry_info_lines(
             &entry,
             &browse,
+            &crate::directory_accounting::AccountingService::new(None),
             96,
+            false,
             false,
             false,
             false,
@@ -5264,7 +5668,9 @@ mod folder_classification_info_pane_tests {
         let info = entry_info_lines(
             &entry,
             &browse,
+            &crate::directory_accounting::AccountingService::new(None),
             96,
+            false,
             false,
             false,
             false,
@@ -5310,7 +5716,9 @@ mod folder_classification_info_pane_tests {
         let info = entry_info_lines(
             &entry,
             &browse,
+            &crate::directory_accounting::AccountingService::new(None),
             96,
+            false,
             false,
             false,
             false,
@@ -5402,7 +5810,9 @@ mod folder_classification_info_pane_tests {
         let info = entry_info_lines(
             &entry,
             &browse,
+            &crate::directory_accounting::AccountingService::new(None),
             96,
+            false,
             false,
             false,
             false,
@@ -5630,4 +6040,886 @@ mod path_field_render_tests {
                 && span.style.fg == Some(theme.bg)
         }));
     }
+}
+
+
+#[cfg(test)]
+mod directory_info_presentation_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn theme() -> crate::tui::theme::Theme {
+        crate::tui::theme::theme_by_slug_or_default(
+            crate::tui::theme::default_theme_slug(),
+        )
+    }
+
+    fn render(entry: &BrowseEntry, browse: &BrowseState) -> String {
+        let theme = crate::tui::theme::theme_by_slug_or_default(crate::tui::theme::default_theme_slug());
+        let info = entry_info_lines(entry, browse, &crate::directory_accounting::AccountingService::new(None), 100, false, false, false, false, None, None, theme);
+        info.lines.iter().map(|spans| spans.iter().map(|span| span.content.as_ref()).collect::<String>())
+            .collect::<Vec<_>>().join("\n")
+    }
+
+    #[tokio::test]
+    async fn parent_row_displays_current_directory_and_not_ancestor() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let current = temp.path().join("Rock");
+        std::fs::create_dir(&current).expect("rock");
+        let child = current.join("Yes");
+        std::fs::create_dir(&child).expect("yes");
+        std::fs::write(current.join("one.flac"), b"abc").expect("audio");
+        std::fs::write(current.join("cover.jpg"), b"d").expect("cover");
+        std::fs::write(temp.path().join("parent-only.txt"), b"different").expect("parent-only");
+        let parent_entry = BrowseEntry::new(temp.path().to_path_buf(), "..".into(), EntryKind::ParentDir, 0, None);
+        let mut browse = BrowseState::new();
+        browse.current_dir = current.clone();
+        browse.entries = vec![parent_entry.clone()];
+        browse.all_dirs = vec![BrowseEntry::new(child, "Yes".into(), EntryKind::Directory, 0, None)];
+        browse.all_files = vec![
+            BrowseEntry::new(current.join("one.flac"), "one.flac".into(),
+                EntryKind::AudioFile(crate::convert::formats::AudioFormat::Flac), 3, None),
+            BrowseEntry::new(current.join("cover.jpg"), "cover.jpg".into(), EntryKind::OtherFile, 1, None),
+        ];
+        browse.publish_scanned_entries(Some(parent_entry.clone()), browse.all_dirs.clone(), browse.all_files.clone());
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        browse.probe_current(&tx);
+        // Debounce tested by forcing its clock in the Browse module tests;
+        // here simply wait out the public policy interval.
+        tokio::time::sleep(Duration::from_millis(190)).await;
+        browse.check_probe_debounce(&tx);
+        let identity = crate::tui::browse::ProbeCacheIdentity::from_metadata(
+            &std::fs::metadata(&current).expect("identity")
+        );
+        browse.insert_dir_stats_for_identity(current, identity,
+            crate::tui::browse::DirStats { total_size: 4, complete: true, ..Default::default() });
+        let text = render(&parent_entry, &browse);
+        assert!(text.contains("Rock"));
+        assert!(!text.contains("parent directory"));
+        assert!(text.contains("Folders"));
+        assert!(text.contains("Files"));
+        assert!(text.contains("Audio files"));
+        assert!(text.contains("Total size"));
+        assert!(text.contains("Refresh"));
+        assert!(!text.contains("4 B"));
+        assert!(text.contains("Updated"));
+    }
+
+    #[test]
+    fn incomplete_collection_size_is_never_published_as_total() {
+        let entry = BrowseEntry::new(
+            Path::new("/music/collection").to_path_buf(), "collection".into(), EntryKind::Directory, 0, None
+        );
+        let identity = crate::tui::browse::ProbeCacheIdentity::from_entry(&entry);
+        let mut browse = BrowseState::new();
+        browse.entries = vec![entry.clone()];
+        browse.insert_dir_stats_for_identity(entry.path.clone(), identity,
+            crate::tui::browse::DirStats {
+                folder_count: 100,
+                immediate: Some(crate::tui::browse::DirectoryImmediateCounts {
+                    folders: 3, files: 2, audio_files: 1,
+                }),
+                total_size: 2 * (1u64 << 40),
+                complete: false,
+                ..Default::default()
+            });
+        let text = render(&entry, &browse);
+        assert!(text.contains("Folders"));
+        assert!(text.contains("Files"));
+        assert!(text.contains("Audio files"));
+        assert!(text.contains("Total size"));
+        assert!(text.contains("Refresh"));
+        assert!(!text.contains("not calculated"));
+        assert!(!text.contains("unavailable"));
+        assert!(!text.contains("2.00 TiB"));
+        assert!(!text.contains("(partial)"));
+        assert!(!text.contains("Disk free"));
+    }
+
+    fn directory_info_with_service(
+        entry: &BrowseEntry,
+        browse: &BrowseState,
+        accounting: &crate::directory_accounting::AccountingService,
+    ) -> InfoContent {
+        let theme = crate::tui::theme::theme_by_slug_or_default(
+            crate::tui::theme::default_theme_slug(),
+        );
+        entry_info_lines(entry, browse, accounting, 100, false, false, false,
+            false, None, None, theme)
+    }
+
+    fn flatten_lines(info: &InfoContent) -> Vec<String> {
+        info.lines.iter().map(|row| row.iter()
+            .map(|span| span.content.as_ref()).collect::<String>()).collect()
+    }
+
+    fn fake_measurement(path: &Path, bytes: u128) -> crate::directory_accounting::CachedMeasurement {
+        use crate::directory_accounting::model::{CompleteMeasurement, Counts, Observation};
+        let time = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(86_400);
+        crate::directory_accounting::CachedMeasurement {
+            measurement: CompleteMeasurement {
+                path: path.to_path_buf(),
+                counts: Counts { bytes, ..Counts::default() },
+                started: time, finished: time, created: None, modified: None,
+                generation: 10, observation: Observation::AsObserved,
+            },
+            freshness: crate::directory_accounting::Freshness::Unverified,
+        }
+    }
+
+    #[test]
+    fn directory_metric_columns_align_and_unknown_counts_have_dim_rows() {
+        use crate::directory_accounting::{AccountingService, Counts};
+        let path = Path::new("/music/albums");
+        let entry = BrowseEntry::new(path.to_path_buf(), "albums".into(), EntryKind::Directory, 0, None);
+        let mut browse = BrowseState::new();
+        browse.entries = vec![entry.clone()];
+        let mut service = AccountingService::new(None);
+        let unknown = directory_info_with_service(&entry, &browse, &service);
+        let text = flatten_lines(&unknown).join("\n");
+        assert!(text.contains("Folders"));
+        assert!(text.contains("Files"));
+        assert!(text.contains("Audio files"));
+        assert_eq!(text.matches("unknown").count(), 4);
+        for label in ["Folders", "Files", "Audio files", "Total size"] {
+            let row = unknown.lines.iter().find(|row|
+                row.first().is_some_and(|span| span.content.trim() == label)).unwrap();
+            assert_eq!(row[1].style.fg, Some(theme().text_dim));
+        }
+        assert!(!text.contains("not calculated"));
+        assert!(!text.contains("unavailable"));
+        assert!(!text.contains("Ctrl+P"));
+        assert!(!text.contains("Disk free"));
+        assert!(text.contains("Total size"));
+        assert!(text.contains("Refresh"));
+        assert!(unknown.refresh_pill_row.is_some());
+
+        service.views.entry(path.to_path_buf()).or_default().local = Some(Counts {
+            folders: 2, files: 12, audio: 9, ..Counts::default()
+        });
+        let known = directory_info_with_service(&entry, &browse, &service);
+        let rows = known.lines.iter().filter(|row| row.len() == 2
+            && row[0].content.starts_with("   ")).collect::<Vec<_>>();
+        let row = rows.iter().find(|row| row[0].content.trim() == "Folders").unwrap();
+        assert_eq!(row[0].content.chars().count(), 3 + "Audio files".len() + 2);
+        assert_eq!(row[1].content.as_ref(), "2");
+        assert!(row[0].content.ends_with("  "));
+        // A one-level preview does not turn recursive Files/Audio into known values.
+        assert_eq!(rows.iter().find(|row| row[0].content.trim() == "Files").unwrap()[1].content.as_ref(), "unknown");
+        assert_eq!(rows.iter().find(|row| row[0].content.trim() == "Audio files").unwrap()[1].content.as_ref(), "unknown");
+        // An immediate folder count of zero is a known value, not an omitted row.
+        service.views.get_mut(path).unwrap().local = Some(Counts::default());
+        let zero = directory_info_with_service(&entry, &browse, &service);
+        let text = flatten_lines(&zero).join("\n");
+        assert!(text.contains("Folders      0"));
+        assert!(text.contains("Audio files  unknown"));
+    }
+
+    #[test]
+    fn immediate_folders_stay_distinct_from_recursive_cached_folders() {
+        use crate::directory_accounting::{AccountingService, Counts};
+        let path = Path::new("/music/parent");
+        let entry = BrowseEntry::new(path.to_path_buf(), "parent".into(), EntryKind::Directory, 0, None);
+        let mut browse = BrowseState::new();
+        browse.entries = vec![entry.clone()];
+        let mut service = AccountingService::new(None);
+        let mut cached = fake_measurement(path, 1024);
+        cached.measurement.counts = Counts {
+            folders: 99, files: 80, audio: 70, bytes: 1024, ..Default::default()
+        };
+        service.views.entry(path.to_path_buf()).or_default().cached = Some(cached);
+        let info = directory_info_with_service(&entry, &browse, &service);
+        let rendered = flatten_lines(&info).join("\n");
+        assert!(rendered.contains("Folders      unknown"));
+        assert!(rendered.contains("Files        80"));
+        assert!(rendered.contains("Audio files  70"));
+        assert!(info.refresh_pill_row.is_none());
+        service.views.get_mut(path).unwrap().local = Some(Counts {
+            folders: 3, files: 2, audio: 1, ..Default::default()
+        });
+        let info = directory_info_with_service(&entry, &browse, &service);
+        let rendered = flatten_lines(&info).join("\n");
+        assert!(rendered.contains("Folders      3"));
+        assert!(!rendered.contains("Folders      99"));
+        assert!(rendered.contains("Files        80"));
+        assert!(rendered.contains("Audio files  70"));
+    }
+
+    #[test]
+    fn saved_total_is_indistinguishable_from_new_total_and_invalid_total_is_hidden() {
+        use crate::directory_accounting::{AccountingService, Freshness};
+        let path = Path::new("/music/catalogue");
+        let entry = BrowseEntry::new(path.to_path_buf(), "catalogue".into(), EntryKind::Directory, 0, None);
+        let mut browse = BrowseState::new();
+        browse.entries = vec![entry.clone()];
+        let mut service = AccountingService::new(None);
+        let saved = fake_measurement(path, 1024u128 * 1024 * 1024);
+        service.views.entry(path.to_path_buf()).or_default().cached = Some(saved);
+        let restored = directory_info_with_service(&entry, &browse, &service);
+        let text = flatten_lines(&restored).join("\n");
+        assert!(text.contains("1.00 GiB"));
+        assert!(!text.contains("Refresh"));
+        assert!(restored.refresh_pill_row.is_none());
+        assert!(!text.contains("measurement"));
+        assert!(!text.contains("historical"));
+        assert!(!text.contains("measured at"));
+        assert!(!text.contains("1970"));
+        service.views.get_mut(path).unwrap().cached.as_mut().unwrap().freshness = Freshness::AsObserved;
+        let observed = directory_info_with_service(&entry, &browse, &service);
+        assert_eq!(flatten_lines(&restored), flatten_lines(&observed));
+
+        let view = service.views.get_mut(path).unwrap();
+        view.cached.as_mut().unwrap().freshness = Freshness::KnownInvalid;
+        let stale = directory_info_with_service(&entry, &browse, &service);
+        let text = flatten_lines(&stale).join("\n");
+        assert!(!text.contains("1.00 GiB"));
+        assert!(text.contains("Refresh"));
+        assert!(stale.refresh_pill_row.is_some());
+
+        service.views.get_mut(path).unwrap().running = true;
+        let running = directory_info_with_service(&entry, &browse, &service);
+        let text = flatten_lines(&running).join("\n");
+        assert!(text.contains("0 B…"));
+        assert!(text.contains("Cancel"));
+        assert!(!text.contains("Refresh"));
+        assert!(!text.contains("1.00 GiB"));
+        assert!(running.refresh_pill_row.is_some());
+    }
+
+    #[test]
+    fn running_progress_is_ephemeral_and_button_swaps_to_cancel() {
+        use crate::directory_accounting::{AccountingService, ScanProgress};
+        let path = Path::new("/music/big-album");
+        let entry = BrowseEntry::new(path.to_path_buf(), "big-album".into(), EntryKind::Directory, 0, None);
+        let mut browse = BrowseState::new();
+        browse.entries = vec![entry.clone()];
+        let mut service = AccountingService::new(None);
+        let view = service.views.entry(path.to_path_buf()).or_default();
+        view.running = true;
+        view.progress = Some(ScanProgress {
+            folders_discovered: 8, files_examined: 77, audio_examined: 70,
+            bytes_examined: 2 * 1024 * 1024 * 1024, ..Default::default()
+        });
+        let info = directory_info_with_service(&entry, &browse, &service);
+        let content = flatten_lines(&info).join("\n");
+        assert!(content.contains("77"));
+        assert!(content.contains("70"));
+        assert!(content.contains("2.00 GiB…"));
+        assert!(content.contains("Cancel"));
+        assert!(!content.contains("Refresh"));
+        assert_eq!(info.lines[info.refresh_pill_row.unwrap() - 1].len(), 0);
+        let spinning = info.lines.iter().filter(|row|
+            row.iter().any(|span| span.style.fg == Some(theme().purple))).count();
+        assert_eq!(spinning, 4);
+        // If an independently known direct folder count exists, its row
+        // remains stable while the other three values are still being tallied.
+        service.views.get_mut(path).unwrap().running = false;
+        service.views.get_mut(path).unwrap().local = Some(
+            crate::directory_accounting::Counts { folders: 8, ..Default::default() });
+        service.views.get_mut(path).unwrap().running = true;
+        let stable = directory_info_with_service(&entry, &browse, &service);
+        let folders_row = stable.lines.iter().find(|row|
+            row.first().is_some_and(|span| span.content.trim() == "Folders")).unwrap();
+        assert_eq!(folders_row[1].content.as_ref(), "8");
+        assert!(!folders_row.iter().any(|span| span.style.fg == Some(theme().purple)));
+        let stable_spinning = stable.lines.iter().filter(|row|
+            row.iter().any(|span| span.style.fg == Some(theme().purple))).count();
+        assert_eq!(stable_spinning, 3);
+    }
+
+    #[test]
+    fn full_height_info_has_name_kind_unknown_values_and_separate_action() {
+        let path = Path::new("/music/Long Artist - Album Collection");
+        let entry = BrowseEntry::new(path.to_path_buf(),
+            "Long Artist - Album Collection".into(), EntryKind::Directory, 0, None);
+        let mut browse = BrowseState::new();
+        browse.entries = vec![entry.clone()];
+        let info = directory_info_with_service(&entry, &browse,
+            &crate::directory_accounting::AccountingService::new(None));
+        let rows = flatten_lines(&info);
+        let labels = ["Kind", "Folders", "Files", "Audio files", "Total size"];
+        let positions: Vec<_> = labels.iter().map(|label| rows.iter().position(|row|
+            row.contains(label)).unwrap()).collect();
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+        let action = info.refresh_pill_row.unwrap();
+        assert!(action > *positions.last().unwrap());
+        assert!(rows[action - 1].trim().is_empty());
+        assert!(rows[action].contains(" Refresh "));
+    }
+
+    #[test]
+    fn narrow_directory_info_keeps_refresh_pill_whole_and_focusable() {
+        let path = Path::new("/music/collection");
+        let entry = BrowseEntry::new(path.to_path_buf(), "collection".into(), EntryKind::Directory, 0, None);
+        let mut browse = BrowseState::new();
+        browse.entries = vec![entry.clone()];
+        let accounting = crate::directory_accounting::AccountingService::new(None);
+        let theme = crate::tui::theme::theme_by_slug_or_default(crate::tui::theme::default_theme_slug());
+        let info = entry_info_lines(&entry, &browse, &accounting, 13,
+            false, false, false, false, None, Some(BrowseInfoFocus::Refresh), theme);
+        let rows = flatten_lines(&info);
+        let row = info.refresh_pill_row.expect("narrow pane pill row");
+        assert!(rows[row].contains(" Refresh "));
+        assert!(rows.iter().any(|line| line.contains("Total size")));
+        assert!(rows[row].len() <= 13, "pill fits narrow content area");
+    }
+
+    #[test]
+    fn refresh_pill_hitbox_is_registered_only_when_visible() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("Child");
+        std::fs::create_dir(&folder).unwrap();
+        let entry = BrowseEntry::new(folder, "Child".into(), EntryKind::Directory, 0, None);
+        let mut browse = BrowseState::new();
+        browse.entries = vec![entry];
+        let mut buttons = ButtonRenderMap::new();
+        let accounting = crate::directory_accounting::AccountingService::new(None);
+        let theme = crate::tui::theme::theme_by_slug_or_default(crate::tui::theme::default_theme_slug());
+        let backend = TestBackend::new(70, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw_browse_info(frame, Rect::new(0, 0, 70, 24),
+            &browse, &accounting, None, None, &mut buttons, None, theme)).unwrap();
+        let hit = buttons.find_button_rect(&TuiButton::BrowseInfoRefresh).expect("Refresh hit region");
+        let row = (0..70).map(|x| terminal.backend().buffer().get(x, hit.y).symbol().to_string())
+            .collect::<Vec<_>>().join("");
+        assert!(row.contains("Refresh"));
+        assert_eq!(buttons.find_button_at(hit.x, hit.y), Some(TuiButton::BrowseInfoRefresh));
+    }
+
+    // The full Browse layout leaves an eight-row Info content viewport at
+    // 24 terminal rows. Test that layout, not a standalone tall Info pane.
+    fn render_directory_browse_24(
+        app: &mut AppState,
+        width: u16,
+    ) -> (Vec<String>, Rect, Option<Rect>) {
+        use ratatui::{backend::TestBackend, Terminal};
+        let screen = Rect::new(0, 0, width, 24);
+        let theme = crate::tui::theme::theme_by_slug_or_default(
+            crate::tui::theme::default_theme_slug(),
+        );
+        app.button_map.clear();
+        let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+        terminal.draw(|frame| draw_browse_screen(frame, screen, app, theme)).unwrap();
+        let info_area = browse_content_layout(Rect::new(0, 12, width, 10), &app.browse)[2];
+        let rows = (info_area.y + 1..info_area.bottom() - 1)
+            .map(|y| (info_area.x + 1..info_area.right() - 1)
+                .map(|x| terminal.backend().buffer().get(x, y).symbol().to_string())
+                .collect::<Vec<_>>().join(""))
+            .collect::<Vec<_>>();
+        let hit = app.button_map.find_button_rect(&TuiButton::BrowseInfoRefresh);
+        (rows, info_area, hit)
+    }
+
+    /// Use the actual three-pane Browse layout at arbitrary terminal heights.
+    fn render_directory_browse_size(
+        app: &mut AppState,
+        width: u16,
+        height: u16,
+    ) -> (Vec<String>, Rect, Option<Rect>) {
+        use ratatui::{backend::TestBackend, Terminal};
+        let theme = crate::tui::theme::theme_by_slug_or_default(
+            crate::tui::theme::default_theme_slug(),
+        );
+        app.button_map.clear();
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw_browse_screen(
+            frame, Rect::new(0, 0, width, height), app, theme,
+        )).unwrap();
+        // Single-tab Browse: 7 header + 5 toolbar + 2 footer.
+        let content = Rect::new(0, 12, width, height.saturating_sub(14));
+        let info_area = browse_content_layout(content, &app.browse)[2];
+        let rows = (info_area.y + 1..info_area.bottom() - 1)
+            .map(|y| (info_area.x + 1..info_area.right() - 1)
+                .map(|x| terminal.backend().buffer().get(x, y).symbol().to_string())
+                .collect::<Vec<_>>().join(""))
+            .collect::<Vec<_>>();
+        let hit = app.button_map.find_button_rect(&TuiButton::BrowseInfoRefresh);
+        (rows, info_area, hit)
+    }
+
+    fn assert_complete_unknowns(rows: &[String], expected: usize) {
+        for label in ["Folders", "Files", "Audio files", "Total size"] {
+            assert!(rows.iter().any(|row| row.contains(label)),
+                "missing {label}: {rows:?}");
+        }
+        assert_eq!(rows.join("\n").matches("unknown").count(), expected,
+            "an unknown value was elided or clipped: {rows:?}");
+    }
+
+    #[test]
+    fn sixty_six_by_twenty_four_keeps_every_cold_unknown_and_refresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("Unmeasured");
+        std::fs::create_dir(&folder).unwrap();
+        let entry = BrowseEntry::new(folder.clone(), "Unmeasured".into(),
+            EntryKind::Directory, 0, None);
+        let mut app = directory_layout_app(entry);
+        app.directory_accounting.views.get_mut(&folder).unwrap().local = None;
+        let (rows, area, hit) = render_directory_browse_size(&mut app, 66, 24);
+        assert_complete_unknowns(&rows, 4);
+        assert_refresh_visible(&rows, area, hit, &app);
+
+        // The one-level preview establishes Folders, not the recursive totals.
+        app.directory_accounting.views.get_mut(&folder).unwrap().local =
+            Some(crate::directory_accounting::Counts {
+                folders: 7, ..Default::default()
+            });
+        let (rows, area, hit) = render_directory_browse_size(&mut app, 66, 24);
+        assert_complete_unknowns(&rows, 3);
+        assert!(rows.iter().any(|row| row.contains("Folders") && row.contains('7')),
+            "direct folder count should remain whole: {rows:?}");
+        assert_refresh_visible(&rows, area, hit, &app);
+
+        let view = app.directory_accounting.views.get_mut(&folder).unwrap();
+        view.running = true;
+        view.progress = Some(crate::directory_accounting::ScanProgress {
+            folders_discovered: 7, files_examined: 12, audio_examined: 9,
+            bytes_examined: 2 * 1024 * 1024, ..Default::default()
+        });
+        let (rows, area, hit) = render_directory_browse_size(&mut app, 66, 24);
+        assert_complete_unknowns(&rows, 0);
+        assert!(rows.iter().any(|row| row.contains("Cancel")), "{rows:?}");
+        assert!(rows.iter().any(|row| row.contains("MiB…")), "{rows:?}");
+        let hit = hit.expect("Cancel hitbox");
+        assert_eq!(hit.width, 8);
+        assert!(rows[(hit.y - area.y - 1) as usize].contains("Cancel"));
+        assert_eq!(app.button_map.find_button_at(hit.x, hit.y),
+            Some(TuiButton::BrowseInfoRefresh));
+    }
+
+    fn directory_layout_app(entry: BrowseEntry) -> AppState {
+        let path = entry.path.clone();
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.current_screen = crate::tui::app::AppScreen::Browse;
+        app.browse.current_dir = path.parent().unwrap().to_path_buf();
+        app.browse.entries = vec![entry];
+        app.browse.selected_index = 0;
+        app.browse.explore_enabled = true;
+        app.browse.explore_collapsed = false;
+        app.browse.info_enabled = true;
+        app.browse.info_collapsed = false;
+        app.directory_accounting.views.entry(path).or_default().local = Some(
+            crate::directory_accounting::Counts {
+                folders: 2, files: 12, audio: 9, ..Default::default()
+            },
+        );
+        app
+    }
+
+    fn assert_refresh_visible(rows: &[String], info_area: Rect, hit: Option<Rect>, app: &AppState) {
+        assert_eq!(rows.len(), 8, "24-row Browse has eight Info content rows");
+        assert!(rows.iter().any(|row| row.contains("Refresh")),
+            "Refresh must not fall below the viewport: {rows:?}");
+        let hit = hit.expect("Refresh must have a registered mouse hitbox");
+        assert_eq!(hit.width, 9, "mouse hitbox covers only the painted button");
+        assert!(hit.x > info_area.x && hit.right() < info_area.right());
+        assert!(hit.y > info_area.y && hit.bottom() < info_area.bottom());
+        assert!(rows[(hit.y - info_area.y - 1) as usize].contains("Refresh"),
+            "hitbox must align with the actually rendered pill");
+        assert_eq!(app.button_map.find_button_at(hit.x, hit.y), Some(TuiButton::BrowseInfoRefresh));
+    }
+
+    #[test]
+    fn directory_accounting_and_refresh_are_visible_at_80_by_24_even_after_counts() {
+        let temp = tempfile::tempdir().unwrap();
+        let child = temp.path().join("Collection");
+        std::fs::create_dir(&child).unwrap();
+        let entry = BrowseEntry::new(child, "Collection".into(), EntryKind::Directory, 0, None);
+        for width in [66, 80, 120] {
+            let mut app = directory_layout_app(entry.clone());
+            let (rows, info, hit) = render_directory_browse_24(&mut app, width);
+            assert_refresh_visible(&rows, info, hit, &app);
+            for label in ["Folders", "Files", "Audio files", "Total size"] {
+                assert!(rows.iter().any(|row| row.contains(label)),
+                    "{label} must remain visible at width {width}: {rows:?}");
+            }
+            assert!(rows.iter().any(|row| row.trim() == "Refresh"),
+                "button is separate from the metric value column: {rows:?}");
+        }
+    }
+
+    /// The real Browse viewport is eight lines high at 80x24. Add the same
+    /// two-line capacity reading produced by push_directory_stats_lines so
+    /// compact selection is tested against physically wrapped optional rows.
+    fn info_with_wrapped_disk_space(
+        entry: &BrowseEntry,
+        browse: &BrowseState,
+        accounting: &crate::directory_accounting::AccountingService,
+    ) -> InfoContent {
+        let theme = crate::tui::theme::theme_by_slug_or_default(
+            crate::tui::theme::default_theme_slug());
+        let mut info = entry_info_lines(entry, browse, accounting, 22,
+            false, false, false, false, None, None, theme);
+        let updated = directory_info_metric_block(&info, "Updated").unwrap().0;
+        let disk = vec![
+            vec![Span::styled("   Disk free   ", theme.muted())],
+            vec![Span::raw("   "), Span::styled("█████░ 2.66T/16.30T",
+                Style::default().fg(theme.cyan))],
+        ];
+        info.lines.splice(updated..updated, disk);
+        if let Some(row) = &mut info.refresh_pill_row { *row += 2; }
+        info
+    }
+
+    fn assert_counted_rows_present(info: &InfoContent) {
+        let rows = flatten_lines(info);
+        for label in ["Folders", "Files", "Audio files", "Total size"] {
+            assert!(rows.iter().any(|row| row.contains(label)),
+                "{label} must remain in the compact viewport: {rows:?}");
+        }
+    }
+
+    #[test]
+    fn eighty_by_twenty_four_keeps_all_metrics_with_disk_free_and_updated() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Collection");
+        std::fs::create_dir(&path).unwrap();
+        let modified = Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(86400));
+        let entry = BrowseEntry::new(path, "Collection".into(), EntryKind::Directory, 0, modified);
+        let mut browse = BrowseState::new();
+        browse.entries = vec![entry.clone()];
+        let accounting = crate::directory_accounting::AccountingService::new(None);
+        let full = info_with_wrapped_disk_space(&entry, &browse, &accounting);
+        let full_rows = flatten_lines(&full);
+        assert!(full_rows.iter().any(|r| r.contains("Disk free")));
+        assert!(full_rows.iter().any(|r| r.contains("Updated")));
+        let compact = compact_directory_info(full, 8, 22);
+        assert_eq!(compact.lines.len(), 8);
+        assert_counted_rows_present(&compact);
+        let rows = flatten_lines(&compact);
+        assert!(rows.iter().any(|r| r.contains("Refresh")));
+        assert!(compact.refresh_pill_row.is_some());
+        assert_eq!(compact.lines[compact.refresh_pill_row.unwrap() - 1].len(), 0);
+    }
+
+    #[test]
+    fn eighty_by_twenty_four_keeps_running_spinners_size_and_cancel() {
+        use crate::directory_accounting::{AccountingService, Counts, ScanProgress};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Very Long Artist Name And Very Long Album Name");
+        std::fs::create_dir(&path).unwrap();
+        let modified = Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(86400));
+        let entry = BrowseEntry::new(path.clone(),
+            "Very Long Artist Name And Very Long Album Name".into(),
+            EntryKind::Directory, 0, modified);
+        let mut browse = BrowseState::new();
+        browse.entries = vec![entry.clone()];
+        let mut accounting = AccountingService::new(None);
+        let view = accounting.views.entry(path).or_default();
+        view.local = Some(Counts { folders: 8, ..Default::default() });
+        view.running = true;
+        view.progress = Some(ScanProgress {
+            folders_discovered: 8, files_examined: 77, audio_examined: 70,
+            bytes_examined: 2 * 1024 * 1024 * 1024, ..Default::default()
+        });
+        let full = info_with_wrapped_disk_space(&entry, &browse, &accounting);
+        let compact = compact_directory_info(full, 8, 22);
+        assert_eq!(compact.lines.len(), 8);
+        assert_counted_rows_present(&compact);
+        let rows = flatten_lines(&compact);
+        assert!(rows.iter().any(|r| r.contains("Cancel")), "{rows:?}");
+        assert!(!rows.iter().any(|r| r.contains("Refresh")));
+        assert!(rows.iter().any(|r| r.contains("2.00 GiB…")), "{rows:?}");
+        let spinner_rows = compact.lines.iter().filter(|row|
+            row.iter().any(|span| span.style.fg == Some(theme().purple))).count();
+        assert_eq!(spinner_rows, 3, "Files, Audio files and Total size are scanning");
+        let button = compact.refresh_pill_row.unwrap();
+        assert!(rows[button].contains("Cancel"));
+    }
+
+    #[test]
+    fn full_height_keeps_original_name_kind_disk_date_and_action_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Long Name With Several Wrapped Words");
+        std::fs::create_dir(&path).unwrap();
+        let modified = Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(86400));
+        let entry = BrowseEntry::new(path, "Long Name With Several Wrapped Words".into(),
+            EntryKind::Directory, 0, modified);
+        let mut browse = BrowseState::new();
+        browse.entries = vec![entry.clone()];
+        let accounting = crate::directory_accounting::AccountingService::new(None);
+        let full = info_with_wrapped_disk_space(&entry, &browse, &accounting);
+        let rows = flatten_lines(&full);
+        let positions = ["Name", "Kind", "Folders", "Files", "Audio files", "Total size",
+            "Disk free", "Updated", "Refresh"].iter().map(|label|
+            rows.iter().position(|row| row.contains(label)).unwrap()).collect::<Vec<_>>();
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(rows[positions[7] + 1].contains(entry.date_label().as_str()));
+        assert!(rows[positions[8] - 1].trim().is_empty());
+    }
+
+    #[test]
+    fn long_folder_and_date_do_not_displace_compact_metrics_or_hitbox() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("A Very Long Folder Name With Several Wrapped Words");
+        std::fs::create_dir(&path).unwrap();
+        let entry = BrowseEntry::new(path, "A Very Long Folder Name With Several Wrapped Words".into(),
+            EntryKind::Directory, 0,
+            Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(86400)));
+        let mut app = directory_layout_app(entry);
+        let (rows, info, hit) = render_directory_browse_24(&mut app, 80);
+        assert_refresh_visible(&rows, info, hit, &app);
+        for label in ["Folders", "Files", "Audio files", "Total size"] {
+            assert!(rows.iter().any(|r| r.contains(label)),
+                "{label} disappeared at 80x24: {rows:?}");
+        }
+    }
+
+    #[test]
+    fn scanning_cancel_hitbox_tracks_compacted_painted_button() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("A Very Long Folder Name With Several Wrapped Words");
+        std::fs::create_dir(&path).unwrap();
+        let entry = BrowseEntry::new(path.clone(),
+            "A Very Long Folder Name With Several Wrapped Words".into(),
+            EntryKind::Directory, 0,
+            Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(86400)));
+        let mut app = directory_layout_app(entry);
+        let view = app.directory_accounting.views.get_mut(&path).unwrap();
+        view.running = true;
+        view.progress = Some(crate::directory_accounting::ScanProgress {
+            files_examined: 77, audio_examined: 70,
+            bytes_examined: 2 * 1024 * 1024 * 1024, ..Default::default()
+        });
+        let (rows, area, hit) = render_directory_browse_24(&mut app, 80);
+        let hit = hit.expect("Cancel is visible");
+        assert_eq!(hit.width, 8);
+        assert!(hit.x > area.x && hit.right() < area.right());
+        assert!(hit.y > area.y && hit.bottom() < area.bottom());
+        assert!(rows[(hit.y - area.y - 1) as usize].contains("Cancel"));
+        assert_eq!(app.button_map.find_button_at(hit.x, hit.y), Some(TuiButton::BrowseInfoRefresh));
+        for label in ["Folders", "Files", "Audio files", "Total size"] {
+            assert!(rows.iter().any(|r| r.contains(label)),
+                "{label} disappeared while scanning: {rows:?}");
+        }
+        assert!(rows.iter().any(|r| r.contains("2.00 GiB…")));
+    }
+
+    fn example_classification(
+        entry: &BrowseEntry,
+        kind: FolderClassificationKind,
+    ) -> FolderContentClassification {
+        FolderContentClassification {
+            kind,
+            identity: crate::tui::browse::ProbeCacheIdentity::from_entry(entry),
+            audio: FolderAudioSummary::default(),
+            units: Vec::new(),
+            unit_count: 2,
+            collection_many: false,
+            io_budget_exhausted: false,
+            disc_marker: Some(crate::tui::browse::FolderDiscMarkerKind::DvdAudio),
+            embedded_cue_availability: crate::tui::probe::EmbeddedCueAvailability::Unknown,
+            cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
+            cue_repair_availability: crate::tui::browse::CueRepairAvailability::Unknown,
+            cue_file_reference_repairs: Default::default(),
+        }
+    }
+
+    #[test]
+    fn classified_album_and_disc_details_follow_visible_accounting() {
+        let temp = tempfile::tempdir().unwrap();
+        let child = temp.path().join("Album");
+        std::fs::create_dir(&child).unwrap();
+        let entry = BrowseEntry::new(child.clone(), "Album".into(), EntryKind::Directory, 0, None);
+        for kind in [FolderClassificationKind::Album, FolderClassificationKind::Disc,
+            FolderClassificationKind::MultiDisc] {
+            let mut app = directory_layout_app(entry.clone());
+            app.browse.insert_folder_classification_for_test(
+                child.clone(), example_classification(&entry, kind),
+            );
+            let (rows, info, hit) = render_directory_browse_24(&mut app, 80);
+            assert_refresh_visible(&rows, info, hit, &app);
+        }
+        for kind in [EntryKind::DvdAudioDir, EntryKind::DvdVideoDir, EntryKind::BlurayDir] {
+            let mut app = directory_layout_app(BrowseEntry::new(
+                child.clone(), "Album".into(), kind, 0, None,
+            ));
+            let (rows, info, hit) = render_directory_browse_24(&mut app, 80);
+            assert_refresh_visible(&rows, info, hit, &app);
+        }
+    }
+
+    #[test]
+    fn album_headline_survives_80_by_30_compaction_with_capacity_and_date() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("Album Collection");
+        std::fs::create_dir(&folder).unwrap();
+        let modified = Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(86_400));
+        let entry = BrowseEntry::new(folder.clone(),
+            "Album Collection".into(),
+            EntryKind::Directory, 0, modified);
+        let mut app = directory_layout_app(entry.clone());
+        let track = folder.join("track.flac");
+        let mut classification = example_classification(&entry, FolderClassificationKind::Album);
+        classification.audio.track_count = 1;
+        classification.audio.format_counts.insert("FLAC".to_string(), 1);
+        classification.audio.file_paths.push(track.clone());
+        app.browse.insert_folder_classification_for_identity(
+            folder.clone(), crate::tui::browse::ProbeCacheIdentity::from_entry(&entry), classification,
+        );
+        app.browse.insert_probe_cache_for_test(track, Some(std::sync::Arc::new(
+            crate::tui::browse::CachedInfo {
+                source: crate::tui::probe::SourceInfo {
+                    sample_format_is_float: Some(false), compression_is_lossless: Some(true),
+                    format_name: "FLAC".into(), codec: "flac".into(), bit_depth: Some(16),
+                    sample_rate: 44_100, channels: 2, channel_layout: "stereo".into(),
+                    duration_secs: 90.0, file_size: 1234,
+                },
+                metadata: crate::tui::probe::SourceMetadata::default(),
+            }
+        )));
+
+        // The actual 80x30 Browse panel has 14 content rows.
+        let (drawn, area, hit) = render_directory_browse_size(&mut app, 80, 30);
+        assert_eq!(drawn.len(), 14);
+        assert!(drawn.iter().any(|row| row.contains("1 track")), "{drawn:?}");
+        assert!(drawn.iter().any(|row| row.contains("duration:")), "{drawn:?}");
+        assert_eq!(app.button_map.find_button_at(hit.unwrap().x, hit.unwrap().y),
+            Some(TuiButton::BrowseInfoRefresh));
+        assert_eq!(area.height, 16);
+
+        // A capacity bar plus date causes two additional wrapped rows. With
+        // those fields populated, the headline must still get the spare line;
+        // the duration detail follows as soon as another line becomes free.
+        let full = info_with_wrapped_disk_space(&entry, &app.browse, &app.directory_accounting);
+        assert!(flatten_lines(&full).join("\n").contains("duration:"));
+        let compact = compact_directory_info(full.clone(), 14, 22);
+        let rows = flatten_lines(&compact);
+        assert_counted_rows_present(&compact);
+        assert!(rows.iter().any(|r| r.contains("1 track")),
+            "album headline lost despite remaining space: {rows:?}");
+        assert!(rows.iter().any(|r| r.contains("Refresh")));
+        let expanded = compact_directory_info(full, 15, 22);
+        assert!(flatten_lines(&expanded).iter().any(|r| r.contains("duration:")),
+            "additional space must reveal next classification detail");
+    }
+
+    #[test]
+    fn disc_supplemental_lines_and_visible_controls_survive_compaction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("Disc");
+        std::fs::create_dir(&folder).unwrap();
+        let entry = BrowseEntry::new(folder.clone(), "Disc".into(),
+            EntryKind::Directory, 0, Some(std::time::SystemTime::UNIX_EPOCH
+                + Duration::from_secs(86_400)));
+        let mut app = directory_layout_app(entry.clone());
+        app.browse.insert_folder_classification_for_identity(
+            folder, crate::tui::browse::ProbeCacheIdentity::from_entry(&entry),
+            example_classification(&entry, FolderClassificationKind::Disc),
+        );
+        let full = info_with_wrapped_disk_space(&entry, &app.browse, &app.directory_accounting);
+        let source = flatten_lines(&full);
+        assert!(source.iter().any(|row| row.contains("status")));
+        let compact = compact_directory_info(full.clone(), 14, 22);
+        let rows = flatten_lines(&compact);
+        assert_counted_rows_present(&compact);
+        assert!(rows.iter().any(|row| row.contains("status")),
+            "disc probe status must occupy available supplemental rows: {rows:?}");
+
+        // A future disc probe may add an interactive stream button at the end.
+        // Compacting must rebase its hitbox only if that source row is drawn.
+        let mut with_control = full;
+        let source_row = with_control.lines.len();
+        with_control.lines.push(vec![Span::raw("   "),
+            Span::styled(" audio streams ", Style::default().fg(theme().pill_active_fg)
+                .bg(theme().purple))]);
+        with_control.audio_streams_pill_row = Some(source_row);
+        let expanded = compact_directory_info(with_control.clone(), 19, 22);
+        let mapped = expanded.audio_streams_pill_row.expect("retained control must be clickable");
+        assert!(flatten_lines(&expanded)[mapped].contains("audio streams"));
+        let short = compact_directory_info(with_control, 8, 22);
+        assert!(short.audio_streams_pill_row.is_none(),
+            "unpainted control cannot retain a stale hitbox");
+        assert_counted_rows_present(&short);
+    }
+
+    #[test]
+    fn measured_total_fits_24_row_info_without_truncation() {
+        let temp = tempfile::tempdir().unwrap();
+        let child = temp.path().join("Collection");
+        std::fs::create_dir(&child).unwrap();
+        let mut app = directory_layout_app(BrowseEntry::new(
+            child.clone(), "Collection".into(), EntryKind::Directory, 0, None,
+        ));
+        app.directory_accounting.views.get_mut(&child).unwrap().cached =
+            Some(fake_measurement(&child, 1024u128 * 1024 * 1024));
+        let (rows, _info, hit) = render_directory_browse_24(&mut app, 80);
+        assert!(hit.is_none(), "completed total has no Refresh action");
+        assert!(rows.iter().any(|row| row.contains("Total size")));
+        assert!(rows.iter().any(|row| row.contains("1.00 GiB")),
+            "complete value should wrap, not be clipped: {rows:?}");
+        assert!(!rows.iter().any(|row| row.contains("Refresh")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_symlink_keeps_indicator_but_never_offers_refresh() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("real");
+        std::fs::create_dir(&target).unwrap();
+        let link = temp.path().join("linked");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let entry = BrowseEntry::new_with_symlink(
+            link, "linked".into(), EntryKind::Directory, 0, None, true, false,
+        );
+        let mut app = directory_layout_app(entry.clone());
+        let info = directory_info_with_service(&entry, &app.browse, &app.directory_accounting);
+        assert!(info.refresh_pill_row.is_none());
+        assert!(!flatten_lines(&info).iter().any(|row| row.contains("Refresh")));
+        let (rows, _area, hit) = render_directory_browse_24(&mut app, 80);
+        assert!(hit.is_none());
+        assert!(!rows.iter().any(|row| row.contains("Refresh")));
+        assert!(rows.iter().any(|row| row.contains("symlink")),
+            "existing symlink indication should remain visible");
+
+        let ordinary = BrowseEntry::new(
+            target, "real".into(), EntryKind::Directory, 0, None,
+        );
+        let mut ordinary_app = directory_layout_app(ordinary);
+        let (rows, info, hit) = render_directory_browse_24(&mut ordinary_app, 80);
+        assert_refresh_visible(&rows, info, hit, &ordinary_app);
+    }
+
+    #[test]
+    fn binary_size_formatter_does_not_call_gibibytes_gigabytes() {
+        assert_eq!(directory_size_str(1u64 << 40), "1.00 TiB");
+        assert_eq!(directory_size_str(1u64 << 30), "1.00 GiB");
+        assert_eq!(directory_size_str(0), "0 B");
+    }
+    #[test]
+    fn archive_navigation_rows_do_not_claim_filesystem_directory_stats() {
+        let archive_path = std::path::PathBuf::from("/tmp/archive.zip");
+        let mut browse = BrowseState::new();
+        browse.archive = Some(crate::tui::browse::ArchiveBrowseState {
+            listing: crate::tui::archive_listing::ArchiveListing {
+                archive_path: archive_path.clone(),
+                format: "zip".to_string(),
+                physical_size: 1024,
+                entries: Vec::new(),
+            },
+            inner_path: "inside".to_string(),
+            password: None,
+            staging: None,
+        });
+        let parent = BrowseEntry::new(
+            archive_path.clone(), "..".into(), EntryKind::ParentDir, 0, None,
+        );
+        browse.entries = vec![parent.clone()];
+        let parent_render = render(&parent, &browse);
+        assert!(parent_render.contains("parent directory"));
+        assert!(!parent_render.contains("Disk free"));
+        assert!(!parent_render.contains("Contents size"));
+
+        let child = BrowseEntry::new(
+            archive_path.join("inside").join("folder"),
+            "folder".into(), EntryKind::Directory, 0, None,
+        );
+        browse.entries = vec![child.clone()];
+        let child_render = render(&child, &browse);
+        assert!(child_render.contains("directory"));
+        assert!(!child_render.contains("Disk free"));
+        assert!(!child_render.contains("Contents size"));
+    }
+
 }

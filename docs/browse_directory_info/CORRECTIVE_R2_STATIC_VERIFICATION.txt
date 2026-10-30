@@ -1,0 +1,17 @@
+PASS scan propagates readdir errors
+PASS scan propagates metadata errors
+PASS incomplete listing count gate still active
+PASS stats launch increments request ID
+PASS stats counter follows shared tab workers
+PASS completion checks ownership before state removal
+PASS completion message includes request ID
+PASS event reducer passes ownership ID
+PASS no new dependencies
+PASS D-01 regression present
+PASS D-02 regression present
+PASS whitespace diff src/tui/browse.rs
+PASS whitespace diff src/tui/event_loop.rs
+PASS whitespace diff src/tui/message.rs
+PASS corrective patch cleanly applies to original R1
+
+Rust compilation/tests not executed: cargo, rustc, rustfmt are unavailable.

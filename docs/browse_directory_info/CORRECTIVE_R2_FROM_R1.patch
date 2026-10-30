@@ -1,0 +1,463 @@
+--- a/src/tui/browse.rs
++++ b/src/tui/browse.rs
+@@ -359,6 +359,7 @@
+ 
+ #[derive(Debug, Clone)]
+ struct DirStatsActiveJob {
++    request_id: u64,
+     identity: ProbeCacheIdentity,
+     scan_generation: u64,
+     cursor_focused: bool,
+@@ -2851,6 +2852,10 @@
+     /// directories when the cursor moves rapidly over folders.
+     dir_stats_active: HashMap<PathBuf, DirStatsActiveJob>,
+ 
++    /// Monotonic identity for launched stats walks. Never reset on navigation:
++    /// a cancelled walk may send its completion after a replacement starts.
++    dir_stats_next_request_id: u64,
++
+     /// Recursive directory stats requests waiting for an in-flight slot.
+     /// Current-selection requests are kept ahead of stale cursor positions.
+     dir_stats_queue: VecDeque<DirStatsRequest>,
+@@ -3915,6 +3920,7 @@
+             dir_stats_cache: HashMap::new(),
+             dir_stats_pending: std::collections::HashSet::new(),
+             dir_stats_active: HashMap::new(),
++            dir_stats_next_request_id: 0,
+             dir_stats_queue: VecDeque::new(),
+             current_dir_identity: None,
+             filesystem_space_cache: None,
+@@ -4029,6 +4035,7 @@
+         std::mem::swap(&mut self.dir_stats_cache, &mut other.dir_stats_cache);
+         std::mem::swap(&mut self.dir_stats_pending, &mut other.dir_stats_pending);
+         std::mem::swap(&mut self.dir_stats_active, &mut other.dir_stats_active);
++        std::mem::swap(&mut self.dir_stats_next_request_id, &mut other.dir_stats_next_request_id);
+         std::mem::swap(&mut self.dir_stats_queue, &mut other.dir_stats_queue);
+         std::mem::swap(&mut self.directory_summary_cache, &mut other.directory_summary_cache);
+         std::mem::swap(&mut self.directory_summary_db_miss_cache, &mut other.directory_summary_db_miss_cache);
+@@ -9977,18 +9984,21 @@
+         identity: ProbeCacheIdentity,
+         tx: &tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
+     ) {
++        self.dir_stats_next_request_id = self.dir_stats_next_request_id.wrapping_add(1);
++        let request_id = self.dir_stats_next_request_id;
+         let cancel = Arc::new(AtomicBool::new(false));
+         self.dir_stats_pending.insert(path.clone());
+         self.dir_stats_active.insert(
+             path.clone(),
+             DirStatsActiveJob {
++                request_id,
+                 identity,
+                 scan_generation: self.scan_generation,
+                 cursor_focused: true,
+                 cancel: cancel.clone(),
+             },
+         );
+-        spawn_dir_stats(path, identity, cancel, tx.clone());
++        spawn_dir_stats(path, identity, request_id, cancel, tx.clone());
+     }
+ 
+     fn uncached_directory_summary_work_allowed_for_focus(&self) -> bool {
+@@ -10134,14 +10144,28 @@
+     pub fn complete_dir_stats(
+         &mut self,
+         path: &Path,
++        request_id: u64,
+         tx: &tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
+     ) -> bool {
+-        let was_pending = self.dir_stats_pending.remove(path);
++        // Path and filesystem identity cannot distinguish two requests for the
++        // same directory. A late cancelled completion must not consume or
++        // cancel its replacement, even when both share one scan generation.
++        if !self.dir_stats_active.get(path).is_some_and(|job| job.request_id == request_id)
++            || !self.dir_stats_pending.contains(path)
++        {
++            return false;
++        }
++        self.dir_stats_pending.remove(path);
+         if let Some(job) = self.dir_stats_active.remove(path) {
+             job.cancel.store(true, Ordering::Relaxed);
+         }
+         self.launch_ready_dir_stats(tx);
+-        was_pending
++        true
++    }
++
++    #[cfg(test)]
++    pub(crate) fn active_dir_stats_request_id(&self, path: &Path) -> Option<u64> {
++        self.dir_stats_active.get(path).map(|job| job.request_id)
+     }
+ 
+     fn launch_ready_dir_stats(
+@@ -11815,6 +11839,7 @@
+ pub fn spawn_dir_stats(
+     path: PathBuf,
+     identity: ProbeCacheIdentity,
++    request_id: u64,
+     cancel: Arc<AtomicBool>,
+     tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
+ ) {
+@@ -11836,6 +11861,7 @@
+             .send(crate::tui::message::AppMessage::DirStatsComplete {
+                 path,
+                 identity,
++                request_id,
+                 stats,
+                 cancelled,
+             })
+@@ -12284,6 +12310,28 @@
+     Vec<BrowseEntry>,
+     BrowseClassificationCacheUpdates,
+ ), String> {
++    let read = fs::read_dir(dir).map_err(|e| format!("Cannot read directory: {}", e))?;
++
++    scan_directory_entries_blocking(dir, cancel, batch_sink, read)
++}
++
++/// Share the production scan loop with fault-injection tests. In particular,
++/// an individual readdir failure must not become a successful partial listing.
++fn scan_directory_entries_blocking(
++    dir: &Path,
++    cancel: &std::sync::atomic::AtomicBool,
++    batch_sink: Option<(
++        BrowseTabId,
++        u64,
++        &tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
++    )>,
++    read: impl Iterator<Item = std::io::Result<fs::DirEntry>>,
++) -> Result<(
++    Option<BrowseEntry>,
++    Vec<BrowseEntry>,
++    Vec<BrowseEntry>,
++    BrowseClassificationCacheUpdates,
++), String> {
+     use std::sync::atomic::Ordering;
+ 
+     let parent_entry = dir.parent().map(|parent| {
+@@ -12295,8 +12343,6 @@
+             None,
+         )
+     });
+-
+-    let read = fs::read_dir(dir).map_err(|e| format!("Cannot read directory: {}", e))?;
+ 
+     let mut dirs = Vec::new();
+     let mut files = Vec::new();
+@@ -12333,17 +12379,19 @@
+         .map_err(|_| "directory scan receiver closed".to_string())
+     };
+ 
+-    for (i, entry) in read.flatten().enumerate() {
++    for (i, entry) in read.enumerate() {
+         if i % DIR_SCAN_CANCEL_CHECK_INTERVAL == 0 && cancel.load(Ordering::Relaxed) {
+             return Err("cancelled".into());
+         }
+ 
++        let entry = entry.map_err(|e| format!("Cannot enumerate {}: {}", dir.display(), e))?;
++
+         let path = entry.path();
+         let name = entry.file_name().to_string_lossy().to_string();
+ 
+         let symlink_meta = match fs::symlink_metadata(&path) {
+             Ok(m) => m,
+-            Err(_) => continue,
++            Err(e) => return Err(format!("Cannot read entry metadata for {}: {}", path.display(), e)),
+         };
+         let is_symlink = symlink_meta.file_type().is_symlink();
+ 
+@@ -20083,6 +20131,7 @@
+         state.dir_stats_active.insert(
+             active.clone(),
+             DirStatsActiveJob {
++                request_id: 0,
+                 identity: active_identity,
+                 scan_generation: state.scan_generation,
+                 cursor_focused: false,
+@@ -20143,6 +20192,7 @@
+         state.dir_stats_active.insert(
+             active,
+             DirStatsActiveJob {
++                request_id: 0,
+                 identity: ProbeCacheIdentity { modified: None, size: 0 },
+                 scan_generation: state.scan_generation,
+                 cursor_focused: false,
+@@ -20167,6 +20217,7 @@
+         state.dir_stats_active.insert(
+             stale_path.clone(),
+             DirStatsActiveJob {
++                request_id: 0,
+                 identity: ProbeCacheIdentity { modified: None, size: 0 },
+                 scan_generation: state.scan_generation + 1,
+                 cursor_focused: true,
+@@ -20463,6 +20514,7 @@
+         state.dir_stats_active.insert(
+             stale_dir.clone(),
+             DirStatsActiveJob {
++                request_id: 0,
+                 identity: ProbeCacheIdentity { modified: None, size: 0 },
+                 scan_generation: state.scan_generation,
+                 cursor_focused: true,
+@@ -20627,6 +20679,7 @@
+         state.dir_stats_active.insert(
+             active_path.clone(),
+             DirStatsActiveJob {
++                request_id: 0,
+                 identity: ProbeCacheIdentity { modified: None, size: 0 },
+                 scan_generation: state.scan_generation,
+                 cursor_focused: true,
+@@ -22564,6 +22617,53 @@
+         browse.parent_entry = Some(parent_entry.clone());
+         browse.entries = vec![parent_entry];
+         browse.selected_index = 0;
++    }
++
++    #[test]
++    fn failed_directory_enumeration_cannot_publish_authoritative_immediate_counts() {
++        let temp = tempfile::tempdir().expect("tempdir");
++        let current = temp.path().join("Music");
++        std::fs::create_dir(&current).expect("directory");
++        std::fs::write(current.join("one.flac"), b"audio").expect("file");
++
++        // The first entry is readable but a later readdir yields an error.
++        // `flatten()` would drop that error and return an apparently complete
++        // listing. The production scanner must instead fail terminally.
++        let read = std::fs::read_dir(&current).expect("read dir").chain(std::iter::once(
++            Err(std::io::Error::other("injected readdir error")),
++        ));
++        let error = scan_directory_entries_blocking(
++            &current, &AtomicBool::new(false), None, read,
++        ).expect_err("partial enumeration must fail");
++        assert!(error.contains("injected readdir error"));
++
++        let mut browse = BrowseState::new();
++        parent_selection(&mut browse, &current);
++        browse.all_files.push(BrowseEntry::new(
++            current.join("one.flac"), "one.flac".into(),
++            EntryKind::OtherFile, 5, None,
++        ));
++        browse.error = Some(error); // Same terminal-error state as the reducer.
++        assert!(browse.current_directory_immediate_counts().is_none());
++    }
++
++    #[test]
++    fn failed_entry_metadata_cannot_finish_directory_scan_successfully() {
++        let temp = tempfile::tempdir().expect("tempdir");
++        let file = temp.path().join("removed.flac");
++        std::fs::write(&file, b"audio").expect("file");
++
++        // Return a real DirEntry, but remove its file before lstat. This
++        // deterministically exercises the second previously silent skip.
++        let read = std::fs::read_dir(temp.path()).expect("read dir").map(|entry| {
++            let entry = entry?;
++            std::fs::remove_file(entry.path())?;
++            Ok(entry)
++        });
++        let error = scan_directory_entries_blocking(
++            temp.path(), &AtomicBool::new(false), None, read,
++        ).expect_err("missing metadata must fail");
++        assert!(error.contains("Cannot read entry metadata"));
+     }
+ 
+     #[test]
+--- a/src/tui/event_loop.rs
++++ b/src/tui/event_loop.rs
+@@ -8274,8 +8274,8 @@
+                 }
+             }
+         }
+-        AppMessage::DirStatsComplete { path, identity, stats, cancelled } => {
+-            let was_pending = app.browse.complete_dir_stats(&path, tx);
++        AppMessage::DirStatsComplete { path, identity, request_id, stats, cancelled } => {
++            let was_pending = app.browse.complete_dir_stats(&path, request_id, tx);
+             if !was_pending {
+                 return;
+             }
+@@ -21622,22 +21622,26 @@
+ 
+         let mut app = AppState::new_for_test(TonepoetConfig::default());
+         app.current_screen = AppScreen::Browse;
++        app.browse.current_dir = path.clone();
+         app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
+-            path.clone(),
+-            "album".to_string(),
+-            EntryKind::Directory,
++            temp.path().to_path_buf(),
++            "..".to_string(),
++            EntryKind::ParentDir,
+             0,
+             None,
+         )];
+         app.browse.selected_index = 0;
+-        app.browse.dir_stats_pending.insert(path.clone());
+-
+-        let (tx, _rx) = mpsc::channel(4);
++        let (tx, _rx) = mpsc::channel(8);
++        app.browse.probe_current(&tx);
++        app.browse.probe_debounce.as_mut().expect("focus debounce").deadline = std::time::Instant::now();
++        app.browse.check_probe_debounce(&tx);
++        let request_id = app.browse.active_dir_stats_request_id(&path).expect("active stats request");
+         handle_message(
+             &mut app,
+             AppMessage::DirStatsComplete {
+                 path: path.clone(),
+                 identity: stale_identity,
++                request_id,
+                 stats: crate::tui::browse::DirStats {
+                     folder_count: 0,
+                     file_count: 99,
+@@ -21655,13 +21659,13 @@
+         assert!(!app.browse.dir_stats_pending.contains(&path));
+         assert_eq!(
+             app.browse.probe_debounce.as_ref().map(|pending| pending.path.as_path()),
+-            Some(path.as_path()),
++            Some(temp.path()),
+             "a stale stats result should re-enter the settled-focus policy path instead of immediately relaunching recursive stats"
+         );
+     }
+ 
+-    #[test]
+-    fn missing_dir_stats_completion_stops_without_retry() {
++    #[tokio::test]
++    async fn missing_dir_stats_completion_stops_without_retry() {
+         let temp = tempfile::tempdir().expect("tempdir");
+         let path = temp.path().join("gone");
+         std::fs::create_dir(&path).expect("mkdir");
+@@ -21671,23 +21675,40 @@
+ 
+         let mut app = AppState::new_for_test(TonepoetConfig::default());
+         app.current_screen = AppScreen::Browse;
++        app.browse.current_dir = path.clone();
+         app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
+-            path.clone(),
+-            "gone".to_string(),
+-            EntryKind::Directory,
+-            identity.size,
+-            identity.modified,
++            temp.path().to_path_buf(),
++            "..".to_string(),
++            EntryKind::ParentDir,
++            0,
++            None,
+         )];
+         app.browse.selected_index = 0;
+-        app.browse.dir_stats_pending.insert(path.clone());
++        let (tx, mut rx) = mpsc::channel(8);
++        app.browse.probe_current(&tx);
++        app.browse.probe_debounce.as_mut().expect("focus debounce").deadline = std::time::Instant::now();
++        app.browse.check_probe_debounce(&tx);
++        let request_id = app.browse.active_dir_stats_request_id(&path).expect("active stats request");
++        // The launched worker must have closed its directory before rmdir,
++        // including on hosts that prevent deleting open directories.
++        tokio::time::timeout(Duration::from_secs(5), async {
++            loop {
++                match rx.recv().await {
++                    Some(AppMessage::DirStatsComplete { request_id: finished, .. })
++                        if finished == request_id => break,
++                    Some(_) => {},
++                    None => panic!("stats worker channel closed"),
++                }
++            }
++        }).await.expect("stats worker completed");
+         std::fs::remove_dir(&path).expect("remove dir");
+ 
+-        let (tx, _rx) = mpsc::channel(4);
+         handle_message(
+             &mut app,
+             AppMessage::DirStatsComplete {
+                 path: path.clone(),
+                 identity,
++                request_id,
+                 stats: crate::tui::browse::DirStats {
+                     folder_count: 0,
+                     file_count: 1,
+@@ -21703,6 +21724,71 @@
+ 
+         assert!(!app.browse.dir_stats_pending.contains(&path));
+         assert!(app.browse.current_dir_stats().is_none());
++    }
++
++    #[tokio::test]
++    async fn late_stats_completion_cannot_displace_newer_request_for_same_directory() {
++        let temp = tempfile::tempdir().expect("tempdir");
++        let path = temp.path().join("music");
++        std::fs::create_dir(&path).expect("music fixture");
++        let identity = crate::tui::browse::ProbeCacheIdentity::from_metadata(
++            &std::fs::metadata(&path).expect("directory metadata"),
++        );
++
++        let mut app = AppState::new_for_test(TonepoetConfig::default());
++        app.current_screen = AppScreen::Browse;
++        app.browse.current_dir = path.clone();
++        app.browse.entries = vec![
++            crate::tui::browse::BrowseEntry::new(
++                temp.path().to_path_buf(), "..".into(), EntryKind::ParentDir, 0, None,
++            ),
++            crate::tui::browse::BrowseEntry::new(
++                path.join("unrelated.txt"), "unrelated.txt".into(), EntryKind::OtherFile, 0, None,
++            ),
++        ];
++        let (tx, _rx) = mpsc::channel(8);
++
++        app.browse.probe_current(&tx);
++        app.browse.probe_debounce.as_mut().expect("A debounce").deadline = std::time::Instant::now();
++        app.browse.check_probe_debounce(&tx);
++        let request_a = app.browse.active_dir_stats_request_id(&path).expect("A active");
++
++        app.browse.selected_index = 1;
++        app.browse.probe_current(&tx); // Cancel A without processing its completion.
++        assert!(app.browse.active_dir_stats_request_id(&path).is_none());
++
++        app.browse.selected_index = 0;
++        app.browse.probe_current(&tx);
++        app.browse.probe_debounce.as_mut().expect("B debounce").deadline = std::time::Instant::now();
++        app.browse.check_probe_debounce(&tx);
++        let request_b = app.browse.active_dir_stats_request_id(&path).expect("B active");
++        assert_ne!(request_a, request_b);
++
++        // Both a cancelled A and a previously completed (but delayed) A must
++        // leave B untouched, even though path, identity and generation match.
++        for cancelled in [true, false] {
++            handle_message(&mut app, AppMessage::DirStatsComplete {
++                path: path.clone(), identity, request_id: request_a,
++                stats: crate::tui::browse::DirStats {
++                    total_size: 111, complete: true, ..Default::default()
++                },
++                cancelled,
++            }, &tx);
++            assert_eq!(app.browse.active_dir_stats_request_id(&path), Some(request_b));
++            assert!(app.browse.dir_stats_pending.contains(&path));
++            assert!(app.browse.current_dir_stats().is_none(), "stale A must not publish");
++        }
++
++        handle_message(&mut app, AppMessage::DirStatsComplete {
++            path: path.clone(), identity, request_id: request_b,
++            stats: crate::tui::browse::DirStats {
++                total_size: 222, complete: true, ..Default::default()
++            },
++            cancelled: false,
++        }, &tx);
++        assert!(app.browse.active_dir_stats_request_id(&path).is_none());
++        assert!(!app.browse.dir_stats_pending.contains(&path));
++        assert_eq!(app.browse.current_dir_stats().map(|stats| stats.total_size), Some(222));
+     }
+ 
+     #[test]
+--- a/src/tui/message.rs
++++ b/src/tui/message.rs
+@@ -582,12 +582,13 @@
+     },
+     /// Result of an asynchronous directory-stats computation launched by
+     /// `BrowseState::probe_current` for a directory entry. The completion
+-    /// carries the directory identity captured at dispatch so stale walkers
+-    /// cannot publish stats after the selected directory has changed or
+-    /// disappeared.
++    /// carries the directory identity and unique request id captured at
++    /// dispatch. The id prevents a cancelled walk from consuming a newer
++    /// request for the same directory and filesystem identity.
+     DirStatsComplete {
+         path: std::path::PathBuf,
+         identity: crate::tui::browse::ProbeCacheIdentity,
++        request_id: u64,
+         stats: crate::tui::browse::DirStats,
+         cancelled: bool,
+     },

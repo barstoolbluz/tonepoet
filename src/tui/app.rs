@@ -8873,6 +8873,8 @@ pub enum WizardTarget {
 #[derive(Debug, Clone)]
 pub enum ActiveOverlay {
     None,
+    /// Read-only filesystem folder properties; metadata editor remains separate.
+    FolderProperties(Box<crate::tui::directory_properties::FolderPropertiesState>),
     /// Three-view theme builder overlay.
     ThemeBuilder(Box<crate::tui::theme_builder::ThemeBuilderState>),
     Confirmation {
@@ -14659,6 +14661,8 @@ pub type BrowseTextMouseTarget = EditorTextTarget;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BrowseInfoFocus {
     Metadata(crate::tui::probe::MetadataField),
+    /// The Total size Refresh pill for a physical directory selection.
+    Refresh,
 }
 
 /// Which field a TextEdit overlay is editing
@@ -15763,6 +15767,8 @@ pub struct AppState {
 
     // Overlays
     pub active_overlay: ActiveOverlay,
+    /// Shared directory-statistics service across Browse tabs.
+    pub directory_accounting: crate::directory_accounting::AccountingService,
 
     /// Overlay temporarily replaced by a text-editor context menu. Unlike the
     /// older feature-specific parking slots, this owns the complete overlay so
@@ -16844,6 +16850,11 @@ impl AppState {
         // Import TOML presets into DB on first run.
         crate::tui::presets::import_presets_to_db(&db);
         let mut browse = crate::tui::browse::BrowseState::new_with_config(&config.browsing);
+        // Disable the legacy depth/time-bounded recursive subtotal worker in
+        // production. The separate complete-only service owns all new totals.
+        browse.set_directory_stats_cold_work_policy(
+            crate::tui::browse::BrowseDirectoryStatsColdWorkPolicy::CachedOnly,
+        );
         let mut file_transfers = FileTransferQueueState::default();
         let mut recovery_surface_records = Vec::new();
         if startup_options.recover_pending_file_operations {
@@ -16935,6 +16946,9 @@ impl AppState {
             crate::config::FileOperationStatusVerbosity::Verbose
         );
 
+        let directory_accounting = crate::directory_accounting::AccountingService::new(
+            db.accounting_database_path(),
+        );
         Self {
             config,
             theme,
@@ -16980,6 +16994,7 @@ impl AppState {
             wizard_mouse_areas: None,
             wizard_target: WizardTarget::ConfigureAll,
             active_overlay,
+            directory_accounting,
             pending_editor_context_overlay: None,
             editor_context_target: None,
             host_clipboard_paste_generation: 0,
@@ -20504,8 +20519,11 @@ mod app_startup_options_tests {
         // queue authority exactly enough to exercise the real v23 -> v24
         // activation boundary rather than relying on a version-only stub.
         drop(crate::db::Database::open_path(&db_path).expect("initialize current database"));
-        {
+        let current_schema_version = {
             let conn = rusqlite::Connection::open(&db_path).expect("open database for v23 fixture");
+            let version: u32 = conn
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .expect("read freshly initialized current schema version");
             conn.execute_batch(
                 "PRAGMA foreign_keys = OFF;
                  DROP VIEW conversion_queue;
@@ -20518,7 +20536,8 @@ mod app_startup_options_tests {
                  PRAGMA user_version = 23;",
             )
             .expect("reconstruct complete v23 fixture");
-        }
+            version
+        };
         let options = AppStartupOptions::default().with_database_path(&db_path);
         let app = AppState::try_new_with_startup_options(TonepoetConfig::default(), options)
             .expect("quiescent v23 startup should activate v24 without external confirmation");
@@ -20528,7 +20547,7 @@ mod app_startup_options_tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("read activated schema version");
         assert_eq!(
-            version, 28,
+            version, current_schema_version,
             "quiescent startup must durably advance through the current schema"
         );
         let protocol_version: u32 = conn

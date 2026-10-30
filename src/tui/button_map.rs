@@ -347,6 +347,8 @@ pub enum TuiButton {
 
     // Browse info pane: clickable metadata field (click → edit tag).
     BrowseInfoMeta(crate::tui::probe::MetadataField),
+    // Browse info pane: foreground recursive accounting on demand.
+    BrowseInfoRefresh,
     // Browse info pane: analyze pill (click → run audio analysis).
     BrowseInfoAnalyze,
     // Browse info pane: edit tags pill (click → open metadata editor).
@@ -745,6 +747,7 @@ impl TuiButton {
             | Self::BrowseOptionsFilterChoice(_)
             | Self::BrowseOptionsArchiveChoice(_)
             | Self::BrowseInfoMeta(_)
+            | Self::BrowseInfoRefresh
             | Self::BrowseInfoAnalyze
             | Self::BrowseInfoEditTags
             | Self::BrowseInfoAudioStreams
