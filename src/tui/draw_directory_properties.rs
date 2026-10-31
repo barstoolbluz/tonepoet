@@ -1,26 +1,34 @@
 //! Read-only filesystem Properties, matching the compact card layout.
 //! No probing, filesystem operations or database access occurs during drawing.
 use ratatui::{
-    layout::{Alignment, Rect},
+    layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph}, Frame,
+    widgets::{Clear, Paragraph}, Frame,
 };
 use super::button_map::{ButtonRenderMap, TuiButton};
 use super::directory_properties::{FolderPropertiesState, PropertiesFocus, PropertiesSubject};
 use super::theme::Theme;
 use crate::directory_accounting::{AccountingService, CachedMeasurement, DirectoryView, Freshness, ScanEnd, format_bytes, format_exact};
 
-const CARD_WIDTH: u16 = 76;
-const CARD_HEIGHT: u16 = 17;
 const LABEL_WIDTH: usize = 11;
 
-/// Shared geometry for the renderer. Mouse actions use recorded hitboxes,
-/// never a second approximation of the popup or button positions.
-pub fn popup_rect(screen: Rect) -> Option<Rect> {
+/// Size from the terminal, not a fixed card. The normal-size floors reproduce
+/// roughly 95 x 21 at 100 x 26 (about 25% above the former 76 x 17 card).
+/// Maximized Properties grows by up to 40%, unlike the full-screen editor.
+/// Both modes retain a border cell on small terminals.
+pub fn popup_rect(screen: Rect, maximized: bool) -> Option<Rect> {
     if screen.width < 24 || screen.height < 9 { return None; }
-    let width = screen.width.saturating_sub(2).min(CARD_WIDTH);
-    let height = screen.height.saturating_sub(2).min(CARD_HEIGHT);
+    let cap_w = screen.width.saturating_sub(2);
+    let cap_h = screen.height.saturating_sub(2);
+    let normal_w = ((screen.width as u32 * 70 + 99) / 100) as u16;
+    let normal_h = ((screen.height as u32 * 60 + 99) / 100) as u16;
+    let normal_w = normal_w.max(95).min(cap_w);
+    let normal_h = normal_h.max(21).min(cap_h);
+    let (width, height) = if maximized {
+        (((normal_w as u32 * 7 + 4) / 5).min(cap_w as u32) as u16,
+         ((normal_h as u32 * 7 + 4) / 5).min(cap_h as u32) as u16)
+    } else { (normal_w, normal_h) };
     Some(Rect::new(
         screen.x + screen.width.saturating_sub(width) / 2,
         screen.y + screen.height.saturating_sub(height) / 2,
@@ -223,7 +231,7 @@ fn render_button(f: &mut Frame, map: &mut ButtonRenderMap, area: Rect, label: &s
 
 pub fn draw(f: &mut Frame, state: &FolderPropertiesState, service: &AccountingService,
     map: &mut ButtonRenderMap, theme: Theme) {
-    let Some(area) = popup_rect(f.size()) else { return; };
+    let Some(area) = popup_rect(f.size(), state.maximized) else { return; };
     let view = if let Some(id) = state.request_id {
         service.view(&state.path).filter(|v| state.cancelled || v.subscription == Some(id))
     } else { None };
@@ -231,14 +239,15 @@ pub fn draw(f: &mut Frame, state: &FolderPropertiesState, service: &AccountingSe
     let running = state.is_folder() && !state.cancelled && view.is_some_and(|v| v.running);
     let name = state.path.file_name().map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| state.path.display().to_string());
-    let title = format!(" {} Properties ", super::display_width::truncate_right(&name, area.width.saturating_sub(16) as usize));
-    let block = Block::default().borders(Borders::ALL)
-        .title(Line::from(Span::styled(title, style(theme.amber).add_modifier(Modifier::BOLD))))
-        .title_alignment(Alignment::Center)
-        .style(Style::default().bg(theme.surface))
-        .border_style(style(theme.amber));
+    let indicator = if state.maximized { "▾" } else { "▸" };
+    let title = format!("{indicator} {} Properties", super::display_width::truncate_right(
+        &name, area.width.saturating_sub(19) as usize));
+    let block = super::draw::solid_title_block(area, title, theme.purple, theme)
+        .style(Style::default().bg(theme.surface));
     f.render_widget(Clear, area);
     f.render_widget(block, area);
+    map.record_button(TuiButton::PropertiesTitle, Rect::new(
+        area.x.saturating_add(1), area.y, area.width.saturating_sub(2), 1));
 
     let body_x = area.x.saturating_add(2);
     let body_w = area.width.saturating_sub(4);
@@ -298,7 +307,7 @@ mod tests {
         FolderPropertiesState {
             path: PathBuf::from("/library/zeppelin/Led Zeppelin - Led Zeppelin DVD/disc 01"),
             subject: PropertiesSubject::Folder, request_id: Some(19), scroll: 0,
-            horizontal_scroll: 0, cancelled: false, focus: PropertiesFocus::Ok,
+            horizontal_scroll: 0, cancelled: false, maximized: false, focus: PropertiesFocus::Ok,
         }
     }
     fn completed(state: &FolderPropertiesState) -> AccountingService {
@@ -351,8 +360,8 @@ mod tests {
             assert!(text.find(pair[0]) < text.find(pair[1]), "wrong row order: {text}");
         }
         assert!(!text.contains("Exact bytes:"), "old scrolling debug layout must be gone");
-        let rect = popup_rect(Rect::new(0, 0, 100, 26)).unwrap();
-        assert_eq!(rect.width, CARD_WIDTH);
+        let rect = popup_rect(Rect::new(0, 0, 100, 26), false).unwrap();
+        assert_eq!((rect.width, rect.height), (95, 21));
         let edit = map.button_rect(TuiButton::PropertiesEditMetadata).unwrap();
         let ok = map.button_rect(TuiButton::PropertiesOk).unwrap();
         let recalc = map.button_rect(TuiButton::PropertiesRecalculate).unwrap();
@@ -365,9 +374,43 @@ mod tests {
         }
         // The frame uses the active theme for the frame and action button.
         let border = terminal.backend().buffer().get(rect.x, rect.y + 1);
-        assert_eq!(border.fg, theme().amber);
+        assert_eq!(border.fg, theme().purple);
         let ok_cell = terminal.backend().buffer().get(ok.x + 1, ok.y);
         assert_eq!(ok_cell.bg, theme().purple);
+    }
+
+    #[test]
+    fn properties_geometry_scales_with_terminal_and_maximizes_without_fullscreen() {
+        let normal = popup_rect(Rect::new(0, 0, 140, 38), false).unwrap();
+        let large = popup_rect(Rect::new(0, 0, 140, 38), true).unwrap();
+        assert_eq!((normal.width, normal.height), (98, 23));
+        assert_eq!((large.width, large.height), (138, 33));
+        assert!(large.width > normal.width && large.height > normal.height);
+        assert_ne!(large, Rect::new(0, 0, 140, 38));
+        for (w, h) in [(100, 26), (46, 12), (24, 9)] {
+            let base = popup_rect(Rect::new(0, 0, w, h), false).unwrap();
+            let max = popup_rect(Rect::new(0, 0, w, h), true).unwrap();
+            for area in [base, max] {
+                assert!(area.width <= w - 2 && area.height <= h - 2);
+                assert!(area.right() <= w && area.bottom() <= h);
+            }
+            assert!(max.width >= base.width && max.height >= base.height);
+        }
+        assert!(popup_rect(Rect::new(0, 0, 23, 9), false).is_none());
+
+        let mut state = folder();
+        state.maximized = true;
+        let (text, map, terminal) = render(&state, &completed(&state), 140, 38);
+        assert!(text.contains("▾ disc 01 Properties"));
+        for button in [TuiButton::PropertiesTitle, TuiButton::PropertiesOk,
+            TuiButton::PropertiesEditMetadata, TuiButton::PropertiesRecalculate] {
+            let hit = map.button_rect(button).expect("maximized Properties hitbox");
+            assert_eq!(map.find_button_at(hit.x, hit.y), Some(button));
+            assert!(hit.x >= large.x && hit.right() <= large.right());
+            assert!(hit.y >= large.y && hit.bottom() <= large.bottom());
+        }
+        let bar = terminal.backend().buffer().get(large.x + 1, large.y);
+        assert_eq!(bar.bg, theme().purple, "the title bar must be solid");
     }
 
     /// Location is the containing directory, not the path in the title.

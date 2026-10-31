@@ -261,7 +261,7 @@ struct DerivedListRow {
 impl ThemeBuilderState {
     /// True when keyboard text events currently belong to one of the
     /// builder's `TextInputState` fields. The app-level clipboard bridge uses
-    /// this to fetch the host clipboard before replaying Ctrl+V/Ctrl+P through
+    /// this to fetch the host clipboard before replaying Ctrl+V/Ctrl+Shift+P through
     /// the normal builder reducer.
     pub fn text_input_owns_focus(&self) -> bool {
         match self.overlay {

@@ -1094,7 +1094,7 @@ fn actionable_read_error(env: &ClipboardEnvironment, errors: &[String]) -> Strin
         "host clipboard read requires a usable pbpaste transport".to_string()
     } else if env.wayland_display.is_none() && env.display.is_none() {
         if env.remote_session {
-            "host clipboard read could not resolve a readable Wayland/X11 display from this remote session lineage; write-only OSC 52 cannot service Ctrl+V/Ctrl+P"
+            "host clipboard read could not resolve a readable Wayland/X11 display from this remote session lineage; write-only OSC 52 cannot service Ctrl+V/Ctrl+Shift+P"
                 .to_string()
         } else {
             "host clipboard read could not resolve a readable Wayland/X11 display from the process or same-UID session ancestry"

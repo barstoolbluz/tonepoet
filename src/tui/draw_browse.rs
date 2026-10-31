@@ -3084,6 +3084,9 @@ fn pad_or_truncate(s: &str, width: usize, right_align: bool) -> String {
 #[derive(Clone)]
 struct InfoContent {
     lines: Vec<Vec<Span<'static>>>,
+    /// The untruncated first-row title, retained for optional two-line display.
+    /// The four-row header stays fixed when late metadata changes this title.
+    title: Option<String>,
     /// (field, line_index) for each clickable metadata row. Fields
     /// that are absent but have a "(click to add)" placeholder also
     /// appear here.
@@ -3336,6 +3339,49 @@ fn compact_media_info(mut info: InfoContent, height: usize) -> InfoContent {
     info
 }
 
+/// Split at a word boundary when it uses most of the first row, otherwise
+/// break at a display-column boundary. The second line may be ellipsized: a
+/// long title never takes space from accounting rows or action controls.
+fn wrapped_info_title(title: &str, max_width: usize) -> (String, Option<String>) {
+    let clean = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    if super::display_width::width(&clean) <= max_width {
+        return (clean, None);
+    }
+    let fitted = super::display_width::fit_prefix(&clean, max_width);
+    let split = fitted.char_indices().rev()
+        .find(|(offset, ch)| *offset > 0 && ch.is_whitespace()
+            && super::display_width::width(&clean[..*offset]) >= max_width / 2)
+        .map(|(offset, _)| offset)
+        .unwrap_or(fitted.len());
+    let (first, rest) = clean.split_at(split);
+    (first.trim_end().to_string(), Some(truncate_to(rest.trim_start(), max_width)))
+}
+
+/// Use the existing blank fourth header row for a stationary continuation
+/// slot, rather than inserting a row. Artist and edition move once with the
+/// fixed full-height geometry, not when an async disc/tag probe completes.
+/// Compact layouts keep their established one-row ellipsized titles and
+/// prioritise labels, counts, and buttons over wrapping.
+fn wrap_full_info_title(mut info: InfoContent, width: usize,
+    theme: super::theme::Theme) -> InfoContent {
+    if info.lines.len() < 4 || !info.lines[3].is_empty() {
+        return info;
+    }
+    let Some(title) = info.title.as_deref() else { return info; };
+    let max_width = width.saturating_sub(MEDIA_INDENT.len());
+    if max_width == 0 { return info; }
+    let (first, continuation) = wrapped_info_title(title, max_width);
+    // The header renderer already owns these cells and their foreground style.
+    info.lines[0] = vec![Span::raw(MEDIA_INDENT),
+        Span::styled(first, theme.bold(theme.text_bright))];
+    let artist = std::mem::take(&mut info.lines[1]);
+    let descriptor = std::mem::replace(&mut info.lines[2], artist);
+    info.lines[3] = descriptor;
+    info.lines[1] = continuation.map(|line| vec![Span::raw(MEDIA_INDENT),
+        Span::styled(line, theme.bold(theme.text_bright))]).unwrap_or_default();
+    info
+}
+
 /// Return a painted pill's actual cell range. Refresh and Streams can share
 /// one row; computing both positions from spans keeps click hitboxes exact.
 fn info_pill_offset(spans: &[Span<'_>], caption: &str) -> Option<(usize, usize)> {
@@ -3410,6 +3456,7 @@ fn draw_browse_info(
     } else {
         InfoContent {
             lines: vec![vec![Span::styled("   (no selection)", theme.muted())]],
+            title: None,
             meta_field_rows: Vec::new(),
             refresh_pill_row: None,
             analyze_pill_row: None,
@@ -3434,11 +3481,20 @@ fn draw_browse_info(
             matches!(c.kind, FolderClassificationKind::Album | FolderClassificationKind::Disc |
                 FolderClassificationKind::MultiDisc)))
     });
+    let compact_media = media_selection && (content_height <= MEDIA_COMPACT_MAX_CONTENT_ROWS
+        || info.lines.len() > content_height);
+    let compact_directory = !media_selection && physical_folder
+        && info.lines.len() > content_height;
     let info = if media_selection {
         compact_media_info(info, content_height)
-    } else if physical_folder && info.lines.len() > content_height {
+    } else if compact_directory {
         compact_directory_info(info, content_height, content_width)
     } else { info };
+    // Never reinterpret a compact layout as a four-row header: its rows are
+    // reindexed and its hitboxes already refer to that compact ordering.
+    let info = if compact_media || compact_directory { info } else {
+        wrap_full_info_title(info, content_width, theme)
+    };
     let start_row = 0;
 
     // Render content lines with border
@@ -5350,6 +5406,7 @@ fn entry_info_lines(
                 ]);
                 return InfoContent {
                     lines,
+                    title: Some(header.title.clone()),
                     meta_field_rows,
                     refresh_pill_row: None,
                     analyze_pill_row: Some(analyze_row_unprobed),
@@ -5382,6 +5439,7 @@ fn entry_info_lines(
             ]);
             return InfoContent {
                 lines,
+                title: Some(header.title.clone()),
                 meta_field_rows,
                 refresh_pill_row: None,
                 analyze_pill_row: Some(analyze_row),
@@ -5494,6 +5552,7 @@ fn entry_info_lines(
 
     InfoContent {
         lines,
+        title: Some(header.title),
         meta_field_rows,
         refresh_pill_row,
         analyze_pill_row: None,
@@ -8634,6 +8693,142 @@ mod directory_info_presentation_tests {
         assert_eq!(spinner_rows, 3, "Files, Audio files and Total size are scanning");
         let button = compact.refresh_pill_row.unwrap();
         assert!(rows[button].contains("Cancel"));
+    }
+
+    #[test]
+    fn title_wrap_reserves_one_header_row_without_moving_metrics_or_buttons() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Collection");
+        std::fs::create_dir(&path).unwrap();
+        let entry = BrowseEntry::new(path, "Collection".into(), EntryKind::Directory, 0, None);
+        let mut browse = BrowseState::new();
+        browse.entries = vec![entry.clone()];
+        let accounting = crate::directory_accounting::AccountingService::new(None);
+        let mut info = entry_info_lines(&entry, &browse, &accounting, 22,
+            false, false, false, false, None, None, theme());
+        let original_metrics = flatten_lines(&info).into_iter().skip(4).collect::<Vec<_>>();
+        let refresh = info.refresh_pill_row;
+        let height = info.lines.len() + 1;
+        assert!(height <= MEDIA_COMPACT_MAX_CONTENT_ROWS,
+            "plain directories can wrap if the full view fits even at a modest height");
+        info.title = Some("At Fillmore East".into());
+        let cold = wrap_full_info_title(info.clone(), 22, theme());
+        assert!(flatten_lines(&cold)[1].is_empty(), "short title reserves the slot");
+        info.title = Some("At Fillmore East New York 1971".into());
+        let warm = wrap_full_info_title(info.clone(), 22, theme());
+        let rows = flatten_lines(&warm);
+        assert_eq!(rows[0].trim(), "At Fillmore East New");
+        assert_eq!(rows[1].trim(), "York 1971");
+        assert_eq!(warm.lines.len(), cold.lines.len());
+        assert_eq!(warm.refresh_pill_row, refresh);
+        assert_eq!(rows.into_iter().skip(4).collect::<Vec<_>>(), original_metrics);
+        assert_eq!(flatten_lines(&cold).into_iter().skip(4).collect::<Vec<_>>(),
+            original_metrics);
+        let compact = compact_directory_info(info, 8, 22);
+        assert!(compact.lines.len() <= 8);
+        assert!(flatten_lines(&compact)[0].starts_with(" Collection"),
+            "compact title remains single-line and truncated");
+        assert!(compact.refresh_pill_row.is_some(), "compact action must remain");
+    }
+
+    #[test]
+    fn long_flac_title_stays_wrapped_when_probe_overflows_info_viewport() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let temp = tempfile::tempdir().unwrap();
+        let name = "A Very Long Live Recording From Fillmore East In New York 1971.flac";
+        let path = temp.path().join(name);
+        std::fs::write(&path, b"FLAC fixture").unwrap();
+        let entry = BrowseEntry::new(path.clone(), name.to_owned(),
+            EntryKind::AudioFile(crate::convert::formats::AudioFormat::Flac), 12, None);
+        let mut app = directory_layout_app(entry.clone());
+        let mut cold_header: Option<Vec<String>> = None;
+
+        for probed in [false, true] {
+            if probed {
+                app.browse.insert_probe_for_identity(path.clone(),
+                    crate::tui::browse::ProbeCacheIdentity::from_entry(&entry),
+                    Some(std::sync::Arc::new(CachedInfo {
+                        source: crate::tui::probe::SourceInfo {
+                            format_name: "FLAC".into(), codec: "FLAC".into(),
+                            bit_depth: Some(24), sample_format_is_float: Some(false),
+                            compression_is_lossless: Some(true), sample_rate: 96_000,
+                            channels: 2, channel_layout: "stereo".into(),
+                            duration_secs: 240.0, file_size: 12,
+                        },
+                        metadata: crate::tui::probe::SourceMetadata {
+                            title: Some("Live recording".into()),
+                            artist: Some("The performing artist".into()),
+                            album: Some("The concert album".into()),
+                            genre: Some("Jazz".into()), year: Some("1971".into()),
+                            ..Default::default()
+                        },
+                        transport: None,
+                    })));
+            }
+
+            let full = entry_info_lines(&entry, &app.browse, &app.directory_accounting,
+                46, false, false, false, false, None, None, theme());
+            assert_eq!(full.lines.len() > 14, probed,
+                "the probe must cross the fourteen-row viewport boundary");
+            let body = flatten_lines(&full)[4].clone();
+            let (analyze, edit_tags, metadata_rows) = (full.analyze_pill_row,
+                full.edit_tags_pill_row, full.meta_field_rows.clone());
+            let original_len = full.lines.len();
+            let wrapped = wrap_full_info_title(full, 46, theme());
+            let wrapped_rows = flatten_lines(&wrapped);
+            assert_eq!(wrapped_rows.len(), original_len);
+            assert!(wrapped_rows[1].trim().contains("1971.flac"),
+                "second title row disappeared after probe: {wrapped_rows:?}");
+            assert_eq!(wrapped_rows[4], body, "the first body row moved");
+            assert_eq!(wrapped.analyze_pill_row, analyze);
+            assert_eq!(wrapped.edit_tags_pill_row, edit_tags);
+            assert_eq!(wrapped.meta_field_rows, metadata_rows);
+
+            let mut buttons = ButtonRenderMap::new();
+            let mut terminal = Terminal::new(TestBackend::new(48, 16)).unwrap();
+            terminal.draw(|frame| draw_browse_info(frame, Rect::new(0, 0, 48, 16),
+                &app.browse, &app.directory_accounting, None, None,
+                &mut buttons, None, theme())).unwrap();
+            let rendered = (1..15).map(|y| (1..47).map(|x|
+                terminal.backend().buffer().get(x, y).symbol().to_owned())
+                .collect::<Vec<_>>().join("")).collect::<Vec<_>>();
+            assert_eq!(rendered[0].trim(), wrapped_rows[0].trim());
+            assert_eq!(rendered[1].trim(), wrapped_rows[1].trim());
+            assert_eq!(rendered[4].trim(), body.trim());
+            if let Some(header) = &cold_header {
+                assert_eq!(&rendered[..2], header.as_slice(), "header changed after probe");
+            } else {
+                cold_header = Some(rendered[..2].to_vec());
+            }
+            if !probed {
+                let rect = buttons.find_button_rect(&TuiButton::BrowseInfoAnalyze)
+                    .expect("cold FLAC Analyze hitbox");
+                assert_eq!(rect.y as usize, analyze.unwrap() + 1);
+                assert_eq!(buttons.find_button_at(rect.x, rect.y),
+                    Some(TuiButton::BrowseInfoAnalyze));
+            }
+
+            let (browse_rows, area, _) = render_directory_browse_size(&mut app, 160, 30);
+            assert_eq!((area.width, area.height), (48, 16));
+            assert_eq!(&browse_rows[..2], &rendered[..2]);
+            assert_eq!(browse_rows[4], rendered[4]);
+        }
+    }
+
+    #[test]
+    fn wrapped_title_respects_display_columns_and_limits_to_two_rows() {
+        for title in ["Wish You Were Here: 50th Anniversary Edition",
+            "東京 音楽 日本語 作品", "e\u{301}lan vital remastered at Fillmore"] {
+            let (first, second) = wrapped_info_title(title, 20);
+            assert!(super::super::display_width::width(&first) <= 20, "{first}");
+            if let Some(second) = second {
+                assert!(super::super::display_width::width(&second) <= 20, "{second}");
+            }
+        }
+        let (first, second) = wrapped_info_title("At Fillmore East", 30);
+        assert_eq!(first, "At Fillmore East");
+        assert!(second.is_none());
     }
 
     #[test]

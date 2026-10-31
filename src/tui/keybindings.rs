@@ -119,7 +119,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
         app.browse.tree_last_click = None;
     }
 
-    // Text surfaces that historically delegated Ctrl+V/Ctrl+P to the reusable
+    // Text surfaces that delegate Ctrl+V/Ctrl+Shift+P to the reusable
     // TextInputState need one app-level bridge to the terminal clipboard. More
     // specialized editors below retain their stronger identity guards. Do not
     // intercept browse/file-picker filesystem paste when no text field owns
@@ -4059,8 +4059,7 @@ fn is_host_clipboard_paste_chord(key: &KeyEvent) -> bool {
                 || key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
         }
         KeyCode::Char(c) if c.eq_ignore_ascii_case(&'p') => {
-            key.modifiers == KeyModifiers::CONTROL
-                || key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+            key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
         }
         _ => false,
     }
@@ -9197,8 +9196,7 @@ fn handle_browse_search_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender
                     app.browse.search.focus = super::browse::SearchFocus::Results;
                 }
                 _ => {
-                    let attempted_paste = matches!(key.code, KeyCode::Char('v' | 'p'))
-                        && key.modifiers == KeyModifiers::CONTROL;
+                    let attempted_paste = is_host_clipboard_paste_chord(&key);
                     let handled = super::text_input::handle_text_input_key(
                         &mut app.browse.search.input,
                         &key,
@@ -73339,6 +73337,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::MetadataReplayGainScanTrack
             | TuiButton::MetadataReplayGainScanAlbum
             | TuiButton::MetadataEntryView(_)
+            | TuiButton::PropertiesTitle
             | TuiButton::PropertiesEditMetadata
             | TuiButton::PropertiesRecalculate
             | TuiButton::PropertiesCancel
@@ -77344,7 +77343,7 @@ ignored".to_string()),
     async fn metadata_add_row_all_paste_chords_request_the_host_clipboard() {
         for (code, modifiers, label) in [
             (KeyCode::Char('v'), KeyModifiers::CONTROL, "Ctrl+V"),
-            (KeyCode::Char('p'), KeyModifiers::CONTROL, "Ctrl+P"),
+            (KeyCode::Char('p'), KeyModifiers::CONTROL | KeyModifiers::SHIFT, "Ctrl+Shift+P"),
             (
                 KeyCode::Char('v'),
                 KeyModifiers::CONTROL | KeyModifiers::SHIFT,
@@ -109145,6 +109144,77 @@ mod file_picker_browse_parity_regression_tests {
     use super::*;
     use super::file_operation_safety_tests::{clipboard_copy_worker_for_test, clipboard_move_worker_for_test, worker_for_test, worker_for_test_with_policy};
     use crate::config::TonepoetConfig;
+
+    #[test]
+    fn ctrl_p_does_not_paste_or_open_properties_while_text_input_has_focus() {
+        use crate::tui::browse::SearchFocus;
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("Album Name");
+        std::fs::create_dir(&target).unwrap();
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        let (tx, _rx) = mpsc::channel(8);
+        let chord = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
+
+        begin_browse_inline_rename(&mut app, target);
+        app.browse_inline_edit.as_mut().unwrap().input =
+            super::super::text_input::TextInputState::new_selected("unchanged".into());
+        handle_key(&mut app, chord, &tx);
+        assert_eq!(app.browse_inline_edit.as_ref().unwrap().input.text, "unchanged");
+        assert_eq!(app.host_clipboard_paste_generation, 0);
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+
+        app.browse_inline_edit = None;
+        app.browse.search.active = true;
+        app.browse.search.focus = SearchFocus::Input;
+        app.browse.search.input = super::super::text_input::TextInputState::new_selected(
+            "search unchanged".into());
+        handle_key(&mut app, chord, &tx);
+        assert_eq!(app.browse.search.input.text, "search unchanged");
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+
+        app.browse.search.active = false;
+        app.browse.path_input = Some(super::super::text_input::TextInputState::new_selected(
+            "path unchanged".into()));
+        handle_key(&mut app, chord, &tx);
+        assert_eq!(app.browse.path_input.as_ref().unwrap().text, "path unchanged");
+
+        app.browse.path_input = None;
+        app.browse.filter_input = Some(super::super::text_input::TextInputState::new_selected(
+            "filter unchanged".into()));
+        handle_key(&mut app, chord, &tx);
+        assert_eq!(app.browse.filter_input.as_ref().unwrap().text, "filter unchanged");
+
+        app.browse.filter_input = None;
+        app.active_overlay = ActiveOverlay::CommandInput {
+            input: super::super::text_input::TextInputState::new_selected("command unchanged".into()),
+            completion: None,
+        };
+        handle_key(&mut app, chord, &tx);
+        let ActiveOverlay::CommandInput { input, .. } = &app.active_overlay else {
+            panic!("Ctrl+P closed the command input");
+        };
+        assert_eq!(input.text, "command unchanged");
+        assert_eq!(app.host_clipboard_paste_generation, 0);
+    }
+
+    #[test]
+    fn only_shifted_ctrl_p_is_a_host_text_paste_chord() {
+        for (code, modifiers) in [
+            ('v', KeyModifiers::CONTROL),
+            ('V', KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            ('p', KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            ('P', KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+        ] {
+            assert!(is_host_clipboard_paste_chord(&KeyEvent::new(
+                KeyCode::Char(code), modifiers)));
+        }
+        for modifiers in [KeyModifiers::CONTROL, KeyModifiers::NONE, KeyModifiers::ALT] {
+            assert!(!is_host_clipboard_paste_chord(&KeyEvent::new(
+                KeyCode::Char('p'), modifiers)));
+        }
+    }
 
     /// Empirical reproduction of the user-reported flow: highlight text in the
     /// Browse inline RENAME editor, Ctrl+C, then paste back into the same

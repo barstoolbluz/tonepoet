@@ -345,7 +345,9 @@ pub enum TuiButton {
     BrowseOptionsFilterChoice(usize),
     BrowseOptionsArchiveChoice(usize),
 
-    // Properties modal actions, recorded from the painted pill rectangles.
+    // Properties modal title bar and actions, recorded from painted rectangles.
+    /// Double-click the title bar to toggle the bounded maximized size.
+    PropertiesTitle,
     PropertiesEditMetadata,
     PropertiesRecalculate,
     PropertiesCancel,
@@ -616,6 +618,7 @@ impl TuiButton {
             | Self::FormatSettingsSoxAliasing(_)
             | Self::FormatSettingsSoxSincPhase(_)
             | Self::FormatSettingsSoxrChebyshev(_)
+            | Self::PropertiesTitle
             | Self::PropertiesEditMetadata
             | Self::PropertiesRecalculate
             | Self::PropertiesCancel
