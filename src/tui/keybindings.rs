@@ -8038,6 +8038,14 @@ fn adjust_archive_listing_timeout(app: &mut AppState, delta: i64) {
 
 // ── Browse screen keybindings ────────────────────────────────────────
 
+// A mouse click on a search hit selects the file-list surface, not the
+// search query. Keyboard file operations must subsequently target that hit.
+fn focus_browse_search_results_if_active(app: &mut AppState) {
+    if app.browse.search.active {
+        app.browse.search.focus = super::browse::SearchFocus::Results;
+    }
+}
+
 fn focus_browse_navigation_pane(
     app: &mut AppState,
     pane: super::browse::BrowseNavigationPane,
@@ -9132,15 +9140,15 @@ fn handle_browse_search_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender
         return;
     }
 
-    // File paste is valid from every non-text search focus and is handled
-    // below before the generic search-local clipboard refusal. Copy/cut still
-    // require leaving the search result surface because their source scope is
-    // the normal Browse panes, not the search result projection.
+    // Results use the normal Browse selection and filesystem clipboard paths,
+    // including visible recursive hits from different directories. Search
+    // controls still own their keys; copy/cut require Results focus, while
+    // Input retains its text-editing shortcuts.
     if matches!(key.code, KeyCode::Char('c' | 'x'))
         && key.modifiers == KeyModifiers::CONTROL
-        && app.browse.search.focus != SearchFocus::Input
+        && !matches!(app.browse.search.focus, SearchFocus::Input | SearchFocus::Results)
     {
-        app.set_status("filesystem copy/cut is unavailable in search results; close search first");
+        app.set_status("focus the search results list to copy/cut files");
         return;
     }
 
@@ -72018,6 +72026,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                                 if let super::button_map::TuiButton::BrowseEntry(idx)
                                 | super::button_map::TuiButton::BrowseEntryGutter(idx) = button
                                 {
+                                    focus_browse_search_results_if_active(app);
                                     app.browse.selected_index = idx;
                                     app.browse.ensure_visible();
                                 }
@@ -72117,6 +72126,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                                 app.browse.set_navigation_pane(
                                     super::browse::BrowseNavigationPane::Files,
                                 );
+                                focus_browse_search_results_if_active(app);
                                 app.browse.selected_index = idx;
                                 app.browse.ensure_visible();
                             }
@@ -72899,6 +72909,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 if idx >= app.browse.entries.len() {
                     return;
                 }
+                focus_browse_search_results_if_active(app);
                 app.browse.commit_range_selection();
                 app.browse.toggle_selection_at_index(idx);
                 app.pending_browse_rename = None;
@@ -72916,6 +72927,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 if idx >= app.browse.entries.len() {
                     return;
                 }
+                focus_browse_search_results_if_active(app);
 
                 let clicked_path = app.browse.entries[idx].path.clone();
                 let ctrl = mouse.modifiers.contains(KeyModifiers::CONTROL);
@@ -111423,24 +111435,234 @@ mod file_picker_browse_parity_regression_tests {
     }
 
     #[test]
-    fn search_results_refuse_filesystem_clipboard_shortcuts() {
+    fn search_results_copy_and_cut_target_single_nested_file_or_folder() {
+        use crate::tui::browse::SearchFocus;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let nested = temp.path().join("nested");
+        let folder = temp.path().join("folder");
+        std::fs::create_dir(&nested).expect("nested");
+        std::fs::create_dir(&folder).expect("folder");
+        let file = nested.join("track.flac");
+        std::fs::write(&file, b"audio").expect("file");
+
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![
+            browse_file_entry(file.clone()),
+            crate::tui::browse::BrowseEntry::new(
+                folder.clone(), "folder".into(),
+                crate::convert::classify::EntryKind::Directory, 0, None,
+            ),
+        ];
         app.browse.search.active = true;
-        app.browse.search.focus = crate::tui::browse::SearchFocus::Results;
-        let (tx, _rx) = mpsc::channel(4);
+        app.browse.search.focus = SearchFocus::Results;
+        let (tx, _rx) = mpsc::channel(8);
 
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
-            &tx,
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), &tx);
+        let clipboard = app.browse.filesystem_clipboard.as_ref().expect("copy clipboard");
+        assert_eq!(clipboard.mode(), tui_file_picker::FilePickerClipboardMode::Copy);
+        assert_eq!(clipboard.paths(), std::slice::from_ref(&file));
+        assert_eq!(app.browse.search.focus, SearchFocus::Results);
+
+        app.browse.selected_index = 1;
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL), &tx);
+        let clipboard = app.browse.filesystem_clipboard.as_ref().expect("cut clipboard");
+        assert_eq!(clipboard.mode(), tui_file_picker::FilePickerClipboardMode::Cut);
+        assert_eq!(clipboard.paths(), std::slice::from_ref(&folder));
+        assert!(folder.exists() && file.exists(), "cut only stages a source; it must not move it yet");
+    }
+
+    #[test]
+    fn search_results_bulk_clipboard_delete_copy_to_and_move_to_use_recursive_hits() {
+        use crate::tui::browse::SearchFocus;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("album");
+        let other_dir = temp.path().join("other");
+        std::fs::create_dir(&album).expect("album");
+        std::fs::create_dir(&other_dir).expect("other");
+        let nested_track = album.join("track.flac");
+        let other_track = other_dir.join("other.flac");
+        std::fs::write(&nested_track, b"album audio").expect("track");
+        std::fs::write(&other_track, b"other audio").expect("other track");
+        let stale = temp.path().join("unlisted").join("stale.flac");
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![
+            browse_file_entry(nested_track.clone()),
+            browse_file_entry(other_track.clone()),
+            crate::tui::browse::BrowseEntry::new(
+                album.clone(), "album".into(),
+                crate::convert::classify::EntryKind::Directory, 0, None,
+            ),
+        ];
+        // Recursive hits can contain both a selected directory and a file
+        // inside it; an unrelated stale mark must never enter the operation.
+        app.browse.multi_selected = vec![
+            nested_track.clone(), other_track.clone(), album.clone(), stale,
+        ];
+        app.browse.search.active = true;
+        app.browse.search.focus = SearchFocus::Results;
+        let (tx, _rx) = mpsc::channel(8);
+
+        for (key, mode) in [
+            ('c', tui_file_picker::FilePickerClipboardMode::Copy),
+            ('x', tui_file_picker::FilePickerClipboardMode::Cut),
+        ] {
+            handle_key(&mut app, KeyEvent::new(KeyCode::Char(key), KeyModifiers::CONTROL), &tx);
+            let clipboard = app.browse.filesystem_clipboard.as_ref().expect("clipboard");
+            assert_eq!(clipboard.mode(), mode);
+            assert_eq!(clipboard.paths(), &[other_track.clone(), album.clone()]);
+        }
+        assert_eq!(
+            app.browse.multi_selected,
+            vec![nested_track.clone(), other_track.clone(), album.clone()],
+            "stale paths are pruned from the raw selection",
         );
 
+        for (action, is_move) in [
+            (super::super::context_menu::ContextAction::CopyTo, false),
+            (super::super::context_menu::ContextAction::MoveTo, true),
+        ] {
+            super::super::context_menu::execute_context_action(&mut app, action, &tx, false);
+            match &app.active_overlay {
+                ActiveOverlay::FilePicker(state) => {
+                    let sources = match &state.purpose {
+                        FilePickerPurpose::MoveTo { sources, force } if is_move && !*force => sources,
+                        FilePickerPurpose::CopyTo { sources, force } if !is_move && !*force => sources,
+                        other => panic!("expected copy/move destination picker, got {other:?}"),
+                    };
+                    assert_eq!(sources, &vec![other_track.clone(), album.clone()]);
+                }
+                other => panic!("expected picker, got {other:?}"),
+            }
+            app.active_overlay = ActiveOverlay::None;
+        }
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE), &tx);
+        match &app.active_overlay {
+            ActiveOverlay::Confirmation {
+                action: ConfirmAction::DeleteSelection(paths), ..
+            } => assert_eq!(paths, &vec![nested_track.clone(), other_track.clone(), album.clone()]),
+            other => panic!("expected permanent-delete confirmation, got {other:?}"),
+        }
+        assert!(nested_track.exists() && other_track.exists() && album.exists());
+    }
+
+    #[test]
+    fn mouse_search_hit_focus_routes_clipboard_then_query_click_reclaims_input() {
+        use crate::tui::browse::SearchFocus;
+        use ratatui::layout::Rect;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = temp.path().join("track.flac");
+        std::fs::write(&file, b"audio").expect("file");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![browse_file_entry(file.clone())];
+        app.browse.search.active = true;
+        app.browse.search.focus = SearchFocus::Input;
+        app.button_map.record_button(TuiButton::BrowseEntry(0), Rect::new(4, 5, 30, 1));
+        app.button_map.record_button(TuiButton::BrowseSearchInput, Rect::new(4, 2, 30, 1));
+        let (tx, _rx) = mpsc::channel(8);
+
+        handle_mouse(&mut app, MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 6, row: 5, modifiers: KeyModifiers::NONE,
+        }, &tx);
+        assert_eq!(app.browse.search.focus, SearchFocus::Results);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), &tx);
+        assert_eq!(
+            app.browse.filesystem_clipboard.as_ref().expect("filesystem clipboard").paths(),
+            std::slice::from_ref(&file),
+        );
+
+        handle_mouse(&mut app, MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 6, row: 2, modifiers: KeyModifiers::NONE,
+        }, &tx);
+        assert_eq!(app.browse.search.focus, SearchFocus::Input);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL), &tx);
+        assert_eq!(
+            app.browse.filesystem_clipboard.as_ref().expect("retained copy").mode(),
+            tui_file_picker::FilePickerClipboardMode::Copy,
+            "search text shortcuts must not replace the filesystem clipboard",
+        );
+    }
+
+    #[test]
+    fn search_hit_gutter_and_right_click_transfer_keyboard_focus_to_results() {
+        use crate::tui::browse::SearchFocus;
+        use ratatui::layout::Rect;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = temp.path().join("track.flac");
+        std::fs::write(&file, b"audio").expect("file");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![browse_file_entry(file.clone())];
+        app.browse.search.active = true;
+        app.browse.search.focus = SearchFocus::Input;
+        app.button_map.record_button(TuiButton::BrowseEntryGutter(0), Rect::new(2, 5, 2, 1));
+        app.button_map.record_button(TuiButton::BrowseEntry(0), Rect::new(4, 5, 30, 1));
+        let (tx, _rx) = mpsc::channel(8);
+
+        handle_mouse(&mut app, MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2, row: 5, modifiers: KeyModifiers::NONE,
+        }, &tx);
+        assert_eq!(app.browse.search.focus, SearchFocus::Results);
+        assert_eq!(app.browse.multi_selected, vec![file.clone()]);
+
+        app.browse.search.focus = SearchFocus::Input;
+        handle_mouse(&mut app, MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: 6, row: 5, modifiers: KeyModifiers::NONE,
+        }, &tx);
+        assert_eq!(app.browse.search.focus, SearchFocus::Results);
+        assert!(matches!(app.active_overlay, ActiveOverlay::ContextMenu { .. }));
+    }
+
+    #[test]
+    fn search_controls_cannot_copy_results_and_parent_row_cannot_be_copied() {
+        use crate::tui::browse::SearchFocus;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let file = temp.path().join("track.flac");
+        std::fs::write(&file, b"audio").expect("file");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![
+            crate::tui::browse::BrowseEntry::new(
+                temp.path().parent().expect("parent").to_path_buf(), "..".into(),
+                crate::convert::classify::EntryKind::ParentDir, 0, None,
+            ),
+            browse_file_entry(file),
+        ];
+        app.browse.search.active = true;
+        let (tx, _rx) = mpsc::channel(8);
+
+        app.browse.search.focus = SearchFocus::Sort;
+        app.browse.selected_index = 1;
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), &tx);
         assert!(app.browse.filesystem_clipboard.is_none());
-        assert!(app
-            .status_message
-            .as_ref()
-            .is_some_and(|(message, _)| message.contains("unavailable in search results")));
+        assert!(app.status_message.as_ref().is_some_and(|(message, _)| {
+            message.contains("focus the search results list")
+        }));
+
+        app.browse.search.focus = SearchFocus::Results;
+        app.browse.selected_index = 0;
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL), &tx);
+        assert!(app.browse.filesystem_clipboard.is_none());
+        assert!(app.status_message.as_ref().is_some_and(|(message, _)| {
+            message.contains("No items selected")
+        }));
     }
 
     #[test]
