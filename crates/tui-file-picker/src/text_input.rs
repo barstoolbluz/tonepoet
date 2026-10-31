@@ -1265,11 +1265,12 @@ pub fn handle_text_input_key_with_boundaries(
         (true, false, _, KeyCode::Char(c)) if c.eq_ignore_ascii_case(&'x') => {
             input.cut_selection()
         }
-        (true, false, _, KeyCode::Char(c))
-            if c.eq_ignore_ascii_case(&'v') || c.eq_ignore_ascii_case(&'p') =>
-        {
+        (true, false, _, KeyCode::Char(c)) if c.eq_ignore_ascii_case(&'v') => {
             input.paste_clipboard()
         }
+        // Ctrl+P is reserved for Properties in Browse. Shared text inputs
+        // consume it without changing text, selection, or clipboard state.
+        (true, false, false, KeyCode::Char(c)) if c.eq_ignore_ascii_case(&'p') => true,
 
         // Readline-style movement/editing.
         (true, false, _, KeyCode::Char(c)) => {
@@ -2667,15 +2668,18 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_p_replays_the_scoped_host_clipboard_like_ctrl_v() {
+    fn ctrl_p_is_noop_even_with_a_select_all_and_retained_clipboard() {
         with_scoped_shared_text_clipboard("replacement", || {
             let mut input = TextInputState::new_selected("old".to_string());
-
+            let before = input.clone();
             assert!(handle_text_input_key(
                 &mut input,
                 &key(KeyCode::Char('p'), KeyModifiers::CONTROL),
             ));
-            assert_eq!(input.text, "replacement");
+            assert_eq!(input.text, before.text, "Ctrl+P must not replace selected text");
+            assert_eq!(input.cursor, before.cursor);
+            assert_eq!(input.select_all, before.select_all);
+            assert_eq!(input.selection_anchor, before.selection_anchor);
         });
     }
 

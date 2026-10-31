@@ -11126,7 +11126,7 @@ fn replay_single_line_terminal_text_at_current_focus(
 fn handle_paste(app: &mut AppState, text: &str, tx: &mpsc::Sender<AppMessage>) {
     // A terminal-supplied bracketed paste is authoritative. Advance both the
     // logical clipboard and the command-read generation before applying it so
-    // an older in-flight Ctrl+V/Ctrl+P host read cannot overwrite this value.
+    // an older in-flight Ctrl+V/Ctrl+Shift+P host read cannot overwrite this value.
     let terminal_snapshot = tui_file_picker::observe_terminal_clipboard_text(text.to_string());
     app.host_clipboard_paste_generation = app
         .host_clipboard_paste_generation
@@ -11148,7 +11148,7 @@ fn handle_paste(app: &mut AppState, text: &str, tx: &mpsc::Sender<AppMessage>) {
 
     // The dedicated picker owns its focused text fields. When navigation owns
     // focus, an intercepted Ctrl+V arrives as Event::Paste and is promoted to
-    // the same filesystem-paste command as Ctrl+V/Ctrl+P.
+    // the same filesystem-paste command as Ctrl+V/Ctrl+Shift+P.
     if let ActiveOverlay::FilePicker(session) = &mut app.active_overlay {
         if session.picker.handle_terminal_paste(text) {
             return;
@@ -12066,7 +12066,7 @@ mod metadata_detail_paste_tests {
         };
 
         let mut snapshots = Vec::new();
-        // Ctrl+V and Ctrl+P resolve through HostClipboardReadComplete. The
+        // Ctrl+V and Ctrl+Shift+P resolve through HostClipboardReadComplete. The
         // bracketed Ctrl+Shift+V case must apply the terminal payload directly
         // but converge on the same structured metadata parser/application path.
         for generation in [41_u64, 42_u64] {

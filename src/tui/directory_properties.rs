@@ -28,6 +28,7 @@ pub struct FolderPropertiesState {
     pub scroll: usize,
     pub horizontal_scroll: usize,
     pub cancelled: bool,
+    pub maximized: bool,
     pub focus: PropertiesFocus,
 }
 
@@ -99,7 +100,7 @@ pub fn open_for_path(app: &mut AppState, path: PathBuf, tx: &Sender<AppMessage>)
     } else { None };
     app.active_overlay = ActiveOverlay::FolderProperties(Box::new(FolderPropertiesState {
         path, subject, request_id, scroll: 0, horizontal_scroll: 0,
-        cancelled: false, focus: PropertiesFocus::Ok,
+        cancelled: false, maximized: false, focus: PropertiesFocus::Ok,
     }));
 }
 
@@ -157,6 +158,10 @@ pub fn handle_key(app: &mut AppState, mut state: FolderPropertiesState, key: Key
         && app.directory_accounting.view(&state.path).is_some_and(|view| view.running);
     match (key.code, key.modifiers) {
         (KeyCode::Esc, _) => close(app, &state),
+        (KeyCode::Char('m' | 'M'), KeyModifiers::ALT) => {
+            state.maximized = !state.maximized;
+            app.active_overlay = ActiveOverlay::FolderProperties(Box::new(state));
+        }
         (KeyCode::Enter | KeyCode::Char(' '), KeyModifiers::NONE) => {
             if running && state.focus == PropertiesFocus::Recalculate {
                 cancel(app, state);
@@ -190,6 +195,14 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &Sender<AppMessag
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             match app.button_map.find_button_at(mouse.column, mouse.row) {
+                Some(TuiButton::PropertiesTitle) => {
+                    let mut state = state;
+                    if app.double_click.register_click(TuiButton::PropertiesTitle,
+                        mouse.column, mouse.row, tui_file_picker::DOUBLE_CLICK_WINDOW) {
+                        state.maximized = !state.maximized;
+                    }
+                    app.active_overlay = ActiveOverlay::FolderProperties(Box::new(state));
+                }
                 Some(TuiButton::PropertiesOk) => activate(app, state, PropertiesFocus::Ok, tx),
                 Some(TuiButton::PropertiesEditMetadata) => activate(app, state, PropertiesFocus::EditMetadata, tx),
                 Some(TuiButton::PropertiesRecalculate) => activate(app, state, PropertiesFocus::Recalculate, tx),
@@ -272,6 +285,45 @@ mod tests {
         let ActiveOverlay::FolderProperties(state) = &app.active_overlay else { panic!("not open"); };
         assert!(state.request_id.is_none());
         assert!(matches!(state.subject, PropertiesSubject::File { is_symlink: true, modified: None, .. }));
+    }
+
+    #[test]
+    fn alt_m_and_title_double_click_toggle_same_properties_state() {
+        let (mut app, tx) = file_app();
+        open_selected(&mut app, &tx);
+        let toggle = KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT);
+        let ActiveOverlay::FolderProperties(state) = app.active_overlay.clone() else {
+            panic!("Properties not open");
+        };
+        assert!(!state.maximized);
+        handle_key(&mut app, *state, toggle, &tx);
+        let ActiveOverlay::FolderProperties(state) = app.active_overlay.clone() else {
+            panic!("Properties closed on Alt+M");
+        };
+        assert!(state.maximized);
+        handle_key(&mut app, *state, toggle, &tx);
+        let ActiveOverlay::FolderProperties(state) = &app.active_overlay else {
+            panic!("Properties closed on second Alt+M");
+        };
+        assert!(!state.maximized);
+
+        let hit = Rect::new(12, 4, 30, 1);
+        app.button_map.record_button(TuiButton::PropertiesTitle, hit);
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left), column: 16, row: 4,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, click, &tx);
+        let ActiveOverlay::FolderProperties(state) = &app.active_overlay else { panic!("closed"); };
+        assert!(!state.maximized, "one click does not maximize");
+        handle_mouse(&mut app, click, &tx);
+        let ActiveOverlay::FolderProperties(state) = &app.active_overlay else { panic!("closed"); };
+        assert!(state.maximized, "double click maximizes");
+        handle_mouse(&mut app, click, &tx);
+        handle_mouse(&mut app, click, &tx);
+        let ActiveOverlay::FolderProperties(state) = &app.active_overlay else { panic!("closed"); };
+        assert!(!state.maximized, "second double click restores");
+        assert!(state.request_id.is_none(), "file Properties never requests a scan");
     }
 
     #[test]

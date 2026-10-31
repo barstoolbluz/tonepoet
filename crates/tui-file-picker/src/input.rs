@@ -282,7 +282,7 @@ impl FilePickerState {
                     || key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
             }
             KeyCode::Char(c) if c.eq_ignore_ascii_case(&'p') => {
-                key.modifiers == KeyModifiers::CONTROL
+                key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
             }
             _ => false,
         };
@@ -2378,10 +2378,13 @@ mod tests {
                 )),
                 FilePickerAction::None,
             );
-            assert!(
-                picker.take_host_clipboard_paste_request(),
-                "Ctrl+P on a picker text field must request the authoritative host clipboard",
-            );
+            assert!(!picker.take_host_clipboard_paste_request(),
+                "Ctrl+P in picker text fields must not paste");
+            assert_eq!(active_text(picker), "def");
+            assert_eq!(picker.handle_key(KeyEvent::new(KeyCode::Char('p'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT)), FilePickerAction::None);
+            assert!(picker.take_host_clipboard_paste_request(),
+                "Ctrl+Shift+P must request host text paste");
             assert!(
                 picker.paste_host_clipboard_text("abc"),
                 "the returned host clipboard text must be applied to the focused picker field",
@@ -2514,7 +2517,7 @@ mod tests {
         picker.begin_address_edit();
         for (code, modifiers) in [
             (KeyCode::Char('v'), KeyModifiers::CONTROL),
-            (KeyCode::Char('p'), KeyModifiers::CONTROL),
+            (KeyCode::Char('p'), KeyModifiers::CONTROL | KeyModifiers::SHIFT),
             (
                 KeyCode::Char('v'),
                 KeyModifiers::CONTROL | KeyModifiers::SHIFT,
