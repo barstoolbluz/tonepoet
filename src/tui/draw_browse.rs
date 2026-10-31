@@ -575,7 +575,15 @@ fn draw_browse_toolbar(f: &mut Frame, area: Rect, app: &mut AppState, theme: sup
     x = x.saturating_add(10);
     draw_toolbar_button(f, &mut app.button_map, TuiButton::BrowseToolbarOptions, x, y, " Options ▾ ", true, theme);
     x = x.saturating_add(12);
-    draw_toolbar_button(f, &mut app.button_map, TuiButton::BrowseToolbarSearch, x, y, " Search ", true, theme);
+    // On narrow terminals, New takes priority over Search. Neither new
+    // control may paint or register a hitbox across the right border.
+    if x.saturating_add(7) <= area.right().saturating_sub(1) {
+        draw_toolbar_button(f, &mut app.button_map, TuiButton::BrowseToolbarNew, x, y, " New ▾ ", true, theme);
+    }
+    x = x.saturating_add(8);
+    if x.saturating_add(8) <= area.right().saturating_sub(1) {
+        draw_toolbar_button(f, &mut app.button_map, TuiButton::BrowseToolbarSearch, x, y, " Search ", true, theme);
+    }
 
     // Render path bar on line 3, inside the borders. Reserve explicit hit
     // rectangles for both trailing actions so the breadcrumb never overlaps them.
@@ -7812,6 +7820,47 @@ mod folder_classification_info_pane_tests {
         assert!(!rendered.contains("Kind") && !rendered.contains('─'), "{rendered}");
         assert!(info.audio_streams_pill_row.is_some());
         assert!(info.edit_tags_pill_row.is_some());
+    }
+}
+
+#[cfg(test)]
+mod browse_new_toolbar_render_tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn new_button_is_painted_and_clickable_next_to_options_without_overflow() {
+        for width in [55, 80] {
+            let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+            let mut terminal = Terminal::new(TestBackend::new(width, 5)).expect("terminal");
+            let theme = crate::tui::theme::theme_by_slug_or_default(
+                crate::tui::theme::default_theme_slug(),
+            );
+            terminal.draw(|frame| {
+                draw_browse_toolbar(frame, Rect::new(0, 0, width, 5), &mut app, theme);
+            }).expect("toolbar draw");
+
+            let options = app.button_map.button_rect(TuiButton::BrowseToolbarOptions)
+                .expect("Options button");
+            let new_button = app.button_map.button_rect(TuiButton::BrowseToolbarNew)
+                .expect("New button");
+            assert_eq!(new_button, Rect::new(options.right() + 1, options.y, 7, 1));
+            assert!(new_button.right() < width, "New hitbox must stay inside right border");
+            let row = (0..width).map(|x| {
+                terminal.backend().buffer().get(x, new_button.y).symbol().to_string()
+            }).collect::<Vec<_>>().join("");
+            assert!(row.contains(" New ▾ "), "New button must be visible: {row}");
+            assert_eq!(
+                app.button_map.find_button_at(new_button.x + 3, new_button.y),
+                Some(TuiButton::BrowseToolbarNew),
+            );
+            assert_eq!(app.button_map.find_button_at(width - 1, new_button.y), None);
+            assert_eq!(
+                app.button_map.button_rect(TuiButton::BrowseToolbarSearch).is_some(),
+                width == 80,
+                "Search must not have an off-screen hitbox",
+            );
+        }
     }
 }
 
