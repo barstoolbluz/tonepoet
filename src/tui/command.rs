@@ -10986,6 +10986,7 @@ fn execute_file_op(
         return;
     }
 
+    let sources = independent_copy_move_sources(sources);
     let target = if is_move {
         TextEditTarget::BrowseMove { sources, force }
     } else {
@@ -10998,6 +10999,19 @@ fn execute_file_op(
     let dest_expanded = expand_path(dest.trim());
     super::keybindings::apply_file_op_with_tx(app, target, &dest_expanded, tx);
     surface_stale_selection_notice(app, dropped_stale_count);
+}
+
+/// Recursive search can mark a folder and its descendants at once, unlike a
+/// normal directory listing. Reuse the filesystem clipboard's independent-root
+/// rule before launching a direct copy/move or capturing a picker source set.
+/// A selected directory already includes its selected children.
+fn independent_copy_move_sources(sources: Vec<PathBuf>) -> Vec<PathBuf> {
+    tui_file_picker::FilesystemClipboard::new(
+        tui_file_picker::FilePickerClipboardMode::Copy,
+        sources,
+    )
+    .map(|clipboard| clipboard.paths().to_vec())
+    .unwrap_or_default()
 }
 
 /// Open the reusable file picker as a Browse-screen destination chooser for
@@ -11016,6 +11030,7 @@ pub(super) fn open_file_picker_for_copy_move(
         app.set_status(format!("{} only works on the Browse screen", cmd));
         return;
     }
+    let sources = independent_copy_move_sources(sources);
     if sources.is_empty() {
         app.set_status("no files selected for copy/move");
         return;
@@ -11056,6 +11071,64 @@ pub(super) fn open_file_picker_for_copy_move(
         dropped_stale_count,
         status,
     ));
+}
+
+#[cfg(test)]
+mod browse_search_copy_move_roots_tests {
+    use super::*;
+    use crate::config::TonepoetConfig;
+
+    #[test]
+    fn direct_copy_and_move_from_recursive_results_dispatch_independent_roots() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let album = temp.path().join("album");
+        let other_dir = temp.path().join("other");
+        let destination = temp.path().join("destination");
+        for dir in [&album, &other_dir, &destination] {
+            std::fs::create_dir(dir).expect("fixture directory");
+        }
+        let child = album.join("track.flac");
+        let other = other_dir.join("other.flac");
+        std::fs::write(&child, b"album audio").expect("child");
+        std::fs::write(&other, b"other audio").expect("other");
+
+        for is_move in [false, true] {
+            let mut app = AppState::new_for_test(TonepoetConfig::default());
+            app.current_screen = AppScreen::Browse;
+            app.browse.current_dir = temp.path().to_path_buf();
+            app.browse.search.active = true;
+            app.browse.entries = vec![
+                crate::tui::browse::BrowseEntry::new(
+                    child.clone(), "track.flac".into(),
+                    crate::convert::classify::EntryKind::OtherFile, 11, None,
+                ),
+                crate::tui::browse::BrowseEntry::new(
+                    other.clone(), "other.flac".into(),
+                    crate::convert::classify::EntryKind::OtherFile, 11, None,
+                ),
+                crate::tui::browse::BrowseEntry::new(
+                    album.clone(), "album".into(),
+                    crate::convert::classify::EntryKind::Directory, 0, None,
+                ),
+            ];
+            app.browse.multi_selected = vec![child.clone(), other.clone(), album.clone()];
+            // Capture the worker dispatch instead of touching the filesystem.
+            app.test_file_task_dispatches = Some(Vec::new());
+            let (tx, _rx) = mpsc::channel(8);
+            let dest = destination.to_string_lossy().into_owned();
+            let command = if is_move {
+                Command::Move { dest, force: false }
+            } else {
+                Command::Copy { dest, force: false }
+            };
+            execute_command(&mut app, command, &tx);
+
+            let dispatches = app.test_file_task_dispatches.as_ref().expect("dispatch capture");
+            assert_eq!(dispatches.len(), 1, "one job must be dispatched");
+            assert_eq!(dispatches[0].1, vec![other.clone(), album.clone()]);
+            assert!(child.exists() && other.exists(), "test seam cannot mutate sources");
+        }
+    }
 }
 
 fn directory_destination_picker_policy(

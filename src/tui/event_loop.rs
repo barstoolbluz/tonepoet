@@ -2416,9 +2416,10 @@ fn reduce_file_task_complete(
     // Completion reduction must remain control-plane-only. Directory scans run
     // on the existing cancellable scan worker; tree rebuilding and selection
     // probes can synchronously touch a dead mount and therefore do not run here.
-    // Refresh every open Browse tab that actually displays a successful
-    // destination parent. Transfers can be minimized while the user switches
-    // tabs, so the active tab is not necessarily the destination anymore.
+    // Refresh tabs showing successful destination parents and recursive
+    // searches containing the completed paths. Transfers can be minimized
+    // while the user switches tabs, so the active tab is not necessarily the
+    // destination anymore.
     let destination_refreshed_tabs =
         refresh_browse_destination_views_after_file_task(app, &completed_destinations);
     if pending.clipboard.mode() == tui_file_picker::FilePickerClipboardMode::Cut
@@ -2519,12 +2520,23 @@ fn refresh_browse_destination_views_after_file_task(
         let Some(tab) = app.browse.tab_mut(tab_id) else {
             continue;
         };
-        let Some(restore_target) = destination_targets.get(&tab.current_dir) else {
+        let restore_target = destination_targets.get(&tab.current_dir);
+        let recursive_search_affected = tab.archive.is_none()
+            && tab.search.active
+            && tab.search.recursive
+            && completed_destinations
+                .iter()
+                .any(|destination| destination.starts_with(&tab.current_dir));
+        if restore_target.is_none() && !recursive_search_affected {
             continue;
-        };
+        }
 
-        tab.cursor_restore_target = restore_target.clone();
-        tab.cursor_restore_scroll_offset = None;
+        // An ancestor search needs new results, not a cursor jump to a file
+        // nested below the directory this tab actually displays.
+        if let Some(restore_target) = restore_target {
+            tab.cursor_restore_target = restore_target.clone();
+            tab.cursor_restore_scroll_offset = None;
+        }
         tab.refresh_after_file_task_nonblocking();
         refreshed_tabs.insert(tab_id);
     }
@@ -2560,11 +2572,17 @@ fn refresh_browse_source_views_after_move(
         // stale-node gap when no tab is currently displaying the source parent.
         tab.prune_tree_paths_after_move(completed_sources);
 
-        // A tab already refreshed because it displays a successful destination
-        // parent must not receive a second source scan/cancel cycle (notably for
-        // same-directory moves). Every other tab displaying a source parent is
-        // refreshed regardless of which tab happens to be active now.
-        if source_parents.contains(&tab.current_dir)
+        // A tab already refreshed for the destination (including a recursive
+        // search ancestor) must not receive a second source scan/cancel cycle.
+        // Other tabs showing a source parent or its recursive-search ancestor
+        // are refreshed regardless of which tab is currently active.
+        let recursive_search_affected = tab.archive.is_none()
+            && tab.search.active
+            && tab.search.recursive
+            && completed_sources
+                .iter()
+                .any(|source| source.starts_with(&tab.current_dir));
+        if (source_parents.contains(&tab.current_dir) || recursive_search_affected)
             && !destination_refreshed_tabs.contains(&tab_id)
         {
             tab.refresh_after_file_task_nonblocking();
@@ -22834,6 +22852,270 @@ mod minimized_file_transfer_attention_tests {
 mod browse_tab_async_routing_tests {
     use super::*;
     use crate::config::TonepoetConfig;
+
+    // A file task refreshes the listing first; the existing directory-scan
+    // reducer then re-runs the recursive search on that tab. Exercise both
+    // asynchronous completions rather than only the path-routing predicate.
+    async fn complete_background_recursive_search_refresh(
+        app: &mut AppState,
+        tab_id: crate::tui::browse::BrowseTabId,
+        tx: &mpsc::Sender<AppMessage>,
+        rx: &mut mpsc::Receiver<AppMessage>,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let message = rx.recv().await.expect("Browse scan/search channel closed");
+                let is_scan = matches!(
+                    &message,
+                    AppMessage::DirScanComplete { tab_id: owner, .. } if *owner == tab_id
+                );
+                let is_search = matches!(
+                    &message,
+                    AppMessage::SearchComplete { tab_id: owner, .. } if *owner == tab_id
+                );
+                // Other tabs may have initial scans in flight. They are
+                // unrelated to the background search being tested.
+                if is_scan || is_search {
+                    handle_message(app, message, tx);
+                }
+                if is_search {
+                    assert!(
+                        !app.browse.tab_mut(tab_id).expect("search tab").search.searching,
+                        "replacement recursive search must publish its results",
+                    );
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("background recursive search refresh timed out");
+    }
+
+    #[tokio::test]
+    async fn completed_nested_move_removes_stale_background_recursive_search_hit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("Music");
+        let album = root.join("Album");
+        let output = temp.path().join("Output");
+        std::fs::create_dir_all(&album).expect("album fixture");
+        std::fs::create_dir_all(&output).expect("output fixture");
+        let moved = album.join("needle-track.flac");
+        std::fs::write(&moved, b"fixture").expect("source fixture");
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = root.clone();
+        app.browse.set_tx(tx.clone());
+        let search_tab_id = app.browse.active_tab_id();
+        app.browse.search.active = true;
+        app.browse.search.recursive = true;
+        app.browse.search.input = TextInputState::new("needle".to_string());
+        app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
+            moved.clone(),
+            "Album/needle-track.flac".to_string(),
+            EntryKind::AudioFile(crate::convert::formats::AudioFormat::Flac),
+            7,
+            None,
+        )];
+        assert_eq!(app.browse.entries[0].path, moved);
+
+        assert!(app.browse.open_dir_in_new_tab(output.clone(), true));
+        let output_tab_id = app.browse.active_tab_id();
+        let completed_destination = output.join("needle-track.flac");
+        std::fs::rename(&moved, &completed_destination).expect("completed move fixture");
+
+        let destination_refreshed_tabs = refresh_browse_destination_views_after_file_task(
+            &mut app,
+            std::slice::from_ref(&completed_destination),
+        );
+        assert!(destination_refreshed_tabs.contains(&output_tab_id));
+        assert!(!destination_refreshed_tabs.contains(&search_tab_id));
+        refresh_browse_source_views_after_move(
+            &mut app,
+            std::slice::from_ref(&moved),
+            &destination_refreshed_tabs,
+        );
+        assert!(
+            app.browse
+                .tab_mut(search_tab_id)
+                .expect("search tab")
+                .pending_scan_generation()
+                .is_some(),
+            "nested moved source must refresh the background recursive search root",
+        );
+
+        complete_background_recursive_search_refresh(
+            &mut app,
+            search_tab_id,
+            &tx,
+            &mut rx,
+        )
+        .await;
+        let search_tab = app.browse.tab_mut(search_tab_id).expect("search tab");
+        assert!(search_tab.search.active && search_tab.search.recursive);
+        assert!(
+            !search_tab.entries.iter().any(|entry| entry.path == moved),
+            "the moved file must disappear after the replacement search completes",
+        );
+        assert_eq!(app.browse.active_tab_id(), output_tab_id);
+    }
+
+    #[tokio::test]
+    async fn completed_nested_copy_discovers_new_background_recursive_search_hit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("Music");
+        let album = root.join("Album");
+        let outside = temp.path().join("Outside");
+        std::fs::create_dir_all(&album).expect("album fixture");
+        std::fs::create_dir_all(&outside).expect("outside fixture");
+        let source = outside.join("needle-new.flac");
+        let destination = album.join("needle-new.flac");
+        std::fs::write(&source, b"fixture").expect("source fixture");
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = root.clone();
+        app.browse.set_tx(tx.clone());
+        let search_tab_id = app.browse.active_tab_id();
+        app.browse.search.active = true;
+        app.browse.search.recursive = true;
+        app.browse.search.input = TextInputState::new("needle".to_string());
+        app.browse.cursor_restore_target = Some("keep-current-cursor".to_string());
+
+        // A nonrecursive ancestor also contains the changed path, but it is
+        // not displaying the directory whose immediate children changed.
+        assert!(app.browse.open_dir_in_new_tab(temp.path().to_path_buf(), true));
+        let ancestor_tab_id = app.browse.active_tab_id();
+        let ancestor_generation = app
+            .browse
+            .pending_scan_generation()
+            .expect("initial ancestor scan");
+        assert!(!app.browse.search.recursive);
+        std::fs::copy(&source, &destination).expect("completed copy fixture");
+
+        let destination_refreshed_tabs = refresh_browse_destination_views_after_file_task(
+            &mut app,
+            std::slice::from_ref(&destination),
+        );
+        assert!(destination_refreshed_tabs.contains(&search_tab_id));
+        assert!(!destination_refreshed_tabs.contains(&ancestor_tab_id));
+        assert_eq!(app.browse.pending_scan_generation(), Some(ancestor_generation));
+        let search_tab = app.browse.tab_mut(search_tab_id).expect("search tab");
+        assert!(search_tab.pending_scan_generation().is_some());
+        assert_eq!(
+            search_tab.cursor_restore_target.as_deref(),
+            Some("keep-current-cursor"),
+            "a nested destination must not overwrite an ancestor search cursor target",
+        );
+
+        complete_background_recursive_search_refresh(
+            &mut app,
+            search_tab_id,
+            &tx,
+            &mut rx,
+        )
+        .await;
+        assert!(
+            app.browse
+                .tab_mut(search_tab_id)
+                .expect("search tab")
+                .entries
+                .iter()
+                .any(|entry| entry.path == destination),
+            "replacement recursive search must discover a newly copied nested match",
+        );
+        assert_eq!(app.browse.active_tab_id(), ancestor_tab_id);
+    }
+
+    #[tokio::test]
+    async fn nested_move_within_one_recursive_root_refreshes_only_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("Music");
+        let first_album = root.join("first");
+        let second_album = root.join("second");
+        std::fs::create_dir_all(&first_album).expect("first album");
+        std::fs::create_dir_all(&second_album).expect("second album");
+        let source = first_album.join("needle-old.flac");
+        let destination = second_album.join("needle-new.flac");
+        std::fs::write(&source, b"fixture").expect("source fixture");
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = root;
+        app.browse.set_tx(tx.clone());
+        let search_tab_id = app.browse.active_tab_id();
+        app.browse.search.active = true;
+        app.browse.search.recursive = true;
+        app.browse.search.input = TextInputState::new("needle".to_string());
+        std::fs::rename(&source, &destination).expect("completed move fixture");
+
+        let destination_refreshed_tabs = refresh_browse_destination_views_after_file_task(
+            &mut app,
+            std::slice::from_ref(&destination),
+        );
+        assert!(destination_refreshed_tabs.contains(&search_tab_id));
+        let pending_generation = app
+            .browse
+            .pending_scan_generation()
+            .expect("destination started search-root scan");
+        refresh_browse_source_views_after_move(
+            &mut app,
+            std::slice::from_ref(&source),
+            &destination_refreshed_tabs,
+        );
+        assert_eq!(
+            app.browse.pending_scan_generation(),
+            Some(pending_generation),
+            "source invalidation must not restart the same ancestor search scan",
+        );
+        complete_background_recursive_search_refresh(
+            &mut app,
+            search_tab_id,
+            &tx,
+            &mut rx,
+        )
+        .await;
+        assert!(app.browse.entries.iter().any(|entry| entry.path == destination));
+        assert!(!app.browse.entries.iter().any(|entry| entry.path == source));
+    }
+
+    #[tokio::test]
+    async fn similar_prefix_outside_search_root_does_not_refresh_recursive_tab() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("Music");
+        let sibling = temp.path().join("Music-Extras");
+        std::fs::create_dir_all(&root).expect("root fixture");
+        std::fs::create_dir_all(&sibling).expect("sibling fixture");
+
+        let (tx, _rx) = mpsc::channel(16);
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = root;
+        app.browse.set_tx(tx);
+        app.browse.search.active = true;
+        app.browse.search.recursive = true;
+        assert!(app.browse.pending_scan_generation().is_none());
+
+        let destination = sibling.join("needle-new.flac");
+        let refreshed = refresh_browse_destination_views_after_file_task(
+            &mut app,
+            std::slice::from_ref(&destination),
+        );
+        assert!(refreshed.is_empty());
+        refresh_browse_source_views_after_move(
+            &mut app,
+            std::slice::from_ref(&destination),
+            &refreshed,
+        );
+        assert!(
+            app.browse.pending_scan_generation().is_none(),
+            "Path::starts_with must respect directory components, not text prefixes",
+        );
+    }
+
 
     #[tokio::test]
     async fn completed_move_refreshes_background_source_tab_and_prunes_sidebar_node() {
