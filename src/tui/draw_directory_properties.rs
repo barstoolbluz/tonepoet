@@ -242,7 +242,7 @@ pub fn draw(f: &mut Frame, state: &FolderPropertiesState, service: &AccountingSe
     let indicator = if state.maximized { "▾" } else { "▸" };
     let title = format!("{indicator} {} Properties", super::display_width::truncate_right(
         &name, area.width.saturating_sub(19) as usize));
-    let block = super::draw::solid_title_block(area, title, theme.amber, theme)
+    let block = super::draw::solid_title_block(area, title, theme.purple, theme)
         .style(Style::default().bg(theme.surface));
     f.render_widget(Clear, area);
     f.render_widget(block, area);
@@ -374,7 +374,7 @@ mod tests {
         }
         // The frame uses the active theme for the frame and action button.
         let border = terminal.backend().buffer().get(rect.x, rect.y + 1);
-        assert_eq!(border.fg, theme().amber);
+        assert_eq!(border.fg, theme().purple);
         let ok_cell = terminal.backend().buffer().get(ok.x + 1, ok.y);
         assert_eq!(ok_cell.bg, theme().purple);
     }
@@ -410,7 +410,7 @@ mod tests {
             assert!(hit.y >= large.y && hit.bottom() <= large.bottom());
         }
         let bar = terminal.backend().buffer().get(large.x + 1, large.y);
-        assert_eq!(bar.bg, theme().amber, "the title bar must be solid");
+        assert_eq!(bar.bg, theme().purple, "the title bar must be solid");
     }
 
     /// Location is the containing directory, not the path in the title.
