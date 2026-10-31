@@ -4010,9 +4010,10 @@ fn media_count(count: usize, singular: &'static str, plural: &'static str,
         media_secondary(format!(" {}", if count == 1 { singular } else { plural }), theme)]
 }
 
-/// Wrap a styled value without moving its label. Every continuation has the
-/// same value-column alignment. The fallback truncation applies only to a
-/// single token wider than the entire value column.
+/// Render media values inside the Info pane. Normal panes retain a shared
+/// value column. Narrow panes use a shorter label gap when an entire value
+/// fits; otherwise the label is put above the value. Word breaks preserve
+/// status text, while a count and its noun stay on the same physical line.
 fn push_media_row(
     lines: &mut Vec<Vec<Span<'static>>>,
     label: &'static str,
@@ -4020,58 +4021,149 @@ fn push_media_row(
     content_width: usize,
     theme: super::theme::Theme,
 ) {
-    // One shared value column for every media row. The trailing space is
-    // mandatory: even the longest regular label must not touch its value.
     let prefix = format!("{}{label:<width$} ", MEDIA_INDENT, width = MEDIA_LABEL_COLUMNS);
     let prefix_width = super::display_width::width(&prefix);
     let value_width = content_width.saturating_sub(prefix_width);
-    // Keep a count with its noun ("7 files") and a first indivisible value
-    // together. In compact panes, a label and its value use separate rows.
-    let first_value_width = if values.len() >= 2
-        && values[0].content.chars().all(|c| c.is_ascii_digit()) {
-        values.iter().take(2).map(|span|
-            super::display_width::width(span.content.as_ref())).sum()
-    } else {
-        values.first().map_or(0, |span|
-            super::display_width::width(span.content.as_ref()))
+    let width_of = |span: &Span<'static>| super::display_width::width(span.content.as_ref());
+    let total_value_width: usize = values.iter().map(width_of).sum();
+    // A number and its noun are one semantic value, not two wrap points.
+    let is_count_noun = |count: &Span<'static>, noun: &Span<'static>| {
+        !count.content.is_empty()
+            && count.content.chars().all(|c| c.is_ascii_digit())
+            && noun.content.starts_with(' ')
+            && noun.content.trim().chars().all(|c| c.is_ascii_alphabetic() || c == ' ')
     };
-    let compact = content_width < prefix_width.saturating_add(4)
-        || (!label.is_empty() && first_value_width > value_width);
+    let first_value_width = values.first().map_or(0, width_of);
+    let widest_count_noun = values.windows(2)
+        .filter(|pair| is_count_noun(&pair[0], &pair[1]))
+        .map(|pair| width_of(&pair[0]) + width_of(&pair[1]))
+        .max().unwrap_or(0);
+    let widest_value = first_value_width.max(widest_count_noun);
+
+    // At width 22, "Modified  1970-01-01" fits on one line even though
+    // the normal 12-column grid does not. Do not make Contents or Audio
+    // harder to read by forcing their long values onto that short line.
+    let tight_prefix = format!("{}{label}  ", MEDIA_INDENT);
+    let tight_width = super::display_width::width(&tight_prefix);
+    let tight = !label.is_empty() && widest_value > value_width
+        && tight_width <= content_width
+        && total_value_width <= content_width - tight_width;
+    let compact = !tight && (content_width < prefix_width.saturating_add(4)
+        || widest_value > value_width);
     if compact && !label.is_empty() {
         lines.push(vec![Span::raw(MEDIA_INDENT), Span::styled(
             truncate_to(label, content_width.saturating_sub(MEDIA_INDENT.len())), theme.muted())]);
     }
+    let row_prefix = if compact { MEDIA_INDENT.to_string() }
+        else if tight { tight_prefix } else { prefix };
+    let row_prefix_width = super::display_width::width(&row_prefix);
+    // Continuations belong to the current field, not a new labelled field.
+    // Preserve the value column in inline layouts and the compact indent.
     let continuation_prefix = if compact { MEDIA_INDENT.to_string() }
-        else { " ".repeat(prefix_width) };
-    let mut row = if compact {
-        vec![Span::raw(continuation_prefix.clone())]
-    } else {
-        vec![Span::styled(prefix, theme.muted())]
-    };
-    let available = if compact { content_width.saturating_sub(MEDIA_INDENT.len()) }
-        else { value_width };
+        else { " ".repeat(row_prefix_width) };
+    let available = content_width.saturating_sub(row_prefix_width);
+    let mut row = vec![Span::styled(row_prefix.clone(), theme.muted())];
     let mut used = 0usize;
-    for span in values {
-        let mut content = span.content.into_owned();
-        if content.trim().is_empty() && used == 0 { continue; }
-        let mut width = super::display_width::width(&content);
-        if used > 0 && used.saturating_add(width) > available {
+
+    // Group adjacent count/noun spans without losing their separate styles.
+    let mut segments: Vec<Vec<Span<'static>>> = Vec::with_capacity(values.len());
+    let mut iter = values.into_iter().peekable();
+    while let Some(span) = iter.next() {
+        if iter.peek().is_some_and(|noun| is_count_noun(&span, noun)) {
+            segments.push(vec![span, iter.next().expect("peeked count noun")]);
+        } else {
+            segments.push(vec![span]);
+        }
+    }
+    for (index, segment) in segments.iter().enumerate() {
+        let segment_width: usize = segment.iter().map(width_of).sum();
+        let separator = segment.len() == 1
+            && matches!(segment[0].content.trim(), "·" | "/");
+        if separator {
+            let next_width = segments.get(index + 1).map_or(0, |next|
+                next.iter().map(width_of).sum::<usize>());
+            if used == 0 || next_width == 0
+                || used + segment_width + next_width > available {
+                // A separator belongs between complete values, never at the
+                // end of one row or the beginning of the next.
+                continue;
+            }
+        }
+        if used > 0 && used + segment_width > available {
             lines.push(row);
-            row = vec![Span::raw(continuation_prefix.clone())];
+            row = vec![Span::styled(continuation_prefix.clone(), theme.muted())];
             used = 0;
         }
-        if used == 0 {
-            // Leading inter-part separators are not useful on a wrapped row.
-            if content.starts_with(" · ") { content = content[3..].to_owned(); }
-            width = super::display_width::width(&content);
+        if segment_width <= available {
+            for span in segment {
+                let text = if used == 0 {
+                    let text = span.content.trim_start();
+                    text.strip_prefix("· ").or_else(|| text.strip_prefix("/ "))
+                        .unwrap_or(text)
+                } else { span.content.as_ref() };
+                used += super::display_width::width(text);
+                row.push(Span::styled(text.to_owned(), span.style));
+            }
+            continue;
         }
-        let remaining = available.saturating_sub(used);
-        if width > remaining {
-            content = truncate_to(&content, remaining);
-            width = super::display_width::width(&content);
+        // A single long styled status/description may contain several words.
+        // Reflow at whitespace rather than permanently truncating its tail.
+        // Only a word wider than the complete value row needs ellipsis.
+        for span in segment {
+            let mut rest = span.content.as_ref().to_owned();
+            loop {
+                if used == 0 {
+                    let text = rest.trim_start();
+                    rest = text.strip_prefix("· ").or_else(|| text.strip_prefix("/ "))
+                        .unwrap_or(text).to_owned();
+                }
+                if rest.is_empty() { break; }
+                let remaining = available.saturating_sub(used);
+                let width = super::display_width::width(&rest);
+                if width <= remaining {
+                    row.push(Span::styled(rest, span.style));
+                    used += width;
+                    break;
+                }
+                let mut columns = 0usize;
+                let mut break_at = None;
+                for (byte, ch) in rest.char_indices() {
+                    if byte > 0 && ch.is_whitespace() && columns <= remaining {
+                        break_at = Some(byte);
+                    }
+                    columns += super::display_width::char_width(ch);
+                    if columns > remaining { break; }
+                }
+                let break_at = break_at.filter(|byte| !rest[*byte..].trim().is_empty()
+                    && super::display_width::width(rest[..*byte].trim_end()) <= remaining);
+                if let Some(byte) = break_at {
+                    let head = rest[..byte].trim_end();
+                    if !head.is_empty() {
+                        row.push(Span::styled(head.to_owned(), span.style));
+                    }
+                    lines.push(row);
+                    row = vec![Span::styled(continuation_prefix.clone(), theme.muted())];
+                    used = 0;
+                    rest = rest[byte..].trim_start().to_owned();
+                } else if used > 0 {
+                    lines.push(row);
+                    row = vec![Span::styled(continuation_prefix.clone(), theme.muted())];
+                    used = 0;
+                } else {
+                    // The first word itself exceeds a complete value row.
+                    // Abbreviate that word only; later words still get rows.
+                    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+                    let head = truncate_to(&rest[..end], available);
+                    used = super::display_width::width(&head);
+                    row.push(Span::styled(head, span.style));
+                    if rest[end..].trim().is_empty() { break; }
+                    rest = rest[end..].trim_start().to_owned();
+                    lines.push(row);
+                    row = vec![Span::styled(continuation_prefix.clone(), theme.muted())];
+                    used = 0;
+                }
+            }
         }
-        row.push(Span::styled(content, span.style));
-        used += width;
     }
     lines.push(row);
 }
@@ -4159,7 +4251,7 @@ fn media_header_descriptor(
         || classification.is_some_and(|c| c.units.iter().any(|u|
             u.path.extension().and_then(|s| s.to_str())
                 .is_some_and(|s| s.eq_ignore_ascii_case("iso"))));
-    if is_iso { description.push_str(" · ISO"); }
+    if is_iso && !disc_kind.eq_ignore_ascii_case("ISO") { description.push_str(" · ISO"); }
     description
 }
 
@@ -4582,11 +4674,23 @@ fn push_media_folder_layout(
             }
             push_media_row(lines, "Discs", media_count(classification.unit_count,
                 "disc", "discs", theme), content_width, theme);
-            for unit in classification.units.iter().take(6) {
+            // Filesystem enumeration order is unspecified. Sort the small
+            // presentation list, not the cached classification or the scanner.
+            let mut units = classification.units.iter().collect::<Vec<_>>();
+            units.sort_by_cached_key(|unit| (unit.name.to_lowercase(), unit.path.clone()));
+            for unit in units.iter().take(6) {
+                // A direct child ISO should be shown by its real filename;
+                // an ISO inside "Disc 1/" retains that directory's unit name.
+                let display_name = if unit.path.parent() == Some(entry_path)
+                    && unit.path.extension().and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("iso")) {
+                    unit.path.file_name().and_then(|name| name.to_str())
+                        .unwrap_or(&unit.name)
+                } else { &unit.name };
                 let description = if let Some(marker) = unit.disc_marker {
-                    format!("{} · {}", unit.name, marker.label())
+                    format!("{display_name} · {}", marker.label())
                 } else {
-                    format!("{} · {} {}", unit.name, unit.audio.track_count,
+                    format!("{display_name} · {} {}", unit.audio.track_count,
                         if unit.audio.track_count == 1 { "track" } else { "tracks" })
                 };
                 push_media_row(lines, "", vec![media_secondary(description, theme)], content_width, theme);
@@ -5993,14 +6097,18 @@ mod folder_classification_info_pane_tests {
         std::fs::write(root.join("Disc 2.iso"), b"").expect("disc 2 fixture");
         let entry = BrowseEntry::new(root.to_path_buf(), "Album".into(),
             EntryKind::Directory, 0, None);
-        let classification = crate::tui::browse::classify_folder_content_blocking(
+        let mut classification = crate::tui::browse::classify_folder_content_blocking(
             root, ProbeCacheIdentity::from_entry(&entry));
         assert_eq!(classification.kind, FolderClassificationKind::MultiDisc);
         assert_eq!(classification.audio.track_count, 0);
+        classification.units.reverse(); // Deliberately non-directory order.
         let (rendered, _) = render_classification(entry, classification);
         assert!(!rendered.contains("multi-disc album"), "{rendered}");
         assert!(rendered.contains("Discs") && rendered.contains("2"), "{rendered}");
-        assert!(rendered.contains("Disc 1.iso · ISO") && rendered.contains("Disc 2.iso · ISO"), "{rendered}");
+        let first = rendered.find("Disc 1.iso · ISO").expect(&rendered);
+        let second = rendered.find("Disc 2.iso · ISO").expect(&rendered);
+        assert!(first < second, "ISO unit order: {rendered}");
+        assert!(!rendered.contains("ISO · ISO"), "redundant ISO descriptor: {rendered}");
         assert!(!rendered.contains("Tracks") && !rendered.contains("0 tracks"), "{rendered}");
     }
 
@@ -6013,15 +6121,37 @@ mod folder_classification_info_pane_tests {
         std::fs::write(root.join("Disc 2.iso"), b"").expect("disc 2 image");
         let entry = BrowseEntry::new(root.to_path_buf(), "Album".into(),
             EntryKind::Directory, 0, None);
-        let classification = crate::tui::browse::classify_folder_content_blocking(
+        let mut classification = crate::tui::browse::classify_folder_content_blocking(
             root, ProbeCacheIdentity::from_entry(&entry));
         assert_eq!(classification.kind, FolderClassificationKind::MultiDisc);
         assert_eq!(classification.audio.track_count, 1);
+        classification.units.reverse(); // Mixed unit kinds must sort equally.
         let (rendered, _) = render_classification(entry, classification);
         assert!(rendered.contains("Audio files") && rendered.contains("1 file"), "{rendered}");
-        assert!(rendered.contains("Disc 1 · 1 track") && rendered.contains("Disc 2.iso · ISO"), "{rendered}");
+        let first = rendered.find("Disc 1 · 1 track").expect(&rendered);
+        let second = rendered.find("Disc 2.iso · ISO").expect(&rendered);
+        assert!(first < second, "mixed unit order: {rendered}");
         assert!(rendered.contains("Discs") && rendered.contains("2"), "{rendered}");
         assert!(!rendered.contains("Tracks") && !rendered.contains("1 tracks"), "{rendered}");
+    }
+
+    #[test]
+    fn nested_iso_multidisc_uses_the_disc_directory_names() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for n in 1..=2 {
+            let folder = temp.path().join(format!("Disc {n}"));
+            std::fs::create_dir(&folder).expect("disc directory");
+            std::fs::write(folder.join("media.iso"), b"").expect("disc image");
+        }
+        let entry = BrowseEntry::new(temp.path().to_path_buf(), "Album".into(),
+            EntryKind::Directory, 0, None);
+        let classification = crate::tui::browse::classify_folder_content_blocking(
+            temp.path(), ProbeCacheIdentity::from_entry(&entry));
+        assert_eq!(classification.kind, FolderClassificationKind::MultiDisc);
+        let (rendered, _) = render_classification(entry, classification);
+        assert!(rendered.contains("Disc 1 · ISO") && rendered.contains("Disc 2 · ISO"),
+            "{rendered}");
+        assert!(!rendered.contains("media.iso · ISO"), "{rendered}");
     }
 
     #[test]
@@ -6121,7 +6251,14 @@ mod folder_classification_info_pane_tests {
 
         let (rendered, _) = render_classification(entry, classification);
 
-        assert!(rendered.contains("Kind    directory"));
+        let kind = rendered.lines().find(|row| row.contains("Kind"))
+            .expect("Kind row");
+        let folders = rendered.lines().find(|row| row.contains("Folders"))
+            .expect("Folders row");
+        assert_eq!(kind.find("directory"), folders.find("unknown"),
+            "Kind and counted metrics share the same value column: {rendered}");
+        assert!(rendered.starts_with(" artist\n\n\n\n"),
+            "keep the header stationary across lazy classification: {rendered}");
         assert!(!rendered.contains("collection · 24 albums"));
         assert!(!rendered.contains("probing..."));
         assert!(!rendered.contains("streams:"));
@@ -6876,12 +7013,130 @@ mod folder_classification_info_pane_tests {
             assert_eq!(rows[0].iter().map(|s| s.content.as_ref())
                 .collect::<String>(), " Protection");
             assert_eq!(rows[1][0].content.as_ref(), MEDIA_INDENT);
-            assert_eq!(rows.len(), 2, "width={width}: {rows:?}");
+            assert!(rows.len() >= 2, "width={width}: {rows:?}");
+            assert!(rows.iter().skip(1).any(|row| row.iter()
+                .any(|span| span.content.contains("CPPM"))));
             for row in rows {
                 let painted = row.iter().map(|s|
                     super::super::display_width::width(s.content.as_ref())).sum::<usize>();
                 assert!(painted <= width, "width={width}, painted={painted}");
             }
+        }
+    }
+
+    #[test]
+    fn narrow_media_rows_keep_status_and_count_units_without_orphaning_the_date() {
+        let mut lines = Vec::new();
+        push_media_row(&mut lines, "Audio", vec![
+            media_secondary("disc metadata not cached", theme()),
+        ], 22, theme());
+        let status = lines.iter().map(|row| row.iter()
+            .map(|span| span.content.as_ref()).collect::<String>())
+            .map(|row| row.trim().to_string()).collect::<Vec<_>>().join(" ");
+        assert!(status.contains("disc metadata not cached"), "{status}");
+        assert!(!status.contains('…'), "status was truncated: {status}");
+
+        lines.clear();
+        let mut contents = media_count(12, "file", "files", theme());
+        contents.push(media_secondary(" · ", theme()));
+        contents.extend(media_count(2, "folder", "folders", theme()));
+        push_media_row(&mut lines, "Contents", contents, 22, theme());
+        let rows = lines.iter().map(|row| row.iter()
+            .map(|span| span.content.as_ref()).collect::<String>())
+            .collect::<Vec<_>>();
+        assert_eq!(rows, vec![" Contents".to_string(),
+            " 12 files · 2 folders".to_string()], "{rows:?}");
+
+        lines.clear();
+        push_media_row(&mut lines, "Modified", vec![
+            media_accent("1970-01-01", theme()),
+        ], 22, theme());
+        assert_eq!(lines.len(), 1, "date should fit with its label: {lines:?}");
+        assert!(lines[0].iter().map(|span| span.content.as_ref())
+            .collect::<String>().contains("Modified  1970-01-01"));
+        for row in lines {
+            let width = row.iter().map(|span| super::super::display_width::width(
+                span.content.as_ref())).sum::<usize>();
+            assert!(width <= 22, "date row width {width}");
+        }
+    }
+
+    #[test]
+    fn wrapped_audio_count_keeps_a_single_label_and_both_values() {
+        let mut values = media_count(64, "track", "tracks", theme());
+        values.push(media_secondary(" · ", theme()));
+        values.extend(media_count(12, "stream", "streams", theme()));
+        let mut rows = Vec::new();
+        push_media_row(&mut rows, "Audio", values, 24, theme());
+        let painted = rows.iter().map(|row| row.iter()
+            .map(|span| span.content.as_ref()).collect::<String>()).collect::<Vec<_>>();
+        assert_eq!(painted, vec![" Audio        64 tracks".to_string(),
+            "              12 streams".to_string()], "{painted:?}");
+        assert_eq!(rows[0][0].content.trim(), "Audio");
+        assert!(rows[1][0].content.trim().is_empty());
+        assert_eq!(super::super::display_width::width(rows[1][0].content.as_ref()), 14);
+        for row in &rows {
+            let painted_width = row.iter().map(|span|
+                super::super::display_width::width(span.content.as_ref())).sum::<usize>();
+            assert!(painted_width <= 24, "{painted:?}");
+        }
+    }
+
+    #[test]
+    fn compact_cached_bluray_iso_keeps_wrapped_audio_stream_count() {
+        let temp = tempfile::tempdir().unwrap();
+        let iso = temp.path().join("movie.iso");
+        std::fs::write(&iso, b"disc fingerprint").unwrap();
+        let metadata = std::fs::metadata(&iso).unwrap();
+        let entry = BrowseEntry::new(iso.clone(), "movie.iso".into(),
+            EntryKind::BlurayIso, metadata.len(), metadata.modified().ok());
+        let mut browse = BrowseState::new();
+        browse.entries = vec![entry.clone()];
+        browse.selected_index = 0;
+        let mut contents = disc_contents(iso.clone());
+        // Twelve distinct presentations with 64 tracks in total.
+        contents.presentations = (1..=12).map(|index| {
+            let mut p = disc_presentation(index, "LPCM", 2, "stereo");
+            p.tracks = vec![p.tracks[0].clone(); if index <= 4 { 6 } else { 5 }];
+            p
+        }).collect();
+        let fingerprint = disc_probe_fingerprint(&iso).unwrap();
+        browse.disc_probe_cache.insert(iso.clone(),
+            DiscProbeCacheEntry::from_success(fingerprint, contents));
+        let accounting = crate::directory_accounting::AccountingService::new(None);
+        let full = entry_info_lines(&entry, &browse, &accounting, 24,
+            false, false, false, false, None, None, theme());
+        let compact = compact_media_info(full, 8);
+        let rows = reference_rows(&compact);
+        let audio_row = rows.iter().position(|row| row.trim_start().starts_with("Audio"))
+            .expect("Audio row survives compaction");
+        assert!(rows[audio_row].contains("64 tracks"), "{rows:?}");
+        assert_eq!(rows.get(audio_row + 1).map(String::as_str),
+            Some("              12 streams"), "{rows:?}");
+        assert_eq!(rows.iter().filter(|row| row.trim_start().starts_with("Audio")).count(), 1);
+        assert!(compact.audio_streams_pill_row.is_some(), "Streams control survives");
+    }
+
+    #[test]
+    fn wrapped_flac_format_continuations_align_without_repeating_label() {
+        let mut rows = Vec::new();
+        push_media_row(&mut rows, "Format", vec![
+            media_accent("FLAC", theme()), media_secondary(" · ", theme()),
+            media_accent("24-bit", theme()), media_secondary(" / ", theme()),
+            media_accent("96 kHz", theme()), media_secondary(" · ", theme()),
+            media_accent("stereo", theme()),
+        ], 34, theme());
+        let painted = rows.iter().map(|row| row.iter()
+            .map(|span| span.content.as_ref()).collect::<String>()).collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2, "{painted:?}");
+        assert_eq!(rows[0][0].content.trim(), "Format");
+        assert_eq!(rows[1][0].content.as_ref(), "              ");
+        assert_eq!(painted[1], "              stereo");
+        assert_eq!(painted.iter().filter(|row| row.contains("Format")).count(), 1);
+        for row in &rows {
+            let painted_width = row.iter().map(|span|
+                super::super::display_width::width(span.content.as_ref())).sum::<usize>();
+            assert!(painted_width <= 34, "{painted:?}");
         }
     }
 
@@ -8620,7 +8875,14 @@ mod directory_info_presentation_tests {
             example_classification(&entry, FolderClassificationKind::Disc));
         let full = entry_info_lines(&entry, &app.browse, &app.directory_accounting,
             22, false, false, false, false, None, None, theme());
-        assert!(flatten_lines(&full).iter().any(|row| row.contains("disc metadata not cached")));
+        let full_rows = flatten_lines(&full);
+        assert!(full_rows.iter().map(|row| row.trim())
+            .collect::<Vec<_>>().join(" ").contains("disc metadata not cached"),
+            "status must survive whitespace wrapping: {full_rows:?}");
+        assert!(full_rows.iter().any(|row| row.contains("12 files · 2 folders")),
+            "count+noun rows must not split: {full_rows:?}");
+        assert!(full_rows.iter().any(|row| row.contains("Modified  1970-01-01")),
+            "narrow date should fit on one row: {full_rows:?}");
         let compact = compact_media_info(full, 6);
         let rows = flatten_lines(&compact);
         assert!(rows.iter().any(|row| row.contains("Audio")), "{rows:?}");
