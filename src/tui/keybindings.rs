@@ -72059,7 +72059,11 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
         let clicked_button = app.button_map.find_button_at(mouse.column, mouse.row);
         if !clicked_button.is_some_and(is_browse_options_menu_button) {
             app.browse.close_options_menu();
-            return;
+            // Switching from Options to the adjacent New dropdown takes one
+            // click; other outside clicks retain their existing dismissal.
+            if clicked_button != Some(TuiButton::BrowseToolbarNew) {
+                return;
+            }
         }
         if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             return;
@@ -73056,6 +73060,20 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 app.bookmarks.close_dropdown();
                 app.browse.toggle_options_menu();
                 ensure_options_menu_highlight(app);
+            }
+            TuiButton::BrowseToolbarNew => {
+                app.browse.close_options_menu();
+                app.bookmarks.close_dropdown();
+                app.browse_context_action_paths = None;
+                if let Some(anchor) = app.button_map.button_rect(TuiButton::BrowseToolbarNew) {
+                    app.active_overlay = ActiveOverlay::ContextMenu {
+                        levels: vec![super::context_menu::MenuLevel::new(
+                            super::context_menu::browse_new_items(),
+                        )],
+                        origin: (anchor.x, anchor.bottom()),
+                        anchor_bottom: false,
+                    };
+                }
             }
             TuiButton::BrowseToolbarSearch => {
                 open_browse_search(app);
@@ -115544,5 +115562,114 @@ mod r33_metadata_authority_regressions {
         let state = super::phase4_tests::single_image_unified_cue_state(vec![], 2);
         let sheet = state.active_surface().cue_album_synthetic_sheet.as_ref().unwrap();
         assert_eq!(cue_album_one_track_per_file_slot_map(sheet, &[0, 1]), None);
+    }
+}
+
+#[cfg(test)]
+mod browse_new_toolbar_interaction_tests {
+    use super::*;
+
+    fn left_click(app: &mut AppState, x: u16, y: u16, tx: &mpsc::Sender<AppMessage>) {
+        handle_mouse(app, MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        }, tx);
+    }
+
+    #[test]
+    fn new_toolbar_menu_runs_both_existing_create_actions_in_current_folder() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let selected = temp.path().join("not-the-destination");
+        std::fs::create_dir(&selected).expect("selected directory");
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
+            selected.clone(), "not-the-destination".into(),
+            crate::convert::classify::EntryKind::Directory, 0, None,
+        )];
+        app.browse.selected_index = 0;
+        app.button_map.record_button(
+            TuiButton::BrowseToolbarNew, Rect::new(46, 8, 7, 1),
+        );
+        let (tx, _rx) = mpsc::channel(8);
+
+        // A click on New while Options is open must switch dropdowns
+        // immediately instead of consuming the first click as dismissal.
+        app.browse.options_menu = BrowseOptionsMenu::Root;
+        left_click(&mut app, 49, 8, &tx);
+        assert_eq!(app.browse.options_menu, BrowseOptionsMenu::Closed);
+        let ActiveOverlay::ContextMenu { levels, origin, .. } = &app.active_overlay else {
+            panic!("New button must open the existing context-menu surface");
+        };
+        assert_eq!(*origin, (46, 9));
+        let (rects, _) = context_menu_stack_rects_anchored(levels, *origin, 80, 24, false);
+        let panel = rects[0];
+        assert_eq!(panel.y, 9);
+        assert_eq!(context_menu_hit_test(&levels[0].entries, panel, panel.x + 1, panel.y + 1), Some(0));
+        assert_eq!(context_menu_hit_test(&levels[0].entries, panel, panel.x + 1, panel.y + 2), Some(1));
+        assert!(matches!(levels[0].entries.as_slice(), [
+            super::super::context_menu::ContextMenuEntry::Item(
+                super::super::context_menu::ContextMenuItem {
+                    action: super::super::context_menu::ContextAction::NewFile, ..
+                }
+            ),
+            super::super::context_menu::ContextMenuEntry::Item(
+                super::super::context_menu::ContextMenuItem {
+                    action: super::super::context_menu::ContextAction::NewFolder, ..
+                }
+            ),
+        ]));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        assert!(matches!(app.browse_inline_edit.as_ref().map(|edit| &edit.target),
+            Some(BrowseInlineEditTarget::Create { dir, kind: BrowseCreateKind::File })
+                if dir.as_path() == temp.path()));
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
+        assert!(commit_browse_create(
+            &mut app,
+            temp.path().to_path_buf(),
+            BrowseCreateKind::File,
+            "created-from-new.txt",
+            &tx,
+        ));
+        assert!(temp.path().join("created-from-new.txt").is_file());
+        assert!(!selected.join("created-from-new.txt").exists());
+
+        // Reopen, choose Folder with the normal keyboard navigation.
+        app.browse_inline_edit = None;
+        left_click(&mut app, 49, 8, &tx);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &tx);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        assert!(matches!(app.browse_inline_edit.as_ref().map(|edit| &edit.target),
+            Some(BrowseInlineEditTarget::Create { dir, kind: BrowseCreateKind::Folder })
+                if dir.as_path() == temp.path()));
+    }
+
+    #[test]
+    fn entry_context_new_file_creates_in_browsed_folder_not_selected_child() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let child = temp.path().join("selected-child");
+        std::fs::create_dir(&child).expect("child");
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
+            child, "selected-child".into(),
+            crate::convert::classify::EntryKind::Directory, 0, None,
+        )];
+        app.button_map.record_button(TuiButton::BrowseList, Rect::new(2, 2, 40, 12));
+        app.button_map.record_button(TuiButton::BrowseEntry(0), Rect::new(2, 3, 40, 1));
+        let (tx, _rx) = mpsc::channel(8);
+
+        open_context_menu(&mut app, 4, 3);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        assert!(matches!(app.browse_inline_edit.as_ref().map(|edit| &edit.target),
+            Some(BrowseInlineEditTarget::Create { dir, kind: BrowseCreateKind::File })
+                if dir.as_path() == temp.path()));
+        assert!(matches!(app.active_overlay, ActiveOverlay::None));
     }
 }

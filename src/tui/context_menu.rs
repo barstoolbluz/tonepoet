@@ -1332,10 +1332,13 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
     };
 
     if app.browse.is_in_archive() {
-        return build_archive_browse_entry_menu(entry);
+        let mut items = build_archive_browse_entry_menu(entry);
+        items.insert(0, separator());
+        items.insert(0, build_browse_new_submenu());
+        return items;
     }
 
-    let mut items = Vec::new();
+    let mut items = vec![build_browse_new_submenu(), separator()];
     let effective_kind = effective_browse_context_entry_kind(&entry.kind, &entry.path);
     // Properties applies to any real filesystem entry, including generic files.
     // Keep archive-internal (synthetic) paths on their existing metadata menu.
@@ -1831,16 +1834,26 @@ pub fn build_editor_context_menu(app: &AppState) -> Vec<ContextMenuEntry> {
     ]
 }
 
+/// These actions always target the directory being browsed, not a selected
+/// entry. Share them between the toolbar dropdown and list context menus.
+pub(super) fn browse_new_items() -> Vec<ContextMenuEntry> {
+    vec![
+        item("File", ContextAction::NewFile),
+        item("Folder", ContextAction::NewFolder),
+    ]
+}
+
+fn build_browse_new_submenu() -> ContextMenuEntry {
+    ContextMenuEntry::Submenu {
+        label: "New".to_string(),
+        children: browse_new_items(),
+    }
+}
+
 /// Build the context menu for a right-click on empty space in the browse list.
 pub fn build_browse_empty_menu(_app: &AppState) -> Vec<ContextMenuEntry> {
     vec![
-        ContextMenuEntry::Submenu {
-            label: "New".to_string(),
-            children: vec![
-                item("File", ContextAction::NewFile),
-                item("Folder", ContextAction::NewFolder),
-            ],
-        },
+        build_browse_new_submenu(),
         build_select_submenu(false),
         item_enabled(
             "Paste",
@@ -5039,6 +5052,51 @@ pub(super) fn launch_single_image_gnudb(
             paths: paths_for_editor,
         }
     });
+}
+
+#[cfg(test)]
+mod browse_new_entry_menu_tests {
+    use super::*;
+
+    fn assert_new_submenu(entries: &[ContextMenuEntry]) {
+        let ContextMenuEntry::Submenu { label, children } = &entries[0] else {
+            panic!("New should be the first entry submenu");
+        };
+        assert_eq!(label, "New");
+        assert!(matches!(children.as_slice(), [
+            ContextMenuEntry::Item(ContextMenuItem { action: ContextAction::NewFile, .. }),
+            ContextMenuEntry::Item(ContextMenuItem { action: ContextAction::NewFolder, .. }),
+        ]));
+    }
+
+    #[test]
+    fn browse_list_entry_menus_offer_new_for_files_folders_and_parent_row() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let folder = temp.path().join("selected-child");
+        std::fs::create_dir(&folder).expect("selected child folder");
+        let file = temp.path().join("selected.txt");
+        std::fs::write(&file, b"selected file").expect("selected file");
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.current_screen = crate::tui::app::AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+
+        for (path, name, kind) in [
+            (file, "selected.txt", EntryKind::OtherFile),
+            (folder, "selected-child", EntryKind::Directory),
+            (temp.path().parent().unwrap().to_path_buf(), "..", EntryKind::ParentDir),
+        ] {
+            app.browse.entries = vec![BrowseEntry::new(
+                path, name.to_string(), kind, 0, None,
+            )];
+            app.browse.selected_index = 0;
+            assert_new_submenu(&build_browse_entry_menu(&app));
+        }
+        assert_new_submenu(&build_browse_empty_menu(&app));
+        assert!(matches!(browse_new_items().as_slice(), [
+            ContextMenuEntry::Item(ContextMenuItem { action: ContextAction::NewFile, .. }),
+            ContextMenuEntry::Item(ContextMenuItem { action: ContextAction::NewFolder, .. }),
+        ]));
+    }
 }
 
 /// Resolve whether a convert action should start processing.

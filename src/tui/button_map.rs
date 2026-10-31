@@ -313,6 +313,7 @@ pub enum TuiButton {
     BrowseToolbarUp,
     BrowseToolbarRefresh,
     BrowseToolbarOptions,
+    BrowseToolbarNew,
     BrowseToolbarSearch,
     BrowseToolbarShowHidden,
     BrowsePathGo,
@@ -730,6 +731,7 @@ impl TuiButton {
             | Self::BrowseToolbarUp
             | Self::BrowseToolbarRefresh
             | Self::BrowseToolbarOptions
+            | Self::BrowseToolbarNew
             | Self::BrowseToolbarSearch
             | Self::BrowseToolbarShowHidden
             | Self::BrowsePathGo

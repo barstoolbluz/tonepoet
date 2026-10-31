@@ -85,6 +85,9 @@ fn help_content(screen: AppScreen) -> Vec<HelpSection> {
                 title: "File Operations",
                 entries: vec![
                     (":context", "Context menu (right-click)"),
+                    ("New ▾", "Browse toolbar: create a file or folder in the current directory"),
+                    (":new-file [name]", "Create a file in the current directory"),
+                    (":new-folder [name]", "Create a folder in the current directory"),
                     ("Ctrl+P", "Filesystem Properties (files and folders)"),
                     ("Ctrl+Shift+P", "Paste filesystem clipboard"),
                     ("Alt+P", "Metadata editor (existing mapping)"),
@@ -312,6 +315,15 @@ mod tests {
             .into_iter()
             .flat_map(|section| section.entries.into_iter())
             .collect()
+    }
+
+    #[test]
+    fn browse_help_documents_visible_new_and_both_create_commands() {
+        let entries = rendered_help_pairs(AppScreen::Browse);
+        for label in ["New ▾", ":new-file [name]", ":new-folder [name]"] {
+            assert!(entries.iter().any(|(key, _)| *key == label),
+                "Browse help must document {label}");
+        }
     }
 
     #[test]
