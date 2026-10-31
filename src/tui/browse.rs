@@ -208,6 +208,8 @@ use crate::tui::text_input::TextInputState;
 pub struct CachedInfo {
     pub source: SourceInfo,
     pub metadata: SourceMetadata,
+    /// Present only for an in-memory, Browse-only VOB/M2TS preview.
+    pub transport: Option<crate::tui::probe::TransportStreamSummary>,
 }
 
 impl CachedInfo {
@@ -217,7 +219,7 @@ impl CachedInfo {
                 metadata.preemphasis_metadata.take(),
                 &source,
             );
-        Self { source, metadata }
+        Self { source, metadata, transport: None }
     }
 
     fn apply_preemphasis_source_gate(&mut self) {
@@ -1890,6 +1892,14 @@ fn windows_reparse_point(metadata: &fs::Metadata) -> bool {
 #[cfg(not(windows))]
 fn windows_reparse_point(_metadata: &fs::Metadata) -> bool { false }
 
+/// A media-transport preview must not change queue or format classification.
+/// Accept these two known container suffixes only, case-insensitively.
+fn is_video_transport_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("vob") || ext.eq_ignore_ascii_case("m2ts"))
+}
+
 /// A single entry in the browse listing
 #[derive(Debug, Clone)]
 pub struct BrowseEntry {
@@ -2029,16 +2039,23 @@ impl BrowseEntry {
         self.kind.is_disc_source()
     }
 
-    /// Probe-pipeline gate: entries this returns `true` for produce
-    /// a `SourceInfo` + `SourceMetadata` pair via `probe_audio` +
-    /// `read_metadata`, which routes SACDs to their ScarletBook/
-    /// sidecar-aware variants. Distinct from `is_audio()`, which
+    /// Individual DVD VOB and Blu-ray M2TS files are previewable media, but
+    /// they are not conversion-queue audio inputs or disc roots. Keep this
+    /// Browse-only exception out of the shared extension classifier.
+    pub fn is_video_transport_file(&self) -> bool {
+        matches!(self.kind, EntryKind::OtherFile) && is_video_transport_path(&self.path)
+    }
+
+    /// Probe-cache/Info pane gate. Ordinary audio and disc sources produce
+    /// `SourceInfo` with their usual metadata enrichment; video transport
+    /// files receive a bounded video-and-audio inventory with empty tag metadata.
+    /// Distinct from `is_audio()`, which
     /// gates per-file lofty tag operations (`:edit-tags`, lofty
     /// save) — SACDs use a different write path. Use this for
     /// probe-cache and InfoPane decisions; use `is_audio()` for
     /// lofty-specific feature gates.
     pub fn is_probeable(&self) -> bool {
-        self.is_audio() || self.is_disc_source()
+        self.is_audio() || self.is_disc_source() || self.is_video_transport_file()
     }
 
     /// Short type/format label for display in the type column.
@@ -8985,6 +9002,11 @@ impl BrowseState {
             .map(|info| info.source.duration_secs)
     }
 
+    /// Look up cached probe info for a path (used by the Browse Info album header).
+    pub fn probe_info_for_path(&self, path: &Path) -> Option<&CachedInfo> {
+        self.probe_cache.get(path).and_then(|cached| cached.info.as_deref())
+    }
+
     /// enrichment metadata and transient retry backoff. This is the canonical
     /// invalidation path for identity-bound probe state.
     /// Test-only: insert a probe result directly into the cache without
@@ -10537,6 +10559,11 @@ impl BrowseState {
         if !self.probe_cache_needs_metadata_enrichment.remove(path) {
             return;
         }
+        // A VOB/M2TS preview has no Lofty tag stage. DB cache warm-ups must
+        // not schedule a second irrelevant metadata read for this source.
+        if is_video_transport_path(path) {
+            return;
+        }
         if self.probe_pending.contains(path) {
             return;
         }
@@ -10710,7 +10737,7 @@ impl BrowseState {
             // movement key through a long album from issuing hundreds of DB
             // point lookups while still allowing a focused row to avoid an
             // ffmpeg probe when a valid persistent row exists.
-            if let Some(db) = db {
+            if let Some(db) = db.filter(|_| !entry.is_video_transport_file()) {
                 if let Some(mtime) = identity.modified {
                     let mtime_unix = crate::db::systemtime_to_unix(mtime);
                     if let Some(row) = db.get_cached_probe(
@@ -10747,7 +10774,9 @@ impl BrowseState {
         tx: tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>,
     ) {
         let mut candidates = Vec::new();
-        for entry in self.all_files.iter().filter(|entry| entry.is_probeable()) {
+        for entry in self.all_files.iter()
+            .filter(|entry| entry.is_probeable() && !entry.is_video_transport_file())
+        {
             let identity = ProbeCacheIdentity::from_entry(entry);
             if self.has_probe_cache_entry_for_identity(&entry.path, identity) {
                 continue;
@@ -10839,6 +10868,10 @@ impl BrowseState {
     }
 
     fn merge_probe_cache_warm_row(&mut self, row: ProbeCacheWarmRow) -> bool {
+        // Older SQLite rows cannot represent a transport stream inventory.
+        if is_video_transport_path(&row.path) {
+            return false;
+        }
         // Warm rows are consumed by the reducer during large backlog drains; do
         // not use `same_path()` here. The rows were created from scan-owned
         // paths, so exact path identity is both the stale-safe contract and the
@@ -11689,11 +11722,11 @@ async fn extract_archive_entry_to_temp(
 
 /// Spawn a background tokio task that probes the audio file at `path` and
 /// sends the result back to the main loop via `AudioProbeComplete`. The
-/// blocking probe (`probe_audio` + `read_metadata`) runs on `spawn_blocking`
-/// so it doesn't tie up an async worker thread. `read_metadata()` already
-/// performs external pre-emphasis metadata enrichment; only failed metadata
-/// reads get a single fallback PE check so successful fresh probes do not
-/// duplicate tag/CUE/catalog work.
+/// blocking probe runs on `spawn_blocking` so it doesn't tie up an async
+/// worker thread. Ordinary audio uses `probe_audio` and `read_metadata`;
+/// VOB/M2TS uses an audio-and-video stream inventory without tag enrichment.
+/// `read_metadata()` already performs external pre-emphasis metadata
+/// enrichment; only failed metadata reads get a fallback PE check.
 pub fn spawn_audio_probe(
     path: PathBuf,
     identity: ProbeCacheIdentity,
@@ -11720,6 +11753,15 @@ pub fn spawn_audio_probe(
         let result: Result<CachedInfo, String> = tokio::task::spawn_blocking(move || {
             if cancel_for_task.load(Ordering::Relaxed) {
                 return Err("audio probe cancelled".to_string());
+            }
+            if is_video_transport_path(&path_for_task) {
+                let (source, streams) = crate::tui::probe::probe_video_transport(&path_for_task)?;
+                if cancel_for_task.load(Ordering::Relaxed) {
+                    return Err("transport probe cancelled".to_owned());
+                }
+                let mut info = CachedInfo::new(source, SourceMetadata::default());
+                info.transport = Some(streams);
+                return Ok(info);
             }
             let source =
                 crate::tui::probe::probe_audio(&path_for_task).map_err(|e| format!("{}", e))?;
@@ -13010,7 +13052,7 @@ impl FolderClassifyScan {
     }
 }
 
-fn classify_folder_content_blocking(
+pub(super) fn classify_folder_content_blocking(
     path: &Path,
     identity: ProbeCacheIdentity,
 ) -> FolderContentClassification {
@@ -15701,6 +15743,7 @@ mod tests {
                 title: Some(title.to_string()),
                 ..Default::default()
             },
+            transport: None,
         }
     }
 
@@ -17989,6 +18032,25 @@ mod tests {
         assert!(!entry_with_kind(EntryKind::Archive).is_probeable());
         assert!(!entry_with_kind(EntryKind::OtherFile).is_probeable());
         assert!(!entry_with_kind(EntryKind::ParentDir).is_probeable());
+
+        for name in ["clip.vob", "CLIP.VOB", "clip.m2ts", "CLIP.M2TS"] {
+            let entry = BrowseEntry::new(
+                std::path::PathBuf::from(format!("/tmp/{name}")),
+                name.to_string(), EntryKind::OtherFile, 1024, None,
+            );
+            assert!(entry.is_video_transport_file(), "{name}");
+            assert!(entry.is_probeable(), "{name}");
+            assert!(!entry.is_audio(), "transport files must not become audio inputs");
+            assert!(!entry.is_disc_source(), "transport files are not disc roots");
+        }
+        for name in ["clip.mp4", "clip.vob.bak", "clip.txt"] {
+            let entry = BrowseEntry::new(
+                std::path::PathBuf::from(format!("/tmp/{name}")),
+                name.to_string(), EntryKind::OtherFile, 1024, None,
+            );
+            assert!(!entry.is_video_transport_file(), "{name}");
+            assert!(!entry.is_probeable(), "{name}");
+        }
     }
 
     #[test]
@@ -19347,6 +19409,7 @@ mod tests {
                         year: year.map(str::to_string),
                         ..Default::default()
                     },
+                    transport: None,
                 }),
             ),
         );

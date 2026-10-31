@@ -24,6 +24,33 @@ pub struct SourceInfo {
     pub file_size: u64,
 }
 
+/// A bounded, read-only stream inventory for Browse previews of .vob and
+/// .m2ts files. Counts cover the container; detail vectors retain only the
+/// first few streams in their native order. This is not a conversion source.
+#[derive(Debug, Clone, Default)]
+pub struct TransportStreamSummary {
+    pub video_count: usize,
+    pub audio_count: usize,
+    pub videos: Vec<TransportVideoStream>,
+    pub audios: Vec<TransportAudioStream>,
+    pub duration_secs: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct TransportVideoStream {
+    pub codec: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct TransportAudioStream {
+    pub codec: String,
+    pub sample_rate: u32,
+    pub channels: u32,
+    pub channel_layout: String,
+}
+
 /// Embedded artwork metadata read from tags. The editor deliberately keeps
 /// only compact metadata here instead of storing raw image bytes; this avoids
 /// retaining large artwork payloads in TUI state while preserving the typed
@@ -662,6 +689,113 @@ fn probe_bluray_disc(path: &Path) -> Result<SourceInfo, String> {
 fn recover_metadata_before_read(path: &Path) -> Result<(), String> {
     recover_ape_tail_before_read(path)?;
     flac_metadata_writer::recover_before_read(path)
+}
+
+/// Inspect DVD/Blu-ray transport streams without decoding media or requiring
+/// an audio stream. Called only by the existing canceled, bounded Browse
+/// background probe; there is no I/O from the Info renderer.
+///
+/// A transport preview is kept in memory rather than the ordinary audio-probe
+/// SQLite schema, which cannot represent multiple streams or video-only files.
+pub fn probe_video_transport(
+    path: &Path,
+) -> Result<(SourceInfo, TransportStreamSummary), String> {
+    const MAX_DETAILS_PER_KIND: usize = 6;
+    ensure_ffmpeg_init();
+    let input = ffmpeg_next::format::input(path)
+        .map_err(|error| format!("Failed to open '{}': {error}", path.display()))?;
+    let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let duration_secs = if input.duration() > 0 {
+        input.duration() as f64 / ffmpeg_next::ffi::AV_TIME_BASE as f64
+    } else {
+        0.0
+    };
+    let mut summary = TransportStreamSummary {
+        duration_secs,
+        ..Default::default()
+    };
+
+    for stream in input.streams() {
+        let params = stream.parameters();
+        let kind = params.medium();
+        if kind == ffmpeg_next::media::Type::Video {
+            summary.video_count = summary.video_count.saturating_add(1);
+            if summary.videos.len() < MAX_DETAILS_PER_KIND {
+                let codec_name = params.id().name();
+                let codec = match codec_name {
+                    "h264" => "H.264".to_owned(),
+                    "hevc" => "HEVC".to_owned(),
+                    "mpeg2video" => "MPEG-2".to_owned(),
+                    "vc1" => "VC-1".to_owned(),
+                    other => other.to_ascii_uppercase(),
+                };
+                let dimensions = ffmpeg_next::codec::context::Context::from_parameters(params)
+                    .ok()
+                    .and_then(|ctx| ctx.decoder().video().ok())
+                    .map(|video| (video.width(), video.height()))
+                    .unwrap_or((0, 0));
+                summary.videos.push(TransportVideoStream {
+                    codec,
+                    width: dimensions.0,
+                    height: dimensions.1,
+                });
+            }
+        } else if kind == ffmpeg_next::media::Type::Audio {
+            summary.audio_count = summary.audio_count.saturating_add(1);
+            if summary.audios.len() < MAX_DETAILS_PER_KIND {
+                let codec_name = params.id().name();
+                let codec = match codec_name {
+                    "pcm_dvd" | "pcm_bluray" => "LPCM".to_owned(),
+                    "truehd" => "Dolby TrueHD".to_owned(),
+                    "eac3" => "E-AC3".to_owned(),
+                    other => friendly_codec_name(other),
+                };
+                let (sample_rate, channels) =
+                    ffmpeg_next::codec::context::Context::from_parameters(params)
+                        .ok()
+                        .and_then(|ctx| ctx.decoder().audio().ok())
+                        .map(|audio| (audio.rate(), audio.channels() as u32))
+                        .unwrap_or((0, 0));
+                let channel_layout = match channels {
+                    1 => "mono".to_owned(),
+                    2 => "stereo".to_owned(),
+                    6 => "5.1".to_owned(),
+                    8 => "7.1".to_owned(),
+                    0 => String::new(),
+                    n => format!("{n} ch"),
+                };
+                summary.audios.push(TransportAudioStream {
+                    codec,
+                    sample_rate,
+                    channels,
+                    channel_layout,
+                });
+            }
+        }
+    }
+
+    // The ordinary Browse cache stores SourceInfo alongside optional transport
+    // details. A video-only source deliberately has zero audio channels/rate;
+    // it is never offered to Convert (the entry remains OtherFile).
+    let first_audio = summary.audios.first();
+    let source = SourceInfo {
+        format_name: if path.extension().and_then(|s| s.to_str())
+            .is_some_and(|s| s.eq_ignore_ascii_case("vob")) {
+            "DVD-Video VOB".to_owned()
+        } else {
+            "Blu-ray M2TS".to_owned()
+        },
+        codec: first_audio.map(|s| s.codec.clone()).unwrap_or_else(|| "no audio".to_owned()),
+        bit_depth: None,
+        sample_format_is_float: None,
+        compression_is_lossless: None,
+        sample_rate: first_audio.map_or(0, |s| s.sample_rate),
+        channels: first_audio.map_or(0, |s| s.channels),
+        channel_layout: first_audio.map(|s| s.channel_layout.clone()).unwrap_or_default(),
+        duration_secs,
+        file_size,
+    };
+    Ok((source, summary))
 }
 
 pub fn probe_audio(path: &Path) -> Result<SourceInfo, String> {

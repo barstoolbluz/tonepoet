@@ -1,114 +1,511 @@
-//! Adaptive read-only Folder Properties modal.
+//! Read-only filesystem Properties, matching the compact card layout.
+//! No probing, filesystem operations or database access occurs during drawing.
 use ratatui::{
     layout::{Alignment, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph}, Frame,
 };
-use super::directory_properties::FolderPropertiesState;
-use crate::directory_accounting::{AccountingService, Freshness, ScanEnd, format_bytes, format_exact};
+use super::button_map::{ButtonRenderMap, TuiButton};
+use super::directory_properties::{FolderPropertiesState, PropertiesFocus, PropertiesSubject};
+use super::theme::Theme;
+use crate::directory_accounting::{AccountingService, CachedMeasurement, DirectoryView, Freshness, ScanEnd, format_bytes, format_exact};
 
-fn date(time: Option<std::time::SystemTime>) -> String {
-    time.map(|t| {
-        let dt: chrono::DateTime<chrono::Local> = t.into();
-        dt.format("%Y-%m-%d %H:%M:%S %:z").to_string()
-    }).unwrap_or_else(|| "Unavailable on this filesystem".into())
+const CARD_WIDTH: u16 = 76;
+const CARD_HEIGHT: u16 = 17;
+const LABEL_WIDTH: usize = 11;
+
+/// Shared geometry for the renderer. Mouse actions use recorded hitboxes,
+/// never a second approximation of the popup or button positions.
+pub fn popup_rect(screen: Rect) -> Option<Rect> {
+    if screen.width < 24 || screen.height < 9 { return None; }
+    let width = screen.width.saturating_sub(2).min(CARD_WIDTH);
+    let height = screen.height.saturating_sub(2).min(CARD_HEIGHT);
+    Some(Rect::new(
+        screen.x + screen.width.saturating_sub(width) / 2,
+        screen.y + screen.height.saturating_sub(height) / 2,
+        width, height,
+    ))
 }
 
-pub fn draw(f: &mut Frame, state: &FolderPropertiesState, service: &AccountingService, theme: super::theme::Theme) {
-    let parent = f.size();
-    if parent.width < 8 || parent.height < 3 { return; }
-    let width = parent.width.min(76).saturating_sub(if parent.width > 80 { 0 } else { 2 }).max(8);
-    let height = parent.height.min(22).saturating_sub(if parent.height > 24 { 0 } else { 1 }).max(3);
-    let area = Rect::new(parent.x + (parent.width - width) / 2,
-        parent.y + (parent.height - height) / 2, width, height);
-    // A superseded modal must not consume another subscription's results.
-    let view = service.view(&state.path).filter(|v| state.cancelled || v.subscription == Some(state.request_id));
-    let running = !state.cancelled && view.is_some_and(|v| v.running);
-    let title = " Folder Properties ";
-    let block = Block::default().borders(Borders::ALL).title(title)
-        .border_style(Style::default().fg(theme.amber))
-        .title_alignment(Alignment::Center);
-    f.render_widget(Clear, area);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-    if inner.height == 0 || inner.width == 0 { return; }
-    let mut rows: Vec<String> = Vec::new();
-    let name = state.path.file_name().map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| state.path.display().to_string());
-    rows.push(format!("Name: {name}"));
-    rows.push(format!("Location: {}", state.path.display()));
-    rows.push("Type: Directory (links not followed)".into());
-    if let Some(view) = view {
+fn timestamp(time: Option<std::time::SystemTime>) -> Option<String> {
+    time.map(|value| {
+        let dt: chrono::DateTime<chrono::Local> = value.into();
+        dt.format("%Y-%m-%d %H:%M:%S %:z").to_string()
+    })
+}
+
+fn measured_at(cached: &CachedMeasurement) -> String {
+    let dt: chrono::DateTime<chrono::Local> = cached.measurement.finished.into();
+    dt.format("%Y-%m-%d %H:%M").to_string()
+}
+
+fn style(color: Color) -> Style { Style::default().fg(color) }
+fn dim(value: impl Into<String>, theme: Theme) -> Span<'static> { Span::styled(value.into(), style(theme.text_muted)) }
+fn bright(value: impl Into<String>, theme: Theme) -> Span<'static> { Span::styled(value.into(), style(theme.blue)) }
+
+fn labeled(label: &str, value: Vec<Span<'static>>, theme: Theme) -> Line<'static> {
+    let mut spans = Vec::with_capacity(value.len() + 1);
+    spans.push(Span::styled(format!("{label:<LABEL_WIDTH$}"), style(theme.text_muted)));
+    spans.extend(value);
+    Line::from(spans)
+}
+
+fn text_row(label: &str, value: impl Into<String>, theme: Theme) -> Line<'static> {
+    labeled(label, vec![bright(value, theme)], theme)
+}
+
+fn quantity(n: u128, singular: &str, plural: &str) -> String {
+    format!("{} {}", format_exact(n), if n == 1 { singular } else { plural })
+}
+
+fn contents_line(files: u128, folders: u128, audio: u128, theme: Theme) -> Line<'static> {
+    let mut values = vec![
+        bright(quantity(files, "file", "files"), theme),
+        dim(", ", theme),
+        bright(quantity(folders, "folder", "folders"), theme),
+        dim(" · ", theme),
+    ];
+    if audio == 0 { values.push(dim("no audio files", theme)); }
+    else { values.push(bright(quantity(audio, "audio file", "audio files"), theme)); }
+    labeled("Contains", values, theme)
+}
+
+fn status_line(state: &FolderPropertiesState, view: Option<&DirectoryView>, theme: Theme) -> Line<'static> {
+    let Some(view) = view else { return Line::from(dim("           checking cached measurement…", theme)); };
+    if let Some(cached) = &view.cached {
+        let mut spans = vec![dim(format!("{:<LABEL_WIDTH$}cached {}", "", measured_at(cached)), theme)];
+        let end_label = if view.running && state.cancelled { Some("cancelling…") }
+            else if view.running { Some("recalculating…") }
+            else if state.cancelled || matches!(view.last_end.as_ref(), Some(ScanEnd::Cancelled(_))) { Some("rescan cancelled") }
+            else { match view.last_end.as_ref() {
+                Some(ScanEnd::Failed { .. }) => Some("rescan failed"),
+                Some(ScanEnd::Deferred(_)) => Some("scan deferred"),
+                Some(ScanEnd::Changed { .. }) => Some("changed during scan"),
+                Some(ScanEnd::Complete { saved: false, .. }) => Some("not saved"),
+                _ => match cached.freshness {
+                    Freshness::AsObserved => None,
+                    Freshness::Unverified => Some("freshness unverified"),
+                    Freshness::KnownInvalid => Some("known changes since scan"),
+                },
+            }};
+        if let Some(label) = end_label {
+            spans.push(dim(" · ", theme));
+            spans.push(Span::styled(label.to_string(), style(theme.amber)));
+        }
+        return Line::from(spans);
+    }
+    if view.running {
         if state.cancelled {
-            rows.push("Status: Scan cancellation requested".into());
+            return Line::from(dim(format!("{:<LABEL_WIDTH$}cancelling…", ""), theme));
         }
-        if running {
-            rows.push("Status: Calculating...".into());
-            if let Some(p) = &view.progress {
-                rows.push(format!("Examined: {} files, {} folders", format_exact(p.files_examined), format_exact(p.folders_examined)));
-                rows.push(format!("Scanned so far: {} (NOT a total)", format_bytes(p.bytes_examined)));
+        if let Some(p) = &view.progress {
+            return Line::from(dim(format!("{:<LABEL_WIDTH$}{} files examined · partial", "", format_exact(p.files_examined)), theme));
+        }
+        return Line::from(dim(format!("{:<LABEL_WIDTH$}scanning…", ""), theme));
+    }
+    let message = match view.last_end.as_ref() {
+        Some(ScanEnd::Cancelled(_)) => "scan cancelled",
+        Some(ScanEnd::Deferred(_)) => "scan deferred",
+        Some(ScanEnd::Failed { .. }) => "scan failed",
+        Some(ScanEnd::Changed { .. }) => "changed during scan",
+        _ if view.error.is_some() => "measurement unavailable",
+        _ => "not yet calculated",
+    };
+    Line::from(dim(format!("{:<LABEL_WIDTH$}{message}", ""), theme))
+}
+
+fn display_location(path: &std::path::Path, skip: usize, max_width: usize) -> String {
+    let full = path.to_string_lossy();
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    let display = home.and_then(|home| {
+        path.strip_prefix(&home).ok().map(|tail| {
+            if tail.as_os_str().is_empty() { "~".to_string() }
+            else { format!("~/{}", tail.display()) }
+        })
+    }).unwrap_or_else(|| full.to_string());
+    super::display_width::truncate_right(&display.chars().skip(skip).collect::<String>(), max_width)
+}
+
+fn content_lines(state: &FolderPropertiesState, view: Option<&DirectoryView>, theme: Theme, width: usize) -> Vec<Line<'static>> {
+    let name = state.path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| state.path.display().to_string());
+    let name = super::display_width::truncate_right(&name, width);
+    let subtype = match &state.subject {
+        PropertiesSubject::Folder => "Folder · symlinks not followed",
+        PropertiesSubject::File { is_symlink: true, .. } => "Symlink · target not followed",
+        PropertiesSubject::File { .. } => "File · filesystem metadata",
+    };
+    let rule = || Line::from(Span::styled("─".repeat(width), style(theme.border_dim)));
+    let mut lines = vec![
+        Line::from(Span::styled(name, style(theme.text_bright).add_modifier(Modifier::BOLD))),
+        Line::from(dim(subtype, theme)),
+        rule(),
+        text_row("Location", display_location(state.path.parent().unwrap_or(&state.path),
+            state.horizontal_scroll, width.saturating_sub(LABEL_WIDTH)), theme),
+        rule(),
+    ];
+    match &state.subject {
+        PropertiesSubject::Folder => {
+            if let Some(cached) = view.and_then(|v| v.cached.as_ref()) {
+                let bytes = cached.measurement.counts.bytes;
+                lines.push(labeled("Size", vec![bright(format_bytes(bytes), theme),
+                    dim(format!(" ({} bytes)", format_exact(bytes)), theme)], theme));
+            } else if let Some(progress) = view.filter(|v| v.running).and_then(|v| v.progress.as_ref()) {
+                lines.push(labeled("Size", vec![bright(format_bytes(progress.bytes_examined), theme),
+                    dim(" · partial", theme)], theme));
+            } else { lines.push(text_row("Size", "unknown", theme)); }
+            lines.push(status_line(state, view, theme));
+            if let Some(cached) = view.and_then(|v| v.cached.as_ref()) {
+                let c = &cached.measurement.counts;
+                lines.push(contents_line(c.files, c.folders, c.audio, theme));
+            } else if let Some(progress) = view.filter(|v| v.running).and_then(|v| v.progress.as_ref()) {
+                lines.push(labeled("Contains", vec![bright(quantity(progress.files_examined, "file", "files"), theme),
+                    dim(", ", theme), bright(quantity(progress.folders_examined, "folder", "folders"), theme),
+                    dim(" · partial", theme)], theme));
+            } else if let Some(local) = view.and_then(|v| v.local.as_ref()) {
+                lines.push(labeled("Contains", vec![bright(quantity(local.files, "file", "files"), theme),
+                    dim(", ", theme), bright(quantity(local.folders, "folder", "folders"), theme),
+                    dim(" · one level", theme)], theme));
+            } else { lines.push(text_row("Contains", "unknown", theme)); }
+            lines.push(rule());
+            let cached = view.and_then(|v| v.cached.as_ref());
+            lines.push(labeled("Created", vec![cached.and_then(|c| timestamp(c.measurement.created))
+                .map(|s| bright(s, theme)).unwrap_or_else(|| dim("– not recorded by this filesystem", theme))], theme));
+            lines.push(labeled("Modified", vec![cached.and_then(|c| timestamp(c.measurement.modified))
+                .map(|s| bright(s, theme)).unwrap_or_else(|| dim("– not yet measured", theme))], theme));
+        }
+        PropertiesSubject::File { size, modified, is_symlink } => {
+            let size_text = if *is_symlink { "unknown · symlink not followed".to_string() }
+                else { format!("{} ({} bytes)", format_bytes(*size as u128), format_exact(*size as u128)) };
+            lines.push(text_row("Size", size_text, theme));
+            lines.push(Line::default());
+            lines.push(Line::default());
+            lines.push(rule());
+            lines.push(labeled("Created", vec![dim("– not recorded by this filesystem", theme)], theme));
+            // Browse may have followed a symlink for classification. Its mtime
+            // is not proof of the link's own mtime, even if the caller supplied
+            // one. Do not show target metadata under a no-follow heading.
+            let link_safe_modified = if *is_symlink { None } else { *modified };
+            lines.push(labeled("Modified", vec![link_safe_modified.and_then(|t| timestamp(Some(t)))
+                .map(|s| bright(s, theme)).unwrap_or_else(|| dim("– unavailable in listing", theme))], theme));
+        }
+    }
+    lines
+}
+
+fn pill(label: &str, focused: bool, muted: bool, theme: Theme) -> Line<'static> {
+    let bg = if muted { theme.pill_dim_bg } else { theme.purple };
+    let fg = if muted { theme.text_bright } else { theme.pill_active_fg };
+    let base = Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD);
+    let label = label.trim();
+    let mut chars = label.chars();
+    let first = chars.next().unwrap_or(' ');
+    let rest = chars.collect::<String>();
+    let shortcut = if muted { base.add_modifier(Modifier::UNDERLINED) } else { base };
+    let focused_style = if focused && muted { base.add_modifier(Modifier::ITALIC) } else { base };
+    let padding = if muted { " " } else { "  " };
+    Line::from(vec![
+        Span::styled(padding, base),
+        Span::styled(first.to_string(), shortcut),
+        Span::styled(rest, focused_style),
+        Span::styled(padding, base),
+    ])
+}
+
+fn render_button(f: &mut Frame, map: &mut ButtonRenderMap, area: Rect, label: &str,
+    id: TuiButton, focused: bool, muted: bool, theme: Theme) {
+    if area.width == 0 || area.height == 0 { return; }
+    f.render_widget(Paragraph::new(pill(label, focused, muted, theme)), area);
+    map.record_button(id, area);
+}
+
+pub fn draw(f: &mut Frame, state: &FolderPropertiesState, service: &AccountingService,
+    map: &mut ButtonRenderMap, theme: Theme) {
+    let Some(area) = popup_rect(f.size()) else { return; };
+    let view = if let Some(id) = state.request_id {
+        service.view(&state.path).filter(|v| state.cancelled || v.subscription == Some(id))
+    } else { None };
+    let cancelling = state.is_folder() && state.cancelled && view.is_some_and(|v| v.running);
+    let running = state.is_folder() && !state.cancelled && view.is_some_and(|v| v.running);
+    let name = state.path.file_name().map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| state.path.display().to_string());
+    let title = format!(" {} Properties ", super::display_width::truncate_right(&name, area.width.saturating_sub(16) as usize));
+    let block = Block::default().borders(Borders::ALL)
+        .title(Line::from(Span::styled(title, style(theme.amber).add_modifier(Modifier::BOLD))))
+        .title_alignment(Alignment::Center)
+        .style(Style::default().bg(theme.surface))
+        .border_style(style(theme.amber));
+    f.render_widget(Clear, area);
+    f.render_widget(block, area);
+
+    let body_x = area.x.saturating_add(2);
+    let body_w = area.width.saturating_sub(4);
+    let body_y = area.y.saturating_add(1);
+    let footer_y = area.bottom().saturating_sub(3);
+    let body_h = footer_y.saturating_sub(body_y).saturating_sub(1);
+    if body_w == 0 || body_h == 0 { return; }
+    let lines = content_lines(state, view, theme, body_w as usize);
+    let scroll = state.scroll.min(lines.len().saturating_sub(body_h as usize));
+    f.render_widget(Paragraph::new(lines).scroll((scroll.min(u16::MAX as usize) as u16, 0)),
+        Rect::new(body_x, body_y, body_w, body_h));
+
+    // Recalculate/Cancel shares the Size row, away from its value; the mouse
+    // hit region is *exactly* the painted pill, even in narrow terminals.
+    if state.is_folder() && scroll <= 5 && 5 - scroll < body_h as usize {
+        let label = if cancelling { "Cancelling…" } else if running { "Cancel" } else { "Recalculate" };
+        let width = label.chars().count() as u16 + 2;
+        if body_w >= width + 14 {
+            let rect = Rect::new(body_x + body_w - width, body_y + 5 - scroll as u16, width, 1);
+            if cancelling {
+                // Cancellation is cooperative. Do not offer a no-op
+                // Recalculate until the current worker has acknowledged it.
+                f.render_widget(Paragraph::new(pill(label, false, true, theme)), rect);
+            } else {
+                let id = if running { TuiButton::PropertiesCancel } else { TuiButton::PropertiesRecalculate };
+                render_button(f, map, rect, label, id, state.focus == PropertiesFocus::Recalculate, true, theme);
             }
         }
-        if let Some(cached) = &view.cached {
-            let c = &cached.measurement.counts;
-            let size_label = match cached.freshness {
-                Freshness::AsObserved => "Size",
-                Freshness::Unverified => "Cached size",
-                Freshness::KnownInvalid => "Historical size",
-            };
-            rows.push(format!("{size_label}: {}", format_bytes(c.bytes)));
-            rows.push(format!("Exact bytes: {}", format_exact(c.bytes)));
-            rows.push(format!("Contains: {} files, {} folders", format_exact(c.files), format_exact(c.folders)));
-            rows.push(format!("Audio files: {}", format_exact(c.audio)));
-            rows.push(format!("Excluded links: {}", format_exact(c.excluded_links)));
-            rows.push(format!("Created: {}", date(cached.measurement.created)));
-            rows.push(format!("Modified: {}", date(cached.measurement.modified)));
-            rows.push(format!("Measured: {}", date(Some(cached.measurement.finished))));
-            let status = match cached.freshness {
-                Freshness::AsObserved => "Completed (as observed; not a filesystem snapshot)",
-                Freshness::Unverified => "Cached (freshness unverified)",
-                Freshness::KnownInvalid => "Cached (known change; historical measurement)",
-            };
-            rows.push(format!("Status: {status}"));
-        }
-        if running {
-            // Running status is deliberately first, including on recalculation
-            // of a cached (potentially stale) historical measurement.
-        } else if let Some(end) = &view.last_end {
-            match end {
-                ScanEnd::Complete { saved: false, persistence_error, .. } => rows.push(format!("Persistence: not saved ({})", persistence_error.as_deref().unwrap_or("unavailable"))),
-                ScanEnd::Cancelled(p) => rows.push(format!("Status: Cancelled after {} files", format_exact(p.files_examined))),
-                ScanEnd::Deferred(_) => rows.push("Status: Background scan deferred by metadata latency".into()),
-                ScanEnd::Failed { reason, .. } => rows.push(format!("Status: Failed: {reason}")),
-                ScanEnd::Changed { reason, .. } => rows.push(format!("Status: Changed during scan: {reason}")),
-                _ => {},
-            }
-        } else if let Some(error) = &view.error {
-            rows.push(format!("Status: Unavailable: {error}"));
-        }
-        if view.cached.is_none() && !running && !state.cancelled && view.last_end.is_none() {
-            rows.push("Status: Not calculated".into());
-        }
-    } else {
-        rows.push("Status: Checking cached measurement...".into());
     }
-    // Long paths remain accessible by scrolling in a normal-sized terminal.
-    let footer = if running { "Esc Close  C Cancel  R Recalculate  Arrows Scroll" }
-        else { "Esc Close  R Recalculate  Arrows Scroll  Home Reset" };
-    let body_rows = inner.height.saturating_sub(1) as usize;
-    if body_rows > 0 {
-        let max_scroll = rows.len().saturating_sub(body_rows);
-        let start = state.scroll.min(max_scroll);
-        let lines = rows.iter().skip(start).take(body_rows).map(|row| {
-            Line::from(Span::styled(row.clone(), Style::default().fg(theme.text)))
-        }).collect::<Vec<_>>();
-        let body = Rect::new(inner.x, inner.y, inner.width, body_rows as u16);
-        // Horizontal scroll applies to the full untruncated location line,
-        // including paths too long to fit in the current terminal width.
-        f.render_widget(Paragraph::new(lines)
-            .scroll((0, state.horizontal_scroll.min(u16::MAX as usize) as u16)), body);
+    let edit = "Edit Metadata...";
+    let edit_width = edit.chars().count() as u16 + 2;
+    let ok_width = 6u16;
+    if body_w >= edit_width + ok_width + 2 {
+        render_button(f, map, Rect::new(body_x, footer_y, edit_width, 1), edit,
+            TuiButton::PropertiesEditMetadata, state.focus == PropertiesFocus::EditMetadata, true, theme);
+        render_button(f, map, Rect::new(body_x + body_w - ok_width, footer_y, ok_width, 1), "OK",
+            TuiButton::PropertiesOk, state.focus == PropertiesFocus::Ok, false, theme);
+    } else if body_w >= ok_width {
+        render_button(f, map, Rect::new(body_x + body_w - ok_width, footer_y, ok_width, 1), "OK",
+            TuiButton::PropertiesOk, state.focus == PropertiesFocus::Ok, false, theme);
     }
-    let footer_area = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
-    f.render_widget(Paragraph::new(footer).style(Style::default().fg(theme.cyan).add_modifier(Modifier::BOLD)), footer_area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::directory_accounting::{CachedMeasurement, CompleteMeasurement, Counts, Freshness, ScanProgress};
+    use crate::directory_accounting::model::Observation;
+    use crate::tui::directory_properties::{PropertiesFocus, PropertiesSubject};
+    use ratatui::{backend::TestBackend, Terminal};
+    use std::{path::PathBuf, time::{Duration, SystemTime}};
+
+    fn theme() -> Theme {
+        crate::tui::theme::theme_by_slug_or_default(crate::tui::theme::default_theme_slug())
+    }
+    fn folder() -> FolderPropertiesState {
+        FolderPropertiesState {
+            path: PathBuf::from("/library/zeppelin/Led Zeppelin - Led Zeppelin DVD/disc 01"),
+            subject: PropertiesSubject::Folder, request_id: Some(19), scroll: 0,
+            horizontal_scroll: 0, cancelled: false, focus: PropertiesFocus::Ok,
+        }
+    }
+    fn completed(state: &FolderPropertiesState) -> AccountingService {
+        let mut service = AccountingService::new(None);
+        let time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_798_000_000);
+        service.views.insert(state.path.clone(), DirectoryView {
+            cached: Some(CachedMeasurement {
+                measurement: CompleteMeasurement {
+                    path: state.path.clone(),
+                    counts: Counts { files: 31, folders: 1, audio: 0, bytes: 8_208_015_360, ..Counts::default() },
+                    started: time, finished: time, created: None, modified: Some(time),
+                    generation: 1, observation: Observation::AsObserved,
+                },
+                freshness: Freshness::AsObserved,
+            }),
+            subscription: Some(19),
+            ..DirectoryView::default()
+        });
+        service
+    }
+    fn render(state: &FolderPropertiesState, service: &AccountingService, width: u16, height: u16)
+        -> (String, ButtonRenderMap, Terminal<TestBackend>) {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut map = ButtonRenderMap::new();
+        terminal.draw(|f| draw(f, state, service, &mut map, theme())).unwrap();
+        let rendered = (0..height).map(|y| {
+            let mut line = String::new();
+            for x in 0..width { line.push_str(terminal.backend().buffer().get(x, y).symbol()); }
+            line
+        }).collect::<Vec<_>>().join("\n");
+        (rendered, map, terminal)
+    }
+
+    #[test]
+    fn reference_properties_layout_orders_rows_and_draws_real_buttons() {
+        let state = folder();
+        let service = completed(&state);
+        let (text, map, terminal) = render(&state, &service, 100, 26);
+        for needle in [
+            "disc 01 Properties", "disc 01", "Folder · symlinks not followed",
+            "Location", "Size", "7.64 GiB", "8,208,015,360 bytes",
+            "Contains", "31 files", "1 folder", "no audio files",
+            "Created", "not recorded", "Modified", "Recalculate", "Edit Metadata...", "OK",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?}: {text}");
+        }
+        let order = ["Folder ·", "Location", "Size", "Contains", "Created", "Modified"];
+        for pair in order.windows(2) {
+            assert!(text.find(pair[0]) < text.find(pair[1]), "wrong row order: {text}");
+        }
+        assert!(!text.contains("Exact bytes:"), "old scrolling debug layout must be gone");
+        let rect = popup_rect(Rect::new(0, 0, 100, 26)).unwrap();
+        assert_eq!(rect.width, CARD_WIDTH);
+        let edit = map.button_rect(TuiButton::PropertiesEditMetadata).unwrap();
+        let ok = map.button_rect(TuiButton::PropertiesOk).unwrap();
+        let recalc = map.button_rect(TuiButton::PropertiesRecalculate).unwrap();
+        assert_eq!(edit.y, ok.y);
+        assert!(edit.right() < ok.x, "footer actions must be separate clickable targets");
+        assert_eq!(recalc.y, rect.y + 6, "recalculate must sit beside Size");
+        for (button, bounds) in map.recorded_buttons() {
+            assert_eq!(map.find_button_at(bounds.x, bounds.y), Some(*button));
+            assert!(bounds.x >= rect.x && bounds.right() <= rect.right());
+        }
+        // The frame uses the active theme for the frame and action button.
+        let border = terminal.backend().buffer().get(rect.x, rect.y + 1);
+        assert_eq!(border.fg, theme().amber);
+        let ok_cell = terminal.backend().buffer().get(ok.x + 1, ok.y);
+        assert_eq!(ok_cell.bg, theme().purple);
+    }
+
+    /// Location is the containing directory, not the path in the title.
+    fn location_row(state: &FolderPropertiesState) -> String {
+        let (text, _, _) = render(state, &AccountingService::new(None), 100, 26);
+        text.lines().find(|line| line.contains("Location"))
+            .expect("Properties Location row").to_string()
+    }
+
+    #[test]
+    fn location_is_the_parent_of_a_folder_or_file_with_root_fallback() {
+        let mut state = folder();
+        let parent = state.path.parent().unwrap();
+        let row = location_row(&state);
+        assert!(row.contains(&display_location(parent, 0, 61)), "{row}");
+        assert!(!row.contains("disc 01"), "the folder name belongs in the heading: {row}");
+
+        state.path = PathBuf::from("/library/zeppelin/track.flac");
+        state.subject = PropertiesSubject::File { size: 42, modified: None, is_symlink: false };
+        let row = location_row(&state);
+        assert!(row.contains(&display_location(state.path.parent().unwrap(), 0, 61)), "{row}");
+        assert!(!row.contains("track.flac"), "the file name belongs in the heading: {row}");
+
+        // Path::parent() returns None at filesystem roots: Location must still
+        // have a usable value, rather than being empty or panicking.
+        state.path = PathBuf::from(if cfg!(windows) { "C:\\" } else { "/" });
+        assert!(state.path.parent().is_none());
+        let row = location_row(&state);
+        assert!(row.contains(&display_location(&state.path, 0, 61)), "{row}");
+    }
+
+    #[test]
+    fn location_retains_unicode_and_horizontal_scroll() {
+        let mut state = folder();
+        state.path = PathBuf::from("/library/Música/日本語/track.flac");
+        state.subject = PropertiesSubject::File { size: 1, modified: None, is_symlink: false };
+        state.horizontal_scroll = 3;
+        // Inspect the spans rather than the TestBackend buffer: wide glyphs
+        // reserve a second terminal cell which need not repeat the glyph.
+        let lines = content_lines(&state, None, theme(), 72);
+        let row = lines[3].spans.iter().map(|span| span.content.as_ref()).collect::<String>();
+        assert!(row.contains(&display_location(state.path.parent().unwrap(), 3, 61)), "{row}");
+    }
+
+    #[test]
+    fn cached_cancelled_scan_is_never_displayed_as_a_partial_total() {
+        let mut state = folder();
+        state.cancelled = true;
+        let mut service = completed(&state);
+        service.views.get_mut(&state.path).unwrap().last_end =
+            Some(ScanEnd::Cancelled(ScanProgress { files_examined: 2, ..ScanProgress::default() }));
+        let (text, map, _) = render(&state, &service, 100, 26);
+        assert!(text.contains("cached "));
+        assert!(text.contains("rescan cancelled"));
+        assert!(text.contains("7.64 GiB"));
+        assert!(!text.contains("partial"));
+        assert!(map.button_rect(TuiButton::PropertiesRecalculate).is_some());
+    }
+
+    #[test]
+    fn running_scan_exposes_cancel_and_marks_numbers_partial() {
+        let state = folder();
+        let mut service = AccountingService::new(None);
+        service.views.insert(state.path.clone(), DirectoryView {
+            subscription: Some(19), running: true,
+            progress: Some(ScanProgress {
+                bytes_examined: 50_000, files_examined: 5, folders_examined: 2,
+                ..ScanProgress::default()
+            }),
+            ..DirectoryView::default()
+        });
+        let (text, map, _) = render(&state, &service, 92, 26);
+        assert!(text.contains("partial"), "running counts are not final: {text}");
+        assert!(text.contains("Cancel"));
+        assert!(map.button_rect(TuiButton::PropertiesCancel).is_some());
+        assert!(map.button_rect(TuiButton::PropertiesRecalculate).is_none());
+    }
+
+    #[test]
+    fn cancellation_in_progress_does_not_offer_an_ineffective_recalculate() {
+        let mut state = folder();
+        state.cancelled = true;
+        let mut service = AccountingService::new(None);
+        service.views.insert(state.path.clone(), DirectoryView {
+            subscription: Some(19), running: true,
+            progress: Some(ScanProgress { files_examined: 5, ..ScanProgress::default() }),
+            ..DirectoryView::default()
+        });
+        let (text, map, _) = render(&state, &service, 92, 26);
+        assert!(text.contains("cancelling"));
+        assert!(map.button_rect(TuiButton::PropertiesRecalculate).is_none());
+        assert!(map.button_rect(TuiButton::PropertiesCancel).is_none());
+    }
+
+    #[test]
+    fn cold_cache_and_compact_terminal_preserve_exit_and_scroll() {
+        let state = folder();
+        let service = AccountingService::new(None);
+        let (text, map, _) = render(&state, &service, 46, 12);
+        assert!(text.contains("disc 01"));
+        assert!(map.button_rect(TuiButton::PropertiesOk).is_some());
+        assert!(map.button_rect(TuiButton::PropertiesEditMetadata).is_some());
+        let mut scrolled = state;
+        scrolled.scroll = 4;
+        let (text, map, _) = render(&scrolled, &service, 46, 12);
+        assert!(text.contains("unknown") || text.contains("checking cached"));
+        assert!(text.contains("Contains") || text.contains("Created") || text.contains("Modified"));
+        assert!(map.button_rect(TuiButton::PropertiesOk).is_some());
+    }
+
+    #[test]
+    fn symlink_presentation_never_displays_a_target_timestamp() {
+        let mut state = folder();
+        let target_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        // Defense at the presentation boundary: do not trust metadata from
+        // another caller that obtained a followed target's timestamp.
+        state.subject = PropertiesSubject::File {
+            size: 123_456, modified: Some(target_time), is_symlink: true,
+        };
+        state.request_id = None;
+        let (text, map, _) = render(&state, &AccountingService::new(None), 100, 26);
+        assert!(text.contains("Symlink · target not followed"), "{text}");
+        assert!(text.contains("unknown · symlink not followed"), "{text}");
+        assert!(text.contains("unavailable in listing"), "{text}");
+        assert!(!text.contains(&timestamp(Some(target_time)).unwrap()));
+        assert!(map.button_rect(TuiButton::PropertiesRecalculate).is_none());
+    }
+
+    #[test]
+    fn file_properties_use_listing_facts_and_never_offer_directory_scan() {
+        let mut state = folder();
+        state.subject = PropertiesSubject::File { size: 123_456, modified: None, is_symlink: false };
+        state.request_id = None;
+        let (text, map, _) = render(&state, &AccountingService::new(None), 80, 24);
+        assert!(text.contains("File · filesystem metadata"));
+        assert!(text.contains("123,456 bytes"));
+        assert!(text.contains("Modified"));
+        assert!(map.button_rect(TuiButton::PropertiesRecalculate).is_none());
+        assert!(map.button_rect(TuiButton::PropertiesEditMetadata).is_some());
+    }
 }

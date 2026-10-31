@@ -3170,10 +3170,11 @@ fn compact_directory_info(
     let mut required = mandatory.iter().map(|(_, rows)| rows.len()).sum::<usize>()
         + action_rows;
     // Before clipping any count, reclaim unused label-column padding in just
-    // the wrapped rows. At 66x24 this fits complete "unknown" values for
-    // Folders/Files without stealing the lines needed by the other counts.
+    // the wrapped rows. Prefer to fit the title as well as all four complete
+    // values and the action; at 66x24 this tightens two unknown-count rows.
+    let preferred_required = content_height.saturating_sub(usize::from(!info.lines.is_empty()));
     for (_, rows) in &mut mandatory {
-        if required <= content_height { break; }
+        if required <= preferred_required { break; }
         if rows.len() > 1 {
             if let Some(tight) = tighten_directory_metric_value(rows, content_width) {
                 *rows = vec![tight];
@@ -3191,9 +3192,16 @@ fn compact_directory_info(
         }
     }
     let mut remaining = content_height.saturating_sub(required);
+    let mut selected = mandatory;
+    // The title is the shared visual origin, not an optional directory
+    // statistic. Counts and the active control still take precedence when a
+    // genuinely tiny viewport cannot accommodate both.
+    if remaining > 0 && !info.lines.is_empty() {
+        selected.push((0, vec![info.lines[0].clone()]));
+        remaining -= 1;
+    }
     let show_blank = action.is_some() && remaining > 0;
     if show_blank { remaining -= 1; }
-    let mut selected = mandatory;
     // Optional metric blocks retain their original physical wrapping and order.
     for label in ["Disk free", "Updated", "Kind"] {
         if let Some(block) = directory_info_metric_block(&info, label) {
@@ -3203,24 +3211,12 @@ fn compact_directory_info(
             }
         }
     }
-    if let (Some(start), Some(end)) = (
-        info.lines.iter().position(|row| row.first()
-            .is_some_and(|span| span.content.trim() == "Name")),
-        info.lines.iter().position(|row| row.first()
-            .is_some_and(|span| span.content.trim() == "Kind")),
-    ) {
-        if start < end && end - start <= remaining {
-            remaining -= end - start;
-            selected.push((start, info.lines[start..end].to_vec()));
-        }
-    }
     if let Some(row) = action {
         if show_blank { selected.push((row - 1, vec![Vec::new()])); }
         selected.push((row, vec![info.lines[row].clone()]));
     }
-    // Album and disc information follows the directory summary. C4C1
-    // inadvertently dropped it, even with spare rows in the compact pane.
-    // Keep the original order, including controls, without displacing counts.
+    // All media views use compact_media_info instead. Keep the original
+    // plain-directory supplemental-row policy and its mapped button index.
     let supplemental_start = action.map(|row| row + 1).or_else(|| {
         ["Updated", "Disk free", "Total size"].into_iter()
             .find_map(|label| directory_info_metric_block(&info, label)
@@ -3256,6 +3252,100 @@ fn compact_directory_info(
         remap(Some(row)).map(|new| (new, col)));
     info.lines = compact;
     info
+}
+
+// A short Info pane cannot accommodate the reference header plus enriched
+// disc rows and controls. Select its compact geometry before the probe cache
+// fills, including the 14-row content pane at a 160x30 terminal.
+const MEDIA_COMPACT_MAX_CONTENT_ROWS: usize = 14;
+
+/// Compact media views anchor the title and first body row independently of
+/// probe-cache detail. Wrapped fields remain atomic, and controls remain mapped
+/// to their painted positions.
+fn compact_media_info(mut info: InfoContent, height: usize) -> InfoContent {
+    if height > MEDIA_COMPACT_MAX_CONTENT_ROWS && info.lines.len() <= height {
+        return info;
+    }
+    let mut selected: Vec<usize> = Vec::new();
+    let mut budget = height;
+    let button = info.refresh_pill_row.or(info.audio_streams_pill_row);
+    for row in [button, info.edit_tags_pill_row].into_iter().flatten() {
+        if budget > 0 && !selected.contains(&row) {
+            selected.push(row);
+            budget -= 1;
+        }
+    }
+    // The first row is the unlabelled title. Secondary header rows stay out
+    // of compact views so cache enrichment cannot push the first metric down.
+    if budget > 0 && !info.lines.is_empty() {
+        selected.push(0);
+        budget -= 1;
+    }
+    let body_start = 4.min(info.lines.len());
+    let labels = ["Audio", "Audio files", "Discs", "Contents", "Size", "Modified",
+        "Format", "Mixes", "Areas", "Protection", "Streams", "Video", "Content",
+        "Duration", "Status"];
+    // Compact push_media_row emits [indent, label] and then [indent, value].
+    // Recognize both that form and the regular aligned label prefix, and do
+    // not absorb the next compact label into the current wrapped field.
+    let is_label_row = |row: &[Span<'static>], label: &str| {
+        row.first().is_some_and(|span| span.content.trim() == label)
+            || (row.first().is_some_and(|span| span.content == MEDIA_INDENT)
+                && row.get(1).is_some_and(|span| span.content.trim() == label))
+    };
+    let mut add_group = |label: &str, selected: &mut Vec<usize>, budget: &mut usize| {
+        if let Some(start) = (body_start..info.lines.len()).find(|&row|
+            is_label_row(&info.lines[row], label)) {
+            let mut end = start + 1;
+            while end < info.lines.len() && !info.lines[end].is_empty()
+                && info.lines[end].first().is_some_and(|span| span.content.trim().is_empty())
+                && !labels.iter().any(|other| is_label_row(&info.lines[end], other))
+                && Some(end) != button {
+                end += 1;
+            }
+            if end - start <= *budget && !selected.contains(&start) {
+                selected.extend(start..end);
+                *budget -= end - start;
+            }
+        }
+    };
+    for label in labels.iter().copied() {
+        if budget == 0 { break; }
+        add_group(label, &mut selected, &mut budget);
+    }
+    // Preserve one blank row before the controls when space is available.
+    if budget > 0 {
+        if let Some(row) = button.filter(|row| *row > 0 && info.lines[row - 1].is_empty()) {
+            selected.push(row - 1);
+        }
+    }
+    selected.sort_unstable();
+    selected.dedup();
+    let remap = |old: Option<usize>| old.and_then(|row| selected.iter()
+        .position(|value| *value == row));
+    info.refresh_pill_row = remap(info.refresh_pill_row);
+    info.audio_streams_pill_row = remap(info.audio_streams_pill_row);
+    info.edit_tags_pill_row = remap(info.edit_tags_pill_row);
+    info.analyze_pill_row = remap(info.analyze_pill_row);
+    info.meta_field_rows.retain(|(_, row)| selected.contains(row));
+    info.meta_field_rows = info.meta_field_rows.into_iter()
+        .filter_map(|(field, row)| remap(Some(row)).map(|index| (field, index))).collect();
+    info.inline_cursor = info.inline_cursor.and_then(|(row, col)|
+        remap(Some(row)).map(|index| (index, col)));
+    info.lines = selected.into_iter().map(|row| info.lines[row].clone()).collect();
+    info
+}
+
+/// Return a painted pill's actual cell range. Refresh and Streams can share
+/// one row; computing both positions from spans keeps click hitboxes exact.
+fn info_pill_offset(spans: &[Span<'_>], caption: &str) -> Option<(usize, usize)> {
+    let mut offset = 0usize;
+    for span in spans {
+        let width = super::display_width::width(span.content.as_ref());
+        if span.content == caption { return Some((offset, width)); }
+        offset += width;
+    }
+    None
 }
 
 fn draw_browse_info(
@@ -3336,7 +3426,17 @@ fn draw_browse_info(
         !browse.is_in_archive() &&
             (matches!(entry.kind, EntryKind::ParentDir) || entry.is_child_dir())
             && !entry.is_symlink);
-    let info = if physical_folder && info.lines.len() > content_height {
+    let media_selection = browse.selected_entry().is_some_and(|entry| {
+        entry.is_disc_source() || entry.is_video_transport_file()
+        || (matches!(entry.kind, EntryKind::Archive) && entry.path.extension()
+            .and_then(|v| v.to_str()).is_some_and(|v| v.eq_ignore_ascii_case("iso")))
+        || (entry.is_child_dir() && browse.current_folder_classification().is_some_and(|c|
+            matches!(c.kind, FolderClassificationKind::Album | FolderClassificationKind::Disc |
+                FolderClassificationKind::MultiDisc)))
+    });
+    let info = if media_selection {
+        compact_media_info(info, content_height)
+    } else if physical_folder && info.lines.len() > content_height {
         compact_directory_info(info, content_height, content_width)
     } else { info };
     let start_row = 0;
@@ -3380,20 +3480,21 @@ fn draw_browse_info(
         }
     }
 
-    // The Refresh/Cancel block is below the summary. Only register its
-    // actual painted row, including when the compact viewport is offset.
+    // The Refresh/Cancel pill is painted on the media action row, adjacent to
+    // Streams when available. Locate it from its spans rather than assuming the
+    // C4 directory indent of three columns.
     if let Some(row) = info.refresh_pill_row {
         if row >= start_row && row - start_row < content_height {
-            buttons.record_button(
-                TuiButton::BrowseInfoRefresh,
-                Rect::new(
-                    area.x + 4,
-                    info_y_start + (row - start_row) as u16,
-                    (if info.lines[row].iter().any(|span| span.content == " Cancel ") { 8 } else { 9 })
-                        .min(w.saturating_sub(5)) as u16,
-                    1,
-                ),
-            );
+            let spans = &info.lines[row];
+            let pill = if spans.iter().any(|s| s.content == " Cancel ") {
+                " Cancel "
+            } else { " Refresh " };
+            if let Some((left, width)) = info_pill_offset(spans, pill) {
+                buttons.record_button(TuiButton::BrowseInfoRefresh,
+                    Rect::new(area.x + 1 + left as u16,
+                        info_y_start + (row - start_row) as u16,
+                        width as u16, 1));
+            }
         }
     }
     // Register pill buttons if they fit.
@@ -3415,10 +3516,21 @@ fn draw_browse_info(
     }
     if let Some(row) = info.audio_streams_pill_row {
         if row >= start_row && row - start_row < content_height {
-            buttons.record_button(
-                TuiButton::BrowseInfoAudioStreams,
-                Rect::new(area.x + 1, info_y_start + (row - start_row) as u16, (w - 2) as u16, 1),
-            );
+            if let Some(spans) = info.lines.get(row) {
+                if let Some(pill) = spans.last().filter(|span| span.content == " Streams… ") {
+                    let left = spans[..spans.len() - 1].iter()
+                        .map(|span| super::display_width::width(span.content.as_ref()))
+                        .sum::<usize>();
+                    let width = super::display_width::width(pill.content.as_ref());
+                    if left + width <= w.saturating_sub(2) {
+                        buttons.record_button(
+                            TuiButton::BrowseInfoAudioStreams,
+                            Rect::new(area.x + 1 + left as u16,
+                                info_y_start + (row - start_row) as u16, width as u16, 1),
+                        );
+                    }
+                }
+            }
         }
     }
 }
@@ -3431,21 +3543,17 @@ fn truncate_to(s: &str, max_chars: usize) -> String {
     super::display_width::truncate_right(s, max_chars)
 }
 
-fn push_key_value_line(
-    lines: &mut Vec<Vec<Span<'static>>>,
-    key: &'static str,
-    value: impl Into<String>,
-    key_style: Style,
-    value_style: Style,
-) {
-    lines.push(vec![
-        Span::styled(format!("   {key:<8}"), key_style),
-        Span::styled(value.into(), value_style),
-    ]);
+/// Plain-directory details share the accounting metrics' value column.
+/// "Audio files" is always one of the four counted rows and is the longest
+/// metric label, including when disk space and modification time are absent.
+fn directory_metric_label_width(content_width: usize) -> usize {
+    let max_label = "Audio files".len();
+    let gap = if content_width >= 3 + max_label + 2 + 10 { 2 } else { 1 };
+    max_label + gap
 }
 
-/// One label column for the four counted rows, Disk free and Updated.
-/// Kind intentionally keeps its older, narrower label column.
+/// One label column for Kind, provisional Content, the four counted rows,
+/// Disk free and Updated.
 fn push_directory_metric_line(
     lines: &mut Vec<Vec<Span<'static>>>,
     key: &'static str,
@@ -3456,6 +3564,28 @@ fn push_directory_metric_line(
     let mut row = vec![Span::styled(format!("   {key:label_width$}"), theme.muted())];
     row.extend(value);
     lines.push(row);
+}
+
+/// Keep provisional directory facts in the same column as the counted rows.
+/// Narrow panes wrap a long value rather than painting over the right border.
+fn push_directory_detail_line(
+    lines: &mut Vec<Vec<Span<'static>>>,
+    key: &'static str,
+    value: &'static str,
+    style: Style,
+    content_width: usize,
+    theme: super::theme::Theme,
+) {
+    let label_width = directory_metric_label_width(content_width);
+    let value_width = super::display_width::width(value);
+    if value_width <= content_width.saturating_sub(3 + label_width) {
+        push_directory_metric_line(lines, key, vec![Span::styled(value, style)],
+            label_width, theme);
+    } else {
+        push_directory_metric_line(lines, key, vec![], label_width, theme);
+        lines.push(vec![Span::raw("   "),
+            Span::styled(truncate_to(value, content_width.saturating_sub(3)), style)]);
+    }
 }
 
 /// Binary units for directory contents and filesystem capacity. The general
@@ -3562,11 +3692,9 @@ fn push_directory_stats_lines(
         matches!(*label, "Files" | "Audio files" | "Total size")
             && matches!(value, DirectoryMetricValue::Unknown));
 
-    let max_label = metrics.iter().map(|(label, _)| label.len()).max().unwrap_or(0);
     // On a narrow terminal one inter-column space fits 'unknown' without
     // orphaning its value. Keep the image's two spaces at normal widths.
-    let gap = if content_width >= 3 + max_label + 2 + 10 { 2 } else { 1 };
-    let label_width = max_label + gap;
+    let label_width = directory_metric_label_width(content_width);
     let available = content_width.saturating_sub(3 + label_width);
     for (label, value) in metrics {
         let mut spans: Vec<Span<'static>> = Vec::new();
@@ -3638,6 +3766,157 @@ fn push_directory_stats_lines(
     Some(row)
 }
 
+/// Display facts from cached tags or a disc probe. Missing fields are omitted.
+struct BrowseMediaHeader {
+    title: String,
+    artist: Option<String>,
+    year: Option<String>,
+    catalog: Option<String>,
+}
+
+/// A conflicting album tag is not authoritative. Missing probe results do not
+/// cause extra I/O from the renderer.
+fn album_tag_consensus(
+    browse: &BrowseState,
+    audio: &FolderAudioSummary,
+    field: fn(&super::probe::SourceMetadata) -> Option<&str>,
+) -> Option<String> {
+    let mut result: Option<String> = None;
+    for path in &audio.file_paths {
+        let Some(info) = browse.probe_info_for_path(path) else { continue };
+        let Some(value) = field(&info.metadata).map(str::trim).filter(|v| !v.is_empty()) else {
+            continue;
+        };
+        if let Some(existing) = &result {
+            if !existing.eq_ignore_ascii_case(value) { return None; }
+        } else {
+            result = Some(value.to_owned());
+        }
+    }
+    result
+}
+
+fn media_header_for_entry(
+    entry: &BrowseEntry,
+    browse: &BrowseState,
+    disc_contents: Option<&crate::disc::DiscContents>,
+) -> Option<BrowseMediaHeader> {
+    let classification = if matches!(entry.kind, EntryKind::Directory) && !browse.is_in_archive() {
+        browse.current_folder_classification().filter(|c| matches!(c.kind,
+            FolderClassificationKind::Album | FolderClassificationKind::Disc |
+            FolderClassificationKind::MultiDisc))
+    } else { None };
+    if classification.is_none() && !entry.is_disc_source() && !entry.is_video_transport_file() {
+        return None;
+    }
+    let fallback_title = if (entry.is_disc_source() || entry.is_video_transport_file())
+        && !entry.is_child_dir() {
+        entry.path.file_stem().and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty()).unwrap_or(&entry.name).to_owned()
+    } else { entry.name.clone() };
+    if entry.is_video_transport_file() {
+        return Some(BrowseMediaHeader {
+            title: fallback_title, artist: None, year: None, catalog: None,
+        });
+    }
+    let disc = entry.is_disc_source() || classification.is_some_and(|c|
+        c.kind == FolderClassificationKind::Disc);
+    if disc {
+        let meta = if matches!(entry.kind, EntryKind::SacdIso) {
+            browse.current_cached_info().map(|cache| &cache.metadata)
+        } else { None };
+        return Some(BrowseMediaHeader {
+            title: disc_contents.and_then(|c| c.album_title.as_deref())
+                .or_else(|| meta.and_then(|m| m.album.as_deref()))
+                .filter(|v| !v.trim().is_empty()).unwrap_or(&fallback_title).to_owned(),
+            artist: disc_contents.and_then(|c| c.album_artist.as_deref())
+                .or_else(|| meta.and_then(|m| m.artist.as_deref()))
+                .filter(|v| !v.trim().is_empty()).map(str::to_owned),
+            year: disc_contents.and_then(|c| c.year.as_deref())
+                .or_else(|| meta.and_then(|m| m.year.as_deref()))
+                .filter(|v| !v.trim().is_empty()).map(str::to_owned),
+            catalog: meta.and_then(|m| m.catalog_number.as_deref())
+                .filter(|v| !v.trim().is_empty()).map(str::to_owned),
+        });
+    }
+    let audio = &classification?.audio;
+    Some(BrowseMediaHeader {
+        title: album_tag_consensus(browse, audio, |m| m.album.as_deref())
+            .unwrap_or(fallback_title),
+        artist: album_tag_consensus(browse, audio, |m| m.artist.as_deref()),
+        year: album_tag_consensus(browse, audio, |m| m.year.as_deref()),
+        catalog: album_tag_consensus(browse, audio, |m| m.catalog_number.as_deref()),
+    })
+}
+
+/// Transport previews share the same value column and compact wrapping as
+/// the album and disc rows. No alternate indent or label grid is needed.
+fn push_media_field(
+    lines: &mut Vec<Vec<Span<'static>>>,
+    label: &'static str,
+    value: impl AsRef<str>,
+    content_width: usize,
+    theme: super::theme::Theme,
+) {
+    push_media_row(lines, label, vec![Span::styled(value.as_ref().to_owned(),
+        theme.text_style())], content_width, theme);
+}
+
+/// Render only the transport details collected by the asynchronous FFmpeg
+/// probe. There is deliberately no Streams button: the disc browser operates
+/// on complete disc sources, not individual VOB/M2TS transport files.
+fn push_transport_stream_lines(
+    lines: &mut Vec<Vec<Span<'static>>>,
+    summary: &crate::tui::probe::TransportStreamSummary,
+    content_width: usize,
+    theme: super::theme::Theme,
+) {
+    let noun = |count: usize| if count == 1 { "stream" } else { "streams" };
+    push_media_field(lines, "Content", format!("{} video {} · {} audio {}",
+        summary.video_count, noun(summary.video_count),
+        summary.audio_count, noun(summary.audio_count)), content_width, theme);
+
+    for (index, video) in summary.videos.iter().enumerate() {
+        let details = if video.width > 0 && video.height > 0 {
+            format!("{} · {}×{}", video.codec, video.width, video.height)
+        } else {
+            video.codec.clone()
+        };
+        push_media_field(lines, "Video", format!("{}: {details}", index + 1), content_width, theme);
+    }
+    if summary.video_count > summary.videos.len() {
+        push_media_field(lines, "Video", format!("… and {} more",
+            summary.video_count - summary.videos.len()), content_width, theme);
+    }
+    for (index, audio) in summary.audios.iter().enumerate() {
+        let mut details = vec![audio.codec.clone()];
+        if !audio.channel_layout.is_empty() {
+            details.push(audio.channel_layout.clone());
+        }
+        if audio.sample_rate > 0 {
+            let khz = audio.sample_rate as f64 / 1000.0;
+            details.push(if audio.sample_rate % 1000 == 0 {
+                format!("{} kHz", audio.sample_rate / 1000)
+            } else {
+                format!("{khz:.1} kHz")
+            });
+        }
+        push_media_field(lines, "Audio", format!("{}: {}", index + 1, details.join(" · ")),
+            content_width, theme);
+    }
+    if summary.audio_count == 0 {
+        push_media_field(lines, "Audio", "no audio streams", content_width, theme);
+    } else if summary.audio_count > summary.audios.len() {
+        push_media_field(lines, "Audio", format!("… and {} more",
+            summary.audio_count - summary.audios.len()), content_width, theme);
+    }
+    if summary.duration_secs.is_finite() && summary.duration_secs > 0.0 {
+        push_media_field(lines, "Duration",
+            crate::tui::disc_browser::duration_display(summary.duration_secs),
+            content_width, theme);
+    }
+}
+
 fn folder_audio_headline(
     audio: &FolderAudioSummary,
     browse: &BrowseState,
@@ -3672,151 +3951,6 @@ fn folder_audio_headline(
     parts.join(" · ")
 }
 
-fn push_folder_audio_detail_lines(
-    lines: &mut Vec<Vec<Span<'static>>>,
-    audio: &FolderAudioSummary,
-    browse: &BrowseState,
-    content_width: usize,
-    theme: super::theme::Theme,
-) {
-    let rollup = browse.folder_probe_rollup(audio);
-    if rollup.profile_counts.len() > 1 {
-        let detail = rollup
-            .profile_counts
-            .iter()
-            .map(|(profile, count)| format!("{count}x {profile}"))
-            .collect::<Vec<_>>()
-            .join(" · ");
-        lines.push(vec![
-            Span::raw("   "),
-            Span::styled(truncate_to(&detail, content_width.saturating_sub(3)), theme.text_style()),
-        ]);
-    }
-
-    let mut tail = Vec::new();
-    if rollup.total_duration_secs > 0.0 {
-        tail.push(format!(
-            "duration: {}",
-            crate::tui::disc_browser::duration_display(rollup.total_duration_secs)
-        ));
-    }
-    if rollup.probed_count > 0 && rollup.probed_count < audio.track_count {
-        tail.push(format!(
-            "{} unprobed",
-            audio.track_count.saturating_sub(rollup.probed_count)
-        ));
-    }
-
-    if !tail.is_empty() {
-        lines.push(vec![
-            Span::raw("   "),
-            Span::styled(truncate_to(&tail.join(" · "), content_width.saturating_sub(3)), theme.muted()),
-        ]);
-    }
-}
-
-fn push_disc_probe_summary_lines(
-    lines: &mut Vec<Vec<Span<'static>>>,
-    browse: &BrowseState,
-    source_path: &Path,
-    entry_size: u64,
-    content_width: usize,
-    audio_streams_hovered: bool,
-    audio_streams_pill_row: &mut Option<usize>,
-    theme: super::theme::Theme,
-) {
-    let max_value_chars = content_width.saturating_sub(3);
-    if let Some(contents) = browse
-        .disc_probe_cache
-        .get(source_path)
-        .and_then(|cache| cache.contents_if_current(source_path))
-    {
-        for summary in crate::tui::disc_browser::disc_content_summary_lines(contents.as_ref()) {
-            lines.push(vec![
-                Span::raw("   "),
-                Span::styled(truncate_to(&summary, max_value_chars), theme.text_style()),
-            ]);
-        }
-        let copy_protection = contents.copy_protection.description.trim();
-        if !copy_protection.eq_ignore_ascii_case("none") {
-            lines.push(vec![
-                Span::styled("   copy protection", theme.muted()),
-                Span::raw(" "),
-                Span::styled(
-                    truncate_to(copy_protection, max_value_chars.saturating_sub(18)),
-                    theme.text_style(),
-                ),
-            ]);
-        }
-        lines.push(vec![]);
-        lines.push(vec![Span::styled("   streams:", theme.muted())]);
-        for stream in crate::tui::disc_browser::disc_stream_summary_lines(contents.as_ref(), 6) {
-            lines.push(vec![
-                Span::raw("     "),
-                Span::styled(truncate_to(&stream, max_value_chars.saturating_sub(2)), theme.text_style()),
-            ]);
-        }
-        if contents.presentations.len() > 6 {
-            lines.push(vec![Span::styled(
-                format!("     ... and {} more", contents.presentations.len() - 6),
-                theme.muted(),
-            )]);
-        }
-        if !contents.presentations.is_empty() {
-            lines.push(vec![]);
-            let row = lines.len();
-            let label = " audio streams ";
-            let width = super::display_width::width(label);
-            let pad = content_width.saturating_sub(width + 3);
-            let bg = if audio_streams_hovered { theme.blue } else { theme.purple };
-            lines.push(vec![
-                Span::raw(" ".repeat(pad)),
-                Span::styled(
-                    label,
-                    Style::default()
-                        .fg(theme.pill_active_fg)
-                        .bg(bg)
-                        .add_modifier(ratatui::style::Modifier::BOLD),
-                ),
-            ]);
-            *audio_streams_pill_row = Some(row);
-        }
-    } else if let Some(error) = browse
-        .disc_probe_cache
-        .get(source_path)
-        .and_then(|cache| cache.error_if_current(source_path))
-    {
-        lines.push(vec![
-            Span::styled("   status  ", theme.muted()),
-            Span::styled(truncate_to(error, max_value_chars.saturating_sub(10)), Style::default().fg(theme.destructive)),
-        ]);
-        lines.push(vec![Span::styled("   size    ", theme.muted()), Span::styled(size_str(entry_size), theme.text_style())]);
-    } else {
-        // Only claim analysis is happening when the reducer actually has a
-        // worker in flight. In cached-only / after-descend modes the absence of
-        // a cache entry is intentional, and rendering "Analyzing disc…" would
-        // be a false progress indicator that can sit forever.
-        let pending = browse.disc_probe_pending.contains(source_path);
-        let status = if pending {
-            "Analyzing disc…"
-        } else if matches!(
-            browse.directory_summary_cold_work_policy,
-            BrowseDirectorySummaryColdWorkPolicy::CachedOnly
-        ) {
-            "disc summary not cached"
-        } else if matches!(
-            browse.directory_summary_cold_work_policy,
-            BrowseDirectorySummaryColdWorkPolicy::AfterDescendOnly
-        ) {
-            "disc summary available after descend/scan"
-        } else {
-            "disc summary not cached"
-        };
-        lines.push(vec![Span::styled("   status  ", theme.muted()), Span::styled(status, theme.muted())]);
-        lines.push(vec![Span::styled("   size    ", theme.muted()), Span::styled(size_str(entry_size), theme.text_style())]);
-    }
-}
-
 fn push_folder_classification_lines(
     lines: &mut Vec<Vec<Span<'static>>>,
     classification: &FolderContentClassification,
@@ -3826,6 +3960,7 @@ fn push_folder_classification_lines(
     entry_size: u64,
     entry_date_label: &str,
     content_width: usize,
+    cached_disc_contents: Option<&crate::disc::DiscContents>,
     audio_streams_hovered: bool,
     audio_streams_pill_row: &mut Option<usize>,
     refresh_hovered: bool,
@@ -3834,96 +3969,786 @@ fn push_folder_classification_lines(
     is_symlink: bool,
     theme: super::theme::Theme,
 ) {
-    // Keep the essential accounting rows immediately after Kind. Album and
-    // disc-probe details can be arbitrarily long and belong below them.
     match classification.kind {
-        FolderClassificationKind::Album => push_key_value_line(
-            lines, "Kind", "album folder", theme.muted(), theme.bold(theme.blue),
+        FolderClassificationKind::Album | FolderClassificationKind::Disc |
+        FolderClassificationKind::MultiDisc => push_media_folder_layout(
+            lines, classification, browse, accounting, entry_path, entry_date_label,
+            content_width, cached_disc_contents, audio_streams_hovered,
+            audio_streams_pill_row, refresh_hovered, refresh_pill_row, is_symlink, theme,
         ),
-        FolderClassificationKind::Disc => {
-            let marker = classification
-                .disc_marker
-                .map(|marker| marker.label())
-                .or_else(|| {
-                    classification.units.first()
-                        .and_then(|unit| unit.disc_marker.map(|marker| marker.label()))
-                })
-                .unwrap_or("disc");
-            push_key_value_line(
-                lines, "Kind", format!("{marker} disc folder"),
-                theme.muted(), theme.bold(theme.purple),
-            );
-        }
-        FolderClassificationKind::MultiDisc => push_key_value_line(
-            lines, "Kind", "multi-disc album", theme.muted(), theme.bold(theme.blue),
-        ),
-        FolderClassificationKind::Collection | FolderClassificationKind::Unknown =>
-            push_key_value_line(lines, "Kind", "directory", theme.muted(), theme.text_style()),
-    }
-    // A symlink can be classified as a directory because Browse follows its
-    // target for navigation. The accounting scanner deliberately does not
-    // follow symlink roots, so no directory-accounting action belongs here.
-    if !is_symlink {
-        *refresh_pill_row = push_directory_stats_lines(
-            lines, browse, accounting, entry_path, entry_date_label, content_width,
-            refresh_hovered, refresh_focused, theme,
-        );
-    }
-
-    match classification.kind {
-        FolderClassificationKind::Album => {
-            lines.push(vec![
-                Span::raw("   "),
-                Span::styled(
-                    truncate_to(
-                        &folder_audio_headline(&classification.audio, browse, true),
-                        content_width.saturating_sub(3),
-                    ),
-                    theme.text_style(),
-                ),
-            ]);
-            push_folder_audio_detail_lines(lines, &classification.audio, browse, content_width, theme);
-        }
-        FolderClassificationKind::Disc => {
-            let source_path = classification.disc_probe_source_path(entry_path);
-            push_disc_probe_summary_lines(
-                lines, browse, source_path, entry_size, content_width,
-                audio_streams_hovered, audio_streams_pill_row, theme,
-            );
-        }
-        FolderClassificationKind::MultiDisc => {
-            let disc_word = if classification.unit_count == 1 { "disc" } else { "discs" };
-            let mut headline = format!("{} {disc_word}", classification.unit_count);
-            if classification.audio.track_count > 0 {
-                headline.push_str(" · ");
-                headline.push_str(&folder_audio_headline(&classification.audio, browse, true));
+        FolderClassificationKind::Collection | FolderClassificationKind::Unknown => {
+            push_directory_detail_line(lines, "Kind", "directory", theme.text_style(),
+                content_width, theme);
+            if !is_symlink {
+                *refresh_pill_row = push_directory_stats_lines(
+                    lines, browse, accounting, entry_path, entry_date_label, content_width,
+                    refresh_hovered, refresh_focused, theme,
+                );
             }
-            lines.push(vec![
-                Span::raw("   "),
-                Span::styled(
-                    truncate_to(&headline, content_width.saturating_sub(3)),
-                    theme.text_style(),
-                ),
-            ]);
-            push_folder_audio_detail_lines(lines, &classification.audio, browse, content_width, theme);
-            if classification.audio.track_count > 0 && classification.units.len() <= 6 {
-                for unit in &classification.units {
-                    let unit_line = format!(
-                        "{}: {}", unit.name,
-                        folder_audio_headline(&unit.audio, browse, false)
-                    );
-                    lines.push(vec![
-                        Span::raw("   "),
-                        Span::styled(
-                            truncate_to(&unit_line, content_width.saturating_sub(3)),
-                            theme.muted(),
-                        ),
-                    ]);
+        }
+    }
+    let _ = entry_size;
+
+}
+
+// Media previews share a fixed value column with an explicit label/value gap.
+// Plain directories retain their existing C4 metric formatter.
+const MEDIA_INDENT: &str = " ";
+const MEDIA_LABEL_COLUMNS: usize = 12;
+
+fn media_accent(value: impl Into<String>, theme: super::theme::Theme) -> Span<'static> {
+    Span::styled(value.into(), Style::default().fg(theme.cyan))
+}
+
+fn media_secondary(value: impl Into<String>, theme: super::theme::Theme) -> Span<'static> {
+    Span::styled(value.into(), Style::default().fg(theme.text_muted))
+}
+
+fn media_count(count: usize, singular: &'static str, plural: &'static str,
+    theme: super::theme::Theme) -> Vec<Span<'static>> {
+    vec![media_accent(count.to_string(), theme),
+        media_secondary(format!(" {}", if count == 1 { singular } else { plural }), theme)]
+}
+
+/// Render media values inside the Info pane. Normal panes retain a shared
+/// value column. Narrow panes use a shorter label gap when an entire value
+/// fits; otherwise the label is put above the value. Word breaks preserve
+/// status text, while a count and its noun stay on the same physical line.
+fn push_media_row(
+    lines: &mut Vec<Vec<Span<'static>>>,
+    label: &'static str,
+    values: Vec<Span<'static>>,
+    content_width: usize,
+    theme: super::theme::Theme,
+) {
+    let prefix = format!("{}{label:<width$} ", MEDIA_INDENT, width = MEDIA_LABEL_COLUMNS);
+    let prefix_width = super::display_width::width(&prefix);
+    let value_width = content_width.saturating_sub(prefix_width);
+    let width_of = |span: &Span<'static>| super::display_width::width(span.content.as_ref());
+    let total_value_width: usize = values.iter().map(width_of).sum();
+    // A number and its noun are one semantic value, not two wrap points.
+    let is_count_noun = |count: &Span<'static>, noun: &Span<'static>| {
+        !count.content.is_empty()
+            && count.content.chars().all(|c| c.is_ascii_digit())
+            && noun.content.starts_with(' ')
+            && noun.content.trim().chars().all(|c| c.is_ascii_alphabetic() || c == ' ')
+    };
+    let first_value_width = values.first().map_or(0, width_of);
+    let widest_count_noun = values.windows(2)
+        .filter(|pair| is_count_noun(&pair[0], &pair[1]))
+        .map(|pair| width_of(&pair[0]) + width_of(&pair[1]))
+        .max().unwrap_or(0);
+    let widest_value = first_value_width.max(widest_count_noun);
+
+    // At width 22, "Modified  1970-01-01" fits on one line even though
+    // the normal 12-column grid does not. Do not make Contents or Audio
+    // harder to read by forcing their long values onto that short line.
+    let tight_prefix = format!("{}{label}  ", MEDIA_INDENT);
+    let tight_width = super::display_width::width(&tight_prefix);
+    let tight = !label.is_empty() && widest_value > value_width
+        && tight_width <= content_width
+        && total_value_width <= content_width - tight_width;
+    let compact = !tight && (content_width < prefix_width.saturating_add(4)
+        || widest_value > value_width);
+    if compact && !label.is_empty() {
+        lines.push(vec![Span::raw(MEDIA_INDENT), Span::styled(
+            truncate_to(label, content_width.saturating_sub(MEDIA_INDENT.len())), theme.muted())]);
+    }
+    let row_prefix = if compact { MEDIA_INDENT.to_string() }
+        else if tight { tight_prefix } else { prefix };
+    let row_prefix_width = super::display_width::width(&row_prefix);
+    // Continuations belong to the current field, not a new labelled field.
+    // Preserve the value column in inline layouts and the compact indent.
+    let continuation_prefix = if compact { MEDIA_INDENT.to_string() }
+        else { " ".repeat(row_prefix_width) };
+    let available = content_width.saturating_sub(row_prefix_width);
+    let mut row = vec![Span::styled(row_prefix.clone(), theme.muted())];
+    let mut used = 0usize;
+
+    // Group adjacent count/noun spans without losing their separate styles.
+    let mut segments: Vec<Vec<Span<'static>>> = Vec::with_capacity(values.len());
+    let mut iter = values.into_iter().peekable();
+    while let Some(span) = iter.next() {
+        if iter.peek().is_some_and(|noun| is_count_noun(&span, noun)) {
+            segments.push(vec![span, iter.next().expect("peeked count noun")]);
+        } else {
+            segments.push(vec![span]);
+        }
+    }
+    for (index, segment) in segments.iter().enumerate() {
+        let segment_width: usize = segment.iter().map(width_of).sum();
+        let separator = segment.len() == 1
+            && matches!(segment[0].content.trim(), "·" | "/");
+        if separator {
+            let next_width = segments.get(index + 1).map_or(0, |next|
+                next.iter().map(width_of).sum::<usize>());
+            if used == 0 || next_width == 0
+                || used + segment_width + next_width > available {
+                // A separator belongs between complete values, never at the
+                // end of one row or the beginning of the next.
+                continue;
+            }
+        }
+        if used > 0 && used + segment_width > available {
+            lines.push(row);
+            row = vec![Span::styled(continuation_prefix.clone(), theme.muted())];
+            used = 0;
+        }
+        if segment_width <= available {
+            for span in segment {
+                let text = if used == 0 {
+                    let text = span.content.trim_start();
+                    text.strip_prefix("· ").or_else(|| text.strip_prefix("/ "))
+                        .unwrap_or(text)
+                } else { span.content.as_ref() };
+                used += super::display_width::width(text);
+                row.push(Span::styled(text.to_owned(), span.style));
+            }
+            continue;
+        }
+        // A single long styled status/description may contain several words.
+        // Reflow at whitespace rather than permanently truncating its tail.
+        // Only a word wider than the complete value row needs ellipsis.
+        for span in segment {
+            let mut rest = span.content.as_ref().to_owned();
+            loop {
+                if used == 0 {
+                    let text = rest.trim_start();
+                    rest = text.strip_prefix("· ").or_else(|| text.strip_prefix("/ "))
+                        .unwrap_or(text).to_owned();
+                }
+                if rest.is_empty() { break; }
+                let remaining = available.saturating_sub(used);
+                let width = super::display_width::width(&rest);
+                if width <= remaining {
+                    row.push(Span::styled(rest, span.style));
+                    used += width;
+                    break;
+                }
+                let mut columns = 0usize;
+                let mut break_at = None;
+                for (byte, ch) in rest.char_indices() {
+                    if byte > 0 && ch.is_whitespace() && columns <= remaining {
+                        break_at = Some(byte);
+                    }
+                    columns += super::display_width::char_width(ch);
+                    if columns > remaining { break; }
+                }
+                let break_at = break_at.filter(|byte| !rest[*byte..].trim().is_empty()
+                    && super::display_width::width(rest[..*byte].trim_end()) <= remaining);
+                if let Some(byte) = break_at {
+                    let head = rest[..byte].trim_end();
+                    if !head.is_empty() {
+                        row.push(Span::styled(head.to_owned(), span.style));
+                    }
+                    lines.push(row);
+                    row = vec![Span::styled(continuation_prefix.clone(), theme.muted())];
+                    used = 0;
+                    rest = rest[byte..].trim_start().to_owned();
+                } else if used > 0 {
+                    lines.push(row);
+                    row = vec![Span::styled(continuation_prefix.clone(), theme.muted())];
+                    used = 0;
+                } else {
+                    // The first word itself exceeds a complete value row.
+                    // Abbreviate that word only; later words still get rows.
+                    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+                    let head = truncate_to(&rest[..end], available);
+                    used = super::display_width::width(&head);
+                    row.push(Span::styled(head, span.style));
+                    if rest[end..].trim().is_empty() { break; }
+                    rest = rest[end..].trim_start().to_owned();
+                    lines.push(row);
+                    row = vec![Span::styled(continuation_prefix.clone(), theme.muted())];
+                    used = 0;
                 }
             }
         }
-        FolderClassificationKind::Collection | FolderClassificationKind::Unknown => {}
     }
+    lines.push(row);
+}
+
+fn media_duration(seconds: f64) -> Option<String> {
+    if !seconds.is_finite() || seconds <= 0.0 { return None; }
+    let total = seconds.round() as u64;
+    let hours = total / 3600;
+    let minutes = (total % 3600) / 60;
+    let secs = total % 60;
+    Some(if hours > 0 { format!("{hours}h {minutes:02}m") }
+        else if minutes > 0 { format!("{minutes}m {secs:02}s") }
+        else { format!("{secs}s") })
+}
+
+fn media_duration_append(values: &mut Vec<Span<'static>>, seconds: Option<f64>,
+    theme: super::theme::Theme) {
+    if let Some(value) = seconds.and_then(media_duration) {
+        values.push(media_secondary(" · ", theme));
+        values.push(media_accent(value, theme));
+    }
+}
+
+fn media_edition(name: &str, title: &str) -> Option<String> {
+    // A suffix explicitly carried by the folder/ISO name is usable; a catalog
+    // number or an inferred pressing is not evidence of an edition.
+    let rest = name.get(title.len()..)?;
+    if !name.get(..title.len())?.eq_ignore_ascii_case(title) { return None; }
+    let suffix = rest.trim();
+    let enclosed = suffix.strip_prefix('[').and_then(|v| v.strip_suffix(']'))
+        .or_else(|| suffix.strip_prefix('(').and_then(|v| v.strip_suffix(')')));
+    enclosed.map(str::trim).filter(|v| !v.is_empty()).map(str::to_owned)
+}
+
+fn media_header_descriptor(
+    entry: &BrowseEntry,
+    browse: &BrowseState,
+    contents: Option<&crate::disc::DiscContents>,
+) -> String {
+    let classification = if entry.is_child_dir() && !browse.is_in_archive() {
+        browse.current_folder_classification()
+    } else { None };
+    if entry.is_video_transport_file() {
+        return if entry.path.extension().and_then(|v| v.to_str())
+            .is_some_and(|v| v.eq_ignore_ascii_case("vob")) {
+                "DVD-Video · VOB".to_string()
+            } else { "Blu-ray · M2TS".to_string() };
+    }
+    if let Some(classification) = classification {
+        if matches!(classification.kind, FolderClassificationKind::Album) {
+            let audio = &classification.audio;
+            return match (audio.dominant_format_label(), audio.is_mixed_format()) {
+                (Some(label), false) => label.to_string(),
+                (Some(label), true) => format!("{label} + mixed formats"),
+                _ => "audio files".to_string(),
+            };
+        }
+    }
+    let disc_kind = contents.map(|v| v.format.name())
+        .or_else(|| classification.and_then(|c| c.disc_marker.map(|m| m.label())))
+        .unwrap_or_else(|| match entry.kind {
+            EntryKind::SacdIso => "SACD",
+            EntryKind::DvdAudioIso | EntryKind::DvdAudioDir => "DVD-Audio",
+            EntryKind::DvdVideoIso | EntryKind::DvdVideoDir => "DVD-Video",
+            EntryKind::BlurayIso | EntryKind::BlurayDir => "Blu-ray",
+            _ => "disc",
+        });
+    let mut description = disc_kind.to_string();
+    if disc_kind == "Blu-ray" {
+        if let Some(p) = contents.and_then(|v| v.presentations.iter()
+            .filter(|p| p.format.codec.as_deref().is_some_and(|s|
+                s.eq_ignore_ascii_case("LPCM") || s.eq_ignore_ascii_case("PCM")))
+            .max_by_key(|p| p.format.sample_rate.unwrap_or(0))) {
+            let format = &p.format;
+            if let (Some(bits), Some(rate)) = (format.bit_depth, format.sample_rate) {
+                if rate % 1000 == 0 {
+                    description.push_str(&format!(" {bits}-{} {}", rate / 1000,
+                        format.codec.as_deref().unwrap_or("LPCM")));
+                }
+            }
+        }
+    }
+    let is_iso = matches!(entry.kind, EntryKind::SacdIso | EntryKind::DvdAudioIso
+        | EntryKind::DvdVideoIso | EntryKind::BlurayIso)
+        || classification.is_some_and(|c| c.units.iter().any(|u|
+            u.path.extension().and_then(|s| s.to_str())
+                .is_some_and(|s| s.eq_ignore_ascii_case("iso"))));
+    if is_iso && !disc_kind.eq_ignore_ascii_case("ISO") { description.push_str(" · ISO"); }
+    description
+}
+
+fn push_media_reference_header(
+    lines: &mut Vec<Vec<Span<'static>>>,
+    header: &BrowseMediaHeader,
+    descriptor: &str,
+    entry_name: &str,
+    content_width: usize,
+    theme: super::theme::Theme,
+) {
+    let max = content_width.saturating_sub(MEDIA_INDENT.len());
+    lines.push(vec![Span::raw(MEDIA_INDENT),
+        Span::styled(truncate_to(&header.title, max), theme.bold(theme.text_bright))]);
+    if header.artist.is_some() || header.year.is_some() {
+        let mut values = vec![Span::raw(MEDIA_INDENT)];
+        if let Some(artist) = &header.artist {
+            values.push(media_accent(artist, theme));
+        }
+        if let Some(year) = &header.year {
+            if header.artist.is_some() { values.push(media_secondary(" · ", theme)); }
+            values.push(media_secondary(year, theme));
+        }
+        // A long artist name must not paint through the right border.
+        let mut left = max;
+        let mut bounded = vec![Span::raw(MEDIA_INDENT)];
+        for span in values.into_iter().skip(1) {
+            let text = truncate_to(span.content.as_ref(), left);
+            left = left.saturating_sub(super::display_width::width(&text));
+            bounded.push(Span::styled(text, span.style));
+        }
+        lines.push(bounded);
+    } else {
+        lines.push(Vec::new());
+    }
+    let edition = media_edition(entry_name, &header.title);
+    if edition.is_some() || !descriptor.is_empty() {
+        let description = if let Some(edition) = edition {
+            // The edition may already name the medium ("Japan SHM SACD").
+            // Do not repeat it as "SACD · SACD · ISO".
+            let medium = descriptor.split(" · ").next().unwrap_or(descriptor);
+            let suffix = if edition.to_ascii_lowercase().ends_with(&medium.to_ascii_lowercase()) {
+                descriptor.strip_prefix(medium).unwrap_or(descriptor)
+                    .trim_start_matches(" · ")
+            } else { descriptor };
+            if suffix.is_empty() { edition } else { format!("{edition} · {suffix}") }
+        } else { descriptor.to_string() };
+        lines.push(vec![Span::raw(MEDIA_INDENT),
+            media_secondary(truncate_to(&description, max), theme)]);
+    } else {
+        lines.push(Vec::new());
+    }
+    lines.push(Vec::new());
+}
+
+fn push_media_album_audio(
+    lines: &mut Vec<Vec<Span<'static>>>,
+    audio: &FolderAudioSummary,
+    browse: &BrowseState,
+    content_width: usize,
+    label: &'static str,
+    theme: super::theme::Theme,
+) {
+    let rollup = browse.folder_probe_rollup(audio);
+    let noun = if label == "Audio" { "track" } else { "file" };
+    let mut values = media_count(audio.track_count, noun,
+        if label == "Audio" { "tracks" } else { "files" }, theme);
+    if rollup.probed_count == audio.track_count {
+        media_duration_append(&mut values, Some(rollup.total_duration_secs), theme);
+    }
+    push_media_row(lines, label, values, content_width, theme);
+    if let Some(format) = audio.dominant_format_label() {
+        let mut values = vec![media_accent(format.to_string(), theme)];
+        if audio.is_mixed_format() { values.push(media_secondary(" · mixed formats", theme)); }
+        if rollup.has_mixed_profiles() {
+            values.push(media_secondary(" · mixed audio profiles", theme));
+        } else if let Some(profile) = rollup.dominant_profile_label() {
+            let profile = profile.split('/').collect::<Vec<_>>();
+            if let Some(bits) = profile.first().filter(|s| !s.is_empty()) {
+                values.push(media_secondary(" · ", theme));
+                values.push(media_accent((*bits).to_string(), theme));
+            }
+            if let Some(rate) = profile.get(1).filter(|s| !s.is_empty()) {
+                values.push(media_secondary(" / ", theme));
+                values.push(media_accent((*rate).to_string(), theme));
+            }
+            if let Some(channels) = profile.get(2).filter(|s| !s.is_empty()) {
+                values.push(media_secondary(" · ", theme));
+                values.push(media_accent((*channels).to_string(), theme));
+            }
+        }
+        if rollup.probed_count > 0 && rollup.probed_count < audio.track_count {
+            values.push(media_secondary(format!(" ({} of {} probed)",
+                rollup.probed_count, audio.track_count), theme));
+        }
+        push_media_row(lines, "Format", values, content_width, theme);
+    }
+}
+
+fn media_disc_is_stereo(p: &crate::disc::DiscPresentation) -> bool {
+    if let Some(layout) = &p.format.channel_layout {
+        let layout = layout.to_ascii_lowercase();
+        if layout.contains("stereo") || layout == "2.0" || layout == "2ch" { return true; }
+    }
+    matches!(p.format.channels, Some(2))
+        || matches!(p.id, crate::disc::PresentationId::SacdArea(
+            crate::disc::SacdAreaId::Stereo))
+}
+
+fn media_disc_stream_name(p: &crate::disc::DiscPresentation) -> String {
+    let codec = p.format.codec.as_deref().unwrap_or(&p.label);
+    let fmt = &p.format;
+    let rate = fmt.sample_rate.filter(|r| *r > 0).map(|r| {
+        if r % 1000 == 0 { (r / 1000).to_string() }
+        else { format!("{:.1}", r as f64 / 1000.0) }
+    });
+    let quality = match (fmt.bit_depth, rate) {
+        (Some(bits), Some(rate)) => format!(" {bits}/{rate}"),
+        (None, Some(rate)) => format!(" {rate} kHz"),
+        (Some(bits), None) => format!(" {bits}-bit"),
+        _ => String::new(),
+    };
+    let layout = fmt.channel_layout.clone()
+        .or_else(|| fmt.channels.map(|n| if n == 2 { "stereo".into() }
+            else if n > 2 { "multichannel".into() } else { "mono".into() }));
+    format!("{codec}{quality}{}", layout.map(|s| format!(" {s}")).unwrap_or_default())
+}
+
+/// Mirrors the reference's Audio/Mixes/Streams, or Audio/Format/Areas for
+/// SACD. All values are derived from an already cached disc probe.
+fn push_media_disc_audio(
+    lines: &mut Vec<Vec<Span<'static>>>,
+    contents: &crate::disc::DiscContents,
+    content_width: usize,
+    theme: super::theme::Theme,
+) -> bool {
+    use crate::disc::{DiscFormat, PresentationId, SacdAreaId};
+    let streams = contents.presentations.len();
+    let sacd = contents.format == DiscFormat::Sacd;
+    let tracks = if sacd {
+        // The stereo and multichannel areas may contain the same titles.
+        contents.presentations.iter().map(|p| p.tracks.len()).max().unwrap_or(0)
+    } else {
+        contents.presentations.iter().map(|p| p.tracks.len()).sum()
+    };
+    let mut values = media_count(tracks, "track", "tracks", theme);
+    if sacd {
+        let duration = contents.presentations.iter()
+            .map(|p| p.total_duration_secs).filter(|s| s.is_finite() && *s > 0.0)
+            .fold(0.0f64, f64::max);
+        media_duration_append(&mut values, Some(duration), theme);
+    } else {
+        values.push(media_secondary(" · ", theme));
+        values.extend(media_count(streams, "stream", "streams", theme));
+    }
+    push_media_row(lines, "Audio", values, content_width, theme);
+    if sacd {
+        // Stereo is the reference's principal SACD format when both areas
+        // are present; probe order must not arbitrarily select multichannel.
+        if let Some(p) = contents.presentations.iter()
+            .find(|p| matches!(p.id, PresentationId::SacdArea(SacdAreaId::Stereo)))
+            .or_else(|| contents.presentations.first()) {
+            let rate = p.format.sample_rate.filter(|v| *v > 0);
+            let dsd = rate.and_then(|rate| (rate % 44_100 == 0).then_some(rate / 44_100))
+                .map(|multiplier| format!("DSD{multiplier}"))
+                .or_else(|| p.format.codec.clone()).unwrap_or_else(|| "DSD".into());
+            let mut format = vec![media_accent(dsd, theme)];
+            if let Some(rate) = rate {
+                format.push(media_secondary(" · ", theme));
+                format.push(media_accent(format!("{:.1} MHz", rate as f64 / 1_000_000.0), theme));
+            }
+            let layout = if media_disc_is_stereo(p) { "stereo" } else { "multichannel" };
+            format.push(media_secondary(" · ", theme));
+            format.push(media_accent(layout.to_string(), theme));
+            push_media_row(lines, "Format", format, content_width, theme);
+        }
+        let stereo = contents.presentations.iter().any(|p|
+            matches!(p.id, PresentationId::SacdArea(SacdAreaId::Stereo)));
+        let multi = contents.presentations.iter().any(|p|
+            matches!(p.id, PresentationId::SacdArea(SacdAreaId::MultiChannel)));
+        push_media_row(lines, "Areas", vec![
+            media_accent(format!("stereo {}", if stereo { "✓" } else { "—" }), theme),
+            media_secondary(" · ", theme),
+            media_secondary(format!("multichannel {}", if multi { "✓" } else { "—" }), theme),
+        ], content_width, theme);
+    } else {
+        let stereo = contents.presentations.iter().filter(|p| media_disc_is_stereo(p)).count();
+        let multi = streams.saturating_sub(stereo);
+        let mut mixes = Vec::new();
+        if stereo > 0 { mixes.extend(media_count(stereo, "stereo", "stereo", theme)); }
+        if multi > 0 {
+            if !mixes.is_empty() { mixes.push(media_secondary(" · ", theme)); }
+            mixes.extend(media_count(multi, "multichannel", "multichannel", theme));
+        }
+        if !mixes.is_empty() { push_media_row(lines, "Mixes", mixes, content_width, theme); }
+        let mut groups: Vec<(String, usize, bool, u32)> = Vec::new();
+        for presentation in &contents.presentations {
+            let description = media_disc_stream_name(presentation);
+            if let Some((_, count, _, _)) = groups.iter_mut().find(|(name, _, _, _)| *name == description) {
+                *count += 1;
+            } else {
+                let linear_pcm = presentation.format.codec.as_deref().is_some_and(|codec|
+                    codec.eq_ignore_ascii_case("LPCM") || codec.eq_ignore_ascii_case("PCM"));
+                groups.push((description, 1, linear_pcm,
+                    presentation.format.sample_rate.unwrap_or(0)));
+            }
+        }
+        // Show lossless LPCM and higher rates first, retaining a stable
+        // secondary ordering. The Streams view still provides every mix.
+        groups.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| b.3.cmp(&a.3))
+            .then_with(|| a.0.cmp(&b.0)));
+        let mut shown = 0;
+        for (index, (description, count, _, _)) in groups.iter().take(2).enumerate() {
+            let value = vec![media_secondary(format!("{count}× "), theme),
+                media_accent(description.clone(), theme)];
+            push_media_row(lines, if index == 0 { "Streams" } else { "" }, value,
+                content_width, theme);
+            shown += count;
+        }
+        if streams > shown {
+            push_media_row(lines, "", vec![media_secondary(format!("+ {} more", streams - shown), theme)],
+                content_width, theme);
+        }
+    }
+    let protection = contents.copy_protection.description.trim();
+    if !protection.is_empty() && (!sacd || !protection.eq_ignore_ascii_case("none")) {
+        let description = if protection.eq_ignore_ascii_case("none") {
+            "unencrypted".to_string()
+        } else { protection.to_string() };
+        push_media_row(lines, "Protection", vec![media_accent(description, theme)],
+            content_width, theme);
+    }
+    streams > 0
+}
+
+fn push_media_contents_and_size(
+    lines: &mut Vec<Vec<Span<'static>>>,
+    browse: &BrowseState,
+    accounting: &crate::directory_accounting::AccountingService,
+    path: &Path,
+    classification: Option<&FolderContentClassification>,
+    direct_file_size: Option<u64>,
+    entry_date_label: &str,
+    content_width: usize,
+    theme: super::theme::Theme,
+) -> bool {
+    use crate::directory_accounting::{format_bytes, Freshness};
+    let view = accounting.view(path);
+    let running = direct_file_size.is_none()
+        && (view.is_some_and(|v| v.running) || accounting.scan_pending(path));
+    let progress = view.and_then(|v| v.progress.as_ref());
+    let complete = view.and_then(|v| v.cached.as_ref())
+        .filter(|v| direct_file_size.is_none() && v.freshness != Freshness::KnownInvalid)
+        .map(|v| v.measurement.counts);
+    let listing = (path == browse.current_dir.as_path())
+        .then(|| browse.current_directory_listing_counts()).flatten();
+    let local = view.and_then(|v| v.local);
+    let folders = if direct_file_size.is_some() { None } else {
+        local.map(|c| c.folders)
+            .or_else(|| listing.map(|c| c.folders as u128))
+    };
+    let iso_units = classification.map_or(0, |classification|
+        classification.units.iter().filter(|u|
+            u.path.extension().and_then(|s| s.to_str())
+                .is_some_and(|s| s.eq_ignore_ascii_case("iso"))).count());
+    let disc_image_count = if direct_file_size.is_some() { 1 }
+        else if classification.is_some_and(|c| c.kind == FolderClassificationKind::Disc
+            && c.units.is_empty()) { 0 }
+        else { iso_units };
+    let mut contents = Vec::new();
+    // A one-level count can describe immediate contents even when no
+    // complete recursive size measurement has finished. The Size row
+    // still reports unknown until a complete result is available.
+    let count = direct_file_size.map(|_| 1u128)
+        .or_else(|| complete.map(|c| c.files))
+        .or_else(|| local.map(|c| c.files))
+        .or_else(|| listing.map(|c| c.files as u128));
+    if let Some(count) = count {
+        let count = usize::try_from(count).unwrap_or(usize::MAX);
+        // When the only file is an ISO, put 'disc image' first, as in the
+        // Blu-ray reference. Otherwise retain the file count and add the ISO
+        // subset, as in the SACD reference. Never add subsets to totals.
+        if !(disc_image_count > 0 && count == disc_image_count) {
+            contents.extend(media_count(count, "file", "files", theme));
+        }
+    } else if running {
+        contents.push(media_secondary("scanning…", theme));
+    } else {
+        contents.push(media_secondary("unknown", theme));
+    }
+    if disc_image_count > 0 {
+        if !contents.is_empty() && count != Some(disc_image_count as u128) {
+            contents.push(media_secondary(" · ", theme));
+        } else if count == Some(disc_image_count as u128) { contents.clear(); }
+        contents.extend(media_count(disc_image_count, "disc image", "disc images", theme));
+    }
+    if let Some(folders) = folders {
+        if folders > 0 {
+            if !contents.is_empty() { contents.push(media_secondary(" · ", theme)); }
+            let count = usize::try_from(folders).unwrap_or(usize::MAX);
+            contents.extend(media_count(count, "folder", "folders", theme));
+        }
+    }
+    push_media_row(lines, "Contents", contents, content_width, theme);
+    if classification.is_some_and(|c| c.kind == FolderClassificationKind::Album)
+        && complete.is_some_and(|counts| counts.audio > 0) {
+        let counts = complete.expect("checked above");
+        let files = counts.files;
+        let audio = counts.audio.min(files);
+        let other = files.saturating_sub(audio);
+        let mut breakdown = vec![media_accent(audio.to_string(), theme), media_secondary(" audio", theme)];
+        breakdown.push(media_secondary(" · ", theme));
+        breakdown.push(media_accent(other.to_string(), theme));
+        breakdown.push(media_secondary(" other", theme));
+        push_media_row(lines, "", breakdown, content_width, theme);
+    }
+    let value = if let Some(bytes) = direct_file_size {
+        vec![media_accent(format_bytes(bytes as u128), theme)]
+    } else if running {
+        let current = format_bytes(progress.map_or(0, |p| p.bytes_examined));
+        vec![media_accent(format!("{} {current}…", directory_spinner()), theme)]
+    } else if let Some(cached) = complete {
+        vec![media_accent(format_bytes(cached.bytes), theme)]
+    } else {
+        vec![media_secondary("unknown", theme)]
+    };
+    push_media_row(lines, "Size", value, content_width, theme);
+    let modified = if entry_date_label.is_empty() {
+        vec![media_secondary("unknown", theme)]
+    } else {
+        vec![media_accent(entry_date_label.to_string(), theme)]
+    };
+    push_media_row(lines, "Modified", modified, content_width, theme);
+    running
+}
+
+fn push_media_actions(
+    lines: &mut Vec<Vec<Span<'static>>>,
+    content_width: usize,
+    running: bool,
+    show_refresh: bool,
+    show_streams: bool,
+    refresh_hovered: bool,
+    streams_hovered: bool,
+    refresh_pill_row: &mut Option<usize>,
+    streams_pill_row: &mut Option<usize>,
+    theme: super::theme::Theme,
+) {
+    if !show_refresh && !show_streams { return; }
+    lines.push(Vec::new());
+    let row_index = lines.len();
+    let mut row = vec![Span::raw(MEDIA_INDENT)];
+    let mut remaining = content_width.saturating_sub(MEDIA_INDENT.len());
+    if show_refresh {
+        let label = if running { " Cancel " } else { " Refresh " };
+        let width = super::display_width::width(label);
+        if remaining >= width {
+            let bg = if refresh_hovered { theme.blue } else { theme.purple };
+            row.push(Span::styled(label, Style::default()
+                .fg(theme.pill_active_fg).bg(bg).add_modifier(Modifier::BOLD)));
+            remaining -= width;
+            *refresh_pill_row = Some(row_index);
+        }
+    }
+    if show_streams {
+        let label = " Streams… ";
+        let width = super::display_width::width(label);
+        let gap = if refresh_pill_row.is_some() { 2 } else { 0 };
+        if remaining >= gap + width {
+            if gap > 0 { row.push(Span::raw("  ")); }
+            let bg = if streams_hovered { theme.blue } else { theme.purple };
+            row.push(Span::styled(label, Style::default()
+                .fg(theme.pill_active_fg).bg(bg).add_modifier(Modifier::BOLD)));
+            *streams_pill_row = Some(row_index);
+        }
+    }
+    lines.push(row);
+}
+
+fn push_media_folder_layout(
+    lines: &mut Vec<Vec<Span<'static>>>,
+    classification: &FolderContentClassification,
+    browse: &BrowseState,
+    accounting: &crate::directory_accounting::AccountingService,
+    entry_path: &Path,
+    entry_date_label: &str,
+    content_width: usize,
+    cached_disc_contents: Option<&crate::disc::DiscContents>,
+    audio_streams_hovered: bool,
+    audio_streams_pill_row: &mut Option<usize>,
+    refresh_hovered: bool,
+    refresh_pill_row: &mut Option<usize>,
+    is_symlink: bool,
+    theme: super::theme::Theme,
+) {
+    let mut has_streams = false;
+    match classification.kind {
+        FolderClassificationKind::Album => push_media_album_audio(lines, &classification.audio,
+            browse, content_width, "Audio", theme),
+        FolderClassificationKind::Disc => {
+            let path = classification.disc_probe_source_path(entry_path);
+            if let Some(contents) = cached_disc_contents {
+                has_streams = push_media_disc_audio(lines, contents, content_width, theme);
+            } else {
+                let status = browse.disc_probe_cache.get(path)
+                    .and_then(|cache| cache.error_if_current(path))
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| if browse.disc_probe_pending.contains(path) {
+                        "Analyzing disc…".into()
+                    } else { "disc metadata not cached".into() });
+                push_media_row(lines, "Audio", vec![media_secondary(status, theme)],
+                    content_width, theme);
+            }
+        }
+        FolderClassificationKind::MultiDisc => {
+            let has_iso = classification.units.iter().any(|u| u.disc_marker.is_some());
+            if classification.audio.track_count > 0 {
+                push_media_album_audio(lines, &classification.audio, browse, content_width,
+                    if has_iso { "Audio files" } else { "Audio" }, theme);
+            }
+            push_media_row(lines, "Discs", media_count(classification.unit_count,
+                "disc", "discs", theme), content_width, theme);
+            // Filesystem enumeration order is unspecified. Sort the small
+            // presentation list, not the cached classification or the scanner.
+            let mut units = classification.units.iter().collect::<Vec<_>>();
+            units.sort_by_cached_key(|unit| (unit.name.to_lowercase(), unit.path.clone()));
+            for unit in units.iter().take(6) {
+                // A direct child ISO should be shown by its real filename;
+                // an ISO inside "Disc 1/" retains that directory's unit name.
+                let display_name = if unit.path.parent() == Some(entry_path)
+                    && unit.path.extension().and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("iso")) {
+                    unit.path.file_name().and_then(|name| name.to_str())
+                        .unwrap_or(&unit.name)
+                } else { &unit.name };
+                let description = if let Some(marker) = unit.disc_marker {
+                    format!("{display_name} · {}", marker.label())
+                } else {
+                    format!("{display_name} · {} {}", unit.audio.track_count,
+                        if unit.audio.track_count == 1 { "track" } else { "tracks" })
+                };
+                push_media_row(lines, "", vec![media_secondary(description, theme)], content_width, theme);
+            }
+            if classification.units.len() > 6 {
+                push_media_row(lines, "", vec![media_secondary(
+                    format!("+ {} more discs", classification.units.len() - 6), theme)],
+                    content_width, theme);
+            }
+        }
+        _ => return,
+    }
+    let running = push_media_contents_and_size(lines, browse, accounting, entry_path,
+        Some(classification), None, entry_date_label, content_width, theme);
+    push_media_actions(lines, content_width, running, !is_symlink, has_streams,
+        refresh_hovered, audio_streams_hovered, refresh_pill_row,
+        audio_streams_pill_row, theme);
+}
+
+/// Directly selected ISO files and disc-source directories use the same
+/// presentation as a directory classified as containing an ISO. This draws
+/// from already cached probe/accounting data; it starts no new work.
+fn push_direct_disc_layout(
+    lines: &mut Vec<Vec<Span<'static>>>,
+    entry: &BrowseEntry,
+    browse: &BrowseState,
+    accounting: &crate::directory_accounting::AccountingService,
+    entry_date_label: &str,
+    content_width: usize,
+    cached_disc_contents: Option<&crate::disc::DiscContents>,
+    audio_streams_hovered: bool,
+    audio_streams_pill_row: &mut Option<usize>,
+    refresh_hovered: bool,
+    refresh_pill_row: &mut Option<usize>,
+    theme: super::theme::Theme,
+) {
+    let source = entry.path.as_path();
+    let has_streams = if let Some(contents) = cached_disc_contents {
+        push_media_disc_audio(lines, contents, content_width, theme)
+    } else {
+        let status = browse.disc_probe_cache.get(source)
+            .and_then(|cache| cache.error_if_current(source))
+            .map(str::to_owned)
+            .unwrap_or_else(|| if browse.disc_probe_pending.contains(source) {
+                "Analyzing disc…".to_owned()
+            } else if matches!(browse.directory_summary_cold_work_policy,
+                BrowseDirectorySummaryColdWorkPolicy::AfterDescendOnly) {
+                "disc summary available after descend/scan".to_owned()
+            } else { "disc metadata not cached".to_owned() });
+        push_media_row(lines, "Audio", vec![media_secondary(status, theme)], content_width, theme);
+        false
+    };
+    let physical_dir = entry.is_child_dir();
+    let running = push_media_contents_and_size(lines, browse, accounting, source,
+        None, (!physical_dir).then_some(entry.size), entry_date_label, content_width, theme);
+    push_media_actions(lines, content_width, running, physical_dir && !entry.is_symlink,
+        has_streams, refresh_hovered, audio_streams_hovered, refresh_pill_row,
+        audio_streams_pill_row, theme);
 }
 
 /// Build content lines for the info pane based on the entry kind.
@@ -4013,52 +4838,57 @@ fn entry_info_lines(
         entry.date_label()
     };
 
-    // Directory Name starts at the top of a full-height Info pane. A compact
-    // viewport keeps the accounting action visible when only eight rows fit.
-    let physical_directory = !browse.is_in_archive() &&
-        (matches!(entry.kind, EntryKind::ParentDir) || entry.is_child_dir());
-    if !physical_directory {
-        lines.push(vec![]);
-    }
-    lines.push(vec![Span::styled(if physical_directory { "   Name" } else { "   name" }, theme.muted())]);
+    // All selections start at the same cell with the same header height.
+    // Classification and probe arrival may enrich text but cannot move the
+    // body down or shift the title horizontally.
+    let disc_source_path = if entry.is_disc_source() {
+        Some(entry.path.as_path())
+    } else if matches!(entry.kind, EntryKind::Directory) && !browse.is_in_archive() {
+        browse.current_folder_classification().filter(|c|
+            c.kind == FolderClassificationKind::Disc
+        ).map(|c| c.disc_probe_source_path(&entry.path))
+    } else { None };
+    let cached_disc_contents = disc_source_path.and_then(|path|
+        browse.disc_probe_cache.get(path)
+            .and_then(|cache| cache.contents_if_current(path))
+    );
     let display_name = if matches!(entry.kind, EntryKind::ParentDir) && !browse.is_in_archive() {
         browse.current_dir.file_name()
             .and_then(|name| name.to_str())
             .filter(|name| !name.is_empty())
             .map(str::to_owned)
             .unwrap_or_else(|| browse.current_dir.display().to_string())
-    } else {
-        entry.name.clone()
-    };
-    if physical_directory {
-        // Match the reference's multiline physical-directory name without
-        // truncating its last word at ordinary Info-pane widths.
-        let mut row = String::new();
-        for word in display_name.split_whitespace() {
-            let joined = if row.is_empty() { word.to_string() }
-                else { format!("{row} {word}") };
-            if !row.is_empty() && super::display_width::width(&joined) > max_value_chars {
-                lines.push(vec![Span::raw("   "), Span::styled(row, theme.bright())]);
-                row = word.to_string();
-            } else { row = joined; }
-        }
-        if row.is_empty() { row = display_name; }
-        lines.push(vec![Span::raw("   "),
-            Span::styled(truncate_to(&row, max_value_chars), theme.bright())]);
-    } else {
-        lines.push(vec![Span::raw("   "),
-            Span::styled(truncate_to(&display_name, max_value_chars), theme.bright())]);
-    }
-    if !physical_directory {
-        lines.push(vec![]);
-    }
+    } else if matches!(entry.kind, EntryKind::Archive)
+        && entry.path.extension().and_then(|s| s.to_str())
+            .is_some_and(|s| s.eq_ignore_ascii_case("iso")) {
+        // ISOs start out as Archive until the cheap kind probe completes.
+        // Use the same visible title before and after the promotion.
+        entry.path.file_stem().and_then(|s| s.to_str())
+            .unwrap_or(&entry.name).to_owned()
+    } else { entry.name.clone() };
+    let header = media_header_for_entry(entry, browse, cached_disc_contents.as_deref())
+        .unwrap_or_else(|| BrowseMediaHeader {
+            title: display_name.clone(), artist: None, year: None, catalog: None,
+        });
+    let descriptor = if entry.is_disc_source() || entry.is_video_transport_file()
+        || (entry.is_child_dir() && !browse.is_in_archive()
+            && browse.current_folder_classification().is_some_and(|c|
+                matches!(c.kind, FolderClassificationKind::Album
+                    | FolderClassificationKind::Disc | FolderClassificationKind::MultiDisc))) {
+        media_header_descriptor(entry, browse, cached_disc_contents.as_deref())
+    } else { String::new() };
+    let edition_name = if entry.is_child_dir() { entry.name.as_str() }
+        else { entry.path.file_stem().and_then(|s| s.to_str()).unwrap_or(&entry.name) };
+    push_media_reference_header(&mut lines, &header, &descriptor, edition_name,
+        content_width, theme);
 
     match &entry.kind {
         EntryKind::ParentDir => {
             if browse.is_in_archive() {
                 lines.push(vec![Span::styled("   parent directory", theme.muted())]);
             } else {
-                push_key_value_line(&mut lines, "Kind", "directory", theme.muted(), theme.text_style());
+                push_directory_detail_line(&mut lines, "Kind", "directory", theme.text_style(),
+                    content_width, theme);
                 refresh_pill_row = push_directory_stats_lines(
                     &mut lines, browse, accounting, &browse.current_dir, &entry_date_label,
                     content_width, refresh_hovered, refresh_focused, theme,
@@ -4083,6 +4913,7 @@ fn entry_info_lines(
                     entry.size,
                     &entry_date_label,
                     content_width,
+                    cached_disc_contents.as_deref(),
                     audio_streams_hovered,
                     &mut audio_streams_pill_row,
                     refresh_hovered,
@@ -4092,10 +4923,8 @@ fn entry_info_lines(
                     theme,
                 );
             } else {
-                lines.push(vec![
-                    Span::styled("   Kind    ", theme.muted()),
-                    Span::styled("directory", theme.text_style()),
-                ]);
+                push_directory_detail_line(&mut lines, "Kind", "directory", theme.text_style(),
+                    content_width, theme);
                 if !entry.is_symlink {
                     refresh_pill_row = push_directory_stats_lines(
                         &mut lines, browse, accounting, &entry.path, &entry_date_label,
@@ -4103,10 +4932,8 @@ fn entry_info_lines(
                     );
                 }
                 if browse.folder_classification_pending_for(&entry.path) {
-                    lines.push(vec![
-                        Span::styled("   Content ", theme.muted()),
-                        Span::styled("classifying...", Style::default().fg(theme.text_dim)),
-                    ]);
+                    push_directory_detail_line(&mut lines, "Content", "classifying...",
+                        Style::default().fg(theme.text_dim), content_width, theme);
                 }
             }
         }
@@ -4569,186 +5396,85 @@ fn entry_info_lines(
         | EntryKind::DvdVideoDir
         | EntryKind::BlurayIso
         | EntryKind::BlurayDir => {
-            let disc_kind = match &entry.kind {
-                EntryKind::DvdAudioIso => "DVD-Audio ISO",
-                EntryKind::DvdAudioDir => "DVD-Audio directory",
-                EntryKind::DvdVideoIso => "DVD-Video ISO",
-                EntryKind::DvdVideoDir => "DVD-Video directory",
-                EntryKind::BlurayIso => "Blu-ray ISO",
-                EntryKind::BlurayDir => "Blu-ray directory",
-                _ => unreachable!("disc info arm only handles disc entries"),
-            };
-            lines.push(vec![
-                Span::styled(
-                    if entry.is_child_dir() && !browse.is_in_archive() {
-                        "   Kind    "
-                    } else { "   kind    " },
-                    theme.muted(),
-                ),
-                Span::styled(disc_kind, theme.bold(theme.purple)),
-            ]);
-            if entry.is_child_dir() && !browse.is_in_archive() && !entry.is_symlink {
-                refresh_pill_row = push_directory_stats_lines(
-                    &mut lines, browse, accounting, &entry.path, &entry_date_label,
-                    content_width, refresh_hovered, refresh_focused, theme,
-                );
-            }
-            push_disc_probe_summary_lines(
-                &mut lines,
-                browse,
-                &entry.path,
-                entry.size,
-                content_width,
-                audio_streams_hovered,
-                &mut audio_streams_pill_row,
-                theme,
-            );
+            push_direct_disc_layout(&mut lines, entry, browse, accounting,
+                &entry_date_label, content_width, cached_disc_contents.as_deref(),
+                audio_streams_hovered, &mut audio_streams_pill_row,
+                refresh_hovered, &mut refresh_pill_row, theme);
         }
         EntryKind::Archive => {
-            lines.push(vec![
-                Span::styled("   kind    ", theme.muted()),
-                Span::styled("archive (7z)", theme.text_style()),
-            ]);
-            lines.push(vec![
-                Span::styled("   size    ", theme.muted()),
-                Span::styled(size_str(entry.size), theme.text_style()),
-            ]);
-        }
-        EntryKind::SacdIso => {
-            lines.push(vec![
-                Span::styled("   kind    ", theme.muted()),
-                Span::styled("SACD ISO (ScarletBook)", theme.text_style()),
-            ]);
-
-            // SACD ISOs are native disc sources and must use the same compact
-            // content/stream summary renderer as Blu-ray, DVD-Audio, and
-            // DVD-Video sources. Keep the SACD-specific metadata/edit-tags UI
-            // below, but do not bypass the shared disc probe cache path.
-            push_disc_probe_summary_lines(
-                &mut lines,
-                browse,
-                &entry.path,
-                entry.size,
-                content_width,
-                audio_streams_hovered,
-                &mut audio_streams_pill_row,
-                theme,
-            );
-
-            if let Some(cached) = browse.current_cached_info() {
-                let info = &cached.source;
-                lines.push(vec![]);
+            if entry.path.extension().and_then(|v| v.to_str())
+                .is_some_and(|v| v.eq_ignore_ascii_case("iso")) {
+                // The cheap kind probe may not yet have promoted this ISO to a
+                // native disc source. Hold its header and body position until
+                // the effective kind arrives; do not invent stream metadata.
+                push_media_row(&mut lines, "Audio", vec![media_secondary(
+                    "disc format not identified", theme)], content_width, theme);
+                push_media_contents_and_size(&mut lines, browse, accounting, &entry.path,
+                    None, Some(entry.size), &entry_date_label, content_width, theme);
+            } else {
                 lines.push(vec![
-                    Span::styled("   format  ", theme.muted()),
-                    Span::styled(info.format_name.clone(), theme.bold(theme.purple)),
+                    Span::styled("   kind    ", theme.muted()),
+                    Span::styled("archive (7z)", theme.text_style()),
                 ]);
-                lines.push(vec![
-                    Span::styled("   codec   ", theme.muted()),
-                    Span::styled(info.codec_display(), theme.text_style()),
-                ]);
-                if info.sample_rate > 0 {
-                    lines.push(vec![
-                        Span::styled("   rate    ", theme.muted()),
-                        Span::styled(info.sample_rate_display(), theme.text_style()),
-                    ]);
-                }
-                if info.channels > 0 {
-                    lines.push(vec![
-                        Span::styled("   channels", theme.muted()),
-                        Span::raw(" "),
-                        Span::styled(info.channels_display(), theme.text_style()),
-                    ]);
-                }
-                if info.duration_secs > 0.0 {
-                    lines.push(vec![
-                        Span::styled("   duration", theme.muted()),
-                        Span::raw(" "),
-                        Span::styled(info.duration_display(), theme.text_style()),
-                    ]);
-                }
                 lines.push(vec![
                     Span::styled("   size    ", theme.muted()),
-                    Span::styled(info.size_display(), theme.text_style()),
+                    Span::styled(size_str(entry.size), theme.text_style()),
                 ]);
-
-                // Album-level metadata block (from sidecar overlay when
-                // present, ScarletBook fallback otherwise).
-                let meta = &cached.metadata;
-                let inline_max = max_value_chars.saturating_sub(11);
-                let has_any = meta.album.is_some()
-                    || meta.artist.is_some()
-                    || meta.genre.is_some()
-                    || meta.year.is_some()
-                    || meta.catalog_number.is_some();
-                if has_any {
-                    lines.push(vec![]);
-                    if let Some(s) = &meta.artist {
-                        lines.push(vec![
-                            Span::styled("   artist  ", metadata_label_style(MetadataField::Artist)),
-                            Span::styled(truncate_to(s, inline_max), theme.text_style()),
-                        ]);
-                    }
-                    if let Some(s) = &meta.album {
-                        lines.push(vec![
-                            Span::styled("   album   ", metadata_label_style(MetadataField::Album)),
-                            Span::styled(truncate_to(s, inline_max), theme.text_style()),
-                        ]);
-                    }
-                    if let Some(s) = &meta.genre {
-                        lines.push(vec![
-                            Span::styled("   genre   ", metadata_label_style(MetadataField::Genre)),
-                            Span::styled(truncate_to(s, inline_max), theme.text_style()),
-                        ]);
-                    }
-                    if let Some(s) = &meta.year {
-                        lines.push(vec![
-                            Span::styled("   year    ", metadata_label_style(MetadataField::Year)),
-                            Span::styled(truncate_to(s, inline_max), theme.text_style()),
-                        ]);
-                    }
-                    if let Some(s) = &meta.catalog_number {
-                        lines.push(vec![
-                            Span::styled("   catalog ", theme.muted()),
-                            Span::styled(truncate_to(s, inline_max), theme.text_style()),
-                        ]);
-                    }
+            }
+        }
+        EntryKind::SacdIso => {
+            push_direct_disc_layout(&mut lines, entry, browse, accounting,
+                &entry_date_label, content_width, cached_disc_contents.as_deref(),
+                audio_streams_hovered, &mut audio_streams_pill_row,
+                refresh_hovered, &mut refresh_pill_row, theme);
+            // Keep the SACD metadata editor even before the disc probe arrives.
+            // The primary album/artist/year already live in the shared header.
+            if let Some(cached) = browse.current_cached_info() {
+                if let Some(genre) = &cached.metadata.genre {
+                    push_media_row(&mut lines, "Genre", vec![media_accent(genre.clone(), theme)],
+                        content_width, theme);
+                }
+                if let Some(catalog) = &cached.metadata.catalog_number {
+                    push_media_row(&mut lines, "Catalog", vec![media_accent(catalog.clone(), theme)],
+                        content_width, theme);
                 }
             }
-
-            // Edit-tags pill — parity with the AudioFile arm so SACD ISOs have
-            // a clickable mouse path to the metadata editor. This remains
-            // available even while the async disc/source probe is pending.
-            lines.push(vec![]);
-            let edit_tags_row = lines.len();
-            let et_label = " edit tags ";
-            let et_w = super::display_width::width(et_label);
-            let et_pad = content_width.saturating_sub(et_w + 3);
-            let et_bg = if edit_tags_hovered {
-                theme.blue
-            } else {
-                theme.purple
-            };
-            lines.push(vec![
-                Span::raw(" ".repeat(et_pad)),
-                Span::styled(
-                    et_label,
-                    Style::default()
-                        .fg(theme.pill_active_fg)
-                        .bg(et_bg)
-                        .add_modifier(ratatui::style::Modifier::BOLD),
-                ),
-            ]);
-            sacd_edit_tags_row = Some(edit_tags_row);
+            lines.push(Vec::new());
+            let row = lines.len();
+            let bg = if edit_tags_hovered { theme.blue } else { theme.purple };
+            lines.push(vec![Span::raw(MEDIA_INDENT), Span::styled(" edit tags ",
+                Style::default().fg(theme.pill_active_fg).bg(bg)
+                    .add_modifier(Modifier::BOLD))]);
+            sacd_edit_tags_row = Some(row);
         }
         EntryKind::OtherFile => {
-            lines.push(vec![
-                Span::styled("   kind    ", theme.muted()),
-                Span::styled("file", theme.text_style()),
-            ]);
-            lines.push(vec![
-                Span::styled("   size    ", theme.muted()),
-                Span::styled(size_str(entry.size), theme.text_style()),
-            ]);
+            if entry.is_video_transport_file() {
+                // The header already describes DVD-Video/VOB or Blu-ray/M2TS.
+                // Render the same column grid as the other media previews.
+                if let Some(streams) = browse.current_cached_info()
+                    .and_then(|cached| cached.transport.as_ref()) {
+                    push_transport_stream_lines(&mut lines, streams, content_width, theme);
+                } else {
+                    let status = if browse.probe_pending.contains(&entry.path) {
+                        "Inspecting streams…"
+                    } else { "stream details not cached" };
+                    push_media_field(&mut lines, "Status", status, content_width, theme);
+                }
+                push_media_row(&mut lines, "Size", vec![media_accent(
+                    size_str(entry.size), theme)], content_width, theme);
+                push_media_row(&mut lines, "Modified", vec![media_accent(
+                    if entry_date_label.is_empty() { "unknown".into() }
+                    else { entry_date_label.clone() }, theme)], content_width, theme);
+            } else {
+                lines.push(vec![
+                    Span::styled("   kind    ", theme.muted()),
+                    Span::styled("file", theme.text_style()),
+                ]);
+                lines.push(vec![
+                    Span::styled("   size    ", theme.muted()),
+                    Span::styled(size_str(entry.size), theme.text_style()),
+                ]);
+            }
         }
     }
 
@@ -4862,6 +5588,7 @@ mod browse_list_render_allocation_tests {
                 album: Some("Album".to_string()),
                 ..SourceMetadata::default()
             },
+            transport: None,
         }
     }
 
@@ -5075,6 +5802,189 @@ mod folder_classification_info_pane_tests {
     }
 
     #[test]
+    fn media_fields_fit_minimum_info_pane_width_without_separators() {
+        for width in [13usize, 14, 18, 22, 78] {
+            let mut lines = Vec::new();
+            push_media_field(&mut lines, "Probed time", "long unavailable value", width, theme());
+            push_media_field(&mut lines, "Protection", "CPPM / CSS", width, theme());
+            push_media_field(&mut lines, "Format", "FLAC", width, theme());
+            for (line_no, row) in lines.iter().enumerate() {
+                let painted_width = row.iter().map(|span|
+                    crate::tui::display_width::width(span.content.as_ref())).sum::<usize>();
+                assert!(painted_width <= width,
+                    "width {width}, row {line_no} overran Info content: {painted_width}");
+            }
+        }
+    }
+
+    fn cache_flac_tag(
+        browse: &mut BrowseState,
+        path: PathBuf,
+        album: Option<&str>,
+        artist: Option<&str>,
+        year: Option<&str>,
+    ) {
+        let metadata = crate::tui::probe::SourceMetadata {
+            album: album.map(str::to_owned),
+            artist: artist.map(str::to_owned),
+            year: year.map(str::to_owned),
+            ..Default::default()
+        };
+        browse.insert_probe_cache_for_test(path, Some(std::sync::Arc::new(CachedInfo {
+            source: crate::tui::probe::SourceInfo {
+                format_name: "FLAC".into(), codec: "FLAC".into(),
+                bit_depth: Some(24), sample_format_is_float: Some(false),
+                compression_is_lossless: Some(true), sample_rate: 96_000,
+                channels: 2, channel_layout: "stereo".into(),
+                duration_secs: 120.0, file_size: 0,
+            },
+            metadata,
+            transport: None,
+        })));
+    }
+
+    #[test]
+    fn album_header_uses_consistent_cached_tags_and_falls_back_on_conflicts() {
+        let entry = BrowseEntry::new(PathBuf::from("/music/folder"),
+            "folder".into(), EntryKind::Directory, 0, None);
+        let p1 = entry.path.join("01.flac");
+        let p2 = entry.path.join("02.flac");
+        let identity = ProbeCacheIdentity::from_entry(&entry);
+        let mut classification = FolderContentClassification {
+            kind: FolderClassificationKind::Album,
+            identity,
+            audio: audio_summary(&[p1.clone(), p2.clone()], "FLAC"),
+            units: Vec::new(), unit_count: 1, collection_many: false,
+            io_budget_exhausted: false, disc_marker: None,
+            embedded_cue_availability: crate::tui::probe::EmbeddedCueAvailability::Unknown,
+            cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
+            cue_repair_availability: crate::tui::browse::CueRepairAvailability::Unknown,
+            cue_file_reference_repairs: BTreeMap::new(),
+        };
+        let mut browse = BrowseState::new();
+        browse.entries = vec![entry.clone()];
+        browse.selected_index = 0;
+        browse.insert_folder_classification_for_identity(entry.path.clone(), identity,
+            classification.clone());
+        cache_flac_tag(&mut browse, p1.clone(), Some("The Album"), Some("The Artist"), Some("1987"));
+        cache_flac_tag(&mut browse, p2.clone(), Some("the album"), Some("THE ARTIST"), Some("1987"));
+
+        let header = media_header_for_entry(&entry, &browse, None).expect("album header");
+        assert_eq!(header.title, "The Album");
+        assert_eq!(header.artist.as_deref(), Some("The Artist"));
+        assert_eq!(header.year.as_deref(), Some("1987"));
+
+        cache_flac_tag(&mut browse, p2, Some("Different Album"), Some("Another Artist"), None);
+        let conflicting = media_header_for_entry(&entry, &browse, None).expect("album header");
+        assert_eq!(conflicting.title, "folder", "do not invent a single album from disagreeing tags");
+        assert!(conflicting.artist.is_none(), "a conflicting track artist is not an album artist");
+        assert_eq!(conflicting.year.as_deref(), Some("1987"));
+
+        classification.audio.file_paths.clear();
+        browse.insert_folder_classification_for_identity(entry.path.clone(), identity, classification);
+        let unknown = media_header_for_entry(&entry, &browse, None).expect("album header");
+        assert_eq!(unknown.title, "folder");
+        assert!(unknown.artist.is_none());
+        assert!(unknown.year.is_none());
+    }
+
+    fn transport_preview_info(
+        name: &str,
+        summary: crate::tui::probe::TransportStreamSummary,
+    ) -> (String, InfoContent) {
+        let path = PathBuf::from(format!("/tmp/{name}"));
+        let entry = BrowseEntry::new(path.clone(), name.into(), EntryKind::OtherFile, 0, None);
+        let mut browse = BrowseState::new();
+        browse.entries = vec![entry.clone()];
+        browse.selected_index = 0;
+        let mut info = CachedInfo::new(crate::tui::probe::SourceInfo {
+            format_name: "M2TS".into(), codec: "DTS".into(), bit_depth: None,
+            sample_format_is_float: None, compression_is_lossless: None,
+            sample_rate: 48000, channels: 2, channel_layout: "stereo".into(),
+            duration_secs: 123.0, file_size: 0,
+        }, crate::tui::probe::SourceMetadata::default());
+        info.transport = Some(summary);
+        browse.insert_probe_cache_for_test(path, Some(std::sync::Arc::new(info)));
+        let rendered = entry_info_lines(&entry, &browse,
+            &crate::directory_accounting::AccountingService::new(None),
+            96, false, false, false, false, None, None, theme());
+        (flatten(&rendered), rendered)
+    }
+
+    #[test]
+    fn transport_previews_render_video_and_all_cached_audio_streams() {
+        use crate::tui::probe::{TransportAudioStream, TransportStreamSummary, TransportVideoStream};
+        let video = TransportVideoStream { codec: "H.264".into(), width: 1920, height: 1080 };
+        let audio1 = TransportAudioStream { codec: "DTS".into(), sample_rate: 48000,
+            channels: 6, channel_layout: "5.1".into() };
+        let audio2 = TransportAudioStream { codec: "AC3".into(), sample_rate: 48000,
+            channels: 2, channel_layout: "stereo".into() };
+
+        // Blu-ray with a multichannel mix and stereo commentary.
+        let (rendered, info) = transport_preview_info("movie.m2ts", TransportStreamSummary {
+            video_count: 1, audio_count: 2, videos: vec![video.clone()],
+            audios: vec![audio1, audio2.clone()], duration_secs: 123.0,
+        });
+        assert!(rendered.contains("Blu-ray · M2TS"), "{rendered}");
+        assert!(rendered.contains("1 video stream") && rendered.contains("2 audio streams"), "{rendered}");
+        assert!(rendered.contains("Video") && rendered.contains("H.264") && rendered.contains("1920×1080"), "{rendered}");
+        assert!(rendered.contains("DTS · 5.1 · 48 kHz"), "{rendered}");
+        assert!(rendered.contains("AC3 · stereo · 48 kHz"), "{rendered}");
+        assert!(info.audio_streams_pill_row.is_none(), "transport preview is not a disc browser");
+
+        // One audio stream, same bounded preview path.
+        let (single, _) = transport_preview_info("clip.VOB", TransportStreamSummary {
+            video_count: 1, audio_count: 1, videos: vec![video.clone()],
+            audios: vec![audio2], duration_secs: 20.0,
+        });
+        assert!(single.contains("DVD-Video · VOB") && single.contains("1 audio stream"), "{single}");
+        assert!(single.contains("AC3 · stereo · 48 kHz"), "{single}");
+        assert!(!single.contains("no audio streams"));
+
+        // Valid video-only menu VOB: completed probe is NOT 'not cached'.
+        let (silent, _) = transport_preview_info("menu.vob", TransportStreamSummary {
+            video_count: 1, audio_count: 0, videos: vec![video],
+            audios: Vec::new(), duration_secs: 6.0,
+        });
+        assert!(silent.contains("1 video stream") && silent.contains("0 audio streams"), "{silent}");
+        assert!(silent.contains("no audio streams"), "{silent}");
+        assert!(!silent.contains("not cached") && !silent.contains("Probing audio"), "{silent}");
+
+        let other = BrowseEntry::new(PathBuf::from("/tmp/readme.txt"),
+            "readme.txt".into(), EntryKind::OtherFile, 0, None);
+        let mut browse = BrowseState::new();
+        browse.entries = vec![other.clone()];
+        let plain = entry_info_lines(&other, &browse,
+            &crate::directory_accounting::AccountingService::new(None),
+            96, false, false, false, false, None, None, theme());
+        assert!(flatten(&plain).contains("file"));
+        assert!(!flatten(&plain).contains("video stream"));
+    }
+
+    #[test]
+    fn transport_preview_omits_missing_streams_and_bounds_lines_in_narrow_panes() {
+        use crate::tui::probe::{TransportStreamSummary, TransportVideoStream};
+        let summary = TransportStreamSummary {
+            video_count: 9, audio_count: 0,
+            videos: vec![TransportVideoStream { codec: "H.264".into(),
+                width: 1920, height: 1080 }],
+            audios: vec![], duration_secs: 1.0,
+        };
+        for width in [13usize, 18, 22, 78] {
+            let mut lines = Vec::new();
+            push_transport_stream_lines(&mut lines, &summary, width, theme());
+            for line in &lines {
+                let used = line.iter().map(|span|
+                    crate::tui::display_width::width(span.content.as_ref())).sum::<usize>();
+                assert!(used <= width, "width={width}, line={line:?}, used={used}");
+            }
+        }
+        let (rendered, info) = transport_preview_info("many.m2ts", summary);
+        assert!(rendered.contains("… and 8 more"), "{rendered}");
+        assert!(info.audio_streams_pill_row.is_none());
+    }
+
+    #[test]
     fn album_classification_renders_track_format_and_probe_state() {
         let entry = BrowseEntry::new(
             PathBuf::from("/music/album"),
@@ -5108,8 +6018,9 @@ mod folder_classification_info_pane_tests {
 
         let (rendered, info) = render_classification(entry, classification);
 
-        assert!(rendered.contains("album folder"));
-        assert!(rendered.contains("2 tracks · FLAC"));
+        assert!(!rendered.contains("album folder"));
+        assert!(rendered.contains("Audio") && rendered.contains("2 tracks"));
+        assert!(rendered.contains("Format") && rendered.contains("FLAC"));
         assert!(!rendered.contains("probing..."));
         assert!(info.audio_streams_pill_row.is_none());
     }
@@ -5169,11 +6080,148 @@ mod folder_classification_info_pane_tests {
 
         let (rendered, _) = render_classification(entry, classification);
 
-        assert!(rendered.contains("multi-disc album"));
-        assert!(rendered.contains("2 discs · 2 tracks · FLAC"));
+        assert!(!rendered.contains("multi-disc album"));
+        assert!(rendered.contains("Discs") && rendered.contains("2"));
+        assert!(rendered.contains("Audio") && rendered.contains("2 tracks"));
+        assert!(rendered.contains("Format") && rendered.contains("FLAC"));
         assert!(!rendered.contains("probing..."));
-        assert!(rendered.contains("Disc 1: 1 track · FLAC"));
-        assert!(rendered.contains("Disc 2: 1 track · FLAC"));
+        assert!(rendered.contains("Disc 1 · 1 track"));
+        assert!(rendered.contains("Disc 2 · 1 track"));
+    }
+
+    #[test]
+    fn numbered_iso_multidisc_renders_disc_names_without_zero_tracks() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        std::fs::write(root.join("Disc 1.iso"), b"").expect("disc 1 fixture");
+        std::fs::write(root.join("Disc 2.iso"), b"").expect("disc 2 fixture");
+        let entry = BrowseEntry::new(root.to_path_buf(), "Album".into(),
+            EntryKind::Directory, 0, None);
+        let mut classification = crate::tui::browse::classify_folder_content_blocking(
+            root, ProbeCacheIdentity::from_entry(&entry));
+        assert_eq!(classification.kind, FolderClassificationKind::MultiDisc);
+        assert_eq!(classification.audio.track_count, 0);
+        classification.units.reverse(); // Deliberately non-directory order.
+        let (rendered, _) = render_classification(entry, classification);
+        assert!(!rendered.contains("multi-disc album"), "{rendered}");
+        assert!(rendered.contains("Discs") && rendered.contains("2"), "{rendered}");
+        let first = rendered.find("Disc 1.iso · ISO").expect(&rendered);
+        let second = rendered.find("Disc 2.iso · ISO").expect(&rendered);
+        assert!(first < second, "ISO unit order: {rendered}");
+        assert!(!rendered.contains("ISO · ISO"), "redundant ISO descriptor: {rendered}");
+        assert!(!rendered.contains("Tracks") && !rendered.contains("0 tracks"), "{rendered}");
+    }
+
+    #[test]
+    fn flac_and_iso_multidisc_labels_only_the_regular_audio_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        std::fs::create_dir(root.join("Disc 1")).expect("disc 1 directory");
+        std::fs::write(root.join("Disc 1").join("01.flac"), b"").expect("track fixture");
+        std::fs::write(root.join("Disc 2.iso"), b"").expect("disc 2 image");
+        let entry = BrowseEntry::new(root.to_path_buf(), "Album".into(),
+            EntryKind::Directory, 0, None);
+        let mut classification = crate::tui::browse::classify_folder_content_blocking(
+            root, ProbeCacheIdentity::from_entry(&entry));
+        assert_eq!(classification.kind, FolderClassificationKind::MultiDisc);
+        assert_eq!(classification.audio.track_count, 1);
+        classification.units.reverse(); // Mixed unit kinds must sort equally.
+        let (rendered, _) = render_classification(entry, classification);
+        assert!(rendered.contains("Audio files") && rendered.contains("1 file"), "{rendered}");
+        let first = rendered.find("Disc 1 · 1 track").expect(&rendered);
+        let second = rendered.find("Disc 2.iso · ISO").expect(&rendered);
+        assert!(first < second, "mixed unit order: {rendered}");
+        assert!(rendered.contains("Discs") && rendered.contains("2"), "{rendered}");
+        assert!(!rendered.contains("Tracks") && !rendered.contains("1 tracks"), "{rendered}");
+    }
+
+    #[test]
+    fn nested_iso_multidisc_uses_the_disc_directory_names() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for n in 1..=2 {
+            let folder = temp.path().join(format!("Disc {n}"));
+            std::fs::create_dir(&folder).expect("disc directory");
+            std::fs::write(folder.join("media.iso"), b"").expect("disc image");
+        }
+        let entry = BrowseEntry::new(temp.path().to_path_buf(), "Album".into(),
+            EntryKind::Directory, 0, None);
+        let classification = crate::tui::browse::classify_folder_content_blocking(
+            temp.path(), ProbeCacheIdentity::from_entry(&entry));
+        assert_eq!(classification.kind, FolderClassificationKind::MultiDisc);
+        let (rendered, _) = render_classification(entry, classification);
+        assert!(rendered.contains("Disc 1 · ISO") && rendered.contains("Disc 2 · ISO"),
+            "{rendered}");
+        assert!(!rendered.contains("media.iso · ISO"), "{rendered}");
+    }
+
+    #[test]
+    fn multidisc_audio_files_count_preserves_right_border_at_compact_widths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let disc = root.join("Disc 1");
+        std::fs::create_dir(&disc).expect("disc directory");
+        for n in 1..=7 {
+            std::fs::write(disc.join(format!("{n:02}.flac")), b"")
+                .expect("audio fixture");
+        }
+        std::fs::write(root.join("Disc 2.iso"), b"").expect("ISO fixture");
+
+        let entry = BrowseEntry::new(root.to_path_buf(), "Album".into(),
+            EntryKind::Directory, 0, None);
+        let identity = ProbeCacheIdentity::from_entry(&entry);
+        let classification = crate::tui::browse::classify_folder_content_blocking(root, identity);
+        assert_eq!(classification.kind, FolderClassificationKind::MultiDisc);
+        assert_eq!(classification.audio.track_count, 7);
+        assert!(classification.units.iter().any(|unit| unit.disc_marker.is_some()));
+
+        let mut browse = BrowseState::new();
+        browse.entries = vec![entry.clone()];
+        browse.selected_index = 0;
+        browse.insert_folder_classification_for_identity(
+            entry.path.clone(), identity, classification);
+        let accounting = crate::directory_accounting::AccountingService::new(None);
+        for width in [14usize, 18, 19, 20, 28] {
+            let info = entry_info_lines(&entry, &browse, &accounting, width,
+                false, false, false, false, None, None, theme());
+            for (index, row) in info.lines.iter().enumerate() {
+                let painted = row.iter().map(|span|
+                    super::super::display_width::width(span.content.as_ref())).sum::<usize>();
+                assert!(painted <= width,
+                    "content width={width}, row={index}, painted={painted}: {row:?}");
+                let bordered = bordered_line(theme().border_dim, width + 2, row.clone(), theme());
+                assert_eq!(bordered.width(), width + 2,
+                    "right border displaced at width={width}, row={index}");
+                assert_eq!(bordered.spans.last().map(|s| s.content.as_ref()), Some("│"));
+            }
+            let rows = reference_rows(&info);
+            let label_row = rows.iter().position(|line| line.contains("Audio files"))
+                .unwrap_or_else(|| panic!("missing Audio files: {rows:?}"));
+            if width <= 20 {
+                assert_eq!(rows[label_row], " Audio files", "width={width}: {rows:?}");
+                assert_eq!(rows[label_row + 1], " 7 files", "width={width}: {rows:?}");
+            } else {
+                assert_eq!(rows[label_row], " Audio files  7 files",
+                    "width={width}: {rows:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn long_multidisc_sets_show_six_units_and_the_remainder() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for n in 1..=8 {
+            std::fs::write(temp.path().join(format!("Disc {n}.iso")), b"")
+                .expect("ISO fixture");
+        }
+        let entry = BrowseEntry::new(temp.path().to_path_buf(), "Album".into(),
+            EntryKind::Directory, 0, None);
+        let classification = crate::tui::browse::classify_folder_content_blocking(
+            temp.path(), ProbeCacheIdentity::from_entry(&entry));
+        assert_eq!(classification.kind, FolderClassificationKind::MultiDisc);
+        let (rendered, _) = render_classification(entry, classification);
+        assert!(rendered.contains("Discs") && rendered.contains("8"), "{rendered}");
+        assert!(rendered.contains("+ 2 more discs"), "{rendered}");
+        assert!(!rendered.contains("Tracks  0") && !rendered.contains("0 tracks"));
     }
 
     #[test]
@@ -5203,7 +6251,14 @@ mod folder_classification_info_pane_tests {
 
         let (rendered, _) = render_classification(entry, classification);
 
-        assert!(rendered.contains("Kind    directory"));
+        let kind = rendered.lines().find(|row| row.contains("Kind"))
+            .expect("Kind row");
+        let folders = rendered.lines().find(|row| row.contains("Folders"))
+            .expect("Folders row");
+        assert_eq!(kind.find("directory"), folders.find("unknown"),
+            "Kind and counted metrics share the same value column: {rendered}");
+        assert!(rendered.starts_with(" artist\n\n\n\n"),
+            "keep the header stationary across lazy classification: {rendered}");
         assert!(!rendered.contains("collection · 24 albums"));
         assert!(!rendered.contains("probing..."));
         assert!(!rendered.contains("streams:"));
@@ -5444,9 +6499,13 @@ mod folder_classification_info_pane_tests {
         browse.selected_index = 0;
         browse.insert_folder_classification_for_identity(root.clone(), identity, classification);
         let fingerprint = disc_probe_fingerprint(&root).expect("disc fingerprint");
+        let mut disc = disc_contents(root.clone());
+        disc.album_title = Some("Blu-ray Album".into());
+        disc.album_artist = Some("Blu-ray Artist".into());
+        disc.year = Some("2018".into());
         browse.disc_probe_cache.insert(
             root.clone(),
-            DiscProbeCacheEntry::from_success(fingerprint, disc_contents(root.clone())),
+            DiscProbeCacheEntry::from_success(fingerprint, disc),
         );
 
         let info = entry_info_lines(
@@ -5464,12 +6523,14 @@ mod folder_classification_info_pane_tests {
         );
         let rendered = flatten(&info);
 
-        assert!(rendered.contains("Blu-ray disc folder"));
-        assert!(rendered.contains("content: 7 audio streams · 7 tracks"));
-        assert!(rendered.contains("streams:"));
-        assert!(rendered.contains("LPCM 24-bit/96kHz stereo"));
-        assert!(rendered.contains("... and 1 more"));
-        assert!(!rendered.contains("copy protection"));
+        assert!(!rendered.contains("Blu-ray disc folder"));
+        assert!(rendered.contains("Blu-ray Album"));
+        assert!(rendered.contains("Blu-ray Artist") && rendered.contains("2018"));
+        assert!(rendered.contains("7 tracks") && rendered.contains("7 streams"));
+        assert!(rendered.contains("Streams"));
+        assert!(rendered.contains("LPCM 24/96"));
+        assert!(rendered.contains("+ 4 more"));
+        assert!(rendered.contains("Protection") && rendered.contains("unencrypted"));
         assert!(info.audio_streams_pill_row.is_some());
     }
 
@@ -5520,11 +6581,13 @@ mod folder_classification_info_pane_tests {
             match marker {
                 FolderDiscMarkerKind::DvdAudio => {
                     contents.format = DiscFormat::DvdAudio;
+                    contents.copy_protection.description = "CPPM".into();
                     presentation.id = PresentationId::DvdAudioGroup(1);
                     presentation.format.codec = Some("MLP".to_string());
                 }
                 FolderDiscMarkerKind::DvdVideo => {
                     contents.format = DiscFormat::DvdVideo;
+                    contents.copy_protection.description = "CSS".into();
                     presentation.id = PresentationId::dvd_video(1, 1, 0);
                     presentation.format.codec = Some("LPCM".to_string());
                 }
@@ -5571,7 +6634,25 @@ mod folder_classification_info_pane_tests {
                 info.audio_streams_pill_row.is_some(),
                 "{marker:?} folder with one presentation must expose audio streams",
             );
-            assert!(rendered.contains("content: 1 audio stream"));
+            // SACD areas describe overlapping programs, not independent
+            // Blu-ray/DVD streams. Its reference layout reports the track
+            // count and areas rather than manufacturing a stream count.
+            if marker == FolderDiscMarkerKind::Sacd {
+                assert!(rendered.contains("1 track") && rendered.contains("Areas"));
+            } else {
+                assert!(rendered.contains("1 stream"));
+            }
+            match marker {
+                FolderDiscMarkerKind::DvdAudio => {
+                    assert!(rendered.contains("MLP") && rendered.contains("CPPM"));
+                }
+                FolderDiscMarkerKind::DvdVideo => {
+                    assert!(rendered.contains("LPCM") && rendered.contains("CSS"));
+                }
+                FolderDiscMarkerKind::Sacd => assert!(rendered.contains("DSD")),
+                FolderDiscMarkerKind::BluRay => assert!(rendered.contains("AC3")),
+                FolderDiscMarkerKind::Iso => unreachable!(),
+            }
         }
     }
 
@@ -5626,11 +6707,11 @@ mod folder_classification_info_pane_tests {
         );
         let rendered = flatten(&info);
 
-        assert!(rendered.contains("copy protection AACS"));
+        assert!(rendered.contains("Protection") && rendered.contains("AACS"));
     }
 
     #[test]
-    fn disc_folder_suppresses_whitespace_padded_none_copy_protection() {
+    fn disc_folder_labels_known_none_copy_protection_as_unencrypted() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().join("UNPROTECTED");
         std::fs::create_dir(&root).expect("disc root");
@@ -5680,7 +6761,7 @@ mod folder_classification_info_pane_tests {
         );
         let rendered = flatten(&info);
 
-        assert!(!rendered.contains("copy protection"));
+        assert!(rendered.contains("Protection") && rendered.contains("unencrypted"));
     }
 
     #[test]
@@ -5728,8 +6809,8 @@ mod folder_classification_info_pane_tests {
         );
         let rendered = flatten(&info);
 
-        assert!(rendered.contains("Blu-ray disc folder"));
-        assert!(rendered.contains("disc summary not cached"));
+        assert!(rendered.contains("Cached Only Disc"));
+        assert!(rendered.contains("disc metadata not cached"));
         assert!(
             !rendered.contains("Analyzing disc…"),
             "cached-only mode must not claim a worker is running when none is pending"
@@ -5785,6 +6866,850 @@ mod folder_classification_info_pane_tests {
     }
 
     #[test]
+    fn streams_control_hitbox_covers_only_the_painted_button() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let temp = tempfile::tempdir().expect("tempdir");
+        let iso = temp.path().join("disc.iso");
+        std::fs::write(&iso, b"synthetic disc iso").expect("iso fixture");
+        let metadata = std::fs::metadata(&iso).expect("metadata");
+        let entry = BrowseEntry::new(iso.clone(), "disc.iso".into(),
+            EntryKind::BlurayIso, metadata.len(), metadata.modified().ok());
+        let mut browse = BrowseState::new();
+        browse.entries = vec![entry];
+        browse.selected_index = 0;
+        let fingerprint = disc_probe_fingerprint(&iso).expect("disc fingerprint");
+        browse.disc_probe_cache.insert(iso.clone(),
+            DiscProbeCacheEntry::from_success(fingerprint, disc_contents(iso)));
+        let accounting = crate::directory_accounting::AccountingService::new(None);
+        let mut terminal = Terminal::new(TestBackend::new(72, 36)).expect("terminal");
+        let mut buttons = ButtonRenderMap::new();
+        terminal.draw(|frame| {
+            draw_browse_info(frame, Rect::new(0, 0, 72, 36), &browse,
+                &accounting, None, None, &mut buttons, None, theme());
+        }).expect("draw");
+        let hit = buttons.find_button_rect(&TuiButton::BrowseInfoAudioStreams)
+            .expect("Streams button should fit in tall Info pane");
+        assert_eq!(hit.width, super::super::display_width::width(" Streams… ") as u16);
+        assert_eq!(hit.x, 2, "direct ISO Streams is left-aligned after one indent");
+        assert_eq!(buttons.find_button_at(hit.x, hit.y), Some(TuiButton::BrowseInfoAudioStreams));
+        assert_eq!(buttons.find_button_at(hit.x + hit.width - 1, hit.y),
+            Some(TuiButton::BrowseInfoAudioStreams));
+        assert_ne!(buttons.find_button_at(hit.x - 1, hit.y),
+            Some(TuiButton::BrowseInfoAudioStreams), "left padding is not clickable");
+    }
+
+    // Three screenshot specifications: source data is fixture data, not an
+    // assertion that TonePoet must manufacture absent metadata.
+    fn reference_accounting(path: &Path, files: u128, audio: u128, folders: u128,
+        bytes: u128) -> crate::directory_accounting::AccountingService {
+        use crate::directory_accounting::{AccountingService, CachedMeasurement, Counts,
+            CompleteMeasurement, Freshness};
+        use crate::directory_accounting::model::Observation;
+        let mut service = AccountingService::new(None);
+        let time = SystemTime::UNIX_EPOCH;
+        let counts = Counts { files, audio, folders, bytes, ..Default::default() };
+        let view = service.views.entry(path.to_path_buf()).or_default();
+        view.cached = Some(CachedMeasurement {
+            measurement: CompleteMeasurement {
+                path: path.to_path_buf(), counts,
+                started: time, finished: time, created: None, modified: None,
+                generation: 1, observation: Observation::AsObserved,
+            },
+            freshness: Freshness::AsObserved,
+        });
+        view.local = Some(Counts { folders, ..Default::default() });
+        service
+    }
+
+    fn reference_disc_info(
+        root: &Path,
+        display_name: &str,
+        file_name: &str,
+        marker: FolderDiscMarkerKind,
+        contents: DiscContents,
+        accounting: &crate::directory_accounting::AccountingService,
+    ) -> (InfoContent, BrowseState) {
+        let entry = BrowseEntry::new(root.to_path_buf(), display_name.to_owned(),
+            EntryKind::Directory, 0, None);
+        let identity = ProbeCacheIdentity::from_entry(&entry);
+        let iso = root.join(file_name);
+        let classification = FolderContentClassification {
+            kind: FolderClassificationKind::Disc, identity,
+            audio: FolderAudioSummary::default(),
+            units: vec![FolderUnitSummary {
+                path: iso.clone(), parent: root.to_path_buf(),
+                name: file_name.to_string(), disc_marker: Some(marker),
+                audio: FolderAudioSummary::default(),
+            }],
+            unit_count: 1, collection_many: false, io_budget_exhausted: false,
+            disc_marker: Some(marker),
+            embedded_cue_availability: crate::tui::probe::EmbeddedCueAvailability::Unknown,
+            cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
+            cue_repair_availability: crate::tui::browse::CueRepairAvailability::Unknown,
+            cue_file_reference_repairs: BTreeMap::new(),
+        };
+        let mut browse = BrowseState::new();
+        browse.entries = vec![entry.clone()];
+        browse.selected_index = 0;
+        browse.insert_folder_classification_for_identity(root.to_path_buf(), identity, classification);
+        let fingerprint = disc_probe_fingerprint(&iso).expect("ISO fixture fingerprint");
+        browse.disc_probe_cache.insert(iso.clone(),
+            DiscProbeCacheEntry::from_success(fingerprint, contents));
+        let info = entry_info_lines(&entry, &browse, accounting, 78,
+            false, false, false, false, None, None, theme());
+        (info, browse)
+    }
+
+    fn reference_rows(info: &InfoContent) -> Vec<String> {
+        info.lines.iter().map(|row| row.iter().map(|span| span.content.as_ref())
+            .collect::<String>().trim_end().to_string()).collect()
+    }
+
+    fn reference_labels_in_order(info: &InfoContent, labels: &[&str]) {
+        let mut last = None;
+        for label in labels {
+            let index = info.lines.iter().position(|line| line.first()
+                .is_some_and(|span| span.content.trim() == *label))
+                .unwrap_or_else(|| panic!("missing {label:?}: {:?}", reference_rows(info)));
+            assert!(last.is_none_or(|old| index > old),
+                "label {label:?} out of order: {:?}", reference_rows(info));
+            last = Some(index);
+        }
+    }
+
+    #[test]
+    fn media_reference_rows_never_overrun_narrow_info_panes() {
+        for width in [11usize, 13, 14, 18, 28, 78] {
+            let mut lines = Vec::new();
+            push_media_row(&mut lines, "Protection", vec![
+                media_accent("CPPM · copy-protected long identifier", theme()),
+            ], width, theme());
+            push_media_row(&mut lines, "Streams", vec![
+                media_secondary("12× ", theme()),
+                media_accent("LPCM 24/192 multichannel", theme()),
+            ], width, theme());
+            let (mut refresh, mut streams) = (None, None);
+            push_media_actions(&mut lines, width, false, true, true, false, false,
+                &mut refresh, &mut streams, theme());
+            for line in &lines {
+                let len: usize = line.iter().map(|s|
+                    super::super::display_width::width(s.content.as_ref())).sum();
+                assert!(len <= width, "width {width}, line {line:?}, painted {len}");
+            }
+            assert!(refresh.is_some(), "Refresh is visible at width {width}");
+            if let Some(row) = streams {
+                assert_eq!(Some(row), refresh, "controls share a row");
+            }
+        }
+    }
+
+    #[test]
+    fn compact_media_row_does_not_paint_values_on_a_label_only_row() {
+        for width in [11usize, 13, 14] {
+            let mut rows = Vec::new();
+            push_media_row(&mut rows, "Protection", vec![
+                media_accent("CPPM copy-protected", theme()),
+            ], width, theme());
+            assert_eq!(rows[0].iter().map(|s| s.content.as_ref())
+                .collect::<String>(), " Protection");
+            assert_eq!(rows[1][0].content.as_ref(), MEDIA_INDENT);
+            assert!(rows.len() >= 2, "width={width}: {rows:?}");
+            assert!(rows.iter().skip(1).any(|row| row.iter()
+                .any(|span| span.content.contains("CPPM"))));
+            for row in rows {
+                let painted = row.iter().map(|s|
+                    super::super::display_width::width(s.content.as_ref())).sum::<usize>();
+                assert!(painted <= width, "width={width}, painted={painted}");
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_media_rows_keep_status_and_count_units_without_orphaning_the_date() {
+        let mut lines = Vec::new();
+        push_media_row(&mut lines, "Audio", vec![
+            media_secondary("disc metadata not cached", theme()),
+        ], 22, theme());
+        let status = lines.iter().map(|row| row.iter()
+            .map(|span| span.content.as_ref()).collect::<String>())
+            .map(|row| row.trim().to_string()).collect::<Vec<_>>().join(" ");
+        assert!(status.contains("disc metadata not cached"), "{status}");
+        assert!(!status.contains('…'), "status was truncated: {status}");
+
+        lines.clear();
+        let mut contents = media_count(12, "file", "files", theme());
+        contents.push(media_secondary(" · ", theme()));
+        contents.extend(media_count(2, "folder", "folders", theme()));
+        push_media_row(&mut lines, "Contents", contents, 22, theme());
+        let rows = lines.iter().map(|row| row.iter()
+            .map(|span| span.content.as_ref()).collect::<String>())
+            .collect::<Vec<_>>();
+        assert_eq!(rows, vec![" Contents".to_string(),
+            " 12 files · 2 folders".to_string()], "{rows:?}");
+
+        lines.clear();
+        push_media_row(&mut lines, "Modified", vec![
+            media_accent("1970-01-01", theme()),
+        ], 22, theme());
+        assert_eq!(lines.len(), 1, "date should fit with its label: {lines:?}");
+        assert!(lines[0].iter().map(|span| span.content.as_ref())
+            .collect::<String>().contains("Modified  1970-01-01"));
+        for row in lines {
+            let width = row.iter().map(|span| super::super::display_width::width(
+                span.content.as_ref())).sum::<usize>();
+            assert!(width <= 22, "date row width {width}");
+        }
+    }
+
+    #[test]
+    fn wrapped_audio_count_keeps_a_single_label_and_both_values() {
+        let mut values = media_count(64, "track", "tracks", theme());
+        values.push(media_secondary(" · ", theme()));
+        values.extend(media_count(12, "stream", "streams", theme()));
+        let mut rows = Vec::new();
+        push_media_row(&mut rows, "Audio", values, 24, theme());
+        let painted = rows.iter().map(|row| row.iter()
+            .map(|span| span.content.as_ref()).collect::<String>()).collect::<Vec<_>>();
+        assert_eq!(painted, vec![" Audio        64 tracks".to_string(),
+            "              12 streams".to_string()], "{painted:?}");
+        assert_eq!(rows[0][0].content.trim(), "Audio");
+        assert!(rows[1][0].content.trim().is_empty());
+        assert_eq!(super::super::display_width::width(rows[1][0].content.as_ref()), 14);
+        for row in &rows {
+            let painted_width = row.iter().map(|span|
+                super::super::display_width::width(span.content.as_ref())).sum::<usize>();
+            assert!(painted_width <= 24, "{painted:?}");
+        }
+    }
+
+    #[test]
+    fn compact_cached_bluray_iso_keeps_wrapped_audio_stream_count() {
+        let temp = tempfile::tempdir().unwrap();
+        let iso = temp.path().join("movie.iso");
+        std::fs::write(&iso, b"disc fingerprint").unwrap();
+        let metadata = std::fs::metadata(&iso).unwrap();
+        let entry = BrowseEntry::new(iso.clone(), "movie.iso".into(),
+            EntryKind::BlurayIso, metadata.len(), metadata.modified().ok());
+        let mut browse = BrowseState::new();
+        browse.entries = vec![entry.clone()];
+        browse.selected_index = 0;
+        let mut contents = disc_contents(iso.clone());
+        // Twelve distinct presentations with 64 tracks in total.
+        contents.presentations = (1..=12).map(|index| {
+            let mut p = disc_presentation(index, "LPCM", 2, "stereo");
+            p.tracks = vec![p.tracks[0].clone(); if index <= 4 { 6 } else { 5 }];
+            p
+        }).collect();
+        let fingerprint = disc_probe_fingerprint(&iso).unwrap();
+        browse.disc_probe_cache.insert(iso.clone(),
+            DiscProbeCacheEntry::from_success(fingerprint, contents));
+        let accounting = crate::directory_accounting::AccountingService::new(None);
+        let full = entry_info_lines(&entry, &browse, &accounting, 24,
+            false, false, false, false, None, None, theme());
+        let compact = compact_media_info(full, 8);
+        let rows = reference_rows(&compact);
+        let audio_row = rows.iter().position(|row| row.trim_start().starts_with("Audio"))
+            .expect("Audio row survives compaction");
+        assert!(rows[audio_row].contains("64 tracks"), "{rows:?}");
+        assert_eq!(rows.get(audio_row + 1).map(String::as_str),
+            Some("              12 streams"), "{rows:?}");
+        assert_eq!(rows.iter().filter(|row| row.trim_start().starts_with("Audio")).count(), 1);
+        assert!(compact.audio_streams_pill_row.is_some(), "Streams control survives");
+    }
+
+    #[test]
+    fn wrapped_flac_format_continuations_align_without_repeating_label() {
+        let mut rows = Vec::new();
+        push_media_row(&mut rows, "Format", vec![
+            media_accent("FLAC", theme()), media_secondary(" · ", theme()),
+            media_accent("24-bit", theme()), media_secondary(" / ", theme()),
+            media_accent("96 kHz", theme()), media_secondary(" · ", theme()),
+            media_accent("stereo", theme()),
+        ], 34, theme());
+        let painted = rows.iter().map(|row| row.iter()
+            .map(|span| span.content.as_ref()).collect::<String>()).collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2, "{painted:?}");
+        assert_eq!(rows[0][0].content.trim(), "Format");
+        assert_eq!(rows[1][0].content.as_ref(), "              ");
+        assert_eq!(painted[1], "              stereo");
+        assert_eq!(painted.iter().filter(|row| row.contains("Format")).count(), 1);
+        for row in &rows {
+            let painted_width = row.iter().map(|span|
+                super::super::display_width::width(span.content.as_ref())).sum::<usize>();
+            assert!(painted_width <= 34, "{painted:?}");
+        }
+    }
+
+    #[test]
+    fn media_rows_leave_a_real_gap_and_share_one_value_column() {
+        for label in ["Audio", "Audio files", "Format", "Protection", "Contents"] {
+            let mut rows = Vec::new();
+            push_media_row(&mut rows, label, media_count(7, "file", "files", theme()),
+                78, theme());
+            assert_eq!(rows.len(), 1, "{label}: {rows:?}");
+            assert_eq!(rows[0].len(), 3);
+            let prefix = rows[0][0].content.as_ref();
+            assert_eq!(super::super::display_width::width(prefix), 14, "{label}");
+            assert!(prefix.starts_with(' ') && prefix.ends_with(' '), "{label}: {prefix:?}");
+            assert!(prefix.trim_end().ends_with(label), "{label}: {prefix:?}");
+            assert_eq!(rows[0][1].content.as_ref(), "7");
+            assert_eq!(rows[0][2].content.as_ref(), " files");
+        }
+    }
+
+    #[test]
+    fn all_entry_kinds_anchor_the_header_at_one_cell_with_four_fixed_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let album = tmp.path().join("Album");
+        std::fs::create_dir(&album).unwrap();
+        let entries = [
+            BrowseEntry::new(album.clone(), "Album".into(), EntryKind::Directory, 0, None),
+            BrowseEntry::new(tmp.path().join("track.flac"), "track.flac".into(),
+                EntryKind::AudioFile(crate::convert::formats::AudioFormat::Flac), 0, None),
+            BrowseEntry::new(tmp.path().join("movie.iso"), "movie.iso".into(),
+                EntryKind::BlurayIso, 0, None),
+        ];
+        let accounting = crate::directory_accounting::AccountingService::new(None);
+        for entry in &entries {
+            let mut browse = BrowseState::new();
+            browse.entries = vec![entry.clone()];
+            browse.selected_index = 0;
+            let cold = entry_info_lines(entry, &browse, &accounting, 78,
+                false, false, false, false, None, None, theme());
+            assert_eq!(cold.lines[0][0].content.as_ref(), MEDIA_INDENT);
+            assert_eq!(cold.lines[0][1].content.as_ref(),
+                if entry.is_disc_source() { "movie" } else { entry.name.as_str() });
+            assert!(cold.lines[1].is_empty() && cold.lines[3].is_empty());
+            assert!(!cold.lines[4].is_empty(), "details begin after header");
+        }
+        let entry = &entries[0];
+        let identity = ProbeCacheIdentity::from_entry(entry);
+        let mut browse = BrowseState::new();
+        browse.entries = vec![entry.clone()];
+        browse.selected_index = 0;
+        let cold = entry_info_lines(entry, &browse, &accounting, 78,
+            false, false, false, false, None, None, theme());
+        browse.insert_folder_classification_for_identity(entry.path.clone(), identity,
+            FolderContentClassification {
+                kind: FolderClassificationKind::Album, identity,
+                audio: FolderAudioSummary::default(), units: vec![],
+                unit_count: 1, collection_many: false, io_budget_exhausted: false,
+                disc_marker: None,
+                embedded_cue_availability: crate::tui::probe::EmbeddedCueAvailability::Unknown,
+                cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
+                cue_repair_availability: crate::tui::browse::CueRepairAvailability::Unknown,
+                cue_file_reference_repairs: BTreeMap::new(),
+            });
+        let warm = entry_info_lines(entry, &browse, &accounting, 78,
+            false, false, false, false, None, None, theme());
+        assert_eq!(cold.lines[0][0].content, warm.lines[0][0].content);
+        assert_eq!(cold.lines[0][1].content, warm.lines[0][1].content);
+        assert!(warm.lines[3].is_empty());
+        assert_eq!(warm.lines[4][0].content.trim(), "Audio");
+    }
+
+    #[test]
+    fn direct_disc_kinds_use_media_rows_instead_of_legacy_kind_and_rules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let accounting = crate::directory_accounting::AccountingService::new(None);
+        for kind in [EntryKind::DvdAudioIso, EntryKind::DvdVideoIso,
+            EntryKind::BlurayIso, EntryKind::SacdIso] {
+            let iso = tmp.path().join("album.iso");
+            std::fs::write(&iso, b"disc fixture").unwrap();
+            let meta = std::fs::metadata(&iso).unwrap();
+            let entry = BrowseEntry::new(iso.clone(), "album.iso".into(), kind,
+                meta.len(), meta.modified().ok());
+            let mut browse = BrowseState::new();
+            browse.entries = vec![entry.clone()];
+            browse.selected_index = 0;
+            let cold = entry_info_lines(&entry, &browse, &accounting, 78,
+                false, false, false, false, None, None, theme());
+            let rows = reference_rows(&cold);
+            assert!(rows[0].starts_with(" album"), "{rows:?}");
+            assert!(rows[3].is_empty());
+            reference_labels_in_order(&cold, &["Audio", "Contents", "Size", "Modified"]);
+            assert!(!rows.iter().any(|r| r.contains("Kind") || r.contains('─')),
+                "{rows:?}");
+            assert!(rows.iter().any(|r| r.contains("1 disc image")));
+            assert!(cold.refresh_pill_row.is_none());
+        }
+        for kind in [EntryKind::DvdAudioDir, EntryKind::DvdVideoDir, EntryKind::BlurayDir] {
+            let root = tmp.path().join("DiscDir");
+            std::fs::create_dir_all(&root).unwrap();
+            let entry = BrowseEntry::new(root, "DiscDir".into(), kind, 0, None);
+            let mut browse = BrowseState::new();
+            browse.entries = vec![entry.clone()];
+            browse.selected_index = 0;
+            let info = entry_info_lines(&entry, &browse, &accounting, 78,
+                false, false, false, false, None, None, theme());
+            let rows = reference_rows(&info);
+            reference_labels_in_order(&info, &["Audio", "Contents", "Size", "Modified"]);
+            assert!(!rows.iter().any(|r| r.contains("Kind") || r.contains('─')),
+                "{rows:?}");
+            assert!(info.refresh_pill_row.is_some());
+        }
+    }
+
+    #[test]
+    fn iso_archive_promotion_keeps_title_and_first_metric_position() {
+        let tmp = tempfile::tempdir().unwrap();
+        let iso = tmp.path().join("movie.iso");
+        std::fs::write(&iso, b"disc fixture").unwrap();
+        let metadata = std::fs::metadata(&iso).unwrap();
+        let archive = BrowseEntry::new(iso.clone(), "movie.iso".into(),
+            EntryKind::Archive, metadata.len(), metadata.modified().ok());
+        let mut browse = BrowseState::new();
+        browse.entries = vec![archive.clone()];
+        browse.selected_index = 0;
+        let accounting = crate::directory_accounting::AccountingService::new(None);
+        let cold = entry_info_lines(&archive, &browse, &accounting, 78,
+            false, false, false, false, None, None, theme());
+        let promoted = BrowseEntry::new(iso, "movie.iso".into(),
+            EntryKind::BlurayIso, metadata.len(), metadata.modified().ok());
+        browse.entries[0] = promoted.clone();
+        let warm = entry_info_lines(&promoted, &browse, &accounting, 78,
+            false, false, false, false, None, None, theme());
+        assert_eq!(cold.lines[0][1].content.as_ref(), "movie");
+        assert_eq!(cold.lines[0][1].content, warm.lines[0][1].content);
+        assert!(cold.lines[3].is_empty() && warm.lines[3].is_empty());
+        assert_eq!(cold.lines[4][0].content.trim(), "Audio");
+        assert_eq!(warm.lines[4][0].content.trim(), "Audio");
+        assert!(reference_rows(&cold).iter().any(|row| row.contains("1 disc image")));
+        assert!(reference_rows(&warm).iter().any(|row| row.contains("1 disc image")));
+    }
+
+    #[test]
+    fn direct_bluray_iso_probe_enriches_rows_without_moving_header() {
+        let tmp = tempfile::tempdir().unwrap();
+        let iso = tmp.path().join("movie.iso");
+        std::fs::write(&iso, b"disc fixture").unwrap();
+        let meta = std::fs::metadata(&iso).unwrap();
+        let entry = BrowseEntry::new(iso.clone(), "movie.iso".into(),
+            EntryKind::BlurayIso, meta.len(), meta.modified().ok());
+        let mut browse = BrowseState::new();
+        browse.entries = vec![entry.clone()];
+        browse.selected_index = 0;
+        let accounting = crate::directory_accounting::AccountingService::new(None);
+        let cold = entry_info_lines(&entry, &browse, &accounting, 78,
+            false, false, false, false, None, None, theme());
+        let mut contents = disc_contents(iso.clone());
+        contents.album_title = Some("Movie".into());
+        contents.album_artist = Some("Artist".into());
+        contents.year = Some("2026".into());
+        let fingerprint = disc_probe_fingerprint(&iso).unwrap();
+        browse.disc_probe_cache.insert(iso.clone(),
+            DiscProbeCacheEntry::from_success(fingerprint, contents));
+        let warm = entry_info_lines(&entry, &browse, &accounting, 78,
+            false, false, false, false, None, None, theme());
+        assert_eq!(cold.lines[0][0].content, warm.lines[0][0].content);
+        assert!(cold.lines[1].is_empty());
+        assert!(reference_rows(&warm)[1].contains("Artist · 2026"));
+        assert!(cold.lines[3].is_empty() && warm.lines[3].is_empty());
+        assert_eq!(cold.lines[4][0].content.trim(), warm.lines[4][0].content.trim());
+        reference_labels_in_order(&warm,
+            &["Audio", "Mixes", "Streams", "Protection", "Contents", "Size", "Modified"]);
+        assert!(warm.audio_streams_pill_row.is_some());
+        assert!(warm.refresh_pill_row.is_none());
+    }
+
+    #[test]
+    fn compact_bluray_iso_keeps_first_audio_row_at_one_with_and_without_probe() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let temp = tempfile::tempdir().unwrap();
+        let iso = temp.path().join("movie.iso");
+        std::fs::write(&iso, b"disc fingerprint").unwrap();
+        let metadata = std::fs::metadata(&iso).unwrap();
+        let entry = BrowseEntry::new(iso.clone(), "movie.iso".into(),
+            EntryKind::BlurayIso, metadata.len(), metadata.modified().ok());
+        let mut browse = BrowseState::new();
+        browse.entries = vec![entry.clone()];
+        browse.selected_index = 0;
+        let accounting = crate::directory_accounting::AccountingService::new(None);
+        // A bordered 26x10 pane has exactly eight rows and 24 content cells.
+        for populated in [false, true] {
+            if populated {
+                let fingerprint = disc_probe_fingerprint(&iso).unwrap();
+                browse.disc_probe_cache.insert(iso.clone(),
+                    DiscProbeCacheEntry::from_success(fingerprint, disc_contents(iso.clone())));
+            }
+            let full = entry_info_lines(&entry, &browse, &accounting, 24,
+                false, false, false, false, None, None, theme());
+            let compact = compact_media_info(full, 8);
+            let rows = reference_rows(&compact);
+            assert_eq!(rows[0], " movie", "populated={populated}: {rows:?}");
+            assert!(rows[1].starts_with(" Audio"),
+                "first detail moved with cache, populated={populated}: {rows:?}");
+            assert!(rows.len() <= 8);
+
+            let mut buttons = ButtonRenderMap::new();
+            let mut terminal = Terminal::new(TestBackend::new(26, 10)).unwrap();
+            terminal.draw(|frame| draw_browse_info(frame, Rect::new(0, 0, 26, 10),
+                &browse, &accounting, None, None, &mut buttons, None, theme())).unwrap();
+            let painted = (1..9).map(|y| (1..25).map(|x|
+                terminal.backend().buffer().get(x, y).symbol().to_owned())
+                .collect::<Vec<_>>().join("")).collect::<Vec<_>>();
+            assert!(painted[0].starts_with(" movie"), "{painted:?}");
+            assert!(painted[1].starts_with(" Audio"), "{painted:?}");
+            if populated {
+                let action = TuiButton::BrowseInfoAudioStreams;
+                let rect = buttons.find_button_rect(&action)
+                    .expect("Streams action after probe");
+                assert_eq!(buttons.find_button_at(rect.x, rect.y), Some(action));
+                assert!(rect.y > 0 && rect.bottom() < 10);
+            } else {
+                // Direct ISO files have no Refresh button before a probe.
+                assert!(buttons.find_button_rect(&TuiButton::BrowseInfoRefresh).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn short_bluray_iso_info_does_not_switch_layout_when_disc_cache_fills() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let tmp = tempfile::tempdir().unwrap();
+        let iso = tmp.path().join("movie.iso");
+        std::fs::write(&iso, b"disc fingerprint").unwrap();
+        let metadata = std::fs::metadata(&iso).unwrap();
+        let entry = BrowseEntry::new(iso.clone(), "movie.iso".into(),
+            EntryKind::BlurayIso, metadata.len(), metadata.modified().ok());
+        let mut app = super::directory_info_presentation_tests::directory_layout_app(entry);
+        let mut cold_info_titles: [Option<String>; 3] = [None, None, None];
+        let mut cold_browse_titles: [Option<String>; 3] = [None, None, None];
+        for populated in [false, true] {
+            if populated {
+                let fingerprint = disc_probe_fingerprint(&iso).unwrap();
+                app.browse.disc_probe_cache.insert(iso.clone(),
+                    DiscProbeCacheEntry::from_success(fingerprint, disc_contents(iso.clone())));
+            }
+
+            // Browse at 160x24, 160x29, and 160x30 must choose compact
+            // geometry before and after the disc cache fills. The standalone
+            // Info panes have eight, thirteen, and fourteen content rows.
+            for (index, (pane_height, screen_height)) in
+                [(10u16, 24u16), (15u16, 29u16), (16u16, 30u16)]
+                    .into_iter().enumerate() {
+                let mut buttons = ButtonRenderMap::new();
+                let mut terminal = Terminal::new(TestBackend::new(48, pane_height)).unwrap();
+                terminal.draw(|frame| draw_browse_info(frame,
+                    Rect::new(0, 0, 48, pane_height), &app.browse,
+                    &app.directory_accounting, None, None, &mut buttons,
+                    None, theme())).unwrap();
+                let rows = (1..(pane_height - 1)).map(|y| (1..47).map(|x|
+                    terminal.backend().buffer().get(x, y).symbol().to_owned())
+                    .collect::<Vec<_>>().join("")).collect::<Vec<_>>();
+                assert!(rows[0].starts_with(" movie"),
+                    "Info title, height={pane_height}, populated={populated}: {rows:?}");
+                assert!(rows[1].starts_with(" Audio"),
+                    "Info Audio moved, height={pane_height}, populated={populated}: {rows:?}");
+                if let Some(cold) = &cold_info_titles[index] {
+                    assert_eq!(&rows[0], cold, "Info title moved or changed");
+                } else {
+                    cold_info_titles[index] = Some(rows[0].clone());
+                }
+                if populated {
+                    let rect = buttons.find_button_rect(&TuiButton::BrowseInfoAudioStreams)
+                        .expect("cached ISO exposes Streams action");
+                    assert!(rect.x > 0 && rect.right() < 48);
+                    assert!(rect.y > 0 && rect.bottom() < pane_height);
+                    assert!(rows[(rect.y - 1) as usize].contains("Streams…"));
+                    assert_eq!(buttons.find_button_at(rect.x, rect.y),
+                        Some(TuiButton::BrowseInfoAudioStreams));
+                } else {
+                    assert!(buttons.find_button_rect(&TuiButton::BrowseInfoAudioStreams).is_none());
+                }
+
+                // Verify the actual three-pane layout and mouse translation,
+                // not just the standalone Info renderer.
+                let (browse_rows, area, _) =
+                    super::directory_info_presentation_tests::render_directory_browse_size(&mut app, 160, screen_height);
+                assert_eq!((area.width, area.height), (48, pane_height));
+                assert!(browse_rows[0].starts_with(" movie"),
+                    "Browse title, height={screen_height}: {browse_rows:?}");
+                assert!(browse_rows[1].starts_with(" Audio"),
+                    "Browse Audio moved, height={screen_height}, populated={populated}: {browse_rows:?}");
+                if let Some(cold) = &cold_browse_titles[index] {
+                    assert_eq!(&browse_rows[0], cold, "Browse title moved or changed");
+                } else {
+                    cold_browse_titles[index] = Some(browse_rows[0].clone());
+                }
+                if populated {
+                    let rect = app.button_map.find_button_rect(&TuiButton::BrowseInfoAudioStreams)
+                        .expect("Browse Streams hitbox");
+                    assert!(rect.x > area.x && rect.right() < area.right());
+                    assert!(rect.y > area.y && rect.bottom() < area.bottom());
+                    assert!(browse_rows[(rect.y - area.y - 1) as usize].contains("Streams…"));
+                    assert_eq!(app.button_map.find_button_at(rect.x, rect.y),
+                        Some(TuiButton::BrowseInfoAudioStreams));
+                } else {
+                    assert!(app.button_map.find_button_rect(
+                        &TuiButton::BrowseInfoAudioStreams).is_none());
+                }
+            }
+
+            // Tall panes retain the full four-row media reference header.
+            let mut tall_buttons = ButtonRenderMap::new();
+            let mut tall = Terminal::new(TestBackend::new(48, 36)).unwrap();
+            tall.draw(|frame| draw_browse_info(frame, Rect::new(0, 0, 48, 36),
+                &app.browse, &app.directory_accounting, None, None, &mut tall_buttons,
+                None, theme())).unwrap();
+            let first_audio = (1..35).find(|y| (1..47).map(|x|
+                tall.backend().buffer().get(x, *y).symbol().to_owned())
+                .collect::<Vec<_>>().join("").starts_with(" Audio"));
+            assert_eq!(first_audio, Some(5),
+                "tall Info pane must keep four header rows, populated={populated}");
+        }
+    }
+
+    #[test]
+    fn flac_reference_has_unlabelled_header_audio_format_contents_size_and_action() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("At Fillmore East (Japan Platinum SHM)");
+        std::fs::create_dir(&root).unwrap();
+        let entry = BrowseEntry::new(root.clone(),
+            "At Fillmore East (Japan Platinum SHM)".into(), EntryKind::Directory, 0, None);
+        let identity = ProbeCacheIdentity::from_entry(&entry);
+        let paths = (1..=7).map(|n| root.join(format!("{n:02}.flac")))
+            .collect::<Vec<_>>();
+        let classification = FolderContentClassification {
+            kind: FolderClassificationKind::Album, identity,
+            audio: audio_summary(&paths, "FLAC"), units: vec![],
+            unit_count: 1, collection_many: false, io_budget_exhausted: false,
+            disc_marker: None,
+            embedded_cue_availability: crate::tui::probe::EmbeddedCueAvailability::Unknown,
+            cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
+            cue_repair_availability: crate::tui::browse::CueRepairAvailability::Unknown,
+            cue_file_reference_repairs: BTreeMap::new(),
+        };
+        let mut browse = BrowseState::new();
+        browse.entries = vec![entry.clone()];
+        browse.selected_index = 0;
+        browse.insert_folder_classification_for_identity(root.clone(), identity, classification);
+        for path in paths {
+            browse.insert_probe_cache_for_test(path, Some(std::sync::Arc::new(CachedInfo {
+                source: crate::tui::probe::SourceInfo {
+                    format_name: "FLAC".into(), codec: "FLAC".into(), bit_depth: Some(16),
+                    sample_format_is_float: Some(false), compression_is_lossless: Some(true),
+                    sample_rate: 44_100, channels: 2, channel_layout: "stereo".into(),
+                    duration_secs: 4560.0 / 7.0, file_size: 0,
+                },
+                metadata: crate::tui::probe::SourceMetadata {
+                    album: Some("At Fillmore East".into()),
+                    artist: Some("The Allman Brothers Band".into()),
+                    year: Some("1971".into()), ..Default::default()
+                }, transport: None,
+            })));
+        }
+        let accounting = reference_accounting(&root, 28, 7, 1,
+            (584.9 * 1_048_576.0) as u128);
+        let info = entry_info_lines(&entry, &browse, &accounting, 78,
+            false, false, false, false, None, None, theme());
+        let rows = reference_rows(&info);
+        assert_eq!(rows[0].trim(), "At Fillmore East");
+        assert_eq!(rows[1].trim(), "The Allman Brothers Band · 1971");
+        assert_eq!(rows[2].trim(), "Japan Platinum SHM · FLAC");
+        assert!(rows[3].is_empty(), "blank line between header and audio");
+        reference_labels_in_order(&info, &["Audio", "Format", "Contents", "Size", "Modified"]);
+        assert!(rows.iter().any(|r| r.contains("7 tracks · 1h 16m")), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("FLAC · 16-bit / 44.1 kHz · stereo")), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("28 files · 1 folder")), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("7 audio · 21 other")), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("584.9 MiB")), "{rows:?}");
+        assert!(!rows.iter().any(|r| r.contains("Kind") || r.contains("─")));
+        assert!(info.refresh_pill_row.is_some(), "complete measurement still supports Refresh");
+        assert!(info.audio_streams_pill_row.is_none());
+        let labels = &info.lines[4];
+        assert_eq!(labels[0].style.fg, Some(theme().text_muted));
+        assert_eq!(info.lines[0][1].style.fg, Some(theme().text_bright));
+        assert!(info.lines[0][1].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(info.lines[1][1].style.fg, Some(theme().cyan));
+    }
+
+    #[test]
+    fn sacd_reference_has_area_flags_one_disc_image_and_adjacent_buttons() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("At Fillmore East (Japan SHM SACD)");
+        std::fs::create_dir(&root).unwrap();
+        let iso = root.join("album.iso");
+        std::fs::write(&iso, b"test disc").unwrap();
+        let mut contents = sacd_contents(iso.clone());
+        contents.presentations.truncate(1);
+        contents.presentations[0] = sacd_presentation(SacdAreaId::Stereo, "Stereo", 2, "stereo");
+        contents.presentations[0].tracks = (1..=7).map(|n| DiscTrack {
+            number: n, title: None, performer: None,
+            duration_secs: None, format_note: None,
+        }).collect();
+        contents.presentations[0].total_duration_secs = 4560.0;
+        contents.album_title = Some("At Fillmore East".into());
+        contents.album_artist = Some("The Allman Brothers Band".into());
+        contents.year = Some("1971".into());
+        let accounting = reference_accounting(&root, 4, 0, 0,
+            (3.16 * 1_073_741_824.0) as u128);
+        let (info, _) = reference_disc_info(&root,
+            "At Fillmore East (Japan SHM SACD)", "album.iso",
+            FolderDiscMarkerKind::Sacd, contents, &accounting);
+        let rows = reference_rows(&info);
+        assert_eq!(rows[0].trim(), "At Fillmore East");
+        assert_eq!(rows[1].trim(), "The Allman Brothers Band · 1971");
+        assert_eq!(rows[2].trim(), "Japan SHM SACD · ISO");
+        reference_labels_in_order(&info, &["Audio", "Format", "Areas", "Contents", "Size", "Modified"]);
+        assert!(rows.iter().any(|r| r.contains("7 tracks · 1h 16m")), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("DSD64 · 2.8 MHz · stereo")), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("stereo ✓ · multichannel —")), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("4 files · 1 disc image")), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("3.16 GiB")), "{rows:?}");
+        assert!(!rows.iter().any(|r| r.contains("Protection") || r.contains("─")));
+        assert_eq!(info.refresh_pill_row, info.audio_streams_pill_row);
+        assert!(info.refresh_pill_row.is_some());
+        let buttons = &info.lines[info.refresh_pill_row.unwrap()];
+        assert_eq!(buttons.iter().filter(|s| s.content == " Refresh ").count(), 1);
+        assert_eq!(buttons.iter().filter(|s| s.content == " Streams… ").count(), 1);
+    }
+
+    #[test]
+    fn bluray_reference_has_grouped_streams_mixes_and_unencrypted_status() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("Wish You Were Here: 50th Anniversary Edition");
+        std::fs::create_dir(&root).unwrap();
+        let iso = root.join("disc.iso");
+        std::fs::write(&iso, b"test blu-ray").unwrap();
+        let mut contents = disc_contents(iso.clone());
+        contents.presentations.clear();
+        for index in 0..12usize {
+            let (codec, channels, layout, rate) = if index == 0 {
+                ("LPCM", 2, "stereo", 192_000)
+            } else if index <= 5 {
+                ("LPCM", 2, "stereo", 96_000)
+            } else if index <= 7 {
+                ("DTS-HD MA", 2, "stereo", 48_000)
+            } else {
+                ("DTS-HD MA", 6, "5.1", 48_000)
+            };
+            let mut presentation = disc_presentation((index + 1) as u32, codec, channels, layout);
+            presentation.format.sample_rate = Some(rate);
+            presentation.tracks = (0..if index < 8 { 5 } else { 6 }).map(|n| DiscTrack {
+                number: n + 1, title: None, performer: None,
+                duration_secs: None, format_note: None,
+            }).collect();
+            contents.presentations.push(presentation);
+        }
+        // Two stereo formats and a multichannel mix. The actual mix count
+        // is derived from the presentations, never assigned by the renderer.
+        contents.album_title = Some("Wish You Were Here: 50th Anniversary Edition".into());
+        contents.album_artist = Some("Pink Floyd".into());
+        contents.year = Some("1975".into());
+        let mut accounting = crate::directory_accounting::AccountingService::new(None);
+        accounting.views.entry(root.clone()).or_default().local =
+            Some(crate::directory_accounting::Counts {
+                files: 1, folders: 1, ..Default::default()
+            });
+        let (info, _) = reference_disc_info(&root,
+            "Wish You Were Here: 50th Anniversary Edition", "disc.iso",
+            FolderDiscMarkerKind::BluRay, contents, &accounting);
+        let rows = reference_rows(&info);
+        assert_eq!(rows[0].trim(), "Wish You Were Here: 50th Anniversary Edition");
+        assert_eq!(rows[1].trim(), "Pink Floyd · 1975");
+        assert_eq!(rows[2].trim(), "Blu-ray 24-192 LPCM · ISO");
+        reference_labels_in_order(&info, &["Audio", "Mixes", "Streams", "Protection", "Contents", "Size", "Modified"]);
+        assert!(rows.iter().any(|r| r.contains("64 tracks · 12 streams")), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("8 stereo · 4 multichannel")), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("1× LPCM 24/192 stereo")), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("5× LPCM 24/96 stereo")), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("+ 6 more")), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("Protection") && r.contains("unencrypted")));
+        assert!(rows.iter().any(|r| r.contains("1 disc image · 1 folder")), "{rows:?}");
+        assert!(rows.iter().any(|r| r.trim().starts_with("Size") && r.contains("unknown")), "{rows:?}");
+        assert_eq!(info.refresh_pill_row, info.audio_streams_pill_row);
+    }
+
+    #[test]
+    fn media_unknown_and_scanning_views_keep_refresh_and_cancel_action() {
+        let entry = BrowseEntry::new(PathBuf::from("/tmp/Album"), "Album".into(),
+            EntryKind::Directory, 0, None);
+        let kind = FolderClassificationKind::Album;
+        let identity = ProbeCacheIdentity::from_entry(&entry);
+        let classification = FolderContentClassification {
+            kind, identity, audio: FolderAudioSummary::default(), units: vec![],
+            unit_count: 1, collection_many: false, io_budget_exhausted: false,
+            disc_marker: None,
+            embedded_cue_availability: crate::tui::probe::EmbeddedCueAvailability::Unknown,
+            cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
+            cue_repair_availability: crate::tui::browse::CueRepairAvailability::Unknown,
+            cue_file_reference_repairs: BTreeMap::new(),
+        };
+        let mut browse = BrowseState::new();
+        browse.entries = vec![entry.clone()];
+        browse.selected_index = 0;
+        browse.insert_folder_classification_for_identity(entry.path.clone(), identity, classification);
+        let mut accounting = crate::directory_accounting::AccountingService::new(None);
+        let unknown = entry_info_lines(&entry, &browse, &accounting, 55,
+            false, false, false, false, None, None, theme());
+        assert!(reference_rows(&unknown).iter().any(|r| r.contains("Size") && r.contains("unknown")));
+        assert!(unknown.refresh_pill_row.is_some());
+        accounting.views.entry(entry.path.clone()).or_default().running = true;
+        accounting.views.get_mut(&entry.path).unwrap().progress =
+            Some(crate::directory_accounting::ScanProgress {
+                files_examined: 4, bytes_examined: 4_194_304, ..Default::default()
+            });
+        let running = entry_info_lines(&entry, &browse, &accounting, 55,
+            false, false, false, false, None, None, theme());
+        assert!(reference_rows(&running).iter().any(|r| r.contains("4.0 MiB…")));
+        assert!(reference_rows(&running)[running.refresh_pill_row.unwrap()].contains("Cancel"));
+    }
+
+    #[test]
+    fn adjacent_media_buttons_have_separate_exact_hitboxes() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("Disc");
+        std::fs::create_dir(&root).unwrap();
+        let iso = root.join("disc.iso");
+        std::fs::write(&iso, b"probe fingerprint").unwrap();
+        let contents = disc_contents(iso.clone());
+        let mut accounting = reference_accounting(&root, 1, 0, 1, 0);
+        let (_, browse) = reference_disc_info(&root, "Disc", "disc.iso",
+            FolderDiscMarkerKind::BluRay, contents, &accounting);
+        let mut buttons = ButtonRenderMap::new();
+        let mut terminal = Terminal::new(TestBackend::new(80, 32)).unwrap();
+        terminal.draw(|frame| draw_browse_info(frame, Rect::new(0, 0, 80, 32),
+            &browse, &accounting, None, None, &mut buttons, None, theme())).unwrap();
+        let refresh = buttons.find_button_rect(&TuiButton::BrowseInfoRefresh).unwrap();
+        let streams = buttons.find_button_rect(&TuiButton::BrowseInfoAudioStreams).unwrap();
+        assert_eq!(refresh.y, streams.y);
+        assert_eq!(streams.x - refresh.right(), 2);
+        assert_eq!(refresh.width as usize, super::super::display_width::width(" Refresh "));
+        assert_eq!(streams.width as usize, super::super::display_width::width(" Streams… "));
+        assert_eq!(buttons.find_button_at(refresh.x, refresh.y), Some(TuiButton::BrowseInfoRefresh));
+        assert_eq!(buttons.find_button_at(streams.x, streams.y),
+            Some(TuiButton::BrowseInfoAudioStreams));
+        assert_eq!(buttons.find_button_at(refresh.right(), refresh.y), None);
+        let line = (0..80).map(|x| terminal.backend().buffer().get(x, refresh.y).symbol().to_owned())
+            .collect::<Vec<_>>().join("");
+        assert!(line.contains("Refresh") && line.contains("Streams"), "{line}");
+
+        // During a scan the same action changes to Cancel, without losing
+        // its click region or moving Streams to a separate line.
+        accounting.views.get_mut(&root).unwrap().running = true;
+        accounting.views.get_mut(&root).unwrap().progress =
+            Some(crate::directory_accounting::ScanProgress {
+                bytes_examined: 1024, ..Default::default()
+            });
+        let mut running_buttons = ButtonRenderMap::new();
+        terminal.draw(|frame| draw_browse_info(frame, Rect::new(0, 0, 80, 32),
+            &browse, &accounting, None, None, &mut running_buttons, None,
+            theme())).unwrap();
+        let cancel = running_buttons.find_button_rect(&TuiButton::BrowseInfoRefresh).unwrap();
+        let running_streams = running_buttons.find_button_rect(&TuiButton::BrowseInfoAudioStreams).unwrap();
+        assert_eq!(cancel.width as usize, super::super::display_width::width(" Cancel "));
+        assert_eq!(cancel.y, running_streams.y);
+        assert_eq!(running_streams.x - cancel.right(), 2);
+        assert_eq!(running_buttons.find_button_at(cancel.x, cancel.y),
+            Some(TuiButton::BrowseInfoRefresh));
+        let row = (0..80).map(|x| terminal.backend().buffer().get(x, cancel.y).symbol().to_owned())
+            .collect::<Vec<_>>().join("");
+        assert!(row.contains("Cancel") && row.contains("Streams"), "{row}");
+    }
+
+    #[test]
     fn native_sacd_iso_renders_compact_disc_stream_summary() {
         let temp = tempfile::tempdir().expect("tempdir");
         let iso = temp.path().join("album.iso");
@@ -5822,11 +7747,10 @@ mod folder_classification_info_pane_tests {
         );
         let rendered = flatten(&info);
 
-        assert!(rendered.contains("SACD ISO (ScarletBook)"));
-        assert!(rendered.contains("content: 2 audio streams · 2 tracks"));
-        assert!(rendered.contains("streams:"));
-        assert!(rendered.contains("DSD 2.8MHz stereo"));
-        assert!(rendered.contains("DSD 2.8MHz 5.1"));
+        assert!(rendered.contains("SACD · ISO"), "{rendered}");
+        assert!(rendered.contains("1 track"), "{rendered}");
+        assert!(rendered.contains("DSD64") && rendered.contains("Areas"), "{rendered}");
+        assert!(!rendered.contains("Kind") && !rendered.contains('─'), "{rendered}");
         assert!(info.audio_streams_pill_row.is_some());
         assert!(info.edit_tags_pill_row.is_some());
     }
@@ -6216,6 +8140,88 @@ mod directory_info_presentation_tests {
     }
 
     #[test]
+    fn ordinary_directory_kind_content_and_metrics_share_value_column() {
+        use crate::directory_accounting::{AccountingService, Counts};
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("Collection");
+        std::fs::create_dir(&folder).unwrap();
+        let entry = BrowseEntry::new(folder.clone(), "Collection".into(),
+            EntryKind::Directory, 0,
+            Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(86_400)));
+        let mut browse = BrowseState::new();
+        browse.entries = vec![entry.clone()];
+        browse.selected_index = 0;
+        browse.mark_folder_classification_pending_for_test(folder.clone());
+        let mut accounting = AccountingService::new(None);
+        let view = accounting.views.entry(folder.clone()).or_default();
+        view.local = Some(Counts { folders: 2, ..Counts::default() });
+        view.cached = Some(fake_measurement(&folder, 1024));
+        let mut full = entry_info_lines(&entry, &browse, &accounting, 78,
+            false, false, false, false, None, None, theme());
+        // The actual Disk free producer uses this same metric-row formatter.
+        // Add a representative disk row without filesystem-dependent statvfs.
+        let mut disk_row = Vec::new();
+        push_directory_metric_line(&mut disk_row, "Disk free",
+            vec![Span::styled("8 GiB / 16 GiB", theme().text_style())],
+            directory_metric_label_width(78), theme());
+        let updated = directory_info_metric_block(&full, "Updated").unwrap().0;
+        full.lines.splice(updated..updated, disk_row);
+        let mut column = None;
+        for label in ["Kind", "Folders", "Files", "Audio files", "Total size",
+            "Disk free", "Updated", "Content"] {
+            let row = full.lines.iter().find(|r| r.first()
+                .is_some_and(|span| span.content.trim() == label))
+                .unwrap_or_else(|| panic!("missing {label}: {:?}", flatten_lines(&full)));
+            assert!(row.len() >= 2, "no value on {label}: {row:?}");
+            let start = super::super::display_width::width(row[0].content.as_ref());
+            assert_eq!(start, 16, "{label} starts at {start}, expected 16");
+            if let Some(previous) = column { assert_eq!(start, previous, "{label}"); }
+            column = Some(start);
+        }
+
+        // The same Kind column applies when browsing the parent row and a
+        // classified non-media collection, not just an unclassified child.
+        let parent = BrowseEntry::new(temp.path().to_path_buf(), "..".into(),
+            EntryKind::ParentDir, 0, None);
+        browse.current_dir = folder.clone();
+        browse.entries = vec![parent.clone()];
+        let parent_info = entry_info_lines(&parent, &browse, &accounting, 78,
+            false, false, false, false, None, None, theme());
+        for label in ["Kind", "Folders", "Files", "Audio files", "Total size"] {
+            let row = parent_info.lines.iter().find(|r| r.first()
+                .is_some_and(|span| span.content.trim() == label)).unwrap();
+            assert_eq!(super::super::display_width::width(row[0].content.as_ref()), 16);
+        }
+        browse.current_dir = temp.path().to_path_buf();
+        browse.entries = vec![entry.clone()];
+        browse.insert_folder_classification_for_identity(folder.clone(),
+            crate::tui::browse::ProbeCacheIdentity::from_entry(&entry),
+            example_classification(&entry, FolderClassificationKind::Collection));
+        let classified = entry_info_lines(&entry, &browse, &accounting, 78,
+            false, false, false, false, None, None, theme());
+        let kind = classified.lines.iter().find(|r| r.first()
+            .is_some_and(|span| span.content.trim() == "Kind")).unwrap();
+        assert_eq!(super::super::display_width::width(kind[0].content.as_ref()), 16);
+
+        // Wider alignment must not introduce a painted-width overflow on a
+        // compact pane. Long provisional values use the metric continuation.
+        let mut cold = BrowseState::new();
+        cold.entries = vec![entry.clone()];
+        cold.mark_folder_classification_pending_for_test(folder);
+        let narrow = entry_info_lines(&entry, &cold, &accounting, 22,
+            false, false, false, false, None, None, theme());
+        for label in ["Kind", "Content"] {
+            let start = narrow.lines.iter().position(|r| r.first()
+                .is_some_and(|span| span.content.trim() == label)).unwrap();
+            assert_eq!(narrow.lines[start].len(), 1, "{label} should wrap");
+            assert!(flatten_lines(&narrow)[start + 1].trim().len() > 0);
+            assert!(narrow.lines[start..=start + 1].iter().all(|r| r.iter()
+                .map(|span| super::super::display_width::width(span.content.as_ref()))
+                .sum::<usize>() <= 22));
+        }
+    }
+
+    #[test]
     fn immediate_folders_stay_distinct_from_recursive_cached_folders() {
         use crate::directory_accounting::{AccountingService, Counts};
         let path = Path::new("/music/parent");
@@ -6412,7 +8418,7 @@ mod directory_info_presentation_tests {
     }
 
     /// Use the actual three-pane Browse layout at arbitrary terminal heights.
-    fn render_directory_browse_size(
+    pub(super) fn render_directory_browse_size(
         app: &mut AppState,
         width: u16,
         height: u16,
@@ -6488,7 +8494,7 @@ mod directory_info_presentation_tests {
             Some(TuiButton::BrowseInfoRefresh));
     }
 
-    fn directory_layout_app(entry: BrowseEntry) -> AppState {
+    pub(super) fn directory_layout_app(entry: BrowseEntry) -> AppState {
         let path = entry.path.clone();
         let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
         app.current_screen = crate::tui::app::AppScreen::Browse;
@@ -6585,9 +8591,10 @@ mod directory_info_presentation_tests {
         assert!(full_rows.iter().any(|r| r.contains("Disk free")));
         assert!(full_rows.iter().any(|r| r.contains("Updated")));
         let compact = compact_directory_info(full, 8, 22);
-        assert_eq!(compact.lines.len(), 8);
+        assert!(compact.lines.len() <= 8);
         assert_counted_rows_present(&compact);
         let rows = flatten_lines(&compact);
+        assert!(rows[0].starts_with(" Collection"), "stationary title: {rows:?}");
         assert!(rows.iter().any(|r| r.contains("Refresh")));
         assert!(compact.refresh_pill_row.is_some());
         assert_eq!(compact.lines[compact.refresh_pill_row.unwrap() - 1].len(), 0);
@@ -6615,9 +8622,10 @@ mod directory_info_presentation_tests {
         });
         let full = info_with_wrapped_disk_space(&entry, &browse, &accounting);
         let compact = compact_directory_info(full, 8, 22);
-        assert_eq!(compact.lines.len(), 8);
+        assert!(compact.lines.len() <= 8);
         assert_counted_rows_present(&compact);
         let rows = flatten_lines(&compact);
+        assert!(rows[0].starts_with(" Very Long Artist"), "stationary title: {rows:?}");
         assert!(rows.iter().any(|r| r.contains("Cancel")), "{rows:?}");
         assert!(!rows.iter().any(|r| r.contains("Refresh")));
         assert!(rows.iter().any(|r| r.contains("2.00 GiB…")), "{rows:?}");
@@ -6629,7 +8637,7 @@ mod directory_info_presentation_tests {
     }
 
     #[test]
-    fn full_height_keeps_original_name_kind_disk_date_and_action_order() {
+    fn full_height_keeps_directory_accounting_below_stationary_title() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("Long Name With Several Wrapped Words");
         std::fs::create_dir(&path).unwrap();
@@ -6641,12 +8649,15 @@ mod directory_info_presentation_tests {
         let accounting = crate::directory_accounting::AccountingService::new(None);
         let full = info_with_wrapped_disk_space(&entry, &browse, &accounting);
         let rows = flatten_lines(&full);
-        let positions = ["Name", "Kind", "Folders", "Files", "Audio files", "Total size",
+        assert!(rows[0].starts_with(" Long Name"), "{rows:?}");
+        assert!(rows[1..4].iter().all(|row| row.is_empty()), "{rows:?}");
+        let positions = ["Kind", "Folders", "Files", "Audio files", "Total size",
             "Disk free", "Updated", "Refresh"].iter().map(|label|
             rows.iter().position(|row| row.contains(label)).unwrap()).collect::<Vec<_>>();
         assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
-        assert!(rows[positions[7] + 1].contains(entry.date_label().as_str()));
-        assert!(rows[positions[8] - 1].trim().is_empty());
+        assert_eq!(positions[0], 4);
+        assert!(rows[positions[6] + 1].contains(entry.date_label().as_str()));
+        assert!(rows[positions[7] - 1].trim().is_empty());
     }
 
     #[test]
@@ -6663,6 +8674,65 @@ mod directory_info_presentation_tests {
         for label in ["Folders", "Files", "Audio files", "Total size"] {
             assert!(rows.iter().any(|r| r.contains(label)),
                 "{label} disappeared at 80x24: {rows:?}");
+        }
+    }
+
+    #[test]
+    fn compact_directory_keeps_title_at_66_and_80_for_counts_progress_and_flac_switch() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Collection");
+        std::fs::create_dir(&path).unwrap();
+        let entry = BrowseEntry::new(path.clone(), "Collection".into(),
+            EntryKind::Directory, 0,
+            Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(86_400)));
+        for width in [66u16, 80] {
+            let mut app = directory_layout_app(entry.clone());
+            let view = app.directory_accounting.views.get_mut(&path).unwrap();
+            view.local = None;
+            for stage in 0..4 {
+                if stage == 1 {
+                    app.directory_accounting.views.get_mut(&path).unwrap().local =
+                        Some(crate::directory_accounting::Counts {
+                            folders: 3, ..Default::default()
+                        });
+                } else if stage == 2 {
+                    let view = app.directory_accounting.views.get_mut(&path).unwrap();
+                    view.running = true;
+                    view.progress = Some(crate::directory_accounting::ScanProgress {
+                        folders_discovered: 3, files_examined: 7, audio_examined: 5,
+                        bytes_examined: 2 * 1024 * 1024, ..Default::default()
+                    });
+                } else if stage == 3 {
+                    let view = app.directory_accounting.views.get_mut(&path).unwrap();
+                    view.running = false;
+                    view.cached = Some(fake_measurement(&path, 2 * 1024 * 1024));
+                }
+                let (rows, area, hit) = render_directory_browse_24(&mut app, width);
+                assert!(rows[0].starts_with(" Collection"),
+                    "width={width}, stage={stage}, rows={rows:?}");
+                for label in ["Folders", "Files", "Audio files", "Total size"] {
+                    assert!(rows.iter().any(|r| r.contains(label)),
+                        "width={width}, stage={stage}, missing {label}: {rows:?}");
+                }
+                if stage < 2 {
+                    assert_refresh_visible(&rows, area, hit, &app);
+                } else if stage == 2 {
+                    let hit = hit.expect("Cancel hitbox");
+                    assert!(rows[(hit.y - area.y - 1) as usize].contains("Cancel"));
+                    assert_eq!(app.button_map.find_button_at(hit.x, hit.y),
+                        Some(TuiButton::BrowseInfoRefresh));
+                } else {
+                    assert!(hit.is_none(), "complete measurement has no Refresh");
+                }
+            }
+            // An unprobed FLAC selection shares the exact same title origin.
+            let flac = BrowseEntry::new(path.join("track.flac"), "track.flac".into(),
+                EntryKind::AudioFile(crate::convert::formats::AudioFormat::Flac), 0, None);
+            app.browse.entries = vec![flac];
+            app.browse.selected_index = 0;
+            let (rows, _, _) = render_directory_browse_24(&mut app, width);
+            assert!(rows[0].starts_with(" track.flac"),
+                "FLAC title shifted at width={width}: {rows:?}");
         }
     }
 
@@ -6729,7 +8799,13 @@ mod directory_info_presentation_tests {
                 child.clone(), example_classification(&entry, kind),
             );
             let (rows, info, hit) = render_directory_browse_24(&mut app, 80);
-            assert_refresh_visible(&rows, info, hit, &app);
+            assert!(rows.iter().any(|row| row.contains("Audio") || row.contains("Discs")),
+                "{kind:?}: {rows:?}");
+            assert!(rows.iter().any(|row| row.contains("Size")), "{kind:?}: {rows:?}");
+            let hit = hit.expect("media Refresh visible");
+            assert!(hit.x > info.x && hit.right() < info.right());
+            assert_eq!(app.button_map.find_button_at(hit.x, hit.y),
+                Some(TuiButton::BrowseInfoRefresh));
         }
         for kind in [EntryKind::DvdAudioDir, EntryKind::DvdVideoDir, EntryKind::BlurayDir] {
             let mut app = directory_layout_app(BrowseEntry::new(
@@ -6741,13 +8817,12 @@ mod directory_info_presentation_tests {
     }
 
     #[test]
-    fn album_headline_survives_80_by_30_compaction_with_capacity_and_date() {
+    fn album_reference_layout_survives_compact_browse_height() {
         let tmp = tempfile::tempdir().unwrap();
         let folder = tmp.path().join("Album Collection");
         std::fs::create_dir(&folder).unwrap();
         let modified = Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(86_400));
-        let entry = BrowseEntry::new(folder.clone(),
-            "Album Collection".into(),
+        let entry = BrowseEntry::new(folder.clone(), "Album Collection".into(),
             EntryKind::Directory, 0, modified);
         let mut app = directory_layout_app(entry.clone());
         let track = folder.join("track.flac");
@@ -6756,8 +8831,7 @@ mod directory_info_presentation_tests {
         classification.audio.format_counts.insert("FLAC".to_string(), 1);
         classification.audio.file_paths.push(track.clone());
         app.browse.insert_folder_classification_for_identity(
-            folder.clone(), crate::tui::browse::ProbeCacheIdentity::from_entry(&entry), classification,
-        );
+            folder, crate::tui::browse::ProbeCacheIdentity::from_entry(&entry), classification);
         app.browse.insert_probe_cache_for_test(track, Some(std::sync::Arc::new(
             crate::tui::browse::CachedInfo {
                 source: crate::tui::probe::SourceInfo {
@@ -6765,38 +8839,30 @@ mod directory_info_presentation_tests {
                     format_name: "FLAC".into(), codec: "flac".into(), bit_depth: Some(16),
                     sample_rate: 44_100, channels: 2, channel_layout: "stereo".into(),
                     duration_secs: 90.0, file_size: 1234,
-                },
-                metadata: crate::tui::probe::SourceMetadata::default(),
+                }, metadata: crate::tui::probe::SourceMetadata::default(), transport: None,
             }
         )));
-
-        // The actual 80x30 Browse panel has 14 content rows.
         let (drawn, area, hit) = render_directory_browse_size(&mut app, 80, 30);
         assert_eq!(drawn.len(), 14);
         assert!(drawn.iter().any(|row| row.contains("1 track")), "{drawn:?}");
-        assert!(drawn.iter().any(|row| row.contains("duration:")), "{drawn:?}");
+        assert!(drawn.iter().any(|row| row.contains("Contents")), "{drawn:?}");
+        assert!(drawn.iter().any(|row| row.contains("Size")), "{drawn:?}");
         assert_eq!(app.button_map.find_button_at(hit.unwrap().x, hit.unwrap().y),
             Some(TuiButton::BrowseInfoRefresh));
         assert_eq!(area.height, 16);
 
-        // A capacity bar plus date causes two additional wrapped rows. With
-        // those fields populated, the headline must still get the spare line;
-        // the duration detail follows as soon as another line becomes free.
-        let full = info_with_wrapped_disk_space(&entry, &app.browse, &app.directory_accounting);
-        assert!(flatten_lines(&full).join("\n").contains("duration:"));
-        let compact = compact_directory_info(full.clone(), 14, 22);
+        let full = entry_info_lines(&entry, &app.browse, &app.directory_accounting,
+            22, false, false, false, false, None, None, theme());
+        assert!(flatten_lines(&full).join("\n").contains("1m 30s"));
+        let compact = compact_media_info(full, 7);
         let rows = flatten_lines(&compact);
-        assert_counted_rows_present(&compact);
-        assert!(rows.iter().any(|r| r.contains("1 track")),
-            "album headline lost despite remaining space: {rows:?}");
-        assert!(rows.iter().any(|r| r.contains("Refresh")));
-        let expanded = compact_directory_info(full, 15, 22);
-        assert!(flatten_lines(&expanded).iter().any(|r| r.contains("duration:")),
-            "additional space must reveal next classification detail");
+        assert!(rows.iter().any(|row| row.contains("1 track")), "{rows:?}");
+        assert!(rows.iter().any(|row| row.contains("Refresh")), "{rows:?}");
+        assert!(compact.refresh_pill_row.is_some());
     }
 
     #[test]
-    fn disc_supplemental_lines_and_visible_controls_survive_compaction() {
+    fn disc_probe_status_and_refresh_survive_compact_media_view() {
         let tmp = tempfile::tempdir().unwrap();
         let folder = tmp.path().join("Disc");
         std::fs::create_dir(&folder).unwrap();
@@ -6806,32 +8872,23 @@ mod directory_info_presentation_tests {
         let mut app = directory_layout_app(entry.clone());
         app.browse.insert_folder_classification_for_identity(
             folder, crate::tui::browse::ProbeCacheIdentity::from_entry(&entry),
-            example_classification(&entry, FolderClassificationKind::Disc),
-        );
-        let full = info_with_wrapped_disk_space(&entry, &app.browse, &app.directory_accounting);
-        let source = flatten_lines(&full);
-        assert!(source.iter().any(|row| row.contains("status")));
-        let compact = compact_directory_info(full.clone(), 14, 22);
+            example_classification(&entry, FolderClassificationKind::Disc));
+        let full = entry_info_lines(&entry, &app.browse, &app.directory_accounting,
+            22, false, false, false, false, None, None, theme());
+        let full_rows = flatten_lines(&full);
+        assert!(full_rows.iter().map(|row| row.trim())
+            .collect::<Vec<_>>().join(" ").contains("disc metadata not cached"),
+            "status must survive whitespace wrapping: {full_rows:?}");
+        assert!(full_rows.iter().any(|row| row.contains("12 files · 2 folders")),
+            "count+noun rows must not split: {full_rows:?}");
+        assert!(full_rows.iter().any(|row| row.contains("Modified  1970-01-01")),
+            "narrow date should fit on one row: {full_rows:?}");
+        let compact = compact_media_info(full, 6);
         let rows = flatten_lines(&compact);
-        assert_counted_rows_present(&compact);
-        assert!(rows.iter().any(|row| row.contains("status")),
-            "disc probe status must occupy available supplemental rows: {rows:?}");
-
-        // A future disc probe may add an interactive stream button at the end.
-        // Compacting must rebase its hitbox only if that source row is drawn.
-        let mut with_control = full;
-        let source_row = with_control.lines.len();
-        with_control.lines.push(vec![Span::raw("   "),
-            Span::styled(" audio streams ", Style::default().fg(theme().pill_active_fg)
-                .bg(theme().purple))]);
-        with_control.audio_streams_pill_row = Some(source_row);
-        let expanded = compact_directory_info(with_control.clone(), 19, 22);
-        let mapped = expanded.audio_streams_pill_row.expect("retained control must be clickable");
-        assert!(flatten_lines(&expanded)[mapped].contains("audio streams"));
-        let short = compact_directory_info(with_control, 8, 22);
-        assert!(short.audio_streams_pill_row.is_none(),
-            "unpainted control cannot retain a stale hitbox");
-        assert_counted_rows_present(&short);
+        assert!(rows.iter().any(|row| row.contains("Audio")), "{rows:?}");
+        assert!(rows.iter().any(|row| row.contains("Refresh")), "{rows:?}");
+        assert!(compact.refresh_pill_row.is_some());
+        assert!(compact.audio_streams_pill_row.is_none());
     }
 
     #[test]

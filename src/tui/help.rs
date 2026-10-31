@@ -85,7 +85,7 @@ fn help_content(screen: AppScreen) -> Vec<HelpSection> {
                 title: "File Operations",
                 entries: vec![
                     (":context", "Context menu (right-click)"),
-                    ("Ctrl+P", "Folder Properties (filesystem directories)"),
+                    ("Ctrl+P", "Filesystem Properties (files and folders)"),
                     ("Ctrl+Shift+P", "Paste filesystem clipboard"),
                     ("Alt+P", "Metadata editor (existing mapping)"),
                     (":rename <name>", "Rename selected entry"),
