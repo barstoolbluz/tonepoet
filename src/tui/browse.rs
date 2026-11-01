@@ -2755,6 +2755,21 @@ pub struct BrowseState {
     pub sort_by: SortBy,
     pub sort_dir: SortDir,
 
+    /// Session-only, opt-in recursive folder totals for the Size column.
+    /// Never written to BrowsingConfig. The toggle follows the active tab;
+    /// measurements and cursor state remain local to each listing.
+    pub folder_size_sort: bool,
+    folder_size_values: HashMap<PathBuf, u128>,
+    folder_size_sort_root: Option<PathBuf>,
+    folder_size_sort_generation: u64,
+    folder_size_sort_projected: usize,
+    folder_size_sort_cursor: usize,
+    folder_size_sort_filter: Option<(String, bool, FormatFilter)>,
+    folder_size_sort_accounting_generation: u64,
+    folder_size_resort_pending: bool,
+    folder_size_last_resort: Option<Instant>,
+    pub folder_size_sort_busy: bool,
+
     /// Persisted default sort applied when entering a new directory. Kept
     /// separate from the active sort so column-click sorting remains local to
     /// the current directory, matching the Browse options model.
@@ -3895,6 +3910,17 @@ impl BrowseState {
             show_hidden: config.show_hidden,
             sort_by,
             sort_dir,
+            folder_size_sort: false,
+            folder_size_values: HashMap::new(),
+            folder_size_sort_root: None,
+            folder_size_sort_generation: 0,
+            folder_size_sort_projected: 0,
+            folder_size_sort_cursor: 0,
+            folder_size_sort_filter: None,
+            folder_size_sort_accounting_generation: 0,
+            folder_size_resort_pending: false,
+            folder_size_last_resort: None,
+            folder_size_sort_busy: false,
             default_sort_by: sort_by,
             default_sort_dir: sort_dir,
             format_filter,
@@ -4057,6 +4083,17 @@ impl BrowseState {
         std::mem::swap(&mut self.disc_probe_followup, &mut other.disc_probe_followup);
 
         std::mem::swap(&mut self.return_target, &mut other.return_target);
+        let local_folder_size_toggle = self.folder_size_sort;
+        std::mem::swap(&mut self.folder_size_sort, &mut other.folder_size_sort);
+        // The switch swaps per-tab data before restoring session-wide controls.
+        // A tab which missed an on/off change must not resurrect old totals.
+        if self.folder_size_sort != local_folder_size_toggle {
+            self.folder_size_values.clear();
+            self.folder_size_sort_cursor = 0;
+            self.folder_size_sort_projected = 0;
+            self.folder_size_sort_filter = None;
+            self.folder_size_resort_pending = self.sort_by == SortBy::Size;
+        }
         std::mem::swap(&mut self.default_sort_by, &mut other.default_sort_by);
         std::mem::swap(&mut self.default_sort_dir, &mut other.default_sort_dir);
         std::mem::swap(&mut self.explore_enabled, &mut other.explore_enabled);
@@ -6250,8 +6287,10 @@ impl BrowseState {
             .cloned()
             .collect();
 
-        sort_entries(&mut dirs, self.sort_by, self.sort_dir, &self.probe_cache);
-        sort_entries(&mut files, self.sort_by, self.sort_dir, &self.probe_cache);
+        sort_entries(&mut dirs, self.sort_by, self.sort_dir, &self.probe_cache,
+            self.folder_size_sort && self.archive.is_none(), &self.folder_size_values);
+        sort_entries(&mut files, self.sort_by, self.sort_dir, &self.probe_cache,
+            false, &self.folder_size_values);
 
         self.entries.extend(dirs);
         self.entries.extend(files);
@@ -6308,6 +6347,153 @@ impl BrowseState {
             self.sort_dir = dir;
             self.reapply_after_browse_preference_change(tx);
         }
+    }
+
+    /// Enable or disable recursive folder-size accounting for the current
+    /// session. This is deliberately independent of the persisted sort field.
+    pub fn set_folder_size_sort(&mut self, enabled: bool,
+        tx: Option<&tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>>,
+    ) {
+        if self.folder_size_sort == enabled { return; }
+        self.folder_size_sort = enabled;
+        self.folder_size_sort_cursor = 0;
+        self.folder_size_sort_projected = 0;
+        self.folder_size_sort_filter = None;
+        self.folder_size_values.clear();
+        self.folder_size_sort_busy = enabled && self.archive.is_none();
+        self.folder_size_resort_pending = false;
+        self.reapply_after_browse_preference_change(tx);
+    }
+
+    /// Apply only measurement values produced by the existing accounting
+    /// service. This method never stats a path or performs database I/O.
+    fn folder_size_value_for(entry: &BrowseEntry,
+        accounting: &crate::directory_accounting::AccountingService,
+    ) -> Option<u128> {
+        use crate::directory_accounting::Freshness;
+        if !entry.is_child_dir() || entry.is_symlink { return None; }
+        let cached = accounting.view(&entry.path)?.cached.as_ref()?;
+        if cached.freshness == Freshness::KnownInvalid
+            || cached.measurement.path != entry.path
+            || cached.measurement.modified != entry.modified
+        { return None; }
+        Some(cached.measurement.counts.bytes)
+    }
+
+    /// Project the cache for newly streamed rows once, not at frame rate. A
+    /// source invalidation discards the entire current projection; later
+    /// account events repopulate the affected rows. The service/SQLite cache
+    /// remains the sole measurement authority.
+    pub fn sync_folder_size_sort(&mut self,
+        accounting: &crate::directory_accounting::AccountingService,
+    ) {
+        if !self.folder_size_sort || self.archive.is_some() { return; }
+        let invalidation = accounting.cache_generation();
+        if self.folder_size_sort_root.as_deref() != Some(self.current_dir.as_path())
+            || self.folder_size_sort_generation != self.scan_generation
+            || self.folder_size_sort_accounting_generation != invalidation
+        {
+            self.folder_size_values.clear();
+            self.folder_size_sort_cursor = 0;
+            self.folder_size_sort_projected = 0;
+            self.folder_size_sort_root = Some(self.current_dir.clone());
+            self.folder_size_sort_generation = self.scan_generation;
+            self.folder_size_sort_accounting_generation = invalidation;
+            self.folder_size_resort_pending = self.sort_by == SortBy::Size;
+        }
+        for entry in &self.all_dirs[self.folder_size_sort_projected.min(self.all_dirs.len())..] {
+            if let Some(bytes) = Self::folder_size_value_for(entry, accounting) {
+                if self.folder_size_values.insert(entry.path.clone(), bytes) != Some(bytes) {
+                    self.folder_size_resort_pending = true;
+                }
+            }
+        }
+        self.folder_size_sort_projected = self.all_dirs.len();
+        // Filter edits must revisit newly visible folders. Remember only the
+        // current filter identity rather than re-enumerating the directory.
+        let view_changed = self.folder_size_sort_filter.as_ref().is_none_or(|(text, hidden, format)| {
+            text != &self.filter_text || *hidden != self.show_hidden || *format != self.format_filter
+        });
+        if view_changed {
+            self.folder_size_sort_filter = Some((self.filter_text.clone(), self.show_hidden, self.format_filter));
+            self.folder_size_sort_cursor = 0;
+        }
+    }
+
+    /// A single accounting event updates one direct child in O(1) by the
+    /// scan-owned identity index. Missing or invalid measurements are never
+    /// interpreted as zero bytes.
+    pub fn update_folder_size_from_accounting(&mut self, path: &Path,
+        accounting: &crate::directory_accounting::AccountingService,
+    ) {
+        if !self.folder_size_sort || self.archive.is_some()
+            || path.parent() != Some(self.current_dir.as_path())
+            || !self.probe_cache_scan_identity_index.contains_key(path)
+        { return; }
+        let identity = self.probe_cache_scan_identity_index.get(path);
+        let bytes = accounting.view(path).and_then(|view| view.cached.as_ref())
+            .filter(|value| value.freshness != crate::directory_accounting::Freshness::KnownInvalid
+                && value.measurement.path == path
+                && identity.is_some_and(|entry| entry.modified == value.measurement.modified))
+            .map(|value| value.measurement.counts.bytes);
+        let prior = match bytes {
+            Some(value) => self.folder_size_values.insert(path.to_path_buf(), value),
+            None => self.folder_size_values.remove(path),
+        };
+        if prior != bytes { self.folder_size_resort_pending = true; }
+    }
+
+    /// Incremental scheduling by scan-owned directory index. One candidate
+    /// per event-loop tick, with at most four queued in the shared service.
+    /// A streaming directory scan appends rows without resetting this cursor.
+    pub fn next_folder_size_sort_path(&mut self) -> Option<PathBuf> {
+        if !self.folder_size_sort || self.archive.is_some() || self.search.active { return None; }
+        let filter_lower_owned = (!self.filter_text.is_empty()).then(|| self.filter_text.to_lowercase());
+        for _ in 0..256 {
+            let entry = self.all_dirs.get(self.folder_size_sort_cursor)?;
+            if entry.is_child_dir() && !entry.is_symlink
+                && entry_passes_view(entry, self.show_hidden, &self.format_filter, filter_lower_owned.as_deref())
+                && !self.folder_size_values.contains_key(&entry.path)
+            { return Some(entry.path.clone()); }
+            self.folder_size_sort_cursor += 1;
+        }
+        None
+    }
+
+    pub fn advance_folder_size_sort_path(&mut self) { self.folder_size_sort_cursor += 1; }
+
+    /// Suspended sort work is cancelled by the accounting service. Revisit
+    /// unmeasured candidates when Browse becomes active again; completed
+    /// measurements and the existing cache projection remain intact.
+    pub fn suspend_folder_size_sort(&mut self) {
+        if self.folder_size_sort {
+            self.folder_size_sort_cursor = 0;
+        }
+    }
+
+    pub fn folder_size_sort_cursor_pending(&self) -> bool {
+        self.folder_size_sort && !self.search.active && self.archive.is_none()
+            && self.folder_size_sort_cursor < self.all_dirs.len()
+    }
+
+    /// Coalesce many small-folder completions: an O(n log n) view rebuild no
+    /// more often than every 200 ms, and never while the cursor is moving.
+    pub fn maybe_resort_folder_sizes(&mut self) {
+        if !self.folder_size_resort_pending || self.sort_by != SortBy::Size
+            || !self.listing_complete || self.search.active
+            || !self.folder_size_sort || self.archive.is_some()
+        { return; }
+        if self.folder_size_last_resort.is_some_and(|when| when.elapsed() < Duration::from_millis(200))
+            || self.last_focus_movement_at.is_some_and(|when| when.elapsed() < BROWSE_PROBE_DEBOUNCE)
+        { return; }
+        self.folder_size_resort_pending = false;
+        self.folder_size_last_resort = Some(Instant::now());
+        self.apply_view_preserving_cursor();
+    }
+
+    pub fn folder_size_for_entry(&self, entry: &BrowseEntry) -> Option<u128> {
+        if !self.folder_size_sort || self.archive.is_some() || !entry.is_child_dir() { return None; }
+        self.folder_size_values.get(&entry.path).copied()
     }
 
     /// Cycle to the next sort field and re-apply, preserving cursor on current entry
@@ -6397,6 +6583,7 @@ impl BrowseState {
         tx: Option<&tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>>,
     ) {
         self.format_filter = filter;
+        self.folder_size_sort_cursor = 0;
         self.reapply_after_browse_preference_change(tx);
     }
 
@@ -7410,6 +7597,7 @@ impl BrowseState {
         tx: Option<&tokio::sync::mpsc::Sender<crate::tui::message::AppMessage>>,
     ) {
         self.show_hidden = !self.show_hidden;
+        self.folder_size_sort_cursor = 0;
         self.rebuild_tree_preserving_expansion();
 
         if self.search.active {
@@ -7485,6 +7673,10 @@ impl BrowseState {
     ) {
         if self.search.active {
             self.restart_active_search_after_preference_change(tx);
+        } else if self.folder_size_sort && self.sort_by == SortBy::Size && self.archive.is_none() {
+            // The streaming view retains discovery order. At completion, a
+            // size-ordered rebuild can move every row, including the cursor.
+            self.apply_view_preserving_cursor();
         } else {
             self.apply_view();
         }
@@ -8441,8 +8633,10 @@ impl BrowseState {
             }
         }
 
-        sort_entries(&mut dirs, self.sort_by, self.sort_dir, &self.probe_cache);
-        sort_entries(&mut files, self.sort_by, self.sort_dir, &self.probe_cache);
+        sort_entries(&mut dirs, self.sort_by, self.sort_dir, &self.probe_cache,
+            false, &self.folder_size_values);
+        sort_entries(&mut files, self.sort_by, self.sort_dir, &self.probe_cache,
+            false, &self.folder_size_values);
         dirs.extend(files);
         dirs
     }
@@ -12623,11 +12817,29 @@ fn sort_entries(
     by: SortBy,
     dir: SortDir,
     probe_cache: &HashMap<PathBuf, ProbeCacheEntry>,
+    folder_size_sort: bool,
+    folder_sizes: &HashMap<PathBuf, u128>,
 ) {
     entries.sort_by(|a, b| {
         let a_info = cached_info_for_sort(probe_cache, a);
         let b_info = cached_info_for_sort(probe_cache, b);
         let name_ord = || a.name.to_lowercase().cmp(&b.name.to_lowercase());
+        // Unknown recursive totals follow measured folders in *both*
+        // directions. Reverse only the comparison between known totals.
+        if by == SortBy::Size && folder_size_sort && a.is_child_dir() && b.is_child_dir() {
+            let a_size = folder_sizes.get(&a.path).copied();
+            let b_size = folder_sizes.get(&b.path).copied();
+            return match (a_size, b_size) {
+                (Some(a_bytes), Some(b_bytes)) => {
+                    let ord = a_bytes.cmp(&b_bytes);
+                    let ord = if dir == SortDir::Desc { ord.reverse() } else { ord };
+                    ord.then_with(name_ord)
+                }
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => name_ord(),
+            };
+        }
         let ord = match by {
             SortBy::Name => name_ord(),
             SortBy::Date => compare_opt_ord(a.modified, b.modified).then_with(name_ord),
@@ -15256,6 +15468,228 @@ mod tests {
 
     fn test_file_entry(path: PathBuf, name: &str) -> BrowseEntry {
         BrowseEntry::new(path, name.to_string(), EntryKind::OtherFile, 0, None)
+    }
+
+    #[test]
+    fn folder_size_sort_is_opt_in_and_unknown_totals_always_follow_measured() {
+        let root = PathBuf::from("/size-order-fixture");
+        let mut dirs = vec![
+            test_directory_entry(root.join("unknown"), "unknown"),
+            test_directory_entry(root.join("tiny"), "tiny"),
+            test_directory_entry(root.join("large"), "large"),
+        ];
+        // Directory entry metadata size is not a recursive total.
+        dirs[0].size = 99999;
+        dirs[1].size = 77777;
+        dirs[2].size = 11111;
+        let mut sizes = HashMap::new();
+        sizes.insert(root.join("tiny"), 0);
+        sizes.insert(root.join("large"), 2048);
+        fn names(rows: &[BrowseEntry]) -> Vec<&str> { rows.iter().map(|e| e.name.as_str()).collect() }
+        sort_entries(&mut dirs, SortBy::Size, SortDir::Asc, &HashMap::new(), true, &sizes);
+        assert_eq!(names(&dirs), ["tiny", "large", "unknown"]);
+        sort_entries(&mut dirs, SortBy::Size, SortDir::Desc, &HashMap::new(), true, &sizes);
+        assert_eq!(names(&dirs), ["large", "tiny", "unknown"]);
+        sort_entries(&mut dirs, SortBy::Size, SortDir::Asc, &HashMap::new(), false, &sizes);
+        assert_eq!(names(&dirs), ["large", "tiny", "unknown"],
+            "when disabled the old directory-entry size comparison remains in force");
+    }
+
+    fn folder_sort_cached(path: &Path, bytes: u128) -> crate::directory_accounting::CachedMeasurement {
+        use crate::directory_accounting::{CachedMeasurement, CompleteMeasurement, Counts, Freshness};
+        use crate::directory_accounting::model::Observation;
+        let now = SystemTime::now();
+        CachedMeasurement {
+            measurement: CompleteMeasurement {
+                path: path.to_path_buf(), counts: Counts { bytes, ..Counts::default() },
+                started: now, finished: now, created: None, modified: None,
+                generation: 1, observation: Observation::AsObserved,
+            },
+            freshness: Freshness::AsObserved,
+        }
+    }
+
+    #[test]
+    fn folder_size_cache_projection_resorts_without_losing_selected_entry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        let mut browse = BrowseState::new_with_config_at(
+            &crate::config::BrowsingConfig::default(), root.clone());
+        browse.all_dirs = ["a", "b", "c"].into_iter()
+            .map(|name| test_directory_entry(root.join(name), name)).collect();
+        browse.rebuild_probe_cache_scan_identity_index();
+        browse.listing_complete = true;
+        browse.sort_by = SortBy::Size;
+        browse.sort_dir = SortDir::Desc;
+        browse.apply_view();
+        browse.set_folder_size_sort(true, None);
+        browse.selected_index = browse.entries.iter().position(|entry| entry.name == "b").unwrap();
+        let mut accounting = crate::directory_accounting::AccountingService::new(None);
+        accounting.views.entry(root.join("a")).or_default().cached = Some(folder_sort_cached(&root.join("a"), 500));
+        browse.sync_folder_size_sort(&accounting);
+        browse.maybe_resort_folder_sizes();
+        assert_eq!(browse.entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["a", "b", "c"]);
+        assert_eq!(browse.selected_entry().unwrap().name, "b");
+        accounting.views.entry(root.join("c")).or_default().cached = Some(folder_sort_cached(&root.join("c"), 1000));
+        browse.update_folder_size_from_accounting(&root.join("c"), &accounting);
+        browse.folder_size_last_resort = None; // exercise completion after debounce
+        browse.maybe_resort_folder_sizes();
+        assert_eq!(browse.entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["c", "a", "b"]);
+        assert_eq!(browse.selected_entry().unwrap().name, "b", "resorting may not move focus to another entry");
+        assert_eq!(browse.folder_size_for_entry(&browse.entries[0]), Some(1000));
+        browse.set_folder_size_sort(false, None);
+        assert_eq!(browse.folder_size_for_entry(&browse.entries[0]), None);
+    }
+
+    #[test]
+    fn folder_size_toggle_follows_browse_session_across_tabs() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut browse = BrowseState::new_with_config_at(
+            &crate::config::BrowsingConfig::default(), temp.path().to_path_buf());
+        browse.set_folder_size_sort(true, None);
+        assert!(browse.open_dir_in_new_tab(temp.path().join("second"), true));
+        assert!(browse.folder_size_sort, "new tab retains the session toggle");
+        browse.set_folder_size_sort(false, None);
+        assert!(browse.switch_to_tab(0));
+        assert!(!browse.folder_size_sort, "inactive tab cannot restore an obsolete toggle");
+    }
+
+    #[test]
+    fn folder_size_sort_revisits_entries_after_filter_changes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        let mut browse = BrowseState::new_with_config_at(
+            &crate::config::BrowsingConfig::default(), root.clone());
+        browse.all_dirs = vec![
+            test_directory_entry(root.join(".hidden"), ".hidden"),
+            test_directory_entry(root.join("shown"), "shown"),
+        ];
+        browse.set_folder_size_sort(true, None);
+        let accounting = crate::directory_accounting::AccountingService::new(None);
+        browse.sync_folder_size_sort(&accounting);
+        assert_eq!(browse.next_folder_size_sort_path(), Some(root.join("shown")));
+        browse.advance_folder_size_sort_path();
+        assert_eq!(browse.next_folder_size_sort_path(), None);
+        browse.show_hidden = true;
+        browse.sync_folder_size_sort(&accounting);
+        assert_eq!(browse.next_folder_size_sort_path(), Some(root.join(".hidden")));
+        browse.filter_text = "shown".into();
+        browse.sync_folder_size_sort(&accounting);
+        assert_eq!(browse.next_folder_size_sort_path(), Some(root.join("shown")));
+    }
+
+    #[test]
+    fn suspended_folder_size_sort_revisits_four_unmeasured_candidates() {
+        // Both Search and leaving Browse cancel the service's sort scope;
+        // returning need not change the directory, filter, or scan generation.
+        for search_overlay in [true, false] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let root = tmp.path().to_path_buf();
+            let mut browse = BrowseState::new_with_config_at(
+                &crate::config::BrowsingConfig::default(), root.clone());
+            browse.all_dirs = ["cached", "one", "two", "three", "four"]
+                .into_iter().map(|name| test_directory_entry(root.join(name), name))
+                .collect();
+            browse.rebuild_probe_cache_scan_identity_index();
+            browse.set_folder_size_sort(true, None);
+            let mut accounting = crate::directory_accounting::AccountingService::new(None);
+            let cached = root.join("cached");
+            accounting.views.entry(cached.clone()).or_default().cached =
+                Some(folder_sort_cached(&cached, 4096));
+            browse.sync_folder_size_sort(&accounting);
+            assert_eq!(browse.folder_size_values.get(&cached), Some(&4096));
+
+            let missing = ["one", "two", "three", "four"]
+                .map(|name| root.join(name));
+            for path in &missing {
+                assert_eq!(browse.next_folder_size_sort_path().as_deref(), Some(path.as_path()));
+                browse.advance_folder_size_sort_path();
+            }
+            assert_eq!(browse.next_folder_size_sort_path(), None);
+
+            if search_overlay { browse.search.active = true; }
+            // The event-loop inactive branch calls this just after the
+            // accounting service cancels its scope and drops queued work.
+            browse.suspend_folder_size_sort();
+            if search_overlay { browse.search.active = false; }
+            assert_eq!(browse.folder_size_values.get(&cached), Some(&4096),
+                "a finished measurement must survive suspension");
+            browse.sync_folder_size_sort(&accounting);
+            for (index, path) in missing.iter().enumerate() {
+                assert_eq!(browse.next_folder_size_sort_path().as_deref(), Some(path.as_path()),
+                    "cancelled candidates must be eligible again in the same listing");
+                accounting.views.entry(path.clone()).or_default().cached =
+                    Some(folder_sort_cached(path, (index + 1) as u128 * 100));
+                browse.update_folder_size_from_accounting(path, &accounting);
+                browse.advance_folder_size_sort_path();
+                assert_eq!(browse.folder_size_values.get(path), Some(&((index + 1) as u128 * 100)));
+            }
+            assert_eq!(browse.next_folder_size_sort_path(), None);
+            assert_eq!(browse.folder_size_values.len(), 5);
+        }
+    }
+
+    #[test]
+    fn terminal_size_sort_keeps_streaming_selection_for_both_directions() {
+        for direction in [SortDir::Asc, SortDir::Desc] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let root = tmp.path().to_path_buf();
+            let mut browse = BrowseState::new_with_config_at(
+                &crate::config::BrowsingConfig::default(), root.clone());
+            browse.sort_by = SortBy::Size;
+            browse.sort_dir = direction;
+            browse.set_folder_size_sort(true, None);
+            let parent = BrowseEntry::new(root.parent().unwrap().to_path_buf(),
+                "..".to_string(), EntryKind::ParentDir, 0, None);
+            browse.parent_entry = Some(parent.clone());
+            browse.apply_view();
+
+            let gamma = test_directory_entry(root.join("gamma"), "gamma");
+            let beta = test_directory_entry(root.join("beta"), "beta");
+            let alpha = test_directory_entry(root.join("alpha"), "alpha");
+            let (handle, _cancel) = ScanHandle::new(70);
+            browse.scan_pending = Some(handle);
+            assert!(browse.apply_dir_scan_batch_if_current(70, &root,
+                vec![gamma.clone(), beta.clone()], vec![], 2));
+            browse.selected_index = browse.entries.iter().position(|entry| entry.path == beta.path)
+                .expect("beta appears in first batch");
+            assert!(browse.apply_dir_scan_batch_if_current(70, &root,
+                vec![alpha.clone()], vec![], 3));
+            assert_eq!(browse.selected_entry().unwrap().path, beta.path);
+            // The streaming view is in discovery order; cache completions
+            // arrive before the terminal authoritative sort.
+            browse.folder_size_values.insert(alpha.path.clone(), 500);
+            browse.folder_size_values.insert(beta.path.clone(), 50);
+            browse.folder_size_values.insert(gamma.path.clone(), 200);
+            assert!(browse.finish_dir_scan_if_current(70, &root));
+            browse.publish_scanned_entries(Some(parent.clone()),
+                vec![gamma.clone(), beta.clone(), alpha.clone()], vec![]);
+            browse.reapply_after_directory_scan_complete(None);
+            let names = browse.entries.iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>();
+            let expected = if direction == SortDir::Asc {
+                vec!["..", "beta", "gamma", "alpha"]
+            } else {
+                vec!["..", "alpha", "gamma", "beta"]
+            };
+            assert_eq!(names, expected);
+            assert_eq!(browse.selected_entry().unwrap().path, beta.path,
+                "terminal sort cannot move focus to another folder");
+
+            browse.selected_index = 0;
+            browse.reapply_after_directory_scan_complete(None);
+            assert_eq!(browse.selected_entry().unwrap().path, parent.path,
+                "the parent entry must keep its position and selection");
+
+            browse.selected_index = browse.entries.iter().position(|entry| entry.path == beta.path)
+                .unwrap();
+            let previous_index = browse.selected_index;
+            browse.publish_scanned_entries(Some(parent.clone()), vec![gamma, alpha], vec![]);
+            browse.reapply_after_directory_scan_complete(None);
+            assert_eq!(browse.selected_index,
+                previous_index.min(browse.entries.len().saturating_sub(1)),
+                "when a selected entry disappears, retain the existing clamp fallback");
+            assert_ne!(browse.selected_entry().unwrap().path, beta.path);
+        }
     }
 
     #[test]

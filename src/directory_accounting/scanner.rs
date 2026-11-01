@@ -281,8 +281,13 @@ impl RateGovernor {
             if self.cancel.load(Ordering::Acquire) { return Err(ScanExit::Cancelled); }
             #[cfg(test)]
             if self.unlimited_fixture { return Ok(()); }
-            let foreground = self.priority.load(Ordering::Acquire) >= 2;
-            if !foreground && (self.background_pause.load(Ordering::Acquire) || self.background_busy.load(Ordering::Acquire)) {
+            let priority = self.priority.load(Ordering::Acquire);
+            let foreground = priority >= 2;
+            // Priority 3 is opt-in Browse accounting: do not rate-limit an
+            // expressly requested folder walk, but yield to Properties and
+            // active playback/analysis just like other background work.
+            if priority != 2 && (self.background_pause.load(Ordering::Acquire)
+                || self.background_busy.load(Ordering::Acquire)) {
                 std::thread::sleep(Duration::from_millis(15));
                 continue;
             }

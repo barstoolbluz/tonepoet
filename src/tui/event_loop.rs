@@ -182,6 +182,32 @@ pub async fn run_app(
             app.directory_accounting.set_interactive_busy(
                 app.analysis_pending > 0 || app.processing_active
             );
+            // Opt-in folder sizes reuse the one app-wide accounting worker.
+            // The scan-owned index and a four-root queue bound event-loop work
+            // even when a listing has tens of thousands of subdirectories.
+            let sort_active = app.current_screen == AppScreen::Browse
+                && app.browse.folder_size_sort && !app.browse.is_in_archive()
+                && !app.browse.search.active;
+            app.directory_accounting.set_folder_sort_scope(
+                sort_active.then_some(app.browse.current_dir.as_path()));
+            if sort_active {
+                app.browse.sync_folder_size_sort(&app.directory_accounting);
+                for _ in 0..4 {
+                    let Some(path) = app.browse.next_folder_size_sort_path() else { break; };
+                    if !app.directory_accounting.request_folder_sort(&path, &tx) { break; }
+                    app.browse.advance_folder_size_sort_path();
+                }
+                app.browse.folder_size_sort_busy =
+                    app.browse.folder_size_sort_cursor_pending()
+                    || app.directory_accounting.folder_sort_work_pending();
+                app.browse.maybe_resort_folder_sizes();
+            } else {
+                // Scope cancellation discards queued sort requests. The
+                // cursor must revisit their paths after Search or another
+                // screen closes without a directory-generation change.
+                app.browse.suspend_folder_size_sort();
+                app.browse.folder_size_sort_busy = false;
+            }
             if app.current_screen == AppScreen::Browse && !app.browse.is_in_archive() {
                 let highlighted = if app.browse.selected_entry().is_some_and(|entry| entry.is_child_dir() && !entry.is_symlink) {
                     app.browse.selected_entry().map(|entry| entry.path.clone())
@@ -7055,9 +7081,20 @@ mod analysis_batch_status_tests {
 pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMessage>) {
     match msg {
         AppMessage::DirectoryAccounting(event) => {
-            // Request ids prevent late results from previous tabs/selections
-            // from overwriting a newer view, while all tabs share the cache.
-            let _ = app.directory_accounting.accept_event(&event, tx);
+            // The service validates request identity before any sorting state
+            // observes a completed/cached total.
+            if app.directory_accounting.accept_event(&event, tx) {
+                let path = match &event {
+                    crate::directory_accounting::AccountingEvent::Cached { path, .. }
+                    | crate::directory_accounting::AccountingEvent::Local { path, .. }
+                    | crate::directory_accounting::AccountingEvent::LocalPreview { path, .. }
+                    | crate::directory_accounting::AccountingEvent::Progress { path, .. }
+                    | crate::directory_accounting::AccountingEvent::Finished { path, .. }
+                    | crate::directory_accounting::AccountingEvent::Ready { path, .. } => path,
+                };
+                app.browse.update_folder_size_from_accounting(path, &app.directory_accounting);
+                app.browse.maybe_resort_folder_sizes();
+            }
         }
         AppMessage::HostClipboardReadComplete {
             generation,

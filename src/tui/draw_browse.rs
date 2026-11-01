@@ -1373,10 +1373,12 @@ pub(super) fn options_submenu_rows(
                 })
                 .collect(),
         )),
-        BrowseOptionsMenu::Sort => Some((
-            "Default sort",
-            SortBy::ALL
-                .into_iter()
+        BrowseOptionsMenu::Sort => {
+            let mut rows = vec![
+                (format!(" {} Calculate folder sizes", if browse.folder_size_sort { "☑" } else { "☐" }),
+                    Some(TuiButton::BrowseOptionsFolderSizeSort)),
+            ];
+            rows.extend(SortBy::ALL.into_iter()
                 .flat_map(|by| [(by, SortDir::Asc), (by, SortDir::Desc)])
                 .map(|(by, dir)| {
                     let mark = if browse.default_sort_by == by && browse.default_sort_dir == dir {
@@ -1388,13 +1390,11 @@ pub(super) fn options_submenu_rows(
                         SortDir::Asc => "↑",
                         SortDir::Desc => "↓",
                     };
-                    (
-                        format!(" {} {} {}", mark, by.display_label(), arrow),
-                        Some(TuiButton::BrowseOptionsSortChoice(by, dir)),
-                    )
-                })
-                .collect(),
-        )),
+                    (format!(" {} {} {}", mark, by.display_label(), arrow),
+                        Some(TuiButton::BrowseOptionsSortChoice(by, dir)))
+                }));
+            Some(("Default sort", rows))
+        },
         BrowseOptionsMenu::Filter => Some((
             "Filter",
             FormatFilter::menu_choices()
@@ -1595,6 +1595,25 @@ pub(super) fn active_options_menu_rows(
 #[cfg(test)]
 mod options_menu_tests {
     use super::*;
+
+    #[test]
+    fn folder_size_sort_option_and_size_header_marker_track_session_state() {
+        let mut browse = BrowseState::new();
+        browse.options_menu = BrowseOptionsMenu::Sort;
+        let (_, off) = options_submenu_rows(&browse, "never").unwrap();
+        assert_eq!(off[0].1, Some(TuiButton::BrowseOptionsFolderSizeSort));
+        assert!(off[0].0.contains('☐'));
+        browse.set_folder_size_sort(true, None);
+        let (_, on) = options_submenu_rows(&browse, "never").unwrap();
+        assert_eq!(on[0].1, Some(TuiButton::BrowseOptionsFolderSizeSort));
+        assert!(on[0].0.contains('☑'));
+        let theme = crate::tui::theme::theme_by_slug_or_default(crate::tui::theme::default_theme_slug());
+        let cols = [BrowseColumnCell { column: BrowseColumn::Size, width: COL_SIZE_W }];
+        let row = render_header_row(ratatui::style::Color::White, 32, &cols,
+            SortBy::Size, SortDir::Desc, true, true, theme);
+        let content = row.spans.iter().map(|span| span.content.as_ref()).collect::<String>();
+        assert!(content.contains("size*⟳"), "missing opt-in marker/activity: {content}");
+    }
 
     #[test]
     fn layout_gives_recovered_explore_space_to_browse_pane() {
@@ -2581,6 +2600,8 @@ fn draw_browse_list(
         &column_layout,
         browse.sort_by,
         browse.sort_dir,
+        browse.folder_size_sort,
+        browse.folder_size_sort_busy && browse.archive.is_none(),
         theme,
     ));
 
@@ -2795,6 +2816,8 @@ fn render_header_row(
     columns: &[BrowseColumnCell],
     sort_by: SortBy,
     sort_dir: SortDir,
+    folder_size_sort: bool,
+    folder_size_busy: bool,
     theme: super::theme::Theme,
 ) -> Line<'static> {
     let arrow = match sort_dir {
@@ -2818,11 +2841,12 @@ fn render_header_row(
         } else {
             theme.muted()
         };
-        let text = if is_active {
-            format!("{} {}", cell.column.config_key(), arrow)
+        let key = if cell.column == BrowseColumn::Size && folder_size_sort {
+            format!("size*{}", if folder_size_busy { "⟳" } else { "" })
         } else {
             cell.column.config_key().to_string()
         };
+        let text = if is_active { format!("{key} {arrow}") } else { key };
         let display = pad_or_truncate(&text, cell.width, column_right_aligned(cell.column));
         spans.push(Span::styled(display, style));
     }
@@ -2894,7 +2918,14 @@ fn render_entry_line(
                 spans.push(Span::styled(name_display, entry_name_style(entry, is_selected, theme)));
             }
         } else {
-            let value = entry_column_text(entry, cell.column, cached);
+            let value = if cell.column == BrowseColumn::Size && browse.folder_size_sort
+                && browse.archive.is_none() && entry.is_child_dir()
+            {
+                Cow::Owned(browse.folder_size_for_entry(entry)
+                    .map(folder_size_str).unwrap_or_default())
+            } else {
+                entry_column_text(entry, cell.column, cached)
+            };
             let display = pad_or_truncate(value.as_ref(), cell.width, column_right_aligned(cell.column));
             spans.push(Span::styled(display, entry_column_style(entry, cell.column, cached, theme)));
         }
@@ -7862,6 +7893,22 @@ mod browse_new_toolbar_render_tests {
             );
         }
     }
+}
+
+/// One decimal and short IEC labels keep large recursive directory totals
+/// legible within the existing nine-column Size cell without lossy f64 casts.
+fn folder_size_str(bytes: u128) -> String {
+    const UNITS: [&str; 7] = ["B", "KB", "MB", "GB", "TB", "PB", "EB"];
+    if bytes < 1024 { return format!("{bytes} B"); }
+    let mut unit = 0;
+    let mut scale = 1u128;
+    while unit + 1 < UNITS.len() && bytes / scale >= 1024 {
+        scale *= 1024;
+        unit += 1;
+    }
+    let fractional = (bytes % scale * 10 + scale / 2) / scale;
+    let whole = bytes / scale + fractional / 10;
+    format!("{whole}.{} {}", fractional % 10, UNITS[unit])
 }
 
 /// Format a file size for display

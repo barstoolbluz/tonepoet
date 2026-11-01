@@ -3477,6 +3477,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "help",
     "sort",
     "sortdir",
+    "folder-sort",
     "filter",
     "refresh",
     "l",
@@ -3751,6 +3752,8 @@ pub enum Command {
     Sort(Option<String>, Option<String>),
     /// Toggle sort direction
     SortDir,
+    /// Toggle or set recursive folder-size measurements; session only.
+    FolderSort(Option<String>),
     /// Filter command for the browse screen. Arg: format name or empty (cycle)
     Filter(Option<String>),
     /// Refresh the current browse directory from the filesystem.
@@ -4020,6 +4023,7 @@ impl std::fmt::Debug for Command {
             Command::ArchiveList => f.write_str("ArchiveList"),
             Command::NewFile(arg) => f.debug_tuple("NewFile").field(arg).finish(),
             Command::NewFolder(arg) => f.debug_tuple("NewFolder").field(arg).finish(),
+            Command::FolderSort(arg) => f.debug_tuple("FolderSort").field(arg).finish(),
             Command::Rename(arg) => f.debug_tuple("Rename").field(arg).finish(),
             Command::Delete => f.write_str("Delete"),
             Command::Copy { dest, force } => f
@@ -4295,6 +4299,7 @@ pub fn parse_command(input: &str) -> Command {
             Command::Sort(field, dir)
         }
         "sortdir" => Command::SortDir,
+        "folder-sort" => Command::FolderSort((!args.is_empty()).then(|| args.to_string())),
         "filter" => {
             let arg = if args.is_empty() {
                 None
@@ -5281,6 +5286,24 @@ OSC 52 fallback is capped at 64 KiB; install a native clipboard helper for large
                 app.browse.sort_dir.label()
             );
             app.set_status(msg);
+        }
+        Command::FolderSort(arg) => {
+            if app.current_screen != AppScreen::Browse {
+                app.set_status(":folder-sort only works on the browse screen");
+                return;
+            }
+            let enabled = match arg.as_deref() {
+                None => !app.browse.folder_size_sort,
+                Some("on") => true,
+                Some("off") => false,
+                _ => {
+                    app.set_status("Usage: :folder-sort [on|off]");
+                    return;
+                }
+            };
+            app.browse.set_folder_size_sort(enabled, Some(tx));
+            app.set_status(if enabled { "Folder-size accounting on (session only)" }
+                else { "Folder-size accounting off" });
         }
         Command::Filter(arg) => {
             execute_filter(app, arg.as_deref(), tx);
@@ -16985,6 +17008,15 @@ mod completion_tests {
     }
 
     // ── compute_completion: command-name completion ──
+
+    #[test]
+    fn folder_sort_command_forms_are_session_commands() {
+        assert!(matches!(parse_command("folder-sort"), Command::FolderSort(None)));
+        assert!(matches!(parse_command("folder-sort on"), Command::FolderSort(Some(ref s)) if s == "on"));
+        assert!(matches!(parse_command("folder-sort off"), Command::FolderSort(Some(ref s)) if s == "off"));
+        let completions = compute_completion("folder-so", 9).expect("command completion");
+        assert!(completions.candidates.contains(&"folder-sort".to_string()));
+    }
 
     #[test]
     fn command_completion_prefix_q() {

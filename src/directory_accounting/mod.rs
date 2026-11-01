@@ -65,6 +65,10 @@ pub struct AccountingService {
     browse_dwell: Option<(PathBuf, Instant)>,
     highlight_dwell: Option<(PathBuf, Instant)>,
     background_tried: HashMap<PathBuf, BackgroundAttempt>,
+    /// At most four opt-in sort candidates share the normal accounting worker;
+    /// no separate walker, cache, or unbounded job queue is introduced.
+    folder_sort_scope: Option<PathBuf>,
+    folder_sort_targets: HashSet<PathBuf>,
     preview_active: Option<PreviewJob>,
     preview_tried: HashMap<PathBuf, Instant>,
     explicit_pause: Arc<AtomicBool>,
@@ -113,6 +117,7 @@ impl AccountingService {
         Self { db_path, active: HashMap::new(), queued: VecDeque::new(), next_id: 0,
             views: HashMap::new(), browse_dwell: None, highlight_dwell: None,
             background_tried: HashMap::new(),
+            folder_sort_scope: None, folder_sort_targets: HashSet::new(),
             preview_active: None, preview_tried: HashMap::new(),
             explicit_pause: Arc::new(AtomicBool::new(false)),
             background_busy: Arc::new(AtomicBool::new(false)),
@@ -121,6 +126,62 @@ impl AccountingService {
             invalidation_generation: 0, invalidation_tx, invalidation_overflow }
     }
     pub fn view(&self, path: &Path) -> Option<&DirectoryView> { self.views.get(path) }
+    pub fn cache_generation(&self) -> u64 { self.invalidation_generation }
+
+    /// The current filesystem listing owns a small, opt-in set of background
+    /// roots. Navigation/off cancels only work scheduled for sorting; explicit
+    /// Properties/Refresh subscribers remain independently owned.
+    pub fn set_folder_sort_scope(&mut self, scope: Option<&Path>) {
+        if self.folder_sort_scope.as_deref() == scope { return; }
+        for path in self.folder_sort_targets.drain() {
+            self.queued.retain(|pending| pending.path != path || pending.explicit);
+            if let Some(job) = self.active.get(&path) {
+                if !job.explicit { job.cancel.store(true, Ordering::Release); }
+            }
+            self.background_tried.remove(&path);
+        }
+        self.folder_sort_scope = scope.map(Path::to_path_buf);
+        // Once the user explicitly requests child sizes, avoid spending the
+        // sole background permit on a full parent traversal first.
+        if let Some(root) = scope {
+            if let Some(job) = self.active.get(root) {
+                if !job.explicit { job.cancel.store(true, Ordering::Release); }
+            }
+            self.queued.retain(|pending| pending.explicit || pending.path != root);
+            self.background_tried.remove(root);
+        }
+    }
+
+    pub fn folder_sort_work_pending(&self) -> bool { !self.folder_sort_targets.is_empty() }
+
+    /// Submit a single direct child without I/O on the UI thread. Returns
+    /// false only for backpressure or a scope mismatch; the caller retries
+    /// later without advancing its cursor. Existing attempts are not repeated.
+    pub fn request_folder_sort(&mut self, path: &Path, tx: &Sender<AppMessage>) -> bool {
+        if path.parent() != self.folder_sort_scope.as_deref() { return false; }
+        if self.folder_sort_targets.contains(path) { return true; }
+        // A prior navigation may have cancelled this exact worker. Do not
+        // claim that attempt: retry only after its cancellation is acknowledged.
+        if let Some(active) = self.active.get(path) {
+            if active.cancel.load(Ordering::Acquire) { return active.user_cancelled; }
+        }
+        let already_running = self.active.contains_key(path);
+        let already_queued = self.queued.iter().any(|job| job.path == path);
+        if self.folder_sort_targets.len() >= 4
+            || (!already_running && !already_queued && self.queued.len() >= 64)
+        { return false; }
+        self.folder_sort_targets.insert(path.to_path_buf());
+        if let Some(active) = self.active.get(path) {
+            if !active.explicit { active.priority.store(3, Ordering::Release); }
+        } else if !already_queued {
+            // An automatic dwell attempt (or a pruned UI projection) must not
+            // mask SQLite-cached totals after navigation. A single opt-in
+            // request per listing can cheaply rehydrate them via the worker.
+            self.background_tried.remove(path);
+        }
+        self.queue_background_if_needed(path.to_path_buf(), tx);
+        true
+    }
     pub fn set_interactive_busy(&mut self, busy: bool) {
         self.background_busy.store(busy, Ordering::Release);
     }
@@ -141,6 +202,7 @@ impl AccountingService {
             .chain(self.preview_active.iter().map(|job| &job.path))
             .chain(self.browse_dwell.iter().map(|(path, _)| path))
             .chain(self.highlight_dwell.iter().map(|(path, _)| path))
+            .chain(self.folder_sort_targets.iter())
             .cloned().collect::<HashSet<_>>();
         let mut excess = self.views.len() - 1024;
         let obsolete = self.views.keys().filter(|path| !pinned.contains(*path))
@@ -283,7 +345,7 @@ impl AccountingService {
                     // Keep foreground priority and do not cancel the scan.
                 } else if job.background_interest {
                     job.explicit = false;
-                    job.priority.store(1, Ordering::Release);
+                    job.priority.store(if self.folder_sort_targets.contains(path) { 3 } else { 1 }, Ordering::Release);
                 } else {
                     job.cancel.store(true, Ordering::Release);
                 }
@@ -343,7 +405,8 @@ impl AccountingService {
         // Navigation changes immediately discard not-yet-started roots. An
         // active unrelated walk is cancelled at the next metadata I/O token.
         // Completed subtrees remain independently cacheable after cancellation.
-        let relevant = |path: &Path| current.as_deref() == Some(path) || highlighted.as_deref() == Some(path);
+        let relevant = |path: &Path| current.as_deref() == Some(path)
+            || highlighted.as_deref() == Some(path) || self.folder_sort_targets.contains(path);
         self.queued.retain(|pending| pending.explicit || relevant(&pending.path));
         for job in self.active.values() {
             if !job.explicit && !relevant(&job.path) { job.cancel.store(true, Ordering::Release); }
@@ -352,7 +415,7 @@ impl AccountingService {
         let settled_highlight = Self::settled(&mut self.highlight_dwell, highlighted.clone(), Duration::from_millis(1500));
         self.consider_preview(highlighted.as_deref(), settled_highlight.clone(), tx);
         // Prefer current Browse folder, then a cursor-stable highlighted folder.
-        for candidate in [settled_current, settled_highlight].into_iter().flatten() {
+        for candidate in [settled_current.filter(|_| self.folder_sort_scope.is_none()), settled_highlight].into_iter().flatten() {
             if candidate.is_absolute() { self.queue_background_if_needed(candidate, tx); }
         }
         if self.preview_tried.len() > 1024 {
@@ -396,7 +459,12 @@ impl AccountingService {
     fn launch(&mut self, path: PathBuf, explicit: bool, force: bool, id: u64,
         subscriber: Option<u64>, refresh_interest: bool, tx: &Sender<AppMessage>) {
         let cancel = Arc::new(AtomicBool::new(false));
-        let priority = Arc::new(AtomicU8::new(if explicit { 2 } else { 1 }));
+        // Folder sizes are explicitly opted in by the user but measured on
+        // the existing worker. The opted-in scan bypasses conservative
+        // *automatic* network admission/rate gates; it stays cancellable and
+        // serial, and never blocks the event loop on sshfs or other mounts.
+        let priority = Arc::new(AtomicU8::new(if explicit { 2 }
+            else if self.folder_sort_targets.contains(&path) { 3 } else { 1 }));
         let prior_local = self.views.get(&path).and_then(|view| view.local);
         self.active.insert(path.clone(), Job {
             id, path: path.clone(), cancel: cancel.clone(), priority: priority.clone(),
@@ -527,6 +595,7 @@ impl AccountingService {
             let _ = tx.blocking_send(AppMessage::DirectoryAccounting(Event::Finished { id, path, end: result }));
         });
         if let Err(error) = started {
+            self.folder_sort_targets.remove(&path_for_failure);
             self.active.remove(&path_for_failure);
             self.refresh_pause();
             let view = self.views.entry(path_for_failure).or_default();
@@ -641,6 +710,7 @@ impl AccountingService {
                 _ => {},
             }
             self.active.remove(path);
+            self.folder_sort_targets.remove(path);
             self.refresh_pause();
             // Never run two foreground walks or two background roots. A
             // queued explicit may coexist with the one paused background root.
@@ -719,6 +789,48 @@ mod service_tests {
             subscribers: HashSet::new(), invalidation_generation: generation,
             prior_local: None, user_cancelled: false,
         }
+    }
+
+    #[test]
+    fn folder_size_scope_rehydrates_cached_roots_and_cancels_only_its_own_work() {
+        let mut service = AccountingService::new(None);
+        let root = PathBuf::from("/music/collection");
+        let child = root.join("album");
+        let other = root.join("existing-background");
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        service.active.insert(other.clone(), job(&other, 20, false, 0));
+        service.background_tried.insert(child.clone(), BackgroundAttempt {
+            at: Instant::now(), retry_after: Duration::from_secs(86400),
+        });
+        service.set_folder_sort_scope(Some(&root));
+        assert!(service.request_folder_sort(&child, &tx));
+        assert!(service.folder_sort_targets.contains(&child));
+        assert!(service.background_tried.get(&child).is_some(),
+            "the queued path receives a new attempt marker");
+        assert_eq!(service.queued.iter().filter(|q| q.path == child).count(), 1);
+        assert!(service.request_folder_sort(&child, &tx));
+        assert_eq!(service.queued.iter().filter(|q| q.path == child).count(), 1);
+        service.set_folder_sort_scope(None);
+        assert!(service.queued.iter().all(|q| q.path != child));
+        assert!(!service.folder_sort_work_pending());
+        assert!(!service.active.get(&other).unwrap().cancel.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn folder_size_request_waits_for_cancellation_and_promotes_shared_worker() {
+        let mut service = AccountingService::new(None);
+        let root = PathBuf::from("/music/collection");
+        let child = root.join("album");
+        service.set_folder_sort_scope(Some(&root));
+        service.active.insert(child.clone(), job(&child, 10, false, 0));
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        assert!(service.request_folder_sort(&child, &tx));
+        assert_eq!(service.active[&child].priority.load(Ordering::Acquire), 3);
+        assert_eq!(service.active.len(), 1, "promotion cannot duplicate a directory walker");
+        service.set_folder_sort_scope(None);
+        assert!(service.active[&child].cancel.load(Ordering::Acquire));
+        service.set_folder_sort_scope(Some(&root));
+        assert!(!service.request_folder_sort(&child, &tx), "do not claim a cancelled worker");
     }
 
     #[test]

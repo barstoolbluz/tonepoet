@@ -3087,6 +3087,12 @@ fn activate_browse_options_menu_button(
                 .set_default_sort_with_search(by, dir, true, Some(tx));
             persist_browse_config(app);
         }
+        TuiButton::BrowseOptionsFolderSizeSort => {
+            let enabled = !app.browse.folder_size_sort;
+            app.browse.set_folder_size_sort(enabled, Some(tx));
+            app.set_status(if enabled { "Folder-size accounting on (session only)" }
+                else { "Folder-size accounting off" });
+        }
         TuiButton::BrowseOptionsFilterChoice(choice) => {
             set_browse_filter_choice(app, choice, tx);
             persist_browse_config(app);
@@ -3117,6 +3123,7 @@ fn is_browse_options_menu_button(button: TuiButton) -> bool {
             | TuiButton::BrowseOptionsRestoreDefaults
             | TuiButton::BrowseOptionsColumn(_)
             | TuiButton::BrowseOptionsSortChoice(_, _)
+            | TuiButton::BrowseOptionsFolderSizeSort
             | TuiButton::BrowseOptionsFilterChoice(_)
             | TuiButton::BrowseOptionsArchiveChoice(_)
     )
@@ -13802,6 +13809,10 @@ pub(super) fn open_context_menu_with_tx(
                 ) => {
                     app.browse_context_action_paths = None;
                     Vec::new()
+                }
+                Some(TuiButton::BrowseColumn(super::browse::BrowseColumn::Size)) => {
+                    app.browse_context_action_paths = None;
+                    build_browse_size_header_menu(app.browse.folder_size_sort)
                 }
                 Some(TuiButton::BrowseList) => {
                     app.browse_context_action_paths = None;
@@ -73150,6 +73161,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::BrowseOptionsRestoreDefaults
             | TuiButton::BrowseOptionsColumn(_)
             | TuiButton::BrowseOptionsSortChoice(_, _)
+            | TuiButton::BrowseOptionsFolderSizeSort
             | TuiButton::BrowseOptionsFilterChoice(_)
             | TuiButton::BrowseOptionsArchiveChoice(_) => {
                 let handled = activate_browse_options_menu_button(app, button, tx);
