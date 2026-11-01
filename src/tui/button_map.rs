@@ -343,6 +343,7 @@ pub enum TuiButton {
     BrowseOptionsRestoreDefaults,
     BrowseOptionsColumn(crate::tui::browse::BrowseColumn),
     BrowseOptionsSortChoice(crate::tui::browse::SortBy, crate::tui::browse::SortDir),
+    BrowseOptionsFolderSizeSort,
     BrowseOptionsFilterChoice(usize),
     BrowseOptionsArchiveChoice(usize),
 
@@ -759,6 +760,7 @@ impl TuiButton {
             | Self::BrowseOptionsRestoreDefaults
             | Self::BrowseOptionsColumn(_)
             | Self::BrowseOptionsSortChoice(_, _)
+            | Self::BrowseOptionsFolderSizeSort
             | Self::BrowseOptionsFilterChoice(_)
             | Self::BrowseOptionsArchiveChoice(_)
             | Self::BrowseInfoMeta(_)

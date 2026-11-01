@@ -135,6 +135,8 @@ pub enum ContextAction {
     BrowseTabDuplicate(usize),
     BrowseTabClose(usize),
     BrowseTabReopenClosed,
+    /// Session-only Size-column accounting option.
+    ToggleFolderSizeSort,
     /// Toggle the current entry's selection.
     Select,
     /// Select all non-ParentDir entries.
@@ -3137,6 +3139,11 @@ fn explicit_convert_cue_policy_for_selection(
 
 /// Execute a context action. Delegates to existing command/action
 /// functions where possible.
+pub fn build_browse_size_header_menu(enabled: bool) -> Vec<ContextMenuEntry> {
+    vec![item(if enabled { "☑ Calculate folder sizes" } else { "☐ Calculate folder sizes" },
+        ContextAction::ToggleFolderSizeSort)]
+}
+
 pub fn execute_context_action(
     app: &mut AppState,
     action: ContextAction,
@@ -3160,6 +3167,12 @@ pub fn execute_context_action(
         }
     }
     match action {
+        ContextAction::ToggleFolderSizeSort => {
+            let enabled = !app.browse.folder_size_sort;
+            app.browse.set_folder_size_sort(enabled, Some(tx));
+            app.set_status(if enabled { "Folder-size accounting on (session only)" }
+                else { "Folder-size accounting off" });
+        }
         ContextAction::BrowseCueView
         | ContextAction::BrowseCueEdit
         | ContextAction::BrowseCueExtract
