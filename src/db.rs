@@ -6472,14 +6472,6 @@ fn directory_summary_identity_mtime_nanos(identity: crate::tui::browse::ProbeCac
         .unwrap_or(-1)
 }
 
-fn directory_summary_scope_rank(scope: crate::tui::browse::DirectorySummaryScope) -> u8 {
-    match scope {
-        crate::tui::browse::DirectorySummaryScope::Immediate => 0,
-        crate::tui::browse::DirectorySummaryScope::ShallowDepth2 => 1,
-        crate::tui::browse::DirectorySummaryScope::RecursiveBestEffort => 2,
-    }
-}
-
 fn directory_summary_scope_code(scope: crate::tui::browse::DirectorySummaryScope) -> &'static str {
     match scope {
         crate::tui::browse::DirectorySummaryScope::Immediate => "immediate",

@@ -660,11 +660,6 @@ impl DirectorySummaryCacheEntry {
         self.facts.classification_scope = Some(classification_summary_scope(classification.as_ref()));
         self.facts.classification = Some(classification);
     }
-
-    fn set_stats(&mut self, stats: Arc<DirStats>) {
-        self.facts.stats_scope = Some(DirectorySummaryScope::RecursiveBestEffort);
-        self.facts.stats = Some(stats);
-    }
 }
 
 
@@ -11308,6 +11303,20 @@ impl BrowseState {
     pub fn current_folder_classification(&self) -> Option<&Arc<FolderContentClassification>> {
         let entry = self.entries.get(self.selected_index)?;
         self.valid_folder_classification_for_entry(entry)
+    }
+
+    /// Match the Browse Info layouts that expose manual Refresh after a
+    /// completed measurement. This is a cached classification lookup only.
+    pub fn info_refresh_allows_completed(&self, entry: &BrowseEntry) -> bool {
+        match entry.kind {
+            EntryKind::ParentDir => true,
+            EntryKind::DvdAudioDir | EntryKind::DvdVideoDir | EntryKind::BlurayDir => true,
+            EntryKind::Directory => self.valid_folder_classification_for_entry(entry)
+                .is_some_and(|classification| matches!(classification.kind,
+                    FolderClassificationKind::Album | FolderClassificationKind::Disc
+                    | FolderClassificationKind::MultiDisc)),
+            _ => false,
+        }
     }
 
     /// Return the cached classification for the displayed directory itself.

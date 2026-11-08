@@ -3335,7 +3335,7 @@ fn compact_media_info(mut info: InfoContent, height: usize) -> InfoContent {
             || (row.first().is_some_and(|span| span.content == MEDIA_INDENT)
                 && row.get(1).is_some_and(|span| span.content.trim() == label))
     };
-    let mut add_group = |label: &str, selected: &mut Vec<usize>, budget: &mut usize| {
+    let add_group = |label: &str, selected: &mut Vec<usize>, budget: &mut usize| {
         if let Some(start) = (body_start..info.lines.len()).find(|&row|
             is_label_row(&info.lines[row], label)) {
             let mut end = start + 1;
@@ -3724,6 +3724,7 @@ fn push_directory_stats_lines(
     entry_path: &Path,
     entry_date_label: &str,
     content_width: usize,
+    allow_completed_refresh: bool,
     refresh_hovered: bool,
     refresh_focused: bool,
     theme: super::theme::Theme,
@@ -3732,8 +3733,11 @@ fn push_directory_stats_lines(
     let view = accounting.view(entry_path);
     let running = view.is_some_and(|v| v.running) || accounting.scan_pending(entry_path);
     let progress = view.and_then(|v| v.progress.as_ref());
+    let interrupted = view.and_then(|v| v.interrupted_label());
+    // Keep historical cache data in the service, but do not display it as
+    // current after deferred, limited, or failed revalidation.
     let cached = view.and_then(|v| v.cached.as_ref())
-        .filter(|v| v.freshness != Freshness::KnownInvalid);
+        .filter(|v| v.freshness != Freshness::KnownInvalid && interrupted.is_none());
     let local = view.and_then(|v| v.local);
     // Folders is the *immediate* child-directory count shown in the image.
     // Files and Audio files are recursive totals: a one-level preview does
@@ -3783,10 +3787,6 @@ fn push_directory_stats_lines(
     if !entry_date_label.is_empty() {
         metrics.push(("Updated", DirectoryMetricValue::Known(entry_date_label.into())));
     }
-    let has_unknown = metrics.iter().any(|(label, value)|
-        matches!(*label, "Files" | "Audio files" | "Total size")
-            && matches!(value, DirectoryMetricValue::Unknown));
-
     // On a narrow terminal one inter-column space fits 'unknown' without
     // orphaning its value. Keep the image's two spaces at normal widths.
     let label_width = directory_metric_label_width(content_width);
@@ -3798,7 +3798,8 @@ fn push_directory_stats_lines(
                 spans.push(Span::styled(value, Style::default().fg(theme.cyan)));
             }
             DirectoryMetricValue::Unknown => {
-                spans.push(Span::styled("unknown", Style::default().fg(theme.text_dim)));
+                spans.push(Span::styled(interrupted.unwrap_or("unknown"),
+                    Style::default().fg(theme.text_dim)));
             }
             DirectoryMetricValue::Scanning(value) => {
                 spans.push(Span::styled(format!("{} ", directory_spinner()),
@@ -3846,7 +3847,9 @@ fn push_directory_stats_lines(
             lines.push(row);
         }
     }
-    if !running && !has_unknown { return None; }
+    if !running && !accounting.refresh_available_for_selection(entry_path, allow_completed_refresh) {
+        return None;
+    }
     // One blank line below Updated (or Total size when optional rows are
     // absent). The control always aligns with the labels, not the value column.
     lines.push(Vec::new());
@@ -3866,7 +3869,6 @@ struct BrowseMediaHeader {
     title: String,
     artist: Option<String>,
     year: Option<String>,
-    catalog: Option<String>,
 }
 
 /// A conflicting album tag is not authoritative. Missing probe results do not
@@ -3911,7 +3913,7 @@ fn media_header_for_entry(
     } else { entry.name.clone() };
     if entry.is_video_transport_file() {
         return Some(BrowseMediaHeader {
-            title: fallback_title, artist: None, year: None, catalog: None,
+            title: fallback_title, artist: None, year: None,
         });
     }
     let disc = entry.is_disc_source() || classification.is_some_and(|c|
@@ -3930,8 +3932,6 @@ fn media_header_for_entry(
             year: disc_contents.and_then(|c| c.year.as_deref())
                 .or_else(|| meta.and_then(|m| m.year.as_deref()))
                 .filter(|v| !v.trim().is_empty()).map(str::to_owned),
-            catalog: meta.and_then(|m| m.catalog_number.as_deref())
-                .filter(|v| !v.trim().is_empty()).map(str::to_owned),
         });
     }
     let audio = &classification?.audio;
@@ -3940,7 +3940,6 @@ fn media_header_for_entry(
             .unwrap_or(fallback_title),
         artist: album_tag_consensus(browse, audio, |m| m.artist.as_deref()),
         year: album_tag_consensus(browse, audio, |m| m.year.as_deref()),
-        catalog: album_tag_consensus(browse, audio, |m| m.catalog_number.as_deref()),
     })
 }
 
@@ -4012,40 +4011,6 @@ fn push_transport_stream_lines(
     }
 }
 
-fn folder_audio_headline(
-    audio: &FolderAudioSummary,
-    browse: &BrowseState,
-    include_probe_status: bool,
-) -> String {
-    let rollup = browse.folder_probe_rollup(audio);
-    let mut parts = vec![format!(
-        "{} {}",
-        audio.track_count,
-        if audio.track_count == 1 { "track" } else { "tracks" }
-    )];
-
-    if let Some(format) = audio.dominant_format_label() {
-        if audio.is_mixed_format() {
-            parts.push(format!("{format} + mixed formats"));
-        } else {
-            parts.push(format.to_string());
-        }
-    }
-
-    if rollup.has_mixed_profiles() {
-        parts.push("mixed rates".to_string());
-    } else if let Some(profile) = rollup.dominant_profile_label() {
-        parts.push(profile.to_string());
-    } else if include_probe_status
-        && audio.track_count > 0
-        && browse.folder_audio_summary_probe_work_in_flight(audio)
-    {
-        parts.push("probing...".to_string());
-    }
-
-    parts.join(" · ")
-}
-
 fn push_folder_classification_lines(
     lines: &mut Vec<Vec<Span<'static>>>,
     classification: &FolderContentClassification,
@@ -4077,7 +4042,7 @@ fn push_folder_classification_lines(
             if !is_symlink {
                 *refresh_pill_row = push_directory_stats_lines(
                     lines, browse, accounting, entry_path, entry_date_label, content_width,
-                    refresh_hovered, refresh_focused, theme,
+                    false, refresh_hovered, refresh_focused, theme,
                 );
             }
         }
@@ -4598,8 +4563,10 @@ fn push_media_contents_and_size(
     let running = direct_file_size.is_none()
         && (view.is_some_and(|v| v.running) || accounting.scan_pending(path));
     let progress = view.and_then(|v| v.progress.as_ref());
+    let interrupted = view.and_then(|v| v.interrupted_label());
     let complete = view.and_then(|v| v.cached.as_ref())
-        .filter(|v| direct_file_size.is_none() && v.freshness != Freshness::KnownInvalid)
+        .filter(|v| direct_file_size.is_none()
+            && v.freshness != Freshness::KnownInvalid && interrupted.is_none())
         .map(|v| v.measurement.counts);
     let listing = (path == browse.current_dir.as_path())
         .then(|| browse.current_directory_listing_counts()).flatten();
@@ -4635,7 +4602,7 @@ fn push_media_contents_and_size(
     } else if running {
         contents.push(media_secondary("scanning…", theme));
     } else {
-        contents.push(media_secondary("unknown", theme));
+        contents.push(media_secondary(interrupted.unwrap_or("unknown"), theme));
     }
     if disc_image_count > 0 {
         if !contents.is_empty() && count != Some(disc_image_count as u128) {
@@ -4671,7 +4638,7 @@ fn push_media_contents_and_size(
     } else if let Some(cached) = complete {
         vec![media_accent(format_bytes(cached.bytes), theme)]
     } else {
-        vec![media_secondary("unknown", theme)]
+        vec![media_secondary(interrupted.unwrap_or("unknown"), theme)]
     };
     push_media_row(lines, "Size", value, content_width, theme);
     let modified = if entry_date_label.is_empty() {
@@ -4800,7 +4767,9 @@ fn push_media_folder_layout(
     }
     let running = push_media_contents_and_size(lines, browse, accounting, entry_path,
         Some(classification), None, entry_date_label, content_width, theme);
-    push_media_actions(lines, content_width, running, !is_symlink, has_streams,
+    push_media_actions(lines, content_width, running,
+        !is_symlink && (running || accounting.refresh_available_for_selection(entry_path, true)),
+        has_streams,
         refresh_hovered, audio_streams_hovered, refresh_pill_row,
         audio_streams_pill_row, theme);
 }
@@ -4841,7 +4810,9 @@ fn push_direct_disc_layout(
     let physical_dir = entry.is_child_dir();
     let running = push_media_contents_and_size(lines, browse, accounting, source,
         None, (!physical_dir).then_some(entry.size), entry_date_label, content_width, theme);
-    push_media_actions(lines, content_width, running, physical_dir && !entry.is_symlink,
+    push_media_actions(lines, content_width, running,
+        physical_dir && !entry.is_symlink
+            && (running || accounting.refresh_available_for_selection(source, true)),
         has_streams, refresh_hovered, audio_streams_hovered, refresh_pill_row,
         audio_streams_pill_row, theme);
 }
@@ -4963,7 +4934,7 @@ fn entry_info_lines(
     } else { entry.name.clone() };
     let header = media_header_for_entry(entry, browse, cached_disc_contents.as_deref())
         .unwrap_or_else(|| BrowseMediaHeader {
-            title: display_name.clone(), artist: None, year: None, catalog: None,
+            title: display_name.clone(), artist: None, year: None,
         });
     let descriptor = if entry.is_disc_source() || entry.is_video_transport_file()
         || (entry.is_child_dir() && !browse.is_in_archive()
@@ -4986,7 +4957,7 @@ fn entry_info_lines(
                     content_width, theme);
                 refresh_pill_row = push_directory_stats_lines(
                     &mut lines, browse, accounting, &browse.current_dir, &entry_date_label,
-                    content_width, refresh_hovered, refresh_focused, theme,
+                    content_width, true, refresh_hovered, refresh_focused, theme,
                 );
             }
         }
@@ -5023,7 +4994,7 @@ fn entry_info_lines(
                 if !entry.is_symlink {
                     refresh_pill_row = push_directory_stats_lines(
                         &mut lines, browse, accounting, &entry.path, &entry_date_label,
-                        content_width, refresh_hovered, refresh_focused, theme,
+                        content_width, false, refresh_hovered, refresh_focused, theme,
                     );
                 }
                 if browse.folder_classification_pending_for(&entry.path) {
@@ -8404,6 +8375,112 @@ mod directory_info_presentation_tests {
         assert!(!rendered.contains("Folders      99"));
         assert!(rendered.contains("Files        80"));
         assert!(rendered.contains("Audio files  70"));
+    }
+
+    #[test]
+    fn limited_revalidation_never_displays_old_total_as_new_and_keeps_refresh_visible() {
+        use crate::directory_accounting::{ScanEnd, ScanProgress};
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("Collection");
+        std::fs::create_dir(&path).unwrap();
+        let entry = BrowseEntry::new(path.clone(), "Collection".into(),
+            EntryKind::Directory, 0, None);
+        let mut app = directory_layout_app(entry);
+        let view = app.directory_accounting.views.get_mut(&path).unwrap();
+        view.cached = Some(fake_measurement(&path, 1024 * 1024 * 1024));
+        view.last_end = Some(ScanEnd::Limited {
+            reason: "elapsed-time budget reached",
+            progress: ScanProgress { files_examined: 50, ..Default::default() },
+        });
+        assert!(app.directory_accounting.refresh_available(&path));
+        // Inspect all Info rows even when the compact viewport must reserve
+        // space for Refresh instead of displaying the entire metric block.
+        let details = directory_info_with_service(&app.browse.entries[0],
+            &app.browse, &app.directory_accounting);
+        let lines = flatten_lines(&details).join("\n");
+        assert!(lines.contains("incomplete"),
+            "budget exhaustion must be visible in complete Info content: {lines}");
+        assert!(!lines.contains("1.00 GiB"),
+            "a previous complete cache must not masquerade as this scan's total");
+        let (rows, area, hit) = render_directory_browse_24(&mut app, 80);
+        assert_refresh_visible(&rows, area, hit, &app);
+    }
+
+    #[test]
+    fn cached_parent_row_still_paints_refresh_without_automatic_scan() {
+        let temp = tempfile::tempdir().unwrap();
+        let current = temp.path().join("Collection");
+        std::fs::create_dir(&current).unwrap();
+        let entry = BrowseEntry::new(temp.path().to_path_buf(), "..".into(),
+            EntryKind::ParentDir, 0, None);
+        let mut app = directory_layout_app(entry);
+        app.browse.current_dir = current.clone();
+        app.directory_accounting.views.entry(current.clone()).or_default().cached =
+            Some(fake_measurement(&current, 1024 * 1024 * 1024));
+        assert!(app.directory_accounting.refresh_available_for_selection(&current, true));
+        assert!(!app.directory_accounting.refresh_available(&current));
+        assert!(!app.directory_accounting.view(&current).unwrap().running);
+        let detail = directory_info_with_service(&app.browse.entries[0],
+            &app.browse, &app.directory_accounting);
+        assert!(flatten_lines(&detail).join("\n").contains("Refresh"));
+        let (rows, area, hit) = render_directory_browse_24(&mut app, 80);
+        assert_refresh_visible(&rows, area, hit, &app);
+    }
+
+    #[test]
+    fn deferred_and_failed_cached_revalidation_discloses_status_in_plain_and_media_info() {
+        use crate::directory_accounting::{ScanEnd, ScanProgress};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Collection");
+        std::fs::create_dir(&path).unwrap();
+        let entry = BrowseEntry::new(path.clone(), "Collection".into(),
+            EntryKind::Directory, 0, None);
+        for media in [false, true] {
+            for (end, status) in [
+                (ScanEnd::Deferred(ScanProgress::default()), "deferred"),
+                (ScanEnd::Failed { reason: "I/O error".into(), progress: ScanProgress::default() }, "scan failed"),
+            ] {
+                let mut app = directory_layout_app(entry.clone());
+                if media {
+                    app.browse.insert_folder_classification_for_test(path.clone(),
+                        example_classification(&entry, FolderClassificationKind::Album));
+                }
+                let view = app.directory_accounting.views.get_mut(&path).unwrap();
+                view.cached = Some(fake_measurement(&path, 1024 * 1024 * 1024));
+                view.last_end = Some(end);
+                assert!(app.directory_accounting.refresh_available(&path));
+                let details = directory_info_with_service(&entry,
+                    &app.browse, &app.directory_accounting);
+                let text = flatten_lines(&details).join("\n");
+                assert!(text.contains(status), "media={media}: {text}");
+                assert!(!text.contains("1.00 GiB"), "failed scan must not show old total: {text}");
+                assert!(text.contains("Refresh"), "media={media}: {text}");
+                let (rows, _area, hit) = render_directory_browse_24(&mut app, 80);
+                let hit = hit.expect("Refresh button after unsuccessful revalidation");
+                assert_eq!(app.button_map.find_button_at(hit.x, hit.y),
+                    Some(TuiButton::BrowseInfoRefresh), "media={media}: {rows:?}");
+                assert_eq!(app.directory_accounting.view(&path).unwrap().cached.as_ref()
+                    .unwrap().measurement.counts.bytes, 1024 * 1024 * 1024,
+                    "the historical measurement stays intact");
+            }
+        }
+    }
+
+    #[test]
+    fn completed_album_refresh_stays_visible_and_has_a_service_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Album");
+        std::fs::create_dir(&path).unwrap();
+        let entry = BrowseEntry::new(path.clone(), "Album".into(), EntryKind::Directory, 0, None);
+        let mut app = directory_layout_app(entry.clone());
+        app.browse.insert_folder_classification_for_test(path.clone(),
+            example_classification(&entry, FolderClassificationKind::Album));
+        app.directory_accounting.views.get_mut(&path).unwrap().cached =
+            Some(fake_measurement(&path, 123_456));
+        assert!(app.browse.info_refresh_allows_completed(&entry));
+        assert!(app.directory_accounting.refresh_available_for_selection(&path, true));
+        let (rows, area, hit) = render_directory_browse_24(&mut app, 80);
+        assert_refresh_visible(&rows, area, hit, &app);
     }
 
     #[test]

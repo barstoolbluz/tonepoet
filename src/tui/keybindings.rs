@@ -4707,8 +4707,10 @@ fn browse_info_directory_target(app: &AppState) -> Option<std::path::PathBuf> {
 }
 
 fn browse_info_refresh_target(app: &AppState) -> Option<std::path::PathBuf> {
-    browse_info_directory_target(app)
-        .filter(|path| app.directory_accounting.refresh_available(path))
+    let entry = app.browse.selected_entry()?;
+    let allow_completed = app.browse.info_refresh_allows_completed(entry);
+    browse_info_directory_target(app).filter(|path|
+        app.directory_accounting.refresh_available_for_selection(path, allow_completed))
 }
 
 fn browse_info_cancel_target(app: &AppState) -> Option<std::path::PathBuf> {
@@ -109698,6 +109700,170 @@ mod file_picker_browse_parity_regression_tests {
         assert!(view.running);
         assert!(view.subscription.is_none());
         assert!(!app.directory_accounting.refresh_available(&child));
+    }
+
+    /// Historical cache data is supplied in the projection without touching
+    /// the database: forced Refresh must still start the actual walker.
+    fn directory_completed_cache(path: &std::path::Path) -> crate::directory_accounting::CachedMeasurement {
+        use crate::directory_accounting::model::{CompleteMeasurement, Observation};
+        let now = std::time::SystemTime::now();
+        crate::directory_accounting::CachedMeasurement {
+            measurement: CompleteMeasurement {
+                path: path.to_path_buf(), counts: crate::directory_accounting::Counts {
+                    files: 900, bytes: 999_999, ..Default::default()
+                },
+                started: now, finished: now, created: None, modified: None,
+                generation: 7, observation: Observation::AsObserved,
+            },
+            freshness: crate::directory_accounting::Freshness::AsObserved,
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_parent_info_keyboard_refresh_remeasures_current_dir_not_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("Collection");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("track.flac"), b"new data").unwrap();
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = root.clone();
+        app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
+            temp.path().to_path_buf(), "..".into(),
+            crate::convert::classify::EntryKind::ParentDir, 0, None,
+        )];
+        app.browse.selected_index = 0;
+        app.browse.explore_enabled = false;
+        app.browse.info_enabled = true;
+        app.browse.info_collapsed = false;
+        app.browse.set_navigation_pane(crate::tui::browse::BrowseNavigationPane::Files);
+        app.directory_accounting.views.entry(root.clone()).or_default().cached =
+            Some(directory_completed_cache(&root));
+        let (tx, mut rx) = mpsc::channel(64);
+        app.directory_accounting.consider_background(None, &tx);
+        assert!(!app.directory_accounting.view(&root).unwrap().running);
+        assert_eq!(browse_info_refresh_target(&app), Some(root.clone()));
+        cycle_browse_pane_focus(&mut app, true);
+        assert_eq!(app.browse_info_focus, Some(BrowseInfoFocus::Refresh));
+        handle_browse_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        assert_eq!(app.browse.current_dir, root, "Refresh must not navigate");
+        assert_eq!(app.browse.selected_index, 0);
+        assert!(app.directory_accounting.cancel_available(&root));
+        assert!(browse_info_refresh_target(&app).is_none());
+        let mut complete = false;
+        while let Some(message) = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await.expect("manual Refresh timed out") {
+            let AppMessage::DirectoryAccounting(event) = message else { panic!("unexpected event") };
+            let finished = matches!(event, crate::directory_accounting::AccountingEvent::Finished { .. });
+            app.directory_accounting.accept_event(&event, &tx);
+            if finished { complete = true; break; }
+        }
+        assert!(complete, "the exhaustive worker must finish");
+        let view = app.directory_accounting.view(&root).unwrap();
+        assert_eq!(view.cached.as_ref().unwrap().measurement.path, root);
+        assert_eq!(view.cached.as_ref().unwrap().measurement.counts.files, 1);
+        assert_eq!(view.cached.as_ref().unwrap().measurement.counts.bytes, 8);
+    }
+
+    fn cached_album_browse_app(album: &std::path::Path) -> AppState {
+        use crate::tui::browse::{FolderClassificationKind, FolderContentClassification,
+            FolderAudioSummary, ProbeCacheIdentity};
+        let entry = crate::tui::browse::BrowseEntry::new(album.to_path_buf(), "Album".into(),
+            crate::convert::classify::EntryKind::Directory, 0, None);
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = album.parent().unwrap().to_path_buf();
+        app.browse.entries = vec![entry.clone()];
+        app.browse.selected_index = 0;
+        app.browse.explore_enabled = false;
+        app.browse.info_enabled = true;
+        app.browse.info_collapsed = false;
+        app.browse.set_navigation_pane(crate::tui::browse::BrowseNavigationPane::Files);
+        app.browse.insert_folder_classification_for_test(album.to_path_buf(), FolderContentClassification {
+            kind: FolderClassificationKind::Album,
+            identity: ProbeCacheIdentity::from_entry(&entry),
+            audio: FolderAudioSummary::default(), units: Vec::new(), unit_count: 0,
+            collection_many: false, io_budget_exhausted: false, disc_marker: None,
+            embedded_cue_availability: crate::tui::probe::EmbeddedCueAvailability::Unknown,
+            cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
+            cue_repair_availability: crate::tui::browse::CueRepairAvailability::Unknown,
+            cue_file_reference_repairs: Default::default(),
+        });
+        app.directory_accounting.views.entry(album.to_path_buf()).or_default().cached =
+            Some(directory_completed_cache(album));
+        app
+    }
+
+    #[test]
+    fn completed_album_info_mouse_refresh_is_actionable_and_cancellable() {
+        let temp = tempfile::tempdir().unwrap();
+        let album = temp.path().join("Album");
+        std::fs::create_dir(&album).unwrap();
+        let mut app = cached_album_browse_app(&album);
+        assert_eq!(browse_info_refresh_target(&app), Some(album.clone()));
+        let (tx, _rx) = mpsc::channel(64);
+        app.button_map.record_button(TuiButton::BrowseInfoRefresh, Rect::new(20, 12, 9, 1));
+        handle_mouse(&mut app, MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 20, row: 12, modifiers: KeyModifiers::NONE,
+        }, &tx);
+        assert!(app.directory_accounting.cancel_available(&album),
+            "a click on a visible cached-album Refresh must start a scan");
+        assert!(browse_info_refresh_target(&app).is_none());
+        // A second click uses the existing Cancel path, not another scan.
+        handle_mouse(&mut app, MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 20, row: 12, modifiers: KeyModifiers::NONE,
+        }, &tx);
+        assert!(!app.directory_accounting.cancel_available(&album),
+            "Cancel must stop ownership of the active request");
+    }
+
+    #[test]
+    fn completed_album_info_keyboard_refresh_starts_existing_exhaustive_worker() {
+        let temp = tempfile::tempdir().unwrap();
+        let album = temp.path().join("Album");
+        std::fs::create_dir(&album).unwrap();
+        let mut app = cached_album_browse_app(&album);
+        assert_eq!(browse_info_refresh_target(&app), Some(album.clone()));
+        let (tx, _rx) = mpsc::channel(32);
+        cycle_browse_pane_focus(&mut app, true);
+        assert_eq!(app.browse_info_focus, Some(BrowseInfoFocus::Refresh));
+        handle_browse_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        assert!(app.directory_accounting.cancel_available(&album));
+        assert!(browse_info_refresh_target(&app).is_none());
+        assert_eq!(app.browse.current_dir, temp.path());
+    }
+
+    #[test]
+    fn completed_parent_info_mouse_refresh_targets_current_dir_not_its_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let current = temp.path().join("Collection");
+        std::fs::create_dir(&current).unwrap();
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = current.clone();
+        app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
+            temp.path().to_path_buf(), "..".into(),
+            crate::convert::classify::EntryKind::ParentDir, 0, None,
+        )];
+        app.browse.selected_index = 0;
+        app.browse.info_enabled = true;
+        app.browse.info_collapsed = false;
+        app.directory_accounting.views.entry(current.clone()).or_default().cached =
+            Some(directory_completed_cache(&current));
+        assert_eq!(browse_info_refresh_target(&app), Some(current.clone()));
+        let (tx, _rx) = mpsc::channel(32);
+        app.button_map.record_button(TuiButton::BrowseInfoRefresh, Rect::new(20, 12, 9, 1));
+        handle_mouse(&mut app, MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 20, row: 12, modifiers: KeyModifiers::NONE,
+        }, &tx);
+        assert!(app.directory_accounting.cancel_available(&current));
+        assert_eq!(app.browse.current_dir, current);
+        assert_eq!(app.browse.selected_index, 0);
+        assert!(!app.directory_accounting.cancel_available(temp.path()),
+            "the parent directory must not be scanned");
     }
 
     #[test]

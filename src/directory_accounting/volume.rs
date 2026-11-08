@@ -277,7 +277,7 @@ mod tests {
         let mut governor = RateGovernor::with_budgets(cancel.clone(), Arc::new(AtomicU8::new(2)),
             Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)),
             budgets.clone(), Arc::new(NetworkProbeGate::default()), inventory);
-        governor.enter_directory(temp.path()).unwrap();
+        governor.enter_directory(temp.path(), 0).unwrap();
         for _ in 0..1000 { governor.tick(2.0).expect("foreground must not sleep for tokens"); }
         let after = {
             let held = budgets.buckets.lock().unwrap();
@@ -287,6 +287,26 @@ mod tests {
         assert_eq!(before, after, "foreground must not charge or refill background budgets");
         cancel.store(true, Ordering::Release);
         assert!(matches!(governor.tick(1.0), Err(ScanExit::Cancelled)));
+    }
+
+    #[test]
+    fn nested_network_and_bind_mounts_use_their_own_volume_decision() {
+        // A deterministic surrogate for nested mounts: no root privileges or
+        // actual remote server are needed. Bind paths may share a budget key.
+        let inventory = Inventory { mounts: vec![
+            Mount { point: PathBuf::from("/music/remote"), volume: Volume {
+                key: "sshfs:server".into(), class: VolumeClass::NetworkOrUnknown,
+            } },
+            Mount { point: PathBuf::from("/music/bind"), volume: Volume {
+                key: "8:1:ext4".into(), class: VolumeClass::Ssd,
+            } },
+            Mount { point: PathBuf::from("/music"), volume: Volume {
+                key: "8:1:ext4".into(), class: VolumeClass::Ssd,
+            } },
+        ] };
+        assert_eq!(inventory.for_path(Path::new("/music/remote/album")).key, "sshfs:server");
+        assert_eq!(inventory.for_path(Path::new("/music/bind/album")).key, "8:1:ext4");
+        assert_eq!(inventory.for_path(Path::new("/music/ordinary-album")).class, VolumeClass::Ssd);
     }
 
     #[test]
