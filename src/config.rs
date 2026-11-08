@@ -177,6 +177,70 @@ fn default_archive_listing_timeout() -> u64 {
 }
 
 
+/// Artwork policy for the Browse Info pane. Only direct album-folder images are
+/// considered; filename entries are basenames, never paths or glob patterns.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowseArtworkConfig {
+    #[serde(default = "default_artwork_pane_height")]
+    pub pane_height_percent: u8,
+    #[serde(default = "default_artwork_popup_height")]
+    pub popup_height_percent: u8,
+    #[serde(default = "default_true")]
+    pub prefer_embedded: bool,
+    #[serde(default)]
+    pub allow_upscale: bool,
+    #[serde(default = "default_artwork_filenames")]
+    pub filenames: Vec<String>,
+}
+
+fn default_artwork_pane_height() -> u8 { 28 }
+fn default_artwork_popup_height() -> u8 { 60 }
+fn default_artwork_filenames() -> Vec<String> {
+    ["cover.png", "cover.jpg", "folder.png", "folder.jpg",
+     "original_cover.png", "original_cover.jpg"]
+        .iter().map(|s| (*s).to_string()).collect()
+}
+
+impl Default for BrowseArtworkConfig {
+    fn default() -> Self {
+        Self {
+            pane_height_percent: default_artwork_pane_height(),
+            popup_height_percent: default_artwork_popup_height(),
+            prefer_embedded: true,
+            allow_upscale: false,
+            filenames: default_artwork_filenames(),
+        }
+    }
+}
+
+impl BrowseArtworkConfig {
+    pub fn normalized(&self) -> Self {
+        let mut out = self.clone();
+        out.pane_height_percent = out.pane_height_percent.clamp(1, 100);
+        out.popup_height_percent = out.popup_height_percent.clamp(1, 100);
+        out.filenames = out.filenames.iter().map(|name| name.trim().to_string()).collect();
+        out.filenames.retain(|name| is_safe_artwork_basename(name));
+        let mut seen = std::collections::HashSet::new();
+        out.filenames.retain(|name| seen.insert(name.to_ascii_lowercase()));
+        out.filenames.truncate(32);
+        out
+    }
+}
+
+/// Reject nested paths, traversal, control characters and names that cannot
+/// possibly be decoded by the image formats enabled in Cargo.toml.
+pub fn is_safe_artwork_basename(name: &str) -> bool {
+    let name = name.trim();
+    name.len() <= 255
+        && !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.chars().any(|c| c.is_control() || c == '/' || c == '\\')
+        && std::path::Path::new(name).extension().and_then(|v| v.to_str())
+            .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "bmp" | "webp" | "gif"))
+}
+
 /// Browse-screen view and interaction preferences.
 ///
 /// This table is intentionally separate from `[performance.browsing]`, which
@@ -214,6 +278,8 @@ pub struct BrowsingConfig {
     /// so late high-quality matches are not discarded by walk order.
     #[serde(default = "default_browse_search_result_cap")]
     pub search_result_cap: usize,
+    #[serde(default)]
+    pub artwork: BrowseArtworkConfig,
 }
 
 impl Default for BrowsingConfig {
@@ -229,6 +295,7 @@ impl Default for BrowsingConfig {
             layout_explore: default_browse_layout_open(),
             layout_info: default_browse_layout_open(),
             search_result_cap: default_browse_search_result_cap(),
+            artwork: BrowseArtworkConfig::default(),
         }
     }
 }
@@ -284,6 +351,7 @@ impl BrowsingConfig {
             layout_explore,
             layout_info,
             search_result_cap,
+            artwork: self.artwork.normalized(),
         }
     }
 }
@@ -2838,6 +2906,7 @@ append_lineage_to_comment = false
             layout_explore: "closed".into(),
             layout_info: "OPEN".into(),
             search_result_cap: 0,
+            artwork: BrowseArtworkConfig::default(),
         }
         .normalized();
 
@@ -4615,4 +4684,50 @@ append_lineage_to_comment = false
         assert!(strict_path.exists());
     }
 
+}
+
+
+#[cfg(test)]
+mod browse_artwork_config_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_and_custom_preferences_round_trip() {
+        let mut config = TonepoetConfig::default();
+        assert_eq!(config.browsing.artwork.pane_height_percent, 28);
+        assert_eq!(config.browsing.artwork.popup_height_percent, 60);
+        assert!(config.browsing.artwork.prefer_embedded);
+        assert!(!config.browsing.artwork.allow_upscale);
+        config.browsing.artwork.pane_height_percent = 100;
+        config.browsing.artwork.popup_height_percent = 80;
+        config.browsing.artwork.prefer_embedded = false;
+        config.browsing.artwork.allow_upscale = true;
+        config.browsing.artwork.filenames = vec!["Front.jpg".into(), "folder.png".into()];
+        let encoded = toml::to_string(&config).expect("serialize browsing preferences");
+        assert!(encoded.contains("[browsing.artwork]"));
+        let restored: TonepoetConfig = toml::from_str(&encoded).expect("decode browsing preferences");
+        assert_eq!(restored.browsing.artwork, config.browsing.artwork);
+    }
+
+    #[test]
+    fn filenames_are_deduplicated_without_allowing_parent_paths_or_control_chars() {
+        let mut config = BrowseArtworkConfig::default();
+        config.filenames = vec![
+            " Cover.JPG ".into(), "cover.jpg".into(), "folder.jpeg".into(),
+            "../x.png".into(), "artwork/cover.jpg".into(), "x\\y.jpg".into(),
+            "other.txt".into(), "bad\nimage.png".into(),
+        ];
+        let normalized = config.normalized();
+        assert_eq!(normalized.filenames, vec!["Cover.JPG", "folder.jpeg"]);
+    }
+
+    #[test]
+    fn percentage_bounds_are_nonzero_and_allow_all_available_height() {
+        let mut config = BrowseArtworkConfig::default();
+        config.pane_height_percent = 0;
+        config.popup_height_percent = 200;
+        let normalized = config.normalized();
+        assert_eq!(normalized.pane_height_percent, 1);
+        assert_eq!(normalized.popup_height_percent, 100);
+    }
 }

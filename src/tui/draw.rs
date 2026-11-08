@@ -102,6 +102,12 @@ pub fn draw_ui(f: &mut Frame, app: &mut AppState) {
 
     // Draw any active overlay on top
     draw_overlay(f, app, theme);
+    if app.current_screen == AppScreen::Browse
+        && matches!(app.active_overlay, super::app::ActiveOverlay::None)
+        && app.browse_artwork.popup_open
+    {
+        super::browse_artwork::draw_popup(f, app, theme);
+    }
 }
 
 /// Draw the wizard screen by delegating to tonepoet_wizard

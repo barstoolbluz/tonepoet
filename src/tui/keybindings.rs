@@ -153,6 +153,24 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
         return;
     }
 
+    // The centered Browse artwork view is modal without displacing the
+    // existing overlay machinery. Keyboard navigation cannot fall through
+    // into directory operations while the image occupies the terminal.
+    if app.current_screen == AppScreen::Browse && app.browse_artwork.popup_open
+        && matches!(app.active_overlay, ActiveOverlay::None)
+    {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter => app.browse_artwork.close_popup(),
+            KeyCode::Left | KeyCode::Up => { app.browse_artwork.cycle(false); }
+            KeyCode::Right | KeyCode::Down | KeyCode::Char(' ') => {
+                app.browse_artwork.cycle(true);
+            }
+            _ => {}
+        }
+        app.request_image_preview_repaint();
+        return;
+    }
+
     if key.code == KeyCode::Esc && app.cancel_inline_metadata_write() {
         app.set_status("Cancelling metadata write...");
         return;
@@ -13815,6 +13833,10 @@ pub(super) fn open_context_menu_with_tx(
                 Some(TuiButton::BrowseColumn(super::browse::BrowseColumn::Size)) => {
                     app.browse_context_action_paths = None;
                     build_browse_size_header_menu(app.browse.folder_size_sort)
+                }
+                Some(TuiButton::BrowseInfoArtworkArea) => {
+                    app.browse_context_action_paths = None;
+                    build_browse_artwork_menu(app)
                 }
                 Some(TuiButton::BrowseList) => {
                     app.browse_context_action_paths = None;
@@ -54228,6 +54250,36 @@ fn apply_text_edit(
 ) {
     let trimmed = value.trim();
     match target {
+        TextEditTarget::BrowseArtworkPaneHeight | TextEditTarget::BrowseArtworkPopupHeight => {
+            let Ok(value) = trimmed.parse::<u8>() else {
+                app.set_status("Artwork height must be an integer between 1 and 100");
+                return;
+            };
+            if !(1..=100).contains(&value) {
+                app.set_status("Artwork height must be between 1 and 100 percent");
+                return;
+            }
+            if matches!(target, TextEditTarget::BrowseArtworkPaneHeight) {
+                app.browse.artwork_config.pane_height_percent = value;
+            } else {
+                app.browse.artwork_config.popup_height_percent = value;
+            }
+            app.browse_artwork.invalidate_protocol();
+            persist_browse_config(app);
+        }
+        TextEditTarget::BrowseArtworkFilenames => {
+            let names = trimmed.split(',').map(str::trim)
+                .filter(|name| !name.is_empty()).collect::<Vec<_>>();
+            if names.len() > 32 || names.iter().any(|name|
+                !crate::config::is_safe_artwork_basename(name)) {
+                app.set_status("Artwork names must be ≤32 comma-separated image filenames (no paths)");
+                return;
+            }
+            app.browse.artwork_config.filenames = names.iter().map(|name| (*name).to_owned()).collect();
+            app.browse.artwork_config = app.browse.artwork_config.normalized();
+            app.browse_artwork.invalidate();
+            persist_browse_config(app);
+        }
         TextEditTarget::DestPath => {
             // dest_path is not in the preset, don't mark modified
             app.convert.output_options.dest_path = if trimmed.is_empty() {
@@ -71544,6 +71596,37 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
         .host_clipboard_interaction_generation
         .checked_add(1)
         .unwrap_or(1);
+    // The popup captures pointer events before Browse hit-testing, and never
+    // changes a file selection in the covered underlying list.
+    if app.current_screen == AppScreen::Browse && app.browse_artwork.popup_open
+        && matches!(app.active_overlay, ActiveOverlay::None)
+    {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let r = app.browse_artwork.popup_rect;
+                if mouse.column >= r.x && mouse.column < r.right()
+                    && mouse.row >= r.y && mouse.row < r.bottom()
+                {
+                    app.browse_artwork.cycle(true);
+                } else {
+                    app.browse_artwork.close_popup();
+                }
+            }
+            MouseEventKind::Down(MouseButton::Right) => {
+                app.browse_artwork.close_popup();
+            }
+            MouseEventKind::ScrollUp => { app.browse_artwork.cycle(false); }
+            MouseEventKind::ScrollDown => { app.browse_artwork.cycle(true); }
+            _ => {}
+        }
+        app.request_image_preview_repaint();
+        return;
+    }
+    // Ghostty/Kitty mouse events can damage graphics layers without a new
+    // ratatui text-buffer diff. Use the existing rate-limited retransmission.
+    if app.current_screen == AppScreen::Browse && app.browse_artwork.has_image() {
+        app.request_image_preview_repaint();
+    }
     // Properties owns every pointer event ahead of any parked text editor or
     // underlying Browse widget. Hitboxes come from the current painted frame.
     if matches!(app.active_overlay, ActiveOverlay::FolderProperties(_)) {
@@ -73175,6 +73258,11 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 } else {
                     set_browse_metadata_focus(app, field);
                     begin_browse_metadata_inline_edit(app, field, None);
+                }
+            }
+            TuiButton::BrowseInfoArtworkArea => {
+                if app.browse_artwork.cycle(true) {
+                    app.request_image_preview_repaint();
                 }
             }
             TuiButton::BrowseInfoRefresh => {

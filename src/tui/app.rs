@@ -14668,6 +14668,9 @@ pub enum BrowseInfoFocus {
 /// Which field a TextEdit overlay is editing
 #[derive(Debug, Clone, PartialEq)]
 pub enum TextEditTarget {
+    BrowseArtworkPaneHeight,
+    BrowseArtworkPopupHeight,
+    BrowseArtworkFilenames,
     DestPath,
     FolderTemplate,
     FilenameTemplate,
@@ -15747,6 +15750,8 @@ pub struct AppState {
 
     // Browse screen state
     pub browse: crate::tui::browse::BrowseState,
+    /// Asynchronous, single-slot Browse Info artwork cache and popup state.
+    pub browse_artwork: crate::tui::browse_artwork::BrowseArtworkState,
     pub inline_metadata_write_generation: u64,
     pub inline_metadata_write: Option<InlineMetadataWriteState>,
 
@@ -16981,6 +16986,7 @@ impl AppState {
             browse_cue_inspection_generation: 0,
             preset: PresetState::default(),
             browse,
+            browse_artwork: crate::tui::browse_artwork::BrowseArtworkState::default(),
             inline_metadata_write_generation: 0,
             inline_metadata_write: None,
             queue_focus: QueueFocus::FileList,
@@ -17704,6 +17710,7 @@ impl AppState {
     }
 
     fn invalidate_terminal_image_preview_caches(&mut self) {
+        self.browse_artwork.invalidate_protocol();
         match &mut self.active_overlay {
             ActiveOverlay::MetadataEditor(state) => {
                 state.invalidate_artwork_preview_cache();
@@ -17735,6 +17742,11 @@ impl AppState {
     /// rate-limited retransmit generation can also rebuild protocol state from
     /// cached decoded pixels after mouse-driven graphics-layer damage.
     pub fn prepare_image_preview_protocols(&mut self) -> bool {
+        if self.browse_artwork.popup_open
+            && !matches!(self.active_overlay, ActiveOverlay::None)
+        {
+            self.browse_artwork.close_popup();
+        }
         // This must run before any preview path can wrap decoded pixels in a
         // terminal protocol. In tmux/byobu it downgrades any cached Kitty picker
         // state to Halfblocks and invalidates old protocol caches first.
@@ -17770,6 +17782,18 @@ impl AppState {
                     );
             }
             _ => {}
+        }
+        if self.current_screen == AppScreen::Browse
+            && self.browse.info_enabled && !self.browse.info_collapsed
+        {
+            changed |= self.browse_artwork.prepare(
+                &mut self.image_picker,
+                protocol_generation,
+                retransmit_generation,
+                &self.browse.artwork_config,
+            );
+        } else {
+            self.browse_artwork.suspend();
         }
         // No force_redraw — the next normal render cycle picks up the new
         // protocol. force_redraw triggers terminal.clear() which causes a

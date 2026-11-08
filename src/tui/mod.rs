@@ -11,6 +11,7 @@ pub mod bookmarks;
 pub mod bookmarks_overlay;
 pub mod bookmark_workers;
 pub mod browse;
+pub mod browse_artwork;
 pub mod button_map;
 pub mod disc_browser;
 pub mod disc_browser_actions;
