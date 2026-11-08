@@ -79,6 +79,9 @@ pub enum ScanEnd {
     Cancelled(ScanProgress),
     /// A network/unknown mount failed its read-only metadata-latency gate.
     Deferred(ScanProgress),
+    /// Automatic traversal stopped at a work budget. Progress is not a total;
+    /// a user-initiated Refresh can request exhaustive measurement.
+    Limited { reason: &'static str, progress: ScanProgress },
     Failed { reason: String, progress: ScanProgress },
     Changed { reason: String, progress: ScanProgress },
 }

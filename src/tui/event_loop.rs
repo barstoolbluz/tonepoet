@@ -30,6 +30,41 @@ const DEAD_QUEUE_RECOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 // explicit message or state-change signal.
 const IDLE_REDRAW_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Only the chosen real child is eligible for automatic recursive accounting.
+/// In Browse Info, `..` refers to current_dir but never authorizes recursion.
+fn automatic_accounting_target(browse: &super::browse::BrowseState) -> Option<std::path::PathBuf> {
+    browse.selected_entry()
+        .filter(|entry| entry.is_child_dir() && !entry.is_symlink)
+        .map(|entry| entry.path.clone())
+}
+
+#[cfg(test)]
+mod automatic_accounting_focus_tests {
+    use super::*;
+    use crate::tui::browse::{BrowseEntry, BrowseState};
+
+    #[test]
+    fn parent_focus_does_not_authorize_recursive_scan_but_child_does() {
+        let mut browse = BrowseState::new();
+        let current = browse.current_dir.clone();
+        let parent = current.parent().unwrap_or(&current).to_path_buf();
+        browse.entries = vec![
+            BrowseEntry::new(parent, "..".into(), EntryKind::ParentDir, 0, None),
+            BrowseEntry::new(current.join("album"), "album".into(), EntryKind::Directory, 0, None),
+            BrowseEntry::new_with_symlink(current.join("remote-link"), "remote-link".into(),
+                EntryKind::Directory, 0, None, true, false),
+        ];
+        browse.selected_index = 0;
+        assert!(automatic_accounting_target(&browse).is_none(),
+            "the displayed directory may contain millions of files or bind/remote mounts");
+        browse.selected_index = 1;
+        assert_eq!(automatic_accounting_target(&browse), Some(current.join("album")));
+        browse.selected_index = 2;
+        assert!(automatic_accounting_target(&browse).is_none(),
+            "a symlink is never an automatic scan root");
+    }
+}
+
 fn should_draw_frame(
     requested: bool,
     visible_state_changed: bool,
@@ -209,12 +244,10 @@ pub async fn run_app(
                 app.browse.folder_size_sort_busy = false;
             }
             if app.current_screen == AppScreen::Browse && !app.browse.is_in_archive() {
-                let highlighted = if app.browse.selected_entry().is_some_and(|entry| entry.is_child_dir() && !entry.is_symlink) {
-                    app.browse.selected_entry().map(|entry| entry.path.clone())
-                } else { None };
-                app.directory_accounting.consider_background(Some(app.browse.current_dir.clone()), highlighted, &tx);
+                app.directory_accounting.consider_background(
+                    automatic_accounting_target(&app.browse), &tx);
             } else {
-                app.directory_accounting.consider_background(None, None, &tx);
+                app.directory_accounting.consider_background(None, &tx);
             }
         }
         check_search_debounce(app, &tx);

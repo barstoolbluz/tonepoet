@@ -28,6 +28,20 @@ pub struct DirectoryView {
     pub subscription: Option<u64>,
 }
 
+impl DirectoryView {
+    /// An unsuccessful revalidation must never make historical recursive totals
+    /// look freshly observed. Keep the cache intact for other consumers.
+    pub fn interrupted_label(&self) -> Option<&'static str> {
+        match self.last_end.as_ref()? {
+            ScanEnd::Limited { .. } => Some("incomplete"),
+            ScanEnd::Deferred(_) => Some("deferred"),
+            ScanEnd::Failed { .. } => Some("scan failed"),
+            ScanEnd::Changed { .. } => Some("changed during scan"),
+            ScanEnd::Complete { .. } | ScanEnd::Cancelled(_) => None,
+        }
+    }
+}
+
 struct Job {
     id: u64,
     path: PathBuf,
@@ -62,7 +76,6 @@ pub struct AccountingService {
     queued: VecDeque<Pending>,
     next_id: u64,
     pub views: HashMap<PathBuf, DirectoryView>,
-    browse_dwell: Option<(PathBuf, Instant)>,
     highlight_dwell: Option<(PathBuf, Instant)>,
     background_tried: HashMap<PathBuf, BackgroundAttempt>,
     /// At most four opt-in sort candidates share the normal accounting worker;
@@ -115,7 +128,7 @@ impl AccountingService {
             }
         });
         Self { db_path, active: HashMap::new(), queued: VecDeque::new(), next_id: 0,
-            views: HashMap::new(), browse_dwell: None, highlight_dwell: None,
+            views: HashMap::new(), highlight_dwell: None,
             background_tried: HashMap::new(),
             folder_sort_scope: None, folder_sort_targets: HashSet::new(),
             preview_active: None, preview_tried: HashMap::new(),
@@ -200,7 +213,6 @@ impl AccountingService {
         let pinned = self.active.keys()
             .chain(self.queued.iter().map(|pending| &pending.path))
             .chain(self.preview_active.iter().map(|job| &job.path))
-            .chain(self.browse_dwell.iter().map(|(path, _)| path))
             .chain(self.highlight_dwell.iter().map(|(path, _)| path))
             .chain(self.folder_sort_targets.iter())
             .cloned().collect::<HashSet<_>>();
@@ -223,9 +235,10 @@ impl AccountingService {
 
     /// The Browse Info Refresh pill requests the same exhaustive foreground
     /// walker as Folder Properties, without allocating a modal subscription.
-    /// A known-valid cached total is never silently replaced by a UI refresh.
+    /// A user-authorized Refresh may replace a completed historical cache;
+    /// automatic selection never calls this forced scan path.
     pub fn request_refresh(&mut self, path: PathBuf, tx: &Sender<AppMessage>) -> bool {
-        if !path.is_absolute() || !self.refresh_available(&path) { return false; }
+        if !path.is_absolute() || !self.refresh_available_for_selection(&path, true) { return false; }
         self.request_explicit_scan(path.clone(), true, None, tx);
         // launch() reports thread-spawn failures in the view, with running
         // cleared. Do not tell the caller a Refresh started when it did not.
@@ -273,14 +286,27 @@ impl AccountingService {
         self.queued.iter().any(|pending| pending.path == path && pending.explicit)
     }
 
+    /// Ordinary, unclassified directories retain their original completed-
+    /// cache presentation. `..` and physical media directories offer an
+    /// explicit remeasurement even when their existing cache is complete.
     pub fn refresh_available(&self, path: &Path) -> bool {
-        // A queued background attempt is not an obstacle: the user-triggered
-        // Refresh supersedes it and owns foreground priority.
-        if self.scan_pending(path) { return false; }
-        if self.views.get(path).is_some_and(|view| view.running) { return false; }
-        self.views.get(path)
-            .and_then(|view| view.cached.as_ref())
-            .is_none_or(|cached| cached.freshness == Freshness::KnownInvalid)
+        self.refresh_available_for_selection(path, false)
+    }
+
+    pub fn refresh_available_for_selection(&self, path: &Path, allow_completed: bool) -> bool {
+        // A queued background attempt can be superseded by manual Refresh.
+        // An active or queued explicit request cannot be duplicated.
+        if self.scan_pending(path) || self.views.get(path).is_some_and(|view| view.running)
+            || self.active.contains_key(path)
+        { return false; }
+        allow_completed
+            || self.views.get(path).is_some_and(|view|
+                matches!(view.last_end.as_ref(), Some(
+                    ScanEnd::Limited { .. } | ScanEnd::Deferred(_)
+                    | ScanEnd::Failed { .. } | ScanEnd::Changed { .. })))
+            || self.views.get(path)
+                .and_then(|view| view.cached.as_ref())
+                .is_none_or(|cached| cached.freshness == Freshness::KnownInvalid)
     }
 
     fn request_explicit_scan(&mut self, path: PathBuf, force: bool,
@@ -401,22 +427,22 @@ impl AccountingService {
         }
     }
 
-    pub fn consider_background(&mut self, current: Option<PathBuf>, highlighted: Option<PathBuf>, tx: &Sender<AppMessage>) {
-        // Navigation changes immediately discard not-yet-started roots. An
-        // active unrelated walk is cancelled at the next metadata I/O token.
-        // Completed subtrees remain independently cacheable after cancellation.
-        let relevant = |path: &Path| current.as_deref() == Some(path)
-            || highlighted.as_deref() == Some(path) || self.folder_sort_targets.contains(path);
+    pub fn consider_background(&mut self, highlighted: Option<PathBuf>, tx: &Sender<AppMessage>) {
+        // Only a selected real child is eligible for automatic recursion.
+        // In particular, the synthetic `..` row describes current_dir but
+        // never authorizes a recursive walk of that potentially large tree.
+        // A user can request the same exhaustive walker through Refresh.
+        // Opted-in folder-size sorting retains its own independent ownership.
+        let relevant = |path: &Path| highlighted.as_deref() == Some(path)
+            || self.folder_sort_targets.contains(path);
         self.queued.retain(|pending| pending.explicit || relevant(&pending.path));
         for job in self.active.values() {
             if !job.explicit && !relevant(&job.path) { job.cancel.store(true, Ordering::Release); }
         }
-        let settled_current = Self::settled(&mut self.browse_dwell, current, Duration::from_millis(750));
         let settled_highlight = Self::settled(&mut self.highlight_dwell, highlighted.clone(), Duration::from_millis(1500));
         self.consider_preview(highlighted.as_deref(), settled_highlight.clone(), tx);
-        // Prefer current Browse folder, then a cursor-stable highlighted folder.
-        for candidate in [settled_current.filter(|_| self.folder_sort_scope.is_none()), settled_highlight].into_iter().flatten() {
-            if candidate.is_absolute() { self.queue_background_if_needed(candidate, tx); }
+        if let Some(path) = settled_highlight.filter(|path| path.is_absolute()) {
+            self.queue_background_if_needed(path, tx);
         }
         if self.preview_tried.len() > 1024 {
             self.preview_tried.retain(|_, when| when.elapsed() < Duration::from_secs(30));
@@ -680,8 +706,8 @@ impl AccountingService {
                     }
                     ScanEnd::Failed { reason, .. } => view.error = Some(reason.clone()),
                     ScanEnd::Changed { reason, .. } => { view.error = Some(reason.clone()); view.local = None; },
-                    ScanEnd::Cancelled(_) => view.local = prior_local,
-                    ScanEnd::Deferred(_) => view.local = prior_local,
+                    ScanEnd::Cancelled(_) | ScanEnd::Deferred(_)
+                    | ScanEnd::Limited { .. } => view.local = prior_local,
                 }
             }
         }
@@ -967,12 +993,12 @@ mod service_tests {
         // this fixture. The preview must be a separate worker.
         service.background_tried.insert(root.clone(), BackgroundAttempt { at: Instant::now(), retry_after: Duration::from_secs(86400) });
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        service.consider_background(None, Some(root.clone()), &tx);
+        service.consider_background(Some(root.clone()), &tx);
         assert!(service.preview_active.is_none(), "cursor has not settled");
         service.highlight_dwell = Some((root.clone(), Instant::now() - Duration::from_secs(2)));
-        service.consider_background(None, Some(root.clone()), &tx);
+        service.consider_background(Some(root.clone()), &tx);
         assert!(service.preview_active.is_some());
-        service.consider_background(None, Some(root.clone()), &tx);
+        service.consider_background(Some(root.clone()), &tx);
         assert!(service.preview_active.is_some(), "must not spawn another reader");
         let message = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await.expect("worker returned").expect("preview event");
@@ -1056,7 +1082,7 @@ mod service_tests {
             id: 32, path: old.clone(), cancel: cancel.clone(), invalidation_generation: 0,
         });
         let (tx, _rx) = tokio::sync::mpsc::channel(4);
-        service.consider_background(None, Some(new), &tx);
+        service.consider_background(Some(new), &tx);
         assert!(cancel.load(Ordering::Acquire), "moving focus fences the old reader");
         assert!(!service.accept_event(&Event::LocalPreview {
             id: 32, path: old.clone(),
@@ -1239,5 +1265,287 @@ mod service_tests {
         assert!(!service.active.get(&background).unwrap().explicit);
         assert!(service.queued.iter().any(|p| p.path == background && p.explicit));
         assert_eq!(service.active.values().filter(|j| j.explicit).count(), 1);
+    }
+
+    #[test]
+    fn parent_or_remote_bind_context_does_not_auto_queue_recursive_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("large-tree-with-remote-mounts");
+        std::fs::create_dir(&root).unwrap();
+        for i in 0..200 { std::fs::create_dir(root.join(format!("album-{i}"))).unwrap(); }
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut service = AccountingService::new(None);
+        // None is what Browse passes for `..`. Mount classification is not
+        // queried, so the test does not depend on actual bind/sshfs privileges.
+        service.consider_background(None, &tx);
+        assert!(service.active.is_empty() && service.queued.is_empty());
+        assert!(service.background_tried.is_empty());
+        assert!(service.refresh_available(&root));
+    }
+
+    #[test]
+    fn navigation_cancels_obsolete_background_walker_but_not_refresh() {
+        let mut service = AccountingService::new(None);
+        let old = PathBuf::from("/test/album-old");
+        let new = PathBuf::from("/test/album-new");
+        let old_job = job(&old, 51, false, 0);
+        let cancelled = old_job.cancel.clone();
+        service.active.insert(old.clone(), old_job);
+        let explicit = PathBuf::from("/test/manual");
+        let manual_job = job(&explicit, 52, true, 0);
+        let kept = manual_job.cancel.clone();
+        service.active.insert(explicit.clone(), manual_job);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        service.consider_background(Some(new.clone()), &tx);
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(!kept.load(Ordering::Acquire));
+        assert!(!service.accept_event(&Event::Progress {
+            id: 50, path: new, progress: ScanProgress { files_examined: 999, ..Default::default() },
+        }, &tx), "an older request may not modify a new selection");
+        assert!(service.view(&explicit).is_none(), "unrelated explicit worker untouched");
+    }
+
+    #[test]
+    fn automatic_budget_exhaustion_rolls_back_partial_local_and_offers_refresh() {
+        let mut service = AccountingService::new(None);
+        let path = PathBuf::from("/test/limited-album");
+        let original = Counts { files: 2, ..Counts::default() };
+        let mut active = job(&path, 70, false, 0);
+        active.prior_local = Some(original);
+        service.active.insert(path.clone(), active);
+        service.views.entry(path.clone()).or_default().local = Some(original);
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        assert!(service.accept_event(&Event::Local {
+            id: 70, path: path.clone(), counts: Counts { files: 100, ..Counts::default() },
+        }, &tx));
+        assert_eq!(service.view(&path).unwrap().local.unwrap().files, 100);
+        let partial = ScanProgress { files_examined: 100, ..Default::default() };
+        assert!(service.accept_event(&Event::Finished {
+            id: 70, path: path.clone(), end: ScanEnd::Limited {
+                reason: "directory-entry budget reached", progress: partial,
+            },
+        }, &tx));
+        let view = service.view(&path).unwrap();
+        assert!(!view.running);
+        assert!(view.cached.is_none(), "limited progress cannot become complete cache");
+        assert_eq!(view.local.unwrap(), original, "discard partial direct count");
+        assert!(matches!(&view.last_end, Some(ScanEnd::Limited { .. })));
+        assert!(service.refresh_available(&path));
+    }
+
+    #[test]
+    fn limited_revalidation_still_offers_refresh_with_an_old_cached_total() {
+        let mut service = AccountingService::new(None);
+        let path = PathBuf::from("/test/cached-then-limited");
+        service.active.insert(path.clone(), job(&path, 88, false, 0));
+        let now = SystemTime::now();
+        service.views.entry(path.clone()).or_default().cached = Some(CachedMeasurement {
+            measurement: CompleteMeasurement {
+                path: path.clone(), counts: Counts { files: 12, ..Default::default() },
+                started: now, finished: now, created: None, modified: None,
+                generation: 1, observation: Observation::AsObserved,
+            },
+            freshness: Freshness::Unverified,
+        });
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        assert!(service.accept_event(&Event::Finished {
+            id: 88, path: path.clone(), end: ScanEnd::Limited {
+                reason: "elapsed-time budget reached", progress: ScanProgress::default(),
+            },
+        }, &tx));
+        assert_eq!(service.view(&path).unwrap().cached.as_ref().unwrap()
+            .measurement.counts.files, 12, "historical complete cache remains intact");
+        assert!(service.refresh_available(&path), "a limited scan needs manual authorization");
+    }
+
+    #[test]
+    fn deferred_network_scan_with_historical_cache_still_allows_manual_refresh() {
+        let mut service = AccountingService::new(None);
+        let path = PathBuf::from("/test/remote-album");
+        service.active.insert(path.clone(), job(&path, 99, false, 0));
+        let now = SystemTime::now();
+        service.views.entry(path.clone()).or_default().cached = Some(CachedMeasurement {
+            measurement: CompleteMeasurement {
+                path: path.clone(), counts: Counts { files: 1, ..Default::default() },
+                started: now, finished: now, created: None, modified: None,
+                generation: 1, observation: Observation::AsObserved,
+            },
+            freshness: Freshness::AsObserved,
+        });
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        assert!(service.accept_event(&Event::Finished {
+            id: 99, path: path.clone(), end: ScanEnd::Deferred(ScanProgress::default()),
+        }, &tx));
+        assert!(service.refresh_available(&path),
+            "a deferred network scan needs manual authorization even with old cache");
+    }
+
+    #[tokio::test]
+    async fn refresh_after_limited_result_replaces_incomplete_state_with_complete_total() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("album");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("one.flac"), b"abc").unwrap();
+        std::fs::write(root.join("two.flac"), b"defgh").unwrap();
+        let mut service = AccountingService::new(None);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        service.active.insert(root.clone(), job(&root, 100, false, 0));
+        assert!(service.accept_event(&Event::Finished {
+            id: 100, path: root.clone(), end: ScanEnd::Limited {
+                reason: "directory-entry budget reached", progress: ScanProgress::default(),
+            },
+        }, &tx));
+        assert!(service.refresh_available(&root));
+        assert!(service.request_refresh(root.clone(), &tx));
+        let mut completed = false;
+        while let Some(message) = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await.expect("refresh event timeout") {
+            let AppMessage::DirectoryAccounting(event) = message else { panic!("unexpected message") };
+            let finished = matches!(event, Event::Finished { .. });
+            service.accept_event(&event, &tx);
+            if finished { completed = true; break; }
+        }
+        assert!(completed, "explicit Refresh completes asynchronously");
+        let view = service.view(&root).unwrap();
+        assert!(matches!(view.last_end.as_ref(), Some(ScanEnd::Complete { .. })));
+        assert_eq!(view.cached.as_ref().unwrap().measurement.counts.files, 2);
+        assert_eq!(view.cached.as_ref().unwrap().measurement.counts.audio, 2);
+        assert_eq!(view.cached.as_ref().unwrap().measurement.counts.bytes, 8);
+        assert!(!service.refresh_available(&root));
+    }
+
+    #[test]
+    fn unsuccessful_revalidations_preserve_cache_but_offer_recovery() {
+        let path = PathBuf::from("/music/collection");
+        let now = SystemTime::now();
+        let saved = CachedMeasurement {
+            measurement: CompleteMeasurement {
+                path: path.clone(), counts: Counts { files: 901, bytes: 999_999, ..Default::default() },
+                started: now, finished: now, created: None, modified: None,
+                generation: 7, observation: Observation::AsObserved,
+            },
+            freshness: Freshness::AsObserved,
+        };
+        for (end, label) in [
+            (ScanEnd::Deferred(ScanProgress::default()), "deferred"),
+            (ScanEnd::Failed { reason: "permission denied".into(), progress: ScanProgress::default() }, "scan failed"),
+            (ScanEnd::Changed { reason: "directory changed".into(), progress: ScanProgress::default() }, "changed during scan"),
+        ] {
+            let mut service = AccountingService::new(None);
+            service.active.insert(path.clone(), job(&path, 42, false, 0));
+            service.views.entry(path.clone()).or_default().cached = Some(saved.clone());
+            let (tx, _rx) = tokio::sync::mpsc::channel(8);
+            assert!(service.accept_event(&Event::Finished { id: 42, path: path.clone(), end }, &tx));
+            let view = service.view(&path).unwrap();
+            assert_eq!(view.interrupted_label(), Some(label));
+            assert_eq!(view.cached.as_ref().unwrap().measurement.counts.files, 901);
+            assert_eq!(view.cached.as_ref().unwrap().freshness, Freshness::AsObserved);
+            assert!(service.refresh_available(&path), "{label} must permit manual Refresh");
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_cache_can_be_explicitly_remeasured_without_automatic_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("Collection");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("one.flac"), b"new data").unwrap();
+        let now = SystemTime::now();
+        let mut service = AccountingService::new(None);
+        service.views.entry(root.clone()).or_default().cached = Some(CachedMeasurement {
+            measurement: CompleteMeasurement {
+                path: root.clone(), counts: Counts { files: 900, bytes: 999_999, ..Default::default() },
+                started: now, finished: now, created: None, modified: None,
+                generation: 1, observation: Observation::AsObserved,
+            },
+            freshness: Freshness::AsObserved,
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        service.consider_background(None, &tx); // `..` does not authorize automatic scanning.
+        assert!(!service.view(&root).unwrap().running);
+        assert!(!service.refresh_available(&root), "ordinary completed directory keeps its layout");
+        assert!(service.refresh_available_for_selection(&root, true),
+            "a parent or completed media row offers remeasurement");
+        assert!(service.request_refresh(root.clone(), &tx));
+        assert!(service.cancel_available(&root));
+        assert!(!service.refresh_available_for_selection(&root, true),
+            "no duplicate scan while a forced Refresh is running");
+        assert!(!service.request_refresh(root.clone(), &tx));
+        let mut completed = false;
+        while let Some(message) = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await.expect("manual refresh timed out") {
+            let AppMessage::DirectoryAccounting(event) = message else { panic!("unexpected message") };
+            let finished = matches!(event, Event::Finished { .. });
+            service.accept_event(&event, &tx);
+            if finished { completed = true; break; }
+        }
+        assert!(completed);
+        let view = service.view(&root).unwrap();
+        assert_eq!(view.interrupted_label(), None);
+        assert!(matches!(view.last_end.as_ref(), Some(ScanEnd::Complete { .. })));
+        assert_eq!(view.cached.as_ref().unwrap().measurement.counts.files, 1);
+        assert_eq!(view.cached.as_ref().unwrap().measurement.counts.bytes, 8);
+        assert_eq!(view.cached.as_ref().unwrap().freshness, Freshness::Unverified,
+            "a scan without a persistent DB cannot claim verified cache storage");
+    }
+
+    #[tokio::test]
+    async fn deferred_and_failed_cached_scans_can_recover_with_exhaustive_refresh() {
+        for is_failed in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("Album");
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join("track.flac"), b"updated").unwrap();
+            let now = SystemTime::now();
+            let mut service = AccountingService::new(None);
+            service.active.insert(root.clone(), job(&root, 77, false, 0));
+            service.views.entry(root.clone()).or_default().cached = Some(CachedMeasurement {
+                measurement: CompleteMeasurement {
+                    path: root.clone(), counts: Counts { files: 999, bytes: 999_999, ..Default::default() },
+                    started: now, finished: now, created: None, modified: None,
+                    generation: 5, observation: Observation::AsObserved,
+                },
+                freshness: Freshness::AsObserved,
+            });
+            let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+            let end = if is_failed {
+                ScanEnd::Failed { reason: "network read error".into(), progress: ScanProgress::default() }
+            } else { ScanEnd::Deferred(ScanProgress::default()) };
+            assert!(service.accept_event(&Event::Finished { id: 77, path: root.clone(), end }, &tx));
+            assert!(service.view(&root).unwrap().interrupted_label().is_some());
+            assert_eq!(service.view(&root).unwrap().cached.as_ref().unwrap().measurement.counts.files, 999);
+            assert!(service.refresh_available(&root));
+            assert!(service.request_refresh(root.clone(), &tx));
+            let mut completed = false;
+            while let Some(message) = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+                .await.expect("recovery scan timed out") {
+                let AppMessage::DirectoryAccounting(event) = message else { panic!("unexpected event") };
+                let finished = matches!(event, Event::Finished { .. });
+                service.accept_event(&event, &tx);
+                if finished { completed = true; break; }
+            }
+            assert!(completed);
+            let view = service.view(&root).unwrap();
+            assert!(matches!(view.last_end.as_ref(), Some(ScanEnd::Complete { .. })));
+            assert_eq!(view.cached.as_ref().unwrap().measurement.counts.files, 1);
+            assert_eq!(view.cached.as_ref().unwrap().measurement.counts.bytes, 7);
+            assert_eq!(view.interrupted_label(), None);
+        }
+    }
+
+    #[test]
+    fn repeated_stable_highlight_reuses_attempt_instead_of_restarting() {
+        let path = PathBuf::from("/test/same-album");
+        let mut service = AccountingService::new(None);
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        service.background_tried.insert(path.clone(), BackgroundAttempt {
+            at: Instant::now(), retry_after: Duration::from_secs(86400),
+        });
+        service.preview_tried.insert(path.clone(), Instant::now());
+        service.highlight_dwell = Some((path.clone(), Instant::now() - Duration::from_secs(3)));
+        for _ in 0..5 { service.consider_background(Some(path.clone()), &tx); }
+        assert!(service.active.is_empty());
+        assert!(service.queued.is_empty());
+        assert_eq!(service.background_tried.len(), 1);
     }
 }

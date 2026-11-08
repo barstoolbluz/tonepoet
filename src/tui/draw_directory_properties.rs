@@ -89,6 +89,7 @@ fn status_line(state: &FolderPropertiesState, view: Option<&DirectoryView>, them
             else { match view.last_end.as_ref() {
                 Some(ScanEnd::Failed { .. }) => Some("rescan failed"),
                 Some(ScanEnd::Deferred(_)) => Some("scan deferred"),
+                Some(ScanEnd::Limited { .. }) => Some("automatic scan limited"),
                 Some(ScanEnd::Changed { .. }) => Some("changed during scan"),
                 Some(ScanEnd::Complete { saved: false, .. }) => Some("not saved"),
                 _ => match cached.freshness {
@@ -115,6 +116,7 @@ fn status_line(state: &FolderPropertiesState, view: Option<&DirectoryView>, them
     let message = match view.last_end.as_ref() {
         Some(ScanEnd::Cancelled(_)) => "scan cancelled",
         Some(ScanEnd::Deferred(_)) => "scan deferred",
+        Some(ScanEnd::Limited { .. }) => "automatic scan incomplete; use Refresh",
         Some(ScanEnd::Failed { .. }) => "scan failed",
         Some(ScanEnd::Changed { .. }) => "changed during scan",
         _ if view.error.is_some() => "measurement unavailable",

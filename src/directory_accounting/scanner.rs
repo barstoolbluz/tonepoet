@@ -1,5 +1,6 @@
-//! Iterative, no-follow, exhaustive directory traversal. Only *finished* subtrees
-//! produce persistent totals. A bounded background I/O rate is not a scan limit.
+//! Iterative, no-follow directory accounting. Only *finished* subtrees produce
+//! persistent totals. Automatic scans have hard work budgets; explicitly
+//! requested scans retain the existing exhaustive, cancellable walker.
 use std::collections::{HashSet, VecDeque};
 use std::fs::{self, Metadata};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -14,6 +15,63 @@ use super::volume::{Inventory, NetworkProbeGate, Volume, VolumeBudgets, VolumeCl
 
 const MEMORY_CHILDREN_LIMIT: usize = 2048;
 const BACKGROUND_SCRATCH_QUOTA: u64 = 64 * 1024 * 1024;
+
+/// Caps *selected-subtree* automatic recursion, never parent/sibling fanout.
+/// The existing background I/O throttle remains independent of these limits.
+/// A Refresh or opted-in folder-size sort uses the same walker without caps.
+#[derive(Debug, Clone, Copy)]
+struct AutoScanLimits {
+    entry_reads: u64,
+    directories: u64,
+    depth: usize,
+    elapsed: Duration,
+}
+const AUTO_SCAN_LIMITS: AutoScanLimits = AutoScanLimits {
+    entry_reads: 16_384,
+    directories: 512,
+    depth: 16,
+    elapsed: Duration::from_secs(8),
+};
+
+struct AutoScanBudget {
+    limits: AutoScanLimits,
+    started: Instant,
+    entry_reads: u64,
+    directories: u64,
+}
+impl AutoScanBudget {
+    fn new() -> Self { Self { limits: AUTO_SCAN_LIMITS, started: Instant::now(), entry_reads: 0, directories: 0 } }
+    fn check_time(&self) -> Result<(), ScanExit> {
+        if self.started.elapsed() >= self.limits.elapsed {
+            Err(ScanExit::Limited("elapsed-time budget reached"))
+        } else { Ok(()) }
+    }
+    fn enter_directory(&mut self, depth: usize) -> Result<(), ScanExit> {
+        self.check_time()?;
+        if depth > self.limits.depth { return Err(ScanExit::Limited("directory-depth budget reached")); }
+        if self.directories >= self.limits.directories {
+            return Err(ScanExit::Limited("directory-count budget reached"));
+        }
+        self.directories += 1;
+        Ok(())
+    }
+    /// Reserve permission *before* advancing ReadDir: even obtaining its next
+    /// entry may block on a remote filesystem. The EOF probe counts as a read;
+    /// an exact-limit directory may conservatively require manual Refresh.
+    fn before_next_entry(&mut self) -> Result<(), ScanExit> {
+        self.check_time()?;
+        if self.entry_reads >= self.limits.entry_reads {
+            return Err(ScanExit::Limited("directory-entry budget reached"));
+        }
+        self.entry_reads += 1;
+        Ok(())
+    }
+}
+
+// A one-level preview is not recursion, but a single huge or remote directory
+// can also monopolize a worker. Never publish its partial counts.
+const PREVIEW_MAX_ENTRY_READS: u64 = 8_192;
+const PREVIEW_MAX_ELAPSED: Duration = Duration::from_secs(4);
 
 #[derive(Clone)]
 struct ScratchBudget { used: Arc<AtomicU64>, priority: Arc<AtomicU8> }
@@ -234,6 +292,7 @@ pub struct RateGovernor {
     last_network_probe: Instant,
     scratch: ScratchBudget,
     operations: u64,
+    auto_budget: AutoScanBudget,
     #[cfg(test)] unlimited_fixture: bool,
 }
 impl RateGovernor {
@@ -250,10 +309,24 @@ impl RateGovernor {
             budgets, network_gate, inventory,
             current_volume: Volume { key: "unclassified".into(), class: VolumeClass::NetworkOrUnknown },
             current_directory: None, last_network_probe: Instant::now(), operations: 0,
+            auto_budget: AutoScanBudget::new(),
             #[cfg(test)] unlimited_fixture: false,
         }
     }
-    pub fn enter_directory(&mut self, path: &Path) -> Result<(), ScanExit> {
+    fn budget_active(&self) -> bool { self.priority.load(Ordering::Acquire) < 2 }
+    fn check_budget(&self) -> Result<(), ScanExit> {
+        if self.cancel.load(Ordering::Acquire) { return Err(ScanExit::Cancelled); }
+        if self.budget_active() { self.auto_budget.check_time()?; }
+        Ok(())
+    }
+    fn before_next_entry(&mut self) -> Result<(), ScanExit> {
+        self.check_budget()?;
+        if self.budget_active() { self.auto_budget.before_next_entry()?; }
+        Ok(())
+    }
+    pub fn enter_directory(&mut self, path: &Path, depth: usize) -> Result<(), ScanExit> {
+        self.check_budget()?;
+        if self.budget_active() { self.auto_budget.enter_directory(depth)?; }
         self.current_volume = self.inventory.for_path(path);
         self.current_directory = Some(path.to_path_buf());
         #[cfg(test)]
@@ -278,7 +351,7 @@ impl RateGovernor {
     }
     pub fn tick(&mut self, cost: f64) -> Result<(), ScanExit> {
         loop {
-            if self.cancel.load(Ordering::Acquire) { return Err(ScanExit::Cancelled); }
+            self.check_budget()?;
             #[cfg(test)]
             if self.unlimited_fixture { return Ok(()); }
             let priority = self.priority.load(Ordering::Acquire);
@@ -322,7 +395,18 @@ impl RateGovernor {
 }
 
 #[derive(Debug)]
-pub enum ScanExit { Cancelled, Deferred, Failed(String), Changed(String) }
+pub enum ScanExit { Cancelled, Deferred, Limited(&'static str), Failed(String), Changed(String) }
+impl ScanExit {
+    fn into_end(self, progress: ScanProgress) -> ScanEnd {
+        match self {
+            Self::Cancelled => ScanEnd::Cancelled(progress),
+            Self::Deferred => ScanEnd::Deferred(progress),
+            Self::Limited(reason) => ScanEnd::Limited { reason, progress },
+            Self::Failed(reason) => ScanEnd::Failed { reason, progress },
+            Self::Changed(reason) => ScanEnd::Changed { reason, progress },
+        }
+    }
+}
 impl From<String> for ScanExit { fn from(value: String) -> Self { Self::Failed(value) } }
 
 fn io_error(path: &Path, what: &str, error: impl std::fmt::Display) -> ScanExit {
@@ -342,12 +426,16 @@ fn inspect_directory(path: &Path, governor: &mut RateGovernor, progress: &mut Sc
     let created = before_meta.created().ok();
     let modified = before_meta.modified().ok();
     governor.tick(4.0)?;
-    let read = fs::read_dir(path).map_err(|e| io_error(path, "list directory", e))?;
+    let mut read = fs::read_dir(path).map_err(|e| io_error(path, "list directory", e))?;
     let mut counts = Counts::default();
     let mut digest = [0u8;64];
     let mut children = ChildSpool::new(governor.scratch.clone());
-    for result in read {
+    loop {
+        // Charge/check *before* ReadDir::next(), not after a potentially
+        // blocking remote fetch. No new metadata I/O starts after exhaustion.
+        governor.before_next_entry()?;
         governor.tick(2.0)?; // charge the enumeration AND metadata lookup
+        let Some(result) = read.next() else { break; };
         let entry = result.map_err(|e| io_error(path, "enumerate entry", e))?;
         let entry_path = entry.path();
         let meta = fs::symlink_metadata(&entry_path).map_err(|e| io_error(&entry_path, "read entry", e))?;
@@ -388,6 +476,12 @@ fn inspect_directory(path: &Path, governor: &mut RateGovernor, progress: &mut Sc
 /// Errors and cancellations produce no counts, not partial numbers. It uses
 /// the same no-follow and audio-extension policy as the full walker.
 pub(super) fn preview_local_counts(path: &Path, cancel: &AtomicBool) -> Result<Option<Counts>, String> {
+    preview_local_counts_bounded(path, cancel, PREVIEW_MAX_ENTRY_READS, PREVIEW_MAX_ELAPSED)
+}
+
+fn preview_local_counts_bounded(path: &Path, cancel: &AtomicBool,
+    entry_limit: u64, time_limit: Duration) -> Result<Option<Counts>, String> {
+    let started = Instant::now();
     if cancel.load(Ordering::Acquire) { return Ok(None); }
     let before_meta = fs::symlink_metadata(path)
         .map_err(|e| format!("{}: read directory attributes: {e}", path.display()))?;
@@ -395,11 +489,21 @@ pub(super) fn preview_local_counts(path: &Path, cancel: &AtomicBool) -> Result<O
         return Err(format!("{} is not a real directory", path.display()));
     }
     let before = fingerprint(&before_meta);
-    let entries = fs::read_dir(path)
+    if started.elapsed() >= time_limit { return Ok(None); }
+    let mut entries = fs::read_dir(path)
         .map_err(|e| format!("{}: list directory: {e}", path.display()))?;
     let mut counts = Counts::default();
-    for entry in entries {
-        if cancel.load(Ordering::Acquire) { return Ok(None); }
+    for _ in 0..entry_limit {
+        if cancel.load(Ordering::Acquire) || started.elapsed() >= time_limit { return Ok(None); }
+        let Some(entry) = entries.next() else {
+            if cancel.load(Ordering::Acquire) || started.elapsed() >= time_limit { return Ok(None); }
+            let after_meta = fs::symlink_metadata(path)
+                .map_err(|e| format!("{}: recheck directory: {e}", path.display()))?;
+            if !after_meta.is_dir() || is_excluded(&after_meta) || fingerprint(&after_meta) != before {
+                return Err(format!("{} changed during enumeration", path.display()));
+            }
+            return Ok(Some(counts));
+        };
         let entry = entry.map_err(|e| format!("{}: enumerate entry: {e}", path.display()))?;
         let child = entry.path();
         let metadata = fs::symlink_metadata(&child)
@@ -417,17 +521,12 @@ pub(super) fn preview_local_counts(path: &Path, cancel: &AtomicBool) -> Result<O
                 .ok_or("entry count overflow")?;
         }
     }
-    if cancel.load(Ordering::Acquire) { return Ok(None); }
-    let after_meta = fs::symlink_metadata(path)
-        .map_err(|e| format!("{}: recheck directory: {e}", path.display()))?;
-    if !after_meta.is_dir() || is_excluded(&after_meta) || fingerprint(&after_meta) != before {
-        return Err(format!("{} changed during enumeration", path.display()));
-    }
-    Ok(Some(counts))
+    // The budget was consumed before an EOF probe could establish completeness.
+    Ok(None)
 }
 
-/// Full traversal is deliberately unbounded by depth, total bytes, file count,
-/// or wall clock. Rate limits affect speed only, never completion truth.
+/// Foreground and opted-in traversals are exhaustive (and cancellable).
+/// Background recursion is bounded; a limited root is never a complete total.
 pub fn scan<F, L>(root: &Path, generation: i64, repo: &mut Option<Repository>, governor: &mut RateGovernor,
     mut progress_event: F, mut local_event: L,
 ) -> ScanEnd
@@ -463,27 +562,20 @@ where F: FnMut(ScanProgress), L: FnMut(Counts) {
 
     loop {
         if let Some(path) = next.take() {
+            progress.current = Some(path.clone());
+            let started = SystemTime::now();
+            // Reject a new directory before issuing even a repository lookup.
+            if let Err(exit) = governor.enter_directory(&path, stack.len()) {
+                return exit.into_end(progress);
+            }
             let epoch = match repo.as_ref().map(|r| r.epoch(&path)).transpose() {
                 Ok(v) => v.unwrap_or(0),
                 Err(error) => { all_saved = false; persistence_error.get_or_insert(error); 0 }
             };
-            progress.current = Some(path.clone());
-            let started = SystemTime::now();
-            if let Err(exit) = governor.enter_directory(&path) {
-                return match exit {
-                    ScanExit::Cancelled => ScanEnd::Cancelled(progress),
-                    ScanExit::Deferred => ScanEnd::Deferred(progress),
-                    ScanExit::Failed(reason) => ScanEnd::Failed { reason, progress },
-                    ScanExit::Changed(reason) => ScanEnd::Changed { reason, progress },
-                };
-            }
             let inspected = inspect_directory(&path, governor, &mut progress, |p| report(p));
             let (counts, children, before, created, modified, observation, digest, root_identity) = match inspected {
                 Ok(value) => value,
-                Err(ScanExit::Cancelled) => return ScanEnd::Cancelled(progress),
-                Err(ScanExit::Deferred) => return ScanEnd::Deferred(progress),
-                Err(ScanExit::Failed(reason)) => return ScanEnd::Failed { reason, progress },
-                Err(ScanExit::Changed(reason)) => return ScanEnd::Changed { reason, progress },
+                Err(exit) => return exit.into_end(progress),
             };
             #[cfg(unix)] {
                 if !active_ids.insert((before.dev,before.ino)) {
@@ -503,6 +595,7 @@ where F: FnMut(ScanProgress), L: FnMut(Counts) {
         let Some(frame) = stack.last_mut() else {
             return ScanEnd::Failed { reason: "accounting stack unexpectedly empty".into(), progress };
         };
+        if let Err(exit) = governor.check_budget() { return exit.into_end(progress); }
         match frame.children.next() {
             Ok(Some(child)) => { next = Some(child); continue; }
             Err(reason) => return ScanEnd::Failed { reason, progress },
@@ -511,14 +604,7 @@ where F: FnMut(ScanProgress), L: FnMut(Counts) {
         // All children are accounted for; only now is this subtree complete.
         let complete_frame = stack.pop().expect("checked nonempty");
         #[cfg(unix)] { active_ids.remove(&(complete_frame.before.dev, complete_frame.before.ino)); }
-        if let Err(exit) = governor.tick(1.0) {
-            return match exit {
-                ScanExit::Cancelled => ScanEnd::Cancelled(progress),
-                ScanExit::Deferred => ScanEnd::Deferred(progress),
-                ScanExit::Failed(reason) => ScanEnd::Failed { reason, progress },
-                ScanExit::Changed(reason) => ScanEnd::Changed { reason, progress },
-            };
-        }
+        if let Err(exit) = governor.tick(1.0) { return exit.into_end(progress); }
         let final_meta = match fs::symlink_metadata(&complete_frame.path) {
             Ok(m) => m,
             Err(e) => return ScanEnd::Changed { reason: format!("{} disappeared before completion: {e}", complete_frame.path.display()), progress },
@@ -811,5 +897,186 @@ mod local_preview_tests {
             std::os::unix::fs::symlink(temp.path(), &link).unwrap();
             assert!(preview_local_counts(&link, &AtomicBool::new(false)).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod automatic_scan_budget_tests {
+    use super::*;
+
+    fn governor_with_limits(limits: AutoScanLimits) -> RateGovernor {
+        let mut governor = RateGovernor::new(
+            Arc::new(AtomicBool::new(false)), Arc::new(AtomicU8::new(1)),
+            Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)), false);
+        // Disable only volume I/O-rate/latency probes for deterministic tests.
+        // The *automatic traversal budget* stays active on this governor.
+        governor.auto_budget.limits = limits;
+        governor
+    }
+    fn limits() -> AutoScanLimits {
+        AutoScanLimits { entry_reads: 128, directories: 16,
+            depth: 8, elapsed: Duration::from_secs(8) }
+    }
+    fn walk(root: &Path, governor: &mut RateGovernor) -> ScanEnd {
+        scan(root, 1, &mut None, governor, |_| {}, |_| {})
+    }
+
+    #[test]
+    fn entry_limit_stops_without_claiming_or_persisting_a_partial_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("cache.db");
+        crate::db::Database::open_path(&db).unwrap();
+        let root = tmp.path().join("music");
+        fs::create_dir(&root).unwrap();
+        for i in 0..10 { fs::write(root.join(format!("{i}.flac")), b"audio").unwrap(); }
+        let mut limits = limits();
+        limits.entry_reads = 3;
+        let mut governor = governor_with_limits(limits);
+        let mut repo = Some(Repository::open(&db).unwrap());
+        let generation = repo.as_mut().unwrap().allocate_generation().unwrap();
+        let result = scan(&root, generation, &mut repo, &mut governor, |_| {}, |_| {});
+        match result {
+            ScanEnd::Limited { reason, progress } => {
+                assert_eq!(reason, "directory-entry budget reached");
+                assert_eq!(progress.files_examined, 3);
+            }
+            other => panic!("entry budget must not report complete: {other:?}"),
+        }
+        assert!(repo.as_mut().unwrap().lookup(&root).unwrap().is_none(),
+            "no complete root measurement may be cached");
+    }
+
+    #[test]
+    fn directory_count_and_depth_have_independent_limits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("collection");
+        let nested = root.join("artist").join("album").join("disc");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("track.flac"), b"1234").unwrap();
+        let mut count = limits();
+        count.directories = 1;
+        match walk(&root, &mut governor_with_limits(count)) {
+            ScanEnd::Limited { reason, progress } => {
+                assert_eq!(reason, "directory-count budget reached");
+                assert_eq!(progress.folders_examined, 1);
+            }
+            other => panic!("unexpected directory-count outcome: {other:?}"),
+        }
+        let mut depth = limits();
+        depth.depth = 1;
+        match walk(&root, &mut governor_with_limits(depth)) {
+            ScanEnd::Limited { reason, progress } => {
+                assert_eq!(reason, "directory-depth budget reached");
+                assert_eq!(progress.folders_examined, 2);
+            }
+            other => panic!("unexpected depth outcome: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn elapsed_limit_is_checked_before_starting_new_filesystem_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut limits = limits();
+        limits.elapsed = Duration::from_secs(1);
+        let mut governor = governor_with_limits(limits);
+        // Simulate an I/O stall without relying on real network latency.
+        governor.auto_budget.started = Instant::now() - Duration::from_secs(2);
+        match walk(tmp.path(), &mut governor) {
+            ScanEnd::Limited { reason, progress } => {
+                assert_eq!(reason, "elapsed-time budget reached");
+                assert_eq!(progress.folders_examined, 0);
+                assert_eq!(governor.auto_budget.directories, 0);
+                assert_eq!(governor.auto_budget.entry_reads, 0);
+            }
+            other => panic!("unexpected elapsed outcome: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn selection_scans_one_album_not_its_two_hundred_siblings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("library");
+        fs::create_dir(&root).unwrap();
+        for album in 0..200 {
+            let directory = root.join(format!("album-{album:03}"));
+            fs::create_dir(&directory).unwrap();
+            for track in 0..30 {
+                fs::write(directory.join(format!("{track:02}.flac")), b"a").unwrap();
+            }
+        }
+        let selected = root.join("album-117");
+        let mut governor = governor_with_limits(limits());
+        match walk(&selected, &mut governor) {
+            ScanEnd::Complete { value, .. } => {
+                assert_eq!(value.path, selected);
+                assert_eq!(value.counts.files, 30);
+                assert_eq!(value.counts.audio, 30);
+                assert_eq!(value.counts.folders, 0);
+                assert!(governor.auto_budget.entry_reads < 40,
+                    "200 sibling albums did not consume the selected budget");
+            }
+            other => panic!("single album must stay automatic: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explicit_refresh_bypasses_auto_budgets_without_changing_walk_semantics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("album");
+        fs::create_dir(&root).unwrap();
+        for n in 0..12 { fs::write(root.join(format!("{n}.flac")), b"t").unwrap(); }
+        let mut tiny = limits();
+        tiny.entry_reads = 1;
+        assert!(matches!(walk(&root, &mut governor_with_limits(tiny)), ScanEnd::Limited { .. }));
+        let mut manual = governor_with_limits(tiny);
+        manual.priority.store(2, Ordering::Release);
+        match walk(&root, &mut manual) {
+            ScanEnd::Complete { value, .. } => assert_eq!(value.counts.audio, 12),
+            other => panic!("explicit must finish the same root: {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_cycles_are_never_followed_by_automatic_walk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("album");
+        fs::create_dir(&root).unwrap();
+        std::os::unix::fs::symlink(&root, root.join("cycle")).unwrap();
+        fs::write(root.join("one.flac"), b"123").unwrap();
+        match walk(&root, &mut governor_with_limits(limits())) {
+            ScanEnd::Complete { value, .. } => {
+                assert_eq!(value.counts.files, 1);
+                assert_eq!(value.counts.excluded_links, 1);
+            }
+            other => panic!("symlink must not be followed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn disappearing_or_inaccessible_directory_is_not_reported_as_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let absent = tmp.path().join("missing");
+        assert!(matches!(walk(&absent, &mut governor_with_limits(limits())),
+            ScanEnd::Failed { .. } | ScanEnd::Changed { .. }));
+        let not_directory = tmp.path().join("file.txt");
+        fs::write(&not_directory, b"one").unwrap();
+        assert!(matches!(walk(&not_directory, &mut governor_with_limits(limits())),
+            ScanEnd::Failed { .. } | ScanEnd::Changed { .. }));
+    }
+
+    #[test]
+    fn one_level_preview_exhaustion_does_not_publish_truncated_counts() {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..5 { fs::write(tmp.path().join(format!("{i}.flac")), b"x").unwrap(); }
+        let cancel = AtomicBool::new(false);
+        assert!(preview_local_counts_bounded(tmp.path(), &cancel, 2,
+            Duration::from_secs(10)).unwrap().is_none());
+        let full = preview_local_counts_bounded(tmp.path(), &cancel, 20,
+            Duration::from_secs(10)).unwrap().unwrap();
+        assert_eq!(full.files, 5);
+        assert_eq!(full.audio, 5);
+        assert!(preview_local_counts_bounded(tmp.path(), &cancel, 20,
+            Duration::ZERO).unwrap().is_none());
     }
 }

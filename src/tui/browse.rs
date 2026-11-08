@@ -11310,6 +11310,20 @@ impl BrowseState {
         self.valid_folder_classification_for_entry(entry)
     }
 
+    /// Match the Browse Info layouts that expose manual Refresh after a
+    /// completed measurement. This is a cached classification lookup only.
+    pub fn info_refresh_allows_completed(&self, entry: &BrowseEntry) -> bool {
+        match entry.kind {
+            EntryKind::ParentDir => true,
+            EntryKind::DvdAudioDir | EntryKind::DvdVideoDir | EntryKind::BlurayDir => true,
+            EntryKind::Directory => self.valid_folder_classification_for_entry(entry)
+                .is_some_and(|classification| matches!(classification.kind,
+                    FolderClassificationKind::Album | FolderClassificationKind::Disc
+                    | FolderClassificationKind::MultiDisc)),
+            _ => false,
+        }
+    }
+
     /// Return the cached classification for the displayed directory itself.
     ///
     /// Direct-child CUE context menus explicitly refresh this parent cache
