@@ -660,11 +660,6 @@ impl DirectorySummaryCacheEntry {
         self.facts.classification_scope = Some(classification_summary_scope(classification.as_ref()));
         self.facts.classification = Some(classification);
     }
-
-    fn set_stats(&mut self, stats: Arc<DirStats>) {
-        self.facts.stats_scope = Some(DirectorySummaryScope::RecursiveBestEffort);
-        self.facts.stats = Some(stats);
-    }
 }
 
 

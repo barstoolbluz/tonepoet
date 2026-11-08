@@ -3335,7 +3335,7 @@ fn compact_media_info(mut info: InfoContent, height: usize) -> InfoContent {
             || (row.first().is_some_and(|span| span.content == MEDIA_INDENT)
                 && row.get(1).is_some_and(|span| span.content.trim() == label))
     };
-    let mut add_group = |label: &str, selected: &mut Vec<usize>, budget: &mut usize| {
+    let add_group = |label: &str, selected: &mut Vec<usize>, budget: &mut usize| {
         if let Some(start) = (body_start..info.lines.len()).find(|&row|
             is_label_row(&info.lines[row], label)) {
             let mut end = start + 1;
@@ -3869,7 +3869,6 @@ struct BrowseMediaHeader {
     title: String,
     artist: Option<String>,
     year: Option<String>,
-    catalog: Option<String>,
 }
 
 /// A conflicting album tag is not authoritative. Missing probe results do not
@@ -3914,7 +3913,7 @@ fn media_header_for_entry(
     } else { entry.name.clone() };
     if entry.is_video_transport_file() {
         return Some(BrowseMediaHeader {
-            title: fallback_title, artist: None, year: None, catalog: None,
+            title: fallback_title, artist: None, year: None,
         });
     }
     let disc = entry.is_disc_source() || classification.is_some_and(|c|
@@ -3933,8 +3932,6 @@ fn media_header_for_entry(
             year: disc_contents.and_then(|c| c.year.as_deref())
                 .or_else(|| meta.and_then(|m| m.year.as_deref()))
                 .filter(|v| !v.trim().is_empty()).map(str::to_owned),
-            catalog: meta.and_then(|m| m.catalog_number.as_deref())
-                .filter(|v| !v.trim().is_empty()).map(str::to_owned),
         });
     }
     let audio = &classification?.audio;
@@ -3943,7 +3940,6 @@ fn media_header_for_entry(
             .unwrap_or(fallback_title),
         artist: album_tag_consensus(browse, audio, |m| m.artist.as_deref()),
         year: album_tag_consensus(browse, audio, |m| m.year.as_deref()),
-        catalog: album_tag_consensus(browse, audio, |m| m.catalog_number.as_deref()),
     })
 }
 
@@ -4013,40 +4009,6 @@ fn push_transport_stream_lines(
             crate::tui::disc_browser::duration_display(summary.duration_secs),
             content_width, theme);
     }
-}
-
-fn folder_audio_headline(
-    audio: &FolderAudioSummary,
-    browse: &BrowseState,
-    include_probe_status: bool,
-) -> String {
-    let rollup = browse.folder_probe_rollup(audio);
-    let mut parts = vec![format!(
-        "{} {}",
-        audio.track_count,
-        if audio.track_count == 1 { "track" } else { "tracks" }
-    )];
-
-    if let Some(format) = audio.dominant_format_label() {
-        if audio.is_mixed_format() {
-            parts.push(format!("{format} + mixed formats"));
-        } else {
-            parts.push(format.to_string());
-        }
-    }
-
-    if rollup.has_mixed_profiles() {
-        parts.push("mixed rates".to_string());
-    } else if let Some(profile) = rollup.dominant_profile_label() {
-        parts.push(profile.to_string());
-    } else if include_probe_status
-        && audio.track_count > 0
-        && browse.folder_audio_summary_probe_work_in_flight(audio)
-    {
-        parts.push("probing...".to_string());
-    }
-
-    parts.join(" · ")
 }
 
 fn push_folder_classification_lines(
@@ -4972,7 +4934,7 @@ fn entry_info_lines(
     } else { entry.name.clone() };
     let header = media_header_for_entry(entry, browse, cached_disc_contents.as_deref())
         .unwrap_or_else(|| BrowseMediaHeader {
-            title: display_name.clone(), artist: None, year: None, catalog: None,
+            title: display_name.clone(), artist: None, year: None,
         });
     let descriptor = if entry.is_disc_source() || entry.is_video_transport_file()
         || (entry.is_child_dir() && !browse.is_in_archive()
