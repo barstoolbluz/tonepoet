@@ -429,7 +429,10 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: 
         if app.browse.info_collapsed {
             draw_collapsed_pane(f, info_area, BrowsePaneId::Info, "info", &mut app.button_map, theme);
         } else {
-            let suppress_artwork_image = !matches!(app.active_overlay, super::app::ActiveOverlay::None)
+            // Context menus are composited after Browse; they must not
+            // remove artwork from the underlying Info pane.
+            let suppress_artwork_image = !matches!(app.active_overlay,
+                super::app::ActiveOverlay::None | super::app::ActiveOverlay::ContextMenu { .. })
                 || app.browse_artwork.popup_open;
             draw_browse_info_with_artwork(
                 f,
@@ -3626,12 +3629,13 @@ fn draw_browse_info_with_artwork(
                 && state.render_image(f, image_area, config.allow_upscale,
                     ImageVerticalPlacement::Bottom);
             if !visible && !suppress_image {
+                // Silent when no embedded/external image exists. Missing tag
+                // diagnostics belong to explicit operations, not Browse Info.
                 state.set_desired_area(image_area, ImageVerticalPlacement::Bottom);
-                let placeholder = super::display_width::fit_prefix(
-                    state.message(), artwork_area.width as usize);
-                f.render_widget(Paragraph::new(placeholder)
-                    .style(theme.muted()), image_area);
             }
+            // The hit region also hosts artwork settings while discovery is
+            // pending or absent. Retain it across async cycles so a second
+            // click can open the image that was initially under the pointer.
             buttons.record_button(TuiButton::BrowseInfoArtworkArea, artwork_area);
         }
     }

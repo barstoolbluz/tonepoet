@@ -3694,6 +3694,15 @@ fn activate_archive_browse_directory(
     }
 }
 
+/// Filesystem images may open in the Browse artwork viewer. Keep mouse and
+/// keyboard admission identical; archive entries and broken links are excluded.
+fn browse_entry_opens_artwork(entry: &super::browse::BrowseEntry, in_archive: bool) -> bool {
+    !in_archive
+        && matches!(entry.kind, crate::convert::classify::EntryKind::OtherFile)
+        && super::browse_artwork::is_supported_image(&entry.path)
+        && (entry.is_regular_file || (entry.is_symlink && !entry.is_broken_symlink))
+}
+
 pub(crate) fn activate_browse_entry(
     app: &mut AppState,
     idx: usize,
@@ -3702,6 +3711,14 @@ pub(crate) fn activate_browse_entry(
     let Some(entry) = app.browse.entries.get(idx).cloned() else {
         return;
     };
+
+    // A direct raster image opens the existing artwork viewer, not Convert.
+    // This route is shared by double-click and Enter, like text-file View.
+    if browse_entry_opens_artwork(&entry, app.browse.is_in_archive()) {
+        app.browse_artwork.open_file_popup(entry.path);
+        app.request_image_preview_repaint();
+        return;
+    }
 
     if entry.is_navigable_dir() && app.browse.is_in_archive() {
         if activate_archive_browse_directory(app, idx, tx) {
@@ -5817,6 +5834,248 @@ mod inline_edit_behavior_tests {
     }
 
     #[test]
+    fn image_filename_double_click_opens_viewer_without_switching_to_convert() {
+        let (tx, _rx) = channel();
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("front.png");
+        image::DynamicImage::new_rgb8(12, 12).save(&image).unwrap();
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
+            image.clone(), "front.png".into(),
+            crate::convert::classify::EntryKind::OtherFile, 100, None,
+        )];
+        app.button_map.record_button(TuiButton::BrowseEntry(0), Rect::new(4, 4, 25, 1));
+        let click = || MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left), column: 8, row: 4,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, click(), &tx);
+        handle_mouse(&mut app, click(), &tx);
+        assert_eq!(app.current_screen, AppScreen::Browse);
+        assert!(app.browse_artwork.is_single_file_popup());
+        assert_eq!(app.browse_artwork.current_label().as_deref(), Some("front.png"));
+    }
+
+    #[test]
+    fn browse_enter_opens_raster_images_via_the_same_viewer_as_double_click() {
+        for filename in ["cover.png", "front.jpg"] {
+            let (tx, _rx) = channel();
+            let temp = tempfile::tempdir().expect("tempdir");
+            let image = temp.path().join(filename);
+            image::DynamicImage::new_rgb8(12, 12).save(&image).expect("image");
+            let mut app = AppState::new_for_test(TonepoetConfig::default());
+            app.current_screen = AppScreen::Browse;
+            app.browse.current_dir = temp.path().to_path_buf();
+            app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
+                image.clone(), filename.to_string(),
+                crate::convert::classify::EntryKind::OtherFile, 100, None,
+            )];
+
+            handle_key(&mut app, key(KeyCode::Enter), &tx);
+
+            assert_eq!(app.current_screen, AppScreen::Browse, "{filename}");
+            assert!(app.browse_artwork.is_single_file_popup(), "{filename}");
+            assert_eq!(app.browse_artwork.current_label().as_deref(), Some(filename));
+            assert!(app.browse.multi_selected.is_empty(), "Enter opens, not marks, images");
+        }
+    }
+
+    #[tokio::test]
+    async fn browse_enter_preserves_nonimage_selection_and_rejects_broken_image_links() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for name in ["track.flac", "payload.unknown"] {
+            let (tx, _rx) = channel();
+            let path = temp.path().join(name);
+            std::fs::write(&path, b"file").expect("fixture");
+            let mut app = AppState::new_for_test(TonepoetConfig::default());
+            app.current_screen = AppScreen::Browse;
+            app.browse.current_dir = temp.path().to_path_buf();
+            app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
+                path.clone(), name.into(), crate::convert::classify::classify_file(&path), 4, None,
+            )];
+            handle_key(&mut app, key(KeyCode::Enter), &tx);
+            assert!(app.browse.multi_selected.contains(&path), "{name}");
+            assert!(!app.browse_artwork.popup_open, "{name}");
+            assert_eq!(app.current_screen, AppScreen::Browse);
+        }
+
+        let broken = temp.path().join("broken.png");
+        let entry = crate::tui::browse::BrowseEntry::new_with_symlink(
+            broken.clone(), "broken.png".into(),
+            crate::convert::classify::EntryKind::OtherFile, 0, None, true, true,
+        );
+        assert!(!browse_entry_opens_artwork(&entry, false));
+        assert!(!browse_entry_opens_artwork(&entry, true),
+            "synthetic archive paths must not open the filesystem viewer");
+        let (tx, _rx) = channel();
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.entries = vec![entry];
+        handle_key(&mut app, key(KeyCode::Enter), &tx);
+        assert!(!app.browse_artwork.popup_open);
+        assert!(app.browse.multi_selected.contains(&broken));
+    }
+
+    #[tokio::test]
+    async fn browse_click_pause_then_double_click_opens_image_audio_and_folder() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let folder = temp.path().join("album");
+        std::fs::create_dir(&folder).expect("folder");
+        let audio = temp.path().join("track.flac");
+        std::fs::write(&audio, b"not real audio; selection only").expect("audio");
+        let image = temp.path().join("cover.png");
+        image::DynamicImage::new_rgb8(8, 8).save(&image).expect("image");
+
+        for (path, kind) in [
+            (folder.clone(), crate::convert::classify::EntryKind::Directory),
+            (audio.clone(), crate::convert::classify::classify_file(&audio)),
+            (image.clone(), crate::convert::classify::EntryKind::OtherFile),
+        ] {
+            let (tx, _rx) = channel();
+            let mut app = AppState::new_for_test(TonepoetConfig::default());
+            app.current_screen = AppScreen::Browse;
+            app.browse.current_dir = temp.path().to_path_buf();
+            app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
+                path.clone(), path.file_name().unwrap().to_string_lossy().into_owned(),
+                kind, 1, None,
+            )];
+            app.button_map.record_button(TuiButton::BrowseEntry(0), Rect::new(4, 4, 24, 1));
+            let click = || MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left), column: 8, row: 4,
+                modifiers: KeyModifiers::NONE,
+            };
+
+            handle_mouse(&mut app, click(), &tx); // initial selection
+            // Simulate a pause without wall-clock sleeps or scheduler dependence.
+            app.last_browse_click = Some((
+                path.clone(), std::time::Instant::now()
+                    - tui_file_picker::DOUBLE_CLICK_WINDOW
+                    - std::time::Duration::from_millis(20),
+            ));
+            handle_mouse(&mut app, click(), &tx); // first click of a new pair
+            assert!(app.browse_inline_edit.is_none(), "premature rename: {}", path.display());
+            assert!(app.pending_browse_rename.as_ref().is_some_and(|(p, _)| p == &path));
+            handle_mouse(&mut app, click(), &tx); // second click of the pair
+            assert!(app.pending_browse_rename.is_none());
+            assert!(app.browse_inline_edit.is_none());
+            assert!(app.browse.multi_selected.is_empty());
+            if path == image {
+                assert!(app.browse_artwork.is_single_file_popup());
+                assert_eq!(app.current_screen, AppScreen::Browse);
+            } else if path == audio {
+                assert_eq!(app.current_screen, AppScreen::Convert);
+            } else {
+                assert_eq!(app.browse.current_dir, folder);
+                assert_eq!(app.current_screen, AppScreen::Browse);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tentative_browse_rename_survives_mouse_up_but_cancels_on_another_action() {
+        let (tx, _rx) = channel();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("track.flac");
+        std::fs::write(&path, b"audio").expect("fixture");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
+            path.clone(), "track.flac".into(),
+            crate::convert::classify::classify_file(&path), 5, None,
+        )];
+        app.button_map.record_button(TuiButton::BrowseEntry(0), Rect::new(4, 4, 24, 1));
+        let mouse = |kind, column, row| MouseEvent {
+            kind, column, row, modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, mouse(MouseEventKind::Down(MouseButton::Left), 8, 4), &tx);
+        app.last_browse_click = Some((
+            path, std::time::Instant::now()
+                - tui_file_picker::DOUBLE_CLICK_WINDOW
+                - std::time::Duration::from_millis(20),
+        ));
+        handle_mouse(&mut app, mouse(MouseEventKind::Down(MouseButton::Left), 8, 4), &tx);
+        assert!(app.pending_browse_rename.is_some());
+        handle_mouse(&mut app, mouse(MouseEventKind::Up(MouseButton::Left), 8, 4), &tx);
+        assert!(app.pending_browse_rename.is_some(), "mouse-up must not cancel rename");
+        handle_mouse(&mut app, mouse(MouseEventKind::Down(MouseButton::Right), 99, 30), &tx);
+        assert!(app.pending_browse_rename.is_none(), "other mouse action cancels rename");
+    }
+
+    #[test]
+    fn info_artwork_double_click_opens_original_image_after_single_click_cycle() {
+        let (tx, _rx) = channel();
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["cover.png", "back.png"] {
+            image::DynamicImage::new_rgb8(8, 8).save(temp.path().join(name)).unwrap();
+        }
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse_artwork.observe(Some(super::super::browse_artwork::ArtworkContext::Album {
+            directory: temp.path().to_path_buf(), selected_audio: None,
+        }));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.browse_artwork.count() != 2 && std::time::Instant::now() < deadline {
+            app.browse_artwork.prepare(&mut app.image_picker, 0, 0,
+                &app.browse.artwork_config);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(app.browse_artwork.count(), 2);
+        let initial = app.browse_artwork.current_label();
+        app.button_map.record_button(TuiButton::BrowseInfoArtworkArea,
+            Rect::new(10, 10, 20, 10));
+        let click = || MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left), column: 15, row: 15,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, click(), &tx);
+        assert!(!app.browse_artwork.popup_open);
+        assert_ne!(app.browse_artwork.current_label(), initial);
+        handle_mouse(&mut app, click(), &tx);
+        assert!(app.browse_artwork.popup_open);
+        assert_eq!(app.browse_artwork.current_label(), initial);
+    }
+
+    #[test]
+    fn viewer_right_click_keeps_image_popup_open_behind_its_context_menu() {
+        let (tx, _rx) = channel();
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("front.png");
+        image::DynamicImage::new_rgb8(8, 8).save(&image).unwrap();
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse_artwork.open_file_popup(image);
+        app.browse_artwork.popup_rect = Rect::new(10, 6, 55, 24);
+        handle_mouse(&mut app, MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right), column: 20, row: 12,
+            modifiers: KeyModifiers::NONE,
+        }, &tx);
+        assert!(app.browse_artwork.popup_open, "right click must not close the viewer");
+        assert!(matches!(app.active_overlay, ActiveOverlay::ContextMenu { .. }));
+        app.prepare_image_preview_protocols();
+        assert!(app.browse_artwork.popup_open, "preparing a menu must not close the viewer");
+        // The text buffer can display both layers together. Terminal-specific
+        // raster protocol compositing still requires a real-terminal check.
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        let theme = app.theme;
+        terminal.draw(|frame| {
+            super::super::browse_artwork::draw_popup(frame, &mut app, theme);
+            super::super::draw_overlays::draw_overlay(frame, &mut app, theme);
+        }).unwrap();
+        let mut text = String::new();
+        for y in 0..40_u16 {
+            for x in 0..100_u16 {
+                text.push_str(terminal.backend().buffer().get(x, y).symbol());
+            }
+            text.push(' ');
+        }
+        assert!(text.contains("Close") && text.contains("view"), "menu must remain visible");
+        assert!(text.contains("front.png"), "image view caption must remain visible");
+    }
+
+    #[test]
     fn browse_file_activation_uses_cached_lexical_routing_and_text_view_policy() {
         for path in [
             std::path::Path::new("track.flac"),
@@ -6100,7 +6359,7 @@ mod inline_edit_behavior_tests {
     #[test]
     fn rejected_double_click_file_does_not_switch_screen_or_install_source() {
         let (tx, _rx) = channel();
-        for name in ["cover.jpg", "payload.unknown"] {
+        for name in ["payload.unknown"] {
             let temp = tempfile::tempdir().expect("tempdir");
             let file = temp.path().join(name);
             std::fs::write(&file, b"not audio").expect("file");
@@ -8993,6 +9252,9 @@ fn handle_browse_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMes
                         app.set_status(
                             "archive entry selected; use Tags & Tagging or Rename for archive-aware changes",
                         );
+                    }
+                    _ if browse_entry_opens_artwork(entry, app.browse.is_in_archive()) => {
+                        activate_browse_entry(app, app.browse.selected_index, tx);
                     }
                     _ => {
                         let open_action = (!app.browse.is_in_archive())
@@ -13730,6 +13992,18 @@ fn browse_context_paths_for_current_entry(app: &AppState) -> Option<Vec<std::pat
         vec![current]
     };
     (!paths.is_empty()).then_some(paths)
+}
+
+/// Right-clicking a live image opens its own context, not the Browse entry
+/// that happens to lie behind the viewer. The popup remains open throughout.
+fn open_browse_artwork_context_menu(app: &mut AppState, x: u16, y: u16) {
+    let entries = super::context_menu::build_browse_artwork_menu(app);
+    app.browse_context_action_paths = None;
+    app.active_overlay = ActiveOverlay::ContextMenu {
+        levels: vec![super::context_menu::MenuLevel::new(entries)],
+        origin: (x, y),
+        anchor_bottom: false,
+    };
 }
 
 /// Build and open the context menu for the current screen. `x, y` is
@@ -71592,6 +71866,15 @@ fn handle_editor_text_mouse(app: &mut AppState, mouse: MouseEvent) -> bool {
 }
 
 pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<AppMessage>) {
+    // Any new pointer action supersedes a tentative delayed-click rename.
+    // BrowseEntry handling below re-arms it only for a genuine delayed repeat.
+    // Do not cancel on Move/Up: those are part of the preceding click gesture.
+    if matches!(
+        mouse.kind,
+        MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+    ) {
+        app.pending_browse_rename = None;
+    }
     app.host_clipboard_interaction_generation = app
         .host_clipboard_interaction_generation
         .checked_add(1)
@@ -71613,7 +71896,14 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 }
             }
             MouseEventKind::Down(MouseButton::Right) => {
-                app.browse_artwork.close_popup();
+                let r = app.browse_artwork.popup_rect;
+                if mouse.column >= r.x && mouse.column < r.right()
+                    && mouse.row >= r.y && mouse.row < r.bottom()
+                {
+                    open_browse_artwork_context_menu(app, mouse.column, mouse.row);
+                } else {
+                    app.browse_artwork.close_popup();
+                }
             }
             MouseEventKind::ScrollUp => { app.browse_artwork.cycle(false); }
             MouseEventKind::ScrollDown => { app.browse_artwork.cycle(true); }
@@ -73100,7 +73390,12 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     if same_path_as_last
                         && !matches!(app.browse.entries[idx].kind, crate::convert::classify::EntryKind::ParentDir)
                     {
-                        begin_browse_inline_rename(app, clicked_path.clone());
+                        // A delayed repeat may be the first click of a new double-click.
+                        // Wait until that pair's window closes before starting rename.
+                        app.pending_browse_rename = Some((
+                            clicked_path.clone(),
+                            now + tui_file_picker::DOUBLE_CLICK_WINDOW,
+                        ));
                     }
 
                     app.last_browse_click = Some((clicked_path.clone(), now));
@@ -73261,7 +73556,14 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 }
             }
             TuiButton::BrowseInfoArtworkArea => {
-                if app.browse_artwork.cycle(true) {
+                if app.double_click.register_click(
+                    TuiButton::BrowseInfoArtworkArea, mouse.column, mouse.row,
+                    tui_file_picker::DOUBLE_CLICK_WINDOW,
+                ) {
+                    if app.browse_artwork.open_inline_popup_on_double_click() {
+                        app.request_image_preview_repaint();
+                    }
+                } else if app.browse_artwork.inline_click() {
                     app.request_image_preview_repaint();
                 }
             }

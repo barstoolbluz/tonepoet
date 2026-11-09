@@ -94,6 +94,67 @@ mod idle_redraw_tests {
     }
 }
 
+#[cfg(test)]
+mod pending_browse_rename_tests {
+    use super::*;
+    use crate::config::TonepoetConfig;
+    use crate::tui::app::BrowseInlineEditTarget;
+    use crate::tui::browse::BrowseEntry;
+
+    #[test]
+    fn deferred_rename_waits_for_window_then_opens_editor_and_requests_redraw() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("track.flac");
+        std::fs::write(&path, b"test").expect("fixture");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![BrowseEntry::new(
+            path.clone(), "track.flac".into(), EntryKind::OtherFile, 4, None,
+        )];
+        app.pending_browse_rename = Some((path.clone(), Instant::now() + Duration::from_secs(10)));
+        assert!(!check_pending_browse_rename(&mut app));
+        assert!(app.pending_browse_rename.is_some());
+        assert!(app.browse_inline_edit.is_none());
+
+        app.pending_browse_rename = Some((path.clone(), Instant::now() - Duration::from_millis(1)));
+        assert!(check_pending_browse_rename(&mut app), "editor transition must request redraw");
+        assert!(app.pending_browse_rename.is_none());
+        assert!(matches!(
+            app.browse_inline_edit.as_ref().map(|edit| &edit.target),
+            Some(BrowseInlineEditTarget::Rename { path: target }) if target == &path
+        ));
+        assert!(!check_pending_browse_rename(&mut app), "timer is one-shot");
+    }
+
+    #[test]
+    fn deferred_rename_never_steals_focus_from_another_entry_or_pane() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first = temp.path().join("first.flac");
+        let second = temp.path().join("second.flac");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![
+            BrowseEntry::new(first.clone(), "first.flac".into(), EntryKind::OtherFile, 0, None),
+            BrowseEntry::new(second, "second.flac".into(), EntryKind::OtherFile, 0, None),
+        ];
+        app.browse.selected_index = 1;
+        app.pending_browse_rename = Some((first.clone(), Instant::now() - Duration::from_millis(1)));
+        assert!(!check_pending_browse_rename(&mut app));
+        assert!(app.pending_browse_rename.is_none());
+        assert!(app.browse_inline_edit.is_none());
+
+        app.browse.selected_index = 0;
+        app.browse_info_focus = Some(crate::tui::app::BrowseInfoFocus::Refresh);
+        app.pending_browse_rename = Some((first, Instant::now() - Duration::from_millis(1)));
+        assert!(!check_pending_browse_rename(&mut app));
+        assert!(app.pending_browse_rename.is_none());
+        assert!(app.browse_inline_edit.is_none());
+    }
+}
+
+
 fn merge_recovered_queue_items(
     app: &mut AppState,
     pending: &mut VecDeque<crate::convert::ConversionItem>,
@@ -208,7 +269,9 @@ pub async fn run_app(
         let items_changed = app.refresh_items();
         app.clamp_selection();
         app.clear_expired_status();
-        check_pending_browse_rename(app);
+        if !input_waiting_at_frame_start {
+            redraw_requested |= check_pending_browse_rename(app);
+        }
         check_batch_probe_debounce(app, &tx);
         check_deemphasis_batch_preflight(app, &tx);
         let _ = super::app::ensure_convert_hdcd_scan(app, &tx);
@@ -1023,43 +1086,42 @@ fn check_search_debounce(
     app.browse.execute_search(Some(tx));
 }
 
-fn check_pending_browse_rename(app: &mut AppState) {
+/// Settle a delayed row click only after the possible double-click has had
+/// its full window. Returns true if the inline editor was opened (needs redraw).
+fn check_pending_browse_rename(app: &mut AppState) -> bool {
     let (path, deadline) = match app.pending_browse_rename.as_ref() {
         Some(pr) => (pr.0.clone(), pr.1),
-        None => return,
+        None => return false,
     };
 
-    // Cancel if the user left the browse screen or has an overlay open already.
-    if app.current_screen != AppScreen::Browse || !matches!(app.active_overlay, ActiveOverlay::None)
+    // The target must still own file-list focus; never reopen an editor over
+    // another overlay, pane, directory, or an existing text edit.
+    if app.current_screen != AppScreen::Browse
+        || !matches!(app.active_overlay, ActiveOverlay::None)
+        || app.browse_inline_edit.is_some()
+        || app.browse_info_focus.is_some()
+        || !app.browse.files_navigation_active()
     {
         app.pending_browse_rename = None;
-        return;
+        return false;
     }
 
     if std::time::Instant::now() < deadline {
-        return;
+        return false;
     }
 
-    // Look up the entry by path in the current view. If it's gone (filtered
-    // out, deleted, or user navigated), drop silently.
-    let entry_info = app
-        .browse
-        .entries
-        .iter()
-        .find(|e| e.path == path)
-        .map(|e| (e.name.clone(), e.kind.clone()));
-
+    // Use the selected row, not merely any matching path in the listing:
+    // asynchronous refreshes and selection changes must not rename an old row.
+    let still_selected = app.browse.selected_entry().is_some_and(|entry| {
+        entry.path == path && !matches!(entry.kind, EntryKind::ParentDir)
+    });
     app.pending_browse_rename = None;
     app.last_browse_click = None;
-
-    match entry_info {
-        Some((_name, kind)) if !matches!(kind, EntryKind::ParentDir) => {
-            super::keybindings::begin_browse_inline_rename(app, path);
-        }
-        _ => {
-            // Entry no longer visible or is ParentDir — silently drop.
-        }
+    if still_selected {
+        super::keybindings::begin_browse_inline_rename(app, path);
+        return true;
     }
+    false
 }
 
 /// Handle async messages from background tasks
