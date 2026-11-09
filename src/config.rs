@@ -181,6 +181,10 @@ fn default_archive_listing_timeout() -> u64 {
 /// considered; filename entries are basenames, never paths or glob patterns.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BrowseArtworkConfig {
+    /// Show album artwork in the Browse Info pane. Direct file viewing stays
+    /// available when this is disabled (e.g. on a remote SSH session).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     #[serde(default = "default_artwork_pane_height")]
     pub pane_height_percent: u8,
     #[serde(default = "default_artwork_popup_height")]
@@ -204,6 +208,7 @@ fn default_artwork_filenames() -> Vec<String> {
 impl Default for BrowseArtworkConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             pane_height_percent: default_artwork_pane_height(),
             popup_height_percent: default_artwork_popup_height(),
             prefer_embedded: true,
@@ -4694,10 +4699,12 @@ mod browse_artwork_config_tests {
     #[test]
     fn defaults_and_custom_preferences_round_trip() {
         let mut config = TonepoetConfig::default();
+        assert!(config.browsing.artwork.enabled);
         assert_eq!(config.browsing.artwork.pane_height_percent, 28);
         assert_eq!(config.browsing.artwork.popup_height_percent, 60);
         assert!(config.browsing.artwork.prefer_embedded);
         assert!(!config.browsing.artwork.allow_upscale);
+        config.browsing.artwork.enabled = false;
         config.browsing.artwork.pane_height_percent = 100;
         config.browsing.artwork.popup_height_percent = 80;
         config.browsing.artwork.prefer_embedded = false;
@@ -4707,6 +4714,17 @@ mod browse_artwork_config_tests {
         assert!(encoded.contains("[browsing.artwork]"));
         let restored: TonepoetConfig = toml::from_str(&encoded).expect("decode browsing preferences");
         assert_eq!(restored.browsing.artwork, config.browsing.artwork);
+    }
+
+    #[test]
+    fn old_artwork_configuration_defaults_to_visible() {
+        // Pre-toggle files have no enabled field; retain their old behavior.
+        let restored: BrowseArtworkConfig = toml::from_str(
+            "pane_height_percent = 40\nprefer_embedded = false\n"
+        ).expect("legacy artwork configuration");
+        assert!(restored.enabled);
+        assert_eq!(restored.pane_height_percent, 40);
+        assert!(!restored.prefer_embedded);
     }
 
     #[test]

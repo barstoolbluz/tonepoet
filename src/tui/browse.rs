@@ -4096,6 +4096,9 @@ impl BrowseState {
         std::mem::swap(&mut self.default_sort_dir, &mut other.default_sort_dir);
         std::mem::swap(&mut self.explore_enabled, &mut other.explore_enabled);
         std::mem::swap(&mut self.info_enabled, &mut other.info_enabled);
+        // Artwork visibility and decoding preferences are Browse-wide layout
+        // settings. A tab switch must not resurrect an older preference.
+        std::mem::swap(&mut self.artwork_config, &mut other.artwork_config);
         std::mem::swap(&mut self.explore_collapsed, &mut other.explore_collapsed);
         std::mem::swap(&mut self.info_collapsed, &mut other.info_collapsed);
         std::mem::swap(&mut self.browse_maximized, &mut other.browse_maximized);
@@ -22894,6 +22897,29 @@ mod tabbed_browsing_tests {
     use super::*;
     use super::tests::{archive_entry_for_tests, archive_listing_for_tests_at};
     use tui_file_picker::{FilePickerClipboardMode, FilesystemClipboard};
+
+    #[test]
+    fn artwork_visibility_and_preferences_follow_browse_tab_switches() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let mut browse = BrowseState::new_with_config_at(
+            &crate::config::BrowsingConfig::default(), first);
+        assert!(browse.open_dir_in_new_tab(second, false));
+        browse.artwork_config.enabled = false;
+        browse.artwork_config.allow_upscale = true;
+
+        assert!(browse.switch_to_tab(1));
+        assert!(!browse.artwork_config.enabled);
+        assert!(browse.artwork_config.allow_upscale);
+        browse.artwork_config.enabled = true;
+
+        assert!(browse.switch_to_tab(0));
+        assert!(browse.artwork_config.enabled);
+        assert!(browse.artwork_config.allow_upscale);
+    }
 
     #[test]
     fn tabs_preserve_independent_view_state_while_clipboard_stays_shared() {

@@ -253,6 +253,15 @@ impl BrowseArtworkState {
     }
 
     pub fn has_image(&self) -> bool { self.decoded.is_some() }
+    /// The popup's hit target and background must match the *displayed*
+    /// pixels, not the larger viewport used to fit them. Both this and
+    /// render_image use the same cell/pixel geometry and scaling policy.
+    fn popup_image_area(&self, viewport: Rect, allow_upscale: bool) -> Option<Rect> {
+        let image = self.decoded.as_ref()?;
+        let rect = fitted_image_area(viewport, image.width(), image.height(), self.font_size,
+            allow_upscale, ImageVerticalPlacement::Center);
+        (rect.width > 0 && rect.height > 0).then_some(rect)
+    }
     pub fn has_candidate(&self) -> bool { self.failed.len() < self.sources.len() }
     pub fn count(&self) -> usize { self.sources.len() }
     pub fn index(&self) -> usize { self.cursor }
@@ -849,6 +858,53 @@ mod tests {
     }
 
     #[test]
+    fn popup_background_and_mouse_hitbox_fit_image_without_a_caption() {
+        use ratatui::{backend::TestBackend, widgets::Paragraph, Terminal};
+
+        let mut app = super::super::app::AppState::new_for_test(
+            crate::config::TonepoetConfig::default());
+        app.browse_artwork.popup_open = true;
+        app.browse_artwork.decoded = Some(DynamicImage::new_rgb8(160, 96));
+        app.browse_artwork.font_size = (8, 12);
+        app.browse_artwork.sources = vec![ArtworkSource::File(PathBuf::from("cover.png"))];
+        let theme = app.theme;
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        terminal.draw(|frame| {
+            frame.render_widget(Paragraph::new("background marker"), Rect::new(0, 0, 20, 1));
+            draw_popup(frame, &mut app, theme);
+        }).unwrap();
+
+        let bounds = popup_rect(Rect::new(0, 0, 100, 40), 60);
+        let fitted = fitted_image_area(bounds, 160, 96, (8, 12), false,
+            ImageVerticalPlacement::Center);
+        assert_eq!(fitted, Rect::new(40, 16, 20, 8));
+        assert_eq!(app.browse_artwork.popup_rect, fitted);
+        let buffer = terminal.backend().buffer();
+        let painted = (0..40_u16).map(|y| (0..100_u16)
+            .map(|x| buffer.get(x, y).symbol().to_owned())
+            .collect::<Vec<_>>().join("")).collect::<Vec<_>>().join("\n");
+        assert!(painted.contains("background marker"),
+            "outside-image screen content must not be covered by a popup panel");
+        assert!(!painted.contains("cover.png"), "filename caption must be absent");
+    }
+
+    #[test]
+    fn loading_viewer_uses_only_a_centered_status_line() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut app = super::super::app::AppState::new_for_test(
+            crate::config::TonepoetConfig::default());
+        app.browse_artwork.open_file_popup(PathBuf::from("cover.png"));
+        let theme = app.theme;
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        terminal.draw(|frame| draw_popup(frame, &mut app, theme)).unwrap();
+        let status = app.browse_artwork.popup_rect;
+        assert_eq!(status.height, 1);
+        assert!(status.width < 80, "loading must not paint the maximum viewport");
+        assert_eq!(status.y, 19);
+    }
+
+    #[test]
     fn embedded_art_is_found_after_first_track_without_a_picture() {
         let tmp = tempfile::tempdir().unwrap();
         let first = tmp.path().join("01 Intro.flac");
@@ -1108,8 +1164,9 @@ mod tests {
 
 }
 
-/// A popup rectangle is always a subset of the terminal (including narrow
-/// terminals and the maximum 100% height option).
+/// Maximum image viewport, always bounded by the terminal (including narrow
+/// terminals and the maximum 100% height option). The *painted popup* uses
+/// the image's fitted rectangle inside this viewport.
 pub fn popup_rect(terminal: Rect, percent: u8) -> Rect {
     let height = percent_height(terminal.height, percent).max(5).min(terminal.height);
     let width = ((u32::from(terminal.width) * 80 + 50) / 100)
@@ -1119,37 +1176,43 @@ pub fn popup_rect(terminal: Rect, percent: u8) -> Rect {
 }
 
 /// A centered modal image view, rendered after the ordinary screen. The
-/// artwork occupies the configurable fraction of the full terminal height;
-/// the same image protocol cache is used for the inline and popup views.
+/// configurable height controls the maximum image size, not a blank panel.
+/// The same image protocol cache is used for inline and popup views.
 pub fn draw_popup(f: &mut ratatui::Frame, app: &mut super::app::AppState,
                   theme: super::theme::Theme) {
     use ratatui::widgets::{Block, Clear, Paragraph};
     use ratatui::style::Style;
 
     let terminal = f.size();
-    if terminal.width < 8 || terminal.height < 5 { return; }
-    let rect = popup_rect(terminal, app.browse.artwork_config.popup_height_percent);
+    if terminal.width < 8 || terminal.height < 5 {
+        app.browse_artwork.popup_rect = Rect::default();
+        return;
+    }
+    let viewport = popup_rect(terminal, app.browse.artwork_config.popup_height_percent);
+    let message_width = {
+        let message = app.browse_artwork.message();
+        let message = if message.is_empty() { "Loading image…" } else { message };
+        super::display_width::width(message)
+    };
+    let rect = app.browse_artwork.popup_image_area(viewport,
+        app.browse.artwork_config.allow_upscale).unwrap_or_else(|| {
+            // While loading or on failure, show just a centered status line;
+            // don't reserve a large empty canvas for a missing image.
+            let width = message_width.min(viewport.width as usize).max(1) as u16;
+            Rect::new(viewport.x + (viewport.width - width) / 2,
+                viewport.y + (viewport.height - 1) / 2, width, 1)
+        });
     app.browse_artwork.popup_rect = rect;
     f.render_widget(Clear, rect);
-    // Borderless image view. The last row is reserved for the filename and
-    // navigation hint, but the artwork itself has no surrounding frame.
+    // No border, label, caption row, or panel outside the image. The backing
+    // color matches the application rather than the old oversized panel.
     f.render_widget(Block::default()
-        .style(Style::default().fg(theme.text).bg(theme.panel_bg)), rect);
-    let image_area = Rect::new(rect.x, rect.y,
-        rect.width, rect.height.saturating_sub(1));
-    let displayed = app.browse_artwork.render_image(f, image_area,
+        .style(Style::default().bg(theme.bg)), rect);
+    let displayed = app.browse_artwork.render_image(f, viewport,
         app.browse.artwork_config.allow_upscale, ImageVerticalPlacement::Center);
     if !displayed {
-        let caption = app.browse_artwork.message();
-        f.render_widget(Paragraph::new(caption).style(theme.muted()), image_area);
+        let message = app.browse_artwork.message();
+        let message = if message.is_empty() { "Loading image…" } else { message };
+        f.render_widget(Paragraph::new(message).style(theme.muted()), rect);
     }
-    let label = app.browse_artwork.current_label().unwrap_or_default();
-    let count = app.browse_artwork.count();
-    let navigation = if count > 1 { " · ←/→ or click: next" } else { "" };
-    let caption = format!(" {}  ({}/{}){} ",
-        label, if count == 0 { 0 } else { app.browse_artwork.index() + 1 },
-        count, navigation);
-    let caption = super::display_width::fit_prefix(&caption, rect.width as usize);
-    f.render_widget(Paragraph::new(caption).style(theme.muted()),
-        Rect::new(rect.x, rect.bottom().saturating_sub(1), rect.width, 1));
 }

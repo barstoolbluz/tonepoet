@@ -17829,7 +17829,8 @@ impl AppState {
             _ => {}
         }
         if self.current_screen == AppScreen::Browse
-            && ((self.browse.info_enabled && !self.browse.info_collapsed)
+            && ((self.browse.info_enabled && !self.browse.info_collapsed
+                && self.browse.artwork_config.enabled)
                 || self.browse_artwork.popup_open)
         {
             changed |= self.browse_artwork.prepare(
