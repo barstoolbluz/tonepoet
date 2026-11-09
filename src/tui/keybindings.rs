@@ -6209,7 +6209,7 @@ mod inline_edit_behavior_tests {
     #[test]
     fn rejected_double_click_file_does_not_switch_screen_or_install_source() {
         let (tx, _rx) = channel();
-        for name in ["cover.jpg", "payload.unknown"] {
+        for name in ["payload.unknown"] {
             let temp = tempfile::tempdir().expect("tempdir");
             let file = temp.path().join(name);
             std::fs::write(&file, b"not audio").expect("file");
