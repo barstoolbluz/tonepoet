@@ -138,6 +138,8 @@ pub enum ContextAction {
     /// Session-only Size-column accounting option.
     ToggleFolderSizeSort,
     BrowseArtworkView,
+    /// View a selected direct image file in Browse's existing artwork popup.
+    BrowseImageFileView(PathBuf),
     BrowseArtworkToggleEmbeddedPreference,
     BrowseArtworkToggleUpscale,
     BrowseArtworkEditPaneHeight,
@@ -1548,6 +1550,13 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
                     ));
                     items.push(direct_cue_repair_utilities_submenu(app, &entry.path));
                 }
+                items.push(separator());
+            }
+            if allow_single_item_actions
+                && super::browse_artwork::is_supported_image(&entry.path)
+                && (entry.is_regular_file || (entry.is_symlink && !entry.is_broken_symlink))
+            {
+                items.push(item("View", ContextAction::BrowseImageFileView(entry.path.clone())));
                 items.push(separator());
             }
             if super::browse::is_viewable_text_file(&entry.path) {
@@ -3207,6 +3216,15 @@ pub fn execute_context_action(
             if app.current_screen == AppScreen::Browse && app.browse_artwork.has_candidate() {
                 app.browse_artwork.popup_open = true;
                 app.browse_artwork.invalidate_protocol();
+                app.request_image_preview_repaint();
+            }
+        }
+        ContextAction::BrowseImageFileView(path) => {
+            if app.current_screen == AppScreen::Browse
+                && !app.browse.is_in_archive()
+                && super::browse_artwork::is_supported_image(&path)
+            {
+                app.browse_artwork.open_file_popup(path);
                 app.request_image_preview_repaint();
             }
         }
@@ -8355,6 +8373,58 @@ mod tests {
             .unwrap_or("");
         assert!(status.contains("ARTIST restored to MusicBrainz values"));
         assert!(status.contains("warning: 1 carrier"));
+    }
+
+    #[test]
+    fn browse_file_view_is_available_only_for_supported_image_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.selected_index = 0;
+
+        for name in ["cover.png", "photo.JPG", "art.webp", "art.GIF", "art.bmp", "art.jpeg"] {
+            let path = temp.path().join(name);
+            std::fs::write(&path, b"image data is decoded only after View").unwrap();
+            app.browse.entries = vec![BrowseEntry::new(
+                path.clone(), name.into(), EntryKind::OtherFile, 0, None,
+            )];
+            let menu = build_browse_entry_menu(&app);
+            assert!(menu.iter().any(|entry| matches!(entry,
+                ContextMenuEntry::Item(ContextMenuItem {
+                    label, action: ContextAction::BrowseImageFileView(view_path), enabled: true, ..
+                }) if label == "View" && view_path == &path)), "{name}");
+        }
+
+        for name in ["image.svg", "image.png.txt", "notes.bin"] {
+            let path = temp.path().join(name);
+            std::fs::write(&path, b"not a supported raster image").unwrap();
+            app.browse.entries = vec![BrowseEntry::new(
+                path, name.into(), EntryKind::OtherFile, 0, None,
+            )];
+            let menu = build_browse_entry_menu(&app);
+            assert!(!menu.iter().any(|entry| matches!(entry,
+                ContextMenuEntry::Item(ContextMenuItem {
+                    action: ContextAction::BrowseImageFileView(_), ..
+                }))), "{name}");
+        }
+    }
+
+    #[test]
+    fn image_view_context_action_opens_existing_popup_with_info_collapsed() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cover.png");
+        std::fs::write(&path, b"image").unwrap();
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.info_enabled = false;
+        let (tx, _rx) = tokio::sync::mpsc::channel(2);
+        execute_context_action(&mut app, ContextAction::BrowseImageFileView(path.clone()), &tx, false);
+        assert!(app.browse_artwork.is_single_file_popup());
+        assert_eq!(app.browse_artwork.count(), 1);
+        assert!(app.prepare_image_preview_protocols() || app.browse_artwork.popup_open);
+        app.browse_artwork.close_popup();
+        assert!(!app.browse_artwork.popup_open);
     }
 
     #[test]

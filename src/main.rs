@@ -3612,12 +3612,12 @@ async fn run_tui(config: TonepoetConfig, cli_paths: Vec<PathBuf>) -> anyhow::Res
     enable_raw_mode()?;
     let mut terminal_restore = TerminalRestoreGuard::armed();
     let mut stdout = std::io::stdout();
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableMouseCapture,
-        EnableBracketedPaste
-    )?;
+    execute!(stdout, EnterAlternateScreen)?;
+    // XTWINOPS cell-size replies go through stdin, not the SSH PTY's ioctl
+    // pixel fields. Query after raw/alternate-screen setup, before mouse
+    // reporting and before crossterm starts consuming terminal input.
+    app.probe_image_cell_size_at_tui_startup();
+    execute!(stdout, EnableMouseCapture, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
