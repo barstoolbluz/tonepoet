@@ -20,7 +20,7 @@ use ratatui::layout::Rect;
 use ratatui_image::{picker::Picker, protocol::StatefulProtocol};
 
 use crate::config::BrowseArtworkConfig;
-use super::browse::{BrowseState, EntryKind};
+use super::browse::{BrowseState, EntryKind, FolderClassificationKind};
 
 const SELECTION_SETTLE: Duration = Duration::from_millis(130);
 const MAX_DIRECTORY_ENTRIES: usize = 32_768;
@@ -38,12 +38,17 @@ pub struct ArtworkContext {
 
 impl ArtworkContext {
     /// Never follow Browse's synthetic `..`, archive members, or symlinks.
-    /// For a selected album folder, discovery may inspect only its direct files.
+    /// A directory must already be classified as album/disc content; ordinary
+    /// folders retain their full Info metrics instead of reserving image rows.
+    /// This is a cached lookup only, never filesystem I/O during rendering.
     pub fn from_browse(browse: &BrowseState) -> Option<Self> {
         if browse.is_in_archive() { return None; }
         let entry = browse.selected_entry()?;
         if entry.is_symlink || matches!(entry.kind, EntryKind::ParentDir) { return None; }
-        if entry.is_child_dir() {
+        if entry.is_child_dir() && browse.current_folder_classification().is_some_and(|c|
+            matches!(c.kind, FolderClassificationKind::Album | FolderClassificationKind::Disc
+                | FolderClassificationKind::MultiDisc))
+        {
             return Some(Self { directory: entry.path.clone(), selected_audio: None });
         }
         if entry.is_audio() && entry.is_regular_file {

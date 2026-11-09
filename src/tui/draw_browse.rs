@@ -3493,9 +3493,10 @@ fn draw_browse_info_with_artwork(
     ));
 
     let content_height = (area.height as usize).saturating_sub(2);
-    let has_album_context = ArtworkContext::from_browse(browse).is_some();
+    let artwork_context = ArtworkContext::from_browse(browse);
+    let has_album_context = artwork_context.is_some();
     if let Some((state, _)) = artwork.as_mut() {
-        state.observe(ArtworkContext::from_browse(browse));
+        state.observe(artwork_context);
     }
     let artwork_height = if has_album_context {
         artwork.as_ref().map_or(0, |(_, config)|
@@ -9423,13 +9424,105 @@ mod browse_info_artwork_presentation_tests {
     use super::*;
     use ratatui::{backend::TestBackend, Terminal};
 
+    fn classify(browse: &mut BrowseState, entry: &BrowseEntry, kind: FolderClassificationKind) {
+        let identity = crate::tui::browse::ProbeCacheIdentity::from_entry(entry);
+        browse.insert_folder_classification_for_test(entry.path.clone(), FolderContentClassification {
+            kind, identity, audio: FolderAudioSummary::default(),
+            units: Vec::new(), unit_count: 1, collection_many: false,
+            io_budget_exhausted: false, disc_marker: None,
+            embedded_cue_availability: crate::tui::probe::EmbeddedCueAvailability::Unknown,
+            cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
+            cue_repair_availability: crate::tui::browse::CueRepairAvailability::Unknown,
+            cue_file_reference_repairs: Default::default(),
+        });
+    }
+
+    #[test]
+    fn artwork_context_only_for_classified_album_folders_and_audio_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let entry = BrowseEntry::new(temp.path().join("Album"), "Album".into(),
+            EntryKind::Directory, 0, None);
+        let mut browse = BrowseState::new();
+        browse.entries = vec![entry.clone()];
+        assert!(ArtworkContext::from_browse(&browse).is_none(), "unclassified folder");
+        for kind in [FolderClassificationKind::Unknown, FolderClassificationKind::Collection] {
+            classify(&mut browse, &entry, kind);
+            assert!(ArtworkContext::from_browse(&browse).is_none(), "{kind:?}");
+        }
+        for kind in [FolderClassificationKind::Album, FolderClassificationKind::Disc,
+            FolderClassificationKind::MultiDisc]
+        {
+            classify(&mut browse, &entry, kind);
+            assert_eq!(ArtworkContext::from_browse(&browse), Some(ArtworkContext {
+                directory: entry.path.clone(), selected_audio: None,
+            }), "{kind:?}");
+        }
+        // A classification from an earlier listing identity is not authoritative.
+        let mut changed = entry.clone();
+        changed.size = 1;
+        browse.entries = vec![changed];
+        assert!(ArtworkContext::from_browse(&browse).is_none(), "stale classification");
+
+        let audio = BrowseEntry::new(entry.path.join("01.flac"), "01.flac".into(),
+            EntryKind::AudioFile(crate::convert::formats::AudioFormat::Flac), 0, None);
+        browse.entries = vec![audio.clone()];
+        assert_eq!(ArtworkContext::from_browse(&browse), Some(ArtworkContext {
+            directory: entry.path, selected_audio: Some(audio.path),
+        }));
+    }
+
+    #[test]
+    fn plain_folder_keeps_compact_metrics_and_has_no_artwork_hitbox() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("Collection");
+        let album = temp.path().join("Album");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::create_dir(&album).unwrap();
+        let entry = BrowseEntry::new(folder.clone(), "Collection".into(),
+            EntryKind::Directory, 0, None);
+        let mut app = super::directory_info_presentation_tests::directory_layout_app(entry.clone());
+        app.directory_accounting.views.get_mut(&folder).unwrap().local = None;
+
+        let check_plain = |app: &mut AppState| {
+            let (rows, _, hit) = super::directory_info_presentation_tests::render_directory_browse_size(
+                app, 66, 24);
+            for label in ["Folders", "Files", "Audio files", "Total size", "Refresh"] {
+                assert!(rows.iter().any(|row| row.contains(label)),
+                    "{label} lost in compact plain folder: {rows:?}");
+            }
+            assert_eq!(rows.join("\n").matches("unknown").count(), 4,
+                "an unknown value was clipped: {rows:?}");
+            assert!(hit.is_some(), "Refresh must remain clickable");
+            assert!(app.button_map.find_button_rect(&TuiButton::BrowseInfoArtworkArea).is_none());
+            assert!(!rows.join("\n").contains("Finding artwork"));
+            assert_eq!(app.browse_artwork.message(), "");
+        };
+        check_plain(&mut app);
+        for kind in [FolderClassificationKind::Unknown, FolderClassificationKind::Collection] {
+            classify(&mut app.browse, &entry, kind);
+            check_plain(&mut app);
+        }
+
+        // Recognized album content restores the image area, even at compact sizes.
+        let album_entry = BrowseEntry::new(album, "Album".into(), EntryKind::Directory, 0, None);
+        classify(&mut app.browse, &album_entry, FolderClassificationKind::Album);
+        app.browse.entries = vec![album_entry];
+        let _ = super::directory_info_presentation_tests::render_directory_browse_size(&mut app, 66, 24);
+        assert!(app.button_map.find_button_rect(&TuiButton::BrowseInfoArtworkArea).is_some());
+
+        // Leaving that album must give the entire Info pane back to plain-folder metrics.
+        app.browse.entries = vec![entry];
+        check_plain(&mut app);
+    }
+
     #[test]
     fn artwork_hit_target_is_bounded_to_lower_percentage_and_can_fill_pane() {
         let temp = tempfile::tempdir().unwrap();
         let entry = BrowseEntry::new(temp.path().into(), "Album".into(),
             EntryKind::Directory, 0, None);
         let mut browse = BrowseState::new();
-        browse.entries = vec![entry];
+        browse.entries = vec![entry.clone()];
+        classify(&mut browse, &entry, FolderClassificationKind::Album);
         browse.selected_index = 0;
         let mut state = BrowseArtworkState::default();
         let accounting = crate::directory_accounting::AccountingService::new(None);
