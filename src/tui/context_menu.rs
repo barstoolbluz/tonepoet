@@ -137,6 +137,13 @@ pub enum ContextAction {
     BrowseTabReopenClosed,
     /// Session-only Size-column accounting option.
     ToggleFolderSizeSort,
+    BrowseArtworkView,
+    BrowseArtworkToggleEmbeddedPreference,
+    BrowseArtworkToggleUpscale,
+    BrowseArtworkEditPaneHeight,
+    BrowseArtworkEditPopupHeight,
+    BrowseArtworkEditFilenames,
+    BrowseArtworkReload,
     /// Toggle the current entry's selection.
     Select,
     /// Select all non-ParentDir entries.
@@ -3137,13 +3144,42 @@ fn explicit_convert_cue_policy_for_selection(
     None
 }
 
-/// Execute a context action. Delegates to existing command/action
-/// functions where possible.
+/// An image-region menu: unrelated Browse context actions are never offered
+/// when the pointer is over album artwork.
+pub fn build_browse_artwork_menu(app: &AppState) -> Vec<ContextMenuEntry> {
+    let config = &app.browse.artwork_config;
+    vec![
+        item_enabled("View", ContextAction::BrowseArtworkView,
+            app.browse_artwork.has_candidate()),
+        ContextMenuEntry::Submenu {
+            label: "Settings".into(),
+            children: vec![
+                item(&format!("{} Prefer embedded artwork",
+                    if config.prefer_embedded { "☑" } else { "☐" }),
+                    ContextAction::BrowseArtworkToggleEmbeddedPreference),
+                item(&format!("{} Allow image enlargement",
+                    if config.allow_upscale { "☑" } else { "☐" }),
+                    ContextAction::BrowseArtworkToggleUpscale),
+                separator(),
+                item(&format!("Info artwork height… ({}%)", config.pane_height_percent),
+                    ContextAction::BrowseArtworkEditPaneHeight),
+                item(&format!("View artwork height… ({}%)", config.popup_height_percent),
+                    ContextAction::BrowseArtworkEditPopupHeight),
+                item("Preferred artwork filenames…", ContextAction::BrowseArtworkEditFilenames),
+                separator(),
+                item("Reload artwork", ContextAction::BrowseArtworkReload),
+            ],
+        },
+    ]
+}
+
 pub fn build_browse_size_header_menu(enabled: bool) -> Vec<ContextMenuEntry> {
     vec![item(if enabled { "☑ Calculate folder sizes" } else { "☐ Calculate folder sizes" },
         ContextAction::ToggleFolderSizeSort)]
 }
 
+/// Execute a context action. Delegates to existing command/action
+/// functions where possible.
 pub fn execute_context_action(
     app: &mut AppState,
     action: ContextAction,
@@ -3167,6 +3203,50 @@ pub fn execute_context_action(
         }
     }
     match action {
+        ContextAction::BrowseArtworkView => {
+            if app.current_screen == AppScreen::Browse && app.browse_artwork.has_candidate() {
+                app.browse_artwork.popup_open = true;
+                app.browse_artwork.invalidate_protocol();
+                app.request_image_preview_repaint();
+            }
+        }
+        ContextAction::BrowseArtworkToggleEmbeddedPreference => {
+            app.browse.artwork_config.prefer_embedded = !app.browse.artwork_config.prefer_embedded;
+            app.browse_artwork.invalidate();
+            persist_browse_config(app);
+        }
+        ContextAction::BrowseArtworkToggleUpscale => {
+            app.browse.artwork_config.allow_upscale = !app.browse.artwork_config.allow_upscale;
+            app.browse_artwork.invalidate_protocol();
+            persist_browse_config(app);
+        }
+        ContextAction::BrowseArtworkEditPaneHeight
+        | ContextAction::BrowseArtworkEditPopupHeight
+        | ContextAction::BrowseArtworkEditFilenames => {
+            let (target, value, label) = match action {
+                ContextAction::BrowseArtworkEditPaneHeight => (
+                    TextEditTarget::BrowseArtworkPaneHeight,
+                    app.browse.artwork_config.pane_height_percent.to_string(),
+                    "Browse Info artwork height (%)"),
+                ContextAction::BrowseArtworkEditPopupHeight => (
+                    TextEditTarget::BrowseArtworkPopupHeight,
+                    app.browse.artwork_config.popup_height_percent.to_string(),
+                    "Browse artwork View height (%)"),
+                ContextAction::BrowseArtworkEditFilenames => (
+                    TextEditTarget::BrowseArtworkFilenames,
+                    app.browse.artwork_config.filenames.join(", "),
+                    "Preferred artwork names (comma-separated, priority order)"),
+                _ => unreachable!(),
+            };
+            app.active_overlay = ActiveOverlay::TextEdit {
+                input: super::text_input::TextInputState::new_selected(value),
+                target,
+                label: label.into(),
+            };
+        }
+        ContextAction::BrowseArtworkReload => {
+            app.browse_artwork.invalidate();
+        }
         ContextAction::ToggleFolderSizeSort => {
             let enabled = !app.browse.folder_size_sort;
             app.browse.set_folder_size_sort(enabled, Some(tx));

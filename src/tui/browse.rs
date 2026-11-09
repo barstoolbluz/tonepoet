@@ -2754,6 +2754,8 @@ pub struct BrowseState {
     /// Never written to BrowsingConfig. The toggle follows the active tab;
     /// measurements and cursor state remain local to each listing.
     pub folder_size_sort: bool,
+    /// Persisted Browse artwork selection, sizing, and filename preferences.
+    pub artwork_config: crate::config::BrowseArtworkConfig,
     folder_size_values: HashMap<PathBuf, u128>,
     folder_size_sort_root: Option<PathBuf>,
     folder_size_sort_generation: u64,
@@ -3906,6 +3908,7 @@ impl BrowseState {
             sort_by,
             sort_dir,
             folder_size_sort: false,
+            artwork_config: config.artwork.clone(),
             folder_size_values: HashMap::new(),
             folder_size_sort_root: None,
             folder_size_sort_generation: 0,
@@ -4581,6 +4584,7 @@ impl BrowseState {
             layout_explore: if self.explore_collapsed { "collapsed" } else { "open" }.to_string(),
             layout_info: if self.info_collapsed { "collapsed" } else { "open" }.to_string(),
             search_result_cap: self.search_result_cap,
+            artwork: self.artwork_config.clone(),
         }
         .normalized()
     }
@@ -4717,6 +4721,7 @@ impl BrowseState {
         self.info_collapsed = config.layout_info == "collapsed";
         self.browse_maximized = self.explore_collapsed && self.info_collapsed;
         self.search_result_cap = config.search_result_cap;
+        self.artwork_config = config.artwork;
         self.repair_navigation_pane_visibility();
         self.close_options_menu();
 
@@ -15391,6 +15396,22 @@ mod tests {
     use std::io::{Seek, SeekFrom, Write};
     use std::sync::{atomic::AtomicBool, Arc};
     use std::time::Duration;
+
+    #[test]
+    fn artwork_policy_survives_browse_config_capture_and_reapply() {
+        let mut cfg = crate::config::BrowsingConfig::default();
+        cfg.artwork.prefer_embedded = false;
+        cfg.artwork.allow_upscale = true;
+        cfg.artwork.pane_height_percent = 100;
+        cfg.artwork.filenames = vec!["Front.jpg".into(), "folder.png".into()];
+        let state = BrowseState::new_with_config(&cfg);
+        assert_eq!(state.artwork_config, cfg.artwork);
+        let capture = state.capture_browsing_config();
+        assert_eq!(capture.artwork, cfg.artwork);
+        let mut restored = BrowseState::new();
+        restored.apply_browsing_config(&capture);
+        assert_eq!(restored.artwork_config, cfg.artwork);
+    }
 
     #[test]
     fn rf64_browse_tag_only_search_and_tag_sort_use_real_metadata() {

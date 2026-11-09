@@ -12,6 +12,7 @@ use ratatui::{
 };
 
 use super::app::{AppState, BrowseInfoFocus, BrowseInlineEditState, BrowseInlineEditTarget};
+use super::browse_artwork::{ArtworkContext, BrowseArtworkState, percent_height};
 use super::browse::{BrowseColumn, BrowseDirectorySummaryColdWorkPolicy, BrowseEntry, BrowseOptionsMenu, BrowsePaneId, BrowseState, CachedInfo, EntryKind, FolderAudioSummary, FolderClassificationKind, FolderContentClassification, FormatFilter, SortBy, SortDir};
 use super::button_map::{ButtonRenderMap, ScrollbarSurface, TuiButton};
 use super::draw_footer::draw_footer;
@@ -428,7 +429,9 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: 
         if app.browse.info_collapsed {
             draw_collapsed_pane(f, info_area, BrowsePaneId::Info, "info", &mut app.button_map, theme);
         } else {
-            draw_browse_info(
+            let suppress_artwork_image = !matches!(app.active_overlay, super::app::ActiveOverlay::None)
+                || app.browse_artwork.popup_open;
+            draw_browse_info_with_artwork(
                 f,
                 info_area,
                 &app.browse,
@@ -438,6 +441,8 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: 
                 &mut app.button_map,
                 hover,
                 theme,
+                Some((&mut app.browse_artwork, &app.browse.artwork_config)),
+                suppress_artwork_image,
             );
             app.button_map.record_button(TuiButton::BrowsePaneToggle(BrowsePaneId::Info), Rect::new(info_area.x + 1, info_area.y, 7.min(info_area.width.saturating_sub(2)), 1));
         }
@@ -3433,6 +3438,7 @@ fn info_pill_offset(spans: &[Span<'_>], caption: &str) -> Option<(usize, usize)>
     None
 }
 
+#[cfg(test)]
 fn draw_browse_info(
     f: &mut Frame,
     area: Rect,
@@ -3443,6 +3449,23 @@ fn draw_browse_info(
     buttons: &mut ButtonRenderMap,
     hover: Option<super::button_map::TuiButton>,
     theme: super::theme::Theme,
+) {
+    draw_browse_info_with_artwork(
+        f, area, browse, accounting, inline_edit, info_focus, buttons, hover, theme, None, false);
+}
+
+fn draw_browse_info_with_artwork(
+    f: &mut Frame,
+    area: Rect,
+    browse: &BrowseState,
+    accounting: &crate::directory_accounting::AccountingService,
+    inline_edit: Option<&BrowseInlineEditState>,
+    info_focus: Option<BrowseInfoFocus>,
+    buttons: &mut ButtonRenderMap,
+    hover: Option<super::button_map::TuiButton>,
+    theme: super::theme::Theme,
+    mut artwork: Option<(&mut BrowseArtworkState, &crate::config::BrowseArtworkConfig)>,
+    suppress_image: bool,
 ) {
     if area.height < 4 || area.width < 15 {
         return;
@@ -3470,6 +3493,16 @@ fn draw_browse_info(
     ));
 
     let content_height = (area.height as usize).saturating_sub(2);
+    let artwork_context = ArtworkContext::from_browse(browse);
+    let has_album_context = artwork_context.is_some();
+    if let Some((state, _)) = artwork.as_mut() {
+        state.observe(artwork_context);
+    }
+    let artwork_height = if has_album_context {
+        artwork.as_ref().map_or(0, |(_, config)|
+            percent_height(content_height as u16, config.pane_height_percent) as usize)
+    } else { 0 };
+    let text_height = content_height.saturating_sub(artwork_height);
 
     let mut lines: Vec<Line> = vec![top_line];
 
@@ -3520,14 +3553,14 @@ fn draw_browse_info(
             matches!(c.kind, FolderClassificationKind::Album | FolderClassificationKind::Disc |
                 FolderClassificationKind::MultiDisc)))
     });
-    let compact_media = media_selection && (content_height <= MEDIA_COMPACT_MAX_CONTENT_ROWS
-        || info.lines.len() > content_height);
+    let compact_media = media_selection && (text_height <= MEDIA_COMPACT_MAX_CONTENT_ROWS
+        || info.lines.len() > text_height);
     let compact_directory = !media_selection && physical_folder
-        && info.lines.len() > content_height;
+        && info.lines.len() > text_height;
     let info = if media_selection {
-        compact_media_info(info, content_height)
+        compact_media_info(info, text_height)
     } else if compact_directory {
-        compact_directory_info(info, content_height, content_width)
+        compact_directory_info(info, text_height, content_width)
     } else { info };
     // Never reinterpret a compact layout as a four-row header: its rows are
     // reindexed and its hitboxes already refer to that compact ordering.
@@ -3537,12 +3570,12 @@ fn draw_browse_info(
     let start_row = 0;
 
     // Render content lines with border
-    for line_spans in info.lines.iter().skip(start_row).take(content_height) {
+    for line_spans in info.lines.iter().skip(start_row).take(text_height) {
         lines.push(bordered_line(border_color, w, line_spans.clone(), theme));
     }
 
     // Fill remaining
-    let rendered = info.lines.len().saturating_sub(start_row).min(content_height);
+    let rendered = info.lines.len().saturating_sub(start_row).min(text_height);
     for _ in rendered..content_height {
         lines.push(bordered_line(border_color, w, vec![], theme));
     }
@@ -3552,8 +3585,44 @@ fn draw_browse_info(
     let paragraph = Paragraph::new(lines);
     f.render_widget(paragraph, area);
 
+    if artwork_height > 0 {
+        if let Some((state, config)) = artwork.as_mut() {
+            let artwork_area = Rect::new(area.x.saturating_add(1),
+                area.y.saturating_add(1 + text_height as u16),
+                area.width.saturating_sub(2), artwork_height as u16);
+            // At 100%, the user's allocation belongs entirely to the image;
+            // intermediate percentages reserve a row for source/cycle status.
+            let show_caption = artwork_area.height > 1 && config.pane_height_percent < 100;
+            let image_area = if show_caption {
+                Rect::new(artwork_area.x, artwork_area.y,
+                    artwork_area.width, artwork_area.height - 1)
+            } else { artwork_area };
+            let visible = !suppress_image
+                && state.render_image(f, image_area, config.allow_upscale);
+            if !visible && !suppress_image {
+                state.set_desired_area(image_area);
+                let placeholder = super::display_width::fit_prefix(
+                    state.message(), artwork_area.width as usize);
+                f.render_widget(Paragraph::new(placeholder)
+                    .style(theme.muted()), image_area);
+            }
+            if show_caption {
+                let caption = state.current_label().unwrap_or_else(||
+                    "Artwork · left-click to cycle · right-click for menu".to_string());
+                let tail = if state.count() > 1 {
+                    format!("  [{}/{}]", state.index() + 1, state.count())
+                } else { String::new() };
+                let caption = super::display_width::fit_prefix(
+                    &format!(" {caption}{tail}"), artwork_area.width as usize);
+                f.render_widget(Paragraph::new(caption).style(theme.muted()),
+                    Rect::new(artwork_area.x, artwork_area.bottom() - 1, artwork_area.width, 1));
+            }
+            buttons.record_button(TuiButton::BrowseInfoArtworkArea, artwork_area);
+        }
+    }
+
     if let Some((line_idx, col)) = info.inline_cursor {
-        if line_idx >= start_row && line_idx - start_row < content_height {
+        if line_idx >= start_row && line_idx - start_row < text_height {
             f.set_cursor(area.x + 1 + col, area.y + 1 + (line_idx - start_row) as u16);
         }
     }
@@ -3562,7 +3631,7 @@ fn draw_browse_info(
     // lines that fit within the visible content area.
     let info_y_start = area.y + 1; // below top border
     for (field, line_idx) in &info.meta_field_rows {
-        if *line_idx >= start_row && *line_idx - start_row < content_height {
+        if *line_idx >= start_row && *line_idx - start_row < text_height {
             buttons.record_button(
                 TuiButton::BrowseInfoMeta(*field),
                 Rect::new(
@@ -3579,7 +3648,7 @@ fn draw_browse_info(
     // Streams when available. Locate it from its spans rather than assuming the
     // C4 directory indent of three columns.
     if let Some(row) = info.refresh_pill_row {
-        if row >= start_row && row - start_row < content_height {
+        if row >= start_row && row - start_row < text_height {
             let spans = &info.lines[row];
             let pill = if spans.iter().any(|s| s.content == " Cancel ") {
                 " Cancel "
@@ -3594,7 +3663,7 @@ fn draw_browse_info(
     }
     // Register pill buttons if they fit.
     if let Some(row) = info.analyze_pill_row {
-        if row >= start_row && row - start_row < content_height {
+        if row >= start_row && row - start_row < text_height {
             buttons.record_button(
                 TuiButton::BrowseInfoAnalyze,
                 Rect::new(area.x + 1, info_y_start + (row - start_row) as u16, (w - 2) as u16, 1),
@@ -3602,7 +3671,7 @@ fn draw_browse_info(
         }
     }
     if let Some(row) = info.edit_tags_pill_row {
-        if row >= start_row && row - start_row < content_height {
+        if row >= start_row && row - start_row < text_height {
             buttons.record_button(
                 TuiButton::BrowseInfoEditTags,
                 Rect::new(area.x + 1, info_y_start + (row - start_row) as u16, (w - 2) as u16, 1),
@@ -3610,7 +3679,7 @@ fn draw_browse_info(
         }
     }
     if let Some(row) = info.audio_streams_pill_row {
-        if row >= start_row && row - start_row < content_height {
+        if row >= start_row && row - start_row < text_height {
             if let Some(spans) = info.lines.get(row) {
                 if let Some(pill) = spans.last().filter(|span| span.content == " Streams… ") {
                     let left = spans[..spans.len() - 1].iter()
@@ -9347,4 +9416,140 @@ mod directory_info_presentation_tests {
         assert!(!child_render.contains("Contents size"));
     }
 
+}
+
+
+#[cfg(test)]
+mod browse_info_artwork_presentation_tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn classify(browse: &mut BrowseState, entry: &BrowseEntry, kind: FolderClassificationKind) {
+        let identity = crate::tui::browse::ProbeCacheIdentity::from_entry(entry);
+        browse.insert_folder_classification_for_test(entry.path.clone(), FolderContentClassification {
+            kind, identity, audio: FolderAudioSummary::default(),
+            units: Vec::new(), unit_count: 1, collection_many: false,
+            io_budget_exhausted: false, disc_marker: None,
+            embedded_cue_availability: crate::tui::probe::EmbeddedCueAvailability::Unknown,
+            cue_import_availability: crate::tui::probe::CueImportAvailability::Unknown,
+            cue_repair_availability: crate::tui::browse::CueRepairAvailability::Unknown,
+            cue_file_reference_repairs: Default::default(),
+        });
+    }
+
+    #[test]
+    fn artwork_context_only_for_classified_album_folders_and_audio_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let entry = BrowseEntry::new(temp.path().join("Album"), "Album".into(),
+            EntryKind::Directory, 0, None);
+        let mut browse = BrowseState::new();
+        browse.entries = vec![entry.clone()];
+        assert!(ArtworkContext::from_browse(&browse).is_none(), "unclassified folder");
+        for kind in [FolderClassificationKind::Unknown, FolderClassificationKind::Collection] {
+            classify(&mut browse, &entry, kind);
+            assert!(ArtworkContext::from_browse(&browse).is_none(), "{kind:?}");
+        }
+        for kind in [FolderClassificationKind::Album, FolderClassificationKind::Disc,
+            FolderClassificationKind::MultiDisc]
+        {
+            classify(&mut browse, &entry, kind);
+            assert_eq!(ArtworkContext::from_browse(&browse), Some(ArtworkContext {
+                directory: entry.path.clone(), selected_audio: None,
+            }), "{kind:?}");
+        }
+        // A classification from an earlier listing identity is not authoritative.
+        let mut changed = entry.clone();
+        changed.size = 1;
+        browse.entries = vec![changed];
+        assert!(ArtworkContext::from_browse(&browse).is_none(), "stale classification");
+
+        let audio = BrowseEntry::new(entry.path.join("01.flac"), "01.flac".into(),
+            EntryKind::AudioFile(crate::convert::formats::AudioFormat::Flac), 0, None);
+        browse.entries = vec![audio.clone()];
+        assert_eq!(ArtworkContext::from_browse(&browse), Some(ArtworkContext {
+            directory: entry.path, selected_audio: Some(audio.path),
+        }));
+    }
+
+    #[test]
+    fn plain_folder_keeps_compact_metrics_and_has_no_artwork_hitbox() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("Collection");
+        let album = temp.path().join("Album");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::create_dir(&album).unwrap();
+        let entry = BrowseEntry::new(folder.clone(), "Collection".into(),
+            EntryKind::Directory, 0, None);
+        let mut app = super::directory_info_presentation_tests::directory_layout_app(entry.clone());
+        app.directory_accounting.views.get_mut(&folder).unwrap().local = None;
+
+        let check_plain = |app: &mut AppState| {
+            let (rows, _, hit) = super::directory_info_presentation_tests::render_directory_browse_size(
+                app, 66, 24);
+            for label in ["Folders", "Files", "Audio files", "Total size", "Refresh"] {
+                assert!(rows.iter().any(|row| row.contains(label)),
+                    "{label} lost in compact plain folder: {rows:?}");
+            }
+            assert_eq!(rows.join("\n").matches("unknown").count(), 4,
+                "an unknown value was clipped: {rows:?}");
+            assert!(hit.is_some(), "Refresh must remain clickable");
+            assert!(app.button_map.find_button_rect(&TuiButton::BrowseInfoArtworkArea).is_none());
+            assert!(!rows.join("\n").contains("Finding artwork"));
+            assert_eq!(app.browse_artwork.message(), "");
+        };
+        check_plain(&mut app);
+        for kind in [FolderClassificationKind::Unknown, FolderClassificationKind::Collection] {
+            classify(&mut app.browse, &entry, kind);
+            check_plain(&mut app);
+        }
+
+        // Recognized album content restores the image area, even at compact sizes.
+        let album_entry = BrowseEntry::new(album, "Album".into(), EntryKind::Directory, 0, None);
+        classify(&mut app.browse, &album_entry, FolderClassificationKind::Album);
+        app.browse.entries = vec![album_entry];
+        let _ = super::directory_info_presentation_tests::render_directory_browse_size(&mut app, 66, 24);
+        assert!(app.button_map.find_button_rect(&TuiButton::BrowseInfoArtworkArea).is_some());
+
+        // Leaving that album must give the entire Info pane back to plain-folder metrics.
+        app.browse.entries = vec![entry];
+        check_plain(&mut app);
+    }
+
+    #[test]
+    fn artwork_hit_target_is_bounded_to_lower_percentage_and_can_fill_pane() {
+        let temp = tempfile::tempdir().unwrap();
+        let entry = BrowseEntry::new(temp.path().into(), "Album".into(),
+            EntryKind::Directory, 0, None);
+        let mut browse = BrowseState::new();
+        browse.entries = vec![entry.clone()];
+        classify(&mut browse, &entry, FolderClassificationKind::Album);
+        browse.selected_index = 0;
+        let mut state = BrowseArtworkState::default();
+        let accounting = crate::directory_accounting::AccountingService::new(None);
+        let mut terminal = Terminal::new(TestBackend::new(72, 40)).unwrap();
+        let mut buttons = ButtonRenderMap::new();
+        let theme = crate::tui::theme::theme_by_slug_or_default(
+            crate::tui::theme::default_theme_slug());
+        let mut config = crate::config::BrowseArtworkConfig::default();
+        for (percent, expected_start) in [(28, 28), (100, 1)] {
+            config.pane_height_percent = percent;
+            buttons.clear();
+            terminal.draw(|f| draw_browse_info_with_artwork(
+                f, Rect::new(0, 0, 72, 40), &browse, &accounting,
+                None, None, &mut buttons, None, theme, Some((&mut state, &config)), false,
+            )).unwrap();
+            let target = buttons.find_button_rect(&TuiButton::BrowseInfoArtworkArea)
+                .expect("artwork region must have a hit target even before decoding");
+            assert_eq!(target.height, percent_height(38, percent));
+            assert_eq!(target.y, expected_start);
+            assert_eq!(buttons.find_button_at(target.x, target.y),
+                Some(TuiButton::BrowseInfoArtworkArea));
+            assert_eq!(buttons.find_button_at(target.x, target.bottom() - 1),
+                Some(TuiButton::BrowseInfoArtworkArea));
+            if target.y > 1 {
+                assert_ne!(buttons.find_button_at(target.x, target.y - 1),
+                    Some(TuiButton::BrowseInfoArtworkArea));
+            }
+        }
+    }
 }
