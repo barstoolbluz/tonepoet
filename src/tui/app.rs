@@ -16051,11 +16051,10 @@ pub struct AppState {
     pub last_disc_browser_stream_click: Option<(usize, std::time::Instant)>,
 
     /// Pending rename action: a same-path click outside the double-click window
-    /// schedules a rename for `deadline`. A subsequent click before the deadline
-    /// cancels the pending rename (e.g. to allow the second click to complete a
-    /// double-click). When the deadline passes without cancellation, the event
-    /// loop tick fires the rename overlay. Matches Windows/macOS "rename-on-
-    /// click-after-pause, but double-click-to-open preempts" semantics.
+    /// schedules a rename after one further double-click interval. Another
+    /// click within that interval cancels the rename and can activate the row.
+    /// The event loop opens the inline editor only after the deadline, provided
+    /// the same row still owns file-list focus.
     pub pending_browse_rename: Option<(std::path::PathBuf, std::time::Instant)>,
 
     /// Active inline editor in the Browse screen (file-list rename or info-pane metadata).
