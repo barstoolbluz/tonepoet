@@ -17788,7 +17788,8 @@ impl AppState {
     /// cached decoded pixels after mouse-driven graphics-layer damage.
     pub fn prepare_image_preview_protocols(&mut self) -> bool {
         if self.browse_artwork.popup_open
-            && !matches!(self.active_overlay, ActiveOverlay::None)
+            && !matches!(self.active_overlay,
+                ActiveOverlay::None | ActiveOverlay::ContextMenu { .. })
         {
             self.browse_artwork.close_popup();
         }

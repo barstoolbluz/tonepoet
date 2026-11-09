@@ -3703,6 +3703,18 @@ pub(crate) fn activate_browse_entry(
         return;
     };
 
+    // A direct raster image opens the existing artwork viewer, not Convert.
+    // This route is shared by double-click and Enter, like text-file View.
+    if !app.browse.is_in_archive()
+        && matches!(entry.kind, crate::convert::classify::EntryKind::OtherFile)
+        && super::browse_artwork::is_supported_image(&entry.path)
+        && (entry.is_regular_file || (entry.is_symlink && !entry.is_broken_symlink))
+    {
+        app.browse_artwork.open_file_popup(entry.path);
+        app.request_image_preview_repaint();
+        return;
+    }
+
     if entry.is_navigable_dir() && app.browse.is_in_archive() {
         if activate_archive_browse_directory(app, idx, tx) {
             app.cancel_browse_convert_expansion_for_browse_change("browse navigation changed");
@@ -5814,6 +5826,103 @@ mod inline_edit_behavior_tests {
 
         assert_eq!(app.current_screen, AppScreen::Convert);
         assert!(app.browse.multi_selected.is_empty());
+    }
+
+    #[test]
+    fn image_filename_double_click_opens_viewer_without_switching_to_convert() {
+        let (tx, _rx) = channel();
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("front.png");
+        image::DynamicImage::new_rgb8(12, 12).save(&image).unwrap();
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
+            image.clone(), "front.png".into(),
+            crate::convert::classify::EntryKind::OtherFile, 100, None,
+        )];
+        app.button_map.record_button(TuiButton::BrowseEntry(0), Rect::new(4, 4, 25, 1));
+        let click = || MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left), column: 8, row: 4,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, click(), &tx);
+        handle_mouse(&mut app, click(), &tx);
+        assert_eq!(app.current_screen, AppScreen::Browse);
+        assert!(app.browse_artwork.is_single_file_popup());
+        assert_eq!(app.browse_artwork.current_label().as_deref(), Some("front.png"));
+    }
+
+    #[test]
+    fn info_artwork_double_click_opens_original_image_after_single_click_cycle() {
+        let (tx, _rx) = channel();
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["cover.png", "back.png"] {
+            image::DynamicImage::new_rgb8(8, 8).save(temp.path().join(name)).unwrap();
+        }
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse_artwork.observe(Some(super::super::browse_artwork::ArtworkContext::Album {
+            directory: temp.path().to_path_buf(), selected_audio: None,
+        }));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.browse_artwork.count() != 2 && std::time::Instant::now() < deadline {
+            app.browse_artwork.prepare(&mut app.image_picker, 0, 0,
+                &app.browse.artwork_config);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(app.browse_artwork.count(), 2);
+        let initial = app.browse_artwork.current_label();
+        app.button_map.record_button(TuiButton::BrowseInfoArtworkArea,
+            Rect::new(10, 10, 20, 10));
+        let click = || MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left), column: 15, row: 15,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, click(), &tx);
+        assert!(!app.browse_artwork.popup_open);
+        assert_ne!(app.browse_artwork.current_label(), initial);
+        handle_mouse(&mut app, click(), &tx);
+        assert!(app.browse_artwork.popup_open);
+        assert_eq!(app.browse_artwork.current_label(), initial);
+    }
+
+    #[test]
+    fn viewer_right_click_keeps_image_popup_open_behind_its_context_menu() {
+        let (tx, _rx) = channel();
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("front.png");
+        image::DynamicImage::new_rgb8(8, 8).save(&image).unwrap();
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse_artwork.open_file_popup(image);
+        app.browse_artwork.popup_rect = Rect::new(10, 6, 55, 24);
+        handle_mouse(&mut app, MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right), column: 20, row: 12,
+            modifiers: KeyModifiers::NONE,
+        }, &tx);
+        assert!(app.browse_artwork.popup_open, "right click must not close the viewer");
+        assert!(matches!(app.active_overlay, ActiveOverlay::ContextMenu { .. }));
+        app.prepare_image_preview_protocols();
+        assert!(app.browse_artwork.popup_open, "preparing a menu must not close the viewer");
+        // The text buffer can display both layers together. Terminal-specific
+        // raster protocol compositing still requires a real-terminal check.
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        let theme = app.theme;
+        terminal.draw(|frame| {
+            super::super::browse_artwork::draw_popup(frame, &mut app, theme);
+            super::super::draw_overlays::draw_overlay(frame, &mut app, theme);
+        }).unwrap();
+        let mut text = String::new();
+        for y in 0..40_u16 {
+            for x in 0..100_u16 {
+                text.push_str(terminal.backend().buffer().get(x, y).symbol());
+            }
+            text.push(' ');
+        }
+        assert!(text.contains("Close") && text.contains("view"), "menu must remain visible");
+        assert!(text.contains("front.png"), "image view caption must remain visible");
     }
 
     #[test]
@@ -13730,6 +13839,18 @@ fn browse_context_paths_for_current_entry(app: &AppState) -> Option<Vec<std::pat
         vec![current]
     };
     (!paths.is_empty()).then_some(paths)
+}
+
+/// Right-clicking a live image opens its own context, not the Browse entry
+/// that happens to lie behind the viewer. The popup remains open throughout.
+fn open_browse_artwork_context_menu(app: &mut AppState, x: u16, y: u16) {
+    let entries = super::context_menu::build_browse_artwork_menu(app);
+    app.browse_context_action_paths = None;
+    app.active_overlay = ActiveOverlay::ContextMenu {
+        levels: vec![super::context_menu::MenuLevel::new(entries)],
+        origin: (x, y),
+        anchor_bottom: false,
+    };
 }
 
 /// Build and open the context menu for the current screen. `x, y` is
@@ -71613,7 +71734,14 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 }
             }
             MouseEventKind::Down(MouseButton::Right) => {
-                app.browse_artwork.close_popup();
+                let r = app.browse_artwork.popup_rect;
+                if mouse.column >= r.x && mouse.column < r.right()
+                    && mouse.row >= r.y && mouse.row < r.bottom()
+                {
+                    open_browse_artwork_context_menu(app, mouse.column, mouse.row);
+                } else {
+                    app.browse_artwork.close_popup();
+                }
             }
             MouseEventKind::ScrollUp => { app.browse_artwork.cycle(false); }
             MouseEventKind::ScrollDown => { app.browse_artwork.cycle(true); }
@@ -73261,7 +73389,14 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 }
             }
             TuiButton::BrowseInfoArtworkArea => {
-                if app.browse_artwork.cycle(true) {
+                if app.double_click.register_click(
+                    TuiButton::BrowseInfoArtworkArea, mouse.column, mouse.row,
+                    tui_file_picker::DOUBLE_CLICK_WINDOW,
+                ) {
+                    if app.browse_artwork.open_inline_popup_on_double_click() {
+                        app.request_image_preview_repaint();
+                    }
+                } else if app.browse_artwork.inline_click() {
                     app.request_image_preview_repaint();
                 }
             }

@@ -34,7 +34,7 @@ const MAX_PREVIEW_EDGE: u32 = 1_600;
 pub enum ArtworkContext {
     /// Info-pane discovery: one album/disc directory, no recursive traversal.
     Album { directory: PathBuf, selected_audio: Option<PathBuf> },
-    /// Right-click View on a direct image entry: decode this file only.
+    /// Direct image View: decode this file and discover sibling image names only.
     SingleFile(PathBuf),
 }
 
@@ -131,6 +131,9 @@ pub struct BrowseArtworkState {
     protocol_generation: usize,
     retransmit_generation: usize,
     font_size: (u16, u16),
+    // An inline single-click cycles; a subsequent double-click must open the
+    // image that was under the first click, not the next image.
+    inline_click_source: Option<ArtworkSource>,
     warning: Option<String>,
     pub popup_open: bool,
     pub popup_rect: Rect,
@@ -145,7 +148,7 @@ impl Default for BrowseArtworkState {
             protocol: None, desired_area: Rect::default(),
             vertical_placement: ImageVerticalPlacement::Center, protocol_area: Rect::default(),
             protocol_generation: 0, retransmit_generation: 0, font_size: (8, 12),
-            warning: None, popup_open: false, popup_rect: Rect::default(),
+            inline_click_source: None, warning: None, popup_open: false, popup_rect: Rect::default(),
         }
     }
 }
@@ -172,6 +175,7 @@ impl BrowseArtworkState {
         self.decoded = None;
         self.protocol = None;
         self.protocol_area = Rect::default();
+        self.inline_click_source = None;
     }
 
     /// User-initiated reload or discovery-policy change. Keep in-flight work
@@ -204,6 +208,30 @@ impl BrowseArtworkState {
         self.vertical_placement = placement;
     }
 
+    /// A normal click retains Browse Info's existing cycle behavior. Remember
+    /// the originally displayed source so double-click opens THAT artwork.
+    pub fn inline_click(&mut self) -> bool {
+        self.inline_click_source = self.sources.get(self.cursor).cloned();
+        self.cycle(true)
+    }
+
+    pub fn open_inline_popup_on_double_click(&mut self) -> bool {
+        let Some(original) = self.inline_click_source.take() else { return false; };
+        if let Some(index) = self.sources.iter().position(|source| *source == original) {
+            if index != self.cursor {
+                self.cursor = index;
+                self.generation = self.generation.wrapping_add(1);
+                self.decoded_source = None;
+                self.decoded_embedded_path = None;
+                self.decoded = None;
+            }
+        }
+        if !self.has_candidate() { return false; }
+        self.popup_open = true;
+        self.invalidate_protocol();
+        true
+    }
+
     /// A direct image popup is independent of Info's album selection, which
     /// may be None when the selected Browse entry is a PNG/JPEG/etc.
     pub fn is_single_file_popup(&self) -> bool {
@@ -212,9 +240,10 @@ impl BrowseArtworkState {
 
     pub fn open_file_popup(&mut self, path: PathBuf) {
         self.observe(Some(ArtworkContext::SingleFile(path.clone())));
-        // We already know the exact file. No album traversal, discovery
-        // debounce, or wait for a superseded album scan is necessary.
-        self.scanned = self.context.clone();
+        // Show the requested file immediately while a bounded, nonrecursive
+        // worker enumerates other images in its directory for viewer cycling.
+        self.scanned = None;
+        self.changed_at = Instant::now() - SELECTION_SETTLE;
         self.sources = vec![ArtworkSource::File(path)];
         self.popup_open = true;
         self.popup_rect = Rect::default();
@@ -240,12 +269,15 @@ impl BrowseArtworkState {
         if self.context.is_none() { return ""; }
         if self.decoded.is_some() { return ""; }
         if self.scanned.is_none() || (self.scan_rx.is_some() && self.sources.is_empty()) {
-            return "Finding artwork…";
+            return if matches!(&self.context, Some(ArtworkContext::SingleFile(_))) {
+                "Loading image…"
+            } else { "Finding artwork…" };
         }
         if self.decode_rx.is_some() || !self.sources.is_empty() && self.failed.len() < self.sources.len() {
             return "Loading artwork…";
         }
-        self.warning.as_deref().unwrap_or("No artwork in album folder")
+        if matches!(&self.context, Some(ArtworkContext::Album { .. })) { return ""; }
+        self.warning.as_deref().unwrap_or("No image available")
     }
 
     pub fn cycle(&mut self, forward: bool) -> bool {
@@ -272,6 +304,7 @@ impl BrowseArtworkState {
         let was_file_view = self.is_single_file_popup();
         self.popup_open = false;
         self.popup_rect = Rect::default();
+        self.inline_click_source = None;
         self.protocol = None; // rebuild for the pane on the next prepare pass
         self.protocol_area = Rect::default();
         if was_file_view {
@@ -346,14 +379,23 @@ impl BrowseArtworkState {
             match rx.try_recv() {
                 Ok(result) => {
                     if result.generation == self.generation && self.context.as_ref() == Some(&result.context) {
+                        let direct_file = matches!(&result.context, ArtworkContext::SingleFile(_));
+                        let selected = direct_file.then(|| self.sources.get(self.cursor).cloned())
+                            .flatten();
                         self.scanned = Some(result.context);
                         self.sources = result.sources;
-                        self.cursor = 0;
+                        self.cursor = selected.as_ref().and_then(|source|
+                            self.sources.iter().position(|candidate| candidate == source))
+                            .unwrap_or(0);
                         self.failed.clear();
-                        self.decoded = None;
-                        self.decoded_source = None;
-                        self.decoded_embedded_path = None;
-                        self.protocol = None;
+                        // Don't throw away the selected file's pending/decoded
+                        // pixels when sibling discovery completes.
+                        if !direct_file || self.decoded_source.as_ref() != self.sources.get(self.cursor) {
+                            self.decoded = None;
+                            self.decoded_source = None;
+                            self.decoded_embedded_path = None;
+                            self.protocol = None;
+                        }
                         self.warning = result.warning;
                         changed = true;
                     }
@@ -481,14 +523,9 @@ fn scan_directory(context: ArtworkContext, config: &BrowseArtworkConfig) -> Scan
     let (directory, selected_audio) = match &context {
         ArtworkContext::Album { directory, selected_audio } => (directory, selected_audio),
         ArtworkContext::SingleFile(path) => {
-            // The file action must not launch an album scan or follow folders.
-            // decode_source revalidates the file and enforces resource limits.
-            return ScanResult {
-                context: context.clone(),
-                sources: vec![ArtworkSource::File(path.clone())],
-                warning: None,
-                generation: 0,
-            };
+            // This explicit View scans only sibling image names. Never scan
+            // audio tags, descend into subfolders, or decode sibling images.
+            return scan_image_siblings(context.clone(), path);
         }
     };
     let mut files = Vec::new();
@@ -564,6 +601,60 @@ fn scan_directory(context: ArtworkContext, config: &BrowseArtworkConfig) -> Scan
         else { sources.push(embedded); }
     }
     ScanResult { context, sources, warning, generation: 0 }
+}
+
+/// A bounded, deterministic shallow listing for an explicitly opened image.
+/// Keep the selected file in the list even if a huge directory hits the cap.
+fn scan_image_siblings(context: ArtworkContext, selected: &Path) -> ScanResult {
+    let mut files = Vec::new();
+    let mut warning = None;
+    if let Some(directory) = selected.parent() {
+        match fs::read_dir(directory) {
+            Ok(listing) => {
+                for (index, result) in listing.enumerate() {
+                    if index >= MAX_DIRECTORY_ENTRIES {
+                        warning = Some("Image directory listing capped".into());
+                        break;
+                    }
+                    let Ok(entry) = result else { continue; };
+                    let path = entry.path();
+                    if !is_supported_image(&path) { continue; }
+                    let Ok(kind) = entry.file_type() else { continue; };
+                    if kind.is_file() || (kind.is_symlink()
+                        && fs::metadata(&path).is_ok_and(|md| md.is_file())) {
+                        files.push(path);
+                    }
+                }
+            }
+            Err(error) => warning = Some(format!("Cannot list image directory: {error}")),
+        }
+    }
+    // Sort all candidates before truncating so directory iteration order never
+    // changes the cycle sequence; the selected entry is always retained.
+    fn order(a: &PathBuf, b: &PathBuf) -> std::cmp::Ordering {
+        a.file_name().unwrap_or_default().to_string_lossy().to_ascii_lowercase()
+            .cmp(&b.file_name().unwrap_or_default().to_string_lossy().to_ascii_lowercase())
+            .then_with(|| a.cmp(b))
+    }
+    files.sort_by(order);
+    // Unlike album artwork discovery, the explicit image viewer includes all
+    // image files found by the bounded directory scan (up to 32,768 entries).
+    // Truncating the viewer at the album-artwork limit would silently exclude
+    // most images in larger photography or artwork folders.
+    // A renamed/removed file can still be visible in a stale Browse list; the
+    // decoder revalidates it. Preserve the explicitly requested file so the
+    // popup never silently changes to a different image.
+    if !files.iter().any(|path| path == selected) {
+        if files.len() == MAX_DIRECTORY_ENTRIES { files.pop(); }
+        files.push(selected.to_path_buf());
+        files.sort_by(order);
+    }
+    ScanResult {
+        context,
+        sources: files.into_iter().map(ArtworkSource::File).collect(),
+        warning,
+        generation: 0,
+    }
 }
 
 fn decode_source(source: &ArtworkSource) -> Result<DecodedArtwork, String> {
@@ -866,8 +957,8 @@ mod tests {
         state.open_file_popup(image_path.clone());
         assert!(state.is_single_file_popup());
         assert!(state.generation > album_generation);
-        assert_eq!(state.scanned, state.context);
-        assert!(state.scan_rx.is_none(), "direct View must not scan the directory");
+        assert!(state.scanned.is_none(), "sibling listing is deferred to a worker");
+        assert!(state.scan_rx.is_none(), "opening View must not scan synchronously");
         assert_eq!(state.sources, vec![ArtworkSource::File(image_path.clone())]);
         assert!(!state.cycle(true), "a single image has nothing to cycle to");
 
@@ -907,6 +998,77 @@ mod tests {
         assert_eq!(state.message(), "");
         assert!(state.warning.is_none());
         assert!(state.context.is_none());
+    }
+
+    #[test]
+    fn missing_embedded_art_is_silent_in_browse_artwork_state() {
+        let mut state = BrowseArtworkState::default();
+        state.observe(Some(ArtworkContext::Album {
+            directory: PathBuf::from("/music/album"), selected_audio: None,
+        }));
+        state.scanned = state.context.clone();
+        state.warning = Some("No embedded Other artwork found in '/music/album/track.flac'".into());
+        assert_eq!(state.message(), "", "absence is not an Info-pane error");
+    }
+
+    #[test]
+    fn inline_double_click_opens_the_original_image_not_the_cycled_successor() {
+        let mut state = BrowseArtworkState::default();
+        state.sources = vec![ArtworkSource::File(PathBuf::from("cover.png")),
+            ArtworkSource::File(PathBuf::from("back.jpg"))];
+        assert!(!state.open_inline_popup_on_double_click(), "needs a first click");
+        assert!(state.inline_click(), "normal single-click cycles");
+        assert_eq!(state.index(), 1);
+        assert!(state.open_inline_popup_on_double_click());
+        assert!(state.popup_open);
+        assert_eq!(state.index(), 0, "double-click keeps the image originally clicked");
+        state.close_popup();
+        assert!(!state.popup_open);
+    }
+
+    #[test]
+    fn direct_image_view_cycles_shallow_siblings_in_deterministic_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let cover = temp.path().join("cover.png");
+        for file in ["z.png", "Back.JPG", "cover.png"] {
+            image::DynamicImage::new_rgb8(12, 10).save(temp.path().join(file)).unwrap();
+        }
+        fs::write(temp.path().join("track.flac"), b"audio").unwrap();
+        fs::create_dir(temp.path().join("artwork")).unwrap();
+        image::DynamicImage::new_rgb8(12, 10)
+            .save(temp.path().join("artwork").join("hidden.png")).unwrap();
+        let mut state = BrowseArtworkState::default();
+        state.open_file_popup(cover.clone());
+        assert_eq!(state.count(), 1, "the explicit file is available before a scan");
+        let mut picker = Picker::new((12, 24));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while (state.count() != 3 || !state.has_image()) && Instant::now() < deadline {
+            state.prepare(&mut picker, 0, 0, &BrowseArtworkConfig::default());
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(state.count(), 3, "only direct supported images are cycled");
+        assert_eq!(state.index(), 1, "discovery preserves the explicitly opened cover");
+        assert_eq!(state.current_label().as_deref(), Some("cover.png"));
+        assert!(state.has_image(), "the worker must retain already decoded pixels");
+        assert!(state.cycle(true));
+        assert_eq!(state.current_label().as_deref(), Some("z.png"));
+        assert!(state.cycle(true));
+        assert_eq!(state.current_label().as_deref(), Some("Back.JPG"));
+        assert!(state.cycle(false));
+        assert_eq!(state.current_label().as_deref(), Some("z.png"));
+    }
+
+    #[test]
+    fn direct_gallery_includes_siblings_beyond_the_album_artwork_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        for n in 0..140 {
+            fs::write(temp.path().join(format!("{n:03}.png")), b"image").unwrap();
+        }
+        let selected = temp.path().join("139.png");
+        let result = scan_image_siblings(ArtworkContext::SingleFile(selected.clone()), &selected);
+        assert_eq!(result.sources.len(), 140, "a gallery is not an album-artwork list");
+        assert!(result.sources.contains(&ArtworkSource::File(selected)));
+        assert!(result.warning.is_none());
     }
 
     #[cfg(unix)]
@@ -961,7 +1123,7 @@ pub fn popup_rect(terminal: Rect, percent: u8) -> Rect {
 /// the same image protocol cache is used for the inline and popup views.
 pub fn draw_popup(f: &mut ratatui::Frame, app: &mut super::app::AppState,
                   theme: super::theme::Theme) {
-    use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+    use ratatui::widgets::{Block, Clear, Paragraph};
     use ratatui::style::Style;
 
     let terminal = f.size();
@@ -969,15 +1131,12 @@ pub fn draw_popup(f: &mut ratatui::Frame, app: &mut super::app::AppState,
     let rect = popup_rect(terminal, app.browse.artwork_config.popup_height_percent);
     app.browse_artwork.popup_rect = rect;
     f.render_widget(Clear, rect);
-    let single_file = app.browse_artwork.is_single_file_popup();
-    let title = if single_file { " Image · Esc to close " }
-        else { " Album artwork · Esc to close " };
-    f.render_widget(Block::default().borders(Borders::ALL)
-        .title(title)
-        .style(Style::default().fg(theme.text).bg(theme.panel_bg))
-        .border_style(theme.border(theme.amber)), rect);
-    let image_area = Rect::new(rect.x + 1, rect.y + 1,
-        rect.width.saturating_sub(2), rect.height.saturating_sub(3));
+    // Borderless image view. The last row is reserved for the filename and
+    // navigation hint, but the artwork itself has no surrounding frame.
+    f.render_widget(Block::default()
+        .style(Style::default().fg(theme.text).bg(theme.panel_bg)), rect);
+    let image_area = Rect::new(rect.x, rect.y,
+        rect.width, rect.height.saturating_sub(1));
     let displayed = app.browse_artwork.render_image(f, image_area,
         app.browse.artwork_config.allow_upscale, ImageVerticalPlacement::Center);
     if !displayed {
@@ -990,7 +1149,7 @@ pub fn draw_popup(f: &mut ratatui::Frame, app: &mut super::app::AppState,
     let caption = format!(" {}  ({}/{}){} ",
         label, if count == 0 { 0 } else { app.browse_artwork.index() + 1 },
         count, navigation);
-    let caption = super::display_width::fit_prefix(&caption, rect.width.saturating_sub(2) as usize);
+    let caption = super::display_width::fit_prefix(&caption, rect.width as usize);
     f.render_widget(Paragraph::new(caption).style(theme.muted()),
-        Rect::new(rect.x + 1, rect.bottom() - 2, rect.width.saturating_sub(2), 1));
+        Rect::new(rect.x, rect.bottom().saturating_sub(1), rect.width, 1));
 }

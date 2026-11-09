@@ -100,14 +100,17 @@ pub fn draw_ui(f: &mut Frame, app: &mut AppState) {
         }
     }
 
-    // Draw any active overlay on top
-    draw_overlay(f, app, theme);
+    // Draw the borderless image popup before a context menu. Unlike modal
+    // editors, the Browse artwork menu is permitted above its live image.
     if app.current_screen == AppScreen::Browse
-        && matches!(app.active_overlay, super::app::ActiveOverlay::None)
         && app.browse_artwork.popup_open
+        && matches!(app.active_overlay,
+            super::app::ActiveOverlay::None | super::app::ActiveOverlay::ContextMenu { .. })
     {
         super::browse_artwork::draw_popup(f, app, theme);
     }
+    // Context menus are the foreground text layer, above any image view.
+    draw_overlay(f, app, theme);
 }
 
 /// Draw the wizard screen by delegating to tonepoet_wizard

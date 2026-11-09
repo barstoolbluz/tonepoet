@@ -138,6 +138,7 @@ pub enum ContextAction {
     /// Session-only Size-column accounting option.
     ToggleFolderSizeSort,
     BrowseArtworkView,
+    BrowseArtworkCloseView,
     /// View a selected direct image file in Browse's existing artwork popup.
     BrowseImageFileView(PathBuf),
     BrowseArtworkToggleEmbeddedPreference,
@@ -3157,10 +3158,13 @@ fn explicit_convert_cue_policy_for_selection(
 /// when the pointer is over album artwork.
 pub fn build_browse_artwork_menu(app: &AppState) -> Vec<ContextMenuEntry> {
     let config = &app.browse.artwork_config;
-    vec![
+    let mut entries = vec![if app.browse_artwork.popup_open {
+        item("Close view", ContextAction::BrowseArtworkCloseView)
+    } else {
         item_enabled("View", ContextAction::BrowseArtworkView,
-            app.browse_artwork.has_candidate()),
-        ContextMenuEntry::Submenu {
+            app.browse_artwork.has_candidate())
+    }];
+    entries.push(ContextMenuEntry::Submenu {
             label: "Settings".into(),
             children: vec![
                 item(&format!("{} Prefer embedded artwork",
@@ -3178,8 +3182,8 @@ pub fn build_browse_artwork_menu(app: &AppState) -> Vec<ContextMenuEntry> {
                 separator(),
                 item("Reload artwork", ContextAction::BrowseArtworkReload),
             ],
-        },
-    ]
+        });
+    entries
 }
 
 pub fn build_browse_size_header_menu(enabled: bool) -> Vec<ContextMenuEntry> {
@@ -3212,6 +3216,10 @@ pub fn execute_context_action(
         }
     }
     match action {
+        ContextAction::BrowseArtworkCloseView => {
+            app.browse_artwork.close_popup();
+            app.request_image_preview_repaint();
+        }
         ContextAction::BrowseArtworkView => {
             if app.current_screen == AppScreen::Browse && app.browse_artwork.has_candidate() {
                 app.browse_artwork.popup_open = true;
