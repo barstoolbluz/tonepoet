@@ -12,7 +12,7 @@ use ratatui::{
 };
 
 use super::app::{AppState, BrowseInfoFocus, BrowseInlineEditState, BrowseInlineEditTarget};
-use super::browse_artwork::{ArtworkContext, BrowseArtworkState, percent_height};
+use super::browse_artwork::{ArtworkContext, BrowseArtworkState, ImageVerticalPlacement, percent_height};
 use super::browse::{BrowseColumn, BrowseDirectorySummaryColdWorkPolicy, BrowseEntry, BrowseOptionsMenu, BrowsePaneId, BrowseState, CachedInfo, EntryKind, FolderAudioSummary, FolderClassificationKind, FolderContentClassification, FormatFilter, SortBy, SortDir};
 use super::button_map::{ButtonRenderMap, ScrollbarSurface, TuiButton};
 use super::draw_footer::draw_footer;
@@ -3454,6 +3454,29 @@ fn draw_browse_info(
         f, area, browse, accounting, inline_edit, info_focus, buttons, hover, theme, None, false);
 }
 
+/// Keep the Info image one row above the pane's bottom border without a
+/// filename caption. Reserving the last artwork row here means changing the
+/// artwork-height percentage can only move the image's TOP edge, never its
+/// bottom edge. The surrounding artwork hit target is deliberately unchanged.
+fn info_artwork_image_area(area: Rect) -> Rect {
+    Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1))
+}
+
+/// Metadata and its controls own their rows. Artwork is a preference, not a
+/// reason to compact or clip the Info content. Leave one row between the
+/// last painted metadata row and the artwork, plus the existing bottom gap.
+/// In a short pane, suppress artwork entirely rather than hide information.
+fn bounded_info_artwork_height(info: &InfoContent, content_height: usize,
+                               requested_height: usize) -> usize {
+    let metadata_end = info.lines.iter().rposition(|row|
+        row.iter().any(|span| !span.content.trim().is_empty()))
+        .map_or(0, |last| last + 1);
+    let available = content_height.saturating_sub(metadata_end.saturating_add(1));
+    let height = requested_height.min(available);
+    // One row belongs to the bottom gap; an image needs another row.
+    if height < 2 { 0 } else { height }
+}
+
 fn draw_browse_info_with_artwork(
     f: &mut Frame,
     area: Rect,
@@ -3496,14 +3519,12 @@ fn draw_browse_info_with_artwork(
     let artwork_context = ArtworkContext::from_browse(browse);
     let has_album_context = artwork_context.is_some();
     if let Some((state, _)) = artwork.as_mut() {
-        state.observe(artwork_context);
+        // A direct image View is modal, not an Info album selection. Do not
+        // cancel it by observing the image file's absent album context.
+        if !state.is_single_file_popup() {
+            state.observe(artwork_context);
+        }
     }
-    let artwork_height = if has_album_context {
-        artwork.as_ref().map_or(0, |(_, config)|
-            percent_height(content_height as u16, config.pane_height_percent) as usize)
-    } else { 0 };
-    let text_height = content_height.saturating_sub(artwork_height);
-
     let mut lines: Vec<Line> = vec![top_line];
 
     // Available width for content (inside borders, after the 3-space indent)
@@ -3553,20 +3574,28 @@ fn draw_browse_info_with_artwork(
             matches!(c.kind, FolderClassificationKind::Album | FolderClassificationKind::Disc |
                 FolderClassificationKind::MultiDisc)))
     });
-    let compact_media = media_selection && (text_height <= MEDIA_COMPACT_MAX_CONTENT_ROWS
-        || info.lines.len() > text_height);
+    // First choose the metadata layout using the ENTIRE pane. The artwork
+    // preference must not trigger the compact layout or hide action rows.
+    let compact_media = media_selection && (content_height <= MEDIA_COMPACT_MAX_CONTENT_ROWS
+        || info.lines.len() > content_height);
     let compact_directory = !media_selection && physical_folder
-        && info.lines.len() > text_height;
+        && info.lines.len() > content_height;
     let info = if media_selection {
-        compact_media_info(info, text_height)
+        compact_media_info(info, content_height)
     } else if compact_directory {
-        compact_directory_info(info, text_height, content_width)
+        compact_directory_info(info, content_height, content_width)
     } else { info };
     // Never reinterpret a compact layout as a four-row header: its rows are
     // reindexed and its hitboxes already refer to that compact ordering.
     let info = if compact_media || compact_directory { info } else {
         wrap_full_info_title(info, content_width, theme)
     };
+    let artwork_height = if has_album_context {
+        artwork.as_ref().map_or(0, |(_, config)| bounded_info_artwork_height(
+            &info, content_height,
+            percent_height(content_height as u16, config.pane_height_percent) as usize))
+    } else { 0 };
+    let text_height = content_height.saturating_sub(artwork_height);
     let start_row = 0;
 
     // Render content lines with border
@@ -3590,32 +3619,18 @@ fn draw_browse_info_with_artwork(
             let artwork_area = Rect::new(area.x.saturating_add(1),
                 area.y.saturating_add(1 + text_height as u16),
                 area.width.saturating_sub(2), artwork_height as u16);
-            // At 100%, the user's allocation belongs entirely to the image;
-            // intermediate percentages reserve a row for source/cycle status.
-            let show_caption = artwork_area.height > 1 && config.pane_height_percent < 100;
-            let image_area = if show_caption {
-                Rect::new(artwork_area.x, artwork_area.y,
-                    artwork_area.width, artwork_area.height - 1)
-            } else { artwork_area };
+            // The final content row stays empty as a visual gap below the
+            // image. No source filename or cycle caption is drawn in Info.
+            let image_area = info_artwork_image_area(artwork_area);
             let visible = !suppress_image
-                && state.render_image(f, image_area, config.allow_upscale);
+                && state.render_image(f, image_area, config.allow_upscale,
+                    ImageVerticalPlacement::Bottom);
             if !visible && !suppress_image {
-                state.set_desired_area(image_area);
+                state.set_desired_area(image_area, ImageVerticalPlacement::Bottom);
                 let placeholder = super::display_width::fit_prefix(
                     state.message(), artwork_area.width as usize);
                 f.render_widget(Paragraph::new(placeholder)
                     .style(theme.muted()), image_area);
-            }
-            if show_caption {
-                let caption = state.current_label().unwrap_or_else(||
-                    "Artwork · left-click to cycle · right-click for menu".to_string());
-                let tail = if state.count() > 1 {
-                    format!("  [{}/{}]", state.index() + 1, state.count())
-                } else { String::new() };
-                let caption = super::display_width::fit_prefix(
-                    &format!(" {caption}{tail}"), artwork_area.width as usize);
-                f.render_widget(Paragraph::new(caption).style(theme.muted()),
-                    Rect::new(artwork_area.x, artwork_area.bottom() - 1, artwork_area.width, 1));
             }
             buttons.record_button(TuiButton::BrowseInfoArtworkArea, artwork_area);
         }
@@ -9453,7 +9468,7 @@ mod browse_info_artwork_presentation_tests {
             FolderClassificationKind::MultiDisc]
         {
             classify(&mut browse, &entry, kind);
-            assert_eq!(ArtworkContext::from_browse(&browse), Some(ArtworkContext {
+            assert_eq!(ArtworkContext::from_browse(&browse), Some(ArtworkContext::Album {
                 directory: entry.path.clone(), selected_audio: None,
             }), "{kind:?}");
         }
@@ -9466,7 +9481,7 @@ mod browse_info_artwork_presentation_tests {
         let audio = BrowseEntry::new(entry.path.join("01.flac"), "01.flac".into(),
             EntryKind::AudioFile(crate::convert::formats::AudioFormat::Flac), 0, None);
         browse.entries = vec![audio.clone()];
-        assert_eq!(ArtworkContext::from_browse(&browse), Some(ArtworkContext {
+        assert_eq!(ArtworkContext::from_browse(&browse), Some(ArtworkContext::Album {
             directory: entry.path, selected_audio: Some(audio.path),
         }));
     }
@@ -9503,12 +9518,24 @@ mod browse_info_artwork_presentation_tests {
             check_plain(&mut app);
         }
 
-        // Recognized album content restores the image area, even at compact sizes.
+        // A recognized album is eligible for artwork, but it may not take
+        // space from its compact metadata and controls at 66x24.
         let album_entry = BrowseEntry::new(album, "Album".into(), EntryKind::Directory, 0, None);
         classify(&mut app.browse, &album_entry, FolderClassificationKind::Album);
-        app.browse.entries = vec![album_entry];
-        let _ = super::directory_info_presentation_tests::render_directory_browse_size(&mut app, 66, 24);
-        assert!(app.button_map.find_button_rect(&TuiButton::BrowseInfoArtworkArea).is_some());
+        app.browse.entries = vec![album_entry.clone()];
+        let (_, info_area, _) = super::directory_info_presentation_tests::render_directory_browse_size(
+            &mut app, 66, 24);
+        let content_height = (info_area.height - 2) as usize;
+        let theme = crate::tui::theme::theme_by_slug_or_default(
+            crate::tui::theme::default_theme_slug());
+        let full = entry_info_lines(&album_entry, &app.browse, &app.directory_accounting,
+            (info_area.width - 2) as usize, false, false, false, false, None, None, theme);
+        let compact = compact_media_info(full, content_height);
+        let height = bounded_info_artwork_height(&compact, content_height,
+            percent_height(content_height as u16, app.browse.artwork_config.pane_height_percent)
+                as usize);
+        assert_eq!(app.button_map.find_button_rect(&TuiButton::BrowseInfoArtworkArea).is_some(),
+            height > 0, "album artwork must yield when the compact Info pane is full");
 
         // Leaving that album must give the entire Info pane back to plain-folder metrics.
         app.browse.entries = vec![entry];
@@ -9516,7 +9543,160 @@ mod browse_info_artwork_presentation_tests {
     }
 
     #[test]
-    fn artwork_hit_target_is_bounded_to_lower_percentage_and_can_fill_pane() {
+    fn info_artwork_has_no_caption_and_one_row_gap_at_every_height() {
+        // Border: row 80; blank gap: row 79; image bottom: row 78.
+        let info = Rect::new(4, 5, 72, 76);
+        let content_height = info.height - 2;
+        let gap_row = info.bottom() - 2;
+        assert_eq!(gap_row, 79);
+        for percentage in [28, 50, 75, 100] {
+            let height = percent_height(content_height, percentage);
+            let artwork_area = Rect::new(info.x + 1, info.bottom() - 1 - height,
+                info.width - 2, height);
+            let image = info_artwork_image_area(artwork_area);
+            assert_eq!(image.bottom(), gap_row, "{percentage}%");
+            assert_eq!(image.bottom() - 1, 78, "{percentage}%");
+            assert_eq!(image.height + 1, artwork_area.height, "{percentage}%");
+        }
+        // Even a one-row artwork allocation never uses the gap for pixels.
+        assert_eq!(info_artwork_image_area(Rect::new(1, 2, 10, 1)).height, 0);
+    }
+
+    #[test]
+    fn artwork_height_caps_at_last_metadata_row_and_drops_out_when_too_short() {
+        // A long metadata block, including an action, ends on content row 34.
+        // Trailing blank lines are not metadata and must not claim height.
+        let mut lines = vec![Vec::new(); 42];
+        lines[0] = vec![Span::raw("title")];
+        lines[29] = vec![Span::raw("year 1972")];
+        lines[34] = vec![Span::raw(" edit tags ")];
+        let info = InfoContent {
+            lines, title: None, meta_field_rows: Vec::new(),
+            refresh_pill_row: None, analyze_pill_row: None,
+            edit_tags_pill_row: Some(34), audio_streams_pill_row: None,
+            inline_cursor: None,
+        };
+        for percent in [28, 50, 60, 75, 100] {
+            let requested = percent_height(74, percent) as usize;
+            let height = bounded_info_artwork_height(&info, 74, requested);
+            assert_eq!(height, requested.min(38), "{percent}%");
+            assert!(74 - height > 34, "action row clipped at {percent}%");
+            if height > 0 {
+                // One metadata-to-artwork row and one image-to-border row.
+                assert!(74 - height >= 36, "missing metadata separator");
+                assert!(height >= 2, "missing bottom separator");
+            }
+        }
+        assert_eq!(bounded_info_artwork_height(&info, 36, 36), 0,
+            "no space for an image, top gap and bottom gap");
+        assert_eq!(bounded_info_artwork_height(&info, 35, 35), 0);
+        assert_eq!(bounded_info_artwork_height(&info, 34, 34), 0);
+        assert_eq!(bounded_info_artwork_height(&info, 74, 1), 0,
+            "a one-row allocation cannot contain pixels and the bottom gap");
+    }
+
+    #[test]
+    fn artwork_never_hides_probed_track_metadata_or_action_pills() {
+        use std::sync::Arc;
+        let track = std::path::PathBuf::from("/music/album/01 - Track.flac");
+        let entry = BrowseEntry::new(track.clone(), "01 - Track.flac".into(),
+            EntryKind::AudioFile(crate::convert::formats::AudioFormat::Flac), 0, None);
+        let mut browse = BrowseState::new();
+        browse.entries = vec![entry.clone()];
+        browse.insert_probe_cache_for_test(track, Some(Arc::new(CachedInfo {
+            source: crate::tui::probe::SourceInfo {
+                format_name: "FLAC".into(), codec: "FLAC".into(),
+                bit_depth: Some(16), sample_format_is_float: Some(false),
+                compression_is_lossless: Some(true), sample_rate: 44_100,
+                channels: 2, channel_layout: "stereo".into(),
+                duration_secs: 222.0, file_size: 22_200_000,
+            },
+            metadata: crate::tui::probe::SourceMetadata {
+                title: Some("Ain't Wasting Time No More".into()),
+                artist: Some("The Allman Brothers Band".into()),
+                album: Some("Eat a Peach".into()),
+                genre: Some("Southern Rock".into()), year: Some("1972".into()),
+                rg_track_gain: Some("-0.51 dB".into()),
+                rg_track_peak: Some("0.624390".into()),
+                rg_album_gain: Some("0.26 dB".into()),
+                rg_album_peak: Some("0.632690".into()),
+                ..Default::default()
+            },
+            transport: None,
+        })));
+        assert!(ArtworkContext::from_browse(&browse).is_some());
+        let accounting = crate::directory_accounting::AccountingService::new(None);
+        let theme = crate::tui::theme::theme_by_slug_or_default(
+            crate::tui::theme::default_theme_slug());
+        let info = entry_info_lines(&entry, &browse, &accounting, 78,
+            false, false, false, false, None, None, theme);
+        let action_row = info.edit_tags_pill_row.expect("Edit Tags row");
+        let analyze_row = info.analyze_pill_row.expect("Analyze row");
+        let year_row = info.meta_field_rows.iter().find(|(f, _)|
+            *f == crate::tui::probe::MetadataField::Year).expect("year row").1;
+        let last_row = info.lines.iter().rposition(|row|
+            row.iter().any(|span| !span.content.trim().is_empty())).unwrap();
+        assert_eq!(action_row, last_row, "fixture must cover bottom-most control");
+        let mut state = BrowseArtworkState::default();
+        let mut config = crate::config::BrowseArtworkConfig::default();
+        let mut terminal = Terminal::new(TestBackend::new(80, 76)).unwrap();
+        let mut buttons = ButtonRenderMap::new();
+        for percent in [28, 60, 75, 100] {
+            config.pane_height_percent = percent;
+            buttons.clear();
+            terminal.draw(|frame| draw_browse_info_with_artwork(
+                frame, Rect::new(0, 0, 80, 76), &browse, &accounting,
+                None, None, &mut buttons, None, theme,
+                Some((&mut state, &config)), false,
+            )).unwrap();
+            let read_row = |y: u16| (1..79).map(|x|
+                terminal.backend().buffer().get(x, y).symbol().to_owned())
+                .collect::<Vec<_>>().join("");
+            let edit = buttons.find_button_rect(&TuiButton::BrowseInfoEditTags)
+                .expect("Edit Tags must remain visible");
+            let analyze = buttons.find_button_rect(&TuiButton::BrowseInfoAnalyze)
+                .expect("Analyze must remain visible");
+            assert_eq!(edit.y, action_row as u16 + 1, "{percent}%");
+            assert_eq!(analyze.y, analyze_row as u16 + 1, "{percent}%");
+            assert!(read_row(edit.y).contains("edit tags"), "{percent}%");
+            assert!(read_row(analyze.y).contains("analyze"), "{percent}%");
+            assert!(read_row(year_row as u16 + 1).contains("1972"), "{percent}%");
+            let target = buttons.find_button_rect(&TuiButton::BrowseInfoArtworkArea)
+                .expect("track artwork must have a bounded target");
+            assert!(target.y >= edit.y + 2,
+                "{percent}% artwork displaced Edit Tags or the metadata separator");
+            assert!(target.y >= analyze.y + 2);
+            let expected = bounded_info_artwork_height(&info, 74,
+                percent_height(74, percent) as usize);
+            assert_eq!(target.height, expected as u16, "{percent}%");
+            assert_eq!(target.bottom(), 75, "artwork must remain bottom-anchored");
+            for x in 1..79 {
+                assert_eq!(terminal.backend().buffer().get(x, target.y - 1).symbol(), " ",
+                    "metadata-to-artwork gap at {percent}%");
+                assert_eq!(terminal.backend().buffer().get(x, 74).symbol(), " ",
+                    "artwork-to-border gap at {percent}%");
+            }
+        }
+        // An Info pane just tall enough to show Edit Tags must keep that
+        // button, even for 100% artwork, and omit the image entirely.
+        config.pane_height_percent = 100;
+        let short_height = action_row as u16 + 3; // title border, rows, bottom border
+        let mut short = Terminal::new(TestBackend::new(80, short_height)).unwrap();
+        buttons.clear();
+        short.draw(|frame| draw_browse_info_with_artwork(
+            frame, Rect::new(0, 0, 80, short_height), &browse, &accounting,
+            None, None, &mut buttons, None, theme,
+            Some((&mut state, &config)), false,
+        )).unwrap();
+        let edit = buttons.find_button_rect(&TuiButton::BrowseInfoEditTags)
+            .expect("Edit Tags must own its row in a short pane");
+        assert_eq!(edit.y, action_row as u16 + 1);
+        assert!(buttons.find_button_rect(&TuiButton::BrowseInfoArtworkArea).is_none(),
+            "artwork must disappear instead of obscuring the final control");
+    }
+
+    #[test]
+    fn artwork_hit_target_respects_metadata_and_requested_percentage() {
         let temp = tempfile::tempdir().unwrap();
         let entry = BrowseEntry::new(temp.path().into(), "Album".into(),
             EntryKind::Directory, 0, None);
@@ -9531,7 +9711,9 @@ mod browse_info_artwork_presentation_tests {
         let theme = crate::tui::theme::theme_by_slug_or_default(
             crate::tui::theme::default_theme_slug());
         let mut config = crate::config::BrowseArtworkConfig::default();
-        for (percent, expected_start) in [(28, 28), (100, 1)] {
+        let info = entry_info_lines(&entry, &browse, &accounting, 70,
+            false, false, false, false, None, None, theme);
+        for percent in [28, 100] {
             config.pane_height_percent = percent;
             buttons.clear();
             terminal.draw(|f| draw_browse_info_with_artwork(
@@ -9540,8 +9722,20 @@ mod browse_info_artwork_presentation_tests {
             )).unwrap();
             let target = buttons.find_button_rect(&TuiButton::BrowseInfoArtworkArea)
                 .expect("artwork region must have a hit target even before decoding");
-            assert_eq!(target.height, percent_height(38, percent));
-            assert_eq!(target.y, expected_start);
+            let expected_height = bounded_info_artwork_height(&info, 38,
+                percent_height(38, percent) as usize);
+            assert_eq!(target.height, expected_height as u16);
+            assert_eq!(target.y, 39 - expected_height as u16);
+            let last_metadata = info.lines.iter().rposition(|row|
+                row.iter().any(|span| !span.content.trim().is_empty())).unwrap();
+            assert!(target.y >= last_metadata as u16 + 3,
+                "{percent}% artwork impinged on metadata");
+            // The last interior row must stay visibly blank, including when
+            // the caption would previously have occupied it at 28%.
+            for x in 1..71 {
+                assert_eq!(terminal.backend().buffer().get(x, 38).symbol(), " ",
+                    "Info bottom gap occupied at {percent}% and column {x}");
+            }
             assert_eq!(buttons.find_button_at(target.x, target.y),
                 Some(TuiButton::BrowseInfoArtworkArea));
             assert_eq!(buttons.find_button_at(target.x, target.bottom() - 1),

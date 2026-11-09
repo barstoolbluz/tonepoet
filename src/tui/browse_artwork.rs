@@ -31,9 +31,17 @@ const MAX_DECODE_ALLOC: u64 = 96 * 1024 * 1024;
 const MAX_PREVIEW_EDGE: u32 = 1_600;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ArtworkContext {
-    pub directory: PathBuf,
-    pub selected_audio: Option<PathBuf>,
+pub enum ArtworkContext {
+    /// Info-pane discovery: one album/disc directory, no recursive traversal.
+    Album { directory: PathBuf, selected_audio: Option<PathBuf> },
+    /// Right-click View on a direct image entry: decode this file only.
+    SingleFile(PathBuf),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageVerticalPlacement {
+    Center,
+    Bottom,
 }
 
 impl ArtworkContext {
@@ -49,10 +57,10 @@ impl ArtworkContext {
             matches!(c.kind, FolderClassificationKind::Album | FolderClassificationKind::Disc
                 | FolderClassificationKind::MultiDisc))
         {
-            return Some(Self { directory: entry.path.clone(), selected_audio: None });
+            return Some(Self::Album { directory: entry.path.clone(), selected_audio: None });
         }
         if entry.is_audio() && entry.is_regular_file {
-            return Some(Self {
+            return Some(Self::Album {
                 directory: entry.path.parent()?.to_path_buf(),
                 selected_audio: Some(entry.path.clone()),
             });
@@ -118,6 +126,7 @@ pub struct BrowseArtworkState {
     decoded: Option<DynamicImage>,
     protocol: Option<Box<dyn StatefulProtocol>>,
     desired_area: Rect,
+    vertical_placement: ImageVerticalPlacement,
     protocol_area: Rect,
     protocol_generation: usize,
     retransmit_generation: usize,
@@ -133,7 +142,8 @@ impl Default for BrowseArtworkState {
             context: None, generation: 0, scan_generation: 0, decode_generation: 0, changed_at: Instant::now(), scanned: None,
             scan_rx: None, sources: Vec::new(), cursor: 0, failed: HashSet::new(),
             decode_rx: None, decoded_source: None, decoded_embedded_path: None, decoded: None,
-            protocol: None, desired_area: Rect::default(), protocol_area: Rect::default(),
+            protocol: None, desired_area: Rect::default(),
+            vertical_placement: ImageVerticalPlacement::Center, protocol_area: Rect::default(),
             protocol_generation: 0, retransmit_generation: 0, font_size: (8, 12),
             warning: None, popup_open: false, popup_rect: Rect::default(),
         }
@@ -178,6 +188,7 @@ impl BrowseArtworkState {
     pub fn suspend(&mut self) {
         self.popup_open = false;
         self.desired_area = Rect::default();
+        self.vertical_placement = ImageVerticalPlacement::Center;
         if self.context.is_some() {
             self.observe(None);
         }
@@ -188,8 +199,28 @@ impl BrowseArtworkState {
         self.protocol_area = Rect::default();
     }
 
-    pub fn set_desired_area(&mut self, area: Rect) {
+    pub fn set_desired_area(&mut self, area: Rect, placement: ImageVerticalPlacement) {
         self.desired_area = area;
+        self.vertical_placement = placement;
+    }
+
+    /// A direct image popup is independent of Info's album selection, which
+    /// may be None when the selected Browse entry is a PNG/JPEG/etc.
+    pub fn is_single_file_popup(&self) -> bool {
+        self.popup_open && matches!(&self.context, Some(ArtworkContext::SingleFile(_)))
+    }
+
+    pub fn open_file_popup(&mut self, path: PathBuf) {
+        self.observe(Some(ArtworkContext::SingleFile(path.clone())));
+        // We already know the exact file. No album traversal, discovery
+        // debounce, or wait for a superseded album scan is necessary.
+        self.scanned = self.context.clone();
+        self.sources = vec![ArtworkSource::File(path)];
+        self.popup_open = true;
+        self.popup_rect = Rect::default();
+        self.desired_area = Rect::default();
+        self.vertical_placement = ImageVerticalPlacement::Center;
+        self.invalidate_protocol();
     }
 
     pub fn has_image(&self) -> bool { self.decoded.is_some() }
@@ -208,7 +239,9 @@ impl BrowseArtworkState {
     pub fn message(&self) -> &str {
         if self.context.is_none() { return ""; }
         if self.decoded.is_some() { return ""; }
-        if self.scan_rx.is_some() || self.scanned.is_none() { return "Finding artwork…"; }
+        if self.scanned.is_none() || (self.scan_rx.is_some() && self.sources.is_empty()) {
+            return "Finding artwork…";
+        }
         if self.decode_rx.is_some() || !self.sources.is_empty() && self.failed.len() < self.sources.len() {
             return "Loading artwork…";
         }
@@ -236,10 +269,17 @@ impl BrowseArtworkState {
     }
 
     pub fn close_popup(&mut self) {
+        let was_file_view = self.is_single_file_popup();
         self.popup_open = false;
         self.popup_rect = Rect::default();
         self.protocol = None; // rebuild for the pane on the next prepare pass
         self.protocol_area = Rect::default();
+        if was_file_view {
+            // Restore Info's ordinary selection on the next draw. Reject any
+            // file-view worker result that arrives after the popup closes.
+            self.observe(None);
+            self.desired_area = Rect::default();
+        }
     }
 
     /// This is invoked before/after terminal draws, never within the renderer.
@@ -282,7 +322,7 @@ impl BrowseArtworkState {
         self.font_size = font_size;
         let desired = self.decoded.as_ref().map_or(self.desired_area, |image| {
             fitted_image_area(self.desired_area, image.width(), image.height(), font_size,
-                config.allow_upscale)
+                config.allow_upscale, self.vertical_placement)
         });
         let kitty = if picker.protocol_type == ratatui_image::picker::ProtocolType::Kitty {
             kitty_generation
@@ -366,12 +406,12 @@ impl BrowseArtworkState {
     /// The renderer merely records the geometry and paints prepared protocol
     /// state; no image file I/O, decode, or protocol construction occurs here.
     pub fn render_image(&mut self, f: &mut ratatui::Frame, area: Rect,
-                        allow_upscale: bool) -> bool {
-        self.set_desired_area(area);
+                        allow_upscale: bool, placement: ImageVerticalPlacement) -> bool {
+        self.set_desired_area(area, placement);
         if self.decoded.is_none() || self.protocol.is_none() { return false; }
         let image = self.decoded.as_ref().expect("checked");
         let target = fitted_image_area(area, image.width(), image.height(), self.font_size,
-            allow_upscale);
+            allow_upscale, placement);
         if target.width == 0 || target.height == 0 || self.protocol_area != target { return false; }
         let widget = ratatui_image::StatefulImage::new(None);
         f.render_stateful_widget(widget, target,
@@ -390,7 +430,8 @@ pub fn percent_height(available: u16, percent: u8) -> u16 {
 /// cell counts. Fit computes the size before rendering, so the actual image
 /// remains centered even when only one dimension needs shrinking.
 fn fitted_image_area(area: Rect, pixel_width: u32, pixel_height: u32,
-                     font_size: (u16, u16), allow_upscale: bool) -> Rect {
+                     font_size: (u16, u16), allow_upscale: bool,
+                     placement: ImageVerticalPlacement) -> Rect {
     if area.width == 0 || area.height == 0 || pixel_width == 0 || pixel_height == 0 {
         return Rect::new(area.x, area.y, 0, 0);
     }
@@ -415,16 +456,20 @@ fn fitted_image_area(area: Rect, pixel_width: u32, pixel_height: u32,
     };
     let width = fit(cell_w, available_w);
     let height = fit(cell_h, available_h);
-    Rect::new(area.x.saturating_add((area.width - width) / 2),
-              area.y.saturating_add((area.height - height) / 2), width, height)
+    let y = match placement {
+        ImageVerticalPlacement::Center => area.y.saturating_add((area.height - height) / 2),
+        ImageVerticalPlacement::Bottom => area.bottom().saturating_sub(height),
+    };
+    Rect::new(area.x.saturating_add((area.width - width) / 2), y, width, height)
 }
 
 pub fn fitted_without_upscale(area: Rect, pixel_width: u32, pixel_height: u32,
                               font_size: (u16, u16)) -> Rect {
-    fitted_image_area(area, pixel_width, pixel_height, font_size, false)
+    fitted_image_area(area, pixel_width, pixel_height, font_size, false,
+        ImageVerticalPlacement::Center)
 }
 
-fn is_supported_image(path: &Path) -> bool {
+pub(crate) fn is_supported_image(path: &Path) -> bool {
     path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| {
         matches!(ext.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp")
     })
@@ -433,16 +478,29 @@ fn is_supported_image(path: &Path) -> bool {
 /// Read only direct entries. A supported image-name symlink is eligible only
 /// when its target resolves to an ordinary file. Never traverse linked folders.
 fn scan_directory(context: ArtworkContext, config: &BrowseArtworkConfig) -> ScanResult {
+    let (directory, selected_audio) = match &context {
+        ArtworkContext::Album { directory, selected_audio } => (directory, selected_audio),
+        ArtworkContext::SingleFile(path) => {
+            // The file action must not launch an album scan or follow folders.
+            // decode_source revalidates the file and enforces resource limits.
+            return ScanResult {
+                context: context.clone(),
+                sources: vec![ArtworkSource::File(path.clone())],
+                warning: None,
+                generation: 0,
+            };
+        }
+    };
     let mut files = Vec::new();
     let mut audio = Vec::new();
     let mut warning = None;
-    if !fs::symlink_metadata(&context.directory).is_ok_and(|md| md.is_dir()) {
+    if !fs::symlink_metadata(directory).is_ok_and(|md| md.is_dir()) {
         return ScanResult {
             context, sources: Vec::new(), warning: Some("Album folder is unavailable".into()),
             generation: 0,
         };
     }
-    match fs::read_dir(&context.directory) {
+    match fs::read_dir(directory) {
         Ok(listing) => {
             for (index, result) in listing.enumerate() {
                 if index >= MAX_DIRECTORY_ENTRIES {
@@ -485,11 +543,11 @@ fn scan_directory(context: ArtworkContext, config: &BrowseArtworkConfig) -> Scan
     audio.sort();
     // The selected track has first opportunity, but a track without artwork
     // must not hide valid embedded art on another track in the same album.
-    if let Some(selected) = &context.selected_audio {
+    if let Some(selected) = selected_audio {
         if let Some(position) = audio.iter().position(|path| path == selected) {
             let path = audio.remove(position);
             audio.insert(0, path);
-        } else if selected.parent() == Some(context.directory.as_path())
+        } else if selected.parent() == Some(directory.as_path())
             && fs::symlink_metadata(selected).is_ok_and(|md| md.is_file())
             && crate::convert::classify::is_audio_file_path(selected)
         {
@@ -596,7 +654,7 @@ mod tests {
             Rect::new(10, 13, 40, 3));
         assert_eq!(fitted_without_upscale(area, 24, 24, (8, 12)),
             Rect::new(28, 14, 3, 2));
-        assert_eq!(fitted_image_area(area, 24, 24, (8, 12), true),
+        assert_eq!(fitted_image_area(area, 24, 24, (8, 12), true, ImageVerticalPlacement::Center),
             Rect::new(15, 5, 30, 20));
     }
 
@@ -610,7 +668,7 @@ mod tests {
         fs::write(root.join("cover.png"), b"image").unwrap();
         fs::create_dir(root.join("artwork")).unwrap();
         fs::write(root.join("artwork").join("cover.jpg"), b"image").unwrap();
-        let ctx = ArtworkContext { directory: root.to_path_buf(), selected_audio: None };
+        let ctx = ArtworkContext::Album { directory: root.to_path_buf(), selected_audio: None };
         let result = scan_directory(ctx.clone(), &BrowseArtworkConfig::default());
         assert_eq!(result.sources.len(), 4);
         assert!(matches!(&result.sources[0], ArtworkSource::Embedded(_)));
@@ -631,7 +689,7 @@ mod tests {
         fs::write(tmp.path().join("folder.jpg"), b"image").unwrap();
         let mut config = BrowseArtworkConfig::default();
         config.filenames = vec!["FOLDER.JPG".into(), "front.jpg".into()];
-        let result = scan_directory(ArtworkContext {
+        let result = scan_directory(ArtworkContext::Album {
             directory: tmp.path().into(), selected_audio: None,
         }, &config);
         let labels: Vec<_> = result.sources.iter().map(ArtworkSource::label).collect();
@@ -664,7 +722,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         for index in 0..140 { fs::write(tmp.path().join(format!("a{index:04}.jpg")), b"x").unwrap(); }
         fs::write(tmp.path().join("cover.png"), b"x").unwrap();
-        let result = scan_directory(ArtworkContext { directory: tmp.path().into(), selected_audio: None },
+        let result = scan_directory(ArtworkContext::Album { directory: tmp.path().into(), selected_audio: None },
                                     &BrowseArtworkConfig::default());
         assert_eq!(result.sources.len(), MAX_FOLDER_IMAGES);
         assert_eq!(result.sources[0].label(), "cover.png");
@@ -675,7 +733,7 @@ mod tests {
     fn stale_generation_is_rejected_after_policy_change() {
         let mut state = BrowseArtworkState::default();
         let tmp = tempfile::tempdir().unwrap();
-        let context = ArtworkContext { directory: tmp.path().into(), selected_audio: None };
+        let context = ArtworkContext::Album { directory: tmp.path().into(), selected_audio: None };
         state.observe(Some(context.clone()));
         let stale = state.generation;
         state.invalidate();
@@ -707,7 +765,7 @@ mod tests {
         fs::write(&first, include_bytes!("../../tests/fixtures/silence.flac")).unwrap();
         fs::write(&second, include_bytes!("../../tests/fixtures/browse_artwork/embedded_valid.flac")).unwrap();
         image::DynamicImage::new_rgb8(8, 6).save(tmp.path().join("cover.jpg")).unwrap();
-        let sources = scan_directory(ArtworkContext {
+        let sources = scan_directory(ArtworkContext::Album {
             directory: tmp.path().into(), selected_audio: None,
         }, &BrowseArtworkConfig::default()).sources;
         assert_eq!(sources.len(), 2); // One logical embedded image and one folder cover.
@@ -718,7 +776,7 @@ mod tests {
         assert_eq!(sources[1].label(), "cover.jpg");
 
         // A selected track that lacks artwork still searches the other tracks.
-        let selected = scan_directory(ArtworkContext {
+        let selected = scan_directory(ArtworkContext::Album {
             directory: tmp.path().into(), selected_audio: Some(first),
         }, &BrowseArtworkConfig::default()).sources;
         assert_eq!(decode_source(&selected[0]).unwrap().embedded_path.as_deref(), Some(second.as_path()));
@@ -732,7 +790,7 @@ mod tests {
         let good = tmp.path().join("02 Usable.flac");
         fs::write(&good,
             include_bytes!("../../tests/fixtures/browse_artwork/embedded_valid.flac")).unwrap();
-        let sources = scan_directory(ArtworkContext {
+        let sources = scan_directory(ArtworkContext::Album {
             directory: tmp.path().into(), selected_audio: None,
         }, &BrowseArtworkConfig::default()).sources;
         assert_eq!(sources.len(), 1);
@@ -748,7 +806,7 @@ mod tests {
         let bytes = include_bytes!("../../tests/fixtures/browse_artwork/embedded_valid.flac");
         fs::write(&first, bytes).unwrap();
         fs::write(&second, bytes).unwrap();
-        let sources = scan_directory(ArtworkContext {
+        let sources = scan_directory(ArtworkContext::Album {
             directory: tmp.path().into(), selected_audio: Some(second.clone()),
         }, &BrowseArtworkConfig::default()).sources;
         let decoded = decode_source(&sources[0]).unwrap();
@@ -763,7 +821,7 @@ mod tests {
         fs::write(tmp.path().join("02 Song.flac"),
             include_bytes!("../../tests/fixtures/silence.flac")).unwrap();
         image::DynamicImage::new_rgb8(7, 9).save(tmp.path().join("cover.jpg")).unwrap();
-        let sources = scan_directory(ArtworkContext {
+        let sources = scan_directory(ArtworkContext::Album {
             directory: tmp.path().into(), selected_audio: None,
         }, &BrowseArtworkConfig::default()).sources;
         assert_eq!(sources.len(), 2);
@@ -771,6 +829,84 @@ mod tests {
         assert_eq!(sources[1].label(), "cover.jpg");
         let decoded = decode_source(&sources[1]).expect("fallback cover must be usable");
         assert_eq!((decoded.image.width(), decoded.image.height()), (7, 9));
+    }
+
+    #[test]
+    fn info_image_bottom_placement_stays_fixed_as_height_allocation_grows() {
+        // The 1080-pixel square reaches the Info pane's width ceiling.
+        // The extra height at 75% must go ABOVE the image, not below it.
+        let bottom = 70;
+        let mut prior_height = 0;
+        for height in [22, 38, 57] {
+            let area = Rect::new(5, bottom - height, 80, height);
+            let target = fitted_image_area(area, 1080, 1080, (12, 24), true,
+                ImageVerticalPlacement::Bottom);
+            assert_eq!(target.bottom(), bottom);
+            assert!(target.height >= prior_height);
+            assert!(target.width <= area.width);
+            prior_height = target.height;
+        }
+        let popup = fitted_image_area(Rect::new(5, 5, 80, 57), 1080, 1080, (12, 24),
+            true, ImageVerticalPlacement::Center);
+        assert_eq!(popup.y, 5 + (57 - popup.height) / 2);
+    }
+
+    #[test]
+    fn file_view_decodes_only_selected_image_and_restores_album_state_on_close() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("image.png");
+        image::DynamicImage::new_rgba8(24, 18).save(&image_path).unwrap();
+        fs::write(temp.path().join("unrelated.jpg"), b"not decoded").unwrap();
+
+        let mut state = BrowseArtworkState::default();
+        state.observe(Some(ArtworkContext::Album {
+            directory: temp.path().to_path_buf(), selected_audio: None,
+        }));
+        let album_generation = state.generation;
+        state.open_file_popup(image_path.clone());
+        assert!(state.is_single_file_popup());
+        assert!(state.generation > album_generation);
+        assert_eq!(state.scanned, state.context);
+        assert!(state.scan_rx.is_none(), "direct View must not scan the directory");
+        assert_eq!(state.sources, vec![ArtworkSource::File(image_path.clone())]);
+        assert!(!state.cycle(true), "a single image has nothing to cycle to");
+
+        let mut picker = Picker::new((12, 24));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !state.has_image() && Instant::now() < deadline {
+            state.prepare(&mut picker, 0, 0, &BrowseArtworkConfig::default());
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(state.has_image(), "direct image should decode in a bounded worker");
+        assert_eq!(state.decoded.as_ref().map(|image| (image.width(), image.height())),
+            Some((24, 18)));
+
+        let file_generation = state.generation;
+        state.close_popup();
+        assert!(!state.popup_open);
+        assert!(!state.is_single_file_popup());
+        assert!(state.context.is_none());
+        assert!(state.sources.is_empty());
+        assert!(state.generation > file_generation);
+    }
+
+    #[test]
+    fn stale_file_view_result_is_discarded_after_popup_closes() {
+        let mut state = BrowseArtworkState::default();
+        state.open_file_popup(PathBuf::from("/pictures/front.png"));
+        let stale = state.generation;
+        let (tx, rx) = mpsc::channel();
+        state.decode_rx = Some(rx);
+        tx.send(DecodeResult {
+            generation: stale,
+            source: ArtworkSource::File(PathBuf::from("/pictures/front.png")),
+            image: Err("stale decode error".to_string()),
+        }).unwrap();
+        state.close_popup();
+        state.poll_workers();
+        assert_eq!(state.message(), "");
+        assert!(state.warning.is_none());
+        assert!(state.context.is_none());
     }
 
     #[cfg(unix)]
@@ -789,7 +925,7 @@ mod tests {
         image::DynamicImage::new_rgb8(9, 9).save(nested.join("unreferenced.png")).unwrap();
         symlink(&nested, album.join("original_cover.jpg")).unwrap();
         image::DynamicImage::new_rgb8(6, 6).save(album.join("back.png")).unwrap();
-        let sources = scan_directory(ArtworkContext {
+        let sources = scan_directory(ArtworkContext::Album {
             directory: album.clone(), selected_audio: None,
         }, &BrowseArtworkConfig::default()).sources;
         let labels: Vec<_> = sources.iter().map(ArtworkSource::label).collect();
@@ -833,21 +969,27 @@ pub fn draw_popup(f: &mut ratatui::Frame, app: &mut super::app::AppState,
     let rect = popup_rect(terminal, app.browse.artwork_config.popup_height_percent);
     app.browse_artwork.popup_rect = rect;
     f.render_widget(Clear, rect);
+    let single_file = app.browse_artwork.is_single_file_popup();
+    let title = if single_file { " Image · Esc to close " }
+        else { " Album artwork · Esc to close " };
     f.render_widget(Block::default().borders(Borders::ALL)
-        .title(" Album artwork · Esc to close ")
+        .title(title)
         .style(Style::default().fg(theme.text).bg(theme.panel_bg))
         .border_style(theme.border(theme.amber)), rect);
     let image_area = Rect::new(rect.x + 1, rect.y + 1,
         rect.width.saturating_sub(2), rect.height.saturating_sub(3));
     let displayed = app.browse_artwork.render_image(f, image_area,
-        app.browse.artwork_config.allow_upscale);
+        app.browse.artwork_config.allow_upscale, ImageVerticalPlacement::Center);
     if !displayed {
         let caption = app.browse_artwork.message();
         f.render_widget(Paragraph::new(caption).style(theme.muted()), image_area);
     }
     let label = app.browse_artwork.current_label().unwrap_or_default();
-    let caption = format!(" {}  ({}/{}) · ←/→ or click: next ",
-        label, app.browse_artwork.index().saturating_add(1), app.browse_artwork.count());
+    let count = app.browse_artwork.count();
+    let navigation = if count > 1 { " · ←/→ or click: next" } else { "" };
+    let caption = format!(" {}  ({}/{}){} ",
+        label, if count == 0 { 0 } else { app.browse_artwork.index() + 1 },
+        count, navigation);
     let caption = super::display_width::fit_prefix(&caption, rect.width.saturating_sub(2) as usize);
     f.render_widget(Paragraph::new(caption).style(theme.muted()),
         Rect::new(rect.x + 1, rect.bottom() - 2, rect.width.saturating_sub(2), 1));

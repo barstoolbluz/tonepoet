@@ -16138,6 +16138,9 @@ pub struct AppState {
     /// as the preferred start directory for the next artwork picker session.
     pub last_artwork_picker_dir: Option<std::path::PathBuf>,
 
+    /// Terminal-reported cell pixels, retained when SSH PTYs report 0x0 pixels.
+    /// The XTWINOPS query is run once, before crossterm begins reading events.
+    pub queried_image_cell_size: Option<(u16, u16)>,
     /// Terminal image protocol picker detected once at startup and refreshed on resize.
     pub image_picker: ratatui_image::picker::Picker,
     /// Monotonic generation for terminal image protocol/cell-size changes.
@@ -16158,10 +16161,35 @@ pub struct AppState {
     pub tool_check_cache: once_cell::sync::OnceCell<Vec<(String, String, bool)>>,
 }
 
-fn new_terminal_image_picker() -> ratatui_image::picker::Picker {
-    let mut picker = ratatui_image::picker::Picker::from_termios()
-        .unwrap_or_else(|_| ratatui_image::picker::Picker::new((8, 12)));
+fn new_terminal_image_picker(
+    queried_cell_size: Option<(u16, u16)>,
+) -> ratatui_image::picker::Picker {
+    use ratatui_image::picker::{Picker, ProtocolType};
+
+    // A user's explicit setting overrides both ioctl and the escape-sequence
+    // query. Otherwise prefer live ioctl dimensions (which can change with a
+    // font resize), then the last terminal response over SSH.
+    let configured = super::terminal_image_geometry::configured_cell_size();
+    let termios = Picker::from_termios().ok().filter(|picker| {
+        picker.font_size.0 > 0 && picker.font_size.1 > 0
+    });
+    let reliable_metrics = configured.is_some() || termios.is_some() || queried_cell_size.is_some();
+    let mut picker = if let Some(size) = configured {
+        Picker::new(size)
+    } else if let Some(picker) = termios {
+        picker
+    } else if let Some(size) = queried_cell_size {
+        Picker::new(size)
+    } else {
+        // With no measured cell size, pixel-based protocols cannot map
+        // images to terminal cells safely. Halfblocks are cell-based and
+        // need only a plausible pixel aspect ratio (1:2, not 8:12).
+        Picker::new((10, 20))
+    };
     configure_terminal_image_picker_protocol_for_current_environment(&mut picker);
+    if !reliable_metrics {
+        picker.protocol_type = ProtocolType::Halfblocks;
+    }
     picker
 }
 
@@ -17081,7 +17109,8 @@ impl AppState {
             archive_listing_cache_bytes: 0,
             split_cue_album_grouping_cache: std::collections::HashMap::new(),
             last_artwork_picker_dir: None,
-            image_picker: new_terminal_image_picker(),
+            queried_image_cell_size: None,
+            image_picker: new_terminal_image_picker(None),
             image_picker_generation: 0,
             image_repaint_generation: 0,
             image_kitty_retransmit_generation: 0,
@@ -17648,14 +17677,30 @@ impl AppState {
         self.set_ui_theme(&slug);
     }
 
+    /// Called exactly once after entering raw/alternate-screen terminal mode
+    /// and before crossterm's input event reader starts. A bounded XTWINOPS
+    /// query gets actual cell pixels even when the SSH PTY reports 0 x 0.
+    pub fn probe_image_cell_size_at_tui_startup(&mut self) {
+        if super::terminal_image_geometry::configured_cell_size().is_none()
+            && !ratatui_image::picker::Picker::from_termios()
+                .is_ok_and(|picker| picker.font_size.0 > 0 && picker.font_size.1 > 0)
+        {
+            self.queried_image_cell_size = super::terminal_image_geometry::query_cell_size(
+                std::time::Duration::from_millis(250),
+            );
+        }
+        self.refresh_image_picker_after_resize();
+    }
+
     /// Refresh terminal graphics protocol detection after a terminal resize.
     ///
     /// `ratatui-image` protocol state is encoded for terminal cell geometry.
     /// Re-detecting the picker and advancing this generation forces metadata
     /// and file-picker preview caches to rebuild instead of reusing stale
     /// StatefulProtocol values after the terminal size/cell metrics change.
+    /// Do not query stdin here: crossterm already owns the event reader.
     pub fn refresh_image_picker_after_resize(&mut self) {
-        self.image_picker = new_terminal_image_picker();
+        self.image_picker = new_terminal_image_picker(self.queried_image_cell_size);
         self.image_picker_generation = self.image_picker_generation.saturating_add(1);
         self.last_image_kitty_retransmit_at = None;
 
@@ -17784,7 +17829,8 @@ impl AppState {
             _ => {}
         }
         if self.current_screen == AppScreen::Browse
-            && self.browse.info_enabled && !self.browse.info_collapsed
+            && ((self.browse.info_enabled && !self.browse.info_collapsed)
+                || self.browse_artwork.popup_open)
         {
             changed |= self.browse_artwork.prepare(
                 &mut self.image_picker,
