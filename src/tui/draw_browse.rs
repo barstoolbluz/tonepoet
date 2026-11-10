@@ -452,6 +452,22 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: 
         }
     }
 
+    // A native image can alter terminal pixels outside its fitted rectangle,
+    // even though Ratatui still considers the corresponding cells unchanged.
+    // Limit the normal preview repair to Info. A full-size file viewer (which
+    // also works with Info disabled) and its one-shot teardown need the whole
+    // screen; only blank theme-background cells are actually updated.
+    let restore_background = app.browse_artwork.take_background_restore();
+    let popup_open = app.browse_artwork.popup_open;
+    let inline_image_visible = app.browse.info_enabled && !app.browse.info_collapsed
+        && app.browse.artwork_config.enabled && app.browse_artwork.has_image();
+    if app.image_picker.protocol_type != ratatui_image::picker::ProtocolType::Halfblocks
+        && (popup_open || restore_background || inline_image_visible)
+    {
+        let repaint_area = if popup_open || restore_background { f.size() } else { info_area };
+        super::browse_artwork::repaint_image_background(f, repaint_area, theme.bg);
+    }
+
     let file_task_footer = app.file_task_footer_state();
     let status_msg = app.status_message.as_ref().map(|(s, _)| s.as_str());
     draw_footer(
@@ -3639,7 +3655,7 @@ fn draw_browse_info_with_artwork(
 
     lines.push(bot_line);
 
-    let paragraph = Paragraph::new(lines);
+    let paragraph = Paragraph::new(lines).style(Style::default().bg(theme.bg));
     f.render_widget(paragraph, area);
 
     if artwork_height > 0 {
@@ -3652,7 +3668,7 @@ fn draw_browse_info_with_artwork(
             let image_area = info_artwork_image_area(artwork_area);
             let visible = !suppress_image
                 && state.render_image(f, image_area, config.allow_upscale,
-                    ImageVerticalPlacement::Bottom);
+                    ImageVerticalPlacement::Bottom, theme.bg);
             if !visible && !suppress_image {
                 // Silent when no embedded/external image exists. Missing tag
                 // diagnostics belong to explicit operations, not Browse Info.

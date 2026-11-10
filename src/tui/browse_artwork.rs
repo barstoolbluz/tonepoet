@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use image::{DynamicImage, ImageReader, Limits};
 use lofty::picture::PictureType;
-use ratatui::layout::Rect;
+use ratatui::{buffer::Buffer, layout::Rect, style::Color};
 use ratatui_image::{picker::Picker, protocol::StatefulProtocol};
 
 use crate::config::BrowseArtworkConfig;
@@ -137,6 +137,9 @@ pub struct BrowseArtworkState {
     warning: Option<String>,
     pub popup_open: bool,
     pub popup_rect: Rect,
+    // Native graphics may have altered terminal pixels outside the ratatui diff.
+    // One extra blank-cell repaint restores the Info pane after image teardown.
+    needs_background_restore: bool,
 }
 
 impl Default for BrowseArtworkState {
@@ -149,6 +152,7 @@ impl Default for BrowseArtworkState {
             vertical_placement: ImageVerticalPlacement::Center, protocol_area: Rect::default(),
             protocol_generation: 0, retransmit_generation: 0, font_size: (8, 12),
             inline_click_source: None, warning: None, popup_open: false, popup_rect: Rect::default(),
+            needs_background_restore: false,
         }
     }
 }
@@ -156,6 +160,7 @@ impl Default for BrowseArtworkState {
 impl BrowseArtworkState {
     pub fn observe(&mut self, context: Option<ArtworkContext>) {
         if self.context == context { return; }
+        self.needs_background_restore |= self.decoded.is_some() || self.protocol.is_some();
         self.context = context;
         self.generation = self.generation.wrapping_add(1);
         self.changed_at = Instant::now();
@@ -181,6 +186,7 @@ impl BrowseArtworkState {
     /// User-initiated reload or discovery-policy change. Keep in-flight work
     /// owned, but reject its result if the policy has changed in the meantime.
     pub fn invalidate(&mut self) {
+        self.needs_background_restore |= self.decoded.is_some() || self.protocol.is_some();
         self.generation = self.generation.wrapping_add(1);
         self.scanned = None;
         self.changed_at = Instant::now();
@@ -196,6 +202,10 @@ impl BrowseArtworkState {
         if self.context.is_some() {
             self.observe(None);
         }
+    }
+
+    pub fn take_background_restore(&mut self) -> bool {
+        std::mem::take(&mut self.needs_background_restore)
     }
 
     pub fn invalidate_protocol(&mut self) {
@@ -296,6 +306,7 @@ impl BrowseArtworkState {
             let next = if forward { (self.cursor + step) % len }
                 else { (self.cursor + len - (step % len)) % len };
             if !self.failed.contains(&next) {
+                self.needs_background_restore |= self.decoded.is_some() || self.protocol.is_some();
                 self.cursor = next;
                 self.generation = self.generation.wrapping_add(1);
                 self.decoded_source = None;
@@ -311,6 +322,7 @@ impl BrowseArtworkState {
 
     pub fn close_popup(&mut self) {
         let was_file_view = self.is_single_file_popup();
+        self.needs_background_restore = true;
         self.popup_open = false;
         self.popup_rect = Rect::default();
         self.inline_click_source = None;
@@ -457,17 +469,58 @@ impl BrowseArtworkState {
     /// The renderer merely records the geometry and paints prepared protocol
     /// state; no image file I/O, decode, or protocol construction occurs here.
     pub fn render_image(&mut self, f: &mut ratatui::Frame, area: Rect,
-                        allow_upscale: bool, placement: ImageVerticalPlacement) -> bool {
+                        allow_upscale: bool, placement: ImageVerticalPlacement,
+                        background: Color) -> bool {
         self.set_desired_area(area, placement);
         if self.decoded.is_none() || self.protocol.is_none() { return false; }
         let image = self.decoded.as_ref().expect("checked");
         let target = fitted_image_area(area, image.width(), image.height(), self.font_size,
             allow_upscale, placement);
         if target.width == 0 || target.height == 0 || self.protocol_area != target { return false; }
-        let widget = ratatui_image::StatefulImage::new(None);
+        // The image protocol needs the actual UI background when padding or
+        // compositing source pixels, not the terminal's default background.
+        let (r, g, b) = super::theme::rgb_tuple(background);
+        let widget = ratatui_image::StatefulImage::new(Some(image::Rgb([r, g, b])));
         f.render_stateful_widget(widget, target,
             self.protocol.as_mut().expect("checked"));
         true
+    }
+}
+
+
+/// Keep Ratatui's diff in sync with terminal graphics outside the fitted image.
+/// Sixel/Kitty/iTerm can change actual terminal pixels without changing any
+/// normal cell. Repainting blank theme-background cells is necessary even if
+/// Ratatui still believes their contents are identical to the previous frame.
+/// Alternating the *invisible* foreground forces diff updates without changing
+/// the displayed color or touching either text or graphics-protocol cells.
+/// Both choices must be explicit RGB values: a first frame with a Reset ink
+/// color would otherwise leave previously unpainted cells unchanged.
+fn background_repaint_ink(background: Color, frame_count: usize) -> Color {
+    let (r, g, b) = super::theme::rgb_tuple(background);
+    if frame_count % 2 == 0 {
+        Color::Rgb(r, g, b)
+    } else {
+        Color::Rgb(if r == u8::MAX { r - 1 } else { r + 1 }, g, b)
+    }
+}
+
+pub(crate) fn repaint_image_background(f: &mut ratatui::Frame, area: Rect, background: Color) {
+    let ink = background_repaint_ink(background, f.count());
+    repaint_blank_background_cells(f.buffer_mut(), area, background, ink);
+}
+
+fn repaint_blank_background_cells(buffer: &mut Buffer, area: Rect, background: Color, ink: Color) {
+    let area = area.intersection(buffer.area);
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let cell = buffer.get_mut(x, y);
+            // Image widgets mark covered cells as skipped. Do not overwrite their
+            // escape sequences or controls, and do not recolor other UI surfaces.
+            if !cell.skip && cell.symbol() == " " && cell.bg == background {
+                cell.set_fg(ink);
+            }
+        }
     }
 }
 
@@ -858,6 +911,67 @@ mod tests {
     }
 
     #[test]
+    fn graphics_background_restore_preserves_text_images_and_other_surfaces() {
+        let area = Rect::new(0, 0, 9, 3);
+        let background = Color::Rgb(26, 27, 38);
+        let other_background = Color::Rgb(40, 44, 52);
+        let mut before = Buffer::empty(area);
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                before.get_mut(x, y).set_bg(background);
+            }
+        }
+        before.get_mut(1, 1).set_symbol("T");
+        before.get_mut(2, 1).set_skip(true); // native image area
+        before.get_mut(3, 1).set_bg(other_background); // control surface
+
+        let even = background_repaint_ink(background, 0);
+        let odd = background_repaint_ink(background, 1);
+        assert_ne!(even, Color::Reset);
+        assert_ne!(odd, Color::Reset);
+        assert_ne!(even, odd);
+        assert_eq!(even, background);
+        assert_eq!(odd, Color::Rgb(27, 27, 38));
+        assert_eq!(background_repaint_ink(Color::Rgb(255, 0, 0), 1),
+            Color::Rgb(254, 0, 0)); // keep the +/-1 adjustment in range
+
+        // A new preview may first render on an odd OR an even frame, before
+        // any foreground has been painted. Both must generate terminal writes.
+        for first_frame in [0_usize, 1] {
+            let mut previous = before.clone();
+            // Also exercise consecutive frames while native artwork is active.
+            for frame_count in first_frame..first_frame + 3 {
+                let mut after = previous.clone();
+                repaint_blank_background_cells(&mut after, area, background,
+                    background_repaint_ink(background, frame_count));
+
+                for (x, y) in [(1, 1), (2, 1), (3, 1)] {
+                    assert_eq!(after.get(x, y), before.get(x, y),
+                        "text, native images, and non-theme surfaces must not change");
+                }
+                assert_eq!(after.get(4, 1).bg, background);
+                assert_ne!(after.get(4, 1).fg, Color::Reset);
+                assert!(previous.diff(&after).iter().any(|(x, y, _)| (*x, *y) == (4, 1)),
+                    "frame {frame_count} must repaint an initially reset blank cell");
+                assert!(previous.diff(&after).iter().all(|(x, y, _)| {
+                    let cell = after.get(*x, *y);
+                    !cell.skip && cell.symbol() == " " && cell.bg == background
+                }), "only blank theme-background cells may be repainted");
+                previous = after;
+            }
+        }
+    }
+
+    #[test]
+    fn image_close_requests_one_background_restoration() {
+        let mut artwork = BrowseArtworkState::default();
+        artwork.popup_open = true;
+        artwork.close_popup();
+        assert!(artwork.take_background_restore());
+        assert!(!artwork.take_background_restore());
+    }
+
+    #[test]
     fn popup_background_and_mouse_hitbox_fit_image_without_a_caption() {
         use ratatui::{backend::TestBackend, widgets::Paragraph, Terminal};
 
@@ -1209,7 +1323,8 @@ pub fn draw_popup(f: &mut ratatui::Frame, app: &mut super::app::AppState,
     f.render_widget(Block::default()
         .style(Style::default().bg(theme.bg)), rect);
     let displayed = app.browse_artwork.render_image(f, viewport,
-        app.browse.artwork_config.allow_upscale, ImageVerticalPlacement::Center);
+        app.browse.artwork_config.allow_upscale, ImageVerticalPlacement::Center,
+        theme.bg);
     if !displayed {
         let message = app.browse_artwork.message();
         let message = if message.is_empty() { "Loading image…" } else { message };
