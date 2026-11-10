@@ -452,20 +452,17 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: 
         }
     }
 
-    // A native image can alter terminal pixels outside its fitted rectangle,
-    // even though Ratatui still considers the corresponding cells unchanged.
-    // Limit the normal preview repair to Info. A full-size file viewer (which
-    // also works with Info disabled) and its one-shot teardown need the whole
-    // screen; only blank theme-background cells are actually updated.
-    let restore_background = app.browse_artwork.take_background_restore();
-    let popup_open = app.browse_artwork.popup_open;
-    let inline_image_visible = app.browse.info_enabled && !app.browse.info_collapsed
-        && app.browse.artwork_config.enabled && app.browse_artwork.has_image();
+    // Native image placement can alter pixels outside Ratatui's text buffer.
+    // Repair the blank theme background only when the graphics protocol has
+    // actually changed (or a popup closed). During startup, unrelated probe
+    // messages can redraw Browse dozens of times: repainting the entire
+    // terminal on EVERY such frame both delays input and floods slow links.
     if app.image_picker.protocol_type != ratatui_image::picker::ProtocolType::Halfblocks
-        && (popup_open || restore_background || inline_image_visible)
+        && app.browse_artwork.take_background_restore()
     {
-        let repaint_area = if popup_open || restore_background { f.size() } else { info_area };
-        super::browse_artwork::repaint_image_background(f, repaint_area, theme.bg);
+        super::browse_artwork::repaint_image_background(
+            f, f.size(), theme.bg, app.browse_artwork.background_restore_count(),
+        );
     }
 
     let file_task_footer = app.file_task_footer_state();

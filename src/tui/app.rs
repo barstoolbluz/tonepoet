@@ -16329,7 +16329,10 @@ fn lower_env_value(value: Option<&std::ffi::OsStr>) -> Option<String> {
     Some(value.to_string_lossy().to_ascii_lowercase())
 }
 
-const KITTY_IMAGE_RETRANSMIT_MIN_INTERVAL: Duration = Duration::from_millis(33);
+// Pointer-motion graphics recovery is opportunistic. Re-encoding and
+// retransmitting a large Kitty image at 30 Hz can stall input during startup
+// Browse scans; explicit image changes still invalidate immediately.
+const KITTY_IMAGE_RETRANSMIT_MIN_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Database source used while constructing [`AppState`].
 ///

@@ -167,7 +167,8 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
             }
             _ => {}
         }
-        app.request_image_preview_repaint();
+        // The image was invalidated by cycle/close (or the key was ignored).
+        // An additional full Kitty retransmit would stall the next input.
         return;
     }
 
@@ -3726,7 +3727,6 @@ pub(crate) fn activate_browse_entry(
     // This route is shared by double-click and Enter, like text-file View.
     if browse_entry_opens_artwork(&entry, app.browse.is_in_archive()) {
         app.browse_artwork.open_file_popup(entry.path);
-        app.request_image_preview_repaint();
         return;
     }
 
@@ -6045,6 +6045,361 @@ mod inline_edit_behavior_tests {
         handle_mouse(&mut app, click(), &tx);
         assert!(app.browse_artwork.popup_open);
         assert_eq!(app.browse_artwork.current_label(), initial);
+    }
+
+    #[test]
+    fn info_artwork_right_click_opens_its_own_menu_without_changing_selection() {
+        let (tx, mut rx) = channel();
+        let temp = tempfile::tempdir().unwrap();
+        let audio = temp.path().join("01.flac");
+        std::fs::write(&audio, b"fixture").unwrap();
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
+            audio.clone(), "01.flac".to_owned(),
+            crate::convert::classify::classify_file(&audio), 7, None,
+        )];
+        app.button_map.record_button(TuiButton::BrowseInfoArtworkArea,
+            Rect::new(20, 12, 25, 12));
+        handle_mouse(&mut app, MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right), column: 24, row: 15,
+            modifiers: KeyModifiers::NONE,
+        }, &tx);
+        assert_eq!(app.browse.selected_index, 0);
+        assert!(matches!(app.active_overlay, ActiveOverlay::ContextMenu { .. }));
+        assert!(app.browse_context_action_paths.is_none());
+        assert!(rx.try_recv().is_err(),
+            "an artwork menu must not initiate an unrelated audio/CUE probe");
+    }
+
+    #[test]
+    fn repeated_info_artwork_right_click_never_falls_back_to_audio_menu() {
+        use crate::tui::context_menu::{ContextAction, ContextMenuEntry};
+        let (tx, mut rx) = channel();
+        let temp = tempfile::tempdir().unwrap();
+        image::DynamicImage::new_rgb8(8, 8)
+            .save(temp.path().join("cover.png")).unwrap();
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse_artwork.observe(Some(super::super::browse_artwork::ArtworkContext::Album {
+            directory: temp.path().to_path_buf(), selected_audio: None,
+        }));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !app.browse_artwork.has_image() && std::time::Instant::now() < deadline {
+            app.browse_artwork.prepare(&mut app.image_picker, 0, 0,
+                &app.browse.artwork_config);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(app.browse_artwork.has_image());
+        app.browse_artwork.set_desired_area(Rect::new(20, 12, 25, 12),
+            super::super::browse_artwork::ImageVerticalPlacement::Center);
+        assert!(app.browse_artwork.prepare(&mut app.image_picker, 0, 0,
+            &app.browse.artwork_config), "Info art protocol must be prepared");
+        app.button_map.record_button(TuiButton::BrowseInfoArtworkArea,
+            Rect::new(20, 12, 25, 12));
+        let original_selection = app.browse.selected_index;
+        for (x, y) in [(25, 15), (30, 18), (25, 15)] {
+            handle_mouse(&mut app, MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right), column: x, row: y,
+                modifiers: KeyModifiers::NONE,
+            }, &tx);
+            let ActiveOverlay::ContextMenu { levels, .. } = &app.active_overlay else {
+                panic!("Info artwork menu");
+            };
+            assert!(levels[0].entries.iter().any(|entry| matches!(entry,
+                ContextMenuEntry::Item(item)
+                    if matches!(&item.action, ContextAction::BrowseArtworkView))),
+                "Info artwork must not show the underlying audio-file menu");
+            assert_eq!(app.browse.selected_index, original_selection);
+        }
+        assert!(rx.try_recv().is_err(), "Info art menu must not start audio/CUE probes");
+    }
+
+    #[test]
+    fn repeated_right_click_inside_fullsize_artwork_keeps_artwork_actions_and_selection() {
+        use crate::tui::context_menu::{ContextAction, ContextMenuEntry};
+
+        let (tx, mut rx) = channel();
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("front.png");
+        image::DynamicImage::new_rgb8(8, 8).save(&image).unwrap();
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse_artwork.open_file_popup(image);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !app.browse_artwork.has_image() && std::time::Instant::now() < deadline {
+            app.browse_artwork.prepare(&mut app.image_picker, 0, 0,
+                &app.browse.artwork_config);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(app.browse_artwork.has_image());
+        app.browse_artwork.set_desired_area(Rect::new(10, 6, 55, 24),
+            super::super::browse_artwork::ImageVerticalPlacement::Center);
+        assert!(app.browse_artwork.prepare(&mut app.image_picker, 0, 0,
+            &app.browse.artwork_config), "full-size image protocol must be prepared");
+        app.browse_artwork.popup_rect = Rect::new(10, 6, 55, 24);
+        let selected = app.browse.selected_index;
+        for (x, y) in [(20, 12), (21, 12), (28, 18)] {
+            handle_mouse(&mut app, MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right), column: x, row: y,
+                modifiers: KeyModifiers::NONE,
+            }, &tx);
+            let ActiveOverlay::ContextMenu { levels, origin, .. } = &app.active_overlay else {
+                panic!("each click must show an artwork context menu");
+            };
+            assert_eq!(*origin, (x, y));
+            assert!(levels[0].entries.iter().any(|entry| matches!(entry,
+                ContextMenuEntry::Item(item)
+                    if matches!(&item.action, ContextAction::BrowseArtworkCloseView))),
+                "a repeated click must still offer Close view, not Browse file actions");
+            assert!(app.browse_artwork.popup_open);
+            assert_eq!(app.browse.selected_index, selected);
+            assert!(app.browse_context_action_paths.is_none());
+        }
+        assert!(rx.try_recv().is_err(), "artwork right-clicks must not probe audio/CUE");
+    }
+
+    #[test]
+    fn artwork_menu_dismissals_restore_native_pixels_only_if_view_remains() {
+        use ratatui::{backend::TestBackend, style::Color, Terminal};
+        use ratatui_image::picker::ProtocolType;
+        use crate::tui::context_menu::ContextAction;
+
+        let (tx, _rx) = channel();
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("front.png");
+        image::DynamicImage::new_rgb8(160, 96).save(&image).unwrap();
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.image_picker.protocol_type = ProtocolType::Sixel;
+        app.browse_artwork.open_file_popup(image);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !app.browse_artwork.has_image() && std::time::Instant::now() < deadline {
+            app.browse_artwork.prepare(&mut app.image_picker, 0, 0,
+                &app.browse.artwork_config);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(app.browse_artwork.has_image());
+        let viewport = Rect::new(10, 6, 55, 24);
+        app.browse_artwork.set_desired_area(viewport,
+            super::super::browse_artwork::ImageVerticalPlacement::Center);
+        assert!(app.browse_artwork.prepare(&mut app.image_picker, 0, 0,
+            &app.browse.artwork_config), "native image protocol must be prepared");
+        let mut terminal = Terminal::new(TestBackend::new(100, 45)).unwrap();
+        // Render a real native-image frame between interactions. Clear models
+        // the menu's overwriting of pixels away from the image-origin cell.
+        let draw_artwork = |app: &mut AppState, terminal: &mut Terminal<TestBackend>| {
+            app.browse_artwork.prepare(&mut app.image_picker, 0, 0,
+                &app.browse.artwork_config);
+            let menu_open = matches!(&app.active_overlay, ActiveOverlay::ContextMenu { .. });
+            terminal.draw(|frame| {
+                assert!(app.browse_artwork.render_image(frame, viewport,
+                    app.browse.artwork_config.allow_upscale,
+                    super::super::browse_artwork::ImageVerticalPlacement::Center,
+                    Color::Rgb(26, 27, 38)));
+                if menu_open {
+                    frame.render_widget(ratatui::widgets::Clear,
+                        Rect::new(30, 16, 4, 2));
+                }
+            }).unwrap();
+        };
+        draw_artwork(&mut app, &mut terminal);
+        app.browse_artwork.take_background_restore();
+        app.browse_artwork.popup_rect = viewport;
+        let right = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right), column: 20, row: 12,
+            modifiers: KeyModifiers::NONE,
+        };
+        open_browse_artwork_context_menu(&mut app, right.column, right.row);
+        assert!(!app.browse_artwork.take_background_restore(),
+            "opening a menu must not retransmit the image immediately");
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+        assert!(app.browse_artwork.popup_open);
+        assert!(app.browse_artwork.take_background_restore(),
+            "Esc dismissal must schedule one native image restoration");
+        assert!(!app.browse_artwork.take_background_restore());
+        draw_artwork(&mut app, &mut terminal);
+        app.browse_artwork.take_background_restore();
+
+        // Replace the menu after an actual draw, then draw the replacement
+        // before dismissing it. The final Esc must restore the image again.
+        open_browse_artwork_context_menu(&mut app, right.column, right.row);
+        draw_artwork(&mut app, &mut terminal);
+        handle_mouse(&mut app, MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right), column: 25, row: 14,
+            modifiers: KeyModifiers::NONE,
+        }, &tx);
+        assert!(matches!(&app.active_overlay,
+            ActiveOverlay::ContextMenu { origin: (25, 14), .. }));
+        draw_artwork(&mut app, &mut terminal);
+        app.browse_artwork.take_background_restore();
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+        assert!(app.browse_artwork.take_background_restore(),
+            "final dismissal after a drawn replacement menu must restore the image");
+        assert!(!app.browse_artwork.take_background_restore());
+        draw_artwork(&mut app, &mut terminal);
+        app.browse_artwork.take_background_restore();
+
+        open_browse_artwork_context_menu(&mut app, right.column, right.row);
+        handle_mouse(&mut app, MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left), column: 90, row: 35,
+            modifiers: KeyModifiers::NONE,
+        }, &tx);
+        assert!(app.browse_artwork.popup_open);
+        assert!(app.browse_artwork.take_background_restore(),
+            "an outside-menu click must also restore obscured image pixels");
+        draw_artwork(&mut app, &mut terminal);
+        app.browse_artwork.take_background_restore();
+
+        open_browse_artwork_context_menu(&mut app, right.column, right.row);
+        run_context_action_restoring_parked(&mut app,
+            ContextAction::BrowseImageActions, &tx, false);
+        assert!(app.browse_artwork.popup_open);
+        assert!(app.browse_artwork.take_background_restore(),
+            "an action leaving the viewer open must restore the image");
+        draw_artwork(&mut app, &mut terminal);
+        app.browse_artwork.take_background_restore();
+
+        open_browse_artwork_context_menu(&mut app, right.column, right.row);
+        run_context_action_restoring_parked(&mut app,
+            ContextAction::BrowseArtworkCloseView, &tx, false);
+        assert!(!app.browse_artwork.popup_open);
+        assert!(app.browse_artwork.take_background_restore(),
+            "closing the viewer still cleans up the background");
+    }
+
+    #[test]
+    fn artwork_menu_opened_during_async_decode_restores_visible_native_image() {
+        use ratatui::{backend::TestBackend, style::Color, Terminal};
+        use ratatui_image::picker::ProtocolType;
+
+        let (tx, _rx) = channel();
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("front.png");
+        image::DynamicImage::new_rgb8(160, 96).save(&image).unwrap();
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.image_picker.protocol_type = ProtocolType::Sixel;
+        app.browse_artwork.open_file_popup(image);
+        assert!(!app.browse_artwork.has_image(), "decode must begin asynchronously");
+        let viewport = Rect::new(10, 6, 55, 24);
+        app.browse_artwork.set_desired_area(viewport,
+            super::super::browse_artwork::ImageVerticalPlacement::Center);
+        app.browse_artwork.popup_rect = viewport;
+        open_browse_artwork_context_menu(&mut app, 25, 16);
+        assert!(matches!(&app.active_overlay, ActiveOverlay::ContextMenu { .. }));
+
+        // The worker completes while the menu is still visible. A native
+        // image can now be drawn behind the menu's Clear rectangle.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !app.browse_artwork.has_image() && std::time::Instant::now() < deadline {
+            app.browse_artwork.prepare(&mut app.image_picker, 0, 0,
+                &app.browse.artwork_config);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(app.browse_artwork.has_image());
+        app.browse_artwork.prepare(&mut app.image_picker, 0, 0,
+            &app.browse.artwork_config);
+        let mut terminal = Terminal::new(TestBackend::new(100, 45)).unwrap();
+        terminal.draw(|frame| {
+            assert!(app.browse_artwork.render_image(frame, viewport,
+                app.browse.artwork_config.allow_upscale,
+                super::super::browse_artwork::ImageVerticalPlacement::Center,
+                Color::Rgb(26, 27, 38)));
+            frame.render_widget(ratatui::widgets::Clear, Rect::new(30, 16, 4, 2));
+        }).unwrap();
+        assert!(app.browse_artwork.take_background_restore(),
+            "first image placement has its own background restoration");
+        assert!(!app.browse_artwork.take_background_restore());
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+        assert!(app.browse_artwork.popup_open);
+        assert!(matches!(&app.active_overlay, ActiveOverlay::None));
+        assert!(app.browse_artwork.take_background_restore(),
+            "dismissing a menu opened before decode must restore obscured pixels");
+        assert!(!app.browse_artwork.take_background_restore());
+
+        app.browse_artwork.prepare(&mut app.image_picker, 0, 0,
+            &app.browse.artwork_config);
+        terminal.draw(|frame| {
+            assert!(app.browse_artwork.render_image(frame, viewport,
+                app.browse.artwork_config.allow_upscale,
+                super::super::browse_artwork::ImageVerticalPlacement::Center,
+                Color::Rgb(26, 27, 38)));
+        }).unwrap();
+        app.browse_artwork.take_background_restore();
+        app.browse_artwork.prepare(&mut app.image_picker, 0, 0,
+            &app.browse.artwork_config);
+        assert!(!app.browse_artwork.take_background_restore(),
+            "ordinary redraw must not request another restoration");
+
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+        assert!(!app.browse_artwork.popup_open);
+        assert!(app.browse_artwork.take_background_restore(),
+            "closing the viewer must restore its background only");
+        assert!(!app.browse_artwork.take_background_restore());
+    }
+
+    #[test]
+    fn viewer_left_click_cycles_inside_image_and_closes_outside() {
+        let (tx, _rx) = channel();
+        let temp = tempfile::tempdir().unwrap();
+        let opened = temp.path().join("b.png");
+        for name in ["a.png", "b.png", "c.png"] {
+            image::DynamicImage::new_rgb8(12, 10)
+                .save(temp.path().join(name)).unwrap();
+        }
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse_artwork.open_file_popup(opened);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.browse_artwork.count() != 3 && std::time::Instant::now() < deadline {
+            app.browse_artwork.prepare(&mut app.image_picker, 0, 0,
+                &app.browse.artwork_config);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(app.browse_artwork.count(), 3);
+        assert_eq!(app.browse_artwork.current_label().as_deref(), Some("b.png"));
+        let selected_browse_entry = app.browse.selected_index;
+        let generation = app.image_kitty_retransmit_generation;
+        app.browse_artwork.popup_rect = Rect::new(10, 6, 35, 20);
+        let left = |column, row| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left), column, row,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, left(10, 6), &tx);
+        assert!(app.browse_artwork.popup_open);
+        assert_eq!(app.browse_artwork.current_label().as_deref(), Some("c.png"),
+            "a click at the image's top-left boundary cycles forward");
+        handle_key(&mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &tx);
+        assert_eq!(app.browse_artwork.current_label().as_deref(), Some("b.png"),
+            "keyboard and mouse use the same ordered sibling list");
+        assert_eq!(app.image_kitty_retransmit_generation, generation,
+            "cycling already invalidates the protocol; no redundant Kitty retransmit");
+        handle_mouse(&mut app, left(45, 10), &tx);
+        assert!(!app.browse_artwork.popup_open,
+            "the right edge lies outside the fitted image's exclusive hitbox");
+        assert_eq!(app.browse.selected_index, selected_browse_entry,
+            "the popup must never forward an outside click into the Browse listing");
+        assert!(app.browse_artwork.take_background_restore(),
+            "close must request background cleanup");
+    }
+
+    #[test]
+    fn viewer_escape_closes_without_image_retransmit_or_browse_navigation() {
+        let (tx, _rx) = channel();
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse_artwork.open_file_popup(std::path::PathBuf::from("cover.png"));
+        let before = app.image_kitty_retransmit_generation;
+        let selected = app.browse.selected_index;
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+        assert!(!app.browse_artwork.popup_open);
+        assert_eq!(app.browse.selected_index, selected);
+        assert_eq!(app.image_kitty_retransmit_generation, before,
+            "Esc must not retransmit a closing image");
+        assert!(app.browse_artwork.take_background_restore());
     }
 
     #[test]
@@ -13765,12 +14120,28 @@ fn open_editor_context_menu(
     true
 }
 
-///
+/// Repaint native artwork only after a context menu that covered it ends or
+/// changes position. Other menus and halfblock-only terminals are unaffected.
+fn finish_artwork_context_menu(app: &mut AppState) {
+    // Only restore when the menu covered native artwork that is still
+    // displayed. A closing viewer, a text-only fallback, or an unrelated menu
+    // must not transmit an image. Keep this independent of overlay identity:
+    // keyboard dispatch temporarily takes ContextMenu out of active_overlay.
+    let native = app.image_picker.protocol_type != ratatui_image::picker::ProtocolType::Halfblocks;
+    let visible = app.current_screen == AppScreen::Browse
+        && matches!(app.active_overlay, ActiveOverlay::None | ActiveOverlay::ContextMenu { .. })
+        && (app.browse_artwork.popup_open
+            || (app.browse.info_enabled && !app.browse.info_collapsed
+                && app.browse.artwork_config.enabled));
+    app.browse_artwork.artwork_menu_finished(native && visible);
+}
+
 /// Called from every ContextMenu close path (Esc / Left / outside-click /
 /// post-action) so right-click → context menu → Esc round-trips back to
 /// the originating overlay. Mirrors the `pending_*.take()` pattern used
 /// by the CommandInput Enter/Esc handlers.
 fn close_context_menu_restoring_parked(app: &mut AppState) {
+    finish_artwork_context_menu(app);
     app.browse_context_action_paths = None;
     app.editor_context_target = None;
     if let Some(parked) = app.pending_editor_context_overlay.take() {
@@ -13822,6 +14193,9 @@ fn run_context_action_restoring_parked(
 ) {
     app.active_overlay = ActiveOverlay::None;
     super::context_menu::execute_context_action(app, action, tx, invert);
+    // An action such as Image actions leaves the viewer visible; Close view
+    // does not. Decide after the action to avoid retransmitting closed art.
+    finish_artwork_context_menu(app);
     app.browse_context_action_paths = None;
     app.editor_context_target = None;
     if matches!(app.active_overlay, ActiveOverlay::None) {
@@ -14009,6 +14383,7 @@ fn browse_context_paths_for_current_entry(app: &AppState) -> Option<Vec<std::pat
 /// that happens to lie behind the viewer. The popup remains open throughout.
 fn open_browse_artwork_context_menu(app: &mut AppState, x: u16, y: u16) {
     let entries = super::context_menu::build_browse_artwork_menu(app);
+    app.browse_artwork.artwork_menu_opened();
     app.browse_context_action_paths = None;
     app.active_overlay = ActiveOverlay::ContextMenu {
         levels: vec![super::context_menu::MenuLevel::new(entries)],
@@ -14064,11 +14439,22 @@ pub(super) fn open_context_menu_with_tx(
 ) {
     use super::context_menu::*;
 
+    // An artwork-specific Info menu can overwrite native image cells just
+    // like the full-size viewer's menu. Remember that provenance at opening.
+    let artwork_target = app.current_screen == AppScreen::Browse && matches!(
+        app.button_map.find_button_at(x, y),
+        Some(TuiButton::BrowseInfoArtworkArea)
+    );
     if app.current_screen == AppScreen::Browse {
-        if let Some(tx) = tx {
-            app.browse.probe_current_with_db(tx, Some(&app.db));
-            app.browse
-                .request_current_folder_cue_availability(tx);
+        // Artwork settings and View/Close need only cached UI state. Avoid
+        // triggering unrelated audio probes and CUE availability checks while
+        // showing an image menu, especially during startup catalog warming.
+        if !artwork_target {
+            if let Some(tx) = tx {
+                app.browse.probe_current_with_db(tx, Some(&app.db));
+                app.browse
+                    .request_current_folder_cue_availability(tx);
+            }
         }
     }
 
@@ -14158,6 +14544,9 @@ pub(super) fn open_context_menu_with_tx(
 
     let levels = vec![super::context_menu::MenuLevel::new(entries)];
 
+    if artwork_target {
+        app.browse_artwork.artwork_menu_opened();
+    }
     app.active_overlay = ActiveOverlay::ContextMenu {
         levels,
         origin: (x, y),
@@ -71920,12 +72309,19 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             MouseEventKind::ScrollDown => { app.browse_artwork.cycle(true); }
             _ => {}
         }
-        app.request_image_preview_repaint();
+        // Mouse motion can damage native graphics in some terminals. A click
+        // that opens a menu or changes/closes an image already causes a draw;
+        // retransmitting the old image here only delays that interaction.
+        if matches!(mouse.kind, MouseEventKind::Moved | MouseEventKind::Drag(_)) {
+            app.request_image_preview_repaint();
+        }
         return;
     }
-    // Ghostty/Kitty mouse events can damage graphics layers without a new
-    // ratatui text-buffer diff. Use the existing rate-limited retransmission.
-    if app.current_screen == AppScreen::Browse && app.browse_artwork.has_image() {
+    // Do not force a costly Kitty retransmit just to open the Info artwork
+    // context menu. Preserve motion-damage recovery for native graphics.
+    if app.current_screen == AppScreen::Browse && app.browse_artwork.has_image()
+        && matches!(mouse.kind, MouseEventKind::Moved | MouseEventKind::Drag(_))
+    {
         app.request_image_preview_repaint();
     }
     // Properties owns every pointer event ahead of any parked text editor or
@@ -72382,6 +72778,24 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     return;
                 }
 
+                // The full-size image owns its fitted rectangle even when its
+                // artwork context menu is already open. Repeated right-clicks
+                // must never fall through to an underlying Browse file/menu.
+                // If the anchor moved, restore pixels previously obscured by
+                // the old menu once, before painting the replacement.
+                if app.current_screen == AppScreen::Browse
+                    && app.browse_artwork.popup_open
+                {
+                    let r = app.browse_artwork.popup_rect;
+                    if mouse.column >= r.x && mouse.column < r.right()
+                        && mouse.row >= r.y && mouse.row < r.bottom()
+                    {
+                        finish_artwork_context_menu(app);
+                        open_browse_artwork_context_menu(app, mouse.column, mouse.row);
+                        return;
+                    }
+                }
+
                 // Re-right-clicking the tab strip while a screen-owned context
                 // menu is open must rebuild the tab menu, not fall through to
                 // the generic Browse entry/empty menu after dismissal.
@@ -72398,6 +72812,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
 
                 // Other origins preserve the existing desktop behavior: close
                 // the old menu and let the underlying screen open a new one.
+                finish_artwork_context_menu(app);
                 app.active_overlay = ActiveOverlay::None;
                 app.pending_metadata_editor = None;
                 app.pending_cue_preview = None;
@@ -73572,12 +73987,12 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     TuiButton::BrowseInfoArtworkArea, mouse.column, mouse.row,
                     tui_file_picker::DOUBLE_CLICK_WINDOW,
                 ) {
-                    if app.browse_artwork.open_inline_popup_on_double_click() {
-                        app.request_image_preview_repaint();
-                    }
-                } else if app.browse_artwork.inline_click() {
-                    app.request_image_preview_repaint();
+                    app.browse_artwork.open_inline_popup_on_double_click();
+                } else {
+                    app.browse_artwork.inline_click();
                 }
+                // The popup/cycle invalidates its protocol directly. There
+                // is no need to retransmit the previous image as well.
             }
             TuiButton::BrowseInfoRefresh => {
                 activate_browse_info_refresh(app, tx);

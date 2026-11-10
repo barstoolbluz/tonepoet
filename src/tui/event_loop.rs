@@ -226,6 +226,7 @@ pub async fn run_app(
     let mut last_dead_queue_recovery_attempt = Instant::now();
     let mut redraw_requested = true;
     let mut last_draw = Instant::now();
+    let mut has_drawn_frame = false;
 
     loop {
         // Check whether terminal input is already queued before firing any
@@ -233,6 +234,15 @@ pub async fn run_app(
         // an event waiting while the old debounce expires, causing periodic
         // folder classification/probe/stat work in the middle of scrolling.
         let input_waiting_at_frame_start = event::poll(Duration::from_millis(0))?;
+        // Startup Browse work can keep the renderer busy for many frames.
+        // Consume an already-queued input event BEFORE the next draw/reducer
+        // slice, so Esc and image context-menu clicks are not perpetually
+        // placed behind fresh probe completions and graphics retransmissions.
+        // The first frame must still establish the mouse hit map.
+        if input_waiting_at_frame_start && has_drawn_frame {
+            dispatch_terminal_input(app, event::read()?, &tx);
+            redraw_requested = true;
+        }
 
         // Queue-scope recovery is not a startup-only event. A dead session's
         // supervisor tree can still be winding down when this process starts,
@@ -379,6 +389,7 @@ pub async fn run_app(
                 app.force_redraw = false;
             }
             terminal.draw(|f| draw_ui(f, app))?;
+            has_drawn_frame = true;
             last_draw = Instant::now();
             redraw_requested = false;
         }
@@ -449,18 +460,22 @@ pub async fn run_app(
         };
         if event::poll(poll_timeout)? {
             redraw_requested = true;
-            match event::read()? {
-                Event::Key(key) => handle_key(app, key, &tx),
-                Event::Mouse(mouse) => handle_mouse(app, mouse, &tx),
-                Event::Paste(text) => handle_paste(app, &text, &tx),
-                Event::Resize(_, _) => app.refresh_image_picker_after_resize(),
-                _ => {}
-            }
-            reconcile_tags_mb_apply_operation_state(app);
+            dispatch_terminal_input(app, event::read()?, &tx);
         }
     }
 
     Ok(())
+}
+
+fn dispatch_terminal_input(app: &mut AppState, input: Event, tx: &mpsc::Sender<AppMessage>) {
+    match input {
+        Event::Key(key) => handle_key(app, key, tx),
+        Event::Mouse(mouse) => handle_mouse(app, mouse, tx),
+        Event::Paste(text) => handle_paste(app, &text, tx),
+        Event::Resize(_, _) => app.refresh_image_picker_after_resize(),
+        _ => {}
+    }
+    reconcile_tags_mb_apply_operation_state(app);
 }
 
 

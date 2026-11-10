@@ -3224,13 +3224,11 @@ pub fn execute_context_action(
     match action {
         ContextAction::BrowseArtworkCloseView => {
             app.browse_artwork.close_popup();
-            app.request_image_preview_repaint();
         }
         ContextAction::BrowseArtworkView => {
             if app.current_screen == AppScreen::Browse && app.browse_artwork.has_candidate() {
                 app.browse_artwork.popup_open = true;
                 app.browse_artwork.invalidate_protocol();
-                app.request_image_preview_repaint();
             }
         }
         ContextAction::BrowseImageFileView(path) => {
@@ -3239,7 +3237,6 @@ pub fn execute_context_action(
                 && super::browse_artwork::is_supported_image(&path)
             {
                 app.browse_artwork.open_file_popup(path);
-                app.request_image_preview_repaint();
             }
         }
         ContextAction::BrowseImageActions => {

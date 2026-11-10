@@ -119,6 +119,9 @@ pub struct BrowseArtworkState {
     scan_rx: Option<Receiver<ScanResult>>,
     sources: Vec<ArtworkSource>,
     cursor: usize,
+    // Net key/click navigation while the worker-owned sibling scan is pending.
+    // Apply once, modulo the final ordered list, without extra decode jobs.
+    queued_gallery_offset: i64,
     failed: HashSet<usize>,
     decode_rx: Option<Receiver<DecodeResult>>,
     decoded_source: Option<ArtworkSource>,
@@ -131,6 +134,7 @@ pub struct BrowseArtworkState {
     protocol_generation: usize,
     retransmit_generation: usize,
     font_size: (u16, u16),
+    prepared_protocol_has_fixed_origin: bool,
     // An inline single-click cycles; a subsequent double-click must open the
     // image that was under the first click, not the next image.
     inline_click_source: Option<ArtworkSource>,
@@ -138,21 +142,35 @@ pub struct BrowseArtworkState {
     pub popup_open: bool,
     pub popup_rect: Rect,
     // Native graphics may have altered terminal pixels outside the ratatui diff.
-    // One extra blank-cell repaint restores the Info pane after image teardown.
+    // Restore only when terminal graphics are newly placed, invalidated, or
+    // removed, not on every unrelated (often startup-driven) UI redraw.
     needs_background_restore: bool,
+    // Alternate the invisible ink on each ACTUAL restoration. Frame parity
+    // cannot guarantee a change when intervening frames don't repaint.
+    background_restore_count: usize,
+    // A context menu painted over native artwork may overwrite terminal pixels
+    // without modifying Ratatui's image-origin cell. Restore once when that
+    // menu closes or moves; never on hover or unrelated startup redraws.
+    artwork_menu_occludes_image: bool,
+    repaint_image_after_menu: bool,
+    native_image_restore_count: usize,
 }
 
 impl Default for BrowseArtworkState {
     fn default() -> Self {
         Self {
             context: None, generation: 0, scan_generation: 0, decode_generation: 0, changed_at: Instant::now(), scanned: None,
-            scan_rx: None, sources: Vec::new(), cursor: 0, failed: HashSet::new(),
+            scan_rx: None, sources: Vec::new(), cursor: 0,
+            queued_gallery_offset: 0, failed: HashSet::new(),
             decode_rx: None, decoded_source: None, decoded_embedded_path: None, decoded: None,
             protocol: None, desired_area: Rect::default(),
             vertical_placement: ImageVerticalPlacement::Center, protocol_area: Rect::default(),
             protocol_generation: 0, retransmit_generation: 0, font_size: (8, 12),
+            prepared_protocol_has_fixed_origin: false,
             inline_click_source: None, warning: None, popup_open: false, popup_rect: Rect::default(),
-            needs_background_restore: false,
+            needs_background_restore: false, background_restore_count: 0,
+            artwork_menu_occludes_image: false, repaint_image_after_menu: false,
+            native_image_restore_count: 0,
         }
     }
 }
@@ -174,6 +192,10 @@ impl BrowseArtworkState {
     fn clear_selection(&mut self) {
         self.sources.clear();
         self.cursor = 0;
+        self.queued_gallery_offset = 0;
+        self.artwork_menu_occludes_image = false;
+        self.repaint_image_after_menu = false;
+        self.native_image_restore_count = 0;
         self.failed.clear();
         self.decoded_source = None;
         self.decoded_embedded_path = None;
@@ -205,12 +227,46 @@ impl BrowseArtworkState {
     }
 
     pub fn take_background_restore(&mut self) -> bool {
-        std::mem::take(&mut self.needs_background_restore)
+        let needed = std::mem::take(&mut self.needs_background_restore);
+        if needed {
+            self.background_restore_count = self.background_restore_count.wrapping_add(1);
+        }
+        needed
+    }
+
+    pub fn background_restore_count(&self) -> usize {
+        self.background_restore_count
     }
 
     pub fn invalidate_protocol(&mut self) {
         self.protocol = None;
         self.protocol_area = Rect::default();
+    }
+
+    /// Track the artwork menu independently of decode and protocol readiness.
+    /// A menu opened during asynchronous decoding may cover the first image
+    /// frame, and a replacement menu may open while restoration is pending.
+    pub fn artwork_menu_opened(&mut self) {
+        self.artwork_menu_occludes_image = true;
+    }
+
+    /// Called only when an artwork menu closes or changes position. Rebuild
+    /// native protocol state, and force its origin command through the terminal
+    /// diff on the next visible image frame. A protocol rebuild alone cannot
+    /// restore Sixel/iTerm pixels when the origin buffer cell is unchanged.
+    pub fn artwork_menu_finished(&mut self, native_image_still_visible: bool) {
+        let menu_was_open = std::mem::take(&mut self.artwork_menu_occludes_image);
+        if !menu_was_open || !native_image_still_visible || self.decoded.is_none() {
+            return;
+        }
+        // A previous dismissal can already have invalidated the protocol.
+        // Do not cancel its pending one-shot restoration when another menu
+        // opens and closes before a frame can rebuild and render the image.
+        if self.protocol.is_some() {
+            self.invalidate_protocol();
+            self.needs_background_restore = true;
+            self.repaint_image_after_menu = true;
+        }
     }
 
     pub fn set_desired_area(&mut self, area: Rect, placement: ImageVerticalPlacement) {
@@ -255,6 +311,7 @@ impl BrowseArtworkState {
         self.scanned = None;
         self.changed_at = Instant::now() - SELECTION_SETTLE;
         self.sources = vec![ArtworkSource::File(path)];
+        self.queued_gallery_offset = 0;
         self.popup_open = true;
         self.popup_rect = Rect::default();
         self.desired_area = Rect::default();
@@ -300,7 +357,17 @@ impl BrowseArtworkState {
     }
 
     pub fn cycle(&mut self, forward: bool) -> bool {
-        if self.sources.len() < 2 { return false; }
+        if self.sources.len() < 2 {
+            // The requested image is available before its siblings. Preserve
+            // *every* navigation step without enumerating the directory on the
+            // UI thread or launching a decode for each intermediate image.
+            if self.is_single_file_popup() && self.scanned != self.context {
+                self.queued_gallery_offset = self.queued_gallery_offset.saturating_add(
+                    if forward { 1 } else { -1 });
+                return true;
+            }
+            return false;
+        }
         let len = self.sources.len();
         for step in 1..len {
             let next = if forward { (self.cursor + step) % len }
@@ -326,6 +393,9 @@ impl BrowseArtworkState {
         self.popup_open = false;
         self.popup_rect = Rect::default();
         self.inline_click_source = None;
+        self.artwork_menu_occludes_image = false;
+        self.repaint_image_after_menu = false;
+        self.native_image_restore_count = 0;
         self.protocol = None; // rebuild for the pane on the next prepare pass
         self.protocol_area = Rect::default();
         if was_file_view {
@@ -374,6 +444,18 @@ impl BrowseArtworkState {
         }
         let font_size = picker.font_size;
         self.font_size = font_size;
+        self.prepared_protocol_has_fixed_origin =
+            picker.protocol_type != ratatui_image::picker::ProtocolType::Halfblocks
+            && picker.protocol_type != ratatui_image::picker::ProtocolType::Kitty;
+        if !self.prepared_protocol_has_fixed_origin {
+            // Kitty encodes its ID in the placeholder. Halfblocks uses cell
+            // foregrounds for real pixels. Neither may inherit Sixel/iTerm
+            // origin-cell ink after a terminal protocol change.
+            self.native_image_restore_count = 0;
+        }
+        if picker.protocol_type == ratatui_image::picker::ProtocolType::Halfblocks {
+            self.repaint_image_after_menu = false;
+        }
         let desired = self.decoded.as_ref().map_or(self.desired_area, |image| {
             fitted_image_area(self.desired_area, image.width(), image.height(), font_size,
                 config.allow_upscale, self.vertical_placement)
@@ -386,6 +468,11 @@ impl BrowseArtworkState {
                 || self.protocol_generation != picker_generation || self.retransmit_generation != kitty)
         {
             self.protocol = self.decoded.as_ref().map(|image| picker.new_resize_protocol(image.clone()));
+            if picker.protocol_type != ratatui_image::picker::ProtocolType::Halfblocks {
+                // A new native graphics placement may have modified the
+                // terminal outside Ratatui's buffer. Restore it on this draw.
+                self.needs_background_restore = true;
+            }
             self.protocol_area = desired;
             self.protocol_generation = picker_generation;
             self.retransmit_generation = kitty;
@@ -418,6 +505,24 @@ impl BrowseArtworkState {
                             self.protocol = None;
                         }
                         self.warning = result.warning;
+                        if direct_file {
+                            let offset = std::mem::take(&mut self.queued_gallery_offset);
+                            if !self.sources.is_empty() {
+                                let len = self.sources.len() as i64;
+                                let next = (self.cursor as i64 + offset.rem_euclid(len))
+                                    .rem_euclid(len) as usize;
+                                if next != self.cursor {
+                                    self.needs_background_restore |=
+                                        self.decoded.is_some() || self.protocol.is_some();
+                                    self.cursor = next;
+                                    self.generation = self.generation.wrapping_add(1);
+                                    self.decoded_source = None;
+                                    self.decoded_embedded_path = None;
+                                    self.decoded = None;
+                                    self.invalidate_protocol();
+                                }
+                            }
+                        }
                         changed = true;
                     }
                 }
@@ -426,6 +531,7 @@ impl BrowseArtworkState {
                     // A worker panic must never lead to an automatic retry loop.
                     if self.scan_generation == self.generation {
                         self.scanned = self.context.clone();
+                        self.queued_gallery_offset = 0;
                         self.warning = Some("Artwork discovery failed".into());
                         changed = true;
                     }
@@ -483,6 +589,27 @@ impl BrowseArtworkState {
         let widget = ratatui_image::StatefulImage::new(Some(image::Rgb([r, g, b])));
         f.render_stateful_widget(widget, target,
             self.protocol.as_mut().expect("checked"));
+        // The pinned image crate's other native types are Sixel and iTerm2;
+        // unlike Kitty they have no fresh image ID to change the image-origin
+        // cell after an otherwise byte-identical retransmission.
+        let fixed_origin_protocol = self.prepared_protocol_has_fixed_origin;
+        if self.repaint_image_after_menu {
+            // Sixel/iTerm commands may remain byte-identical after a rebuild.
+            // Kitty creates a fresh image ID on protocol invalidation, so its
+            // placeholder colors must NOT be overridden with invisible ink.
+            if fixed_origin_protocol {
+                self.native_image_restore_count = self.native_image_restore_count
+                    .wrapping_add(1).max(1);
+            }
+            self.repaint_image_after_menu = false;
+        }
+        if fixed_origin_protocol && self.native_image_restore_count != 0 {
+            // Keep this same ink on subsequent ordinary redraws; reverting to
+            // Color::Reset would retransmit the image a second, unrelated time.
+            // Never change the native protocol's skipped image cells.
+            let ink = background_repaint_ink(background, self.native_image_restore_count);
+            f.buffer_mut().get_mut(target.x, target.y).set_fg(ink);
+        }
         true
     }
 }
@@ -492,21 +619,22 @@ impl BrowseArtworkState {
 /// Sixel/Kitty/iTerm can change actual terminal pixels without changing any
 /// normal cell. Repainting blank theme-background cells is necessary even if
 /// Ratatui still believes their contents are identical to the previous frame.
-/// Alternating the *invisible* foreground forces diff updates without changing
-/// the displayed color or touching either text or graphics-protocol cells.
-/// Both choices must be explicit RGB values: a first frame with a Reset ink
-/// color would otherwise leave previously unpainted cells unchanged.
-fn background_repaint_ink(background: Color, frame_count: usize) -> Color {
+/// Alternating the *invisible* foreground on successive restoration passes
+/// forces diff updates without changing the displayed color or touching text
+/// or graphics-protocol cells. Both choices must be explicit RGB values.
+fn background_repaint_ink(background: Color, restore_count: usize) -> Color {
     let (r, g, b) = super::theme::rgb_tuple(background);
-    if frame_count % 2 == 0 {
+    if restore_count % 2 == 0 {
         Color::Rgb(r, g, b)
     } else {
         Color::Rgb(if r == u8::MAX { r - 1 } else { r + 1 }, g, b)
     }
 }
 
-pub(crate) fn repaint_image_background(f: &mut ratatui::Frame, area: Rect, background: Color) {
-    let ink = background_repaint_ink(background, f.count());
+pub(crate) fn repaint_image_background(
+    f: &mut ratatui::Frame, area: Rect, background: Color, restore_count: usize,
+) {
+    let ink = background_repaint_ink(background, restore_count);
     repaint_blank_background_cells(f.buffer_mut(), area, background, ink);
 }
 
@@ -963,6 +1091,235 @@ mod tests {
     }
 
     #[test]
+    fn native_background_repaint_is_on_demand_not_per_unrelated_frame() {
+        use ratatui_image::picker::ProtocolType;
+
+        let mut artwork = BrowseArtworkState::default();
+        artwork.decoded = Some(DynamicImage::new_rgb8(80, 60));
+        artwork.set_desired_area(Rect::new(0, 0, 30, 15), ImageVerticalPlacement::Center);
+        let mut picker = Picker::new((8, 12));
+        picker.protocol_type = ProtocolType::Kitty;
+        let config = BrowseArtworkConfig::default();
+        let background = Color::Rgb(26, 27, 38);
+
+        assert!(artwork.prepare(&mut picker, 0, 0, &config));
+        assert!(artwork.take_background_restore(), "first native placement must repaint");
+        let first = artwork.background_restore_count();
+        let first_ink = background_repaint_ink(background, first);
+        assert!(!artwork.take_background_restore(), "restoration is consumed once");
+        assert!(!artwork.prepare(&mut picker, 0, 0, &config),
+            "unchanged artwork must not rebuild on unrelated Browse redraws");
+        assert!(!artwork.take_background_restore(),
+            "unrelated redraws must not repaint thousands of blank cells");
+
+        assert!(artwork.prepare(&mut picker, 0, 1, &config),
+            "an explicit Kitty retransmit must rebuild its protocol");
+        assert!(artwork.take_background_restore());
+        let second = artwork.background_restore_count();
+        assert_ne!(background_repaint_ink(background, second), first_ink,
+            "restorations must alternate even if rendered frame counts have the same parity");
+        assert!(!artwork.take_background_restore());
+        artwork.popup_open = true;
+        artwork.close_popup();
+        assert!(artwork.take_background_restore(), "popup teardown still repaints");
+        assert_eq!(artwork.background_restore_count(), second + 1);
+    }
+
+    #[test]
+    fn native_artwork_menu_restoration_forces_one_image_origin_diff() {
+        use ratatui::{backend::TestBackend, Terminal};
+        use ratatui_image::picker::ProtocolType;
+
+        let mut state = BrowseArtworkState::default();
+        state.decoded = Some(DynamicImage::new_rgb8(24, 24));
+        state.popup_open = true;
+        let viewport = Rect::new(3, 2, 45, 24);
+        let background = Color::Rgb(26, 27, 38);
+        let mut picker = Picker::new((8, 12));
+        picker.protocol_type = ProtocolType::Sixel;
+        let config = BrowseArtworkConfig::default();
+        state.set_desired_area(viewport, ImageVerticalPlacement::Center);
+        assert!(state.prepare(&mut picker, 0, 0, &config));
+        let mut terminal = Terminal::new(TestBackend::new(60, 30)).unwrap();
+        terminal.draw(|frame| {
+            assert!(state.render_image(frame, viewport, config.allow_upscale,
+                ImageVerticalPlacement::Center, background));
+        }).unwrap();
+        let initial = terminal.backend().buffer().clone();
+        let origin = (state.protocol_area.x, state.protocol_area.y);
+
+        // No menu painted over the image: ordinary drawing and unrelated
+        // context menus must not initiate image restoration.
+        state.artwork_menu_finished(true);
+        assert!(!state.repaint_image_after_menu);
+        state.artwork_menu_opened();
+        state.artwork_menu_finished(false); // e.g. viewer is closing
+        assert!(!state.repaint_image_after_menu);
+        assert_eq!(state.native_image_restore_count, 0);
+
+        state.artwork_menu_opened();
+        state.artwork_menu_finished(true);
+        assert!(state.repaint_image_after_menu);
+        assert!(state.protocol.is_none(), "reprepare the native protocol after occlusion");
+        // A replacement menu can open before the next frame rebuilds the
+        // protocol. Dismissing it must not discard the first restoration.
+        state.artwork_menu_opened();
+        state.artwork_menu_finished(true);
+        assert!(state.repaint_image_after_menu,
+            "replacement before redraw must preserve the pending restoration");
+        assert!(state.protocol.is_none());
+        assert!(state.prepare(&mut picker, 0, 0, &config));
+        terminal.draw(|frame| {
+            assert!(state.render_image(frame, viewport, config.allow_upscale,
+                ImageVerticalPlacement::Center, background));
+        }).unwrap();
+        let restored = terminal.backend().buffer().clone();
+        assert_ne!(initial.get(origin.0, origin.1).fg, restored.get(origin.0, origin.1).fg);
+        assert!(initial.diff(&restored).iter().any(|(x, y, _)| (*x, *y) == origin),
+            "Ratatui must emit the native image command at its origin");
+        assert_eq!(state.native_image_restore_count, 1);
+        assert!(!state.repaint_image_after_menu);
+
+        terminal.draw(|frame| {
+            assert!(state.render_image(frame, viewport, config.allow_upscale,
+                ImageVerticalPlacement::Center, background));
+        }).unwrap();
+        let ordinary_redraw = terminal.backend().buffer().clone();
+        assert_eq!(ordinary_redraw.get(origin.0, origin.1).fg,
+            restored.get(origin.0, origin.1).fg,
+            "unrelated redraw must not toggle the image-origin ink again");
+
+        // Replace the menu, allow an actual image frame to render under the
+        // replacement, then dismiss it. The final dismissal must request a
+        // second restoration even though the first was already consumed.
+        state.artwork_menu_opened();
+        state.artwork_menu_finished(true);
+        state.artwork_menu_opened();
+        assert!(state.prepare(&mut picker, 0, 0, &config));
+        terminal.draw(|frame| {
+            assert!(state.render_image(frame, viewport, config.allow_upscale,
+                ImageVerticalPlacement::Center, background));
+            frame.render_widget(ratatui::widgets::Clear,
+                Rect::new(origin.0 + 1, origin.1, 1, 1));
+        }).unwrap();
+        let covered_frame = terminal.backend().buffer().clone();
+        assert!(!state.repaint_image_after_menu);
+        state.artwork_menu_finished(true);
+        assert!(state.repaint_image_after_menu,
+            "dismissing the replacement menu must request another restoration");
+        assert!(state.protocol.is_none());
+        assert!(state.prepare(&mut picker, 0, 0, &config));
+        terminal.draw(|frame| {
+            assert!(state.render_image(frame, viewport, config.allow_upscale,
+                ImageVerticalPlacement::Center, background));
+        }).unwrap();
+        let second_restore = terminal.backend().buffer().clone();
+        assert_ne!(second_restore.get(origin.0, origin.1).fg,
+            covered_frame.get(origin.0, origin.1).fg,
+            "successive menu dismissals must each restore native image pixels");
+        assert!(covered_frame.diff(&second_restore).iter()
+            .any(|(x, y, _)| (*x, *y) == origin));
+        assert_eq!(state.native_image_restore_count, 3,
+            "each rendered menu restoration forces the origin exactly once");
+        assert!(!state.repaint_image_after_menu);
+
+        // Halfblocks pixels use the real cell foreground for their upper
+        // pixel. Native-only diff forcing must not recolor that pixel if the
+        // terminal protocol changes (for example on entering tmux).
+        picker.protocol_type = ProtocolType::Halfblocks;
+        state.invalidate_protocol();
+        assert!(state.prepare(&mut picker, 1, 0, &config));
+        assert_eq!(state.native_image_restore_count, 0);
+        terminal.draw(|frame| {
+            assert!(state.render_image(frame, viewport, config.allow_upscale,
+                ImageVerticalPlacement::Center, background));
+        }).unwrap();
+        let halfblocks = terminal.backend().buffer();
+        assert_eq!(halfblocks.get(origin.0, origin.1).fg, Color::Rgb(0, 0, 0),
+            "native restoration ink must not overwrite Halfblocks pixel colors");
+    }
+
+    #[test]
+    fn artwork_menu_opened_before_decode_restores_first_occluded_native_frame() {
+        use ratatui::{backend::TestBackend, Terminal};
+        use ratatui_image::picker::ProtocolType;
+
+        let mut still_loading = BrowseArtworkState::default();
+        still_loading.artwork_menu_opened();
+        still_loading.artwork_menu_finished(true);
+        assert!(!still_loading.repaint_image_after_menu,
+            "a menu dismissed before any image exists must not retransmit");
+        assert!(!still_loading.take_background_restore());
+
+        let mut state = BrowseArtworkState::default();
+        state.popup_open = true;
+        state.artwork_menu_opened();
+        assert!(state.artwork_menu_occludes_image,
+            "the menu must remain tracked while decoding has not completed");
+        assert!(state.decoded.is_none());
+        assert!(state.protocol.is_none());
+
+        // Model the asynchronous decode completing before the menu closes.
+        state.decoded = Some(DynamicImage::new_rgb8(160, 96));
+        let viewport = Rect::new(3, 2, 45, 24);
+        let background = Color::Rgb(26, 27, 38);
+        let mut picker = Picker::new((8, 12));
+        picker.protocol_type = ProtocolType::Sixel;
+        let config = BrowseArtworkConfig::default();
+        state.set_desired_area(viewport, ImageVerticalPlacement::Center);
+        assert!(state.prepare(&mut picker, 0, 0, &config));
+        let origin = (state.protocol_area.x, state.protocol_area.y);
+        let mut terminal = Terminal::new(TestBackend::new(60, 30)).unwrap();
+        terminal.draw(|frame| {
+            assert!(state.render_image(frame, viewport, config.allow_upscale,
+                ImageVerticalPlacement::Center, background));
+            frame.render_widget(ratatui::widgets::Clear,
+                Rect::new(origin.0 + 1, origin.1, 2, 1));
+        }).unwrap();
+        let occluded = terminal.backend().buffer().clone();
+        assert!(state.take_background_restore(), "the initial placement was prepared");
+        assert!(!state.take_background_restore());
+
+        state.artwork_menu_finished(true);
+        assert!(state.repaint_image_after_menu);
+        assert!(state.protocol.is_none());
+        assert!(state.take_background_restore(),
+            "dismissal of a menu opened before decode must schedule restoration");
+        assert!(!state.take_background_restore());
+        assert!(state.prepare(&mut picker, 0, 0, &config));
+        terminal.draw(|frame| {
+            assert!(state.render_image(frame, viewport, config.allow_upscale,
+                ImageVerticalPlacement::Center, background));
+        }).unwrap();
+        let restored = terminal.backend().buffer().clone();
+        assert!(occluded.diff(&restored).iter()
+            .any(|(x, y, _)| (*x, *y) == origin),
+            "restoration must retransmit the native command at the image origin");
+        assert_eq!(state.native_image_restore_count, 1);
+        assert!(!state.repaint_image_after_menu);
+
+        terminal.draw(|frame| {
+            assert!(state.render_image(frame, viewport, config.allow_upscale,
+                ImageVerticalPlacement::Center, background));
+        }).unwrap();
+        assert_eq!(state.native_image_restore_count, 1,
+            "ordinary redraws must not trigger a second menu restoration");
+    }
+
+    #[test]
+    fn closing_artwork_view_never_retransmits_its_hidden_image() {
+        let mut state = BrowseArtworkState::default();
+        state.open_file_popup(PathBuf::from("/pictures/cover.png"));
+        state.decoded = Some(DynamicImage::new_rgb8(12, 12));
+        state.artwork_menu_opened();
+        state.close_popup();
+        state.artwork_menu_finished(true);
+        assert!(!state.repaint_image_after_menu);
+        assert!(state.context.is_none());
+        assert!(state.decoded.is_none());
+    }
+
+    #[test]
     fn image_close_requests_one_background_restoration() {
         let mut artwork = BrowseArtworkState::default();
         artwork.popup_open = true;
@@ -1194,6 +1551,69 @@ mod tests {
         assert_eq!(state.index(), 0, "double-click keeps the image originally clicked");
         state.close_popup();
         assert!(!state.popup_open);
+    }
+
+    #[test]
+    fn direct_image_early_navigation_accumulates_every_step() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["a.png", "b.png", "c.png"] {
+            DynamicImage::new_rgb8(12, 10).save(temp.path().join(name)).unwrap();
+        }
+        let path = temp.path().join("b.png");
+        let context = ArtworkContext::SingleFile(path.clone());
+        for (directions, expected) in [
+            (vec![true], "c.png"),
+            (vec![false], "a.png"),
+            (vec![true, false], "b.png"),
+            (vec![true, true], "a.png"),
+            (vec![false, true, true], "c.png"),
+        ] {
+            let mut state = BrowseArtworkState::default();
+            state.open_file_popup(path.clone());
+            assert_eq!(state.count(), 1);
+            for direction in directions.iter().copied() {
+                assert!(state.cycle(direction), "early inputs are accepted");
+            }
+            assert_eq!(state.current_label().as_deref(), Some("b.png"),
+                "do not navigate an incomplete sibling list");
+            let mut result = scan_image_siblings(context.clone(), &path);
+            result.generation = state.generation;
+            let (tx, rx) = mpsc::channel();
+            state.scan_rx = Some(rx);
+            tx.send(result).unwrap();
+            assert!(state.poll_workers());
+            assert_eq!(state.count(), 3);
+            assert_eq!(state.current_label().as_deref(), Some(expected),
+                "deferred navigation {directions:?} must preserve all steps");
+            assert_eq!(state.queued_gallery_offset, 0);
+            state.close_popup();
+            assert!(!state.popup_open);
+        }
+    }
+
+    #[test]
+    fn closing_direct_view_discards_pending_gallery_navigation_and_scan() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["a.png", "b.png", "c.png"] {
+            DynamicImage::new_rgb8(12, 10).save(temp.path().join(name)).unwrap();
+        }
+        let path = temp.path().join("b.png");
+        let context = ArtworkContext::SingleFile(path.clone());
+        let mut state = BrowseArtworkState::default();
+        state.open_file_popup(path.clone());
+        assert!(state.cycle(true));
+        assert!(state.cycle(true));
+        assert_eq!(state.queued_gallery_offset, 2);
+        let mut result = scan_image_siblings(context, &path);
+        result.generation = state.generation;
+        let (tx, rx) = mpsc::channel();
+        state.scan_rx = Some(rx);
+        tx.send(result).unwrap();
+        state.close_popup();
+        assert_eq!(state.queued_gallery_offset, 0);
+        assert!(state.context.is_none());
+        assert!(!state.poll_workers(), "a post-close scan is stale");
+        assert!(state.sources.is_empty(), "stale results must not reopen a gallery");
     }
 
     #[test]
