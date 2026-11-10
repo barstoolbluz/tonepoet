@@ -72309,20 +72309,11 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             MouseEventKind::ScrollDown => { app.browse_artwork.cycle(true); }
             _ => {}
         }
-        // Mouse motion can damage native graphics in some terminals. A click
-        // that opens a menu or changes/closes an image already causes a draw;
-        // retransmitting the old image here only delays that interaction.
-        if matches!(mouse.kind, MouseEventKind::Moved | MouseEventKind::Drag(_)) {
-            app.request_image_preview_repaint();
-        }
+        // Motion alone does not change image pixels, size or graphics protocol.
+        // Re-uploading on mouse movement can saturate the terminal during
+        // startup and delay queued Esc/click input by many seconds. Explicit
+        // image, resize and artwork-menu changes still restore their graphics.
         return;
-    }
-    // Do not force a costly Kitty retransmit just to open the Info artwork
-    // context menu. Preserve motion-damage recovery for native graphics.
-    if app.current_screen == AppScreen::Browse && app.browse_artwork.has_image()
-        && matches!(mouse.kind, MouseEventKind::Moved | MouseEventKind::Drag(_))
-    {
-        app.request_image_preview_repaint();
     }
     // Properties owns every pointer event ahead of any parked text editor or
     // underlying Browse widget. Hitboxes come from the current painted frame.

@@ -5,7 +5,6 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
 
 use crate::config::TonepoetConfig;
 use crate::convert::formats::AudioFormat;
@@ -16144,18 +16143,13 @@ pub struct AppState {
     pub image_picker: ratatui_image::picker::Picker,
     /// Monotonic generation for terminal image protocol/cell-size changes.
     pub image_picker_generation: usize,
-    /// Monotonic generation used to force terminal image command re-emission
-    /// after mouse movement or other terminal-side graphics damage.
+    /// Render-only image repaint generation for auxiliary preview widgets.
+    /// Advancing this value must not rebuild or upload a native protocol.
     pub image_repaint_generation: usize,
-    /// Kitty-only retransmit generation used when Ghostty/Kitty mouse damage
-    /// requires protocol re-creation/retransmission. This is intentionally
-    /// separate from `image_picker_generation`, which tracks real terminal
-    /// size/cell-metric changes.
+    /// Legacy explicit Kitty retransmit generation, retained for the existing
+    /// protocol-cache interface. Motion never advances it; source/geometry
+    /// changes and artwork-menu restoration invalidate the relevant cache.
     pub image_kitty_retransmit_generation: usize,
-    /// Last time a Kitty/Ghostty retransmit was requested. Used to rate-limit
-    /// protocol rebuilds during high-frequency mouse motion.
-    pub last_image_kitty_retransmit_at: Option<Instant>,
-
     // Caches
     pub tool_check_cache: once_cell::sync::OnceCell<Vec<(String, String, bool)>>,
 }
@@ -16328,11 +16322,6 @@ fn lower_env_value(value: Option<&std::ffi::OsStr>) -> Option<String> {
     }
     Some(value.to_string_lossy().to_ascii_lowercase())
 }
-
-// Pointer-motion graphics recovery is opportunistic. Re-encoding and
-// retransmitting a large Kitty image at 30 Hz can stall input during startup
-// Browse scans; explicit image changes still invalidate immediately.
-const KITTY_IMAGE_RETRANSMIT_MIN_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Database source used while constructing [`AppState`].
 ///
@@ -17116,7 +17105,6 @@ impl AppState {
             image_picker_generation: 0,
             image_repaint_generation: 0,
             image_kitty_retransmit_generation: 0,
-            last_image_kitty_retransmit_at: None,
             hover_target: None,
             analysis_results: Vec::new(),
             analysis_pending: 0,
@@ -17704,42 +17692,19 @@ impl AppState {
     pub fn refresh_image_picker_after_resize(&mut self) {
         self.image_picker = new_terminal_image_picker(self.queried_image_cell_size);
         self.image_picker_generation = self.image_picker_generation.saturating_add(1);
-        self.last_image_kitty_retransmit_at = None;
 
         self.invalidate_terminal_image_preview_caches();
         self.request_image_preview_repaint();
         self.force_redraw = true;
     }
 
-    /// Advance image-preview repaint/retransmit generations after terminal-side
-    /// graphics damage, such as mouse movement over Ghostty's Kitty graphics
-    /// layer.
-    ///
-    /// The repaint generation remains as a cheap ratatui-buffer nudge for
-    /// non-Kitty protocol cells. Kitty/Ghostty additionally gets a separate,
-    /// rate-limited retransmit generation so cached decoded pixels can be
-    /// re-wrapped in a fresh StatefulProtocol without conflating mouse damage
-    /// with terminal resize/cell-metric changes.
+    /// A cheap, non-reencoding nudge for editor/file-picker image widgets.
+    /// Native image protocols are invalidated only by an actual source,
+    /// geometry, terminal-configuration, or overlay-restoration transition.
+    /// In particular, mouse motion must not trigger a fresh Kitty upload:
+    /// synchronous encoding/output can otherwise keep Esc and clicks queued.
     pub fn request_image_preview_repaint(&mut self) {
         self.image_repaint_generation = self.image_repaint_generation.saturating_add(1);
-        self.request_kitty_image_preview_retransmit();
-    }
-
-    fn request_kitty_image_preview_retransmit(&mut self) {
-        if self.image_picker.protocol_type != ratatui_image::picker::ProtocolType::Kitty {
-            return;
-        }
-
-        let now = Instant::now();
-        let should_retransmit = self
-            .last_image_kitty_retransmit_at
-            .map(|last| now.duration_since(last) >= KITTY_IMAGE_RETRANSMIT_MIN_INTERVAL)
-            .unwrap_or(true);
-        if should_retransmit {
-            self.image_kitty_retransmit_generation =
-                self.image_kitty_retransmit_generation.saturating_add(1);
-            self.last_image_kitty_retransmit_at = Some(now);
-        }
     }
 
 
@@ -17752,7 +17717,6 @@ impl AppState {
 
         self.image_picker_generation = self.image_picker_generation.saturating_add(1);
         self.image_kitty_retransmit_generation = 0;
-        self.last_image_kitty_retransmit_at = None;
         self.invalidate_terminal_image_preview_caches();
     }
 
@@ -17783,11 +17747,8 @@ impl AppState {
     ///
     /// Render records the desired preview pane geometry. This update pass polls
     /// non-blocking decode workers and, once decoded pixels and geometry are
-    /// both available, builds terminal protocol state from the startup-owned
-    /// image picker so the next frame can render without synchronous disk/tag/
-    /// image decode or protocol creation work. For Kitty/Ghostty, a separate
-    /// rate-limited retransmit generation can also rebuild protocol state from
-    /// cached decoded pixels after mouse-driven graphics-layer damage.
+    /// both available, prepares terminal protocol state from the startup-owned
+    /// image picker. Ordinary pointer movement never rebuilds the protocol.
     pub fn prepare_image_preview_protocols(&mut self) -> bool {
         if self.browse_artwork.popup_open
             && !matches!(self.active_overlay,
