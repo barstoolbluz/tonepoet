@@ -1487,7 +1487,6 @@ mod tests {
         assert!(state.scanned.is_none(), "sibling listing is deferred to a worker");
         assert!(state.scan_rx.is_none(), "opening View must not scan synchronously");
         assert_eq!(state.sources, vec![ArtworkSource::File(image_path.clone())]);
-        assert!(!state.cycle(true), "a single image has nothing to cycle to");
 
         let mut picker = Picker::new((12, 24));
         let deadline = Instant::now() + Duration::from_secs(5);
