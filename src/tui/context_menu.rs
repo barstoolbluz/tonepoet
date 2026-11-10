@@ -141,6 +141,8 @@ pub enum ContextAction {
     BrowseArtworkCloseView,
     /// View a selected direct image file in Browse's existing artwork popup.
     BrowseImageFileView(PathBuf),
+    /// Reserved image-editing entry. No edits or resize UI are implemented yet.
+    BrowseImageActions,
     BrowseArtworkToggleEmbeddedPreference,
     BrowseArtworkToggleUpscale,
     BrowseArtworkEditPaneHeight,
@@ -1558,6 +1560,7 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
                 && (entry.is_regular_file || (entry.is_symlink && !entry.is_broken_symlink))
             {
                 items.push(item("View", ContextAction::BrowseImageFileView(entry.path.clone())));
+                items.push(item("Actions", ContextAction::BrowseImageActions));
                 items.push(separator());
             }
             if super::browse::is_viewable_text_file(&entry.path) {
@@ -3164,6 +3167,9 @@ pub fn build_browse_artwork_menu(app: &AppState) -> Vec<ContextMenuEntry> {
         item_enabled("View", ContextAction::BrowseArtworkView,
             app.browse_artwork.has_candidate())
     }];
+    if app.browse_artwork.popup_open || app.browse_artwork.has_candidate() {
+        entries.push(item("Actions", ContextAction::BrowseImageActions));
+    }
     entries.push(ContextMenuEntry::Submenu {
             label: "Settings".into(),
             children: vec![
@@ -3235,6 +3241,10 @@ pub fn execute_context_action(
                 app.browse_artwork.open_file_popup(path);
                 app.request_image_preview_repaint();
             }
+        }
+        ContextAction::BrowseImageActions => {
+            // Intentionally a placeholder: no file writes, scaling, or modal.
+            app.set_status("Image actions are not implemented yet");
         }
         ContextAction::BrowseArtworkToggleEmbeddedPreference => {
             app.browse.artwork_config.prefer_embedded = !app.browse.artwork_config.prefer_embedded;
@@ -8402,6 +8412,10 @@ mod tests {
                 ContextMenuEntry::Item(ContextMenuItem {
                     label, action: ContextAction::BrowseImageFileView(view_path), enabled: true, ..
                 }) if label == "View" && view_path == &path)), "{name}");
+            assert!(menu.iter().any(|entry| matches!(entry,
+                ContextMenuEntry::Item(ContextMenuItem {
+                    label, action: ContextAction::BrowseImageActions, enabled: true, ..
+                }) if label == "Actions")), "image actions missing: {name}");
         }
 
         for name in ["image.svg", "image.png.txt", "notes.bin"] {
@@ -8415,6 +8429,10 @@ mod tests {
                 ContextMenuEntry::Item(ContextMenuItem {
                     action: ContextAction::BrowseImageFileView(_), ..
                 }))), "{name}");
+            assert!(!menu.iter().any(|entry| matches!(entry,
+                ContextMenuEntry::Item(ContextMenuItem {
+                    action: ContextAction::BrowseImageActions, ..
+                }))), "unexpected image actions: {name}");
         }
     }
 
@@ -8426,9 +8444,21 @@ mod tests {
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
         app.browse.info_enabled = false;
+        app.browse.artwork_config.enabled = false;
         let (tx, _rx) = tokio::sync::mpsc::channel(2);
         execute_context_action(&mut app, ContextAction::BrowseImageFileView(path.clone()), &tx, false);
         assert!(app.browse_artwork.is_single_file_popup());
+        let menu = build_browse_artwork_menu(&app);
+        assert!(menu.iter().any(|entry| matches!(entry,
+            ContextMenuEntry::Item(ContextMenuItem {
+                label, action: ContextAction::BrowseImageActions, enabled: true, ..
+            }) if label == "Actions")));
+        let before = std::fs::read(&path).unwrap();
+        execute_context_action(&mut app, ContextAction::BrowseImageActions, &tx, false);
+        assert_eq!(std::fs::read(&path).unwrap(), before,
+            "reserved Actions entry must never change source files");
+        assert!(app.browse_artwork.is_single_file_popup(),
+            "Actions placeholder must leave the viewer open");
         assert_eq!(app.browse_artwork.count(), 1);
         assert!(app.prepare_image_preview_protocols() || app.browse_artwork.popup_open);
         app.browse_artwork.close_popup();

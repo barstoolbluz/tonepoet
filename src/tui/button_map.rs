@@ -335,6 +335,7 @@ pub enum TuiButton {
     BrowseOptionsLayout,
     BrowseOptionsToggleExplore,
     BrowseOptionsToggleInfo,
+    BrowseOptionsToggleArtwork,
     BrowseOptionsColumns,
     BrowseOptionsSort,
     BrowseOptionsFilter,
@@ -753,6 +754,7 @@ impl TuiButton {
             | Self::BrowseOptionsLayout
             | Self::BrowseOptionsToggleExplore
             | Self::BrowseOptionsToggleInfo
+            | Self::BrowseOptionsToggleArtwork
             | Self::BrowseOptionsColumns
             | Self::BrowseOptionsSort
             | Self::BrowseOptionsFilter

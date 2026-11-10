@@ -3066,6 +3066,15 @@ fn activate_browse_options_menu_button(
             repair_browse_focus_visibility(app);
             persist_browse_config(app);
         }
+        TuiButton::BrowseOptionsToggleArtwork => {
+            app.browse.artwork_config.enabled = !app.browse.artwork_config.enabled;
+            if !app.browse.artwork_config.enabled && !app.browse_artwork.popup_open {
+                // Suppress discovery and decode work as soon as the pane is
+                // hidden, not only after the following draw/prepare cycle.
+                app.browse_artwork.suspend();
+            }
+            persist_browse_config(app);
+        }
         TuiButton::BrowseOptionsColumns => {
             set_options_menu_panel(app, BrowseOptionsMenu::Columns);
         }
@@ -3133,6 +3142,7 @@ fn is_browse_options_menu_button(button: TuiButton) -> bool {
             | TuiButton::BrowseOptionsLayout
             | TuiButton::BrowseOptionsToggleExplore
             | TuiButton::BrowseOptionsToggleInfo
+            | TuiButton::BrowseOptionsToggleArtwork
             | TuiButton::BrowseOptionsColumns
             | TuiButton::BrowseOptionsSort
             | TuiButton::BrowseOptionsFilter
@@ -6072,7 +6082,8 @@ mod inline_edit_behavior_tests {
             text.push(' ');
         }
         assert!(text.contains("Close") && text.contains("view"), "menu must remain visible");
-        assert!(text.contains("front.png"), "image view caption must remain visible");
+        assert!(text.contains("Actions"), "image actions entry must be present");
+        assert!(!text.contains("front.png"), "viewer must not paint a filename caption");
     }
 
     #[test]
@@ -73533,6 +73544,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::BrowseOptionsLayout
             | TuiButton::BrowseOptionsToggleExplore
             | TuiButton::BrowseOptionsToggleInfo
+            | TuiButton::BrowseOptionsToggleArtwork
             | TuiButton::BrowseOptionsColumns
             | TuiButton::BrowseOptionsSort
             | TuiButton::BrowseOptionsFilter

@@ -444,11 +444,28 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: 
                 &mut app.button_map,
                 hover,
                 theme,
-                Some((&mut app.browse_artwork, &app.browse.artwork_config)),
+                app.browse.artwork_config.enabled.then_some(
+                    (&mut app.browse_artwork, &app.browse.artwork_config)),
                 suppress_artwork_image,
             );
             app.button_map.record_button(TuiButton::BrowsePaneToggle(BrowsePaneId::Info), Rect::new(info_area.x + 1, info_area.y, 7.min(info_area.width.saturating_sub(2)), 1));
         }
+    }
+
+    // A native image can alter terminal pixels outside its fitted rectangle,
+    // even though Ratatui still considers the corresponding cells unchanged.
+    // Limit the normal preview repair to Info. A full-size file viewer (which
+    // also works with Info disabled) and its one-shot teardown need the whole
+    // screen; only blank theme-background cells are actually updated.
+    let restore_background = app.browse_artwork.take_background_restore();
+    let popup_open = app.browse_artwork.popup_open;
+    let inline_image_visible = app.browse.info_enabled && !app.browse.info_collapsed
+        && app.browse.artwork_config.enabled && app.browse_artwork.has_image();
+    if app.image_picker.protocol_type != ratatui_image::picker::ProtocolType::Halfblocks
+        && (popup_open || restore_background || inline_image_visible)
+    {
+        let repaint_area = if popup_open || restore_background { f.size() } else { info_area };
+        super::browse_artwork::repaint_image_background(f, repaint_area, theme.bg);
     }
 
     let file_task_footer = app.file_task_footer_state();
@@ -1366,6 +1383,10 @@ pub(super) fn options_submenu_rows(
                     format!(" {} Show Info pane", if browse.info_enabled { "●" } else { "○" }),
                     Some(TuiButton::BrowseOptionsToggleInfo),
                 ),
+                (
+                    format!(" {} Show Info artwork", if browse.artwork_config.enabled { "●" } else { "○" }),
+                    Some(TuiButton::BrowseOptionsToggleArtwork),
+                ),
             ],
         )),
         BrowseOptionsMenu::Columns => Some((
@@ -1603,6 +1624,22 @@ pub(super) fn active_options_menu_rows(
 #[cfg(test)]
 mod options_menu_tests {
     use super::*;
+
+    #[test]
+    fn layout_menu_artwork_is_independent_of_info_pane_visibility() {
+        let mut browse = BrowseState::new();
+        browse.options_menu = BrowseOptionsMenu::Layout;
+        let (_, rows) = options_submenu_rows(&browse, "auto").expect("layout rows");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[2].1, Some(TuiButton::BrowseOptionsToggleArtwork));
+        assert!(rows[2].0.contains("● Show Info artwork"));
+
+        browse.artwork_config.enabled = false;
+        browse.info_enabled = true;
+        let (_, rows) = options_submenu_rows(&browse, "auto").expect("layout rows");
+        assert!(rows[1].0.contains("● Show Info pane"));
+        assert!(rows[2].0.contains("○ Show Info artwork"));
+    }
 
     #[test]
     fn folder_size_sort_option_and_size_header_marker_track_session_state() {
@@ -3497,6 +3534,10 @@ fn draw_browse_info_with_artwork(
         return;
     }
 
+    if artwork.as_ref().is_some_and(|(_, config)| !config.enabled) {
+        artwork = None;
+    }
+
     let border_color = theme.amber;
     let w = area.width as usize;
 
@@ -3614,7 +3655,7 @@ fn draw_browse_info_with_artwork(
 
     lines.push(bot_line);
 
-    let paragraph = Paragraph::new(lines);
+    let paragraph = Paragraph::new(lines).style(Style::default().bg(theme.bg));
     f.render_widget(paragraph, area);
 
     if artwork_height > 0 {
@@ -3627,7 +3668,7 @@ fn draw_browse_info_with_artwork(
             let image_area = info_artwork_image_area(artwork_area);
             let visible = !suppress_image
                 && state.render_image(f, image_area, config.allow_upscale,
-                    ImageVerticalPlacement::Bottom);
+                    ImageVerticalPlacement::Bottom, theme.bg);
             if !visible && !suppress_image {
                 // Silent when no embedded/external image exists. Missing tag
                 // diagnostics belong to explicit operations, not Browse Info.
@@ -9454,6 +9495,43 @@ mod browse_info_artwork_presentation_tests {
             cue_repair_availability: crate::tui::browse::CueRepairAvailability::Unknown,
             cue_file_reference_repairs: Default::default(),
         });
+    }
+
+    #[test]
+    fn disabled_info_artwork_reclaims_rows_without_hiding_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("Album");
+        std::fs::create_dir(&folder).unwrap();
+        let entry = BrowseEntry::new(folder, "Album".into(), EntryKind::Directory, 0, None);
+        let mut browse = BrowseState::new();
+        browse.entries = vec![entry.clone()];
+        classify(&mut browse, &entry, FolderClassificationKind::Album);
+        let accounting = crate::directory_accounting::AccountingService::new(None);
+        let theme = crate::tui::theme::theme_by_slug_or_default(
+            crate::tui::theme::default_theme_slug());
+        let mut state = BrowseArtworkState::default();
+        let mut config = crate::config::BrowseArtworkConfig::default();
+        config.pane_height_percent = 75;
+        let mut terminal = Terminal::new(TestBackend::new(72, 48)).unwrap();
+        let mut buttons = ButtonRenderMap::new();
+
+        terminal.draw(|frame| draw_browse_info_with_artwork(
+            frame, Rect::new(0, 0, 72, 48), &browse, &accounting,
+            None, None, &mut buttons, None, theme, Some((&mut state, &config)), false,
+        )).unwrap();
+        assert!(buttons.find_button_rect(&TuiButton::BrowseInfoArtworkArea).is_some());
+
+        config.enabled = false;
+        buttons.clear();
+        terminal.draw(|frame| draw_browse_info_with_artwork(
+            frame, Rect::new(0, 0, 72, 48), &browse, &accounting,
+            None, None, &mut buttons, None, theme, Some((&mut state, &config)), false,
+        )).unwrap();
+        assert!(buttons.find_button_rect(&TuiButton::BrowseInfoArtworkArea).is_none());
+        let painted = (0..48_u16).map(|y| (0..72_u16).map(|x|
+            terminal.backend().buffer().get(x, y).symbol().to_string())
+            .collect::<Vec<_>>().join("")).collect::<Vec<_>>().join("\n");
+        assert!(painted.contains("Album"), "Info content must remain visible");
     }
 
     #[test]
