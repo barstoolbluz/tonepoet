@@ -16629,7 +16629,7 @@ impl AppState {
         config: TonepoetConfig,
         database_path: impl Into<std::path::PathBuf>,
     ) -> Self {
-        Self::new_with_startup_options(
+        let mut app = Self::new_with_startup_options(
             config,
             // Tests must not scan the process-global file-operation journal
             // directory at construction: concurrent journal tests point it at
@@ -16639,7 +16639,9 @@ impl AppState {
             AppStartupOptions::without_archive_recovery()
                 .without_file_operation_recovery()
                 .with_database_path(database_path),
-        )
+        );
+        app.browse_artwork.use_memory_only_preview_cache();
+        app
     }
 
     pub fn new_for_test_with_isolated_db(mut config: TonepoetConfig) -> Self {
@@ -16648,14 +16650,16 @@ impl AppState {
         // migration on an empty database) and write test items back into it.
         // Tests must never read or mutate the developer's actual queue.
         config.conversion.persist_queue = false;
-        Self::new_with_startup_options(
+        let mut app = Self::new_with_startup_options(
             config,
             // See new_for_test_with_db_path: never scan the process-global
             // file-operation journal directory from a test constructor.
             AppStartupOptions::without_archive_recovery()
                 .without_file_operation_recovery()
                 .with_isolated_temp_database(),
-        )
+        );
+        app.browse_artwork.use_memory_only_preview_cache();
+        app
     }
 
     fn new_with_open_database(
