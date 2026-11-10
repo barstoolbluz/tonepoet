@@ -148,6 +148,12 @@ pub struct BrowseArtworkState {
     // Alternate the invisible ink on each ACTUAL restoration. Frame parity
     // cannot guarantee a change when intervening frames don't repaint.
     background_restore_count: usize,
+    // A native image command can repaint terminal pixels AFTER the current
+    // frame's blank-cell repair. Request one follow-up repair only after the
+    // newly prepared protocol has actually been rendered. This closes the
+    // first-placement race without restoring on every unrelated Browse frame.
+    native_placement_awaiting_render: bool,
+    post_native_repaint_redraw: bool,
     // A context menu painted over native artwork may overwrite terminal pixels
     // without modifying Ratatui's image-origin cell. Restore once when that
     // menu closes or moves; never on hover or unrelated startup redraws.
@@ -169,6 +175,7 @@ impl Default for BrowseArtworkState {
             prepared_protocol_has_fixed_origin: false,
             inline_click_source: None, warning: None, popup_open: false, popup_rect: Rect::default(),
             needs_background_restore: false, background_restore_count: 0,
+            native_placement_awaiting_render: false, post_native_repaint_redraw: false,
             artwork_menu_occludes_image: false, repaint_image_after_menu: false,
             native_image_restore_count: 0,
         }
@@ -196,6 +203,8 @@ impl BrowseArtworkState {
         self.artwork_menu_occludes_image = false;
         self.repaint_image_after_menu = false;
         self.native_image_restore_count = 0;
+        self.native_placement_awaiting_render = false;
+        self.post_native_repaint_redraw = false;
         self.failed.clear();
         self.decoded_source = None;
         self.decoded_embedded_path = None;
@@ -241,6 +250,8 @@ impl BrowseArtworkState {
     pub fn invalidate_protocol(&mut self) {
         self.protocol = None;
         self.protocol_area = Rect::default();
+        self.native_placement_awaiting_render = false;
+        self.post_native_repaint_redraw = false;
     }
 
     /// Track the artwork menu independently of decode and protocol readiness.
@@ -396,6 +407,8 @@ impl BrowseArtworkState {
         self.artwork_menu_occludes_image = false;
         self.repaint_image_after_menu = false;
         self.native_image_restore_count = 0;
+        self.native_placement_awaiting_render = false;
+        self.post_native_repaint_redraw = false;
         self.protocol = None; // rebuild for the pane on the next prepare pass
         self.protocol_area = Rect::default();
         if was_file_view {
@@ -410,7 +423,11 @@ impl BrowseArtworkState {
     /// Filesystem traversal and image decoding always run on worker threads.
     pub fn prepare(&mut self, picker: &mut Picker, picker_generation: usize,
                    kitty_generation: usize, config: &BrowseArtworkConfig) -> bool {
-        let mut changed = self.poll_workers();
+        // Post-draw preparation asks the event loop for one prompt, non-clearing
+        // draw. The second pass paints background cells after the terminal has
+        // received its new Sixel/Kitty/iTerm image command.
+        let mut changed = std::mem::take(&mut self.post_native_repaint_redraw);
+        changed |= self.poll_workers();
         if self.scan_rx.is_none() && self.scanned != self.context
             && self.context.is_some() && self.changed_at.elapsed() >= SELECTION_SETTLE
         {
@@ -468,9 +485,11 @@ impl BrowseArtworkState {
                 || self.protocol_generation != picker_generation || self.retransmit_generation != kitty)
         {
             self.protocol = self.decoded.as_ref().map(|image| picker.new_resize_protocol(image.clone()));
-            if picker.protocol_type != ratatui_image::picker::ProtocolType::Halfblocks {
-                // A new native graphics placement may have modified the
-                // terminal outside Ratatui's buffer. Restore it on this draw.
+            self.native_placement_awaiting_render =
+                picker.protocol_type != ratatui_image::picker::ProtocolType::Halfblocks;
+            if self.native_placement_awaiting_render {
+                // The first pass repairs any stale terminal background. A
+                // second pass is queued only once this image actually renders.
                 self.needs_background_restore = true;
             }
             self.protocol_area = desired;
@@ -609,6 +628,14 @@ impl BrowseArtworkState {
             // Never change the native protocol's skipped image cells.
             let ink = background_repaint_ink(background, self.native_image_restore_count);
             f.buffer_mut().get_mut(target.x, target.y).set_fg(ink);
+        }
+        if self.native_placement_awaiting_render {
+            // Native graphics can overwrite the first blank-cell repaint as
+            // their escape sequences are emitted. Force a DIFFERENT invisible
+            // ink on the next frame; do not continuously repaint while idle.
+            self.native_placement_awaiting_render = false;
+            self.needs_background_restore = true;
+            self.post_native_repaint_redraw = true;
         }
         true
     }
@@ -1123,6 +1150,166 @@ mod tests {
         artwork.close_popup();
         assert!(artwork.take_background_restore(), "popup teardown still repaints");
         assert_eq!(artwork.background_restore_count(), second + 1);
+    }
+
+    #[test]
+    fn native_image_placement_gets_one_post_render_background_repair() {
+        use ratatui::{backend::TestBackend, style::Style, widgets::Paragraph, Terminal};
+        use ratatui_image::picker::ProtocolType;
+
+        let background = Color::Rgb(26, 27, 38);
+        let viewport = Rect::new(2, 2, 42, 24);
+        let empty_cell = (59, 28); // Outside the image, inside the drawn screen.
+        let config = BrowseArtworkConfig::default();
+
+        // The popup is composited after Browse's background pass. The Info
+        // preview is composited before it. Both need a post-image repair, for
+        // each native protocol; Halfblocks must never request this redraw.
+        for (protocol_type, popup) in [
+            (ProtocolType::Sixel, false),
+            (ProtocolType::Sixel, true),
+            (ProtocolType::Kitty, false),
+            (ProtocolType::Kitty, true),
+            (ProtocolType::Iterm2, false),
+            (ProtocolType::Iterm2, true),
+        ] {
+            let mut state = BrowseArtworkState::default();
+            state.decoded = Some(DynamicImage::new_rgb8(40, 30));
+            state.popup_open = popup;
+            let placement = if popup {
+                ImageVerticalPlacement::Center
+            } else {
+                ImageVerticalPlacement::Bottom
+            };
+            state.set_desired_area(viewport, placement);
+            let mut picker = Picker::new((8, 12));
+            picker.protocol_type = protocol_type;
+            assert!(state.prepare(&mut picker, 0, 0, &config));
+            assert!(state.native_placement_awaiting_render);
+            // Preparing alone must not schedule a second render. The native
+            // protocol might be suppressed by an overlay or zero-size area.
+            assert!(!state.prepare(&mut picker, 0, 0, &config));
+            assert!(state.take_background_restore());
+
+            let mut terminal = Terminal::new(TestBackend::new(64, 32)).unwrap();
+            terminal.draw(|frame| {
+                let screen = frame.size();
+                frame.render_widget(Paragraph::new("")
+                    .style(Style::default().bg(background)), screen);
+                if popup {
+                    // Full-size images are drawn after Browse's repair.
+                    repaint_image_background(frame, screen, background,
+                        state.background_restore_count());
+                }
+                assert!(state.render_image(frame, viewport, config.allow_upscale,
+                    placement, background));
+                if !popup {
+                    // Info previews are painted before Browse's repair.
+                    repaint_image_background(frame, screen, background,
+                        state.background_restore_count());
+                }
+            }).unwrap();
+            let first = terminal.backend().buffer().clone();
+            let origin = (state.protocol_area.x, state.protocol_area.y);
+            assert!(state.post_native_repaint_redraw);
+            assert!(!state.native_placement_awaiting_render);
+
+            // The actual image command may have altered terminal pixels after
+            // the first pass. The post-draw prepare must request another frame
+            // without invalidating/re-encoding the image protocol.
+            let prepared_before = state.protocol_area;
+            assert!(state.prepare(&mut picker, 0, 0, &config));
+            assert_eq!(state.protocol_area, prepared_before);
+            assert!(!state.post_native_repaint_redraw);
+            assert!(state.take_background_restore());
+            terminal.draw(|frame| {
+                let screen = frame.size();
+                frame.render_widget(Paragraph::new("")
+                    .style(Style::default().bg(background)), screen);
+                if popup {
+                    // Full-size images are drawn after Browse's repair.
+                    repaint_image_background(frame, screen, background,
+                        state.background_restore_count());
+                }
+                assert!(state.render_image(frame, viewport, config.allow_upscale,
+                    placement, background));
+                if !popup {
+                    // Info previews are painted before Browse's repair.
+                    repaint_image_background(frame, screen, background,
+                        state.background_restore_count());
+                }
+            }).unwrap();
+            let second = terminal.backend().buffer().clone();
+            assert_eq!(first.get(origin.0, origin.1).symbol(),
+                second.get(origin.0, origin.1).symbol(),
+                "the follow-up must not retransmit a new native image");
+            assert_eq!(first.get(empty_cell.0, empty_cell.1).bg, background);
+            assert_eq!(second.get(empty_cell.0, empty_cell.1).bg, background);
+            assert_ne!(first.get(empty_cell.0, empty_cell.1).fg,
+                second.get(empty_cell.0, empty_cell.1).fg);
+            assert!(first.diff(&second).iter().any(|(x, y, _)|
+                (*x, *y) == empty_cell),
+                "post-image repair must force a terminal write to the blank region");
+            assert!(!state.prepare(&mut picker, 0, 0, &config));
+            assert!(!state.take_background_restore(),
+                "an unchanged image must not flood subsequent Browse redraws");
+        }
+    }
+
+    #[test]
+    fn post_render_background_repair_is_cancelled_when_image_closes() {
+        use ratatui::{backend::TestBackend, Terminal};
+        use ratatui_image::picker::ProtocolType;
+
+        let mut state = BrowseArtworkState::default();
+        state.open_file_popup(PathBuf::from("/pictures/cover.png"));
+        state.scanned = state.context.clone(); // No filesystem worker in this state test.
+        state.decoded = Some(DynamicImage::new_rgb8(24, 24));
+        state.set_desired_area(Rect::new(2, 2, 20, 15), ImageVerticalPlacement::Center);
+        let mut picker = Picker::new((8, 12));
+        picker.protocol_type = ProtocolType::Sixel;
+        let config = BrowseArtworkConfig::default();
+        assert!(state.prepare(&mut picker, 0, 0, &config));
+        assert!(state.take_background_restore());
+        let mut terminal = Terminal::new(TestBackend::new(40, 25)).unwrap();
+        terminal.draw(|frame| {
+            assert!(state.render_image(frame, Rect::new(2, 2, 20, 15),
+                config.allow_upscale, ImageVerticalPlacement::Center,
+                Color::Rgb(26, 27, 38)));
+        }).unwrap();
+        assert!(state.post_native_repaint_redraw);
+        state.close_popup();
+        assert!(!state.post_native_repaint_redraw,
+            "closing must not schedule another hidden-image render");
+        assert!(!state.native_placement_awaiting_render);
+        assert!(state.take_background_restore(),
+            "closing still needs the ordinary one-shot background cleanup");
+        assert!(!state.take_background_restore());
+    }
+
+    #[test]
+    fn halfblocks_never_schedules_native_background_followup() {
+        use ratatui::{backend::TestBackend, Terminal};
+        use ratatui_image::picker::ProtocolType;
+
+        let mut state = BrowseArtworkState::default();
+        state.decoded = Some(DynamicImage::new_rgb8(24, 24));
+        let area = Rect::new(2, 2, 20, 15);
+        state.set_desired_area(area, ImageVerticalPlacement::Center);
+        let mut picker = Picker::new((8, 12));
+        picker.protocol_type = ProtocolType::Halfblocks;
+        let config = BrowseArtworkConfig::default();
+        assert!(state.prepare(&mut picker, 0, 0, &config));
+        assert!(!state.native_placement_awaiting_render);
+        assert!(!state.take_background_restore());
+        let mut terminal = Terminal::new(TestBackend::new(40, 25)).unwrap();
+        terminal.draw(|frame| {
+            assert!(state.render_image(frame, area, config.allow_upscale,
+                ImageVerticalPlacement::Center, Color::Rgb(26, 27, 38)));
+        }).unwrap();
+        assert!(!state.post_native_repaint_redraw);
+        assert!(!state.prepare(&mut picker, 0, 0, &config));
+        assert!(!state.take_background_restore());
     }
 
     #[test]
