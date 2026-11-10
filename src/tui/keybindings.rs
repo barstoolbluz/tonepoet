@@ -6299,40 +6299,70 @@ mod inline_edit_behavior_tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(app.browse_artwork.has_image());
-        app.browse_artwork.prepare(&mut app.image_picker, 0, 0,
-            &app.browse.artwork_config);
+        let background = Color::Rgb(26, 27, 38);
         let mut terminal = Terminal::new(TestBackend::new(100, 45)).unwrap();
-        terminal.draw(|frame| {
-            assert!(app.browse_artwork.render_image(frame, viewport,
-                app.browse.artwork_config.allow_upscale,
-                super::super::browse_artwork::ImageVerticalPlacement::Center,
-                Color::Rgb(26, 27, 38)));
-            frame.render_widget(ratatui::widgets::Clear, Rect::new(30, 16, 4, 2));
-        }).unwrap();
-        assert!(app.browse_artwork.take_background_restore(),
-            "first image placement has its own background restoration");
-        assert!(!app.browse_artwork.take_background_restore());
+        // One event-loop iteration: pre-draw prepare; Browse's background
+        // repair; the full-size viewer composited after it; the menu, if
+        // open; then the post-draw prepare. Returns whether this frame
+        // repaired, whether the post-draw prepare asked for another frame,
+        // and the frame's buffer, whose diff is what reaches the terminal.
+        let mut draw_frame = |app: &mut AppState, menu_open: bool| {
+            app.browse_artwork.prepare(&mut app.image_picker, 0, 0,
+                &app.browse.artwork_config);
+            let mut repaired = false;
+            let buffer = terminal.draw(|frame| {
+                let screen = frame.size();
+                frame.render_widget(ratatui::widgets::Paragraph::new("")
+                    .style(ratatui::style::Style::default().bg(background)), screen);
+                repaired = app.browse_artwork.take_background_restore();
+                if repaired {
+                    super::super::browse_artwork::repaint_image_background(frame, screen,
+                        background, app.browse_artwork.background_restore_count());
+                }
+                assert!(app.browse_artwork.render_image(frame, viewport,
+                    app.browse.artwork_config.allow_upscale,
+                    super::super::browse_artwork::ImageVerticalPlacement::Center,
+                    background));
+                if menu_open {
+                    frame.render_widget(ratatui::widgets::Clear, Rect::new(30, 16, 4, 2));
+                }
+            }).unwrap().buffer.clone();
+            let redraw = app.browse_artwork.prepare(&mut app.image_picker, 0, 0,
+                &app.browse.artwork_config);
+            (repaired, redraw, buffer)
+        };
+
+        let (repaired, redraw, _) = draw_frame(&mut app, true);
+        assert!(repaired, "first image placement has its own background restoration");
+        assert!(redraw, "a native placement requests one follow-up frame");
+        let (repaired, _, _) = draw_frame(&mut app, true);
+        assert!(repaired, "the follow-up frame carries the one post-render repair");
 
         handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
         assert!(app.browse_artwork.popup_open);
         assert!(matches!(&app.active_overlay, ActiveOverlay::None));
-        assert!(app.browse_artwork.take_background_restore(),
+        let (repaired, _, _) = draw_frame(&mut app, false);
+        assert!(repaired,
             "dismissing a menu opened before decode must restore obscured pixels");
-        assert!(!app.browse_artwork.take_background_restore());
+        let (repaired, _, follow_up) = draw_frame(&mut app, false);
+        assert!(repaired, "the restored image's follow-up frame carries the one post-render repair");
 
-        app.browse_artwork.prepare(&mut app.image_picker, 0, 0,
-            &app.browse.artwork_config);
-        terminal.draw(|frame| {
-            assert!(app.browse_artwork.render_image(frame, viewport,
-                app.browse.artwork_config.allow_upscale,
-                super::super::browse_artwork::ImageVerticalPlacement::Center,
-                Color::Rgb(26, 27, 38)));
-        }).unwrap();
-        app.browse_artwork.take_background_restore();
-        app.browse_artwork.prepare(&mut app.image_picker, 0, 0,
-            &app.browse.artwork_config);
-        assert!(!app.browse_artwork.take_background_restore(),
-            "ordinary redraw must not request another restoration");
+        let (repaired, redraw, ordinary) = draw_frame(&mut app, false);
+        assert!(!repaired, "ordinary redraw must not request another restoration");
+        assert!(!redraw, "ordinary redraw must not request another frame");
+        // A redraw may rewrite blank cells: the repair's ink is withdrawn,
+        // and ratatui rewrites the cells after the wide Sixel symbol. It must
+        // not write an image cell, which would retransmit the native image.
+        let rewrites_image = |before: &ratatui::buffer::Buffer,
+                              after: &ratatui::buffer::Buffer| {
+            before.diff(after).iter().any(|(x, y, cell)|
+                cell.symbol() != " " || before.get(*x, *y).symbol() != " ")
+        };
+        assert!(!rewrites_image(&follow_up, &ordinary),
+            "ordinary redraw must not rewrite the native image");
+        let (repaired, redraw, next) = draw_frame(&mut app, false);
+        assert!(!repaired && !redraw && !rewrites_image(&ordinary, &next),
+            "a further ordinary redraw must not restore, request a frame, or rewrite the image");
 
         handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
         assert!(!app.browse_artwork.popup_open);
