@@ -134,6 +134,9 @@ pub struct BrowseArtworkState {
     decoded: Option<Arc<DynamicImage>>,
     // Created on first Info request, not when disabled or in direct viewer use.
     preview_cache: Option<Arc<InfoPreviewCache>>,
+    // AppState's test constructors request a memory-only implicit cache even
+    // in integration tests, where the library is built without cfg(test).
+    memory_only_preview_cache: bool,
     protocol: Option<Box<dyn StatefulProtocol>>,
     desired_area: Rect,
     vertical_placement: ImageVerticalPlacement,
@@ -176,7 +179,7 @@ impl Default for BrowseArtworkState {
             scan_rx: None, sources: Vec::new(), cursor: 0,
             queued_gallery_offset: 0, failed: HashSet::new(),
             decode_rx: None, decoded_source: None, decoded_embedded_path: None, decoded: None,
-            preview_cache: None,
+            preview_cache: None, memory_only_preview_cache: false,
             protocol: None, desired_area: Rect::default(),
             vertical_placement: ImageVerticalPlacement::Center, protocol_area: Rect::default(),
             protocol_generation: 0, retransmit_generation: 0, font_size: (8, 12),
@@ -191,6 +194,21 @@ impl Default for BrowseArtworkState {
 }
 
 impl BrowseArtworkState {
+    /// Test-state constructors call this before any artwork request. Explicit
+    /// at_path() fixtures still qualify the persistent SQLite implementation.
+    pub(super) fn use_memory_only_preview_cache(&mut self) {
+        assert!(self.preview_cache.is_none(), "test cache policy must be selected before cache creation");
+        self.memory_only_preview_cache = true;
+    }
+
+    fn preview_cache_handle(&mut self) -> Arc<InfoPreviewCache> {
+        let memory_only = self.memory_only_preview_cache;
+        Arc::clone(self.preview_cache.get_or_insert_with(|| Arc::new(
+            if memory_only { InfoPreviewCache::memory_only() }
+            else { InfoPreviewCache::new() }
+        )))
+    }
+
     pub fn observe(&mut self, context: Option<ArtworkContext>) {
         if self.context == context { return; }
         self.needs_background_restore |= self.decoded.is_some() || self.protocol.is_some();
@@ -235,7 +253,7 @@ impl BrowseArtworkState {
     }
 
     pub fn clear_cache(&mut self) -> (u64, mpsc::Receiver<Result<(), String>>) {
-        self.preview_cache.get_or_insert_with(|| Arc::new(InfoPreviewCache::new())).clear()
+        self.preview_cache_handle().clear()
     }
 
     pub fn latest_clear_id(&self) -> Option<u64> {
@@ -507,8 +525,7 @@ impl BrowseArtworkState {
                 // source's File/Embedded variant. View never receives a cache.
                 let info_request = !self.popup_open
                     && matches!(self.context, Some(ArtworkContext::Album { .. }));
-                let cache = info_request.then(|| Arc::clone(self.preview_cache
-                    .get_or_insert_with(|| Arc::new(InfoPreviewCache::new()))));
+                let cache = info_request.then(|| self.preview_cache_handle());
                 let cache_epoch = cache.as_ref().map(|cache| cache.epoch());
                 thread::spawn(move || {
                     let image = match (&cache, cache_epoch) {
@@ -1034,6 +1051,22 @@ fn decode_image_bytes_with_edge(bytes: Vec<u8>, edge: u32) -> Result<DynamicImag
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_app_constructors_keep_implicit_artwork_cache_in_memory() {
+        let mut app = crate::tui::app::AppState::new_for_test(
+            crate::config::TonepoetConfig::default());
+        assert!(app.browse_artwork.memory_only_preview_cache);
+        assert!(app.browse_artwork.preview_cache.is_none(), "remain lazy");
+        assert!(app.browse_artwork.preview_cache_handle().is_memory_only_for_test());
+
+        let root = tempfile::tempdir().unwrap();
+        let mut app = crate::tui::app::AppState::new_for_test_with_db_path(
+            crate::config::TonepoetConfig::default(), root.path().join("metadata.sqlite3"));
+        assert!(app.browse_artwork.memory_only_preview_cache);
+        assert!(app.browse_artwork.preview_cache.is_none(), "remain lazy");
+        assert!(app.browse_artwork.preview_cache_handle().is_memory_only_for_test());
+    }
 
     #[test]
     fn ratios_round_and_allow_full_height() {

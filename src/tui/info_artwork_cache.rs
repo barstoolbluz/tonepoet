@@ -201,10 +201,23 @@ pub(super) struct InfoPreviewCache {
 }
 
 impl InfoPreviewCache {
+    /// Unit-test binaries default to memory-only previews. Disk-cache tests
+    /// provide their own temporary SQLite path through at_path().
+    #[cfg(test)]
+    pub fn new() -> Self { Self::memory_only() }
+
+    /// Production keeps using the ordinary XDG/platform cache directory.
+    /// AppState's explicit test constructors override this in integration
+    /// tests, which compile the library without cfg(test).
+    #[cfg(not(test))]
     pub fn new() -> Self {
-        let path = cache_file_path();
-        Self::with_optional_path(path)
+        Self::with_optional_path(cache_file_path())
     }
+
+    pub(super) fn memory_only() -> Self { Self::with_optional_path(None) }
+
+    #[cfg(test)]
+    pub(super) fn is_memory_only_for_test(&self) -> bool { self.path.is_none() }
 
     #[cfg(test)]
     pub(super) fn at_path(path: PathBuf) -> Self { Self::with_optional_path(Some(path)) }
@@ -317,6 +330,7 @@ impl InfoPreviewCache {
     }
 }
 
+#[cfg(not(test))]
 fn cache_file_path() -> Option<PathBuf> {
     let home = std::env::var_os("XDG_CACHE_HOME").filter(|v| Path::new(v).is_absolute())
         .map(PathBuf::from).or_else(dirs::cache_dir)?;
@@ -618,6 +632,15 @@ fn matches_source_path_stamps(stamps: &[SourceStamp]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn implicit_unit_test_cache_cannot_write_to_the_user_cache_directory() {
+        let cache = InfoPreviewCache::new();
+        assert!(cache.path.is_none(), "unit tests must opt in to disk cache using at_path");
+        let (id, done) = cache.clear();
+        assert_eq!(cache.latest_clear_id(), id);
+        assert!(done.recv_timeout(Duration::from_secs(5)).unwrap().is_ok());
+    }
 
     fn file_source(path: &Path) -> ArtworkSource { ArtworkSource::File(path.to_path_buf()) }
     fn preview(path: &Path, value: u8) -> Preview {
