@@ -5565,3 +5565,29 @@ expensive in themselves, such as on battery.
 
 My reading of the event loop covers only the poll and the redraw decision. The
 account of why it polls is inference and may be incomplete.
+
+---
+
+## 80. Two user-facing subcommands migrate v0.4.8 journals for users who do not exist
+
+Filed 2026-11-09.
+
+`tonepoet --help` lists:
+
+```
+  legacy-file-recovery-list   List top-level v0.4.8 file-operation journals that need explicit upgrade handling
+  legacy-file-recovery-adopt  Adopt one nonterminal top-level v0.4.8 journal into protocol-v2 recovery review
+```
+
+TonePoet has no users, so there are no v0.4.8 journals in the field to list or
+adopt. The commands are upgrade machinery for an install base that does not
+exist, and they sit in the CLI beside the real subcommands.
+
+They are variants of `enum Commands` in `src/main.rs`, backed by
+`legacy_journal_inventory` and `adopt_legacy_journal` in
+`src/tui/file_task_runtime.rs`. v0.4.8 and legacy-journal handling is also
+referenced from `src/concurrency.rs`, `src/db.rs` and `src/tui/recovery_ui.rs`.
+I have not checked how much of that exists only to serve these two commands.
+
+**What we want.** No legacy-journal subcommands in the CLI, and no
+legacy-journal code that only they use.
