@@ -426,7 +426,15 @@ impl BrowseArtworkState {
         // Post-draw preparation asks the event loop for one prompt, non-clearing
         // draw. The second pass paints background cells after the terminal has
         // received its new Sixel/Kitty/iTerm image command.
-        let mut changed = std::mem::take(&mut self.post_native_repaint_redraw);
+        let post_render_repair = std::mem::take(&mut self.post_native_repaint_redraw);
+        if post_render_repair {
+            // Browse may already have consumed the first repair after the
+            // native image rendered in that same frame. Re-arm it only AFTER
+            // terminal.draw has completed, so the follow-up frame really
+            // repaints cells the terminal's image command could have cleared.
+            self.needs_background_restore = true;
+        }
+        let mut changed = post_render_repair;
         changed |= self.poll_workers();
         if self.scan_rx.is_none() && self.scanned != self.context
             && self.context.is_some() && self.changed_at.elapsed() >= SELECTION_SETTLE
@@ -1189,7 +1197,7 @@ mod tests {
             // Preparing alone must not schedule a second render. The native
             // protocol might be suppressed by an overlay or zero-size area.
             assert!(!state.prepare(&mut picker, 0, 0, &config));
-            assert!(state.take_background_restore());
+            assert!(state.needs_background_restore);
 
             let mut terminal = Terminal::new(TestBackend::new(64, 32)).unwrap();
             terminal.draw(|frame| {
@@ -1198,6 +1206,7 @@ mod tests {
                     .style(Style::default().bg(background)), screen);
                 if popup {
                     // Full-size images are drawn after Browse's repair.
+                    assert!(state.take_background_restore());
                     repaint_image_background(frame, screen, background,
                         state.background_restore_count());
                 }
@@ -1205,6 +1214,7 @@ mod tests {
                     placement, background));
                 if !popup {
                     // Info previews are painted before Browse's repair.
+                    assert!(state.take_background_restore());
                     repaint_image_background(frame, screen, background,
                         state.background_restore_count());
                 }
@@ -1221,13 +1231,15 @@ mod tests {
             assert!(state.prepare(&mut picker, 0, 0, &config));
             assert_eq!(state.protocol_area, prepared_before);
             assert!(!state.post_native_repaint_redraw);
-            assert!(state.take_background_restore());
+            assert!(state.needs_background_restore,
+                "post-draw prepare must re-arm the repair even when the first draw consumed it");
             terminal.draw(|frame| {
                 let screen = frame.size();
                 frame.render_widget(Paragraph::new("")
                     .style(Style::default().bg(background)), screen);
                 if popup {
                     // Full-size images are drawn after Browse's repair.
+                    assert!(state.take_background_restore());
                     repaint_image_background(frame, screen, background,
                         state.background_restore_count());
                 }
@@ -1235,14 +1247,30 @@ mod tests {
                     placement, background));
                 if !popup {
                     // Info previews are painted before Browse's repair.
+                    assert!(state.take_background_restore());
                     repaint_image_background(frame, screen, background,
                         state.background_restore_count());
                 }
             }).unwrap();
             let second = terminal.backend().buffer().clone();
-            assert_eq!(first.get(origin.0, origin.1).symbol(),
-                second.get(origin.0, origin.1).symbol(),
-                "the follow-up must not retransmit a new native image");
+            let first_origin = first.get(origin.0, origin.1).symbol();
+            let second_origin = second.get(origin.0, origin.1).symbol();
+            if protocol_type == ProtocolType::Kitty {
+                // In ratatui-image 1.0.5 the initial Kitty origin contains
+                // an upload followed by colored Unicode placeholders. Later
+                // frames keep only the placeholders. Equality would reject
+                // the intended one-time upload, not a retransmission.
+                assert!(first_origin.contains("\x1b_G"));
+                assert!(!second_origin.contains("\x1b_G"),
+                    "the follow-up must not upload Kitty image data again");
+                assert!(first_origin.ends_with(second_origin),
+                    "the follow-up must retain the original Kitty placeholders");
+            } else {
+                assert_eq!(first_origin, second_origin,
+                    "the follow-up must not change the native image command");
+            }
+            assert_eq!(state.background_restore_count(), 2,
+                "the first and post-render frame each need one real repair");
             assert_eq!(first.get(empty_cell.0, empty_cell.1).bg, background);
             assert_eq!(second.get(empty_cell.0, empty_cell.1).bg, background);
             assert_ne!(first.get(empty_cell.0, empty_cell.1).fg,
@@ -1253,6 +1281,17 @@ mod tests {
             assert!(!state.prepare(&mut picker, 0, 0, &config));
             assert!(!state.take_background_restore(),
                 "an unchanged image must not flood subsequent Browse redraws");
+            terminal.draw(|frame| {
+                frame.render_widget(Paragraph::new("")
+                    .style(Style::default().bg(background)), frame.size());
+                assert!(state.render_image(frame, viewport, config.allow_upscale,
+                    placement, background));
+                assert!(!state.take_background_restore());
+            }).unwrap();
+            assert_eq!(second_origin,
+                terminal.backend().buffer().get(origin.0, origin.1).symbol(),
+                "an ordinary third frame must not retransmit native graphics");
+            assert_eq!(state.background_restore_count(), 2);
         }
     }
 
@@ -1285,6 +1324,91 @@ mod tests {
         assert!(state.take_background_restore(),
             "closing still needs the ordinary one-shot background cleanup");
         assert!(!state.take_background_restore());
+    }
+
+    #[test]
+    fn hidden_info_preview_cancels_pending_image_repair_but_cleans_old_pixels() {
+        use ratatui::{backend::TestBackend, Terminal};
+        use ratatui_image::picker::ProtocolType;
+
+        let mut state = BrowseArtworkState::default();
+        state.observe(Some(ArtworkContext::Album {
+            directory: PathBuf::from("/albums/old"), selected_audio: None,
+        }));
+        state.scanned = state.context.clone(); // Suppress filesystem workers.
+        state.decoded = Some(DynamicImage::new_rgb8(32, 24));
+        let area = Rect::new(3, 2, 24, 16);
+        state.set_desired_area(area, ImageVerticalPlacement::Bottom);
+        let mut picker = Picker::new((8, 12));
+        picker.protocol_type = ProtocolType::Kitty;
+        let config = BrowseArtworkConfig::default();
+        assert!(state.prepare(&mut picker, 0, 0, &config));
+        let mut terminal = Terminal::new(TestBackend::new(40, 25)).unwrap();
+        terminal.draw(|frame| {
+            assert!(state.render_image(frame, area, config.allow_upscale,
+                ImageVerticalPlacement::Bottom, Color::Rgb(26, 27, 38)));
+            assert!(state.take_background_restore());
+        }).unwrap();
+        assert!(state.post_native_repaint_redraw);
+
+        // Layout changes can hide Info immediately after the image is drawn.
+        // Its pending second image pass must be cancelled; removal still
+        // requires one blank-background cleanup for the old terminal pixels.
+        state.suspend();
+        assert!(!state.post_native_repaint_redraw);
+        assert!(!state.native_placement_awaiting_render);
+        assert!(!state.has_image());
+        assert!(state.take_background_restore());
+        assert!(!state.prepare(&mut picker, 0, 0, &config));
+        assert!(!state.take_background_restore());
+    }
+
+    #[test]
+    fn new_info_selection_preserves_cleanup_and_schedules_its_own_repair() {
+        use ratatui::{backend::TestBackend, Terminal};
+        use ratatui_image::picker::ProtocolType;
+
+        let mut state = BrowseArtworkState::default();
+        let mut picker = Picker::new((8, 12));
+        picker.protocol_type = ProtocolType::Kitty;
+        let area = Rect::new(2, 2, 24, 16);
+        let config = BrowseArtworkConfig::default();
+        state.observe(Some(ArtworkContext::Album {
+            directory: PathBuf::from("/albums/one"), selected_audio: None,
+        }));
+        state.scanned = state.context.clone(); // Suppress filesystem workers.
+        state.decoded = Some(DynamicImage::new_rgb8(32, 24));
+        state.set_desired_area(area, ImageVerticalPlacement::Bottom);
+        assert!(state.prepare(&mut picker, 0, 0, &config));
+        let mut terminal = Terminal::new(TestBackend::new(40, 25)).unwrap();
+        terminal.draw(|frame| {
+            assert!(state.render_image(frame, area, config.allow_upscale,
+                ImageVerticalPlacement::Bottom, Color::Rgb(26, 27, 38)));
+            assert!(state.take_background_restore());
+        }).unwrap();
+        assert!(state.post_native_repaint_redraw);
+
+        // Replacing artwork cancels the obsolete upload's second pass, but
+        // keeps cleanup for the old pixels and prepares a fresh image.
+        state.observe(Some(ArtworkContext::Album {
+            directory: PathBuf::from("/albums/two"), selected_audio: None,
+        }));
+        state.scanned = state.context.clone();
+        assert!(!state.post_native_repaint_redraw);
+        assert!(state.needs_background_restore);
+        state.decoded = Some(DynamicImage::new_rgb8(40, 30));
+        state.set_desired_area(area, ImageVerticalPlacement::Bottom);
+        assert!(state.prepare(&mut picker, 0, 0, &config));
+        terminal.draw(|frame| {
+            assert!(state.render_image(frame, area, config.allow_upscale,
+                ImageVerticalPlacement::Bottom, Color::Rgb(26, 27, 38)));
+            assert!(state.take_background_restore());
+        }).unwrap();
+        assert!(state.post_native_repaint_redraw);
+        assert!(state.prepare(&mut picker, 0, 0, &config));
+        assert!(state.take_background_restore());
+        assert!(!state.prepare(&mut picker, 0, 0, &config),
+            "unchanged replacement artwork must not schedule a third upload or repaint");
     }
 
     #[test]

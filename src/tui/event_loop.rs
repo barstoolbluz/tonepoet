@@ -81,9 +81,27 @@ fn should_draw_frame(
     requested || visible_state_changed || force_redraw || since_last_draw >= IDLE_REDRAW_INTERVAL
 }
 
+/// A native image's one-shot background repair must render without waiting for
+/// pointer movement or the ordinary 100 ms input-poll interval. No background
+/// tick is added: once the requested frame draws, normal blocking resumes.
+fn input_poll_timeout(post_draw_image_changed: bool, immediate_work: bool) -> Duration {
+    if post_draw_image_changed || immediate_work {
+        Duration::ZERO
+    } else {
+        Duration::from_millis(100)
+    }
+}
+
 #[cfg(test)]
 mod idle_redraw_tests {
     use super::*;
+
+    #[test]
+    fn pending_post_image_frame_does_not_wait_for_input() {
+        assert_eq!(input_poll_timeout(true, false), Duration::ZERO);
+        assert_eq!(input_poll_timeout(false, true), Duration::ZERO);
+        assert_eq!(input_poll_timeout(false, false), Duration::from_millis(100));
+    }
 
     #[test]
     fn inactive_timeout_skips_draw_but_events_and_progress_draw_immediately() {
@@ -506,7 +524,8 @@ pub async fn run_app(
         }
         // Geometry discovered by this draw may complete a preview protocol.
         // Mark the next iteration dirty without forcing a terminal clear.
-        redraw_requested |= timed_prepare_image_preview_protocols(app);
+        let post_draw_image_changed = timed_prepare_image_preview_protocols(app);
+        redraw_requested |= post_draw_image_changed;
 
         // 3. Check quit
         if app.should_quit {
@@ -564,11 +583,8 @@ pub async fn run_app(
         // to render/drain again promptly, but do not map that to
         // `force_redraw`: a full terminal clear is far more expensive and can
         // visibly flicker while warm-cache backlogs are being reduced.
-        let poll_timeout = if immediate_nonclearing_tick_needed {
-            Duration::from_millis(0)
-        } else {
-            Duration::from_millis(100)
-        };
+        let poll_timeout =
+            input_poll_timeout(post_draw_image_changed, immediate_nonclearing_tick_needed);
         if event::poll(poll_timeout)? {
             redraw_requested |= drain_ready_terminal_input(app, event::read()?, &tx)?;
         }
