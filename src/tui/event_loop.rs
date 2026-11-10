@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event};
+use crossterm::event::{self, Event, MouseEventKind};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use tokio::sync::mpsc;
 
@@ -23,6 +23,13 @@ use super::text_input::TextInputState;
 /// deferred work continues promptly without making one render absorb an
 /// unbounded reducer batch.
 const MAX_ASYNC_MESSAGES_PER_FRAME: usize = 32;
+// Process a bounded burst of input before drawing. Repeated pointer moves
+// collapse to the last position, but key presses, button events, scrolling,
+// and drag samples remain strictly ordered and are never dropped.
+const MAX_INPUT_EVENTS_PER_BATCH: usize = 256;
+// Only report genuinely slow synchronous work: an Instant pair on each draw
+// is inexpensive compared with image encoding or terminal writes.
+const SLOW_UI_STAGE_WARNING: Duration = Duration::from_millis(200);
 const DEAD_QUEUE_RECOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 // Timed app maintenance (status expiry, queue recovery, browse debounce) must
 // still run when no input arrives. Rendering a full terminal buffer on every
@@ -74,9 +81,27 @@ fn should_draw_frame(
     requested || visible_state_changed || force_redraw || since_last_draw >= IDLE_REDRAW_INTERVAL
 }
 
+/// A native image's one-shot background repair must render without waiting for
+/// pointer movement or the ordinary 100 ms input-poll interval. No background
+/// tick is added: once the requested frame draws, normal blocking resumes.
+fn input_poll_timeout(post_draw_image_changed: bool, immediate_work: bool) -> Duration {
+    if post_draw_image_changed || immediate_work {
+        Duration::ZERO
+    } else {
+        Duration::from_millis(100)
+    }
+}
+
 #[cfg(test)]
 mod idle_redraw_tests {
     use super::*;
+
+    #[test]
+    fn pending_post_image_frame_does_not_wait_for_input() {
+        assert_eq!(input_poll_timeout(true, false), Duration::ZERO);
+        assert_eq!(input_poll_timeout(false, true), Duration::ZERO);
+        assert_eq!(input_poll_timeout(false, false), Duration::from_millis(100));
+    }
 
     #[test]
     fn inactive_timeout_skips_draw_but_events_and_progress_draw_immediately() {
@@ -91,6 +116,112 @@ mod idle_redraw_tests {
             IDLE_REDRAW_INTERVAL - Duration::from_millis(1)
         ));
         assert!(should_draw_frame(false, false, false, IDLE_REDRAW_INTERVAL));
+    }
+}
+
+#[cfg(test)]
+mod artwork_input_responsiveness_tests {
+    use super::*;
+    use crate::config::TonepoetConfig;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent};
+    use std::collections::VecDeque;
+
+    fn moved(x: u16) -> Event {
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Moved, column: x, row: 8,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    #[test]
+    fn repeated_moves_are_coalesced_before_escape_not_after_it() {
+        let esc = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let click = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 15, row: 10, modifiers: KeyModifiers::NONE,
+        });
+        let mut queued = VecDeque::from([moved(2), moved(3), esc.clone(), click.clone()]);
+        let first = queued.pop_front().unwrap();
+        let mut dispatched = Vec::new();
+        assert!(dispatch_input_batch(first, || Ok(queued.pop_front()), |event| {
+            dispatched.push(event);
+            true
+        }).unwrap());
+        assert_eq!(dispatched, vec![moved(3), esc],
+            "keep the final hover location and deliver Escape without a draw for each move");
+        assert_eq!(queued.pop_front(), Some(click),
+            "the next click must wait for the frame that reflects Escape");
+    }
+
+    #[test]
+    fn drag_and_button_events_are_not_coalesced_or_reordered() {
+        let drag = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 9, row: 8, modifiers: KeyModifiers::NONE,
+        });
+        let up = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 10, row: 8, modifiers: KeyModifiers::NONE,
+        });
+        let mut queued = VecDeque::from([moved(4), drag.clone(), moved(5), up.clone()]);
+        let first = queued.pop_front().unwrap();
+        let mut dispatched = Vec::new();
+        dispatch_input_batch(first, || Ok(queued.pop_front()), |event| {
+            dispatched.push(event);
+            true
+        }).unwrap();
+        assert_eq!(dispatched, vec![moved(4), drag]);
+        let mut dispatched = Vec::new();
+        dispatch_input_batch(queued.pop_front().unwrap(), || Ok(queued.pop_front()), |event| {
+            dispatched.push(event);
+            true
+        }).unwrap();
+        assert_eq!(dispatched, vec![moved(5), up]);
+    }
+
+    #[test]
+    fn motion_batches_are_bounded_during_continuous_input() {
+        let mut queued = (1..=MAX_INPUT_EVENTS_PER_BATCH as u16)
+            .map(moved).collect::<VecDeque<_>>();
+        let mut dispatched = Vec::new();
+        assert!(dispatch_input_batch(moved(0), || Ok(queued.pop_front()), |event| {
+            dispatched.push(event);
+            true
+        }).unwrap());
+        assert_eq!(dispatched, vec![moved((MAX_INPUT_EVENTS_PER_BATCH - 1) as u16)]);
+        assert_eq!(queued.len(), 1, "the batch must not drain input without a bound");
+    }
+
+    #[test]
+    fn passive_viewer_motion_does_not_reupload_or_redraw_but_escape_does_close() {
+        let (tx, _rx) = mpsc::channel(8);
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse_artwork.open_file_popup("front.png".into());
+        let generation = app.image_kitty_retransmit_generation;
+        let repaint = app.image_repaint_generation;
+        for n in 0..32 {
+            assert!(!dispatch_terminal_input(&mut app, moved(n), &tx));
+        }
+        assert!(app.browse_artwork.popup_open);
+        assert_eq!(app.image_kitty_retransmit_generation, generation);
+        assert_eq!(app.image_repaint_generation, repaint);
+        assert!(dispatch_terminal_input(&mut app,
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)), &tx));
+        assert!(!app.browse_artwork.popup_open,
+            "Escape must remain effective after a burst of mouse motion");
+    }
+
+    #[test]
+    fn nonviewer_image_repaint_does_not_rebuild_the_kitty_protocol() {
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.image_picker.protocol_type = ratatui_image::picker::ProtocolType::Kitty;
+        let before = app.image_kitty_retransmit_generation;
+        for _ in 0..500 {
+            app.request_image_preview_repaint();
+        }
+        assert_eq!(app.image_kitty_retransmit_generation, before,
+            "a cheap repaint must not rebuild or re-encode native graphics");
     }
 }
 
@@ -226,6 +357,7 @@ pub async fn run_app(
     let mut last_dead_queue_recovery_attempt = Instant::now();
     let mut redraw_requested = true;
     let mut last_draw = Instant::now();
+    let mut has_drawn_frame = false;
 
     loop {
         // Check whether terminal input is already queued before firing any
@@ -233,6 +365,14 @@ pub async fn run_app(
         // an event waiting while the old debounce expires, causing periodic
         // folder classification/probe/stat work in the middle of scrolling.
         let input_waiting_at_frame_start = event::poll(Duration::from_millis(0))?;
+        // Startup Browse work can keep the renderer busy for many frames.
+        // Consume an already-queued input event BEFORE the next draw/reducer
+        // slice, so Esc and image context-menu clicks are not perpetually
+        // placed behind fresh probe completions and graphics retransmissions.
+        // The first frame must still establish the mouse hit map.
+        if input_waiting_at_frame_start && has_drawn_frame {
+            redraw_requested |= drain_ready_terminal_input(app, event::read()?, &tx)?;
+        }
 
         // Queue-scope recovery is not a startup-only event. A dead session's
         // supervisor tree can still be winding down when this process starts,
@@ -350,14 +490,11 @@ pub async fn run_app(
 
         // 2. Advance image-preview protocol state, then render.
         //
-        // The pre-draw prepare is important for Ghostty/Kitty mouse-damage
-        // recovery: mouse events are handled after the previous draw, so the
-        // desired preview geometry from that frame is already known. Rebuilding
-        // the Kitty protocol from cached decoded pixels before the next draw
-        // lets that draw retransmit immediately instead of showing one stale or
-        // missing frame. The post-draw prepare remains for first-time geometry
-        // discovery and resize/layout changes recorded during this draw.
-        let image_changed = app.prepare_image_preview_protocols();
+        // The pre-draw prepare polls asynchronous image discovery/decoding and
+        // prepares protocols after genuine source/geometry changes. Mouse
+        // movement cannot invalidate the cached native graphics protocol.
+        // Post-draw prepare remains necessary for geometry first seen here.
+        let image_changed = timed_prepare_image_preview_protocols(app);
         // `force_redraw` means the terminal diff buffer is suspected to be
         // invalid and a full clear is required before drawing. Ordinary async
         // reducer progress must not set it: the loop below uses a zero-timeout
@@ -378,13 +515,17 @@ pub async fn run_app(
                 terminal.clear()?;
                 app.force_redraw = false;
             }
+            let draw_started = Instant::now();
             terminal.draw(|f| draw_ui(f, app))?;
+            warn_if_slow_ui_stage("terminal.draw", draw_started.elapsed());
+            has_drawn_frame = true;
             last_draw = Instant::now();
             redraw_requested = false;
         }
         // Geometry discovered by this draw may complete a preview protocol.
         // Mark the next iteration dirty without forcing a terminal clear.
-        redraw_requested |= app.prepare_image_preview_protocols();
+        let post_draw_image_changed = timed_prepare_image_preview_protocols(app);
+        redraw_requested |= post_draw_image_changed;
 
         // 3. Check quit
         if app.should_quit {
@@ -442,25 +583,106 @@ pub async fn run_app(
         // to render/drain again promptly, but do not map that to
         // `force_redraw`: a full terminal clear is far more expensive and can
         // visibly flicker while warm-cache backlogs are being reduced.
-        let poll_timeout = if immediate_nonclearing_tick_needed {
-            Duration::from_millis(0)
-        } else {
-            Duration::from_millis(100)
-        };
+        let poll_timeout =
+            input_poll_timeout(post_draw_image_changed, immediate_nonclearing_tick_needed);
         if event::poll(poll_timeout)? {
-            redraw_requested = true;
-            match event::read()? {
-                Event::Key(key) => handle_key(app, key, &tx),
-                Event::Mouse(mouse) => handle_mouse(app, mouse, &tx),
-                Event::Paste(text) => handle_paste(app, &text, &tx),
-                Event::Resize(_, _) => app.refresh_image_picker_after_resize(),
-                _ => {}
-            }
-            reconcile_tags_mb_apply_operation_state(app);
+            redraw_requested |= drain_ready_terminal_input(app, event::read()?, &tx)?;
         }
     }
 
     Ok(())
+}
+
+/// Coalesce only consecutive passive motion events, stopping after the first
+/// non-motion event. That event must have its own rendering opportunity before
+/// another click or key is dispatched: new overlays can need fresh hitboxes.
+/// The last motion preceding a click is dispatched first, preserving hover
+/// order. Drags, scrolls, button transitions, resizes and keys are never lost.
+fn dispatch_input_batch<N, D>(first: Event, mut next: N, mut dispatch: D) -> io::Result<bool>
+where
+    N: FnMut() -> io::Result<Option<Event>>,
+    D: FnMut(Event) -> bool,
+{
+    let mut pending_motion = None;
+    let mut redraw = false;
+    let mut first_event = Some(first);
+    for _ in 0..MAX_INPUT_EVENTS_PER_BATCH {
+        let current = match first_event.take() {
+            Some(input) => input,
+            None => match next()? {
+                Some(input) => input,
+                None => break,
+            },
+        };
+        match current {
+            Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved) => {
+                pending_motion = Some(Event::Mouse(mouse));
+            }
+            other => {
+                if let Some(motion) = pending_motion.take() {
+                    redraw |= dispatch(motion);
+                }
+                redraw |= dispatch(other);
+                return Ok(redraw);
+            }
+        }
+    }
+    if let Some(motion) = pending_motion {
+        redraw |= dispatch(motion);
+    }
+    Ok(redraw)
+}
+
+fn drain_ready_terminal_input(
+    app: &mut AppState, first: Event, tx: &mpsc::Sender<AppMessage>,
+) -> io::Result<bool> {
+    dispatch_input_batch(
+        first,
+        || {
+            if event::poll(Duration::ZERO)? {
+                Ok(Some(event::read()?))
+            } else {
+                Ok(None)
+            }
+        },
+        |input| dispatch_terminal_input(app, input, tx),
+    )
+}
+
+fn timed_prepare_image_preview_protocols(app: &mut AppState) -> bool {
+    let started = Instant::now();
+    let changed = app.prepare_image_preview_protocols();
+    warn_if_slow_ui_stage("image protocol preparation", started.elapsed());
+    changed
+}
+
+fn warn_if_slow_ui_stage(stage: &str, duration: Duration) {
+    if duration >= SLOW_UI_STAGE_WARNING {
+        log::warn!("TUI {stage} blocked the input loop for {} ms", duration.as_millis());
+    }
+}
+
+/// Return false for passive motion over a full-size image, which neither
+/// changes its contents nor affects any hover UI. No redraw or image upload is
+/// necessary. All other input retains its existing behavior and draw request.
+fn dispatch_terminal_input(app: &mut AppState, input: Event, tx: &mpsc::Sender<AppMessage>) -> bool {
+    if matches!(&input,
+        Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved)
+            && app.current_screen == AppScreen::Browse
+            && app.browse_artwork.popup_open
+            && matches!(app.active_overlay, ActiveOverlay::None)
+    ) {
+        return false;
+    }
+    match input {
+        Event::Key(key) => handle_key(app, key, tx),
+        Event::Mouse(mouse) => handle_mouse(app, mouse, tx),
+        Event::Paste(text) => handle_paste(app, &text, tx),
+        Event::Resize(_, _) => app.refresh_image_picker_after_resize(),
+        _ => {}
+    }
+    reconcile_tags_mb_apply_operation_state(app);
+    true
 }
 
 
