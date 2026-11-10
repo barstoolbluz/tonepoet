@@ -3480,6 +3480,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "folder-sort",
     "filter",
     "refresh",
+    "artwork-cache",
     "l",
     "list",
     "messages",
@@ -3758,6 +3759,8 @@ pub enum Command {
     Filter(Option<String>),
     /// Refresh the current browse directory from the filesystem.
     Refresh,
+    /// Clear disposable Info-pane previews, independently of artwork visibility.
+    ArtworkCacheClear,
     /// Force-list the selected archive, bypassing the remote/disabled listing
     /// policy gate. Command-mode is used because plain letters remain reserved
     /// for Browse type-ahead.
@@ -4020,6 +4023,7 @@ impl std::fmt::Debug for Command {
             Command::SortDir => f.write_str("SortDir"),
             Command::Filter(arg) => f.debug_tuple("Filter").field(arg).finish(),
             Command::Refresh => f.write_str("Refresh"),
+            Command::ArtworkCacheClear => f.write_str("ArtworkCacheClear"),
             Command::ArchiveList => f.write_str("ArchiveList"),
             Command::NewFile(arg) => f.debug_tuple("NewFile").field(arg).finish(),
             Command::NewFolder(arg) => f.debug_tuple("NewFolder").field(arg).finish(),
@@ -4309,6 +4313,8 @@ pub fn parse_command(input: &str) -> Command {
             Command::Filter(arg)
         }
         "refresh" => Command::Refresh,
+        "artwork-cache" if args == "clear" => Command::ArtworkCacheClear,
+        "artwork-cache" => Command::Unknown("usage: :artwork-cache clear".into()),
         "l" | "list" => Command::ArchiveList,
         "messages" | "task-messages" => Command::FileTaskMessages,
         "file-notices" => Command::FileTaskNotices(
@@ -5403,6 +5409,15 @@ OSC 52 fallback is capped at 64 KiB; install a native clipboard helper for large
                 }
                 Some(_) => app.set_status("usage: :file-notices [quiet|verbose]"),
             }
+        }
+        Command::ArtworkCacheClear => {
+            let (clear_id, done) = app.browse_artwork.clear_cache();
+            let tx = tx.clone();
+            tokio::task::spawn_blocking(move || {
+                let result = done.recv().unwrap_or_else(|_| Err("Artwork cache worker stopped".into()));
+                let _ = tx.blocking_send(AppMessage::ArtworkCacheClearComplete { clear_id, result });
+            });
+            app.set_status("Clearing Info artwork cache…");
         }
         Command::Refresh => {
             if app.current_screen == AppScreen::Browse {
@@ -24837,4 +24852,17 @@ mod round6_application_quit_lifecycle_tests {
         );
     }
 
+}
+
+#[cfg(test)]
+mod info_artwork_cache_command_tests {
+    use super::*;
+
+    #[test]
+    fn clear_command_has_an_exact_usage_and_completion_token() {
+        assert!(matches!(parse_command("artwork-cache clear"), Command::ArtworkCacheClear));
+        assert!(matches!(parse_command("artwork-cache"), Command::Unknown(_)));
+        assert!(matches!(parse_command("artwork-cache remove"), Command::Unknown(_)));
+        assert!(COMMAND_NAMES.contains(&"artwork-cache"));
+    }
 }

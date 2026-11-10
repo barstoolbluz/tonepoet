@@ -203,6 +203,8 @@ pub enum HostClipboardPasteTarget {
 /// Messages sent to the TUI event loop via mpsc channel
 #[derive(Debug)]
 pub enum AppMessage {
+    /// Completion of explicit disposable Info-pane preview cache clearing.
+    ArtworkCacheClearComplete { clear_id: u64, result: Result<(), String> },
     /// Dedicated nonblocking directory accounting worker update.
     DirectoryAccounting(crate::directory_accounting::AccountingEvent),
     /// Completion of an explicit terminal-clipboard read.

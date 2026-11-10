@@ -21,6 +21,7 @@ use ratatui_image::{picker::Picker, protocol::StatefulProtocol};
 
 use crate::config::BrowseArtworkConfig;
 use super::browse::{BrowseState, EntryKind, FolderClassificationKind};
+use super::info_artwork_cache::{InfoPreviewCache, Preview, SourceStamp, PREVIEW_EDGE, stamps_for_decoded};
 
 const SELECTION_SETTLE: Duration = Duration::from_millis(130);
 const MAX_DIRECTORY_ENTRIES: usize = 32_768;
@@ -97,14 +98,18 @@ struct ScanResult {
 }
 
 struct DecodedArtwork {
-    image: DynamicImage,
+    image: Arc<DynamicImage>,
     embedded_path: Option<PathBuf>,
+    // Set only for Info-pane requests. Never populated by the full-size viewer.
+    preview_stamps: Option<Vec<SourceStamp>>,
+    preview_cache_hit: bool,
 }
 
 struct DecodeResult {
     generation: u64,
     source: ArtworkSource,
     image: Result<DecodedArtwork, String>,
+    cache_epoch: Option<u64>,
 }
 
 /// Non-clonable, session-only graphics state. This cache is deliberately not
@@ -126,7 +131,9 @@ pub struct BrowseArtworkState {
     decode_rx: Option<Receiver<DecodeResult>>,
     decoded_source: Option<ArtworkSource>,
     decoded_embedded_path: Option<PathBuf>,
-    decoded: Option<DynamicImage>,
+    decoded: Option<Arc<DynamicImage>>,
+    // Created on first Info request, not when disabled or in direct viewer use.
+    preview_cache: Option<Arc<InfoPreviewCache>>,
     protocol: Option<Box<dyn StatefulProtocol>>,
     desired_area: Rect,
     vertical_placement: ImageVerticalPlacement,
@@ -169,6 +176,7 @@ impl Default for BrowseArtworkState {
             scan_rx: None, sources: Vec::new(), cursor: 0,
             queued_gallery_offset: 0, failed: HashSet::new(),
             decode_rx: None, decoded_source: None, decoded_embedded_path: None, decoded: None,
+            preview_cache: None,
             protocol: None, desired_area: Rect::default(),
             vertical_placement: ImageVerticalPlacement::Center, protocol_area: Rect::default(),
             protocol_generation: 0, retransmit_generation: 0, font_size: (8, 12),
@@ -226,11 +234,25 @@ impl BrowseArtworkState {
         self.warning = None;
     }
 
+    pub fn clear_cache(&mut self) -> (u64, mpsc::Receiver<Result<(), String>>) {
+        self.preview_cache.get_or_insert_with(|| Arc::new(InfoPreviewCache::new())).clear()
+    }
+
+    pub fn latest_clear_id(&self) -> Option<u64> {
+        self.preview_cache.as_ref().map(|cache| cache.latest_clear_id())
+    }
+
+    pub fn invalidate_cache_paths(&mut self, paths: &[PathBuf]) {
+        if let Some(cache) = &self.preview_cache { cache.invalidate_paths(paths); }
+        self.invalidate();
+    }
+
     pub fn suspend(&mut self) {
         self.popup_open = false;
         self.desired_area = Rect::default();
         self.vertical_placement = ImageVerticalPlacement::Center;
         if self.context.is_some() {
+            if let Some(cache) = &self.preview_cache { cache.cancel_pending(); }
             self.observe(None);
         }
     }
@@ -304,9 +326,22 @@ impl BrowseArtworkState {
             }
         }
         if !self.has_candidate() { return false; }
-        self.popup_open = true;
-        self.invalidate_protocol();
+        self.open_info_popup();
         true
+    }
+
+    /// Switching from an Info preview to View discards its pixels and returns
+    /// to the original, uncached decoding path. An outstanding Info result is
+    /// generation-obsolete; it may finish, but cannot populate the viewer.
+    pub fn open_info_popup(&mut self) {
+        self.popup_open = true;
+        if matches!(self.context, Some(ArtworkContext::Album { .. })) {
+            self.generation = self.generation.wrapping_add(1);
+            self.decoded = None;
+            self.decoded_source = None;
+            self.decoded_embedded_path = None;
+        }
+        self.invalidate_protocol();
     }
 
     /// A direct image popup is independent of Info's album selection, which
@@ -411,6 +446,14 @@ impl BrowseArtworkState {
         self.post_native_repaint_redraw = false;
         self.protocol = None; // rebuild for the pane on the next prepare pass
         self.protocol_area = Rect::default();
+        if !was_file_view && matches!(self.context, Some(ArtworkContext::Album { .. })) {
+            // The just-closed viewer used the original decode, not an Info
+            // derivative. Resume the pane from its own cache on the next pass.
+            self.generation = self.generation.wrapping_add(1);
+            self.decoded_source = None;
+            self.decoded_embedded_path = None;
+            self.decoded = None;
+        }
         if was_file_view {
             // Restore Info's ordinary selection on the next draw. Reject any
             // file-view worker result that arrives after the popup closes.
@@ -460,9 +503,34 @@ impl BrowseArtworkState {
                 self.decode_rx = Some(rx);
                 let generation = self.generation;
                 self.decode_generation = generation;
+                // Eligibility is decided by the Info consumer, not by the
+                // source's File/Embedded variant. View never receives a cache.
+                let info_request = !self.popup_open
+                    && matches!(self.context, Some(ArtworkContext::Album { .. }));
+                let cache = info_request.then(|| Arc::clone(self.preview_cache
+                    .get_or_insert_with(|| Arc::new(InfoPreviewCache::new()))));
+                let cache_epoch = cache.as_ref().map(|cache| cache.epoch());
                 thread::spawn(move || {
-                    let image = decode_source(&source);
-                    let _ = tx.send(DecodeResult { generation, source, image });
+                    let image = match (&cache, cache_epoch) {
+                        (Some(cache), Some(epoch)) => {
+                            if let Some((preview, hit)) = cache.lookup(&source, epoch) {
+                                Ok(DecodedArtwork {
+                                    image: preview.pixels,
+                                    embedded_path: preview.embedded_path,
+                                    preview_stamps: Some(preview.stamps),
+                                    preview_cache_hit: hit,
+                                })
+                            } else {
+                                decode_source_with_edge(&source, PREVIEW_EDGE).map(|mut decoded| {
+                                    decoded.preview_stamps = stamps_for_decoded(
+                                        &source, decoded.embedded_path.as_deref());
+                                    decoded
+                                })
+                            }
+                        }
+                        _ => decode_source(&source), // full-size viewer: original path
+                    };
+                    let _ = tx.send(DecodeResult { generation, source, image, cache_epoch });
                 });
                 changed = true;
             }
@@ -492,7 +560,7 @@ impl BrowseArtworkState {
             && (self.protocol.is_none() || self.protocol_area != desired
                 || self.protocol_generation != picker_generation || self.retransmit_generation != kitty)
         {
-            self.protocol = self.decoded.as_ref().map(|image| picker.new_resize_protocol(image.clone()));
+            self.protocol = self.decoded.as_ref().map(|image| picker.new_resize_protocol(image.as_ref().clone()));
             self.native_placement_awaiting_render =
                 picker.protocol_type != ratatui_image::picker::ProtocolType::Halfblocks;
             if self.native_placement_awaiting_render {
@@ -571,6 +639,16 @@ impl BrowseArtworkState {
                     if result.generation == self.generation && self.sources.get(self.cursor) == Some(&result.source) {
                         match result.image {
                             Ok(decoded) => {
+                                if let (Some(epoch), Some(stamps), Some(cache)) = (
+                                    result.cache_epoch, decoded.preview_stamps,
+                                    self.preview_cache.as_ref(),
+                                ) {
+                                    cache.admit(&result.source, epoch, Preview {
+                                        pixels: Arc::clone(&decoded.image),
+                                        embedded_path: decoded.embedded_path.clone(),
+                                        stamps,
+                                    }, decoded.preview_cache_hit);
+                                }
                                 self.decoded_source = Some(result.source);
                                 self.decoded_embedded_path = decoded.embedded_path;
                                 self.decoded = Some(decoded.image);
@@ -883,6 +961,10 @@ fn scan_image_siblings(context: ArtworkContext, selected: &Path) -> ScanResult {
 }
 
 fn decode_source(source: &ArtworkSource) -> Result<DecodedArtwork, String> {
+    decode_source_with_edge(source, MAX_PREVIEW_EDGE)
+}
+
+fn decode_source_with_edge(source: &ArtworkSource, edge: u32) -> Result<DecodedArtwork, String> {
     match source {
         ArtworkSource::File(path) => {
             // Only direct image-name links are eligible. A link replaced with
@@ -904,7 +986,8 @@ fn decode_source(source: &ArtworkSource) -> Result<DecodedArtwork, String> {
             let mut bytes = Vec::new();
             file.take(MAX_ENCODED_IMAGE_BYTES + 1).read_to_end(&mut bytes)
                 .map_err(|e| e.to_string())?;
-            Ok(DecodedArtwork { image: decode_image_bytes(bytes)?, embedded_path: None })
+            Ok(DecodedArtwork { image: Arc::new(decode_image_bytes_with_edge(bytes, edge)?),
+                embedded_path: None, preview_stamps: None, preview_cache_hit: false })
         }
         ArtworkSource::Embedded(paths) => {
             // The worker tries candidates in order and stops on the first
@@ -917,9 +1000,10 @@ fn decode_source(source: &ArtworkSource) -> Result<DecodedArtwork, String> {
                 if !fs::symlink_metadata(path).is_ok_and(|md| md.is_file()) { continue; }
                 let bytes = super::probe::read_embedded_picture_bytes(path, PictureType::CoverFront)
                     .or_else(|_| super::probe::read_embedded_picture_bytes(path, PictureType::Other));
-                match bytes.and_then(decode_image_bytes) {
+                match bytes.and_then(|data| decode_image_bytes_with_edge(data, edge)) {
                     Ok(image) => return Ok(DecodedArtwork {
-                        image, embedded_path: Some(path.clone()),
+                        image: Arc::new(image), embedded_path: Some(path.clone()),
+                        preview_stamps: None, preview_cache_hit: false,
                     }),
                     Err(error) => last_error = Some(error),
                 }
@@ -929,7 +1013,7 @@ fn decode_source(source: &ArtworkSource) -> Result<DecodedArtwork, String> {
     }
 }
 
-fn decode_image_bytes(bytes: Vec<u8>) -> Result<DynamicImage, String> {
+fn decode_image_bytes_with_edge(bytes: Vec<u8>, edge: u32) -> Result<DynamicImage, String> {
     if bytes.len() as u64 > MAX_ENCODED_IMAGE_BYTES { return Err("Artwork exceeds 24 MiB limit".into()); }
     let mut reader = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format().map_err(|e| e.to_string())?;
@@ -939,8 +1023,11 @@ fn decode_image_bytes(bytes: Vec<u8>) -> Result<DynamicImage, String> {
     limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
     reader.limits(limits);
     let image = reader.decode().map_err(|e| e.to_string())?;
-    if image.width() > MAX_PREVIEW_EDGE || image.height() > MAX_PREVIEW_EDGE {
-        Ok(image.resize(MAX_PREVIEW_EDGE, MAX_PREVIEW_EDGE, image::imageops::FilterType::Triangle))
+    if image.width() > edge || image.height() > edge {
+        Ok(image.resize(edge, edge, if edge == MAX_PREVIEW_EDGE {
+            // Preserve the pre-cache viewer's exact resizing policy.
+            image::imageops::FilterType::Triangle
+        } else { image::imageops::FilterType::Lanczos3 }))
     } else { Ok(image) }
 }
 
@@ -1025,7 +1112,9 @@ mod tests {
         tx.send(DecodeResult {
             generation: old_generation,
             source: ArtworkSource::File(tmp.path().join("first.png")),
-            image: Ok(DecodedArtwork { image: DynamicImage::new_rgba8(10, 10), embedded_path: None }),
+            image: Ok(DecodedArtwork { image: Arc::new(DynamicImage::new_rgba8(10, 10)),
+                embedded_path: None, preview_stamps: None, preview_cache_hit: false }),
+            cache_epoch: None,
         }).unwrap();
         state.decode_rx = Some(rx);
         assert!(!state.poll_workers());
@@ -1130,7 +1219,7 @@ mod tests {
         use ratatui_image::picker::ProtocolType;
 
         let mut artwork = BrowseArtworkState::default();
-        artwork.decoded = Some(DynamicImage::new_rgb8(80, 60));
+        artwork.decoded = Some(Arc::new(DynamicImage::new_rgb8(80, 60)));
         artwork.set_desired_area(Rect::new(0, 0, 30, 15), ImageVerticalPlacement::Center);
         let mut picker = Picker::new((8, 12));
         picker.protocol_type = ProtocolType::Kitty;
@@ -1182,7 +1271,7 @@ mod tests {
             (ProtocolType::Iterm2, true),
         ] {
             let mut state = BrowseArtworkState::default();
-            state.decoded = Some(DynamicImage::new_rgb8(40, 30));
+            state.decoded = Some(Arc::new(DynamicImage::new_rgb8(40, 30)));
             state.popup_open = popup;
             let placement = if popup {
                 ImageVerticalPlacement::Center
@@ -1303,7 +1392,7 @@ mod tests {
         let mut state = BrowseArtworkState::default();
         state.open_file_popup(PathBuf::from("/pictures/cover.png"));
         state.scanned = state.context.clone(); // No filesystem worker in this state test.
-        state.decoded = Some(DynamicImage::new_rgb8(24, 24));
+        state.decoded = Some(Arc::new(DynamicImage::new_rgb8(24, 24)));
         state.set_desired_area(Rect::new(2, 2, 20, 15), ImageVerticalPlacement::Center);
         let mut picker = Picker::new((8, 12));
         picker.protocol_type = ProtocolType::Sixel;
@@ -1336,7 +1425,7 @@ mod tests {
             directory: PathBuf::from("/albums/old"), selected_audio: None,
         }));
         state.scanned = state.context.clone(); // Suppress filesystem workers.
-        state.decoded = Some(DynamicImage::new_rgb8(32, 24));
+        state.decoded = Some(Arc::new(DynamicImage::new_rgb8(32, 24)));
         let area = Rect::new(3, 2, 24, 16);
         state.set_desired_area(area, ImageVerticalPlacement::Bottom);
         let mut picker = Picker::new((8, 12));
@@ -1377,7 +1466,7 @@ mod tests {
             directory: PathBuf::from("/albums/one"), selected_audio: None,
         }));
         state.scanned = state.context.clone(); // Suppress filesystem workers.
-        state.decoded = Some(DynamicImage::new_rgb8(32, 24));
+        state.decoded = Some(Arc::new(DynamicImage::new_rgb8(32, 24)));
         state.set_desired_area(area, ImageVerticalPlacement::Bottom);
         assert!(state.prepare(&mut picker, 0, 0, &config));
         let mut terminal = Terminal::new(TestBackend::new(40, 25)).unwrap();
@@ -1396,7 +1485,7 @@ mod tests {
         state.scanned = state.context.clone();
         assert!(!state.post_native_repaint_redraw);
         assert!(state.needs_background_restore);
-        state.decoded = Some(DynamicImage::new_rgb8(40, 30));
+        state.decoded = Some(Arc::new(DynamicImage::new_rgb8(40, 30)));
         state.set_desired_area(area, ImageVerticalPlacement::Bottom);
         assert!(state.prepare(&mut picker, 0, 0, &config));
         terminal.draw(|frame| {
@@ -1417,7 +1506,7 @@ mod tests {
         use ratatui_image::picker::ProtocolType;
 
         let mut state = BrowseArtworkState::default();
-        state.decoded = Some(DynamicImage::new_rgb8(24, 24));
+        state.decoded = Some(Arc::new(DynamicImage::new_rgb8(24, 24)));
         let area = Rect::new(2, 2, 20, 15);
         state.set_desired_area(area, ImageVerticalPlacement::Center);
         let mut picker = Picker::new((8, 12));
@@ -1442,7 +1531,7 @@ mod tests {
         use ratatui_image::picker::ProtocolType;
 
         let mut state = BrowseArtworkState::default();
-        state.decoded = Some(DynamicImage::new_rgb8(24, 24));
+        state.decoded = Some(Arc::new(DynamicImage::new_rgb8(24, 24)));
         state.popup_open = true;
         let viewport = Rect::new(3, 2, 45, 24);
         let background = Color::Rgb(26, 27, 38);
@@ -1571,7 +1660,7 @@ mod tests {
         assert!(state.protocol.is_none());
 
         // Model the asynchronous decode completing before the menu closes.
-        state.decoded = Some(DynamicImage::new_rgb8(160, 96));
+        state.decoded = Some(Arc::new(DynamicImage::new_rgb8(160, 96)));
         let viewport = Rect::new(3, 2, 45, 24);
         let background = Color::Rgb(26, 27, 38);
         let mut picker = Picker::new((8, 12));
@@ -1621,7 +1710,7 @@ mod tests {
     fn closing_artwork_view_never_retransmits_its_hidden_image() {
         let mut state = BrowseArtworkState::default();
         state.open_file_popup(PathBuf::from("/pictures/cover.png"));
-        state.decoded = Some(DynamicImage::new_rgb8(12, 12));
+        state.decoded = Some(Arc::new(DynamicImage::new_rgb8(12, 12)));
         state.artwork_menu_opened();
         state.close_popup();
         state.artwork_menu_finished(true);
@@ -1646,7 +1735,7 @@ mod tests {
         let mut app = super::super::app::AppState::new_for_test(
             crate::config::TonepoetConfig::default());
         app.browse_artwork.popup_open = true;
-        app.browse_artwork.decoded = Some(DynamicImage::new_rgb8(160, 96));
+        app.browse_artwork.decoded = Some(Arc::new(DynamicImage::new_rgb8(160, 96)));
         app.browse_artwork.font_size = (8, 12);
         app.browse_artwork.sources = vec![ArtworkSource::File(PathBuf::from("cover.png"))];
         let theme = app.theme;
@@ -1828,7 +1917,7 @@ mod tests {
         tx.send(DecodeResult {
             generation: stale,
             source: ArtworkSource::File(PathBuf::from("/pictures/front.png")),
-            image: Err("stale decode error".to_string()),
+            image: Err("stale decode error".to_string()), cache_epoch: None,
         }).unwrap();
         state.close_popup();
         state.poll_workers();
@@ -1846,6 +1935,105 @@ mod tests {
         state.scanned = state.context.clone();
         state.warning = Some("No embedded Other artwork found in '/music/album/track.flac'".into());
         assert_eq!(state.message(), "", "absence is not an Info-pane error");
+    }
+
+    #[test]
+    fn info_preview_uses_cache_but_inline_view_reloads_full_size_original() {
+        let temp = tempfile::tempdir().unwrap();
+        let picture = temp.path().join("cover.png");
+        DynamicImage::new_rgba8(1300, 900).save(&picture).unwrap();
+        let context = ArtworkContext::Album { directory: temp.path().to_path_buf(), selected_audio: None };
+        let mut state = BrowseArtworkState::default();
+        state.preview_cache = Some(Arc::new(InfoPreviewCache::at_path(temp.path().join("cache.sqlite3"))));
+        state.observe(Some(context.clone()));
+        state.scanned = Some(context);
+        state.sources = vec![ArtworkSource::File(picture.clone())];
+        let mut picker = Picker::new((8, 12));
+        let mut load = |state: &mut BrowseArtworkState| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !state.has_image() && Instant::now() < deadline {
+                state.prepare(&mut picker, 0, 0, &BrowseArtworkConfig::default());
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(state.has_image(), "decode worker did not complete");
+        };
+        load(&mut state);
+        assert_eq!(state.decoded.as_ref().map(|image| image.width()), Some(PREVIEW_EDGE));
+        assert!(state.preview_cache.is_some());
+        state.open_info_popup();
+        assert!(state.decoded.is_none(), "viewer must not reuse a cached preview");
+        load(&mut state);
+        assert_eq!(state.decoded.as_ref().map(|image| image.width()), Some(1300));
+        state.close_popup();
+        load(&mut state);
+        assert_eq!(state.decoded.as_ref().map(|image| image.width()), Some(PREVIEW_EDGE));
+        assert!(picture.exists(), "original must remain untouched");
+    }
+
+    #[test]
+    fn disabled_info_artwork_does_not_start_discovery_or_a_cache() {
+        let mut app = crate::tui::app::AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.current_screen = crate::tui::app::AppScreen::Browse;
+        app.browse.artwork_config.enabled = false;
+        app.browse_artwork.observe(Some(ArtworkContext::Album {
+            directory: PathBuf::from("/unvisited/album"), selected_audio: None,
+        }));
+        app.prepare_image_preview_protocols();
+        assert!(app.browse_artwork.context.is_none());
+        assert!(app.browse_artwork.preview_cache.is_none());
+        assert!(app.browse_artwork.scan_rx.is_none());
+        assert!(app.browse_artwork.decode_rx.is_none());
+        let root = tempfile::tempdir().unwrap();
+        app.browse_artwork.preview_cache = Some(Arc::new(InfoPreviewCache::at_path(root.path().join("cache.sqlite3"))));
+        let (_generation, done) = app.browse_artwork.clear_cache();
+        assert!(done.recv_timeout(Duration::from_secs(5)).unwrap().is_ok());
+    }
+
+    #[test]
+    fn clear_completion_identity_survives_browse_suspension() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = BrowseArtworkState::default();
+        state.preview_cache = Some(Arc::new(InfoPreviewCache::at_path(
+            root.path().join("previews.sqlite3"))));
+        state.observe(Some(ArtworkContext::Album {
+            directory: root.path().to_path_buf(), selected_audio: None,
+        }));
+        let (first_id, done) = state.clear_cache();
+        assert!(done.recv_timeout(Duration::from_secs(5)).unwrap().is_ok());
+        state.suspend(); // Increments the preview epoch after the clear succeeds.
+        assert_eq!(state.latest_clear_id(), Some(first_id));
+
+        // A later clear is a new user command, not an ordinary invalidation.
+        let (second_id, done) = state.clear_cache();
+        assert!(second_id > first_id);
+        assert!(done.recv_timeout(Duration::from_secs(5)).unwrap().is_ok());
+        assert_eq!(state.latest_clear_id(), Some(second_id));
+    }
+
+    #[test]
+    fn stale_preview_worker_after_clear_may_display_but_cannot_repopulate() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("cover.png");
+        fs::write(&image_path, b"unchanged original").unwrap();
+        let source = ArtworkSource::File(image_path);
+        let mut state = BrowseArtworkState::default();
+        state.sources = vec![source.clone()];
+        let cache = Arc::new(InfoPreviewCache::at_path(temp.path().join("previews.sqlite3")));
+        let old = cache.epoch();
+        state.preview_cache = Some(Arc::clone(&cache));
+        let (sender, receiver) = mpsc::channel();
+        sender.send(DecodeResult { generation: state.generation, source: source.clone(),
+            cache_epoch: Some(old), image: Ok(DecodedArtwork {
+                image: Arc::new(DynamicImage::new_rgb8(32, 32)),
+                embedded_path: None, preview_stamps: stamps_for_decoded(&source, None),
+                preview_cache_hit: false,
+            }) }).unwrap();
+        state.decode_rx = Some(receiver);
+        let (_new, clear_done) = state.clear_cache();
+        assert!(state.poll_workers());
+        assert!(state.decoded.is_some(), "clearing must not interfere with display");
+        assert!(clear_done.recv_timeout(Duration::from_secs(5)).unwrap().is_ok());
+        assert!(cache.lookup(&source, cache.epoch()).is_none());
     }
 
     #[test]

@@ -3227,8 +3227,7 @@ pub fn execute_context_action(
         }
         ContextAction::BrowseArtworkView => {
             if app.current_screen == AppScreen::Browse && app.browse_artwork.has_candidate() {
-                app.browse_artwork.popup_open = true;
-                app.browse_artwork.invalidate_protocol();
+                app.browse_artwork.open_info_popup();
             }
         }
         ContextAction::BrowseImageFileView(path) => {

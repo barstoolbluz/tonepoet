@@ -7395,8 +7395,49 @@ mod analysis_batch_status_tests {
     }
 }
 
+fn artwork_cache_clear_completion_status(
+    latest_clear_id: Option<u64>, clear_id: u64, result: Result<(), String>,
+) -> Option<String> {
+    if latest_clear_id != Some(clear_id) { return None; }
+    Some(match result {
+        Ok(()) => "Info artwork cache cleared (memory and disk reclaimed)".to_owned(),
+        Err(error) => format!("Info artwork cache clear failed: {error}"),
+    })
+}
+
+#[cfg(test)]
+mod artwork_cache_clear_completion_tests {
+    use super::artwork_cache_clear_completion_status;
+
+    #[test]
+    fn navigation_does_not_hide_success_or_failure_of_latest_clear() {
+        // Browse suspension changes the preview epoch, never the clear id.
+        let clear_id = 7;
+        assert!(artwork_cache_clear_completion_status(Some(clear_id), clear_id, Ok(()))
+            .unwrap().contains("cleared"));
+        let error = artwork_cache_clear_completion_status(
+            Some(clear_id), clear_id, Err("disk is read-only".into())).unwrap();
+        assert!(error.contains("failed: disk is read-only"));
+    }
+
+    #[test]
+    fn successive_clears_only_report_the_latest_completion() {
+        assert!(artwork_cache_clear_completion_status(Some(9), 8, Ok(())).is_none());
+        assert!(artwork_cache_clear_completion_status(Some(9), 8,
+            Err("superseded".into())).is_none());
+        assert!(artwork_cache_clear_completion_status(Some(9), 9, Ok(())).is_some());
+    }
+}
+
 pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMessage>) {
     match msg {
+        AppMessage::ArtworkCacheClearComplete { clear_id, result } => {
+            if let Some(status) = artwork_cache_clear_completion_status(
+                app.browse_artwork.latest_clear_id(), clear_id, result,
+            ) {
+                app.set_status(status);
+            }
+        }
         AppMessage::DirectoryAccounting(event) => {
             // The service validates request identity before any sorting state
             // observes a completed/cached total.
@@ -10160,6 +10201,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 } else {
                     match result {
                         Ok(batch_result) => {
+                            app.browse_artwork.invalidate_cache_paths(&paths);
                             let durability_warning_count = batch_result.durability_warnings.len();
                             let first_durability_warning =
                                 batch_result.durability_warnings.first().cloned();
