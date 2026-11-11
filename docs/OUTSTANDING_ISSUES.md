@@ -5591,3 +5591,50 @@ I have not checked how much of that exists only to serve these two commands.
 
 **What we want.** No legacy-journal subcommands in the CLI, and no
 legacy-journal code that only they use.
+
+---
+
+## 81. The recovery screen offers nothing to do with a copy or move that is still running
+
+Filed 2026-11-11.
+
+A move of `~/temp/external/archive/audio-isos/blu-ray` to
+`~/temp/other/archive` was started from Browse and interrupted, and the TUI
+that started it exited. When the TUI was started again, "recovery · copy and
+move" listed the move with "1 interrupted". The footer said "1 needs attention"
+and "1 unresolved · some paths remain blocked and undo remains unavailable".
+The detail pane said "still running · 39m ago". Its only control was "Show
+these files and paths", which opens a details window whose only button is
+Close. Nothing on either screen tells the user what to do.
+
+The move had not stopped. Its `__file-task-worker` process had outlived the
+TUI, been reparented to init, and still held the job's lease. It was writing
+into the staging tree, about 230 GB in by then and partway through `Doors.iso`.
+`classify_recovery_surface` reports a record whose lease is held as `Live`, and
+`window_actions` offers only Details for a live entry. Resume and Discard are
+absent because the job is running, which is consistent. What the screen tells
+the user is not:
+
+- It counts the move as interrupted and needing attention while also saying
+  it is still running.
+- "Still running: process 379847" names the TUI that started the move, the
+  journal's origin owner, which no longer existed. The worker doing the copy
+  is not named.
+- "last progress 2m ago" appeared while the worker was writing. As far as I
+  can tell progress advances per file, so a single large file reads as a
+  stall.
+- "On disk: 0 incomplete destination files" appeared while the destination
+  held the hidden staging tree `.blu-ray.tonepoet-tree-….tmp` and a
+  `Doors.iso.tonepoet-part-….tmp` inside it.
+- There is no way to stop, wait for, or follow the running operation from
+  this screen.
+
+**What we want.** A copy or move that is still running is shown as running,
+with its real progress, and with something the user can do about it, at least
+stop it. It is not presented as interrupted or as needing attention. Whether
+the worker should outlive the TUI that started it is a separate question I
+have not looked into.
+
+My reading covers `window_actions` and `classify_recovery_surface`. The
+accounts of the stale process ID, the stale progress time and the zero count
+are inference from what the screen showed and what was on disk.
