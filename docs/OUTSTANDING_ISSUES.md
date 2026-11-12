@@ -5741,3 +5741,29 @@ sent to the terminal costs no more than it needs to.
 
 The account of the limits and the failure path is from source and fits what
 was seen. I have not stepped through it in a debugger.
+
+---
+
+## 85. The recovery window's frame has a gap on each side at the footer rule
+
+Filed 2026-11-12. Seen in `Screenshot from 2026-11-11 21-06-09.png`.
+
+The "recovery · copy and move" window is framed in cyan. One row above its
+footer ("0 needs attention", "1 saved operations…"), the left and right sides
+of the frame are missing: each side shows a dark cell where `│` should be.
+
+That row is the dim horizontal rule separating the job panes from the footer.
+As far as I can tell, `draw_window` in `recovery_ui.rs` draws the rule across
+the window's full width, in the dim separator colour, with `├` and `┤` at its
+ends, over the frame's own side cells. The screenshot fits that. The frame
+is cyan, `(115,218,202)`, everywhere except those two cells. Each holds a
+full-height vertical stroke joined at mid-height by the rule, in
+`(42,46,67)`. The background is `(40,44,52)`, so the junctions are close to
+invisible and read as gaps. The rule itself and the divider between the job
+list and the details pane are the same dim colour.
+
+**What we want.** The frame is unbroken on every side, and the footer rule
+meets it without changing the frame's appearance. The same holds for any
+other rule or divider that reaches a window's edge.
+
+The account of the cause is from source and fits the screenshot.
