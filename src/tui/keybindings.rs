@@ -21924,13 +21924,59 @@ fn handle_conversion_actions_wizard_mouse(app: &mut AppState, mouse: MouseEvent)
     }
 }
 
-fn handle_file_task_user_action(
+pub(super) fn handle_file_task_user_action(
     app: &mut AppState,
     session: &mut super::app::FileTaskProgressSession,
     action: tui_file_picker::FileTaskUserAction,
     tx: &mpsc::Sender<AppMessage>,
 ) -> bool {
     use super::app::FileTaskControl;
+    if session.is_recovery_monitor() {
+        let Some(remote) = session.remote_worker.as_ref() else {
+            app.set_status("Recovery monitor lost its worker identity");
+            return true;
+        };
+        let control = match action {
+            tui_file_picker::FileTaskUserAction::None => return true,
+            tui_file_picker::FileTaskUserAction::Minimize
+            | tui_file_picker::FileTaskUserAction::Acknowledge => {
+                super::recovery_ui::return_from_progress_watch(app);
+                return false;
+            }
+            tui_file_picker::FileTaskUserAction::Pause => Some(FileTaskControl::Pause),
+            tui_file_picker::FileTaskUserAction::Resume => Some(FileTaskControl::Resume),
+            tui_file_picker::FileTaskUserAction::SkipCurrent => Some(FileTaskControl::SkipCurrent),
+            tui_file_picker::FileTaskUserAction::ChooseConflictResolution(
+                tui_file_picker::ConflictResolution::Abort,
+            ) => {
+                // A recovered worker may already have published files. Conflict
+                // Abort is a stop request, not an ordinary conflict decision.
+                super::recovery_ui::open_stop_confirm_from_progress_watch(app, remote);
+                return false;
+            }
+            tui_file_picker::FileTaskUserAction::ChooseConflictResolution(resolution) =>
+                session.progress.conflict.as_ref().map(|conflict| {
+                    FileTaskControl::ConflictResolution {
+                        request_id: conflict.request_id, resolution,
+                    }
+                }),
+            tui_file_picker::FileTaskUserAction::Abort => {
+                super::recovery_ui::open_stop_confirm_from_progress_watch(app, remote);
+                return false;
+            }
+            _ => {
+                app.set_status("This progress window does not own the transfer; choose an action in Recovery");
+                return true;
+            }
+        };
+        if let Some(control) = control {
+            match super::file_task_live::request_control(remote, control) {
+                Ok(()) => app.set_status("Request sent to the running transfer; awaiting acknowledgment"),
+                Err(error) => app.set_status(format!("Could not contact the running transfer: {error}")),
+            }
+        }
+        return true;
+    }
     if session.is_retained_viewer()
         && !matches!(
             action,
@@ -56534,7 +56580,10 @@ enum FileTaskApplyAllPolicy {
 enum FileTaskEventSink {
     #[allow(dead_code)] // in-process sink retained alongside the Wire variant
     App(mpsc::Sender<AppMessage>),
-    Wire(std::sync::Arc<std::sync::Mutex<std::io::BufWriter<std::io::Stdout>>>),
+    Wire {
+        writer: std::sync::Arc<std::sync::Mutex<std::io::BufWriter<std::io::Stdout>>>,
+        detached: Option<super::file_task_live::LiveProgressSender>,
+    },
 }
 
 impl FileTaskEventSink {
@@ -56543,14 +56592,16 @@ impl FileTaskEventSink {
             Self::App(tx) => {
                 let _ = tx.try_send(AppMessage::FileTaskProgress { session_id, update });
             }
-            Self::Wire(writer) => {
-                let Ok(mut writer) = writer.lock() else {
-                    return;
-                };
-                let _ = super::file_task_runtime::write_wire_event(
-                    &mut *writer,
-                    &super::file_task_runtime::FileTaskWireEvent::Progress { update },
-                );
+            Self::Wire { writer, detached } => {
+                if let Some(detached) = detached { detached.publish(&update); }
+                // The launching TUI can exit while the helper is still running.
+                // A closed stdout pipe must not stop detached observation.
+                if let Ok(mut writer) = writer.lock() {
+                    let _ = super::file_task_runtime::write_wire_event(
+                        &mut *writer,
+                        &super::file_task_runtime::FileTaskWireEvent::Progress { update },
+                    );
+                }
             }
         }
     }
@@ -56573,7 +56624,7 @@ impl FileTaskEventSink {
                     },
                 );
             }
-            Self::Wire(writer) => {
+            Self::Wire { writer, .. } => {
                 let Ok(mut writer) = writer.lock() else {
                     return;
                 };
@@ -62526,6 +62577,20 @@ pub fn run_internal_file_task_worker(journal_path: &std::path::Path, lease_fd: i
         .ok_or_else(|| anyhow::anyhow!("file-task journal has no durable admitted destination root"))?;
 
     let (control_tx, control_rx) = std::sync::mpsc::channel();
+    let stdin_controls = control_tx.clone();
+    let detached_identity = super::file_task_live::LiveWorkerRef::new(
+        journal_path.to_path_buf(), job.job_id.clone(), job.generation,
+    ).map_err(anyhow::Error::msg)?;
+    let detached_service = super::file_task_live::start_worker(
+        detached_identity, control_tx,
+    );
+    if let Err(error) = &detached_service {
+        log::warn!("detached file-task observation unavailable: {error}");
+    }
+    let (detached_progress, _detached_guard) = match detached_service {
+        Ok((progress, guard)) => (Some(progress), Some(guard)),
+        Err(_) => (None, None),
+    };
     let _ = std::thread::Builder::new()
         .name(format!("file-task-helper-controls-{}", job.session_id))
         .spawn(move || {
@@ -62536,7 +62601,7 @@ pub fn run_internal_file_task_worker(journal_path: &std::path::Path, lease_fd: i
                 };
                 match serde_json::from_str::<super::app::FileTaskControl>(&line) {
                     Ok(control) => {
-                        if control_tx.send(control).is_err() {
+                        if stdin_controls.send(control).is_err() {
                             break;
                         }
                     }
@@ -62548,7 +62613,7 @@ pub fn run_internal_file_task_worker(journal_path: &std::path::Path, lease_fd: i
     let writer = std::sync::Arc::new(std::sync::Mutex::new(std::io::BufWriter::new(
         std::io::stdout(),
     )));
-    let sink = FileTaskEventSink::Wire(writer);
+    let sink = FileTaskEventSink::Wire { writer, detached: detached_progress };
     let _ = journal.mark_lifecycle(
         super::file_task_runtime::DurableFileTaskLifecycle::Running,
         "helper executing",
@@ -62570,6 +62635,174 @@ pub fn run_internal_file_task_worker(journal_path: &std::path::Path, lease_fd: i
 mod file_task_supervisor_tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    // Child process fixture: the actual file-task worker, not a synthetic
+    // publisher, waits at real destination collisions. Its output pipe is
+    // intentionally disconnected, just as when the original TUI exits.
+    #[test]
+    fn issue81_subprocess_conflict_fixture() {
+        let Some(root) = std::env::var_os("TONEPOET_ISSUE81_CONFLICT_CHILD_ROOT") else {
+            return; // Not a spawned fixture: ordinary workspace tests do nothing.
+        };
+        let root = std::path::PathBuf::from(root);
+        let id = std::env::var("TONEPOET_ISSUE81_CONFLICT_CHILD_ID")
+            .expect("child receives unique journal identity");
+        let identity = super::super::file_task_live::LiveWorkerRef::new(
+            super::super::file_task_runtime::file_task_journal_dir()
+                .join(format!("{id}.jsonl")), id.clone(), 1,
+        ).expect("child valid identity");
+        let (control_tx, control_rx) = std::sync::mpsc::channel();
+        let (detached, _guard) = super::super::file_task_live::start_worker(identity, control_tx)
+            .expect("child opens private progress and control transport");
+        let sink = FileTaskEventSink::Wire {
+            writer: std::sync::Arc::new(std::sync::Mutex::new(
+                std::io::BufWriter::new(std::io::stdout()))),
+            detached: Some(detached),
+        };
+        let source_dir = root.join("sources");
+        let destination_dir = root.join("destination");
+        let sources = vec![source_dir.join("a.flac"), source_dir.join("b.flac")];
+        let job = FileTaskJob {
+            session_id: 81, job_id: id, generation: 1, journal_path: None,
+            stall_timeout_secs: 20,
+            sources, dest: destination_dir.to_string_lossy().into_owned(),
+            force: false, is_move: false,
+            conflict_policy: Some(tui_file_picker::ConflictPolicyPreset::Ask),
+            root_targets: None, clipboard_retry_plan: None,
+            verbose_degrade_notices: false,
+            verification: tui_file_picker::VerificationMode::Standard,
+        };
+        FileTaskWorker::new_with_sink(job, sink, control_rx, None).run();
+        // The worker's terminal event does not depend on a connected viewer.
+        std::fs::write(root.join("child-complete"), b"complete")
+            .expect("child completed both collisions");
+    }
+
+    #[test]
+    fn issue81_reconnect_resolves_real_conflicts_in_surviving_process() {
+        let _lock = super::super::file_task_runtime::test_environment_lock();
+        let temp = tempfile::tempdir().expect("test work tree");
+        let root = temp.path();
+        let journal = root.join("journal");
+        let old_journal = std::env::var_os("TONEPOET_FILE_OPERATION_JOURNAL_DIR");
+        struct JournalEnv(Option<std::ffi::OsString>);
+        impl Drop for JournalEnv {
+            fn drop(&mut self) {
+                if let Some(value) = self.0.take() {
+                    std::env::set_var("TONEPOET_FILE_OPERATION_JOURNAL_DIR", value);
+                } else {
+                    std::env::remove_var("TONEPOET_FILE_OPERATION_JOURNAL_DIR");
+                }
+            }
+        }
+        let _journal_restore = JournalEnv(old_journal);
+        std::env::set_var("TONEPOET_FILE_OPERATION_JOURNAL_DIR", &journal);
+        std::fs::create_dir_all(super::super::file_task_runtime::file_task_journal_dir())
+            .expect("create private file-task journal namespace");
+        let sources = root.join("sources");
+        let destination = root.join("destination");
+        std::fs::create_dir(&sources).expect("create sources");
+        std::fs::create_dir(&destination).expect("create destination");
+        for name in ["a.flac", "b.flac"] {
+            std::fs::write(sources.join(name), format!("incoming {name}"))
+                .expect("create incoming file");
+            std::fs::write(destination.join(name), format!("existing {name}"))
+                .expect("create real destination collision");
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let identity = super::super::file_task_live::LiveWorkerRef::new(
+            super::super::file_task_runtime::file_task_journal_dir()
+                .join(format!("{id}.jsonl")), id.clone(), 1,
+        ).expect("observe same journal generation");
+        // Spawn this test executable as a worker-only process. Nothing in the
+        // parent holds its controls; reconnect is solely through the mailbox.
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("issue81_subprocess_conflict_fixture")
+            .arg("--test-threads=1")
+            .env("TONEPOET_ISSUE81_CONFLICT_CHILD_ROOT", root)
+            .env("TONEPOET_ISSUE81_CONFLICT_CHILD_ID", &id)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn().expect("spawn independent file-task worker");
+        struct ChildGuard(Option<std::process::Child>);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                if let Some(child) = self.0.as_mut() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+        let mut child = ChildGuard(Some(child));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let observe_conflict = |after: u64| -> tui_file_picker::ConflictPromptState {
+            loop {
+                if let Some(snapshot) = super::super::file_task_live::read_snapshot(&identity) {
+                    if let Some(prompt) = snapshot.conflict {
+                        if prompt.request_id > after { return prompt; }
+                    }
+                }
+                assert!(Instant::now() < deadline,
+                    "independent worker did not publish next real collision");
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        };
+        let first = observe_conflict(0);
+        assert_eq!(first.source.as_deref(), Some(sources.join("a.flac").as_path()));
+        assert_eq!(first.destination.as_deref(), Some(destination.join("a.flac").as_path()));
+        // This is the restarted TUI's existing progress-state reducer.
+        let mut viewer = tui_file_picker::FileTaskProgressState::new(
+            tui_file_picker::FileTaskKind::Copy, "Reconnected copy",
+            tui_file_picker::FilePickerTheme::default(),
+        );
+        viewer.set_recovery_monitor();
+        viewer.apply_update(tui_file_picker::FileTaskProgressUpdate::ShowConflict {
+            conflict: first.clone(),
+        });
+        let key = |code| crossterm::event::KeyEvent::new(code,
+            crossterm::event::KeyModifiers::NONE);
+        assert_eq!(viewer.handle_key(key(crossterm::event::KeyCode::Esc)),
+            tui_file_picker::FileTaskUserAction::Minimize,
+            "Esc must not abort a surviving worker at a conflict");
+        assert_eq!(viewer.conflict.as_ref().map(|c| c.request_id), Some(first.request_id));
+        let choose = viewer.handle_key(key(crossterm::event::KeyCode::Char('s')));
+        let tui_file_picker::FileTaskUserAction::ChooseConflictResolution(resolution) = choose else {
+            panic!("reconnected viewer did not offer Skip");
+        };
+        super::super::file_task_live::request_control(&identity,
+            super::super::app::FileTaskControl::ConflictResolution {
+                request_id: first.request_id, resolution,
+            }).expect("send first resolution from restarted viewer");
+        let second = observe_conflict(first.request_id);
+        assert_eq!(second.source.as_deref(), Some(sources.join("b.flac").as_path()));
+        viewer.apply_update(tui_file_picker::FileTaskProgressUpdate::ClearConflict);
+        viewer.apply_update(tui_file_picker::FileTaskProgressUpdate::ShowConflict {
+            conflict: second.clone(),
+        });
+        let choose = viewer.handle_key(key(crossterm::event::KeyCode::Char('r')));
+        let tui_file_picker::FileTaskUserAction::ChooseConflictResolution(resolution) = choose else {
+            panic!("reconnected viewer did not offer Rename");
+        };
+        super::super::file_task_live::request_control(&identity,
+            super::super::app::FileTaskControl::ConflictResolution {
+                request_id: second.request_id, resolution,
+            }).expect("send second resolution from restarted viewer");
+        let status = loop {
+            if let Some(status) = child.0.as_mut().unwrap().try_wait().expect("poll worker") {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "worker did not finish after both decisions");
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        child.0.take();
+        assert!(status.success(), "worker helper failed during actual file transfer");
+        assert_eq!(std::fs::read(destination.join("a.flac")).unwrap(), b"existing a.flac");
+        assert_eq!(std::fs::read(destination.join("b.flac")).unwrap(), b"existing b.flac");
+        assert_eq!(std::fs::read(destination.join("b copy.flac")).unwrap(), b"incoming b.flac");
+        assert!(root.join("child-complete").exists());
+    }
+
 
     struct FileTaskTestEnvironment {
         _coordination: crate::concurrency::ScopedTestCoordinationRootGuard,

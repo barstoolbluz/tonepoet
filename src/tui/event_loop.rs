@@ -354,6 +354,10 @@ pub async fn run_app(
     }
     let mut deferred_browse_visible_messages: VecDeque<AppMessage> = VecDeque::new();
     let mut pending_recovered_queue_items = VecDeque::new();
+    // Reconnect to an independently owned copy/move without repeatedly
+    // replaying potentially megabyte-sized append-only recovery journals.
+    let mut last_recovery_inventory = Instant::now();
+    let mut last_recovery_progress = Instant::now();
     let mut last_dead_queue_recovery_attempt = Instant::now();
     let mut redraw_requested = true;
     let mut last_draw = Instant::now();
@@ -468,6 +472,25 @@ pub async fn run_app(
             && super::keybindings::cancel_and_detach_pending_browse_archive_edit_staging(app)
         {
             app.set_status("archive edit preparation cancelled: Browse screen changed");
+        }
+        let recovery_visible = matches!(app.active_overlay, ActiveOverlay::FileRecovery)
+            || matches!(&app.active_overlay, ActiveOverlay::FileTaskProgress(session)
+                if session.is_recovery_monitor());
+        if !input_waiting_at_frame_start && (recovery_visible
+            || !app.recovery_ui.stop_and_undo_pending.is_empty())
+            && last_recovery_inventory.elapsed() >= Duration::from_secs(2)
+        {
+            last_recovery_inventory = Instant::now();
+            super::recovery_ui::refresh_from_runtime(app);
+            // A reconnected progress surface must not keep displaying an old
+            // worker after the durable lease changes or the job completes.
+            super::recovery_ui::reconcile_progress_watch(app);
+            super::recovery_ui::advance_stop_and_undo(app, &tx);
+            redraw_requested = true;
+        }
+        if recovery_visible && last_recovery_progress.elapsed() >= Duration::from_millis(350) {
+            last_recovery_progress = Instant::now();
+            redraw_requested |= super::recovery_ui::refresh_live_observation(app);
         }
         super::recovery_ui::maybe_open_startup_prompt(app);
 
@@ -9822,6 +9845,9 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             result,
         } => {
             super::recovery_ui::complete_discard(app, journal_path, result);
+        }
+        AppMessage::RecoverySetAsideComplete { journal_path, result } => {
+            super::recovery_ui::complete_set_aside(app, journal_path, result);
         }
         AppMessage::RecoveryIncompleteSizesLoaded { journal_path, sizes } => {
             super::recovery_ui::complete_incomplete_sizes(app, journal_path, sizes);

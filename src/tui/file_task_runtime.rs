@@ -1858,6 +1858,58 @@ pub fn pending_journals() -> Vec<(PathBuf, DurableFileTaskRecord)> {
     pending_journals_from_surfaces(&surfaces)
 }
 
+/// Explicitly set aside a genuinely unreadable journal and release its stale
+/// path reservation. This does *not* delete any source or destination data.
+/// The original bytes are preserved under the private journal namespace for
+/// later forensic review. A still-running worker can never be set aside.
+pub fn set_aside_unreadable_recovery(path: &Path) -> Result<PathBuf, String> {
+    let root = file_task_journal_dir();
+    if path.parent() != Some(root.as_path()) {
+        return Err("unreadable recovery pathname is outside the journal directory".into());
+    }
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|e| format!("inspect unreadable record: {e}"))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err("unreadable recovery record is not a regular file".into());
+    }
+    let stem = path.file_stem().and_then(|s| s.to_str())
+        .ok_or_else(|| "invalid unreadable recovery filename".to_string())?;
+    let id = uuid::Uuid::parse_str(stem)
+        .map_err(|_| "unreadable recovery filename has no valid job identity".to_string())?;
+    if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+        return Err("unreadable recovery is not a journal".into());
+    }
+    let family = LeaseFamily::JournalOperation { job_id: id };
+    let descriptor = crate::concurrency::find_family_descriptor(&family)?
+        .ok_or_else(|| "no path reservation can be proven for this unreadable record".to_string())?;
+    let (actual_family, available) = crate::concurrency::descriptor_availability(&descriptor)?;
+    if actual_family != family || available != crate::concurrency::ClaimAvailability::RecoveryReserved {
+        return Err("a worker still owns this record, or its reservation changed; no paths were released".into());
+    }
+    let lease = PersistentLease::acquire_existing_recovery(&descriptor, &family)?;
+    if load_record(path).is_ok() {
+        return Err("record became readable; review its ordinary recovery options".into());
+    }
+    let aside_dir = root.join("set-aside");
+    create_private_journal_directory(&aside_dir)
+        .map_err(|e| format!("create protected set-aside directory: {e}"))?;
+    let destination = aside_dir.join(format!("{}-{}.jsonl", id, uuid::Uuid::new_v4()));
+    fs::rename(path, &destination)
+        .map_err(|e| format!("preserve unreadable record for inspection: {e}"))?;
+    let sync_result = File::open(&aside_dir).and_then(|d| d.sync_all())
+        .and_then(|_| File::open(&root).and_then(|d| d.sync_all()));
+    if let Err(e) = sync_result {
+        let _ = fs::rename(&destination, path);
+        return Err(format!("sync preserved recovery record: {e}"));
+    }
+    drop(lease);
+    if let Err(error) = crate::concurrency::retire_descriptor_after_lifecycle_release(&descriptor, &family) {
+        let _ = fs::rename(&destination, path);
+        return Err(format!("release saved path reservations: {error}"));
+    }
+    Ok(destination)
+}
+
 pub enum RecoveryDiscardPreparation {
     Ready {
         handle: FileTaskJournalHandle,
