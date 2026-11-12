@@ -5171,9 +5171,8 @@ exec /bin/cat >/dev/null
             canonical_path: canonical.clone(),
             executable_sha256: executable_sha256(&canonical).expect("hash bound pump script"),
         };
-        let pump = bound_scalar_pump_fixture(
-            canonical.parent().expect("bound pump script has parent"),
-        );
+        let input_dir = tempfile::tempdir().expect("scalar-pump input directory");
+        let pump = bound_scalar_pump_fixture(input_dir.path());
         let runner = runner_with_override(ToolBinary::Metaflac, canonical.to_str().unwrap());
         let output = runner
             .run_pcm_scalar_pump_bound(
@@ -5198,9 +5197,8 @@ exec /bin/cat >/dev/null
             canonical_path: canonical.clone(),
             executable_sha256: executable_sha256(&canonical).expect("hash bound pump script"),
         };
-        let pump = bound_scalar_pump_fixture(
-            canonical.parent().expect("bound pump script has parent"),
-        );
+        let input_dir = tempfile::tempdir().expect("scalar-pump input directory");
+        let pump = bound_scalar_pump_fixture(input_dir.path());
         let runner = runner_with_override(ToolBinary::Metaflac, canonical.to_str().unwrap());
         let mut consumer = closed_command(
             ToolBinary::Metaflac,
@@ -5231,9 +5229,8 @@ exec /bin/cat >/dev/null
             canonical_path: certified.clone(),
             executable_sha256: executable_sha256(&certified).expect("hash certified pump script"),
         };
-        let pump = bound_scalar_pump_fixture(
-            certified.parent().expect("certified pump script has parent"),
-        );
+        let input_dir = tempfile::tempdir().expect("scalar-pump input directory");
+        let pump = bound_scalar_pump_fixture(input_dir.path());
         let runner = runner_with_override(ToolBinary::Wvtag, replacement.to_str().unwrap());
         let error = runner
             .run_pcm_scalar_pump_bound(
@@ -5256,9 +5253,8 @@ exec /bin/cat >/dev/null
             canonical_path: canonical.clone(),
             executable_sha256: Sha256Digest::of_bytes(b"not-the-executable"),
         };
-        let pump = bound_scalar_pump_fixture(
-            canonical.parent().expect("bound pump script has parent"),
-        );
+        let input_dir = tempfile::tempdir().expect("scalar-pump input directory");
+        let pump = bound_scalar_pump_fixture(input_dir.path());
         let runner = runner_with_override(ToolBinary::AtomicParsley, canonical.to_str().unwrap());
         let error = runner
             .run_pcm_scalar_pump_bound(
