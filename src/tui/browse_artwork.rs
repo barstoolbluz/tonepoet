@@ -155,6 +155,9 @@ pub struct BrowseArtworkState {
     inline_click_source: Option<ArtworkSource>,
     warning: Option<String>,
     pub popup_open: bool,
+    /// Full-screen uses the same async viewer and protocol cache, without a
+    /// Browse frame behind it. This is transient; the opening policy is saved.
+    pub fullscreen: bool,
     pub popup_rect: Rect,
     // Native graphics may have altered terminal pixels outside the ratatui diff.
     // Restore only when terminal graphics are newly placed, invalidated, or
@@ -189,7 +192,8 @@ impl Default for BrowseArtworkState {
             vertical_placement: ImageVerticalPlacement::Center, protocol_area: Rect::default(),
             protocol_generation: 0, retransmit_generation: 0, font_size: (8, 12),
             prepared_protocol_has_fixed_origin: false, kitty_upload_transport: false,
-            inline_click_source: None, warning: None, popup_open: false, popup_rect: Rect::default(),
+            inline_click_source: None, warning: None, popup_open: false,
+            fullscreen: false, popup_rect: Rect::default(),
             needs_background_restore: false, background_restore_count: 0,
             native_placement_awaiting_render: false, post_native_repaint_redraw: false,
             artwork_menu_occludes_image: false, repaint_image_after_menu: false,
@@ -224,6 +228,7 @@ impl BrowseArtworkState {
         self.clear_selection();
         // Keep the in-flight receivers until they complete to cap concurrency.
         self.popup_open = false;
+        self.fullscreen = false;
         self.warning = None;
     }
 
@@ -255,6 +260,7 @@ impl BrowseArtworkState {
         self.changed_at = Instant::now();
         self.clear_selection();
         self.popup_open = false;
+        self.fullscreen = false;
         self.warning = None;
     }
 
@@ -273,6 +279,7 @@ impl BrowseArtworkState {
 
     pub fn suspend(&mut self) {
         self.popup_open = false;
+        self.fullscreen = false;
         self.desired_area = Rect::default();
         self.vertical_placement = ImageVerticalPlacement::Center;
         if self.context.is_some() {
@@ -359,7 +366,9 @@ impl BrowseArtworkState {
     /// generation-obsolete; it may finish, but cannot populate the viewer.
     pub fn open_info_popup(&mut self) {
         self.popup_open = true;
-        self.desired_area = Rect::default(); // wait for popup geometry before decoding
+        self.fullscreen = false;
+        self.popup_rect = Rect::default();
+        self.desired_area = Rect::default(); // wait for viewer geometry before decoding
         self.viewer_decode_bounds = None;
         if matches!(self.context, Some(ArtworkContext::Album { .. })) {
             self.generation = self.generation.wrapping_add(1);
@@ -385,10 +394,27 @@ impl BrowseArtworkState {
         self.sources = vec![ArtworkSource::File(path)];
         self.queued_gallery_offset = 0;
         self.popup_open = true;
+        self.fullscreen = false;
         self.popup_rect = Rect::default();
         self.desired_area = Rect::default();
         self.vertical_placement = ImageVerticalPlacement::Center;
         self.invalidate_protocol();
+    }
+
+    /// `f` expands an already-open viewer. The next draw records the new
+    /// terminal-sized viewport; the existing prepare pass then decodes to its
+    /// new pixel bounds, discarding any stale lower-resolution result.
+    pub fn enter_fullscreen(&mut self) {
+        if self.popup_open && !self.fullscreen {
+            self.fullscreen = true;
+            self.popup_rect = Rect::default();
+            // The next render records the terminal's actual geometry.
+            // Defer decoding until then, rather than scheduling an obsolete
+            // modal-sized decode during the event loop's pre-draw update.
+            self.desired_area = Rect::default();
+            self.needs_background_restore = true;
+            self.invalidate_protocol();
+        }
     }
 
     pub fn has_image(&self) -> bool { self.decoded.is_some() }
@@ -476,6 +502,7 @@ impl BrowseArtworkState {
         let was_file_view = self.is_single_file_popup();
         self.needs_background_restore = true;
         self.popup_open = false;
+        self.fullscreen = false;
         self.popup_rect = Rect::default();
         self.inline_click_source = None;
         self.artwork_menu_occludes_image = false;
@@ -614,9 +641,12 @@ impl BrowseArtworkState {
         if picker.protocol_type == ratatui_image::picker::ProtocolType::Halfblocks {
             self.repaint_image_after_menu = false;
         }
+        // Full-screen never enlarges small source images, even when the
+        // ordinary modal's enlargement preference is enabled.
+        let allow_upscale = !self.fullscreen && config.allow_upscale;
         let desired = self.decoded.as_ref().map_or(self.desired_area, |image| {
             fitted_image_area(self.desired_area, image.width(), image.height(), font_size,
-                config.allow_upscale, self.vertical_placement)
+                allow_upscale, self.vertical_placement)
         });
         let kitty = if picker.protocol_type == ratatui_image::picker::ProtocolType::Kitty {
             kitty_generation
@@ -2423,6 +2453,50 @@ mod tests {
     }
 
     #[test]
+    fn fullscreen_uses_whole_terminal_and_never_enlarges_small_images() {
+        use ratatui::{backend::TestBackend, Terminal};
+        use ratatui_image::picker::ProtocolType;
+
+        let mut app = crate::tui::app::AppState::new_for_test(
+            crate::config::TonepoetConfig::default());
+        app.current_screen = crate::tui::app::AppScreen::Browse;
+        app.browse.artwork_config.allow_upscale = true;
+        app.browse_artwork.open_file_popup(PathBuf::from("/image/front.png"));
+        app.browse_artwork.scanned = app.browse_artwork.context.clone();
+        app.browse_artwork.decoded = Some(Arc::new(DynamicImage::new_rgb8(24, 24)));
+        app.browse_artwork.enter_fullscreen();
+        app.image_picker = Picker::new((8, 12));
+        app.image_picker.protocol_type = ProtocolType::Halfblocks;
+        let screen = Rect::new(0, 0, 100, 40);
+        app.browse_artwork.set_desired_area(screen, ImageVerticalPlacement::Center);
+        assert!(app.prepare_image_preview_protocols());
+        assert_eq!(app.browse_artwork.protocol_area, Rect::new(48, 19, 3, 2),
+            "source pixels cap the fit even when normal View allows enlargement");
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        terminal.draw(|frame| frame.render_widget(
+            ratatui::widgets::Paragraph::new("BROWSE_PREVIOUS_FRAME"),
+            Rect::new(0, 0, 30, 1),
+        )).unwrap();
+        terminal.draw(|frame| crate::tui::draw::draw_ui(frame, &mut app)).unwrap();
+        assert_eq!(terminal.backend().buffer().get(0, 0).bg, app.theme.bg,
+            "letterboxing must have the application's background colour");
+        assert_eq!(app.browse_artwork.popup_rect, screen,
+            "full-screen pointer input includes any letterboxing");
+        assert_eq!(app.browse_artwork.desired_area, screen,
+            "full-screen must not reuse the configured popup-height viewport");
+        let buf = terminal.backend().buffer();
+        let text = (0..screen.height).flat_map(|y| (0..screen.width)
+            .map(move |x| buf.get(x, y).symbol().to_owned()))
+            .collect::<Vec<_>>().join("");
+        assert!(!text.contains("browse") && !text.contains("tonepoet")
+            && !text.contains("BROWSE_PREVIOUS_FRAME"),
+            "the normal Browse chrome and prior frame must not appear behind the image");
+        app.browse_artwork.close_popup();
+        assert!(!app.browse_artwork.fullscreen);
+    }
+
+    #[test]
     fn kitty_image_upload_is_compressed_once_and_not_resent_on_redraw() {
         use ratatui::{backend::TestBackend, Terminal};
         use ratatui_image::picker::ProtocolType;
@@ -2542,11 +2616,17 @@ pub fn draw_popup(f: &mut ratatui::Frame, app: &mut super::app::AppState,
     use ratatui::{layout::Alignment, style::Style};
 
     let terminal = f.size();
-    if terminal.width < 8 || terminal.height < 5 {
+    let fullscreen = app.browse_artwork.fullscreen;
+    if terminal.width == 0 || terminal.height == 0
+        || (!fullscreen && (terminal.width < 8 || terminal.height < 5))
+    {
         app.browse_artwork.popup_rect = Rect::default();
         return;
     }
-    let viewport = popup_rect(terminal, app.browse.artwork_config.popup_height_percent);
+    let viewport = if fullscreen { terminal } else {
+        popup_rect(terminal, app.browse.artwork_config.popup_height_percent)
+    };
+    let allow_upscale = !fullscreen && app.browse.artwork_config.allow_upscale;
     let failure = app.browse_artwork.sources.get(app.browse_artwork.cursor)
         .is_some_and(|source| app.browse_artwork.failed.contains_key(source));
     let message = app.browse_artwork.message();
@@ -2555,18 +2635,19 @@ pub fn draw_popup(f: &mut ratatui::Frame, app: &mut super::app::AppState,
     // spans multiple columns, and keeps the existing message() API unchanged.
     let status = if failure { message.replacen(": ", ":\n", 1) } else { message.to_owned() };
     let rect = app.browse_artwork.popup_image_area(viewport,
-        app.browse.artwork_config.allow_upscale).unwrap_or_else(|| {
+        allow_upscale).unwrap_or_else(|| {
             popup_status_area(viewport, &status, failure)
         });
-    app.browse_artwork.popup_rect = rect;
+    // In full-screen mode, the entire terminal owns pointer input, including
+    // letterboxing around an image smaller than the display.
+    app.browse_artwork.popup_rect = if fullscreen { terminal } else { rect };
     f.render_widget(Clear, rect);
     // No border, label, caption row, or panel outside the image. The backing
     // color matches the application rather than the old oversized panel.
     f.render_widget(Block::default()
         .style(Style::default().bg(theme.bg)), rect);
     let displayed = app.browse_artwork.render_image(f, viewport,
-        app.browse.artwork_config.allow_upscale, ImageVerticalPlacement::Center,
-        theme.bg);
+        allow_upscale, ImageVerticalPlacement::Center, theme.bg);
     if !displayed {
         f.render_widget(Paragraph::new(status).style(theme.muted())
             .alignment(Alignment::Center).wrap(Wrap { trim: false }), rect);

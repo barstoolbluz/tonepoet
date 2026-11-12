@@ -2338,11 +2338,17 @@ fn draw_window(f: &mut Frame, app: &mut AppState, theme: super::theme::Theme) {
         if divider_offset < partition.len().saturating_sub(1) {
             partition[divider_offset] = '┴';
         }
-        f.render_widget(
-            Paragraph::new(partition.into_iter().collect::<String>())
-                .style(Style::default().fg(theme.border_dim)),
-            Rect::new(popup.x, partition_y, popup.width, 1),
-        );
+        // The horizontal rule is deliberately dim, but its junctions are
+        // part of the cyan outer frame. Do not repaint those frame cells with
+        // the dim divider style (which makes both side rails look broken).
+        let middle = partition[1..partition.len() - 1].iter().collect::<String>();
+        let partition = Line::from(vec![
+            Span::styled("├", Style::default().fg(theme.cyan)),
+            Span::styled(middle, Style::default().fg(theme.border_dim)),
+            Span::styled("┤", Style::default().fg(theme.cyan)),
+        ]);
+        f.render_widget(Paragraph::new(partition),
+            Rect::new(popup.x, partition_y, popup.width, 1));
     }
     let resume = app.recovery_ui.resume_count();
     let discard = app.recovery_ui.bulk_discard_count();
@@ -4039,6 +4045,36 @@ mod tests {
             details.x >= window.x && details.x + details.width <= window.x + window.width,
             "an epi-popup must stay within its parent window",
         );
+    }
+
+    #[test]
+    fn recovery_footer_rule_preserves_both_frame_rails() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.recovery_ui.maximized = true;
+        let theme = app.theme;
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|frame| draw_window(frame, &mut app, theme)).unwrap();
+        let popup = parent_window_rect(Rect::new(0, 0, 140, 40), true);
+        let inner = Rect::new(popup.x + 1, popup.y + 1,
+            popup.width - 2, popup.height - 2);
+        let rule_y = inner.y + inner.height - 3;
+        let buffer = terminal.backend().buffer();
+        for (x, glyph) in [(popup.x, "├"), (popup.right() - 1, "┤")] {
+            let cell = buffer.get(x, rule_y);
+            assert_eq!(cell.symbol(), glyph, "footer rule must join the frame");
+            assert_eq!(cell.fg, theme.cyan, "footer junction must match frame colour");
+            for y in [rule_y - 1, rule_y + 1] {
+                let rail = buffer.get(x, y);
+                assert_eq!(rail.symbol(), "│", "frame rail must be continuous");
+                assert_eq!(rail.fg, theme.cyan);
+            }
+        }
+        let interior = buffer.get(popup.x + 2, rule_y);
+        assert_eq!(interior.symbol(), "─");
+        assert_eq!(interior.fg, theme.border_dim,
+            "the separator interior must retain its subdued style");
     }
 
     #[test]

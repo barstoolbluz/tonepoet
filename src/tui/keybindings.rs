@@ -161,6 +161,9 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
     {
         match key.code {
             KeyCode::Esc | KeyCode::Enter => app.browse_artwork.close_popup(),
+            KeyCode::Char('f') if key.modifiers == KeyModifiers::NONE => {
+                app.browse_artwork.enter_fullscreen();
+            }
             KeyCode::Left | KeyCode::Up => { app.browse_artwork.cycle(false); }
             KeyCode::Right | KeyCode::Down | KeyCode::Char(' ') => {
                 app.browse_artwork.cycle(true);
@@ -3727,6 +3730,9 @@ pub(crate) fn activate_browse_entry(
     // This route is shared by double-click and Enter, like text-file View.
     if browse_entry_opens_artwork(&entry, app.browse.is_in_archive()) {
         app.browse_artwork.open_file_popup(entry.path);
+        if app.browse.artwork_config.open_fullscreen {
+            app.browse_artwork.enter_fullscreen();
+        }
         return;
     }
 
@@ -6426,6 +6432,81 @@ mod inline_edit_behavior_tests {
         assert_eq!(app.image_kitty_retransmit_generation, before,
             "Esc must not retransmit a closing image");
         assert!(app.browse_artwork.take_background_restore());
+    }
+
+    #[test]
+    fn viewer_fullscreen_key_and_exit_action_return_to_browse() {
+        use crate::tui::context_menu::{
+            build_browse_artwork_menu, ContextAction, ContextMenuEntry,
+        };
+
+        let (tx, _rx) = channel();
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse_artwork.open_file_popup(std::path::PathBuf::from("front.png"));
+        let normal_menu = build_browse_artwork_menu(&app);
+        assert!(!normal_menu.iter().any(|entry| matches!(entry,
+            ContextMenuEntry::Item(item)
+                if matches!(&item.action, ContextAction::BrowseArtworkExitFullscreen))));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE), &tx);
+        assert!(app.browse_artwork.popup_open && app.browse_artwork.fullscreen);
+        let fullscreen_menu = build_browse_artwork_menu(&app);
+        assert!(fullscreen_menu.iter().any(|entry| matches!(entry,
+            ContextMenuEntry::Item(item)
+                if matches!(&item.action, ContextAction::BrowseArtworkExitFullscreen))));
+        assert!(!fullscreen_menu.iter().any(|entry| matches!(entry,
+            ContextMenuEntry::Item(item)
+                if matches!(&item.action, ContextAction::BrowseArtworkCloseView))));
+        super::super::context_menu::execute_context_action(&mut app,
+            ContextAction::BrowseArtworkExitFullscreen, &tx, false);
+        assert!(!app.browse_artwork.popup_open && !app.browse_artwork.fullscreen);
+        assert_eq!(app.current_screen, AppScreen::Browse);
+
+        app.browse_artwork.open_file_popup(std::path::PathBuf::from("front.png"));
+        app.browse_artwork.enter_fullscreen();
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+        assert!(!app.browse_artwork.popup_open && !app.browse_artwork.fullscreen);
+    }
+
+    #[test]
+    fn browse_image_activation_respects_saved_fullscreen_opening_policy() {
+        let (tx, _rx) = channel();
+        let temp = tempfile::tempdir().unwrap();
+        let image = temp.path().join("front.png");
+        image::DynamicImage::new_rgb8(8, 8).save(&image).unwrap();
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.artwork_config.open_fullscreen = true;
+        app.browse.entries = vec![crate::tui::browse::BrowseEntry::new(
+            image.clone(), "front.png".to_owned(),
+            crate::convert::classify::classify_file(&image), 0, None,
+        )];
+        activate_browse_entry(&mut app, 0, &tx);
+        assert!(app.browse_artwork.popup_open && app.browse_artwork.fullscreen);
+        assert_eq!(app.browse_artwork.current_label().as_deref(), Some("front.png"));
+    }
+
+    #[test]
+    fn viewer_fullscreen_right_click_on_letterbox_is_captured() {
+        use crate::tui::context_menu::{ContextAction, ContextMenuEntry};
+
+        let (tx, _rx) = channel();
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse_artwork.open_file_popup(std::path::PathBuf::from("front.png"));
+        app.browse_artwork.enter_fullscreen();
+        app.browse_artwork.popup_rect = Rect::new(0, 0, 100, 40);
+        handle_mouse(&mut app, MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right), column: 1, row: 1,
+            modifiers: KeyModifiers::NONE,
+        }, &tx);
+        let ActiveOverlay::ContextMenu { levels, .. } = &app.active_overlay else {
+            panic!("full-screen right click must open an image context menu");
+        };
+        assert!(levels[0].entries.iter().any(|entry| matches!(entry,
+            ContextMenuEntry::Item(item)
+                if matches!(&item.action, ContextAction::BrowseArtworkExitFullscreen))));
+        assert!(app.browse_artwork.popup_open && app.browse_artwork.fullscreen);
     }
 
     #[test]
@@ -72556,8 +72637,9 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 let r = app.browse_artwork.popup_rect;
-                if mouse.column >= r.x && mouse.column < r.right()
-                    && mouse.row >= r.y && mouse.row < r.bottom()
+                if app.browse_artwork.fullscreen
+                    || (mouse.column >= r.x && mouse.column < r.right()
+                        && mouse.row >= r.y && mouse.row < r.bottom())
                 {
                     app.browse_artwork.cycle(true);
                 } else {
@@ -72566,8 +72648,9 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             }
             MouseEventKind::Down(MouseButton::Right) => {
                 let r = app.browse_artwork.popup_rect;
-                if mouse.column >= r.x && mouse.column < r.right()
-                    && mouse.row >= r.y && mouse.row < r.bottom()
+                if app.browse_artwork.fullscreen
+                    || (mouse.column >= r.x && mouse.column < r.right()
+                        && mouse.row >= r.y && mouse.row < r.bottom())
                 {
                     open_browse_artwork_context_menu(app, mouse.column, mouse.row);
                 } else {
@@ -73047,8 +73130,9 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     && app.browse_artwork.popup_open
                 {
                     let r = app.browse_artwork.popup_rect;
-                    if mouse.column >= r.x && mouse.column < r.right()
-                        && mouse.row >= r.y && mouse.row < r.bottom()
+                    if app.browse_artwork.fullscreen
+                        || (mouse.column >= r.x && mouse.column < r.right()
+                            && mouse.row >= r.y && mouse.row < r.bottom())
                     {
                         finish_artwork_context_menu(app);
                         open_browse_artwork_context_menu(app, mouse.column, mouse.row);
@@ -74247,7 +74331,11 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     TuiButton::BrowseInfoArtworkArea, mouse.column, mouse.row,
                     tui_file_picker::DOUBLE_CLICK_WINDOW,
                 ) {
-                    app.browse_artwork.open_inline_popup_on_double_click();
+                    if app.browse_artwork.open_inline_popup_on_double_click()
+                        && app.browse.artwork_config.open_fullscreen
+                    {
+                        app.browse_artwork.enter_fullscreen();
+                    }
                 } else {
                     app.browse_artwork.inline_click();
                 }
