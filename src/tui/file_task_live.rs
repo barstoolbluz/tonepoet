@@ -534,6 +534,7 @@ mod tests {
     #[test]
     fn force_stop_only_the_verified_macos_helper_process() {
         let mut helper = std::process::Command::new("/bin/sleep")
+            .stdin(std::process::Stdio::null())
             .arg("30").spawn().expect("start unresponsive helper");
         let pid = helper.id();
         let identity_text = crate::convert::script_supervisor::local_process_start_identity(pid)
