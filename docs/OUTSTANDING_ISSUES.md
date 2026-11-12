@@ -5793,3 +5793,30 @@ whole terminal.
   view.
 
 No zoom. Full screen is a single fitted view.
+
+---
+
+## 87. Four scalar-pump tests share one fixture file in the repo
+
+Filed 2026-11-12.
+
+`bound_scalar_pump_spawns_the_exact_attested_executable` failed once in a
+full gate on `bd01543` and passed 3/3 alone:
+
+```
+retained PCM scalar input extent changed before execution: expected 8 bytes,
+found 0 at …/fixtures/test-bin/bound-scalar-input.f64le
+```
+
+`bound_scalar_pump_fixture` in `src/convert/pipeline/tool.rs` writes
+`bound-scalar-input.f64le` with `fs::write`, and four tests in
+`real_tool_runner_tests` call it. As far as I can tell they all write the same
+tracked file in `fixtures/test-bin`, concurrently. `fs::write` truncates
+before writing, so one test can find the file at 0 bytes while another is
+rewriting it. The code under test reported the change correctly.
+
+This is the first failure seen from it. The fixture has been written this way
+since R35.
+
+**What we want.** These tests do not share a file, and no test writes into
+the repository's tracked fixtures.
