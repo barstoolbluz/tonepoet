@@ -2726,6 +2726,7 @@ dependencies = [
  "encoding_rs",
  "env_logger 0.10.2",
  "ffmpeg-next",
+ "flate2",
  "fs2",
  "fuzzy-matcher",
  "getrandom 0.2.17",

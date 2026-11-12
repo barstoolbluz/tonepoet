@@ -656,6 +656,10 @@ pub struct FileTaskProgressState {
     auto_close_progress: bool,
     minimize_available: bool,
     recovery_monitor: bool,
+    // Unlike ordinary task progress, a reconnected monitor may have no
+    // producer. In that case journal checkpoints replace all numeric bars,
+    // rate, and elapsed time instead of presenting synthetic zero readings.
+    recovery_without_feed: Option<(String, String)>,
     queued_jobs: Vec<QueuedFileTaskSummary>,
     queued_selection: usize,
     queued_scroll: usize,
@@ -692,6 +696,7 @@ impl FileTaskProgressState {
             auto_close_progress: false,
             minimize_available: false,
             recovery_monitor: false,
+            recovery_without_feed: None,
             queued_jobs: Vec::new(),
             queued_selection: 0,
             queued_scroll: 0,
@@ -714,6 +719,32 @@ impl FileTaskProgressState {
         self.recovery_monitor = true;
         self.auto_close_available = false;
         self.minimize_available = false;
+        self.task_controls_available = false;
+        self.recovery_without_feed = Some((
+            "Journal checkpoint unavailable".into(),
+            "Waiting for a readable worker progress feed".into(),
+        ));
+    }
+
+    /// A journal is not a progress measurement. Present its own checkpoint
+    /// fields without passing invented numeric snapshots through the reducer.
+    /// A live feed may disappear and return during the same monitor session.
+    pub fn set_recovery_feed_state(
+        &mut self,
+        without_feed: Option<(String, String)>,
+        controls_available: bool,
+    ) -> bool {
+        if !self.recovery_monitor { return false; }
+        let controls_available = controls_available && without_feed.is_none();
+        let changed = self.recovery_without_feed != without_feed
+            || self.task_controls_available != controls_available;
+        if changed {
+            if without_feed.is_some() { self.conflict = None; }
+            self.recovery_without_feed = without_feed;
+            self.task_controls_available = controls_available;
+            self.updated_at = Instant::now();
+        }
+        changed
     }
 
     #[must_use]
@@ -995,7 +1026,9 @@ impl FileTaskProgressState {
         if self.recovery_monitor && matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
             return FileTaskUserAction::Minimize;
         }
-        if self.recovery_monitor && key.code == KeyCode::Char('u') {
+        if self.recovery_monitor && key.code == KeyCode::Char('u')
+            && self.task_controls_available
+        {
             return FileTaskUserAction::Abort; // host opens Stop-and-undo confirmation
         }
         if self.conflict.is_some() {
@@ -1256,11 +1289,26 @@ impl FileTaskProgressState {
         self.render_source_row(frame, area, 1);
         self.render_destination_row(frame, area, 2);
         self.render_empty_row(frame, area, 3);
-        self.render_current_item_row(frame, area, 4);
-        self.render_current_progress_row(frame, area, 5);
-        self.render_total_summary_row(frame, area, 6);
-        self.render_total_progress_row(frame, area, 7);
-        self.render_transfer_stats_row(frame, area, 8);
+        if let Some((checkpoint, last_status)) = &self.recovery_without_feed {
+            self.render_bordered_text(frame, area, 4, "  No live progress feed from this worker",
+                self.theme.progress_text);
+            self.render_bordered_text(frame, area, 5,
+                "  Bytes, percent, rate and elapsed time are unavailable",
+                self.theme.progress_text_dim);
+            self.render_bordered_text(frame, area, 6,
+                &format!("  {checkpoint}"), self.theme.progress_text);
+            self.render_bordered_text(frame, area, 7,
+                &format!("  {last_status}"), self.theme.progress_text_dim);
+            self.render_bordered_text(frame, area, 8,
+                "  Worker commands unavailable: no verified progress/control feed",
+                self.theme.progress_text_dim);
+        } else {
+            self.render_current_item_row(frame, area, 4);
+            self.render_current_progress_row(frame, area, 5);
+            self.render_total_summary_row(frame, area, 6);
+            self.render_total_progress_row(frame, area, 7);
+            self.render_transfer_stats_row(frame, area, 8);
+        }
 
         let mut row = 9;
         if !self.queued_jobs.is_empty() {
@@ -1753,6 +1801,12 @@ impl FileTaskProgressState {
 
         let wide = area_width >= 78;
         if self.recovery_monitor {
+            if !self.task_controls_available {
+                return vec![(
+                    if wide { " Esc Back ".into() } else { "Esc Back".into() },
+                    ProgressHitAction::Minimize, self.theme.progress_button,
+                )];
+            }
             let paused = matches!(self.phase, FileTaskPhase::Paused);
             return vec![
                 (if wide { " Esc Back ".into() } else { "Esc Back".into() },
@@ -2242,6 +2296,7 @@ mod tests {
         let mut progress = super::FileTaskProgressState::new(super::FileTaskKind::Copy,
             "Reconnected collision", crate::theme::FilePickerTheme::default());
         progress.set_recovery_monitor();
+        progress.set_recovery_feed_state(None, true);
         let prompt = super::ConflictPromptState::new(11, "Existing file", "Choose",
             super::ConflictItemKind::File);
         progress.apply_update(super::FileTaskProgressUpdate::ShowConflict { conflict: prompt });
@@ -2277,6 +2332,7 @@ mod tests {
             crate::theme::FilePickerTheme::default(),
         );
         progress.set_recovery_monitor();
+        progress.set_recovery_feed_state(None, true);
         progress.apply_update(super::FileTaskProgressUpdate::ShowConflict {
             conflict: super::ConflictPromptState::new(
                 41, "Existing track", "Choose a resolution", super::ConflictItemKind::File,
@@ -3333,4 +3389,39 @@ mod tests {
         );
     }
 
+
+    #[test]
+    fn no_feed_monitor_never_fabricates_progress_or_offers_dead_controls() {
+        let mut state = FileTaskProgressState::new(FileTaskKind::Move,
+            "Detached move", FilePickerTheme::default());
+        state.set_recovery_monitor();
+        state.set_recovery_feed_state(Some(("Journal: 1/3 roots completed".into(),
+            "Last journal status: resumed".into())), false);
+        assert!(!state.task_controls_available());
+        let buttons = state.progress_buttons(100);
+        assert!(buttons.iter().any(|(label, action, _)|
+            label.contains("Back") && *action == ProgressHitAction::Minimize));
+        assert!(!buttons.iter().any(|(label, _, _)|
+            label.contains("Pause") || label.contains("Skip") || label.contains("Stop")));
+        assert_eq!(state.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE)),
+            FileTaskUserAction::None);
+        assert_eq!(state.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            FileTaskUserAction::Minimize);
+        let area = ratatui::layout::Rect::new(0, 0, 100, 30);
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| state.render(frame, area)).unwrap();
+        let text = (0..30).map(|y| buffer_row(terminal.backend().buffer(), y, 100))
+            .collect::<Vec<_>>().join("\n");
+        assert!(text.contains("No live progress feed"));
+        assert!(text.contains("1/3 roots completed"));
+        assert!(text.contains("Last journal status: resumed"));
+        assert!(!text.contains("0 items"));
+        assert!(!text.contains("0 B/s"));
+        assert!(state.set_recovery_feed_state(None, true));
+        assert!(state.task_controls_available());
+        assert!(state.recovery_without_feed.is_none());
+        assert!(state.set_recovery_feed_state(Some(("No feed".into(),
+            "Journal status".into())), false));
+        assert!(!state.task_controls_available());
+    }
 }

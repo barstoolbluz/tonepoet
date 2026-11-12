@@ -5638,3 +5638,106 @@ have not looked into.
 My reading covers `window_actions` and `classify_recovery_surface`. The
 accounts of the stale process ID, the stale progress time and the zero count
 are inference from what the screen showed and what was on disk.
+
+---
+
+## 82. Live-progress directories outlive their jobs
+
+Filed 2026-11-12, after #81 merged.
+
+Each copy or move started since #81 creates
+`.live-<job>-<generation>/` beside its journal in
+`file-operation-journal/v2`, holding `progress.json` and the job's command
+mailbox. Nothing removes it. On 2026-11-12 the move `aa3bc66c…` had completed
+(its journal ends with a `completed` checkpoint, and no worker was running), and
+`.live-aa3bc66c-6e18-44fc-89d5-aabe841ca692-1/progress.json` was still
+there. The worker discards stale command files when it starts, but no code
+path removes the directory or the snapshot.
+
+It is TonePoet's own storage, not a destination, so the standing rule is not
+broken. It does leave one directory per job, indefinitely. `progress.json` was
+mode 0644, while the directory and the journals are 0700 and 0600.
+
+**What we want.** A job's live-progress state is gone once nothing can read
+it: after the job completes, is set aside, or is otherwise resolved. A
+directory left by a worker that died is cleaned up too.
+
+---
+
+## 83. The progress monitor shows zeros and inert controls when a worker has no progress feed
+
+Filed 2026-11-12, after #81 merged.
+
+Watch progress on a running job whose worker publishes no live progress
+opened "Move (reconnected)" with "Total 0 items · 0 B", empty bars at 0%, a
+rate of `--/s`, and an elapsed time counting from when the monitor opened. It
+offered `p Pause`, `s Skip` and `u Stop and undo`. The case seen was the
+blu-ray move from #81. Its worker had been started by a build from before #81,
+so it never created a live-progress directory.
+
+Those figures are not measurements. They are what an absent snapshot renders
+as. The controls cannot work. As far as I can tell, `request_control` fails
+with "worker control channel unavailable" when the directory does not exist,
+and Force stop needs the worker identity from the same snapshot, so it is
+refused as well. A running worker the TUI cannot talk to therefore cannot be
+stopped from the UI at all.
+
+New workers create the directory, so this mostly affects workers from older
+builds. It may also apply to a worker whose snapshot is missing, unreadable or
+from another generation. I have not tried those.
+
+**What we want.** When there is no progress feed, the monitor says so instead
+of showing zeros. It offers only controls that can reach the worker, and says
+why the others are unavailable. Whatever the journal does record about the
+job's progress is shown, if that is enough to be useful.
+
+My reading of `request_control` and the force-stop path is from source, not
+from pressing the buttons.
+
+---
+
+## 84. The image viewer silently shows a different image when a file is too large, and the limits are too low
+
+Filed 2026-11-12.
+
+In `~/library/abb/The Allman Brothers Band - At Fillmore East (1971) [FLAC]
+{MFSL}/artwork`, every image opened in the full viewer, and every image
+reached by stepping left or right, showed the same picture. The folder holds
+ten distinct PNG booklet scans, 20–47 MB each, nine of them 6540×2940 and one
+13410×2940.
+
+The decode limits in `browse_artwork.rs` are 24 MiB encoded
+(`MAX_ENCODED_IMAGE_BYTES`), 12,000 px per edge (`MAX_IMAGE_DIMENSION`) and
+96 MiB of decode allocation (`MAX_DECODE_ALLOC`). Only
+`booklet_pages_1_&_2.png`, at 20.1 MB, is within them. Every other file fails,
+and the decode-failure path marks it failed and calls `cycle(true)`, which
+moves to the next image that has not failed. Every route therefore ends at the
+one decodable file. The error is kept but shown only when nothing at all can
+be displayed. The Info pane's artwork goes through the same decode.
+
+**Silent substitution.** Opening or stepping to an image that cannot be shown
+displays a different file under the user's request, with no indication.
+
+**Limits.** We need to view images of up to 100 MB. Archival scans of this
+size are normal in the library. A 6540×2940 RGB image needs about 58 MB
+decoded, which is within the allocation cap; the encoded-size cap is what
+rejects it. A 100 MB PNG can decode to several hundred MB, for example
+12000×9000 RGBA at about 430 MB, before it is reduced. The viewer then reduces
+every image to at most 1600 px on its long edge (`MAX_PREVIEW_EDGE`), which is
+small on a large display.
+
+**On the wire.** The source file never crosses the terminal. `ratatui-image`
+1.0.5 sends the reduced image to Kitty-protocol terminals as uncompressed
+RGB (`f=24`), base64-encoded, and resends it whenever the image is rebuilt:
+on resizes, menu dismissals and image changes. A 1600×719 image is about
+4.6 MB per transmission. The protocol also accepts zlib-compressed (`o=z`) and
+PNG (`f=100`) payloads, which matters over SSH. That version uses neither.
+
+**What we want.** A file the viewer cannot show is named as such, with the
+reason, and never replaced by another image without saying so. Images up to
+100 MB open in the viewer and the Info pane without unbounded memory use. The
+viewer uses the space the terminal gives it. Over a remote connection, what is
+sent to the terminal costs no more than it needs to.
+
+The account of the limits and the failure path is from source and fits what
+was seen. I have not stepped through it in a debugger.

@@ -6127,6 +6127,8 @@ mod inline_edit_behavior_tests {
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
         app.browse_artwork.open_file_popup(image);
+        app.browse_artwork.set_desired_area(Rect::new(10, 6, 55, 24),
+            super::super::browse_artwork::ImageVerticalPlacement::Center);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !app.browse_artwork.has_image() && std::time::Instant::now() < deadline {
             app.browse_artwork.prepare(&mut app.image_picker, 0, 0,
@@ -6134,10 +6136,6 @@ mod inline_edit_behavior_tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(app.browse_artwork.has_image());
-        app.browse_artwork.set_desired_area(Rect::new(10, 6, 55, 24),
-            super::super::browse_artwork::ImageVerticalPlacement::Center);
-        assert!(app.browse_artwork.prepare(&mut app.image_picker, 0, 0,
-            &app.browse.artwork_config), "full-size image protocol must be prepared");
         app.browse_artwork.popup_rect = Rect::new(10, 6, 55, 24);
         let selected = app.browse.selected_index;
         for (x, y) in [(20, 12), (21, 12), (28, 18)] {
@@ -6174,6 +6172,9 @@ mod inline_edit_behavior_tests {
         app.current_screen = AppScreen::Browse;
         app.image_picker.protocol_type = ProtocolType::Sixel;
         app.browse_artwork.open_file_popup(image);
+        let viewport = Rect::new(10, 6, 55, 24);
+        app.browse_artwork.set_desired_area(viewport,
+            super::super::browse_artwork::ImageVerticalPlacement::Center);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !app.browse_artwork.has_image() && std::time::Instant::now() < deadline {
             app.browse_artwork.prepare(&mut app.image_picker, 0, 0,
@@ -6181,11 +6182,6 @@ mod inline_edit_behavior_tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(app.browse_artwork.has_image());
-        let viewport = Rect::new(10, 6, 55, 24);
-        app.browse_artwork.set_desired_area(viewport,
-            super::super::browse_artwork::ImageVerticalPlacement::Center);
-        assert!(app.browse_artwork.prepare(&mut app.image_picker, 0, 0,
-            &app.browse.artwork_config), "native image protocol must be prepared");
         let mut terminal = Terminal::new(TestBackend::new(100, 45)).unwrap();
         // Render a real native-image frame between interactions. Clear models
         // the menu's overwriting of pixels away from the image-origin cell.
@@ -21936,6 +21932,15 @@ pub(super) fn handle_file_task_user_action(
             app.set_status("Recovery monitor lost its worker identity");
             return true;
         };
+        if !session.progress.task_controls_available()
+            && !matches!(action,
+                tui_file_picker::FileTaskUserAction::None
+                    | tui_file_picker::FileTaskUserAction::Minimize
+                    | tui_file_picker::FileTaskUserAction::Acknowledge)
+        {
+            app.set_status("This worker has no verified progress/control feed; only Back is available");
+            return true;
+        }
         let control = match action {
             tui_file_picker::FileTaskUserAction::None => return true,
             tui_file_picker::FileTaskUserAction::Minimize
@@ -62757,6 +62762,7 @@ mod file_task_supervisor_tests {
             tui_file_picker::FilePickerTheme::default(),
         );
         viewer.set_recovery_monitor();
+        viewer.set_recovery_feed_state(None, true);
         viewer.apply_update(tui_file_picker::FileTaskProgressUpdate::ShowConflict {
             conflict: first.clone(),
         });

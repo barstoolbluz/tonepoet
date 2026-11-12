@@ -750,10 +750,12 @@ impl FileTaskJournalHandle {
                 .map_err(|e| format!("sync terminal journal directory {}: {e}", parent.display()))?;
         }
         let family = LeaseFamily::JournalOperation { job_id };
+        let journal_path = self.path.clone();
         drop(self);
         if let Some(descriptor) = descriptor {
             crate::concurrency::retire_descriptor_after_lifecycle_release(&descriptor, &family)?;
         }
+        super::file_task_live::retire_job_live_directories(&journal_path, &record.job_id);
         Ok(true)
     }
 
@@ -1776,6 +1778,7 @@ fn classify_recovery_surface(
 /// UI can explain why no automatic action is currently offered.
 pub fn recovery_surface_records() -> Vec<RecoverySurfaceRecord> {
     cleanup_setup_orphan_journal_descriptors();
+    super::file_task_live::collect_orphan_live_directories();
     cleanup_discarded_recovery_records();
     let root = file_task_journal_dir();
     let Ok(entries) = fs::read_dir(&root) else {
@@ -1907,6 +1910,7 @@ pub fn set_aside_unreadable_recovery(path: &Path) -> Result<PathBuf, String> {
         let _ = fs::rename(&destination, path);
         return Err(format!("release saved path reservations: {error}"));
     }
+    super::file_task_live::retire_job_live_directories(path, &id.to_string());
     Ok(destination)
 }
 
@@ -2027,6 +2031,9 @@ fn finish_discarded_recovery_retirement(
             }
         }
     }
+    // Discard has completed and its durable reservation was retired. This
+    // also cleans an earlier worker that died before its first snapshot.
+    super::file_task_live::retire_job_live_directories(path, &record.job_id);
     match fs::remove_file(path) {
         Ok(()) => {
             if let Some(parent) = path.parent() {
