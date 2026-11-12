@@ -12,6 +12,7 @@ pub mod bookmarks_overlay;
 pub mod bookmark_workers;
 pub mod browse;
 pub mod browse_artwork;
+mod kitty_transport;
 mod info_artwork_cache;
 pub mod terminal_image_geometry;
 pub mod button_map;

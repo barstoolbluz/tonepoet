@@ -5,9 +5,9 @@
 //! motion is debounced; superseded results are discarded by context/source
 //! identity, so large or remote albums cannot spawn unbounded worker threads.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fs;
-use std::io::{Cursor, Read};
+use std::io::{BufReader, Cursor, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
@@ -26,10 +26,11 @@ use super::info_artwork_cache::{InfoPreviewCache, Preview, SourceStamp, PREVIEW_
 const SELECTION_SETTLE: Duration = Duration::from_millis(130);
 const MAX_DIRECTORY_ENTRIES: usize = 32_768;
 const MAX_FOLDER_IMAGES: usize = 128;
-const MAX_ENCODED_IMAGE_BYTES: u64 = 24 * 1024 * 1024;
-const MAX_IMAGE_DIMENSION: u32 = 12_000;
-const MAX_DECODE_ALLOC: u64 = 96 * 1024 * 1024;
-const MAX_PREVIEW_EDGE: u32 = 1_600;
+// Input byte admission and decoded memory admission are separate. A compressed
+// 100 MiB archive scan may expand to hundreds of MiB before resampling.
+const MAX_ENCODED_IMAGE_BYTES: u64 = 100 * 1024 * 1024;
+const MAX_IMAGE_DIMENSION: u32 = 32_768;
+const MAX_DECODE_ALLOC: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArtworkContext {
@@ -70,7 +71,7 @@ impl ArtworkContext {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ArtworkSource {
     // One cycling entry per album, regardless of the number of audio tracks.
     // Sharing the list avoids copying it when a decode worker is launched.
@@ -127,7 +128,10 @@ pub struct BrowseArtworkState {
     // Net key/click navigation while the worker-owned sibling scan is pending.
     // Apply once, modulo the final ordered list, without extra decode jobs.
     queued_gallery_offset: i64,
-    failed: HashSet<usize>,
+    // Key failures by source, never by a cursor index that changes when an
+    // asynchronous gallery scan finishes. A failed explicit file stays chosen.
+    failed: HashMap<ArtworkSource, String>,
+    viewer_decode_bounds: Option<(u32, u32)>,
     decode_rx: Option<Receiver<DecodeResult>>,
     decoded_source: Option<ArtworkSource>,
     decoded_embedded_path: Option<PathBuf>,
@@ -145,6 +149,7 @@ pub struct BrowseArtworkState {
     retransmit_generation: usize,
     font_size: (u16, u16),
     prepared_protocol_has_fixed_origin: bool,
+    kitty_upload_transport: bool,
     // An inline single-click cycles; a subsequent double-click must open the
     // image that was under the first click, not the next image.
     inline_click_source: Option<ArtworkSource>,
@@ -177,13 +182,13 @@ impl Default for BrowseArtworkState {
         Self {
             context: None, generation: 0, scan_generation: 0, decode_generation: 0, changed_at: Instant::now(), scanned: None,
             scan_rx: None, sources: Vec::new(), cursor: 0,
-            queued_gallery_offset: 0, failed: HashSet::new(),
+            queued_gallery_offset: 0, failed: HashMap::new(), viewer_decode_bounds: None,
             decode_rx: None, decoded_source: None, decoded_embedded_path: None, decoded: None,
             preview_cache: None, memory_only_preview_cache: false,
             protocol: None, desired_area: Rect::default(),
             vertical_placement: ImageVerticalPlacement::Center, protocol_area: Rect::default(),
             protocol_generation: 0, retransmit_generation: 0, font_size: (8, 12),
-            prepared_protocol_has_fixed_origin: false,
+            prepared_protocol_has_fixed_origin: false, kitty_upload_transport: false,
             inline_click_source: None, warning: None, popup_open: false, popup_rect: Rect::default(),
             needs_background_restore: false, background_restore_count: 0,
             native_placement_awaiting_render: false, post_native_repaint_redraw: false,
@@ -232,6 +237,7 @@ impl BrowseArtworkState {
         self.native_placement_awaiting_render = false;
         self.post_native_repaint_redraw = false;
         self.failed.clear();
+        self.viewer_decode_bounds = None;
         self.decoded_source = None;
         self.decoded_embedded_path = None;
         self.decoded = None;
@@ -353,6 +359,8 @@ impl BrowseArtworkState {
     /// generation-obsolete; it may finish, but cannot populate the viewer.
     pub fn open_info_popup(&mut self) {
         self.popup_open = true;
+        self.desired_area = Rect::default(); // wait for popup geometry before decoding
+        self.viewer_decode_bounds = None;
         if matches!(self.context, Some(ArtworkContext::Album { .. })) {
             self.generation = self.generation.wrapping_add(1);
             self.decoded = None;
@@ -393,7 +401,9 @@ impl BrowseArtworkState {
             allow_upscale, ImageVerticalPlacement::Center);
         (rect.width > 0 && rect.height > 0).then_some(rect)
     }
-    pub fn has_candidate(&self) -> bool { self.failed.len() < self.sources.len() }
+    pub fn has_candidate(&self) -> bool {
+        self.sources.iter().any(|source| !self.failed.contains_key(source))
+    }
     pub fn count(&self) -> usize { self.sources.len() }
     pub fn index(&self) -> usize { self.cursor }
     pub fn current_label(&self) -> Option<String> {
@@ -408,12 +418,20 @@ impl BrowseArtworkState {
     pub fn message(&self) -> &str {
         if self.context.is_none() { return ""; }
         if self.decoded.is_some() { return ""; }
+        // A selected failure takes priority over discovery status: the
+        // sibling scan can still be in flight after the requested file fails.
+        if self.popup_open {
+            if let Some(message) = self.sources.get(self.cursor)
+                .and_then(|source| self.failed.get(source)) {
+                return message;
+            }
+        }
         if self.scanned.is_none() || (self.scan_rx.is_some() && self.sources.is_empty()) {
             return if matches!(&self.context, Some(ArtworkContext::SingleFile(_))) {
                 "Loading image…"
             } else { "Finding artwork…" };
         }
-        if self.decode_rx.is_some() || !self.sources.is_empty() && self.failed.len() < self.sources.len() {
+        if self.decode_rx.is_some() || self.has_candidate() {
             return "Loading artwork…";
         }
         if matches!(&self.context, Some(ArtworkContext::Album { .. })) { return ""; }
@@ -436,7 +454,10 @@ impl BrowseArtworkState {
         for step in 1..len {
             let next = if forward { (self.cursor + step) % len }
                 else { (self.cursor + len - (step % len)) % len };
-            if !self.failed.contains(&next) {
+            // Album Info silently tries the next usable source if an empty
+            // embedded picture tag was found. A deliberate viewer navigation
+            // never skips a broken/oversized file: show its own error instead.
+            if self.popup_open || !self.failed.contains_key(&self.sources[next]) {
                 self.needs_background_restore |= self.decoded.is_some() || self.protocol.is_some();
                 self.cursor = next;
                 self.generation = self.generation.wrapping_add(1);
@@ -462,6 +483,7 @@ impl BrowseArtworkState {
         self.native_image_restore_count = 0;
         self.native_placement_awaiting_render = false;
         self.post_native_repaint_redraw = false;
+        self.viewer_decode_bounds = None;
         self.protocol = None; // rebuild for the pane on the next prepare pass
         self.protocol_area = Rect::default();
         if !was_file_view && matches!(self.context, Some(ArtworkContext::Album { .. })) {
@@ -513,14 +535,35 @@ impl BrowseArtworkState {
             });
             changed = true;
         }
+        let font_size = picker.font_size;
+        self.font_size = font_size;
+        let bounds = (
+            u32::from(self.desired_area.width).saturating_mul(u32::from(font_size.0.max(1))),
+            u32::from(self.desired_area.height).saturating_mul(u32::from(font_size.1.max(1))),
+        );
+        // The popup is measured on its first draw. Do not decode at an
+        // arbitrary 1600-pixel fallback then immediately decode again.
+        if self.popup_open && self.decoded.is_some()
+            && self.viewer_decode_bounds.is_some()
+            && self.viewer_decode_bounds != Some(bounds)
+        {
+            self.needs_background_restore = true;
+            self.generation = self.generation.wrapping_add(1);
+            self.decoded = None;
+            self.decoded_source = None;
+            self.decoded_embedded_path = None;
+            self.invalidate_protocol();
+        }
         if self.decode_rx.is_none() && self.decoded.is_none()
-            && !self.sources.is_empty() && self.failed.len() < self.sources.len()
+            && (!self.popup_open || (bounds.0 > 0 && bounds.1 > 0))
+            && self.sources.get(self.cursor).is_some_and(|s| !self.failed.contains_key(s))
         {
             if let Some(source) = self.sources.get(self.cursor).cloned() {
                 let (tx, rx) = mpsc::channel();
                 self.decode_rx = Some(rx);
                 let generation = self.generation;
                 self.decode_generation = generation;
+                self.viewer_decode_bounds = self.popup_open.then_some(bounds);
                 // Eligibility is decided by the Info consumer, not by the
                 // source's File/Embedded variant. View never receives a cache.
                 let info_request = !self.popup_open
@@ -545,15 +588,20 @@ impl BrowseArtworkState {
                                 })
                             }
                         }
-                        _ => decode_source(&source), // full-size viewer: original path
+                        _ => decode_source_with_bounds(&source, bounds.0, bounds.1),
+                        // The viewer decodes only the pixels that can appear
+                        // inside the actual terminal's current viewport.
                     };
                     let _ = tx.send(DecodeResult { generation, source, image, cache_epoch });
                 });
                 changed = true;
             }
         }
-        let font_size = picker.font_size;
-        self.font_size = font_size;
+        // `o=z` is part of the Kitty graphics specification. Terminals with
+        // incomplete implementations can explicitly retain the native upload.
+        self.kitty_upload_transport =
+            picker.protocol_type == ratatui_image::picker::ProtocolType::Kitty
+            && !matches!(std::env::var("TONEPOET_KITTY_ZLIB").as_deref(), Ok("0"));
         self.prepared_protocol_has_fixed_origin =
             picker.protocol_type != ratatui_image::picker::ProtocolType::Halfblocks
             && picker.protocol_type != ratatui_image::picker::ProtocolType::Kitty;
@@ -607,7 +655,9 @@ impl BrowseArtworkState {
                         self.cursor = selected.as_ref().and_then(|source|
                             self.sources.iter().position(|candidate| candidate == source))
                             .unwrap_or(0);
-                        self.failed.clear();
+                        // Discovery can reorder the cursor. Keep earlier
+                        // source-bound decode failures for retained images.
+                        self.failed.retain(|source, _| self.sources.contains(source));
                         // Don't throw away the selected file's pending/decoded
                         // pixels when sibling discovery completes.
                         if !direct_file || self.decoded_source.as_ref() != self.sources.get(self.cursor) {
@@ -672,9 +722,7 @@ impl BrowseArtworkState {
                                 self.protocol = None;
                             }
                             Err(error) => {
-                                self.failed.insert(self.cursor);
-                                self.warning = Some(error);
-                                self.cycle(true);
+                                self.record_decode_failure(&result.source, error);
                             }
                         }
                         changed = true;
@@ -683,15 +731,30 @@ impl BrowseArtworkState {
                 Err(TryRecvError::Empty) => self.decode_rx = Some(rx),
                 Err(TryRecvError::Disconnected) => {
                     if self.decode_generation == self.generation {
-                        self.failed.insert(self.cursor);
-                        self.cycle(true);
-                        self.warning = Some("Artwork decode worker failed".into());
+                        if let Some(source) = self.sources.get(self.cursor).cloned() {
+                            self.record_decode_failure(&source,
+                                "Artwork decode worker failed".into());
+                        }
                         changed = true;
                     }
                 }
             }
         }
         changed
+    }
+
+    fn record_decode_failure(&mut self, source: &ArtworkSource, error: String) {
+        self.decoded = None;
+        self.decoded_source = None;
+        self.decoded_embedded_path = None;
+        self.invalidate_protocol();
+        self.failed.insert(source.clone(), format!("Cannot display {}: {error}", source.label()));
+        if !self.popup_open {
+            // Info pane discovery has always preferred embedded art but
+            // permitted missing/invalid embedded tags to fall back to files.
+            // Keep that behavior; explicit popup navigation never substitutes.
+            self.cycle(true);
+        }
     }
 
     /// The renderer merely records the geometry and paints prepared protocol
@@ -711,6 +774,16 @@ impl BrowseArtworkState {
         let widget = ratatui_image::StatefulImage::new(Some(image::Rgb([r, g, b])));
         f.render_stateful_widget(widget, target,
             self.protocol.as_mut().expect("checked"));
+        // ratatui-image 1.0.5 places its first Kitty upload and Unicode
+        // placeholders in the image-origin cell. Transform that one-shot APC
+        // without changing its ID, placement, cache, or subsequent redraws.
+        // Failed/non-beneficial compression leaves the original bytes intact.
+        if self.kitty_upload_transport {
+            let cell = f.buffer_mut().get_mut(target.x, target.y);
+            if let Some(compressed) = super::kitty_transport::compress_kitty_upload(cell.symbol()) {
+                cell.set_symbol(&compressed);
+            }
+        }
         // The pinned image crate's other native types are Sixel and iTerm2;
         // unlike Kitty they have no fresh image ID to change the image-origin
         // cell after an otherwise byte-identical retransmission.
@@ -977,16 +1050,23 @@ fn scan_image_siblings(context: ArtworkContext, selected: &Path) -> ScanResult {
     }
 }
 
+#[cfg(test)]
 fn decode_source(source: &ArtworkSource) -> Result<DecodedArtwork, String> {
-    decode_source_with_edge(source, MAX_PREVIEW_EDGE)
+    decode_source_with_edge(source, MAX_IMAGE_DIMENSION)
 }
 
 fn decode_source_with_edge(source: &ArtworkSource, edge: u32) -> Result<DecodedArtwork, String> {
+    decode_source_with_bounds(source, edge, edge)
+}
+
+fn decode_source_with_bounds(source: &ArtworkSource, width: u32, height: u32)
+    -> Result<DecodedArtwork, String>
+{
     match source {
         ArtworkSource::File(path) => {
-            // Only direct image-name links are eligible. A link replaced with
-            // a missing target or directory between scanning and decoding
-            // must fail without traversing anything else.
+            // Check both before and after opening; the source may change while
+            // the nonrecursive scan is running. Never buffer a second 100 MiB
+            // copy of a regular image file solely for format detection.
             if !is_supported_image(path) { return Err("Unsupported artwork filename".into()); }
             let metadata = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
             if !(metadata.is_file() || (metadata.file_type().is_symlink()
@@ -998,26 +1078,23 @@ fn decode_source_with_edge(source: &ArtworkSource, edge: u32) -> Result<DecodedA
             let opened = file.metadata().map_err(|e| e.to_string())?;
             if !opened.is_file() { return Err("Artwork source is not a regular file".into()); }
             if opened.len() > MAX_ENCODED_IMAGE_BYTES {
-                return Err("Artwork image exceeds 24 MiB limit".into());
+                return Err("Artwork exceeds 100 MiB encoded-size limit".into());
             }
-            let mut bytes = Vec::new();
-            file.take(MAX_ENCODED_IMAGE_BYTES + 1).read_to_end(&mut bytes)
-                .map_err(|e| e.to_string())?;
-            Ok(DecodedArtwork { image: Arc::new(decode_image_bytes_with_edge(bytes, edge)?),
-                embedded_path: None, preview_stamps: None, preview_cache_hit: false })
+            Ok(DecodedArtwork {
+                image: Arc::new(decode_image_reader(BufReader::new(file), width, height)?),
+                embedded_path: None, preview_stamps: None, preview_cache_hit: false,
+            })
         }
         ArtworkSource::Embedded(paths) => {
-            // The worker tries candidates in order and stops on the first
-            // image that really decodes, not merely the first picture tag.
-            // Missing, unreadable, and corrupt pictures all permit fallback.
+            // An absent embedded picture is not a failing gallery file: scan
+            // the next album source instead. The same safety limits apply to
+            // each extracted embedded image.
             let mut last_error = None;
             for path in paths.iter() {
-                // Do not read audio symlinks even if they were replaced after
-                // discovery. Image-file symlinks are handled separately above.
                 if !fs::symlink_metadata(path).is_ok_and(|md| md.is_file()) { continue; }
                 let bytes = super::probe::read_embedded_picture_bytes(path, PictureType::CoverFront)
                     .or_else(|_| super::probe::read_embedded_picture_bytes(path, PictureType::Other));
-                match bytes.and_then(|data| decode_image_bytes_with_edge(data, edge)) {
+                match bytes.and_then(|data| decode_image_bytes_with_bounds(data, width, height)) {
                     Ok(image) => return Ok(DecodedArtwork {
                         image: Arc::new(image), embedded_path: Some(path.clone()),
                         preview_stamps: None, preview_cache_hit: false,
@@ -1030,9 +1107,19 @@ fn decode_source_with_edge(source: &ArtworkSource, edge: u32) -> Result<DecodedA
     }
 }
 
-fn decode_image_bytes_with_edge(bytes: Vec<u8>, edge: u32) -> Result<DynamicImage, String> {
-    if bytes.len() as u64 > MAX_ENCODED_IMAGE_BYTES { return Err("Artwork exceeds 24 MiB limit".into()); }
-    let mut reader = ImageReader::new(Cursor::new(bytes))
+fn decode_image_bytes_with_bounds(bytes: Vec<u8>, width: u32, height: u32)
+    -> Result<DynamicImage, String>
+{
+    if bytes.len() as u64 > MAX_ENCODED_IMAGE_BYTES {
+        return Err("Artwork exceeds 100 MiB encoded-size limit".into());
+    }
+    decode_image_reader(Cursor::new(bytes), width, height)
+}
+
+fn decode_image_reader<R: std::io::BufRead + Seek>(reader: R, width: u32, height: u32)
+    -> Result<DynamicImage, String>
+{
+    let mut reader = ImageReader::new(reader)
         .with_guessed_format().map_err(|e| e.to_string())?;
     let mut limits = Limits::default();
     limits.max_alloc = Some(MAX_DECODE_ALLOC);
@@ -1040,11 +1127,9 @@ fn decode_image_bytes_with_edge(bytes: Vec<u8>, edge: u32) -> Result<DynamicImag
     limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
     reader.limits(limits);
     let image = reader.decode().map_err(|e| e.to_string())?;
-    if image.width() > edge || image.height() > edge {
-        Ok(image.resize(edge, edge, if edge == MAX_PREVIEW_EDGE {
-            // Preserve the pre-cache viewer's exact resizing policy.
-            image::imageops::FilterType::Triangle
-        } else { image::imageops::FilterType::Lanczos3 }))
+    let (width, height) = (width.max(1), height.max(1));
+    if image.width() > width || image.height() > height {
+        Ok(image.resize(width, height, image::imageops::FilterType::Triangle))
     } else { Ok(image) }
 }
 
@@ -1915,6 +2000,7 @@ mod tests {
         }));
         let album_generation = state.generation;
         state.open_file_popup(image_path.clone());
+        state.set_desired_area(Rect::new(0, 0, 70, 25), ImageVerticalPlacement::Center);
         assert!(state.is_single_file_popup());
         assert!(state.generation > album_generation);
         assert!(state.scanned.is_none(), "sibling listing is deferred to a worker");
@@ -1994,6 +2080,7 @@ mod tests {
         assert_eq!(state.decoded.as_ref().map(|image| image.width()), Some(PREVIEW_EDGE));
         assert!(state.preview_cache.is_some());
         state.open_info_popup();
+        state.set_desired_area(Rect::new(0, 0, 170, 80), ImageVerticalPlacement::Center);
         assert!(state.decoded.is_none(), "viewer must not reuse a cached preview");
         load(&mut state);
         assert_eq!(state.decoded.as_ref().map(|image| image.width()), Some(1300));
@@ -2160,6 +2247,7 @@ mod tests {
             .save(temp.path().join("artwork").join("hidden.png")).unwrap();
         let mut state = BrowseArtworkState::default();
         state.open_file_popup(cover.clone());
+        state.set_desired_area(Rect::new(0, 0, 70, 25), ImageVerticalPlacement::Center);
         assert_eq!(state.count(), 1, "the explicit file is available before a scan");
         let mut picker = Picker::new((12, 24));
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -2227,6 +2315,191 @@ mod tests {
         assert!(decode_source(&state.sources[0]).is_err());
     }
 
+
+    #[test]
+    fn failed_explicit_view_keeps_filename_and_gallery_position() {
+        let mut state = BrowseArtworkState::default();
+        let first = ArtworkSource::File(PathBuf::from("/images/large.png"));
+        let second = ArtworkSource::File(PathBuf::from("/images/small.png"));
+        state.open_file_popup(PathBuf::from("/images/large.png"));
+        let generation = state.generation;
+        let (tx, rx) = mpsc::channel();
+        state.decode_rx = Some(rx);
+        tx.send(DecodeResult { generation, source: first.clone(),
+            image: Err("decoded-memory budget exceeded".into()), cache_epoch: None }).unwrap();
+        assert!(state.poll_workers());
+        assert_eq!(state.current_label().as_deref(), Some("large.png"));
+        assert!(state.message().contains("large.png"));
+        assert!(state.message().contains("decoded-memory budget exceeded"));
+        assert!(!state.has_image());
+        // A delayed sibling scan may change the cursor index but must not
+        // discard the failure or silently present the successful sibling.
+        let (scan_tx, scan_rx) = mpsc::channel();
+        state.scan_rx = Some(scan_rx);
+        scan_tx.send(ScanResult { context: ArtworkContext::SingleFile(
+            PathBuf::from("/images/large.png")), sources: vec![second.clone(), first.clone()],
+            warning: None, generation }).unwrap();
+        assert!(state.poll_workers());
+        assert_eq!(state.current_label().as_deref(), Some("large.png"));
+        assert!(state.message().contains("large.png"));
+        assert!(state.cycle(false));
+        assert_eq!(state.current_label().as_deref(), Some("small.png"));
+        assert!(state.cycle(true));
+        assert_eq!(state.current_label().as_deref(), Some("large.png"));
+        assert!(state.message().contains("large.png"));
+    }
+
+    #[test]
+    fn info_skips_missing_embedded_art_and_keeps_usable_folder_cover() {
+        let mut state = BrowseArtworkState::default();
+        let embedded = ArtworkSource::Embedded(Arc::from([
+            PathBuf::from("/music/album/no-cover.flac")
+        ]));
+        let cover = ArtworkSource::File(PathBuf::from("/music/album/cover.png"));
+        state.context = Some(ArtworkContext::Album {
+            directory: PathBuf::from("/music/album"), selected_audio: None,
+        });
+        state.scanned = state.context.clone();
+        state.sources = vec![embedded.clone(), cover.clone()];
+        state.record_decode_failure(&embedded, "No usable embedded artwork in album".into());
+        assert_eq!(state.cursor, 1);
+        assert_eq!(state.sources[state.cursor], cover);
+        assert!(!state.popup_open);
+        assert_eq!(state.message(), "Loading artwork…");
+    }
+
+    #[test]
+    fn viewer_accepts_over_24_mib_up_to_100_mib_and_rejects_oversize() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("scan.png");
+        let handle = fs::File::create(&file).unwrap();
+        handle.set_len(25 * 1024 * 1024).unwrap();
+        let error = decode_source_with_bounds(&ArtworkSource::File(file.clone()), 800, 600)
+            .err().expect("an empty sparse file has no valid image format");
+        assert!(!error.contains("encoded-size limit"), "25 MiB passes byte admission");
+        handle.set_len(MAX_ENCODED_IMAGE_BYTES + 1).unwrap();
+        let error = decode_source_with_bounds(&ArtworkSource::File(file), 800, 600)
+            .err().expect("oversized file is rejected");
+        assert!(error.contains("100 MiB"));
+    }
+
+    #[test]
+    fn decode_binds_large_original_to_requested_viewport() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("page.png");
+        DynamicImage::new_rgb8(2000, 1000).save(&path).unwrap();
+        let result = decode_source_with_bounds(&ArtworkSource::File(path), 1200, 720).unwrap();
+        assert_eq!((result.image.width(), result.image.height()), (1200, 600));
+    }
+
+
+    #[test]
+    fn failed_viewer_wraps_filename_and_reason_on_eighty_and_forty_columns() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        for columns in [80_u16, 40_u16] {
+            let mut app = super::super::app::AppState::new_for_test(
+                crate::config::TonepoetConfig::default());
+            let file = PathBuf::from("/images/scan_100mb.png");
+            let source = ArtworkSource::File(file.clone());
+            app.browse_artwork.open_file_popup(file);
+            app.browse_artwork.record_decode_failure(&source,
+                "Source encoded-size limit exceeded after reading image headers; \
+                 maximum supported image is 100 MiB; please choose a smaller scan".into());
+            let theme = app.theme;
+            let mut terminal = Terminal::new(TestBackend::new(columns, 24)).unwrap();
+            terminal.draw(|frame| draw_popup(frame, &mut app, theme)).unwrap();
+            let status = app.browse_artwork.popup_rect;
+            assert!(status.height > 1 && status.width <= columns,
+                "failure needs a bounded multiline area at {columns} columns");
+            let buffer = terminal.backend().buffer();
+            let display = (0..24_u16).map(|y| (0..columns)
+                .map(|x| buffer.get(x, y).symbol().to_owned())
+                .collect::<Vec<_>>().join("")).collect::<Vec<_>>().join("\n");
+            assert!(display.contains("scan_100mb.png"), "filename hidden at {columns} columns");
+            assert!(display.contains("100 MiB"), "size-limit explanation hidden at {columns} columns");
+            assert!(display.contains("Cannot display"), "failure marker hidden at {columns} columns");
+        }
+    }
+
+    #[test]
+    fn kitty_image_upload_is_compressed_once_and_not_resent_on_redraw() {
+        use ratatui::{backend::TestBackend, Terminal};
+        use ratatui_image::picker::ProtocolType;
+
+        let mut state = BrowseArtworkState::default();
+        // A synthetic archival scan with nearby pixels correlated enough to
+        // benefit from zlib, but larger than a thumbnail.
+        let image = image::RgbImage::from_fn(1024, 768, |x, y| {
+            image::Rgb([((x / 8) % 256) as u8, ((y / 8) % 256) as u8,
+                (((x / 16) + (y / 16)) % 256) as u8])
+        });
+        state.decoded = Some(Arc::new(DynamicImage::ImageRgb8(image)));
+        let viewport = Rect::new(2, 2, 70, 25);
+        state.set_desired_area(viewport, ImageVerticalPlacement::Center);
+        let mut picker = Picker::new((8, 12));
+        picker.protocol_type = ProtocolType::Kitty;
+        let config = BrowseArtworkConfig::default();
+        assert!(state.prepare(&mut picker, 0, 0, &config));
+        let mut terminal = Terminal::new(TestBackend::new(80, 32)).unwrap();
+        let draw = |frame: &mut ratatui::Frame, artwork: &mut BrowseArtworkState| {
+            assert!(artwork.render_image(frame, viewport, config.allow_upscale,
+                ImageVerticalPlacement::Center, Color::Rgb(26, 27, 38)));
+        };
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let first_origin = terminal.backend().buffer()
+            .get(state.protocol_area.x, state.protocol_area.y).symbol().to_owned();
+        assert!(first_origin.contains("\x1b_G"), "first frame must transmit Kitty image");
+        assert!(first_origin.contains("o=z"), "Kitty upload should use zlib");
+        // Compare actual transmitted bytes against the original uncompressed
+        // payload at the *fitted* size, not the larger source image dimensions.
+        let header = first_origin.split("\x1b_G").nth(1).unwrap()
+            .split(';').next().unwrap();
+        let header_number = |key: &str| -> usize {
+            header.split(',').find_map(|field| field.split_once('=')
+                .filter(|(name, _)| *name == key)
+                .and_then(|(_, value)| value.parse::<usize>().ok())).unwrap()
+        };
+        let channels = if header_number("f") == 32 { 4 } else { 3 };
+        let raw_bytes = header_number("s") * header_number("v") * channels;
+        let uncompressed_wire_bytes = raw_bytes.div_ceil(3) * 4;
+        eprintln!("Kitty actual upload {} bytes vs {} uncompressed Base64 bytes",
+            first_origin.len(), uncompressed_wire_bytes);
+        assert!(first_origin.len() < uncompressed_wire_bytes / 2,
+            "representative scan should save at least half of its RGB upload");
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let second_origin = terminal.backend().buffer()
+            .get(state.protocol_area.x, state.protocol_area.y).symbol().to_owned();
+        assert!(!second_origin.contains("\x1b_G"), "ordinary redraw cannot retransmit RGB");
+        assert!(first_origin.ends_with(&second_origin),
+            "compression must not change cached Kitty placeholders");
+    }
+
+    #[test]
+    fn valid_png_above_former_24_mib_limit_decodes_to_viewport() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("archival_scan.png");
+        // Deterministic high-entropy pixels, so the *actual valid PNG* is
+        // larger than 24 MiB, rather than a sparse invalid image or metadata
+        // padding masquerading as a high-resolution scan.
+        let pixels = image::RgbImage::from_fn(3072, 3072, |x, y| {
+            let mut n = ((x as u64) << 32) | y as u64;
+            n ^= n >> 33;
+            n = n.wrapping_mul(0xff51afd7ed558ccd);
+            n ^= n >> 33;
+            n = n.wrapping_mul(0xc4ceb9fe1a85ec53);
+            n ^= n >> 33;
+            image::Rgb([n as u8, (n >> 8) as u8, (n >> 16) as u8])
+        });
+        pixels.save(&path).unwrap();
+        let encoded_size = fs::metadata(&path).unwrap().len();
+        assert!(encoded_size > 24 * 1024 * 1024,
+            "PNG must exceed old limit, but was {encoded_size} bytes");
+        assert!(encoded_size < MAX_ENCODED_IMAGE_BYTES);
+        let decoded = decode_source_with_bounds(&ArtworkSource::File(path), 800, 600).unwrap();
+        assert_eq!((decoded.image.width(), decoded.image.height()), (600, 600));
+    }
+
 }
 
 /// Maximum image viewport, always bounded by the terminal (including narrow
@@ -2240,13 +2513,33 @@ pub fn popup_rect(terminal: Rect, percent: u8) -> Rect {
               terminal.y.saturating_add((terminal.height - height) / 2), width, height)
 }
 
+/// Failure text is kept separate from the one-line loading indicator.
+/// The error gets a bounded, centered text area that can wrap on narrow TTYs.
+fn popup_status_area(viewport: Rect, status: &str, failed: bool) -> Rect {
+    let longest = status.lines().map(super::display_width::width).max().unwrap_or(1);
+    let width = if failed { viewport.width } else {
+        longest.min(viewport.width as usize).max(1) as u16
+    };
+    let height = if failed {
+        let columns = usize::from(width.max(1));
+        // Word wrapping can use more rows than character-count / columns:
+        // leave a couple of rows for word boundaries, within the viewport.
+        status.lines().map(|line| {
+            super::display_width::width(line).max(1).div_ceil(columns)
+        }).sum::<usize>().saturating_add(2)
+            .min(viewport.height as usize).max(1) as u16
+    } else { 1 };
+    Rect::new(viewport.x + (viewport.width - width) / 2,
+              viewport.y + (viewport.height - height) / 2, width, height)
+}
+
 /// A centered modal image view, rendered after the ordinary screen. The
 /// configurable height controls the maximum image size, not a blank panel.
 /// The same image protocol cache is used for inline and popup views.
 pub fn draw_popup(f: &mut ratatui::Frame, app: &mut super::app::AppState,
                   theme: super::theme::Theme) {
-    use ratatui::widgets::{Block, Clear, Paragraph};
-    use ratatui::style::Style;
+    use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
+    use ratatui::{layout::Alignment, style::Style};
 
     let terminal = f.size();
     if terminal.width < 8 || terminal.height < 5 {
@@ -2254,18 +2547,16 @@ pub fn draw_popup(f: &mut ratatui::Frame, app: &mut super::app::AppState,
         return;
     }
     let viewport = popup_rect(terminal, app.browse.artwork_config.popup_height_percent);
-    let message_width = {
-        let message = app.browse_artwork.message();
-        let message = if message.is_empty() { "Loading image…" } else { message };
-        super::display_width::width(message)
-    };
+    let failure = app.browse_artwork.sources.get(app.browse_artwork.cursor)
+        .is_some_and(|source| app.browse_artwork.failed.contains_key(source));
+    let message = app.browse_artwork.message();
+    let message = if message.is_empty() { "Loading image…" } else { message };
+    // A line break makes the reason easy to find when the selected filename
+    // spans multiple columns, and keeps the existing message() API unchanged.
+    let status = if failure { message.replacen(": ", ":\n", 1) } else { message.to_owned() };
     let rect = app.browse_artwork.popup_image_area(viewport,
         app.browse.artwork_config.allow_upscale).unwrap_or_else(|| {
-            // While loading or on failure, show just a centered status line;
-            // don't reserve a large empty canvas for a missing image.
-            let width = message_width.min(viewport.width as usize).max(1) as u16;
-            Rect::new(viewport.x + (viewport.width - width) / 2,
-                viewport.y + (viewport.height - 1) / 2, width, 1)
+            popup_status_area(viewport, &status, failure)
         });
     app.browse_artwork.popup_rect = rect;
     f.render_widget(Clear, rect);
@@ -2277,8 +2568,8 @@ pub fn draw_popup(f: &mut ratatui::Frame, app: &mut super::app::AppState,
         app.browse.artwork_config.allow_upscale, ImageVerticalPlacement::Center,
         theme.bg);
     if !displayed {
-        let message = app.browse_artwork.message();
-        let message = if message.is_empty() { "Loading image…" } else { message };
-        f.render_widget(Paragraph::new(message).style(theme.muted()), rect);
+        f.render_widget(Paragraph::new(status).style(theme.muted())
+            .alignment(Alignment::Center).wrap(Wrap { trim: false }), rect);
     }
+
 }

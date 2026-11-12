@@ -21936,6 +21936,15 @@ pub(super) fn handle_file_task_user_action(
             app.set_status("Recovery monitor lost its worker identity");
             return true;
         };
+        if !session.progress.task_controls_available()
+            && !matches!(action,
+                tui_file_picker::FileTaskUserAction::None
+                    | tui_file_picker::FileTaskUserAction::Minimize
+                    | tui_file_picker::FileTaskUserAction::Acknowledge)
+        {
+            app.set_status("This worker has no verified progress/control feed; only Back is available");
+            return true;
+        }
         let control = match action {
             tui_file_picker::FileTaskUserAction::None => return true,
             tui_file_picker::FileTaskUserAction::Minimize
@@ -62757,6 +62766,7 @@ mod file_task_supervisor_tests {
             tui_file_picker::FilePickerTheme::default(),
         );
         viewer.set_recovery_monitor();
+        viewer.set_recovery_feed_state(None, true);
         viewer.apply_update(tui_file_picker::FileTaskProgressUpdate::ShowConflict {
             conflict: first.clone(),
         });

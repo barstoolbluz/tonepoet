@@ -153,6 +153,11 @@ impl RecoveryEntry {
         self.availability == RecoverySurfaceAvailability::Live
     }
 
+    fn has_observed_control(&self) -> bool {
+        self.is_live() && self.live_snapshot.as_ref()
+            .is_some_and(|snapshot| snapshot.worker.appears_active())
+    }
+
     fn is_unreadable(&self) -> bool {
         self.availability == RecoverySurfaceAvailability::Unreadable
     }
@@ -266,10 +271,12 @@ impl RecoveryEntry {
             return "record unreadable";
         }
         if self.is_live() {
-            if self.live_snapshot.as_ref().is_some_and(|s| matches!(s.phase, tui_file_picker::FileTaskPhase::Paused)) {
+            if self.has_observed_control() && self.live_snapshot.as_ref()
+                .is_some_and(|s| matches!(s.phase, tui_file_picker::FileTaskPhase::Paused)) {
                 return "paused";
             }
-            return if self.is_stalled() { "running · stalled" } else { "running" };
+            return if !self.has_observed_control() { "running · no feed" }
+                else if self.is_stalled() { "running · stalled" } else { "running" };
         }
         if self.resume_committed {
             return if self.approved_resume_queue_id.is_some() { "resume queued" }
@@ -720,10 +727,23 @@ pub fn refresh_live_observation(app: &mut AppState) -> bool {
             entry.live_snapshot = next.clone();
             changed = true;
         }
-        if identity == remote { monitor_snapshot = next; }
+        if identity == remote && entry.has_observed_control() { monitor_snapshot = next; }
         // The UI must repaint a stalled-age label as wall time advances even
         // when the producer has not emitted a new snapshot.
         if entry.is_stalled() { changed = true; }
+    }
+    // A missing/corrupt/pre-#81 feed is NOT a 0-byte transfer. Journal
+    // checkpoints are independent of that feed and remain useful.
+    if let Some(entry) = app.recovery_ui.entries.iter().find(|entry| {
+        entry.is_live() && entry.worker_ref() == remote
+    }) {
+        let checkpoint = (!entry.has_observed_control()).then(|| journal_checkpoint(entry));
+        let controls = entry.has_observed_control();
+        if let ActiveOverlay::FileTaskProgress(session) = &mut app.active_overlay {
+            if session.is_recovery_monitor() {
+                changed |= session.progress.set_recovery_feed_state(checkpoint, controls);
+            }
+        }
     }
     if let Some(snapshot) = monitor_snapshot {
         if let ActiveOverlay::FileTaskProgress(session) = &mut app.active_overlay {
@@ -748,7 +768,7 @@ pub fn refresh_live_observation(app: &mut AppState) -> bool {
     // Same-request metadata updates are delivered through the existing reducer.
     if let Some(snapshot) = app.recovery_ui.entries.iter()
         .filter(|entry| entry.is_live() && entry.worker_ref() == remote)
-        .find_map(|entry| entry.live_snapshot.as_ref())
+        .find_map(|entry| entry.live_snapshot.as_ref().filter(|_| entry.has_observed_control()))
     {
         if let ActiveOverlay::FileTaskProgress(session) = &mut app.active_overlay {
             let current = session.progress.conflict.as_ref().map(|c| c.request_id);
@@ -830,7 +850,7 @@ pub fn return_from_progress_watch(app: &mut AppState) {
 
 pub fn open_stop_confirm_from_progress_watch(app: &mut AppState, remote: &LiveWorkerRef) {
     if let Some(index) = app.recovery_ui.entries.iter().position(|entry| {
-        entry.worker_ref().as_ref() == Some(remote) && entry.is_live()
+        entry.worker_ref().as_ref() == Some(remote) && entry.has_observed_control()
     }) {
         app.recovery_ui.selected = index;
         app.recovery_ui.surface = RecoverySurface::StopConfirm;
@@ -840,6 +860,29 @@ pub fn open_stop_confirm_from_progress_watch(app: &mut AppState, remote: &LiveWo
         app.set_status("This transfer changed since it was opened; review its current Recovery state");
     }
     app.active_overlay = ActiveOverlay::FileRecovery;
+}
+
+/// Only durable journal root outcomes are shown without a live feed. Multiple
+/// checkpoints for the same root must not count as multiple completed files.
+fn journal_checkpoint(entry: &RecoveryEntry) -> (String, String) {
+    let Some(record) = entry.record.as_ref() else {
+        return ("Journal checkpoint unreadable".into(),
+            "Open Recovery details for the recorded error".into());
+    };
+    let mut last_roots = BTreeMap::new();
+    for root in &record.roots {
+        last_roots.insert((root.source.clone(), root.destination.clone()), root.disposition);
+    }
+    let completed = last_roots.values().filter(|state| state.is_completed()).count();
+    let skipped = last_roots.values().filter(|state|
+        **state == tui_file_picker::FileTaskRootDisposition::Skipped).count();
+    let failed = last_roots.values().filter(|state|
+        **state == tui_file_picker::FileTaskRootDisposition::Failed).count();
+    let total = record.mappings.len();
+    (
+        format!("Journal: {completed}/{total} roots completed · {skipped} skipped · {failed} failed"),
+        format!("Last journal status: {}", record.last_status.as_deref().unwrap_or("not recorded")),
+    )
 }
 
 fn watch_selected_progress(app: &mut AppState) {
@@ -861,7 +904,7 @@ fn watch_selected_progress(app: &mut AppState) {
     scope.source_root = record.mappings.first().map(|m| m.source.clone());
     scope.destination = record.admitted_destination_root.clone();
     progress.set_scope(scope);
-    if let Some(snapshot) = entry.live_snapshot.as_ref() {
+    if let Some(snapshot) = entry.live_snapshot.as_ref().filter(|_| entry.has_observed_control()) {
         progress.apply_update(tui_file_picker::FileTaskProgressUpdate::Snapshot {
             phase: snapshot.phase.clone(), status: snapshot.status.clone(),
             current_item: snapshot.current_item.clone(), totals: snapshot.totals,
@@ -870,23 +913,25 @@ fn watch_selected_progress(app: &mut AppState) {
         if let Some(conflict) = snapshot.conflict.clone() {
             progress.apply_update(tui_file_picker::FileTaskProgressUpdate::ShowConflict { conflict });
         }
-    } else {
-        progress.apply_update(tui_file_picker::FileTaskProgressUpdate::Snapshot {
-            phase: tui_file_picker::FileTaskPhase::Preparing,
-            status: "Waiting for independent worker progress; press Esc to return to Recovery".into(),
-            current_item: None, totals: tui_file_picker::ProgressTotals::default(), rate_bytes_per_sec: None,
-        });
     }
-    app.active_overlay = ActiveOverlay::FileTaskProgress(
-        super::app::FileTaskProgressSession::recovery_monitor(progress, remote));
+    let checkpoint = entry.live_snapshot.is_none().then(|| journal_checkpoint(entry));
+    let controls = entry.has_observed_control();
+    let mut session = super::app::FileTaskProgressSession::recovery_monitor(progress, remote);
+    session.progress.set_recovery_feed_state(checkpoint, controls);
+    app.active_overlay = ActiveOverlay::FileTaskProgress(session);
 }
 
 fn request_running_control(app: &mut AppState, control: super::app::FileTaskControl) {
-    let Some(remote) = app.recovery_ui.selected_entry().filter(|entry| entry.is_live())
+    let Some(remote) = app.recovery_ui.selected_entry().filter(|entry| entry.has_observed_control())
         .and_then(RecoveryEntry::worker_ref) else {
-        app.set_status("Worker is not live or its identity is unavailable");
+        app.set_status("Worker has no verified progress/control feed; this command is unavailable");
         return;
     };
+    if !super::file_task_live::read_snapshot(&remote)
+        .is_some_and(|snapshot| snapshot.worker.appears_active()) {
+        app.set_status("The worker feed disappeared; this command was not sent");
+        return;
+    }
     match super::file_task_live::request_control(&remote, control) {
         Ok(()) => app.set_status("Request sent; watch worker progress for acknowledgment"),
         Err(error) => app.set_status(format!("Cannot send worker control: {error}")),
@@ -904,11 +949,18 @@ fn activate_safety_confirmation(app: &mut AppState, tx: &mpsc::Sender<AppMessage
     match app.recovery_ui.surface {
         RecoverySurface::StopConfirm => {
             let entry = app.recovery_ui.selected_entry();
-            let Some((path, remote)) = entry.filter(|e| e.is_live()).and_then(|e| Some((e.journal_path.clone(), e.worker_ref()?))) else {
+            let Some((path, remote)) = entry.filter(|e| e.has_observed_control())
+                .and_then(|e| Some((e.journal_path.clone(), e.worker_ref()?))) else {
                 app.recovery_ui.open_window();
                 app.set_status("Worker no longer live; recheck Recovery before stopping");
                 return;
             };
+            if !super::file_task_live::read_snapshot(&remote)
+                .is_some_and(|snapshot| snapshot.worker.appears_active()) {
+                app.recovery_ui.open_window();
+                app.set_status("The worker feed disappeared; Stop was not sent");
+                return;
+            }
             match super::file_task_live::request_control(&remote, super::app::FileTaskControl::Abort) {
                 Ok(()) => {
                     app.recovery_ui.stop_and_undo_pending.insert(path.clone());
@@ -1433,12 +1485,14 @@ fn window_actions(entry: &RecoveryEntry) -> Vec<WindowAction> {
     }
     if entry.is_live() {
         let mut actions = vec![WindowAction::Watch];
-        if entry.live_snapshot.as_ref().is_some_and(|s| matches!(s.phase, tui_file_picker::FileTaskPhase::Paused)) {
-            actions.push(WindowAction::ResumeRunning);
-        } else {
-            actions.push(WindowAction::Pause);
+        if entry.has_observed_control() {
+            if entry.live_snapshot.as_ref().is_some_and(|s| matches!(s.phase, tui_file_picker::FileTaskPhase::Paused)) {
+                actions.push(WindowAction::ResumeRunning);
+            } else {
+                actions.push(WindowAction::Pause);
+            }
+            actions.push(WindowAction::StopAndUndo);
         }
-        actions.push(WindowAction::StopAndUndo);
         if entry.worker_pid().is_some() && (entry.is_stalled()
             || entry.stop_requested_unix_ms.is_some_and(|ms| unix_ms_now().saturating_sub(ms) >= 10_000)) {
             actions.push(WindowAction::ForceStop);
@@ -4335,7 +4389,7 @@ mod tests {
         let remote = LiveWorkerRef::new(journal_path.clone(), job_id.clone(), 1)
             .expect("valid generation-bound identity");
         let (controls, received) = std::sync::mpsc::channel();
-        let (_publisher, _worker_guard) = crate::tui::file_task_live::start_worker(
+        let (publisher, _worker_guard) = crate::tui::file_task_live::start_worker(
             remote.clone(), controls,
         ).expect("start isolated private command listener");
 
@@ -4355,6 +4409,20 @@ mod tests {
             conflict: Some(ConflictPromptState::new(71, "Existing file", "Choose",
                 ConflictItemKind::File)),
         });
+        // This is a connected #81 worker, not a legacy worker without a
+        // progress feed. Establish the on-disk feed before confirming Stop.
+        publisher.publish(&FileTaskProgressUpdate::Snapshot {
+            phase: tui_file_picker::FileTaskPhase::Paused,
+            status: "Waiting for a destination conflict decision".into(),
+            current_item: None, totals: tui_file_picker::ProgressTotals::default(),
+            rate_bytes_per_sec: None,
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        while crate::tui::file_task_live::read_snapshot(&remote).is_none()
+            && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(crate::tui::file_task_live::read_snapshot(&remote).is_some());
         let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
         app.recovery_ui.entries.push(entry);
         let (tx, _rx) = mpsc::channel::<AppMessage>(8);
@@ -4365,6 +4433,7 @@ mod tests {
                 ConflictItemKind::File),
         });
         let mut session = FileTaskProgressSession::recovery_monitor(progress, remote);
+        session.progress.set_recovery_feed_state(None, true);
         let abort = FileTaskUserAction::ChooseConflictResolution(ConflictResolution::Abort);
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
 
@@ -4467,5 +4536,24 @@ mod tests {
         state.details_scroll = 99;
         scroll_auxiliary(&mut state, 3);
         assert_eq!(state.details_scroll, 0);
+    }
+
+    #[test]
+    fn live_legacy_worker_without_feed_has_journal_checkpoint_but_no_dead_controls() {
+        let mut entry = test_entry("legacy", "dest/legacy", true, None);
+        entry.availability = RecoverySurfaceAvailability::Live;
+        entry.live_snapshot = None;
+        assert_eq!(entry.state_label(), "running · no feed");
+        let actions = window_actions(&entry);
+        assert!(actions.contains(&WindowAction::Watch));
+        assert!(actions.contains(&WindowAction::Details));
+        assert!(actions.contains(&WindowAction::LeaveRunning));
+        for invalid in [WindowAction::Pause, WindowAction::ResumeRunning,
+            WindowAction::StopAndUndo, WindowAction::ForceStop] {
+            assert!(!actions.contains(&invalid), "no-feed command must not be offered");
+        }
+        let (checkpoint, status) = journal_checkpoint(&entry);
+        assert!(checkpoint.starts_with("Journal:"));
+        assert!(status.starts_with("Last journal status:"));
     }
 }

@@ -110,7 +110,7 @@ fn publish_snapshot(identity: &LiveWorkerRef, snapshot: &LiveWorkerSnapshot) -> 
     let name = format!(".progress-{}.tmp", uuid::Uuid::new_v4());
     let temp = dir.join(name);
     let result = (|| {
-        let mut file = OpenOptions::new().write(true).create_new(true).open(&temp)
+        let mut file = create_private_file(&temp)
             .map_err(|error| format!("create progress snapshot: {error}"))?;
         let bytes = serde_json::to_vec(snapshot)
             .map_err(|error| format!("serialize progress: {error}"))?;
@@ -165,10 +165,23 @@ fn unix_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
 
+// Create private on disk, not world-readable for an instant before chmod.
+fn create_private_file(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)] {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
 #[cfg(unix)]
 fn private_dir(path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    match fs::create_dir(path) {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
+    match builder.create(path) {
         Ok(()) => {},
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {},
         Err(error) => return Err(format!("create live worker directory: {error}")),
@@ -207,7 +220,7 @@ pub fn start_worker(
     let alive = Arc::new(AtomicBool::new(true));
     let control_alive = Arc::clone(&alive);
     let control_identity = identity.clone();
-    let _ = std::thread::Builder::new()
+    let control_thread = std::thread::Builder::new()
         .name("file-task-detached-controls".into())
         .spawn(move || {
             while control_alive.load(Ordering::Acquire) {
@@ -224,12 +237,15 @@ pub fn start_worker(
     let (sender, receiver) = mpsc::sync_channel::<FileTaskProgressUpdate>(2);
     let conflict = Arc::new(Mutex::new(None::<ConflictPromptState>));
     let published_conflict = Arc::clone(&conflict);
-    std::thread::Builder::new()
+    let progress_alive = Arc::clone(&alive);
+    let publisher_identity = identity.clone();
+    let publisher = std::thread::Builder::new()
         .name("file-task-detached-progress".into())
         .spawn(move || {
             let worker = OwnerProcessIdentity::current();
             let mut previous = None::<LiveWorkerSnapshot>;
             loop {
+                if !progress_alive.load(Ordering::Acquire) { break; }
                 // Always retain the latest byte snapshot, even when a later
                 // control event occupies the queue. Conflict transitions are
                 // independently protected by the shared state below.
@@ -277,7 +293,7 @@ pub fn start_worker(
                 };
                 let snapshot = LiveWorkerSnapshot {
                     schema: SNAPSHOT_SCHEMA,
-                    job_id: identity.job_id.clone(), generation: identity.generation,
+                    job_id: publisher_identity.job_id.clone(), generation: publisher_identity.generation,
                     worker, observed_unix_ms: now, forward_unix_ms,
                     phase, status, current_item, totals, rate_bytes_per_sec, conflict,
                 };
@@ -287,17 +303,129 @@ pub fn start_worker(
                         || old.conflict != snapshot.conflict)
                     || previous.as_ref().is_some_and(|old|
                         now.saturating_sub(old.observed_unix_ms) >= 2_000);
-                if must_publish { let _ = publish_snapshot(&identity, &snapshot); }
+                if must_publish { let _ = publish_snapshot(&publisher_identity, &snapshot); }
                 previous = Some(snapshot);
             }
-        })
-        .map_err(|e| format!("start worker progress publisher: {e}"))?;
-    Ok((LiveProgressSender { sender, conflict }, LiveWorkerGuard { alive }))
+        });
+    let publisher = match publisher {
+        Ok(handle) => handle,
+        Err(error) => {
+            alive.store(false, Ordering::Release);
+            let _ = control_thread.join();
+            let _ = retire_live_directory(&identity);
+            return Err(format!("start worker progress publisher: {error}"));
+        }
+    };
+    Ok((LiveProgressSender { sender, conflict }, LiveWorkerGuard {
+        alive, identity, control_thread: Some(control_thread), publisher: Some(publisher),
+    }))
 }
 
-pub struct LiveWorkerGuard { alive: Arc<AtomicBool> }
+/// The helper owns the lifecycle. A UI may detach, but once the helper has
+/// finished no thread may publish/read its private state before it is removed.
+pub struct LiveWorkerGuard {
+    alive: Arc<AtomicBool>,
+    identity: LiveWorkerRef,
+    control_thread: Option<std::thread::JoinHandle<()>>,
+    publisher: Option<std::thread::JoinHandle<()>>,
+}
 impl Drop for LiveWorkerGuard {
-    fn drop(&mut self) { self.alive.store(false, Ordering::Release); }
+    fn drop(&mut self) {
+        self.alive.store(false, Ordering::Release);
+        if let Some(handle) = self.control_thread.take() { let _ = handle.join(); }
+        if let Some(handle) = self.publisher.take() { let _ = handle.join(); }
+        if let Err(error) = retire_live_directory(&self.identity) {
+            log::debug!("retire live file-task state {}: {error}", self.identity.dir().display());
+        }
+    }
+}
+
+fn retire_live_directory(identity: &LiveWorkerRef) -> Result<(), String> {
+    let dir = identity.dir();
+    match fs::symlink_metadata(&dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("stat live worker directory: {error}")),
+        Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() =>
+            return Err("live worker state is not a directory".into()),
+        Ok(_) => {}
+    }
+    fs::remove_dir_all(&dir).map_err(|error| format!("remove live worker state: {error}"))
+}
+
+/// Remove only this job's generation-qualified observation directories. Call
+/// after its durable lease has been released; unrelated jobs are untouched.
+pub fn retire_job_live_directories(journal_path: &Path, job_id: &str) {
+    let Ok(job) = uuid::Uuid::parse_str(job_id) else { return };
+    if journal_path.parent() != Some(super::file_task_runtime::file_task_journal_dir().as_path()) {
+        return;
+    }
+    let root = super::file_task_runtime::file_task_journal_dir();
+    let Ok(entries) = fs::read_dir(root) else { return };
+    for entry in entries.filter_map(Result::ok) {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
+        let Some((entry_job, generation)) = parse_live_directory_name(&name) else { continue };
+        if entry_job != job { continue; }
+        if let Ok(identity) = LiveWorkerRef::new(journal_path.to_path_buf(), job_id.into(), generation) {
+            // Terminal retirement can occur a moment before the worker's
+            // detached publisher guard exits. That guard removes its own
+            // directory; do not race it while it is still alive.
+            if read_snapshot(&identity).is_some_and(|s| s.worker.appears_active()) {
+                continue;
+            }
+            if let Err(error) = retire_live_directory(&identity) {
+                log::debug!("retire job observation {}: {error}", entry.path().display());
+            }
+        }
+    }
+}
+
+fn parse_live_directory_name(name: &str) -> Option<(uuid::Uuid, u64)> {
+    let rest = name.strip_prefix(".live-")?;
+    // UUID is canonical 36 characters, and generation is an unsigned integer.
+    let (job, suffix) = rest.split_at_checked(36)?;
+    let generation = suffix.strip_prefix('-')?.parse::<u64>().ok()?;
+    (generation != 0).then_some((uuid::Uuid::parse_str(job).ok()?, generation))
+}
+
+/// Startup Recovery sweep for observations abandoned by a crashed helper.
+/// Never delete while a durable descriptor admits a live holder. If the
+/// journal disappeared, require a recorded, demonstrably dead worker; an
+/// unknown identity is not enough to touch possible active observation.
+pub fn collect_orphan_live_directories() {
+    use crate::concurrency::{ClaimAvailability, LeaseFamily};
+    let root = super::file_task_runtime::file_task_journal_dir();
+    let Ok(entries) = fs::read_dir(&root) else { return };
+    for entry in entries.filter_map(Result::ok) {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
+        let Some((job, generation)) = parse_live_directory_name(&name) else { continue };
+        let job_id = job.to_string();
+        let journal_path = root.join(format!("{job_id}.jsonl"));
+        let Ok(identity) = LiveWorkerRef::new(journal_path.clone(), job_id, generation) else { continue };
+        let family = LeaseFamily::JournalOperation { job_id: job };
+        let record = super::file_task_runtime::load_record(&journal_path).ok();
+        let descriptor = record.as_ref().and_then(|r| r.lease_descriptor.clone())
+            .or_else(|| crate::concurrency::find_family_descriptor(&family).ok().flatten());
+        // A live worker can still be running with no snapshot (e.g., startup).
+        let no_live_lease = descriptor.as_deref().and_then(|d|
+            crate::concurrency::descriptor_availability(d).ok())
+            .is_some_and(|(found, available)| found == family
+                && available == ClaimAvailability::RecoveryReserved);
+        let snapshot = read_snapshot(&identity);
+        let producer_still_alive = snapshot.as_ref()
+            .is_some_and(|s| s.worker.appears_active());
+        let can_retire = if producer_still_alive { false }
+            else if no_live_lease {
+                record.as_ref().is_none_or(|r| r.job_id == identity.job_id
+                    && r.generation >= identity.generation)
+            } else if descriptor.is_none() && !journal_path.exists() {
+                snapshot.is_some()
+            } else { false };
+        if can_retire {
+            if let Err(error) = retire_live_directory(&identity) {
+                log::debug!("collect orphan worker observation {}: {error}", identity.dir().display());
+            }
+        }
+    }
 }
 
 fn read_control_paths(dir: &Path) -> Vec<PathBuf> {
@@ -344,7 +472,7 @@ pub fn request_control(identity: &LiveWorkerRef, control: FileTaskControl) -> Re
     let target = dir.join(filename);
     let temporary = dir.join(format!(".control-{}.tmp", uuid::Uuid::new_v4()));
     let result = (|| {
-        let mut file = OpenOptions::new().create_new(true).write(true).open(&temporary)
+        let mut file = create_private_file(&temporary)
             .map_err(|e| format!("create worker command: {e}"))?;
         serde_json::to_writer(&mut file, &cmd)
             .map_err(|e| format!("encode worker command: {e}"))?;
@@ -527,6 +655,92 @@ mod tests {
         sender.publish(&FileTaskProgressUpdate::ClearConflict);
         drop(sender);
         drop(guard);
+        std::env::remove_var("TONEPOET_FILE_OPERATION_JOURNAL_DIR");
+    }
+
+    #[test]
+    fn finishing_worker_retires_private_live_state_after_both_threads_stop() {
+        let _guard = super::super::file_task_runtime::test_environment_lock();
+        let temp = tempfile::tempdir().unwrap();
+        std::env::set_var("TONEPOET_FILE_OPERATION_JOURNAL_DIR", temp.path());
+        let id = uuid::Uuid::new_v4().to_string();
+        let root = super::super::file_task_runtime::file_task_journal_dir();
+        fs::create_dir_all(&root).unwrap();
+        let identity = LiveWorkerRef::new(root.join(format!("{id}.jsonl")), id, 1).unwrap();
+        let (controls, _received) = mpsc::channel();
+        let (progress, worker) = start_worker(identity.clone(), controls).unwrap();
+        progress.publish(&FileTaskProgressUpdate::Snapshot {
+            phase: FileTaskPhase::Running, status: "copying".into(),
+            current_item: None, totals: ProgressTotals::default(), rate_bytes_per_sec: None,
+        });
+        let until = std::time::Instant::now() + Duration::from_secs(4);
+        while read_snapshot(&identity).is_none() && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(identity.snapshot().exists(), "publisher wrote a snapshot");
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(identity.dir()).unwrap().permissions().mode() & 0o777, 0o700);
+            assert_eq!(fs::metadata(identity.snapshot()).unwrap().permissions().mode() & 0o777, 0o600);
+            let private = identity.dir().join("permissions.tmp");
+            create_private_file(&private).unwrap();
+            assert_eq!(fs::metadata(&private).unwrap().permissions().mode() & 0o777, 0o600);
+            fs::remove_file(private).unwrap();
+        }
+        // The sender may still be live when the guard goes away. Shutdown
+        // must terminate the publisher rather than waiting for disconnection.
+        drop(worker);
+        assert!(!identity.dir().exists());
+        drop(progress);
+        std::env::remove_var("TONEPOET_FILE_OPERATION_JOURNAL_DIR");
+    }
+
+    #[test]
+    fn orphan_sweep_preserves_live_identity_and_retires_dead_identity() {
+        let _guard = super::super::file_task_runtime::test_environment_lock();
+        let temp = tempfile::tempdir().unwrap();
+        std::env::set_var("TONEPOET_FILE_OPERATION_JOURNAL_DIR", temp.path());
+        let root = super::super::file_task_runtime::file_task_journal_dir();
+        fs::create_dir_all(&root).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let identity = LiveWorkerRef::new(root.join(format!("{id}.jsonl")), id, 1).unwrap();
+        private_dir(&identity.dir()).unwrap();
+        let mut snapshot = LiveWorkerSnapshot {
+            schema: SNAPSHOT_SCHEMA, job_id: identity.job_id.clone(), generation: 1,
+            worker: OwnerProcessIdentity::current(), observed_unix_ms: unix_ms(),
+            forward_unix_ms: unix_ms(), phase: FileTaskPhase::Running,
+            status: "running".into(), current_item: None, totals: ProgressTotals::default(),
+            rate_bytes_per_sec: None, conflict: None,
+        };
+        publish_snapshot(&identity, &snapshot).unwrap();
+        collect_orphan_live_directories();
+        assert!(identity.dir().exists(), "a live producer still owns this state");
+        snapshot.worker.pid = u64::MAX;
+        publish_snapshot(&identity, &snapshot).unwrap();
+        collect_orphan_live_directories();
+        assert!(!identity.dir().exists(), "strongly dead producer with no journal is collectable");
+        std::env::remove_var("TONEPOET_FILE_OPERATION_JOURNAL_DIR");
+    }
+
+    #[test]
+    fn job_retirement_removes_only_matching_generations() {
+        let _guard = super::super::file_task_runtime::test_environment_lock();
+        let temp = tempfile::tempdir().unwrap();
+        std::env::set_var("TONEPOET_FILE_OPERATION_JOURNAL_DIR", temp.path());
+        let root = super::super::file_task_runtime::file_task_journal_dir();
+        fs::create_dir_all(&root).unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let other = uuid::Uuid::new_v4().to_string();
+        for (job, generation) in [(&id, 1), (&id, 2), (&other, 1)] {
+            let identity = LiveWorkerRef::new(root.join(format!("{job}.jsonl")),
+                job.to_string(), generation).unwrap();
+            private_dir(&identity.dir()).unwrap();
+        }
+        let journal = root.join(format!("{id}.jsonl"));
+        retire_job_live_directories(&journal, &id);
+        assert!(!root.join(format!(".live-{id}-1")).exists());
+        assert!(!root.join(format!(".live-{id}-2")).exists());
+        assert!(root.join(format!(".live-{other}-1")).exists());
         std::env::remove_var("TONEPOET_FILE_OPERATION_JOURNAL_DIR");
     }
 
