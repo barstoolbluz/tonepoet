@@ -28,7 +28,8 @@ fn parameter<'a>(header: &'a str, key: &str) -> Option<&'a str> {
 /// Return a compressed replacement for a first-time Kitty upload, or `None`
 /// to keep the original symbol unchanged. Non-Kitty redraws take the fast path.
 /// The RFC 1950 zlib stream is compressed *before* Base64 encoding; `o=z` is
-/// attached to the first APC only. All subsequent APCs use Kitty's `m` flag.
+/// attached to the first APC only. Continuations retain the opening image ID
+/// and quiet flag alongside Kitty's `m` flag.
 pub(super) fn compress_kitty_upload(symbol: &str) -> Option<String> {
     let start = symbol.find(APC_START)?;
     let first = &symbol[start + APC_START.len()..];
@@ -51,10 +52,28 @@ pub(super) fn compress_kitty_upload(symbol: &str) -> Option<String> {
         let rest = symbol.get(offset..)?.strip_prefix(APC_START)?;
         let separator = rest.find(';')?;
         let header = &rest[..separator];
-        // Following chunks must be simple continuation commands, not another
-        // image, deletion, or placement action mixed into the same buffer cell.
-        if offset != start && header.split(',').any(|param| !param.starts_with("m=")) {
-            return None;
+        // ratatui-image 1.0.5 repeats q=2 and the image ID on *every*
+        // continuation APC, not just m=. Permit those identity/quiet fields
+        // only when they agree with the opening command; never swallow a
+        // separate transmission, placement, or deletion into this stream.
+        if offset != start {
+            let mut seen_m = false;
+            let mut seen_q = false;
+            let mut seen_i = false;
+            for field in header.split(',') {
+                let (key, value) = field.split_once('=')?;
+                match key {
+                    "m" if !seen_m => seen_m = true,
+                    "q" if !seen_q && parameter(first_header, "q") == Some(value) => {
+                        seen_q = true;
+                    }
+                    "i" if !seen_i && parameter(first_header, "i") == Some(value) => {
+                        seen_i = true;
+                    }
+                    _ => return None,
+                }
+            }
+            if !seen_m { return None; }
         }
         let body = &rest[separator + 1..];
         let end = body.find(APC_END)?;
@@ -91,6 +110,18 @@ pub(super) fn compress_kitty_upload(symbol: &str) -> Option<String> {
         if index == 0 {
             output.push_str(&first_parameters);
             output.push_str(",o=z,");
+        } else {
+            // Keep the original transport's quiet and identity metadata on
+            // continuation APCs. Omitting q=2 can elicit one terminal reply
+            // per chunk on a slow SSH link.
+            for key in ["q", "i"] {
+                if let Some(value) = parameter(first_header, key) {
+                    output.push_str(key);
+                    output.push('=');
+                    output.push_str(value);
+                    output.push(',');
+                }
+            }
         }
         let last = index + 1 == chunks.len();
         output.push_str(if last { "m=0;" } else { "m=1;" });
@@ -123,6 +154,49 @@ mod tests {
         }
         symbol.push_str("\u{10eeee}placeholder");
         symbol
+    }
+
+    // This is the continuation-header layout emitted by ratatui-image 1.0.5
+    // transmit_virtual. The simpler fixture above does not exercise it.
+    fn ratatui_105_upload(rgb: &[u8], w: usize, h: usize) -> String {
+        original_kitty_upload(rgb, w, h)
+            .replace("a=T,f=24,", "a=T,q=2,f=24,")
+            .replace("\x1b_Gm=", "\x1b_Gq=2,i=42,m=")
+    }
+
+    #[test]
+    fn ratatui_105_continuations_compress_and_reject_mismatched_identity() {
+        let rgb = vec![91_u8; 320 * 180 * 3];
+        let original = ratatui_105_upload(&rgb, 320, 180);
+        assert!(original.matches("\x1b_Gq=2,i=42,m=").count() > 1);
+        let compressed = compress_kitty_upload(&original).expect("real upload must compress");
+        assert!(compressed.contains("i=42,o=z,m="));
+        assert_eq!(compressed_rgb(&compressed), rgb);
+        assert!(compressed.ends_with("\u{10eeee}placeholder"));
+        // A compressible but nontrivial pattern still needs multiple APCs.
+        // Every compressed continuation must retain quiet/id metadata.
+        let mut seed = 0x123456789abcdef0_u64;
+        let tile = (0..(16 * 1024)).map(|_| {
+            seed ^= seed >> 12;
+            seed ^= seed << 25;
+            seed ^= seed >> 27;
+            (seed.wrapping_mul(0x2545f4914f6cdd1d) >> 56) as u8
+        }).collect::<Vec<_>>();
+        let mut patterned = Vec::with_capacity(512 * 512 * 3);
+        for i in 0..(512 * 512 * 3) { patterned.push(tile[i % tile.len()]); }
+        let original_chunks = ratatui_105_upload(&patterned, 512, 512);
+        let compressed_chunks = compress_kitty_upload(&original_chunks).unwrap();
+        assert!(compressed_chunks.matches("\x1b_G").count() > 1);
+        assert!(compressed_chunks.contains("\x1b_Gq=2,i=42,m="));
+        assert_eq!(compressed_rgb(&compressed_chunks), patterned);
+        // A different image ID or quiet flag in a continuation must fall
+        // back untouched; it is not the same image's payload.
+        assert!(compress_kitty_upload(&original.replacen(
+            "\x1b_Gq=2,i=42,m=", "\x1b_Gq=2,i=43,m=", 1)).is_none());
+        assert!(compress_kitty_upload(&original.replacen(
+            "\x1b_Gq=2,i=42,m=", "\x1b_Gq=1,i=42,m=", 1)).is_none());
+        assert!(compress_kitty_upload(&original.replacen(
+            "\x1b_Gq=2,i=42,m=", "\x1b_Ga=d,q=2,i=42,m=", 1)).is_none());
     }
 
     fn compressed_rgb(symbol: &str) -> Vec<u8> {

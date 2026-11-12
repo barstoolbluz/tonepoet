@@ -139,12 +139,14 @@ pub enum ContextAction {
     ToggleFolderSizeSort,
     BrowseArtworkView,
     BrowseArtworkCloseView,
+    BrowseArtworkExitFullscreen,
     /// View a selected direct image file in Browse's existing artwork popup.
     BrowseImageFileView(PathBuf),
     /// Reserved image-editing entry. No edits or resize UI are implemented yet.
     BrowseImageActions,
     BrowseArtworkToggleEmbeddedPreference,
     BrowseArtworkToggleUpscale,
+    BrowseArtworkToggleOpenFullscreen,
     BrowseArtworkEditPaneHeight,
     BrowseArtworkEditPopupHeight,
     BrowseArtworkEditFilenames,
@@ -3161,7 +3163,9 @@ fn explicit_convert_cue_policy_for_selection(
 /// when the pointer is over album artwork.
 pub fn build_browse_artwork_menu(app: &AppState) -> Vec<ContextMenuEntry> {
     let config = &app.browse.artwork_config;
-    let mut entries = vec![if app.browse_artwork.popup_open {
+    let mut entries = vec![if app.browse_artwork.popup_open && app.browse_artwork.fullscreen {
+        item("Exit full screen", ContextAction::BrowseArtworkExitFullscreen)
+    } else if app.browse_artwork.popup_open {
         item("Close view", ContextAction::BrowseArtworkCloseView)
     } else {
         item_enabled("View", ContextAction::BrowseArtworkView,
@@ -3179,6 +3183,9 @@ pub fn build_browse_artwork_menu(app: &AppState) -> Vec<ContextMenuEntry> {
                 item(&format!("{} Allow image enlargement",
                     if config.allow_upscale { "☑" } else { "☐" }),
                     ContextAction::BrowseArtworkToggleUpscale),
+                item(&format!("{} Open images full screen",
+                    if config.open_fullscreen { "☑" } else { "☐" }),
+                    ContextAction::BrowseArtworkToggleOpenFullscreen),
                 separator(),
                 item(&format!("Info artwork height… ({}%)", config.pane_height_percent),
                     ContextAction::BrowseArtworkEditPaneHeight),
@@ -3222,12 +3229,16 @@ pub fn execute_context_action(
         }
     }
     match action {
-        ContextAction::BrowseArtworkCloseView => {
+        ContextAction::BrowseArtworkCloseView
+        | ContextAction::BrowseArtworkExitFullscreen => {
             app.browse_artwork.close_popup();
         }
         ContextAction::BrowseArtworkView => {
             if app.current_screen == AppScreen::Browse && app.browse_artwork.has_candidate() {
                 app.browse_artwork.open_info_popup();
+                if app.browse.artwork_config.open_fullscreen {
+                    app.browse_artwork.enter_fullscreen();
+                }
             }
         }
         ContextAction::BrowseImageFileView(path) => {
@@ -3236,6 +3247,9 @@ pub fn execute_context_action(
                 && super::browse_artwork::is_supported_image(&path)
             {
                 app.browse_artwork.open_file_popup(path);
+                if app.browse.artwork_config.open_fullscreen {
+                    app.browse_artwork.enter_fullscreen();
+                }
             }
         }
         ContextAction::BrowseImageActions => {
@@ -3251,6 +3265,12 @@ pub fn execute_context_action(
             app.browse.artwork_config.allow_upscale = !app.browse.artwork_config.allow_upscale;
             app.browse_artwork.invalidate_protocol();
             persist_browse_config(app);
+        }
+        ContextAction::BrowseArtworkToggleOpenFullscreen => {
+            app.browse.artwork_config.open_fullscreen = !app.browse.artwork_config.open_fullscreen;
+            persist_browse_config(app);
+            // This is a policy for *new* views, not an implicit mode switch
+            // under a currently open viewer or its context menu.
         }
         ContextAction::BrowseArtworkEditPaneHeight
         | ContextAction::BrowseArtworkEditPopupHeight

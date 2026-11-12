@@ -193,6 +193,10 @@ pub struct BrowseArtworkConfig {
     pub prefer_embedded: bool,
     #[serde(default)]
     pub allow_upscale: bool,
+    /// Open View directly over the whole terminal. Unlike the ordinary
+    /// artwork-view enlargement preference, this mode never scales up.
+    #[serde(default)]
+    pub open_fullscreen: bool,
     #[serde(default = "default_artwork_filenames")]
     pub filenames: Vec<String>,
 }
@@ -213,6 +217,7 @@ impl Default for BrowseArtworkConfig {
             popup_height_percent: default_artwork_popup_height(),
             prefer_embedded: true,
             allow_upscale: false,
+            open_fullscreen: false,
             filenames: default_artwork_filenames(),
         }
     }
@@ -4704,11 +4709,13 @@ mod browse_artwork_config_tests {
         assert_eq!(config.browsing.artwork.popup_height_percent, 60);
         assert!(config.browsing.artwork.prefer_embedded);
         assert!(!config.browsing.artwork.allow_upscale);
+        assert!(!config.browsing.artwork.open_fullscreen);
         config.browsing.artwork.enabled = false;
         config.browsing.artwork.pane_height_percent = 100;
         config.browsing.artwork.popup_height_percent = 80;
         config.browsing.artwork.prefer_embedded = false;
         config.browsing.artwork.allow_upscale = true;
+        config.browsing.artwork.open_fullscreen = true;
         config.browsing.artwork.filenames = vec!["Front.jpg".into(), "folder.png".into()];
         let encoded = toml::to_string(&config).expect("serialize browsing preferences");
         assert!(encoded.contains("[browsing.artwork]"));
@@ -4725,6 +4732,7 @@ mod browse_artwork_config_tests {
         assert!(restored.enabled);
         assert_eq!(restored.pane_height_percent, 40);
         assert!(!restored.prefer_embedded);
+        assert!(!restored.open_fullscreen, "old configurations open the normal viewer");
     }
 
     #[test]

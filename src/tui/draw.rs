@@ -50,8 +50,16 @@ pub fn draw_ui(f: &mut Frame, app: &mut AppState) {
     app.button_map.clear();
 
     // Background fill
-    let bg = Paragraph::new("").style(Style::default().bg(theme.bg));
-    f.render_widget(bg, f.size());
+    if app.current_screen == AppScreen::Browse
+        && app.browse_artwork.popup_open && app.browse_artwork.fullscreen
+    {
+        // In this mode Browse does not paint its panes. Cover the entire
+        // terminal, including letterboxing, so no old text remains visible.
+        f.render_widget(Block::default().style(Style::default().bg(theme.bg)), f.size());
+    } else {
+        let bg = Paragraph::new("").style(Style::default().bg(theme.bg));
+        f.render_widget(bg, f.size());
+    }
 
     match app.current_screen {
         AppScreen::Convert => {
@@ -93,11 +101,27 @@ pub fn draw_ui(f: &mut Frame, app: &mut AppState) {
             draw_settings_screen(f, f.size(), app, theme);
         }
         AppScreen::Browse => {
-            super::draw_browse::draw_browse_screen(f, f.size(), app, theme);
+            // Full-screen artwork is its own terminal surface. Do not paint
+            // Browse's header, panes, or footer underneath the fitted image.
+            if !(app.browse_artwork.popup_open && app.browse_artwork.fullscreen) {
+                super::draw_browse::draw_browse_screen(f, f.size(), app, theme);
+            }
         }
         AppScreen::Library => {
             draw_placeholder_screen(f, f.size(), app, theme);
         }
+    }
+
+    // The normal Browse renderer owns native-background repair. When Browse
+    // is intentionally omitted for full-screen artwork, perform the same
+    // one-shot repair here, before painting the image and its context menu.
+    if app.current_screen == AppScreen::Browse
+        && app.browse_artwork.popup_open && app.browse_artwork.fullscreen
+        && app.image_picker.protocol_type != ratatui_image::picker::ProtocolType::Halfblocks
+        && app.browse_artwork.take_background_restore()
+    {
+        super::browse_artwork::repaint_image_background(
+            f, f.size(), theme.bg, app.browse_artwork.background_restore_count());
     }
 
     // Draw the borderless image popup before a context menu. Unlike modal

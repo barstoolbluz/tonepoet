@@ -5741,3 +5741,82 @@ sent to the terminal costs no more than it needs to.
 
 The account of the limits and the failure path is from source and fits what
 was seen. I have not stepped through it in a debugger.
+
+---
+
+## 85. The recovery window's frame has a gap on each side at the footer rule
+
+Filed 2026-11-12. Seen in `Screenshot from 2026-11-11 21-06-09.png`.
+
+The "recovery · copy and move" window is framed in cyan. One row above its
+footer ("0 needs attention", "1 saved operations…"), the left and right sides
+of the frame are missing: each side shows a dark cell where `│` should be.
+
+That row is the dim horizontal rule separating the job panes from the footer.
+As far as I can tell, `draw_window` in `recovery_ui.rs` draws the rule across
+the window's full width, in the dim separator colour, with `├` and `┤` at its
+ends, over the frame's own side cells. The screenshot fits that. The frame
+is cyan, `(115,218,202)`, everywhere except those two cells. Each holds a
+full-height vertical stroke joined at mid-height by the rule, in
+`(42,46,67)`. The background is `(40,44,52)`, so the junctions are close to
+invisible and read as gaps. The rule itself and the divider between the job
+list and the details pane are the same dim colour.
+
+**What we want.** The frame is unbroken on every side, and the footer rule
+meets it without changing the frame's appearance. The same holds for any
+other rule or divider that reaches a window's edge.
+
+The account of the cause is from source and fits the screenshot.
+
+---
+
+## 86. The image viewer has no full-screen view
+
+Filed 2026-11-12.
+
+The viewer shows an image in a window over Browse, at most the "View artwork
+height" share of the terminal. There is no way to see an image using the
+whole terminal.
+
+**What we want.**
+
+- In the viewer, a bare `f` shows the current image full screen: the whole
+  terminal, with the TUI not drawn around it.
+- The image is as large as fits with all of it visible. A wide image fills
+  the width, a tall one fills the height. It is never enlarged beyond its own
+  pixels, whatever "Allow image enlargement" says.
+- The image Settings menu gains a toggle to open images full screen directly.
+  It is saved with the other artwork settings.
+- Esc leaves full screen and returns to Browse. The image's right-click menu
+  gains "Exit full screen", shown only in full screen, which does the same.
+- Stepping between images works in full screen as it does in the normal
+  view.
+
+No zoom. Full screen is a single fitted view.
+
+---
+
+## 87. Four scalar-pump tests share one fixture file in the repo
+
+Filed 2026-11-12.
+
+`bound_scalar_pump_spawns_the_exact_attested_executable` failed once in a
+full gate on `bd01543` and passed 3/3 alone:
+
+```
+retained PCM scalar input extent changed before execution: expected 8 bytes,
+found 0 at …/fixtures/test-bin/bound-scalar-input.f64le
+```
+
+`bound_scalar_pump_fixture` in `src/convert/pipeline/tool.rs` writes
+`bound-scalar-input.f64le` with `fs::write`, and four tests in
+`real_tool_runner_tests` call it. As far as I can tell they all write the same
+tracked file in `fixtures/test-bin`, concurrently. `fs::write` truncates
+before writing, so one test can find the file at 0 bytes while another is
+rewriting it. The code under test reported the change correctly.
+
+This is the first failure seen from it. The fixture has been written this way
+since R35.
+
+**What we want.** These tests do not share a file, and no test writes into
+the repository's tracked fixtures.
