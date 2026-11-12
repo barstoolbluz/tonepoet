@@ -6127,6 +6127,8 @@ mod inline_edit_behavior_tests {
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.current_screen = AppScreen::Browse;
         app.browse_artwork.open_file_popup(image);
+        app.browse_artwork.set_desired_area(Rect::new(10, 6, 55, 24),
+            super::super::browse_artwork::ImageVerticalPlacement::Center);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !app.browse_artwork.has_image() && std::time::Instant::now() < deadline {
             app.browse_artwork.prepare(&mut app.image_picker, 0, 0,
@@ -6134,10 +6136,6 @@ mod inline_edit_behavior_tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(app.browse_artwork.has_image());
-        app.browse_artwork.set_desired_area(Rect::new(10, 6, 55, 24),
-            super::super::browse_artwork::ImageVerticalPlacement::Center);
-        assert!(app.browse_artwork.prepare(&mut app.image_picker, 0, 0,
-            &app.browse.artwork_config), "full-size image protocol must be prepared");
         app.browse_artwork.popup_rect = Rect::new(10, 6, 55, 24);
         let selected = app.browse.selected_index;
         for (x, y) in [(20, 12), (21, 12), (28, 18)] {
@@ -6174,6 +6172,9 @@ mod inline_edit_behavior_tests {
         app.current_screen = AppScreen::Browse;
         app.image_picker.protocol_type = ProtocolType::Sixel;
         app.browse_artwork.open_file_popup(image);
+        let viewport = Rect::new(10, 6, 55, 24);
+        app.browse_artwork.set_desired_area(viewport,
+            super::super::browse_artwork::ImageVerticalPlacement::Center);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !app.browse_artwork.has_image() && std::time::Instant::now() < deadline {
             app.browse_artwork.prepare(&mut app.image_picker, 0, 0,
@@ -6181,11 +6182,6 @@ mod inline_edit_behavior_tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(app.browse_artwork.has_image());
-        let viewport = Rect::new(10, 6, 55, 24);
-        app.browse_artwork.set_desired_area(viewport,
-            super::super::browse_artwork::ImageVerticalPlacement::Center);
-        assert!(app.browse_artwork.prepare(&mut app.image_picker, 0, 0,
-            &app.browse.artwork_config), "native image protocol must be prepared");
         let mut terminal = Terminal::new(TestBackend::new(100, 45)).unwrap();
         // Render a real native-image frame between interactions. Clear models
         // the menu's overwriting of pixels away from the image-origin cell.
