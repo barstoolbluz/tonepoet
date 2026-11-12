@@ -5638,3 +5638,58 @@ have not looked into.
 My reading covers `window_actions` and `classify_recovery_surface`. The
 accounts of the stale process ID, the stale progress time and the zero count
 are inference from what the screen showed and what was on disk.
+
+---
+
+## 82. Live-progress directories outlive their jobs
+
+Filed 2026-11-12, after #81 merged.
+
+Each copy or move started since #81 creates
+`.live-<job>-<generation>/` beside its journal in
+`file-operation-journal/v2`, holding `progress.json` and the job's command
+mailbox. Nothing removes it. On 2026-11-12 the move `aa3bc66c…` had completed
+(its journal ends with a `completed` checkpoint, and no worker was running), and
+`.live-aa3bc66c-6e18-44fc-89d5-aabe841ca692-1/progress.json` was still
+there. The worker discards stale command files when it starts, but no code
+path removes the directory or the snapshot.
+
+It is TonePoet's own storage, not a destination, so the standing rule is not
+broken. It does leave one directory per job, indefinitely. `progress.json` was
+mode 0644, while the directory and the journals are 0700 and 0600.
+
+**What we want.** A job's live-progress state is gone once nothing can read
+it: after the job completes, is set aside, or is otherwise resolved. A
+directory left by a worker that died is cleaned up too.
+
+---
+
+## 83. The progress monitor shows zeros and inert controls when a worker has no progress feed
+
+Filed 2026-11-12, after #81 merged.
+
+Watch progress on a running job whose worker publishes no live progress
+opened "Move (reconnected)" with "Total 0 items · 0 B", empty bars at 0%, a
+rate of `--/s`, and an elapsed time counting from when the monitor opened. It
+offered `p Pause`, `s Skip` and `u Stop and undo`. The case seen was the
+blu-ray move from #81. Its worker had been started by a build from before #81,
+so it never created a live-progress directory.
+
+Those figures are not measurements. They are what an absent snapshot renders
+as. The controls cannot work. As far as I can tell, `request_control` fails
+with "worker control channel unavailable" when the directory does not exist,
+and Force stop needs the worker identity from the same snapshot, so it is
+refused as well. A running worker the TUI cannot talk to therefore cannot be
+stopped from the UI at all.
+
+New workers create the directory, so this mostly affects workers from older
+builds. It may also apply to a worker whose snapshot is missing, unreadable or
+from another generation. I have not tried those.
+
+**What we want.** When there is no progress feed, the monitor says so instead
+of showing zeros. It offers only controls that can reach the worker, and says
+why the others are unavailable. Whatever the journal does record about the
+job's progress is shown, if that is enough to be useful.
+
+My reading of `request_control` and the force-stop path is from source, not
+from pressing the buttons.
