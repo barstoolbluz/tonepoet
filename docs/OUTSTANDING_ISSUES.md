@@ -5820,3 +5820,31 @@ since R35.
 
 **What we want.** These tests do not share a file, and no test writes into
 the repository's tracked fixtures.
+
+---
+
+## 88. There is no way to extract tracks or chapters from a disc without converting them
+
+Filed 2026-11-12. A feature request.
+
+TonePoet reads SACD, DVD-Audio, DVD-Video and Blu-ray sources, but every
+stream it takes from them goes through Convert. A user who wants the audio as
+it is on the disc has no direct route. The "Audio Streams" window opened from
+the Info pane's `Streams…` pill lists streams and sends a whole stream to
+Convert. Its selection mark does nothing, tracks cannot be chosen
+individually, and streams with the same format look identical.
+
+**What we want.** A stream selection window that replaces "Audio Streams"
+and extracts the chosen tracks or chapters natively:
+
+- PCM is written to WAV at the source's own bit depth. Lossless codecs are
+  decoded losslessly. Lossy codecs are decoded to 24-bit PCM, labelled as
+  coming from a lossy source.
+- DSD is written to DSF by default, with DST decoded. Keeping DST in DFF,
+  which holds no tags, is an option for DST-compressed areas.
+- Tags are carried over on request, where the container can hold them.
+- A shortcut hands the selection to Convert for anything else.
+
+One window serves every source type. The design is in
+`tonepoet-streams-spec.md` and `tonepoet-streams-mockups.html`, delivered
+with the brief for this issue.
