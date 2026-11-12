@@ -13,6 +13,9 @@ const DEFAULT_MAX_CONFLICT_RECORDS: usize = 8;
 const MIN_PROGRESS_DIALOG_WIDTH: u16 = 52;
 const PROGRESS_DIALOG_HEIGHT: u16 = 12;
 const CONFLICT_DIALOG_HEIGHT: u16 = 15;
+// Visible even in the minimum-width recovered conflict dialog.
+const RECOVERY_CONFLICT_ABORT_NOTICE: &str =
+    "  Abort opens Stop confirmation; output may remain";
 const MAX_VISIBLE_QUEUED_JOBS: usize = 4;
 
 /// Generic category label for a long-running file-oriented task.
@@ -652,6 +655,7 @@ pub struct FileTaskProgressState {
     auto_close_available: bool,
     auto_close_progress: bool,
     minimize_available: bool,
+    recovery_monitor: bool,
     queued_jobs: Vec<QueuedFileTaskSummary>,
     queued_selection: usize,
     queued_scroll: usize,
@@ -687,6 +691,7 @@ impl FileTaskProgressState {
             auto_close_available,
             auto_close_progress: false,
             minimize_available: false,
+            recovery_monitor: false,
             queued_jobs: Vec::new(),
             queued_selection: 0,
             queued_scroll: 0,
@@ -700,6 +705,15 @@ impl FileTaskProgressState {
 
     pub fn set_minimize_available(&mut self, available: bool) {
         self.minimize_available = available;
+    }
+
+    /// When watching a worker started by another TUI, Esc returns to Recovery
+    /// and never aborts that worker. Stop-and-undo belongs to the Recovery
+    /// confirmation, not the progress overlay's ordinary Abort control.
+    pub fn set_recovery_monitor(&mut self) {
+        self.recovery_monitor = true;
+        self.auto_close_available = false;
+        self.minimize_available = false;
     }
 
     #[must_use]
@@ -976,6 +990,14 @@ impl FileTaskProgressState {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> FileTaskUserAction {
+        // A reconnected monitor never owns the worker's lifetime. Even at a
+        // conflict prompt Esc means Back, not the conflict's Abort decision.
+        if self.recovery_monitor && matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+            return FileTaskUserAction::Minimize;
+        }
+        if self.recovery_monitor && key.code == KeyCode::Char('u') {
+            return FileTaskUserAction::Abort; // host opens Stop-and-undo confirmation
+        }
         if self.conflict.is_some() {
             return self.handle_conflict_key(key);
         }
@@ -1505,10 +1527,15 @@ impl FileTaskProgressState {
                 });
             }
 
-            self.render_empty_row(frame, area, 11);
+            if self.recovery_monitor {
+                self.render_bordered_text(frame, area, 11,
+                    RECOVERY_CONFLICT_ABORT_NOTICE, self.theme.progress_text_dim);
+            } else {
+                self.render_empty_row(frame, area, 11);
+            }
         }
         self.render_rule(frame, area, 12, '\u{251c}', '\u{2524}');
-        self.render_action_row(frame, area, 13, self.conflict_buttons());
+        self.render_action_row(frame, area, 13, self.conflict_buttons(area.width));
         self.render_rule(frame, area, 14, '\u{2514}', '\u{2518}');
     }
 
@@ -1725,6 +1752,18 @@ impl FileTaskProgressState {
         }
 
         let wide = area_width >= 78;
+        if self.recovery_monitor {
+            let paused = matches!(self.phase, FileTaskPhase::Paused);
+            return vec![
+                (if wide { " Esc Back ".into() } else { "Esc Back".into() },
+                    ProgressHitAction::Minimize, self.theme.progress_button),
+                (if paused { " p Resume ".into() } else { " p Pause ".into() },
+                    ProgressHitAction::PauseResume, self.theme.progress_button),
+                (" s Skip ".into(), ProgressHitAction::SkipCurrent, self.theme.progress_button),
+                (if wide { " u Stop and undo ".into() } else { "u Stop / undo".into() },
+                    ProgressHitAction::Abort, self.theme.progress_destructive),
+            ];
+        }
         let pause_label = match (wide, matches!(self.phase, FileTaskPhase::Paused)) {
             (true, true) => " p Resume ",
             (true, false) => " p Pause ",
@@ -1800,11 +1839,12 @@ impl FileTaskProgressState {
         buttons
     }
 
-    fn conflict_buttons(&self) -> Vec<(String, ProgressHitAction, Style)> {
+    fn conflict_buttons(&self, area_width: u16) -> Vec<(String, ProgressHitAction, Style)> {
         let Some(conflict) = self.conflict.as_ref() else {
-            return self.progress_buttons(MIN_PROGRESS_DIALOG_WIDTH);
+            return self.progress_buttons(area_width);
         };
-        conflict
+        let compact = self.recovery_monitor && area_width < 80;
+        let mut buttons = conflict
             .choices
             .iter()
             .enumerate()
@@ -1817,14 +1857,30 @@ impl FileTaskProgressState {
                 } else {
                     self.theme.progress_button
                 };
-                let label = if *action == ConflictAction::Abort {
-                    " Esc Abort ".to_string()
+                let label = if compact {
+                    match action {
+                        ConflictAction::Overwrite => "Ovr",
+                        ConflictAction::Skip => "Skip",
+                        ConflictAction::Rename => "Ren",
+                        ConflictAction::Abort if self.recovery_monitor => "Abort?",
+                        ConflictAction::Abort => "Abort",
+                    }.to_string()
+                } else if *action == ConflictAction::Abort {
+                    if self.recovery_monitor { " Abort? ".to_string() }
+                    else { " Esc Abort ".to_string() }
                 } else {
                     format!(" {} ", action.label())
                 };
                 (label, ProgressHitAction::Conflict(*action), style)
             })
-            .collect()
+            .collect::<Vec<_>>();
+        if self.recovery_monitor {
+            buttons.push((if compact { "u Undo" } else { " u Stop and undo " }.into(),
+                ProgressHitAction::Abort, self.theme.progress_destructive));
+            buttons.push((if compact { "Esc Back" } else { " Esc Back " }.into(),
+                ProgressHitAction::Minimize, self.theme.progress_button));
+        }
+        buttons
     }
 
     fn progress_bar_spans(&self, area: Rect, ratio: f64) -> Vec<Span<'static>> {
@@ -2166,6 +2222,111 @@ fn format_duration(duration: Duration) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recovery_progress_escape_returns_without_aborting() {
+        let mut progress = super::FileTaskProgressState::new(
+            super::FileTaskKind::Move,
+            "Reconnected move",
+            crate::theme::FilePickerTheme::default(),
+        );
+        progress.set_recovery_monitor();
+        let action = progress.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(action, super::FileTaskUserAction::Minimize);
+    }
+
+    #[test]
+    fn reconnected_conflict_keeps_escape_as_back_and_offers_stop_confirmation() {
+        let mut progress = super::FileTaskProgressState::new(super::FileTaskKind::Copy,
+            "Reconnected collision", crate::theme::FilePickerTheme::default());
+        progress.set_recovery_monitor();
+        let prompt = super::ConflictPromptState::new(11, "Existing file", "Choose",
+            super::ConflictItemKind::File);
+        progress.apply_update(super::FileTaskProgressUpdate::ShowConflict { conflict: prompt });
+        assert_eq!(progress.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc, crossterm::event::KeyModifiers::NONE)),
+            super::FileTaskUserAction::Minimize);
+        assert_eq!(progress.conflict.as_ref().map(|p| p.request_id), Some(11));
+        assert_eq!(progress.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('u'), crossterm::event::KeyModifiers::NONE)),
+            super::FileTaskUserAction::Abort);
+        let labels = progress.conflict_buttons(100);
+        assert!(labels.iter().any(|(label, action, _)| label.contains("Stop and undo")
+            && *action == super::ProgressHitAction::Abort));
+        assert!(labels.iter().any(|(label, action, _)| label.contains("Back")
+            && *action == super::ProgressHitAction::Minimize));
+        assert!(!labels.iter().any(|(label, _, _)| label.contains("Esc Abort")));
+        let compact = progress.conflict_buttons(super::MIN_PROGRESS_DIALOG_WIDTH);
+        let occupied = compact.iter().map(|(label, _, _)| crate::display_width::width(label)).sum::<usize>()
+            + 3 * compact.len().saturating_sub(1);
+        assert!(occupied <= usize::from(super::MIN_PROGRESS_DIALOG_WIDTH - 2),
+            "all six actions must fit the minimum recovery conflict dialog");
+        assert!(compact.iter().any(|(_, action, _)| *action == super::ProgressHitAction::Abort));
+        assert!(compact.iter().any(|(_, action, _)| *action == super::ProgressHitAction::Minimize));
+        progress.apply_update(super::FileTaskProgressUpdate::ClearConflict);
+        assert!(progress.conflict.is_none());
+    }
+
+    #[test]
+    fn recovered_conflict_abort_click_and_shortcuts_request_confirmation_in_host() {
+        let mut progress = super::FileTaskProgressState::new(
+            super::FileTaskKind::Copy,
+            "Reconnected copy",
+            crate::theme::FilePickerTheme::default(),
+        );
+        progress.set_recovery_monitor();
+        progress.apply_update(super::FileTaskProgressUpdate::ShowConflict {
+            conflict: super::ConflictPromptState::new(
+                41, "Existing track", "Choose a resolution", super::ConflictItemKind::File,
+            ),
+        });
+        let abort = super::FileTaskUserAction::ChooseConflictResolution(
+            super::ConflictResolution::Abort,
+        );
+        for key in [
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ] {
+            assert_eq!(progress.handle_key(key), abort);
+        }
+        assert_eq!(progress.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            super::FileTaskUserAction::Minimize);
+        assert_eq!(progress.conflict.as_ref().map(|c| c.request_id), Some(41));
+
+        for width in [super::MIN_PROGRESS_DIALOG_WIDTH, 80] {
+            let area = ratatui::layout::Rect::new(0, 0, width, super::CONFLICT_DIALOG_HEIGHT);
+            let mut terminal = Terminal::new(TestBackend::new(width, super::CONFLICT_DIALOG_HEIGHT))
+                .expect("test terminal");
+            terminal.draw(|frame| progress.render(frame, area)).expect("render conflict");
+            assert!(buffer_row(terminal.backend().buffer(), 11, width).contains(
+                "Abort opens Stop confirmation; output may remain"),
+                "reconnected conflict must disclose confirmation and possible completed output");
+            let hit = progress.hit_regions.iter().find(|hit| matches!(hit.action,
+                super::ProgressHitAction::Conflict(super::ConflictAction::Abort)))
+                .copied().expect("rendered Abort hit region");
+            let action = progress.handle_mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: hit.rect.x,
+                row: hit.rect.y,
+                modifiers: KeyModifiers::NONE,
+            }, area);
+            assert_eq!(action, abort);
+            assert!(progress.conflict_buttons(width).iter().any(|(label, _, _)|
+                label.contains("Abort?")), "the recovered Abort label must signal an extra step");
+        }
+
+        // The generic dialog and its direct Abort semantics are unchanged.
+        let mut local = super::FileTaskProgressState::new(
+            super::FileTaskKind::Copy, "Local copy", crate::theme::FilePickerTheme::default());
+        local.apply_update(super::FileTaskProgressUpdate::ShowConflict {
+            conflict: super::ConflictPromptState::new(
+                42, "Existing track", "Choose", super::ConflictItemKind::File),
+        });
+        assert_eq!(local.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)), abort);
+    }
+
     use super::*;
     use crossterm::event::{KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;

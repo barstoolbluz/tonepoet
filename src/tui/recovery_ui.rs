@@ -27,6 +27,7 @@ use super::file_task_runtime::{
     RecoveryRecordVersion, RecoverySurfaceAvailability, RecoverySurfaceRecord,
 };
 use super::message::AppMessage;
+use super::file_task_live::{LiveWorkerRef, LiveWorkerSnapshot};
 
 const PROMPT_MIN_WIDTH: u16 = 84;
 const PROMPT_MIN_HEIGHT: u16 = 14;
@@ -56,6 +57,9 @@ pub enum RecoverySurface {
     Details,
     DiscardConfirm,
     BulkDiscardConfirm,
+    StopConfirm,
+    ForceStopConfirm,
+    SetAsideConfirm,
     Inspector,
 }
 
@@ -76,7 +80,7 @@ impl RecoveryDetailsTab {
     fn label(self) -> &'static str {
         match self {
             Self::BlockedPaths => "Blocked paths",
-            Self::IncompleteFiles => "Incomplete files",
+            Self::IncompleteFiles => "Staging paths",
             Self::RenamedSources => "Renamed sources",
         }
     }
@@ -102,14 +106,37 @@ pub struct RecoveryEntry {
     /// entering, execution outside the review queue. Such an entry remains
     /// visible until it resolves, but must not concurrently offer Discard.
     pub resume_committed: bool,
+    /// Queue identity of an approved Resume that has not yet been dispatched.
+    /// Different from the dormant review queue's `queue_id`.
+    pub approved_resume_queue_id: Option<u64>,
     /// The user confirmed Discard and its worker is taking over the durable
     /// record. Keep all competing decisions unavailable until that attempt
     /// reports success or failure.
     pub discard_committed: bool,
     pub session_deferred: bool,
+    pub live_snapshot: Option<LiveWorkerSnapshot>,
+    pub stop_requested_unix_ms: Option<u64>,
 }
 
 impl RecoveryEntry {
+    fn worker_ref(&self) -> Option<LiveWorkerRef> {
+        let record = self.record.as_ref()?;
+        LiveWorkerRef::new(self.journal_path.clone(), record.job_id.clone(), record.generation).ok()
+    }
+
+    fn worker_pid(&self) -> Option<u64> {
+        self.live_snapshot.as_ref().filter(|snapshot| snapshot.worker.appears_active())
+            .map(|snapshot| snapshot.worker.pid)
+    }
+
+    fn is_stalled(&self) -> bool {
+        if !self.is_live() { return false; }
+        let Some(snapshot) = self.live_snapshot.as_ref() else { return false; };
+        if matches!(snapshot.phase, tui_file_picker::FileTaskPhase::Paused) { return false; }
+        matches!(snapshot.phase, tui_file_picker::FileTaskPhase::Stalled)
+            || snapshot.age_since_forward_ms() >= self.record.as_ref().map_or(8_000, |r| r.stall_timeout_secs.max(8).saturating_mul(1_000))
+    }
+
     fn kind_label(&self) -> &'static str {
         match self.record.as_ref() {
             Some(record) if record.is_move => "move",
@@ -239,7 +266,14 @@ impl RecoveryEntry {
             return "record unreadable";
         }
         if self.is_live() {
-            return "still running";
+            if self.live_snapshot.as_ref().is_some_and(|s| matches!(s.phase, tui_file_picker::FileTaskPhase::Paused)) {
+                return "paused";
+            }
+            return if self.is_stalled() { "running · stalled" } else { "running" };
+        }
+        if self.resume_committed {
+            return if self.approved_resume_queue_id.is_some() { "resume queued" }
+                else { "resume starting" };
         }
         if self.is_discard_cleanup() {
             return "cleanup pending";
@@ -316,10 +350,12 @@ impl RecoveryEntry {
     }
 
     fn needs_attention(&self) -> bool {
-        self.is_live()
-            || self.is_unreadable()
-            || self.is_discard_cleanup()
-            || self.irreversible()
+        // A live copy is not an interrupted operation. Only jobs that have
+        // lost their worker or wait for a recovery decision count here.
+        (!self.is_live() && !self.resume_committed && !self.discard_committed)
+            || self.live_snapshot.as_ref().is_some_and(|s| {
+            matches!(s.phase, tui_file_picker::FileTaskPhase::Paused)
+        })
     }
 }
 
@@ -339,6 +375,11 @@ pub struct RecoveryUiState {
     pub incomplete_sizes: BTreeMap<PathBuf, Option<u64>>,
     pub size_requests: BTreeSet<PathBuf>,
     pub discard_in_flight: BTreeSet<PathBuf>,
+    /// Confirmed stop-and-undo requests wait for the worker's durable lease
+    /// to be released before entering the existing discard machinery.
+    pub stop_and_undo_pending: BTreeSet<PathBuf>,
+    pub stop_requested_at: BTreeMap<PathBuf, u64>,
+    pub aside_in_flight: BTreeSet<PathBuf>,
     /// Recovery records explicitly deferred with `:recovery-defer` during
     /// this process. The durable record stays unresolved, but its executable
     /// retry is not recreated until the next session.
@@ -362,6 +403,9 @@ impl Default for RecoveryUiState {
             incomplete_sizes: BTreeMap::new(),
             size_requests: BTreeSet::new(),
             discard_in_flight: BTreeSet::new(),
+            stop_and_undo_pending: BTreeSet::new(),
+            stop_requested_at: BTreeMap::new(),
+            aside_in_flight: BTreeSet::new(),
             session_deferred: BTreeSet::new(),
         }
     }
@@ -386,11 +430,20 @@ impl RecoveryUiState {
             .map(|entry| entry.journal_path.clone());
         let session_deferred = self.session_deferred.clone();
         let discard_in_flight = self.discard_in_flight.clone();
+        let stop_requested_at = self.stop_requested_at.clone();
         self.entries = records
             .into_iter()
             .map(|surface| RecoveryEntry {
+                live_snapshot: if surface.availability == RecoverySurfaceAvailability::Live {
+                    surface.record.as_ref().and_then(|record| {
+                        LiveWorkerRef::new(surface.journal_path.clone(), record.job_id.clone(), record.generation)
+                            .ok().and_then(|identity| super::file_task_live::read_snapshot(&identity))
+                    })
+                } else { None },
                 queue_id: queue_id_for_journal(queued, &surface.journal_path),
                 resume_committed: false,
+                approved_resume_queue_id: None,
+                stop_requested_unix_ms: stop_requested_at.get(&surface.journal_path).copied(),
                 discard_committed: discard_in_flight.contains(&surface.journal_path),
                 session_deferred: session_deferred.contains(&surface.journal_path),
                 journal_path: surface.journal_path,
@@ -413,6 +466,8 @@ impl RecoveryUiState {
             .retain(|path| self.entries.iter().any(|entry| &entry.journal_path == path));
         self.session_deferred
             .retain(|path| self.entries.iter().any(|entry| &entry.journal_path == path));
+        self.stop_requested_at
+            .retain(|path, _| self.entries.iter().any(|entry| &entry.journal_path == path));
         self.size_requests
             .retain(|path| self.entries.iter().any(|entry| &entry.journal_path == path));
         let current_incomplete = self
@@ -648,6 +703,283 @@ fn sync_recovery_review_queue(
     app.sync_file_transfer_queue_surfaces();
 }
 
+/// Cheap periodic observation of worker-owned progress; journal replay runs
+/// separately at a lower cadence. No source or destination directory walk.
+pub fn refresh_live_observation(app: &mut AppState) -> bool {
+    let remote = match &app.active_overlay {
+        ActiveOverlay::FileTaskProgress(session) if session.is_recovery_monitor() => session.remote_worker.clone(),
+        _ => None,
+    };
+    let mut monitor_snapshot = None;
+    let mut changed = false;
+    for entry in &mut app.recovery_ui.entries {
+        if !entry.is_live() { continue; }
+        let identity = entry.worker_ref();
+        let next = identity.as_ref().and_then(super::file_task_live::read_snapshot);
+        if next != entry.live_snapshot {
+            entry.live_snapshot = next.clone();
+            changed = true;
+        }
+        if identity == remote { monitor_snapshot = next; }
+        // The UI must repaint a stalled-age label as wall time advances even
+        // when the producer has not emitted a new snapshot.
+        if entry.is_stalled() { changed = true; }
+    }
+    if let Some(snapshot) = monitor_snapshot {
+        if let ActiveOverlay::FileTaskProgress(session) = &mut app.active_overlay {
+            if session.is_recovery_monitor()
+                && (session.progress.phase != snapshot.phase
+                    || session.progress.status != snapshot.status
+                    || session.progress.current_item != snapshot.current_item
+                    || session.progress.totals != snapshot.totals
+                    || session.progress.rate_bytes_per_sec != snapshot.rate_bytes_per_sec)
+            {
+                session.progress.apply_update(tui_file_picker::FileTaskProgressUpdate::Snapshot {
+                    phase: snapshot.phase, status: snapshot.status,
+                    current_item: snapshot.current_item, totals: snapshot.totals,
+                    rate_bytes_per_sec: snapshot.rate_bytes_per_sec,
+                });
+                changed = true;
+            }
+        }
+    }
+    // Conflict prompts outlive individual progress frames. Apply only changes
+    // in request identity to avoid resetting the viewer's selection/checkbox.
+    // Same-request metadata updates are delivered through the existing reducer.
+    if let Some(snapshot) = app.recovery_ui.entries.iter()
+        .filter(|entry| entry.is_live() && entry.worker_ref() == remote)
+        .find_map(|entry| entry.live_snapshot.as_ref())
+    {
+        if let ActiveOverlay::FileTaskProgress(session) = &mut app.active_overlay {
+            let current = session.progress.conflict.as_ref().map(|c| c.request_id);
+            let new = snapshot.conflict.as_ref().map(|c| c.request_id);
+            if current != new {
+                if let Some(conflict) = snapshot.conflict.clone() {
+                    session.progress.apply_update(tui_file_picker::FileTaskProgressUpdate::ShowConflict { conflict });
+                } else {
+                    session.progress.apply_update(tui_file_picker::FileTaskProgressUpdate::ClearConflict);
+                }
+                changed = true;
+            } else if let (Some(old), Some(new)) = (session.progress.conflict.as_ref(), snapshot.conflict.as_ref()) {
+                if new.existing_size.is_some() && (old.existing_size != new.existing_size
+                    || old.existing_modified != new.existing_modified)
+                {
+                    session.progress.apply_update(tui_file_picker::FileTaskProgressUpdate::UpdateConflictExistingStats {
+                        request_id: new.request_id,
+                        size: new.existing_size.unwrap_or_default(),
+                        modified: new.existing_modified,
+                    });
+                    changed = true;
+                }
+            }
+        }
+    }
+    changed
+}
+
+/// Once the worker releases its durable lease, use precisely the established
+/// discard implementation. A running process is never cleaned up underfoot.
+pub fn advance_stop_and_undo(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
+    let pending = app.recovery_ui.stop_and_undo_pending.iter().cloned().collect::<Vec<_>>();
+    for path in pending {
+        let selected = app.recovery_ui.entries.iter().find(|entry| entry.journal_path == path);
+        let Some(entry) = selected else {
+            app.recovery_ui.stop_and_undo_pending.remove(&path);
+            app.recovery_ui.stop_requested_at.remove(&path);
+            app.set_status("Stopped transfer record is no longer recoverable; completed output may remain on disk");
+            continue;
+        };
+        if entry.is_live() || app.recovery_ui.discard_in_flight.contains(&path) { continue; }
+        if !entry.can_discard() {
+            // A corrupt or changed record is not silently deleted. Stop is
+            // complete, but its recovery decision still requires review.
+            app.recovery_ui.stop_and_undo_pending.remove(&path);
+            app.recovery_ui.stop_requested_at.remove(&path);
+            app.set_status("Worker stopped, but automatic cleanup is not safe; review Recovery before changing files");
+            continue;
+        }
+        let Some(version) = entry.version else { continue; };
+        app.recovery_ui.stop_and_undo_pending.remove(&path);
+        app.recovery_ui.stop_requested_at.remove(&path);
+        app.recovery_ui.discard_in_flight.insert(path.clone());
+        commit_discard_choices_in_session(app, &BTreeSet::from([path.clone()]));
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let result = super::keybindings::discard_file_transfer_recovery(&path, version);
+            let _ = tx.blocking_send(AppMessage::RecoveryDiscardComplete { journal_path: path, result });
+        });
+    }
+}
+
+pub fn reconcile_progress_watch(app: &mut AppState) {
+    let remote = match &app.active_overlay {
+        ActiveOverlay::FileTaskProgress(session) if session.is_recovery_monitor() => session.remote_worker.clone(),
+        _ => None,
+    };
+    let Some(remote) = remote else { return; };
+    if app.recovery_ui.entries.iter().any(|entry| entry.is_live()
+        && entry.worker_ref().as_ref() == Some(&remote)) { return; }
+    return_from_progress_watch(app);
+    app.set_status("The worker is no longer running; review its final state and any remaining cleanup");
+}
+
+pub fn return_from_progress_watch(app: &mut AppState) {
+    app.recovery_ui.open_window();
+    app.active_overlay = ActiveOverlay::FileRecovery;
+}
+
+pub fn open_stop_confirm_from_progress_watch(app: &mut AppState, remote: &LiveWorkerRef) {
+    if let Some(index) = app.recovery_ui.entries.iter().position(|entry| {
+        entry.worker_ref().as_ref() == Some(remote) && entry.is_live()
+    }) {
+        app.recovery_ui.selected = index;
+        app.recovery_ui.surface = RecoverySurface::StopConfirm;
+        app.recovery_ui.focus = 1;
+    } else {
+        app.recovery_ui.open_window();
+        app.set_status("This transfer changed since it was opened; review its current Recovery state");
+    }
+    app.active_overlay = ActiveOverlay::FileRecovery;
+}
+
+fn watch_selected_progress(app: &mut AppState) {
+    let Some(entry) = app.recovery_ui.selected_entry().filter(|entry| entry.is_live()) else {
+        app.set_status("This transfer is no longer live; refresh Recovery before watching");
+        return;
+    };
+    let Some(remote) = entry.worker_ref() else {
+        app.set_status("The running worker's observation identity cannot be verified");
+        return;
+    };
+    let Some(record) = entry.record.as_ref() else { return; };
+    let mut progress = tui_file_picker::FileTaskProgressState::new(
+        if record.is_move { tui_file_picker::FileTaskKind::Move } else { tui_file_picker::FileTaskKind::Copy },
+        format!("{} (reconnected)", if record.is_move { "Move" } else { "Copy" }),
+        super::keybindings::file_picker_theme_from_theme(&app.theme),
+    );
+    let mut scope = tui_file_picker::FileTaskScope::new(summarize_sources(record));
+    scope.source_root = record.mappings.first().map(|m| m.source.clone());
+    scope.destination = record.admitted_destination_root.clone();
+    progress.set_scope(scope);
+    if let Some(snapshot) = entry.live_snapshot.as_ref() {
+        progress.apply_update(tui_file_picker::FileTaskProgressUpdate::Snapshot {
+            phase: snapshot.phase.clone(), status: snapshot.status.clone(),
+            current_item: snapshot.current_item.clone(), totals: snapshot.totals,
+            rate_bytes_per_sec: snapshot.rate_bytes_per_sec,
+        });
+        if let Some(conflict) = snapshot.conflict.clone() {
+            progress.apply_update(tui_file_picker::FileTaskProgressUpdate::ShowConflict { conflict });
+        }
+    } else {
+        progress.apply_update(tui_file_picker::FileTaskProgressUpdate::Snapshot {
+            phase: tui_file_picker::FileTaskPhase::Preparing,
+            status: "Waiting for independent worker progress; press Esc to return to Recovery".into(),
+            current_item: None, totals: tui_file_picker::ProgressTotals::default(), rate_bytes_per_sec: None,
+        });
+    }
+    app.active_overlay = ActiveOverlay::FileTaskProgress(
+        super::app::FileTaskProgressSession::recovery_monitor(progress, remote));
+}
+
+fn request_running_control(app: &mut AppState, control: super::app::FileTaskControl) {
+    let Some(remote) = app.recovery_ui.selected_entry().filter(|entry| entry.is_live())
+        .and_then(RecoveryEntry::worker_ref) else {
+        app.set_status("Worker is not live or its identity is unavailable");
+        return;
+    };
+    match super::file_task_live::request_control(&remote, control) {
+        Ok(()) => app.set_status("Request sent; watch worker progress for acknowledgment"),
+        Err(error) => app.set_status(format!("Cannot send worker control: {error}")),
+    }
+}
+
+fn open_safety_confirm(app: &mut AppState, surface: RecoverySurface) {
+    app.recovery_ui.surface = surface;
+    app.recovery_ui.focus = 1; // cancellation is the safe default
+    app.recovery_ui.details_scroll = 0;
+}
+
+fn activate_safety_confirmation(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
+    if app.recovery_ui.focus != 0 { app.recovery_ui.open_window(); return; }
+    match app.recovery_ui.surface {
+        RecoverySurface::StopConfirm => {
+            let entry = app.recovery_ui.selected_entry();
+            let Some((path, remote)) = entry.filter(|e| e.is_live()).and_then(|e| Some((e.journal_path.clone(), e.worker_ref()?))) else {
+                app.recovery_ui.open_window();
+                app.set_status("Worker no longer live; recheck Recovery before stopping");
+                return;
+            };
+            match super::file_task_live::request_control(&remote, super::app::FileTaskControl::Abort) {
+                Ok(()) => {
+                    app.recovery_ui.stop_and_undo_pending.insert(path.clone());
+                    app.recovery_ui.stop_requested_at.insert(path, unix_ms_now());
+                    app.recovery_ui.open_window();
+                    app.set_status("Stop requested; after the worker releases its lease, tracked staging will be cleaned and restorable names restored. Already published output may remain");
+                }
+                Err(error) => { app.recovery_ui.open_window(); app.set_status(format!("Stop request failed; worker still running: {error}")); }
+            }
+        }
+        RecoverySurface::ForceStopConfirm => {
+            let entry = app.recovery_ui.selected_entry();
+            let Some((path, remote, worker)) = entry.filter(|e| e.is_live())
+                .and_then(|e| Some((e.journal_path.clone(), e.worker_ref()?, e.live_snapshot.as_ref()?.worker))) else {
+                app.recovery_ui.open_window();
+                app.set_status("The worker identity cannot be verified; no process was signaled");
+                return;
+            };
+            // Re-read generation-bound snapshot; only the current worker gets a signal.
+            let result = super::file_task_live::read_snapshot(&remote)
+                .filter(|fresh| fresh.worker == worker && worker.appears_active())
+                .ok_or_else(|| "Worker identity changed; no process was signaled".to_string())
+                .and_then(|_| super::file_task_live::force_stop(worker));
+            app.recovery_ui.open_window();
+            match result {
+                Ok(()) => {
+                    app.recovery_ui.stop_and_undo_pending.insert(path.clone());
+                    app.recovery_ui.stop_requested_at.insert(path, unix_ms_now());
+                    app.set_status("Identity-checked force stop sent; recoverable staging will be reviewed for cleanup after the lease releases");
+                }
+                Err(error) => app.set_status(format!("Could not force stop worker: {error}")),
+            }
+        }
+        RecoverySurface::SetAsideConfirm => {
+            let Some(path) = app.recovery_ui.selected_entry().filter(|entry| entry.is_unreadable())
+                .map(|entry| entry.journal_path.clone()) else {
+                app.recovery_ui.open_window();
+                app.set_status("This record is not unreadable; review its current state");
+                return;
+            };
+            if !app.recovery_ui.aside_in_flight.insert(path.clone()) { return; }
+            app.recovery_ui.open_window();
+            app.set_status("Checking ownership and preserving the unreadable record before releasing reservations");
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let result = super::file_task_runtime::set_aside_unreadable_recovery(&path);
+                let _ = tx.blocking_send(AppMessage::RecoverySetAsideComplete { journal_path: path, result });
+            });
+        }
+        _ => app.recovery_ui.open_window(),
+    }
+}
+
+pub fn complete_set_aside(app: &mut AppState, journal_path: PathBuf, result: Result<PathBuf,String>) {
+    app.recovery_ui.aside_in_flight.remove(&journal_path);
+    match result {
+        Ok(saved) => {
+            refresh_from_runtime(app);
+            if app.recovery_ui.entries.is_empty() && matches!(app.active_overlay, ActiveOverlay::FileRecovery) {
+                app.active_overlay = ActiveOverlay::None;
+            } else { app.recovery_ui.open_window(); }
+            app.set_status(format!("Unreadable record preserved at {}; its proved stale reservations were released. Source and destination files were not altered",saved.display()));
+        }
+        Err(error) => {
+            refresh_from_runtime(app);
+            app.recovery_ui.open_window();
+            app.set_status(format!("Could not release blocked paths safely: {error}"));
+        }
+    }
+}
+
 pub fn refresh_from_runtime(app: &mut AppState) {
     let super::file_task_runtime::StartupFileTaskRecoveryInventory {
         recoveries,
@@ -680,6 +1012,9 @@ pub fn refresh_from_runtime(app: &mut AppState) {
         .collect::<BTreeSet<_>>();
     for entry in &mut app.recovery_ui.entries {
         entry.resume_committed = resume_committed.contains(&entry.journal_path);
+        entry.approved_resume_queue_id = app.file_transfers.queued.iter()
+            .find(|job| queued_recovery_journal(job) == Some(entry.journal_path.as_path()))
+            .map(|job| job.queue_id);
     }
 }
 
@@ -800,7 +1135,7 @@ fn request_incomplete_sizes_if_needed(app: &mut AppState, tx: &mpsc::Sender<AppM
             .map(|path| {
                 let size = std::fs::symlink_metadata(&path)
                     .ok()
-                    .map(|metadata| metadata.len());
+                    .and_then(|metadata| metadata.is_file().then_some(metadata.len()));
                 (path, size)
             })
             .collect();
@@ -983,6 +1318,11 @@ fn bulk_discard_header(count: usize) -> String {
 const INSPECTOR_SCOPE_LINE: &str =
     "This interrupted copy/move operation cannot be changed automatically.";
 
+const UNREADABLE_BLOCKING_NOTE: &str =
+    "Saved record cannot be interpreted. Earlier path reservations may remain blocked until Set aside succeeds.";
+const UNREADABLE_PATH_NOTE: &str =
+    "Exact affected path names may not be recoverable from the unreadable record; the blocked-path inventory is unknown, not empty.";
+
 fn decide_later(app: &mut AppState) {
     let count = app.recovery_ui.entries.len();
     app.recovery_ui.minimize();
@@ -1071,21 +1411,49 @@ fn resume_reviewed_set(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WindowAction {
+    Watch,
+    Pause,
+    ResumeRunning,
+    StopAndUndo,
+    ForceStop,
+    LeaveRunning,
+    CancelQueuedResume,
+    KeepWaiting,
     Resume,
     Discard,
     Details,
     Inspect,
+    SetAside,
     Later,
 }
 
 fn window_actions(entry: &RecoveryEntry) -> Vec<WindowAction> {
     if entry.is_unreadable() {
-        return vec![WindowAction::Inspect];
+        return vec![WindowAction::SetAside, WindowAction::Inspect];
     }
     if entry.is_live() {
-        // Details is informational, not a decision control, and remains
-        // available while another process still owns the operation.
-        return vec![WindowAction::Details];
+        let mut actions = vec![WindowAction::Watch];
+        if entry.live_snapshot.as_ref().is_some_and(|s| matches!(s.phase, tui_file_picker::FileTaskPhase::Paused)) {
+            actions.push(WindowAction::ResumeRunning);
+        } else {
+            actions.push(WindowAction::Pause);
+        }
+        actions.push(WindowAction::StopAndUndo);
+        if entry.worker_pid().is_some() && (entry.is_stalled()
+            || entry.stop_requested_unix_ms.is_some_and(|ms| unix_ms_now().saturating_sub(ms) >= 10_000)) {
+            actions.push(WindowAction::ForceStop);
+        }
+        actions.push(WindowAction::Details);
+        actions.push(WindowAction::LeaveRunning);
+        return actions;
+    }
+    if entry.resume_committed {
+        let mut actions = Vec::new();
+        if entry.approved_resume_queue_id.is_some() {
+            actions.push(WindowAction::CancelQueuedResume);
+        }
+        actions.extend([WindowAction::KeepWaiting, WindowAction::Details]);
+        return actions;
     }
     let mut actions = Vec::new();
     if entry.can_resume() {
@@ -1113,9 +1481,11 @@ fn visible_action_count(state: &RecoveryUiState) -> usize {
                 + usize::from(state.resume_count() > 0)
                 + usize::from(state.bulk_discard_count() > 0)
         }
-        RecoverySurface::Details => 1,
-        RecoverySurface::DiscardConfirm | RecoverySurface::BulkDiscardConfirm => 2,
-        RecoverySurface::Inspector => 1,
+        RecoverySurface::Details => 2,
+        RecoverySurface::DiscardConfirm | RecoverySurface::BulkDiscardConfirm
+        | RecoverySurface::StopConfirm | RecoverySurface::ForceStopConfirm
+        | RecoverySurface::SetAsideConfirm => 2,
+        RecoverySurface::Inspector => 2,
     }
 }
 
@@ -1170,7 +1540,9 @@ fn auxiliary_scroll_count(state: &RecoveryUiState) -> usize {
             .selected_entry()
             .map_or(0, single_discard_effect_count),
         RecoverySurface::BulkDiscardConfirm => state.bulk_discard_count().saturating_mul(2),
-        RecoverySurface::Inspector | RecoverySurface::Prompt | RecoverySurface::Window => 0,
+        RecoverySurface::Inspector | RecoverySurface::Prompt | RecoverySurface::Window
+        | RecoverySurface::StopConfirm | RecoverySurface::ForceStopConfirm
+        | RecoverySurface::SetAsideConfirm => 0,
     }
 }
 
@@ -1232,7 +1604,7 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
                 key.modifiers.contains(KeyModifiers::SHIFT),
             ),
             KeyCode::BackTab => cycle_focus(&mut app.recovery_ui, true),
-            KeyCode::Enter => activate_details_focus(app),
+            KeyCode::Enter => activate_details_focus(app, tx),
             _ => {}
         },
         RecoverySurface::DiscardConfirm => match key.code {
@@ -1273,8 +1645,24 @@ pub fn handle_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMessag
             }
             _ => {}
         },
+        RecoverySurface::StopConfirm | RecoverySurface::ForceStopConfirm
+        | RecoverySurface::SetAsideConfirm => match key.code {
+            KeyCode::Esc => app.recovery_ui.open_window(),
+            KeyCode::Tab => cycle_focus(&mut app.recovery_ui, key.modifiers.contains(KeyModifiers::SHIFT)),
+            KeyCode::BackTab => cycle_focus(&mut app.recovery_ui, true),
+            KeyCode::Enter => activate_safety_confirmation(app, tx),
+            _ => {}
+        },
         RecoverySurface::Inspector => match key.code {
-            KeyCode::Esc | KeyCode::Enter => app.recovery_ui.open_window(),
+            KeyCode::Esc => app.recovery_ui.open_window(),
+            KeyCode::Tab => cycle_focus(&mut app.recovery_ui, key.modifiers.contains(KeyModifiers::SHIFT)),
+            KeyCode::BackTab => cycle_focus(&mut app.recovery_ui, true),
+            KeyCode::Enter => {
+                if app.recovery_ui.focus == 0 { app.recovery_ui.open_window();
+                    app.recovery_ui.focus = 0;
+                    activate_window_focus(app, tx);
+                } else { app.recovery_ui.open_window(); }
+            }
             KeyCode::Up => scroll_auxiliary(&mut app.recovery_ui, -1),
             KeyCode::Down => scroll_auxiliary(&mut app.recovery_ui, 1),
             _ => {}
@@ -1299,6 +1687,34 @@ fn activate_window_focus(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
     let focus = app.recovery_ui.focus;
     if let Some(action) = actions.get(focus).copied() {
         match action {
+            WindowAction::Watch => watch_selected_progress(app),
+            WindowAction::Pause => request_running_control(app, super::app::FileTaskControl::Pause),
+            WindowAction::ResumeRunning => request_running_control(app, super::app::FileTaskControl::Resume),
+            WindowAction::StopAndUndo => open_safety_confirm(app, RecoverySurface::StopConfirm),
+            WindowAction::ForceStop => open_safety_confirm(app, RecoverySurface::ForceStopConfirm),
+            WindowAction::LeaveRunning => {
+                app.recovery_ui.minimize();
+                app.active_overlay = ActiveOverlay::None;
+                app.set_status("The transfer continues in its worker; Recovery can watch or control it later");
+            }
+            WindowAction::CancelQueuedResume => {
+                let Some(queue_id) = app.recovery_ui.selected_entry()
+                    .and_then(|entry| entry.approved_resume_queue_id) else {
+                    app.set_status("This approved resume has already left the queue; refresh Recovery");
+                    return;
+                };
+                // The scheduler already owns cancellation and queue sync.
+                // Do not offer Undo while the runnable item could still start.
+                super::keybindings::cancel_queued_file_transfer(app, queue_id, tx);
+                refresh_from_runtime(app);
+                app.recovery_ui.open_window();
+            }
+            WindowAction::KeepWaiting => {
+                app.recovery_ui.minimize();
+                app.active_overlay = ActiveOverlay::None;
+                app.set_status("The approved recovery is waiting to start; no user files were changed by leaving Recovery");
+            }
+            WindowAction::SetAside => open_safety_confirm(app, RecoverySurface::SetAsideConfirm),
             WindowAction::Resume => resume_selected(app, tx),
             WindowAction::Discard => open_selected_discard_confirm(app),
             WindowAction::Details => {
@@ -1401,8 +1817,13 @@ fn select_adjacent_tab(app: &mut AppState, delta: isize, tx: &mpsc::Sender<AppMe
     request_incomplete_sizes_if_needed(app, tx);
 }
 
-fn activate_details_focus(app: &mut AppState) {
+fn activate_details_focus(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
+    let focus = app.recovery_ui.focus;
     app.recovery_ui.open_window();
+    if focus == 0 {
+        app.recovery_ui.focus = 0;
+        activate_window_focus(app, tx);
+    }
 }
 
 pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<AppMessage>) {
@@ -1413,6 +1834,8 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 RecoverySurface::Details
                 | RecoverySurface::DiscardConfirm
                 | RecoverySurface::BulkDiscardConfirm
+                | RecoverySurface::StopConfirm | RecoverySurface::ForceStopConfirm
+                | RecoverySurface::SetAsideConfirm
                 | RecoverySurface::Inspector => scroll_auxiliary(&mut app.recovery_ui, -3),
                 RecoverySurface::Prompt => {}
             }
@@ -1424,6 +1847,8 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                 RecoverySurface::Details
                 | RecoverySurface::DiscardConfirm
                 | RecoverySurface::BulkDiscardConfirm
+                | RecoverySurface::StopConfirm | RecoverySurface::ForceStopConfirm
+                | RecoverySurface::SetAsideConfirm
                 | RecoverySurface::Inspector => scroll_auxiliary(&mut app.recovery_ui, 3),
                 RecoverySurface::Prompt => {}
             }
@@ -1496,6 +1921,8 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                         app.recovery_ui.open_window();
                     }
                 }
+                RecoverySurface::StopConfirm | RecoverySurface::ForceStopConfirm
+                | RecoverySurface::SetAsideConfirm => activate_safety_confirmation(app, tx),
                 _ => {}
             }
         }
@@ -1510,6 +1937,8 @@ pub fn draw(f: &mut Frame, app: &mut AppState, theme: super::theme::Theme) {
         RecoverySurface::Details => draw_details(f, app, theme),
         RecoverySurface::DiscardConfirm => draw_discard_confirm(f, app, theme, false),
         RecoverySurface::BulkDiscardConfirm => draw_discard_confirm(f, app, theme, true),
+        RecoverySurface::StopConfirm | RecoverySurface::ForceStopConfirm
+        | RecoverySurface::SetAsideConfirm => draw_safety_confirmation(f, app, theme),
         RecoverySurface::Inspector => draw_inspector(f, app, theme),
     }
 }
@@ -1613,7 +2042,7 @@ fn draw_prompt(f: &mut Frame, app: &mut AppState, theme: super::theme::Theme) {
     let inner = recovery_block(
         f,
         popup,
-        "interrupted operations",
+        "copy and move recovery",
         theme.purple,
         &mut app.button_map,
         theme,
@@ -1631,7 +2060,7 @@ fn draw_prompt(f: &mut Frame, app: &mut AppState, theme: super::theme::Theme) {
     if inner.height >= 3 {
         f.render_widget(
             Paragraph::new(format!(
-                "{count} file operation{} did not finish.\nCopy and move are recoverable. Interrupted deletes are not recorded.",
+                "{count} saved copy/move operation{} remain open. Some workers may still be running.\nReview their status and choose the available controls.",
                 plural(count),
             ))
             .style(Style::default().fg(theme.text)),
@@ -1710,6 +2139,32 @@ fn draw_prompt(f: &mut Frame, app: &mut AppState, theme: super::theme::Theme) {
     );
 }
 
+/// Both recovery list layouts use worker-reported byte progress when live.
+/// Journal root counts describe recoverable work, not an in-flight large file.
+fn recovery_row_progress(entry: &RecoveryEntry) -> (String, String) {
+    if entry.is_live() {
+        return entry.live_snapshot.as_ref().map_or_else(
+            || ("????????".to_string(), "waiting".to_string()),
+            |snapshot| {
+                let ratio = snapshot.totals.byte_ratio();
+                let filled = ratio.map_or(0, |r| (r.clamp(0.0, 1.0) * 8.0).floor() as usize);
+                let bar = ratio.map_or_else(|| "????????".to_string(), |_| {
+                    format!("{}{}", "█".repeat(filled), "░".repeat(8 - filled))
+                });
+                let count = ratio.map_or_else(|| "bytes ?".to_string(), |r| {
+                    format!("{:>3}%", (r * 100.0).round() as u64)
+                });
+                (bar, count)
+            },
+        );
+    }
+    let total = entry.item_count();
+    let completed = entry.completed_count().min(total);
+    let filled = if total == 0 { 0 } else { completed.saturating_mul(8) / total };
+    (format!("{}{}", "█".repeat(filled), "░".repeat(8 - filled)),
+        format!("{completed:>2}/{total:<2}"))
+}
+
 fn draw_compact_entry_row(
     f: &mut Frame,
     entry: &RecoveryEntry,
@@ -1717,13 +2172,7 @@ fn draw_compact_entry_row(
     theme: super::theme::Theme,
 ) {
     let total = entry.item_count();
-    let completed = entry.completed_count().min(total);
-    let filled = if total == 0 {
-        0
-    } else {
-        completed.saturating_mul(8) / total
-    };
-    let bar = format!("{}{}", "█".repeat(filled), "░".repeat(8 - filled));
+    let (bar, counter) = recovery_row_progress(entry);
     let destination = entry
         .record
         .as_ref()
@@ -1744,7 +2193,7 @@ fn draw_compact_entry_row(
         ),
         Span::styled(format!(" {bar} "), Style::default().fg(theme.cyan)),
         Span::styled(
-            format!("{completed:>2}/{total:<2}  "),
+            format!("{counter}  "),
             Style::default().fg(theme.text_muted),
         ),
         Span::styled(destination, Style::default().fg(theme.text)),
@@ -1789,7 +2238,7 @@ fn draw_window(f: &mut Frame, app: &mut AppState, theme: super::theme::Theme) {
         return;
     }
     f.render_widget(
-        Paragraph::new(format!("{count} interrupted"))
+        Paragraph::new(format!("{count} unresolved · {} waiting for a decision", app.recovery_ui.needs_attention_count()))
             .alignment(Alignment::Right)
             .style(Style::default().fg(theme.text_muted)),
         Rect::new(inner.x, inner.y, inner.width, 1),
@@ -1923,7 +2372,7 @@ fn draw_window(f: &mut Frame, app: &mut AppState, theme: super::theme::Theme) {
     );
     f.render_widget(
         Paragraph::new(format!(
-            "▲ {count} unresolved · some paths remain blocked and undo remains unavailable"
+            "▲ {count} saved operations · reserved paths are released when recovery finishes"
         ))
         .style(Style::default().fg(theme.warning)),
         Rect::new(
@@ -1963,13 +2412,7 @@ fn draw_recovery_list(f: &mut Frame, app: &mut AppState, area: Rect, theme: supe
             theme.panel_bg
         };
         let total = entry.item_count();
-        let completed = entry.completed_count().min(total);
-        let filled = if total == 0 {
-            0
-        } else {
-            completed.saturating_mul(8) / total
-        };
-        let bar = format!("{}{}", "█".repeat(filled), "░".repeat(8 - filled));
+        let (bar, counter) = recovery_row_progress(entry);
         let line = Line::from(vec![
             Span::styled(
                 format!(" {:<4} {:>2} ", entry.kind_label(), total),
@@ -1982,7 +2425,7 @@ fn draw_recovery_list(f: &mut Frame, app: &mut AppState, area: Rect, theme: supe
                     .bg(background),
             ),
             Span::styled(
-                format!(" {bar} {completed:>2}/{total:<2}"),
+                format!(" {bar} {counter}"),
                 Style::default().fg(theme.text).bg(background),
             ),
         ]);
@@ -2020,10 +2463,10 @@ fn draw_recovery_detail_pane(
             .as_deref()
             .unwrap_or("The operation record could not be interpreted safely.");
         let text = format!(
-            "Record unreadable\n\nNo automatic resume or discard is offered.\n\n{}",
+            "Record unreadable\n\n{UNREADABLE_BLOCKING_NOTE}\n\n{UNREADABLE_PATH_NOTE}\n\nNo automatic resume or undo is offered.\n\nDiagnostic: {}",
             user_safe_diagnostic(diagnostic)
         );
-        let text_height = area.height.saturating_sub(2);
+        let text_height = area.height.saturating_sub(3);
         f.render_widget(
             Paragraph::new(text)
                 .wrap(Wrap { trim: false })
@@ -2066,11 +2509,7 @@ fn draw_recovery_detail_pane(
     );
     let header_right = format!(
         "{} · {}",
-        if entry.is_live() {
-            "still running"
-        } else {
-            "no longer running"
-        },
+        if entry.is_live() { entry.state_label() } else { "no longer running" },
         age_label(record.created_unix_ms)
     );
     let header_width = text_area.width as usize;
@@ -2101,6 +2540,50 @@ fn draw_recovery_detail_pane(
             Span::styled(destination, Style::default().fg(theme.text)),
         ]),
         Line::raw(""),
+    ];
+    if entry.is_live() {
+        let process = entry.worker_pid()
+            .map(|pid| format!("worker process {pid}"))
+            .unwrap_or_else(|| "worker process active (identity pending)".to_string());
+        lines.push(Line::from(Span::styled(
+            format!("{}: {process}", entry.state_label()),
+            Style::default().fg(if entry.is_stalled() { theme.warning } else { theme.success }),
+        )));
+        if let Some(snapshot) = entry.live_snapshot.as_ref() {
+            lines.push(Line::from(Span::styled(
+                format!("Files: {}/{}  Bytes: {} / {}  Rate: {}",
+                    snapshot.totals.items_done,
+                    snapshot.totals.items_total.map_or_else(|| "unknown".into(), |n| n.to_string()),
+                    human_bytes(snapshot.totals.bytes_done),
+                    snapshot.totals.bytes_total.map_or_else(|| "unknown".into(), human_bytes),
+                    snapshot.rate_bytes_per_sec.map_or_else(|| "unknown".into(), |n| format!("{}/s", human_bytes(n))),
+                ), Style::default().fg(theme.text_bright),
+            )));
+            if let Some(item) = snapshot.current_item.as_ref() {
+                lines.push(Line::from(Span::styled(
+                    format!("Current: {} · {} / {}", item.label,
+                        human_bytes(item.bytes_done),
+                        item.bytes_total.map_or_else(|| "unknown".into(), human_bytes)),
+                    Style::default().fg(theme.text),
+                )));
+            }
+            lines.push(Line::from(Span::styled(
+                format!("Last advancing progress {} · {}", age_label(snapshot.forward_unix_ms), snapshot.status),
+                Style::default().fg(if entry.is_stalled() { theme.warning } else { theme.text_muted }),
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                "Waiting for a current worker progress snapshot; journal updates are not per-byte.",
+                Style::default().fg(theme.warning),
+            )));
+        }
+    } else {
+        lines.push(Line::from(Span::styled(
+            format!("Last progress {}", age_label(record.updated_unix_ms)),
+            Style::default().fg(theme.text_muted),
+        )));
+    }
+    lines.extend([
         Line::from(Span::styled(
             outcome_summary(entry),
             Style::default().fg(theme.info),
@@ -2116,19 +2599,19 @@ fn draw_recovery_detail_pane(
         Line::from(Span::styled(
             if record.native_rename_intents.is_empty() {
                 format!(
-                    "On disk: {} incomplete destination file{} · {} renamed source file{}",
-                    record.temp_artifacts.len(),
+                    "Tracked staging path{}: {} · source rename record{}: {} (trees may contain partial files)",
                     plural(record.temp_artifacts.len()),
-                    record.quarantine_artifacts.len(),
-                    plural(record.quarantine_artifacts.len())
+                    record.temp_artifacts.len(),
+                    plural(record.quarantine_artifacts.len()),
+                    record.quarantine_artifacts.len()
                 )
             } else {
                 format!(
-                    "On disk: {} incomplete destination file{} · {} renamed source file{} · {} direct move{} to recheck",
-                    record.temp_artifacts.len(),
+                    "Tracked staging path{}: {} · renamed source{}: {} · {} direct move{} to recheck",
                     plural(record.temp_artifacts.len()),
-                    record.quarantine_artifacts.len(),
+                    record.temp_artifacts.len(),
                     plural(record.quarantine_artifacts.len()),
+                    record.quarantine_artifacts.len(),
                     record.native_rename_intents.len(),
                     plural(record.native_rename_intents.len())
                 )
@@ -2144,28 +2627,14 @@ fn draw_recovery_detail_pane(
             Style::default().fg(theme.text_muted),
         )),
         Line::raw(""),
-    ];
-    if entry.is_live() {
-        let process = record
-            .origin_owner
-            .map(|owner| format!("process {}", owner.pid))
-            .unwrap_or_else(|| "another process".to_string());
-        lines.push(Line::from(Span::styled(
-            format!(
-                "Still running: {process} · last progress {}",
-                age_label(record.updated_unix_ms)
-            ),
-            Style::default().fg(theme.warning),
-        )));
-    } else {
-        lines.push(Line::from(Span::styled(
-            format!("Last progress {}", age_label(record.updated_unix_ms)),
-            Style::default().fg(theme.text_muted),
-        )));
-    }
+    ]);
     if entry.resume_committed {
         lines.push(Line::from(Span::styled(
-            "Resume approved; this operation is waiting in or entering the transfer queue.",
+            if entry.approved_resume_queue_id.is_some() {
+                "Resume approved and queued behind other transfers; Cancel queued resume returns it to review."
+            } else {
+                "Resume approved and starting; it cannot be cancelled from the waiting queue."
+            },
             Style::default().fg(theme.info),
         )));
     }
@@ -2198,8 +2667,9 @@ fn draw_recovery_detail_pane(
     }
     lines.push(Line::from(Span::styled(
         format!(
-            "Started {} · last progress {}",
+            "Started {} · {} {}",
             timestamp_clock(record.created_unix_ms),
+            if entry.is_live() { "last journal checkpoint" } else { "last progress" },
             timestamp_clock(record.updated_unix_ms)
         ),
         Style::default().fg(theme.text_dim),
@@ -2211,88 +2681,76 @@ fn draw_recovery_detail_pane(
     draw_window_actions(f, app, area, theme);
 }
 
+fn action_description(action: WindowAction, entry: &RecoveryEntry) -> &'static str {
+    match action {
+        WindowAction::Watch => "Open live file/byte progress; Esc returns without stopping the worker",
+        WindowAction::Pause => "Ask the worker to pause at a safe checkpoint; staged data stays",
+        WindowAction::ResumeRunning => "Ask the paused worker to resume copying or moving",
+        WindowAction::StopAndUndo => "Confirm stop, then remove tracked staging and restore eligible names; published output may remain",
+        WindowAction::ForceStop => "Confirm an identity-checked force stop; partial work will need recovery",
+        WindowAction::LeaveRunning => "Close Recovery; the independent worker keeps running",
+        WindowAction::CancelQueuedResume => "Remove the approved retry from the serial transfer queue; return its saved record to recovery review",
+        WindowAction::KeepWaiting => "Close Recovery and let the already-approved retry continue waiting or starting",
+        WindowAction::SetAside => "Confirm release of reserved paths; file content is left untouched",
+        WindowAction::Resume => "Continue the recorded transfer from its recoverable state",
+        WindowAction::Discard if entry.is_discard_cleanup() => "Finish cleaning private staging and release the saved path reservations",
+        WindowAction::Discard => "Confirm removal of private staging and safe restoration of renamed sources",
+        WindowAction::Details => "Inspect saved paths and staging; details also offer a direct action",
+        WindowAction::Inspect => "Inspect why the record could not be read safely",
+        WindowAction::Later => "Leave the decision for later; reserved paths remain blocked",
+    }
+}
+
+fn action_label(action: WindowAction, entry: &RecoveryEntry) -> (&'static str, bool) {
+    match action {
+        WindowAction::Watch => ("Watch progress", false),
+        WindowAction::Pause => ("Pause", false),
+        WindowAction::ResumeRunning => ("Resume worker", false),
+        WindowAction::StopAndUndo => ("Stop and undo", true),
+        WindowAction::ForceStop => ("Force stop", true),
+        WindowAction::LeaveRunning if entry.is_stalled() => ("Keep waiting", false),
+        WindowAction::LeaveRunning => ("Leave running", false),
+        WindowAction::CancelQueuedResume => ("Cancel queued resume", false),
+        WindowAction::KeepWaiting => ("Keep waiting", false),
+        WindowAction::SetAside => ("Set aside", true),
+        WindowAction::Resume => ("Resume", false),
+        WindowAction::Discard if entry.is_discard_cleanup() => ("Finish cleanup", true),
+        WindowAction::Discard => ("Undo (review)", true),
+        WindowAction::Details => ("Details", false),
+        WindowAction::Inspect => ("Inspect", false),
+        WindowAction::Later => ("Later", false),
+    }
+}
+
 fn draw_window_actions(f: &mut Frame, app: &mut AppState, area: Rect, theme: super::theme::Theme) {
-    let Some(entry) = app.recovery_ui.selected_entry() else {
-        return;
-    };
+    let Some(entry) = app.recovery_ui.selected_entry() else { return; };
     let actions = window_actions(entry);
-    if actions.is_empty() || area.height == 0 {
-        return;
+    if actions.is_empty() || area.height < 3 || area.width == 0 { return; }
+    let hint = actions.get(app.recovery_ui.focus)
+        .map(|action| action_description(*action, entry))
+        .unwrap_or("Select an action to review its result");
+    let hint_y = area.y.saturating_add(area.height.saturating_sub(1));
+    f.render_widget(Paragraph::new(hint).style(Style::default().fg(theme.text_dim)),
+        Rect::new(area.x.saturating_add(1), hint_y, area.width.saturating_sub(2), 1));
+    // Two rows, at most three decisions each. A single-row layout would hide
+    // Stop/Leave on the right at ordinary 116-column terminal widths.
+    for (index, action) in actions.iter().copied().enumerate() {
+        let row = index / 3;
+        let col = index % 3;
+        if row >= 2 { break; }
+        let cell_width = area.width.saturating_sub(2) / 3;
+        let x = area.x.saturating_add(1 + (col as u16) * cell_width);
+        let y = area.y.saturating_add(area.height.saturating_sub(3 - row as u16));
+        let (label, dangerous) = action_label(action, entry);
+        let text = format!(" {label} ");
+        let width = (text.chars().count() as u16).min(cell_width);
+        let color = if dangerous { theme.warning } else { theme.cyan };
+        let style = if app.recovery_ui.focus == index {
+            Style::default().fg(theme.bg).bg(color).add_modifier(Modifier::BOLD)
+        } else { Style::default().fg(color).add_modifier(Modifier::BOLD) };
+        f.render_widget(Paragraph::new(text).style(style), Rect::new(x, y, width, 1));
+        app.button_map.record_button(TuiButton::RecoveryAction(index as u8), Rect::new(x, y, width, 1));
     }
-
-    // The details control belongs with the On disk / Blocking facts, not in
-    // the decision row. Keep its action index stable so keyboard and mouse
-    // activation share the same dispatch path.
-    if let Some(details_index) = actions
-        .iter()
-        .position(|action| *action == WindowAction::Details)
-    {
-        let label = " Show these files and paths ";
-        let width = (label.chars().count() as u16).min(area.width.saturating_sub(2));
-        let y = area
-            .y
-            .saturating_add(8)
-            .min(area.y.saturating_add(area.height.saturating_sub(1)));
-        let style = if app.recovery_ui.focus == details_index {
-            Style::default()
-                .fg(theme.bg)
-                .bg(theme.cyan)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme.cyan).add_modifier(Modifier::BOLD)
-        };
-        let rect = Rect::new(area.x.saturating_add(1), y, width, 1);
-        f.render_widget(Paragraph::new(label).style(style), rect);
-        app.button_map.record_button(
-            TuiButton::RecoveryAction(details_index as u8),
-            rect,
-        );
-    }
-
-    let decision = actions
-        .iter()
-        .enumerate()
-        .filter(|(_, action)| **action != WindowAction::Details)
-        .collect::<Vec<_>>();
-    if decision.is_empty() {
-        return;
-    }
-    let labels = decision
-        .iter()
-        .map(|(_, action)| match action {
-            WindowAction::Resume => ("Resume".to_string(), theme.success),
-            WindowAction::Discard if entry.is_discard_cleanup() => {
-                ("Finish cleanup".to_string(), theme.warning)
-            }
-            WindowAction::Discard if entry.irreversible() => {
-                ("Discard, keep what is on disk".to_string(), theme.error)
-            }
-            WindowAction::Discard => ("Discard and restore".to_string(), theme.warning),
-            WindowAction::Inspect => ("Record inspector".to_string(), theme.cyan),
-            WindowAction::Later => ("Decide later".to_string(), theme.dismiss),
-            WindowAction::Details => unreachable!("details is rendered above the decision row"),
-        })
-        .collect::<Vec<_>>();
-    let action_indices = decision.iter().map(|(index, _)| *index).collect::<Vec<_>>();
-    let decision_focus = action_indices
-        .iter()
-        .position(|index| *index == app.recovery_ui.focus)
-        .unwrap_or(usize::MAX);
-    let y = area.y + area.height.saturating_sub(2);
-    draw_button_row_owned(
-        f,
-        Rect::new(
-            area.x.saturating_add(1),
-            y,
-            area.width.saturating_sub(2),
-            1,
-        ),
-        labels,
-        decision_focus,
-        |local_index| TuiButton::RecoveryAction(action_indices[local_index] as u8),
-        &mut app.button_map,
-        theme,
-    );
 }
 
 fn details_restored_height(state: &RecoveryUiState) -> u16 {
@@ -2518,7 +2976,7 @@ fn draw_details_inventory(f: &mut Frame, app: &AppState, area: Rect, theme: supe
                 let y = area.y.saturating_add(offset as u16);
                 let right = match app.recovery_ui.incomplete_sizes.get(&path) {
                     Some(Some(size)) => human_bytes(*size),
-                    Some(None) => "size unavailable".to_string(),
+                    Some(None) => "tree or size unavailable".to_string(),
                     None if app
                         .recovery_ui
                         .size_requests
@@ -2604,13 +3062,19 @@ fn draw_details_footer(f: &mut Frame, app: &mut AppState, area: Rect, theme: sup
     );
     if area.height >= 2 {
         f.render_widget(
-            Paragraph::new("If resumed     continue from partial files · paths remain blocked")
+            Paragraph::new(if entry.is_live() {
+                "Watch progress  observe current worker bytes/files; Esc returns, job continues"
+            } else {
+                "If resumed     continue from partial files · paths remain blocked"
+            })
                 .style(Style::default().fg(theme.text_muted)),
             Rect::new(area.x, area.y.saturating_add(1), area.width, 1),
         );
     }
     if area.height >= 4 {
-        let discarded = if entry.is_discard_cleanup() {
+        let discarded = if entry.is_live() {
+            "Stop and undo   stop worker, then clean eligible staging; published output may remain".to_string()
+        } else if entry.is_discard_cleanup() {
             format!(
                 "If discarded   finish cleanup · release {released} blocked path{}",
                 plural(released)
@@ -2650,7 +3114,7 @@ fn draw_details_footer(f: &mut Frame, app: &mut AppState, area: Rect, theme: sup
     let close_x = area
         .x
         .saturating_add(area.width.saturating_sub(close_width));
-    let close_style = if app.recovery_ui.focus == 0 {
+    let close_style = if app.recovery_ui.focus == 1 {
         Style::default()
             .fg(theme.bg)
             .bg(theme.dismiss)
@@ -2668,6 +3132,28 @@ fn draw_details_footer(f: &mut Frame, app: &mut AppState, area: Rect, theme: sup
         TuiButton::RecoveryDetailsClose,
         Rect::new(close_x, y, close_width, 1),
     );
+    let action = window_actions(entry).into_iter().next();
+    if let Some(action) = action {
+        let label = match action {
+            WindowAction::Watch => " Watch progress ",
+            WindowAction::Resume | WindowAction::ResumeRunning => " Resume ",
+            WindowAction::Pause => " Pause ",
+            WindowAction::StopAndUndo => " Stop and undo ",
+            WindowAction::SetAside => " Set aside ",
+            WindowAction::Discard => " Undo / finish cleanup ",
+            WindowAction::Details | WindowAction::Inspect => " Open actions ",
+            WindowAction::ForceStop => " Force stop ",
+            WindowAction::CancelQueuedResume => " Cancel queued resume ",
+            WindowAction::KeepWaiting => " Keep waiting ",
+            WindowAction::LeaveRunning | WindowAction::Later => " Decide later ",
+        };
+        let width = (label.chars().count() as u16).min(area.width.saturating_sub(close_width));
+        let style = if app.recovery_ui.focus == 0 {
+            Style::default().fg(theme.bg).bg(theme.cyan).add_modifier(Modifier::BOLD)
+        } else { Style::default().fg(theme.cyan).add_modifier(Modifier::BOLD) };
+        f.render_widget(Paragraph::new(label).style(style), Rect::new(area.x, y, width, 1));
+        app.button_map.record_button(TuiButton::RecoveryAction(0), Rect::new(area.x, y, width, 1));
+    }
 
     let esc = "Esc";
     let esc_width = esc.chars().count() as u16;
@@ -2678,6 +3164,49 @@ fn draw_details_footer(f: &mut Frame, app: &mut AppState, area: Rect, theme: sup
             Rect::new(close_x.saturating_sub(esc_width + 2), y, esc_width, 1),
         );
     }
+}
+
+fn draw_safety_confirmation(f: &mut Frame, app: &mut AppState, theme: super::theme::Theme) {
+    let popup = surface_rect(
+        parent_window_rect(f.size(), app.recovery_ui.maximized),
+        CONFIRM_MIN_WIDTH, 14, EPI_POPUP_WIDTH_PERCENT, None, app.recovery_ui.maximized,
+    );
+    let (title, intro, consequence, affirmative) = match app.recovery_ui.surface {
+        RecoverySurface::StopConfirm => (
+            "stop the running transfer and undo recoverable work",
+            "Ask the worker to stop at its next safe checkpoint. The existing recovery engine then removes tracked staging and restores eligible renamed sources.",
+            "Already published files or folders may remain. A move whose source cleanup began may have deleted files that cannot be restored. Do not interpret this as a complete rollback.",
+            "Stop; then recover",
+        ),
+        RecoverySurface::ForceStopConfirm => (
+            "force stop a stalled or unresponsive worker",
+            "Terminate the identity-verified worker using the operating system's process API. Partial files and durable reservations remain for reconciliation.",
+            "This interrupts a write without a graceful checkpoint. It may leave more partial files than a normal Stop. Cleanup starts only after the worker lease is released; completed output may remain.",
+            "Force stop",
+        ),
+        RecoverySurface::SetAsideConfirm => (
+            "preserve an unreadable record and release paths",
+            "Verify there is no live worker and that its old path reservations can be taken over safely. Preserve the unreadable record under TonePoet's private storage.",
+            "Source and destination files are not removed. Those files may still contain partial work. Once paths are released, future operations can overlap them; inspect the disk before proceeding.",
+            "Set aside record",
+        ),
+        _ => return,
+    };
+    let inner = recovery_block(f,popup,title,theme.warning,
+        &mut app.button_map, theme, app.recovery_ui.maximized);
+    if inner.width == 0 || inner.height < 6 { return; }
+    let selected_name = app.recovery_ui.selected_entry()
+        .and_then(|entry| entry.record.as_ref())
+        .map(summarize_destination)
+        .unwrap_or_else(|| "saved unreadable record".into());
+    let body = format!("Operation: {selected_name}\n\n{intro}\n\nWarning: {consequence}");
+    f.render_widget(Paragraph::new(body).wrap(Wrap{trim:false})
+        .style(Style::default().fg(theme.text)), Rect::new(inner.x+1,inner.y+1,
+        inner.width.saturating_sub(2), inner.height.saturating_sub(4)));
+    draw_button_row_owned(f,
+        Rect::new(inner.x+1,inner.y+inner.height.saturating_sub(2),inner.width.saturating_sub(2),1),
+        vec![(affirmative.into(),theme.error),("Cancel".into(),theme.dismiss)],
+        app.recovery_ui.focus,|i| TuiButton::RecoveryConfirm(i as u8),&mut app.button_map,theme);
 }
 
 fn draw_discard_confirm(
@@ -2980,7 +3509,7 @@ fn draw_inspector(f: &mut Frame, app: &mut AppState, theme: super::theme::Theme)
     let popup = surface_rect(
         parent_window_rect(f.size(), app.recovery_ui.maximized),
         DETAILS_MIN_WIDTH,
-        13,
+        17,
         EPI_POPUP_WIDTH_PERCENT,
         None,
         app.recovery_ui.maximized,
@@ -3004,6 +3533,8 @@ fn draw_inspector(f: &mut Frame, app: &mut AppState, theme: super::theme::Theme)
         .unwrap_or_else(|| "The saved recovery record could not be interpreted safely.".to_string());
     let lines = vec![
         Line::from(INSPECTOR_SCOPE_LINE),
+        Line::from(UNREADABLE_BLOCKING_NOTE),
+        Line::from(UNREADABLE_PATH_NOTE),
         Line::raw(""),
         Line::from(Span::styled(
             "Record location:",
@@ -3031,9 +3562,16 @@ fn draw_inspector(f: &mut Frame, app: &mut AppState, theme: super::theme::Theme)
             inner.x.saturating_add(1),
             inner.y.saturating_add(1),
             inner.width.saturating_sub(2),
-            inner.height.saturating_sub(2),
+            inner.height.saturating_sub(3),
         ),
     );
+    draw_button_row_owned(f,
+        Rect::new(inner.x.saturating_add(1), inner.y + inner.height.saturating_sub(1),
+            inner.width.saturating_sub(2),1),
+        vec![("Set aside after ownership check".into(),theme.warning), ("Close".into(),theme.dismiss)],
+        app.recovery_ui.focus,
+        |i| if i==0 { TuiButton::RecoveryAction(0) } else { TuiButton::RecoveryDetailsClose },
+        &mut app.button_map,theme);
 }
 
 fn draw_button_row_owned<F>(
@@ -3345,8 +3883,11 @@ mod tests {
             diagnostic: None,
             queue_id,
             resume_committed: false,
+            approved_resume_queue_id: None,
             discard_committed: false,
             session_deferred: false,
+            live_snapshot: None,
+            stop_requested_unix_ms: None,
         }
     }
 
@@ -3449,7 +3990,7 @@ mod tests {
     #[test]
     fn recovery_tab_labels_match_operator_language() {
         assert_eq!(RecoveryDetailsTab::BlockedPaths.label(), "Blocked paths");
-        assert_eq!(RecoveryDetailsTab::IncompleteFiles.label(), "Incomplete files");
+        assert_eq!(RecoveryDetailsTab::IncompleteFiles.label(), "Staging paths");
         assert_eq!(RecoveryDetailsTab::RenamedSources.label(), "Renamed sources");
     }
 
@@ -3597,6 +4138,326 @@ mod tests {
         for prohibited in ["journal", "descriptor", "recovery reservation"] {
             assert!(!text.to_ascii_lowercase().contains(prohibited));
         }
+    }
+
+    #[test]
+    fn live_worker_is_not_interrupted_and_has_actionable_choices() {
+        let mut entry = test_entry("running", "dest/music", true, None);
+        entry.availability = RecoverySurfaceAvailability::Live;
+        let now = unix_ms_now();
+        entry.live_snapshot = Some(LiveWorkerSnapshot {
+            schema: 1,
+            job_id: uuid::Uuid::new_v4().to_string(),
+            generation: 1,
+            worker: crate::concurrency::OwnerProcessIdentity::current(),
+            observed_unix_ms: now, forward_unix_ms: now,
+            phase: tui_file_picker::FileTaskPhase::Running,
+            status: "copying".into(),
+            current_item: Some(tui_file_picker::ProgressItem::new("large.iso")),
+            totals: tui_file_picker::ProgressTotals {bytes_done: 4_000, bytes_total: Some(10_000), ..Default::default()},
+            rate_bytes_per_sec: Some(2_000), conflict: None,
+        });
+        assert_eq!(entry.state_label(), "running");
+        assert!(!entry.needs_attention());
+        let actions = window_actions(&entry);
+        for action in [WindowAction::Watch, WindowAction::Pause, WindowAction::StopAndUndo,
+            WindowAction::LeaveRunning, WindowAction::Details] {
+            assert!(actions.contains(&action), "missing {action:?}");
+        }
+        assert!(!actions.contains(&WindowAction::Resume));
+        assert!(!actions.contains(&WindowAction::Discard));
+
+        entry.live_snapshot.as_mut().unwrap().phase = tui_file_picker::FileTaskPhase::Paused;
+        assert_eq!(entry.state_label(), "paused");
+        assert!(entry.needs_attention());
+        assert!(window_actions(&entry).contains(&WindowAction::ResumeRunning));
+        assert!(!window_actions(&entry).contains(&WindowAction::Pause));
+    }
+
+    #[test]
+    fn compact_and_full_rows_share_live_byte_progress() {
+        let mut entry = test_entry("large", "destination/large.iso", false, None);
+        entry.availability = RecoverySurfaceAvailability::Live;
+        let identity = uuid::Uuid::new_v4().to_string();
+        entry.live_snapshot = Some(LiveWorkerSnapshot {
+            schema: 1, job_id: identity, generation: 1,
+            worker: crate::concurrency::OwnerProcessIdentity::current(),
+            observed_unix_ms: unix_ms_now(), forward_unix_ms: unix_ms_now(),
+            phase: tui_file_picker::FileTaskPhase::Running,
+            status: "Copying a large file".into(), current_item: None,
+            totals: tui_file_picker::ProgressTotals { bytes_done: 4_000,
+                bytes_total: Some(10_000), ..Default::default() },
+            rate_bytes_per_sec: Some(1_000), conflict: None,
+        });
+        assert_eq!(recovery_row_progress(&entry), ("███░░░░░".into(), " 40%".into()));
+        entry.live_snapshot.as_mut().unwrap().totals.bytes_done = 6_000;
+        assert_eq!(recovery_row_progress(&entry), ("████░░░░".into(), " 60%".into()));
+        entry.live_snapshot = None;
+        assert_eq!(recovery_row_progress(&entry), ("????????".into(), "waiting".into()));
+    }
+
+    #[test]
+    fn approved_resume_queued_has_cancel_and_never_offers_undo() {
+        let mut entry = test_entry("retry", "dest/retry.flac", false, None);
+        entry.resume_committed = true;
+        entry.approved_resume_queue_id = Some(88);
+        assert_eq!(entry.state_label(), "resume queued");
+        assert!(!entry.needs_attention());
+        let actions = window_actions(&entry);
+        assert!(actions.contains(&WindowAction::CancelQueuedResume));
+        assert!(actions.contains(&WindowAction::KeepWaiting));
+        assert!(!actions.contains(&WindowAction::Discard));
+        assert!(!actions.contains(&WindowAction::Resume));
+        entry.approved_resume_queue_id = None;
+        assert_eq!(entry.state_label(), "resume starting");
+        assert!(!window_actions(&entry).contains(&WindowAction::CancelQueuedResume));
+        assert!(window_actions(&entry).contains(&WindowAction::KeepWaiting));
+    }
+
+    #[test]
+    fn cancel_approved_queue_retry_preserves_source_and_destination() {
+        let _home = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-issue81-queued-recovery-cancel");
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("track.flac");
+        let dest = temp.path().join("output");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(&source, b"original").unwrap();
+        let target = dest.join("track.flac");
+        let plan = tui_file_picker::PastePlan {
+            mode: tui_file_picker::FilePickerClipboardMode::Copy,
+            mappings: vec![tui_file_picker::PasteMapping { source: source.clone(), destination: target.clone() }],
+        };
+        let clipboard = tui_file_picker::FilesystemClipboard::new(
+            tui_file_picker::FilePickerClipboardMode::Copy, vec![source.clone()]).unwrap();
+        let entry = {
+            let mut entry = test_entry("retry", target.to_string_lossy().as_ref(), false, None);
+            entry.resume_committed = true;
+            entry.approved_resume_queue_id = Some(88);
+            entry
+        };
+        let mut retry = crate::tui::browse::BrowsePasteRetryPlan::from_plan(plan.clone());
+        retry.recovery_journal_path = Some(entry.journal_path.clone());
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.file_transfers.active_session_id = Some(777); // serial queue occupied
+        app.file_transfers.queued.push_back(QueuedFileTransfer {
+            queue_id: 88, clipboard, clipboard_owner_generation: None,
+            destination_dir: dest, enqueue_plan: plan, retry_plan: Some(retry), recovered: true,
+        });
+        app.recovery_ui.entries.push(entry);
+        app.recovery_ui.focus = 0;
+        let (tx, _rx) = mpsc::channel(8);
+        activate_window_focus(&mut app, &tx);
+        assert!(app.file_transfers.queued.is_empty());
+        assert_eq!(std::fs::read(&source).unwrap(), b"original");
+        assert!(!target.exists(), "queue cancellation must not touch user files");
+    }
+
+    #[test]
+    fn unreadable_records_admit_unknown_reserved_paths_without_fabricated_zero() {
+        let mut entry = test_entry("unreadable", "dest/unreadable", false, None);
+        entry.availability = RecoverySurfaceAvailability::Unreadable;
+        entry.record = None;
+        entry.diagnostic = Some("corrupt saved record".into());
+        assert!(UNREADABLE_BLOCKING_NOTE.contains("may remain blocked"));
+        assert!(UNREADABLE_PATH_NOTE.contains("unknown, not empty"));
+        assert!(window_actions(&entry).contains(&WindowAction::SetAside));
+        assert!(window_actions(&entry).contains(&WindowAction::Inspect));
+    }
+
+    #[test]
+    fn stalled_worker_offers_identity_checked_force_stop() {
+        let mut entry = test_entry("stalled", "dest/music", false, None);
+        entry.availability = RecoverySurfaceAvailability::Live;
+        entry.live_snapshot = Some(LiveWorkerSnapshot {
+            schema: 1, job_id: uuid::Uuid::new_v4().to_string(), generation: 1,
+            worker: crate::concurrency::OwnerProcessIdentity::current(),
+            observed_unix_ms: unix_ms_now().saturating_sub(15_000),
+            forward_unix_ms: unix_ms_now().saturating_sub(15_000),
+            phase: tui_file_picker::FileTaskPhase::Stalled,
+            status: "stalled".into(), current_item: None,
+            totals: tui_file_picker::ProgressTotals::default(), rate_bytes_per_sec: None,
+            conflict: None,
+        });
+        assert!(entry.is_stalled());
+        assert_eq!(entry.state_label(), "running · stalled");
+        assert!(window_actions(&entry).contains(&WindowAction::ForceStop));
+        assert!(!entry.needs_attention(), "live stall needs observation or intervention, not an interrupted decision");
+    }
+
+    #[test]
+    fn all_unresolved_states_have_a_real_action_beyond_details() {
+        let mut unreadable = test_entry("unreadable", "dest/unreadable", true, None);
+        unreadable.availability = RecoverySurfaceAvailability::Unreadable;
+        unreadable.record = None;
+        assert_eq!(window_actions(&unreadable)[0], WindowAction::SetAside);
+        assert!(window_actions(&unreadable).contains(&WindowAction::Inspect));
+        let interrupted = test_entry("interrupted", "dest/interrupted", false, Some(5));
+        assert!(window_actions(&interrupted).contains(&WindowAction::Resume));
+        assert!(window_actions(&interrupted).contains(&WindowAction::Discard));
+        assert!(window_actions(&interrupted).contains(&WindowAction::Later));
+        let mut cleanup = interrupted;
+        cleanup.queue_id = None;
+        cleanup.record.as_mut().unwrap().lifecycle =
+            crate::tui::file_task_runtime::DurableFileTaskLifecycle::AwaitingReconciliation;
+        cleanup.record.as_mut().unwrap().last_status = Some("recovery-ui-discard-in-progress".into());
+        assert!(window_actions(&cleanup).contains(&WindowAction::Discard));
+    }
+
+    #[test]
+    fn stop_and_undo_never_cleans_a_live_lease() {
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        let mut live = test_entry("live", "dest/live", false, None);
+        live.availability = RecoverySurfaceAvailability::Live;
+        let path = live.journal_path.clone();
+        app.recovery_ui.entries.push(live);
+        app.recovery_ui.stop_and_undo_pending.insert(path.clone());
+        let (tx, _rx) = mpsc::channel(8);
+        advance_stop_and_undo(&mut app, &tx);
+        assert!(app.recovery_ui.stop_and_undo_pending.contains(&path));
+        assert!(!app.recovery_ui.discard_in_flight.contains(&path));
+    }
+
+    #[test]
+    fn reconnect_conflict_abort_requires_stop_confirmation_before_any_worker_command() {
+        use super::super::app::{FileTaskControl, FileTaskProgressSession};
+        use tui_file_picker::{ConflictItemKind, ConflictPromptState, ConflictResolution,
+            FileTaskKind, FileTaskProgressState, FileTaskProgressUpdate, FileTaskUserAction};
+
+        let _journal_lock = crate::tui::file_task_runtime::test_environment_lock();
+        let _home = crate::tui::test_support::XdgConfigHomeGuard::new(
+            "tonepoet-reconnect-conflict-confirmation",
+        );
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let journal_dir = crate::tui::file_task_runtime::file_task_journal_dir();
+        std::fs::create_dir_all(&journal_dir).expect("create isolated journal directory");
+        let journal_path = journal_dir.join(format!("{job_id}.jsonl"));
+        let remote = LiveWorkerRef::new(journal_path.clone(), job_id.clone(), 1)
+            .expect("valid generation-bound identity");
+        let (controls, received) = std::sync::mpsc::channel();
+        let (_publisher, _worker_guard) = crate::tui::file_task_live::start_worker(
+            remote.clone(), controls,
+        ).expect("start isolated private command listener");
+
+        let mut entry = test_entry("reconnected", "output/reconnected", false, None);
+        entry.journal_path = journal_path.clone();
+        entry.record.as_mut().unwrap().job_id = job_id.clone();
+        entry.availability = RecoverySurfaceAvailability::Live;
+        let now = unix_ms_now();
+        entry.live_snapshot = Some(LiveWorkerSnapshot {
+            schema: 1, job_id, generation: 1,
+            worker: crate::concurrency::OwnerProcessIdentity::current(),
+            observed_unix_ms: now, forward_unix_ms: now,
+            phase: tui_file_picker::FileTaskPhase::Paused,
+            status: "Waiting for a destination conflict decision".into(),
+            current_item: None, totals: tui_file_picker::ProgressTotals::default(),
+            rate_bytes_per_sec: None,
+            conflict: Some(ConflictPromptState::new(71, "Existing file", "Choose",
+                ConflictItemKind::File)),
+        });
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        app.recovery_ui.entries.push(entry);
+        let (tx, _rx) = mpsc::channel::<AppMessage>(8);
+        let mut progress = FileTaskProgressState::new(FileTaskKind::Copy,
+            "Reconnected copy", tui_file_picker::FilePickerTheme::default());
+        progress.apply_update(FileTaskProgressUpdate::ShowConflict {
+            conflict: ConflictPromptState::new(71, "Existing file", "Choose",
+                ConflictItemKind::File),
+        });
+        let mut session = FileTaskProgressSession::recovery_monitor(progress, remote);
+        let abort = FileTaskUserAction::ChooseConflictResolution(ConflictResolution::Abort);
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+
+        // Key, Ctrl+C, and the rendered mouse Abort all produce this same
+        // semantic action, so the host must guard the shared action dispatcher.
+        for action in [
+            session.progress.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            session.progress.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            abort.clone(), // mouse hit action, verified in the picker crate test
+        ] {
+            assert_eq!(action, abort);
+            assert!(!super::super::keybindings::handle_file_task_user_action(
+                &mut app, &mut session, action, &tx));
+            assert_eq!(app.recovery_ui.surface, RecoverySurface::StopConfirm);
+            assert!(matches!(&app.active_overlay, ActiveOverlay::FileRecovery));
+            assert_eq!(app.recovery_ui.focus, 1, "decline must be the safe default");
+            assert!(!app.recovery_ui.stop_and_undo_pending.contains(&journal_path));
+            assert!(received.recv_timeout(std::time::Duration::from_millis(220)).is_err(),
+                "Abort before confirmation must not reach the worker");
+            handle_key(&mut app, enter, &tx); // Decline confirmation.
+            assert_eq!(app.recovery_ui.surface, RecoverySurface::Window);
+            assert!(session.progress.conflict.as_ref().is_some_and(|c| c.request_id == 71),
+                "declining must leave the same conflict available to the worker");
+            assert!(received.try_recv().is_err());
+        }
+
+        // A reconnected watcher may still return to Recovery with Esc.
+        let back = session.progress.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(back, FileTaskUserAction::Minimize);
+        assert!(!super::super::keybindings::handle_file_task_user_action(
+            &mut app, &mut session, back, &tx));
+        assert!(received.try_recv().is_err());
+        assert!(!app.recovery_ui.stop_and_undo_pending.contains(&journal_path));
+
+        // Other conflict decisions continue through the original mailbox,
+        // with the untouched generation and request ID (including Apply all).
+        for choice in [
+            ConflictResolution::Overwrite { apply_to_all: true },
+            ConflictResolution::Skip { apply_to_all: true },
+            ConflictResolution::Rename,
+        ] {
+            assert!(super::super::keybindings::handle_file_task_user_action(
+                &mut app, &mut session,
+                FileTaskUserAction::ChooseConflictResolution(choice.clone()), &tx));
+            assert_eq!(received.recv_timeout(std::time::Duration::from_secs(2))
+                .expect("control mailbox accepted conflict resolution"),
+                FileTaskControl::ConflictResolution { request_id: 71, resolution: choice });
+        }
+
+        assert!(!super::super::keybindings::handle_file_task_user_action(
+            &mut app, &mut session, abort.clone(), &tx));
+        assert_eq!(app.recovery_ui.surface, RecoverySurface::StopConfirm);
+        app.recovery_ui.focus = 0; // Explicitly choose the destructive affirmative.
+        handle_key(&mut app, enter, &tx);
+        assert_eq!(received.recv_timeout(std::time::Duration::from_secs(2))
+            .expect("confirmed Stop reaches existing worker mailbox"), FileTaskControl::Abort);
+        assert!(app.recovery_ui.stop_and_undo_pending.contains(&journal_path));
+
+        // A locally launched job keeps its original direct conflict behavior.
+        let (local_tx, local_rx) = std::sync::mpsc::channel();
+        let mut local_progress = FileTaskProgressState::new(FileTaskKind::Copy,
+            "Locally launched", tui_file_picker::FilePickerTheme::default());
+        local_progress.apply_update(FileTaskProgressUpdate::ShowConflict {
+            conflict: ConflictPromptState::new(72, "Local collision", "Choose",
+                ConflictItemKind::File),
+        });
+        let mut local = FileTaskProgressSession::new(local_progress, local_tx);
+        assert!(super::super::keybindings::handle_file_task_user_action(
+            &mut app, &mut local, abort, &tx));
+        assert_eq!(local_rx.try_recv().unwrap(), FileTaskControl::ConflictResolution {
+            request_id: 72, resolution: ConflictResolution::Abort,
+        });
+    }
+
+    #[test]
+    fn reconnected_progress_closes_when_its_live_worker_is_gone() {
+        let mut app = AppState::new_for_test(crate::config::TonepoetConfig::default());
+        let id = uuid::Uuid::new_v4().to_string();
+        let remote = LiveWorkerRef::new(
+            crate::tui::file_task_runtime::file_task_journal_dir().join(format!("{id}.jsonl")),
+            id,
+            1,
+        ).unwrap();
+        let progress = tui_file_picker::FileTaskProgressState::new(
+            tui_file_picker::FileTaskKind::Copy,
+            "Recovery watch",
+            crate::tui::keybindings::file_picker_theme_from_theme(&app.theme),
+        );
+        app.active_overlay = ActiveOverlay::FileTaskProgress(
+            crate::tui::app::FileTaskProgressSession::recovery_monitor(progress, remote),
+        );
+        reconcile_progress_watch(&mut app);
+        assert!(matches!(app.active_overlay, ActiveOverlay::FileRecovery));
     }
 
     #[test]

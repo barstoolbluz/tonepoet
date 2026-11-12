@@ -9446,6 +9446,7 @@ pub enum FileTaskControl {
 pub enum FileTaskProgressSessionRole {
     LiveTask,
     RetainedViewer,
+    RecoveryMonitor,
 }
 
 /// Host wrapper around the reusable crate-owned progress overlay.
@@ -9455,6 +9456,7 @@ pub struct FileTaskProgressSession {
     pub role: FileTaskProgressSessionRole,
     pub progress: tui_file_picker::FileTaskProgressState,
     pub controls: mpsc::Sender<FileTaskControl>,
+    pub remote_worker: Option<super::file_task_live::LiveWorkerRef>,
 }
 
 impl FileTaskProgressSession {
@@ -9467,6 +9469,7 @@ impl FileTaskProgressSession {
             role: FileTaskProgressSessionRole::LiveTask,
             progress,
             controls,
+            remote_worker: None,
         }
     }
 
@@ -9481,7 +9484,29 @@ impl FileTaskProgressSession {
             role: FileTaskProgressSessionRole::RetainedViewer,
             progress,
             controls,
+            remote_worker: None,
         }
+    }
+
+    pub fn recovery_monitor(
+        mut progress: tui_file_picker::FileTaskProgressState,
+        remote_worker: super::file_task_live::LiveWorkerRef,
+    ) -> Self {
+        let (controls, receiver) = mpsc::channel();
+        drop(receiver);
+        progress.set_recovery_monitor();
+        Self {
+            session_id: next_file_task_session_id(),
+            role: FileTaskProgressSessionRole::RecoveryMonitor,
+            progress,
+            controls,
+            remote_worker: Some(remote_worker),
+        }
+    }
+
+    #[must_use]
+    pub const fn is_recovery_monitor(&self) -> bool {
+        matches!(self.role, FileTaskProgressSessionRole::RecoveryMonitor)
     }
 
     #[must_use]

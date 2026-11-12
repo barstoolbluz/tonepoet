@@ -247,6 +247,10 @@ pub enum AppMessage {
         journal_path: std::path::PathBuf,
         result: Result<crate::tui::file_task_runtime::RecoveryDiscardSummary, String>,
     },
+    RecoverySetAsideComplete {
+        journal_path: std::path::PathBuf,
+        result: Result<std::path::PathBuf, String>,
+    },
     RecoveryIncompleteSizesLoaded {
         journal_path: std::path::PathBuf,
         sizes: Vec<(std::path::PathBuf, Option<u64>)>,
