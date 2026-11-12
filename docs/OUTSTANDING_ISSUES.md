@@ -5767,3 +5767,29 @@ meets it without changing the frame's appearance. The same holds for any
 other rule or divider that reaches a window's edge.
 
 The account of the cause is from source and fits the screenshot.
+
+---
+
+## 86. The image viewer has no full-screen view
+
+Filed 2026-11-12.
+
+The viewer shows an image in a window over Browse, at most the "View artwork
+height" share of the terminal. There is no way to see an image using the
+whole terminal.
+
+**What we want.**
+
+- In the viewer, a bare `f` shows the current image full screen: the whole
+  terminal, with the TUI not drawn around it.
+- The image is as large as fits with all of it visible. A wide image fills
+  the width, a tall one fills the height. It is never enlarged beyond its own
+  pixels, whatever "Allow image enlargement" says.
+- The image Settings menu gains a toggle to open images full screen directly.
+  It is saved with the other artwork settings.
+- Esc leaves full screen and returns to Browse. The image's right-click menu
+  gains "Exit full screen", shown only in full screen, which does the same.
+- Stepping between images works in full screen as it does in the normal
+  view.
+
+No zoom. Full screen is a single fitted view.
