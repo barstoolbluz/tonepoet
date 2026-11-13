@@ -49,16 +49,48 @@ pub fn materialize_validated_final(paths: &TransactionalTrackPaths) -> io::Resul
 /// into the final path. Cross-device fallback copies into a hidden temp file in
 /// the final directory, fsyncs it, then atomically renames temp -> final.
 pub fn publish_validated_to_final(validated_path: &Path, final_path: &Path) -> io::Result<()> {
+    publish_validated_to_final_checked(validated_path, final_path, || Ok(()))
+}
+
+/// The same atomic publisher with a cooperative checkpoint. Native extraction
+/// uses this hook at each 64 KiB cross-volume copy boundary to honor pause,
+/// skip-current, and abort without exposing a partially published filename.
+/// Ordinary conversion publication uses the no-op checkpoint above.
+pub fn publish_validated_to_final_checked(
+    validated_path: &Path,
+    final_path: &Path,
+    checkpoint: impl FnMut() -> io::Result<()>,
+) -> io::Result<()> {
+    publish_validated_to_final_checked_observed(
+        validated_path, final_path, checkpoint, None, |_| Ok(()),
+    )
+}
+
+/// Optional, extraction-only observation of cross-device publication. The
+/// provided private name is journal-owned and is recorded *before* creation.
+/// `on_temporary(None)` is called only once a temporary path is gone; failed
+/// deletion leaves the durable recovery obligation in place. Convert passes
+/// no observer through the original entrypoint and retains its old filenames.
+pub(crate) fn publish_validated_to_final_checked_observed(
+    validated_path: &Path,
+    final_path: &Path,
+    mut checkpoint: impl FnMut() -> io::Result<()>,
+    private_temp: Option<PathBuf>,
+    on_temporary: impl FnMut(Option<&Path>) -> io::Result<()>,
+) -> io::Result<()> {
+    checkpoint()?;
     if let Some(parent) = final_path.parent() {
         fs::create_dir_all(parent)?;
     }
-
+    checkpoint()?;
     match fs::rename(validated_path, final_path) {
         Ok(()) => {
             sync_parent_dir_best_effort(final_path);
             Ok(())
         }
-        Err(err) if is_cross_device_error(&err) => copy_across_devices_atomically(validated_path, final_path),
+        Err(err) if is_cross_device_error(&err) =>
+            copy_across_devices_atomically_checked_observed(
+                validated_path, final_path, checkpoint, private_temp, on_temporary),
         Err(err) => Err(err),
     }
 }
@@ -98,36 +130,67 @@ pub fn is_transactional_state_file(path: &Path) -> bool {
     name.ends_with(PARTIAL_SUFFIX) || name.ends_with(VALIDATED_SUFFIX)
 }
 
-fn copy_across_devices_atomically(src: &Path, dst: &Path) -> io::Result<()> {
+fn copy_across_devices_atomically_checked_observed(
+    src: &Path,
+    dst: &Path,
+    mut checkpoint: impl FnMut() -> io::Result<()>,
+    private_temp: Option<PathBuf>,
+    mut on_temporary: impl FnMut(Option<&Path>) -> io::Result<()>,
+) -> io::Result<()> {
     let parent = dst.parent().unwrap_or_else(|| Path::new("."));
     let file_name = dst.file_name().and_then(|s| s.to_str()).unwrap_or("tonepoet-output");
-    let tmp = parent.join(format!(
+    // Only extraction carries a durable temp identity. Ordinary Convert
+    // preserves its historical publication/cleanup error contract.
+    let journaled_native_temp = private_temp.is_some();
+    let tmp = private_temp.unwrap_or_else(|| parent.join(format!(
         ".{file_name}.tmp-{}-{}",
         std::process::id(),
         Utc::now().timestamp_nanos_opt().unwrap_or_default()
-    ));
-
+    )));
+    if tmp.parent() != Some(parent) || tmp == dst {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "publication temporary path leaves destination parent"));
+    }
+    on_temporary(Some(&tmp))?;
+    let mut created = false;
     let copy_result = (|| {
         let mut in_file = File::open(src)?;
         let mut out_file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        created = true;
         let mut buffer = [0_u8; 64 * 1024];
         loop {
+            checkpoint()?;
             let n = in_file.read(&mut buffer)?;
-            if n == 0 {
-                break;
-            }
+            if n == 0 { break; }
             out_file.write_all(&buffer[..n])?;
         }
         out_file.sync_all()?;
+        checkpoint()?;
         drop(out_file);
         fs::rename(&tmp, dst)?;
         sync_parent_dir_best_effort(dst);
-        fs::remove_file(src)?;
+        if journaled_native_temp {
+            // The public filename already contains the complete, synced data.
+            // Recovery owns this exact publication, so a failure to remove
+            // private source staging must not report the output as missing.
+            let _ = fs::remove_file(src);
+        } else {
+            // The pre-existing Convert path keeps its original failure
+            // propagation semantics; native extraction alone opts in above.
+            fs::remove_file(src)?;
+        }
         Ok(())
     })();
-
-    if copy_result.is_err() {
-        let _ = fs::remove_file(&tmp);
+    if copy_result.is_err() && created {
+        match fs::remove_file(&tmp) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return copy_result, // retain the recovery record
+        }
+    }
+    // This path is either published or provably not created by this call.
+    // An unsuccessful cleanup retains the journaled temporary for Recovery.
+    if let Err(error) = on_temporary(None) {
+        return Err(error);
     }
     copy_result
 }
@@ -178,4 +241,23 @@ fn is_cross_device_error(err: &io::Error) -> bool {
     { err.raw_os_error() == Some(libc::EXDEV) }
     #[cfg(not(unix))]
     { false }
+}
+
+#[cfg(test)]
+mod native_publication_checkpoint_tests {
+    use super::*;
+
+    #[test]
+    fn stopped_publication_never_exposes_an_output_filename() {
+        let temporary = tempfile::tempdir().expect("private output root");
+        let source = temporary.path().join("completed.dsf");
+        let target = temporary.path().join("destination").join("selected.dsf");
+        fs::write(&source, b"complete private media").expect("private media");
+        let result = publish_validated_to_final_checked(&source, &target, || {
+            Err(io::Error::new(io::ErrorKind::Interrupted, "skip current"))
+        });
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert!(source.is_file(), "private completed media remains until owner cleans it");
+        assert!(!target.exists(), "aborted item is never published");
+    }
 }

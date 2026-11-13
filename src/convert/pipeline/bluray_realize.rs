@@ -35,7 +35,7 @@ use super::bluray_wav_validate::{
 };
 use super::errors::{ConvertError, ToolRunnerError};
 use super::progress::OperationProgressTracker;
-use super::tool::{ToolBinary, ToolCommand, ToolRunner};
+use super::tool::{NativeToolPause, ToolBinary, ToolCommand, ToolRunner};
 use super::track_executor::{run_tool_command_with_concurrency, ToolConcurrencyLimits};
 use super::types::{StagingDir, TrackSourceRef};
 
@@ -140,7 +140,7 @@ pub async fn realize_bluray_track(
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
     progress_tracker: Option<&mut OperationProgressTracker<'_>>,
 ) -> Result<PathBuf, ConvertError> {
-    realize_bluray_track_impl(src,staging,runner,cancel,tool_concurrency_limits,progress_tracker,false).await
+    realize_bluray_track_impl(src,staging,runner,cancel,tool_concurrency_limits,progress_tracker,false,None).await
 }
 
 pub(super) async fn realize_bluray_track_native(
@@ -150,8 +150,9 @@ pub(super) async fn realize_bluray_track_native(
     cancel: &CancellationToken,
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
     progress_tracker: Option<&mut OperationProgressTracker<'_>>,
+    native_pause: Arc<NativeToolPause>,
 ) -> Result<PathBuf, ConvertError> {
-    realize_bluray_track_impl(src,staging,runner,cancel,tool_concurrency_limits,progress_tracker,true).await
+    realize_bluray_track_impl(src,staging,runner,cancel,tool_concurrency_limits,progress_tracker,true,Some(native_pause)).await
 }
 
 async fn realize_bluray_track_impl(
@@ -162,6 +163,7 @@ async fn realize_bluray_track_impl(
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
     _progress_tracker: Option<&mut OperationProgressTracker<'_>>,
     native_large: bool,
+    native_pause: Option<Arc<NativeToolPause>>,
 ) -> Result<PathBuf, ConvertError> {
     let TrackSourceRef::BluRayTrack {
         source,
@@ -261,6 +263,7 @@ async fn realize_bluray_track_impl(
         channel_layout.as_deref(),
         cancel,
         native_large,
+        native_pause.as_deref(),
     )?;
 
     validate_nonempty_wav(&wav_path)?;
@@ -413,6 +416,7 @@ fn realize_lpcm_from_libbluray_title(
     expected_channel_layout: Option<&str>,
     cancel: &CancellationToken,
     native_large: bool,
+    native_pause: Option<&NativeToolPause>,
 ) -> Result<(), ConvertError> {
     let backend_source = bluray_source_path_for_backend(source).map_err(|err| {
         ConvertError::TrackValidation(format!(
@@ -505,7 +509,8 @@ fn realize_lpcm_from_libbluray_title(
     let mut detected_format: Option<TsPacketFormat> = None;
 
     loop {
-        if cancel.is_cancelled() {
+        if native_pause.is_some_and(|pause| !pause.cooperative_checkpoint(cancel))
+            || cancel.is_cancelled() {
             return Err(ConvertError::Realize("cancelled".to_string()));
         }
         let read = title_source.read(&mut read_buffer).map_err(|err| {
@@ -594,7 +599,8 @@ fn realize_lpcm_from_libbluray_title(
             packets_since_cancel_check += 1;
             if packets_since_cancel_check >= BLURAY_READ_PACKET_COUNT {
                 packets_since_cancel_check = 0;
-                if cancel.is_cancelled() {
+                if native_pause.is_some_and(|pause| !pause.cooperative_checkpoint(cancel))
+                    || cancel.is_cancelled() {
                     return Err(ConvertError::Realize("cancelled".to_string()));
                 }
             }

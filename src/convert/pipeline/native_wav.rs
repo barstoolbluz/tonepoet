@@ -240,6 +240,16 @@ pub(super) fn package_raw_pcm(
     raw: &Path, output: &Path, format: NativePcmFormat,
     container: NativeWavContainer, cancel: &CancellationToken,
 ) -> Result<(), String> {
+    package_raw_pcm_checked(raw, output, format, container, cancel, || Ok(()))
+}
+
+/// Extraction-only pause checkpoint. Ordinary callers retain the original
+/// signature and do not pay for any extra shared-state polling.
+pub(super) fn package_raw_pcm_checked(
+    raw: &Path, output: &Path, format: NativePcmFormat,
+    container: NativeWavContainer, cancel: &CancellationToken,
+    mut checkpoint: impl FnMut() -> Result<(), String>,
+) -> Result<(), String> {
     let size = fs::metadata(raw).map_err(|e| format!("Raw PCM not found: {e}"))?.len();
     let align = u64::from(format.block_align()?);
     if size == 0 || size % align != 0 { return Err("Raw audio is empty or has an incomplete sample frame".into()); }
@@ -254,6 +264,7 @@ pub(super) fn package_raw_pcm(
     let mut buffer = vec![0u8; chunk_bytes];
     let mut remaining = size;
     while remaining != 0 {
+        checkpoint()?;
         if cancel.is_cancelled() { return Err("Extraction cancelled while packaging PCM".into()); }
         let want = usize::try_from(remaining.min(buffer.len() as u64)).map_err(|e|e.to_string())?;
         input.read_exact(&mut buffer[..want]).map_err(|e| format!("Read raw PCM: {e}"))?;
@@ -271,6 +282,7 @@ pub(super) fn package_raw_pcm(
         output_file.write_all(&buffer[..want]).map_err(|e| format!("Write native WAV: {e}"))?;
         remaining -= want as u64;
     }
+    checkpoint()?;
     output_file.write_all(&[0; 8][..padding as usize]).map_err(|e| e.to_string())?;
     output_file.sync_all().map_err(|e| e.to_string())?;
     let actual = output_file.metadata().map_err(|e|e.to_string())?.len();
@@ -454,6 +466,14 @@ pub(super) fn concatenate_generated_waves(
     inputs: &[std::path::PathBuf], output: &Path,
     container: NativeWavContainer, cancel: &CancellationToken,
 ) -> Result<(Vec<u64>, u32), String> {
+    concatenate_generated_waves_checked(inputs, output, container, cancel, || Ok(()))
+}
+
+pub(super) fn concatenate_generated_waves_checked(
+    inputs: &[std::path::PathBuf], output: &Path,
+    container: NativeWavContainer, cancel: &CancellationToken,
+    mut checkpoint: impl FnMut() -> Result<(), String>,
+) -> Result<(Vec<u64>, u32), String> {
     if inputs.is_empty() { return Err("No selected chapters to concatenate".into()); }
     let spool = output.with_extension("native-join-pcm");
     let mut raw = OpenOptions::new().create_new(true).write(true).open(&spool)
@@ -462,6 +482,7 @@ pub(super) fn concatenate_generated_waves(
     let mut samples = Vec::with_capacity(inputs.len());
     let mut buf = vec![0u8; 1024*1024];
     for path in inputs {
+        checkpoint()?;
         if cancel.is_cancelled() { return Err("Extraction cancelled".into()); }
         let (format, start, bytes) = generated_wave_span(path)?;
         if let Some(previous) = common {
@@ -472,6 +493,7 @@ pub(super) fn concatenate_generated_waves(
         f.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
         let mut remaining = bytes;
         while remaining > 0 {
+            checkpoint()?;
             if cancel.is_cancelled() { return Err("Extraction cancelled".into()); }
             let count = usize::try_from(remaining.min(buf.len() as u64)).map_err(|e|e.to_string())?;
             f.read_exact(&mut buf[..count]).map_err(|e| e.to_string())?;
@@ -482,7 +504,7 @@ pub(super) fn concatenate_generated_waves(
     raw.sync_all().map_err(|e| e.to_string())?;
     drop(raw);
     let format = common.ok_or("No native PCM format found")?;
-    package_raw_pcm(&spool, output, format, container, cancel)?;
+    package_raw_pcm_checked(&spool, output, format, container, cancel, &mut checkpoint)?;
     fs::remove_file(&spool).map_err(|e| e.to_string())?;
     Ok((samples, format.rate))
 }

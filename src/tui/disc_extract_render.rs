@@ -32,11 +32,6 @@ fn format_bytes(bytes: u64) -> String {
     else { format!("{bytes} B") }
 }
 
-fn row_style(focused: bool, selected: bool, theme: Theme) -> Style {
-    if focused && selected { Style::default().fg(theme.pill_active_fg).bg(theme.selection_bg).add_modifier(Modifier::BOLD) }
-    else { Style::default().fg(theme.text) }
-}
-
 fn check(checked: bool) -> &'static str { if checked { "[✓]" } else { "[ ]" } }
 fn program_check(s: &DiscBrowserState, i: usize) -> &'static str {
     if !s.is_extractable(i) { "×" } else { check(s.selected[i]) }
@@ -72,6 +67,15 @@ fn space_for(path: &Path) -> Option<u64> {
     fs2::available_space(p).ok()
 }
 
+fn rule(frame: &mut ratatui::Frame, area: Rect, theme: Theme) {
+    if area.width > 0 && area.height > 0 {
+        frame.render_widget(Paragraph::new("─".repeat(area.width as usize))
+            .style(Style::default().fg(theme.title).bg(theme.panel_bg)), area);
+    }
+}
+
+/// The single frame and its dividers belong to the dialog, not to individual
+/// panes. Every region is derived from the current viewport on each draw.
 pub fn draw(
     frame: &mut ratatui::Frame,
     state: &DiscBrowserState,
@@ -81,106 +85,165 @@ pub fn draw(
 ) {
     let area = frame.size();
     if area.width < 64 || area.height < 20 {
-        let label = "Make the terminal at least 64×20 to extract.";
-        frame.render_widget(Paragraph::new(label).alignment(Alignment::Center),
+        frame.render_widget(Paragraph::new("Make the terminal at least 64×20 to extract.")
+            .alignment(Alignment::Center).style(Style::default().fg(theme.label)),
             Rect::new(area.x, area.y + area.height / 2, area.width, 1));
         return;
     }
     let wide = area.width >= 140 && area.height >= 36;
     let small = area.width < 96 || area.height < 30;
-    let popup = Rect::new(area.x + 2, area.y + 1, area.width - 4, area.height - 2);
+    let popup = Rect::new(area.x + 1, area.y + 1, area.width - 2, area.height - 2);
     frame.render_widget(Clear, popup);
+    frame.render_widget(Block::default().style(Style::default().bg(theme.panel_bg))
+        .borders(Borders::LEFT | Borders::RIGHT)
+        .border_style(Style::default().fg(theme.title)), popup);
+
     let source_name = state.source_path.file_name()
         .map(|v| v.to_string_lossy().into_owned()).unwrap_or_else(|| state.contents.label.clone());
     let action = match state.contents.format {
         DiscFormat::Sacd | DiscFormat::DvdAudio => "extract tracks",
         DiscFormat::DvdVideo | DiscFormat::BluRay => "extract chapters",
     };
-    let type_name = format!("{} {}", state.contents.format.name(), if state.source_path.is_dir() { "folder" } else { "ISO" });
-    let title = clip(&format!("▸ {action} · {source_name}                            {type_name}"), popup.width - 2);
-    let border = Block::default().borders(Borders::ALL).border_style(Style::default().fg(theme.border))
-        .title(Span::styled(title, Style::default().fg(theme.title).add_modifier(Modifier::BOLD)));
-    let inner = border.inner(popup);
-    frame.render_widget(border, popup);
+    let source_type = format!("{} {}", state.contents.format.name(),
+        if state.source_path.is_dir() { "folder" } else { "ISO" });
+    let tag_width = (source_type.chars().count() as u16 + 1).min(popup.width / 2);
+    let title_style = Style::default().fg(theme.panel_bg).bg(theme.title).add_modifier(Modifier::BOLD);
+    frame.render_widget(Block::default().style(title_style), Rect::new(popup.x,popup.y,popup.width,1));
+    let left = Rect::new(popup.x+1,popup.y,popup.width.saturating_sub(tag_width+2),1);
+    frame.render_widget(Paragraph::new(clip(&format!("▸ {action} · {source_name}"),left.width))
+        .style(title_style),left);
+    let right = Rect::new(popup.x+popup.width-tag_width-1,popup.y,tag_width,1);
+    frame.render_widget(Paragraph::new(source_type).alignment(Alignment::Right)
+        .style(title_style),right);
 
-    // Reserve presentation rows first. Small terminals hide inactive panes
-    // instead of shrinking the lists into unreadable two-column slivers.
+    let inner = Rect::new(popup.x+1,popup.y+1,popup.width-2,popup.height-2);
     let header_height = if small { 2 } else { 3 };
-    let footer_height = if small { 1 } else { 2 };
-    let results_height = if small { 1 } else { 2 };
-    // Wide output is two columns; medium stacks every row. Both reserve
-    // enough height for DVD-Audio's conditional controls.
     let output_count = state.output_rows().len() as u16;
-    let output_height = if small { 2 } else if wide { output_count.div_ceil(2) } else { output_count };
-    let warning_height = if state.blockers(scratch).is_empty() { 0 } else { 1 };
-    let chunks = Layout::default().direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(header_height), Constraint::Min(1),
-            Constraint::Length(output_height), Constraint::Length(warning_height),
-            Constraint::Length(results_height), Constraint::Length(footer_height),
-        ]).split(inner);
-    draw_header(frame, state, chunks[0], small, theme);
+    let output_height = if small { 1 } else if wide { output_count.div_ceil(2).max(2) }
+        else { output_count.max(1) };
+    let results_height = if small { 1 } else { 2 };
+    let footer_height = if small { 1 } else { 2 };
+    let problems = state.blockers(scratch);
+    let warning_height = u16::from(!problems.is_empty());
+    let chunks = Layout::default().direction(Direction::Vertical).constraints([
+        Constraint::Length(header_height), Constraint::Length(1),
+        Constraint::Min(1), Constraint::Length(1),
+        Constraint::Length(output_height), Constraint::Length(u16::from(!small)),
+        Constraint::Length(warning_height), Constraint::Length(results_height),
+        Constraint::Length(1), Constraint::Length(footer_height),
+    ]).split(inner);
+    draw_header(frame,state,chunks[0],small,theme);
+    rule(frame,chunks[1],theme);
     if small {
         match state.focus {
-            ExtractFocus::Programs => draw_programs(frame,state,chunks[1],buttons,theme),
-            ExtractFocus::Items => draw_items(frame,state,chunks[1],buttons,theme,false),
-            ExtractFocus::Output => draw_output(frame,state,chunks[1],buttons,theme,false),
+            ExtractFocus::Programs => draw_programs(frame,state,chunks[2],buttons,theme),
+            ExtractFocus::Items => draw_items(frame,state,chunks[2],buttons,theme,false),
+            ExtractFocus::Output => draw_output(frame,state,chunks[2],buttons,theme,false),
         }
     } else {
-        let prefix = (34u16.min(chunks[1].width.saturating_sub(1))).max(chunks[1].width * 34 / 100);
-        let program_width = prefix.min(chunks[1].width * 50 / 100);
-        let panes = Layout::default().direction(Direction::Horizontal)
-            .constraints([Constraint::Length(program_width), Constraint::Min(1)]).split(chunks[1]);
+        // The largest authored program label plus checkbox, duration and
+        // count determines the preferred width, constrained by the mockup's
+        // proportional bounds. No fixed 80-column assumption.
+        let longest = state.contents.presentations.iter().enumerate().map(|(i,p)| {
+            header_for(p.id,p,i).chars().count() + 7
+                + duration_display(p.total_duration_secs).chars().count()
+                + p.tracks.len().to_string().len() + 11
+        }).max().unwrap_or(0) as u16;
+        let pane_width = chunks[2].width;
+        let min_width = (pane_width as u32 * 34 / 100) as u16;
+        let max_width = pane_width / 2;
+        let program_width = longest.clamp(min_width.min(max_width),max_width)
+            .min(pane_width.saturating_sub(2));
+        let panes = Layout::default().direction(Direction::Horizontal).constraints([
+            Constraint::Length(program_width),Constraint::Length(1),Constraint::Min(1)
+        ]).split(chunks[2]);
         draw_programs(frame,state,panes[0],buttons,theme);
-        draw_items(frame,state,panes[1],buttons,theme,wide);
+        if panes[1].height > 0 {
+            for y in panes[1].y..panes[1].y+panes[1].height {
+                frame.render_widget(Paragraph::new("│").style(Style::default().fg(theme.title)),
+                    Rect::new(panes[1].x,y,1,1));
+            }
+        }
+        draw_items(frame,state,panes[2],buttons,theme,wide);
     }
-    if !small { draw_output(frame,state,chunks[2],buttons,theme,wide); }
-    else {
-        let tabs = match state.focus { ExtractFocus::Programs=>"AREAS / GROUPS / TITLES / PLAYLISTS", ExtractFocus::Items=>"TRACKS / CHAPTERS", ExtractFocus::Output=>"OUTPUT" };
-        frame.render_widget(Paragraph::new(format!("Tab: {tabs}")),chunks[2]);
-    }
-    let problems = state.blockers(scratch);
+    rule(frame,chunks[3],theme);
+    if small {
+        // The three tabs use the existing pane focus; no extra navigation
+        // state, and no generic label which obscures the available panes.
+        let program = match state.contents.format {
+            DiscFormat::Sacd => "Areas",
+            DiscFormat::DvdAudio => "Groups",
+            DiscFormat::DvdVideo => "Titles",
+            DiscFormat::BluRay => "Playlists",
+        };
+        let item = if matches!(state.contents.format, DiscFormat::DvdVideo | DiscFormat::BluRay) {
+            "Chapters"
+        } else { "Tracks" };
+        let tabs = [(program, ExtractFocus::Programs),
+            (item, ExtractFocus::Items), ("Output", ExtractFocus::Output)];
+        let mut line = Vec::new();
+        for (i, (label, focus)) in tabs.iter().enumerate() {
+            if i != 0 { line.push(Span::styled("  ", Style::default().fg(theme.text_dim))); }
+            let style = if state.focus == *focus {
+                Style::default().fg(theme.panel_bg).bg(theme.tab_active).add_modifier(Modifier::BOLD)
+            } else { Style::default().fg(theme.label) };
+            line.push(Span::styled(format!(" {label} "), style));
+        }
+        frame.render_widget(Paragraph::new(Line::from(line))
+            .style(Style::default().bg(theme.panel_bg)), chunks[4]);
+    } else { draw_output(frame,state,chunks[4],buttons,theme,wide); }
     if let Some(problem) = problems.first() {
-        frame.render_widget(Paragraph::new(clip(&format!("⚠ {problem}"), chunks[3].width))
-            .style(Style::default().fg(theme.error)), chunks[3]);
+        frame.render_widget(Paragraph::new(clip(&format!("⚠ {problem}"),chunks[6].width))
+            .style(Style::default().fg(theme.error)),chunks[6]);
     }
-    draw_results(frame,state,scratch,chunks[4],small,theme);
-    draw_footer(frame,state,chunks[5],buttons,small,problems.is_empty(),theme);
+    draw_results(frame,state,scratch,chunks[7],small,theme);
+    rule(frame,chunks[8],theme);
+    draw_footer(frame,state,chunks[9],buttons,small,problems.is_empty(),theme);
+    rule(frame,Rect::new(popup.x+1,popup.y+popup.height-1,popup.width-2,1),theme);
     if let Some(panel) = state.panel { draw_panel(frame,state,panel,popup,theme); }
 }
 
 fn draw_header(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect, small: bool, theme: Theme) {
-    let mut lines = vec![Line::from(clip(&format!("{} · {} · {} · {}",
+    if r.width == 0 || r.height == 0 { return; }
+    let mut lines = vec![Line::from(Span::styled(clip(&format!("{} · {} · {} · {}",
         s.contents.album_title.as_deref().unwrap_or(&s.contents.label),
         s.contents.album_artist.as_deref().unwrap_or("no disc text"),
         s.contents.genre.as_deref().unwrap_or(""),
-        s.contents.year.as_deref().unwrap_or("")),r.width))];
+        s.contents.year.as_deref().unwrap_or("")),r.width),
+        Style::default().fg(theme.value)))];
     if !small && s.contents.format == DiscFormat::Sacd {
         let details = s.contents.presentations.first()
             .and_then(|p| p.extract.sacd_header_details.as_deref())
             .unwrap_or("SACD · native DSD64");
-        lines.push(Line::from(clip(details, r.width)));
+        lines.push(Line::from(Span::styled(clip(details,r.width),
+            Style::default().fg(theme.text_dim))));
     }
-    let diagnostics = if s.contents.diagnostics.is_empty() { "none".to_string() }
-        else { format!("{}", s.contents.diagnostics.len()) };
-    let summary = if s.contents.format == DiscFormat::Sacd {
-        // At 64x20 the second header row is the diagnostics affordance.
-        // Authored SACD details remain visible on medium/wide terminals.
-        format!("Diagnostics  {diagnostics}  · d view")
-    } else {
-        format!("Protection  {}    Diagnostics  {diagnostics}  · d view", s.protection_display())
-    };
-    let summary_color = if s.contents.diagnostics.is_empty() { theme.text_dim } else { theme.warning };
-    lines.push(Line::from(Span::styled(clip(&summary, r.width),Style::default().fg(summary_color))));
-    frame.render_widget(Paragraph::new(lines),r);
+    let diagnostics = if s.contents.diagnostics.is_empty() { "none".to_owned() }
+        else { s.contents.diagnostics.len().to_string() };
+    let color = if s.contents.diagnostics.is_empty() { theme.value } else { theme.warning };
+    let mut summary = Vec::new();
+    if !(small && s.contents.format == DiscFormat::Sacd) {
+        summary.push(Span::styled("Protection  ",Style::default().fg(theme.label)));
+        summary.push(Span::styled(format!("{}    ",s.protection_display()),
+            Style::default().fg(theme.value)));
+    }
+    summary.push(Span::styled("Diagnostics  ",Style::default().fg(theme.label)));
+    summary.push(Span::styled(diagnostics,Style::default().fg(color)));
+    if !s.contents.diagnostics.is_empty() {
+        summary.push(Span::styled("  · d view",Style::default().fg(theme.info)));
+    }
+    lines.push(Line::from(summary));
+    frame.render_widget(Paragraph::new(lines).style(Style::default().bg(theme.panel_bg)),r);
 }
 
 fn draw_programs(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect, buttons: &mut ButtonRenderMap, theme: Theme) {
     let title = match s.contents.format { DiscFormat::Sacd=>"AREAS",DiscFormat::DvdAudio=>"GROUPS",DiscFormat::DvdVideo=>"TITLES",DiscFormat::BluRay=>"PLAYLISTS" };
-    let header = format!("{title}  {} checked · {} hidden",s.selected_program_count(),s.contents.suppressed.len());
-    let inner = Rect::new(r.x+1,r.y+1,r.width.saturating_sub(2),r.height.saturating_sub(2));
-    frame.render_widget(Block::default().borders(Borders::ALL).title(header)
-        .border_style(Style::default().fg(if s.focus==ExtractFocus::Programs {theme.info} else {theme.border_dim})),r);
+    frame.render_widget(Paragraph::new(Line::from(vec![
+        Span::styled(format!("{title}  "),Style::default().fg(theme.header)),
+        Span::styled(format!("{} of {} checked · {} hidden",s.selected_program_count(),
+            s.len(),s.contents.suppressed.len()),Style::default().fg(theme.text_dim)),
+    ])),Rect::new(r.x+1,r.y,r.width.saturating_sub(2),1));
+    let inner = Rect::new(r.x+1,r.y+1,r.width.saturating_sub(2),r.height.saturating_sub(1));
     if inner.width == 0 || inner.height == 0 { return; }
     let mut display_rows: Vec<(Option<usize>,String,bool,Option<usize>)> = Vec::new();
     // Keep all streams of the same authored title/playlist together. Blu-ray
@@ -240,78 +303,182 @@ fn draw_programs(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect, butt
     let max_scroll=display_rows.len().saturating_sub(inner.height as usize);
     let scroll = if cursor_row < s.scroll { cursor_row } else if cursor_row>=s.scroll+inner.height as usize {
         cursor_row+1-inner.height as usize } else { s.scroll }.min(max_scroll);
-    for (offset,(index,label,focused,angle_owner)) in display_rows.iter().skip(scroll).take(inner.height as usize).enumerate() {
+    for (offset,(index,label,focused,angle_owner)) in display_rows.iter()
+        .skip(scroll).take(inner.height as usize).enumerate() {
         let y=inner.y+offset as u16;
-        let mut style=row_style(s.focus==ExtractFocus::Programs,*focused,theme);
-        if index.is_none() { style=style.fg(theme.text_dim); }
-        if index.is_some_and(|i| !s.is_extractable(i)) && !*focused {
-            style=style.fg(theme.error);
-        }
+        let active = s.focus==ExtractFocus::Programs && *focused;
+        let bg = if active { theme.selection_bg } else { theme.panel_bg };
+        frame.render_widget(Block::default().style(Style::default().bg(bg)),
+            Rect::new(inner.x,y,inner.width,1));
         if let Some(i)=index {
             buttons.record_button(TuiButton::DiscBrowserStream(*i),Rect::new(inner.x,y,inner.width,1));
-            buttons.record_button(TuiButton::DiscBrowserExpand(*i),Rect::new(inner.x,y,4.min(inner.width),1));
+            buttons.record_button(TuiButton::DiscBrowserExpand(*i),
+                Rect::new(inner.x+2,y,4.min(inner.width.saturating_sub(2)),1));
         }
-        if let Some(owner) = angle_owner {
+        let mut text = label.as_str();
+        let mut suffix = None;
+        if let Some(i)=index {
+            let p=&s.contents.presentations[*i];
+            if matches!(s.contents.format,DiscFormat::Sacd|DiscFormat::DvdAudio) {
+                let tail=format!("{} · {} tracks",duration_display(p.total_duration_secs),p.tracks.len());
+                if let Some(base) = label.strip_suffix(&tail) {
+                    suffix=Some(tail);
+                    text=base.trim_end();
+                }
+            }
+        } else if label.contains(" chapters") {
+            // Title/playlist group headings align like SACD program rows.
+            if let Some(split) = label.rfind("  ") {
+                if label[split+2..].contains(" chapters") {
+                    suffix=Some(label[split+2..].to_owned());
+                    text=&label[..split];
+                }
+            }
+        }
+        let right_width = suffix.as_ref().map_or(0,|t|t.chars().count() as u16);
+        let left_width=inner.width.saturating_sub(right_width + u16::from(right_width>0));
+        let mut spans = Vec::new();
+        spans.push(Span::styled(if active { "▸ " } else { "  " },
+            Style::default().fg(theme.info)));
+        if let Some(mark) = text.find('[') {
+            let prefix=&text[..mark];
+            spans.push(Span::styled(prefix.to_owned(),Style::default().fg(theme.text_dim)));
+            if text[mark..].starts_with("[✓]") || text[mark..].starts_with("[ ]") {
+                spans.push(Span::styled("[",Style::default().fg(theme.text_dim)));
+                spans.push(Span::styled(if text[mark..].starts_with("[✓]") {"✓"}else{" "},
+                    Style::default().fg(theme.success)));
+                spans.push(Span::styled("]",Style::default().fg(theme.text_dim)));
+                let marker_bytes=if text[mark..].starts_with("[✓]") {5}else{3};
+                spans.push(Span::styled(text[mark+marker_bytes..].to_owned(),
+                    Style::default().fg(if index.is_some_and(|i|!s.is_extractable(i)) {theme.error}
+                        else {theme.value})));
+            } else {
+                spans.push(Span::styled(text[mark..].to_owned(),Style::default().fg(theme.value)));
+            }
+        } else {
+            spans.push(Span::styled(text.to_owned(),Style::default().fg(theme.text_dim)));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(bg)),
+            Rect::new(inner.x,y,left_width,1));
+        if let Some(tail)=suffix {
+            frame.render_widget(Paragraph::new(tail).alignment(Alignment::Right)
+                .style(Style::default().bg(bg).fg(theme.text_dim)),
+                Rect::new(inner.x+inner.width-right_width,y,right_width,1));
+        }
+        if let Some(owner)=angle_owner {
             for (symbol, button) in [('◂', TuiButton::DiscBrowserAnglePrev(*owner)),
                                      ('▸', TuiButton::DiscBrowserAngleNext(*owner))] {
-                if let Some(col) = label.chars().position(|ch| ch == symbol) {
-                    if col < inner.width as usize {
-                        buttons.record_button(button, Rect::new(inner.x + col as u16, y, 1, 1));
+                if let Some(col)=label.chars().position(|ch|ch==symbol) {
+                    let offset=col as u16+2;
+                    if offset<inner.width {
+                        buttons.record_button(button, Rect::new(inner.x+offset,y,1,1));
                     }
                 }
             }
         }
-        frame.render_widget(Paragraph::new(clip(label,inner.width)).style(style),Rect::new(inner.x,y,inner.width,1));
     }
 }
 
-fn draw_items(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect, buttons: &mut ButtonRenderMap, theme: Theme, wide: bool) {
+fn draw_items(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect,
+    buttons: &mut ButtonRenderMap, theme: Theme, wide: bool) {
     let Some(p)=s.selected_presentation() else { return; };
-    let kind=if s.contents.format==DiscFormat::DvdVideo || s.contents.format==DiscFormat::BluRay { "CHAPTERS" } else { "TRACKS" };
-    let checked=s.items_checked.get(s.cursor).map_or(0,|v| v.iter().filter(|x| **x).count());
-    let label=clip(&format!("{kind}  {checked} of {} checked · {}",p.tracks.len(),p.id.compact_label()),r.width.saturating_sub(2));
-    frame.render_widget(Block::default().borders(Borders::ALL).title(label)
-        .border_style(Style::default().fg(if s.focus==ExtractFocus::Items {theme.info} else {theme.border_dim})),r);
-    let inner=Rect::new(r.x+1,r.y+1,r.width.saturating_sub(2),r.height.saturating_sub(2));
-    if inner.width==0 || inner.height==0 { return; }
+    let kind=if matches!(s.contents.format,DiscFormat::DvdVideo|DiscFormat::BluRay) {
+        "CHAPTERS" } else { "TRACKS" };
+    let checked=s.items_checked.get(s.cursor).map_or(0,|v|v.iter().filter(|x|**x).count());
+    frame.render_widget(Paragraph::new(Line::from(vec![
+        Span::styled(format!("{kind}  "),Style::default().fg(theme.header)),
+        Span::styled(format!("{checked} of {} checked · {}",p.tracks.len(),p.id.compact_label()),
+            Style::default().fg(theme.text_dim)),
+    ])),Rect::new(r.x+1,r.y,r.width.saturating_sub(2),1));
+    let inner=Rect::new(r.x+1,r.y+1,r.width.saturating_sub(2),r.height.saturating_sub(1));
+    if inner.width<12 || inner.height==0 { return; }
     let cursor=s.item_cursor.min(p.tracks.len().saturating_sub(1));
-    // Show a conditional SACD detail line only when the disc actually has
-    // extra per-track fields. No placeholder text on discs without disc text.
-    let sacd_detail = (s.contents.format == DiscFormat::Sacd)
-        .then(|| p.tracks.get(cursor).and_then(|t| t.format_note.as_deref()))
-        .flatten()
-        .filter(|note| note.contains("ISRC ") || note.contains("Composer ")
-            || note.contains("Songwriter ") || note.contains("Arranger ")
-            || note.contains("Genre "));
-    let visible_rows = inner.height.saturating_sub(u16::from(sacd_detail.is_some())).max(1);
+    let sacd_detail=(s.contents.format==DiscFormat::Sacd)
+        .then(||p.tracks.get(cursor).and_then(|t|t.format_note.as_deref()))
+        .flatten().filter(|note|note.contains("ISRC ")||note.contains("Composer ")
+            ||note.contains("Songwriter ")||note.contains("Arranger ")||note.contains("Genre "));
+    let capacity = inner.height.saturating_sub(u16::from(sacd_detail.is_some())).max(1);
+    // When items remain below, the final visible row is a count, not a
+    // truncated chapter. Scroll against the smaller selection viewport so
+    // the focused row and its click target remain visible.
+    let list_rows = if p.tracks.len() > capacity as usize && capacity > 1 {
+        capacity - 1
+    } else { capacity };
     let scroll = if cursor < s.item_scroll { cursor }
-        else if cursor >= s.item_scroll+visible_rows as usize { cursor+1-visible_rows as usize }
-        else { s.item_scroll }.min(p.tracks.len().saturating_sub(visible_rows as usize));
-    let mut start_secs = Some(0.0_f64);
-    for earlier in p.tracks.iter().take(scroll) {
-        start_secs = start_secs.and_then(|start| earlier.duration_secs.map(|duration| start + duration));
+        else if cursor >= s.item_scroll + list_rows as usize {
+            cursor + 1 - list_rows as usize
+        } else { s.item_scroll }.min(p.tracks.len().saturating_sub(list_rows as usize));
+    let remaining = p.tracks.len().saturating_sub(scroll);
+    let more_below = remaining > capacity as usize;
+    let visible = if more_below { capacity - 1 } else { capacity };
+    let mut start_secs=Some(0.0_f64);
+    for previous in p.tracks.iter().take(scroll) {
+        start_secs=start_secs.and_then(|secs|previous.duration_secs.map(|d|secs+d));
     }
-    for (offset,(i,track)) in p.tracks.iter().enumerate().skip(scroll).take(visible_rows as usize).enumerate() {
-        let mut label=format!("{} {:02}  {}",check(s.items_checked.get(s.cursor).and_then(|v|v.get(i))==Some(&true)),
-            track.number,track.title.as_deref().unwrap_or("Untitled"));
-        if wide { if let Some(performer)=&track.performer { label.push_str(&format!(" · {performer}")); } }
-        if let Some(secs)=track.duration_secs { label.push_str(&format!("   {}",duration_display(secs))); }
-        if wide { if let Some(start)=start_secs { label.push_str(&format!("   {}",duration_display(start))); } }
-        start_secs = start_secs.and_then(|start| track.duration_secs.map(|duration| start + duration));
+    for (offset,(i,track)) in p.tracks.iter().enumerate().skip(scroll)
+        .take(visible as usize).enumerate() {
         let y=inner.y+offset as u16;
-        frame.render_widget(Paragraph::new(clip(&label,inner.width)).style(row_style(s.focus==ExtractFocus::Items,i==cursor,theme)),
-            Rect::new(inner.x,y,inner.width,1));
+        let focused=s.focus==ExtractFocus::Items && i==cursor;
+        let bg=if focused {theme.selection_bg}else{theme.panel_bg};
+        frame.render_widget(Block::default().style(Style::default().bg(bg)),Rect::new(inner.x,y,inner.width,1));
+        let style=Style::default().bg(bg);
+        let mut x=inner.x;
+        frame.render_widget(Paragraph::new(if focused {"▸"}else{" "}).style(style.fg(theme.info)),
+            Rect::new(x,y,1,1));
+        x+=2;
+        let checked=s.items_checked.get(s.cursor).and_then(|v|v.get(i))==Some(&true);
+        frame.render_widget(Paragraph::new(Line::from(vec![
+            Span::styled("[",style.fg(theme.text_dim)),
+            Span::styled(if checked {"✓"}else{" "},style.fg(theme.success)),
+            Span::styled("]",style.fg(theme.text_dim)),
+        ])).style(style),Rect::new(x,y,3,1));
+        let check_x=x;
+        x+=4;
+        let number_width=if track.number>99 {4}else{3};
+        frame.render_widget(Paragraph::new(format!("{:02}",track.number))
+            .style(style.fg(theme.text_dim)),Rect::new(x,y,number_width,1));
+        x+=number_width+1;
+        let tail_width=if wide {15u16}else{8u16};
+        let performer_width=if wide {((inner.width.saturating_sub(32))/4).min(24)}else{0};
+        let title_width=inner.x+inner.width;
+        let title_width=title_width.saturating_sub(x+tail_width+performer_width);
+        frame.render_widget(Paragraph::new(clip(track.title.as_deref().unwrap_or("Untitled"),title_width))
+            .style(style.fg(theme.value)),Rect::new(x,y,title_width,1));
+        x+=title_width;
+        if wide && performer_width>0 {
+            frame.render_widget(Paragraph::new(clip(track.performer.as_deref().unwrap_or(""),performer_width))
+                .style(style.fg(theme.text_dim)),Rect::new(x,y,performer_width,1));
+            x+=performer_width;
+        }
+        let duration=track.duration_secs.map(duration_display).unwrap_or_default();
+        let duration_width=if wide {7}else{8};
+        frame.render_widget(Paragraph::new(duration).alignment(Alignment::Right)
+            .style(style.fg(theme.text_dim)),Rect::new(x,y,duration_width,1));
+        x+=duration_width;
+        if wide {
+            let start=start_secs.map(duration_display).unwrap_or_default();
+            frame.render_widget(Paragraph::new(start).alignment(Alignment::Right)
+                .style(style.fg(theme.text_dim)),Rect::new(x,y,8,1));
+        }
+        start_secs=start_secs.and_then(|secs|track.duration_secs.map(|duration|secs+duration));
         buttons.record_button(TuiButton::DiscBrowserTrack(i),Rect::new(inner.x,y,inner.width,1));
-        buttons.record_button(TuiButton::DiscBrowserTrackCheck(i),Rect::new(inner.x,y,3.min(inner.width),1));
+        buttons.record_button(TuiButton::DiscBrowserTrackCheck(i),Rect::new(check_x,y,3,1));
     }
-    if let Some(note) = sacd_detail {
-        let y=inner.y+visible_rows;
-        if y < inner.y + inner.height {
+    if more_below {
+        let hidden = remaining.saturating_sub(visible as usize);
+        frame.render_widget(Paragraph::new(format!("    ↓ {hidden} more"))
+            .style(Style::default().fg(theme.text_dim).bg(theme.panel_bg)),
+            Rect::new(inner.x,inner.y + visible,inner.width,1));
+    }
+    if let Some(note)=sacd_detail {
+        let y=inner.y+capacity;
+        if y<inner.y+inner.height {
             frame.render_widget(Paragraph::new(clip(note,inner.width))
                 .style(Style::default().fg(theme.text_dim)),Rect::new(inner.x,y,inner.width,1));
         }
     }
 }
+
 
 fn option_value(s: &DiscBrowserState, name: &str) -> String {
     match name {
@@ -324,7 +491,7 @@ fn option_value(s: &DiscBrowserState, name: &str) -> String {
             NativeWavContainer::Rf64 => "RF64 WAV · large-file capable".into(),
             NativeWavContainer::W64 => "W64 · 64-bit sizes".into(),
         },
-        "Files" => if s.file_per_program { if s.cue {"continuous per program + CUE"} else {"continuous per program"} } else { "one per track/chapter" }.into(),
+        "Files" => (if s.file_per_program { if s.cue {"continuous per program + CUE"} else {"continuous per program"} } else if matches!(s.contents.format,DiscFormat::DvdVideo|DiscFormat::BluRay) { "one per chapter" } else { "one per track" }).into(),
         "Tags" => if s.tags { format!("on · {} selected fields · artwork {}{}",
             s.tag_fields.count_ones(),if s.tag_artwork {"on"}else{"off"},
             if s.keep_dst.iter().any(|v|*v) {" · DFF drops tags"}else{""}) }
@@ -355,49 +522,93 @@ fn output_cell(index: usize, count: usize, area: Rect, wide: bool, focus: usize)
     Some(Rect::new(x, area.y + (row - scroll) as u16, width, 1))
 }
 
-fn draw_output(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,buttons:&mut ButtonRenderMap,theme:Theme,wide:bool) {
-    let rows = s.output_rows();
+/// Highlight template tokens without granting the renderer any knowledge of
+/// path expansion. Only the native job builder interprets those tokens.
+fn value_spans(value: &str, theme: Theme) -> Vec<Span<'static>> {
+    let mut spans=Vec::new();
+    let mut rest=value;
+    while let Some(start)=rest.find('{') {
+        let Some(end)=rest[start..].find('}') else {break;};
+        if start>0 {spans.push(Span::styled(rest[..start].to_owned(),
+            Style::default().fg(theme.value)));}
+        let length=start+end+1;
+        spans.push(Span::styled(rest[start..length].to_owned(),
+            Style::default().fg(theme.purple)));
+        rest=&rest[length..];
+    }
+    if !rest.is_empty() {spans.push(Span::styled(rest.to_owned(),
+        Style::default().fg(theme.value)));}
+    spans
+}
+
+fn draw_output(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,
+    buttons:&mut ButtonRenderMap,theme:Theme,wide:bool) {
+    let rows=s.output_rows();
     for (i,name) in rows.iter().enumerate() {
-        let Some(cell) = output_cell(i, rows.len(), r, wide, s.output_cursor) else { continue; };
-        let label_width = if wide { 13 } else { 14 };
-        let text = format!(" {:<label_width$} {}", name, option_value(s,name));
-        let selected = s.focus==ExtractFocus::Output && s.output_cursor==i;
-        frame.render_widget(Paragraph::new(clip(&text,cell.width)).style(row_style(s.focus==ExtractFocus::Output,selected,theme)),cell);
+        let Some(cell)=output_cell(i,rows.len(),r,wide,s.output_cursor) else {continue;};
+        let selected=s.focus==ExtractFocus::Output && s.output_cursor==i;
+        let bg=if selected {theme.selection_bg}else{theme.panel_bg};
+        frame.render_widget(Block::default().style(Style::default().bg(bg)),cell);
+        let label_width=if wide {13usize}else{18usize};
+        let value_width=cell.width.saturating_sub(label_width as u16+2);
+        let mut spans=vec![
+            Span::styled(if selected {"▸"}else{" "},Style::default().fg(theme.info)),
+            Span::styled(format!("{name:<label_width$} "),Style::default().fg(theme.label)),
+        ];
+        spans.extend(value_spans(&clip(&option_value(s,name),value_width),theme));
+        frame.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(bg)),cell);
         buttons.record_button(TuiButton::DiscBrowserOutput(i),cell);
     }
 }
 
-fn draw_results(frame:&mut ratatui::Frame,s:&DiscBrowserState,scratch:&Path,r:Rect,small:bool,theme:Theme) {
+fn draw_results(frame:&mut ratatui::Frame,s:&DiscBrowserState,
+    scratch:&Path,r:Rect,small:bool,theme:Theme) {
     let items=s.selected_item_count();
     let programs=s.selected_program_count();
     let size=s.selected_item_bytes().map_or_else(||"pending".into(),|(total,_,_)|format_bytes(total));
-    let kind=if s.contents.format==DiscFormat::DvdVideo || s.contents.format==DiscFormat::BluRay {"chapters"} else {"tracks"};
-    let main=format!("Extract  {items} {kind} · {programs} streams · about {size}");
-    let dest=space_for(&s.destination).map_or_else(||"unknown".into(),format_bytes);
-    let work_free=space_for(scratch).map_or_else(||"unknown".into(),format_bytes);
+    let kind=if matches!(s.contents.format,DiscFormat::DvdVideo|DiscFormat::BluRay) {
+        "chapters" }else{"tracks"};
+    let group=match s.contents.format {
+        DiscFormat::Sacd=>if programs==1 {"area"}else{"areas"},
+        DiscFormat::DvdAudio=>if programs==1 {"group"}else{"groups"},
+        DiscFormat::DvdVideo=>if programs==1 {"title"}else{"titles"},
+        DiscFormat::BluRay=>if programs==1 {"playlist"}else{"playlists"},
+    };
+    let main=format!("{items} {kind} · {programs} {group} · about {size}");
+    let destination=space_for(&s.destination).map_or_else(||"unknown".into(),format_bytes);
+    let available=space_for(scratch).map_or_else(||"unknown".into(),format_bytes);
     let space=if s.native_storage_shares_destination_volume(scratch) {
-        let work=s.native_required_volume_bytes(false).map_or_else(||"pending".into(),format_bytes);
-        format!("Space  destination {dest} free · working storage needs {work}, {work_free} free (shared volume)")
-    } else {
+        let required=s.native_required_volume_bytes(false).map_or_else(||"pending".into(),format_bytes);
+        format!("destination {destination} free · working storage needs {required}, {available} free (shared volume)")
+    }else{
         let (target,work)=s.native_split_volume_bytes(false)
             .map_or_else(||("pending".into(),"pending".into()),|(target,work)|
                 (format_bytes(target),format_bytes(work)));
-        format!("Space  destination needs {target}, {dest} free · working storage needs {work}, {work_free} free")
+        format!("destination needs {target}, {destination} free · working storage needs {work}, {available} free")
     };
-    let lines=if small {vec![Line::from(clip(&main,r.width))]}
-        else {vec![Line::from(clip(&main,r.width)),Line::from(clip(&space,r.width))]};
-    frame.render_widget(Paragraph::new(lines).style(Style::default().fg(theme.text_dim)),r);
+    for (row,(label,value)) in [ ("Extract",main),("Space",space) ]
+        .into_iter().take(if small {1}else{2}).enumerate() {
+        let width=r.width.saturating_sub(10);
+        frame.render_widget(Paragraph::new(Line::from(vec![
+            Span::styled(format!("{label:<10}"),Style::default().fg(theme.label)),
+            Span::styled(clip(&value,width),Style::default().fg(theme.text_dim)),
+        ])).style(Style::default().bg(theme.panel_bg)),Rect::new(r.x,r.y+row as u16,r.width,1));
+    }
 }
 
 fn draw_footer(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,buttons:&mut ButtonRenderMap,small:bool,can_extract:bool,theme:Theme) {
     if r.height==0 {return;}
     if !small {
-        frame.render_widget(Paragraph::new(clip("↑↓ move · ←→ pane · Space check · a n i all none invert · ⇧↑↓ range · [ ] cycle · Tab focus · ↵ open · h hidden",r.width))
-            .style(Style::default().fg(theme.text_dim)),Rect::new(r.x,r.y,r.width,1));
+        let hint = "↑↓ move · ←→ pane · Space check · a n i all none invert · ⇧↑↓ range · [ ] cycle · Tab focus · ↵ open · h hidden";
+        frame.render_widget(Paragraph::new(Line::from(vec![
+            Span::styled("↑↓",Style::default().fg(theme.info)),
+            Span::styled(clip(&hint["↑↓".len()..],r.width.saturating_sub(2)),
+                Style::default().fg(theme.text_dim)),
+        ])),Rect::new(r.x,r.y,r.width,1));
     }
     let y=r.y+r.height-1;
     let chips=[("^x Extract",TuiButton::DiscBrowserExtract,can_extract,theme.chip_go),
-        ("c Convert…",TuiButton::DiscBrowserConvert,true,theme.blue),
+        ("c Convert…",TuiButton::DiscBrowserConvert,true,theme.tab_active),
         ("m … more",TuiButton::DiscBrowserMore,true,theme.warning),
         ("Esc Close",TuiButton::DiscBrowserClose,true,theme.chip_dismiss)];
     let length:usize=chips.iter().filter(|(_,_,enabled,_)|*enabled).map(|(txt,_,_,_)|txt.chars().count()+2).sum();
@@ -407,7 +618,7 @@ fn draw_footer(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,buttons:&mut
         let text=format!(" {label} ");
         let width=text.chars().count() as u16;
         if x+width>r.x+r.width {break;}
-        frame.render_widget(Paragraph::new(text).style(Style::default().bg(color).fg(theme.bg)),Rect::new(x,y,width,1));
+        frame.render_widget(Paragraph::new(text).style(Style::default().bg(color).fg(theme.panel_bg)),Rect::new(x,y,width,1));
         buttons.record_button(button,Rect::new(x,y,width,1));
         x=x.saturating_add(width);
     }
@@ -419,6 +630,7 @@ fn draw_panel(frame:&mut ratatui::Frame,s:&DiscBrowserState,panel:ExtractPanel,p
     let max_h=popup.height.saturating_sub(6).min(17);
     let area=Rect::new(popup.x+(popup.width-max_w)/2,popup.y+(popup.height-max_h)/2,max_w,max_h);
     frame.render_widget(Clear,area);
+    frame.render_widget(Block::default().style(Style::default().bg(theme.panel_bg)),area);
     let title=match panel {
         ExtractPanel::Format=>"Format",ExtractPanel::Files=>"Files",ExtractPanel::Tags=>"Tags",
         ExtractPanel::Destination=>"Destination",ExtractPanel::Downmix=>"Downmix",
@@ -426,7 +638,8 @@ fn draw_panel(frame:&mut ratatui::Frame,s:&DiscBrowserState,panel:ExtractPanel,p
         ExtractPanel::More=>"More",ExtractPanel::ConvertChoice=>"Convert selection",
     };
     let block=Block::default().borders(Borders::ALL).title(format!(" {title} "))
-        .border_style(Style::default().fg(theme.info));
+        .style(Style::default().bg(theme.panel_bg).fg(theme.value))
+        .border_style(Style::default().fg(theme.title));
     let inner=block.inner(area);
     frame.render_widget(block,area);
     let lines:Vec<String>=match panel {
@@ -465,7 +678,7 @@ fn draw_panel(frame:&mut ratatui::Frame,s:&DiscBrowserState,panel:ExtractPanel,p
             "Esc  Back".into(),
         ],
         ExtractPanel::Destination=>vec![
-            "e  Edit folder  ·  t  Edit template".into(),
+            "p  Pick folder  ·  t  Edit naming template".into(),
             format!("Folder: {}", s.destination.display()),
             format!("Template: {}",s.naming_template),
             format!("s  Program subfolders: {}",if s.program_subfolders {"on"}else{"off"}),
@@ -570,7 +783,7 @@ mod extract_r3_render_tests {
                 let (small, terminal) = render_header(&state, 64, true);
                 let expected = if diagnostics { "Diagnostics  1" } else { "Diagnostics  none" };
                 assert!(small[1].contains(expected), "{small:?}");
-                assert!(small[1].contains("d view"), "{small:?}");
+                assert_eq!(small[1].contains("d view"), diagnostics, "{small:?}");
                 if details { assert!(!small[1].contains("Catalog")); }
                 if diagnostics {
                     let theme = crate::tui::theme::theme_by_slug_or_default("tokyo-night");
@@ -578,9 +791,89 @@ mod extract_r3_render_tests {
                     assert_eq!(terminal.backend().buffer().get(x, 1).fg, theme.warning);
                 }
                 let (medium, _) = render_header(&state, 96, false);
-                assert!(medium[2].contains(expected) && medium[2].contains("d view"));
+                assert!(medium[2].contains(expected));
+                assert_eq!(medium[2].contains("d view"), diagnostics);
                 if details { assert!(medium[1].contains("Catalog 12345")); }
             }
+        }
+    }
+
+    #[test]
+    fn themed_extraction_dialog_fills_the_surface_and_title_bar() {
+        let state = sacd_state(false, false);
+        let theme = crate::tui::theme::theme_by_slug_or_default("tokyo-night");
+        for (width, height) in [(150, 40), (100, 30), (64, 20)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| {
+                let mut buttons = ButtonRenderMap::new();
+                draw(frame,&state,Path::new("/tmp"),&mut buttons,theme);
+            }).unwrap();
+            let buffer = terminal.backend().buffer();
+            assert_eq!(buffer.get(2, 1).bg, theme.title, "title bar {width}x{height}");
+            assert_eq!(buffer.get(2, 2).bg, theme.panel_bg,
+                "dialog surface {width}x{height}");
+            assert_eq!(buffer.get(1, 2).fg, theme.title, "outer rail {width}x{height}");
+        }
+    }
+
+    fn rendered_lines(state: &DiscBrowserState, width: u16, height: u16) -> (Vec<String>, Terminal<TestBackend>) {
+        let mut terminal = Terminal::new(TestBackend::new(width,height)).unwrap();
+        terminal.draw(|frame| {
+            let mut buttons = ButtonRenderMap::new();
+            draw(frame,state,Path::new("/tmp"),&mut buttons,
+                crate::tui::theme::theme_by_slug_or_default("tokyo-night"));
+        }).unwrap();
+        let text = (0..height).map(|y| (0..width)
+            .map(|x| terminal.backend().buffer().get(x,y).symbol().to_owned())
+            .collect::<Vec<_>>().concat()).collect();
+        (text,terminal)
+    }
+
+    fn chapter_state(count: usize) -> DiscBrowserState {
+        let mut contents = sacd_state(false,false).contents;
+        contents.format = DiscFormat::DvdVideo;
+        contents.presentations[0].id = PresentationId::dvd_video(1,1,0);
+        contents.presentations[0].label = "DVD title".into();
+        contents.presentations[0].tracks = (1..=count).map(|i|DiscTrack {
+            number:i as u32, title: Some(format!("Chapter {i:02}")),
+            performer:None, duration_secs:Some(90.0), format_note:None,
+        }).collect();
+        let mut state = DiscBrowserState::new(contents,"disc.iso".into());
+        state.focus = ExtractFocus::Items;
+        state
+    }
+
+    #[test]
+    fn small_dialog_has_three_named_tabs_and_diagnostics_hint_only_when_present() {
+        for format in [DiscFormat::Sacd,DiscFormat::DvdVideo] {
+            for diagnostic in [false,true] {
+                let mut state = sacd_state(diagnostic,false);
+                state.contents.format=format;
+                let (lines,_) = rendered_lines(&state,72,24);
+                let joined = lines.join("\n");
+                assert!(joined.contains("Output"),"{joined}");
+                assert!(joined.contains(if format==DiscFormat::Sacd {"Areas"}else{"Titles"}),"{joined}");
+                assert!(joined.contains(if format==DiscFormat::Sacd {"Tracks"}else{"Chapters"}),"{joined}");
+                assert!(!joined.contains("Tab:"),"{joined}");
+                assert_eq!(joined.contains("d view"),diagnostic,"{joined}");
+            }
+        }
+    }
+
+    #[test]
+    fn overflowing_chapters_reserve_a_remaining_row_at_both_mockup_sizes() {
+        for (width,height) in [(72,24),(110,34)] {
+            let mut state = chapter_state(44);
+            let (start,_) = rendered_lines(&state,width,height);
+            assert!(start.join("\n").contains("more"),"{start:?}");
+            state.item_cursor = 22;
+            let (middle,_) = rendered_lines(&state,width,height);
+            assert!(middle.join("\n").contains("Chapter 23"),"{middle:?}");
+            assert!(middle.join("\n").contains("more"),"{middle:?}");
+            state.item_cursor = 43;
+            let (end,_) = rendered_lines(&state,width,height);
+            assert!(end.join("\n").contains("Chapter 44"),"{end:?}");
+            assert!(!end.join("\n").contains("more"),"{end:?}");
         }
     }
 

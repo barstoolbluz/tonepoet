@@ -244,10 +244,6 @@ pub struct ConversionItem {
     /// remain until PR 10 finishes CLI/TUI surface).
     #[serde(default)]
     pub pipeline_request: Option<PipelineRequest>,
-    /// A native disc extraction uses the normal persisted queue, scheduler,
-    /// progress and cancellation machinery, not Convert or its DSP pipeline.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub native_extraction: Option<super::pipeline::native_extract::NativeExtractionJob>,
     /// Per-track progress for multi-track sources. Keyed by track_index.
     /// Transient display state only — not serialized.
     #[serde(skip)]
@@ -287,7 +283,6 @@ impl Default for ConversionItem {
             pre_extracted_staging: None,
             archive_metadata_overrides: Vec::new(),
             pipeline_request: None,
-            native_extraction: None,
             active_tracks: BTreeMap::new(),
             closed_track_epochs: BTreeMap::new(),
             tracks_collapsed: false,
@@ -329,7 +324,6 @@ impl ConversionItem {
             pre_extracted_staging: None,
             archive_metadata_overrides: Vec::new(),
             pipeline_request: None,
-            native_extraction: None,
             active_tracks: BTreeMap::new(),
             closed_track_epochs: BTreeMap::new(),
             tracks_collapsed: false,

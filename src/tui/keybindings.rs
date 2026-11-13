@@ -22118,9 +22118,10 @@ pub(super) fn handle_file_task_user_action(
                 || !matches!(
                     &session.progress.kind,
                     tui_file_picker::FileTaskKind::Copy | tui_file_picker::FileTaskKind::Move
+                        | tui_file_picker::FileTaskKind::Extract
                 )
             {
-                app.set_status("Only a running copy or move can be minimized");
+                app.set_status("Only a running copy, move or extraction can be minimized");
                 return true;
             }
             if session.progress.conflict.is_some()
@@ -22136,7 +22137,7 @@ pub(super) fn handle_file_task_user_action(
                 .take()
                 .map(|overlay| *overlay)
                 .unwrap_or(ActiveOverlay::None);
-            app.set_status("File transfer minimized; use the footer segment or :messages to restore it");
+            app.set_status("File task minimized; use the footer segment or :messages to restore it");
             return false;
         }
         tui_file_picker::FileTaskUserAction::CancelQueued(queue_id) => {
@@ -22157,6 +22158,11 @@ pub(super) fn handle_file_task_user_action(
                 .unwrap_or(ActiveOverlay::None);
             if app.file_transfers.blocked_for_attention {
                 app.file_transfers.blocked_for_attention = false;
+            }
+            // A terminal extraction may have released its file-task lease
+            // while the dialog awaited acknowledgment. Dispatch a queued
+            // copy/move only after that visible surface has been dismissed.
+            if app.file_transfers.active_session_id.is_none() {
                 maybe_start_next_file_transfer(app, tx);
             }
             return false;
@@ -56434,6 +56440,18 @@ pub(super) fn discard_file_transfer_recovery(
         }
     };
 
+    if record.is_native_extraction() {
+        // Native outputs are already committed, never rollback candidates.
+        // Only exact journal-owned, hidden publication copies can be removed.
+        let removed = record.temp_artifacts.iter().filter(|a| a.path.is_file()).count();
+        super::native_extract_task::clean_native_partial_publications(&handle, &record)?;
+        super::file_task_runtime::commit_recovery_discard(handle)?;
+        return Ok(super::file_task_runtime::RecoveryDiscardSummary {
+            released_paths: super::file_task_runtime::recovery_blocked_path_count(&record),
+            deleted_incomplete: removed,
+            ..Default::default()
+        });
+    }
     let mut summary = super::file_task_runtime::RecoveryDiscardSummary {
         released_paths: super::file_task_runtime::recovery_blocked_path_count(&record),
         ..Default::default()
@@ -62141,6 +62159,9 @@ fn supervise_file_task_process(
                     update,
                 });
             }
+            Ok(Ok(super::file_task_runtime::FileTaskWireEvent::NativeComplete { .. })) => {
+                log::warn!("copy/move file-task helper sent an extraction completion");
+            }
             Ok(Ok(super::file_task_runtime::FileTaskWireEvent::Complete {
                 report,
                 retry_plan,
@@ -62655,6 +62676,10 @@ pub fn run_internal_file_task_worker(journal_path: &std::path::Path, lease_fd: i
     let record = journal.load().map_err(anyhow::Error::msg)?;
     if journal.is_abandoned() {
         return Ok(());
+    }
+    if record.is_native_extraction() {
+        return super::native_extract_task::run_detached_file_task_helper(journal, record)
+            .map_err(anyhow::Error::msg);
     }
     let job: FileTaskJob = serde_json::from_value(record.job.clone())
         .map_err(|error| anyhow::anyhow!("decode file-task job: {error}"))?;

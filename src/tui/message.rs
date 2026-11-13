@@ -204,8 +204,10 @@ pub enum HostClipboardPasteTarget {
 #[derive(Debug)]
 pub enum AppMessage {
     /// Native disc extraction worker report; no conversion job is created.
-    NativeExtractProgress(crate::convert::pipeline::native_extract::NativeExtractionProgress),
-    NativeExtractComplete(Result<crate::convert::pipeline::native_extract::NativeExtractionReport, String>),
+    NativeExtractComplete {
+        session_id: u64,
+        result: Result<crate::convert::pipeline::native_extract::NativeExtractionReport, String>,
+    },
     /// A bounded native source preflight started when the extraction overlay
     /// opened. Only the matching live overlay generation may consume it.
     DiscExtractProbeComplete {

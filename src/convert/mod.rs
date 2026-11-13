@@ -1484,34 +1484,6 @@ impl ConversionManager {
         Ok(id)
     }
 
-    /// Submit a native disc extraction to the same queue, progress and
-    /// cancellation owner used by all ordinary Convert jobs.
-    pub fn add_native_extraction_job(
-        &mut self,
-        job: crate::convert::pipeline::native_extract::NativeExtractionJob,
-    ) -> ConversionResult<String> {
-        // The disc browser already identified this as a native disc source.
-        // FileFormat is queue-admission metadata, not the extraction router.
-        // In particular, never synchronously probe an ISO or disc folder from
-        // the TUI reducer just to enqueue the independently selected job.
-        let source = job.source.clone();
-        let mut item = ConversionItem::new(source, FileFormat::Archive, ConversionOptions::default());
-        item.status = ConversionStatus::Queued;
-        item.native_extraction = Some(job);
-        // Full-settings admission remains valid for older conversion queue
-        // readers even though the native worker intentionally ignores DSP.
-        item.set_pipeline_settings(
-            crate::convert::pipeline::native_extract::native_compatibility_settings()
-                .map_err(ConversionError::ValidationError)?
-        );
-        let id = item.id.clone();
-        let mut queue = self.queue.try_write().map_err(|_| {
-            ConversionError::ConversionFailed("Queue is busy, try again".into())
-        })?;
-        queue.add_item_direct(item);
-        Ok(id)
-    }
-
     /// Add a file that is already configured and ready for processing with a
     /// prebuilt orchestrator request.
     ///

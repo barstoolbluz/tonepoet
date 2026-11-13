@@ -10,9 +10,7 @@ use std::future::Future;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-#[cfg(unix)]
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant as StdInstant};
 
@@ -473,6 +471,16 @@ fn create_cloexec_pipe() -> std::io::Result<(std::fs::File, std::fs::File)> {
     Ok((read_end, write_end))
 }
 
+#[allow(unsafe_code)] // centralized getpgid for native-extraction pause
+fn native_pause_process_group(pid: i32) -> i32 {
+    unsafe { libc::getpgid(pid) }
+}
+
+#[allow(unsafe_code)] // centralized process-group signal for native-extraction pause
+fn native_pause_signal_group(pid: i32, signal: i32) -> i32 {
+    unsafe { libc::kill(-pid, signal) }
+}
+
 #[cfg(unix)]
 /// A downstream failure can close the read end before arbitration observes it,
 /// making the producer's SIGPIPE a consequence rather than the root failure.
@@ -877,12 +885,96 @@ pub(crate) fn write_executable_test_script(name: &str, body: &str) -> PathBuf {
 // Real runner — PR 2
 // ===========================================================================
 
+/// Optional process-pause state used only by detached disc extraction. The
+/// regular Convert path never constructs this control and therefore retains
+/// its existing process supervision and hot-path behavior.
+#[derive(Debug, Default)]
+pub(crate) struct NativeToolPause {
+    requested: AtomicBool,
+    acknowledged: AtomicBool,
+}
+
+impl NativeToolPause {
+    pub fn request(&self, paused: bool) {
+        self.acknowledged.store(false, Ordering::Release);
+        self.requested.store(paused, Ordering::Release);
+    }
+    pub fn requested(&self) -> bool { self.requested.load(Ordering::Acquire) }
+    pub fn acknowledged(&self) -> bool { self.acknowledged.load(Ordering::Acquire) }
+    pub fn acknowledge(&self, stopped: bool) { self.acknowledged.store(stopped, Ordering::Release); }
+
+    /// Cooperative pause boundary for extraction-only, in-process media I/O.
+    /// Cancellation remains responsive during the pause, including Skip.
+    pub fn cooperative_checkpoint(&self, cancel: &CancellationToken) -> bool {
+        while self.requested() && !cancel.is_cancelled() {
+            self.acknowledge(true);
+            std::thread::sleep(Duration::from_millis(35));
+        }
+        self.acknowledge(false);
+        !cancel.is_cancelled()
+    }
+}
+
+#[cfg(test)]
+mod native_extraction_pause_regression_tests {
+    use super::NativeToolPause;
+    use std::sync::{mpsc, Arc};
+    use std::time::{Duration, Instant};
+    use tokio_util::sync::CancellationToken;
+
+    fn await_acknowledgment(pause: &NativeToolPause) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !pause.acknowledged() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(pause.acknowledged(), "native media writer did not stop at its pause checkpoint");
+    }
+
+    #[test]
+    fn paused_native_sector_io_stops_and_resumes() {
+        let pause = Arc::new(NativeToolPause::default());
+        let cancel = CancellationToken::new();
+        pause.request(true);
+        let (tx, rx) = mpsc::channel();
+        let worker_pause = Arc::clone(&pause);
+        let worker = std::thread::spawn(move || {
+            tx.send(worker_pause.cooperative_checkpoint(&cancel)).unwrap();
+        });
+        await_acknowledgment(&pause);
+        assert!(rx.try_recv().is_err(), "media writer continued during Pause");
+        pause.request(false);
+        assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        worker.join().unwrap();
+        assert!(!pause.acknowledged());
+    }
+
+    #[test]
+    fn skip_current_interrupts_paused_native_sector_io() {
+        let pause = Arc::new(NativeToolPause::default());
+        let cancel = CancellationToken::new();
+        pause.request(true);
+        let (tx, rx) = mpsc::channel();
+        let worker_pause = Arc::clone(&pause);
+        let worker_cancel = cancel.clone();
+        let worker = std::thread::spawn(move || {
+            tx.send(worker_pause.cooperative_checkpoint(&worker_cancel)).unwrap();
+        });
+        await_acknowledgment(&pause);
+        cancel.cancel();
+        assert!(!rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "cancellation must terminate a paused writer without requiring Resume");
+        worker.join().unwrap();
+        assert!(!pause.acknowledged());
+    }
+}
+
 /// Async child-process `ToolRunner`. Spawns real processes via tokio,
 /// enforces per-command timeouts, honours cancellation tokens, captures
 /// bounded stdout/stderr tails, and always produces sanitized
 /// `CommandRecord`s on both success and failure.
 pub struct RealToolRunner {
     tool_paths: HashMap<String, PathBuf>,
+    native_pause: Option<Arc<NativeToolPause>>,
     version_cache: Arc<Mutex<HashMap<ToolBinary, String>>>,
     execution_item_id: Option<String>,
     execution_supervisor: Option<crate::convert::script_supervisor::ItemExecutionSupervisorClient>,
@@ -909,6 +1001,7 @@ impl RealToolRunner {
         Self {
             tool_paths,
             version_cache,
+            native_pause: None,
             execution_item_id: None,
             execution_supervisor: None,
             #[cfg(all(test, unix))]
@@ -929,6 +1022,13 @@ impl RealToolRunner {
             return idle_timeout;
         }
         CUE_STREAM_TRANSPORT_IDLE_TIMEOUT
+    }
+
+    /// Enable process-group suspension for one native-extraction runner.
+    /// This is not used by Convert; its runner stays completely unchanged.
+    pub(crate) fn with_native_pause(mut self, pause: Arc<NativeToolPause>) -> Self {
+        self.native_pause = Some(pause);
+        self
     }
 
     /// Bind this runner to one durable queue execution. Scheduled fan-out
@@ -1837,11 +1937,31 @@ impl RealToolRunner {
                 stderr_file,
             };
             let cancellation = cancel.clone();
+            let native_pause = self.native_pause.clone();
             let containment_token = invocation.token.clone();
             let containment_runtime = invocation.runtime_directory.clone();
             let event_item = execution_item.clone();
             let outcome = tokio::task::spawn_blocking(move || {
+                // The trusted containment helper runs each external tool in
+                // a dedicated process group. Suspend that group only after
+                // the supervisor confirms the user code was released. Never
+                // suspend TonePoet, its supervisor or an unrelated process.
+                let leader = AtomicI32::new(0);
+                let stopped = AtomicBool::new(false);
                 let mut lifecycle = |event: &ScriptLifecycleEvent| {
+                    if native_pause.is_some() {
+                        match event {
+                            ScriptLifecycleEvent::UserCodeReleased { leader: identity, .. } => {
+                                leader.store(identity.pid as i32, Ordering::Release);
+                            }
+                            ScriptLifecycleEvent::ContainmentEmpty { .. } => {
+                                leader.store(0, Ordering::Release);
+                                stopped.store(false, Ordering::Release);
+                                if let Some(pause) = &native_pause { pause.acknowledge(false); }
+                            }
+                            _ => {}
+                        }
+                    }
                     if let Some(item_id) = event_item.as_deref() {
                         match event {
                             ScriptLifecycleEvent::ContainmentPrepared { descriptor, .. } => {
@@ -1859,12 +1979,46 @@ impl RealToolRunner {
                     }
                     Ok(())
                 };
-                match supervisor_for_run.as_ref() {
+                let poll = || {
+                    if let Some(pause) = &native_pause {
+                        let pid = leader.load(Ordering::Acquire);
+                        if pid > 0 {
+                            let was_stopped = stopped.load(Ordering::Acquire);
+                            // A cancelled command must always get SIGCONT
+                            // before its supervisor attempts termination.
+                            let should_stop = pause.requested() && !cancellation.is_cancelled();
+                            if should_stop != was_stopped {
+                                let safe_group = if should_stop {
+                                    native_pause_process_group(pid) == pid
+                                } else {
+                                    // We previously stopped this exact
+                                    // command group. Its leader may already
+                                    // have exited, leaving descendants.
+                                    true
+                                };
+                                if safe_group && native_pause_signal_group(pid, if should_stop { libc::SIGSTOP } else { libc::SIGCONT }) == 0 {
+                                    stopped.store(should_stop, Ordering::Release);
+                                    pause.acknowledge(should_stop);
+                                }
+                            }
+                        }
+                    }
+                    cancellation.is_cancelled()
+                };
+                let result = match supervisor_for_run.as_ref() {
                     Some(supervisor) => run_supervised_via_item_supervisor(
-                        &invocation, supervisor, || cancellation.is_cancelled(), &mut lifecycle
+                        &invocation, supervisor, &poll, &mut lifecycle
                     ),
-                    None => run_supervised(&invocation, || cancellation.is_cancelled(), &mut lifecycle),
+                    None => run_supervised(&invocation, &poll, &mut lifecycle),
+                };
+                if let Some(pause) = &native_pause {
+                    if stopped.load(Ordering::Acquire) {
+                        let pid = leader.load(Ordering::Acquire);
+                        if pid > 0 { native_pause_signal_group(pid, libc::SIGCONT); }
+                    }
+                    pause.acknowledge(false);
                 }
+                result
             }).await.map_err(|error| ToolRunnerError::Io(std::io::Error::new(
                 std::io::ErrorKind::Other, format!("tool supervisor task failed: {error}")
             )))?.map_err(|error| ToolRunnerError::Io(std::io::Error::new(

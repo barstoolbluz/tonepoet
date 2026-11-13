@@ -23,6 +23,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::Arc;
 
 use crate::concurrency::{ClaimMode, ClaimScope, LeaseFamily, MutationClaimGuard, OwnerProcessIdentity, PathClaim, PathResolutionSemantics, PersistentLease};
+use crate::convert::pipeline::native_extract::NativeSkippedSelection;
 
 use super::browse::{BrowseMoveRecoveryProof, BrowsePasteRetryPlan};
 
@@ -221,6 +222,15 @@ pub struct DurableNativeRenameIntent {
     pub source_manifest: tui_file_picker::SourceManifest,
 }
 
+/// Exact text prepared from native sample boundaries before its continuous
+/// audio file is made visible. Retaining it in the existing journal supports
+/// CUE-only recovery without re-decoding an already published program.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DurableNativePreparedCue {
+    pub destination: PathBuf,
+    pub content: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DurableFileTaskRecord {
     pub schema: u32,
@@ -244,6 +254,14 @@ pub struct DurableFileTaskRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admitted_destination_root: Option<PathBuf>,
     pub job: serde_json::Value,
+    /// Native extraction uses the same file-task journal and lease as copy/move,
+    /// but its authored outputs are not copy/move source mappings.
+    #[serde(default)]
+    pub native_published_paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub native_skipped_selections: Vec<NativeSkippedSelection>,
+    #[serde(default)]
+    pub native_prepared_cues: Vec<DurableNativePreparedCue>,
     pub retry_plan: Option<BrowsePasteRetryPlan>,
     pub roots: Vec<tui_file_picker::FileTaskRootResult>,
     pub temp_artifacts: Vec<DurableTempArtifact>,
@@ -280,6 +298,10 @@ pub struct DurableFileTaskRecord {
 }
 
 impl DurableFileTaskRecord {
+    pub fn is_native_extraction(&self) -> bool {
+        self.job.get("native_extraction").is_some_and(serde_json::Value::is_object)
+    }
+
     pub fn admitted_mappings_for(
         &self,
         requested: &[tui_file_picker::PasteMapping],
@@ -478,6 +500,13 @@ enum DurableFileTaskJournalMutation {
         source: PathBuf,
         proof: BrowseMoveRecoveryProof,
     },
+    /// Only one append per successfully published native output. Durable
+    /// checkpoints let an interrupted extraction skip already published tracks.
+    NativePublished { destination: PathBuf },
+    /// A confirmed skip is distinct from a completed output filename.
+    NativeSkipped { selection: NativeSkippedSelection },
+    /// Journaled before the corresponding continuous audio publication.
+    NativeCuePrepared { cue: DurableNativePreparedCue },
     Checkpoint {
         lifecycle: DurableFileTaskLifecycle,
         status: String,
@@ -591,7 +620,11 @@ impl FileTaskJournalHandle {
         let FileTaskPathAdmission {
             claims,
             admitted_mappings,
-        } = file_task_path_admission(is_move, &mappings)?;
+        } = if job.get("native_extraction").is_some() {
+            native_extraction_path_admission(&mappings)?
+        } else {
+            file_task_path_admission(is_move, &mappings)?
+        };
         let admitted_destination_root = file_task_destination_root_from_job(&job, &mappings)?;
         let record = DurableFileTaskRecord {
             schema: FILE_TASK_JOURNAL_SCHEMA,
@@ -608,6 +641,9 @@ impl FileTaskJournalHandle {
             admitted_mappings,
             admitted_destination_root: Some(admitted_destination_root),
             job,
+            native_published_paths: Vec::new(),
+            native_skipped_selections: Vec::new(),
+            native_prepared_cues: Vec::new(),
             retry_plan,
             roots: Vec::new(),
             temp_artifacts: Vec::new(),
@@ -788,6 +824,32 @@ impl FileTaskJournalHandle {
                 abandoned_reason: Some(reason),
             },
         )
+    }
+
+    /// Publication is complete before this durable append. Re-running an
+    /// interrupted extraction must never overwrite a published selection.
+    pub fn record_native_published(&self, destination: &Path) -> Result<(), String> {
+        self.append_mutation(
+            true,
+            true,
+            DurableFileTaskJournalMutation::NativePublished {
+                destination: destination.to_path_buf(),
+            },
+        )
+    }
+
+    pub fn record_native_skipped(&self, selection: &NativeSkippedSelection) -> Result<(), String> {
+        self.append_mutation(true, true, DurableFileTaskJournalMutation::NativeSkipped {
+            selection: selection.clone(),
+        })
+    }
+
+    pub fn record_native_prepared_cue(&self, destination: &Path, content: &str) -> Result<(), String> {
+        self.append_mutation(true, true, DurableFileTaskJournalMutation::NativeCuePrepared {
+            cue: DurableNativePreparedCue {
+                destination: destination.to_path_buf(), content: content.to_owned(),
+            },
+        })
     }
 
     pub fn mark_lifecycle(
@@ -1165,6 +1227,11 @@ pub enum FileTaskWireEvent {
         report: tui_file_picker::FileTaskCompletionReport,
         retry_plan: Option<BrowsePasteRetryPlan>,
     },
+    /// Used only by the native extraction helper. Copy/move wire events and
+    /// their recovery payloads retain their existing shape.
+    NativeComplete {
+        result: Result<crate::convert::pipeline::native_extract::NativeExtractionReport, String>,
+    },
 }
 
 pub fn write_wire_event(writer: &mut impl Write, event: &FileTaskWireEvent) -> Result<(), String> {
@@ -1479,6 +1546,29 @@ fn apply_journal_entry(
             });
             retry.recovery_by_source.insert(source, proof);
         }
+        DurableFileTaskJournalMutation::NativePublished { destination } => {
+            if !record.is_native_extraction() {
+                return Err("native publication attached to a copy/move journal".to_string());
+            }
+            if !record.native_published_paths.contains(&destination) {
+                record.native_published_paths.push(destination);
+            }
+        }
+        DurableFileTaskJournalMutation::NativeSkipped { selection } => {
+            if !record.is_native_extraction() {
+                return Err("native skip attached to a copy/move journal".to_string());
+            }
+            if !record.native_skipped_selections.contains(&selection) {
+                record.native_skipped_selections.push(selection);
+            }
+        }
+        DurableFileTaskJournalMutation::NativeCuePrepared { cue } => {
+            if !record.is_native_extraction() {
+                return Err("native CUE attached to a copy/move journal".to_string());
+            }
+            record.native_prepared_cues.retain(|known|known.destination != cue.destination);
+            record.native_prepared_cues.push(cue);
+        }
         DurableFileTaskJournalMutation::Checkpoint {
             lifecycle,
             status,
@@ -1749,10 +1839,48 @@ fn recovery_descriptor_path(
     ))
 }
 
+/// A completed native file task keeps its *journal* for later inspection,
+/// not a durable filesystem mutation reservation. The retirement primitive
+/// itself refuses release while any helper still owns the lease.
+pub(crate) fn retire_completed_native_reservation(
+    record: &DurableFileTaskRecord,
+) -> Result<(), String> {
+    if !record.is_native_extraction()
+        || record.lifecycle != DurableFileTaskLifecycle::Completed
+        || !record.temp_artifacts.is_empty()
+    {
+        return Err("Native extraction has not completed cleanly".into());
+    }
+    let job_id = uuid::Uuid::parse_str(&record.job_id)
+        .map_err(|error| format!("Invalid completed native job identifier: {error}"))?;
+    let family = LeaseFamily::JournalOperation { job_id };
+    let descriptor = record.lease_descriptor.clone()
+        .or_else(|| crate::concurrency::find_family_descriptor(&family).ok().flatten());
+    if let Some(descriptor) = descriptor.filter(|path| path.exists()) {
+        crate::concurrency::retire_descriptor_after_lifecycle_release(&descriptor, &family)?;
+    }
+    Ok(())
+}
+
 fn classify_recovery_surface(
     path: &Path,
     record: &DurableFileTaskRecord,
 ) -> Result<RecoverySurfaceAvailability, String> {
+    if record.is_native_extraction()
+        && record.lifecycle == DurableFileTaskLifecycle::Completed
+        && record.temp_artifacts.is_empty()
+    {
+        if let Some(descriptor) = record.lease_descriptor.as_deref().filter(|path| path.exists()) {
+            // The helper may still be committing its completion. Do not
+            // retire a live lease or present a running worker as ownerless.
+            let (_, availability) = crate::concurrency::descriptor_availability(descriptor)?;
+            if availability == crate::concurrency::ClaimAvailability::Live {
+                return Ok(RecoverySurfaceAvailability::Live);
+            }
+            retire_completed_native_reservation(record)?;
+        }
+        return Ok(RecoverySurfaceAvailability::Recoverable);
+    }
     let Some(descriptor) = recovery_descriptor_path(path, record)? else {
         return Ok(RecoverySurfaceAvailability::Recoverable);
     };
@@ -1790,7 +1918,9 @@ pub fn recovery_surface_records() -> Vec<RecoverySurfaceRecord> {
         .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
         .filter_map(|path| match load_record_with_version(&path) {
             Ok((record, version))
-                if record.needs_reconciliation() || recovery_record_is_discarded(&record) =>
+                if record.needs_reconciliation() || recovery_record_is_discarded(&record)
+                    || (record.is_native_extraction()
+                        && record.lifecycle == DurableFileTaskLifecycle::Completed) =>
             {
                 match classify_recovery_surface(&path, &record) {
                     Ok(availability) => Some(RecoverySurfaceRecord {
@@ -1845,7 +1975,8 @@ fn pending_journals_from_surfaces(
         .filter(|surface| surface.availability == RecoverySurfaceAvailability::Recoverable)
         .filter_map(|surface| {
             let record = surface.record.as_ref()?;
-            (record.needs_reconciliation() && !recovery_record_is_discard_cleanup(record))
+            (record.needs_reconciliation() && !recovery_record_is_discard_cleanup(record)
+                && !record.is_native_extraction())
                 .then_some((surface.journal_path.clone(), record.clone()))
         })
         .collect::<Vec<_>>();
@@ -2216,6 +2347,16 @@ pub fn startup_file_task_recovery_inventory() -> StartupFileTaskRecoveryInventor
     inventory
 }
 
+/// A native extraction completed while the UI was closed leaves a retained
+/// result in Recovery. It is inspectable, but must not reserve the serial
+/// file-task slot or stop unrelated copy/move work.
+pub fn recovery_reservation_count(records: &[RecoverySurfaceRecord]) -> usize {
+    records.iter().filter(|entry| {
+        !entry.record.as_ref().is_some_and(|record| record.is_native_extraction()
+            && record.lifecycle == DurableFileTaskLifecycle::Completed)
+    }).count()
+}
+
 /// Load every recoverable interrupted job in oldest-to-newest journal order.
 pub fn startup_file_task_recoveries() -> Vec<StartupFileTaskRecovery> {
     startup_file_task_recovery_inventory().recoveries
@@ -2291,6 +2432,33 @@ pub(crate) fn file_task_path_admission(
     Ok(FileTaskPathAdmission {
         claims,
         admitted_mappings,
+    })
+}
+
+/// A native extraction reads one disc and publishes a set of authored outputs
+/// inside the selected directory. Claim the destination *subtree* rather than
+/// a fictional copy target. The original copy/move admission is unchanged.
+fn native_extraction_path_admission(
+    mappings: &[tui_file_picker::PasteMapping],
+) -> Result<FileTaskPathAdmission, String> {
+    let mapping = mappings.first().ok_or("native extraction has no source mapping")?;
+    if mappings.len() != 1 {
+        return Err("native extraction must reserve one source and destination root".into());
+    }
+    let source = PathClaim::resolve_with_semantics(
+        &mapping.source, ClaimMode::Read, ClaimScope::Subtree,
+        PathResolutionSemantics::FollowReferent,
+    )?;
+    let dest = PathClaim::resolve_with_semantics(
+        &mapping.destination, ClaimMode::Write, ClaimScope::Subtree,
+        PathResolutionSemantics::FollowReferent,
+    )?;
+    Ok(FileTaskPathAdmission {
+        admitted_mappings: vec![tui_file_picker::PasteMapping {
+            source: source.identity.resolved_io_path.clone(),
+            destination: dest.identity.resolved_io_path.clone(),
+        }],
+        claims: vec![source, dest],
     })
 }
 
@@ -2763,6 +2931,51 @@ fn sync_directory_best_effort(_path: &Path) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_skips_and_prepared_cues_survive_journal_replay_and_new_generation() {
+        let _lock = test_environment_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let _environment = JournalDirGuard::install(&temp.path().join("journals"));
+        let source = temp.path().join("disc.iso");
+        let dest = temp.path().join("output");
+        fs::write(&source, b"native media fixture").unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        let mapping = tui_file_picker::PasteMapping { source, destination: dest.clone() };
+        let job = serde_json::json!({
+            "native_extraction": {"test_fixture": true},
+            "dest": dest.to_string_lossy(),
+        });
+        let first = FileTaskJournalHandle::create(
+            uuid::Uuid::new_v4().to_string(), 1, 21, false,
+            tui_file_picker::VerificationMode::Standard, 600,
+            vec![mapping.clone()], None, job.clone(),
+        ).unwrap();
+        let skipped = NativeSkippedSelection {
+            presentation: crate::disc::PresentationId::SacdArea(crate::disc::SacdAreaId::Stereo),
+            angle: 1, track_number: Some(1),
+        };
+        let cue = dest.join("continuous.cue");
+        first.record_native_skipped(&skipped).unwrap();
+        first.record_native_skipped(&skipped).unwrap();
+        first.record_native_prepared_cue(&cue,
+            "FILE \"continuous.wav\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n").unwrap();
+        first.record_native_published(&dest.join("continuous.wav")).unwrap();
+        let path = first.path().to_path_buf();
+        let current = load_record(&path).unwrap();
+        assert_eq!(current.native_skipped_selections, vec![skipped.clone()]);
+        assert_eq!(current.native_prepared_cues.len(), 1);
+        assert_eq!(current.native_prepared_cues[0].destination, cue);
+        assert!(current.native_prepared_cues[0].content.contains("INDEX 01"));
+        drop(first); // simulate a helper exiting before it finished the CUE
+        let second = FileTaskJournalHandle::resume(path, 2, 22, false,
+            tui_file_picker::VerificationMode::Standard, 600,
+            vec![mapping], None, job).unwrap();
+        let recovered = second.load().unwrap();
+        assert_eq!(recovered.native_skipped_selections, vec![skipped]);
+        assert_eq!(recovered.native_prepared_cues.len(), 1);
+        assert_eq!(recovered.native_published_paths.len(), 1);
+    }
 
     struct JournalDirGuard {
         _concurrency: crate::concurrency::ScopedTestCoordinationRootGuard,

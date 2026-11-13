@@ -1955,6 +1955,29 @@ fn reduce_file_picker_complete(
                 tx,
             );
         }
+        super::app::FilePickerPurpose::NativeExtractDestination { probe_id } => {
+            if !close_matching_file_picker(app, session_id, &purpose) {
+                app.set_status("file picker: ignored stale extraction destination");
+                return false;
+            }
+            if let Some(mut state) = app.pending_disc_extract_picker.take() {
+                if state.probe_id != probe_id {
+                    state.probe_cancel.cancel();
+                    app.set_status("discarded obsolete extraction destination selection");
+                } else {
+                    let message = match path {
+                        Some(ref path) if path.is_dir() => {
+                            state.destination = path.clone();
+                            format!("extraction destination: {}", path.display())
+                        }
+                        Some(path) => format!("not a directory: {}", path.display()),
+                        None => "extraction destination unchanged".to_string(),
+                    };
+                    app.active_overlay = ActiveOverlay::DiscBrowser(state);
+                    app.set_status(message);
+                }
+            }
+        }
         super::app::FilePickerPurpose::SelectDestination => {
             if !close_matching_file_picker(app, session_id, &purpose) {
                 app.set_status("file picker: ignored stale destination completion");
@@ -7454,13 +7477,25 @@ mod artwork_cache_clear_completion_tests {
 
 pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMessage>) {
     match msg {
-        AppMessage::NativeExtractProgress(progress) => {
-            app.set_status(format!("Extracting {}/{}: {}", progress.done, progress.total, progress.current));
-        }
-        AppMessage::NativeExtractComplete(result) => {
-            match result {
-                Ok(report) => app.set_status(format!("Extraction complete: {} files published", report.published.len())),
-                Err(error) => app.set_status(format!("Extraction failed: {error}")),
+        AppMessage::NativeExtractComplete { session_id, result } => {
+            // A completed extraction releases precisely its own serial
+            // file-task reservation; conversion never touches this lease.
+            if app.file_transfers.active_session_id == Some(session_id) {
+                app.file_transfers.active_session_id = None;
+                if app.minimized_file_task_progress.as_ref()
+                    .is_some_and(|session| session.session_id == session_id)
+                {
+                    app.minimized_file_task_progress = None;
+                }
+                match result {
+                    Ok(report) => app.set_status(format!(
+                        "Extraction complete: {} files published, {} skipped",
+                        report.published.len(), report.skipped)),
+                    Err(error) => app.set_status(format!("Extraction ended: {error}")),
+                }
+                if matches!(app.active_overlay, ActiveOverlay::None) {
+                    super::keybindings::maybe_start_next_file_transfer(app, tx);
+                }
             }
         }
         AppMessage::ArtworkCacheClearComplete { clear_id, result } => {
@@ -8665,7 +8700,11 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             super::context_menu::refresh_open_browse_entry_menu(app);
         }
         AppMessage::DiscExtractProbeComplete { path, probe_id, program_index, result } => {
-            if let crate::tui::app::ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay {
+            let state = match &mut app.active_overlay {
+                crate::tui::app::ActiveOverlay::DiscBrowser(state) => Some(state.as_mut()),
+                _ => app.pending_disc_extract_picker.as_deref_mut(),
+            };
+            if let Some(state) = state {
                 if state.probe_id == probe_id && state.source_path == path {
                     if result.is_err() && program_index < state.selected.len() {
                         // A failed stream can still be sent to Convert, but it

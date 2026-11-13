@@ -9660,6 +9660,8 @@ pub enum FilePickerPurpose {
     SelectDirectory,
     /// Convert output-options destination picker.
     SelectDestination,
+    /// Restore the exact disc extraction surface after a folder choice.
+    NativeExtractDestination { probe_id: u64 },
     /// Convert preset loader; selects an existing TOML preset.
     SelectPreset,
     /// Convert preset save-as picker; returns the composed target preset path.
@@ -15829,6 +15831,10 @@ pub struct AppState {
     /// identical whether the surface is visible or in the shared footer.
     pub minimized_file_task_progress: Option<FileTaskProgressSession>,
 
+    /// Disc overlay parked while its folder picker owns the modal surface.
+    /// Its source-probe generation remains live during the picker.
+    pub pending_disc_extract_picker: Option<Box<super::disc_browser::DiscBrowserState>>,
+
     /// Modal surface displaced only when a minimized transfer demands urgent
     /// attention. It is restored after the transfer is minimized again or its
     /// terminal report is acknowledged, so attention preemption never destroys
@@ -16918,7 +16924,8 @@ impl AppState {
                 unreconstructable_journals,
             } = crate::tui::file_task_runtime::startup_file_task_recovery_inventory();
             recovery_surface_records = startup_recovery_surface_records;
-            file_transfers.unresolved_recovery_count = recovery_surface_records.len();
+            file_transfers.unresolved_recovery_count =
+                crate::tui::file_task_runtime::recovery_reservation_count(&recovery_surface_records);
             if let Some(newest) = recoveries.last().cloned() {
                 // Preserve the historical user-facing clipboard/retry surface
                 // for the newest job while also admitting every reconstructable
@@ -17056,6 +17063,7 @@ impl AppState {
             host_clipboard_replay_active: false,
             last_file_task_progress: None,
             minimized_file_task_progress: None,
+            pending_disc_extract_picker: None,
             file_task_preempted_overlay: None,
             file_transfers,
             recovery_ui,

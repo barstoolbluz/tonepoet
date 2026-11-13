@@ -371,10 +371,10 @@ impl DiscBrowserState {
             wav_container: crate::convert::pipeline::native_extract::NativeWavContainer::Automatic,
             keep_dst: vec![false; len],
             selected_angles: vec![1; len],
-            tags: false,
+            tags: true,
             tag_source: crate::convert::pipeline::native_extract::NativeTagSource::DiscAndSidecar,
             tag_fields: 0x7f,
-            tag_artwork: false,
+            tag_artwork: true,
             native_space_cache: RefCell::new(None),
             assume_decrypted: false,
             downmix: crate::convert::pipeline::DvdaDownmixPolicy::None,
@@ -982,6 +982,7 @@ impl DiscBrowserState {
                     .filter(|(j,_)| self.items_checked[i].get(*j) == Some(&true))
                     .map(|(j,t)| NativeTrackChoice { number: (j + 1) as u32,
                         name: t.title.clone().unwrap_or_else(|| format!("Track {}", t.number)),
+                        estimated_bytes: self.native_item_payload_bytes(p, t),
                         // DVD-Video/Blu-ray mappers synthesize "Chapter n"
                         // for navigation. It is a filename fallback, never a
                         // discovered metadata field that should become a tag.

@@ -439,7 +439,9 @@ static int tonepoet_native_mlp_decode_stereo_s32le_impl(
     const char *input_path,
     const char *output_path,
     struct tonepoet_native_mlp_decode_result *out,
-    int native_rf64) {
+    int native_rf64,
+    tonepoet_native_mlp_checkpoint checkpoint,
+    void *checkpoint_context) {
     if (out == NULL) {
         return -1;
     }
@@ -530,6 +532,10 @@ static int tonepoet_native_mlp_decode_stereo_s32le_impl(
     }
 
     for (;;) {
+        if (checkpoint != NULL && checkpoint(checkpoint_context) != 0) {
+            tonepoet_set_text(out->error, sizeof(out->error), "native MLP extraction cancelled");
+            goto done;
+        }
         size_t bytes_read = fread(input_buf, 1, INPUT_CHUNK_SIZE, input);
         if (bytes_read == 0) {
             if (ferror(input)) {
@@ -618,11 +624,24 @@ done:
 int tonepoet_native_mlp_decode_stereo_s32le_wav(
     const char *input_path, const char *output_path,
     struct tonepoet_native_mlp_decode_result *out) {
-    return tonepoet_native_mlp_decode_stereo_s32le_impl(input_path, output_path, out, 0);
+    return tonepoet_native_mlp_decode_stereo_s32le_impl(input_path, output_path, out, 0, NULL, NULL);
 }
 
 int tonepoet_native_mlp_decode_stereo_s32le_rf64(
     const char *input_path, const char *output_path,
     struct tonepoet_native_mlp_decode_result *out) {
-    return tonepoet_native_mlp_decode_stereo_s32le_impl(input_path, output_path, out, 1);
+    return tonepoet_native_mlp_decode_stereo_s32le_impl(input_path, output_path, out, 1, NULL, NULL);
+}
+
+/* Native extraction uses the same qualified MLP code path, with bounded
+ * cooperative pause/cancel checkpoints. Convert uses the original exports. */
+int tonepoet_native_mlp_decode_stereo_s32le_controlled(
+    const char *input_path,
+    const char *output_path,
+    struct tonepoet_native_mlp_decode_result *out,
+    int native_rf64,
+    tonepoet_native_mlp_checkpoint checkpoint,
+    void *checkpoint_context) {
+    return tonepoet_native_mlp_decode_stereo_s32le_impl(
+        input_path, output_path, out, native_rf64, checkpoint, checkpoint_context);
 }

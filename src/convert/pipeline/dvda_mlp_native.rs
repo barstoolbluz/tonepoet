@@ -7,10 +7,12 @@
 //! FFmpeg private decoder structs and only passes paths plus value structs
 //! across the FFI seam.
 
-use std::ffi::{CStr, CString};
+use std::ffi::{c_void, CStr, CString};
 use std::fmt;
 use std::os::raw::{c_char, c_int, c_uint};
 use std::path::Path;
+use tokio_util::sync::CancellationToken;
+use super::tool::NativeToolPause;
 
 const TEXT_CAP: usize = 1024;
 
@@ -56,6 +58,14 @@ unsafe extern "C" {
         input_path: *const c_char,
         output_path: *const c_char,
         out: *mut TonepoetNativeMlpDecodeResultRaw,
+    ) -> c_int;
+    fn tonepoet_native_mlp_decode_stereo_s32le_controlled(
+        input_path: *const c_char,
+        output_path: *const c_char,
+        out: *mut TonepoetNativeMlpDecodeResultRaw,
+        native_rf64: c_int,
+        checkpoint: Option<unsafe extern "C" fn(*mut c_void) -> c_int>,
+        checkpoint_context: *mut c_void,
     ) -> c_int;
 }
 
@@ -144,11 +154,40 @@ pub(crate) fn decode_authored_stereo_to_wav_with_rf64(
     wav_path: &Path,
     native_rf64: bool,
 ) -> Result<NativeMlpDecodeResult, NativeMlpError> {
+    decode_authored_stereo_to_wav_with_rf64_controlled(mlp_path, wav_path, native_rf64, None)
+}
+
+struct NativeMlpCheckpointContext<'a> {
+    pause: &'a NativeToolPause,
+    cancel: &'a CancellationToken,
+}
+
+/// The Rust context is borrowed only for the synchronous native call. The
+/// callback never unwinds across C, and does not inspect FFmpeg structures.
+unsafe extern "C" fn native_mlp_checkpoint(context: *mut c_void) -> c_int {
+    if context.is_null() { return 1; }
+    let context = unsafe { &*(context as *const NativeMlpCheckpointContext<'_>) };
+    if context.pause.cooperative_checkpoint(context.cancel) { 0 } else { 1 }
+}
+
+pub(crate) fn decode_authored_stereo_to_wav_with_rf64_controlled(
+    mlp_path: &Path,
+    wav_path: &Path,
+    native_rf64: bool,
+    pause: Option<(&NativeToolPause, &CancellationToken)>,
+) -> Result<NativeMlpDecodeResult, NativeMlpError> {
     let input = path_to_cstring(mlp_path)?;
     let output = path_to_cstring(wav_path)?;
     let mut raw = TonepoetNativeMlpDecodeResultRaw::zeroed();
+    let context = pause.map(|(pause, cancel)| NativeMlpCheckpointContext { pause, cancel });
     let rc = unsafe {
-        if native_rf64 {
+        if let Some(context) = context.as_ref() {
+            tonepoet_native_mlp_decode_stereo_s32le_controlled(
+                input.as_ptr(), output.as_ptr(), &mut raw,
+                c_int::from(native_rf64), Some(native_mlp_checkpoint),
+                context as *const _ as *mut c_void,
+            )
+        } else if native_rf64 {
             tonepoet_native_mlp_decode_stereo_s32le_rf64(input.as_ptr(), output.as_ptr(), &mut raw)
         } else {
             tonepoet_native_mlp_decode_stereo_s32le_wav(input.as_ptr(), output.as_ptr(), &mut raw)

@@ -19060,7 +19060,6 @@ pub fn recover_stale_flac_metadata_journals_in_dir(dir: &std::path::Path) -> Vec
 #[cfg(test)]
 mod dsf_artwork_projection_tests {
     use super::*;
-    use id3::TagLike;
 
     fn disk_picture_data(path: &Path) -> Vec<(u8, Vec<u8>)> {
         // Independent on-disk ID3 readback: do not reuse the UI projector.

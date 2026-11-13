@@ -32,7 +32,7 @@ use super::dvda_mlp::{
 use super::dvda_mlp_native::{self, NativeMlpDecodeResult};
 use super::errors::{ConvertError, ToolRunnerError};
 use super::progress::{heartbeat, OperationProgressTracker};
-use super::tool::{ToolBinary, ToolCommand, ToolRunner};
+use super::tool::{NativeToolPause, ToolBinary, ToolCommand, ToolRunner};
 use super::track_executor::{run_tool_command_with_concurrency, ToolConcurrencyLimits};
 use super::types::{
     DvdaAobFileRef, DvdaDownmixPolicy, DvdaElementaryStreamKind, DvdaIsoBackend,
@@ -78,6 +78,38 @@ pub(super) async fn realize_dvda_track(
     cancel: &CancellationToken,
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
     progress_tracker: Option<&mut OperationProgressTracker<'_>>,
+) -> Result<PathBuf, ConvertError> {
+    realize_dvda_track_impl(src, expected_audio, audio_policy, staging, runner, cancel,
+        tool_concurrency_limits, progress_tracker, None).await
+}
+
+/// Extraction-only entry point: native sector I/O acknowledges Pause without
+/// changing the long-established Convert realization path.
+pub(super) async fn realize_dvda_track_native(
+    src: &TrackSourceRef,
+    expected_audio: DvdaSourceAudioExpectation,
+    audio_policy: DvdaRealizationAudioPolicy,
+    staging: &StagingDir,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
+    progress_tracker: Option<&mut OperationProgressTracker<'_>>,
+    native_pause: Arc<NativeToolPause>,
+) -> Result<PathBuf, ConvertError> {
+    realize_dvda_track_impl(src, expected_audio, audio_policy, staging, runner, cancel,
+        tool_concurrency_limits, progress_tracker, Some(native_pause)).await
+}
+
+async fn realize_dvda_track_impl(
+    src: &TrackSourceRef,
+    expected_audio: DvdaSourceAudioExpectation,
+    mut audio_policy: DvdaRealizationAudioPolicy,
+    staging: &StagingDir,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
+    progress_tracker: Option<&mut OperationProgressTracker<'_>>,
+    native_pause: Option<Arc<NativeToolPause>>,
 ) -> Result<PathBuf, ConvertError> {
     if cancel.is_cancelled() {
         return Err(ConvertError::Realize("cancelled".to_string()));
@@ -144,9 +176,11 @@ pub(super) async fn realize_dvda_track(
     let track_for_extract = track.clone();
     let lpcm_channel_order_policy = audio_policy.lpcm_channel_order_policy;
     let cancel_for_extract = cancel.clone();
+    let native_pause_for_extract = native_pause.clone();
 
     let extracted = match progress_tracker {
         Some(tracker) => {
+            let pause_for_heartbeat = native_pause_for_extract.clone();
             heartbeat::run_with_heartbeat(
                 async move {
                     tokio::task::spawn_blocking(move || {
@@ -155,6 +189,7 @@ pub(super) async fn realize_dvda_track(
                             &staging_root,
                             lpcm_channel_order_policy,
                             &cancel_for_extract,
+                            pause_for_heartbeat.as_deref(),
                         )
                     })
                     .await
@@ -175,6 +210,7 @@ pub(super) async fn realize_dvda_track(
                 &staging_root,
                 lpcm_channel_order_policy,
                 &cancel_for_extract,
+                native_pause_for_extract.as_deref(),
             )
         })
         .await
@@ -234,6 +270,7 @@ pub(super) async fn realize_dvda_track(
                 cancel,
                 tool_concurrency_limits,
                 audio_policy.native_large_carrier,
+                native_pause.as_deref(),
             )
             .await?;
             mlp_guard.remove_now()?;
@@ -1576,12 +1613,14 @@ fn extract_track_audio_payload(
     staging_root: &Path,
     lpcm_channel_order_policy: DvdaChannelOrderPolicy,
     cancel: &CancellationToken,
+    native_pause: Option<&NativeToolPause>,
 ) -> Result<ExtractedDvdaAudio, ConvertError> {
     match extract_track_audio_payload_with_mlp_reassembly_attempt(
         track,
         staging_root,
         lpcm_channel_order_policy,
         cancel,
+        native_pause,
         MlpReassemblyAttempt::Strict,
     ) {
         Ok(audio) => Ok(audio),
@@ -1599,6 +1638,7 @@ fn extract_track_audio_payload(
                 staging_root,
                 lpcm_channel_order_policy,
                 cancel,
+                native_pause,
                 MlpReassemblyAttempt::TolerantFallback,
             )
             .map_err(DvdaPayloadExtractionError::into_convert_error)
@@ -1612,6 +1652,7 @@ fn extract_track_audio_payload_with_mlp_reassembly_attempt(
     staging_root: &Path,
     lpcm_channel_order_policy: DvdaChannelOrderPolicy,
     cancel: &CancellationToken,
+    native_pause: Option<&NativeToolPause>,
     mlp_reassembly_attempt: MlpReassemblyAttempt,
 ) -> Result<ExtractedDvdaAudio, DvdaPayloadExtractionError> {
     let volume = open_realize_volume(&track.volume_source)?;
@@ -1652,7 +1693,8 @@ fn extract_track_audio_payload_with_mlp_reassembly_attempt(
         let mut next_sector = range.first;
         let mut sectors_remaining = range.block_count();
         while sectors_remaining > 0 {
-            if cancel.is_cancelled() {
+            if native_pause.is_some_and(|pause| !pause.cooperative_checkpoint(cancel))
+                || cancel.is_cancelled() {
                 return Err(ConvertError::Realize("cancelled".to_string()).into());
             }
 
@@ -3019,6 +3061,7 @@ async fn decode_mlp_to_wav(
     cancel: &CancellationToken,
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
     native_large: bool,
+    native_pause: Option<&NativeToolPause>,
 ) -> Result<(DvdaWavProbe, DvdaDecodeAudit), ConvertError> {
     if cancel.is_cancelled() {
         return Err(ConvertError::Realize("cancelled".to_string()));
@@ -3079,10 +3122,11 @@ async fn decode_mlp_to_wav(
                 decoder_info.private_downmix_layout_offset,
             );
 
-            let result = dvda_mlp_native::decode_authored_stereo_to_wav_with_rf64(
+            let result = dvda_mlp_native::decode_authored_stereo_to_wav_with_rf64_controlled(
                 mlp_path,
                 tmp_wav_guard.path(),
                 native_large,
+                native_pause.map(|pause| (pause, cancel)),
             )
             .map_err(|err| {
                 ConvertError::TrackValidation(format!(
@@ -6893,6 +6937,7 @@ mod tests {
             staging.path(),
             DvdaChannelOrderPolicy::PreserveDvdAudio,
             &CancellationToken::new(),
+            None,
         )
         .expect("MLP stream hint should extract an MLP elementary payload");
         assert_eq!(

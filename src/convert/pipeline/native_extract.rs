@@ -8,10 +8,11 @@
 //! a cleaned-up temporary file at the final target before atomic rename.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use super::native_wav::{inspect_carrier, package_raw_pcm, concatenate_generated_waves, NativePcmFormat};
+use super::native_wav::{inspect_carrier, package_raw_pcm_checked, concatenate_generated_waves_checked, NativePcmFormat};
 use super::actions::ActionPipeline;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -19,14 +20,14 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use crate::disc::{DiscFormat, PresentationId};
 use super::bluray_realize::realize_bluray_track_native;
-use super::dvda_realize::{realize_dvda_track, DvdaRealizationAudioPolicy, DvdaSourceAudioExpectation};
+use super::dvda_realize::{realize_dvda_track_native, DvdaRealizationAudioPolicy, DvdaSourceAudioExpectation};
 use super::dvdv_realize::realize_dvdv_track_native;
 use super::materializer_bluray::BlurayMaterializer;
 use super::materializer_dvda::DvdaAudioMaterializer;
 use super::materializer_dvdv::DvdVideoMaterializer;
 use super::materializer_sacd::SacdIsoMaterializer;
 use super::stages::Materializer;
-use super::tool::{RealToolRunner, ToolBinary, ToolCommand, ToolRunner};
+use super::tool::{NativeToolPause, RealToolRunner, ToolBinary, ToolCommand, ToolRunner};
 use super::types::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,6 +59,9 @@ pub struct NativeTrackChoice {
     pub name: String,
     #[serde(default)]
     pub tags: NativeTagValues,
+    /// Preflight's uncompressed item-size estimate; never a measurement.
+    #[serde(default)]
+    pub estimated_bytes: Option<u64>,
 }
 
 fn default_angle_one() -> u8 { 1 }
@@ -122,12 +126,221 @@ pub struct NativeExtractionProgress {
     pub done: usize,
     pub total: usize,
     pub published: usize,
+    /// Completed filenames, reported only after atomic publication. The
+    /// detached file-task journal records newly published files once each.
+    pub published_paths: Vec<PathBuf>,
+    pub skipped: usize,
     pub current: String,
+    /// Private file currently being written. The file-task host samples its
+    /// size periodically; this path is never displayed as an output path.
+    pub current_file: Option<PathBuf>,
+    pub current_estimated_bytes: Option<u64>,
+    pub estimated_bytes_done: u64,
+    /// Estimated bytes of fully published audio; continuous-mode staged tracks
+    /// are not counted until their assembled program has been published.
+    pub estimated_bytes_published: u64,
+    pub estimated_bytes_skipped: u64,
+    pub estimated_bytes_total: Option<u64>,
 }
 
+/// A confirmed user/policy skip is a disposition of a selected track (or of
+/// an entire continuous program), not a publication of an output pathname.
+/// The authored presentation identity stays stable when Recovery removes
+/// completed selections from the work left for a new helper generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeSkippedSelection {
+    pub presentation: PresentationId,
+    pub angle: u8,
+    /// None identifies a whole continuous program, including its final join.
+    pub track_number: Option<u32>,
+}
+
+impl NativeSkippedSelection {
+    pub fn track(program: &NativeProgramChoice, number: u32) -> Self {
+        Self { presentation: program.id, angle: program.angle, track_number: Some(number) }
+    }
+
+    pub fn program(program: &NativeProgramChoice) -> Self {
+        Self { presentation: program.id, angle: program.angle, track_number: None }
+    }
+}
+
+/// One private file or a bounded private staging directory observed by the
+/// detached progress sampler. Its path is *never* a UI source/destination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeWatchSource { File(PathBuf), Tree(PathBuf) }
+
 #[derive(Debug, Clone)]
+pub struct NativeWriteWatch {
+    pub label: String,
+    pub source: NativeWatchSource,
+    pub baseline: u64,
+    pub estimated_bytes: Option<u64>,
+    pub finalizing: bool,
+    /// Portion of the estimated final audio bytes represented by this phase.
+    pub fraction_start: u8,
+    pub fraction_end: u8,
+}
+
+impl NativeWriteWatch {
+    pub fn measured_bytes(&self) -> u64 {
+        let measured = match &self.source {
+            NativeWatchSource::File(path) => fs::metadata(path).ok().map_or(0, |meta|meta.len()),
+            NativeWatchSource::Tree(path) => sum_private_staging_bytes(path),
+        };
+        measured.saturating_sub(self.baseline)
+    }
+}
+
+/// Count only regular private staging files. Never follow symlinks or leave
+/// the specific temporary tree. A bounded scan on the periodic UI sampler is
+/// less invasive than adding per-frame progress events to three realizers.
+fn sum_private_staging_bytes(root: &Path) -> u64 {
+    const MAX_ENTRIES: usize = 4096;
+    let mut stack = vec![root.to_path_buf()];
+    let mut total = 0u64;
+    let mut visited = 0;
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else { continue; };
+        for entry in entries.flatten() {
+            visited += 1;
+            if visited > MAX_ENTRIES { return total; }
+            let Ok(meta) = entry.metadata() else { continue; };
+            // Do not count external symlinks mounted beneath temporary paths.
+            if let Ok(plain) = fs::symlink_metadata(entry.path()) {
+                if plain.file_type().is_symlink() { continue; }
+            }
+            if meta.is_dir() { stack.push(entry.path()); }
+            else if meta.is_file() { total = total.saturating_add(meta.len()); }
+        }
+    }
+    total
+}
+
+#[derive(Clone)]
+pub struct NativePublicationHook {
+    pub job_id: String,
+    pub generation: u64,
+    pub notify: Arc<dyn Fn(&Path, &Path, bool) -> Result<(), String> + Send + Sync>,
+    /// Both callbacks append to the existing file-task journal synchronously.
+    /// They run before the worker acknowledges a skip or publishes CUE audio.
+    pub skipped: Arc<dyn Fn(&NativeSkippedSelection) -> Result<(), String> + Send + Sync>,
+    pub prepared_cue: Arc<dyn Fn(&Path, &str) -> Result<(), String> + Send + Sync>,
+}
+
+impl std::fmt::Debug for NativePublicationHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativePublicationHook")
+            .field("job_id", &self.job_id).field("generation", &self.generation).finish()
+    }
+}
+
+/// Independent, cooperative file-task controls. Per-item cancellation is a
+/// child of the job token; Skip never cancels the whole extraction. An Abort
+/// always cancels both. Native loops and supervised tools acknowledge pause.
+#[derive(Debug, Default)]
+pub struct NativeExtractionControl {
+    tool_pause: Arc<NativeToolPause>,
+    skip_requested: AtomicBool,
+    active_item: Mutex<Option<CancellationToken>>,
+    watch: Mutex<Option<NativeWriteWatch>>,
+    publication: Mutex<Option<NativePublicationHook>>,
+}
+
+impl NativeExtractionControl {
+    pub fn pause(&self) { self.tool_pause.request(true); }
+    pub fn resume(&self) { self.tool_pause.request(false); }
+    pub fn is_paused(&self) -> bool { self.tool_pause.requested() }
+    pub fn is_pause_acknowledged(&self) -> bool { self.tool_pause.acknowledged() }
+    pub(crate) fn tool_pause(&self) -> Arc<NativeToolPause> { Arc::clone(&self.tool_pause) }
+    pub fn set_publication_hook(&self, hook: NativePublicationHook) {
+        *self.publication.lock().unwrap_or_else(|e|e.into_inner()) = Some(hook);
+    }
+    fn publication_hook(&self) -> Option<NativePublicationHook> {
+        self.publication.lock().unwrap_or_else(|e|e.into_inner()).clone()
+    }
+    fn record_skipped(&self, selection: NativeSkippedSelection) -> Result<(), String> {
+        if let Some(hook) = self.publication_hook() { (hook.skipped)(&selection)?; }
+        Ok(())
+    }
+    fn record_prepared_cue(&self, destination: &Path, content: &str) -> Result<(), String> {
+        if let Some(hook) = self.publication_hook() { (hook.prepared_cue)(destination, content)?; }
+        Ok(())
+    }
+    pub fn watch_snapshot(&self) -> Option<NativeWriteWatch> {
+        self.watch.lock().unwrap_or_else(|e|e.into_inner()).clone()
+    }
+    fn watch_file(&self, path: PathBuf, label: String, estimated_bytes: Option<u64>, finalizing: bool) {
+        let (start, end) = if finalizing { (85, 100) } else { (0, 85) };
+        self.watch_file_range(path, label, estimated_bytes, start, end);
+    }
+    fn watch_file_range(&self, path: PathBuf, label: String,
+        estimated_bytes: Option<u64>, start: u8, end: u8,
+    ) {
+        *self.watch.lock().unwrap_or_else(|e|e.into_inner()) = Some(NativeWriteWatch {
+            label, source: NativeWatchSource::File(path), baseline: 0, estimated_bytes,
+            finalizing: end == 100 || start >= 75,
+            fraction_start: start, fraction_end: end,
+        });
+    }
+    fn watch_tree(&self, path: PathBuf, label: String, estimated_bytes: Option<u64>) {
+        self.watch_tree_range(path, label, estimated_bytes, 0, 30);
+    }
+    fn watch_tree_range(&self, path: PathBuf, label: String,
+        estimated_bytes: Option<u64>, start: u8, end: u8,
+    ) {
+        let baseline = sum_private_staging_bytes(&path);
+        *self.watch.lock().unwrap_or_else(|e|e.into_inner()) = Some(NativeWriteWatch {
+            label, source: NativeWatchSource::Tree(path), baseline, estimated_bytes,
+            finalizing: end == 100 || start >= 75,
+            fraction_start: start, fraction_end: end,
+        });
+    }
+    fn clear_watch(&self) { *self.watch.lock().unwrap_or_else(|e|e.into_inner()) = None; }
+    pub fn skip_current(&self) {
+        let active = self.active_item.lock().unwrap_or_else(|e| e.into_inner());
+        // Skip-current never arms the *next* item when no item is active.
+        if let Some(token) = active.as_ref() {
+            self.skip_requested.store(true, Ordering::Release);
+            token.cancel();
+        }
+    }
+    fn begin_item(&self, cancel: &CancellationToken) -> CancellationToken {
+        let mut active = self.active_item.lock().unwrap_or_else(|e| e.into_inner());
+        let token = cancel.child_token();
+        if self.skip_requested.load(Ordering::Acquire) { token.cancel(); }
+        *active = Some(token.clone());
+        token
+    }
+    fn finish_item(&self) -> bool {
+        let mut active = self.active_item.lock().unwrap_or_else(|e| e.into_inner());
+        *active = None;
+        self.skip_requested.swap(false, Ordering::AcqRel)
+    }
+    async fn wait_ready(&self, job: &CancellationToken, item: &CancellationToken) -> Result<(), String> {
+        loop {
+            if job.is_cancelled() { self.tool_pause.acknowledge(false); return Err("Extraction cancelled".into()); }
+            if item.is_cancelled() { self.tool_pause.acknowledge(false); return Err("Current extraction item skipped".into()); }
+            if !self.is_paused() { self.tool_pause.acknowledge(false); return Ok(()); }
+            self.tool_pause.acknowledge(true);
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+    }
+    fn wait_blocking(&self, job: &CancellationToken, item: &CancellationToken) -> bool {
+        while self.is_paused() && !job.is_cancelled() && !item.is_cancelled() {
+            self.tool_pause.acknowledge(true);
+            std::thread::sleep(Duration::from_millis(35));
+        }
+        self.tool_pause.acknowledge(false);
+        job.is_cancelled() || item.is_cancelled()
+    }
+}
+
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NativeExtractionReport {
     pub published: Vec<PathBuf>,
+    pub skipped: usize,
 }
 
 /// Facts observed by the pre-extraction materializer. A successful probe must
@@ -145,11 +358,22 @@ pub struct NativeProbeFacts {
 pub async fn execute(
     job: NativeExtractionJob,
     cancel: CancellationToken,
+    on_progress: impl FnMut(NativeExtractionProgress),
+) -> Result<NativeExtractionReport, String> {
+    execute_with_controls(job, cancel, Arc::new(NativeExtractionControl::default()), on_progress).await
+}
+
+/// File-task entrypoint. It shares the existing materializers and native
+/// publisher but does not submit to, observe, or cancel the conversion queue.
+pub async fn execute_with_controls(
+    job: NativeExtractionJob,
+    cancel: CancellationToken,
+    controls: Arc<NativeExtractionControl>,
     mut on_progress: impl FnMut(NativeExtractionProgress),
 ) -> Result<NativeExtractionReport, String> {
     let mut published = 0usize;
     let destination = job.destination.clone();
-    let result = execute_inner(job, cancel, |progress| {
+    let result = execute_inner(job, cancel, controls, |progress| {
         published = published.max(progress.published);
         on_progress(progress);
     }).await;
@@ -215,6 +439,7 @@ pub async fn probe_selected_sources(
 async fn execute_inner(
     job: NativeExtractionJob,
     cancel: CancellationToken,
+    controls: Arc<NativeExtractionControl>,
     mut on_progress: impl FnMut(NativeExtractionProgress),
 ) -> Result<NativeExtractionReport, String> {
     validate_job(&job)?;
@@ -228,20 +453,44 @@ async fn execute_inner(
         .tempdir_in(&work_path)
         .map_err(|e| format!("Cannot allocate private working storage: {e}"))?;
     let staging = StagingDir::borrowed(temporary.path().to_path_buf(), "native-extract".to_string());
-    let runner = RealToolRunner::new(HashMap::new());
+    let runner = RealToolRunner::new(HashMap::new()).with_native_pause(controls.tool_pause());
     let tool_paths = HashMap::new();
     let total: usize = job.programs.iter().map(|p| p.tracks.len()).sum();
     let mut done = 0;
+    let mut skipped = 0usize;
+    let mut estimated_bytes_done = 0u64;
+    let mut estimated_bytes_published = 0u64;
+    let mut estimated_bytes_skipped = 0u64;
+    let estimated_bytes_total = job.programs.iter().flat_map(|p| &p.tracks)
+        .try_fold(0u64, |sum, t| sum.checked_add(t.estimated_bytes?));
     let mut published = Vec::new();
     let mut reserved_names = HashSet::new();
+    // One snapshot shape for all phases, including skips and continuous mode.
+    let mut emit = |done: usize, published: usize, skipped: usize, current: String,
+        current_file: Option<PathBuf>, current_estimated_bytes: Option<u64>,
+        estimated_bytes_done: u64, estimated_bytes_skipped: u64,
+        estimated_bytes_published: u64, published_paths: Vec<PathBuf>| {
+        on_progress(NativeExtractionProgress {
+            done, total, published, published_paths, skipped, current, current_file,
+            current_estimated_bytes, estimated_bytes_done, estimated_bytes_published,
+            estimated_bytes_skipped, estimated_bytes_total,
+        });
+    };
+    emit(0, 0, 0, "Preparing selected disc streams".to_owned(), None, None, 0, 0, 0, Vec::new());
 
     for (pi, program) in job.programs.iter().enumerate() {
         if cancel.is_cancelled() { return Err("Extraction cancelled".into()); }
         let grouped_target = proposed_destination_for_program(&job, program);
         if job.file_per_program && job.overwrite_policy == NativeOverwritePolicy::Skip
             && fs::symlink_metadata(&grouped_target).is_ok() {
+            controls.record_skipped(NativeSkippedSelection::program(program))?;
             done += program.tracks.len();
-            on_progress(NativeExtractionProgress { done, total, published: published.len(), current: format!("Skipped existing {}",program.label) });
+            skipped += program.tracks.len();
+            let skipped_bytes = program.tracks.iter().filter_map(|t| t.estimated_bytes)
+                .fold(0u64, u64::saturating_add);
+            estimated_bytes_done = estimated_bytes_done.saturating_add(skipped_bytes);
+            estimated_bytes_skipped = estimated_bytes_skipped.saturating_add(skipped_bytes);
+            emit(done, published.len(), skipped, format!("Skipped existing {}",program.label), None, None, estimated_bytes_done, estimated_bytes_skipped, estimated_bytes_published, published.clone());
             continue;
         }
         let mut grouped_outputs: Vec<(u32, PathBuf, String)> = Vec::new();
@@ -254,9 +503,15 @@ async fn execute_inner(
             DiscFormat::DvdVideo => Box::new(DvdVideoMaterializer),
             DiscFormat::BluRay => Box::new(BlurayMaterializer),
         };
+        controls.wait_ready(&cancel, &cancel).await?;
+        let program_estimate = program.tracks.iter()
+            .try_fold(0u64, |sum, track| sum.checked_add(track.estimated_bytes?));
+        controls.watch_tree(temporary.path().to_path_buf(),
+            format!("Preparing {}", program.label), program_estimate);
         let prepared = materializer.materialize(
             &req, &staging, &runner, None, &tool_paths, &cancel,
         ).await.map_err(|e| format!("{}: {e}", program.label))?;
+        controls.clear_watch();
         if prepared.tracks.len() != program.tracks.len() {
             return Err(format!("{}: selected track inventory changed; refusing partial extraction", program.label));
         }
@@ -264,7 +519,7 @@ async fn execute_inner(
             if cancel.is_cancelled() { return Err("Extraction cancelled".into()); }
             let requested = program.tracks.iter().find(|chosen| chosen.number == track.id.source_ordinal)
                 .ok_or_else(|| format!("{}: materializer returned unexpected track {}", program.label, track.id.source_ordinal))?;
-            on_progress(NativeExtractionProgress { done, total, published: published.len(), current: format!("{} · {}", program.label, requested.name) });
+            let item_cancel = controls.begin_item(&cancel);
             let extension = extraction_extension(&job, program);
             let dest = proposed_destination(&job, program, requested);
             if !job.file_per_program {
@@ -272,8 +527,13 @@ async fn execute_inner(
                     return Err(format!("Two selected items would publish to '{}'; choose different names", dest.display()));
                 }
                 if job.overwrite_policy == NativeOverwritePolicy::Skip && fs::symlink_metadata(&dest).is_ok() {
+                    controls.record_skipped(NativeSkippedSelection::track(program, requested.number))?;
                     done += 1;
-                    on_progress(NativeExtractionProgress { done, total, published: published.len(), current: format!("Skipped existing {}", requested.name) });
+                    skipped += 1;
+                    estimated_bytes_done = estimated_bytes_done.saturating_add(requested.estimated_bytes.unwrap_or(0));
+                    estimated_bytes_skipped = estimated_bytes_skipped.saturating_add(requested.estimated_bytes.unwrap_or(0));
+                    controls.finish_item();
+                    emit(done, published.len(), skipped, format!("Skipped existing {}", requested.name), None, None, estimated_bytes_done, estimated_bytes_skipped, estimated_bytes_published, published.clone());
                     continue;
                 }
                 if job.overwrite_policy == NativeOverwritePolicy::Fail && fs::symlink_metadata(&dest).is_ok() {
@@ -282,12 +542,21 @@ async fn execute_inner(
             }
 
             let complete = temporary.path().join(format!("completed-{pi}-{}.{extension}", track.id.source_ordinal));
+            controls.watch_file(complete.clone(), format!("Writing {}", requested.name),
+                requested.estimated_bytes, false);
+            let watched = complete.clone();
+            emit(done, published.len(), skipped, format!("{} · {}", program.label, requested.name),
+                Some(watched), requested.estimated_bytes, estimated_bytes_done, estimated_bytes_skipped, estimated_bytes_published, published.clone());
+            let item_result: Result<(), String> = async {
+            controls.wait_ready(&cancel, &item_cancel).await?;
             if job.format == DiscFormat::Sacd {
                 let src = track.source_ref.clone();
                 let dst = complete.clone();
                 let cancel_copy = cancel.clone();
+                let item_copy = item_cancel.clone();
+                let controls_copy = controls.clone();
                 let keep_dst = program.keep_dst;
-                tokio::task::spawn_blocking(move || extract_sacd_native(&src, &dst, keep_dst, &cancel_copy))
+                tokio::task::spawn_blocking(move || extract_sacd_native(&src, &dst, keep_dst, &cancel_copy, &item_copy, &controls_copy))
                     .await.map_err(|e| format!("SACD extraction task: {e}"))??;
             } else {
                 if job.format == DiscFormat::DvdAudio {
@@ -299,17 +568,19 @@ async fn execute_inner(
                         return Err(format!("{}: channel-group sample rates are mixed or unknown; use Convert", requested.name));
                     }
                 }
+                controls.watch_tree(temporary.path().to_path_buf(),
+                    format!("Realizing {}", requested.name), requested.estimated_bytes);
                 let carrier = match &track.source_ref {
                     TrackSourceRef::DvdaTrack { .. } => {
                         let expectation = DvdaSourceAudioExpectation::from_prepared_track_and_source(Some(track), &track.source_ref);
                         let policy = DvdaRealizationAudioPolicy::new("native".to_string(), None, job.downmix).for_native_extraction();
-                        realize_dvda_track(&track.source_ref, expectation, policy, &staging, &runner, &cancel, None, None).await
+                        realize_dvda_track_native(&track.source_ref, expectation, policy, &staging, &runner, &item_cancel, None, None, controls.tool_pause()).await
                     }
                     TrackSourceRef::DvdVideoTrack { .. } => {
-                        realize_dvdv_track_native(&track.source_ref, &staging, &runner, &cancel, None, None).await
+                        realize_dvdv_track_native(&track.source_ref, &staging, &runner, &item_cancel, None, None, controls.tool_pause()).await
                     }
                     TrackSourceRef::BluRayTrack { .. } => {
-                        realize_bluray_track_native(&track.source_ref, &staging, &runner, &cancel, None, None).await
+                        realize_bluray_track_native(&track.source_ref, &staging, &runner, &item_cancel, None, None, controls.tool_pause()).await
                     }
                     _ => return Err("Unexpected prepared track kind".into()),
                 }.map_err(|e| format!("{}: {e}", requested.name))?;
@@ -322,18 +593,19 @@ async fn execute_inner(
                 encode_pcm_container(&runner, &carrier, &complete, output_depth, depth, job.wav_container,
                     track.scalar_sample_rate().or(program.source_rate),
                     if job.downmix.is_active() { None } else { program.source_channels },
-                    if job.downmix.is_active() { None } else { program.source_layout.as_deref() }, &cancel).await?;
+                    if job.downmix.is_active() { None } else { program.source_layout.as_deref() },
+                    &item_cancel, &cancel, Arc::clone(&controls), requested.estimated_bytes).await?;
                 // This carrier was made in private staging, never in source.
                 // Reclaim it before decoding the next selected item.
                 let _ = fs::remove_file(&carrier);
             }
-            if cancel.is_cancelled() { return Err("Extraction cancelled".into()); }
+            controls.wait_ready(&cancel, &item_cancel).await?;
             if job.transfer_tags && !job.file_per_program && !program.keep_dst {
                 let entries = extraction_tags(&job, program, requested, track, &prepared.album_metadata);
                 let art = if job.tag_artwork { native_artwork_path(&prepared.album_metadata, &job.source) } else { None };
                 if !entries.is_empty() || art.is_some() {
                     let complete_copy = complete.clone();
-                    let cancel_copy = cancel.clone();
+                    let cancel_copy = item_cancel.clone();
                     tokio::task::spawn_blocking(move || {
                         if cancel_copy.is_cancelled() { return Err("Extraction cancelled before metadata".to_string()); }
                         write_completed_native_metadata(&complete_copy, &entries, art.as_deref())?;
@@ -342,34 +614,79 @@ async fn execute_inner(
                     }).await.map_err(|e|format!("Metadata worker: {e}"))??;
                 }
             }
+            controls.wait_ready(&cancel, &item_cancel).await?;
             if fs::metadata(&complete).map_err(|e| format!("Completed file not found: {e}"))?.len() < 64 {
                 return Err(format!("{}: extraction produced an empty or truncated output", requested.name));
             }
             File::open(&complete).and_then(|f| f.sync_all())
                 .map_err(|e| format!("Cannot synchronize completed file: {e}"))?;
             if job.file_per_program {
-                grouped_outputs.push((requested.number, complete, requested.name.clone()));
+                grouped_outputs.push((requested.number, complete.clone(), requested.name.clone()));
             } else {
-                publish_finished_file(&job, &complete, &dest)?;
+                publish_finished_file_controlled(&job, &complete, &dest, &cancel, &item_cancel, &controls)?;
                 published.push(dest);
+                estimated_bytes_published = estimated_bytes_published
+                    .saturating_add(requested.estimated_bytes.unwrap_or(0));
+                // Persist the destination before any next-track work. This
+                // closes the successful-publication / abrupt-exit window.
+                emit(done, published.len(), skipped, format!("Published {}", requested.name),
+                    None, None, estimated_bytes_done, estimated_bytes_skipped, estimated_bytes_published, published.clone());
             }
-            done += 1;
-            on_progress(NativeExtractionProgress { done, total, published: published.len(), current: requested.name.clone() });
-        }
-        if job.file_per_program {
+            Ok(())
+            }.await;
+            controls.clear_watch();
+            let item_was_skipped = controls.finish_item();
             if cancel.is_cancelled() { return Err("Extraction cancelled".into()); }
+            if item_was_skipped && item_result.is_err() {
+                let _ = fs::remove_file(&complete);
+                let _ = fs::remove_file(complete.with_extension("raw-pcm-in-working-storage"));
+                controls.record_skipped(NativeSkippedSelection::track(program, requested.number))?;
+                done += 1;
+                skipped += 1;
+                estimated_bytes_done = estimated_bytes_done.saturating_add(requested.estimated_bytes.unwrap_or(0));
+                estimated_bytes_skipped = estimated_bytes_skipped.saturating_add(requested.estimated_bytes.unwrap_or(0));
+                emit(done, published.len(), skipped, format!("Skipped {}", requested.name), None, None, estimated_bytes_done, estimated_bytes_skipped, estimated_bytes_published, published.clone());
+                continue;
+            }
+            item_result?;
+            done += 1;
+            estimated_bytes_done = estimated_bytes_done.saturating_add(requested.estimated_bytes.unwrap_or(0));
+            emit(done, published.len(), skipped, requested.name.clone(), None, None, estimated_bytes_done, estimated_bytes_skipped, estimated_bytes_published, published.clone());
+        }
+        if job.file_per_program && !grouped_outputs.is_empty() {
+            if cancel.is_cancelled() { return Err("Extraction cancelled".into()); }
+            let join_item = controls.begin_item(&cancel);
+            let mut program_published = false;
+            let join_result: Result<(), String> = async {
+            controls.wait_ready(&cancel, &join_item).await?;
             grouped_outputs.sort_by_key(|(ordinal,_,_)| *ordinal);
             let parts = grouped_outputs.iter().map(|(_,path,_)|path.clone()).collect::<Vec<_>>();
             let grouped_file = temporary.path().join(format!("continuous-{pi}.{}", extraction_extension(&job, program)));
             let grouped = grouped_file.clone();
             let cancel_copy = cancel.clone();
+            let join_copy = join_item.clone();
             let container = job.wav_container;
             let sacd = job.format == DiscFormat::Sacd;
             let keep_dst = program.keep_dst;
+            let join_bytes = grouped_outputs.iter()
+                .filter_map(|(_, path, _)| fs::metadata(path).ok().map(|m| m.len()))
+                .fold(0u64, u64::saturating_add);
+            controls.watch_tree_range(temporary.path().to_path_buf(),
+                format!("Joining {}", program.label), Some(join_bytes), 75, 90);
+            emit(done, published.len(), skipped, format!("Joining {}", program.label),
+                Some(grouped_file.clone()), Some(join_bytes),
+                estimated_bytes_done, estimated_bytes_skipped, estimated_bytes_published, published.clone());
+            let join_controls = Arc::clone(&controls);
             let (sample_counts, rate) = tokio::task::spawn_blocking(move || {
-                if sacd { concatenate_sacd_tracks(&parts, &grouped, keep_dst, &cancel_copy) }
-                else { concatenate_generated_waves(&parts, &grouped, container, &cancel_copy) }
+                let checkpoint = || if join_controls.wait_blocking(&cancel_copy, &join_copy) {
+                    Err("Continuous extraction cancelled".to_owned())
+                } else { Ok(()) };
+                if sacd { concatenate_sacd_tracks_checked(&parts, &grouped, keep_dst, &cancel_copy, checkpoint) }
+                else { concatenate_generated_waves_checked(&parts, &grouped, container, &cancel_copy, checkpoint) }
             }).await.map_err(|e| format!("Continuous native audio worker: {e}"))??;
+            controls.wait_ready(&cancel, &join_item).await?;
+            controls.watch_file_range(grouped_file.clone(), format!("Finishing {}", program.label),
+                Some(join_bytes), 90, 90);
             let cue_file = if job.cue {
                 let file_name = grouped_target.file_name().and_then(|s|s.to_str()).ok_or("Invalid continuous output name")?;
                 let names = grouped_outputs.iter().map(|(_,_,name)| name.clone()).collect::<Vec<_>>();
@@ -379,6 +696,10 @@ async fn execute_inner(
                     .map_err(|e| format!("Cannot create private CUE: {e}"))?;
                 file.write_all(cue_text.as_bytes()).and_then(|()|file.sync_all())
                     .map_err(|e| format!("Cannot finish private CUE: {e}"))?;
+                // Journal the exact generated indexes *before* publishing the
+                // continuous audio. A restart can then finish a missing CUE
+                // without decoding or rewriting the completed audio.
+                controls.record_prepared_cue(&grouped_target.with_extension("cue"), &cue_text)?;
                 Some(path)
             } else { None };
             if job.transfer_tags && !program.keep_dst {
@@ -401,28 +722,117 @@ async fn execute_inner(
                     write_completed_native_metadata(&grouped_copy, &values, art.as_deref())
                 }).await.map_err(|e|format!("Metadata worker: {e}"))??;
             }
-            publish_finished_file(&job, &grouped_file, &grouped_target)?;
+            controls.wait_ready(&cancel, &join_item).await?;
+            publish_finished_file_controlled(&job, &grouped_file, &grouped_target, &cancel, &join_item, &controls)?;
+            program_published = true;
             published.push(grouped_target.clone());
+            estimated_bytes_published = estimated_bytes_published.saturating_add(
+                estimated_bytes_for_staged_continuous_tracks(program, &grouped_outputs));
+            emit(done, published.len(), skipped, format!("Published {}", program.label),
+                None, None, estimated_bytes_done, estimated_bytes_skipped, estimated_bytes_published, published.clone());
             if let Some(cue_file) = cue_file {
                 let cue_target = grouped_target.with_extension("cue");
-                publish_finished_file(&job, &cue_file, &cue_target)?;
+                controls.wait_ready(&cancel, &join_item).await?;
+                publish_finished_file_controlled(&job, &cue_file, &cue_target, &cancel, &join_item, &controls)?;
                 published.push(cue_target);
+                emit(done, published.len(), skipped, format!("Published CUE for {}", program.label),
+                    None, None, estimated_bytes_done, estimated_bytes_skipped, estimated_bytes_published, published.clone());
             }
-            on_progress(NativeExtractionProgress { done, total, published: published.len(), current: format!("Completed {}",program.label) });
+            controls.clear_watch();
+            emit(done, published.len(), skipped, format!("Completed {}",program.label), None, None, estimated_bytes_done, estimated_bytes_skipped, estimated_bytes_published, published.clone());
+            Ok(())
+            }.await;
+            controls.clear_watch();
+            let join_was_skipped = controls.finish_item();
+            if cancel.is_cancelled() { return Err("Extraction cancelled".into()); }
+            if join_was_skipped && join_result.is_err() && !program_published {
+                controls.record_skipped(NativeSkippedSelection::program(program))?;
+                // Tracks previously skipped in this program have already been
+                // counted. The join skip disposes only the successfully
+                // staged tracks that would otherwise form the final output.
+                let skipped_bytes = grouped_outputs.iter().filter_map(|(number, _, _)|
+                    program.tracks.iter().find(|track|track.number == *number)
+                        .and_then(|track|track.estimated_bytes))
+                    .fold(0u64, u64::saturating_add);
+                skipped += grouped_outputs.len();
+                estimated_bytes_skipped = estimated_bytes_skipped.saturating_add(skipped_bytes);
+                emit(done, published.len(), skipped, format!("Skipped continuous {}", program.label),
+                    None, None, estimated_bytes_done, estimated_bytes_skipped,
+                    estimated_bytes_published, published.clone());
+                continue;
+            }
+            join_result?;
         }
     }
     if job.extraction_log {
         let log = temporary.path().join("native-extraction.log");
         let mut output = OpenOptions::new().create_new(true).write(true).open(&log)
             .map_err(|e| format!("Cannot stage extraction log: {e}"))?;
-        writeln!(output, "Native extraction from {}", job.source.display()).map_err(|e| e.to_string())?;
-        for item in &published { writeln!(output, "Completed: {}", item.display()).map_err(|e|e.to_string())?; }
+        output.write_all(render_native_extraction_log(&job, &published).as_bytes())
+            .map_err(|e|format!("Write extraction log: {e}"))?;
         output.sync_all().map_err(|e|format!("Cannot sync extraction log: {e}"))?;
         let log_target = job.destination.join("native-extraction.log");
-        publish_finished_file(&job, &log, &log_target)?;
+        publish_finished_file_controlled(&job, &log, &log_target, &cancel, &cancel, &controls)?;
         published.push(log_target);
+        emit(done, published.len(), skipped, "Published extraction log".to_owned(),
+            None, None, estimated_bytes_done, estimated_bytes_skipped, estimated_bytes_published, published.clone());
+        controls.clear_watch();
     }
-    Ok(NativeExtractionReport { published })
+    Ok(NativeExtractionReport { published, skipped })
+}
+
+/// A continuous output contains only successfully staged tracks. A skipped
+/// selection remains in the preflight total and skip counter, but contributes
+/// no published bytes even after the joined file has been published.
+fn estimated_bytes_for_staged_continuous_tracks(
+    program: &NativeProgramChoice, grouped_outputs: &[(u32, PathBuf, String)],
+) -> u64 {
+    grouped_outputs.iter().filter_map(|(number, _, _)|
+        program.tracks.iter().find(|track| track.number == *number)
+            .and_then(|track| track.estimated_bytes))
+        .fold(0u64, u64::saturating_add)
+}
+
+/// The same log body is used by uninterrupted extraction and by a recovered
+/// detached helper. The caller supplies *all* previously published artifacts,
+/// so a resumed generation cannot lose earlier entries. A log is not its own
+/// completed entry, and each output appears at most once.
+pub(crate) fn render_native_extraction_log(job: &NativeExtractionJob, paths: &[PathBuf]) -> String {
+    let mut log = format!("Native extraction from {}\n", job.source.display());
+    let log_target = job.destination.join("native-extraction.log");
+    let mut seen = HashSet::new();
+    for path in paths {
+        if path != &log_target && seen.insert(path) {
+            log.push_str(&format!("Completed: {}\n", path.display()));
+        }
+    }
+    log
+}
+
+/// Complete a journaled CUE or extraction log without realizing any audio.
+/// The private staging, checked cross-volume publisher, cancellation and
+/// journal-owned destination temporary are exactly those of normal extraction.
+pub(crate) fn publish_native_recovery_sidecar(
+    job: &NativeExtractionJob, target: &Path, content: &str,
+    cancel: &CancellationToken, controls: &NativeExtractionControl,
+) -> Result<(), String> {
+    let work_path = native_working_storage(&job.working_root, &job.destination)?;
+    fs::create_dir_all(&work_path).map_err(|e| format!("Sidecar working storage: {e}"))?;
+    let staged_dir = tempfile::Builder::new().prefix("tonepoet-extract-sidecar-")
+        .tempdir_in(&work_path).map_err(|e|format!("Stage extraction sidecar: {e}"))?;
+    let staged = staged_dir.path().join("completed-sidecar");
+    let mut output = OpenOptions::new().create_new(true).write(true).open(&staged)
+        .map_err(|e|format!("Create extraction sidecar: {e}"))?;
+    output.write_all(content.as_bytes()).and_then(|()|output.sync_all())
+        .map_err(|e|format!("Write extraction sidecar: {e}"))?;
+    drop(output);
+    if controls.wait_blocking(cancel, cancel) { return Err("Extraction cancelled".into()); }
+    controls.watch_file_range(staged.clone(),
+        format!("Publishing {}", target.file_name().unwrap_or_default().to_string_lossy()),
+        Some(content.len() as u64), 90, 100);
+    let result = publish_finished_file_controlled(job, &staged, target, cancel, cancel, controls);
+    controls.clear_watch();
+    result
 }
 
 /// Publish only completed private artifacts. On a different filesystem the
@@ -430,6 +840,33 @@ async fn execute_inner(
 /// directory and atomically renames it only after flushing the complete data.
 /// A failed copy never exposes a partial result at the requested filename.
 fn publish_finished_file(job: &NativeExtractionJob, complete: &Path, target: &Path) -> Result<(), String> {
+    publish_finished_file_checked(job, complete, target, || Ok(()))
+}
+
+fn publish_finished_file_controlled(
+    job: &NativeExtractionJob, complete: &Path, target: &Path,
+    cancel: &CancellationToken, item: &CancellationToken, controls: &NativeExtractionControl,
+) -> Result<(), String> {
+    publish_finished_file_checked_observed(job, complete, target, || {
+        if controls.wait_blocking(cancel, item) {
+            Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "Extraction stopped during publication"))
+        } else { Ok(()) }
+    }, Some(controls))
+}
+
+fn publish_finished_file_checked(
+    job: &NativeExtractionJob, complete: &Path, target: &Path,
+    mut checkpoint: impl FnMut() -> std::io::Result<()>,
+) -> Result<(), String> {
+    publish_finished_file_checked_observed(job, complete, target, checkpoint, None)
+}
+
+fn publish_finished_file_checked_observed(
+    job: &NativeExtractionJob, complete: &Path, target: &Path,
+    mut checkpoint: impl FnMut() -> std::io::Result<()>,
+    controls: Option<&NativeExtractionControl>,
+) -> Result<(), String> {
+    checkpoint().map_err(|e|format!("Publication cancelled: {e}"))?;
     if job.overwrite_policy != NativeOverwritePolicy::Replace && fs::symlink_metadata(target).is_ok() {
         return Err(format!("Destination already exists: '{}'",target.display()));
     }
@@ -437,7 +874,32 @@ fn publish_finished_file(job: &NativeExtractionJob, complete: &Path, target: &Pa
     let parent_existed = parent.exists();
     let root_existed = job.destination.exists();
     fs::create_dir_all(parent).map_err(|e|format!("Cannot create destination parent: {e}"))?;
-    if let Err(error) = super::transactional_state::publish_validated_to_final(complete, target) {
+    let hook = controls.and_then(NativeExtractionControl::publication_hook);
+    let private_temp = hook.as_ref().map(|hook| {
+        let name = target.file_name().and_then(|s|s.to_str()).unwrap_or("audio");
+        parent.join(format!(".{name}.tonepoet-part-{}-{}-{}-{}.tmp",
+            hook.job_id, hook.generation, std::process::id(), uuid::Uuid::new_v4().as_u128()))
+    });
+    let observed_temp = private_temp.clone();
+    if let Err(error) = super::transactional_state::publish_validated_to_final_checked_observed(
+        complete, target, &mut checkpoint, private_temp,
+        |temporary| {
+            if let Some(hook) = &hook {
+                let temp = observed_temp.as_deref().ok_or_else(||std::io::Error::other("Missing native publication temporary"))?;
+                if let Some(controls) = controls {
+                    if temporary.is_some() {
+                        controls.watch_file_range(temp.to_path_buf(),
+                            format!("Publishing {}",target.file_name().unwrap_or_default().to_string_lossy()),
+                            fs::metadata(complete).ok().map(|m|m.len()),
+                            if job.file_per_program { 90 } else { 85 }, 100);
+                    }
+                }
+                (hook.notify)(temp, target, temporary.is_some())
+                    .map_err(std::io::Error::other)?;
+            }
+            Ok(())
+        },
+    ) {
         if !parent_existed { let _ = fs::remove_dir(parent); }
         if !root_existed { let _ = fs::remove_dir(&job.destination); }
         return Err(format!("Cannot publish complete file '{}': {error}", target.display()));
@@ -446,7 +908,7 @@ fn publish_finished_file(job: &NativeExtractionJob, complete: &Path, target: &Pa
 }
 
 pub(crate) fn proposed_destination_for_program(job: &NativeExtractionJob, program: &NativeProgramChoice) -> PathBuf {
-    let virtual_track = NativeTrackChoice { number: 0, name: program.label.clone(), tags: NativeTagValues::default() };
+    let virtual_track = NativeTrackChoice { number: 0, name: program.label.clone(), tags: NativeTagValues::default(), estimated_bytes: None };
     let mut stem = if job.naming_template == default_naming_template() {
         sanitize_component(&program.label)
     } else { render_naming_template(&job.naming_template, program, &virtual_track) };
@@ -778,7 +1240,9 @@ fn materializer_request(job: &NativeExtractionJob, program: &NativeProgramChoice
     })
 }
 
-fn extract_sacd_native(src: &TrackSourceRef, output: &Path, keep_dst: bool, cancel: &CancellationToken) -> Result<(), String> {
+fn extract_sacd_native(src: &TrackSourceRef, output: &Path, keep_dst: bool,
+    cancel: &CancellationToken, item_cancel: &CancellationToken,
+    controls: &NativeExtractionControl) -> Result<(), String> {
     let TrackSourceRef::SacdTrack { iso, track_index, area } = src else { return Err("Not a SACD track".into()); };
     let metadata = crate::tui::sacd::parse_sacd_iso(iso).map_err(|e| e.to_string())?;
     let area_info = match area {
@@ -793,7 +1257,7 @@ fn extract_sacd_native(src: &TrackSourceRef, output: &Path, keep_dst: bool, canc
     let mut file = OpenOptions::new().write(true).create_new(true).open(output).map_err(|e| e.to_string())?;
     let report = sacd_rs::extract::extract_track_with_area_frame_format_and_cancel(
         &mut reader, &mut file, options, area_info.extraction_frame_format(),
-        sacd_rs::extract::ExtractIntegrityOptions::strict(), || cancel.is_cancelled(),
+        sacd_rs::extract::ExtractIntegrityOptions::strict(), || controls.wait_blocking(cancel, item_cancel),
     ).map_err(|e| format!("SACD extraction: {e}"))?;
     if report.integrity_loss_detected() { return Err("SACD extractor reported loss of integrity".into()); }
     file.sync_all().map_err(|e| e.to_string())?;
@@ -807,6 +1271,13 @@ fn extract_sacd_native(src: &TrackSourceRef, output: &Path, keep_dst: bool, canc
 /// container structures and DSTC checksums for the combined frame sequence.
 fn concatenate_sacd_tracks(
     parts: &[PathBuf], output: &Path, keep_dst: bool, cancel: &CancellationToken,
+) -> Result<(Vec<u64>, u32), String> {
+    concatenate_sacd_tracks_checked(parts, output, keep_dst, cancel, || Ok(()))
+}
+
+fn concatenate_sacd_tracks_checked(
+    parts: &[PathBuf], output: &Path, keep_dst: bool, cancel: &CancellationToken,
+    mut checkpoint: impl FnMut() -> Result<(), String>,
 ) -> Result<(Vec<u64>, u32), String> {
     use sacd_rs::dsd_file::{DsdFrameReader, DsfStreamReader, DstFrameReader, DstDsdiffStreamReader};
     if parts.is_empty() { return Err("Continuous SACD selection is empty".into()); }
@@ -823,6 +1294,7 @@ fn concatenate_sacd_tracks(
         let mut writer = sacd_rs::dff_dst_writer::DffDstWriter::new(file, channels, rate)
             .map_err(|e|format!("Create continuous DFF writer: {e}"))?;
         for (index, part) in parts.iter().enumerate() {
+            checkpoint()?;
             if cancel.is_cancelled() { return Err("SACD extraction cancelled".into()); }
             let mut reader = first_part_dst_reader(part)?;
             if reader.info().channel_count != u16::from(channels) || reader.info().sample_rate != rate {
@@ -830,7 +1302,8 @@ fn concatenate_sacd_tracks(
             }
             let mut track_samples = 0u64;
             while let Some(frame) = reader.next_dst_frame().map_err(|e|format!("Read DST frame: {e}"))? {
-                if cancel.is_cancelled() { return Err("SACD extraction cancelled".into()); }
+                checkpoint()?;
+            if cancel.is_cancelled() { return Err("SACD extraction cancelled".into()); }
                 let decoded = sacd_rs::dst::decode_frame_with_rate(&frame.encoded, channels, dst_rate)
                     .map_err(|e|format!("Verify source DST frame: {e}"))?;
                 if frame.dstc.is_some_and(|crc| crc != sacd_rs::dff_dst_writer::dst_frame_crc(&decoded)) {
@@ -857,6 +1330,7 @@ fn concatenate_sacd_tracks(
         let mut writer = sacd_rs::dsf_writer::DsfWriter::new(file, channels, rate)
             .map_err(|e|format!("Create continuous DSF writer: {e}"))?;
         for (index, part) in parts.iter().enumerate() {
+            checkpoint()?;
             if cancel.is_cancelled() { return Err("SACD extraction cancelled".into()); }
             let mut reader = DsfStreamReader::new(File::open(part).map_err(|e|e.to_string())?)
                 .map_err(|e|format!("Read DSF track: {e}"))?;
@@ -865,7 +1339,8 @@ fn concatenate_sacd_tracks(
             }
             let mut track_samples = 0u64;
             while let Some(frame) = reader.next_dsd_frame().map_err(|e|format!("Read DSD data: {e}"))? {
-                if cancel.is_cancelled() { return Err("SACD extraction cancelled".into()); }
+                checkpoint()?;
+            if cancel.is_cancelled() { return Err("SACD extraction cancelled".into()); }
                 writer.write_interleaved(&frame.data).map_err(|e|format!("Join DSD data: {e}"))?;
                 track_samples = track_samples.checked_add((frame.data.len() / usize::from(channels)) as u64 * 8)
                     .ok_or("DSD sample-count overflow")?;
@@ -910,6 +1385,8 @@ async fn encode_pcm_container(
     output_depth: u32, valid_bits: u32, container: NativeWavContainer,
     declared_rate: Option<u32>, declared_channels: Option<u8>,
     source_layout: Option<&str>, cancel: &CancellationToken,
+    job_cancel: &CancellationToken, controls: Arc<NativeExtractionControl>,
+    estimated_bytes: Option<u64>,
 ) -> Result<(), String> {
     if valid_bits == 0 || valid_bits > output_depth { return Err("Invalid PCM valid-bit depth".into()); }
     let observed = inspect_carrier(carrier)?;
@@ -942,11 +1419,20 @@ async fn encode_pcm_container(
         environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
         env: Vec::new(), timeout: Duration::from_secs(6 * 60 * 60),
     };
+    controls.watch_file_range(raw.clone(), "Decoding native PCM".to_owned(), estimated_bytes, 30, 65);
     runner.run(command, cancel).await.map_err(|e| format!("Native PCM realization: {e}"))?;
+    controls.wait_ready(job_cancel, cancel).await?;
+    controls.watch_file_range(output.to_path_buf(), "Packaging native PCM".to_owned(), estimated_bytes, 65, 85);
     let raw_copy = raw.clone();
     let out_copy = output.to_path_buf();
     let cancel_copy = cancel.clone();
-    tokio::task::spawn_blocking(move || package_raw_pcm(&raw_copy, &out_copy, format, container, &cancel_copy))
+    let job_copy = job_cancel.clone();
+    tokio::task::spawn_blocking(move || package_raw_pcm_checked(
+        &raw_copy, &out_copy, format, container, &cancel_copy,
+        || if controls.wait_blocking(&job_copy, &cancel_copy) {
+            Err("PCM packaging stopped".to_owned())
+        } else { Ok(()) },
+    ))
         .await.map_err(|e| format!("PCM packaging worker: {e}"))??;
     fs::remove_file(&raw).map_err(|e| format!("Cannot remove private PCM staging: {e}"))?;
     Ok(())
@@ -1026,7 +1512,7 @@ mod tests {
                 id: PresentationId::SacdArea(crate::disc::SacdAreaId::Stereo),
                 angle: 1, label: "Stereo".into(),
                 tracks: vec![NativeTrackChoice { number: 1, name: "one".into(),
-                    tags: NativeTagValues::default() }],
+                    tags: NativeTagValues::default(), estimated_bytes: None }],
                 keep_dst: false, source_depth: Some(1), source_channels: Some(2),
                 source_rate: Some(2_822_400), source_layout: None, is_lossless: true,
                 tags: NativeTagValues::default(),
@@ -1039,6 +1525,38 @@ mod tests {
             transfer_tags: false, tag_source: default_tag_source(),
             tag_fields: default_tag_fields(), tag_artwork: false,
         }
+    }
+
+    #[test]
+    fn partial_continuous_skips_count_only_published_track_estimates() {
+        const TRACK: u64 = 100 * 1024 * 1024;
+        let mut job = fixture_job(Path::new("/unused-destination"), Path::new("/unused-scratch"));
+        let program = &mut job.programs[0];
+        program.tracks = (1..=3).map(|number| NativeTrackChoice {
+            number, name: format!("Track {number}"), tags: NativeTagValues::default(),
+            estimated_bytes: Some(TRACK),
+        }).collect();
+
+        // Two selected tracks, first skipped: only track 2 reaches the join.
+        let mut two_tracks = program.clone();
+        two_tracks.tracks.pop();
+        let staged = vec![(2, PathBuf::from("private-2.wav"), "Track 2".into())];
+        let published = estimated_bytes_for_staged_continuous_tracks(&two_tracks, &staged);
+        let skipped = two_tracks.tracks[0].estimated_bytes.unwrap();
+        let total = two_tracks.tracks.iter().filter_map(|t| t.estimated_bytes).sum::<u64>();
+        assert_eq!((published, skipped, total), (TRACK, TRACK, 2 * TRACK));
+        assert_eq!(published + skipped, total);
+
+        // Three selected tracks, middle skipped: 1 and 3 reach the join.
+        let staged = vec![
+            (1, PathBuf::from("private-1.wav"), "Track 1".into()),
+            (3, PathBuf::from("private-3.wav"), "Track 3".into()),
+        ];
+        let published = estimated_bytes_for_staged_continuous_tracks(program, &staged);
+        let skipped = program.tracks[1].estimated_bytes.unwrap();
+        let total = program.tracks.iter().filter_map(|t| t.estimated_bytes).sum::<u64>();
+        assert_eq!((published, skipped, total), (2 * TRACK, TRACK, 3 * TRACK));
+        assert_eq!(published + skipped, total);
     }
 
     /// Include hidden entries and every nested directory. An inventory that
@@ -1243,7 +1761,7 @@ mod tests {
         };
         let track = NativeTrackChoice { number: 3, name: "A Song".into(),
             tags: NativeTagValues { title: Some("A Song".into()),
-                composer: Some("A Composer".into()), ..Default::default() } };
+                composer: Some("A Composer".into()), ..Default::default() }, estimated_bytes: None };
         assert_eq!(render_naming_template("{track} - {artist} - {title}", &program, &track),
             "03 - A Performer - A Song");
         assert_eq!(name_value("genre", &program, &track), "");
@@ -1392,7 +1910,7 @@ mod tests {
             programs: vec![NativeProgramChoice {
                 id: PresentationId::SacdArea(crate::disc::SacdAreaId::Stereo),
                 label: "Stereo".into(),
-                tracks: vec![NativeTrackChoice { number: 1, name: "one".into(), tags: NativeTagValues::default() }],
+                tracks: vec![NativeTrackChoice { number: 1, name: "one".into(), tags: NativeTagValues::default(), estimated_bytes: None }],
                 keep_dst: false,
                 source_depth: Some(1),
                 source_channels: Some(2),
@@ -1527,8 +2045,8 @@ mod tests {
     fn reject_duplicate_track_selection_before_io() {
         let job = NativeExtractionJob { source: std::env::current_exe().unwrap(), format: DiscFormat::Sacd,
             programs: vec![NativeProgramChoice { id: PresentationId::SacdArea(crate::disc::SacdAreaId::Stereo),
-                label: "Stereo".into(), tracks: vec![NativeTrackChoice{number:1,name:"a".into(),tags:NativeTagValues::default()},
-                NativeTrackChoice{number:1,name:"b".into(),tags:NativeTagValues::default()}], keep_dst:false,source_depth:Some(1),
+                label: "Stereo".into(), tracks: vec![NativeTrackChoice{number:1,name:"a".into(),tags:NativeTagValues::default(),estimated_bytes:None},
+                NativeTrackChoice{number:1,name:"b".into(),tags:NativeTagValues::default(),estimated_bytes:None}], keep_dst:false,source_depth:Some(1),
                 source_channels:Some(2), source_rate:Some(2822400), angle:1,source_layout:None, is_lossless:true, tags:NativeTagValues::default() }],
             destination:"/tmp/dest".into(),working_root:"/tmp".into(),
             wav_container:NativeWavContainer::Automatic,assume_decrypted:false,downmix:DvdaDownmixPolicy::None,
@@ -1536,5 +2054,68 @@ mod tests {
             overwrite_policy:NativeOverwritePolicy::Fail,extraction_log:false,file_per_program:false,cue:false,
             transfer_tags:false,tag_source:default_tag_source(),tag_fields:default_tag_fields(),tag_artwork:false };
         assert!(validate_job(&job).unwrap_err().contains("duplicate"));
+    }
+}
+
+#[cfg(test)]
+mod native_file_task_controls_tests {
+    use super::*;
+
+    #[test]
+    fn skip_current_only_cancels_an_active_item() {
+        let controls = NativeExtractionControl::default();
+        let job = CancellationToken::new();
+        controls.skip_current(); // No active item: must not skip the next.
+        let first = controls.begin_item(&job);
+        assert!(!first.is_cancelled());
+        controls.skip_current();
+        assert!(first.is_cancelled());
+        assert!(!job.is_cancelled());
+        assert!(controls.finish_item());
+        let next = controls.begin_item(&job);
+        assert!(!next.is_cancelled());
+        assert!(!controls.finish_item());
+    }
+
+    #[tokio::test]
+    async fn pause_blocks_a_stage_until_resume_without_cancelling_job() {
+        let controls = Arc::new(NativeExtractionControl::default());
+        let job = CancellationToken::new();
+        let item = controls.begin_item(&job);
+        controls.pause();
+        let task_controls = Arc::clone(&controls);
+        let task_job = job.clone();
+        let task_item = item.clone();
+        let wait = tokio::spawn(async move {
+            task_controls.wait_ready(&task_job, &task_item).await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!wait.is_finished(), "paused stage must not advance");
+        controls.resume();
+        assert!(tokio::time::timeout(Duration::from_secs(2), wait)
+            .await.expect("stage should resume").expect("task join").is_ok());
+        assert!(!job.is_cancelled());
+        controls.finish_item();
+    }
+
+    #[test]
+    fn skipped_sacd_frame_poll_does_not_cancel_the_extraction_job() {
+        let controls = Arc::new(NativeExtractionControl::default());
+        let job = CancellationToken::new();
+        let item = controls.begin_item(&job);
+        controls.pause();
+        let worker_controls = Arc::clone(&controls);
+        let worker_job = job.clone();
+        let worker_item = item.clone();
+        let worker = std::thread::spawn(move || {
+            worker_controls.wait_blocking(&worker_job, &worker_item)
+        });
+        std::thread::sleep(Duration::from_millis(90));
+        assert!(!worker.is_finished(), "native frame callback must pause");
+        controls.skip_current();
+        assert!(worker.join().expect("frame callback"));
+        assert!(!job.is_cancelled());
+        assert!(controls.finish_item());
+        controls.resume();
     }
 }

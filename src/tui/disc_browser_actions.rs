@@ -326,6 +326,38 @@ pub fn native_working_root(
         crate::convert::pipeline::native_extract::default_native_working_root)
 }
 
+/// Transfer ownership of the extraction dialog to the existing directory
+/// picker. Cancel and invalid selections restore the exact original state.
+fn open_native_destination_picker(app: &mut AppState) {
+    use crate::tui::app::{FilePickerPurpose, MetadataFilePickerState};
+    let overlay = std::mem::replace(&mut app.active_overlay, ActiveOverlay::None);
+    let ActiveOverlay::DiscBrowser(mut state) = overlay else {
+        app.active_overlay = overlay;
+        return;
+    };
+    state.focus = crate::tui::disc_browser::ExtractFocus::Output;
+    state.output_cursor = state.output_rows().iter().position(|row| *row == "Destination").unwrap_or(0);
+    let start_dir = state.destination.ancestors().find(|path| path.is_dir())
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let purpose = FilePickerPurpose::NativeExtractDestination { probe_id: state.probe_id };
+    let picker = tui_file_picker::FilePickerState::new(
+        super::keybindings::file_picker_config_with_browse_sort(app, tui_file_picker::FilePickerConfig {
+            start_dir,
+            filter: tui_file_picker::FilePickerFilter::All,
+            title: "Select extraction destination".to_owned(),
+            theme: super::keybindings::file_picker_theme_from_theme(&app.theme),
+            selection_mode: tui_file_picker::FilePickerSelectionMode::Directories,
+            operation_policy: tui_file_picker::FileOperationPolicy::selection_only(
+                app.file_task_verbose_degrade_notices),
+            ..tui_file_picker::FilePickerConfig::default()
+        }),
+    );
+    app.pending_disc_extract_picker = Some(state);
+    app.active_overlay = ActiveOverlay::FilePicker(MetadataFilePickerState::new(purpose, picker));
+}
+
 fn start_native_extraction(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
     let ActiveOverlay::DiscBrowser(state) = &app.active_overlay else { return; };
     let root = native_working_root(state, app.config.conversion.scratch_directory.as_deref());
@@ -335,16 +367,12 @@ fn start_native_extraction(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
         return;
     }
     let job = state.native_job(root);
-    if let Err(error) = app.manager.add_native_extraction_job(job) {
-        app.set_status(format!("Cannot queue native extraction: {error}"));
+    let probe_cancel = state.probe_cancel.clone();
+    if let Err(error) = super::native_extract_task::launch(app, job, tx) {
+        app.set_status(format!("Cannot start native extraction: {error}"));
         return;
     }
-    app.active_overlay = ActiveOverlay::None;
-    app.current_screen = AppScreen::Queue;
-    app.save_queue();
-    if !app.processing_active {
-        super::convert_actions::start_processing(app, tx);
-    }
+    probe_cancel.cancel();
 }
 
 /// Handle a click according to the visible extraction controls. Double-clicking
@@ -423,8 +451,12 @@ pub fn handle_disc_browser_button_click_with_shift(
             let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay else { return false; };
             state.focus = crate::tui::disc_browser::ExtractFocus::Output;
             state.output_cursor = *index;
-            state.panel = Some(state.current_output_panel());
-            state.panel_cursor = 0;
+            if state.current_output_panel() == crate::tui::disc_browser::ExtractPanel::Destination {
+                open_native_destination_picker(app);
+            } else if let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay {
+                state.panel = Some(state.current_output_panel());
+                state.panel_cursor = 0;
+            }
             true
         }
         TuiButton::DiscBrowserExtract => {
@@ -542,6 +574,21 @@ pub fn handle_disc_browser_key(
             return;
         }
     }
+    if key.code == KeyCode::Enter && matches!(&app.active_overlay,
+        ActiveOverlay::DiscBrowser(state) if state.panel.is_none()
+            && state.focus == ExtractFocus::Output
+            && state.current_output_panel() == ExtractPanel::Destination)
+    {
+        open_native_destination_picker(app);
+        return;
+    }
+    if key.code == KeyCode::Char('p') && matches!(&app.active_overlay,
+        ActiveOverlay::DiscBrowser(state) if state.panel == Some(ExtractPanel::Destination)
+            && !state.editing_destination)
+    {
+        open_native_destination_picker(app);
+        return;
+    }
     let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay else { return; };
 
     if state.editing_destination {
@@ -600,11 +647,6 @@ pub fn handle_disc_browser_key(
                     if *selected { state.keep_dst[i] = false; }
                 }
             },
-            (ExtractPanel::Destination, KeyCode::Char('e')) => {
-                state.destination_input = state.destination.display().to_string();
-                state.editing_destination = true;
-                state.editing_template = false;
-            }
             (ExtractPanel::Destination, KeyCode::Char('t')) => {
                 state.destination_input = state.naming_template.clone();
                 state.editing_destination = true;
@@ -1230,6 +1272,49 @@ mod tests {
             ),
         );
         app
+    }
+
+    #[test]
+    fn destination_picker_round_trip_preserves_extract_options() {
+        use crossterm::event::KeyModifiers;
+        let tmp = tempfile::tempdir().unwrap();
+        let disc = tmp.path().join("disc.iso");
+        std::fs::write(&disc, b"test disc").unwrap();
+        let contents = selectable_disc_contents(disc.clone(), FolderDiscMarkerKind::Sacd);
+        let mut state = DiscBrowserState::new(contents, disc);
+        let original_template = "{track} - {title}".to_owned();
+        state.naming_template = original_template.clone();
+        state.focus = crate::tui::disc_browser::ExtractFocus::Output;
+        state.output_cursor = state.output_rows().iter()
+            .position(|name| *name == "Destination").expect("destination row");
+        let original_dest = state.destination.clone();
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::DiscBrowser(Box::new(state));
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        handle_disc_browser_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        assert!(app.pending_disc_extract_picker.is_some());
+        let (id, purpose) = match &app.active_overlay {
+            ActiveOverlay::FilePicker(picker) => {
+                assert_eq!(picker.picker.selection_mode(),
+                    tui_file_picker::FilePickerSelectionMode::Directories);
+                (picker.session_id, picker.purpose.clone())
+            },
+            other => panic!("expected directory picker, got {other:?}"),
+        };
+        assert!(matches!(purpose, crate::tui::app::FilePickerPurpose::NativeExtractDestination { .. }));
+        let chosen = tmp.path().to_path_buf();
+        crate::tui::event_loop::handle_message(&mut app, AppMessage::FilePickerComplete {
+            session_id: id, purpose, path: Some(chosen.clone()), paths: vec![chosen.clone()],
+            ignored_directories: 0,
+        }, &tx);
+        let ActiveOverlay::DiscBrowser(restored) = &app.active_overlay else {
+            panic!("destination chooser did not restore extraction dialog");
+        };
+        assert_eq!(restored.destination, chosen);
+        assert_eq!(restored.naming_template, original_template);
+        assert_eq!(restored.focus, crate::tui::disc_browser::ExtractFocus::Output);
+        assert_ne!(restored.destination, original_dest);
+        assert!(app.pending_disc_extract_picker.is_none());
     }
 
     #[test]
