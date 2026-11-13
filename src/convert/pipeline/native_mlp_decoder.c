@@ -49,6 +49,7 @@ typedef struct tonepoet_decode_ctx {
     int saw_frame;
     uint64_t samples_per_channel;
     uint64_t data_bytes;
+    int native_rf64;
     char *error;
     size_t error_cap;
 } tonepoet_decode_ctx;
@@ -163,6 +164,37 @@ static int tonepoet_write_le32(FILE *f, uint32_t value) {
     return fwrite(bytes, 1, sizeof(bytes), f) == sizeof(bytes) ? 0 : -1;
 }
 
+static int tonepoet_write_le64(FILE *f, uint64_t value) {
+    unsigned char bytes[8];
+    for (unsigned i=0; i<8; ++i) bytes[i] = (unsigned char)(value >> (8u * i));
+    return fwrite(bytes, 1, 8, f) == 8 ? 0 : -1;
+}
+
+/* Native extraction only: fixed 80-byte RF64 header for stereo s32le.
+ * Leave Convert's original 44-byte RIFF route untouched. */
+static int tonepoet_write_native_rf64_header(FILE *f, uint32_t rate, uint64_t bytes) {
+    if (bytes > UINT64_MAX - 72u || bytes % 8u != 0u || rate > UINT32_MAX / 8u) return -1;
+    if (fseek(f, 0, SEEK_SET) != 0) return -1;
+    if (fwrite("RF64", 1, 4, f) != 4) return -1;
+    if (tonepoet_write_le32(f, UINT32_MAX) != 0) return -1;
+    if (fwrite("WAVEds64", 1, 8, f) != 8) return -1;
+    if (tonepoet_write_le32(f, 28u) != 0) return -1;
+    if (tonepoet_write_le64(f, bytes + 72u) != 0) return -1;
+    if (tonepoet_write_le64(f, bytes) != 0) return -1;
+    if (tonepoet_write_le64(f, bytes / 8u) != 0) return -1;
+    if (tonepoet_write_le32(f, 0u) != 0) return -1;
+    if (fwrite("fmt ", 1, 4, f) != 4) return -1;
+    if (tonepoet_write_le32(f, 16u) != 0) return -1;
+    if (tonepoet_write_le16(f, 1u) != 0) return -1;
+    if (tonepoet_write_le16(f, 2u) != 0) return -1;
+    if (tonepoet_write_le32(f, rate) != 0) return -1;
+    if (tonepoet_write_le32(f, rate * 8u) != 0) return -1;
+    if (tonepoet_write_le16(f, 8u) != 0) return -1;
+    if (tonepoet_write_le16(f, 32u) != 0) return -1;
+    if (fwrite("data", 1, 4, f) != 4) return -1;
+    return tonepoet_write_le32(f, UINT32_MAX);
+}
+
 static int tonepoet_write_wav_header(FILE *f, uint32_t sample_rate, uint32_t data_bytes) {
     if (fseek(f, 0, SEEK_SET) != 0) {
         return -1;
@@ -183,8 +215,10 @@ static int tonepoet_write_wav_header(FILE *f, uint32_t sample_rate, uint32_t dat
     return 0;
 }
 
-static int tonepoet_start_wav(FILE *f, char *err, size_t err_cap) {
-    if (tonepoet_write_wav_header(f, 48000u, 0u) != 0) {
+static int tonepoet_start_wav(FILE *f, char *err, size_t err_cap, int native_rf64) {
+    const int rc = native_rf64 ? tonepoet_write_native_rf64_header(f, 48000u, 0u)
+        : tonepoet_write_wav_header(f, 48000u, 0u);
+    if (rc != 0) {
         tonepoet_set_text(err, err_cap, "failed to write placeholder WAV header");
         return -1;
     }
@@ -192,11 +226,14 @@ static int tonepoet_start_wav(FILE *f, char *err, size_t err_cap) {
 }
 
 static int tonepoet_finish_wav(tonepoet_decode_ctx *ctx) {
-    if (ctx->data_bytes > 0xffffffffu) {
+    if (!ctx->native_rf64 && ctx->data_bytes > 0xffffffffu) {
         tonepoet_set_text(ctx->error, ctx->error_cap, "decoded WAV exceeds RIFF 32-bit data limit");
         return -1;
     }
-    if (tonepoet_write_wav_header(ctx->out_file, (uint32_t)ctx->output_sample_rate, (uint32_t)ctx->data_bytes) != 0) {
+    const int rc = ctx->native_rf64
+        ? tonepoet_write_native_rf64_header(ctx->out_file, (uint32_t)ctx->output_sample_rate, ctx->data_bytes)
+        : tonepoet_write_wav_header(ctx->out_file, (uint32_t)ctx->output_sample_rate, (uint32_t)ctx->data_bytes);
+    if (rc != 0) {
         tonepoet_set_text(ctx->error, ctx->error_cap, "failed to rewrite final WAV header");
         return -1;
     }
@@ -307,6 +344,12 @@ static int tonepoet_write_frame(tonepoet_decode_ctx *ctx, const AVFrame *frame) 
         return -1;
     }
     ctx->samples_per_channel += (uint64_t)ret;
+    if ((uint64_t)bytes > UINT64_MAX - ctx->data_bytes) {
+        tonepoet_set_text(ctx->error, ctx->error_cap, "decoded PCM byte-count overflow");
+        av_freep(&out_data[0]);
+        av_freep(&out_data);
+        return -1;
+    }
     ctx->data_bytes += (uint64_t)bytes;
 
     av_freep(&out_data[0]);
@@ -392,10 +435,11 @@ int tonepoet_native_mlp_decoder_info(struct tonepoet_native_mlp_decoder_info *ou
     return 0;
 }
 
-int tonepoet_native_mlp_decode_stereo_s32le_wav(
+static int tonepoet_native_mlp_decode_stereo_s32le_impl(
     const char *input_path,
     const char *output_path,
-    struct tonepoet_native_mlp_decode_result *out) {
+    struct tonepoet_native_mlp_decode_result *out,
+    int native_rf64) {
     if (out == NULL) {
         return -1;
     }
@@ -431,10 +475,11 @@ int tonepoet_native_mlp_decode_stereo_s32le_wav(
     tonepoet_decode_ctx decode_ctx;
     memset(&decode_ctx, 0, sizeof(decode_ctx));
     decode_ctx.out_file = output;
+    decode_ctx.native_rf64 = native_rf64;
     decode_ctx.error = out->error;
     decode_ctx.error_cap = sizeof(out->error);
 
-    if (tonepoet_start_wav(output, out->error, sizeof(out->error)) != 0) {
+    if (tonepoet_start_wav(output, out->error, sizeof(out->error), native_rf64) != 0) {
         goto done;
     }
 
@@ -568,4 +613,16 @@ done:
         remove(output_path);
     }
     return rc;
+}
+
+int tonepoet_native_mlp_decode_stereo_s32le_wav(
+    const char *input_path, const char *output_path,
+    struct tonepoet_native_mlp_decode_result *out) {
+    return tonepoet_native_mlp_decode_stereo_s32le_impl(input_path, output_path, out, 0);
+}
+
+int tonepoet_native_mlp_decode_stereo_s32le_rf64(
+    const char *input_path, const char *output_path,
+    struct tonepoet_native_mlp_decode_result *out) {
+    return tonepoet_native_mlp_decode_stereo_s32le_impl(input_path, output_path, out, 1);
 }

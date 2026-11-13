@@ -877,7 +877,8 @@ artist = "Neil Young"
             label: "Fixture".to_string(),
             source_path: iso.clone(),
             presentations: vec![DiscPresentation {
-                id: PresentationId::dvd_video(1, 1, 0),
+                extract: crate::disc::model::PresentationExtractInfo::default(),
+            id: PresentationId::dvd_video(1, 1, 0),
                 label: "VTS 01 Title 01 Stream 1".to_string(),
                 format: AudioPresentationFormat {
                     codec: Some("LPCM".to_string()),
@@ -979,7 +980,8 @@ title = "Authored Chapter Two"
             label: "Fixture".to_string(),
             source_path: iso.clone(),
             presentations: vec![DiscPresentation {
-                id: PresentationId::dvd_video(1, 1, 0),
+                extract: crate::disc::model::PresentationExtractInfo::default(),
+            id: PresentationId::dvd_video(1, 1, 0),
                 label: "VTS 01 Title 01 Stream 1".to_string(),
                 format: AudioPresentationFormat {
                     codec: Some("LPCM".to_string()),
@@ -1054,7 +1056,8 @@ title = "Authored Chapter Two"
             label: "Fixture".to_string(),
             source_path: iso,
             presentations: vec![DiscPresentation {
-                id: PresentationId::dvd_video(1, 1, 0),
+                extract: crate::disc::model::PresentationExtractInfo::default(),
+            id: PresentationId::dvd_video(1, 1, 0),
                 label: "VTS 01 Title 01 Stream 1".to_string(),
                 format: AudioPresentationFormat {
                     codec: Some("LPCM".to_string()),

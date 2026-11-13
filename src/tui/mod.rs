@@ -18,6 +18,7 @@ pub mod terminal_image_geometry;
 pub mod button_map;
 pub mod disc_browser;
 pub mod disc_browser_actions;
+pub mod disc_extract_render;
 pub mod display_width;
 pub mod command;
 pub mod context_menu;

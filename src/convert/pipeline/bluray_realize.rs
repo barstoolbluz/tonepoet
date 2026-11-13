@@ -138,7 +138,30 @@ pub async fn realize_bluray_track(
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
+    progress_tracker: Option<&mut OperationProgressTracker<'_>>,
+) -> Result<PathBuf, ConvertError> {
+    realize_bluray_track_impl(src,staging,runner,cancel,tool_concurrency_limits,progress_tracker,false).await
+}
+
+pub(super) async fn realize_bluray_track_native(
+    src: &TrackSourceRef,
+    staging: &StagingDir,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
+    progress_tracker: Option<&mut OperationProgressTracker<'_>>,
+) -> Result<PathBuf, ConvertError> {
+    realize_bluray_track_impl(src,staging,runner,cancel,tool_concurrency_limits,progress_tracker,true).await
+}
+
+async fn realize_bluray_track_impl(
+    src: &TrackSourceRef,
+    staging: &StagingDir,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
     _progress_tracker: Option<&mut OperationProgressTracker<'_>>,
+    native_large: bool,
 ) -> Result<PathBuf, ConvertError> {
     let TrackSourceRef::BluRayTrack {
         source,
@@ -184,6 +207,7 @@ pub async fn realize_bluray_track(
             runner,
             cancel,
             tool_concurrency_limits,
+            native_large,
         )
         .await;
     }
@@ -236,6 +260,7 @@ pub async fn realize_bluray_track(
         *channels,
         channel_layout.as_deref(),
         cancel,
+        native_large,
     )?;
 
     validate_nonempty_wav(&wav_path)?;
@@ -259,6 +284,7 @@ async fn realize_compressed_bluray_via_ffmpeg(
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
+    native_large: bool,
 ) -> Result<PathBuf, ConvertError> {
     // Prepared Blu-ray tracks use 1-based angle numbers.  ffmpeg expects a
     // 0-based `-angle` value, so reject impossible metadata before translating
@@ -343,8 +369,9 @@ async fn realize_compressed_bluray_via_ffmpeg(
         "wav".to_string(),
         "-c:a".to_string(),
         "pcm_s32le".to_string(),
-        tmp_path.to_string_lossy().into_owned(),
     ]);
+    if native_large { args.extend(["-rf64".into(),"auto".into()]); }
+    args.push(tmp_path.to_string_lossy().into_owned());
 
     let cmd = ToolCommand {
         environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
@@ -385,6 +412,7 @@ fn realize_lpcm_from_libbluray_title(
     expected_channels: Option<u8>,
     expected_channel_layout: Option<&str>,
     cancel: &CancellationToken,
+    native_large: bool,
 ) -> Result<(), ConvertError> {
     let backend_source = bluray_source_path_for_backend(source).map_err(|err| {
         ConvertError::TrackValidation(format!(
@@ -542,7 +570,7 @@ fn realize_lpcm_from_libbluray_title(
             if let Some(pes) = packet_demuxer.push_ts_packet(packet)? {
                 if !wav_header_written {
                     let wav_format = extractor.peek_or_create_wav_format(&pes.payload)?;
-                    write_wav_header(&mut output, wav_format, 0)?;
+                    write_bluray_carrier_header(&mut output, wav_format, 0, native_large)?;
                     wav_header_written = true;
                 }
                 if extractor.process_pes_packet(pes, &mut output)?
@@ -557,6 +585,7 @@ fn realize_lpcm_from_libbluray_title(
                         wav_path,
                         extractor,
                         wav_header_written,
+                        native_large,
                     )?;
                     return Ok(());
                 }
@@ -603,7 +632,7 @@ fn realize_lpcm_from_libbluray_title(
     if let Some(pes) = packet_demuxer.finish()? {
         if !wav_header_written {
             let format = extractor.peek_or_create_wav_format(&pes.payload)?;
-            write_wav_header(&mut output, format, 0)?;
+            write_bluray_carrier_header(&mut output, format, 0, native_large)?;
             wav_header_written = true;
         }
         let _ = extractor.process_pes_packet(pes, &mut output)?;
@@ -616,7 +645,23 @@ fn realize_lpcm_from_libbluray_title(
         wav_path,
         extractor,
         wav_header_written,
+        native_large,
     )
+}
+
+fn write_bluray_carrier_header(
+    output: &mut File, format: super::bluray_wav_validate::LpcmWavFormat,
+    data_len: u64, native_large: bool,
+) -> Result<(), ConvertError> {
+    if !native_large { return write_wav_header(output, format, data_len); }
+    super::native_wav::write_native_rf64_carrier_header(output,
+        super::native_wav::NativeCarrierFormat {
+            rate:format.sample_rate,channels:format.channels,
+            container_bits:format.container_bits_per_sample,
+            valid_bits:format.valid_bits_per_sample,
+            channel_mask:format.channel_mask,extensible:format.format_extensible,
+        }, data_len)
+        .map_err(|e| ConvertError::Realize(format!("Native Blu-ray RF64 carrier: {e}")))
 }
 
 fn finalize_bluray_lpcm_output(
@@ -626,6 +671,7 @@ fn finalize_bluray_lpcm_output(
     wav_path: &Path,
     extractor: BlurayLpcmExtractor,
     wav_header_written: bool,
+    native_large: bool,
 ) -> Result<(), ConvertError> {
     if !wav_header_written {
         let _ = fs::remove_file(tmp_path);
@@ -656,7 +702,15 @@ fn finalize_bluray_lpcm_output(
         ConvertError::Realize("Blu-ray LPCM WAV format was not initialized".to_string())
     })?;
     extractor.validate_reasonable_output_size()?;
-    rewrite_wav_header(output, format, extractor.data_bytes_written())?;
+    if native_large {
+        if extractor.data_bytes_written() & 1 != 0 { output.write_all(&[0]).map_err(|e|
+            ConvertError::Realize(format!("Blu-ray LPCM RF64 padding: {e}")))?; }
+        output.seek(SeekFrom::Start(0)).map_err(|e|
+            ConvertError::Realize(format!("Blu-ray LPCM RF64 seek: {e}")))?;
+        write_bluray_carrier_header(output, format, extractor.data_bytes_written(), true)?;
+    } else {
+        rewrite_wav_header(output, format, extractor.data_bytes_written())?;
+    }
     output.flush().map_err(|err| {
         ConvertError::Realize(format!(
             "failed to flush Blu-ray LPCM WAV '{}': {err}",

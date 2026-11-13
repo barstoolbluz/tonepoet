@@ -103,7 +103,7 @@ fn selected_entry_effective_disc_path(app: &mut AppState) -> Option<PathBuf> {
 /// Open the Audio Streams overlay for a specific disc path, or start probing it.
 pub fn open_disc_browser_for_path(app: &mut AppState, path: PathBuf, tx: &mpsc::Sender<AppMessage>) {
     if let Some(contents) = cached_disc_contents(app, &path) {
-        open_disc_browser_from_contents(app, contents.as_ref().clone(), path);
+        open_disc_browser_from_contents(app, contents.as_ref().clone(), path, tx);
         return;
     }
 
@@ -121,16 +121,53 @@ pub fn open_disc_browser_for_path(app: &mut AppState, path: PathBuf, tx: &mpsc::
 }
 
 /// Open the modal overlay from already available `DiscContents`.
-pub fn open_disc_browser_from_contents(app: &mut AppState, contents: DiscContents, source_path: PathBuf) {
+pub fn open_disc_browser_from_contents(app: &mut AppState, contents: DiscContents, source_path: PathBuf, tx: &mpsc::Sender<AppMessage>) {
     if contents.presentations.is_empty() {
         app.set_status("Disc contains no selectable audio streams");
         return;
     }
 
-    app.active_overlay = ActiveOverlay::DiscBrowser(Box::new(DiscBrowserState::new(
-        contents,
-        source_path,
-    )));
+    let state = DiscBrowserState::new(contents, source_path.clone());
+    if state.probe_statuses.iter().any(Option::is_none) {
+        let id = state.probe_id;
+        let cancel = state.probe_cancel.clone();
+        // Probe every eligible stream, whether or not it was initially
+        // checked. Keep the exact presentation index with its job: a program
+        // with no materializable chapter must not shift the results onto an
+        // unrelated stream later in the list.
+        let mut probe_view = state.clone();
+        probe_view.selected = state.probe_statuses.iter().map(Option::is_none).collect();
+        let mut job = probe_view.native_job(std::env::temp_dir());
+        let mut pending = std::mem::take(&mut job.programs).into_iter();
+        let mut probes = Vec::new();
+        for (index, status) in state.probe_statuses.iter().enumerate() {
+            if status.is_none() {
+                let program = if state.items_checked[index].iter().any(|checked| *checked) {
+                    pending.next()
+                } else { None };
+                probes.push((index, program));
+            }
+        }
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            for (program_index, program) in probes {
+                if cancel.is_cancelled() { break; }
+                let result = if let Some(program) = program {
+                    let mut view = job.clone();
+                    view.programs = vec![program];
+                    crate::convert::pipeline::native_extract::probe_selected_sources(
+                        view, cancel.clone()).await
+                } else {
+                    Err("No selected chapter available to probe".to_string())
+                };
+                if cancel.is_cancelled() { break; }
+                if tx.send(AppMessage::DiscExtractProbeComplete {
+                    path: source_path.clone(), probe_id: id, program_index, result,
+                }).await.is_err() { break; }
+            }
+        });
+    }
+    app.active_overlay = ActiveOverlay::DiscBrowser(Box::new(state));
 }
 
 /// Context-menu entry point for `Convert (default stream)`.
@@ -166,6 +203,7 @@ pub fn handle_disc_probe_followup(
     app: &mut AppState,
     path: &Path,
     followup: DiscProbeFollowup,
+    tx: &mpsc::Sender<AppMessage>,
 ) {
     match followup {
         DiscProbeFollowup::OpenDiscBrowser => {
@@ -173,7 +211,7 @@ pub fn handle_disc_probe_followup(
                 app.set_status("Audio streams are not available after analysis");
                 return;
             };
-            open_disc_browser_from_contents(app, contents.as_ref().clone(), path.to_path_buf());
+            open_disc_browser_from_contents(app, contents.as_ref().clone(), path.to_path_buf(), tx);
         }
         DiscProbeFollowup::ConvertDefaultStream => {
             let Some(contents) = cached_disc_contents(app, path) else {
@@ -278,71 +316,151 @@ pub fn handle_disc_browser_button(
     handle_disc_browser_button_click(app, button, 1, tx)
 }
 
-/// Mouse/button dispatcher with click-count information.
-///
-/// The Audio Streams overlay uses the same registered row target for a single
-/// click and a double click: one click selects the stream row, while a double
-/// click selects it and immediately loads it in Convert. This keeps registration
-/// aligned with the visible clipped rows produced by `draw_disc_browser()`.
+/// Prefer configured working storage. The native worker chooses a private
+/// sibling on the destination volume if the configured volume differs; the
+/// destination never receives an incomplete output.
+pub fn native_working_root(
+    state: &DiscBrowserState,
+    configured: Option<&Path>,
+) -> PathBuf {
+    if let Some(path) = configured {
+        return path.to_path_buf();
+    }
+    let mut parent = state.destination.parent().unwrap_or(Path::new("."));
+    while !parent.exists() {
+        let Some(next) = parent.parent() else { break; };
+        parent = next;
+    }
+    parent.join(".tonepoet-native-extraction-work")
+}
+
+fn start_native_extraction(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
+    let ActiveOverlay::DiscBrowser(state) = &app.active_overlay else { return; };
+    let root = native_working_root(state, app.config.conversion.scratch_directory.as_deref());
+    let blockers = state.blockers_with_capacity_refresh(&root, true);
+    if !blockers.is_empty() {
+        app.set_status(format!("Cannot extract: {}", blockers.join("; ")));
+        return;
+    }
+    let job = state.native_job(root);
+    if let Err(error) = app.manager.add_native_extraction_job(job) {
+        app.set_status(format!("Cannot queue native extraction: {error}"));
+        return;
+    }
+    app.active_overlay = ActiveOverlay::None;
+    app.current_screen = AppScreen::Queue;
+    app.save_queue();
+    if !app.processing_active {
+        super::convert_actions::start_processing(app, tx);
+    }
+}
+
+/// Handle a click according to the visible extraction controls. Double-clicking
+/// a program checks it; it does not unexpectedly switch into Convert.
 pub fn handle_disc_browser_button_click(
     app: &mut AppState,
     button: &TuiButton,
     click_count: u8,
     tx: &mpsc::Sender<AppMessage>,
 ) -> bool {
+    handle_disc_browser_button_click_with_shift(app, button, click_count, false, tx)
+}
+
+/// Shift-modified mouse selection shares the keyboard range-check operations.
+pub fn handle_disc_browser_button_click_with_shift(
+    app: &mut AppState,
+    button: &TuiButton,
+    click_count: u8,
+    shift: bool,
+    tx: &mpsc::Sender<AppMessage>,
+) -> bool {
+    // A popup owns the overlay. Its background hitboxes must not remain
+    // clickable through the transparent regions of the popup.
+    if matches!(&app.active_overlay, ActiveOverlay::DiscBrowser(state) if state.panel.is_some()) {
+        return true;
+    }
     match button {
         TuiButton::BrowseInfoAnalyze => {
             if let Some(path) = selected_entry_effective_disc_path(app) {
                 force_disc_reprobe(app, path, tx);
                 true
-            } else {
-                false
-            }
+            } else { false }
         }
         TuiButton::BrowseInfoAudioStreams => {
             open_selected_disc_browser(app, tx);
             true
         }
-        TuiButton::DiscBrowserStream(index) => {
-            if let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay {
-                state.set_cursor(*index);
-            } else {
-                return false;
+        TuiButton::DiscBrowserStream(index) | TuiButton::DiscBrowserExpand(index) => {
+            let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay else { return false; };
+            let previous = state.cursor;
+            state.set_cursor(*index);
+            if shift {
+                for target in previous.min(*index)..=previous.max(*index) {
+                    if state.is_extractable(target) { state.selected[target] = true; }
+                }
             }
-
-            if click_count >= 2 {
-                convert_overlay_cursor(app);
+            state.item_cursor = 0;
+            state.item_scroll = 0;
+            state.focus = crate::tui::disc_browser::ExtractFocus::Programs;
+            if matches!(button, TuiButton::DiscBrowserExpand(_)) || click_count >= 2 {
+                state.toggle_selected(*index);
             }
             true
         }
-        TuiButton::DiscBrowserExpand(index) => {
-            if let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay {
-                state.set_cursor(*index);
-                state.toggle_expanded(*index);
-                true
-            } else {
-                false
+        TuiButton::DiscBrowserAnglePrev(index) | TuiButton::DiscBrowserAngleNext(index) => {
+            let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay else { return false; };
+            state.set_cursor(*index);
+            state.focus = crate::tui::disc_browser::ExtractFocus::Programs;
+            let step = if matches!(button, TuiButton::DiscBrowserAnglePrev(_)) { -1 } else { 1 };
+            state.cycle_angle_for(*index, step);
+            true
+        }
+        TuiButton::DiscBrowserTrack(index) | TuiButton::DiscBrowserTrackCheck(index) => {
+            let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay else { return false; };
+            state.focus = crate::tui::disc_browser::ExtractFocus::Items;
+            let prior = state.item_cursor;
+            state.item_cursor = *index;
+            if shift {
+                state.check_item_range(prior, *index);
+            } else if matches!(button, TuiButton::DiscBrowserTrackCheck(_)) {
+                state.toggle_item(*index);
             }
+            true
+        }
+        TuiButton::DiscBrowserOutput(index) => {
+            let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay else { return false; };
+            state.focus = crate::tui::disc_browser::ExtractFocus::Output;
+            state.output_cursor = *index;
+            state.panel = Some(state.current_output_panel());
+            state.panel_cursor = 0;
+            true
+        }
+        TuiButton::DiscBrowserExtract => {
+            start_native_extraction(app, tx);
+            true
         }
         TuiButton::DiscBrowserConvert => {
-            convert_overlay_cursor(app);
+            activate_overlay_convert(app);
+            true
+        }
+        TuiButton::DiscBrowserMore => {
+            if let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay {
+                state.panel = Some(crate::tui::disc_browser::ExtractPanel::More);
+            }
             true
         }
         TuiButton::DiscBrowserClose => {
-            if matches!(app.active_overlay, ActiveOverlay::DiscBrowser(_)) {
+            if let ActiveOverlay::DiscBrowser(state) = &app.active_overlay {
+                state.probe_cancel.cancel();
                 app.active_overlay = ActiveOverlay::None;
                 true
-            } else {
-                false
-            }
+            } else { false }
         }
         _ => false,
     }
 }
 
-/// Convenience entry point for mouse handlers that classify a repeated row click
-/// as a double-click. This deliberately forwards through the click-count path so
-/// the same safeguards and overlay-state checks are used in both mouse paths.
+/// Convenience entry point for mouse handlers that classify repeated clicks.
 pub fn handle_disc_browser_double_click(
     app: &mut AppState,
     button: &TuiButton,
@@ -351,79 +469,256 @@ pub fn handle_disc_browser_double_click(
     handle_disc_browser_button_click(app, button, 2, tx)
 }
 
-/// Key dispatcher for `ActiveOverlay::DiscBrowser`.
-pub fn handle_disc_browser_key(app: &mut AppState, key: KeyEvent) {
-    let mut overlay = ActiveOverlay::None;
-    std::mem::swap(&mut overlay, &mut app.active_overlay);
+fn cycle_native_option(state: &mut DiscBrowserState, step: i32) {
+    use crate::convert::pipeline::native_extract::NativeWavContainer;
+    use crate::convert::pipeline::DvdaDownmixPolicy;
+    match state.output_rows().get(state.output_cursor).copied() {
+        _ if state.focus == crate::tui::disc_browser::ExtractFocus::Programs => {
+            state.cycle_angle_for(state.cursor, step);
+        }
+        Some("Format") if state.contents.format == crate::disc::DiscFormat::Sacd => {
+            let selected = state.cursor;
+            let has_dst = state.contents.presentations.get(selected).is_some_and(|p|
+                p.tracks.iter().any(|t| t.format_note.as_deref().unwrap_or("").contains("DST")));
+            if has_dst { state.keep_dst[selected] = !state.keep_dst[selected]; }
+        }
+        Some("Format") => {
+            let all = [NativeWavContainer::Automatic, NativeWavContainer::Riff,
+                NativeWavContainer::Rf64, NativeWavContainer::W64];
+            let index = all.iter().position(|value| *value == state.wav_container).unwrap_or(0);
+            state.wav_container = all[(index as i32 + step).rem_euclid(all.len() as i32) as usize];
+        }
+        Some("Downmix") => {
+            let all = [DvdaDownmixPolicy::None, DvdaDownmixPolicy::FooInputDvdaCompatible,
+                DvdaDownmixPolicy::FfmpegDefault, DvdaDownmixPolicy::Auto];
+            let index = all.iter().position(|value| *value == state.downmix).unwrap_or(0);
+            state.downmix = all[(index as i32 + step).rem_euclid(all.len() as i32) as usize];
+        }
+        Some("Assume decrypted") => { state.assume_decrypted = !state.assume_decrypted; }
+        _ => {}
+    }
+}
 
-    let ActiveOverlay::DiscBrowser(mut state) = overlay else {
-        app.active_overlay = overlay;
+/// Window-only navigation. No Convert actions run unless explicitly selected.
+pub fn handle_disc_browser_key(
+    app: &mut AppState,
+    key: KeyEvent,
+    tx: &mpsc::Sender<AppMessage>,
+) {
+    use crossterm::event::KeyModifiers;
+    use crate::tui::disc_browser::{ExtractFocus, ExtractPanel};
+    let ActiveOverlay::DiscBrowser(state) = &app.active_overlay else { return; };
+    // Text editors and popups own their keys. In particular Ctrl+X must not
+    // bypass an unfinished destination edit or a pending choice dialog.
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('x') {
+        if state.panel.is_none() && !state.editing_destination { start_native_extraction(app, tx); }
         return;
-    };
+    }
+    // Opening the existing editor mutates the overlay, so perform this route
+    // before borrowing the extraction state for in-panel key dispatch.
+    if matches!(&app.active_overlay, ActiveOverlay::DiscBrowser(state)
+        if matches!(state.panel, Some(ExtractPanel::Tags | ExtractPanel::More))
+            && !state.editing_destination)
+        && key.code == KeyCode::Char('e')
+    {
+        match open_existing_metadata_editor_for_disc_cursor(app) {
+            Ok(true) => {},
+            Ok(false) => app.set_status("No selected presentation is available to edit"),
+            Err(error) => app.set_status(format!("Cannot open tag editor: {error}")),
+        }
+        return;
+    }
+    // More routes to established app actions, not a second lookup or probe.
+    if matches!(&app.active_overlay, ActiveOverlay::DiscBrowser(state)
+        if matches!(state.panel, Some(ExtractPanel::More | ExtractPanel::Tags)))
+        && key.code == KeyCode::Char('b')
+    {
+        crate::tui::command::execute_command(app,
+            crate::tui::command::Command::TagsFromMb {query:None,catno:None,year:None},tx);
+        return;
+    }
+    if let ActiveOverlay::DiscBrowser(state) = &app.active_overlay {
+        if state.panel == Some(ExtractPanel::More)
+            && state.contents.format != crate::disc::DiscFormat::Sacd
+            && key.code == KeyCode::Char('a') {
+            let path = state.source_path.clone();
+            state.probe_cancel.cancel();
+            app.active_overlay = ActiveOverlay::None;
+            app.browse.disc_probe_followup.insert(path.clone(),
+                crate::tui::disc_browser::DiscProbeFollowup::OpenDiscBrowser);
+            force_disc_reprobe(app,path,tx);
+            return;
+        }
+    }
+    let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay else { return; };
+
+    if state.editing_destination {
+        match key.code {
+            KeyCode::Esc => { state.editing_destination = false; state.editing_template = false; }
+            KeyCode::Enter => {
+                if state.editing_template {
+                    if !state.destination_input.trim().is_empty() {
+                        state.naming_template = state.destination_input.trim().to_string();
+                    }
+                } else {
+                    let path = PathBuf::from(state.destination_input.trim());
+                    if path.is_absolute() && !path.components().any(|component| matches!(component, std::path::Component::ParentDir)) {
+                        state.destination = path;
+                    }
+                }
+                state.editing_destination = false;
+                state.editing_template = false;
+            }
+            KeyCode::Backspace => { state.destination_input.pop(); }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                state.destination_input.push(c);
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    if let Some(panel) = state.panel {
+        match (panel, key.code) {
+            (_, KeyCode::Esc) => { state.panel = None; state.panel_cursor = 0; }
+            (ExtractPanel::Files, KeyCode::Char('f')) => {
+                state.file_per_program = !state.file_per_program;
+                if !state.file_per_program { state.cue = false; }
+            }
+            (ExtractPanel::Files, KeyCode::Char('c')) => {
+                if state.file_per_program && state.contents.format != crate::disc::DiscFormat::Sacd {
+                    state.cue = !state.cue;
+                }
+            }
+            (ExtractPanel::Tags, KeyCode::Char('t')) => state.tags = !state.tags,
+            (ExtractPanel::Tags, KeyCode::Char('s')) => {
+                use crate::convert::pipeline::native_extract::NativeTagSource;
+                state.tag_source = match state.tag_source {
+                    NativeTagSource::DiscAndSidecar => NativeTagSource::AuthoredTrack,
+                    NativeTagSource::AuthoredTrack => NativeTagSource::DiscAndSidecar,
+                };
+            },
+            (ExtractPanel::Tags, KeyCode::Char('a')) => state.tag_artwork = !state.tag_artwork,
+            (ExtractPanel::Tags, KeyCode::Char(k @ '1'..='7')) => {
+                let bit = u32::from(k) - u32::from('1');
+                state.tag_fields ^= 1 << bit;
+            },
+            (ExtractPanel::Tags, KeyCode::Char('k')) => {
+                for (i,selected) in state.selected.iter().enumerate() {
+                    if *selected { state.keep_dst[i] = false; }
+                }
+            },
+            (ExtractPanel::Destination, KeyCode::Char('e')) => {
+                state.destination_input = state.destination.display().to_string();
+                state.editing_destination = true;
+                state.editing_template = false;
+            }
+            (ExtractPanel::Destination, KeyCode::Char('t')) => {
+                state.destination_input = state.naming_template.clone();
+                state.editing_destination = true;
+                state.editing_template = true;
+            }
+            (ExtractPanel::Destination, KeyCode::Char('s')) => state.program_subfolders = !state.program_subfolders,
+            (ExtractPanel::Destination, KeyCode::Char('l')) => state.extraction_log = !state.extraction_log,
+            (ExtractPanel::Destination, KeyCode::Char('o')) => {
+                use crate::convert::pipeline::native_extract::NativeOverwritePolicy;
+                state.overwrite_policy = match state.overwrite_policy {
+                    NativeOverwritePolicy::Fail => NativeOverwritePolicy::Skip,
+                    NativeOverwritePolicy::Skip => NativeOverwritePolicy::Replace,
+                    NativeOverwritePolicy::Replace => NativeOverwritePolicy::Fail,
+                };
+            },
+            (ExtractPanel::Format, KeyCode::Char('k')) if state.contents.format == crate::disc::DiscFormat::Sacd => {
+                cycle_native_option(state, 1);
+            }
+            (ExtractPanel::Format | ExtractPanel::Downmix | ExtractPanel::AssumeDecrypted, KeyCode::Char('[')) => cycle_native_option(state, -1),
+            (ExtractPanel::Format | ExtractPanel::Downmix | ExtractPanel::AssumeDecrypted, KeyCode::Char(']')) => cycle_native_option(state, 1),
+            (ExtractPanel::ConvertChoice, KeyCode::Enter) => { convert_overlay_cursor(app); }
+            (ExtractPanel::ConvertChoice, KeyCode::Char('e')) => { queue_overlay_checked_programs(app); }
+            (ExtractPanel::More, KeyCode::Char('g')) => state.cycle_dvda_group_preset(),
+            (ExtractPanel::More, KeyCode::Char('h')) => { state.show_hidden = !state.show_hidden; }
+            (ExtractPanel::More, KeyCode::Char('d')) => { state.panel = Some(ExtractPanel::Diagnostics); }
+            (ExtractPanel::More, KeyCode::Char('c')) => { state.panel = Some(ExtractPanel::ConvertChoice); }
+            (_, KeyCode::Down) => { state.panel_cursor = state.panel_cursor.saturating_add(1); }
+            (_, KeyCode::Up) => { state.panel_cursor = state.panel_cursor.saturating_sub(1); }
+            _ => {}
+        }
+        return;
+    }
 
     match key.code {
-        KeyCode::Up | KeyCode::Char('k') => {
-            state.move_cursor(-1);
-            app.active_overlay = ActiveOverlay::DiscBrowser(state);
+        KeyCode::Esc | KeyCode::Char('q') => { state.probe_cancel.cancel(); app.active_overlay = ActiveOverlay::None; }
+        KeyCode::Tab => {
+            state.focus = match (state.focus, key.modifiers.contains(KeyModifiers::SHIFT)) {
+                (ExtractFocus::Programs, false) | (ExtractFocus::Output, true) => ExtractFocus::Items,
+                (ExtractFocus::Items, false) | (ExtractFocus::Programs, true) => ExtractFocus::Output,
+                (ExtractFocus::Output, false) | (ExtractFocus::Items, true) => ExtractFocus::Programs,
+            };
         }
-        KeyCode::Down | KeyCode::Char('j') => {
-            state.move_cursor(1);
-            app.active_overlay = ActiveOverlay::DiscBrowser(state);
-        }
-        KeyCode::Right | KeyCode::Char('e') | KeyCode::Char('E') => {
-            let cursor = state.cursor;
-            state.toggle_expanded(cursor);
-            app.active_overlay = ActiveOverlay::DiscBrowser(state);
-        }
-        KeyCode::Char(' ') => {
-            let cursor = state.cursor;
-            state.toggle_selected(cursor);
-            app.active_overlay = ActiveOverlay::DiscBrowser(state);
-        }
-        KeyCode::PageUp => {
-            state.scroll_by_rows(-10);
-            app.active_overlay = ActiveOverlay::DiscBrowser(state);
-        }
-        KeyCode::PageDown => {
-            state.scroll_by_rows(10);
-            let max_scroll = crate::tui::disc_browser::disc_browser_visible_rows(&state)
-                .len()
-                .saturating_sub(1);
-            state.scroll = state.scroll.min(max_scroll);
-            app.active_overlay = ActiveOverlay::DiscBrowser(state);
-        }
-        KeyCode::Home => {
-            state.set_cursor(0);
-            state.scroll = 0;
-            app.active_overlay = ActiveOverlay::DiscBrowser(state);
-        }
-        KeyCode::End => {
-            let last = state.len().saturating_sub(1);
-            state.set_cursor(last);
-            state.scroll = crate::tui::disc_browser::disc_browser_visible_rows(&state)
-                .len()
-                .saturating_sub(1);
-            app.active_overlay = ActiveOverlay::DiscBrowser(state);
-        }
-        KeyCode::Enter => {
-            let cursor = state.cursor;
-            let contents = state.contents.clone();
-            match require_selected_presentation_stream_conversion(&contents, cursor)
-                .and_then(|()| load_disc_presentation_for_convert(app, contents, cursor))
-            {
-                Ok(()) => {}
-                Err(err) => {
-                    app.set_status(format!("Disc stream load failed: {err}"));
-                    app.active_overlay = ActiveOverlay::DiscBrowser(state);
+        // Left/right never change an output setting or move into Output.
+        // Tab is the only way to select that third focus zone.
+        KeyCode::Left if state.focus == ExtractFocus::Items => state.focus = ExtractFocus::Programs,
+        KeyCode::Right if state.focus == ExtractFocus::Programs => state.focus = ExtractFocus::Items,
+        KeyCode::Up | KeyCode::Char('k') | KeyCode::Down | KeyCode::Char('j') => {
+            let delta = if matches!(key.code, KeyCode::Up | KeyCode::Char('k')) {-1isize} else {1isize};
+            match state.focus {
+                ExtractFocus::Programs => {
+                    let from = state.cursor;
+                    state.move_cursor(delta);
+                    if key.modifiers.contains(KeyModifiers::SHIFT) {
+                        for index in from.min(state.cursor)..=from.max(state.cursor) {
+                            if state.is_extractable(index) { state.selected[index] = true; }
+                        }
+                    }
+                    state.item_cursor = 0; state.item_scroll = 0;
+                }
+                ExtractFocus::Items => {
+                    let from = state.item_cursor;
+                    let last = state.selected_presentation().map_or(0,|p|p.tracks.len().saturating_sub(1));
+                    state.item_cursor = if delta < 0 {state.item_cursor.saturating_sub(1)} else {state.item_cursor.saturating_add(1).min(last)};
+                    if key.modifiers.contains(KeyModifiers::SHIFT) {state.check_item_range(from,state.item_cursor);}
+                }
+                ExtractFocus::Output => {
+                    let last = state.output_rows().len().saturating_sub(1);
+                    state.output_cursor = if delta < 0 {state.output_cursor.saturating_sub(1)} else {state.output_cursor.saturating_add(1).min(last)};
                 }
             }
         }
-        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
-            app.active_overlay = ActiveOverlay::None;
+        KeyCode::Char(' ') => match state.focus {
+            ExtractFocus::Programs => state.toggle_selected(state.cursor),
+            ExtractFocus::Items => state.toggle_item(state.item_cursor),
+            ExtractFocus::Output => cycle_native_option(state, 1),
+        },
+        KeyCode::Char('a') | KeyCode::Char('n') | KeyCode::Char('i') => {
+            if let KeyCode::Char(mode) = key.code { state.check_focus(mode); }
         }
-        _ => {
-            app.active_overlay = ActiveOverlay::DiscBrowser(state);
+        KeyCode::Char('h') => { state.show_hidden = !state.show_hidden; }
+        KeyCode::Char('d') => { state.panel = Some(ExtractPanel::Diagnostics); }
+        KeyCode::Char('m') => { state.panel = Some(ExtractPanel::More); }
+        KeyCode::Char('c') => { activate_overlay_convert(app); }
+        KeyCode::Char('[') => cycle_native_option(state, -1),
+        KeyCode::Char(']') => cycle_native_option(state, 1),
+        KeyCode::PageDown => match state.focus {
+            ExtractFocus::Programs => state.move_cursor(10),
+            ExtractFocus::Items => {let last = state.selected_presentation().map_or(0, |p|p.tracks.len().saturating_sub(1)); state.item_cursor = state.item_cursor.saturating_add(10).min(last);},
+            ExtractFocus::Output => {state.output_cursor = state.output_cursor.saturating_add(2).min(state.output_rows().len().saturating_sub(1));},
+        },
+        KeyCode::PageUp => match state.focus {
+            ExtractFocus::Programs => state.move_cursor(-10),
+            ExtractFocus::Items => state.item_cursor = state.item_cursor.saturating_sub(10),
+            ExtractFocus::Output => state.output_cursor = state.output_cursor.saturating_sub(2),
+        },
+        KeyCode::Enter => {
+            if state.focus == ExtractFocus::Output {
+                state.panel = Some(state.current_output_panel());
+                state.panel_cursor = 0;
+            } else if state.focus == ExtractFocus::Programs {
+                state.focus = ExtractFocus::Items;
+            } else {
+                state.toggle_item(state.item_cursor);
+            }
         }
+        _ => {}
     }
 }
 
@@ -491,18 +786,161 @@ pub fn load_disc_presentation_for_convert(
     Ok(())
 }
 
-/// Convert the currently highlighted overlay stream.
-pub fn convert_overlay_cursor(app: &mut AppState) {
-    let (contents, cursor) = match &app.active_overlay {
-        ActiveOverlay::DiscBrowser(state) => (state.contents.clone(), state.cursor),
+/// Convert respects the extraction window's checked programs; the cursor is
+/// relevant only with no checked programs or as the multiple-choice override.
+/// Selecting a program never changes Convert's existing codec/processing path.
+pub fn activate_overlay_convert(app: &mut AppState) {
+    let checked = match &app.active_overlay {
+        ActiveOverlay::DiscBrowser(state) => state.selected_indices(),
         _ => return,
     };
+    if checked.len() > 1 {
+        if let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay {
+            state.panel = Some(crate::tui::disc_browser::ExtractPanel::ConvertChoice);
+        }
+    } else {
+        convert_overlay_selected(app, checked.first().copied());
+    }
+}
 
-    if let Err(err) = require_selected_presentation_stream_conversion(&contents, cursor)
-        .and_then(|()| load_disc_presentation_for_convert(app, contents, cursor))
+pub fn convert_overlay_cursor(app: &mut AppState) {
+    let index = match &app.active_overlay {
+        ActiveOverlay::DiscBrowser(state) => state.cursor,
+        _ => return,
+    };
+    // The multiple-choice popup's highlighted program uses its current
+    // selections when checked. A cursor outside the set converts all items.
+    convert_overlay_selected(app, Some(index));
+}
+
+fn convert_overlay_selected(app: &mut AppState, explicit_index: Option<usize>) {
+    let (contents, index, checked) = match &app.active_overlay {
+        ActiveOverlay::DiscBrowser(state) => {
+            let index = explicit_index.unwrap_or(state.cursor);
+            let checked = if state.selected.get(index) == Some(&true) {
+                state.items_checked.get(index).cloned()
+            } else { None };
+            (state.contents.clone(), index, checked)
+        }
+        _ => return,
+    };
+    if let Err(err) = require_selected_presentation_stream_conversion(&contents, index)
+        .and_then(|()| load_disc_presentation_for_convert(app, contents, index))
     {
         app.set_status(format!("Disc stream load failed: {err}"));
+        return;
     }
+    if let (Some(checked), SourceMode::MultiTrack { selected, .. }) =
+        (checked, &mut app.convert.source.mode)
+    {
+        if checked.len() == selected.len() && checked.iter().any(|value| *value) {
+            *selected = checked;
+        }
+    }
+}
+
+/// Queue each checked program through the existing Convert queue's ready-item
+/// admission. Requests are built before the first insertion so a broken
+/// selection or invalid pipeline setting cannot queue only an early prefix.
+fn queue_overlay_checked_programs(app: &mut AppState) {
+    use crate::convert::{ConversionItem, FormatDetector};
+    use crate::convert::pipeline::unified_request::{
+        build_pipeline_request_from_settings, pipeline_settings_from_legacy_options,
+    };
+    use crate::tui::disc_browser::metadata_for_disc_presentation;
+
+    let (contents, choices, source_path) = match &app.active_overlay {
+        ActiveOverlay::DiscBrowser(state) => (
+            state.contents.clone(),
+            state.selected_indices().into_iter().map(|i| (i, state.items_checked[i].clone()))
+                .collect::<Vec<_>>(),
+            state.source_path.clone(),
+        ),
+        _ => return,
+    };
+    if choices.len() < 2 { activate_overlay_convert(app); return; }
+    let options = super::convert_actions::pills_to_options(
+        &app.convert.format, &app.convert.output_options, &app.config,
+    );
+    if options.output_dir.is_none() {
+        app.set_status("Choose a Convert destination before queuing multiple programs");
+        return;
+    }
+    let prepare = || -> Result<Vec<_>, String> {
+        let format = FormatDetector::detect(&source_path).map_err(|e| e.to_string())?;
+        let settings = match options.pipeline_settings.clone() {
+            Some(settings) => settings,
+            None => pipeline_settings_from_legacy_options(&options)
+                .map_err(|e| e.to_string())?,
+        };
+        choices.iter().map(|(index, bitmap)| {
+            require_selected_presentation_stream_conversion(&contents, *index)?;
+            let metadata = metadata_for_disc_presentation(&contents, contents.presentations.get(*index));
+            let mut mode = source_mode_for_presentation(contents.clone(), *index, metadata)?;
+            if let SourceMode::MultiTrack { selected, .. } = &mut mode {
+                if selected.len() != bitmap.len() || !bitmap.iter().any(|on| *on) {
+                    return Err(format!("Program {} has no checked items", index + 1));
+                }
+                *selected = bitmap.clone();
+            }
+            let item = ConversionItem::new(source_path.clone(), format, options.clone());
+            let request = build_pipeline_request_from_settings(&item, settings.clone())
+                .map_err(|e| e.to_string())?;
+            Ok((source_path.clone(), options.clone(),
+                crate::tui::command::pipeline_request_with_convert_source_disc_selection(&mode, request)))
+        }).collect()
+    };
+    let ready = match prepare() {
+        Ok(ready) => ready,
+        Err(err) => { app.set_status(format!("Cannot queue selected programs: {err}")); return; }
+    };
+    let total = ready.len();
+    let mut enqueued = 0usize;
+    for (path, options, request) in ready {
+        match app.manager.add_file_ready_for_processing_with_pipeline_request(
+            path, options, request, None,
+        ) {
+            Ok(_) => enqueued += 1,
+            Err(err) => {
+                app.set_status(format!("Queued {enqueued} of {total} programs; last error: {err}"));
+                app.save_queue();
+                return;
+            }
+        }
+    }
+    app.save_queue();
+    app.active_overlay = ActiveOverlay::None;
+    app.current_screen = AppScreen::Queue;
+    app.set_status(format!("Queued {enqueued} independently selected disc program(s) for Convert"));
+}
+
+/// Reuse the existing format-specific metadata editor for the focused program.
+/// All editors already support presentation tabs. Switch to the exact source
+/// stream after they have loaded, instead of displaying an unrelated default.
+fn open_existing_metadata_editor_for_disc_cursor(app: &mut AppState) -> Result<bool, String> {
+    let (path, id, format) = match &app.active_overlay {
+        ActiveOverlay::DiscBrowser(state) => {
+            let Some(presentation) = state.selected_presentation() else { return Ok(false); };
+            (state.source_path.clone(), presentation.id, state.contents.format)
+        }
+        _ => return Ok(false),
+    };
+    match format {
+        crate::disc::DiscFormat::DvdVideo => return open_dvdv_metadata_editor_for_overlay_cursor(app),
+        crate::disc::DiscFormat::Sacd => super::keybindings::open_metadata_editor_for_sacd(app, path),
+        crate::disc::DiscFormat::DvdAudio => {
+            if let PresentationId::DvdAudioGroup(group) = id {
+                super::keybindings::open_metadata_editor_for_dvda_group(app, path, group);
+            } else { return Ok(false); }
+        }
+        crate::disc::DiscFormat::BluRay => super::keybindings::open_metadata_editor_for_bluray(app, path),
+    }
+    if let ActiveOverlay::MetadataEditor(editor) = &mut app.active_overlay {
+        if let Some(index) = editor.presentation_tabs.iter().position(|tab|tab.id == id) {
+            editor.switch_presentation_tab(index);
+        }
+    }
+    Ok(true)
 }
 
 /// Open the metadata editor for the currently highlighted DVD-Video stream and
@@ -706,6 +1144,7 @@ mod tests {
             label: marker.label().to_string(),
             source_path,
             presentations: vec![DiscPresentation {
+                extract: crate::disc::model::PresentationExtractInfo::default(),
                 id,
                 label: "stream 1".to_string(),
                 format: AudioPresentationFormat {

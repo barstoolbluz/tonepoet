@@ -7454,6 +7454,15 @@ mod artwork_cache_clear_completion_tests {
 
 pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMessage>) {
     match msg {
+        AppMessage::NativeExtractProgress(progress) => {
+            app.set_status(format!("Extracting {}/{}: {}", progress.done, progress.total, progress.current));
+        }
+        AppMessage::NativeExtractComplete(result) => {
+            match result {
+                Ok(report) => app.set_status(format!("Extraction complete: {} files published", report.published.len())),
+                Err(error) => app.set_status(format!("Extraction failed: {error}")),
+            }
+        }
         AppMessage::ArtworkCacheClearComplete { clear_id, result } => {
             if let Some(status) = artwork_cache_clear_completion_status(
                 app.browse_artwork.latest_clear_id(), clear_id, result,
@@ -8655,6 +8664,29 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             }
             super::context_menu::refresh_open_browse_entry_menu(app);
         }
+        AppMessage::DiscExtractProbeComplete { path, probe_id, program_index, result } => {
+            if let crate::tui::app::ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay {
+                if state.probe_id == probe_id && state.source_path == path {
+                    if result.is_err() && program_index < state.selected.len() {
+                        // A failed stream can still be sent to Convert, but it
+                        // must not remain checked for native extraction.
+                        state.selected[program_index] = false;
+                    }
+                    if let Ok(facts) = &result {
+                        if let Some(presentation) = state.contents.presentations.get_mut(program_index) {
+                            // Only observed values change the display/source facts. Do not
+                            // turn a count-derived layout label into a speaker assignment.
+                            if let Some(depth) = facts.bit_depth { presentation.format.bit_depth = Some(depth); }
+                            if let Some(rate) = facts.sample_rate { presentation.format.sample_rate = Some(rate); }
+                            if let Some(channels) = facts.channels { presentation.format.channels = Some(channels); }
+                        }
+                    }
+                    if let Some(slot) = state.probe_statuses.get_mut(program_index) {
+                        *slot = Some(result);
+                    }
+                }
+            }
+        }
         AppMessage::DiscProbeComplete { path, fingerprint, result } => {
             if !app.browse.complete_disc_probe(&path) {
                 return;
@@ -8673,7 +8705,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                             app.browse.deferred_work.info_pane_changed = true;
                         }
                         if let Some(followup) = app.browse.disc_probe_followup.remove(&path) {
-                            super::disc_browser_actions::handle_disc_probe_followup(app, &path, followup);
+                            super::disc_browser_actions::handle_disc_probe_followup(app, &path, followup, tx);
                         }
                     } else {
                         log::debug!(

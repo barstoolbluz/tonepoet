@@ -5196,6 +5196,54 @@ fn build_initial_work(
         return None;
     }
 
+    // This is the same queue and worker pool used by Convert, but the native
+    // operation never projects through a Convert PipelineRequest or DSP stage.
+    if let Some(job) = item.native_extraction.take() {
+        let tx = progress_tx.clone();
+        let job_key = format!("native-extract:{item_id}");
+        job_to_item.insert(job_key.clone(), item_id.clone());
+        return Some(WorkUnit {
+            job_id: job_key,
+            unit_id: format!("native-extract:{item_id}"),
+            kind: WorkKind::MaterializeItem,
+            task: boxed_work(move |worker_cancel| async move {
+                let output_root = job.destination.clone();
+                let report = crate::convert::pipeline::native_extract::execute(
+                    job, worker_cancel.clone(), |progress| {
+                        let fraction = if progress.total == 0 { 0.0 } else {
+                            (progress.done as f32 * 100.0 / progress.total as f32).min(100.0)
+                        };
+                        let status = ConversionStatus::Processing {
+                            progress: fraction,
+                            message: Some(format!("Extracting {}/{}: {}", progress.done, progress.total, progress.current)),
+                            file_progress: Some((progress.done as u32, progress.total as u32)),
+                            phase: Some(ConversionPhase::Extracting),
+                            phase_progress: Some(fraction),
+                        };
+                        let _ = tx.send(ProgressUpdate {
+                            item_id: item_id.clone(), track_index: None,
+                            track_epoch: None, progress: fraction, status,
+                        });
+                    },
+                ).await;
+                let status = match report {
+                    Ok(result) => ConversionStatus::Completed {
+                        output_path: result.published.first().cloned().unwrap_or(output_root),
+                        log_path: None, warning_count: 0,
+                    },
+                    Err(error) if worker_cancel.is_cancelled() => {
+                        // Cancellation retains any individually published, complete
+                        // files. The worker error carries their count and location.
+                        log::info!("Native extraction cancelled: {error}");
+                        ConversionStatus::Cancelled
+                    },
+                    Err(error) => ConversionStatus::Failed { error, log_path: None },
+                };
+                Ok(QueueWorkOutput::PostProcessed { item_id, status })
+            }),
+        });
+    }
+
     if let Err(error) = item.resolve_archive_password_for_execution() {
         pool.metrics().record_job_failed();
         terminal.insert(

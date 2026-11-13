@@ -43,6 +43,12 @@ int tonepoet_native_mlp_decode_stereo_s32le_wav(
     const char *output_path,
     struct tonepoet_native_mlp_decode_result *out);
 
+/* Extraction-only fixed RF64 carrier; the Convert ABI remains unchanged. */
+int tonepoet_native_mlp_decode_stereo_s32le_rf64(
+    const char *input_path,
+    const char *output_path,
+    struct tonepoet_native_mlp_decode_result *out);
+
 #ifdef __cplusplus
 }
 #endif

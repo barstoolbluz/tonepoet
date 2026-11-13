@@ -1251,7 +1251,8 @@ mod tests {
             label: "Fixture".to_string(),
             source_path: root.to_path_buf(),
             presentations: vec![crate::disc::model::DiscPresentation {
-                id: crate::disc::model::PresentationId::blu_ray_title(
+                extract: crate::disc::model::PresentationExtractInfo::default(),
+            id: crate::disc::model::PresentationId::blu_ray_title(
                     12,
                     0x1100,
                     0,

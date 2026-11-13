@@ -11542,7 +11542,7 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             super::directory_properties::handle_key(app, *state, key, tx);
         }
         ActiveOverlay::DiscBrowser(_) => {
-            super::disc_browser_actions::handle_disc_browser_key(app, key);
+            super::disc_browser_actions::handle_disc_browser_key(app, key, tx);
         }
         ActiveOverlay::FilePicker(mut session) => {
             let session_id = session.session_id;
@@ -18327,6 +18327,7 @@ fn metadata_editor_save_with_cue_consent(
         ) {
             Ok(outcome) => {
                 state.mark_presentation_tabs_saved(&outcome.saved_tab_indices);
+                app.browse.disc_probe_cache.remove(&source_path);
                 let file_name = outcome
                     .path
                     .file_name()
@@ -18356,6 +18357,7 @@ fn metadata_editor_save_with_cue_consent(
         match super::command::save_dvdv_metadata_sidecar(&source_path, state) {
             Ok(outcome) => {
                 state.mark_active_presentation_saved();
+                app.browse.disc_probe_cache.remove(&source_path);
                 let remaining = state.dirty_presentation_count();
                 let file_name = outcome
                     .path
@@ -18393,6 +18395,9 @@ fn metadata_editor_save_with_cue_consent(
             match save_dvda_metabase(state, &sidecar_path) {
                 Ok(kind) => {
                     state.mark_all_presentations_saved();
+                    if let Some(source) = state.active_surface().paths.first() {
+                        app.browse.disc_probe_cache.remove(source);
+                    }
                     let verb = match kind {
                         SacdSaveKind::Created => "created",
                         SacdSaveKind::Updated => "updated",
@@ -18413,6 +18418,9 @@ fn metadata_editor_save_with_cue_consent(
         match save_sacd_sidecar(state, &sidecar_path) {
             Ok(outcome) => {
                 state.mark_all_presentations_saved();
+                if let Some(source) = state.active_surface().paths.first() {
+                    app.browse.disc_probe_cache.remove(source);
+                }
                 let verb = match outcome.kind {
                     SacdSaveKind::Created => "created",
                     SacdSaveKind::Updated => "updated",
@@ -72749,6 +72757,28 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
     }
 
     if matches!(app.active_overlay, ActiveOverlay::DiscBrowser(_)) {
+        if matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) {
+            use super::disc_browser::ExtractFocus;
+            let delta = if mouse.kind == MouseEventKind::ScrollUp { -3isize } else { 3isize };
+            if let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay {
+                if state.panel.is_none() {
+                    match state.focus {
+                        ExtractFocus::Programs => { state.move_cursor(delta); state.item_cursor = 0; },
+                        ExtractFocus::Items => {
+                            let max = state.selected_presentation().map_or(0, |p| p.tracks.len().saturating_sub(1));
+                            state.item_cursor = if delta < 0 { state.item_cursor.saturating_sub(3) }
+                                else { state.item_cursor.saturating_add(3).min(max) };
+                        }
+                        ExtractFocus::Output => {
+                            let max = state.output_rows().len().saturating_sub(1);
+                            state.output_cursor = if delta < 0 { state.output_cursor.saturating_sub(3) }
+                                else { state.output_cursor.saturating_add(3).min(max) };
+                        }
+                    }
+                }
+            }
+            return;
+        }
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             if let Some(button) = app.button_map.find_button_at(mouse.column, mouse.row) {
                 let now = std::time::Instant::now();
@@ -72773,7 +72803,10 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                         1
                     }
                 };
-                super::disc_browser_actions::handle_disc_browser_button_click(app, &button, click_count, tx);
+                super::disc_browser_actions::handle_disc_browser_button_click_with_shift(
+                    app, &button, click_count,
+                    mouse.modifiers.contains(KeyModifiers::SHIFT), tx,
+                );
             }
         }
         return;
@@ -74608,6 +74641,13 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::FormatSettingsSoxrChebyshev(_)
             | TuiButton::DiscBrowserStream(_)
             | TuiButton::DiscBrowserExpand(_)
+            | TuiButton::DiscBrowserTrack(_)
+            | TuiButton::DiscBrowserTrackCheck(_)
+            | TuiButton::DiscBrowserAnglePrev(_)
+            | TuiButton::DiscBrowserAngleNext(_)
+            | TuiButton::DiscBrowserOutput(_)
+            | TuiButton::DiscBrowserExtract
+            | TuiButton::DiscBrowserMore
             | TuiButton::DiscBrowserConvert
             | TuiButton::DiscBrowserClose
             | TuiButton::ThemeBuilderPreset
@@ -74751,6 +74791,7 @@ mod phase4_tests {
         channel_layout: Option<&str>,
     ) -> crate::disc::model::DiscPresentation {
         crate::disc::model::DiscPresentation {
+            extract: crate::disc::model::PresentationExtractInfo::default(),
             id: crate::disc::model::PresentationId::DvdAudioGroup(group_nr),
             label: label.to_string(),
             format: crate::disc::model::AudioPresentationFormat {
@@ -74779,6 +74820,7 @@ mod phase4_tests {
         durations: &[f64],
     ) -> crate::disc::model::DiscPresentation {
         crate::disc::model::DiscPresentation {
+            extract: crate::disc::model::PresentationExtractInfo::default(),
             id: crate::disc::model::PresentationId::try_blu_ray_title(
                 playlist_number,
                 audio_pid,

@@ -52,6 +52,11 @@ unsafe extern "C" {
         output_path: *const c_char,
         out: *mut TonepoetNativeMlpDecodeResultRaw,
     ) -> c_int;
+    fn tonepoet_native_mlp_decode_stereo_s32le_rf64(
+        input_path: *const c_char,
+        output_path: *const c_char,
+        out: *mut TonepoetNativeMlpDecodeResultRaw,
+    ) -> c_int;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -138,11 +143,23 @@ pub(crate) fn decode_authored_stereo_to_wav(
     mlp_path: &Path,
     wav_path: &Path,
 ) -> Result<NativeMlpDecodeResult, NativeMlpError> {
+    decode_authored_stereo_to_wav_with_rf64(mlp_path,wav_path,false)
+}
+
+pub(crate) fn decode_authored_stereo_to_wav_with_rf64(
+    mlp_path: &Path,
+    wav_path: &Path,
+    native_rf64: bool,
+) -> Result<NativeMlpDecodeResult, NativeMlpError> {
     let input = path_to_cstring(mlp_path)?;
     let output = path_to_cstring(wav_path)?;
     let mut raw = TonepoetNativeMlpDecodeResultRaw::zeroed();
     let rc = unsafe {
-        tonepoet_native_mlp_decode_stereo_s32le_wav(input.as_ptr(), output.as_ptr(), &mut raw)
+        if native_rf64 {
+            tonepoet_native_mlp_decode_stereo_s32le_rf64(input.as_ptr(), output.as_ptr(), &mut raw)
+        } else {
+            tonepoet_native_mlp_decode_stereo_s32le_wav(input.as_ptr(), output.as_ptr(), &mut raw)
+        }
     };
     if rc != 0 {
         let message = nonempty_c_char_buf(&raw.error)

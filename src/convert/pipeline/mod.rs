@@ -25,6 +25,8 @@ pub(crate) mod bluray_ts_demux;
 pub(crate) mod bluray_lpcm;
 pub(crate) mod bluray_wav_validate;
 pub(crate) mod bluray_realize;
+pub(crate) mod native_extract;
+pub(crate) mod native_wav;
 pub(crate) mod coordination_name;
 pub mod actions;
 // IP-02 feasibility probe only. No production decoder/worker admission uses it.

@@ -7,7 +7,7 @@ pub use super::bluray_backend::BlurayDisplayAngle;
 use super::diagnostics::DiscDiagnostic;
 
 /// Disc format identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DiscFormat {
     DvdAudio,
     Sacd,
@@ -232,6 +232,55 @@ pub enum SacdAreaId {
     MultiChannel,
 }
 
+/// Independent, observed authored/sidecar fields. Applying precedence at the
+/// extraction request boundary avoids losing the lower-priority source in the
+/// presentation's display-oriented (merged) title and album fields.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiscExtractTagFields {
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub genre: Option<String>,
+    pub year: Option<String>,
+    pub composer: Option<String>,
+    pub performer: Option<String>,
+}
+
+impl DiscExtractTagFields {
+    pub fn prioritized(&self, fallback: &Self) -> Self {
+        let pick = |first: &Option<String>, second: &Option<String>| {
+            first.as_ref().filter(|value| !value.trim().is_empty()).cloned()
+                .or_else(|| second.as_ref().filter(|value| !value.trim().is_empty()).cloned())
+        };
+        Self {
+            title: pick(&self.title, &fallback.title),
+            artist: pick(&self.artist, &fallback.artist),
+            album: pick(&self.album, &fallback.album),
+            genre: pick(&self.genre, &fallback.genre),
+            year: pick(&self.year, &fallback.year),
+            composer: pick(&self.composer, &fallback.composer),
+            performer: pick(&self.performer, &fallback.performer),
+        }
+    }
+}
+
+/// Extraction eligibility and display details supplied by the source mapper.
+/// Missing facts do not imply a guessed language, speaker position or role.
+#[derive(Debug, Clone, Default)]
+pub struct PresentationExtractInfo {
+    pub ineligible_reason: Option<String>,
+    pub language: Option<String>,
+    pub role: Option<String>,
+    pub angle_count: u8,
+    /// Parsed SACD TOC details displayed on the second disc header line.
+    pub sacd_header_details: Option<String>,
+    /// Only populated by source parsers that can distinguish both authorities.
+    pub authored_album_tags: DiscExtractTagFields,
+    pub sidecar_album_tags: DiscExtractTagFields,
+    pub authored_track_tags: Vec<DiscExtractTagFields>,
+    pub sidecar_track_tags: Vec<DiscExtractTagFields>,
+}
+
 /// A meaningful, user-selectable audio presentation on the disc.
 #[derive(Debug, Clone)]
 pub struct DiscPresentation {
@@ -240,6 +289,7 @@ pub struct DiscPresentation {
     pub format: AudioPresentationFormat,
     pub tracks: Vec<DiscTrack>,
     pub total_duration_secs: f64,
+    pub extract: PresentationExtractInfo,
     pub album_title: Option<String>,
     pub album_artist: Option<String>,
     pub genre: Option<String>,
@@ -379,5 +429,36 @@ mod presentation_id_tests {
         );
         assert_eq!(id.compact_label(), "Playlist 00012 Stream 1 PID 0x1100 Angle 1");
         assert_eq!(id.blu_ray_parts(), Some((12, 0x1100, 0, 1)));
+    }
+}
+
+#[cfg(test)]
+mod extraction_tag_precedence_tests {
+    use super::DiscExtractTagFields;
+
+    #[test]
+    fn priority_is_per_field_and_does_not_merge_unknown_values_as_facts() {
+        let authored = DiscExtractTagFields {
+            title: Some("authored title".into()),
+            artist: Some("disc artist".into()),
+            composer: Some("disc composer".into()),
+            year: Some("2025".into()),
+            ..Default::default()
+        };
+        let sidecar = DiscExtractTagFields {
+            title: Some("sidecar title".into()),
+            composer: Some("sidecar composer".into()),
+            artist: Some("".into()),
+            ..Default::default()
+        };
+        let sidecar_first = sidecar.prioritized(&authored);
+        assert_eq!(sidecar_first.title.as_deref(), Some("sidecar title"));
+        assert_eq!(sidecar_first.composer.as_deref(), Some("sidecar composer"));
+        assert_eq!(sidecar_first.artist.as_deref(), Some("disc artist"));
+        assert_eq!(sidecar_first.year.as_deref(), Some("2025"));
+        let disc_first = authored.prioritized(&sidecar);
+        assert_eq!(disc_first.title.as_deref(), Some("authored title"));
+        assert_eq!(disc_first.composer.as_deref(), Some("disc composer"));
+        assert_eq!(disc_first.album, None);
     }
 }

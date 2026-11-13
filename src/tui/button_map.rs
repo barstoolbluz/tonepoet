@@ -381,6 +381,13 @@ pub enum TuiButton {
     // Disc browser overlay.
     DiscBrowserStream(usize),
     DiscBrowserExpand(usize),
+    DiscBrowserTrack(usize),
+    DiscBrowserTrackCheck(usize),
+    DiscBrowserAnglePrev(usize),
+    DiscBrowserAngleNext(usize),
+    DiscBrowserOutput(usize),
+    DiscBrowserExtract,
+    DiscBrowserMore,
     DiscBrowserConvert,
     DiscBrowserClose,
 
@@ -542,6 +549,13 @@ impl TuiButton {
             | Self::CuePreviewEditCancel
             | Self::DiscBrowserStream(_)
             | Self::DiscBrowserExpand(_)
+            | Self::DiscBrowserTrack(_)
+            | Self::DiscBrowserTrackCheck(_)
+            | Self::DiscBrowserAnglePrev(_)
+            | Self::DiscBrowserAngleNext(_)
+            | Self::DiscBrowserOutput(_)
+            | Self::DiscBrowserExtract
+            | Self::DiscBrowserMore
             | Self::DiscBrowserConvert
             | Self::DiscBrowserClose
             | Self::ActionsAvailable(_)

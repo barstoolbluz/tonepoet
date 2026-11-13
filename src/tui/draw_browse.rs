@@ -6614,6 +6614,7 @@ mod folder_classification_info_pane_tests {
 
     fn disc_presentation(index: u32, codec: &str, channels: u32, layout: &str) -> DiscPresentation {
         DiscPresentation {
+            extract: crate::disc::model::PresentationExtractInfo::default(),
             id: PresentationId::try_blu_ray_title(index, 0x1100 + index as u16, 0, 1)
                 .expect("valid Blu-ray id"),
             label: format!("stream {index}"),
@@ -7015,6 +7016,7 @@ mod folder_classification_info_pane_tests {
 
     fn sacd_presentation(area: SacdAreaId, label: &str, channels: u32, layout: &str) -> DiscPresentation {
         DiscPresentation {
+            extract: crate::disc::model::PresentationExtractInfo::default(),
             id: PresentationId::SacdArea(area),
             label: label.to_string(),
             format: AudioPresentationFormat {

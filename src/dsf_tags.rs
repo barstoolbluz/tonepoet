@@ -144,7 +144,7 @@ pub struct DsfTailJournalInspection {
 }
 
 const COPY_CHUNK_BYTES: usize = 1024 * 1024;
-const REWRITE_PADDING_BYTES: u64 = 1024 * 1024;
+pub(crate) const REWRITE_PADDING_BYTES: u64 = 1024 * 1024;
 const MAX_IN_PLACE_TAIL_BYTES: u64 = 64 * 1024 * 1024;
 const TAIL_JOURNAL_MAGIC_V2: &[u8; 8] = b"TPDSFJ02";
 const TAIL_JOURNAL_MAGIC_V3: &[u8; 8] = b"TPDSFJ03";

@@ -4,9 +4,8 @@
 //! final data length, validates the emitted WAV metadata by reading it back, and
 //! only then publishes the temporary file atomically.
 
-use std::fs;
 use std::fs::File;
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use super::bluray_pts::PTS_CLOCK_HZ;
@@ -307,111 +306,91 @@ pub(crate) fn validate_bluray_lpcm_wav(path: &Path, expected: &ExpectedAudio) ->
     Ok(())
 }
 
+/// Read RIFF/RF64 metadata in bounded memory. Never load sample data: a
+/// selected native chapter may exceed the entire 32-bit RIFF address space.
 pub(crate) fn read_wav_info(path: &Path) -> Result<WavInfo, String> {
-    let bytes = fs::read(path).map_err(|err| format!("failed to read WAV '{}': {err}", path.display()))?;
-    if bytes.len() < 12 {
-        return Err("truncated RIFF header".to_string());
+    let mut file = File::open(path).map_err(|err| format!("failed to open WAV '{}': {err}",path.display()))?;
+    let file_len = file.metadata().map_err(|e|e.to_string())?.len();
+    if file_len < 12 { return Err("truncated RIFF header".into()); }
+    let mut header = [0u8;12];
+    file.read_exact(&mut header).map_err(|e|e.to_string())?;
+    let rf64 = &header[0..4] == b"RF64";
+    require(rf64 || &header[0..4] == b"RIFF", "missing RIFF signature")?;
+    require(&header[8..12] == b"WAVE", "missing WAVE signature")?;
+    let riff_32 = u32::from_le_bytes(header[4..8].try_into().unwrap());
+    if !rf64 {
+        require(u64::from(riff_32) + 8 == file_len,
+            format!("RIFF size mismatch: header declares {} total byte(s), file has {} byte(s)",u64::from(riff_32)+8,file_len))?;
+    } else {
+        require(riff_32 == u32::MAX, "RF64 RIFF sentinel is missing")?;
     }
-    require(&bytes[0..4] == b"RIFF", "missing RIFF signature")?;
-    require(&bytes[8..12] == b"WAVE", "missing WAVE signature")?;
-
-    let riff_size_field = read_u32_le(&bytes, 4, "RIFF size")?;
-    let riff_total_size = u64::from(riff_size_field)
-        .checked_add(8)
-        .ok_or_else(|| "RIFF size overflow".to_string())?;
-    require(
-        riff_total_size == bytes.len() as u64,
-        format!(
-            "RIFF size mismatch: header declares {} total byte(s), file has {} byte(s)",
-            riff_total_size,
-            bytes.len()
-        ),
-    )?;
-
-    let mut offset = 12usize;
-    let riff_end = usize::try_from(riff_total_size).map_err(|_| "RIFF size exceeds usize".to_string())?;
+    let mut offset = 12u64;
     let mut fmt: Option<WavInfo> = None;
-    let mut data_size: Option<u64> = None;
-
-    while offset < riff_end {
-        if riff_end - offset < 8 {
-            return Err("truncated RIFF chunk header".to_string());
+    let mut declared_data: Option<u64> = None;
+    let mut ds64: Option<(u64,u64)> = None;
+    while offset < file_len {
+        if file_len - offset < 8 { return Err("truncated RIFF chunk header".into()); }
+        file.seek(SeekFrom::Start(offset)).map_err(|e|e.to_string())?;
+        let mut ch = [0u8;8];
+        file.read_exact(&mut ch).map_err(|e|e.to_string())?;
+        let kind = &ch[..4];
+        let size32 = u32::from_le_bytes(ch[4..8].try_into().unwrap());
+        let size = if rf64 && kind == b"data" && size32 == u32::MAX {
+            ds64.ok_or("RF64 data sentinel appears before ds64")?.1
+        } else { u64::from(size32) };
+        let data_start = offset.checked_add(8).ok_or("RIFF chunk offset overflow")?;
+        let data_end = data_start.checked_add(size).ok_or("RIFF chunk size overflow")?;
+        require(data_end <= file_len,
+            format!("truncated RIFF chunk '{}': declares {size} byte(s) past file end", chunk_id_label(kind)))?;
+        if kind == b"ds64" {
+            require(rf64 && ds64.is_none() && size >= 28, "invalid RF64 ds64 chunk")?;
+            let mut ds = [0u8;28];
+            file.read_exact(&mut ds).map_err(|e|e.to_string())?;
+            let riff_size = u64::from_le_bytes(ds[..8].try_into().unwrap());
+            let pcm_size = u64::from_le_bytes(ds[8..16].try_into().unwrap());
+            let table_count = u32::from_le_bytes(ds[24..28].try_into().unwrap());
+            require(table_count == 0, "RF64 chunk-size table is not supported for native PCM")?;
+            require(riff_size.checked_add(8) == Some(file_len),
+                format!("RF64 size mismatch: header declares {} RIFF bytes, file has {file_len} total bytes",riff_size))?;
+            ds64 = Some((riff_size, pcm_size));
+        } else if kind == b"fmt " {
+            require(fmt.is_none() && size >= 16 && size <= 256, "invalid WAV fmt chunk")?;
+            let mut data = [0u8;40];
+            let read_len = usize::try_from(size.min(40)).map_err(|e|e.to_string())?;
+            file.read_exact(&mut data[..read_len]).map_err(|e|e.to_string())?;
+            let format_tag = read_u16_le(&data,0,"format tag")?;
+            let channels = read_u16_le(&data,2,"channels")?;
+            let sample_rate = read_u32_le(&data,4,"sample rate")?;
+            let byte_rate = read_u32_le(&data,8,"byte rate")?;
+            let block_align = read_u16_le(&data,12,"block align")?;
+            let bits_per_sample = read_u16_le(&data,14,"bits per sample")?;
+            let (valid_bits_per_sample,channel_mask) = if format_tag == WAVE_FORMAT_EXTENSIBLE {
+                require(size >= 40, "truncated WAVE_FORMAT_EXTENSIBLE fmt chunk")?;
+                let cb_size = read_u16_le(&data,16,"extensible cbSize")?;
+                require(cb_size >= 22,
+                    format!("WAVE_FORMAT_EXTENSIBLE fmt chunk has cbSize {cb_size}, expected at least 22"))?;
+                let valid = read_u16_le(&data,18,"valid bits per sample")?;
+                let mask = read_u32_le(&data,20,"channel mask")?;
+                let subformat = read_u16_le(&data,24,"subformat tag")?;
+                require(subformat == WAVE_FORMAT_PCM && &data[26..40] == WAV_PCM_GUID_TAIL.as_slice(),
+                    "WAVE_FORMAT_EXTENSIBLE subformat is not PCM")?;
+                (Some(valid),Some(mask))
+            } else { (None,None) };
+            fmt = Some(WavInfo {format_tag,channels,sample_rate,byte_rate,block_align,
+                bits_per_sample,valid_bits_per_sample,channel_mask,data_size:0,
+                riff_size:ds64.map_or(u64::from(riff_32),|(r,_)|r)});
+        } else if kind == b"data" {
+            require(declared_data.is_none(), "multiple data chunks are not supported")?;
+            declared_data = Some(size);
         }
-        let chunk_id = &bytes[offset..offset + 4];
-        let chunk_size = read_u32_le(&bytes, offset + 4, "chunk size")? as usize;
-        let data_start = offset
-            .checked_add(8)
-            .ok_or_else(|| "RIFF chunk offset overflow".to_string())?;
-        let data_end = data_start
-            .checked_add(chunk_size)
-            .ok_or_else(|| "RIFF chunk size overflow".to_string())?;
-        if data_end > riff_end {
-            return Err(format!(
-                "truncated RIFF chunk '{}': declares {} byte(s) past file end",
-                chunk_id_label(chunk_id), chunk_size
-            ));
-        }
-
-        if chunk_id == b"fmt " {
-            if fmt.is_some() {
-                return Err("multiple fmt chunks are not supported".to_string());
-            }
-            if chunk_size < 16 {
-                return Err("truncated fmt chunk".to_string());
-            }
-            let format_tag = read_u16_le(&bytes, data_start, "format tag")?;
-            let channels = read_u16_le(&bytes, data_start + 2, "channels")?;
-            let sample_rate = read_u32_le(&bytes, data_start + 4, "sample rate")?;
-            let byte_rate = read_u32_le(&bytes, data_start + 8, "byte rate")?;
-            let block_align = read_u16_le(&bytes, data_start + 12, "block align")?;
-            let bits_per_sample = read_u16_le(&bytes, data_start + 14, "bits per sample")?;
-            let (valid_bits_per_sample, channel_mask) = if format_tag == WAVE_FORMAT_EXTENSIBLE {
-                if chunk_size < 40 {
-                    return Err("truncated WAVE_FORMAT_EXTENSIBLE fmt chunk".to_string());
-                }
-                let cb_size = read_u16_le(&bytes, data_start + 16, "extensible cbSize")?;
-                if cb_size < 22 {
-                    return Err(format!(
-                        "WAVE_FORMAT_EXTENSIBLE fmt chunk has cbSize {cb_size}, expected at least 22"
-                    ));
-                }
-                let valid_bits = read_u16_le(&bytes, data_start + 18, "valid bits per sample")?;
-                let mask = read_u32_le(&bytes, data_start + 20, "channel mask")?;
-                let subformat_tag = read_u16_le(&bytes, data_start + 24, "subformat tag")?;
-                if subformat_tag != WAVE_FORMAT_PCM || &bytes[data_start + 26..data_start + 40] != WAV_PCM_GUID_TAIL.as_slice() {
-                    return Err("WAVE_FORMAT_EXTENSIBLE subformat is not PCM".to_string());
-                }
-                (Some(valid_bits), Some(mask))
-            } else {
-                (None, None)
-            };
-            fmt = Some(WavInfo {
-                format_tag,
-                channels,
-                sample_rate,
-                byte_rate,
-                block_align,
-                bits_per_sample,
-                valid_bits_per_sample,
-                channel_mask,
-                data_size: 0,
-                riff_size: u64::from(riff_size_field),
-            });
-        } else if chunk_id == b"data" {
-            if data_size.is_some() {
-                return Err("multiple data chunks are not supported".to_string());
-            }
-            data_size = Some(chunk_size as u64);
-        }
-
-        offset = data_end
-            .checked_add(chunk_size & 1)
-            .ok_or_else(|| "RIFF chunk padding overflow".to_string())?;
+        offset = data_end.checked_add(size & 1).ok_or("RIFF chunk padding overflow")?;
+        require(offset <= file_len, "truncated RIFF chunk padding")?;
     }
-
-    let mut info = fmt.ok_or_else(|| "missing fmt chunk".to_string())?;
-    info.data_size = data_size.ok_or_else(|| "missing data chunk".to_string())?;
-    Ok(info)
+    if rf64 { require(ds64.is_some(), "RF64 is missing ds64 chunk")?; }
+    let mut output = fmt.ok_or_else(||"missing fmt chunk".to_string())?;
+    output.data_size = declared_data.ok_or_else(||"missing data chunk".to_string())?;
+    if let Some((riff_size, _)) = ds64 { output.riff_size=riff_size; }
+    Ok(output)
 }
 
 fn read_u16_le(bytes: &[u8], offset: usize, what: &str) -> Result<u16, String> {

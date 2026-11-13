@@ -154,6 +154,10 @@ pub fn map_dvda_disc_with_metabase(
         };
 
         presentations.push(DiscPresentation {
+            extract: PresentationExtractInfo {
+                ineligible_reason: dvda_utils::native_group_extraction_issue(disc, group),
+                ..PresentationExtractInfo::default()
+            },
             id: group_id,
             label: pres_label,
             format,
