@@ -22159,10 +22159,16 @@ pub(super) fn handle_file_task_user_action(
             if app.file_transfers.blocked_for_attention {
                 app.file_transfers.blocked_for_attention = false;
             }
-            // A terminal extraction may have released its file-task lease
-            // while the dialog awaited acknowledgment. Dispatch a queued
-            // copy/move only after that visible surface has been dismissed.
-            if app.file_transfers.active_session_id.is_none() {
+            // A terminal copy/move/extraction may have released its serial
+            // slot while the dialog awaited acknowledgment. Other kinds of
+            // file-task overlays (notably Archive) must not start the FIFO
+            // just because their unrelated result was dismissed.
+            if app.file_transfers.active_session_id.is_none()
+                && matches!(&session.progress.kind,
+                    tui_file_picker::FileTaskKind::Copy
+                    | tui_file_picker::FileTaskKind::Move
+                    | tui_file_picker::FileTaskKind::Extract)
+            {
                 maybe_start_next_file_transfer(app, tx);
             }
             return false;
@@ -55607,9 +55613,7 @@ fn recovery_journal_is_already_claimed(
             .and_then(|retry| retry.recovery_journal_path.as_deref())
             == Some(journal_path)
     }) || app.file_transfers.queued.iter().any(|queued| {
-        queued
-            .retry_plan
-            .as_ref()
+        queued.transfer().and_then(|transfer| transfer.retry_plan.as_ref())
             .and_then(|retry| retry.recovery_journal_path.as_deref())
             == Some(journal_path)
     })
@@ -55733,7 +55737,7 @@ pub(super) fn start_filesystem_clipboard_paste(
     };
     let queue_id = queued.queue_id;
     let item_count = queued.clipboard.paths().len();
-    app.file_transfers.queued.push_back(queued);
+    app.file_transfers.queued.push_back(queued.into());
     app.sync_file_transfer_queue_surfaces();
 
     if app.file_transfers.active_session_id.is_none()
@@ -55745,7 +55749,7 @@ pub(super) fn start_filesystem_clipboard_paste(
         .file_transfers
         .queued
         .iter()
-        .position(|job| job.queue_id == queue_id)
+        .position(|job| job.queue_id() == queue_id)
         .map(|index| index + 1)
     {
         let recovery_note = if duplicate_recovery_demoted {
@@ -55785,6 +55789,21 @@ pub(super) fn maybe_start_next_file_transfer(
         app.file_transfers.keep_minimized_across_jobs = false;
         app.sync_file_transfer_queue_surfaces();
         return;
+    };
+    let queued = match queued {
+        super::app::QueuedFileTask::Extract(native) => {
+            let minimized = app.file_transfers.keep_minimized_across_jobs;
+            if let Err(error) = super::native_extract_task::dispatch_queued(
+                app, native.job.clone(), tx, minimized,
+            ) {
+                app.file_transfers.queued.push_front(
+                    super::app::QueuedFileTask::Extract(native));
+                app.set_status(format!("Queued extraction could not start: {error}; still queued"));
+            }
+            app.sync_file_transfer_queue_surfaces();
+            return;
+        }
+        super::app::QueuedFileTask::Transfer(transfer) => transfer,
     };
 
     let mut revalidation_warning = None;
@@ -55861,7 +55880,7 @@ pub(super) fn maybe_start_next_file_transfer(
         true,
         true,
     ) else {
-        app.file_transfers.queued.push_front(queued);
+        app.file_transfers.queued.push_front(queued.into());
         app.sync_file_transfer_queue_surfaces();
         app.set_status("Queued transfer could not start; it remains at the front of the queue");
         return;
@@ -55924,7 +55943,7 @@ pub(super) fn cancel_queued_file_transfer(
         .file_transfers
         .queued
         .iter()
-        .position(|job| job.queue_id == queue_id)
+        .position(|job| job.queue_id() == queue_id)
     else {
         app.set_status("Queued transfer was already started, deferred, or removed");
         return;
@@ -55934,12 +55953,19 @@ pub(super) fn cancel_queued_file_transfer(
         return;
     };
     app.sync_file_transfer_queue_surfaces();
-    app.set_status(format!(
-        "Cancelled queued transfer of {} item{} to {}",
-        removed.clipboard.paths().len(),
-        if removed.clipboard.paths().len() == 1 { "" } else { "s" },
-        removed.destination_dir.display()
-    ));
+    match removed {
+        super::app::QueuedFileTask::Transfer(removed) => app.set_status(format!(
+            "Cancelled queued transfer of {} item{} to {}",
+            removed.clipboard.paths().len(),
+            if removed.clipboard.paths().len() == 1 { "" } else { "s" },
+            removed.destination_dir.display()
+        )),
+        super::app::QueuedFileTask::Extract(removed) => {
+            let count: usize = removed.job.programs.iter().map(|p| p.tracks.len()).sum();
+            app.set_status(format!("Cancelled queued extraction of {count} tracks/chapters to {}",
+                removed.job.destination.display()));
+        }
+    }
     maybe_start_next_file_transfer(app, tx);
 }
 
@@ -56000,7 +56026,7 @@ pub(super) fn resume_file_transfer_recoveries(
         recovery.clipboard.paths().len()
     });
     for recovery in promoted.into_iter().rev() {
-        app.file_transfers.queued.push_front(recovery);
+        app.file_transfers.queued.push_front(recovery.into());
     }
     app.sync_file_transfer_queue_surfaces();
     if let Some(item_count) = one_summary {
@@ -70567,7 +70593,7 @@ fn cancel_confirm_action(app: &mut AppState, action: Option<&ConfirmAction>) {
             if let Some(overlay) = app.queued_quit_preempted_overlay.take() {
                 app.active_overlay = *overlay;
             }
-            app.set_status("Quit cancelled; queued file transfers were retained".to_string());
+            app.set_status("Quit cancelled; queued file tasks were retained".to_string());
         }
         Some(ConfirmAction::ArchiveExternalConflict { context }) => {
             app.should_quit = false;
@@ -71551,18 +71577,18 @@ fn execute_confirm_action(
             let mut outcomes = Vec::new();
             if actual_unjournaled > 0 {
                 outcomes.push(format!(
-                    "discarded {actual_unjournaled} unjournaled queued transfer{}",
+                    "discarded {actual_unjournaled} unjournaled queued file task{}",
                     if actual_unjournaled == 1 { "" } else { "s" },
                 ));
             }
             if actual_journal_backed > 0 {
                 outcomes.push(format!(
-                    "deferred {actual_journal_backed} journal-backed recovery transfer{} to startup recovery",
+                    "deferred {actual_journal_backed} journal-backed recovery task{} to startup recovery",
                     if actual_journal_backed == 1 { "" } else { "s" },
                 ));
             }
             if outcomes.is_empty() {
-                outcomes.push("no queued transfers remained to discard or defer".to_string());
+                outcomes.push("no queued file tasks remained to discard or defer".to_string());
             }
             let queue_changed = actual_unjournaled != *unjournaled_count
                 || actual_journal_backed != *journal_backed_count;
@@ -71809,12 +71835,12 @@ mod queued_transfer_quit_confirmation_tests {
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.file_transfers
             .queued
-            .push_back(queued_transfer(71, "/source/new", None));
+            .push_back(queued_transfer(71, "/source/new", None).into());
         app.file_transfers.queued.push_back(queued_transfer(
             72,
             "/source/recovery",
             Some(journal_path.clone()),
-        ));
+        ).into());
         let (tx, _rx) = mpsc::channel(4);
 
         execute_confirm_action(
@@ -71834,9 +71860,9 @@ mod queued_transfer_quit_confirmation_tests {
             .as_ref()
             .map(|(message, _)| message.as_str())
             .unwrap_or_default();
-        assert!(status.contains("discarded 1 unjournaled queued transfer"));
+        assert!(status.contains("discarded 1 unjournaled queued file task"));
         assert!(status.contains(
-            "deferred 1 journal-backed recovery transfer to startup recovery"
+            "deferred 1 journal-backed recovery task to startup recovery"
         ));
     }
 }
@@ -115913,7 +115939,8 @@ mod file_transfer_queue_state_tests {
 
         start_filesystem_clipboard_paste(&mut app, clipboard, destination, &tx);
 
-        let queued = app.file_transfers.queued.front().expect("queued duplicate paste");
+        let queued = app.file_transfers.queued.front().expect("queued duplicate paste")
+            .transfer().expect("clipboard transfer");
         assert!(queued
             .retry_plan
             .as_ref()
@@ -115967,23 +115994,23 @@ mod file_transfer_queue_state_tests {
         );
 
         assert_eq!(app.file_transfers.queued.len(), 2);
-        assert_eq!(app.file_transfers.queued[0].clipboard, first_clipboard);
-        assert_eq!(app.file_transfers.queued[1].clipboard, second_clipboard);
+        assert_eq!(app.file_transfers.queued[0].transfer().unwrap().clipboard, first_clipboard);
+        assert_eq!(app.file_transfers.queued[1].transfer().unwrap().clipboard, second_clipboard);
         assert_eq!(
-            app.file_transfers.queued[0].enqueue_plan.mappings[0].source,
+            app.file_transfers.queued[0].transfer().unwrap().enqueue_plan.mappings[0].source,
             first_source,
         );
         assert_eq!(
-            app.file_transfers.queued[1].enqueue_plan.mappings[0].source,
+            app.file_transfers.queued[1].transfer().unwrap().enqueue_plan.mappings[0].source,
             second_source,
         );
-        let first_id = app.file_transfers.queued[0].queue_id;
-        let second_id = app.file_transfers.queued[1].queue_id;
+        let first_id = app.file_transfers.queued[0].queue_id();
+        let second_id = app.file_transfers.queued[1].queue_id();
 
         cancel_queued_file_transfer(&mut app, first_id, &tx);
 
         assert_eq!(app.file_transfers.queued.len(), 1);
-        assert_eq!(app.file_transfers.queued[0].queue_id, second_id);
+        assert_eq!(app.file_transfers.queued[0].queue_id(), second_id);
         assert_eq!(app.file_transfers.active_session_id, Some(9001));
     }
 }

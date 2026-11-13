@@ -9571,6 +9571,58 @@ impl QueuedFileTransfer {
     }
 }
 
+/// A native extraction waiting for the same serial file-task slot as copy/move.
+/// The complete selection is frozen at enqueue time; the detached helper and
+/// journal are created only when this entry reaches the front of the FIFO.
+#[derive(Debug, Clone)]
+pub struct QueuedNativeExtraction {
+    pub queue_id: u64,
+    pub job: crate::convert::pipeline::native_extract::NativeExtractionJob,
+}
+
+/// One FIFO for copy, move, and native extraction, without disguising a disc
+/// selection as a filesystem clipboard transfer.
+#[derive(Debug, Clone)]
+pub enum QueuedFileTask {
+    Transfer(QueuedFileTransfer),
+    Extract(QueuedNativeExtraction),
+}
+
+impl From<QueuedFileTransfer> for QueuedFileTask {
+    fn from(transfer: QueuedFileTransfer) -> Self { Self::Transfer(transfer) }
+}
+
+impl QueuedFileTask {
+    pub fn queue_id(&self) -> u64 {
+        match self { Self::Transfer(task) => task.queue_id, Self::Extract(task) => task.queue_id }
+    }
+
+    pub fn transfer(&self) -> Option<&QueuedFileTransfer> {
+        match self { Self::Transfer(task) => Some(task), Self::Extract(_) => None }
+    }
+
+    pub fn is_journal_backed(&self) -> bool {
+        self.transfer().is_some_and(QueuedFileTransfer::is_journal_backed)
+    }
+
+    pub fn summary(&self) -> tui_file_picker::QueuedFileTaskSummary {
+        match self {
+            Self::Transfer(task) => task.summary(),
+            Self::Extract(task) => {
+                let items: usize = task.job.programs.iter().map(|program| program.tracks.len()).sum();
+                tui_file_picker::QueuedFileTaskSummary {
+                    queue_id: task.queue_id,
+                    source_summary: format!("Extract {items} tracks/chapters from {}",
+                        task.job.source.file_name().unwrap_or(task.job.source.as_os_str()).to_string_lossy()),
+                    destination_summary: task.job.destination.display().to_string(),
+                    item_count: items,
+                    recovered: false,
+                }
+            }
+        }
+    }
+}
+
 /// Correlation state for a paste initiated by the metadata artwork picker but
 /// executed by Tonepoet's hardened file-task worker. The picker session id is
 /// stable even if the progress overlay temporarily preempts the editor.
@@ -9584,13 +9636,13 @@ pub struct ArtworkPickerFileTask {
     pub plan: tui_file_picker::PastePlan,
 }
 
-/// App-side serial scheduler and per-job reconciliation registry for Browse
-/// copy/move transfers. The worker layer remains one-helper-per-job; this state
-/// only decides which queued snapshot owns the single active slot.
+/// App-side serial scheduler for copy, move, and native extraction, with
+/// per-job clipboard reconciliation records. Each dispatched job owns its own
+/// worker; this queue only decides who gets the one active file-task slot.
 #[derive(Debug, Default)]
 pub struct FileTransferQueueState {
     pub active_session_id: Option<u64>,
-    pub queued: VecDeque<QueuedFileTransfer>,
+    pub queued: VecDeque<QueuedFileTask>,
     /// Durable crash recoveries discovered at startup. Kept distinct from the
     /// ordinary user queue so discovery never silently changes normal queue
     /// ownership semantics. The scheduler admits these only through the exact
@@ -9609,10 +9661,10 @@ impl FileTransferQueueState {
         // `recovery_queued` is a review queue, not a live transfer queue. Its
         // entries are presented by the dedicated recovery surfaces until the
         // user explicitly resumes one; only then is it promoted into `queued`
-        // and becomes an ordinary runnable transfer row.
+        // and becomes an ordinary runnable file-task row.
         self.queued
             .iter()
-            .map(QueuedFileTransfer::summary)
+            .map(QueuedFileTask::summary)
             .collect()
     }
 

@@ -29,6 +29,7 @@ fn clip(s: &str, width: u16) -> String {
 fn format_bytes(bytes: u64) -> String {
     if bytes >= 1024u64.pow(3) { format!("{:.1} GiB",bytes as f64/1024f64.powi(3)) }
     else if bytes >= 1024u64.pow(2) { format!("{:.1} MiB",bytes as f64/1024f64.powi(2)) }
+    else if bytes >= 1024 { format!("{:.1} KiB", bytes as f64 / 1024.0) }
     else { format!("{bytes} B") }
 }
 
@@ -205,11 +206,14 @@ pub fn draw(
 
 fn draw_header(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect, small: bool, theme: Theme) {
     if r.width == 0 || r.height == 0 { return; }
-    let mut lines = vec![Line::from(Span::styled(clip(&format!("{} · {} · {} · {}",
-        s.contents.album_title.as_deref().unwrap_or(&s.contents.label),
-        s.contents.album_artist.as_deref().unwrap_or("no disc text"),
-        s.contents.genre.as_deref().unwrap_or(""),
-        s.contents.year.as_deref().unwrap_or("")),r.width),
+    // Do not emit empty separators when a disc has no genre or year.
+    let subtitle = [
+        Some(s.contents.album_title.as_deref().unwrap_or(&s.contents.label)),
+        Some(s.contents.album_artist.as_deref().unwrap_or("no disc text")),
+        s.contents.genre.as_deref(), s.contents.year.as_deref(),
+    ].into_iter().flatten().filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>().join(" · ");
+    let mut lines = vec![Line::from(Span::styled(clip(&subtitle, r.width),
         Style::default().fg(theme.value)))];
     if !small && s.contents.format == DiscFormat::Sacd {
         let details = s.contents.presentations.first()
@@ -223,9 +227,23 @@ fn draw_header(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect, small:
     let color = if s.contents.diagnostics.is_empty() { theme.value } else { theme.warning };
     let mut summary = Vec::new();
     if !(small && s.contents.format == DiscFormat::Sacd) {
-        summary.push(Span::styled("Protection  ",Style::default().fg(theme.label)));
-        summary.push(Span::styled(format!("{}    ",s.protection_display()),
-            Style::default().fg(theme.value)));
+        let protection = s.protection_display();
+        // Reserve room for diagnostics and its shortcut, even for a long
+        // CSS/AACS protection description on the compact two-line header.
+        let reserved = if small {
+            "Diagnostics  ".chars().count() + diagnostics.chars().count()
+                + if s.contents.diagnostics.is_empty() { 0 } else { "  · d view".chars().count() }
+                + 2
+        } else { 0 };
+        let available = (r.width as usize).saturating_sub(reserved);
+        if !small || available > "Protection  ".chars().count() {
+            summary.push(Span::styled("Protection  ",Style::default().fg(theme.label)));
+            let value = if small {
+                clip(&protection, available.saturating_sub("Protection  ".len()) as u16)
+            } else { protection };
+            summary.push(Span::styled(format!("{value}  "),
+                Style::default().fg(theme.value)));
+        }
     }
     summary.push(Span::styled("Diagnostics  ",Style::default().fg(theme.label)));
     summary.push(Span::styled(diagnostics,Style::default().fg(color)));
@@ -260,9 +278,10 @@ fn draw_programs(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect, butt
         let first = &s.contents.presentations[group_start];
         let is_title = matches!(s.contents.format, DiscFormat::DvdVideo | DiscFormat::BluRay);
         if is_title {
-            display_rows.push((None, format!("{}  {} · {} chapters",
+            display_rows.push((None, format!("{}  {} · {} {}",
                 header_for(first.id, first, group_start),
-                duration_display(first.total_duration_secs), first.tracks.len()), false, None));
+                duration_display(first.total_duration_secs), first.tracks.len(),
+                if first.tracks.len() == 1 { "chapter" } else { "chapters" }), false, None));
             if first.extract.angle_count > 1 {
                 display_rows.push((None, format!("  {} angles · angle ◂ {} ▸",
                     first.extract.angle_count, s.selected_angle_for(group_start)), false, Some(group_start)));
@@ -278,8 +297,9 @@ fn draw_programs(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect, butt
                     program_info(p, s.contents.format),
                     if role.is_empty() { String::new() } else { format!(" · {role}") })
             } else {
-                format!("{checkmark}  {}  {} · {} tracks",
-                    header_for(p.id,p,i),duration_display(p.total_duration_secs),p.tracks.len())
+                format!("{checkmark}  {}  {} · {} {}",
+                    header_for(p.id,p,i),duration_display(p.total_duration_secs),p.tracks.len(),
+                    if p.tracks.len() == 1 { "track" } else { "tracks" })
             };
             let reason = p.extract.ineligible_reason.as_deref().or_else(||
                 s.probe_statuses.get(i).and_then(|status| status.as_ref())
@@ -608,18 +628,19 @@ fn draw_footer(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,buttons:&mut
     }
     let y=r.y+r.height-1;
     let chips=[("^x Extract",TuiButton::DiscBrowserExtract,can_extract,theme.chip_go),
-        ("c Convert…",TuiButton::DiscBrowserConvert,true,theme.tab_active),
-        ("m … more",TuiButton::DiscBrowserMore,true,theme.warning),
+        ("c Convert",TuiButton::DiscBrowserConvert,true,theme.tab_active),
+        ("m Options",TuiButton::DiscBrowserMore,true,theme.warning),
         ("Esc Close",TuiButton::DiscBrowserClose,true,theme.chip_dismiss)];
-    let length:usize=chips.iter().filter(|(_,_,enabled,_)|*enabled).map(|(txt,_,_,_)|txt.chars().count()+2).sum();
+    let length:usize=chips.iter().map(|(txt,_,_,_)|txt.chars().count()+2).sum();
     let mut x=r.x+r.width.saturating_sub(length as u16)/2;
     for (label,button,enabled,color) in chips {
-        if !enabled {continue;}
         let text=format!(" {label} ");
         let width=text.chars().count() as u16;
         if x+width>r.x+r.width {break;}
-        frame.render_widget(Paragraph::new(text).style(Style::default().bg(color).fg(theme.panel_bg)),Rect::new(x,y,width,1));
-        buttons.record_button(button,Rect::new(x,y,width,1));
+        let style = if enabled { Style::default().bg(color).fg(theme.panel_bg) }
+            else { Style::default().bg(theme.text_dim).fg(theme.panel_bg) };
+        frame.render_widget(Paragraph::new(text).style(style),Rect::new(x,y,width,1));
+        if enabled { buttons.record_button(button,Rect::new(x,y,width,1)); }
         x=x.saturating_add(width);
     }
     let _=s;
@@ -858,6 +879,25 @@ mod extract_r3_render_tests {
                 assert_eq!(joined.contains("d view"),diagnostic,"{joined}");
             }
         }
+    }
+
+    #[test]
+    fn narrow_dialog_preserves_diagnostics_and_readable_metadata() {
+        let mut state = sacd_state(true, false);
+        state.contents.format = DiscFormat::DvdVideo;
+        state.contents.copy_protection.description =
+            "Long CSS protection / region information ".repeat(5);
+        let (header, _) = render_header(&state, 68, true);
+        assert!(header[1].contains("Diagnostics  1"), "{header:?}");
+        assert!(header[1].contains("d view"), "{header:?}");
+        assert!(!header[0].contains("· ·"), "{header:?}");
+        assert_eq!(format_bytes(705_600), "689.1 KiB");
+
+        let single_chapter = chapter_state(1);
+        let (dialog, _) = rendered_lines(&single_chapter, 110, 34);
+        let text = dialog.join("\n");
+        assert!(text.contains("1 chapter"), "{text}");
+        assert!(!text.contains("1 chapters"), "{text}");
     }
 
     #[test]

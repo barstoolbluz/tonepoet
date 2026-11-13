@@ -64,20 +64,46 @@ fn new_progress(app: &AppState, job: &NativeExtractionJob) -> FileTaskProgressSt
     progress
 }
 
-/// Reserve the same single file-task slot used by copy/move. Convert is not
-/// involved in this decision, control channel or scheduling.
+/// Freeze the user's selection and join the same FIFO as clipboard copy/move.
+/// No journal or detached helper is started until the scheduler dispatches it.
+/// Convert has an independent queue and is never involved in this path.
 pub(super) fn launch(
     app: &mut AppState,
     job: NativeExtractionJob,
     tx: &mpsc::Sender<AppMessage>,
 ) -> Result<(), String> {
-    if app.file_transfers.is_busy()
-        || app.minimized_file_task_progress.is_some()
-        || app.file_task_preempted_overlay.is_some()
-    {
-        return Err("Another file task or a transfer awaiting recovery owns the progress slot; finish it before extracting".into());
+    if job.programs.is_empty() || !job.programs.iter().any(|p| !p.tracks.is_empty()) {
+        return Err("Nothing selected for extraction".into());
     }
-    launch_session(app, job, None, tx)
+    let queued = super::app::QueuedNativeExtraction {
+        queue_id: super::app::next_file_transfer_queue_id(),
+        job,
+    };
+    let queue_id = queued.queue_id;
+    app.file_transfers.queued.push_back(super::app::QueuedFileTask::Extract(queued));
+    // Starting or queuing extraction closes its selection dialog, just as
+    // starting a paste returns to Browse. Existing minimized work stays live.
+    if matches!(&app.active_overlay, super::app::ActiveOverlay::DiscBrowser(_)) {
+        app.active_overlay = super::app::ActiveOverlay::None;
+    }
+    app.sync_file_transfer_queue_surfaces();
+    if app.file_transfers.active_session_id.is_none() && !app.file_transfers.blocked_for_attention {
+        super::keybindings::maybe_start_next_file_transfer(app, tx);
+    }
+    if let Some(index) = app.file_transfers.queued.iter().position(|entry| entry.queue_id() == queue_id) {
+        app.set_status(format!("Queued extraction at position {} in the file-task queue", index + 1));
+    }
+    Ok(())
+}
+
+/// Called by the existing file-task FIFO only when its active slot is free.
+pub(super) fn dispatch_queued(
+    app: &mut AppState,
+    job: NativeExtractionJob,
+    tx: &mpsc::Sender<AppMessage>,
+    start_minimized: bool,
+) -> Result<(), String> {
+    launch_session(app, job, None, tx, start_minimized)
 }
 
 /// Called only after a reviewed, ownerless native journal is selected in the
@@ -104,7 +130,7 @@ pub(super) fn resume_from_journal(
     }
     let saved: DurableNativeExtractionTask = serde_json::from_value(record.job)
         .map_err(|error| format!("Decode saved extraction selection: {error}"))?;
-    launch_session(app, saved.native_extraction, Some(journal_path.to_path_buf()), tx)
+    launch_session(app, saved.native_extraction, Some(journal_path.to_path_buf()), tx, false)
 }
 
 fn launch_session(
@@ -112,6 +138,7 @@ fn launch_session(
     job: NativeExtractionJob,
     resume_path: Option<PathBuf>,
     tx: &mpsc::Sender<AppMessage>,
+    start_minimized: bool,
 ) -> Result<(), String> {
     let progress = new_progress(app, &job);
     let (control_tx, control_rx) = std_mpsc::channel();
@@ -124,13 +151,22 @@ fn launch_session(
         dest: job.destination.to_string_lossy().into_owned(),
         native_extraction: job,
     };
+    #[cfg(test)]
+    if let Some(dispatches) = app.test_file_task_dispatches.as_mut() {
+        dispatches.push((session_id, vec![task.native_extraction.source.clone()],
+            vec![task.native_extraction.destination.clone()]));
+        drop(control_rx);
+        app.file_transfers.active_session_id = Some(session_id);
+        app.install_file_task_progress_with_visibility(session, start_minimized);
+        return Ok(());
+    }
     let tx = tx.clone();
     std::thread::Builder::new()
         .name(format!("native-extraction-supervisor-{session_id}"))
         .spawn(move || supervise_detached_extraction(task, resume_path, tx, control_rx))
         .map_err(|error| format!("Start native extraction supervisor: {error}"))?;
     app.file_transfers.active_session_id = Some(session_id);
-    app.install_file_task_progress(session);
+    app.install_file_task_progress_with_visibility(session, start_minimized);
     Ok(())
 }
 
@@ -143,7 +179,7 @@ fn supervisor_failure(tx: &mpsc::Sender<AppMessage>, session_id: u64, error: Str
         AppMessage::NativeExtractComplete { session_id, result: Err(error) });
 }
 
-fn send_to_tui(tx: &mpsc::Sender<AppMessage>, session_id: u64, message: AppMessage) {
+fn send_to_tui(tx: &mpsc::Sender<AppMessage>, _session_id: u64, message: AppMessage) {
     match tx.try_send(message) {
         Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
         Err(mpsc::error::TrySendError::Full(message)) => {
@@ -829,10 +865,6 @@ async fn run_native_extraction(
         result.published = combined;
         Ok::<NativeExtractionReport,String>(result)
     }.await;
-    let progress = match journal.load() {
-        Ok(record) => record,
-        Err(_) => record,
-    };
     let totals = final_totals;
     let lifecycle = if result.is_ok() { DurableFileTaskLifecycle::Completed }
         else { DurableFileTaskLifecycle::AwaitingReconciliation };
@@ -992,6 +1024,140 @@ mod tests {
             transfer_tags: false, tag_source: NativeTagSource::DiscAndSidecar,
             tag_fields: 0x7f, tag_artwork: false,
         }
+    }
+
+    #[test]
+    fn native_extractions_share_fifo_order_with_copy_and_can_be_cancelled_while_queued() {
+        use crate::config::TonepoetConfig;
+        use tui_file_picker::{FilePickerClipboardMode, FilesystemClipboard};
+        let temp = tempfile::tempdir().unwrap();
+        let dest = temp.path().join("destination");
+        std::fs::create_dir_all(&dest).unwrap();
+        let first = temp.path().join("first.flac");
+        let last = temp.path().join("last.flac");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&last, b"last").unwrap();
+        let clipboard = |path: &Path| FilesystemClipboard::new(
+            FilePickerClipboardMode::Copy, vec![path.to_path_buf()],
+        ).unwrap();
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.test_file_task_dispatches = Some(Vec::new());
+        app.file_transfers.active_session_id = Some(9001);
+        app.file_transfers.keep_minimized_across_jobs = true;
+        let (tx, _rx) = mpsc::channel(16);
+        super::super::keybindings::start_filesystem_clipboard_paste(
+            &mut app, clipboard(&first), dest.clone(), &tx);
+        let native = recovery_fixture_job(&dest);
+        let source = native.source.clone();
+        launch(&mut app, native, &tx).unwrap();
+        super::super::keybindings::start_filesystem_clipboard_paste(
+            &mut app, clipboard(&last), dest.clone(), &tx);
+
+        let order = app.file_transfers.queued.iter().map(|entry| entry.queue_id())
+            .collect::<Vec<_>>();
+        assert_eq!(order.len(), 3);
+        assert!(matches!(&app.file_transfers.queued[1], super::super::app::QueuedFileTask::Extract(_)));
+        assert!(app.file_transfers.queued_summaries()[1].source_summary.contains("Extract 2"));
+        assert!(app.test_file_task_dispatches.as_ref().unwrap().is_empty());
+
+        // The previous file task releases its slot; each FIFO successor gets
+        // its own session and the minimized mode remains in force.
+        for expected_source in [&first, &source, &last] {
+            app.file_transfers.active_session_id = None;
+            app.active_overlay = super::super::app::ActiveOverlay::None;
+            super::super::keybindings::maybe_start_next_file_transfer(&mut app, &tx);
+            let dispatches = app.test_file_task_dispatches.as_ref().unwrap();
+            assert_eq!(dispatches.last().unwrap().1, vec![expected_source.to_path_buf()]);
+            assert!(app.minimized_file_task_progress.is_some());
+        }
+        assert!(app.file_transfers.queued.is_empty());
+        assert_eq!(app.test_file_task_dispatches.as_ref().unwrap().len(), 3);
+
+        // Unstarted extraction has no helper, journal, or destination side
+        // effects. Cancelling its row must never cancel the running copy.
+        app.file_transfers.active_session_id = Some(9002);
+        let before = app.test_file_task_dispatches.as_ref().unwrap().len();
+        let pending = recovery_fixture_job(&dest);
+        launch(&mut app, pending, &tx).unwrap();
+        let queue_id = app.file_transfers.queued[0].queue_id();
+        super::super::keybindings::cancel_queued_file_transfer(&mut app, queue_id, &tx);
+        assert!(app.file_transfers.queued.is_empty());
+        assert_eq!(app.file_transfers.active_session_id, Some(9002));
+        assert_eq!(app.test_file_task_dispatches.as_ref().unwrap().len(), before);
+    }
+
+    #[test]
+    fn native_completion_advances_fifo_only_after_success() {
+        use crate::config::TonepoetConfig;
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _rx) = mpsc::channel(16);
+
+        let mut successful = AppState::new_for_test(TonepoetConfig::default());
+        successful.test_file_task_dispatches = Some(Vec::new());
+        launch(&mut successful, recovery_fixture_job(dir.path()), &tx).unwrap();
+        let first_session = successful.file_transfers.active_session_id.unwrap();
+        launch(&mut successful, recovery_fixture_job(dir.path()), &tx).unwrap();
+        assert_eq!(successful.file_transfers.queued.len(), 1);
+        super::super::event_loop::handle_message(
+            &mut successful,
+            AppMessage::NativeExtractComplete {
+                session_id: first_session,
+                result: Ok(NativeExtractionReport { published: vec![], skipped: 0 }),
+            },
+            &tx,
+        );
+        assert!(successful.file_transfers.queued.is_empty());
+        assert_ne!(successful.file_transfers.active_session_id, Some(first_session));
+        assert_eq!(successful.test_file_task_dispatches.as_ref().unwrap().len(), 2);
+        assert!(!successful.file_transfers.blocked_for_attention);
+
+        // A failed helper must not launch another queued extraction behind
+        // the user's back. Copy/move use the same attention barrier.
+        let mut interrupted = AppState::new_for_test(TonepoetConfig::default());
+        interrupted.test_file_task_dispatches = Some(Vec::new());
+        launch(&mut interrupted, recovery_fixture_job(dir.path()), &tx).unwrap();
+        let failed_session = interrupted.file_transfers.active_session_id.unwrap();
+        launch(&mut interrupted, recovery_fixture_job(dir.path()), &tx).unwrap();
+        super::super::event_loop::handle_message(
+            &mut interrupted,
+            AppMessage::NativeExtractComplete {
+                session_id: failed_session,
+                result: Err("worker stopped".into()),
+            },
+            &tx,
+        );
+        assert!(interrupted.file_transfers.blocked_for_attention);
+        assert_eq!(interrupted.file_transfers.active_session_id, None);
+        assert_eq!(interrupted.file_transfers.queued.len(), 1);
+        assert_eq!(interrupted.test_file_task_dispatches.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn queued_native_jobs_are_snapshots_and_do_not_enter_convert_queue() {
+        use crate::config::TonepoetConfig;
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.file_transfers.active_session_id = Some(42);
+        let (tx, _rx) = mpsc::channel(8);
+        let conversion_queue_before = app.manager.queue.try_read().unwrap().all_items().len();
+        let mut original = recovery_fixture_job(dir.path());
+        launch(&mut app, original.clone(), &tx).unwrap();
+        original.destination = dir.path().join("new destination");
+        launch(&mut app, original, &tx).unwrap();
+        assert_eq!(app.file_transfers.queued.len(), 2);
+        let first_dest = match &app.file_transfers.queued[0] {
+            super::super::app::QueuedFileTask::Extract(task) => &task.job.destination,
+            _ => panic!("first job must be an extraction"),
+        };
+        assert_eq!(first_dest.as_path(), dir.path());
+        let second_dest = match &app.file_transfers.queued[1] {
+            super::super::app::QueuedFileTask::Extract(task) => &task.job.destination,
+            _ => panic!("second job must be an extraction"),
+        };
+        assert_eq!(second_dest, &dir.path().join("new destination"));
+        assert_eq!(app.manager.queue.try_read().unwrap().all_items().len(),
+            conversion_queue_before, "native extraction must not enter Convert");
     }
 
     #[test]

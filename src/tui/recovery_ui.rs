@@ -682,7 +682,7 @@ fn queued_recovery_journal(job: &QueuedFileTransfer) -> Option<&Path> {
 
 fn recovery_is_already_runnable_or_active(app: &AppState, journal_path: &Path) -> bool {
     app.file_transfers.queued.iter().any(|job| {
-        queued_recovery_journal(job) == Some(journal_path)
+        job.transfer().and_then(queued_recovery_journal) == Some(journal_path)
     }) || app.file_transfers.pending_by_session.values().any(|pending| {
         pending
             .retry_plan
@@ -1097,7 +1097,7 @@ pub fn refresh_from_runtime(app: &mut AppState) {
         .file_transfers
         .queued
         .iter()
-        .filter_map(queued_recovery_journal)
+        .filter_map(|job| job.transfer().and_then(queued_recovery_journal))
         .chain(app.file_transfers.pending_by_session.values().filter_map(|pending| {
             pending
                 .retry_plan
@@ -1109,8 +1109,9 @@ pub fn refresh_from_runtime(app: &mut AppState) {
     for entry in &mut app.recovery_ui.entries {
         entry.resume_committed = resume_committed.contains(&entry.journal_path);
         entry.approved_resume_queue_id = app.file_transfers.queued.iter()
-            .find(|job| queued_recovery_journal(job) == Some(entry.journal_path.as_path()))
-            .map(|job| job.queue_id);
+            .find(|job| job.transfer().and_then(queued_recovery_journal)
+                == Some(entry.journal_path.as_path()))
+            .map(|job| job.queue_id());
     }
 }
 
@@ -4396,7 +4397,7 @@ mod tests {
         app.file_transfers.queued.push_back(QueuedFileTransfer {
             queue_id: 88, clipboard, clipboard_owner_generation: None,
             destination_dir: dest, enqueue_plan: plan, retry_plan: Some(retry), recovered: true,
-        });
+        }.into());
         app.recovery_ui.entries.push(entry);
         app.recovery_ui.focus = 0;
         let (tx, _rx) = mpsc::channel(8);

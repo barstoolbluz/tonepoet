@@ -2505,6 +2505,8 @@ mod disc_selection_bridge_tests {
             PresentationId::SacdArea(SacdAreaId::MultiChannel), "DSD Multichannel");
         let mut state = DiscBrowserState::new(contents, "disc.iso".into());
         state.file_per_program = true;
+        state.tags = false;
+        state.tag_artwork = false;
         let needed = state.required_native_volume_bytes(10 * GIB, GIB, 10 * GIB);
         assert!(needed <= 25 * GIB, "25 GiB must admit continuous 10 GiB SACD");
         assert!(needed > 19 * GIB, "19 GiB must block continuous 10 GiB SACD");
@@ -2533,6 +2535,8 @@ mod disc_selection_bridge_tests {
         }).collect();
         state.items_checked[0] = vec![true; 4];
         state.file_per_program = false;
+        state.tags = false;
+        state.tag_artwork = false;
         let (total, largest, largest_program) = state.selected_item_bytes().unwrap();
         assert_eq!(total, 2_540_160_000); // Four 15-minute stereo DSD64 tracks.
         assert_eq!(largest * 4, total);
@@ -2553,6 +2557,14 @@ mod disc_selection_bridge_tests {
         let (dest_needed, scratch_needed) = state.native_split_volume_bytes(true).unwrap();
         assert_eq!(dest_needed, total + 4 * 128 * 1024);
         assert_eq!(scratch_needed, total * 2 + 4 * 128 * 1024);
+        // The estimator must still reserve additional space for the actual
+        // default DSF tag/cover workflow. Audio-only assertions above are
+        // explicitly opt-out; this is not a request to reduce the budget.
+        let audio_only = state.native_required_volume_bytes(true).unwrap();
+        state.tags = true;
+        state.tag_artwork = true;
+        let with_tags = state.native_required_volume_bytes(true).unwrap();
+        assert!(with_tags > audio_only, "default DSF tags must add capacity");
     }
 
     #[test]
