@@ -1,11 +1,11 @@
 //! Native disc extraction, separate from the Convert DSP/encoder pipeline.
 //!
 //! Materializers resolve the authored track/chapter, realizers decode its
-//! carrier into a private WAV, and only a *completed* final file is renamed into
-//! the destination. No conversion settings, ReplayGain, resampler, DSP effect,
-//! or lossy encoder is involved. Private staging is on the destination volume,
-//! outside the chosen destination directory, so publication is atomic even on
-//! filesystems without hard-link support.
+//! carrier into a private WAV, and only a *completed* final file is published
+//! into the destination. No conversion settings, ReplayGain, resampler, DSP
+//! effect, or lossy encoder is involved. All staging stays in TonePoet's cache
+//! or the configured scratch directory; cross-volume publication copies through
+//! a cleaned-up temporary file at the final target before atomic rename.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use serde::{Deserialize, Serialize};
@@ -182,7 +182,7 @@ pub async fn probe_selected_sources(
                 if !seen_dvd_titles.insert((vts_number, title_number)) { continue; }
             }
         }
-        let mut request = materializer_request(&job, program, index);
+        let mut request = materializer_request(&job, program, index)?;
         let number = program.tracks.first().ok_or("Program has no probeable chapter")?.number;
         request.source.track_selection = TrackSelection::Set(BTreeSet::from([number]));
         let materializer: Box<dyn Materializer> = match job.format {
@@ -218,10 +218,10 @@ async fn execute_inner(
     mut on_progress: impl FnMut(NativeExtractionProgress),
 ) -> Result<NativeExtractionReport, String> {
     validate_job(&job)?;
-    // Reject an overlapping scratch path before creating any directory.
-    // An invalid scratch setting must never leave a new directory under the
-    // user's chosen destination, even if extraction produces zero files.
-    let work_path = target_volume_working_root(&job.working_root, &job.destination)?;
+    // Reject overlapping scratch before creating anything in working storage.
+    // Older persisted jobs may contain the R5 implicit destination-sibling
+    // staging path. Move that obsolete default to TonePoet's cache too.
+    let work_path = native_working_storage(&job.working_root, &job.destination)?;
     fs::create_dir_all(&work_path).map_err(|e| format!("Working storage: {e}"))?;
     let temporary = tempfile::Builder::new()
         .prefix("tonepoet-extract-")
@@ -235,17 +235,6 @@ async fn execute_inner(
     let mut published = Vec::new();
     let mut reserved_names = HashSet::new();
 
-    // No part of a requested file is written under the destination. Check
-    // filesystem topology before the first decode is started.
-    let work_dev = fs::metadata(temporary.path())
-        .map_err(|e| format!("Cannot inspect working storage: {e}"))?;
-    let destination_ancestor = nearest_existing_ancestor(&job.destination)?;
-    let dest_dev = fs::metadata(destination_ancestor)
-        .map_err(|e| format!("Cannot inspect destination filesystem: {e}"))?;
-    if !same_filesystem(&work_dev, &dest_dev) {
-        return Err("Cannot stage on the destination filesystem; no files were published".into());
-    }
-
     for (pi, program) in job.programs.iter().enumerate() {
         if cancel.is_cancelled() { return Err("Extraction cancelled".into()); }
         let grouped_target = proposed_destination_for_program(&job, program);
@@ -256,7 +245,7 @@ async fn execute_inner(
             continue;
         }
         let mut grouped_outputs: Vec<(u32, PathBuf, String)> = Vec::new();
-        let mut req = materializer_request(&job, program, pi);
+        let mut req = materializer_request(&job, program, pi)?;
         let selection: BTreeSet<u32> = program.tracks.iter().map(|track| track.number).collect();
         req.source.track_selection = TrackSelection::Set(selection);
         let materializer: Box<dyn Materializer> = match job.format {
@@ -436,9 +425,10 @@ async fn execute_inner(
     Ok(NativeExtractionReport { published })
 }
 
-/// Publish only completed private artifacts. Staging and destination share a
-/// filesystem; rename makes the completed data visible without copying
-/// partially written data into the user-visible output directory.
+/// Publish only completed private artifacts. On a different filesystem the
+/// shared Convert publisher copies through a disposable file in the target
+/// directory and atomically renames it only after flushing the complete data.
+/// A failed copy never exposes a partial result at the requested filename.
 fn publish_finished_file(job: &NativeExtractionJob, complete: &Path, target: &Path) -> Result<(), String> {
     if job.overwrite_policy != NativeOverwritePolicy::Replace && fs::symlink_metadata(target).is_ok() {
         return Err(format!("Destination already exists: '{}'",target.display()));
@@ -447,7 +437,7 @@ fn publish_finished_file(job: &NativeExtractionJob, complete: &Path, target: &Pa
     let parent_existed = parent.exists();
     let root_existed = job.destination.exists();
     fs::create_dir_all(parent).map_err(|e|format!("Cannot create destination parent: {e}"))?;
-    if let Err(error) = fs::rename(complete, target) {
+    if let Err(error) = super::transactional_state::publish_validated_to_final(complete, target) {
         if !parent_existed { let _ = fs::remove_dir(parent); }
         if !root_existed { let _ = fs::remove_dir(&job.destination); }
         return Err(format!("Cannot publish complete file '{}': {error}", target.display()));
@@ -734,7 +724,16 @@ fn inspect_publication_target(job: &NativeExtractionJob, planned: &mut HashSet<P
     }
 }
 
-fn materializer_request(job: &NativeExtractionJob, program: &NativeProgramChoice, index: usize) -> PipelineRequest {
+/// Native extraction has no DSP contract; this conversion-options projection
+/// supplies a typed compatibility request for existing materializer/queue
+/// interfaces, not a silently invented PipelineSettings default.
+pub(crate) fn native_compatibility_settings() -> Result<tonepoet_pipeline::PipelineSettings, String> {
+    let options = crate::convert::formats::ConversionOptions::default();
+    super::unified_request::pipeline_settings_from_legacy_options(&options)
+        .map_err(|error| format!("Native compatibility settings: {error}"))
+}
+
+fn materializer_request(job: &NativeExtractionJob, program: &NativeProgramChoice, index: usize) -> Result<PipelineRequest, String> {
     let mut source = SourceOptions {
         archive_password: None, sacd_area: None, dvda_group: None,
         dvda_group_selection: DvdaGroupSelection::Default,
@@ -753,11 +752,11 @@ fn materializer_request(job: &NativeExtractionJob, program: &NativeProgramChoice
             _ => {},
         }
     }
-    PipelineRequest {
+    Ok(PipelineRequest {
         job_id: format!("native-extract-{}", std::process::id()), item_id: format!("program-{index}"),
         submission_id: None, submission_size: None,
         container: job.source.clone(), source,
-        settings: tonepoet_pipeline::PipelineSettings::default(),
+        settings: native_compatibility_settings()?,
         registered_effects: Vec::new(),
         deemphasis_choice_origin: Default::default(), deemphasis_evidence_origin: Default::default(),
         worker_count: Some(1), scratch_staging: None, merge: false,
@@ -765,7 +764,7 @@ fn materializer_request(job: &NativeExtractionJob, program: &NativeProgramChoice
         naming: NamingPolicy { template: "%NN% - %TITLE%".into(), folder_template: None,
             per_album_subdir: false, collision_policy: NamingCollisionPolicy::Fail, windows_portable: false },
         publish: PublishPolicy { overwrite: OverwritePolicy::FailIfExists,
-            same_filesystem_required: true, write_manifest: false },
+            same_filesystem_required: false, write_manifest: false },
         log: LogPolicy { root: job.working_root.clone(), write_for_blocked: false,
             write_json_log: false, write_conversion_log: false },
         stages: StagePolicy { metadata: StageRequirement::Disabled,
@@ -776,7 +775,7 @@ fn materializer_request(job: &NativeExtractionJob, program: &NativeProgramChoice
         batch_resolved_identity: None, suppress_incremental_conversion_log_append: false,
         expected_album_track_count: None, container_extension: None, container_ffmpeg_flags: Vec::new(),
         companion: CompanionCopyPolicy::default(), actions: ActionPipeline::default(),
-    }
+    })
 }
 
 fn extract_sacd_native(src: &TrackSourceRef, output: &Path, keep_dst: bool, cancel: &CancellationToken) -> Result<(), String> {
@@ -981,31 +980,30 @@ fn resolved_future_path(path: &Path) -> Result<PathBuf, String> {
     Ok(result)
 }
 
-/// Choose private staging outside the requested output directory, on the
-/// destination filesystem. An explicitly configured scratch directory is
-/// preferred when suitable. Otherwise use a private sibling on that volume.
-/// A scratch directory *inside* output is a configuration error, not a fallback.
-fn target_volume_working_root(configured: &Path, destination: &Path) -> Result<PathBuf, String> {
+/// The default is a dedicated TonePoet cache directory, never an implicit
+/// destination sibling. The system temporary directory is only a last resort
+/// on platforms that expose neither an application cache nor a data directory.
+pub(crate) fn default_native_working_root() -> PathBuf {
+    dirs::cache_dir().or_else(dirs::data_local_dir)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("tonepoet").join("native-extraction")
+}
+
+/// Validate a job's working root before creating its per-job TempDir. Historical
+/// R5 queued jobs used this implicit sibling path: migrate those to the cache
+/// instead of perpetuating that old default on resume.
+pub(crate) fn native_working_storage(configured: &Path, destination: &Path) -> Result<PathBuf, String> {
     let dest_path = resolved_future_path(destination)?;
-    let configured_path = resolved_future_path(configured)?;
+    let obsolete_default = configured.file_name().is_some_and(|name| name == ".tonepoet-native-extraction-work")
+        && configured.parent().is_some_and(|parent|
+            resolved_future_path(parent).is_ok_and(|parent| dest_path.starts_with(parent)));
+    let configured = if obsolete_default { default_native_working_root() }
+        else { configured.to_path_buf() };
+    let configured_path = resolved_future_path(&configured)?;
     if configured_path.starts_with(&dest_path) {
         return Err("Working storage is within the destination. Choose working storage outside the destination before extracting.".into());
     }
-    let dest_ancestor = nearest_existing_ancestor(destination)?;
-    let dest_dev = fs::metadata(dest_ancestor).map_err(|e| format!("Destination filesystem: {e}"))?;
-    let scratch_dev = fs::metadata(nearest_existing_ancestor(configured)?)
-        .map_err(|e| format!("Working filesystem: {e}"))?;
-    if same_filesystem(&dest_dev, &scratch_dev) { return Ok(configured.to_path_buf()); }
-    let parent = dest_path.parent().ok_or("Destination has no parent for private staging")?;
-    let sibling = parent.join(".tonepoet-native-extraction-work");
-    // The destination itself might be a filesystem mount root, in which case
-    // there is no out-of-destination sibling on the same volume.
-    let sibling_dev = fs::metadata(nearest_existing_ancestor(&sibling)?)
-        .map_err(|e| format!("Destination sibling filesystem: {e}"))?;
-    if !same_filesystem(&dest_dev, &sibling_dev) {
-        return Err("No out-of-destination working directory on the target filesystem".into());
-    }
-    Ok(sibling)
+    Ok(configured)
 }
 
 fn nearest_existing_ancestor(path: &Path) -> Result<&Path, String> {
@@ -1016,17 +1014,175 @@ fn nearest_existing_ancestor(path: &Path) -> Result<&Path, String> {
     }
 }
 
-#[cfg(unix)]
-fn same_filesystem(a: &fs::Metadata, b: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    a.dev() == b.dev()
-}
-#[cfg(not(unix))]
-fn same_filesystem(_a: &fs::Metadata, _b: &fs::Metadata) -> bool { true }
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture_job(destination: &Path, scratch: &Path) -> NativeExtractionJob {
+        NativeExtractionJob {
+            source: std::env::current_exe().unwrap(),
+            format: DiscFormat::Sacd,
+            programs: vec![NativeProgramChoice {
+                id: PresentationId::SacdArea(crate::disc::SacdAreaId::Stereo),
+                angle: 1, label: "Stereo".into(),
+                tracks: vec![NativeTrackChoice { number: 1, name: "one".into(),
+                    tags: NativeTagValues::default() }],
+                keep_dst: false, source_depth: Some(1), source_channels: Some(2),
+                source_rate: Some(2_822_400), source_layout: None, is_lossless: true,
+                tags: NativeTagValues::default(),
+            }],
+            destination: destination.to_path_buf(), working_root: scratch.to_path_buf(),
+            wav_container: NativeWavContainer::Automatic, assume_decrypted: false,
+            downmix: DvdaDownmixPolicy::None, naming_template: default_naming_template(),
+            program_subfolders: true, overwrite_policy: NativeOverwritePolicy::Fail,
+            extraction_log: false, file_per_program: false, cue: false,
+            transfer_tags: false, tag_source: default_tag_source(),
+            tag_fields: default_tag_fields(), tag_artwork: false,
+        }
+    }
+
+    /// Include hidden entries and every nested directory. An inventory that
+    /// looks only at final filenames would miss the old sibling work folder.
+    fn path_inventory(root: &Path) -> BTreeSet<String> {
+        fn walk(root: &Path, dir: &Path, out: &mut BTreeSet<String>) {
+            for entry in fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let name = path.strip_prefix(root).unwrap().to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/");
+                if entry.file_type().unwrap().is_dir() {
+                    out.insert(format!("{name}/"));
+                    walk(root, &path, out);
+                } else {
+                    out.insert(name);
+                }
+            }
+        }
+        let mut inventory = BTreeSet::new();
+        walk(root, root, &mut inventory);
+        inventory
+    }
+
+    #[test]
+    fn native_materializer_settings_are_built_by_the_typed_legacy_bridge() {
+        let settings = native_compatibility_settings().unwrap();
+        settings.validate().unwrap();
+    }
+
+    #[test]
+    fn default_native_staging_and_persisted_r5_job_use_cache_not_music_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("music/album");
+        let old_root = temp.path().join(".tonepoet-native-extraction-work");
+        let fallback = default_native_working_root();
+        assert!(fallback.ends_with(Path::new("tonepoet/native-extraction")));
+        assert_eq!(native_working_storage(&old_root, &destination).unwrap(), fallback);
+        let custom = temp.path().join("custom-scratch");
+        assert_eq!(native_working_storage(&custom, &destination).unwrap(), custom);
+        assert!(path_inventory(temp.path()).is_empty(), "path preflight must be side-effect free");
+    }
+
+    #[test]
+    fn completed_publish_has_exact_destination_and_parent_inventory() {
+        let temp = tempfile::tempdir().unwrap();
+        let scratch = temp.path().join("scratch");
+        fs::create_dir(&scratch).unwrap();
+        let destination = temp.path().join("music");
+        let job = fixture_job(&destination, &scratch);
+        {
+            let staging = tempfile::tempdir_in(&scratch).unwrap();
+            let complete = staging.path().join("complete.dsf");
+            fs::write(&complete, b"validated native payload").unwrap();
+            publish_finished_file(&job, &complete, &destination.join("track.dsf")).unwrap();
+            assert_eq!(fs::read(destination.join("track.dsf")).unwrap(), b"validated native payload");
+            assert!(!complete.exists());
+        }
+        assert_eq!(path_inventory(temp.path()), BTreeSet::from([
+            "scratch/".to_string(), "music/".to_string(), "music/track.dsf".to_string(),
+        ]));
+    }
+
+    #[test]
+    fn failed_publish_removes_staging_and_does_not_change_destination_inventory() {
+        let temp = tempfile::tempdir().unwrap();
+        let scratch = temp.path().join("scratch");
+        let destination = temp.path().join("music");
+        let existing_directory = destination.join("reserved");
+        fs::create_dir_all(&scratch).unwrap();
+        fs::create_dir_all(&existing_directory).unwrap();
+        let before = path_inventory(temp.path());
+        let mut job = fixture_job(&destination, &scratch);
+        job.overwrite_policy = NativeOverwritePolicy::Replace;
+        {
+            let staging = tempfile::tempdir_in(&scratch).unwrap();
+            let complete = staging.path().join("complete.dsf");
+            fs::write(&complete, b"validated native payload").unwrap();
+            assert!(publish_finished_file(&job, &complete, &existing_directory).is_err());
+        }
+        assert_eq!(path_inventory(temp.path()), before);
+    }
+
+    #[tokio::test]
+    async fn cancelled_and_failed_extractions_leave_destination_and_parent_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let scratch = temp.path().join("scratch");
+        fs::create_dir(&scratch).unwrap();
+        let destination = temp.path().join("music");
+        let job = fixture_job(&destination, &scratch);
+        let before = path_inventory(temp.path());
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let err = execute(job.clone(), cancelled, |_| {}).await.unwrap_err();
+        assert!(err.contains("cancelled"), "{err}");
+        assert_eq!(path_inventory(temp.path()), before);
+
+        // A real media failure occurs after the worker owns a TempDir, not
+        // just in validate_job(). Our executable is not a valid SACD ISO.
+        assert!(execute(job, CancellationToken::new(), |_| {}).await.is_err());
+        assert_eq!(path_inventory(temp.path()), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cross_volume_publication_cleans_success_and_failed_copy_temp_files() {
+        use std::os::unix::fs::MetadataExt;
+        let destination_root = tempfile::tempdir().unwrap();
+        let Ok(scratch) = tempfile::Builder::new()
+            .prefix("tonepoet-extract-cross-device-").tempdir_in("/dev/shm") else {
+            return; // Not all Unix hosts mount a writable, separate /dev/shm.
+        };
+        if fs::metadata(destination_root.path()).unwrap().dev()
+            == fs::metadata(scratch.path()).unwrap().dev() { return; }
+        let destination = destination_root.path().join("music");
+        let mut job = fixture_job(&destination, scratch.path());
+        {
+            let staging = tempfile::tempdir_in(scratch.path()).unwrap();
+            let complete = staging.path().join("complete.dsf");
+            fs::write(&complete, b"validated native payload").unwrap();
+            publish_finished_file(&job, &complete, &destination.join("track.dsf")).unwrap();
+            assert_eq!(fs::read(destination.join("track.dsf")).unwrap(), b"validated native payload");
+        }
+        assert_eq!(path_inventory(destination_root.path()), BTreeSet::from([
+            "music/".to_string(), "music/track.dsf".to_string(),
+        ]));
+        assert!(path_inventory(scratch.path()).is_empty());
+
+        // EXDEV copying succeeds, but the atomic rename cannot replace a
+        // directory. Its private destination-side copy must be removed.
+        let reserved = destination.join("reserved");
+        fs::create_dir(&reserved).unwrap();
+        let before = path_inventory(destination_root.path());
+        job.overwrite_policy = NativeOverwritePolicy::Replace;
+        {
+            let staging = tempfile::tempdir_in(scratch.path()).unwrap();
+            let complete = staging.path().join("complete.dsf");
+            fs::write(&complete, b"validated native payload").unwrap();
+            assert!(publish_finished_file(&job, &complete, &reserved).is_err());
+        }
+        assert_eq!(path_inventory(destination_root.path()), before);
+        assert!(path_inventory(scratch.path()).is_empty());
+    }
 
     #[test]
     fn large_dsf_cover_then_text_stays_in_place_and_preserves_audio() {

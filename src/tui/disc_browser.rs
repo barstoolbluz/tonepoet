@@ -236,7 +236,12 @@ struct NativeSpaceKey {
 #[derive(Debug, Clone)]
 struct NativeSpaceCache {
     key: NativeSpaceKey,
+    /// Shared-volume peak, retaining the existing sequential/replace budget.
     required: u64,
+    /// Independent peaks when private working storage and output are on
+    /// different volumes. No scratch bytes are charged to the destination.
+    working_required: u64,
+    destination_required: u64,
 }
 
 /// Modal overlay state for browsing the presentations on one disc source.
@@ -532,8 +537,7 @@ impl DiscBrowserState {
         Some((total, largest, largest_program))
     }
 
-    /// Extra work files are on the destination filesystem, including when an
-    /// alternate configured scratch location lives on a different volume.
+    /// Combined peak for staging and publication on a shared filesystem.
     /// For continuous PCM, retain chapter outputs, the full raw concatenation
     /// spool, and the final container, plus the largest decoded carrier.
     /// SACD has no decoded WAV carrier. Separate tracks are published one at
@@ -602,8 +606,9 @@ impl DiscBrowserState {
         })
     }
 
-    /// Capacity needed on the actual staging/destination filesystem. Skip
-    /// excludes targets the worker will leave untouched. Replace budgets the
+    /// Budget for a shared filesystem; the same cached inventory also
+    /// produces separate working/destination budgets for cross-volume output.
+    /// Skip excludes untouched targets. Replace budgets the
     /// peak of sequential private outputs, net of previously replaced files,
     /// rather than requiring a second copy of every existing destination.
     /// Cached results avoid directory scans on every redraw. The launch action
@@ -689,8 +694,58 @@ impl DiscBrowserState {
         let extras = (if key.extraction_log { 128 * 1024 } else { 0 })
             + (if key.cue { (active.len() as u64).saturating_mul(128 * 1024) } else { 0 });
         let required = required.saturating_add(extras).saturating_add(tail_journal);
-        *self.native_space_cache.borrow_mut() = Some(NativeSpaceCache { key, required });
+
+        // With a separate scratch volume, completed files are published one
+        // at a time. Scratch holds the private output and its intermediates;
+        // destination holds only the net published media. During a replacement
+        // the old destination remains allocated until the atomic rename, so
+        // charge the full new output *before* subtracting the old allocation.
+        let mut destination_delta: i128 = 0;
+        let mut destination_peak: i128 = 0;
+        let mut retained_parts = 0u64;
+        let mut working_peak = 0u64;
+        for (output, existing, extra) in &active {
+            let overhead = (output.item_count as u64).saturating_mul(128 * 1024);
+            let final_bytes = output.audio_bytes.saturating_add(*extra).saturating_add(overhead);
+            destination_peak = destination_peak.max(destination_delta + i128::from(final_bytes));
+            destination_delta += i128::from(final_bytes) - i128::from(existing.unwrap_or(0));
+            destination_peak = destination_peak.max(destination_delta);
+
+            let work = if key.format == DiscFormat::Sacd {
+                final_bytes.saturating_add(if key.continuous { output.audio_bytes } else { 0 })
+            } else if key.continuous {
+                final_bytes.saturating_add(output.audio_bytes.saturating_mul(2))
+                    .saturating_add(output.largest_item.saturating_mul(3))
+            } else {
+                final_bytes.saturating_add(output.largest_item.saturating_mul(3))
+            };
+            let journal = if key.artwork && output.taggable_dsf { *extra } else { 0 };
+            working_peak = working_peak.max(retained_parts.saturating_add(work).saturating_add(journal));
+            if key.continuous { retained_parts = retained_parts.saturating_add(output.audio_bytes); }
+            working_peak = working_peak.max(retained_parts);
+        }
+        let destination_required = destination_peak.max(0).min(i128::from(u64::MAX)) as u64;
+        let destination_required = destination_required.saturating_add(extras);
+        let working_required = working_peak.saturating_add(extras);
+        *self.native_space_cache.borrow_mut() = Some(NativeSpaceCache {
+            key, required, working_required, destination_required,
+        });
         Some(required)
+    }
+
+    /// Required free bytes on (destination, scratch) when the volumes differ.
+    /// The same inventory/cache as the shared-volume estimator is used.
+    pub(crate) fn native_split_volume_bytes(&self, refresh: bool) -> Option<(u64, u64)> {
+        self.native_required_volume_bytes(refresh)?;
+        self.native_space_cache.borrow().as_ref()
+            .map(|cache| (cache.destination_required, cache.working_required))
+    }
+
+    pub(crate) fn native_storage_shares_destination_volume(&self, scratch: &Path) -> bool {
+        match (existing_ancestor(&self.destination), existing_ancestor(scratch)) {
+            (Ok(destination), Ok(working)) => same_filesystem_paths(destination, working),
+            _ => false,
+        }
     }
 
     pub fn shared_program(&self, left: usize, right: usize) -> bool {
@@ -861,20 +916,49 @@ impl DiscBrowserState {
         }
         if !self.destination.is_absolute() || !scratch.is_absolute() {
             problems.push("Choose an absolute destination and working-storage path".into());
+        } else if refresh {
+            // Launch-time validation uses the worker's canonical path check;
+            // redraws do not repeat this filesystem walk.
+            if let Err(error) = crate::convert::pipeline::native_extract::native_working_storage(
+                scratch, &self.destination)
+            {
+                problems.push(error);
+            }
         }
         if self.selected_item_count() != 0 {
             if let Some((total, largest, largest_program)) = self.selected_item_bytes() {
-                // The worker's private fallback staging is on the destination
-                // volume, even when configured scratch is on another device.
-                if let Ok(ancestor) = existing_ancestor(&self.destination) {
-                    if let Ok(free) = fs2::available_space(ancestor) {
-                        let needed = self.native_required_volume_bytes(refresh)
-                            .unwrap_or_else(||self.required_native_volume_bytes(total, largest, largest_program));
-                        if free < needed {
-                            problems.push(format!("Destination filesystem needs {}, has {}",
-                                bytes_display(needed), bytes_display(free)));
+                let destination_ancestor = existing_ancestor(&self.destination);
+                let scratch_ancestor = existing_ancestor(scratch);
+                if let (Ok(destination_ancestor), Ok(scratch_ancestor)) =
+                    (&destination_ancestor, &scratch_ancestor)
+                {
+                    if same_filesystem_paths(destination_ancestor, scratch_ancestor) {
+                        if let Ok(free) = fs2::available_space(destination_ancestor) {
+                            let needed = self.native_required_volume_bytes(refresh)
+                                .unwrap_or_else(||self.required_native_volume_bytes(total, largest, largest_program));
+                            if free < needed {
+                                problems.push(format!("Destination/working filesystem needs {}, has {}",
+                                    bytes_display(needed), bytes_display(free)));
+                            }
+                        }
+                    } else if let Some((destination_needed, working_needed)) =
+                        self.native_split_volume_bytes(refresh)
+                    {
+                        if let Ok(free) = fs2::available_space(destination_ancestor) {
+                            if free < destination_needed {
+                                problems.push(format!("Destination filesystem needs {}, has {}",
+                                    bytes_display(destination_needed), bytes_display(free)));
+                            }
+                        }
+                        if let Ok(free) = fs2::available_space(scratch_ancestor) {
+                            if free < working_needed {
+                                problems.push(format!("Working filesystem needs {}, has {}",
+                                    bytes_display(working_needed), bytes_display(free)));
+                            }
                         }
                     }
+                } else if refresh {
+                    problems.push("Cannot inspect destination or working-storage filesystem".into());
                 }
             } else {
                 problems.push("Source size pending: selected duration/rate/depth is not yet known".into());
@@ -972,10 +1056,139 @@ fn existing_ancestor(path: &Path) -> Result<&Path, String> {
 #[cfg(unix)]
 fn same_filesystem_paths(a: &Path, b: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
-    match (fs::metadata(a),fs::metadata(b)) { (Ok(a),Ok(b)) => a.dev()==b.dev(), _ => false }
+    match (fs::metadata(a), fs::metadata(b)) { (Ok(a), Ok(b)) => a.dev() == b.dev(), _ => false }
 }
-#[cfg(not(unix))]
-fn same_filesystem_paths(_a: &Path, _b: &Path) -> bool { true }
+#[cfg(windows)]
+fn same_filesystem_paths(a: &Path, b: &Path) -> bool {
+    // GetFileInformationByHandle accepts directory handles opened with
+    // FILE_FLAG_BACKUP_SEMANTICS. Neither that flag nor access_mode(0)
+    // requires nightly Rust or read permission on the directory contents.
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_ID_INFO_CLASS: i32 = 0x12;
+    #[repr(C)]
+    struct ByHandleFileInfo {
+        _attributes: u32,
+        _creation_time: [u32; 2],
+        _access_time: [u32; 2],
+        _write_time: [u32; 2],
+        volume_serial: u32,
+        _size_high: u32,
+        _size_low: u32,
+        _links: u32,
+        _index_high: u32,
+        _index_low: u32,
+    }
+    #[repr(C)]
+    struct FileIdInfo {
+        volume_serial: u64,
+        _file_id: [u8; 16],
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileInformationByHandle(
+            handle: *mut std::ffi::c_void,
+            info: *mut ByHandleFileInfo,
+        ) -> i32;
+        fn GetFileInformationByHandleEx(
+            handle: *mut std::ffi::c_void,
+            class: i32,
+            info: *mut std::ffi::c_void,
+            size: u32,
+        ) -> i32;
+    }
+
+    fn volume_identity(path: &Path) -> Option<(u32, Option<u64>)> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        let dir = fs::OpenOptions::new()
+            .access_mode(0)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path).ok()?;
+        let handle = dir.as_raw_handle();
+        let mut basic = std::mem::MaybeUninit::<ByHandleFileInfo>::uninit();
+        if unsafe { GetFileInformationByHandle(handle, basic.as_mut_ptr()) } == 0 {
+            return None;
+        }
+        let serial = unsafe { basic.assume_init() }.volume_serial;
+        // Modern filesystems provide a 64-bit volume identity. The 32-bit
+        // API remains the fallback for FAT and older/network filesystems.
+        let mut extended = std::mem::MaybeUninit::<FileIdInfo>::uninit();
+        let extended_serial = (unsafe {
+            GetFileInformationByHandleEx(
+                handle,
+                FILE_ID_INFO_CLASS,
+                extended.as_mut_ptr().cast(),
+                std::mem::size_of::<FileIdInfo>() as u32,
+            )
+        } != 0).then(|| unsafe { extended.assume_init().volume_serial });
+        Some((serial, extended_serial))
+    }
+
+    match (volume_identity(a), volume_identity(b)) {
+        (Some((legacy_a, full_a)), Some((legacy_b, full_b))) => {
+            if let (Some(full_a), Some(full_b)) = (full_a, full_b) {
+                full_a == full_b
+            } else {
+                legacy_a == legacy_b
+            }
+        }
+        _ => false,
+    }
+}
+#[cfg(not(any(unix, windows)))]
+fn same_filesystem_paths(_a: &Path, _b: &Path) -> bool { false }
+
+#[cfg(all(test, windows))]
+mod windows_native_volume_tests {
+    use super::*;
+
+    #[test]
+    fn existing_directories_on_one_volume_use_the_combined_budget() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let destination = temp.path().join("destination");
+        let scratch = temp.path().join("scratch");
+        fs::create_dir_all(&destination).expect("destination dir");
+        fs::create_dir_all(&scratch).expect("scratch dir");
+        assert!(same_filesystem_paths(&destination, &scratch));
+
+        let contents = super::disc_selection_bridge_tests::disc_contents(
+            DiscFormat::Sacd,
+            PresentationId::SacdArea(SacdAreaId::Stereo),
+            "DSD Stereo",
+        );
+        let mut state = DiscBrowserState::new(contents, temp.path().join("disc.iso"));
+        state.contents.presentations[0].format.sample_rate = Some(2_822_400);
+        state.contents.presentations[0].format.bit_depth = Some(1);
+        state.destination = destination;
+        assert!(state.native_storage_shares_destination_volume(&scratch));
+        assert!(state.native_required_volume_bytes(true).is_some());
+    }
+
+    #[test]
+    fn distinct_volume_uses_separate_destination_and_scratch_budgets() {
+        // Set this to an existing directory on a physically different volume
+        // (e.g. D:\test-scratch). Single-volume CI hosts skip this case.
+        let Some(other_volume) = std::env::var_os("TONEPOET_TEST_OTHER_VOLUME") else {
+            return;
+        };
+        let other_volume = PathBuf::from(other_volume);
+        assert!(other_volume.is_dir(), "other-volume directory does not exist");
+        let temp = tempfile::tempdir().expect("tempdir");
+        assert!(!same_filesystem_paths(temp.path(), &other_volume),
+            "TONEPOET_TEST_OTHER_VOLUME must be a distinct volume");
+        let contents = super::disc_selection_bridge_tests::disc_contents(
+            DiscFormat::Sacd,
+            PresentationId::SacdArea(SacdAreaId::Stereo),
+            "DSD Stereo",
+        );
+        let mut state = DiscBrowserState::new(contents, temp.path().join("disc.iso"));
+        state.contents.presentations[0].format.sample_rate = Some(2_822_400);
+        state.contents.presentations[0].format.bit_depth = Some(1);
+        state.destination = temp.path().join("destination");
+        assert!(!state.native_storage_shares_destination_volume(&other_volume));
+        assert!(state.native_split_volume_bytes(true).is_some());
+    }
+}
 
 /// Return the overlay's flattened row list.
 ///
@@ -2103,7 +2316,7 @@ mod disc_selection_bridge_tests {
     use crate::convert::pipeline::{CueSidecarPolicy, DvdaDownmixPolicy, DvdaGroupSelection, SourceOptions, TrackSelection};
     use std::path::PathBuf;
 
-    fn disc_contents(
+    pub(super) fn disc_contents(
         format: DiscFormat,
         id: PresentationId,
         label: &str,
@@ -2327,10 +2540,18 @@ mod disc_selection_bridge_tests {
         assert_eq!(required, total + 4 * 128 * 1024);
         assert!(required < 3 * GIB, "3 GiB must admit separate-track SACD");
         assert!(required > 2 * GIB, "insufficient output capacity must block");
+        // When storage is on another volume, the scratch budget must not
+        // accumulate already-published separate tracks a second time.
+        let (dest_needed, scratch_needed) = state.native_split_volume_bytes(true).unwrap();
+        assert_eq!(dest_needed, required);
+        assert!(scratch_needed >= largest && scratch_needed < 2 * largest);
         // The continuous SACD path retains completed parts during joining.
         state.file_per_program = true;
         assert_eq!(state.required_native_volume_bytes(total, largest, largest_program),
             total * 2 + 4 * 128 * 1024);
+        let (dest_needed, scratch_needed) = state.native_split_volume_bytes(true).unwrap();
+        assert_eq!(dest_needed, total + 4 * 128 * 1024);
+        assert_eq!(scratch_needed, total * 2 + 4 * 128 * 1024);
     }
 
     #[test]
@@ -2372,6 +2593,9 @@ mod disc_selection_bridge_tests {
         state.overwrite_policy = NativeOverwritePolicy::Replace;
         let replacement = state.native_required_volume_bytes(true).unwrap();
         assert!(replacement < GIB, "same-sized replacements only need one staged track");
+        let (destination_needed, scratch_needed) = state.native_split_volume_bytes(false).unwrap();
+        assert!(destination_needed < GIB, "replacement must budget one temporary destination copy");
+        assert!(scratch_needed < GIB, "replacement scratch must not accumulate all four tracks");
         state.overwrite_policy = NativeOverwritePolicy::Fail;
         assert!(state.native_required_volume_bytes(true).unwrap() > 2 * GIB);
 

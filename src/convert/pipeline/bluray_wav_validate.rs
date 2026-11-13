@@ -383,8 +383,15 @@ pub(crate) fn read_wav_info(path: &Path) -> Result<WavInfo, String> {
             require(declared_data.is_none(), "multiple data chunks are not supported")?;
             declared_data = Some(size);
         }
-        offset = data_end.checked_add(size & 1).ok_or("RIFF chunk padding overflow")?;
-        require(offset <= file_len, "truncated RIFF chunk padding")?;
+        // Some writers omit the expected final pad byte after an odd-sized
+        // data chunk. The declared data is complete in that case; every other
+        // odd chunk still needs its pad byte before parsing can continue.
+        if kind == b"data" && data_end == file_len {
+            offset = data_end;
+        } else {
+            offset = data_end.checked_add(size & 1).ok_or("RIFF chunk padding overflow")?;
+            require(offset <= file_len, "truncated RIFF chunk padding")?;
+        }
     }
     if rf64 { require(ds64.is_some(), "RF64 is missing ds64 chunk")?; }
     let mut output = fmt.ok_or_else(||"missing fmt chunk".to_string())?;
@@ -540,6 +547,16 @@ mod tests {
         let path = write_test_wav("wav-unaligned", format, &[0, 0, 0]);
         let err = validate_bluray_lpcm_wav(&path, &expected_audio(48_000, 2, 16, 16, None)).unwrap_err();
         assert!(err.contains("data chunk is not frame-aligned"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn wav_validation_accepts_complete_final_odd_data_without_padding() {
+        // A mono 24-bit frame occupies three bytes. Missing final RIFF padding
+        // is tolerated, but the PCM frame-alignment check is still enforced.
+        let format = LpcmWavFormat::new(48_000, 1, 24, 24, None).unwrap();
+        let path = write_test_wav("wav-mono-24-odd-final", format, &[0, 0, 0]);
+        validate_bluray_lpcm_wav(&path, &expected_audio(48_000, 1, 24, 24, None)).unwrap();
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

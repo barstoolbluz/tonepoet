@@ -144,7 +144,7 @@ pub fn draw(
         frame.render_widget(Paragraph::new(clip(&format!("⚠ {problem}"), chunks[3].width))
             .style(Style::default().fg(theme.error)), chunks[3]);
     }
-    draw_results(frame,state,chunks[4],small,theme);
+    draw_results(frame,state,scratch,chunks[4],small,theme);
     draw_footer(frame,state,chunks[5],buttons,small,problems.is_empty(),theme);
     if let Some(panel) = state.panel { draw_panel(frame,state,panel,popup,theme); }
 }
@@ -367,23 +367,23 @@ fn draw_output(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,buttons:&mut
     }
 }
 
-fn draw_results(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,small:bool,theme:Theme) {
+fn draw_results(frame:&mut ratatui::Frame,s:&DiscBrowserState,scratch:&Path,r:Rect,small:bool,theme:Theme) {
     let items=s.selected_item_count();
     let programs=s.selected_program_count();
-    let (size,work)=match s.selected_item_bytes() {
-        Some((total,largest,program))=>(format_bytes(total),
-            format_bytes(s.native_required_volume_bytes(false).unwrap_or_else(||
-                s.required_native_volume_bytes(total,largest,program)))),
-        None=>("pending".into(),"pending".into()),
-    };
+    let size=s.selected_item_bytes().map_or_else(||"pending".into(),|(total,_,_)|format_bytes(total));
     let kind=if s.contents.format==DiscFormat::DvdVideo || s.contents.format==DiscFormat::BluRay {"chapters"} else {"tracks"};
     let main=format!("Extract  {items} {kind} · {programs} streams · about {size}");
-    // The native worker always stages on the destination volume, even if
-    // configured scratch storage is on another filesystem. Both figures must
-    // describe that same actual volume as the preflight blocker does.
     let dest=space_for(&s.destination).map_or_else(||"unknown".into(),format_bytes);
-    let work_free=dest.clone();
-    let space=format!("Space  destination {dest} free · working storage needs {work}, {work_free} free");
+    let work_free=space_for(scratch).map_or_else(||"unknown".into(),format_bytes);
+    let space=if s.native_storage_shares_destination_volume(scratch) {
+        let work=s.native_required_volume_bytes(false).map_or_else(||"pending".into(),format_bytes);
+        format!("Space  destination {dest} free · working storage needs {work}, {work_free} free (shared volume)")
+    } else {
+        let (target,work)=s.native_split_volume_bytes(false)
+            .map_or_else(||("pending".into(),"pending".into()),|(target,work)|
+                (format_bytes(target),format_bytes(work)));
+        format!("Space  destination needs {target}, {dest} free · working storage needs {work}, {work_free} free")
+    };
     let lines=if small {vec![Line::from(clip(&main,r.width))]}
         else {vec![Line::from(clip(&main,r.width)),Line::from(clip(&space,r.width))]};
     frame.render_widget(Paragraph::new(lines).style(Style::default().fg(theme.text_dim)),r);
@@ -585,23 +585,28 @@ mod extract_r3_render_tests {
     }
 
     #[test]
-    fn working_space_label_reports_destination_volume_not_configured_scratch() {
+    fn working_space_label_reports_actual_scratch_and_destination_volumes() {
         let mut state = sacd_state(false, false);
         let destination = tempfile::tempdir().unwrap();
         state.destination = destination.path().join("extracted");
         let available = space_for(&state.destination).unwrap();
         let expected = format_bytes(available);
-        // The configured scratch path may be on another filesystem. Its
-        // capacity must never enter the native extraction results display.
+        // Display the actual working volume. The default may share the
+        // destination filesystem, while explicit scratch can be elsewhere.
         for configured in [None, Some(destination.path()), Some(Path::new("/dev/shm"))] {
-            let _scratch = crate::tui::disc_browser_actions::native_working_root(&state, configured);
+            let scratch = crate::tui::disc_browser_actions::native_working_root(&state, configured);
             let mut terminal = Terminal::new(TestBackend::new(170, 2)).unwrap();
             let theme = crate::tui::theme::theme_by_slug_or_default("tokyo-night");
-            terminal.draw(|f| draw_results(f, &state, Rect::new(0, 0, 170, 2), false, theme)).unwrap();
+            terminal.draw(|f| draw_results(f, &state, &scratch, Rect::new(0, 0, 170, 2), false, theme)).unwrap();
             let result = (0..170).map(|x| terminal.backend().buffer().get(x,1).symbol().to_owned())
                 .collect::<Vec<_>>().concat();
-            assert!(result.contains(&format!("destination {expected} free")), "{result}");
-            assert!(result.contains(&format!(", {expected} free")), "{result}");
+            if state.native_storage_shares_destination_volume(&scratch) {
+                assert!(result.contains(&format!("destination {expected} free")), "{result}");
+            } else {
+                assert!(result.contains(&format!(", {expected} free")), "{result}");
+            }
+            let scratch_free=space_for(&scratch).map_or_else(||"unknown".into(),format_bytes);
+            assert!(result.contains(&format!(", {scratch_free} free")), "{result}");
         }
     }
 }

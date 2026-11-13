@@ -172,12 +172,10 @@ fn sync_parent_dir_best_effort(path: &Path) {
     }
 }
 
-#[cfg(unix)]
 fn is_cross_device_error(err: &io::Error) -> bool {
-    err.raw_os_error() == Some(libc::EXDEV)
-}
-
-#[cfg(not(unix))]
-fn is_cross_device_error(_err: &io::Error) -> bool {
-    false
+    if err.kind() == io::ErrorKind::CrossesDevices { return true; }
+    #[cfg(unix)]
+    { err.raw_os_error() == Some(libc::EXDEV) }
+    #[cfg(not(unix))]
+    { false }
 }

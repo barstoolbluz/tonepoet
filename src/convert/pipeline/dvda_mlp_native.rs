@@ -139,13 +139,6 @@ pub(crate) fn decoder_info() -> NativeMlpDecoderInfo {
     }
 }
 
-pub(crate) fn decode_authored_stereo_to_wav(
-    mlp_path: &Path,
-    wav_path: &Path,
-) -> Result<NativeMlpDecodeResult, NativeMlpError> {
-    decode_authored_stereo_to_wav_with_rf64(mlp_path,wav_path,false)
-}
-
 pub(crate) fn decode_authored_stereo_to_wav_with_rf64(
     mlp_path: &Path,
     wav_path: &Path,

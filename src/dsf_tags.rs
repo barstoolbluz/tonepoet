@@ -232,6 +232,33 @@ pub fn read(path: &Path) -> Result<DsfTagSnapshot, String> {
     Ok(outcome.snapshot)
 }
 
+/// Read DSF text and summarize its ID3 pictures in one pass for the artwork
+/// editor. `summarize` sees borrowed APIC payloads while the native ID3 tag is
+/// live; its return values contain only compact facts, never cloned images.
+/// Corrupt/absent tags degrade exactly as in the ordinary DSF metadata reader.
+pub(crate) fn read_with_projected_artwork<T>(
+    path: &Path,
+    summarize: impl Fn(u8, &str, &[u8]) -> T,
+) -> Result<(DsfTagSnapshot, Vec<T>), String> {
+    if !is_dsf(path) {
+        return Err(format!("'{}' is not a DSF file", path.display()));
+    }
+    let (location, warnings) = inspect_dsf_metadata_location_for_read(path)?;
+    for warning in &warnings {
+        log::warn!("DSF metadata read degraded for '{}': {warning}", path.display());
+    }
+    let Some(location) = location else {
+        return Ok((DsfTagSnapshot::default(), Vec::new()));
+    };
+    match backend::read_at_location_with_artwork(path, location, &summarize) {
+        Ok((snapshot, artwork)) => Ok((canonicalize_snapshot(snapshot), artwork)),
+        Err(error) => {
+            log::warn!("DSF metadata read degraded for '{}': ID3 metadata could not be decoded and was ignored: {error}", path.display());
+            Ok((DsfTagSnapshot::default(), Vec::new()))
+        }
+    }
+}
+
 /// Best-effort DSF metadata read. Container quirks that do not prevent safe
 /// audio conversion are reported as warnings and yield either the readable ID3
 /// snapshot or an empty snapshot. Mutation continues to use the strict
@@ -3448,6 +3475,22 @@ mod backend {
     ) -> Result<DsfTagSnapshot, String> {
         let tag = read_tag(path, location)?;
         Ok(snapshot_from_tag(&tag))
+    }
+
+    pub(super) fn read_at_location_with_artwork<T>(
+        path: &Path,
+        location: DsfMetadataLocation,
+        summarize: &impl Fn(u8, &str, &[u8]) -> T,
+    ) -> Result<(DsfTagSnapshot, Vec<T>), String> {
+        let tag = read_tag(path, location)?;
+        let artwork = tag.pictures()
+            .map(|picture| summarize(
+                u8::from(picture.picture_type.clone()),
+                &picture.mime_type,
+                &picture.data,
+            ))
+            .collect();
+        Ok((snapshot_from_tag(&tag), artwork))
     }
 
     pub(super) fn prepare_values(

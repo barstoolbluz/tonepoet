@@ -1500,7 +1500,10 @@ impl ConversionManager {
         item.native_extraction = Some(job);
         // Full-settings admission remains valid for older conversion queue
         // readers even though the native worker intentionally ignores DSP.
-        item.set_pipeline_settings(tonepoet_pipeline::PipelineSettings::default());
+        item.set_pipeline_settings(
+            crate::convert::pipeline::native_extract::native_compatibility_settings()
+                .map_err(ConversionError::ValidationError)?
+        );
         let id = item.id.clone();
         let mut queue = self.queue.try_write().map_err(|_| {
             ConversionError::ConversionFailed("Queue is busy, try again".into())

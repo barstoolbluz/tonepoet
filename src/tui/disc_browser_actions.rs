@@ -316,22 +316,14 @@ pub fn handle_disc_browser_button(
     handle_disc_browser_button_click(app, button, 1, tx)
 }
 
-/// Prefer configured working storage. The native worker chooses a private
-/// sibling on the destination volume if the configured volume differs; the
-/// destination never receives an incomplete output.
+/// Honor configured scratch, otherwise stage in TonePoet's private cache.
+/// The target volume may differ; the worker's publisher handles that safely.
 pub fn native_working_root(
-    state: &DiscBrowserState,
+    _state: &DiscBrowserState,
     configured: Option<&Path>,
 ) -> PathBuf {
-    if let Some(path) = configured {
-        return path.to_path_buf();
-    }
-    let mut parent = state.destination.parent().unwrap_or(Path::new("."));
-    while !parent.exists() {
-        let Some(next) = parent.parent() else { break; };
-        parent = next;
-    }
-    parent.join(".tonepoet-native-extraction-work")
+    configured.map(Path::to_path_buf).unwrap_or_else(
+        crate::convert::pipeline::native_extract::default_native_working_root)
 }
 
 fn start_native_extraction(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
@@ -1287,8 +1279,8 @@ mod tests {
         assert!(matches!(app.browse.entries[0].kind, EntryKind::Archive));
     }
 
-    #[test]
-    fn classified_folders_activate_nested_iso_audio_streams_for_all_disc_markers() {
+    #[tokio::test]
+    async fn classified_folders_activate_nested_iso_audio_streams_for_all_disc_markers() {
         let marker_cases = [
             (FolderDiscMarkerKind::DvdAudio, "dvda.iso"),
             (FolderDiscMarkerKind::DvdVideo, "dvdv.iso"),
