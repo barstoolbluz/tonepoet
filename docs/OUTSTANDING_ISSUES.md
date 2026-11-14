@@ -5848,3 +5848,22 @@ and extracts the chosen tracks or chapters natively:
 One window serves every source type. The design is in
 `tonepoet-streams-spec.md` and `tonepoet-streams-mockups.html`, delivered
 with the brief for this issue.
+
+---
+
+## 89. Recovery can only be opened by a typed command
+
+Filed 2026-11-14.
+
+On startup the status bar says "Found 2 unresolved copy/move operations; open
+Recovery to review the current state". Nothing in the UI opens Recovery: no
+key, no menu item, no button, and the notice is not clickable.
+
+The only routes are the vi commands `:recovery` (`Command::FileRecovery`) and
+`:messages` (`Command::FileTaskMessages`), which opens Recovery while
+unresolved operations exist. Both call `recovery_ui::open_recovery_window`,
+and nothing else does. A user who doesn't know those commands cannot act on
+the notice.
+
+**What we want.** The notice is clickable and names the key that opens
+Recovery. Recovery has a visible entry point: a key, a menu item, or both.
