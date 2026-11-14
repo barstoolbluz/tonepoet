@@ -260,6 +260,8 @@ pub struct DiscBrowserState {
     /// selections are synchronized across streams in the same authored title.
     pub items_checked: Vec<Vec<bool>>,
     pub focus: ExtractFocus,
+    /// Same title-bar window state as Folder Properties and Recovery.
+    pub maximized: bool,
     pub item_cursor: usize,
     pub item_scroll: usize,
     pub output_cursor: usize,
@@ -354,6 +356,7 @@ impl DiscBrowserState {
             source_path: source_path.clone(),
             items_checked,
             focus: ExtractFocus::Programs,
+            maximized: false,
             item_cursor: 0,
             item_scroll: 0,
             output_cursor: 0,

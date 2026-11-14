@@ -29,9 +29,59 @@ fn clip(s: &str, width: u16) -> String {
 fn format_bytes(bytes: u64) -> String {
     if bytes >= 1024u64.pow(4) { format!("{:.1} TiB",bytes as f64/1024f64.powi(4)) }
     else if bytes >= 1024u64.pow(3) { format!("{:.1} GiB",bytes as f64/1024f64.powi(3)) }
-    else if bytes >= 1024u64.pow(2) { format!("{:.1} MiB",bytes as f64/1024f64.powi(2)) }
+    else if bytes >= 1024u64.pow(2) { format!("{:.0} MiB",bytes as f64/1024f64.powi(2)) }
     else if bytes >= 1024 { format!("{:.1} KiB", bytes as f64 / 1024.0) }
     else { format!("{bytes} B") }
+}
+
+/// Clip names and path components from the end rather than erasing their middle.
+fn clip_end(s: &str, width: u16) -> String {
+    let width = width as usize;
+    if s.chars().count() <= width { return s.into(); }
+    if width == 0 { return String::new(); }
+    if width == 1 { return "…".into(); }
+    format!("{}…", s.chars().take(width - 1).collect::<String>())
+}
+
+/// Prefer the album-folder identity to the machine-specific path prefix.
+/// A surviving final directory (often "Extracted") is retained ahead of
+/// shortening the longer preceding disc-folder name.
+fn compact_folder_path(path: &Path, width: u16) -> String {
+    let raw = path.to_string_lossy();
+    let home = std::env::var_os("HOME")
+        .or_else(||std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from);
+    let value = if let Some(tail) = home.as_deref().and_then(|home| path.strip_prefix(home).ok()) {
+        if tail.as_os_str().is_empty() { "~".to_string() }
+        else { format!("~/{}", tail.display()) }
+    } else { raw.into_owned() };
+    if value.chars().count() <= width as usize { return value; }
+    let home_prefix = value.starts_with("~/") || value.starts_with("~\\");
+    let absolute = path.is_absolute();
+    let mut pieces: Vec<&str> = value.split(|ch| ch == '/' || ch == '\\')
+        .filter(|part| !part.is_empty() && *part != "~").collect();
+    if pieces.is_empty() { return clip_end(&value, width); }
+    let prefix = if home_prefix { "~/…/" } else if absolute { "/…/" } else { "…/" };
+    while pieces.len() > 2 && format!("{prefix}{}", pieces.join("/")).chars().count() > width as usize {
+        pieces.remove(0);
+    }
+    let mut compact: Vec<String> = pieces.iter().map(|part| (*part).to_owned()).collect();
+    if format!("{prefix}{}", compact.join("/")).chars().count() <= width as usize {
+        return format!("{prefix}{}", compact.join("/"));
+    }
+    // The parent is usually the disc name. Keep its beginning and the last
+    // folder name whole while space permits; only then shorten that last name.
+    for i in (0..compact.len()).rev().skip(1).chain(std::iter::once(compact.len()-1)) {
+        let used = prefix.chars().count() + compact.iter().enumerate()
+            .filter(|(j, _)| *j != i).map(|(_, part)| part.chars().count()).sum::<usize>()
+            + compact.len().saturating_sub(1);
+        let available = (width as usize).saturating_sub(used);
+        compact[i] = clip_end(&compact[i], available as u16);
+        if format!("{prefix}{}",compact.join("/")).chars().count() <= width as usize {
+            return format!("{prefix}{}",compact.join("/"));
+        }
+    }
+    clip_end(&format!("{prefix}{}",compact.join("/")),width)
 }
 
 fn check(checked: bool) -> &'static str { if checked { "[✓]" } else { "[ ]" } }
@@ -54,7 +104,22 @@ fn program_info(p: &DiscPresentation, format: DiscFormat) -> String {
     let loss = if p.format.lossless { "lossless" } else { "lossy" };
     if format == DiscFormat::Sacd {
         let dst = p.tracks.iter().any(|t| t.format_note.as_deref().unwrap_or("").contains("DST"));
-        return format!("{} · lossless · DSD64 · {}", if dst { "DST" } else { "DSD" }, p.format.channel_layout.as_deref().unwrap_or("unknown"));
+        // The SACD mapper supplies layout labels (including 5.0) directly.
+        // Keep the review's familiar numeric spellings for Stereo and 5.1.
+        let channels = match (p.format.channel_layout.as_deref(),p.format.channels) {
+            (Some("Stereo" | "stereo"), _) => "2.0".to_owned(),
+            (Some("Multichannel" | "multichannel"), Some(5)) => "5.0".to_owned(),
+            (Some("Multichannel" | "multichannel"), Some(6)) => "5.1".to_owned(),
+            (Some(layout), _) if !layout.is_empty() => layout.to_owned(),
+            _ => match p.format.channels {
+                Some(2) => "2.0".to_owned(),
+                Some(5) => "5.0".to_owned(),
+                Some(6) => "5.1".to_owned(),
+                Some(n) => format!("{n} ch"),
+                None => "unknown".into(),
+            },
+        };
+        return format!("{} · lossless · DSD64 · {channels}", if dst { "DST" } else { "DSD" });
     }
     let rate = p.format.sample_rate.map(sample_rate_display).unwrap_or_else(|| "probing".into());
     let depth = p.format.bit_depth.map_or_else(|| "probing".into(), |bits| format!("{bits}-bit"));
@@ -210,8 +275,9 @@ pub fn draw(
     let colors=extract_colors(theme);
     let header_height=if small {2} else {3};
     let output_count=state.output_rows().len() as u16;
-    let output_height=if small {1} else if wide {3+output_count.saturating_sub(4)}
-        else {output_count.max(1)};
+    // Folder and Naming share the Destination keyboard index, but have
+    // independent mouse targets and actions.
+    let output_height=if small {1} else {output_count.saturating_add(1).max(2)};
     let results_height=if small {1}else{2};
     let footer_height=if small {1}else{2};
     let problems=state.blockers(scratch);
@@ -225,8 +291,25 @@ pub fn draw(
         .saturating_add(pane_height).saturating_add(output_height)
         .saturating_add(u16::from(!small)).saturating_add(warning_height)
         .saturating_add(results_height).saturating_add(footer_height);
-    let height=requested_height.min(area.height.saturating_sub(2));
-    let popup=Rect::new(area.x+1,area.y+(area.height-height)/2,area.width-2,height);
+    let height=requested_height.min(area.height.saturating_sub(4));
+    let longest_item=state.contents.presentations.iter()
+        .flat_map(|p|p.tracks.iter()).filter_map(|t|t.title.as_deref())
+        .map(|t|t.chars().count()).max().unwrap_or(0);
+    let natural_width=(78usize + longest_item).clamp(96,150) as u16;
+    let width=natural_width.min(area.width.saturating_sub(4));
+    let popup=if state.maximized { area } else { Rect::new(
+        area.x+(area.width-width)/2,area.y+(area.height-height)/2,width,height,
+    ) };
+    // The window is the foreground; Browse should remain context, not compete
+    // for attention with its selection, scrollbar, and metadata headings.
+    for y in area.y..area.y.saturating_add(area.height) {
+        for x in area.x..area.x.saturating_add(area.width) {
+            let cell=frame.buffer_mut().get_mut(x,y);
+            let faded_bg=blend_color(cell.bg,colors.base,3,4);
+            cell.set_bg(faded_bg);
+            cell.set_fg(colors.faint);
+        }
+    }
     frame.render_widget(Clear,popup);
     let body=Rect::new(popup.x,popup.y+1,popup.width,popup.height.saturating_sub(1));
     let body_block=Block::default().borders(Borders::LEFT|Borders::RIGHT|Borders::BOTTOM)
@@ -249,9 +332,11 @@ pub fn draw(
     let title_style=Style::default().fg(readable_word(theme.panel_bg,theme.title)).bg(theme.title)
         .add_modifier(Modifier::BOLD);
     fill(frame,Rect::new(popup.x,popup.y,popup.width,1),theme.title);
-    let left=Rect::new(popup.x+1,popup.y,popup.width.saturating_sub(tag_width+2),1);
-    frame.render_widget(Paragraph::new(clip(&format!("▸ {action} · {source_name}"),left.width))
+    let left=Rect::new(popup.x+2,popup.y,popup.width.saturating_sub(tag_width+4),1);
+    let indicator=if state.maximized { "▾" } else { "▸" };
+    frame.render_widget(Paragraph::new(clip_end(&format!("{indicator} {action} · {source_name}"),left.width))
         .style(title_style),left);
+    buttons.record_button(TuiButton::DiscBrowserTitle,Rect::new(popup.x,popup.y,popup.width,1));
     let right=Rect::new(popup.x+popup.width-tag_width-1,popup.y,tag_width,1);
     frame.render_widget(Paragraph::new(source_type).alignment(Alignment::Right)
         .style(title_style),right);
@@ -263,7 +348,10 @@ pub fn draw(
         Constraint::Length(warning_height),Constraint::Length(results_height),
         Constraint::Length(1),Constraint::Length(footer_height),
     ]).split(inner);
-    draw_header(frame,state,chunks[0],small,theme);
+    fill(frame,chunks[0],colors.band);
+    let header_text=Rect::new(chunks[0].x+2,chunks[0].y,
+        chunks[0].width.saturating_sub(4),chunks[0].height);
+    draw_header(frame,state,header_text,small,theme);
     let mut pane_separator=None;
     if small {
         match state.focus {
@@ -344,6 +432,23 @@ fn append_header_field(fields: &mut Vec<Span<'static>>, value: &str, color: Colo
     fields.push(Span::styled(value.to_string(),Style::default().fg(color)));
 }
 
+fn sacd_details_line(details: &str, words: WordTiers, colors: ExtractColors) -> Line<'static> {
+    let mut spans=Vec::new();
+    for part in details.split('·').map(str::trim).filter(|part|!part.is_empty()) {
+        if !spans.is_empty() {spans.push(Span::styled("  ·  ",Style::default().fg(colors.faint)));}
+        let (label,value)=part.split_once(' ').unwrap_or((part,""));
+        let display=match label {"Date"=>"Disc date", "Hybrid"=>"hybrid", _=>label};
+        if !value.is_empty() && matches!(label,"Catalog"|"Publisher"|"Date") {
+            spans.push(Span::styled(format!("{display} "),Style::default().fg(colors.dim)));
+            spans.push(Span::styled(value.to_owned(),Style::default().fg(words.soft)));
+        }else{
+            spans.push(Span::styled(display.to_owned(),Style::default().fg(words.soft)));
+            if !value.is_empty(){spans.push(Span::styled(format!(" {value}"),Style::default().fg(words.soft)));}
+        }
+    }
+    Line::from(spans)
+}
+
 fn draw_header(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect, small: bool, theme: Theme) {
     if r.width==0 || r.height==0 { return; }
     let colors=extract_colors(theme);
@@ -369,8 +474,7 @@ fn draw_header(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect, small:
         let details=s.contents.presentations.first()
             .and_then(|p|p.extract.sacd_header_details.as_deref())
             .unwrap_or("SACD · native DSD64");
-        lines.push(Line::from(Span::styled(clip(details,r.width),
-            Style::default().fg(words.soft))));
+        lines.push(sacd_details_line(details,words,colors));
     }
     let diagnostics=if s.contents.diagnostics.is_empty(){"none".to_owned()}
         else{s.contents.diagnostics.len().to_string()};
@@ -378,7 +482,10 @@ fn draw_header(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect, small:
         else{readable_word(theme.warning,colors.band)};
     let mut summary=Vec::new();
     if !(small && s.contents.format==DiscFormat::Sacd) {
-        let protection=s.protection_display();
+        let protection=match s.protection_display().as_str() {
+            "None" => "no encryption detected".to_owned(),
+            other => other.to_owned(),
+        };
         let reserved=if small {
             "Diagnostics  ".chars().count()+diagnostics.chars().count()
                 +if s.contents.diagnostics.is_empty(){0}else{"  · d view".chars().count()}+2
@@ -412,10 +519,12 @@ fn draw_programs(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect, butt
     frame.render_widget(Paragraph::new(Line::from(vec![
         Span::styled(format!("{title}  "),Style::default().fg(if pane_focused{
             readable_word(theme.header,pane_bg)}else{colors.faint})),
-        Span::styled(format!("{} of {} checked · {} hidden",s.selected_program_count(),
-            s.len(),s.contents.suppressed.len()),Style::default().fg(pane_words.label)),
-    ])).style(Style::default().bg(pane_bg)),Rect::new(r.x+1,r.y,r.width.saturating_sub(2),1));
-    let inner = Rect::new(r.x+1,r.y+1,r.width.saturating_sub(2),r.height.saturating_sub(1));
+        Span::styled(format!("{} of {} checked{}",s.selected_program_count(),s.len(),
+            if s.contents.suppressed.is_empty() { String::new() }
+            else {format!(" · {} hidden",s.contents.suppressed.len())}),
+            Style::default().fg(pane_words.label)),
+    ])).style(Style::default().bg(pane_bg)),Rect::new(r.x+2,r.y,r.width.saturating_sub(4),1));
+    let inner = Rect::new(r.x+2,r.y+1,r.width.saturating_sub(4),r.height.saturating_sub(1));
     if inner.width == 0 || inner.height == 0 { return; }
     let mut display_rows: Vec<(Option<usize>,String,bool,Option<usize>)> = Vec::new();
     // Keep all streams of the same authored title/playlist together. Blu-ray
@@ -575,8 +684,8 @@ fn draw_items(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect,
             readable_word(theme.header,pane_bg)}else{colors.faint})),
         Span::styled(format!("{checked} of {} checked · {}",p.tracks.len(),p.id.compact_label()),
             Style::default().fg(pane_words.label)),
-    ])).style(Style::default().bg(pane_bg)),Rect::new(r.x+1,r.y,r.width.saturating_sub(2),1));
-    let inner=Rect::new(r.x+1,r.y+1,r.width.saturating_sub(2),r.height.saturating_sub(1));
+    ])).style(Style::default().bg(pane_bg)),Rect::new(r.x+2,r.y,r.width.saturating_sub(4),1));
+    let inner=Rect::new(r.x+2,r.y+1,r.width.saturating_sub(4),r.height.saturating_sub(1));
     if inner.width<12 || inner.height==0 { return; }
     let cursor=s.item_cursor.min(p.tracks.len().saturating_sub(1));
     let sacd_detail=(s.contents.format==DiscFormat::Sacd)
@@ -632,8 +741,14 @@ fn draw_items(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect,
         let number_width=if track.number>99 {4}else{3};
         frame.render_widget(Paragraph::new(format!("{:02}",track.number))
             .style(style.fg(colors.dim)),Rect::new(x,y,number_width,1));
-        x+=number_width+1;
-        let tail_width=if wide {15u16}else{8u16};
+        x+=number_width;
+        let duration=track.duration_secs.map(duration_display).unwrap_or_default();
+        let duration_width=(duration.chars().count() as u16).saturating_add(1);
+        frame.render_widget(Paragraph::new(duration)
+            .style(style.fg(if focused{words.value}else{words.soft})),
+            Rect::new(x,y,duration_width,1));
+        x+=duration_width;
+        let tail_width=if wide {9u16}else{0u16};
         let differing_performer=p.tracks.iter().any(|track|track.performer.as_deref()
             .is_some_and(|name|Some(name)!=s.contents.album_artist.as_deref()));
         let performer_width=if wide && differing_performer {
@@ -649,16 +764,12 @@ fn draw_items(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect,
                 .style(style.fg(if focused{words.value}else{words.soft})),Rect::new(x,y,performer_width,1));
             x+=performer_width;
         }
-        let duration=track.duration_secs.map(duration_display).unwrap_or_default();
-        let duration_width=if wide {7}else{8};
-        frame.render_widget(Paragraph::new(duration).alignment(Alignment::Right)
-            .style(style.fg(if focused{words.value}else{words.soft})),Rect::new(x,y,duration_width,1));
-        x+=duration_width;
         if wide {
             let start=start_secs.map(duration_display).unwrap_or_default();
+            let right=inner.x+inner.width;
             frame.render_widget(Paragraph::new(start).alignment(Alignment::Right)
-                .style(style.fg(if focused { theme.value } else { colors.dim })),
-                Rect::new(x,y,8,1));
+                .style(style.fg(if focused { words.value } else { colors.dim })),
+                Rect::new(right.saturating_sub(8),y,8.min(inner.width),1));
         }
         start_secs=start_secs.and_then(|secs|track.duration_secs.map(|duration|secs+duration));
         buttons.record_button(TuiButton::DiscBrowserTrack(i),Rect::new(inner.x,y,inner.width,1));
@@ -675,8 +786,11 @@ fn draw_items(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect,
             inner.y+(p.tracks.len() as u16).saturating_add(1)
         }else{inner.y+inner.height-1};
         if y<inner.y+inner.height {
-            frame.render_widget(Paragraph::new(clip(note,inner.width))
-                .style(Style::default().fg(colors.dim).bg(pane_bg)),Rect::new(inner.x,y,inner.width,1));
+            let note=if note.contains("ISRC ") {
+                format!("{:02} {note}",p.tracks[cursor].number)
+            }else{note.to_owned()};
+            frame.render_widget(Paragraph::new(clip_end(&note,inner.width))
+                .style(Style::default().fg(pane_words.soft).bg(pane_bg)),Rect::new(inner.x,y,inner.width,1));
         }
     }
 }
@@ -684,9 +798,39 @@ fn draw_items(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect,
 
 fn option_value(s: &DiscBrowserState, name: &str) -> String {
     match name {
-        "Format" if s.contents.format==DiscFormat::Sacd =>
-            if s.keep_dst.iter().any(|v| *v) { "DSF · DST decoded; some areas keep DST in DFF".into() }
-            else { "DSF · DST decoded to uncompressed DSD".into() },
+        "Format" if s.contents.format==DiscFormat::Sacd => {
+            let mut dsf = false;
+            let mut dff = false;
+            let mut dst_decoded = false;
+            let mut dst_preserved = false;
+            let mut native_dsd = false;
+            // Match native_job's selected, extractable, nonempty programs and
+            // its keep_dst -> dff extension decision. DST is tracked separately
+            // only to explain what the selected output will contain.
+            for (i,p) in s.contents.presentations.iter().enumerate() {
+                if s.selected.get(i) != Some(&true) || !s.is_extractable(i) { continue; }
+                let keep_dst = s.keep_dst.get(i) == Some(&true);
+                for (j,track) in p.tracks.iter().enumerate() {
+                    if s.items_checked.get(i).and_then(|v|v.get(j)) != Some(&true) { continue; }
+                    if keep_dst { dff = true; } else { dsf = true; }
+                    let dst = p.format.codec.as_deref() == Some("DST")
+                        || track.format_note.as_deref().unwrap_or("").contains("DST");
+                    if dst {
+                        if keep_dst { dst_preserved = true; } else { dst_decoded = true; }
+                    } else { native_dsd = true; }
+                }
+            }
+            match (dsf,dff) {
+                (false,false) => "DSF · native DSD (no DST decode)".into(),
+                (true,false) if dst_decoded && native_dsd => "DSF · native DSD / DST decoded".into(),
+                (true,false) if dst_decoded => "DSF · DST decoded to DSD".into(),
+                (true,false) => "DSF · native DSD (no DST decode)".into(),
+                (false,true) if dst_preserved => "DFF · keep selected DST".into(),
+                (false,true) => "DFF · native DSD".into(),
+                (true,true) if dst_decoded => "DSF / DFF · decode or keep DST by area".into(),
+                (true,true) => "DSF / DFF · native DSD / keep selected DST".into(),
+            }
+        },
         "Format" => match s.wav_container {
             NativeWavContainer::Automatic => "WAV · automatic RIFF/RF64 · channel mask".into(),
             NativeWavContainer::Riff => "RIFF WAV · 4 GB limit".into(),
@@ -694,11 +838,11 @@ fn option_value(s: &DiscBrowserState, name: &str) -> String {
             NativeWavContainer::W64 => "W64 · 64-bit sizes".into(),
         },
         "Files" => (if s.file_per_program { if s.cue {"continuous per program + CUE"} else {"continuous per program"} } else if matches!(s.contents.format,DiscFormat::DvdVideo|DiscFormat::BluRay) { "one per chapter" } else { "one per track" }).into(),
-        "Tags" => if s.tags { format!("on · {} selected fields · artwork {}{}",
-            s.tag_fields.count_ones(),if s.tag_artwork {"on"}else{"off"},
+        "Tags" => if s.tags { format!("on · {} fields · {}{}",
+            s.tag_fields.count_ones(),if s.tag_artwork {"artwork"}else{"no artwork"},
             if s.keep_dst.iter().any(|v|*v) {" · DFF drops tags"}else{""}) }
             else { "off · no metadata written".into() },
-        "Destination" => format!("{} · {}",s.destination.display(),s.naming_template),
+        "Destination" => compact_folder_path(&s.destination, 120),
         "Downmix" => s.downmix.as_str().to_string(),
         "Assume decrypted" => if s.assume_decrypted {"on · already decrypted"} else {"off"}.into(),
         _ => String::new(),
@@ -708,23 +852,28 @@ fn option_value(s: &DiscBrowserState, name: &str) -> String {
 /// Stable logical index -> output cell mapping. All visible controls retain
 /// their existing logical indices, independent of viewport and column count.
 fn output_cell(index: usize, count: usize, area: Rect, wide: bool, focus: usize) -> Option<Rect> {
-    if count==0 || area.height==0 || area.width==0 {return None;}
-    if wide && count>=4 && area.width>=70 {
-        let half=area.width/2;
+    if count==0 || area.height==0 || area.width<=4 {return None;}
+    let text=Rect::new(area.x+2,area.y,area.width-4,area.height);
+    if wide && count>=4 && text.width>=70 {
+        const GUTTER:u16=3;
+        let left_width=(text.width-GUTTER)/2;
+        let right_x=text.x+left_width+GUTTER;
+        let right_width=text.width-left_width-GUTTER;
         return match index {
-            0=>Some(Rect::new(area.x,area.y,half,1)),
-            1=>Some(Rect::new(area.x,area.y+1,half,1)),
-            2=>Some(Rect::new(area.x+half,area.y,area.width-half,1)),
-            3=>Some(Rect::new(area.x,area.y+2,area.width,1)),
-            _=>{let row=index.saturating_sub(1) as u16;
-                (row<area.height).then(||Rect::new(area.x,area.y+row,area.width,1))},
+            0=>Some(Rect::new(text.x,text.y,left_width,1)),
+            1=>Some(Rect::new(text.x,text.y+1,left_width,1)),
+            2=>Some(Rect::new(right_x,text.y,right_width,1)),
+            3=>Some(Rect::new(text.x,text.y+2,text.width,2.min(text.height.saturating_sub(2)))),
+            _=>{let row=index as u16;
+                (row<text.height).then(||Rect::new(text.x,text.y+row,text.width,1))},
         };
     }
-    let visible=area.height as usize;
+    let visible=text.height.saturating_sub(1) as usize;
     let scroll=focus.min(count.saturating_sub(1)).saturating_sub(visible.saturating_sub(1))
         .min(count.saturating_sub(visible));
     if index<scroll || index>=scroll+visible {return None;}
-    Some(Rect::new(area.x,area.y+(index-scroll) as u16,area.width,1))
+    let y=text.y+(index-scroll) as u16+u16::from(index>3);
+    Some(Rect::new(text.x,y,text.width,if index==3 {2.min(text.y+text.height-y)}else{1}))
 }
 
 /// Highlight template tokens without granting the renderer any knowledge of
@@ -751,31 +900,34 @@ fn draw_output(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,
     let rows=s.output_rows();
     let colors=extract_colors(theme);
     fill(frame,r,colors.band);
+    const LABEL_WIDTH:usize=12;
     for (i,name) in rows.iter().enumerate() {
         let Some(cell)=output_cell(i,rows.len(),r,wide,s.output_cursor) else{continue;};
-        let chosen=s.output_cursor==i;
-        let focused=s.focus==ExtractFocus::Output && chosen;
-        let bg=if focused{theme.selection_bg}
-            else if chosen{colors.selection_muted}else{colors.band};
+        let focused=s.focus==ExtractFocus::Output && s.output_cursor==i;
+        // Output, unlike the two lists, has no selection bar when unfocused.
+        let bg=if focused {theme.selection_bg}else{colors.band};
         fill(frame,cell,bg);
         let words=word_tiers(theme,colors,bg);
-        let label_width=if wide{13usize}else{18usize};
-        let value_width=cell.width.saturating_sub(label_width as u16+2);
+        let label=if *name=="Destination" {"Folder"}else{*name};
+        let value_width=cell.width.saturating_sub(LABEL_WIDTH as u16+2);
+        let prefix=if focused {"▌"}else{" "};
         let mut spans=vec![
-            Span::styled(if chosen{"▌"}else{" "},Style::default().fg(if focused{theme.info}else{colors.dim})),
-            Span::styled(format!("{name:<label_width$} "),Style::default().fg(if focused{words.value}else{words.label})),
+            Span::styled(prefix,Style::default().fg(if focused{theme.info}else{colors.faint})),
+            Span::styled(format!("{label:<LABEL_WIDTH$} "),
+                Style::default().fg(if focused{words.value}else{words.label})),
         ];
         if *name=="Destination" {
-            // The template remains intact. Only the folder is middle-clipped.
-            let template=&s.naming_template;
-            let path_width=value_width.saturating_sub(template.chars().count() as u16+3);
-            spans.push(Span::styled(clip(&s.destination.display().to_string(),path_width),
+            // The compact layout has no separate shortcut row; retain a
+            // visible hint without changing the Folder mouse hitbox.
+            let hint=if focused && r.width<96 {"  ↵ pick · Space settings"}else{""};
+            let path_width=value_width.saturating_sub(hint.chars().count() as u16);
+            spans.push(Span::styled(compact_folder_path(&s.destination,path_width),
                 Style::default().fg(words.value)));
-            spans.push(Span::styled(" / ",Style::default().fg(colors.faint)));
-            spans.extend(value_spans(template,words.value,if focused{words.value}
-                else{readable_word(theme.purple,bg)}));
+            if !hint.is_empty() {
+                spans.push(Span::styled(hint,Style::default().fg(words.value)));
+            }
         }else{
-            let value=clip(&option_value(s,name),value_width);
+            let value=clip_end(&option_value(s,name),value_width);
             if let Some((first,tail))=value.split_once(" · ") {
                 spans.push(Span::styled(first.to_string(),Style::default().fg(words.value)));
                 spans.push(Span::styled(" · ",Style::default().fg(colors.faint)));
@@ -785,28 +937,56 @@ fn draw_output(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,
                     else{readable_word(theme.purple,bg)}));
             }
         }
-        frame.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(bg)),cell);
-        buttons.record_button(TuiButton::DiscBrowserOutput(i),cell);
+        frame.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(bg)),
+            Rect::new(cell.x,cell.y,cell.width,1));
+        if *name=="Destination" && cell.height>1 {
+            let mut naming=vec![
+                Span::styled(prefix,Style::default().fg(if focused{theme.info}else{colors.faint})),
+                Span::styled(format!("{:<LABEL_WIDTH$} ","Naming"),
+                    Style::default().fg(if focused{words.value}else{words.label})),
+            ];
+            naming.extend(value_spans(&clip_end(&s.naming_template,value_width),words.value,
+                if focused{words.value}else{readable_word(theme.purple,bg)}));
+            frame.render_widget(Paragraph::new(Line::from(naming)).style(Style::default().bg(bg)),
+                Rect::new(cell.x,cell.y+1,cell.width,1));
+        }
+        if *name=="Destination" {
+            // Folder and Naming are two actions, not a two-row picker hitbox.
+            buttons.record_button(TuiButton::DiscBrowserOutput(i),
+                Rect::new(cell.x,cell.y,cell.width,1));
+            if cell.height>1 {
+                buttons.record_button(TuiButton::DiscBrowserNaming,
+                    Rect::new(cell.x,cell.y+1,cell.width,1));
+            }
+        } else {
+            buttons.record_button(TuiButton::DiscBrowserOutput(i),cell);
+        }
     }
-    if wide && rows.len()>=4 && r.height>1 && r.width>=70 {
-        // The fourth logical control still opens Destination, where overwrite
-        // policy is configured. No extra keyboard or navigation state.
-        let half=r.width/2;
-        let cell=Rect::new(r.x+half,r.y+1,r.width-half,1);
+    if wide && rows.len()>=4 && r.height>1 && r.width>=74 {
+        // Overwrite is a second view into the existing Destination option;
+        // it does not add a keyboard index or a separate settings subsystem.
+        const GUTTER:u16=3;
+        let text=Rect::new(r.x+2,r.y,r.width.saturating_sub(4),r.height);
+        let left_width=(text.width-GUTTER)/2;
+        let cell=Rect::new(text.x+left_width+GUTTER,r.y+1,
+            text.width-left_width-GUTTER,1);
         let policy=match s.overwrite_policy {
-            crate::convert::pipeline::native_extract::NativeOverwritePolicy::Fail=>"fail if present",
+            crate::convert::pipeline::native_extract::NativeOverwritePolicy::Fail=>"stop if a file exists",
             crate::convert::pipeline::native_extract::NativeOverwritePolicy::Skip=>"skip existing",
             crate::convert::pipeline::native_extract::NativeOverwritePolicy::Replace=>"replace existing",
         };
-        let selected=s.focus==ExtractFocus::Output && s.output_cursor==3;
-        let bg=if selected{theme.selection_bg}else{colors.band};
+        let focused=s.focus==ExtractFocus::Output && s.output_cursor==3;
+        let bg=if focused{theme.selection_bg}else{colors.band};
         fill(frame,cell,bg);
         let words=word_tiers(theme,colors,bg);
+        let width=cell.width.saturating_sub(LABEL_WIDTH as u16+2);
         frame.render_widget(Paragraph::new(Line::from(vec![
-            Span::styled(" Overwrite     ",Style::default().fg(if selected{words.value}else{words.label})),
-            Span::styled(policy.to_string(),Style::default().fg(words.value)),
+            Span::styled(if focused{"▌"}else{" "},Style::default().fg(if focused{theme.info}else{colors.faint})),
+            Span::styled(format!("{:<LABEL_WIDTH$} ","Overwrite"),
+                Style::default().fg(if focused{words.value}else{words.label})),
+            Span::styled(clip_end(policy,width),Style::default().fg(words.value)),
         ])).style(Style::default().bg(bg)),cell);
-        buttons.record_button(TuiButton::DiscBrowserOutput(3),cell);
+        buttons.record_button(TuiButton::DiscBrowserOverwrite,cell);
     }
 }
 
@@ -829,24 +1009,22 @@ fn draw_results(frame:&mut ratatui::Frame,s:&DiscBrowserState,
     let destination=space_for(&s.destination).map_or_else(||"unknown".into(),format_bytes);
     let available=space_for(scratch).map_or_else(||"unknown".into(),format_bytes);
     let space=if s.native_storage_shares_destination_volume(scratch) {
-        let required=s.native_required_volume_bytes(false).map_or_else(||"pending".into(),format_bytes);
-        format!("destination {destination} free · working storage needs {required}, {available} free (shared volume)")
+        format!("destination {destination} free · working storage {available} free (shared volume)")
     }else{
-        let (target,work)=s.native_split_volume_bytes(false)
-            .map_or_else(||("pending".into(),"pending".into()),|(target,work)|
-                (format_bytes(target),format_bytes(work)));
-        format!("destination needs {target}, {destination} free · working storage needs {work}, {available} free")
+        format!("destination {destination} free · working storage {available} free")
     };
     let colors=extract_colors(theme);
     let words=word_tiers(theme,colors,colors.base);
     fill(frame,r,colors.base);
     for (row,(label,value)) in [ ("Extract",main),("Space",space) ]
         .into_iter().take(if small {1}else{2}).enumerate() {
-        let width=r.width.saturating_sub(10);
+        let width=r.width.saturating_sub(4);
         frame.render_widget(Paragraph::new(Line::from(vec![
-            Span::styled(format!("{label:<10}"),Style::default().fg(words.label)),
-            Span::styled(clip(&value,width),Style::default().fg(words.soft)),
-        ])).style(Style::default().bg(theme.panel_bg)),Rect::new(r.x,r.y+row as u16,r.width,1));
+            Span::styled(" ",Style::default()),
+            Span::styled(format!("{label:<12} "),Style::default().fg(words.label)),
+            Span::styled(clip_end(&value,width.saturating_sub(14)),Style::default().fg(words.soft)),
+        ])).style(Style::default().bg(theme.panel_bg)),
+            Rect::new(r.x+2,r.y+row as u16,width,1));
     }
 }
 
@@ -856,16 +1034,21 @@ fn draw_footer(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,buttons:&mut
     let words=word_tiers(theme,colors,colors.base);
     fill(frame,r,colors.base);
     if !small {
-        let hint = "↑↓ move · ←→ pane · Space check · a n i all none invert · ⇧↑↓ range · [ ] cycle · Tab focus · ↵ open · h hidden";
+        let (lead,hint)=if s.focus==ExtractFocus::Output
+            && s.current_output_panel()==ExtractPanel::Destination {
+            ("↵"," folder picker · Space settings · t naming · o overwrite")
+        }else{
+            ("↑↓"," move · ←→ pane · Space check · a n i all none invert · ⇧↑↓ range · [ ] cycle · Tab focus · ↵ open · h hidden")
+        };
         frame.render_widget(Paragraph::new(Line::from(vec![
-            Span::styled("↑↓",Style::default().fg(theme.info)),
-            Span::styled(clip(&hint["↑↓".len()..],r.width.saturating_sub(2)),
+            Span::styled(lead,Style::default().fg(theme.info)),
+            Span::styled(clip_end(hint,r.width.saturating_sub(6)),
                 Style::default().fg(words.label)),
-        ])),Rect::new(r.x,r.y,r.width,1));
+        ])),Rect::new(r.x+2,r.y,r.width.saturating_sub(4),1));
     }
     let y=r.y+r.height-1;
     let chips=[("^x Extract",TuiButton::DiscBrowserExtract,can_extract,theme.chip_go),
-        ("c Convert",TuiButton::DiscBrowserConvert,true,theme.tab_active),
+        ("c Convert…",TuiButton::DiscBrowserConvert,true,theme.tab_active),
         ("m Options",TuiButton::DiscBrowserMore,true,theme.warning),
         ("Esc Close",TuiButton::DiscBrowserClose,true,theme.chip_dismiss)];
     let length:usize=chips.iter().map(|(txt,_,_,_)|txt.chars().count()+2).sum();
@@ -880,7 +1063,6 @@ fn draw_footer(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,buttons:&mut
         if enabled { buttons.record_button(button,Rect::new(x,y,width,1)); }
         x=x.saturating_add(width+2);
     }
-    let _=s;
 }
 
 fn draw_panel(frame:&mut ratatui::Frame,s:&DiscBrowserState,panel:ExtractPanel,popup:Rect,theme:Theme) {
@@ -1067,14 +1249,18 @@ mod extract_r3_render_tests {
                 draw(frame,&state,Path::new("/tmp"),&mut buttons,theme);
             }).unwrap();
             let buffer = terminal.backend().buffer();
-            let title_y=(0..height).find(|y|buffer.get(2,*y).bg==theme.title)
+            let title_y=(0..height).find(|y|(0..width).any(|x|buffer.get(x,*y).bg==theme.title))
                 .expect("centered title bar");
-            let bottom_y=(title_y+1..height).find(|y|buffer.get(1,*y).symbol()=="└")
+            let left=(0..width).find(|x|buffer.get(*x,title_y).bg==theme.title)
+                .expect("dialog left edge");
+            let right=(0..width).rev().find(|x|buffer.get(*x,title_y).bg==theme.title)
+                .expect("dialog right edge");
+            let bottom_y=(title_y+1..height).find(|y|buffer.get(left,*y).symbol()=="└")
                 .expect("closed bottom frame");
-            assert_eq!(buffer.get(width-2,bottom_y).symbol(),"┘", "{width}x{height}");
-            assert_eq!(buffer.get(2,title_y+1).bg,extract_colors(theme).band,
+            assert_eq!(buffer.get(right,bottom_y).symbol(),"┘", "{width}x{height}");
+            assert_eq!(buffer.get(left+2,title_y+1).bg,extract_colors(theme).band,
                 "header band {width}x{height}");
-            assert_eq!(buffer.get(1,title_y+1).fg,theme.title,
+            assert_eq!(buffer.get(left,title_y+1).fg,theme.title,
                 "side rail {width}x{height}");
             if height==40 {assert!(title_y>1,"content-sized dialog should be centered");}
         }
@@ -1183,7 +1369,7 @@ mod extract_r3_render_tests {
                 assert!(result.contains(&format!(", {expected} free")), "{result}");
             }
             let scratch_free=space_for(&scratch).map_or_else(||"unknown".into(),format_bytes);
-            assert!(result.contains(&format!(", {scratch_free} free")), "{result}");
+            assert!(result.contains(&format!("working storage {scratch_free} free")), "{result}");
         }
     }
     #[test]
@@ -1203,12 +1389,14 @@ mod extract_r3_render_tests {
         let text=lines.join("\n");
         assert!(text.contains("Prog +4"),"{text}");
         assert!(text.contains("Overwrite"),"{text}");
-        assert!(text.contains("Destination"),"{text}");
+        assert!(text.contains("Folder") && text.contains("Naming"),"{text}");
         let pane_y=lines.iter().position(|line|line.contains("AREAS") && line.contains("TRACKS"))
             .expect("both pane headings") as u16;
         let buf=terminal.backend().buffer();
-        assert_eq!(buf.get(4,pane_y).bg,colors.unfocused);
-        assert_eq!(buf.get(100,pane_y).bg,colors.focused);
+        let left=lines[pane_y as usize][..lines[pane_y as usize].find("AREAS").unwrap()].chars().count() as u16;
+        let right=lines[pane_y as usize][..lines[pane_y as usize].find("TRACKS").unwrap()].chars().count() as u16;
+        assert_eq!(buf.get(left,pane_y).bg,colors.unfocused);
+        assert_eq!(buf.get(right,pane_y).bg,colors.focused);
         let top=lines.iter().position(|line|line.contains("extract tracks"))
             .expect("title") as u16;
         assert!(top>1,"short selection must not fill the terminal");
@@ -1218,8 +1406,10 @@ mod extract_r3_render_tests {
         let (other,terminal)=rendered_lines(&state,154,36);
         let pane_y=other.iter().position(|line|line.contains("AREAS") && line.contains("TRACKS"))
             .unwrap() as u16;
-        assert_eq!(terminal.backend().buffer().get(4,pane_y).bg,colors.focused);
-        assert_eq!(terminal.backend().buffer().get(100,pane_y).bg,colors.unfocused);
+        let left=other[pane_y as usize][..other[pane_y as usize].find("AREAS").unwrap()].chars().count() as u16;
+        let right=other[pane_y as usize][..other[pane_y as usize].find("TRACKS").unwrap()].chars().count() as u16;
+        assert_eq!(terminal.backend().buffer().get(left,pane_y).bg,colors.focused);
+        assert_eq!(terminal.backend().buffer().get(right,pane_y).bg,colors.unfocused);
     }
 
     #[test]
@@ -1284,16 +1474,17 @@ mod extract_r3_render_tests {
                     }).unwrap();
                     let buffer=terminal.backend().buffer();
                     let name=state.output_rows()[index];
+                    let display=if name=="Destination" {"Folder"}else{name};
                     let context=format!("{slug} {width}x{height} selected={name}");
-                    let (x,y)=word_cells(buffer,name,&context);
+                    let (x,y)=word_cells(buffer,display,&context);
                     let selected=buffer.get(x,y);
                     assert_eq!(selected.bg,theme.selection_bg,"{context}: selection surface");
                     assert_eq!(selected.fg,readable_word(theme.value,theme.selection_bg),
                         "{context}: focused label must use Value, not Label");
                     for other in state.output_rows().into_iter().filter(|other|*other!=name) {
-                        word_cells(buffer,other,&context);
+                        word_cells(buffer,if other=="Destination" {"Folder"}else{other},&context);
                     }
-                    if index==2 { word_cells(buffer,"selected",&context); }
+                    if index==2 { word_cells(buffer,"fields",&context); }
                     if index==3 { word_cells(buffer,"{track}",&context); }
                     if wide {
                         let (ox,oy)=word_cells(buffer,"Overwrite",&context);
@@ -1303,7 +1494,7 @@ mod extract_r3_render_tests {
                         let expected=if index==3 {readable_word(theme.value,bg)}
                             else {word_tiers(theme,extract_colors(theme),bg).label};
                         assert_eq!(cell.fg,expected,"{context}: overwrite label tier");
-                        word_cells(buffer,"fail if present",&context);
+                        word_cells(buffer,"stop if a file exists",&context);
                     }
                 }
 
@@ -1341,11 +1532,202 @@ mod extract_r3_render_tests {
                 let buffer=terminal.backend().buffer();
                 let suffix=format!("{count} {unit}{}",if count==1{""}else{"s"});
                 let (_,y)=word_cells(buffer,&suffix,"right-aligned program total");
-                let final_letter=if count==1 {"r"}else{"s"};
-                assert_eq!(buffer.get(area.x+area.width-2,y).symbol(),final_letter,
-                    "{suffix} must end at the inner right edge of the program pane");
+                let final_letter=suffix.chars().last().unwrap().to_string();
+                assert_eq!(buffer.get(area.x+area.width-3,y).symbol(),final_letter.as_str(),
+                    "{suffix} must end at the padded right edge of the program pane");
             }
         }
     }
 
+
+    #[test]
+    fn r16_sacd_format_summary_matches_the_native_job_output_extensions() {
+        use crate::disc::model::SacdAreaId;
+        let base=sacd_state(false,false).contents;
+        let mut dst=base.clone();
+        dst.presentations[0].format.codec=Some("DST".into());
+        dst.presentations[0].tracks[0].format_note=Some("DST compressed".into());
+        let mut mixed=base.clone();
+        let mut second=dst.presentations[0].clone();
+        second.id=PresentationId::SacdArea(SacdAreaId::MultiChannel);
+        second.format.channels=Some(5);
+        second.format.channel_layout=Some("5.0".into());
+        mixed.presentations.push(second);
+
+        for (contents,keep,expected,descriptor) in [
+            (base.clone(),vec![false],"DSF","native DSD"),
+            (dst.clone(),vec![false],"DSF","DST decoded"),
+            (dst.clone(),vec![true],"DFF","keep selected DST"),
+            (mixed.clone(),vec![false,true],"DSF / DFF","keep selected DST"),
+        ] {
+            let mut state=DiscBrowserState::new(contents,"disc.iso".into());
+            state.keep_dst=keep;
+            let planned=state.native_job("/tmp/extract-test".into());
+            let extensions=planned.programs.iter().map(|p|
+                if p.keep_dst {"DFF"} else {"DSF"}).collect::<std::collections::BTreeSet<_>>();
+            let expected_set=expected.split(" / ").collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(extensions,expected_set,"{expected}: native job extensions");
+            let summary=option_value(&state,"Format");
+            assert_eq!(summary.split(" · ").next(),Some(expected),"{summary}");
+            assert!(summary.contains(descriptor),"{summary}");
+        }
+        // An unchecked track must not contribute an extension even when its
+        // area remains checked; native_job drops empty programs too.
+        let mut partial=DiscBrowserState::new(mixed,"disc.iso".into());
+        partial.keep_dst=vec![false,true];
+        partial.items_checked[0][0]=false;
+        let planned=partial.native_job("/tmp/extract-test".into());
+        assert_eq!(planned.programs.len(),1);
+        assert!(planned.programs[0].keep_dst);
+        assert!(option_value(&partial,"Format").starts_with("DFF ·"));
+    }
+
+    #[test]
+    fn r16_sacd_program_layout_shows_two_five_and_six_channels() {
+        let mut state=sacd_state(false,false);
+        for (channels,layout,expected) in [
+            (2,"Stereo","2.0"), (5,"5.0","5.0"), (6,"5.1","5.1"),
+            (5,"Multichannel","5.0"), (6,"Multichannel","5.1"),
+        ] {
+            state.contents.presentations[0].format.channels=Some(channels);
+            state.contents.presentations[0].format.channel_layout=Some(layout.into());
+            let program=&state.contents.presentations[0];
+            let details=program_info(program,DiscFormat::Sacd);
+            assert!(details.ends_with(&format!(" · {expected}")),"{details}");
+            let (lines,_)=rendered_lines(&state,154,40);
+            assert!(lines.join("\n").contains(&format!("DSD64 · {expected}")),
+                "{channels} channels absent from rendered area");
+        }
+    }
+
+    #[test]
+    fn r16_rendered_destination_hitboxes_separate_folder_naming_and_overwrite() {
+        let mut state=sacd_state(false,false);
+        state.focus=ExtractFocus::Output;
+        state.output_cursor=3;
+        let theme=crate::tui::theme::theme_by_slug_or_default("tokyo-night");
+        for (width,height) in [(72,24),(110,34),(154,40)] {
+            let mut buttons=ButtonRenderMap::new();
+            let mut terminal=Terminal::new(TestBackend::new(width,height)).unwrap();
+            terminal.draw(|f|draw(f,&state,Path::new("/tmp"),&mut buttons,theme)).unwrap();
+            let targets=[TuiButton::DiscBrowserOutput(3),
+                TuiButton::DiscBrowserNaming];
+            for target in targets {
+                let rect=buttons.button_rect(target).expect("visible destination action");
+                let hit=buttons.find_button_at(rect.x,rect.y);
+                assert_eq!(hit,Some(target),"{width}x{height}: {target:?} at {rect:?}");
+            }
+            let folder=buttons.button_rect(TuiButton::DiscBrowserOutput(3)).unwrap();
+            let naming=buttons.button_rect(TuiButton::DiscBrowserNaming).unwrap();
+            assert_eq!(naming.y,folder.y+1,"{width}x{height}: distinct rows");
+            assert_eq!(naming.x,folder.x);
+            if width>=154 {
+                let overwrite=buttons.button_rect(TuiButton::DiscBrowserOverwrite)
+                    .expect("wide overwrite action");
+                assert_eq!(buttons.find_button_at(overwrite.x,overwrite.y),
+                    Some(TuiButton::DiscBrowserOverwrite));
+                assert!(overwrite.x>folder.x && overwrite.y<folder.y,
+                    "overwrite must be a separate control: {overwrite:?} {folder:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn r15_focus_exclusive_and_selected_sacd_format_is_source_driven() {
+        let theme=crate::tui::theme::theme_by_slug_or_default("tokyo-night");
+        let mut state=sacd_state(false,false);
+        assert!(option_value(&state,"Format").contains("native DSD"));
+        state.contents.presentations[0].tracks[0].format_note=Some("DST compressed".into());
+        assert!(option_value(&state,"Format").contains("DST decoded"));
+        state.keep_dst[0]=true;
+        assert!(option_value(&state,"Format").contains("keep selected DST"));
+        state.selected[0]=false;
+        assert!(option_value(&state,"Format").contains("native DSD"));
+        state.selected[0]=true;
+        state.keep_dst[0]=false;
+        let area=Rect::new(3,3,120,6);
+        let mut terminal=Terminal::new(TestBackend::new(130,16)).unwrap();
+        state.focus=ExtractFocus::Programs;
+        state.output_cursor=0;
+        terminal.draw(|f|{
+            let mut buttons=ButtonRenderMap::new();
+            draw_output(f,&state,area,&mut buttons,theme,true);
+        }).unwrap();
+        let buf=terminal.backend().buffer();
+        let (x,y)=word_cells(buf,"Format","unfocused output");
+        assert_eq!(buf.get(x,y).bg,extract_colors(theme).band,
+            "unfocused output selection must not draw a bright or muted bar");
+        state.focus=ExtractFocus::Output;
+        terminal.draw(|f|{
+            let mut buttons=ButtonRenderMap::new();
+            draw_output(f,&state,area,&mut buttons,theme,true);
+        }).unwrap();
+        let buf=terminal.backend().buffer();
+        let (x,y)=word_cells(buf,"Format","focused output");
+        assert_eq!(buf.get(x,y).bg,theme.selection_bg);
+        assert_eq!(buf.get(x,y).fg,readable_word(theme.value,theme.selection_bg));
+        let (x,y)=word_cells(buf,"Files","other output row");
+        assert_eq!(buf.get(x,y).bg,extract_colors(theme).band);
+    }
+
+    #[test]
+    fn r15_normal_width_cap_and_full_terminal_maximize_have_title_hitboxes() {
+        let mut state=sacd_state(false,false);
+        let theme=crate::tui::theme::theme_by_slug_or_default("tokyo-night");
+        let mut terminal=Terminal::new(TestBackend::new(240,50)).unwrap();
+        let mut normal=None;
+        terminal.draw(|f|{
+            let mut buttons=ButtonRenderMap::new();
+            draw(f,&state,Path::new("/tmp"),&mut buttons,theme);
+            normal=buttons.button_rect(TuiButton::DiscBrowserTitle);
+        }).unwrap();
+        let normal=normal.unwrap();
+        assert!(normal.width<=150 && normal.x>=4 && normal.y>=2,
+            "normal popup should be centered and leave background visible: {normal:?}");
+        let lines=(0..50).map(|y|(0..240)
+            .map(|x|terminal.backend().buffer().get(x,y).symbol().to_owned())
+            .collect::<Vec<_>>().concat()).collect::<Vec<_>>().join("\n");
+        assert!(lines.contains("▸ extract tracks"));
+        state.maximized=true;
+        let mut maximum=None;
+        terminal.draw(|f|{
+            let mut buttons=ButtonRenderMap::new();
+            draw(f,&state,Path::new("/tmp"),&mut buttons,theme);
+            maximum=buttons.button_rect(TuiButton::DiscBrowserTitle);
+        }).unwrap();
+        assert_eq!(maximum.unwrap(),Rect::new(0,0,240,1));
+        let buf=terminal.backend().buffer();
+        assert_eq!(buf.get(2,0).symbol(),"▾");
+        assert_eq!(buf.get(0,49).symbol(),"└");
+        assert_eq!(buf.get(239,49).symbol(),"┘");
+    }
+
+    #[test]
+    fn r15_folder_path_preserves_disc_identity_and_naming_separately() {
+        let home=std::env::var_os("HOME").map(std::path::PathBuf::from)
+            .unwrap_or_else(||std::path::PathBuf::from("/home/test"));
+        let disc=home.join("temp/external/archive/audio-isos/sacd")
+            .join("1973 - Genesis - Selling England By The Pound (2024, SACD, Analogue Productions)")
+            .join("Extracted");
+        let folder=compact_folder_path(&disc,86);
+        assert!(folder.chars().count()<=86 && folder.contains("Selling England By The Pound"),
+            "{folder}");
+        assert!(folder.ends_with("/Extracted"),"{folder}");
+        if std::env::var_os("HOME").is_some(){assert!(folder.starts_with("~/…/"),"{folder}");}
+        let mut state=sacd_state(false,false);
+        state.destination=disc;
+        let (lines,_)=rendered_lines(&state,154,40);
+        let text=lines.join("\n");
+        assert!(text.contains("Folder") && text.contains("Naming"),"{text}");
+        assert!(text.contains("{track} - {title}"),"{text}");
+        assert!(!text.contains(" / {track}"),"template must not resemble a path component");
+        assert_eq!(format_bytes(479*1024*1024),"479 MiB");
+        assert_eq!(format_bytes(2*1024*1024*1024),"2.0 GiB");
+        let mut state=sacd_state(false,false);
+        state.contents.presentations[0].tracks[0].title=Some("Dancing with the Moonlit Knight".into());
+        state.contents.presentations[0].tracks[0].duration_secs=Some(484.0);
+        state.focus=ExtractFocus::Items;
+        let (lines,_)=rendered_lines(&state,150,40);
+        assert!(lines.iter().any(|row|row.contains("01 8:04 Dancing")),"{lines:?}");
+    }
 }

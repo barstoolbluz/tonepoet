@@ -72834,6 +72834,13 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             if let Some(button) = app.button_map.find_button_at(mouse.column, mouse.row) {
                 let now = std::time::Instant::now();
                 let click_count = match button {
+                    TuiButton::DiscBrowserTitle => {
+                        app.last_disc_browser_stream_click = None;
+                        if app.double_click.register_click(
+                            TuiButton::DiscBrowserTitle,mouse.column,mouse.row,
+                            tui_file_picker::DOUBLE_CLICK_WINDOW,
+                        ) {2}else{1}
+                    }
                     TuiButton::DiscBrowserStream(index) => {
                         let is_double = app
                             .last_disc_browser_stream_click
@@ -74690,6 +74697,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::FormatSettingsSoxAliasing(_)
             | TuiButton::FormatSettingsSoxSincPhase(_)
             | TuiButton::FormatSettingsSoxrChebyshev(_)
+            | TuiButton::DiscBrowserTitle
             | TuiButton::DiscBrowserStream(_)
             | TuiButton::DiscBrowserExpand(_)
             | TuiButton::DiscBrowserTrack(_)
@@ -74697,6 +74705,8 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::DiscBrowserAnglePrev(_)
             | TuiButton::DiscBrowserAngleNext(_)
             | TuiButton::DiscBrowserOutput(_)
+            | TuiButton::DiscBrowserNaming
+            | TuiButton::DiscBrowserOverwrite
             | TuiButton::DiscBrowserExtract
             | TuiButton::DiscBrowserMore
             | TuiButton::DiscBrowserConvert

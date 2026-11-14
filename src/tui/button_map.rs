@@ -379,6 +379,7 @@ pub enum TuiButton {
     BrowseSearchAudioOnly,
 
     // Disc browser overlay.
+    DiscBrowserTitle,
     DiscBrowserStream(usize),
     DiscBrowserExpand(usize),
     DiscBrowserTrack(usize),
@@ -386,6 +387,8 @@ pub enum TuiButton {
     DiscBrowserAnglePrev(usize),
     DiscBrowserAngleNext(usize),
     DiscBrowserOutput(usize),
+    DiscBrowserNaming,
+    DiscBrowserOverwrite,
     DiscBrowserExtract,
     DiscBrowserMore,
     DiscBrowserConvert,
@@ -547,6 +550,7 @@ impl TuiButton {
             | Self::CuePreviewBottom
             | Self::CuePreviewEditCommit
             | Self::CuePreviewEditCancel
+            | Self::DiscBrowserTitle
             | Self::DiscBrowserStream(_)
             | Self::DiscBrowserExpand(_)
             | Self::DiscBrowserTrack(_)
@@ -554,6 +558,8 @@ impl TuiButton {
             | Self::DiscBrowserAnglePrev(_)
             | Self::DiscBrowserAngleNext(_)
             | Self::DiscBrowserOutput(_)
+            | Self::DiscBrowserNaming
+            | Self::DiscBrowserOverwrite
             | Self::DiscBrowserExtract
             | Self::DiscBrowserMore
             | Self::DiscBrowserConvert

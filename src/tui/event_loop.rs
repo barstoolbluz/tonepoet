@@ -21869,7 +21869,18 @@ mod async_message_drain_tests {
         }).collect::<Vec<_>>().join("\n");
         assert!(first_screen.contains("File task details"), "{first_screen}");
         assert!(first_screen.contains("requested"), "{first_screen}");
-        assert!(first_screen.contains("overlaps reserved"), "{first_screen}");
+        // A full error is retained; wrapping is allowed to split a word at
+        // the terminal's edge. Do not require one unbroken screen substring.
+        let unwrapped=first_screen.chars()
+            .filter(|ch|!ch.is_whitespace() && !matches!(ch,'│'|'├'|'┤'|'┌'|'┐'|'─'|'└'|'┘'))
+            .collect::<String>();
+        assert!(unwrapped.contains("overlapsreserved"), "{first_screen}");
+        assert!(retained.status.contains("overlaps reserved"));
+        // The Details overlay must have intact rails on content rows too.
+        for y in 1..21 {
+            assert_eq!(buffer.get(0,y).symbol(),"│", "missing left rail at row {y}");
+            assert_eq!(buffer.get(119,y).symbol(),"│", "missing right rail at row {y}");
+        }
     }
 
     #[test]

@@ -410,6 +410,14 @@ pub fn handle_disc_browser_button_click_with_shift(
             open_selected_disc_browser(app, tx);
             true
         }
+        TuiButton::DiscBrowserTitle => {
+            if click_count >= 2 {
+                if let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay {
+                    state.maximized = !state.maximized;
+                }
+            }
+            true
+        }
         TuiButton::DiscBrowserStream(index) | TuiButton::DiscBrowserExpand(index) => {
             let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay else { return false; };
             let previous = state.cursor;
@@ -452,11 +460,28 @@ pub fn handle_disc_browser_button_click_with_shift(
             state.focus = crate::tui::disc_browser::ExtractFocus::Output;
             state.output_cursor = *index;
             if state.current_output_panel() == crate::tui::disc_browser::ExtractPanel::Destination {
+                // Only the Folder row opens the directory picker.
                 open_native_destination_picker(app);
             } else if let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay {
                 state.panel = Some(state.current_output_panel());
                 state.panel_cursor = 0;
             }
+            true
+        }
+        TuiButton::DiscBrowserNaming => {
+            let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay else { return false; };
+            state.focus = crate::tui::disc_browser::ExtractFocus::Output;
+            state.output_cursor = 3;
+            state.panel = Some(crate::tui::disc_browser::ExtractPanel::Destination);
+            state.panel_cursor = 0;
+            begin_native_template_edit(state);
+            true
+        }
+        TuiButton::DiscBrowserOverwrite => {
+            let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay else { return false; };
+            state.focus = crate::tui::disc_browser::ExtractFocus::Output;
+            state.output_cursor = 3;
+            cycle_native_overwrite(state);
             true
         }
         TuiButton::DiscBrowserExtract => {
@@ -491,6 +516,22 @@ pub fn handle_disc_browser_double_click(
     tx: &mpsc::Sender<AppMessage>,
 ) -> bool {
     handle_disc_browser_button_click(app, button, 2, tx)
+}
+
+// Mouse and keyboard share the existing Destination editor and policy.
+fn begin_native_template_edit(state: &mut DiscBrowserState) {
+    state.destination_input = state.naming_template.clone();
+    state.editing_destination = true;
+    state.editing_template = true;
+}
+
+fn cycle_native_overwrite(state: &mut DiscBrowserState) {
+    use crate::convert::pipeline::native_extract::NativeOverwritePolicy;
+    state.overwrite_policy = match state.overwrite_policy {
+        NativeOverwritePolicy::Fail => NativeOverwritePolicy::Skip,
+        NativeOverwritePolicy::Skip => NativeOverwritePolicy::Replace,
+        NativeOverwritePolicy::Replace => NativeOverwritePolicy::Fail,
+    };
 }
 
 fn cycle_native_option(state: &mut DiscBrowserState, step: i32) {
@@ -531,6 +572,13 @@ pub fn handle_disc_browser_key(
 ) {
     use crossterm::event::KeyModifiers;
     use crate::tui::disc_browser::{ExtractFocus, ExtractPanel};
+    let ActiveOverlay::DiscBrowser(_) = &app.active_overlay else { return; };
+    if matches!(key.code, KeyCode::Char('m' | 'M')) && key.modifiers == KeyModifiers::ALT {
+        if let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay {
+            state.maximized = !state.maximized;
+        }
+        return;
+    }
     let ActiveOverlay::DiscBrowser(state) = &app.active_overlay else { return; };
     // Text editors and popups own their keys. In particular Ctrl+X must not
     // bypass an unfinished destination edit or a pending choice dialog.
@@ -574,14 +622,19 @@ pub fn handle_disc_browser_key(
             return;
         }
     }
+    // Folder activation is the same with Enter or a click. Route before the
+    // mutable state borrow: the picker takes ownership of the dialog.
     if key.code == KeyCode::Enter && matches!(&app.active_overlay,
         ActiveOverlay::DiscBrowser(state) if state.panel.is_none()
+            && !state.editing_destination
             && state.focus == ExtractFocus::Output
             && state.current_output_panel() == ExtractPanel::Destination)
     {
         open_native_destination_picker(app);
         return;
     }
+    // Space on Folder opens its settings panel; `p` inside remains a
+    // convenient alternative for opening the existing directory picker.
     if key.code == KeyCode::Char('p') && matches!(&app.active_overlay,
         ActiveOverlay::DiscBrowser(state) if state.panel == Some(ExtractPanel::Destination)
             && !state.editing_destination)
@@ -647,21 +700,10 @@ pub fn handle_disc_browser_key(
                     if *selected { state.keep_dst[i] = false; }
                 }
             },
-            (ExtractPanel::Destination, KeyCode::Char('t')) => {
-                state.destination_input = state.naming_template.clone();
-                state.editing_destination = true;
-                state.editing_template = true;
-            }
+            (ExtractPanel::Destination, KeyCode::Char('t')) => begin_native_template_edit(state),
             (ExtractPanel::Destination, KeyCode::Char('s')) => state.program_subfolders = !state.program_subfolders,
             (ExtractPanel::Destination, KeyCode::Char('l')) => state.extraction_log = !state.extraction_log,
-            (ExtractPanel::Destination, KeyCode::Char('o')) => {
-                use crate::convert::pipeline::native_extract::NativeOverwritePolicy;
-                state.overwrite_policy = match state.overwrite_policy {
-                    NativeOverwritePolicy::Fail => NativeOverwritePolicy::Skip,
-                    NativeOverwritePolicy::Skip => NativeOverwritePolicy::Replace,
-                    NativeOverwritePolicy::Replace => NativeOverwritePolicy::Fail,
-                };
-            },
+            (ExtractPanel::Destination, KeyCode::Char('o')) => cycle_native_overwrite(state),
             (ExtractPanel::Format, KeyCode::Char('k')) if state.contents.format == crate::disc::DiscFormat::Sacd => {
                 cycle_native_option(state, 1);
             }
@@ -721,6 +763,10 @@ pub fn handle_disc_browser_key(
         KeyCode::Char(' ') => match state.focus {
             ExtractFocus::Programs => state.toggle_selected(state.cursor),
             ExtractFocus::Items => state.toggle_item(state.item_cursor),
+            ExtractFocus::Output if state.current_output_panel() == ExtractPanel::Destination => {
+                state.panel = Some(ExtractPanel::Destination);
+                state.panel_cursor = 0;
+            },
             ExtractFocus::Output => cycle_native_option(state, 1),
         },
         KeyCode::Char('a') | KeyCode::Char('n') | KeyCode::Char('i') => {
@@ -1291,6 +1337,8 @@ mod tests {
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.active_overlay = ActiveOverlay::DiscBrowser(Box::new(state));
         let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        // Folder is the selected output row: Enter must open the directory
+        // picker directly, without first visiting Destination settings.
         handle_disc_browser_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
         assert!(app.pending_disc_extract_picker.is_some());
         let (id, purpose) = match &app.active_overlay {
@@ -1315,6 +1363,172 @@ mod tests {
         assert_eq!(restored.focus, crate::tui::disc_browser::ExtractFocus::Output);
         assert_ne!(restored.destination, original_dest);
         assert!(app.pending_disc_extract_picker.is_none());
+    }
+
+    #[test]
+    fn r17_folder_enter_space_and_other_output_panels_at_supported_viewports() {
+        use crate::tui::button_map::ButtonRenderMap;
+        use crate::tui::disc_browser::{ExtractFocus, ExtractPanel};
+        use crossterm::event::KeyModifiers;
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let temp = tempfile::tempdir().unwrap();
+        let disc = temp.path().join("disc.iso");
+        std::fs::write(&disc, b"disc fixture").unwrap();
+        let mut base = DiscBrowserState::new(
+            selectable_disc_contents(disc.clone(), FolderDiscMarkerKind::Sacd), disc);
+        base.destination = temp.path().join("extracted");
+        base.focus = ExtractFocus::Output;
+        base.output_cursor = 3;
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+
+        for (width, height) in [(72, 24), (110, 34), (154, 40)] {
+            let mut buttons = ButtonRenderMap::new();
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| crate::tui::disc_extract_render::draw(
+                frame, &base, temp.path(), &mut buttons,
+                crate::tui::theme::theme_by_slug_or_default("tokyo-night"),
+            )).unwrap();
+            let folder = buttons.button_rect(TuiButton::DiscBrowserOutput(3))
+                .expect("Folder must be present in the rendered button map");
+            assert_eq!(buttons.find_button_at(folder.x, folder.y),
+                Some(TuiButton::DiscBrowserOutput(3)));
+            let screen = (0..height).map(|y| (0..width)
+                .map(|x| terminal.backend().buffer().get(x, y).symbol().to_owned())
+                .collect::<Vec<_>>().concat()).collect::<Vec<_>>().join("\n");
+            assert!(screen.contains("Space settings"),
+                "{width}x{height}: missing contextual shortcut hint: {screen}");
+
+            // Enter opens the directory picker in one operation, not the
+            // Destination settings panel. The suspended dialog remains intact.
+            let mut direct = AppState::new_for_test(TonepoetConfig::default());
+            direct.active_overlay = ActiveOverlay::DiscBrowser(Box::new(base.clone()));
+            handle_disc_browser_key(&mut direct,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+            assert!(matches!(direct.active_overlay, ActiveOverlay::FilePicker(_)),
+                "{width}x{height}: Enter must open the folder picker");
+            assert!(direct.pending_disc_extract_picker.is_some());
+
+            let mut click = AppState::new_for_test(TonepoetConfig::default());
+            click.active_overlay = ActiveOverlay::DiscBrowser(Box::new(base.clone()));
+            let mapped = buttons.find_button_at(folder.x, folder.y).unwrap();
+            assert!(handle_disc_browser_button_click(&mut click, &mapped, 1, &tx));
+            assert!(matches!(click.active_overlay, ActiveOverlay::FilePicker(_)),
+                "{width}x{height}: Folder click must still open the picker");
+
+            // Space opens the existing settings panel. Its established 'o'
+            // control is still usable, and 'p' opens the same directory picker.
+            let mut settings = AppState::new_for_test(TonepoetConfig::default());
+            settings.active_overlay = ActiveOverlay::DiscBrowser(Box::new(base.clone()));
+            handle_disc_browser_key(&mut settings,
+                KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+            assert!(matches!(&settings.active_overlay, ActiveOverlay::DiscBrowser(s)
+                if s.panel == Some(ExtractPanel::Destination)));
+            handle_disc_browser_key(&mut settings,
+                KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE), &tx);
+            assert!(matches!(&settings.active_overlay, ActiveOverlay::DiscBrowser(s)
+                if s.overwrite_policy ==
+                    crate::convert::pipeline::native_extract::NativeOverwritePolicy::Skip));
+            handle_disc_browser_key(&mut settings,
+                KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE), &tx);
+            assert!(matches!(settings.active_overlay, ActiveOverlay::FilePicker(_)));
+            assert!(settings.pending_disc_extract_picker.is_some());
+
+            // Enter on the other output rows must continue opening their own
+            // settings panels, rather than the Folder picker.
+            for (index, expected_panel) in [
+                (0, ExtractPanel::Format), (1, ExtractPanel::Files),
+                (2, ExtractPanel::Tags),
+            ] {
+                let mut row = base.clone();
+                row.output_cursor = index;
+                let mut other = AppState::new_for_test(TonepoetConfig::default());
+                other.active_overlay = ActiveOverlay::DiscBrowser(Box::new(row));
+                handle_disc_browser_key(&mut other,
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+                assert!(matches!(&other.active_overlay, ActiveOverlay::DiscBrowser(s)
+                    if s.panel == Some(expected_panel)),
+                    "{width}x{height}: Enter on output row {index} misrouted");
+                assert!(other.pending_disc_extract_picker.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn r16_rendered_destination_mouse_actions_and_keyboard_settings_work() {
+        use crossterm::event::KeyModifiers;
+        use crate::convert::pipeline::native_extract::NativeOverwritePolicy;
+        use crate::tui::disc_browser::{ExtractFocus, ExtractPanel};
+        use crate::tui::button_map::ButtonRenderMap;
+        use ratatui::{backend::TestBackend, Terminal};
+        let source=PathBuf::from("disc.iso");
+        let contents=selectable_disc_contents(source.clone(),FolderDiscMarkerKind::Sacd);
+        let mut app=AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay=ActiveOverlay::DiscBrowser(Box::new(DiscBrowserState::new(contents,source)));
+        let (tx,_rx)=tokio::sync::mpsc::channel(8);
+        let mut buttons=ButtonRenderMap::new();
+        let mut terminal=Terminal::new(TestBackend::new(154,40)).unwrap();
+        if let ActiveOverlay::DiscBrowser(state)=&app.active_overlay {
+            terminal.draw(|frame|crate::tui::disc_extract_render::draw(frame,state,
+                Path::new("/tmp"),&mut buttons,app.theme)).unwrap();
+        }
+        let hit=|target| {
+            let rect=buttons.button_rect(target).expect("rendered button");
+            buttons.find_button_at(rect.x,rect.y).expect("clickable cell")
+        };
+        let naming=hit(TuiButton::DiscBrowserNaming);
+        let overwrite=hit(TuiButton::DiscBrowserOverwrite);
+        let folder=hit(TuiButton::DiscBrowserOutput(3));
+        assert_ne!(naming,folder);
+        assert_ne!(overwrite,folder);
+        assert_ne!(naming,overwrite);
+
+        // Naming enters the existing template editor. Cancel retains the
+        // previous template; a subsequent edit commits through normal keys.
+        handle_disc_browser_button_click(&mut app,&naming,1,&tx);
+        let previous=match &app.active_overlay {
+            ActiveOverlay::DiscBrowser(state)=>{
+                assert!(state.editing_destination && state.editing_template);
+                assert_eq!(state.panel,Some(ExtractPanel::Destination));
+                assert_eq!(state.focus,ExtractFocus::Output);
+                state.naming_template.clone()
+            }, other=>panic!("naming click opened {other:?}"),
+        };
+        handle_disc_browser_key(&mut app,KeyEvent::new(KeyCode::Esc,KeyModifiers::NONE),&tx);
+        let ActiveOverlay::DiscBrowser(state)=&app.active_overlay else {panic!("overlay lost")};
+        assert_eq!(state.naming_template,previous);
+        assert!(!state.editing_destination);
+        handle_disc_browser_key(&mut app,KeyEvent::new(KeyCode::Char('t'),KeyModifiers::NONE),&tx);
+        for _ in 0..previous.chars().count() {
+            handle_disc_browser_key(&mut app,KeyEvent::new(KeyCode::Backspace,KeyModifiers::NONE),&tx);
+        }
+        for ch in "{track}-{title}".chars() {
+            handle_disc_browser_key(&mut app,KeyEvent::new(KeyCode::Char(ch),KeyModifiers::NONE),&tx);
+        }
+        handle_disc_browser_key(&mut app,KeyEvent::new(KeyCode::Enter,KeyModifiers::NONE),&tx);
+        let ActiveOverlay::DiscBrowser(state)=&app.active_overlay else {panic!("overlay lost")};
+        assert_eq!(state.naming_template,"{track}-{title}");
+        assert_eq!(state.panel,Some(ExtractPanel::Destination));
+        handle_disc_browser_key(&mut app,KeyEvent::new(KeyCode::Char('o'),KeyModifiers::NONE),&tx);
+        let ActiveOverlay::DiscBrowser(state)=&app.active_overlay else {panic!("overlay lost")};
+        assert_eq!(state.overwrite_policy,NativeOverwritePolicy::Skip);
+        let subfolders=state.program_subfolders;
+        let log=state.extraction_log;
+        handle_disc_browser_key(&mut app,KeyEvent::new(KeyCode::Char('s'),KeyModifiers::NONE),&tx);
+        handle_disc_browser_key(&mut app,KeyEvent::new(KeyCode::Char('l'),KeyModifiers::NONE),&tx);
+        let ActiveOverlay::DiscBrowser(state)=&app.active_overlay else {panic!("overlay lost")};
+        assert_ne!(state.program_subfolders,subfolders);
+        assert_ne!(state.extraction_log,log);
+        handle_disc_browser_key(&mut app,KeyEvent::new(KeyCode::Esc,KeyModifiers::NONE),&tx);
+        for expected in [NativeOverwritePolicy::Replace,NativeOverwritePolicy::Fail,NativeOverwritePolicy::Skip] {
+            handle_disc_browser_button_click(&mut app,&overwrite,1,&tx);
+            let ActiveOverlay::DiscBrowser(state)=&app.active_overlay else {panic!("overlay lost")};
+            assert_eq!(state.overwrite_policy,expected);
+            assert_eq!(state.panel,None);
+        }
+        handle_disc_browser_button_click(&mut app,&folder,1,&tx);
+        assert!(app.pending_disc_extract_picker.is_some());
+        assert!(matches!(app.active_overlay,ActiveOverlay::FilePicker(_)));
     }
 
     #[test]
@@ -1395,5 +1609,27 @@ mod tests {
                 "{marker:?} folder-level activation must open the audio-streams overlay",
             );
         }
+    }
+
+    #[test]
+    fn r15_extract_title_double_click_and_alt_m_toggle_maximize_plain_m_keeps_options() {
+        use crossterm::event::KeyModifiers;
+        let source=std::path::PathBuf::from("disc.iso");
+        let contents=selectable_disc_contents(source.clone(),FolderDiscMarkerKind::Sacd);
+        let mut app=AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay=ActiveOverlay::DiscBrowser(Box::new(DiscBrowserState::new(contents,source)));
+        let (tx,_rx)=tokio::sync::mpsc::channel(4);
+        handle_disc_browser_button_click(&mut app,&TuiButton::DiscBrowserTitle,1,&tx);
+        let ActiveOverlay::DiscBrowser(state)=&app.active_overlay else {panic!("missing extract overlay")};
+        assert!(!state.maximized);
+        handle_disc_browser_button_click(&mut app,&TuiButton::DiscBrowserTitle,2,&tx);
+        let ActiveOverlay::DiscBrowser(state)=&app.active_overlay else {panic!("missing extract overlay")};
+        assert!(state.maximized);
+        handle_disc_browser_key(&mut app,KeyEvent::new(KeyCode::Char('m'),KeyModifiers::ALT),&tx);
+        let ActiveOverlay::DiscBrowser(state)=&app.active_overlay else {panic!("missing extract overlay")};
+        assert!(!state.maximized);
+        handle_disc_browser_key(&mut app,KeyEvent::new(KeyCode::Char('m'),KeyModifiers::NONE),&tx);
+        let ActiveOverlay::DiscBrowser(state)=&app.active_overlay else {panic!("missing extract overlay")};
+        assert_eq!(state.panel,Some(crate::tui::disc_browser::ExtractPanel::More));
     }
 }
