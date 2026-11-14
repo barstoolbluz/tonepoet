@@ -621,7 +621,7 @@ impl FileTaskJournalHandle {
             claims,
             admitted_mappings,
         } = if job.get("native_extraction").is_some() {
-            native_extraction_path_admission(&mappings)?
+            native_extraction_path_admission(&mappings, &job)?
         } else {
             file_task_path_admission(is_move, &mappings)?
         };
@@ -2435,30 +2435,88 @@ pub(crate) fn file_task_path_admission(
     })
 }
 
-/// A native extraction reads one disc and publishes a set of authored outputs
-/// inside the selected directory. Claim the destination *subtree* rather than
-/// a fictional copy target. The original copy/move admission is unchanged.
+/// A native extraction reads a disc but only writes its planned output files.
+/// Keep one logical mapping for the detached helper / recovery identity, while
+/// the durable lease claims each real output (including CUE and log) exactly.
+/// In particular, do not claim the whole destination folder: other file tasks
+/// must be able to write unrelated siblings there.
 fn native_extraction_path_admission(
     mappings: &[tui_file_picker::PasteMapping],
+    job: &serde_json::Value,
 ) -> Result<FileTaskPathAdmission, String> {
-    let mapping = mappings.first().ok_or("native extraction has no source mapping")?;
+    let mapping = mappings
+        .first()
+        .ok_or("native extraction has no source mapping")?;
     if mappings.len() != 1 {
-        return Err("native extraction must reserve one source and destination root".into());
+        return Err("native extraction must have one logical source and destination".into());
     }
+    let native: crate::convert::pipeline::native_extract::NativeExtractionJob =
+        serde_json::from_value(
+            job.get("native_extraction")
+                .cloned()
+                .ok_or("native extraction job is missing its selection")?,
+        )
+        .map_err(|error| format!("decode native extraction for path admission: {error}"))?;
+    if native.source != mapping.source || native.destination != mapping.destination {
+        return Err(
+            "native extraction journal endpoints differ from its selected source/destination".into(),
+        );
+    }
+
+    let source_scope = if native.source.is_dir() {
+        ClaimScope::Subtree
+    } else {
+        ClaimScope::Exact
+    };
     let source = PathClaim::resolve_with_semantics(
-        &mapping.source, ClaimMode::Read, ClaimScope::Subtree,
+        &native.source,
+        ClaimMode::Read,
+        source_scope,
         PathResolutionSemantics::FollowReferent,
     )?;
-    let dest = PathClaim::resolve_with_semantics(
-        &mapping.destination, ClaimMode::Write, ClaimScope::Subtree,
-        PathResolutionSemantics::FollowReferent,
-    )?;
+    let mut claims = vec![source.clone()];
+    let mut planned = std::collections::BTreeSet::new();
+    for program in &native.programs {
+        if native.file_per_program {
+            let media =
+                crate::convert::pipeline::native_extract::proposed_destination_for_program(
+                    &native, program,
+                );
+            if native.cue {
+                planned.insert(media.with_extension("cue"));
+            }
+            planned.insert(media);
+        } else {
+            for track in &program.tracks {
+                planned.insert(crate::convert::pipeline::native_extract::proposed_destination(
+                    &native, program, track,
+                ));
+            }
+        }
+    }
+    if native.extraction_log {
+        planned.insert(native.destination.join("native-extraction.log"));
+    }
+    if planned.is_empty() {
+        return Err("native extraction has no output files to reserve".into());
+    }
+    for output in planned {
+        claims.push(PathClaim::resolve_with_semantics(
+            &output,
+            ClaimMode::Write,
+            ClaimScope::Exact,
+            PathResolutionSemantics::NamespaceObject,
+        )?);
+    }
+    let resolved_root = crate::concurrency::ResolvedPathIdentity::resolve(&native.destination)?;
     Ok(FileTaskPathAdmission {
+        // The detached worker's logical mapping is unchanged: reservation
+        // scope comes only from the independently admitted path claims.
         admitted_mappings: vec![tui_file_picker::PasteMapping {
             source: source.identity.resolved_io_path.clone(),
-            destination: dest.identity.resolved_io_path.clone(),
+            destination: resolved_root.resolved_io_path,
         }],
-        claims: vec![source, dest],
+        claims,
     })
 }
 
@@ -2932,6 +2990,94 @@ fn sync_directory_best_effort(_path: &Path) {}
 mod tests {
     use super::*;
 
+    fn native_reservation_fixture(source: &Path, dest: &Path) ->
+        crate::convert::pipeline::native_extract::NativeExtractionJob
+    {
+        use crate::convert::pipeline::native_extract::{
+            NativeExtractionJob, NativeProgramChoice, NativeTrackChoice,
+            NativeTagValues, NativeWavContainer, NativeOverwritePolicy, NativeTagSource,
+        };
+        NativeExtractionJob {
+            source:source.to_path_buf(),format:crate::disc::DiscFormat::Sacd,
+            programs:vec![NativeProgramChoice {
+                id:crate::disc::PresentationId::SacdArea(crate::disc::SacdAreaId::Stereo),
+                angle:1,label:"Stereo".into(),keep_dst:false,
+                tracks:vec![NativeTrackChoice {
+                    number:1,name:"one".into(),tags:NativeTagValues::default(),
+                    estimated_bytes:Some(100_000),
+                }],
+                source_depth:Some(1),source_channels:Some(2),source_rate:Some(2_822_400),
+                source_layout:None,is_lossless:true,tags:NativeTagValues::default(),
+            }],
+            destination:dest.to_path_buf(),working_root:dest.to_path_buf(),
+            wav_container:NativeWavContainer::Automatic,assume_decrypted:false,
+            downmix:crate::convert::pipeline::DvdaDownmixPolicy::None,
+            naming_template:"{track} - {title}".into(),program_subfolders:false,
+            overwrite_policy:NativeOverwritePolicy::Fail,extraction_log:true,
+            file_per_program:false,cue:false,transfer_tags:false,
+            tag_source:NativeTagSource::DiscAndSidecar,tag_fields:0,tag_artwork:false,
+        }
+    }
+
+    #[test]
+    fn native_reservation_covers_only_planned_files_and_not_destination_subtree() {
+        let temp=tempfile::tempdir().unwrap();
+        let source=temp.path().join("disc.iso");
+        fs::write(&source,b"disc").unwrap();
+        let dest=temp.path().join("output");
+        fs::create_dir_all(&dest).unwrap();
+        let job=native_reservation_fixture(&source,&dest);
+        let mapping=tui_file_picker::PasteMapping {
+            source:source.clone(),destination:dest.clone(),
+        };
+        let admitted=native_extraction_path_admission(&[mapping],
+            &serde_json::json!({"native_extraction":job.clone()})).unwrap();
+        let audio=crate::convert::pipeline::native_extract::proposed_destination(
+            &job,&job.programs[0],&job.programs[0].tracks[0]);
+        assert_eq!(admitted.claims.len(),3); // source, audio, log
+        assert_eq!(admitted.admitted_mappings.len(),1);
+        let writes=admitted.claims.iter()
+            .filter(|claim|claim.mode==ClaimMode::Write).collect::<Vec<_>>();
+        assert_eq!(writes.len(),2);
+        assert!(writes.iter().all(|claim|claim.scope==ClaimScope::Exact));
+        assert!(writes.iter().any(|claim|claim.identity.resolved_io_path==audio));
+        assert!(writes.iter().any(|claim|claim.identity.resolved_io_path==dest.join("native-extraction.log")));
+        let unrelated=PathClaim::resolve_with_semantics(
+            &dest.join("unrelated-old-job"),ClaimMode::Write,ClaimScope::Subtree,
+            PathResolutionSemantics::NamespaceObject).unwrap();
+        assert!(admitted.claims.iter().all(|claim|!claim.conflicts_with(&unrelated)),
+            "unrelated work under the same destination must be admitted");
+        let same_audio=PathClaim::resolve_with_semantics(
+            &audio,ClaimMode::Write,ClaimScope::Exact,
+            PathResolutionSemantics::NamespaceObject).unwrap();
+        assert!(writes.iter().any(|claim|claim.conflicts_with(&same_audio)));
+    }
+
+    #[test]
+    fn continuous_native_reservation_includes_cue_and_log_without_folder_claim() {
+        let temp=tempfile::tempdir().unwrap();
+        let source=temp.path().join("dvd.iso");
+        fs::write(&source,b"disc").unwrap();
+        let dest=temp.path().join("output");
+        fs::create_dir_all(&dest).unwrap();
+        let mut job=native_reservation_fixture(&source,&dest);
+        job.format=crate::disc::DiscFormat::DvdAudio;
+        job.file_per_program=true;
+        job.cue=true;
+        let media=crate::convert::pipeline::native_extract::proposed_destination_for_program(
+            &job,&job.programs[0]);
+        let admitted=native_extraction_path_admission(&[tui_file_picker::PasteMapping {
+            source,destination:dest.clone(),
+        }],&serde_json::json!({"native_extraction":job})).unwrap();
+        let targets=admitted.claims.iter().filter(|claim|claim.mode==ClaimMode::Write)
+            .map(|claim|claim.identity.resolved_io_path.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(targets, [media.clone(),media.with_extension("cue"),
+            dest.join("native-extraction.log")].into_iter().collect());
+        assert!(admitted.claims.iter().filter(|claim|claim.mode==ClaimMode::Write)
+            .all(|claim|claim.scope==ClaimScope::Exact));
+    }
+
     #[test]
     fn native_skips_and_prepared_cues_survive_journal_replay_and_new_generation() {
         let _lock = test_environment_lock();
@@ -2942,8 +3088,9 @@ mod tests {
         fs::write(&source, b"native media fixture").unwrap();
         fs::create_dir_all(&dest).unwrap();
         let mapping = tui_file_picker::PasteMapping { source, destination: dest.clone() };
+        let selected=native_reservation_fixture(&mapping.source,&dest);
         let job = serde_json::json!({
-            "native_extraction": {"test_fixture": true},
+            "native_extraction": selected,
             "dest": dest.to_string_lossy(),
         });
         let first = FileTaskJournalHandle::create(

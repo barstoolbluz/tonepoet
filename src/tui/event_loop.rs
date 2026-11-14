@@ -2096,6 +2096,14 @@ fn reduce_file_task_progress(
     update: tui_file_picker::FileTaskProgressUpdate,
     tx: &mpsc::Sender<AppMessage>,
 ) {
+    // A single status line cannot contain two complete paths and recovery
+    // advice. Open the existing wrapped, scrollable file-task details view
+    // for reservation refusals; the full diagnostic stays in `status`.
+    let full_reservation_refusal = matches!(
+        &update,
+        tui_file_picker::FileTaskProgressUpdate::Failed { status, .. }
+            if status.contains("filesystem mutation conflicts with recovery reservation")
+    );
     let retained_update = update.clone();
     let terminal = matches!(
         &update,
@@ -2153,6 +2161,9 @@ fn reduce_file_task_progress(
             .as_deref_mut()
         {
             session.progress.apply_update(update.clone());
+            if full_reservation_refusal {
+                session.progress.open_details();
+            }
             live_progress_snapshot = Some(session.progress.clone());
             status_to_set = status.clone();
             refresh_after_terminal = terminal;
@@ -2186,6 +2197,9 @@ fn reduce_file_task_progress(
     {
         if let Some(session) = app.minimized_file_task_progress.as_mut() {
             session.progress.apply_update(update.clone());
+            if full_reservation_refusal {
+                session.progress.open_details();
+            }
             live_progress_snapshot = Some(session.progress.clone());
             status_to_set = status.clone();
             refresh_after_terminal = terminal;
@@ -2221,6 +2235,9 @@ fn reduce_file_task_progress(
             app.file_task_preempted_overlay.as_deref_mut()
         {
             session.progress.apply_update(update.clone());
+            if full_reservation_refusal {
+                session.progress.open_details();
+            }
             live_progress_snapshot = Some(session.progress.clone());
             status_to_set = status.clone();
             refresh_after_terminal = terminal;
@@ -2238,6 +2255,9 @@ fn reduce_file_task_progress(
                 if session.session_id == session_id && session.is_live_task() =>
             {
                 session.progress.apply_update(update.clone());
+                if full_reservation_refusal {
+                    session.progress.open_details();
+                }
                 live_progress_snapshot = Some(session.progress.clone());
                 status_to_set = status;
                 refresh_after_terminal = terminal;
@@ -2248,6 +2268,9 @@ fn reduce_file_task_progress(
                 // Keep an open read-only viewer current for the same underlying
                 // task, but never use its clone as ordering or retention authority.
                 session.progress.apply_update(update.clone());
+                if full_reservation_refusal {
+                    session.progress.open_details();
+                }
                 if !update_is_stale {
                     status_to_set = status;
                     refresh_after_terminal = terminal;
@@ -2289,6 +2312,9 @@ fn reduce_file_task_progress(
         match &mut app.last_file_task_progress {
             Some((retained_session_id, retained)) if *retained_session_id == session_id => {
                 retained.apply_update(retained_update.clone());
+                if full_reservation_refusal {
+                    retained.open_details();
+                }
             }
             Some((retained_session_id, _)) if *retained_session_id > session_id => {
                 // A late update from an older task must not displace the newer
@@ -2311,11 +2337,21 @@ fn reduce_file_task_progress(
                 super::keybindings::file_picker_theme_from_theme(&app.theme),
             );
             retained.apply_update(retained_update);
+            if full_reservation_refusal {
+                retained.open_details();
+            }
             app.last_file_task_progress = Some((session_id, retained));
         }
     }
     if let Some(status) = status_to_set {
-        app.set_status(status);
+        if full_reservation_refusal {
+            // Do not replace the native extraction progress dialog with the
+            // generic Recovery surface: it would hide the full path pair.
+            // The wrapped details view was opened on the failed snapshot.
+            app.set_status("Extraction output reservation conflict: full paths and recovery advice are in the file-task details dialog");
+        } else {
+            app.set_status(status);
+        }
     }
     let defer_clipboard_refresh = terminal
         && (app
@@ -7491,7 +7527,11 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                         false
                     }
                     Err(error) => {
-                        app.set_status(format!("Extraction ended: {error}"));
+                        if error.contains("filesystem mutation conflicts with recovery reservation") {
+                            app.set_status("Extraction was refused: the complete conflicting paths and recovery advice are shown in file-task details");
+                        } else {
+                            app.set_status(format!("Extraction ended: {error}"));
+                        }
                         true
                     }
                 };
@@ -21777,6 +21817,59 @@ mod async_message_drain_tests {
             Some(&report),
             "closing a stale viewer clone must never overwrite authoritative completion data"
         );
+    }
+
+    #[test]
+    fn native_reservation_failure_opens_full_scrollable_file_task_details() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let progress = tui_file_picker::FileTaskProgressState::new(
+            tui_file_picker::FileTaskKind::Extract,
+            "Extracting disc audio",
+            super::super::keybindings::file_picker_theme_from_theme(&app.theme),
+        );
+        let (control_tx, _control_rx) = std::sync::mpsc::channel();
+        let session = super::super::app::FileTaskProgressSession::new(progress, control_tx);
+        let session_id = session.session_id;
+        app.install_file_task_progress(session);
+        let (tx, _rx) = mpsc::channel(8);
+        let complete_error = format!(
+            "filesystem mutation conflicts with recovery reservation: requested '{}' overlaps reserved '{}'; retry after TonePoet finishes interrupted-operation recovery",
+            "/home/user/temp/new/audio-output.dsf",
+            "/home/user/temp/other-operation/published-track.flac",
+        );
+        reduce_file_task_progress(
+            &mut app,
+            session_id,
+            tui_file_picker::FileTaskProgressUpdate::Failed {
+                status: complete_error.clone(),
+                totals: tui_file_picker::ProgressTotals {
+                    errors: 1,
+                    ..tui_file_picker::ProgressTotals::default()
+                },
+            },
+            &tx,
+        );
+        let (_, retained) = app.last_file_task_progress.as_ref().unwrap();
+        assert_eq!(retained.status, complete_error);
+        assert_eq!(app.status_message.as_ref().map(|(text, _)| text.as_str()),
+            Some("Extraction output reservation conflict: full paths and recovery advice are in the file-task details dialog"));
+        let ActiveOverlay::FileTaskProgress(session) = &mut app.active_overlay else {
+            panic!("the failed task must retain its visible progress overlay");
+        };
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        terminal.draw(|frame| {
+            session.progress.render(frame, ratatui::layout::Rect::new(0, 0, 120, 24));
+        }).unwrap();
+        let buffer = terminal.backend().buffer();
+        let first_screen = (0..24).map(|row| {
+            (0..120).map(|col| buffer.get(col, row).symbol().to_owned())
+                .collect::<String>()
+        }).collect::<Vec<_>>().join("\n");
+        assert!(first_screen.contains("File task details"), "{first_screen}");
+        assert!(first_screen.contains("requested"), "{first_screen}");
+        assert!(first_screen.contains("overlaps reserved"), "{first_screen}");
     }
 
     #[test]
