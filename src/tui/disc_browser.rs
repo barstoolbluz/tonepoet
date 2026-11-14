@@ -265,11 +265,26 @@ pub struct DiscBrowserState {
     pub item_cursor: usize,
     pub item_scroll: usize,
     pub output_cursor: usize,
+    /// Keyboard focus among Extract, Convert, Options, and Close.
+    pub footer_cursor: usize,
+    /// Set by the renderer from the actual popup geometry; keyboard arrows
+    /// must use the same one- or two-column layout the user sees.
+    pub form_wide: std::cell::Cell<bool>,
+    pub form_column: usize,
+    pub footer_extract_enabled: std::cell::Cell<bool>,
+    /// An anchored Overwrite list, not a settings sheet. The committed policy
+    /// only changes on Enter or a deliberate mouse selection.
+    pub overwrite_open: bool,
+    pub overwrite_cursor: usize,
     pub show_hidden: bool,
     pub panel: Option<ExtractPanel>,
     pub panel_cursor: usize,
     pub editing_destination: bool,
     pub destination_input: String,
+    /// Unicode scalar insertion point in the active destination editor.
+    pub destination_caret: usize,
+    /// Cached destination feedback, refreshed on edits and picker completion.
+    pub destination_feedback: Option<DestinationFeedback>,
     pub editing_template: bool,
     pub naming_template: String,
     pub program_subfolders: bool,
@@ -304,10 +319,13 @@ pub struct DiscBrowserState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExtractFocus { Programs, Items, Output }
+pub enum ExtractFocus { Programs, Items, Output, Footer }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExtractPanel { Format, Files, Tags, Destination, Downmix, AssumeDecrypted, Diagnostics, More, ConvertChoice, Keys }
+pub enum DestinationFeedback { WillBeCreated, NotWritable, InvalidPath }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtractPanel { Tags, Downmix, AssumeDecrypted, Diagnostics, More, ConvertChoice, Keys }
 
 /// One logical row in the Audio Streams overlay after expansion is applied.
 ///
@@ -347,7 +365,7 @@ impl DiscBrowserState {
                     && p.format.bit_depth.is_none())
             ) { None } else { Some(Ok(Default::default())) }
         }).collect();
-        Self {
+        let mut state = Self {
             contents,
             cursor: 0,
             expanded: vec![false; len],
@@ -360,11 +378,19 @@ impl DiscBrowserState {
             item_cursor: 0,
             item_scroll: 0,
             output_cursor: 0,
+            footer_cursor: 0,
+            form_wide: std::cell::Cell::new(false),
+            form_column: 0,
+            footer_extract_enabled: std::cell::Cell::new(true),
+            overwrite_open: false,
+            overwrite_cursor: 0,
             show_hidden: false,
             panel: None,
             panel_cursor: 0,
             editing_destination: false,
             destination_input: String::new(),
+            destination_caret: 0,
+            destination_feedback: None,
             editing_template: false,
             naming_template: "{track} - {title}".into(),
             program_subfolders: true,
@@ -387,7 +413,9 @@ impl DiscBrowserState {
             probe_id: NEXT_EXTRACT_PROBE_ID.fetch_add(1, Ordering::Relaxed),
             probe_cancel: CancellationToken::new(),
             probe_statuses,
-        }
+        };
+        if state.destination.is_absolute() { state.refresh_destination_feedback(); }
+        state
     }
 
     pub fn len(&self) -> usize {
@@ -817,7 +845,7 @@ impl DiscBrowserState {
                     if old != wanted { self.set_item_checked(i, wanted); }
                 }
             }
-            ExtractFocus::Output => {}
+            ExtractFocus::Output | ExtractFocus::Footer => {}
         }
     }
 
@@ -843,9 +871,13 @@ impl DiscBrowserState {
     }
 
     pub fn output_rows(&self) -> Vec<&'static str> {
-        // Each drawn setting has one keyboard stop, including the legacy
-        // Destination panel's Folder, Naming, and Overwrite controls.
-        let mut rows = vec!["Format", "Files", "Tags", "Overwrite", "Folder", "Naming"];
+        // One row per form control, plus a non-focusable Tags warning when
+        // DFF-only output cannot carry metadata. CUE remains conditional.
+        let mut rows = vec!["Format", "Overwrite", "Files", "Tags", "Log"];
+        if self.file_per_program && self.contents.format != DiscFormat::Sacd {
+            rows.push("CUE");
+        }
+        rows.extend(["Folder", "Naming"]);
         if self.contents.format == DiscFormat::DvdAudio && self.contents.presentations.iter().enumerate()
             .any(|(i,p)| self.selected.get(i) == Some(&true) && p.format.channels.unwrap_or(0) > 2) {
             rows.push("Downmix");
@@ -856,19 +888,73 @@ impl DiscBrowserState {
         rows
     }
 
-    pub fn current_output_row(&self) -> &'static str {
-        self.output_rows().get(self.output_cursor).copied().unwrap_or("Format")
+    /// The wide form has three paired rows and two full-width fields. CUE
+    /// occupies the otherwise empty left cell beside Log, not an extra row.
+    /// Extra DVD-Audio controls retain fixed row positions independently.
+    pub fn wide_output_height(&self) -> u16 {
+        let rows = self.output_rows();
+        if rows.contains(&"Assume decrypted") { 9 }
+        else if rows.contains(&"Downmix") { 8 }
+        else { 7 }
     }
 
-    pub fn current_output_panel(&self) -> ExtractPanel {
-        match self.current_output_row() {
-            "Files" => ExtractPanel::Files,
-            "Tags" => ExtractPanel::Tags,
-            "Folder" | "Naming" | "Overwrite" => ExtractPanel::Destination,
-            "Downmix" => ExtractPanel::Downmix,
-            "Assume decrypted" => ExtractPanel::AssumeDecrypted,
-            _ => ExtractPanel::Format,
+    /// Track selected DFF (DST-preserving) versus DSF destinations. The
+    /// plain-DSD DFF carrier is deliberately deferred to round 4.
+    pub fn selected_sacd_tag_carriers(&self) -> (bool, bool) {
+        if self.contents.format != DiscFormat::Sacd { return (true, false); }
+        let mut dsf = false;
+        let mut dff = false;
+        for (i, chosen) in self.selected.iter().enumerate() {
+            if !*chosen || !self.items_checked.get(i).is_some_and(|v| v.iter().any(|item| *item)) {
+                continue;
+            }
+            if self.keep_dst.get(i).copied().unwrap_or(false) { dff = true; }
+            else { dsf = true; }
         }
+        (dsf, dff)
+    }
+
+    pub fn native_tags_available(&self) -> bool {
+        let (dsf,dff) = self.selected_sacd_tag_carriers();
+        dsf || !dff
+    }
+
+    /// One filesystem inspection per destination change, never on redraw.
+    /// This is guidance; the worker still performs authoritative validation.
+    pub fn refresh_destination_feedback(&mut self) {
+        let path = &self.destination;
+        self.destination_feedback = if !path.is_absolute() {
+            Some(DestinationFeedback::InvalidPath)
+        } else if let Ok(ancestor) = existing_ancestor(path) {
+            if !ancestor.is_dir() || !destination_directory_writable(ancestor) {
+                Some(DestinationFeedback::NotWritable)
+            } else if !path.exists() {
+                Some(DestinationFeedback::WillBeCreated)
+            } else { None }
+        } else { Some(DestinationFeedback::NotWritable) };
+    }
+
+    /// The Tags warning is displayed for DFF-only selections, but has no
+    /// action. Keep its visual row without making it a keyboard focus stop.
+    pub fn output_row_focusable(&self, index: usize) -> bool {
+        match self.output_rows().get(index) {
+            Some(&"Tags") => self.native_tags_available(),
+            Some(_) => true,
+            None => false,
+        }
+    }
+
+    pub fn normalize_output_cursor(&mut self) {
+        if self.output_row_focusable(self.output_cursor) { return; }
+        let rows = self.output_rows();
+        self.output_cursor = (0..rows.len())
+            .find(|index| *index >= self.output_cursor && self.output_row_focusable(*index))
+            .or_else(|| (0..rows.len()).rev().find(|index| self.output_row_focusable(*index)))
+            .unwrap_or(0);
+    }
+
+    pub fn current_output_row(&self) -> &'static str {
+        self.output_rows().get(self.output_cursor).copied().unwrap_or("Format")
     }
 
     pub fn protection_display(&self) -> String {
@@ -907,6 +993,9 @@ impl DiscBrowserState {
     /// queue submission; painting the overlay uses the cached result.
     pub(crate) fn blockers_with_capacity_refresh(&self, scratch: &Path, refresh: bool) -> Vec<String> {
         let mut problems = Vec::new();
+        if self.destination_feedback == Some(DestinationFeedback::NotWritable) {
+            problems.push("Extraction destination is not writable".into());
+        }
         if self.selected_item_count() == 0 { problems.push("Check at least one extractable track or chapter".into()); }
         if self.selected.iter().enumerate().any(|(i,checked)| *checked && !self.is_extractable(i)) {
             problems.push("One or more checked programs cannot be extracted".into());
@@ -1053,7 +1142,8 @@ impl DiscBrowserState {
             naming_template:self.naming_template.clone(), program_subfolders:self.program_subfolders,
             overwrite_policy:self.overwrite_policy, extraction_log:self.extraction_log,
             file_per_program:self.file_per_program, cue:self.cue,
-            transfer_tags:self.tags,tag_source:self.tag_source,
+            transfer_tags:self.tags && self.native_tags_available(),
+            tag_source:self.tag_source,
             tag_fields:self.tag_fields,tag_artwork:self.tag_artwork }
     }
 }
@@ -1073,6 +1163,20 @@ fn existing_ancestor(path: &Path) -> Result<&Path, String> {
     let mut p = path;
     while !p.exists() { p = p.parent().ok_or("Destination has no existing ancestor")?; }
     Ok(p)
+}
+
+#[cfg(unix)]
+fn destination_directory_writable(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return false; };
+    // Query access without mutating the destination. The extraction worker
+    // remains responsible for final filesystem and conflict checks.
+    unsafe { libc::access(path.as_ptr(), libc::W_OK | libc::X_OK) == 0 }
+}
+
+#[cfg(not(unix))]
+fn destination_directory_writable(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|m| m.is_dir() && !m.permissions().readonly())
 }
 
 #[cfg(unix)]

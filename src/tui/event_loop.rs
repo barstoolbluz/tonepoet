@@ -1968,6 +1968,7 @@ fn reduce_file_picker_complete(
                     let message = match path {
                         Some(ref path) if path.is_dir() => {
                             state.destination = path.clone();
+                            state.refresh_destination_feedback();
                             format!("extraction destination: {}", path.display())
                         }
                         Some(path) => format!("not a directory: {}", path.display()),

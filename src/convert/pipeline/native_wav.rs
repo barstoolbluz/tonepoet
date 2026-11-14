@@ -236,6 +236,7 @@ fn write_header(out: &mut File, f: NativePcmFormat, bytes: u64, container: Nativ
 /// Writes only inside working storage. The output must not exist on entry.
 /// Raw PCM is kept in a separate private file so its length is known before
 /// writing any header, removing all 32-bit-size wrap risk.
+#[cfg_attr(not(test), allow(dead_code))] // Non-controlled compatibility wrapper used by tests.
 pub(super) fn package_raw_pcm(
     raw: &Path, output: &Path, format: NativePcmFormat,
     container: NativeWavContainer, cancel: &CancellationToken,
@@ -462,6 +463,7 @@ fn generated_wave_span(path: &Path) -> Result<(NativePcmFormat, u64, u64), Strin
 /// Assemble a continuous native PCM presentation from fully completed private
 /// per-item containers. Returns the exact source sample-frame count of each
 /// authored selected chapter for CUE boundary calculation.
+#[cfg_attr(not(test), allow(dead_code))] // Non-controlled compatibility wrapper used by tests.
 pub(super) fn concatenate_generated_waves(
     inputs: &[std::path::PathBuf], output: &Path,
     container: NativeWavContainer, cancel: &CancellationToken,

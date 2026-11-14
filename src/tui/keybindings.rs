@@ -72821,10 +72821,13 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                                 else { state.item_cursor.saturating_add(3).min(max) };
                         }
                         ExtractFocus::Output => {
+                            super::disc_browser_actions::cancel_native_text_edit(state);
                             let max = state.output_rows().len().saturating_sub(1);
                             state.output_cursor = if delta < 0 { state.output_cursor.saturating_sub(3) }
                                 else { state.output_cursor.saturating_add(3).min(max) };
+                            state.normalize_output_cursor();
                         }
+                        ExtractFocus::Footer => {}
                     }
                 }
             }
@@ -72832,6 +72835,12 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
         }
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             if let Some(button) = app.button_map.find_button_at(mouse.column, mouse.row) {
+                let folder_hitbox = if button == TuiButton::DiscBrowserFolderField {
+                    app.button_map.button_rect(TuiButton::DiscBrowserFolderField)
+                } else { None };
+                let folder_preview_before_edit = matches!(&app.active_overlay,
+                    ActiveOverlay::DiscBrowser(state)
+                        if !state.editing_destination || state.editing_template);
                 let now = std::time::Instant::now();
                 let click_count = match button {
                     TuiButton::DiscBrowserTitle => {
@@ -72842,6 +72851,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                         ) {2}else{1}
                     }
                     TuiButton::DiscBrowserStream(index) => {
+                        app.double_click.clear();
                         let is_double = app
                             .last_disc_browser_stream_click
                             .as_ref()
@@ -72856,8 +72866,16 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                             1
                         }
                     }
+                    TuiButton::DiscBrowserFolderField => {
+                        app.last_disc_browser_stream_click = None;
+                        if app.double_click.register_click(
+                            TuiButton::DiscBrowserFolderField, mouse.column, mouse.row,
+                            tui_file_picker::DOUBLE_CLICK_WINDOW,
+                        ) { 2 } else { 1 }
+                    }
                     _ => {
                         app.last_disc_browser_stream_click = None;
+                        app.double_click.clear();
                         1
                     }
                 };
@@ -72865,6 +72883,14 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
                     app, &button, click_count,
                     mouse.modifiers.contains(KeyModifiers::SHIFT), tx,
                 );
+                if click_count == 1 {
+                    if let (Some(rect), ActiveOverlay::DiscBrowser(state)) =
+                        (folder_hitbox, &mut app.active_overlay) {
+                        super::disc_browser_actions::native_folder_caret_from_mouse(
+                            state, mouse.column, rect.x, rect.width,
+                            folder_preview_before_edit);
+                    }
+                }
             }
         }
         return;
@@ -74705,6 +74731,13 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::DiscBrowserAnglePrev(_)
             | TuiButton::DiscBrowserAngleNext(_)
             | TuiButton::DiscBrowserOutput(_)
+            | TuiButton::DiscBrowserFormatChoice(_)
+            | TuiButton::DiscBrowserFilesChoice(_)
+            | TuiButton::DiscBrowserOverwriteChoice(_)
+            | TuiButton::DiscBrowserToggle(_)
+            | TuiButton::DiscBrowserTagsEdit
+            | TuiButton::DiscBrowserFolderField
+            | TuiButton::DiscBrowserFolderBrowse
             | TuiButton::DiscBrowserHint(_)
             | TuiButton::DiscBrowserHiddenToggle
             | TuiButton::DiscBrowserNaming

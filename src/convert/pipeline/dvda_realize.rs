@@ -72,7 +72,7 @@ const FOO_INPUT_DVDA_COMPATIBLE_PAN_FILTER: &str =
 pub(super) async fn realize_dvda_track(
     src: &TrackSourceRef,
     expected_audio: DvdaSourceAudioExpectation,
-    mut audio_policy: DvdaRealizationAudioPolicy,
+    audio_policy: DvdaRealizationAudioPolicy,
     staging: &StagingDir,
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,

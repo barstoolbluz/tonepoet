@@ -431,6 +431,7 @@ pub struct NativeProbeFacts {
 /// Make one private temporary directory per extraction.  `TempDir` owns and
 /// removes the entire hierarchy on ordinary completion, error and cancellation.
 /// An OS crash can leave only files in working storage, never partial outputs.
+#[cfg_attr(not(test), allow(dead_code))] // Compatibility entrypoint exercised by focused tests.
 pub async fn execute(
     job: NativeExtractionJob,
     cancel: CancellationToken,
@@ -1190,6 +1191,7 @@ pub(crate) fn publish_native_recovery_sidecar(
 /// shared Convert publisher copies through a disposable file in the target
 /// directory and atomically renames it only after flushing the complete data.
 /// A failed copy never exposes a partial result at the requested filename.
+#[cfg_attr(not(test), allow(dead_code))] // Compatibility entrypoint exercised by focused tests.
 fn publish_finished_file(job: &NativeExtractionJob, complete: &Path, target: &Path) -> Result<(), String> {
     publish_finished_file_checked(job, complete, target, || Ok(()))
 }
@@ -1205,9 +1207,10 @@ fn publish_finished_file_controlled(
     }, Some(controls))
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // Compatibility entrypoint exercised by focused tests.
 fn publish_finished_file_checked(
     job: &NativeExtractionJob, complete: &Path, target: &Path,
-    mut checkpoint: impl FnMut() -> std::io::Result<()>,
+    checkpoint: impl FnMut() -> std::io::Result<()>,
 ) -> Result<(), String> {
     publish_finished_file_checked_observed(job, complete, target, checkpoint, None)
 }
@@ -1631,6 +1634,7 @@ fn extract_sacd_native(src: &TrackSourceRef, output: &Path, keep_dst: bool,
 /// block ordering; the writer re-blocks the uninterrupted DSD bitstream once.
 /// DSDIFF/DST uses the original encoded frames, re-emitting valid FRTE/DSTI
 /// container structures and DSTC checksums for the combined frame sequence.
+#[cfg_attr(not(test), allow(dead_code))] // Compatibility entrypoint exercised by focused tests.
 fn concatenate_sacd_tracks(
     parts: &[PathBuf], output: &Path, keep_dst: bool, cancel: &CancellationToken,
 ) -> Result<(Vec<u64>, u32), String> {

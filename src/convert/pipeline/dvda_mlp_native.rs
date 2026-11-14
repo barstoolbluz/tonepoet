@@ -149,6 +149,7 @@ pub(crate) fn decoder_info() -> NativeMlpDecoderInfo {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // Non-controlled compatibility wrapper.
 pub(crate) fn decode_authored_stereo_to_wav_with_rf64(
     mlp_path: &Path,
     wav_path: &Path,
