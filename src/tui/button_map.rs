@@ -387,6 +387,9 @@ pub enum TuiButton {
     DiscBrowserAnglePrev(usize),
     DiscBrowserAngleNext(usize),
     DiscBrowserOutput(usize),
+    /// Context key hint; mapped back through the same table as keyboard input.
+    DiscBrowserHint(usize),
+    DiscBrowserHiddenToggle,
     DiscBrowserNaming,
     DiscBrowserOverwrite,
     DiscBrowserExtract,
@@ -558,6 +561,8 @@ impl TuiButton {
             | Self::DiscBrowserAnglePrev(_)
             | Self::DiscBrowserAngleNext(_)
             | Self::DiscBrowserOutput(_)
+            | Self::DiscBrowserHint(_)
+            | Self::DiscBrowserHiddenToggle
             | Self::DiscBrowserNaming
             | Self::DiscBrowserOverwrite
             | Self::DiscBrowserExtract

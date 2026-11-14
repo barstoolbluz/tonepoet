@@ -307,7 +307,7 @@ pub struct DiscBrowserState {
 pub enum ExtractFocus { Programs, Items, Output }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExtractPanel { Format, Files, Tags, Destination, Downmix, AssumeDecrypted, Diagnostics, More, ConvertChoice }
+pub enum ExtractPanel { Format, Files, Tags, Destination, Downmix, AssumeDecrypted, Diagnostics, More, ConvertChoice, Keys }
 
 /// One logical row in the Audio Streams overlay after expansion is applied.
 ///
@@ -843,7 +843,9 @@ impl DiscBrowserState {
     }
 
     pub fn output_rows(&self) -> Vec<&'static str> {
-        let mut rows = vec!["Format", "Files", "Tags", "Destination"];
+        // Each drawn setting has one keyboard stop, including the legacy
+        // Destination panel's Folder, Naming, and Overwrite controls.
+        let mut rows = vec!["Format", "Files", "Tags", "Overwrite", "Folder", "Naming"];
         if self.contents.format == DiscFormat::DvdAudio && self.contents.presentations.iter().enumerate()
             .any(|(i,p)| self.selected.get(i) == Some(&true) && p.format.channels.unwrap_or(0) > 2) {
             rows.push("Downmix");
@@ -854,11 +856,15 @@ impl DiscBrowserState {
         rows
     }
 
+    pub fn current_output_row(&self) -> &'static str {
+        self.output_rows().get(self.output_cursor).copied().unwrap_or("Format")
+    }
+
     pub fn current_output_panel(&self) -> ExtractPanel {
-        match self.output_rows().get(self.output_cursor).copied().unwrap_or("Format") {
+        match self.current_output_row() {
             "Files" => ExtractPanel::Files,
             "Tags" => ExtractPanel::Tags,
-            "Destination" => ExtractPanel::Destination,
+            "Folder" | "Naming" | "Overwrite" => ExtractPanel::Destination,
             "Downmix" => ExtractPanel::Downmix,
             "Assume decrypted" => ExtractPanel::AssumeDecrypted,
             _ => ExtractPanel::Format,
@@ -983,7 +989,7 @@ impl DiscBrowserState {
                 };
                 let tracks: Vec<NativeTrackChoice> = p.tracks.iter().enumerate()
                     .filter(|(j,_)| self.items_checked[i].get(*j) == Some(&true))
-                    .map(|(j,t)| NativeTrackChoice { number: (j + 1) as u32,
+                    .map(|(j,t)| NativeTrackChoice { duration_secs: t.duration_secs, number: (j + 1) as u32,
                         name: t.title.clone().unwrap_or_else(|| format!("Track {}", t.number)),
                         estimated_bytes: self.native_item_payload_bytes(p, t),
                         // DVD-Video/Blu-ray mappers synthesize "Chapter n"
@@ -1029,7 +1035,19 @@ impl DiscBrowserState {
                             genre:metadata.genre,year:metadata.year,..Default::default()}
                     } })
             }).collect();
-        NativeExtractionJob{ source:self.source_path.clone(),format:self.contents.format,
+        let catalog = self.contents.presentations.iter()
+            .filter_map(|p| p.extract.sacd_header_details.as_deref())
+            .flat_map(|details| details.split('·'))
+            .find_map(|part| part.trim().strip_prefix("Catalog ").map(str::trim)
+                .filter(|value| !value.is_empty()).map(str::to_owned));
+        let disc_identity = NativeDiscIdentity {
+            title: self.contents.album_title.clone()
+                .or_else(||self.contents.presentations.iter().find_map(|p|p.album_title.clone())),
+            artist: self.contents.album_artist.clone()
+                .or_else(||self.contents.presentations.iter().find_map(|p|p.album_artist.clone())),
+            catalog,
+        };
+        NativeExtractionJob{ disc_identity, source:self.source_path.clone(),format:self.contents.format,
             programs,destination:self.destination.clone(), working_root,
             wav_container:self.wav_container, assume_decrypted:self.assume_decrypted,downmix:self.downmix,
             naming_template:self.naming_template.clone(), program_subfolders:self.program_subfolders,

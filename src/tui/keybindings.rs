@@ -74705,6 +74705,8 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::DiscBrowserAnglePrev(_)
             | TuiButton::DiscBrowserAngleNext(_)
             | TuiButton::DiscBrowserOutput(_)
+            | TuiButton::DiscBrowserHint(_)
+            | TuiButton::DiscBrowserHiddenToggle
             | TuiButton::DiscBrowserNaming
             | TuiButton::DiscBrowserOverwrite
             | TuiButton::DiscBrowserExtract

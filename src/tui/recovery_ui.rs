@@ -3965,6 +3965,8 @@ mod tests {
             job: serde_json::json!({}),
             native_published_paths: Vec::new(),
             native_skipped_selections: Vec::new(),
+            native_unfinished_outputs: Vec::new(),
+            native_log_sha256: None,
             native_prepared_cues: Vec::new(),
             retry_plan: None,
             roots: Vec::new(),

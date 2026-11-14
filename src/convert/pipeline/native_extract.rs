@@ -33,6 +33,10 @@ use super::types::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NativeWavContainer { Automatic, Riff, Rf64, W64 }
 
+/// The user-facing extraction receipt. This name is shared by the planner,
+/// path reservation, initial publication, and detached recovery.
+pub const EXTRACTION_LOG_FILE: &str = "extraction.log";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NativeOverwritePolicy { Fail, Skip, Replace }
 
@@ -62,6 +66,9 @@ pub struct NativeTrackChoice {
     /// Preflight's uncompressed item-size estimate; never a measurement.
     #[serde(default)]
     pub estimated_bytes: Option<u64>,
+    /// Duration from disc metadata, not calculated from estimated bytes.
+    #[serde(default)]
+    pub duration_secs: Option<f64>,
 }
 
 fn default_angle_one() -> u8 { 1 }
@@ -85,8 +92,19 @@ pub struct NativeProgramChoice {
     pub tags: NativeTagValues,
 }
 
+/// Disc identity as reported by the probed source, not inferred from filenames.
+/// Optional fields also allow recovery of jobs created by earlier versions.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NativeDiscIdentity {
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub catalog: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NativeExtractionJob {
+    #[serde(default)]
+    pub disc_identity: NativeDiscIdentity,
     pub source: PathBuf,
     pub format: DiscFormat,
     pub programs: Vec<NativeProgramChoice>,
@@ -147,21 +165,50 @@ pub struct NativeExtractionProgress {
 /// an entire continuous program), not a publication of an output pathname.
 /// The authored presentation identity stays stable when Recovery removes
 /// completed selections from the work left for a new helper generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NativeSkipReason { ExistingFile, RequestedByUser }
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeSkippedSelection {
     pub presentation: PresentationId,
     pub angle: u8,
     /// None identifies a whole continuous program, including its final join.
     pub track_number: Option<u32>,
+    /// Older durable receipts did not record why the selection was skipped.
+    #[serde(default)]
+    pub reason: Option<NativeSkipReason>,
 }
+
+/// Exact output whose processing was interrupted. A later recovery may
+/// complete it; the log projection gives a completed publication precedence
+/// over an earlier interruption for the same path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeUnfinishedOutput {
+    pub destination: PathBuf,
+    pub reason: String,
+    pub cancelled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeLogOutcome { Complete, Cancelled, Failed }
 
 impl NativeSkippedSelection {
     pub fn track(program: &NativeProgramChoice, number: u32) -> Self {
-        Self { presentation: program.id, angle: program.angle, track_number: Some(number) }
+        Self { presentation: program.id, angle: program.angle, track_number: Some(number), reason: None }
     }
 
     pub fn program(program: &NativeProgramChoice) -> Self {
-        Self { presentation: program.id, angle: program.angle, track_number: None }
+        Self { presentation: program.id, angle: program.angle, track_number: None, reason: None }
+    }
+
+    pub fn with_reason(mut self, reason: NativeSkipReason) -> Self {
+        self.reason = Some(reason);
+        self
+    }
+
+    pub fn same_selection(&self, other: &Self) -> bool {
+        self.presentation == other.presentation && self.angle == other.angle
+            && self.track_number == other.track_number
     }
 }
 
@@ -226,6 +273,7 @@ pub struct NativePublicationHook {
     /// They run before the worker acknowledges a skip or publishes CUE audio.
     pub skipped: Arc<dyn Fn(&NativeSkippedSelection) -> Result<(), String> + Send + Sync>,
     pub prepared_cue: Arc<dyn Fn(&Path, &str) -> Result<(), String> + Send + Sync>,
+    pub unfinished: Arc<dyn Fn(&NativeUnfinishedOutput) -> Result<(), String> + Send + Sync>,
 }
 
 impl std::fmt::Debug for NativePublicationHook {
@@ -245,6 +293,10 @@ pub struct NativeExtractionControl {
     active_item: Mutex<Option<CancellationToken>>,
     watch: Mutex<Option<NativeWriteWatch>>,
     publication: Mutex<Option<NativePublicationHook>>,
+    recorded_skips: Mutex<Vec<NativeSkippedSelection>>,
+    attempted_output: Mutex<Option<PathBuf>>,
+    unfinished_outputs: Mutex<Vec<NativeUnfinishedOutput>>,
+    execution_started: AtomicBool,
 }
 
 impl NativeExtractionControl {
@@ -261,7 +313,31 @@ impl NativeExtractionControl {
     }
     fn record_skipped(&self, selection: NativeSkippedSelection) -> Result<(), String> {
         if let Some(hook) = self.publication_hook() { (hook.skipped)(&selection)?; }
+        self.recorded_skips.lock().unwrap_or_else(|e|e.into_inner()).push(selection);
         Ok(())
+    }
+    pub(crate) fn skipped_receipts(&self) -> Vec<NativeSkippedSelection> {
+        self.recorded_skips.lock().unwrap_or_else(|e|e.into_inner()).clone()
+    }
+    fn set_attempted_output(&self, destination: PathBuf) {
+        *self.attempted_output.lock().unwrap_or_else(|e| e.into_inner()) = Some(destination);
+    }
+    fn clear_attempted_output(&self) {
+        *self.attempted_output.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+    fn record_interrupted_output(&self, reason: &str, cancelled: bool) -> Result<(), String> {
+        let Some(destination) = self.attempted_output.lock()
+            .unwrap_or_else(|e| e.into_inner()).take() else { return Ok(()); };
+        let receipt = NativeUnfinishedOutput { destination, reason: reason.to_owned(), cancelled };
+        if let Some(hook) = self.publication_hook() { (hook.unfinished)(&receipt)?; }
+        self.unfinished_outputs.lock().unwrap_or_else(|e| e.into_inner()).push(receipt);
+        Ok(())
+    }
+    pub(crate) fn unfinished_receipts(&self) -> Vec<NativeUnfinishedOutput> {
+        self.unfinished_outputs.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+    pub(crate) fn execution_has_started(&self) -> bool {
+        self.execution_started.load(Ordering::Acquire)
     }
     fn record_prepared_cue(&self, destination: &Path, content: &str) -> Result<(), String> {
         if let Some(hook) = self.publication_hook() { (hook.prepared_cue)(destination, content)?; }
@@ -371,15 +447,43 @@ pub async fn execute_with_controls(
     controls: Arc<NativeExtractionControl>,
     mut on_progress: impl FnMut(NativeExtractionProgress),
 ) -> Result<NativeExtractionReport, String> {
-    let mut published = 0usize;
-    let destination = job.destination.clone();
+    let mut published_paths = Vec::new();
+    let original_job = job.clone();
+    let execution_controls = Arc::clone(&controls);
+    let execution_cancel = cancel.clone();
     let result = execute_inner(job, cancel, controls, |progress| {
-        published = published.max(progress.published);
+        published_paths = progress.published_paths.clone();
         on_progress(progress);
     }).await;
     result.map_err(|error| {
-        if published == 0 { error }
-        else { format!("{error}; {published} completed file(s) remain published under '{}'", destination.display()) }
+        let mut error = error;
+        if execution_controls.execution_started.load(Ordering::Acquire) {
+            let cancelled = execution_cancel.is_cancelled();
+            if let Err(journal_error) = execution_controls.record_interrupted_output(&error, cancelled) {
+                error.push_str(&format!("; cannot record interrupted output: {journal_error}"));
+            }
+            // The detached helper handles its own terminal log, using the
+            // durable receipts across generations. This branch serves direct
+            // callers that requested a log on the media job itself.
+            if original_job.extraction_log && execution_controls.publication_hook().is_none() {
+                let content = render_native_extraction_log_with_outcome(&original_job,
+                    &published_paths, &execution_controls.skipped_receipts(),
+                    &execution_controls.unfinished_receipts(),
+                    if cancelled { NativeLogOutcome::Cancelled } else { NativeLogOutcome::Failed },
+                    Some(&error));
+                let target = original_job.destination.join(EXTRACTION_LOG_FILE);
+                // The regular job token may already be cancelled. Only this
+                // terminal receipt publication uses a fresh control token.
+                if let Err(log_error) = publish_native_recovery_sidecar(&original_job, &target,
+                    &content, &CancellationToken::new(), &NativeExtractionControl::default()) {
+                    error.push_str(&format!("; extraction log could not be written: {log_error}"));
+                }
+            }
+        }
+        if published_paths.is_empty() { error } else {
+            format!("{error}; {} completed file(s) remain published under '{}'",
+                published_paths.len(), original_job.destination.display())
+        }
     })
 }
 
@@ -443,6 +547,7 @@ async fn execute_inner(
     mut on_progress: impl FnMut(NativeExtractionProgress),
 ) -> Result<NativeExtractionReport, String> {
     validate_job(&job)?;
+    controls.execution_started.store(true, Ordering::Release);
     // Reject overlapping scratch before creating anything in working storage.
     // Older persisted jobs may contain the R5 implicit destination-sibling
     // staging path. Move that obsolete default to TonePoet's cache too.
@@ -483,7 +588,8 @@ async fn execute_inner(
         let grouped_target = proposed_destination_for_program(&job, program);
         if job.file_per_program && job.overwrite_policy == NativeOverwritePolicy::Skip
             && fs::symlink_metadata(&grouped_target).is_ok() {
-            controls.record_skipped(NativeSkippedSelection::program(program))?;
+            controls.record_skipped(NativeSkippedSelection::program(program)
+                .with_reason(NativeSkipReason::ExistingFile))?;
             done += program.tracks.len();
             skipped += program.tracks.len();
             let skipped_bytes = program.tracks.iter().filter_map(|t| t.estimated_bytes)
@@ -494,6 +600,9 @@ async fn execute_inner(
             continue;
         }
         let mut grouped_outputs: Vec<(u32, PathBuf, String)> = Vec::new();
+        // Preparation may examine the entire program, so an error there
+        // cannot be attributed to an unattempted first output. The exact
+        // destination becomes known when we start processing each track.
         let mut req = materializer_request(&job, program, pi)?;
         let selection: BTreeSet<u32> = program.tracks.iter().map(|track| track.number).collect();
         req.source.track_selection = TrackSelection::Set(selection);
@@ -522,17 +631,20 @@ async fn execute_inner(
             let item_cancel = controls.begin_item(&cancel);
             let extension = extraction_extension(&job, program);
             let dest = proposed_destination(&job, program, requested);
+            controls.set_attempted_output(if job.file_per_program { grouped_target.clone() } else { dest.clone() });
             if !job.file_per_program {
                 if !reserved_names.insert(dest.clone()) {
                     return Err(format!("Two selected items would publish to '{}'; choose different names", dest.display()));
                 }
                 if job.overwrite_policy == NativeOverwritePolicy::Skip && fs::symlink_metadata(&dest).is_ok() {
-                    controls.record_skipped(NativeSkippedSelection::track(program, requested.number))?;
+                    controls.record_skipped(NativeSkippedSelection::track(program, requested.number)
+                        .with_reason(NativeSkipReason::ExistingFile))?;
                     done += 1;
                     skipped += 1;
                     estimated_bytes_done = estimated_bytes_done.saturating_add(requested.estimated_bytes.unwrap_or(0));
                     estimated_bytes_skipped = estimated_bytes_skipped.saturating_add(requested.estimated_bytes.unwrap_or(0));
                     controls.finish_item();
+                    controls.clear_attempted_output();
                     emit(done, published.len(), skipped, format!("Skipped existing {}", requested.name), None, None, estimated_bytes_done, estimated_bytes_skipped, estimated_bytes_published, published.clone());
                     continue;
                 }
@@ -640,15 +752,18 @@ async fn execute_inner(
             if item_was_skipped && item_result.is_err() {
                 let _ = fs::remove_file(&complete);
                 let _ = fs::remove_file(complete.with_extension("raw-pcm-in-working-storage"));
-                controls.record_skipped(NativeSkippedSelection::track(program, requested.number))?;
+                controls.record_skipped(NativeSkippedSelection::track(program, requested.number)
+                        .with_reason(NativeSkipReason::RequestedByUser))?;
                 done += 1;
                 skipped += 1;
                 estimated_bytes_done = estimated_bytes_done.saturating_add(requested.estimated_bytes.unwrap_or(0));
                 estimated_bytes_skipped = estimated_bytes_skipped.saturating_add(requested.estimated_bytes.unwrap_or(0));
+                controls.clear_attempted_output();
                 emit(done, published.len(), skipped, format!("Skipped {}", requested.name), None, None, estimated_bytes_done, estimated_bytes_skipped, estimated_bytes_published, published.clone());
                 continue;
             }
             item_result?;
+            controls.clear_attempted_output();
             done += 1;
             estimated_bytes_done = estimated_bytes_done.saturating_add(requested.estimated_bytes.unwrap_or(0));
             emit(done, published.len(), skipped, requested.name.clone(), None, None, estimated_bytes_done, estimated_bytes_skipped, estimated_bytes_published, published.clone());
@@ -656,6 +771,7 @@ async fn execute_inner(
         if job.file_per_program && !grouped_outputs.is_empty() {
             if cancel.is_cancelled() { return Err("Extraction cancelled".into()); }
             let join_item = controls.begin_item(&cancel);
+            controls.set_attempted_output(grouped_target.clone());
             let mut program_published = false;
             let join_result: Result<(), String> = async {
             controls.wait_ready(&cancel, &join_item).await?;
@@ -732,6 +848,7 @@ async fn execute_inner(
                 None, None, estimated_bytes_done, estimated_bytes_skipped, estimated_bytes_published, published.clone());
             if let Some(cue_file) = cue_file {
                 let cue_target = grouped_target.with_extension("cue");
+                controls.set_attempted_output(cue_target.clone());
                 controls.wait_ready(&cancel, &join_item).await?;
                 publish_finished_file_controlled(&job, &cue_file, &cue_target, &cancel, &join_item, &controls)?;
                 published.push(cue_target);
@@ -746,7 +863,8 @@ async fn execute_inner(
             let join_was_skipped = controls.finish_item();
             if cancel.is_cancelled() { return Err("Extraction cancelled".into()); }
             if join_was_skipped && join_result.is_err() && !program_published {
-                controls.record_skipped(NativeSkippedSelection::program(program))?;
+                controls.record_skipped(NativeSkippedSelection::program(program)
+                    .with_reason(NativeSkipReason::RequestedByUser))?;
                 // Tracks previously skipped in this program have already been
                 // counted. The join skip disposes only the successfully
                 // staged tracks that would otherwise form the final output.
@@ -756,22 +874,25 @@ async fn execute_inner(
                     .fold(0u64, u64::saturating_add);
                 skipped += grouped_outputs.len();
                 estimated_bytes_skipped = estimated_bytes_skipped.saturating_add(skipped_bytes);
+                controls.clear_attempted_output();
                 emit(done, published.len(), skipped, format!("Skipped continuous {}", program.label),
                     None, None, estimated_bytes_done, estimated_bytes_skipped,
                     estimated_bytes_published, published.clone());
                 continue;
             }
             join_result?;
+            controls.clear_attempted_output();
         }
+        controls.clear_attempted_output();
     }
     if job.extraction_log {
-        let log = temporary.path().join("native-extraction.log");
+        let log = temporary.path().join(EXTRACTION_LOG_FILE);
         let mut output = OpenOptions::new().create_new(true).write(true).open(&log)
             .map_err(|e| format!("Cannot stage extraction log: {e}"))?;
-        output.write_all(render_native_extraction_log(&job, &published).as_bytes())
+        output.write_all(render_native_extraction_log(&job, &published, &controls.skipped_receipts()).as_bytes())
             .map_err(|e|format!("Write extraction log: {e}"))?;
         output.sync_all().map_err(|e|format!("Cannot sync extraction log: {e}"))?;
-        let log_target = job.destination.join("native-extraction.log");
+        let log_target = job.destination.join(EXTRACTION_LOG_FILE);
         publish_finished_file_controlled(&job, &log, &log_target, &cancel, &cancel, &controls)?;
         published.push(log_target);
         emit(done, published.len(), skipped, "Published extraction log".to_owned(),
@@ -793,20 +914,250 @@ fn estimated_bytes_for_staged_continuous_tracks(
         .fold(0u64, u64::saturating_add)
 }
 
-/// The same log body is used by uninterrupted extraction and by a recovered
-/// detached helper. The caller supplies *all* previously published artifacts,
-/// so a resumed generation cannot lose earlier entries. A log is not its own
-/// completed entry, and each output appears at most once.
-pub(crate) fn render_native_extraction_log(job: &NativeExtractionJob, paths: &[PathBuf]) -> String {
-    let mut log = format!("Native extraction from {}\n", job.source.display());
-    let log_target = job.destination.join("native-extraction.log");
-    let mut seen = HashSet::new();
-    for path in paths {
-        if path != &log_target && seen.insert(path) {
-            log.push_str(&format!("Completed: {}\n", path.display()));
+/// Produce the same human-readable receipt for a direct run and a resumed
+/// run. `published` and `skipped` are execution receipts, not estimates or a
+/// fresh scan of filenames that happen to exist in the destination. The
+/// log's own pathname is deliberately absent from the output inventory.
+pub(crate) fn render_native_extraction_log(
+    job: &NativeExtractionJob,
+    published: &[PathBuf],
+    skipped: &[NativeSkippedSelection],
+) -> String {
+    render_native_extraction_log_with_outcome(job, published, skipped, &[],
+        NativeLogOutcome::Complete, None)
+}
+
+pub(crate) fn render_native_extraction_log_with_outcome(
+    job: &NativeExtractionJob,
+    published: &[PathBuf],
+    skipped: &[NativeSkippedSelection],
+    unfinished: &[NativeUnfinishedOutput],
+    outcome: NativeLogOutcome,
+    terminal_error: Option<&str>,
+) -> String {
+    let log_target = job.destination.join(EXTRACTION_LOG_FILE);
+    let published: HashSet<&Path> = published.iter().map(PathBuf::as_path)
+        .filter(|path| *path != log_target.as_path()).collect();
+    // An older journal may contain a selection without a reason. Respect the
+    // identity of the selection, but never invent why it was skipped.
+    let skip_for = |program: &NativeProgramChoice, number: Option<u32>| {
+        skipped.iter().find(|entry| entry.presentation == program.id
+            && entry.angle == program.angle && entry.track_number == number)
+            .or_else(|| if number.is_some() {skipped.iter().find(|entry|
+                entry.presentation == program.id && entry.angle == program.angle
+                    && entry.track_number.is_none())} else {None})
+    };
+    let quoted = |text: &str| format!("{text:?}");
+    let yes_no = |flag: bool| if flag { "yes" } else { "no" };
+    let duration = |seconds: Option<f64>| -> String {
+        match seconds {
+            Some(value) if value.is_finite() && value >= 0.0 => {
+                let whole = value.round() as u64;
+                format!("{}:{:02}", whole / 60, whole % 60)
+            }
+            _ => "not reported by disc".to_owned(),
+        }
+    };
+    let skip_label = |receipt: &NativeSkippedSelection| match receipt.reason {
+        Some(NativeSkipReason::ExistingFile) => "Skipped: file already existed",
+        Some(NativeSkipReason::RequestedByUser) => "Skipped: requested by user",
+        None => "Skipped: reason unavailable (earlier run)",
+    };
+    let saved_size = |path: &Path| -> String {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_file() => format!("{} bytes", metadata.len()),
+            _ => "not available".to_owned(),
+        }
+    };
+    let program_name = |p: &NativeProgramChoice| p.id.display_label();
+    let unit = match job.format {
+        DiscFormat::Sacd => "area",
+        DiscFormat::DvdAudio => "group",
+        DiscFormat::DvdVideo => "title",
+        DiscFormat::BluRay => "playlist",
+    };
+    let item_kind = if matches!(job.format, DiscFormat::DvdVideo | DiscFormat::BluRay) {
+        "chapters"
+    } else { "tracks" };
+    let format_name = |p: &NativeProgramChoice| match job.format {
+        DiscFormat::Sacd if p.keep_dst => "DFF (DST kept)",
+        DiscFormat::Sacd => "DSF (DSD native; DST decoded if present)",
+        _ => match job.wav_container {
+            NativeWavContainer::Automatic => "WAV (RIFF or RF64 as needed)",
+            NativeWavContainer::Riff => "RIFF WAV",
+            NativeWavContainer::Rf64 => "RF64 WAV",
+            NativeWavContainer::W64 => "W64",
+        },
+    };
+    let mut lines = vec![
+        format!("TonePoet {} · Extraction log", env!("CARGO_PKG_VERSION")),
+        format!("Generated: {}", chrono::Utc::now().to_rfc3339()),
+        format!("Source: {}", quoted(&job.source.to_string_lossy())),
+        format!("Disc format: {}", job.format.name()),
+    ];
+    if let Some(title) = &job.disc_identity.title {
+        lines.push(format!("Disc title: {}", quoted(title)));
+    }
+    if let Some(artist) = &job.disc_identity.artist {
+        lines.push(format!("Disc artist: {}", quoted(artist)));
+    }
+    if let Some(catalog) = &job.disc_identity.catalog {
+        lines.push(format!("Catalog: {}", quoted(catalog)));
+    }
+    lines.push(String::new());
+    lines.push("Settings".to_owned());
+    lines.push(format!("Folder: {}", quoted(&job.destination.to_string_lossy())));
+    lines.push(format!("Naming: {}", quoted(&job.naming_template)));
+    lines.push(format!("Separate folders by {unit}: {}", yes_no(job.program_subfolders)));
+    lines.push(format!("Files: {}", if job.file_per_program {
+        format!("one per {unit}")
+    } else { format!("one per {}", if item_kind == "chapters" {"chapter"}else{"track"}) }));
+    lines.push(format!("CUE sheets: {}", yes_no(job.cue)));
+    lines.push(format!("Transfer tags: {}", yes_no(job.transfer_tags)));
+    lines.push(format!("Tag fields selected: {}", job.tag_fields.count_ones()));
+    lines.push(format!("Artwork: {}", if job.transfer_tags && job.tag_artwork {"requested"}else{"off"}));
+    lines.push(format!("Tag source: {}", match job.tag_source {
+        NativeTagSource::DiscAndSidecar => "tag file, then disc metadata",
+        NativeTagSource::AuthoredTrack => "disc metadata, then tag file",
+    }));
+    lines.push(format!("When a file exists: {}", match job.overwrite_policy {
+        NativeOverwritePolicy::Fail => "stop",
+        NativeOverwritePolicy::Skip => "skip existing files",
+        NativeOverwritePolicy::Replace => "replace existing files",
+    }));
+    if let Some(error) = terminal_error {
+        lines.push(format!("Interrupted: {}", quoted(error)));
+    }
+    lines.push(String::new());
+    lines.push("Output files".into());
+    let mut written = 0usize;
+    let mut omitted = 0usize;
+    let mut failed = 0usize;
+    let mut listed = HashSet::new();
+    for program in &job.programs {
+        lines.push(format!("{} · {}", program_name(program), format_name(program)));
+        // Distinct authored selections, never counts of overlapping skip
+        // receipts. A whole-program skip covers only the as-yet uncounted
+        // selections; it does not add a second count for earlier track skips.
+        let program_skip = skip_for(program, None);
+        let mut skipped_numbers = program.tracks.iter()
+            .filter(|track| skipped.iter().any(|entry| entry.presentation == program.id
+                && entry.angle == program.angle && entry.track_number == Some(track.number)))
+            .map(|track| track.number).collect::<HashSet<_>>();
+        if program_skip.is_some() {
+            skipped_numbers.extend(program.tracks.iter().map(|track| track.number));
+        }
+        let all_skipped = skipped_numbers.len() == program.tracks.len();
+        let audio_path = job.file_per_program.then(||proposed_destination_for_program(job, program));
+        let items: Vec<(PathBuf, String, Option<f64>, Option<&NativeSkippedSelection>)> =
+            if let Some(path) = &audio_path {
+                let whole = program.tracks.iter().try_fold(0.0_f64, |total, track| {
+                    // An existing continuous file was skipped as a whole: its
+                    // duration is the selected source duration, not zero.
+                    if program_skip.is_none() && skip_for(program, Some(track.number)).is_some() {
+                        Some(total)
+                    } else {
+                        track.duration_secs.map(|seconds| total + seconds)
+                    }
+                });
+                vec![(path.clone(),
+                    format!("{} ({} selected {item_kind})", program_name(program), program.tracks.len()),
+                    whole, program_skip)]
+            } else {
+                program.tracks.iter().map(|track|(
+                    proposed_destination(job, program, track),
+                    format!("{} · {:02} {}",program_name(program),track.number,track.name),
+                    track.duration_secs,skip_for(program, Some(track.number)),
+                )).collect()
+            };
+        for (path, item, secs, skip) in items {
+            if !listed.insert(path.clone()) {continue;}
+            lines.push(format!("  File: {}",quoted(&path.to_string_lossy())));
+            lines.push(format!("    Item: {}",quoted(&item)));
+            let was_published = published.contains(path.as_path());
+            let duration_text = if job.file_per_program && all_skipped && !was_published {
+                if program_skip.is_some() {
+                    format!("{} (selected source; output skipped)", duration(secs))
+                } else {
+                    "unavailable (no continuous output)".to_owned()
+                }
+            } else {
+                duration(secs)
+            };
+            lines.push(format!("    Duration: {duration_text}"));
+            if was_published {
+                written += 1;
+                lines.push(format!("    Size: {}",saved_size(&path)));
+                lines.push("    Outcome: written".into());
+            } else if job.file_per_program && all_skipped {
+                lines.push("    Size: not written".into());
+                lines.push(format!("    Outcome: {}",skip.map_or(
+                    "Skipped: every selected track was individually skipped", skip_label)));
+            } else if let Some(receipt) = skip {
+                lines.push("    Size: not written".into());
+                lines.push(format!("    Outcome: {}",skip_label(receipt)));
+            } else if let Some(issue) = unfinished.iter().rev().find(|entry| entry.destination == path) {
+                if !issue.cancelled { failed += 1; }
+                lines.push("    Size: not written".into());
+                lines.push(format!("    Outcome: {} ({})",
+                    if issue.cancelled {"cancelled"} else {"failed"}, quoted(&issue.reason)));
+            } else if outcome == NativeLogOutcome::Complete {
+                failed += 1;
+                lines.push("    Size: not written".into());
+                lines.push("    Outcome: failed (no completed publication recorded)".into());
+            } else {
+                lines.push("    Size: not written".into());
+                lines.push("    Outcome: not reached".into());
+            }
+        }
+        if job.file_per_program {
+            omitted += skipped_numbers.len();
+            // A skipped track may be omitted from a successfully published
+            // continuous file. The log records both facts, without counting
+            // the omitted track twice if the program join was also skipped.
+            for track in &program.tracks {
+                if let Some(receipt) = skip_for(program, Some(track.number)) {
+                    lines.push(format!("  Omitted {:02} {}: {}",track.number,
+                        quoted(&track.name),skip_label(receipt)));
+                }
+            }
+        } else {
+            omitted += skipped_numbers.len();
+        }
+        if job.cue && job.file_per_program {
+            let cue = proposed_destination_for_program(job, program).with_extension("cue");
+            if listed.insert(cue.clone()) {
+                if published.contains(cue.as_path()) {
+                    written += 1;
+                    lines.push(format!("  CUE: {} · {} · written",quoted(&cue.to_string_lossy()),saved_size(&cue)));
+                } else if all_skipped {
+                    lines.push(format!("  CUE: {} · skipped (no continuous audio)",quoted(&cue.to_string_lossy())));
+                } else if let Some(issue) = unfinished.iter().rev().find(|entry|entry.destination == cue) {
+                    if !issue.cancelled { failed += 1; }
+                    lines.push(format!("  CUE: {} · {} ({})",quoted(&cue.to_string_lossy()),
+                        if issue.cancelled {"cancelled"}else{"failed"},quoted(&issue.reason)));
+                } else if outcome == NativeLogOutcome::Complete && audio_path.as_ref()
+                    .is_some_and(|path| published.contains(path.as_path())) {
+                    failed += 1;
+                    lines.push(format!("  CUE: {} · failed (no completed publication recorded)",quoted(&cue.to_string_lossy())));
+                } else {
+                    lines.push(format!("  CUE: {} · not reached",quoted(&cue.to_string_lossy())));
+                }
+            }
         }
     }
-    log
+    lines.push(String::new());
+    lines.push(format!("Written files: {written}"));
+    lines.push(format!("Skipped items: {omitted}"));
+    lines.push(format!("Failed outputs: {failed}"));
+    lines.push(format!("Outcome: {}", match outcome {
+        NativeLogOutcome::Cancelled => "cancelled",
+        NativeLogOutcome::Failed => "finished with failed items",
+        NativeLogOutcome::Complete if failed > 0 => "finished with failed items",
+        NativeLogOutcome::Complete if omitted > 0 => "finished with skipped items",
+        NativeLogOutcome::Complete => "complete",
+    }));
+    lines.join("\n") + "\n"
 }
 
 /// Complete a journaled CUE or extraction log without realizing any audio.
@@ -908,7 +1259,7 @@ fn publish_finished_file_checked_observed(
 }
 
 pub(crate) fn proposed_destination_for_program(job: &NativeExtractionJob, program: &NativeProgramChoice) -> PathBuf {
-    let virtual_track = NativeTrackChoice { number: 0, name: program.label.clone(), tags: NativeTagValues::default(), estimated_bytes: None };
+    let virtual_track = NativeTrackChoice { duration_secs: None, number: 0, name: program.label.clone(), tags: NativeTagValues::default(), estimated_bytes: None };
     let mut stem = if job.naming_template == default_naming_template() {
         sanitize_component(&program.label)
     } else { render_naming_template(&job.naming_template, program, &virtual_track) };
@@ -1126,7 +1477,7 @@ pub(crate) fn proposed_destination(job: &NativeExtractionJob, program: &NativePr
     parent.join(file_name)
 }
 
-fn validate_job(job: &NativeExtractionJob) -> Result<(), String> {
+pub(crate) fn validate_job(job: &NativeExtractionJob) -> Result<(), String> {
     if job.programs.is_empty() || job.programs.iter().any(|p| p.tracks.is_empty()) {
         return Err("Check at least one track or chapter".into());
     }
@@ -1157,17 +1508,28 @@ fn validate_job(job: &NativeExtractionJob) -> Result<(), String> {
         if job.file_per_program {
             let media = proposed_destination_for_program(job, program);
             inspect_publication_target(job, &mut planned, media.clone())?;
-            if job.cue { inspect_publication_target(job, &mut planned, media.with_extension("cue"))?; }
+            if job.cue {
+                let cue = media.with_extension("cue");
+                // Skip never publishes a CUE when its continuous audio
+                // already exists: the execution loop skips that whole program.
+                // Reject only CUE-only collisions before starting audio work.
+                if job.overwrite_policy == NativeOverwritePolicy::Skip
+                    && fs::symlink_metadata(&cue).is_ok()
+                    && fs::symlink_metadata(&media).is_err() {
+                    return Err(format!("CUE sheet already exists: '{}'; choose Replace, disable CUE output, or change the destination", cue.display()));
+                }
+                inspect_publication_target(job, &mut planned, cue)?;
+            }
         }
         if program.keep_dst && (job.format != DiscFormat::Sacd) {
             return Err("DST passthrough is available only for SACD".into());
         }
     }
     if job.extraction_log {
-        let path = job.destination.join("native-extraction.log");
+        let path = job.destination.join(EXTRACTION_LOG_FILE);
         if !planned.insert(path.clone()) { return Err("Extraction log conflicts with media name".into()); }
-        if job.overwrite_policy == NativeOverwritePolicy::Fail && fs::symlink_metadata(&path).is_ok() {
-            return Err(format!("Extraction log already exists: '{}'", path.display()));
+        if job.overwrite_policy != NativeOverwritePolicy::Replace && fs::symlink_metadata(&path).is_ok() {
+            return Err(format!("Extraction log already exists: '{}'; choose Replace or disable logging", path.display()));
         }
     }
     Ok(())
@@ -1505,13 +1867,13 @@ mod tests {
     use super::*;
 
     fn fixture_job(destination: &Path, scratch: &Path) -> NativeExtractionJob {
-        NativeExtractionJob {
+        NativeExtractionJob { disc_identity: Default::default(),
             source: std::env::current_exe().unwrap(),
             format: DiscFormat::Sacd,
             programs: vec![NativeProgramChoice {
                 id: PresentationId::SacdArea(crate::disc::SacdAreaId::Stereo),
                 angle: 1, label: "Stereo".into(),
-                tracks: vec![NativeTrackChoice { number: 1, name: "one".into(),
+                tracks: vec![NativeTrackChoice { duration_secs: None, number: 1, name: "one".into(),
                     tags: NativeTagValues::default(), estimated_bytes: None }],
                 keep_dst: false, source_depth: Some(1), source_channels: Some(2),
                 source_rate: Some(2_822_400), source_layout: None, is_lossless: true,
@@ -1528,11 +1890,350 @@ mod tests {
     }
 
     #[test]
+    fn extraction_log_reports_measured_outputs_confirmed_skips_and_source_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut job = fixture_job(&temp.path().join("output"), temp.path());
+        job.extraction_log = true;
+        job.disc_identity = NativeDiscIdentity {
+            title: Some("The Album".into()), artist: Some("The Artist".into()),
+            catalog: Some("ABC-123".into()),
+        };
+        job.programs[0].tracks[0].duration_secs = Some(121.0);
+        job.programs[0].tracks[0].estimated_bytes = Some(9_000_000);
+        job.programs[0].tracks.push(NativeTrackChoice {
+            number: 2, name: "two".into(), duration_secs: Some(60.0),
+            estimated_bytes: Some(9_000_000), tags: NativeTagValues::default(),
+        });
+        let written_path = proposed_destination(&job, &job.programs[0], &job.programs[0].tracks[0]);
+        std::fs::create_dir_all(written_path.parent().unwrap()).unwrap();
+        std::fs::write(&written_path, b"abcde").unwrap();
+        let skipped_path = proposed_destination(&job, &job.programs[0], &job.programs[0].tracks[1]);
+        let skipped = NativeSkippedSelection::track(&job.programs[0], 2)
+            .with_reason(NativeSkipReason::ExistingFile);
+        let body = render_native_extraction_log(&job,
+            &[written_path.clone(), job.destination.join(EXTRACTION_LOG_FILE)], &[skipped]);
+        assert!(body.contains("TonePoet "));
+        assert!(body.contains("Generated: "));
+        assert!(body.contains("Disc title: \"The Album\""));
+        assert!(body.contains("Disc artist: \"The Artist\""));
+        assert!(body.contains("Catalog: \"ABC-123\""));
+        assert!(body.contains("Duration: 2:01"));
+        assert!(body.contains("Duration: 1:00"));
+        assert!(body.contains(&format!("File: {:?}", written_path.to_string_lossy())));
+        assert!(body.contains(&format!("File: {:?}", skipped_path.to_string_lossy())));
+        assert!(body.contains("Size: 5 bytes"), "measured size, not preflight estimate");
+        assert!(body.contains("Skipped: file already existed"));
+        assert!(body.contains("Written files: 1"));
+        assert!(body.contains("Skipped items: 1"));
+        assert!(body.contains("Outcome: finished with skipped items"));
+        assert!(!body.contains(&format!("File: {:?}",job.destination.join(EXTRACTION_LOG_FILE).to_string_lossy())),
+            "log cannot inventory itself");
+    }
+
+    #[test]
+    fn earlier_native_extraction_journals_deserialize_without_new_receipt_fields() {
+        let temp = tempfile::tempdir().unwrap();
+        let job = fixture_job(temp.path(), temp.path());
+        let mut value = serde_json::to_value(&job).unwrap();
+        value.as_object_mut().unwrap().remove("disc_identity");
+        value["programs"][0]["tracks"][0].as_object_mut().unwrap().remove("duration_secs");
+        let recovered: NativeExtractionJob = serde_json::from_value(value).unwrap();
+        assert!(recovered.disc_identity.title.is_none());
+        assert!(recovered.programs[0].tracks[0].duration_secs.is_none());
+        let skipped = NativeSkippedSelection::track(&job.programs[0], 1);
+        let mut value = serde_json::to_value(&skipped).unwrap();
+        value.as_object_mut().unwrap().remove("reason");
+        let restored: NativeSkippedSelection = serde_json::from_value(value).unwrap();
+        assert!(restored.same_selection(&skipped));
+        assert_eq!(restored.reason, None);
+    }
+
+    #[test]
+    fn continuous_log_counts_all_tracks_when_a_program_is_skipped() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut job = fixture_job(temp.path(), temp.path());
+        job.file_per_program = true;
+        job.programs[0].tracks.push(NativeTrackChoice {
+            number: 2, name: "two".into(), duration_secs: Some(60.0),
+            estimated_bytes: None, tags: NativeTagValues::default(),
+        });
+        let skipped = NativeSkippedSelection::program(&job.programs[0])
+            .with_reason(NativeSkipReason::ExistingFile);
+        let body=render_native_extraction_log(&job,&[],&[skipped]);
+        assert!(body.contains("Skipped items: 2"));
+        assert!(body.contains("Outcome: finished with skipped items"));
+        assert!(!body.contains("Outcome: failed"));
+    }
+
+    #[test]
+    fn continuous_log_handles_individual_program_and_cue_skips_without_double_counts() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut job = fixture_job(&temp.path().join("output"), temp.path());
+        job.file_per_program = true;
+        job.cue = true;
+        job.format = DiscFormat::DvdAudio;
+        job.programs[0].id = PresentationId::DvdAudioGroup(1);
+        job.programs[0].tracks = (1..=3).map(|number| NativeTrackChoice {
+            number, name: format!("Track {number}"), duration_secs: Some(10.0),
+            estimated_bytes: Some(1000), tags: NativeTagValues::default(),
+        }).collect();
+        let program = &job.programs[0];
+        let skip = |number| NativeSkippedSelection::track(program, number)
+            .with_reason(NativeSkipReason::RequestedByUser);
+        let all_individual = vec![skip(1),skip(2),skip(3)];
+        let body = render_native_extraction_log(&job, &[], &all_individual);
+        assert!(body.contains("Skipped items: 3"), "{body}");
+        assert!(body.contains("Failed outputs: 0"), "{body}");
+        assert!(body.contains("every selected track was individually skipped"), "{body}");
+        assert!(body.contains("CUE:") && body.contains("skipped (no continuous audio)"), "{body}");
+
+        let whole = NativeSkippedSelection::program(program)
+            .with_reason(NativeSkipReason::RequestedByUser);
+        let body = render_native_extraction_log(&job, &[], &[skip(1), whole]);
+        assert!(body.contains("Skipped items: 3"), "{body}");
+        assert!(!body.contains("Skipped items: 4"), "{body}");
+        assert!(body.contains("Failed outputs: 0"), "{body}");
+        let whole_existing = NativeSkippedSelection::program(program)
+            .with_reason(NativeSkipReason::ExistingFile);
+        let body = render_native_extraction_log(&job, &[], &[whole_existing]);
+        assert!(body.contains("Skipped items: 3"), "{body}");
+        assert!(body.contains("Failed outputs: 0"), "{body}");
+        assert!(body.contains("Skipped: file already existed"), "{body}");
+
+        let output = proposed_destination_for_program(&job, program);
+        std::fs::create_dir_all(output.parent().unwrap()).unwrap();
+        std::fs::write(&output, b"joined audio").unwrap();
+        let body = render_native_extraction_log_with_outcome(&job,
+            std::slice::from_ref(&output), &[skip(1)], &[], NativeLogOutcome::Complete, None);
+        assert!(body.contains("Written files: 1"), "{body}");
+        assert!(body.contains("Skipped items: 1"), "{body}");
+        // A complete CUE-enabled program with a missing expected sheet is an
+        // actual missing publication, not a skipped source track.
+        assert!(body.contains("Failed outputs: 1"), "{body}");
+        // With no CUE requested, an individually skipped track plus a
+        // successfully published combined file is a completed, not failed,
+        // extraction.
+        job.cue = false;
+        let body = render_native_extraction_log(&job, &[output.clone()], &[skip(1)]);
+        assert!(body.contains("Written files: 1"), "{body}");
+        assert!(body.contains("Skipped items: 1"), "{body}");
+        assert!(body.contains("Failed outputs: 0"), "{body}");
+        job.cue = true;
+
+        let issue = NativeUnfinishedOutput {
+            destination: output.clone(), reason: "join failed: source read error".into(),
+            cancelled: false,
+        };
+        let body = render_native_extraction_log_with_outcome(&job, &[], &[skip(1)],
+            &[issue], NativeLogOutcome::Failed, Some("source read error"));
+        assert!(body.contains("Failed outputs: 1"), "{body}");
+        assert!(body.contains("join failed: source read error"), "{body}");
+        assert!(body.contains("Skipped items: 1"), "{body}");
+        assert!(body.contains("CUE:") && body.contains("not reached"), "{body}");
+    }
+
+    #[test]
+    fn terminal_log_distinguishes_failed_cancelled_and_unreached_outputs() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut job = fixture_job(&temp.path().join("output"), temp.path());
+        job.programs[0].tracks = (1..=3).map(|number| NativeTrackChoice {
+            number, name: format!("Track {number}"), duration_secs: Some(90.0),
+            estimated_bytes: Some(1024), tags: NativeTagValues::default(),
+        }).collect();
+        let program = &job.programs[0];
+        let first = proposed_destination(&job, program, &program.tracks[0]);
+        let second = proposed_destination(&job, program, &program.tracks[1]);
+        let third = proposed_destination(&job, program, &program.tracks[2]);
+        std::fs::create_dir_all(first.parent().unwrap()).unwrap();
+        std::fs::write(&first, b"previously published audio").unwrap();
+        let failed = NativeUnfinishedOutput { destination: second.clone(),
+            reason: "read error on track 2".into(), cancelled: false };
+        let body = render_native_extraction_log_with_outcome(&job, std::slice::from_ref(&first),
+            &[], &[failed.clone()], NativeLogOutcome::Failed, Some("track 2 failed"));
+        assert!(body.contains("Written files: 1"), "{body}");
+        assert!(body.contains("Failed outputs: 1"), "{body}");
+        assert!(body.contains("read error on track 2"), "{body}");
+        let pending = body.find(&format!("File: {:?}",third.to_string_lossy())).unwrap();
+        assert!(body[pending..].contains("Outcome: not reached"), "{body}");
+        assert!(!body[pending..].contains("Outcome: failed"), "{body}");
+        let cancelled = NativeUnfinishedOutput { cancelled: true, ..failed };
+        let body = render_native_extraction_log_with_outcome(&job, &[first],
+            &[], &[cancelled], NativeLogOutcome::Cancelled, Some("user cancelled"));
+        assert!(body.contains("Outcome: cancelled"), "{body}");
+        assert!(body.contains("Failed outputs: 0"), "{body}");
+        assert!(body.contains("Outcome: not reached"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn preexisting_log_under_skip_or_fail_stops_before_media_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut job = fixture_job(&temp.path().join("output"), temp.path());
+        job.extraction_log = true;
+        job.overwrite_policy = NativeOverwritePolicy::Skip;
+        std::fs::create_dir_all(&job.destination).unwrap();
+        let log = job.destination.join(EXTRACTION_LOG_FILE);
+        std::fs::write(&log, b"existing user receipt").unwrap();
+        let error = execute(job.clone(), CancellationToken::new(), |_| {}).await.unwrap_err();
+        assert!(error.contains("Replace or disable logging"), "{error}");
+        assert_eq!(std::fs::read(&log).unwrap(), b"existing user receipt");
+        assert_eq!(path_inventory(&job.destination),
+            BTreeSet::from([EXTRACTION_LOG_FILE.to_string()]));
+        job.overwrite_policy = NativeOverwritePolicy::Fail;
+        assert!(validate_job(&job).unwrap_err().contains("Extraction log already exists"));
+        job.overwrite_policy = NativeOverwritePolicy::Replace;
+        assert!(validate_job(&job).is_ok());
+        std::fs::remove_file(log).unwrap();
+        job.overwrite_policy = NativeOverwritePolicy::Skip;
+        assert!(validate_job(&job).is_ok());
+    }
+
+    #[tokio::test]
+    async fn preexisting_cue_with_skip_is_rejected_before_continuous_audio_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let formats = [
+            (DiscFormat::DvdAudio, PresentationId::DvdAudioGroup(1)),
+            (DiscFormat::DvdVideo, PresentationId::dvd_video(1, 1, 0)),
+            (DiscFormat::BluRay, PresentationId::try_blu_ray_title(1, 0x1100, 0, 1).unwrap()),
+        ];
+        for (format, presentation) in formats {
+            let mut job = fixture_job(&temp.path().join(format.name()), temp.path());
+            job.format = format;
+            job.programs[0].id = presentation;
+            job.file_per_program = true;
+            job.cue = true;
+            job.overwrite_policy = NativeOverwritePolicy::Skip;
+            let media = proposed_destination_for_program(&job, &job.programs[0]);
+            let cue = media.with_extension("cue");
+            fs::create_dir_all(cue.parent().unwrap()).unwrap();
+            fs::write(&cue, b"original CUE sheet").unwrap();
+            let before = path_inventory(&job.destination);
+
+            // Direct callers and the UI share this validation; execute must
+            // refuse without materializing or publishing any audio.
+            let error = execute(job.clone(), CancellationToken::new(), |_| {}).await.unwrap_err();
+            assert!(error.contains("CUE sheet already exists"), "{format:?}: {error}");
+            assert!(error.contains("choose Replace, disable CUE output, or change the destination"),
+                "{format:?}: {error}");
+            assert!(!media.exists(), "{format:?}: unexpected continuous audio");
+            assert_eq!(fs::read(&cue).unwrap(), b"original CUE sheet");
+            assert_eq!(path_inventory(&job.destination), before);
+
+            job.cue = false;
+            assert!(validate_job(&job).is_ok(), "{format:?}: disabling CUE resolves collision");
+            job.cue = true;
+            job.overwrite_policy = NativeOverwritePolicy::Fail;
+            assert!(validate_job(&job).unwrap_err().contains("Destination item already exists"));
+            job.overwrite_policy = NativeOverwritePolicy::Replace;
+            assert!(validate_job(&job).is_ok(), "{format:?}: Replace must admit CUE");
+            fs::remove_file(&cue).unwrap();
+            job.overwrite_policy = NativeOverwritePolicy::Skip;
+            assert!(validate_job(&job).is_ok(), "{format:?}: no CUE collision");
+
+            // Skip must continue accepting an existing whole-program audio
+            // output when there is no CUE collision.
+            fs::write(&media, b"previously joined audio").unwrap();
+            assert!(validate_job(&job).is_ok(), "{format:?}: whole-program media skip");
+            assert_eq!(fs::read(&media).unwrap(), b"previously joined audio");
+        }
+    }
+
+    #[tokio::test]
+    async fn existing_continuous_audio_and_cue_allow_skip_and_other_programs() {
+        let temp = tempfile::tempdir().unwrap();
+        let formats = [
+            (DiscFormat::DvdAudio, PresentationId::DvdAudioGroup(1), PresentationId::DvdAudioGroup(2)),
+            (DiscFormat::DvdVideo, PresentationId::dvd_video(1, 1, 0), PresentationId::dvd_video(1, 2, 0)),
+            (DiscFormat::BluRay,
+                PresentationId::try_blu_ray_title(1, 0x1100, 0, 1).unwrap(),
+                PresentationId::try_blu_ray_title(2, 0x1100, 0, 1).unwrap()),
+        ];
+        for (format, first_id, second_id) in formats {
+            let mut job = fixture_job(&temp.path().join(format.name()), temp.path());
+            job.format = format;
+            job.programs[0].id = first_id;
+            job.file_per_program = true;
+            job.cue = true;
+            job.overwrite_policy = NativeOverwritePolicy::Skip;
+            let media = proposed_destination_for_program(&job, &job.programs[0]);
+            let cue = media.with_extension("cue");
+            fs::create_dir_all(media.parent().unwrap()).unwrap();
+            fs::write(&media, b"previous continuous audio").unwrap();
+            fs::write(&cue, b"previous CUE sheet").unwrap();
+            let before = path_inventory(&job.destination);
+
+            // The engine skips this entire program without attempting CUE
+            // publication, so an existing CUE must not block validation.
+            assert!(validate_job(&job).is_ok(), "{format:?}: existing audio and CUE");
+            let report = execute(job.clone(), CancellationToken::new(), |_| {}).await.unwrap();
+            assert!(report.published.is_empty(), "{format:?}: no output should be republished");
+            assert_eq!(report.skipped, job.programs[0].tracks.len(), "{format:?}");
+            assert_eq!(fs::read(&media).unwrap(), b"previous continuous audio");
+            assert_eq!(fs::read(&cue).unwrap(), b"previous CUE sheet");
+            assert_eq!(path_inventory(&job.destination), before);
+
+            // A completed program must not prevent a different selected
+            // program from entering the extraction queue under Skip.
+            let mut second = job.programs[0].clone();
+            second.id = second_id;
+            second.label = "Another program".into();
+            job.programs.push(second);
+            assert!(!proposed_destination_for_program(&job, &job.programs[1]).exists());
+            assert!(validate_job(&job).is_ok(), "{format:?}: second program should proceed");
+        }
+    }
+
+    #[test]
+    fn continuous_log_uses_source_duration_for_whole_skips_and_output_duration_for_joins() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut job = fixture_job(&temp.path().join("output"), temp.path());
+        job.format = DiscFormat::DvdAudio;
+        job.programs[0].id = PresentationId::DvdAudioGroup(1);
+        job.file_per_program = true;
+        job.programs[0].tracks = [20.0, 25.0].into_iter().enumerate().map(|(index, minutes)| {
+            NativeTrackChoice {
+                number: index as u32 + 1,
+                name: format!("Track {}", index + 1), duration_secs: Some(minutes * 60.0),
+                estimated_bytes: None, tags: NativeTagValues::default(),
+            }
+        }).collect();
+        let program = &job.programs[0];
+        let output = proposed_destination_for_program(&job, program);
+        let first_skip = NativeSkippedSelection::track(program, 1)
+            .with_reason(NativeSkipReason::RequestedByUser);
+        let second_skip = NativeSkippedSelection::track(program, 2)
+            .with_reason(NativeSkipReason::RequestedByUser);
+        let whole_skip = NativeSkippedSelection::program(program)
+            .with_reason(NativeSkipReason::ExistingFile);
+
+        let whole = render_native_extraction_log(&job, &[], &[whole_skip]);
+        assert!(whole.contains("Duration: 45:00 (selected source; output skipped)"), "{whole}");
+        assert!(whole.contains("Skipped: file already existed"), "{whole}");
+        assert!(whole.contains("Skipped items: 2"), "{whole}");
+        assert!(whole.contains("Failed outputs: 0"), "{whole}");
+
+        let none_written = render_native_extraction_log(&job, &[], &[first_skip.clone(), second_skip]);
+        assert!(none_written.contains("Duration: unavailable (no continuous output)"), "{none_written}");
+        assert!(!none_written.contains("Duration: 0:00"), "{none_written}");
+        assert!(none_written.contains("every selected track was individually skipped"), "{none_written}");
+        assert!(none_written.contains("Skipped items: 2"), "{none_written}");
+        assert!(none_written.contains("Failed outputs: 0"), "{none_written}");
+
+        fs::create_dir_all(output.parent().unwrap()).unwrap();
+        fs::write(&output, b"joined second track").unwrap();
+        let joined = render_native_extraction_log(&job, &[output], &[first_skip]);
+        assert!(joined.contains("Duration: 25:00"), "{joined}");
+        assert!(!joined.contains("Duration: 45:00"), "{joined}");
+        assert!(joined.contains("Outcome: written"), "{joined}");
+        assert!(joined.contains("Skipped items: 1"), "{joined}");
+        assert!(joined.contains("Failed outputs: 0"), "{joined}");
+    }
+
+    #[test]
     fn partial_continuous_skips_count_only_published_track_estimates() {
         const TRACK: u64 = 100 * 1024 * 1024;
         let mut job = fixture_job(Path::new("/unused-destination"), Path::new("/unused-scratch"));
         let program = &mut job.programs[0];
-        program.tracks = (1..=3).map(|number| NativeTrackChoice {
+        program.tracks = (1..=3).map(|number| NativeTrackChoice { duration_secs: None,
             number, name: format!("Track {number}"), tags: NativeTagValues::default(),
             estimated_bytes: Some(TRACK),
         }).collect();
@@ -1759,7 +2460,7 @@ mod tests {
             tags: NativeTagValues { album: Some("An Album".into()),
                 artist: Some("A Performer".into()), ..Default::default() },
         };
-        let track = NativeTrackChoice { number: 3, name: "A Song".into(),
+        let track = NativeTrackChoice { duration_secs: None, number: 3, name: "A Song".into(),
             tags: NativeTagValues { title: Some("A Song".into()),
                 composer: Some("A Composer".into()), ..Default::default() }, estimated_bytes: None };
         assert_eq!(render_naming_template("{track} - {artist} - {title}", &program, &track),
@@ -1904,13 +2605,13 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let destination = temp.path().join("requested-output");
         let scratch = destination.join("scratch-should-not-exist");
-        let job = NativeExtractionJob {
+        let job = NativeExtractionJob { disc_identity: Default::default(),
             source: std::env::current_exe().unwrap(),
             format: DiscFormat::Sacd,
             programs: vec![NativeProgramChoice {
                 id: PresentationId::SacdArea(crate::disc::SacdAreaId::Stereo),
                 label: "Stereo".into(),
-                tracks: vec![NativeTrackChoice { number: 1, name: "one".into(), tags: NativeTagValues::default(), estimated_bytes: None }],
+                tracks: vec![NativeTrackChoice { duration_secs: None, number: 1, name: "one".into(), tags: NativeTagValues::default(), estimated_bytes: None }],
                 keep_dst: false,
                 source_depth: Some(1),
                 source_channels: Some(2),
@@ -2043,10 +2744,10 @@ mod tests {
 
     #[test]
     fn reject_duplicate_track_selection_before_io() {
-        let job = NativeExtractionJob { source: std::env::current_exe().unwrap(), format: DiscFormat::Sacd,
+        let job = NativeExtractionJob { disc_identity: Default::default(), source: std::env::current_exe().unwrap(), format: DiscFormat::Sacd,
             programs: vec![NativeProgramChoice { id: PresentationId::SacdArea(crate::disc::SacdAreaId::Stereo),
-                label: "Stereo".into(), tracks: vec![NativeTrackChoice{number:1,name:"a".into(),tags:NativeTagValues::default(),estimated_bytes:None},
-                NativeTrackChoice{number:1,name:"b".into(),tags:NativeTagValues::default(),estimated_bytes:None}], keep_dst:false,source_depth:Some(1),
+                label: "Stereo".into(), tracks: vec![NativeTrackChoice{ duration_secs: None,number:1,name:"a".into(),tags:NativeTagValues::default(),estimated_bytes:None},
+                NativeTrackChoice{ duration_secs: None,number:1,name:"b".into(),tags:NativeTagValues::default(),estimated_bytes:None}], keep_dst:false,source_depth:Some(1),
                 source_channels:Some(2), source_rate:Some(2822400), angle:1,source_layout:None, is_lossless:true, tags:NativeTagValues::default() }],
             destination:"/tmp/dest".into(),working_root:"/tmp".into(),
             wav_container:NativeWavContainer::Automatic,assume_decrypted:false,downmix:DvdaDownmixPolicy::None,

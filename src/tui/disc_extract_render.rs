@@ -275,13 +275,15 @@ pub fn draw(
     let colors=extract_colors(theme);
     let header_height=if small {2} else {3};
     let output_count=state.output_rows().len() as u16;
-    // Folder and Naming share the Destination keyboard index, but have
-    // independent mouse targets and actions.
-    let output_height=if small {1} else {output_count.saturating_add(1).max(2)};
-    let results_height=if small {1}else{2};
+    // A stop per setting, while the wide layout still fits four rows of
+    // controls (the first four occupy two columns).
+    let output_height=if small {1} else if wide {output_count.saturating_sub(2)}
+        else {output_count};
+    let results_height=1;
     let footer_height=if small {1}else{2};
     let problems=state.blockers(scratch);
-    let warning_height=u16::from(!problems.is_empty());
+    // A blocker replaces the caption, rather than creating an extra form row.
+    let warning_height=0u16;
     let item_count=state.selected_presentation().map_or(0,|p|p.tracks.len())
         .min(u16::MAX as usize) as u16;
     let pane_height=12u16.max(item_count.saturating_add(3))
@@ -406,11 +408,7 @@ pub fn draw(
         frame.render_widget(Paragraph::new(Line::from(line))
             .style(Style::default().bg(colors.band)),chunks[4]);
     } else { draw_output(frame,state,chunks[4],buttons,theme,wide); }
-    if let Some(problem)=problems.first() {
-        frame.render_widget(Paragraph::new(clip(&format!("⚠ {problem}"),chunks[6].width))
-            .style(Style::default().fg(theme.error).bg(colors.base)),chunks[6]);
-    }
-    draw_results(frame,state,scratch,chunks[7],small,theme);
+    draw_results(frame,state,scratch,chunks[7],problems.first().map(String::as_str),theme);
     fill(frame,chunks[5],colors.base);
     draw_footer(frame,state,chunks[9],buttons,small,problems.is_empty(),theme);
     // These dividers are the only widgets allowed to touch the body rails.
@@ -589,6 +587,11 @@ fn draw_programs(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect, butt
     for (offset,(index,label,focused,angle_owner)) in display_rows.iter()
         .skip(scroll).take(inner.height as usize).enumerate() {
         let y=inner.y+offset as u16;
+        if index.is_none() && !s.contents.suppressed.is_empty()
+            && label.starts_with(&format!("{} hidden",s.contents.suppressed.len())) {
+            buttons.record_button(TuiButton::DiscBrowserHiddenToggle,
+                Rect::new(inner.x,y,inner.width,1));
+        }
         let active = s.focus==ExtractFocus::Programs && *focused;
         let bg=if active {theme.selection_bg}
             else if *focused {colors.selection_muted}
@@ -713,6 +716,13 @@ fn draw_items(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect,
     for previous in p.tracks.iter().take(scroll) {
         start_secs=start_secs.and_then(|secs|previous.duration_secs.map(|d|secs+d));
     }
+    let differing_performer=p.tracks.iter().any(|track|track.performer.as_deref()
+        .is_some_and(|name|Some(name)!=s.contents.album_artist.as_deref()));
+    // Measure the entire chosen program once; every title starts in one
+    // column even when a later track's time crosses an hour boundary.
+    let duration_width=p.tracks.iter().filter_map(|track| track.duration_secs)
+        .map(duration_display).map(|text| text.chars().count())
+        .max().unwrap_or(0).max(4).min(u16::MAX as usize - 1) as u16 + 1;
     for (offset,(i,track)) in p.tracks.iter().enumerate().skip(scroll)
         .take(visible as usize).enumerate() {
         let y=inner.y+offset as u16;
@@ -743,14 +753,11 @@ fn draw_items(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect,
             .style(style.fg(colors.dim)),Rect::new(x,y,number_width,1));
         x+=number_width;
         let duration=track.duration_secs.map(duration_display).unwrap_or_default();
-        let duration_width=(duration.chars().count() as u16).saturating_add(1);
-        frame.render_widget(Paragraph::new(duration)
+        frame.render_widget(Paragraph::new(duration).alignment(Alignment::Right)
             .style(style.fg(if focused{words.value}else{words.soft})),
-            Rect::new(x,y,duration_width,1));
+            Rect::new(x,y,duration_width.saturating_sub(1),1));
         x+=duration_width;
         let tail_width=if wide {9u16}else{0u16};
-        let differing_performer=p.tracks.iter().any(|track|track.performer.as_deref()
-            .is_some_and(|name|Some(name)!=s.contents.album_artist.as_deref()));
         let performer_width=if wide && differing_performer {
             ((inner.width.saturating_sub(32))/4).min(24)
         }else{0};
@@ -762,7 +769,6 @@ fn draw_items(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect,
         if wide && performer_width>0 {
             frame.render_widget(Paragraph::new(clip(track.performer.as_deref().unwrap_or(""),performer_width))
                 .style(style.fg(if focused{words.value}else{words.soft})),Rect::new(x,y,performer_width,1));
-            x+=performer_width;
         }
         if wide {
             let start=start_secs.map(duration_display).unwrap_or_default();
@@ -786,9 +792,8 @@ fn draw_items(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect,
             inner.y+(p.tracks.len() as u16).saturating_add(1)
         }else{inner.y+inner.height-1};
         if y<inner.y+inner.height {
-            let note=if note.contains("ISRC ") {
-                format!("{:02} {note}",p.tracks[cursor].number)
-            }else{note.to_owned()};
+            // Track-scoped details always name the track, not just ISRC notes.
+            let note=format!("{:02} {note}",p.tracks[cursor].number);
             frame.render_widget(Paragraph::new(clip_end(&note,inner.width))
                 .style(Style::default().fg(pane_words.soft).bg(pane_bg)),Rect::new(inner.x,y,inner.width,1));
         }
@@ -837,12 +842,15 @@ fn option_value(s: &DiscBrowserState, name: &str) -> String {
             NativeWavContainer::Rf64 => "RF64 WAV · large-file capable".into(),
             NativeWavContainer::W64 => "W64 · 64-bit sizes".into(),
         },
-        "Files" => (if s.file_per_program { if s.cue {"continuous per program + CUE"} else {"continuous per program"} } else if matches!(s.contents.format,DiscFormat::DvdVideo|DiscFormat::BluRay) { "one per chapter" } else { "one per track" }).into(),
+        "Files" => (if s.file_per_program {
+            if s.cue { "one per area/group/title + CUE" } else { "one per area/group/title" }
+        } else if matches!(s.contents.format,DiscFormat::DvdVideo|DiscFormat::BluRay) {
+            "one per chapter"
+        } else { "one per track" }).into(),
         "Tags" => if s.tags { format!("on · {} fields · {}{}",
             s.tag_fields.count_ones(),if s.tag_artwork {"artwork"}else{"no artwork"},
             if s.keep_dst.iter().any(|v|*v) {" · DFF drops tags"}else{""}) }
             else { "off · no metadata written".into() },
-        "Destination" => compact_folder_path(&s.destination, 120),
         "Downmix" => s.downmix.as_str().to_string(),
         "Assume decrypted" => if s.assume_decrypted {"on · already decrypted"} else {"off"}.into(),
         _ => String::new(),
@@ -854,26 +862,25 @@ fn option_value(s: &DiscBrowserState, name: &str) -> String {
 fn output_cell(index: usize, count: usize, area: Rect, wide: bool, focus: usize) -> Option<Rect> {
     if count==0 || area.height==0 || area.width<=4 {return None;}
     let text=Rect::new(area.x+2,area.y,area.width-4,area.height);
-    if wide && count>=4 && text.width>=70 {
+    if wide && count>=6 && text.width>=70 {
         const GUTTER:u16=3;
         let left_width=(text.width-GUTTER)/2;
         let right_x=text.x+left_width+GUTTER;
         let right_width=text.width-left_width-GUTTER;
-        return match index {
-            0=>Some(Rect::new(text.x,text.y,left_width,1)),
-            1=>Some(Rect::new(text.x,text.y+1,left_width,1)),
-            2=>Some(Rect::new(right_x,text.y,right_width,1)),
-            3=>Some(Rect::new(text.x,text.y+2,text.width,2.min(text.height.saturating_sub(2)))),
-            _=>{let row=index as u16;
-                (row<text.height).then(||Rect::new(text.x,text.y+row,text.width,1))},
+        let (x,y,width)=match index {
+            0=>(text.x,0,left_width),              // Format
+            1=>(text.x,1,left_width),              // Files
+            2=>(right_x,0,right_width),           // Tags
+            3=>(right_x,1,right_width),           // Overwrite
+            _=>(text.x,(index-2) as u16,text.width), // Folder, Naming, extras
         };
+        return (y<text.height).then(||Rect::new(x,text.y+y,width,1));
     }
-    let visible=text.height.saturating_sub(1) as usize;
+    let visible=text.height as usize;
     let scroll=focus.min(count.saturating_sub(1)).saturating_sub(visible.saturating_sub(1))
         .min(count.saturating_sub(visible));
     if index<scroll || index>=scroll+visible {return None;}
-    let y=text.y+(index-scroll) as u16+u16::from(index>3);
-    Some(Rect::new(text.x,y,text.width,if index==3 {2.min(text.y+text.height-y)}else{1}))
+    Some(Rect::new(text.x,text.y+(index-scroll) as u16,text.width,1))
 }
 
 /// Highlight template tokens without granting the renderer any knowledge of
@@ -899,105 +906,75 @@ fn draw_output(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,
     buttons:&mut ButtonRenderMap,theme:Theme,wide:bool) {
     let rows=s.output_rows();
     let colors=extract_colors(theme);
-    fill(frame,r,colors.band);
+    let region_bg=if s.focus==ExtractFocus::Output {colors.focused}else{colors.band};
+    fill(frame,r,region_bg);
     const LABEL_WIDTH:usize=12;
     for (i,name) in rows.iter().enumerate() {
         let Some(cell)=output_cell(i,rows.len(),r,wide,s.output_cursor) else{continue;};
         let focused=s.focus==ExtractFocus::Output && s.output_cursor==i;
-        // Output, unlike the two lists, has no selection bar when unfocused.
-        let bg=if focused {theme.selection_bg}else{colors.band};
-        fill(frame,cell,bg);
-        let words=word_tiers(theme,colors,bg);
-        let label=if *name=="Destination" {"Folder"}else{*name};
+        // The region takes a surface tint, but no control gets a row bar or
+        // list cursor. Only the focused label and its value receive emphasis.
+        let words=word_tiers(theme,colors,region_bg);
+        let highlight=if focused {readable_word(theme.info,region_bg)} else {words.label};
+        let style=Style::default().bg(region_bg).fg(highlight);
+        let label_style=if focused {style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED)}
+            else{style};
         let value_width=cell.width.saturating_sub(LABEL_WIDTH as u16+2);
-        let prefix=if focused {"▌"}else{" "};
         let mut spans=vec![
-            Span::styled(prefix,Style::default().fg(if focused{theme.info}else{colors.faint})),
-            Span::styled(format!("{label:<LABEL_WIDTH$} "),
-                Style::default().fg(if focused{words.value}else{words.label})),
+            Span::styled(" ",Style::default().fg(colors.faint)),
+            Span::styled(format!("{name:<LABEL_WIDTH$} "),label_style),
         ];
-        if *name=="Destination" {
-            // The compact layout has no separate shortcut row; retain a
-            // visible hint without changing the Folder mouse hitbox.
-            let hint=if focused && r.width<96 {"  ↵ pick · Space settings"}else{""};
-            let path_width=value_width.saturating_sub(hint.chars().count() as u16);
-            spans.push(Span::styled(compact_folder_path(&s.destination,path_width),
-                Style::default().fg(words.value)));
-            if !hint.is_empty() {
-                spans.push(Span::styled(hint,Style::default().fg(words.value)));
-            }
-        }else{
-            let value=clip_end(&option_value(s,name),value_width);
-            if let Some((first,tail))=value.split_once(" · ") {
-                spans.push(Span::styled(first.to_string(),Style::default().fg(words.value)));
-                spans.push(Span::styled(" · ",Style::default().fg(colors.faint)));
-                spans.push(Span::styled(tail.to_string(),Style::default().fg(if focused{words.value}else{words.soft})));
-            }else{
-                spans.extend(value_spans(&value,words.value,if focused{words.value}
-                    else{readable_word(theme.purple,bg)}));
-            }
-        }
-        frame.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(bg)),
-            Rect::new(cell.x,cell.y,cell.width,1));
-        if *name=="Destination" && cell.height>1 {
-            let mut naming=vec![
-                Span::styled(prefix,Style::default().fg(if focused{theme.info}else{colors.faint})),
-                Span::styled(format!("{:<LABEL_WIDTH$} ","Naming"),
-                    Style::default().fg(if focused{words.value}else{words.label})),
-            ];
-            naming.extend(value_spans(&clip_end(&s.naming_template,value_width),words.value,
-                if focused{words.value}else{readable_word(theme.purple,bg)}));
-            frame.render_widget(Paragraph::new(Line::from(naming)).style(Style::default().bg(bg)),
-                Rect::new(cell.x,cell.y+1,cell.width,1));
-        }
-        if *name=="Destination" {
-            // Folder and Naming are two actions, not a two-row picker hitbox.
-            buttons.record_button(TuiButton::DiscBrowserOutput(i),
-                Rect::new(cell.x,cell.y,cell.width,1));
-            if cell.height>1 {
-                buttons.record_button(TuiButton::DiscBrowserNaming,
-                    Rect::new(cell.x,cell.y+1,cell.width,1));
-            }
-        } else {
-            buttons.record_button(TuiButton::DiscBrowserOutput(i),cell);
-        }
-    }
-    if wide && rows.len()>=4 && r.height>1 && r.width>=74 {
-        // Overwrite is a second view into the existing Destination option;
-        // it does not add a keyboard index or a separate settings subsystem.
-        const GUTTER:u16=3;
-        let text=Rect::new(r.x+2,r.y,r.width.saturating_sub(4),r.height);
-        let left_width=(text.width-GUTTER)/2;
-        let cell=Rect::new(text.x+left_width+GUTTER,r.y+1,
-            text.width-left_width-GUTTER,1);
-        let policy=match s.overwrite_policy {
-            crate::convert::pipeline::native_extract::NativeOverwritePolicy::Fail=>"stop if a file exists",
-            crate::convert::pipeline::native_extract::NativeOverwritePolicy::Skip=>"skip existing",
-            crate::convert::pipeline::native_extract::NativeOverwritePolicy::Replace=>"replace existing",
+        let value=match *name {
+            "Folder"=>compact_folder_path(&s.destination,value_width),
+            "Naming"=>clip_end(&s.naming_template,value_width),
+            "Overwrite"=>match s.overwrite_policy {
+                crate::convert::pipeline::native_extract::NativeOverwritePolicy::Fail=>"stop if a file exists".into(),
+                crate::convert::pipeline::native_extract::NativeOverwritePolicy::Skip=>"skip existing".into(),
+                crate::convert::pipeline::native_extract::NativeOverwritePolicy::Replace=>"replace existing".into(),
+            },
+            _=>clip_end(&option_value(s,name),value_width),
         };
-        let focused=s.focus==ExtractFocus::Output && s.output_cursor==3;
-        let bg=if focused{theme.selection_bg}else{colors.band};
-        fill(frame,cell,bg);
-        let words=word_tiers(theme,colors,bg);
-        let width=cell.width.saturating_sub(LABEL_WIDTH as u16+2);
-        frame.render_widget(Paragraph::new(Line::from(vec![
-            Span::styled(if focused{"▌"}else{" "},Style::default().fg(if focused{theme.info}else{colors.faint})),
-            Span::styled(format!("{:<LABEL_WIDTH$} ","Overwrite"),
-                Style::default().fg(if focused{words.value}else{words.label})),
-            Span::styled(clip_end(policy,width),Style::default().fg(words.value)),
-        ])).style(Style::default().bg(bg)),cell);
-        buttons.record_button(TuiButton::DiscBrowserOverwrite,cell);
+        let hint=if focused && *name=="Folder" && r.width<96 {
+            // The compact Output tab has no shortcut row. Reuse the exact
+            // binding labels that drive Enter and Space in this context.
+            let bindings=super::disc_browser_actions::native_key_hints(s);
+            let keys=bindings.into_iter().filter(|label| label.starts_with('↵') || label.starts_with("Space"))
+                .collect::<Vec<_>>();
+            format!(" · {}",keys.join(" · "))
+        }else{String::new()};
+        let shown=if hint.is_empty(){value}else{
+            format!("{}{}",clip_end(&value,value_width.saturating_sub(hint.chars().count() as u16)),hint)
+        };
+        if let Some((first,tail))=shown.split_once(" · ") {
+            spans.push(Span::styled(first.to_owned(),Style::default().fg(words.value)));
+            spans.push(Span::styled(" · ",Style::default().fg(colors.faint)));
+            spans.push(Span::styled(tail.to_owned(),Style::default().fg(words.soft)));
+        }else if *name=="Naming" {
+            spans.extend(value_spans(&shown,words.value,if focused {highlight}
+                else {readable_word(theme.purple,region_bg)}));
+        }else{
+            spans.push(Span::styled(shown,Style::default().fg(words.value)));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().bg(region_bg)),cell);
+        let target=match *name {
+            "Naming"=>TuiButton::DiscBrowserNaming,
+            "Overwrite"=>TuiButton::DiscBrowserOverwrite,
+            _=>TuiButton::DiscBrowserOutput(i),
+        };
+        buttons.record_button(target,cell);
     }
 }
 
+/// A result caption, not a selectable setting. The only highlighted text
+/// here is an extraction blocker. Working space is shown only when separate.
 fn draw_results(frame:&mut ratatui::Frame,s:&DiscBrowserState,
-    scratch:&Path,r:Rect,small:bool,theme:Theme) {
+    scratch:&Path,r:Rect,blocker:Option<&str>,theme:Theme) {
+    if r.height==0 {return;}
     let items=s.selected_item_count();
     let programs=s.selected_program_count();
     let size=s.selected_item_bytes().map_or_else(||"pending".into(),|(total,_,_)|format_bytes(total));
     let kind=match (matches!(s.contents.format,DiscFormat::DvdVideo|DiscFormat::BluRay),items) {
-        (true,1)=>"chapter",(true,_)=>"chapters",
-        (false,1)=>"track",(false,_)=>"tracks",
+        (true,1)=>"chapter",(true,_)=>"chapters",(false,1)=>"track",(false,_)=>"tracks",
     };
     let group=match s.contents.format {
         DiscFormat::Sacd=>if programs==1 {"area"}else{"areas"},
@@ -1005,27 +982,31 @@ fn draw_results(frame:&mut ratatui::Frame,s:&DiscBrowserState,
         DiscFormat::DvdVideo=>if programs==1 {"title"}else{"titles"},
         DiscFormat::BluRay=>if programs==1 {"playlist"}else{"playlists"},
     };
-    let main=format!("{items} {kind} · {programs} {group} · about {size}");
-    let destination=space_for(&s.destination).map_or_else(||"unknown".into(),format_bytes);
-    let available=space_for(scratch).map_or_else(||"unknown".into(),format_bytes);
-    let space=if s.native_storage_shares_destination_volume(scratch) {
-        format!("destination {destination} free · working storage {available} free (shared volume)")
-    }else{
-        format!("destination {destination} free · working storage {available} free")
-    };
     let colors=extract_colors(theme);
     let words=word_tiers(theme,colors,colors.base);
     fill(frame,r,colors.base);
-    for (row,(label,value)) in [ ("Extract",main),("Space",space) ]
-        .into_iter().take(if small {1}else{2}).enumerate() {
-        let width=r.width.saturating_sub(4);
-        frame.render_widget(Paragraph::new(Line::from(vec![
-            Span::styled(" ",Style::default()),
-            Span::styled(format!("{label:<12} "),Style::default().fg(words.label)),
-            Span::styled(clip_end(&value,width.saturating_sub(14)),Style::default().fg(words.soft)),
-        ])).style(Style::default().bg(theme.panel_bg)),
-            Rect::new(r.x+2,r.y+row as u16,width,1));
-    }
+    let caption=if let Some(blocker)=blocker {format!("⚠ {blocker}")} else {
+        let log=if s.extraction_log {" + log"}else{""};
+        let dest=space_for(&s.destination).map_or_else(||"unknown".into(),format_bytes);
+        let base=format!("{items} {kind}{log} · {programs} {group} · {size}");
+        if s.native_storage_shares_destination_volume(scratch) {
+            format!("{base} · destination {dest} free")
+        } else {
+            let available=space_for(scratch).map_or_else(||"unknown".into(),format_bytes);
+            let capacities=format!("destination {dest} free · working {available} free");
+            let detailed=format!("{base} · {capacities}");
+            let compact=format!("{items} {kind}{log} · {size} · {capacities}");
+            // A popup may be narrower than the terminal. Remove optional
+            // selection details before sacrificing either volume's capacity.
+            let width=r.width.saturating_sub(4) as usize;
+            if detailed.chars().count()<=width { detailed }
+            else if compact.chars().count()<=width { compact }
+            else { capacities }
+        }
+    };
+    frame.render_widget(Paragraph::new(clip_end(&caption,r.width.saturating_sub(4)))
+        .style(Style::default().bg(colors.base).fg(if blocker.is_some(){theme.error}else{words.soft})),
+        Rect::new(r.x+2,r.y,r.width.saturating_sub(4),1));
 }
 
 fn draw_footer(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,buttons:&mut ButtonRenderMap,small:bool,can_extract:bool,theme:Theme) {
@@ -1034,17 +1015,38 @@ fn draw_footer(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,buttons:&mut
     let words=word_tiers(theme,colors,colors.base);
     fill(frame,r,colors.base);
     if !small {
-        let (lead,hint)=if s.focus==ExtractFocus::Output
-            && s.current_output_panel()==ExtractPanel::Destination {
-            ("↵"," folder picker · Space settings · t naming · o overwrite")
-        }else{
-            ("↑↓"," move · ←→ pane · Space check · a n i all none invert · ⇧↑↓ range · [ ] cycle · Tab focus · ↵ open · h hidden")
-        };
-        frame.render_widget(Paragraph::new(Line::from(vec![
-            Span::styled(lead,Style::default().fg(theme.info)),
-            Span::styled(clip_end(hint,r.width.saturating_sub(6)),
-                Style::default().fg(words.label)),
-        ])),Rect::new(r.x+2,r.y,r.width.saturating_sub(4),1));
+        let hints=super::disc_browser_actions::native_key_hints(s);
+        // Keep the help key visible at the right margin, even when the other
+        // contextual hints cannot all fit in a medium-width terminal.
+        let help=hints.last().copied().unwrap_or("? all keys");
+        let help_width=help.chars().count() as u16;
+        let right=r.x.saturating_add(r.width).saturating_sub(2);
+        let help_x=right.saturating_sub(help_width);
+        let mut x=r.x+2;
+        for (i,hint) in hints.iter().take(hints.len().saturating_sub(1)).enumerate() {
+            let token=format!("{}{}",if i==0 {""}else{" · "},hint);
+            let width=token.chars().count() as u16;
+            if x.saturating_add(width+3)>help_x { break; }
+            let clickable=super::disc_browser_actions::native_hint_clickable(s,i);
+            let key=token.find(' ').unwrap_or(token.len());
+            let mut key_style=Style::default().fg(theme.info);
+            if clickable {key_style=key_style.add_modifier(Modifier::UNDERLINED);}
+            let spans=vec![Span::styled(token[..key].to_owned(),key_style),
+                Span::styled(token[key..].to_owned(),Style::default().fg(words.label))];
+            frame.render_widget(Paragraph::new(Line::from(spans)),Rect::new(x,r.y,width,1));
+            if clickable {
+                buttons.record_button(TuiButton::DiscBrowserHint(i),Rect::new(x,r.y,width,1));
+            }
+            x=x.saturating_add(width);
+        }
+        if help_x>=x && help_x+help_width<=right && help_width>0 {
+            let index=hints.len().saturating_sub(1);
+            frame.render_widget(Paragraph::new(help)
+                .style(Style::default().fg(theme.info).add_modifier(Modifier::UNDERLINED)),
+                Rect::new(help_x,r.y,help_width,1));
+            buttons.record_button(TuiButton::DiscBrowserHint(index),
+                Rect::new(help_x,r.y,help_width,1));
+        }
     }
     let y=r.y+r.height-1;
     let chips=[("^x Extract",TuiButton::DiscBrowserExtract,can_extract,theme.chip_go),
@@ -1076,6 +1078,7 @@ fn draw_panel(frame:&mut ratatui::Frame,s:&DiscBrowserState,panel:ExtractPanel,p
         ExtractPanel::Destination=>"Destination",ExtractPanel::Downmix=>"Downmix",
         ExtractPanel::AssumeDecrypted=>"Assume decrypted",ExtractPanel::Diagnostics=>"Diagnostics",
         ExtractPanel::More=>"More",ExtractPanel::ConvertChoice=>"Convert selection",
+        ExtractPanel::Keys=>"Extract keys",
     };
     let block=Block::default().borders(Borders::ALL).title(format!(" {title} "))
         .style(Style::default().bg(theme.panel_bg).fg(readable_word(theme.value,theme.panel_bg)))
@@ -1085,14 +1088,17 @@ fn draw_panel(frame:&mut ratatui::Frame,s:&DiscBrowserState,panel:ExtractPanel,p
     let lines:Vec<String>=match panel {
         ExtractPanel::Format=> {
             if s.contents.format==DiscFormat::Sacd { vec![
-                "DSF (DST decoded) by default".into(),
-                "k  Toggle Keep DST for highlighted DST area (DFF)".into(),
-                "DFF cannot store tags".into(),
+                format!("Selected output: {}",option_value(s,"Format")),
+                "DSF keeps native DSD. DST is decoded only in DST areas.".into(),
+                if super::disc_browser_actions::selected_sacd_area_has_dst(s) {
+                    "k  Keep DST for the highlighted DST area (DFF)".into()
+                } else { "Plain DSD area: no DST option to change".into() },
+                "DFF has no standard tags".into(),
             ]} else {vec!["[ ] cycle: Automatic / RIFF / RF64 / W64".into(),
                 format!("Current: {}",option_value(s,"Format")),
                 "Audio is decoded, not resampled or gain-adjusted".into()] }
         },
-        ExtractPanel::Files=>vec!["f  Toggle one file per track/chapter or program".into(),
+        ExtractPanel::Files=>vec!["f  Switch between one file per track/chapter or per area".into(),
             format!("Current: {}", option_value(s,"Files")),
             if s.contents.format == DiscFormat::Sacd {
                 "CUE is not supported for DSF/DFF; continuous native DSD is available".into()
@@ -1111,23 +1117,23 @@ fn draw_panel(frame:&mut ratatui::Frame,s:&DiscBrowserState,panel:ExtractPanel,p
             format!("1-7  Fields: {} selected (title/artist/album/genre/year/composer/performer)",s.tag_fields.count_ones()),
             format!("a  Artwork: {} (source or direct-folder cover)",if s.tag_artwork {"on"}else{"off"}),
             if s.keep_dst.iter().any(|v|*v) {
-                "DFF cannot hold tags; selected DST-preserving DFF tracks drop them".into()
-            } else {"Tags apply to completed private files before publication".into()},
-            "k  Keep tags: change selected DFF areas to DSF".into(),
-            "e  Edit tags (existing disc-sidecar editor)".into(),
+                "DFF has no standard tags; selected DST-preserving tracks omit them".into()
+            } else {"Tags are written to completed audio files".into()},
+            "k  Change checked DFF areas to DSF to keep tags".into(),
+            "e  Edit disc tags".into(),
             "Esc  Back".into(),
         ],
         ExtractPanel::Destination=>vec![
             "p  Pick folder  ·  t  Edit naming template".into(),
             format!("Folder: {}", s.destination.display()),
             format!("Template: {}",s.naming_template),
-            format!("s  Program subfolders: {}",if s.program_subfolders {"on"}else{"off"}),
-            format!("o  Existing output: {:?}",s.overwrite_policy),
-            format!("l  Extraction log: {}",if s.extraction_log {"on"}else{"off"}),
+            format!("s  Separate folder for each area/group: {}",if s.program_subfolders {"on"}else{"off"}),
+            format!("o  If a file exists: {:?}",s.overwrite_policy),
+            format!("l  Write extraction.log: {}",if s.extraction_log {"on"}else{"off"}),
             "Tokens: {area} {group} {title} {playlist} {stream}".into(),
             "        {track} {chapter} and available tag fields".into(),
             if s.editing_destination {format!("> {}",s.destination_input)}
-                else {"Only complete files appear in the destination".into()},
+                else {"Files appear in the destination after they are complete".into()},
         ],
         ExtractPanel::Downmix=>vec!["[ / ]  Cycle DVD-Audio downmix policy".into(),
             format!("Current: {}", option_value(s,"Downmix")),
@@ -1155,6 +1161,7 @@ fn draw_panel(frame:&mut ratatui::Frame,s:&DiscBrowserState,panel:ExtractPanel,p
         ExtractPanel::ConvertChoice=>vec!["Enter  Convert highlighted program".into(),
             "e  Queue every checked program separately".into(),
             "Esc  Return to extraction".into()],
+        ExtractPanel::Keys=>super::disc_browser_actions::native_key_help(s),
     };
     if lines.is_empty(){frame.render_widget(Paragraph::new("None"),inner);}else{
         let rendered=lines.into_iter().skip(s.panel_cursor).take(inner.height as usize).map(|l|Line::from(clip(&l,inner.width))).collect::<Vec<_>>();
@@ -1360,18 +1367,114 @@ mod extract_r3_render_tests {
             let scratch = crate::tui::disc_browser_actions::native_working_root(&state, configured);
             let mut terminal = Terminal::new(TestBackend::new(170, 2)).unwrap();
             let theme = crate::tui::theme::theme_by_slug_or_default("tokyo-night");
-            terminal.draw(|f| draw_results(f, &state, &scratch, Rect::new(0, 0, 170, 2), false, theme)).unwrap();
-            let result = (0..170).map(|x| terminal.backend().buffer().get(x,1).symbol().to_owned())
+            terminal.draw(|f| draw_results(f, &state, &scratch, Rect::new(0, 0, 170, 2), None, theme)).unwrap();
+            let result = (0..170).map(|x| terminal.backend().buffer().get(x,0).symbol().to_owned())
                 .collect::<Vec<_>>().concat();
-            if state.native_storage_shares_destination_volume(&scratch) {
-                assert!(result.contains(&format!("destination {expected} free")), "{result}");
-            } else {
-                assert!(result.contains(&format!(", {expected} free")), "{result}");
-            }
+            assert!(result.contains(&format!("destination {expected} free")), "{result}");
             let scratch_free=space_for(&scratch).map_or_else(||"unknown".into(),format_bytes);
-            assert!(result.contains(&format!("working storage {scratch_free} free")), "{result}");
+            if state.native_storage_shares_destination_volume(&scratch) {
+                assert!(!result.contains(" · working "), "{result}");
+            } else {
+                assert!(result.contains(&format!("working {scratch_free} free")), "{result}");
+            }
         }
     }
+    #[test]
+    fn track_performer_never_overwrites_title_or_right_aligned_start_time() {
+        let mut state = sacd_state(false, false);
+        state.contents.album_artist = Some("Various Artists".into());
+        state.contents.presentations[0].tracks = vec![
+            DiscTrack { number: 1, title: Some("Mountain Jam".into()),
+                performer: Some("The Allman Brothers Band".into()),
+                duration_secs: Some(130.0), format_note: None },
+            DiscTrack { number: 2, title: Some("Short Song".into()),
+                performer: Some("Guest Performer".into()),
+                duration_secs: Some(600.0), format_note: None },
+            DiscTrack { number: 3, title: Some("Closing Number".into()),
+                performer: Some("Another Performer".into()),
+                duration_secs: Some(15.0), format_note: None },
+        ];
+        state.items_checked[0] = vec![true; 3];
+        for (width, height, show_performer) in [(240, 50, true), (154, 40, false),
+            (110, 34, false), (92, 28, false)] {
+            state.maximized = width == 240;
+            // The compact popup shows one tab at a time; select Tracks.
+            state.focus = if width < 96 || height < 30 { ExtractFocus::Items }
+                else { ExtractFocus::Programs };
+            let (lines, _terminal) = rendered_lines(&state, width, height);
+            for (title, performer) in [("Mountain Jam", "The Allman Brothers Band"),
+                ("Short Song", "Guest Performer"), ("Closing Number", "Another Performer")] {
+                let line = lines.iter().find(|line| line.contains(title))
+                    .unwrap_or_else(|| panic!("{width}x{height}: title {title} missing: {lines:?}"));
+                if show_performer {
+                    let title_end = line.find(title).unwrap() + title.len();
+                    let performer_start = line.find(performer).expect("performer has its own column");
+                    assert!(performer_start >= title_end, "{line}");
+                } else if width < 140 {
+                    assert!(!line.contains(performer), "compact view must prioritize title: {line}");
+                }
+            }
+            if show_performer {
+                let first = lines.iter().find(|line|line.contains("Mountain Jam")).unwrap();
+                let second = lines.iter().find(|line|line.contains("Short Song")).unwrap();
+                let third = lines.iter().find(|line|line.contains("Closing Number")).unwrap();
+                let x1 = first[..first.rfind("0:00").unwrap() + "0:00".len()].chars().count();
+                let x2 = second[..second.rfind("2:10").unwrap() + "2:10".len()].chars().count();
+                let x3 = third[..third.rfind("12:10").unwrap() + "12:10".len()].chars().count();
+                assert_eq!((x1,x2,x3),(x1,x1,x1),"start times must share one right edge");
+            }
+        }
+        // When every performer matches the album artist, no separate
+        // performer column is drawn even in a wide terminal.
+        state.maximized = true;
+        state.contents.album_artist = Some("The Allman Brothers Band".into());
+        state.contents.presentations[0].tracks.iter_mut().for_each(|track|
+            track.performer = Some("The Allman Brothers Band".into()));
+        let (lines,_) = rendered_lines(&state,240,50);
+        let row = lines.iter().find(|line|line.contains("Mountain Jam")).unwrap();
+        assert!(!row.contains("The Allman Brothers Band"), "{row}");
+    }
+
+    #[test]
+    fn result_caption_preserves_both_capacities_at_popup_widths() {
+        let mut state = sacd_state(false, false);
+        let temp = tempfile::tempdir().unwrap();
+        state.destination = temp.path().join("out");
+        let theme = crate::tui::theme::theme_by_slug_or_default("tokyo-night");
+        let working = Path::new("/dev/shm");
+        let mut terminal=Terminal::new(TestBackend::new(92,2)).unwrap();
+        terminal.draw(|f|draw_results(f,&state,temp.path(),Rect::new(0,0,92,1),None,theme)).unwrap();
+        let row = (0..92).map(|x|terminal.backend().buffer().get(x,0).symbol())
+            .collect::<String>();
+        assert!(!row.contains("working"), "shared storage: {row}");
+        terminal.draw(|f|draw_results(f,&state,temp.path(),Rect::new(0,0,92,1),
+            Some("Insufficient destination storage"),theme)).unwrap();
+        let row = (0..92).map(|x|terminal.backend().buffer().get(x,0).symbol())
+            .collect::<String>();
+        assert!(row.contains("Insufficient destination storage"), "{row}");
+        assert!(!row.contains("destination ") && !row.contains("working "), "{row}");
+        if !working.exists() || state.native_storage_shares_destination_volume(working) {
+            // The distinct-volume check requires a second mounted filesystem.
+            return;
+        }
+        let destination_free = format_bytes(space_for(&state.destination).unwrap());
+        let working_free = format_bytes(space_for(working).unwrap());
+        for (width,height) in [(110,34),(96,30)] {
+            let mut terminal = Terminal::new(TestBackend::new(width,height)).unwrap();
+            terminal.draw(|frame| {
+                let mut buttons = ButtonRenderMap::new();
+                draw(frame,&state,working,&mut buttons,theme);
+            }).unwrap();
+            let rows = (0..height).map(|y|(0..width)
+                .map(|x|terminal.backend().buffer().get(x,y).symbol().to_owned())
+                .collect::<Vec<_>>().concat()).collect::<Vec<_>>();
+            let caption = rows.iter().find(|row|row.contains("destination "))
+                .unwrap_or_else(||panic!("{width}x{height}: no result caption: {rows:?}"));
+            assert!(caption.contains(&format!("destination {destination_free} free")),"{caption}");
+            assert!(caption.contains(&format!("working {working_free} free")),"{caption}");
+        }
+    }
+
     #[test]
     fn visual_revision_focus_surfaces_output_and_genre_count() {
         let theme=crate::tui::theme::theme_by_slug_or_default("tokyo-night");
@@ -1465,7 +1568,7 @@ mod extract_r3_render_tests {
                 state.focus=ExtractFocus::Output;
                 state.destination="out".into();
                 state.naming_template="{track}-{title}".into();
-                for index in 0..4 {
+                for index in 0..6 {
                     state.output_cursor=index;
                     let mut terminal=Terminal::new(TestBackend::new(width,height)).unwrap();
                     terminal.draw(|f| {
@@ -1474,24 +1577,25 @@ mod extract_r3_render_tests {
                     }).unwrap();
                     let buffer=terminal.backend().buffer();
                     let name=state.output_rows()[index];
-                    let display=if name=="Destination" {"Folder"}else{name};
+                    let display=name;
                     let context=format!("{slug} {width}x{height} selected={name}");
                     let (x,y)=word_cells(buffer,display,&context);
                     let selected=buffer.get(x,y);
-                    assert_eq!(selected.bg,theme.selection_bg,"{context}: selection surface");
-                    assert_eq!(selected.fg,readable_word(theme.value,theme.selection_bg),
-                        "{context}: focused label must use Value, not Label");
+                    let focused_bg=extract_colors(theme).focused;
+                    assert_eq!(selected.bg,focused_bg,"{context}: focused output surface");
+                    assert_eq!(selected.fg,readable_word(theme.info,focused_bg),
+                        "{context}: focused label must use Info, not Label");
                     for other in state.output_rows().into_iter().filter(|other|*other!=name) {
-                        word_cells(buffer,if other=="Destination" {"Folder"}else{other},&context);
+                        word_cells(buffer,other,&context);
                     }
                     if index==2 { word_cells(buffer,"fields",&context); }
-                    if index==3 { word_cells(buffer,"{track}",&context); }
+                    if index==5 { word_cells(buffer,"{track}",&context); }
                     if wide {
                         let (ox,oy)=word_cells(buffer,"Overwrite",&context);
                         let cell=buffer.get(ox,oy);
-                        let bg=if index==3 {theme.selection_bg}else{extract_colors(theme).band};
+                        let bg=extract_colors(theme).focused;
                         assert_eq!(cell.bg,bg,"{context}: overwrite surface");
-                        let expected=if index==3 {readable_word(theme.value,bg)}
+                        let expected=if index==3 {readable_word(theme.info,bg)}
                             else {word_tiers(theme,extract_colors(theme),bg).label};
                         assert_eq!(cell.fg,expected,"{context}: overwrite label tier");
                         word_cells(buffer,"stop if a file exists",&context);
@@ -1601,33 +1705,30 @@ mod extract_r3_render_tests {
     }
 
     #[test]
-    fn r16_rendered_destination_hitboxes_separate_folder_naming_and_overwrite() {
+    fn r18_destination_controls_have_independent_focus_and_hitboxes() {
         let mut state=sacd_state(false,false);
         state.focus=ExtractFocus::Output;
-        state.output_cursor=3;
         let theme=crate::tui::theme::theme_by_slug_or_default("tokyo-night");
         for (width,height) in [(72,24),(110,34),(154,40)] {
-            let mut buttons=ButtonRenderMap::new();
-            let mut terminal=Terminal::new(TestBackend::new(width,height)).unwrap();
-            terminal.draw(|f|draw(f,&state,Path::new("/tmp"),&mut buttons,theme)).unwrap();
-            let targets=[TuiButton::DiscBrowserOutput(3),
-                TuiButton::DiscBrowserNaming];
-            for target in targets {
-                let rect=buttons.button_rect(target).expect("visible destination action");
-                let hit=buttons.find_button_at(rect.x,rect.y);
-                assert_eq!(hit,Some(target),"{width}x{height}: {target:?} at {rect:?}");
+            let mut positions=Vec::new();
+            for (index,target) in [(3,TuiButton::DiscBrowserOverwrite),
+                (4,TuiButton::DiscBrowserOutput(4)),
+                (5,TuiButton::DiscBrowserNaming)] {
+                state.output_cursor=index;
+                let mut buttons=ButtonRenderMap::new();
+                let mut terminal=Terminal::new(TestBackend::new(width,height)).unwrap();
+                terminal.draw(|frame|draw(frame,&state,Path::new("/tmp"),&mut buttons,theme)).unwrap();
+                let rect=buttons.button_rect(target).expect("focused control is visible");
+                assert_eq!(buttons.find_button_at(rect.x,rect.y),Some(target),
+                    "{width}x{height}: {target:?} at {rect:?}");
+                positions.push(rect);
             }
-            let folder=buttons.button_rect(TuiButton::DiscBrowserOutput(3)).unwrap();
-            let naming=buttons.button_rect(TuiButton::DiscBrowserNaming).unwrap();
-            assert_eq!(naming.y,folder.y+1,"{width}x{height}: distinct rows");
-            assert_eq!(naming.x,folder.x);
+            // A compact window scrolls one control into view at a time.
+            // A large one displays each control in a separate stable cell.
             if width>=154 {
-                let overwrite=buttons.button_rect(TuiButton::DiscBrowserOverwrite)
-                    .expect("wide overwrite action");
-                assert_eq!(buttons.find_button_at(overwrite.x,overwrite.y),
-                    Some(TuiButton::DiscBrowserOverwrite));
-                assert!(overwrite.x>folder.x && overwrite.y<folder.y,
-                    "overwrite must be a separate control: {overwrite:?} {folder:?}");
+                assert_eq!(positions[2].y,positions[1].y+1);
+                assert_eq!(positions[2].x,positions[1].x);
+                assert!(positions[0].x>positions[1].x);
             }
         }
     }
@@ -1664,10 +1765,10 @@ mod extract_r3_render_tests {
         }).unwrap();
         let buf=terminal.backend().buffer();
         let (x,y)=word_cells(buf,"Format","focused output");
-        assert_eq!(buf.get(x,y).bg,theme.selection_bg);
-        assert_eq!(buf.get(x,y).fg,readable_word(theme.value,theme.selection_bg));
+        assert_eq!(buf.get(x,y).bg,extract_colors(theme).focused);
+        assert_eq!(buf.get(x,y).fg,readable_word(theme.info,extract_colors(theme).focused));
         let (x,y)=word_cells(buf,"Files","other output row");
-        assert_eq!(buf.get(x,y).bg,extract_colors(theme).band);
+        assert_eq!(buf.get(x,y).bg,extract_colors(theme).focused);
     }
 
     #[test]

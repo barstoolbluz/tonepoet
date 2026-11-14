@@ -261,6 +261,12 @@ pub struct DurableFileTaskRecord {
     #[serde(default)]
     pub native_skipped_selections: Vec<NativeSkippedSelection>,
     #[serde(default)]
+    pub native_unfinished_outputs: Vec<crate::convert::pipeline::native_extract::NativeUnfinishedOutput>,
+    /// SHA-256 of the last log this journal published. Only that exact
+    /// journal-owned content may be replaced when extraction resumes.
+    #[serde(default)]
+    pub native_log_sha256: Option<String>,
+    #[serde(default)]
     pub native_prepared_cues: Vec<DurableNativePreparedCue>,
     pub retry_plan: Option<BrowsePasteRetryPlan>,
     pub roots: Vec<tui_file_picker::FileTaskRootResult>,
@@ -505,6 +511,8 @@ enum DurableFileTaskJournalMutation {
     NativePublished { destination: PathBuf },
     /// A confirmed skip is distinct from a completed output filename.
     NativeSkipped { selection: NativeSkippedSelection },
+    NativeUnfinished { output: crate::convert::pipeline::native_extract::NativeUnfinishedOutput },
+    NativeLogPublished { sha256: String },
     /// Journaled before the corresponding continuous audio publication.
     NativeCuePrepared { cue: DurableNativePreparedCue },
     Checkpoint {
@@ -643,6 +651,8 @@ impl FileTaskJournalHandle {
             job,
             native_published_paths: Vec::new(),
             native_skipped_selections: Vec::new(),
+            native_unfinished_outputs: Vec::new(),
+            native_log_sha256: None,
             native_prepared_cues: Vec::new(),
             retry_plan,
             roots: Vec::new(),
@@ -841,6 +851,20 @@ impl FileTaskJournalHandle {
     pub fn record_native_skipped(&self, selection: &NativeSkippedSelection) -> Result<(), String> {
         self.append_mutation(true, true, DurableFileTaskJournalMutation::NativeSkipped {
             selection: selection.clone(),
+        })
+    }
+
+    pub fn record_native_unfinished(
+        &self, output: &crate::convert::pipeline::native_extract::NativeUnfinishedOutput,
+    ) -> Result<(), String> {
+        self.append_mutation(true, true, DurableFileTaskJournalMutation::NativeUnfinished {
+            output: output.clone(),
+        })
+    }
+
+    pub fn record_native_log_sha256(&self, sha256: &str) -> Result<(), String> {
+        self.append_mutation(true, true, DurableFileTaskJournalMutation::NativeLogPublished {
+            sha256: sha256.to_owned(),
         })
     }
 
@@ -1558,9 +1582,22 @@ fn apply_journal_entry(
             if !record.is_native_extraction() {
                 return Err("native skip attached to a copy/move journal".to_string());
             }
-            if !record.native_skipped_selections.contains(&selection) {
+            if !record.native_skipped_selections.iter().any(|old| old.same_selection(&selection)) {
                 record.native_skipped_selections.push(selection);
             }
+        }
+        DurableFileTaskJournalMutation::NativeUnfinished { output } => {
+            if !record.is_native_extraction() {
+                return Err("native failure attached to a copy/move journal".to_string());
+            }
+            record.native_unfinished_outputs.retain(|known|known.destination != output.destination);
+            record.native_unfinished_outputs.push(output);
+        }
+        DurableFileTaskJournalMutation::NativeLogPublished { sha256 } => {
+            if !record.is_native_extraction() {
+                return Err("native extraction log attached to a copy/move journal".to_string());
+            }
+            record.native_log_sha256 = Some(sha256);
         }
         DurableFileTaskJournalMutation::NativeCuePrepared { cue } => {
             if !record.is_native_extraction() {
@@ -2495,7 +2532,7 @@ fn native_extraction_path_admission(
         }
     }
     if native.extraction_log {
-        planned.insert(native.destination.join("native-extraction.log"));
+        planned.insert(native.destination.join(crate::convert::pipeline::native_extract::EXTRACTION_LOG_FILE));
     }
     if planned.is_empty() {
         return Err("native extraction has no output files to reserve".into());
@@ -2997,12 +3034,12 @@ mod tests {
             NativeExtractionJob, NativeProgramChoice, NativeTrackChoice,
             NativeTagValues, NativeWavContainer, NativeOverwritePolicy, NativeTagSource,
         };
-        NativeExtractionJob {
+        NativeExtractionJob { disc_identity: Default::default(),
             source:source.to_path_buf(),format:crate::disc::DiscFormat::Sacd,
             programs:vec![NativeProgramChoice {
                 id:crate::disc::PresentationId::SacdArea(crate::disc::SacdAreaId::Stereo),
                 angle:1,label:"Stereo".into(),keep_dst:false,
-                tracks:vec![NativeTrackChoice {
+                tracks:vec![NativeTrackChoice { duration_secs: None,
                     number:1,name:"one".into(),tags:NativeTagValues::default(),
                     estimated_bytes:Some(100_000),
                 }],
@@ -3041,7 +3078,7 @@ mod tests {
         assert_eq!(writes.len(),2);
         assert!(writes.iter().all(|claim|claim.scope==ClaimScope::Exact));
         assert!(writes.iter().any(|claim|claim.identity.resolved_io_path==audio));
-        assert!(writes.iter().any(|claim|claim.identity.resolved_io_path==dest.join("native-extraction.log")));
+        assert!(writes.iter().any(|claim|claim.identity.resolved_io_path==dest.join(crate::convert::pipeline::native_extract::EXTRACTION_LOG_FILE)));
         let unrelated=PathClaim::resolve_with_semantics(
             &dest.join("unrelated-old-job"),ClaimMode::Write,ClaimScope::Subtree,
             PathResolutionSemantics::NamespaceObject).unwrap();
@@ -3073,7 +3110,7 @@ mod tests {
             .map(|claim|claim.identity.resolved_io_path.clone())
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(targets, [media.clone(),media.with_extension("cue"),
-            dest.join("native-extraction.log")].into_iter().collect());
+            dest.join(crate::convert::pipeline::native_extract::EXTRACTION_LOG_FILE)].into_iter().collect());
         assert!(admitted.claims.iter().filter(|claim|claim.mode==ClaimMode::Write)
             .all(|claim|claim.scope==ClaimScope::Exact));
     }
@@ -3100,7 +3137,7 @@ mod tests {
         ).unwrap();
         let skipped = NativeSkippedSelection {
             presentation: crate::disc::PresentationId::SacdArea(crate::disc::SacdAreaId::Stereo),
-            angle: 1, track_number: Some(1),
+            angle: 1, track_number: Some(1), reason: None,
         };
         let cue = dest.join("continuous.cue");
         first.record_native_skipped(&skipped).unwrap();
@@ -3108,12 +3145,20 @@ mod tests {
         first.record_native_prepared_cue(&cue,
             "FILE \"continuous.wav\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n").unwrap();
         first.record_native_published(&dest.join("continuous.wav")).unwrap();
+        let failure = crate::convert::pipeline::native_extract::NativeUnfinishedOutput {
+            destination: dest.join("continuous.cue"),
+            reason: "interrupted CUE publication".into(), cancelled: true,
+        };
+        first.record_native_unfinished(&failure).unwrap();
+        first.record_native_log_sha256("0123456789abcdef").unwrap();
         let path = first.path().to_path_buf();
         let current = load_record(&path).unwrap();
         assert_eq!(current.native_skipped_selections, vec![skipped.clone()]);
         assert_eq!(current.native_prepared_cues.len(), 1);
         assert_eq!(current.native_prepared_cues[0].destination, cue);
         assert!(current.native_prepared_cues[0].content.contains("INDEX 01"));
+        assert_eq!(current.native_unfinished_outputs, vec![failure.clone()]);
+        assert_eq!(current.native_log_sha256.as_deref(), Some("0123456789abcdef"));
         drop(first); // simulate a helper exiting before it finished the CUE
         let second = FileTaskJournalHandle::resume(path, 2, 22, false,
             tui_file_picker::VerificationMode::Standard, 600,
@@ -3122,6 +3167,8 @@ mod tests {
         assert_eq!(recovered.native_skipped_selections, vec![skipped]);
         assert_eq!(recovered.native_prepared_cues.len(), 1);
         assert_eq!(recovered.native_published_paths.len(), 1);
+        assert_eq!(recovered.native_unfinished_outputs, vec![failure]);
+        assert_eq!(recovered.native_log_sha256.as_deref(), Some("0123456789abcdef"));
     }
 
     struct JournalDirGuard {

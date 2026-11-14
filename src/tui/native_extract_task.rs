@@ -6,7 +6,8 @@
 //! mailbox and durable journal as Browse copy/move, not Convert's queue.
 
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex};
@@ -29,7 +30,8 @@ use super::file_task_runtime::{
 use super::message::AppMessage;
 use crate::convert::pipeline::native_extract::{
     self, NativeExtractionControl, NativeExtractionJob, NativeExtractionProgress,
-    NativeExtractionReport, NativeSkippedSelection, NativeWatchSource, NativeWriteWatch,
+    NativeExtractionReport, NativeSkippedSelection, NativeLogOutcome,
+    NativeWatchSource, NativeWriteWatch,
 };
 
 const SAMPLING_INTERVAL: Duration = Duration::from_millis(175);
@@ -103,6 +105,7 @@ pub(super) fn dispatch_queued(
     tx: &mpsc::Sender<AppMessage>,
     start_minimized: bool,
 ) -> Result<(), String> {
+    native_extract::validate_job(&job)?;
     launch_session(app, job, None, tx, start_minimized)
 }
 
@@ -456,7 +459,7 @@ impl NativeWireSink {
 /// replay any unrecorded existing output rather than silently replacing it.
 /// This ambiguity is presented in Recovery for a deliberate user decision.
 fn refuse_ambiguous_recovery_replacement(
-    job: &NativeExtractionJob, published: &[PathBuf],
+    job: &NativeExtractionJob, published: &[PathBuf], owned_log: bool,
 ) -> Result<(), String> {
     if job.overwrite_policy != native_extract::NativeOverwritePolicy::Replace { return Ok(()); }
     let recorded = published.iter().collect::<HashSet<_>>();
@@ -472,7 +475,9 @@ fn refuse_ambiguous_recovery_replacement(
             }
         }
     }
-    if job.extraction_log { planned.push(job.destination.join("native-extraction.log")); }
+    if job.extraction_log && !owned_log {
+        planned.push(job.destination.join(native_extract::EXTRACTION_LOG_FILE));
+    }
     for path in planned {
         if !recorded.contains(&path) && std::fs::symlink_metadata(&path).is_ok() {
             return Err(format!(
@@ -488,8 +493,8 @@ fn is_skipped_selection(
     program: &native_extract::NativeProgramChoice, number: u32,
     skipped: &[NativeSkippedSelection],
 ) -> bool {
-    skipped.contains(&NativeSkippedSelection::program(program))
-        || skipped.contains(&NativeSkippedSelection::track(program, number))
+    skipped.iter().any(|selection|selection.same_selection(&NativeSkippedSelection::program(program))
+        || selection.same_selection(&NativeSkippedSelection::track(program, number)))
 }
 
 /// Recovery filters work, not the original authored selection. Confirmed
@@ -628,6 +633,7 @@ async fn run_native_extraction(
     let hook_journal = journal.clone();
     let skip_journal = journal.clone();
     let cue_journal = journal.clone();
+    let unfinished_journal = journal.clone();
     let hook_generation = task.generation;
     controls.set_publication_hook(native_extract::NativePublicationHook {
         job_id: task.job_id.clone(), generation: task.generation,
@@ -645,7 +651,16 @@ async fn run_native_extraction(
         skipped: Arc::new(move |selection| skip_journal.record_native_skipped(selection)),
         prepared_cue: Arc::new(move |destination, text|
             cue_journal.record_native_prepared_cue(destination, text)),
+        unfinished: Arc::new(move |output|
+            unfinished_journal.record_native_unfinished(output)),
     });
+    let mut terminal_log_job = task.native_extraction.clone();
+    if let Some(mapping) = record.admitted_mappings.first() {
+        terminal_log_job.source = mapping.source.clone();
+    }
+    if let Some(root) = &record.admitted_destination_root {
+        terminal_log_job.destination = root.clone();
+    }
     let mut final_totals = ProgressTotals::default();
     let result = async {
         // An abandoned generation may have left a partial destination-side
@@ -658,18 +673,26 @@ async fn run_native_extraction(
         job.destination = record.admitted_destination_root.clone()
             .ok_or("Native extraction journal has no admitted destination")?;
         if record.generation > 1 {
-            refuse_ambiguous_recovery_replacement(&job, &record.native_published_paths)?;
+            refuse_ambiguous_recovery_replacement(&job, &record.native_published_paths,
+                record.native_log_sha256.is_some())?;
         }
         let original_job = job.clone();
+        // Reject a conflicting/unowned log before any resumed audio work.
+        // Direct runs and the UI enforce the same policy in validate_job.
+        if original_job.extraction_log {
+            verify_native_log_ownership(&original_job, &record)?;
+        }
         let baseline = native_recovery_baseline(&original_job,
             &record.native_published_paths, &record.native_skipped_selections);
         let pending_cues = pending_native_cues(&original_job,
             &record.native_published_paths, &record.native_prepared_cues)?;
         job = remaining_native_job(job, &record.native_published_paths,
             &record.native_skipped_selections, &record.native_prepared_cues)?;
-        let log_target = original_job.destination.join("native-extraction.log");
-        let log_needed = original_job.extraction_log
-            && !record.native_published_paths.contains(&log_target);
+        let log_target = original_job.destination.join(native_extract::EXTRACTION_LOG_FILE);
+        // An earlier cancelled/failed run may already have left its own
+        // receipt. Recovery replaces that exact journal-owned log after all
+        // outstanding media/CUEs are handled, never a user-created file.
+        let log_needed = original_job.extraction_log;
         // The detached helper publishes the log *after* all pending recovered
         // CUEs. The media engine otherwise keeps its normal direct-call API.
         job.extraction_log = false;
@@ -692,6 +715,8 @@ async fn run_native_extraction(
         let worker_controls = Arc::clone(&controls);
         let mut known_published = record.native_published_paths.iter().cloned().collect::<HashSet<_>>();
         let prior_published = record.native_published_paths.clone();
+        let prior_skipped = record.native_skipped_selections.clone();
+        let prior_unfinished = record.native_unfinished_outputs.clone();
         let continuous = job.file_per_program;
         let mut worker = tokio::spawn(async move {
             let media_progress_tx = progress_tx.clone();
@@ -722,10 +747,18 @@ async fn run_native_extraction(
                 state.current = format!("Publishing recovered CUE {}", cue.destination.display());
                 state.current_file = None;
                 progress_tx.send_replace(state);
-                native_extract::publish_native_recovery_sidecar(
+                if let Err(error) = native_extract::publish_native_recovery_sidecar(
                     &original_job, &cue.destination, &cue.content,
                     &worker_cancel, &worker_controls,
-                )?;
+                ) {
+                    let failure = native_extract::NativeUnfinishedOutput {
+                        destination: cue.destination.clone(), reason: error.clone(),
+                        cancelled: worker_cancel.is_cancelled(),
+                    };
+                    journal_for_sidecars.record_native_unfinished(&failure)
+                        .map_err(|e| format!("{error}; cannot record failed CUE: {e}"))?;
+                    return Err(error);
+                }
                 journal_for_sidecars.record_native_published(&cue.destination)?;
                 let mut state = (*progress_tx.borrow()).clone();
                 state.current = "Published recovered CUE".into();
@@ -736,15 +769,18 @@ async fn run_native_extraction(
             if log_needed {
                 let mut all_published = prior_published;
                 all_published.extend(report.published.iter().cloned());
-                let content = native_extract::render_native_extraction_log(&original_job, &all_published);
+                let mut all_skipped = prior_skipped;
+                all_skipped.extend(worker_controls.skipped_receipts());
+                let mut all_unfinished = prior_unfinished;
+                all_unfinished.extend(worker_controls.unfinished_receipts());
+                let content = native_extract::render_native_extraction_log_with_outcome(&original_job,
+                    &all_published, &all_skipped, &all_unfinished, NativeLogOutcome::Complete, None);
                 let mut state = (*progress_tx.borrow()).clone();
                 state.current = "Publishing extraction log".into();
                 state.current_file = None;
                 progress_tx.send_replace(state);
-                native_extract::publish_native_recovery_sidecar(
-                    &original_job, &log_target, &content, &worker_cancel, &worker_controls,
-                )?;
-                journal_for_sidecars.record_native_published(&log_target)?;
+                publish_journaled_native_log(&original_job, &journal_for_sidecars,
+                    &worker_controls, &content, &worker_cancel)?;
                 let mut state = (*progress_tx.borrow()).clone();
                 state.current = "Published extraction log".into();
                 state.published += 1;
@@ -865,6 +901,30 @@ async fn run_native_extraction(
         result.published = combined;
         Ok::<NativeExtractionReport,String>(result)
     }.await;
+    let mut result = result;
+    if let Err(error) = &mut result {
+        // The media worker has stopped. The regular cancellation token must
+        // not suppress a terminal receipt for files already published.
+        if terminal_log_job.extraction_log && (controls.execution_has_started()
+            || !record.native_published_paths.is_empty()) {
+            let outcome = if cancel.is_cancelled() { NativeLogOutcome::Cancelled }
+                else { NativeLogOutcome::Failed };
+            let saved_error = error.clone();
+            let log_result = (|| {
+                let latest = journal.load()?;
+                let body = native_extract::render_native_extraction_log_with_outcome(
+                    &terminal_log_job, &latest.native_published_paths,
+                    &latest.native_skipped_selections, &latest.native_unfinished_outputs,
+                    outcome, Some(&saved_error));
+                controls.resume(); // a paused worker must not keep a terminal log paused
+                publish_journaled_native_log(&terminal_log_job, &journal, &controls,
+                    &body, &CancellationToken::new())
+            })();
+            if let Err(log_error) = log_result {
+                error.push_str(&format!("; extraction log could not be written: {log_error}"));
+            }
+        }
+    }
     let totals = final_totals;
     let lifecycle = if result.is_ok() { DurableFileTaskLifecycle::Completed }
         else { DurableFileTaskLifecycle::AwaitingReconciliation };
@@ -881,6 +941,66 @@ async fn run_native_extraction(
     };
     sink.progress(terminal);
     sink.complete(result);
+}
+
+/// Only a previously journaled receipt with unchanged bytes can be
+/// replaced on Recovery. The initial run may replace an unrelated log only
+/// when the user explicitly selected Replace before starting extraction.
+fn verify_native_log_ownership(
+    job: &NativeExtractionJob, record: &DurableFileTaskRecord,
+) -> Result<bool, String> {
+    let target = job.destination.join(native_extract::EXTRACTION_LOG_FILE);
+    match std::fs::symlink_metadata(&target) {
+        Ok(meta) => {
+            if let Some(expected) = &record.native_log_sha256 {
+                if !meta.is_file() || meta.file_type().is_symlink() {
+                    return Err(format!("Previously journal-owned extraction log changed type: {}", target.display()));
+                }
+                let mut file = std::fs::File::open(&target)
+                    .map_err(|e|format!("Inspect journal-owned extraction log: {e}"))?;
+                let mut digest = Sha256::new();
+                let mut buffer = [0u8; 65536];
+                loop {
+                    let count = file.read(&mut buffer)
+                        .map_err(|e|format!("Read journal-owned extraction log: {e}"))?;
+                    if count == 0 { break; }
+                    digest.update(&buffer[..count]);
+                }
+                if format!("{:x}", digest.finalize()) != *expected {
+                    return Err(format!("Extraction log was changed outside this task: {}; Recovery will not overwrite it", target.display()));
+                }
+                Ok(true)
+            } else if record.generation != 1
+                || job.overwrite_policy != native_extract::NativeOverwritePolicy::Replace {
+                Err(format!("Existing extraction log is not owned by this task: {}; choose a different destination or resolve it in Recovery",target.display()))
+            } else { Ok(false) }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("Inspect destination extraction log: {e}")),
+    }
+}
+
+fn publish_journaled_native_log(
+    job: &NativeExtractionJob, journal: &FileTaskJournalHandle,
+    controls: &NativeExtractionControl, content: &str, cancel: &CancellationToken,
+) -> Result<(), String> {
+    let target = job.destination.join(native_extract::EXTRACTION_LOG_FILE);
+    let record = journal.load()?;
+    let mut publishing_job = job.clone();
+    if verify_native_log_ownership(job, &record)? {
+        publishing_job.overwrite_policy = native_extract::NativeOverwritePolicy::Replace;
+    }
+    native_extract::publish_native_recovery_sidecar(&publishing_job,
+        &target, content, cancel, controls)?;
+    // Persist the ownership proof before recording completion. A crash after
+    // publication but before this append leaves a deliberate Recovery conflict
+    // rather than permission to overwrite an unverified existing file.
+    let digest = Sha256::digest(content.as_bytes());
+    journal.record_native_log_sha256(&format!("{digest:x}"))?;
+    if !record.native_published_paths.contains(&target) {
+        journal.record_native_published(&target)?;
+    }
+    Ok(())
 }
 
 fn known_published_path(journal: &FileTaskJournalHandle, path: &Path) -> Result<bool,String> {
@@ -1000,13 +1120,13 @@ mod tests {
             NativeOverwritePolicy, NativeProgramChoice, NativeTagSource,
             NativeTagValues, NativeTrackChoice, NativeWavContainer,
         };
-        NativeExtractionJob {
+        NativeExtractionJob { disc_identity: Default::default(),
             source: std::env::current_exe().unwrap(),
             format: crate::disc::DiscFormat::Sacd,
             programs: vec![NativeProgramChoice {
                 id: crate::disc::PresentationId::SacdArea(crate::disc::SacdAreaId::Stereo),
                 angle: 1, label: "Stereo".into(),
-                tracks: (1..=2).map(|number| NativeTrackChoice {
+                tracks: (1..=2).map(|number| NativeTrackChoice { duration_secs: None,
                     number, name: format!("Track {number}"),
                     tags: NativeTagValues::default(), estimated_bytes: Some(10_000),
                 }).collect(),
@@ -1180,7 +1300,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut job = recovery_fixture_job(dir.path());
         job.extraction_log = true;
-        job.programs[0].tracks.push(native_extract::NativeTrackChoice {
+        job.programs[0].tracks.push(native_extract::NativeTrackChoice { duration_secs: None,
             number: 3, name: "Track 3".into(), tags: Default::default(),
             estimated_bytes: Some(10_000),
         });
@@ -1191,11 +1311,11 @@ mod tests {
         let remaining = remaining_native_job(job.clone(), &paths[..1], &[], &[]).unwrap();
         assert_eq!(remaining.programs[0].tracks.len(), 2);
         let body = native_extract::render_native_extraction_log(&job,
-            &[paths[0].clone(),paths[1].clone(),paths[2].clone(),paths[0].clone()]);
+            &[paths[0].clone(),paths[1].clone(),paths[2].clone(),paths[0].clone()], &[]);
         for path in &paths {
-            assert_eq!(body.matches(&format!("Completed: {}\n",path.display())).count(), 1);
+            assert_eq!(body.matches(&format!("File: {:?}",path.to_string_lossy())).count(), 1);
         }
-        assert_eq!(body.matches("Completed:").count(), 3);
+        assert_eq!(body.matches("Outcome: written").count(), 3);
         assert_eq!(std::fs::read(&paths[0]).unwrap(), b"first published generation");
     }
 
@@ -1214,13 +1334,13 @@ mod tests {
         }
         assert!(remaining_native_job(job.clone(), &published, &[], &[])
             .unwrap().programs.is_empty());
-        let log_path = job.destination.join("native-extraction.log");
-        let text = native_extract::render_native_extraction_log(&job, &published);
+        let log_path = job.destination.join(native_extract::EXTRACTION_LOG_FILE);
+        let text = native_extract::render_native_extraction_log(&job, &published, &[]);
         native_extract::publish_native_recovery_sidecar(&job, &log_path, &text,
             &CancellationToken::new(), &NativeExtractionControl::default()).unwrap();
         let actual = std::fs::read_to_string(&log_path).unwrap();
         assert_eq!(actual, text);
-        assert_eq!(actual.matches("Completed:").count(), published.len());
+        assert_eq!(actual.matches("Outcome: written").count(), published.len());
         for path in &published {
             assert_eq!(std::fs::read(path).unwrap(), b"already completed audio");
         }
@@ -1259,7 +1379,7 @@ mod tests {
     fn recovery_preserves_confirmed_skips_and_original_preflight_totals() {
         let dir = tempfile::tempdir().unwrap();
         let mut job = recovery_fixture_job(dir.path());
-        job.programs[0].tracks.push(native_extract::NativeTrackChoice {
+        job.programs[0].tracks.push(native_extract::NativeTrackChoice { duration_secs: None,
             number: 3, name: "Track 3".into(), tags: Default::default(),
             estimated_bytes: Some(10_000),
         });
@@ -1306,7 +1426,7 @@ mod tests {
         second.id = crate::disc::PresentationId::SacdArea(
             crate::disc::SacdAreaId::MultiChannel);
         second.label = "Second program".into();
-        second.tracks.push(native_extract::NativeTrackChoice {
+        second.tracks.push(native_extract::NativeTrackChoice { duration_secs: None,
             number: 3, name: "Track 3".into(), tags: Default::default(),
             estimated_bytes: Some(TRACK),
         });
@@ -1448,9 +1568,107 @@ mod tests {
         );
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"uncertain publication").unwrap();
-        assert!(refuse_ambiguous_recovery_replacement(&job, &[]).is_err());
-        assert!(refuse_ambiguous_recovery_replacement(&job, std::slice::from_ref(&path)).is_ok());
+        assert!(refuse_ambiguous_recovery_replacement(&job, &[], false).is_err());
+        assert!(refuse_ambiguous_recovery_replacement(&job, std::slice::from_ref(&path), false).is_ok());
         assert_eq!(std::fs::read(path).unwrap(), b"uncertain publication");
+    }
+
+    #[test]
+    fn interrupted_receipt_is_replaced_only_after_owned_recovery_and_never_rewrites_audio() {
+        // Use the ordinary journal and sidecar publisher, not a test-only
+        // surrogate for their ownership checks or publication policy.
+        let _lock = file_task_runtime::test_environment_lock();
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        struct RestoreJournalDir(Option<std::ffi::OsString>);
+        impl Drop for RestoreJournalDir {
+            fn drop(&mut self) {
+                if let Some(old) = self.0.take() {
+                    std::env::set_var("TONEPOET_FILE_OPERATION_JOURNAL_DIR", old);
+                } else {
+                    std::env::remove_var("TONEPOET_FILE_OPERATION_JOURNAL_DIR");
+                }
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let _restore = RestoreJournalDir(std::env::var_os("TONEPOET_FILE_OPERATION_JOURNAL_DIR"));
+        std::env::set_var("TONEPOET_FILE_OPERATION_JOURNAL_DIR", temp.path().join("journals"));
+        let mut job = recovery_fixture_job(&temp.path().join("destination"));
+        job.working_root = temp.path().join("scratch");
+        job.extraction_log = true;
+        job.overwrite_policy = native_extract::NativeOverwritePolicy::Fail;
+        std::fs::create_dir_all(&job.destination).unwrap();
+        let first_audio = native_extract::proposed_destination(&job, &job.programs[0],
+            &job.programs[0].tracks[0]);
+        let second_audio = native_extract::proposed_destination(&job, &job.programs[0],
+            &job.programs[0].tracks[1]);
+        let log_path = job.destination.join(native_extract::EXTRACTION_LOG_FILE);
+        let mapping = PasteMapping { source: job.source.clone(), destination: job.destination.clone() };
+        let payload = serde_json::json!({"native_extraction":job.clone(),
+            "dest":job.destination.to_string_lossy()});
+        let journal = FileTaskJournalHandle::create(
+            uuid::Uuid::new_v4().to_string(), 1, 3, false,
+            VerificationMode::Standard, 600, vec![mapping.clone()], None, payload.clone(),
+        ).unwrap();
+        std::fs::create_dir_all(first_audio.parent().unwrap()).unwrap();
+        std::fs::write(&first_audio, b"generation one audio").unwrap();
+        journal.record_native_published(&first_audio).unwrap();
+        let interrupted = native_extract::NativeUnfinishedOutput {
+            destination: second_audio.clone(), reason: "source read failed".into(),
+            cancelled: true,
+        };
+        journal.record_native_unfinished(&interrupted).unwrap();
+        let body = native_extract::render_native_extraction_log_with_outcome(&job,
+            std::slice::from_ref(&first_audio), &[], &[interrupted.clone()],
+            NativeLogOutcome::Cancelled, Some("Extraction cancelled"));
+        let controls = NativeExtractionControl::default();
+        publish_journaled_native_log(&job, &journal, &controls, &body, &CancellationToken::new()).unwrap();
+        assert_eq!(std::fs::read_to_string(&log_path).unwrap(), body);
+        assert!(body.contains("Outcome: cancelled"));
+        assert!(body.contains("source read failed"));
+        let recorded = journal.load().unwrap();
+        assert!(recorded.native_published_paths.contains(&log_path));
+        assert!(recorded.native_log_sha256.is_some());
+        assert!(verify_native_log_ownership(&job, &recorded).unwrap());
+        let resume_path = journal.path().to_path_buf();
+        drop(journal);
+
+        let resumed = FileTaskJournalHandle::resume(resume_path, 2, 4, false,
+            VerificationMode::Standard, 600, vec![mapping], None, payload).unwrap();
+        let prior = resumed.load().unwrap();
+        let pending = remaining_native_job(job.clone(), &prior.native_published_paths,
+            &prior.native_skipped_selections, &prior.native_prepared_cues).unwrap();
+        assert_eq!(pending.programs[0].tracks.len(), 1);
+        assert_eq!(pending.programs[0].tracks[0].number, 2);
+        // A successful recovery publishes only the remaining track. The
+        // original audio must not be processed or replaced again.
+        std::fs::write(&second_audio, b"generation two audio").unwrap();
+        resumed.record_native_published(&second_audio).unwrap();
+        let recovered = resumed.load().unwrap();
+        let body = native_extract::render_native_extraction_log_with_outcome(&job,
+            &recovered.native_published_paths, &recovered.native_skipped_selections,
+            &recovered.native_unfinished_outputs, NativeLogOutcome::Complete, None);
+        publish_journaled_native_log(&job, &resumed, &controls, &body, &CancellationToken::new()).unwrap();
+        assert!(body.contains("Outcome: complete"), "{body}");
+        assert_eq!(body.matches("Outcome: written").count(), 2);
+        assert!(body.contains("Failed outputs: 0"));
+        assert_eq!(std::fs::read_to_string(&log_path).unwrap(), body);
+        assert_eq!(std::fs::read(&first_audio).unwrap(), b"generation one audio");
+        let after = resumed.load().unwrap();
+        assert_eq!(after.native_published_paths.iter().filter(|path| **path == log_path).count(), 1);
+        assert_ne!(after.native_log_sha256, recorded.native_log_sha256);
+
+        // This pathname no longer contains the journal's receipt. Recovery
+        // must not adopt its contents merely because the name matches.
+        std::fs::write(&log_path, b"user edited this receipt").unwrap();
+        let error = publish_journaled_native_log(&job, &resumed, &controls,
+            &body, &CancellationToken::new()).unwrap_err();
+        assert!(error.contains("changed outside this task"), "{error}");
+        assert_eq!(std::fs::read(&log_path).unwrap(), b"user edited this receipt");
+        std::fs::remove_file(&log_path).unwrap();
+        std::fs::create_dir(&log_path).unwrap();
+        let error = publish_journaled_native_log(&job, &resumed, &controls,
+            &body, &CancellationToken::new()).unwrap_err();
+        assert!(error.contains("changed type"), "{error}");
     }
 
     #[test]

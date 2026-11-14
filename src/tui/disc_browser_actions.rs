@@ -336,7 +336,7 @@ fn open_native_destination_picker(app: &mut AppState) {
         return;
     };
     state.focus = crate::tui::disc_browser::ExtractFocus::Output;
-    state.output_cursor = state.output_rows().iter().position(|row| *row == "Destination").unwrap_or(0);
+    state.output_cursor = state.output_rows().iter().position(|row| *row == "Folder").unwrap_or(0);
     let start_dir = state.destination.ancestors().find(|path| path.is_dir())
         .map(Path::to_path_buf)
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
@@ -367,6 +367,10 @@ fn start_native_extraction(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
         return;
     }
     let job = state.native_job(root);
+    if let Err(error) = crate::convert::pipeline::native_extract::validate_job(&job) {
+        app.set_status(format!("Cannot extract: {error}"));
+        return;
+    }
     let probe_cancel = state.probe_cancel.clone();
     if let Err(error) = super::native_extract_task::launch(app, job, tx) {
         app.set_status(format!("Cannot start native extraction: {error}"));
@@ -408,6 +412,21 @@ pub fn handle_disc_browser_button_click_with_shift(
         }
         TuiButton::BrowseInfoAudioStreams => {
             open_selected_disc_browser(app, tx);
+            true
+        }
+        TuiButton::DiscBrowserHint(index) => {
+            let key = match &app.active_overlay {
+                ActiveOverlay::DiscBrowser(state) => native_hint_key(state, *index),
+                _ => None,
+            };
+            if let Some(key) = key { handle_disc_browser_key(app, key, tx); }
+            true
+        }
+        TuiButton::DiscBrowserHiddenToggle => {
+            if let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay {
+                state.focus = crate::tui::disc_browser::ExtractFocus::Programs;
+                state.show_hidden = !state.show_hidden;
+            }
             true
         }
         TuiButton::DiscBrowserTitle => {
@@ -459,7 +478,7 @@ pub fn handle_disc_browser_button_click_with_shift(
             let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay else { return false; };
             state.focus = crate::tui::disc_browser::ExtractFocus::Output;
             state.output_cursor = *index;
-            if state.current_output_panel() == crate::tui::disc_browser::ExtractPanel::Destination {
+            if state.current_output_row() == "Folder" {
                 // Only the Folder row opens the directory picker.
                 open_native_destination_picker(app);
             } else if let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay {
@@ -471,7 +490,7 @@ pub fn handle_disc_browser_button_click_with_shift(
         TuiButton::DiscBrowserNaming => {
             let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay else { return false; };
             state.focus = crate::tui::disc_browser::ExtractFocus::Output;
-            state.output_cursor = 3;
+            state.output_cursor = state.output_rows().iter().position(|row| *row == "Naming").unwrap_or(0);
             state.panel = Some(crate::tui::disc_browser::ExtractPanel::Destination);
             state.panel_cursor = 0;
             begin_native_template_edit(state);
@@ -480,7 +499,7 @@ pub fn handle_disc_browser_button_click_with_shift(
         TuiButton::DiscBrowserOverwrite => {
             let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay else { return false; };
             state.focus = crate::tui::disc_browser::ExtractFocus::Output;
-            state.output_cursor = 3;
+            state.output_cursor = state.output_rows().iter().position(|row| *row == "Overwrite").unwrap_or(0);
             cycle_native_overwrite(state);
             true
         }
@@ -534,6 +553,16 @@ fn cycle_native_overwrite(state: &mut DiscBrowserState) {
     };
 }
 
+/// The probed codec, not merely a track's optional note, determines whether
+/// keeping DST is a meaningful choice for the highlighted SACD area.
+pub(super) fn selected_sacd_area_has_dst(state: &DiscBrowserState) -> bool {
+    state.contents.presentations.get(state.cursor).is_some_and(|program| {
+        program.format.codec.as_deref() == Some("DST")
+            || program.tracks.iter().any(|track|track.format_note.as_deref()
+                .is_some_and(|note| note.contains("DST")))
+    })
+}
+
 fn cycle_native_option(state: &mut DiscBrowserState, step: i32) {
     use crate::convert::pipeline::native_extract::NativeWavContainer;
     use crate::convert::pipeline::DvdaDownmixPolicy;
@@ -542,10 +571,10 @@ fn cycle_native_option(state: &mut DiscBrowserState, step: i32) {
             state.cycle_angle_for(state.cursor, step);
         }
         Some("Format") if state.contents.format == crate::disc::DiscFormat::Sacd => {
-            let selected = state.cursor;
-            let has_dst = state.contents.presentations.get(selected).is_some_and(|p|
-                p.tracks.iter().any(|t| t.format_note.as_deref().unwrap_or("").contains("DST")));
-            if has_dst { state.keep_dst[selected] = !state.keep_dst[selected]; }
+            if selected_sacd_area_has_dst(state) {
+                let selected = state.cursor;
+                state.keep_dst[selected] = !state.keep_dst[selected];
+            }
         }
         Some("Format") => {
             let all = [NativeWavContainer::Automatic, NativeWavContainer::Riff,
@@ -553,6 +582,7 @@ fn cycle_native_option(state: &mut DiscBrowserState, step: i32) {
             let index = all.iter().position(|value| *value == state.wav_container).unwrap_or(0);
             state.wav_container = all[(index as i32 + step).rem_euclid(all.len() as i32) as usize];
         }
+        Some("Overwrite") => cycle_native_overwrite(state),
         Some("Downmix") => {
             let all = [DvdaDownmixPolicy::None, DvdaDownmixPolicy::FooInputDvdaCompatible,
                 DvdaDownmixPolicy::FfmpegDefault, DvdaDownmixPolicy::Auto];
@@ -562,6 +592,193 @@ fn cycle_native_option(state: &mut DiscBrowserState, step: i32) {
         Some("Assume decrypted") => { state.assume_decrypted = !state.assume_decrypted; }
         _ => {}
     }
+}
+
+/// The key table is the authority for the extraction window's context hints
+/// and its normal (non-popup) key dispatch. Each displayed key group maps to
+/// one or more concrete key events; no independent hint string can drift from
+/// the handler. Editor/popup keys remain owned by their existing controls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeKeyAction {
+    Up, Down, RangeUp, RangeDown, PageUp, PageDown,
+    NextFocus, PreviousFocus, ToPrograms, ToItems,
+    Check, All, None, Invert, Enter, Space, Previous, Next,
+    Hidden, Diagnostics, More, Convert, Help, Close,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NativeKeyBinding {
+    code: KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+    hint: &'static str,
+    action: NativeKeyAction,
+}
+
+fn native_key_bindings(state: &DiscBrowserState) -> Vec<NativeKeyBinding> {
+    use crossterm::event::KeyModifiers as M;
+    use crate::tui::disc_browser::ExtractFocus;
+    use NativeKeyAction as A;
+    let mut bindings = Vec::with_capacity(32);
+    let mut add = |code, modifiers, hint, action| bindings.push(NativeKeyBinding {
+        code, modifiers, hint, action,
+    });
+    match state.focus {
+        ExtractFocus::Programs | ExtractFocus::Items => {
+            add(KeyCode::Char(' '), M::NONE, "Space check", A::Check);
+            for (code, hint, action) in [('a', "a all", A::All),
+                ('n', "n none", A::None), ('i', "i invert", A::Invert)] {
+                add(KeyCode::Char(code), M::NONE, hint, action);
+            }
+            if state.focus == ExtractFocus::Items {
+                add(KeyCode::Up, M::SHIFT, "⇧↑↓ range", A::RangeUp);
+                add(KeyCode::Down, M::SHIFT, "⇧↑↓ range", A::RangeDown);
+                add(KeyCode::Left, M::NONE, "← areas", A::ToPrograms);
+            } else {
+                add(KeyCode::Right, M::NONE, "→ tracks", A::ToItems);
+                if !state.contents.suppressed.is_empty() {
+                    add(KeyCode::Char('h'), M::NONE, "h hidden", A::Hidden);
+                }
+            }
+            if state.focus == ExtractFocus::Programs {
+                add(KeyCode::Enter, M::NONE, "↵ tracks", A::Enter);
+            }
+        }
+        ExtractFocus::Output => {
+            let row = state.current_output_row();
+            add(KeyCode::Enter, M::NONE, match row {
+                "Folder" => "↵ pick folder",
+                "Naming" => "↵ edit naming",
+                "Overwrite" => "↵ change policy",
+                _ => "↵ settings",
+            }, A::Enter);
+            // On a plain-DSD area Format cannot change; never advertise
+            // Space/[ ] as a change when these keys would be no-ops.
+            let can_change_format = row != "Format"
+                || state.contents.format != crate::disc::DiscFormat::Sacd
+                || selected_sacd_area_has_dst(state);
+            if can_change_format {
+                add(KeyCode::Char(' '), M::NONE, match row {
+                    "Folder" => "Space settings",
+                    "Naming" => "Space edit",
+                    "Overwrite" | "Downmix" | "Assume decrypted" | "Format" => "Space change",
+                    _ => "Space settings",
+                }, A::Space);
+            }
+            if matches!(row, "Format" | "Downmix" | "Assume decrypted") && can_change_format {
+                add(KeyCode::Char('['), M::NONE, "[ ] change", A::Previous);
+                add(KeyCode::Char(']'), M::NONE, "[ ] change", A::Next);
+            }
+        }
+    }
+    for (code, action) in [(KeyCode::Up, A::Up), (KeyCode::Down, A::Down),
+        (KeyCode::Char('k'), A::Up), (KeyCode::Char('j'), A::Down)] {
+        add(code, M::NONE, "↑↓ move", action);
+    }
+    add(KeyCode::Tab, M::NONE, "Tab next", A::NextFocus);
+    add(KeyCode::BackTab, M::SHIFT, "⇧Tab previous", A::PreviousFocus);
+    add(KeyCode::BackTab, M::NONE, "⇧Tab previous", A::PreviousFocus);
+    add(KeyCode::Tab, M::SHIFT, "⇧Tab previous", A::PreviousFocus);
+    for (code, action) in [(KeyCode::PageUp, A::PageUp), (KeyCode::PageDown, A::PageDown)] {
+        add(code, M::NONE, "PgUp/PgDn page", action);
+    }
+    if !state.contents.diagnostics.is_empty() {
+        add(KeyCode::Char('d'), M::NONE, "d diagnostics", A::Diagnostics);
+    }
+    add(KeyCode::Char('m'), M::NONE, "m options", A::More);
+    add(KeyCode::Char('c'), M::NONE, "c convert", A::Convert);
+    add(KeyCode::Char('?'), M::NONE, "? all keys", A::Help);
+    add(KeyCode::Esc, M::NONE, "Esc close", A::Close);
+    add(KeyCode::Char('q'), M::NONE, "q close", A::Close);
+    bindings
+}
+
+/// The displayed hints and the mouse actions are selected from the same
+/// binding table that the key dispatcher reads. Duplicate physical bindings
+/// (for example ArrowUp and k) share one visual hint.
+fn native_visible_hints(state: &DiscBrowserState) -> Vec<NativeKeyBinding> {
+    let bindings = native_key_bindings(state);
+    // Prefer navigation and the immediate action over bulk operations that
+    // still remain available through ?. All entries are real bindings.
+    use NativeKeyAction as A;
+    let priority: &[A] = match state.focus {
+        crate::tui::disc_browser::ExtractFocus::Programs =>
+            &[A::Up, A::Check, A::ToItems, A::Hidden, A::NextFocus],
+        crate::tui::disc_browser::ExtractFocus::Items =>
+            &[A::Up, A::Check, A::RangeUp, A::ToPrograms, A::NextFocus],
+        crate::tui::disc_browser::ExtractFocus::Output =>
+            &[A::Up, A::Previous, A::Enter, A::Space, A::NextFocus],
+    };
+    let mut hints = Vec::with_capacity(6);
+    for action in priority {
+        if let Some(binding) = bindings.iter().find(|binding| binding.action == *action) {
+            if !hints.iter().any(|other: &NativeKeyBinding| other.hint == binding.hint) {
+                hints.push(*binding);
+            }
+        }
+    }
+    if let Some(help) = bindings.into_iter().find(|binding| binding.action == A::Help) {
+        hints.push(help);
+    }
+    hints
+}
+
+pub(crate) fn native_key_hints(state: &DiscBrowserState) -> Vec<&'static str> {
+    native_visible_hints(state).into_iter().map(|hint| hint.hint).collect()
+}
+
+fn native_hint_can_click(action: NativeKeyAction) -> bool {
+    use NativeKeyAction as A;
+    matches!(action,A::Check|A::All|A::None|A::Invert|A::Enter|A::Space
+        |A::Previous|A::Next|A::Hidden|A::Diagnostics|A::Help)
+}
+
+pub(crate) fn native_hint_clickable(state: &DiscBrowserState, index: usize) -> bool {
+    native_visible_hints(state).get(index)
+        .is_some_and(|hint|native_hint_can_click(hint.action))
+}
+
+fn native_hint_key(state: &DiscBrowserState, index: usize) -> Option<KeyEvent> {
+    native_visible_hints(state).get(index)
+        .filter(|hint|native_hint_can_click(hint.action))
+        .map(|hint|KeyEvent::new(hint.code,hint.modifiers))
+}
+
+pub(crate) fn native_key_help(state: &DiscBrowserState) -> Vec<String> {
+    use crate::tui::disc_browser::ExtractFocus;
+    let mut lines = vec!["Keys for the extract window".to_owned(),
+        "↑↓ scroll this help · Esc close".to_owned()];
+    // Lines stay short enough for the existing read-only panel. The regular
+    // panel scroll keys handle output forms with several optional rows.
+    for (label, focus) in [("Areas / groups", ExtractFocus::Programs),
+        ("Tracks / chapters", ExtractFocus::Items), ("Output", ExtractFocus::Output)] {
+        let mut context=state.clone();
+        context.focus=focus;
+        lines.push(format!("{label}:"));
+        let row_count = if focus == ExtractFocus::Output { context.output_rows().len() } else { 1 };
+        for row in 0..row_count {
+            context.output_cursor=row;
+            let name=if focus == ExtractFocus::Output {format!("  {}: ",context.current_output_row())}
+                else {"  ".to_owned()};
+            let mut text=name.clone();
+            let mut seen = std::collections::HashSet::new();
+            let hints = native_key_bindings(&context).into_iter()
+                .filter_map(|binding| seen.insert(binding.hint).then_some(binding.hint));
+            for hint in hints {
+                let separator=if text==name {""}else{" · "};
+                // The 64-column popup leaves about 50 columns for panel
+                // text; wrap here rather than clipping active commands.
+                if text.chars().count()+separator.chars().count()+hint.chars().count()>49 {
+                    lines.push(text);
+                    text="    ".to_owned();
+                }
+                if text != name && text != "    " {text.push_str(separator);}
+                text.push_str(hint);
+            }
+            lines.push(text);
+        }
+    }
+    lines.push("Inside settings, use the keys shown in that panel".into());
+    lines
 }
 
 /// Window-only navigation. No Convert actions run unless explicitly selected.
@@ -628,7 +845,7 @@ pub fn handle_disc_browser_key(
         ActiveOverlay::DiscBrowser(state) if state.panel.is_none()
             && !state.editing_destination
             && state.focus == ExtractFocus::Output
-            && state.current_output_panel() == ExtractPanel::Destination)
+            && state.current_output_row() == "Folder")
     {
         open_native_destination_picker(app);
         return;
@@ -722,83 +939,100 @@ pub fn handle_disc_browser_key(
         return;
     }
 
-    match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => { state.probe_cancel.cancel(); app.active_overlay = ActiveOverlay::None; }
-        KeyCode::Tab => {
-            state.focus = match (state.focus, key.modifiers.contains(KeyModifiers::SHIFT)) {
+    let action = native_key_bindings(state).into_iter().find(|binding|
+        binding.code == key.code && binding.modifiers == key.modifiers)
+        .map(|binding| binding.action);
+    use NativeKeyAction as A;
+    match action {
+        Some(A::Close) => { state.probe_cancel.cancel(); app.active_overlay = ActiveOverlay::None; }
+        Some(A::Help) => { state.panel = Some(ExtractPanel::Keys); state.panel_cursor = 0; }
+        Some(A::NextFocus | A::PreviousFocus) => {
+            let backwards = action == Some(A::PreviousFocus);
+            state.focus = match (state.focus, backwards) {
                 (ExtractFocus::Programs, false) | (ExtractFocus::Output, true) => ExtractFocus::Items,
                 (ExtractFocus::Items, false) | (ExtractFocus::Programs, true) => ExtractFocus::Output,
                 (ExtractFocus::Output, false) | (ExtractFocus::Items, true) => ExtractFocus::Programs,
             };
         }
-        // Left/right never change an output setting or move into Output.
-        // Tab is the only way to select that third focus zone.
-        KeyCode::Left if state.focus == ExtractFocus::Items => state.focus = ExtractFocus::Programs,
-        KeyCode::Right if state.focus == ExtractFocus::Programs => state.focus = ExtractFocus::Items,
-        KeyCode::Up | KeyCode::Char('k') | KeyCode::Down | KeyCode::Char('j') => {
-            let delta = if matches!(key.code, KeyCode::Up | KeyCode::Char('k')) {-1isize} else {1isize};
+        Some(A::ToPrograms) => state.focus = ExtractFocus::Programs,
+        Some(A::ToItems) => state.focus = ExtractFocus::Items,
+        Some(A::Up | A::Down | A::RangeUp | A::RangeDown) => {
+            let delta = if matches!(action, Some(A::Up | A::RangeUp)) {-1isize} else {1isize};
             match state.focus {
                 ExtractFocus::Programs => {
                     let from = state.cursor;
                     state.move_cursor(delta);
                     if key.modifiers.contains(KeyModifiers::SHIFT) {
                         for index in from.min(state.cursor)..=from.max(state.cursor) {
-                            if state.is_extractable(index) { state.selected[index] = true; }
+                            if state.is_extractable(index) {state.selected[index] = true;}
                         }
                     }
                     state.item_cursor = 0; state.item_scroll = 0;
                 }
                 ExtractFocus::Items => {
                     let from = state.item_cursor;
-                    let last = state.selected_presentation().map_or(0,|p|p.tracks.len().saturating_sub(1));
-                    state.item_cursor = if delta < 0 {state.item_cursor.saturating_sub(1)} else {state.item_cursor.saturating_add(1).min(last)};
-                    if key.modifiers.contains(KeyModifiers::SHIFT) {state.check_item_range(from,state.item_cursor);}
+                    let last = state.selected_presentation().map_or(0, |p|p.tracks.len().saturating_sub(1));
+                    state.item_cursor = if delta < 0 {from.saturating_sub(1)}
+                        else {from.saturating_add(1).min(last)};
+                    if matches!(action,Some(A::RangeUp | A::RangeDown)) {
+                        state.check_item_range(from,state.item_cursor);
+                    }
                 }
                 ExtractFocus::Output => {
                     let last = state.output_rows().len().saturating_sub(1);
-                    state.output_cursor = if delta < 0 {state.output_cursor.saturating_sub(1)} else {state.output_cursor.saturating_add(1).min(last)};
+                    state.output_cursor = if delta < 0 {state.output_cursor.saturating_sub(1)}
+                        else {state.output_cursor.saturating_add(1).min(last)};
                 }
             }
         }
-        KeyCode::Char(' ') => match state.focus {
+        Some(A::Check) => match state.focus {
             ExtractFocus::Programs => state.toggle_selected(state.cursor),
             ExtractFocus::Items => state.toggle_item(state.item_cursor),
-            ExtractFocus::Output if state.current_output_panel() == ExtractPanel::Destination => {
-                state.panel = Some(ExtractPanel::Destination);
-                state.panel_cursor = 0;
-            },
-            ExtractFocus::Output => cycle_native_option(state, 1),
+            ExtractFocus::Output => {},
         },
-        KeyCode::Char('a') | KeyCode::Char('n') | KeyCode::Char('i') => {
-            if let KeyCode::Char(mode) = key.code { state.check_focus(mode); }
+        Some(A::All | A::None | A::Invert) => {
+            state.check_focus(match action {Some(A::All)=>'a', Some(A::None)=>'n', _=>'i'});
         }
-        KeyCode::Char('h') => { state.show_hidden = !state.show_hidden; }
-        KeyCode::Char('d') => { state.panel = Some(ExtractPanel::Diagnostics); }
-        KeyCode::Char('m') => { state.panel = Some(ExtractPanel::More); }
-        KeyCode::Char('c') => { activate_overlay_convert(app); }
-        KeyCode::Char('[') => cycle_native_option(state, -1),
-        KeyCode::Char(']') => cycle_native_option(state, 1),
-        KeyCode::PageDown => match state.focus {
-            ExtractFocus::Programs => state.move_cursor(10),
-            ExtractFocus::Items => {let last = state.selected_presentation().map_or(0, |p|p.tracks.len().saturating_sub(1)); state.item_cursor = state.item_cursor.saturating_add(10).min(last);},
-            ExtractFocus::Output => {state.output_cursor = state.output_cursor.saturating_add(2).min(state.output_rows().len().saturating_sub(1));},
-        },
-        KeyCode::PageUp => match state.focus {
-            ExtractFocus::Programs => state.move_cursor(-10),
-            ExtractFocus::Items => state.item_cursor = state.item_cursor.saturating_sub(10),
-            ExtractFocus::Output => state.output_cursor = state.output_cursor.saturating_sub(2),
-        },
-        KeyCode::Enter => {
-            if state.focus == ExtractFocus::Output {
-                state.panel = Some(state.current_output_panel());
-                state.panel_cursor = 0;
-            } else if state.focus == ExtractFocus::Programs {
-                state.focus = ExtractFocus::Items;
-            } else {
-                state.toggle_item(state.item_cursor);
+        Some(A::Hidden) => state.show_hidden = !state.show_hidden,
+        Some(A::Diagnostics) => {state.panel=Some(ExtractPanel::Diagnostics);state.panel_cursor=0;}
+        Some(A::More) => {state.panel=Some(ExtractPanel::More);state.panel_cursor=0;}
+        Some(A::Convert) => activate_overlay_convert(app),
+        Some(A::Previous | A::Next) => cycle_native_option(state, if action==Some(A::Previous){-1}else{1}),
+        Some(A::PageDown | A::PageUp) => {
+            let down=action==Some(A::PageDown);
+            match state.focus {
+                ExtractFocus::Programs => state.move_cursor(if down {10}else{-10}),
+                ExtractFocus::Items => {
+                    let last=state.selected_presentation().map_or(0,|p|p.tracks.len().saturating_sub(1));
+                    state.item_cursor=if down{state.item_cursor.saturating_add(10).min(last)}
+                        else{state.item_cursor.saturating_sub(10)};
+                }
+                ExtractFocus::Output => {
+                    let last=state.output_rows().len().saturating_sub(1);
+                    state.output_cursor=if down{state.output_cursor.saturating_add(2).min(last)}
+                        else{state.output_cursor.saturating_sub(2)};
+                }
             }
         }
-        _ => {}
+        Some(A::Space) => match state.current_output_row() {
+            "Folder" => {state.panel=Some(ExtractPanel::Destination);state.panel_cursor=0;}
+            "Naming" => {state.panel=Some(ExtractPanel::Destination);state.panel_cursor=0;
+                begin_native_template_edit(state);}
+            "Overwrite" => cycle_native_overwrite(state),
+            "Format" | "Downmix" | "Assume decrypted" => cycle_native_option(state,1),
+            _ => {state.panel=Some(state.current_output_panel());state.panel_cursor=0;}
+        },
+        Some(A::Enter) => match state.focus {
+            ExtractFocus::Programs => state.focus=ExtractFocus::Items,
+            ExtractFocus::Items => {}, // Space, not Enter, checks a track.
+            ExtractFocus::Output => match state.current_output_row() {
+                "Naming" => {state.panel=Some(ExtractPanel::Destination);state.panel_cursor=0;
+                    begin_native_template_edit(state);}
+                "Overwrite" => cycle_native_overwrite(state),
+                _ => {state.panel=Some(state.current_output_panel());state.panel_cursor=0;}
+            },
+        },
+        None => {},
     }
 }
 
@@ -1321,6 +1555,84 @@ mod tests {
     }
 
     #[test]
+    fn r18_hint_actions_are_bound_only_in_their_actual_context() {
+        use crate::tui::disc_browser::ExtractFocus;
+        let contents=selectable_disc_contents(PathBuf::from("disc.iso"),FolderDiscMarkerKind::Sacd);
+        let mut state=DiscBrowserState::new(contents,PathBuf::from("disc.iso"));
+        for focus in [ExtractFocus::Programs, ExtractFocus::Items, ExtractFocus::Output] {
+            state.focus=focus;
+            for index in 0..state.output_rows().len() {
+                state.output_cursor=index;
+                let bindings=native_key_bindings(&state);
+                for hint in native_visible_hints(&state) {
+                    assert!(bindings.iter().any(|candidate|candidate.code==hint.code
+                        && candidate.modifiers==hint.modifiers && candidate.action==hint.action));
+                }
+                if focus==ExtractFocus::Output {
+                    assert!(!bindings.iter().any(|binding|
+                        binding.action==NativeKeyAction::All || binding.action==NativeKeyAction::Invert));
+                    if state.current_output_row()=="Format" {
+                        // The fixture is SACD with plain DSD; there is no
+                        // DST option to toggle, so no fake choice hint.
+                        assert!(!bindings.iter().any(|binding|binding.action==NativeKeyAction::Previous));
+                        assert!(!bindings.iter().any(|binding|binding.action==NativeKeyAction::Space));
+                    }
+                } else {
+                    assert!(!bindings.iter().any(|binding|binding.action==NativeKeyAction::Previous));
+                }
+            }
+        }
+        state.focus=ExtractFocus::Output;
+        state.output_cursor=4;
+        let labels=native_key_hints(&state);
+        assert!(labels.contains(&"↵ pick folder"));
+        assert!(labels.contains(&"Space settings"));
+        assert!(native_hint_key(&state,labels.iter().position(|hint|*hint=="↵ pick folder").unwrap()).is_some());
+    }
+
+    #[test]
+    fn all_keys_overlay_uses_full_binding_table_and_hidden_hint_is_actionable() {
+        use crate::tui::disc_browser::ExtractFocus;
+        let contents=selectable_disc_contents(PathBuf::from("disc.iso"),FolderDiscMarkerKind::Sacd);
+        let mut state=DiscBrowserState::new(contents, PathBuf::from("disc.iso"));
+        let help=native_key_help(&state).join("\n");
+        assert!(native_key_help(&state).iter().all(|line|line.chars().count()<=49),
+            "help rows must fit the smallest scrolling help panel");
+        for expected in ["n none", "i invert", "a all", "PgUp/PgDn page",
+            "⇧↑↓ range", "↵ pick folder", "Space settings", "↵ edit naming"] {
+            assert!(help.contains(expected), "Missing {expected} from all-keys help: {help}");
+        }
+        for focus in [ExtractFocus::Programs, ExtractFocus::Items, ExtractFocus::Output] {
+            state.focus=focus;
+            for cursor in 0..state.output_rows().len() {
+                state.output_cursor=cursor;
+                let help=native_key_help(&state).join("\n");
+                for binding in native_key_bindings(&state) {
+                    assert!(help.contains(binding.hint),
+                        "Help does not report active binding {} for {focus:?}: {help}",binding.hint);
+                }
+            }
+        }
+        // Hiding/showing suppressed areas is an active and clickable hint
+        // when that menu actually contains suppressed programs.
+        state.contents.suppressed.push(crate::disc::model::SuppressedPresentation {
+            id: PresentationId::SacdArea(SacdAreaId::MultiChannel),
+            reason: "duplicate area".into(), track_count: 1,
+            duration_secs: 60.0, native_detail: None,
+        });
+        state.focus=ExtractFocus::Programs;
+        let hints=native_key_hints(&state);
+        let index=hints.iter().position(|label|*label=="h hidden").expect("visible hidden toggle");
+        let key=native_hint_key(&state,index).unwrap();
+        assert_eq!(key.code,KeyCode::Char('h'));
+        assert!(native_key_help(&state).join("\n").contains("h hidden"));
+        state.focus=ExtractFocus::Output;
+        state.output_cursor=0;
+        assert!(!native_key_hints(&state).contains(&"h hidden"));
+        assert!(!native_key_help(&state).join("\n").contains("k  Keep DST"));
+    }
+
+    #[test]
     fn destination_picker_round_trip_preserves_extract_options() {
         use crossterm::event::KeyModifiers;
         let tmp = tempfile::tempdir().unwrap();
@@ -1332,7 +1644,7 @@ mod tests {
         state.naming_template = original_template.clone();
         state.focus = crate::tui::disc_browser::ExtractFocus::Output;
         state.output_cursor = state.output_rows().iter()
-            .position(|name| *name == "Destination").expect("destination row");
+            .position(|name| *name == "Folder").expect("folder row");
         let original_dest = state.destination.clone();
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.active_overlay = ActiveOverlay::DiscBrowser(Box::new(state));
@@ -1379,7 +1691,7 @@ mod tests {
             selectable_disc_contents(disc.clone(), FolderDiscMarkerKind::Sacd), disc);
         base.destination = temp.path().join("extracted");
         base.focus = ExtractFocus::Output;
-        base.output_cursor = 3;
+        base.output_cursor = 4;
         let (tx, _rx) = tokio::sync::mpsc::channel(16);
 
         for (width, height) in [(72, 24), (110, 34), (154, 40)] {
@@ -1389,10 +1701,10 @@ mod tests {
                 frame, &base, temp.path(), &mut buttons,
                 crate::tui::theme::theme_by_slug_or_default("tokyo-night"),
             )).unwrap();
-            let folder = buttons.button_rect(TuiButton::DiscBrowserOutput(3))
+            let folder = buttons.button_rect(TuiButton::DiscBrowserOutput(4))
                 .expect("Folder must be present in the rendered button map");
             assert_eq!(buttons.find_button_at(folder.x, folder.y),
-                Some(TuiButton::DiscBrowserOutput(3)));
+                Some(TuiButton::DiscBrowserOutput(4)));
             let screen = (0..height).map(|y| (0..width)
                 .map(|x| terminal.backend().buffer().get(x, y).symbol().to_owned())
                 .collect::<Vec<_>>().concat()).collect::<Vec<_>>().join("\n");
@@ -1478,7 +1790,7 @@ mod tests {
         };
         let naming=hit(TuiButton::DiscBrowserNaming);
         let overwrite=hit(TuiButton::DiscBrowserOverwrite);
-        let folder=hit(TuiButton::DiscBrowserOutput(3));
+        let folder=hit(TuiButton::DiscBrowserOutput(4));
         assert_ne!(naming,folder);
         assert_ne!(overwrite,folder);
         assert_ne!(naming,overwrite);
