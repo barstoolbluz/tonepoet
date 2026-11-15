@@ -1447,6 +1447,16 @@ impl FileTaskProgressState {
         self.render_rule(frame, area, action_rule_row, '\u{251c}', '\u{2524}');
         self.render_action_row(frame, area, action_row, self.detail_buttons());
         self.render_rule(frame, area, bottom_row, '\u{2514}', '\u{2518}');
+        // The details body is scrollable, but its side rails must remain
+        // visible on *every* content row, not only on the dividers.
+        for row in 1..action_rule_row {
+            for (x, symbol) in [(area.x, "│"), (area.x + area.width - 1, "│")] {
+                frame.render_widget(
+                    Paragraph::new(symbol).style(self.theme.progress_border),
+                    Rect::new(x,area.y+row,1,1),
+                );
+            }
+        }
     }
 
     fn details_text(&self) -> String {

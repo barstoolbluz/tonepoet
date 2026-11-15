@@ -1048,6 +1048,40 @@ pub fn group_duration_secs(disc: &DvdaDisc, group: &DvdaGroup) -> f64 {
     total_pts as f64 / PTS_PER_SEC
 }
 
+/// A group with differently clocked channel groups is not representable as
+/// one native PCM stream. This is a property of the authored channel groups,
+/// not the first-rate-only AOB summary. Convert may still process this group.
+pub fn native_group_extraction_issue(disc: &DvdaDisc, group: &DvdaGroup) -> Option<String> {
+    let mut conflicts = Vec::new();
+    let mut has_ifo_evidence = false;
+    for title_ref in &group.title_refs {
+        let Some(title_set) = disc.title_sets.iter().find(|ts| ts.number == title_ref.title_set_nr) else { continue; };
+        for attr in title_set.audio_formats.iter().filter(|a| a.present) {
+            let Some(assignment) = &attr.channel_assignment else { continue; };
+            if assignment.group2_channels == 0 { continue; }
+            has_ifo_evidence = true;
+            if let (Some(a), Some(b)) = (attr.channel_format.group1_sample_rate, attr.channel_format.group2_sample_rate) {
+                if a != b { conflicts.push((a,b)); }
+            }
+        }
+    }
+    if !has_ifo_evidence {
+        if let Some(samg) = disc.samg.as_ref() {
+            for reference in &group.samg_tracks {
+                let Some(track) = samg.tracks.iter().find(|t|
+                    t.ordinal == reference.samg_ordinal && t.group_nr == reference.group_nr && t.track_nr == reference.track_nr) else { continue; };
+                if track.channel_assignment.as_ref().is_some_and(|a| a.group2_channels > 0) {
+                    if let (Some(a), Some(b)) = (track.channel_format.group1_sample_rate, track.channel_format.group2_sample_rate) {
+                        if a != b { conflicts.push((a,b)); }
+                    }
+                }
+            }
+        }
+    }
+    conflicts.first().map(|(a,b)| format!(
+        "channel groups at {} and {} kHz · use Convert", a / 1000, b / 1000))
+}
+
 /// Resolve structured audio format for a DVD-Audio group from IFO/SAMG metadata.
 /// Returns format fields suitable for building an AudioPresentationFormat.
 /// AOB probe results take priority when available — call this as the fallback.

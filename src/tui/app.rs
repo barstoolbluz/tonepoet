@@ -9031,6 +9031,8 @@ pub enum ActiveOverlay {
         preview: String,
         /// Current field value (for "active" badge).
         active_template: Option<String>,
+        /// Return to the extract form, not Convert, when opened from Naming.
+        return_to_extract: Option<Box<crate::tui::disc_browser::DiscBrowserState>>,
     },
     /// Advanced file-operation settings opened from the Config screen. The
     /// overlay owns a draft and commits all values together on Enter.
@@ -9103,6 +9105,12 @@ pub struct TemplateBuilderState {
     pub saved_selected: usize,
     /// Scroll offset for the saved templates list.
     pub saved_scroll: usize,
+    /// Scroll position for the shared token palette; the action footer stays fixed.
+    pub token_scroll: usize,
+    /// Shared Convert builder may also edit a native extraction template.
+    pub return_to_extract: Option<Box<crate::tui::disc_browser::DiscBrowserState>>,
+    /// Additional token pills are displayed only for their source format.
+    pub disc_format: Option<crate::disc::DiscFormat>,
 }
 
 /// State for the AccurateRip verification overlay.
@@ -9571,6 +9579,58 @@ impl QueuedFileTransfer {
     }
 }
 
+/// A native extraction waiting for the same serial file-task slot as copy/move.
+/// The complete selection is frozen at enqueue time; the detached helper and
+/// journal are created only when this entry reaches the front of the FIFO.
+#[derive(Debug, Clone)]
+pub struct QueuedNativeExtraction {
+    pub queue_id: u64,
+    pub job: crate::convert::pipeline::native_extract::NativeExtractionJob,
+}
+
+/// One FIFO for copy, move, and native extraction, without disguising a disc
+/// selection as a filesystem clipboard transfer.
+#[derive(Debug, Clone)]
+pub enum QueuedFileTask {
+    Transfer(QueuedFileTransfer),
+    Extract(QueuedNativeExtraction),
+}
+
+impl From<QueuedFileTransfer> for QueuedFileTask {
+    fn from(transfer: QueuedFileTransfer) -> Self { Self::Transfer(transfer) }
+}
+
+impl QueuedFileTask {
+    pub fn queue_id(&self) -> u64 {
+        match self { Self::Transfer(task) => task.queue_id, Self::Extract(task) => task.queue_id }
+    }
+
+    pub fn transfer(&self) -> Option<&QueuedFileTransfer> {
+        match self { Self::Transfer(task) => Some(task), Self::Extract(_) => None }
+    }
+
+    pub fn is_journal_backed(&self) -> bool {
+        self.transfer().is_some_and(QueuedFileTransfer::is_journal_backed)
+    }
+
+    pub fn summary(&self) -> tui_file_picker::QueuedFileTaskSummary {
+        match self {
+            Self::Transfer(task) => task.summary(),
+            Self::Extract(task) => {
+                let items: usize = task.job.programs.iter().map(|program| program.tracks.len()).sum();
+                tui_file_picker::QueuedFileTaskSummary {
+                    queue_id: task.queue_id,
+                    source_summary: format!("Extract {items} tracks/chapters from {}",
+                        task.job.source.file_name().unwrap_or(task.job.source.as_os_str()).to_string_lossy()),
+                    destination_summary: task.job.destination.display().to_string(),
+                    item_count: items,
+                    recovered: false,
+                }
+            }
+        }
+    }
+}
+
 /// Correlation state for a paste initiated by the metadata artwork picker but
 /// executed by Tonepoet's hardened file-task worker. The picker session id is
 /// stable even if the progress overlay temporarily preempts the editor.
@@ -9584,13 +9644,13 @@ pub struct ArtworkPickerFileTask {
     pub plan: tui_file_picker::PastePlan,
 }
 
-/// App-side serial scheduler and per-job reconciliation registry for Browse
-/// copy/move transfers. The worker layer remains one-helper-per-job; this state
-/// only decides which queued snapshot owns the single active slot.
+/// App-side serial scheduler for copy, move, and native extraction, with
+/// per-job clipboard reconciliation records. Each dispatched job owns its own
+/// worker; this queue only decides who gets the one active file-task slot.
 #[derive(Debug, Default)]
 pub struct FileTransferQueueState {
     pub active_session_id: Option<u64>,
-    pub queued: VecDeque<QueuedFileTransfer>,
+    pub queued: VecDeque<QueuedFileTask>,
     /// Durable crash recoveries discovered at startup. Kept distinct from the
     /// ordinary user queue so discovery never silently changes normal queue
     /// ownership semantics. The scheduler admits these only through the exact
@@ -9609,10 +9669,10 @@ impl FileTransferQueueState {
         // `recovery_queued` is a review queue, not a live transfer queue. Its
         // entries are presented by the dedicated recovery surfaces until the
         // user explicitly resumes one; only then is it promoted into `queued`
-        // and becomes an ordinary runnable transfer row.
+        // and becomes an ordinary runnable file-task row.
         self.queued
             .iter()
-            .map(QueuedFileTransfer::summary)
+            .map(QueuedFileTask::summary)
             .collect()
     }
 
@@ -9660,6 +9720,8 @@ pub enum FilePickerPurpose {
     SelectDirectory,
     /// Convert output-options destination picker.
     SelectDestination,
+    /// Restore the exact disc extraction surface after a folder choice.
+    NativeExtractDestination { probe_id: u64 },
     /// Convert preset loader; selects an existing TOML preset.
     SelectPreset,
     /// Convert preset save-as picker; returns the composed target preset path.
@@ -11716,6 +11778,12 @@ pub(crate) struct MetadataSourceSaveBatch {
 /// - read-only tab scroll values are clamped before storage.
 #[derive(Debug, Clone)]
 pub struct MetadataEditorState {
+    /// A screen-level draft owned by Extract while its existing metadata
+    /// editor/lookup is open. Never serialized or committed to the queue.
+    pub return_to_extract: Option<Box<crate::tui::disc_browser::DiscBrowserState>>,
+    pub extract_mb_populated: bool,
+    pub extract_mb_saved: bool,
+    pub extract_tags_saved: bool,
     /// True when the presentation tabs are single-image CUE surfaces (one
     /// tab per cue/image pair of an album). Split-cue MB population slices
     /// the release tracklist ACROSS tabs, which is only correct for cue
@@ -11791,6 +11859,10 @@ fn read_only_max_scroll(total_lines: usize, visible_rows: usize) -> usize {
 impl MetadataEditorState {
     pub fn from_model(model: MetadataEditorModel) -> Self {
         Self {
+            return_to_extract: None,
+            extract_mb_populated: false,
+            extract_mb_saved: false,
+            extract_tags_saved: false,
             cue_surface_tabs: false,
             archive_edit_context: None,
             archive_staging_dirty: false,
@@ -15829,6 +15901,10 @@ pub struct AppState {
     /// identical whether the surface is visible or in the shared footer.
     pub minimized_file_task_progress: Option<FileTaskProgressSession>,
 
+    /// Disc overlay parked while its folder picker owns the modal surface.
+    /// Its source-probe generation remains live during the picker.
+    pub pending_disc_extract_picker: Option<Box<super::disc_browser::DiscBrowserState>>,
+
     /// Modal surface displaced only when a minimized transfer demands urgent
     /// attention. It is restored after the transfer is minimized again or its
     /// terminal report is acknowledged, so attention preemption never destroys
@@ -16918,7 +16994,8 @@ impl AppState {
                 unreconstructable_journals,
             } = crate::tui::file_task_runtime::startup_file_task_recovery_inventory();
             recovery_surface_records = startup_recovery_surface_records;
-            file_transfers.unresolved_recovery_count = recovery_surface_records.len();
+            file_transfers.unresolved_recovery_count =
+                crate::tui::file_task_runtime::recovery_reservation_count(&recovery_surface_records);
             if let Some(newest) = recoveries.last().cloned() {
                 // Preserve the historical user-facing clipboard/retry surface
                 // for the newest job while also admitting every reconstructable
@@ -17056,6 +17133,7 @@ impl AppState {
             host_clipboard_replay_active: false,
             last_file_task_progress: None,
             minimized_file_task_progress: None,
+            pending_disc_extract_picker: None,
             file_task_preempted_overlay: None,
             file_transfers,
             recovery_ui,

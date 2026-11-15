@@ -23,6 +23,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::Arc;
 
 use crate::concurrency::{ClaimMode, ClaimScope, LeaseFamily, MutationClaimGuard, OwnerProcessIdentity, PathClaim, PathResolutionSemantics, PersistentLease};
+use crate::convert::pipeline::native_extract::NativeSkippedSelection;
 
 use super::browse::{BrowseMoveRecoveryProof, BrowsePasteRetryPlan};
 
@@ -221,6 +222,15 @@ pub struct DurableNativeRenameIntent {
     pub source_manifest: tui_file_picker::SourceManifest,
 }
 
+/// Exact text prepared from native sample boundaries before its continuous
+/// audio file is made visible. Retaining it in the existing journal supports
+/// CUE-only recovery without re-decoding an already published program.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DurableNativePreparedCue {
+    pub destination: PathBuf,
+    pub content: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DurableFileTaskRecord {
     pub schema: u32,
@@ -244,6 +254,24 @@ pub struct DurableFileTaskRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admitted_destination_root: Option<PathBuf>,
     pub job: serde_json::Value,
+    /// Native extraction uses the same file-task journal and lease as copy/move,
+    /// but its authored outputs are not copy/move source mappings.
+    #[serde(default)]
+    pub native_published_paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub native_skipped_selections: Vec<NativeSkippedSelection>,
+    #[serde(default)]
+    pub native_unfinished_outputs: Vec<crate::convert::pipeline::native_extract::NativeUnfinishedOutput>,
+    /// SHA-256 of the last log this journal published. Only that exact
+    /// journal-owned content may be replaced when extraction resumes.
+    #[serde(default)]
+    pub native_log_sha256: Option<String>,
+    /// Round-4 journals own each program's receipt independently. The old
+    /// single SHA remains readable for in-flight pre-R34 recoveries.
+    #[serde(default)]
+    pub native_log_digests: std::collections::BTreeMap<PathBuf,String>,
+    #[serde(default)]
+    pub native_prepared_cues: Vec<DurableNativePreparedCue>,
     pub retry_plan: Option<BrowsePasteRetryPlan>,
     pub roots: Vec<tui_file_picker::FileTaskRootResult>,
     pub temp_artifacts: Vec<DurableTempArtifact>,
@@ -280,6 +308,10 @@ pub struct DurableFileTaskRecord {
 }
 
 impl DurableFileTaskRecord {
+    pub fn is_native_extraction(&self) -> bool {
+        self.job.get("native_extraction").is_some_and(serde_json::Value::is_object)
+    }
+
     pub fn admitted_mappings_for(
         &self,
         requested: &[tui_file_picker::PasteMapping],
@@ -478,6 +510,16 @@ enum DurableFileTaskJournalMutation {
         source: PathBuf,
         proof: BrowseMoveRecoveryProof,
     },
+    /// Only one append per successfully published native output. Durable
+    /// checkpoints let an interrupted extraction skip already published tracks.
+    NativePublished { destination: PathBuf },
+    /// A confirmed skip is distinct from a completed output filename.
+    NativeSkipped { selection: NativeSkippedSelection },
+    NativeUnfinished { output: crate::convert::pipeline::native_extract::NativeUnfinishedOutput },
+    NativeLogPublished { sha256: String },
+    NativeProgramLogPublished { destination: PathBuf, sha256: String },
+    /// Journaled before the corresponding continuous audio publication.
+    NativeCuePrepared { cue: DurableNativePreparedCue },
     Checkpoint {
         lifecycle: DurableFileTaskLifecycle,
         status: String,
@@ -591,7 +633,11 @@ impl FileTaskJournalHandle {
         let FileTaskPathAdmission {
             claims,
             admitted_mappings,
-        } = file_task_path_admission(is_move, &mappings)?;
+        } = if job.get("native_extraction").is_some() {
+            native_extraction_path_admission(&mappings, &job)?
+        } else {
+            file_task_path_admission(is_move, &mappings)?
+        };
         let admitted_destination_root = file_task_destination_root_from_job(&job, &mappings)?;
         let record = DurableFileTaskRecord {
             schema: FILE_TASK_JOURNAL_SCHEMA,
@@ -608,6 +654,12 @@ impl FileTaskJournalHandle {
             admitted_mappings,
             admitted_destination_root: Some(admitted_destination_root),
             job,
+            native_published_paths: Vec::new(),
+            native_skipped_selections: Vec::new(),
+            native_unfinished_outputs: Vec::new(),
+            native_log_sha256: None,
+            native_log_digests: Default::default(),
+            native_prepared_cues: Vec::new(),
             retry_plan,
             roots: Vec::new(),
             temp_artifacts: Vec::new(),
@@ -788,6 +840,52 @@ impl FileTaskJournalHandle {
                 abandoned_reason: Some(reason),
             },
         )
+    }
+
+    /// Publication is complete before this durable append. Re-running an
+    /// interrupted extraction must never overwrite a published selection.
+    pub fn record_native_published(&self, destination: &Path) -> Result<(), String> {
+        self.append_mutation(
+            true,
+            true,
+            DurableFileTaskJournalMutation::NativePublished {
+                destination: destination.to_path_buf(),
+            },
+        )
+    }
+
+    pub fn record_native_skipped(&self, selection: &NativeSkippedSelection) -> Result<(), String> {
+        self.append_mutation(true, true, DurableFileTaskJournalMutation::NativeSkipped {
+            selection: selection.clone(),
+        })
+    }
+
+    pub fn record_native_unfinished(
+        &self, output: &crate::convert::pipeline::native_extract::NativeUnfinishedOutput,
+    ) -> Result<(), String> {
+        self.append_mutation(true, true, DurableFileTaskJournalMutation::NativeUnfinished {
+            output: output.clone(),
+        })
+    }
+
+    pub fn record_native_log_sha256(&self, sha256: &str) -> Result<(), String> {
+        self.append_mutation(true, true, DurableFileTaskJournalMutation::NativeLogPublished {
+            sha256: sha256.to_owned(),
+        })
+    }
+
+    pub fn record_native_program_log(&self, destination: &Path, sha256: &str) -> Result<(), String> {
+        self.append_mutation(true, true, DurableFileTaskJournalMutation::NativeProgramLogPublished {
+            destination: destination.to_path_buf(), sha256: sha256.to_owned(),
+        })
+    }
+
+    pub fn record_native_prepared_cue(&self, destination: &Path, content: &str) -> Result<(), String> {
+        self.append_mutation(true, true, DurableFileTaskJournalMutation::NativeCuePrepared {
+            cue: DurableNativePreparedCue {
+                destination: destination.to_path_buf(), content: content.to_owned(),
+            },
+        })
     }
 
     pub fn mark_lifecycle(
@@ -1165,6 +1263,11 @@ pub enum FileTaskWireEvent {
         report: tui_file_picker::FileTaskCompletionReport,
         retry_plan: Option<BrowsePasteRetryPlan>,
     },
+    /// Used only by the native extraction helper. Copy/move wire events and
+    /// their recovery payloads retain their existing shape.
+    NativeComplete {
+        result: Result<crate::convert::pipeline::native_extract::NativeExtractionReport, String>,
+    },
 }
 
 pub fn write_wire_event(writer: &mut impl Write, event: &FileTaskWireEvent) -> Result<(), String> {
@@ -1479,6 +1582,48 @@ fn apply_journal_entry(
             });
             retry.recovery_by_source.insert(source, proof);
         }
+        DurableFileTaskJournalMutation::NativePublished { destination } => {
+            if !record.is_native_extraction() {
+                return Err("native publication attached to a copy/move journal".to_string());
+            }
+            if !record.native_published_paths.contains(&destination) {
+                record.native_published_paths.push(destination);
+            }
+        }
+        DurableFileTaskJournalMutation::NativeSkipped { selection } => {
+            if !record.is_native_extraction() {
+                return Err("native skip attached to a copy/move journal".to_string());
+            }
+            if !record.native_skipped_selections.iter().any(|old| old.same_selection(&selection)) {
+                record.native_skipped_selections.push(selection);
+            }
+        }
+        DurableFileTaskJournalMutation::NativeUnfinished { output } => {
+            if !record.is_native_extraction() {
+                return Err("native failure attached to a copy/move journal".to_string());
+            }
+            record.native_unfinished_outputs.retain(|known|known.destination != output.destination);
+            record.native_unfinished_outputs.push(output);
+        }
+        DurableFileTaskJournalMutation::NativeLogPublished { sha256 } => {
+            if !record.is_native_extraction() {
+                return Err("native extraction log attached to a copy/move journal".to_string());
+            }
+            record.native_log_sha256 = Some(sha256);
+        }
+        DurableFileTaskJournalMutation::NativeProgramLogPublished { destination, sha256 } => {
+            if !record.is_native_extraction() {
+                return Err("native extraction log attached to a copy/move journal".to_string());
+            }
+            record.native_log_digests.insert(destination, sha256);
+        }
+        DurableFileTaskJournalMutation::NativeCuePrepared { cue } => {
+            if !record.is_native_extraction() {
+                return Err("native CUE attached to a copy/move journal".to_string());
+            }
+            record.native_prepared_cues.retain(|known|known.destination != cue.destination);
+            record.native_prepared_cues.push(cue);
+        }
         DurableFileTaskJournalMutation::Checkpoint {
             lifecycle,
             status,
@@ -1749,10 +1894,48 @@ fn recovery_descriptor_path(
     ))
 }
 
+/// A completed native file task keeps its *journal* for later inspection,
+/// not a durable filesystem mutation reservation. The retirement primitive
+/// itself refuses release while any helper still owns the lease.
+pub(crate) fn retire_completed_native_reservation(
+    record: &DurableFileTaskRecord,
+) -> Result<(), String> {
+    if !record.is_native_extraction()
+        || record.lifecycle != DurableFileTaskLifecycle::Completed
+        || !record.temp_artifacts.is_empty()
+    {
+        return Err("Native extraction has not completed cleanly".into());
+    }
+    let job_id = uuid::Uuid::parse_str(&record.job_id)
+        .map_err(|error| format!("Invalid completed native job identifier: {error}"))?;
+    let family = LeaseFamily::JournalOperation { job_id };
+    let descriptor = record.lease_descriptor.clone()
+        .or_else(|| crate::concurrency::find_family_descriptor(&family).ok().flatten());
+    if let Some(descriptor) = descriptor.filter(|path| path.exists()) {
+        crate::concurrency::retire_descriptor_after_lifecycle_release(&descriptor, &family)?;
+    }
+    Ok(())
+}
+
 fn classify_recovery_surface(
     path: &Path,
     record: &DurableFileTaskRecord,
 ) -> Result<RecoverySurfaceAvailability, String> {
+    if record.is_native_extraction()
+        && record.lifecycle == DurableFileTaskLifecycle::Completed
+        && record.temp_artifacts.is_empty()
+    {
+        if let Some(descriptor) = record.lease_descriptor.as_deref().filter(|path| path.exists()) {
+            // The helper may still be committing its completion. Do not
+            // retire a live lease or present a running worker as ownerless.
+            let (_, availability) = crate::concurrency::descriptor_availability(descriptor)?;
+            if availability == crate::concurrency::ClaimAvailability::Live {
+                return Ok(RecoverySurfaceAvailability::Live);
+            }
+            retire_completed_native_reservation(record)?;
+        }
+        return Ok(RecoverySurfaceAvailability::Recoverable);
+    }
     let Some(descriptor) = recovery_descriptor_path(path, record)? else {
         return Ok(RecoverySurfaceAvailability::Recoverable);
     };
@@ -1790,7 +1973,9 @@ pub fn recovery_surface_records() -> Vec<RecoverySurfaceRecord> {
         .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
         .filter_map(|path| match load_record_with_version(&path) {
             Ok((record, version))
-                if record.needs_reconciliation() || recovery_record_is_discarded(&record) =>
+                if record.needs_reconciliation() || recovery_record_is_discarded(&record)
+                    || (record.is_native_extraction()
+                        && record.lifecycle == DurableFileTaskLifecycle::Completed) =>
             {
                 match classify_recovery_surface(&path, &record) {
                     Ok(availability) => Some(RecoverySurfaceRecord {
@@ -1845,7 +2030,8 @@ fn pending_journals_from_surfaces(
         .filter(|surface| surface.availability == RecoverySurfaceAvailability::Recoverable)
         .filter_map(|surface| {
             let record = surface.record.as_ref()?;
-            (record.needs_reconciliation() && !recovery_record_is_discard_cleanup(record))
+            (record.needs_reconciliation() && !recovery_record_is_discard_cleanup(record)
+                && !record.is_native_extraction())
                 .then_some((surface.journal_path.clone(), record.clone()))
         })
         .collect::<Vec<_>>();
@@ -2216,6 +2402,16 @@ pub fn startup_file_task_recovery_inventory() -> StartupFileTaskRecoveryInventor
     inventory
 }
 
+/// A native extraction completed while the UI was closed leaves a retained
+/// result in Recovery. It is inspectable, but must not reserve the serial
+/// file-task slot or stop unrelated copy/move work.
+pub fn recovery_reservation_count(records: &[RecoverySurfaceRecord]) -> usize {
+    records.iter().filter(|entry| {
+        !entry.record.as_ref().is_some_and(|record| record.is_native_extraction()
+            && record.lifecycle == DurableFileTaskLifecycle::Completed)
+    }).count()
+}
+
 /// Load every recoverable interrupted job in oldest-to-newest journal order.
 pub fn startup_file_task_recoveries() -> Vec<StartupFileTaskRecovery> {
     startup_file_task_recovery_inventory().recoveries
@@ -2291,6 +2487,91 @@ pub(crate) fn file_task_path_admission(
     Ok(FileTaskPathAdmission {
         claims,
         admitted_mappings,
+    })
+}
+
+/// A native extraction reads a disc but only writes its planned output files.
+/// Keep one logical mapping for the detached helper / recovery identity, while
+/// the durable lease claims each real output (including CUE and log) exactly.
+/// In particular, do not claim the whole destination folder: other file tasks
+/// must be able to write unrelated siblings there.
+fn native_extraction_path_admission(
+    mappings: &[tui_file_picker::PasteMapping],
+    job: &serde_json::Value,
+) -> Result<FileTaskPathAdmission, String> {
+    let mapping = mappings
+        .first()
+        .ok_or("native extraction has no source mapping")?;
+    if mappings.len() != 1 {
+        return Err("native extraction must have one logical source and destination".into());
+    }
+    let native: crate::convert::pipeline::native_extract::NativeExtractionJob =
+        serde_json::from_value(
+            job.get("native_extraction")
+                .cloned()
+                .ok_or("native extraction job is missing its selection")?,
+        )
+        .map_err(|error| format!("decode native extraction for path admission: {error}"))?;
+    if native.source != mapping.source || native.destination != mapping.destination {
+        return Err(
+            "native extraction journal endpoints differ from its selected source/destination".into(),
+        );
+    }
+
+    let source_scope = if native.source.is_dir() {
+        ClaimScope::Subtree
+    } else {
+        ClaimScope::Exact
+    };
+    let source = PathClaim::resolve_with_semantics(
+        &native.source,
+        ClaimMode::Read,
+        source_scope,
+        PathResolutionSemantics::FollowReferent,
+    )?;
+    let mut claims = vec![source.clone()];
+    let mut planned = std::collections::BTreeSet::new();
+    for program in &native.programs {
+        if native.file_per_program {
+            let media =
+                crate::convert::pipeline::native_extract::proposed_destination_for_program(
+                    &native, program,
+                );
+            if native.cue {
+                planned.insert(media.with_extension("cue"));
+            }
+            planned.insert(media);
+        } else {
+            for track in &program.tracks {
+                planned.insert(crate::convert::pipeline::native_extract::proposed_destination(
+                    &native, program, track,
+                ));
+            }
+        }
+    }
+    for log in crate::convert::pipeline::native_extract::native_log_targets(&native) {
+        planned.insert(log);
+    }
+    if planned.is_empty() {
+        return Err("native extraction has no output files to reserve".into());
+    }
+    for output in planned {
+        claims.push(PathClaim::resolve_with_semantics(
+            &output,
+            ClaimMode::Write,
+            ClaimScope::Exact,
+            PathResolutionSemantics::NamespaceObject,
+        )?);
+    }
+    let resolved_root = crate::concurrency::ResolvedPathIdentity::resolve(&native.destination)?;
+    Ok(FileTaskPathAdmission {
+        // The detached worker's logical mapping is unchanged: reservation
+        // scope comes only from the independently admitted path claims.
+        admitted_mappings: vec![tui_file_picker::PasteMapping {
+            source: source.identity.resolved_io_path.clone(),
+            destination: resolved_root.resolved_io_path,
+        }],
+        claims,
     })
 }
 
@@ -2763,6 +3044,156 @@ fn sync_directory_best_effort(_path: &Path) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn native_reservation_fixture(source: &Path, dest: &Path) ->
+        crate::convert::pipeline::native_extract::NativeExtractionJob
+    {
+        use crate::convert::pipeline::native_extract::{
+            NativeExtractionJob, NativeProgramChoice, NativeTrackChoice,
+            NativeTagValues, NativeWavContainer, NativeOverwritePolicy, NativeTagSource,
+        };
+        NativeExtractionJob { disc_identity: Default::default(),
+            source:source.to_path_buf(),format:crate::disc::DiscFormat::Sacd,
+            programs:vec![NativeProgramChoice {
+                id:crate::disc::PresentationId::SacdArea(crate::disc::SacdAreaId::Stereo),
+                angle:1,label:"Stereo".into(),keep_dst:false,
+                tracks:vec![NativeTrackChoice { duration_secs: None,
+                    number:1,name:"one".into(),tags:NativeTagValues::default(),
+                    estimated_bytes:Some(100_000),
+                }],
+                source_depth:Some(1),source_channels:Some(2),source_rate:Some(2_822_400),
+                source_layout:None,is_lossless:true,tags:NativeTagValues::default(),authored_tags:None,
+            }],
+            destination:dest.to_path_buf(),working_root:dest.to_path_buf(),
+            wav_container:NativeWavContainer::Automatic,assume_decrypted:false,
+            downmix:crate::convert::pipeline::DvdaDownmixPolicy::None,
+            naming_template:"{track} - {title}".into(),program_subfolders:false,
+            overwrite_policy:NativeOverwritePolicy::Fail,extraction_log:true, program_log_paths: Vec::new(), round4_layout: false,
+            file_per_program:false,cue:false,transfer_tags:false,
+            sacd_dff: false, tag_source:NativeTagSource::DiscAndSidecar,tag_fields:0,tag_artwork:false,
+        }
+    }
+
+    #[test]
+    fn native_reservation_covers_only_planned_files_and_not_destination_subtree() {
+        let temp=tempfile::tempdir().unwrap();
+        let source=temp.path().join("disc.iso");
+        fs::write(&source,b"disc").unwrap();
+        let dest=temp.path().join("output");
+        fs::create_dir_all(&dest).unwrap();
+        let job=native_reservation_fixture(&source,&dest);
+        let mapping=tui_file_picker::PasteMapping {
+            source:source.clone(),destination:dest.clone(),
+        };
+        let admitted=native_extraction_path_admission(&[mapping],
+            &serde_json::json!({"native_extraction":job.clone()})).unwrap();
+        let audio=crate::convert::pipeline::native_extract::proposed_destination(
+            &job,&job.programs[0],&job.programs[0].tracks[0]);
+        assert_eq!(admitted.claims.len(),3); // source, audio, log
+        assert_eq!(admitted.admitted_mappings.len(),1);
+        let writes=admitted.claims.iter()
+            .filter(|claim|claim.mode==ClaimMode::Write).collect::<Vec<_>>();
+        assert_eq!(writes.len(),2);
+        assert!(writes.iter().all(|claim|claim.scope==ClaimScope::Exact));
+        assert!(writes.iter().any(|claim|claim.identity.resolved_io_path==audio));
+        assert!(writes.iter().any(|claim|claim.identity.resolved_io_path==dest.join(crate::convert::pipeline::native_extract::EXTRACTION_LOG_FILE)));
+        let unrelated=PathClaim::resolve_with_semantics(
+            &dest.join("unrelated-old-job"),ClaimMode::Write,ClaimScope::Subtree,
+            PathResolutionSemantics::NamespaceObject).unwrap();
+        assert!(admitted.claims.iter().all(|claim|!claim.conflicts_with(&unrelated)),
+            "unrelated work under the same destination must be admitted");
+        let same_audio=PathClaim::resolve_with_semantics(
+            &audio,ClaimMode::Write,ClaimScope::Exact,
+            PathResolutionSemantics::NamespaceObject).unwrap();
+        assert!(writes.iter().any(|claim|claim.conflicts_with(&same_audio)));
+    }
+
+    #[test]
+    fn continuous_native_reservation_includes_cue_and_log_without_folder_claim() {
+        let temp=tempfile::tempdir().unwrap();
+        let source=temp.path().join("dvd.iso");
+        fs::write(&source,b"disc").unwrap();
+        let dest=temp.path().join("output");
+        fs::create_dir_all(&dest).unwrap();
+        let mut job=native_reservation_fixture(&source,&dest);
+        job.format=crate::disc::DiscFormat::DvdAudio;
+        job.file_per_program=true;
+        job.cue=true;
+        let media=crate::convert::pipeline::native_extract::proposed_destination_for_program(
+            &job,&job.programs[0]);
+        let admitted=native_extraction_path_admission(&[tui_file_picker::PasteMapping {
+            source,destination:dest.clone(),
+        }],&serde_json::json!({"native_extraction":job})).unwrap();
+        let targets=admitted.claims.iter().filter(|claim|claim.mode==ClaimMode::Write)
+            .map(|claim|claim.identity.resolved_io_path.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(targets, [media.clone(),media.with_extension("cue"),
+            dest.join(crate::convert::pipeline::native_extract::EXTRACTION_LOG_FILE)].into_iter().collect());
+        assert!(admitted.claims.iter().filter(|claim|claim.mode==ClaimMode::Write)
+            .all(|claim|claim.scope==ClaimScope::Exact));
+    }
+
+    #[test]
+    fn native_skips_and_prepared_cues_survive_journal_replay_and_new_generation() {
+        let _lock = test_environment_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let _environment = JournalDirGuard::install(&temp.path().join("journals"));
+        let source = temp.path().join("disc.iso");
+        let dest = temp.path().join("output");
+        fs::write(&source, b"native media fixture").unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        let mapping = tui_file_picker::PasteMapping { source, destination: dest.clone() };
+        let selected=native_reservation_fixture(&mapping.source,&dest);
+        let job = serde_json::json!({
+            "native_extraction": selected,
+            "dest": dest.to_string_lossy(),
+        });
+        let first = FileTaskJournalHandle::create(
+            uuid::Uuid::new_v4().to_string(), 1, 21, false,
+            tui_file_picker::VerificationMode::Standard, 600,
+            vec![mapping.clone()], None, job.clone(),
+        ).unwrap();
+        let skipped = NativeSkippedSelection {
+            presentation: crate::disc::PresentationId::SacdArea(crate::disc::SacdAreaId::Stereo),
+            angle: 1, track_number: Some(1), reason: None,
+        };
+        let cue = dest.join("continuous.cue");
+        first.record_native_skipped(&skipped).unwrap();
+        first.record_native_skipped(&skipped).unwrap();
+        first.record_native_prepared_cue(&cue,
+            "FILE \"continuous.wav\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n").unwrap();
+        first.record_native_published(&dest.join("continuous.wav")).unwrap();
+        let failure = crate::convert::pipeline::native_extract::NativeUnfinishedOutput {
+            destination: dest.join("continuous.cue"),
+            reason: "interrupted CUE publication".into(), cancelled: true,
+        };
+        first.record_native_unfinished(&failure).unwrap();
+        first.record_native_log_sha256("0123456789abcdef").unwrap();
+        let program_log=dest.join("Stereo/extraction.log");
+        first.record_native_program_log(&program_log,"fedcba9876543210").unwrap();
+        let path = first.path().to_path_buf();
+        let current = load_record(&path).unwrap();
+        assert_eq!(current.native_skipped_selections, vec![skipped.clone()]);
+        assert_eq!(current.native_prepared_cues.len(), 1);
+        assert_eq!(current.native_prepared_cues[0].destination, cue);
+        assert!(current.native_prepared_cues[0].content.contains("INDEX 01"));
+        assert_eq!(current.native_unfinished_outputs, vec![failure.clone()]);
+        assert_eq!(current.native_log_sha256.as_deref(), Some("0123456789abcdef"));
+        assert_eq!(current.native_log_digests.get(&program_log).map(String::as_str),
+            Some("fedcba9876543210"));
+        drop(first); // simulate a helper exiting before it finished the CUE
+        let second = FileTaskJournalHandle::resume(path, 2, 22, false,
+            tui_file_picker::VerificationMode::Standard, 600,
+            vec![mapping], None, job).unwrap();
+        let recovered = second.load().unwrap();
+        assert_eq!(recovered.native_skipped_selections, vec![skipped]);
+        assert_eq!(recovered.native_prepared_cues.len(), 1);
+        assert_eq!(recovered.native_published_paths.len(), 1);
+        assert_eq!(recovered.native_unfinished_outputs, vec![failure]);
+        assert_eq!(recovered.native_log_sha256.as_deref(), Some("0123456789abcdef"));
+        assert_eq!(recovered.native_log_digests.get(&program_log).map(String::as_str),
+            Some("fedcba9876543210"));
+    }
 
     struct JournalDirGuard {
         _concurrency: crate::concurrency::ScopedTestCoordinationRootGuard,

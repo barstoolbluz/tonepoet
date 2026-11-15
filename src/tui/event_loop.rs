@@ -903,9 +903,9 @@ fn defer_quit_for_queued_file_transfers(app: &mut AppState) -> bool {
     let mut consequences = Vec::new();
     if unjournaled_count > 0 {
         let transfer_grammar = if unjournaled_count == 1 {
-            "transfer has"
+            "file task has"
         } else {
-            "transfers have"
+            "file tasks have"
         };
         consequences.push(format!(
             "{unjournaled_count} unstarted {transfer_grammar} no journal and will be lost.",
@@ -913,7 +913,7 @@ fn defer_quit_for_queued_file_transfers(app: &mut AppState) -> bool {
     }
     if journal_backed_count > 0 {
         consequences.push(format!(
-            "{journal_backed_count} journal-backed recovery transfer{} will leave the current in-memory queue but remain pending for the next startup.",
+            "{journal_backed_count} journal-backed recovery task{} will leave the current in-memory queue but remain pending for the next startup.",
             if journal_backed_count == 1 { "" } else { "s" },
         ));
     }
@@ -921,7 +921,7 @@ fn defer_quit_for_queued_file_transfers(app: &mut AppState) -> bool {
         (true, true) => {
             "Y discards the unjournaled work, defers the journal-backed recovery work, and quits."
         }
-        (true, false) => "Y discards the queued transfers and quits.",
+        (true, false) => "Y discards the queued file tasks and quits.",
         (false, true) => {
             "Y clears the in-memory recovery queue and quits; the journals remain pending for startup recovery."
         }
@@ -929,9 +929,9 @@ fn defer_quit_for_queued_file_transfers(app: &mut AppState) -> bool {
     };
     app.active_overlay = ActiveOverlay::Confirmation {
         message: format!(
-            "Quit with {queued_count} queued file transfer{}?
+            "Quit with {queued_count} queued file task{}?
 
-The running transfer, if any, has journal protection. {}
+The running file task, if any, has journal protection. {}
 
 {confirm_verb} N/Esc keeps the queue and returns to the app.",
             if queued_count == 1 { "" } else { "s" },
@@ -943,8 +943,8 @@ The running transfer, if any, has journal protection. {}
         },
     };
     app.set_status(match (unjournaled_count > 0, journal_backed_count > 0) {
-        (true, true) => "Quit requires confirmation: unjournaled queued transfers will be lost; journal-backed recoveries remain pending",
-        (true, false) => "Quit requires confirmation because unjournaled queued file transfers are not persisted",
+        (true, true) => "Quit requires confirmation: unjournaled queued file tasks will be lost; journal-backed recoveries remain pending",
+        (true, false) => "Quit requires confirmation because unjournaled queued file tasks are not persisted",
         (false, true) => "Quit requires confirmation; journal-backed recoveries will be deferred to the next startup",
         (false, false) => unreachable!("non-empty queue must have a classified entry"),
     });
@@ -1955,6 +1955,30 @@ fn reduce_file_picker_complete(
                 tx,
             );
         }
+        super::app::FilePickerPurpose::NativeExtractDestination { probe_id } => {
+            if !close_matching_file_picker(app, session_id, &purpose) {
+                app.set_status("file picker: ignored stale extraction destination");
+                return false;
+            }
+            if let Some(mut state) = app.pending_disc_extract_picker.take() {
+                if state.probe_id != probe_id {
+                    state.probe_cancel.cancel();
+                    app.set_status("discarded obsolete extraction destination selection");
+                } else {
+                    let message = match path {
+                        Some(ref path) if path.is_dir() => {
+                            state.destination = path.clone();
+                            state.refresh_destination_feedback();
+                            format!("extraction destination: {}", path.display())
+                        }
+                        Some(path) => format!("not a directory: {}", path.display()),
+                        None => "extraction destination unchanged".to_string(),
+                    };
+                    app.active_overlay = ActiveOverlay::DiscBrowser(state);
+                    app.set_status(message);
+                }
+            }
+        }
         super::app::FilePickerPurpose::SelectDestination => {
             if !close_matching_file_picker(app, session_id, &purpose) {
                 app.set_status("file picker: ignored stale destination completion");
@@ -2073,6 +2097,14 @@ fn reduce_file_task_progress(
     update: tui_file_picker::FileTaskProgressUpdate,
     tx: &mpsc::Sender<AppMessage>,
 ) {
+    // A single status line cannot contain two complete paths and recovery
+    // advice. Open the existing wrapped, scrollable file-task details view
+    // for reservation refusals; the full diagnostic stays in `status`.
+    let full_reservation_refusal = matches!(
+        &update,
+        tui_file_picker::FileTaskProgressUpdate::Failed { status, .. }
+            if status.contains("filesystem mutation conflicts with recovery reservation")
+    );
     let retained_update = update.clone();
     let terminal = matches!(
         &update,
@@ -2130,6 +2162,9 @@ fn reduce_file_task_progress(
             .as_deref_mut()
         {
             session.progress.apply_update(update.clone());
+            if full_reservation_refusal {
+                session.progress.open_details();
+            }
             live_progress_snapshot = Some(session.progress.clone());
             status_to_set = status.clone();
             refresh_after_terminal = terminal;
@@ -2163,6 +2198,9 @@ fn reduce_file_task_progress(
     {
         if let Some(session) = app.minimized_file_task_progress.as_mut() {
             session.progress.apply_update(update.clone());
+            if full_reservation_refusal {
+                session.progress.open_details();
+            }
             live_progress_snapshot = Some(session.progress.clone());
             status_to_set = status.clone();
             refresh_after_terminal = terminal;
@@ -2198,6 +2236,9 @@ fn reduce_file_task_progress(
             app.file_task_preempted_overlay.as_deref_mut()
         {
             session.progress.apply_update(update.clone());
+            if full_reservation_refusal {
+                session.progress.open_details();
+            }
             live_progress_snapshot = Some(session.progress.clone());
             status_to_set = status.clone();
             refresh_after_terminal = terminal;
@@ -2215,6 +2256,9 @@ fn reduce_file_task_progress(
                 if session.session_id == session_id && session.is_live_task() =>
             {
                 session.progress.apply_update(update.clone());
+                if full_reservation_refusal {
+                    session.progress.open_details();
+                }
                 live_progress_snapshot = Some(session.progress.clone());
                 status_to_set = status;
                 refresh_after_terminal = terminal;
@@ -2225,6 +2269,9 @@ fn reduce_file_task_progress(
                 // Keep an open read-only viewer current for the same underlying
                 // task, but never use its clone as ordering or retention authority.
                 session.progress.apply_update(update.clone());
+                if full_reservation_refusal {
+                    session.progress.open_details();
+                }
                 if !update_is_stale {
                     status_to_set = status;
                     refresh_after_terminal = terminal;
@@ -2266,6 +2313,9 @@ fn reduce_file_task_progress(
         match &mut app.last_file_task_progress {
             Some((retained_session_id, retained)) if *retained_session_id == session_id => {
                 retained.apply_update(retained_update.clone());
+                if full_reservation_refusal {
+                    retained.open_details();
+                }
             }
             Some((retained_session_id, _)) if *retained_session_id > session_id => {
                 // A late update from an older task must not displace the newer
@@ -2288,11 +2338,21 @@ fn reduce_file_task_progress(
                 super::keybindings::file_picker_theme_from_theme(&app.theme),
             );
             retained.apply_update(retained_update);
+            if full_reservation_refusal {
+                retained.open_details();
+            }
             app.last_file_task_progress = Some((session_id, retained));
         }
     }
     if let Some(status) = status_to_set {
-        app.set_status(status);
+        if full_reservation_refusal {
+            // Do not replace the native extraction progress dialog with the
+            // generic Recovery surface: it would hide the full path pair.
+            // The wrapped details view was opened on the failed snapshot.
+            app.set_status("Extraction output reservation conflict: full paths and recovery advice are in the file-task details dialog");
+        } else {
+            app.set_status(status);
+        }
     }
     let defer_clipboard_refresh = terminal
         && (app
@@ -7454,6 +7514,31 @@ mod artwork_cache_clear_completion_tests {
 
 pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sender<AppMessage>) {
     match msg {
+        AppMessage::NativeExtractComplete { session_id, result } => {
+            // Native extraction owns the same serial slot as copy/move. A
+            // clean result advances the FIFO, whereas an interrupted task
+            // retains its progress and blocks the next job for attention.
+            if app.file_transfers.active_session_id == Some(session_id) {
+                let requires_attention = match result {
+                    Ok(report) => {
+                        app.set_status(format!(
+                            "Extraction complete: {} files published, {} skipped",
+                            report.published.len(), report.skipped,
+                        ));
+                        false
+                    }
+                    Err(error) => {
+                        if error.contains("filesystem mutation conflicts with recovery reservation") {
+                            app.set_status("Extraction was refused: the complete conflicting paths and recovery advice are shown in file-task details");
+                        } else {
+                            app.set_status(format!("Extraction ended: {error}"));
+                        }
+                        true
+                    }
+                };
+                finalize_file_transfer_scheduler(app, session_id, requires_attention, tx);
+            }
+        }
         AppMessage::ArtworkCacheClearComplete { clear_id, result } => {
             if let Some(status) = artwork_cache_clear_completion_status(
                 app.browse_artwork.latest_clear_id(), clear_id, result,
@@ -8655,6 +8740,33 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             }
             super::context_menu::refresh_open_browse_entry_menu(app);
         }
+        AppMessage::DiscExtractProbeComplete { path, probe_id, program_index, result } => {
+            let state = match &mut app.active_overlay {
+                crate::tui::app::ActiveOverlay::DiscBrowser(state) => Some(state.as_mut()),
+                _ => app.pending_disc_extract_picker.as_deref_mut(),
+            };
+            if let Some(state) = state {
+                if state.probe_id == probe_id && state.source_path == path {
+                    if result.is_err() && program_index < state.selected.len() {
+                        // A failed stream can still be sent to Convert, but it
+                        // must not remain checked for native extraction.
+                        state.selected[program_index] = false;
+                    }
+                    if let Ok(facts) = &result {
+                        if let Some(presentation) = state.contents.presentations.get_mut(program_index) {
+                            // Only observed values change the display/source facts. Do not
+                            // turn a count-derived layout label into a speaker assignment.
+                            if let Some(depth) = facts.bit_depth { presentation.format.bit_depth = Some(depth); }
+                            if let Some(rate) = facts.sample_rate { presentation.format.sample_rate = Some(rate); }
+                            if let Some(channels) = facts.channels { presentation.format.channels = Some(channels); }
+                        }
+                    }
+                    if let Some(slot) = state.probe_statuses.get_mut(program_index) {
+                        *slot = Some(result);
+                    }
+                }
+            }
+        }
         AppMessage::DiscProbeComplete { path, fingerprint, result } => {
             if !app.browse.complete_disc_probe(&path) {
                 return;
@@ -8665,6 +8777,13 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                         .map(|current| current == fingerprint)
                         .unwrap_or(false)
                     {
+                        if let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay {
+                            if state.tag_refresh_pending && state.source_path == path {
+                                if let Err(error) = state.accept_refreshed_tag_contents(contents.clone()) {
+                                    app.set_status(error);
+                                }
+                            }
+                        }
                         app.browse.disc_probe_cache.insert(
                             path.clone(),
                             crate::tui::disc_browser::DiscProbeCacheEntry::from_success(fingerprint, contents),
@@ -8673,7 +8792,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                             app.browse.deferred_work.info_pane_changed = true;
                         }
                         if let Some(followup) = app.browse.disc_probe_followup.remove(&path) {
-                            super::disc_browser_actions::handle_disc_probe_followup(app, &path, followup);
+                            super::disc_browser_actions::handle_disc_probe_followup(app, &path, followup, tx);
                         }
                     } else {
                         log::debug!(
@@ -8684,6 +8803,13 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                     }
                 }
                 (Some(fingerprint), Err(error)) => {
+                    if let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay {
+                        if state.tag_refresh_pending && state.source_path == path {
+                            state.tag_refresh_pending=false;
+                            state.tag_refresh_failed=true;
+                            app.set_status(format!("Saved tags could not be refreshed: {error}"));
+                        }
+                    }
                     if crate::tui::disc_browser::disc_probe_fingerprint(&path)
                         .map(|current| current == fingerprint)
                         .unwrap_or(false)
@@ -8705,6 +8831,13 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                     app.browse.disc_probe_followup.remove(&path);
                 }
                 (None, Err(error)) => {
+                    if let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay {
+                        if state.tag_refresh_pending && state.source_path == path {
+                            state.tag_refresh_pending=false;
+                            state.tag_refresh_failed=true;
+                            app.set_status(format!("Saved tags could not be refreshed: {error}"));
+                        }
+                    }
                     app.browse.disc_probe_cache.remove(&path);
                     app.browse.disc_probe_followup.remove(&path);
                     if app.browse.current_selected_disc_source_matches(&path) {
@@ -8717,6 +8850,13 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                     }
                 }
                 (None, Ok(contents)) => {
+                    if let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay {
+                        if state.tag_refresh_pending && state.source_path == path {
+                            if let Err(error) = state.accept_refreshed_tag_contents(contents.clone()) {
+                                app.set_status(error);
+                            }
+                        }
+                    }
                     if let Ok(fingerprint) = crate::tui::disc_browser::disc_probe_fingerprint(&path) {
                         app.browse.disc_probe_cache.insert(
                             path.clone(),
@@ -10366,6 +10506,12 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                     }
                     if !summary.saved_paths.is_empty() {
                         taken.state.mark_archive_staging_dirty();
+                        if taken.state.return_to_extract.is_some() {
+                            taken.state.extract_tags_saved = true;
+                            if summary.all_saved() && taken.state.extract_mb_populated {
+                                taken.state.extract_mb_saved = true;
+                            }
+                        }
                     }
                     if let Some(refresh) = refreshed_entries {
                         match refresh {
@@ -10457,7 +10603,10 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                                 }
                             }
                             None => {
-                                app.browse.probe_current_with_db(tx, Some(&app.db));
+                                if !super::disc_browser_actions::restore_extract_after_tag_editor(
+                                    app, &mut taken.state, tx) {
+                                    app.browse.probe_current_with_db(tx, Some(&app.db));
+                                }
                                 app.set_status(summary.status_line());
                             }
                         }
@@ -12202,7 +12351,8 @@ mod browse_bracketed_paste_tests {
 
         handle_paste(&mut app, &current.display().to_string(), &test_tx());
 
-        let queued = app.file_transfers.queued.front().expect("queued paste");
+        let queued = app.file_transfers.queued.front().expect("queued paste")
+            .transfer().expect("clipboard transfer");
         assert_eq!(queued.destination_dir, destination);
         assert_eq!(queued.clipboard.paths(), std::slice::from_ref(&current));
         assert_eq!(queued.clipboard.mode(), tui_file_picker::FilePickerClipboardMode::Copy);
@@ -12247,7 +12397,8 @@ mod browse_bracketed_paste_tests {
             &tx,
         );
 
-        let queued = app.file_transfers.queued.front().expect("queued paste");
+        let queued = app.file_transfers.queued.front().expect("queued paste")
+            .transfer().expect("clipboard transfer");
         assert_eq!(queued.destination_dir, captured_destination);
         assert_eq!(queued.clipboard.paths(), std::slice::from_ref(&source));
     }
@@ -15641,7 +15792,7 @@ mod sentinel_clamp_status_tests {
             enqueue_plan: plan.clone(),
             retry_plan: Some(crate::tui::browse::BrowsePasteRetryPlan::from_plan(plan)),
             recovered: false,
-        });
+        }.into());
         let progress = tui_file_picker::FileTaskProgressState::new(
             tui_file_picker::FileTaskKind::Copy,
             "Copying files",
@@ -15754,16 +15905,16 @@ mod sentinel_clamp_status_tests {
                 enqueue_plan: plan,
                 retry_plan: Some(retry),
                 recovered: queue_id == 52,
-            });
+            }.into());
         }
 
         assert!(defer_quit_for_queued_file_transfers(&mut app));
         let ActiveOverlay::Confirmation { message, action } = &app.active_overlay else {
             panic!("mixed queue must open a quit confirmation");
         };
-        assert!(message.contains("1 unstarted transfer has no journal and will be lost"));
+        assert!(message.contains("1 unstarted file task has no journal and will be lost"));
         assert!(message.contains(
-            "1 journal-backed recovery transfer will leave the current in-memory queue but remain pending for the next startup"
+            "1 journal-backed recovery task will leave the current in-memory queue but remain pending for the next startup"
         ));
         assert!(matches!(
             action,
@@ -15803,7 +15954,7 @@ mod sentinel_clamp_status_tests {
             enqueue_plan: plan,
             retry_plan: Some(retry),
             recovered: true,
-        });
+        }.into());
 
         assert!(defer_quit_for_queued_file_transfers(&mut app));
         let ActiveOverlay::Confirmation { message, action } = &app.active_overlay else {
@@ -17080,7 +17231,7 @@ mod browse_archive_quit_lifecycle_tests {
             enqueue_plan: plan.clone(),
             retry_plan: Some(crate::tui::browse::BrowsePasteRetryPlan::from_plan(plan)),
             recovered: false,
-        });
+        }.into());
         app.sync_file_transfer_queue_surfaces();
     }
 
@@ -21707,6 +21858,70 @@ mod async_message_drain_tests {
     }
 
     #[test]
+    fn native_reservation_failure_opens_full_scrollable_file_task_details() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let progress = tui_file_picker::FileTaskProgressState::new(
+            tui_file_picker::FileTaskKind::Extract,
+            "Extracting disc audio",
+            super::super::keybindings::file_picker_theme_from_theme(&app.theme),
+        );
+        let (control_tx, _control_rx) = std::sync::mpsc::channel();
+        let session = super::super::app::FileTaskProgressSession::new(progress, control_tx);
+        let session_id = session.session_id;
+        app.install_file_task_progress(session);
+        let (tx, _rx) = mpsc::channel(8);
+        let complete_error = format!(
+            "filesystem mutation conflicts with recovery reservation: requested '{}' overlaps reserved '{}'; retry after TonePoet finishes interrupted-operation recovery",
+            "/home/user/temp/new/audio-output.dsf",
+            "/home/user/temp/other-operation/published-track.flac",
+        );
+        reduce_file_task_progress(
+            &mut app,
+            session_id,
+            tui_file_picker::FileTaskProgressUpdate::Failed {
+                status: complete_error.clone(),
+                totals: tui_file_picker::ProgressTotals {
+                    errors: 1,
+                    ..tui_file_picker::ProgressTotals::default()
+                },
+            },
+            &tx,
+        );
+        let (_, retained) = app.last_file_task_progress.as_ref().unwrap();
+        assert_eq!(retained.status, complete_error);
+        assert_eq!(app.status_message.as_ref().map(|(text, _)| text.as_str()),
+            Some("Extraction output reservation conflict: full paths and recovery advice are in the file-task details dialog"));
+        let ActiveOverlay::FileTaskProgress(session) = &mut app.active_overlay else {
+            panic!("the failed task must retain its visible progress overlay");
+        };
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        terminal.draw(|frame| {
+            session.progress.render(frame, ratatui::layout::Rect::new(0, 0, 120, 24));
+        }).unwrap();
+        let buffer = terminal.backend().buffer();
+        let first_screen = (0..24).map(|row| {
+            (0..120).map(|col| buffer.get(col, row).symbol().to_owned())
+                .collect::<String>()
+        }).collect::<Vec<_>>().join("\n");
+        assert!(first_screen.contains("File task details"), "{first_screen}");
+        assert!(first_screen.contains("requested"), "{first_screen}");
+        // A full error is retained; wrapping is allowed to split a word at
+        // the terminal's edge. Do not require one unbroken screen substring.
+        let unwrapped=first_screen.chars()
+            .filter(|ch|!ch.is_whitespace() && !matches!(ch,'│'|'├'|'┤'|'┌'|'┐'|'─'|'└'|'┘'))
+            .collect::<String>();
+        assert!(unwrapped.contains("overlapsreserved"), "{first_screen}");
+        assert!(retained.status.contains("overlaps reserved"));
+        // The Details overlay must have intact rails on content rows too.
+        for y in 1..21 {
+            assert_eq!(buffer.get(0,y).symbol(),"│", "missing left rail at row {y}");
+            assert_eq!(buffer.get(119,y).symbol(),"│", "missing right rail at row {y}");
+        }
+    }
+
+    #[test]
     fn terminal_progress_without_any_overlay_or_seed_still_becomes_reopenable() {
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.active_overlay = ActiveOverlay::None;
@@ -22774,7 +22989,7 @@ mod minimized_file_transfer_attention_tests {
             enqueue_plan: plan.clone(),
             retry_plan: Some(crate::tui::browse::BrowsePasteRetryPlan::from_plan(plan)),
             recovered: false,
-        });
+        }.into());
         app.sync_file_transfer_queue_surfaces();
 
         let footer = app.file_task_footer_state().expect("live footer");
@@ -22862,7 +23077,7 @@ mod minimized_file_transfer_attention_tests {
             enqueue_plan: plan.clone(),
             retry_plan: Some(crate::tui::browse::BrowsePasteRetryPlan::from_plan(plan)),
             recovered: false,
-        });
+        }.into());
         app.sync_file_transfer_queue_surfaces();
 
         let archive_progress = tui_file_picker::FileTaskProgressState::new(
@@ -23255,7 +23470,7 @@ mod minimized_file_transfer_attention_tests {
             enqueue_plan: plan.clone(),
             retry_plan: Some(crate::tui::browse::BrowsePasteRetryPlan::from_plan(plan)),
             recovered: false,
-        });
+        }.into());
         let (tx, _rx) = mpsc::channel(8);
 
         finalize_file_transfer_scheduler(&mut app, session_id, false, &tx);

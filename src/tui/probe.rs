@@ -18894,6 +18894,22 @@ fn read_artwork_metadata_for_projection(path: &std::path::Path) -> Result<Source
     if super::sacd::is_sacd_iso(path) {
         return read_metadata_sacd(path);
     }
+    // Untagged DSF is a valid native output. Lofty cannot identify it from
+    // its container alone. Summarize every existing ID3 picture before
+    // applying the replacement/removal; otherwise the UI loses unrelated
+    // picture types even though the native writer preserves them on disk.
+    if crate::dsf_tags::is_dsf(path) {
+        let (snapshot, artwork) = crate::dsf_tags::read_with_projected_artwork(
+            path,
+            |code, mime, bytes| artwork_info_from_image(
+                lofty::picture::PictureType::from_u8(code), mime, bytes,
+            ),
+        )?;
+        let mut metadata = source_metadata_from_dsf(&snapshot);
+        metadata.artwork = artwork;
+        sort_artwork_infos(&mut metadata.artwork);
+        return Ok(metadata);
+    }
 
     recover_metadata_before_read(path)?;
     let tagged = lofty::read_from_path(path)
@@ -19039,6 +19055,82 @@ pub fn recover_stale_flac_metadata_journals_in_dir(dir: &std::path::Path) -> Vec
     messages.extend(crate::dsf_tags::recover_stale_writes_in_directory(dir));
     messages.extend(recover_stale_ape_tail_journals_in_dir(dir));
     messages
+}
+
+#[cfg(test)]
+mod dsf_artwork_projection_tests {
+    use super::*;
+
+    fn disk_picture_data(path: &Path) -> Vec<(u8, Vec<u8>)> {
+        // Independent on-disk ID3 readback: do not reuse the UI projector.
+        let bytes = std::fs::read(path).expect("read DSF bytes");
+        let offset = u64::from_le_bytes(bytes[20..28].try_into().expect("DSF metadata pointer"));
+        assert!(offset > 0);
+        let tag = id3::Tag::read_from2(&mut std::io::Cursor::new(&bytes[offset as usize..]))
+            .expect("read DSF ID3 tag");
+        let mut pictures = tag.pictures()
+            .map(|pic| (u8::from(pic.picture_type), pic.data.clone()))
+            .collect::<Vec<_>>();
+        pictures.sort_by_key(|(kind, _)| *kind);
+        pictures
+    }
+
+    fn picture_types(metadata: &SourceMetadata) -> Vec<u8> {
+        metadata.artwork.iter().map(|art| art.picture_type.as_u8()).collect()
+    }
+
+    #[test]
+    fn fresh_untagged_dsf_artwork_and_unaffected_pictures_survive_edits() {
+        let _coordination = crate::concurrency::scoped_test_coordination_root();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("album.dsf");
+        crate::dsf_tags::write_test_dsf_fixture(&path, None).expect("untagged DSF fixture");
+        assert!(read_artwork_metadata_for_projection(&path)
+            .expect("read untagged DSF").artwork.is_empty());
+
+        let front = temp.path().join("front.png");
+        let replacement = temp.path().join("replacement.png");
+        let back = temp.path().join("back.png");
+        image::RgbaImage::from_pixel(2, 3, image::Rgba([10, 20, 30, 255]))
+            .save(&front).expect("write front PNG");
+        image::RgbaImage::from_pixel(5, 7, image::Rgba([40, 50, 60, 255]))
+            .save(&replacement).expect("write replacement PNG");
+        image::RgbaImage::from_pixel(3, 4, image::Rgba([70, 80, 90, 255]))
+            .save(&back).expect("write back PNG");
+        let paths = vec![path.clone()];
+
+        let added_front = write_artwork_to_files(&paths, &front,
+            lofty::picture::PictureType::CoverFront).expect("embed front cover");
+        assert_eq!(picture_types(&added_front.metadata[0]), vec![3],
+            "fresh, untagged DSF must project the first artwork");
+        let added_back = write_artwork_to_files(&paths, &back,
+            lofty::picture::PictureType::CoverBack).expect("embed back cover");
+        assert_eq!(picture_types(&added_back.metadata[0]), vec![3, 4]);
+        let before = disk_picture_data(&path);
+        assert_eq!(before.iter().map(|(kind, _)| *kind).collect::<Vec<_>>(), vec![3, 4]);
+
+        let replaced = write_artwork_to_files(&paths, &replacement,
+            lofty::picture::PictureType::CoverFront).expect("replace front cover");
+        assert_eq!(picture_types(&replaced.metadata[0]), vec![3, 4]);
+        let new_front = &replaced.metadata[0].artwork[0];
+        assert_eq!((new_front.width, new_front.height), (Some(5), Some(7)));
+        let kept_back = &replaced.metadata[0].artwork[1];
+        assert_eq!((kept_back.width, kept_back.height), (Some(3), Some(4)));
+        assert_eq!(kept_back.mime_type, "image/png");
+        assert_eq!(kept_back.data_size, std::fs::metadata(&back).unwrap().len() as usize);
+        let after = disk_picture_data(&path);
+        assert_eq!(after.iter().map(|(kind, _)| *kind).collect::<Vec<_>>(), vec![3, 4]);
+        assert_eq!(after[1].1, before[1].1, "the stored back picture must remain unchanged");
+        assert_ne!(after[0].1, before[0].1, "front picture must be replaced");
+
+        let removed = remove_artwork_from_files(&paths,
+            lofty::picture::PictureType::CoverBack).expect("remove back cover");
+        assert_eq!(picture_types(&removed.metadata[0]), vec![3],
+            "removal must keep the front picture visible");
+        assert_eq!(disk_picture_data(&path), vec![after[0].clone()],
+            "removal must keep the front picture on disk");
+        assert_eq!(picture_types(&read_artwork_metadata_for_projection(&path).unwrap()), vec![3]);
+    }
 }
 
 #[cfg(test)]

@@ -2020,11 +2020,26 @@ fn button_span(label: &str, style: ratatui::style::Style) -> Span<'static> {
     Span::styled(format!(" {label} "), style)
 }
 
-fn text_input_spans(
+pub fn text_input_spans(
     input: &crate::text_input::TextInputState,
     width: usize,
     text_style: Style,
     selection_style: Style,
+    show_caret: bool,
+) -> Vec<Span<'static>> {
+    text_input_spans_with_caret(input, width, text_style, selection_style,
+        selection_style, show_caret)
+}
+
+/// Render one shared input using independent selection and block-caret styles.
+/// This keeps cursor scrolling, UTF-8 boundaries and visible-range layout
+/// identical to Browse's existing text fields.
+pub fn text_input_spans_with_caret(
+    input: &crate::text_input::TextInputState,
+    width: usize,
+    text_style: Style,
+    selection_style: Style,
+    caret_style: Style,
     show_caret: bool,
 ) -> Vec<Span<'static>> {
     if width == 0 {
@@ -2044,11 +2059,9 @@ fn text_input_spans(
             .as_ref()
             .is_some_and(|range| absolute >= range.start && absolute < range.end);
         let caret = show_caret && absolute == input.cursor && selection.is_none();
-        let style = if selected || caret {
-            selection_style
-        } else {
-            text_style
-        };
+        let style = if selected { selection_style }
+            else if caret { caret_style }
+            else { text_style };
         if current_style.is_some_and(|existing| existing != style) {
             spans.push(Span::styled(visible[segment_start..offset].to_string(), current_style.unwrap()));
             segment_start = offset;
@@ -2063,7 +2076,7 @@ fn text_input_spans(
         ));
     }
     if show_caret && input.cursor == visible_end && selection.is_none() {
-        spans.push(Span::styled(" ", selection_style));
+        spans.push(Span::styled(" ", caret_style));
     }
     let caret_at_end = show_caret && input.cursor == visible_end && selection.is_none();
     let used = crate::display_width::width(visible)

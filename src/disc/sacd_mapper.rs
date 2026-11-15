@@ -58,12 +58,60 @@ pub fn map_sacd_disc(
                 .map(|d| d.year.to_string())
         });
 
+    // Retain distinct tag authorities, even though presentation labels prefer
+    // sidecar text. A user may reverse the precedence when extracting.
+    let toc = &metadata.master_toc;
+    let catalog = if !toc.disc_catalog_number.is_empty() { &toc.disc_catalog_number }
+        else { &toc.album_catalog_number };
+    let publisher = metadata.master_text.as_ref()
+        .and_then(|text| text.disc_publisher.as_ref().or(text.album_publisher.as_ref()))
+        .filter(|value| !value.trim().is_empty());
+    let authored_album_tags = DiscExtractTagFields {
+        catalog: (!catalog.trim().is_empty()).then(|| catalog.clone()),
+        publisher: publisher.cloned(),
+        album: metadata.album_title().map(str::to_string),
+        artist: metadata.album_artist().map(str::to_string),
+        genre: metadata.master_toc.disc_genres.first()
+            .or(metadata.master_toc.album_genres.first()).map(|genre|genre.name().to_string()),
+        year: metadata.master_toc.disc_date.as_ref().map(|date|date.year.to_string()),
+        ..Default::default()
+    };
+    let sidecar_album_tags = DiscExtractTagFields {
+        catalog: sidecar_first_track.and_then(|track|track.meta.get("CATALOGNUMBER")
+            .or_else(||track.meta.get("CATALOG"))).cloned(),
+        publisher: sidecar_first_track.and_then(|track|track.meta.get("PUBLISHER")
+            .or_else(||track.meta.get("LABEL"))).cloned(),
+        album: sidecar_first_track.and_then(|track|track.meta.get("ALBUM")).cloned(),
+        artist: sidecar_first_track.and_then(|track|track.meta.get("ARTIST")).cloned(),
+        genre: sidecar_first_track.and_then(|track|track.meta.get("GENRE")).cloned(),
+        year: sidecar_first_track.and_then(|track|track.meta.get("DATE")).cloned(),
+        ..Default::default()
+    };
     let mut presentations = Vec::new();
     let mut diagnostics = Vec::new();
+    let mut details = Vec::new();
+    if !catalog.is_empty() { details.push(format!("Catalog {catalog}")); }
+    if let Some(publisher) = publisher {
+        if !publisher.trim().is_empty() { details.push(format!("Publisher {publisher}")); }
+    }
+    if let Some(date) = toc.disc_date {
+        let text = if date.month == 0 { date.year.to_string() }
+            else if date.day == 0 { format!("{:04}-{:02}",date.year,date.month) }
+            else { format!("{:04}-{:02}-{:02}",date.year,date.month,date.day) };
+        details.push(format!("Date {text}"));
+    }
+    if toc.album_set_size > 1 && toc.album_sequence_number > 0 {
+        details.push(format!("Disc {} of {}",toc.album_sequence_number,toc.album_set_size));
+    }
+    if toc.disc_type_hybrid { details.push("Hybrid".into()); }
+    let sacd_header_details = (!details.is_empty()).then(|| details.join(" · "));
 
     // Map stereo area
     if let Some(area) = &metadata.stereo {
         let mut pres = map_area(area, AreaKind::Stereo, sidecar, 1, &mut diagnostics);
+        pres.extract.sacd_header_details = sacd_header_details.clone();
+        pres.extract.authored_album_tags = authored_album_tags.clone();
+        pres.extract.sidecar_album_tags = sidecar_album_tags.clone();
         pres.album_title = album_title.clone();
         pres.album_artist = album_artist.clone();
         pres.genre = genre.clone();
@@ -74,6 +122,9 @@ pub fn map_sacd_disc(
     // Map multichannel area
     if let Some(area) = &metadata.multi_channel {
         let mut pres = map_area(area, AreaKind::MultiChannel, sidecar, 2, &mut diagnostics);
+        pres.extract.sacd_header_details = sacd_header_details.clone();
+        pres.extract.authored_album_tags = authored_album_tags.clone();
+        pres.extract.sidecar_album_tags = sidecar_album_tags.clone();
         pres.album_title = album_title.clone();
         pres.album_artist = album_artist.clone();
         pres.genre = genre.clone();
@@ -132,6 +183,29 @@ fn map_area(
     // Resolve sidecar tracks for this area
     let sidecar_tracks = sidecar.map(|s| s.tracks_for_area(area_one_based));
 
+    let authored_track_tags: Vec<DiscExtractTagFields> = area.tracks.iter().map(|entry| {
+        DiscExtractTagFields {
+            title: entry.text.title.clone(),
+            artist: entry.text.performer.clone(),
+            performer: entry.text.performer.clone(),
+            composer: entry.text.composer.clone(),
+            genre: entry.genre.as_ref().map(|genre|genre.name().to_string()),
+            ..Default::default()
+        }
+    }).collect();
+    let sidecar_track_tags: Vec<DiscExtractTagFields> = area.tracks.iter().enumerate()
+        .map(|(i,_)| {
+            let metadata = sidecar_tracks.as_ref().and_then(|tracks| tracks.get(i));
+            let get = |key| metadata.and_then(|track|track.meta.get(key)).cloned();
+            DiscExtractTagFields {
+                title: get("TITLE"), artist: get("ARTIST"),
+                composer: get("COMPOSER"), performer: get("PERFORMER"),
+                genre: get("GENRE"), year: get("DATE"),
+                catalog: get("CATALOGNUMBER").or_else(||get("CATALOG")),
+                publisher: get("PUBLISHER").or_else(||get("LABEL")),
+                ..Default::default()
+            }
+        }).collect();
     // Map tracks
     let tracks: Vec<DiscTrack> = area
         .tracks
@@ -151,11 +225,17 @@ fn map_area(
                 .cloned()
                 .or_else(|| entry.text.performer.clone());
 
-            let format_note = if is_dst {
-                Some("DST encoded".to_string())
-            } else {
-                None
-            };
+            // Carry only fields that really exist in the SACD TOC/track text.
+            // The selection window displays these for the focused track;
+            // the DST flag stays available to the existing format selector.
+            let mut details = Vec::new();
+            if is_dst { details.push("DST encoded".to_string()); }
+            if let Some(isrc) = &entry.isrc { details.push(format!("ISRC {isrc}")); }
+            if let Some(composer) = &entry.text.composer { details.push(format!("Composer {composer}")); }
+            if let Some(songwriter) = &entry.text.songwriter { details.push(format!("Songwriter {songwriter}")); }
+            if let Some(arranger) = &entry.text.arranger { details.push(format!("Arranger {arranger}")); }
+            if let Some(genre) = &entry.genre { details.push(format!("Genre {}", genre.name())); }
+            let format_note = (!details.is_empty()).then(|| details.join(" · "));
 
             DiscTrack {
                 number: (i + 1) as u32,
@@ -186,6 +266,7 @@ fn map_area(
     }
 
     DiscPresentation {
+        extract: PresentationExtractInfo { authored_track_tags, sidecar_track_tags, ..Default::default() },
         id: pres_id,
         label,
         format,

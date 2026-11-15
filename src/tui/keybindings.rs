@@ -4174,6 +4174,7 @@ pub(super) fn current_focus_needs_generic_host_clipboard(app: &AppState) -> bool
             help_scroll: None,
         } => format_settings_text_input_owns_focus(kind, *focus),
         ActiveOverlay::BulkRename(state) => state.focus == super::app::BulkRenameFocus::Template,
+        ActiveOverlay::DiscBrowser(state) => state.editing_destination,
         ActiveOverlay::TemplateBuilder(state) => {
             state.focus == super::app::TemplateBuilderFocus::TemplateInput
         }
@@ -11536,13 +11537,21 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
         return;
     }
 
-    let overlay = app.active_overlay.clone();
+    // Native extraction parks a potentially large disc listing inside the
+    // shared naming popups. Move those two overlay variants instead of deep
+    // cloning the disc on every key press; other overlay dispatch is unchanged.
+    let overlay = if matches!(app.active_overlay,
+        ActiveOverlay::TemplateBuilder(_) | ActiveOverlay::TemplatePicker { .. }) {
+        std::mem::replace(&mut app.active_overlay, ActiveOverlay::None)
+    } else {
+        app.active_overlay.clone()
+    };
     match overlay {
         ActiveOverlay::FolderProperties(state) => {
             super::directory_properties::handle_key(app, *state, key, tx);
         }
         ActiveOverlay::DiscBrowser(_) => {
-            super::disc_browser_actions::handle_disc_browser_key(app, key);
+            super::disc_browser_actions::handle_disc_browser_key(app, key, tx);
         }
         ActiveOverlay::FilePicker(mut session) => {
             let session_id = session.session_id;
@@ -12871,26 +12880,16 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             match state.focus {
                 TemplateBuilderFocus::TemplateInput => match key.code {
                     KeyCode::Esc => {
-                        app.active_overlay = ActiveOverlay::None;
+                        close_shared_template(app, state.return_to_extract.take());
                     }
                     KeyCode::Tab => {
                         state.focus = TemplateBuilderFocus::SavedList;
                         app.active_overlay = ActiveOverlay::TemplateBuilder(state);
                     }
                     KeyCode::Enter => {
-                        // Apply: write template to the target field
                         let text = state.template_input.text.clone();
-                        match state.target {
-                            TemplateTarget::Folder => {
-                                app.convert.output_options.folder_template = text;
-                            }
-                            TemplateTarget::Filename => {
-                                app.convert.output_options.filename_template = text;
-                            }
-                        }
-                        app.preset.mark_modified();
-                        app.active_overlay = ActiveOverlay::None;
-                        app.set_status("Template applied");
+                        apply_shared_template(app, state.target, text,
+                            state.return_to_extract.take());
                     }
                     _ => {
                         super::text_input::handle_text_input_key(&mut state.template_input, &key);
@@ -12899,10 +12898,12 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 },
                 TemplateBuilderFocus::SavedList => match key.code {
                     KeyCode::Esc => {
-                        app.active_overlay = ActiveOverlay::None;
+                        close_shared_template(app, state.return_to_extract.take());
                     }
                     KeyCode::Tab => {
                         state.focus = TemplateBuilderFocus::TokenGrid;
+                        let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
+                        state.reveal_grid_cursor(ratatui::layout::Rect::new(0, 0, w, h));
                         app.active_overlay = ActiveOverlay::TemplateBuilder(state);
                     }
                     KeyCode::BackTab => {
@@ -12953,7 +12954,7 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                 },
                 TemplateBuilderFocus::TokenGrid => match key.code {
                     KeyCode::Esc => {
-                        app.active_overlay = ActiveOverlay::None;
+                        close_shared_template(app, state.return_to_extract.take());
                     }
                     KeyCode::Tab => {
                         state.focus = TemplateBuilderFocus::TemplateInput;
@@ -12964,16 +12965,15 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                         app.active_overlay = ActiveOverlay::TemplateBuilder(state);
                     }
                     KeyCode::Left => {
-                        if state.grid_cursor > 0 {
-                            state.grid_cursor -= 1;
-                        }
+                        state.grid_cursor = state.grid_cursor.saturating_sub(1);
+                        let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
+                        state.reveal_grid_cursor(ratatui::layout::Rect::new(0, 0, w, h));
                         app.active_overlay = ActiveOverlay::TemplateBuilder(state);
                     }
                     KeyCode::Right => {
-                        let max = state.total_grid_items().saturating_sub(1);
-                        if state.grid_cursor < max {
-                            state.grid_cursor += 1;
-                        }
+                        state.grid_cursor = (state.grid_cursor + 1).min(state.total_grid_items().saturating_sub(1));
+                        let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
+                        state.reveal_grid_cursor(ratatui::layout::Rect::new(0, 0, w, h));
                         app.active_overlay = ActiveOverlay::TemplateBuilder(state);
                     }
                     KeyCode::Enter => {
@@ -12992,12 +12992,13 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
             mut selected,
             mut scroll,
             active_template,
+            mut return_to_extract,
             ..
         } => {
             let count = templates.len();
             match key.code {
                 KeyCode::Esc => {
-                    app.active_overlay = ActiveOverlay::None;
+                    close_shared_template(app, return_to_extract.take());
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     if selected > 0 {
@@ -13018,6 +13019,7 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                         scroll,
                         preview,
                         active_template,
+                        return_to_extract,
                     };
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
@@ -13041,21 +13043,18 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                         scroll,
                         preview,
                         active_template,
+                        return_to_extract,
                     };
                 }
                 KeyCode::Enter => {
                     if let Some(tmpl) = templates.get(selected).cloned() {
-                        match target {
-                            TemplateTarget::Folder => {
-                                app.convert.output_options.folder_template = tmpl;
-                            }
-                            TemplateTarget::Filename => {
-                                app.convert.output_options.filename_template = tmpl;
-                            }
-                        }
-                        app.preset.mark_modified();
-                        app.active_overlay = ActiveOverlay::None;
-                        app.set_status("Template applied");
+                        apply_shared_template(app,target,tmpl,return_to_extract.take());
+                    } else {
+                        // Empty preset library is not an Apply operation.
+                        app.active_overlay=ActiveOverlay::TemplatePicker {
+                            target,templates,selected,scroll,preview:String::new(),
+                            active_template,return_to_extract,
+                        };
                     }
                 }
                 KeyCode::Delete => {
@@ -13083,6 +13082,12 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                             scroll,
                             preview,
                             active_template,
+                            return_to_extract,
+                        };
+                    } else {
+                        app.active_overlay = ActiveOverlay::TemplatePicker {
+                            target, templates, selected, scroll,
+                            preview: String::new(), active_template, return_to_extract,
                         };
                     }
                 }
@@ -13094,6 +13099,7 @@ fn handle_overlay_key(app: &mut AppState, key: KeyEvent, tx: &mpsc::Sender<AppMe
                         scroll,
                         preview: String::new(),
                         active_template,
+                        return_to_extract,
                     };
                 }
             }
@@ -18220,6 +18226,16 @@ pub(super) fn metadata_editor_save(
     metadata_editor_save_with_cue_consent(app, state, tx, false);
 }
 
+/// Disc-image metabase/sidecar saves complete synchronously, unlike the
+/// ordinary metadata write worker. Both routes must inform the parked Extract
+/// draft before its editor closes.
+fn record_extract_sidecar_save(state: &mut super::app::MetadataEditorState) {
+    if state.return_to_extract.is_some() {
+        state.extract_tags_saved = true;
+        state.extract_mb_saved |= state.extract_mb_populated;
+    }
+}
+
 fn metadata_editor_save_with_cue_consent(
     app: &mut AppState,
     state: &mut super::app::MetadataEditorState,
@@ -18326,7 +18342,9 @@ fn metadata_editor_save_with_cue_consent(
             state,
         ) {
             Ok(outcome) => {
+                record_extract_sidecar_save(state);
                 state.mark_presentation_tabs_saved(&outcome.saved_tab_indices);
+                app.browse.disc_probe_cache.remove(&source_path);
                 let file_name = outcome
                     .path
                     .file_name()
@@ -18355,7 +18373,9 @@ fn metadata_editor_save_with_cue_consent(
         };
         match super::command::save_dvdv_metadata_sidecar(&source_path, state) {
             Ok(outcome) => {
+                record_extract_sidecar_save(state);
                 state.mark_active_presentation_saved();
+                app.browse.disc_probe_cache.remove(&source_path);
                 let remaining = state.dirty_presentation_count();
                 let file_name = outcome
                     .path
@@ -18392,7 +18412,11 @@ fn metadata_editor_save_with_cue_consent(
         if state.active_surface().sacd_area_kind.is_none() {
             match save_dvda_metabase(state, &sidecar_path) {
                 Ok(kind) => {
+                    record_extract_sidecar_save(state);
                     state.mark_all_presentations_saved();
+                    if let Some(source) = state.active_surface().paths.first() {
+                        app.browse.disc_probe_cache.remove(source);
+                    }
                     let verb = match kind {
                         SacdSaveKind::Created => "created",
                         SacdSaveKind::Updated => "updated",
@@ -18412,7 +18436,11 @@ fn metadata_editor_save_with_cue_consent(
 
         match save_sacd_sidecar(state, &sidecar_path) {
             Ok(outcome) => {
+                record_extract_sidecar_save(state);
                 state.mark_all_presentations_saved();
+                if let Some(source) = state.active_surface().paths.first() {
+                    app.browse.disc_probe_cache.remove(source);
+                }
                 let verb = match outcome.kind {
                     SacdSaveKind::Created => "created",
                     SacdSaveKind::Updated => "updated",
@@ -19214,6 +19242,9 @@ pub(super) fn reopen_metadata_editor_after_musicbrainz_population(
     // tag-block or transfer preparation whether the result reopens the editor
     // directly or first asks for multi-presentation confirmation.
     state.invalidate_tag_interchange_preparation();
+    if state.return_to_extract.is_some() {
+        state.extract_mb_populated = true;
+    }
     if state.has_multiple_presentations() {
         app.pending_metadata_editor = Some(state.clone());
         app.active_overlay = ActiveOverlay::Confirmation {
@@ -19423,7 +19454,9 @@ fn request_metadata_editor_close(
         }
     } else {
         cleanup_metadata_editor_archive_context(app, state);
-        app.active_overlay = ActiveOverlay::None;
+        if !super::disc_browser_actions::restore_extract_after_tag_editor(app, state, _tx) {
+            app.active_overlay = ActiveOverlay::None;
+        }
     }
 }
 
@@ -22110,9 +22143,10 @@ pub(super) fn handle_file_task_user_action(
                 || !matches!(
                     &session.progress.kind,
                     tui_file_picker::FileTaskKind::Copy | tui_file_picker::FileTaskKind::Move
+                        | tui_file_picker::FileTaskKind::Extract
                 )
             {
-                app.set_status("Only a running copy or move can be minimized");
+                app.set_status("Only a running copy, move or extraction can be minimized");
                 return true;
             }
             if session.progress.conflict.is_some()
@@ -22128,7 +22162,7 @@ pub(super) fn handle_file_task_user_action(
                 .take()
                 .map(|overlay| *overlay)
                 .unwrap_or(ActiveOverlay::None);
-            app.set_status("File transfer minimized; use the footer segment or :messages to restore it");
+            app.set_status("File task minimized; use the footer segment or :messages to restore it");
             return false;
         }
         tui_file_picker::FileTaskUserAction::CancelQueued(queue_id) => {
@@ -22149,6 +22183,17 @@ pub(super) fn handle_file_task_user_action(
                 .unwrap_or(ActiveOverlay::None);
             if app.file_transfers.blocked_for_attention {
                 app.file_transfers.blocked_for_attention = false;
+            }
+            // A terminal copy/move/extraction may have released its serial
+            // slot while the dialog awaited acknowledgment. Other kinds of
+            // file-task overlays (notably Archive) must not start the FIFO
+            // just because their unrelated result was dismissed.
+            if app.file_transfers.active_session_id.is_none()
+                && matches!(&session.progress.kind,
+                    tui_file_picker::FileTaskKind::Copy
+                    | tui_file_picker::FileTaskKind::Move
+                    | tui_file_picker::FileTaskKind::Extract)
+            {
                 maybe_start_next_file_transfer(app, tx);
             }
             return false;
@@ -49847,6 +49892,37 @@ fn build_metadata_detail_context_menu(
     entries
 }
 
+/// A template overlay is either a Convert editor or a suspended Extract form.
+/// Preserve that owner on Apply, Cancel, mouse close, and keyboard close.
+fn close_shared_template(app:&mut AppState,
+    return_to_extract:Option<Box<crate::tui::disc_browser::DiscBrowserState>>) {
+    app.active_overlay=return_to_extract.map(ActiveOverlay::DiscBrowser)
+        .unwrap_or(ActiveOverlay::None);
+}
+
+fn apply_shared_template(app:&mut AppState,target:TemplateTarget,template:String,
+    return_to_extract:Option<Box<crate::tui::disc_browser::DiscBrowserState>>) {
+    if let Some(mut browser)=return_to_extract {
+        browser.naming_template=template;
+        app.active_overlay=ActiveOverlay::DiscBrowser(browser);
+    } else {
+        match target {
+            TemplateTarget::Folder=>app.convert.output_options.folder_template=template,
+            TemplateTarget::Filename=>app.convert.output_options.filename_template=template,
+        }
+        app.preset.mark_modified();
+        app.active_overlay=ActiveOverlay::None;
+    }
+    app.set_status("Template applied");
+}
+
+fn close_current_template_picker(app:&mut AppState) {
+    let overlay=std::mem::replace(&mut app.active_overlay,ActiveOverlay::None);
+    if let ActiveOverlay::TemplatePicker{return_to_extract,..}=overlay {
+        close_shared_template(app,return_to_extract);
+    }else {app.active_overlay=overlay;}
+}
+
 fn open_template_picker(app: &mut AppState, target: TemplateTarget) {
     let templates = super::template_builder::list_templates(target);
     let active = match target {
@@ -49865,6 +49941,7 @@ fn open_template_picker(app: &mut AppState, target: TemplateTarget) {
         scroll: 0,
         preview,
         active_template: active,
+        return_to_extract:None,
     };
 }
 
@@ -49888,22 +49965,14 @@ fn handle_template_picker_mouse(app: &mut AppState, mouse: MouseEvent) {
                 target,
                 ref templates,
                 selected,
+                ref mut return_to_extract,
                 ..
             } = app.active_overlay
             {
                 let idx = click_idx.unwrap_or(selected);
                 if let Some(tmpl) = templates.get(idx).cloned() {
-                    match target {
-                        TemplateTarget::Folder => {
-                            app.convert.output_options.folder_template = tmpl;
-                        }
-                        TemplateTarget::Filename => {
-                            app.convert.output_options.filename_template = tmpl;
-                        }
-                    }
-                    app.preset.mark_modified();
-                    app.active_overlay = ActiveOverlay::None;
-                    app.set_status("Template applied");
+                    let owner=return_to_extract.take();
+                    apply_shared_template(app,target,tmpl,owner);
                 }
             }
         }
@@ -49914,6 +49983,7 @@ fn handle_template_picker_mouse(app: &mut AppState, mouse: MouseEvent) {
                 mut selected,
                 mut scroll,
                 ref active_template,
+                ref mut return_to_extract,
                 ..
             } = app.active_overlay
             {
@@ -49932,6 +50002,7 @@ fn handle_template_picker_mouse(app: &mut AppState, mouse: MouseEvent) {
                         String::new()
                     };
                     let active_template = active_template.clone();
+                    let owner = return_to_extract.take();
                     app.set_status("Template deleted");
                     app.active_overlay = ActiveOverlay::TemplatePicker {
                         target,
@@ -49940,12 +50011,13 @@ fn handle_template_picker_mouse(app: &mut AppState, mouse: MouseEvent) {
                         scroll,
                         preview,
                         active_template,
+                        return_to_extract:owner,
                     };
                 }
             }
         }
         Some(TuiButton::TemplatePickerClose) => {
-            app.active_overlay = ActiveOverlay::None;
+            close_current_template_picker(app);
         }
         _ => {
             // Click outside or on non-button area — compute bounds and close if outside
@@ -49964,7 +50036,7 @@ fn handle_template_picker_mouse(app: &mut AppState, mouse: MouseEvent) {
             let px = (area.0.saturating_sub(w)) / 2;
             let py = (area.1.saturating_sub(h)) / 2;
             if mx < px || mx >= px + w || my < py || my >= py + h {
-                app.active_overlay = ActiveOverlay::None;
+                close_current_template_picker(app);
             }
         }
     }
@@ -50924,9 +50996,8 @@ fn handle_template_builder_mouse(app: &mut AppState, mouse: MouseEvent) {
     let mx = mouse.column;
     let my = mouse.row;
 
-    if mouse.kind != MouseEventKind::Down(MouseButton::Left) {
-        return;
-    }
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)
+        | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) { return; }
 
     let mut state = match std::mem::replace(&mut app.active_overlay, ActiveOverlay::None) {
         ActiveOverlay::TemplateBuilder(s) => s,
@@ -50935,6 +51006,20 @@ fn handle_template_builder_mouse(app: &mut AppState, mouse: MouseEvent) {
             return;
         }
     };
+
+    let (w, h) = crossterm::terminal::size().unwrap_or((80, 24));
+    let screen = ratatui::layout::Rect::new(0, 0, w, h);
+    if matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) {
+        if super::template_builder::builder_token_viewport(screen, &state)
+            .is_some_and(|r| mx >= r.x && mx < r.x + r.width && my >= r.y && my < r.y + r.height) {
+            let limit = super::template_builder::builder_token_scroll_limit(screen, &state);
+            state.token_scroll = if mouse.kind == MouseEventKind::ScrollUp {
+                state.token_scroll.saturating_sub(3)
+            } else { (state.token_scroll + 3).min(limit) };
+        }
+        app.active_overlay = ActiveOverlay::TemplateBuilder(state);
+        return;
+    }
 
     match app.button_map.find_button_at(mx, my) {
         Some(TuiButton::TemplateBuilderToken(idx)) => {
@@ -50952,16 +51037,7 @@ fn handle_template_builder_mouse(app: &mut AppState, mouse: MouseEvent) {
         }
         Some(TuiButton::TemplateBuilderApply) => {
             let text = state.template_input.text.clone();
-            match state.target {
-                TemplateTarget::Folder => {
-                    app.convert.output_options.folder_template = text;
-                }
-                TemplateTarget::Filename => {
-                    app.convert.output_options.filename_template = text;
-                }
-            }
-            app.preset.mark_modified();
-            app.set_status("Template applied");
+            apply_shared_template(app,state.target,text,state.return_to_extract.take());
             return; // overlay already set to None
         }
         Some(TuiButton::TemplateBuilderSave) => {
@@ -50990,23 +51066,15 @@ fn handle_template_builder_mouse(app: &mut AppState, mouse: MouseEvent) {
             }
         }
         _ => {
-            // Click outside popup or on non-button area — close.
-            // Compute bounds matching draw_template_builder's layout.
-            let area = crossterm::terminal::size().unwrap_or((80, 24));
-            let tw = (area.0 * 80 / 100).max(60).min(area.0.saturating_sub(2));
-            let categories = state.token_categories();
-            let saved_visible = state.saved_templates.len().min(4).max(1);
-            let category_rows: u16 = categories.iter().map(|_| 2).sum();
-            let content_height =
-                1 + 2 + 1 + 1 + saved_visible as u16 + 1 + category_rows + 2 + 1 + 1;
-            let th = (content_height + 2).min(area.1.saturating_sub(2));
-            let px = (area.0.saturating_sub(tw)) / 2;
-            let py = (area.1.saturating_sub(th)) / 2;
-            if tw < 60 || th < 12 {
-                return; // terminal too small for popup
-            }
-            if mx < px || mx >= px + tw || my < py || my >= py + th {
-                return; // click outside — overlay already set to None
+            // The same popup geometry drives painting and dismissal.
+            let Some(popup) = super::template_builder::builder_popup(screen, &state) else {
+                close_shared_template(app, state.return_to_extract.take());
+                return;
+            };
+            if mx < popup.x || mx >= popup.x + popup.width
+                || my < popup.y || my >= popup.y + popup.height {
+                close_shared_template(app, state.return_to_extract.take());
+                return;
             }
             // Click inside but not on a button — switch focus to template input
             state.focus = TemplateBuilderFocus::TemplateInput;
@@ -55593,9 +55661,7 @@ fn recovery_journal_is_already_claimed(
             .and_then(|retry| retry.recovery_journal_path.as_deref())
             == Some(journal_path)
     }) || app.file_transfers.queued.iter().any(|queued| {
-        queued
-            .retry_plan
-            .as_ref()
+        queued.transfer().and_then(|transfer| transfer.retry_plan.as_ref())
             .and_then(|retry| retry.recovery_journal_path.as_deref())
             == Some(journal_path)
     })
@@ -55719,7 +55785,7 @@ pub(super) fn start_filesystem_clipboard_paste(
     };
     let queue_id = queued.queue_id;
     let item_count = queued.clipboard.paths().len();
-    app.file_transfers.queued.push_back(queued);
+    app.file_transfers.queued.push_back(queued.into());
     app.sync_file_transfer_queue_surfaces();
 
     if app.file_transfers.active_session_id.is_none()
@@ -55731,7 +55797,7 @@ pub(super) fn start_filesystem_clipboard_paste(
         .file_transfers
         .queued
         .iter()
-        .position(|job| job.queue_id == queue_id)
+        .position(|job| job.queue_id() == queue_id)
         .map(|index| index + 1)
     {
         let recovery_note = if duplicate_recovery_demoted {
@@ -55771,6 +55837,21 @@ pub(super) fn maybe_start_next_file_transfer(
         app.file_transfers.keep_minimized_across_jobs = false;
         app.sync_file_transfer_queue_surfaces();
         return;
+    };
+    let queued = match queued {
+        super::app::QueuedFileTask::Extract(native) => {
+            let minimized = app.file_transfers.keep_minimized_across_jobs;
+            if let Err(error) = super::native_extract_task::dispatch_queued(
+                app, native.job.clone(), tx, minimized,
+            ) {
+                app.file_transfers.queued.push_front(
+                    super::app::QueuedFileTask::Extract(native));
+                app.set_status(format!("Queued extraction could not start: {error}; still queued"));
+            }
+            app.sync_file_transfer_queue_surfaces();
+            return;
+        }
+        super::app::QueuedFileTask::Transfer(transfer) => transfer,
     };
 
     let mut revalidation_warning = None;
@@ -55847,7 +55928,7 @@ pub(super) fn maybe_start_next_file_transfer(
         true,
         true,
     ) else {
-        app.file_transfers.queued.push_front(queued);
+        app.file_transfers.queued.push_front(queued.into());
         app.sync_file_transfer_queue_surfaces();
         app.set_status("Queued transfer could not start; it remains at the front of the queue");
         return;
@@ -55910,7 +55991,7 @@ pub(super) fn cancel_queued_file_transfer(
         .file_transfers
         .queued
         .iter()
-        .position(|job| job.queue_id == queue_id)
+        .position(|job| job.queue_id() == queue_id)
     else {
         app.set_status("Queued transfer was already started, deferred, or removed");
         return;
@@ -55920,12 +56001,19 @@ pub(super) fn cancel_queued_file_transfer(
         return;
     };
     app.sync_file_transfer_queue_surfaces();
-    app.set_status(format!(
-        "Cancelled queued transfer of {} item{} to {}",
-        removed.clipboard.paths().len(),
-        if removed.clipboard.paths().len() == 1 { "" } else { "s" },
-        removed.destination_dir.display()
-    ));
+    match removed {
+        super::app::QueuedFileTask::Transfer(removed) => app.set_status(format!(
+            "Cancelled queued transfer of {} item{} to {}",
+            removed.clipboard.paths().len(),
+            if removed.clipboard.paths().len() == 1 { "" } else { "s" },
+            removed.destination_dir.display()
+        )),
+        super::app::QueuedFileTask::Extract(removed) => {
+            let count: usize = removed.job.programs.iter().map(|p| p.tracks.len()).sum();
+            app.set_status(format!("Cancelled queued extraction of {count} tracks/chapters to {}",
+                removed.job.destination.display()));
+        }
+    }
     maybe_start_next_file_transfer(app, tx);
 }
 
@@ -55986,7 +56074,7 @@ pub(super) fn resume_file_transfer_recoveries(
         recovery.clipboard.paths().len()
     });
     for recovery in promoted.into_iter().rev() {
-        app.file_transfers.queued.push_front(recovery);
+        app.file_transfers.queued.push_front(recovery.into());
     }
     app.sync_file_transfer_queue_surfaces();
     if let Some(item_count) = one_summary {
@@ -56426,6 +56514,18 @@ pub(super) fn discard_file_transfer_recovery(
         }
     };
 
+    if record.is_native_extraction() {
+        // Native outputs are already committed, never rollback candidates.
+        // Only exact journal-owned, hidden publication copies can be removed.
+        let removed = record.temp_artifacts.iter().filter(|a| a.path.is_file()).count();
+        super::native_extract_task::clean_native_partial_publications(&handle, &record)?;
+        super::file_task_runtime::commit_recovery_discard(handle)?;
+        return Ok(super::file_task_runtime::RecoveryDiscardSummary {
+            released_paths: super::file_task_runtime::recovery_blocked_path_count(&record),
+            deleted_incomplete: removed,
+            ..Default::default()
+        });
+    }
     let mut summary = super::file_task_runtime::RecoveryDiscardSummary {
         released_paths: super::file_task_runtime::recovery_blocked_path_count(&record),
         ..Default::default()
@@ -62133,6 +62233,9 @@ fn supervise_file_task_process(
                     update,
                 });
             }
+            Ok(Ok(super::file_task_runtime::FileTaskWireEvent::NativeComplete { .. })) => {
+                log::warn!("copy/move file-task helper sent an extraction completion");
+            }
             Ok(Ok(super::file_task_runtime::FileTaskWireEvent::Complete {
                 report,
                 retry_plan,
@@ -62647,6 +62750,10 @@ pub fn run_internal_file_task_worker(journal_path: &std::path::Path, lease_fd: i
     let record = journal.load().map_err(anyhow::Error::msg)?;
     if journal.is_abandoned() {
         return Ok(());
+    }
+    if record.is_native_extraction() {
+        return super::native_extract_task::run_detached_file_task_helper(journal, record)
+            .map_err(anyhow::Error::msg);
     }
     let job: FileTaskJob = serde_json::from_value(record.job.clone())
         .map_err(|error| anyhow::anyhow!("decode file-task job: {error}"))?;
@@ -70534,7 +70641,7 @@ fn cancel_confirm_action(app: &mut AppState, action: Option<&ConfirmAction>) {
             if let Some(overlay) = app.queued_quit_preempted_overlay.take() {
                 app.active_overlay = *overlay;
             }
-            app.set_status("Quit cancelled; queued file transfers were retained".to_string());
+            app.set_status("Quit cancelled; queued file tasks were retained".to_string());
         }
         Some(ConfirmAction::ArchiveExternalConflict { context }) => {
             app.should_quit = false;
@@ -71251,8 +71358,8 @@ fn execute_confirm_action(
         ConfirmAction::DiscardMetadataEditorChanges => {
             let quit_after_resolution = app.quit_after_browse_archive_metadata_resolution;
             app.quit_after_browse_archive_metadata_resolution = false;
-            let parked = app.pending_metadata_editor.take();
-            if let Some(parked) = parked.as_ref() {
+            let mut parked = app.pending_metadata_editor.take();
+            if let Some(parked) = parked.as_mut() {
                 if parked.has_browse_archive_staged_changes() {
                     if let Some(context) = parked.archive_edit_context.clone() {
                         app.active_overlay = ActiveOverlay::None;
@@ -71285,6 +71392,12 @@ fn execute_confirm_action(
                     }
                 } else {
                     cleanup_metadata_editor_archive_context(app, parked);
+                    if !quit_after_resolution &&
+                        super::disc_browser_actions::restore_extract_after_tag_editor(app,
+                            parked, tx) {
+                        app.set_status("metadata editor: unsaved edits discarded; Extract settings retained");
+                        return;
+                    }
                     app.active_overlay = ActiveOverlay::None;
                     if quit_after_resolution {
                         app.should_quit = true;
@@ -71518,18 +71631,18 @@ fn execute_confirm_action(
             let mut outcomes = Vec::new();
             if actual_unjournaled > 0 {
                 outcomes.push(format!(
-                    "discarded {actual_unjournaled} unjournaled queued transfer{}",
+                    "discarded {actual_unjournaled} unjournaled queued file task{}",
                     if actual_unjournaled == 1 { "" } else { "s" },
                 ));
             }
             if actual_journal_backed > 0 {
                 outcomes.push(format!(
-                    "deferred {actual_journal_backed} journal-backed recovery transfer{} to startup recovery",
+                    "deferred {actual_journal_backed} journal-backed recovery task{} to startup recovery",
                     if actual_journal_backed == 1 { "" } else { "s" },
                 ));
             }
             if outcomes.is_empty() {
-                outcomes.push("no queued transfers remained to discard or defer".to_string());
+                outcomes.push("no queued file tasks remained to discard or defer".to_string());
             }
             let queue_changed = actual_unjournaled != *unjournaled_count
                 || actual_journal_backed != *journal_backed_count;
@@ -71776,12 +71889,12 @@ mod queued_transfer_quit_confirmation_tests {
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         app.file_transfers
             .queued
-            .push_back(queued_transfer(71, "/source/new", None));
+            .push_back(queued_transfer(71, "/source/new", None).into());
         app.file_transfers.queued.push_back(queued_transfer(
             72,
             "/source/recovery",
             Some(journal_path.clone()),
-        ));
+        ).into());
         let (tx, _rx) = mpsc::channel(4);
 
         execute_confirm_action(
@@ -71801,9 +71914,9 @@ mod queued_transfer_quit_confirmation_tests {
             .as_ref()
             .map(|(message, _)| message.as_str())
             .unwrap_or_default();
-        assert!(status.contains("discarded 1 unjournaled queued transfer"));
+        assert!(status.contains("discarded 1 unjournaled queued file task"));
         assert!(status.contains(
-            "deferred 1 journal-backed recovery transfer to startup recovery"
+            "deferred 1 journal-backed recovery task to startup recovery"
         ));
     }
 }
@@ -72749,31 +72862,111 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
     }
 
     if matches!(app.active_overlay, ActiveOverlay::DiscBrowser(_)) {
+        if matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) {
+            use super::disc_browser::ExtractFocus;
+            let delta = if mouse.kind == MouseEventKind::ScrollUp { -3isize } else { 3isize };
+            if let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay {
+                if state.panel.is_none() {
+                    match state.focus {
+                        ExtractFocus::Programs => { state.move_cursor(delta); state.item_cursor = 0; },
+                        ExtractFocus::Items => {
+                            let max = state.selected_presentation().map_or(0, |p| p.tracks.len().saturating_sub(1));
+                            state.item_cursor = if delta < 0 { state.item_cursor.saturating_sub(3) }
+                                else { state.item_cursor.saturating_add(3).min(max) };
+                        }
+                        ExtractFocus::Output => {
+                            super::disc_browser_actions::cancel_native_text_edit(state);
+                            let max = state.output_rows().len().saturating_sub(1);
+                            state.output_cursor = if delta < 0 { state.output_cursor.saturating_sub(3) }
+                                else { state.output_cursor.saturating_add(3).min(max) };
+                            state.normalize_output_cursor();
+                        }
+                        ExtractFocus::Footer => {}
+                    }
+                }
+            }
+            return;
+        }
+        if matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left)
+            | MouseEventKind::Up(MouseButton::Left)) {
+            if let ActiveOverlay::DiscBrowser(state)=&mut app.active_overlay {
+                if state.text_mouse_origin.is_some() {
+                    let name=if state.editing_template {TuiButton::DiscBrowserNaming}
+                        else {TuiButton::DiscBrowserFolderField};
+                    if let Some(rect)=app.button_map.button_rect(name) {
+                        let column=mouse.column.saturating_sub(rect.x) as usize;
+                        super::disc_browser_actions::native_text_mouse_drag(
+                            state,column,matches!(mouse.kind,MouseEventKind::Up(_)));
+                    }
+                }
+            }
+            return;
+        }
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             if let Some(button) = app.button_map.find_button_at(mouse.column, mouse.row) {
-                let now = std::time::Instant::now();
-                let click_count = match button {
-                    TuiButton::DiscBrowserStream(index) => {
-                        let is_double = app
-                            .last_disc_browser_stream_click
-                            .as_ref()
-                            .filter(|(prior, _)| *prior == index)
-                            .map(|(_, t)| now.duration_since(*t).as_millis() < 500)
-                            .unwrap_or(false);
-                        if is_double {
-                            app.last_disc_browser_stream_click = None;
-                            2
-                        } else {
-                            app.last_disc_browser_stream_click = Some((index, now));
-                            1
-                        }
+                let field_rect=if matches!(button,TuiButton::DiscBrowserFolderField
+                    |TuiButton::DiscBrowserNaming) {
+                    app.button_map.button_rect(button)
+                }else{None};
+                let position_caret=matches!(&app.active_overlay,
+                    ActiveOverlay::DiscBrowser(state) if state.focus
+                        == super::disc_browser::ExtractFocus::Output
+                        && state.current_output_row() == (if matches!(button,TuiButton::DiscBrowserNaming) {
+                            "Naming"
+                        } else { "Folder" }));
+                // Resolve the read-only field's displayed coordinates before
+                // opening the editor, including on the *first* unfocused drag.
+                // Folder has a compact-path mapping; Naming displays a prefix.
+                let preview_caret=match (button,&app.active_overlay,field_rect) {
+                    (TuiButton::DiscBrowserFolderField,
+                        ActiveOverlay::DiscBrowser(state),Some(rect))
+                        if !state.editing_destination => {
+                        Some(super::disc_extract_render::native_folder_preview_caret(
+                            &state.destination,rect.width,
+                            mouse.column.saturating_sub(rect.x) as usize))
                     }
-                    _ => {
-                        app.last_disc_browser_stream_click = None;
-                        1
+                    (TuiButton::DiscBrowserNaming,
+                        ActiveOverlay::DiscBrowser(state),Some(rect))
+                        if !state.editing_destination => {
+                        let mut preview=super::text_input::TextInputState::new(
+                            state.naming_template.clone());
+                        preview.cursor=0; // the read-only Naming field shows its prefix
+                        let at=preview.byte_index_for_view_column(rect.width as usize,
+                            mouse.column.saturating_sub(rect.x) as usize);
+                        Some(preview.text[..at].chars().count())
                     }
+                    _ => None,
                 };
-                super::disc_browser_actions::handle_disc_browser_button_click(app, &button, click_count, tx);
+                let now=std::time::Instant::now();
+                let click_count=match button {
+                    TuiButton::DiscBrowserTitle => {
+                        app.last_disc_browser_stream_click=None;
+                        if app.double_click.register_click(button,mouse.column,mouse.row,
+                            tui_file_picker::DOUBLE_CLICK_WINDOW){2}else{1}
+                    }
+                    TuiButton::DiscBrowserStream(index) => {
+                        app.double_click.clear();
+                        let is_double=app.last_disc_browser_stream_click.as_ref()
+                            .filter(|(prior,_)|*prior==index)
+                            .map(|(_,t)|now.duration_since(*t).as_millis()<500)
+                            .unwrap_or(false);
+                        if is_double {app.last_disc_browser_stream_click=None;2}
+                        else {app.last_disc_browser_stream_click=Some((index,now));1}
+                    }
+                    TuiButton::DiscBrowserFolderField|TuiButton::DiscBrowserNaming => {
+                        app.last_disc_browser_stream_click=None;
+                        if app.double_click.register_click(button,mouse.column,mouse.row,
+                            tui_file_picker::DOUBLE_CLICK_WINDOW){2}else{1}
+                    }
+                    _ => {app.last_disc_browser_stream_click=None;app.double_click.clear();1}
+                };
+                super::disc_browser_actions::handle_disc_browser_button_click_with_shift(
+                    app,&button,click_count,mouse.modifiers.contains(KeyModifiers::SHIFT),tx);
+                if let (Some(rect),ActiveOverlay::DiscBrowser(state))=(field_rect,&mut app.active_overlay) {
+                    super::disc_browser_actions::native_text_mouse_down(state,
+                        rect.width as usize,mouse.column.saturating_sub(rect.x) as usize,
+                        position_caret,click_count,preview_caret);
+                }
             }
         }
         return;
@@ -74606,8 +74799,38 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::FormatSettingsSoxAliasing(_)
             | TuiButton::FormatSettingsSoxSincPhase(_)
             | TuiButton::FormatSettingsSoxrChebyshev(_)
+            | TuiButton::DiscBrowserTitle
+            | TuiButton::DiscBrowserTitleSize
             | TuiButton::DiscBrowserStream(_)
             | TuiButton::DiscBrowserExpand(_)
+            | TuiButton::DiscBrowserTrack(_)
+            | TuiButton::DiscBrowserTrackCheck(_)
+            | TuiButton::DiscBrowserAnglePrev(_)
+            | TuiButton::DiscBrowserAngleNext(_)
+            | TuiButton::DiscBrowserOutput(_)
+            | TuiButton::DiscBrowserFormatChoice(_)
+            | TuiButton::DiscBrowserFilesChoice(_)
+            | TuiButton::DiscBrowserOverwritePrev
+            | TuiButton::DiscBrowserOverwriteNext
+            | TuiButton::DiscBrowserOverwriteHelp
+            | TuiButton::DiscBrowserOverwriteHelpOutside
+            | TuiButton::DiscBrowserOverwriteHelpPassive
+            | TuiButton::DiscBrowserToggle(_)
+            | TuiButton::DiscBrowserTagsEdit
+            | TuiButton::DiscBrowserTagSheetControl(_)
+            | TuiButton::DiscBrowserTagSheetSourceChoice(_)
+            | TuiButton::DiscBrowserTagSheetOutside
+            | TuiButton::DiscBrowserTagSheetPassive
+            | TuiButton::DiscBrowserFolderField
+            | TuiButton::DiscBrowserFolderBrowse
+            | TuiButton::DiscBrowserHint(_)
+            | TuiButton::DiscBrowserHiddenToggle
+            | TuiButton::DiscBrowserNaming
+            | TuiButton::DiscBrowserNamingLoad
+            | TuiButton::DiscBrowserNamingCustom
+            | TuiButton::DiscBrowserOverwrite
+            | TuiButton::DiscBrowserExtract
+            | TuiButton::DiscBrowserMore
             | TuiButton::DiscBrowserConvert
             | TuiButton::DiscBrowserClose
             | TuiButton::ThemeBuilderPreset
@@ -74751,6 +74974,7 @@ mod phase4_tests {
         channel_layout: Option<&str>,
     ) -> crate::disc::model::DiscPresentation {
         crate::disc::model::DiscPresentation {
+            extract: crate::disc::model::PresentationExtractInfo::default(),
             id: crate::disc::model::PresentationId::DvdAudioGroup(group_nr),
             label: label.to_string(),
             format: crate::disc::model::AudioPresentationFormat {
@@ -74779,6 +75003,7 @@ mod phase4_tests {
         durations: &[f64],
     ) -> crate::disc::model::DiscPresentation {
         crate::disc::model::DiscPresentation {
+            extract: crate::disc::model::PresentationExtractInfo::default(),
             id: crate::disc::model::PresentationId::try_blu_ray_title(
                 playlist_number,
                 audio_pid,
@@ -115846,7 +116071,8 @@ mod file_transfer_queue_state_tests {
 
         start_filesystem_clipboard_paste(&mut app, clipboard, destination, &tx);
 
-        let queued = app.file_transfers.queued.front().expect("queued duplicate paste");
+        let queued = app.file_transfers.queued.front().expect("queued duplicate paste")
+            .transfer().expect("clipboard transfer");
         assert!(queued
             .retry_plan
             .as_ref()
@@ -115900,23 +116126,23 @@ mod file_transfer_queue_state_tests {
         );
 
         assert_eq!(app.file_transfers.queued.len(), 2);
-        assert_eq!(app.file_transfers.queued[0].clipboard, first_clipboard);
-        assert_eq!(app.file_transfers.queued[1].clipboard, second_clipboard);
+        assert_eq!(app.file_transfers.queued[0].transfer().unwrap().clipboard, first_clipboard);
+        assert_eq!(app.file_transfers.queued[1].transfer().unwrap().clipboard, second_clipboard);
         assert_eq!(
-            app.file_transfers.queued[0].enqueue_plan.mappings[0].source,
+            app.file_transfers.queued[0].transfer().unwrap().enqueue_plan.mappings[0].source,
             first_source,
         );
         assert_eq!(
-            app.file_transfers.queued[1].enqueue_plan.mappings[0].source,
+            app.file_transfers.queued[1].transfer().unwrap().enqueue_plan.mappings[0].source,
             second_source,
         );
-        let first_id = app.file_transfers.queued[0].queue_id;
-        let second_id = app.file_transfers.queued[1].queue_id;
+        let first_id = app.file_transfers.queued[0].queue_id();
+        let second_id = app.file_transfers.queued[1].queue_id();
 
         cancel_queued_file_transfer(&mut app, first_id, &tx);
 
         assert_eq!(app.file_transfers.queued.len(), 1);
-        assert_eq!(app.file_transfers.queued[0].queue_id, second_id);
+        assert_eq!(app.file_transfers.queued[0].queue_id(), second_id);
         assert_eq!(app.file_transfers.active_session_id, Some(9001));
     }
 }
@@ -117014,5 +117240,32 @@ mod browse_new_toolbar_interaction_tests {
             Some(BrowseInlineEditTarget::Create { dir, kind: BrowseCreateKind::File })
                 if dir.as_path() == temp.path()));
         assert!(matches!(app.active_overlay, ActiveOverlay::None));
+    }
+}
+
+#[cfg(test)]
+mod r30c_extract_disc_save_notification_tests {
+    use super::*;
+    use crate::disc::model::{CopyProtectionSummary,DiscContents,DiscFormat};
+
+    #[test]
+    fn synchronous_disc_sidecar_save_marks_only_extract_owned_draft() {
+        let mut editor=super::super::app::MetadataEditorState::for_files(
+            vec!["/tmp/disc.iso".into()],Vec::new(),vec!["01".into()],Default::default());
+        editor.extract_mb_populated=true;
+        record_extract_sidecar_save(&mut editor);
+        assert!(!editor.extract_tags_saved);
+        assert!(!editor.extract_mb_saved);
+        let contents=DiscContents{
+            format:DiscFormat::Sacd,label:"disc".into(),source_path:"/tmp/disc.iso".into(),
+            presentations:Vec::new(),suppressed:Vec::new(),
+            copy_protection:CopyProtectionSummary{description:String::new()},
+            diagnostics:Vec::new(),album_title:None,album_artist:None,genre:None,year:None,
+        };
+        editor.return_to_extract=Some(Box::new(
+            crate::tui::disc_browser::DiscBrowserState::new(contents,"/tmp/disc.iso".into())));
+        record_extract_sidecar_save(&mut editor);
+        assert!(editor.extract_tags_saved);
+        assert!(editor.extract_mb_saved);
     }
 }

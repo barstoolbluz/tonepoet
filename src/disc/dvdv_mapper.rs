@@ -85,8 +85,26 @@ pub fn map_dvdv_disc(
                     .collect::<Vec<_>>();
                 let total_duration_secs = tracks_total_duration_secs(&tracks).unwrap_or(0.0);
 
+                let extraction_issue = title.chapters.iter().any(|chapter| {
+                    vts.pgcs.get(usize::from(chapter.pgcn.saturating_sub(1)))
+                        .is_some_and(|pgc| (chapter.start_cell..=chapter.end_cell).any(|cell_nr| {
+                            pgc.cells.get(usize::from(cell_nr.saturating_sub(1)))
+                                .is_some_and(|cell| cell.interleaved())
+                        }))
+                }).then(|| "seamless branching · cannot extract".to_string());
                 presentations.push(DiscPresentation {
-                    id: PresentationId::dvd_video(*vts_number, title.number, attr.stream_index),
+                    extract: PresentationExtractInfo {
+                        ineligible_reason: extraction_issue,
+                        language: attr.language.clone(),
+                        role: match attr.audio_type {
+                            2 => Some("visually impaired".to_string()),
+                            3 => Some("commentary".to_string()),
+                            _ => None,
+                        },
+                        angle_count: title.angle_count.max(1),
+                        ..PresentationExtractInfo::default()
+                    },
+            id: PresentationId::dvd_video(*vts_number, title.number, attr.stream_index),
                     label,
                     format,
                     tracks,

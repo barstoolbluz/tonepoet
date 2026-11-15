@@ -203,6 +203,19 @@ pub enum HostClipboardPasteTarget {
 /// Messages sent to the TUI event loop via mpsc channel
 #[derive(Debug)]
 pub enum AppMessage {
+    /// Native disc extraction worker report; no conversion job is created.
+    NativeExtractComplete {
+        session_id: u64,
+        result: Result<crate::convert::pipeline::native_extract::NativeExtractionReport, String>,
+    },
+    /// A bounded native source preflight started when the extraction overlay
+    /// opened. Only the matching live overlay generation may consume it.
+    DiscExtractProbeComplete {
+        path: std::path::PathBuf,
+        probe_id: u64,
+        program_index: usize,
+        result: Result<crate::convert::pipeline::native_extract::NativeProbeFacts, String>,
+    },
     /// Completion of explicit disposable Info-pane preview cache clearing.
     ArtworkCacheClearComplete { clear_id: u64, result: Result<(), String> },
     /// Dedicated nonblocking directory accounting worker update.

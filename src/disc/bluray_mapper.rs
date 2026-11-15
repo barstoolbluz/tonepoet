@@ -272,7 +272,14 @@ where
                 let total_duration_secs = tracks_total_duration_secs(&tracks)
                     .unwrap_or_else(|| title_duration_secs(&title, &angle_chapters));
                 let mut presentation = DiscPresentation {
-                    id: PresentationId::blu_ray_title(
+                    extract: PresentationExtractInfo {
+                        language: stream.language.clone(),
+                        role: (stream.kind != BluRayAudioStreamKind::Primary)
+                            .then(|| "secondary".to_string()),
+                        angle_count: max_angle,
+                        ..PresentationExtractInfo::default()
+                    },
+            id: PresentationId::blu_ray_title(
                         playlist_number,
                         stream.pid,
                         stream.stream_index,
@@ -2420,6 +2427,7 @@ bits_per_raw_sample=24
     #[test]
     fn mapper_label_includes_one_based_stream_pid_format_and_angle() {
         let mut presentation = DiscPresentation {
+            extract: crate::disc::model::PresentationExtractInfo::default(),
             id: PresentationId::blu_ray_title(7, 0x1101, 1, BlurayDisplayAngle::first()),
             label: String::new(),
             format: AudioPresentationFormat {
@@ -2513,6 +2521,7 @@ bits_per_raw_sample=24
     #[test]
     fn scoring_prefers_sidecar_metadata_then_stereo_then_bit_depth() {
         let stereo = DiscPresentation {
+            extract: crate::disc::model::PresentationExtractInfo::default(),
             id: PresentationId::blu_ray_title(12, 0x1100, 0, BlurayDisplayAngle::first()),
             label: String::new(),
             format: AudioPresentationFormat {

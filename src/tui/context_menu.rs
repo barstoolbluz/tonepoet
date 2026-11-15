@@ -1418,7 +1418,7 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
         }
         EntryKind::SacdIso => {
             items.push(item("Convert (default stream)", ContextAction::ConvertDiscDefault));
-            items.push(item("Browse Audio Streams...", ContextAction::BrowseDiscStreams));
+            items.push(item("Extract tracks…", ContextAction::BrowseDiscStreams));
             if let Some(contents) = app
                 .browse
                 .disc_probe_cache
@@ -1449,7 +1449,10 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
         | EntryKind::BlurayIso
         | EntryKind::BlurayDir => {
             items.push(item("Convert (default stream)", ContextAction::ConvertDiscDefault));
-            items.push(item("Browse Audio Streams...", ContextAction::BrowseDiscStreams));
+            let label = if matches!(entry.kind, EntryKind::DvdVideoIso | EntryKind::DvdVideoDir | EntryKind::BlurayIso | EntryKind::BlurayDir) {
+                "Extract chapters…"
+            } else { "Extract tracks…" };
+            items.push(item(label, ContextAction::BrowseDiscStreams));
             if let Some(contents) = app
                 .browse
                 .disc_probe_cache
@@ -1476,6 +1479,17 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(item("Copy path", ContextAction::CopyPath(entry.path.clone())));
         }
         EntryKind::Directory => {
+            // Classification is already cached by the asynchronous Browse
+            // scanner. Do not inspect folder contents on the UI thread.
+            if let Some(classification) = app.browse.valid_folder_classification_for_entry(entry) {
+                if classification.kind == super::browse::FolderClassificationKind::Disc {
+                    let name = match classification.disc_marker {
+                        Some(super::browse::FolderDiscMarkerKind::DvdVideo | super::browse::FolderDiscMarkerKind::BluRay) => "Extract chapters…",
+                        _ => "Extract tracks…",
+                    };
+                    items.push(item(name, ContextAction::BrowseDiscStreams));
+                }
+            }
             items.push(build_convert_submenu(app));
             items.push(separator());
             items.push(item("Open", ContextAction::OpenEntry));
@@ -6268,6 +6282,7 @@ mod tests {
             label: "disc".to_string(),
             source_path: std::path::PathBuf::from("disc.iso"),
             presentations: vec![crate::disc::model::DiscPresentation {
+                extract: crate::disc::model::PresentationExtractInfo::default(),
                 id,
                 label: "Selectable stream".to_string(),
                 format: crate::disc::model::AudioPresentationFormat {

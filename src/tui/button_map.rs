@@ -379,8 +379,39 @@ pub enum TuiButton {
     BrowseSearchAudioOnly,
 
     // Disc browser overlay.
+    DiscBrowserTitle,
+    DiscBrowserTitleSize,
     DiscBrowserStream(usize),
     DiscBrowserExpand(usize),
+    DiscBrowserTrack(usize),
+    DiscBrowserTrackCheck(usize),
+    DiscBrowserAnglePrev(usize),
+    DiscBrowserAngleNext(usize),
+    DiscBrowserOutput(usize),
+    DiscBrowserFormatChoice(usize),
+    DiscBrowserFilesChoice(usize),
+    DiscBrowserOverwritePrev,
+    DiscBrowserOverwriteNext,
+    DiscBrowserOverwriteHelp,
+    DiscBrowserOverwriteHelpOutside,
+    DiscBrowserOverwriteHelpPassive,
+    DiscBrowserToggle(usize),
+    DiscBrowserTagsEdit,
+    DiscBrowserTagSheetControl(usize),
+    DiscBrowserTagSheetSourceChoice(usize),
+    DiscBrowserTagSheetOutside,
+    DiscBrowserTagSheetPassive,
+    DiscBrowserFolderField,
+    DiscBrowserFolderBrowse,
+    /// Context key hint; mapped back through the same table as keyboard input.
+    DiscBrowserHint(usize),
+    DiscBrowserHiddenToggle,
+    DiscBrowserNaming,
+    DiscBrowserNamingLoad,
+    DiscBrowserNamingCustom,
+    DiscBrowserOverwrite,
+    DiscBrowserExtract,
+    DiscBrowserMore,
     DiscBrowserConvert,
     DiscBrowserClose,
 
@@ -540,8 +571,38 @@ impl TuiButton {
             | Self::CuePreviewBottom
             | Self::CuePreviewEditCommit
             | Self::CuePreviewEditCancel
+            | Self::DiscBrowserTitle
+            | Self::DiscBrowserTitleSize
             | Self::DiscBrowserStream(_)
             | Self::DiscBrowserExpand(_)
+            | Self::DiscBrowserTrack(_)
+            | Self::DiscBrowserTrackCheck(_)
+            | Self::DiscBrowserAnglePrev(_)
+            | Self::DiscBrowserAngleNext(_)
+            | Self::DiscBrowserOutput(_)
+            | Self::DiscBrowserFormatChoice(_)
+            | Self::DiscBrowserFilesChoice(_)
+            | Self::DiscBrowserOverwritePrev
+            | Self::DiscBrowserOverwriteNext
+            | Self::DiscBrowserOverwriteHelp
+            | Self::DiscBrowserOverwriteHelpOutside
+            | Self::DiscBrowserOverwriteHelpPassive
+            | Self::DiscBrowserToggle(_)
+            | Self::DiscBrowserTagsEdit
+            | Self::DiscBrowserTagSheetControl(_)
+            | Self::DiscBrowserTagSheetSourceChoice(_)
+            | Self::DiscBrowserTagSheetOutside
+            | Self::DiscBrowserTagSheetPassive
+            | Self::DiscBrowserFolderField
+            | Self::DiscBrowserFolderBrowse
+            | Self::DiscBrowserHint(_)
+            | Self::DiscBrowserHiddenToggle
+            | Self::DiscBrowserNaming
+            | Self::DiscBrowserNamingLoad
+            | Self::DiscBrowserNamingCustom
+            | Self::DiscBrowserOverwrite
+            | Self::DiscBrowserExtract
+            | Self::DiscBrowserMore
             | Self::DiscBrowserConvert
             | Self::DiscBrowserClose
             | Self::ActionsAvailable(_)

@@ -30,7 +30,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::errors::{ConvertError, ToolRunnerError};
 use super::progress::OperationProgressTracker;
-use super::tool::{ToolBinary, ToolCommand, ToolRunner};
+use super::tool::{NativeToolPause, ToolBinary, ToolCommand, ToolRunner};
 use super::track_executor::{run_tool_command_with_concurrency, ToolConcurrencyLimits};
 use super::types::{DvdVideoAudioCoding, DvdVideoVobFileRef, StagingDir, TrackSourceRef};
 use super::{
@@ -55,7 +55,34 @@ pub async fn realize_dvdv_track(
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
+    progress_tracker: Option<&mut OperationProgressTracker<'_>>,
+) -> Result<PathBuf, ConvertError> {
+    realize_dvdv_track_impl(src, staging, runner, cancel, tool_concurrency_limits, progress_tracker, false, None).await
+}
+
+/// RF64 intermediates are used only by native extraction. The existing
+/// Convert realization remains byte-for-byte the classic RIFF route.
+pub(super) async fn realize_dvdv_track_native(
+    src: &TrackSourceRef,
+    staging: &StagingDir,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
+    progress_tracker: Option<&mut OperationProgressTracker<'_>>,
+    native_pause: Arc<NativeToolPause>,
+) -> Result<PathBuf, ConvertError> {
+    realize_dvdv_track_impl(src, staging, runner, cancel, tool_concurrency_limits, progress_tracker, true, Some(native_pause)).await
+}
+
+async fn realize_dvdv_track_impl(
+    src: &TrackSourceRef,
+    staging: &StagingDir,
+    runner: &dyn ToolRunner,
+    cancel: &CancellationToken,
+    tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
     _progress_tracker: Option<&mut OperationProgressTracker<'_>>,
+    native_large: bool,
+    native_pause: Option<Arc<NativeToolPause>>,
 ) -> Result<PathBuf, ConvertError> {
     let TrackSourceRef::DvdVideoTrack {
         source,
@@ -120,6 +147,8 @@ pub async fn realize_dvdv_track(
                 *bit_depth,
                 *channels,
                 cancel,
+                native_large,
+                native_pause.as_deref(),
             )?;
         }
         DvdVideoAudioCoding::Ac3 | DvdVideoAudioCoding::Dts | DvdVideoAudioCoding::Mpeg => {
@@ -135,6 +164,8 @@ pub async fn realize_dvdv_track(
                 runner,
                 cancel,
                 tool_concurrency_limits,
+                native_large,
+                native_pause.as_deref(),
             )
             .await?;
         }
@@ -157,6 +188,8 @@ fn realize_lpcm_with_dvdvideo_demuxer(
     bit_depth: Option<u32>,
     channels: Option<u8>,
     cancel: &CancellationToken,
+    native_large: bool,
+    native_pause: Option<&NativeToolPause>,
 ) -> Result<(), ConvertError> {
     let sample_rate = sample_rate.ok_or_else(|| {
         ConvertError::TrackValidation(format!(
@@ -203,7 +236,11 @@ fn realize_lpcm_with_dvdvideo_demuxer(
     })?;
 
     let format = LpcmWavFormat::new(sample_rate, channels, bit_depth)?;
-    write_wav_header(&mut output, format, 0)?;
+    if native_large {
+        write_dvdv_rf64_header(&mut output, format, 0)?;
+    } else {
+        write_wav_header(&mut output, format, 0)?;
+    }
 
     let mut sector_reader = DvdVideoSectorReader::open(source, vob_files)?;
     let mut read_buffer = vec![0u8; DVDV_READ_CHUNK_BYTES];
@@ -220,6 +257,7 @@ fn realize_lpcm_with_dvdvideo_demuxer(
         cell_sectors,
         &mut read_buffer,
         cancel,
+        native_pause,
         |relative_sector, sector| {
             if !sector_has_selected_private_stream_1_pes_packet(sector, target_substream) {
                 return Ok(());
@@ -312,7 +350,15 @@ fn realize_lpcm_with_dvdvideo_demuxer(
         )));
     }
 
-    rewrite_wav_header(&mut output, format, data_bytes_written)?;
+    if native_large {
+        // WAVE chunks require even alignment. Keep actual sample byte length
+        // separate from this final padding byte in the ds64 data size.
+        if data_bytes_written & 1 != 0 { output.write_all(&[0]).map_err(wav_write_error)?; }
+        output.seek(SeekFrom::Start(0)).map_err(wav_write_error)?;
+        write_dvdv_rf64_header(&mut output, format, data_bytes_written)?;
+    } else {
+        rewrite_wav_header(&mut output, format, data_bytes_written)?;
+    }
     output.sync_all().map_err(|err| {
         ConvertError::Realize(format!(
             "failed to sync DVD-Video LPCM WAV '{}': {err}",
@@ -335,6 +381,8 @@ async fn decode_compressed_audio_stream(
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
+    native_large: bool,
+    native_pause: Option<&NativeToolPause>,
 ) -> Result<(), ConvertError> {
     // Keep compressed-codec decoding behind the project ToolRunner. The
     // previous streaming implementation spawned ffmpeg directly, which bypassed configured tool paths, command provenance,
@@ -355,6 +403,7 @@ async fn decode_compressed_audio_stream(
         audio_stream_index,
         audio_coding,
         cancel,
+        native_pause,
     )?;
 
     let decode_result = if cancel.is_cancelled() {
@@ -367,6 +416,7 @@ async fn decode_compressed_audio_stream(
             runner,
             cancel,
             tool_concurrency_limits,
+            native_large,
         )
         .await
     };
@@ -381,6 +431,7 @@ fn extract_elementary_stream(
     audio_stream_index: u8,
     audio_coding: DvdVideoAudioCoding,
     cancel: &CancellationToken,
+    native_pause: Option<&NativeToolPause>,
 ) -> Result<(), ConvertError> {
     debug_assert!(!matches!(audio_coding, DvdVideoAudioCoding::Lpcm));
 
@@ -401,6 +452,7 @@ fn extract_elementary_stream(
         audio_stream_index,
         audio_coding,
         cancel,
+        native_pause,
     )?;
 
     if bytes_written == 0 {
@@ -441,6 +493,7 @@ fn extract_elementary_stream_to_writer<W: Write>(
     audio_stream_index: u8,
     audio_coding: DvdVideoAudioCoding,
     cancel: &CancellationToken,
+    native_pause: Option<&NativeToolPause>,
 ) -> Result<u64, ConvertError> {
     debug_assert!(!matches!(audio_coding, DvdVideoAudioCoding::Lpcm));
 
@@ -454,6 +507,7 @@ fn extract_elementary_stream_to_writer<W: Write>(
         cell_sectors,
         &mut read_buffer,
         cancel,
+        native_pause,
         |_relative_sector, sector| {
             for pes in pes_payloads(sector) {
                 let Some(elementary) = selected_elementary_payload(
@@ -490,6 +544,7 @@ async fn decode_elementary_stream(
     runner: &dyn ToolRunner,
     cancel: &CancellationToken,
     tool_concurrency_limits: Option<&Arc<ToolConcurrencyLimits>>,
+    native_large: bool,
 ) -> Result<(), ConvertError> {
     let mut tmp = ScopedTempPath::for_final(wav_path, "decoded-wav")?;
     let tmp_path = tmp.path().to_path_buf();
@@ -515,8 +570,9 @@ async fn decode_elementary_stream(
         "wav".into(),
         "-c:a".into(),
         "pcm_s32le".into(),
-        tmp_path.to_string_lossy().into_owned(),
     ]);
+    if native_large { args.extend(["-rf64".into(), "auto".into()]); }
+    args.push(tmp_path.to_string_lossy().into_owned());
 
     let cmd = ToolCommand {
         environment_policy: tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
@@ -1000,6 +1056,7 @@ fn for_each_sector_in_authored_spans<F>(
     cell_sectors: &[(u32, u32)],
     buffer: &mut [u8],
     cancel: &CancellationToken,
+    native_pause: Option<&NativeToolPause>,
     mut visit: F,
 ) -> Result<(), ConvertError>
 where
@@ -1015,7 +1072,8 @@ where
 
         let mut next_sector = first;
         while next_sector <= last {
-            if cancel.is_cancelled() {
+            if native_pause.is_some_and(|pause| !pause.cooperative_checkpoint(cancel))
+                || cancel.is_cancelled() {
                 return Err(ConvertError::Realize("cancelled".to_string()));
             }
             let remaining = last
@@ -1535,6 +1593,19 @@ impl LpcmWavFormat {
     }
 }
 
+fn write_dvdv_rf64_header(
+    output: &mut File, format: LpcmWavFormat, data_len: u64,
+) -> Result<(), ConvertError> {
+    super::native_wav::write_native_rf64_carrier_header(output,
+        super::native_wav::NativeCarrierFormat {
+            rate: format.sample_rate, channels: format.channels,
+            container_bits: format.container_bits_per_sample,
+            valid_bits: format.valid_bits_per_sample,
+            channel_mask: None, extensible: format.format_extensible,
+        }, data_len)
+        .map_err(|e| ConvertError::Realize(format!("Native DVD-Video RF64 carrier: {e}")))
+}
+
 fn write_wav_header(
     output: &mut File,
     format: LpcmWavFormat,
@@ -1991,6 +2062,7 @@ mod tests {
             &[(2, 3), (0, 1)],
             &mut buf,
             &CancellationToken::new(),
+            None,
             |_relative_sector, sector| {
                 seen.push(sector[0]);
                 Ok(())

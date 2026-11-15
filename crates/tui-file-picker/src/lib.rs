@@ -18,6 +18,7 @@ mod filter;
 mod input;
 mod progress;
 mod render;
+pub use render::{text_input_spans, text_input_spans_with_caret};
 mod search;
 mod state;
 mod theme;

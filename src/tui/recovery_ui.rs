@@ -23,7 +23,7 @@ use tokio::sync::mpsc;
 use super::app::{ActiveOverlay, AppState, QueuedFileTransfer};
 use super::button_map::{ButtonRenderMap, TuiButton};
 use super::file_task_runtime::{
-    DurableFileTaskRecord, DurableQuarantineState,
+    DurableFileTaskLifecycle, DurableFileTaskRecord, DurableQuarantineState,
     RecoveryRecordVersion, RecoverySurfaceAvailability, RecoverySurfaceRecord,
 };
 use super::message::AppMessage;
@@ -139,6 +139,7 @@ impl RecoveryEntry {
 
     fn kind_label(&self) -> &'static str {
         match self.record.as_ref() {
+            Some(record) if record.is_native_extraction() => "extract",
             Some(record) if record.is_move => "move",
             Some(_) => "copy",
             None => "operation",
@@ -146,7 +147,22 @@ impl RecoveryEntry {
     }
 
     fn item_count(&self) -> usize {
-        self.record.as_ref().map_or(0, |record| record.mappings.len())
+        self.record.as_ref().map_or(0, |record| {
+            if record.is_native_extraction() {
+                let programs = record.job.get("native_extraction")
+                    .and_then(|job| job.get("programs"))
+                    .and_then(serde_json::Value::as_array);
+                let file_per_program = record.job.get("native_extraction")
+                    .and_then(|job| job.get("file_per_program"))
+                    .and_then(serde_json::Value::as_bool).unwrap_or(false);
+                return programs.map_or(0, |programs| {
+                    if file_per_program { programs.len() }
+                    else { programs.iter().map(|program| program.get("tracks")
+                        .and_then(serde_json::Value::as_array).map_or(0, Vec::len)).sum() }
+                });
+            }
+            record.mappings.len()
+        })
     }
 
     fn is_live(&self) -> bool {
@@ -194,11 +210,17 @@ impl RecoveryEntry {
         self.is_recoverable()
             && !self.is_discard_cleanup()
             && !self.discard_committed
-            && self.queue_id.is_some()
+            && !self.resume_committed
+            && match self.record.as_ref() {
+                Some(record) if record.is_native_extraction() =>
+                    record.lifecycle != DurableFileTaskLifecycle::Completed,
+                _ => self.queue_id.is_some(),
+            }
     }
 
     fn can_defer(&self) -> bool {
         self.is_recoverable()
+            && !self.record.as_ref().is_some_and(DurableFileTaskRecord::is_native_extraction)
             && self.queue_id.is_some()
             && !self.resume_committed
             && !self.discard_committed
@@ -206,6 +228,9 @@ impl RecoveryEntry {
 
     fn can_discard(&self) -> bool {
         self.is_recoverable()
+            && !self.record.as_ref().is_some_and(|record|
+                record.is_native_extraction()
+                    && record.lifecycle == DurableFileTaskLifecycle::Completed)
             && !self.resume_committed
             && !self.discard_committed
             && self.record.is_some()
@@ -226,6 +251,11 @@ impl RecoveryEntry {
 
     fn completed_count(&self) -> usize {
         self.record.as_ref().map_or(0, |record| {
+            if record.is_native_extraction() {
+                return if record.lifecycle == DurableFileTaskLifecycle::Completed {
+                    self.item_count()
+                } else { record.native_published_paths.len().min(self.item_count()) };
+            }
             record
                 .roots
                 .iter()
@@ -288,6 +318,11 @@ impl RecoveryEntry {
         let Some(record) = self.record.as_ref() else {
             return "record unreadable";
         };
+        if record.is_native_extraction() {
+            if record.lifecycle == DurableFileTaskLifecycle::Completed { return "completed"; }
+            return if record.native_published_paths.is_empty() { "not started" }
+                else { "partly completed" };
+        }
         let completed = self.completed_count();
         let total = self.item_count();
         let attempted = completed
@@ -359,7 +394,9 @@ impl RecoveryEntry {
     fn needs_attention(&self) -> bool {
         // A live copy is not an interrupted operation. Only jobs that have
         // lost their worker or wait for a recovery decision count here.
-        (!self.is_live() && !self.resume_committed && !self.discard_committed)
+        (!self.is_live() && !self.resume_committed && !self.discard_committed
+            && !self.record.as_ref().is_some_and(|record| record.is_native_extraction()
+                && record.lifecycle == DurableFileTaskLifecycle::Completed))
             || self.live_snapshot.as_ref().is_some_and(|s| {
             matches!(s.phase, tui_file_picker::FileTaskPhase::Paused)
         })
@@ -422,7 +459,7 @@ impl RecoveryUiState {
     pub fn from_records(records: Vec<RecoverySurfaceRecord>, queued: &VecDeque<QueuedFileTransfer>) -> Self {
         let mut state = Self::default();
         state.replace_records(records, queued);
-        state.prompt_pending = !state.entries.is_empty();
+        state.prompt_pending = state.entries.iter().any(RecoveryEntry::needs_attention);
         state
     }
 
@@ -484,7 +521,7 @@ impl RecoveryUiState {
             .collect::<BTreeSet<_>>();
         self.incomplete_sizes
             .retain(|path, _| current_incomplete.contains(path));
-        if self.entries.is_empty() && !self.prompt_shown {
+        if !self.entries.iter().any(RecoveryEntry::needs_attention) && !self.prompt_shown {
             // The startup set was resolved by another process before the
             // prompt could be shown. Do not let a later unrelated recovery
             // resurrect a stale "session-start" prompt.
@@ -549,6 +586,9 @@ impl RecoveryUiState {
     }
 
     fn can_resume_unattended(&self, entry: &RecoveryEntry) -> bool {
+        if entry.record.as_ref().is_some_and(DurableFileTaskRecord::is_native_extraction) {
+            return false;
+        }
         entry.can_resume() && !entry_has_destination_overlap(&self.entries, entry)
     }
 
@@ -642,7 +682,7 @@ fn queued_recovery_journal(job: &QueuedFileTransfer) -> Option<&Path> {
 
 fn recovery_is_already_runnable_or_active(app: &AppState, journal_path: &Path) -> bool {
     app.file_transfers.queued.iter().any(|job| {
-        queued_recovery_journal(job) == Some(journal_path)
+        job.transfer().and_then(queued_recovery_journal) == Some(journal_path)
     }) || app.file_transfers.pending_by_session.values().any(|pending| {
         pending
             .retry_plan
@@ -896,8 +936,11 @@ fn watch_selected_progress(app: &mut AppState) {
     };
     let Some(record) = entry.record.as_ref() else { return; };
     let mut progress = tui_file_picker::FileTaskProgressState::new(
-        if record.is_move { tui_file_picker::FileTaskKind::Move } else { tui_file_picker::FileTaskKind::Copy },
-        format!("{} (reconnected)", if record.is_move { "Move" } else { "Copy" }),
+        if record.is_native_extraction() { tui_file_picker::FileTaskKind::Extract }
+        else if record.is_move { tui_file_picker::FileTaskKind::Move }
+        else { tui_file_picker::FileTaskKind::Copy },
+        format!("{} (reconnected)", if record.is_native_extraction() { "Extraction" }
+            else if record.is_move { "Move" } else { "Copy" }),
         super::keybindings::file_picker_theme_from_theme(&app.theme),
     );
     let mut scope = tui_file_picker::FileTaskScope::new(summarize_sources(record));
@@ -1039,7 +1082,8 @@ pub fn refresh_from_runtime(app: &mut AppState) {
         ..
     } = super::file_task_runtime::startup_file_task_recovery_inventory();
     sync_recovery_review_queue(app, recoveries);
-    app.file_transfers.unresolved_recovery_count = recovery_surface_records.len();
+    app.file_transfers.unresolved_recovery_count =
+        super::file_task_runtime::recovery_reservation_count(&recovery_surface_records);
     app.recovery_ui.replace_records(
         recovery_surface_records,
         &app.file_transfers.recovery_queued,
@@ -1053,7 +1097,7 @@ pub fn refresh_from_runtime(app: &mut AppState) {
         .file_transfers
         .queued
         .iter()
-        .filter_map(queued_recovery_journal)
+        .filter_map(|job| job.transfer().and_then(queued_recovery_journal))
         .chain(app.file_transfers.pending_by_session.values().filter_map(|pending| {
             pending
                 .retry_plan
@@ -1065,8 +1109,9 @@ pub fn refresh_from_runtime(app: &mut AppState) {
     for entry in &mut app.recovery_ui.entries {
         entry.resume_committed = resume_committed.contains(&entry.journal_path);
         entry.approved_resume_queue_id = app.file_transfers.queued.iter()
-            .find(|job| queued_recovery_journal(job) == Some(entry.journal_path.as_path()))
-            .map(|job| job.queue_id);
+            .find(|job| job.transfer().and_then(queued_recovery_journal)
+                == Some(entry.journal_path.as_path()))
+            .map(|job| job.queue_id());
     }
 }
 
@@ -1407,6 +1452,22 @@ fn defer_selected(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
 }
 
 fn resume_selected(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
+    if let Some(entry) = app.recovery_ui.selected_entry().filter(|entry| {
+        entry.can_resume() && entry.record.as_ref().is_some_and(DurableFileTaskRecord::is_native_extraction)
+    }) {
+        let path = entry.journal_path.clone();
+        app.recovery_ui.minimize();
+        app.active_overlay = ActiveOverlay::None;
+        match super::native_extract_task::resume_from_journal(app, &path, tx) {
+            Ok(()) => app.set_status("Resuming native extraction in detached file-task worker"),
+            Err(error) => {
+                app.recovery_ui.open_window();
+                app.active_overlay = ActiveOverlay::FileRecovery;
+                app.set_status(format!("Cannot resume extraction: {error}"));
+            }
+        }
+        return;
+    }
     let Some(queue_id) = app
         .recovery_ui
         .selected_entry()
@@ -3902,6 +3963,12 @@ mod tests {
             admitted_mappings: mappings,
             admitted_destination_root: None,
             job: serde_json::json!({}),
+            native_published_paths: Vec::new(),
+            native_skipped_selections: Vec::new(),
+            native_unfinished_outputs: Vec::new(),
+            native_log_sha256: None,
+            native_log_digests: Default::default(),
+            native_prepared_cues: Vec::new(),
             retry_plan: None,
             roots: Vec::new(),
             temp_artifacts: Vec::new(),
@@ -4333,7 +4400,7 @@ mod tests {
         app.file_transfers.queued.push_back(QueuedFileTransfer {
             queue_id: 88, clipboard, clipboard_owner_generation: None,
             destination_dir: dest, enqueue_plan: plan, retry_plan: Some(retry), recovered: true,
-        });
+        }.into());
         app.recovery_ui.entries.push(entry);
         app.recovery_ui.focus = 0;
         let (tx, _rx) = mpsc::channel(8);

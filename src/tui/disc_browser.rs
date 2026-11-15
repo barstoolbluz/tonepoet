@@ -9,10 +9,14 @@
 //! The functions here intentionally avoid UI side effects except for
 //! spawning a probe message. Renderers and key handlers own state mutation.
 
+use std::cell::RefCell;
 use std::fs::{self, Metadata};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use tokio_util::sync::CancellationToken;
+
+static NEXT_EXTRACT_PROBE_ID: AtomicU64 = AtomicU64::new(1);
 use std::time::SystemTime;
 
 use tokio::sync::mpsc;
@@ -204,6 +208,42 @@ fn platform_file_identity(_metadata: &Metadata) -> Option<(u64, u64)> {
     None
 }
 
+/// One proposed destination, computed with the worker's naming functions.
+/// These values are pure selection facts; no filesystem work is done while
+/// building a plan, so a redraw can compare plans cheaply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeSpaceOutput {
+    path: PathBuf,
+    program_index: usize,
+    audio_bytes: u64,
+    largest_item: u64,
+    item_count: usize,
+    taggable_dsf: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeSpaceKey {
+    outputs: Vec<NativeSpaceOutput>,
+    format: DiscFormat,
+    continuous: bool,
+    overwrite: crate::convert::pipeline::native_extract::NativeOverwritePolicy,
+    artwork: bool,
+    source: PathBuf,
+    cue: bool,
+    extraction_log: bool,
+}
+
+#[derive(Debug, Clone)]
+struct NativeSpaceCache {
+    key: NativeSpaceKey,
+    /// Shared-volume peak, retaining the existing sequential/replace budget.
+    required: u64,
+    /// Independent peaks when private working storage and output are on
+    /// different volumes. No scratch bytes are charged to the destination.
+    working_required: u64,
+    destination_required: u64,
+}
+
 /// Modal overlay state for browsing the presentations on one disc source.
 #[derive(Debug, Clone)]
 pub struct DiscBrowserState {
@@ -216,7 +256,108 @@ pub struct DiscBrowserState {
     /// rows. It is deliberately not a presentation index.
     pub scroll: usize,
     pub source_path: PathBuf,
+    /// Native extraction uses one selection bitmap per presentation. Chapter
+    /// selections are synchronized across streams in the same authored title.
+    pub items_checked: Vec<Vec<bool>>,
+    pub focus: ExtractFocus,
+    /// Same title-bar window state as Folder Properties and Recovery.
+    pub maximized: bool,
+    pub item_cursor: usize,
+    pub item_scroll: usize,
+    pub output_cursor: usize,
+    /// Keyboard focus among Extract, Convert, Options, and Close.
+    pub footer_cursor: usize,
+    /// Set by the renderer from the actual popup geometry; keyboard arrows
+    /// must use the same one- or two-column layout the user sees.
+    pub form_wide: std::cell::Cell<bool>,
+    pub form_column: usize,
+    pub footer_extract_enabled: std::cell::Cell<bool>,
+    /// Read-only Overwrite help sheet. The cycler's committed policy is
+    /// independent of opening or dismissing this explanation.
+    pub overwrite_open: bool,
+    pub show_hidden: bool,
+    pub panel: Option<ExtractPanel>,
+    /// Focused control in the Tags sheet (index into tag_sheet_controls).
+    pub panel_cursor: usize,
+    pub tag_source_open: bool,
+    pub tag_source_cursor: usize,
+    /// A MusicBrainz match was accepted and committed through the existing
+    /// editor/sidecar route for this Extract session.
+    pub tag_mb_available: bool,
+    /// Saved sidecar values are being refreshed through the existing probe.
+    pub tag_refresh_pending: bool,
+    pub tag_refresh_failed: bool,
+    /// Discovered once when opening the sheet, never scanned on each frame.
+    pub tag_preview_artwork: Option<PathBuf>,
+    pub editing_destination: bool,
+    /// Authoritative text editor shared with Browse, file picker and metadata screens.
+    pub text_edit: Option<super::text_input::TextInputState>,
+    /// The active field's mouse-down origin for shared drag-selection behavior.
+    pub text_mouse_origin: Option<(usize, usize)>,
+    pub text_mouse_drag_started: bool,
+    /// Compatibility projection for existing native destination and naming consumers.
+    pub destination_input: String,
+    /// Unicode scalar insertion point in the active destination editor.
+    pub destination_caret: usize,
+    /// Cached destination feedback, refreshed on edits and picker completion.
+    pub destination_feedback: Option<DestinationFeedback>,
+    pub editing_template: bool,
+    pub naming_template: String,
+    pub program_subfolders: bool,
+    pub overwrite_policy: crate::convert::pipeline::native_extract::NativeOverwritePolicy,
+    pub extraction_log: bool,
+    pub destination: PathBuf,
+    pub wav_container: crate::convert::pipeline::native_extract::NativeWavContainer,
+    pub keep_dst: Vec<bool>,
+    /// The Format radio selection for all SACD outputs. Older native jobs
+    /// default to DSF; per-area keep_dst may still force DST/DFF.
+    pub sacd_dff: bool,
+    /// One authored angle per title/playlist, shared by all its audio streams.
+    pub selected_angles: Vec<u8>,
+    pub tags: bool,
+    pub tag_source: crate::convert::pipeline::native_extract::NativeTagSource,
+    pub tag_fields: u16,
+    pub tag_artwork: bool,
+    /// Cached destination inventory for capacity display. Path existence is
+    /// checked on a selection/settings change, not on every TUI redraw; the
+    /// Extract action always refreshes immediately before queuing the job.
+    native_space_cache: RefCell<Option<NativeSpaceCache>>,
+    pub assume_decrypted: bool,
+    pub downmix: crate::convert::pipeline::DvdaDownmixPolicy,
+    pub file_per_program: bool,
+    pub cue: bool,
+    pub dvda_group_preset: u8,
+    /// Source reads for the pre-extraction eligibility probe never run on the
+    /// UI reducer. A late completion only applies to this overlay generation.
+    pub probe_id: u64,
+    pub probe_cancel: CancellationToken,
+    /// One bounded evidence result per presentation. Pending programs cannot
+    /// be extracted, and a failure disables only its own stream, not unrelated
+    /// playable streams. Convert is never gated by these results.
+    pub probe_statuses: Vec<Option<Result<crate::convert::pipeline::native_extract::NativeProbeFacts, String>>>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtractFocus { Programs, Items, Output, Footer }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DestinationFeedback { WillBeCreated, NotWritable, InvalidPath }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtractPanel { Tags, Downmix, AssumeDecrypted, Diagnostics, More, ConvertChoice, Keys }
+
+/// Shared Tags-sheet focus and mouse activation targets. No row-specific key
+/// shortcuts or hidden hot spots: all items use the same activation path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagSheetControl {
+    Transfer, Source, Field(usize), All, None, Artwork, UseDsf,
+    EditValues, MusicBrainz, Done,
+}
+
+pub const NATIVE_TAG_FIELD_LABELS: [&str; 9] = [
+    "Title", "Artist", "Album", "Genre", "Year", "Composer", "Performer",
+    "Catalog", "Publisher",
+];
 
 /// One logical row in the Audio Streams overlay after expansion is applied.
 ///
@@ -232,14 +373,90 @@ pub enum DiscBrowserVisibleRow {
 impl DiscBrowserState {
     pub fn new(contents: DiscContents, source_path: PathBuf) -> Self {
         let len = contents.presentations.len();
-        Self {
+        let selected: Vec<bool> = contents.presentations.iter().enumerate().map(|(index, p)| {
+            p.extract.ineligible_reason.is_none()
+                && !matches!(p.id, PresentationId::BluRayTitle { display_angle, .. } if display_angle.get() != 1)
+                && match contents.format {
+                DiscFormat::Sacd | DiscFormat::DvdAudio => true,
+                DiscFormat::DvdVideo | DiscFormat::BluRay =>
+                    (0..index).all(|earlier| contents.presentations[earlier].extract.ineligible_reason.is_some()),
+            }
+        }).collect();
+        let items_checked = contents.presentations.iter().map(|p| vec![true; p.tracks.len()]).collect();
+        // Selection can change before the user starts Extract. Probe every
+        // eligible source needing media evidence, not just initially checked
+        // rows, so checking an alternate language/playlist cannot bypass a
+        // previously completed preflight for a different presentation.
+        let probe_statuses = contents.presentations.iter().map(|p| {
+            if p.extract.ineligible_reason.is_none()
+                && !matches!(p.id, PresentationId::BluRayTitle { display_angle, .. }
+                    if display_angle.get() != 1)
+                && (
+                matches!(contents.format, DiscFormat::DvdVideo | DiscFormat::BluRay)
+                || (contents.format != DiscFormat::Sacd && p.format.lossless
+                    && p.format.bit_depth.is_none())
+            ) { None } else { Some(Ok(Default::default())) }
+        }).collect();
+        let mut state = Self {
             contents,
             cursor: 0,
             expanded: vec![false; len],
-            selected: vec![false; len],
+            selected,
             scroll: 0,
-            source_path,
-        }
+            source_path: source_path.clone(),
+            items_checked,
+            focus: ExtractFocus::Programs,
+            maximized: false,
+            item_cursor: 0,
+            item_scroll: 0,
+            output_cursor: 0,
+            footer_cursor: 0,
+            form_wide: std::cell::Cell::new(false),
+            form_column: 0,
+            footer_extract_enabled: std::cell::Cell::new(true),
+            overwrite_open: false,
+            show_hidden: false,
+            panel: None,
+            panel_cursor: 0,
+            tag_source_open: false,
+            tag_source_cursor: 0,
+            tag_mb_available: false,
+            tag_refresh_pending: false,
+            tag_refresh_failed: false,
+            tag_preview_artwork: None,
+            editing_destination: false,
+            text_edit: None,
+            text_mouse_origin: None,
+            text_mouse_drag_started: false,
+            destination_input: String::new(),
+            destination_caret: 0,
+            destination_feedback: None,
+            editing_template: false,
+            naming_template: "%TRACKNUMBER% - %TITLE%".into(),
+            program_subfolders: true,
+            overwrite_policy: crate::convert::pipeline::native_extract::NativeOverwritePolicy::Fail,
+            extraction_log: false,
+            destination: source_path.parent().unwrap_or(Path::new(".")).join("Extracted"),
+            wav_container: crate::convert::pipeline::native_extract::NativeWavContainer::Automatic,
+            keep_dst: vec![false; len],
+            sacd_dff: false,
+            selected_angles: vec![1; len],
+            tags: true,
+            tag_source: crate::convert::pipeline::native_extract::NativeTagSource::DiscAndSidecar,
+            tag_fields: 0x7f,
+            tag_artwork: true,
+            native_space_cache: RefCell::new(None),
+            assume_decrypted: false,
+            downmix: crate::convert::pipeline::DvdaDownmixPolicy::None,
+            file_per_program: false,
+            cue: false,
+            dvda_group_preset: 0,
+            probe_id: NEXT_EXTRACT_PROBE_ID.fetch_add(1, Ordering::Relaxed),
+            probe_cancel: CancellationToken::new(),
+            probe_statuses,
+        };
+        if state.destination.is_absolute() { state.refresh_destination_feedback(); }
+        state
     }
 
     pub fn len(&self) -> usize {
@@ -262,11 +479,18 @@ impl DiscBrowserState {
             return;
         }
         let max = len - 1;
-        self.cursor = if delta < 0 {
-            self.cursor.saturating_sub(delta.unsigned_abs())
-        } else {
-            self.cursor.saturating_add(delta as usize).min(max)
-        };
+        let mut next = self.cursor;
+        for _ in 0..delta.unsigned_abs() {
+            let mut candidate = next;
+            loop {
+                let following = if delta < 0 { candidate.saturating_sub(1) }
+                    else { candidate.saturating_add(1).min(max) };
+                if following == candidate { break; }
+                candidate = following;
+                if self.is_visible_program(candidate) { next = candidate; break; }
+            }
+        }
+        self.cursor = next;
     }
 
     pub fn toggle_expanded(&mut self, index: usize) {
@@ -275,14 +499,47 @@ impl DiscBrowserState {
         }
     }
 
+    /// Only angle-one presentations are drawn as audio-stream rows: the angle
+    /// selector controls the authored angle for *every* stream in the group.
+    pub fn is_visible_program(&self, index: usize) -> bool {
+        self.contents.presentations.get(index).is_some_and(|p|
+            !matches!(p.id, PresentationId::BluRayTitle { display_angle, .. } if display_angle.get() != 1))
+    }
+
+    pub fn selected_angle_for(&self, index: usize) -> u8 {
+        self.selected_angles.get(index).copied().unwrap_or(1)
+    }
+
+    pub fn cycle_angle_for(&mut self, index: usize, step: i32) {
+        if !self.is_visible_program(index) { return; }
+        let max = self.contents.presentations.get(index).map_or(1, |p| p.extract.angle_count.max(1));
+        if max <= 1 { return; }
+        let current = self.selected_angle_for(index);
+        let next = ((i32::from(current) - 1 + step).rem_euclid(i32::from(max)) + 1) as u8;
+        for i in 0..self.len() {
+            if self.shared_program(index, i) { self.selected_angles[i] = next; }
+        }
+    }
+
+    /// Extraction restrictions do not affect the existing Convert dispatcher.
+    pub fn is_extractable(&self, index: usize) -> bool {
+        self.is_visible_program(index) && self.contents.presentations.get(index)
+            .is_some_and(|p| p.extract.ineligible_reason.is_none())
+            && !matches!(self.probe_statuses.get(index), Some(Some(Err(_))))
+    }
+
     pub fn toggle_selected(&mut self, index: usize) {
+        if !self.is_extractable(index) { return; }
         if let Some(selected) = self.selected.get_mut(index) {
             *selected = !*selected;
+            if *selected && !self.items_checked[index].iter().any(|checked| *checked) {
+                self.items_checked[index].fill(true);
+            }
         }
     }
 
     pub fn set_cursor(&mut self, index: usize) {
-        if index < self.len() {
+        if index < self.len() && self.is_visible_program(index) {
             self.cursor = index;
         }
     }
@@ -301,6 +558,1037 @@ impl DiscBrowserState {
         } else {
             self.scroll = self.scroll.saturating_add(delta as usize);
         }
+    }
+}
+
+impl DiscBrowserState {
+    pub fn selected_item_count(&self) -> usize {
+        self.selected.iter().enumerate().filter(|(_, selected)| **selected)
+            .map(|(i, _)| self.items_checked.get(i).map_or(0, |items| items.iter().filter(|v| **v).count()))
+            .sum()
+    }
+
+    pub fn selected_program_count(&self) -> usize {
+        self.selected.iter().filter(|v| **v).count()
+    }
+
+    fn native_item_payload_bytes(&self, p: &DiscPresentation, track: &DiscTrack) -> Option<u64> {
+        let rate = p.format.sample_rate? as f64;
+        let channels = f64::from(p.format.channels?);
+        let bits = if self.contents.format == DiscFormat::Sacd { 1 }
+            else if p.format.lossless { p.format.bit_depth? } else { 24 };
+        let bytes_per_sample = if bits == 1 { 1.0 / 8.0 }
+            else { f64::from(bits.div_ceil(8)) };
+        let seconds = track.duration_secs?;
+        if !seconds.is_finite() || seconds < 0.0 { return None; }
+        let estimate = (seconds * rate * channels * bytes_per_sample).ceil();
+        if !estimate.is_finite() || estimate > u64::MAX as f64 { return None; }
+        Some(estimate as u64)
+    }
+
+    /// Native payload estimate, largest individual item and largest selected
+    /// program. The latter bounds the simultaneous intermediates retained by
+    /// continuous-file concatenation, even for many small chapters.
+    pub fn selected_item_bytes(&self) -> Option<(u64, u64, u64)> {
+        let mut total = 0u64;
+        let mut largest = 0u64;
+        let mut largest_program = 0u64;
+        for (i, selected) in self.selected.iter().enumerate() {
+            if !*selected { continue; }
+            let mut program_bytes = 0u64;
+            let p = self.contents.presentations.get(i)?;
+            for (j, track) in p.tracks.iter().enumerate() {
+                if !self.items_checked.get(i)?.get(j).copied().unwrap_or(false) { continue; }
+                let bytes = self.native_item_payload_bytes(p, track)?;
+                total = total.checked_add(bytes)?;
+                program_bytes = program_bytes.checked_add(bytes)?;
+                largest = largest.max(bytes);
+            }
+            largest_program = largest_program.max(program_bytes);
+        }
+        Some((total, largest, largest_program))
+    }
+
+    /// Combined peak for staging and publication on a shared filesystem.
+    /// For continuous PCM, retain chapter outputs, the full raw concatenation
+    /// spool, and the final container, plus the largest decoded carrier.
+    /// SACD has no decoded WAV carrier. Separate tracks are published one at
+    /// a time; continuous SACD retains its track files while joining them.
+    pub(crate) fn required_native_volume_bytes(&self, total: u64, largest: u64, largest_program: u64) -> u64 {
+        self.native_bytes_with_allowance(total, largest, largest_program, self.selected_item_count())
+    }
+
+    fn native_bytes_with_allowance(&self, total: u64, largest: u64, largest_program: u64, items: usize) -> u64 {
+        let allowance = (items as u64).saturating_mul(128 * 1024);
+        if self.contents.format == DiscFormat::Sacd {
+            let payload = if self.file_per_program { total.saturating_mul(2) } else { total };
+            return payload.saturating_add(allowance);
+        }
+        let intermediate = if self.file_per_program { largest_program.saturating_mul(2) } else { 0 };
+        total.saturating_add(intermediate)
+            .saturating_add(largest.saturating_mul(3))
+            .saturating_add(allowance)
+    }
+
+    /// Build destination paths through the worker's own template resolver.
+    /// No path is stat'ed here; this is safe to compare on TUI redraws.
+    fn native_space_key(&self) -> Option<NativeSpaceKey> {
+        use crate::convert::pipeline::native_extract::{proposed_destination, proposed_destination_for_program};
+        let job = self.native_job(PathBuf::new());
+        let mut outputs = Vec::new();
+        let indices = self.selected.iter().enumerate()
+            .filter(|(index, checked)| **checked && self.is_extractable(*index)
+                && self.items_checked.get(*index).is_some_and(|items| items.iter().any(|item| *item)))
+            .map(|(index, _)| index);
+        for (index, program) in indices.zip(&job.programs) {
+            let presentation = self.contents.presentations.get(index)?;
+            let mut program_bytes = 0u64;
+            let mut largest = 0u64;
+            for track in &program.tracks {
+                let number = usize::try_from(track.number).ok()?;
+                let disc_track = presentation.tracks.get(number.checked_sub(1)?)?;
+                let bytes = self.native_item_payload_bytes(presentation, disc_track)?;
+                program_bytes = program_bytes.checked_add(bytes)?;
+                largest = largest.max(bytes);
+                if !self.file_per_program {
+                    outputs.push(NativeSpaceOutput {
+                        path: proposed_destination(&job, program, track),
+                        program_index: index, audio_bytes: bytes, largest_item: bytes,
+                        item_count: 1,
+                        taggable_dsf: self.contents.format == DiscFormat::Sacd
+                            && self.tags && !self.sacd_dff && !program.keep_dst,
+                    });
+                }
+            }
+            if self.file_per_program {
+                outputs.push(NativeSpaceOutput {
+                    path: proposed_destination_for_program(&job, program),
+                    program_index: index, audio_bytes: program_bytes,
+                    largest_item: largest, item_count: program.tracks.len(),
+                    taggable_dsf: self.contents.format == DiscFormat::Sacd
+                        && self.tags && !self.sacd_dff && !program.keep_dst,
+                });
+            }
+        }
+        Some(NativeSpaceKey {
+            outputs, format: self.contents.format, continuous: self.file_per_program,
+            overwrite: self.overwrite_policy, artwork: self.tags && self.tag_artwork,
+            source: self.source_path.clone(), cue: self.cue,
+            extraction_log: self.extraction_log,
+        })
+    }
+
+    /// Budget for a shared filesystem; the same cached inventory also
+    /// produces separate working/destination budgets for cross-volume output.
+    /// Skip excludes untouched targets. Replace budgets the
+    /// peak of sequential private outputs, net of previously replaced files,
+    /// rather than requiring a second copy of every existing destination.
+    /// Cached results avoid directory scans on every redraw. The launch action
+    /// calls this with `refresh` so external destination changes are observed.
+    pub(crate) fn native_required_volume_bytes(&self, refresh: bool) -> Option<u64> {
+        use crate::convert::pipeline::native_extract::{native_artwork_path, NativeOverwritePolicy};
+        let key = self.native_space_key()?;
+        if !refresh {
+            if let Some(cache) = self.native_space_cache.borrow().as_ref() {
+                if cache.key == key { return Some(cache.required); }
+            }
+        }
+        // An already discovered cover is known additional DSF ID3 payload.
+        // Other materializer-provided art is not available until media prep.
+        let artwork_bytes = if key.artwork && key.format == DiscFormat::Sacd {
+            native_artwork_path(&Default::default(), &key.source)
+                .and_then(|path| fs::metadata(path).ok().map(|info| info.len()))
+                .unwrap_or(0)
+        } else { 0 };
+        let mut active = Vec::with_capacity(key.outputs.len());
+        for output in &key.outputs {
+            let existing = if key.overwrite == NativeOverwritePolicy::Fail { None }
+                else { fs::symlink_metadata(&output.path).ok() };
+            if key.overwrite == NativeOverwritePolicy::Skip && existing.is_some() { continue; }
+            let extra = if output.taggable_dsf {
+                crate::dsf_tags::REWRITE_PADDING_BYTES.saturating_add(artwork_bytes)
+            } else { 0 };
+            active.push((output, existing.filter(|meta| meta.is_file()).map(|meta| meta.len()), extra));
+        }
+        let required = if key.overwrite == NativeOverwritePolicy::Replace {
+            // The continuous worker retains completed component files in its
+            // private directory until the job finishes; the PCM join spool is
+            // additionally live while the final container is being written.
+            let mut previous_delta: i128 = 0;
+            let mut retained_parts = 0u64;
+            let mut peak: i128 = 0;
+            for (output, existing, extra) in &active {
+                let overhead = (output.item_count as u64).saturating_mul(128 * 1024);
+                let final_bytes = output.audio_bytes.saturating_add(*extra).saturating_add(overhead);
+                // After artwork-first DSF writes, an ordinary text edit may
+                // journal the existing ID3 tail in place. The journal holds
+                // metadata, never a second copy of the audio payload.
+                let tail_journal = if key.artwork && output.taggable_dsf { *extra } else { 0 };
+                let work = if key.format == DiscFormat::Sacd {
+                    final_bytes.saturating_add(if key.continuous { output.audio_bytes } else { 0 })
+                } else if key.continuous {
+                    final_bytes.saturating_add(output.audio_bytes.saturating_mul(2))
+                        .saturating_add(output.largest_item.saturating_mul(3))
+                } else {
+                    final_bytes.saturating_add(output.audio_bytes.saturating_mul(3))
+                };
+                peak = peak.max(previous_delta + i128::from(retained_parts)
+                    + i128::from(work.saturating_add(tail_journal)));
+                previous_delta += i128::from(final_bytes) - i128::from(existing.unwrap_or(0));
+                if key.continuous { retained_parts = retained_parts.saturating_add(output.audio_bytes); }
+                peak = peak.max(previous_delta + i128::from(retained_parts));
+            }
+            peak.max(0).min(i128::from(u64::MAX)) as u64
+        } else {
+            let mut total = 0u64;
+            let mut largest = 0u64;
+            let mut per_program = std::collections::BTreeMap::<usize,u64>::new();
+            let mut items = 0usize;
+            let mut extra = 0u64;
+            for (output, _, metadata_extra) in &active {
+                total = total.saturating_add(output.audio_bytes);
+                largest = largest.max(output.largest_item);
+                let group = per_program.entry(output.program_index).or_default();
+                *group = group.saturating_add(output.audio_bytes);
+                items = items.saturating_add(output.item_count);
+                extra = extra.saturating_add(*metadata_extra);
+            }
+            let largest_program = per_program.values().copied().max().unwrap_or(0);
+            self.native_bytes_with_allowance(total, largest, largest_program, items)
+                .saturating_add(extra)
+        };
+        // Only one DSF text update runs at a time. The largest metadata tail
+        // may be duplicated temporarily in its rollback journal.
+        let tail_journal = if key.overwrite != NativeOverwritePolicy::Replace && key.artwork {
+            active.iter().filter(|(output, _, _)| output.taggable_dsf)
+                .map(|(_, _, extra)| *extra).max().unwrap_or(0)
+        } else { 0 };
+        let extras = (if key.extraction_log { 128 * 1024 } else { 0 })
+            + (if key.cue { (active.len() as u64).saturating_mul(128 * 1024) } else { 0 });
+        let required = required.saturating_add(extras).saturating_add(tail_journal);
+
+        // With a separate scratch volume, completed files are published one
+        // at a time. Scratch holds the private output and its intermediates;
+        // destination holds only the net published media. During a replacement
+        // the old destination remains allocated until the atomic rename, so
+        // charge the full new output *before* subtracting the old allocation.
+        let mut destination_delta: i128 = 0;
+        let mut destination_peak: i128 = 0;
+        let mut retained_parts = 0u64;
+        let mut working_peak = 0u64;
+        for (output, existing, extra) in &active {
+            let overhead = (output.item_count as u64).saturating_mul(128 * 1024);
+            let final_bytes = output.audio_bytes.saturating_add(*extra).saturating_add(overhead);
+            destination_peak = destination_peak.max(destination_delta + i128::from(final_bytes));
+            destination_delta += i128::from(final_bytes) - i128::from(existing.unwrap_or(0));
+            destination_peak = destination_peak.max(destination_delta);
+
+            let work = if key.format == DiscFormat::Sacd {
+                final_bytes.saturating_add(if key.continuous { output.audio_bytes } else { 0 })
+            } else if key.continuous {
+                final_bytes.saturating_add(output.audio_bytes.saturating_mul(2))
+                    .saturating_add(output.largest_item.saturating_mul(3))
+            } else {
+                final_bytes.saturating_add(output.largest_item.saturating_mul(3))
+            };
+            let journal = if key.artwork && output.taggable_dsf { *extra } else { 0 };
+            working_peak = working_peak.max(retained_parts.saturating_add(work).saturating_add(journal));
+            if key.continuous { retained_parts = retained_parts.saturating_add(output.audio_bytes); }
+            working_peak = working_peak.max(retained_parts);
+        }
+        let destination_required = destination_peak.max(0).min(i128::from(u64::MAX)) as u64;
+        let destination_required = destination_required.saturating_add(extras);
+        let working_required = working_peak.saturating_add(extras);
+        *self.native_space_cache.borrow_mut() = Some(NativeSpaceCache {
+            key, required, working_required, destination_required,
+        });
+        Some(required)
+    }
+
+    /// Required free bytes on (destination, scratch) when the volumes differ.
+    /// The same inventory/cache as the shared-volume estimator is used.
+    pub(crate) fn native_split_volume_bytes(&self, refresh: bool) -> Option<(u64, u64)> {
+        self.native_required_volume_bytes(refresh)?;
+        self.native_space_cache.borrow().as_ref()
+            .map(|cache| (cache.destination_required, cache.working_required))
+    }
+
+    pub(crate) fn native_storage_shares_destination_volume(&self, scratch: &Path) -> bool {
+        match (existing_ancestor(&self.destination), existing_ancestor(scratch)) {
+            (Ok(destination), Ok(working)) => same_filesystem_paths(destination, working),
+            _ => false,
+        }
+    }
+
+    pub fn shared_program(&self, left: usize, right: usize) -> bool {
+        let Some(a) = self.contents.presentations.get(left) else { return false; };
+        let Some(b) = self.contents.presentations.get(right) else { return false; };
+        match (a.id, b.id) {
+            (PresentationId::DvdVideoTitle { vts_number: av, title_number: at, .. },
+             PresentationId::DvdVideoTitle { vts_number: bv, title_number: bt, .. }) => av == bv && at == bt,
+            (PresentationId::BluRayTitle { playlist_number: ap, .. },
+             PresentationId::BluRayTitle { playlist_number: bp, .. }) => ap == bp,
+            _ => left == right,
+        }
+    }
+
+    /// Chapter membership is shared within a DVD title/Blu-ray playlist,
+    /// but checking a chapter must not silently select an audio stream the
+    /// user explicitly unchecked. Only the focused stream is reselected.
+    pub fn set_item_checked(&mut self, index: usize, checked: bool) {
+        if index >= self.contents.presentations.get(self.cursor).map_or(0, |p| p.tracks.len()) {
+            return;
+        }
+        for i in 0..self.len() {
+            if self.shared_program(self.cursor, i) && index < self.items_checked[i].len() {
+                self.items_checked[i][index] = checked;
+                if !self.items_checked[i].iter().any(|value| *value) {
+                    self.selected[i] = false;
+                }
+            }
+        }
+        if checked && self.is_extractable(self.cursor) { self.selected[self.cursor] = true; }
+    }
+
+    pub fn toggle_item(&mut self, index: usize) {
+        if let Some(checked) = self.items_checked.get(self.cursor).and_then(|row| row.get(index)) {
+            self.set_item_checked(index, !*checked);
+        }
+    }
+
+    /// Extend selection using explicit check operations, not a series of
+    /// toggles. Repeating Shift+Down is idempotent over the selected range.
+    pub fn check_item_range(&mut self, from: usize, to: usize) {
+        let len = self.items_checked.get(self.cursor).map_or(0, Vec::len);
+        if len == 0 { return; }
+        for index in from.min(to)..=from.max(to).min(len - 1) {
+            self.set_item_checked(index, true);
+        }
+    }
+
+    pub fn check_focus(&mut self, mode: char) {
+        match self.focus {
+            ExtractFocus::Programs => {
+                for i in 0..self.len() {
+                    let old = self.selected[i];
+                    self.selected[i] = self.is_extractable(i) && !self.items_checked[i].is_empty() &&
+                        match mode { 'a' => true, 'n' => false, _ => !old };
+                    if self.selected[i] && !self.items_checked[i].iter().any(|checked| *checked) {
+                        self.items_checked[i].fill(true);
+                    }
+                }
+            }
+            ExtractFocus::Items => {
+                let n = self.items_checked.get(self.cursor).map_or(0, Vec::len);
+                for i in 0..n {
+                    let old = self.items_checked[self.cursor][i];
+                    let wanted = match mode { 'a' => true, 'n' => false, _ => !old };
+                    if old != wanted { self.set_item_checked(i, wanted); }
+                }
+            }
+            ExtractFocus::Output | ExtractFocus::Footer => {}
+        }
+    }
+
+    /// DVD-Audio More presets select groups only; authored track checkboxes
+    /// and the Convert pipeline retain their existing state. Ineligible groups
+    /// stay uncheckable under every preset.
+    pub fn cycle_dvda_group_preset(&mut self) {
+        if self.contents.format != DiscFormat::DvdAudio { return; }
+        self.dvda_group_preset = (self.dvda_group_preset + 1) % 4;
+        let max = self.contents.presentations.iter().enumerate()
+            .filter(|(i,_)|self.is_extractable(*i))
+            .map(|(_,p)| (p.format.sample_rate.unwrap_or(0),p.format.bit_depth.unwrap_or(0)))
+            .max().unwrap_or((0,0));
+        for i in 0..self.len() {
+            let p = &self.contents.presentations[i];
+            self.selected[i] = self.is_extractable(i) && match self.dvda_group_preset {
+                0 => true,
+                1 => p.format.channels.is_some_and(|channels| channels <= 2),
+                2 => p.format.channels.is_some_and(|channels| channels > 2),
+                _ => (p.format.sample_rate.unwrap_or(0),p.format.bit_depth.unwrap_or(0)) == max,
+            };
+        }
+    }
+
+    pub fn output_rows(&self) -> Vec<&'static str> {
+        // Keep DST is meaningful only when a selected SACD area is DST encoded.
+        let mut rows = vec!["Format", "Overwrite"];
+        if self.contents.format == DiscFormat::Sacd
+            && super::disc_browser_actions::selected_sacd_has_dst(self) {
+            rows.push("Keep DST");
+        }
+        rows.extend(["Files", "Tags", "Log"]);
+        if self.file_per_program && self.contents.format != DiscFormat::Sacd {
+            rows.push("CUE");
+        }
+        rows.extend(["Folder", "Naming"]);
+        if self.contents.format == DiscFormat::DvdAudio && self.contents.presentations.iter().enumerate()
+            .any(|(i,p)| self.selected.get(i) == Some(&true) && p.format.channels.unwrap_or(0) > 2) {
+            rows.push("Downmix");
+        }
+        if self.contents.format == DiscFormat::DvdAudio && self.contents.copy_protection.description.to_lowercase().contains("mkb") {
+            rows.push("Assume decrypted");
+        }
+        rows
+    }
+
+    /// The wide form has three paired rows and two full-width fields. CUE
+    /// occupies the otherwise empty left cell beside Log, not an extra row.
+    /// Extra DVD-Audio controls retain fixed row positions independently.
+    pub fn wide_output_height(&self) -> u16 {
+        let rows = self.output_rows();
+        if rows.contains(&"Assume decrypted") { 10 }
+        else if rows.contains(&"Downmix") { 9 }
+        else { 8 }
+    }
+
+    /// Track selected DSF and DFF destinations, including plain DSDIFF/DSD
+    /// and the per-area DST passthrough override.
+    pub fn selected_sacd_tag_carriers(&self) -> (bool, bool) {
+        if self.contents.format != DiscFormat::Sacd { return (true, false); }
+        let mut dsf = false;
+        let mut dff = false;
+        for (i, chosen) in self.selected.iter().enumerate() {
+            if !*chosen || !self.items_checked.get(i).is_some_and(|v| v.iter().any(|item| *item)) {
+                continue;
+            }
+            if self.sacd_dff || self.keep_dst.get(i).copied().unwrap_or(false) { dff = true; }
+            else { dsf = true; }
+        }
+        (dsf, dff)
+    }
+
+    /// Update only the disc evidence after a sidecar save, retaining every
+    /// Extract selection and form setting. A changed program structure needs
+    /// a new Extract session; remapping checkboxes would be unsafe.
+    pub fn accept_refreshed_tag_contents(&mut self, refreshed: DiscContents) -> Result<(), String> {
+        if !self.tag_refresh_pending {return Ok(());}
+        self.tag_refresh_pending=false;
+        let same_structure=self.contents.format==refreshed.format
+            && self.contents.presentations.len()==refreshed.presentations.len()
+            && self.contents.presentations.iter().zip(refreshed.presentations.iter())
+                .all(|(a,b)|a.id==b.id && a.tracks.len()==b.tracks.len());
+        if !same_structure {
+            self.tag_refresh_failed=true;
+            return Err("Disc structure changed while editing tags; reopen Extract".into());
+        }
+        self.contents=refreshed;
+        self.tag_refresh_failed=false;
+        Ok(())
+    }
+
+    pub fn tag_source_option_count(&self) -> usize {
+        if self.tag_mb_available {3} else {2}
+    }
+
+    pub fn tag_source_index(&self) -> usize {
+        use crate::convert::pipeline::native_extract::NativeTagSource;
+        match self.tag_source {
+            NativeTagSource::DiscAndSidecar => 0,
+            NativeTagSource::AuthoredTrack => 1,
+            NativeTagSource::MusicBrainz => 2,
+        }
+    }
+
+    pub fn tag_source_label(&self, index: usize) -> &'static str {
+        match (self.contents.format == DiscFormat::Sacd,index) {
+            (true,0)=>"Tag file, then disc text",
+            (true,1)=>"Disc text, then tag file",
+            (false,0)=>"Sidecar, then authored tags",
+            (false,1)=>"Authored tags, then sidecar",
+            (_,2) if self.tag_mb_available=>"MusicBrainz (saved tag file)",
+            _=>"Unknown source",
+        }
+    }
+
+    pub fn tag_sheet_controls(&self) -> Vec<TagSheetControl> {
+        use TagSheetControl as C;
+        let mut controls = vec![C::Transfer];
+        if self.tags {
+            controls.push(C::Source);
+            controls.extend((0..NATIVE_TAG_FIELD_LABELS.len()).map(C::Field));
+            controls.extend([C::All, C::None, C::Artwork]);
+            let (_, dff) = self.selected_sacd_tag_carriers();
+            if dff { controls.push(C::UseDsf); }
+        }
+        // Footer actions remain available even when tag transfer is off.
+        controls.extend([C::EditValues, C::MusicBrainz, C::Done]);
+        controls
+    }
+
+    /// The grouped writer tags an area/group file with program metadata,
+    /// never the highlighted individual track's title. An authored PCM track
+    /// is not known until preparation; don't present navigation as written tags.
+    pub fn tag_preview_is_pending(&self) -> bool {
+        self.contents.format != DiscFormat::Sacd
+            && self.tag_source != crate::convert::pipeline::native_extract::NativeTagSource::DiscAndSidecar
+    }
+
+    pub fn tag_preview_for_highlight(&self) -> crate::convert::pipeline::native_extract::NativeTagValues {
+        use crate::convert::pipeline::native_extract::{native_selected_track_tags, NativeTagValues};
+        let Some(p) = self.contents.presentations.get(self.cursor) else { return NativeTagValues::default(); };
+        let Some(program) = self.native_program_choice(self.cursor, p, Some(self.item_cursor))
+            else { return NativeTagValues::default(); };
+        if self.file_per_program {
+            // Authored non-SACD album values also come from preparation.
+            return if self.tag_preview_is_pending() { NativeTagValues::default() }
+                else { program.tags };
+        }
+        let Some(track) = program.tracks.first() else { return NativeTagValues::default(); };
+        native_selected_track_tags(self.contents.format, self.tag_source, &program, track)
+            .unwrap_or_default()
+    }
+
+    pub fn native_tags_available(&self) -> bool {
+        let (dsf,dff) = self.selected_sacd_tag_carriers();
+        dsf || !dff
+    }
+
+    /// One filesystem inspection per destination change, never on redraw.
+    /// This is guidance; the worker still performs authoritative validation.
+    pub fn refresh_destination_feedback(&mut self) {
+        let path = &self.destination;
+        self.destination_feedback = if !path.is_absolute() {
+            Some(DestinationFeedback::InvalidPath)
+        } else if let Ok(ancestor) = existing_ancestor(path) {
+            if !ancestor.is_dir() || !destination_directory_writable(ancestor) {
+                Some(DestinationFeedback::NotWritable)
+            } else if !path.exists() {
+                Some(DestinationFeedback::WillBeCreated)
+            } else { None }
+        } else { Some(DestinationFeedback::NotWritable) };
+    }
+
+    /// The Tags editor remains accessible even when DFF suppresses writing,
+    /// so keyboard users can reach its Use DSF action without a mouse.
+    pub fn output_row_focusable(&self, index: usize) -> bool {
+        self.output_rows().get(index).is_some()
+    }
+
+    pub fn normalize_output_cursor(&mut self) {
+        if self.output_row_focusable(self.output_cursor) { return; }
+        let rows = self.output_rows();
+        self.output_cursor = (0..rows.len())
+            .find(|index| *index >= self.output_cursor && self.output_row_focusable(*index))
+            .or_else(|| (0..rows.len()).rev().find(|index| self.output_row_focusable(*index)))
+            .unwrap_or(0);
+    }
+
+    pub fn current_output_row(&self) -> &'static str {
+        self.output_rows().get(self.output_cursor).copied().unwrap_or("Format")
+    }
+
+    pub fn protection_display(&self) -> String {
+        if self.contents.format != DiscFormat::DvdVideo {
+            return self.contents.copy_protection.description.clone();
+        }
+        if self.probe_statuses.iter().any(Option::is_none) {
+            "CSS sample probes pending".into()
+        } else if self.probe_statuses.iter().flatten().any(Result::is_err) {
+            "One or more sampled DVD-Video streams could not be read".into()
+        } else {
+            "No scrambling observed in sampled chapter starts".into()
+        }
+    }
+
+    pub fn protection_blocker(&self) -> Option<String> {
+        let description = self.contents.copy_protection.description.to_ascii_lowercase();
+        match self.contents.format {
+            DiscFormat::Sacd => None,
+            DiscFormat::DvdAudio if description.contains("mkb") && !self.assume_decrypted =>
+                Some("CPPM/MKB found. Use Assume decrypted only if the copy is already decrypted".into()),
+            DiscFormat::BluRay if description.contains("not handled") || description.contains("cannot") || description.contains("not readable") || description.contains("unknown / probe failed") =>
+                Some("Blu-ray protection cannot be read by the installed libraries".into()),
+            // DVD-Video mapper describes its CSS *preflight capability*, not
+            // positive CSS evidence. The per-chapter demuxer rejects encrypted
+            // sectors; do not mark every ordinary DVD-Video as protected.
+            _ => None,
+        }
+    }
+
+    /// Path planning is deliberately shared with the worker: the UI must not
+    /// approve a combination that the publisher will reject later. This does
+    /// no filesystem IO and includes only checked, extractable outputs.
+    pub fn native_output_paths(&self) -> Vec<PathBuf> {
+        self.native_output_paths_for_template(&self.naming_template)
+    }
+
+    /// A naming draft can add or remove a program token. Recalculate the
+    /// implicit-folder rule for that draft, not the last committed template;
+    /// live preview, collision checks, and publication must agree.
+    fn native_job_for_template(&self, template: &str) -> crate::convert::pipeline::native_extract::NativeExtractionJob {
+        let mut job = self.native_job(PathBuf::new());
+        job.naming_template = template.to_owned();
+        job.program_subfolders = job.programs.len() > 1 &&
+            !crate::convert::pipeline::native_extract::native_template_has_program_token(template);
+        job
+    }
+
+    fn native_output_paths_for_template(&self, template: &str) -> Vec<PathBuf> {
+        use crate::convert::pipeline::native_extract::{proposed_destination,
+            proposed_destination_for_program};
+        let job = self.native_job_for_template(template);
+        let mut paths = Vec::new();
+        for program in &job.programs {
+            if self.file_per_program {
+                paths.push(proposed_destination_for_program(&job, program));
+            } else {
+                paths.extend(program.tracks.iter().map(|track|
+                    proposed_destination(&job,program,track)));
+            }
+        }
+        paths
+    }
+
+    pub fn native_duplicate_count(&self) -> usize {
+        self.native_duplicate_count_for_template(&self.naming_template)
+    }
+
+    pub fn native_duplicate_count_for_template(&self, template: &str) -> usize {
+        use crate::convert::pipeline::native_extract::native_destination_collision_key;
+        let mut counts = std::collections::HashMap::<String,usize>::new();
+        for path in self.native_output_paths_for_template(template) {
+            *counts.entry(native_destination_collision_key(&path)).or_default() += 1;
+        }
+        counts.values().filter(|count|**count>1).sum()
+    }
+
+    /// Explain the actual output layout before Extract, using the same
+    /// selected-program projection that supplies the worker's paths.
+    pub fn native_output_layout_hint(&self) -> String {
+        let job = self.native_job(PathBuf::new());
+        if job.programs.len() == 1 && !job.program_subfolders {
+            let root=crate::convert::pipeline::native_extract::native_program_output_root(
+                &job,&job.programs[0]);
+            if root != job.destination {
+                let relative=root.strip_prefix(&job.destination).unwrap_or(&root);
+                return format!("Naming places files under {}; {}",relative.display(),
+                    if job.extraction_log {"extraction.log goes beside the files"} else {"no log will be written"});
+            }
+            return "Files go directly into this folder.".into();
+        }
+        if job.program_subfolders {
+            let folders = job.programs.iter().filter_map(|program|
+                crate::convert::pipeline::native_extract::native_program_output_root(&job,program)
+                    .strip_prefix(&job.destination).ok()
+                    .and_then(|relative|relative.iter().next())
+                    .map(|name|name.to_string_lossy().into_owned()))
+                .collect::<Vec<_>>();
+            let names = match folders.as_slice() {
+                [] => String::new(),
+                [only] => only.clone(),
+                [first,second] => format!("{first}/ and {second}/"),
+                _ => format!("{} program folders",folders.len()),
+            };
+            if folders.len()==2 {
+                return if job.extraction_log {
+                    format!("{names} will be created here, each with its own extraction.log")
+                } else {format!("{names} will be created here, without extraction logs")};
+            }
+            return format!("{names} will be created here{}",
+                if job.extraction_log {", with one log per program"} else {""});
+        }
+        if job.programs.len()>1 {
+            return if job.extraction_log {
+                "Naming separates the files; per-program logs use unique names beside them.".into()
+            } else {"Naming separates the files; no extraction logs will be written.".into()};
+        }
+        "Files go directly into this folder.".into()
+    }
+
+    /// The highlighted program/chapter is previewed even if it is unchecked.
+    /// Construct that one candidate using the same worker path functions as
+    /// publication, rather than a parallel approximation.
+    pub fn native_preview_path(&self) -> Option<PathBuf> {
+        self.native_preview_path_for_template(&self.naming_template)
+    }
+
+    pub fn native_preview_path_for_template(&self, template: &str) -> Option<PathBuf> {
+        use crate::convert::pipeline::native_extract::{proposed_destination,
+            proposed_destination_for_program};
+        if !self.is_extractable(self.cursor) { return None; }
+        let authored = self.contents.presentations.get(self.cursor)?;
+        let program = self.native_program_choice(self.cursor,authored,Some(self.item_cursor))?;
+        let job = self.native_job_for_template(template);
+        if self.file_per_program {
+            Some(proposed_destination_for_program(&job,&program))
+        } else {
+            let track = program.tracks.first()?;
+            Some(proposed_destination(&job,&program,track))
+        }
+    }
+
+    pub fn blockers(&self, scratch: &Path) -> Vec<String> {
+        self.blockers_with_capacity_refresh(scratch, false)
+    }
+
+    /// The extract action rechecks existence and sizes immediately before
+    /// queue submission; painting the overlay uses the cached result.
+    pub(crate) fn blockers_with_capacity_refresh(&self, scratch: &Path, refresh: bool) -> Vec<String> {
+        let mut problems = Vec::new();
+        let duplicate_count = self.native_duplicate_count();
+        if duplicate_count > 0 {
+            problems.push(format!("{} tracks would get the same name; change Naming before extracting",
+                duplicate_count));
+        }
+        if self.destination_feedback == Some(DestinationFeedback::NotWritable) {
+            problems.push("Extraction destination is not writable".into());
+        }
+        if self.tag_refresh_pending {
+            problems.push("Refreshing saved tags before extraction".into());
+        }
+        if self.tag_refresh_failed {
+            problems.push("Saved tags could not be refreshed; reopen Extract before extracting".into());
+        }
+        if self.selected_item_count() == 0 { problems.push("Check at least one extractable track or chapter".into()); }
+        if self.selected.iter().enumerate().any(|(i,checked)| *checked && !self.is_extractable(i)) {
+            problems.push("One or more checked programs cannot be extracted".into());
+        }
+        if let Some(message) = self.protection_blocker() { problems.push(message); }
+        for (index, selected) in self.selected.iter().enumerate() {
+            if !*selected { continue; }
+            match self.probe_statuses.get(index) {
+                Some(None) => problems.push(format!("Probe pending for program {}: source eligibility and depth", index + 1)),
+                Some(Some(Err(reason))) => problems.push(format!("Program {} cannot be extracted: {reason}", index + 1)),
+                _ => {},
+            }
+        }
+        if self.cue && self.contents.format == DiscFormat::Sacd {
+            problems.push("CUE indexes cannot describe DSF/DFF media; disable CUE for continuous native SACD".into());
+        }
+        if !self.destination.is_absolute() || !scratch.is_absolute() {
+            problems.push("Choose an absolute destination and working-storage path".into());
+        } else if refresh {
+            // Launch-time validation uses the worker's canonical path check;
+            // redraws do not repeat this filesystem walk.
+            if let Err(error) = crate::convert::pipeline::native_extract::native_working_storage(
+                scratch, &self.destination)
+            {
+                problems.push(error);
+            }
+        }
+        if self.selected_item_count() != 0 {
+            if let Some((total, largest, largest_program)) = self.selected_item_bytes() {
+                let destination_ancestor = existing_ancestor(&self.destination);
+                let scratch_ancestor = existing_ancestor(scratch);
+                if let (Ok(destination_ancestor), Ok(scratch_ancestor)) =
+                    (&destination_ancestor, &scratch_ancestor)
+                {
+                    if same_filesystem_paths(destination_ancestor, scratch_ancestor) {
+                        if let Ok(free) = fs2::available_space(destination_ancestor) {
+                            let needed = self.native_required_volume_bytes(refresh)
+                                .unwrap_or_else(||self.required_native_volume_bytes(total, largest, largest_program));
+                            if free < needed {
+                                problems.push(format!("Destination/working filesystem needs {}, has {}",
+                                    bytes_display(needed), bytes_display(free)));
+                            }
+                        }
+                    } else if let Some((destination_needed, working_needed)) =
+                        self.native_split_volume_bytes(refresh)
+                    {
+                        if let Ok(free) = fs2::available_space(destination_ancestor) {
+                            if free < destination_needed {
+                                problems.push(format!("Destination filesystem needs {}, has {}",
+                                    bytes_display(destination_needed), bytes_display(free)));
+                            }
+                        }
+                        if let Ok(free) = fs2::available_space(scratch_ancestor) {
+                            if free < working_needed {
+                                problems.push(format!("Working filesystem needs {}, has {}",
+                                    bytes_display(working_needed), bytes_display(free)));
+                            }
+                        }
+                    }
+                } else if refresh {
+                    problems.push("Cannot inspect destination or working-storage filesystem".into());
+                }
+            } else {
+                problems.push("Source size pending: selected duration/rate/depth is not yet known".into());
+            }
+        }
+        problems
+    }
+
+    /// Select native track data from one authored presentation. The worker's
+    /// job builder and the highlighted-item path preview share this projection;
+    /// preview can select one unchecked item without cloning the entire disc.
+    fn native_program_choice(&self, i: usize, p: &DiscPresentation,
+        only_track: Option<usize>) -> Option<crate::convert::pipeline::native_extract::NativeProgramChoice> {
+        use crate::convert::pipeline::native_extract::{NativeProgramChoice,NativeTrackChoice,
+            NativeAuthoredTags,NativeTagSource,NativeTagValues};
+        let sacd_tags = self.contents.format == DiscFormat::Sacd;
+        let sidecar_first = self.tag_source != NativeTagSource::AuthoredTrack;
+        let mb_only = self.tag_source == NativeTagSource::MusicBrainz;
+        let tags_to_native = |tags: crate::disc::model::DiscExtractTagFields| NativeTagValues {
+            title: tags.title, artist: tags.artist, album: tags.album,
+            genre: tags.genre, year: tags.year, composer: tags.composer,
+            performer: tags.performer, catalog: tags.catalog, publisher: tags.publisher,
+        };
+        let tracks: Vec<NativeTrackChoice> = p.tracks.iter().enumerate()
+            .filter(|(j,_)| only_track.map_or_else(|| self.items_checked[i].get(*j) == Some(&true), |track| track == *j))
+            .map(|(j,t)| NativeTrackChoice { duration_secs: t.duration_secs, number: (j + 1) as u32,
+                name: t.title.clone().unwrap_or_else(|| format!("Track {}", t.number)),
+                estimated_bytes: self.native_item_payload_bytes(p, t),
+                // DVD-Video/Blu-ray mappers synthesize "Chapter n"
+                // for navigation. It is a filename fallback, never a
+                // discovered metadata field that should become a tag.
+                tags: if sacd_tags {
+                    // Resolve track-to-album fallback *within* each
+                    // authority before applying the selected source
+                    // precedence. Otherwise a lower-priority sidecar
+                    // track DATE/GENRE can override authored album data.
+                    let authored = p.extract.authored_track_tags.get(j).cloned()
+                        .unwrap_or_default().prioritized(&p.extract.authored_album_tags);
+                    let sidecar = p.extract.sidecar_track_tags.get(j).cloned()
+                        .unwrap_or_default().prioritized(&p.extract.sidecar_album_tags);
+                    tags_to_native(if mb_only { sidecar }
+                        else if sidecar_first { sidecar.prioritized(&authored) }
+                        else { authored.prioritized(&sidecar) })
+                } else { NativeTagValues {
+                    title: if matches!(self.contents.format, DiscFormat::DvdVideo | DiscFormat::BluRay) {
+                        None
+                    } else { t.title.clone() },
+                    performer:t.performer.clone(), artist:t.performer.clone(), ..Default::default()
+                } } }).collect();
+        let authored_tags = if sacd_tags { None } else {
+            let album = &p.extract.authored_album_tags;
+            let track_tags = tracks.iter().filter_map(|track| {
+                p.extract.authored_track_tags.get(track.number.saturating_sub(1) as usize)
+                    .filter(|value| *value != &crate::disc::model::DiscExtractTagFields::default())
+                    .map(|value| (track.number, tags_to_native(value.clone())))
+            }).collect::<std::collections::BTreeMap<_,_>>();
+            (album != &crate::disc::model::DiscExtractTagFields::default() || !track_tags.is_empty())
+                .then(|| NativeAuthoredTags {
+                album: tags_to_native(album.clone()), tracks: track_tags,
+            })
+        };
+        (!tracks.is_empty()).then(|| NativeProgramChoice{
+            id:p.id, angle:self.selected_angle_for(i), label:p.id.compact_label(), tracks,
+            keep_dst:self.keep_dst.get(i) == Some(&true),
+            source_depth:p.format.bit_depth, source_channels:p.format.channels,
+            source_rate:p.format.sample_rate,
+            // The DVD-Video IFO mapper labels 5.1 from *count*, not
+            // speaker assignments. Do not treat it as an authoritative
+            // channel mask. Keep observed nonzero WAV masks instead.
+            source_layout: if self.contents.format == DiscFormat::DvdVideo && p.format.channels.unwrap_or(0) > 2 {
+                None
+            } else { p.format.channel_layout.clone() },
+            is_lossless:p.format.lossless,
+            authored_tags,
+            tags: if sacd_tags {
+                let authored = &p.extract.authored_album_tags;
+                let sidecar = &p.extract.sidecar_album_tags;
+                tags_to_native(if mb_only { sidecar.clone() }
+                    else if sidecar_first { sidecar.prioritized(authored) }
+                    else { authored.prioritized(sidecar) })
+            } else {
+                let metadata = metadata_for_disc_presentation(&self.contents, Some(p));
+                NativeTagValues {title:None,artist:metadata.artist,album:metadata.album,
+                    genre:metadata.genre,year:metadata.year,..Default::default()}
+            } })
+    }
+
+    pub fn native_job(&self, working_root: PathBuf) -> crate::convert::pipeline::native_extract::NativeExtractionJob {
+        use crate::convert::pipeline::native_extract::*;
+        let programs: Vec<_> = self.contents.presentations.iter().enumerate()
+            .filter(|(i,_)| self.selected[*i] && self.is_extractable(*i))
+            .filter_map(|(i,p)|self.native_program_choice(i,p,None)).collect();
+        let catalog = self.contents.presentations.iter()
+            .filter_map(|p| p.extract.sacd_header_details.as_deref())
+            .flat_map(|details| details.split('·'))
+            .find_map(|part| part.trim().strip_prefix("Catalog ").map(str::trim)
+                .filter(|value| !value.is_empty()).map(str::to_owned));
+        let disc_identity = NativeDiscIdentity {
+            title: self.contents.album_title.clone()
+                .or_else(||self.contents.presentations.iter().find_map(|p|p.album_title.clone())),
+            artist: self.contents.album_artist.clone()
+                .or_else(||self.contents.presentations.iter().find_map(|p|p.album_artist.clone())),
+            catalog,
+        };
+        // Separate programs only when the naming template itself has no
+        // program discriminator. A single checked area goes straight to Folder.
+        let program_subfolders = programs.len() > 1 &&
+            !native_template_has_program_token(&self.naming_template);
+        NativeExtractionJob{ disc_identity, source:self.source_path.clone(),format:self.contents.format,
+            programs,destination:self.destination.clone(), working_root,
+            wav_container:self.wav_container, assume_decrypted:self.assume_decrypted,downmix:self.downmix,
+            naming_template:self.naming_template.clone(), program_subfolders,
+            overwrite_policy:self.overwrite_policy, extraction_log:self.extraction_log,
+            program_log_paths:Vec::new(), round4_layout:true,
+            file_per_program:self.file_per_program, cue:self.cue,
+            transfer_tags:self.tags && self.native_tags_available(),
+            sacd_dff:self.sacd_dff,
+            tag_source:self.tag_source,
+            tag_fields:self.tag_fields,tag_artwork:self.tag_artwork }
+    }
+}
+
+fn bytes_display(bytes: u64) -> String {
+    let mut value = bytes as f64;
+    let mut unit = "B";
+    for next in ["KiB", "MiB", "GiB", "TiB"] {
+        if value < 1024.0 { break; }
+        value /= 1024.0;
+        unit = next;
+    }
+    format!("{value:.1} {unit}")
+}
+
+fn existing_ancestor(path: &Path) -> Result<&Path, String> {
+    let mut p = path;
+    while !p.exists() { p = p.parent().ok_or("Destination has no existing ancestor")?; }
+    Ok(p)
+}
+
+#[cfg(unix)]
+fn destination_directory_writable(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return false; };
+    // Query access without mutating the destination. The extraction worker
+    // remains responsible for final filesystem and conflict checks.
+    unsafe { libc::access(path.as_ptr(), libc::W_OK | libc::X_OK) == 0 }
+}
+
+#[cfg(not(unix))]
+fn destination_directory_writable(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|m| m.is_dir() && !m.permissions().readonly())
+}
+
+#[cfg(unix)]
+fn same_filesystem_paths(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (fs::metadata(a), fs::metadata(b)) { (Ok(a), Ok(b)) => a.dev() == b.dev(), _ => false }
+}
+#[cfg(windows)]
+fn same_filesystem_paths(a: &Path, b: &Path) -> bool {
+    // GetFileInformationByHandle accepts directory handles opened with
+    // FILE_FLAG_BACKUP_SEMANTICS. Neither that flag nor access_mode(0)
+    // requires nightly Rust or read permission on the directory contents.
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_ID_INFO_CLASS: i32 = 0x12;
+    #[repr(C)]
+    struct ByHandleFileInfo {
+        _attributes: u32,
+        _creation_time: [u32; 2],
+        _access_time: [u32; 2],
+        _write_time: [u32; 2],
+        volume_serial: u32,
+        _size_high: u32,
+        _size_low: u32,
+        _links: u32,
+        _index_high: u32,
+        _index_low: u32,
+    }
+    #[repr(C)]
+    struct FileIdInfo {
+        volume_serial: u64,
+        _file_id: [u8; 16],
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileInformationByHandle(
+            handle: *mut std::ffi::c_void,
+            info: *mut ByHandleFileInfo,
+        ) -> i32;
+        fn GetFileInformationByHandleEx(
+            handle: *mut std::ffi::c_void,
+            class: i32,
+            info: *mut std::ffi::c_void,
+            size: u32,
+        ) -> i32;
+    }
+
+    fn volume_identity(path: &Path) -> Option<(u32, Option<u64>)> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        let dir = fs::OpenOptions::new()
+            .access_mode(0)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path).ok()?;
+        let handle = dir.as_raw_handle();
+        let mut basic = std::mem::MaybeUninit::<ByHandleFileInfo>::uninit();
+        if unsafe { GetFileInformationByHandle(handle, basic.as_mut_ptr()) } == 0 {
+            return None;
+        }
+        let serial = unsafe { basic.assume_init() }.volume_serial;
+        // Modern filesystems provide a 64-bit volume identity. The 32-bit
+        // API remains the fallback for FAT and older/network filesystems.
+        let mut extended = std::mem::MaybeUninit::<FileIdInfo>::uninit();
+        let extended_serial = (unsafe {
+            GetFileInformationByHandleEx(
+                handle,
+                FILE_ID_INFO_CLASS,
+                extended.as_mut_ptr().cast(),
+                std::mem::size_of::<FileIdInfo>() as u32,
+            )
+        } != 0).then(|| unsafe { extended.assume_init().volume_serial });
+        Some((serial, extended_serial))
+    }
+
+    match (volume_identity(a), volume_identity(b)) {
+        (Some((legacy_a, full_a)), Some((legacy_b, full_b))) => {
+            if let (Some(full_a), Some(full_b)) = (full_a, full_b) {
+                full_a == full_b
+            } else {
+                legacy_a == legacy_b
+            }
+        }
+        _ => false,
+    }
+}
+#[cfg(not(any(unix, windows)))]
+fn same_filesystem_paths(_a: &Path, _b: &Path) -> bool { false }
+
+#[cfg(all(test, windows))]
+mod windows_native_volume_tests {
+    use super::*;
+
+    #[test]
+    fn existing_directories_on_one_volume_use_the_combined_budget() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let destination = temp.path().join("destination");
+        let scratch = temp.path().join("scratch");
+        fs::create_dir_all(&destination).expect("destination dir");
+        fs::create_dir_all(&scratch).expect("scratch dir");
+        assert!(same_filesystem_paths(&destination, &scratch));
+
+        let contents = super::disc_selection_bridge_tests::disc_contents(
+            DiscFormat::Sacd,
+            PresentationId::SacdArea(SacdAreaId::Stereo),
+            "DSD Stereo",
+        );
+        let mut state = DiscBrowserState::new(contents, temp.path().join("disc.iso"));
+        state.contents.presentations[0].format.sample_rate = Some(2_822_400);
+        state.contents.presentations[0].format.bit_depth = Some(1);
+        state.destination = destination;
+        assert!(state.native_storage_shares_destination_volume(&scratch));
+        assert!(state.native_required_volume_bytes(true).is_some());
+    }
+
+    #[test]
+    fn distinct_volume_uses_separate_destination_and_scratch_budgets() {
+        // Set this to an existing directory on a physically different volume
+        // (e.g. D:\test-scratch). Single-volume CI hosts skip this case.
+        let Some(other_volume) = std::env::var_os("TONEPOET_TEST_OTHER_VOLUME") else {
+            return;
+        };
+        let other_volume = PathBuf::from(other_volume);
+        assert!(other_volume.is_dir(), "other-volume directory does not exist");
+        let temp = tempfile::tempdir().expect("tempdir");
+        assert!(!same_filesystem_paths(temp.path(), &other_volume),
+            "TONEPOET_TEST_OTHER_VOLUME must be a distinct volume");
+        let contents = super::disc_selection_bridge_tests::disc_contents(
+            DiscFormat::Sacd,
+            PresentationId::SacdArea(SacdAreaId::Stereo),
+            "DSD Stereo",
+        );
+        let mut state = DiscBrowserState::new(contents, temp.path().join("disc.iso"));
+        state.contents.presentations[0].format.sample_rate = Some(2_822_400);
+        state.contents.presentations[0].format.bit_depth = Some(1);
+        state.destination = temp.path().join("destination");
+        assert!(!state.native_storage_shares_destination_volume(&other_volume));
+        assert!(state.native_split_volume_bytes(true).is_some());
     }
 }
 
@@ -1316,6 +2604,7 @@ mod disc_stream_summary_tests {
         playlist: u32,
     ) -> DiscPresentation {
         DiscPresentation {
+            extract: crate::disc::model::PresentationExtractInfo::default(),
             id: PresentationId::try_blu_ray_title(playlist, 0x1100 + playlist as u16, 0, 1)
                 .expect("valid Blu-ray id"),
             label: label.to_string(),
@@ -1429,7 +2718,7 @@ mod disc_selection_bridge_tests {
     use crate::convert::pipeline::{CueSidecarPolicy, DvdaDownmixPolicy, DvdaGroupSelection, SourceOptions, TrackSelection};
     use std::path::PathBuf;
 
-    fn disc_contents(
+    pub(super) fn disc_contents(
         format: DiscFormat,
         id: PresentationId,
         label: &str,
@@ -1439,6 +2728,7 @@ mod disc_selection_bridge_tests {
             label: "Disc".to_string(),
             source_path: PathBuf::from("disc.iso"),
             presentations: vec![DiscPresentation {
+                extract: crate::disc::model::PresentationExtractInfo::default(),
                 id,
                 label: label.to_string(),
                 format: AudioPresentationFormat {
@@ -1493,6 +2783,497 @@ mod disc_selection_bridge_tests {
             cue_sidecar: CueSidecarPolicy::PreferSidecar,
             track_selection: TrackSelection::All,
         }
+    }
+
+    #[test]
+    fn source_probe_blocks_only_its_own_program_and_not_convert() {
+        let good = disc_contents(DiscFormat::DvdVideo,
+            PresentationId::dvd_video(1, 1, 0), "English");
+        let mut contents = good.clone();
+        let mut alternate = good.presentations[0].clone();
+        alternate.id = PresentationId::dvd_video(1, 1, 1);
+        alternate.label = "Commentary".into();
+        contents.presentations.push(alternate);
+        let mut state = DiscBrowserState::new(contents, "dvd".into());
+        assert!(state.probe_statuses.iter().all(Option::is_none));
+        state.probe_statuses[0] = Some(Ok(Default::default()));
+        state.probe_statuses[1] = Some(Err("CSS in source sample".into()));
+        assert!(state.is_extractable(0));
+        assert!(!state.is_extractable(1));
+        // The same stream remains valid for the unchanged Convert route.
+        assert!(presentation_id_supports_stream_conversion(&state.contents.presentations[1].id));
+        state.selected[1] = false;
+        assert!(!state.blockers(std::path::Path::new("/tmp")).iter()
+            .any(|reason| reason.contains("CSS")));
+    }
+
+    #[test]
+    fn r34_draft_naming_template_recomputes_program_folder_rule_for_preview_and_inventory() {
+        use crate::disc::model::SacdAreaId;
+        let mut disc = disc_contents(DiscFormat::Sacd,
+            PresentationId::SacdArea(SacdAreaId::Stereo), "Stereo");
+        let mut multichannel = disc.presentations[0].clone();
+        multichannel.id = PresentationId::SacdArea(SacdAreaId::MultiChannel);
+        multichannel.label = "Multichannel".into();
+        disc.presentations.push(multichannel);
+        let mut state = DiscBrowserState::new(disc, "disc.iso".into());
+        state.destination = PathBuf::from("/tmp/r34-preview");
+        assert_eq!(state.native_job(PathBuf::new()).programs.len(), 2);
+
+        // Committed default separates selected programs with implicit folders.
+        let implicit = state.native_preview_path().unwrap();
+        assert_eq!(implicit.parent(), Some(state.destination.join("Stereo").as_path()));
+        assert_eq!(state.native_output_paths().len(), 2);
+
+        // Inserting an explicit area token into a draft removes implicit
+        // folders before the edit is committed, including in path inventory.
+        let filename_token = "%AREA% - %TRACKNN% - %TITLE%";
+        let flat = state.native_preview_path_for_template(filename_token).unwrap();
+        assert_eq!(flat.parent(), Some(state.destination.as_path()));
+        let flat_paths = state.native_output_paths_for_template(filename_token);
+        assert_eq!(flat_paths.len(), 2);
+        assert!(flat_paths.iter().all(|path|path.parent()==Some(state.destination.as_path())));
+        assert_eq!(state.native_duplicate_count_for_template(filename_token), 0);
+        let nested = state.native_preview_path_for_template("%AREA%/%TRACKNN% - %TITLE%").unwrap();
+        assert_eq!(nested.parent(),Some(state.destination.join("Stereo").as_path()));
+        assert_eq!(state.native_preview_path(),Some(implicit));
+    }
+
+    #[test]
+    fn sacd_native_job_retains_selected_authored_vs_sidecar_precedence() {
+        use crate::disc::model::{SacdAreaId, DiscExtractTagFields};
+        use crate::convert::pipeline::native_extract::NativeTagSource;
+        let contents = disc_contents(DiscFormat::Sacd, PresentationId::SacdArea(SacdAreaId::Stereo), "DSD Stereo");
+        let mut state = DiscBrowserState::new(contents, "disc.iso".into());
+        let tags = &mut state.contents.presentations[0].extract;
+        tags.authored_album_tags = DiscExtractTagFields { album: Some("disc album".into()),
+            artist: Some("disc artist".into()), catalog: Some("disc cat".into()),
+            publisher: Some("disc label".into()), ..Default::default() };
+        tags.sidecar_album_tags = DiscExtractTagFields { album: Some("sidecar album".into()),
+            publisher: Some("sidecar label".into()), ..Default::default() };
+        tags.authored_track_tags = vec![DiscExtractTagFields { title: Some("disc title".into()),
+            composer: Some("disc composer".into()), ..Default::default() }];
+        tags.sidecar_track_tags = vec![DiscExtractTagFields { title: Some("sidecar title".into()),
+            composer: Some("sidecar composer".into()), ..Default::default() }];
+        state.tag_source = NativeTagSource::DiscAndSidecar;
+        let job = state.native_job("/tmp".into());
+        assert_eq!(job.programs[0].tags.album.as_deref(), Some("sidecar album"));
+        assert_eq!(job.programs[0].tags.artist.as_deref(), Some("disc artist"));
+        assert_eq!(job.programs[0].tags.catalog.as_deref(), Some("disc cat"));
+        assert_eq!(job.programs[0].tags.publisher.as_deref(), Some("sidecar label"));
+        let preview = state.tag_preview_for_highlight();
+        assert_eq!(preview.catalog.as_deref(), Some("disc cat"));
+        assert_eq!(preview.publisher.as_deref(), Some("sidecar label"));
+        assert_eq!(job.programs[0].tracks[0].tags.title.as_deref(), Some("sidecar title"));
+        state.tag_source = NativeTagSource::AuthoredTrack;
+        let job = state.native_job("/tmp".into());
+        assert_eq!(job.programs[0].tags.album.as_deref(), Some("disc album"));
+        assert_eq!(job.programs[0].tags.publisher.as_deref(), Some("disc label"));
+        assert_eq!(job.programs[0].tracks[0].tags.title.as_deref(), Some("disc title"));
+        assert_eq!(job.programs[0].tracks[0].tags.composer.as_deref(), Some("disc composer"));
+    }
+
+    #[test]
+    fn r30d05_non_sacd_jobs_preserve_independent_authored_evidence() {
+        use crate::convert::pipeline::native_extract::NativeTagSource;
+        use crate::disc::model::DiscExtractTagFields;
+
+        for (format, id) in [
+            (DiscFormat::DvdAudio, PresentationId::DvdAudioGroup(1)),
+            (DiscFormat::DvdVideo, PresentationId::dvd_video(1, 1, 0)),
+            (DiscFormat::BluRay, PresentationId::try_blu_ray_title(1, 0x1100, 0, 1).unwrap()),
+        ] {
+            let mut contents = disc_contents(format, id, "Program");
+            let presentation = &mut contents.presentations[0];
+            presentation.album_title = Some("Navigation album from saved tags".into());
+            presentation.tracks[0].title = Some("Navigation track from saved tags".into());
+            presentation.extract.authored_album_tags = DiscExtractTagFields {
+                album: Some("Disc album".into()),
+                artist: Some("Disc artist".into()),
+                ..Default::default()
+            };
+            presentation.extract.authored_track_tags = vec![DiscExtractTagFields {
+                title: Some("Disc track".into()),
+                ..Default::default()
+            }];
+            presentation.extract.sidecar_album_tags = DiscExtractTagFields {
+                album: Some("Saved album".into()),
+                ..Default::default()
+            };
+            let mut state = DiscBrowserState::new(contents, "disc.iso".into());
+            state.tags = true;
+            state.tag_source = NativeTagSource::AuthoredTrack;
+            let job = state.native_job("/tmp".into());
+            assert_eq!(job.programs.len(), 1, "{format:?}");
+            let program = &job.programs[0];
+            assert_eq!(program.tags.album.as_deref(), Some("Navigation album from saved tags"),
+                "naming retains its established projection for {format:?}");
+            let independent = program.authored_tags.as_ref().unwrap();
+            assert_eq!(independent.album.album.as_deref(), Some("Disc album"), "{format:?}");
+            assert_eq!(independent.tracks.get(&1).unwrap().title.as_deref(),
+                Some("Disc track"), "{format:?}");
+
+            state.tag_source = NativeTagSource::MusicBrainz;
+            let job = state.native_job("/tmp".into());
+            assert_eq!(job.tag_source, NativeTagSource::MusicBrainz);
+            assert_eq!(job.programs[0].authored_tags.as_ref().unwrap()
+                .album.album.as_deref(), Some("Disc album"), "{format:?}");
+
+            // A parser that has no separate authored evidence does not
+            // repurpose a sidecar-merged display title as authored data.
+            state.contents.presentations[0].extract.authored_album_tags = Default::default();
+            state.contents.presentations[0].extract.authored_track_tags.clear();
+            state.tag_source = NativeTagSource::AuthoredTrack;
+            let job = state.native_job("/tmp".into());
+            assert!(job.programs[0].authored_tags.is_none(), "{format:?}");
+        }
+    }
+
+    #[test]
+    fn r30c_grouped_and_single_sacd_tag_preview_matches_published_selection() {
+        use crate::convert::pipeline::native_extract::{
+            native_selected_track_tags, selected_tag_items, NativeTagSource,
+        };
+        use crate::disc::model::{DiscExtractTagFields, SacdAreaId};
+
+        let contents = disc_contents(DiscFormat::Sacd,
+            PresentationId::SacdArea(SacdAreaId::Stereo), "DSD Stereo");
+        let mut state = DiscBrowserState::new(contents, "disc.iso".into());
+        let presentation = &mut state.contents.presentations[0];
+        presentation.tracks[0].title = Some("Track A".into());
+        presentation.extract.sidecar_album_tags = DiscExtractTagFields {
+            album: Some("Album".into()), artist: Some("Artist".into()),
+            ..Default::default()
+        };
+        presentation.extract.sidecar_track_tags = vec![DiscExtractTagFields {
+            title: Some("Track A".into()), ..Default::default()
+        }];
+        state.tags = true;
+        state.tag_fields = 0x1ff;
+
+        // The continuous writer uses program tags, without Track A as TITLE.
+        state.file_per_program = true;
+        let group = state.native_job("/tmp".into());
+        let group_preview = state.tag_preview_for_highlight();
+        assert_eq!(group_preview.title, None);
+        assert_eq!(group_preview.album.as_deref(), Some("Album"));
+        assert_eq!(selected_tag_items(&group_preview, state.tag_fields),
+            selected_tag_items(&group.programs[0].tags, group.tag_fields));
+
+        // Individual files use the worker's same selected-track projection.
+        state.file_per_program = false;
+        let single = state.native_job("/tmp".into());
+        let program = &single.programs[0];
+        let expected = native_selected_track_tags(DiscFormat::Sacd,
+            NativeTagSource::DiscAndSidecar, program, &program.tracks[0]).unwrap();
+        assert_eq!(state.tag_preview_for_highlight().title.as_deref(), Some("Track A"));
+        assert_eq!(selected_tag_items(&state.tag_preview_for_highlight(), state.tag_fields),
+            selected_tag_items(&expected, single.tag_fields));
+    }
+
+    #[test]
+    fn r30c_authored_non_sacd_preview_waits_for_prepared_metadata() {
+        use crate::convert::pipeline::native_extract::{native_selected_track_tags, NativeTagSource};
+        let contents = disc_contents(DiscFormat::DvdVideo,
+            PresentationId::dvd_video(1,1,0), "DVD title");
+        let mut state = DiscBrowserState::new(contents, "disc.iso".into());
+        state.contents.presentations[0].tracks[0].title = Some("Navigation title only".into());
+        state.tag_source = NativeTagSource::AuthoredTrack;
+        assert!(state.tag_preview_is_pending());
+        assert!(state.tag_preview_for_highlight().title.is_none());
+        let job = state.native_job("/tmp".into());
+        assert!(native_selected_track_tags(job.format, job.tag_source,
+            &job.programs[0], &job.programs[0].tracks[0]).is_none());
+        state.tag_source = NativeTagSource::MusicBrainz;
+        state.tag_mb_available = true;
+        assert_eq!(state.tag_source_option_count(), 3);
+        assert_eq!(state.tag_source_index(), 2);
+        assert!(state.tag_preview_is_pending(), "saved tags are resolved by the materializer");
+    }
+
+    #[test]
+    fn r30c_sidecar_refresh_preserves_extract_draft_but_rejects_new_disc_shape() {
+        use crate::disc::model::{DiscExtractTagFields, SacdAreaId};
+        let contents = disc_contents(DiscFormat::Sacd,
+            PresentationId::SacdArea(SacdAreaId::Stereo), "DSD Stereo");
+        let mut state = DiscBrowserState::new(contents, "disc.iso".into());
+        state.destination = "/tmp/extract-target".into();
+        state.naming_template = "%ARTIST%/%TITLE%".into();
+        state.sacd_dff = true;
+        state.tag_fields = 0x1ab;
+        state.tag_refresh_pending = true;
+        let mut updated = state.contents.clone();
+        updated.presentations[0].extract.sidecar_album_tags = DiscExtractTagFields {
+            album: Some("New sidecar album".into()), ..Default::default()
+        };
+        state.accept_refreshed_tag_contents(updated).unwrap();
+        assert_eq!(state.native_job("/tmp".into()).programs[0].tags.album.as_deref(),
+            Some("New sidecar album"));
+        assert_eq!(state.destination, std::path::PathBuf::from("/tmp/extract-target"));
+        assert_eq!(state.naming_template, "%ARTIST%/%TITLE%");
+        assert!(state.sacd_dff);
+        assert_eq!(state.tag_fields, 0x1ab);
+        assert!(!state.tag_refresh_pending);
+        assert!(!state.tag_refresh_failed);
+
+        state.tag_refresh_pending = true;
+        let mut incompatible = state.contents.clone();
+        let duplicate_track = incompatible.presentations[0].tracks[0].clone();
+        incompatible.presentations[0].tracks.push(duplicate_track);
+        assert!(state.accept_refreshed_tag_contents(incompatible).is_err());
+        assert!(state.tag_refresh_failed);
+    }
+
+    #[test]
+    fn sacd_tag_precedence_resolves_track_and_album_within_each_source() {
+        use crate::disc::model::{DiscExtractTagFields, SacdAreaId};
+        use crate::convert::pipeline::native_extract::NativeTagSource;
+
+        let contents = disc_contents(DiscFormat::Sacd,
+            PresentationId::SacdArea(SacdAreaId::Stereo), "DSD Stereo");
+        let mut state = DiscBrowserState::new(contents, "disc.iso".into());
+        let presentation = &mut state.contents.presentations[0];
+        presentation.extract.authored_album_tags = DiscExtractTagFields {
+            album: Some("Authored album".into()),
+            artist: Some("Authored album artist".into()),
+            genre: Some("Classical".into()), year: Some("1998".into()),
+            ..Default::default()
+        };
+        presentation.extract.sidecar_album_tags = DiscExtractTagFields {
+            album: Some("Sidecar album".into()),
+            artist: Some("Sidecar album artist".into()),
+            ..Default::default()
+        };
+        presentation.extract.authored_track_tags = vec![DiscExtractTagFields {
+            title: Some("Authored title".into()), ..Default::default()
+        }];
+        presentation.extract.sidecar_track_tags = vec![DiscExtractTagFields {
+            title: Some("Sidecar title".into()),
+            year: Some("2024".into()), genre: Some("Alternative".into()),
+            ..Default::default()
+        }];
+        state.tags = true;
+
+        state.tag_source = NativeTagSource::AuthoredTrack;
+        let job = state.native_job("/tmp".into());
+        let track = &job.programs[0].tracks[0].tags;
+        assert_eq!(track.title.as_deref(), Some("Authored title"));
+        assert_eq!(track.artist.as_deref(), Some("Authored album artist"));
+        assert_eq!(track.album.as_deref(), Some("Authored album"));
+        assert_eq!(track.year.as_deref(), Some("1998"));
+        assert_eq!(track.genre.as_deref(), Some("Classical"));
+        assert!(job.transfer_tags);
+
+        state.tag_source = NativeTagSource::DiscAndSidecar;
+        let job = state.native_job("/tmp".into());
+        let track = &job.programs[0].tracks[0].tags;
+        assert_eq!(track.title.as_deref(), Some("Sidecar title"));
+        assert_eq!(track.year.as_deref(), Some("2024"));
+        assert_eq!(track.genre.as_deref(), Some("Alternative"));
+        assert_eq!(track.artist.as_deref(), Some("Sidecar album artist"));
+
+        // Missing values within an authority fall through only after its
+        // album fields have been tried. A missing authored genre may then
+        // use the sidecar track's genre.
+        state.contents.presentations[0].extract.authored_album_tags.genre = None;
+        state.contents.presentations[0].extract.authored_track_tags[0].title = None;
+        state.tag_source = NativeTagSource::AuthoredTrack;
+        let job = state.native_job("/tmp".into());
+        let track = &job.programs[0].tracks[0].tags;
+        assert_eq!(track.title.as_deref(), Some("Sidecar title"));
+        assert_eq!(track.genre.as_deref(), Some("Alternative"));
+        assert_eq!(track.year.as_deref(), Some("1998"));
+
+        state.tags = false;
+        assert!(!state.native_job("/tmp".into()).transfer_tags);
+    }
+
+    #[test]
+    fn sacd_continuous_storage_budget_excludes_pcm_join_spool() {
+        use crate::disc::model::SacdAreaId;
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let contents = disc_contents(DiscFormat::Sacd,
+            PresentationId::SacdArea(SacdAreaId::MultiChannel), "DSD Multichannel");
+        let mut state = DiscBrowserState::new(contents, "disc.iso".into());
+        state.file_per_program = true;
+        state.tags = false;
+        state.tag_artwork = false;
+        let needed = state.required_native_volume_bytes(10 * GIB, GIB, 10 * GIB);
+        assert!(needed <= 25 * GIB, "25 GiB must admit continuous 10 GiB SACD");
+        assert!(needed > 19 * GIB, "19 GiB must block continuous 10 GiB SACD");
+        assert_eq!(needed, 20 * GIB + 128 * 1024);
+        assert_eq!(state.native_required_volume_bytes(true),
+            state.selected_item_bytes().map(|(total, largest, program)|
+                state.required_native_volume_bytes(total, largest, program)));
+        state.file_per_program = false;
+        assert_eq!(state.required_native_volume_bytes(10 * GIB, GIB, 10 * GIB),
+            10 * GIB + 128 * 1024);
+    }
+
+    #[test]
+    fn sacd_separate_tracks_preflight_uses_selected_payload_without_pcm_reserve() {
+        use crate::disc::model::SacdAreaId;
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let contents = disc_contents(DiscFormat::Sacd,
+            PresentationId::SacdArea(SacdAreaId::Stereo), "DSD Stereo");
+        let mut state = DiscBrowserState::new(contents, "disc.iso".into());
+        let presentation = &mut state.contents.presentations[0];
+        presentation.format.sample_rate = Some(2_822_400);
+        presentation.format.bit_depth = Some(1);
+        presentation.tracks = (1..=4).map(|number| DiscTrack {
+            number, title: None, performer: None, duration_secs: Some(15.0 * 60.0),
+            format_note: None,
+        }).collect();
+        state.items_checked[0] = vec![true; 4];
+        state.file_per_program = false;
+        state.tags = false;
+        state.tag_artwork = false;
+        let (total, largest, largest_program) = state.selected_item_bytes().unwrap();
+        assert_eq!(total, 2_540_160_000); // Four 15-minute stereo DSD64 tracks.
+        assert_eq!(largest * 4, total);
+        assert_eq!(largest_program, total);
+        let required = state.required_native_volume_bytes(total, largest, largest_program);
+        assert_eq!(required, total + 4 * 128 * 1024);
+        assert!(required < 3 * GIB, "3 GiB must admit separate-track SACD");
+        assert!(required > 2 * GIB, "insufficient output capacity must block");
+        // When storage is on another volume, the scratch budget must not
+        // accumulate already-published separate tracks a second time.
+        let (dest_needed, scratch_needed) = state.native_split_volume_bytes(true).unwrap();
+        assert_eq!(dest_needed, required);
+        assert!(scratch_needed >= largest && scratch_needed < 2 * largest);
+        // The continuous SACD path retains completed parts during joining.
+        state.file_per_program = true;
+        assert_eq!(state.required_native_volume_bytes(total, largest, largest_program),
+            total * 2 + 4 * 128 * 1024);
+        let (dest_needed, scratch_needed) = state.native_split_volume_bytes(true).unwrap();
+        assert_eq!(dest_needed, total + 4 * 128 * 1024);
+        assert_eq!(scratch_needed, total * 2 + 4 * 128 * 1024);
+        // The estimator must still reserve additional space for the actual
+        // default DSF tag/cover workflow. Audio-only assertions above are
+        // explicitly opt-out; this is not a request to reduce the budget.
+        let audio_only = state.native_required_volume_bytes(true).unwrap();
+        state.tags = true;
+        state.tag_artwork = true;
+        let with_tags = state.native_required_volume_bytes(true).unwrap();
+        assert!(with_tags > audio_only, "default DSF tags must add capacity");
+    }
+
+    #[test]
+    fn native_space_skip_and_replace_follow_the_workers_output_paths() {
+        use crate::convert::pipeline::native_extract::{
+            proposed_destination, proposed_destination_for_program, NativeOverwritePolicy,
+        };
+        use crate::disc::model::SacdAreaId;
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let temp = tempfile::tempdir().unwrap();
+        let contents = disc_contents(DiscFormat::Sacd,
+            PresentationId::SacdArea(SacdAreaId::Stereo), "DSD Stereo");
+        let mut state = DiscBrowserState::new(contents, temp.path().join("album.iso"));
+        state.destination = temp.path().join("out");
+        state.contents.presentations[0].format.sample_rate = Some(2_822_400);
+        state.contents.presentations[0].format.bit_depth = Some(1);
+        state.contents.presentations[0].tracks = (1..=4).map(|number| DiscTrack {
+            number, title: Some(format!("Track {number}")), performer: None,
+            duration_secs: Some(900.0), format_note: None,
+        }).collect();
+        state.items_checked[0] = vec![true; 4];
+        let job = state.native_job(temp.path().into());
+        let targets = job.programs[0].tracks.iter().map(|track|
+            proposed_destination(&job, &job.programs[0], track)).collect::<Vec<_>>();
+        for target in targets.iter().take(3) {
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::File::create(target).unwrap().set_len(635_040_000).unwrap();
+        }
+        state.overwrite_policy = NativeOverwritePolicy::Skip;
+        let missing = state.native_required_volume_bytes(true).unwrap();
+        assert!(missing < GIB, "1 GiB must admit the one missing 606 MiB track: {missing}");
+        assert!(missing > 600 * 1024 * 1024);
+
+        // Redraw uses the prior inventory, but launching a job refreshes it.
+        std::fs::File::create(&targets[3]).unwrap().set_len(635_040_000).unwrap();
+        assert_eq!(state.native_required_volume_bytes(false), Some(missing));
+        assert_eq!(state.native_required_volume_bytes(true), Some(0));
+
+        state.overwrite_policy = NativeOverwritePolicy::Replace;
+        let replacement = state.native_required_volume_bytes(true).unwrap();
+        assert!(replacement < GIB, "same-sized replacements only need one staged track");
+        let (destination_needed, scratch_needed) = state.native_split_volume_bytes(false).unwrap();
+        assert!(destination_needed < GIB, "replacement must budget one temporary destination copy");
+        assert!(scratch_needed < GIB, "replacement scratch must not accumulate all four tracks");
+        state.overwrite_policy = NativeOverwritePolicy::Fail;
+        assert!(state.native_required_volume_bytes(true).unwrap() > 2 * GIB);
+
+        // The same native path calculation works for flattened filenames.
+        state.program_subfolders = false;
+        let job = state.native_job(temp.path().into());
+        for track in &job.programs[0].tracks {
+            let target = proposed_destination(&job, &job.programs[0], track);
+            assert_eq!(target.parent(), Some(state.destination.as_path()));
+            std::fs::File::create(&target).unwrap().set_len(635_040_000).unwrap();
+        }
+        state.overwrite_policy = NativeOverwritePolicy::Skip;
+        assert_eq!(state.native_required_volume_bytes(true), Some(0));
+
+        // In continuous mode Skip must bypass the *entire* existing output.
+        state.file_per_program = true;
+        let job = state.native_job(temp.path().into());
+        let continuous = proposed_destination_for_program(&job, &job.programs[0]);
+        std::fs::create_dir_all(continuous.parent().unwrap()).unwrap();
+        std::fs::File::create(&continuous).unwrap().set_len(2_540_160_000).unwrap();
+        assert_eq!(state.native_required_volume_bytes(true), Some(0));
+        std::fs::remove_file(continuous).unwrap();
+        let continuous_need = state.native_required_volume_bytes(true).unwrap();
+        assert!(continuous_need > 4 * GIB && continuous_need < 5 * GIB);
+    }
+
+    #[test]
+    fn native_space_includes_known_dsf_artwork_and_writer_padding() {
+        use crate::disc::model::SacdAreaId;
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("album.iso");
+        let cover = temp.path().join("cover.jpg");
+        std::fs::write(&cover, vec![0u8; 2 * 1024 * 1024]).unwrap();
+        let contents = disc_contents(DiscFormat::Sacd,
+            PresentationId::SacdArea(SacdAreaId::Stereo), "DSD Stereo");
+        let mut state = DiscBrowserState::new(contents, source);
+        state.destination = temp.path().join("out");
+        state.tags = true;
+        state.tag_artwork = true;
+        let (total, largest, program) = state.selected_item_bytes().unwrap();
+        let ordinary = state.required_native_volume_bytes(total, largest, program);
+        let needed = state.native_required_volume_bytes(true).unwrap();
+        let tail = 2 * 1024 * 1024 + crate::dsf_tags::REWRITE_PADDING_BYTES;
+        assert_eq!(needed, ordinary + 2 * tail);
+        state.file_per_program = true;
+        assert_eq!(state.native_required_volume_bytes(true).unwrap(),
+            state.required_native_volume_bytes(total, largest, program) + 2 * tail);
+    }
+
+    #[test]
+    fn continuous_preflight_accounts_for_all_retained_chapters_and_join_spool() {
+        let contents = disc_contents(DiscFormat::DvdVideo, PresentationId::dvd_video(1, 1, 0), "English");
+        let mut state = DiscBrowserState::new(contents, "dvd".into());
+        let template = state.contents.presentations[0].tracks[0].clone();
+        state.contents.presentations[0].tracks = (0..20).map(|index| {
+            let mut item = template.clone();
+            item.number = index + 1;
+            // 500 MiB per item at 96 kHz, 24-bit, stereo.
+            item.duration_secs = Some((500f64 * 1024f64 * 1024f64) / (96_000f64 * 2f64 * 3f64));
+            item
+        }).collect();
+        state.items_checked[0] = vec![true; 20];
+        state.file_per_program = true;
+        let (total, largest, program) = state.selected_item_bytes().unwrap();
+        assert_eq!(program, total);
+        assert!(largest > 490 * 1024 * 1024);
+        // A 12 GiB volume cannot hold 10 GiB of parts, 10 GiB of
+        // join spool and 10 GiB of completed private container at once.
+        assert!(state.required_native_volume_bytes(total, largest, program) > 12 * 1024 * 1024 * 1024);
+        assert_eq!(state.native_required_volume_bytes(true),
+            Some(state.required_native_volume_bytes(total, largest, program)));
+        state.file_per_program = false;
+        assert!(state.required_native_volume_bytes(total, largest, program)
+            < total.saturating_add(program.saturating_mul(2)));
     }
 
     #[test]

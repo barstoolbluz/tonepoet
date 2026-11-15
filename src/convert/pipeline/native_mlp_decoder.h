@@ -43,6 +43,23 @@ int tonepoet_native_mlp_decode_stereo_s32le_wav(
     const char *output_path,
     struct tonepoet_native_mlp_decode_result *out);
 
+/* Extraction-only fixed RF64 carrier; the Convert ABI remains unchanged. */
+int tonepoet_native_mlp_decode_stereo_s32le_rf64(
+    const char *input_path,
+    const char *output_path,
+    struct tonepoet_native_mlp_decode_result *out);
+
+/* Extraction-only hook, invoked once per bounded MLP input chunk. A
+ * nonzero return aborts decode and removes the private incomplete WAV. */
+typedef int (*tonepoet_native_mlp_checkpoint)(void *context);
+int tonepoet_native_mlp_decode_stereo_s32le_controlled(
+    const char *input_path,
+    const char *output_path,
+    struct tonepoet_native_mlp_decode_result *out,
+    int native_rf64,
+    tonepoet_native_mlp_checkpoint checkpoint,
+    void *checkpoint_context);
+
 #ifdef __cplusplus
 }
 #endif

@@ -59753,7 +59753,7 @@ fn render_template_with_tokens(
     render_template_segment(&conditional, tokens, track_extra, album_extra)
 }
 
-fn render_conditional_template_blocks(
+pub(crate) fn render_conditional_template_blocks(
     template: &str,
     tokens: &BTreeMap<String, String>,
     track_extra: Option<&BTreeMap<String, String>>,
@@ -59912,7 +59912,7 @@ fn path_from_template_components(rendered: &str) -> PathBuf {
 /// extra_content))`. Otherwise returns `None` so title subtitles are preserved.
 ///
 /// Only called when `%TITLE_EXTRA%` appears in the template.
-fn extract_title_extra(album: &str) -> Option<(String, String)> {
+pub(crate) fn extract_title_extra(album: &str) -> Option<(String, String)> {
     // Find the last '(' that has a matching ')'
     let mut depth = 0_i32;
     let mut last_open = None;
@@ -59980,8 +59980,14 @@ fn normalize_title_extra_for_template(
     source: &PreparedSource,
     strip_resolution: bool,
 ) -> String {
+    normalize_title_extra_value(extra, title_extra_should_strip_iso_for_source(source), strip_resolution)
+}
+
+/// Shared release-qualifier normalization for Convert and native extraction.
+/// Disc extraction always has a disc source, so its ISO marker is redundant.
+pub(crate) fn normalize_title_extra_value(extra: &str, strip_iso: bool, strip_resolution: bool) -> String {
     let mut normalized = extra.trim().to_string();
-    if title_extra_should_strip_iso_for_source(source) {
+    if strip_iso {
         normalized = strip_iso_marker_from_title_extra(&normalized);
     }
     if strip_resolution {
@@ -60151,7 +60157,7 @@ fn format_sample_rate(hz: u32) -> String {
     format!("{khz}kHz")
 }
 
-fn sanitize_component(value: &str) -> String {
+pub(super) fn sanitize_component(value: &str) -> String {
     let sanitized: String = value
         .chars()
         .map(|ch| match ch {
@@ -60316,7 +60322,7 @@ fn shorten_final_path_component(
 /// `sanitize_component`, so e.g. an `AC/DC` artist stays `AC DC`. Every other
 /// illegal/control character still becomes a single space, and whitespace
 /// within a slash-delimited segment still collapses.
-fn sanitize_title_extra_component(value: &str) -> String {
+pub(super) fn sanitize_title_extra_component(value: &str) -> String {
     fn sanitize_slash_segment(part: &str) -> String {
         part.chars()
             .map(|ch| match ch {
@@ -69452,6 +69458,25 @@ mod naming_template_tests {
             render_folder_template("%ARTIST%", &source, &tonepoet_pipeline::AudioFormat::Flac),
             PathBuf::from("AC DC")
         );
+    }
+
+    #[test]
+    fn r29_d05_convert_track_renderer_preserves_common_and_qualifier_slash_spacing() {
+        let mut source = template_source();
+        source.kind = SourceKind::SacdIso;
+        source.album_metadata.album = Some("Aja (Japan / SHM SACD ISO)".into());
+        source.album_metadata.album_artist = Some("AC/DC".into()).into();
+        source.tracks[0].metadata.artist = Some("AC/DC".into()).into();
+        source.tracks[0].metadata.title = Some("First Song".into());
+
+        // Convert publishes its extension separately; Extract's explicit
+        // %EXTENSION% yields the same suffix, with the same relative naming.
+        let relative = render_track_template(
+            "%ARTIST%/%ALBUM% {%TITLE_EXTRA%}/%TRACKNN% - %TITLE%",
+            &source, &source.tracks[0], &tonepoet_pipeline::AudioFormat::Flac,
+        ).unwrap();
+        assert_eq!(relative, PathBuf::from(
+            "AC DC/Aja {Japan  SHM SACD}/01 - First Song"));
     }
 
     #[test]
