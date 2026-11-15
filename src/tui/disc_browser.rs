@@ -291,6 +291,12 @@ pub struct DiscBrowserState {
     /// Discovered once when opening the sheet, never scanned on each frame.
     pub tag_preview_artwork: Option<PathBuf>,
     pub editing_destination: bool,
+    /// Authoritative text editor shared with Browse, file picker and metadata screens.
+    pub text_edit: Option<super::text_input::TextInputState>,
+    /// The active field's mouse-down origin for shared drag-selection behavior.
+    pub text_mouse_origin: Option<(usize, usize)>,
+    pub text_mouse_drag_started: bool,
+    /// Compatibility projection for existing native destination and naming consumers.
     pub destination_input: String,
     /// Unicode scalar insertion point in the active destination editor.
     pub destination_caret: usize,
@@ -421,6 +427,9 @@ impl DiscBrowserState {
             tag_refresh_failed: false,
             tag_preview_artwork: None,
             editing_destination: false,
+            text_edit: None,
+            text_mouse_origin: None,
+            text_mouse_drag_started: false,
             destination_input: String::new(),
             destination_caret: 0,
             destination_feedback: None,

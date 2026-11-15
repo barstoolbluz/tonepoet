@@ -121,12 +121,14 @@ fn folder_char_at_cell(text: &str, cell: usize) -> usize {
     text.chars().count()
 }
 
-/// Translate a click on the compact, read-only Folder value to the caret
-/// position in its full path. Match visible runs from the right so `~` and
-/// collapsed `…` do not shift later path components.
+/// Translate an already-focused Folder preview click into the full-path
+/// caret before opening the shared text editor. Once editing, all clicks,
+/// word selection and dragging use TextInputState's own cell mapping.
+/// Matching visible runs from the right keeps `~` and collapsed `…` from
+/// shifting later path components.
 pub(super) fn native_folder_preview_caret(path: &Path, field_width: u16, cell: usize) -> usize {
     let (value, home_prefix_chars) = folder_display_value(path);
-    let preview = compact_folder_path(path, field_width.saturating_sub(2));
+    let preview = compact_folder_path(path, field_width);
     // Windows-style separators are rendered as '/' when components collapse.
     // This normalization does not change Unicode scalar positions.
     let full: Vec<char> = value.chars().map(|ch| if ch == '\\' { '/' } else { ch }).collect();
@@ -162,34 +164,6 @@ pub(super) fn native_folder_preview_caret(path: &Path, field_width: u16, cell: u
         _ => display_index,
     };
     raw_index.min(path.to_string_lossy().chars().count())
-}
-
-/// The drawn path and its mouse mapper share one cell-bounded viewport.
-/// The caret occupies one cell but does not count as a character in the path.
-fn folder_editor_view(text: &str, caret: usize, field_width: u16) -> (String, usize) {
-    let caret = caret.min(text.chars().count());
-    let start = super::disc_browser_actions::native_folder_visible_start(text,caret,field_width);
-    let limit = field_width.saturating_sub(2) as usize;
-    let mut used = 0;
-    let mut output = String::new();
-    for (index,ch) in text.chars().enumerate().skip(start) {
-        if index == caret && used < limit { output.push('▏'); used += 1; }
-        let cells = super::display_width::char_width(ch);
-        if used + cells > limit { break; }
-        output.push(ch);
-        used += cells;
-    }
-    if caret == text.chars().count() && used < limit { output.push('▏'); }
-    (output,start)
-}
-
-pub(super) fn native_folder_editor_caret(text: &str, caret: usize,
-    field_width: u16, cell: usize) -> usize {
-    let (displayed,start) = folder_editor_view(text,caret,field_width);
-    let index = folder_char_at_cell(&displayed,cell.min(field_width.saturating_sub(3) as usize));
-    let marker = caret.min(text.chars().count()).saturating_sub(start);
-    (start + index.saturating_sub(usize::from(index > marker)))
-        .min(text.chars().count())
 }
 
 fn check(checked: bool) -> &'static str { if checked { "[✓]" } else { "[ ]" } }
@@ -442,18 +416,16 @@ pub fn draw(
     };
     let source_type=format!("{} {}",state.contents.format.name(),
         if state.source_path.is_dir() {"folder"}else{"ISO"});
-    let tag_width=(source_type.chars().count() as u16+1).min(popup.width/2);
-    let title_style=Style::default().fg(readable_word(theme.panel_bg,theme.title)).bg(theme.title)
-        .add_modifier(Modifier::BOLD);
-    fill(frame,Rect::new(popup.x,popup.y,popup.width,1),theme.title);
-    let left=Rect::new(popup.x+2,popup.y,popup.width.saturating_sub(tag_width+4),1);
-    let indicator=if state.maximized { "▾" } else { "▸" };
-    frame.render_widget(Paragraph::new(clip_end(&format!("{indicator} {action} · {source_name}"),left.width))
-        .style(title_style),left);
+    let indicator=if state.maximized {"▾"}else{"▸"};
+    let presentation=state.selected_presentation()
+        .map(|p|p.id.compact_label()).unwrap_or_else(||"no selection".into());
+    let leading=format!("{indicator} {action}  [▾ {presentation} · {source_type}] ");
+    let trailing=format!(" {source_name} ");
+    frame.render_widget(Paragraph::new(super::draw_browse::browse_title_bar_line(
+        popup.width as usize,&leading,&trailing,theme.title,theme,
+        theme.panel_bg,None)),Rect::new(popup.x,popup.y,popup.width,1));
     buttons.record_button(TuiButton::DiscBrowserTitle,Rect::new(popup.x,popup.y,popup.width,1));
-    let right=Rect::new(popup.x+popup.width-tag_width-1,popup.y,tag_width,1);
-    frame.render_widget(Paragraph::new(source_type).alignment(Alignment::Right)
-        .style(title_style),right);
+    buttons.record_button(TuiButton::DiscBrowserTitleSize,Rect::new(popup.x+1,popup.y,1,1));
 
     let chunks=Layout::default().direction(Direction::Vertical).constraints([
         Constraint::Length(header_height),Constraint::Length(1),
@@ -1031,6 +1003,10 @@ fn overwrite_index(s: &DiscBrowserState) -> usize {
 
 /// Each option owns exactly its printed cells; repeated clicks do not depend
 /// on the selected value's width or on neighboring text.
+fn radio_focus_bg(band: Color, theme: Theme) -> Color {
+    blend_color(band,theme.selection_bg,1,8)
+}
+
 fn draw_native_radio(frame: &mut ratatui::Frame, buttons: &mut ButtonRenderMap,
     field: Rect, options: &[(&str,bool)], focused: bool, format: bool,
     theme: Theme, background: Color) -> u16 {
@@ -1041,12 +1017,20 @@ fn draw_native_radio(frame: &mut ratatui::Frame, buttons: &mut ButtonRenderMap,
         let width = text.chars().count() as u16;
         if x.saturating_add(width)>limit { break; }
         let active = focused && *selected;
-        let bg = if active { theme.input_focused_bg } else { background };
+        let bg = if active { radio_focus_bg(background, theme) } else { background };
         let color = if *selected {theme.value} else {theme.label};
         let style = Style::default().bg(bg).fg(readable_word(color,bg))
-            .add_modifier(if active { Modifier::BOLD | Modifier::UNDERLINED } else {Modifier::empty()});
+            .add_modifier(if active { Modifier::BOLD } else {Modifier::empty()});
         let rect=Rect::new(x,field.y,width,1);
-        frame.render_widget(Paragraph::new(text).style(style),rect);
+        if active {
+            let glyph=if *selected {"●"}else{"○"};
+            frame.render_widget(Paragraph::new(Line::from(vec![
+                Span::styled(glyph,style.fg(readable_word(theme.info,bg))),
+                Span::styled(format!(" {label}"),style),
+            ])),rect);
+        } else {
+            frame.render_widget(Paragraph::new(text).style(style),rect);
+        }
         buttons.record_button(if format {TuiButton::DiscBrowserFormatChoice(i)}
             else {TuiButton::DiscBrowserFilesChoice(i)},rect);
         x=x.saturating_add(width+2);
@@ -1079,21 +1063,27 @@ fn draw_native_pill(frame:&mut ratatui::Frame, buttons:&mut ButtonRenderMap,
     buttons.record_button(target,rect);
 }
 
-fn draw_native_input(frame:&mut ratatui::Frame, rect:Rect, text:&str, focused:bool,
-    caret:Option<usize>,theme:Theme) {
-    if rect.width<3{return;}
-    let bg=if focused {theme.input_focused_bg}else{theme.input_unfocused_bg};
-    let edge=if focused {theme.info}else{theme.label};
-    let avail=rect.width.saturating_sub(2);
-    let value=if let Some(caret)=caret {
-        // Preserve characters on either side of the caret, including when
-        // editing a long path in a narrow input field.
-        folder_editor_view(text,caret,rect.width).0
-    }else{format!("{}▏",clip_end(text,avail))};
-    let spans=vec![Span::styled("▕",Style::default().fg(edge).bg(bg)),
-        Span::styled(value,Style::default().fg(readable_word(theme.value,bg)).bg(bg))];
-    fill(frame,rect,bg);
-    frame.render_widget(Paragraph::new(Line::from(spans)),rect);
+/// Render the existing shared TextInputState with a theme-derived recessed
+/// well. The selection and the block caret use separate surfaces. A field with
+/// focus but no editor has neither a caret nor a selection.
+fn draw_native_input(frame:&mut ratatui::Frame, rect:Rect, text:&str,
+    editing:Option<&super::text_input::TextInputState>,theme:Theme) {
+    if rect.width==0 {return;}
+    let well=if theme.dark {
+        blend_color(theme.panel_bg,Color::Black,1,4)
+    }else{blend_color(theme.panel_bg,theme.value,1,6)};
+    let normal=Style::default().fg(readable_word(theme.value,well)).bg(well);
+    fill(frame,rect,well);
+    let content=if let Some(editor)=editing {
+        let selection=blend_color(theme.selection_bg,well,1,5);
+        Line::from(tui_file_picker::text_input_spans_with_caret(
+            editor,rect.width as usize,normal,
+            Style::default().fg(readable_word(theme.value,selection)).bg(selection),
+            Style::default().fg(well).bg(readable_word(theme.value,well)),true))
+    } else {
+        Line::from(Span::styled(clip_end(text,rect.width),normal))
+    };
+    frame.render_widget(Paragraph::new(content).style(normal),rect);
 }
 
 fn draw_native_overwrite_menu(frame:&mut ratatui::Frame, buttons:&mut ButtonRenderMap,
@@ -1145,8 +1135,11 @@ fn draw_output(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,
         let label_width=LABEL_WIDTH.min(cell.width);
         let labels=word_tiers(theme,colors,bg);
         let label=if *name=="Assume decrypted" {"Decrypt"} else {name};
+        let label_focused = focused && !s.editing_destination
+            && matches!(*name,"Folder"|"Naming");
         frame.render_widget(Paragraph::new(format!("{label} ")).style(Style::default()
-            .bg(bg).fg(labels.label)),Rect::new(cell.x,cell.y,label_width,1));
+            .bg(bg).fg(if label_focused {theme.info}else{labels.label})),
+            Rect::new(cell.x,cell.y,label_width,1));
         let field=Rect::new(cell.x+label_width,cell.y,cell.width.saturating_sub(label_width),1);
         if field.width==0 {continue;}
         match *name {
@@ -1260,10 +1253,9 @@ fn draw_output(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,
                 let input_width=field.width.saturating_sub(pw+2);
                 let input=Rect::new(field.x,field.y,input_width,1);
                 let editing=s.editing_destination && !s.editing_template;
-                let value=if editing {s.destination_input.clone()}
-                    else {compact_folder_path(&s.destination,input_width.saturating_sub(2))};
-                draw_native_input(frame,input,&value,focused,
-                    editing.then_some(s.destination_caret),theme);
+                let value=compact_folder_path(&s.destination,input_width);
+                draw_native_input(frame,input,&value,
+                    editing.then_some(s.text_edit.as_ref()).flatten(),theme);
                 folder_note=Some((cell.x+LABEL_WIDTH,cell.y+1,cell.width.saturating_sub(LABEL_WIDTH)));
                 buttons.record_button(TuiButton::DiscBrowserFolderField,input);
                 if field.width>=pw+3 {
@@ -1273,7 +1265,7 @@ fn draw_output(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,
             }
             "Naming" => {
                 let editing=s.editing_destination && s.editing_template;
-                let value=if editing {s.destination_input.as_str()}else{s.naming_template.as_str()};
+                let value=s.naming_template.as_str();
                 let load=" Load preset ▾ ";
                 let custom=" Custom… ";
                 let load_width=load.chars().count() as u16;
@@ -1282,8 +1274,8 @@ fn draw_output(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,
                 let show_pills=field.width>=pills_width+8;
                 let input_width=if show_pills {field.width-pills_width} else {field.width};
                 let input=Rect::new(field.x,field.y,input_width.min(field.width),1);
-                draw_native_input(frame,input,value,focused,
-                    editing.then_some(s.destination_caret),theme);
+                draw_native_input(frame,input,value,
+                    editing.then_some(s.text_edit.as_ref()).flatten(),theme);
                 buttons.record_button(TuiButton::DiscBrowserNaming,input);
                 if show_pills {
                     let first=Rect::new(field.x+input_width+1,field.y,load_width,1);
@@ -1443,8 +1435,8 @@ fn draw_footer(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,buttons:&mut
             if x.saturating_add(width+3)>help_x { break; }
             let clickable=super::disc_browser_actions::native_hint_clickable(s,i);
             let key=token.find(' ').unwrap_or(token.len());
-            let mut key_style=Style::default().fg(theme.info);
-            if clickable {key_style=key_style.add_modifier(Modifier::UNDERLINED);}
+            let key_style=Style::default().fg(theme.info);
+            // Interactive key hints use the info accent, never an underline.
             let spans=vec![Span::styled(token[..key].to_owned(),key_style),
                 Span::styled(token[key..].to_owned(),Style::default().fg(words.label))];
             frame.render_widget(Paragraph::new(Line::from(spans)),Rect::new(x,r.y,width,1));
@@ -1456,7 +1448,7 @@ fn draw_footer(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,buttons:&mut
         if help_x>=x && help_x+help_width<=right && help_width>0 {
             let index=help_index.expect("only a real help binding reserves space");
             frame.render_widget(Paragraph::new(hints[index])
-                .style(Style::default().fg(theme.info).add_modifier(Modifier::UNDERLINED)),
+                .style(Style::default().fg(theme.info)),
                 Rect::new(help_x,r.y,help_width,1));
             buttons.record_button(TuiButton::DiscBrowserHint(index),
                 Rect::new(help_x,r.y,help_width,1));
@@ -1478,7 +1470,7 @@ fn draw_footer(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,buttons:&mut
             else if active {theme.pill_active_bg}else{color};
         let fg=if active {theme.pill_active_fg}else{theme.panel_bg};
         let style=Style::default().bg(chip_bg).fg(readable_word(fg,chip_bg))
-            .add_modifier(if active {Modifier::BOLD|Modifier::UNDERLINED}else{Modifier::empty()});
+            .add_modifier(if active {Modifier::BOLD}else{Modifier::empty()});
         frame.render_widget(Paragraph::new(text).style(style),Rect::new(x,y,width,1));
         if enabled { buttons.record_button(button,Rect::new(x,y,width,1)); }
         x=x.saturating_add(width+2);
@@ -1815,10 +1807,15 @@ mod extract_r3_render_tests {
             let buffer = terminal.backend().buffer();
             let title_y=(0..height).find(|y|(0..width).any(|x|buffer.get(x,*y).bg==theme.title))
                 .expect("centered title bar");
-            let left=(0..width).find(|x|buffer.get(*x,title_y).bg==theme.title)
-                .expect("dialog left edge");
-            let right=(0..width).rev().find(|x|buffer.get(*x,title_y).bg==theme.title)
-                .expect("dialog right edge");
+            let left=(0..width).find(|x|buffer.get(*x,title_y).symbol()=="┌")
+                .expect("unfilled left title corner");
+            let right=(0..width).rev().find(|x|buffer.get(*x,title_y).symbol()=="┐")
+                .expect("unfilled right title corner");
+            assert_ne!(buffer.get(left,title_y).bg,theme.title);
+            assert_ne!(buffer.get(right,title_y).bg,theme.title);
+            assert_eq!(buffer.get(left+1,title_y).bg,theme.title);
+            assert_eq!(buffer.get(right-1,title_y).bg,theme.title);
+            assert_eq!(buffer.get(left+1,title_y).symbol(),"▸");
             let bottom_y=(title_y+1..height).find(|y|buffer.get(left,*y).symbol()=="└")
                 .expect("closed bottom frame");
             assert_eq!(buffer.get(right,bottom_y).symbol(),"┘", "{width}x{height}");
@@ -2138,8 +2135,10 @@ mod extract_r3_render_tests {
                     let (x,y)=word_cells(buffer,name,&context);
                     let region_bg=extract_colors(theme).focused;
                     assert_eq!(buffer.get(x,y).bg,region_bg,"{context}");
-                    assert_eq!(buffer.get(x,y).fg,word_tiers(theme,extract_colors(theme),region_bg).label,
-                        "{context}: labels are read-only text, not active controls");
+                    assert_eq!(buffer.get(x,y).fg,
+                        if matches!(name,"Folder"|"Naming") { theme.info }
+                        else { word_tiers(theme,extract_colors(theme),region_bg).label },
+                        "{context}: only focused unedited text-field labels use the info accent");
                     // Compact viewports scroll the form to keep the active
                     // control in view. Only assert labels actually rendered.
                     for (other_index,other) in state.output_rows().iter().enumerate() {
@@ -2620,8 +2619,8 @@ mod extract_r3_render_tests {
         let active=buttons.button_rect(TuiButton::DiscBrowserFormatChoice(0)).unwrap();
         let inactive=buttons.button_rect(TuiButton::DiscBrowserFormatChoice(1)).unwrap();
         let buf=terminal.backend().buffer();
-        assert_eq!(buf.get(active.x,active.y).bg,theme.input_focused_bg);
-        assert_ne!(buf.get(inactive.x,inactive.y).bg,theme.input_focused_bg);
+        assert_eq!(buf.get(active.x,active.y).bg,radio_focus_bg(extract_colors(theme).focused,theme));
+        assert_ne!(buf.get(inactive.x,inactive.y).bg,radio_focus_bg(extract_colors(theme).focused,theme));
         let (x,y)=word_cells(buf,"Format","radio label");
         assert_eq!(buf.get(x,y).bg,extract_colors(theme).focused);
         let (x,y)=word_cells(buf,"Files","other output label");
@@ -2629,12 +2628,82 @@ mod extract_r3_render_tests {
         state.keep_dst[0]=true;
         // DST retention must not change the independent DSF/DFF radio.
         terminal.draw(|f|draw_output(f,&state,area,&mut ButtonRenderMap::new(),theme,true)).unwrap();
-        assert_eq!(terminal.backend().buffer().get(active.x,active.y).bg,theme.input_focused_bg);
-        assert_ne!(terminal.backend().buffer().get(inactive.x,inactive.y).bg,theme.input_focused_bg);
+        assert_eq!(terminal.backend().buffer().get(active.x,active.y).bg,radio_focus_bg(extract_colors(theme).focused,theme));
+        assert_ne!(terminal.backend().buffer().get(inactive.x,inactive.y).bg,radio_focus_bg(extract_colors(theme).focused,theme));
         state.sacd_dff=true;
         terminal.draw(|f|draw_output(f,&state,area,&mut ButtonRenderMap::new(),theme,true)).unwrap();
-        assert_ne!(terminal.backend().buffer().get(active.x,active.y).bg,theme.input_focused_bg);
-        assert_eq!(terminal.backend().buffer().get(inactive.x,inactive.y).bg,theme.input_focused_bg);
+        assert_ne!(terminal.backend().buffer().get(active.x,active.y).bg,radio_focus_bg(extract_colors(theme).focused,theme));
+        assert_eq!(terminal.backend().buffer().get(inactive.x,inactive.y).bg,radio_focus_bg(extract_colors(theme).focused,theme));
+    }
+
+    #[test]
+    fn r32_abbreviated_folder_preview_click_maps_to_full_path_component() {
+        let home=std::env::var_os("HOME").or_else(||std::env::var_os("USERPROFILE"))
+            .map(std::path::PathBuf::from).unwrap_or_else(||"/tmp".into());
+        let path=home.join("long-parent-folder-not-displayed")
+            .join("another-hidden-directory").join("Extracted");
+        let preview=compact_folder_path(&path,28);
+        let column=preview.find("Extracted").expect("last component visible");
+        let caret=native_folder_preview_caret(&path,28,column);
+        let tail=path.to_string_lossy().chars().skip(caret).collect::<String>();
+        assert!(tail.starts_with("Extracted"),"{preview:?} caret mapped to {tail:?}");
+    }
+
+    #[test]
+    fn r32_text_input_uses_recessed_well_selection_and_inverted_block_caret() {
+        for slug in ["tokyo-night", "tokyo-night-day"] {
+            let theme=crate::tui::theme::theme_by_slug_or_default(slug);
+            let mut terminal=Terminal::new(TestBackend::new(36,8)).unwrap();
+            let area=Rect::new(3,2,24,1);
+            let mut editor=super::super::text_input::TextInputState::new_selected(
+                "café_music".to_owned());
+            terminal.draw(|f|draw_native_input(f,area,"ignored",Some(&editor),theme)).unwrap();
+            let buffer=terminal.backend().buffer();
+            let selected=buffer.get(area.x,area.y);
+            assert_ne!(selected.bg,theme.panel_bg,"{slug}: selection is visible");
+            assert_ne!(selected.bg,theme.value,"{slug}: selection is not the caret");
+            assert!(!selected.modifier.contains(Modifier::UNDERLINED));
+            editor.clear_selection();
+            terminal.draw(|f|draw_native_input(f,area,"ignored",Some(&editor),theme)).unwrap();
+            let buffer=terminal.backend().buffer();
+            let caret_x=area.x+"café_music".chars().count() as u16;
+            let cell=buffer.get(caret_x,area.y);
+            assert_eq!(cell.symbol()," ","{slug}: end of text uses the block's empty cell");
+            assert_eq!(cell.bg,readable_word(theme.value,
+                if theme.dark {blend_color(theme.panel_bg,Color::Black,1,4)}
+                else {blend_color(theme.panel_bg,theme.value,1,6)}),"{slug}: block fill");
+            let unedited="café_music";
+            terminal.draw(|f|draw_native_input(f,area,unedited,None,theme)).unwrap();
+            let buffer=terminal.backend().buffer();
+            assert_ne!(buffer.get(area.x,area.y).bg,theme.panel_bg,"{slug}: recessed well");
+            assert_ne!(buffer.get(caret_x,area.y).bg,theme.value,"{slug}: no caret without edit");
+            let text=(area.x..area.right()).map(|x|buffer.get(x,area.y).symbol().to_owned())
+                .collect::<String>();
+            assert!(!text.contains('▕') && !text.contains('▏'),"{slug}: no edge marks");
+        }
+    }
+
+    #[test]
+    fn r32_radio_focus_has_theme_surface_not_underlined_selection() {
+        let theme=crate::tui::theme::theme_by_slug_or_default("tokyo-night");
+        let mut state=sacd_state(false,false);
+        state.focus=ExtractFocus::Output;
+        state.output_cursor=0;
+        let mut terminal=Terminal::new(TestBackend::new(140,22)).unwrap();
+        let mut buttons=ButtonRenderMap::new();
+        terminal.draw(|f|draw_output(f,&state,Rect::new(2,2,130,10),
+            &mut buttons,theme,true)).unwrap();
+        let selected=buttons.button_rect(TuiButton::DiscBrowserFormatChoice(0)).unwrap();
+        let unselected=buttons.button_rect(TuiButton::DiscBrowserFormatChoice(1)).unwrap();
+        let buf=terminal.backend().buffer();
+        assert_ne!(buf.get(selected.x,selected.y).bg,buf.get(unselected.x,unselected.y).bg);
+        assert_eq!(buf.get(selected.x,selected.y).fg,
+            readable_word(theme.info,radio_focus_bg(extract_colors(theme).focused,theme)));
+        for rect in [selected,unselected] {
+            for x in rect.x..rect.right() {
+                assert!(!buf.get(x,rect.y).modifier.contains(Modifier::UNDERLINED));
+            }
+        }
     }
 
     #[test]
@@ -2664,7 +2733,7 @@ mod extract_r3_render_tests {
         }).unwrap();
         assert_eq!(maximum.unwrap(),Rect::new(0,0,240,1));
         let buf=terminal.backend().buffer();
-        assert_eq!(buf.get(2,0).symbol(),"▾");
+        assert_eq!(buf.get(1,0).symbol(),"▾");
         assert_eq!(buf.get(0,49).symbol(),"└");
         assert_eq!(buf.get(239,49).symbol(),"┘");
     }

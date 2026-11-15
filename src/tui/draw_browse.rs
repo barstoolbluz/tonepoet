@@ -366,6 +366,10 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: 
     let list_area = content_chunks[1];
     let info_area = content_chunks[2];
 
+    // Extract draws a block caret itself. Suppress terminal cursor placement
+    // by the underlying Browse surface, including active search/path inputs.
+    let show_terminal_cursor=!matches!(&app.active_overlay,
+        super::app::ActiveOverlay::DiscBrowser(_));
     let hover = app.hover_target;
     let inline_edit = app.browse_inline_edit.clone();
     let navigation_focus_active = app.browse_info_focus.is_none()
@@ -385,6 +389,7 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: 
                 hover,
                 navigation_focus_active,
                 theme,
+                show_terminal_cursor,
             );
         }
     }
@@ -397,6 +402,7 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: 
         hover,
         navigation_focus_active,
         theme,
+        show_terminal_cursor,
     );
     let create_row_active = matches!(
         app.browse_inline_edit.as_ref().map(|state| &state.target),
@@ -434,7 +440,7 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: 
             let suppress_artwork_image = !matches!(app.active_overlay,
                 super::app::ActiveOverlay::None | super::app::ActiveOverlay::ContextMenu { .. })
                 || app.browse_artwork.popup_open;
-            draw_browse_info_with_artwork(
+            draw_browse_info_with_artwork_cursor(
                 f,
                 info_area,
                 &app.browse,
@@ -447,6 +453,7 @@ pub fn draw_browse_screen(f: &mut Frame, area: Rect, app: &mut AppState, theme: 
                 app.browse.artwork_config.enabled.then_some(
                     (&mut app.browse_artwork, &app.browse.artwork_config)),
                 suppress_artwork_image,
+                show_terminal_cursor,
             );
             app.button_map.record_button(TuiButton::BrowsePaneToggle(BrowsePaneId::Info), Rect::new(info_area.x + 1, info_area.y, 7.min(info_area.width.saturating_sub(2)), 1));
         }
@@ -623,7 +630,8 @@ fn draw_browse_toolbar(f: &mut Frame, area: Rect, app: &mut AppState, theme: sup
         row_area.width.saturating_sub(action_width),
         1,
     );
-    draw_breadcrumb_inline(f, path_area, &app.browse, theme);
+    draw_breadcrumb_inline(f, path_area, &app.browse, theme,
+        !matches!(&app.active_overlay, super::app::ActiveOverlay::DiscBrowser(_)));
     app.button_map.record_button(TuiButton::BrowseBreadcrumb, path_area);
     if app.browse.path_input.is_some() {
         let prefix_width = (super::display_width::width(" path: ") as u16).min(path_area.width);
@@ -711,6 +719,7 @@ fn draw_explore_pane(
     hover: Option<TuiButton>,
     navigation_focus_active: bool,
     theme: super::theme::Theme,
+    show_terminal_cursor: bool,
 ) {
     if area.height < 3 || area.width < 6 {
         return;
@@ -893,8 +902,10 @@ fn draw_explore_pane(
         );
     }
 
-    if let Some((x, y)) = editor_cursor {
-        f.set_cursor(x.min(inner.x + inner.width.saturating_sub(1)), y);
+    if show_terminal_cursor {
+        if let Some((x, y)) = editor_cursor {
+            f.set_cursor(x.min(inner.x + inner.width.saturating_sub(1)), y);
+        }
     }
 }
 
@@ -2377,7 +2388,8 @@ fn render_path_input_spans(
 }
 
 /// Draw the path bar inline (no border — caller provides the containing border).
-fn draw_breadcrumb_inline(f: &mut Frame, area: Rect, browse: &BrowseState, theme: super::theme::Theme) {
+fn draw_breadcrumb_inline(f: &mut Frame, area: Rect, browse: &BrowseState,
+    theme: super::theme::Theme, show_terminal_cursor: bool) {
     if area.width < 10 {
         return;
     }
@@ -2389,7 +2401,7 @@ fn draw_breadcrumb_inline(f: &mut Frame, area: Rect, browse: &BrowseState, theme
         f.render_widget(line, area);
 
         let cursor_x = area.x + cursor_col;
-        if cursor_x < area.x + area.width {
+        if show_terminal_cursor && cursor_x < area.x + area.width {
             f.set_cursor(cursor_x, area.y);
         }
         return;
@@ -2483,6 +2495,32 @@ fn browse_scan_progress_text(browse: &BrowseState) -> Option<String> {
     ))
 }
 
+/// The Browse pane's bordered, filled title row. Other modals reuse this
+/// renderer to keep the corner cells unfilled and the trailing label flush.
+pub(super) fn browse_title_bar_line(
+    width: usize,
+    leading: &str,
+    trailing: &str,
+    border_color: ratatui::style::Color,
+    theme: super::theme::Theme,
+    leading_fg: ratatui::style::Color,
+    trailing_style: Option<Style>,
+) -> Line<'static> {
+    let interior = width.saturating_sub(2);
+    let leading = super::display_width::truncate_right(leading, interior);
+    let remaining = interior.saturating_sub(super::display_width::width(&leading));
+    let trailing = super::display_width::truncate_left(trailing, remaining);
+    let gap = remaining.saturating_sub(super::display_width::width(&trailing));
+    let bar_style = Style::default().fg(leading_fg).bg(border_color);
+    Line::from(vec![
+        Span::styled("┌", theme.border(border_color)),
+        Span::styled(leading, bar_style),
+        Span::styled(" ".repeat(gap), bar_style),
+        Span::styled(trailing, trailing_style.unwrap_or(bar_style)),
+        Span::styled("┐", theme.border(border_color)),
+    ])
+}
+
 /// Draw the directory listing (left pane) with a sortable column header row.
 /// Reserves an extra row for the live filter input when one is active.
 fn draw_browse_list(
@@ -2493,6 +2531,7 @@ fn draw_browse_list(
     hover: Option<super::button_map::TuiButton>,
     navigation_focus_active: bool,
     theme: super::theme::Theme,
+    show_terminal_cursor: bool,
 ) -> Option<(Rect, Rect)> {
     if area.height < 4 || area.width < 20 {
         return None;
@@ -2509,26 +2548,11 @@ fn draw_browse_list(
     } else {
         " search "
     };
-    let search_display_w = super::display_width::width(search_label);
-    let title_w = super::display_width::width(&title);
-    let fill_count = w.saturating_sub(1 + title_w + search_display_w + 1);
-
-    let bar_style = Style::default().fg(theme.bg).bg(border_color);
-    let search_style = if browse.search.active {
-        Style::default()
-            .fg(theme.green)
-            .bg(border_color)
-            .add_modifier(ratatui::style::Modifier::BOLD)
-    } else {
-        bar_style
-    };
-    let top_line = Line::from(vec![
-        Span::styled("┌", theme.border(border_color)),
-        Span::styled(title, bar_style),
-        Span::styled(" ".repeat(fill_count), bar_style),
-        Span::styled(search_label, search_style),
-        Span::styled("┐", theme.border(border_color)),
-    ]);
+    let search_style = browse.search.active.then(|| Style::default()
+        .fg(theme.green).bg(border_color)
+        .add_modifier(ratatui::style::Modifier::BOLD));
+    let top_line = browse_title_bar_line(w, title, search_label,
+        border_color, theme, theme.bg, search_style);
 
     let bot_line = if let Some(progress) = browse_scan_progress_text(browse) {
         let available = w.saturating_sub(2);
@@ -2771,21 +2795,23 @@ fn draw_browse_list(
     let paragraph = Paragraph::new(lines);
     f.render_widget(paragraph, area);
 
-    // Position the terminal cursor inside the search input or filter input.
-    if browse.search.active && browse.search.focus == super::browse::SearchFocus::Input {
-        let input_w = inner_w.saturating_sub(3);
-        let (_, cursor_col) = browse.search.input.view(input_w);
-        let cursor_x = area.x + 1 + 3 + cursor_col; // border + " / " prefix
-        let cursor_y = browse_search_input_y(area); // top border + first search row
-        f.set_cursor(cursor_x, cursor_y);
-    } else if let Some(col_in_view) = filter_cursor {
-        let cursor_x = area.x + 1 + 3 + col_in_view;
-        let cursor_y = area.y + area.height - 2;
-        f.set_cursor(cursor_x, cursor_y);
-    } else if let Some((row, col_in_view)) = rename_cursor {
-        let cursor_x = area.x + 1 + ROW_PREFIX as u16 + col_in_view;
-        let cursor_y = browse_entry_y_start(area, browse.search.active) + row as u16;
-        f.set_cursor(cursor_x, cursor_y);
+    // Only a foreground Browse input may own the terminal cursor.
+    if show_terminal_cursor {
+        if browse.search.active && browse.search.focus == super::browse::SearchFocus::Input {
+            let input_w = inner_w.saturating_sub(3);
+            let (_, cursor_col) = browse.search.input.view(input_w);
+            let cursor_x = area.x + 1 + 3 + cursor_col; // border + " / " prefix
+            let cursor_y = browse_search_input_y(area); // top border + first search row
+            f.set_cursor(cursor_x, cursor_y);
+        } else if let Some(col_in_view) = filter_cursor {
+            let cursor_x = area.x + 1 + 3 + col_in_view;
+            let cursor_y = area.y + area.height - 2;
+            f.set_cursor(cursor_x, cursor_y);
+        } else if let Some((row, col_in_view)) = rename_cursor {
+            let cursor_x = area.x + 1 + ROW_PREFIX as u16 + col_in_view;
+            let cursor_y = browse_entry_y_start(area, browse.search.active) + row as u16;
+            f.set_cursor(cursor_x, cursor_y);
+        }
     }
 
     draw_vertical_scrollbar(
@@ -3514,7 +3540,25 @@ fn bounded_info_artwork_height(info: &InfoContent, content_height: usize,
     if height < 2 { 0 } else { height }
 }
 
+#[cfg(test)]
 fn draw_browse_info_with_artwork(
+    f: &mut Frame,
+    area: Rect,
+    browse: &BrowseState,
+    accounting: &crate::directory_accounting::AccountingService,
+    inline_edit: Option<&BrowseInlineEditState>,
+    info_focus: Option<BrowseInfoFocus>,
+    buttons: &mut ButtonRenderMap,
+    hover: Option<super::button_map::TuiButton>,
+    theme: super::theme::Theme,
+    artwork: Option<(&mut BrowseArtworkState, &crate::config::BrowseArtworkConfig)>,
+    suppress_image: bool,
+) {
+    draw_browse_info_with_artwork_cursor(f,area,browse,accounting,inline_edit,
+        info_focus,buttons,hover,theme,artwork,suppress_image,true);
+}
+
+fn draw_browse_info_with_artwork_cursor(
     f: &mut Frame,
     area: Rect,
     browse: &BrowseState,
@@ -3526,6 +3570,7 @@ fn draw_browse_info_with_artwork(
     theme: super::theme::Theme,
     mut artwork: Option<(&mut BrowseArtworkState, &crate::config::BrowseArtworkConfig)>,
     suppress_image: bool,
+    show_terminal_cursor: bool,
 ) {
     if area.height < 4 || area.width < 15 {
         return;
@@ -3679,7 +3724,7 @@ fn draw_browse_info_with_artwork(
     }
 
     if let Some((line_idx, col)) = info.inline_cursor {
-        if line_idx >= start_row && line_idx - start_row < text_height {
+        if show_terminal_cursor && line_idx >= start_row && line_idx - start_row < text_height {
             f.set_cursor(area.x + 1 + col, area.y + 1 + (line_idx - start_row) as u16);
         }
     }

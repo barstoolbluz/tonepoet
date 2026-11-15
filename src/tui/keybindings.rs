@@ -4174,6 +4174,7 @@ pub(super) fn current_focus_needs_generic_host_clipboard(app: &AppState) -> bool
             help_scroll: None,
         } => format_settings_text_input_owns_focus(kind, *focus),
         ActiveOverlay::BulkRename(state) => state.focus == super::app::BulkRenameFocus::Template,
+        ActiveOverlay::DiscBrowser(state) => state.editing_destination,
         ActiveOverlay::TemplateBuilder(state) => {
             state.focus == super::app::TemplateBuilderFocus::TemplateInput
         }
@@ -72886,63 +72887,85 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             }
             return;
         }
+        if matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left)
+            | MouseEventKind::Up(MouseButton::Left)) {
+            if let ActiveOverlay::DiscBrowser(state)=&mut app.active_overlay {
+                if state.text_mouse_origin.is_some() {
+                    let name=if state.editing_template {TuiButton::DiscBrowserNaming}
+                        else {TuiButton::DiscBrowserFolderField};
+                    if let Some(rect)=app.button_map.button_rect(name) {
+                        let column=mouse.column.saturating_sub(rect.x) as usize;
+                        super::disc_browser_actions::native_text_mouse_drag(
+                            state,column,matches!(mouse.kind,MouseEventKind::Up(_)));
+                    }
+                }
+            }
+            return;
+        }
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             if let Some(button) = app.button_map.find_button_at(mouse.column, mouse.row) {
-                let folder_hitbox = if button == TuiButton::DiscBrowserFolderField {
-                    app.button_map.button_rect(TuiButton::DiscBrowserFolderField)
-                } else { None };
-                let folder_preview_before_edit = matches!(&app.active_overlay,
-                    ActiveOverlay::DiscBrowser(state)
-                        if !state.editing_destination || state.editing_template);
-                let now = std::time::Instant::now();
-                let click_count = match button {
+                let field_rect=if matches!(button,TuiButton::DiscBrowserFolderField
+                    |TuiButton::DiscBrowserNaming) {
+                    app.button_map.button_rect(button)
+                }else{None};
+                let position_caret=matches!(&app.active_overlay,
+                    ActiveOverlay::DiscBrowser(state) if state.focus
+                        == super::disc_browser::ExtractFocus::Output
+                        && state.current_output_row() == (if matches!(button,TuiButton::DiscBrowserNaming) {
+                            "Naming"
+                        } else { "Folder" }));
+                // Resolve the read-only field's displayed coordinates before
+                // opening the editor, including on the *first* unfocused drag.
+                // Folder has a compact-path mapping; Naming displays a prefix.
+                let preview_caret=match (button,&app.active_overlay,field_rect) {
+                    (TuiButton::DiscBrowserFolderField,
+                        ActiveOverlay::DiscBrowser(state),Some(rect))
+                        if !state.editing_destination => {
+                        Some(super::disc_extract_render::native_folder_preview_caret(
+                            &state.destination,rect.width,
+                            mouse.column.saturating_sub(rect.x) as usize))
+                    }
+                    (TuiButton::DiscBrowserNaming,
+                        ActiveOverlay::DiscBrowser(state),Some(rect))
+                        if !state.editing_destination => {
+                        let mut preview=super::text_input::TextInputState::new(
+                            state.naming_template.clone());
+                        preview.cursor=0; // the read-only Naming field shows its prefix
+                        let at=preview.byte_index_for_view_column(rect.width as usize,
+                            mouse.column.saturating_sub(rect.x) as usize);
+                        Some(preview.text[..at].chars().count())
+                    }
+                    _ => None,
+                };
+                let now=std::time::Instant::now();
+                let click_count=match button {
                     TuiButton::DiscBrowserTitle => {
-                        app.last_disc_browser_stream_click = None;
-                        if app.double_click.register_click(
-                            TuiButton::DiscBrowserTitle,mouse.column,mouse.row,
-                            tui_file_picker::DOUBLE_CLICK_WINDOW,
-                        ) {2}else{1}
+                        app.last_disc_browser_stream_click=None;
+                        if app.double_click.register_click(button,mouse.column,mouse.row,
+                            tui_file_picker::DOUBLE_CLICK_WINDOW){2}else{1}
                     }
                     TuiButton::DiscBrowserStream(index) => {
                         app.double_click.clear();
-                        let is_double = app
-                            .last_disc_browser_stream_click
-                            .as_ref()
-                            .filter(|(prior, _)| *prior == index)
-                            .map(|(_, t)| now.duration_since(*t).as_millis() < 500)
+                        let is_double=app.last_disc_browser_stream_click.as_ref()
+                            .filter(|(prior,_)|*prior==index)
+                            .map(|(_,t)|now.duration_since(*t).as_millis()<500)
                             .unwrap_or(false);
-                        if is_double {
-                            app.last_disc_browser_stream_click = None;
-                            2
-                        } else {
-                            app.last_disc_browser_stream_click = Some((index, now));
-                            1
-                        }
+                        if is_double {app.last_disc_browser_stream_click=None;2}
+                        else {app.last_disc_browser_stream_click=Some((index,now));1}
                     }
-                    TuiButton::DiscBrowserFolderField => {
-                        app.last_disc_browser_stream_click = None;
-                        if app.double_click.register_click(
-                            TuiButton::DiscBrowserFolderField, mouse.column, mouse.row,
-                            tui_file_picker::DOUBLE_CLICK_WINDOW,
-                        ) { 2 } else { 1 }
+                    TuiButton::DiscBrowserFolderField|TuiButton::DiscBrowserNaming => {
+                        app.last_disc_browser_stream_click=None;
+                        if app.double_click.register_click(button,mouse.column,mouse.row,
+                            tui_file_picker::DOUBLE_CLICK_WINDOW){2}else{1}
                     }
-                    _ => {
-                        app.last_disc_browser_stream_click = None;
-                        app.double_click.clear();
-                        1
-                    }
+                    _ => {app.last_disc_browser_stream_click=None;app.double_click.clear();1}
                 };
                 super::disc_browser_actions::handle_disc_browser_button_click_with_shift(
-                    app, &button, click_count,
-                    mouse.modifiers.contains(KeyModifiers::SHIFT), tx,
-                );
-                if click_count == 1 {
-                    if let (Some(rect), ActiveOverlay::DiscBrowser(state)) =
-                        (folder_hitbox, &mut app.active_overlay) {
-                        super::disc_browser_actions::native_folder_caret_from_mouse(
-                            state, mouse.column, rect.x, rect.width,
-                            folder_preview_before_edit);
-                    }
+                    app,&button,click_count,mouse.modifiers.contains(KeyModifiers::SHIFT),tx);
+                if let (Some(rect),ActiveOverlay::DiscBrowser(state))=(field_rect,&mut app.active_overlay) {
+                    super::disc_browser_actions::native_text_mouse_down(state,
+                        rect.width as usize,mouse.column.saturating_sub(rect.x) as usize,
+                        position_caret,click_count,preview_caret);
                 }
             }
         }
@@ -74777,6 +74800,7 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::FormatSettingsSoxSincPhase(_)
             | TuiButton::FormatSettingsSoxrChebyshev(_)
             | TuiButton::DiscBrowserTitle
+            | TuiButton::DiscBrowserTitleSize
             | TuiButton::DiscBrowserStream(_)
             | TuiButton::DiscBrowserExpand(_)
             | TuiButton::DiscBrowserTrack(_)

@@ -562,6 +562,12 @@ pub fn handle_disc_browser_button_click_with_shift(
             }
             true
         }
+        TuiButton::DiscBrowserTitleSize => {
+            if let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay {
+                state.maximized = !state.maximized;
+            }
+            true
+        }
         TuiButton::DiscBrowserTitle => {
             if click_count >= 2 {
                 if let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay {
@@ -656,8 +662,7 @@ pub fn handle_disc_browser_button_click_with_shift(
         TuiButton::DiscBrowserFolderField => {
             let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay else { return false; };
             focus_native_row(state, "Folder");
-            if click_count >= 2 { open_native_destination_picker(app); }
-            else if !state.editing_destination { begin_native_folder_edit(state); }
+            if !state.editing_destination { begin_native_folder_edit(state); }
             true
         }
         TuiButton::DiscBrowserFolderBrowse => {
@@ -716,9 +721,13 @@ pub fn handle_disc_browser_double_click(
 // values until Enter. Esc discards changes without any filesystem mutation.
 fn begin_native_folder_edit(state: &mut DiscBrowserState) {
     state.destination_input = state.destination.to_string_lossy().into_owned();
+    state.text_edit = Some(super::text_input::TextInputState::new_selected(
+        state.destination_input.clone()));
     state.destination_caret = state.destination_input.chars().count();
     state.editing_destination = true;
     state.editing_template = false;
+    state.text_mouse_origin = None;
+    state.text_mouse_drag_started = false;
 }
 
 pub(super) fn cancel_native_text_edit(state: &mut DiscBrowserState) {
@@ -727,6 +736,9 @@ pub(super) fn cancel_native_text_edit(state: &mut DiscBrowserState) {
     state.editing_template = false;
     state.destination_input.clear();
     state.destination_caret = 0;
+    state.text_edit = None;
+    state.text_mouse_origin = None;
+    state.text_mouse_drag_started = false;
     state.refresh_destination_feedback();
 }
 
@@ -734,47 +746,93 @@ fn native_edit_byte_index(text: &str, char_index: usize) -> usize {
     text.char_indices().nth(char_index).map_or(text.len(), |(index, _)| index)
 }
 
-/// Renderer and mouse use the same clipped editor window.
-pub(super) fn native_folder_visible_start(text: &str, caret: usize, field_width: u16) -> usize {
-    // The editor reserves one cell for its caret and two for the field edges.
-    // Scroll by terminal columns, not Unicode scalar count: CJK and emoji
-    // occupy two columns while combining marks occupy none.
-    let width = (field_width as usize).saturating_sub(2);
-    let caret = caret.min(text.chars().count());
-    // Keep the existing suffix visible when editing in the middle of a long
-    // path. Without this allowance the caret sits at the far right and there
-    // is no visible text beyond it to click for a second edit.
-    let suffix_width: usize = text.chars().skip(caret)
-        .map(super::display_width::char_width).sum();
-    let after_budget = suffix_width.min(width / 2);
-    let before_budget = width.saturating_sub(1 + after_budget);
-    let mut used = 0;
-    let mut start = caret;
-    let boundary = native_edit_byte_index(text, caret);
-    for ch in text[..boundary].chars().rev() {
-        let cells = super::display_width::char_width(ch);
-        if used + cells > before_budget { break; }
-        used += cells;
-        start -= 1;
+/// Project the shared editor into legacy field snapshots. All mutations run
+/// through TextInputState; the projections preserve old call sites and tests.
+fn sync_native_text_projection(state: &mut DiscBrowserState) {
+    if let Some(input) = state.text_edit.as_ref() {
+        state.destination_input = input.text.clone();
+        state.destination_caret = input.text[..input.cursor].chars().count();
     }
-    start
 }
 
-/// Called from the actual mouse dispatcher using the rendered field hitbox.
-pub(super) fn native_folder_caret_from_mouse(state: &mut DiscBrowserState,
-    x: u16, field_x: u16, field_width: u16, preview_before_edit: bool) {
-    if !state.editing_destination || state.editing_template { return; }
-    let cell = x.saturating_sub(field_x.saturating_add(1)) as usize;
-    if preview_before_edit {
-        // The click was on the compact, non-editing value. Map its visible
-        // characters (including home and collapsed-prefix abbreviations) to
-        // the absolute editor string, not to the editor's different viewport.
-        state.destination_caret = super::disc_extract_render::native_folder_preview_caret(
-            &state.destination, field_width, cell);
-    } else {
-        state.destination_caret = super::disc_extract_render::native_folder_editor_caret(
-            &state.destination_input, state.destination_caret, field_width, cell);
+/// Older host call sites still provide the saved draft and a Unicode-scalar
+/// caret. Accept those values only when they differ from the active shared
+/// editor (normally only fixture setup uses this route).
+fn receive_native_text_projection(state: &mut DiscBrowserState) {
+    if let Some(input) = state.text_edit.as_mut() {
+        let cursor = native_edit_byte_index(&state.destination_input,state.destination_caret);
+        if input.text != state.destination_input || input.cursor != cursor {
+            input.set_text_and_cursor(state.destination_input.clone(),cursor);
+        }
     }
+}
+
+/// Start a pointer selection using the shared input's UTF-8/display-cell
+/// mapping. The first click to an unfocused field selects all; a click on
+/// an already-focused field positions the caret. Double click selects a word.
+pub(super) fn native_text_mouse_down(state:&mut DiscBrowserState, width:usize,
+    column:usize, position_caret:bool, click_count:u8, preview_caret:Option<usize>) {
+    if !state.editing_destination {return;}
+    receive_native_text_projection(state);
+    if let Some(input)=state.text_edit.as_mut() {
+        if state.text_mouse_origin.is_some() {
+            input.end_mouse_selection(); // close a previous incomplete gesture
+        }
+        if click_count>=2 {
+            input.select_word_at_view_column(width,column);
+        } else if let Some(caret)=preview_caret {
+            // Preserve the read-only field's hit, even on an unfocused first
+            // click. Reveal that portion of the full editor at the same cell.
+            // A click alone must still select all; a drag uses this same
+            // original caret and pinned window as its selection anchor.
+            let keep_select_all=input.select_all && !position_caret;
+            input.cursor=native_edit_byte_index(&input.text,caret);
+            input.begin_mouse_selection_at_cursor(width,column);
+            if keep_select_all {
+                input.select_all=true;
+                input.selection_anchor=Some(0);
+            }
+        } else if position_caret {
+            input.begin_mouse_selection(width,column);
+        } // first activation without a preview keeps select-all from new_selected()
+    }
+    state.text_mouse_origin=Some((width,column));
+    state.text_mouse_drag_started=false;
+    sync_native_text_projection(state);
+}
+
+pub(super) fn native_text_mouse_drag(state:&mut DiscBrowserState,
+    column:usize, released:bool) {
+    let Some((width,anchor_col))=state.text_mouse_origin else{return;};
+    if !state.editing_destination {return;}
+    if let Some(input)=state.text_edit.as_mut() {
+        if !released {
+            if !state.text_mouse_drag_started {
+                // A first unfocused click kept select-all. Turn it into a
+                // selection anchored at the preview's original mouse-down
+                // caret without remapping against the newly opened editor.
+                if input.select_all {
+                    input.select_all=false;
+                    input.selection_anchor=Some(input.cursor);
+                } else if input.selection_anchor != Some(input.cursor) {
+                    input.begin_mouse_selection(width,anchor_col);
+                }
+                state.text_mouse_drag_started=true;
+            }
+            input.drag_mouse_selection(width,column);
+        } else if state.text_mouse_drag_started {
+            input.drag_mouse_selection(width,column);
+            input.end_mouse_selection();
+        } else if !input.select_all {
+            // A first unfocused click still owns a whole-field selection.
+            input.end_mouse_selection();
+        }
+    }
+    if released {
+        state.text_mouse_origin=None;
+        state.text_mouse_drag_started=false;
+    }
+    sync_native_text_projection(state);
 }
 
 fn expand_native_home(text: &str) -> PathBuf {
@@ -967,9 +1025,13 @@ fn toggle_native_form_row(state: &mut DiscBrowserState) {
 
 fn begin_native_template_edit(state: &mut DiscBrowserState) {
     state.destination_input = state.naming_template.clone();
+    state.text_edit = Some(super::text_input::TextInputState::new_selected(
+        state.destination_input.clone()));
     state.destination_caret = state.destination_input.chars().count();
     state.editing_destination = true;
     state.editing_template = true;
+    state.text_mouse_origin = None;
+    state.text_mouse_drag_started = false;
 }
 
 /// The probed codec, not merely a track's optional note, determines whether
@@ -1390,6 +1452,77 @@ fn native_tag_external_action(app: &mut AppState,
     }
 }
 
+/// Validate and apply an edited field. On failure keep the shared editor
+/// alive with its selection, undo history and caret intact.
+fn commit_native_text_edit(state:&mut DiscBrowserState) -> bool {
+    receive_native_text_projection(state);
+    let Some(value)=state.text_edit.as_ref().map(|input|input.text.trim().to_string()) else {
+        return false;
+    };
+    if state.editing_template {
+        if value.is_empty() {return false;}
+        state.naming_template=value;
+    } else {
+        let path=expand_native_home(&value);
+        if !path.is_absolute() || path.components().any(|component|
+            matches!(component,std::path::Component::ParentDir)) {
+            state.destination_feedback=Some(
+                crate::tui::disc_browser::DestinationFeedback::InvalidPath);
+            return false;
+        }
+        state.destination=path;
+    }
+    cancel_native_text_edit(state);
+    true
+}
+
+fn native_text_tab_completion(state:&mut DiscBrowserState) -> bool {
+    receive_native_text_projection(state);
+    let Some(input)=state.text_edit.as_mut() else {return false;};
+    let before=input.text.clone();
+    if state.editing_template {
+        let available=super::template_builder::native_completion_tokens(state.contents.format);
+        let candidates=available.iter().map(String::as_str).collect::<Vec<_>>();
+        super::text_input::apply_template_variable_completion_with(input,&candidates);
+    }else{
+        let byte=input.cursor;
+        let mut prefix=input.text[..byte].to_owned();
+        complete_native_folder_segment(&mut prefix);
+        if prefix.as_str()!=&input.text[..byte] {
+            input.replace_range(0..byte,&prefix);
+        }
+    }
+    let changed=input.text!=before;
+    sync_native_text_projection(state);
+    changed
+}
+
+fn handle_native_text_key(state:&mut DiscBrowserState,key:KeyEvent) {
+    use crossterm::event::{KeyCode,KeyModifiers};
+    match key.code {
+        KeyCode::Esc => cancel_native_text_edit(state),
+        KeyCode::Enter => {commit_native_text_edit(state);},
+        KeyCode::Tab if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+            if !native_text_tab_completion(state) && commit_native_text_edit(state) {
+                move_native_form_cursor(state,0,1);
+            }
+        }
+        KeyCode::BackTab | KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            if commit_native_text_edit(state) { move_native_form_cursor(state,0,-1); }
+        }
+        _ => {
+            receive_native_text_projection(state);
+            if let Some(input)=state.text_edit.as_mut() {
+                // The shared reducer owns navigation, selection, edits,
+                // shortcuts and the logical clipboard. Unknown chords are
+                // swallowed here rather than leaking to form accelerators.
+                let _=super::text_input::handle_text_input_key(input,&key);
+            }
+            sync_native_text_projection(state);
+        }
+    }
+}
+
 /// Window-only navigation. No Convert actions run unless explicitly selected.
 pub fn handle_disc_browser_key(
     app: &mut AppState,
@@ -1400,7 +1533,8 @@ pub fn handle_disc_browser_key(
     use crate::tui::disc_browser::{ExtractFocus, ExtractPanel};
     let ActiveOverlay::DiscBrowser(_) = &app.active_overlay else { return; };
     if matches!(key.code, KeyCode::Char('m' | 'M')) && key.modifiers == KeyModifiers::ALT
-        && matches!(&app.active_overlay, ActiveOverlay::DiscBrowser(s) if s.panel.is_none()) {
+        && matches!(&app.active_overlay, ActiveOverlay::DiscBrowser(s)
+            if s.panel.is_none() && !s.editing_destination) {
         if let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay {
             state.maximized = !state.maximized;
         }
@@ -1420,13 +1554,9 @@ pub fn handle_disc_browser_key(
     let ActiveOverlay::DiscBrowser(state) = &app.active_overlay else { return; };
     // Text editors and popups own their keys. In particular Ctrl+X must not
     // bypass an unfinished destination edit or a pending choice dialog.
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('x') {
-        if state.editing_destination {
-            let field = if state.editing_template { "Naming" } else { "Folder" };
-            app.set_status(format!(
-                "Finish editing {field} before extracting: Enter to accept or Esc to discard"
-            ));
-        } else if state.panel.is_none() && !state.overwrite_open {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('x')
+        && !state.editing_destination {
+        if state.panel.is_none() && !state.overwrite_open {
             start_native_extraction(app, tx);
         }
         return;
@@ -1502,79 +1632,7 @@ pub fn handle_disc_browser_key(
         return;
     }
     if state.editing_destination {
-        use NativeKeyAction as A;
-        let action = native_key_bindings(state).into_iter().find(|binding|
-            binding.code == key.code && binding.modifiers == key.modifiers)
-            .map(|binding| binding.action);
-        match (action, key.code) {
-            (Some(A::EditUndo), _) => cancel_native_text_edit(state),
-            (Some(A::EditDone), _) => {
-                if state.editing_template {
-                    if state.destination_input.trim().is_empty() { return; }
-                    state.naming_template = state.destination_input.trim().to_string();
-                } else {
-                    let path = expand_native_home(state.destination_input.trim());
-                    if !path.is_absolute() || path.components().any(|component|
-                        matches!(component, std::path::Component::ParentDir)) {
-                        // Keep the field open: a rejected edit must not look
-                        // as though its invalid value was accepted.
-                        state.destination_feedback = Some(
-                            crate::tui::disc_browser::DestinationFeedback::InvalidPath);
-                        return;
-                    }
-                    state.destination = path;
-                    state.refresh_destination_feedback();
-                }
-                state.editing_destination = false;
-                state.editing_template = false;
-                state.destination_input.clear();
-                state.destination_caret = 0;
-            }
-            (Some(A::EditComplete), _) => {
-                if state.editing_template {
-                    let mut input=super::text_input::TextInputState::new(state.destination_input.clone());
-                    input.cursor=native_edit_byte_index(&state.destination_input,state.destination_caret);
-                    let available=super::template_builder::native_completion_tokens(state.contents.format);
-                    let candidates=available.iter().map(String::as_str).collect::<Vec<_>>();
-                    super::text_input::apply_template_variable_completion_with(&mut input,&candidates);
-                    state.destination_caret=input.text[..input.cursor].chars().count();
-                    state.destination_input=input.text;
-                } else {
-                    let byte=native_edit_byte_index(&state.destination_input,state.destination_caret);
-                    let mut prefix=state.destination_input[..byte].to_owned();
-                    complete_native_folder_segment(&mut prefix);
-                    state.destination_input=format!("{}{}",prefix,&state.destination_input[byte..]);
-                    state.destination_caret=prefix.chars().count();
-                }
-            }
-            (Some(A::EditLeft), _) => {
-                state.destination_caret=state.destination_caret.saturating_sub(1);
-            }
-            (Some(A::EditRight), _) => {
-                state.destination_caret=(state.destination_caret+1).min(state.destination_input.chars().count());
-            }
-            (_, KeyCode::Home) => state.destination_caret=0,
-            (_, KeyCode::End) => state.destination_caret=state.destination_input.chars().count(),
-            (_, KeyCode::Delete) => {
-                let start=native_edit_byte_index(&state.destination_input,state.destination_caret);
-                let end=native_edit_byte_index(&state.destination_input,state.destination_caret+1);
-                state.destination_input.replace_range(start..end,"");
-            }
-            (_, KeyCode::Backspace) => {
-                if state.destination_caret>0 {
-                    let start=native_edit_byte_index(&state.destination_input,state.destination_caret-1);
-                    let end=native_edit_byte_index(&state.destination_input,state.destination_caret);
-                    state.destination_input.replace_range(start..end,"");
-                    state.destination_caret-=1;
-                }
-            }
-            (_, KeyCode::Char(c)) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                let byte=native_edit_byte_index(&state.destination_input,state.destination_caret);
-                state.destination_input.insert(byte,c);
-                state.destination_caret+=1;
-            }
-            _ => {}
-        }
+        handle_native_text_key(state,key);
         return;
     }
 
@@ -2643,7 +2701,69 @@ mod tests {
     }
 
     #[test]
-    fn r23_real_mouse_folder_double_click_opens_picker_and_log_click_clears_editor() {
+    fn r32d01_unfocused_first_click_keeps_select_all_on_mouse_release() {
+        let contents=selectable_disc_contents(PathBuf::from("disc.iso"),FolderDiscMarkerKind::Sacd);
+        let mut state=DiscBrowserState::new(contents,PathBuf::from("disc.iso"));
+        begin_native_folder_edit(&mut state);
+        native_text_mouse_down(&mut state,12,2,false,1,None);
+        assert!(state.text_edit.as_ref().unwrap().select_all);
+        native_text_mouse_drag(&mut state,2,true);
+        assert!(state.text_edit.as_ref().unwrap().select_all);
+    }
+
+    #[test]
+    fn r32d01_naming_drag_keeps_initial_scrolled_window() {
+        let contents=selectable_disc_contents(PathBuf::from("disc.iso"),FolderDiscMarkerKind::Sacd);
+        let mut state=DiscBrowserState::new(contents,PathBuf::from("disc.iso"));
+        state.naming_template="%ARTIST%/%ALBUM%/%DISC%/%TRACKNN% - %TITLE%".to_owned();
+        focus_native_row(&mut state,"Naming");
+        begin_native_template_edit(&mut state);
+        let width=12usize;
+        let (start,_)=state.text_edit.as_ref().unwrap().view_range(width);
+        let anchor=state.text_edit.as_ref().unwrap().byte_index_for_view_column(width,2);
+        native_text_mouse_down(&mut state,width,2,true,1,None);
+        let frozen=state.text_edit.as_ref().unwrap().view(width).0;
+        assert_eq!(state.text_edit.as_ref().unwrap().cursor,anchor);
+        native_text_mouse_drag(&mut state,8,false);
+        let input=state.text_edit.as_ref().unwrap();
+        assert_eq!(input.view_range(width).0.start,start.start);
+        assert_eq!(input.view(width).0,frozen);
+        assert_eq!(input.selection_range(),Some(anchor..start.start+8));
+        native_text_mouse_drag(&mut state,5,true);
+        assert_eq!(state.text_edit.as_ref().unwrap().selection_range(),
+            Some(anchor..start.start+5));
+    }
+
+    #[test]
+    fn r32d01_abbreviated_folder_drag_keeps_mapped_anchor_and_revealed_view() {
+        use crate::tui::disc_extract_render::native_folder_preview_caret;
+        let contents=selectable_disc_contents(PathBuf::from("disc.iso"),FolderDiscMarkerKind::Sacd);
+        let mut state=DiscBrowserState::new(contents,PathBuf::from("disc.iso"));
+        state.destination=PathBuf::from("/archives/huge_hidden_collection/more_hidden/Composer/Album/Edition");
+        focus_native_row(&mut state,"Folder");
+        begin_native_folder_edit(&mut state);
+        let width=23usize;
+        let column=7usize;
+        let mapped_char=native_folder_preview_caret(&state.destination,width as u16,column);
+        let expected_anchor=native_edit_byte_index(&state.destination_input,mapped_char);
+        native_text_mouse_down(&mut state,width,column,true,1,Some(mapped_char));
+        let input=state.text_edit.as_ref().unwrap();
+        let frozen=input.view(width).0;
+        let frozen_start=input.view_range(width).0.start;
+        assert_eq!(input.cursor,expected_anchor);
+        assert_eq!(input.selection_anchor,Some(expected_anchor));
+        native_text_mouse_drag(&mut state,column+5,false);
+        let input=state.text_edit.as_ref().unwrap();
+        assert_eq!(input.view_range(width).0.start,frozen_start);
+        assert_eq!(input.view(width).0,frozen);
+        assert_eq!(input.selection_range().unwrap().start,expected_anchor);
+        native_text_mouse_drag(&mut state,column+3,true);
+        assert_eq!(state.text_edit.as_ref().unwrap().selection_range().unwrap().start,
+            expected_anchor);
+    }
+
+    #[test]
+    fn r32_mouse_folder_selects_word_and_browse_pill_opens_picker() {
         use crossterm::event::{MouseEvent,MouseEventKind,MouseButton,KeyModifiers as M};
         use ratatui::layout::Rect;
         let temp=tempfile::tempdir().unwrap();
@@ -2656,6 +2776,7 @@ mod tests {
         let mut app=AppState::new_for_test(TonepoetConfig::default());
         app.active_overlay=ActiveOverlay::DiscBrowser(Box::new(state));
         app.button_map.record_button(TuiButton::DiscBrowserFolderField,Rect::new(8,12,38,1));
+        app.button_map.record_button(TuiButton::DiscBrowserFolderBrowse,Rect::new(48,12,7,1));
         app.button_map.record_button(TuiButton::DiscBrowserToggle(log),Rect::new(55,13,20,1));
         let (tx,_rx)=tokio::sync::mpsc::channel(8);
         let click=|x,y| MouseEvent{kind:MouseEventKind::Down(MouseButton::Left),
@@ -2671,10 +2792,17 @@ mod tests {
         handle_disc_browser_key(&mut app,KeyEvent::new(KeyCode::Char(' '),M::NONE),&tx);
         assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s)
             if !s.extraction_log && s.destination==original));
+        app.double_click.clear();
         crate::tui::keybindings::handle_mouse(&mut app,click(12,12),&tx);
+        assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s)
+            if s.text_edit.as_ref().is_some_and(|input| input.select_all)));
         crate::tui::keybindings::handle_mouse(&mut app,click(12,12),&tx);
+        assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s)
+            if s.text_edit.as_ref().and_then(|input| input.selection_range()).is_some()),
+            "double-click selects the word, not the directory picker");
+        crate::tui::keybindings::handle_mouse(&mut app,click(50,12),&tx);
         assert!(matches!(&app.active_overlay,ActiveOverlay::FilePicker(_)),
-            "the second actual mouse-down must enter the existing directory picker");
+            "the Browse pill still opens the existing directory picker");
         assert!(app.pending_disc_extract_picker.as_ref().is_some_and(|s|
             !s.editing_destination && s.destination==original));
         let (session_id,purpose)=match &app.active_overlay {
@@ -2698,7 +2826,7 @@ mod tests {
         state.destination=temp.path().join("Música").join("Album");
         focus_native_row(&mut state,"Folder");
         begin_native_folder_edit(&mut state);
-        native_folder_caret_from_mouse(&mut state,14,10,80,false);
+        native_text_mouse_down(&mut state,80,4,true,1,None);
         let original=state.destination_input.clone();
         let caret=state.destination_caret;
         assert!(caret<original.chars().count());
@@ -2878,7 +3006,30 @@ mod tests {
         }).unwrap();
         let field=buttons.button_rect(TuiButton::DiscBrowserFolderField)
             .expect("folder field must render");
-        let row=(field.x+1..field.right()).map(|x|
+        let row=(field.x..field.right()).map(|x|
+            terminal.backend().buffer().get(x,field.y).symbol().to_owned())
+            .collect::<Vec<_>>().concat();
+        app.button_map=buttons;
+        (field,row)
+    }
+
+    /// Read the actual rendered field and its registered hitbox before a
+    /// pointer gesture, including when the field does not have form focus.
+    fn r32c_paint_field(app: &mut AppState, target: TuiButton,
+        width: u16, height: u16) -> (ratatui::layout::Rect, String) {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use crate::tui::button_map::ButtonRenderMap;
+        let mut terminal=Terminal::new(TestBackend::new(width,height)).unwrap();
+        let mut buttons=ButtonRenderMap::new();
+        let theme=app.theme;
+        let scratch=std::env::temp_dir();
+        terminal.draw(|frame| {
+            let ActiveOverlay::DiscBrowser(state)=&app.active_overlay else {panic!("not browser")};
+            crate::tui::disc_extract_render::draw(frame,state,&scratch,&mut buttons,theme);
+        }).unwrap();
+        let field=buttons.button_rect(target).expect("text field must render");
+        let row=(field.x..field.right()).map(|x|
             terminal.backend().buffer().get(x,field.y).symbol().to_owned())
             .collect::<Vec<_>>().concat();
         app.button_map=buttons;
@@ -2886,7 +3037,116 @@ mod tests {
     }
 
     #[test]
-    fn r24_compacted_home_and_ellipsis_caret_follow_actual_mouse_hitboxes() {
+    fn r32c_unfocused_first_drag_uses_compacted_folder_preview() {
+        use crossterm::event::{MouseButton,MouseEvent,MouseEventKind,KeyModifiers as M};
+        let source=PathBuf::from("disc.iso");
+        let mut state=DiscBrowserState::new(
+            selectable_disc_contents(source.clone(),FolderDiscMarkerKind::Sacd),source);
+        let path=PathBuf::from("/music/a-very-long-hidden-directory/another-hidden-directory/Album/Extracted");
+        state.destination=path.clone();
+        state.focus=crate::tui::disc_browser::ExtractFocus::Programs;
+        let mut app=AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay=ActiveOverlay::DiscBrowser(Box::new(state));
+        let (tx,_rx)=tokio::sync::mpsc::channel(8);
+        let (field,row)=r32c_paint_field(&mut app,TuiButton::DiscBrowserFolderField,154,40);
+        assert!(row.contains('…') && row.contains("Album"),"preview: {row:?}");
+        let start_col=row[..row.find("Album").unwrap()].chars().count();
+        let down=MouseEvent {kind:MouseEventKind::Down(MouseButton::Left),
+            column:field.x+start_col as u16,row:field.y,modifiers:M::NONE};
+        crate::tui::keybindings::handle_mouse(&mut app,down,&tx);
+        let ActiveOverlay::DiscBrowser(state)=&app.active_overlay else {panic!("browser")};
+        assert!(state.text_edit.as_ref().unwrap().select_all,
+            "an unfocused first click must keep whole-field selection");
+        let original_anchor=state.text_edit.as_ref().unwrap().cursor;
+        assert_eq!(original_anchor,path.to_string_lossy().find("Album").unwrap());
+        let original_view=state.text_edit.as_ref().unwrap().view(field.width as usize).0;
+        let (edit_field,_)=r32c_paint_field(&mut app,TuiButton::DiscBrowserFolderField,154,40);
+        assert_eq!(edit_field,field);
+        crate::tui::keybindings::handle_mouse(&mut app,MouseEvent {
+            kind:MouseEventKind::Drag(MouseButton::Left),
+            column:down.column+3,row:down.row,modifiers:M::NONE},&tx);
+        let ActiveOverlay::DiscBrowser(state)=&app.active_overlay else {panic!("browser")};
+        let input=state.text_edit.as_ref().unwrap();
+        assert_eq!(input.view(field.width as usize).0,original_view,
+            "the first drag must not change the clicked text window");
+        let selected=input.selection_range().expect("first drag selects a substring");
+        assert_eq!(selected.start,original_anchor);
+        assert_eq!(&input.text[selected],"Alb");
+        crate::tui::keybindings::handle_mouse(&mut app,MouseEvent {
+            kind:MouseEventKind::Up(MouseButton::Left),
+            column:down.column+3,row:down.row,modifiers:M::NONE},&tx);
+        handle_disc_browser_key(&mut app,KeyEvent::new(KeyCode::Char('Z'),M::NONE),&tx);
+        let ActiveOverlay::DiscBrowser(state)=&app.active_overlay else {panic!("browser")};
+        assert_eq!(state.destination_input,
+            path.to_string_lossy().replacen("Album","Zum",1));
+    }
+
+    #[test]
+    fn r32c_unfocused_click_without_drag_still_selects_all() {
+        use crossterm::event::{MouseButton,MouseEvent,MouseEventKind,KeyModifiers as M};
+        let source=PathBuf::from("disc.iso");
+        let mut state=DiscBrowserState::new(
+            selectable_disc_contents(source.clone(),FolderDiscMarkerKind::Sacd),source);
+        state.naming_template="%ALBUM%/%ARTIST%/%TRACKNN% - %TITLE%".into();
+        state.focus=crate::tui::disc_browser::ExtractFocus::Programs;
+        let mut app=AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay=ActiveOverlay::DiscBrowser(Box::new(state));
+        let (tx,_rx)=tokio::sync::mpsc::channel(8);
+        let (field,_)=r32c_paint_field(&mut app,TuiButton::DiscBrowserNaming,154,40);
+        let press=MouseEvent{kind:MouseEventKind::Down(MouseButton::Left),
+            column:field.x+2,row:field.y,modifiers:M::NONE};
+        crate::tui::keybindings::handle_mouse(&mut app,press,&tx);
+        crate::tui::keybindings::handle_mouse(&mut app,MouseEvent{
+            kind:MouseEventKind::Up(MouseButton::Left),
+            column:field.x+2,row:field.y,modifiers:M::NONE},&tx);
+        let ActiveOverlay::DiscBrowser(state)=&app.active_overlay else {panic!("browser")};
+        assert!(state.text_edit.as_ref().unwrap().select_all);
+        handle_disc_browser_key(&mut app,KeyEvent::new(KeyCode::Char('X'),M::NONE),&tx);
+        let ActiveOverlay::DiscBrowser(state)=&app.active_overlay else {panic!("browser")};
+        assert_eq!(state.destination_input,"X");
+    }
+
+    #[test]
+    fn r32c_unfocused_first_drag_uses_naming_preview_prefix() {
+        use crossterm::event::{MouseButton,MouseEvent,MouseEventKind,KeyModifiers as M};
+        let source=PathBuf::from("disc.iso");
+        let mut state=DiscBrowserState::new(
+            selectable_disc_contents(source.clone(),FolderDiscMarkerKind::Sacd),source);
+        let template="%ALBUM%/%ARTIST%/%TRACKNN% - %TITLE%/additional-long-template-suffix";
+        state.naming_template=template.into();
+        state.focus=crate::tui::disc_browser::ExtractFocus::Programs;
+        let mut app=AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay=ActiveOverlay::DiscBrowser(Box::new(state));
+        let (tx,_rx)=tokio::sync::mpsc::channel(8);
+        let (field,row)=r32c_paint_field(&mut app,TuiButton::DiscBrowserNaming,154,40);
+        assert!(row.contains("ALBUM") && row.contains('…'),"preview: {row:?}");
+        let column=row[..row.find("ALBUM").unwrap()].chars().count();
+        let down=MouseEvent {kind:MouseEventKind::Down(MouseButton::Left),
+            column:field.x+column as u16,row:field.y,modifiers:M::NONE};
+        crate::tui::keybindings::handle_mouse(&mut app,down,&tx);
+        let ActiveOverlay::DiscBrowser(state)=&app.active_overlay else {panic!("browser")};
+        let input=state.text_edit.as_ref().unwrap();
+        assert!(state.editing_template && input.select_all);
+        assert_eq!(input.cursor,1);
+        let original_view=input.view(field.width as usize).0;
+        r32c_paint_field(&mut app,TuiButton::DiscBrowserNaming,154,40);
+        crate::tui::keybindings::handle_mouse(&mut app,MouseEvent {
+            kind:MouseEventKind::Drag(MouseButton::Left),
+            column:down.column+5,row:down.row,modifiers:M::NONE},&tx);
+        let ActiveOverlay::DiscBrowser(state)=&app.active_overlay else {panic!("browser")};
+        let input=state.text_edit.as_ref().unwrap();
+        assert_eq!(input.view(field.width as usize).0,original_view);
+        assert_eq!(&input.text[input.selection_range().expect("Naming drag")],"ALBUM");
+        crate::tui::keybindings::handle_mouse(&mut app,MouseEvent {
+            kind:MouseEventKind::Up(MouseButton::Left),
+            column:down.column+5,row:down.row,modifiers:M::NONE},&tx);
+        handle_disc_browser_key(&mut app,KeyEvent::new(KeyCode::Char('X'),M::NONE),&tx);
+        let ActiveOverlay::DiscBrowser(state)=&app.active_overlay else {panic!("browser")};
+        assert_eq!(state.destination_input,template.replacen("ALBUM","X",1));
+    }
+
+    #[test]
+    fn r32_compacted_home_preview_opens_full_editor_and_supports_mouse_caret() {
         use crossterm::event::{MouseEvent,MouseEventKind,MouseButton,KeyModifiers as M};
         let home=std::env::var_os("HOME").or_else(||std::env::var_os("USERPROFILE"))
             .map(PathBuf::from).expect("home directory for path abbreviation");
@@ -2895,6 +3155,7 @@ mod tests {
             selectable_disc_contents(source.clone(),FolderDiscMarkerKind::Sacd),source);
         state.focus=crate::tui::disc_browser::ExtractFocus::Output;
         state.output_cursor=state.output_rows().iter().position(|row|*row=="Folder").unwrap();
+        state.focus=crate::tui::disc_browser::ExtractFocus::Programs;
         state.destination=home.join("Music").join("Out");
         let mut app=AppState::new_for_test(TonepoetConfig::default());
         app.active_overlay=ActiveOverlay::DiscBrowser(Box::new(state));
@@ -2905,7 +3166,13 @@ mod tests {
             KeyEvent::new(code,M::NONE),&tx);
         let (field,row)=r24_paint_folder(&mut app,154,40);
         assert!(row.starts_with("~/") && row.contains("Music") && row.contains("Out"),"actual field: {row:?}");
-        let x=field.x+1+row[..row.find("Music").unwrap()].chars().count() as u16;
+        let x=field.x+row[..row.find("Music").unwrap()].chars().count() as u16;
+        crate::tui::keybindings::handle_mouse(&mut app,click(x,field.y),&tx);
+        assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s)
+            if s.text_edit.as_ref().is_some_and(|input|input.select_all)));
+        app.double_click.clear();
+        let (field,row)=r24_paint_folder(&mut app,154,40);
+        let x=field.x+row[..row.find("Music").unwrap()].chars().count() as u16;
         crate::tui::keybindings::handle_mouse(&mut app,click(x,field.y),&tx);
         press(&mut app,KeyCode::Char('X'));
         assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(state)
@@ -2920,10 +3187,17 @@ mod tests {
             .join("AlbumName").join("Extracted");
         if let ActiveOverlay::DiscBrowser(state)=&mut app.active_overlay {
             state.destination=long.clone();
+            state.focus=crate::tui::disc_browser::ExtractFocus::Programs;
         }
         let (field,row)=r24_paint_folder(&mut app,154,40);
         assert!(row.contains('…') && row.contains("Extracted"),"collapsed field: {row:?}");
-        let x=field.x+1+row[..row.find("Extracted").unwrap()].chars().count() as u16;
+        let x=field.x+row[..row.find("Extracted").unwrap()].chars().count() as u16;
+        crate::tui::keybindings::handle_mouse(&mut app,click(x,field.y),&tx);
+        assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s)
+            if s.text_edit.as_ref().is_some_and(|input|input.select_all)));
+        app.double_click.clear();
+        let (field,row)=r24_paint_folder(&mut app,154,40);
+        let x=field.x+row[..row.find("Extracted").unwrap()].chars().count() as u16;
         crate::tui::keybindings::handle_mouse(&mut app,click(x,field.y),&tx);
         press(&mut app,KeyCode::Char('X'));
         assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(state)
@@ -2931,7 +3205,7 @@ mod tests {
         press(&mut app,KeyCode::Backspace);
         let (field,row)=r24_paint_folder(&mut app,154,40);
         assert!(row.contains("Extracted"),"editor must show the clicked component: {row:?}");
-        let x=field.x+1+row[..row.find("racted").unwrap()].chars().count() as u16;
+        let x=field.x+row[..row.find("racted").unwrap()].chars().count() as u16;
         crate::tui::keybindings::handle_mouse(&mut app,click(x,field.y),&tx);
         press(&mut app,KeyCode::Delete);
         assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(state)
@@ -3198,7 +3472,7 @@ mod tests {
             crate::tui::disc_extract_render::draw(frame,s,&scratch,&mut buttons,theme);
         }).unwrap();
         let field=buttons.button_rect(TuiButton::DiscBrowserFolderField).unwrap();
-        let cell=(field.x+1..field.right()).find(|x| {
+        let cell=(field.x..field.right()).find(|x| {
             marker.chars().enumerate().all(|(i,ch)|{
                 let col=(*x).saturating_add(i as u16);
                 col<field.right() && terminal.backend().buffer().get(col,field.y).symbol()
@@ -3238,9 +3512,14 @@ mod tests {
                 s.destination=path.clone();
                 s.editing_destination=false;
                 s.destination_input.clear();
-                s.focus=crate::tui::disc_browser::ExtractFocus::Output;
                 focus_native_row(s,"Folder");
+                s.focus=crate::tui::disc_browser::ExtractFocus::Programs;
             }
+            app.double_click.clear();
+            let (field,x)=r25_paint_and_locate(&mut app,width,height,"Extracted");
+            crate::tui::keybindings::handle_mouse(&mut app,click(x,field.y),&tx);
+            assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s)
+                if s.text_edit.as_ref().is_some_and(|input|input.select_all)));
             app.double_click.clear();
             let (field,x)=r25_paint_and_locate(&mut app,width,height,"Extracted");
             crate::tui::keybindings::handle_mouse(&mut app,click(x,field.y),&tx);
@@ -3497,6 +3776,91 @@ mod tests {
                 (state.tag_fields,state.sacd_dff)};
             assert_eq!(result_mouse,result_key,"{control:?} mouse vs keyboard");
         }
+    }
+
+    #[test]
+    fn r32_click_on_already_focused_field_places_caret_without_selecting_all() {
+        use crossterm::event::{MouseButton,MouseEvent,MouseEventKind,KeyModifiers as M};
+        use ratatui::layout::Rect;
+        let source=PathBuf::from("disc.iso");
+        let mut state=DiscBrowserState::new(
+            selectable_disc_contents(source.clone(),FolderDiscMarkerKind::Sacd),source);
+        state.destination=PathBuf::from("/tmp/Album");
+        focus_native_row(&mut state,"Folder");
+        let mut app=AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay=ActiveOverlay::DiscBrowser(Box::new(state));
+        app.button_map.record_button(TuiButton::DiscBrowserFolderField,Rect::new(8,12,32,1));
+        let (tx,_rx)=tokio::sync::mpsc::channel(8);
+        crate::tui::keybindings::handle_mouse(&mut app,MouseEvent {
+            kind:MouseEventKind::Down(MouseButton::Left),
+            column:10,row:12,modifiers:M::NONE,
+        },&tx);
+        assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s)
+            if s.editing_destination && s.text_edit.as_ref().is_some_and(|i|
+                !i.select_all && i.cursor==2 && i.selection_range().is_none())));
+    }
+
+    #[test]
+    fn r32_folder_and_naming_share_edit_keys_and_do_not_invoke_form_accelerators() {
+        use crossterm::event::KeyModifiers as M;
+        let path=PathBuf::from("/tmp/r32-original-folder");
+        let source=PathBuf::from("disc.iso");
+        let mut state=DiscBrowserState::new(
+            selectable_disc_contents(source.clone(),FolderDiscMarkerKind::Sacd),source);
+        state.destination=path.clone();
+        let mut app=AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay=ActiveOverlay::DiscBrowser(Box::new(state));
+        let (tx,_rx)=tokio::sync::mpsc::channel(8);
+        let send=|app:&mut AppState,code,mods|handle_disc_browser_key(app,
+            KeyEvent::new(code,mods),&tx);
+        if let ActiveOverlay::DiscBrowser(s)=&mut app.active_overlay {
+            focus_native_row(s,"Folder");
+        }
+        send(&mut app,KeyCode::Enter,M::NONE);
+        assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s)
+            if s.text_edit.as_ref().is_some_and(|i|i.select_all)));
+        // A letter which is a window accelerator must replace the selection,
+        // not change a checkbox or trigger the More sheet.
+        send(&mut app,KeyCode::Char('m'),M::NONE);
+        assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s)
+            if s.editing_destination && s.destination_input=="m" && s.panel.is_none()));
+        send(&mut app,KeyCode::Esc,M::NONE);
+        assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s)
+            if !s.editing_destination && s.destination==path));
+        if let ActiveOverlay::DiscBrowser(s)=&mut app.active_overlay {
+            focus_native_row(s,"Naming");
+        }
+        send(&mut app,KeyCode::Enter,M::NONE);
+        assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s)
+            if s.editing_template && s.text_edit.as_ref().is_some_and(|i|i.select_all)));
+        send(&mut app,KeyCode::Char('c'),M::NONE);
+        assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s)
+            if s.destination_input=="c" && s.panel.is_none()));
+        send(&mut app,KeyCode::Char('a'),M::CONTROL);
+        send(&mut app,KeyCode::Char('%'),M::NONE);
+        send(&mut app,KeyCode::Char('T'),M::NONE);
+        send(&mut app,KeyCode::Char('I'),M::NONE);
+        send(&mut app,KeyCode::Char('T'),M::NONE);
+        send(&mut app,KeyCode::Char('L'),M::NONE);
+        send(&mut app,KeyCode::Char('E'),M::NONE);
+        send(&mut app,KeyCode::Char('%'),M::NONE);
+        send(&mut app,KeyCode::Enter,M::NONE);
+        assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s)
+            if !s.editing_destination && s.naming_template=="%TITLE%"));
+    }
+
+    #[test]
+    fn r32_title_size_glyph_toggles_without_requiring_double_click() {
+        let source=PathBuf::from("disc.iso");
+        let state=DiscBrowserState::new(
+            selectable_disc_contents(source.clone(),FolderDiscMarkerKind::Sacd),source);
+        let mut app=AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay=ActiveOverlay::DiscBrowser(Box::new(state));
+        let (tx,_rx)=tokio::sync::mpsc::channel(8);
+        assert!(handle_disc_browser_button_click(&mut app,&TuiButton::DiscBrowserTitleSize,1,&tx));
+        assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s) if s.maximized));
+        assert!(handle_disc_browser_button_click(&mut app,&TuiButton::DiscBrowserTitleSize,1,&tx));
+        assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s) if !s.maximized));
     }
 
     #[test]

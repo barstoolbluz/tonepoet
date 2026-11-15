@@ -4,6 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use unicode_segmentation::UnicodeSegmentation;
 
 static TEXT_INPUT_CLIPBOARD_PUBLISH_HOOK: OnceLock<fn(&str)> = OnceLock::new();
 
@@ -322,6 +323,9 @@ pub struct TextInputState {
     /// Some and differs from `cursor`; both endpoints are kept on UTF-8
     /// boundaries.
     pub selection_anchor: Option<usize>,
+    /// Mouse-chosen horizontal origin, retained until keyboard navigation or
+    /// a text edit so pointer placement does not jump after button release.
+    mouse_view_start: Option<usize>,
     undo_history: Vec<TextInputSnapshot>,
     redo_history: Vec<TextInputSnapshot>,
     ranked_completion_cycle: Option<RankedCompletionCycle>,
@@ -395,6 +399,7 @@ impl TextInputState {
             cursor,
             select_all: false,
             selection_anchor: None,
+            mouse_view_start: None,
             undo_history: Vec::new(),
             redo_history: Vec::new(),
             ranked_completion_cycle: None,
@@ -409,6 +414,7 @@ impl TextInputState {
             cursor,
             select_all: true,
             selection_anchor: Some(0),
+            mouse_view_start: None,
             undo_history: Vec::new(),
             redo_history: Vec::new(),
             ranked_completion_cycle: None,
@@ -440,6 +446,7 @@ impl TextInputState {
             .selection_anchor
             .filter(|anchor| *anchor <= self.text.len() && self.text.is_char_boundary(*anchor));
         self.ranked_completion_cycle = None;
+        self.mouse_view_start = None;
     }
 
     fn push_bounded(history: &mut Vec<TextInputSnapshot>, snapshot: TextInputSnapshot) {
@@ -450,6 +457,7 @@ impl TextInputState {
     }
 
     fn record_edit(&mut self, before: TextInputSnapshot) -> bool {
+        self.mouse_view_start = None;
         if before.text == self.text {
             return false;
         }
@@ -512,6 +520,7 @@ impl TextInputState {
         self.select_all = false;
         self.selection_anchor = None;
         self.ranked_completion_cycle = None;
+        self.mouse_view_start = None;
     }
 
     pub fn select_all_text(&mut self) {
@@ -519,6 +528,7 @@ impl TextInputState {
         self.select_all = true;
         self.selection_anchor = Some(0);
         self.ranked_completion_cycle = None;
+        self.mouse_view_start = None;
     }
 
     fn delete_selection(&mut self) -> bool {
@@ -712,6 +722,7 @@ impl TextInputState {
     }
 
     pub fn extend_left(&mut self) {
+        self.mouse_view_start = None;
         if self.selection_anchor.is_none() {
             self.selection_anchor = Some(self.cursor);
         }
@@ -722,6 +733,7 @@ impl TextInputState {
     }
 
     pub fn extend_right(&mut self) {
+        self.mouse_view_start = None;
         if self.selection_anchor.is_none() {
             self.selection_anchor = Some(self.cursor);
         }
@@ -732,6 +744,7 @@ impl TextInputState {
     }
 
     pub fn extend_word_left(&mut self) {
+        self.mouse_view_start = None;
         if self.selection_anchor.is_none() {
             self.selection_anchor = Some(self.cursor);
         }
@@ -739,6 +752,7 @@ impl TextInputState {
     }
 
     pub fn extend_word_right(&mut self) {
+        self.mouse_view_start = None;
         if self.selection_anchor.is_none() {
             self.selection_anchor = Some(self.cursor);
         }
@@ -746,6 +760,7 @@ impl TextInputState {
     }
 
     pub fn extend_path_segment_left(&mut self) {
+        self.mouse_view_start = None;
         if self.selection_anchor.is_none() {
             self.selection_anchor = Some(self.cursor);
         }
@@ -753,6 +768,7 @@ impl TextInputState {
     }
 
     pub fn extend_path_segment_right(&mut self) {
+        self.mouse_view_start = None;
         if self.selection_anchor.is_none() {
             self.selection_anchor = Some(self.cursor);
         }
@@ -1006,7 +1022,10 @@ impl TextInputState {
 
         let mut start_byte = 0usize;
         let mut start_col = 0usize;
-        if desired_start > 0 {
+        if let Some(fixed_start) = self.mouse_view_start {
+            start_byte = fixed_start;
+            start_col = crate::display_width::width(&self.text[..fixed_start]);
+        } else if desired_start > 0 {
             let mut col = 0usize;
             let mut candidate = self.cursor;
             let mut candidate_col = cursor_col;
@@ -1115,10 +1134,39 @@ impl TextInputState {
     /// Begin a mouse-drag selection at a display column. A simple click leaves
     /// an empty anchor which is collapsed when the button is released.
     pub fn begin_mouse_selection(&mut self, width: usize, column: usize) {
+        // Map the down event against the window that was on screen, not the
+        // window that would be chosen after changing the caret.
+        self.mouse_view_start = Some(self.view_range(width).0.start);
         let cursor = self.byte_index_for_view_column(width, column);
         self.cursor = cursor;
         self.select_all = false;
         self.selection_anchor = Some(cursor);
+    }
+
+    /// Start a selection from a caret mapped out of a shortened path preview.
+    /// Reveal the full text with that caret at the clicked screen column and
+    /// retain the resulting window for the entire gesture.
+    pub fn begin_mouse_selection_at_cursor(&mut self, width: usize, column: usize) {
+        // A shortened Folder preview maps Unicode scalar positions. If its
+        // hit lands between a base letter and a combining mark, advance to
+        // the cluster end before creating a replaceable selection boundary.
+        if let Some((byte, g)) = self.text.grapheme_indices(true)
+            .find(|(byte, g)| *byte < self.cursor && self.cursor < *byte + g.len())
+        {
+            self.cursor = byte + g.len();
+        }
+        let mut start = self.cursor;
+        let mut used = 0usize;
+        let target = column.min(width.saturating_sub(1));
+        for (byte, grapheme) in self.text[..self.cursor].grapheme_indices(true).rev() {
+            let cells = crate::display_width::width(grapheme);
+            if used.saturating_add(cells) > target { break; }
+            used += cells;
+            start = byte;
+        }
+        self.mouse_view_start = Some(start);
+        self.select_all = false;
+        self.selection_anchor = Some(self.cursor);
     }
 
     /// Extend an in-progress mouse selection to a display column.
@@ -1129,6 +1177,48 @@ impl TextInputState {
         self.selection_anchor = Some(anchor);
     }
 
+    /// Select the word under the pointer, including underscores in file names
+    /// and naming tokens. Scan grapheme clusters so decomposed letters retain
+    /// their combining marks when selected or replaced.
+    pub fn select_word_at_view_column(&mut self, width: usize, column: usize) {
+        let (view, _) = self.view_range(width);
+        self.mouse_view_start = Some(view.start);
+        let word_grapheme = |g: &str| g.chars().any(|c| c.is_alphanumeric() || c == '_');
+        // A caret hit on the *second* cell of a wide glyph belongs after the
+        // glyph. A word hit instead belongs to the glyph occupying that cell.
+        let mut cell = 0usize;
+        let hit = if column < width {
+            self.text[view.clone()].grapheme_indices(true).find_map(|(offset, g)| {
+                let next = cell.saturating_add(crate::display_width::width(g));
+                let occupied = cell <= column && column < next;
+                cell = next;
+                occupied.then_some((view.start + offset, g))
+            })
+        } else {
+            None
+        };
+        let Some((mut start, g)) = hit.filter(|(_, g)| word_grapheme(g)) else {
+            // Empty field cells and punctuation do not select a nearby word.
+            self.cursor = self.byte_index_for_view_column(width, column);
+            let window = self.mouse_view_start;
+            self.clear_selection();
+            self.mouse_view_start = window;
+            return;
+        };
+        let mut end = start + g.len();
+        for (byte, g) in self.text[..start].grapheme_indices(true).rev() {
+            if !word_grapheme(g) { break; }
+            start = byte;
+        }
+        for (_, g) in self.text[end..].grapheme_indices(true) {
+            if !word_grapheme(g) { break; }
+            end += g.len();
+        }
+        self.cursor = end;
+        self.selection_anchor = Some(start);
+        self.select_all = false;
+    }
+
     /// Finish a mouse selection. A click without movement becomes an ordinary
     /// insertion cursor rather than retaining an empty selection anchor.
     pub fn end_mouse_selection(&mut self) {
@@ -1136,6 +1226,8 @@ impl TextInputState {
             self.selection_anchor = None;
         }
         self.select_all = false;
+        // Keep the clicked window visible after release; the next text edit
+        // or keyboard navigation returns to normal caret-follow scrolling.
     }
 
 }
@@ -1316,6 +1408,7 @@ pub fn handle_text_input_key_with_boundaries(
             true
         }
         (true, false, _, KeyCode::Home) => {
+            input.mouse_view_start = None;
             if shift {
                 if input.selection_anchor.is_none() {
                     input.selection_anchor = Some(input.cursor);
@@ -1328,6 +1421,7 @@ pub fn handle_text_input_key_with_boundaries(
             true
         }
         (true, false, _, KeyCode::End) => {
+            input.mouse_view_start = None;
             if shift {
                 if input.selection_anchor.is_none() {
                     input.selection_anchor = Some(input.cursor);
@@ -1391,6 +1485,7 @@ pub fn handle_text_input_key_with_boundaries(
             true
         }
         (false, false, _, KeyCode::Home) => {
+            input.mouse_view_start = None;
             if shift {
                 if input.selection_anchor.is_none() {
                     input.selection_anchor = Some(input.cursor);
@@ -1403,6 +1498,7 @@ pub fn handle_text_input_key_with_boundaries(
             true
         }
         (false, false, _, KeyCode::End) => {
+            input.mouse_view_start = None;
             if shift {
                 if input.selection_anchor.is_none() {
                     input.selection_anchor = Some(input.cursor);
@@ -1964,6 +2060,89 @@ fn expand_tilde(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn r32d01_long_field_click_and_drag_keep_original_visible_window() {
+        let mut field = TextInputState::new("0123456789abcdefghijABCDEFGHIJ".into());
+        let width = 8;
+        let original_view = field.view(width).0;
+        let original_start = field.view_range(width).0.start;
+        let original_anchor = field.byte_index_for_view_column(width, 1);
+        field.begin_mouse_selection(width, 1);
+        assert_eq!(field.cursor, original_anchor);
+        assert_eq!(field.selection_anchor, Some(original_anchor));
+        assert_eq!(field.view_range(width).0.start, original_start);
+        assert_eq!(field.view(width).0, original_view);
+        field.drag_mouse_selection(width, 5);
+        assert_eq!(field.selection_range(), Some(original_anchor..original_start + 5));
+        assert_eq!(field.view(width).0, original_view);
+        field.drag_mouse_selection(width, 2);
+        assert_eq!(field.selection_range(), Some(original_anchor..original_start + 2));
+        field.end_mouse_selection();
+        assert_eq!(field.selection_range(), Some(original_anchor..original_start + 2));
+        assert_eq!(field.view_range(width).0.start, original_start);
+        // Keyboard movement gives the caret its usual follow-scroll policy.
+        field.cursor_left();
+        assert_ne!(field.view_range(width).0.start, original_start);
+    }
+
+    #[test]
+    fn r32d02_word_hit_testing_respects_empty_cells_and_graphemes() {
+        let mut field = TextInputState::new("short text".into());
+        field.select_word_at_view_column(24, 15);
+        assert!(!field.has_selection(), "empty cells cannot select the last word");
+        assert_eq!(field.cursor, field.text.len());
+        field.select_word_at_view_column(24, 7);
+        assert_eq!(&field.text[field.selection_range().unwrap()], "text");
+
+        let mut decomposed = TextInputState::new("Cafe\u{301}_take next".into());
+        decomposed.select_word_at_view_column(32, 3);
+        assert_eq!(&decomposed.text[decomposed.selection_range().unwrap()],
+            "Cafe\u{301}_take");
+        decomposed.insert_string("New");
+        assert_eq!(decomposed.text, "New next");
+        assert!(!decomposed.text.contains('\u{301}'));
+
+        let mut suffix = TextInputState::new("Song e\u{301}lite".into());
+        suffix.select_word_at_view_column(30, 6);
+        assert_eq!(&suffix.text[suffix.selection_range().unwrap()], "e\u{301}lite");
+        suffix.insert_string("");
+        assert_eq!(suffix.text, "Song ");
+    }
+
+    #[test]
+    fn r32c_double_click_hits_both_cells_of_wide_word_grapheme() {
+        let mut input=TextInputState::new("猫_word other".into());
+        for column in [0,1] {
+            input.select_word_at_view_column(20,column);
+            let range=input.selection_range().expect("wide glyph is under pointer");
+            assert_eq!(&input.text[range],"猫_word");
+        }
+        input.insert_string("犬");
+        assert_eq!(input.text,"犬 other");
+
+        let mut scrolled=TextInputState::new("a-long-prefix-before-猫_word".into());
+        let width=9;
+        let visible=scrolled.view(width).0;
+        let offset=crate::display_width::width(&visible[..visible.find('猫').unwrap()]);
+        scrolled.select_word_at_view_column(width,offset+1);
+        let range=scrolled.selection_range().expect("wide glyph in scrolled view");
+        assert_eq!(&scrolled.text[range],"猫_word");
+    }
+
+    #[test]
+    fn r32_double_click_selects_unicode_word_without_splitting_utf8() {
+        let mut field=TextInputState::new_selected("café_word next".into());
+        field.select_word_at_view_column(40,3);
+        let selected=field.selection_range().expect("word selected");
+        assert_eq!(&field.text[selected],"café_word");
+        field.begin_mouse_selection(40,0);
+        field.drag_mouse_selection(40,5);
+        let selected=field.selection_range().expect("drag selection");
+        assert_eq!(&field.text[selected],"café_");
+        field.end_mouse_selection();
+        assert!(!field.select_all);
+    }
 
     #[test]
     fn ascii_insert_and_cursor() {
