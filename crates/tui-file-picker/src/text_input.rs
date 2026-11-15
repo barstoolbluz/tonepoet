@@ -323,8 +323,8 @@ pub struct TextInputState {
     /// Some and differs from `cursor`; both endpoints are kept on UTF-8
     /// boundaries.
     pub selection_anchor: Option<usize>,
-    /// Mouse-chosen horizontal origin, retained until keyboard navigation or
-    /// a text edit so pointer placement does not jump after button release.
+    /// Mouse-chosen horizontal origin. It stays fixed during selection and
+    /// nearby edits; keyboard navigation restores normal caret scrolling.
     mouse_view_start: Option<usize>,
     undo_history: Vec<TextInputSnapshot>,
     redo_history: Vec<TextInputSnapshot>,
@@ -457,9 +457,18 @@ impl TextInputState {
     }
 
     fn record_edit(&mut self, before: TextInputSnapshot) -> bool {
-        self.mouse_view_start = None;
         if before.text == self.text {
             return false;
+        }
+        // Nearby typing should not hide the path component that was just
+        // clicked. A changed byte length can invalidate the old window edge;
+        // clamp it to a UTF-8 boundary before the next render.
+        if let Some(start) = self.mouse_view_start {
+            let mut start = start.min(self.text.len()).min(self.cursor);
+            while start > 0 && !self.text.is_char_boundary(start) {
+                start -= 1;
+            }
+            self.mouse_view_start = Some(start);
         }
         Self::push_bounded(&mut self.undo_history, before);
         self.redo_history.clear();
@@ -533,7 +542,11 @@ impl TextInputState {
 
     fn delete_selection(&mut self) -> bool {
         let Some(range) = self.selection_range() else {
+            // There is no selection to remove. Keep a mouse-chosen horizontal
+            // window through an ordinary insertion or backspace at the caret.
+            let mouse_view_start = self.mouse_view_start;
             self.clear_selection();
+            self.mouse_view_start = mouse_view_start;
             return false;
         };
         let start = range.start;
@@ -1022,9 +1035,17 @@ impl TextInputState {
 
         let mut start_byte = 0usize;
         let mut start_col = 0usize;
-        if let Some(fixed_start) = self.mouse_view_start {
-            start_byte = fixed_start;
-            start_col = crate::display_width::width(&self.text[..fixed_start]);
+        // Retain a mouse-chosen origin while its caret still fits; when
+        // insertion reaches the edge, fall back to ordinary caret scrolling.
+        let fixed_start = self.mouse_view_start.filter(|&start| {
+            start <= self.cursor && start <= self.text.len()
+                && self.text.is_char_boundary(start)
+                && (self.selection_anchor.is_some() || cursor_col.saturating_sub(
+                    crate::display_width::width(&self.text[..start])) < width)
+        });
+        if let Some(start) = fixed_start {
+            start_byte = start;
+            start_col = crate::display_width::width(&self.text[..start]);
         } else if desired_start > 0 {
             let mut col = 0usize;
             let mut candidate = self.cursor;
@@ -1226,8 +1247,8 @@ impl TextInputState {
             self.selection_anchor = None;
         }
         self.select_all = false;
-        // Keep the clicked window visible after release; the next text edit
-        // or keyboard navigation returns to normal caret-follow scrolling.
+        // Keep the clicked window visible during nearby edits; keyboard
+        // navigation restores normal caret-follow scrolling.
     }
 
 }
@@ -2084,6 +2105,36 @@ mod tests {
         // Keyboard movement gives the caret its usual follow-scroll policy.
         field.cursor_left();
         assert_ne!(field.view_range(width).0.start, original_start);
+    }
+
+    #[test]
+    fn r33_mouse_chosen_suffix_stays_visible_during_local_edits() {
+        let path = "/long/parent/another/long-hidden-directory/Album/Extracted";
+        let mut field = TextInputState::new(path.to_owned());
+        let width = 26;
+        let start = path.find("Extracted").unwrap();
+        // A read-only shortened preview supplies this full-path caret.
+        field.cursor = start;
+        field.begin_mouse_selection_at_cursor(width, 8);
+        field.end_mouse_selection();
+        assert!(field.view(width).0.contains("Extracted"));
+        field.insert_char('X');
+        assert!(field.view(width).0.contains("XExtracted"));
+        field.backspace();
+        assert!(field.view(width).0.contains("Extracted"));
+        assert_eq!(field.cursor, start);
+        field.cursor_left();
+        assert_eq!(field.mouse_view_start, None,
+            "keyboard navigation returns to the ordinary scroll policy");
+
+        // Typing at the rightmost cell scrolls rather than hiding the caret.
+        let mut edge = TextInputState::new("0123456789abcdefghij".into());
+        edge.begin_mouse_selection(8, 7);
+        edge.end_mouse_selection();
+        edge.insert_char('X');
+        let (view, caret) = edge.view(8);
+        assert!(view.ends_with('X'));
+        assert!(caret < 8, "the block caret remains visible");
     }
 
     #[test]

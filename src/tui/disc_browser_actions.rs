@@ -2582,7 +2582,9 @@ mod tests {
         }
         handle_disc_browser_key(&mut app,KeyEvent::new(KeyCode::Tab,M::NONE),&tx);
         assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s)
-            if s.destination_input=="%DVDT"));
+            if !s.editing_destination && s.naming_template=="%DVDT"
+                && s.destination_input.is_empty()),
+            "without a matching SACD completion, Tab commits the unchanged draft");
     }
 
     #[test]
@@ -2948,11 +2950,20 @@ mod tests {
                     && state.destination==old_destination));
             assert!(app.status_message.as_ref().is_some_and(|(text,_)|
                 text.contains("Finish editing Folder")));
-            press(&mut app,KeyCode::Char('x'),M::CONTROL);
+            // Round 4 routes Ctrl+X to the active shared text editor.
+            // With no selection it cuts the field, rather than extracting.
+            crate::tui::text_input::with_scoped_shared_text_clipboard("", || {
+                press(&mut app,KeyCode::Char('x'),M::CONTROL);
+                assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(state)
+                    if state.editing_destination && state.destination_input.is_empty()
+                        && state.destination==old_destination));
+                assert_eq!(crate::tui::text_input::read_shared_text_clipboard(),draft);
+            });
+            assert!(matches!(rx.try_recv(),Err(tokio::sync::mpsc::error::TryRecvError::Empty)));
+            press(&mut app,KeyCode::Char('z'),M::CONTROL);
             assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(state)
                 if state.editing_destination && state.destination_input==draft
                     && state.destination==old_destination));
-            assert!(matches!(rx.try_recv(),Err(tokio::sync::mpsc::error::TryRecvError::Empty)));
             press(&mut app,KeyCode::Enter,M::NONE);
             if valid {
                 assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(state)

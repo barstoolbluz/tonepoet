@@ -1138,7 +1138,7 @@ fn draw_output(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,
         let label_focused = focused && !s.editing_destination
             && matches!(*name,"Folder"|"Naming");
         frame.render_widget(Paragraph::new(format!("{label} ")).style(Style::default()
-            .bg(bg).fg(if label_focused {theme.info}else{labels.label})),
+            .bg(bg).fg(if label_focused {readable_word(theme.info,bg)}else{labels.label})),
             Rect::new(cell.x,cell.y,label_width,1));
         let field=Rect::new(cell.x+label_width,cell.y,cell.width.saturating_sub(label_width),1);
         if field.width==0 {continue;}
@@ -2136,7 +2136,7 @@ mod extract_r3_render_tests {
                     let region_bg=extract_colors(theme).focused;
                     assert_eq!(buffer.get(x,y).bg,region_bg,"{context}");
                     assert_eq!(buffer.get(x,y).fg,
-                        if matches!(name,"Folder"|"Naming") { theme.info }
+                        if matches!(name,"Folder"|"Naming") { readable_word(theme.info,region_bg) }
                         else { word_tiers(theme,extract_colors(theme),region_bg).label },
                         "{context}: only focused unedited text-field labels use the info accent");
                     // Compact viewports scroll the form to keep the active
@@ -2643,7 +2643,10 @@ mod extract_r3_render_tests {
         let path=home.join("long-parent-folder-not-displayed")
             .join("another-hidden-directory").join("Extracted");
         let preview=compact_folder_path(&path,28);
-        let column=preview.find("Extracted").expect("last component visible");
+        let byte=preview.find("Extracted").expect("last component visible");
+        // The click mapper consumes terminal cells, not UTF-8 byte offsets.
+        // A compact path contains multibyte ellipsis glyphs before this word.
+        let column=crate::tui::display_width::width(&preview[..byte]);
         let caret=native_folder_preview_caret(&path,28,column);
         let tail=path.to_string_lossy().chars().skip(caret).collect::<String>();
         assert!(tail.starts_with("Extracted"),"{preview:?} caret mapped to {tail:?}");
