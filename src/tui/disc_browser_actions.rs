@@ -407,7 +407,11 @@ fn start_native_extraction(app: &mut AppState, tx: &mpsc::Sender<AppMessage>) {
         app.set_status(format!("Cannot extract: {}", blockers.join("; ")));
         return;
     }
-    let job = state.native_job(root);
+    let mut job = state.native_job(root);
+    if let Err(error) = crate::convert::pipeline::native_extract::plan_native_program_logs(&mut job) {
+        app.set_status(format!("Cannot plan extraction logs: {error}"));
+        return;
+    }
     if let Err(error) = crate::convert::pipeline::native_extract::validate_job(&job) {
         app.set_status(format!("Cannot extract: {error}"));
         return;
@@ -526,14 +530,11 @@ pub fn handle_disc_browser_button_click_with_shift(
     }
     if let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay {
         if state.overwrite_open {
-            match button {
-                TuiButton::DiscBrowserOverwriteChoice(choice) if *choice < 3 => {
-                    set_native_overwrite(state, *choice);
-                    state.overwrite_open = false;
-                }
-                TuiButton::DiscBrowserOverwrite => state.overwrite_open = false,
-                _ => state.overwrite_open = false,
+            if !matches!(button,TuiButton::DiscBrowserOverwriteHelpPassive) {
+                state.overwrite_open = false;
             }
+            // A click outside the help sheet dismisses it, but must not
+            // activate whichever output control lies behind the sheet.
             return true;
         }
         // The mouse can change form focus independently of keyboard input.
@@ -632,19 +633,25 @@ pub fn handle_disc_browser_button_click_with_shift(
             set_native_files(state, *choice);
             true
         }
-        TuiButton::DiscBrowserOverwrite => {
+        TuiButton::DiscBrowserOverwrite | TuiButton::DiscBrowserOverwriteNext => {
             let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay else { return false; };
             focus_native_row(state, "Overwrite");
-            open_native_overwrite(state);
+            cycle_native_option(state,1);
             true
         }
-        TuiButton::DiscBrowserOverwriteChoice(choice) => {
+        TuiButton::DiscBrowserOverwritePrev => {
             let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay else { return false; };
             focus_native_row(state, "Overwrite");
-            set_native_overwrite(state, *choice);
-            state.overwrite_open = false;
+            cycle_native_option(state,-1);
             true
         }
+        TuiButton::DiscBrowserOverwriteHelp => {
+            let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay else { return false; };
+            focus_native_row(state, "Overwrite");
+            state.overwrite_open = true;
+            true
+        }
+        TuiButton::DiscBrowserOverwriteHelpOutside | TuiButton::DiscBrowserOverwriteHelpPassive => true,
         TuiButton::DiscBrowserToggle(index) => {
             let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay else { return false; };
             state.focus = crate::tui::disc_browser::ExtractFocus::Output;
@@ -968,14 +975,9 @@ fn set_native_format(state: &mut DiscBrowserState, choice: usize) {
     use crate::convert::pipeline::native_extract::NativeWavContainer as W;
     if state.contents.format == crate::disc::DiscFormat::Sacd {
         if choice <= 1 {
+            // The radio selects the default SACD container; per-area Keep DST
+            // overrides remain independent, even on a redundant DSF click.
             state.sacd_dff = choice == 1;
-            if choice == 0 {
-                // Selecting DSF explicitly also clears DST/DFF exceptions.
-                // The separate Keep DST control can re-enable them afterwards.
-                for (i, keep) in state.keep_dst.iter_mut().enumerate() {
-                    if state.selected.get(i) == Some(&true) { *keep = false; }
-                }
-            }
         }
     } else if let Some(option) = [W::Automatic, W::Riff, W::Rf64, W::W64].get(choice) {
         state.wav_container = *option;
@@ -992,11 +994,6 @@ fn set_native_overwrite(state: &mut DiscBrowserState, choice: usize) {
     if let Some(policy) = [P::Fail, P::Skip, P::Replace].get(choice) {
         state.overwrite_policy = *policy;
     }
-}
-
-fn open_native_overwrite(state: &mut DiscBrowserState) {
-    state.overwrite_cursor = native_overwrite_index(state);
-    state.overwrite_open = true;
 }
 
 fn toggle_native_keep_dst(state: &mut DiscBrowserState) {
@@ -1094,7 +1091,7 @@ enum NativeKeyAction {
     FormLeft, FormRight, FooterLeft, FooterRight,
     Hidden, Diagnostics, More, Convert, Help, Close,
     EditDone, EditUndo, EditComplete, EditLeft, EditRight,
-    DropdownUp, DropdownDown, DropdownChoose, DropdownClose,
+    OverwriteHelp, OverwriteHelpClose,
     NamingLoad, NamingCustom,
 }
 
@@ -1114,7 +1111,7 @@ fn native_key_bindings(state: &DiscBrowserState) -> Vec<NativeKeyBinding> {
     let mut add = |code, modifiers, hint, action| bindings.push(NativeKeyBinding {
         code, modifiers, hint, action,
     });
-    // The editor and dropdown take priority over the underlying Output row.
+    // The shared editor and the cycler help sheet take priority over the Output row.
     // Their hint entries also drive the corresponding key-handler branches.
     if state.editing_destination {
         add(KeyCode::Enter, M::NONE, "↵ Done", A::EditDone);
@@ -1125,10 +1122,7 @@ fn native_key_bindings(state: &DiscBrowserState) -> Vec<NativeKeyBinding> {
         return bindings;
     }
     if state.overwrite_open {
-        add(KeyCode::Up, M::NONE, "↑↓ move", A::DropdownUp);
-        add(KeyCode::Down, M::NONE, "↑↓ move", A::DropdownDown);
-        add(KeyCode::Enter, M::NONE, "↵ choose", A::DropdownChoose);
-        add(KeyCode::Esc, M::NONE, "Esc close", A::DropdownClose);
+        add(KeyCode::Esc, M::NONE, "Esc close", A::OverwriteHelpClose);
         return bindings;
     }
     match state.focus {
@@ -1163,8 +1157,9 @@ fn native_key_bindings(state: &DiscBrowserState) -> Vec<NativeKeyBinding> {
                 "Files" | "Overwrite" | "Downmix" | "Assume decrypted" => {
                     add(KeyCode::Char('['), M::NONE, "[ ] choose", A::Previous);
                     add(KeyCode::Char(']'), M::NONE, "[ ] choose", A::Next);
-                    if row != "Overwrite" {
-                        add(KeyCode::Char(' '), M::NONE, "Space choose", A::Space);
+                    add(KeyCode::Char(' '), M::NONE, "Space choose", A::Space);
+                    if row == "Overwrite" {
+                        add(KeyCode::Char('i'), M::NONE, "i help", A::OverwriteHelp);
                     }
                 }
                 "Tags" if state.native_tags_available() =>
@@ -1181,7 +1176,7 @@ fn native_key_bindings(state: &DiscBrowserState) -> Vec<NativeKeyBinding> {
             // opens its sheet even for DFF-only media so Use DSF is reachable.
             {
             add(KeyCode::Enter, M::NONE, match row {
-                "Overwrite" => "↵ open list",
+                "Overwrite" => "↵ next",
                 "Tags" => "↵ edit tags",
                 "Folder" => "↵ edit folder",
                 "Naming" => "↵ edit naming",
@@ -1240,14 +1235,15 @@ fn native_visible_hints(state: &DiscBrowserState) -> Vec<NativeKeyBinding> {
     let priority: &[A] = if state.editing_destination {
         &[A::EditDone, A::EditUndo, A::EditComplete]
     } else if state.overwrite_open {
-        &[A::DropdownUp, A::DropdownChoose, A::DropdownClose]
+        &[A::OverwriteHelpClose]
     } else { match state.focus {
         crate::tui::disc_browser::ExtractFocus::Programs =>
             &[A::Up, A::Check, A::ToItems, A::Hidden, A::NextFocus],
         crate::tui::disc_browser::ExtractFocus::Items =>
             &[A::Up, A::Check, A::RangeUp, A::ToPrograms, A::NextFocus],
         crate::tui::disc_browser::ExtractFocus::Output =>
-            &[A::Up, A::NamingLoad, A::NamingCustom, A::Previous, A::Space, A::Enter, A::NextFocus],
+            &[A::Up, A::NamingLoad, A::NamingCustom, A::OverwriteHelp,
+              A::Previous, A::Space, A::Enter, A::NextFocus],
         crate::tui::disc_browser::ExtractFocus::Footer =>
             &[A::FooterLeft, A::Enter, A::NextFocus],
     }};
@@ -1277,7 +1273,7 @@ fn native_hint_can_click(action: NativeKeyAction) -> bool {
         |A::Previous|A::Next|A::Hidden|A::Diagnostics|A::Help
         |A::NamingLoad|A::NamingCustom
         |A::EditDone|A::EditUndo|A::EditComplete
-        |A::DropdownUp|A::DropdownChoose|A::DropdownClose)
+        |A::OverwriteHelp|A::OverwriteHelpClose)
 }
 
 pub(crate) fn native_hint_clickable(state: &DiscBrowserState, index: usize) -> bool {
@@ -1329,7 +1325,7 @@ pub(crate) fn native_key_help(state: &DiscBrowserState) -> Vec<String> {
             lines.push(text);
         }
     }
-    lines.push("Dropdown: ↑↓ move · ↵ choose · Esc close".into());
+    lines.push("Overwrite: [ ] cycle · i help · Esc closes help".into());
     lines.push("Folder: Tab complete · ↵ done · Esc undo".into());
     lines.push("Naming: Tab complete · ↵ done · Esc undo".into());
     lines.push("Tags sheet: use its own listed keys".into());
@@ -1615,20 +1611,7 @@ pub fn handle_disc_browser_key(
     let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay else { return; };
 
     if state.overwrite_open {
-        use NativeKeyAction as A;
-        let action = native_key_bindings(state).into_iter().find(|binding|
-            binding.code == key.code && binding.modifiers == key.modifiers)
-            .map(|binding| binding.action);
-        match action {
-            Some(A::DropdownClose) => state.overwrite_open = false,
-            Some(A::DropdownUp) => state.overwrite_cursor = state.overwrite_cursor.saturating_sub(1),
-            Some(A::DropdownDown) => state.overwrite_cursor = (state.overwrite_cursor+1).min(2),
-            Some(A::DropdownChoose) => {
-                set_native_overwrite(state, state.overwrite_cursor);
-                state.overwrite_open = false;
-            }
-            _ => {},
-        }
+        if key.code == KeyCode::Esc { state.overwrite_open = false; }
         return;
     }
     if state.editing_destination {
@@ -1750,6 +1733,7 @@ pub fn handle_disc_browser_key(
         Some(A::Hidden) => state.show_hidden = !state.show_hidden,
         Some(A::Diagnostics) => {state.panel=Some(ExtractPanel::Diagnostics);state.panel_cursor=0;}
         Some(A::More) => {state.panel=Some(ExtractPanel::More);state.panel_cursor=0;}
+        Some(A::OverwriteHelp) => {state.overwrite_open=true;}
         Some(A::Convert) => activate_overlay_convert(app),
         Some(A::Previous | A::Next) => cycle_native_option(state, if action==Some(A::Previous){-1}else{1}),
         Some(A::PageDown | A::PageUp) => {
@@ -1783,7 +1767,7 @@ pub fn handle_disc_browser_key(
             "Format" | "Files" | "Downmix" | "Assume decrypted" => cycle_native_option(state,1),
             "Folder" => begin_native_folder_edit(state),
             "Naming" => begin_native_template_edit(state),
-            "Overwrite" => open_native_overwrite(state),
+            "Overwrite" => cycle_native_option(state,1),
             _ => {},
         },
         Some(A::Enter) => match state.focus {
@@ -1792,7 +1776,7 @@ pub fn handle_disc_browser_key(
             ExtractFocus::Output => match state.current_output_row() {
                 "Folder" => begin_native_folder_edit(state),
                 "Naming" => begin_native_template_edit(state),
-                "Overwrite" => open_native_overwrite(state),
+                "Overwrite" => cycle_native_option(state,1),
                 "Log" | "CUE" | "Keep DST" => toggle_native_form_row(state),
                 "Format" | "Files" | "Downmix" | "Assume decrypted" => cycle_native_option(state,1),
                 "Tags" => open_native_tags_sheet(state),
@@ -1806,10 +1790,10 @@ pub fn handle_disc_browser_key(
                 _ => {},
             },
         },
-        // Modal bindings are dispatched by their owning editor or dropdown
+        // Modal bindings are dispatched by their owning editor or help sheet
         // before this ordinary form handler is reached.
         Some(A::EditDone | A::EditUndo | A::EditComplete | A::EditLeft | A::EditRight
-            | A::DropdownUp | A::DropdownDown | A::DropdownChoose | A::DropdownClose
+            | A::OverwriteHelpClose
             | A::NamingLoad | A::NamingCustom) => {},
         None => {},
     }
@@ -2529,7 +2513,7 @@ mod tests {
         };
         assert_eq!(loaded.naming_template,saved);
         assert_eq!(loaded.native_preview_path().unwrap(),PathBuf::from(
-            "/tmp/r28-preset/Stereo/1/Plain Album {Japan SHM-CD}/01 - First Song.dsf"));
+            "/tmp/r28-preset/1/Plain Album {Japan SHM-CD}/01 - First Song.dsf"));
         assert_eq!(app.convert.output_options.filename_template,convert_before);
 
         handle_disc_browser_button_click(&mut app,&TuiButton::DiscBrowserNamingCustom,1,&tx);
@@ -2616,12 +2600,12 @@ mod tests {
             assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s) if !s.extraction_log));
             if let ActiveOverlay::DiscBrowser(s)=&mut app.active_overlay {focus_native_row(s,"Overwrite");}
             handle_disc_browser_key(&mut app,KeyEvent::new(KeyCode::Enter,M::NONE),&tx);
-            assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s) if s.overwrite_open));
-            handle_disc_browser_key(&mut app,KeyEvent::new(KeyCode::Down,M::NONE),&tx);
-            handle_disc_browser_key(&mut app,KeyEvent::new(KeyCode::Enter,M::NONE),&tx);
             assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s)
                 if !s.overwrite_open && s.overwrite_policy==
                     crate::convert::pipeline::native_extract::NativeOverwritePolicy::Skip));
+            handle_disc_browser_key(&mut app,KeyEvent::new(KeyCode::Char('i'),M::NONE),&tx);
+            assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s) if s.overwrite_open));
+            handle_disc_browser_key(&mut app,KeyEvent::new(KeyCode::Esc,M::NONE),&tx);
             // The old Destination letter commands do not silently change values.
             handle_disc_browser_key(&mut app,KeyEvent::new(KeyCode::Char('o'),M::NONE),&tx);
             assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s)
@@ -2673,7 +2657,7 @@ mod tests {
     }
 
     #[test]
-    fn r22_dropdown_cancel_and_radio_selection_preserve_state() {
+    fn r34_overwrite_help_cancel_and_radio_selection_preserve_state() {
         use crate::convert::pipeline::native_extract::NativeOverwritePolicy as P;
         use crossterm::event::KeyModifiers as M;
         let contents=selectable_disc_contents(PathBuf::from("disc.iso"),FolderDiscMarkerKind::Sacd);
@@ -2682,8 +2666,8 @@ mod tests {
         let mut app=AppState::new_for_test(TonepoetConfig::default());
         app.active_overlay=ActiveOverlay::DiscBrowser(Box::new(state));
         let (tx,_rx)=tokio::sync::mpsc::channel(8);
-        handle_disc_browser_key(&mut app,KeyEvent::new(KeyCode::Enter,M::NONE),&tx);
-        handle_disc_browser_key(&mut app,KeyEvent::new(KeyCode::Down,M::NONE),&tx);
+        handle_disc_browser_key(&mut app,KeyEvent::new(KeyCode::Char('i'),M::NONE),&tx);
+        assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s) if s.overwrite_open));
         handle_disc_browser_key(&mut app,KeyEvent::new(KeyCode::Esc,M::NONE),&tx);
         assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s)
             if !s.overwrite_open && s.overwrite_policy==P::Fail));
@@ -2700,6 +2684,83 @@ mod tests {
         let mut text=tmp.path().join("Extr").to_string_lossy().into_owned();
         complete_native_folder_segment(&mut text);
         assert_eq!(PathBuf::from(text),tmp.path().join("Extracted"));
+    }
+
+    #[test]
+    fn r34_audit_d01_dsf_radio_preserves_dst_override_and_planned_paths() {
+        use crate::convert::pipeline::native_extract::proposed_destination;
+        use crossterm::event::KeyModifiers as M;
+
+        let source = PathBuf::from("disc.iso");
+        let mut contents = selectable_disc_contents(source.clone(), FolderDiscMarkerKind::Sacd);
+        let mut multichannel = contents.presentations[0].clone();
+        multichannel.id = PresentationId::SacdArea(SacdAreaId::MultiChannel);
+        multichannel.format.codec = Some("DST".into());
+        multichannel.format.channels = Some(6);
+        multichannel.tracks[0].format_note = Some("DST compressed".into());
+        contents.presentations.push(multichannel);
+        let mut state = DiscBrowserState::new(contents, source);
+        state.destination = PathBuf::from("/tmp/r34-dst-override");
+        state.selected[0] = false; // Begin with only DST Multichannel checked.
+        state.cursor = 1;
+        let keep_dst_row = state.output_rows().iter().position(|row| *row == "Keep DST").unwrap();
+
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.active_overlay = ActiveOverlay::DiscBrowser(Box::new(state));
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        // Turn on Keep DST through the same mouse reducer as the real checkbox.
+        handle_disc_browser_button_click(&mut app, &TuiButton::DiscBrowserToggle(keep_dst_row), 1, &tx);
+        let assert_routes = |app: &AppState, radio_dff: bool, stereo_dff: Option<bool>| {
+            let ActiveOverlay::DiscBrowser(state) = &app.active_overlay else { panic!("Extract closed"); };
+            assert_eq!(state.sacd_dff, radio_dff);
+            assert_eq!(state.keep_dst, vec![false, true]);
+            let job = state.native_job(PathBuf::from("/tmp/r34-work"));
+            assert_eq!(job.sacd_dff, radio_dff);
+            let extension = |program: &crate::convert::pipeline::native_extract::NativeProgramChoice| {
+                proposed_destination(&job, program, &program.tracks[0])
+                    .extension().and_then(|value| value.to_str()).unwrap().to_owned()
+            };
+            let multi = job.programs.iter().find(|p|
+                p.id == PresentationId::SacdArea(SacdAreaId::MultiChannel)).unwrap();
+            assert!(multi.keep_dst);
+            assert_eq!(extension(multi), "dff", "DST output must ignore the format radio");
+            assert_eq!(state.native_preview_path().unwrap().extension()
+                .and_then(|value| value.to_str()), Some("dff"));
+            if let Some(expect_dff) = stereo_dff {
+                let stereo = job.programs.iter().find(|p|
+                    p.id == PresentationId::SacdArea(SacdAreaId::Stereo)).unwrap();
+                assert!(!stereo.keep_dst);
+                assert_eq!(extension(stereo), if expect_dff {"dff"}else{"dsf"});
+                assert_eq!(state.selected_sacd_tag_carriers(),
+                    if expect_dff {(false, true)}else{(true, true)});
+            } else {
+                assert_eq!(job.programs.len(), 1);
+                assert_eq!(state.selected_sacd_tag_carriers(), (false, true));
+            }
+        };
+
+        assert_routes(&app, false, None);
+        // The selected DSF radio must be idempotent, not disable Keep DST.
+        handle_disc_browser_button_click(&mut app, &TuiButton::DiscBrowserFormatChoice(0), 1, &tx);
+        assert_routes(&app, false, None);
+        handle_disc_browser_button_click(&mut app, &TuiButton::DiscBrowserFormatChoice(1), 1, &tx);
+        assert_routes(&app, true, None);
+        handle_disc_browser_button_click(&mut app, &TuiButton::DiscBrowserFormatChoice(0), 1, &tx);
+        assert_routes(&app, false, None);
+        // Keyboard radio cycling has the same independence.
+        handle_disc_browser_key(&mut app, KeyEvent::new(KeyCode::Char(']'), M::NONE), &tx);
+        assert_routes(&app, true, None);
+        handle_disc_browser_key(&mut app, KeyEvent::new(KeyCode::Char('['), M::NONE), &tx);
+        assert_routes(&app, false, None);
+
+        if let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay {
+            state.selected[0] = true; // Plain-DSD Stereo now follows the radio.
+        }
+        assert_routes(&app, false, Some(false));
+        handle_disc_browser_button_click(&mut app, &TuiButton::DiscBrowserFormatChoice(1), 1, &tx);
+        assert_routes(&app, true, Some(true));
+        handle_disc_browser_button_click(&mut app, &TuiButton::DiscBrowserFormatChoice(0), 1, &tx);
+        assert_routes(&app, false, Some(false));
     }
 
     #[test]
@@ -3327,7 +3388,7 @@ mod tests {
                 NativeKeyAction::PageUp | NativeKeyAction::PageDown)));
             let help=native_key_help(state).join("\n");
             let footer=help.split("Footer buttons:").nth(1).unwrap()
-                .split("Dropdown:").next().unwrap();
+                .split("Overwrite:").next().unwrap();
             assert!(!footer.contains("PgUp/PgDn page"),"{footer}");
             for focus in [ExtractFocus::Programs,ExtractFocus::Items,ExtractFocus::Output] {
                 let mut context=state.clone();
@@ -3427,44 +3488,51 @@ mod tests {
     }
 
     #[test]
-    fn r25_dropdown_hint_keys_match_keyboard_and_mouse() {
+    fn r34_overwrite_cycler_mouse_keyboard_and_help_sheet() {
         use crossterm::event::KeyModifiers as M;
         use crate::convert::pipeline::native_extract::NativeOverwritePolicy as Policy;
         let source=PathBuf::from("disc.iso");
-        let state=DiscBrowserState::new(
+        let mut state=DiscBrowserState::new(
             selectable_disc_contents(source.clone(),FolderDiscMarkerKind::Sacd),source);
+        focus_native_row(&mut state,"Overwrite");
         let mut app=AppState::new_for_test(TonepoetConfig::default());
         app.active_overlay=ActiveOverlay::DiscBrowser(Box::new(state));
         let (tx,_rx)=tokio::sync::mpsc::channel(8);
         let press=|app:&mut AppState,key| handle_disc_browser_key(app,KeyEvent::new(key,M::NONE),&tx);
+        assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s) if
+            native_key_hints(s).contains(&"i help")));
         handle_disc_browser_button_click(&mut app,&TuiButton::DiscBrowserOverwrite,1,&tx);
-        if let ActiveOverlay::DiscBrowser(s)=&mut app.active_overlay {
-            assert_eq!(native_key_hints(s),vec!["↑↓ move","↵ choose","Esc close"]);
-            s.overwrite_cursor=2;
+        assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s) if
+            s.overwrite_policy==Policy::Skip));
+        for (button,expected) in [
+            (TuiButton::DiscBrowserOverwriteNext,Policy::Replace),
+            (TuiButton::DiscBrowserOverwriteNext,Policy::Fail),
+            (TuiButton::DiscBrowserOverwritePrev,Policy::Replace),
+        ] {
+            handle_disc_browser_button_click(&mut app,&button,1,&tx);
+            assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s) if
+                s.overwrite_policy==expected && !s.overwrite_open));
         }
-        r25_click_hint(&mut app,0,&tx);
-        assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s)
-            if s.overwrite_open && s.overwrite_cursor==1));
-        press(&mut app,KeyCode::Down);
-        press(&mut app,KeyCode::Up);
-        assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s)
-            if s.overwrite_open && s.overwrite_cursor==1));
-        r25_click_hint(&mut app,1,&tx);
-        assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s)
-            if !s.overwrite_open && s.overwrite_policy==Policy::Skip));
-        handle_disc_browser_button_click(&mut app,&TuiButton::DiscBrowserOverwrite,1,&tx);
-        r25_click_hint(&mut app,2,&tx);
-        assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s)
-            if !s.overwrite_open && s.overwrite_policy==Policy::Skip));
-        handle_disc_browser_button_click(&mut app,&TuiButton::DiscBrowserOverwrite,1,&tx);
+        press(&mut app,KeyCode::Char('['));
+        assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s) if
+            s.overwrite_policy==Policy::Skip));
+        press(&mut app,KeyCode::Char(']'));
+        assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s) if
+            s.overwrite_policy==Policy::Replace));
+        handle_disc_browser_button_click(&mut app,&TuiButton::DiscBrowserOverwriteHelp,1,&tx);
+        assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s) if
+            s.overwrite_open && native_key_hints(s)==vec!["Esc close"]));
+        // Clicks inside the help sheet are passive and clicks behind it
+        // dismiss the sheet without changing the selected policy.
+        handle_disc_browser_button_click(&mut app,&TuiButton::DiscBrowserOverwriteHelpPassive,1,&tx);
+        assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s) if s.overwrite_open));
+        handle_disc_browser_button_click(&mut app,&TuiButton::DiscBrowserOverwriteNext,1,&tx);
+        assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s) if
+            !s.overwrite_open && s.overwrite_policy==Policy::Replace));
+        press(&mut app,KeyCode::Char('i'));
         press(&mut app,KeyCode::Esc);
-        assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s)
-            if !s.overwrite_open && s.overwrite_policy==Policy::Skip));
-        handle_disc_browser_button_click(&mut app,&TuiButton::DiscBrowserOverwrite,1,&tx);
-        press(&mut app,KeyCode::Down);
-        press(&mut app,KeyCode::Enter);
-        assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s)
-            if !s.overwrite_open && s.overwrite_policy==Policy::Replace));
+        assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(s) if
+            !s.overwrite_open && s.overwrite_policy==Policy::Replace));
     }
 
     /// Locate a character in the rendered terminal cell buffer, not by
@@ -3658,9 +3726,11 @@ mod tests {
         assert!(!state.tag_source_open);
         assert_eq!(state.tag_source, crate::convert::pipeline::native_extract::NativeTagSource::AuthoredTrack);
         state.sacd_dff = true;
+        state.keep_dst[0] = true;
         assert!(state.tag_sheet_controls().contains(&C::UseDsf));
         activate_native_tag_control(&mut state, C::UseDsf);
         assert!(!state.sacd_dff);
+        assert!(!state.keep_dst[0], "the explicitly named Use DSF action clears overrides");
         activate_native_tag_control(&mut state, C::Transfer);
         assert!(!state.tags);
         assert_eq!(state.tag_sheet_controls(), vec![C::Transfer, C::EditValues, C::MusicBrainz, C::Done]);

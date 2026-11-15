@@ -266,6 +266,10 @@ pub struct DurableFileTaskRecord {
     /// journal-owned content may be replaced when extraction resumes.
     #[serde(default)]
     pub native_log_sha256: Option<String>,
+    /// Round-4 journals own each program's receipt independently. The old
+    /// single SHA remains readable for in-flight pre-R34 recoveries.
+    #[serde(default)]
+    pub native_log_digests: std::collections::BTreeMap<PathBuf,String>,
     #[serde(default)]
     pub native_prepared_cues: Vec<DurableNativePreparedCue>,
     pub retry_plan: Option<BrowsePasteRetryPlan>,
@@ -513,6 +517,7 @@ enum DurableFileTaskJournalMutation {
     NativeSkipped { selection: NativeSkippedSelection },
     NativeUnfinished { output: crate::convert::pipeline::native_extract::NativeUnfinishedOutput },
     NativeLogPublished { sha256: String },
+    NativeProgramLogPublished { destination: PathBuf, sha256: String },
     /// Journaled before the corresponding continuous audio publication.
     NativeCuePrepared { cue: DurableNativePreparedCue },
     Checkpoint {
@@ -653,6 +658,7 @@ impl FileTaskJournalHandle {
             native_skipped_selections: Vec::new(),
             native_unfinished_outputs: Vec::new(),
             native_log_sha256: None,
+            native_log_digests: Default::default(),
             native_prepared_cues: Vec::new(),
             retry_plan,
             roots: Vec::new(),
@@ -865,6 +871,12 @@ impl FileTaskJournalHandle {
     pub fn record_native_log_sha256(&self, sha256: &str) -> Result<(), String> {
         self.append_mutation(true, true, DurableFileTaskJournalMutation::NativeLogPublished {
             sha256: sha256.to_owned(),
+        })
+    }
+
+    pub fn record_native_program_log(&self, destination: &Path, sha256: &str) -> Result<(), String> {
+        self.append_mutation(true, true, DurableFileTaskJournalMutation::NativeProgramLogPublished {
+            destination: destination.to_path_buf(), sha256: sha256.to_owned(),
         })
     }
 
@@ -1598,6 +1610,12 @@ fn apply_journal_entry(
                 return Err("native extraction log attached to a copy/move journal".to_string());
             }
             record.native_log_sha256 = Some(sha256);
+        }
+        DurableFileTaskJournalMutation::NativeProgramLogPublished { destination, sha256 } => {
+            if !record.is_native_extraction() {
+                return Err("native extraction log attached to a copy/move journal".to_string());
+            }
+            record.native_log_digests.insert(destination, sha256);
         }
         DurableFileTaskJournalMutation::NativeCuePrepared { cue } => {
             if !record.is_native_extraction() {
@@ -2531,8 +2549,8 @@ fn native_extraction_path_admission(
             }
         }
     }
-    if native.extraction_log {
-        planned.insert(native.destination.join(crate::convert::pipeline::native_extract::EXTRACTION_LOG_FILE));
+    for log in crate::convert::pipeline::native_extract::native_log_targets(&native) {
+        planned.insert(log);
     }
     if planned.is_empty() {
         return Err("native extraction has no output files to reserve".into());
@@ -3050,7 +3068,7 @@ mod tests {
             wav_container:NativeWavContainer::Automatic,assume_decrypted:false,
             downmix:crate::convert::pipeline::DvdaDownmixPolicy::None,
             naming_template:"{track} - {title}".into(),program_subfolders:false,
-            overwrite_policy:NativeOverwritePolicy::Fail,extraction_log:true,
+            overwrite_policy:NativeOverwritePolicy::Fail,extraction_log:true, program_log_paths: Vec::new(), round4_layout: false,
             file_per_program:false,cue:false,transfer_tags:false,
             sacd_dff: false, tag_source:NativeTagSource::DiscAndSidecar,tag_fields:0,tag_artwork:false,
         }
@@ -3151,6 +3169,8 @@ mod tests {
         };
         first.record_native_unfinished(&failure).unwrap();
         first.record_native_log_sha256("0123456789abcdef").unwrap();
+        let program_log=dest.join("Stereo/extraction.log");
+        first.record_native_program_log(&program_log,"fedcba9876543210").unwrap();
         let path = first.path().to_path_buf();
         let current = load_record(&path).unwrap();
         assert_eq!(current.native_skipped_selections, vec![skipped.clone()]);
@@ -3159,6 +3179,8 @@ mod tests {
         assert!(current.native_prepared_cues[0].content.contains("INDEX 01"));
         assert_eq!(current.native_unfinished_outputs, vec![failure.clone()]);
         assert_eq!(current.native_log_sha256.as_deref(), Some("0123456789abcdef"));
+        assert_eq!(current.native_log_digests.get(&program_log).map(String::as_str),
+            Some("fedcba9876543210"));
         drop(first); // simulate a helper exiting before it finished the CUE
         let second = FileTaskJournalHandle::resume(path, 2, 22, false,
             tui_file_picker::VerificationMode::Standard, 600,
@@ -3169,6 +3191,8 @@ mod tests {
         assert_eq!(recovered.native_published_paths.len(), 1);
         assert_eq!(recovered.native_unfinished_outputs, vec![failure]);
         assert_eq!(recovered.native_log_sha256.as_deref(), Some("0123456789abcdef"));
+        assert_eq!(recovered.native_log_digests.get(&program_log).map(String::as_str),
+            Some("fedcba9876543210"));
     }
 
     struct JournalDirGuard {

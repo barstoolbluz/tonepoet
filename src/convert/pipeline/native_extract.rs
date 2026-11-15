@@ -160,6 +160,14 @@ pub struct NativeExtractionJob {
     pub overwrite_policy: NativeOverwritePolicy,
     #[serde(default)]
     pub extraction_log: bool,
+    /// Round-4 log destinations are chosen once, before queueing, and stored
+    /// in the durable job. An empty list preserves pre-R34 journal semantics.
+    #[serde(default)]
+    pub program_log_paths: Vec<PathBuf>,
+    /// Older flattened jobs prefix filenames even when only one area was
+    /// selected. Keep that recorded path contract across recovery upgrades.
+    #[serde(default)]
+    pub round4_layout: bool,
     #[serde(default)]
     pub file_per_program: bool,
     #[serde(default)]
@@ -510,17 +518,17 @@ pub async fn execute_with_controls(
             // durable receipts across generations. This branch serves direct
             // callers that requested a log on the media job itself.
             if original_job.extraction_log && execution_controls.publication_hook().is_none() {
-                let content = render_native_extraction_log_with_outcome(&original_job,
-                    &published_paths, &execution_controls.skipped_receipts(),
-                    &execution_controls.unfinished_receipts(),
-                    if cancelled { NativeLogOutcome::Cancelled } else { NativeLogOutcome::Failed },
-                    Some(&error));
-                let target = original_job.destination.join(EXTRACTION_LOG_FILE);
-                // The regular job token may already be cancelled. Only this
-                // terminal receipt publication uses a fresh control token.
-                if let Err(log_error) = publish_native_recovery_sidecar(&original_job, &target,
-                    &content, &CancellationToken::new(), &NativeExtractionControl::default()) {
-                    error.push_str(&format!("; extraction log could not be written: {log_error}"));
+                for (index, target) in native_log_targets(&original_job).into_iter().enumerate() {
+                    let content = native_log_content_for_index(&original_job,index,
+                        &published_paths, &execution_controls.skipped_receipts(),
+                        &execution_controls.unfinished_receipts(),
+                        if cancelled { NativeLogOutcome::Cancelled } else { NativeLogOutcome::Failed },
+                        Some(&error));
+                    // Cancellation cannot suppress a requested terminal receipt.
+                    if let Err(log_error) = publish_native_recovery_sidecar(&original_job, &target,
+                        &content, &CancellationToken::new(), &NativeExtractionControl::default()) {
+                        error.push_str(&format!("; extraction log could not be written: {log_error}"));
+                    }
                 }
             }
         }
@@ -923,18 +931,22 @@ async fn execute_inner(
         controls.clear_attempted_output();
     }
     if job.extraction_log {
-        let log = temporary.path().join(EXTRACTION_LOG_FILE);
-        let mut output = OpenOptions::new().create_new(true).write(true).open(&log)
-            .map_err(|e| format!("Cannot stage extraction log: {e}"))?;
-        output.write_all(render_native_extraction_log(&job, &published, &controls.skipped_receipts()).as_bytes())
-            .map_err(|e|format!("Write extraction log: {e}"))?;
-        output.sync_all().map_err(|e|format!("Cannot sync extraction log: {e}"))?;
-        let log_target = job.destination.join(EXTRACTION_LOG_FILE);
-        publish_finished_file_controlled(&job, &log, &log_target, &cancel, &cancel, &controls)?;
-        published.push(log_target);
-        emit(done, published.len(), skipped, "Published extraction log".to_owned(),
-            None, None, estimated_bytes_done, estimated_bytes_skipped, estimated_bytes_published, published.clone());
-        controls.clear_watch();
+        let targets = native_log_targets(&job);
+        for (index, log_target) in targets.into_iter().enumerate() {
+            let log = temporary.path().join(format!("extraction-receipt-{index}.log"));
+            let mut output = OpenOptions::new().create_new(true).write(true).open(&log)
+                .map_err(|e| format!("Cannot stage extraction log: {e}"))?;
+            let content = native_log_content_for_index(&job,index,&published,
+                &controls.skipped_receipts(),&[],NativeLogOutcome::Complete,None);
+            output.write_all(content.as_bytes())
+                .map_err(|e|format!("Write extraction log: {e}"))?;
+            output.sync_all().map_err(|e|format!("Cannot sync extraction log: {e}"))?;
+            publish_finished_file_controlled(&job, &log, &log_target, &cancel, &cancel, &controls)?;
+            published.push(log_target);
+            emit(done, published.len(), skipped, "Published extraction log".to_owned(),
+                None, None, estimated_bytes_done, estimated_bytes_skipped, estimated_bytes_published, published.clone());
+            controls.clear_watch();
+        }
     }
     Ok(NativeExtractionReport { published, skipped })
 }
@@ -972,9 +984,9 @@ pub(crate) fn render_native_extraction_log_with_outcome(
     outcome: NativeLogOutcome,
     terminal_error: Option<&str>,
 ) -> String {
-    let log_target = job.destination.join(EXTRACTION_LOG_FILE);
+    let log_targets = native_log_targets(job).into_iter().collect::<HashSet<_>>();
     let published: HashSet<&Path> = published.iter().map(PathBuf::as_path)
-        .filter(|path| *path != log_target.as_path()).collect();
+        .filter(|path| !log_targets.contains(*path)).collect();
     // An older journal may contain a selection without a reason. Respect the
     // identity of the selection, but never invent why it was skipped.
     let skip_for = |program: &NativeProgramChoice, number: Option<u32>| {
@@ -1299,6 +1311,122 @@ fn publish_finished_file_checked_observed(
     Ok(())
 }
 
+/// Only literal program tokens remove the need for implicit program folders.
+/// File metadata tokens such as %ARTIST% do not uniquely identify an area.
+pub(crate) fn native_template_has_program_token(template: &str) -> bool {
+    ["%AREA%", "%GROUP%", "%DVDTITLE%", "%PLAYLIST%", "%STREAM%"]
+        .iter().any(|token| template.contains(token))
+}
+
+fn prefix_implicit_program_name(job: &NativeExtractionJob) -> bool {
+    !job.program_subfolders && (!job.round4_layout ||
+        (job.programs.len() > 1 && !native_template_has_program_token(&job.naming_template)))
+}
+
+/// All selected media paths for one authored program, as the worker will
+/// publish them. The same source drives output roots and log reservations.
+fn native_program_media_paths(job: &NativeExtractionJob, program: &NativeProgramChoice) -> Vec<PathBuf> {
+    if job.file_per_program {
+        let audio = proposed_destination_for_program(job, program);
+        let mut paths = vec![audio.clone()];
+        if job.cue { paths.push(audio.with_extension("cue")); }
+        paths
+    } else {
+        program.tracks.iter().map(|track|proposed_destination(job, program, track)).collect()
+    }
+}
+
+/// Deepest common output directory for this program's selected files.
+/// A template may introduce subdirectories: choose the common parent rather
+/// than the top-level Folder or the directory of an arbitrary first track.
+pub(crate) fn native_program_output_root(job: &NativeExtractionJob, program: &NativeProgramChoice) -> PathBuf {
+    let paths = native_program_media_paths(job, program);
+    let mut parents = paths.iter().filter_map(|path|path.parent());
+    let Some(first) = parents.next() else { return job.destination.clone(); };
+    let mut common = first.to_path_buf();
+    for parent in parents {
+        while !parent.starts_with(&common) {
+            if !common.pop() { return job.destination.clone(); }
+        }
+    }
+    if common.starts_with(&job.destination) { common } else { job.destination.clone() }
+}
+
+/// A planned log path is an immutable part of the queued job. Suffixes protect
+/// an existing user receipt even under Stop/Skip. Replace explicitly permits
+/// replacing the base name. Avoid collisions with *all* planned media and
+/// other programs' logs, including on case-insensitive filesystems.
+pub(crate) fn plan_native_program_logs(job: &mut NativeExtractionJob) -> Result<(), String> {
+    job.program_log_paths.clear();
+    if !job.extraction_log { return Ok(()); }
+    let mut reserved = HashSet::new();
+    for program in &job.programs {
+        for path in native_program_media_paths(job, program) {
+            reserved.insert(native_destination_collision_key(&path));
+        }
+    }
+    for program in &job.programs {
+        let root = native_program_output_root(job, program);
+        let mut chosen = None;
+        for suffix in 1..=100_000u32 {
+            let name = if suffix == 1 { EXTRACTION_LOG_FILE.to_owned() }
+                else { format!("extraction-{suffix}.log") };
+            let candidate = root.join(name);
+            if reserved.contains(&native_destination_collision_key(&candidate)) { continue; }
+            match fs::symlink_metadata(&candidate) {
+                Ok(_) if job.overwrite_policy != NativeOverwritePolicy::Replace => continue,
+                Ok(_) => {},
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                Err(error) => return Err(format!("Inspect extraction log '{}': {error}",candidate.display())),
+            }
+            reserved.insert(native_destination_collision_key(&candidate));
+            chosen = Some(candidate);
+            break;
+        }
+        job.program_log_paths.push(chosen.ok_or_else(||
+            format!("No free extraction log name in '{}'",root.display()))?);
+    }
+    Ok(())
+}
+
+/// Bind authored log paths to the same admitted filesystem root as the
+/// audio outputs. The journal stores logical paths, but the detached worker
+/// publishes through resolved endpoints; never mix those path namespaces.
+pub(crate) fn admit_native_destination(job: &mut NativeExtractionJob, root: PathBuf) -> Result<(),String> {
+    if !job.program_log_paths.is_empty() {
+        let paths = job.program_log_paths.iter().map(|path| {
+            path.strip_prefix(&job.destination)
+                .map(|relative| root.join(relative))
+                .map_err(|_|format!("Extraction log is outside the selected destination: {}",path.display()))
+        }).collect::<Result<Vec<_>,_>>()?;
+        job.program_log_paths = paths;
+    }
+    job.destination = root;
+    Ok(())
+}
+
+/// Empty list means a pre-R34 job with its single legacy root log.
+pub(crate) fn native_log_targets(job: &NativeExtractionJob) -> Vec<PathBuf> {
+    if !job.extraction_log { return Vec::new(); }
+    if job.program_log_paths.is_empty() { vec![job.destination.join(EXTRACTION_LOG_FILE)] }
+    else { job.program_log_paths.clone() }
+}
+
+/// A new receipt describes only its own program; old journals keep their
+/// historical combined receipt to avoid changing published contract on resume.
+pub(crate) fn native_log_content_for_index(
+    job: &NativeExtractionJob, index: usize, published: &[PathBuf],
+    skipped: &[NativeSkippedSelection], unfinished: &[NativeUnfinishedOutput],
+    outcome: NativeLogOutcome, error: Option<&str>,
+) -> String {
+    if job.program_log_paths.is_empty() {
+        return render_native_extraction_log_with_outcome(job,published,skipped,unfinished,outcome,error);
+    }
+    let mut per_program = job.clone();
+    per_program.programs = vec![job.programs[index].clone()];
+    render_native_extraction_log_with_outcome(&per_program,published,skipped,unfinished,outcome,error)
+}
+
 pub(crate) fn proposed_destination_for_program(job: &NativeExtractionJob, program: &NativeProgramChoice) -> PathBuf {
     let virtual_track = NativeTrackChoice { duration_secs: None, number: 0, name: program.label.clone(), tags: NativeTagValues::default(), estimated_bytes: None };
     let legacy = legacy_naming_template(&job.naming_template);
@@ -1309,7 +1437,7 @@ pub(crate) fn proposed_destination_for_program(job: &NativeExtractionJob, progra
         sanitize_component(&program.label)
     } else { render_naming_template_for_extension(&job.naming_template, program, &virtual_track,
         extraction_extension(job, program), &job.disc_identity) };
-    if !job.program_subfolders {
+    if prefix_implicit_program_name(job) {
         stem = if legacy {sanitize_component(&format!("{} - {stem}",program.label))}
             else {prefix_flat_native_name(&program.label,stem)};
     }
@@ -1759,7 +1887,7 @@ pub(crate) fn proposed_destination(job: &NativeExtractionJob, program: &NativePr
     let legacy = legacy_naming_template(&job.naming_template);
     let mut stem = render_naming_template_for_extension(&job.naming_template, program, track,
         extension, &job.disc_identity);
-    if !job.program_subfolders {
+    if prefix_implicit_program_name(job) {
         // The default can be reused across unrelated authored streams. Prefix
         // the stream identity when flattening, without guessing unique names.
         stem = if legacy {sanitize_component(&format!("{} - {stem}",program.label))}
@@ -1821,12 +1949,31 @@ pub(crate) fn validate_job(job: &NativeExtractionJob) -> Result<(), String> {
         }
     }
     if job.extraction_log {
-        let path = job.destination.join(EXTRACTION_LOG_FILE);
-        if !planned.insert(native_destination_collision_key(&path)) {
-            return Err("Extraction log conflicts with media name".into());
+        if !job.program_log_paths.is_empty() && job.program_log_paths.len() != job.programs.len() {
+            return Err("Extraction log plan does not match the selected programs".into());
         }
-        if job.overwrite_policy != NativeOverwritePolicy::Replace && fs::symlink_metadata(&path).is_ok() {
-            return Err(format!("Extraction log already exists: '{}'; choose Replace or disable logging", path.display()));
+        for (index, path) in native_log_targets(job).iter().enumerate() {
+            // Each new log must belong to its program's actual output root.
+            if !job.program_log_paths.is_empty() {
+                let expected = native_program_output_root(job, &job.programs[index]);
+                if path.parent() != Some(expected.as_path()) ||
+                    !path.file_name().and_then(|name|name.to_str()).is_some_and(|name|
+                        name == EXTRACTION_LOG_FILE ||
+                        (name.starts_with("extraction-") && name.ends_with(".log") &&
+                         name[11..name.len()-4].parse::<u32>().is_ok_and(|n|n>=2))) {
+                    return Err(format!("Invalid extraction log destination: '{}'",path.display()));
+                }
+            }
+            if !planned.insert(native_destination_collision_key(path)) {
+                return Err("Extraction log conflicts with another selected output".into());
+            }
+            match fs::symlink_metadata(path) {
+                Ok(_) if job.overwrite_policy != NativeOverwritePolicy::Replace =>
+                    return Err(format!("Extraction log was created after preflight: '{}'",path.display())),
+                Ok(_) => {},
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                Err(error) => return Err(format!("Cannot inspect extraction log '{}': {error}",path.display())),
+            }
         }
     }
     Ok(())
@@ -2225,10 +2372,136 @@ mod tests {
             wav_container: NativeWavContainer::Automatic, assume_decrypted: false,
             downmix: DvdaDownmixPolicy::None, naming_template: default_naming_template(),
             program_subfolders: true, overwrite_policy: NativeOverwritePolicy::Fail,
-            extraction_log: false, file_per_program: false, cue: false,
+            extraction_log: false, program_log_paths: Vec::new(), round4_layout: false, file_per_program: false, cue: false,
             transfer_tags: false, sacd_dff: false, tag_source: default_tag_source(),
             tag_fields: default_tag_fields(), tag_artwork: false,
         }
+    }
+
+    /// A new selection must not inherit the older mandatory area-folder rule.
+    #[test]
+    fn r34_one_program_goes_straight_to_folder_with_its_log() {
+        let temp=tempfile::tempdir().unwrap();
+        let mut job=fixture_job(&temp.path().join("output"),temp.path());
+        job.program_subfolders=false;
+        job.round4_layout=true;
+        job.extraction_log=true;
+        plan_native_program_logs(&mut job).unwrap();
+        let media=proposed_destination(&job,&job.programs[0],&job.programs[0].tracks[0]);
+        assert_eq!(media.parent(),Some(job.destination.as_path()));
+        assert_eq!(native_log_targets(&job),vec![job.destination.join(EXTRACTION_LOG_FILE)]);
+        validate_job(&job).unwrap();
+        let encoded=serde_json::to_string(&job).unwrap();
+        let resumed:NativeExtractionJob=serde_json::from_str(&encoded).unwrap();
+        assert_eq!(resumed.program_log_paths,job.program_log_paths);
+        assert_eq!(proposed_destination(&resumed,&resumed.programs[0],&resumed.programs[0].tracks[0]),media);
+    }
+
+    #[test]
+    fn r34_two_programs_get_separate_folders_and_independent_logs() {
+        let temp=tempfile::tempdir().unwrap();
+        let mut job=fixture_job(&temp.path().join("output"),temp.path());
+        let mut second=job.programs[0].clone();
+        second.id=PresentationId::SacdArea(crate::disc::SacdAreaId::MultiChannel);
+        second.label="Multichannel".into();
+        job.programs.push(second);
+        job.program_subfolders=true;
+        job.round4_layout=true;
+        job.extraction_log=true;
+        plan_native_program_logs(&mut job).unwrap();
+        let p0=proposed_destination(&job,&job.programs[0],&job.programs[0].tracks[0]);
+        let p1=proposed_destination(&job,&job.programs[1],&job.programs[1].tracks[0]);
+        assert_eq!(p0.parent(),Some(job.destination.join("Stereo").as_path()));
+        assert_eq!(p1.parent(),Some(job.destination.join("Multichannel").as_path()));
+        assert_eq!(native_log_targets(&job),vec![job.destination.join("Stereo/extraction.log"),
+            job.destination.join("Multichannel/extraction.log")]);
+        validate_job(&job).unwrap();
+        let receipt0=native_log_content_for_index(&job,0,&[p0.clone(),p1.clone()],&[],&[],
+            NativeLogOutcome::Complete,None);
+        let receipt1=native_log_content_for_index(&job,1,&[p0.clone(),p1.clone()],&[],&[],
+            NativeLogOutcome::Complete,None);
+        assert!(receipt0.contains(&format!("File: {:?}",p0.to_string_lossy())));
+        assert!(!receipt0.contains(&format!("File: {:?}",p1.to_string_lossy())));
+        assert!(receipt1.contains(&format!("File: {:?}",p1.to_string_lossy())));
+        assert!(!receipt1.contains(&format!("File: {:?}",p0.to_string_lossy())));
+    }
+
+    #[test]
+    fn r34_explicit_program_token_avoids_implicit_folders_and_preserves_deepest_log_root() {
+        let temp=tempfile::tempdir().unwrap();
+        let mut job=fixture_job(&temp.path().join("output"),temp.path());
+        let mut second=job.programs[0].clone();
+        second.id=PresentationId::SacdArea(crate::disc::SacdAreaId::MultiChannel);
+        second.label="Multichannel".into();
+        job.programs.push(second);
+        job.round4_layout=true;
+        job.program_subfolders=false;
+        job.extraction_log=true;
+        job.naming_template="%AREA%/%TRACKNUMBER% - %TITLE%".into();
+        assert!(native_template_has_program_token(&job.naming_template));
+        plan_native_program_logs(&mut job).unwrap();
+        let roots=job.programs.iter().map(|p|native_program_output_root(&job,p)).collect::<Vec<_>>();
+        assert_eq!(roots,vec![job.destination.join("Stereo"),job.destination.join("Multichannel")]);
+        assert_eq!(job.program_log_paths,roots.iter().map(|root|root.join(EXTRACTION_LOG_FILE))
+            .collect::<Vec<_>>());
+        for (program,root) in job.programs.iter().zip(roots) {
+            let media=proposed_destination(&job,program,&program.tracks[0]);
+            assert_eq!(media.parent(),Some(root.as_path()));
+            assert!(!media.file_name().unwrap().to_string_lossy().starts_with("Stereo - "));
+        }
+        validate_job(&job).unwrap();
+    }
+
+    #[test]
+    fn r34_log_suffixes_protect_existing_receipts_and_repeat_without_side_effects() {
+        let temp=tempfile::tempdir().unwrap();
+        let mut job=fixture_job(&temp.path().join("output"),temp.path());
+        job.round4_layout=true;
+        job.program_subfolders=false;
+        job.extraction_log=true;
+        fs::create_dir_all(&job.destination).unwrap();
+        fs::write(job.destination.join("extraction.log"),b"existing user receipt").unwrap();
+        fs::write(job.destination.join("extraction-2.log"),b"another receipt").unwrap();
+        for policy in [NativeOverwritePolicy::Fail,NativeOverwritePolicy::Skip] {
+            job.overwrite_policy=policy;
+            plan_native_program_logs(&mut job).unwrap();
+            assert_eq!(native_log_targets(&job),vec![job.destination.join("extraction-3.log")]);
+            validate_job(&job).unwrap();
+            plan_native_program_logs(&mut job).unwrap();
+            assert_eq!(native_log_targets(&job),vec![job.destination.join("extraction-3.log")]);
+        }
+        assert_eq!(fs::read(job.destination.join("extraction.log")).unwrap(),
+            b"existing user receipt");
+        job.overwrite_policy=NativeOverwritePolicy::Replace;
+        plan_native_program_logs(&mut job).unwrap();
+        assert_eq!(native_log_targets(&job),vec![job.destination.join("extraction.log")]);
+        validate_job(&job).unwrap();
+    }
+
+    #[test]
+    fn r34_multiple_logs_share_a_folder_with_disjoint_names() {
+        let temp=tempfile::tempdir().unwrap();
+        let mut job=fixture_job(&temp.path().join("output"),temp.path());
+        job.round4_layout=true;
+        job.program_subfolders=false;
+        job.extraction_log=true;
+        job.naming_template="%AREA% - %TRACKNUMBER% - %TITLE%".into();
+        let mut second=job.programs[0].clone();
+        second.id=PresentationId::SacdArea(crate::disc::SacdAreaId::MultiChannel);
+        second.label="Multichannel".into();
+        job.programs.push(second);
+        plan_native_program_logs(&mut job).unwrap();
+        assert_eq!(job.program_log_paths,
+            vec![job.destination.join("extraction.log"),job.destination.join("extraction-2.log")]);
+        validate_job(&job).unwrap();
+        let old=job.destination.clone();
+        let admitted=temp.path().join("physical-output");
+        admit_native_destination(&mut job,admitted.clone()).unwrap();
+        assert_eq!(job.destination,admitted);
+        assert_eq!(job.program_log_paths,
+            vec![admitted.join("extraction.log"),admitted.join("extraction-2.log")]);
+        assert!(!job.program_log_paths.iter().any(|path|path.starts_with(&old)));
+        assert_eq!(native_program_output_root(&job,&job.programs[0]),admitted);
     }
 
     #[test]
@@ -3221,7 +3494,7 @@ mod tests {
             assume_decrypted: false,
             downmix: DvdaDownmixPolicy::None,
             naming_template:default_naming_template(),program_subfolders:true,
-            overwrite_policy:NativeOverwritePolicy::Fail,extraction_log:false,
+            overwrite_policy:NativeOverwritePolicy::Fail,extraction_log:false, program_log_paths: Vec::new(), round4_layout: false,
             file_per_program:false,cue:false,
             transfer_tags:false,sacd_dff: false, tag_source:default_tag_source(),tag_fields:default_tag_fields(),tag_artwork:false,
         };
@@ -3582,7 +3855,7 @@ mod tests {
             destination:"/tmp/dest".into(),working_root:"/tmp".into(),
             wav_container:NativeWavContainer::Automatic,assume_decrypted:false,downmix:DvdaDownmixPolicy::None,
             naming_template:default_naming_template(),program_subfolders:true,
-            overwrite_policy:NativeOverwritePolicy::Fail,extraction_log:false,file_per_program:false,cue:false,
+            overwrite_policy:NativeOverwritePolicy::Fail,extraction_log:false, program_log_paths: Vec::new(), round4_layout: false,file_per_program:false,cue:false,
             transfer_tags:false,sacd_dff: false, tag_source:default_tag_source(),tag_fields:default_tag_fields(),tag_artwork:false };
         assert!(validate_job(&job).unwrap_err().contains("duplicate"));
     }

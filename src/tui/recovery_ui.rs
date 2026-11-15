@@ -3967,6 +3967,7 @@ mod tests {
             native_skipped_selections: Vec::new(),
             native_unfinished_outputs: Vec::new(),
             native_log_sha256: None,
+            native_log_digests: Default::default(),
             native_prepared_cues: Vec::new(),
             retry_plan: None,
             roots: Vec::new(),

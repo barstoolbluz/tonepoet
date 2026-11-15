@@ -377,12 +377,16 @@ pub fn draw(
         .saturating_add(pane_height).saturating_add(output_height)
         .saturating_add(u16::from(!small)).saturating_add(warning_height)
         .saturating_add(results_height).saturating_add(footer_height);
-    let height=requested_height.min(area.height.saturating_sub(4));
+    // Grow the content-derived default by 25% per side, retaining a one-row
+    // top/bottom and two-column left/right terminal margin.
+    let height=requested_height.saturating_add((requested_height+3)/4)
+        .min(area.height.saturating_sub(2));
     let longest_item=state.contents.presentations.iter()
         .flat_map(|p|p.tracks.iter()).filter_map(|t|t.title.as_deref())
         .map(|t|t.chars().count()).max().unwrap_or(0);
     let natural_width=(78usize + longest_item).clamp(96,150) as u16;
-    let width=natural_width.min(area.width.saturating_sub(4));
+    let width=natural_width.saturating_add((natural_width+3)/4)
+        .min(area.width.saturating_sub(4));
     let popup=if state.maximized { area } else { Rect::new(
         area.x+(area.width-width)/2,area.y+(area.height-height)/2,width,height,
     ) };
@@ -454,8 +458,11 @@ pub fn draw(
             headline.max(detail)
         }).max().unwrap_or(0).min(u16::MAX as usize) as u16;
         let pane_width=chunks[2].width;
-        let min_width=(u32::from(pane_width)*28/100) as u16;
-        let max_width=pane_width/2;
+        // Hold the natural program column while the additional width goes
+        // entirely to tracks. Still adapt when the terminal is narrower.
+        let base_pane_width=natural_width.saturating_sub(2).min(pane_width);
+        let min_width=(u32::from(base_pane_width)*28/100) as u16;
+        let max_width=(base_pane_width/2).min(pane_width/2);
         let program_width=longest.saturating_add(4)
             .clamp(min_width.min(max_width),max_width)
             .min(pane_width.saturating_sub(2));
@@ -499,6 +506,12 @@ pub fn draw(
     divider(frame,popup,chunks[1].y,theme,pane_separator.map(|x|(x,'┬')));
     divider(frame,popup,chunks[3].y,theme,pane_separator.map(|x|(x,'┴')));
     divider(frame,popup,chunks[8].y,theme,None);
+    if state.overwrite_open {
+        if let Some(value) = buttons.button_rect(TuiButton::DiscBrowserOverwrite) {
+            let anchor=Rect::new(value.x.saturating_sub(2),value.y,28,1);
+            draw_native_overwrite_menu(frame,buttons,anchor,popup,state,theme);
+        }
+    }
     if let Some(panel)=state.panel { draw_panel(frame,state,panel,popup,buttons,theme); }
 }
 
@@ -531,6 +544,33 @@ fn sacd_details_line(details: &str, words: WordTiers, colors: ExtractColors) -> 
     Line::from(spans)
 }
 
+/// Clip the *rendered* styled line, not the source metadata. SACD detail
+/// labels and separators expand during formatting, and truncating the raw
+/// source can still overrun the frame. Preserve the existing text colors.
+fn clip_styled_header_line(line: Line<'static>, cells: usize, ellipsis_color: Color) -> Line<'static> {
+    if cells == 0 {return Line::default();}
+    let text_width = line.spans.iter()
+        .map(|span|super::display_width::width(span.content.as_ref()))
+        .sum::<usize>();
+    let clipped = text_width > cells;
+    let budget = cells.saturating_sub(usize::from(clipped));
+    let mut used = 0;
+    let mut spans = Vec::new();
+    for span in line.spans {
+        if used >= budget {break;}
+        let mut part = String::new();
+        for ch in span.content.chars() {
+            let width = super::display_width::char_width(ch);
+            if used + width > budget {break;}
+            part.push(ch);
+            used += width;
+        }
+        if !part.is_empty() {spans.push(Span::styled(part,span.style));}
+    }
+    if clipped {spans.push(Span::styled("…", Style::default().fg(ellipsis_color)));}
+    Line::from(spans)
+}
+
 fn draw_header(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect, small: bool, theme: Theme) {
     if r.width==0 || r.height==0 { return; }
     let colors=extract_colors(theme);
@@ -556,7 +596,10 @@ fn draw_header(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect, small:
         let details=s.contents.presentations.first()
             .and_then(|p|p.extract.sacd_header_details.as_deref())
             .unwrap_or("SACD · native DSD64");
-        lines.push(sacd_details_line(details,words,colors));
+        // A formatted " · " separator uses more cells than the raw disc
+        // metadata. Clip after styling, leaving two cells of right padding.
+        lines.push(clip_styled_header_line(sacd_details_line(details,words,colors),
+            r.width.saturating_sub(2) as usize,colors.dim));
     }
     let diagnostics=if s.contents.diagnostics.is_empty(){"none".to_owned()}
         else{s.contents.diagnostics.len().to_string()};
@@ -711,7 +754,11 @@ fn draw_programs(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect, butt
             }
         }
         let right_width = suffix.as_ref().map_or(0,|t|t.chars().count() as u16);
-        let left_width=inner.width.saturating_sub(right_width + u16::from(right_width>0));
+        let left_width=inner.width.saturating_sub(right_width + if right_width>0 {2}else{0});
+        // Truncate before the fixed two-cell gap, never let a long area name
+        // collide with its right-aligned duration.
+        let visible_name=folder_clip_end(text,left_width.saturating_sub(2) as usize);
+        let text=visible_name.as_str();
         let mut spans = Vec::new();
         spans.push(Span::styled(if *focused { "▌ " } else { "  " },
             Style::default().fg(if active{theme.info}else{colors.dim})));
@@ -990,6 +1037,7 @@ fn output_cell(name: &str, index: usize, rows: &[&str], area: Rect, wide: bool, 
 const OVERWRITE_OPTIONS: [&str;3] = [
     "Stop if a file exists", "Skip existing files", "Replace existing files",
 ];
+const OVERWRITE_HELP_GLYPH: &str = "?"; // One-cell fallback for fonts without ⓘ.
 const OVERWRITE_EXPLANATIONS: [&str;3] = [
     "Nothing is written if any target exists.",
     "Existing files stay. The rest are written.",
@@ -1086,34 +1134,36 @@ fn draw_native_input(frame:&mut ratatui::Frame, rect:Rect, text:&str,
     frame.render_widget(Paragraph::new(content).style(normal),rect);
 }
 
+/// A read-only help sheet anchored under the fixed-position cycler.
+/// Its click shield absorbs clicks outside without activating underlying rows.
 fn draw_native_overwrite_menu(frame:&mut ratatui::Frame, buttons:&mut ButtonRenderMap,
     anchor:Rect, container:Rect, s:&DiscBrowserState, theme:Theme) {
-    if !s.overwrite_open || container.height < 4 {return;}
-    let width=container.width.saturating_sub(4).min(70).max(anchor.width);
-    let x=anchor.x.min(container.x.saturating_add(container.width).saturating_sub(width+1))
-        .max(container.x+1);
-    let top=anchor.y.saturating_add(1);
-    // The list must remain in the form viewport; an overwrite control on
-    // the first wide row cannot fit five lines *below* its anchor.
-    let bottom=container.y.saturating_add(container.height);
-    let y=if top.saturating_add(5)<=bottom { top }
-        else if anchor.y>=container.y.saturating_add(5) { anchor.y-5 }
-        else { container.y };
-    let rect=Rect::new(x,y,width.min(container.width.saturating_sub(2)),5);
+    if !s.overwrite_open {return;}
+    const H:u16=6;
+    let width=66u16.min(container.width.saturating_sub(4));
+    if width<30 || container.height<H+2 {return;}
+    let x=anchor.x.min(container.right().saturating_sub(width+2)).max(container.x+1);
+    let below=anchor.bottom();
+    let y=if below+H<=container.bottom().saturating_sub(1) {below}
+        else {anchor.y.saturating_sub(H)};
+    let rect=Rect::new(x,y,width,H);
+    // Dismiss from anywhere outside this sheet, including the dimmed Browse
+    // region beyond the dialog. The passive sheet target is recorded last.
+    buttons.record_button(TuiButton::DiscBrowserOverwriteHelpOutside,frame.size());
+    buttons.record_button(TuiButton::DiscBrowserOverwriteHelpPassive,rect);
     frame.render_widget(Clear,rect);
     frame.render_widget(Block::default().borders(Borders::ALL).style(Style::default()
         .bg(theme.dropdown_bg).fg(readable_word(theme.value,theme.dropdown_bg)))
         .border_style(Style::default().fg(theme.label)),rect);
-    let inner=Rect::new(rect.x+1,rect.y+1,rect.width.saturating_sub(2),3);
-    for i in 0..3 {
-        let row=Rect::new(inner.x,inner.y+i,inner.width,1);
-        let chosen=i as usize==s.overwrite_cursor;
-        let bg=if chosen {theme.input_focused_bg}else{theme.dropdown_bg};
-        let text=format!("{}  {} · {}",if chosen {"●"}else{"○"},OVERWRITE_OPTIONS[i as usize],
-            OVERWRITE_EXPLANATIONS[i as usize]);
-        frame.render_widget(Paragraph::new(clip_end(&text,row.width)).style(Style::default()
-            .fg(readable_word(if chosen{theme.value}else{theme.label},bg)).bg(bg)),row);
-        buttons.record_button(TuiButton::DiscBrowserOverwriteChoice(i as usize),row);
+    let heading="Overwrite · Esc or click outside to close";
+    frame.render_widget(Paragraph::new(clip_end(heading,width.saturating_sub(2)))
+        .style(Style::default().fg(theme.info).bg(theme.dropdown_bg)),
+        Rect::new(x+1,y+1,width.saturating_sub(2),1));
+    for (index,description) in OVERWRITE_EXPLANATIONS.iter().enumerate() {
+        let label=format!("{}: {}",OVERWRITE_OPTIONS[index],description);
+        frame.render_widget(Paragraph::new(clip_end(&label,width.saturating_sub(4)))
+            .style(Style::default().fg(readable_word(theme.value,theme.dropdown_bg))
+                .bg(theme.dropdown_bg)),Rect::new(x+2,y+2+index as u16,width.saturating_sub(4),1));
     }
 }
 
@@ -1124,7 +1174,6 @@ fn draw_output(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,
     let bg=if s.focus==ExtractFocus::Output {colors.focused}else{colors.band};
     s.form_wide.set(wide && r.width.saturating_sub(4) >= 88);
     fill(frame,r,bg);
-    let mut overwrite_anchor=None;
     let mut format_note=None;
     let mut folder_note=None;
     const LABEL_WIDTH:u16=10;
@@ -1157,28 +1206,43 @@ fn draw_output(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,
                 format_note=Some((cell.x+LABEL_WIDTH,cell.y+1,cell.width.saturating_sub(LABEL_WIDTH)));
             }
             "Overwrite" => {
-                let width=(OVERWRITE_OPTIONS.iter().map(|item|item.chars().count()).max().unwrap_or(0)+4) as u16;
-                let width=width.min(field.width);
-                if width==0 {continue;}
-                let box_rect=Rect::new(field.x,field.y,width,1);
-                let fill_bg=if focused && !s.overwrite_open {theme.input_focused_bg}else{theme.input_unfocused_bg};
-                fill(frame,box_rect,fill_bg);
-                let text=format!("▕ {}",OVERWRITE_OPTIONS[overwrite_index(s)]);
-                frame.render_widget(Paragraph::new(clip_end(&text,width.saturating_sub(2)))
-                    .style(Style::default().fg(readable_word(theme.value,fill_bg)).bg(fill_bg)),
-                    Rect::new(box_rect.x,box_rect.y,box_rect.width.saturating_sub(2),1));
-                frame.render_widget(Paragraph::new("▾▏").style(Style::default()
-                    .fg(if focused {theme.info}else{theme.label}).bg(fill_bg)),
-                    Rect::new(box_rect.x+box_rect.width.saturating_sub(2),box_rect.y,2,1));
-                buttons.record_button(TuiButton::DiscBrowserOverwrite,box_rect);
-                overwrite_anchor=Some(box_rect);
+                // Fixed 22-cell value: every arrow has a stable hitbox across
+                // all three policies, including when repeatedly clicked.
+                const VALUE_WIDTH:u16=22;
+                const CONTROL_WIDTH:u16=28;
+                if field.width<CONTROL_WIDTH {continue;}
+                let well=if focused {theme.input_focused_bg}else{theme.input_unfocused_bg};
+                fill(frame,Rect::new(field.x,field.y,26,1),well);
+                let value=format!("{:<22}",OVERWRITE_OPTIONS[overwrite_index(s)]);
+                let style=Style::default().fg(readable_word(theme.value,well)).bg(well);
+                frame.render_widget(Paragraph::new("◂").style(Style::default()
+                    .fg(if focused {theme.info}else{theme.label}).bg(well)),
+                    Rect::new(field.x,field.y,1,1));
+                frame.render_widget(Paragraph::new(value).style(style),
+                    Rect::new(field.x+2,field.y,VALUE_WIDTH,1));
+                frame.render_widget(Paragraph::new("▸").style(Style::default()
+                    .fg(if focused {theme.info}else{theme.label}).bg(well)),
+                    Rect::new(field.x+25,field.y,1,1));
+                frame.render_widget(Paragraph::new(OVERWRITE_HELP_GLYPH).style(Style::default()
+                    .fg(theme.info).bg(bg)),Rect::new(field.x+27,field.y,1,1));
+                buttons.record_button(TuiButton::DiscBrowserOverwritePrev,Rect::new(field.x,field.y,1,1));
+                buttons.record_button(TuiButton::DiscBrowserOverwrite,Rect::new(field.x+2,field.y,VALUE_WIDTH,1));
+                buttons.record_button(TuiButton::DiscBrowserOverwriteNext,Rect::new(field.x+25,field.y,1,1));
+                buttons.record_button(TuiButton::DiscBrowserOverwriteHelp,Rect::new(field.x+27,field.y,1,1));
             }
             "Keep DST" => {
                 let enabled = s.contents.presentations.iter().enumerate().any(|(i,p)|
                     s.selected.get(i) == Some(&true)
                         && super::disc_browser_actions::presentation_has_dst(p)
                         && s.keep_dst.get(i) == Some(&true));
-                draw_native_toggle(frame,buttons,field,"Keep DST in DST areas",enabled,
+                let names=s.contents.presentations.iter().enumerate()
+                    .filter(|(index,p)|s.selected.get(*index)==Some(&true)
+                        && s.items_checked.get(*index).is_some_and(|items|items.iter().any(|yes|*yes))
+                        && super::disc_browser_actions::presentation_has_dst(p))
+                    .map(|(_,p)|p.id.compact_label()).collect::<Vec<_>>();
+                let label=if names.is_empty() {"Keep DST in selected areas".to_owned()}
+                    else {format!("Keep DST in {}",names.join(" and "))};
+                draw_native_toggle(frame,buttons,field,&label,enabled,
                     focused,i,theme,bg);
             }
             "Files" => {
@@ -1202,11 +1266,13 @@ fn draw_output(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,
                     let button_x=field.x+field.width-ew;
                     let summary=if dff && !dsf {"off for DFF".to_owned()}
                         else if s.tags && dff {"DSF only; DFF none".to_owned()}
-                        else if s.tags {format!("{} fields",s.tag_fields.count_ones())}
+                        else if s.tags {format!("{} fields · {}",s.tag_fields.count_ones(),
+                            if s.tag_artwork {"artwork"}else{"no artwork"})}
                         else {"no tags".to_owned()};
                     if button_x>x+1 {
                         frame.render_widget(Paragraph::new(clip_end(&summary,button_x-x-1))
-                            .style(Style::default().fg(if dff {theme.warning}else{labels.soft}).bg(bg)),
+                            .style(Style::default().fg(if dff {theme.warning}
+                                else {readable_word(theme.text_dim,bg)}).bg(bg)),
                             Rect::new(x+1,field.y,button_x-x-1,1));
                     }
                     draw_native_pill(frame,buttons,Rect::new(button_x,field.y,ew,1),edit,
@@ -1322,16 +1388,17 @@ fn draw_output(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,
     if let Some((x,y,width))=folder_note {
         if y<r.y+r.height && width>0 {
             use super::disc_browser::DestinationFeedback as D;
+            let layout=s.native_output_layout_hint();
             let message=match s.destination_feedback {
-                Some(D::WillBeCreated)=>"will be created",
-                Some(D::NotWritable)=>"not writable",
-                Some(D::InvalidPath)=>"enter an absolute directory path",
-                None=>"",
+                Some(D::WillBeCreated)=>format!("{layout} · will be created"),
+                Some(D::NotWritable)=>"not writable".to_owned(),
+                Some(D::InvalidPath)=>"enter an absolute directory path".to_owned(),
+                None=>layout,
             };
             let color=if matches!(s.destination_feedback,Some(D::NotWritable|D::InvalidPath)) {
                 theme.error
             }else{colors.soft};
-            frame.render_widget(Paragraph::new(clip_end(message,width))
+            frame.render_widget(Paragraph::new(clip_end(&message,width))
                 .style(Style::default().bg(bg).fg(color)),Rect::new(x,y,width,1));
         }
     }
@@ -1357,9 +1424,6 @@ fn draw_output(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,
                     .bg(bg).fg(color)),Rect::new(naming.x,naming.y+1,naming.width,1));
             }
         }
-    }
-    if let Some(anchor)=overwrite_anchor {
-        draw_native_overwrite_menu(frame,buttons,anchor,r,s,theme);
     }
 }
 
@@ -2153,11 +2217,11 @@ mod extract_r3_render_tests {
                     if wide {
                         word_cells(buffer,"Stop if a file exists",&context);
                         let rect=buttons.button_rect(TuiButton::DiscBrowserOverwrite)
-                            .expect("dropdown field visible");
+                            .expect("cycler value visible");
                         let active=name=="Overwrite";
                         assert_eq!(buffer.get(rect.x+1,rect.y).bg,
                             if active {theme.input_focused_bg}else{theme.input_unfocused_bg},
-                            "{context}: focus belongs only to the dropdown control");
+                            "{context}: focus belongs only to the cycler value");
                     }
                 }
                 let state=sacd_state(true,false);
@@ -2168,6 +2232,28 @@ mod extract_r3_render_tests {
                     word_cells(buffer,word,&format!("{slug} header"));
                 }
             }
+        }
+    }
+
+    #[test]
+    fn r34_sacd_details_clip_after_label_expansion_and_leave_two_blank_cells() {
+        let theme=crate::tui::theme::theme_by_slug_or_default("tokyo-night");
+        let mut state=sacd_state(false,false);
+        state.contents.presentations[0].extract.sacd_header_details=Some(format!(
+            "Catalog AL-001 · Date 1999 · Publisher {} · Hybrid SACD", "長い出版社".repeat(60)));
+        for width in [45,80,102] {
+            let mut terminal=Terminal::new(TestBackend::new(130,12)).unwrap();
+            let rect=Rect::new(3,2,width,3);
+            terminal.draw(|frame|draw_header(frame,&state,rect,false,theme)).unwrap();
+            let buffer=terminal.backend().buffer();
+            for x in rect.right()-2..rect.right() {
+                assert_eq!(buffer.get(x,rect.y+1).symbol()," ",
+                    "second header line must leave two blank frame-side cells, width={width}");
+            }
+            let visible=(rect.x..rect.right()-2).map(|x|
+                buffer.get(x,rect.y+1).symbol().to_owned()).collect::<String>();
+            assert!(visible.contains("Catalog"),"{visible}");
+            assert!(visible.contains('…'),"long publisher must truncate, width={width}: {visible}");
         }
     }
 
@@ -2288,29 +2374,58 @@ mod extract_r3_render_tests {
     }
 
     #[test]
-    fn r22_overwrite_dropdown_stays_inside_the_form_and_owns_its_mouse_targets() {
+    fn r34_overwrite_cycler_hitboxes_stay_fixed_as_values_change() {
+        use crate::convert::pipeline::native_extract::NativeOverwritePolicy as Policy;
         let theme = crate::tui::theme::theme_by_slug_or_default("tokyo-night");
-        let mut state = sacd_state(false, false);
-        state.focus = ExtractFocus::Output;
-        state.output_cursor = 1;
-        state.overwrite_open = true;
-        state.overwrite_cursor = 1;
-        // A five-line form has no room below its top-row Overwrite field.
-        // The list still has to stay visible and clickable in that viewport.
-        for (area, wide) in [(Rect::new(2, 4, 120, 5), true),
-            (Rect::new(2, 4, 80, 7), false)] {
-            let mut terminal = Terminal::new(TestBackend::new(130, 20)).unwrap();
-            let mut buttons = ButtonRenderMap::new();
-            terminal.draw(|frame| draw_output(frame, &state, area, &mut buttons, theme, wide)).unwrap();
-            for i in 0..3 {
-                let target = TuiButton::DiscBrowserOverwriteChoice(i);
-                let hit = buttons.button_rect(target).expect("all three policies must have hitboxes");
-                assert!(hit.y >= area.y && hit.y < area.y + area.height,
-                    "policy {i} outside form at {hit:?}");
-                assert!(hit.x >= area.x && hit.x + hit.width <= area.x + area.width);
-                assert_eq!(buttons.find_button_at(hit.x, hit.y), Some(target));
+        for (area,wide) in [(Rect::new(2,4,120,8),true),
+            (Rect::new(2,4,80,10),false)] {
+            let mut state=sacd_state(false,false);
+            state.focus=ExtractFocus::Output;
+            state.output_cursor=state.output_rows().iter().position(|name|*name=="Overwrite").unwrap();
+            let mut positions=None;
+            for policy in [Policy::Fail,Policy::Skip,Policy::Replace] {
+                state.overwrite_policy=policy;
+                let mut terminal=Terminal::new(TestBackend::new(130,20)).unwrap();
+                let mut buttons=ButtonRenderMap::new();
+                terminal.draw(|f|draw_output(f,&state,area,&mut buttons,theme,wide)).unwrap();
+                let targets=[TuiButton::DiscBrowserOverwritePrev,TuiButton::DiscBrowserOverwrite,
+                    TuiButton::DiscBrowserOverwriteNext,TuiButton::DiscBrowserOverwriteHelp];
+                let rects=targets.iter().map(|target| {
+                    let rect=buttons.button_rect(*target).expect("cycler target must be visible");
+                    assert!(rect.y>=area.y && rect.y<area.bottom());
+                    assert_eq!(buttons.find_button_at(rect.x,rect.y),Some(*target));
+                    rect
+                }).collect::<Vec<_>>();
+                assert_eq!(rects[1].width,22);
+                assert_eq!(rects[2].x,rects[0].x+25);
+                assert_eq!(rects[3].x,rects[2].x+2);
+                if let Some(first)=&positions { assert_eq!(&rects,first); }
+                else { positions=Some(rects); }
             }
         }
+    }
+
+    #[test]
+    fn r34_overwrite_help_sheet_shields_underlying_form_clicks() {
+        let theme=crate::tui::theme::theme_by_slug_or_default("tokyo-night");
+        let mut state=sacd_state(false,false);
+        state.focus=ExtractFocus::Output;
+        state.output_cursor=state.output_rows().iter().position(|name|*name=="Overwrite").unwrap();
+        state.overwrite_open=true;
+        let mut terminal=Terminal::new(TestBackend::new(160,45)).unwrap();
+        let mut buttons=ButtonRenderMap::new();
+        terminal.draw(|f|draw(f,&state,Path::new("/tmp"),&mut buttons,theme)).unwrap();
+        let sheet=buttons.button_rect(TuiButton::DiscBrowserOverwriteHelpPassive)
+            .expect("help sheet must be visible");
+        assert_eq!(buttons.find_button_at(sheet.x+1,sheet.y+1),
+            Some(TuiButton::DiscBrowserOverwriteHelpPassive));
+        let popup=buttons.button_rect(TuiButton::DiscBrowserOverwriteHelpOutside)
+            .expect("the help sheet must shield the popup");
+        assert!(sheet.x>=popup.x && sheet.y>=popup.y
+            && sheet.right()<=popup.right() && sheet.bottom()<=popup.bottom());
+        let arrow=buttons.button_rect(TuiButton::DiscBrowserOverwriteNext).unwrap();
+        assert_eq!(buttons.find_button_at(arrow.x,arrow.y),
+            Some(TuiButton::DiscBrowserOverwriteHelpOutside));
     }
 
     #[test]
@@ -2352,7 +2467,7 @@ mod extract_r3_render_tests {
         let text = (0..44).map(|y|(0..160)
             .map(|x|terminal.backend().buffer().get(x,y).symbol().to_owned())
             .collect::<Vec<_>>().concat()).collect::<Vec<_>>().join("\n");
-        assert!(text.contains("→ /tmp/r27-album/Stereo/Untitled/01 - Track.dsf"),"{text}");
+        assert!(text.contains("→ /tmp/r27-album/Untitled/01 - Track.dsf"),"{text}");
         for button in [TuiButton::DiscBrowserNamingLoad,TuiButton::DiscBrowserNamingCustom] {
             let rect = buttons.button_rect(button).expect("shared naming control must be clickable");
             assert_eq!(buttons.find_button_at(rect.x,rect.y),Some(button));
@@ -2544,7 +2659,7 @@ mod extract_r3_render_tests {
             state.item_cursor=cursor;
             let (lines,_) = rendered_lines(&state,160,44);
             let text=lines.join("\n");
-            assert!(text.contains(&format!("→ /tmp/r28-preview/Stereo/{spelling}.dsf")),"{text}");
+            assert!(text.contains(&format!("→ /tmp/r28-preview/{spelling}.dsf")),"{text}");
             assert!(text.contains("2 tracks would get the same name"),"{text}");
             assert!(state.blockers(Path::new("/tmp")).iter().any(|b|
                 b.contains("2 tracks would get the same name")));
@@ -2558,19 +2673,19 @@ mod extract_r3_render_tests {
         state.editing_template=true;
         state.destination_input="%TRACKNUMBER% - %TITLE%.%EXTENSION%".into();
         let (draft,_) = rendered_lines(&state,160,44);
-        assert!(draft.join("\n").contains("→ /tmp/r28-preview/Stereo/02 - song.dsf"));
+        assert!(draft.join("\n").contains("→ /tmp/r28-preview/02 - song.dsf"));
         state.naming_template=state.destination_input.clone();
         state.editing_destination=false;
         state.editing_template=false;
         assert_eq!(state.native_duplicate_count(),0);
         let (resolved,_) = rendered_lines(&state,160,44);
-        assert!(resolved.join("\n").contains("→ /tmp/r28-preview/Stereo/02 - song.dsf"));
+        assert!(resolved.join("\n").contains("→ /tmp/r28-preview/02 - song.dsf"));
         assert!(!resolved.join("\n").contains("2 tracks would get the same name"));
 
         state.naming_template="%TITLE%/%MISSING%".into();
         let (unknown,_) = rendered_lines(&state,160,44);
         let text=unknown.join("\n");
-        assert!(text.contains("→ /tmp/r28-preview/Stereo/song/Untitled.dsf"),"{text}");
+        assert!(text.contains("→ /tmp/r28-preview/song/Untitled.dsf"),"{text}");
         assert!(text.contains("2 tracks would get the same name"),"{text}");
         // Resolve the collision independently. The unknown-token warning is
         // then visible while the live (amber) destination preview remains.
@@ -2721,8 +2836,8 @@ mod extract_r3_render_tests {
             normal=buttons.button_rect(TuiButton::DiscBrowserTitle);
         }).unwrap();
         let normal=normal.unwrap();
-        assert!(normal.width<=150 && normal.x>=4 && normal.y>=2,
-            "normal popup should be centered and leave background visible: {normal:?}");
+        assert!(normal.width>=120 && normal.width<=188 && normal.x>=2 && normal.y>=1,
+            "content-derived popup should grow by 25% while retaining terminal margins: {normal:?}");
         let lines=(0..50).map(|y|(0..240)
             .map(|x|terminal.backend().buffer().get(x,y).symbol().to_owned())
             .collect::<Vec<_>>().concat()).collect::<Vec<_>>().join("\n");
@@ -2813,6 +2928,58 @@ mod extract_r3_render_tests {
             .map(|x|buffer.get(x,area.y+1).symbol().to_owned()).collect::<Vec<_>>().concat();
         assert!(mixed.contains("DSF keeps tags; DFF has no standard tags"),"{mixed}");
         assert!(mixed_buttons.button_rect(TuiButton::DiscBrowserToggle(tags_index)).is_some());
+    }
+
+    #[test]
+    fn r34_audit_d02_tags_summary_uses_text_dim_across_light_and_dark_themes() {
+        for slug in ["tokyo-night", "tokyo-night-day"] {
+            let theme = crate::tui::theme::theme_by_slug_or_default(slug);
+            let mut state = sacd_state(false, false);
+            state.focus = ExtractFocus::Output;
+            state.tags = true;
+            state.tag_fields = 0x7f; // Seven selected fields.
+            state.tag_artwork = true;
+            let area = Rect::new(2, 3, 146, 9);
+            let mut terminal = Terminal::new(TestBackend::new(152, 14)).unwrap();
+            let mut buttons = ButtonRenderMap::new();
+            let find_summary = |buffer: &ratatui::buffer::Buffer, text: &str| {
+                (area.y..area.bottom()).find_map(|y| {
+                    let line = (area.x..area.right()).map(|x| buffer.get(x, y).symbol().to_owned())
+                        .collect::<Vec<_>>().concat();
+                    line.find(text).map(|at| (area.x + line[..at].chars().count() as u16, y))
+                }).unwrap_or_else(|| panic!("{slug}: missing Tags summary {text:?}"))
+            };
+            terminal.draw(|frame| draw_output(frame, &state, area, &mut buttons, theme, true)).unwrap();
+            let summary = "7 fields · artwork";
+            let buffer = terminal.backend().buffer();
+            let (x, y) = find_summary(buffer, summary);
+            let bg = extract_colors(theme).focused;
+            let fg = readable_word(theme.text_dim, bg);
+            for offset in 0..summary.chars().count() as u16 {
+                let cell = buffer.get(x + offset, y);
+                assert_eq!((cell.fg, cell.bg), (fg, bg), "{slug} summary cell {offset}");
+                assert!(contrast_ratio(cell.fg, cell.bg) >= 4.5);
+            }
+            assert!(buttons.button_rect(TuiButton::DiscBrowserTagsEdit).is_some());
+
+            // A second DST area is DFF even when the radio remains DSF;
+            // this mixed-format warning retains its established warning color.
+            let mut multi = state.contents.presentations[0].clone();
+            multi.id = PresentationId::SacdArea(SacdAreaId::MultiChannel);
+            multi.format.codec = Some("DST".into());
+            state.contents.presentations.push(multi);
+            state.selected.push(true);
+            state.items_checked.push(vec![true]);
+            state.keep_dst.push(true);
+            terminal.draw(|frame| draw_output(frame, &state, area, &mut buttons, theme, true)).unwrap();
+            let warning = "DSF only; DFF none";
+            let buffer = terminal.backend().buffer();
+            let (x, y) = find_summary(buffer, warning);
+            for offset in 0..warning.chars().count() as u16 {
+                let cell = buffer.get(x + offset, y);
+                assert_eq!(cell.fg, theme.warning, "{slug} warning cell {offset}");
+            }
+        }
     }
 
     #[test]

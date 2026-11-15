@@ -272,10 +272,9 @@ pub struct DiscBrowserState {
     pub form_wide: std::cell::Cell<bool>,
     pub form_column: usize,
     pub footer_extract_enabled: std::cell::Cell<bool>,
-    /// An anchored Overwrite list, not a settings sheet. The committed policy
-    /// only changes on Enter or a deliberate mouse selection.
+    /// Read-only Overwrite help sheet. The cycler's committed policy is
+    /// independent of opening or dismissing this explanation.
     pub overwrite_open: bool,
-    pub overwrite_cursor: usize,
     pub show_hidden: bool,
     pub panel: Option<ExtractPanel>,
     /// Focused control in the Tags sheet (index into tag_sheet_controls).
@@ -416,7 +415,6 @@ impl DiscBrowserState {
             form_column: 0,
             footer_extract_enabled: std::cell::Cell::new(true),
             overwrite_open: false,
-            overwrite_cursor: 0,
             show_hidden: false,
             panel: None,
             panel_cursor: 0,
@@ -1116,11 +1114,21 @@ impl DiscBrowserState {
         self.native_output_paths_for_template(&self.naming_template)
     }
 
+    /// A naming draft can add or remove a program token. Recalculate the
+    /// implicit-folder rule for that draft, not the last committed template;
+    /// live preview, collision checks, and publication must agree.
+    fn native_job_for_template(&self, template: &str) -> crate::convert::pipeline::native_extract::NativeExtractionJob {
+        let mut job = self.native_job(PathBuf::new());
+        job.naming_template = template.to_owned();
+        job.program_subfolders = job.programs.len() > 1 &&
+            !crate::convert::pipeline::native_extract::native_template_has_program_token(template);
+        job
+    }
+
     fn native_output_paths_for_template(&self, template: &str) -> Vec<PathBuf> {
         use crate::convert::pipeline::native_extract::{proposed_destination,
             proposed_destination_for_program};
-        let mut job = self.native_job(PathBuf::new());
-        job.naming_template = template.to_owned();
+        let job = self.native_job_for_template(template);
         let mut paths = Vec::new();
         for program in &job.programs {
             if self.file_per_program {
@@ -1146,9 +1154,52 @@ impl DiscBrowserState {
         counts.values().filter(|count|**count>1).sum()
     }
 
+    /// Explain the actual output layout before Extract, using the same
+    /// selected-program projection that supplies the worker's paths.
+    pub fn native_output_layout_hint(&self) -> String {
+        let job = self.native_job(PathBuf::new());
+        if job.programs.len() == 1 && !job.program_subfolders {
+            let root=crate::convert::pipeline::native_extract::native_program_output_root(
+                &job,&job.programs[0]);
+            if root != job.destination {
+                let relative=root.strip_prefix(&job.destination).unwrap_or(&root);
+                return format!("Naming places files under {}; {}",relative.display(),
+                    if job.extraction_log {"extraction.log goes beside the files"} else {"no log will be written"});
+            }
+            return "Files go directly into this folder.".into();
+        }
+        if job.program_subfolders {
+            let folders = job.programs.iter().filter_map(|program|
+                crate::convert::pipeline::native_extract::native_program_output_root(&job,program)
+                    .strip_prefix(&job.destination).ok()
+                    .and_then(|relative|relative.iter().next())
+                    .map(|name|name.to_string_lossy().into_owned()))
+                .collect::<Vec<_>>();
+            let names = match folders.as_slice() {
+                [] => String::new(),
+                [only] => only.clone(),
+                [first,second] => format!("{first}/ and {second}/"),
+                _ => format!("{} program folders",folders.len()),
+            };
+            if folders.len()==2 {
+                return if job.extraction_log {
+                    format!("{names} will be created here, each with its own extraction.log")
+                } else {format!("{names} will be created here, without extraction logs")};
+            }
+            return format!("{names} will be created here{}",
+                if job.extraction_log {", with one log per program"} else {""});
+        }
+        if job.programs.len()>1 {
+            return if job.extraction_log {
+                "Naming separates the files; per-program logs use unique names beside them.".into()
+            } else {"Naming separates the files; no extraction logs will be written.".into()};
+        }
+        "Files go directly into this folder.".into()
+    }
+
     /// The highlighted program/chapter is previewed even if it is unchecked.
-    /// Construct that one candidate using the same job and worker functions
-    /// as real publication, rather than a parallel approximation.
+    /// Construct that one candidate using the same worker path functions as
+    /// publication, rather than a parallel approximation.
     pub fn native_preview_path(&self) -> Option<PathBuf> {
         self.native_preview_path_for_template(&self.naming_template)
     }
@@ -1159,8 +1210,7 @@ impl DiscBrowserState {
         if !self.is_extractable(self.cursor) { return None; }
         let authored = self.contents.presentations.get(self.cursor)?;
         let program = self.native_program_choice(self.cursor,authored,Some(self.item_cursor))?;
-        let mut job = self.native_job(PathBuf::new());
-        job.naming_template = template.to_owned();
+        let job = self.native_job_for_template(template);
         if self.file_per_program {
             Some(proposed_destination_for_program(&job,&program))
         } else {
@@ -1341,7 +1391,7 @@ impl DiscBrowserState {
 
     pub fn native_job(&self, working_root: PathBuf) -> crate::convert::pipeline::native_extract::NativeExtractionJob {
         use crate::convert::pipeline::native_extract::*;
-        let programs = self.contents.presentations.iter().enumerate()
+        let programs: Vec<_> = self.contents.presentations.iter().enumerate()
             .filter(|(i,_)| self.selected[*i] && self.is_extractable(*i))
             .filter_map(|(i,p)|self.native_program_choice(i,p,None)).collect();
         let catalog = self.contents.presentations.iter()
@@ -1356,11 +1406,16 @@ impl DiscBrowserState {
                 .or_else(||self.contents.presentations.iter().find_map(|p|p.album_artist.clone())),
             catalog,
         };
+        // Separate programs only when the naming template itself has no
+        // program discriminator. A single checked area goes straight to Folder.
+        let program_subfolders = programs.len() > 1 &&
+            !native_template_has_program_token(&self.naming_template);
         NativeExtractionJob{ disc_identity, source:self.source_path.clone(),format:self.contents.format,
             programs,destination:self.destination.clone(), working_root,
             wav_container:self.wav_container, assume_decrypted:self.assume_decrypted,downmix:self.downmix,
-            naming_template:self.naming_template.clone(), program_subfolders:self.program_subfolders,
+            naming_template:self.naming_template.clone(), program_subfolders,
             overwrite_policy:self.overwrite_policy, extraction_log:self.extraction_log,
+            program_log_paths:Vec::new(), round4_layout:true,
             file_per_program:self.file_per_program, cue:self.cue,
             transfer_tags:self.tags && self.native_tags_available(),
             sacd_dff:self.sacd_dff,
@@ -2750,6 +2805,38 @@ mod disc_selection_bridge_tests {
         state.selected[1] = false;
         assert!(!state.blockers(std::path::Path::new("/tmp")).iter()
             .any(|reason| reason.contains("CSS")));
+    }
+
+    #[test]
+    fn r34_draft_naming_template_recomputes_program_folder_rule_for_preview_and_inventory() {
+        use crate::disc::model::SacdAreaId;
+        let mut disc = disc_contents(DiscFormat::Sacd,
+            PresentationId::SacdArea(SacdAreaId::Stereo), "Stereo");
+        let mut multichannel = disc.presentations[0].clone();
+        multichannel.id = PresentationId::SacdArea(SacdAreaId::MultiChannel);
+        multichannel.label = "Multichannel".into();
+        disc.presentations.push(multichannel);
+        let mut state = DiscBrowserState::new(disc, "disc.iso".into());
+        state.destination = PathBuf::from("/tmp/r34-preview");
+        assert_eq!(state.native_job(PathBuf::new()).programs.len(), 2);
+
+        // Committed default separates selected programs with implicit folders.
+        let implicit = state.native_preview_path().unwrap();
+        assert_eq!(implicit.parent(), Some(state.destination.join("Stereo").as_path()));
+        assert_eq!(state.native_output_paths().len(), 2);
+
+        // Inserting an explicit area token into a draft removes implicit
+        // folders before the edit is committed, including in path inventory.
+        let filename_token = "%AREA% - %TRACKNN% - %TITLE%";
+        let flat = state.native_preview_path_for_template(filename_token).unwrap();
+        assert_eq!(flat.parent(), Some(state.destination.as_path()));
+        let flat_paths = state.native_output_paths_for_template(filename_token);
+        assert_eq!(flat_paths.len(), 2);
+        assert!(flat_paths.iter().all(|path|path.parent()==Some(state.destination.as_path())));
+        assert_eq!(state.native_duplicate_count_for_template(filename_token), 0);
+        let nested = state.native_preview_path_for_template("%AREA%/%TRACKNN% - %TITLE%").unwrap();
+        assert_eq!(nested.parent(),Some(state.destination.join("Stereo").as_path()));
+        assert_eq!(state.native_preview_path(),Some(implicit));
     }
 
     #[test]

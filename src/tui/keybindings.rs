@@ -74810,7 +74810,11 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::DiscBrowserOutput(_)
             | TuiButton::DiscBrowserFormatChoice(_)
             | TuiButton::DiscBrowserFilesChoice(_)
-            | TuiButton::DiscBrowserOverwriteChoice(_)
+            | TuiButton::DiscBrowserOverwritePrev
+            | TuiButton::DiscBrowserOverwriteNext
+            | TuiButton::DiscBrowserOverwriteHelp
+            | TuiButton::DiscBrowserOverwriteHelpOutside
+            | TuiButton::DiscBrowserOverwriteHelpPassive
             | TuiButton::DiscBrowserToggle(_)
             | TuiButton::DiscBrowserTagsEdit
             | TuiButton::DiscBrowserTagSheetControl(_)

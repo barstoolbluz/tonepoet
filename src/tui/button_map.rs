@@ -390,7 +390,11 @@ pub enum TuiButton {
     DiscBrowserOutput(usize),
     DiscBrowserFormatChoice(usize),
     DiscBrowserFilesChoice(usize),
-    DiscBrowserOverwriteChoice(usize),
+    DiscBrowserOverwritePrev,
+    DiscBrowserOverwriteNext,
+    DiscBrowserOverwriteHelp,
+    DiscBrowserOverwriteHelpOutside,
+    DiscBrowserOverwriteHelpPassive,
     DiscBrowserToggle(usize),
     DiscBrowserTagsEdit,
     DiscBrowserTagSheetControl(usize),
@@ -578,7 +582,11 @@ impl TuiButton {
             | Self::DiscBrowserOutput(_)
             | Self::DiscBrowserFormatChoice(_)
             | Self::DiscBrowserFilesChoice(_)
-            | Self::DiscBrowserOverwriteChoice(_)
+            | Self::DiscBrowserOverwritePrev
+            | Self::DiscBrowserOverwriteNext
+            | Self::DiscBrowserOverwriteHelp
+            | Self::DiscBrowserOverwriteHelpOutside
+            | Self::DiscBrowserOverwriteHelpPassive
             | Self::DiscBrowserToggle(_)
             | Self::DiscBrowserTagsEdit
             | Self::DiscBrowserTagSheetControl(_)
