@@ -2365,9 +2365,14 @@ mod tests {
         assert!(native_key_help(&state).iter().all(|line|line.chars().count()<=49),
             "help rows must fit the smallest scrolling help panel");
         for expected in ["n none", "i invert", "a all", "PgUp/PgDn page",
-            "⇧↑↓ range", "↵ edit folder", "Space toggle", "↵ edit naming", "↵ open list"] {
+            "⇧↑↓ range", "↵ edit folder", "Space toggle", "↵ edit naming",
+            "↵ next", "i help"] {
             assert!(help.contains(expected), "Missing {expected} from all-keys help: {help}");
         }
+        assert!(help.contains("Overwrite: [ ] cycle · i help"),
+            "Overwrite help must describe the cycler: {help}");
+        assert!(!help.contains("↵ open list"),
+            "the obsolete Overwrite dropdown must not appear: {help}");
         for focus in [ExtractFocus::Programs, ExtractFocus::Items, ExtractFocus::Output] {
             state.focus=focus;
             for cursor in 0..state.output_rows().len() {
@@ -3114,7 +3119,11 @@ mod tests {
         let source=PathBuf::from("disc.iso");
         let mut state=DiscBrowserState::new(
             selectable_disc_contents(source.clone(),FolderDiscMarkerKind::Sacd),source);
-        let path=PathBuf::from("/music/a-very-long-hidden-directory/another-hidden-directory/Album/Extracted");
+        // Round 4 enlarged the input well. Build a path longer than that
+        // field so this still exercises mapping from a collapsed preview.
+        let path=(0..12).fold(PathBuf::from("/music"), |p, i|
+            p.join(format!("hidden-directory-with-long-component-{i:02}")))
+            .join("Album").join("Extracted");
         state.destination=path.clone();
         state.focus=crate::tui::disc_browser::ExtractFocus::Programs;
         let mut app=AppState::new_for_test(TonepoetConfig::default());
@@ -3184,8 +3193,11 @@ mod tests {
         let source=PathBuf::from("disc.iso");
         let mut state=DiscBrowserState::new(
             selectable_disc_contents(source.clone(),FolderDiscMarkerKind::Sacd),source);
-        let template="%ALBUM%/%ARTIST%/%TRACKNN% - %TITLE%/additional-long-template-suffix";
-        state.naming_template=template.into();
+        // Keep the leading token visible, but exceed the larger R34 well
+        // so the first drag still exercises a genuinely clipped preview.
+        let template=format!("%ALBUM%/%ARTIST%/%TRACKNN% - %TITLE%/{}",
+            "additional-long-template-suffix/".repeat(12));
+        state.naming_template=template.clone();
         state.focus=crate::tui::disc_browser::ExtractFocus::Programs;
         let mut app=AppState::new_for_test(TonepoetConfig::default());
         app.active_overlay=ActiveOverlay::DiscBrowser(Box::new(state));

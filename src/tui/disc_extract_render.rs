@@ -336,8 +336,8 @@ fn preferred_program_rows(state: &DiscBrowserState) -> u16 {
 
 /// The title bar is separate from the three-sided body block. All child rows
 /// are contained in `body_block.inner(body)`, so they cannot erase its corners.
-/// Height follows the authored content rather than stretching eight tracks
-/// into the terminal's entire height.
+/// The content-derived size grows by 25% per side, up to the terminal's
+/// two-column and one-row margins; short selections can fill that cap.
 pub fn draw(
     frame: &mut ratatui::Frame,
     state: &DiscBrowserState,
@@ -1887,7 +1887,13 @@ mod extract_r3_render_tests {
                 "header band {width}x{height}");
             assert_eq!(buffer.get(left,title_y+1).fg,theme.title,
                 "side rail {width}x{height}");
-            if height==40 {assert!(title_y>1,"content-sized dialog should be centered");}
+            let bottom_margin = height - bottom_y - 1;
+            assert!(title_y>=1 && bottom_margin>=1,
+                "dialog must leave a row above and below: {width}x{height}");
+            assert!(title_y.abs_diff(bottom_margin)<=1,
+                "dialog must remain centered even when the 1.25× size is capped: {width}x{height}");
+            assert!(left>=2 && width-right-1>=2,
+                "dialog must leave two columns at each side: {width}x{height}");
         }
     }
 
@@ -2120,7 +2126,13 @@ mod extract_r3_render_tests {
         assert_eq!(buf.get(right,pane_y).bg,colors.focused);
         let top=lines.iter().position(|line|line.contains("extract tracks"))
             .expect("title") as u16;
-        assert!(top>1,"short selection must not fill the terminal");
+        let bottom=lines.iter().rposition(|line|line.contains('└'))
+            .expect("closed bottom frame") as u16;
+        let bottom_margin=36-bottom-1;
+        assert!(top>=1 && bottom_margin>=1,
+            "expanded dialog must leave the terminal margin");
+        assert!(top.abs_diff(bottom_margin)<=1,
+            "expanded dialog must remain vertically centered");
         assert!(!lines.iter().any(|line|line.contains("Track 01") &&
             line.contains("Genesis")),"artist performer column should be hidden");
         state.focus=ExtractFocus::Programs;

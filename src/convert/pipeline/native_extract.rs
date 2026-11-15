@@ -967,6 +967,7 @@ fn estimated_bytes_for_staged_continuous_tracks(
 /// run. `published` and `skipped` are execution receipts, not estimates or a
 /// fresh scan of filenames that happen to exist in the destination. The
 /// log's own pathname is deliberately absent from the output inventory.
+#[cfg(test)] // Test fixture helper; production uses the outcome-aware renderer directly.
 pub(crate) fn render_native_extraction_log(
     job: &NativeExtractionJob,
     published: &[PathBuf],
@@ -2679,27 +2680,42 @@ mod tests {
         assert!(body.contains("Outcome: not reached"), "{body}");
     }
 
-    #[tokio::test]
-    async fn preexisting_log_under_skip_or_fail_stops_before_media_work() {
+    #[test]
+    fn preexisting_log_under_skip_or_fail_gets_unique_name_before_media_work() {
         let temp = tempfile::tempdir().unwrap();
         let mut job = fixture_job(&temp.path().join("output"), temp.path());
+        job.round4_layout = true;
+        job.program_subfolders = false;
         job.extraction_log = true;
-        job.overwrite_policy = NativeOverwritePolicy::Skip;
-        std::fs::create_dir_all(&job.destination).unwrap();
+        fs::create_dir_all(&job.destination).unwrap();
         let log = job.destination.join(EXTRACTION_LOG_FILE);
-        std::fs::write(&log, b"existing user receipt").unwrap();
-        let error = execute(job.clone(), CancellationToken::new(), |_| {}).await.unwrap_err();
-        assert!(error.contains("Replace or disable logging"), "{error}");
-        assert_eq!(std::fs::read(&log).unwrap(), b"existing user receipt");
-        assert_eq!(path_inventory(&job.destination),
-            BTreeSet::from([EXTRACTION_LOG_FILE.to_string()]));
-        job.overwrite_policy = NativeOverwritePolicy::Fail;
-        assert!(validate_job(&job).unwrap_err().contains("Extraction log already exists"));
+        fs::write(&log, b"existing user receipt").unwrap();
+        let media = proposed_destination(&job, &job.programs[0], &job.programs[0].tracks[0]);
+        let before = path_inventory(&job.destination);
+        assert_eq!(before, BTreeSet::from([EXTRACTION_LOG_FILE.to_string()]));
+
+        // Both Stop and Skip reserve a different log before the first media
+        // operation. Replanning is stable and does not publish anything.
+        for policy in [NativeOverwritePolicy::Skip, NativeOverwritePolicy::Fail] {
+            job.overwrite_policy = policy;
+            plan_native_program_logs(&mut job).unwrap();
+            let expected = job.destination.join("extraction-2.log");
+            assert_eq!(native_log_targets(&job), vec![expected.clone()]);
+            validate_job(&job).unwrap();
+            plan_native_program_logs(&mut job).unwrap();
+            assert_eq!(native_log_targets(&job), vec![expected]);
+            assert_eq!(fs::read(&log).unwrap(), b"existing user receipt");
+            assert_eq!(path_inventory(&job.destination), before);
+            assert!(!media.exists(), "preflight must not publish media");
+        }
+        // Replace explicitly reuses the base name, but still does not write
+        // until the extraction job actually publishes its receipt.
         job.overwrite_policy = NativeOverwritePolicy::Replace;
-        assert!(validate_job(&job).is_ok());
-        std::fs::remove_file(log).unwrap();
-        job.overwrite_policy = NativeOverwritePolicy::Skip;
-        assert!(validate_job(&job).is_ok());
+        plan_native_program_logs(&mut job).unwrap();
+        assert_eq!(native_log_targets(&job), vec![log.clone()]);
+        validate_job(&job).unwrap();
+        assert_eq!(fs::read(&log).unwrap(), b"existing user receipt");
+        assert_eq!(path_inventory(&job.destination), before);
     }
 
     #[tokio::test]
