@@ -2569,7 +2569,7 @@ mod extract_r3_render_tests {
         assert!(!resolved.join("\n").contains("2 tracks would get the same name"));
 
         state.naming_template="%TITLE%/%MISSING%".into();
-        let (unknown,terminal) = rendered_lines(&state,160,44);
+        let (unknown,_) = rendered_lines(&state,160,44);
         let text=unknown.join("\n");
         assert!(text.contains("→ /tmp/r28-preview/Stereo/song/Untitled.dsf"),"{text}");
         assert!(text.contains("2 tracks would get the same name"),"{text}");

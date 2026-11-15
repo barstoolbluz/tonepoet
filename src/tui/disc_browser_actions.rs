@@ -1288,7 +1288,6 @@ fn activate_native_tag_control(state: &mut DiscBrowserState,
     control: crate::tui::disc_browser::TagSheetControl,
 ) {
     use crate::tui::disc_browser::TagSheetControl as C;
-    use crate::convert::pipeline::native_extract::NativeTagSource;
     match control {
         C::Transfer => state.tags = !state.tags,
         C::Source => {
@@ -2294,11 +2293,14 @@ mod tests {
                     assert!(!bindings.iter().any(|binding|
                         binding.action==NativeKeyAction::All || binding.action==NativeKeyAction::Invert));
                     if state.current_output_row()=="Format" {
-                        // The fixture is SACD with plain DSD; there is no
-                        // DST option to toggle, so no fake choice hint.
-                        assert!(!bindings.iter().any(|binding|binding.action==NativeKeyAction::Previous));
-                        assert!(!bindings.iter().any(|binding|binding.action==NativeKeyAction::Space));
-                        assert!(!bindings.iter().any(|binding|binding.action==NativeKeyAction::Enter));
+                        // Plain DSD now supports DSF/DFF choice. Keep DST is
+                        // a separate control, absent for this DSD-only area.
+                        assert!(!state.output_rows().contains(&"Keep DST"));
+                        for action in [NativeKeyAction::Previous, NativeKeyAction::Next,
+                            NativeKeyAction::Space, NativeKeyAction::Enter] {
+                            assert!(bindings.iter().any(|binding|binding.action==action),
+                                "Format must expose its DSF/DFF choice: {action:?}");
+                        }
                     }
                 } else {
                     assert!(!bindings.iter().any(|binding|binding.action==NativeKeyAction::Previous));
@@ -2973,7 +2975,9 @@ mod tests {
             if let ActiveOverlay::DiscBrowser(state)=&mut app.active_overlay {
                 focus_native_row(state,"Files");
             }
-            press(&mut app,KeyCode::Right);
+            // Paired wide controls use Left/Right; compact rows are stacked
+            // and use Up/Down, including when DFF suppresses tag writing.
+            press(&mut app,if wide {KeyCode::Right}else{KeyCode::Down});
             assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(state)
                 if state.current_output_row()=="Tags"),"Tags must remain keyboard accessible for Use DSF");
         }
@@ -3377,7 +3381,7 @@ mod tests {
 
     #[test]
     fn r30_tags_sheet_mouse_click_outside_dismisses_without_underlying_action() {
-        use crate::tui::disc_browser::{ExtractPanel, TagSheetControl as C};
+        use crate::tui::disc_browser::TagSheetControl as C;
         let contents = selectable_disc_contents("disc.iso".into(), FolderDiscMarkerKind::Sacd);
         let mut app = AppState::new_for_test(TonepoetConfig::default());
         let mut state = DiscBrowserState::new(contents, "disc.iso".into());
@@ -3475,7 +3479,9 @@ mod tests {
             KeyEvent::new(code,KeyModifiers::NONE),&tx);
         for control in [C::All,C::None,C::UseDsf] {
             let index={let ActiveOverlay::DiscBrowser(state)=&mut app.active_overlay else{panic!("browser")};
-                if control==C::UseDsf {state.sacd_dff=true;}
+                // Both activation paths must begin with the same draft state.
+                state.tag_fields=0x7f;
+                state.sacd_dff=true;
                 state.tag_sheet_controls().iter().position(|item|*item==control).unwrap()};
             assert!(handle_disc_browser_button_click(&mut app,
                 &TuiButton::DiscBrowserTagSheetControl(index),1,&tx));
