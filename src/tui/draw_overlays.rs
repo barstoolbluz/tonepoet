@@ -21,31 +21,11 @@ fn template_builder_input_hit_rect(
     area: Rect,
     state: &super::app::TemplateBuilderState,
 ) -> Option<Rect> {
-    let width = (area.width.saturating_mul(80) / 100)
-        .max(60)
-        .min(area.width.saturating_sub(2));
-    let categories = state.token_categories();
-    let saved_visible = state.saved_templates.len().min(4).max(1);
-    let category_rows: u16 = categories.iter().map(|_| 2).sum();
-    let content_height =
-        1 + 2 + 1 + 1 + saved_visible as u16 + 1 + category_rows + 2 + 1 + 1;
-    let height = (content_height + 2).min(area.height.saturating_sub(2));
-    if width < 60 || height < 12 {
-        return None;
-    }
-    let x = area.x + area.width.saturating_sub(width) / 2;
-    let y = area.y + area.height.saturating_sub(height) / 2;
-    // `draw_template_builder` lays out the editable template directly under
-    // the popup title: one label row followed by one single-line field. Keep
-    // the hit region on that field only. Registering the whole popup as an
-    // editor (the earlier fallback) made clicks on saved templates, token
-    // whitespace, and footer gaps reposition the text cursor.
-    Some(Rect::new(
-        x.saturating_add(2),
-        y.saturating_add(2),
-        width.saturating_sub(4),
-        1,
-    ))
+    let popup = super::template_builder::builder_popup(area, state)?;
+    // Match the rendered editor after "  Template:  " (13 cells). The label
+    // and popup border are not text-input targets.
+    Some(Rect::new(popup.x + 14, popup.y + 1,
+        popup.width.saturating_sub(16), 1))
 }
 
 /// Render a pill-style footer button: ` label ` with colored background.
@@ -708,6 +688,11 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState, theme: super::theme::Them
             draw_ar_batch_report(f, result, scroll, theme);
         }
         ActiveOverlay::TemplateBuilder(ref state) => {
+            if let Some(browser) = state.return_to_extract.as_deref() {
+                let scratch = crate::tui::disc_browser_actions::native_working_root(
+                    browser, app.config.conversion.scratch_directory.as_deref());
+                crate::tui::disc_extract_render::draw(f,browser,&scratch,&mut app.button_map,theme);
+            }
             // The template renderer lives outside the round-4 source bundle,
             // but its layout contract is mirrored by the existing mouse handler
             // below. Register only the actual editable line with the shared
@@ -729,7 +714,13 @@ pub fn draw_overlay(f: &mut Frame, app: &mut AppState, theme: super::theme::Them
             scroll,
             ref preview,
             ref active_template,
+            ref return_to_extract,
         } => {
+            if let Some(browser) = return_to_extract.as_deref() {
+                let scratch = crate::tui::disc_browser_actions::native_working_root(
+                    browser, app.config.conversion.scratch_directory.as_deref());
+                crate::tui::disc_extract_render::draw(f,browser,&scratch,&mut app.button_map,theme);
+            }
             super::template_builder::draw_template_picker(
                 f,
                 target,
@@ -9638,6 +9629,9 @@ mod tests {
             saved_templates: vec!["%NN% - %TITLE%".to_string()],
             saved_selected: 0,
             saved_scroll: 0,
+            token_scroll: 0,
+            return_to_extract: None,
+            disc_format: None,
         };
         let rect = template_builder_input_hit_rect(Rect::new(0, 0, 100, 40), &state)
             .expect("template input hit region");

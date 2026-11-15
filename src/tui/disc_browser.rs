@@ -392,7 +392,7 @@ impl DiscBrowserState {
             destination_caret: 0,
             destination_feedback: None,
             editing_template: false,
-            naming_template: "{track} - {title}".into(),
+            naming_template: "%TRACKNUMBER% - %TITLE%".into(),
             program_subfolders: true,
             overwrite_policy: crate::convert::pipeline::native_extract::NativeOverwritePolicy::Fail,
             extraction_log: false,
@@ -893,9 +893,9 @@ impl DiscBrowserState {
     /// Extra DVD-Audio controls retain fixed row positions independently.
     pub fn wide_output_height(&self) -> u16 {
         let rows = self.output_rows();
-        if rows.contains(&"Assume decrypted") { 9 }
-        else if rows.contains(&"Downmix") { 8 }
-        else { 7 }
+        if rows.contains(&"Assume decrypted") { 10 }
+        else if rows.contains(&"Downmix") { 9 }
+        else { 8 }
     }
 
     /// Track selected DFF (DST-preserving) versus DSF destinations. The
@@ -985,6 +985,66 @@ impl DiscBrowserState {
         }
     }
 
+    /// Path planning is deliberately shared with the worker: the UI must not
+    /// approve a combination that the publisher will reject later. This does
+    /// no filesystem IO and includes only checked, extractable outputs.
+    pub fn native_output_paths(&self) -> Vec<PathBuf> {
+        self.native_output_paths_for_template(&self.naming_template)
+    }
+
+    fn native_output_paths_for_template(&self, template: &str) -> Vec<PathBuf> {
+        use crate::convert::pipeline::native_extract::{proposed_destination,
+            proposed_destination_for_program};
+        let mut job = self.native_job(PathBuf::new());
+        job.naming_template = template.to_owned();
+        let mut paths = Vec::new();
+        for program in &job.programs {
+            if self.file_per_program {
+                paths.push(proposed_destination_for_program(&job, program));
+            } else {
+                paths.extend(program.tracks.iter().map(|track|
+                    proposed_destination(&job,program,track)));
+            }
+        }
+        paths
+    }
+
+    pub fn native_duplicate_count(&self) -> usize {
+        self.native_duplicate_count_for_template(&self.naming_template)
+    }
+
+    pub fn native_duplicate_count_for_template(&self, template: &str) -> usize {
+        use crate::convert::pipeline::native_extract::native_destination_collision_key;
+        let mut counts = std::collections::HashMap::<String,usize>::new();
+        for path in self.native_output_paths_for_template(template) {
+            *counts.entry(native_destination_collision_key(&path)).or_default() += 1;
+        }
+        counts.values().filter(|count|**count>1).sum()
+    }
+
+    /// The highlighted program/chapter is previewed even if it is unchecked.
+    /// Construct that one candidate using the same job and worker functions
+    /// as real publication, rather than a parallel approximation.
+    pub fn native_preview_path(&self) -> Option<PathBuf> {
+        self.native_preview_path_for_template(&self.naming_template)
+    }
+
+    pub fn native_preview_path_for_template(&self, template: &str) -> Option<PathBuf> {
+        use crate::convert::pipeline::native_extract::{proposed_destination,
+            proposed_destination_for_program};
+        if !self.is_extractable(self.cursor) { return None; }
+        let authored = self.contents.presentations.get(self.cursor)?;
+        let program = self.native_program_choice(self.cursor,authored,Some(self.item_cursor))?;
+        let mut job = self.native_job(PathBuf::new());
+        job.naming_template = template.to_owned();
+        if self.file_per_program {
+            Some(proposed_destination_for_program(&job,&program))
+        } else {
+            let track = program.tracks.first()?;
+            Some(proposed_destination(&job,&program,track))
+        }
+    }
+
     pub fn blockers(&self, scratch: &Path) -> Vec<String> {
         self.blockers_with_capacity_refresh(scratch, false)
     }
@@ -993,6 +1053,11 @@ impl DiscBrowserState {
     /// queue submission; painting the overlay uses the cached result.
     pub(crate) fn blockers_with_capacity_refresh(&self, scratch: &Path, refresh: bool) -> Vec<String> {
         let mut problems = Vec::new();
+        let duplicate_count = self.native_duplicate_count();
+        if duplicate_count > 0 {
+            problems.push(format!("{} tracks would get the same name; change Naming before extracting",
+                duplicate_count));
+        }
         if self.destination_feedback == Some(DestinationFeedback::NotWritable) {
             problems.push("Extraction destination is not writable".into());
         }
@@ -1065,65 +1130,74 @@ impl DiscBrowserState {
         problems
     }
 
+    /// Select native track data from one authored presentation. The worker's
+    /// job builder and the highlighted-item path preview share this projection;
+    /// preview can select one unchecked item without cloning the entire disc.
+    fn native_program_choice(&self, i: usize, p: &DiscPresentation,
+        only_track: Option<usize>) -> Option<crate::convert::pipeline::native_extract::NativeProgramChoice> {
+        use crate::convert::pipeline::native_extract::{NativeProgramChoice,NativeTrackChoice,
+            NativeTagSource,NativeTagValues};
+        let sacd_tags = self.contents.format == DiscFormat::Sacd;
+        let sidecar_first = self.tag_source == NativeTagSource::DiscAndSidecar;
+        let tags_to_native = |tags: crate::disc::model::DiscExtractTagFields| NativeTagValues {
+            title: tags.title, artist: tags.artist, album: tags.album,
+            genre: tags.genre, year: tags.year, composer: tags.composer,
+            performer: tags.performer,
+        };
+        let tracks: Vec<NativeTrackChoice> = p.tracks.iter().enumerate()
+            .filter(|(j,_)| only_track.map_or_else(|| self.items_checked[i].get(*j) == Some(&true), |track| track == *j))
+            .map(|(j,t)| NativeTrackChoice { duration_secs: t.duration_secs, number: (j + 1) as u32,
+                name: t.title.clone().unwrap_or_else(|| format!("Track {}", t.number)),
+                estimated_bytes: self.native_item_payload_bytes(p, t),
+                // DVD-Video/Blu-ray mappers synthesize "Chapter n"
+                // for navigation. It is a filename fallback, never a
+                // discovered metadata field that should become a tag.
+                tags: if sacd_tags {
+                    // Resolve track-to-album fallback *within* each
+                    // authority before applying the selected source
+                    // precedence. Otherwise a lower-priority sidecar
+                    // track DATE/GENRE can override authored album data.
+                    let authored = p.extract.authored_track_tags.get(j).cloned()
+                        .unwrap_or_default().prioritized(&p.extract.authored_album_tags);
+                    let sidecar = p.extract.sidecar_track_tags.get(j).cloned()
+                        .unwrap_or_default().prioritized(&p.extract.sidecar_album_tags);
+                    tags_to_native(if sidecar_first { sidecar.prioritized(&authored) }
+                        else { authored.prioritized(&sidecar) })
+                } else { NativeTagValues {
+                    title: if matches!(self.contents.format, DiscFormat::DvdVideo | DiscFormat::BluRay) {
+                        None
+                    } else { t.title.clone() },
+                    performer:t.performer.clone(), artist:t.performer.clone(), ..Default::default()
+                } } }).collect();
+        (!tracks.is_empty()).then(|| NativeProgramChoice{
+            id:p.id, angle:self.selected_angle_for(i), label:p.id.compact_label(), tracks,
+            keep_dst:self.keep_dst.get(i) == Some(&true),
+            source_depth:p.format.bit_depth, source_channels:p.format.channels,
+            source_rate:p.format.sample_rate,
+            // The DVD-Video IFO mapper labels 5.1 from *count*, not
+            // speaker assignments. Do not treat it as an authoritative
+            // channel mask. Keep observed nonzero WAV masks instead.
+            source_layout: if self.contents.format == DiscFormat::DvdVideo && p.format.channels.unwrap_or(0) > 2 {
+                None
+            } else { p.format.channel_layout.clone() },
+            is_lossless:p.format.lossless,
+            tags: if sacd_tags {
+                let authored = &p.extract.authored_album_tags;
+                let sidecar = &p.extract.sidecar_album_tags;
+                tags_to_native(if sidecar_first { sidecar.prioritized(authored) }
+                    else { authored.prioritized(sidecar) })
+            } else {
+                let metadata = metadata_for_disc_presentation(&self.contents, Some(p));
+                NativeTagValues {title:None,artist:metadata.artist,album:metadata.album,
+                    genre:metadata.genre,year:metadata.year,..Default::default()}
+            } })
+    }
+
     pub fn native_job(&self, working_root: PathBuf) -> crate::convert::pipeline::native_extract::NativeExtractionJob {
         use crate::convert::pipeline::native_extract::*;
-        let programs = self.contents.presentations.iter().enumerate().filter(|(i,_)| self.selected[*i] && self.is_extractable(*i))
-            .filter_map(|(i,p)| {
-                let sacd_tags = self.contents.format == DiscFormat::Sacd;
-                let sidecar_first = self.tag_source == NativeTagSource::DiscAndSidecar;
-                let tags_to_native = |tags: crate::disc::model::DiscExtractTagFields| NativeTagValues {
-                    title: tags.title, artist: tags.artist, album: tags.album,
-                    genre: tags.genre, year: tags.year, composer: tags.composer,
-                    performer: tags.performer,
-                };
-                let tracks: Vec<NativeTrackChoice> = p.tracks.iter().enumerate()
-                    .filter(|(j,_)| self.items_checked[i].get(*j) == Some(&true))
-                    .map(|(j,t)| NativeTrackChoice { duration_secs: t.duration_secs, number: (j + 1) as u32,
-                        name: t.title.clone().unwrap_or_else(|| format!("Track {}", t.number)),
-                        estimated_bytes: self.native_item_payload_bytes(p, t),
-                        // DVD-Video/Blu-ray mappers synthesize "Chapter n"
-                        // for navigation. It is a filename fallback, never a
-                        // discovered metadata field that should become a tag.
-                        tags: if sacd_tags {
-                            // Resolve track-to-album fallback *within* each
-                            // authority before applying the selected source
-                            // precedence. Otherwise a lower-priority sidecar
-                            // track DATE/GENRE can override authored album data.
-                            let authored = p.extract.authored_track_tags.get(j).cloned()
-                                .unwrap_or_default().prioritized(&p.extract.authored_album_tags);
-                            let sidecar = p.extract.sidecar_track_tags.get(j).cloned()
-                                .unwrap_or_default().prioritized(&p.extract.sidecar_album_tags);
-                            tags_to_native(if sidecar_first { sidecar.prioritized(&authored) }
-                                else { authored.prioritized(&sidecar) })
-                        } else { NativeTagValues {
-                            title: if matches!(self.contents.format, DiscFormat::DvdVideo | DiscFormat::BluRay) {
-                                None
-                            } else { t.title.clone() },
-                            performer:t.performer.clone(), artist:t.performer.clone(), ..Default::default()
-                        } } }).collect();
-                (!tracks.is_empty()).then(|| NativeProgramChoice{
-                    id:p.id, angle:self.selected_angle_for(i), label:p.id.compact_label(), tracks,
-                    keep_dst:self.keep_dst.get(i) == Some(&true),
-                    source_depth:p.format.bit_depth, source_channels:p.format.channels,
-                    source_rate:p.format.sample_rate,
-                    // The DVD-Video IFO mapper labels 5.1 from *count*, not
-                    // speaker assignments. Do not treat it as an authoritative
-                    // channel mask. Keep observed nonzero WAV masks instead.
-                    source_layout: if self.contents.format == DiscFormat::DvdVideo && p.format.channels.unwrap_or(0) > 2 {
-                        None
-                    } else { p.format.channel_layout.clone() },
-                    is_lossless:p.format.lossless,
-                    tags: if sacd_tags {
-                        let authored = &p.extract.authored_album_tags;
-                        let sidecar = &p.extract.sidecar_album_tags;
-                        tags_to_native(if sidecar_first { sidecar.prioritized(authored) }
-                            else { authored.prioritized(sidecar) })
-                    } else {
-                        let metadata = metadata_for_disc_presentation(&self.contents, Some(p));
-                        NativeTagValues {title:None,artist:metadata.artist,album:metadata.album,
-                            genre:metadata.genre,year:metadata.year,..Default::default()}
-                    } })
-            }).collect();
+        let programs = self.contents.presentations.iter().enumerate()
+            .filter(|(i,_)| self.selected[*i] && self.is_extractable(*i))
+            .filter_map(|(i,p)|self.native_program_choice(i,p,None)).collect();
         let catalog = self.contents.presentations.iter()
             .filter_map(|p| p.extract.sacd_header_details.as_deref())
             .flat_map(|details| details.split('·'))

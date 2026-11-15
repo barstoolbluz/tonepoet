@@ -398,6 +398,8 @@ pub enum TuiButton {
     DiscBrowserHint(usize),
     DiscBrowserHiddenToggle,
     DiscBrowserNaming,
+    DiscBrowserNamingLoad,
+    DiscBrowserNamingCustom,
     DiscBrowserOverwrite,
     DiscBrowserExtract,
     DiscBrowserMore,
@@ -578,6 +580,8 @@ impl TuiButton {
             | Self::DiscBrowserHint(_)
             | Self::DiscBrowserHiddenToggle
             | Self::DiscBrowserNaming
+            | Self::DiscBrowserNamingLoad
+            | Self::DiscBrowserNamingCustom
             | Self::DiscBrowserOverwrite
             | Self::DiscBrowserExtract
             | Self::DiscBrowserMore

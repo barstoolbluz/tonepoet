@@ -78,6 +78,38 @@ const FILENAME_TOKENS: &[TokenCategory] = &[
     },
 ];
 
+// The builder and its saved presets are Convert's existing component. Native
+// extraction contributes only the token pills its authored format can supply;
+// Convert's ordinary palette remains exactly as before.
+const NATIVE_COMMON: TokenCategory = TokenCategory {
+    label: "Extraction",
+    tokens: &["TRACKNUMBER", "EXTENSION", "PERFORMER"],
+};
+const NATIVE_SACD: TokenCategory = TokenCategory {label: "SACD", tokens: &["AREA"]};
+const NATIVE_DVDA: TokenCategory = TokenCategory {label: "DVD-Audio", tokens: &["GROUP"]};
+const NATIVE_DVDV: TokenCategory = TokenCategory {
+    label: "DVD-Video", tokens: &["DVDTITLE", "STREAM", "ANGLE"],
+};
+const NATIVE_BLURAY: TokenCategory = TokenCategory {
+    label: "Blu-ray", tokens: &["PLAYLIST", "STREAM", "ANGLE"],
+};
+
+fn format_native_tokens(format: crate::disc::DiscFormat) -> &'static TokenCategory {
+    match format {
+        crate::disc::DiscFormat::Sacd => &NATIVE_SACD,
+        crate::disc::DiscFormat::DvdAudio => &NATIVE_DVDA,
+        crate::disc::DiscFormat::DvdVideo => &NATIVE_DVDV,
+        crate::disc::DiscFormat::BluRay => &NATIVE_BLURAY,
+    }
+}
+
+/// Use the builder's own token palette for inline Tab completion; this keeps
+/// format-specific tokens out of unrelated extraction and Convert contexts.
+pub(crate) fn native_completion_tokens(format: crate::disc::DiscFormat) -> Vec<String> {
+    NATIVE_COMMON.tokens.iter().chain(format_native_tokens(format).tokens.iter())
+        .map(|name|format!("%{name}%")).collect()
+}
+
 const SEPARATORS: &[(&str, &str)] = &[
     (" - ", " - "),
     (" / ", " / "),
@@ -212,14 +244,22 @@ impl TemplateBuilderState {
             saved_templates,
             saved_selected: 0,
             saved_scroll: 0,
+            token_scroll: 0,
+            return_to_extract: None,
+            disc_format: None,
         }
     }
 
-    pub fn token_categories(&self) -> &'static [TokenCategory] {
-        match self.target {
-            TemplateTarget::Folder => FOLDER_TOKENS,
-            TemplateTarget::Filename => FILENAME_TOKENS,
+    pub fn token_categories(&self) -> Vec<&'static TokenCategory> {
+        let mut categories: Vec<_> = match self.target {
+            TemplateTarget::Folder => FOLDER_TOKENS.iter().collect(),
+            TemplateTarget::Filename => FILENAME_TOKENS.iter().collect(),
+        };
+        if let Some(format) = self.disc_format {
+            categories.push(&NATIVE_COMMON);
+            categories.push(format_native_tokens(format));
         }
+        categories
     }
 
     /// Flat list of all tokens across all categories.
@@ -270,26 +310,119 @@ impl TemplateBuilderState {
 // Drawing
 // =========================================================================
 
+/// One visual token row. Wrapping happens between complete pills, so every
+/// palette token remains selectable even in an 80-column terminal.
+struct BuilderTokenRow {
+    heading: Option<&'static str>,
+    pills: Vec<BuilderPill>,
+}
+
+struct BuilderPill {
+    index: usize,
+    label: &'static str,
+    separator: bool,
+}
+
+fn append_builder_pills(
+    rows: &mut Vec<BuilderTokenRow>,
+    labels: impl Iterator<Item = &'static str>,
+    inner_width: u16,
+    index: &mut usize,
+    separator: bool,
+) {
+    let mut pills = Vec::new();
+    let mut x = 2u16;
+    for label in labels {
+        let pill_width = label.chars().count() as u16 + 2;
+        if !pills.is_empty() && x.saturating_add(pill_width + 1) > inner_width {
+            rows.push(BuilderTokenRow { heading: None, pills });
+            pills = Vec::new();
+            x = 2;
+        }
+        pills.push(BuilderPill { index: *index, label, separator });
+        *index += 1;
+        x = x.saturating_add(pill_width + 2);
+    }
+    if !pills.is_empty() {
+        rows.push(BuilderTokenRow { heading: None, pills });
+    }
+}
+
+fn builder_token_rows(state: &TemplateBuilderState, inner_width: u16) -> Vec<BuilderTokenRow> {
+    let mut rows = Vec::new();
+    let mut index = 0;
+    for category in state.token_categories() {
+        rows.push(BuilderTokenRow { heading: Some(category.label), pills: Vec::new() });
+        append_builder_pills(&mut rows, category.tokens.iter().copied(), inner_width, &mut index, false);
+    }
+    rows.push(BuilderTokenRow { heading: Some("Separators"), pills: Vec::new() });
+    append_builder_pills(&mut rows, SEPARATORS.iter().map(|&(label, _)| label),
+        inner_width, &mut index, true);
+    rows
+}
+
+fn builder_saved_rows(state: &TemplateBuilderState) -> u16 {
+    state.saved_templates.len().min(4).max(1) as u16
+}
+
+/// Shared popup geometry for drawing, editor hit testing, and mouse dismissal.
+/// The token region may scroll, but template input, saved presets and footer
+/// always occupy real rows inside this rectangle.
+pub(crate) fn builder_popup(area: Rect, state: &TemplateBuilderState) -> Option<Rect> {
+    let w = (area.width.saturating_mul(80) / 100)
+        .max(60)
+        .min(area.width.saturating_sub(2));
+    if w < 60 || area.height < 14 { return None; }
+    let tokens = builder_token_rows(state, w.saturating_sub(2)).len() as u16;
+    let inner_height = 2 + 1 + builder_saved_rows(state) + 1 + tokens + 1 + 1;
+    let h = (inner_height + 2).min(area.height.saturating_sub(2));
+    if h < 12 { return None; }
+    Some(Rect::new(
+        area.x + area.width.saturating_sub(w) / 2,
+        area.y + area.height.saturating_sub(h) / 2, w, h,
+    ))
+}
+
+pub(crate) fn builder_token_viewport(area: Rect, state: &TemplateBuilderState) -> Option<Rect> {
+    let popup = builder_popup(area, state)?;
+    let inner = Rect::new(popup.x + 1, popup.y + 1,
+        popup.width.saturating_sub(2), popup.height.saturating_sub(2));
+    let top = inner.y + 2 + 1 + builder_saved_rows(state) + 1;
+    // Leave a blank row before the fixed footer so the token palette never
+    // paints over actions when the modal is shorter than its natural height.
+    let bottom = inner.y + inner.height.saturating_sub(2);
+    if top >= bottom { return None; }
+    Some(Rect::new(inner.x, top, inner.width, bottom - top))
+}
+
+pub(crate) fn builder_token_scroll_limit(area: Rect, state: &TemplateBuilderState) -> usize {
+    let Some(viewport) = builder_token_viewport(area, state) else { return 0; };
+    builder_token_rows(state, viewport.width).len()
+        .saturating_sub(viewport.height as usize)
+}
+
+impl TemplateBuilderState {
+    /// Keyboard token navigation exposes the selected pill without altering
+    /// the mouse's token-scroll position on unrelated redraws.
+    pub(crate) fn reveal_grid_cursor(&mut self, area: Rect) {
+        let Some(viewport) = builder_token_viewport(area, self) else { return; };
+        let rows = builder_token_rows(self, viewport.width);
+        let Some(index) = rows.iter().position(|row| row.pills.iter().any(|p| p.index == self.grid_cursor)) else { return; };
+        if index < self.token_scroll {
+            self.token_scroll = index;
+        } else if index >= self.token_scroll + viewport.height as usize {
+            self.token_scroll = index + 1 - viewport.height as usize;
+        }
+    }
+}
+
 pub fn draw_template_builder(
     f: &mut Frame,
     state: &TemplateBuilderState,
     button_map: &mut ButtonRenderMap,
     theme: super::theme::Theme,
 ) {
-    let area = f.size();
-    let w = (area.width * 80 / 100)
-        .max(60)
-        .min(area.width.saturating_sub(2));
-    let categories = state.token_categories();
-    // Calculate height: title(1) + template input(2) + blank(1) + saved section + categories + separators + footer
-    let saved_visible = state.saved_templates.len().min(4).max(1);
-    let category_rows: u16 = categories.iter().map(|_| 2).sum::<u16>(); // label + tokens per category
-    let content_height = 1 + 2 + 1 + 1 + saved_visible as u16 + 1 + category_rows + 2 + 1 + 1;
-    let h = (content_height + 2).min(area.height.saturating_sub(2)); // +2 for top/bottom borders
-    let x = (area.width.saturating_sub(w)) / 2;
-    let y = (area.height.saturating_sub(h)) / 2;
-    let popup = Rect::new(x, y, w, h);
-
+    let Some(popup) = builder_popup(f.size(), state) else { return; };
     f.render_widget(Clear, popup);
 
     let title = match state.target {
@@ -299,275 +432,130 @@ pub fn draw_template_builder(
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.amber))
-        .title(Span::styled(
-            title,
-            Style::default()
-                .fg(theme.amber)
-                .add_modifier(Modifier::BOLD),
-        ));
+        .title(Span::styled(title, Style::default().fg(theme.amber).add_modifier(Modifier::BOLD)));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
+    if inner.width < 40 || inner.height < 10 { return; }
 
-    if inner.width < 40 || inner.height < 10 {
-        return;
-    }
-
-    let mut cy = inner.y;
     let iw = inner.width as usize;
-
-    // ── Template input line ──
+    // Editable input: fixed at the top, even when the token palette scrolls.
     {
         let focused = state.focus == TemplateBuilderFocus::TemplateInput;
-        let label = Span::styled("  Template:  ", theme.muted());
         let input_width = iw.saturating_sub(14);
-        let mut spans = vec![label];
-        let input_style = Style::default()
-            .fg(theme.text_bright)
-            .bg(if focused {
-                theme.input_focused_bg
-            } else {
-                theme.input_unfocused_bg
-            });
+        let input_style = Style::default().fg(theme.text_bright).bg(if focused {
+            theme.input_focused_bg
+        } else { theme.input_unfocused_bg });
+        let mut spans = vec![Span::styled("  Template:  ", theme.muted())];
         spans.extend(super::inline_edit::render_text_input_value_with_style(
-            &state.template_input,
-            input_width,
-            focused,
-            input_style,
-            theme,
-        ));
-        f.render_widget(
-            Paragraph::new(Line::from(spans)),
-            Rect::new(inner.x, cy, inner.width, 1),
-        );
+            &state.template_input, input_width, focused, input_style, theme));
+        f.render_widget(Paragraph::new(Line::from(spans)),
+            Rect::new(inner.x, inner.y, inner.width, 1));
         if focused {
-            f.set_cursor(
-                inner.x
-                    + 13
-                    + super::inline_edit::inline_cursor_col(&state.template_input, input_width),
-                cy,
-            );
+            f.set_cursor(inner.x + 13 + super::inline_edit::inline_cursor_col(
+                &state.template_input, input_width), inner.y);
         }
-        cy += 2;
     }
 
-    // ── Saved templates ──
-    {
-        let header = Line::from(Span::styled(
-            "  ── Saved templates ──",
-            Style::default()
-                .fg(theme.text_dim)
-                .add_modifier(Modifier::BOLD),
-        ));
-        f.render_widget(
-            Paragraph::new(header),
-            Rect::new(inner.x, cy, inner.width, 1),
-        );
-        cy += 1;
-
-        if state.saved_templates.is_empty() {
-            let empty = Line::from(Span::styled(
-                "    (none saved)",
-                Style::default().fg(theme.text_dim),
-            ));
-            f.render_widget(
-                Paragraph::new(empty),
-                Rect::new(inner.x, cy, inner.width, 1),
-            );
-            cy += 1;
-        } else {
-            let max_visible = saved_visible;
-            let start = state.saved_scroll;
-            let end = (start + max_visible).min(state.saved_templates.len());
-            for (vis_idx, idx) in (start..end).enumerate() {
-                let tmpl = &state.saved_templates[idx];
-                let is_selected =
-                    state.focus == TemplateBuilderFocus::SavedList && idx == state.saved_selected;
-                let marker = if is_selected { "  ▸ " } else { "    " };
-                let style = if is_selected {
-                    Style::default().fg(theme.amber)
-                } else {
-                    Style::default().fg(theme.text)
-                };
-                let display: String = if tmpl.len() > iw.saturating_sub(8) {
-                    let trunc: String = tmpl.chars().take(iw.saturating_sub(11)).collect();
-                    format!("{}...", trunc)
-                } else {
-                    tmpl.clone()
-                };
-                let row_y = cy + vis_idx as u16;
-                let line = Line::from(vec![
-                    Span::styled(marker, style),
-                    Span::styled(display, style),
-                ]);
-                f.render_widget(
-                    Paragraph::new(line),
-                    Rect::new(inner.x, row_y, inner.width, 1),
-                );
-                button_map.record_button(
-                    TuiButton::TemplateBuilderSavedItem(idx),
-                    Rect::new(inner.x, row_y, inner.width, 1),
-                );
-            }
-            cy += max_visible as u16;
+    // Saved templates: keep the familiar Convert list and its hit targets.
+    let mut y = inner.y + 2;
+    f.render_widget(Paragraph::new(Line::from(Span::styled(
+        "  ── Saved templates ──",
+        Style::default().fg(theme.text_dim).add_modifier(Modifier::BOLD)))),
+        Rect::new(inner.x, y, inner.width, 1));
+    y += 1;
+    if state.saved_templates.is_empty() {
+        f.render_widget(Paragraph::new(Line::from(Span::styled(
+            "    (none saved)", Style::default().fg(theme.text_dim)))),
+            Rect::new(inner.x, y, inner.width, 1));
+    } else {
+        let start = state.saved_scroll.min(state.saved_templates.len().saturating_sub(1));
+        let end = (start + builder_saved_rows(state) as usize).min(state.saved_templates.len());
+        for (visible_index, index) in (start..end).enumerate() {
+            let selected = state.focus == TemplateBuilderFocus::SavedList && index == state.saved_selected;
+            let marker = if selected { "  ▸ " } else { "    " };
+            let style = Style::default().fg(if selected { theme.amber } else { theme.text });
+            let tmpl = &state.saved_templates[index];
+            let display: String = if tmpl.chars().count() > iw.saturating_sub(8) {
+                format!("{}...", tmpl.chars().take(iw.saturating_sub(11)).collect::<String>())
+            } else { tmpl.clone() };
+            let row_y = y + visible_index as u16;
+            f.render_widget(Paragraph::new(Line::from(vec![Span::styled(marker, style),
+                Span::styled(display, style)])), Rect::new(inner.x, row_y, inner.width, 1));
+            button_map.record_button(TuiButton::TemplateBuilderSavedItem(index),
+                Rect::new(inner.x, row_y, inner.width, 1));
         }
-        cy += 1;
     }
 
-    // ── Token categories ──
-    let mut grid_idx = 0_usize;
-    for cat in categories {
-        // Category header
-        let header = Line::from(Span::styled(
-            format!("  ── {} ──", cat.label),
-            Style::default()
-                .fg(theme.text_dim)
-                .add_modifier(Modifier::BOLD),
-        ));
-        if cy < inner.y + inner.height {
-            f.render_widget(
-                Paragraph::new(header),
-                Rect::new(inner.x, cy, inner.width, 1),
-            );
-        }
-        cy += 1;
-
-        // Token pills
-        if cy < inner.y + inner.height {
-            let mut px = inner.x + 2;
-            for &token in cat.tokens {
-                let label = format!(" {} ", token);
-                let pill_w = label.len() as u16;
-                if px + pill_w + 2 > inner.x + inner.width {
-                    // Would overflow — skip (shouldn't happen on reasonable terminals)
-                    grid_idx += 1;
-                    continue;
-                }
-                let is_highlighted =
-                    state.focus == TemplateBuilderFocus::TokenGrid && grid_idx == state.grid_cursor;
-                let style = if is_highlighted {
-                    Style::default()
-                        .fg(theme.bg)
-                        .bg(theme.amber)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                        .fg(theme.pill_active_fg)
-                        .bg(theme.blue)
-                        .add_modifier(Modifier::BOLD)
-                };
-                let pill = Span::styled(label, style);
-                f.render_widget(
-                    Paragraph::new(Line::from(pill)),
-                    Rect::new(px, cy, pill_w, 1),
-                );
-                button_map.record_button(
-                    TuiButton::TemplateBuilderToken(grid_idx),
-                    Rect::new(px, cy, pill_w, 1),
-                );
-                px += pill_w + 2;
-                grid_idx += 1;
-            }
-        }
-        cy += 1;
-    }
-
-    // ── Separators ──
-    if cy < inner.y + inner.height {
-        let header = Line::from(Span::styled(
-            "  ── Separators ──",
-            Style::default()
-                .fg(theme.text_dim)
-                .add_modifier(Modifier::BOLD),
-        ));
-        f.render_widget(
-            Paragraph::new(header),
-            Rect::new(inner.x, cy, inner.width, 1),
-        );
-        cy += 1;
-    }
-    if cy < inner.y + inner.height {
-        let mut px = inner.x + 2;
-        for &(label, _) in SEPARATORS {
-            let display = format!(" {} ", label);
-            let pill_w = display.len() as u16;
-            if px + pill_w + 2 > inner.x + inner.width {
-                grid_idx += 1;
-                continue;
-            }
-            let is_highlighted =
-                state.focus == TemplateBuilderFocus::TokenGrid && grid_idx == state.grid_cursor;
-            let style = if is_highlighted {
-                Style::default()
-                    .fg(theme.bg)
-                    .bg(theme.amber)
-                    .add_modifier(Modifier::BOLD)
+    // The token grid wraps complete pills into rows. Scroll only this region,
+    // with all actions continuously available in the fixed footer.
+    if let Some(viewport) = builder_token_viewport(f.size(), state) {
+        let rows = builder_token_rows(state, viewport.width);
+        let scroll = state.token_scroll.min(rows.len().saturating_sub(viewport.height as usize));
+        for (visible_row, row) in rows.iter().skip(scroll)
+            .take(viewport.height as usize).enumerate() {
+            let row_y = viewport.y + visible_row as u16;
+            if let Some(heading) = row.heading {
+                f.render_widget(Paragraph::new(Line::from(Span::styled(
+                    format!("  ── {heading} ──"),
+                    Style::default().fg(theme.text_dim).add_modifier(Modifier::BOLD)))),
+                    Rect::new(viewport.x, row_y, viewport.width, 1));
             } else {
-                Style::default()
-                    .fg(theme.pill_active_fg)
-                    .bg(theme.purple)
-                    .add_modifier(Modifier::BOLD)
-            };
-            let pill = Span::styled(display, style);
-            f.render_widget(
-                Paragraph::new(Line::from(pill)),
-                Rect::new(px, cy, pill_w, 1),
-            );
-            button_map.record_button(
-                TuiButton::TemplateBuilderToken(grid_idx),
-                Rect::new(px, cy, pill_w, 1),
-            );
-            px += pill_w + 2;
-            grid_idx += 1;
-        }
-        cy += 1;
-    }
-
-    // ── Footer pills ──
-    cy += 1;
-    if cy < inner.y + inner.height {
-        let pills: &[(&str, TuiButton, Color)] = &[
-            ("apply", TuiButton::TemplateBuilderApply, theme.green),
-            ("save", TuiButton::TemplateBuilderSave, theme.blue),
-            ("clear", TuiButton::TemplateBuilderClear, theme.purple),
-            ("x delete", TuiButton::TemplateBuilderDelete, theme.destructive),
-        ];
-
-        let total_w: u16 = pills
-            .iter()
-            .map(|(l, _, _)| l.len() as u16 + 2)
-            .sum::<u16>()
-            + (pills.len().saturating_sub(1) as u16);
-        let left_pad = inner.width.saturating_sub(total_w) / 2;
-        let mut px = inner.x + left_pad;
-        let mut spans: Vec<Span> = vec![Span::raw(" ".repeat(left_pad as usize))];
-
-        for (i, (label, btn, color)) in pills.iter().enumerate() {
-            if i > 0 {
-                spans.push(Span::raw(" "));
-                px += 1;
+                let mut x = viewport.x + 2;
+                for pill in &row.pills {
+                    let width = pill.label.chars().count() as u16 + 2;
+                    let selected = state.focus == TemplateBuilderFocus::TokenGrid
+                        && pill.index == state.grid_cursor;
+                    let style = if selected {
+                        Style::default().fg(theme.bg).bg(theme.amber).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(theme.pill_active_fg)
+                            .bg(if pill.separator { theme.purple } else { theme.blue })
+                            .add_modifier(Modifier::BOLD)
+                    };
+                    f.render_widget(Paragraph::new(Line::from(Span::styled(
+                        format!(" {} ", pill.label), style))),
+                        Rect::new(x, row_y, width, 1));
+                    button_map.record_button(TuiButton::TemplateBuilderToken(pill.index),
+                        Rect::new(x, row_y, width, 1));
+                    x += width + 2;
+                }
             }
-            let pill_w = label.len() as u16 + 2;
-            let pill = Span::styled(
-                format!(" {} ", label),
-                Style::default()
-                    .fg(theme.pill_active_fg)
-                    .bg(*color)
-                    .add_modifier(Modifier::BOLD),
-            );
-            button_map.record_button(*btn, Rect::new(px, cy, pill_w, 1));
-            spans.push(pill);
-            px += pill_w;
         }
-
-        // Esc close (not a button — just a hint)
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled("Esc close", theme.muted()));
-
-        f.render_widget(
-            Paragraph::new(Line::from(spans)),
-            Rect::new(inner.x, cy, inner.width, 1),
-        );
+        let last = rows.len().saturating_sub(viewport.height as usize);
+        if last > 0 {
+            // Available without another row: the gap above the token area.
+            let hint = format!("  wheel tokens  {} / {}", scroll + 1, last + 1);
+            f.render_widget(Paragraph::new(hint).style(Style::default().fg(theme.text_dim)),
+                Rect::new(inner.x, viewport.y.saturating_sub(1), inner.width, 1));
+        }
     }
+
+    // All four footer controls stay visible and clickable at 80x24, even
+    // when the token palette or saved-template list is long.
+    let footer_y = inner.y + inner.height - 1;
+    let pills: &[(&str, TuiButton, Color)] = &[
+        ("apply", TuiButton::TemplateBuilderApply, theme.green),
+        ("save", TuiButton::TemplateBuilderSave, theme.blue),
+        ("clear", TuiButton::TemplateBuilderClear, theme.purple),
+        ("x delete", TuiButton::TemplateBuilderDelete, theme.destructive),
+    ];
+    let total_w: u16 = pills.iter().map(|(l, _, _)| l.len() as u16 + 2).sum::<u16>()
+        + (pills.len().saturating_sub(1) as u16);
+    let left_pad = inner.width.saturating_sub(total_w) / 2;
+    let mut x = inner.x + left_pad;
+    let mut spans = vec![Span::raw(" ".repeat(left_pad as usize))];
+    for (index, (label, button, color)) in pills.iter().enumerate() {
+        if index > 0 { spans.push(Span::raw(" ")); x += 1; }
+        let width = label.len() as u16 + 2;
+        spans.push(Span::styled(format!(" {} ", label), Style::default()
+            .fg(theme.pill_active_fg).bg(*color).add_modifier(Modifier::BOLD)));
+        button_map.record_button(*button, Rect::new(x, footer_y, width, 1));
+        x += width;
+    }
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled("Esc close", theme.muted()));
+    f.render_widget(Paragraph::new(Line::from(spans)),
+        Rect::new(inner.x, footer_y, inner.width, 1));
 }
 
 // =========================================================================
@@ -793,5 +781,86 @@ mod tests {
             })
             .count();
         assert_eq!(selected_cells, 3);
+    }
+
+    #[test]
+    fn r28_shared_builder_keeps_footer_and_all_tokens_mouse_reachable_at_standard_sizes() {
+        use std::collections::HashSet;
+        let theme = crate::tui::theme::theme_by_slug_or_default("tokyo-night");
+        for (width, height) in [(80,24),(100,30),(160,40)] {
+            for saved in [0,4] {
+                // Both the extraction extension and the unchanged ordinary
+                // Convert palette use the same viewport and button map.
+                for native in [false,true] {
+                    let mut state = TemplateBuilderState::new(TemplateTarget::Filename,
+                        "%TRACKNN% - %TITLE%",TemplateBuilderFocus::TemplateInput);
+                    state.saved_templates = (0..saved).map(|n|format!("%ARTIST% - {n}")).collect();
+                    state.disc_format = native.then_some(crate::disc::DiscFormat::Sacd);
+                    let area = Rect::new(0,0,width,height);
+                    let popup = builder_popup(area,&state).expect("popup should fit");
+                    let viewport = builder_token_viewport(area,&state).expect("token viewport");
+                    let last_scroll=builder_token_scroll_limit(area,&state);
+                    let mut seen=HashSet::new();
+                    let mut terminal=Terminal::new(TestBackend::new(width,height)).unwrap();
+                    for scroll in 0..=last_scroll {
+                        state.token_scroll=scroll;
+                        let mut buttons=ButtonRenderMap::new();
+                        terminal.draw(|f|draw_template_builder(f,&state,&mut buttons,theme)).unwrap();
+                        for (button,letter) in [
+                            (TuiButton::TemplateBuilderApply,"a"),
+                            (TuiButton::TemplateBuilderSave,"s"),
+                            (TuiButton::TemplateBuilderClear,"c"),
+                            (TuiButton::TemplateBuilderDelete,"x"),
+                        ] {
+                            let rect=buttons.button_rect(button).expect("fixed footer action");
+                            assert_eq!(rect.y,popup.y+popup.height-2,
+                                "{width}x{height}, native={native}, saved={saved}");
+                            assert_eq!(terminal.backend().buffer().get(rect.x+1,rect.y).symbol(),letter);
+                            assert_eq!(buttons.find_button_at(rect.x+1,rect.y),Some(button));
+                        }
+                        for index in 0..state.total_grid_items() {
+                            let target=TuiButton::TemplateBuilderToken(index);
+                            if let Some(rect)=buttons.button_rect(target) {
+                                assert!(rect.y>=viewport.y && rect.y<viewport.y+viewport.height,
+                                    "token hitbox clipped by footer or modal frame");
+                                assert_eq!(buttons.find_button_at(rect.x+1,rect.y),Some(target));
+                                seen.insert(index);
+                            }
+                        }
+                    }
+                    assert_eq!(seen.len(),state.total_grid_items(),
+                        "all Convert and native tokens must be reachable by mouse at {width}x{height}, saved={saved}, native={native}");
+                    // Clicking a visible native item uses the original
+                    // index-to-token insertion path, not a second map.
+                    if native {
+                        let index=state.token_categories().iter().map(|c|c.tokens.len()).sum::<usize>()-1;
+                        state.grid_cursor=index;
+                        state.template_input=TextInputState::empty();
+                        state.insert_current_grid_item();
+                        assert_eq!(state.template_input.text,"%AREA%");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_builder_shows_only_relevant_disc_tokens() {
+        let mut builder = TemplateBuilderState::new(TemplateTarget::Filename,
+            "%TRACKNN% - %TITLE%",TemplateBuilderFocus::TemplateInput);
+        let convert_count = builder.total_grid_items();
+        assert!(builder.token_categories().iter().all(|category|
+            category.label != "Extraction"));
+        builder.disc_format = Some(crate::disc::DiscFormat::Sacd);
+        let sacd = builder.token_categories().into_iter().flat_map(|c|c.tokens.iter().copied())
+            .collect::<Vec<_>>();
+        assert!(sacd.contains(&"AREA") && sacd.contains(&"TRACKNUMBER"));
+        assert!(!sacd.contains(&"DVDTITLE") && !sacd.contains(&"PLAYLIST"));
+        assert!(builder.total_grid_items() > convert_count);
+        builder.disc_format = Some(crate::disc::DiscFormat::DvdVideo);
+        let dvd = builder.token_categories().into_iter().flat_map(|c|c.tokens.iter().copied())
+            .collect::<Vec<_>>();
+        assert!(dvd.contains(&"DVDTITLE") && dvd.contains(&"ANGLE"));
+        assert!(!dvd.contains(&"AREA") && !dvd.contains(&"PLAYLIST"));
     }
 }

@@ -1803,7 +1803,31 @@ pub fn apply_template_variable_completion(input: &mut TextInputState) -> bool {
     true
 }
 
+/// The same completion algorithm as Convert, extended with tokens supplied by
+/// the caller's source format. Convert's existing vocabulary stays unchanged.
+pub fn apply_template_variable_completion_with(
+    input: &mut TextInputState,
+    additional_variables: &[&str],
+) -> bool {
+    let variables = TEMPLATE_VARIABLES.iter().copied()
+        .chain(additional_variables.iter().copied());
+    if let Some((text, cursor)) = complete_template_variable_text_from(
+        &input.text, input.cursor, variables,
+    ) {
+        input.set_text_and_cursor(text, cursor);
+    }
+    true
+}
+
 fn complete_template_variable_text(text: &str, cursor: usize) -> Option<(String, usize)> {
+    complete_template_variable_text_from(text, cursor, TEMPLATE_VARIABLES.iter().copied())
+}
+
+fn complete_template_variable_text_from<'a>(
+    text: &str,
+    cursor: usize,
+    variables: impl Iterator<Item = &'a str>,
+) -> Option<(String, usize)> {
     if cursor > text.len() || !text.is_char_boundary(cursor) {
         return None;
     }
@@ -1814,9 +1838,7 @@ fn complete_template_variable_text(text: &str, cursor: usize) -> Option<(String,
         return None;
     }
     let wanted = partial.to_ascii_uppercase();
-    let mut matches: Vec<&str> = TEMPLATE_VARIABLES
-        .iter()
-        .copied()
+    let mut matches: Vec<&str> = variables
         .filter(|v| v.trim_matches('%').starts_with(&wanted))
         .collect();
     matches.sort_unstable();
@@ -2500,6 +2522,20 @@ mod tests {
         let mut s = TextInputState::new("%AL".to_string());
         assert!(apply_tab_completion(&mut s, CompletionMode::TemplateVariable));
         assert_eq!(s.text, "%ALBUM");
+    }
+
+    #[test]
+    fn native_completion_adds_only_caller_supplied_disc_tokens() {
+        let mut dvd = TextInputState::new("Disc/%DVDT".to_owned());
+        assert!(apply_template_variable_completion_with(&mut dvd,
+            &["%DVDTITLE%", "%STREAM%", "%ANGLE%"]));
+        assert_eq!(dvd.text, "Disc/%DVDTITLE%");
+        let mut sacd = TextInputState::new("Disc/%DVDT".to_owned());
+        assert!(apply_template_variable_completion_with(&mut sacd, &["%AREA%"]));
+        assert_eq!(sacd.text, "Disc/%DVDT", "DVD-Video tokens must not leak into SACD");
+        let mut common = TextInputState::new("%ART".to_owned());
+        apply_template_variable_completion_with(&mut common, &["%AREA%"]);
+        assert_eq!(common.text, "%ARTIST%", "existing Convert variables are retained");
     }
 
     #[test]

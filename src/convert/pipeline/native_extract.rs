@@ -7,7 +7,7 @@
 //! or the configured scratch directory; cross-volume publication copies through
 //! a cleaned-up temporary file at the final target before atomic rename.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -135,7 +135,7 @@ pub struct NativeExtractionJob {
     pub tag_artwork: bool,
 }
 fn default_tag_fields() -> u16 { 0x7f }
-fn default_naming_template() -> String { "{track} - {title}".into() }
+fn default_naming_template() -> String { "%TRACKNUMBER% - %TITLE%".into() }
 fn default_yes() -> bool { true }
 fn default_overwrite_policy() -> NativeOverwritePolicy { NativeOverwritePolicy::Fail }
 
@@ -634,7 +634,7 @@ async fn execute_inner(
             let dest = proposed_destination(&job, program, requested);
             controls.set_attempted_output(if job.file_per_program { grouped_target.clone() } else { dest.clone() });
             if !job.file_per_program {
-                if !reserved_names.insert(dest.clone()) {
+                if !reserved_names.insert(native_destination_collision_key(&dest)) {
                     return Err(format!("Two selected items would publish to '{}'; choose different names", dest.display()));
                 }
                 if job.overwrite_policy == NativeOverwritePolicy::Skip && fs::symlink_metadata(&dest).is_ok() {
@@ -1263,13 +1263,22 @@ fn publish_finished_file_checked_observed(
 
 pub(crate) fn proposed_destination_for_program(job: &NativeExtractionJob, program: &NativeProgramChoice) -> PathBuf {
     let virtual_track = NativeTrackChoice { duration_secs: None, number: 0, name: program.label.clone(), tags: NativeTagValues::default(), estimated_bytes: None };
-    let mut stem = if job.naming_template == default_naming_template() {
+    let legacy = legacy_naming_template(&job.naming_template);
+    // Already-queued/recoverable jobs still store the pre-R27 default. Their
+    // continuous output must retain its existing name across an upgrade.
+    let mut stem = if job.naming_template == default_naming_template()
+        || job.naming_template == "{track} - {title}" {
         sanitize_component(&program.label)
-    } else { render_naming_template(&job.naming_template, program, &virtual_track) };
-    if !job.program_subfolders { stem = sanitize_component(&format!("{} - {stem}",program.label)); }
+    } else { render_naming_template_for_extension(&job.naming_template, program, &virtual_track,
+        extraction_extension(job, program), &job.disc_identity) };
+    if !job.program_subfolders {
+        stem = if legacy {sanitize_component(&format!("{} - {stem}",program.label))}
+            else {prefix_flat_native_name(&program.label,stem)};
+    }
     let parent = if job.program_subfolders { job.destination.join(sanitize_component(&program.label)) }
         else { job.destination.clone() };
-    parent.join(format!("{}.{}", stem, extraction_extension(job, program)))
+    if legacy {parent.join(format!("{stem}.{}",extraction_extension(job,program)))}
+    else {parent.join(with_native_extension(stem, extraction_extension(job, program)))}
 }
 
 /// CUE indexes have 1/75-second resolution. Round *only the CUE index* to
@@ -1450,7 +1459,20 @@ fn name_value(token: &str, program: &NativeProgramChoice, track: &NativeTrackCho
     }
 }
 
-fn render_naming_template(template: &str, program: &NativeProgramChoice, track: &NativeTrackChoice) -> String {
+/// Serialized pre-round-3 jobs can still be running or resuming. Keep their
+/// brace templates on the old resolver; newly entered templates use Convert's
+/// percent-token spelling and treat braces as ordinary filename characters.
+fn legacy_naming_template(template: &str) -> bool {
+    // A literal percentage in an old saved pattern ("100% - {track}") is
+    // not a new-style token. Only a delimited token switches the resolver.
+    let has_percent_token = template.split('%').skip(1).step_by(2).any(|part|
+        !part.is_empty() && part.chars().all(|c|c.is_ascii_alphanumeric() || c=='_'));
+    !has_percent_token && ["track", "chapter", "title", "stream", "area", "group",
+        "playlist", "album", "artist", "albumartist", "performer", "genre", "year",
+        "date", "composer", "disc"].iter().any(|token| template.contains(&format!("{{{token}}}")))
+}
+
+fn render_legacy_naming_template(template: &str, program: &NativeProgramChoice, track: &NativeTrackChoice) -> String {
     let mut result = String::new();
     let mut chars = template.chars().peekable();
     while let Some(c) = chars.next() {
@@ -1467,14 +1489,180 @@ fn render_naming_template(template: &str, program: &NativeProgramChoice, track: 
     sanitize_component(&result)
 }
 
+/// Convert's filename tokens plus native disc identities. Missing evidence
+/// yields an empty value, not an invented tag. The suffix is an explicit token
+/// only when the user requests it; otherwise the publisher appends it once.
+fn native_naming_value(token: &str, program: &NativeProgramChoice,
+    track: &NativeTrackChoice, extension: &str, identity: &NativeDiscIdentity,
+    album: &str, title_extra: &str) -> Option<String> {
+    let id = program.id;
+    let number = track.number;
+    let value = match token {
+        "TRACKNUMBER" | "TRACKNN" | "NN" => format!("{number:02}"),
+        "TRACKN" | "TRACK" | "N" => number.to_string(),
+        "NNN" => format!("{number:03}"),
+        "TITLE" => name_value("title",program,track),
+        "ARTIST" => track.tags.artist.clone().or_else(||program.tags.artist.clone())
+            .or_else(||identity.artist.clone()).unwrap_or_default(),
+        "ALBUM_ARTIST" => program.tags.artist.clone().or_else(||identity.artist.clone()).unwrap_or_default(),
+        "ALBUM" => album.to_owned(),
+        "COMPOSER" => name_value("composer",program,track),
+        "PERFORMER" => name_value("performer",program,track),
+        "YEAR" | "DATE" => name_value("year",program,track),
+        "GENRE" => name_value("genre",program,track),
+        "AREA" => name_value("area",program,track),
+        "GROUP" => name_value("group",program,track),
+        "DVDTITLE" => id.dvd_video_parts().map(|(_,title,_)|title.to_string()).unwrap_or_default(),
+        "PLAYLIST" => name_value("playlist",program,track),
+        "STREAM" => match id {
+            PresentationId::DvdVideoTitle {audio_stream_index,..} => (u16::from(audio_stream_index)+1).to_string(),
+            PresentationId::BluRayTitle {audio_stream_index,..} => (u16::from(audio_stream_index)+1).to_string(),
+            _ => program.label.clone(),
+        },
+        "ANGLE" => program.angle.to_string(),
+        "EXTENSION" | "EXT" => extension.to_string(),
+        "FORMAT" => extension.to_ascii_uppercase(),
+        "SAMPLERATE" => program.source_rate.map(|rate|rate.to_string()).unwrap_or_default(),
+        "BITDEPTH" => program.source_depth.map(|depth|depth.to_string()).unwrap_or_default(),
+        "CATALOG" => identity.catalog.clone().unwrap_or_default(),
+        "TITLE_EXTRA" => title_extra.to_owned(),
+        // Convert's back-compatible %DISC% defaults to disc 1 for an ordinary
+        // single-disc album. Native tags carry no separate disc-number field.
+        "DISC" => "1".into(),
+        "ISRC" | "LABEL" | "COUNTRY" | "PRESSING"
+            | "DISCNUMBER" | "TRACKTOTAL" => String::new(),
+        _ => return None,
+    };
+    Some(value)
+}
+
+/// The same vocabulary drives the amber invalid-token indicator in the form.
+/// Do not make a second allowlist in the renderer or its event handler.
+pub(crate) fn unknown_native_naming_token(template: &str) -> Option<String> {
+    if legacy_naming_template(template) { return None; }
+    let mut rest = template;
+    while let Some(start) = rest.find('%') {
+        rest = &rest[start+1..];
+        let Some(end) = rest.find('%') else { return Some("unclosed % token".into()); };
+        let token = &rest[..end];
+        if !is_native_naming_token(token) {return Some(format!("%{token}%"));}
+        rest = &rest[end+1..];
+    }
+    None
+}
+
+fn is_native_naming_token(token: &str) -> bool {
+    matches!(token, "TRACKNUMBER" | "TRACKNN" | "TRACKN" | "TRACK" | "N" | "NN" | "NNN"
+        | "TITLE" | "ARTIST" | "ALBUM_ARTIST" | "ALBUM" | "COMPOSER" | "PERFORMER"
+        | "YEAR" | "DATE" | "GENRE" | "AREA" | "GROUP" | "DVDTITLE" | "PLAYLIST"
+        | "STREAM" | "ANGLE" | "EXTENSION" | "EXT" | "FORMAT" | "SAMPLERATE"
+        | "BITDEPTH" | "TITLE_EXTRA" | "ISRC" | "LABEL" | "COUNTRY" | "PRESSING"
+        | "CATALOG" | "DISC" | "DISCNUMBER" | "TRACKTOTAL")
+}
+
+/// Split only *literal* template slashes into directories. Slashes inside tag
+/// values are sanitized by component, so a malicious disc title cannot create
+/// another level or escape the selected destination. Recovery and preview both
+/// call the same output-path functions below.
+fn render_naming_template_for_extension(template: &str, program: &NativeProgramChoice,
+    track: &NativeTrackChoice, extension: &str, identity: &NativeDiscIdentity) -> String {
+    if legacy_naming_template(template) {
+        return render_legacy_naming_template(template,program,track);
+    }
+
+    // Convert derives TITLE_EXTRA from a release qualifier in ALBUM and
+    // removes that qualifier from ALBUM only if the template references it.
+    let raw_album = track.tags.album.as_deref().or(program.tags.album.as_deref())
+        .or(identity.title.as_deref()).unwrap_or_default();
+    let (album, title_extra) = if template.contains("%TITLE_EXTRA%") {
+        match super::stages::extract_title_extra(raw_album) {
+            Some((clean, extra)) => {
+                let strip_resolution = template.contains("%BITDEPTH%")
+                    || template.contains("%SAMPLERATE%");
+                (clean, super::stages::normalize_title_extra_value(&extra, true, strip_resolution))
+            }
+            None => (raw_album.to_owned(), String::new()),
+        }
+    } else { (raw_album.to_owned(), String::new()) };
+
+    // Run Convert's existing conditional-block pass on the *template*, not
+    // on substituted metadata: literal braces inside a track/album title are
+    // data, never control syntax. The renderer still sanitizes each value
+    // before it is joined to the user's chosen destination.
+    let mut tokens = BTreeMap::new();
+    for token in template.split('%').skip(1).step_by(2) {
+        if token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            let value = native_naming_value(token,program,track,extension,identity,&album,&title_extra)
+                .unwrap_or_default();
+            // Keep Convert's metadata naming rules for shared presets. Empty
+            // values stay empty so the existing conditional pass can drop
+            // missing qualifiers rather than rendering "untitled".
+            tokens.insert(token.to_owned(), if value.trim().is_empty() {
+                String::new()
+            } else if token == "TITLE_EXTRA" {
+                super::stages::sanitize_title_extra_component(&value)
+            } else {
+                super::stages::sanitize_component(&value)
+            });
+        }
+    }
+    let conditional = super::stages::render_conditional_template_blocks(
+        template, &tokens, None, &BTreeMap::new());
+    conditional.split('/').filter(|part|!part.is_empty()).map(|part| {
+        let mut output = String::new();
+        let mut rest = part;
+        while let Some(start) = rest.find('%') {
+            output.push_str(&rest[..start]);
+            rest = &rest[start+1..];
+            let Some(end) = rest.find('%') else {
+                output.push('%'); output.push_str(rest); rest=""; break;
+            };
+            // Use the same normalized value as the conditional pass; only
+            // literal template separators may create subfolders.
+            if let Some(value) = tokens.get(&rest[..end]) {
+                output.push_str(value);
+            }
+            rest = &rest[end+1..];
+        }
+        output.push_str(rest);
+        sanitize_component(&output)
+    }).collect::<Vec<_>>().join("/")
+}
+
+fn with_native_extension(stem: String, extension: &str) -> String {
+    if stem.to_ascii_lowercase().ends_with(&format!(".{extension}")) {stem}
+    else {format!("{stem}.{extension}")}
+}
+
+fn prefix_flat_native_name(program_label: &str, stem: String) -> String {
+    let prefix = sanitize_component(program_label);
+    // Prefix the actual filename, not the first template subdirectory. This
+    // retains the per-program distinction without changing the requested
+    // %ARTIST%/… directory hierarchy when implicit program folders are off.
+    match stem.rsplit_once('/') {
+        Some((folder, filename)) => format!("{folder}/{prefix} - {filename}"),
+        None => format!("{prefix} - {stem}"),
+    }
+}
+
+#[cfg(test)]
+fn render_naming_template(template: &str, program: &NativeProgramChoice, track: &NativeTrackChoice) -> String {
+    render_naming_template_for_extension(template,program,track,"dsf",&NativeDiscIdentity::default())
+}
+
 pub(crate) fn proposed_destination(job: &NativeExtractionJob, program: &NativeProgramChoice, track: &NativeTrackChoice) -> PathBuf {
-    let mut stem = render_naming_template(&job.naming_template, program, track);
+    let extension = extraction_extension(job, program);
+    let legacy = legacy_naming_template(&job.naming_template);
+    let mut stem = render_naming_template_for_extension(&job.naming_template, program, track,
+        extension, &job.disc_identity);
     if !job.program_subfolders {
         // The default can be reused across unrelated authored streams. Prefix
         // the stream identity when flattening, without guessing unique names.
-        stem = sanitize_component(&format!("{} - {stem}", program.label));
+        stem = if legacy {sanitize_component(&format!("{} - {stem}",program.label))}
+            else {prefix_flat_native_name(&program.label,stem)};
     }
-    let file_name = format!("{stem}.{}", extraction_extension(job, program));
+    let file_name = if legacy {format!("{stem}.{extension}")}
+        else {with_native_extension(stem, extension)};
     let parent = if job.program_subfolders { job.destination.join(sanitize_component(&program.label)) }
         else { job.destination.clone() };
     parent.join(file_name)
@@ -1530,7 +1718,9 @@ pub(crate) fn validate_job(job: &NativeExtractionJob) -> Result<(), String> {
     }
     if job.extraction_log {
         let path = job.destination.join(EXTRACTION_LOG_FILE);
-        if !planned.insert(path.clone()) { return Err("Extraction log conflicts with media name".into()); }
+        if !planned.insert(native_destination_collision_key(&path)) {
+            return Err("Extraction log conflicts with media name".into());
+        }
         if job.overwrite_policy != NativeOverwritePolicy::Replace && fs::symlink_metadata(&path).is_ok() {
             return Err(format!("Extraction log already exists: '{}'; choose Replace or disable logging", path.display()));
         }
@@ -1538,8 +1728,16 @@ pub(crate) fn validate_job(job: &NativeExtractionJob) -> Result<(), String> {
     Ok(())
 }
 
-fn inspect_publication_target(job: &NativeExtractionJob, planned: &mut HashSet<PathBuf>, dest: PathBuf) -> Result<(), String> {
-    if !planned.insert(dest.clone()) {
+/// A conservative key for all planned native publications. Case-insensitive
+/// filesystems treat differently capitalized components as one file, even when
+/// the host's default filesystem is case-sensitive. Keep the display/published
+/// PathBuf unchanged; only the reserved namespace uses this key.
+pub(crate) fn native_destination_collision_key(path: &Path) -> String {
+    path.to_string_lossy().to_lowercase()
+}
+
+fn inspect_publication_target(job: &NativeExtractionJob, planned: &mut HashSet<String>, dest: PathBuf) -> Result<(), String> {
+    if !planned.insert(native_destination_collision_key(&dest)) {
         return Err(format!("Two selected artifacts would publish to '{}'; choose different names",dest.display()));
     }
     match fs::symlink_metadata(&dest) {
@@ -2478,6 +2676,261 @@ mod tests {
         assert_eq!(chosen.len(), 1);
         assert_eq!(chosen[0].0, lofty::tag::ItemKey::Composer);
         assert!(selected_tag_items(&values, 1 << 3).is_empty());
+    }
+
+    #[test]
+    fn r27_convert_tokens_resolve_subfolders_and_exactly_one_extension() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut job = fixture_job(&temp.path().join("output"), temp.path());
+        job.programs[0].tracks[0].number = 3;
+        job.programs[0].tracks[0].name = "A Song".into();
+        job.programs[0].tags.artist = Some("A Performer".into());
+        job.naming_template = "%ARTIST%/%TRACKNUMBER% - %TITLE%.%EXTENSION%".into();
+        assert_eq!(
+            proposed_destination(&job, &job.programs[0], &job.programs[0].tracks[0]),
+            job.destination.join("Stereo/A Performer/03 - A Song.dsf")
+        );
+        assert_eq!(unknown_native_naming_token(&job.naming_template), None);
+
+        job.naming_template = "%TRACKNN% - %TITLE%".into();
+        assert_eq!(
+            proposed_destination(&job, &job.programs[0], &job.programs[0].tracks[0]),
+            job.destination.join("Stereo/03 - A Song.dsf"),
+            "Convert's numbering tokens must use the same spelling in Extract"
+        );
+        assert_eq!(unknown_native_naming_token("%UNRECOGNIZED%"),
+            Some("%UNRECOGNIZED%".into()));
+        assert_eq!(unknown_native_naming_token("%TITLE"),
+            Some("unclosed % token".into()));
+
+        job.disc_identity.catalog = Some("SACD-123".into());
+        job.disc_identity.title = Some("Recorded Album".into());
+        job.naming_template = "%CATALOG%/%ALBUM%/%TRACKNUMBER% - %TITLE%".into();
+        assert_eq!(proposed_destination(&job,&job.programs[0],&job.programs[0].tracks[0]),
+            job.destination.join("Stereo/SACD-123/Recorded Album/03 - A Song.dsf"));
+    }
+
+    #[test]
+    fn r28_convert_preset_disc_number_and_conditional_title_extra_match_convert() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut job = fixture_job(&temp.path().join("output"), temp.path());
+        let track = job.programs[0].tracks.first_mut().unwrap();
+        track.name = "First Song".into();
+        track.tags.album = Some("Plain Album".into());
+        job.naming_template = "%DISC%/%TRACKNN% - %TITLE%".into();
+        assert_eq!(proposed_destination(&job,&job.programs[0],&job.programs[0].tracks[0]),
+            job.destination.join("Stereo/1/01 - First Song.dsf"),
+            "Convert's %DISC% defaults to the first disc when no disc tag is available");
+
+        // Convert omits an entire unresolved conditional block, including its
+        // brace punctuation. A missing TITLE_EXTRA must not become Untitled.
+        job.naming_template = "%ALBUM% {%TITLE_EXTRA%}/%TRACKNN% - %TITLE%".into();
+        assert_eq!(proposed_destination(&job,&job.programs[0],&job.programs[0].tracks[0]),
+            job.destination.join("Stereo/Plain Album/01 - First Song.dsf"));
+
+        // The same Convert qualifier extractor supplies a populated block;
+        // ordinary metadata blocks retain their literal braces when present.
+        job.programs[0].tracks[0].tags.album = Some("Plain Album (Japan SHM-CD)".into());
+        assert_eq!(proposed_destination(&job,&job.programs[0],&job.programs[0].tracks[0]),
+            job.destination.join("Stereo/Plain Album {Japan SHM-CD}/01 - First Song.dsf"));
+
+        // Braces originating *inside* metadata are literal data, never
+        // interpreted as a conditional, even when the template has one.
+        job.programs[0].tracks[0].tags.album = Some("Plain {Live} Album".into());
+        job.naming_template = "%ALBUM% {%TITLE_EXTRA%}/%TRACKNN% - %TITLE%".into();
+        assert_eq!(proposed_destination(&job,&job.programs[0],&job.programs[0].tracks[0]),
+            job.destination.join("Stereo/Plain {Live} Album/01 - First Song.dsf"));
+
+        job.naming_template = "%DISC%/%ALBUM%/%TRACKNN% - %TITLE%.%EXTENSION%".into();
+        assert_eq!(proposed_destination(&job,&job.programs[0],&job.programs[0].tracks[0]),
+            job.destination.join("Stereo/1/Plain {Live} Album/01 - First Song.dsf"),
+            "literal subfolders and the explicit extension must resolve exactly once");
+        // A metadata path separator is never promoted into a template slash.
+        job.programs[0].tracks[0].tags.album = Some("../AC/DC".into());
+        let path = proposed_destination(&job,&job.programs[0],&job.programs[0].tracks[0]);
+        assert!(path.starts_with(&job.destination));
+        assert_eq!(path, job.destination.join("Stereo/1/AC DC/01 - First Song.dsf"));
+    }
+
+    #[test]
+    fn r29_d05_convert_saved_preset_uses_convert_metadata_normalization() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut job = fixture_job(&temp.path().join("output"), temp.path());
+        let template = "%ARTIST%/%ALBUM% {%TITLE_EXTRA%}/%TRACKNN% - %TITLE%.%EXTENSION%";
+        job.naming_template = template.into();
+        job.programs[0].tags.artist = Some("AC/DC".into());
+        let track = &mut job.programs[0].tracks[0];
+        track.tags.album = Some("Aja (Japan / SHM SACD ISO)".into());
+        track.tags.title = Some("First Song".into());
+
+        let path = proposed_destination(&job, &job.programs[0], &job.programs[0].tracks[0]);
+        let expected_relative = Path::new("AC DC/Aja {Japan  SHM SACD}/01 - First Song.dsf");
+        assert_eq!(path, job.destination.join("Stereo").join(expected_relative));
+        assert!(path.starts_with(&job.destination), "metadata must stay below the output root");
+        assert!(!path.to_string_lossy().ends_with(".dsf.dsf"));
+
+        // Compare the same saved template through Convert's renderer, with
+        // Convert's token values. The production Convert track renderer uses
+        // these very sanitizers for artist, album, title and TITLE_EXTRA.
+        let (album, qualifier) = super::super::stages::extract_title_extra(
+            "Aja (Japan / SHM SACD ISO)").unwrap();
+        let qualifier = super::super::stages::normalize_title_extra_value(&qualifier, true, false);
+        let convert_tokens = BTreeMap::from([
+            ("ARTIST".to_owned(), super::super::stages::sanitize_component("AC/DC")),
+            ("ALBUM".to_owned(), super::super::stages::sanitize_component(&album)),
+            ("TITLE_EXTRA".to_owned(), super::super::stages::sanitize_title_extra_component(&qualifier)),
+            ("TRACKNN".to_owned(), "01".into()),
+            ("TITLE".to_owned(), super::super::stages::sanitize_component("First Song")),
+            ("EXTENSION".to_owned(), "dsf".into()),
+        ]);
+        let convert_rendered = super::super::stages::conversion_action_render_template(
+            template, &convert_tokens).unwrap();
+        assert_eq!(expected_relative, Path::new(&convert_rendered));
+        assert_eq!(path.strip_prefix(job.destination.join("Stereo")).unwrap(),
+            Path::new(&convert_rendered));
+    }
+
+    #[test]
+    fn r29_d05_metadata_slashes_do_not_create_folders_or_change_legacy_jobs() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut job = fixture_job(&temp.path().join("output"), temp.path());
+        job.programs[0].tags.artist = Some("AC/DC".into());
+        job.programs[0].tracks[0].tags.title = Some("Song/Part".into());
+        job.programs[0].tracks[0].tags.album = Some("Aja / Japan".into());
+        job.naming_template = "%ARTIST%/%ALBUM%/%TRACKNN% - %TITLE%.%EXTENSION%".into();
+        assert_eq!(proposed_destination(&job, &job.programs[0], &job.programs[0].tracks[0]),
+            job.destination.join("Stereo/AC DC/Aja Japan/01 - Song Part.dsf"),
+            "only literal slashes in the template may introduce subfolders");
+        assert!(validate_job(&job).is_ok());
+
+        // Names that differ before normalization but resolve to one path
+        // must still fail the existing preflight, regardless of case policy.
+        job.naming_template = "%TITLE%.%EXTENSION%".into();
+        let mut second = job.programs[0].tracks[0].clone();
+        second.number = 2;
+        second.tags.title = Some("Song Part".into());
+        job.programs[0].tracks.push(second);
+        for policy in [NativeOverwritePolicy::Fail, NativeOverwritePolicy::Skip,
+            NativeOverwritePolicy::Replace] {
+            job.overwrite_policy = policy;
+            assert!(validate_job(&job).unwrap_err().contains("Two selected artifacts"),
+                "normalized collision must be rejected under {policy:?}");
+        }
+
+        // Existing recoverable {track} patterns retain native underscores.
+        job.programs[0].tracks.truncate(1);
+        job.programs[0].tracks[0].tags.title = Some("First Song".into());
+        job.naming_template = "{artist} - {track} - {title}".into();
+        assert_eq!(proposed_destination(&job, &job.programs[0], &job.programs[0].tracks[0]),
+            job.destination.join("Stereo/AC_DC - 01 - First Song.dsf"));
+    }
+
+    #[test]
+    fn r28_case_insensitive_collision_preflight_rejects_all_policies_and_preserves_unique_outputs() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut job = fixture_job(&temp.path().join("output"), temp.path());
+        job.naming_template = "%TITLE%.%EXTENSION%".into();
+        job.programs[0].tracks[0].tags.title = Some("Song".into());
+        let mut second = job.programs[0].tracks[0].clone();
+        second.number = 2;
+        second.tags.title = Some("song".into());
+        job.programs[0].tracks.push(second);
+        let a = proposed_destination(&job,&job.programs[0],&job.programs[0].tracks[0]);
+        let b = proposed_destination(&job,&job.programs[0],&job.programs[0].tracks[1]);
+        assert_ne!(a,b,"display names retain their original spelling");
+        assert_eq!(native_destination_collision_key(&a),native_destination_collision_key(&b));
+        for policy in [NativeOverwritePolicy::Fail, NativeOverwritePolicy::Skip, NativeOverwritePolicy::Replace] {
+            job.overwrite_policy = policy;
+            assert!(validate_job(&job).unwrap_err().contains("Two selected artifacts"),
+                "case-only collision under {policy:?} must be rejected before work");
+        }
+        job.naming_template = "%TRACKNUMBER% - %TITLE%.%EXTENSION%".into();
+        assert!(validate_job(&job).is_ok(),"numbering distinguishes the two outputs");
+        job.naming_template = "%TITLE%.%EXTENSION%".into();
+        job.programs[0].tracks[1].tags.title = Some("Different Song".into());
+        assert!(validate_job(&job).is_ok(),"genuinely distinct titles must be admitted");
+
+        job.programs[0].tracks.truncate(1);
+        let mut other = job.programs[0].clone();
+        other.label = "Surround".into();
+        other.tracks[0].tags.title = Some("Song".into());
+        job.programs.push(other);
+        assert!(validate_job(&job).is_ok(),"distinct program subfolders distinguish outputs");
+        job.programs[1].label = "stereo".into();
+        assert!(validate_job(&job).is_err(),"case-only program-folder names collide");
+
+        // Continuous files and their optional CUE artifacts go through the
+        // same planned-publication namespace, not the track-only guard.
+        job.file_per_program = true;
+        job.naming_template = "%TITLE%.%EXTENSION%".into();
+        for policy in [NativeOverwritePolicy::Fail, NativeOverwritePolicy::Skip, NativeOverwritePolicy::Replace] {
+            job.overwrite_policy = policy;
+            assert!(validate_job(&job).unwrap_err().contains("Two selected artifacts"),
+                "case-only continuous targets under {policy:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn r27_disc_identity_tokens_use_authored_ids_not_guessed_tags() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut job = fixture_job(&temp.path().join("output"), temp.path());
+        job.format = DiscFormat::DvdVideo;
+        job.programs[0].id = PresentationId::dvd_video(1, 9, 2);
+        job.programs[0].angle = 3;
+        job.naming_template = "%DVDTITLE%-%STREAM%-%ANGLE%-%TRACKNUMBER%".into();
+        let track = &job.programs[0].tracks[0];
+        assert_eq!(proposed_destination(&job, &job.programs[0], track),
+            job.destination.join("Stereo/9-3-3-01.wav"));
+        job.file_per_program = true;
+        job.naming_template = "%DVDTITLE%-%STREAM%-%ANGLE%".into();
+        assert_eq!(proposed_destination_for_program(&job, &job.programs[0]),
+            job.destination.join("Stereo/9-3-3.wav"));
+    }
+
+    #[test]
+    fn r27_old_continuous_default_keeps_its_recoverable_filename() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut job = fixture_job(&temp.path().join("output"), temp.path());
+        job.file_per_program = true;
+        let expected = job.destination.join("Stereo/Stereo.dsf");
+        assert_eq!(proposed_destination_for_program(&job, &job.programs[0]), expected);
+        job.naming_template = "{track} - {title}".into();
+        assert_eq!(proposed_destination_for_program(&job, &job.programs[0]), expected,
+            "an older durable extraction must not change its publication target");
+        job.naming_template = "{title}.dsf".into();
+        assert_eq!(proposed_destination_for_program(&job,&job.programs[0]),
+            job.destination.join("Stereo/Stereo.dsf.dsf"),
+            "a pre-round-3 explicit extension stays intact in a durable job");
+        job.file_per_program = false;
+        job.program_subfolders = false;
+        assert_eq!(proposed_destination(&job,&job.programs[0],&job.programs[0].tracks[0]),
+            job.destination.join("Stereo - one.dsf.dsf"),
+            "legacy flattened names and extension handling remain unchanged");
+    }
+
+    #[test]
+    fn r27_untrusted_tag_values_and_literal_parent_segments_stay_under_folder() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut job = fixture_job(&temp.path().join("output"), temp.path());
+        job.naming_template = "../../%ARTIST%/%TRACKNUMBER% - %TITLE%".into();
+        job.programs[0].tags.artist = Some("../outside\\folder".into());
+        job.programs[0].tracks[0].name = "../../escape".into();
+        let dest = proposed_destination(&job, &job.programs[0], &job.programs[0].tracks[0]);
+        assert!(dest.starts_with(&job.destination), "{dest:?}");
+        assert!(!dest.components().any(|component|
+            matches!(component, std::path::Component::ParentDir)), "{dest:?}");
+        assert_eq!(dest.extension().and_then(|ext| ext.to_str()), Some("dsf"));
+        // Old recoverable jobs keep their original brace-template semantics.
+        job.naming_template = "{track} - {title}".into();
+        assert_eq!(proposed_destination(&job, &job.programs[0], &job.programs[0].tracks[0]),
+            job.destination.join("Stereo/01 - .._.._escape.dsf"));
+        job.naming_template = "100% - {track} - {title}".into();
+        assert_eq!(proposed_destination(&job, &job.programs[0], &job.programs[0].tracks[0]),
+            job.destination.join("Stereo/100% - 01 - .._.._escape.dsf"));
+        job.naming_template = "%ARTIST%/%TRACKNUMBER% - %TITLE%".into();
+        job.program_subfolders = false;
+        assert_eq!(proposed_destination(&job, &job.programs[0], &job.programs[0].tracks[0]),
+            job.destination.join("_outside_folder/Stereo - 01 - .._.._escape.dsf"));
     }
 
     #[test]

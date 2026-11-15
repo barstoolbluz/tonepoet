@@ -461,16 +461,7 @@ fn generated_wave_span(path: &Path) -> Result<(NativePcmFormat, u64, u64), Strin
 }
 
 /// Assemble a continuous native PCM presentation from fully completed private
-/// per-item containers. Returns the exact source sample-frame count of each
-/// authored selected chapter for CUE boundary calculation.
-#[cfg_attr(not(test), allow(dead_code))] // Non-controlled compatibility wrapper used by tests.
-pub(super) fn concatenate_generated_waves(
-    inputs: &[std::path::PathBuf], output: &Path,
-    container: NativeWavContainer, cancel: &CancellationToken,
-) -> Result<(Vec<u64>, u32), String> {
-    concatenate_generated_waves_checked(inputs, output, container, cancel, || Ok(()))
-}
-
+/// per-item containers. Returns exact source sample-frame counts for CUE.
 pub(super) fn concatenate_generated_waves_checked(
     inputs: &[std::path::PathBuf], output: &Path,
     container: NativeWavContainer, cancel: &CancellationToken,

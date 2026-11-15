@@ -9031,6 +9031,8 @@ pub enum ActiveOverlay {
         preview: String,
         /// Current field value (for "active" badge).
         active_template: Option<String>,
+        /// Return to the extract form, not Convert, when opened from Naming.
+        return_to_extract: Option<Box<crate::tui::disc_browser::DiscBrowserState>>,
     },
     /// Advanced file-operation settings opened from the Config screen. The
     /// overlay owns a draft and commits all values together on Enter.
@@ -9103,6 +9105,12 @@ pub struct TemplateBuilderState {
     pub saved_selected: usize,
     /// Scroll offset for the saved templates list.
     pub saved_scroll: usize,
+    /// Scroll position for the shared token palette; the action footer stays fixed.
+    pub token_scroll: usize,
+    /// Shared Convert builder may also edit a native extraction template.
+    pub return_to_extract: Option<Box<crate::tui::disc_browser::DiscBrowserState>>,
+    /// Additional token pills are displayed only for their source format.
+    pub disc_format: Option<crate::disc::DiscFormat>,
 }
 
 /// State for the AccurateRip verification overlay.

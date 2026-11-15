@@ -385,9 +385,10 @@ pub fn draw(
     let output_count=state.output_rows().len() as u16;
     // A stop per setting, while the wide layout still fits four rows of
     // controls (the first four occupy two columns).
-    // Two read-only helper lines belong to the form but never take focus.
+    // Three read-only helper lines (format, folder, resolved naming preview)
+    // belong to the form but never take focus.
     let output_height=if small {1} else if wide {state.wide_output_height()}
-        else {output_count.saturating_add(2)};
+        else {output_count.saturating_add(3)};
     let results_height=1;
     let footer_height=if small {1}else{2};
     let problems=state.blockers(scratch);
@@ -989,19 +990,22 @@ fn output_cell(name: &str, index: usize, rows: &[&str], area: Rect, wide: bool, 
             "Log" => (right_x,3,right_width),
             "Folder" => (text.x,4,text.width),
             "Naming" => (text.x,6,text.width),
-            "Downmix" => (text.x,7,text.width),
-            "Assume decrypted" => (text.x,8,text.width),
+            "Downmix" => (text.x,8,text.width),
+            "Assume decrypted" => (text.x,9,text.width),
             _ => return None,
         };
         return (y < text.height).then(|| Rect::new(x,text.y+y,width,1));
     }
     let visual = |i:usize| {
-        i + usize::from(i > 0) + usize::from(i > rows.iter().position(|row| *row == "Folder").unwrap_or(rows.len()))
+        i + usize::from(i > 0)
+            + usize::from(i > rows.iter().position(|row| *row == "Folder").unwrap_or(rows.len()))
+            + usize::from(i > rows.iter().position(|row| *row == "Naming").unwrap_or(rows.len()))
     };
     let visible = text.height as usize;
-    let total = rows.len()+2;
+    let total = rows.len()+3;
     let focused = visual(focus.min(rows.len().saturating_sub(1)))
-        + usize::from(rows.get(focus) == Some(&"Folder"));
+        + usize::from(rows.get(focus).is_some_and(|name|
+            *name == "Folder" || *name == "Naming"));
     let scroll = focused.saturating_sub(visible.saturating_sub(1))
         .min(total.saturating_sub(visible));
     let position = visual(index);
@@ -1265,9 +1269,25 @@ fn draw_output(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,
             "Naming" => {
                 let editing=s.editing_destination && s.editing_template;
                 let value=if editing {s.destination_input.as_str()}else{s.naming_template.as_str()};
-                draw_native_input(frame,field,value,focused,
-                    editing.then_some(value.chars().count()),theme);
-                buttons.record_button(TuiButton::DiscBrowserNaming,field);
+                let load=" Load preset ▾ ";
+                let custom=" Custom… ";
+                let load_width=load.chars().count() as u16;
+                let custom_width=custom.chars().count() as u16;
+                let pills_width=load_width+custom_width+2;
+                let show_pills=field.width>=pills_width+8;
+                let input_width=if show_pills {field.width-pills_width} else {field.width};
+                let input=Rect::new(field.x,field.y,input_width.min(field.width),1);
+                draw_native_input(frame,input,value,focused,
+                    editing.then_some(s.destination_caret),theme);
+                buttons.record_button(TuiButton::DiscBrowserNaming,input);
+                if show_pills {
+                    let first=Rect::new(field.x+input_width+1,field.y,load_width,1);
+                    draw_native_pill(frame,buttons,first,load,
+                        TuiButton::DiscBrowserNamingLoad,false,theme);
+                    let second=Rect::new(first.x+load_width+1,field.y,custom_width,1);
+                    draw_native_pill(frame,buttons,second,custom,
+                        TuiButton::DiscBrowserNamingCustom,false,theme);
+                }
             }
             "Downmix" | "Assume decrypted" => {
                 let value=if *name=="Downmix" {option_value(s,"Downmix")}
@@ -1315,6 +1335,29 @@ fn draw_output(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,
                 .style(Style::default().bg(bg).fg(color)),Rect::new(x,y,width,1));
         }
     }
+    // Read-only full destination preview, below Naming and using exactly the
+    // worker's resolved path, not a second token-replacement implementation.
+    if let Some(index)=rows.iter().position(|name|*name=="Naming") {
+        if let Some(naming)=output_cell("Naming",index,&rows,r,wide,s.output_cursor) {
+            let y=naming.y.saturating_add(1);
+            if y<r.y+r.height && naming.width>2 {
+                let template=if s.editing_destination && s.editing_template {
+                    s.destination_input.as_str()
+                } else { s.naming_template.as_str() };
+                let invalid=crate::convert::pipeline::native_extract::unknown_native_naming_token(
+                    template);
+                // Neither a collision nor an invalid token may replace the
+                // highlighted item's live destination path. The separate
+                // result caption communicates the warning/blocker.
+                let preview=if let Some(path)=s.native_preview_path_for_template(template) {
+                    format!("→ {}",compact_folder_path(&path,naming.width.saturating_sub(2)))
+                } else { "→ Select a playable track to preview its path".into() };
+                let color=if invalid.is_some() {theme.warning} else {colors.soft};
+                frame.render_widget(Paragraph::new(preview).style(Style::default()
+                    .bg(bg).fg(color)),Rect::new(naming.x,naming.y+1,naming.width,1));
+            }
+        }
+    }
     if let Some(anchor)=overwrite_anchor {
         draw_native_overwrite_menu(frame,buttons,anchor,r,s,theme);
     }
@@ -1340,7 +1383,14 @@ fn draw_results(frame:&mut ratatui::Frame,s:&DiscBrowserState,
     let colors=extract_colors(theme);
     let words=word_tiers(theme,colors,colors.base);
     fill(frame,r,colors.base);
-    let caption=if let Some(blocker)=blocker {format!("⚠ {blocker}")} else {
+    let template=if s.editing_destination && s.editing_template {
+        s.destination_input.as_str()
+    } else { s.naming_template.as_str() };
+    let unknown=crate::convert::pipeline::native_extract::unknown_native_naming_token(template);
+    let caption=if let Some(blocker)=blocker {format!("⚠ {blocker}")}
+        else if let Some(token)=unknown.as_deref() {
+            format!("▲ Unknown naming token: {token}")
+        } else {
         let log=if s.extraction_log {" + log"}else{""};
         let dest=space_for(&s.destination).map_or_else(||"unknown".into(),format_bytes);
         let base=format!("{items} {kind}{log} · {programs} {group} · {size}");
@@ -1360,7 +1410,8 @@ fn draw_results(frame:&mut ratatui::Frame,s:&DiscBrowserState,
         }
     };
     frame.render_widget(Paragraph::new(clip_end(&caption,r.width.saturating_sub(4)))
-        .style(Style::default().bg(colors.base).fg(if blocker.is_some(){theme.error}else{words.soft})),
+        .style(Style::default().bg(colors.base).fg(if blocker.is_some(){theme.error}
+            else if unknown.is_some(){theme.warning}else{words.soft})),
         Rect::new(r.x+2,r.y,r.width.saturating_sub(4),1));
 }
 
@@ -2086,19 +2137,133 @@ mod extract_r3_render_tests {
         state.contents.format = DiscFormat::DvdAudio;
         state.contents.copy_protection.description = "CPPM MKB detected".into();
         state.focus = ExtractFocus::Output;
-        assert_eq!(state.wide_output_height(), 9);
+        assert_eq!(state.wide_output_height(), 10);
         let index = state.output_rows().iter().position(|name| *name == "Assume decrypted").unwrap();
         state.output_cursor = index;
         let mut buttons = ButtonRenderMap::new();
         let mut terminal = Terminal::new(TestBackend::new(155, 30)).unwrap();
-        terminal.draw(|frame| draw_output(frame, &state, Rect::new(2, 3, 150, 9),
+        terminal.draw(|frame| draw_output(frame, &state, Rect::new(2, 3, 150, 10),
             &mut buttons, theme, true)).unwrap();
         let rect = buttons.button_rect(TuiButton::DiscBrowserToggle(index))
             .expect("the conditional row must stay visible at its fixed position");
-        assert_eq!(rect.y, 11);
+        assert_eq!(rect.y, 12);
         state.contents.presentations[0].format.channels = Some(6);
-        assert_eq!(state.wide_output_height(), 9);
+        assert_eq!(state.wide_output_height(), 10);
         assert!(state.output_rows().contains(&"Downmix"));
+    }
+
+    #[test]
+    fn r27_naming_preview_uses_worker_path_and_both_shared_controls_have_hitboxes() {
+        let theme = crate::tui::theme::theme_by_slug_or_default("tokyo-night");
+        let mut state = sacd_state(false, false);
+        state.destination = "/tmp/r27-album".into();
+        state.naming_template = "%ARTIST%/%TRACKNUMBER% - %TITLE%.%EXTENSION%".into();
+        state.focus = ExtractFocus::Output;
+        state.output_cursor = state.output_rows().iter().position(|row|*row=="Naming").unwrap();
+        let expected = state.native_output_paths();
+        assert_eq!(expected.len(), 1);
+        assert_eq!(state.native_preview_path().as_ref(), expected.first());
+        let mut terminal = Terminal::new(TestBackend::new(160, 44)).unwrap();
+        let mut buttons = ButtonRenderMap::new();
+        terminal.draw(|frame|draw(frame,&state,Path::new("/tmp"),&mut buttons,theme)).unwrap();
+        let text = (0..44).map(|y|(0..160)
+            .map(|x|terminal.backend().buffer().get(x,y).symbol().to_owned())
+            .collect::<Vec<_>>().concat()).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("→ /tmp/r27-album/Stereo/Untitled/01 - Track.dsf"),"{text}");
+        for button in [TuiButton::DiscBrowserNamingLoad,TuiButton::DiscBrowserNamingCustom] {
+            let rect = buttons.button_rect(button).expect("shared naming control must be clickable");
+            assert_eq!(buttons.find_button_at(rect.x,rect.y),Some(button));
+        }
+    }
+
+    #[test]
+    fn r27_duplicate_selected_media_paths_block_extract_before_queueing() {
+        let theme = crate::tui::theme::theme_by_slug_or_default("tokyo-night");
+        let mut state = sacd_state(false, false);
+        state.destination = "/tmp/r27-album".into();
+        let duplicate = state.contents.presentations[0].tracks[0].clone();
+        state.contents.presentations[0].tracks.push(duplicate);
+        state.items_checked[0] = vec![true, true];
+        state.naming_template = "%TITLE%".into();
+        assert_eq!(state.native_duplicate_count(), 2);
+        assert!(state.blockers(Path::new("/tmp")).iter().any(|p|
+            p.contains("2 tracks would get the same name")));
+        let (lines, _) = rendered_lines(&state, 160, 44);
+        assert!(lines.join("\n").contains("2 tracks would get the same name"));
+        assert!(lines.join("\n").contains("→ "), "the destination remains visible during a collision");
+        let mut terminal = Terminal::new(TestBackend::new(160, 44)).unwrap();
+        terminal.draw(|frame|draw(frame,&state,Path::new("/tmp"),
+            &mut ButtonRenderMap::new(),theme)).unwrap();
+        assert!(!state.footer_extract_enabled.get(),"collision must disable Extract");
+        state.naming_template = "%TRACKNUMBER% - %TITLE%".into();
+        assert_eq!(state.native_duplicate_count(),0);
+        state.items_checked[0][1] = false;
+        state.naming_template = "%TITLE%".into();
+        assert_eq!(state.native_duplicate_count(),0,"unchecked tracks cannot cause false collisions");
+    }
+
+    #[test]
+    fn r28_collision_and_unknown_token_never_replace_live_path_preview() {
+        let theme=crate::tui::theme::theme_by_slug_or_default("tokyo-night");
+        let mut state=sacd_state(false,false);
+        state.destination="/tmp/r28-preview".into();
+        let mut second=state.contents.presentations[0].tracks[0].clone();
+        second.number=2;
+        second.title=Some("song".into());
+        state.contents.presentations[0].tracks[0].title=Some("Song".into());
+        state.contents.presentations[0].tracks.push(second);
+        state.items_checked[0]=vec![true,true];
+        state.naming_template="%TITLE%.%EXTENSION%".into();
+        assert_eq!(state.native_duplicate_count(),2);
+        for (cursor,spelling) in [(0,"Song"),(1,"song")] {
+            state.item_cursor=cursor;
+            let (lines,_) = rendered_lines(&state,160,44);
+            let text=lines.join("\n");
+            assert!(text.contains(&format!("→ /tmp/r28-preview/Stereo/{spelling}.dsf")),"{text}");
+            assert!(text.contains("2 tracks would get the same name"),"{text}");
+            assert!(state.blockers(Path::new("/tmp")).iter().any(|b|
+                b.contains("2 tracks would get the same name")));
+            let mut terminal=Terminal::new(TestBackend::new(160,44)).unwrap();
+            terminal.draw(|f|draw(f,&state,Path::new("/tmp"),
+                &mut ButtonRenderMap::new(),theme)).unwrap();
+            assert!(!state.footer_extract_enabled.get());
+        }
+        // While editing, the path reflects the draft, not a stale blocker.
+        state.editing_destination=true;
+        state.editing_template=true;
+        state.destination_input="%TRACKNUMBER% - %TITLE%.%EXTENSION%".into();
+        let (draft,_) = rendered_lines(&state,160,44);
+        assert!(draft.join("\n").contains("→ /tmp/r28-preview/Stereo/02 - song.dsf"));
+        state.naming_template=state.destination_input.clone();
+        state.editing_destination=false;
+        state.editing_template=false;
+        assert_eq!(state.native_duplicate_count(),0);
+        let (resolved,_) = rendered_lines(&state,160,44);
+        assert!(resolved.join("\n").contains("→ /tmp/r28-preview/Stereo/02 - song.dsf"));
+        assert!(!resolved.join("\n").contains("2 tracks would get the same name"));
+
+        state.naming_template="%TITLE%/%MISSING%".into();
+        let (unknown,terminal) = rendered_lines(&state,160,44);
+        let text=unknown.join("\n");
+        assert!(text.contains("→ /tmp/r28-preview/Stereo/song/Untitled.dsf"),"{text}");
+        assert!(text.contains("Unknown naming token: %MISSING%"),"{text}");
+        assert!(terminal.backend().buffer().content().iter().any(|cell|
+            cell.fg==theme.warning && cell.symbol()=="→"),"preview must be amber");
+    }
+
+    #[test]
+    fn r27_program_mode_detects_duplicate_continuous_output_paths() {
+        let mut state = sacd_state(false, false);
+        state.destination = "/tmp/r27-album".into();
+        state.file_per_program = true;
+        let duplicate = state.contents.presentations[0].clone();
+        state.contents.presentations.push(duplicate);
+        state.selected.push(true);
+        state.keep_dst.push(false);
+        state.items_checked.push(vec![true]);
+        assert_eq!(state.native_output_paths().len(),2);
+        assert_eq!(state.native_duplicate_count(),2,
+            "the collision gate must use program-level paths in continuous mode");
     }
 
     #[test]
@@ -2183,8 +2348,8 @@ mod extract_r3_render_tests {
         let (lines,_)=rendered_lines(&state,154,40);
         let text=lines.join("\n");
         assert!(text.contains("Folder") && text.contains("Naming"),"{text}");
-        assert!(text.contains("{track} - {title}"),"{text}");
-        assert!(!text.contains(" / {track}"),"template must not resemble a path component");
+        assert!(text.contains("%TRACKNUMBER% - %TITLE%"),"{text}");
+        assert!(!text.contains(" / %TRACKNUMBER%"),"template must not resemble a path component");
         assert_eq!(format_bytes(479*1024*1024),"479 MiB");
         assert_eq!(format_bytes(2*1024*1024*1024),"2.0 GiB");
         let mut state=sacd_state(false,false);
