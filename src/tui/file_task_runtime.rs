@@ -3044,7 +3044,7 @@ mod tests {
                     estimated_bytes:Some(100_000),
                 }],
                 source_depth:Some(1),source_channels:Some(2),source_rate:Some(2_822_400),
-                source_layout:None,is_lossless:true,tags:NativeTagValues::default(),
+                source_layout:None,is_lossless:true,tags:NativeTagValues::default(),authored_tags:None,
             }],
             destination:dest.to_path_buf(),working_root:dest.to_path_buf(),
             wav_container:NativeWavContainer::Automatic,assume_decrypted:false,
@@ -3052,7 +3052,7 @@ mod tests {
             naming_template:"{track} - {title}".into(),program_subfolders:false,
             overwrite_policy:NativeOverwritePolicy::Fail,extraction_log:true,
             file_per_program:false,cue:false,transfer_tags:false,
-            tag_source:NativeTagSource::DiscAndSidecar,tag_fields:0,tag_artwork:false,
+            sacd_dff: false, tag_source:NativeTagSource::DiscAndSidecar,tag_fields:0,tag_artwork:false,
         }
     }
 

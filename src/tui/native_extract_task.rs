@@ -1132,7 +1132,7 @@ mod tests {
                 }).collect(),
                 keep_dst: false, source_depth: Some(1), source_channels: Some(2),
                 source_rate: Some(2_822_400), source_layout: None, is_lossless: true,
-                tags: NativeTagValues::default(),
+                tags: NativeTagValues::default(), authored_tags: None,
             }],
             destination: destination.to_path_buf(),
             working_root: destination.join("private-work"),
@@ -1141,7 +1141,7 @@ mod tests {
             naming_template: "{track} - {title}".into(),
             program_subfolders: true, overwrite_policy: NativeOverwritePolicy::Replace,
             extraction_log: false, file_per_program: false, cue: false,
-            transfer_tags: false, tag_source: NativeTagSource::DiscAndSidecar,
+            transfer_tags: false, sacd_dff: false, tag_source: NativeTagSource::DiscAndSidecar,
             tag_fields: 0x7f, tag_artwork: false,
         }
     }

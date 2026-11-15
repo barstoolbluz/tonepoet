@@ -8777,6 +8777,13 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                         .map(|current| current == fingerprint)
                         .unwrap_or(false)
                     {
+                        if let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay {
+                            if state.tag_refresh_pending && state.source_path == path {
+                                if let Err(error) = state.accept_refreshed_tag_contents(contents.clone()) {
+                                    app.set_status(error);
+                                }
+                            }
+                        }
                         app.browse.disc_probe_cache.insert(
                             path.clone(),
                             crate::tui::disc_browser::DiscProbeCacheEntry::from_success(fingerprint, contents),
@@ -8796,6 +8803,13 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                     }
                 }
                 (Some(fingerprint), Err(error)) => {
+                    if let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay {
+                        if state.tag_refresh_pending && state.source_path == path {
+                            state.tag_refresh_pending=false;
+                            state.tag_refresh_failed=true;
+                            app.set_status(format!("Saved tags could not be refreshed: {error}"));
+                        }
+                    }
                     if crate::tui::disc_browser::disc_probe_fingerprint(&path)
                         .map(|current| current == fingerprint)
                         .unwrap_or(false)
@@ -8817,6 +8831,13 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                     app.browse.disc_probe_followup.remove(&path);
                 }
                 (None, Err(error)) => {
+                    if let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay {
+                        if state.tag_refresh_pending && state.source_path == path {
+                            state.tag_refresh_pending=false;
+                            state.tag_refresh_failed=true;
+                            app.set_status(format!("Saved tags could not be refreshed: {error}"));
+                        }
+                    }
                     app.browse.disc_probe_cache.remove(&path);
                     app.browse.disc_probe_followup.remove(&path);
                     if app.browse.current_selected_disc_source_matches(&path) {
@@ -8829,6 +8850,13 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                     }
                 }
                 (None, Ok(contents)) => {
+                    if let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay {
+                        if state.tag_refresh_pending && state.source_path == path {
+                            if let Err(error) = state.accept_refreshed_tag_contents(contents.clone()) {
+                                app.set_status(error);
+                            }
+                        }
+                    }
                     if let Ok(fingerprint) = crate::tui::disc_browser::disc_probe_fingerprint(&path) {
                         app.browse.disc_probe_cache.insert(
                             path.clone(),
@@ -10478,6 +10506,12 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                     }
                     if !summary.saved_paths.is_empty() {
                         taken.state.mark_archive_staging_dirty();
+                        if taken.state.return_to_extract.is_some() {
+                            taken.state.extract_tags_saved = true;
+                            if summary.all_saved() && taken.state.extract_mb_populated {
+                                taken.state.extract_mb_saved = true;
+                            }
+                        }
                     }
                     if let Some(refresh) = refreshed_entries {
                         match refresh {
@@ -10569,7 +10603,10 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                                 }
                             }
                             None => {
-                                app.browse.probe_current_with_db(tx, Some(&app.db));
+                                if !super::disc_browser_actions::restore_extract_after_tag_editor(
+                                    app, &mut taken.state, tx) {
+                                    app.browse.probe_current_with_db(tx, Some(&app.db));
+                                }
                                 app.set_status(summary.status_line());
                             }
                         }

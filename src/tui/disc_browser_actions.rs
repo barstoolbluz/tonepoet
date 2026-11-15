@@ -439,10 +439,65 @@ pub fn handle_disc_browser_button_click_with_shift(
     shift: bool,
     tx: &mpsc::Sender<AppMessage>,
 ) -> bool {
-    // A popup owns the overlay. Its background hitboxes must not remain
-    // clickable through the transparent regions of the popup.
-    if matches!(&app.active_overlay, ActiveOverlay::DiscBrowser(state) if state.panel.is_some()) {
-        return true;
+    // Tags is the one interactive sheet. Its own hitboxes always take
+    // precedence over the extraction window below it. Other panels remain
+    // modal but read-only, as before.
+    if let ActiveOverlay::DiscBrowser(state) = &app.active_overlay {
+        if state.panel == Some(crate::tui::disc_browser::ExtractPanel::Tags) {
+            // An open source dropdown owns its interaction until a choice is
+            // made or it is dismissed; a click behind it never edits fields.
+            if state.tag_source_open {
+                match button {
+                    TuiButton::DiscBrowserTagSheetSourceChoice(index) => {
+                        if let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay {
+                            set_native_tag_source(state, *index);
+                        }
+                    }
+                    TuiButton::DiscBrowserTagSheetOutside => {
+                        if let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay {
+                            state.tag_source_open = false;
+                            state.panel = None;
+                        }
+                    }
+                    _ => {
+                        if let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay {
+                            state.tag_source_open = false;
+                        }
+                    }
+                }
+                return true;
+            }
+            match button {
+                TuiButton::DiscBrowserTagSheetControl(index) => {
+                    let control=state.tag_sheet_controls().get(*index).copied();
+                    if let Some(control)=control {
+                        if native_tag_external_action(app,control,tx) {return true;}
+                        if let ActiveOverlay::DiscBrowser(state)=&mut app.active_overlay {
+                            state.panel_cursor=*index;
+                            activate_native_tag_control(state,control);
+                        }
+                    }
+                }
+                TuiButton::DiscBrowserTagSheetSourceChoice(index) => {
+                    if let ActiveOverlay::DiscBrowser(state)=&mut app.active_overlay {
+                        if state.tag_source_open {
+                            set_native_tag_source(state,*index);
+                        }
+                    }
+                }
+                TuiButton::DiscBrowserTagSheetOutside => {
+                    if let ActiveOverlay::DiscBrowser(state)=&mut app.active_overlay {
+                        state.panel=None;
+                        state.tag_source_open=false;
+                    }
+                }
+                // Sheet whitespace and stale underlying hitboxes cannot
+                // activate or dismiss unrelated commands.
+                _ => {}
+            }
+            return true;
+        }
+        if state.panel.is_some() {return true;}
     }
     // Hints are actions of the currently active control. Dispatch them before
     // the generic focus-change cleanup (or the open-dropdown click handler),
@@ -594,10 +649,8 @@ pub fn handle_disc_browser_button_click_with_shift(
         }
         TuiButton::DiscBrowserTagsEdit => {
             let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay else { return false; };
-            if !state.native_tags_available() { return true; }
             focus_native_row(state, "Tags");
-            state.panel = Some(crate::tui::disc_browser::ExtractPanel::Tags);
-            state.panel_cursor = 0;
+            open_native_tags_sheet(state);
             true
         }
         TuiButton::DiscBrowserFolderField => {
@@ -770,30 +823,33 @@ fn focus_native_row(state: &mut DiscBrowserState, name: &str) {
     state.focus = crate::tui::disc_browser::ExtractFocus::Output;
     state.output_cursor = state.output_rows().iter().position(|row| *row == name).unwrap_or(0);
     state.normalize_output_cursor();
-    if matches!(name, "Overwrite" | "Tags" | "Log") { state.form_column = 1; }
+    if matches!(name, "Overwrite" | "Keep DST" | "Tags" | "Log") { state.form_column = 1; }
     else if matches!(name, "Format" | "Files" | "CUE") { state.form_column = 0; }
 }
 
 /// Logical coordinates match the form's fixed wide geometry; full-width
 /// fields preserve the last column when moving back up to paired controls.
-fn native_form_position(name: &str) -> (usize, Option<usize>) {
+fn native_form_position(name: &str, has_keep_dst: bool) -> (usize, Option<usize>) {
+    let extra=usize::from(has_keep_dst);
     match name {
         "Format" => (0,Some(0)), "Overwrite" => (0,Some(1)),
-        "Files" => (1,Some(0)), "Tags" => (1,Some(1)),
-        "CUE" => (2,Some(0)), "Log" => (2,Some(1)),
-        "Folder" => (3,None), "Naming" => (4,None),
-        "Downmix" => (5,None), "Assume decrypted" => (6,None),
+        "Keep DST" => (1,Some(1)),
+        "Files" => (1+extra,Some(0)), "Tags" => (1+extra,Some(1)),
+        "CUE" => (2+extra,Some(0)), "Log" => (2+extra,Some(1)),
+        "Folder" => (3+extra,None), "Naming" => (4+extra,None),
+        "Downmix" => (5+extra,None), "Assume decrypted" => (6+extra,None),
         _ => (0,None),
     }
 }
 
 fn native_form_has_neighbor(state: &DiscBrowserState, step: i8) -> bool {
     if !state.form_wide.get() { return false; }
-    let (row, column) = native_form_position(state.current_output_row());
+    let has_keep_dst=state.output_rows().contains(&"Keep DST");
+    let (row, column) = native_form_position(state.current_output_row(),has_keep_dst);
     let wanted = if step < 0 { Some(0) } else { Some(1) };
     if column == wanted { return false; }
     state.output_rows().iter().enumerate().any(|(index, name)| {
-        let (other_row, other_column) = native_form_position(name);
+        let (other_row, other_column) = native_form_position(name,has_keep_dst);
         other_row == row && other_column == wanted && state.output_row_focusable(index)
     })
 }
@@ -816,20 +872,21 @@ fn move_native_form_cursor(state: &mut DiscBrowserState, dx: i8, dy: i8) {
         }
         return;
     }
-    let (visual_row, column) = native_form_position(state.current_output_row());
+    let has_keep_dst=rows.contains(&"Keep DST");
+    let (visual_row, column) = native_form_position(state.current_output_row(),has_keep_dst);
     if let Some(column) = column { state.form_column = column; }
     let target = if dx != 0 {
         let wanted = if dx < 0 {Some(0)} else {Some(1)};
         rows.iter().enumerate().position(|(index, name)| {
-            let (row, col) = native_form_position(name);
+            let (row, col) = native_form_position(name,has_keep_dst);
             row == visual_row && col == wanted && state.output_row_focusable(index)
         })
     } else {
         let mut visual = visual_row as i32 + i32::from(dy);
         let mut found = None;
-        while (0..7).contains(&visual) {
+        while (0..8).contains(&visual) {
             found = rows.iter().enumerate().position(|(index, name)| {
-                let (row, col) = native_form_position(name);
+                let (row, col) = native_form_position(name,has_keep_dst);
                 row == visual as usize && (col.is_none() || col == Some(state.form_column))
                     && state.output_row_focusable(index)
             });
@@ -852,8 +909,15 @@ fn set_native_files(state: &mut DiscBrowserState, choice: usize) {
 fn set_native_format(state: &mut DiscBrowserState, choice: usize) {
     use crate::convert::pipeline::native_extract::NativeWavContainer as W;
     if state.contents.format == crate::disc::DiscFormat::Sacd {
-        if choice <= 1 && (choice == 0 || selected_sacd_area_has_dst(state)) {
-            if let Some(keep) = state.keep_dst.get_mut(state.cursor) { *keep = choice == 1; }
+        if choice <= 1 {
+            state.sacd_dff = choice == 1;
+            if choice == 0 {
+                // Selecting DSF explicitly also clears DST/DFF exceptions.
+                // The separate Keep DST control can re-enable them afterwards.
+                for (i, keep) in state.keep_dst.iter_mut().enumerate() {
+                    if state.selected.get(i) == Some(&true) { *keep = false; }
+                }
+            }
         }
     } else if let Some(option) = [W::Automatic, W::Riff, W::Rf64, W::W64].get(choice) {
         state.wav_container = *option;
@@ -877,8 +941,20 @@ fn open_native_overwrite(state: &mut DiscBrowserState) {
     state.overwrite_open = true;
 }
 
+fn toggle_native_keep_dst(state: &mut DiscBrowserState) {
+    let new_value = !state.contents.presentations.iter().enumerate().any(|(i,p)|
+        state.selected.get(i) == Some(&true) && presentation_has_dst(p)
+            && state.keep_dst.get(i) == Some(&true));
+    for (i, program) in state.contents.presentations.iter().enumerate() {
+        if state.selected.get(i) == Some(&true) && presentation_has_dst(program) {
+            if let Some(value) = state.keep_dst.get_mut(i) { *value = new_value; }
+        }
+    }
+}
+
 fn toggle_native_form_row(state: &mut DiscBrowserState) {
     match state.current_output_row() {
+        "Keep DST" => toggle_native_keep_dst(state),
         "Tags" if state.native_tags_available() => state.tags = !state.tags,
         "Log" => state.extraction_log = !state.extraction_log,
         "CUE" if state.file_per_program && state.contents.format != crate::disc::DiscFormat::Sacd =>
@@ -898,12 +974,17 @@ fn begin_native_template_edit(state: &mut DiscBrowserState) {
 
 /// The probed codec, not merely a track's optional note, determines whether
 /// keeping DST is a meaningful choice for the highlighted SACD area.
-pub(super) fn selected_sacd_area_has_dst(state: &DiscBrowserState) -> bool {
-    state.contents.presentations.get(state.cursor).is_some_and(|program| {
-        program.format.codec.as_deref() == Some("DST")
-            || program.tracks.iter().any(|track|track.format_note.as_deref()
-                .is_some_and(|note| note.contains("DST")))
-    })
+pub(super) fn presentation_has_dst(program: &crate::disc::DiscPresentation) -> bool {
+    program.format.codec.as_deref() == Some("DST")
+        || program.tracks.iter().any(|track|track.format_note.as_deref()
+            .is_some_and(|note| note.contains("DST")))
+}
+
+pub(super) fn selected_sacd_has_dst(state: &DiscBrowserState) -> bool {
+    state.contents.presentations.iter().enumerate().any(|(i, program)|
+        state.selected.get(i) == Some(&true)
+            && state.items_checked.get(i).is_some_and(|v|v.iter().any(|item|*item))
+            && presentation_has_dst(program))
 }
 
 fn cycle_native_option(state: &mut DiscBrowserState, step: i32) {
@@ -914,11 +995,9 @@ fn cycle_native_option(state: &mut DiscBrowserState, step: i32) {
             state.cycle_angle_for(state.cursor, step);
         }
         Some("Format") if state.contents.format == crate::disc::DiscFormat::Sacd => {
-            if selected_sacd_area_has_dst(state) {
-                let selected = state.cursor;
-                state.keep_dst[selected] = !state.keep_dst[selected];
-            }
+            set_native_format(state,usize::from(!state.sacd_dff));
         }
+        Some("Keep DST") => toggle_native_keep_dst(state),
         Some("Format") => {
             let all = [NativeWavContainer::Automatic, NativeWavContainer::Riff,
                 NativeWavContainer::Rf64, NativeWavContainer::W64];
@@ -1015,12 +1094,9 @@ fn native_key_bindings(state: &DiscBrowserState) -> Vec<NativeKeyBinding> {
             let row = state.current_output_row();
             match row {
                 "Format" => {
-                    if state.contents.format != crate::disc::DiscFormat::Sacd
-                        || selected_sacd_area_has_dst(state) {
-                        add(KeyCode::Char('['), M::NONE, "[ ] choose", A::Previous);
-                        add(KeyCode::Char(']'), M::NONE, "[ ] choose", A::Next);
-                        add(KeyCode::Char(' '), M::NONE, "Space choose", A::Space);
-                    }
+                    add(KeyCode::Char('['), M::NONE, "[ ] choose", A::Previous);
+                    add(KeyCode::Char(']'), M::NONE, "[ ] choose", A::Next);
+                    add(KeyCode::Char(' '), M::NONE, "Space choose", A::Space);
                 }
                 "Files" | "Overwrite" | "Downmix" | "Assume decrypted" => {
                     add(KeyCode::Char('['), M::NONE, "[ ] choose", A::Previous);
@@ -1031,7 +1107,7 @@ fn native_key_bindings(state: &DiscBrowserState) -> Vec<NativeKeyBinding> {
                 }
                 "Tags" if state.native_tags_available() =>
                     add(KeyCode::Char(' '), M::NONE, "Space toggle", A::Space),
-                "Log" | "CUE" =>
+                "Log" | "CUE" | "Keep DST" =>
                     add(KeyCode::Char(' '), M::NONE, "Space toggle", A::Space),
                 "Naming" => {
                     add(KeyCode::Char('l'),M::NONE,"l presets",A::NamingLoad);
@@ -1039,18 +1115,16 @@ fn native_key_bindings(state: &DiscBrowserState) -> Vec<NativeKeyBinding> {
                 },
                 _ => {}
             }
-            // Plain-DSD SACD has only DSF until the later DFF round. Do not
-            // advertise an Enter action that cannot change the format.
-            if (row != "Format" || state.contents.format != crate::disc::DiscFormat::Sacd
-                || selected_sacd_area_has_dst(state))
-                && (row != "Tags" || state.native_tags_available()) {
+            // Every visible form control has a working Enter action; Tags
+            // opens its sheet even for DFF-only media so Use DSF is reachable.
+            {
             add(KeyCode::Enter, M::NONE, match row {
                 "Overwrite" => "↵ open list",
                 "Tags" => "↵ edit tags",
                 "Folder" => "↵ edit folder",
                 "Naming" => "↵ edit naming",
                 "Format" | "Files" => "↵ choose",
-                "Log" | "CUE" => "↵ toggle",
+                "Log" | "CUE" | "Keep DST" => "↵ toggle",
                 _ => "↵ settings",
             }, A::Enter);
             }
@@ -1200,6 +1274,123 @@ pub(crate) fn native_key_help(state: &DiscBrowserState) -> Vec<String> {
     lines
 }
 
+/// The artwork preview is a one-time source discovery at sheet opening.
+/// Redrawing the sheet performs no filesystem scans.
+fn open_native_tags_sheet(state: &mut DiscBrowserState) {
+    state.tag_preview_artwork = crate::convert::pipeline::native_extract::native_artwork_path(
+        &Default::default(), &state.source_path);
+    state.panel = Some(crate::tui::disc_browser::ExtractPanel::Tags);
+    state.panel_cursor = 0;
+    state.tag_source_open = false;
+}
+
+fn activate_native_tag_control(state: &mut DiscBrowserState,
+    control: crate::tui::disc_browser::TagSheetControl,
+) {
+    use crate::tui::disc_browser::TagSheetControl as C;
+    use crate::convert::pipeline::native_extract::NativeTagSource;
+    match control {
+        C::Transfer => state.tags = !state.tags,
+        C::Source => {
+            state.tag_source_cursor = state.tag_source_index();
+            state.tag_source_open = !state.tag_source_open;
+        }
+        C::Field(index) => {state.tag_fields ^= 1u16 << index;}
+        C::All => state.tag_fields = 0x1ff,
+        C::None => state.tag_fields = 0,
+        C::Artwork => state.tag_artwork = !state.tag_artwork,
+        C::UseDsf => {
+            state.sacd_dff = false;
+            for (i, keep) in state.keep_dst.iter_mut().enumerate() {
+                if state.selected.get(i) == Some(&true) { *keep = false; }
+            }
+        }
+        C::Done => {state.panel = None; state.tag_source_open = false;}
+        C::EditValues | C::MusicBrainz => {}, // App-level actions below.
+    }
+    let len = state.tag_sheet_controls().len();
+    state.panel_cursor = state.panel_cursor.min(len.saturating_sub(1));
+}
+
+fn set_native_tag_source(state: &mut DiscBrowserState, choice: usize) {
+    use crate::convert::pipeline::native_extract::NativeTagSource;
+    if choice >= state.tag_source_option_count() {return;}
+    state.tag_source = match choice {
+        0 => NativeTagSource::DiscAndSidecar,
+        1 => NativeTagSource::AuthoredTrack,
+        _ => NativeTagSource::MusicBrainz,
+    };
+    state.tag_source_cursor = choice;
+    state.tag_source_open = false;
+}
+
+/// Open the existing editor on the exact Extract source/presentation, retaining
+/// its in-memory draft through the editor and any nested lookup overlays.
+fn open_extract_owned_tag_editor(app: &mut AppState) -> Result<bool, String> {
+    let draft = match &app.active_overlay {
+        ActiveOverlay::DiscBrowser(state) => state.clone(),
+        _ => return Ok(false),
+    };
+    let opened = open_existing_metadata_editor_for_disc_cursor(app)?;
+    if opened {
+        if let ActiveOverlay::MetadataEditor(editor) = &mut app.active_overlay {
+            editor.return_to_extract = Some(draft);
+        } else {
+            app.active_overlay = ActiveOverlay::DiscBrowser(draft);
+            return Err("the selected metadata editor could not be opened".into());
+        }
+    }
+    Ok(opened)
+}
+
+/// Return from the editor without replacing the current selection and output
+/// settings. The existing asynchronous disc probe rereads saved sidecar tags;
+/// Extract is held until that authoritative evidence is back.
+pub(super) fn restore_extract_after_tag_editor(
+    app: &mut AppState,
+    editor: &mut crate::tui::app::MetadataEditorState,
+    tx: &mpsc::Sender<AppMessage>,
+) -> bool {
+    let Some(mut draft) = editor.return_to_extract.take() else {return false;};
+    draft.tag_mb_available |= editor.extract_mb_saved;
+    let saved = editor.extract_tags_saved;
+    draft.tag_refresh_pending = saved;
+    draft.tag_refresh_failed = false;
+    let path = draft.source_path.clone();
+    app.active_overlay = ActiveOverlay::DiscBrowser(draft);
+    if saved { force_disc_reprobe(app, path, tx); }
+    true
+}
+
+fn native_tag_external_action(app: &mut AppState,
+    control: crate::tui::disc_browser::TagSheetControl,
+    tx: &mpsc::Sender<AppMessage>,
+) -> bool {
+    use crate::tui::disc_browser::TagSheetControl as C;
+    match control {
+        C::EditValues => {
+            match open_extract_owned_tag_editor(app) {
+                Ok(true) => {},
+                Ok(false) => app.set_status("No selected presentation is available to edit"),
+                Err(error) => app.set_status(format!("Cannot open tag editor: {error}")),
+            }
+            true
+        }
+        C::MusicBrainz => {
+            // The in-editor dispatch already carries the chosen presentation
+            // and source path; a Browse multi-selection is not this lookup.
+            match open_extract_owned_tag_editor(app) {
+                Ok(true) => crate::tui::command::execute_command(app,
+                    crate::tui::command::Command::TagsFromMb {query:None,catno:None,year:None},tx),
+                Ok(false) => app.set_status("No selected presentation is available for lookup"),
+                Err(error) => app.set_status(format!("Cannot open tag lookup: {error}")),
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Window-only navigation. No Convert actions run unless explicitly selected.
 pub fn handle_disc_browser_key(
     app: &mut AppState,
@@ -1209,7 +1400,8 @@ pub fn handle_disc_browser_key(
     use crossterm::event::KeyModifiers;
     use crate::tui::disc_browser::{ExtractFocus, ExtractPanel};
     let ActiveOverlay::DiscBrowser(_) = &app.active_overlay else { return; };
-    if matches!(key.code, KeyCode::Char('m' | 'M')) && key.modifiers == KeyModifiers::ALT {
+    if matches!(key.code, KeyCode::Char('m' | 'M')) && key.modifiers == KeyModifiers::ALT
+        && matches!(&app.active_overlay, ActiveOverlay::DiscBrowser(s) if s.panel.is_none()) {
         if let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay {
             state.maximized = !state.maximized;
         }
@@ -1240,14 +1432,24 @@ pub fn handle_disc_browser_key(
         }
         return;
     }
+    if matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) {
+        let sheet_action = match &app.active_overlay {
+            ActiveOverlay::DiscBrowser(state) if state.panel == Some(ExtractPanel::Tags)
+                && !state.tag_source_open => state.tag_sheet_controls().get(state.panel_cursor).copied(),
+            _ => None,
+        };
+        if sheet_action.is_some_and(|control|native_tag_external_action(app,control,tx)) {
+            return;
+        }
+    }
     // Opening the existing editor mutates the overlay, so perform this route
     // before borrowing the extraction state for in-panel key dispatch.
     if matches!(&app.active_overlay, ActiveOverlay::DiscBrowser(state)
-        if matches!(state.panel, Some(ExtractPanel::Tags | ExtractPanel::More))
+        if matches!(state.panel, Some(ExtractPanel::More))
             && !state.editing_destination)
         && key.code == KeyCode::Char('e')
     {
-        match open_existing_metadata_editor_for_disc_cursor(app) {
+        match open_extract_owned_tag_editor(app) {
             Ok(true) => {},
             Ok(false) => app.set_status("No selected presentation is available to edit"),
             Err(error) => app.set_status(format!("Cannot open tag editor: {error}")),
@@ -1256,11 +1458,15 @@ pub fn handle_disc_browser_key(
     }
     // More routes to established app actions, not a second lookup or probe.
     if matches!(&app.active_overlay, ActiveOverlay::DiscBrowser(state)
-        if matches!(state.panel, Some(ExtractPanel::More | ExtractPanel::Tags)))
+        if matches!(state.panel, Some(ExtractPanel::More)))
         && key.code == KeyCode::Char('b')
     {
-        crate::tui::command::execute_command(app,
-            crate::tui::command::Command::TagsFromMb {query:None,catno:None,year:None},tx);
+        match open_extract_owned_tag_editor(app) {
+            Ok(true) => crate::tui::command::execute_command(app,
+                crate::tui::command::Command::TagsFromMb {query:None,catno:None,year:None},tx),
+            Ok(false) => app.set_status("No selected presentation is available for lookup"),
+            Err(error) => app.set_status(format!("Cannot open tag lookup: {error}")),
+        }
         return;
     }
     if let ActiveOverlay::DiscBrowser(state) = &app.active_overlay {
@@ -1374,26 +1580,42 @@ pub fn handle_disc_browser_key(
     }
 
     if let Some(panel) = state.panel {
+        if panel == ExtractPanel::Tags {
+            use crate::tui::disc_browser::TagSheetControl as C;
+            if state.tag_source_open {
+                match key.code {
+                    KeyCode::Esc => state.tag_source_open = false,
+                    KeyCode::Up | KeyCode::Char('[') => state.tag_source_cursor = state.tag_source_cursor.saturating_sub(1),
+                    KeyCode::Down | KeyCode::Char(']') => state.tag_source_cursor = (state.tag_source_cursor+1).min(state.tag_source_option_count()-1),
+                    KeyCode::Enter | KeyCode::Char(' ') => set_native_tag_source(state,state.tag_source_cursor),
+                    _ => {},
+                }
+                return;
+            }
+            match key.code {
+                KeyCode::Esc => {state.panel=None; state.panel_cursor=0;},
+                KeyCode::Up | KeyCode::BackTab => state.panel_cursor = state.panel_cursor.saturating_sub(1),
+                KeyCode::Down | KeyCode::Tab => state.panel_cursor =
+                    (state.panel_cursor+1).min(state.tag_sheet_controls().len().saturating_sub(1)),
+                KeyCode::Char('[') | KeyCode::Char(']')
+                    if state.tag_sheet_controls().get(state.panel_cursor) == Some(&C::Source) => {
+                    let current=state.tag_source_index();
+                    let choice=if key.code == KeyCode::Char(']') {
+                        (current+1).min(state.tag_source_option_count()-1)
+                    }else{current.saturating_sub(1)};
+                    set_native_tag_source(state,choice);
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    if let Some(control)=state.tag_sheet_controls().get(state.panel_cursor).copied() {
+                        activate_native_tag_control(state,control);
+                    }
+                }
+                _ => {},
+            }
+            return;
+        }
         match (panel, key.code) {
             (_, KeyCode::Esc) => { state.panel = None; state.panel_cursor = 0; }
-            (ExtractPanel::Tags, KeyCode::Char('t')) => state.tags = !state.tags,
-            (ExtractPanel::Tags, KeyCode::Char('s')) => {
-                use crate::convert::pipeline::native_extract::NativeTagSource;
-                state.tag_source = match state.tag_source {
-                    NativeTagSource::DiscAndSidecar => NativeTagSource::AuthoredTrack,
-                    NativeTagSource::AuthoredTrack => NativeTagSource::DiscAndSidecar,
-                };
-            },
-            (ExtractPanel::Tags, KeyCode::Char('a')) => state.tag_artwork = !state.tag_artwork,
-            (ExtractPanel::Tags, KeyCode::Char(k @ '1'..='7')) => {
-                let bit = u32::from(k) - u32::from('1');
-                state.tag_fields ^= 1 << bit;
-            },
-            (ExtractPanel::Tags, KeyCode::Char('k')) => {
-                for (i,selected) in state.selected.iter().enumerate() {
-                    if *selected { state.keep_dst[i] = false; }
-                }
-            },
             (ExtractPanel::Downmix | ExtractPanel::AssumeDecrypted, KeyCode::Char('[')) => cycle_native_option(state, -1),
             (ExtractPanel::Downmix | ExtractPanel::AssumeDecrypted, KeyCode::Char(']')) => cycle_native_option(state, 1),
             (ExtractPanel::ConvertChoice, KeyCode::Enter) => { convert_overlay_cursor(app); }
@@ -1500,7 +1722,7 @@ pub fn handle_disc_browser_key(
             state.footer_cursor = (state.footer_cursor as i8 + step).clamp(minimum,3) as usize;
         }
         Some(A::Space) => match state.current_output_row() {
-            "Log" | "Tags" | "CUE" => toggle_native_form_row(state),
+            "Log" | "Tags" | "CUE" | "Keep DST" => toggle_native_form_row(state),
             "Format" | "Files" | "Downmix" | "Assume decrypted" => cycle_native_option(state,1),
             "Folder" => begin_native_folder_edit(state),
             "Naming" => begin_native_template_edit(state),
@@ -1514,9 +1736,9 @@ pub fn handle_disc_browser_key(
                 "Folder" => begin_native_folder_edit(state),
                 "Naming" => begin_native_template_edit(state),
                 "Overwrite" => open_native_overwrite(state),
-                "Log" | "CUE" => toggle_native_form_row(state),
+                "Log" | "CUE" | "Keep DST" => toggle_native_form_row(state),
                 "Format" | "Files" | "Downmix" | "Assume decrypted" => cycle_native_option(state,1),
-                "Tags" => {state.panel=Some(ExtractPanel::Tags);state.panel_cursor=0;},
+                "Tags" => open_native_tags_sheet(state),
                 _ => {},
             },
             ExtractFocus::Footer => match state.footer_cursor {
@@ -2546,8 +2768,8 @@ mod tests {
         assert_eq!(state.selected_sacd_tag_carriers(),(false,true));
         assert!(!state.native_tags_available());
         focus_native_row(&mut state,"Tags");
-        assert_eq!(state.current_output_row(),"Log",
-            "DFF-only read-only Tags cannot take focus");
+        assert_eq!(state.current_output_row(),"Tags",
+            "DFF-only Tags must accept focus for the Use DSF action");
         toggle_native_form_row(&mut state);
         assert!(state.tags,"disabled DFF toggle leaves a future DSF preference untouched");
         assert!(!state.native_job(PathBuf::from("/tmp")).transfer_tags);
@@ -2718,7 +2940,7 @@ mod tests {
     }
 
     #[test]
-    fn r24_spatial_navigation_skips_read_only_tags_at_all_widths() {
+    fn r30_spatial_navigation_reaches_tags_and_keep_dst_at_all_widths() {
         use crate::tui::disc_browser::ExtractFocus;
         use crossterm::event::KeyModifiers as M;
         let source=PathBuf::from("disc.iso");
@@ -2745,7 +2967,7 @@ mod tests {
             assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(state)
                 if state.current_output_row()==expected));
             press(&mut app,KeyCode::Down);
-            let expected=if wide {"Log"}else{"Overwrite"};
+            let expected=if wide {"Keep DST"}else{"Overwrite"};
             assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(state)
                 if state.current_output_row()==expected));
             if let ActiveOverlay::DiscBrowser(state)=&mut app.active_overlay {
@@ -2753,7 +2975,7 @@ mod tests {
             }
             press(&mut app,KeyCode::Right);
             assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(state)
-                if state.current_output_row()=="Files"),"read-only Tags cannot receive focus");
+                if state.current_output_row()=="Tags"),"Tags must remain keyboard accessible for Use DSF");
         }
         if let ActiveOverlay::DiscBrowser(state)=&mut app.active_overlay {
             state.keep_dst[0]=false;
@@ -2761,7 +2983,7 @@ mod tests {
         }
         press(&mut app,KeyCode::Right);
         assert!(matches!(&app.active_overlay,ActiveOverlay::DiscBrowser(state)
-            if state.current_output_row()=="Tags"),"DSF-only re-enables Tags focus");
+            if state.current_output_row()=="Tags"),"DSF still permits Tags focus");
         if let ActiveOverlay::DiscBrowser(state)=&mut app.active_overlay {
             let other=state.contents.presentations[0].clone();
             state.contents.presentations.push(other);
@@ -3115,6 +3337,159 @@ mod tests {
                 matches!(app.active_overlay, ActiveOverlay::DiscBrowser(_)),
                 "{marker:?} folder-level activation must open the audio-streams overlay",
             );
+        }
+    }
+
+    #[test]
+    fn r30_tags_sheet_uses_one_keyboard_mouse_reducer_and_keeps_old_metadata_preferences() {
+        use crate::tui::disc_browser::{ExtractPanel, TagSheetControl as C};
+        let contents = selectable_disc_contents("disc.iso".into(), FolderDiscMarkerKind::Sacd);
+        let mut state = DiscBrowserState::new(contents, "disc.iso".into());
+        state.tags = true;
+        let defaults = state.tag_fields;
+        open_native_tags_sheet(&mut state);
+        assert_eq!(state.panel, Some(ExtractPanel::Tags));
+        activate_native_tag_control(&mut state, C::Field(7));
+        assert_eq!(state.tag_fields, defaults | (1 << 7));
+        activate_native_tag_control(&mut state, C::None);
+        assert_eq!(state.tag_fields, 0);
+        activate_native_tag_control(&mut state, C::All);
+        assert_eq!(state.tag_fields, 0x1ff);
+        let artwork = state.tag_artwork;
+        activate_native_tag_control(&mut state, C::Artwork);
+        assert_ne!(state.tag_artwork, artwork);
+        activate_native_tag_control(&mut state, C::Source);
+        assert!(state.tag_source_open);
+        set_native_tag_source(&mut state, 1);
+        assert!(!state.tag_source_open);
+        assert_eq!(state.tag_source, crate::convert::pipeline::native_extract::NativeTagSource::AuthoredTrack);
+        state.sacd_dff = true;
+        assert!(state.tag_sheet_controls().contains(&C::UseDsf));
+        activate_native_tag_control(&mut state, C::UseDsf);
+        assert!(!state.sacd_dff);
+        activate_native_tag_control(&mut state, C::Transfer);
+        assert!(!state.tags);
+        assert_eq!(state.tag_sheet_controls(), vec![C::Transfer, C::EditValues, C::MusicBrainz, C::Done]);
+        activate_native_tag_control(&mut state, C::Done);
+        assert_eq!(state.panel, None);
+        assert_eq!(state.tag_fields, 0x1ff, "closing the sheet keeps the selected fields");
+    }
+
+    #[test]
+    fn r30_tags_sheet_mouse_click_outside_dismisses_without_underlying_action() {
+        use crate::tui::disc_browser::{ExtractPanel, TagSheetControl as C};
+        let contents = selectable_disc_contents("disc.iso".into(), FolderDiscMarkerKind::Sacd);
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        let mut state = DiscBrowserState::new(contents, "disc.iso".into());
+        state.tags = true;
+        open_native_tags_sheet(&mut state);
+        app.active_overlay = ActiveOverlay::DiscBrowser(Box::new(state));
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let source_index = {
+            let ActiveOverlay::DiscBrowser(state) = &app.active_overlay else { panic!("extract overlay"); };
+            state.tag_sheet_controls().iter().position(|v| *v == C::Source).unwrap()
+        };
+        assert!(handle_disc_browser_button_click(&mut app,
+            &TuiButton::DiscBrowserTagSheetControl(source_index), 1, &tx));
+        let ActiveOverlay::DiscBrowser(state) = &app.active_overlay else { panic!("extract overlay"); };
+        assert!(state.tag_source_open);
+        assert!(handle_disc_browser_button_click(&mut app,
+            &TuiButton::DiscBrowserTagSheetSourceChoice(1), 1, &tx));
+        let ActiveOverlay::DiscBrowser(state) = &app.active_overlay else { panic!("extract overlay"); };
+        assert_eq!(state.tag_source, crate::convert::pipeline::native_extract::NativeTagSource::AuthoredTrack);
+        assert!(handle_disc_browser_button_click(&mut app,
+            &TuiButton::DiscBrowserTagSheetOutside, 1, &tx));
+        let ActiveOverlay::DiscBrowser(state) = &app.active_overlay else { panic!("extract overlay"); };
+        assert_eq!(state.panel, None);
+        assert_eq!(state.tag_source, crate::convert::pipeline::native_extract::NativeTagSource::AuthoredTrack);
+    }
+
+    #[test]
+    fn r30c_extract_draft_returns_from_editor_and_saved_match_is_selectable() {
+        use crate::disc::model::DiscExtractTagFields;
+        use crate::convert::pipeline::native_extract::NativeTagSource;
+        let source=PathBuf::from("/tmp/disc-A.iso");
+        let other=PathBuf::from("/tmp/disc-B.iso");
+        let contents=selectable_disc_contents(source.clone(),FolderDiscMarkerKind::Sacd);
+        let mut draft=DiscBrowserState::new(contents,source.clone());
+        draft.tags=true;
+        draft.tag_source=NativeTagSource::AuthoredTrack;
+        draft.tag_fields=0x1a5;
+        draft.tag_artwork=false;
+        draft.destination="/tmp/selected-destination".into();
+        draft.naming_template="%ARTIST%/%TITLE%.%EXTENSION%".into();
+        draft.sacd_dff=true;
+        draft.contents.presentations[0].extract.authored_track_tags=vec![DiscExtractTagFields {
+            title:Some("Disc title".into()),..Default::default()
+        }];
+        draft.contents.presentations[0].extract.sidecar_track_tags=vec![DiscExtractTagFields {
+            title:Some("MusicBrainz title".into()),..Default::default()
+        }];
+        let mut app=AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen=AppScreen::Browse;
+        app.browse.entries=vec![
+            BrowseEntry::new(source.clone(),"A".into(),EntryKind::Archive,0,None),
+            BrowseEntry::new(other.clone(),"B".into(),EntryKind::Archive,0,None),
+        ];
+        app.browse.multi_selected=vec![source.clone(),other];
+        app.browse.selected_index=1;
+        let mut editor=crate::tui::app::MetadataEditorState::for_files(
+            vec![source.clone()],Vec::new(),vec!["01".into()],Default::default());
+        editor.return_to_extract=Some(Box::new(draft));
+        editor.extract_mb_populated=true;
+        editor.extract_mb_saved=true;
+        let (tx,_rx)=tokio::sync::mpsc::channel(4);
+        assert!(restore_extract_after_tag_editor(&mut app,&mut editor,&tx));
+        let ActiveOverlay::DiscBrowser(state)=&mut app.active_overlay else{panic!("Extract draft lost")};
+        assert_eq!(state.source_path,source,"Browse selection must not retarget Extract");
+        assert_eq!(state.destination,PathBuf::from("/tmp/selected-destination"));
+        assert_eq!(state.naming_template,"%ARTIST%/%TITLE%.%EXTENSION%");
+        assert_eq!(state.tag_fields,0x1a5);
+        assert_eq!(state.tag_source,NativeTagSource::AuthoredTrack);
+        assert!(!state.tag_artwork);
+        assert!(state.sacd_dff);
+        assert!(state.tag_mb_available);
+        assert_eq!(state.tag_source_option_count(),3);
+        let authored=state.native_job("/tmp".into());
+        assert_eq!(authored.programs[0].tracks[0].tags.title.as_deref(),Some("Disc title"));
+        set_native_tag_source(state,2);
+        assert_eq!(state.tag_source,NativeTagSource::MusicBrainz);
+        let lookup=state.native_job("/tmp".into());
+        assert_eq!(lookup.programs[0].tracks[0].tags.title.as_deref(),Some("MusicBrainz title"));
+    }
+
+    #[test]
+    fn r30c_tag_action_pills_have_click_and_enter_parity() {
+        use crate::tui::disc_browser::{ExtractPanel,TagSheetControl as C};
+        use crossterm::event::KeyModifiers;
+        let source=PathBuf::from("disc.iso");
+        let contents=selectable_disc_contents(source.clone(),FolderDiscMarkerKind::Sacd);
+        let mut app=AppState::new_for_test(TonepoetConfig::default());
+        let mut state=DiscBrowserState::new(contents,source);
+        state.tags=true;
+        state.sacd_dff=true;
+        state.panel=Some(ExtractPanel::Tags);
+        app.active_overlay=ActiveOverlay::DiscBrowser(Box::new(state));
+        let (tx,_rx)=tokio::sync::mpsc::channel(4);
+        let press=|app:&mut AppState,code| handle_disc_browser_key(app,
+            KeyEvent::new(code,KeyModifiers::NONE),&tx);
+        for control in [C::All,C::None,C::UseDsf] {
+            let index={let ActiveOverlay::DiscBrowser(state)=&mut app.active_overlay else{panic!("browser")};
+                if control==C::UseDsf {state.sacd_dff=true;}
+                state.tag_sheet_controls().iter().position(|item|*item==control).unwrap()};
+            assert!(handle_disc_browser_button_click(&mut app,
+                &TuiButton::DiscBrowserTagSheetControl(index),1,&tx));
+            let result_mouse={let ActiveOverlay::DiscBrowser(state)=&app.active_overlay else{panic!("browser")};
+                (state.tag_fields,state.sacd_dff)};
+            if let ActiveOverlay::DiscBrowser(state)=&mut app.active_overlay {
+                state.tag_fields=0x7f;
+                if control==C::UseDsf {state.sacd_dff=true;}
+                state.panel_cursor=index;
+            }
+            press(&mut app,KeyCode::Enter);
+            let result_key={let ActiveOverlay::DiscBrowser(state)=&app.active_overlay else{panic!("browser")};
+                (state.tag_fields,state.sacd_dff)};
+            assert_eq!(result_mouse,result_key,"{control:?} mouse vs keyboard");
         }
     }
 

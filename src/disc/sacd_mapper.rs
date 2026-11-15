@@ -60,7 +60,15 @@ pub fn map_sacd_disc(
 
     // Retain distinct tag authorities, even though presentation labels prefer
     // sidecar text. A user may reverse the precedence when extracting.
+    let toc = &metadata.master_toc;
+    let catalog = if !toc.disc_catalog_number.is_empty() { &toc.disc_catalog_number }
+        else { &toc.album_catalog_number };
+    let publisher = metadata.master_text.as_ref()
+        .and_then(|text| text.disc_publisher.as_ref().or(text.album_publisher.as_ref()))
+        .filter(|value| !value.trim().is_empty());
     let authored_album_tags = DiscExtractTagFields {
+        catalog: (!catalog.trim().is_empty()).then(|| catalog.clone()),
+        publisher: publisher.cloned(),
         album: metadata.album_title().map(str::to_string),
         artist: metadata.album_artist().map(str::to_string),
         genre: metadata.master_toc.disc_genres.first()
@@ -69,6 +77,10 @@ pub fn map_sacd_disc(
         ..Default::default()
     };
     let sidecar_album_tags = DiscExtractTagFields {
+        catalog: sidecar_first_track.and_then(|track|track.meta.get("CATALOGNUMBER")
+            .or_else(||track.meta.get("CATALOG"))).cloned(),
+        publisher: sidecar_first_track.and_then(|track|track.meta.get("PUBLISHER")
+            .or_else(||track.meta.get("LABEL"))).cloned(),
         album: sidecar_first_track.and_then(|track|track.meta.get("ALBUM")).cloned(),
         artist: sidecar_first_track.and_then(|track|track.meta.get("ARTIST")).cloned(),
         genre: sidecar_first_track.and_then(|track|track.meta.get("GENRE")).cloned(),
@@ -77,13 +89,9 @@ pub fn map_sacd_disc(
     };
     let mut presentations = Vec::new();
     let mut diagnostics = Vec::new();
-    let toc = &metadata.master_toc;
     let mut details = Vec::new();
-    let catalog = if !toc.disc_catalog_number.is_empty() { &toc.disc_catalog_number }
-        else { &toc.album_catalog_number };
     if !catalog.is_empty() { details.push(format!("Catalog {catalog}")); }
-    if let Some(publisher) = metadata.master_text.as_ref()
-        .and_then(|text| text.disc_publisher.as_ref().or(text.album_publisher.as_ref())) {
+    if let Some(publisher) = publisher {
         if !publisher.trim().is_empty() { details.push(format!("Publisher {publisher}")); }
     }
     if let Some(date) = toc.disc_date {
@@ -193,6 +201,8 @@ fn map_area(
                 title: get("TITLE"), artist: get("ARTIST"),
                 composer: get("COMPOSER"), performer: get("PERFORMER"),
                 genre: get("GENRE"), year: get("DATE"),
+                catalog: get("CATALOGNUMBER").or_else(||get("CATALOG")),
+                publisher: get("PUBLISHER").or_else(||get("LABEL")),
                 ..Default::default()
             }
         }).collect();

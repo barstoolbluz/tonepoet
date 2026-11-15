@@ -11778,6 +11778,12 @@ pub(crate) struct MetadataSourceSaveBatch {
 /// - read-only tab scroll values are clamped before storage.
 #[derive(Debug, Clone)]
 pub struct MetadataEditorState {
+    /// A screen-level draft owned by Extract while its existing metadata
+    /// editor/lookup is open. Never serialized or committed to the queue.
+    pub return_to_extract: Option<Box<crate::tui::disc_browser::DiscBrowserState>>,
+    pub extract_mb_populated: bool,
+    pub extract_mb_saved: bool,
+    pub extract_tags_saved: bool,
     /// True when the presentation tabs are single-image CUE surfaces (one
     /// tab per cue/image pair of an album). Split-cue MB population slices
     /// the release tracklist ACROSS tabs, which is only correct for cue
@@ -11853,6 +11859,10 @@ fn read_only_max_scroll(total_lines: usize, visible_rows: usize) -> usize {
 impl MetadataEditorState {
     pub fn from_model(model: MetadataEditorModel) -> Self {
         Self {
+            return_to_extract: None,
+            extract_mb_populated: false,
+            extract_mb_saved: false,
+            extract_tags_saved: false,
             cue_surface_tabs: false,
             archive_edit_context: None,
             archive_staging_dirty: false,

@@ -278,7 +278,18 @@ pub struct DiscBrowserState {
     pub overwrite_cursor: usize,
     pub show_hidden: bool,
     pub panel: Option<ExtractPanel>,
+    /// Focused control in the Tags sheet (index into tag_sheet_controls).
     pub panel_cursor: usize,
+    pub tag_source_open: bool,
+    pub tag_source_cursor: usize,
+    /// A MusicBrainz match was accepted and committed through the existing
+    /// editor/sidecar route for this Extract session.
+    pub tag_mb_available: bool,
+    /// Saved sidecar values are being refreshed through the existing probe.
+    pub tag_refresh_pending: bool,
+    pub tag_refresh_failed: bool,
+    /// Discovered once when opening the sheet, never scanned on each frame.
+    pub tag_preview_artwork: Option<PathBuf>,
     pub editing_destination: bool,
     pub destination_input: String,
     /// Unicode scalar insertion point in the active destination editor.
@@ -293,6 +304,9 @@ pub struct DiscBrowserState {
     pub destination: PathBuf,
     pub wav_container: crate::convert::pipeline::native_extract::NativeWavContainer,
     pub keep_dst: Vec<bool>,
+    /// The Format radio selection for all SACD outputs. Older native jobs
+    /// default to DSF; per-area keep_dst may still force DST/DFF.
+    pub sacd_dff: bool,
     /// One authored angle per title/playlist, shared by all its audio streams.
     pub selected_angles: Vec<u8>,
     pub tags: bool,
@@ -326,6 +340,19 @@ pub enum DestinationFeedback { WillBeCreated, NotWritable, InvalidPath }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExtractPanel { Tags, Downmix, AssumeDecrypted, Diagnostics, More, ConvertChoice, Keys }
+
+/// Shared Tags-sheet focus and mouse activation targets. No row-specific key
+/// shortcuts or hidden hot spots: all items use the same activation path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagSheetControl {
+    Transfer, Source, Field(usize), All, None, Artwork, UseDsf,
+    EditValues, MusicBrainz, Done,
+}
+
+pub const NATIVE_TAG_FIELD_LABELS: [&str; 9] = [
+    "Title", "Artist", "Album", "Genre", "Year", "Composer", "Performer",
+    "Catalog", "Publisher",
+];
 
 /// One logical row in the Audio Streams overlay after expansion is applied.
 ///
@@ -387,6 +414,12 @@ impl DiscBrowserState {
             show_hidden: false,
             panel: None,
             panel_cursor: 0,
+            tag_source_open: false,
+            tag_source_cursor: 0,
+            tag_mb_available: false,
+            tag_refresh_pending: false,
+            tag_refresh_failed: false,
+            tag_preview_artwork: None,
             editing_destination: false,
             destination_input: String::new(),
             destination_caret: 0,
@@ -399,6 +432,7 @@ impl DiscBrowserState {
             destination: source_path.parent().unwrap_or(Path::new(".")).join("Extracted"),
             wav_container: crate::convert::pipeline::native_extract::NativeWavContainer::Automatic,
             keep_dst: vec![false; len],
+            sacd_dff: false,
             selected_angles: vec![1; len],
             tags: true,
             tag_source: crate::convert::pipeline::native_extract::NativeTagSource::DiscAndSidecar,
@@ -615,7 +649,7 @@ impl DiscBrowserState {
                         program_index: index, audio_bytes: bytes, largest_item: bytes,
                         item_count: 1,
                         taggable_dsf: self.contents.format == DiscFormat::Sacd
-                            && self.tags && !program.keep_dst,
+                            && self.tags && !self.sacd_dff && !program.keep_dst,
                     });
                 }
             }
@@ -625,7 +659,7 @@ impl DiscBrowserState {
                     program_index: index, audio_bytes: program_bytes,
                     largest_item: largest, item_count: program.tracks.len(),
                     taggable_dsf: self.contents.format == DiscFormat::Sacd
-                        && self.tags && !program.keep_dst,
+                        && self.tags && !self.sacd_dff && !program.keep_dst,
                 });
             }
         }
@@ -871,9 +905,13 @@ impl DiscBrowserState {
     }
 
     pub fn output_rows(&self) -> Vec<&'static str> {
-        // One row per form control, plus a non-focusable Tags warning when
-        // DFF-only output cannot carry metadata. CUE remains conditional.
-        let mut rows = vec!["Format", "Overwrite", "Files", "Tags", "Log"];
+        // Keep DST is meaningful only when a selected SACD area is DST encoded.
+        let mut rows = vec!["Format", "Overwrite"];
+        if self.contents.format == DiscFormat::Sacd
+            && super::disc_browser_actions::selected_sacd_has_dst(self) {
+            rows.push("Keep DST");
+        }
+        rows.extend(["Files", "Tags", "Log"]);
         if self.file_per_program && self.contents.format != DiscFormat::Sacd {
             rows.push("CUE");
         }
@@ -898,8 +936,8 @@ impl DiscBrowserState {
         else { 8 }
     }
 
-    /// Track selected DFF (DST-preserving) versus DSF destinations. The
-    /// plain-DSD DFF carrier is deliberately deferred to round 4.
+    /// Track selected DSF and DFF destinations, including plain DSDIFF/DSD
+    /// and the per-area DST passthrough override.
     pub fn selected_sacd_tag_carriers(&self) -> (bool, bool) {
         if self.contents.format != DiscFormat::Sacd { return (true, false); }
         let mut dsf = false;
@@ -908,10 +946,91 @@ impl DiscBrowserState {
             if !*chosen || !self.items_checked.get(i).is_some_and(|v| v.iter().any(|item| *item)) {
                 continue;
             }
-            if self.keep_dst.get(i).copied().unwrap_or(false) { dff = true; }
+            if self.sacd_dff || self.keep_dst.get(i).copied().unwrap_or(false) { dff = true; }
             else { dsf = true; }
         }
         (dsf, dff)
+    }
+
+    /// Update only the disc evidence after a sidecar save, retaining every
+    /// Extract selection and form setting. A changed program structure needs
+    /// a new Extract session; remapping checkboxes would be unsafe.
+    pub fn accept_refreshed_tag_contents(&mut self, refreshed: DiscContents) -> Result<(), String> {
+        if !self.tag_refresh_pending {return Ok(());}
+        self.tag_refresh_pending=false;
+        let same_structure=self.contents.format==refreshed.format
+            && self.contents.presentations.len()==refreshed.presentations.len()
+            && self.contents.presentations.iter().zip(refreshed.presentations.iter())
+                .all(|(a,b)|a.id==b.id && a.tracks.len()==b.tracks.len());
+        if !same_structure {
+            self.tag_refresh_failed=true;
+            return Err("Disc structure changed while editing tags; reopen Extract".into());
+        }
+        self.contents=refreshed;
+        self.tag_refresh_failed=false;
+        Ok(())
+    }
+
+    pub fn tag_source_option_count(&self) -> usize {
+        if self.tag_mb_available {3} else {2}
+    }
+
+    pub fn tag_source_index(&self) -> usize {
+        use crate::convert::pipeline::native_extract::NativeTagSource;
+        match self.tag_source {
+            NativeTagSource::DiscAndSidecar => 0,
+            NativeTagSource::AuthoredTrack => 1,
+            NativeTagSource::MusicBrainz => 2,
+        }
+    }
+
+    pub fn tag_source_label(&self, index: usize) -> &'static str {
+        match (self.contents.format == DiscFormat::Sacd,index) {
+            (true,0)=>"Tag file, then disc text",
+            (true,1)=>"Disc text, then tag file",
+            (false,0)=>"Sidecar, then authored tags",
+            (false,1)=>"Authored tags, then sidecar",
+            (_,2) if self.tag_mb_available=>"MusicBrainz (saved tag file)",
+            _=>"Unknown source",
+        }
+    }
+
+    pub fn tag_sheet_controls(&self) -> Vec<TagSheetControl> {
+        use TagSheetControl as C;
+        let mut controls = vec![C::Transfer];
+        if self.tags {
+            controls.push(C::Source);
+            controls.extend((0..NATIVE_TAG_FIELD_LABELS.len()).map(C::Field));
+            controls.extend([C::All, C::None, C::Artwork]);
+            let (_, dff) = self.selected_sacd_tag_carriers();
+            if dff { controls.push(C::UseDsf); }
+        }
+        // Footer actions remain available even when tag transfer is off.
+        controls.extend([C::EditValues, C::MusicBrainz, C::Done]);
+        controls
+    }
+
+    /// The grouped writer tags an area/group file with program metadata,
+    /// never the highlighted individual track's title. An authored PCM track
+    /// is not known until preparation; don't present navigation as written tags.
+    pub fn tag_preview_is_pending(&self) -> bool {
+        self.contents.format != DiscFormat::Sacd
+            && self.tag_source != crate::convert::pipeline::native_extract::NativeTagSource::DiscAndSidecar
+    }
+
+    pub fn tag_preview_for_highlight(&self) -> crate::convert::pipeline::native_extract::NativeTagValues {
+        use crate::convert::pipeline::native_extract::{native_selected_track_tags, NativeTagValues};
+        let Some(p) = self.contents.presentations.get(self.cursor) else { return NativeTagValues::default(); };
+        let Some(program) = self.native_program_choice(self.cursor, p, Some(self.item_cursor))
+            else { return NativeTagValues::default(); };
+        if self.file_per_program {
+            // Authored non-SACD album values also come from preparation.
+            return if self.tag_preview_is_pending() { NativeTagValues::default() }
+                else { program.tags };
+        }
+        let Some(track) = program.tracks.first() else { return NativeTagValues::default(); };
+        native_selected_track_tags(self.contents.format, self.tag_source, &program, track)
+            .unwrap_or_default()
     }
 
     pub fn native_tags_available(&self) -> bool {
@@ -934,14 +1053,10 @@ impl DiscBrowserState {
         } else { Some(DestinationFeedback::NotWritable) };
     }
 
-    /// The Tags warning is displayed for DFF-only selections, but has no
-    /// action. Keep its visual row without making it a keyboard focus stop.
+    /// The Tags editor remains accessible even when DFF suppresses writing,
+    /// so keyboard users can reach its Use DSF action without a mouse.
     pub fn output_row_focusable(&self, index: usize) -> bool {
-        match self.output_rows().get(index) {
-            Some(&"Tags") => self.native_tags_available(),
-            Some(_) => true,
-            None => false,
-        }
+        self.output_rows().get(index).is_some()
     }
 
     pub fn normalize_output_cursor(&mut self) {
@@ -1061,6 +1176,12 @@ impl DiscBrowserState {
         if self.destination_feedback == Some(DestinationFeedback::NotWritable) {
             problems.push("Extraction destination is not writable".into());
         }
+        if self.tag_refresh_pending {
+            problems.push("Refreshing saved tags before extraction".into());
+        }
+        if self.tag_refresh_failed {
+            problems.push("Saved tags could not be refreshed; reopen Extract before extracting".into());
+        }
         if self.selected_item_count() == 0 { problems.push("Check at least one extractable track or chapter".into()); }
         if self.selected.iter().enumerate().any(|(i,checked)| *checked && !self.is_extractable(i)) {
             problems.push("One or more checked programs cannot be extracted".into());
@@ -1136,13 +1257,14 @@ impl DiscBrowserState {
     fn native_program_choice(&self, i: usize, p: &DiscPresentation,
         only_track: Option<usize>) -> Option<crate::convert::pipeline::native_extract::NativeProgramChoice> {
         use crate::convert::pipeline::native_extract::{NativeProgramChoice,NativeTrackChoice,
-            NativeTagSource,NativeTagValues};
+            NativeAuthoredTags,NativeTagSource,NativeTagValues};
         let sacd_tags = self.contents.format == DiscFormat::Sacd;
-        let sidecar_first = self.tag_source == NativeTagSource::DiscAndSidecar;
+        let sidecar_first = self.tag_source != NativeTagSource::AuthoredTrack;
+        let mb_only = self.tag_source == NativeTagSource::MusicBrainz;
         let tags_to_native = |tags: crate::disc::model::DiscExtractTagFields| NativeTagValues {
             title: tags.title, artist: tags.artist, album: tags.album,
             genre: tags.genre, year: tags.year, composer: tags.composer,
-            performer: tags.performer,
+            performer: tags.performer, catalog: tags.catalog, publisher: tags.publisher,
         };
         let tracks: Vec<NativeTrackChoice> = p.tracks.iter().enumerate()
             .filter(|(j,_)| only_track.map_or_else(|| self.items_checked[i].get(*j) == Some(&true), |track| track == *j))
@@ -1161,7 +1283,8 @@ impl DiscBrowserState {
                         .unwrap_or_default().prioritized(&p.extract.authored_album_tags);
                     let sidecar = p.extract.sidecar_track_tags.get(j).cloned()
                         .unwrap_or_default().prioritized(&p.extract.sidecar_album_tags);
-                    tags_to_native(if sidecar_first { sidecar.prioritized(&authored) }
+                    tags_to_native(if mb_only { sidecar }
+                        else if sidecar_first { sidecar.prioritized(&authored) }
                         else { authored.prioritized(&sidecar) })
                 } else { NativeTagValues {
                     title: if matches!(self.contents.format, DiscFormat::DvdVideo | DiscFormat::BluRay) {
@@ -1169,6 +1292,18 @@ impl DiscBrowserState {
                     } else { t.title.clone() },
                     performer:t.performer.clone(), artist:t.performer.clone(), ..Default::default()
                 } } }).collect();
+        let authored_tags = if sacd_tags { None } else {
+            let album = &p.extract.authored_album_tags;
+            let track_tags = tracks.iter().filter_map(|track| {
+                p.extract.authored_track_tags.get(track.number.saturating_sub(1) as usize)
+                    .filter(|value| *value != &crate::disc::model::DiscExtractTagFields::default())
+                    .map(|value| (track.number, tags_to_native(value.clone())))
+            }).collect::<std::collections::BTreeMap<_,_>>();
+            (album != &crate::disc::model::DiscExtractTagFields::default() || !track_tags.is_empty())
+                .then(|| NativeAuthoredTags {
+                album: tags_to_native(album.clone()), tracks: track_tags,
+            })
+        };
         (!tracks.is_empty()).then(|| NativeProgramChoice{
             id:p.id, angle:self.selected_angle_for(i), label:p.id.compact_label(), tracks,
             keep_dst:self.keep_dst.get(i) == Some(&true),
@@ -1181,10 +1316,12 @@ impl DiscBrowserState {
                 None
             } else { p.format.channel_layout.clone() },
             is_lossless:p.format.lossless,
+            authored_tags,
             tags: if sacd_tags {
                 let authored = &p.extract.authored_album_tags;
                 let sidecar = &p.extract.sidecar_album_tags;
-                tags_to_native(if sidecar_first { sidecar.prioritized(authored) }
+                tags_to_native(if mb_only { sidecar.clone() }
+                    else if sidecar_first { sidecar.prioritized(authored) }
                     else { authored.prioritized(sidecar) })
             } else {
                 let metadata = metadata_for_disc_presentation(&self.contents, Some(p));
@@ -1217,6 +1354,7 @@ impl DiscBrowserState {
             overwrite_policy:self.overwrite_policy, extraction_log:self.extraction_log,
             file_per_program:self.file_per_program, cue:self.cue,
             transfer_tags:self.tags && self.native_tags_available(),
+            sacd_dff:self.sacd_dff,
             tag_source:self.tag_source,
             tag_fields:self.tag_fields,tag_artwork:self.tag_artwork }
     }
@@ -2613,9 +2751,10 @@ mod disc_selection_bridge_tests {
         let mut state = DiscBrowserState::new(contents, "disc.iso".into());
         let tags = &mut state.contents.presentations[0].extract;
         tags.authored_album_tags = DiscExtractTagFields { album: Some("disc album".into()),
-            artist: Some("disc artist".into()), ..Default::default() };
+            artist: Some("disc artist".into()), catalog: Some("disc cat".into()),
+            publisher: Some("disc label".into()), ..Default::default() };
         tags.sidecar_album_tags = DiscExtractTagFields { album: Some("sidecar album".into()),
-            ..Default::default() };
+            publisher: Some("sidecar label".into()), ..Default::default() };
         tags.authored_track_tags = vec![DiscExtractTagFields { title: Some("disc title".into()),
             composer: Some("disc composer".into()), ..Default::default() }];
         tags.sidecar_track_tags = vec![DiscExtractTagFields { title: Some("sidecar title".into()),
@@ -2624,12 +2763,169 @@ mod disc_selection_bridge_tests {
         let job = state.native_job("/tmp".into());
         assert_eq!(job.programs[0].tags.album.as_deref(), Some("sidecar album"));
         assert_eq!(job.programs[0].tags.artist.as_deref(), Some("disc artist"));
+        assert_eq!(job.programs[0].tags.catalog.as_deref(), Some("disc cat"));
+        assert_eq!(job.programs[0].tags.publisher.as_deref(), Some("sidecar label"));
+        let preview = state.tag_preview_for_highlight();
+        assert_eq!(preview.catalog.as_deref(), Some("disc cat"));
+        assert_eq!(preview.publisher.as_deref(), Some("sidecar label"));
         assert_eq!(job.programs[0].tracks[0].tags.title.as_deref(), Some("sidecar title"));
         state.tag_source = NativeTagSource::AuthoredTrack;
         let job = state.native_job("/tmp".into());
         assert_eq!(job.programs[0].tags.album.as_deref(), Some("disc album"));
+        assert_eq!(job.programs[0].tags.publisher.as_deref(), Some("disc label"));
         assert_eq!(job.programs[0].tracks[0].tags.title.as_deref(), Some("disc title"));
         assert_eq!(job.programs[0].tracks[0].tags.composer.as_deref(), Some("disc composer"));
+    }
+
+    #[test]
+    fn r30d05_non_sacd_jobs_preserve_independent_authored_evidence() {
+        use crate::convert::pipeline::native_extract::NativeTagSource;
+        use crate::disc::model::DiscExtractTagFields;
+
+        for (format, id) in [
+            (DiscFormat::DvdAudio, PresentationId::DvdAudioGroup(1)),
+            (DiscFormat::DvdVideo, PresentationId::dvd_video(1, 1, 0)),
+            (DiscFormat::BluRay, PresentationId::try_blu_ray_title(1, 0x1100, 0, 1).unwrap()),
+        ] {
+            let mut contents = disc_contents(format, id, "Program");
+            let presentation = &mut contents.presentations[0];
+            presentation.album_title = Some("Navigation album from saved tags".into());
+            presentation.tracks[0].title = Some("Navigation track from saved tags".into());
+            presentation.extract.authored_album_tags = DiscExtractTagFields {
+                album: Some("Disc album".into()),
+                artist: Some("Disc artist".into()),
+                ..Default::default()
+            };
+            presentation.extract.authored_track_tags = vec![DiscExtractTagFields {
+                title: Some("Disc track".into()),
+                ..Default::default()
+            }];
+            presentation.extract.sidecar_album_tags = DiscExtractTagFields {
+                album: Some("Saved album".into()),
+                ..Default::default()
+            };
+            let mut state = DiscBrowserState::new(contents, "disc.iso".into());
+            state.tags = true;
+            state.tag_source = NativeTagSource::AuthoredTrack;
+            let job = state.native_job("/tmp".into());
+            assert_eq!(job.programs.len(), 1, "{format:?}");
+            let program = &job.programs[0];
+            assert_eq!(program.tags.album.as_deref(), Some("Navigation album from saved tags"),
+                "naming retains its established projection for {format:?}");
+            let independent = program.authored_tags.as_ref().unwrap();
+            assert_eq!(independent.album.album.as_deref(), Some("Disc album"), "{format:?}");
+            assert_eq!(independent.tracks.get(&1).unwrap().title.as_deref(),
+                Some("Disc track"), "{format:?}");
+
+            state.tag_source = NativeTagSource::MusicBrainz;
+            let job = state.native_job("/tmp".into());
+            assert_eq!(job.tag_source, NativeTagSource::MusicBrainz);
+            assert_eq!(job.programs[0].authored_tags.as_ref().unwrap()
+                .album.album.as_deref(), Some("Disc album"), "{format:?}");
+
+            // A parser that has no separate authored evidence does not
+            // repurpose a sidecar-merged display title as authored data.
+            state.contents.presentations[0].extract.authored_album_tags = Default::default();
+            state.contents.presentations[0].extract.authored_track_tags.clear();
+            state.tag_source = NativeTagSource::AuthoredTrack;
+            let job = state.native_job("/tmp".into());
+            assert!(job.programs[0].authored_tags.is_none(), "{format:?}");
+        }
+    }
+
+    #[test]
+    fn r30c_grouped_and_single_sacd_tag_preview_matches_published_selection() {
+        use crate::convert::pipeline::native_extract::{
+            native_selected_track_tags, selected_tag_items, NativeTagSource,
+        };
+        use crate::disc::model::{DiscExtractTagFields, SacdAreaId};
+
+        let contents = disc_contents(DiscFormat::Sacd,
+            PresentationId::SacdArea(SacdAreaId::Stereo), "DSD Stereo");
+        let mut state = DiscBrowserState::new(contents, "disc.iso".into());
+        let presentation = &mut state.contents.presentations[0];
+        presentation.tracks[0].title = Some("Track A".into());
+        presentation.extract.sidecar_album_tags = DiscExtractTagFields {
+            album: Some("Album".into()), artist: Some("Artist".into()),
+            ..Default::default()
+        };
+        presentation.extract.sidecar_track_tags = vec![DiscExtractTagFields {
+            title: Some("Track A".into()), ..Default::default()
+        }];
+        state.tags = true;
+        state.tag_fields = 0x1ff;
+
+        // The continuous writer uses program tags, without Track A as TITLE.
+        state.file_per_program = true;
+        let group = state.native_job("/tmp".into());
+        let group_preview = state.tag_preview_for_highlight();
+        assert_eq!(group_preview.title, None);
+        assert_eq!(group_preview.album.as_deref(), Some("Album"));
+        assert_eq!(selected_tag_items(&group_preview, state.tag_fields),
+            selected_tag_items(&group.programs[0].tags, group.tag_fields));
+
+        // Individual files use the worker's same selected-track projection.
+        state.file_per_program = false;
+        let single = state.native_job("/tmp".into());
+        let program = &single.programs[0];
+        let expected = native_selected_track_tags(DiscFormat::Sacd,
+            NativeTagSource::DiscAndSidecar, program, &program.tracks[0]).unwrap();
+        assert_eq!(state.tag_preview_for_highlight().title.as_deref(), Some("Track A"));
+        assert_eq!(selected_tag_items(&state.tag_preview_for_highlight(), state.tag_fields),
+            selected_tag_items(&expected, single.tag_fields));
+    }
+
+    #[test]
+    fn r30c_authored_non_sacd_preview_waits_for_prepared_metadata() {
+        use crate::convert::pipeline::native_extract::{native_selected_track_tags, NativeTagSource};
+        let contents = disc_contents(DiscFormat::DvdVideo,
+            PresentationId::dvd_video(1,1,0), "DVD title");
+        let mut state = DiscBrowserState::new(contents, "disc.iso".into());
+        state.contents.presentations[0].tracks[0].title = Some("Navigation title only".into());
+        state.tag_source = NativeTagSource::AuthoredTrack;
+        assert!(state.tag_preview_is_pending());
+        assert!(state.tag_preview_for_highlight().title.is_none());
+        let job = state.native_job("/tmp".into());
+        assert!(native_selected_track_tags(job.format, job.tag_source,
+            &job.programs[0], &job.programs[0].tracks[0]).is_none());
+        state.tag_source = NativeTagSource::MusicBrainz;
+        state.tag_mb_available = true;
+        assert_eq!(state.tag_source_option_count(), 3);
+        assert_eq!(state.tag_source_index(), 2);
+        assert!(state.tag_preview_is_pending(), "saved tags are resolved by the materializer");
+    }
+
+    #[test]
+    fn r30c_sidecar_refresh_preserves_extract_draft_but_rejects_new_disc_shape() {
+        use crate::disc::model::{DiscExtractTagFields, SacdAreaId};
+        let contents = disc_contents(DiscFormat::Sacd,
+            PresentationId::SacdArea(SacdAreaId::Stereo), "DSD Stereo");
+        let mut state = DiscBrowserState::new(contents, "disc.iso".into());
+        state.destination = "/tmp/extract-target".into();
+        state.naming_template = "%ARTIST%/%TITLE%".into();
+        state.sacd_dff = true;
+        state.tag_fields = 0x1ab;
+        state.tag_refresh_pending = true;
+        let mut updated = state.contents.clone();
+        updated.presentations[0].extract.sidecar_album_tags = DiscExtractTagFields {
+            album: Some("New sidecar album".into()), ..Default::default()
+        };
+        state.accept_refreshed_tag_contents(updated).unwrap();
+        assert_eq!(state.native_job("/tmp".into()).programs[0].tags.album.as_deref(),
+            Some("New sidecar album"));
+        assert_eq!(state.destination, std::path::PathBuf::from("/tmp/extract-target"));
+        assert_eq!(state.naming_template, "%ARTIST%/%TITLE%");
+        assert!(state.sacd_dff);
+        assert_eq!(state.tag_fields, 0x1ab);
+        assert!(!state.tag_refresh_pending);
+        assert!(!state.tag_refresh_failed);
+
+        state.tag_refresh_pending = true;
+        let mut incompatible = state.contents.clone();
+        let duplicate_track = incompatible.presentations[0].tracks[0].clone();
+        incompatible.presentations[0].tracks.push(duplicate_track);
+        assert!(state.accept_refreshed_tag_contents(incompatible).is_err());
+        assert!(state.tag_refresh_failed);
     }
 
     #[test]

@@ -244,6 +244,8 @@ pub struct DiscExtractTagFields {
     pub year: Option<String>,
     pub composer: Option<String>,
     pub performer: Option<String>,
+    pub catalog: Option<String>,
+    pub publisher: Option<String>,
 }
 
 impl DiscExtractTagFields {
@@ -260,6 +262,8 @@ impl DiscExtractTagFields {
             year: pick(&self.year, &fallback.year),
             composer: pick(&self.composer, &fallback.composer),
             performer: pick(&self.performer, &fallback.performer),
+            catalog: pick(&self.catalog, &fallback.catalog),
+            publisher: pick(&self.publisher, &fallback.publisher),
         }
     }
 }

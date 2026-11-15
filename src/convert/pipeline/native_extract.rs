@@ -51,10 +51,36 @@ pub struct NativeTagValues {
     pub year: Option<String>,
     pub composer: Option<String>,
     pub performer: Option<String>,
+    #[serde(default)]
+    pub catalog: Option<String>,
+    #[serde(default)]
+    pub publisher: Option<String>,
+}
+
+impl NativeTagValues {
+    /// Resolve one field at a time. A blank higher-priority value is absent,
+    /// not an instruction to erase a value supplied by the other authority.
+    fn prioritized(&self, fallback: &Self) -> Self {
+        let pick = |primary: &Option<String>, secondary: &Option<String>| {
+            primary.as_ref().filter(|value| !value.trim().is_empty()).cloned()
+                .or_else(|| secondary.as_ref().filter(|value| !value.trim().is_empty()).cloned())
+        };
+        Self {
+            title: pick(&self.title, &fallback.title),
+            artist: pick(&self.artist, &fallback.artist),
+            album: pick(&self.album, &fallback.album),
+            genre: pick(&self.genre, &fallback.genre),
+            year: pick(&self.year, &fallback.year),
+            composer: pick(&self.composer, &fallback.composer),
+            performer: pick(&self.performer, &fallback.performer),
+            catalog: pick(&self.catalog, &fallback.catalog),
+            publisher: pick(&self.publisher, &fallback.publisher),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum NativeTagSource { DiscAndSidecar, AuthoredTrack }
+pub enum NativeTagSource { DiscAndSidecar, AuthoredTrack, MusicBrainz }
 fn default_tag_source() -> NativeTagSource { NativeTagSource::DiscAndSidecar }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +99,15 @@ pub struct NativeTrackChoice {
 
 fn default_angle_one() -> u8 { 1 }
 
+/// Authoritative text fields captured independently of the display-oriented
+/// disc navigation model. Only a mapper that actually distinguishes disc text
+/// from a saved tag file can populate these values.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NativeAuthoredTags {
+    pub album: NativeTagValues,
+    pub tracks: BTreeMap<u32, NativeTagValues>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NativeProgramChoice {
     pub id: PresentationId,
@@ -90,6 +125,10 @@ pub struct NativeProgramChoice {
     pub is_lossless: bool,
     #[serde(default)]
     pub tags: NativeTagValues,
+    /// Optional independent authored evidence for non-SACD tag precedence.
+    /// Older recovery records have none and continue to use prepared metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authored_tags: Option<NativeAuthoredTags>,
 }
 
 /// Disc identity as reported by the probed source, not inferred from filenames.
@@ -127,6 +166,10 @@ pub struct NativeExtractionJob {
     pub cue: bool,
     #[serde(default)]
     pub transfer_tags: bool,
+    /// Plain DSDIFF/DSD output for SACD; DST passthrough still uses the
+    /// per-area keep_dst flag. Missing in older recovery journals means DSF.
+    #[serde(default)]
+    pub sacd_dff: bool,
     #[serde(default = "default_tag_source")]
     pub tag_source: NativeTagSource,
     #[serde(default = "default_tag_fields")]
@@ -669,7 +712,8 @@ async fn execute_inner(
                 let item_copy = item_cancel.clone();
                 let controls_copy = controls.clone();
                 let keep_dst = program.keep_dst;
-                tokio::task::spawn_blocking(move || extract_sacd_native(&src, &dst, keep_dst, &cancel_copy, &item_copy, &controls_copy))
+                let dff = job.sacd_dff || keep_dst;
+                tokio::task::spawn_blocking(move || extract_sacd_native(&src, &dst, dff, keep_dst, &cancel_copy, &item_copy, &controls_copy))
                     .await.map_err(|e| format!("SACD extraction task: {e}"))??;
             } else {
                 if job.format == DiscFormat::DvdAudio {
@@ -713,7 +757,7 @@ async fn execute_inner(
                 let _ = fs::remove_file(&carrier);
             }
             controls.wait_ready(&cancel, &item_cancel).await?;
-            if job.transfer_tags && !job.file_per_program && !program.keep_dst {
+            if job.transfer_tags && !job.file_per_program && !(job.format == DiscFormat::Sacd && (job.sacd_dff || program.keep_dst)) {
                 let entries = extraction_tags(&job, program, requested, track, &prepared.album_metadata);
                 let art = if job.tag_artwork { native_artwork_path(&prepared.album_metadata, &job.source) } else { None };
                 if !entries.is_empty() || art.is_some() {
@@ -785,6 +829,7 @@ async fn execute_inner(
             let container = job.wav_container;
             let sacd = job.format == DiscFormat::Sacd;
             let keep_dst = program.keep_dst;
+            let dff = job.sacd_dff || keep_dst;
             let join_bytes = grouped_outputs.iter()
                 .filter_map(|(_, path, _)| fs::metadata(path).ok().map(|m| m.len()))
                 .fold(0u64, u64::saturating_add);
@@ -798,7 +843,7 @@ async fn execute_inner(
                 let checkpoint = || if join_controls.wait_blocking(&cancel_copy, &join_copy) {
                     Err("Continuous extraction cancelled".to_owned())
                 } else { Ok(()) };
-                if sacd { concatenate_sacd_tracks_checked(&parts, &grouped, keep_dst, &cancel_copy, checkpoint) }
+                if sacd { concatenate_sacd_tracks_checked(&parts, &grouped, dff, keep_dst, &cancel_copy, checkpoint) }
                 else { concatenate_generated_waves_checked(&parts, &grouped, container, &cancel_copy, checkpoint) }
             }).await.map_err(|e| format!("Continuous native audio worker: {e}"))??;
             controls.wait_ready(&cancel, &join_item).await?;
@@ -819,18 +864,9 @@ async fn execute_inner(
                 controls.record_prepared_cue(&grouped_target.with_extension("cue"), &cue_text)?;
                 Some(path)
             } else { None };
-            if job.transfer_tags && !program.keep_dst {
+            if job.transfer_tags && !(job.format == DiscFormat::Sacd && (job.sacd_dff || program.keep_dst)) {
                 let root_tags = if job.format == DiscFormat::Sacd { program.tags.clone() }
-                else { match job.tag_source {
-                    NativeTagSource::DiscAndSidecar => program.tags.clone(),
-                    NativeTagSource::AuthoredTrack => NativeTagValues {
-                        album: prepared.album_metadata.album.clone(),
-                        artist: prepared.album_metadata.album_artist.as_deref().map(str::to_string),
-                        genre: prepared.album_metadata.genre.as_deref().map(str::to_string),
-                        year: prepared.album_metadata.date.clone(),
-                        ..Default::default()
-                    },
-                }};
+                else { native_non_sacd_album_tags(job.tag_source, program, &prepared.album_metadata) };
                 let fields = job.tag_fields;
                 let art = if job.tag_artwork { native_artwork_path(&prepared.album_metadata, &job.source) } else { None };
                 let grouped_copy = grouped_file.clone();
@@ -982,6 +1018,7 @@ pub(crate) fn render_native_extraction_log_with_outcome(
     } else { "tracks" };
     let format_name = |p: &NativeProgramChoice| match job.format {
         DiscFormat::Sacd if p.keep_dst => "DFF (DST kept)",
+        DiscFormat::Sacd if job.sacd_dff => "DFF (DSD native; DST decoded if present)",
         DiscFormat::Sacd => "DSF (DSD native; DST decoded if present)",
         _ => match job.wav_container {
             NativeWavContainer::Automatic => "WAV (RIFF or RF64 as needed)",
@@ -1020,6 +1057,7 @@ pub(crate) fn render_native_extraction_log_with_outcome(
     lines.push(format!("Tag source: {}", match job.tag_source {
         NativeTagSource::DiscAndSidecar => "tag file, then disc metadata",
         NativeTagSource::AuthoredTrack => "disc metadata, then tag file",
+        NativeTagSource::MusicBrainz => "MusicBrainz match saved to tag file",
     }));
     lines.push(format!("When a file exists: {}", match job.overwrite_policy {
         NativeOverwritePolicy::Fail => "stop",
@@ -1342,7 +1380,7 @@ fn write_completed_native_metadata(
 /// Supported tag keys are sent to the existing metadata persistence writers.
 /// This runs on completed private media only; a failure never publishes a
 /// partially tagged file. The caller's field mask is the exact user choice.
-fn selected_tag_items(values: &NativeTagValues, fields: u16) -> Vec<(lofty::tag::ItemKey, Option<String>)> {
+pub(crate) fn selected_tag_items(values: &NativeTagValues, fields: u16) -> Vec<(lofty::tag::ItemKey, Option<String>)> {
     use lofty::tag::ItemKey;
     let items = [
         (0, ItemKey::TrackTitle, &values.title),
@@ -1352,6 +1390,8 @@ fn selected_tag_items(values: &NativeTagValues, fields: u16) -> Vec<(lofty::tag:
         (4, ItemKey::Year, &values.year),
         (5, ItemKey::Composer, &values.composer),
         (6, ItemKey::Performer, &values.performer),
+        (7, ItemKey::CatalogNumber, &values.catalog),
+        (8, ItemKey::Publisher, &values.publisher),
     ];
     items.into_iter().filter_map(|(i, key, value)| {
         if fields & (1 << i) == 0 { return None; }
@@ -1359,42 +1399,106 @@ fn selected_tag_items(values: &NativeTagValues, fields: u16) -> Vec<(lofty::tag:
     }).collect()
 }
 
+/// Exact tag values used by the individual native writer when they can be
+/// resolved before materialization. For authored PCM the worker uses the
+/// prepared track instead, so the UI must mark those fields as pending.
+pub(crate) fn native_selected_track_tags(
+    format: DiscFormat, source: NativeTagSource,
+    program: &NativeProgramChoice, requested: &NativeTrackChoice,
+) -> Option<NativeTagValues> {
+    if format != DiscFormat::Sacd && source != NativeTagSource::DiscAndSidecar {
+        return None;
+    }
+    Some(NativeTagValues {
+        title: requested.tags.title.clone(),
+        artist: requested.tags.artist.clone().or_else(||program.tags.artist.clone()),
+        album: if format == DiscFormat::Sacd {
+            requested.tags.album.clone().or_else(||program.tags.album.clone())
+        } else { program.tags.album.clone() },
+        genre: requested.tags.genre.clone().or_else(||program.tags.genre.clone()),
+        year: requested.tags.year.clone().or_else(||program.tags.year.clone()),
+        composer: requested.tags.composer.clone().or_else(||
+            (format == DiscFormat::Sacd).then(||program.tags.composer.clone()).flatten()),
+        performer: requested.tags.performer.clone().or_else(||
+            (format == DiscFormat::Sacd).then(||program.tags.performer.clone()).flatten()),
+        catalog: requested.tags.catalog.clone().or_else(||program.tags.catalog.clone()),
+        publisher: requested.tags.publisher.clone().or_else(||program.tags.publisher.clone()),
+    })
+}
+
+fn native_non_sacd_album_tags(
+    source: NativeTagSource, program: &NativeProgramChoice, album: &AlbumMetadata,
+) -> NativeTagValues {
+    // The materializer has already applied the saved tag file. Only an
+    // independently observed authored field can override it: the navigation
+    // projection is often itself sidecar-merged (notably for DVD-Audio).
+    let prepared = NativeTagValues {
+        album: album.album.clone(),
+        artist: album.album_artist.as_deref().map(str::to_string),
+        genre: album.genre.as_deref().map(str::to_string),
+        year: album.date.clone(),
+        ..Default::default()
+    };
+    match source {
+        NativeTagSource::DiscAndSidecar => program.tags.clone(),
+        NativeTagSource::AuthoredTrack => program.authored_tags.as_ref()
+            .map(|tags| tags.album.prioritized(&prepared)).unwrap_or(prepared),
+        NativeTagSource::MusicBrainz => prepared,
+    }
+}
+
+fn native_prepared_track_tags(
+    job: &NativeExtractionJob, requested: &NativeTrackChoice,
+    prepared: &PreparedTrack, album: &AlbumMetadata,
+) -> NativeTagValues {
+    NativeTagValues {
+        title: prepared.metadata.title.as_ref().filter(|title| {
+            !matches!(job.format, DiscFormat::DvdVideo | DiscFormat::BluRay)
+                || *title != &format!("Chapter {}", requested.number)
+        }).cloned(),
+        artist: prepared.metadata.artist.as_deref().map(str::to_string),
+        album: album.album.clone(),
+        genre: prepared.metadata.genre.as_deref().map(str::to_string),
+        year: prepared.metadata.date.clone().or_else(||album.date.clone()),
+        composer: prepared.metadata.composer.as_deref().map(str::to_string),
+        performer: prepared.metadata.performer.as_deref().map(str::to_string),
+        catalog: prepared.metadata.extra.get("CATALOGNUMBER").cloned(),
+        publisher: prepared.metadata.publisher.clone(),
+    }
+}
+
+fn native_non_sacd_track_tags(
+    format: DiscFormat, source: NativeTagSource, program: &NativeProgramChoice,
+    requested: &NativeTrackChoice, prepared: NativeTagValues,
+) -> NativeTagValues {
+    // The navigation projection is still used by the old default, but must
+    // never be mistaken for independent authored evidence in authored-first
+    // mode: DVD-A metabase titles, for example, already include sidecar tags.
+    match source {
+        NativeTagSource::DiscAndSidecar => native_selected_track_tags(format,
+            source, program, requested).unwrap_or_default(),
+        NativeTagSource::AuthoredTrack => program.authored_tags.as_ref().map(|tags| {
+            let authored_track = tags.tracks.get(&requested.number).cloned().unwrap_or_default();
+            authored_track.prioritized(&tags.album).prioritized(&prepared)
+        }).unwrap_or(prepared),
+        NativeTagSource::MusicBrainz => prepared,
+    }
+}
+
 fn extraction_tags(
     job: &NativeExtractionJob, program: &NativeProgramChoice,
     requested: &NativeTrackChoice, prepared: &PreparedTrack,
     album: &AlbumMetadata,
 ) -> Vec<(lofty::tag::ItemKey, Option<String>)> {
-    let values = if job.format == DiscFormat::Sacd { NativeTagValues {
-        title: requested.tags.title.clone(),
-        artist: requested.tags.artist.clone().or_else(||program.tags.artist.clone()),
-        album: requested.tags.album.clone().or_else(||program.tags.album.clone()),
-        genre: requested.tags.genre.clone().or_else(||program.tags.genre.clone()),
-        year: requested.tags.year.clone().or_else(||program.tags.year.clone()),
-        composer: requested.tags.composer.clone().or_else(||program.tags.composer.clone()),
-        performer: requested.tags.performer.clone().or_else(||program.tags.performer.clone()),
-    }} else { match job.tag_source {
-        NativeTagSource::DiscAndSidecar => NativeTagValues {
-            title: requested.tags.title.clone(),
-            artist: requested.tags.artist.clone().or_else(||program.tags.artist.clone()),
-            album: program.tags.album.clone(),
-            genre: requested.tags.genre.clone().or_else(||program.tags.genre.clone()),
-            year: requested.tags.year.clone().or_else(||program.tags.year.clone()),
-            composer: requested.tags.composer.clone(),
-            performer: requested.tags.performer.clone(),
-        },
-        NativeTagSource::AuthoredTrack => NativeTagValues {
-            title: prepared.metadata.title.as_ref().filter(|title| {
-                !matches!(job.format, DiscFormat::DvdVideo | DiscFormat::BluRay)
-                    || *title != &format!("Chapter {}", requested.number)
-            }).cloned(),
-            artist: prepared.metadata.artist.as_deref().map(str::to_string),
-            album: album.album.clone(),
-            genre: prepared.metadata.genre.as_deref().map(str::to_string),
-            year: prepared.metadata.date.clone().or_else(||album.date.clone()),
-            composer: prepared.metadata.composer.as_deref().map(str::to_string),
-            performer: prepared.metadata.performer.as_deref().map(str::to_string),
-        },
-    }};
+    let values = if job.format == DiscFormat::Sacd {
+        // SACD source authority was resolved at job creation and is unchanged.
+        native_selected_track_tags(job.format, job.tag_source, program, requested)
+            .unwrap_or_default()
+    } else {
+        let from_sidecar = native_prepared_track_tags(job, requested, prepared, album);
+        native_non_sacd_track_tags(job.format, job.tag_source,
+            program, requested, from_sidecar)
+    };
     selected_tag_items(&values, job.tag_fields)
 }
 
@@ -1434,7 +1538,7 @@ pub(crate) fn native_artwork_path(album: &AlbumMetadata, source: &Path) -> Optio
 
 fn extraction_extension(job: &NativeExtractionJob, program: &NativeProgramChoice) -> &'static str {
     if job.format == DiscFormat::Sacd {
-        if program.keep_dst { "dff" } else { "dsf" }
+        if job.sacd_dff || program.keep_dst { "dff" } else { "dsf" }
     } else if job.wav_container == NativeWavContainer::W64 { "w64" } else { "wav" }
 }
 
@@ -1712,7 +1816,7 @@ pub(crate) fn validate_job(job: &NativeExtractionJob) -> Result<(), String> {
                 inspect_publication_target(job, &mut planned, cue)?;
             }
         }
-        if program.keep_dst && (job.format != DiscFormat::Sacd) {
+        if (program.keep_dst || job.sacd_dff) && job.format != DiscFormat::Sacd {
             return Err("DST passthrough is available only for SACD".into());
         }
     }
@@ -1803,7 +1907,7 @@ fn materializer_request(job: &NativeExtractionJob, program: &NativeProgramChoice
     })
 }
 
-fn extract_sacd_native(src: &TrackSourceRef, output: &Path, keep_dst: bool,
+fn extract_sacd_native(src: &TrackSourceRef, output: &Path, dff: bool, keep_dst: bool,
     cancel: &CancellationToken, item_cancel: &CancellationToken,
     controls: &NativeExtractionControl) -> Result<(), String> {
     let TrackSourceRef::SacdTrack { iso, track_index, area } = src else { return Err("Not a SACD track".into()); };
@@ -1813,7 +1917,9 @@ fn extract_sacd_native(src: &TrackSourceRef, output: &Path, keep_dst: bool,
         SacdArea::MultiChannel => metadata.multi_channel.as_ref(),
     }.ok_or("Selected SACD area disappeared")?;
     if !matches!(area_info.header.channel_count, 2 | 5 | 6) { return Err("Unsupported SACD channel count".into()); }
-    let format = if keep_dst { sacd_rs::extract::OutputFormat::DffDst } else { sacd_rs::extract::OutputFormat::Dsf };
+    let format = if keep_dst { sacd_rs::extract::OutputFormat::DffDst }
+        else if dff { sacd_rs::extract::OutputFormat::Dff }
+        else { sacd_rs::extract::OutputFormat::Dsf };
     let options = area_info.track_extract_options(*track_index as usize, format)
         .map_err(|e| e.to_string())?;
     let mut reader = sacd_rs::iso_reader::IsoReader::open(iso).map_err(|e| e.to_string())?;
@@ -1836,14 +1942,14 @@ fn extract_sacd_native(src: &TrackSourceRef, output: &Path, keep_dst: bool,
 fn concatenate_sacd_tracks(
     parts: &[PathBuf], output: &Path, keep_dst: bool, cancel: &CancellationToken,
 ) -> Result<(Vec<u64>, u32), String> {
-    concatenate_sacd_tracks_checked(parts, output, keep_dst, cancel, || Ok(()))
+    concatenate_sacd_tracks_checked(parts, output, keep_dst, keep_dst, cancel, || Ok(()))
 }
 
 fn concatenate_sacd_tracks_checked(
-    parts: &[PathBuf], output: &Path, keep_dst: bool, cancel: &CancellationToken,
+    parts: &[PathBuf], output: &Path, dff: bool, keep_dst: bool, cancel: &CancellationToken,
     mut checkpoint: impl FnMut() -> Result<(), String>,
 ) -> Result<(Vec<u64>, u32), String> {
-    use sacd_rs::dsd_file::{DsdFrameReader, DsfStreamReader, DstFrameReader, DstDsdiffStreamReader};
+    use sacd_rs::dsd_file::{DsdFrameReader, DsfStreamReader, DsdDsdiffStreamReader, DstFrameReader, DstDsdiffStreamReader};
     if parts.is_empty() { return Err("Continuous SACD selection is empty".into()); }
     let mut samples = Vec::with_capacity(parts.len());
     if keep_dst {
@@ -1877,6 +1983,40 @@ fn concatenate_sacd_tracks_checked(
                     .map_err(|e|format!("Join source DST frame: {e}"))?;
                 track_samples = track_samples.checked_add((decoded.len() / usize::from(channels)) as u64 * 8)
                     .ok_or("DST sample-count overflow")?;
+            }
+            samples.push(track_samples);
+        }
+        writer.finish().map_err(|e|format!("Finish continuous DFF: {e}"))?;
+        File::open(output).and_then(|f| f.sync_all()).map_err(|e|e.to_string())?;
+        Ok((samples, rate))
+    } else if dff {
+        // Plain DSDIFF/DSD, including decoded DST. Reopen each completed
+        // track, preserve the channel-interleaved DSD payload and emit one
+        // valid continuous DFF header; never concatenate container headers.
+        let first = DsdDsdiffStreamReader::new(File::open(&parts[0]).map_err(|e|e.to_string())?)
+            .map_err(|e|format!("Read DFF track: {e}"))?;
+        let channels = u8::try_from(first.info().channel_count)
+            .map_err(|_| "Invalid SACD channel count")?;
+        let rate = first.info().sample_rate;
+        let file = OpenOptions::new().create_new(true).write(true).read(true).open(output)
+            .map_err(|e|format!("Create private continuous DFF: {e}"))?;
+        let mut writer = sacd_rs::dff_writer::DffWriter::new(file, channels, rate)
+            .map_err(|e|format!("Create continuous DFF writer: {e}"))?;
+        for (index, part) in parts.iter().enumerate() {
+            checkpoint()?;
+            if cancel.is_cancelled() { return Err("SACD extraction cancelled".into()); }
+            let mut reader = DsdDsdiffStreamReader::new(File::open(part).map_err(|e|e.to_string())?)
+                .map_err(|e|format!("Read DFF track: {e}"))?;
+            if reader.info().channel_count != u16::from(channels) || reader.info().sample_rate != rate {
+                return Err(format!("SACD track {} has a different channel count or DSD clock",index+1));
+            }
+            let mut track_samples = 0u64;
+            while let Some(frame) = reader.next_dsd_frame().map_err(|e|format!("Read DSDIFF data: {e}"))? {
+                checkpoint()?;
+                if cancel.is_cancelled() { return Err("SACD extraction cancelled".into()); }
+                writer.write_frame(&frame.data).map_err(|e|format!("Join DFF data: {e}"))?;
+                track_samples = track_samples.checked_add((frame.data.len() / usize::from(channels)) as u64 * 8)
+                    .ok_or("DSD sample-count overflow")?;
             }
             samples.push(track_samples);
         }
@@ -2079,14 +2219,14 @@ mod tests {
                     tags: NativeTagValues::default(), estimated_bytes: None }],
                 keep_dst: false, source_depth: Some(1), source_channels: Some(2),
                 source_rate: Some(2_822_400), source_layout: None, is_lossless: true,
-                tags: NativeTagValues::default(),
+                tags: NativeTagValues::default(), authored_tags: None,
             }],
             destination: destination.to_path_buf(), working_root: scratch.to_path_buf(),
             wav_container: NativeWavContainer::Automatic, assume_decrypted: false,
             downmix: DvdaDownmixPolicy::None, naming_template: default_naming_template(),
             program_subfolders: true, overwrite_policy: NativeOverwritePolicy::Fail,
             extraction_log: false, file_per_program: false, cue: false,
-            transfer_tags: false, tag_source: default_tag_source(),
+            transfer_tags: false, sacd_dff: false, tag_source: default_tag_source(),
             tag_fields: default_tag_fields(), tag_artwork: false,
         }
     }
@@ -2660,7 +2800,7 @@ mod tests {
             source_depth: Some(1), source_channels: Some(2), source_rate: Some(2_822_400),
             source_layout: Some("stereo".into()), is_lossless: true,
             tags: NativeTagValues { album: Some("An Album".into()),
-                artist: Some("A Performer".into()), ..Default::default() },
+                artist: Some("A Performer".into()), ..Default::default() }, authored_tags: None,
         };
         let track = NativeTrackChoice { duration_secs: None, number: 3, name: "A Song".into(),
             tags: NativeTagValues { title: Some("A Song".into()),
@@ -2930,7 +3070,7 @@ mod tests {
         job.naming_template = "%ARTIST%/%TRACKNUMBER% - %TITLE%".into();
         job.program_subfolders = false;
         assert_eq!(proposed_destination(&job, &job.programs[0], &job.programs[0].tracks[0]),
-            job.destination.join("_outside_folder/Stereo - 01 - .._.._escape.dsf"));
+            job.destination.join("outside folder/Stereo - 01 - .. .. escape.dsf"));
     }
 
     #[test]
@@ -3073,7 +3213,7 @@ mod tests {
                 source_depth: Some(1),
                 source_channels: Some(2),
                 source_rate: Some(2_822_400),
-                angle: 1, source_layout: None, is_lossless: true, tags: NativeTagValues::default(),
+                angle: 1, source_layout: None, is_lossless: true, tags: NativeTagValues::default(), authored_tags: None,
             }],
             destination: destination.clone(),
             working_root: scratch,
@@ -3083,7 +3223,7 @@ mod tests {
             naming_template:default_naming_template(),program_subfolders:true,
             overwrite_policy:NativeOverwritePolicy::Fail,extraction_log:false,
             file_per_program:false,cue:false,
-            transfer_tags:false,tag_source:default_tag_source(),tag_fields:default_tag_fields(),tag_artwork:false,
+            transfer_tags:false,sacd_dff: false, tag_source:default_tag_source(),tag_fields:default_tag_fields(),tag_artwork:false,
         };
         let error = execute(job, CancellationToken::new(), |_| {}).await.unwrap_err();
         assert!(error.contains("within the destination"), "{error}");
@@ -3155,6 +3295,239 @@ mod tests {
     }
 
     #[test]
+    fn r30_plain_dff_continuous_join_preserves_interleaved_bytes_and_sample_counts() {
+        use sacd_rs::dsd_file::{DsdFrameReader, DsdDsdiffStreamReader};
+        for channels in [2u8, 5, 6] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut parts = Vec::new();
+            let mut expected = Vec::new();
+            let mut sample_counts = Vec::new();
+            // Nonadjacent authored tracks with different lengths exercise the
+            // exact same sequential join route as an area-level extraction.
+            for index in [0usize, 2] {
+                let path = temp.path().join(format!("part-{index}.dff"));
+                let data: Vec<u8> = (0..4704 * (index + 1) * usize::from(channels))
+                    .map(|n| ((n * 37 + index * 19) % 251) as u8).collect();
+                let mut writer = sacd_rs::dff_writer::DffWriter::new(
+                    File::create(&path).unwrap(), channels, 2_822_400).unwrap();
+                writer.write_frame(&data).unwrap();
+                writer.finish().unwrap();
+                sample_counts.push((data.len() / usize::from(channels) * 8) as u64);
+                expected.extend_from_slice(&data);
+                parts.push(path);
+            }
+            let output = temp.path().join("continuous.dff");
+            let (counts, rate) = concatenate_sacd_tracks_checked(
+                &parts, &output, true, false, &CancellationToken::new(), || Ok(()),
+            ).unwrap();
+            assert_eq!(counts, sample_counts, "{channels} channels");
+            assert_eq!(rate, 2_822_400);
+            let mut reader = DsdDsdiffStreamReader::new(File::open(&output).unwrap()).unwrap();
+            assert_eq!(reader.info().channel_count, u16::from(channels));
+            assert_eq!(reader.info().sample_rate, rate);
+            let mut actual = Vec::new();
+            while let Some(frame) = reader.next_dsd_frame().unwrap() {
+                actual.extend_from_slice(&frame.data);
+            }
+            assert_eq!(actual, expected, "DFF altered DSD audio for {channels} channels");
+            assert!(reader.next_dsd_frame().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn r30_plain_dff_join_rejects_incompatible_clocks_before_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut parts = Vec::new();
+        for (i, rate) in [2_822_400, 5_644_800].into_iter().enumerate() {
+            let path = temp.path().join(format!("part-{i}.dff"));
+            let mut writer = sacd_rs::dff_writer::DffWriter::new(
+                File::create(&path).unwrap(), 2, rate).unwrap();
+            writer.write_frame(&[0xa5; 9408]).unwrap();
+            writer.finish().unwrap();
+            parts.push(path);
+        }
+        let error = concatenate_sacd_tracks_checked(
+            &parts, &temp.path().join("private.dff"), true, false,
+            &CancellationToken::new(), || Ok(()),
+        ).unwrap_err();
+        assert!(error.contains("different channel count or DSD clock"), "{error}");
+    }
+
+    #[test]
+    fn r30_plain_dff_extension_tags_and_legacy_recovery_defaults() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut job = fixture_job(&temp.path().join("out"), temp.path());
+        let program = &job.programs[0];
+        let track = &program.tracks[0];
+        assert_eq!(extraction_extension(&job, program), "dsf");
+        assert_eq!(proposed_destination(&job, program, track).extension().and_then(|ext| ext.to_str()), Some("dsf"));
+        let mut old = serde_json::to_value(&job).unwrap();
+        old.as_object_mut().unwrap().remove("sacd_dff");
+        let legacy: NativeExtractionJob = serde_json::from_value(old).unwrap();
+        assert!(!legacy.sacd_dff, "older queued jobs retain their DSF selection");
+        job.sacd_dff = true;
+        assert_eq!(extraction_extension(&job, &job.programs[0]), "dff");
+        assert_eq!(proposed_destination(&job, &job.programs[0], &job.programs[0].tracks[0])
+            .extension().and_then(|ext| ext.to_str()), Some("dff"));
+        let values = NativeTagValues {
+            catalog: Some("CAT-123".into()), publisher: Some("A label".into()),
+            ..Default::default()
+        };
+        let tagged = selected_tag_items(&values, (1 << 7) | (1 << 8));
+        assert_eq!(tagged, vec![
+            (lofty::tag::ItemKey::CatalogNumber, Some("CAT-123".into())),
+            (lofty::tag::ItemKey::Publisher, Some("A label".into())),
+        ]);
+        assert!(selected_tag_items(&values, 0x7f).is_empty(),
+            "existing seven-field presets must not silently add new tags");
+    }
+
+    #[test]
+    fn r30d05_non_sacd_source_precedence_controls_individual_and_grouped_tags() {
+        use lofty::tag::ItemKey;
+
+        for format in [DiscFormat::DvdAudio, DiscFormat::DvdVideo, DiscFormat::BluRay] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut job = fixture_job(&temp.path().join("out"), temp.path());
+            job.format = format;
+            job.tag_fields = 0x1ff;
+            let program = &mut job.programs[0];
+            program.tags = NativeTagValues {
+                album: Some("Navigation album (already merged)".into()),
+                artist: Some("Navigation artist".into()),
+                ..Default::default()
+            };
+            program.tracks[0].tags = NativeTagValues {
+                title: Some("Navigation track (already merged)".into()),
+                ..Default::default()
+            };
+            // Independent authored facts, not guessed from navigation fields.
+            program.authored_tags = Some(NativeAuthoredTags {
+                album: NativeTagValues {
+                    album: Some("Authored album".into()),
+                    artist: Some("Authored artist".into()),
+                    year: Some("1997".into()),
+                    ..Default::default()
+                },
+                tracks: BTreeMap::from([(1, NativeTagValues {
+                    title: Some("Authored track".into()),
+                    artist: Some("Authored performer".into()),
+                    composer: Some("  ".into()),
+                    ..Default::default()
+                })]),
+            });
+            let track = program.tracks[0].clone();
+            let saved_track = NativeTagValues {
+                title: Some("MusicBrainz track".into()),
+                artist: Some("MusicBrainz artist".into()),
+                album: Some("MusicBrainz album".into()),
+                composer: Some("Sidecar composer".into()),
+                catalog: Some("CAT-88".into()),
+                ..Default::default()
+            };
+            let saved_album = AlbumMetadata {
+                album: Some("MusicBrainz album".into()),
+                album_artist: Some("MusicBrainz artist".into()).into(),
+                genre: Some("Jazz".into()).into(),
+                date: Some("2026".into()),
+                ..Default::default()
+            };
+
+            let authored = native_non_sacd_track_tags(format,
+                NativeTagSource::AuthoredTrack, program, &track, saved_track.clone());
+            assert_eq!(authored.title.as_deref(), Some("Authored track"), "{format:?}");
+            assert_eq!(authored.artist.as_deref(), Some("Authored performer"), "{format:?}");
+            assert_eq!(authored.album.as_deref(), Some("Authored album"), "{format:?}");
+            assert_eq!(authored.year.as_deref(), Some("1997"), "{format:?}");
+            assert_eq!(authored.composer.as_deref(), Some("Sidecar composer"), "{format:?}");
+            assert_eq!(authored.catalog.as_deref(), Some("CAT-88"), "{format:?}");
+            let chosen = selected_tag_items(&authored, job.tag_fields);
+            assert!(chosen.contains(&(ItemKey::TrackTitle, Some("Authored track".into()))));
+            assert!(chosen.contains(&(ItemKey::Composer, Some("Sidecar composer".into()))));
+
+            let matched = native_non_sacd_track_tags(format,
+                NativeTagSource::MusicBrainz, program, &track, saved_track.clone());
+            assert_eq!(matched.title.as_deref(), Some("MusicBrainz track"), "{format:?}");
+            assert_eq!(matched.album.as_deref(), Some("MusicBrainz album"), "{format:?}");
+            assert_eq!(matched.artist.as_deref(), Some("MusicBrainz artist"), "{format:?}");
+            assert!(selected_tag_items(&matched, job.tag_fields).contains(&
+                (ItemKey::TrackTitle, Some("MusicBrainz track".into()))));
+            assert_ne!(selected_tag_items(&authored, job.tag_fields),
+                selected_tag_items(&matched, job.tag_fields), "{format:?}");
+
+            let default = native_non_sacd_track_tags(format,
+                NativeTagSource::DiscAndSidecar, program, &track, saved_track);
+            assert_eq!(default.title.as_deref(), Some("Navigation track (already merged)"),
+                "preserve the earlier navigation-based default for {format:?}");
+
+            // Old recovery jobs and sources without independently observed
+            // authored tags must not mistake sidecar-merged navigation for
+            // authored metadata.
+            let separate = program.authored_tags.take();
+            let fallback = native_non_sacd_track_tags(format,
+                NativeTagSource::AuthoredTrack, program, &track, matched.clone());
+            assert_eq!(fallback.title.as_deref(), Some("MusicBrainz track"), "{format:?}");
+            program.authored_tags = separate;
+
+            let authored_group = native_non_sacd_album_tags(
+                NativeTagSource::AuthoredTrack, program, &saved_album);
+            let matched_group = native_non_sacd_album_tags(
+                NativeTagSource::MusicBrainz, program, &saved_album);
+            assert_eq!(authored_group.album.as_deref(), Some("Authored album"), "{format:?}");
+            assert_eq!(authored_group.artist.as_deref(), Some("Authored artist"), "{format:?}");
+            assert_eq!(authored_group.genre.as_deref(), Some("Jazz"), "{format:?}");
+            assert_eq!(matched_group.album.as_deref(), Some("MusicBrainz album"), "{format:?}");
+            assert_eq!(matched_group.year.as_deref(), Some("2026"), "{format:?}");
+            assert!(selected_tag_items(&authored_group, job.tag_fields).contains(&
+                (ItemKey::AlbumTitle, Some("Authored album".into()))));
+            assert!(selected_tag_items(&matched_group, job.tag_fields).contains(&
+                (ItemKey::AlbumTitle, Some("MusicBrainz album".into()))));
+            assert_ne!(selected_tag_items(&authored_group, job.tag_fields),
+                selected_tag_items(&matched_group, job.tag_fields), "{format:?}");
+            assert!(authored_group.title.is_none() && matched_group.title.is_none(),
+                "grouped output must not inherit an individual Title");
+        }
+    }
+
+    #[test]
+    fn r30d05_sacd_metadata_selection_is_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut job = fixture_job(&temp.path().join("out"), temp.path());
+        job.format = DiscFormat::Sacd;
+        let program = &mut job.programs[0];
+        program.tags.album = Some("SACD album".into());
+        program.tracks[0].tags.title = Some("SACD track".into());
+        for source in [NativeTagSource::DiscAndSidecar,
+            NativeTagSource::AuthoredTrack, NativeTagSource::MusicBrainz] {
+            // SACD jobs already have their selected authority resolved in
+            // track/program tags by DiscBrowserState::native_program_choice.
+            assert_eq!(native_selected_track_tags(DiscFormat::Sacd, source,
+                program, &program.tracks[0]).unwrap().title.as_deref(), Some("SACD track"));
+        }
+    }
+
+    #[test]
+    fn r30d05_legacy_job_without_independent_authored_snapshot_recovers() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut job = fixture_job(&temp.path().join("out"), temp.path());
+        job.format = DiscFormat::DvdVideo;
+        job.tag_source = NativeTagSource::AuthoredTrack;
+        job.programs[0].authored_tags = Some(NativeAuthoredTags {
+            album: NativeTagValues { album: Some("Disc album".into()), ..Default::default() },
+            ..Default::default()
+        });
+        let mut legacy = serde_json::to_value(&job).unwrap();
+        assert!(legacy["programs"][0].as_object_mut().unwrap()
+            .remove("authored_tags").is_some());
+        let recovered: NativeExtractionJob = serde_json::from_value(legacy).unwrap();
+        assert!(recovered.programs[0].authored_tags.is_none());
+        assert_eq!(recovered.tag_source, NativeTagSource::AuthoredTrack);
+        let album = AlbumMetadata { album: Some("Saved album".into()), ..Default::default() };
+        assert_eq!(native_non_sacd_album_tags(recovered.tag_source,
+            &recovered.programs[0], &album).album.as_deref(), Some("Saved album"));
+    }
+
+    #[test]
     fn sacd_continuous_dst_preserves_encoded_frames_and_valid_container() {
         use sacd_rs::dsd_file::{DstDsdiffStreamReader, DstFrameReader};
         for channels in [2u8, 5, 6] {
@@ -3205,12 +3578,12 @@ mod tests {
             programs: vec![NativeProgramChoice { id: PresentationId::SacdArea(crate::disc::SacdAreaId::Stereo),
                 label: "Stereo".into(), tracks: vec![NativeTrackChoice{ duration_secs: None,number:1,name:"a".into(),tags:NativeTagValues::default(),estimated_bytes:None},
                 NativeTrackChoice{ duration_secs: None,number:1,name:"b".into(),tags:NativeTagValues::default(),estimated_bytes:None}], keep_dst:false,source_depth:Some(1),
-                source_channels:Some(2), source_rate:Some(2822400), angle:1,source_layout:None, is_lossless:true, tags:NativeTagValues::default() }],
+                source_channels:Some(2), source_rate:Some(2822400), angle:1,source_layout:None, is_lossless:true, tags:NativeTagValues::default(), authored_tags: None }],
             destination:"/tmp/dest".into(),working_root:"/tmp".into(),
             wav_container:NativeWavContainer::Automatic,assume_decrypted:false,downmix:DvdaDownmixPolicy::None,
             naming_template:default_naming_template(),program_subfolders:true,
             overwrite_policy:NativeOverwritePolicy::Fail,extraction_log:false,file_per_program:false,cue:false,
-            transfer_tags:false,tag_source:default_tag_source(),tag_fields:default_tag_fields(),tag_artwork:false };
+            transfer_tags:false,sacd_dff: false, tag_source:default_tag_source(),tag_fields:default_tag_fields(),tag_artwork:false };
         assert!(validate_job(&job).unwrap_err().contains("duplicate"));
     }
 }

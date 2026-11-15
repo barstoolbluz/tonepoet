@@ -6646,18 +6646,25 @@ OSC 52 fallback is capped at 64 KiB; install a native clipboard helper for large
             ));
         }
         Command::TagsFromMb { query, catno, year } => {
-            let guard_paths = current_bulk_guard_paths(app);
-            if maybe_confirm_bulk_operation(
-                app,
-                BulkOperationKind::MusicBrainzTagging,
-                BulkGuardCommand::TagsFromMb {
-                    query: query.clone(),
-                    catno: catno.clone(),
-                    year: year.clone(),
-                },
-                &guard_paths,
-            ) {
-                return;
+            // The Extract Tags-sheet route is an explicitly scoped single-
+            // disc editor, independent of the Browse selection and its bulk
+            // confirmation guard. All other command origins retain the guard.
+            let from_extract = matches!(&app.active_overlay,
+                ActiveOverlay::MetadataEditor(editor) if editor.return_to_extract.is_some());
+            if !from_extract {
+                let guard_paths = current_bulk_guard_paths(app);
+                if maybe_confirm_bulk_operation(
+                    app,
+                    BulkOperationKind::MusicBrainzTagging,
+                    BulkGuardCommand::TagsFromMb {
+                        query: query.clone(),
+                        catno: catno.clone(),
+                        year: year.clone(),
+                    },
+                    &guard_paths,
+                ) {
+                    return;
+                }
             }
 
             let explicit_args = query.is_some() || catno.is_some() || year.is_some();
@@ -6811,7 +6818,9 @@ OSC 52 fallback is capped at 64 KiB; install a native clipboard helper for large
             // in-editor dispatch then skips TOC and goes straight to
             // text search.
             if let Some(dispatched) = try_dispatch_in_editor_tags_mb(app, tx, direct_seed.clone()) {
-                if dispatched {
+                if dispatched || from_extract {
+                    // An Extract-owned invocation must not fall back to Browse
+                    // when its editor declines the lookup.
                     return;
                 }
             }
@@ -24046,6 +24055,43 @@ mod in_editor_tags_mb_reducer_safety_tests {
             worker_body.contains("collect_single_image_cue_infos_for_sources(&sources, &audio_paths)"),
             "the blocking worker should own the CUE discovery/parsing call"
         );
+    }
+
+    #[test]
+    fn r30c_extract_musicbrainz_command_ignores_browse_multi_selection() {
+        use crate::convert::classify::EntryKind;
+        use crate::disc::model::{CopyProtectionSummary,DiscContents,DiscFormat};
+        use crate::tui::browse::BrowseEntry;
+        use crate::tui::disc_browser::DiscBrowserState;
+        let a=std::path::PathBuf::from("/tmp/disc-A.iso");
+        let b=std::path::PathBuf::from("/tmp/disc-B.iso");
+        let mut app=AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen=AppScreen::Browse;
+        app.browse.entries=vec![
+            BrowseEntry::new(a.clone(),"A".into(),EntryKind::Archive,0,None),
+            BrowseEntry::new(b.clone(),"B".into(),EntryKind::Archive,0,None),
+        ];
+        app.browse.multi_selected=vec![a.clone(),b];
+        app.browse.selected_index=1;
+        let contents=DiscContents {
+            format:DiscFormat::Sacd,label:"A".into(),source_path:a.clone(),
+            presentations:Vec::new(),suppressed:Vec::new(),
+            copy_protection:CopyProtectionSummary{description:String::new()},
+            diagnostics:Vec::new(),album_title:None,album_artist:None,genre:None,year:None,
+        };
+        let draft=DiscBrowserState::new(contents,a.clone());
+        let mut editor=editor_for_path(a.clone());
+        editor.return_to_extract=Some(Box::new(draft));
+        editor.model.tags_mb_in_flight=true;
+        app.active_overlay=ActiveOverlay::MetadataEditor(editor);
+        execute_command(&mut app,Command::TagsFromMb {
+            query:None,catno:None,year:None,
+        },&tx());
+        assert!(app.status_message.as_ref().is_some_and(|(message,_)|
+            message.contains("already in flight")),"the scoped editor must bypass Browse guard");
+        assert!(matches!(&app.active_overlay,ActiveOverlay::MetadataEditor(editor)
+            if editor.return_to_extract.as_ref().is_some_and(|owner|owner.source_path==a)),
+            "the multi-selection must not replace Extract's disc A context");
     }
 
     #[test]

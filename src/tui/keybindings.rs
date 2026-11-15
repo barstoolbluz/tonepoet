@@ -18225,6 +18225,16 @@ pub(super) fn metadata_editor_save(
     metadata_editor_save_with_cue_consent(app, state, tx, false);
 }
 
+/// Disc-image metabase/sidecar saves complete synchronously, unlike the
+/// ordinary metadata write worker. Both routes must inform the parked Extract
+/// draft before its editor closes.
+fn record_extract_sidecar_save(state: &mut super::app::MetadataEditorState) {
+    if state.return_to_extract.is_some() {
+        state.extract_tags_saved = true;
+        state.extract_mb_saved |= state.extract_mb_populated;
+    }
+}
+
 fn metadata_editor_save_with_cue_consent(
     app: &mut AppState,
     state: &mut super::app::MetadataEditorState,
@@ -18331,6 +18341,7 @@ fn metadata_editor_save_with_cue_consent(
             state,
         ) {
             Ok(outcome) => {
+                record_extract_sidecar_save(state);
                 state.mark_presentation_tabs_saved(&outcome.saved_tab_indices);
                 app.browse.disc_probe_cache.remove(&source_path);
                 let file_name = outcome
@@ -18361,6 +18372,7 @@ fn metadata_editor_save_with_cue_consent(
         };
         match super::command::save_dvdv_metadata_sidecar(&source_path, state) {
             Ok(outcome) => {
+                record_extract_sidecar_save(state);
                 state.mark_active_presentation_saved();
                 app.browse.disc_probe_cache.remove(&source_path);
                 let remaining = state.dirty_presentation_count();
@@ -18399,6 +18411,7 @@ fn metadata_editor_save_with_cue_consent(
         if state.active_surface().sacd_area_kind.is_none() {
             match save_dvda_metabase(state, &sidecar_path) {
                 Ok(kind) => {
+                    record_extract_sidecar_save(state);
                     state.mark_all_presentations_saved();
                     if let Some(source) = state.active_surface().paths.first() {
                         app.browse.disc_probe_cache.remove(source);
@@ -18422,6 +18435,7 @@ fn metadata_editor_save_with_cue_consent(
 
         match save_sacd_sidecar(state, &sidecar_path) {
             Ok(outcome) => {
+                record_extract_sidecar_save(state);
                 state.mark_all_presentations_saved();
                 if let Some(source) = state.active_surface().paths.first() {
                     app.browse.disc_probe_cache.remove(source);
@@ -19227,6 +19241,9 @@ pub(super) fn reopen_metadata_editor_after_musicbrainz_population(
     // tag-block or transfer preparation whether the result reopens the editor
     // directly or first asks for multi-presentation confirmation.
     state.invalidate_tag_interchange_preparation();
+    if state.return_to_extract.is_some() {
+        state.extract_mb_populated = true;
+    }
     if state.has_multiple_presentations() {
         app.pending_metadata_editor = Some(state.clone());
         app.active_overlay = ActiveOverlay::Confirmation {
@@ -19436,7 +19453,9 @@ fn request_metadata_editor_close(
         }
     } else {
         cleanup_metadata_editor_archive_context(app, state);
-        app.active_overlay = ActiveOverlay::None;
+        if !super::disc_browser_actions::restore_extract_after_tag_editor(app, state, _tx) {
+            app.active_overlay = ActiveOverlay::None;
+        }
     }
 }
 
@@ -71338,8 +71357,8 @@ fn execute_confirm_action(
         ConfirmAction::DiscardMetadataEditorChanges => {
             let quit_after_resolution = app.quit_after_browse_archive_metadata_resolution;
             app.quit_after_browse_archive_metadata_resolution = false;
-            let parked = app.pending_metadata_editor.take();
-            if let Some(parked) = parked.as_ref() {
+            let mut parked = app.pending_metadata_editor.take();
+            if let Some(parked) = parked.as_mut() {
                 if parked.has_browse_archive_staged_changes() {
                     if let Some(context) = parked.archive_edit_context.clone() {
                         app.active_overlay = ActiveOverlay::None;
@@ -71372,6 +71391,12 @@ fn execute_confirm_action(
                     }
                 } else {
                     cleanup_metadata_editor_archive_context(app, parked);
+                    if !quit_after_resolution &&
+                        super::disc_browser_actions::restore_extract_after_tag_editor(app,
+                            parked, tx) {
+                        app.set_status("metadata editor: unsaved edits discarded; Extract settings retained");
+                        return;
+                    }
                     app.active_overlay = ActiveOverlay::None;
                     if quit_after_resolution {
                         app.should_quit = true;
@@ -74764,6 +74789,10 @@ pub fn handle_mouse(app: &mut AppState, mouse: MouseEvent, tx: &mpsc::Sender<App
             | TuiButton::DiscBrowserOverwriteChoice(_)
             | TuiButton::DiscBrowserToggle(_)
             | TuiButton::DiscBrowserTagsEdit
+            | TuiButton::DiscBrowserTagSheetControl(_)
+            | TuiButton::DiscBrowserTagSheetSourceChoice(_)
+            | TuiButton::DiscBrowserTagSheetOutside
+            | TuiButton::DiscBrowserTagSheetPassive
             | TuiButton::DiscBrowserFolderField
             | TuiButton::DiscBrowserFolderBrowse
             | TuiButton::DiscBrowserHint(_)
@@ -117183,5 +117212,32 @@ mod browse_new_toolbar_interaction_tests {
             Some(BrowseInlineEditTarget::Create { dir, kind: BrowseCreateKind::File })
                 if dir.as_path() == temp.path()));
         assert!(matches!(app.active_overlay, ActiveOverlay::None));
+    }
+}
+
+#[cfg(test)]
+mod r30c_extract_disc_save_notification_tests {
+    use super::*;
+    use crate::disc::model::{CopyProtectionSummary,DiscContents,DiscFormat};
+
+    #[test]
+    fn synchronous_disc_sidecar_save_marks_only_extract_owned_draft() {
+        let mut editor=super::super::app::MetadataEditorState::for_files(
+            vec!["/tmp/disc.iso".into()],Vec::new(),vec!["01".into()],Default::default());
+        editor.extract_mb_populated=true;
+        record_extract_sidecar_save(&mut editor);
+        assert!(!editor.extract_tags_saved);
+        assert!(!editor.extract_mb_saved);
+        let contents=DiscContents{
+            format:DiscFormat::Sacd,label:"disc".into(),source_path:"/tmp/disc.iso".into(),
+            presentations:Vec::new(),suppressed:Vec::new(),
+            copy_protection:CopyProtectionSummary{description:String::new()},
+            diagnostics:Vec::new(),album_title:None,album_artist:None,genre:None,year:None,
+        };
+        editor.return_to_extract=Some(Box::new(
+            crate::tui::disc_browser::DiscBrowserState::new(contents,"/tmp/disc.iso".into())));
+        record_extract_sidecar_save(&mut editor);
+        assert!(editor.extract_tags_saved);
+        assert!(editor.extract_mb_saved);
     }
 }

@@ -12,7 +12,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use crate::convert::pipeline::native_extract::NativeWavContainer;
 use crate::disc::{DiscFormat, DiscPresentation, PresentationId};
 use super::button_map::{ButtonRenderMap, TuiButton};
-use super::disc_browser::{DiscBrowserState, ExtractFocus, ExtractPanel, duration_display, sample_rate_display};
+use super::disc_browser::{DiscBrowserState, ExtractFocus, ExtractPanel, TagSheetControl, NATIVE_TAG_FIELD_LABELS, duration_display, sample_rate_display};
 use super::theme::{contrast_ratio, Theme};
 
 fn clip(s: &str, width: u16) -> String {
@@ -527,7 +527,7 @@ pub fn draw(
     divider(frame,popup,chunks[1].y,theme,pane_separator.map(|x|(x,'┬')));
     divider(frame,popup,chunks[3].y,theme,pane_separator.map(|x|(x,'┴')));
     divider(frame,popup,chunks[8].y,theme,None);
-    if let Some(panel)=state.panel { draw_panel(frame,state,panel,popup,theme); }
+    if let Some(panel)=state.panel { draw_panel(frame,state,panel,popup,buttons,theme); }
 }
 
 fn short_genre(text: &str) -> (String, usize) {
@@ -929,7 +929,7 @@ fn option_value(s: &DiscBrowserState, name: &str) -> String {
                 let keep_dst = s.keep_dst.get(i) == Some(&true);
                 for (j,track) in p.tracks.iter().enumerate() {
                     if s.items_checked.get(i).and_then(|v|v.get(j)) != Some(&true) { continue; }
-                    if keep_dst { dff = true; } else { dsf = true; }
+                    if keep_dst || s.sacd_dff { dff = true; } else { dsf = true; }
                     let dst = p.format.codec.as_deref() == Some("DST")
                         || track.format_note.as_deref().unwrap_or("").contains("DST");
                     if dst {
@@ -943,6 +943,7 @@ fn option_value(s: &DiscBrowserState, name: &str) -> String {
                 (true,false) if dst_decoded => "DSF · DST decoded to DSD".into(),
                 (true,false) => "DSF · native DSD (no DST decode)".into(),
                 (false,true) if dst_preserved => "DFF · keep selected DST".into(),
+                (false,true) if dst_decoded => "DFF · DST decoded to DSD".into(),
                 (false,true) => "DFF · native DSD".into(),
                 (true,true) if dst_decoded => "DSF / DFF · decode or keep DST by area".into(),
                 (true,true) => "DSF / DFF · native DSD / keep selected DST".into(),
@@ -962,7 +963,7 @@ fn option_value(s: &DiscBrowserState, name: &str) -> String {
         "Tags" if !s.native_tags_available() => "off for DFF · no standard tags".into(),
         "Tags" => if s.tags { format!("on · {} fields · {}{}",
             s.tag_fields.count_ones(),if s.tag_artwork {"artwork"}else{"no artwork"},
-            if s.keep_dst.iter().any(|v|*v) {" · DFF drops tags"}else{""}) }
+            if s.selected_sacd_tag_carriers().1 {" · DFF drops tags"}else{""}) }
             else { "off · no metadata written".into() },
         "Downmix" => s.downmix.as_str().to_string(),
         "Assume decrypted" => if s.assume_decrypted {"on · already decrypted"} else {"off"}.into(),
@@ -984,6 +985,7 @@ fn output_cell(name: &str, index: usize, rows: &[&str], area: Rect, wide: bool, 
         let (x, y, width) = match name {
             "Format" => (text.x,0,left_width),
             "Overwrite" => (right_x,0,right_width),
+            "Keep DST" => (right_x,1,right_width),
             "Files" => (text.x,2,left_width),
             "Tags" => (right_x,2,right_width),
             "CUE" => (text.x,3,left_width),
@@ -1150,10 +1152,7 @@ fn draw_output(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,
         match *name {
             "Format" => {
                 if s.contents.format==DiscFormat::Sacd {
-                    let dst=super::disc_browser_actions::selected_sacd_area_has_dst(s);
-                    let keep=s.keep_dst.get(s.cursor).copied().unwrap_or(false) && dst;
-                    let mut options=vec![("DSF",!keep)];
-                    if dst {options.push(("DFF",keep));}
+                    let options=[("DSF",!s.sacd_dff),("DFF",s.sacd_dff)];
                     draw_native_radio(frame,buttons,field,&options,focused,true,theme,bg);
                 }else{
                     let options=[("Automatic",s.wav_container==NativeWavContainer::Automatic),
@@ -1181,6 +1180,14 @@ fn draw_output(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,
                 buttons.record_button(TuiButton::DiscBrowserOverwrite,box_rect);
                 overwrite_anchor=Some(box_rect);
             }
+            "Keep DST" => {
+                let enabled = s.contents.presentations.iter().enumerate().any(|(i,p)|
+                    s.selected.get(i) == Some(&true)
+                        && super::disc_browser_actions::presentation_has_dst(p)
+                        && s.keep_dst.get(i) == Some(&true));
+                draw_native_toggle(frame,buttons,field,"Keep DST in DST areas",enabled,
+                    focused,i,theme,bg);
+            }
             "Files" => {
                 let (item,unit)=match s.contents.format {
                     DiscFormat::Sacd=>("track","area"),DiscFormat::DvdAudio=>("track","group"),
@@ -1193,26 +1200,24 @@ fn draw_output(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,
             }
             "Tags" => {
                 let (dsf,dff)=s.selected_sacd_tag_carriers();
-                if dff && !dsf {
-                    frame.render_widget(Paragraph::new("off for DFF · no standard tags")
-                        .style(Style::default().bg(bg).fg(theme.warning)),field);
-                    continue;
-                }
-                let x=draw_native_toggle(frame,buttons,field,"Transfer",s.tags,focused,i,theme,bg);
+                let x=if dff && !dsf {field.x} else {
+                    draw_native_toggle(frame,buttons,field,"Transfer",s.tags,focused,i,theme,bg)
+                };
                 let edit=" Edit… ";
                 let ew=edit.chars().count() as u16;
-                if field.x.saturating_add(field.width)>=x+ew+1 {
+                if field.width>=ew {
                     let button_x=field.x+field.width-ew;
-                    let summary=if s.tags && dff {"DSF only; DFF none".to_owned()}
+                    let summary=if dff && !dsf {"off for DFF".to_owned()}
+                        else if s.tags && dff {"DSF only; DFF none".to_owned()}
                         else if s.tags {format!("{} fields",s.tag_fields.count_ones())}
                         else {"no tags".to_owned()};
                     if button_x>x+1 {
                         frame.render_widget(Paragraph::new(clip_end(&summary,button_x-x-1))
-                            .style(Style::default().fg(labels.soft).bg(bg)),
+                            .style(Style::default().fg(if dff {theme.warning}else{labels.soft}).bg(bg)),
                             Rect::new(x+1,field.y,button_x-x-1,1));
                     }
                     draw_native_pill(frame,buttons,Rect::new(button_x,field.y,ew,1),edit,
-                        TuiButton::DiscBrowserTagsEdit,false,theme);
+                        TuiButton::DiscBrowserTagsEdit,focused,theme);
                 }
             }
             "Log" => {
@@ -1306,7 +1311,10 @@ fn draw_output(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,
             let (dsf,dff)=s.selected_sacd_tag_carriers();
             let (message,warning)=if s.contents.format==DiscFormat::Sacd {
                 if dff && dsf {("DSF keeps tags; DFF has no standard tags",true)}
-                else if dff {("DFF has no standard tags; DST kept",true)}
+                else if dff && s.keep_dst.iter().any(|keep|*keep) {
+                    ("DFF has no standard tags; DST kept",true)
+                }
+                else if dff {("DFF has no standard tags",true)}
                 else {("DSF keeps tags and artwork",false)}
             } else { match s.wav_container {
                 NativeWavContainer::Automatic => ("Automatic: RF64 past 4 GiB",false),
@@ -1477,7 +1485,195 @@ fn draw_footer(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,buttons:&mut
     }
 }
 
-fn draw_panel(frame:&mut ratatui::Frame,s:&DiscBrowserState,panel:ExtractPanel,popup:Rect,theme:Theme) {
+/// A real, modal Tags sheet: every displayed control has a matching mouse
+/// target and exactly the same action as Space/Enter. The scroll is derived
+/// from the active control; no filesystem work occurs during repaint.
+fn draw_tags_sheet(frame:&mut ratatui::Frame, s:&DiscBrowserState, popup:Rect,
+    buttons:&mut ButtonRenderMap, theme:Theme) {
+    let width=popup.width.saturating_sub(2).min(82);
+    let height=popup.height.saturating_sub(2).min(27);
+    if width<12 || height<7 { return; }
+    let area=Rect::new(popup.x+(popup.width-width)/2,popup.y+(popup.height-height)/2,width,height);
+    // Attenuate the rendered Extract window before the sheet is painted. This
+    // is presentation-only; no additional drawing or layout pass is needed.
+    for y in popup.y..popup.y.saturating_add(popup.height) {
+        for x in popup.x..popup.x.saturating_add(popup.width) {
+            let cell=frame.buffer_mut().get_mut(x,y);
+            cell.set_fg(blend_color(cell.fg,cell.bg,3,4));
+        }
+    }
+    // Register after the main overlay's controls, so the sheet is truly modal.
+    buttons.record_button(TuiButton::DiscBrowserTagSheetOutside,frame.size());
+    buttons.record_button(TuiButton::DiscBrowserTagSheetPassive,area);
+    frame.render_widget(Clear,area);
+    fill(frame,area,theme.surface);
+    let outline=Block::default().borders(Borders::ALL).style(Style::default()
+        .bg(theme.surface).fg(readable_word(theme.value,theme.surface)))
+        .border_style(Style::default().fg(theme.border));
+    frame.render_widget(outline,area);
+    let title=Rect::new(area.x+1,area.y+1,area.width.saturating_sub(2),1);
+    fill(frame,title,theme.title);
+    frame.render_widget(Paragraph::new(" ▸ Tags ").style(Style::default()
+        .fg(readable_word(theme.panel_bg,theme.title)).bg(theme.title)
+        .add_modifier(Modifier::BOLD)),title);
+
+    let controls=s.tag_sheet_controls();
+    // Tuple: focus control index, optional mouse target, label, foreground,
+    // dark-field styling. Headings are not focus stops.
+    let mut rows:Vec<(Option<usize>,Option<TuiButton>,String,Color,bool)>=Vec::new();
+    let preview=s.tag_preview_for_highlight();
+    let values=[&preview.title,&preview.artist,&preview.album,&preview.genre,
+        &preview.year,&preview.composer,&preview.performer,&preview.catalog,&preview.publisher];
+    for (index,control) in controls.iter().copied().enumerate() {
+        use TagSheetControl as C;
+        let target=Some(TuiButton::DiscBrowserTagSheetControl(index));
+        let item=match control {
+            C::Transfer=>format!("{} Transfer tags",check(s.tags)),
+            C::Source=>format!("Source     ▕ {}  ▾▏",
+                s.tag_source_label(s.tag_source_index())),
+            C::Field(i)=>{
+                if i==0 {
+                    let number=s.contents.presentations.get(s.cursor)
+                        .and_then(|p|p.tracks.get(s.item_cursor)).map_or(1,|t|t.number);
+                    let scope=if s.file_per_program { "values for area/group output".to_owned() }
+                        else { format!("values for track {number:02}") };
+                    rows.push((None,None,format!("FIELDS                     {scope}"),theme.header,false));
+                }
+                let value=if s.tag_preview_is_pending() { "from source on extraction" }
+                    else { values.get(i).and_then(|v|v.as_deref()).unwrap_or("no value") };
+                format!("{} {:<11} {}",check(s.tag_fields & (1u16<<i)!=0),
+                    NATIVE_TAG_FIELD_LABELS[i],value)
+            },
+            C::All=>String::new(), // The two action pills share this row.
+            C::None=>continue,
+            C::Artwork=>{
+                rows.push((None,None,"ARTWORK".to_owned(),theme.header,false));
+                // The materializer's source artwork outranks a folder cover;
+                // that evidence is not available until preparation. Avoid
+                // naming a fallback as if it were the selected embedded image.
+                let provenance=s.tag_preview_artwork.as_ref().map(|p|format!("source art preferred · {} folder fallback",
+                    p.file_name().map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "cover".to_owned())))
+                    .unwrap_or_else(||"source art preferred · no folder fallback".to_owned());
+                format!("{} Embed artwork   {}",check(s.tag_artwork),provenance)
+            },
+            C::UseDsf=>"▲ DFF has no standard tags.".to_owned(),
+            C::EditValues | C::MusicBrainz | C::Done=>continue,
+        };
+        let fg=if matches!(control,C::UseDsf) {theme.warning}
+            else if matches!(control,C::Field(_) if s.tag_preview_is_pending()) {theme.text_dim}
+            else if matches!(control,C::Field(i) if values[i].is_none()) {theme.text_dim}
+            else {theme.value};
+        rows.push((Some(index),target,item,fg,matches!(control,C::Source)));
+        if matches!(control,C::Source) && s.tag_source_open {
+            for i in 0..s.tag_source_option_count() {
+                let text=s.tag_source_label(i);
+                rows.push((Some(index),Some(TuiButton::DiscBrowserTagSheetSourceChoice(i)),
+                    format!("  {} {text}",if s.tag_source_cursor==i {"●"}else{"○"}),theme.value,true));
+            }
+        }
+    }
+    let body=Rect::new(area.x+2,area.y+2,area.width.saturating_sub(4),area.height.saturating_sub(6));
+    let layout_focus=if controls.get(s.panel_cursor)==Some(&TagSheetControl::None) {
+        controls.iter().position(|item|*item==TagSheetControl::All).unwrap_or(s.panel_cursor)
+    } else {s.panel_cursor};
+    let active=if s.tag_source_open {
+        rows.iter().position(|(_,target,_,_,_)| *target ==
+            Some(TuiButton::DiscBrowserTagSheetSourceChoice(s.tag_source_cursor)))
+    } else {
+        rows.iter().position(|(focus,_,_,_,_)| *focus == Some(layout_focus))
+    }.unwrap_or(0);
+    let scroll=active.saturating_sub(body.height.saturating_sub(1) as usize)
+        .min(rows.len().saturating_sub(body.height as usize));
+    for (visible,(index,target,label,fg,field)) in rows.iter().skip(scroll)
+        .take(body.height as usize).enumerate() {
+        let rect=Rect::new(body.x,body.y+visible as u16,body.width,1);
+        let control=index.and_then(|i|controls.get(i)).copied();
+        if control==Some(TagSheetControl::All) {
+            fill(frame,rect,theme.surface);
+            let mut end=rect.x+rect.width;
+            for (action,text) in [(TagSheetControl::None," None "),
+                (TagSheetControl::All," All ")] {
+                let Some(action_index)=controls.iter().position(|item|*item==action) else {continue;};
+                let width=text.chars().count() as u16;
+                if end<rect.x+width {break;}
+                end-=width;
+                let action_rect=Rect::new(end,rect.y,width,1);
+                let focused=!s.tag_source_open && s.panel_cursor==action_index;
+                let bg=if focused {theme.pill_active_bg}else{theme.pill_preset_bg};
+                let fg=if focused {theme.pill_active_fg}else{theme.pill_preset_fg};
+                frame.render_widget(Paragraph::new(text).style(Style::default()
+                    .fg(readable_word(fg,bg)).bg(bg)),action_rect);
+                buttons.record_button(TuiButton::DiscBrowserTagSheetControl(action_index),action_rect);
+                end=end.saturating_sub(2);
+            }
+            continue;
+        }
+        if control==Some(TagSheetControl::UseDsf) {
+            fill(frame,rect,theme.surface);
+            let text=" Use DSF ";
+            let width=(text.chars().count() as u16).min(rect.width);
+            let action=Rect::new(rect.x+rect.width-width,rect.y,width,1);
+            let focused=!s.tag_source_open && *index==Some(s.panel_cursor);
+            let bg=if focused {theme.pill_active_bg}else{theme.pill_preset_bg};
+            let fg=if focused {theme.pill_active_fg}else{theme.pill_preset_fg};
+            if action.x>rect.x {
+                frame.render_widget(Paragraph::new(clip_end(label,action.x-rect.x))
+                    .style(Style::default().fg(readable_word(theme.warning,theme.surface))
+                    .bg(theme.surface)),Rect::new(rect.x,rect.y,action.x-rect.x,1));
+            }
+            frame.render_widget(Paragraph::new(text).style(Style::default()
+                .fg(readable_word(fg,bg)).bg(bg)),action);
+            if let Some(target)=target {buttons.record_button(*target,action);}
+            continue;
+        }
+        let focused=match target {
+            Some(TuiButton::DiscBrowserTagSheetSourceChoice(choice)) =>
+                s.tag_source_open && *choice == s.tag_source_cursor,
+            _ => !s.tag_source_open && *index == Some(s.panel_cursor),
+        };
+        let bg=if focused {theme.input_focused_bg}
+            else if *field {theme.input_unfocused_bg}else{theme.surface};
+        fill(frame,rect,bg);
+        let fg=if focused {readable_word(theme.value,bg)}else{readable_word(*fg,bg)};
+        frame.render_widget(Paragraph::new(clip_end(label,rect.width))
+            .style(Style::default().fg(fg).bg(bg)
+                .add_modifier(if focused {Modifier::BOLD}else{Modifier::empty()})),rect);
+        if let Some(target)=target {buttons.record_button(*target,rect);}
+    }
+    let hint_y=area.y+area.height-3;
+    let hint=Rect::new(area.x+2,hint_y,area.width.saturating_sub(4),1);
+    frame.render_widget(Paragraph::new(clip_end("↑↓ move · Space toggle · Enter select · Esc close",hint.width))
+        .style(Style::default().fg(readable_word(theme.text_dim,theme.surface))
+        .bg(theme.surface)),hint);
+    let footer=Rect::new(area.x+2,area.y+area.height-2,area.width.saturating_sub(4),1);
+    let mut x=footer.x.saturating_add(footer.width);
+    for (control,text) in [(TagSheetControl::Done," Done "),
+        (TagSheetControl::MusicBrainz," MusicBrainz… "),
+        (TagSheetControl::EditValues," Edit values… ")] {
+        let Some(index)=controls.iter().position(|item|*item==control) else {continue;};
+        let width=text.chars().count() as u16;
+        if x<footer.x.saturating_add(width) {continue;}
+        x=x.saturating_sub(width);
+        let rect=Rect::new(x,footer.y,width,1);
+        let focused=s.panel_cursor==index;
+        let bg=if focused {theme.pill_active_bg}
+            else if control==TagSheetControl::Done {theme.chip_go}else{theme.pill_preset_bg};
+        let fg=if focused {theme.pill_active_fg}
+            else if control==TagSheetControl::Done {theme.panel_bg}else{theme.pill_preset_fg};
+        frame.render_widget(Paragraph::new(text).style(Style::default()
+            .fg(readable_word(fg,bg)).bg(bg)),rect);
+        buttons.record_button(TuiButton::DiscBrowserTagSheetControl(index),rect);
+        x=x.saturating_sub(2);
+    }
+}
+
+fn draw_panel(frame:&mut ratatui::Frame,s:&DiscBrowserState,panel:ExtractPanel,popup:Rect,
+    buttons:&mut ButtonRenderMap,theme:Theme) {
+    if panel == ExtractPanel::Tags {
+        draw_tags_sheet(frame,s,popup,buttons,theme);
+        return;
+    }
     let max_w=popup.width.saturating_sub(8).min(75);
     let max_h=popup.height.saturating_sub(6).min(17);
     let area=Rect::new(popup.x+(popup.width-max_w)/2,popup.y+(popup.height-max_h)/2,max_w,max_h);
@@ -1495,25 +1691,7 @@ fn draw_panel(frame:&mut ratatui::Frame,s:&DiscBrowserState,panel:ExtractPanel,p
     let inner=block.inner(area);
     frame.render_widget(block,area);
     let lines:Vec<String>=match panel {
-        ExtractPanel::Tags=>vec![
-            format!("t  Transfer tags: {}", if s.tags {"on"}else{"off"}),
-            format!("s  Source: {}", match s.tag_source {
-                crate::convert::pipeline::native_extract::NativeTagSource::DiscAndSidecar =>
-                    if s.contents.format == DiscFormat::Sacd { "sidecar, then disc text" }
-                    else { "disc/sidecar metadata" },
-                crate::convert::pipeline::native_extract::NativeTagSource::AuthoredTrack =>
-                    if s.contents.format == DiscFormat::Sacd { "disc text, then sidecar" }
-                    else { "materialized track metadata" },
-            }),
-            format!("1-7  Fields: {} selected (title/artist/album/genre/year/composer/performer)",s.tag_fields.count_ones()),
-            format!("a  Artwork: {} (source or direct-folder cover)",if s.tag_artwork {"on"}else{"off"}),
-            if s.keep_dst.iter().any(|v|*v) {
-                "DFF has no standard tags; selected DST-preserving tracks omit them".into()
-            } else {"Tags are written to completed audio files".into()},
-            "k  Change checked DFF areas to DSF to keep tags".into(),
-            "e  Edit disc tags".into(),
-            "Esc  Back".into(),
-        ],
+        ExtractPanel::Tags=>unreachable!("Tags uses the dedicated sheet"),
         ExtractPanel::Downmix=>vec!["[ / ]  Cycle DVD-Audio downmix policy".into(),
             format!("Current: {}", option_value(s,"Downmix")),
             "none preserves every source channel".into()],
@@ -1962,10 +2140,16 @@ mod extract_r3_render_tests {
                     assert_eq!(buffer.get(x,y).bg,region_bg,"{context}");
                     assert_eq!(buffer.get(x,y).fg,word_tiers(theme,extract_colors(theme),region_bg).label,
                         "{context}: labels are read-only text, not active controls");
-                    for other in state.output_rows().into_iter().filter(|other|*other!=name) {
-                        word_cells(buffer,other,&context);
+                    // Compact viewports scroll the form to keep the active
+                    // control in view. Only assert labels actually rendered.
+                    for (other_index,other) in state.output_rows().iter().enumerate() {
+                        if *other != name && output_cell(other,other_index,&state.output_rows(),
+                            Rect::new(1,3,width-2,state.output_rows().len() as u16+2),
+                            wide,index).is_some() {
+                            word_cells(buffer,other,&context);
+                        }
                     }
-                    if index==3 {word_cells(buffer,"fields",&context);}
+                    if name=="Tags" {word_cells(buffer,"fields",&context);}
                     if name=="Naming" {word_cells(buffer,"{track}",&context);}
                     if wide {
                         word_cells(buffer,"Stop if a file exists",&context);
@@ -2203,6 +2387,148 @@ mod extract_r3_render_tests {
     }
 
     #[test]
+    fn r30_tags_sheet_renders_actionable_controls_and_shields_underlying_window() {
+        let theme = crate::tui::theme::theme_by_slug_or_default("tokyo-night");
+        let mut state = sacd_state(false, false);
+        state.tags = true;
+        state.panel = Some(ExtractPanel::Tags);
+        state.tag_fields = 0x7f;
+        let mut terminal = Terminal::new(TestBackend::new(132, 44)).unwrap();
+        let mut buttons = ButtonRenderMap::new();
+        let popup = Rect::new(6, 5, 116, 33);
+        terminal.draw(|frame| draw_tags_sheet(frame, &state, popup, &mut buttons, theme)).unwrap();
+        for control in [TagSheetControl::Transfer, TagSheetControl::Source,
+            TagSheetControl::Field(0), TagSheetControl::Field(8), TagSheetControl::All,
+            TagSheetControl::None, TagSheetControl::Artwork, TagSheetControl::EditValues,
+            TagSheetControl::MusicBrainz, TagSheetControl::Done] {
+            let index = state.tag_sheet_controls().iter().position(|item| *item == control).unwrap();
+            let target = TuiButton::DiscBrowserTagSheetControl(index);
+            let rect = buttons.button_rect(target)
+                .unwrap_or_else(|| panic!("missing hitbox for {control:?}"));
+            assert_eq!(buttons.find_button_at(rect.x, rect.y), Some(target));
+        }
+        assert_eq!(buttons.find_button_at(0, 0), Some(TuiButton::DiscBrowserTagSheetOutside));
+        let lines = (0..44).map(|y| (0..132).map(|x|
+            terminal.backend().buffer().get(x, y).symbol().to_owned()
+        ).collect::<Vec<_>>().concat()).collect::<Vec<_>>().join("\n");
+        for label in ["Transfer tags", "Catalog", "Publisher", "no value",
+            "Embed artwork", "Edit values", "MusicBrainz", "Done"] {
+            assert!(lines.contains(label), "missing {label:?} from Tags sheet");
+        }
+        assert!(!lines.contains("1-7  Fields"));
+
+        state.tag_source_open = true;
+        buttons.clear();
+        terminal.draw(|frame| draw_tags_sheet(frame, &state, popup, &mut buttons, theme)).unwrap();
+        for index in 0..2 {
+            let target = TuiButton::DiscBrowserTagSheetSourceChoice(index);
+            let rect = buttons.button_rect(target).expect("source menu item hitbox");
+            assert_eq!(buttons.find_button_at(rect.x, rect.y), Some(target));
+        }
+    }
+
+    #[test]
+    fn r30c_sheet_pills_and_parent_dimming_work_in_both_themes_and_sizes() {
+        for slug in ["tokyo-night", "tokyo-night-day"] {
+            let theme=crate::tui::theme::theme_by_slug_or_default(slug);
+            for (width,height,popup) in [(110,34,Rect::new(4,3,102,28)),
+                (132,44,Rect::new(6,5,116,33))] {
+                let mut state=sacd_state(false,false);
+                state.tags=true;
+                state.sacd_dff=true;
+                state.panel=Some(ExtractPanel::Tags);
+                let controls=state.tag_sheet_controls();
+                let mut terminal=Terminal::new(TestBackend::new(width,height)).unwrap();
+                for control in [TagSheetControl::All,TagSheetControl::None,TagSheetControl::UseDsf] {
+                    let index=controls.iter().position(|v|*v==control).unwrap();
+                    state.panel_cursor=index;
+                    let mut buttons=ButtonRenderMap::new();
+                    terminal.draw(|frame| {
+                        frame.render_widget(Paragraph::new("BACKGROUND EXTRACT WINDOW")
+                            .style(Style::default().fg(theme.value).bg(theme.panel_bg)),
+                            Rect::new(popup.x,popup.y,popup.width,1));
+                        draw_tags_sheet(frame,&state,popup,&mut buttons,theme);
+                    }).unwrap();
+                    let hit=TuiButton::DiscBrowserTagSheetControl(index);
+                    let rect=buttons.button_rect(hit).expect("focused pill hitbox");
+                    let cell=terminal.backend().buffer().get(rect.x,rect.y);
+                    assert_eq!(cell.bg,theme.pill_active_bg,"{slug} {width} {control:?}");
+                    assert_eq!(buttons.find_button_at(rect.x,rect.y),Some(hit));
+                    // Text outside the focused sheet is still the dimmed parent.
+                    let under=terminal.backend().buffer().get(popup.x,popup.y);
+                    assert_eq!(under.fg,blend_color(theme.value,theme.panel_bg,3,4));
+                    if control==TagSheetControl::UseDsf {
+                        assert_ne!(buttons.find_button_at(rect.x.saturating_sub(2),rect.y),Some(hit),
+                            "the warning prose must not be a clickable button");
+                    }
+                    for other in [TagSheetControl::All,TagSheetControl::None,TagSheetControl::UseDsf] {
+                        let other_index=controls.iter().position(|v|*v==other).unwrap();
+                        let other_rect=buttons.button_rect(TuiButton::DiscBrowserTagSheetControl(other_index))
+                            .expect("unfocused pill still visible");
+                        if other != control {
+                            assert_eq!(terminal.backend().buffer().get(other_rect.x,other_rect.y).bg,
+                                theme.pill_preset_bg,"unfocused action must retain button styling");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn r30c_artwork_preview_names_source_preference_not_folder_as_final() {
+        use crate::convert::pipeline::native_extract::native_artwork_path;
+        use crate::convert::pipeline::types::AlbumMetadata;
+        use crate::convert::pipeline::STAGED_SOURCE_ARTWORK_PATH_EXTRA_KEY;
+        let temp=tempfile::tempdir().unwrap();
+        let iso=temp.path().join("disc.iso");
+        let folder_cover=temp.path().join("cover.png");
+        let source_art=temp.path().join("source-art.jpg");
+        std::fs::write(&iso,b"disc").unwrap();
+        std::fs::write(&folder_cover,b"folder").unwrap();
+        std::fs::write(&source_art,b"source").unwrap();
+        let mut album=AlbumMetadata::default();
+        album.extra.insert(STAGED_SOURCE_ARTWORK_PATH_EXTRA_KEY.into(),
+            source_art.to_string_lossy().into_owned());
+        assert_eq!(native_artwork_path(&album,&iso),Some(source_art));
+        let mut state=sacd_state(false,false);
+        state.tags=true;
+        state.tag_preview_artwork=Some(folder_cover);
+        state.panel=Some(ExtractPanel::Tags);
+        let (lines,_)=rendered_lines(&state,132,44);
+        let sheet=lines.join("\n");
+        assert!(sheet.contains("source art preferred"),"{sheet}");
+        assert!(sheet.contains("folder fallback"),"{sheet}");
+    }
+
+    #[test]
+    fn r30_tags_sheet_hides_children_when_transfer_off_and_exposes_dff_recovery() {
+        let theme = crate::tui::theme::theme_by_slug_or_default("tokyo-night");
+        let mut state = sacd_state(false, false);
+        state.panel = Some(ExtractPanel::Tags);
+        state.tags = false;
+        let mut terminal = Terminal::new(TestBackend::new(132, 44)).unwrap();
+        let popup = Rect::new(6, 5, 116, 33);
+        let mut buttons = ButtonRenderMap::new();
+        terminal.draw(|frame| draw_tags_sheet(frame, &state, popup, &mut buttons, theme)).unwrap();
+        assert_eq!(state.tag_sheet_controls().len(), 4);
+        assert!(!state.tag_sheet_controls().contains(&TagSheetControl::Source));
+        assert!(state.tag_sheet_controls().contains(&TagSheetControl::EditValues));
+        state.tags = true;
+        state.sacd_dff = true;
+        assert!(!state.native_tags_available());
+        assert!(state.tag_sheet_controls().contains(&TagSheetControl::UseDsf));
+        buttons.clear();
+        terminal.draw(|frame| draw_tags_sheet(frame, &state, popup, &mut buttons, theme)).unwrap();
+        let index = state.tag_sheet_controls().iter().position(|control|
+            *control == TagSheetControl::UseDsf).unwrap();
+        let rect = buttons.button_rect(TuiButton::DiscBrowserTagSheetControl(index))
+            .expect("DFF warning must have an actionable Use DSF control");
+        assert_eq!(buttons.find_button_at(rect.x, rect.y),
+            Some(TuiButton::DiscBrowserTagSheetControl(index)));
+    }
+
+    #[test]
     fn r28_collision_and_unknown_token_never_replace_live_path_preview() {
         let theme=crate::tui::theme::theme_by_slug_or_default("tokyo-night");
         let mut state=sacd_state(false,false);
@@ -2246,6 +2572,12 @@ mod extract_r3_render_tests {
         let (unknown,terminal) = rendered_lines(&state,160,44);
         let text=unknown.join("\n");
         assert!(text.contains("→ /tmp/r28-preview/Stereo/song/Untitled.dsf"),"{text}");
+        assert!(text.contains("2 tracks would get the same name"),"{text}");
+        // Resolve the collision independently. The unknown-token warning is
+        // then visible while the live (amber) destination preview remains.
+        state.items_checked[0][0]=false;
+        let (unknown,terminal)=rendered_lines(&state,160,44);
+        let text=unknown.join("\n");
         assert!(text.contains("Unknown naming token: %MISSING%"),"{text}");
         assert!(terminal.backend().buffer().content().iter().any(|cell|
             cell.fg==theme.warning && cell.symbol()=="→"),"preview must be amber");
@@ -2295,8 +2627,14 @@ mod extract_r3_render_tests {
         let (x,y)=word_cells(buf,"Files","other output label");
         assert_eq!(buf.get(x,y).bg,extract_colors(theme).focused);
         state.keep_dst[0]=true;
+        // DST retention must not change the independent DSF/DFF radio.
+        terminal.draw(|f|draw_output(f,&state,area,&mut ButtonRenderMap::new(),theme,true)).unwrap();
+        assert_eq!(terminal.backend().buffer().get(active.x,active.y).bg,theme.input_focused_bg);
+        assert_ne!(terminal.backend().buffer().get(inactive.x,inactive.y).bg,theme.input_focused_bg);
+        state.sacd_dff=true;
         terminal.draw(|f|draw_output(f,&state,area,&mut ButtonRenderMap::new(),theme,true)).unwrap();
         assert_ne!(terminal.backend().buffer().get(active.x,active.y).bg,theme.input_focused_bg);
+        assert_eq!(terminal.backend().buffer().get(inactive.x,inactive.y).bg,theme.input_focused_bg);
     }
 
     #[test]
@@ -2386,7 +2724,9 @@ mod extract_r3_render_tests {
         }
         let tags_index=state.output_rows().iter().position(|name|*name=="Tags").unwrap();
         assert!(buttons.button_rect(TuiButton::DiscBrowserToggle(tags_index)).is_none(),
-            "no clickable Tags control when all destinations are DFF");
+            "the disabled DFF-only Transfer toggle must not be clickable");
+        assert!(buttons.button_rect(TuiButton::DiscBrowserTagsEdit).is_some(),
+            "the Tags sheet must remain accessible to offer Use DSF");
 
         // A second selected area producing DSF still accepts tags, and the
         // helper text makes the distinction explicit without a second sheet.
