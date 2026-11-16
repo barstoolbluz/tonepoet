@@ -5896,6 +5896,12 @@ TonePoet finds the rest of the disc for them:
 - **An orphaned file**, copied out of its disc, falls back to its streams
   alone. The window says that no chapters were found and why.
 
+**Plan (2026-11-16).** Phase A of #90–#93 is discovery from a file on its
+disc, for both formats together; the orphan fallback is Phase C, after #91.
+A DVD VOB's name gives its title set, not its title, so matching it to a
+title may mean comparing the file's sectors with each title's cells. Where
+the match is ambiguous, the window offers the candidates.
+
 ---
 
 ## 91. MKV and MKA files cannot be extracted natively
@@ -5905,6 +5911,11 @@ Filed 2026-11-15. A feature request, following #88 and #90.
 **What we want.** The right-click menu on an MKV or MKA file opens #88's
 extract window for its audio streams and chapters, with the same Folder,
 Naming, Tags and Overwrite controls.
+
+**Decided 2026-11-16.** Phase B of #90–#93. Whole streams are copied
+unchanged. When the user wants chapters split out, the audio is decoded to
+WAV and cut there; decoding a lossy stream adds no loss, and re-encoding it
+to a lossy format would.
 
 ---
 
@@ -5927,6 +5938,9 @@ controls, and nothing is converted.
 - **A CUE sheet and its image inside an archive** can be split into tracks,
   as in #93, if this is not overly complex from inside an archive.
 
+**Plan (2026-11-16).** Phase E of #90–#93, last. Plain archive extraction
+comes first; the two "if not overly complex" items are judged once it works.
+
 ---
 
 ## 93. A CUE sheet and its image cannot be split into tracks without a Convert job
@@ -5939,3 +5953,6 @@ Decomposing a CUE album today means running a whole Convert job.
 a CUE sheet and its image, opens #88's extract window. It lists the sheet's
 tracks and splits the image into them, with the same Folder, Naming, Tags
 and Overwrite controls.
+
+**Decided 2026-11-16.** Tracks are re-encoded in the image's own format, so a
+FLAC image gives FLAC tracks. Phase D of #90–#93, independent of the others.
