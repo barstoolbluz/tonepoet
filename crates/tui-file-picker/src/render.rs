@@ -2042,6 +2042,31 @@ pub fn text_input_spans_with_caret(
     caret_style: Style,
     show_caret: bool,
 ) -> Vec<Span<'static>> {
+    text_input_spans_impl(input,width,text_style,selection_style,caret_style,show_caret,false)
+}
+
+/// For editors that display the insertion point beside an active selection.
+/// Other callers retain the existing selection-without-caret presentation.
+pub fn text_input_spans_with_visible_selection_caret(
+    input: &crate::text_input::TextInputState,
+    width: usize,
+    text_style: Style,
+    selection_style: Style,
+    caret_style: Style,
+    show_caret: bool,
+) -> Vec<Span<'static>> {
+    text_input_spans_impl(input,width,text_style,selection_style,caret_style,show_caret,true)
+}
+
+fn text_input_spans_impl(
+    input: &crate::text_input::TextInputState,
+    width: usize,
+    text_style: Style,
+    selection_style: Style,
+    caret_style: Style,
+    show_caret: bool,
+    caret_with_selection: bool,
+) -> Vec<Span<'static>> {
     if width == 0 {
         return Vec::new();
     }
@@ -2058,9 +2083,10 @@ pub fn text_input_spans_with_caret(
         let selected = selection
             .as_ref()
             .is_some_and(|range| absolute >= range.start && absolute < range.end);
-        let caret = show_caret && absolute == input.cursor && selection.is_none();
-        let style = if selected { selection_style }
-            else if caret { caret_style }
+        let caret = show_caret && absolute == input.cursor
+            && (caret_with_selection || selection.is_none());
+        let style = if caret { caret_style }
+            else if selected { selection_style }
             else { text_style };
         if current_style.is_some_and(|existing| existing != style) {
             spans.push(Span::styled(visible[segment_start..offset].to_string(), current_style.unwrap()));
@@ -2075,10 +2101,11 @@ pub fn text_input_spans_with_caret(
             current_style.unwrap_or(text_style),
         ));
     }
-    if show_caret && input.cursor == visible_end && selection.is_none() {
+    let caret_at_end = show_caret && input.cursor == visible_end
+        && (caret_with_selection || selection.is_none());
+    if caret_at_end && crate::display_width::width(visible) < width {
         spans.push(Span::styled(" ", caret_style));
     }
-    let caret_at_end = show_caret && input.cursor == visible_end && selection.is_none();
     let used = crate::display_width::width(visible)
         .saturating_add(if caret_at_end { 1 } else { 0 });
     if used < width {
@@ -2212,6 +2239,31 @@ fn same_display_path(a: &std::path::Path, b: &std::path::Path) -> bool {
 mod tests {
     use super::*;
     use crate::{ConflictPolicyPreset, FilePickerConfig, FilePickerFilter, FilePickerMenuAction};
+
+    #[test]
+    fn selected_caret_is_opt_in_for_shared_text_input_rendering() {
+        let mut input=crate::text_input::TextInputState::new_selected("café".into());
+        let text_style=Style::default().fg(ratatui::style::Color::White);
+        let selection_style=Style::default().bg(ratatui::style::Color::Blue);
+        let caret_style=Style::default().bg(ratatui::style::Color::Yellow);
+        let legacy=text_input_spans_with_caret(&input,12,text_style,
+            selection_style,caret_style,true);
+        let opt_in=text_input_spans_with_visible_selection_caret(&input,12,text_style,
+            selection_style,caret_style,true);
+        assert!(!legacy.iter().any(|span|span.style==caret_style));
+        assert!(opt_in.iter().any(|span|span.content==" " && span.style==caret_style),
+            "select-all caret must appear after the selected text");
+
+        input.select_all=false;
+        input.selection_anchor=Some(input.text.len());
+        input.cursor=0;
+        let reversed=text_input_spans_with_visible_selection_caret(&input,12,text_style,
+            selection_style,caret_style,true);
+        assert_eq!(reversed.first().unwrap().content,"c");
+        assert_eq!(reversed.first().unwrap().style,caret_style,
+            "reverse-selected caret must replace the first selected glyph's style");
+        assert!(reversed.iter().any(|span|span.style==selection_style));
+    }
 
     #[test]
     fn address_go_label_is_lowercase_without_changing_button_width() {

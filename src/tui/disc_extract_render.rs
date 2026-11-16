@@ -336,8 +336,8 @@ fn preferred_program_rows(state: &DiscBrowserState) -> u16 {
 
 /// The title bar is separate from the three-sided body block. All child rows
 /// are contained in `body_block.inner(body)`, so they cannot erase its corners.
-/// The content-derived size grows by 25% per side, up to the terminal's
-/// two-column and one-row margins; short selections can fill that cap.
+/// The default occupies most of a roomy terminal, while respecting the
+/// two-column and one-row margins. Extra space goes to the lists.
 pub fn draw(
     frame: &mut ratatui::Frame,
     state: &DiscBrowserState,
@@ -377,15 +377,21 @@ pub fn draw(
         .saturating_add(pane_height).saturating_add(output_height)
         .saturating_add(u16::from(!small)).saturating_add(warning_height)
         .saturating_add(results_height).saturating_add(footer_height);
-    // Grow the content-derived default by 25% per side, retaining a one-row
-    // top/bottom and two-column left/right terminal margin.
-    let height=requested_height.saturating_add((requested_height+3)/4)
+    // A 25% increase can be imperceptible when the content-based window
+    // already nearly fills the terminal. In larger terminals, give the lists
+    // room to breathe instead of opening a compact content-sized popup.
+    // Keep one terminal row visible above/below the window.
+    let height=requested_height.saturating_add(requested_height.saturating_add(3)/4)
+        .max((u32::from(area.height)*9/10) as u16)
         .min(area.height.saturating_sub(2));
     let longest_item=state.contents.presentations.iter()
         .flat_map(|p|p.tracks.iter()).filter_map(|t|t.title.as_deref())
         .map(|t|t.chars().count()).max().unwrap_or(0);
     let natural_width=(78usize + longest_item).clamp(96,150) as u16;
-    let width=natural_width.saturating_add((natural_width+3)/4)
+    // Prefer a substantial default width on spacious terminals. The extra
+    // columns belong to the track pane, not to the program column.
+    let width=natural_width.saturating_add(natural_width.saturating_add(3)/4)
+        .max((u32::from(area.width)*9/10) as u16)
         .min(area.width.saturating_sub(4));
     let popup=if state.maximized { area } else { Rect::new(
         area.x+(area.width-width)/2,area.y+(area.height-height)/2,width,height,
@@ -1123,11 +1129,25 @@ fn draw_native_input(frame:&mut ratatui::Frame, rect:Rect, text:&str,
     let normal=Style::default().fg(readable_word(theme.value,well)).bg(well);
     fill(frame,rect,well);
     let content=if let Some(editor)=editing {
-        let selection=blend_color(theme.selection_bg,well,1,5);
-        Line::from(tui_file_picker::text_input_spans_with_caret(
+        // Selected text uses the same high-contrast value foreground as an
+        // ordinary field, but inverted. The tinted caret stays visible at
+        // either end of the selection, including after Ctrl+A.
+        let selection_bg=readable_word(theme.value,well);
+        let caret_bg=if editor.has_selection() {
+            // The palette tint can share the selection's luminance (notably
+            // on light themes). Prefer the contrasting pole in that case so
+            // the block caret does not disappear against adjacent selection.
+            let tint=readable_word(theme.selection_bg,well);
+            let pole=if theme.dark {Color::White}else{Color::Black};
+            if contrast_ratio(pole,well)>=4.5
+                && contrast_ratio(pole,selection_bg)>contrast_ratio(tint,selection_bg) {
+                pole
+            }else{tint}
+        }else{selection_bg};
+        Line::from(tui_file_picker::text_input_spans_with_visible_selection_caret(
             editor,rect.width as usize,normal,
-            Style::default().fg(readable_word(theme.value,selection)).bg(selection),
-            Style::default().fg(well).bg(readable_word(theme.value,well)),true))
+            Style::default().fg(well).bg(selection_bg),
+            Style::default().fg(well).bg(caret_bg),true))
     } else {
         Line::from(Span::styled(clip_end(text,rect.width),normal))
     };
@@ -1891,10 +1911,49 @@ mod extract_r3_render_tests {
             assert!(title_y>=1 && bottom_margin>=1,
                 "dialog must leave a row above and below: {width}x{height}");
             assert!(title_y.abs_diff(bottom_margin)<=1,
-                "dialog must remain centered even when the 1.25× size is capped: {width}x{height}");
+                "dialog must remain centered even when the default size is capped: {width}x{height}");
             assert!(left>=2 && width-right-1>=2,
                 "dialog must leave two columns at each side: {width}x{height}");
         }
+    }
+
+    #[test]
+    fn r36_default_extraction_window_fills_roomy_terminals_without_maximizing() {
+        let theme=crate::tui::theme::theme_by_slug_or_default("tokyo-night");
+        let mut state=sacd_state(false,false);
+        assert!(!state.maximized);
+        for (width,height) in [(110u16,34u16),(154,40),(200,64),(240,80)] {
+            let mut terminal=Terminal::new(TestBackend::new(width,height)).unwrap();
+            terminal.draw(|f|draw(f,&state,Path::new("/tmp"),
+                &mut ButtonRenderMap::new(),theme)).unwrap();
+            let buffer=terminal.backend().buffer();
+            let (left,top)=(0..height).find_map(|y|(0..width).find_map(|x|
+                (buffer.get(x,y).symbol()=="┌").then_some((x,y))))
+                .expect("default title corner");
+            let right=(left+1..width).find(|x|buffer.get(*x,top).symbol()=="┐")
+                .expect("default right title corner");
+            let bottom=(top+1..height).find(|y|buffer.get(left,*y).symbol()=="└")
+                .expect("default lower corner");
+            let actual_width=right-left+1;
+            let actual_height=bottom-top+1;
+            assert!(actual_width>=width*9/10,
+                "{width}x{height}: default popup width {actual_width} is too narrow");
+            assert!(actual_height>=height*9/10,
+                "{width}x{height}: default popup height {actual_height} is too short");
+            assert!(left>=2 && width-right-1>=2,"{width}x{height}: horizontal margins");
+            assert!(top>=1 && height-bottom-1>=1,"{width}x{height}: vertical margins");
+            assert!(left.abs_diff(width-right-1)<=1,"{width}x{height}: x centering");
+            assert!(top.abs_diff(height-bottom-1)<=1,"{width}x{height}: y centering");
+        }
+        state.maximized=true;
+        let mut terminal=Terminal::new(TestBackend::new(200,64)).unwrap();
+        terminal.draw(|f|draw(f,&state,Path::new("/tmp"),
+            &mut ButtonRenderMap::new(),theme)).unwrap();
+        let buf=terminal.backend().buffer();
+        assert_eq!(buf.get(0,0).symbol(),"┌");
+        assert_eq!(buf.get(199,0).symbol(),"┐");
+        assert_eq!(buf.get(0,63).symbol(),"└");
+        assert_eq!(buf.get(199,63).symbol(),"┘");
     }
 
     fn rendered_lines(state: &DiscBrowserState, width: u16, height: u16) -> (Vec<String>, Terminal<TestBackend>) {
@@ -2780,36 +2839,92 @@ mod extract_r3_render_tests {
     }
 
     #[test]
-    fn r32_text_input_uses_recessed_well_selection_and_inverted_block_caret() {
-        for slug in ["tokyo-night", "tokyo-night-day"] {
-            let theme=crate::tui::theme::theme_by_slug_or_default(slug);
+    fn r36_native_text_selection_and_block_caret_are_visible_in_every_builtin_theme() {
+        for palette in crate::tui::theme::palettes() {
+            let theme=Theme::from_palette(palette);
+            let slug=palette.slug;
             let mut terminal=Terminal::new(TestBackend::new(36,8)).unwrap();
             let area=Rect::new(3,2,24,1);
+            let well=if theme.dark {blend_color(theme.panel_bg,Color::Black,1,4)}
+                else {blend_color(theme.panel_bg,theme.value,1,6)};
+            let selection_bg=readable_word(theme.value,well);
             let mut editor=super::super::text_input::TextInputState::new_selected(
                 "café_music".to_owned());
             terminal.draw(|f|draw_native_input(f,area,"ignored",Some(&editor),theme)).unwrap();
             let buffer=terminal.backend().buffer();
             let selected=buffer.get(area.x,area.y);
-            assert_ne!(selected.bg,theme.panel_bg,"{slug}: selection is visible");
-            assert_ne!(selected.bg,theme.value,"{slug}: selection is not the caret");
+            assert_eq!(selected.bg,selection_bg,"{slug}: selected fill is the value text");
+            assert_eq!(selected.fg,well,"{slug}: selected text is inverted");
+            assert!(contrast_ratio(selected.bg,well)>=4.5,"{slug}: selection versus well");
+            assert!(contrast_ratio(selected.fg,selected.bg)>=4.5,"{slug}: selected word");
             assert!(!selected.modifier.contains(Modifier::UNDERLINED));
-            editor.clear_selection();
+
+            let caret_x=area.x+"café_music".chars().count() as u16;
+            let selected_caret=buffer.get(caret_x,area.y);
+            assert_eq!(selected_caret.symbol()," ","{slug}: select-all caret is a block");
+            assert_eq!(selected_caret.fg,well,"{slug}: selected caret glyph foreground");
+            assert!(contrast_ratio(selected_caret.bg,well)>=4.5,"{slug}: selected caret versus well");
+            assert!(contrast_ratio(selected_caret.bg,selected.bg)>=1.4,
+                "{slug}: selected caret must differ from adjacent highlight");
+            let selected_caret_bg=selected_caret.bg;
+
+            // Reverse drag/Shift+Left puts the caret on the first selected
+            // character rather than after the selection.
+            editor.select_all=false;
+            editor.selection_anchor=Some(editor.text.len());
+            editor.cursor=0;
             terminal.draw(|f|draw_native_input(f,area,"ignored",Some(&editor),theme)).unwrap();
             let buffer=terminal.backend().buffer();
-            let caret_x=area.x+"café_music".chars().count() as u16;
-            let cell=buffer.get(caret_x,area.y);
-            assert_eq!(cell.symbol()," ","{slug}: end of text uses the block's empty cell");
-            assert_eq!(cell.bg,readable_word(theme.value,
-                if theme.dark {blend_color(theme.panel_bg,Color::Black,1,4)}
-                else {blend_color(theme.panel_bg,theme.value,1,6)}),"{slug}: block fill");
-            let unedited="café_music";
-            terminal.draw(|f|draw_native_input(f,area,unedited,None,theme)).unwrap();
+            assert_eq!(buffer.get(area.x,area.y).bg,selected_caret_bg,"{slug}: reverse caret");
+            assert_eq!(buffer.get(area.x+1,area.y).bg,selection_bg,"{slug}: reverse selection");
+
+            editor.clear_selection();
+            editor.cursor=editor.text.len();
+            terminal.draw(|f|draw_native_input(f,area,"ignored",Some(&editor),theme)).unwrap();
             let buffer=terminal.backend().buffer();
-            assert_ne!(buffer.get(area.x,area.y).bg,theme.panel_bg,"{slug}: recessed well");
-            assert_ne!(buffer.get(caret_x,area.y).bg,theme.value,"{slug}: no caret without edit");
+            let caret=buffer.get(caret_x,area.y);
+            assert_eq!(caret.symbol()," ","{slug}: end of text uses the block's empty cell");
+            assert_eq!(caret.bg,selection_bg,"{slug}: ordinary block caret fill");
+            terminal.draw(|f|draw_native_input(f,area,"café_music",None,theme)).unwrap();
+            let buffer=terminal.backend().buffer();
+            assert_eq!(buffer.get(area.x,area.y).bg,well,"{slug}: recessed well");
+            assert_eq!(buffer.get(caret_x,area.y).bg,well,"{slug}: no caret without edit");
             let text=(area.x..area.right()).map(|x|buffer.get(x,area.y).symbol().to_owned())
                 .collect::<String>();
             assert!(!text.contains('▕') && !text.contains('▏'),"{slug}: no edge marks");
+        }
+    }
+
+    #[test]
+    fn r36_folder_and_naming_render_select_all_using_the_shared_input_widget() {
+        for slug in ["tokyo-night","tokyo-night-day"] {
+            let theme=crate::tui::theme::theme_by_slug_or_default(slug);
+            let well=if theme.dark {blend_color(theme.panel_bg,Color::Black,1,4)}
+                else {blend_color(theme.panel_bg,theme.value,1,6)};
+            let selected=readable_word(theme.value,well);
+            for naming in [false,true] {
+                let mut state=sacd_state(false,false);
+                state.focus=ExtractFocus::Output;
+                state.editing_destination=true;
+                state.editing_template=naming;
+                state.text_edit=Some(super::super::text_input::TextInputState::new_selected(
+                    "AB".into()));
+                let mut terminal=Terminal::new(TestBackend::new(160,36)).unwrap();
+                let mut buttons=ButtonRenderMap::new();
+                terminal.draw(|f|draw_output(f,&state,Rect::new(3,3,144,16),
+                    &mut buttons,theme,true)).unwrap();
+                let field=buttons.button_rect(if naming {TuiButton::DiscBrowserNaming}
+                    else {TuiButton::DiscBrowserFolderField}).expect("editable field hitbox");
+                let buffer=terminal.backend().buffer();
+                for x in field.x..field.x+2 {
+                    assert_eq!(buffer.get(x,field.y).bg,selected,
+                        "{slug}: {} selection",if naming {"Naming"}else{"Folder"});
+                    assert_eq!(buffer.get(x,field.y).fg,well);
+                }
+                let caret=buffer.get(field.x+2,field.y);
+                assert!(contrast_ratio(caret.bg,selected)>=1.4,
+                    "{slug}: {} cursor beside highlighted text",if naming {"Naming"}else{"Folder"});
+            }
         }
     }
 
@@ -2837,7 +2952,7 @@ mod extract_r3_render_tests {
     }
 
     #[test]
-    fn r15_normal_width_cap_and_full_terminal_maximize_have_title_hitboxes() {
+    fn r36_roomy_default_and_full_terminal_maximize_have_title_hitboxes() {
         let mut state=sacd_state(false,false);
         let theme=crate::tui::theme::theme_by_slug_or_default("tokyo-night");
         let mut terminal=Terminal::new(TestBackend::new(240,50)).unwrap();
@@ -2848,8 +2963,8 @@ mod extract_r3_render_tests {
             normal=buttons.button_rect(TuiButton::DiscBrowserTitle);
         }).unwrap();
         let normal=normal.unwrap();
-        assert!(normal.width>=120 && normal.width<=188 && normal.x>=2 && normal.y>=1,
-            "content-derived popup should grow by 25% while retaining terminal margins: {normal:?}");
+        assert!(normal.width>=216 && normal.width<=236 && normal.x>=2 && normal.y>=1,
+            "roomy default must be visibly larger while retaining margins: {normal:?}");
         let lines=(0..50).map(|y|(0..240)
             .map(|x|terminal.backend().buffer().get(x,y).symbol().to_owned())
             .collect::<Vec<_>>().concat()).collect::<Vec<_>>().join("\n");
