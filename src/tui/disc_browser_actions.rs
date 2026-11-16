@@ -3266,8 +3266,10 @@ mod tests {
             if state.destination_input.as_str()==home.join("Music").join("Out").to_string_lossy().as_ref()));
         press(&mut app,KeyCode::Esc);
 
-        let long=home.join("a-very-long-hidden-component-for-the-mouse-test")
-            .join("another-very-long-hidden-component")
+        // The default window fills most of the terminal, so build a path
+        // longer than the field to keep exercising a collapsed preview.
+        let long=(0..6).fold(home.join("a-very-long-hidden-component-for-the-mouse-test"),
+            |p,i|p.join(format!("another-very-long-hidden-component-{i:02}")))
             .join("AlbumName").join("Extracted");
         if let ActiveOverlay::DiscBrowser(state)=&mut app.active_overlay {
             state.destination=long.clone();
