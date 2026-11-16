@@ -5867,3 +5867,62 @@ the notice.
 
 **What we want.** The notice is clickable and names the key that opens
 Recovery. Recovery has a visible entry point: a key, a menu item, or both.
+
+---
+
+## 90. Single `.m2ts` and `.vob` files cannot be extracted natively
+
+Filed 2026-11-15. A feature request, following #88.
+
+#88's extract window opens for SACD, DVD-Audio, DVD-Video and Blu-ray discs,
+as ISOs or folders. A lone `.m2ts` or `.vob` file has no route. The first #88
+brief scoped these out as later work, saying nothing should make them harder
+to add.
+
+**What we want.** The right-click menu on a single `.m2ts` or `.vob` file
+opens the same window, listing its audio streams and chapters, with the same
+Folder, Naming, Tags and Overwrite controls.
+
+---
+
+## 91. MKV and MKA files cannot be extracted natively
+
+Filed 2026-11-15. A feature request, following #88 and #90.
+
+**What we want.** The right-click menu on an MKV or MKA file opens #88's
+extract window for its audio streams and chapters, with the same Folder,
+Naming, Tags and Overwrite controls.
+
+---
+
+## 92. Archives of music cannot be extracted and renamed without converting
+
+Filed 2026-11-15. A feature request, following #88.
+
+TonePoet browses inside archives and converts from them, but a user who wants
+the files as they are has no direct route.
+
+**What we want.** The right-click menu on an archive (rar, zip, 7z, tar,
+gzip and similar) opens #88's extract window. The chosen files are unpacked
+and renamed from their tags, with the same Folder, Naming, Tags and Overwrite
+controls, and nothing is converted.
+
+- **Everything is extracted by default**, including artwork, logs and CUE
+  sheets. A config setting to limit this can come later.
+- **A disc image inside an archive** opens that disc's tracks, as if the ISO
+  had been opened directly, if this is not overly complex.
+- **A CUE sheet and its image inside an archive** can be split into tracks,
+  as in #93, if this is not overly complex from inside an archive.
+
+---
+
+## 93. A CUE sheet and its image cannot be split into tracks without a Convert job
+
+Filed 2026-11-15. A feature request, following #88.
+
+Decomposing a CUE album today means running a whole Convert job.
+
+**What we want.** The right-click menu on a CUE sheet, or on a folder with
+a CUE sheet and its image, opens #88's extract window. It lists the sheet's
+tracks and splits the image into them, with the same Folder, Naming, Tags
+and Overwrite controls.
