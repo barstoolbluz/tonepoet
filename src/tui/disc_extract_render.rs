@@ -1410,7 +1410,9 @@ fn draw_output(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,
             use super::disc_browser::DestinationFeedback as D;
             let layout=s.native_output_layout_hint();
             let message=match s.destination_feedback {
-                Some(D::WillBeCreated)=>format!("{layout} · will be created"),
+                Some(D::WillBeCreated) if layout=="Files go directly into this folder." =>
+                    "This folder will be created; files go directly into it.".to_owned(),
+                Some(D::WillBeCreated)=>format!("This folder will be created; {layout}"),
                 Some(D::NotWritable)=>"not writable".to_owned(),
                 Some(D::InvalidPath)=>"enter an absolute directory path".to_owned(),
                 None=>layout,
@@ -3126,7 +3128,12 @@ mod extract_r3_render_tests {
             let buffer=terminal.backend().buffer();
             let folder_note=(area.x..area.x+area.width)
                 .map(|x|buffer.get(x,area.y+5).symbol().to_owned()).collect::<Vec<_>>().concat();
-            assert!(folder_note.contains("will be created"),"{folder_note}");
+            assert!(folder_note.contains("This folder will be created; "),"{folder_note}");
+            assert!(!folder_note.contains(" · will be created"),"{folder_note}");
+            if state.native_output_layout_hint()=="Files go directly into this folder." {
+                assert!(folder_note.contains("This folder will be created; files go directly into it."),
+                    "{folder_note}");
+            }
         }
 
         let file=temp.path().join("not_a_directory");
