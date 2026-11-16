@@ -5883,6 +5883,19 @@ to add.
 opens the same window, listing its audio streams and chapters, with the same
 Folder, Naming, Tags and Overwrite controls.
 
+The user may not know that these files carry no chapters of their own, so
+TonePoet finds the rest of the disc for them:
+
+- **`.m2ts`.** Chapters and play order live in `BDMV/PLAYLIST/*.mpls`, with
+  clip details in `BDMV/CLIPINF/*.clpi`. TonePoet looks upward for the
+  `BDMV` structure and offers the playlists that use this clip. A playlist
+  may join several clips.
+- **`.vob`.** Titles and chapters live in the `VIDEO_TS` `.IFO` files, and a
+  title can span `VTS_01_1.VOB`, `VTS_01_2.VOB` and so on. TonePoet offers
+  the title this file belongs to.
+- **An orphaned file**, copied out of its disc, falls back to its streams
+  alone. The window says that no chapters were found and why.
+
 ---
 
 ## 91. MKV and MKA files cannot be extracted natively
