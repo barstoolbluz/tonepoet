@@ -381,7 +381,7 @@ impl DiscBrowserState {
             p.extract.ineligible_reason.is_none()
                 && !matches!(p.id, PresentationId::BluRayTitle { display_angle, .. } if display_angle.get() != 1)
                 && match contents.format {
-                DiscFormat::Sacd | DiscFormat::DvdAudio => true,
+                DiscFormat::Sacd | DiscFormat::DvdAudio | DiscFormat::Matroska => true,
                 DiscFormat::DvdVideo | DiscFormat::BluRay =>
                     (0..index).all(|earlier| contents.presentations[earlier].extract.ineligible_reason.is_some()),
             }
@@ -397,10 +397,11 @@ impl DiscBrowserState {
                     if display_angle.get() != 1)
                 && (
                 matches!(contents.format, DiscFormat::DvdVideo | DiscFormat::BluRay)
-                || (contents.format != DiscFormat::Sacd && p.format.lossless
+                || (contents.format != DiscFormat::Sacd && contents.format != DiscFormat::Matroska && p.format.lossless
                     && p.format.bit_depth.is_none())
             ) { None } else { Some(Ok(Default::default())) }
         }).collect();
+        let is_matroska = contents.format == DiscFormat::Matroska;
         let mut state = Self {
             contents,
             cursor: 0,
@@ -453,7 +454,9 @@ impl DiscBrowserState {
             native_space_cache: RefCell::new(None),
             assume_decrypted: false,
             downmix: crate::convert::pipeline::DvdaDownmixPolicy::None,
-            file_per_program: false,
+            // MKV/MKA defaults to an unchanged audio-packet copy. Choosing
+            // split chapters explicitly changes the result to decoded WAV.
+            file_per_program: is_matroska,
             cue: false,
             dvda_group_preset: 0,
             probe_id: NEXT_EXTRACT_PROBE_ID.fetch_add(1, Ordering::Relaxed),
@@ -578,6 +581,25 @@ impl DiscBrowserState {
     }
 
     fn native_item_payload_bytes(&self, p: &DiscPresentation, track: &DiscTrack) -> Option<u64> {
+        if self.contents.format == DiscFormat::Matroska {
+            if self.file_per_program || matches!(p.id,
+                PresentationId::MatroskaStream { chapter_count: 0, .. }) {
+                // Native whole-stream copying is packet-level even when the
+                // user selected Split chapters and this stream has no chapters.
+                // A conservative whole-file upper bound needs no duration.
+                let file_bytes = fs::metadata(&self.source_path).ok()?.len();
+                let count = p.tracks.len().max(1) as u64;
+                return Some(file_bytes.div_ceil(count));
+            }
+            let seconds = track.duration_secs?;
+            if !seconds.is_finite() || seconds < 0.0 { return None; }
+            let depth = if p.format.lossless { p.format.bit_depth.unwrap_or(32) }
+                else {24};
+            let bytes = seconds * f64::from(p.format.sample_rate?)
+                * f64::from(p.format.channels?) * f64::from(depth.div_ceil(8));
+            if !bytes.is_finite() || bytes > u64::MAX as f64 { return None; }
+            return Some(bytes.ceil() as u64);
+        }
         let rate = p.format.sample_rate? as f64;
         let channels = f64::from(p.format.channels?);
         let bits = if self.contents.format == DiscFormat::Sacd { 1 }
@@ -715,6 +737,25 @@ impl DiscBrowserState {
             } else { 0 };
             active.push((output, existing.filter(|meta| meta.is_file()).map(|meta| meta.len()), extra));
         }
+        // Chapter splitting decodes the *entire* selected audio stream once,
+        // even when only one short chapter is requested. The output-only
+        // estimate does not cover that private f64le spool. Charge the largest
+        // outstanding stream to working storage, not the destination volume.
+        // Skip-existing selections do not require a decode or this reserve.
+        let matroska_decode_spool = if key.format == DiscFormat::Matroska && !key.continuous {
+            active.iter().filter_map(|(output, _, _)|
+                self.contents.presentations.get(output.program_index))
+                .filter(|program| !matches!(program.id,
+                    PresentationId::MatroskaStream { chapter_count: 0, .. }))
+                .filter_map(|program| {
+                    let seconds = program.total_duration_secs.max(
+                        program.tracks.iter().filter_map(|track| track.duration_secs).sum());
+                    let bytes = seconds * f64::from(program.format.sample_rate?)
+                        * f64::from(program.format.channels?) * 8.0;
+                    (bytes.is_finite() && bytes >= 0.0 && bytes <= u64::MAX as f64)
+                        .then_some(bytes.ceil() as u64)
+                }).max().unwrap_or(0)
+        } else { 0 };
         let required = if key.overwrite == NativeOverwritePolicy::Replace {
             // The continuous worker retains completed component files in its
             // private directory until the job finishes; the PCM join spool is
@@ -770,7 +811,8 @@ impl DiscBrowserState {
         } else { 0 };
         let extras = (if key.extraction_log { 128 * 1024 } else { 0 })
             + (if key.cue { (active.len() as u64).saturating_mul(128 * 1024) } else { 0 });
-        let required = required.saturating_add(extras).saturating_add(tail_journal);
+        let required = required.saturating_add(extras).saturating_add(tail_journal)
+            .saturating_add(matroska_decode_spool);
 
         // With a separate scratch volume, completed files are published one
         // at a time. Scratch holds the private output and its intermediates;
@@ -803,7 +845,8 @@ impl DiscBrowserState {
         }
         let destination_required = destination_peak.max(0).min(i128::from(u64::MAX)) as u64;
         let destination_required = destination_required.saturating_add(extras);
-        let working_required = working_peak.saturating_add(extras);
+        let working_required = working_peak.saturating_add(extras)
+            .saturating_add(matroska_decode_spool);
         *self.native_space_cache.borrow_mut() = Some(NativeSpaceCache {
             key, required, working_required, destination_required,
         });
@@ -841,6 +884,9 @@ impl DiscBrowserState {
     /// but checking a chapter must not silently select an audio stream the
     /// user explicitly unchecked. Only the focused stream is reselected.
     pub fn set_item_checked(&mut self, index: usize, checked: bool) {
+        // A copied Matroska stream is indivisible. Chapter checkboxes are
+        // meaningful only after switching Files to split-chapters mode.
+        if self.contents.format == DiscFormat::Matroska && self.file_per_program { return; }
         if index >= self.contents.presentations.get(self.cursor).map_or(0, |p| p.tracks.len()) {
             return;
         }
@@ -916,6 +962,17 @@ impl DiscBrowserState {
         }
     }
 
+    pub(crate) fn matroska_cue_available(&self) -> bool {
+        self.contents.format == DiscFormat::Matroska && self.file_per_program &&
+            self.contents.presentations.iter().enumerate().any(|(i, p)| {
+                self.selected.get(i) == Some(&true) &&
+                self.items_checked.get(i).is_some_and(|items| items.iter().any(|yes| *yes)) &&
+                matches!(p.id, PresentationId::MatroskaStream { chapter_count, .. } if chapter_count > 0) &&
+                !crate::convert::pipeline::native_extract::matroska_copy_format(
+                    p.format.codec.as_deref().unwrap_or("unknown")).chapters
+            })
+    }
+
     pub fn output_rows(&self) -> Vec<&'static str> {
         // Keep DST is meaningful only when a selected SACD area is DST encoded.
         let mut rows = vec!["Format", "Overwrite"];
@@ -924,7 +981,8 @@ impl DiscBrowserState {
             rows.push("Keep DST");
         }
         rows.extend(["Files", "Tags", "Log"]);
-        if self.file_per_program && self.contents.format != DiscFormat::Sacd {
+        if self.file_per_program && (self.matroska_cue_available() ||
+            !matches!(self.contents.format, DiscFormat::Sacd | DiscFormat::Matroska)) {
             rows.push("CUE");
         }
         rows.extend(["Folder", "Naming"]);
@@ -997,6 +1055,13 @@ impl DiscBrowserState {
     }
 
     pub fn tag_source_label(&self, index: usize) -> &'static str {
+        if self.contents.format == DiscFormat::Matroska {
+            return match index {
+                0 => "Container tags, then stream tags",
+                1 => "Stream tags, then container tags",
+                _ => "Unknown source",
+            };
+        }
         match (self.contents.format == DiscFormat::Sacd,index) {
             (true,0)=>"Tag file, then disc text",
             (true,1)=>"Disc text, then tag file",
@@ -1018,7 +1083,14 @@ impl DiscBrowserState {
             if dff { controls.push(C::UseDsf); }
         }
         // Footer actions remain available even when tag transfer is off.
-        controls.extend([C::EditValues, C::MusicBrainz, C::Done]);
+        // Disc metadata editors operate on ISO/folder sources and have no
+        // Matroska target. Do not offer actions that silently do nothing or
+        // mutate the user's input file through a side route.
+        if self.contents.format == DiscFormat::Matroska {
+            controls.push(C::Done);
+        } else {
+            controls.extend([C::EditValues, C::MusicBrainz, C::Done]);
+        }
         controls
     }
 
@@ -1026,7 +1098,7 @@ impl DiscBrowserState {
     /// never the highlighted individual track's title. An authored PCM track
     /// is not known until preparation; don't present navigation as written tags.
     pub fn tag_preview_is_pending(&self) -> bool {
-        self.contents.format != DiscFormat::Sacd
+        !matches!(self.contents.format, DiscFormat::Sacd | DiscFormat::Matroska)
             && self.tag_source != crate::convert::pipeline::native_extract::NativeTagSource::DiscAndSidecar
     }
 
@@ -1035,6 +1107,17 @@ impl DiscBrowserState {
         let Some(p) = self.contents.presentations.get(self.cursor) else { return NativeTagValues::default(); };
         let Some(program) = self.native_program_choice(self.cursor, p, Some(self.item_cursor))
             else { return NativeTagValues::default(); };
+        if self.contents.format == DiscFormat::Matroska {
+            use crate::convert::pipeline::native_extract::NativeTagSource;
+            let authored = program.authored_tags.as_ref().map(|values| values.album.clone())
+                .unwrap_or_default();
+            let album = if self.tag_source == NativeTagSource::AuthoredTrack {
+                authored.prioritized(&program.tags)
+            } else { program.tags.prioritized(&authored) };
+            return if self.file_per_program { album }
+                else { program.tracks.first().map_or(album.clone(), |track|
+                    track.tags.prioritized(&album)) };
+        }
         if self.file_per_program {
             // Authored non-SACD album values also come from preparation.
             return if self.tag_preview_is_pending() { NativeTagValues::default() }
@@ -1350,6 +1433,8 @@ impl DiscBrowserState {
                     tags_to_native(if mb_only { sidecar }
                         else if sidecar_first { sidecar.prioritized(&authored) }
                         else { authored.prioritized(&sidecar) })
+                } else if self.contents.format == DiscFormat::Matroska {
+                    tags_to_native(p.extract.authored_track_tags.get(j).cloned().unwrap_or_default())
                 } else { NativeTagValues {
                     title: if matches!(self.contents.format, DiscFormat::DvdVideo | DiscFormat::BluRay) {
                         None
@@ -1371,7 +1456,8 @@ impl DiscBrowserState {
         (!tracks.is_empty()).then(|| NativeProgramChoice{
             id:p.id, angle:self.selected_angle_for(i), label:p.id.compact_label(), tracks,
             keep_dst:self.keep_dst.get(i) == Some(&true),
-            source_depth:p.format.bit_depth, source_channels:p.format.channels,
+            source_depth:p.format.bit_depth, source_codec:p.format.codec.clone().unwrap_or_else(||"unknown".into()),
+            source_channels:p.format.channels,
             source_rate:p.format.sample_rate,
             // The DVD-Video IFO mapper labels 5.1 from *count*, not
             // speaker assignments. Do not treat it as an authoritative
@@ -1421,7 +1507,8 @@ impl DiscBrowserState {
             naming_template:self.naming_template.clone(), program_subfolders,
             overwrite_policy:self.overwrite_policy, extraction_log:self.extraction_log,
             program_log_paths:Vec::new(), round4_layout:true,
-            file_per_program:self.file_per_program, cue:self.cue,
+            file_per_program:self.file_per_program, cue:self.cue && (self.contents.format != DiscFormat::Matroska ||
+                self.matroska_cue_available()),
             transfer_tags:self.tags && self.native_tags_available(),
             sacd_dff:self.sacd_dff,
             tag_source:self.tag_source,
@@ -1712,6 +1799,9 @@ pub fn spawn_disc_probe(
 
 /// Parse a disc source and map it to the unified browsing model.
 pub fn probe_disc_contents(path: &Path) -> Result<DiscContents, String> {
+    if crate::disc::matroska_utils::is_matroska_path(path) {
+        return crate::disc::matroska_utils::map_matroska_file(path);
+    }
     if crate::disc::on_disc_transport::is_transport_path(path) {
         return crate::disc::on_disc_transport::probe_on_disc_transport(path);
     }
@@ -2047,6 +2137,7 @@ pub fn source_info_for_presentation(
             DiscFormat::Sacd => "SACD ISO".to_string(),
             DiscFormat::DvdVideo => "DVD-Video".to_string(),
             DiscFormat::BluRay => "Blu-ray".to_string(),
+            DiscFormat::Matroska => "Matroska".to_string(),
         },
         codec: fmt.codec.clone().unwrap_or_else(|| presentation.label.clone()),
         bit_depth: fmt.bit_depth,
@@ -2099,6 +2190,9 @@ pub fn presentation_id_supports_stream_conversion(id: &PresentationId) -> bool {
         | PresentationId::DvdVideoTitle { .. }
         | PresentationId::SacdArea(_)
         | PresentationId::BluRayTitle { .. } => true,
+        // Convert already admits MKV/MKA by ordinary file path; the disc
+        // presentation-selection bridge has no Matroska stream selector.
+        PresentationId::MatroskaStream { .. } => false,
     }
 }
 
@@ -2160,6 +2254,9 @@ pub fn apply_presentation_to_source_options(
             options.bluray_angle = Some(display_angle.get());
             true
         }
+        // The ordinary Matroska file source is already handled by Convert;
+        // its per-stream selector is local to the Extract worker.
+        PresentationId::MatroskaStream { .. } => false,
     }
 }
 

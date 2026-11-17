@@ -13,6 +13,8 @@ pub enum DiscFormat {
     Sacd,
     DvdVideo,
     BluRay,
+    /// An MKV/MKA file, not an optical disc. It shares the Extract window.
+    Matroska,
 }
 
 impl DiscFormat {
@@ -22,6 +24,7 @@ impl DiscFormat {
             Self::Sacd => "SACD",
             Self::DvdVideo => "DVD-Video",
             Self::BluRay => "Blu-ray",
+            Self::Matroska => "Matroska",
         }
     }
 }
@@ -83,6 +86,16 @@ pub enum PresentationId {
         audio_stream_index: u8,
         #[serde(rename = "display_angle", alias = "angle_number")]
         display_angle: BlurayDisplayAngle,
+    },
+    /// Global zero-based FFmpeg stream index, and the one-based audio stream
+    /// ordinal for display. These differ in MKV files containing video.
+    MatroskaStream {
+        stream_index: u32,
+        audio_ordinal: u32,
+        /// Number of validated embedded chapters, zero when unavailable.
+        /// Capturing it in the durable program identity detects source drift
+        /// before a resumed extraction can publish unrelated chapter ranges.
+        chapter_count: u32,
     },
 }
 
@@ -160,6 +173,8 @@ impl PresentationId {
     /// stream index required by the demux layer.
     pub fn display_label(&self) -> String {
         match self {
+            Self::MatroskaStream { audio_ordinal, .. } =>
+                format!("Matroska audio stream {audio_ordinal}"),
             Self::DvdAudioGroup(n) => format!("DVD-Audio group {n}"),
             Self::SacdArea(SacdAreaId::Stereo) => "SACD stereo area".to_string(),
             Self::SacdArea(SacdAreaId::MultiChannel) => "SACD multichannel area".to_string(),
@@ -187,6 +202,8 @@ impl PresentationId {
     /// Compact label used in dense CLI/table output.
     pub fn compact_label(&self) -> String {
         match self {
+            Self::MatroskaStream { audio_ordinal, .. } =>
+                format!("Audio stream {audio_ordinal}"),
             Self::DvdAudioGroup(n) => format!("Group {n}"),
             Self::SacdArea(SacdAreaId::Stereo) => "Stereo".to_string(),
             Self::SacdArea(SacdAreaId::MultiChannel) => "Multichannel".to_string(),

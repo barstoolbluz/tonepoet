@@ -7,6 +7,8 @@
 //! or the configured scratch directory; cross-volume publication copies through
 //! a cleaned-up temporary file at the final target before atomic rename.
 
+mod matroska;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use serde::{Deserialize, Serialize};
@@ -60,7 +62,7 @@ pub struct NativeTagValues {
 impl NativeTagValues {
     /// Resolve one field at a time. A blank higher-priority value is absent,
     /// not an instruction to erase a value supplied by the other authority.
-    fn prioritized(&self, fallback: &Self) -> Self {
+    pub(crate) fn prioritized(&self, fallback: &Self) -> Self {
         let pick = |primary: &Option<String>, secondary: &Option<String>| {
             primary.as_ref().filter(|value| !value.trim().is_empty()).cloned()
                 .or_else(|| secondary.as_ref().filter(|value| !value.trim().is_empty()).cloned())
@@ -117,6 +119,9 @@ pub struct NativeProgramChoice {
     pub tracks: Vec<NativeTrackChoice>,
     pub keep_dst: bool,
     pub source_depth: Option<u32>,
+    /// Source codec captured when the extraction job is created. Required for
+    /// native Matroska carrier selection; no earlier Phase B jobs exist.
+    pub source_codec: String,
     pub source_channels: Option<u8>,
     pub source_rate: Option<u32>,
     /// Source-reported layout, not derived from the channel count.
@@ -217,7 +222,7 @@ pub struct NativeExtractionProgress {
 /// The authored presentation identity stays stable when Recovery removes
 /// completed selections from the work left for a new helper generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum NativeSkipReason { ExistingFile, RequestedByUser }
+pub enum NativeSkipReason { ExistingFile, RequestedByUser, NoAudioInChapter }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeSkippedSelection {
@@ -548,6 +553,9 @@ pub async fn execute_with_controls(
 pub async fn probe_selected_sources(
     job: NativeExtractionJob, cancel: CancellationToken,
 ) -> Result<NativeProbeFacts, String> {
+    if job.format == DiscFormat::Matroska {
+        return matroska::probe_selected_sources(&job, &cancel).await;
+    }
     let temporary = tempfile::tempdir()
         .map_err(|e| format!("Create private probe storage: {e}"))?;
     let staging = StagingDir::borrowed(temporary.path().to_path_buf(), "native-extract-probe".into());
@@ -570,6 +578,7 @@ pub async fn probe_selected_sources(
             DiscFormat::DvdAudio => Box::new(DvdaAudioMaterializer),
             DiscFormat::DvdVideo => Box::new(DvdVideoMaterializer),
             DiscFormat::BluRay => Box::new(BlurayMaterializer),
+            DiscFormat::Matroska => unreachable!("Matroska uses its dedicated native file extractor"),
         };
         let prepared = materializer.materialize(
             &request, &staging, &runner, None, &tools, &cancel
@@ -598,6 +607,9 @@ async fn execute_inner(
     controls: Arc<NativeExtractionControl>,
     mut on_progress: impl FnMut(NativeExtractionProgress),
 ) -> Result<NativeExtractionReport, String> {
+    if job.format == DiscFormat::Matroska {
+        return matroska::execute_inner(job, cancel, controls, on_progress).await;
+    }
     validate_job(&job)?;
     controls.execution_started.store(true, Ordering::Release);
     // Reject overlapping scratch before creating anything in working storage.
@@ -663,6 +675,7 @@ async fn execute_inner(
             DiscFormat::DvdAudio => Box::new(DvdaAudioMaterializer),
             DiscFormat::DvdVideo => Box::new(DvdVideoMaterializer),
             DiscFormat::BluRay => Box::new(BlurayMaterializer),
+            DiscFormat::Matroska => unreachable!("Matroska uses its dedicated native file extractor"),
         };
         controls.wait_ready(&cancel, &cancel).await?;
         let program_estimate = program.tracks.iter()
@@ -1011,6 +1024,7 @@ pub(crate) fn render_native_extraction_log_with_outcome(
     let skip_label = |receipt: &NativeSkippedSelection| match receipt.reason {
         Some(NativeSkipReason::ExistingFile) => "Skipped: file already existed",
         Some(NativeSkipReason::RequestedByUser) => "Skipped: requested by user",
+        Some(NativeSkipReason::NoAudioInChapter) => "Skipped: chapter contains no audio",
         None => "Skipped: reason unavailable (earlier run)",
     };
     let saved_size = |path: &Path| -> String {
@@ -1025,21 +1039,35 @@ pub(crate) fn render_native_extraction_log_with_outcome(
         DiscFormat::DvdAudio => "group",
         DiscFormat::DvdVideo => "title",
         DiscFormat::BluRay => "playlist",
+        DiscFormat::Matroska => "stream",
     };
-    let item_kind = if matches!(job.format, DiscFormat::DvdVideo | DiscFormat::BluRay) {
+    let item_kind = if matches!(job.format, DiscFormat::DvdVideo | DiscFormat::BluRay | DiscFormat::Matroska) {
         "chapters"
     } else { "tracks" };
-    let format_name = |p: &NativeProgramChoice| match job.format {
-        DiscFormat::Sacd if p.keep_dst => "DFF (DST kept)",
-        DiscFormat::Sacd if job.sacd_dff => "DFF (DSD native; DST decoded if present)",
-        DiscFormat::Sacd => "DSF (DSD native; DST decoded if present)",
+    let format_name = |p: &NativeProgramChoice| -> String { match job.format {
+        DiscFormat::Sacd if p.keep_dst => "DFF (DST kept)".into(),
+        DiscFormat::Sacd if job.sacd_dff => "DFF (DSD native; DST decoded if present)".into(),
+        DiscFormat::Sacd => "DSF (DSD native; DST decoded if present)".into(),
+        DiscFormat::Matroska => if job.file_per_program ||
+            matches!(p.id, PresentationId::MatroskaStream { chapter_count: 0, .. }) {
+            let carrier = matroska_copy_format(&p.source_codec);
+            format!("{} (original audio packets; no re-encoding{}{})",
+                carrier.extension.to_uppercase(),
+                if carrier.chapters {"; chapters retained"} else {"; chapters not embedded"},
+                if job.transfer_tags && !carrier.text_tags {"; native carrier cannot store tags"}
+                else if job.transfer_tags && job.tag_artwork && !carrier.artwork {
+                    "; artwork cannot be embedded in this carrier"
+                } else {""})
+        } else if p.is_lossless {
+            format!("WAV (lossless PCM, {}-bit source depth)",p.source_depth.unwrap_or(32))
+        } else { "WAV (24-bit PCM, decoded from lossy source)".into() },
         _ => match job.wav_container {
             NativeWavContainer::Automatic => "WAV (RIFF or RF64 as needed)",
             NativeWavContainer::Riff => "RIFF WAV",
             NativeWavContainer::Rf64 => "RF64 WAV",
             NativeWavContainer::W64 => "W64",
-        },
-    };
+        }.into(),
+    }};
     let mut lines = vec![
         format!("TonePoet {} · Extraction log", env!("CARGO_PKG_VERSION")),
         format!("Generated: {}", chrono::Utc::now().to_rfc3339()),
@@ -1066,7 +1094,9 @@ pub(crate) fn render_native_extraction_log_with_outcome(
     lines.push(format!("CUE sheets: {}", yes_no(job.cue)));
     lines.push(format!("Transfer tags: {}", yes_no(job.transfer_tags)));
     lines.push(format!("Tag fields selected: {}", job.tag_fields.count_ones()));
-    lines.push(format!("Artwork: {}", if job.transfer_tags && job.tag_artwork {"requested"}else{"off"}));
+    lines.push(format!("Artwork: {}", if job.transfer_tags && job.tag_artwork {
+        "requested where the selected output carrier supports pictures"
+    } else { "off" }));
     lines.push(format!("Tag source: {}", match job.tag_source {
         NativeTagSource::DiscAndSidecar => "tag file, then disc metadata",
         NativeTagSource::AuthoredTrack => "disc metadata, then tag file",
@@ -1176,7 +1206,8 @@ pub(crate) fn render_native_extraction_log_with_outcome(
         } else {
             omitted += skipped_numbers.len();
         }
-        if job.cue && job.file_per_program {
+        if job.cue && job.file_per_program &&
+            (job.format != DiscFormat::Matroska || matroska_cue_for_program(job, program)) {
             let cue = proposed_destination_for_program(job, program).with_extension("cue");
             if listed.insert(cue.clone()) {
                 if published.contains(cue.as_path()) {
@@ -1330,7 +1361,9 @@ fn native_program_media_paths(job: &NativeExtractionJob, program: &NativeProgram
     if job.file_per_program {
         let audio = proposed_destination_for_program(job, program);
         let mut paths = vec![audio.clone()];
-        if job.cue { paths.push(audio.with_extension("cue")); }
+        if job.cue && (job.format != DiscFormat::Matroska || matroska_cue_for_program(job, program)) {
+            paths.push(audio.with_extension("cue"));
+        }
         paths
     } else {
         program.tracks.iter().map(|track|proposed_destination(job, program, track)).collect()
@@ -1665,8 +1698,62 @@ pub(crate) fn native_artwork_path(album: &AlbumMetadata, source: &Path) -> Optio
     None
 }
 
+/// Carrier for a byte-exact Matroska audio-stream copy. An unrecognized or
+/// unsupported elementary stream remains in MKA, which can carry its chapters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MatroskaCopyFormat {
+    pub extension: &'static str,
+    pub muxer: &'static str,
+    pub chapters: bool,
+    pub text_tags: bool,
+    pub artwork: bool,
+}
+
+pub(crate) fn matroska_copy_format(codec: &str) -> MatroskaCopyFormat {
+    let (extension, muxer, chapters, text_tags, artwork) = match codec {
+        "flac" => ("flac", "flac", false, true, true),
+        "mp3" => ("mp3", "mp3", false, true, true),
+        "aac" => ("aac", "adts", false, false, false),
+        "ac3" => ("ac3", "ac3", false, false, false),
+        "eac3" => ("eac3", "eac3", false, false, false),
+        "dts" => ("dts", "dts", false, false, false),
+        "truehd" => ("thd", "truehd", false, false, false),
+        "mp2" => ("mp2", "mp2", false, false, false),
+        // Ogg repackaging of Matroska Opus/Vorbis changes the retained
+        // sample extent (Opus pre-skip/tail or Vorbis end trimming) even with
+        // -c copy. Keep MKA rather than publish altered presentation audio.
+        "opus" | "vorbis" => ("mka", "matroska", true, true, true),
+        "wavpack" => ("wv", "wv", false, true, false),
+        "tta" => ("tta", "tta", false, true, false),
+        // Matroska ALAC packets often lack a final packet duration. Even
+        // with MP4 edit lists disabled, an M4A copy advertises a truncated
+        // timeline despite retaining the decoded samples. Keep the MKA
+        // presentation clock and authored chapters rather than claim a
+        // valid native M4A copy.
+        "alac" => ("mka", "matroska", true, true, true),
+        codec if matches!(codec,
+            "pcm_u8" | "pcm_s16le" | "pcm_s24le" | "pcm_s32le" |
+            "pcm_s64le" | "pcm_f32le" | "pcm_f64le") =>
+            ("wav", "wav", false, true, false),
+        _ => ("mka", "matroska", true, true, true),
+    };
+    MatroskaCopyFormat { extension, muxer, chapters, text_tags, artwork }
+}
+
+pub(crate) fn matroska_cue_for_program(job: &NativeExtractionJob,
+    program: &NativeProgramChoice) -> bool {
+    job.format == DiscFormat::Matroska && job.file_per_program &&
+        matches!(program.id, PresentationId::MatroskaStream { chapter_count, .. } if chapter_count > 0) &&
+        !matroska_copy_format(&program.source_codec).chapters
+}
+
 fn extraction_extension(job: &NativeExtractionJob, program: &NativeProgramChoice) -> &'static str {
-    if job.format == DiscFormat::Sacd {
+    if job.format == DiscFormat::Matroska {
+        if job.file_per_program || matches!(program.id,
+            PresentationId::MatroskaStream { chapter_count: 0, .. }) {
+            matroska_copy_format(&program.source_codec).extension
+        } else { "wav" }
+    } else if job.format == DiscFormat::Sacd {
         if job.sacd_dff || program.keep_dst { "dff" } else { "dsf" }
     } else if job.wav_container == NativeWavContainer::W64 { "w64" } else { "wav" }
 }
@@ -1750,6 +1837,7 @@ fn native_naming_value(token: &str, program: &NativeProgramChoice,
         "STREAM" => match id {
             PresentationId::DvdVideoTitle {audio_stream_index,..} => (u16::from(audio_stream_index)+1).to_string(),
             PresentationId::BluRayTitle {audio_stream_index,..} => (u16::from(audio_stream_index)+1).to_string(),
+            PresentationId::MatroskaStream { audio_ordinal, .. } => audio_ordinal.to_string(),
             _ => program.label.clone(),
         },
         "ANGLE" => program.angle.to_string(),
@@ -1913,6 +2001,33 @@ pub(crate) fn validate_job(job: &NativeExtractionJob) -> Result<(), String> {
     }
     if !job.source.exists() { return Err("Disc source no longer exists".into()); }
     if job.cue && !job.file_per_program { return Err("CUE belongs to continuous-file mode".into()); }
+    if job.format == DiscFormat::Matroska {
+        if !crate::disc::matroska_utils::is_matroska_path(&job.source) || !job.source.is_file() {
+            return Err("Matroska extraction needs an existing MKV/MKA file".into());
+        }
+        if job.cue && !job.programs.iter().any(|program|
+            matroska_cue_for_program(job, program)) {
+            return Err("CUE is available only for chaptered native streams without embedded chapters".into());
+        }
+        if job.downmix.is_active() || job.assume_decrypted || job.sacd_dff ||
+            job.programs.iter().any(|program| program.keep_dst) {
+            return Err("Disc-only extraction controls cannot be applied to Matroska".into());
+        }
+        for program in &job.programs {
+            let PresentationId::MatroskaStream { chapter_count, .. } = program.id else {
+                return Err("Matroska job contains a non-Matroska stream identity".into());
+            };
+            if job.file_per_program && program.tracks.len() != chapter_count.max(1) as usize {
+                return Err("Whole-stream copy requires all chapters to be selected; choose Split chapters".into());
+            }
+            if chapter_count == 0 && (program.tracks.len() != 1 || program.tracks[0].number != 1) {
+                return Err("Chapterless Matroska stream requires its one whole-stream selection".into());
+            }
+            if program.tracks.iter().any(|track| track.number > chapter_count.max(1)) {
+                return Err("Matroska chapter selection is outside the probed chapter table".into());
+            }
+        }
+    }
     if job.cue && job.format == DiscFormat::Sacd {
         return Err("CUE FILE WAVE indexes do not describe DSF/DFF containers; disable CUE to extract continuous native DSD".into());
     }
@@ -1932,7 +2047,8 @@ pub(crate) fn validate_job(job: &NativeExtractionJob) -> Result<(), String> {
         if job.file_per_program {
             let media = proposed_destination_for_program(job, program);
             inspect_publication_target(job, &mut planned, media.clone())?;
-            if job.cue {
+            if job.cue && (job.format != DiscFormat::Matroska ||
+                matroska_cue_for_program(job, program)) {
                 let cue = media.with_extension("cue");
                 // Skip never publishes a CUE when its continuous audio
                 // already exists: the execution loop skips that whole program.
@@ -1989,6 +2105,13 @@ pub(crate) fn native_destination_collision_key(path: &Path) -> String {
 }
 
 fn inspect_publication_target(job: &NativeExtractionJob, planned: &mut HashSet<String>, dest: PathBuf) -> Result<(), String> {
+    // A standalone MKV/MKA input is itself a possible output pathname. Even
+    // an explicit Replace policy must never overwrite the source being read.
+    if job.format == DiscFormat::Matroska &&
+        fs::canonicalize(&job.source).ok().is_some_and(|source|
+            fs::canonicalize(&dest).ok().as_ref() == Some(&source)) {
+        return Err(format!("Matroska output would replace its own input: {}", dest.display()));
+    }
     if !planned.insert(native_destination_collision_key(&dest)) {
         return Err(format!("Two selected artifacts would publish to '{}'; choose different names",dest.display()));
     }
@@ -2356,7 +2479,7 @@ fn nearest_existing_ancestor(path: &Path) -> Result<&Path, String> {
 mod tests {
     use super::*;
 
-    fn fixture_job(destination: &Path, scratch: &Path) -> NativeExtractionJob {
+    pub(super) fn fixture_job(destination: &Path, scratch: &Path) -> NativeExtractionJob {
         NativeExtractionJob { disc_identity: Default::default(),
             source: std::env::current_exe().unwrap(),
             format: DiscFormat::Sacd,
@@ -2365,7 +2488,7 @@ mod tests {
                 angle: 1, label: "Stereo".into(),
                 tracks: vec![NativeTrackChoice { duration_secs: None, number: 1, name: "one".into(),
                     tags: NativeTagValues::default(), estimated_bytes: None }],
-                keep_dst: false, source_depth: Some(1), source_channels: Some(2),
+                keep_dst: false, source_depth: Some(1), source_codec: "unknown".into(), source_channels: Some(2),
                 source_rate: Some(2_822_400), source_layout: None, is_lossless: true,
                 tags: NativeTagValues::default(), authored_tags: None,
             }],
@@ -2562,6 +2685,20 @@ mod tests {
         let restored: NativeSkippedSelection = serde_json::from_value(value).unwrap();
         assert!(restored.same_selection(&skipped));
         assert_eq!(restored.reason, None);
+    }
+
+    #[test]
+    fn matroska_job_rejects_missing_source_codec_instead_of_legacy_mka_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut job = fixture_job(temp.path(), temp.path());
+        job.format = DiscFormat::Matroska;
+        job.programs[0].source_codec = "flac".into();
+        let mut record = serde_json::to_value(&job).unwrap();
+        record["programs"][0].as_object_mut().unwrap().remove("source_codec");
+        assert!(serde_json::from_value::<NativeExtractionJob>(record).is_err());
+        // Unknown codecs remain eligible for MKA for codec support, not for
+        // recovery of an older job without its required codec identity.
+        assert_eq!(matroska_copy_format("unrecognized_codec").extension, "mka");
     }
 
     #[test]
@@ -3086,7 +3223,7 @@ mod tests {
         let program = NativeProgramChoice {
             id: PresentationId::SacdArea(crate::disc::SacdAreaId::Stereo),
             angle: 1, label: "Stereo".into(), tracks: Vec::new(), keep_dst: false,
-            source_depth: Some(1), source_channels: Some(2), source_rate: Some(2_822_400),
+            source_depth: Some(1), source_codec: "unknown".into(), source_channels: Some(2), source_rate: Some(2_822_400),
             source_layout: Some("stereo".into()), is_lossless: true,
             tags: NativeTagValues { album: Some("An Album".into()),
                 artist: Some("A Performer".into()), ..Default::default() }, authored_tags: None,
@@ -3499,7 +3636,7 @@ mod tests {
                 label: "Stereo".into(),
                 tracks: vec![NativeTrackChoice { duration_secs: None, number: 1, name: "one".into(), tags: NativeTagValues::default(), estimated_bytes: None }],
                 keep_dst: false,
-                source_depth: Some(1),
+                source_depth: Some(1), source_codec: "unknown".into(),
                 source_channels: Some(2),
                 source_rate: Some(2_822_400),
                 angle: 1, source_layout: None, is_lossless: true, tags: NativeTagValues::default(), authored_tags: None,
@@ -3866,7 +4003,7 @@ mod tests {
         let job = NativeExtractionJob { disc_identity: Default::default(), source: std::env::current_exe().unwrap(), format: DiscFormat::Sacd,
             programs: vec![NativeProgramChoice { id: PresentationId::SacdArea(crate::disc::SacdAreaId::Stereo),
                 label: "Stereo".into(), tracks: vec![NativeTrackChoice{ duration_secs: None,number:1,name:"a".into(),tags:NativeTagValues::default(),estimated_bytes:None},
-                NativeTrackChoice{ duration_secs: None,number:1,name:"b".into(),tags:NativeTagValues::default(),estimated_bytes:None}], keep_dst:false,source_depth:Some(1),
+                NativeTrackChoice{ duration_secs: None,number:1,name:"b".into(),tags:NativeTagValues::default(),estimated_bytes:None}], keep_dst:false,source_depth:Some(1), source_codec: "unknown".into(),
                 source_channels:Some(2), source_rate:Some(2822400), angle:1,source_layout:None, is_lossless:true, tags:NativeTagValues::default(), authored_tags: None }],
             destination:"/tmp/dest".into(),working_root:"/tmp".into(),
             wav_container:NativeWavContainer::Automatic,assume_decrypted:false,downmix:DvdaDownmixPolicy::None,

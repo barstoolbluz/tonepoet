@@ -79,7 +79,8 @@ fn selected_entry_effective_disc_path(app: &mut AppState) -> Option<PathBuf> {
     let path = entry.path.clone();
     let current_kind = entry.kind.clone();
 
-    if current_kind.is_disc_source() || entry.is_video_transport_file() {
+    if current_kind.is_disc_source() || entry.is_video_transport_file()
+        || crate::disc::matroska_utils::is_matroska_path(&path) {
         return Some(path);
     }
 
@@ -983,13 +984,19 @@ fn move_native_form_cursor(state: &mut DiscBrowserState, dx: i8, dy: i8) {
 fn set_native_files(state: &mut DiscBrowserState, choice: usize) {
     if choice > 1 { return; }
     state.file_per_program = choice == 1;
-    if !state.file_per_program || state.contents.format == crate::disc::DiscFormat::Sacd {
+    if state.file_per_program && state.contents.format == crate::disc::DiscFormat::Matroska {
+        for checked in &mut state.items_checked { checked.fill(true); }
+    }
+    if !state.file_per_program || state.contents.format == crate::disc::DiscFormat::Sacd ||
+        (state.contents.format == crate::disc::DiscFormat::Matroska &&
+            !state.matroska_cue_available()) {
         state.cue = false;
     }
 }
 
 fn set_native_format(state: &mut DiscBrowserState, choice: usize) {
     use crate::convert::pipeline::native_extract::NativeWavContainer as W;
+    if state.contents.format == crate::disc::DiscFormat::Matroska { return; }
     if state.contents.format == crate::disc::DiscFormat::Sacd {
         if choice <= 1 {
             // The radio selects the default SACD container; per-area Keep DST
@@ -1029,7 +1036,9 @@ fn toggle_native_form_row(state: &mut DiscBrowserState) {
         "Keep DST" => toggle_native_keep_dst(state),
         "Tags" if state.native_tags_available() => state.tags = !state.tags,
         "Log" => state.extraction_log = !state.extraction_log,
-        "CUE" if state.file_per_program && state.contents.format != crate::disc::DiscFormat::Sacd =>
+        "CUE" if state.file_per_program && (state.matroska_cue_available() ||
+            !matches!(state.contents.format,
+                crate::disc::DiscFormat::Sacd | crate::disc::DiscFormat::Matroska)) =>
             state.cue = !state.cue,
         "Assume decrypted" => state.assume_decrypted = !state.assume_decrypted,
         "Downmix" => cycle_native_option(state, 1),
@@ -1070,6 +1079,7 @@ fn cycle_native_option(state: &mut DiscBrowserState, step: i32) {
         _ if state.focus == crate::tui::disc_browser::ExtractFocus::Programs => {
             state.cycle_angle_for(state.cursor, step);
         }
+        Some("Format") if state.contents.format == crate::disc::DiscFormat::Matroska => {},
         Some("Format") if state.contents.format == crate::disc::DiscFormat::Sacd => {
             set_native_format(state,usize::from(!state.sacd_dff));
         }
@@ -2028,6 +2038,9 @@ fn open_existing_metadata_editor_for_disc_cursor(app: &mut AppState) -> Result<b
             } else { return Ok(false); }
         }
         crate::disc::DiscFormat::BluRay => super::keybindings::open_metadata_editor_for_bluray(app, path),
+        // MKV/MKA metadata transfer is configured through the Extract Tags
+        // sheet. Disc sidecar editors do not apply to standalone files.
+        crate::disc::DiscFormat::Matroska => return Ok(false),
     }
     if let ActiveOverlay::MetadataEditor(editor) = &mut app.active_overlay {
         if let Some(index) = editor.presentation_tabs.iter().position(|tab|tab.id == id) {

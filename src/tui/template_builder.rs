@@ -93,6 +93,9 @@ const NATIVE_DVDV: TokenCategory = TokenCategory {
 const NATIVE_BLURAY: TokenCategory = TokenCategory {
     label: "Blu-ray", tokens: &["PLAYLIST", "STREAM", "ANGLE"],
 };
+const NATIVE_MATROSKA: TokenCategory = TokenCategory {
+    label: "Matroska", tokens: &["STREAM"],
+};
 
 fn format_native_tokens(format: crate::disc::DiscFormat) -> &'static TokenCategory {
     match format {
@@ -100,6 +103,7 @@ fn format_native_tokens(format: crate::disc::DiscFormat) -> &'static TokenCatego
         crate::disc::DiscFormat::DvdAudio => &NATIVE_DVDA,
         crate::disc::DiscFormat::DvdVideo => &NATIVE_DVDV,
         crate::disc::DiscFormat::BluRay => &NATIVE_BLURAY,
+        crate::disc::DiscFormat::Matroska => &NATIVE_MATROSKA,
     }
 }
 

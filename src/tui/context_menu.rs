@@ -1550,10 +1550,11 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(build_select_submenu(false));
         }
         EntryKind::OtherFile => {
-            // A selected transport file is not a standalone disc root or a
-            // Convert queue input. Its explicit Extract action resolves its
-            // parent disc and authored chapter/playlist metadata off-thread.
-            if allow_single_item_actions && entry.is_video_transport_file() {
+            // Explicit Extract opens the shared #88 window for on-disc
+            // transports and standalone Matroska audio streams. Both probes
+            // run off-thread; only the extension is checked here.
+            if allow_single_item_actions && (entry.is_video_transport_file()
+                || crate::disc::matroska_utils::is_matroska_path(&entry.path)) {
                 items.push(item("Extract chapters…", ContextAction::BrowseDiscStreams));
                 items.push(separator());
             }
@@ -8559,6 +8560,9 @@ mod tests {
             let labels = menu_labels_recursive(&build_browse_entry_menu(&app));
             assert!(labels.iter().any(|label| label == "Convert"), "{name}");
             assert!(labels.iter().any(|label| label == "Properties"), "{name}");
+            assert_eq!(labels.iter().any(|label| label == "Extract chapters…"),
+                name.ends_with(".mka") || name.ends_with(".mkv"),
+                "#91 Phase B must not admit unrelated WebM/WebA carriers: {name}");
             assert!(
                 !labels.iter().any(|label| label == "Tags & Tagging"),
                 "{name} must not gain the out-of-scope tagging submenu"
