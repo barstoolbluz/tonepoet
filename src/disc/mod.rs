@@ -10,6 +10,7 @@ pub mod bluray_backend_libbluray;
 pub mod bluray_utils;
 pub mod bluray_mapper;
 pub mod sacd_mapper;
+pub mod on_disc_transport;
 
 pub use model::*;
 pub use diagnostics::*;

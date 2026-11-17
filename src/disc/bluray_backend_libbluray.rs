@@ -97,6 +97,70 @@ impl BlurayBackendLibbluray {
     }
 }
 
+/// Identify authored playlists containing a five-digit clip identifier.
+///
+/// libbluray parses MPLS play items and their CLPI-backed clip tables. Query
+/// every authored angle: a selected M2TS can be an alternate-angle clip, not
+/// only the first angle's primary clip. This is metadata-only; no stream bytes
+/// are read or copied and no alternative MPLS parser is introduced.
+pub(crate) fn playlists_containing_clip(
+    disc: &BlurayDisc,
+    clip_id: &str,
+) -> Result<HashSet<u32>, String> {
+    let bytes = clip_id.as_bytes();
+    if bytes.len() != 5 || !bytes.iter().all(u8::is_ascii_digit) {
+        return Err(format!("Invalid Blu-ray clip identifier: {clip_id}"));
+    }
+    let mut playlists = HashSet::new();
+    for index in 0..disc.title_count() {
+        let first = disc.title_info_guard(index, BlurayDisplayAngle::first())?;
+        let first_info = first.as_ref();
+        let playlist = first_info.playlist;
+        let angle_count = first_info.angle_count.max(1);
+        let found = title_info_contains_clip(first_info, bytes)?;
+        drop(first);
+        if found {
+            playlists.insert(playlist);
+            continue;
+        }
+        for angle in 2..=angle_count {
+            let display_angle = BlurayDisplayAngle::new(angle)
+                .map_err(|message| message.to_string())?;
+            let info = disc.title_info_guard(index, display_angle)?;
+            if title_info_contains_clip(info.as_ref(), bytes)? {
+                playlists.insert(playlist);
+                break;
+            }
+        }
+    }
+    Ok(playlists)
+}
+
+fn title_info_contains_clip(
+    info: &ffi::BLURAY_TITLE_INFO,
+    clip_id: &[u8],
+) -> Result<bool, String> {
+    if info.clip_count == 0 {
+        return Ok(false);
+    }
+    if info.clips.is_null() {
+        return Err(format!(
+            "Blu-ray playlist {:05} reports clips but has no clip table",
+            info.playlist
+        ));
+    }
+    let clips = unsafe { std::slice::from_raw_parts(info.clips, info.clip_count as usize) };
+    Ok(clips.iter().any(|clip| clip_id_equals(&clip.clip_id, clip_id)))
+}
+
+fn clip_id_equals(available: &[std::os::raw::c_char; 6], wanted: &[u8]) -> bool {
+    wanted.len() == 5
+        && available[..5]
+            .iter()
+            .zip(wanted.iter())
+            .all(|(actual, expected)| *actual as u8 == *expected)
+}
+
 /// Safe owner for a libbluray handle.
 ///
 /// The handle kept on `BlurayDisc` is metadata-only after disc open. Each
@@ -2222,5 +2286,20 @@ mod tests {
             raw_rate: 0x01,
             raw_lang: *b"eng\0",
         }
+    }
+}
+
+#[cfg(test)]
+mod on_disc_clip_identity_tests {
+    use super::clip_id_equals;
+    use std::os::raw::c_char;
+
+    #[test]
+    fn mpls_clip_id_comparison_requires_five_exact_digits() {
+        let id: [c_char; 6] = [b'0', b'0', b'4', b'2', b'1', 0].map(|byte| byte as c_char);
+        assert!(clip_id_equals(&id, b"00421"));
+        assert!(!clip_id_equals(&id, b"00422"));
+        assert!(!clip_id_equals(&id, b"0042"));
+        assert!(!clip_id_equals(&id, b"004210"));
     }
 }

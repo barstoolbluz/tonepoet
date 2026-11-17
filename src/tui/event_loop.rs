@@ -8778,7 +8778,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                         .unwrap_or(false)
                     {
                         if let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay {
-                            if state.tag_refresh_pending && state.source_path == path {
+                            if state.tag_refresh_pending && state.probe_path == path {
                                 if let Err(error) = state.accept_refreshed_tag_contents(contents.clone()) {
                                     app.set_status(error);
                                 }
@@ -8804,7 +8804,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 }
                 (Some(fingerprint), Err(error)) => {
                     if let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay {
-                        if state.tag_refresh_pending && state.source_path == path {
+                        if state.tag_refresh_pending && state.probe_path == path {
                             state.tag_refresh_pending=false;
                             state.tag_refresh_failed=true;
                             app.set_status(format!("Saved tags could not be refreshed: {error}"));
@@ -8818,7 +8818,9 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                             path.clone(),
                             crate::tui::disc_browser::DiscProbeCacheEntry::from_error(fingerprint, error.clone()),
                         );
-                        if app.browse.current_selected_disc_source_matches(&path) {
+                        if app.browse.current_selected_disc_source_matches(&path)
+                            || app.browse.disc_probe_followup.contains_key(&path)
+                        {
                             app.browse.deferred_work.info_pane_changed = true;
                             app.set_status(format!("Disc analysis failed: {error}"));
                         }
@@ -8832,15 +8834,15 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 }
                 (None, Err(error)) => {
                     if let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay {
-                        if state.tag_refresh_pending && state.source_path == path {
+                        if state.tag_refresh_pending && state.probe_path == path {
                             state.tag_refresh_pending=false;
                             state.tag_refresh_failed=true;
                             app.set_status(format!("Saved tags could not be refreshed: {error}"));
                         }
                     }
                     app.browse.disc_probe_cache.remove(&path);
-                    app.browse.disc_probe_followup.remove(&path);
-                    if app.browse.current_selected_disc_source_matches(&path) {
+                    let explicit_request = app.browse.disc_probe_followup.remove(&path).is_some();
+                    if app.browse.current_selected_disc_source_matches(&path) || explicit_request {
                         app.set_status(format!("Disc analysis failed: {error}"));
                     } else {
                         log::debug!(
@@ -8851,7 +8853,7 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
                 }
                 (None, Ok(contents)) => {
                     if let ActiveOverlay::DiscBrowser(state) = &mut app.active_overlay {
-                        if state.tag_refresh_pending && state.source_path == path {
+                        if state.tag_refresh_pending && state.probe_path == path {
                             if let Err(error) = state.accept_refreshed_tag_contents(contents.clone()) {
                                 app.set_status(error);
                             }

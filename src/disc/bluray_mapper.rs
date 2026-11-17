@@ -6,7 +6,7 @@
 //! browser and convert view.
 
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread;
@@ -42,6 +42,25 @@ where
     B: BlurayBackend,
     P: BlurayCompressedAudioProbe + ?Sized,
 {
+    map_bluray_disc_with_audio_probe_filtered::<B, P>(
+        disc, source_path, compressed_audio_probe, probe_control, None,
+    )
+}
+
+/// For a file selected inside a disc, expose every playlist which uses that
+/// clip, even short or otherwise duplicate presentations. Those full-disc
+/// pruning heuristics cannot discard an explicitly selected authored program.
+pub(crate) fn map_bluray_disc_with_audio_probe_filtered<B, P>(
+    disc: &B::Disc,
+    source_path: &Path,
+    compressed_audio_probe: &P,
+    probe_control: &BlurayProbeControl<'_>,
+    playlist_filter: Option<&HashSet<u32>>,
+) -> Result<DiscContents, String>
+where
+    B: BlurayBackend,
+    P: BlurayCompressedAudioProbe + ?Sized,
+{
     let label = blu_ray_disc_label::<B>(disc, source_path);
     let titles = B::titles(disc)?;
     let mut presentations = Vec::new();
@@ -54,6 +73,9 @@ where
 
     for title in titles {
         let playlist_number = title.playlist_number;
+        if playlist_filter.is_some_and(|allowed| !allowed.contains(&playlist_number)) {
+            continue;
+        }
         let max_angle = B::max_angle(disc, title.key)
             .ok()
             .filter(|value| *value > 0)
@@ -191,7 +213,8 @@ where
         }
 
         let total_duration_secs = title_duration_secs(&title, &chapters);
-        if total_duration_secs > 0.0 && total_duration_secs < MIN_PLAYLIST_DURATION_SECS {
+        if playlist_filter.is_none()
+            && total_duration_secs > 0.0 && total_duration_secs < MIN_PLAYLIST_DURATION_SECS {
             let stream = &streams[0];
             suppressed.push(suppressed_title(
                 playlist_number,
@@ -209,22 +232,24 @@ where
             continue;
         }
 
-        let signature = playlist_signature(&chapters, total_duration_secs, &streams);
-        if let Some(original_playlist) = signatures.get(&signature) {
-            let stream = &streams[0];
-            suppressed.push(suppressed_title(
-                playlist_number,
-                stream.pid,
-                stream.stream_index,
-                first_angle,
-                chapters.len(),
-                total_duration_secs,
-                format!("duplicate playlist of {original_playlist:05}"),
-                Some(format!("playlist {playlist_number:05}")),
-            ));
-            continue;
+        if playlist_filter.is_none() {
+            let signature = playlist_signature(&chapters, total_duration_secs, &streams);
+            if let Some(original_playlist) = signatures.get(&signature) {
+                let stream = &streams[0];
+                suppressed.push(suppressed_title(
+                    playlist_number,
+                    stream.pid,
+                    stream.stream_index,
+                    first_angle,
+                    chapters.len(),
+                    total_duration_secs,
+                    format!("duplicate playlist of {original_playlist:05}"),
+                    Some(format!("playlist {playlist_number:05}")),
+                ));
+                continue;
+            }
+            signatures.insert(signature, playlist_number);
         }
-        signatures.insert(signature, playlist_number);
 
         for display_angle in display_angles {
             let angle_chapters = if display_angle == first_angle {
@@ -1696,6 +1721,36 @@ mod tests {
             .iter()
             .find(|title| title.info.key == key)
             .ok_or_else(|| "missing title".to_string())
+    }
+
+    #[test]
+    fn selected_clip_playlist_filter_preserves_short_and_duplicate_authored_programs() {
+        let audio = stream(0x1100, 0, BluRayAudioCoding::Lpcm,
+            Some(48_000), Some(16), Some(2));
+        let disc = fake_disc(vec![
+            fake_title(11, 12, 2, vec![audio.clone()]),
+            fake_title(12, 12, 2, vec![audio.clone()]),
+            fake_title(99, 300, 4, vec![audio]),
+        ]);
+        let eligible = [11, 12].into_iter().collect::<HashSet<_>>();
+        let probe = FakeCompressedAudioProbe::success(Vec::new());
+        let filtered = map_bluray_disc_with_audio_probe_filtered::<FakeBackend, _>(
+            &disc, Path::new("/disc"), &probe,
+            &BlurayProbeControl::bounded_default(), Some(&eligible),
+        ).expect("map authored playlists referencing selected clip");
+        let numbers = filtered.presentations.iter()
+            .filter_map(|presentation| presentation.id.blu_ray_parts().map(|parts| parts.0))
+            .collect::<Vec<_>>();
+        assert_eq!(numbers, vec![11, 12]);
+        assert_eq!(filtered.presentations[0].tracks.len(), 2);
+        assert!(filtered.suppressed.is_empty());
+        assert_eq!(probe.call_count(), 0, "LPCM metadata should not run ffprobe");
+
+        let whole_disc = map_bluray_disc_with_audio_probe::<FakeBackend, _>(
+            &disc, Path::new("/disc"), &probe, &BlurayProbeControl::bounded_default(),
+        ).expect("whole-disc mapping is unchanged");
+        assert_eq!(whole_disc.presentations.len(), 1);
+        assert_eq!(whole_disc.presentations[0].id.blu_ray_parts().unwrap().0, 99);
     }
 
     #[test]

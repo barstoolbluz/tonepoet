@@ -165,6 +165,16 @@ pub fn map_bluray_source(path: &Path) -> Result<crate::disc::DiscContents, Strin
     map_bluray_source_with_audio_probe(path, &probe, &control)
 }
 
+/// Map only the authored playlists referencing a selected BDMV/STREAM clip.
+/// The libbluray metadata tables supply the playlist/clip relationships; the
+/// normal mapper still provides chapter order, stream identities, tags, and
+/// the same extraction semantics as a whole-disc selection.
+pub fn map_bluray_source_for_clip(path: &Path, clip_id: &str) -> Result<crate::disc::DiscContents, String> {
+    let probe = crate::disc::bluray_mapper::FfprobeBlurayAudioProbe::default();
+    let control = crate::disc::bluray_mapper::BlurayProbeControl::bounded_default();
+    map_bluray_source_with_audio_probe_selection(path, &probe, &control, Some(clip_id))
+}
+
 /// Open and map a Blu-ray source using an explicit compressed-stream probe.
 ///
 /// This keeps the normal TUI browse path bounded by default while allowing tests
@@ -177,13 +187,43 @@ pub(crate) fn map_bluray_source_with_audio_probe<P>(
 where
     P: crate::disc::bluray_mapper::BlurayCompressedAudioProbe + ?Sized,
 {
+    map_bluray_source_with_audio_probe_selection(path, compressed_audio_probe, probe_control, None)
+}
+
+fn map_bluray_source_with_audio_probe_selection<P>(
+    path: &Path,
+    compressed_audio_probe: &P,
+    probe_control: &crate::disc::bluray_mapper::BlurayProbeControl<'_>,
+    clip_id: Option<&str>,
+) -> Result<crate::disc::DiscContents, String>
+where
+    P: crate::disc::bluray_mapper::BlurayCompressedAudioProbe + ?Sized,
+{
     let source = bluray_source_path_for_backend(path)?;
     let disc = BlurayBackendLibbluray::open(&source)
         .map_err(|err| format!("Blu-ray open failed for '{}': {err}", source.display()))?;
-    let mut contents = crate::disc::bluray_mapper::map_bluray_disc_with_audio_probe::<
+    let matching = if let Some(clip_id) = clip_id {
+        let playlists = super::bluray_backend_libbluray::playlists_containing_clip(&disc, clip_id)?;
+        if playlists.is_empty() {
+            return Err(format!(
+                "No authored Blu-ray playlist references clip {clip_id}.m2ts on this disc"
+            ));
+        }
+        Some(playlists)
+    } else {
+        None
+    };
+    let mut contents = crate::disc::bluray_mapper::map_bluray_disc_with_audio_probe_filtered::<
         BlurayBackendLibbluray,
         P,
-    >(&disc, &source, compressed_audio_probe, probe_control)?;
+    >(&disc, &source, compressed_audio_probe, probe_control, matching.as_ref())?;
+    if let Some(clip_id) = clip_id {
+        if contents.presentations.is_empty() {
+            return Err(format!(
+                "The playlists referencing clip {clip_id}.m2ts contain no selectable audio chapters"
+            ));
+        }
+    }
     overlay_bluray_sidecar_metadata::<BlurayBackendLibbluray>(path, &disc, &mut contents);
     crate::disc::bluray_mapper::refresh_bluray_presentation_labels(&mut contents);
     Ok(contents)
