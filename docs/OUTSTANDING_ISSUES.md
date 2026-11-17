@@ -5956,3 +5956,57 @@ and Overwrite controls.
 
 **Decided 2026-11-16.** Tracks are re-encoded in the image's own format, so a
 FLAC image gives FLAC tracks. Phase D of #90–#93, independent of the others.
+
+---
+
+## 94. Images are drawn with half-blocks inside tmux and byobu
+
+Filed 2026-11-16.
+
+**Symptom.** Inside tmux or byobu, every image tonepoet draws (Browse artwork, the
+artwork popup, file-picker previews) is rendered with half-block characters. The same
+build outside tmux, in the same terminal, draws sharp Kitty-protocol images.
+
+**Cause.** This is deliberate, not a detection failure. `tmux_like_environment`
+(`src/tui/app.rs`) returns true when `TMUX` is set, `TERM_PROGRAM` is `tmux`,
+`BYOBU_BACKEND` is `tmux`, or `TERM` is `tmux`/`tmux-*`. On true,
+`new_terminal_image_picker` forces `ProtocolType::Halfblocks` and never calls
+`Picker::guess_protocol`; `enforce_safe_terminal_image_picker_protocol_for_current_environment`
+re-applies it on refresh. The rule came from commit `4467ecc4` (2026-06-28, "Fix
+tmux/byobu crash from Kitty graphics protocol query leak"): the protocol probe's
+query escaped into tmux and crashed the TUI.
+
+**Evidence the terminal path works (2026-11-16).** Ghostty 1.3.1 → SSH → byobu 5.133
+on tmux 3.5a. With `allow-passthrough on` and `terminal-features ',xterm-ghostty:RGB'`,
+`kitten icat --transfer-mode=stream --unicode-placeholder cover.png` draws a sharp
+image in a byobu pane. Without the RGB feature the same command draws nothing: the
+placeholder's image id is carried in a 24-bit foreground colour, which tmux downgrades.
+
+**Wanted outcome.**
+- Under tmux/byobu, when the outer terminal supports Kitty graphics and tmux will
+  carry them, tonepoet draws native images, using Unicode placeholders so images stay
+  inside their pane and do not bleed across panes or windows.
+- When that cannot be established (passthrough off, no true colour, outer terminal
+  without Kitty graphics, anything uncertain), tonepoet keeps today's half-block
+  rendering. Half-blocks stay the safe default; native is the earned exception.
+- The user can force half-blocks regardless.
+
+**Guardrails.**
+- The `4467ecc4` crash must not return. No query or response bytes may leak into the
+  pane, the input stream, or the screen, under tmux or byobu, locally or over SSH.
+- Behaviour outside tmux is unchanged.
+- Nothing visible when support is absent: no garbage characters, no blank artwork box
+  where half-blocks would have drawn a picture.
+- SSH is the primary case: `TERM_PROGRAM` is not forwarded, PTYs may report 0x0
+  pixels, and file/shared-memory transfer modes are unavailable.
+- More than one client may be attached to a session, with different capabilities.
+
+**Known facts, not prescriptions.** The pinned `ratatui-image` 1.0.5 `Picker` has an
+`is_tmux` field set by its own `guess_protocol` and passed to its protocol encoders.
+`src/tui/kitty_transport.rs` rewrites the Kitty upload APC for compression and must
+keep working with whatever framing tmux requires.
+
+**Tests owed.** The environment-decision tests around
+
+*(The text as filed ends mid-sentence here; the rest of this section is still to be
+supplied.)*
