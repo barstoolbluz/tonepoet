@@ -256,6 +256,10 @@ pub struct DiscBrowserState {
     /// rows. It is deliberately not a presentation index.
     pub scroll: usize,
     pub source_path: PathBuf,
+    /// Original Browse target for navigation probes and tag refresh. For a
+    /// single M2TS/VOB this is the clicked file while source_path is the
+    /// owning disc root needed by extraction and metadata editors.
+    pub probe_path: PathBuf,
     /// Native extraction uses one selection bitmap per presentation. Chapter
     /// selections are synchronized across streams in the same authored title.
     pub items_checked: Vec<Vec<bool>>,
@@ -404,6 +408,7 @@ impl DiscBrowserState {
             selected,
             scroll: 0,
             source_path: source_path.clone(),
+            probe_path: source_path.clone(),
             items_checked,
             focus: ExtractFocus::Programs,
             maximized: false,
@@ -1707,6 +1712,9 @@ pub fn spawn_disc_probe(
 
 /// Parse a disc source and map it to the unified browsing model.
 pub fn probe_disc_contents(path: &Path) -> Result<DiscContents, String> {
+    if crate::disc::on_disc_transport::is_transport_path(path) {
+        return crate::disc::on_disc_transport::probe_on_disc_transport(path);
+    }
     if crate::tui::sacd::is_sacd_iso(path) {
         return probe_sacd_contents(path);
     }

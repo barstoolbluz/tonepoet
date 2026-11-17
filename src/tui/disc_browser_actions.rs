@@ -79,7 +79,7 @@ fn selected_entry_effective_disc_path(app: &mut AppState) -> Option<PathBuf> {
     let path = entry.path.clone();
     let current_kind = entry.kind.clone();
 
-    if current_kind.is_disc_source() {
+    if current_kind.is_disc_source() || entry.is_video_transport_file() {
         return Some(path);
     }
 
@@ -102,6 +102,12 @@ fn selected_entry_effective_disc_path(app: &mut AppState) -> Option<PathBuf> {
 
 /// Open the Audio Streams overlay for a specific disc path, or start probing it.
 pub fn open_disc_browser_for_path(app: &mut AppState, path: PathBuf, tx: &mpsc::Sender<AppMessage>) {
+    // A transport file's authored navigation lives in sibling MPLS/IFO files,
+    // not in the selected file's own metadata. Explicit opens re-probe rather
+    // than using a cache fingerprint that cannot observe those siblings.
+    if crate::disc::on_disc_transport::is_transport_path(&path) {
+        app.browse.disc_probe_cache.remove(&path);
+    }
     if let Some(contents) = cached_disc_contents(app, &path) {
         open_disc_browser_from_contents(app, contents.as_ref().clone(), path, tx);
         return;
@@ -127,7 +133,17 @@ pub fn open_disc_browser_from_contents(app: &mut AppState, contents: DiscContent
         return;
     }
 
-    let mut state = DiscBrowserState::new(contents, source_path.clone());
+    // The input file identifies the navigation to display. Actual extract,
+    // Convert and tag-editor operations must use the *disc root*, since a
+    // playlist/title can span several M2TS/VOB files. Preserve the clicked
+    // file for async tag refresh and explicit Analyze/reopen requests.
+    let extraction_source = if crate::disc::on_disc_transport::is_transport_path(&source_path) {
+        contents.source_path.clone()
+    } else {
+        source_path.clone()
+    };
+    let mut state = DiscBrowserState::new(contents, extraction_source);
+    state.probe_path = source_path;
     // Match Convert's user preference rather than defaulting off for every
     // extraction. A per-dialogue toggle never writes to the preference.
     state.extraction_log = app.config.conversion.write_log_file;
@@ -152,6 +168,7 @@ pub fn open_disc_browser_from_contents(app: &mut AppState, contents: DiscContent
             }
         }
         let tx = tx.clone();
+        let extraction_path = state.source_path.clone();
         tokio::spawn(async move {
             for (program_index, program) in probes {
                 if cancel.is_cancelled() { break; }
@@ -165,7 +182,7 @@ pub fn open_disc_browser_from_contents(app: &mut AppState, contents: DiscContent
                 };
                 if cancel.is_cancelled() { break; }
                 if tx.send(AppMessage::DiscExtractProbeComplete {
-                    path: source_path.clone(), probe_id: id, program_index, result,
+                    path: extraction_path.clone(), probe_id: id, program_index, result,
                 }).await.is_err() { break; }
             }
         });
@@ -1413,7 +1430,7 @@ pub(super) fn restore_extract_after_tag_editor(
     let saved = editor.extract_tags_saved;
     draft.tag_refresh_pending = saved;
     draft.tag_refresh_failed = false;
-    let path = draft.source_path.clone();
+    let path = draft.probe_path.clone();
     app.active_overlay = ActiveOverlay::DiscBrowser(draft);
     if saved { force_disc_reprobe(app, path, tx); }
     true
@@ -1598,7 +1615,7 @@ pub fn handle_disc_browser_key(
         if state.panel == Some(ExtractPanel::More)
             && state.contents.format != crate::disc::DiscFormat::Sacd
             && key.code == KeyCode::Char('a') {
-            let path = state.source_path.clone();
+            let path = state.probe_path.clone();
             state.probe_cancel.cancel();
             app.active_overlay = ActiveOverlay::None;
             app.browse.disc_probe_followup.insert(path.clone(),
@@ -2255,6 +2272,28 @@ mod tests {
             album_artist: None,
             genre: None,
             year: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn on_disc_transport_extract_uses_disc_root_but_reprobes_clicked_file() {
+        for (marker, part) in [
+            (FolderDiscMarkerKind::BluRay, "BDMV/STREAM/00042.m2ts"),
+            (FolderDiscMarkerKind::DvdVideo, "VIDEO_TS/VTS_01_2.VOB"),
+        ] {
+            let root = PathBuf::from("/fixture/on-disc-root");
+            let clicked = root.join(part);
+            let contents = selectable_disc_contents(root.clone(), marker);
+            let mut app = AppState::new_for_test(TonepoetConfig::default());
+            let (tx, _rx) = tokio::sync::mpsc::channel(8);
+            open_disc_browser_from_contents(&mut app, contents, clicked.clone(), &tx);
+            let ActiveOverlay::DiscBrowser(state) = &app.active_overlay else {
+                panic!("transport selection must use native disc extract window");
+            };
+            assert_eq!(state.source_path, root);
+            assert_eq!(state.probe_path, clicked);
+            assert_eq!(state.contents.source_path, root);
+            assert_eq!(state.native_job(std::env::temp_dir()).source, root);
         }
     }
 

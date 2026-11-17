@@ -53,15 +53,11 @@ impl Materializer for DvdVideoMaterializer {
         if cancel.is_cancelled() {
             return Err(MaterializeError::Cancelled);
         }
-        if crate::disc::dvda_utils::is_dvda_source(&req.container) {
-            return Err(MaterializeError::Parse(format!(
-                "{} is a hybrid/DVD-Audio source; DVD-Audio materialization must handle it",
-                req.container.display()
-            )));
-        }
-
-        let disc = crate::disc::dvdv_utils::open_dvdv_source(&req.container)
-            .map_err(MaterializeError::Parse)?;
+        let disc = open_dvdv_for_materialization(
+            &req.container,
+            req.source.dvdv_vts,
+            req.source.dvdv_title,
+        )?;
         let vts_ifos = crate::disc::dvdv_utils::parse_vts_ifos_for_source(&req.container, &disc)
             .map_err(MaterializeError::Parse)?
             .into_iter()
@@ -253,6 +249,26 @@ impl Materializer for DvdVideoMaterializer {
     }
 }
 
+
+/// An explicit DVD-Video title selection is permitted on a directory-backed
+/// hybrid disc; automatic admission and ISO handling remain DVD-Audio-first.
+fn open_dvdv_for_materialization(
+    path: &Path,
+    requested_vts: Option<u8>,
+    requested_title: Option<u8>,
+) -> Result<DvdDisc, MaterializeError> {
+    if path.is_dir() && requested_vts.is_some() && requested_title.is_some() {
+        return crate::disc::dvdv_utils::open_dvdv_directory_for_title(path)
+            .map_err(MaterializeError::Parse);
+    }
+    if crate::disc::dvda_utils::is_dvda_source(path) {
+        return Err(MaterializeError::Parse(format!(
+            "{} is a hybrid/DVD-Audio source; DVD-Audio materialization must handle it",
+            path.display()
+        )));
+    }
+    crate::disc::dvdv_utils::open_dvdv_source(path).map_err(MaterializeError::Parse)
+}
 
 fn dvdv_tool_versions(runner: &dyn ToolRunner) -> BTreeMap<String, String> {
     let mut tool_versions = BTreeMap::new();
@@ -541,6 +557,7 @@ fn title_vob_inventory(disc: &DvdDisc, source: &Path, vts_number: u8) -> Result<
         )));
     }
 
+    // VTS_C_ADT addresses use zero-based sectors across the title VOBs.
     let mut next_block = 0u32;
     let mut out = Vec::with_capacity(files.len());
     for file in files {
@@ -1545,6 +1562,33 @@ mod tests {
         fn tool_version(&self, binary: ToolBinary) -> Option<String> {
             self.0.get(&binary).cloned()
         }
+    }
+
+    #[test]
+    fn explicit_hybrid_dvd_video_title_reaches_native_materializer_inventory() {
+        use super::open_dvdv_for_materialization;
+        let temp = tempfile::tempdir().unwrap();
+        let video_ts = temp.path().join("VIDEO_TS");
+        let audio_ts = temp.path().join("AUDIO_TS");
+        std::fs::create_dir(&video_ts).unwrap();
+        std::fs::create_dir(&audio_ts).unwrap();
+        std::fs::write(video_ts.join("VIDEO_TS.IFO"), b"DVDVIDEO-VMG").unwrap();
+        std::fs::write(audio_ts.join("AUDIO_TS.IFO"), b"DVDAUDIO-AMG").unwrap();
+        std::fs::write(video_ts.join("VTS_01_1.VOB"), vec![0u8; 2048]).unwrap();
+        std::fs::write(video_ts.join("VTS_01_2.VOB"), vec![0u8; 4096]).unwrap();
+
+        assert!(crate::disc::dvda_utils::is_dvda_source(temp.path()));
+        let disc = open_dvdv_for_materialization(temp.path(), Some(1), Some(1))
+            .expect("explicit DVD-Video title must reach native inventory");
+        assert!(disc.vts_title_vob(1, 1).is_some());
+        assert!(disc.vts_title_vob(1, 2).is_some());
+        // An incomplete or automatic DVD-Video request cannot defeat
+        // the hybrid disc's DVD-Audio-first source policy.
+        assert!(open_dvdv_for_materialization(temp.path(), None, None).is_err());
+        assert!(open_dvdv_for_materialization(temp.path(), Some(1), None).is_err());
+        assert!(open_dvdv_for_materialization(temp.path(), None, Some(1)).is_err());
+        let _ = std::fs::remove_dir_all(audio_ts);
+        assert!(open_dvdv_for_materialization(temp.path(), None, None).is_ok());
     }
 
     #[test]

@@ -1,8 +1,8 @@
 //! DVD-Video source detection and `DiscContents` mapping glue.
 //!
-//! Hybrid DVD-Audio/DVD-Video discs must stay on the DVD-Audio path. These
-//! helpers therefore reject any source that the DVD-Audio detector accepts, and
-//! also reject ISO images whose `AUDIO_TS/` inventory is non-empty.
+//! Automatic whole-disc classification keeps DVD-Audio precedence on hybrids.
+//! An explicitly selected DVD-Video title VOB may use the valid `VIDEO_TS`
+//! navigation without changing whole-disc detection or ISO admission.
 
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
@@ -51,6 +51,15 @@ pub fn is_dvdv_directory(path: &Path) -> bool {
         return false;
     }
     ifo_has_vmg_magic(&ifo)
+}
+
+/// Check DVD-Video navigation without applying DVD-Audio-first classification.
+/// Only use this for an explicit VTS title-VOB selection; whole-disc detection
+/// must continue through `is_dvdv_directory`.
+#[must_use]
+pub(crate) fn has_dvdv_directory_navigation(path: &Path) -> bool {
+    dvdv_directory_root_and_ifo(path)
+        .is_some_and(|(_, ifo)| ifo_has_vmg_magic(&ifo))
 }
 
 /// Check whether a path is any supported DVD-Video source.
@@ -104,6 +113,19 @@ pub fn open_dvdv_source(path: &Path) -> Result<DvdDisc, String> {
     }
 
     Err(format!("Not a DVD-Video source: {}", path.display()))
+}
+
+/// Open directory-backed DVD-Video navigation for an explicit title-VOB
+/// selection. A populated `AUDIO_TS` must not suppress this explicit request.
+/// This is not used for generic source detection or ISO files.
+pub(crate) fn open_dvdv_directory_for_title(path: &Path) -> Result<DvdDisc, String> {
+    let (root, ifo) = dvdv_directory_root_and_ifo(path).ok_or_else(|| {
+        format!("Not a DVD-Video directory source: {}", path.display())
+    })?;
+    if !ifo_has_vmg_magic(&ifo) {
+        return Err(format!("Invalid DVD-Video VMG IFO: {}", ifo.display()));
+    }
+    open_dvdv_directory(&root)
 }
 
 /// Parse all VTS IFOs for either an ISO/block device or a filesystem DVD root.
@@ -461,6 +483,128 @@ pub fn map_dvdv_source(path: &Path) -> Result<crate::disc::DiscContents, String>
     let mut contents = crate::disc::dvdv_mapper::map_dvdv_disc(&disc, &vts_ifos, path);
     overlay_dvdv_sidecar_metadata(path, &mut contents);
     Ok(contents)
+}
+
+/// Select authored DVD titles whose chapter cells actually use the chosen
+/// VTS_xx_N.VOB. The VOB filename identifies a *title set*, not a title.
+/// Several titles may use the same VOB; retain them all for the Extract picker.
+/// Titles and chapters spanning multiple VOBs remain complete, with the disc
+/// root passed to the existing DVD-Video materializer.
+pub fn map_dvdv_source_for_vob(
+    root: &Path,
+    file_name: &str,
+) -> Result<crate::disc::DiscContents, String> {
+    let kind = classify_video_ts_name(file_name).ok_or_else(|| format!(
+        "{file_name} is not a DVD-Video title VOB"
+    ))?;
+    let DvdFileKind::VtsTitle { ts, vob } = kind else {
+        return Err(format!(
+            "{file_name} is a DVD menu VOB, not an authored chapter/title VOB"
+        ));
+    };
+    let disc = open_dvdv_directory_for_title(root)?;
+    let selected = disc.vts_title_vob(ts, vob).ok_or_else(|| format!(
+        "{file_name} is not in the DVD-Video title-set file inventory"
+    ))?;
+    if !selected.name.eq_ignore_ascii_case(file_name) {
+        return Err(format!("{file_name} does not match its DVD-Video title-set inventory"));
+    }
+    let sector_span = title_vob_sector_span(&disc, ts, vob)?;
+    let vts_ifos = parse_vts_ifos_for_source(root, &disc)?;
+    let vts = vts_ifos.iter().find(|(number, _)| *number == ts)
+        .map(|(_, info)| info)
+        .ok_or_else(|| format!("DVD-Video VTS {ts:02} has no readable title IFO"))?;
+    let matching_titles: std::collections::HashSet<u8> = vts.titles.iter()
+        .filter(|title| dvd_title_uses_sectors(title, &vts.pgcs, sector_span, |vob_id, cell_id| {
+            vts.cell_adt.lookup(vob_id, cell_id)
+        }))
+        .map(|title| title.number)
+        .collect();
+    if matching_titles.is_empty() {
+        return Err(format!(
+            "No DVD-Video title references the sectors in {file_name}; the IFO may be incomplete or this VOB contains no authored title chapters"
+        ));
+    }
+
+    let mut contents = crate::disc::dvdv_mapper::map_dvdv_disc(&disc, &vts_ifos, root);
+    contents.presentations.retain(|presentation| {
+        presentation.id.dvd_video_parts().is_some_and(|(number, title, _)| {
+            number == ts && matching_titles.contains(&title)
+        })
+    });
+    contents.suppressed.retain(|presentation| {
+        presentation.id.dvd_video_parts().is_some_and(|(number, title, _)| {
+            number == ts && matching_titles.contains(&title)
+        })
+    });
+    if contents.presentations.is_empty() {
+        return Err(format!(
+            "DVD-Video title(s) using {file_name} have no selectable audio chapters"
+        ));
+    }
+    overlay_dvdv_sidecar_metadata(root, &mut contents);
+    Ok(contents)
+}
+
+/// `VTS_C_ADT` addresses are zero-based sectors relative to the concatenation
+/// of the title VOB files. Compute the selected file's sector interval from
+/// each preceding file's size, never from its suffix alone. The resulting
+/// interval is inclusive, like C_ADT entries.
+fn title_vob_sector_span(disc: &DvdDisc, title_set: u8, vob_index: u8) -> Result<(u32, u32), String> {
+    let mut next_sector = 0_u64;
+    for index in 1..=vob_index {
+        let file = disc.vts_title_vob(title_set, index).ok_or_else(|| format!(
+            "Cannot locate VTS_{title_set:02}_{index}.VOB to calculate the selected VOB's sector range"
+        ))?;
+        if file.size == 0 || file.size % DVD_SECTOR as u64 != 0 {
+            return Err(format!(
+                "DVD VOB {} has an empty or unaligned sector length", file.name
+            ));
+        }
+        let sectors = file.size / DVD_SECTOR as u64;
+        let end = next_sector.checked_add(sectors - 1)
+            .ok_or_else(|| "DVD-Video title VOB sector range overflows".to_string())?;
+        if index == vob_index {
+            return Ok((
+                u32::try_from(next_sector).map_err(|_| "DVD title VOB starts past sector address space")?,
+                u32::try_from(end).map_err(|_| "DVD title VOB ends past sector address space")?,
+            ));
+        }
+        next_sector = end + 1;
+    }
+    Err("Invalid DVD-Video title VOB index".to_string())
+}
+
+fn sector_ranges_overlap(one: (u32, u32), two: (u32, u32)) -> bool {
+    one.0 <= one.1 && two.0 <= two.1 && one.0 <= two.1 && two.0 <= one.1
+}
+
+/// Match chapters to VOBs by cell identity and authored sector addresses.
+/// Looking only at the VTS number would offer unrelated titles in that set.
+fn dvd_title_uses_sectors<F>(
+    title: &dvdvideo::DvdTitle,
+    pgcs: &[dvdvideo::Pgc],
+    selected: (u32, u32),
+    mut cell_sectors: F,
+) -> bool
+where
+    F: FnMut(u16, u8) -> Option<(u32, u32)>,
+{
+    title.chapters.iter().any(|chapter| {
+        let Some(pgc) = pgcs.get(usize::from(chapter.pgcn.saturating_sub(1))) else {
+            return false;
+        };
+        if chapter.start_cell == 0 || chapter.end_cell < chapter.start_cell {
+            return false;
+        }
+        (chapter.start_cell..=chapter.end_cell).any(|cell| {
+            let Some(position) = pgc.cell_positions.get(usize::from(cell - 1)) else {
+                return false;
+            };
+            cell_sectors(position.vob_id, position.cell_id)
+                .is_some_and(|range| sector_ranges_overlap(range, selected))
+        })
+    })
 }
 
 /// Load the DVD-Video TOML sidecar (if present) and overlay metadata onto
@@ -1338,6 +1482,223 @@ title = "Angle One Chapter One"
     }
 
     #[test]
+    fn explicit_title_vob_open_on_hybrid_preserves_full_vob_inventory() {
+        let root = unique_dir("hybrid-vob-title-open");
+        let video_ts = root.join("VIDEO_TS");
+        let audio_ts = root.join("AUDIO_TS");
+        fs::create_dir_all(&video_ts).expect("create VIDEO_TS");
+        fs::create_dir_all(&audio_ts).expect("create AUDIO_TS");
+        fs::write(video_ts.join("VIDEO_TS.IFO"), VMG_MAGIC).expect("write VMG marker");
+        fs::write(audio_ts.join("AUDIO_TS.IFO"), b"DVDAUDIO-AMG").expect("write AMG marker");
+        fs::write(video_ts.join("VTS_01_0.IFO"), []).expect("write title-set IFO entry");
+        fs::write(video_ts.join("VTS_01_1.VOB"), vec![0u8; DVD_SECTOR * 3])
+            .expect("write first title VOB");
+        fs::write(video_ts.join("VTS_01_2.VOB"), vec![0u8; DVD_SECTOR * 4])
+            .expect("write second title VOB");
+
+        // Whole-disc classification retains DVD-Audio first refusal.
+        assert!(crate::disc::dvda_utils::is_dvda_directory(&root));
+        assert!(!is_dvdv_directory(&root));
+        assert!(open_dvdv_source(&root).is_err());
+        assert!(has_dvdv_directory_navigation(&root));
+
+        // Explicit title-VOB requests use the same DVD-Video inventory as
+        // ordinary extraction, including preceding VOB files.
+        let disc = open_dvdv_directory_for_title(&root).expect("open explicit DVD-Video title");
+        assert_eq!(disc.title_set_count, 1);
+        assert_eq!(title_vob_sector_span(&disc, 1, 1).unwrap(), (0, 2));
+        assert_eq!(title_vob_sector_span(&disc, 1, 2).unwrap(), (3, 6));
+        assert!(disc.vts_title_vob(1, 3).is_none());
+
+        fs::write(video_ts.join("VIDEO_TS.IFO"), b"invalid VMG IFO").unwrap();
+        assert!(!has_dvdv_directory_navigation(&root));
+        assert!(open_dvdv_directory_for_title(&root).is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Small, structurally complete IFO fixture: two authored titles share
+    /// two chapters across VTS_01_1 and VTS_01_2. No output audio is decoded.
+    #[tokio::test]
+    async fn hybrid_explicit_vob_maps_complete_ambiguous_authored_titles() {
+        fn be16(bytes: &mut [u8], at: usize, value: u16) {
+            bytes[at..at + 2].copy_from_slice(&value.to_be_bytes());
+        }
+        fn be32(bytes: &mut [u8], at: usize, value: u32) {
+            bytes[at..at + 4].copy_from_slice(&value.to_be_bytes());
+        }
+
+        let root = unique_dir("hybrid-authored-titles");
+        let video_ts = root.join("VIDEO_TS");
+        let audio_ts = root.join("AUDIO_TS");
+        fs::create_dir_all(&video_ts).unwrap();
+        fs::create_dir_all(&audio_ts).unwrap();
+        fs::write(audio_ts.join("AUDIO_TS.IFO"), b"DVDAUDIO-AMG").unwrap();
+
+        // VMG title search table: global titles 1 and 2 both in VTS 1.
+        let mut vmgi = vec![0u8; DVD_SECTOR * 2];
+        vmgi[..12].copy_from_slice(VMG_MAGIC);
+        be16(&mut vmgi, 0x003e, 1);
+        be32(&mut vmgi, 0x0080, 0x01ff);
+        be32(&mut vmgi, 0x00c4, 1);
+        let tt = DVD_SECTOR;
+        be16(&mut vmgi, tt, 2);
+        be32(&mut vmgi, tt + 4, 31);
+        for i in 0..2 {
+            let off = tt + 8 + i * 12;
+            vmgi[off + 1] = 1; // one camera angle
+            be16(&mut vmgi, off + 2, 2); // two chapters
+            vmgi[off + 6] = 1; // VTS 1
+            vmgi[off + 7] = (i + 1) as u8; // authored title 1 or 2
+            be32(&mut vmgi, off + 8, 100);
+        }
+        fs::write(video_ts.join("VIDEO_TS.IFO"), vmgi).unwrap();
+
+        // VTS IFO: sector 1 PTT, sector 2 PGCI, sector 3 C_ADT.
+        let mut vtsi = vec![0u8; DVD_SECTOR * 4];
+        vtsi[..12].copy_from_slice(b"DVDVIDEO-VTS");
+        be32(&mut vtsi, 0x0080, 0x0253);
+        be32(&mut vtsi, 0x00c4, 100);
+        be32(&mut vtsi, 0x00c8, 1);
+        be32(&mut vtsi, 0x00cc, 2);
+        be32(&mut vtsi, 0x00e0, 3);
+        be16(&mut vtsi, 0x0202, 1); // one stereo LPCM stream
+        vtsi[0x0204..0x020c].copy_from_slice(&[0x84, 0x08, b'e', b'n', 0, 0, 0, 0]);
+        let ptt = DVD_SECTOR;
+        be16(&mut vtsi, ptt, 2);
+        be32(&mut vtsi, ptt + 4, 31);
+        be32(&mut vtsi, ptt + 8, 16);
+        be32(&mut vtsi, ptt + 12, 24);
+        for title in 0..2 {
+            for chapter in 0..2 {
+                let off = ptt + 16 + title * 8 + chapter * 4;
+                be16(&mut vtsi, off, 1); // shared PGC 1
+                be16(&mut vtsi, off + 2, (chapter + 1) as u16);
+            }
+        }
+        let pgci = DVD_SECTOR * 2;
+        let pgc = pgci + 16;
+        let prog_map = 0xec;
+        let cell_playback = prog_map + 2;
+        let cell_position = cell_playback + 2 * 24;
+        be16(&mut vtsi, pgci, 1);
+        be32(&mut vtsi, pgci + 4, (16 + cell_position + 8 - 1) as u32);
+        be32(&mut vtsi, pgci + 12, 16); // PGC starts after the PGCI SRP
+        vtsi[pgc + 2] = 2; // programs
+        vtsi[pgc + 3] = 2; // cells
+        vtsi[pgc + 4..pgc + 8].copy_from_slice(&[0, 0, 2, 0x40]);
+        be16(&mut vtsi, pgc + 0x00e6, prog_map as u16);
+        be16(&mut vtsi, pgc + 0x00e8, cell_playback as u16);
+        be16(&mut vtsi, pgc + 0x00ea, cell_position as u16);
+        vtsi[pgc + prog_map..pgc + prog_map + 2].copy_from_slice(&[1, 2]);
+        for (index, (first, last)) in [(0, 2), (3, 6)].into_iter().enumerate() {
+            let playback = pgc + cell_playback + index * 24;
+            vtsi[playback + 4..playback + 8].copy_from_slice(&[0, 0, 1, 0x40]);
+            be32(&mut vtsi, playback + 8, first);
+            be32(&mut vtsi, playback + 12, last);
+            be32(&mut vtsi, playback + 16, first);
+            be32(&mut vtsi, playback + 20, last);
+            let position = pgc + cell_position + index * 4;
+            be16(&mut vtsi, position, (index + 1) as u16);
+            vtsi[position + 3] = 1;
+        }
+        let cadt = DVD_SECTOR * 3;
+        be16(&mut vtsi, cadt, 2);
+        be32(&mut vtsi, cadt + 4, 31);
+        for (index, (first, last)) in [(0, 2), (3, 6)].into_iter().enumerate() {
+            let row = cadt + 8 + index * 12;
+            be16(&mut vtsi, row, (index + 1) as u16);
+            vtsi[row + 2] = 1;
+            be32(&mut vtsi, row + 4, first);
+            be32(&mut vtsi, row + 8, last);
+        }
+        fs::write(video_ts.join("VTS_01_0.IFO"), vtsi).unwrap();
+        fs::write(video_ts.join("VTS_01_1.VOB"), vec![0u8; DVD_SECTOR * 3]).unwrap();
+        fs::write(video_ts.join("VTS_01_2.VOB"), vec![0u8; DVD_SECTOR * 4]).unwrap();
+
+        assert!(!is_dvdv_directory(&root));
+        let contents = map_dvdv_source_for_vob(&root, "VTS_01_2.VOB")
+            .expect("hybrid file-specific navigation must map DVD-Video titles");
+        assert_eq!(contents.source_path, root);
+        let mut titles = contents.presentations.iter().map(|presentation| {
+            assert_eq!(presentation.tracks.len(), 2); // full title across both VOBs
+            assert_eq!(presentation.tracks[0].number, 1);
+            assert_eq!(presentation.tracks[1].number, 2);
+            presentation.id.dvd_video_parts().unwrap().1
+        }).collect::<Vec<_>>();
+        titles.sort_unstable();
+        assert_eq!(titles, vec![1, 2]); // shared sectors yield separate candidates
+        let first = map_dvdv_source_for_vob(&root, "VTS_01_1.VOB").unwrap();
+        assert_eq!(first.presentations.len(), 2);
+        assert!(map_dvdv_source_for_vob(&root, "VTS_01_0.VOB").is_err());
+
+        // Prepare a selected chapter through the actual native materializer.
+        // This checks the hybrid gate, VTS/PGC parsing, full VOB inventory,
+        // cell selection and CSS preflight without creating any output audio.
+        use crate::convert::pipeline::*;
+        let source = SourceOptions {
+            archive_password: None, sacd_area: None, dvda_group: None,
+            dvda_group_selection: DvdaGroupSelection::Default,
+            dvda_assume_decrypted: false, dvda_downmix_policy: DvdaDownmixPolicy::Auto,
+            dvdv_vts: Some(1), dvdv_title: Some(1), dvdv_audio_stream: Some(0),
+            dvdv_angle: Some(1), bluray_playlist: None, bluray_audio_pid: None,
+            bluray_audio_stream: None, bluray_angle: None,
+            sidecar_cue_track_metadata: None, cue_sidecar: CueSidecarPolicy::IgnoreCue,
+            track_selection: TrackSelection::Set(std::collections::BTreeSet::from([2])),
+        };
+        let staging_root = root.with_extension("native-probe-staging");
+        let staging = StagingDir::borrowed(staging_root.clone(), "hybrid-vob-probe".into());
+        let request = PipelineRequest {
+            job_id: "hybrid-vob-probe".into(), item_id: "chapter-2".into(),
+            submission_id: None, submission_size: None, container: root.clone(), source,
+            settings: crate::convert::pipeline::native_extract::native_compatibility_settings().unwrap(),
+            registered_effects: Vec::new(),
+            deemphasis_choice_origin: Default::default(),
+            deemphasis_evidence_origin: Default::default(),
+            worker_count: Some(1), scratch_staging: None, merge: false,
+            output_root: root.with_extension("requested-output"),
+            naming: NamingPolicy { template: "%NN% - %TITLE%".into(), folder_template: None,
+                per_album_subdir: false, collision_policy: NamingCollisionPolicy::Fail,
+                windows_portable: false },
+            publish: PublishPolicy { overwrite: OverwritePolicy::FailIfExists,
+                same_filesystem_required: false, write_manifest: false },
+            log: LogPolicy { root: staging_root.clone(), write_for_blocked: false,
+                write_json_log: false, write_conversion_log: false },
+            stages: StagePolicy { metadata: StageRequirement::Disabled,
+                replaygain: StageRequirement::Disabled, features: StageRequirement::Disabled,
+                generate_cue: false },
+            failure_policy: FailurePolicy::FailAlbumOnAnyTrackFailure,
+            album_batch: None, album_batch_track: None, pre_extracted_staging: None,
+            archive_metadata_overrides: Vec::new(), metadata_overrides: Default::default(),
+            batch_resolved_identity: None, suppress_incremental_conversion_log_append: false,
+            expected_album_track_count: None, container_extension: None,
+            container_ffmpeg_flags: Vec::new(), companion: CompanionCopyPolicy::default(),
+            actions: ActionPipeline::default(),
+        };
+        let prepared = crate::convert::pipeline::materializer_dvdv::DvdVideoMaterializer
+            .materialize(&request, &staging, &StubToolRunner::new(), None,
+                &std::collections::HashMap::new(), &tokio_util::sync::CancellationToken::new())
+            .await.expect("selected hybrid DVD-Video chapter must prepare");
+        assert_eq!(prepared.tracks.len(), 1);
+        assert_eq!(prepared.tracks[0].id.source_ordinal, 2);
+        match &prepared.tracks[0].source_ref {
+            TrackSourceRef::DvdVideoTrack { cell_sectors, vob_files, .. } => {
+                assert_eq!(cell_sectors, &vec![(3, 6)]);
+                assert_eq!(vob_files.len(), 2);
+                assert_eq!((vob_files[0].block_first, vob_files[0].block_last), (0, 2));
+                assert_eq!((vob_files[1].block_first, vob_files[1].block_last), (3, 6));
+            }
+            other => panic!("unexpected prepared track kind: {other:?}"),
+        }
+        assert!(!request.output_root.exists(), "native preparation must not publish output files");
+        let _ = fs::remove_dir_all(&staging_root);
+
+        fs::remove_dir_all(&audio_ts).unwrap();
+        let normal = map_dvdv_source_for_vob(&root, "VTS_01_2.VOB").unwrap();
+        assert_eq!(normal.presentations.len(), 2);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn dvdv_directory_detection_rejects_lowercase_nonempty_audio_ts_hybrid() {
         let root = unique_dir("lowercase-hybrid");
         let video_ts = root.join("video_ts");
@@ -1532,6 +1893,96 @@ title = "Angle One Chapter One"
         fs::write(&iso_path, iso_bytes).expect("write ISO-like fixture");
 
         (root, iso_path, iso_lba)
+    }
+
+    #[test]
+    fn on_disc_vob_spans_are_zero_based_and_include_preceding_vobs() {
+        let mut disc = DvdDisc {
+            volume_id: "TEST".to_string(),
+            title_set_count: 1,
+            video_ts_files: [3_u64, 4, 2].into_iter().enumerate()
+                .map(|(index, sectors)| DvdFile {
+                    kind: DvdFileKind::VtsTitle { ts: 1, vob: index as u8 + 1 },
+                    name: format!("VTS_01_{}.VOB", index + 1),
+                    lba: 0,
+                    size: sectors * DVD_SECTOR as u64,
+                    title_set: 1,
+                    vob_index: index as u8 + 1,
+                })
+                .collect(),
+            audio_ts_files: Vec::new(),
+        };
+        assert_eq!(title_vob_sector_span(&disc, 1, 1).unwrap(), (0, 2));
+        assert_eq!(title_vob_sector_span(&disc, 1, 2).unwrap(), (3, 6));
+        assert_eq!(title_vob_sector_span(&disc, 1, 3).unwrap(), (7, 8));
+        assert!(!sector_ranges_overlap((0, 2), (3, 6)));
+        assert!(sector_ranges_overlap((2, 3), (3, 6)));
+        assert!(!sector_ranges_overlap((6, 5), (3, 6)));
+
+        disc.video_ts_files[0].size -= 1;
+        assert!(title_vob_sector_span(&disc, 1, 2).unwrap_err().contains("unaligned"));
+        disc.video_ts_files[0].size += 1;
+        disc.video_ts_files.remove(1);
+        assert!(title_vob_sector_span(&disc, 1, 3).unwrap_err().contains("Cannot locate"));
+    }
+
+    #[test]
+    fn on_disc_vob_matches_authored_chapter_cells_and_can_offer_ambiguous_titles() {
+        use dvdvideo::ifo::{CellPositionInfo, PaletteEntry, PgcTime};
+        let chapter = dvdvideo::DvdChapter {
+            number: 1,
+            pgcn: 1,
+            pgn: 1,
+            start_cell: 1,
+            end_cell: 2,
+            playback_time: PgcTime::from_bytes([0; 4]),
+        };
+        let title = dvdvideo::DvdTitle {
+            number: 1,
+            angle_count: 1,
+            chapter_count: 1,
+            chapters: vec![chapter.clone()],
+        };
+        let pgc = dvdvideo::Pgc {
+            number_of_programs: 1,
+            number_of_cells: 2,
+            playback_time: PgcTime::from_bytes([0; 4]),
+            prohibited_user_ops: 0,
+            next_pgcn: 0,
+            prev_pgcn: 0,
+            goup_pgcn: 0,
+            still_time: 0,
+            playback_mode: 0,
+            palette: [PaletteEntry::default(); 16],
+            offset_commands: 0,
+            offset_program_map: 0,
+            offset_cell_playback: 0,
+            offset_cell_position: 0,
+            program_map: vec![1],
+            cells: Vec::new(),
+            cell_positions: vec![
+                CellPositionInfo { vob_id: 1, cell_id: 1 },
+                CellPositionInfo { vob_id: 2, cell_id: 1 },
+            ],
+            commands: None,
+        };
+        let sectors = |vob_id, cell_id| match (vob_id, cell_id) {
+            (1, 1) => Some((0, 2)),
+            (2, 1) => Some((3, 7)),
+            _ => None,
+        };
+        let pgcs = vec![pgc];
+        assert!(dvd_title_uses_sectors(&title, &pgcs, (3, 6), sectors));
+        assert!(dvd_title_uses_sectors(&title, &pgcs, (0, 2), sectors));
+        assert!(!dvd_title_uses_sectors(&title, &pgcs, (8, 11), sectors));
+        // Two titles sharing these cells are both valid candidates; no title
+        // number can be inferred from VTS_01_2.VOB's suffix.
+        let another = dvdvideo::DvdTitle { number: 2, ..title.clone() };
+        let matches = [title, another].into_iter()
+            .filter(|title| dvd_title_uses_sectors(title, &pgcs, (3, 6), sectors))
+            .map(|title| title.number)
+            .collect::<Vec<_>>();
+        assert_eq!(matches, vec![1, 2]);
     }
 
     fn disc_with_title_vob(name: &str, lba: u32) -> DvdDisc {

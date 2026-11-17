@@ -784,6 +784,7 @@ fn validate_vob_inventory(vts_number: u8, vob_files: &[DvdVideoVobFileRef]) -> R
         )));
     }
 
+    // VTS_C_ADT addresses are zero-based, matching the title VOB inventory.
     let mut expected_next = 0u32;
     for file in vob_files {
         if file.vts_number != vts_number {
@@ -2029,6 +2030,12 @@ mod tests {
         ];
         let mut reader = DvdVideoSectorReader::open(Path::new("dvd-root"), &vobs).unwrap();
         let mut buf = vec![0u8; DVDV_READ_CHUNK_BYTES];
+
+        validate_vob_inventory(1, &vobs).unwrap();
+        let from_zero = reader.read_sector_chunk(&mut buf, &vobs, 0, 3).unwrap();
+        assert_eq!(from_zero, 2); // stops at the first VOB boundary
+        assert_eq!(buf[0], 0);
+        assert_eq!(buf[DVD_SECTOR_SIZE_USIZE], 1);
 
         let first_count = reader.read_sector_chunk(&mut buf, &vobs, 1, 3).unwrap();
         assert_eq!(first_count, 1);

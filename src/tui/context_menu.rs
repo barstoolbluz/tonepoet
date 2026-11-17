@@ -1550,6 +1550,13 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(build_select_submenu(false));
         }
         EntryKind::OtherFile => {
+            // A selected transport file is not a standalone disc root or a
+            // Convert queue input. Its explicit Extract action resolves its
+            // parent disc and authored chapter/playlist metadata off-thread.
+            if allow_single_item_actions && entry.is_video_transport_file() {
+                items.push(item("Extract chapters…", ContextAction::BrowseDiscStreams));
+                items.push(separator());
+            }
             // CUE files are convertible because they reference an image.
             // Codec-ambiguous Matroska/WebM carriers are also direct audio
             // sources, but this brief establishes only Convert + Properties
@@ -8422,6 +8429,41 @@ mod tests {
             .unwrap_or("");
         assert!(status.contains("ARTIST restored to MusicBrainz values"));
         assert!(status.contains("warning: 1 carrier"));
+    }
+
+    #[test]
+    fn on_disc_transport_context_menu_opens_extract_only_for_single_selection() {
+        let temp = tempfile::tempdir().expect("temporary browse folder");
+        let mut app = AppState::new_for_test(TonepoetConfig::default());
+        app.current_screen = AppScreen::Browse;
+        app.browse.current_dir = temp.path().to_path_buf();
+        app.browse.selected_index = 0;
+
+        for name in ["00042.M2TS", "VTS_01_2.vOb"] {
+            let path = temp.path().join(name);
+            // Menu construction deliberately does not read or validate disc
+            // navigation; the async probe will reject an orphaned file.
+            app.browse.entries = vec![BrowseEntry::new(
+                path.clone(), name.to_string(), EntryKind::OtherFile, 0, None,
+            )];
+            app.browse.multi_selected.clear();
+            let menu = build_browse_entry_menu(&app);
+            assert!(menu.iter().any(|entry| matches!(entry,
+                ContextMenuEntry::Item(ContextMenuItem {
+                    label, action: ContextAction::BrowseDiscStreams, enabled: true, ..
+                }) if label == "Extract chapters…")), "{name}");
+            let labels = menu_labels_recursive(&menu);
+            assert!(!labels.iter().any(|label| label == "Convert"), "{name}");
+            assert!(!labels.iter().any(|label| label == "Tags & Tagging"), "{name}");
+            assert!(labels.iter().any(|label| label == "Properties"), "{name}");
+
+            app.browse.multi_selected = vec![path, temp.path().join("other.flac")];
+            let menu = build_browse_entry_menu(&app);
+            assert!(!menu.iter().any(|entry| matches!(entry,
+                ContextMenuEntry::Item(ContextMenuItem {
+                    action: ContextAction::BrowseDiscStreams, ..
+                }))), "multi-file extract must not silently ignore another selection");
+        }
     }
 
     #[test]
