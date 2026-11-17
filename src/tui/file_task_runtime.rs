@@ -3061,7 +3061,7 @@ mod tests {
                     number:1,name:"one".into(),tags:NativeTagValues::default(),
                     estimated_bytes:Some(100_000),
                 }],
-                source_depth:Some(1),source_channels:Some(2),source_rate:Some(2_822_400),
+                source_depth:Some(1), source_codec: "unknown".into(),source_channels:Some(2),source_rate:Some(2_822_400),
                 source_layout:None,is_lossless:true,tags:NativeTagValues::default(),authored_tags:None,
             }],
             destination:dest.to_path_buf(),working_root:dest.to_path_buf(),

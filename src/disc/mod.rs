@@ -11,6 +11,7 @@ pub mod bluray_utils;
 pub mod bluray_mapper;
 pub mod sacd_mapper;
 pub mod on_disc_transport;
+pub mod matroska_utils;
 
 pub use model::*;
 pub use diagnostics::*;

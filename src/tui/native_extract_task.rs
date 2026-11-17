@@ -1181,7 +1181,7 @@ mod tests {
                     number, name: format!("Track {number}"),
                     tags: NativeTagValues::default(), estimated_bytes: Some(10_000),
                 }).collect(),
-                keep_dst: false, source_depth: Some(1), source_channels: Some(2),
+                keep_dst: false, source_depth: Some(1), source_codec: "unknown".into(), source_channels: Some(2),
                 source_rate: Some(2_822_400), source_layout: None, is_lossless: true,
                 tags: NativeTagValues::default(), authored_tags: None,
             }],
