@@ -178,7 +178,8 @@ fn header_for(id: PresentationId, p: &DiscPresentation, index: usize) -> String 
         PresentationId::DvdVideoTitle { vts_number, title_number, .. } => format!("VTS {vts_number} · Title {title_number}"),
         PresentationId::BluRayTitle { playlist_number, display_angle, .. } =>
             format!("Playlist {playlist_number:05} · angle {}{}", display_angle.get(), if index == 0 { " · main title" } else { "" }),
-        PresentationId::MatroskaStream { audio_ordinal, .. } =>
+        PresentationId::MatroskaStream { audio_ordinal, .. } |
+        PresentationId::TransportStream { audio_ordinal, .. } =>
             format!("Audio stream {audio_ordinal}"),
     }
 }
@@ -425,10 +426,11 @@ pub fn draw(
     let action=match state.contents.format {
         DiscFormat::Sacd|DiscFormat::DvdAudio=>"extract tracks",
         DiscFormat::DvdVideo|DiscFormat::BluRay=>"extract chapters",
-        DiscFormat::Matroska=>"extract audio",
+        DiscFormat::Matroska|DiscFormat::TransportFile=>"extract audio",
     };
     let source_type=format!("{} {}",state.contents.format.name(),
-        if state.source_path.is_dir() {"folder"}else if state.contents.format == DiscFormat::Matroska {"file"} else {"ISO"});
+        if state.source_path.is_dir() {"folder"}else if matches!(state.contents.format,
+            DiscFormat::Matroska | DiscFormat::TransportFile) {"file"} else {"ISO"});
     let indicator=if state.maximized {"▾"}else{"▸"};
     let presentation=state.selected_presentation()
         .map(|p|p.id.compact_label()).unwrap_or_else(||"no selection".into());
@@ -490,10 +492,11 @@ pub fn draw(
         let program=match state.contents.format {
             DiscFormat::Sacd=>"Areas",DiscFormat::DvdAudio=>"Groups",
             DiscFormat::DvdVideo=>"Titles",DiscFormat::BluRay=>"Playlists",
-            DiscFormat::Matroska=>"Streams",
+            DiscFormat::Matroska|DiscFormat::TransportFile=>"Streams",
         };
-        let item=if matches!(state.contents.format,DiscFormat::DvdVideo|DiscFormat::BluRay|DiscFormat::Matroska) {
-            "Chapters" } else { "Tracks" };
+        let item=if state.contents.format == DiscFormat::TransportFile { "Streams" }
+            else if matches!(state.contents.format,DiscFormat::DvdVideo|DiscFormat::BluRay|DiscFormat::Matroska) {
+                "Chapters" } else { "Tracks" };
         let tabs=[(program,ExtractFocus::Programs),(item,ExtractFocus::Items),
             ("Output",ExtractFocus::Output)];
         let mut line=Vec::new();
@@ -602,6 +605,19 @@ fn draw_header(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect, small:
         append_header_field(&mut fields,year,words.soft,colors.faint);
     }
     let mut lines=vec![Line::from(fields)];
+    if s.contents.format == DiscFormat::TransportFile {
+        let explanation = "No chapters found: orphan file has no disc navigation; extract whole streams.";
+        lines.push(clip_styled_header_line(Line::from(Span::styled(explanation,
+            Style::default().fg(readable_word(theme.warning, colors.band)))),
+            r.width.saturating_sub(2) as usize, colors.dim));
+        // The compact header has two rows. Its explanation must remain
+        // visible without a Diagnostics popup; the wide view also shows
+        // the ordinary diagnostics summary on its third row.
+        if small {
+            frame.render_widget(Paragraph::new(lines).style(Style::default().bg(colors.band)),r);
+            return;
+        }
+    }
     if !small && s.contents.format==DiscFormat::Sacd {
         let details=s.contents.presentations.first()
             .and_then(|p|p.extract.sacd_header_details.as_deref())
@@ -646,7 +662,7 @@ fn draw_header(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect, small:
 
 fn draw_programs(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect, buttons: &mut ButtonRenderMap, theme: Theme) {
     let title = match s.contents.format { DiscFormat::Sacd=>"AREAS",DiscFormat::DvdAudio=>"GROUPS",DiscFormat::DvdVideo=>"TITLES",DiscFormat::BluRay=>"PLAYLISTS",
-        DiscFormat::Matroska=>"AUDIO STREAMS" };
+        DiscFormat::Matroska|DiscFormat::TransportFile=>"AUDIO STREAMS" };
     let colors=extract_colors(theme);
     let pane_focused=s.focus==ExtractFocus::Programs;
     let pane_bg=if pane_focused{colors.focused}else{colors.unfocused};
@@ -816,8 +832,9 @@ fn draw_programs(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect, butt
 fn draw_items(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect,
     buttons: &mut ButtonRenderMap, theme: Theme, wide: bool) {
     let Some(p)=s.selected_presentation() else { return; };
-    let kind=if matches!(s.contents.format,DiscFormat::DvdVideo|DiscFormat::BluRay|DiscFormat::Matroska) {
-        "CHAPTERS" } else { "TRACKS" };
+    let kind=if s.contents.format == DiscFormat::TransportFile { "WHOLE STREAM" }
+        else if matches!(s.contents.format,DiscFormat::DvdVideo|DiscFormat::BluRay|DiscFormat::Matroska) {
+            "CHAPTERS" } else { "TRACKS" };
     let checked=s.items_checked.get(s.cursor).map_or(0,|v|v.iter().filter(|x|**x).count());
     let colors=extract_colors(theme);
     let pane_focused=s.focus==ExtractFocus::Items;
@@ -979,15 +996,20 @@ fn option_value(s: &DiscBrowserState, name: &str) -> String {
                 (true,true) => "DSF / DFF · native DSD / keep selected DST".into(),
             }
         },
-        "Format" if s.contents.format == DiscFormat::Matroska => {
+        "Format" if matches!(s.contents.format, DiscFormat::Matroska | DiscFormat::TransportFile) => {
             if s.file_per_program {
                 let ext = s.contents.presentations.iter().enumerate()
                     .filter(|(i,_)| s.selected.get(*i)==Some(&true))
-                    .map(|(_,p)| crate::convert::pipeline::native_extract::matroska_copy_format(
-                        p.format.codec.as_deref().unwrap_or("unknown")).extension)
+                    .map(|(_,p)| crate::convert::pipeline::native_extract::file_stream_copy_format(
+                        s.contents.format, p.format.codec.as_deref().unwrap_or("unknown")).extension)
                     .collect::<std::collections::BTreeSet<_>>();
-                format!("Native {} · copy original packets", ext.into_iter()
-                    .map(|x|format!(".{x}")).collect::<Vec<_>>().join(" / "))
+                let unpack = s.contents.format == DiscFormat::TransportFile &&
+                    s.contents.presentations.iter().any(|p| matches!(p.format.codec.as_deref(),
+                        Some("pcm_dvd" | "pcm_bluray")));
+                format!("Native {} · {}", ext.into_iter()
+                    .map(|x|format!(".{x}")).collect::<Vec<_>>().join(" / "),
+                    if unpack { "lossless PCM unpack or packet copy" }
+                    else { "copy original packets" })
             } else {
                 "WAV · source depth if lossless; 24-bit if lossy (labelled)".into()
             }
@@ -998,6 +1020,8 @@ fn option_value(s: &DiscBrowserState, name: &str) -> String {
             NativeWavContainer::Rf64 => "RF64 WAV · large-file capable".into(),
             NativeWavContainer::W64 => "W64 · 64-bit sizes".into(),
         },
+        "Files" if s.contents.format == DiscFormat::TransportFile =>
+            "Copy complete audio streams · no chapters available".into(),
         "Files" if s.contents.format == DiscFormat::Matroska =>
             (if s.file_per_program { "one native file per audio stream" }
              else { "one WAV per selected chapter (native copy if chapterless)" }).into(),
@@ -1007,7 +1031,7 @@ fn option_value(s: &DiscBrowserState, name: &str) -> String {
             "one per chapter"
         } else { "one per track" }).into(),
         "Tags" if !s.native_tags_available() => "off for DFF · no standard tags".into(),
-        "Tags" if s.contents.format == DiscFormat::Matroska && s.tags => {
+        "Tags" if matches!(s.contents.format, DiscFormat::Matroska | DiscFormat::TransportFile) && s.tags => {
             // The selected carrier, not the input MKV, determines whether
             // metadata survives a whole-stream packet copy. Chapter WAVs
             // retain the existing native metadata writer.
@@ -1018,7 +1042,8 @@ fn option_value(s: &DiscBrowserState, name: &str) -> String {
                 let copy = s.file_per_program || matches!(presentation.id,
                     crate::disc::PresentationId::MatroskaStream { chapter_count: 0, .. });
                 if !copy { continue; }
-                let carrier = crate::convert::pipeline::native_extract::matroska_copy_format(
+                let carrier = crate::convert::pipeline::native_extract::file_stream_copy_format(
+                    s.contents.format,
                     presentation.format.codec.as_deref().unwrap_or("unknown"));
                 if !carrier.text_tags { no_text.insert(carrier.extension); }
                 if s.tag_artwork && !carrier.artwork { no_picture.insert(carrier.extension); }
@@ -1270,7 +1295,7 @@ fn draw_output(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,
         if field.width==0 {continue;}
         match *name {
             "Format" => {
-                if s.contents.format==DiscFormat::Matroska {
+                if matches!(s.contents.format, DiscFormat::Matroska | DiscFormat::TransportFile) {
                     frame.render_widget(Paragraph::new(clip_end(&option_value(s,"Format"),field.width))
                         .style(Style::default().fg(readable_word(theme.value,bg)).bg(bg)),field);
                 } else if s.contents.format==DiscFormat::Sacd {
@@ -1330,15 +1355,21 @@ fn draw_output(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,
                     DiscFormat::Sacd=>("track","area"),DiscFormat::DvdAudio=>("track","group"),
                     DiscFormat::DvdVideo=>("chapter","title"),DiscFormat::BluRay=>("chapter","playlist"),
                     DiscFormat::Matroska=>("chapter","stream"),
+                    DiscFormat::TransportFile=>("stream","stream"),
                 };
                 let individual=if s.contents.format==DiscFormat::Matroska {
                     "Split chapters".to_owned()
                 }else{format!("One per {item}")};
-                let grouped=if s.contents.format==DiscFormat::Matroska {
+                let grouped=if matches!(s.contents.format, DiscFormat::Matroska | DiscFormat::TransportFile) {
                     "Copy stream".to_owned()
                 }else{format!("One per {unit}")};
-                let options=[(individual.as_str(),!s.file_per_program),(grouped.as_str(),s.file_per_program)];
-                draw_native_radio(frame,buttons,field,&options,focused,false,theme,bg);
+                if s.contents.format == DiscFormat::TransportFile {
+                    frame.render_widget(Paragraph::new(clip_end("Copy stream · no authored chapters",field.width))
+                        .style(Style::default().fg(readable_word(theme.value,bg)).bg(bg)),field);
+                } else {
+                    let options=[(individual.as_str(),!s.file_per_program),(grouped.as_str(),s.file_per_program)];
+                    draw_native_radio(frame,buttons,field,&options,focused,false,theme,bg);
+                }
             }
             "Tags" => {
                 let (dsf,dff)=s.selected_sacd_tag_carriers();
@@ -1462,8 +1493,8 @@ fn draw_output(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,
                 }
                 else if dff {("DFF has no standard tags",true)}
                 else {("DSF keeps tags and artwork",false)}
-            } else if s.contents.format == DiscFormat::Matroska {
-                // Matroska's WAV outputs choose RIFF/RF64 automatically for
+            } else if matches!(s.contents.format, DiscFormat::Matroska | DiscFormat::TransportFile) {
+                // File-backed WAV outputs choose RIFF/RF64 automatically for
                 // both PCM stream copies and decoded chapter splits.
                 ("WAV: automatic RF64 past 4 GiB",false)
             } else { match s.wav_container {
@@ -1528,17 +1559,25 @@ fn draw_results(frame:&mut ratatui::Frame,s:&DiscBrowserState,
     if r.height==0 {return;}
     let items=s.selected_item_count();
     let programs=s.selected_program_count();
-    let size=s.selected_item_bytes().map_or_else(||"pending".into(),|(total,_,_)|format_bytes(total));
-    let effective_items=if s.contents.format==DiscFormat::Matroska && s.file_per_program {programs}else{items};
-    let kind=match (matches!(s.contents.format,DiscFormat::DvdVideo|DiscFormat::BluRay|DiscFormat::Matroska),effective_items) {
-        (true,1)=>"chapter",(true,_)=>"chapters",(false,1)=>"track",(false,_)=>"tracks",
+    let size=if s.contents.format==DiscFormat::TransportFile {
+        s.selected_item_bytes().map_or_else(||"audio size unknown".into(),
+            |(total,_,_)|format!("~{} audio",format_bytes(total)))
+    } else {
+        s.selected_item_bytes().map_or_else(||"pending".into(),|(total,_,_)|format_bytes(total))
     };
+    let effective_items=if matches!(s.contents.format, DiscFormat::Matroska | DiscFormat::TransportFile)
+        && s.file_per_program {programs}else{items};
+    let kind=if s.contents.format==DiscFormat::TransportFile {
+        if effective_items == 1 {"stream"}else{"streams"}
+    } else { match (matches!(s.contents.format,DiscFormat::DvdVideo|DiscFormat::BluRay|DiscFormat::Matroska),effective_items) {
+        (true,1)=>"chapter",(true,_)=>"chapters",(false,1)=>"track",(false,_)=>"tracks",
+    }};
     let group=match s.contents.format {
         DiscFormat::Sacd=>if programs==1 {"area"}else{"areas"},
         DiscFormat::DvdAudio=>if programs==1 {"group"}else{"groups"},
         DiscFormat::DvdVideo=>if programs==1 {"title"}else{"titles"},
         DiscFormat::BluRay=>if programs==1 {"playlist"}else{"playlists"},
-        DiscFormat::Matroska=>if programs==1 {"stream"}else{"streams"},
+        DiscFormat::Matroska|DiscFormat::TransportFile=>if programs==1 {"stream"}else{"streams"},
     };
     let colors=extract_colors(theme);
     let words=word_tiers(theme,colors,colors.base);

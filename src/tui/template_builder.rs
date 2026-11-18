@@ -103,7 +103,7 @@ fn format_native_tokens(format: crate::disc::DiscFormat) -> &'static TokenCatego
         crate::disc::DiscFormat::DvdAudio => &NATIVE_DVDA,
         crate::disc::DiscFormat::DvdVideo => &NATIVE_DVDV,
         crate::disc::DiscFormat::BluRay => &NATIVE_BLURAY,
-        crate::disc::DiscFormat::Matroska => &NATIVE_MATROSKA,
+        crate::disc::DiscFormat::Matroska | crate::disc::DiscFormat::TransportFile => &NATIVE_MATROSKA,
     }
 }
 
