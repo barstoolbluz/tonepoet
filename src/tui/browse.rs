@@ -1102,6 +1102,9 @@ pub struct CueFileReferenceRepairProbe {
     pub individual_tags_present: Option<bool>,
     /// Same tri-state contract for a usable embedded CUESHEET.
     pub embedded_cue_present: Option<bool>,
+    /// Shared split-CUE admission found actual logical tracks within an image.
+    /// Read by the extract menu from the explicit CUE background probe only.
+    pub extract_image_tracks: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -13048,6 +13051,7 @@ pub fn spawn_folder_classification(
                 } else {
                     embedded
                 };
+                let mut extract_image_cues = std::collections::BTreeSet::new();
                 // Resolve direct-child CUE usefulness once in the existing
                 // blocking classifier. Menu construction must remain I/O-free,
                 // and mere `.cue` file presence is not evidence that the user
@@ -13064,6 +13068,12 @@ pub fn spawn_folder_classification(
                 } else {
                     let inspection =
                         crate::convert::split_cue_album::inspect_split_cue_folder_members(&candidates);
+                    // The same resolved physical-carrier mapping is used by
+                    // editor/queue admission. A one-track-per-file CUE is a
+                    // metadata sidecar, not an image needing extraction.
+                    extract_image_cues.extend(inspection.viable.iter()
+                        .filter(|member| member.contributes_synthetic_album_part())
+                        .map(|member| member.cue_path.clone()));
                     classification.cue_import_availability = if inspection.viable.is_empty() {
                         CueImportAvailability::Absent
                     } else {
@@ -13139,6 +13149,7 @@ pub fn spawn_folder_classification(
                             assessment,
                             individual_tags_present,
                             embedded_cue_present,
+                            extract_image_tracks: extract_image_cues.contains(cue_path),
                         },
                     );
                 }
@@ -22128,6 +22139,7 @@ mod disc_directory_navigation_tests {
                 ),
                 individual_tags_present: Some(false),
                 embedded_cue_present: Some(false),
+                extract_image_tracks: false,
             },
         );
         state.insert_folder_classification_for_identity(

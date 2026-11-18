@@ -8740,6 +8740,9 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             }
             super::context_menu::refresh_open_browse_entry_menu(app);
         }
+        AppMessage::CueExtractReady {path,request_id,result} => {
+            super::disc_browser_actions::handle_cue_extract_ready(app,path,request_id,result);
+        }
         AppMessage::DiscExtractProbeComplete { path, probe_id, program_index, result } => {
             let state = match &mut app.active_overlay {
                 crate::tui::app::ActiveOverlay::DiscBrowser(state) => Some(state.as_mut()),

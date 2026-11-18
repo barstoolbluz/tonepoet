@@ -1496,6 +1496,13 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(item("Open in New Tab", ContextAction::OpenEntryInNewTab(entry.path.clone())));
             items.push(item("Analyze", ContextAction::Analyze));
             let cue_import_availability = directory_cue_import_availability(app, entry);
+            if allow_single_item_actions &&
+                cue_import_availability == super::probe::CueImportAvailability::Present &&
+                app.browse.valid_folder_classification_for_entry(entry).is_some_and(|classification|
+                    classification.cue_file_reference_repairs.values()
+                        .any(|probe| probe.extract_image_tracks)) {
+                items.push(item("Extract CUE tracks…", ContextAction::BrowseDiscStreams));
+            }
             let cue_repair_availability = directory_cue_repair_availability(app, entry);
             match cue_repair_availability.clone() {
                 super::browse::CueRepairAvailability::Repairable(cue_path) => {
@@ -1568,6 +1575,12 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
                 Some(crate::convert::source_admission::DirectSourceKind::Audio)
             );
             if is_cue || is_direct_audio {
+                if is_cue && allow_single_item_actions &&
+                    app.browse.current_directory_classification()
+                        .and_then(|classification| classification.cue_file_reference_repairs.get(&entry.path))
+                        .is_some_and(|probe| probe.extract_image_tracks) {
+                    items.push(item("Extract CUE tracks…", ContextAction::BrowseDiscStreams));
+                }
                 items.push(build_convert_submenu(app));
                 if is_cue {
                     items.push(build_tagging_submenu(
@@ -7375,11 +7388,56 @@ mod tests {
                 ),
                 individual_tags_present,
                 embedded_cue_present,
+                extract_image_tracks: false,
             },
         );
         app.browse
             .insert_folder_classification_for_test(parent, classification);
         app
+    }
+
+    #[test]
+    fn cue_extract_menu_is_image_only_for_direct_cue_and_album_folder() {
+        let cue = PathBuf::from("/music/r13/album.cue");
+        let parent = cue.parent().unwrap().to_path_buf();
+        let mut direct = app_with_direct_cue_file_reference_repair_probe(
+            crate::config::TonepoetConfig::default()
+                .conversion.aggregate_metadata_target_priority,
+            Some(false),Some(false));
+        let mut classification = direct.browse.current_directory_classification()
+            .unwrap().as_ref().clone();
+        let extract = |app: &AppState| {
+            menu_labels_recursive(&build_browse_entry_menu(app)).iter()
+                .any(|label| label == "Extract CUE tracks…")
+        };
+        assert!(!extract(&direct),"pre-split CUE should not expose extraction");
+        classification.cue_file_reference_repairs.get_mut(&cue)
+            .unwrap().extract_image_tracks = true;
+        direct.browse.insert_folder_classification_for_test(parent,classification);
+        assert!(extract(&direct),"image-based CUE should expose extraction");
+
+        let folder = PathBuf::from("/music/image-album");
+        let mut album = AppState::new_for_test(TonepoetConfig::default());
+        album.current_screen = AppScreen::Browse;
+        album.browse.current_dir = PathBuf::from("/music");
+        album.browse.entries = vec![BrowseEntry::new(
+            folder.clone(),"image-album".into(),EntryKind::Directory,0,None)];
+        album.browse.selected_index=0;
+        let mut data = synthetic_cue_menu_classification(
+            crate::tui::probe::CueImportAvailability::Present,
+            crate::tui::browse::CueRepairAvailability::Absent,
+            crate::tui::probe::EmbeddedCueAvailability::Absent);
+        data.cue_file_reference_repairs.insert(folder.join("album.cue"),
+            crate::tui::browse::CueFileReferenceRepairProbe {
+                assessment:crate::convert::cue_parser::CueFileReferenceRepairAssessment::NotNeeded,
+                individual_tags_present:None,embedded_cue_present:None,
+                extract_image_tracks:false,
+            });
+        album.browse.insert_folder_classification_for_test(folder.clone(),data.clone());
+        assert!(!extract(&album),"metadata-only CUE folder should not expose extraction");
+        data.cue_file_reference_repairs.values_mut().next().unwrap().extract_image_tracks=true;
+        album.browse.insert_folder_classification_for_test(folder,data);
+        assert!(extract(&album),"image-based CUE folder should expose extraction");
     }
 
     #[test]

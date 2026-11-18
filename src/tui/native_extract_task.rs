@@ -541,6 +541,13 @@ fn remaining_native_job(
         }
         job.programs.retain(|program| !program.tracks.is_empty());
     }
+    if job.format == crate::disc::DiscFormat::CueImage {
+        // A resumed CUE task owns only the still-pending track geometry;
+        // keep the full input protection set, including unchecked images.
+        job.cue_segments.retain(|segment|job.programs.iter().any(|program|
+            program.id == segment.presentation && program.tracks.iter().any(|track|
+                track.number == segment.number)));
+    }
     for path in published {
         if !path.is_file() {
             return Err(format!("Previously published extraction output is missing: {}. Resolve in Recovery rather than silently re-extracting",path.display()));
@@ -1171,7 +1178,7 @@ mod tests {
             NativeOverwritePolicy, NativeProgramChoice, NativeTagSource,
             NativeTagValues, NativeTrackChoice, NativeWavContainer,
         };
-        NativeExtractionJob { disc_identity: Default::default(),
+        NativeExtractionJob { cue_input_paths: Vec::new(), cue_segments: Vec::new(), disc_identity: Default::default(),
             source: std::env::current_exe().unwrap(),
             format: crate::disc::DiscFormat::Sacd,
             programs: vec![NativeProgramChoice {

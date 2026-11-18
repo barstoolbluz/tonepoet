@@ -208,6 +208,13 @@ pub enum AppMessage {
         session_id: u64,
         result: Result<crate::convert::pipeline::native_extract::NativeExtractionReport, String>,
     },
+    /// CUE sheet/folder admission and audio clock probing run off the UI reducer.
+    /// A newer Browse intent makes an older completion inert.
+    CueExtractReady {
+        path: std::path::PathBuf,
+        request_id: u64,
+        result: Result<crate::tui::cue_extract::CueExtractPreview, String>,
+    },
     /// A bounded native source preflight started when the extraction overlay
     /// opened. Only the matching live overlay generation may consume it.
     DiscExtractProbeComplete {

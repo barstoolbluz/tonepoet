@@ -8,6 +8,7 @@
 //! a cleaned-up temporary file at the final target before atomic rename.
 
 mod matroska;
+mod cue;
 
 /// File-backed stream routes do not invoke optical-disc materializers.
 fn is_file_stream_format(format: DiscFormat) -> bool {
@@ -150,6 +151,33 @@ pub struct NativeDiscIdentity {
     pub catalog: Option<String>,
 }
 
+/// Exact sample geometry and source carrier for one CUE track. These facts are
+/// bound at admission and checked again before encoding and publication.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeCueSegment {
+    pub presentation: PresentationId,
+    pub number: u32,
+    pub cue_path: PathBuf,
+    pub image: PathBuf,
+    pub start_sample: u64,
+    pub end_sample: u64,
+    pub total_samples: u64,
+    pub sample_rate: u32,
+    pub extension: String,
+    pub encoder: String,
+    pub muxer: String,
+    pub sample_bits: Option<u32>,
+    pub channels: u8,
+    pub source_length: u64,
+    pub source_modified: Option<std::time::SystemTime>,
+    pub cue_length: u64,
+    pub cue_modified: Option<std::time::SystemTime>,
+    /// Source stream bitrate, or a conservative whole-image mean for VBR
+    /// carriers lacking stream metadata. None for lossless images.
+    #[serde(default)]
+    pub source_bit_rate: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NativeExtractionJob {
     #[serde(default)]
@@ -157,6 +185,12 @@ pub struct NativeExtractionJob {
     pub source: PathBuf,
     pub format: DiscFormat,
     pub programs: Vec<NativeProgramChoice>,
+    #[serde(default)]
+    pub cue_segments: Vec<NativeCueSegment>,
+    /// All CUE/image inputs from the admitted view, including unchecked
+    /// tracks; Replace must never overwrite an unchecked source image.
+    #[serde(default)]
+    pub cue_input_paths: Vec<PathBuf>,
     pub destination: PathBuf,
     pub working_root: PathBuf,
     pub wav_container: NativeWavContainer,
@@ -558,6 +592,9 @@ pub async fn execute_with_controls(
 pub async fn probe_selected_sources(
     job: NativeExtractionJob, cancel: CancellationToken,
 ) -> Result<NativeProbeFacts, String> {
+    if job.format == DiscFormat::CueImage {
+        return cue::probe_selected_sources(&job, &cancel).await;
+    }
     if is_file_stream_format(job.format) {
         return matroska::probe_selected_sources(&job, &cancel).await;
     }
@@ -583,7 +620,7 @@ pub async fn probe_selected_sources(
             DiscFormat::DvdAudio => Box::new(DvdaAudioMaterializer),
             DiscFormat::DvdVideo => Box::new(DvdVideoMaterializer),
             DiscFormat::BluRay => Box::new(BlurayMaterializer),
-            DiscFormat::Matroska | DiscFormat::TransportFile => unreachable!("File audio streams use the dedicated native extractor"),
+            DiscFormat::Matroska | DiscFormat::TransportFile | DiscFormat::CueImage => unreachable!("File audio streams use the dedicated native extractor"),
         };
         let prepared = materializer.materialize(
             &request, &staging, &runner, None, &tools, &cancel
@@ -612,6 +649,9 @@ async fn execute_inner(
     controls: Arc<NativeExtractionControl>,
     mut on_progress: impl FnMut(NativeExtractionProgress),
 ) -> Result<NativeExtractionReport, String> {
+    if job.format == DiscFormat::CueImage {
+        return cue::execute_inner(job, cancel, controls, on_progress).await;
+    }
     if is_file_stream_format(job.format) {
         return matroska::execute_inner(job, cancel, controls, on_progress).await;
     }
@@ -680,7 +720,7 @@ async fn execute_inner(
             DiscFormat::DvdAudio => Box::new(DvdaAudioMaterializer),
             DiscFormat::DvdVideo => Box::new(DvdVideoMaterializer),
             DiscFormat::BluRay => Box::new(BlurayMaterializer),
-            DiscFormat::Matroska | DiscFormat::TransportFile => unreachable!("File audio streams use the dedicated native extractor"),
+            DiscFormat::Matroska | DiscFormat::TransportFile | DiscFormat::CueImage => unreachable!("File audio streams use the dedicated native extractor"),
         };
         controls.wait_ready(&cancel, &cancel).await?;
         let program_estimate = program.tracks.iter()
@@ -1045,11 +1085,17 @@ pub(crate) fn render_native_extraction_log_with_outcome(
         DiscFormat::DvdVideo => "title",
         DiscFormat::BluRay => "playlist",
         DiscFormat::Matroska | DiscFormat::TransportFile => "stream",
+        DiscFormat::CueImage => "album",
     };
     let item_kind = if matches!(job.format, DiscFormat::DvdVideo | DiscFormat::BluRay | DiscFormat::Matroska) {
         "chapters"
     } else { "tracks" };
     let format_name = |p: &NativeProgramChoice| -> String { match job.format {
+        DiscFormat::CueImage => {
+            let source = job.cue_segments.iter().find(|s| s.presentation == p.id);
+            format!("{} (re-encoded from CUE image; original format)", source.map(|s|
+                s.extension.to_uppercase()).unwrap_or_else(|| "Unknown".into()))
+        },
         DiscFormat::Sacd if p.keep_dst => "DFF (DST kept)".into(),
         DiscFormat::Sacd if job.sacd_dff => "DFF (DSD native; DST decoded if present)".into(),
         DiscFormat::Sacd => "DSF (DSD native; DST decoded if present)".into(),
@@ -2003,7 +2049,10 @@ fn render_naming_template(template: &str, program: &NativeProgramChoice, track: 
 }
 
 pub(crate) fn proposed_destination(job: &NativeExtractionJob, program: &NativeProgramChoice, track: &NativeTrackChoice) -> PathBuf {
-    let extension = extraction_extension(job, program);
+    let extension = if job.format == DiscFormat::CueImage {
+        job.cue_segments.iter().find(|s| s.presentation == program.id && s.number == track.number)
+            .map(|s| s.extension.as_str()).unwrap_or("invalid")
+    } else { extraction_extension(job, program) };
     let legacy = legacy_naming_template(&job.naming_template);
     let mut stem = render_naming_template_for_extension(&job.naming_template, program, track,
         extension, &job.disc_identity);
@@ -2032,6 +2081,7 @@ pub(crate) fn validate_job(job: &NativeExtractionJob) -> Result<(), String> {
     }
     if !job.source.exists() { return Err("Disc source no longer exists".into()); }
     if job.cue && !job.file_per_program { return Err("CUE belongs to continuous-file mode".into()); }
+    if job.format == DiscFormat::CueImage { cue::validate_cue_job(job)?; }
     if is_file_stream_format(job.format) {
         if job.format == DiscFormat::TransportFile {
             if !crate::disc::on_disc_transport::is_transport_path(&job.source)
@@ -2527,7 +2577,7 @@ mod tests {
     use super::*;
 
     pub(super) fn fixture_job(destination: &Path, scratch: &Path) -> NativeExtractionJob {
-        NativeExtractionJob { disc_identity: Default::default(),
+        NativeExtractionJob { cue_input_paths: Vec::new(), cue_segments: Vec::new(), disc_identity: Default::default(),
             source: std::env::current_exe().unwrap(),
             format: DiscFormat::Sacd,
             programs: vec![NativeProgramChoice {
@@ -3675,7 +3725,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let destination = temp.path().join("requested-output");
         let scratch = destination.join("scratch-should-not-exist");
-        let job = NativeExtractionJob { disc_identity: Default::default(),
+        let job = NativeExtractionJob { cue_input_paths: Vec::new(), cue_segments: Vec::new(), disc_identity: Default::default(),
             source: std::env::current_exe().unwrap(),
             format: DiscFormat::Sacd,
             programs: vec![NativeProgramChoice {
@@ -4047,7 +4097,7 @@ mod tests {
 
     #[test]
     fn reject_duplicate_track_selection_before_io() {
-        let job = NativeExtractionJob { disc_identity: Default::default(), source: std::env::current_exe().unwrap(), format: DiscFormat::Sacd,
+        let job = NativeExtractionJob { cue_input_paths: Vec::new(), cue_segments: Vec::new(), disc_identity: Default::default(), source: std::env::current_exe().unwrap(), format: DiscFormat::Sacd,
             programs: vec![NativeProgramChoice { id: PresentationId::SacdArea(crate::disc::SacdAreaId::Stereo),
                 label: "Stereo".into(), tracks: vec![NativeTrackChoice{ duration_secs: None,number:1,name:"a".into(),tags:NativeTagValues::default(),estimated_bytes:None},
                 NativeTrackChoice{ duration_secs: None,number:1,name:"b".into(),tags:NativeTagValues::default(),estimated_bytes:None}], keep_dst:false,source_depth:Some(1), source_codec: "unknown".into(),
