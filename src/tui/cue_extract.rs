@@ -36,6 +36,7 @@ fn supported_format(path: &Path, codec: &str, depth: Option<u32>, float: Option<
     let codec_expected = match ext.as_str() {
         "flac" => Some("flac"), "wv" => Some("wavpack"),
         "mp3" => Some("mp3"), "opus" => Some("opus"),
+        "ape" => Some("ape"), "tta" => Some("tta"),
         _ => None,
     };
     if codec_expected.is_some_and(|expected|!codec.eq_ignore_ascii_case(expected)) {
@@ -57,10 +58,16 @@ fn supported_format(path: &Path, codec: &str, depth: Option<u32>, float: Option<
         else if depth.unwrap_or(16) > 24 {"pcm_s32be"}
         else if depth.unwrap_or(16) > 16 {"pcm_s24be"} else {"pcm_s16be"}, "aiff", depth),
         "wv" => ("wv", "wavpack", "wv", depth),
+        "ape" if float != Some(true) && matches!(depth,Some(8|16|24|32)) =>
+            ("ape", "mac", "ape", depth),
+        "tta" if float != Some(true) && matches!(depth,Some(8|16|24|32)) =>
+            ("tta", "tta", "tta", depth),
         "mp3" => ("mp3", "libmp3lame", "mp3", depth),
         "m4a" if codec.eq_ignore_ascii_case("alac") => ("m4a", "alac", "ipod", depth),
-        "m4a" | "aac" if codec.eq_ignore_ascii_case("aac") =>
+        "m4a" if codec.eq_ignore_ascii_case("aac") =>
             ("m4a", "aac", "ipod", depth),
+        "aac" if codec.eq_ignore_ascii_case("aac") =>
+            ("aac", "aac", "adts", depth),
         "ogg" if codec.eq_ignore_ascii_case("vorbis") =>
             ("ogg", "libvorbis", "ogg", depth),
         "ogg" if codec.eq_ignore_ascii_case("opus") =>
@@ -70,6 +77,30 @@ fn supported_format(path: &Path, codec: &str, depth: Option<u32>, float: Option<
             choose an image with a supported encoder", path.display())),
     };
     Ok((result.0.into(), result.1.into(), result.2.into(), result.3))
+}
+
+/// Read the original audio-stream bitrate (not just an encoder default).
+/// FFmpeg's audio parameters have the most direct figure. Some VBR formats
+/// omit it; use the container's mean as a conservative floor in that case.
+/// Called once per image during the off-thread CUE preview, never per track.
+fn lossy_image_bitrate(path: &Path, info: &crate::tui::probe::SourceInfo)
+    -> Result<u64, String>
+{
+    crate::tui::probe::ensure_ffmpeg_init_pub();
+    let container = ffmpeg_next::format::input(path).map_err(|error|
+        format!("Inspect lossy CUE bitrate for '{}': {error}",path.display()))?;
+    let audio = container.streams().best(ffmpeg_next::media::Type::Audio)
+        .ok_or_else(||format!("No lossy audio stream: {}",path.display()))?;
+    let stream_bps = unsafe { (*audio.parameters().as_ptr()).bit_rate };
+    if let Ok(value) = u64::try_from(stream_bps) {
+        if value > 0 { return Ok(value); }
+    }
+    let mean = (info.file_size as f64 * 8.0 / info.duration_secs).ceil();
+    if !mean.is_finite() || mean <= 0.0 || mean > u64::MAX as f64 {
+        return Err(format!("Cannot establish source bitrate for lossy CUE image: {}",
+            path.display()));
+    }
+    Ok(mean as u64)
 }
 
 fn check_regular_snapshot(path: &Path) -> Result<(u64, Option<std::time::SystemTime>), String> {
@@ -180,7 +211,7 @@ pub fn inspect(source: &Path, combine: bool,
         let album_year = group[0].sheet.date.clone();
         let album_catalog = group[0].sheet.catalog.clone();
         let mut media_cache: BTreeMap<PathBuf, (u64, u32, crate::tui::probe::SourceInfo,
-            u64,Option<std::time::SystemTime>)> = BTreeMap::new();
+            u64,Option<std::time::SystemTime>,Option<u64>)> = BTreeMap::new();
         let mut tracks = Vec::new();
         let mut segments = Vec::new();
         let mut authored = Vec::new();
@@ -194,13 +225,17 @@ pub fn inspect(source: &Path, combine: bool,
                     if samples == 0 || rate == 0 || info.sample_rate != rate || info.channels == 0 {
                         return Err(format!("Invalid CUE audio clock/extent: {}", image.display()));
                     }
-                    let _ = supported_format(image,&info.codec,info.bit_depth,info.sample_format_is_float)?;
-                    media_cache.insert(image.clone(),(samples,rate,info,len,modified));
+                    let (_,encoder,_,_) = supported_format(image,&info.codec,
+                        info.bit_depth,info.sample_format_is_float)?;
+                    let bitrate = if matches!(encoder.as_str(),"libmp3lame"|"aac"|"libvorbis"|"libopus") {
+                        Some(lossy_image_bitrate(image,&info)?)
+                    } else { None };
+                    media_cache.insert(image.clone(),(samples,rate,info,len,modified,bitrate));
                 }
             }
             for (j,track) in member.sheet.tracks.iter().enumerate() {
                 let image = &member.track_audio_paths[j];
-                let (samples,rate,info,len,modified) = media_cache.get(image)
+                let (samples,rate,info,len,modified,bitrate) = media_cache.get(image)
                     .ok_or("CUE track has no admitted image")?;
                 let index = track.index01_frames.ok_or("CUE track is missing INDEX 01")?;
                 let start = u64::try_from(u128::from(index)*u128::from(*rate)/75)
@@ -232,14 +267,14 @@ pub fn inspect(source: &Path, combine: bool,
                     sample_bits:depth,channels:u8::try_from(info.channels)
                         .map_err(|_|"Too many CUE audio channels")?,
                     source_length:*len,source_modified:*modified,
-                    cue_length,cue_modified});
+                    cue_length,cue_modified,source_bit_rate:*bitrate});
             }
         }
         if tracks.is_empty() { return Err("CUE has no extractable tracks".into()); }
         let first = media_cache.values().next().ok_or("CUE has no audio")?;
         // Mixed-format albums retain per-track carriers in `segments`; the
         // presentation summary is descriptive rather than an encoding policy.
-        let uniform = media_cache.values().all(|(_,rate,info,_,_)| *rate == first.1 &&
+        let uniform = media_cache.values().all(|(_,rate,info,_,_,_)| *rate == first.1 &&
             info.codec == first.2.codec && info.channels == first.2.channels);
         let format = AudioPresentationFormat {
             codec: if uniform {Some(first.2.codec.clone())} else {Some("mixed source formats".into())},
@@ -247,7 +282,7 @@ pub fn inspect(source: &Path, combine: bool,
             bit_depth: if uniform {first.2.bit_depth} else {None},
             channels: if uniform {u8::try_from(first.2.channels).ok()} else {None},
             channel_layout: if uniform {Some(first.2.channel_layout.clone())} else {None},
-            lossless: media_cache.values().all(|(_,_,info,_,_)|
+            lossless: media_cache.values().all(|(_,_,info,_,_,_)|
                 info.compression_is_lossless.unwrap_or(false)),
             provenance:FormatProvenance::Unknown,
         };
@@ -280,8 +315,35 @@ mod tests {
             .unwrap().1,"flac");
         assert_eq!(supported_format(Path::new("side.wav"),"pcm_s24le",Some(24),Some(false))
             .unwrap().1,"pcm_s24le");
-        assert!(supported_format(Path::new("side.ape"),"ape",Some(16),None).is_err());
+        assert_eq!(supported_format(Path::new("side.ape"),"ape",Some(16),None).unwrap().1,"mac");
+        assert_eq!(supported_format(Path::new("side.tta"),"tta",Some(24),None).unwrap().2,"tta");
+        assert!(supported_format(Path::new("side.tak"),"tak",Some(16),None).is_err());
         assert!(supported_format(Path::new("misnamed.flac"),"pcm_s16le",Some(16),None).is_err());
+    }
+
+    #[test]
+    fn aac_adts_and_m4a_are_distinct_source_carriers() {
+        assert_eq!(supported_format(Path::new("side.aac"), "aac", None, None).unwrap(),
+            ("aac".to_string(), "aac".to_string(), "adts".to_string(), None));
+        assert_eq!(supported_format(Path::new("side.m4a"), "aac", None, None).unwrap(),
+            ("m4a".to_string(), "aac".to_string(), "ipod".to_string(), None));
+        assert_eq!(supported_format(Path::new("side.m4a"), "alac", Some(24), None).unwrap(),
+            ("m4a".to_string(), "alac".to_string(), "ipod".to_string(), Some(24)));
+        assert!(supported_format(Path::new("side.aac"), "alac", None, None).is_err());
+    }
+
+    #[test]
+    fn existing_cue_admission_rejects_per_file_metadata_sidecar_for_extract_menu() {
+        let dir = tempfile::tempdir().unwrap();
+        for track in ["one","two"] {
+            write_stereo_pcm_wav(&dir.path().join(format!("{track}.wav")),44_100,44_100);
+        }
+        let cue = dir.path().join("album.cue");
+        fs::write(&cue,"FILE \"one.wav\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n\
+            FILE \"two.wav\" WAVE\n  TRACK 02 AUDIO\n    INDEX 01 00:00:00\n").unwrap();
+        let member = split::admit_split_cue_member(&cue).unwrap();
+        assert!(!member.contributes_synthetic_album_part(),
+            "one logical track per physical file is only a metadata sidecar");
     }
 
     fn write_stereo_pcm_wav(path: &Path, sample_rate: u32, frames: u32) {
@@ -315,6 +377,8 @@ mod tests {
             fs::write(dir.path().join(format!("Album Side {side}.cue")),cue).unwrap();
         }
         let selected = dir.path().join("Album Side A.cue");
+        assert!(split::admit_split_cue_member(&selected).unwrap()
+            .contributes_synthetic_album_part());
         let joined = inspect(&selected,true,&[]).unwrap();
         assert_eq!(joined.contents.presentations.len(),1,
             "shared split-CUE policy should combine these related sides");

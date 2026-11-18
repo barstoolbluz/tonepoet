@@ -172,6 +172,10 @@ pub struct NativeCueSegment {
     pub source_modified: Option<std::time::SystemTime>,
     pub cue_length: u64,
     pub cue_modified: Option<std::time::SystemTime>,
+    /// Source stream bitrate, or a conservative whole-image mean for VBR
+    /// carriers lacking stream metadata. None for lossless images.
+    #[serde(default)]
+    pub source_bit_rate: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

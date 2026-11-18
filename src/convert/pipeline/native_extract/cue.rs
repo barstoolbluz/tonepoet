@@ -34,6 +34,9 @@ fn verify_segment(segment: &NativeCueSegment) -> Result<(), String> {
         segment.encoder.is_empty() || segment.muxer.is_empty() || segment.channels == 0 {
         return Err("Invalid CUE track geometry or missing source encoder".into());
     }
+    if matches!(segment.encoder.as_str(), "libmp3lame"|"aac"|"libvorbis"|"libopus") {
+        lossy_quality_args(&segment.encoder,segment.source_bit_rate,segment.channels)?;
+    }
     Ok(())
 }
 
@@ -115,20 +118,154 @@ fn track_tags(job: &NativeExtractionJob, program: &NativeProgramChoice,
     }
 }
 
+/// CUE indexes are decoded-sample boundaries, generally not compressed
+/// packet boundaries. Stream-copy cuts would lose/gain packets and sometimes
+/// decoder padding; make each lossy re-encode at the highest practical source
+/// quality rather than letting FFmpeg silently select its 128 kb/s defaults.
+fn lossy_quality_args(encoder: &str, source_bps: Option<u64>, channels: u8)
+    -> Result<Vec<String>,String>
+{
+    let source = source_bps.filter(|value|*value > 0)
+        .ok_or("Cannot establish lossy CUE source bitrate")?;
+    let boosted = source.saturating_add(source / 4);
+    let mut args = Vec::new();
+    let mut add = |key: &str,value: String| {
+        args.push(key.into()); args.push(value);
+    };
+    match encoder {
+        "libmp3lame" => {
+            if source > 320_000 {
+                return Err(format!("MP3 source bitrate {source} exceeds its 320 kb/s encoder ceiling"));
+            }
+            add("-b:a", "320000".into());
+        }
+        "aac" => {
+            // AAC has no 320 kb/s MP3-style ceiling; preserve high-rate
+            // multichannel and high-rate stereo images instead of capping.
+            add("-b:a", boosted.max(320_000).to_string());
+        }
+        "libvorbis" => {
+            // Vorbis is quality-based VBR. The highest codec quality level
+            // preserves far more detail than an arbitrary ABR default.
+            add("-b:a", boosted.max(384_000).to_string());
+            add("-q:a", "10".into());
+        }
+        "libopus" => {
+            // libopus limits mono to 256 kb/s, stereo to 510 kb/s, and
+            // multichannel to 256 kb/s per channel. A single stereo ceiling
+            // wrongly rejects valid 5.1 sources and a stereo floor fails mono.
+            let ceiling = match channels {
+                0 => return Err("Opus CUE source has no audio channels".into()),
+                1 => 256_000,
+                2 => 510_000,
+                count => u64::from(count) * 256_000,
+            };
+            // The source may be a whole-file bitrate estimate including Ogg
+            // overhead. Clamp to the encoder's limit instead of rejecting an
+            // otherwise valid source that appears slightly above the ceiling.
+            add("-b:a", boosted.max(384_000).min(ceiling).to_string());
+            add("-vbr", "off".into());
+        }
+        _ => return Err(format!("Not a supported lossy CUE encoder: {encoder}")),
+    }
+    Ok(args)
+}
+
+fn ape_wav_encoder(bits: Option<u32>) -> Result<&'static str,String> {
+    match bits {
+        Some(8) => Ok("pcm_u8"),
+        Some(16) => Ok("pcm_s16le"),
+        Some(24) => Ok("pcm_s24le"),
+        Some(32) => Ok("pcm_s32le"),
+        _ => Err("Cannot preserve this APE sample depth in the mac WAV input".into()),
+    }
+}
+
+/// `mac` accepts a seekable WAV input, not decoded PCM on stdin. The input
+/// WAV lives in the same private extraction workdir as the final APE. Manage
+/// its external process explicitly because ToolBinary is intentionally a
+/// closed, Reference-qualified set and cannot be extended for this one path.
+#[allow(unsafe_code)] // libc::kill pause/resume signals for the mac child
+async fn run_mac_ape(input: &Path, output: &Path, cancel: &CancellationToken,
+    item: &CancellationToken, controls: &NativeExtractionControl) -> Result<(),String>
+{
+    let mut command = tokio::process::Command::new("mac");
+    command.arg(input).arg(output).arg("-c2000")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let mut child = command.spawn()
+        .map_err(|error|format!("Start Monkey's Audio 'mac' encoder: {error}"))?;
+    #[cfg(unix)]
+    let pid = child.id().and_then(|pid|i32::try_from(pid).ok());
+    #[cfg(unix)]
+    let mut stopped = false;
+    let timeout = tokio::time::sleep(Duration::from_secs(6*60*60));
+    tokio::pin!(timeout);
+    let result = loop {
+        tokio::select! {
+            status = child.wait() => break status.map_err(|error|
+                format!("Wait for mac APE encoder: {error}")),
+            _ = cancel.cancelled() => {
+                let _ = child.kill().await;
+                controls.tool_pause().acknowledge(false);
+                return Err("Extraction cancelled during APE encoding".into());
+            }
+            _ = item.cancelled() => {
+                let _ = child.kill().await;
+                controls.tool_pause().acknowledge(false);
+                return Err("Current APE track skipped".into());
+            }
+            _ = &mut timeout => {
+                let _ = child.kill().await;
+                controls.tool_pause().acknowledge(false);
+                return Err("mac APE encoder exceeded its six-hour timeout".into());
+            }
+            _ = tokio::time::sleep(Duration::from_millis(40)) => {
+                #[cfg(unix)]
+                if let Some(pid) = pid {
+                    let pause = controls.is_paused();
+                    if pause != stopped {
+                        let sig = if pause { libc::SIGSTOP } else { libc::SIGCONT };
+                        if unsafe { libc::kill(pid,sig) } == 0 {
+                            stopped = pause;
+                            controls.tool_pause().acknowledge(pause);
+                        }
+                    }
+                }
+            }
+        }
+    };
+    #[cfg(unix)]
+    if stopped {
+        if let Some(pid) = pid { unsafe { libc::kill(pid,libc::SIGCONT); } }
+    }
+    controls.tool_pause().acknowledge(false);
+    let status = result?;
+    if !status.success() {
+        return Err(format!("mac APE encoder failed with status {status}"));
+    }
+    Ok(())
+}
+
 fn encode_command(job: &NativeExtractionJob, program: &NativeProgramChoice,
     track: &NativeTrackChoice, segment: &NativeCueSegment, output: &Path)
     -> Result<ToolCommand,String>
 {
     let mut args = vec!["-hide_banner","-nostdin","-loglevel","error","-xerror","-y"]
         .into_iter().map(str::to_owned).collect::<Vec<_>>();
+    let (encoder,muxer) = if segment.encoder == "mac" {
+        (ape_wav_encoder(segment.sample_bits)?.to_string(),"wav")
+    } else { (segment.encoder.clone(),segment.muxer.as_str()) };
     args.extend(["-i".into(),utf8_path(&segment.image)?,
         "-map".into(),"0:a:0".into(),"-vn".into(),"-sn".into(),"-dn".into(),
         "-map_metadata".into(),"-1".into(),"-map_chapters".into(),"-1".into(),
         "-af".into(),format!("atrim=start_sample={}:end_sample={},asetpts=PTS-STARTPTS",
             segment.start_sample,segment.end_sample),
         "-ar".into(),segment.sample_rate.to_string(),
-        "-c:a".into(),segment.encoder.clone()]);
-    if segment.muxer == "wav" {
+        "-c:a".into(),encoder]);
+    if muxer == "wav" {
         // Large split WAVs must remain writable without a 4 GiB RIFF ceiling.
         args.extend(["-rf64".into(),"auto".into()]);
     }
@@ -136,6 +273,13 @@ fn encode_command(job: &NativeExtractionJob, program: &NativeProgramChoice,
         // FLAC can encode 24-bit integers from FFmpeg's s32 planar input.
         args.extend(["-sample_fmt".into(),"s32".into(),
             "-bits_per_raw_sample".into(),"24".into()]);
+    }
+    if segment.encoder == "tta" && segment.sample_bits == Some(24) {
+        args.extend(["-sample_fmt".into(),"s32".into(),
+            "-bits_per_raw_sample".into(),"24".into()]);
+    }
+    if matches!(segment.encoder.as_str(),"libmp3lame"|"aac"|"libvorbis"|"libopus") {
+        args.extend(lossy_quality_args(&segment.encoder,segment.source_bit_rate,segment.channels)?);
     }
     if job.transfer_tags {
         let tags = track_tags(job,program,track);
@@ -155,7 +299,7 @@ fn encode_command(job: &NativeExtractionJob, program: &NativeProgramChoice,
         }
         args.extend(["-metadata".into(),format!("track={}",track.number)]);
     }
-    args.extend(["-f".into(),segment.muxer.clone(),utf8_path(output)?]);
+    args.extend(["-f".into(),muxer.to_string(),utf8_path(output)?]);
     Ok(ToolCommand {binary:ToolBinary::Ffmpeg,args,secret_args:Vec::new(),cwd:None,
         environment_policy:tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
         env:Vec::new(),timeout:Duration::from_secs(6*60*60)})
@@ -217,13 +361,27 @@ pub(super) async fn execute_inner(
             emit(format!("Encoding {}",track.name),Some(completed.clone()),track.estimated_bytes,
                 done,skipped,&published,bytes_done,bytes_skipped,bytes_published);
             let result: Result<(),String> = async {
-                runner.run(encode_command(&job,program,track,segment,&completed)?,&item)
-                    .await.map_err(|error|format!("CUE re-encoding: {error}"))?;
+                if segment.encoder == "mac" {
+                    let wav = temp.path().join(format!("cue-{pi}-{}-ape-input.wav",track.number));
+                    controls.watch_file(wav.clone(),format!("Decoding {} for APE",track.name),
+                        track.estimated_bytes,false);
+                    runner.run(encode_command(&job,program,track,segment,&wav)?,&item)
+                        .await.map_err(|error|format!("CUE APE PCM stage: {error}"))?;
+                    controls.wait_ready(&cancel,&item).await?;
+                    controls.watch_file(completed.clone(),format!("Encoding {} as APE",track.name),
+                        track.estimated_bytes,false);
+                    let encode = run_mac_ape(&wav,&completed,&cancel,&item,&controls).await;
+                    let _ = fs::remove_file(&wav);
+                    encode?;
+                } else {
+                    runner.run(encode_command(&job,program,track,segment,&completed)?,&item)
+                        .await.map_err(|error|format!("CUE re-encoding: {error}"))?;
+                }
                 controls.wait_ready(&cancel,&item).await?;
                 let meta = fs::metadata(&completed).map_err(|error|
                     format!("CUE output was not encoded: {error}"))?;
                 if meta.len()==0 { return Err("CUE encoder produced an empty file".into()); }
-                if matches!(segment.extension.as_str(),"flac"|"wav"|"aiff"|"wv") {
+                if matches!(segment.extension.as_str(),"flac"|"wav"|"aiff"|"wv"|"ape"|"tta") {
                     // Lossless carriers must have the exact decoded CUE frame
                     // count; a successful encoder exit alone is not proof.
                     let (frames,rate) = crate::tui::accuraterip::probe_sample_count(&completed)?;
@@ -231,6 +389,17 @@ pub(super) async fn execute_inner(
                         return Err(format!("Encoded CUE frame count mismatch for {}: expected {}, got {}",
                             track.name,segment.end_sample-segment.start_sample,frames));
                     }
+                }
+                if segment.encoder == "mac" && job.transfer_tags {
+                    let mut fields = selected_tag_items(&track_tags(&job,program,track),job.tag_fields);
+                    fields.push((lofty::tag::ItemKey::TrackNumber,Some(track.number.to_string())));
+                    let ape = completed.clone();
+                    let art = if job.tag_artwork {
+                        native_artwork_path(&AlbumMetadata::default(),&segment.cue_path)
+                    } else { None };
+                    tokio::task::spawn_blocking(move ||
+                        write_completed_native_metadata(&ape,&fields,art.as_deref()))
+                        .await.map_err(|error|format!("CUE APE tag task: {error}"))??;
                 }
                 if job.transfer_tags && job.tag_artwork &&
                     matches!(segment.extension.as_str(),"flac"|"mp3"|"m4a"|"ogg"|"opus") {
@@ -304,8 +473,45 @@ mod tests {
             cue_path:PathBuf::from("none"),image:PathBuf::from("none"),start_sample:200,
             end_sample:200,total_samples:300,sample_rate:44100,extension:"flac".into(),
             encoder:"flac".into(),muxer:"flac".into(),sample_bits:Some(16),channels:2,
-            source_length:0,source_modified:None,cue_length:0,cue_modified:None};
+            source_length:0,source_modified:None,cue_length:0,cue_modified:None,
+            source_bit_rate:None};
         assert!(verify_segment(&s).is_err());
+    }
+
+    #[test]
+    fn cue_lossy_qualities_do_not_fall_back_to_128k_defaults() {
+        assert_eq!(lossy_quality_args("libmp3lame",Some(320_000),2).unwrap(),
+            vec!["-b:a","320000"]);
+        assert_eq!(lossy_quality_args("aac",Some(256_000),2).unwrap(),
+            vec!["-b:a","320000"]);
+        assert_eq!(lossy_quality_args("aac",Some(512_000),2).unwrap(),
+            vec!["-b:a","640000"]);
+        assert_eq!(lossy_quality_args("libvorbis",Some(256_000),2).unwrap(),
+            vec!["-b:a","384000","-q:a","10"]);
+        // Mono never requests a bitrate above libopus's 256 kb/s limit.
+        assert_eq!(lossy_quality_args("libopus",Some(96_000),1).unwrap(),
+            vec!["-b:a","256000","-vbr","off"]);
+        // Whole-image fallback estimates may include Ogg overhead.
+        assert_eq!(lossy_quality_args("libopus",Some(258_000),1).unwrap(),
+            vec!["-b:a","256000","-vbr","off"]);
+        assert_eq!(lossy_quality_args("libopus",Some(256_000),2).unwrap(),
+            vec!["-b:a","384000","-vbr","off"]);
+        assert_eq!(lossy_quality_args("libopus",Some(512_000),2).unwrap(),
+            vec!["-b:a","510000","-vbr","off"]);
+        // Six channels can retain high-rate 5.1 audio instead of being
+        // refused under the stereo ceiling.
+        assert_eq!(lossy_quality_args("libopus",Some(768_000),6).unwrap(),
+            vec!["-b:a","960000","-vbr","off"]);
+        assert_eq!(lossy_quality_args("libopus",Some(1_536_000),6).unwrap(),
+            vec!["-b:a","1536000","-vbr","off"]);
+        assert!(lossy_quality_args("libopus",Some(96_000),0).is_err());
+        assert!(lossy_quality_args("libmp3lame",Some(400_000),2).is_err());
+        assert!(lossy_quality_args("aac",None,2).is_err());
+        for (depth,codec) in [(8,"pcm_u8"),(16,"pcm_s16le"),
+            (24,"pcm_s24le"),(32,"pcm_s32le")] {
+            assert_eq!(ape_wav_encoder(Some(depth)).unwrap(),codec);
+        }
+        assert!(ape_wav_encoder(None).is_err());
     }
 
     #[test]

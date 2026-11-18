@@ -3004,6 +3004,21 @@ mod disc_selection_bridge_tests {
     }
 
     #[test]
+    fn cue_album_rejects_convert_without_modifying_source_options() {
+        let id = PresentationId::CueAlbum(1);
+        let mut options = blank_source_options();
+        // A rejected presentation must not alter any existing conversion
+        // selection or source option, including non-CUE settings.
+        options.dvdv_vts = Some(3);
+        options.bluray_audio_pid = Some(0x1100);
+        let original = format!("{options:?}");
+
+        assert!(!presentation_id_supports_stream_conversion(&id));
+        assert!(!apply_presentation_to_source_options(&mut options, &id));
+        assert_eq!(format!("{options:?}"), original);
+    }
+
+    #[test]
     fn source_probe_blocks_only_its_own_program_and_not_convert() {
         let good = disc_contents(DiscFormat::DvdVideo,
             PresentationId::dvd_video(1, 1, 0), "English");
