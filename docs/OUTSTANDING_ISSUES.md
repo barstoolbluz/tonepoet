@@ -5902,6 +5902,15 @@ A DVD VOB's name gives its title set, not its title, so matching it to a
 title may mean comparing the file's sectors with each title's cells. Where
 the match is ambiguous, the window offers the candidates.
 
+**To revisit (noted 2026-11-18).** Phase C opens the extract window for an
+orphaned file straight away, with the no-chapters message shown inside it.
+Extracting the contents of an orphaned file is fine, but the user should be
+warned first, something like: "No chapters found: this standalone file
+lacks Blu-ray/DVD-Video navigation. Do you want to extract just the audio
+without any chapters?" Users might want this if, for example, the file is
+all they have. The exact wording and where the question is asked are not
+decided.
+
 ---
 
 ## 91. MKV and MKA files cannot be extracted natively

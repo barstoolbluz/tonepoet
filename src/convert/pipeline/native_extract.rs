@@ -9,6 +9,11 @@
 
 mod matroska;
 
+/// File-backed stream routes do not invoke optical-disc materializers.
+fn is_file_stream_format(format: DiscFormat) -> bool {
+    matches!(format, DiscFormat::Matroska | DiscFormat::TransportFile)
+}
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use serde::{Deserialize, Serialize};
@@ -553,7 +558,7 @@ pub async fn execute_with_controls(
 pub async fn probe_selected_sources(
     job: NativeExtractionJob, cancel: CancellationToken,
 ) -> Result<NativeProbeFacts, String> {
-    if job.format == DiscFormat::Matroska {
+    if is_file_stream_format(job.format) {
         return matroska::probe_selected_sources(&job, &cancel).await;
     }
     let temporary = tempfile::tempdir()
@@ -578,7 +583,7 @@ pub async fn probe_selected_sources(
             DiscFormat::DvdAudio => Box::new(DvdaAudioMaterializer),
             DiscFormat::DvdVideo => Box::new(DvdVideoMaterializer),
             DiscFormat::BluRay => Box::new(BlurayMaterializer),
-            DiscFormat::Matroska => unreachable!("Matroska uses its dedicated native file extractor"),
+            DiscFormat::Matroska | DiscFormat::TransportFile => unreachable!("File audio streams use the dedicated native extractor"),
         };
         let prepared = materializer.materialize(
             &request, &staging, &runner, None, &tools, &cancel
@@ -607,7 +612,7 @@ async fn execute_inner(
     controls: Arc<NativeExtractionControl>,
     mut on_progress: impl FnMut(NativeExtractionProgress),
 ) -> Result<NativeExtractionReport, String> {
-    if job.format == DiscFormat::Matroska {
+    if is_file_stream_format(job.format) {
         return matroska::execute_inner(job, cancel, controls, on_progress).await;
     }
     validate_job(&job)?;
@@ -675,7 +680,7 @@ async fn execute_inner(
             DiscFormat::DvdAudio => Box::new(DvdaAudioMaterializer),
             DiscFormat::DvdVideo => Box::new(DvdVideoMaterializer),
             DiscFormat::BluRay => Box::new(BlurayMaterializer),
-            DiscFormat::Matroska => unreachable!("Matroska uses its dedicated native file extractor"),
+            DiscFormat::Matroska | DiscFormat::TransportFile => unreachable!("File audio streams use the dedicated native extractor"),
         };
         controls.wait_ready(&cancel, &cancel).await?;
         let program_estimate = program.tracks.iter()
@@ -1039,7 +1044,7 @@ pub(crate) fn render_native_extraction_log_with_outcome(
         DiscFormat::DvdAudio => "group",
         DiscFormat::DvdVideo => "title",
         DiscFormat::BluRay => "playlist",
-        DiscFormat::Matroska => "stream",
+        DiscFormat::Matroska | DiscFormat::TransportFile => "stream",
     };
     let item_kind = if matches!(job.format, DiscFormat::DvdVideo | DiscFormat::BluRay | DiscFormat::Matroska) {
         "chapters"
@@ -1048,6 +1053,17 @@ pub(crate) fn render_native_extraction_log_with_outcome(
         DiscFormat::Sacd if p.keep_dst => "DFF (DST kept)".into(),
         DiscFormat::Sacd if job.sacd_dff => "DFF (DSD native; DST decoded if present)".into(),
         DiscFormat::Sacd => "DSF (DSD native; DST decoded if present)".into(),
+        DiscFormat::TransportFile => {
+            let carrier = file_stream_copy_format(job.format, &p.source_codec);
+            if native_pcm_unpack_required(&p.source_codec) {
+                "WAV (lossless unpack of transport LPCM; no lossy encoding)".into()
+            } else {
+                format!("{} (audio packets copied; no re-encoding{})",
+                    carrier.extension.to_uppercase(),
+                    if job.transfer_tags && !carrier.text_tags {"; carrier cannot store tags"}
+                    else {""})
+            }
+        },
         DiscFormat::Matroska => if job.file_per_program ||
             matches!(p.id, PresentationId::MatroskaStream { chapter_count: 0, .. }) {
             let carrier = matroska_copy_format(&p.source_codec);
@@ -1740,6 +1756,20 @@ pub(crate) fn matroska_copy_format(codec: &str) -> MatroskaCopyFormat {
     MatroskaCopyFormat { extension, muxer, chapters, text_tags, artwork }
 }
 
+/// Preserve Matroska's native container mapping unchanged. Only transport
+/// LPCM requires lossless packet unpacking into ordinary WAV PCM; neither
+/// transport-specific codec can be packet-copied to the WAV muxer.
+pub(crate) fn file_stream_copy_format(format: DiscFormat, codec: &str) -> MatroskaCopyFormat {
+    if format == DiscFormat::TransportFile && native_pcm_unpack_required(codec) {
+        MatroskaCopyFormat { extension: "wav", muxer: "wav",
+            chapters: false, text_tags: true, artwork: false }
+    } else { matroska_copy_format(codec) }
+}
+
+fn native_pcm_unpack_required(codec: &str) -> bool {
+    matches!(codec, "pcm_dvd" | "pcm_bluray")
+}
+
 pub(crate) fn matroska_cue_for_program(job: &NativeExtractionJob,
     program: &NativeProgramChoice) -> bool {
     job.format == DiscFormat::Matroska && job.file_per_program &&
@@ -1748,10 +1778,10 @@ pub(crate) fn matroska_cue_for_program(job: &NativeExtractionJob,
 }
 
 fn extraction_extension(job: &NativeExtractionJob, program: &NativeProgramChoice) -> &'static str {
-    if job.format == DiscFormat::Matroska {
-        if job.file_per_program || matches!(program.id,
+    if is_file_stream_format(job.format) {
+        if job.format == DiscFormat::TransportFile || job.file_per_program || matches!(program.id,
             PresentationId::MatroskaStream { chapter_count: 0, .. }) {
-            matroska_copy_format(&program.source_codec).extension
+            file_stream_copy_format(job.format, &program.source_codec).extension
         } else { "wav" }
     } else if job.format == DiscFormat::Sacd {
         if job.sacd_dff || program.keep_dst { "dff" } else { "dsf" }
@@ -1837,7 +1867,8 @@ fn native_naming_value(token: &str, program: &NativeProgramChoice,
         "STREAM" => match id {
             PresentationId::DvdVideoTitle {audio_stream_index,..} => (u16::from(audio_stream_index)+1).to_string(),
             PresentationId::BluRayTitle {audio_stream_index,..} => (u16::from(audio_stream_index)+1).to_string(),
-            PresentationId::MatroskaStream { audio_ordinal, .. } => audio_ordinal.to_string(),
+            PresentationId::MatroskaStream { audio_ordinal, .. } |
+            PresentationId::TransportStream { audio_ordinal, .. } => audio_ordinal.to_string(),
             _ => program.label.clone(),
         },
         "ANGLE" => program.angle.to_string(),
@@ -2001,19 +2032,35 @@ pub(crate) fn validate_job(job: &NativeExtractionJob) -> Result<(), String> {
     }
     if !job.source.exists() { return Err("Disc source no longer exists".into()); }
     if job.cue && !job.file_per_program { return Err("CUE belongs to continuous-file mode".into()); }
-    if job.format == DiscFormat::Matroska {
-        if !crate::disc::matroska_utils::is_matroska_path(&job.source) || !job.source.is_file() {
+    if is_file_stream_format(job.format) {
+        if job.format == DiscFormat::TransportFile {
+            if !crate::disc::on_disc_transport::is_transport_path(&job.source)
+                || crate::disc::on_disc_transport::has_disc_location(&job.source)
+                || !job.source.is_file() {
+                return Err("Standalone extraction requires an orphan M2TS/VOB file, not an authored disc segment".into());
+            }
+            if !job.file_per_program || job.cue {
+                return Err("Standalone transport files expose only whole audio streams, without chapters or CUE".into());
+            }
+            for program in &job.programs {
+                if !matches!(program.id, PresentationId::TransportStream { .. })
+                    || program.tracks.len() != 1 || program.tracks[0].number != 1 {
+                    return Err("Standalone transport selection must contain one complete audio stream".into());
+                }
+            }
+        } else if !crate::disc::matroska_utils::is_matroska_path(&job.source) || !job.source.is_file() {
             return Err("Matroska extraction needs an existing MKV/MKA file".into());
         }
-        if job.cue && !job.programs.iter().any(|program|
+        if job.format == DiscFormat::Matroska && job.cue && !job.programs.iter().any(|program|
             matroska_cue_for_program(job, program)) {
             return Err("CUE is available only for chaptered native streams without embedded chapters".into());
         }
         if job.downmix.is_active() || job.assume_decrypted || job.sacd_dff ||
             job.programs.iter().any(|program| program.keep_dst) {
-            return Err("Disc-only extraction controls cannot be applied to Matroska".into());
+            return Err("Disc-only extraction controls cannot be applied to file streams".into());
         }
         for program in &job.programs {
+            if job.format == DiscFormat::TransportFile { continue; }
             let PresentationId::MatroskaStream { chapter_count, .. } = program.id else {
                 return Err("Matroska job contains a non-Matroska stream identity".into());
             };
@@ -2105,12 +2152,12 @@ pub(crate) fn native_destination_collision_key(path: &Path) -> String {
 }
 
 fn inspect_publication_target(job: &NativeExtractionJob, planned: &mut HashSet<String>, dest: PathBuf) -> Result<(), String> {
-    // A standalone MKV/MKA input is itself a possible output pathname. Even
-    // an explicit Replace policy must never overwrite the source being read.
-    if job.format == DiscFormat::Matroska &&
+    // Any file-backed input is itself a possible output pathname, including
+    // through a symlink. Even explicit Replace must not overwrite the source.
+    if is_file_stream_format(job.format) &&
         fs::canonicalize(&job.source).ok().is_some_and(|source|
             fs::canonicalize(&dest).ok().as_ref() == Some(&source)) {
-        return Err(format!("Matroska output would replace its own input: {}", dest.display()));
+        return Err(format!("File-stream output would replace its own input: {}", dest.display()));
     }
     if !planned.insert(native_destination_collision_key(&dest)) {
         return Err(format!("Two selected artifacts would publish to '{}'; choose different names",dest.display()));

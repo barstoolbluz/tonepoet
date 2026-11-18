@@ -15,6 +15,8 @@ pub enum DiscFormat {
     BluRay,
     /// An MKV/MKA file, not an optical disc. It shares the Extract window.
     Matroska,
+    /// An M2TS/VOB outside its authored disc, browsed as independent streams.
+    TransportFile,
 }
 
 impl DiscFormat {
@@ -25,6 +27,7 @@ impl DiscFormat {
             Self::DvdVideo => "DVD-Video",
             Self::BluRay => "Blu-ray",
             Self::Matroska => "Matroska",
+            Self::TransportFile => "Standalone transport",
         }
     }
 }
@@ -96,6 +99,12 @@ pub enum PresentationId {
         /// Capturing it in the durable program identity detects source drift
         /// before a resumed extraction can publish unrelated chapter ranges.
         chapter_count: u32,
+    },
+    /// A standalone MPEG-TS/PS audio stream. Without disc navigation there
+    /// are no authored chapters, so only the full stream is selectable.
+    TransportStream {
+        stream_index: u32,
+        audio_ordinal: u32,
     },
 }
 
@@ -175,6 +184,8 @@ impl PresentationId {
         match self {
             Self::MatroskaStream { audio_ordinal, .. } =>
                 format!("Matroska audio stream {audio_ordinal}"),
+            Self::TransportStream { audio_ordinal, .. } =>
+                format!("Transport audio stream {audio_ordinal}"),
             Self::DvdAudioGroup(n) => format!("DVD-Audio group {n}"),
             Self::SacdArea(SacdAreaId::Stereo) => "SACD stereo area".to_string(),
             Self::SacdArea(SacdAreaId::MultiChannel) => "SACD multichannel area".to_string(),
@@ -202,7 +213,8 @@ impl PresentationId {
     /// Compact label used in dense CLI/table output.
     pub fn compact_label(&self) -> String {
         match self {
-            Self::MatroskaStream { audio_ordinal, .. } =>
+            Self::MatroskaStream { audio_ordinal, .. } |
+            Self::TransportStream { audio_ordinal, .. } =>
                 format!("Audio stream {audio_ordinal}"),
             Self::DvdAudioGroup(n) => format!("Group {n}"),
             Self::SacdArea(SacdAreaId::Stereo) => "Stereo".to_string(),
@@ -290,6 +302,10 @@ impl DiscExtractTagFields {
 #[derive(Debug, Clone, Default)]
 pub struct PresentationExtractInfo {
     pub ineligible_reason: Option<String>,
+    /// Estimated payload of a standalone transport audio stream. Only filled
+    /// from a known audio clock and LPCM or constant-rate audio facts; absent
+    /// estimates must not become a source-file-size admission limit.
+    pub transport_audio_bytes: Option<u64>,
     pub language: Option<String>,
     pub role: Option<String>,
     pub angle_count: u8,

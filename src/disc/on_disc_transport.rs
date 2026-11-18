@@ -3,7 +3,7 @@
 //! The file is an entry point, not the extraction source. Blu-ray playlists
 //! and DVD-Video titles can cross file boundaries; their existing materializers
 //! need the *disc root*. An unrelated/orphan transport file is deliberately not
-//! treated as a disc (that fallback belongs to #90 Phase C).
+//! treated as a disc. Orphans are mapped to standalone audio streams.
 
 use std::path::{Path, PathBuf};
 
@@ -35,6 +35,72 @@ fn named(path: &Path, name: &str) -> bool {
     path.file_name()
         .and_then(|part| part.to_str())
         .is_some_and(|part| part.eq_ignore_ascii_case(name))
+}
+
+/// Only navigation, not copied directory names, establishes disc ownership.
+/// Inspect the adjacent DVD IFO/BUP files or Blu-ray navigation tables without
+/// reading media or traversing the disc. Once any marker is present, Phase A
+/// owns validation (including malformed/incomplete navigation failures).
+fn directory_has_marker(directory: &Path, predicate: impl Fn(&str) -> bool) -> bool {
+    let Ok(mut entries) = std::fs::read_dir(directory) else {
+        // A directory that cannot be inspected cannot establish the absence
+        // of navigation. Never turn an inaccessible authored disc into an
+        // apparently independent stream.
+        return directory.is_dir();
+    };
+    entries.any(|entry| {
+        match entry {
+            Ok(entry) => entry.file_name().to_str().is_some_and(&predicate),
+            Err(_) => true, // unreadable navigation inventory is not an orphan
+        }
+    })
+}
+
+fn bluray_markers_in(directory: &Path) -> bool {
+    directory_has_marker(directory, |name| {
+        name.eq_ignore_ascii_case("index.bdmv")
+            || name.eq_ignore_ascii_case("MovieObject.bdmv")
+    }) || directory_has_marker_in_child(directory, "PLAYLIST", "mpls")
+        || directory_has_marker_in_child(directory, "CLIPINF", "clpi")
+}
+
+fn has_bluray_navigation(bdmv: &Path) -> bool {
+    if bluray_markers_in(bdmv) { return true; }
+    // An incomplete authored disc can retain backup navigation after its
+    // primary marker was lost. Check this one standard adjacent directory.
+    let Ok(entries) = std::fs::read_dir(bdmv) else { return bdmv.is_dir(); };
+    entries.filter_map(Result::ok).any(|entry| {
+        entry.file_name().to_str().is_some_and(|name| name.eq_ignore_ascii_case("BACKUP"))
+            && bluray_markers_in(&entry.path())
+    })
+}
+
+fn directory_has_marker_in_child(bdmv: &Path, child: &str, extension: &str) -> bool {
+    // Case-insensitive lookup matches Phase A's disc layout recognition.
+    let Ok(children) = std::fs::read_dir(bdmv) else { return bdmv.is_dir(); };
+    children.filter_map(Result::ok).any(|entry| {
+        entry.file_name().to_str().is_some_and(|name| name.eq_ignore_ascii_case(child))
+            && directory_has_marker(&entry.path(), |name| {
+                name.rsplit_once('.').is_some_and(|(_, ext)| ext.eq_ignore_ascii_case(extension))
+            })
+    })
+}
+
+/// Common classifier for both discovery and the worker's launch-time check.
+/// A media-only VIDEO_TS or BDMV/STREAM copy is a standalone file, even when
+/// the copied directories retain their optical-disc names.
+pub(crate) fn has_disc_location(path: &Path) -> bool {
+    let Some(parent) = path.parent() else { return false; };
+    if named(parent, "VIDEO_TS") {
+        return directory_has_marker(parent, |name| {
+            name.rsplit_once('.').is_some_and(|(_, ext)| {
+                ext.eq_ignore_ascii_case("ifo") || ext.eq_ignore_ascii_case("bup")
+            })
+        });
+    }
+    named(parent, "STREAM") && parent.parent()
+        .filter(|bdmv| named(bdmv, "BDMV"))
+        .is_some_and(has_bluray_navigation)
 }
 
 fn locate(path: &Path) -> Result<DiscFileLocation, String> {
@@ -94,6 +160,9 @@ fn locate(path: &Path) -> Result<DiscFileLocation, String> {
 /// audio presentations. Keep the complete title/playlist and its chapter
 /// ordering: an authored program may use several transport files.
 pub fn probe_on_disc_transport(path: &Path) -> Result<DiscContents, String> {
+    if !has_disc_location(path) {
+        return super::matroska_utils::map_orphan_transport_file(path);
+    }
     match locate(path)? {
         DiscFileLocation::Bluray { root, clip_id } => {
             super::bluray_utils::map_bluray_source_for_clip(&root, &clip_id)
@@ -120,6 +189,7 @@ mod tests {
         std::fs::write(bdmv.join("playLIST/00003.MPLS"), []).unwrap();
         let clip = bdmv.join("stream/00042.M2TS");
         std::fs::write(&clip, []).unwrap();
+        assert!(has_disc_location(&clip));
         match locate(&clip).unwrap() {
             DiscFileLocation::Bluray { root, clip_id } => {
                 assert_eq!(root, temp.path().join("BluRay"));
@@ -137,6 +207,7 @@ mod tests {
         std::fs::write(video_ts.join("video_ts.ifo"), b"DVDVIDEO-VMG").unwrap();
         let vob = video_ts.join("vts_02_2.vOb");
         std::fs::write(&vob, []).unwrap();
+        assert!(has_disc_location(&vob));
         match locate(&vob).unwrap() {
             DiscFileLocation::DvdVideo { root, file_name } => {
                 assert_eq!(root, temp.path().join("DVD"));
@@ -157,6 +228,7 @@ mod tests {
         std::fs::write(audio_ts.join("AUDIO_TS.IFO"), b"DVDAUDIO-AMG").unwrap();
         let vob = video_ts.join("VTS_01_2.VOB");
         std::fs::write(&vob, vec![0u8; 2048]).unwrap();
+        assert!(has_disc_location(&vob));
 
         assert!(crate::disc::dvda_utils::is_dvda_directory(temp.path()));
         assert!(!crate::disc::dvdv_utils::is_dvdv_directory(temp.path()));
@@ -185,4 +257,53 @@ mod tests {
         assert!(is_transport_path(Path::new("VTS_01_1.vOb")));
         assert!(!is_transport_path(Path::new("song.flac")));
     }
+
+    #[test]
+    fn copied_media_only_disc_subtrees_are_orphans() {
+        let temp = tempfile::tempdir().unwrap();
+        let bluray = temp.path().join("BDMV/STREAM/00001.m2ts");
+        std::fs::create_dir_all(bluray.parent().unwrap()).unwrap();
+        std::fs::write(&bluray, b"transport stream fixture").unwrap();
+        assert!(!has_disc_location(&bluray));
+
+        let dvd = temp.path().join("VIDEO_TS/VTS_01_1.VOB");
+        std::fs::create_dir_all(dvd.parent().unwrap()).unwrap();
+        std::fs::write(&dvd, b"transport stream fixture").unwrap();
+        assert!(!has_disc_location(&dvd));
+    }
+
+    #[test]
+    fn malformed_adjacent_navigation_retains_phase_a_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let bluray = temp.path().join("BDMV/STREAM/00001.m2ts");
+        std::fs::create_dir_all(bluray.parent().unwrap()).unwrap();
+        std::fs::write(&bluray, b"not a valid playlist").unwrap();
+        let bdmv = bluray.parent().unwrap().parent().unwrap();
+        std::fs::write(bdmv.join("Index.BDMV"), b"broken navigation").unwrap();
+        assert!(has_disc_location(&bluray));
+        assert!(probe_on_disc_transport(&bluray).unwrap_err().contains("navigation"));
+        std::fs::remove_file(bdmv.join("Index.BDMV")).unwrap();
+        std::fs::create_dir_all(bdmv.join("playLIST")).unwrap();
+        std::fs::write(bdmv.join("playLIST/00001.MPLS"), b"broken playlist").unwrap();
+        assert!(has_disc_location(&bluray));
+        std::fs::remove_file(bdmv.join("playLIST/00001.MPLS")).unwrap();
+        std::fs::create_dir_all(bdmv.join("CLIPINF")).unwrap();
+        std::fs::write(bdmv.join("CLIPINF/00001.CLPI"), b"broken clip info").unwrap();
+        assert!(has_disc_location(&bluray));
+        std::fs::remove_file(bdmv.join("CLIPINF/00001.CLPI")).unwrap();
+        std::fs::create_dir_all(bdmv.join("BACKUP")).unwrap();
+        std::fs::write(bdmv.join("BACKUP/MovieObject.bdmv"), b"broken backup").unwrap();
+        assert!(has_disc_location(&bluray));
+
+        let dvd = temp.path().join("VIDEO_TS/VTS_01_1.VOB");
+        std::fs::create_dir_all(dvd.parent().unwrap()).unwrap();
+        std::fs::write(&dvd, b"not a valid title").unwrap();
+        std::fs::write(dvd.parent().unwrap().join("vts_01_0.IfO"), b"broken IFO").unwrap();
+        assert!(has_disc_location(&dvd));
+        assert!(probe_on_disc_transport(&dvd).unwrap_err().contains("IFO navigation"));
+        std::fs::remove_file(dvd.parent().unwrap().join("vts_01_0.IfO")).unwrap();
+        std::fs::write(dvd.parent().unwrap().join("VIDEO_TS.BUP"), b"broken backup").unwrap();
+        assert!(has_disc_location(&dvd));
+    }
+
 }

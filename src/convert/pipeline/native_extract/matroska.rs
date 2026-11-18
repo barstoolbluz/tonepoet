@@ -12,7 +12,7 @@ use super::*;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use crate::convert::chapter_structure::{normalize_embedded_chapters, read_embedded_chapters};
-use crate::disc::matroska_utils::map_matroska_file;
+use crate::disc::matroska_utils::{map_matroska_file, map_orphan_transport_file};
 use crate::convert::chapter_structure::EmbeddedChapterTrack;
 
 fn command(args: Vec<String>) -> ToolCommand {
@@ -33,10 +33,11 @@ fn utf8_path(path: &Path) -> Result<String, String> {
 }
 
 fn source_index(program: &NativeProgramChoice) -> Result<u32, String> {
-    let PresentationId::MatroskaStream { stream_index, .. } = program.id else {
-        return Err("The selected program is not a Matroska audio stream".into());
-    };
-    Ok(stream_index)
+    match program.id {
+        PresentationId::MatroskaStream { stream_index, .. } |
+        PresentationId::TransportStream { stream_index, .. } => Ok(stream_index),
+        _ => Err("The selected program is not a file-backed audio stream".into()),
+    }
 }
 
 fn copied_stream_tags(job: &NativeExtractionJob, program: &NativeProgramChoice) -> NativeTagValues {
@@ -120,7 +121,7 @@ fn alac_duration_bsf(source: &Path, stream_index: u32) -> Option<String> {
 fn copy_command(job: &NativeExtractionJob, program: &NativeProgramChoice,
     target: &Path) -> Result<ToolCommand, String> {
     let stream = source_index(program)?;
-    let carrier = matroska_copy_format(&program.source_codec);
+    let carrier = file_stream_copy_format(job.format, &program.source_codec);
     let mut args: Vec<String> = ["-hide_banner", "-nostdin", "-loglevel", "error", "-xerror",
         "-y"].into_iter().map(str::to_owned).collect();
     // ALAC's final-packet repair uses the source's absolute presentation end.
@@ -131,12 +132,27 @@ fn copy_command(job: &NativeExtractionJob, program: &NativeProgramChoice,
     }
     args.push("-i".into());
     args.push(utf8_path(&job.source)?);
+    // MPEG transport LPCM is framed differently from ordinary WAV PCM.
+    // FFmpeg has no packet-copy WAV muxer for it; decode losslessly at the
+    // probed source precision. Never silently downshift 24-bit source to 16.
+    let audio_codec = if job.format == DiscFormat::TransportFile &&
+        native_pcm_unpack_required(&program.source_codec) {
+        let depth = program.source_depth.ok_or_else(||
+            format!("{}: source LPCM precision is unknown", program.label))?;
+        match depth {
+            1..=16 => "pcm_s16le",
+            17..=24 => "pcm_s24le",
+            25..=32 => "pcm_s32le",
+            _ => return Err(format!("Unsupported transport LPCM precision: {depth} bits")),
+        }
+    } else { "copy" };
     args.extend(["-map".into(), format!("0:{stream}"), "-vn".into(), "-sn".into(),
-        "-dn".into(), "-c:a".into(), "copy".into(),
+        "-dn".into(), "-c:a".into(), audio_codec.into(),
         "-map_metadata".into(), "-1".into(),
         "-map_metadata:s:a:0".into(), "-1".into(),
-        // Only Matroska and MP4 carriers in this map retain chapters.
-        "-map_chapters".into(), if carrier.chapters { "0" } else { "-1" }.into()]);
+        // A loose transport file cannot supply authored chapter navigation.
+        "-map_chapters".into(),
+        if job.format == DiscFormat::Matroska && carrier.chapters { "0" } else { "-1" }.into()]);
     // MP3 Xing generation from Matroska packets can erroneously skip an
     // entire decoder frame on playback; a plain MP3 packet copy preserves
     // the original decoded samples, although encoder padding may remain.
@@ -425,8 +441,12 @@ async fn inspected_source(job: &NativeExtractionJob, cancel: &CancellationToken)
     if cancel.is_cancelled() { return Err("Extraction cancelled".into()); }
     let path = job.source.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let mapped = map_matroska_file(&path)?;
-        let chapters = read_embedded_chapters(&path)?;
+        let mapped = if crate::disc::matroska_utils::is_matroska_path(&path) {
+            map_matroska_file(&path)?
+        } else { map_orphan_transport_file(&path)? };
+        let chapters = if mapped.format == DiscFormat::Matroska {
+            read_embedded_chapters(&path)?
+        } else { Vec::new() };
         Ok::<_, String>((mapped, chapters))
     }).await.map_err(|e| format!("Matroska probe task: {e}"))??;
     if cancel.is_cancelled() { return Err("Extraction cancelled".into()); }
@@ -523,8 +543,8 @@ pub(super) async fn execute_inner(
     validate_job(&job)?;
     controls.execution_started.store(true, Ordering::Release);
     let work = native_working_storage(&job.working_root, &job.destination)?;
-    fs::create_dir_all(&work).map_err(|e| format!("Matroska working storage: {e}"))?;
-    let temp = tempfile::Builder::new().prefix("tonepoet-matroska-").tempdir_in(&work)
+    fs::create_dir_all(&work).map_err(|e| format!("File stream working storage: {e}"))?;
+    let temp = tempfile::Builder::new().prefix("tonepoet-stream-").tempdir_in(&work)
         .map_err(|e| format!("Private Matroska storage: {e}"))?;
     let runner = RealToolRunner::new(HashMap::new()).with_native_pause(controls.tool_pause());
     let initial_metadata = fs::metadata(&job.source)
@@ -551,7 +571,7 @@ pub(super) async fn execute_inner(
             estimated_bytes_skipped: bytes_skipped, estimated_bytes_published: bytes_published,
             estimated_bytes_total });
     };
-    emit("Inspecting selected Matroska audio streams".into(), None, None,
+    emit("Inspecting selected file audio streams".into(), None, None,
         done, skipped, &published, bytes_done, bytes_skipped, bytes_published);
 
     for (pi, program) in job.programs.iter().enumerate() {
@@ -560,11 +580,16 @@ pub(super) async fn execute_inner(
             .ok_or_else(|| format!("{}: stream/chapter inventory changed since selection", program.label))?;
         if program.source_rate.is_some_and(|rate| Some(rate) != presentation.format.sample_rate)
             || program.source_channels.is_some_and(|channels| Some(channels) != presentation.format.channels)
-            || presentation.format.codec.as_deref().unwrap_or("unknown") != program.source_codec.as_str() {
+            || presentation.format.codec.as_deref().unwrap_or("unknown") != program.source_codec.as_str()
+            || (job.format == DiscFormat::TransportFile &&
+                native_pcm_unpack_required(&program.source_codec) &&
+                presentation.format.bit_depth != program.source_depth) {
             return Err(format!("{}: source audio format changed since selection",program.label));
         }
-        let PresentationId::MatroskaStream { chapter_count, .. } = program.id else {
-            return Err("Non-Matroska program in Matroska job".into());
+        let chapter_count = match program.id {
+            PresentationId::MatroskaStream { chapter_count, .. } => chapter_count,
+            PresentationId::TransportStream { .. } => 0,
+            _ => return Err("Non-file-stream program in file-stream job".into()),
         };
         let copy = job.file_per_program || chapter_count == 0;
         let group_target = proposed_destination_for_program(&job, program);
@@ -590,7 +615,7 @@ pub(super) async fn execute_inner(
             if fs::symlink_metadata(&target).is_ok() && job.overwrite_policy == NativeOverwritePolicy::Fail {
                 return Err(format!("Destination already exists: {}", target.display()));
             }
-            let carrier = matroska_copy_format(&program.source_codec);
+            let carrier = file_stream_copy_format(job.format, &program.source_codec);
             let complete = temp.path().join(format!("stream-{pi}.{}", carrier.extension));
             controls.watch_file(complete.clone(), format!("Copying {}", program.label),
                 Some(expected), false);
@@ -598,10 +623,10 @@ pub(super) async fn execute_inner(
                 Some(expected), done, skipped, &published, bytes_done, bytes_skipped, bytes_published);
             let result: Result<(), String> = async {
                 runner.run(copy_command(&job, program, &complete)?, &item)
-                    .await.map_err(|e| format!("Matroska stream copy: {e}"))?;
+                    .await.map_err(|e| format!("Native audio stream extraction: {e}"))?;
                 controls.wait_ready(&cancel, &item).await?;
                 let output = fs::metadata(&complete).map_err(|e| format!("Copied stream missing: {e}"))?;
-                if output.len() < 64 { return Err("Matroska copy produced no usable stream".into()); }
+                if output.len() < 64 { return Err("Audio stream extraction produced no usable file".into()); }
                 // Native FLAC pictures and MP3 ID3 APIC cannot use the
                 // Matroska -attach path. Embed only an explicitly selected
                 // cover, on the completed private copy before publication.
@@ -1869,4 +1894,174 @@ mod tests {
                 "ALAC fallback must retain authored chapter markers");
         }
     }
+
+    #[test]
+    fn standalone_transport_replace_must_never_overwrite_its_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut job = super::super::tests::fixture_job(&temp.path().join("destination"), temp.path());
+        job.format = DiscFormat::TransportFile;
+        job.file_per_program = true;
+        job.cue = false;
+        job.programs[0].id = PresentationId::TransportStream {
+            stream_index: 0, audio_ordinal: 1,
+        };
+        job.programs[0].tracks.truncate(1);
+        job.programs[0].source_codec = "ac3".into();
+        job.overwrite_policy = NativeOverwritePolicy::Replace;
+        let output = proposed_destination_for_program(&job, &job.programs[0]);
+        fs::create_dir_all(output.parent().unwrap()).unwrap();
+        job.source = temp.path().join("orphan.m2ts");
+        fs::write(&job.source, b"source data must survive").unwrap();
+        // On a filesystem without symlinks the same-source canonical test
+        // cannot be exercised; ordinary output-path validation remains intact.
+        #[cfg(unix)] {
+            std::os::unix::fs::symlink(&job.source, &output).unwrap();
+            let error = validate_job(&job).unwrap_err();
+            assert!(error.contains("own input"), "{error}");
+            assert_eq!(fs::read(&job.source).unwrap().as_slice(), b"source data must survive");
+        }
+    }
+
+    #[test]
+    fn orphan_transport_copy_commands_are_chapterless_and_stream_specific() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut job = super::super::tests::fixture_job(temp.path(), temp.path());
+        job.format = DiscFormat::TransportFile;
+        job.file_per_program = true;
+        job.cue = false;
+        job.source = temp.path().join("orphan.M2TS");
+        let mut program = job.programs[0].clone();
+        program.id = PresentationId::TransportStream { stream_index: 3, audio_ordinal: 2 };
+        program.source_codec = "ac3".into();
+        let args = copy_command(&job, &program, &temp.path().join("stream.ac3")).unwrap().args;
+        assert!(args.windows(2).any(|words| words == ["-map", "0:3"]));
+        assert!(args.windows(2).any(|words| words == ["-c:a", "copy"]));
+        assert!(args.windows(2).any(|words| words == ["-map_chapters", "-1"]));
+        assert!(args.windows(2).any(|words| words == ["-f", "ac3"]));
+        // The new LPCM WAV rule must not change Phase B's Matroska
+        // packet-copy carrier mapping for this unusual codec.
+        assert_eq!(matroska_copy_format("pcm_dvd").extension, "mka");
+        assert_eq!(file_stream_copy_format(DiscFormat::TransportFile, "pcm_dvd").extension, "wav");
+        program.source_codec = "pcm_dvd".into();
+        program.source_depth = Some(16);
+        let args = copy_command(&job, &program, &temp.path().join("stream.wav")).unwrap().args;
+        assert!(args.windows(2).any(|words| words == ["-c:a", "pcm_s16le"]));
+        assert!(args.windows(2).any(|words| words == ["-rf64", "auto"]));
+        program.source_depth = None;
+        assert!(copy_command(&job, &program, &temp.path().join("stream.wav")).is_err());
+    }
+
+    #[tokio::test]
+    async fn orphan_m2ts_vob_two_streams_publish_only_requested_native_audio() {
+        use std::process::Command;
+        if Command::new("ffmpeg").arg("-version").output().is_err() { return; }
+        let temp = tempfile::tempdir().unwrap();
+        for (label, file, muxer) in [
+            ("flat-m2ts", "orphan.m2ts", "mpegts"),
+            ("flat-vob", "orphan.vob", "vob"),
+            ("copied-m2ts", "BDMV/STREAM/00001.m2ts", "mpegts"),
+            ("copied-vob", "VIDEO_TS/VTS_01_1.vob", "vob"),
+        ] {
+            let source = temp.path().join(file);
+            fs::create_dir_all(source.parent().unwrap()).unwrap();
+            let generated = Command::new("ffmpeg").args([
+                "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "sine=frequency=440:duration=0.4:sample_rate=48000",
+                "-f", "lavfi", "-i", "sine=frequency=660:duration=0.4:sample_rate=48000",
+                "-map", "0:a:0", "-map", "1:a:0", "-c:a", "ac3", "-b:a", "192k", "-f", muxer,
+            ]).arg(&source).output().unwrap();
+            assert!(generated.status.success(), "fixture: {}",
+                String::from_utf8_lossy(&generated.stderr));
+            let original = fs::read(&source).unwrap();
+            assert!(!crate::disc::on_disc_transport::has_disc_location(&source));
+            let contents = crate::tui::disc_browser::probe_disc_contents(&source).unwrap();
+            assert!(contents.diagnostics.iter().any(|d| d.message.contains("No chapters found")));
+            let mut state = crate::tui::disc_browser::DiscBrowserState::new(contents, source.clone());
+            state.tags = false;
+            state.extraction_log = false;
+            state.destination = temp.path().join(format!("out-{label}"));
+            let job = state.native_job(temp.path().join("scratch"));
+            assert_eq!(job.format, DiscFormat::TransportFile);
+            assert_eq!(job.programs.len(), 2);
+            assert!(job.file_per_program);
+            validate_job(&job).unwrap();
+            let report = execute_with_controls(job.clone(), CancellationToken::new(),
+                Arc::new(NativeExtractionControl::default()), |_| {}).await.unwrap();
+            assert_eq!(report.published.len(), 2);
+            assert_eq!(report.skipped, 0);
+            assert_eq!(fs::read(&source).unwrap(), original);
+            // No unrequested CUE, log, marker or staging file is allowed in
+            // the destination. Count the recursively published leaf files.
+            let leaves = report.published.iter().map(|p| p.canonicalize().unwrap())
+                .collect::<std::collections::HashSet<_>>();
+            let mut directories = vec![job.destination.clone()];
+            let mut on_disk = std::collections::HashSet::new();
+            while let Some(dir) = directories.pop() {
+                for entry in fs::read_dir(dir).unwrap() {
+                    let entry = entry.unwrap();
+                    if entry.file_type().unwrap().is_dir() { directories.push(entry.path()); }
+                    else { on_disk.insert(entry.path().canonicalize().unwrap()); }
+                }
+            }
+            assert_eq!(on_disk, leaves);
+            for (index, copied) in report.published.iter().enumerate() {
+                assert_eq!(copied.extension().and_then(|e|e.to_str()), Some("ac3"));
+                let reference = temp.path().join(format!("reference-{label}-{index}.ac3"));
+                let copied_cmd = Command::new("ffmpeg").args([
+                    "-hide_banner", "-nostdin", "-loglevel", "error", "-xerror", "-y",
+                    "-i",
+                ]).arg(&source).args([
+                    "-map", &format!("0:{index}"), "-vn", "-sn", "-dn", "-c:a", "copy",
+                    "-map_metadata", "-1", "-map_metadata:s:a:0", "-1", "-map_chapters", "-1",
+                    "-f", "ac3",
+                ]).arg(&reference).output().unwrap();
+                assert!(copied_cmd.status.success(), "reference copy: {}",
+                    String::from_utf8_lossy(&copied_cmd.stderr));
+                assert_eq!(fs::read(copied).unwrap(), fs::read(reference).unwrap());
+            }
+            let mut skip = job.clone();
+            skip.overwrite_policy = NativeOverwritePolicy::Skip;
+            let second = execute_with_controls(skip, CancellationToken::new(),
+                Arc::new(NativeExtractionControl::default()), |_| {}).await.unwrap();
+            assert_eq!(second.published.len(), 0);
+            assert_eq!(second.skipped, 2);
+            assert_eq!(fs::read(&source).unwrap(), original);
+        }
+    }
+
+    #[tokio::test]
+    async fn orphan_vob_lpcm_unpacks_without_losing_decoded_samples() {
+        use std::process::Command;
+        if Command::new("ffmpeg").arg("-version").output().is_err() { return; }
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("orphan.vob");
+        let generated = Command::new("ffmpeg").args([
+            "-hide_banner", "-nostdin", "-loglevel", "error", "-y", "-f", "lavfi",
+            "-i", "sine=frequency=750:duration=0.6:sample_rate=48000",
+            "-c:a", "pcm_dvd", "-f", "vob",
+        ]).arg(&source).output().unwrap();
+        assert!(generated.status.success());
+        let contents = crate::tui::disc_browser::probe_disc_contents(&source).unwrap();
+        assert_eq!(contents.presentations[0].format.codec.as_deref(), Some("pcm_dvd"));
+        assert_eq!(contents.presentations[0].format.bit_depth, Some(16));
+        let mut state = crate::tui::disc_browser::DiscBrowserState::new(contents, source.clone());
+        state.tags = false;
+        state.destination = temp.path().join("pcm-output");
+        let report = execute_with_controls(state.native_job(temp.path().join("scratch")),
+            CancellationToken::new(), Arc::new(NativeExtractionControl::default()), |_| {}).await.unwrap();
+        assert_eq!(report.published.len(), 1);
+        assert_eq!(report.published[0].extension().and_then(|ext|ext.to_str()), Some("wav"));
+        let mut pcm = Vec::new();
+        for path in [&source, &report.published[0]] {
+            let decoded = Command::new("ffmpeg").args([
+                "-hide_banner", "-nostdin", "-loglevel", "error", "-i",
+            ]).arg(path).args(["-map", "0:a:0", "-f", "s16le", "-"]).output().unwrap();
+            assert!(decoded.status.success(), "decode: {}",
+                String::from_utf8_lossy(&decoded.stderr));
+            pcm.push(decoded.stdout);
+        }
+        assert!(!pcm[0].is_empty());
+        assert_eq!(pcm[0], pcm[1]);
+    }
+
 }

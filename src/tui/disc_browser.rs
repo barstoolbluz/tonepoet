@@ -381,7 +381,7 @@ impl DiscBrowserState {
             p.extract.ineligible_reason.is_none()
                 && !matches!(p.id, PresentationId::BluRayTitle { display_angle, .. } if display_angle.get() != 1)
                 && match contents.format {
-                DiscFormat::Sacd | DiscFormat::DvdAudio | DiscFormat::Matroska => true,
+                DiscFormat::Sacd | DiscFormat::DvdAudio | DiscFormat::Matroska | DiscFormat::TransportFile => true,
                 DiscFormat::DvdVideo | DiscFormat::BluRay =>
                     (0..index).all(|earlier| contents.presentations[earlier].extract.ineligible_reason.is_some()),
             }
@@ -397,11 +397,12 @@ impl DiscBrowserState {
                     if display_angle.get() != 1)
                 && (
                 matches!(contents.format, DiscFormat::DvdVideo | DiscFormat::BluRay)
-                || (contents.format != DiscFormat::Sacd && contents.format != DiscFormat::Matroska && p.format.lossless
+                || (contents.format != DiscFormat::Sacd && !matches!(contents.format,
+                    DiscFormat::Matroska | DiscFormat::TransportFile) && p.format.lossless
                     && p.format.bit_depth.is_none())
             ) { None } else { Some(Ok(Default::default())) }
         }).collect();
-        let is_matroska = contents.format == DiscFormat::Matroska;
+        let file_backed = matches!(contents.format, DiscFormat::Matroska | DiscFormat::TransportFile);
         let mut state = Self {
             contents,
             cursor: 0,
@@ -456,7 +457,7 @@ impl DiscBrowserState {
             downmix: crate::convert::pipeline::DvdaDownmixPolicy::None,
             // MKV/MKA defaults to an unchanged audio-packet copy. Choosing
             // split chapters explicitly changes the result to decoded WAV.
-            file_per_program: is_matroska,
+            file_per_program: file_backed,
             cue: false,
             dvda_group_preset: 0,
             probe_id: NEXT_EXTRACT_PROBE_ID.fetch_add(1, Ordering::Relaxed),
@@ -581,6 +582,9 @@ impl DiscBrowserState {
     }
 
     fn native_item_payload_bytes(&self, p: &DiscPresentation, track: &DiscTrack) -> Option<u64> {
+        if self.contents.format == DiscFormat::TransportFile {
+            return p.extract.transport_audio_bytes;
+        }
         if self.contents.format == DiscFormat::Matroska {
             if self.file_per_program || matches!(p.id,
                 PresentationId::MatroskaStream { chapter_count: 0, .. }) {
@@ -647,6 +651,11 @@ impl DiscBrowserState {
 
     fn native_bytes_with_allowance(&self, total: u64, largest: u64, largest_program: u64, items: usize) -> u64 {
         let allowance = (items as u64).saturating_mul(128 * 1024);
+        if self.contents.format == DiscFormat::TransportFile {
+            // One private audio stream and one publication temporary are live
+            // with already completed files; never reserve decoded PCM joins.
+            return total.saturating_add(largest).saturating_add(allowance);
+        }
         if self.contents.format == DiscFormat::Sacd {
             let payload = if self.file_per_program { total.saturating_mul(2) } else { total };
             return payload.saturating_add(allowance);
@@ -705,6 +714,46 @@ impl DiscBrowserState {
         })
     }
 
+    /// Standalone M2TS/VOB copies publish one selected stream at a time.
+    /// A private audio file and a same-size destination publication temporary
+    /// coexist; completed outputs stay at the destination. Previously
+    /// replaced files are released only after their new output is published.
+    /// This deliberately does not change Matroska's chapter-spool budget.
+    fn transport_space_budget(&self, key: &NativeSpaceKey) -> NativeSpaceCache {
+        use crate::convert::pipeline::native_extract::NativeOverwritePolicy;
+        let mut completed_delta = 0i128;
+        let mut shared_peak = 0i128;
+        let mut destination_peak = 0i128;
+        let mut working_peak = 0u64;
+        for output in &key.outputs {
+            let existing = if key.overwrite == NativeOverwritePolicy::Fail { None }
+                else { fs::symlink_metadata(&output.path).ok() };
+            if key.overwrite == NativeOverwritePolicy::Skip && existing.is_some() { continue; }
+            // Bitrate/duration can round at stream boundaries and remuxed
+            // carriers contain headers. Leave modest headroom for both.
+            let bytes = output.audio_bytes.saturating_add(output.audio_bytes / 8)
+                .saturating_add(128 * 1024);
+            let prior = existing.filter(|m| m.is_file()).map_or(0, |m| m.len());
+            shared_peak = shared_peak.max(completed_delta + 2 * i128::from(bytes));
+            destination_peak = destination_peak.max(completed_delta + i128::from(bytes));
+            working_peak = working_peak.max(bytes);
+            completed_delta += i128::from(bytes) - i128::from(prior);
+            shared_peak = shared_peak.max(completed_delta);
+            destination_peak = destination_peak.max(completed_delta);
+        }
+        // Per-program logs are still requested when every audio output is skipped.
+        let logs = if key.extraction_log {
+            (key.outputs.len() as u64).saturating_mul(128 * 1024)
+        } else { 0 };
+        let positive = |n: i128| n.max(0).min(i128::from(u64::MAX)) as u64;
+        NativeSpaceCache {
+            key: key.clone(),
+            required: positive(shared_peak).saturating_add(logs),
+            destination_required: positive(destination_peak).saturating_add(logs),
+            working_required: working_peak.saturating_add(logs),
+        }
+    }
+
     /// Budget for a shared filesystem; the same cached inventory also
     /// produces separate working/destination budgets for cross-volume output.
     /// Skip excludes untouched targets. Replace budgets the
@@ -719,6 +768,12 @@ impl DiscBrowserState {
             if let Some(cache) = self.native_space_cache.borrow().as_ref() {
                 if cache.key == key { return Some(cache.required); }
             }
+        }
+        if key.format == DiscFormat::TransportFile {
+            let budget = self.transport_space_budget(&key);
+            let needed = budget.required;
+            *self.native_space_cache.borrow_mut() = Some(budget);
+            return Some(needed);
         }
         // An already discovered cover is known additional DSF ID3 payload.
         // Other materializer-provided art is not available until media prep.
@@ -886,7 +941,7 @@ impl DiscBrowserState {
     pub fn set_item_checked(&mut self, index: usize, checked: bool) {
         // A copied Matroska stream is indivisible. Chapter checkboxes are
         // meaningful only after switching Files to split-chapters mode.
-        if self.contents.format == DiscFormat::Matroska && self.file_per_program { return; }
+        if matches!(self.contents.format, DiscFormat::Matroska | DiscFormat::TransportFile) && self.file_per_program { return; }
         if index >= self.contents.presentations.get(self.cursor).map_or(0, |p| p.tracks.len()) {
             return;
         }
@@ -982,7 +1037,7 @@ impl DiscBrowserState {
         }
         rows.extend(["Files", "Tags", "Log"]);
         if self.file_per_program && (self.matroska_cue_available() ||
-            !matches!(self.contents.format, DiscFormat::Sacd | DiscFormat::Matroska)) {
+            !matches!(self.contents.format, DiscFormat::Sacd | DiscFormat::Matroska | DiscFormat::TransportFile)) {
             rows.push("CUE");
         }
         rows.extend(["Folder", "Naming"]);
@@ -1055,7 +1110,7 @@ impl DiscBrowserState {
     }
 
     pub fn tag_source_label(&self, index: usize) -> &'static str {
-        if self.contents.format == DiscFormat::Matroska {
+        if matches!(self.contents.format, DiscFormat::Matroska | DiscFormat::TransportFile) {
             return match index {
                 0 => "Container tags, then stream tags",
                 1 => "Stream tags, then container tags",
@@ -1086,7 +1141,7 @@ impl DiscBrowserState {
         // Disc metadata editors operate on ISO/folder sources and have no
         // Matroska target. Do not offer actions that silently do nothing or
         // mutate the user's input file through a side route.
-        if self.contents.format == DiscFormat::Matroska {
+        if matches!(self.contents.format, DiscFormat::Matroska | DiscFormat::TransportFile) {
             controls.push(C::Done);
         } else {
             controls.extend([C::EditValues, C::MusicBrainz, C::Done]);
@@ -1098,7 +1153,7 @@ impl DiscBrowserState {
     /// never the highlighted individual track's title. An authored PCM track
     /// is not known until preparation; don't present navigation as written tags.
     pub fn tag_preview_is_pending(&self) -> bool {
-        !matches!(self.contents.format, DiscFormat::Sacd | DiscFormat::Matroska)
+        !matches!(self.contents.format, DiscFormat::Sacd | DiscFormat::Matroska | DiscFormat::TransportFile)
             && self.tag_source != crate::convert::pipeline::native_extract::NativeTagSource::DiscAndSidecar
     }
 
@@ -1107,7 +1162,7 @@ impl DiscBrowserState {
         let Some(p) = self.contents.presentations.get(self.cursor) else { return NativeTagValues::default(); };
         let Some(program) = self.native_program_choice(self.cursor, p, Some(self.item_cursor))
             else { return NativeTagValues::default(); };
-        if self.contents.format == DiscFormat::Matroska {
+        if matches!(self.contents.format, DiscFormat::Matroska | DiscFormat::TransportFile) {
             use crate::convert::pipeline::native_extract::NativeTagSource;
             let authored = program.authored_tags.as_ref().map(|values| values.album.clone())
                 .unwrap_or_default();
@@ -1329,7 +1384,15 @@ impl DiscBrowserState {
         if self.tag_refresh_failed {
             problems.push("Saved tags could not be refreshed; reopen Extract before extracting".into());
         }
-        if self.selected_item_count() == 0 { problems.push("Check at least one extractable track or chapter".into()); }
+        if self.selected_item_count() == 0 { problems.push("Check at least one extractable audio selection".into()); }
+        if self.contents.format == DiscFormat::TransportFile &&
+            self.contents.presentations.iter().enumerate().any(|(i, presentation)| {
+                self.selected.get(i) == Some(&true)
+                    && matches!(presentation.format.codec.as_deref(), Some("pcm_dvd" | "pcm_bluray"))
+                    && presentation.format.bit_depth.is_none()
+            }) {
+            problems.push("Transport LPCM source precision is unknown; cannot choose a lossless WAV output".into());
+        }
         if self.selected.iter().enumerate().any(|(i,checked)| *checked && !self.is_extractable(i)) {
             problems.push("One or more checked programs cannot be extracted".into());
         }
@@ -1391,7 +1454,7 @@ impl DiscBrowserState {
                 } else if refresh {
                     problems.push("Cannot inspect destination or working-storage filesystem".into());
                 }
-            } else {
+            } else if self.contents.format != DiscFormat::TransportFile {
                 problems.push("Source size pending: selected duration/rate/depth is not yet known".into());
             }
         }
@@ -1433,7 +1496,7 @@ impl DiscBrowserState {
                     tags_to_native(if mb_only { sidecar }
                         else if sidecar_first { sidecar.prioritized(&authored) }
                         else { authored.prioritized(&sidecar) })
-                } else if self.contents.format == DiscFormat::Matroska {
+                } else if matches!(self.contents.format, DiscFormat::Matroska | DiscFormat::TransportFile) {
                     tags_to_native(p.extract.authored_track_tags.get(j).cloned().unwrap_or_default())
                 } else { NativeTagValues {
                     title: if matches!(self.contents.format, DiscFormat::DvdVideo | DiscFormat::BluRay) {
@@ -1508,7 +1571,7 @@ impl DiscBrowserState {
             overwrite_policy:self.overwrite_policy, extraction_log:self.extraction_log,
             program_log_paths:Vec::new(), round4_layout:true,
             file_per_program:self.file_per_program, cue:self.cue && (self.contents.format != DiscFormat::Matroska ||
-                self.matroska_cue_available()),
+                self.matroska_cue_available()) && self.contents.format != DiscFormat::TransportFile,
             transfer_tags:self.tags && self.native_tags_available(),
             sacd_dff:self.sacd_dff,
             tag_source:self.tag_source,
@@ -2138,6 +2201,7 @@ pub fn source_info_for_presentation(
             DiscFormat::DvdVideo => "DVD-Video".to_string(),
             DiscFormat::BluRay => "Blu-ray".to_string(),
             DiscFormat::Matroska => "Matroska".to_string(),
+            DiscFormat::TransportFile => "Standalone M2TS/VOB".to_string(),
         },
         codec: fmt.codec.clone().unwrap_or_else(|| presentation.label.clone()),
         bit_depth: fmt.bit_depth,
@@ -2190,9 +2254,9 @@ pub fn presentation_id_supports_stream_conversion(id: &PresentationId) -> bool {
         | PresentationId::DvdVideoTitle { .. }
         | PresentationId::SacdArea(_)
         | PresentationId::BluRayTitle { .. } => true,
-        // Convert already admits MKV/MKA by ordinary file path; the disc
-        // presentation-selection bridge has no Matroska stream selector.
-        PresentationId::MatroskaStream { .. } => false,
+        // File audio streams use the Extract worker; Convert has no per-stream
+        // selector for either Matroska or standalone MPEG transports.
+        PresentationId::MatroskaStream { .. } | PresentationId::TransportStream { .. } => false,
     }
 }
 
@@ -2254,9 +2318,9 @@ pub fn apply_presentation_to_source_options(
             options.bluray_angle = Some(display_angle.get());
             true
         }
-        // The ordinary Matroska file source is already handled by Convert;
-        // its per-stream selector is local to the Extract worker.
-        PresentationId::MatroskaStream { .. } => false,
+        // File-backed audio stream selection belongs to the Extract worker,
+        // not the authored-disc conversion SourceOptions bridge.
+        PresentationId::MatroskaStream { .. } | PresentationId::TransportStream { .. } => false,
     }
 }
 
@@ -3419,5 +3483,91 @@ mod disc_selection_bridge_tests {
         assert_eq!(options.bluray_audio_pid, Some(0x1100));
         assert_eq!(options.bluray_audio_stream, Some(0));
         assert_eq!(options.bluray_angle, Some(2));
+    }
+}
+
+#[cfg(test)]
+mod transport_space_budget_tests {
+    use super::*;
+    use crate::convert::pipeline::native_extract::{
+        proposed_destination_for_program, NativeOverwritePolicy,
+    };
+
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+
+    fn state_with_three_streams(temp: &Path) -> DiscBrowserState {
+        use super::disc_selection_bridge_tests::disc_contents;
+        let source = temp.join("video-heavy.m2ts");
+        // Sparse video payload must not be budgeted as a selected audio copy.
+        fs::File::create(&source).unwrap().set_len(30 * GIB).unwrap();
+        let mut contents = disc_contents(DiscFormat::TransportFile,
+            PresentationId::TransportStream { stream_index: 1, audio_ordinal: 1 }, "Audio 1");
+        contents.presentations[0].format.codec = Some("ac3".into());
+        contents.presentations[0].extract.transport_audio_bytes = Some(100 * MIB);
+        for (index, size) in [(2, 20 * MIB), (3, 150 * MIB)] {
+            let mut extra = contents.presentations[0].clone();
+            extra.id = PresentationId::TransportStream {
+                stream_index: index, audio_ordinal: index,
+            };
+            extra.extract.transport_audio_bytes = Some(size);
+            extra.label = format!("Audio {index}");
+            contents.presentations.push(extra);
+        }
+        let mut state = DiscBrowserState::new(contents, source);
+        state.destination = temp.join("output");
+        state.tags = false;
+        state.tag_artwork = false;
+        state.extraction_log = false;
+        state.selected[2] = false;
+        state
+    }
+
+    #[test]
+    fn video_heavy_transport_reserves_audio_copy_and_publication_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = state_with_three_streams(temp.path());
+        assert!(state.file_per_program);
+        assert_eq!(state.selected_item_bytes().unwrap().0, 120 * MIB);
+        let needed = state.native_required_volume_bytes(true).unwrap();
+        assert!(needed > 200 * MIB, "one private and one publication copy must fit");
+        assert!(needed < 300 * MIB, "video bytes must not be copied: {needed}");
+        let (destination, working) = state.native_split_volume_bytes(false).unwrap();
+        assert!(destination >= 120 * MIB && destination < 150 * MIB);
+        assert!(working >= 100 * MIB && working < 150 * MIB);
+
+        state.selected[2] = true;
+        assert_eq!(state.selected_item_bytes().unwrap().0, 270 * MIB);
+        let with_third = state.native_required_volume_bytes(true).unwrap();
+        assert!(with_third > needed, "adding a selected stream changes the reserve");
+        state.selected[2] = false;
+
+        let job = state.native_job(temp.path().join("scratch"));
+        let first = proposed_destination_for_program(&job, &job.programs[0]);
+        fs::create_dir_all(first.parent().unwrap()).unwrap();
+        fs::File::create(&first).unwrap().set_len(100 * MIB).unwrap();
+        state.overwrite_policy = NativeOverwritePolicy::Skip;
+        let skip = state.native_required_volume_bytes(true).unwrap();
+        assert!(skip > 40 * MIB && skip < 60 * MIB, "only audio 2 remains: {skip}");
+        state.overwrite_policy = NativeOverwritePolicy::Replace;
+        let replace = state.native_required_volume_bytes(true).unwrap();
+        assert!(replace > skip && replace <= needed,
+            "replacement reserves a new private copy but not another video: {replace}");
+        state.selected[1] = false;
+        state.overwrite_policy = NativeOverwritePolicy::Skip;
+        assert_eq!(state.native_required_volume_bytes(true), Some(0));
+    }
+
+    #[test]
+    fn unknown_transport_audio_size_does_not_block_extraction() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = state_with_three_streams(temp.path());
+        state.selected[1] = false;
+        state.contents.presentations[0].extract.transport_audio_bytes = None;
+        assert!(state.selected_item_bytes().is_none());
+        assert!(state.native_required_volume_bytes(true).is_none());
+        let blockers = state.blockers_with_capacity_refresh(temp.path(), true);
+        assert!(!blockers.iter().any(|blocker| blocker.contains("Source size pending")
+            || blocker.contains("filesystem needs")), "{blockers:?}");
     }
 }

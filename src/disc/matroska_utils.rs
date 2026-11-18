@@ -1,9 +1,10 @@
-//! File-backed Matroska presentation mapper for #91 Phase B.
+//! File-backed audio stream mapping for Matroska and orphan MPEG transports.
 //!
 //! A media stream is one independently selectable presentation. A Matroska
 //! chapter table is shared by the file, not owned by one audio stream; the
 //! chapter boundaries are normalized against each stream's own sample clock.
 //! Neither this probe nor the Browse menu decodes media or creates files.
+//! Orphaned M2TS/VOB files have no disc navigation: they expose only whole streams.
 
 use std::path::Path;
 
@@ -61,30 +62,80 @@ fn stream_duration(duration: i64, num: i32, den: i32) -> Option<f64> {
         .filter(|value| value.is_finite() && *value > 0.0)
 }
 
-/// Map exactly the audio streams and (if structurally valid) their chapters.
-/// A malformed chapter table does not discard valid whole-stream copy: it is
-/// surfaced as a warning, and only the whole-stream selection is exposed.
+/// Estimate the audio *output*, never the video-bearing transport file. Use
+/// the audio stream's own duration, not the container's potentially longer
+/// video duration. VBR and unknown-rate streams remain unbudgeted; the worker
+/// handles a real disk-full error rather than an invented hard blocker.
+fn transport_audio_bytes(codec: &str, duration: Option<f64>, bit_rate: i64,
+    sample_rate: Option<u32>, channels: Option<u8>, bit_depth: Option<u32>) -> Option<u64> {
+    let duration = duration?;
+    let bytes_per_second = if matches!(codec, "pcm_dvd" | "pcm_bluray") {
+        let depth = bit_depth?;
+        if !(1..=32).contains(&depth) { return None; }
+        f64::from(sample_rate?) * f64::from(channels?) * f64::from(depth.div_ceil(8))
+    } else if matches!(codec, "ac3" | "mp2") && bit_rate > 0 {
+        bit_rate as f64 / 8.0
+    } else { return None; };
+    let bytes = duration * bytes_per_second;
+    (bytes.is_finite() && bytes > 0.0 && bytes <= u64::MAX as f64)
+        .then_some(bytes.ceil() as u64)
+}
+
+/// Map exactly the Matroska audio streams and their validated chapters.
+/// A malformed chapter table does not discard a valid whole-stream copy.
 pub fn map_matroska_file(path: &Path) -> Result<DiscContents, String> {
-    if !is_matroska_path(path) || !path.is_file() {
-        return Err(format!("Not a regular MKV/MKA file: {}", path.display()));
+    map_file_streams(path, FileStreamKind::Matroska)
+}
+
+/// A transport outside authored Blu-ray/DVD-Video navigation has independent
+/// audio streams, but no trustworthy chapter boundaries. Never invent them
+/// from timestamps, stream duration or MPEG packet boundaries.
+pub(crate) fn map_orphan_transport_file(path: &Path) -> Result<DiscContents, String> {
+    map_file_streams(path, FileStreamKind::OrphanTransport)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FileStreamKind { Matroska, OrphanTransport }
+
+fn map_file_streams(path: &Path, kind: FileStreamKind) -> Result<DiscContents, String> {
+    let supported = match kind {
+        FileStreamKind::Matroska => is_matroska_path(path),
+        FileStreamKind::OrphanTransport => super::on_disc_transport::is_transport_path(path)
+            && !super::on_disc_transport::has_disc_location(path),
+    };
+    if !supported || !path.is_file() {
+        return Err(format!("Not a regular supported standalone media file: {}", path.display()));
     }
-    let raw_chapters = read_embedded_chapters(path)?;
+    let raw_chapters = if kind == FileStreamKind::Matroska {
+        read_embedded_chapters(path)?
+    } else { Vec::new() };
     let input = ffmpeg_next::format::input(path)
-        .map_err(|error| format!("Cannot inspect Matroska streams in '{}': {error}", path.display()))?;
+        .map_err(|error| format!("Cannot inspect audio streams in '{}': {error}", path.display()))?;
     let metadata = input.metadata();
     let tags = disc_tags(&metadata);
     let container_duration = stream_duration(input.duration(), 1, 1_000_000);
     let mut presentations = Vec::new();
     let mut diagnostics = Vec::new();
+    if kind == FileStreamKind::OrphanTransport {
+        diagnostics.push(DiscDiagnostic {
+            severity: DiagnosticSeverity::Info, scope: DiagnosticScope::Disc,
+            message: "No chapters found: this standalone file lacks Blu-ray/DVD-Video navigation; only complete audio streams can be extracted".into(),
+        });
+    }
 
     for stream in input.streams().filter(|s| s.parameters().medium() == ffmpeg_next::media::Type::Audio) {
         let stream_index = u32::try_from(stream.index())
             .map_err(|_| "Matroska stream index exceeds u32".to_string())?;
         let audio_ordinal = u32::try_from(presentations.len() + 1)
             .map_err(|_| "Matroska audio stream count exceeds u32".to_string())?;
-        let id = PresentationId::MatroskaStream {
-            stream_index, audio_ordinal,
-            chapter_count: 0, // finalized after per-stream chapter normalization
+        let id = match kind {
+            FileStreamKind::Matroska => PresentationId::MatroskaStream {
+                stream_index, audio_ordinal,
+                chapter_count: 0, // finalized after per-stream chapter normalization
+            },
+            FileStreamKind::OrphanTransport => PresentationId::TransportStream {
+                stream_index, audio_ordinal,
+            },
         };
         // An unknown or unsupported decoder must not prevent a byte-exact
         // packet copy. The elementary codec ID belongs to stream parameters;
@@ -94,9 +145,9 @@ pub fn map_matroska_file(path: &Path) -> Result<DiscContents, String> {
         // Codec parameters carry the original integer precision for FLAC and
         // other lossless compressed streams. Decoder sample_fmt can be s32 for
         // both 16- and 24-bit inputs; it is not the source bit depth.
-        let (declared_depth, profile) = unsafe {
+        let (declared_depth, profile, bit_rate) = unsafe {
             let p = params.as_ptr();
-            ((*p).bits_per_raw_sample, (*p).profile)
+            ((*p).bits_per_raw_sample, (*p).profile, (*p).bit_rate)
         };
         let decoded_info = ffmpeg_next::codec::context::Context::from_parameters(params)
             .ok().and_then(|context| context.decoder().audio().ok());
@@ -148,17 +199,21 @@ pub fn map_matroska_file(path: &Path) -> Result<DiscContents, String> {
                 Vec::new()
             }
         };
-        let id = PresentationId::MatroskaStream {
-            stream_index, audio_ordinal,
-            chapter_count: u32::try_from(chapters.len())
-                .map_err(|_| "Matroska chapter count exceeds u32".to_string())?,
-        };
+        let id = if kind == FileStreamKind::Matroska {
+            PresentationId::MatroskaStream {
+                stream_index, audio_ordinal,
+                chapter_count: u32::try_from(chapters.len())
+                    .map_err(|_| "Matroska chapter count exceeds u32".to_string())?,
+            }
+        } else { id };
         let mut authored_track_tags = Vec::new();
         let tracks = if chapters.is_empty() {
             authored_track_tags.push(DiscExtractTagFields::default());
             vec![DiscTrack { number: 1, title: Some("Whole stream".into()),
                 performer: stream_tags.performer.clone(), duration_secs: duration,
-                format_note: Some(if raw_chapters.is_empty() { "No embedded chapters" }
+                format_note: Some(if kind == FileStreamKind::OrphanTransport {
+                    "No chapters: standalone file has no disc navigation"
+                } else if raw_chapters.is_empty() { "No embedded chapters" }
                     else { "Whole stream only (chapter split unavailable)" }.into()) }]
         } else {
             chapters.iter().map(|chapter| {
@@ -181,6 +236,9 @@ pub fn map_matroska_file(path: &Path) -> Result<DiscContents, String> {
             .or_else(||reported_depth(&codec))
             .or_else(|| lossless.then(|| decoded_info.as_ref()
                 .map(|audio| (audio.format().bytes() as u32) * 8)).flatten());
+        let estimated_audio_bytes = if kind == FileStreamKind::OrphanTransport {
+            transport_audio_bytes(&codec, native_duration, bit_rate, rate, channels, bit_depth)
+        } else { None };
         presentations.push(DiscPresentation {
             id, label, format: AudioPresentationFormat {
                 codec: Some(codec.clone()), sample_rate: rate,
@@ -188,6 +246,7 @@ pub fn map_matroska_file(path: &Path) -> Result<DiscContents, String> {
                 lossless, provenance: FormatProvenance::Unknown,
             }, tracks, total_duration_secs: duration.unwrap_or(0.0),
             extract: PresentationExtractInfo {
+                transport_audio_bytes: estimated_audio_bytes,
                 authored_album_tags: stream_tags.prioritized(&tags),
                 authored_track_tags, ..Default::default()
             }, album_title: tags.album.clone(),
@@ -198,9 +257,11 @@ pub fn map_matroska_file(path: &Path) -> Result<DiscContents, String> {
         return Err(format!("{} contains no audio streams", path.display()));
     }
     let label = path.file_stem().map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "Matroska file".into());
+        .unwrap_or_else(|| "Audio file".into());
     Ok(DiscContents {
-        format: DiscFormat::Matroska, label, source_path: path.to_path_buf(),
+        format: match kind { FileStreamKind::Matroska => DiscFormat::Matroska,
+            FileStreamKind::OrphanTransport => DiscFormat::TransportFile },
+        label, source_path: path.to_path_buf(),
         presentations, suppressed: Vec::new(), copy_protection: CopyProtectionSummary {
             description: "Not applicable (file source)".into(),
         }, diagnostics, album_title: tags.album, album_artist: tags.artist,
@@ -212,6 +273,69 @@ pub fn map_matroska_file(path: &Path) -> Result<DiscContents, String> {
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn transport_size_is_from_audio_clock_not_container_video() {
+        assert_eq!(transport_audio_bytes("ac3", Some(100.0), 192_000,
+            None, None, None), Some(2_400_000));
+        assert_eq!(transport_audio_bytes("pcm_dvd", Some(100.0), 0,
+            Some(48_000), Some(2), Some(16)), Some(19_200_000));
+        assert_eq!(transport_audio_bytes("pcm_bluray", Some(100.0), 0,
+            Some(96_000), Some(6), Some(24)), Some(172_800_000));
+        assert_eq!(transport_audio_bytes("ac3", None, 192_000,
+            None, None, None), None);
+        assert_eq!(transport_audio_bytes("ac3", Some(100.0), 0,
+            None, None, None), None);
+        assert_eq!(transport_audio_bytes("truehd", Some(100.0), 2_000_000,
+            None, None, None), None); // variable bitrate is not a hard size fact
+    }
+
+    #[test]
+    fn transport_video_payload_does_not_inflate_audio_capacity() {
+        if Command::new("ffmpeg").arg("-version").output().is_err() { return; }
+        let temp = tempfile::tempdir().unwrap();
+        for (extension, muxer) in [("m2ts", "mpegts"), ("vob", "vob")] {
+            let source = temp.path().join(format!("movie.{extension}"));
+            let generated = Command::new("ffmpeg").args([
+                "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=25:duration=5",
+                "-f", "lavfi", "-i", "sine=frequency=440:duration=5:sample_rate=48000",
+                "-map", "0:v:0", "-map", "1:a:0", "-c:v", "mpeg2video", "-b:v", "4M",
+                "-c:a", "ac3", "-b:a", "192k", "-f", muxer,
+            ]).arg(&source).output().unwrap();
+            assert!(generated.status.success(), "fixture: {}",
+                String::from_utf8_lossy(&generated.stderr));
+            let contents = map_orphan_transport_file(&source).unwrap();
+            assert_eq!(contents.presentations.len(), 1);
+            let presentation = &contents.presentations[0];
+            let expected = presentation.extract.transport_audio_bytes.unwrap();
+            let stream_index = match presentation.id {
+                PresentationId::TransportStream { stream_index, .. } => stream_index,
+                _ => panic!("not a transport stream"),
+            };
+            assert_eq!(stream_index, 1, "video is stream 0");
+            let audio = temp.path().join(format!("audio-{extension}.ac3"));
+            let copied = Command::new("ffmpeg").args([
+                "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
+                "-i",
+            ]).arg(&source).args([
+                "-map", "0:1", "-vn", "-sn", "-dn", "-c:a", "copy", "-f", "ac3",
+            ]).arg(&audio).output().unwrap();
+            assert!(copied.status.success());
+            let actual = std::fs::metadata(&audio).unwrap().len();
+            assert!(std::fs::metadata(&source).unwrap().len() > actual * 3);
+            assert!(expected >= actual * 9 / 10 && expected <= actual * 11 / 10,
+                "{extension}: estimated {expected}, actual {actual}");
+            let mut state = crate::tui::disc_browser::DiscBrowserState::new(contents, source);
+            state.tags = false;
+            state.extraction_log = false;
+            state.destination = temp.path().join(format!("output-{extension}"));
+            assert_eq!(state.selected_item_bytes().unwrap().0, expected);
+            let reserve = state.native_required_volume_bytes(true).unwrap();
+            assert!(reserve >= actual * 2, "private and publication copies must fit");
+            assert!(reserve < 2 * 1024 * 1024, "video must not enter reserve: {reserve}");
+        }
+    }
 
     #[test]
     fn admission_is_only_mkv_mka() {
@@ -250,4 +374,46 @@ mod tests {
             stream_index: 1, audio_ordinal: 2, chapter_count: 2,
         });
     }
+
+    #[test]
+    fn orphan_transport_probes_whole_streams_without_authored_chapters() {
+        if Command::new("ffmpeg").arg("-version").output().is_err() { return; }
+        let temp = tempfile::tempdir().unwrap();
+        for (extension, muxer) in [("M2TS", "mpegts"), ("vOb", "vob")] {
+            let file = temp.path().join(format!("copied.{extension}"));
+            let output = Command::new("ffmpeg").args([
+                "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "sine=frequency=420:duration=0.3:sample_rate=48000",
+                "-f", "lavfi", "-i", "sine=frequency=630:duration=0.3:sample_rate=48000",
+                "-map", "0:a:0", "-map", "1:a:0", "-c:a", "ac3", "-b:a", "192k",
+                "-f", muxer,
+            ]).arg(&file).output().unwrap();
+            assert!(output.status.success(), "{}: {}", extension,
+                String::from_utf8_lossy(&output.stderr));
+            let contents = super::super::on_disc_transport::probe_on_disc_transport(&file).unwrap();
+            assert_eq!(contents.format, DiscFormat::TransportFile);
+            assert_eq!(contents.presentations.len(), 2);
+            assert!(contents.diagnostics.iter().any(|d| d.message.contains("No chapters found")
+                && d.message.contains("navigation")));
+            for (index, presentation) in contents.presentations.iter().enumerate() {
+                assert_eq!(presentation.id, PresentationId::TransportStream {
+                    stream_index: index as u32, audio_ordinal: index as u32 + 1,
+                });
+                assert_eq!(presentation.tracks.len(), 1);
+                assert_eq!(presentation.tracks[0].title.as_deref(), Some("Whole stream"));
+                assert!(presentation.tracks[0].format_note.as_deref().unwrap().contains("no disc navigation"));
+                assert_eq!(presentation.format.codec.as_deref(), Some("ac3"));
+            }
+            let state = crate::tui::disc_browser::DiscBrowserState::new(contents, file);
+            assert!(state.file_per_program);
+            assert!(!state.cue);
+            assert!(state.selected.iter().all(|yes| *yes));
+            assert!(state.output_rows().contains(&"Folder"));
+            assert!(state.output_rows().contains(&"Naming"));
+            assert!(state.output_rows().contains(&"Tags"));
+            assert!(state.output_rows().contains(&"Overwrite"));
+            assert!(!state.output_rows().contains(&"CUE"));
+        }
+    }
+
 }
