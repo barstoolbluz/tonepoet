@@ -263,6 +263,9 @@ pub struct DiscBrowserState {
     /// Native extraction uses one selection bitmap per presentation. Chapter
     /// selections are synchronized across streams in the same authored title.
     pub items_checked: Vec<Vec<bool>>,
+    /// CUE geometry per presentation in the exact order of `contents`.
+    /// Only selected tracks are projected into the durable native job.
+    pub cue_segments: Vec<Vec<crate::convert::pipeline::native_extract::NativeCueSegment>>,
     pub focus: ExtractFocus,
     /// Same title-bar window state as Folder Properties and Recovery.
     pub maximized: bool,
@@ -381,7 +384,7 @@ impl DiscBrowserState {
             p.extract.ineligible_reason.is_none()
                 && !matches!(p.id, PresentationId::BluRayTitle { display_angle, .. } if display_angle.get() != 1)
                 && match contents.format {
-                DiscFormat::Sacd | DiscFormat::DvdAudio | DiscFormat::Matroska | DiscFormat::TransportFile => true,
+                DiscFormat::Sacd | DiscFormat::DvdAudio | DiscFormat::Matroska | DiscFormat::TransportFile | DiscFormat::CueImage => true,
                 DiscFormat::DvdVideo | DiscFormat::BluRay =>
                     (0..index).all(|earlier| contents.presentations[earlier].extract.ineligible_reason.is_some()),
             }
@@ -398,7 +401,7 @@ impl DiscBrowserState {
                 && (
                 matches!(contents.format, DiscFormat::DvdVideo | DiscFormat::BluRay)
                 || (contents.format != DiscFormat::Sacd && !matches!(contents.format,
-                    DiscFormat::Matroska | DiscFormat::TransportFile) && p.format.lossless
+                    DiscFormat::Matroska | DiscFormat::TransportFile | DiscFormat::CueImage) && p.format.lossless
                     && p.format.bit_depth.is_none())
             ) { None } else { Some(Ok(Default::default())) }
         }).collect();
@@ -412,6 +415,7 @@ impl DiscBrowserState {
             source_path: source_path.clone(),
             probe_path: source_path.clone(),
             items_checked,
+            cue_segments: Vec::new(),
             focus: ExtractFocus::Programs,
             maximized: false,
             item_cursor: 0,
@@ -584,6 +588,14 @@ impl DiscBrowserState {
     fn native_item_payload_bytes(&self, p: &DiscPresentation, track: &DiscTrack) -> Option<u64> {
         if self.contents.format == DiscFormat::TransportFile {
             return p.extract.transport_audio_bytes;
+        }
+        if self.contents.format == DiscFormat::CueImage {
+            let segment = self.cue_segments.iter().flatten().find(|segment|
+                segment.presentation == p.id && segment.number == track.number)?;
+            let frames = segment.end_sample.checked_sub(segment.start_sample)?;
+            let bytes_per_sample = segment.sample_bits.unwrap_or(24).max(16).div_ceil(8);
+            return frames.checked_mul(u64::from(segment.channels))?
+                .checked_mul(u64::from(bytes_per_sample));
         }
         if self.contents.format == DiscFormat::Matroska {
             if self.file_per_program || matches!(p.id,
@@ -1036,7 +1048,7 @@ impl DiscBrowserState {
             rows.push("Keep DST");
         }
         rows.extend(["Files", "Tags", "Log"]);
-        if self.file_per_program && (self.matroska_cue_available() ||
+        if self.file_per_program && self.contents.format != DiscFormat::CueImage && (self.matroska_cue_available() ||
             !matches!(self.contents.format, DiscFormat::Sacd | DiscFormat::Matroska | DiscFormat::TransportFile)) {
             rows.push("CUE");
         }
@@ -1110,6 +1122,13 @@ impl DiscBrowserState {
     }
 
     pub fn tag_source_label(&self, index: usize) -> &'static str {
+        if self.contents.format == DiscFormat::CueImage {
+            return match index {
+                0 => "CUE track and album tags",
+                1 => "CUE authored tags first",
+                _ => "Unknown source",
+            };
+        }
         if matches!(self.contents.format, DiscFormat::Matroska | DiscFormat::TransportFile) {
             return match index {
                 0 => "Container tags, then stream tags",
@@ -1141,7 +1160,7 @@ impl DiscBrowserState {
         // Disc metadata editors operate on ISO/folder sources and have no
         // Matroska target. Do not offer actions that silently do nothing or
         // mutate the user's input file through a side route.
-        if matches!(self.contents.format, DiscFormat::Matroska | DiscFormat::TransportFile) {
+        if matches!(self.contents.format, DiscFormat::Matroska | DiscFormat::TransportFile | DiscFormat::CueImage) {
             controls.push(C::Done);
         } else {
             controls.extend([C::EditValues, C::MusicBrainz, C::Done]);
@@ -1153,7 +1172,7 @@ impl DiscBrowserState {
     /// never the highlighted individual track's title. An authored PCM track
     /// is not known until preparation; don't present navigation as written tags.
     pub fn tag_preview_is_pending(&self) -> bool {
-        !matches!(self.contents.format, DiscFormat::Sacd | DiscFormat::Matroska | DiscFormat::TransportFile)
+        !matches!(self.contents.format, DiscFormat::Sacd | DiscFormat::Matroska | DiscFormat::TransportFile | DiscFormat::CueImage)
             && self.tag_source != crate::convert::pipeline::native_extract::NativeTagSource::DiscAndSidecar
     }
 
@@ -1162,7 +1181,7 @@ impl DiscBrowserState {
         let Some(p) = self.contents.presentations.get(self.cursor) else { return NativeTagValues::default(); };
         let Some(program) = self.native_program_choice(self.cursor, p, Some(self.item_cursor))
             else { return NativeTagValues::default(); };
-        if matches!(self.contents.format, DiscFormat::Matroska | DiscFormat::TransportFile) {
+        if matches!(self.contents.format, DiscFormat::Matroska | DiscFormat::TransportFile | DiscFormat::CueImage) {
             use crate::convert::pipeline::native_extract::NativeTagSource;
             let authored = program.authored_tags.as_ref().map(|values| values.album.clone())
                 .unwrap_or_default();
@@ -1353,7 +1372,18 @@ impl DiscBrowserState {
         if !self.is_extractable(self.cursor) { return None; }
         let authored = self.contents.presentations.get(self.cursor)?;
         let program = self.native_program_choice(self.cursor,authored,Some(self.item_cursor))?;
-        let job = self.native_job_for_template(template);
+        let mut job = self.native_job_for_template(template);
+        // The highlighted preview can describe an unchecked track. That
+        // segment is absent from the publication plan, but it still decides
+        // the track's original carrier extension.
+        if self.contents.format == DiscFormat::CueImage &&
+            !job.cue_segments.iter().any(|s|s.presentation==program.id &&
+                program.tracks.iter().any(|t|t.number==s.number)) {
+            if let Some(segment) = self.cue_segments.get(self.cursor)
+                .and_then(|segments|segments.get(self.item_cursor)) {
+                job.cue_segments.push(segment.clone());
+            }
+        }
         if self.file_per_program {
             Some(proposed_destination_for_program(&job,&program))
         } else {
@@ -1496,7 +1526,7 @@ impl DiscBrowserState {
                     tags_to_native(if mb_only { sidecar }
                         else if sidecar_first { sidecar.prioritized(&authored) }
                         else { authored.prioritized(&sidecar) })
-                } else if matches!(self.contents.format, DiscFormat::Matroska | DiscFormat::TransportFile) {
+                } else if matches!(self.contents.format, DiscFormat::Matroska | DiscFormat::TransportFile | DiscFormat::CueImage) {
                     tags_to_native(p.extract.authored_track_tags.get(j).cloned().unwrap_or_default())
                 } else { NativeTagValues {
                     title: if matches!(self.contents.format, DiscFormat::DvdVideo | DiscFormat::BluRay) {
@@ -1517,7 +1547,9 @@ impl DiscBrowserState {
             })
         };
         (!tracks.is_empty()).then(|| NativeProgramChoice{
-            id:p.id, angle:self.selected_angle_for(i), label:p.id.compact_label(), tracks,
+            id:p.id, angle:self.selected_angle_for(i), label:if self.contents.format == DiscFormat::CueImage {
+                p.label.clone()
+            } else {p.id.compact_label()}, tracks,
             keep_dst:self.keep_dst.get(i) == Some(&true),
             source_depth:p.format.bit_depth, source_codec:p.format.codec.clone().unwrap_or_else(||"unknown".into()),
             source_channels:p.format.channels,
@@ -1564,13 +1596,25 @@ impl DiscBrowserState {
         // program discriminator. A single checked area goes straight to Folder.
         let program_subfolders = programs.len() > 1 &&
             !native_template_has_program_token(&self.naming_template);
+        let cue_segments = if self.contents.format == DiscFormat::CueImage {
+            self.cue_segments.iter().enumerate().filter(|(i,_)|
+                self.selected.get(*i) == Some(&true)).flat_map(|(i,segments)|
+                segments.iter().filter(move |s| self.items_checked[i].get(s.number as usize - 1)
+                    == Some(&true)).cloned()).collect()
+        } else { Vec::new() };
+        let cue_input_paths = if self.contents.format == DiscFormat::CueImage {
+            let mut paths = self.cue_segments.iter().flatten()
+                .flat_map(|segment|[segment.cue_path.clone(),segment.image.clone()])
+                .collect::<Vec<_>>();
+            paths.sort(); paths.dedup(); paths
+        } else { Vec::new() };
         NativeExtractionJob{ disc_identity, source:self.source_path.clone(),format:self.contents.format,
-            programs,destination:self.destination.clone(), working_root,
+            programs, cue_segments, cue_input_paths, destination:self.destination.clone(), working_root,
             wav_container:self.wav_container, assume_decrypted:self.assume_decrypted,downmix:self.downmix,
             naming_template:self.naming_template.clone(), program_subfolders,
             overwrite_policy:self.overwrite_policy, extraction_log:self.extraction_log,
             program_log_paths:Vec::new(), round4_layout:true,
-            file_per_program:self.file_per_program, cue:self.cue && (self.contents.format != DiscFormat::Matroska ||
+            file_per_program:self.file_per_program, cue:self.cue && self.contents.format != DiscFormat::CueImage && (self.contents.format != DiscFormat::Matroska ||
                 self.matroska_cue_available()) && self.contents.format != DiscFormat::TransportFile,
             transfer_tags:self.tags && self.native_tags_available(),
             sacd_dff:self.sacd_dff,
@@ -2202,6 +2246,7 @@ pub fn source_info_for_presentation(
             DiscFormat::BluRay => "Blu-ray".to_string(),
             DiscFormat::Matroska => "Matroska".to_string(),
             DiscFormat::TransportFile => "Standalone M2TS/VOB".to_string(),
+            DiscFormat::CueImage => "CUE image".to_string(),
         },
         codec: fmt.codec.clone().unwrap_or_else(|| presentation.label.clone()),
         bit_depth: fmt.bit_depth,
@@ -2256,7 +2301,9 @@ pub fn presentation_id_supports_stream_conversion(id: &PresentationId) -> bool {
         | PresentationId::BluRayTitle { .. } => true,
         // File audio streams use the Extract worker; Convert has no per-stream
         // selector for either Matroska or standalone MPEG transports.
-        PresentationId::MatroskaStream { .. } | PresentationId::TransportStream { .. } => false,
+        PresentationId::MatroskaStream { .. }
+        | PresentationId::TransportStream { .. }
+        | PresentationId::CueAlbum(_) => false,
     }
 }
 
@@ -2320,7 +2367,9 @@ pub fn apply_presentation_to_source_options(
         }
         // File-backed audio stream selection belongs to the Extract worker,
         // not the authored-disc conversion SourceOptions bridge.
-        PresentationId::MatroskaStream { .. } | PresentationId::TransportStream { .. } => false,
+        PresentationId::MatroskaStream { .. }
+        | PresentationId::TransportStream { .. }
+        | PresentationId::CueAlbum(_) => false,
     }
 }
 
@@ -3554,6 +3603,12 @@ mod transport_space_budget_tests {
         assert!(replace > skip && replace <= needed,
             "replacement reserves a new private copy but not another video: {replace}");
         state.selected[1] = false;
+        // With a single selected stream the path uses the single-program
+        // layout, not the two-program path used by `first` above.
+        let one = state.native_job(temp.path().join("scratch"));
+        let final_path = proposed_destination_for_program(&one, &one.programs[0]);
+        fs::create_dir_all(final_path.parent().unwrap()).unwrap();
+        fs::File::create(&final_path).unwrap().set_len(100 * MIB).unwrap();
         state.overwrite_policy = NativeOverwritePolicy::Skip;
         assert_eq!(state.native_required_volume_bytes(true), Some(0));
     }

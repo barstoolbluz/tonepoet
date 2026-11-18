@@ -1496,6 +1496,10 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             items.push(item("Open in New Tab", ContextAction::OpenEntryInNewTab(entry.path.clone())));
             items.push(item("Analyze", ContextAction::Analyze));
             let cue_import_availability = directory_cue_import_availability(app, entry);
+            if allow_single_item_actions &&
+                cue_import_availability == super::probe::CueImportAvailability::Present {
+                items.push(item("Extract CUE tracks…", ContextAction::BrowseDiscStreams));
+            }
             let cue_repair_availability = directory_cue_repair_availability(app, entry);
             match cue_repair_availability.clone() {
                 super::browse::CueRepairAvailability::Repairable(cue_path) => {
@@ -1568,6 +1572,9 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
                 Some(crate::convert::source_admission::DirectSourceKind::Audio)
             );
             if is_cue || is_direct_audio {
+                if is_cue && allow_single_item_actions {
+                    items.push(item("Extract CUE tracks…", ContextAction::BrowseDiscStreams));
+                }
                 items.push(build_convert_submenu(app));
                 if is_cue {
                     items.push(build_tagging_submenu(

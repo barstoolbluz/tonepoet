@@ -17,6 +17,8 @@ pub enum DiscFormat {
     Matroska,
     /// An M2TS/VOB outside its authored disc, browsed as independent streams.
     TransportFile,
+    /// CUE-authoritative image extraction (one or several related sheets).
+    CueImage,
 }
 
 impl DiscFormat {
@@ -28,6 +30,7 @@ impl DiscFormat {
             Self::BluRay => "Blu-ray",
             Self::Matroska => "Matroska",
             Self::TransportFile => "Standalone transport",
+            Self::CueImage => "CUE image",
         }
     }
 }
@@ -106,6 +109,8 @@ pub enum PresentationId {
         stream_index: u32,
         audio_ordinal: u32,
     },
+    /// One album group from the shared synthetic-CUE grouping policy.
+    CueAlbum(u32),
 }
 
 impl PresentationId {
@@ -187,6 +192,7 @@ impl PresentationId {
             Self::TransportStream { audio_ordinal, .. } =>
                 format!("Transport audio stream {audio_ordinal}"),
             Self::DvdAudioGroup(n) => format!("DVD-Audio group {n}"),
+            Self::CueAlbum(n) => format!("CUE album {n}"),
             Self::SacdArea(SacdAreaId::Stereo) => "SACD stereo area".to_string(),
             Self::SacdArea(SacdAreaId::MultiChannel) => "SACD multichannel area".to_string(),
             Self::DvdVideoTitle {
@@ -217,6 +223,7 @@ impl PresentationId {
             Self::TransportStream { audio_ordinal, .. } =>
                 format!("Audio stream {audio_ordinal}"),
             Self::DvdAudioGroup(n) => format!("Group {n}"),
+            Self::CueAlbum(n) => format!("Album {n}"),
             Self::SacdArea(SacdAreaId::Stereo) => "Stereo".to_string(),
             Self::SacdArea(SacdAreaId::MultiChannel) => "Multichannel".to_string(),
             Self::DvdVideoTitle {
