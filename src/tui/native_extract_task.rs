@@ -541,6 +541,13 @@ fn remaining_native_job(
         }
         job.programs.retain(|program| !program.tracks.is_empty());
     }
+    if job.format == crate::disc::DiscFormat::Archive {
+        // Resume only members still awaiting publication. The complete
+        // original preview remains protected by source len/mtime validation.
+        job.archive_members.retain(|member|job.programs.iter().any(|program|
+            program.id == crate::disc::PresentationId::ArchiveFiles && program.tracks.iter()
+                .any(|track|track.number==member.number)));
+    }
     if job.format == crate::disc::DiscFormat::CueImage {
         // A resumed CUE task owns only the still-pending track geometry;
         // keep the full input protection set, including unchecked images.
@@ -1178,7 +1185,7 @@ mod tests {
             NativeOverwritePolicy, NativeProgramChoice, NativeTagSource,
             NativeTagValues, NativeTrackChoice, NativeWavContainer,
         };
-        NativeExtractionJob { cue_input_paths: Vec::new(), cue_segments: Vec::new(), disc_identity: Default::default(),
+        NativeExtractionJob { cue_input_paths: Vec::new(), cue_segments: Vec::new(), archive_members:Vec::new(), archive_length:0, archive_modified:None, archive_password:None, disc_identity: Default::default(),
             source: std::env::current_exe().unwrap(),
             format: crate::disc::DiscFormat::Sacd,
             programs: vec![NativeProgramChoice {

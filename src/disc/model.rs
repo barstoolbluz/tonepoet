@@ -19,6 +19,8 @@ pub enum DiscFormat {
     TransportFile,
     /// CUE-authoritative image extraction (one or several related sheets).
     CueImage,
+    /// Raw archived-file extraction through the existing native Extract window.
+    Archive,
 }
 
 impl DiscFormat {
@@ -31,6 +33,7 @@ impl DiscFormat {
             Self::Matroska => "Matroska",
             Self::TransportFile => "Standalone transport",
             Self::CueImage => "CUE image",
+            Self::Archive => "Archive",
         }
     }
 }
@@ -111,6 +114,8 @@ pub enum PresentationId {
     },
     /// One album group from the shared synthetic-CUE grouping policy.
     CueAlbum(u32),
+    /// One archive whose regular files are selectable as individual entries.
+    ArchiveFiles,
 }
 
 impl PresentationId {
@@ -193,6 +198,7 @@ impl PresentationId {
                 format!("Transport audio stream {audio_ordinal}"),
             Self::DvdAudioGroup(n) => format!("DVD-Audio group {n}"),
             Self::CueAlbum(n) => format!("CUE album {n}"),
+            Self::ArchiveFiles => "Archive files".to_owned(),
             Self::SacdArea(SacdAreaId::Stereo) => "SACD stereo area".to_string(),
             Self::SacdArea(SacdAreaId::MultiChannel) => "SACD multichannel area".to_string(),
             Self::DvdVideoTitle {
@@ -224,6 +230,7 @@ impl PresentationId {
                 format!("Audio stream {audio_ordinal}"),
             Self::DvdAudioGroup(n) => format!("Group {n}"),
             Self::CueAlbum(n) => format!("Album {n}"),
+            Self::ArchiveFiles => "Archive".to_owned(),
             Self::SacdArea(SacdAreaId::Stereo) => "Stereo".to_string(),
             Self::SacdArea(SacdAreaId::MultiChannel) => "Multichannel".to_string(),
             Self::DvdVideoTitle {

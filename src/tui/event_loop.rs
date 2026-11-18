@@ -8740,6 +8740,9 @@ pub(super) fn handle_message(app: &mut AppState, msg: AppMessage, tx: &mpsc::Sen
             }
             super::context_menu::refresh_open_browse_entry_menu(app);
         }
+        AppMessage::ArchiveExtractReady {path,request_id,result} => {
+            super::disc_browser_actions::handle_archive_extract_ready(app,path,request_id,result);
+        }
         AppMessage::CueExtractReady {path,request_id,result} => {
             super::disc_browser_actions::handle_cue_extract_ready(app,path,request_id,result);
         }

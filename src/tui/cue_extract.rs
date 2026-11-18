@@ -79,30 +79,6 @@ fn supported_format(path: &Path, codec: &str, depth: Option<u32>, float: Option<
     Ok((result.0.into(), result.1.into(), result.2.into(), result.3))
 }
 
-/// Read the original audio-stream bitrate (not just an encoder default).
-/// FFmpeg's audio parameters have the most direct figure. Some VBR formats
-/// omit it; use the container's mean as a conservative floor in that case.
-/// Called once per image during the off-thread CUE preview, never per track.
-fn lossy_image_bitrate(path: &Path, info: &crate::tui::probe::SourceInfo)
-    -> Result<u64, String>
-{
-    crate::tui::probe::ensure_ffmpeg_init_pub();
-    let container = ffmpeg_next::format::input(path).map_err(|error|
-        format!("Inspect lossy CUE bitrate for '{}': {error}",path.display()))?;
-    let audio = container.streams().best(ffmpeg_next::media::Type::Audio)
-        .ok_or_else(||format!("No lossy audio stream: {}",path.display()))?;
-    let stream_bps = unsafe { (*audio.parameters().as_ptr()).bit_rate };
-    if let Ok(value) = u64::try_from(stream_bps) {
-        if value > 0 { return Ok(value); }
-    }
-    let mean = (info.file_size as f64 * 8.0 / info.duration_secs).ceil();
-    if !mean.is_finite() || mean <= 0.0 || mean > u64::MAX as f64 {
-        return Err(format!("Cannot establish source bitrate for lossy CUE image: {}",
-            path.display()));
-    }
-    Ok(mean as u64)
-}
-
 fn check_regular_snapshot(path: &Path) -> Result<(u64, Option<std::time::SystemTime>), String> {
     let metadata = fs::symlink_metadata(path).map_err(|error|
         format!("Inspect CUE input '{}': {error}", path.display()))?;
@@ -211,7 +187,7 @@ pub fn inspect(source: &Path, combine: bool,
         let album_year = group[0].sheet.date.clone();
         let album_catalog = group[0].sheet.catalog.clone();
         let mut media_cache: BTreeMap<PathBuf, (u64, u32, crate::tui::probe::SourceInfo,
-            u64,Option<std::time::SystemTime>,Option<u64>)> = BTreeMap::new();
+            u64,Option<std::time::SystemTime>)> = BTreeMap::new();
         let mut tracks = Vec::new();
         let mut segments = Vec::new();
         let mut authored = Vec::new();
@@ -225,17 +201,14 @@ pub fn inspect(source: &Path, combine: bool,
                     if samples == 0 || rate == 0 || info.sample_rate != rate || info.channels == 0 {
                         return Err(format!("Invalid CUE audio clock/extent: {}", image.display()));
                     }
-                    let (_,encoder,_,_) = supported_format(image,&info.codec,
+                    supported_format(image,&info.codec,
                         info.bit_depth,info.sample_format_is_float)?;
-                    let bitrate = if matches!(encoder.as_str(),"libmp3lame"|"aac"|"libvorbis"|"libopus") {
-                        Some(lossy_image_bitrate(image,&info)?)
-                    } else { None };
-                    media_cache.insert(image.clone(),(samples,rate,info,len,modified,bitrate));
+                    media_cache.insert(image.clone(),(samples,rate,info,len,modified));
                 }
             }
             for (j,track) in member.sheet.tracks.iter().enumerate() {
                 let image = &member.track_audio_paths[j];
-                let (samples,rate,info,len,modified,bitrate) = media_cache.get(image)
+                let (samples,rate,info,len,modified) = media_cache.get(image)
                     .ok_or("CUE track has no admitted image")?;
                 let index = track.index01_frames.ok_or("CUE track is missing INDEX 01")?;
                 let start = u64::try_from(u128::from(index)*u128::from(*rate)/75)
@@ -267,14 +240,15 @@ pub fn inspect(source: &Path, combine: bool,
                     sample_bits:depth,channels:u8::try_from(info.channels)
                         .map_err(|_|"Too many CUE audio channels")?,
                     source_length:*len,source_modified:*modified,
-                    cue_length,cue_modified,source_bit_rate:*bitrate});
+                    cue_length,cue_modified,source_bit_rate:None,
+                    packet_cut_samples:Vec::new(),packet_part_index:0});
             }
         }
         if tracks.is_empty() { return Err("CUE has no extractable tracks".into()); }
         let first = media_cache.values().next().ok_or("CUE has no audio")?;
         // Mixed-format albums retain per-track carriers in `segments`; the
         // presentation summary is descriptive rather than an encoding policy.
-        let uniform = media_cache.values().all(|(_,rate,info,_,_,_)| *rate == first.1 &&
+        let uniform = media_cache.values().all(|(_,rate,info,_,_)| *rate == first.1 &&
             info.codec == first.2.codec && info.channels == first.2.channels);
         let format = AudioPresentationFormat {
             codec: if uniform {Some(first.2.codec.clone())} else {Some("mixed source formats".into())},
@@ -282,7 +256,7 @@ pub fn inspect(source: &Path, combine: bool,
             bit_depth: if uniform {first.2.bit_depth} else {None},
             channels: if uniform {u8::try_from(first.2.channels).ok()} else {None},
             channel_layout: if uniform {Some(first.2.channel_layout.clone())} else {None},
-            lossless: media_cache.values().all(|(_,_,info,_,_,_)|
+            lossless: media_cache.values().all(|(_,_,info,_,_)|
                 info.compression_is_lossless.unwrap_or(false)),
             provenance:FormatProvenance::Unknown,
         };
@@ -295,6 +269,34 @@ pub fn inspect(source: &Path, combine: bool,
                 authored_track_tags:authored,..Default::default()
             }, album_title:Some(album_name), album_artist, genre:album_genre,year:album_year });
         segments_by_program.push(segments);
+    }
+    // Partition each compressed image once, over all admitted tracks, not
+    // merely the checked tracks of a later job. This lets selection/Skip
+    // retain exact source packet ownership with no re-encode or overlaps.
+    let mut by_image: BTreeMap<PathBuf, Vec<(usize,usize,u64,u64,u64)>> = BTreeMap::new();
+    for (pi, segments) in segments_by_program.iter().enumerate() {
+        for (ti, segment) in segments.iter().enumerate() {
+            if matches!(segment.encoder.as_str(),"libmp3lame"|"aac"|"libvorbis"|"libopus") {
+                by_image.entry(segment.image.clone()).or_default().push((pi,ti,
+                    segment.start_sample,segment.end_sample,segment.total_samples));
+            }
+        }
+    }
+    for (image, mut parts) in by_image {
+        parts.sort_by_key(|part|part.2);
+        let total = parts[0].4;
+        if parts.iter().any(|part|part.4 != total) ||
+            parts.windows(2).any(|pair|pair[0].3 != pair[1].2) ||
+            parts.last().is_some_and(|part|part.3 != total) {
+            return Err(format!("Lossy CUE image has overlapping or incomplete track partition: {}",
+                image.display()));
+        }
+        let cuts: Vec<_> = parts.iter().skip(1).map(|part|part.2).collect();
+        for (index,(pi,ti,_,_,_)) in parts.into_iter().enumerate() {
+            let segment = &mut segments_by_program[pi][ti];
+            segment.packet_cut_samples = cuts.clone();
+            segment.packet_part_index = index;
+        }
     }
     let name = if presentations.len() == 1 { presentations[0].label.clone() }
         else { source.file_name().unwrap_or_default().to_string_lossy().into_owned() };

@@ -210,6 +210,11 @@ pub enum AppMessage {
     },
     /// CUE sheet/folder admission and audio clock probing run off the UI reducer.
     /// A newer Browse intent makes an older completion inert.
+    ArchiveExtractReady {
+        path: std::path::PathBuf,
+        request_id: u64,
+        result: Result<crate::tui::archive_extract::ArchiveExtractPreview, String>,
+    },
     CueExtractReady {
         path: std::path::PathBuf,
         request_id: u64,

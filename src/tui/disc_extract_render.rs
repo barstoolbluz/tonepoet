@@ -174,7 +174,7 @@ fn program_check(s: &DiscBrowserState, i: usize) -> &'static str {
 fn header_for(id: PresentationId, p: &DiscPresentation, index: usize) -> String {
     match id {
         PresentationId::SacdArea(_) => p.id.compact_label(),
-        PresentationId::CueAlbum(_) => p.label.clone(),
+        PresentationId::CueAlbum(_) | PresentationId::ArchiveFiles => p.label.clone(),
         PresentationId::DvdAudioGroup(n) => format!("Group {n}"),
         PresentationId::DvdVideoTitle { vts_number, title_number, .. } => format!("VTS {vts_number} · Title {title_number}"),
         PresentationId::BluRayTitle { playlist_number, display_angle, .. } =>
@@ -188,6 +188,9 @@ fn header_for(id: PresentationId, p: &DiscPresentation, index: usize) -> String 
 fn program_info(p: &DiscPresentation, format: DiscFormat) -> String {
     let codec = p.format.codec.as_deref().unwrap_or("unknown");
     let loss = if p.format.lossless { "lossless" } else { "lossy" };
+    if format == DiscFormat::Archive {
+        return format!("{} original archive files · no conversion",p.tracks.len());
+    }
     if format == DiscFormat::Sacd {
         let dst = p.tracks.iter().any(|t| t.format_note.as_deref().unwrap_or("").contains("DST"));
         // The SACD mapper supplies layout labels (including 5.0) directly.
@@ -429,10 +432,11 @@ pub fn draw(
         DiscFormat::DvdVideo|DiscFormat::BluRay=>"extract chapters",
         DiscFormat::Matroska|DiscFormat::TransportFile=>"extract audio",
         DiscFormat::CueImage=>"extract CUE tracks",
+        DiscFormat::Archive=>"extract files",
     };
     let source_type=format!("{} {}",state.contents.format.name(),
         if state.source_path.is_dir() {"folder"}else if matches!(state.contents.format,
-            DiscFormat::Matroska | DiscFormat::TransportFile) {"file"} else {"ISO"});
+            DiscFormat::Matroska | DiscFormat::TransportFile | DiscFormat::Archive) {"file"} else {"ISO"});
     let indicator=if state.maximized {"▾"}else{"▸"};
     let presentation=state.selected_presentation()
         .map(|p|p.id.compact_label()).unwrap_or_else(||"no selection".into());
@@ -496,8 +500,10 @@ pub fn draw(
             DiscFormat::DvdVideo=>"Titles",DiscFormat::BluRay=>"Playlists",
             DiscFormat::Matroska|DiscFormat::TransportFile=>"Streams",
             DiscFormat::CueImage=>"Albums",
+            DiscFormat::Archive=>"Archive",
         };
-        let item=if state.contents.format == DiscFormat::TransportFile { "Streams" }
+        let item=if state.contents.format == DiscFormat::Archive { "Files" }
+            else if state.contents.format == DiscFormat::TransportFile { "Streams" }
             else if matches!(state.contents.format,DiscFormat::DvdVideo|DiscFormat::BluRay|DiscFormat::Matroska) {
                 "Chapters" } else { "Tracks" };
         let tabs=[(program,ExtractFocus::Programs),(item,ExtractFocus::Items),
@@ -666,7 +672,7 @@ fn draw_header(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect, small:
 fn draw_programs(frame: &mut ratatui::Frame, s: &DiscBrowserState, r: Rect, buttons: &mut ButtonRenderMap, theme: Theme) {
     let title = match s.contents.format { DiscFormat::Sacd=>"AREAS",DiscFormat::DvdAudio=>"GROUPS",DiscFormat::DvdVideo=>"TITLES",DiscFormat::BluRay=>"PLAYLISTS",
         DiscFormat::Matroska|DiscFormat::TransportFile=>"AUDIO STREAMS",
-        DiscFormat::CueImage=>"CUE ALBUMS" };
+        DiscFormat::CueImage=>"CUE ALBUMS",DiscFormat::Archive=>"ARCHIVE CONTENTS" };
     let colors=extract_colors(theme);
     let pane_focused=s.focus==ExtractFocus::Programs;
     let pane_bg=if pane_focused{colors.focused}else{colors.unfocused};
@@ -1000,12 +1006,25 @@ fn option_value(s: &DiscBrowserState, name: &str) -> String {
                 (true,true) => "DSF / DFF · native DSD / keep selected DST".into(),
             }
         },
+        "Format" if s.contents.format == DiscFormat::Archive =>
+            "Original archive files · byte-for-byte copy".into(),
         "Format" if s.contents.format == DiscFormat::CueImage => {
             let formats: std::collections::BTreeSet<_> = s.cue_segments.iter().enumerate()
                 .filter(|(i,_)|s.selected.get(*i)==Some(&true))
                 .flat_map(|(_,segments)| segments.iter().map(|segment|segment.extension.as_str()))
                 .collect();
-            format!("{} · original format, re-encoded",formats.into_iter()
+            let lossless=s.cue_segments.iter().enumerate()
+                .filter(|(i,_)|s.selected.get(*i)==Some(&true))
+                .flat_map(|(_,segments)|segments.iter()).all(|segment|
+                    !matches!(segment.encoder.as_str(),"libmp3lame"|"aac"|"libvorbis"|"libopus"));
+            let lossy=s.cue_segments.iter().enumerate()
+                .filter(|(i,_)|s.selected.get(*i)==Some(&true))
+                .flat_map(|(_,segments)|segments.iter()).all(|segment|
+                    matches!(segment.encoder.as_str(),"libmp3lame"|"aac"|"libvorbis"|"libopus"));
+            let policy=if lossless {"lossless re-encode, exact samples"}
+                else if lossy {"original compressed packets; no re-encode"}
+                else {"lossless exact; lossy packets copied"};
+            format!("{} · {policy}",formats.into_iter()
                 .map(|ext|ext.to_uppercase()).collect::<Vec<_>>().join(" / "))
         },
         "Format" if matches!(s.contents.format, DiscFormat::Matroska | DiscFormat::TransportFile) => {
@@ -1032,8 +1051,10 @@ fn option_value(s: &DiscBrowserState, name: &str) -> String {
             NativeWavContainer::Rf64 => "RF64 WAV · large-file capable".into(),
             NativeWavContainer::W64 => "W64 · 64-bit sizes".into(),
         },
+        "Files" if s.contents.format == DiscFormat::Archive =>
+            "One original file per checked member, including non-audio".into(),
         "Files" if s.contents.format == DiscFormat::CueImage =>
-            "One re-encoded file per selected CUE track".into(),
+            "One source-format file per selected CUE track".into(),
         "Files" if s.contents.format == DiscFormat::TransportFile =>
             "Copy complete audio streams · no chapters available".into(),
         "Files" if s.contents.format == DiscFormat::Matroska =>
@@ -1044,6 +1065,9 @@ fn option_value(s: &DiscBrowserState, name: &str) -> String {
         } else if matches!(s.contents.format,DiscFormat::DvdVideo|DiscFormat::BluRay) {
             "one per chapter"
         } else { "one per track" }).into(),
+        "Tags" if s.contents.format == DiscFormat::Archive =>
+            (if s.tags {"on · tags for filenames only; originals untouched"}
+             else {"off · preserve original member names"}).into(),
         "Tags" if !s.native_tags_available() => "off for DFF · no standard tags".into(),
         "Tags" if matches!(s.contents.format, DiscFormat::Matroska | DiscFormat::TransportFile) && s.tags => {
             // The selected carrier, not the input MKV, determines whether
@@ -1309,7 +1333,7 @@ fn draw_output(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,
         if field.width==0 {continue;}
         match *name {
             "Format" => {
-                if matches!(s.contents.format, DiscFormat::Matroska | DiscFormat::TransportFile | DiscFormat::CueImage) {
+                if matches!(s.contents.format, DiscFormat::Matroska | DiscFormat::TransportFile | DiscFormat::CueImage | DiscFormat::Archive) {
                     frame.render_widget(Paragraph::new(clip_end(&option_value(s,"Format"),field.width))
                         .style(Style::default().fg(readable_word(theme.value,bg)).bg(bg)),field);
                 } else if s.contents.format==DiscFormat::Sacd {
@@ -1371,6 +1395,7 @@ fn draw_output(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,
                     DiscFormat::Matroska=>("chapter","stream"),
                     DiscFormat::TransportFile=>("stream","stream"),
                     DiscFormat::CueImage=>("track","album"),
+                    DiscFormat::Archive=>("file","archive"),
                 };
                 let individual=if s.contents.format==DiscFormat::Matroska {
                     "Split chapters".to_owned()
@@ -1378,7 +1403,7 @@ fn draw_output(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,
                 let grouped=if matches!(s.contents.format, DiscFormat::Matroska | DiscFormat::TransportFile) {
                     "Copy stream".to_owned()
                 }else{format!("One per {unit}")};
-                if matches!(s.contents.format,DiscFormat::TransportFile | DiscFormat::CueImage) {
+                if matches!(s.contents.format,DiscFormat::TransportFile | DiscFormat::CueImage | DiscFormat::Archive) {
                     frame.render_widget(Paragraph::new(clip_end(&option_value(s,"Files"),field.width))
                         .style(Style::default().fg(readable_word(theme.value,bg)).bg(bg)),field);
                 } else {
@@ -1389,7 +1414,7 @@ fn draw_output(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,
             "Tags" => {
                 let (dsf,dff)=s.selected_sacd_tag_carriers();
                 let x=if dff && !dsf {field.x} else {
-                    draw_native_toggle(frame,buttons,field,"Transfer",s.tags,focused,i,theme,bg)
+                    draw_native_toggle(frame,buttons,field,if s.contents.format==DiscFormat::Archive {"Use tags"}else{"Transfer"},s.tags,focused,i,theme,bg)
                 };
                 let edit=" Edit… ";
                 let ew=edit.chars().count() as u16;
@@ -1508,6 +1533,10 @@ fn draw_output(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,
                 }
                 else if dff {("DFF has no standard tags",true)}
                 else {("DSF keeps tags and artwork",false)}
+            } else if s.contents.format == DiscFormat::Archive {
+                ("Archive members are copied without modification",false)
+            } else if s.contents.format == DiscFormat::CueImage {
+                ("Lossy packets copied; lossless sample-exact",false)
             } else if matches!(s.contents.format, DiscFormat::Matroska | DiscFormat::TransportFile) {
                 // File-backed WAV outputs choose RIFF/RF64 automatically for
                 // both PCM stream copies and decoded chapter splits.
@@ -1582,7 +1611,9 @@ fn draw_results(frame:&mut ratatui::Frame,s:&DiscBrowserState,
     };
     let effective_items=if matches!(s.contents.format, DiscFormat::Matroska | DiscFormat::TransportFile)
         && s.file_per_program {programs}else{items};
-    let kind=if s.contents.format==DiscFormat::TransportFile {
+    let kind=if s.contents.format==DiscFormat::Archive {
+        if effective_items==1 {"file"}else{"files"}
+    }else if s.contents.format==DiscFormat::TransportFile {
         if effective_items == 1 {"stream"}else{"streams"}
     } else { match (matches!(s.contents.format,DiscFormat::DvdVideo|DiscFormat::BluRay|DiscFormat::Matroska),effective_items) {
         (true,1)=>"chapter",(true,_)=>"chapters",(false,1)=>"track",(false,_)=>"tracks",
@@ -1594,6 +1625,7 @@ fn draw_results(frame:&mut ratatui::Frame,s:&DiscBrowserState,
         DiscFormat::BluRay=>if programs==1 {"playlist"}else{"playlists"},
         DiscFormat::Matroska|DiscFormat::TransportFile=>if programs==1 {"stream"}else{"streams"},
         DiscFormat::CueImage=>if programs==1 {"album"}else{"albums"},
+        DiscFormat::Archive=>"archive",
     };
     let colors=extract_colors(theme);
     let words=word_tiers(theme,colors,colors.base);
@@ -1671,7 +1703,7 @@ fn draw_footer(frame:&mut ratatui::Frame,s:&DiscBrowserState,r:Rect,buttons:&mut
     }
     let y=r.y+r.height-1;
     let chips=[("^x Extract",TuiButton::DiscBrowserExtract,can_extract,theme.chip_go),
-        ("c Convert…",TuiButton::DiscBrowserConvert,s.contents.format!=DiscFormat::CueImage,theme.tab_active),
+        ("c Convert…",TuiButton::DiscBrowserConvert,!matches!(s.contents.format,DiscFormat::CueImage | DiscFormat::Archive),theme.tab_active),
         ("m Options",TuiButton::DiscBrowserMore,true,theme.warning),
         ("Esc Close",TuiButton::DiscBrowserClose,true,theme.chip_dismiss)];
     let length:usize=chips.iter().map(|(txt,_,_,_)|txt.chars().count()+2).sum();
@@ -1735,7 +1767,9 @@ fn draw_tags_sheet(frame:&mut ratatui::Frame, s:&DiscBrowserState, popup:Rect,
         use TagSheetControl as C;
         let target=Some(TuiButton::DiscBrowserTagSheetControl(index));
         let item=match control {
-            C::Transfer=>format!("{} Transfer tags",check(s.tags)),
+            C::Transfer=>format!("{} {}",check(s.tags),
+                if s.contents.format==DiscFormat::Archive {"Use tags for filenames"}
+                else {"Transfer tags"}),
             C::Source=>format!("Source     ▕ {}  ▾▏",
                 s.tag_source_label(s.tag_source_index())),
             C::Field(i)=>{

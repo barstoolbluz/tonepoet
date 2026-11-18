@@ -1,9 +1,9 @@
 //! CUE-authoritative extraction through the existing native file task.
 //!
-//! CUE indexes identify decoded *sample* frames, never approximate seek
-//! timestamps. Every selected track is encoded into private scratch using the
-//! original image carrier, then independently published with native overwrite,
-//! cancellation, skip and journal semantics. This route does not use Convert.
+//! CUE indexes identify sample-clock boundaries. Lossless tracks are trimmed
+//! and encoded in their original format; lossy tracks copy complete compressed
+//! packets, with boundaries rounded to packet edges. Both routes stage privately
+//! and share native publication, cancellation and skip controls, not Convert.
 
 use super::*;
 
@@ -34,8 +34,12 @@ fn verify_segment(segment: &NativeCueSegment) -> Result<(), String> {
         segment.encoder.is_empty() || segment.muxer.is_empty() || segment.channels == 0 {
         return Err("Invalid CUE track geometry or missing source encoder".into());
     }
-    if matches!(segment.encoder.as_str(), "libmp3lame"|"aac"|"libvorbis"|"libopus") {
-        lossy_quality_args(&segment.encoder,segment.source_bit_rate,segment.channels)?;
+    if is_lossy(segment) {
+        if segment.packet_part_index > segment.packet_cut_samples.len() ||
+            segment.packet_cut_samples.iter().any(|cut|*cut==0 || *cut>=segment.total_samples) ||
+            segment.packet_cut_samples.windows(2).any(|pair|pair[0]>=pair[1]) {
+            return Err("Invalid lossless-packet CUE partition".into());
+        }
     }
     Ok(())
 }
@@ -118,57 +122,102 @@ fn track_tags(job: &NativeExtractionJob, program: &NativeProgramChoice,
     }
 }
 
-/// CUE indexes are decoded-sample boundaries, generally not compressed
-/// packet boundaries. Stream-copy cuts would lose/gain packets and sometimes
-/// decoder padding; make each lossy re-encode at the highest practical source
-/// quality rather than letting FFmpeg silently select its 128 kb/s defaults.
-fn lossy_quality_args(encoder: &str, source_bps: Option<u64>, channels: u8)
-    -> Result<Vec<String>,String>
+/// Lossy CUE images are split by FFmpeg's packet segmenter, never by
+/// decoding and re-encoding. A single sequential pass over each image assigns
+/// every source audio packet to exactly one part. Verification compares every
+/// demuxed compressed packet byte-for-byte before any part can be published.
+fn is_lossy(segment: &NativeCueSegment) -> bool {
+    matches!(segment.encoder.as_str(), "libmp3lame"|"aac"|"libvorbis"|"libopus")
+}
+
+fn packet_segment_paths(segment: &NativeCueSegment, work: &Path, ordinal: usize)
+    -> Vec<PathBuf>
 {
-    let source = source_bps.filter(|value|*value > 0)
-        .ok_or("Cannot establish lossy CUE source bitrate")?;
-    let boosted = source.saturating_add(source / 4);
-    let mut args = Vec::new();
-    let mut add = |key: &str,value: String| {
-        args.push(key.into()); args.push(value);
-    };
-    match encoder {
-        "libmp3lame" => {
-            if source > 320_000 {
-                return Err(format!("MP3 source bitrate {source} exceeds its 320 kb/s encoder ceiling"));
-            }
-            add("-b:a", "320000".into());
+    (0..=segment.packet_cut_samples.len()).map(|index|
+        work.join(format!("cue-packets-{ordinal}-{index:06}.{}",segment.extension))).collect()
+}
+
+fn packet_segment_command(segment: &NativeCueSegment, work: &Path, ordinal: usize)
+    -> Result<ToolCommand,String>
+{
+    let mut args: Vec<String> = ["-hide_banner","-nostdin","-loglevel","error","-xerror","-y"]
+        .into_iter().map(str::to_owned).collect();
+    args.extend(["-i".into(),utf8_path(&segment.image)?,"-map".into(),"0:a:0".into(),
+        "-vn".into(),"-sn".into(),"-dn".into(),"-map_metadata".into(),"-1".into(),
+        "-c:a".into(),"copy".into()]);
+    if segment.packet_cut_samples.is_empty() {
+        // The segment muxer defaults to a two-second split without explicit
+        // boundaries. One-track CUE images need a direct, single-file remux.
+        args.extend(["-f".into(),segment.muxer.clone()]);
+        if segment.extension == "mp3" {
+            args.extend(["-write_xing".into(),"0".into()]);
         }
-        "aac" => {
-            // AAC has no 320 kb/s MP3-style ceiling; preserve high-rate
-            // multichannel and high-rate stereo images instead of capping.
-            add("-b:a", boosted.max(320_000).to_string());
+        args.push(utf8_path(&packet_segment_paths(segment,work,ordinal)[0])?);
+    } else {
+        let cuts = segment.packet_cut_samples.iter().map(|sample|format!("{:.9}",
+            *sample as f64 / f64::from(segment.sample_rate)))
+            .collect::<Vec<_>>().join(",");
+        args.extend(["-f".into(),"segment".into(),"-segment_times".into(),cuts,
+            "-reset_timestamps".into(),"1".into(),
+            "-segment_format".into(),segment.muxer.clone()]);
+        // The MP3 muxer otherwise inserts a new Xing frame into each output.
+        if segment.extension == "mp3" {
+            args.extend(["-segment_format_options".into(),"write_xing=0".into()]);
         }
-        "libvorbis" => {
-            // Vorbis is quality-based VBR. The highest codec quality level
-            // preserves far more detail than an arbitrary ABR default.
-            add("-b:a", boosted.max(384_000).to_string());
-            add("-q:a", "10".into());
-        }
-        "libopus" => {
-            // libopus limits mono to 256 kb/s, stereo to 510 kb/s, and
-            // multichannel to 256 kb/s per channel. A single stereo ceiling
-            // wrongly rejects valid 5.1 sources and a stereo floor fails mono.
-            let ceiling = match channels {
-                0 => return Err("Opus CUE source has no audio channels".into()),
-                1 => 256_000,
-                2 => 510_000,
-                count => u64::from(count) * 256_000,
-            };
-            // The source may be a whole-file bitrate estimate including Ogg
-            // overhead. Clamp to the encoder's limit instead of rejecting an
-            // otherwise valid source that appears slightly above the ceiling.
-            add("-b:a", boosted.max(384_000).min(ceiling).to_string());
-            add("-vbr", "off".into());
-        }
-        _ => return Err(format!("Not a supported lossy CUE encoder: {encoder}")),
+        args.push(utf8_path(&work.join(format!("cue-packets-{ordinal}-%06d.{}",
+            segment.extension)))?);
     }
-    Ok(args)
+    Ok(ToolCommand {binary:ToolBinary::Ffmpeg,args,secret_args:Vec::new(),cwd:None,
+        environment_policy:tonepoet_pipeline::CommandEnvironmentPolicy::InheritAndSet,
+        env:Vec::new(),timeout:Duration::from_secs(6*60*60)})
+}
+
+fn packet_input(path: &Path) -> Result<(ffmpeg_next::format::context::Input,usize),String> {
+    crate::tui::probe::ensure_ffmpeg_init_pub();
+    let input = ffmpeg_next::format::input(path)
+        .map_err(|error|format!("Cannot inspect compressed packets of {}: {error}",path.display()))?;
+    let index = input.streams().best(ffmpeg_next::media::Type::Audio)
+        .ok_or_else(||format!("No audio packets in {}",path.display()))?.index();
+    Ok((input,index))
+}
+
+fn verify_packet_partition(source: &Path, parts: &[PathBuf]) -> Result<(),String> {
+    let (mut original,source_index)=packet_input(source)?;
+    let mut packets=original.packets().filter(|(stream,_)|stream.index()==source_index);
+    for part in parts {
+        let (mut output,index)=packet_input(part)?;
+        let mut count=0usize;
+        for (_,packet) in output.packets().filter(|(stream,_)|stream.index()==index) {
+            let (_,expected)=packets.next().ok_or_else(||format!(
+                "Packet-copy split added audio packets: {}",part.display()))?;
+            if expected.data()!=packet.data() {
+                return Err(format!("Packet-copy split changed audio packet payload: {}",
+                    part.display()));
+            }
+            count+=1;
+        }
+        if count==0 {return Err(format!("CUE packet-cut produced an empty audio part: {}",
+            part.display()));}
+    }
+    if packets.next().is_some() {
+        return Err(format!("Packet-copy split lost source audio packets: {}",source.display()));
+    }
+    Ok(())
+}
+
+fn verify_packet_file_equal(expected: &Path, actual: &Path) -> Result<(),String> {
+    let (mut left,li)=packet_input(expected)?;
+    let (mut right,ri)=packet_input(actual)?;
+    let mut source=left.packets().filter(|(stream,_)|stream.index()==li);
+    let mut output=right.packets().filter(|(stream,_)|stream.index()==ri);
+    loop {
+        match (source.next(),output.next()) {
+            (None,None)=>return Ok(()),
+            (Some((_,a)),Some((_,b))) if a.data()==b.data()=>{},
+            _=>return Err(format!("Tagging altered compressed audio packets in {}",
+                actual.display())),
+        }
+    }
 }
 
 fn ape_wav_encoder(bits: Option<u32>) -> Result<&'static str,String> {
@@ -278,9 +327,6 @@ fn encode_command(job: &NativeExtractionJob, program: &NativeProgramChoice,
         args.extend(["-sample_fmt".into(),"s32".into(),
             "-bits_per_raw_sample".into(),"24".into()]);
     }
-    if matches!(segment.encoder.as_str(),"libmp3lame"|"aac"|"libvorbis"|"libopus") {
-        args.extend(lossy_quality_args(&segment.encoder,segment.source_bit_rate,segment.channels)?);
-    }
     if job.transfer_tags {
         let tags = track_tags(job,program,track);
         let fields = [
@@ -321,6 +367,8 @@ pub(super) async fn execute_inner(
     let estimated_bytes_total = job.programs.iter().flat_map(|p|&p.tracks)
         .try_fold(0u64,|sum,track|sum.checked_add(track.estimated_bytes?));
     let mut published = Vec::new();
+    // One single-pass segmenter execution per distinct compressed image.
+    let mut packet_cache: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
     let (mut done,mut skipped) = (0usize,0usize);
     let (mut bytes_done,mut bytes_skipped,mut bytes_published) = (0u64,0u64,0u64);
     let mut emit = |current: String,current_file: Option<PathBuf>,estimate:Option<u64>,
@@ -356,12 +404,33 @@ pub(super) async fn execute_inner(
             }
             verify_segment(segment)?;
             let completed = temp.path().join(format!("cue-{pi}-{}.{}",track.number,segment.extension));
-            controls.watch_file(completed.clone(),format!("Encoding {}",track.name),
+            controls.watch_file(completed.clone(),format!("Preparing {}",track.name),
                 track.estimated_bytes,false);
-            emit(format!("Encoding {}",track.name),Some(completed.clone()),track.estimated_bytes,
+            emit(format!("Preparing {}",track.name),Some(completed.clone()),track.estimated_bytes,
                 done,skipped,&published,bytes_done,bytes_skipped,bytes_published);
             let result: Result<(),String> = async {
-                if segment.encoder == "mac" {
+                if is_lossy(segment) {
+                    if !packet_cache.contains_key(&segment.image) {
+                        let ordinal=packet_cache.len();
+                        let parts=packet_segment_paths(segment,temp.path(),ordinal);
+                        runner.run(packet_segment_command(segment,temp.path(),ordinal)?,&item)
+                            .await.map_err(|error|format!("Lossy CUE packet-copy split refused: {error}"))?;
+                        controls.wait_ready(&cancel,&item).await?;
+                        if !parts.iter().all(|path|path.is_file()) {
+                            return Err("Lossy CUE packet-copy split did not produce every part; image refused".into());
+                        }
+                        let original=segment.image.clone();
+                        let check=parts.clone();
+                        tokio::task::spawn_blocking(move ||verify_packet_partition(&original,&check))
+                            .await.map_err(|error|format!("Packet-verification task: {error}"))??;
+                        packet_cache.insert(segment.image.clone(),parts);
+                    }
+                    let part=packet_cache.get(&segment.image)
+                        .and_then(|parts|parts.get(segment.packet_part_index))
+                        .ok_or("Missing copied CUE packet part")?;
+                    fs::copy(part,&completed).map_err(|error|
+                        format!("Copy compressed packets into track: {error}"))?;
+                } else if segment.encoder == "mac" {
                     let wav = temp.path().join(format!("cue-{pi}-{}-ape-input.wav",track.number));
                     controls.watch_file(wav.clone(),format!("Decoding {} for APE",track.name),
                         track.estimated_bytes,false);
@@ -390,6 +459,17 @@ pub(super) async fn execute_inner(
                             track.name,segment.end_sample-segment.start_sample,frames));
                     }
                 }
+                if is_lossy(segment) && job.transfer_tags && segment.extension != "aac" {
+                    // Raw ADTS AAC has no ordinary writable tag container.
+                    // Never fail an otherwise exact packet copy merely to
+                    // attempt embedded metadata on that carrier.
+                    let mut fields=selected_tag_items(&track_tags(&job,program,track),job.tag_fields);
+                    fields.push((lofty::tag::ItemKey::TrackNumber,Some(track.number.to_string())));
+                    let output=completed.clone();
+                    tokio::task::spawn_blocking(move ||
+                        write_completed_native_metadata(&output,&fields,None))
+                        .await.map_err(|error|format!("CUE packet-copy tag task: {error}"))??;
+                }
                 if segment.encoder == "mac" && job.transfer_tags {
                     let mut fields = selected_tag_items(&track_tags(&job,program,track),job.tag_fields);
                     fields.push((lofty::tag::ItemKey::TrackNumber,Some(track.number.to_string())));
@@ -409,6 +489,14 @@ pub(super) async fn execute_inner(
                             write_completed_native_metadata(&completed_copy,&[],Some(&artwork)))
                             .await.map_err(|error|format!("CUE artwork embedding task: {error}"))??;
                     }
+                }
+                if is_lossy(segment) {
+                    let original=packet_cache.get(&segment.image)
+                        .and_then(|parts|parts.get(segment.packet_part_index))
+                        .ok_or("Missing original packet part after tagging")?.clone();
+                    let written=completed.clone();
+                    tokio::task::spawn_blocking(move ||verify_packet_file_equal(&original,&written))
+                        .await.map_err(|error|format!("Packet recheck task: {error}"))??;
                 }
                 File::open(&completed).and_then(|file|file.sync_all())
                     .map_err(|error|format!("Sync encoded CUE track: {error}"))?;
@@ -474,44 +562,26 @@ mod tests {
             end_sample:200,total_samples:300,sample_rate:44100,extension:"flac".into(),
             encoder:"flac".into(),muxer:"flac".into(),sample_bits:Some(16),channels:2,
             source_length:0,source_modified:None,cue_length:0,cue_modified:None,
-            source_bit_rate:None};
+            source_bit_rate:None,packet_cut_samples:Vec::new(),packet_part_index:0};
         assert!(verify_segment(&s).is_err());
     }
 
     #[test]
-    fn cue_lossy_qualities_do_not_fall_back_to_128k_defaults() {
-        assert_eq!(lossy_quality_args("libmp3lame",Some(320_000),2).unwrap(),
-            vec!["-b:a","320000"]);
-        assert_eq!(lossy_quality_args("aac",Some(256_000),2).unwrap(),
-            vec!["-b:a","320000"]);
-        assert_eq!(lossy_quality_args("aac",Some(512_000),2).unwrap(),
-            vec!["-b:a","640000"]);
-        assert_eq!(lossy_quality_args("libvorbis",Some(256_000),2).unwrap(),
-            vec!["-b:a","384000","-q:a","10"]);
-        // Mono never requests a bitrate above libopus's 256 kb/s limit.
-        assert_eq!(lossy_quality_args("libopus",Some(96_000),1).unwrap(),
-            vec!["-b:a","256000","-vbr","off"]);
-        // Whole-image fallback estimates may include Ogg overhead.
-        assert_eq!(lossy_quality_args("libopus",Some(258_000),1).unwrap(),
-            vec!["-b:a","256000","-vbr","off"]);
-        assert_eq!(lossy_quality_args("libopus",Some(256_000),2).unwrap(),
-            vec!["-b:a","384000","-vbr","off"]);
-        assert_eq!(lossy_quality_args("libopus",Some(512_000),2).unwrap(),
-            vec!["-b:a","510000","-vbr","off"]);
-        // Six channels can retain high-rate 5.1 audio instead of being
-        // refused under the stereo ceiling.
-        assert_eq!(lossy_quality_args("libopus",Some(768_000),6).unwrap(),
-            vec!["-b:a","960000","-vbr","off"]);
-        assert_eq!(lossy_quality_args("libopus",Some(1_536_000),6).unwrap(),
-            vec!["-b:a","1536000","-vbr","off"]);
-        assert!(lossy_quality_args("libopus",Some(96_000),0).is_err());
-        assert!(lossy_quality_args("libmp3lame",Some(400_000),2).is_err());
-        assert!(lossy_quality_args("aac",None,2).is_err());
-        for (depth,codec) in [(8,"pcm_u8"),(16,"pcm_s16le"),
-            (24,"pcm_s24le"),(32,"pcm_s32le")] {
-            assert_eq!(ape_wav_encoder(Some(depth)).unwrap(),codec);
-        }
-        assert!(ape_wav_encoder(None).is_err());
+    fn lossy_split_command_never_encodes_or_filters_audio() {
+        let segment=NativeCueSegment {
+            presentation:PresentationId::CueAlbum(1),number:1,
+            cue_path:"a.cue".into(),image:"a.mp3".into(),start_sample:0,
+            end_sample:48_000,total_samples:96_000,sample_rate:48_000,
+            extension:"mp3".into(),encoder:"libmp3lame".into(),muxer:"mp3".into(),
+            sample_bits:None,channels:2,source_length:0,source_modified:None,
+            cue_length:0,cue_modified:None,source_bit_rate:None,
+            packet_cut_samples:vec![48_000],packet_part_index:0,
+        };
+        let command=packet_segment_command(&segment,Path::new("/tmp"),0).unwrap();
+        let args=command.args;
+        assert!(args.windows(2).any(|part|part==["-c:a","copy"]));
+        assert!(args.windows(2).any(|part|part==["-segment_times","1.000000000"]));
+        assert!(!args.iter().any(|arg|arg=="-af" || arg=="libmp3lame"));
     }
 
     #[test]
@@ -525,4 +595,119 @@ mod tests {
         assert!(!output_overwrites_input(&temp.path().join("track.flac"),
             &[source.as_path()]));
     }
+
+    #[test]
+    fn one_track_packet_command_is_direct_copy_for_all_lossy_carriers() {
+        for (extension,muxer) in [
+            ("mp3","mp3"),("m4a","ipod"),("aac","adts"),
+            ("ogg","ogg"),("opus","opus"),
+        ] {
+            let segment=NativeCueSegment {
+                presentation:PresentationId::CueAlbum(1),number:1,
+                cue_path:"album.cue".into(),image:PathBuf::from(format!("image.{extension}")),
+                start_sample:0,end_sample:288_000,total_samples:288_000,sample_rate:48_000,
+                extension:extension.into(),encoder:"not-used".into(),muxer:muxer.into(),
+                sample_bits:None,channels:2,source_length:0,source_modified:None,
+                cue_length:0,cue_modified:None,source_bit_rate:None,
+                packet_cut_samples:vec![],packet_part_index:0,
+            };
+            let args=packet_segment_command(&segment,Path::new("/tmp"),5).unwrap().args;
+            assert!(args.windows(2).any(|pair|pair==["-c:a","copy"]),"{extension}");
+            assert!(args.windows(2).any(|pair|pair==["-f",muxer]),"{extension}");
+            assert!(!args.iter().any(|arg|arg=="segment" || arg=="-segment_times" ||
+                arg=="-reset_timestamps" || arg=="-af" || arg=="not-used"),"{extension}");
+            let expected=Path::new("/tmp").join(format!("cue-packets-5-000000.{extension}"));
+            assert_eq!(args.last().map(String::as_str),expected.to_str());
+            if extension=="mp3" {
+                assert!(args.windows(2).any(|pair|pair==["-write_xing","0"]));
+            } else {assert!(!args.iter().any(|arg|arg=="-write_xing"));}
+            assert_eq!(packet_segment_paths(&segment,Path::new("/tmp"),5).len(),1);
+        }
+    }
+
+    #[tokio::test]
+    async fn real_cue_extraction_copies_all_packets_for_single_track_and_three_cuts() {
+        if std::process::Command::new("ffmpeg").arg("-version").output().is_err() {
+            eprintln!("Skipping real lossy CUE extraction fixture: ffmpeg unavailable");
+            return;
+        }
+        let root=tempfile::tempdir().unwrap();
+        for (extension,encoder,muxer) in [
+            ("mp3","libmp3lame","mp3"), ("m4a","aac","ipod"),
+            ("aac","aac","adts"), ("ogg","libvorbis","ogg"),
+            ("opus","libopus","opus"),
+        ] {
+            let input=root.path().join(format!("source.{extension}"));
+            let fixture=std::process::Command::new("ffmpeg")
+                .args(["-hide_banner","-loglevel","error","-nostdin","-y",
+                    "-f","lavfi","-i","sine=frequency=440:sample_rate=48000:duration=4.5",
+                    "-ac","2","-c:a",encoder,"-b:a","128k"])
+                .arg(&input).output().unwrap();
+            assert!(fixture.status.success(),"{extension} fixture: {}",
+                String::from_utf8_lossy(&fixture.stderr));
+            let cue=root.path().join(format!("album.{extension}.cue"));
+            fs::write(&cue,format!("FILE \"source.{extension}\" WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n")).unwrap();
+            let (samples,rate)=crate::tui::accuraterip::probe_sample_count(&input).unwrap();
+            assert!(samples>2*rate as u64);
+            let image_meta=fs::metadata(&input).unwrap();
+            let cue_meta=fs::metadata(&cue).unwrap();
+            let segment=NativeCueSegment {
+                presentation:PresentationId::CueAlbum(1),number:1,
+                cue_path:cue.clone(),image:input.clone(),
+                start_sample:0,end_sample:samples,total_samples:samples,sample_rate:rate,
+                extension:extension.into(),encoder:encoder.into(),muxer:muxer.into(),
+                sample_bits:None,channels:2,source_length:image_meta.len(),
+                source_modified:image_meta.modified().ok(),cue_length:cue_meta.len(),
+                cue_modified:cue_meta.modified().ok(),source_bit_rate:None,
+                packet_cut_samples:vec![],packet_part_index:0,
+            };
+            let mut job=super::super::tests::fixture_job(
+                &root.path().join(format!("output-{extension}")),root.path());
+            job.format=DiscFormat::CueImage;
+            job.source=cue.clone();
+            job.programs[0].id=segment.presentation;
+            job.programs[0].is_lossless=false;
+            job.programs[0].source_rate=Some(rate);
+            job.programs[0].source_depth=None;
+            job.programs[0].source_codec=encoder.into();
+            job.programs[0].tracks[0].name="Single".into();
+            job.cue_segments=vec![segment.clone()];
+            job.cue_input_paths=vec![cue.clone(),input.clone()];
+            job.program_subfolders=false;
+            job.round4_layout=true;
+            job.naming_template="%TITLE%".into();
+            let report=super::super::execute(job.clone(),CancellationToken::new(),|_|{})
+                .await.unwrap_or_else(|error|panic!("{extension}: {error}"));
+            assert_eq!(report.published.len(),1,"{extension}");
+            assert_eq!(report.published[0].extension().and_then(|ext|ext.to_str()),Some(extension));
+            verify_packet_partition(&input,&report.published).unwrap();
+            // Three explicit boundaries still use the original single-pass
+            // segment muxer. Exercise the actual worker for this MP3 case.
+            if extension=="mp3" {
+                let mut four=job;
+                four.destination=root.path().join("four-tracks");
+                let cuts=vec![rate as u64,2*rate as u64,3*rate as u64];
+                let mut start=0;
+                four.programs[0].tracks.clear();
+                four.cue_segments.clear();
+                for (index,end) in cuts.iter().copied().chain([samples]).enumerate() {
+                    let number=(index+1) as u32;
+                    four.programs[0].tracks.push(NativeTrackChoice {
+                        number,name:format!("Part {number}"),tags:NativeTagValues::default(),
+                        duration_secs:None,estimated_bytes:None,
+                    });
+                    four.cue_segments.push(NativeCueSegment {
+                        number,start_sample:start,end_sample:end,
+                        packet_cut_samples:cuts.clone(),packet_part_index:index,..segment.clone()
+                    });
+                    start=end;
+                }
+                let report=super::super::execute(four,CancellationToken::new(),|_|{})
+                    .await.unwrap();
+                assert_eq!(report.published.len(),4);
+                verify_packet_partition(&input,&report.published).unwrap();
+            }
+        }
+    }
+
 }

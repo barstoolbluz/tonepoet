@@ -32,6 +32,7 @@ pub mod cue_generate;
 pub mod chapter_authoring;
 pub mod cue_parser;
 pub mod cue_extract;
+pub mod archive_extract;
 pub mod dr_report;
 pub mod draw;
 pub mod draw_browse;

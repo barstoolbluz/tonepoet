@@ -266,6 +266,10 @@ pub struct DiscBrowserState {
     /// CUE geometry per presentation in the exact order of `contents`.
     /// Only selected tracks are projected into the durable native job.
     pub cue_segments: Vec<Vec<crate::convert::pipeline::native_extract::NativeCueSegment>>,
+    pub archive_members: Vec<crate::convert::pipeline::native_extract::NativeArchiveMember>,
+    pub archive_length: u64,
+    pub archive_modified: Option<SystemTime>,
+    pub archive_password: Option<String>,
     pub focus: ExtractFocus,
     /// Same title-bar window state as Folder Properties and Recovery.
     pub maximized: bool,
@@ -384,7 +388,7 @@ impl DiscBrowserState {
             p.extract.ineligible_reason.is_none()
                 && !matches!(p.id, PresentationId::BluRayTitle { display_angle, .. } if display_angle.get() != 1)
                 && match contents.format {
-                DiscFormat::Sacd | DiscFormat::DvdAudio | DiscFormat::Matroska | DiscFormat::TransportFile | DiscFormat::CueImage => true,
+                DiscFormat::Sacd | DiscFormat::DvdAudio | DiscFormat::Matroska | DiscFormat::TransportFile | DiscFormat::CueImage | DiscFormat::Archive => true,
                 DiscFormat::DvdVideo | DiscFormat::BluRay =>
                     (0..index).all(|earlier| contents.presentations[earlier].extract.ineligible_reason.is_some()),
             }
@@ -401,7 +405,7 @@ impl DiscBrowserState {
                 && (
                 matches!(contents.format, DiscFormat::DvdVideo | DiscFormat::BluRay)
                 || (contents.format != DiscFormat::Sacd && !matches!(contents.format,
-                    DiscFormat::Matroska | DiscFormat::TransportFile | DiscFormat::CueImage) && p.format.lossless
+                    DiscFormat::Matroska | DiscFormat::TransportFile | DiscFormat::CueImage | DiscFormat::Archive) && p.format.lossless
                     && p.format.bit_depth.is_none())
             ) { None } else { Some(Ok(Default::default())) }
         }).collect();
@@ -416,6 +420,10 @@ impl DiscBrowserState {
             probe_path: source_path.clone(),
             items_checked,
             cue_segments: Vec::new(),
+            archive_members: Vec::new(),
+            archive_length: 0,
+            archive_modified: None,
+            archive_password: None,
             focus: ExtractFocus::Programs,
             maximized: false,
             item_cursor: 0,
@@ -588,6 +596,10 @@ impl DiscBrowserState {
     fn native_item_payload_bytes(&self, p: &DiscPresentation, track: &DiscTrack) -> Option<u64> {
         if self.contents.format == DiscFormat::TransportFile {
             return p.extract.transport_audio_bytes;
+        }
+        if self.contents.format == DiscFormat::Archive {
+            return self.archive_members.iter().find(|item|item.number==track.number)
+                .map(|item|item.size);
         }
         if self.contents.format == DiscFormat::CueImage {
             let segment = self.cue_segments.iter().flatten().find(|segment|
@@ -766,6 +778,40 @@ impl DiscBrowserState {
         }
     }
 
+    /// An archive unpacks *all* members into scratch before publishing selected
+    /// files, including when Overwrite=Skip. Budget that complete input tree,
+    /// then one private copy plus the net sequence of atomic publications.
+    fn archive_space_budget(&self, key:&NativeSpaceKey) -> NativeSpaceCache {
+        use crate::convert::pipeline::native_extract::NativeOverwritePolicy;
+        let staged=self.archive_members.iter().fold(0_u64,|sum,entry|
+            sum.saturating_add(entry.size).saturating_add(4096));
+        let mut delta=0_i128;
+        let mut shared_peak=i128::from(staged);
+        let mut dest_peak=0_i128;
+        let mut scratch_peak=staged;
+        for output in &key.outputs {
+            let existing=if key.overwrite==NativeOverwritePolicy::Fail {None}
+                else {fs::symlink_metadata(&output.path).ok()};
+            if key.overwrite==NativeOverwritePolicy::Skip && existing.is_some() {continue;}
+            let bytes=output.audio_bytes.saturating_add(4096);
+            let old=existing.filter(|meta|meta.is_file()).map_or(0,|meta|meta.len());
+            let next=i128::from(bytes);
+            // During a Replace, the old target stays until the complete new
+            // output is atomically installed. Scratch retains the unpacked tree.
+            shared_peak=shared_peak.max(i128::from(staged)+delta+next*2);
+            dest_peak=dest_peak.max(delta+next);
+            scratch_peak=scratch_peak.max(staged.saturating_add(bytes));
+            delta+=next-i128::from(old);
+            shared_peak=shared_peak.max(i128::from(staged)+delta);
+            dest_peak=dest_peak.max(delta);
+        }
+        let logs=if key.extraction_log {128*1024_u64}else{0};
+        let positive=|n:i128|n.max(0).min(i128::from(u64::MAX)) as u64;
+        NativeSpaceCache {key:key.clone(),required:positive(shared_peak).saturating_add(logs),
+            destination_required:positive(dest_peak).saturating_add(logs),
+            working_required:scratch_peak.saturating_add(logs)}
+    }
+
     /// Budget for a shared filesystem; the same cached inventory also
     /// produces separate working/destination budgets for cross-volume output.
     /// Skip excludes untouched targets. Replace budgets the
@@ -780,6 +826,12 @@ impl DiscBrowserState {
             if let Some(cache) = self.native_space_cache.borrow().as_ref() {
                 if cache.key == key { return Some(cache.required); }
             }
+        }
+        if key.format == DiscFormat::Archive {
+            let budget=self.archive_space_budget(&key);
+            let needed=budget.required;
+            *self.native_space_cache.borrow_mut()=Some(budget);
+            return Some(needed);
         }
         if key.format == DiscFormat::TransportFile {
             let budget = self.transport_space_budget(&key);
@@ -1049,7 +1101,7 @@ impl DiscBrowserState {
         }
         rows.extend(["Files", "Tags", "Log"]);
         if self.file_per_program && self.contents.format != DiscFormat::CueImage && (self.matroska_cue_available() ||
-            !matches!(self.contents.format, DiscFormat::Sacd | DiscFormat::Matroska | DiscFormat::TransportFile)) {
+            !matches!(self.contents.format, DiscFormat::Sacd | DiscFormat::Matroska | DiscFormat::TransportFile | DiscFormat::Archive)) {
             rows.push("CUE");
         }
         rows.extend(["Folder", "Naming"]);
@@ -1122,6 +1174,10 @@ impl DiscBrowserState {
     }
 
     pub fn tag_source_label(&self, index: usize) -> &'static str {
+        if self.contents.format == DiscFormat::Archive {
+            return if index==0 {"Original member tags (names only)"}
+                else if index==1 {"Original member tags"} else {"Unknown source"};
+        }
         if self.contents.format == DiscFormat::CueImage {
             return match index {
                 0 => "CUE track and album tags",
@@ -1150,9 +1206,12 @@ impl DiscBrowserState {
         use TagSheetControl as C;
         let mut controls = vec![C::Transfer];
         if self.tags {
-            controls.push(C::Source);
+            // Archive members have one authoritative tag source: their own
+            // embedded tags. Do not present two identical precedence choices.
+            if self.contents.format != DiscFormat::Archive {controls.push(C::Source);}
             controls.extend((0..NATIVE_TAG_FIELD_LABELS.len()).map(C::Field));
-            controls.extend([C::All, C::None, C::Artwork]);
+            controls.extend([C::All, C::None]);
+            if self.contents.format != DiscFormat::Archive {controls.push(C::Artwork);}
             let (_, dff) = self.selected_sacd_tag_carriers();
             if dff { controls.push(C::UseDsf); }
         }
@@ -1160,7 +1219,7 @@ impl DiscBrowserState {
         // Disc metadata editors operate on ISO/folder sources and have no
         // Matroska target. Do not offer actions that silently do nothing or
         // mutate the user's input file through a side route.
-        if matches!(self.contents.format, DiscFormat::Matroska | DiscFormat::TransportFile | DiscFormat::CueImage) {
+        if matches!(self.contents.format, DiscFormat::Matroska | DiscFormat::TransportFile | DiscFormat::CueImage | DiscFormat::Archive) {
             controls.push(C::Done);
         } else {
             controls.extend([C::EditValues, C::MusicBrainz, C::Done]);
@@ -1172,7 +1231,7 @@ impl DiscBrowserState {
     /// never the highlighted individual track's title. An authored PCM track
     /// is not known until preparation; don't present navigation as written tags.
     pub fn tag_preview_is_pending(&self) -> bool {
-        !matches!(self.contents.format, DiscFormat::Sacd | DiscFormat::Matroska | DiscFormat::TransportFile | DiscFormat::CueImage)
+        !matches!(self.contents.format, DiscFormat::Sacd | DiscFormat::Matroska | DiscFormat::TransportFile | DiscFormat::CueImage | DiscFormat::Archive)
             && self.tag_source != crate::convert::pipeline::native_extract::NativeTagSource::DiscAndSidecar
     }
 
@@ -1181,7 +1240,7 @@ impl DiscBrowserState {
         let Some(p) = self.contents.presentations.get(self.cursor) else { return NativeTagValues::default(); };
         let Some(program) = self.native_program_choice(self.cursor, p, Some(self.item_cursor))
             else { return NativeTagValues::default(); };
-        if matches!(self.contents.format, DiscFormat::Matroska | DiscFormat::TransportFile | DiscFormat::CueImage) {
+        if matches!(self.contents.format, DiscFormat::Matroska | DiscFormat::TransportFile | DiscFormat::CueImage | DiscFormat::Archive) {
             use crate::convert::pipeline::native_extract::NativeTagSource;
             let authored = program.authored_tags.as_ref().map(|values| values.album.clone())
                 .unwrap_or_default();
@@ -1320,6 +1379,9 @@ impl DiscBrowserState {
     /// selected-program projection that supplies the worker's paths.
     pub fn native_output_layout_hint(&self) -> String {
         let job = self.native_job(PathBuf::new());
+        if job.format == DiscFormat::Archive {
+            return "Archived subfolders are retained; tagged audio may be renamed in place.".into();
+        }
         if job.programs.len() == 1 && !job.program_subfolders {
             let root=crate::convert::pipeline::native_extract::native_program_output_root(
                 &job,&job.programs[0]);
@@ -1382,6 +1444,16 @@ impl DiscBrowserState {
             if let Some(segment) = self.cue_segments.get(self.cursor)
                 .and_then(|segments|segments.get(self.item_cursor)) {
                 job.cue_segments.push(segment.clone());
+            }
+        }
+        if self.contents.format == DiscFormat::Archive {
+            if let Some(track) = program.tracks.first() {
+                if !job.archive_members.iter().any(|member|member.number==track.number) {
+                    if let Some(member) = self.archive_members.iter()
+                        .find(|member|member.number==track.number) {
+                        job.archive_members.push(member.clone());
+                    }
+                }
             }
         }
         if self.file_per_program {
@@ -1526,7 +1598,7 @@ impl DiscBrowserState {
                     tags_to_native(if mb_only { sidecar }
                         else if sidecar_first { sidecar.prioritized(&authored) }
                         else { authored.prioritized(&sidecar) })
-                } else if matches!(self.contents.format, DiscFormat::Matroska | DiscFormat::TransportFile | DiscFormat::CueImage) {
+                } else if matches!(self.contents.format, DiscFormat::Matroska | DiscFormat::TransportFile | DiscFormat::CueImage | DiscFormat::Archive) {
                     tags_to_native(p.extract.authored_track_tags.get(j).cloned().unwrap_or_default())
                 } else { NativeTagValues {
                     title: if matches!(self.contents.format, DiscFormat::DvdVideo | DiscFormat::BluRay) {
@@ -1547,7 +1619,7 @@ impl DiscBrowserState {
             })
         };
         (!tracks.is_empty()).then(|| NativeProgramChoice{
-            id:p.id, angle:self.selected_angle_for(i), label:if self.contents.format == DiscFormat::CueImage {
+            id:p.id, angle:self.selected_angle_for(i), label:if matches!(self.contents.format,DiscFormat::CueImage | DiscFormat::Archive) {
                 p.label.clone()
             } else {p.id.compact_label()}, tracks,
             keep_dst:self.keep_dst.get(i) == Some(&true),
@@ -1608,14 +1680,21 @@ impl DiscBrowserState {
                 .collect::<Vec<_>>();
             paths.sort(); paths.dedup(); paths
         } else { Vec::new() };
+        let archive_members = if self.contents.format==DiscFormat::Archive {
+            self.archive_members.iter().filter(|member|self.items_checked.get(0)
+                .and_then(|items|items.get(member.number.saturating_sub(1) as usize))==Some(&true))
+                .cloned().collect()
+        } else {Vec::new()};
         NativeExtractionJob{ disc_identity, source:self.source_path.clone(),format:self.contents.format,
-            programs, cue_segments, cue_input_paths, destination:self.destination.clone(), working_root,
+            programs, cue_segments, cue_input_paths,archive_members,
+            archive_length:self.archive_length, archive_modified:self.archive_modified,
+            archive_password:self.archive_password.clone(), destination:self.destination.clone(), working_root,
             wav_container:self.wav_container, assume_decrypted:self.assume_decrypted,downmix:self.downmix,
             naming_template:self.naming_template.clone(), program_subfolders,
             overwrite_policy:self.overwrite_policy, extraction_log:self.extraction_log,
             program_log_paths:Vec::new(), round4_layout:true,
             file_per_program:self.file_per_program, cue:self.cue && self.contents.format != DiscFormat::CueImage && (self.contents.format != DiscFormat::Matroska ||
-                self.matroska_cue_available()) && self.contents.format != DiscFormat::TransportFile,
+                self.matroska_cue_available()) && !matches!(self.contents.format, DiscFormat::TransportFile | DiscFormat::Archive),
             transfer_tags:self.tags && self.native_tags_available(),
             sacd_dff:self.sacd_dff,
             tag_source:self.tag_source,
@@ -2247,6 +2326,7 @@ pub fn source_info_for_presentation(
             DiscFormat::Matroska => "Matroska".to_string(),
             DiscFormat::TransportFile => "Standalone M2TS/VOB".to_string(),
             DiscFormat::CueImage => "CUE image".to_string(),
+            DiscFormat::Archive => "Archive".to_string(),
         },
         codec: fmt.codec.clone().unwrap_or_else(|| presentation.label.clone()),
         bit_depth: fmt.bit_depth,
@@ -2303,7 +2383,8 @@ pub fn presentation_id_supports_stream_conversion(id: &PresentationId) -> bool {
         // selector for either Matroska or standalone MPEG transports.
         PresentationId::MatroskaStream { .. }
         | PresentationId::TransportStream { .. }
-        | PresentationId::CueAlbum(_) => false,
+        | PresentationId::CueAlbum(_)
+        | PresentationId::ArchiveFiles => false,
     }
 }
 
@@ -2369,7 +2450,8 @@ pub fn apply_presentation_to_source_options(
         // not the authored-disc conversion SourceOptions bridge.
         PresentationId::MatroskaStream { .. }
         | PresentationId::TransportStream { .. }
-        | PresentationId::CueAlbum(_) => false,
+        | PresentationId::CueAlbum(_)
+        | PresentationId::ArchiveFiles => false,
     }
 }
 
@@ -3640,4 +3722,45 @@ mod transport_space_budget_tests {
         assert!(!blockers.iter().any(|blocker| blocker.contains("Source size pending")
             || blocker.contains("filesystem needs")), "{blockers:?}");
     }
+
+    #[test]
+    fn unchecked_archive_member_has_valid_preview_but_no_output() {
+        use crate::convert::pipeline::native_extract::NativeArchiveMember;
+        use crate::disc::model::DiscExtractTagFields;
+        use super::disc_selection_bridge_tests::disc_contents;
+        let mut contents=disc_contents(DiscFormat::Archive,PresentationId::ArchiveFiles,"archive.zip");
+        let presentation=&mut contents.presentations[0];
+        presentation.tracks[0].title=Some("First".into());
+        let mut second=presentation.tracks[0].clone();
+        second.number=2;
+        second.title=Some("Second".into());
+        presentation.tracks.push(second);
+        presentation.extract.authored_track_tags=vec![
+            DiscExtractTagFields {title:Some("First".into()),..Default::default()},
+            DiscExtractTagFields {title:Some("Second".into()),..Default::default()},
+        ];
+        let mut state=DiscBrowserState::new(contents,std::env::temp_dir().join("archive.zip"));
+        state.destination=std::env::temp_dir().join("archive-unchecked-preview");
+        state.archive_members=vec![
+            NativeArchiveMember {number:1,relative_path:"Disc 1/first.flac".into(),
+                size:5,tagged_audio:true,tag_track_number:Some(3)},
+            NativeArchiveMember {number:2,relative_path:"cover.jpg".into(),
+                size:5,tagged_audio:false,tag_track_number:None},
+        ];
+        state.item_cursor=0;
+        state.items_checked[0][0]=false;
+        let unchecked=state.native_preview_path_for_template("%TITLE%").unwrap();
+        assert_eq!(unchecked,state.destination.join("Disc 1/First.flac"));
+        assert_eq!(state.native_job(PathBuf::from("/tmp/scratch")).archive_members.len(),1);
+        let published=state.native_output_paths_for_template("%TITLE%");
+        assert_eq!(published,vec![state.destination.join("cover.jpg")]);
+        state.items_checked[0][0]=true;
+        assert_eq!(state.native_preview_path_for_template("%TITLE%"),Some(unchecked.clone()));
+        state.items_checked[0][0]=false;
+        assert_eq!(state.native_preview_path_for_template("%TRACKNUMBER% - %TITLE%"),
+            Some(state.destination.join("Disc 1/03 - First.flac")));
+        assert_eq!(state.native_output_paths_for_template("%TRACKNUMBER% - %TITLE%"),
+            vec![state.destination.join("cover.jpg")]);
+    }
+
 }

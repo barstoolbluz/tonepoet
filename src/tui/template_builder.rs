@@ -96,6 +96,9 @@ const NATIVE_BLURAY: TokenCategory = TokenCategory {
 const NATIVE_MATROSKA: TokenCategory = TokenCategory {
     label: "Matroska", tokens: &["STREAM"],
 };
+const NATIVE_ARCHIVE: TokenCategory = TokenCategory {
+    label: "Archive", tokens: &[],
+};
 
 fn format_native_tokens(format: crate::disc::DiscFormat) -> &'static TokenCategory {
     match format {
@@ -105,6 +108,7 @@ fn format_native_tokens(format: crate::disc::DiscFormat) -> &'static TokenCatego
         crate::disc::DiscFormat::BluRay => &NATIVE_BLURAY,
         crate::disc::DiscFormat::Matroska | crate::disc::DiscFormat::TransportFile => &NATIVE_MATROSKA,
         crate::disc::DiscFormat::CueImage => &NATIVE_MATROSKA,
+        crate::disc::DiscFormat::Archive => &NATIVE_ARCHIVE,
     }
 }
 
