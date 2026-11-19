@@ -148,9 +148,21 @@ pub fn draw_ui(f: &mut Frame, app: &mut AppState) {
             super::kitty_transport::buffer_has_sixel_upload(f.buffer_mut()),
         None => false,
     };
-    if has_upload && app.defer_unverified_tmux_image_upload() {
-        f.buffer_mut().reset();
-        draw_ui(f, app);
+    let sixel_upload = if matches!(native, Some(super::tmux_images::NativeProtocol::Sixel))
+        && has_upload
+    {
+        super::kitty_transport::sixel_upload_fingerprint(f.buffer_mut())
+    } else { None };
+    if has_upload && native.is_some_and(|protocol|
+        app.defer_unverified_tmux_image_upload(protocol, sixel_upload))
+    {
+        if app.native_tmux_image_protocol().is_none() {
+            // No inspection worker could start: use the existing safe picker.
+            f.buffer_mut().reset();
+            draw_ui(f, app);
+        } else {
+            super::kitty_transport::suppress_unverified_tmux_graphics(f.buffer_mut());
+        }
         return;
     }
     let transport_result = match native {
@@ -167,9 +179,10 @@ pub fn draw_ui(f: &mut Frame, app: &mut AppState) {
         draw_ui(f, app);
         return;
     }
-    if has_upload && matches!(native, Some(super::tmux_images::NativeProtocol::Kitty)) {
-        // Kitty uploads once; the next new image needs its own fresh proof.
-        app.tmux_kitty_upload_committed();
+    if has_upload {
+        if let Some(protocol) = native {
+            app.tmux_native_image_upload_committed(protocol, sixel_upload);
+        }
     }
 }
 

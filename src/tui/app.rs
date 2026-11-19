@@ -16249,10 +16249,13 @@ pub struct AppState {
     tmux_image_check_rx: Option<mpsc::Receiver<Option<super::tmux_images::ImageSupport>>>,
     tmux_image_last_check_started: Option<std::time::Instant>,
     tmux_image_recheck_after_pending: bool,
-    /// An upload found before fresh proof is redrawn from the current cache
-    /// after its asynchronous inspection completes.
+    /// A first upload deferred pending fresh forwarding evidence must be
+    /// regenerated on worker completion (Kitty's send is one-shot).
     tmux_image_retry_upload: bool,
     tmux_image_upload_preflight: bool,
+    /// Sixel is emitted on each render. Its last verified payload may redraw
+    /// without starting another tmux process, unlike a new image payload.
+    tmux_verified_sixel_upload: Option<u64>,
     /// Malformed native output disables native tmux images until restart.
     tmux_image_transport_fault: bool,
     /// Monotonic generation for terminal image protocol/cell-size changes.
@@ -16266,6 +16269,22 @@ pub struct AppState {
     pub image_kitty_retransmit_generation: usize,
     // Caches
     pub tool_check_cache: once_cell::sync::OnceCell<Vec<(String, String, bool)>>,
+}
+
+/// A just-inspected pane authorizes the deferred upload. Once Sixel was
+/// verified, its unchanged payload and origin may redraw without rechecking.
+fn tmux_native_upload_needs_preflight(
+    protocol: super::tmux_images::NativeProtocol,
+    fresh_proof: bool,
+    verified_sixel: Option<u64>,
+    current_sixel: Option<u64>,
+) -> bool {
+    if fresh_proof { return false; }
+    match protocol {
+        super::tmux_images::NativeProtocol::Kitty => true,
+        super::tmux_images::NativeProtocol::Sixel =>
+            current_sixel.is_none_or(|current| Some(current) != verified_sixel),
+    }
 }
 
 /// A session override takes precedence over persistent settings. Both only
@@ -17277,6 +17296,7 @@ impl AppState {
             tmux_image_recheck_after_pending: false,
             tmux_image_retry_upload: false,
             tmux_image_upload_preflight: false,
+            tmux_verified_sixel_upload: None,
             tmux_image_transport_fault: false,
             image_picker_generation: 0,
             image_repaint_generation: 0,
@@ -17876,9 +17896,14 @@ impl AppState {
         if tmux_like_current_environment() {
             self.tmux_image_support = None;
             self.tmux_image_upload_preflight = false;
+            self.tmux_verified_sixel_upload = None;
             self.request_tmux_image_refresh(true);
         }
         self.rebuild_terminal_image_picker();
+        // A real terminal resize invalidates the screen layout even when the
+        // graphics protocol itself remains unchanged. This does not occur on
+        // ordinary tmux capability observations or image-upload retries.
+        self.force_redraw = true;
     }
 
     /// Initiate a bounded control-plane inspection on a worker. Called on
@@ -17910,9 +17935,9 @@ impl AppState {
         }
     }
 
-    /// Nonblocking reduction of worker output, on the existing event loop.
-    /// A deferred first upload requires a fresh protocol even when the
-    /// attached-client set was unchanged: the old one-shot was not sent.
+    /// Nonblocking reduction of the single in-flight tmux control-plane query.
+    /// A completed proof is consumed by the next native upload; preparing the
+    /// corresponding protocol cache does not itself invalidate that proof.
     pub(super) fn poll_tmux_image_refresh(&mut self) -> bool {
         let observation = match self.tmux_image_check_rx.as_ref() {
             Some(rx) => match rx.try_recv() {
@@ -17926,46 +17951,62 @@ impl AppState {
         if self.tmux_image_recheck_after_pending {
             self.tmux_image_recheck_after_pending = false;
             self.request_tmux_image_refresh(true);
+            if self.tmux_image_check_rx.is_none() {
+                self.disable_failed_tmux_image_transport();
+                return true;
+            }
             return false;
         }
-        self.tmux_image_upload_preflight = true;
         let changed = self.tmux_image_support != observation;
+        if changed { self.tmux_verified_sixel_upload = None; }
         self.tmux_image_support = observation;
+        // Only an upload already withheld for this check may use its result
+        // immediately. A capability-only observation can predate async image
+        // preparation, so the first actual upload must request fresh proof.
+        self.tmux_image_upload_preflight =
+            self.tmux_image_support.is_some() && self.tmux_image_retry_upload;
         let rebuild = changed || self.tmux_image_retry_upload;
         self.tmux_image_retry_upload = false;
         if rebuild { self.rebuild_terminal_image_picker(); }
         rebuild
     }
 
-    /// Image preparation after the last inspection may finish while the pane
-    /// is hidden. Refresh asynchronously before the newly encoded pixels can
-    /// reach tmux; ordinary placeholder/text redraws do not trigger a check.
-    pub(super) fn tmux_image_preview_changed(&mut self) {
-        // Any fresh image preparation can complete after a window switch,
-        // even milliseconds after the last inspection. It must get its own
-        // off-thread forwarding check, without a timer or a UI-thread call.
-        if self.tmux_image_support.is_some() {
-            self.tmux_image_upload_preflight = false;
-            self.request_tmux_image_refresh(true);
+    /// A native payload is checked only once for the current content. Kitty
+    /// has a one-shot transfer; Sixel may reappear on normal redraws but an
+    /// identical, already-verified payload does not need another subprocess.
+    pub(super) fn defer_unverified_tmux_image_upload(
+        &mut self,
+        protocol: super::tmux_images::NativeProtocol,
+        sixel_upload: Option<u64>,
+    ) -> bool {
+        if !tmux_native_upload_needs_preflight(
+            protocol,
+            self.tmux_image_upload_preflight,
+            self.tmux_verified_sixel_upload,
+            sixel_upload,
+        ) {
+            return false;
         }
-    }
-
-    /// Called only for a native graphics payload. If its transport has not
-    /// been checked since this image was prepared, defer it and redraw with
-    /// halfblocks while the control-plane worker is running. Never spend up
-    /// to 750 ms in the renderer, or consume a hidden pane's one-shot upload.
-    pub(super) fn defer_unverified_tmux_image_upload(&mut self) -> bool {
-        if self.tmux_image_upload_preflight { return false; }
-        self.tmux_image_retry_upload = true;
-        self.request_tmux_image_refresh(true);
-        self.image_picker.protocol_type = ratatui_image::picker::ProtocolType::Halfblocks;
-        self.image_picker_generation = self.image_picker_generation.saturating_add(1);
-        self.invalidate_terminal_image_preview_caches();
-        self.request_image_preview_repaint();
+        if !self.tmux_image_retry_upload {
+            self.tmux_image_retry_upload = true;
+            if self.tmux_image_check_rx.is_some() {
+                // A pre-existing inquiry may precede this image preparation.
+                // Ask for exactly one fresh observation, not one per redraw.
+                self.tmux_image_recheck_after_pending = true;
+            } else {
+                self.request_tmux_image_refresh(true);
+            }
+        }
+        if self.tmux_image_check_rx.is_none() {
+            // Worker creation failed. Never let unchecked graphics escape.
+            self.disable_failed_tmux_image_transport();
+        }
         true
     }
 
     fn rebuild_terminal_image_picker(&mut self) {
+        use ratatui_image::picker::ProtocolType;
+        let previous = self.image_picker.protocol_type;
         self.image_picker = new_terminal_image_picker(
             self.queried_image_cell_size,
             self.tmux_image_support.as_ref(),
@@ -17974,12 +18015,21 @@ impl AppState {
         self.image_picker_generation = self.image_picker_generation.saturating_add(1);
         self.invalidate_terminal_image_preview_caches();
         self.request_image_preview_repaint();
-        self.force_redraw = true;
+        // Only a true native-protocol removal/switch needs a terminal clear.
+        // A retry of the same native image must use Ratatui's non-clearing diff.
+        if previous != self.image_picker.protocol_type && previous != ProtocolType::Halfblocks {
+            self.force_redraw = true;
+        }
     }
 
-    pub(super) fn tmux_kitty_upload_committed(&mut self) {
-        // Only new Kitty transfers (not subsequent placeholder redraws)
-        // require renewed forwarding proof.
+    pub(super) fn tmux_native_image_upload_committed(
+        &mut self,
+        protocol: super::tmux_images::NativeProtocol,
+        sixel_upload: Option<u64>,
+    ) {
+        if protocol == super::tmux_images::NativeProtocol::Sixel {
+            self.tmux_verified_sixel_upload = sixel_upload;
+        }
         self.tmux_image_upload_preflight = false;
     }
 
@@ -17998,6 +18048,10 @@ impl AppState {
         self.tmux_image_transport_fault = true;
         self.tmux_image_support = None;
         self.tmux_image_check_rx = None;
+        self.tmux_image_retry_upload = false;
+        self.tmux_image_recheck_after_pending = false;
+        self.tmux_image_upload_preflight = false;
+        self.tmux_verified_sixel_upload = None;
         self.rebuild_terminal_image_picker();
     }
 
@@ -25115,6 +25169,30 @@ mod terminal_image_protocol_environment_tests {
         assert_eq!(super::trusted_tmux_picker_cell_size(
             super::preferred_image_cell_size_override(None, None), Some(&estimated),
         ), None);
+    }
+
+    #[test]
+    fn native_upload_gate_is_stable_after_a_validated_sixel_upload() {
+        use super::super::tmux_images::NativeProtocol::{Kitty, Sixel};
+        use super::tmux_native_upload_needs_preflight as check;
+
+        // An unverified new image is held until the async worker proves that
+        // tmux can forward its upload. The result authorizes one transfer.
+        assert!(check(Sixel, false, None, Some(10)));
+        assert!(!check(Sixel, true, None, Some(10)));
+        // After that upload, ordinary redraws with the identical payload
+        // never start another inspection, regardless of their number.
+        for _ in 0..100 {
+            assert!(!check(Sixel, false, Some(10), Some(10)));
+        }
+        assert!(check(Sixel, false, Some(10), Some(11)),
+            "new image bytes require a fresh tmux observation");
+        assert!(check(Sixel, false, Some(10), None),
+            "unknown upload identity may not bypass the gate");
+        // Kitty has a one-shot upload; placeholders on later frames are
+        // handled by the draw path and never call this gate.
+        assert!(check(Kitty, false, None, None));
+        assert!(!check(Kitty, true, None, None));
     }
 
     #[test]

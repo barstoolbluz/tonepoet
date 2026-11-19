@@ -431,6 +431,37 @@ pub(super) fn buffer_has_sixel_upload(buffer: &ratatui::buffer::Buffer) -> bool 
     buffer.content.iter().any(|cell| cell.symbol().contains(SIXEL_DCS))
 }
 
+/// A Sixel payload is repeated on ordinary widget redraws. Identical pixels
+/// at the same origin may use an already-fresh forwarding check; a changed
+/// payload/origin requires a new worker inspection. No image data is copied.
+pub(super) fn sixel_upload_fingerprint(buffer: &ratatui::buffer::Buffer) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut seen = false;
+    for (index, cell) in buffer.content.iter().enumerate() {
+        if cell.symbol().contains(SIXEL_DCS) {
+            index.hash(&mut hasher);
+            cell.symbol().hash(&mut hasher);
+            seen = true;
+        }
+    }
+    seen.then(|| hasher.finish())
+}
+
+/// Never send an unverified native image or Kitty placeholder to tmux. This
+/// affects only the transient frame, not the protocol picker/cache: once the
+/// worker replies, a single cache rebuild can perform the real upload.
+pub(super) fn suppress_unverified_tmux_graphics(buffer: &mut ratatui::buffer::Buffer) {
+    for cell in &mut buffer.content {
+        let symbol = cell.symbol();
+        if symbol.contains(SIXEL_DCS) || symbol.contains(APC_START)
+            || symbol.contains(TMUX_DCS) || symbol.contains('\u{10eeee}')
+        {
+            cell.set_symbol(" ");
+        }
+    }
+}
+
 /// Retain the pinned Sixel encoder and its clearing behavior. Reject a
 /// malformed DCS before it reaches the terminal. Do not wrap cursor-control
 /// sequences together with Sixel, since tmux must own their pane placement.
@@ -474,6 +505,39 @@ pub(super) fn wrap_tmux_sixel_buffer(buffer: &mut ratatui::buffer::Buffer) -> Re
 #[cfg(test)]
 mod tmux_tests {
     use super::*;
+
+    #[test]
+    fn sixel_identity_changes_only_with_payload_or_placement() {
+        use ratatui::{buffer::Buffer, layout::Rect};
+        let mut buf = Buffer::empty(Rect::new(0, 0, 3, 1));
+        buf.get_mut(0, 0).set_symbol("\x1bPq#0~\x1b\\");
+        let first = sixel_upload_fingerprint(&buf).unwrap();
+        buf.get_mut(2, 0).set_symbol("new status text");
+        assert_eq!(sixel_upload_fingerprint(&buf), Some(first),
+            "ordinary text redraws do not invalidate an image upload");
+        buf.get_mut(0, 0).set_symbol("\x1bPq#1~\x1b\\");
+        let different = sixel_upload_fingerprint(&buf).unwrap();
+        assert_ne!(different, first);
+        buf.get_mut(0, 0).set_symbol(" ");
+        buf.get_mut(1, 0).set_symbol("\x1bPq#0~\x1b\\");
+        assert_ne!(sixel_upload_fingerprint(&buf), Some(first),
+            "moving the origin requires another forwarding check");
+    }
+
+    #[test]
+    fn an_unverified_image_is_suppressed_without_erasing_other_ui() {
+        use ratatui::{buffer::Buffer, layout::Rect};
+        let mut buf = Buffer::empty(Rect::new(0, 0, 4, 1));
+        buf.get_mut(0, 0).set_symbol("\x1bPq#0~\x1b\\");
+        buf.get_mut(1, 0).set_symbol("\x1b_Ga=T,q=2,m=0;QUJD\x1b\\");
+        buf.get_mut(2, 0).set_symbol("\u{10eeee}");
+        buf.get_mut(3, 0).set_symbol("status");
+        suppress_unverified_tmux_graphics(&mut buf);
+        for x in 0..3 { assert_eq!(buf.get(x, 0).symbol(), " "); }
+        assert_eq!(buf.get(3, 0).symbol(), "status");
+        suppress_unverified_tmux_graphics(&mut buf);
+        assert_eq!(buf.get(3, 0).symbol(), "status");
+    }
 
     #[test]
     fn sixel_is_wrapped_without_hiding_tmux_owned_cursor_commands() {

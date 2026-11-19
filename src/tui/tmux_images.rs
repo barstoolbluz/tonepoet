@@ -66,7 +66,7 @@ pub(super) fn inspect() -> Option<ImageSupport> {
     // -A resolves pane, window, and global inheritance exactly as tmux uses
     // it when forwarding DCS passthrough from this pane (tmux 3.5a).
     let passthrough = tmux_output(&[
-        "show-options", "-p", "-A", "-v", "-t", &pane, "allow-passthrough",
+        "show-options", "-p", "-A", "-v", "-t", &pane, PASSTHROUGH_OPTION,
     ])?;
     if !passthrough_allowed(&passthrough) || !pane_can_forward(&pane, &passthrough) {
         return None;

@@ -61,15 +61,18 @@ fn deserialize_image_cell_size_pixels<'de, D>(deserializer: D) -> Result<Option<
 where
     D: serde::Deserializer<'de>,
 {
-    let size = Option::<[u16; 2]>::deserialize(deserializer)?;
-    if let Some([width, height]) = size {
-        if !valid_image_cell_size(width, height) {
-            return Err(serde::de::Error::custom(
-                "images.cell_size_pixels must be [width, height] with width 1..=256 and height 1..=512",
-            ));
-        }
+    // Deserialize to Vec first: a fixed-size array visitor in some TOML/Serde
+    // versions accepts surplus elements. Do not silently discard a third value.
+    let values = Vec::<u16>::deserialize(deserializer)?;
+    let [width, height]: [u16; 2] = values.try_into().map_err(|_| {
+        serde::de::Error::custom("images.cell_size_pixels must have exactly two integers")
+    })?;
+    if !valid_image_cell_size(width, height) {
+        return Err(serde::de::Error::custom(
+            "images.cell_size_pixels must be [width, height] with width 1..=256 and height 1..=512",
+        ));
     }
-    Ok(size)
+    Ok(Some([width, height]))
 }
 
 impl ImagesConfig {
@@ -2443,17 +2446,18 @@ mod theme_config_tests {
         config.images.cell_size_pixels = Some([9, 18]);
         let encoded = toml::to_string_pretty(&config).expect("serialize override");
         assert!(encoded.contains("[images]"));
-        assert!(encoded.contains("cell_size_pixels = [9, 18]"));
+        assert!(encoded.contains("cell_size_pixels"), "serialization must retain the option");
         let roundtrip: TonepoetConfig = toml::from_str(&encoded).expect("load override");
         assert_eq!(roundtrip.images.configured_cell_size(), Some((9, 18)));
-        assert!(serialize_public_config(&roundtrip).expect("save config")
-            .contains("cell_size_pixels = [9, 18]"));
+        let saved = serialize_public_config(&roundtrip).expect("save config");
+        let restored: TonepoetConfig = toml::from_str(&saved).expect("reload saved config");
+        assert_eq!(restored.images.configured_cell_size(), Some((9, 18)));
     }
 
     #[test]
     fn image_cell_pixels_reject_invalid_configurations() {
         for size in ["[0, 18]", "[9, 0]", "[257, 18]", "[9, 513]",
-                     "[9]", "[9, 18, 1]", "[-1, 18]", "[\"9\", 18]"] {
+                     "[9]", "[9, 18, 1]", "[]", "[9, 18, 19, 20]", "[-1, 18]", "[\"9\", 18]"] {
             let source = format!("cell_size_pixels = {size}\n");
             assert!(toml::from_str::<ImagesConfig>(&source).is_err(),
                 "invalid pixel-cell dimensions must be rejected: {size}");
