@@ -245,3 +245,196 @@ mod tests {
         assert!(compress_kitty_upload(&original).is_none());
     }
 }
+
+// tmux requires DCS passthrough *around each Kitty APC*, not around the whole
+// image cell (which also contains ordinary cursor control and Unicode image
+// placeholders). The latter must reach tmux itself to remain pane-local.
+const TMUX_DCS: &str = "\x1bPtmux;";
+
+/// Wrap raw Kitty upload commands for the tmux server while retaining their
+/// normal Unicode placeholder cells. Every command carries q=2, including
+/// continuations; neither tmux nor the terminal should reply to the TUI.
+/// An unrecognized command is a hard failure, not a raw passthrough attempt.
+pub(super) fn wrap_tmux_kitty_apcs(symbol: &str) -> Result<Option<String>, ()> {
+    if !symbol.contains(APC_START) && !symbol.contains(TMUX_DCS) { return Ok(None); }
+    let bytes = symbol.as_bytes();
+    let mut output = String::with_capacity(symbol.len().saturating_add(128));
+    let mut pos = 0;
+    let mut changed = false;
+    while pos < bytes.len() {
+        let dcs = symbol[pos..].find(TMUX_DCS).map(|offset| pos + offset);
+        let apc = symbol[pos..].find(APC_START).map(|offset| pos + offset);
+        // Already-wrapped commands are left unchanged. Scan escape-doubled
+        // tmux bytes rather than treating the inner APC's ST as a DCS end.
+        if let Some(start) = dcs.filter(|start| apc.is_none_or(|apc| *start < apc)) {
+            output.push_str(&symbol[pos..start]);
+            let end = tmux_dcs_end(symbol, start).ok_or(())?;
+            if !quiet_tmux_kitty_dcs(symbol, start, end) { return Err(()); }
+            output.push_str(&symbol[start..end]);
+            pos = end;
+            continue;
+        }
+        let Some(start) = apc else {
+            output.push_str(&symbol[pos..]);
+            break;
+        };
+        output.push_str(&symbol[pos..start]);
+        let content = &symbol[start + APC_START.len()..];
+        let separator = content.find(';').ok_or(())?;
+        let header = &content[..separator];
+        if header.is_empty() || header.len() > 256 || header.bytes().any(|byte|
+            !matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'=' | b',' | b'-'))
+        {
+            return Err(());
+        }
+        // Only stream uploads (not capability queries, file paths, or shared
+        // memory) are valid here. These are the actions emitted by the pinned
+        // ratatui-image Kitty upload path.
+        if !safe_tmux_kitty_upload_header(header) { return Err(()); }
+        let body = &content[separator + 1..];
+        let end = body.find(APC_END).ok_or(())?;
+        let payload = &body[..end];
+        if payload.len() > 64 * 1024 || !payload.bytes().all(|byte|
+            matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' | b'='))
+        {
+            return Err(());
+        }
+        let mut quiet = false;
+        let mut safe_header = String::with_capacity(header.len() + 4);
+        for part in header.split(',') {
+            if part.is_empty() { return Err(()); }
+            if part.starts_with("q=") {
+                if quiet { return Err(()); }
+                quiet = true;
+                if !safe_header.is_empty() { safe_header.push(','); }
+                safe_header.push_str("q=2");
+            } else {
+                if !safe_header.is_empty() { safe_header.push(','); }
+                safe_header.push_str(part);
+            }
+        }
+        if !quiet { safe_header.push_str(",q=2"); }
+        let mut raw_apc = String::with_capacity(safe_header.len() + payload.len() + 8);
+        raw_apc.push_str(APC_START);
+        raw_apc.push_str(&safe_header);
+        raw_apc.push(';');
+        raw_apc.push_str(payload);
+        raw_apc.push_str(APC_END);
+        output.push_str(TMUX_DCS);
+        for character in raw_apc.chars() {
+            if character == '\x1b' { output.push('\x1b'); }
+            output.push(character);
+        }
+        output.push_str(APC_END);
+        pos = start + APC_START.len() + separator + 1 + end + APC_END.len();
+        changed = true;
+    }
+    Ok(changed.then_some(output))
+}
+
+fn tmux_dcs_end(symbol: &str, start: usize) -> Option<usize> {
+    let bytes = symbol.as_bytes();
+    let mut pos = start + TMUX_DCS.len();
+    while pos < bytes.len() {
+        if bytes[pos] == 0x1b {
+            match *bytes.get(pos + 1)? {
+                0x1b => { pos += 2; continue; }
+                b'\\' => return Some(pos + 2),
+                _ => return None,
+            }
+        }
+        pos += 1;
+    }
+    None
+}
+
+fn safe_tmux_kitty_upload_header(header: &str) -> bool {
+    if parameter(header, "t").is_some_and(|transport| transport != "d") {
+        return false; // file/shm paths are not available over SSH
+    }
+    match parameter(header, "a") {
+        Some("T" | "t") => true,
+        None => parameter(header, "m").is_some(), // continuation chunk
+        _ => false,
+    }
+}
+
+/// A pinned image crate may itself wrap Kitty commands when TMUX is set.
+/// Never trust that opaque DCS blindly: validate that it holds one quiet,
+/// direct stream upload, without a reply-producing capability query.
+fn quiet_tmux_kitty_dcs(symbol: &str, start: usize, end: usize) -> bool {
+    let bytes = symbol.as_bytes();
+    let interior = &bytes[start + TMUX_DCS.len()..end - APC_END.len()];
+    if interior.len() > 64 * 1024 + 512 { return false; }
+    let mut raw = Vec::with_capacity(interior.len());
+    let mut pos = 0;
+    while pos < interior.len() {
+        if interior[pos] == 0x1b {
+            if interior.get(pos + 1) != Some(&0x1b) { return false; }
+            pos += 2;
+            raw.push(0x1b);
+        } else {
+            raw.push(interior[pos]);
+            pos += 1;
+        }
+    }
+    let Ok(apc) = std::str::from_utf8(&raw) else { return false; };
+    let Some(command) = apc.strip_prefix(APC_START).and_then(|part| part.strip_suffix(APC_END))
+    else { return false; };
+    let Some((header, payload)) = command.split_once(';') else { return false; };
+    safe_tmux_kitty_upload_header(header)
+        && header.split(',').filter(|part| part.starts_with("q=")).eq(["q=2"])
+        && payload.len() <= 64 * 1024
+        && payload.bytes().all(|byte| matches!(byte,
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' | b'='))
+}
+
+/// Called only when tmux capability was established. Every protocol-producing
+/// widget, including Browse, metadata previews, and file-picker images, uses
+/// this one final-buffer transport before ratatui sends output to the pane.
+pub(super) fn wrap_tmux_kitty_buffer(buffer: &mut ratatui::buffer::Buffer) -> Result<(), ()> {
+    for cell in &mut buffer.content {
+        match wrap_tmux_kitty_apcs(cell.symbol()) {
+            Ok(Some(wrapped)) => { cell.set_symbol(&wrapped); },
+            Ok(None) => {},
+            Err(()) => return Err(()),
+        };
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tmux_tests {
+    use super::*;
+
+    #[test]
+    fn wraps_every_chunk_while_retaining_placeholders_and_silencing_replies() {
+        let input = "\x1b[0m\x1b_Ga=T,f=24,i=7,q=1,m=1;QUJD\x1b\\\x1b_Gi=7,m=0;REVG\x1b\\\u{10eeee}rest";
+        let wrapped = wrap_tmux_kitty_apcs(input).unwrap().unwrap();
+        assert_eq!(wrapped.matches(TMUX_DCS).count(), 2);
+        assert_eq!(wrapped.matches("q=2").count(), 2);
+        assert!(wrapped.starts_with("\x1b[0m"));
+        assert!(wrapped.ends_with("\u{10eeee}rest"));
+        assert!(wrapped.contains("\x1bPtmux;\x1b\x1b_Ga=T"));
+        assert!(wrapped.contains("\x1b\x1b\\\x1b\\"));
+        assert!(wrap_tmux_kitty_apcs(&wrapped).unwrap().is_none(),
+            "a second transport pass must not double-wrap APCs");
+        let unsafe_wrapped = wrapped.replacen("q=2", "q=1", 1);
+        assert!(wrap_tmux_kitty_apcs(&unsafe_wrapped).is_err(),
+            "already-wrapped commands must still suppress terminal replies");
+    }
+
+    #[test]
+    fn malformed_kitty_commands_never_pass_through_raw() {
+        for command in [
+            "\x1b_Ga=T,q=1,q=0;QUJD\x1b\\",
+            "\x1b_Ga=T;QUJD",
+            "\x1b_Ga=T;ABC\x1b[31m\x1b\\",
+            "\x1b_Ga=T;ABC!!\x1b\\",
+            "\x1b_G;AAA\x1b\\",
+        ] {
+            assert!(wrap_tmux_kitty_apcs(command).is_err(), "{command:?}");
+        }
+        assert!(wrap_tmux_kitty_apcs("normal text\u{10eeee}").unwrap().is_none());
+    }
+}

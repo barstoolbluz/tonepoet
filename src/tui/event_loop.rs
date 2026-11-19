@@ -517,7 +517,10 @@ pub async fn run_app(
         // prepares protocols after genuine source/geometry changes. Mouse
         // movement cannot invalidate the cached native graphics protocol.
         // Post-draw prepare remains necessary for geometry first seen here.
-        let image_changed = timed_prepare_image_preview_protocols(app);
+        // Attached tmux clients can change while this TUI is running. The
+        // control-plane check is throttled and never reads pane input.
+        let tmux_capabilities_changed = app.refresh_tmux_kitty_if_due();
+        let image_changed = timed_prepare_image_preview_protocols(app) || tmux_capabilities_changed;
         // `force_redraw` means the terminal diff buffer is suspected to be
         // invalid and a full clear is required before drawing. Ordinary async
         // reducer progress must not set it: the loop below uses a zero-timeout

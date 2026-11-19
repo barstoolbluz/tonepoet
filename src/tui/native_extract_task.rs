@@ -203,6 +203,31 @@ fn send_to_tui(tx: &mpsc::Sender<AppMessage>, _session_id: u64, message: AppMess
     }
 }
 
+/// The helper has already exited (and was reaped) before this is called.
+/// Only a clean, durable success may release its exported journal lease;
+/// failed/aborted work retains Recovery authority exactly as before.
+fn finish_reaped_native_extraction(
+    journal: FileTaskJournalHandle,
+    result: Result<NativeExtractionReport, String>,
+    tx: &mpsc::Sender<AppMessage>,
+    session_id: u64,
+) {
+    let result = match result {
+        Ok(report) => match journal.retire_reaped_completed_native_reservation() {
+            Ok(()) => Ok(report),
+            Err(error) => {
+                log::error!("Native extraction published its files but reservation retirement failed: {error}");
+                Err(format!("Extraction published its files, but reservation retirement failed: {error}"))
+            }
+        },
+        Err(error) => {
+            drop(journal);
+            Err(error)
+        }
+    };
+    send_to_tui(tx, session_id, AppMessage::NativeExtractComplete { session_id, result });
+}
+
 fn supervise_detached_extraction(
     mut task: DurableNativeExtractionTask,
     resume_path: Option<PathBuf>,
@@ -345,19 +370,12 @@ fn supervise_detached_extraction(
                 send_to_tui(&tx, session_id, AppMessage::FileTaskProgress { session_id, update });
             }
             Ok(Ok(FileTaskWireEvent::NativeComplete { result })) => {
-                let _ = child.wait();
-                let completed = journal.load().ok().filter(|record| record.is_native_extraction()
-                    && record.lifecycle == DurableFileTaskLifecycle::Completed);
-                // Both the helper and this supervisor have held the same
-                // journal lease. Drop the last supervisor holder before
-                // retirement, but retain the journal as a Recovery receipt.
-                drop(journal);
-                if let Some(record) = completed {
-                    if let Err(error) = file_task_runtime::retire_completed_native_reservation(&record) {
-                        log::warn!("Native extraction completed but reservation retirement is pending: {error}");
-                    }
+                if let Err(error) = child.wait() {
+                    supervisor_failure(&tx, session_id,
+                        format!("Cannot confirm native extraction helper exit; Recovery retains its reservation: {error}"));
+                    return;
                 }
-                send_to_tui(&tx, session_id, AppMessage::NativeExtractComplete { session_id, result });
+                finish_reaped_native_extraction(journal, result, &tx, session_id);
                 return;
             }
             Ok(Ok(FileTaskWireEvent::Complete { .. })) => {
@@ -374,15 +392,7 @@ fn supervise_detached_extraction(
             if let Ok(Ok(FileTaskWireEvent::NativeComplete { result })) =
                 wire_rx.recv_timeout(Duration::from_millis(200))
             {
-                let completed = journal.load().ok().filter(|record| record.is_native_extraction()
-                    && record.lifecycle == DurableFileTaskLifecycle::Completed);
-                drop(journal);
-                if let Some(record) = completed {
-                    if let Err(error) = file_task_runtime::retire_completed_native_reservation(&record) {
-                        log::warn!("Native completion reservation retirement pending: {error}");
-                    }
-                }
-                send_to_tui(&tx, session_id, AppMessage::NativeExtractComplete { session_id, result });
+                finish_reaped_native_extraction(journal, result, &tx, session_id);
                 return;
             }
             let error = format!("Native extraction helper exited without a terminal result ({status}); inspect Recovery");

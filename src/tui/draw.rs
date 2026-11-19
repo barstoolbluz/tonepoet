@@ -135,6 +135,19 @@ pub fn draw_ui(f: &mut Frame, app: &mut AppState) {
     }
     // Context menus are the foreground text layer, above any image view.
     draw_overlay(f, app, theme);
+
+    // All image-bearing widgets share the same final Kitty transport. Wrap
+    // each APC for tmux, but leave Unicode placeholders and normal text for
+    // tmux to place within this pane. On malformed output, discard the frame
+    // and redraw with halfblocks; never send raw Kitty APCs through tmux.
+    if app.native_tmux_kitty_images_active()
+        && super::kitty_transport::wrap_tmux_kitty_buffer(f.buffer_mut()).is_err()
+    {
+        log::warn!("Unrecognized Kitty image command in tmux: restoring halfblocks");
+        app.disable_failed_tmux_kitty_transport();
+        f.buffer_mut().reset();
+        draw_ui(f, app);
+    }
 }
 
 /// Draw the wizard screen by delegating to tonepoet_wizard

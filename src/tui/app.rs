@@ -16242,6 +16242,12 @@ pub struct AppState {
     pub queried_image_cell_size: Option<(u16, u16)>,
     /// Terminal image protocol picker detected once at startup and refreshed on resize.
     pub image_picker: ratatui_image::picker::Picker,
+    /// Capability proved by tmux's control plane; never inferred from TERM_PROGRAM.
+    tmux_kitty_support: Option<super::tmux_images::KittySupport>,
+    tmux_kitty_checked: Option<std::time::Instant>,
+    /// A malformed output command disables Kitty until restart; never pass raw
+    /// unrecognized APCs through tmux after an output-transport failure.
+    tmux_kitty_transport_fault: bool,
     /// Monotonic generation for terminal image protocol/cell-size changes.
     pub image_picker_generation: usize,
     /// Render-only image repaint generation for auxiliary preview widgets.
@@ -16257,30 +16263,37 @@ pub struct AppState {
 
 fn new_terminal_image_picker(
     queried_cell_size: Option<(u16, u16)>,
+    tmux_support: Option<super::tmux_images::KittySupport>,
 ) -> ratatui_image::picker::Picker {
     use ratatui_image::picker::{Picker, ProtocolType};
 
-    // A user's explicit setting overrides both ioctl and the escape-sequence
-    // query. Otherwise prefer live ioctl dimensions (which can change with a
-    // font resize), then the last terminal response over SSH.
+    // Under tmux use per-client pixel geometry when known; SSH ioctl often
+    // reports 0 x 0. An explicit user setting always wins. Never probe the
+    // pane's terminal protocol or XTWINOPS while tmux owns the input stream.
     let configured = super::terminal_image_geometry::configured_cell_size();
+    let tmux_cell = tmux_support.and_then(|support| support.cell_size);
     let termios = Picker::from_termios().ok().filter(|picker| {
         picker.font_size.0 > 0 && picker.font_size.1 > 0
     });
-    let reliable_metrics = configured.is_some() || termios.is_some() || queried_cell_size.is_some();
+    let mut reliable_metrics = true;
     let mut picker = if let Some(size) = configured {
+        Picker::new(size)
+    } else if let Some(size) = tmux_cell {
         Picker::new(size)
     } else if let Some(picker) = termios {
         picker
     } else if let Some(size) = queried_cell_size {
         Picker::new(size)
     } else {
-        // With no measured cell size, pixel-based protocols cannot map
-        // images to terminal cells safely. Halfblocks are cell-based and
-        // need only a plausible pixel aspect ratio (1:2, not 8:12).
+        reliable_metrics = false;
+        // Halfblocks need cell geometry only, not pixel dimensions.
         Picker::new((10, 20))
     };
-    configure_terminal_image_picker_protocol_for_current_environment(&mut picker);
+    configure_terminal_image_picker_protocol(&mut picker,
+        terminal_image_protocol_probe_decision_for_current_environment_with_support(
+            tmux_support.is_some() && reliable_metrics,
+        ),
+    );
     if !reliable_metrics {
         picker.protocol_type = ProtocolType::Halfblocks;
     }
@@ -16290,12 +16303,14 @@ fn new_terminal_image_picker(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TerminalImageProtocolProbeDecision {
     ForceHalfblocks,
+    ForceKitty,
     GuessProtocol,
 }
 
 trait TerminalImagePickerProtocolProbe {
     fn protocol_type(&self) -> ratatui_image::picker::ProtocolType;
     fn force_halfblocks_protocol(&mut self);
+    fn force_kitty_protocol(&mut self);
     fn guess_terminal_protocol(&mut self);
 }
 
@@ -16308,19 +16323,13 @@ impl TerminalImagePickerProtocolProbe for ratatui_image::picker::Picker {
         self.protocol_type = ratatui_image::picker::ProtocolType::Halfblocks;
     }
 
+    fn force_kitty_protocol(&mut self) {
+        self.protocol_type = ratatui_image::picker::ProtocolType::Kitty;
+    }
+
     fn guess_terminal_protocol(&mut self) {
         ratatui_image::picker::Picker::guess_protocol(self);
     }
-}
-
-fn configure_terminal_image_picker_protocol_for_current_environment<P>(picker: &mut P)
-where
-    P: TerminalImagePickerProtocolProbe,
-{
-    configure_terminal_image_picker_protocol(
-        picker,
-        terminal_image_protocol_probe_decision_for_current_environment(),
-    );
 }
 
 fn configure_terminal_image_picker_protocol<P>(
@@ -16332,18 +16341,30 @@ where
 {
     match decision {
         TerminalImageProtocolProbeDecision::ForceHalfblocks => picker.force_halfblocks_protocol(),
+        TerminalImageProtocolProbeDecision::ForceKitty => picker.force_kitty_protocol(),
         TerminalImageProtocolProbeDecision::GuessProtocol => picker.guess_terminal_protocol(),
     }
 }
 
-fn terminal_image_protocol_probe_decision_for_current_environment(
+fn terminal_image_protocol_probe_decision_for_current_environment_with_support(
+    tmux_kitty_proven: bool,
 ) -> TerminalImageProtocolProbeDecision {
-    terminal_image_protocol_probe_decision_for_environment(
+    if std::env::var("TONEPOET_IMAGE_PROTOCOL").ok()
+        .is_some_and(|protocol| protocol.eq_ignore_ascii_case("halfblocks"))
+    {
+        return TerminalImageProtocolProbeDecision::ForceHalfblocks;
+    }
+    let decision = terminal_image_protocol_probe_decision_for_environment(
         std::env::var_os("TMUX").as_deref(),
         std::env::var_os("TERM_PROGRAM").as_deref(),
         std::env::var_os("TERM").as_deref(),
         std::env::var_os("BYOBU_BACKEND").as_deref(),
-    )
+    );
+    if decision == TerminalImageProtocolProbeDecision::ForceHalfblocks && tmux_kitty_proven {
+        TerminalImageProtocolProbeDecision::ForceKitty
+    } else {
+        decision
+    }
 }
 
 fn terminal_image_protocol_probe_decision_for_environment(
@@ -16359,16 +16380,6 @@ fn terminal_image_protocol_probe_decision_for_environment(
     }
 }
 
-fn enforce_safe_terminal_image_picker_protocol_for_current_environment<P>(picker: &mut P) -> bool
-where
-    P: TerminalImagePickerProtocolProbe,
-{
-    enforce_safe_terminal_image_picker_protocol(
-        picker,
-        terminal_image_protocol_probe_decision_for_current_environment(),
-    )
-}
-
 fn enforce_safe_terminal_image_picker_protocol<P>(
     picker: &mut P,
     decision: TerminalImageProtocolProbeDecision,
@@ -16381,9 +16392,17 @@ where
     {
         return false;
     }
-
     picker.force_halfblocks_protocol();
     true
+}
+
+fn tmux_like_current_environment() -> bool {
+    tmux_like_environment(
+        std::env::var_os("TMUX").as_deref(),
+        std::env::var_os("TERM_PROGRAM").as_deref(),
+        std::env::var_os("TERM").as_deref(),
+        std::env::var_os("BYOBU_BACKEND").as_deref(),
+    )
 }
 
 fn tmux_like_environment(
@@ -17208,7 +17227,10 @@ impl AppState {
             split_cue_album_grouping_cache: std::collections::HashMap::new(),
             last_artwork_picker_dir: None,
             queried_image_cell_size: None,
-            image_picker: new_terminal_image_picker(None),
+            image_picker: new_terminal_image_picker(None, None),
+            tmux_kitty_support: None,
+            tmux_kitty_checked: None,
+            tmux_kitty_transport_fault: false,
             image_picker_generation: 0,
             image_repaint_generation: 0,
             image_kitty_retransmit_generation: 0,
@@ -17778,7 +17800,9 @@ impl AppState {
     /// and before crossterm's input event reader starts. A bounded XTWINOPS
     /// query gets actual cell pixels even when the SSH PTY reports 0 x 0.
     pub fn probe_image_cell_size_at_tui_startup(&mut self) {
-        if super::terminal_image_geometry::configured_cell_size().is_none()
+        // Do not send XTWINOPS or any protocol query through tmux/byobu.
+        if !tmux_like_current_environment()
+            && super::terminal_image_geometry::configured_cell_size().is_none()
             && !ratatui_image::picker::Picker::from_termios()
                 .is_ok_and(|picker| picker.font_size.0 > 0 && picker.font_size.1 > 0)
         {
@@ -17797,12 +17821,60 @@ impl AppState {
     /// StatefulProtocol values after the terminal size/cell metrics change.
     /// Do not query stdin here: crossterm already owns the event reader.
     pub fn refresh_image_picker_after_resize(&mut self) {
-        self.image_picker = new_terminal_image_picker(self.queried_image_cell_size);
-        self.image_picker_generation = self.image_picker_generation.saturating_add(1);
+        self.refresh_tmux_kitty_capability(true);
+        self.rebuild_terminal_image_picker();
+    }
 
+    /// Check only tmux's control plane, no user-input or output protocol
+    /// queries. A changed set of attached clients or passthrough settings
+    /// invalidates protocol caches before any new image is encoded.
+    fn refresh_tmux_kitty_capability(&mut self, force: bool) -> bool {
+        if !tmux_like_current_environment() {
+            let changed = self.tmux_kitty_support.take().is_some();
+            self.tmux_kitty_checked = None;
+            return changed;
+        }
+        if !force && self.tmux_kitty_checked.is_some_and(|checked|
+            checked.elapsed() < std::time::Duration::from_secs(3))
+        {
+            return false;
+        }
+        self.tmux_kitty_checked = Some(std::time::Instant::now());
+        let support = if self.tmux_kitty_transport_fault || std::env::var("TONEPOET_IMAGE_PROTOCOL")
+            .ok().is_some_and(|value| value.eq_ignore_ascii_case("halfblocks"))
+        {
+            None
+        } else {
+            super::tmux_images::inspect()
+        };
+        if self.tmux_kitty_support == support { return false; }
+        self.tmux_kitty_support = support;
+        true
+    }
+
+    pub(super) fn refresh_tmux_kitty_if_due(&mut self) -> bool {
+        if !self.refresh_tmux_kitty_capability(false) { return false; }
+        self.rebuild_terminal_image_picker();
+        true
+    }
+
+    fn rebuild_terminal_image_picker(&mut self) {
+        self.image_picker = new_terminal_image_picker(self.queried_image_cell_size, self.tmux_kitty_support);
+        self.image_picker_generation = self.image_picker_generation.saturating_add(1);
         self.invalidate_terminal_image_preview_caches();
         self.request_image_preview_repaint();
         self.force_redraw = true;
+    }
+
+    pub(super) fn native_tmux_kitty_images_active(&self) -> bool {
+        self.tmux_kitty_support.is_some()
+            && self.image_picker.protocol_type == ratatui_image::picker::ProtocolType::Kitty
+    }
+
+    pub(super) fn disable_failed_tmux_kitty_transport(&mut self) {
+        self.tmux_kitty_transport_fault = true;
+        self.tmux_kitty_support = None;
+        self.rebuild_terminal_image_picker();
     }
 
     /// A cheap, non-reencoding nudge for editor/file-picker image widgets.
@@ -17816,9 +17888,10 @@ impl AppState {
 
 
     fn force_halfblocks_for_unsafe_terminal_image_protocol(&mut self) {
-        if !enforce_safe_terminal_image_picker_protocol_for_current_environment(
-            &mut self.image_picker,
-        ) {
+        let decision = terminal_image_protocol_probe_decision_for_current_environment_with_support(
+            self.tmux_kitty_support.is_some(),
+        );
+        if !enforce_safe_terminal_image_picker_protocol(&mut self.image_picker, decision) {
             return;
         }
 
@@ -24753,6 +24826,10 @@ mod terminal_image_protocol_environment_tests {
             self.protocol_type = ratatui_image::picker::ProtocolType::Halfblocks;
         }
 
+        fn force_kitty_protocol(&mut self) {
+            self.protocol_type = ratatui_image::picker::ProtocolType::Kitty;
+        }
+
         fn guess_terminal_protocol(&mut self) {
             self.guess_protocol_calls += 1;
             self.protocol_type = ratatui_image::picker::ProtocolType::Kitty;
@@ -24852,6 +24929,15 @@ mod terminal_image_protocol_environment_tests {
             picker.protocol_type,
             ratatui_image::picker::ProtocolType::Halfblocks
         );
+    }
+
+    #[test]
+    fn verified_tmux_kitty_does_not_guess_or_probe_the_terminal() {
+        let mut picker = RecordingPicker::new(ratatui_image::picker::ProtocolType::Halfblocks);
+        configure_terminal_image_picker_protocol(&mut picker, TerminalImageProtocolProbeDecision::ForceKitty);
+        assert_eq!(picker.protocol_type, ratatui_image::picker::ProtocolType::Kitty);
+        assert_eq!(picker.guess_protocol_calls, 0);
+        assert_eq!(picker.force_halfblocks_calls, 0);
     }
 
     #[test]
