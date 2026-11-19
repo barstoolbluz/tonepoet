@@ -389,6 +389,15 @@ fn quiet_tmux_kitty_dcs(symbol: &str, start: usize, end: usize) -> bool {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' | b'='))
 }
 
+/// Only a fresh graphics upload needs a forwarding check. Ordinary redraws
+/// may contain Unicode placeholders but no Kitty APC; do not spawn tmux for
+/// those frames. Check before wrapping to avoid committing a one-shot upload
+/// to a hidden pane with allow-passthrough=on.
+pub(super) fn buffer_has_kitty_upload(buffer: &ratatui::buffer::Buffer) -> bool {
+    buffer.content.iter().any(|cell|
+        cell.symbol().contains(APC_START) || cell.symbol().contains(TMUX_DCS))
+}
+
 /// Called only when tmux capability was established. Every protocol-producing
 /// widget, including Browse, metadata previews, and file-picker images, uses
 /// this one final-buffer transport before ratatui sends output to the pane.
@@ -403,9 +412,92 @@ pub(super) fn wrap_tmux_kitty_buffer(buffer: &mut ratatui::buffer::Buffer) -> Re
     Ok(())
 }
 
+
+// Sixel is already supported by the pinned image crate. It may emit
+// tmux-wrapped SIXEL (when tmux is detected), or a bare SIXEL command.
+// Never forward a bare DCS directly to the outer emulator: wrap just that
+// command, leaving cursor positioning / clearing visible to tmux.
+const SIXEL_DCS: &str = "\x1bP";
+
+fn sixel_header(s: &str) -> bool {
+    // DCS P[0-9;]*q is the Sixel introducer; other DCS commands are not
+    // image data. The original encoder controls all following payload bytes.
+    let n = s.bytes().take(32)
+        .take_while(|byte| matches!(*byte, b'0'..=b'9' | b';')).count();
+    n < 32 && s.as_bytes().get(n) == Some(&b'q')
+}
+
+pub(super) fn buffer_has_sixel_upload(buffer: &ratatui::buffer::Buffer) -> bool {
+    buffer.content.iter().any(|cell| cell.symbol().contains(SIXEL_DCS))
+}
+
+/// Retain the pinned Sixel encoder and its clearing behavior. Reject a
+/// malformed DCS before it reaches the terminal. Do not wrap cursor-control
+/// sequences together with Sixel, since tmux must own their pane placement.
+pub(super) fn wrap_tmux_sixel_buffer(buffer: &mut ratatui::buffer::Buffer) -> Result<(), ()> {
+    for cell in &mut buffer.content {
+        let symbol = cell.symbol();
+        if !symbol.contains(SIXEL_DCS) { continue; }
+        if symbol.contains(TMUX_DCS) {
+            let start = symbol.find(TMUX_DCS).ok_or(())?;
+            let end = tmux_dcs_end(symbol, start).ok_or(())?;
+            // The pinned Sixel renderer wraps its clear + Sixel graphics in
+            // one DCS; do not double wrap this already-owned sequence.
+            if symbol[end..].contains(SIXEL_DCS) ||
+                !symbol[start + TMUX_DCS.len()..end].contains("\x1b\x1bP") ||
+                !symbol[start + TMUX_DCS.len()..end].contains('q')
+            { return Err(()); }
+            continue;
+        }
+        let mut out = String::with_capacity(symbol.len().saturating_add(32));
+        let mut rest = symbol;
+        while let Some(pos) = rest.find(SIXEL_DCS) {
+            out.push_str(&rest[..pos]);
+            let body = &rest[pos + SIXEL_DCS.len()..];
+            if !sixel_header(body) { return Err(()); }
+            let end = body.find(APC_END).ok_or(())?;
+            let command = &rest[pos..pos + SIXEL_DCS.len() + end + APC_END.len()];
+            out.push_str(TMUX_DCS);
+            for c in command.chars() {
+                if c == '\x1b' { out.push('\x1b'); }
+                out.push(c);
+            }
+            out.push_str(APC_END);
+            rest = &body[end + APC_END.len()..];
+        }
+        out.push_str(rest);
+        cell.set_symbol(&out);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tmux_tests {
     use super::*;
+
+    #[test]
+    fn sixel_is_wrapped_without_hiding_tmux_owned_cursor_commands() {
+        use ratatui::{buffer::Buffer, layout::Rect};
+        let mut buf = Buffer::empty(Rect::new(0, 0, 1, 1));
+        buf.get_mut(0,0).set_symbol("\x1b[2K\x1bPq#0;2;100;0;0~\x1b\\");
+        assert!(buffer_has_sixel_upload(&buf));
+        wrap_tmux_sixel_buffer(&mut buf).unwrap();
+        let symbol = buf.get(0,0).symbol();
+        assert!(symbol.starts_with("\x1b[2K\x1bPtmux;"));
+        assert!(symbol.ends_with("\x1b\x1b\\\x1b\\"));
+    }
+
+    #[test]
+    fn prewrapped_sixel_is_not_double_wrapped() {
+        use ratatui::{buffer::Buffer, layout::Rect};
+        let mut buf = Buffer::empty(Rect::new(0, 0, 1, 1));
+        let symbol = "\x1bPtmux;\x1b\x1b[2K\x1b\x1bPq#0~\x1b\x1b\\\x1b\\";
+        buf.get_mut(0,0).set_symbol(symbol);
+        wrap_tmux_sixel_buffer(&mut buf).unwrap();
+        assert_eq!(buf.get(0,0).symbol(), symbol);
+        buf.get_mut(0,0).set_symbol("\x1bPnot-sixel\x1b\\");
+        assert!(wrap_tmux_sixel_buffer(&mut buf).is_err());
+    }
 
     #[test]
     fn wraps_every_chunk_while_retaining_placeholders_and_silencing_replies() {
@@ -422,6 +514,22 @@ mod tmux_tests {
         let unsafe_wrapped = wrapped.replacen("q=2", "q=1", 1);
         assert!(wrap_tmux_kitty_apcs(&unsafe_wrapped).is_err(),
             "already-wrapped commands must still suppress terminal replies");
+    }
+
+    #[test]
+    fn forwarding_check_is_only_needed_for_a_first_upload_not_placeholders() {
+        use ratatui::{buffer::Buffer, layout::Rect};
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 2, 1));
+        buffer.get_mut(0, 0).set_symbol("\u{10eeee}");
+        assert!(!buffer_has_kitty_upload(&buffer),
+            "a normal redraw must not recheck tmux or retransmit an image");
+
+        buffer.get_mut(1, 0).set_symbol("\x1b_Ga=T,q=2,m=0;QUJD\x1b\\");
+        assert!(buffer_has_kitty_upload(&buffer),
+            "a new one-shot upload needs a fresh forwarding check");
+        buffer.get_mut(1, 0).set_symbol("\x1bPtmux;\x1b\x1b_Ga=T,q=2,m=0;QUJD\x1b\x1b\\\x1b\\");
+        assert!(buffer_has_kitty_upload(&buffer),
+            "already-wrapped Kitty streams need the same forwarding check");
     }
 
     #[test]

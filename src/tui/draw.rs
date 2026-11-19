@@ -136,17 +136,40 @@ pub fn draw_ui(f: &mut Frame, app: &mut AppState) {
     // Context menus are the foreground text layer, above any image view.
     draw_overlay(f, app, theme);
 
-    // All image-bearing widgets share the same final Kitty transport. Wrap
-    // each APC for tmux, but leave Unicode placeholders and normal text for
-    // tmux to place within this pane. On malformed output, discard the frame
-    // and redraw with halfblocks; never send raw Kitty APCs through tmux.
-    if app.native_tmux_kitty_images_active()
-        && super::kitty_transport::wrap_tmux_kitty_buffer(f.buffer_mut()).is_err()
-    {
-        log::warn!("Unrecognized Kitty image command in tmux: restoring halfblocks");
-        app.disable_failed_tmux_kitty_transport();
+    // A native image that was prepared after the last tmux observation must
+    // not consume its upload in a hidden pane. Defer only actual graphics
+    // payloads, not text and Kitty placeholders, while a worker rechecks
+    // forwarding. The frame is rebuilt from the existing image caches.
+    let native = app.native_tmux_image_protocol();
+    let has_upload = match native {
+        Some(super::tmux_images::NativeProtocol::Kitty) =>
+            super::kitty_transport::buffer_has_kitty_upload(f.buffer_mut()),
+        Some(super::tmux_images::NativeProtocol::Sixel) =>
+            super::kitty_transport::buffer_has_sixel_upload(f.buffer_mut()),
+        None => false,
+    };
+    if has_upload && app.defer_unverified_tmux_image_upload() {
         f.buffer_mut().reset();
         draw_ui(f, app);
+        return;
+    }
+    let transport_result = match native {
+        Some(super::tmux_images::NativeProtocol::Kitty) =>
+            super::kitty_transport::wrap_tmux_kitty_buffer(f.buffer_mut()),
+        Some(super::tmux_images::NativeProtocol::Sixel) =>
+            super::kitty_transport::wrap_tmux_sixel_buffer(f.buffer_mut()),
+        None => Ok(()),
+    };
+    if transport_result.is_err() {
+        log::warn!("Unrecognized native image command in tmux: restoring halfblocks");
+        app.disable_failed_tmux_image_transport();
+        f.buffer_mut().reset();
+        draw_ui(f, app);
+        return;
+    }
+    if has_upload && matches!(native, Some(super::tmux_images::NativeProtocol::Kitty)) {
+        // Kitty uploads once; the next new image needs its own fresh proof.
+        app.tmux_kitty_upload_committed();
     }
 }
 

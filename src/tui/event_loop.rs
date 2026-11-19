@@ -517,10 +517,12 @@ pub async fn run_app(
         // prepares protocols after genuine source/geometry changes. Mouse
         // movement cannot invalidate the cached native graphics protocol.
         // Post-draw prepare remains necessary for geometry first seen here.
-        // Attached tmux clients can change while this TUI is running. The
-        // control-plane check is throttled and never reads pane input.
-        let tmux_capabilities_changed = app.refresh_tmux_kitty_if_due();
-        let image_changed = timed_prepare_image_preview_protocols(app) || tmux_capabilities_changed;
+        // Consume worker observations without blocking drawing. Unlike the
+        // previous three-second check, no process is spawned on an idle tick.
+        let tmux_capabilities_changed = app.poll_tmux_image_refresh();
+        let preview_changed = timed_prepare_image_preview_protocols(app);
+        if preview_changed { app.tmux_image_preview_changed(); }
+        let image_changed = preview_changed || tmux_capabilities_changed;
         // `force_redraw` means the terminal diff buffer is suspected to be
         // invalid and a full clear is required before drawing. Ordinary async
         // reducer progress must not set it: the loop below uses a zero-timeout
@@ -551,6 +553,7 @@ pub async fn run_app(
         // Geometry discovered by this draw may complete a preview protocol.
         // Mark the next iteration dirty without forcing a terminal clear.
         let post_draw_image_changed = timed_prepare_image_preview_protocols(app);
+        if post_draw_image_changed { app.tmux_image_preview_changed(); }
         redraw_requested |= post_draw_image_changed;
 
         // 3. Check quit
@@ -699,6 +702,12 @@ fn dispatch_terminal_input(app: &mut AppState, input: Event, tx: &mpsc::Sender<A
             && matches!(app.active_overlay, ActiveOverlay::None)
     ) {
         return false;
+    }
+    // User input (including focus gain and resize) is a natural, bounded
+    // trigger to notice tmux attachment changes. The inspection runs on a
+    // worker; passive mouse movement does not create processes.
+    if !matches!(&input, Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Moved)) {
+        app.request_tmux_image_refresh(false);
     }
     match input {
         Event::Key(key) => handle_key(app, key, tx),
