@@ -1400,6 +1400,7 @@ pub fn build_browse_entry_menu(app: &AppState) -> Vec<ContextMenuEntry> {
             ));
         }
         EntryKind::Archive => {
+            items.push(item("Extract files…",ContextAction::BrowseDiscStreams));
             items.push(build_convert_submenu(app));
             items.push(separator());
             items.push(build_select_submenu(true));

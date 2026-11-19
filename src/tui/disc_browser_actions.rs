@@ -23,6 +23,8 @@ use crate::tui::message::AppMessage;
 
 static NEXT_CUE_EXTRACT_REQUEST: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
+static NEXT_ARCHIVE_EXTRACT_REQUEST: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
 
 const BLURAY_STREAM_CONVERSION_UNAVAILABLE: &str =
     "Blu-ray stream-specific conversion is not available until Blu-ray materializer SourceOptions are implemented";
@@ -61,6 +63,13 @@ pub fn open_selected_disc_browser(app: &mut AppState, tx: &mpsc::Sender<AppMessa
         open_disc_browser_for_path(app, path, tx);
         return;
     }
+    if let Some(entry) = app.browse.selected_entry() {
+        if matches!(&entry.kind, crate::tui::browse::EntryKind::Archive) {
+            let archive = entry.path.clone();
+            open_archive_extract_for_path(app, archive, tx);
+            return;
+        }
+    }
     let cue = app.browse.selected_entry().and_then(|entry| {
         if crate::convert::classify::is_cue_sheet_path(&entry.path) ||
             matches!(&entry.kind, crate::tui::browse::EntryKind::Directory) {
@@ -73,6 +82,47 @@ pub fn open_selected_disc_browser(app: &mut AppState, tx: &mpsc::Sender<AppMessa
         app.set_status("No browse entry selected");
     } else {
         app.set_status("Selected entry is not a browsable audio source");
+    }
+}
+
+/// Unpack and inspect selected archive contents off the UI event reducer.
+/// The resulting overlay keeps the exact member list bound to source metadata.
+fn open_archive_extract_for_path(app:&mut AppState,path:PathBuf,tx:&mpsc::Sender<AppMessage>) {
+    use std::sync::atomic::Ordering;
+    let passwords = match crate::tui::app::archive_password_candidates_for_path(app,&path) {
+        Ok(passwords)=>passwords,
+        Err(error)=>{app.set_status(format!("Archive password unavailable: {error}"));return;}
+    };
+    let request_id=NEXT_ARCHIVE_EXTRACT_REQUEST.fetch_add(1,Ordering::Relaxed);
+    let tx=tx.clone();
+    tokio::spawn(async move {
+        let result=crate::tui::archive_extract::inspect(&path,passwords,
+            tokio_util::sync::CancellationToken::new()).await;
+        let _=tx.send(AppMessage::ArchiveExtractReady {path,request_id,result}).await;
+    });
+    app.set_status("Reading archive members and file tags…");
+}
+
+pub(crate) fn handle_archive_extract_ready(app:&mut AppState,path:PathBuf,request_id:u64,
+    result:Result<crate::tui::archive_extract::ArchiveExtractPreview,String>) {
+    use std::sync::atomic::Ordering;
+    if request_id!=NEXT_ARCHIVE_EXTRACT_REQUEST.load(Ordering::Relaxed).saturating_sub(1)
+        || app.browse.selected_entry().is_none_or(|entry|entry.path!=path)
+        || !matches!(&app.active_overlay,ActiveOverlay::None) {return;}
+    match result {
+        Ok(preview)=>{
+            let mut state=DiscBrowserState::new(preview.contents,path.clone());
+            state.archive_members=preview.members;
+            state.archive_length=preview.source_length;
+            state.archive_modified=preview.source_modified;
+            state.archive_password=preview.password;
+            // An archive extracts exactly the checked members by default.
+            // A log is an additional artifact, never implicit for this mode.
+            state.extraction_log=false;
+            state.refresh_destination_feedback();
+            app.active_overlay=ActiveOverlay::DiscBrowser(Box::new(state));
+        }
+        Err(error)=>app.set_status(format!("Cannot extract archive: {error}")),
     }
 }
 
@@ -1035,7 +1085,7 @@ fn move_native_form_cursor(state: &mut DiscBrowserState, dx: i8, dy: i8) {
 }
 
 fn set_native_files(state: &mut DiscBrowserState, choice: usize) {
-    if choice > 1 || matches!(state.contents.format,crate::disc::DiscFormat::TransportFile | crate::disc::DiscFormat::CueImage) { return; }
+    if choice > 1 || matches!(state.contents.format,crate::disc::DiscFormat::TransportFile | crate::disc::DiscFormat::CueImage | crate::disc::DiscFormat::Archive) { return; }
     state.file_per_program = choice == 1;
     if state.file_per_program && state.contents.format == crate::disc::DiscFormat::Matroska {
         for checked in &mut state.items_checked { checked.fill(true); }
@@ -1049,7 +1099,7 @@ fn set_native_files(state: &mut DiscBrowserState, choice: usize) {
 
 fn set_native_format(state: &mut DiscBrowserState, choice: usize) {
     use crate::convert::pipeline::native_extract::NativeWavContainer as W;
-    if matches!(state.contents.format, crate::disc::DiscFormat::Matroska | crate::disc::DiscFormat::TransportFile | crate::disc::DiscFormat::CueImage) { return; }
+    if matches!(state.contents.format, crate::disc::DiscFormat::Matroska | crate::disc::DiscFormat::TransportFile | crate::disc::DiscFormat::CueImage | crate::disc::DiscFormat::Archive) { return; }
     if state.contents.format == crate::disc::DiscFormat::Sacd {
         if choice <= 1 {
             // The radio selects the default SACD container; per-area Keep DST
@@ -1091,7 +1141,7 @@ fn toggle_native_form_row(state: &mut DiscBrowserState) {
         "Log" => state.extraction_log = !state.extraction_log,
         "CUE" if state.file_per_program && (state.matroska_cue_available() ||
             !matches!(state.contents.format,
-                crate::disc::DiscFormat::Sacd | crate::disc::DiscFormat::Matroska | crate::disc::DiscFormat::TransportFile | crate::disc::DiscFormat::CueImage)) =>
+                crate::disc::DiscFormat::Sacd | crate::disc::DiscFormat::Matroska | crate::disc::DiscFormat::TransportFile | crate::disc::DiscFormat::CueImage | crate::disc::DiscFormat::Archive)) =>
             state.cue = !state.cue,
         "Assume decrypted" => state.assume_decrypted = !state.assume_decrypted,
         "Downmix" => cycle_native_option(state, 1),
@@ -1132,7 +1182,7 @@ fn cycle_native_option(state: &mut DiscBrowserState, step: i32) {
         _ if state.focus == crate::tui::disc_browser::ExtractFocus::Programs => {
             state.cycle_angle_for(state.cursor, step);
         }
-        Some("Format") if matches!(state.contents.format, crate::disc::DiscFormat::Matroska | crate::disc::DiscFormat::TransportFile | crate::disc::DiscFormat::CueImage) => {},
+        Some("Format") if matches!(state.contents.format, crate::disc::DiscFormat::Matroska | crate::disc::DiscFormat::TransportFile | crate::disc::DiscFormat::CueImage | crate::disc::DiscFormat::Archive) => {},
         Some("Format") if state.contents.format == crate::disc::DiscFormat::Sacd => {
             set_native_format(state,usize::from(!state.sacd_dff));
         }
@@ -1948,7 +1998,7 @@ pub fn load_disc_presentation_for_convert(
 /// Selecting a program never changes Convert's existing codec/processing path.
 pub fn activate_overlay_convert(app: &mut AppState) {
     let checked = match &app.active_overlay {
-        ActiveOverlay::DiscBrowser(state) if state.contents.format != crate::disc::DiscFormat::CueImage => state.selected_indices(),
+        ActiveOverlay::DiscBrowser(state) if !matches!(state.contents.format, crate::disc::DiscFormat::CueImage | crate::disc::DiscFormat::Archive) => state.selected_indices(),
         _ => return,
     };
     if checked.len() > 1 {
@@ -1962,7 +2012,7 @@ pub fn activate_overlay_convert(app: &mut AppState) {
 
 pub fn convert_overlay_cursor(app: &mut AppState) {
     let index = match &app.active_overlay {
-        ActiveOverlay::DiscBrowser(state) if state.contents.format != crate::disc::DiscFormat::CueImage => state.cursor,
+        ActiveOverlay::DiscBrowser(state) if !matches!(state.contents.format, crate::disc::DiscFormat::CueImage | crate::disc::DiscFormat::Archive) => state.cursor,
         _ => return,
     };
     // The multiple-choice popup's highlighted program uses its current
@@ -1972,7 +2022,7 @@ pub fn convert_overlay_cursor(app: &mut AppState) {
 
 fn convert_overlay_selected(app: &mut AppState, explicit_index: Option<usize>) {
     let (contents, index, checked) = match &app.active_overlay {
-        ActiveOverlay::DiscBrowser(state) if state.contents.format != crate::disc::DiscFormat::CueImage => {
+        ActiveOverlay::DiscBrowser(state) if !matches!(state.contents.format, crate::disc::DiscFormat::CueImage | crate::disc::DiscFormat::Archive) => {
             let index = explicit_index.unwrap_or(state.cursor);
             let checked = if state.selected.get(index) == Some(&true) {
                 state.items_checked.get(index).cloned()
@@ -2093,7 +2143,7 @@ fn open_existing_metadata_editor_for_disc_cursor(app: &mut AppState) -> Result<b
         crate::disc::DiscFormat::BluRay => super::keybindings::open_metadata_editor_for_bluray(app, path),
         // MKV/MKA metadata transfer is configured through the Extract Tags
         // sheet. Disc sidecar editors do not apply to standalone files.
-        crate::disc::DiscFormat::Matroska | crate::disc::DiscFormat::TransportFile | crate::disc::DiscFormat::CueImage => return Ok(false),
+        crate::disc::DiscFormat::Matroska | crate::disc::DiscFormat::TransportFile | crate::disc::DiscFormat::CueImage | crate::disc::DiscFormat::Archive => return Ok(false),
     }
     if let ActiveOverlay::MetadataEditor(editor) = &mut app.active_overlay {
         if let Some(index) = editor.presentation_tabs.iter().position(|tab|tab.id == id) {

@@ -3052,7 +3052,7 @@ mod tests {
             NativeExtractionJob, NativeProgramChoice, NativeTrackChoice,
             NativeTagValues, NativeWavContainer, NativeOverwritePolicy, NativeTagSource,
         };
-        NativeExtractionJob { cue_input_paths: Vec::new(), cue_segments: Vec::new(), disc_identity: Default::default(),
+        NativeExtractionJob { cue_input_paths: Vec::new(), cue_segments: Vec::new(), archive_members:Vec::new(), archive_length:0, archive_modified:None, archive_password:None, disc_identity: Default::default(),
             source:source.to_path_buf(),format:crate::disc::DiscFormat::Sacd,
             programs:vec![NativeProgramChoice {
                 id:crate::disc::PresentationId::SacdArea(crate::disc::SacdAreaId::Stereo),
