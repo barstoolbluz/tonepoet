@@ -16253,9 +16253,10 @@ pub struct AppState {
     /// regenerated on worker completion (Kitty's send is one-shot).
     tmux_image_retry_upload: bool,
     tmux_image_upload_preflight: bool,
-    /// Sixel is emitted on each render. Its last verified payload may redraw
-    /// without starting another tmux process, unlike a new image payload.
-    tmux_verified_sixel_upload: Option<u64>,
+    /// Sixel is emitted on each render. Track the verified image commands at
+    /// their individual buffer origins: adding a viewer must not revoke the
+    /// Info image's proof just because the frame now contains two images.
+    tmux_verified_sixel_uploads: Vec<u64>,
     /// Malformed native output disables native tmux images until restart.
     tmux_image_transport_fault: bool,
     /// Monotonic generation for terminal image protocol/cell-size changes.
@@ -16271,20 +16272,32 @@ pub struct AppState {
     pub tool_check_cache: once_cell::sync::OnceCell<Vec<(String, String, bool)>>,
 }
 
-/// A just-inspected pane authorizes the deferred upload. Once Sixel was
-/// verified, its unchanged payload and origin may redraw without rechecking.
+/// A just-inspected pane authorizes the deferred upload. Once a Sixel command
+/// was verified, its unchanged payload and origin may redraw without
+/// rechecking, even when another image joins the same frame.
 fn tmux_native_upload_needs_preflight(
     protocol: super::tmux_images::NativeProtocol,
     fresh_proof: bool,
-    verified_sixel: Option<u64>,
-    current_sixel: Option<u64>,
+    verified_sixel: &[u64],
+    current_sixel: &[u64],
 ) -> bool {
     if fresh_proof { return false; }
     match protocol {
         super::tmux_images::NativeProtocol::Kitty => true,
         super::tmux_images::NativeProtocol::Sixel =>
-            current_sixel.is_none_or(|current| Some(current) != verified_sixel),
+            current_sixel.is_empty() || current_sixel.iter().any(|id| !verified_sixel.contains(id)),
     }
+}
+
+/// The Sixel renderer can re-emit a withheld command from its existing cache.
+/// Kitty's one-shot transmission state, by contrast, must be rebuilt after a
+/// deferred upload. A real capability change invalidates both protocols.
+fn tmux_inspection_needs_picker_rebuild(
+    changed: bool,
+    retry_upload: bool,
+    protocol: Option<super::tmux_images::NativeProtocol>,
+) -> bool {
+    changed || (retry_upload && protocol == Some(super::tmux_images::NativeProtocol::Kitty))
 }
 
 /// A session override takes precedence over persistent settings. Both only
@@ -17296,7 +17309,7 @@ impl AppState {
             tmux_image_recheck_after_pending: false,
             tmux_image_retry_upload: false,
             tmux_image_upload_preflight: false,
-            tmux_verified_sixel_upload: None,
+            tmux_verified_sixel_uploads: Vec::new(),
             tmux_image_transport_fault: false,
             image_picker_generation: 0,
             image_repaint_generation: 0,
@@ -17896,7 +17909,7 @@ impl AppState {
         if tmux_like_current_environment() {
             self.tmux_image_support = None;
             self.tmux_image_upload_preflight = false;
-            self.tmux_verified_sixel_upload = None;
+            self.tmux_verified_sixel_uploads.clear();
             self.request_tmux_image_refresh(true);
         }
         self.rebuild_terminal_image_picker();
@@ -17958,32 +17971,39 @@ impl AppState {
             return false;
         }
         let changed = self.tmux_image_support != observation;
-        if changed { self.tmux_verified_sixel_upload = None; }
+        if changed { self.tmux_verified_sixel_uploads.clear(); }
         self.tmux_image_support = observation;
         // Only an upload already withheld for this check may use its result
         // immediately. A capability-only observation can predate async image
         // preparation, so the first actual upload must request fresh proof.
         self.tmux_image_upload_preflight =
             self.tmux_image_support.is_some() && self.tmux_image_retry_upload;
-        let rebuild = changed || self.tmux_image_retry_upload;
+        let retry_upload = self.tmux_image_retry_upload;
+        let rebuild = tmux_inspection_needs_picker_rebuild(
+            changed, retry_upload,
+            self.tmux_image_support.as_ref().map(|support| support.protocol),
+        );
         self.tmux_image_retry_upload = false;
         if rebuild { self.rebuild_terminal_image_picker(); }
-        rebuild
+        // A Sixel retry only needs another draw. Rebuilding it here would
+        // withdraw the viewer's prepared protocol and can starve a second
+        // image while the Info preview repeatedly wins the next frame.
+        rebuild || retry_upload
     }
 
-    /// A native payload is checked only once for the current content. Kitty
-    /// has a one-shot transfer; Sixel may reappear on normal redraws but an
-    /// identical, already-verified payload does not need another subprocess.
+    /// A native payload is checked only once for its current content. Kitty
+    /// has a one-shot transfer; independently verified Sixel commands may
+    /// redraw while a newly introduced image awaits its own proof.
     pub(super) fn defer_unverified_tmux_image_upload(
         &mut self,
         protocol: super::tmux_images::NativeProtocol,
-        sixel_upload: Option<u64>,
+        sixel_uploads: &[u64],
     ) -> bool {
         if !tmux_native_upload_needs_preflight(
             protocol,
             self.tmux_image_upload_preflight,
-            self.tmux_verified_sixel_upload,
-            sixel_upload,
+            &self.tmux_verified_sixel_uploads,
+            sixel_uploads,
         ) {
             return false;
         }
@@ -18025,12 +18045,17 @@ impl AppState {
     pub(super) fn tmux_native_image_upload_committed(
         &mut self,
         protocol: super::tmux_images::NativeProtocol,
-        sixel_upload: Option<u64>,
+        sixel_uploads: &[u64],
     ) {
         if protocol == super::tmux_images::NativeProtocol::Sixel {
-            self.tmux_verified_sixel_upload = sixel_upload;
+            self.tmux_verified_sixel_uploads.clear();
+            self.tmux_verified_sixel_uploads.extend_from_slice(sixel_uploads);
         }
         self.tmux_image_upload_preflight = false;
+    }
+
+    pub(super) fn tmux_verified_sixel_uploads(&self) -> &[u64] {
+        &self.tmux_verified_sixel_uploads
     }
 
     pub(super) fn native_tmux_image_protocol(&self) -> Option<super::tmux_images::NativeProtocol> {
@@ -18051,7 +18076,7 @@ impl AppState {
         self.tmux_image_retry_upload = false;
         self.tmux_image_recheck_after_pending = false;
         self.tmux_image_upload_preflight = false;
-        self.tmux_verified_sixel_upload = None;
+        self.tmux_verified_sixel_uploads.clear();
         self.rebuild_terminal_image_picker();
     }
 
@@ -25178,21 +25203,45 @@ mod terminal_image_protocol_environment_tests {
 
         // An unverified new image is held until the async worker proves that
         // tmux can forward its upload. The result authorizes one transfer.
-        assert!(check(Sixel, false, None, Some(10)));
-        assert!(!check(Sixel, true, None, Some(10)));
+        assert!(check(Sixel, false, &[], &[10]));
+        assert!(!check(Sixel, true, &[], &[10]));
         // After that upload, ordinary redraws with the identical payload
         // never start another inspection, regardless of their number.
         for _ in 0..100 {
-            assert!(!check(Sixel, false, Some(10), Some(10)));
+            assert!(!check(Sixel, false, &[10], &[10]));
         }
-        assert!(check(Sixel, false, Some(10), Some(11)),
+        assert!(check(Sixel, false, &[10], &[11]),
             "new image bytes require a fresh tmux observation");
-        assert!(check(Sixel, false, Some(10), None),
+        assert!(check(Sixel, false, &[10], &[]),
             "unknown upload identity may not bypass the gate");
+        // The frame can contain a previously verified Info image AND a new
+        // full-file viewer. Only the new command needs verification. The
+        // worker reply must not rebuild the existing Sixel image protocol.
+        assert!(check(Sixel, false, &[10], &[10, 20]));
+        assert!(!check(Sixel, true, &[10], &[10, 20]));
+        assert!(!check(Sixel, false, &[10, 20], &[20, 10]));
+        assert!(!check(Sixel, false, &[10, 20], &[20]));
+        assert!(check(Sixel, false, &[10, 20], &[10, 30]));
         // Kitty has a one-shot upload; placeholders on later frames are
         // handled by the draw path and never call this gate.
-        assert!(check(Kitty, false, None, None));
-        assert!(!check(Kitty, true, None, None));
+        assert!(check(Kitty, false, &[], &[]));
+        assert!(!check(Kitty, true, &[], &[]));
+    }
+
+    #[test]
+    fn sixel_retry_redraws_without_invalidating_other_image_protocols() {
+        use super::super::tmux_images::NativeProtocol::{Kitty, Sixel};
+        use super::tmux_inspection_needs_picker_rebuild as rebuild;
+
+        assert!(!rebuild(false, true, Some(Sixel)),
+            "a deferred Sixel command remains retryable without re-encoding");
+        assert!(rebuild(false, true, Some(Kitty)),
+            "Kitty must regenerate a consumed one-shot upload");
+        assert!(rebuild(true, false, Some(Sixel)),
+            "an attachment or capability change invalidates every image");
+        assert!(rebuild(true, true, Some(Kitty)));
+        assert!(!rebuild(false, false, Some(Sixel)),
+            "ordinary idle observations must never rebuild native images");
     }
 
     #[test]

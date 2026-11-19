@@ -427,25 +427,39 @@ fn sixel_header(s: &str) -> bool {
     n < 32 && s.as_bytes().get(n) == Some(&b'q')
 }
 
-pub(super) fn buffer_has_sixel_upload(buffer: &ratatui::buffer::Buffer) -> bool {
-    buffer.content.iter().any(|cell| cell.symbol().contains(SIXEL_DCS))
-}
-
-/// A Sixel payload is repeated on ordinary widget redraws. Identical pixels
-/// at the same origin may use an already-fresh forwarding check; a changed
-/// payload/origin requires a new worker inspection. No image data is copied.
-pub(super) fn sixel_upload_fingerprint(buffer: &ratatui::buffer::Buffer) -> Option<u64> {
+/// A Sixel payload is repeated on ordinary widget redraws. Fingerprint each
+/// image *individually* at its buffer origin: a newly opened viewer must not
+/// invalidate an unchanged Info image sharing the same frame. No image data
+/// is copied, and the work is proportional to the emitted payload bytes.
+fn sixel_command_identity(index: usize, symbol: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    let mut seen = false;
-    for (index, cell) in buffer.content.iter().enumerate() {
-        if cell.symbol().contains(SIXEL_DCS) {
-            index.hash(&mut hasher);
-            cell.symbol().hash(&mut hasher);
-            seen = true;
+    index.hash(&mut hasher);
+    symbol.hash(&mut hasher);
+    hasher.finish()
+}
+
+pub(super) fn sixel_upload_identities(buffer: &ratatui::buffer::Buffer) -> Vec<u64> {
+    buffer.content.iter().enumerate()
+        .filter(|(_, cell)| cell.symbol().contains(SIXEL_DCS))
+        .map(|(index, cell)| sixel_command_identity(index, cell.symbol()))
+        .collect()
+}
+
+/// While a new Sixel image awaits a forwarding check, retain any previously
+/// verified images in this frame. The caller still wraps the surviving
+/// commands for tmux. Only the transient buffer changes, not image caches.
+pub(super) fn suppress_unverified_tmux_sixel_uploads(
+    buffer: &mut ratatui::buffer::Buffer,
+    verified: &[u64],
+) {
+    for (index, cell) in buffer.content.iter_mut().enumerate() {
+        if cell.symbol().contains(SIXEL_DCS)
+            && !verified.contains(&sixel_command_identity(index, cell.symbol()))
+        {
+            cell.set_symbol(" ");
         }
     }
-    seen.then(|| hasher.finish())
 }
 
 /// Never send an unverified native image or Kitty placeholder to tmux. This
@@ -511,17 +525,53 @@ mod tmux_tests {
         use ratatui::{buffer::Buffer, layout::Rect};
         let mut buf = Buffer::empty(Rect::new(0, 0, 3, 1));
         buf.get_mut(0, 0).set_symbol("\x1bPq#0~\x1b\\");
-        let first = sixel_upload_fingerprint(&buf).unwrap();
+        let first = sixel_upload_identities(&buf);
+        assert_eq!(first.len(), 1);
         buf.get_mut(2, 0).set_symbol("new status text");
-        assert_eq!(sixel_upload_fingerprint(&buf), Some(first),
+        assert_eq!(sixel_upload_identities(&buf), first,
             "ordinary text redraws do not invalidate an image upload");
         buf.get_mut(0, 0).set_symbol("\x1bPq#1~\x1b\\");
-        let different = sixel_upload_fingerprint(&buf).unwrap();
+        let different = sixel_upload_identities(&buf);
         assert_ne!(different, first);
         buf.get_mut(0, 0).set_symbol(" ");
         buf.get_mut(1, 0).set_symbol("\x1bPq#0~\x1b\\");
-        assert_ne!(sixel_upload_fingerprint(&buf), Some(first),
+        assert_ne!(sixel_upload_identities(&buf), first,
             "moving the origin requires another forwarding check");
+    }
+
+    #[test]
+    fn second_sixel_image_waits_without_hiding_or_rechecking_the_first() {
+        use ratatui::{buffer::Buffer, layout::Rect};
+        let first = "\x1bPq#0~\x1b\\";
+        let second = "\x1bPq#1~\x1b\\";
+        let mut buf = Buffer::empty(Rect::new(0, 0, 5, 1));
+        buf.get_mut(0, 0).set_symbol(first);
+        buf.get_mut(1, 0).set_symbol("status");
+        buf.get_mut(3, 0).set_symbol(second);
+        let identities = sixel_upload_identities(&buf);
+        assert_eq!(identities.len(), 2);
+
+        // Only the Info preview was in the previous verified frame. Withhold
+        // the viewer while an async inspection runs, preserving Info and UI.
+        let mut pending = buf.clone();
+        suppress_unverified_tmux_sixel_uploads(&mut pending, &identities[..1]);
+        assert_eq!(pending.get(0, 0).symbol(), first);
+        assert_eq!(pending.get(1, 0).symbol(), "status");
+        assert_eq!(pending.get(3, 0).symbol(), " ");
+        wrap_tmux_sixel_buffer(&mut pending).unwrap();
+        assert!(pending.get(0, 0).symbol().contains(TMUX_DCS));
+        assert!(!pending.get(3, 0).symbol().contains(SIXEL_DCS));
+
+        // The Sixel cache can be rendered again after the worker replies;
+        // neither command requires a new picker or a new decode. Once both
+        // are verified, ordinary redrawing creates no new preflight request.
+        assert_eq!(sixel_upload_identities(&buf), identities);
+        suppress_unverified_tmux_sixel_uploads(&mut buf, &identities);
+        assert_eq!(buf.get(0, 0).symbol(), first);
+        assert_eq!(buf.get(3, 0).symbol(), second);
+        wrap_tmux_sixel_buffer(&mut buf).unwrap();
+        assert!(buf.get(0, 0).symbol().contains(TMUX_DCS));
+        assert!(buf.get(3, 0).symbol().contains(TMUX_DCS));
     }
 
     #[test]
@@ -544,7 +594,7 @@ mod tmux_tests {
         use ratatui::{buffer::Buffer, layout::Rect};
         let mut buf = Buffer::empty(Rect::new(0, 0, 1, 1));
         buf.get_mut(0,0).set_symbol("\x1b[2K\x1bPq#0;2;100;0;0~\x1b\\");
-        assert!(buffer_has_sixel_upload(&buf));
+        assert!(!sixel_upload_identities(&buf).is_empty());
         wrap_tmux_sixel_buffer(&mut buf).unwrap();
         let symbol = buf.get(0,0).symbol();
         assert!(symbol.starts_with("\x1b[2K\x1bPtmux;"));

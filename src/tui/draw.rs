@@ -136,30 +136,38 @@ pub fn draw_ui(f: &mut Frame, app: &mut AppState) {
     // Context menus are the foreground text layer, above any image view.
     draw_overlay(f, app, theme);
 
-    // A native image that was prepared after the last tmux observation must
-    // not consume its upload in a hidden pane. Defer only actual graphics
-    // payloads, not text and Kitty placeholders, while a worker rechecks
-    // forwarding. The frame is rebuilt from the existing image caches.
+    // A native image prepared after the last tmux observation must not
+    // consume its upload in a hidden pane. A newly introduced Sixel image
+    // must also not withhold a different, already verified image in this
+    // frame. Kitty still needs its one-shot protocol regenerated after proof.
     let native = app.native_tmux_image_protocol();
+    let sixel_uploads = if matches!(native, Some(super::tmux_images::NativeProtocol::Sixel)) {
+        super::kitty_transport::sixel_upload_identities(f.buffer_mut())
+    } else { Vec::new() };
     let has_upload = match native {
         Some(super::tmux_images::NativeProtocol::Kitty) =>
             super::kitty_transport::buffer_has_kitty_upload(f.buffer_mut()),
         Some(super::tmux_images::NativeProtocol::Sixel) =>
-            super::kitty_transport::buffer_has_sixel_upload(f.buffer_mut()),
+            !sixel_uploads.is_empty(),
         None => false,
     };
-    let sixel_upload = if matches!(native, Some(super::tmux_images::NativeProtocol::Sixel))
-        && has_upload
-    {
-        super::kitty_transport::sixel_upload_fingerprint(f.buffer_mut())
-    } else { None };
     if has_upload && native.is_some_and(|protocol|
-        app.defer_unverified_tmux_image_upload(protocol, sixel_upload))
+        app.defer_unverified_tmux_image_upload(protocol, &sixel_uploads))
     {
         if app.native_tmux_image_protocol().is_none() {
             // No inspection worker could start: use the existing safe picker.
             f.buffer_mut().reset();
             draw_ui(f, app);
+        } else if native == Some(super::tmux_images::NativeProtocol::Sixel) {
+            super::kitty_transport::suppress_unverified_tmux_sixel_uploads(
+                f.buffer_mut(), app.tmux_verified_sixel_uploads());
+            // Existing images still emit native Sixel. Wrap those commands
+            // even though the new image's bytes were withheld for preflight.
+            if super::kitty_transport::wrap_tmux_sixel_buffer(f.buffer_mut()).is_err() {
+                app.disable_failed_tmux_image_transport();
+                f.buffer_mut().reset();
+                draw_ui(f, app);
+            }
         } else {
             super::kitty_transport::suppress_unverified_tmux_graphics(f.buffer_mut());
         }
@@ -181,7 +189,7 @@ pub fn draw_ui(f: &mut Frame, app: &mut AppState) {
     }
     if has_upload {
         if let Some(protocol) = native {
-            app.tmux_native_image_upload_committed(protocol, sixel_upload);
+            app.tmux_native_image_upload_committed(protocol, &sixel_uploads);
         }
     }
 }
