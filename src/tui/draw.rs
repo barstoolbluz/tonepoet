@@ -163,7 +163,7 @@ pub fn draw_ui(f: &mut Frame, app: &mut AppState) {
                 f.buffer_mut(), app.tmux_verified_sixel_uploads());
             // Existing images still emit native Sixel. Wrap those commands
             // even though the new image's bytes were withheld for preflight.
-            if super::kitty_transport::wrap_tmux_sixel_buffer(f.buffer_mut()).is_err() {
+            if super::kitty_transport::wrap_tmux_sixel_buffer(f.buffer_mut(), app.tmux_image_font_size()).is_err() {
                 app.disable_failed_tmux_image_transport();
                 f.buffer_mut().reset();
                 draw_ui(f, app);
@@ -177,7 +177,7 @@ pub fn draw_ui(f: &mut Frame, app: &mut AppState) {
         Some(super::tmux_images::NativeProtocol::Kitty) =>
             super::kitty_transport::wrap_tmux_kitty_buffer(f.buffer_mut()),
         Some(super::tmux_images::NativeProtocol::Sixel) =>
-            super::kitty_transport::wrap_tmux_sixel_buffer(f.buffer_mut()),
+            super::kitty_transport::wrap_tmux_sixel_buffer(f.buffer_mut(), app.tmux_image_font_size()),
         None => Ok(()),
     };
     if transport_result.is_err() {

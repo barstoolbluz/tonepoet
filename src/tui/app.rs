@@ -18058,6 +18058,10 @@ impl AppState {
         &self.tmux_verified_sixel_uploads
     }
 
+    pub(super) fn tmux_image_font_size(&self) -> (u16, u16) {
+        self.image_picker.font_size
+    }
+
     pub(super) fn native_tmux_image_protocol(&self) -> Option<super::tmux_images::NativeProtocol> {
         let protocol = self.tmux_image_support.as_ref()?.protocol;
         let picker = self.image_picker.protocol_type;

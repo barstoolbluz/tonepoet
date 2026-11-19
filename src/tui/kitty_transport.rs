@@ -413,106 +413,9 @@ pub(super) fn wrap_tmux_kitty_buffer(buffer: &mut ratatui::buffer::Buffer) -> Re
 }
 
 
-// Sixel is already supported by the pinned image crate. It may emit
-// tmux-wrapped SIXEL (when tmux is detected), or a bare SIXEL command.
-// Never forward a bare DCS directly to the outer emulator: wrap just that
-// command, leaving cursor positioning / clearing visible to tmux.
+// Sixel transport is implemented in sixel_tmux. Every passthrough there
+// contains one complete Sixel command; a Sixel DCS must not cross packets.
 const SIXEL_DCS: &str = "\x1bP";
-
-fn sixel_header(s: &str) -> bool {
-    // DCS P[0-9;]*q is the Sixel introducer; other DCS commands are not
-    // image data. The original encoder controls all following payload bytes.
-    let n = s.bytes().take(32)
-        .take_while(|byte| matches!(*byte, b'0'..=b'9' | b';')).count();
-    n < 32 && s.as_bytes().get(n) == Some(&b'q')
-}
-
-// tmux 3.5a's input.c limits one DCS string to 1 MiB (INPUT_BUF_LIMIT).
-// A full-window Sixel can exceed that even after ratatui-image has resized
-// the pixels to the actual viewport. Keep each outer passthrough *well* below
-// the parser limit; the outer terminal receives the same continuous inner
-// Sixel DCS, byte for byte. This is transport framing, not image tiling or
-// recompression: dimensions, palette and colour fidelity are unchanged.
-const TMUX_SIXEL_PASSTHROUGH_BODY_LIMIT: usize = 64 * 1024;
-
-/// Write a Sixel byte stream as successive bounded tmux DCS passthrough
-/// packets. tmux forwards each packet's unescaped contents without inserting
-/// any bytes, so the *outer* Sixel parser sees one uninterrupted command.
-///
-/// The pinned encoder may already have doubled ESC for tmux. Consume those
-/// pairs as one logical ESC before writing them back; never split a pair
-/// across packet boundaries (which would terminate a tmux DCS prematurely).
-fn append_bounded_tmux_sixel_stream(
-    out: &mut String,
-    source: &str,
-    already_escaped: bool,
-) -> Result<(), ()> {
-    if source.is_empty() { return Err(()); }
-    let mut chars = source.chars();
-    let mut body_bytes = 0_usize;
-    out.push_str(TMUX_DCS);
-    while let Some(ch) = chars.next() {
-        if already_escaped && ch == '\x1b' && chars.next() != Some('\x1b') {
-            return Err(());
-        }
-        let size = if ch == '\x1b' { 2 } else { ch.len_utf8() };
-        if body_bytes + size > TMUX_SIXEL_PASSTHROUGH_BODY_LIMIT {
-            out.push_str(APC_END);
-            out.push_str(TMUX_DCS);
-            body_bytes = 0;
-        }
-        if ch == '\x1b' { out.push('\x1b'); }
-        out.push(ch);
-        body_bytes += size;
-    }
-    out.push_str(APC_END);
-    Ok(())
-}
-
-/// Recognize the one logical Sixel header across successive tmux packets.
-/// The marker can itself straddle a packet boundary. Keep only a few bytes
-/// of parser state instead of concatenating the potentially multi-MiB body.
-#[derive(Default)]
-struct SixelStartProbe {
-    state: usize, // 0: idle; 1: ESC; 2..34: DCS P and numeric parameters
-    found: bool,
-}
-
-impl SixelStartProbe {
-    fn feed(&mut self, byte: u8) {
-        self.state = match self.state {
-            0 => usize::from(byte == 0x1b),
-            1 => if byte == b'P' { 2 } else { usize::from(byte == 0x1b) },
-            state => {
-                if byte == b'q' {
-                    self.found = true;
-                    0
-                } else if state < 34 && matches!(byte, b'0'..=b'9' | b';') {
-                    state + 1
-                } else {
-                    usize::from(byte == 0x1b)
-                }
-            }
-        };
-    }
-
-    fn consume_escaped_tmux_body(&mut self, body: &str) -> Result<(), ()> {
-        if self.found { return Ok(()); }
-        let bytes = body.as_bytes();
-        let mut index = 0;
-        while index < bytes.len() {
-            let byte = bytes[index];
-            if byte == 0x1b {
-                if bytes.get(index + 1) != Some(&0x1b) { return Err(()); }
-                index += 1;
-            }
-            self.feed(byte);
-            if self.found { break; }
-            index += 1;
-        }
-        Ok(())
-    }
-}
 
 /// A Sixel payload is repeated on ordinary widget redraws. Fingerprint each
 /// image *individually* at its buffer origin: a newly opened viewer must not
@@ -563,187 +466,16 @@ pub(super) fn suppress_unverified_tmux_graphics(buffer: &mut ratatui::buffer::Bu
     }
 }
 
-/// Retain the pinned Sixel encoder and its clearing behavior. Reject a
-/// malformed DCS before it reaches the terminal. Do not wrap cursor-control
-/// sequences together with Sixel, since tmux must own their pane placement.
-pub(super) fn wrap_tmux_sixel_buffer(buffer: &mut ratatui::buffer::Buffer) -> Result<(), ()> {
-    for cell in &mut buffer.content {
-        let symbol = cell.symbol();
-        if !symbol.contains(SIXEL_DCS) { continue; }
-
-        // ratatui-image 1.0.5 may have wrapped the clear command and the
-        // entire Sixel image in one tmux DCS already. Splitting *that* DCS
-        // is essential: wrapping only bare Sixel leaves the large upload
-        // untouched and tmux silently discards it. Accept an already-split
-        // stream as well, so a repeated transport pass is idempotent.
-        if symbol.contains(TMUX_DCS) {
-            let mut replacement: Option<String> = None;
-            let mut copied_to = 0;
-            let mut pos = 0;
-            let mut sixel_start = SixelStartProbe::default();
-            let mut saw_packet = false;
-            while let Some(offset) = symbol[pos..].find(TMUX_DCS) {
-                let start = pos + offset;
-                // A mixed raw/wrapped stream cannot be passed through safely:
-                // wrapping was deliberately delegated to one transport owner.
-                if symbol[pos..start].contains(SIXEL_DCS) { return Err(()); }
-                let end = tmux_dcs_end(symbol, start).ok_or(())?;
-                let body = &symbol[start + TMUX_DCS.len()..end - APC_END.len()];
-                sixel_start.consume_escaped_tmux_body(body)?;
-                saw_packet = true;
-                if body.len() > TMUX_SIXEL_PASSTHROUGH_BODY_LIMIT {
-                    let out = replacement.get_or_insert_with(||
-                        String::with_capacity(symbol.len().saturating_add(512)));
-                    out.push_str(&symbol[copied_to..start]);
-                    append_bounded_tmux_sixel_stream(out, body, true)?;
-                    copied_to = end;
-                }
-                pos = end;
-            }
-            if !saw_packet || !sixel_start.found || symbol[pos..].contains(SIXEL_DCS) {
-                return Err(());
-            }
-            if let Some(mut out) = replacement {
-                out.push_str(&symbol[copied_to..]);
-                cell.set_symbol(&out);
-            }
-            continue;
-        }
-
-        // Otherwise the encoder emitted a bare Sixel DCS. The cursor and
-        // clearing CSI outside it remain tmux-owned for pane-local placement.
-        let mut out = String::with_capacity(symbol.len().saturating_add(512));
-        let mut rest = symbol;
-        while let Some(pos) = rest.find(SIXEL_DCS) {
-            out.push_str(&rest[..pos]);
-            let body = &rest[pos + SIXEL_DCS.len()..];
-            if !sixel_header(body) { return Err(()); }
-            let end = body.find(APC_END).ok_or(())?;
-            let command = &rest[pos..pos + SIXEL_DCS.len() + end + APC_END.len()];
-            append_bounded_tmux_sixel_stream(&mut out, command, false)?;
-            rest = &body[end + APC_END.len()..];
-        }
-        out.push_str(rest);
-        cell.set_symbol(&out);
-    }
-    Ok(())
+/// All native-Sixel surfaces use the same final-buffer transport.
+pub(super) fn wrap_tmux_sixel_buffer(
+    buffer: &mut ratatui::buffer::Buffer,
+    font: (u16, u16),
+) -> Result<(), ()> {
+    super::sixel_tmux::wrap_buffer(buffer, font)
 }
 #[cfg(test)]
 mod tmux_tests {
     use super::*;
-
-    /// Model tmux 3.5a's DCS passthrough: it removes the extra ESC from
-    /// doubled pairs in each packet and forwards the body as raw output.
-    /// Every packet is checked against the parser's 1 MiB input bound.
-    fn forwarded_tmux_sixel_bytes(symbol: &str) -> (String, usize) {
-        let mut reconstructed = String::new();
-        let mut pos = 0;
-        let mut packets = 0;
-        while let Some(offset) = symbol[pos..].find(TMUX_DCS) {
-            let start = pos + offset;
-            reconstructed.push_str(&symbol[pos..start]);
-            let end = tmux_dcs_end(symbol, start).expect("bounded DCS terminator");
-            let body = &symbol[start + TMUX_DCS.len()..end - APC_END.len()];
-            assert!(!body.is_empty());
-            assert!(body.len() <= TMUX_SIXEL_PASSTHROUGH_BODY_LIMIT);
-            assert!(body.len() + "tmux;".len() < 1_048_576);
-            let mut chars = body.chars();
-            while let Some(ch) = chars.next() {
-                if ch == '\x1b' {
-                    assert_eq!(chars.next(), Some('\x1b'),
-                        "cannot split an escaped ESC across tmux DCS packets");
-                }
-                reconstructed.push(ch);
-            }
-            packets += 1;
-            pos = end;
-        }
-        reconstructed.push_str(&symbol[pos..]);
-        (reconstructed, packets)
-    }
-
-    #[test]
-    fn large_pre_wrapped_sixel_is_streamed_below_tmux_limit_without_pixel_changes() {
-        use ratatui::{buffer::Buffer, layout::Rect};
-        // The observed viewer upload was 1,752,246 bytes in ONE DCS, which
-        // tmux 3.5a discards. The pinned encoder also places clearing CSI
-        // *inside* its own wrapper. Preserve that exact raw sequence.
-        let sixel = format!("\x1bPq#0;2;100;50;25#1;2;25;50;100{}\x1b\\",
-            "~".repeat(1_752_246));
-        let original = format!("\x1b[2K\x1b[1G{sixel}");
-        let wrapped = format!("{TMUX_DCS}{}\x1b\\", original.replace('\x1b', "\x1b\x1b"));
-        assert!(wrapped.len() > 1_048_576);
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
-        buffer.get_mut(0, 0).set_symbol(&wrapped);
-        wrap_tmux_sixel_buffer(&mut buffer).unwrap();
-        let streamed = buffer.get(0, 0).symbol().to_owned();
-        let (received, packets) = forwarded_tmux_sixel_bytes(&streamed);
-        assert!(packets > 20, "image must be framed in multiple bounded DCS packets");
-        assert_eq!(received, original, "no palette or raster data may be changed");
-        assert_eq!(received.matches("\x1bPq").count(), 1,
-            "the outer terminal must receive ONE logical Sixel image");
-        assert_eq!(received.matches("\x1b\\").count(), 1);
-        // The transport may inspect an already prepared frame again; never
-        // double wrap it or change the image ID/fingerprint by doing so.
-        wrap_tmux_sixel_buffer(&mut buffer).unwrap();
-        assert_eq!(buffer.get(0, 0).symbol(), streamed);
-    }
-
-    #[test]
-    fn bare_large_sixel_and_two_images_keep_independent_transport() {
-        use ratatui::{buffer::Buffer, layout::Rect};
-        let preview = "\x1bPq#0~\x1b\\";
-        let viewer = format!("\x1b[2K\x1bPq#1;2;100;0;0{}\x1b\\",
-            "?".repeat(1_200_000));
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 3, 1));
-        buffer.get_mut(0, 0).set_symbol(preview);
-        buffer.get_mut(2, 0).set_symbol(&viewer);
-        let identities = sixel_upload_identities(&buffer);
-        assert_eq!(identities.len(), 2);
-        wrap_tmux_sixel_buffer(&mut buffer).unwrap();
-        let (first, first_packets) = forwarded_tmux_sixel_bytes(buffer.get(0, 0).symbol());
-        let (second, second_packets) = forwarded_tmux_sixel_bytes(buffer.get(2, 0).symbol());
-        assert_eq!(first, preview);
-        assert_eq!(first_packets, 1);
-        assert_eq!(second, viewer);
-        assert!(second_packets > 15);
-    }
-
-    #[test]
-    fn sixel_header_can_cross_tmux_packet_boundary_and_remain_idempotent() {
-        use ratatui::{buffer::Buffer, layout::Rect};
-        // 13,106 clearing CSI commands occupy 65,530 bytes once ESC is
-        // doubled; four ordinary bytes put the following escaped ESC pair
-        // in the final two bytes of a packet. The 'P0;0q' follows in the
-        // next packet. Even on a second transport pass it is ONE image.
-        let clear = format!("{}ABCD", "\x1b[2K".repeat(13_106));
-        let raw = format!("{clear}\x1bP0;0q#0~\x1b\\");
-        let wrapped = format!("{TMUX_DCS}{}\x1b\\", raw.replace('\x1b', "\x1b\x1b"));
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
-        buffer.get_mut(0, 0).set_symbol(&wrapped);
-        wrap_tmux_sixel_buffer(&mut buffer).unwrap();
-        let once = buffer.get(0, 0).symbol().to_owned();
-        let (received, packets) = forwarded_tmux_sixel_bytes(&once);
-        assert_eq!(packets, 2);
-        assert_eq!(received, raw);
-        wrap_tmux_sixel_buffer(&mut buffer).unwrap();
-        assert_eq!(buffer.get(0, 0).symbol(), once);
-    }
-
-    #[test]
-    fn split_never_breaks_escape_pair_on_packet_boundary() {
-        use ratatui::{buffer::Buffer, layout::Rect};
-        // Make an ESC in a nested Sixel terminator land at a packet edge.
-        let raw = format!("\x1bPq{}\x1b\\", "~".repeat(
-            TMUX_SIXEL_PASSTHROUGH_BODY_LIMIT - 4));
-        let input = format!("{TMUX_DCS}{}\x1b\\", raw.replace('\x1b', "\x1b\x1b"));
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 1, 1));
-        buffer.get_mut(0, 0).set_symbol(&input);
-        wrap_tmux_sixel_buffer(&mut buffer).unwrap();
-        let (received, packets) = forwarded_tmux_sixel_bytes(buffer.get(0, 0).symbol());
-        assert!(packets >= 2);
-        assert_eq!(received, raw);
-    }
 
     #[test]
     fn sixel_identity_changes_only_with_payload_or_placement() {
@@ -783,7 +515,7 @@ mod tmux_tests {
         assert_eq!(pending.get(0, 0).symbol(), first);
         assert_eq!(pending.get(1, 0).symbol(), "status");
         assert_eq!(pending.get(3, 0).symbol(), " ");
-        wrap_tmux_sixel_buffer(&mut pending).unwrap();
+        wrap_tmux_sixel_buffer(&mut pending, (10, 20)).unwrap();
         assert!(pending.get(0, 0).symbol().contains(TMUX_DCS));
         assert!(!pending.get(3, 0).symbol().contains(SIXEL_DCS));
 
@@ -794,7 +526,7 @@ mod tmux_tests {
         suppress_unverified_tmux_sixel_uploads(&mut buf, &identities);
         assert_eq!(buf.get(0, 0).symbol(), first);
         assert_eq!(buf.get(3, 0).symbol(), second);
-        wrap_tmux_sixel_buffer(&mut buf).unwrap();
+        wrap_tmux_sixel_buffer(&mut buf, (10, 20)).unwrap();
         assert!(buf.get(0, 0).symbol().contains(TMUX_DCS));
         assert!(buf.get(3, 0).symbol().contains(TMUX_DCS));
     }
@@ -820,7 +552,7 @@ mod tmux_tests {
         let mut buf = Buffer::empty(Rect::new(0, 0, 1, 1));
         buf.get_mut(0,0).set_symbol("\x1b[2K\x1bPq#0;2;100;0;0~\x1b\\");
         assert!(!sixel_upload_identities(&buf).is_empty());
-        wrap_tmux_sixel_buffer(&mut buf).unwrap();
+        wrap_tmux_sixel_buffer(&mut buf, (10, 20)).unwrap();
         let symbol = buf.get(0,0).symbol();
         assert!(symbol.starts_with("\x1b[2K\x1bPtmux;"));
         assert!(symbol.ends_with("\x1b\x1b\\\x1b\\"));
@@ -832,10 +564,10 @@ mod tmux_tests {
         let mut buf = Buffer::empty(Rect::new(0, 0, 1, 1));
         let symbol = "\x1bPtmux;\x1b\x1b[2K\x1b\x1bPq#0~\x1b\x1b\\\x1b\\";
         buf.get_mut(0,0).set_symbol(symbol);
-        wrap_tmux_sixel_buffer(&mut buf).unwrap();
+        wrap_tmux_sixel_buffer(&mut buf, (10, 20)).unwrap();
         assert_eq!(buf.get(0,0).symbol(), symbol);
         buf.get_mut(0,0).set_symbol("\x1bPnot-sixel\x1b\\");
-        assert!(wrap_tmux_sixel_buffer(&mut buf).is_err());
+        assert!(wrap_tmux_sixel_buffer(&mut buf, (10, 20)).is_err());
     }
 
     #[test]

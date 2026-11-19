@@ -13,6 +13,7 @@ pub mod bookmark_workers;
 pub mod browse;
 pub mod browse_artwork;
 mod kitty_transport;
+mod sixel_tmux;
 mod tmux_images;
 mod info_artwork_cache;
 pub mod terminal_image_geometry;
